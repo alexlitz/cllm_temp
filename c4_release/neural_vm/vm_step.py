@@ -262,21 +262,21 @@ class DivModModule(nn.Module):
         quotient = quotient * b_nonzero
         remainder = remainder * b_nonzero
 
-        # Select result by opcode
-        op_div = x[..., BD.OP_DIV]
-        op_mod = x[..., BD.OP_MOD]
-        result = quotient * op_div + remainder * op_mod
+        # Select result by opcode (binarize flags: OP_DIV ≈ 5.0 when active)
+        is_div = (x[..., BD.OP_DIV] > 0.5).to(x.dtype)
+        is_mod = (x[..., BD.OP_MOD] > 0.5).to(x.dtype)
+        result = quotient * is_div + remainder * is_mod
 
         # Encode result to one-hot nibbles
         result_lo = result % 16
         result_hi = torch.div(result, 16, rounding_mode='trunc')
 
         delta = torch.zeros_like(x)
-        active = op_div + op_mod
+        active = is_div + is_mod
         for k in range(16):
             lo_target = (1.0 - (result_lo - k).abs()).clamp(min=0)
             hi_target = (1.0 - (result_hi - k).abs()).clamp(min=0)
-            # Replace existing OUTPUT values (cancel L6 identity carry residual)
+            # Replace existing OUTPUT values (cancel residual from suppressed passthrough)
             delta[..., BD.OUTPUT_LO + k] = (lo_target - x[..., BD.OUTPUT_LO + k]) * active
             delta[..., BD.OUTPUT_HI + k] = (hi_target - x[..., BD.OUTPUT_HI + k]) * active
 
@@ -506,7 +506,7 @@ class AutoregressiveVM(nn.Module):
         # This is intentionally temporary and should disappear once code loading
         # is implemented inside the transformer itself.
         self._inject_code_addr_keys(token_ids, x)
-        # self._inject_mem_store(token_ids, x)  # temporarily disabled for debugging
+        self._inject_mem_store(token_ids, x)
         for block in self.blocks:
             x = block(x, kv_cache)
         if self.head.weight.is_sparse:
@@ -1143,7 +1143,7 @@ def set_vm_weights(model, enable_tool_calling=False):
     # ===== LAYER 10: carry relay + AX passthrough + bitwise + cmp =====
     attn10 = model.blocks[10].attn
     attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
-    attn10.alibi_slopes[1] = 1.0  # head 1: AX byte 1-3 passthrough (nearest step)
+    attn10.alibi_slopes[1] = 1.0  # head 1: AX byte passthrough (nearest step)
     _set_layer10_carry_relay(attn10, S, BD, HD)
     _set_layer10_byte_passthrough(attn10, S, BD, HD)
     ffn10 = model.blocks[10].ffn
@@ -2920,53 +2920,73 @@ def _set_layer10_carry_relay(attn, S, BD, HD):
 
 
 def _set_layer10_byte_passthrough(attn, S, BD, HD):
-    """L10 attention head 1: AX byte 1-3 passthrough across steps.
+    """L10 attention head 1: AX byte 0-2 passthrough across steps.
 
-    For non-ALU steps (EXIT, BZ-not-taken, etc.), copies CLEAN_EMBED from
-    previous step's AX bytes 1-3 → OUTPUT at current step's AX bytes 1-3.
-    Byte 0 is already handled by the marker-level AX passthrough in the FFN.
+    Copies CLEAN_EMBED from previous step's AX bytes 1-3 → OUTPUT at current
+    step's AX byte 0-2 positions. Uses **shifted** byte matching because of the
+    autoregressive offset: logits at byte K position predict byte K+1's token.
 
-    Design:
-      Q: fires at AX byte positions 1-3 (IS_BYTE + H1[AX] - BYTE_INDEX_0)
-      K: fires at AX byte positions 1-3 (IS_BYTE + H1[AX] - BYTE_INDEX_0)
-      Byte matching: BYTE_INDEX_1/2/3 in separate Q/K dims ensure
-        byte 1→byte 1, byte 2→byte 2, byte 3→byte 3 alignment.
-      V: copies CLEAN_EMBED_LO[0..15] + CLEAN_EMBED_HI[0..15]
-      O: writes OUTPUT_LO[0..15] + OUTPUT_HI[0..15] at strength 2.0
-         (weaker than carry ≈5.0, so carry wins when both fire)
-      ALiBi slope=1.0: prefers nearest step (d=35 beats d=70)
+    Mapping (Q byte K attends to K byte K+1 of prev step):
+      byte 0 pos → prev byte 1 (predicts byte 1 token)
+      byte 1 pos → prev byte 2 (predicts byte 2 token)
+      byte 2 pos → prev byte 3 (predicts byte 3 token)
+      byte 3 pos → suppressed (predicts SP marker, not a byte)
+
+    Byte 0's token (AX byte 0 value) is handled by the marker-level AX passthrough
+    FFN, which reads AX_CARRY_LO/HI at the AX marker position.
+
+    Anti-leakage:
+      - Q dim 33: large negative bias at non-AX positions (H1[AX]=0) → kills softmax
+      - K dim 1: H1[AX_IDX] → only AX byte positions are strong K targets
+      - At step 0 (no prev AX bytes): Q attends to same-step PC bytes (all 0),
+        producing OUTPUT for token 0 (correct: AX=0 initially)
+
+    Strength: W_o=2.0, weaker than carry override (≈5.0) so carry wins when active.
+    ALiBi slope=1.0: prefers nearest step (d=35 beats d=70).
     """
     L = S  # attention scale
     AX_IDX = 1
     base = HD  # head 1 starts at dim 64
 
-    # Q: AX byte positions 1-3
-    # dim0: IS_BYTE - 0.5 (byte vs marker discrimination)
+    # Q dim 0: IS_BYTE (byte vs marker discrimination)
     attn.W_q[base + 0, BD.IS_BYTE] = L
     attn.W_q[base + 0, BD.CONST] = -L / 2
 
-    # dim1: H1[AX_IDX] - 0.5 (AX vs non-AX discrimination)
+    # Q dim 1: H1[AX_IDX] (AX vs non-AX discrimination)
     attn.W_q[base + 1, BD.H1 + AX_IDX] = L
     attn.W_q[base + 1, BD.CONST] = -L / 2
 
-    # dim2: suppress byte 0 (negative for BYTE_INDEX_0)
-    attn.W_q[base + 2, BD.BYTE_INDEX_0] = -L
-    attn.W_q[base + 2, BD.CONST] = L / 2  # +0.5 when not byte0, -0.5 when byte0
+    # Q dim 2: suppress byte 3 (logits at byte 3 predict SP marker, not a byte)
+    attn.W_q[base + 2, BD.BYTE_INDEX_3] = -L
+    attn.W_q[base + 2, BD.CONST] = L / 2
 
-    # K: same structure — fires at AX byte positions 1-3
+    # K dim 0: IS_BYTE
     attn.W_k[base + 0, BD.IS_BYTE] = L
+
+    # K dim 1: H1[AX_IDX] (only AX bytes are strong K targets)
     attn.W_k[base + 1, BD.H1 + AX_IDX] = L
+
+    # K dim 2: suppress byte 0 in K (not a valid target for shifted matching)
     attn.W_k[base + 2, BD.BYTE_INDEX_0] = -L
     attn.W_k[base + 2, BD.CONST] = L / 2
 
-    # Byte index matching (BYTE_INDEX_1, BYTE_INDEX_2, BYTE_INDEX_3)
-    # Each in its own Q/K dim pair so only same-index bytes get high score
-    attn.W_q[base + 3, BD.BYTE_INDEX_1] = L
+    # Shifted byte matching: Q byte K → K byte K+1
+    # byte 0 (BYTE_INDEX_0) attends to byte 1 (BYTE_INDEX_1) of prev step
+    attn.W_q[base + 3, BD.BYTE_INDEX_0] = L
     attn.W_k[base + 3, BD.BYTE_INDEX_1] = L
-    attn.W_q[base + 4, BD.BYTE_INDEX_2] = L
+    # byte 1 (BYTE_INDEX_1) attends to byte 2 (BYTE_INDEX_2) of prev step
+    attn.W_q[base + 4, BD.BYTE_INDEX_1] = L
     attn.W_k[base + 4, BD.BYTE_INDEX_2] = L
-    attn.W_q[base + 5, BD.BYTE_INDEX_3] = L
+    # byte 2 (BYTE_INDEX_2) attends to byte 3 (BYTE_INDEX_3) of prev step
+    attn.W_q[base + 5, BD.BYTE_INDEX_2] = L
     attn.W_k[base + 5, BD.BYTE_INDEX_3] = L
+
+    # Gate dim 33: suppress non-AX Q positions to prevent softmax leakage.
+    # At AX bytes (H1[AX]=1): Q_gate = 0, score_gate = 0 (neutral).
+    # At non-AX (H1[AX]=0): Q_gate = -500, score_gate = -500*5/8 ≈ -312 (kills softmax).
+    attn.W_q[base + 33, BD.CONST] = -500.0
+    attn.W_q[base + 33, BD.H1 + AX_IDX] = 500.0
+    attn.W_k[base + 33, BD.CONST] = 5.0
 
     # V: copy CLEAN_EMBED nibbles (16 lo + 16 hi = 32 V dims)
     for k in range(16):
@@ -3645,17 +3665,22 @@ def _set_layer15_memory_lookup(attn, S, BD, HD):
         attn.W_k[base + 2, BD.MEM_STORE] = 50.0
 
         # === Dim 3: Byte selection ===
-        # Q[3] = L*byte_flag. K[3] = L*MEM_VAL_BH.
+        # Ensures each head attends to the correct MEM val byte TOKEN position.
+        # MEM section layout: [MEM, a0, a1, a2, a3, v0, v1, v2, v3]
+        # Val byte positions: v0=d5, v1=d6, v2=d7, v3=d8 from MEM marker.
+        # Head h reads val byte h via V(CLEAN_EMBED).
+        # Q[3] = L*byte_flag. K[3] = L*threshold_flag_for_val_byte_h.
         byte_q_flag = [BD.MARK_AX, BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][h]
         attn.W_q[base + 3, byte_q_flag] = L
         if h == 0:
             attn.W_q[base + 3, BD.MARK_STACK0] = L
-        MEM_VAL_DIMS = [None, BD.MEM_VAL_B0, BD.MEM_VAL_B1, BD.MEM_VAL_B2]
+        MEM_VAL_DIMS = [None, BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3]
         if h == 0:
-            # MEM val byte 0: d=4 from MEM marker. H1[MEM]=1, H0[MEM]=0 at d=4.
-            attn.W_k[base + 3, BD.H1 + MEM_I] = L
-            attn.W_k[base + 3, BD.H0 + MEM_I] = -L
+            # Head 0 → val byte 0 at d=5: L2H0[MEM]=1 (d≤5.5), H1[MEM]=0 (d>4.5).
+            attn.W_k[base + 3, BD.L2H0 + MEM_I] = L
+            attn.W_k[base + 3, BD.H1 + MEM_I] = -L
         else:
+            # Heads 1-3 → val bytes 1,2,3 at d=6,7,8 via MEM_VAL_B1/B2/B3.
             attn.W_k[base + 3, MEM_VAL_DIMS[h]] = L
 
         # === Dims 4-27: Binary address encoding (24 bits, scale=10) ===
