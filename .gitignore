@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+
+# PyTorch models
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+
+# Build artifacts
+c4_release/build/
+
+# Compiled binaries
+cat
+cat_min
+cat_release
+cat_stripped
+
+# macOS
+.DS_Store
+
+# Test / cache
+.pytest_cache/
+.benchmarks/
+
+# IDE
+.vscode/
+.idea/

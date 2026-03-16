@@ -1,0 +1,12 @@
+{
+  "hidden_dim": 256,
+  "table_bits": 8,
+  "newton_iterations": 2,
+  "vocab_size": 256,
+  "word_size": 8,
+  "data_base": 65536,
+  "model_type": "c4-transformer-vm",
+  "architectures": [
+    "C4TransformerVM"
+  ]
+}

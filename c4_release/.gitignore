@@ -1,0 +1,20 @@
+# Build output
+build/
+
+# Object files
+*.o
+
+# Python
+__pycache__/
+*.pyc
+
+# Large model files
+*.onnx.data
+*.pt
+*.npz
+
+# Large images
+demos/mandelbrot_hd_neural.png
+
+# OS
+.DS_Store

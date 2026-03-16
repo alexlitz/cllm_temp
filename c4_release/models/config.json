@@ -1,0 +1,27 @@
+{
+  "model_type": "c4-transformer-vm",
+  "version": "1.0.0",
+  "architecture": {
+    "vocab_size": 256,
+    "hidden_dim": 256,
+    "word_size": 8,
+    "table_bits": 8,
+    "newton_iterations": 2
+  },
+  "components": {
+    "byte_encoder": "ByteEncoder - int to 4 one-hot bytes",
+    "byte_decoder": "ByteDecoder - 4 one-hot bytes to int",
+    "byte_to_nibble": "ByteToNibbleFFN - byte to 2 nibbles via FFN",
+    "nibble_to_byte": "NibbleToByteFFN - 2 nibbles to byte via FFN",
+    "bitwise_ops": "BitwiseOps - AND/OR/XOR via nibble tables",
+    "addition": "ByteAddFFN - ripple carry via nibble add tables",
+    "multiply": "SwiGLUMul - exact via silu(a)*b + silu(-a)*(-b)",
+    "division": "DivisionFFN - reciprocal table + Newton iterations",
+    "compare": "CompareFFN - sharp gate comparisons"
+  },
+  "statistics": {
+    "num_buffers": 391424,
+    "memory_kb_fp32": 1529.0,
+    "memory_kb_fp16": 764.5
+  }
+}
