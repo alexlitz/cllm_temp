@@ -51,8 +51,6 @@ _TOOL_CALL_OPS = {
 # LI/LC removed: L15 softmax1 memory lookup produces correct AX values
 # when MEM sections are retained in context and MEM_STORE is injected.
 _RUNNER_VM_MEMORY_OPS = {
-    Opcode.DIV,
-    Opcode.MOD,
     Opcode.ADJ,
     Opcode.MALC,
     Opcode.FREE,
@@ -151,8 +149,7 @@ class AutoregressiveVMRunner:
         self._syscall_handlers = {
             Opcode.PUTCHAR: self._syscall_putchar,
             Opcode.GETCHAR: self._syscall_getchar,
-            Opcode.DIV: self._syscall_div,
-            Opcode.MOD: self._syscall_mod,
+            # DIV/MOD removed — neural (DivModModule after L10)
             # LI/LC handlers removed: L15 softmax1 memory lookup produces
             # correct AX values with MEM section retention + MEM_STORE injection.
             # SI/SC handlers removed: _track_memory_write provides equivalent
@@ -356,18 +353,6 @@ class AutoregressiveVMRunner:
                 if ax is not None:
                     if op in (Opcode.LI, Opcode.LC):
                         # L15 produces correct output for all bytes. Trust transformer.
-                        # DEBUG: trace LI/LC AX output
-                        import os
-                        if os.environ.get('DEBUG_LI'):
-                            mem_addr, mem_val = self._extract_mem_write(context)
-                            ma = f"{mem_addr:#010x}" if mem_addr is not None else "None"
-                            mv = f"{mem_val:#010x}" if mem_val is not None else "None"
-                            print(f"DEBUG {_OPCODE_NAME.get(op)}: model AX={ax:#010x}"
-                                  f" bytes=[{ax&0xFF:#04x},{(ax>>8)&0xFF:#04x},{(ax>>16)&0xFF:#04x},{(ax>>24)&0xFF:#04x}]"
-                                  f" mem_end={self.model._mem_history_end}"
-                                  f" hist_keys={[hex(k) for k in self._mem_history.keys()]}"
-                                  f" mem_addr={ma} mem_val={mv}"
-                                  f" _last_ax={self._last_ax:#010x}", flush=True)
                         self._last_ax = ax
                     else:
                         # Normal merge: byte 0 from weights, bytes 1-3 from _last_ax

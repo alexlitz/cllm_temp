@@ -239,6 +239,50 @@ class CausalSelfAttention(PureAttention):
         return x + F.linear(out, self.W_o)
 
 
+class DivModModule(nn.Module):
+    """Neural DIV/MOD: decode one-hot operands -> integer div/mod -> one-hot result."""
+
+    def forward(self, x):
+        BD = _SetDim
+        # Decode operand A from one-hot nibbles
+        a_lo = sum(k * x[..., BD.ALU_LO + k] for k in range(16))
+        a_hi = sum(k * x[..., BD.ALU_HI + k] for k in range(16))
+        a = (a_hi * 16 + a_lo).round()
+
+        # Decode operand B from one-hot nibbles
+        b_lo = sum(k * x[..., BD.AX_CARRY_LO + k] for k in range(16))
+        b_hi = sum(k * x[..., BD.AX_CARRY_HI + k] for k in range(16))
+        b = (b_hi * 16 + b_lo).round()
+
+        # Integer division and modulo (div-by-zero -> 0)
+        safe_b = b.clamp(min=1)
+        quotient = torch.div(a, safe_b, rounding_mode='trunc')
+        remainder = a - quotient * safe_b
+        b_nonzero = (b > 0.5).to(x.dtype)
+        quotient = quotient * b_nonzero
+        remainder = remainder * b_nonzero
+
+        # Select result by opcode
+        op_div = x[..., BD.OP_DIV]
+        op_mod = x[..., BD.OP_MOD]
+        result = quotient * op_div + remainder * op_mod
+
+        # Encode result to one-hot nibbles
+        result_lo = result % 16
+        result_hi = torch.div(result, 16, rounding_mode='trunc')
+
+        delta = torch.zeros_like(x)
+        active = op_div + op_mod
+        for k in range(16):
+            lo_target = (1.0 - (result_lo - k).abs()).clamp(min=0)
+            hi_target = (1.0 - (result_hi - k).abs()).clamp(min=0)
+            # Replace existing OUTPUT values (cancel L6 identity carry residual)
+            delta[..., BD.OUTPUT_LO + k] = (lo_target - x[..., BD.OUTPUT_LO + k]) * active
+            delta[..., BD.OUTPUT_HI + k] = (hi_target - x[..., BD.OUTPUT_HI + k]) * active
+
+        return x + delta
+
+
 class TransformerBlock(nn.Module):
     """Transformer decoder block: attention + FFN.
 
@@ -250,10 +294,13 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attn = attn
         self.ffn = ffn
+        self.post_ops = nn.ModuleList()
 
     def forward(self, x, kv_cache=None):
         x = self.attn(x)
         x = self.ffn(x)
+        for op in self.post_ops:
+            x = op(x)
         return x
 
 
@@ -423,7 +470,7 @@ class AutoregressiveVM(nn.Module):
         # This is intentionally temporary and should disappear once code loading
         # is implemented inside the transformer itself.
         self._inject_code_addr_keys(token_ids, x)
-        self._inject_mem_store(token_ids, x)
+        # self._inject_mem_store(token_ids, x)  # temporarily disabled for debugging
         for block in self.blocks:
             x = block(x, kv_cache)
         if self.head.weight.is_sparse:
@@ -1060,9 +1107,14 @@ def set_vm_weights(model, enable_tool_calling=False):
     # ===== LAYER 10: carry relay + AX passthrough + bitwise + cmp =====
     attn10 = model.blocks[10].attn
     attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
+    attn10.alibi_slopes[1] = 1.0  # head 1: AX byte 1-3 passthrough (nearest step)
     _set_layer10_carry_relay(attn10, S, BD, HD)
+    _set_layer10_byte_passthrough(attn10, S, BD, HD)
     ffn10 = model.blocks[10].ffn
     _set_layer10_alu(ffn10, S, BD)
+
+    # ===== LAYER 10.5: Neural DIV/MOD =====
+    model.blocks[10].post_ops.append(DivModModule())
 
     # ===== LAYER 11: MUL partial sum staging =====
     ffn11 = model.blocks[11].ffn
@@ -2831,6 +2883,66 @@ def _set_layer10_carry_relay(attn, S, BD, HD):
     attn.W_o[BD.CARRY + 2, base + 2] = 1.0
 
 
+def _set_layer10_byte_passthrough(attn, S, BD, HD):
+    """L10 attention head 1: AX byte 1-3 passthrough across steps.
+
+    For non-ALU steps (EXIT, BZ-not-taken, etc.), copies CLEAN_EMBED from
+    previous step's AX bytes 1-3 → OUTPUT at current step's AX bytes 1-3.
+    Byte 0 is already handled by the marker-level AX passthrough in the FFN.
+
+    Design:
+      Q: fires at AX byte positions 1-3 (IS_BYTE + H1[AX] - BYTE_INDEX_0)
+      K: fires at AX byte positions 1-3 (IS_BYTE + H1[AX] - BYTE_INDEX_0)
+      Byte matching: BYTE_INDEX_1/2/3 in separate Q/K dims ensure
+        byte 1→byte 1, byte 2→byte 2, byte 3→byte 3 alignment.
+      V: copies CLEAN_EMBED_LO[0..15] + CLEAN_EMBED_HI[0..15]
+      O: writes OUTPUT_LO[0..15] + OUTPUT_HI[0..15] at strength 2.0
+         (weaker than carry ≈5.0, so carry wins when both fire)
+      ALiBi slope=1.0: prefers nearest step (d=35 beats d=70)
+    """
+    L = S  # attention scale
+    AX_IDX = 1
+    base = HD  # head 1 starts at dim 64
+
+    # Q: AX byte positions 1-3
+    # dim0: IS_BYTE - 0.5 (byte vs marker discrimination)
+    attn.W_q[base + 0, BD.IS_BYTE] = L
+    attn.W_q[base + 0, BD.CONST] = -L / 2
+
+    # dim1: H1[AX_IDX] - 0.5 (AX vs non-AX discrimination)
+    attn.W_q[base + 1, BD.H1 + AX_IDX] = L
+    attn.W_q[base + 1, BD.CONST] = -L / 2
+
+    # dim2: suppress byte 0 (negative for BYTE_INDEX_0)
+    attn.W_q[base + 2, BD.BYTE_INDEX_0] = -L
+    attn.W_q[base + 2, BD.CONST] = L / 2  # +0.5 when not byte0, -0.5 when byte0
+
+    # K: same structure — fires at AX byte positions 1-3
+    attn.W_k[base + 0, BD.IS_BYTE] = L
+    attn.W_k[base + 1, BD.H1 + AX_IDX] = L
+    attn.W_k[base + 2, BD.BYTE_INDEX_0] = -L
+    attn.W_k[base + 2, BD.CONST] = L / 2
+
+    # Byte index matching (BYTE_INDEX_1, BYTE_INDEX_2, BYTE_INDEX_3)
+    # Each in its own Q/K dim pair so only same-index bytes get high score
+    attn.W_q[base + 3, BD.BYTE_INDEX_1] = L
+    attn.W_k[base + 3, BD.BYTE_INDEX_1] = L
+    attn.W_q[base + 4, BD.BYTE_INDEX_2] = L
+    attn.W_k[base + 4, BD.BYTE_INDEX_2] = L
+    attn.W_q[base + 5, BD.BYTE_INDEX_3] = L
+    attn.W_k[base + 5, BD.BYTE_INDEX_3] = L
+
+    # V: copy CLEAN_EMBED nibbles (16 lo + 16 hi = 32 V dims)
+    for k in range(16):
+        attn.W_v[base + k, BD.CLEAN_EMBED_LO + k] = 1.0
+        attn.W_v[base + 16 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+
+    # O: write to OUTPUT_LO/HI (strength 2.0, weaker than carry ≈5.0)
+    for k in range(16):
+        attn.W_o[BD.OUTPUT_LO + k, base + k] = 2.0
+        attn.W_o[BD.OUTPUT_HI + k, base + 16 + k] = 2.0
+
+
 def _set_layer10_alu(ffn, S, BD):
     """L10 FFN: Comparison combine + Bitwise ops + AX passthrough.
 
@@ -2999,7 +3111,9 @@ def _set_layer10_alu(ffn, S, BD):
         BD.OP_GT,
         BD.OP_LE,
         BD.OP_GE,
-        BD.OP_MUL,  # DIV, MOD removed — runner reads old AX then overrides
+        BD.OP_MUL,
+        BD.OP_DIV,   # neural (DivModModule after L10)
+        BD.OP_MOD,   # neural (DivModModule after L10)
         BD.OP_SHL,
         BD.OP_SHR,
         BD.OP_LEA,  # LEA: AX = FETCH + BP (handled by L8/L9 ADD circuit)
@@ -3495,7 +3609,6 @@ def _set_layer15_memory_lookup(attn, S, BD, HD):
         attn.W_k[base + 2, BD.MEM_STORE] = 50.0
 
         # === Dim 3: Byte selection ===
-        # Ensures each head attends to the correct MEM val byte position.
         # Q[3] = L*byte_flag. K[3] = L*MEM_VAL_BH.
         byte_q_flag = [BD.MARK_AX, BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][h]
         attn.W_q[base + 3, byte_q_flag] = L

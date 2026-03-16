@@ -1419,6 +1419,24 @@ _BINOP_TESTS = [
     (0, 255, Opcode.MUL, 'mul'),
     (15, 17, Opcode.MUL, 'mul'),
     (16, 16, Opcode.MUL, 'mul'),
+    # DIV
+    (10, 3, Opcode.DIV, 'div'),
+    (100, 10, Opcode.DIV, 'div'),
+    (255, 1, Opcode.DIV, 'div'),
+    (7, 7, Opcode.DIV, 'div'),
+    (0, 5, Opcode.DIV, 'div'),
+    (3, 5, Opcode.DIV, 'div'),
+    (200, 50, Opcode.DIV, 'div'),
+    (255, 16, Opcode.DIV, 'div'),
+    # MOD
+    (10, 3, Opcode.MOD, 'mod'),
+    (100, 10, Opcode.MOD, 'mod'),
+    (255, 1, Opcode.MOD, 'mod'),
+    (7, 7, Opcode.MOD, 'mod'),
+    (0, 5, Opcode.MOD, 'mod'),
+    (3, 5, Opcode.MOD, 'mod'),
+    (200, 50, Opcode.MOD, 'mod'),
+    (255, 16, Opcode.MOD, 'mod'),
 ]
 
 def _get_binop_cache():
@@ -1451,6 +1469,8 @@ def _expected_binop(name, a, b):
         'xor': lambda a, b: a ^ b,
         'and': lambda a, b: a & b,
         'mul': lambda a, b: (a * b) & 0xFF,
+        'div': lambda a, b: (a // b) if b != 0 else 0,
+        'mod': lambda a, b: (a % b) if b != 0 else 0,
     }
     return ops[name](a, b)
 
@@ -1487,6 +1507,10 @@ for _key in [
     ('xor', 0xF0, 0x0F), ('xor', 0xFF, 0xFF), ('xor', 0, 0),
     ('and', 0xF0, 0x0F), ('and', 0xFF, 0x0F), ('and', 0, 0xFF),
     ('mul', 3, 4), ('mul', 0, 255), ('mul', 15, 17), ('mul', 16, 16),
+    ('div', 10, 3), ('div', 100, 10), ('div', 255, 1), ('div', 7, 7),
+    ('div', 0, 5), ('div', 3, 5), ('div', 200, 50), ('div', 255, 16),
+    ('mod', 10, 3), ('mod', 100, 10), ('mod', 255, 1), ('mod', 7, 7),
+    ('mod', 0, 5), ('mod', 3, 5), ('mod', 200, 50), ('mod', 255, 16),
 ]:
     _name, _a, _b = _key
     setattr(TestBinaryOps, f'test_{_name}_{_a}_{_b}',
@@ -1494,74 +1518,68 @@ for _key in [
 
 
 # =========================================================================
-# 27b. DIV/MOD tests (runner-computed, requires syscall handling)
+# 27b. DIV/MOD edge cases (division by zero)
 # =========================================================================
 
-_DIV_MOD_CASES = [
-    # (a, b, op, name, expected)
-    # DIV
-    (10, 3, Opcode.DIV, 'div', 3),
-    (100, 10, Opcode.DIV, 'div', 10),
-    (255, 1, Opcode.DIV, 'div', 255),
-    (7, 7, Opcode.DIV, 'div', 1),
-    (0, 5, Opcode.DIV, 'div', 0),
-    (3, 5, Opcode.DIV, 'div', 0),
-    (200, 50, Opcode.DIV, 'div', 4),
-    (255, 16, Opcode.DIV, 'div', 15),
-    (42, 0, Opcode.DIV, 'div', 0),       # div by zero
-    # MOD
-    (10, 3, Opcode.MOD, 'mod', 1),
-    (100, 10, Opcode.MOD, 'mod', 0),
-    (255, 1, Opcode.MOD, 'mod', 0),
-    (7, 7, Opcode.MOD, 'mod', 0),
-    (0, 5, Opcode.MOD, 'mod', 0),
-    (3, 5, Opcode.MOD, 'mod', 3),
-    (200, 50, Opcode.MOD, 'mod', 0),
-    (255, 16, Opcode.MOD, 'mod', 15),
-    (42, 0, Opcode.MOD, 'mod', 0),       # mod by zero
-]
+_divmod_zero_cache = None
 
-_divmod_cache = None
-
-def _get_divmod_cache():
-    """Run all DIV/MOD cases once via the runner (syscall-aware)."""
-    global _divmod_cache
-    if _divmod_cache is not None:
-        return _divmod_cache
-    from neural_vm.run_vm import AutoregressiveVMRunner
-    model = _get_model()
-    _divmod_cache = {}
-    for a, b, op, name, expected in _DIV_MOD_CASES:
-        runner = AutoregressiveVMRunner()
-        runner.model = model
-        _, ec = runner.run([
-            Opcode.IMM | (a << 8), Opcode.PSH,
-            Opcode.IMM | (b << 8), op, Opcode.EXIT,
-        ], max_steps=10)
-        _divmod_cache[(name, a, b)] = ec
-    return _divmod_cache
+def _get_divmod_zero_cache():
+    """Cache DIV/MOD by zero cases via batch (model-only)."""
+    global _divmod_zero_cache
+    if _divmod_zero_cache is None:
+        model = _get_model()
+        cases = [
+            (42, 0, Opcode.DIV, 'div'),
+            (0, 0, Opcode.DIV, 'div'),
+            (255, 0, Opcode.DIV, 'div'),
+            (42, 0, Opcode.MOD, 'mod'),
+            (0, 0, Opcode.MOD, 'mod'),
+            (255, 0, Opcode.MOD, 'mod'),
+        ]
+        bytecodes = [
+            [Opcode.IMM | (a << 8), Opcode.PSH, Opcode.IMM | (b << 8), op, Opcode.EXIT]
+            for a, b, op, name in cases
+        ]
+        results = run_programs_batch(model, bytecodes, max_steps=10)
+        _divmod_zero_cache = {(name, a, b): results[i] for i, (a, b, op, name) in enumerate(cases)}
+    return _divmod_zero_cache
 
 
-class TestDivMod(unittest.TestCase):
-    """DIV/MOD: runner-computed integer division and modulo."""
-
+class TestDivModEdgeCases(unittest.TestCase):
+    """DIV/MOD by zero -> result 0."""
     @classmethod
     def setUpClass(cls):
-        cls.cache = _get_divmod_cache()
+        cls.cache = _get_divmod_zero_cache()
 
+    def test_div_42_0(self):
+        """42 div 0 = 0"""
+        ec, _, _ = self.cache[('div', 42, 0)]
+        self.assertEqual(ec, 0)
 
-def _make_divmod_test(a, b, op, name, expected):
-    def test(self):
-        ec = self.cache[(name, a, b)]
-        self.assertEqual(ec, expected,
-                         f"{a} {name} {b}: expected {expected}, got {ec}")
-    test.__doc__ = f"{a} {name} {b} = {expected}"
-    return test
+    def test_div_0_0(self):
+        """0 div 0 = 0"""
+        ec, _, _ = self.cache[('div', 0, 0)]
+        self.assertEqual(ec, 0)
 
-for _a, _b, _op, _name, _expected in _DIV_MOD_CASES:
-    _suffix = f'{_name}_{_a}_{_b}'
-    setattr(TestDivMod, f'test_{_suffix}',
-            _make_divmod_test(_a, _b, _op, _name, _expected))
+    def test_div_255_0(self):
+        """255 div 0 = 0"""
+        ec, _, _ = self.cache[('div', 255, 0)]
+        self.assertEqual(ec, 0)
+
+    def test_mod_42_0(self):
+        """42 mod 0 = 0"""
+        ec, _, _ = self.cache[('mod', 42, 0)]
+        self.assertEqual(ec, 0)
+
+    def test_mod_0_0(self):
+        """0 mod 0 = 0"""
+        ec, _, _ = self.cache[('mod', 0, 0)]
+        self.assertEqual(ec, 0)
+
+    def test_mod_255_0(self):
+        """255 mod 0 = 0"""
+        ec, _, _ = self.cache[('mod', 255, 0)]
+        self.assertEqual(ec, 0)
 
 
 # =========================================================================
