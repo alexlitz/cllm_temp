@@ -453,6 +453,42 @@ class AutoregressiveVM(nn.Module):
         """Load a previously compacted model from disk."""
         return torch.load(path, weights_only=False)
 
+    def to(self, device):
+        """Move model to device, including MoE tensors.
+
+        Overrides nn.Module.to() to also move MoE weight dictionaries
+        that are stored as raw tensors (not Parameters/buffers).
+        """
+        result = super().to(device)
+        # Move MoE tensors in each block's FFN
+        for block in self.blocks:
+            ffn = block.ffn
+            if hasattr(ffn, '_moe_combined') and ffn._moe_combined is not None:
+                for key, tensors in ffn._moe_combined.items():
+                    for k, v in tensors.items():
+                        if isinstance(v, torch.Tensor):
+                            ffn._moe_combined[key][k] = v.to(device)
+            if hasattr(ffn, '_moe_shared') and ffn._moe_shared is not None:
+                for k, v in ffn._moe_shared.items():
+                    if isinstance(v, torch.Tensor):
+                        ffn._moe_shared[k] = v.to(device)
+            if hasattr(ffn, '_moe_experts') and ffn._moe_experts is not None:
+                for opcode, expert in ffn._moe_experts.items():
+                    for k, v in expert.items():
+                        if isinstance(v, torch.Tensor):
+                            ffn._moe_experts[opcode][k] = v.to(device)
+        return result
+
+    def cuda(self, device=None):
+        """Move model to CUDA, including MoE tensors."""
+        if device is None:
+            device = torch.cuda.current_device()
+        return self.to(device)
+
+    def cpu(self):
+        """Move model to CPU, including MoE tensors."""
+        return self.to('cpu')
+
     def forward(self, token_ids, kv_cache=None):
         """Forward pass: token IDs -> logits.
 

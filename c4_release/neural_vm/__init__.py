@@ -23,6 +23,12 @@ from .vm_step import (
 # VM Runner (autoregressive generation loop)
 from .run_vm import AutoregressiveVMRunner, ToolCall, ToolResponse
 
+# DraftVM for speculative execution
+from .speculative import DraftVM
+
+# Ultra-Fast Batch Runner (massive batches + speculation)
+from .batch_runner_v2 import UltraBatchRunner, UltraBatchRunnerCached, run_batch_ultra
+
 # softmax1 (ZFOD attention)
 from .kv_cache_eviction import softmax1
 
@@ -39,6 +45,8 @@ __all__ = [
     'PureFFN', 'PureAttention', 'bake_weights',
     # Autoregressive VM
     'AutoregressiveVM', 'AutoregressiveVMRunner', 'ToolCall', 'ToolResponse',
+    'DraftVM',
+    'UltraBatchRunner', 'UltraBatchRunnerCached', 'run_batch_ultra',
     'Token', 'TransformerBlock',
     'CausalSelfAttention', 'AutoregressiveAttention',
     'set_vm_weights', '_SetDim',
