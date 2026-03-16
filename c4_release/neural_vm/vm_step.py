@@ -1056,6 +1056,11 @@ def set_vm_weights(model, enable_tool_calling=False):
     _set_layer8_alu(ffn8, S, BD)
     ffn9 = model.blocks[9].ffn
     _set_layer9_alu(ffn9, S, BD)
+
+    # ===== LAYER 10: carry relay + AX passthrough + bitwise + cmp =====
+    attn10 = model.blocks[10].attn
+    attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
+    _set_layer10_carry_relay(attn10, S, BD, HD)
     ffn10 = model.blocks[10].ffn
     _set_layer10_alu(ffn10, S, BD)
 
@@ -2744,7 +2749,86 @@ def _set_layer9_alu(ffn, S, BD):
             ffn.W_down[BD.CMP + 3, unit] = 2.0 / S
             unit += 1
 
+    # === ADD hi-nibble carry-out → CARRY[1] (byte carry for inter-byte propagation) ===
+    # Detects (a + b + carry_in >= 16) for hi nibble. Same AND pattern as hi nibble
+    # result, but writes to CARRY[1] instead of OUTPUT_HI.
+    for carry_in in [0, 1]:
+        for a in range(16):
+            for b in range(16):
+                if a + b + carry_in < 16:
+                    continue  # no carry-out
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ALU_HI + a] = S
+                ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
+                if carry_in == 0:
+                    ffn.W_up[unit, BD.CARRY + 0] = -S * 2.0
+                    ffn.b_up[unit] = -S * 2.5
+                else:
+                    ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
+                    ffn.b_up[unit] = -S * 4.5
+                ffn.W_gate[unit, BD.OP_ADD] = 1.0
+                ffn.W_gate[unit, BD.OP_LEA] = 1.0
+                ffn.W_down[BD.CARRY + 1, unit] = 2.0 / (S * 5.0)
+                unit += 1
+
+    # === SUB hi-nibble borrow-out → CARRY[2] (byte borrow for inter-byte propagation) ===
+    # Detects a < b + borrow_in for hi nibble.
+    for borrow_in in [0, 1]:
+        for a in range(16):
+            for b in range(16):
+                if borrow_in == 0:
+                    if a >= b:
+                        continue  # no borrow-out
+                else:
+                    if a > b:
+                        continue  # no borrow-out (a - b - 1 >= 0)
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ALU_HI + a] = S
+                ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
+                if borrow_in == 0:
+                    ffn.W_up[unit, BD.CARRY + 0] = -S * 2.0
+                    ffn.b_up[unit] = -S * 2.5
+                else:
+                    ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
+                    ffn.b_up[unit] = -S * 4.5
+                ffn.W_gate[unit, BD.OP_SUB] = 1.0
+                ffn.W_down[BD.CARRY + 2, unit] = 2.0 / (S * 5.0)
+                unit += 1
+
     return unit
+
+
+def _set_layer10_carry_relay(attn, S, BD, HD):
+    """L10 attention head 0: relay CARRY[1/2] from AX marker to AX byte positions.
+
+    At AX byte positions (IS_BYTE=1, H1[AX]=1), attends strongly to the
+    nearest AX marker and copies CARRY[1] (ADD byte carry) and CARRY[2]
+    (SUB byte borrow). Anti-leakage gate via H1[AX_IDX] ensures non-AX
+    bytes get negligible attention to the AX marker.
+    """
+    L = S  # attention scale
+    AX_IDX = 1  # AX is register index 1 (PC=0, AX=1, SP=2, ...)
+    base = 0  # head 0
+
+    # Q: fires at byte positions, suppressed at markers
+    attn.W_q[base + 0, BD.IS_BYTE] = L
+    attn.W_q[base + 0, BD.CONST] = -L / 2  # Q[0] = L*(IS_BYTE - 0.5)
+
+    # K: fires at AX marker positions
+    attn.W_k[base + 0, BD.MARK_AX] = L
+
+    # Anti-leakage: restrict to AX byte positions (H1[AX_IDX] ≈ 1)
+    attn.W_q[base + 33, BD.H1 + AX_IDX] = L
+    attn.W_q[base + 33, BD.CONST] = -L / 2
+    attn.W_k[base + 33, BD.CONST] = L
+
+    # V: copy CARRY[1] and CARRY[2] from marker
+    attn.W_v[base + 1, BD.CARRY + 1] = 1.0
+    attn.W_v[base + 2, BD.CARRY + 2] = 1.0
+
+    # O: write to CARRY[1] and CARRY[2] at byte position
+    attn.W_o[BD.CARRY + 1, base + 1] = 1.0
+    attn.W_o[BD.CARRY + 2, base + 2] = 1.0
 
 
 def _set_layer10_alu(ffn, S, BD):
@@ -2937,6 +3021,30 @@ def _set_layer10_alu(ffn, S, BD):
         ffn.b_up[unit] = -S * 0.5
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+        unit += 1
+
+    # --- Inter-byte carry/borrow override at AX byte positions (4 units) ---
+    # CARRY[1/2] relayed from AX marker by L10 attention head 0.
+    # At AX byte positions: override OUTPUT to propagate carry result.
+    AX_IDX = 1  # H1[AX_IDX] identifies AX byte positions
+
+    # SUB borrow → all AX bytes = 0xFF: 2-way AND (CARRY[2] + IS_BYTE)
+    for out_dim in [BD.OUTPUT_LO + 15, BD.OUTPUT_HI + 15]:
+        ffn.W_up[unit, BD.CARRY + 2] = S
+        ffn.W_up[unit, BD.IS_BYTE] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.W_gate[unit, BD.H1 + AX_IDX] = 1.0  # AX bytes only
+        ffn.W_down[out_dim, unit] = 10.0 / S  # ≈ 5.0 output
+        unit += 1
+
+    # ADD carry → AX byte 0 only = 0x01: 3-way AND (CARRY[1] + IS_BYTE + BYTE_INDEX_0)
+    for out_dim in [BD.OUTPUT_LO + 1, BD.OUTPUT_HI + 0]:
+        ffn.W_up[unit, BD.CARRY + 1] = S
+        ffn.W_up[unit, BD.IS_BYTE] = S
+        ffn.W_up[unit, BD.BYTE_INDEX_0] = S
+        ffn.b_up[unit] = -S * 2.5
+        ffn.W_gate[unit, BD.H1 + AX_IDX] = 1.0
+        ffn.W_down[out_dim, unit] = 10.0 / S
         unit += 1
 
     return unit

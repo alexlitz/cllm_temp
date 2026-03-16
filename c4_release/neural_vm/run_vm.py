@@ -240,6 +240,7 @@ class AutoregressiveVMRunner:
         self._last_bp = 0
         self._last_sp = 0
         self._mem_history = {}  # addr → 9-token MEM section (latest wins)
+        self.model._mem_history_end = 0  # reset stale boundary from prior runs
         self._pure_attention_report = {
             "enabled": bool(self.pure_attention_memory),
             "blocked_vm_memory_ops": {},
@@ -355,6 +356,18 @@ class AutoregressiveVMRunner:
                 if ax is not None:
                     if op in (Opcode.LI, Opcode.LC):
                         # L15 produces correct output for all bytes. Trust transformer.
+                        # DEBUG: trace LI/LC AX output
+                        import os
+                        if os.environ.get('DEBUG_LI'):
+                            mem_addr, mem_val = self._extract_mem_write(context)
+                            ma = f"{mem_addr:#010x}" if mem_addr is not None else "None"
+                            mv = f"{mem_val:#010x}" if mem_val is not None else "None"
+                            print(f"DEBUG {_OPCODE_NAME.get(op)}: model AX={ax:#010x}"
+                                  f" bytes=[{ax&0xFF:#04x},{(ax>>8)&0xFF:#04x},{(ax>>16)&0xFF:#04x},{(ax>>24)&0xFF:#04x}]"
+                                  f" mem_end={self.model._mem_history_end}"
+                                  f" hist_keys={[hex(k) for k in self._mem_history.keys()]}"
+                                  f" mem_addr={ma} mem_val={mv}"
+                                  f" _last_ax={self._last_ax:#010x}", flush=True)
                         self._last_ax = ax
                     else:
                         # Normal merge: byte 0 from weights, bytes 1-3 from _last_ax

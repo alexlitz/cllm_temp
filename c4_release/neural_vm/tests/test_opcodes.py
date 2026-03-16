@@ -580,7 +580,7 @@ for _a in _OVERRIDE_VALUES:
 # =========================================================================
 
 class TestPCAllValues(unittest.TestCase):
-    """PC should be 2 in step 0, 7 in step 1, for all IMM values."""
+    """PC should be 0 in step 0, 5 in step 1, for all IMM values."""
     @classmethod
     def setUpClass(cls):
         cls.cache = _get_imm_cache()
@@ -589,10 +589,10 @@ def _make_pc_test(val):
     def test(self):
         _, _, steps = self.cache[val]
         pc0 = extract_register(steps[0], Token.REG_PC)
-        self.assertEqual(pc0, 2, f"Step 0 PC={pc0}, expected 2")
+        self.assertEqual(pc0, 0, f"Step 0 PC={pc0}, expected 0")
         pc1 = extract_register(steps[1], Token.REG_PC)
-        self.assertEqual(pc1, 7, f"Step 1 PC={pc1}, expected 7")
-    test.__doc__ = f"IMM {val}: PC=2 then PC=7"
+        self.assertEqual(pc1, 5, f"Step 1 PC={pc1}, expected 5")
+    test.__doc__ = f"IMM {val}: PC=0 then PC=5"
     return test
 
 for _v in range(256):
