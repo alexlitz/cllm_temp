@@ -162,7 +162,9 @@ class UltraBatchRunner:
         # Batch validation - ONE forward pass for all programs
         try:
             # Use the model's batch verification
-            accepted_batch = self.model.verify_speculative_batch(padded_contexts, draft_lens)
+            # Pass actual context lengths (before draft) to handle padding correctly
+            context_lens = [len(ctx) for ctx in self.contexts]
+            accepted_batch = self.model.verify_speculative_batch(padded_contexts, draft_lens, context_lens=context_lens)
         except Exception as e:
             if self.strict:
                 raise AssertionError(f"Transformer forward pass failed during strict validation: {e}")

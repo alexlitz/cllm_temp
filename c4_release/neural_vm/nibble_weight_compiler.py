@@ -91,15 +91,17 @@ class NibbleWeightEmitter:
     - Opcode one-hot for operation selection
     """
 
-    def __init__(self, opcode: int, num_positions: int = 8):
+    def __init__(self, opcode: int, num_positions: int = 8, unit_offset: int = 0):
         """Initialize nibble weight emitter.
 
         Args:
             opcode: C4 opcode for operation gating (from Opcode class)
             num_positions: Number of nibble positions (default 8 for 32-bit)
+            unit_offset: Hidden unit offset for this opcode (for non-overlapping allocation)
         """
         self.opcode = opcode
         self.num_positions = num_positions
+        self.unit_offset_base = unit_offset  # Base offset for this opcode
         self.reg_map = NibbleRegisterMap()
 
         # Flattened dimension: num_positions × DIM
@@ -114,7 +116,7 @@ class NibbleWeightEmitter:
         self.W_down = torch.zeros(self.dim, self.hidden_dim)
         self.b_down = torch.zeros(self.dim)
 
-        self.unit_offset = 0  # Current hidden unit index
+        self.unit_offset = self.unit_offset_base  # Current hidden unit index (starts at base)
 
     def _fi(self, position: int, slot: int) -> int:
         """Flat index helper."""
@@ -952,19 +954,20 @@ class NibbleWeightCompiler:
         self.num_positions = num_positions
         self.reg_map = NibbleRegisterMap()
 
-    def compile_operation(self, op_type: OpType, opcode: int) -> Dict[str, torch.Tensor]:
+    def compile_operation(self, op_type: OpType, opcode: int, unit_offset: int = 0) -> Dict[str, torch.Tensor]:
         """Compile a single operation to nibble-based FFN weights.
 
         Args:
             op_type: Operation type from graph_weight_compiler.OpType
             opcode: C4 opcode for gating (from embedding.Opcode)
+            unit_offset: Hidden unit offset for non-overlapping allocation
 
         Returns:
             Dictionary of weight matrices compatible with PureFFN
         """
         from .embedding import E
 
-        emitter = NibbleWeightEmitter(opcode, self.num_positions)
+        emitter = NibbleWeightEmitter(opcode, self.num_positions, unit_offset=unit_offset)
 
         # Emit operation for all nibble positions
         for pos in range(self.num_positions):

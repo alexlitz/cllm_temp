@@ -962,12 +962,13 @@ class AutoregressiveVM(nn.Module):
         return accepted
 
     @torch.no_grad()
-    def verify_speculative_batch(self, contexts_with_draft, draft_lens, kv_cache=None):
+    def verify_speculative_batch(self, contexts_with_draft, draft_lens, context_lens=None, kv_cache=None):
         """Batched speculative verification.
 
         Args:
-            contexts_with_draft: list of (context + draft_tokens) lists, all same length
+            contexts_with_draft: list of (context + draft_tokens) lists, all same length (may be padded)
             draft_lens: list of int, number of draft tokens per sequence
+            context_lens: Optional list of int, actual context lengths (before draft). If None, calculated from lengths.
             kv_cache: Optional LayerKVCache for incremental decoding with eviction
 
         Returns:
@@ -980,7 +981,12 @@ class AutoregressiveVM(nn.Module):
 
         results = []
         for b in range(len(contexts_with_draft)):
-            ctx_len = len(contexts_with_draft[b]) - draft_lens[b]
+            # Use actual context length if provided, otherwise calculate from padded length
+            if context_lens is not None:
+                ctx_len = context_lens[b]
+            else:
+                ctx_len = len(contexts_with_draft[b]) - draft_lens[b]
+
             accepted = 0
             for i in range(draft_lens[b]):
                 pred = logits[b, ctx_len - 1 + i, :].argmax(-1).item()
@@ -1854,9 +1860,10 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     for k in range(16):
         # Up: fires at byte positions, suppressed at PC/SP/BP
         ffn.W_up[unit, BD.IS_BYTE] = S
-        ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress at PC
-        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP
-        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP
+        ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress at PC (always)
+        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP on step 0
+        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP on step 0
+        ffn.W_up[unit, BD.HAS_SE] = S  # Cancel SP/BP suppression on step 1+
         ffn.b_up[unit] = -S * 0.5
         # Gate: copy this specific nibble value
         ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
@@ -1866,9 +1873,10 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     # HI nibbles: same logic
     for k in range(16):
         ffn.W_up[unit, BD.IS_BYTE] = S
-        ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress at PC
-        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP
-        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP
+        ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress at PC (always)
+        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP on step 0
+        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP on step 0
+        ffn.W_up[unit, BD.HAS_SE] = S  # Cancel SP/BP suppression on step 1+
         ffn.b_up[unit] = -S * 0.5
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -2670,11 +2678,11 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # At SP marker, when PSH: cancel identity carry, write new value.
     # CMP[0] ≈ 1.0 (relayed OP_PSH from L6 attn head 6).
     # Threshold 1.5: CMP[0](1) + MARK_SP(1) = 2 > 1.5 → fires.
-    # DISABLED: CMP[0] has JMP leakage causing false activations (see PSH STACK0 comment)
-    T_psh = 100.0  # DISABLED: was 1.5
+    # Use strong negative weight on CMP[0] in up to suppress JMP leakage
+    T_psh = 1.5  # Re-enabled with CMP[0] suppression
     for k in range(16):
         new_k = (k - 8) % 16
-        ffn.W_up[unit, BD.CMP + 0] = S  # relayed OP_PSH
+        ffn.W_up[unit, BD.CMP + 0] = S - 4*S  # +S detect, -4S suppress high values
         ffn.W_up[unit, BD.MARK_SP] = S
         ffn.b_up[unit] = -S * T_psh
         ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
@@ -2684,7 +2692,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # Hi nibble: if old_lo < 8, borrow → hi -= 1
     for k in range(16):
         new_k_borrow = (k - 1) % 16
-        ffn.W_up[unit, BD.CMP + 0] = S  # relayed OP_PSH
+        ffn.W_up[unit, BD.CMP + 0] = S - 4*S  # Net -3S to suppress
         ffn.W_up[unit, BD.MARK_SP] = S
         ffn.b_up[unit] = -S * T_psh
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
@@ -2700,23 +2708,23 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # and write ALU value.
     #
     # IMPORTANT: CMP[0] can have JMP leakage (~5-7). To prevent false activation,
-    # we disable these units for now until IS_BYTE reliability is fixed.
-    # Temporary workaround: Skip PSH STACK0 units by setting impossible threshold.
-    T_psh_s0 = 100.0  # DISABLED: was 1.5, set to 100 to prevent any activation
+    # we add strong negative weight on CMP[0] in up to suppress high values:
+    #   up = CMP[0] + MARK_STACK0 - 5*CMP[0] - threshold
+    #   PSH (CMP[0]~1): up = 1 + 1 - 5 - 1.5 = -4.5, close to threshold
+    #   JMP (CMP[0]~5): up = 5 + 1 - 25 - 1.5 = -20.5, well below threshold
+    T_psh_s0 = 1.5  # Re-enabled with CMP[0] suppression
     for k in range(16):
-        ffn.W_up[unit, BD.CMP + 0] = S  # relayed OP_PSH
+        ffn.W_up[unit, BD.CMP + 0] = S - 4*S  # +S for detection, -4S for suppression
         ffn.W_up[unit, BD.MARK_STACK0] = S
-        # ffn.W_up[unit, BD.IS_BYTE] = -S  # NOT IS_BYTE (doesn't work, IS_BYTE cleared)
         ffn.b_up[unit] = -S * T_psh_s0
-        # Gate: cancel identity (EMBED_LO) and write AX (ALU_LO from relay)
+        # Gate: data routing only (EMBED vs ALU)
         ffn.W_gate[unit, BD.EMBED_LO + k] = -1.0
         ffn.W_gate[unit, BD.ALU_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
-        ffn.W_up[unit, BD.CMP + 0] = S  # relayed OP_PSH
+        ffn.W_up[unit, BD.CMP + 0] = S - 4*S  # Net -3S to suppress high values
         ffn.W_up[unit, BD.MARK_STACK0] = S
-        # ffn.W_up[unit, BD.IS_BYTE] = -S  # NOT IS_BYTE (doesn't work)
         ffn.b_up[unit] = -S * T_psh_s0
         ffn.W_gate[unit, BD.EMBED_HI + k] = -1.0
         ffn.W_gate[unit, BD.ALU_HI + k] = 1.0

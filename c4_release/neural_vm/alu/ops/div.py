@@ -227,6 +227,103 @@ class FloorExtractionFFN(nn.Module):
         return y64.to(orig_dtype)
 
 
+class FloorExtractionFP32FFN(nn.Module):
+    """Extract floor(Q/base^j) for j=0..N-1 via window detection - FP32 SAFE.
+
+    For each position j and nibble value k=0..base-1:
+      Detect if floor(Q/base^j) == k using step pairs
+      Output k to RESULT[j] when detected
+
+    RESULT[j] = sum_{k=0}^{base-1} k * step(floor(Q/base^j) == k)
+
+    Hidden units: N * base * 4 (step pairs) + 2*N (clear RESULT).
+    Works with fp32 - no IEEE 754 rounding tricks needed.
+    """
+
+    def __init__(self, ge: GenericE, opcode: int):
+        super().__init__()
+        N = ge.NUM_POSITIONS
+        base = ge.BASE
+        S = ge.SCALE
+        dtype = ge.config.torch_dtype
+
+        # 4 units per (position, nibble_value) + 2*N for clearing
+        hidden_dim = N * base * 4 + 2 * N
+
+        self.flat_ffn = GenericFlattenedFFN(ge, hidden_dim=hidden_dim, dtype=dtype)
+        fi = self.flat_ffn._flat_idx
+
+        eps = 0.001  # Small shift to avoid exact integer boundaries
+
+        with torch.no_grad():
+            W_up = self.flat_ffn.W_up
+            b_up = self.flat_ffn.b_up
+            W_gate = self.flat_ffn.W_gate
+            W_down = self.flat_ffn.W_down
+
+            opcode_idx = fi(0, ge.OP_START + opcode)
+            q_float_idx = fi(0, ge.SLOT_REMAINDER)
+
+            h = 0
+
+            # Floor extraction via window detection
+            for j in range(N):
+                scale_j = 1.0 / float(base ** j)
+                result_j_idx = fi(j, ge.RESULT)
+
+                for k in range(base):
+                    # Detect: floor(Q/base^j) == k
+                    # Equivalently: Q/base^j is in [k, k+1)
+                    # Step pair for step(Q*scale_j >= k-eps) - step(Q*scale_j >= k+1-eps)
+                    # Output: k when detected
+
+                    threshold_lo = k - eps
+                    threshold_hi = k + 1 - eps
+
+                    # Step pair for step(scaled_Q >= threshold_lo)
+                    W_up[h, q_float_idx] = S * scale_j
+                    b_up[h] = -S * (threshold_lo - 0.5)
+                    W_gate[h, opcode_idx] = 1.0
+                    W_down[result_j_idx, h] = float(k) / S
+                    h += 1
+
+                    W_up[h, q_float_idx] = S * scale_j
+                    b_up[h] = -S * (threshold_lo + 0.5)
+                    W_gate[h, opcode_idx] = 1.0
+                    W_down[result_j_idx, h] = -float(k) / S
+                    h += 1
+
+                    # Step pair for step(scaled_Q >= threshold_hi) - subtract
+                    W_up[h, q_float_idx] = S * scale_j
+                    b_up[h] = -S * (threshold_hi - 0.5)
+                    W_gate[h, opcode_idx] = 1.0
+                    W_down[result_j_idx, h] = -float(k) / S
+                    h += 1
+
+                    W_up[h, q_float_idx] = S * scale_j
+                    b_up[h] = -S * (threshold_hi + 0.5)
+                    W_gate[h, opcode_idx] = 1.0
+                    W_down[result_j_idx, h] = float(k) / S
+                    h += 1
+
+            # Clear old RESULT values
+            for pos in range(N):
+                result_pos_idx = fi(pos, ge.RESULT)
+
+                W_up[h, opcode_idx] = S
+                W_gate[h, result_pos_idx] = -1.0
+                W_down[result_pos_idx, h] = 1.0 / S
+                h += 1
+
+                W_up[h, opcode_idx] = -S
+                W_gate[h, result_pos_idx] = 1.0
+                W_down[result_pos_idx, h] = 1.0 / S
+                h += 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.flat_ffn(x)
+
+
 class ChunkSubtractFFN(nn.Module):
     """Convert floor values to chunk digits: RESULT[j] -= base * RESULT[j+1].
 
@@ -289,18 +386,37 @@ class DivMergedLayer1(nn.Module):
         return x + d1 + d2 + d3
 
 
-def build_div_layers(config: ChunkConfig, opcode: int) -> nn.ModuleList:
+def build_div_layers(config: ChunkConfig, opcode: int, fp32_floor: bool = False) -> nn.ModuleList:
     """Build 4-layer DIV pipeline for the given chunk config.
 
-    Works at all chunk sizes. Floor extraction uses fp64 MAGIC trick
-    internally regardless of config precision.
+    Args:
+        config: Chunk configuration
+        opcode: DIV opcode number
+        fp32_floor: If True, use fp32-safe floor extraction (more params but no fp64).
+                   If False (default), use MAGIC fp64 trick (fewer params but requires fp64).
+
+    Works at all chunk sizes.
     """
     ge = GenericE(config)
+
+    if fp32_floor:
+        floor_layer = FloorExtractionFP32FFN(ge, opcode)
+    else:
+        floor_layer = FloorExtractionFFN(ge, opcode)
+
     layers = [
         DivMergedLayer1(ge, opcode),
         MultiplyReciprocalFFN(ge, opcode),
-        FloorExtractionFFN(ge, opcode),
+        floor_layer,
     ]
     if config.num_positions > 1:
         layers.append(ChunkSubtractFFN(ge, opcode))
     return nn.ModuleList(layers)
+
+
+def build_div_layers_fp32(config: ChunkConfig, opcode: int) -> nn.ModuleList:
+    """Build DIV pipeline using fp32-safe floor extraction.
+
+    Convenience wrapper for build_div_layers with fp32_floor=True.
+    """
+    return build_div_layers(config, opcode, fp32_floor=True)

@@ -167,13 +167,14 @@ class OpcodeNibbleCompiler:
         support, _ = _NIBBLE_OPCODE_SUPPORT[opcode]
         return support
 
-    def compile_opcode(self, opcode: int) -> Dict[str, torch.Tensor]:
+    def compile_opcode(self, opcode: int, unit_offset: int = 0) -> Dict[str, torch.Tensor]:
         """Compile C4 opcode to nibble-based FFN weights.
 
         Handles both single-operation and multi-operation graphs.
 
         Args:
             opcode: C4 opcode to compile (from Opcode class)
+            unit_offset: Hidden unit offset for non-overlapping allocation
 
         Returns:
             Dictionary of weight matrices for PureFFN:
@@ -219,13 +220,13 @@ class OpcodeNibbleCompiler:
 
             if len(ops) == 1 and ops[0].op in [GOpType.ADD, GOpType.SUB, GOpType.MOVE]:
                 # Single operation - use existing compiler
-                return self.nibble_compiler.compile_operation(ops[0].op, opcode)
+                return self.nibble_compiler.compile_operation(ops[0].op, opcode, unit_offset=unit_offset)
             else:
                 # Multi-operation - use new compiler
-                return self.multi_op_compiler.compile_graph(graph, opcode)
+                return self.multi_op_compiler.compile_graph(graph, opcode, unit_offset=unit_offset)
         else:
             # Single operation - use existing compiler
-            return self.nibble_compiler.compile_operation(op_type, opcode)
+            return self.nibble_compiler.compile_operation(op_type, opcode, unit_offset=unit_offset)
 
     def compile_multilayer_opcode(self, opcode: int) -> Dict[int, Dict[str, torch.Tensor]]:
         """Compile C4 opcode that requires multiple layers (FFN + Attention).

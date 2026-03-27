@@ -125,15 +125,21 @@ class MultiOperationCompiler:
     def compile_graph(
         self,
         graph: ComputationGraph,
-        opcode: int
+        opcode: int,
+        unit_offset: int = 0
     ) -> Dict[str, torch.Tensor]:
         """
         Compile multi-operation graph to FFN weights.
 
+        Args:
+            graph: Computation graph to compile
+            opcode: C4 opcode
+            unit_offset: Hidden unit offset for non-overlapping allocation
+
         Returns: Weight dictionary compatible with PureFFN
         """
-        # Create weight emitter
-        emitter = NibbleWeightEmitter(opcode, self.num_positions)
+        # Create weight emitter with offset
+        emitter = NibbleWeightEmitter(opcode, self.num_positions, unit_offset=unit_offset)
 
         # Sort operations by dependencies
         sorted_nodes = topological_sort(graph)

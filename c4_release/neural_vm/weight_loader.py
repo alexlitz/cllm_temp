@@ -51,10 +51,84 @@ class OpcodeLayerMapping:
 
 class CompiledWeightLoader:
     """Load all compiled opcode weights into AutoregressiveVM."""
-    
+
     def __init__(self):
         self.compiler = OpcodeNibbleCompiler()
         self.layer_map = OpcodeLayerMapping()
+        self.unit_allocations = self._calculate_unit_allocation()
+
+    def _calculate_unit_allocation(self) -> Dict[int, int]:
+        """Calculate non-overlapping hidden unit ranges for each opcode.
+
+        Returns:
+            Dictionary mapping opcode -> unit_offset
+
+        Strategy:
+            - Most ALU ops need ~64 units (8 positions × 8 units/pos)
+            - MUL/DIV may need more units (~128)
+            - Allocate sequentially to avoid collisions
+        """
+        allocations = {}
+        current_offset = 0
+
+        # Arithmetic operations (64 units each)
+        for op in [Opcode.ADD, Opcode.SUB]:
+            allocations[op] = current_offset
+            current_offset += 64
+
+        # Multiply needs more units (128)
+        allocations[Opcode.MUL] = current_offset
+        current_offset += 128
+
+        # Division operations (128 units)
+        for op in [Opcode.DIV, Opcode.MOD]:
+            allocations[op] = current_offset
+            current_offset += 128
+
+        # Comparison operations (64 units each)
+        for op in [Opcode.EQ, Opcode.NE, Opcode.LT, Opcode.GT, Opcode.LE, Opcode.GE]:
+            allocations[op] = current_offset
+            current_offset += 64
+
+        # Bitwise operations (64 units each)
+        for op in [Opcode.OR, Opcode.XOR, Opcode.AND]:
+            allocations[op] = current_offset
+            current_offset += 64
+
+        # Shift operations (96 units each for complexity)
+        for op in [Opcode.SHL, Opcode.SHR]:
+            allocations[op] = current_offset
+            current_offset += 96
+
+        # Register operations (64 units each)
+        for op in [Opcode.LEA, Opcode.IMM]:
+            allocations[op] = current_offset
+            current_offset += 64
+
+        # Control flow (64 units each)
+        for op in [Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.ADJ]:
+            allocations[op] = current_offset
+            current_offset += 64
+
+        # Heap management (64 units each)
+        for op in [Opcode.MALC, Opcode.FREE]:
+            allocations[op] = current_offset
+            current_offset += 64
+
+        # Multi-layer ops (64 units each for setup/result layers)
+        for op in [Opcode.LI, Opcode.LC, Opcode.SI, Opcode.SC,
+                   Opcode.PSH, Opcode.JSR, Opcode.ENT, Opcode.LEV]:
+            allocations[op] = current_offset
+            current_offset += 64
+
+        # Verify we haven't exceeded available units
+        if current_offset > 4096:
+            raise ValueError(
+                f"Unit allocation exceeds available units: {current_offset} > 4096. "
+                f"Need to reduce per-opcode allocation or increase ffn_hidden."
+            )
+
+        return allocations
         
     def load_all_weights(self, vm, verbose: bool = True):
         """Load all 32 compilable opcode weights into VM.
@@ -111,7 +185,8 @@ class CompiledWeightLoader:
         
         for opcode, name in single_ops:
             try:
-                weights = self.compiler.compile_opcode(opcode)
+                unit_offset = self.unit_allocations.get(opcode, 0)
+                weights = self.compiler.compile_opcode(opcode, unit_offset=unit_offset)
                 self._load_into_layer(vm, self.layer_map.PRIMARY_ALU, weights, name, verbose)
                 stats['single_op_loaded'] += 1
                 stats['total_params'] += sum((w.abs() > 1e-9).sum().item() for w in weights.values())
@@ -138,7 +213,8 @@ class CompiledWeightLoader:
         
         for opcode, name in multi_ops:
             try:
-                weights = self.compiler.compile_opcode(opcode)
+                unit_offset = self.unit_allocations.get(opcode, 0)
+                weights = self.compiler.compile_opcode(opcode, unit_offset=unit_offset)
                 self._load_into_layer(vm, self.layer_map.CONTROL_FLOW, weights, name, verbose)
                 stats['multi_op_loaded'] += 1
                 stats['total_params'] += sum((w.abs() > 1e-9).sum().item() for w in weights.values())
@@ -216,7 +292,8 @@ class CompiledWeightLoader:
         """Load weights into a specific FFN layer.
 
         Weights are accumulated (added) rather than replaced, since each opcode
-        uses different hidden units (selected by opcode gating in W_gate).
+        uses non-overlapping hidden unit ranges (assigned via unit_offset during compilation).
+        Opcode gating in W_gate further ensures only the correct units activate per opcode.
         """
         layer = vm.blocks[layer_idx].ffn
 
