@@ -55,6 +55,8 @@ def bake_onehot_decode(ffn, unit, input_base, output_dim, opcode_dims, S):
     """
     for k in range(16):
         # Detect input_base[k] == 1, output k to output_dim
+        # When input = 1.0: up = silu(S*1 - S*0.5) = silu(0.5*S) ≈ 0.5*S
+        # gate = k, hidden = 0.5*S*k, output = 0.5*S*k * (2/S) = k
         ffn.W_up.data[unit, input_base + k] = S
         ffn.b_up.data[unit] = -S * 0.5  # Threshold at 0.5
 
@@ -62,7 +64,7 @@ def bake_onehot_decode(ffn, unit, input_base, output_dim, opcode_dims, S):
         for op_dim in opcode_dims:
             ffn.W_gate.data[unit, op_dim] = float(k)
 
-        ffn.W_down.data[output_dim, unit] = 1.0 / S
+        ffn.W_down.data[output_dim, unit] = 2.0 / S  # 2x to compensate for silu(0.5*S)
         unit += 1
 
     return unit

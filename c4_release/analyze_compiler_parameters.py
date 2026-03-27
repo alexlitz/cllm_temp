@@ -23,14 +23,16 @@ def analyze_operation(op_type, num_inputs, base=None, description=""):
     """Analyze parameter count and sparsity for an operation."""
 
     # Determine dimensions
-    is_onehot = op_type in [OpType.MUL, OpType.DIV, OpType.MOD]
+    is_onehot = op_type in [OpType.MUL, OpType.DIV, OpType.MOD, OpType.BIT_AND, OpType.BIT_OR, OpType.BIT_XOR, OpType.SHL, OpType.SHR]
 
     if is_onehot:
         base = base or 16
         dim = (num_inputs + 1) * base  # inputs + output
-        if op_type == OpType.MUL:
+        # MUL and bitwise ops use all base*base combinations
+        # DIV and MOD exclude division/mod by zero
+        if op_type in [OpType.MUL, OpType.BIT_AND, OpType.BIT_OR, OpType.BIT_XOR, OpType.SHL, OpType.SHR]:
             hidden_dim = 2 * base * base  # 512 for base=16
-        else:
+        else:  # DIV, MOD
             hidden_dim = 2 * base * (base - 1)  # 480 for base=16
     else:
         dim = num_inputs + 1  # inputs + output
@@ -85,6 +87,16 @@ def analyze_operation(op_type, num_inputs, base=None, description=""):
             emitter.emit_div(op_node, graph)
         elif op_type == OpType.MOD:
             emitter.emit_mod(op_node, graph)
+        elif op_type == OpType.BIT_AND:
+            emitter.emit_bit_and(op_node, graph)
+        elif op_type == OpType.BIT_OR:
+            emitter.emit_bit_or(op_node, graph)
+        elif op_type == OpType.BIT_XOR:
+            emitter.emit_bit_xor(op_node, graph)
+        elif op_type == OpType.SHL:
+            emitter.emit_shl(op_node, graph)
+        elif op_type == OpType.SHR:
+            emitter.emit_shr(op_node, graph)
     else:
         emitter.emit_graph(graph)
 
@@ -162,6 +174,13 @@ def main():
         (OpType.MUL, 2, 16, "MUL (one-hot, base=16)"),
         (OpType.DIV, 2, 16, "DIV (one-hot, base=16)"),
         (OpType.MOD, 2, 16, "MOD (one-hot, base=16)"),
+
+        # Bitwise (one-hot)
+        (OpType.BIT_AND, 2, 16, "BIT_AND (one-hot, base=16)"),
+        (OpType.BIT_OR, 2, 16, "BIT_OR (one-hot, base=16)"),
+        (OpType.BIT_XOR, 2, 16, "BIT_XOR (one-hot, base=16)"),
+        (OpType.SHL, 2, 16, "SHL (one-hot, base=16)"),
+        (OpType.SHR, 2, 16, "SHR (one-hot, base=16)"),
     ]
 
     results = []
@@ -186,7 +205,17 @@ def main():
     print(f"{'Operation':<25} {'Units':<8} {'Non-Zero':<12} {'Total':<12} {'Sparsity':<10}")
     print("-" * 80)
 
-    for r in results[16:]:  # One-hot ops
+    for r in results[16:19]:  # One-hot ops: MUL, DIV, MOD
+        print(f"{r['operation']:<25} {r['units_used']:<8} {r['nonzero']:<12,} {r['total_params']:<12,} {r['sparsity']:>8.2f}%")
+
+    print()
+    print("=" * 80)
+    print("BITWISE OPERATIONS (Nibbles, base=16)")
+    print("=" * 80)
+    print(f"{'Operation':<25} {'Units':<8} {'Non-Zero':<12} {'Total':<12} {'Sparsity':<10}")
+    print("-" * 80)
+
+    for r in results[19:]:  # Bitwise ops: BIT_AND, BIT_OR, BIT_XOR, SHL, SHR
         print(f"{r['operation']:<25} {r['units_used']:<8} {r['nonzero']:<12,} {r['total_params']:<12,} {r['sparsity']:>8.2f}%")
 
     # Summary statistics
@@ -212,7 +241,8 @@ def main():
     logical_ops = results[8:12]
     register_ops = results[12:14]
     conditional_ops = results[14:16]
-    onehot_ops = results[16:]
+    onehot_ops = results[16:19]
+    bitwise_ops = results[19:]
 
     categories = [
         ("Arithmetic (Scalar)", scalar_ops),
@@ -221,6 +251,7 @@ def main():
         ("Register", register_ops),
         ("Conditional", conditional_ops),
         ("One-Hot (Nibbles)", onehot_ops),
+        ("Bitwise (Nibbles)", bitwise_ops),
     ]
 
     print("BREAKDOWN BY CATEGORY:")

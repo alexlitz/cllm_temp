@@ -86,9 +86,6 @@ class UltraBatchRunner:
         """
         n_programs = len(bytecodes)
 
-        if n_programs > self.batch_size:
-            raise ValueError(f"Too many programs: {n_programs} > batch_size {self.batch_size}")
-
         # Initialize DraftVMs and contexts
         self.draft_vms = [DraftVM(bc) for bc in bytecodes]
         # Create default data/argv lists if not provided
