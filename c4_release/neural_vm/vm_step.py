@@ -504,8 +504,11 @@ class DivModModule(nn.Module):
     def _forward_lookup(self, x):
         """Pure FFN forward: SwiGLU with residual.
 
-        The 6-way AND (MARK_AX + operands + opcode) should prevent activation
-        at non-AX positions. Multiplicative gating disabled for debugging.
+        Gate OUTPUT dimensions by MARK_AX to prevent DivMod from overwriting
+        OUTPUT at non-AX positions (e.g., PC marker on first step).
+
+        The 6-way AND provides first line of defense, but isn't perfect due to
+        continuous ALU values. Selective OUTPUT gating ensures correctness.
         """
         BD = _SetDim
         up = F.linear(x, self.W_up, self.b_up)
@@ -513,9 +516,14 @@ class DivModModule(nn.Module):
         hidden = F.silu(up) * gate
         delta = F.linear(hidden, self.W_down)
 
-        # TEMPORARY: Disable multiplicative gate to debug token 21 issue
-        # mark_ax_gate = x[..., BD.MARK_AX:BD.MARK_AX+1]  # (B, S, 1)
-        # delta = delta * mark_ax_gate  # Broadcast multiplication
+        # Gate ONLY OUTPUT dimensions (not entire delta) by MARK_AX
+        # This prevents DivMod from writing to OUTPUT at PC/SP/BP markers
+        # DivMod only writes to OUTPUT_LO[0:16] and OUTPUT_HI[0:16]
+        mark_ax_gate = x[..., BD.MARK_AX:BD.MARK_AX+1]  # (B, S, 1)
+
+        # Apply gate selectively to OUTPUT dimensions only
+        delta[..., BD.OUTPUT_LO:BD.OUTPUT_LO+16] *= mark_ax_gate
+        delta[..., BD.OUTPUT_HI:BD.OUTPUT_HI+16] *= mark_ax_gate
 
         return x + delta
 
