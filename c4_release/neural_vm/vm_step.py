@@ -905,7 +905,9 @@ class AutoregressiveVM(nn.Module):
         Returns:
             list of int: accepted token count per sequence
         """
-        token_ids = torch.tensor(contexts_with_draft, dtype=torch.long)
+        # Get device from model parameters
+        device = next(self.parameters()).device
+        token_ids = torch.tensor(contexts_with_draft, dtype=torch.long, device=device)
         logits = self.forward(token_ids, kv_cache=kv_cache)  # [B, S, vocab]
 
         results = []

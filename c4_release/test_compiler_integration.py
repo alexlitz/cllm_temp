@@ -31,13 +31,18 @@ def test_operation(op_type, inputs, expected, description, base=None):
     """
     try:
         # Determine if this is a one-hot operation
-        is_onehot = op_type in [OpType.MUL, OpType.DIV, OpType.MOD]
+        is_onehot = op_type in [OpType.MUL, OpType.DIV, OpType.MOD, OpType.BIT_AND, OpType.BIT_OR, OpType.BIT_XOR, OpType.SHL, OpType.SHR]
 
         # Set dimensions
         if is_onehot:
             base = base or 16
             dim = 3 * base  # a, b, result
-            hidden_dim = 2 * base * base if op_type == OpType.MUL else 2 * base * (base - 1)
+            # MUL and bitwise ops use all base*base combinations
+            # DIV and MOD exclude division/mod by zero
+            if op_type in [OpType.MUL, OpType.BIT_AND, OpType.BIT_OR, OpType.BIT_XOR, OpType.SHL, OpType.SHR]:
+                hidden_dim = 2 * base * base
+            else:  # DIV, MOD
+                hidden_dim = 2 * base * (base - 1)
         else:
             dim = len(inputs) + 1  # inputs + output
             hidden_dim = 512  # Plenty for any scalar operation
@@ -87,6 +92,16 @@ def test_operation(op_type, inputs, expected, description, base=None):
                 emitter.emit_div(op_node, graph)
             elif op_type == OpType.MOD:
                 emitter.emit_mod(op_node, graph)
+            elif op_type == OpType.BIT_AND:
+                emitter.emit_bit_and(op_node, graph)
+            elif op_type == OpType.BIT_OR:
+                emitter.emit_bit_or(op_node, graph)
+            elif op_type == OpType.BIT_XOR:
+                emitter.emit_bit_xor(op_node, graph)
+            elif op_type == OpType.SHL:
+                emitter.emit_shl(op_node, graph)
+            elif op_type == OpType.SHR:
+                emitter.emit_shr(op_node, graph)
         else:
             # Scalar operations - emit full graph
             input_node_ids = []
@@ -406,6 +421,50 @@ def run_compiler_tests():
             passing += 1
 
     results["One-Hot (Nibbles)"] = (passing, len(tests))
+
+    # ==========================================================================
+    # Bitwise Operations
+    # ==========================================================================
+
+    print("\n" + "=" * 70)
+    print("BITWISE OPERATIONS (Nibbles)")
+    print("=" * 70)
+
+    tests = [
+        # BIT_AND
+        (OpType.BIT_AND, [0b1100, 0b1010], 0b1000, "BIT_AND(0b1100, 0b1010) = 0b1000"),
+        (OpType.BIT_AND, [0b1111, 0b0000], 0b0000, "BIT_AND(0b1111, 0b0000) = 0b0000"),
+
+        # BIT_OR
+        (OpType.BIT_OR, [0b1100, 0b1010], 0b1110, "BIT_OR(0b1100, 0b1010) = 0b1110"),
+        (OpType.BIT_OR, [0b0101, 0b0110], 0b0111, "BIT_OR(0b0101, 0b0110) = 0b0111"),
+
+        # BIT_XOR
+        (OpType.BIT_XOR, [0b1100, 0b1010], 0b0110, "BIT_XOR(0b1100, 0b1010) = 0b0110"),
+        (OpType.BIT_XOR, [0b1111, 0b1111], 0b0000, "BIT_XOR(0b1111, 0b1111) = 0b0000"),
+
+        # SHL
+        (OpType.SHL, [0b0001, 1], 0b0010, "SHL(0b0001, 1) = 0b0010"),
+        (OpType.SHL, [0b0011, 2], 0b1100, "SHL(0b0011, 2) = 0b1100"),
+        (OpType.SHL, [0b1111, 1], 0b1110, "SHL(0b1111, 1) = 0b1110 (overflow)"),
+
+        # SHR
+        (OpType.SHR, [0b1000, 1], 0b0100, "SHR(0b1000, 1) = 0b0100"),
+        (OpType.SHR, [0b1111, 2], 0b0011, "SHR(0b1111, 2) = 0b0011"),
+        (OpType.SHR, [0b1100, 2], 0b0011, "SHR(0b1100, 2) = 0b0011"),
+    ]
+
+    passing = 0
+    for op_type, inputs, expected, desc in tests:
+        success, result, error = test_operation(op_type, inputs, expected, desc, base=16)
+        status = "✓" if success else "✗"
+        print(f"  {status} {desc}: {result if result is not None else 'ERROR'}")
+        if not success and error:
+            print(f"      {error}")
+        if success:
+            passing += 1
+
+    results["Bitwise (Nibbles)"] = (passing, len(tests))
 
     # ==========================================================================
     # Summary

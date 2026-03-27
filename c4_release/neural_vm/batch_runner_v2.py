@@ -152,10 +152,20 @@ class UltraBatchRunner:
             contexts_with_draft.append(ctx + draft)
             draft_lens.append(35)  # Always 35 tokens per step
 
+        # Pad all contexts to same length for batching
+        max_len = max(len(ctx) for ctx in contexts_with_draft)
+        padded_contexts = []
+        for ctx in contexts_with_draft:
+            if len(ctx) < max_len:
+                padded = ctx + [Token.HALT] * (max_len - len(ctx))
+                padded_contexts.append(padded)
+            else:
+                padded_contexts.append(ctx)
+
         # Batch validation - ONE forward pass for all programs
         try:
             # Use the model's batch verification
-            accepted_batch = self.model.verify_speculative_batch(contexts_with_draft, draft_lens)
+            accepted_batch = self.model.verify_speculative_batch(padded_contexts, draft_lens)
         except Exception as e:
             if self.strict:
                 raise AssertionError(f"Transformer forward pass failed during strict validation: {e}")
@@ -175,7 +185,7 @@ class UltraBatchRunner:
                     draft_token = draft_tokens_batch[i][failed_token_idx]
 
                     # Get predicted token by running single forward pass
-                    token_ids = torch.tensor([ctx_with_draft[:ctx_len + failed_token_idx]], dtype=torch.long)
+                    token_ids = torch.tensor([ctx_with_draft[:ctx_len + failed_token_idx]], dtype=torch.long, device=self.device)
                     logits = self.model.forward(token_ids)
                     predicted = logits[0, -1, :].argmax(-1).item()
 
@@ -259,7 +269,7 @@ def run_batch_ultra(
 
     Args:
         bytecodes: List of bytecode lists
-        batch_size: Maximum batch size
+        batch_size: Maximum batch size (will be chunked if too large)
         device: 'cuda' or 'cpu'
         strict: If True, raise AssertionError when transformer predictions don't match DraftVM
 
@@ -269,5 +279,18 @@ def run_batch_ultra(
     Raises:
         AssertionError: If strict=True and transformer predictions are wrong
     """
-    runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
-    return runner.run_batch(bytecodes)
+    # For large batches, process in chunks to avoid OOM
+    if len(bytecodes) > batch_size:
+        all_results = []
+        for i in range(0, len(bytecodes), batch_size):
+            chunk = bytecodes[i:i+batch_size]
+            runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
+            results = runner.run_batch(chunk)
+            all_results.extend(results)
+            del runner
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+        return all_results
+    else:
+        runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
+        return runner.run_batch(bytecodes)

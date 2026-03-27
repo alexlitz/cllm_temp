@@ -1067,6 +1067,192 @@ class WeightEmitter:
 
         self.unit_offset += 2 * base * (base - 1)  # Exclude modulo by zero
 
+    def emit_bit_and(self, node: IRNode, graph: ComputationGraph):
+        """Emit weights for BIT_AND: out = a & b (bitwise AND).
+
+        Uses lookup table pattern with one cancel-pair per (a,b) pair.
+        """
+        S = self.scale
+        base = node.params.get('base', 16)
+
+        # Get physical registers
+        input_nodes = [graph.nodes[i] for i in node.inputs]
+        a_reg = input_nodes[0].physical_reg
+        b_reg = input_nodes[1].physical_reg
+        out_reg = node.physical_reg
+
+        # Create one cancel-pair per (a, b) pair
+        unit_idx = 0
+        for a in range(base):
+            for b in range(base):
+                unit_pos = self.unit_offset + unit_idx
+                unit_neg = self.unit_offset + unit_idx + 1
+
+                result = a & b  # Bitwise AND
+
+                # Positive unit
+                self.W_up[unit_pos, a_reg + a] = S
+                self.W_gate[unit_pos, b_reg + b] = 1.0
+                self.W_down[out_reg + result, unit_pos] = 1.0 / S
+
+                # Negative unit
+                self.W_up[unit_neg, a_reg + a] = -S
+                self.W_gate[unit_neg, b_reg + b] = -1.0
+                self.W_down[out_reg + result, unit_neg] = 1.0 / S
+
+                unit_idx += 2
+
+        self.unit_offset += 2 * base * base
+
+    def emit_bit_or(self, node: IRNode, graph: ComputationGraph):
+        """Emit weights for BIT_OR: out = a | b (bitwise OR).
+
+        Uses lookup table pattern with one cancel-pair per (a,b) pair.
+        """
+        S = self.scale
+        base = node.params.get('base', 16)
+
+        # Get physical registers
+        input_nodes = [graph.nodes[i] for i in node.inputs]
+        a_reg = input_nodes[0].physical_reg
+        b_reg = input_nodes[1].physical_reg
+        out_reg = node.physical_reg
+
+        # Create one cancel-pair per (a, b) pair
+        unit_idx = 0
+        for a in range(base):
+            for b in range(base):
+                unit_pos = self.unit_offset + unit_idx
+                unit_neg = self.unit_offset + unit_idx + 1
+
+                result = a | b  # Bitwise OR
+
+                # Positive unit
+                self.W_up[unit_pos, a_reg + a] = S
+                self.W_gate[unit_pos, b_reg + b] = 1.0
+                self.W_down[out_reg + result, unit_pos] = 1.0 / S
+
+                # Negative unit
+                self.W_up[unit_neg, a_reg + a] = -S
+                self.W_gate[unit_neg, b_reg + b] = -1.0
+                self.W_down[out_reg + result, unit_neg] = 1.0 / S
+
+                unit_idx += 2
+
+        self.unit_offset += 2 * base * base
+
+    def emit_bit_xor(self, node: IRNode, graph: ComputationGraph):
+        """Emit weights for BIT_XOR: out = a ^ b (bitwise XOR).
+
+        Uses lookup table pattern with one cancel-pair per (a,b) pair.
+        """
+        S = self.scale
+        base = node.params.get('base', 16)
+
+        # Get physical registers
+        input_nodes = [graph.nodes[i] for i in node.inputs]
+        a_reg = input_nodes[0].physical_reg
+        b_reg = input_nodes[1].physical_reg
+        out_reg = node.physical_reg
+
+        # Create one cancel-pair per (a, b) pair
+        unit_idx = 0
+        for a in range(base):
+            for b in range(base):
+                unit_pos = self.unit_offset + unit_idx
+                unit_neg = self.unit_offset + unit_idx + 1
+
+                result = a ^ b  # Bitwise XOR
+
+                # Positive unit
+                self.W_up[unit_pos, a_reg + a] = S
+                self.W_gate[unit_pos, b_reg + b] = 1.0
+                self.W_down[out_reg + result, unit_pos] = 1.0 / S
+
+                # Negative unit
+                self.W_up[unit_neg, a_reg + a] = -S
+                self.W_gate[unit_neg, b_reg + b] = -1.0
+                self.W_down[out_reg + result, unit_neg] = 1.0 / S
+
+                unit_idx += 2
+
+        self.unit_offset += 2 * base * base
+
+    def emit_shl(self, node: IRNode, graph: ComputationGraph):
+        """Emit weights for SHL: out = (a << n) & mask (shift left).
+
+        Uses lookup table pattern with one cancel-pair per (a,n) pair.
+        For 4-bit values, result is masked to 4 bits.
+        """
+        S = self.scale
+        base = node.params.get('base', 16)
+
+        # Get physical registers
+        input_nodes = [graph.nodes[i] for i in node.inputs]
+        a_reg = input_nodes[0].physical_reg
+        n_reg = input_nodes[1].physical_reg
+        out_reg = node.physical_reg
+
+        # Create one cancel-pair per (a, n) pair
+        unit_idx = 0
+        for a in range(base):
+            for n in range(base):
+                unit_pos = self.unit_offset + unit_idx
+                unit_neg = self.unit_offset + unit_idx + 1
+
+                result = (a << n) & (base - 1)  # Shift left and mask to 4 bits
+
+                # Positive unit
+                self.W_up[unit_pos, a_reg + a] = S
+                self.W_gate[unit_pos, n_reg + n] = 1.0
+                self.W_down[out_reg + result, unit_pos] = 1.0 / S
+
+                # Negative unit
+                self.W_up[unit_neg, a_reg + a] = -S
+                self.W_gate[unit_neg, n_reg + n] = -1.0
+                self.W_down[out_reg + result, unit_neg] = 1.0 / S
+
+                unit_idx += 2
+
+        self.unit_offset += 2 * base * base
+
+    def emit_shr(self, node: IRNode, graph: ComputationGraph):
+        """Emit weights for SHR: out = a >> n (shift right).
+
+        Uses lookup table pattern with one cancel-pair per (a,n) pair.
+        """
+        S = self.scale
+        base = node.params.get('base', 16)
+
+        # Get physical registers
+        input_nodes = [graph.nodes[i] for i in node.inputs]
+        a_reg = input_nodes[0].physical_reg
+        n_reg = input_nodes[1].physical_reg
+        out_reg = node.physical_reg
+
+        # Create one cancel-pair per (a, n) pair
+        unit_idx = 0
+        for a in range(base):
+            for n in range(base):
+                unit_pos = self.unit_offset + unit_idx
+                unit_neg = self.unit_offset + unit_idx + 1
+
+                result = a >> n  # Shift right
+
+                # Positive unit
+                self.W_up[unit_pos, a_reg + a] = S
+                self.W_gate[unit_pos, n_reg + n] = 1.0
+                self.W_down[out_reg + result, unit_pos] = 1.0 / S
+
+                # Negative unit
+                self.W_up[unit_neg, a_reg + a] = -S
+                self.W_gate[unit_neg, n_reg + n] = -1.0
+                self.W_down[out_reg + result, unit_neg] = 1.0 / S
+
+                unit_idx += 2
+
+        self.unit_offset += 2 * base * base
+
     def _get_gate_reg(self, gate_vreg: str, graph: ComputationGraph) -> int:
         """Get physical register for gate virtual register."""
         node_id = graph.get_producer(gate_vreg)
@@ -1120,6 +1306,16 @@ class WeightEmitter:
                 self.emit_select(node, graph)
             elif node.op == OpType.IF_THEN:
                 self.emit_if_then(node, graph)
+            elif node.op == OpType.BIT_AND:
+                self.emit_bit_and(node, graph)
+            elif node.op == OpType.BIT_OR:
+                self.emit_bit_or(node, graph)
+            elif node.op == OpType.BIT_XOR:
+                self.emit_bit_xor(node, graph)
+            elif node.op == OpType.SHL:
+                self.emit_shl(node, graph)
+            elif node.op == OpType.SHR:
+                self.emit_shr(node, graph)
             else:
                 raise NotImplementedError(f"Op {node.op} not implemented")
 

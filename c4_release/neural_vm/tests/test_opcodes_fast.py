@@ -67,7 +67,8 @@ def _get_imm_cache():
     global _imm_cache
     if _imm_cache is None:
         bytecodes = [[Opcode.IMM | (v << 8), Opcode.EXIT] for v in range(256)]
-        _imm_cache = run_programs_batch_ultra(bytecodes, batch_size=256)
+        # Use smaller batch size to avoid OOM with strict mode
+        _imm_cache = run_programs_batch_ultra(bytecodes, batch_size=32)
     return _imm_cache
 
 
@@ -82,7 +83,8 @@ def _get_mul_cache():
             [Opcode.IMM | (a << 8), Opcode.PSH, Opcode.IMM | (b << 8), Opcode.MUL, Opcode.EXIT]
             for a, b in pairs
         ]
-        results = run_programs_batch_ultra(bytecodes, batch_size=len(bytecodes))
+        # Use smaller batch size to avoid OOM
+        results = run_programs_batch_ultra(bytecodes, batch_size=32)
         _mul_cache = {pairs[i]: results[i] for i in range(len(pairs))}
     return _mul_cache
 
@@ -98,7 +100,8 @@ def _get_binop_cache(op):
             [Opcode.IMM | (a << 8), Opcode.PSH, Opcode.IMM | (b << 8), op, Opcode.EXIT]
             for a, b in pairs
         ]
-        results = run_programs_batch_ultra(bytecodes, batch_size=len(bytecodes))
+        # Use smaller batch size to avoid OOM
+        results = run_programs_batch_ultra(bytecodes, batch_size=32)
         cache = {pairs[i]: results[i] for i in range(len(pairs))}
         globals()[key] = cache
     return cache
