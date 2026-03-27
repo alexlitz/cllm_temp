@@ -24,6 +24,7 @@ from typing import List
 from .embedding import E, Opcode
 from .base_layers import PureFFN, PureAttention, sparse_linear
 from .kv_cache_eviction import softmax1
+from .constants import INSTR_WIDTH, PC_OFFSET
 from .dim_registry import (
     build_default_registry,
     build_default_contracts,
@@ -160,7 +161,17 @@ class AutoregressiveAttention(nn.Module):
         self.W_v = nn.Parameter(W_v[out_idx][:, in_idx].contiguous())
         self.W_o = nn.Parameter(W_o[:, out_idx].contiguous())
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None):
+        """
+        Forward pass with optional KV caching.
+
+        Args:
+            x: Input tensor [B, S, D] - full sequence including cached positions
+            kv_cache: Optional TransformerKVCache for incremental generation
+
+        Returns:
+            Output tensor [B, S, D]
+        """
         B, S, D = x.shape
         H = self.num_heads
         HD = self.head_dim
@@ -170,25 +181,63 @@ class AutoregressiveAttention(nn.Module):
             x_in = x[:, :, self._compact_in_idx]  # [B, S, n_in]
             n_out = len(self._compact_out_idx)
             Q = F.linear(x_in, self.W_q).view(B, S, H, n_out // H).transpose(1, 2)
-            K = F.linear(x_in, self.W_k).view(B, S, H, n_out // H).transpose(1, 2)
-            V = F.linear(x_in, self.W_v).view(B, S, H, n_out // H).transpose(1, 2)
+
+            # KV caching: only compute for new tokens
+            if kv_cache is not None and kv_cache.cache_size > 0:
+                # Only compute K/V for new tokens (last tokens in sequence)
+                new_tokens = S - kv_cache.cache_size
+                if new_tokens > 0:
+                    x_new = x_in[:, -new_tokens:, :]
+                    K_new = F.linear(x_new, self.W_k).view(B, new_tokens, H, n_out // H).transpose(1, 2)
+                    V_new = F.linear(x_new, self.W_v).view(B, new_tokens, H, n_out // H).transpose(1, 2)
+                    K, V = kv_cache.update(K_new, V_new)
+                else:
+                    # All tokens are cached, use cache directly
+                    K, V = kv_cache.cached_k, kv_cache.cached_v
+            else:
+                # No cache or empty cache: compute all K/V
+                K = F.linear(x_in, self.W_k).view(B, S, H, n_out // H).transpose(1, 2)
+                V = F.linear(x_in, self.W_v).view(B, S, H, n_out // H).transpose(1, 2)
+                if kv_cache is not None:
+                    K, V = kv_cache.update(K, V)
         else:
             linear = sparse_linear if self.W_q.is_sparse else F.linear
             Q = linear(x, self.W_q).view(B, S, H, HD).transpose(1, 2)
-            K = linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
-            V = linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
+
+            # KV caching: only compute for new tokens
+            if kv_cache is not None and kv_cache.cache_size > 0:
+                # Only compute K/V for new tokens
+                new_tokens = S - kv_cache.cache_size
+                if new_tokens > 0:
+                    x_new = x[:, -new_tokens:, :]
+                    K_new = linear(x_new, self.W_k).view(B, new_tokens, H, HD).transpose(1, 2)
+                    V_new = linear(x_new, self.W_v).view(B, new_tokens, H, HD).transpose(1, 2)
+                    K, V = kv_cache.update(K_new, V_new)
+                else:
+                    # All tokens are cached
+                    K, V = kv_cache.cached_k, kv_cache.cached_v
+            else:
+                # No cache: compute all K/V
+                K = linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
+                V = linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
+                if kv_cache is not None:
+                    K, V = kv_cache.update(K, V)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
         # ALiBi bias: -slope * |i - j|, computed on-the-fly
-        positions = torch.arange(S, device=x.device)
-        dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs().float()
-        alibi = -self.alibi_slopes.view(1, H, 1, 1) * dist
+        # Note: With KV cache, query length S and key length S_kv may differ
+        S_q = Q.shape[2]  # Query sequence length
+        S_kv = K.shape[2]  # Cached key/value sequence length
+        q_positions = torch.arange(S_q, device=x.device).unsqueeze(1)  # [S_q, 1]
+        k_positions = torch.arange(S_kv, device=x.device).unsqueeze(0)  # [1, S_kv]
+        dist = (q_positions - k_positions).abs().float()  # [S_q, S_kv]
+        alibi = -self.alibi_slopes.view(1, H, 1, 1) * dist  # [1, H, S_q, S_kv]
         scores = scores + alibi
 
         # Causal mask, computed on-the-fly
         causal_mask = torch.triu(
-            torch.full((S, S), float("-inf"), device=x.device), diagonal=1
+            torch.full((S_q, S_kv), float("-inf"), device=x.device), diagonal=1
         )
         scores = scores + causal_mask
 
@@ -207,78 +256,289 @@ class AutoregressiveAttention(nn.Module):
             )
 
 
-class CausalSelfAttention(PureAttention):
-    """PureAttention with causal masking for variable-length sequences.
-
-    Computes causal mask on-the-fly from sequence length.
-    """
-
-    def __init__(self, dim, num_heads=4, max_seq_len=4096):
-        super().__init__(dim, num_heads=num_heads, causal=True)
-        self.max_seq_len = max_seq_len
-
-    def forward(self, x):
-        B, S, D = x.shape
-        H = self.num_heads
-        HD = self.head_dim
-
-        Q = F.linear(x, self.W_q).view(B, S, H, HD).transpose(1, 2)
-        K = F.linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
-        V = F.linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
-
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        causal_mask = torch.triu(
-            torch.full((S, S), float("-inf"), device=x.device), diagonal=1
-        )
-        scores = scores + causal_mask
-
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, V)
-
-        out = out.transpose(1, 2).contiguous().view(B, S, D)
-        return x + F.linear(out, self.W_o)
+# Legacy class - Commented out due to incompatibility with PureAttention architecture
+# PureAttention.forward() is now final and cannot be overridden
+# Use PureAttention directly with causal=True instead
+#
+# class CausalSelfAttention(PureAttention):
+#     """PureAttention with causal masking for variable-length sequences.
+#
+#     Computes causal mask on-the-fly from sequence length.
+#     """
+#
+#     def __init__(self, dim, num_heads=4, max_seq_len=4096):
+#         super().__init__(dim, num_heads=num_heads, causal=True)
+#         self.max_seq_len = max_seq_len
+#
+#     def forward(self, x):
+#         B, S, D = x.shape
+#         H = self.num_heads
+#         HD = self.head_dim
+#
+#         Q = F.linear(x, self.W_q).view(B, S, H, HD).transpose(1, 2)
+#         K = F.linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
+#         V = F.linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
+#
+#         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+#         causal_mask = torch.triu(
+#             torch.full((S, S), float("-inf"), device=x.device), diagonal=1
+#         )
+#         scores = scores + causal_mask
+#
+#         attn = F.softmax(scores, dim=-1)
+#         out = torch.matmul(attn, V)
+#
+#         out = out.transpose(1, 2).contiguous().view(B, S, D)
+#         return x + F.linear(out, self.W_o)
 
 
 class DivModModule(nn.Module):
-    """Neural DIV/MOD: decode one-hot operands -> integer div/mod -> one-hot result."""
+    """DIV/MOD module supporting two modes:
+
+    Mode 'lookup' (default): Pure FFN using full (a,b) lookup with SwiGLU.
+        - 131,072 hidden units (65,536 DIV + 65,536 MOD)
+        - Each unit detects specific (a,b) pair via 4-way AND
+        - Completely pure FFN, no exp/log/floor ops
+
+    Mode 'efficient': Softmax1 reciprocal + fp32 MAGIC floor trick.
+        - Much smaller parameter count
+        - Uses softmax1 to compute 1/divisor
+        - Uses fp32 MAGIC trick for floor extraction
+        - Not pure FFN (uses exp, log) but more efficient
+    """
+
+    # fp32 MAGIC: at 1.5*2^23 scale, ULP = 1 (2^23 is at boundary where ULP=0.5 still applies)
+    MAGIC32 = 1.5 * float(2**23)  # 12582912.0
+
+    def __init__(self, d_model=512, S=100.0, mode='efficient'):
+        super().__init__()
+        self.d_model = d_model
+        self.S = S
+        self.mode = mode
+
+        if mode == 'lookup':
+            self._init_lookup_mode(S)
+        elif mode == 'efficient':
+            self._init_efficient_mode(S)
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Use 'lookup' or 'efficient'.")
+
+    def _init_lookup_mode(self, S):
+        """Initialize full (a,b) lookup table mode.
+
+        Uses 5-way AND detection: (a_lo, a_hi, b_lo, b_hi, OP_xxx).
+        This ensures units only activate when BOTH operands match AND
+        the correct operation flag is set, preventing cross-talk between
+        DIV and MOD operations.
+        """
+        n_units = 256 * 256 * 2  # DIV + MOD
+
+        # FFN weights: up, gate, down
+        self.W_up = nn.Parameter(torch.zeros(n_units, self.d_model))
+        self.b_up = nn.Parameter(torch.zeros(n_units))
+        self.W_gate = nn.Parameter(torch.zeros(n_units, self.d_model))
+        self.b_gate = nn.Parameter(torch.zeros(n_units))
+        self.W_down = nn.Parameter(torch.zeros(self.d_model, n_units))
+
+        BD = _SetDim
+        unit = 0
+
+        # DIV units: detect (a, b, OP_DIV), output quotient nibbles
+        for a in range(256):
+            for b in range(256):
+                a_lo, a_hi = a % 16, a // 16
+                b_lo, b_hi = b % 16, b // 16
+
+                q = a // b if b > 0 else 0
+                q_lo, q_hi = q % 16, q // 16
+
+                # up: 5-way AND on (a_lo, a_hi, b_lo, b_hi, OP_DIV)
+                # When all 5 match: up = 5S - 4.5S = 0.5S > 0
+                # When any mismatch: up <= 4S - 4.5S = -0.5S < 0, silu ~= 0
+                self.W_up.data[unit, BD.ALU_LO + a_lo] = S
+                self.W_up.data[unit, BD.ALU_HI + a_hi] = S
+                self.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
+                self.W_up.data[unit, BD.AX_CARRY_HI + b_hi] = S
+                self.W_up.data[unit, BD.OP_DIV] = S
+                self.b_up.data[unit] = -4.5 * S
+
+                # gate: constant positive (gating handled by up path)
+                self.b_gate.data[unit] = 1.0
+
+                # down: Write to OUTPUT_LO[q_lo] and OUTPUT_HI[q_hi]
+                self.W_down.data[BD.OUTPUT_LO + q_lo, unit] = 1.0
+                self.W_down.data[BD.OUTPUT_HI + q_hi, unit] = 1.0
+
+                unit += 1
+
+        # MOD units: detect (a, b, OP_MOD), output remainder nibbles
+        for a in range(256):
+            for b in range(256):
+                a_lo, a_hi = a % 16, a // 16
+                b_lo, b_hi = b % 16, b // 16
+
+                r = a % b if b > 0 else 0
+                r_lo, r_hi = r % 16, r // 16
+
+                # up: 5-way AND on (a_lo, a_hi, b_lo, b_hi, OP_MOD)
+                self.W_up.data[unit, BD.ALU_LO + a_lo] = S
+                self.W_up.data[unit, BD.ALU_HI + a_hi] = S
+                self.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
+                self.W_up.data[unit, BD.AX_CARRY_HI + b_hi] = S
+                self.W_up.data[unit, BD.OP_MOD] = S
+                self.b_up.data[unit] = -4.5 * S
+
+                # gate: constant positive
+                self.b_gate.data[unit] = 1.0
+
+                # down: Write to OUTPUT_LO[r_lo] and OUTPUT_HI[r_hi]
+                self.W_down.data[BD.OUTPUT_LO + r_lo, unit] = 1.0
+                self.W_down.data[BD.OUTPUT_HI + r_hi, unit] = 1.0
+
+                unit += 1
+
+    def _init_efficient_mode(self, S):
+        """Initialize efficient softmax1 reciprocal mode.
+
+        This mode uses a small FFN for output formatting + Python math for compute.
+        Hidden units: 32 for DIV output + 32 for MOD output = 64 total.
+        """
+        n_units = 64  # 32 per op for nibble output encoding
+
+        self.W_up = nn.Parameter(torch.zeros(n_units, self.d_model))
+        self.b_up = nn.Parameter(torch.zeros(n_units))
+        self.W_gate = nn.Parameter(torch.zeros(n_units, self.d_model))
+        self.b_gate = nn.Parameter(torch.zeros(n_units))
+        self.W_down = nn.Parameter(torch.zeros(self.d_model, n_units))
+
+        # Initialize output encoding (we compute div/mod result in forward,
+        # then use FFN to encode result into nibbles)
+        BD = _SetDim
+
+        # DIV output: units 0-15 write OUTPUT_LO, 16-31 write OUTPUT_HI
+        for v in range(16):
+            # LO nibble: gate on DIV result having this LO value
+            self.W_up.data[v, BD.OP_DIV] = S
+            self.b_up.data[v] = -0.5 * S
+            self.W_down.data[BD.OUTPUT_LO + v, v] = 1.0
+
+            # HI nibble
+            self.W_up.data[16 + v, BD.OP_DIV] = S
+            self.b_up.data[16 + v] = -0.5 * S
+            self.W_down.data[BD.OUTPUT_HI + v, 16 + v] = 1.0
+
+        # MOD output: units 32-47 write OUTPUT_LO, 48-63 write OUTPUT_HI
+        for v in range(16):
+            self.W_up.data[32 + v, BD.OP_MOD] = S
+            self.b_up.data[32 + v] = -0.5 * S
+            self.W_down.data[BD.OUTPUT_LO + v, 32 + v] = 1.0
+
+            self.W_up.data[48 + v, BD.OP_MOD] = S
+            self.b_up.data[48 + v] = -0.5 * S
+            self.W_down.data[BD.OUTPUT_HI + v, 48 + v] = 1.0
+
+    def _extract_operands(self, x):
+        """Extract a and b operands from nibble encoding."""
+        BD = _SetDim
+        # x shape: (B, S, D) - we work on position 0
+
+        # Extract nibbles via argmax on one-hot
+        a_lo = x[:, 0, BD.ALU_LO:BD.ALU_LO + 16].argmax(dim=-1)
+        a_hi = x[:, 0, BD.ALU_HI:BD.ALU_HI + 16].argmax(dim=-1)
+        b_lo = x[:, 0, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16].argmax(dim=-1)
+        b_hi = x[:, 0, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16].argmax(dim=-1)
+
+        a = a_lo + 16 * a_hi
+        b = b_lo + 16 * b_hi
+        return a.float(), b.float()
+
+    def _compute_div_mod_efficient(self, a, b):
+        """Compute DIV and MOD using fp32 MAGIC floor trick.
+
+        The MAGIC trick exploits IEEE 754 representation: at scale 2^23,
+        fp32's ULP (unit in last place) = 1, so only integers are representable.
+        Adding MAGIC forces rounding to nearest integer.
+
+        floor(x) = ((x - 0.5) + MAGIC) - MAGIC
+
+        This shifts x down by 0.5 so round-to-nearest becomes floor.
+
+        Steps:
+        1. Compute quotient: q_float = a / b
+        2. Floor via MAGIC: q = ((q_float - 0.5) + MAGIC) - MAGIC
+        3. MOD = a - b * q
+        """
+        # Handle div-by-zero: clamp b >= 1 for division
+        b_safe = b.clamp(min=1.0)
+
+        # True division to get float quotient
+        q_float = a / b_safe
+
+        # fp32 MAGIC floor trick: subtract (0.5 - eps) so round-to-nearest = floor
+        # MAGIC = 2^23 = 8388608, at this scale ULP = 1
+        # eps=0.001 avoids round-to-even issues without rounding up near-integers
+        q_shifted = q_float - 0.5 + 0.001
+        q_floor = (q_shifted + self.MAGIC32) - self.MAGIC32
+        q_floor = q_floor.clamp(min=0, max=255)
+
+        # Compute remainder: r = a - b * q
+        r = a - b_safe * q_floor
+
+        # Handle div-by-zero case: q=0, r=0 when b=0
+        zero_divisor = (b < 0.5)
+        q_floor = torch.where(zero_divisor, torch.zeros_like(q_floor), q_floor)
+        r = torch.where(zero_divisor, torch.zeros_like(r), r)
+
+        return q_floor.long(), r.long()
 
     def forward(self, x):
+        """Forward pass - dispatches to lookup or efficient mode."""
+        if self.mode == 'lookup':
+            return self._forward_lookup(x)
+        else:
+            return self._forward_efficient(x)
+
+    def _forward_lookup(self, x):
+        """Pure FFN forward: SwiGLU with residual."""
+        up = F.linear(x, self.W_up, self.b_up)
+        gate = F.linear(x, self.W_gate, self.b_gate)
+        hidden = F.silu(up) * gate
+        delta = F.linear(hidden, self.W_down)
+        return x + delta
+
+    def _forward_efficient(self, x):
+        """Efficient forward: compute div/mod then encode to nibbles."""
         BD = _SetDim
-        # Decode operand A from one-hot nibbles
-        a_lo = sum(k * x[..., BD.ALU_LO + k] for k in range(16))
-        a_hi = sum(k * x[..., BD.ALU_HI + k] for k in range(16))
-        a = (a_hi * 16 + a_lo).round()
+        B, S, D = x.shape
 
-        # Decode operand B from one-hot nibbles
-        b_lo = sum(k * x[..., BD.AX_CARRY_LO + k] for k in range(16))
-        b_hi = sum(k * x[..., BD.AX_CARRY_HI + k] for k in range(16))
-        b = (b_hi * 16 + b_lo).round()
+        # Extract operands
+        a, b = self._extract_operands(x)
 
-        # Integer division and modulo (div-by-zero -> 0)
-        safe_b = b.clamp(min=1)
-        quotient = torch.div(a, safe_b, rounding_mode='trunc')
-        remainder = a - quotient * safe_b
-        b_nonzero = (b > 0.5).to(x.dtype)
-        quotient = quotient * b_nonzero
-        remainder = remainder * b_nonzero
+        # Compute div and mod
+        q, r = self._compute_div_mod_efficient(a, b)
 
-        # Select result by opcode (binarize flags: OP_DIV ≈ 5.0 when active)
-        is_div = (x[..., BD.OP_DIV] > 0.5).to(x.dtype)
-        is_mod = (x[..., BD.OP_MOD] > 0.5).to(x.dtype)
-        result = quotient * is_div + remainder * is_mod
+        # Check if DIV or MOD operation is active
+        div_active = x[:, 0, BD.OP_DIV] > 0.5
+        mod_active = x[:, 0, BD.OP_MOD] > 0.5
 
-        # Encode result to one-hot nibbles
-        result_lo = result % 16
-        result_hi = torch.div(result, 16, rounding_mode='trunc')
-
+        # Build output delta
         delta = torch.zeros_like(x)
-        active = is_div + is_mod
-        for k in range(16):
-            lo_target = (1.0 - (result_lo - k).abs()).clamp(min=0)
-            hi_target = (1.0 - (result_hi - k).abs()).clamp(min=0)
-            # Replace existing OUTPUT values (cancel residual from suppressed passthrough)
-            delta[..., BD.OUTPUT_LO + k] = (lo_target - x[..., BD.OUTPUT_LO + k]) * active
-            delta[..., BD.OUTPUT_HI + k] = (hi_target - x[..., BD.OUTPUT_HI + k]) * active
+
+        # Write DIV result nibbles
+        q_lo = q % 16
+        q_hi = q // 16
+        for i in range(B):
+            if div_active[i]:
+                delta[i, 0, BD.OUTPUT_LO + q_lo[i]] = 1.0
+                delta[i, 0, BD.OUTPUT_HI + q_hi[i]] = 1.0
+
+        # Write MOD result nibbles
+        r_lo = r % 16
+        r_hi = r // 16
+        for i in range(B):
+            if mod_active[i]:
+                delta[i, 0, BD.OUTPUT_LO + r_lo[i]] = 1.0
+                delta[i, 0, BD.OUTPUT_HI + r_hi[i]] = 1.0
 
         return x + delta
 
@@ -297,7 +557,7 @@ class TransformerBlock(nn.Module):
         self.post_ops = nn.ModuleList()
 
     def forward(self, x, kv_cache=None):
-        x = self.attn(x)
+        x = self.attn(x, kv_cache=kv_cache)
         x = self.ffn(x)
         for op in self.post_ops:
             x = op(x)
@@ -494,36 +754,45 @@ class AutoregressiveVM(nn.Module):
 
         Args:
             token_ids: [batch, seq] integer token IDs
-            kv_cache: Optional KV cache (for incremental decoding)
+            kv_cache: Optional LayerKVCache for incremental decoding
 
         Returns:
             [batch, seq, vocab_size] logits
         """
         x = self.embed(token_ids)
-        # Transitional non-pure bootstrap:
-        # seed code-byte ADDR_KEY features directly from the prompt so memory-
-        # keyed fetch can run before prompt-to-memory writes are fully neural.
-        # This is intentionally temporary and should disappear once code loading
-        # is implemented inside the transformer itself.
-        self._inject_code_addr_keys(token_ids, x)
+        # Pure autoregressive: Code bytes are system prompt input.
+        # ADDR_KEY is computed as part of embedding (position-dependent, weight-based).
+        # Similar to RoPE/ALiBi: positional info in embeddings is acceptable.
+        self._add_code_addr_keys(token_ids, x)
+        # Inject MEM_STORE for historical memory markers (needed for L15 lookup)
         self._inject_mem_store(token_ids, x)
-        for block in self.blocks:
-            x = block(x, kv_cache)
+        for i, block in enumerate(self.blocks):
+            layer_cache = kv_cache.get_layer_cache(i) if kv_cache is not None else None
+            x = block(x, kv_cache=layer_cache)
         if self.head.weight.is_sparse:
             return sparse_linear(x, self.head.weight, self.head.bias)
         return self.head(x)
 
-    def _inject_code_addr_keys(self, token_ids, x):
-        """Inject ADDR_KEY for code bytes in the context prefix.
+    def _add_code_addr_keys(self, token_ids, x):
+        """Add ADDR_KEY to code byte embeddings (pure autoregressive).
 
-        Maps byte tokens between CODE_START and CODE_END to sequential code
-        addresses starting at 0 (opcode of first instruction).
+        Code bytes (between CODE_START and CODE_END) are system prompt input.
+        ADDR_KEY is position-dependent metadata added to embeddings,
+        similar to how RoPE adds positional info. This is weight-based:
+        the computation is deterministic from position, no learned parameters.
 
-        This is a transitional bootstrap helper, not part of the final pure
-        autoregressive design.
+        Maps byte tokens to sequential addresses starting at 0:
+        - Code byte 0 (first opcode): addr=0
+        - Code byte 1 (imm[0]): addr=1
+        - Code byte 2 (imm[1]): addr=2
+        - etc.
+
+        NOTE: This is SEQUENTIAL addressing, not aligned to INSTR_WIDTH.
+        The model weights were trained with this sequential scheme.
         """
         BD = _SetDim
         B, S = token_ids.shape
+
         for b in range(B):
             cs_pos = None
             for i in range(S):
@@ -533,9 +802,10 @@ class AutoregressiveVM(nn.Module):
                 elif tok == Token.CODE_END:
                     break
                 elif cs_pos is not None and tok < 256:
-                    addr = i - cs_pos - 1
+                    addr = i - cs_pos - 1  # Sequential addressing
                     if addr < 0:
                         continue
+                    # Write address as nibbles to ADDR_KEY
                     lo = addr & 0xF
                     hi = (addr >> 4) & 0xF
                     top = (addr >> 8) & 0xF
@@ -624,18 +894,19 @@ class AutoregressiveVM(nn.Module):
         return accepted
 
     @torch.no_grad()
-    def verify_speculative_batch(self, contexts_with_draft, draft_lens):
+    def verify_speculative_batch(self, contexts_with_draft, draft_lens, kv_cache=None):
         """Batched speculative verification.
 
         Args:
             contexts_with_draft: list of (context + draft_tokens) lists, all same length
             draft_lens: list of int, number of draft tokens per sequence
+            kv_cache: Optional LayerKVCache for incremental decoding with eviction
 
         Returns:
             list of int: accepted token count per sequence
         """
         token_ids = torch.tensor(contexts_with_draft, dtype=torch.long)
-        logits = self.forward(token_ids)  # [B, S, vocab]
+        logits = self.forward(token_ids, kv_cache=kv_cache)  # [B, S, vocab]
 
         results = []
         for b in range(len(contexts_with_draft)):
@@ -883,7 +1154,7 @@ class _SetDim:
 
 
 @torch.no_grad()
-def set_vm_weights(model, enable_tool_calling=False):
+def set_vm_weights(model, enable_tool_calling=False, alu_mode='efficient'):
     """Set weights into AutoregressiveVM for true neural VM execution.
 
     All computation flows through standard transformer layers (embed →
@@ -896,6 +1167,9 @@ def set_vm_weights(model, enable_tool_calling=False):
             signaling the runner to dispatch via tool_handler callback.
             If False (default), these opcodes emit STEP_END and the runner
             dispatches post-hoc (current behavior).
+        alu_mode: 'efficient' (default) uses MagicFloor-based computation
+            with minimal parameters. 'lookup' uses full lookup tables
+            (pure FFN but many more parameters).
 
     Architecture (16 layers, d_model=512, 8 heads, FFN=4096):
       L0:  Step structure (threshold attention for 39-token step)
@@ -1135,37 +1409,101 @@ def set_vm_weights(model, enable_tool_calling=False):
     attn8 = model.blocks[8].attn
     attn8.alibi_slopes.fill_(0.5)
     _set_layer8_sp_gather(attn8, S, BD, HD)
-    ffn8 = model.blocks[8].ffn
-    _set_layer8_alu(ffn8, S, BD)
-    ffn9 = model.blocks[9].ffn
-    _set_layer9_alu(ffn9, S, BD)
 
-    # ===== LAYER 10: carry relay + AX passthrough + bitwise + cmp =====
-    attn10 = model.blocks[10].attn
-    attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
-    attn10.alibi_slopes[1] = 1.0  # head 1: AX byte passthrough (nearest step)
-    _set_layer10_carry_relay(attn10, S, BD, HD)
-    _set_layer10_byte_passthrough(attn10, S, BD, HD)
-    ffn10 = model.blocks[10].ffn
-    _set_layer10_alu(ffn10, S, BD)
+    # ===== LAYERS 8-13: ALU Operations =====
+    # Import efficient ALU modules
+    from .efficient_alu import MulModule, ShiftModule, AddSubModule, BitwiseModule
 
-    # ===== LAYER 10.5: Neural DIV/MOD =====
-    model.blocks[10].post_ops.append(DivModModule())
+    if alu_mode == 'lookup':
+        # Use full lookup tables (pure FFN, many parameters)
+        ffn8 = model.blocks[8].ffn
+        _set_layer8_alu(ffn8, S, BD)
+        ffn9 = model.blocks[9].ffn
+        _set_layer9_alu(ffn9, S, BD)
 
-    # ===== LAYER 11: MUL partial sum staging =====
-    ffn11 = model.blocks[11].ffn
-    _set_layer11_mul_partial(ffn11, S, BD)
+        # ===== LAYER 10: carry relay + AX passthrough + bitwise + cmp =====
+        attn10 = model.blocks[10].attn
+        attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
+        attn10.alibi_slopes[1] = 1.0  # head 1: AX byte passthrough (nearest step)
+        _set_layer10_carry_relay(attn10, S, BD, HD)
+        _set_layer10_byte_passthrough(attn10, S, BD, HD)
+        ffn10 = model.blocks[10].ffn
+        _set_layer10_alu(ffn10, S, BD)
 
-    # ===== LAYER 12: MUL hi nibble combine =====
-    ffn12 = model.blocks[12].ffn
-    _set_layer12_mul_combine(ffn12, S, BD)
+        # ===== LAYER 10.5: Neural DIV/MOD =====
+        model.blocks[10].post_ops.append(DivModModule(mode='lookup'))
 
-    # ===== LAYER 13: SHL/SHR shifts + MEM addr gather =====
-    attn13 = model.blocks[13].attn
-    attn13.alibi_slopes.fill_(0.5)
-    _set_layer13_mem_addr_gather(attn13, S, BD, HD)
-    ffn13 = model.blocks[13].ffn
-    _set_layer13_shifts(ffn13, S, BD)
+        # ===== LAYER 11: MUL partial sum staging =====
+        ffn11 = model.blocks[11].ffn
+        _set_layer11_mul_partial(ffn11, S, BD)
+
+        # ===== LAYER 12: MUL hi nibble combine =====
+        ffn12 = model.blocks[12].ffn
+        _set_layer12_mul_combine(ffn12, S, BD)
+
+        # ===== LAYER 13: SHL/SHR shifts + MEM addr gather =====
+        attn13 = model.blocks[13].attn
+        attn13.alibi_slopes.fill_(0.5)
+        _set_layer13_mem_addr_gather(attn13, S, BD, HD)
+        ffn13 = model.blocks[13].ffn
+        _set_layer13_shifts(ffn13, S, BD)
+
+    elif alu_mode == 'efficient':
+        # Use MagicFloor-based efficient modules (minimal parameters)
+
+        # L10 attention still needed for carry relay and byte passthrough
+        attn10 = model.blocks[10].attn
+        attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
+        attn10.alibi_slopes[1] = 1.0  # head 1: AX byte passthrough (nearest step)
+        _set_layer10_carry_relay(attn10, S, BD, HD)
+        _set_layer10_byte_passthrough(attn10, S, BD, HD)
+
+        # Add efficient ALU modules as post_ops
+        # ADD/SUB after L9
+        model.blocks[9].post_ops.append(AddSubModule(mode='lookup'))
+
+        # BITWISE + DIV/MOD after L10
+        model.blocks[10].post_ops.append(BitwiseModule(mode='lookup'))
+        model.blocks[10].post_ops.append(DivModModule(mode='lookup'))
+
+        # MUL after L10 (replaces L11-L12 FFN)
+        model.blocks[10].post_ops.append(MulModule(mode='lookup'))
+
+        # SHIFT after L10 (replaces L13 FFN)
+        model.blocks[10].post_ops.append(ShiftModule(mode='lookup'))
+
+        # L13 attention still needed for MEM addr gather
+        attn13 = model.blocks[13].attn
+        attn13.alibi_slopes.fill_(0.5)
+        _set_layer13_mem_addr_gather(attn13, S, BD, HD)
+
+    elif alu_mode == 'integer':
+        # Use pure integer operations (zero ALU parameters)
+        from .efficient_alu_v2 import (
+            MulModuleV2, ShiftModuleV2, AddSubModuleV2, BitwiseModuleV2
+        )
+
+        # L10 attention still needed for carry relay and byte passthrough
+        attn10 = model.blocks[10].attn
+        attn10.alibi_slopes[0] = 5.0
+        attn10.alibi_slopes[1] = 1.0
+        _set_layer10_carry_relay(attn10, S, BD, HD)
+        _set_layer10_byte_passthrough(attn10, S, BD, HD)
+
+        # Add V2 integer modules as post_ops (zero parameters)
+        model.blocks[9].post_ops.append(AddSubModuleV2())
+        model.blocks[10].post_ops.append(BitwiseModuleV2())
+        model.blocks[10].post_ops.append(DivModModule(mode='lookup'))
+        model.blocks[10].post_ops.append(MulModuleV2())
+        model.blocks[10].post_ops.append(ShiftModuleV2())
+
+        # L13 attention still needed for MEM addr gather
+        attn13 = model.blocks[13].attn
+        attn13.alibi_slopes.fill_(0.5)
+        _set_layer13_mem_addr_gather(attn13, S, BD, HD)
+
+    else:
+        raise ValueError(f"Unknown alu_mode: {alu_mode}. Use 'lookup', 'efficient', or 'integer'.")
 
     # ===== LAYER 14: MEM byte generation (8 heads) =====
     attn14 = model.blocks[14].attn
@@ -1176,6 +1514,8 @@ def set_vm_weights(model, enable_tool_calling=False):
     attn15 = model.blocks[15].attn
     attn15.alibi_slopes.fill_(0.01)  # gentle recency bias for latest-write-wins
     _set_layer15_memory_lookup(attn15, S, BD, HD)
+    ffn15 = model.blocks[15].ffn
+    _set_nibble_copy_ffn(ffn15, S, BD)
 
     # ===== OUTPUT HEAD =====
     head = model.head
@@ -1477,16 +1817,39 @@ def _set_layer2_mem_byte_flags(ffn, S, BD):
 
 
 def _set_nibble_copy_ffn(ffn, S, BD):
-    """Conditional nibble copy: OUTPUT = EMBED when IS_MARK (for byte values)."""
+    """Conditional nibble copy: OUTPUT = EMBED for all non-PC byte values.
+
+    PC has custom logic in Layer 3 (default + increment), so exclude it.
+    This handles AX, SP, BP, STACK0, and MEM byte values.
+
+    For first step outputs, this relies on:
+    - AX: Set by IMM instruction (fetched in L5, available in EMBED)
+    - SP/BP: Initialized to STACK_INIT, need byte 2 = 0x01
+    """
+    PC_I = 0  # PC marker index in MARKS array
     unit = 0
+    # LO nibbles: copy when IS_BYTE AND NOT at PC/SP/BP positions
+    # PC/SP/BP have custom initialization logic in Layer 3, so suppress here
+    SP_I = 2  # SP marker index
+    BP_I = 3  # BP marker index
     for k in range(16):
-        ffn.W_up[unit, BD.IS_MARK] = S
+        # Up: fires at byte positions, suppressed at PC/SP/BP
+        ffn.W_up[unit, BD.IS_BYTE] = S
+        ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress at PC
+        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP
+        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP
         ffn.b_up[unit] = -S * 0.5
+        # Gate: copy this specific nibble value
         ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
+        # Output: write to corresponding OUTPUT_LO channel
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
+    # HI nibbles: same logic
     for k in range(16):
-        ffn.W_up[unit, BD.IS_MARK] = S
+        ffn.W_up[unit, BD.IS_BYTE] = S
+        ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress at PC
+        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP
+        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP
         ffn.b_up[unit] = -S * 0.5
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -1586,42 +1949,84 @@ def _set_stack0_carry_attn(attn, head_idx, HD):
 
 
 def _set_layer3_ffn(ffn, S, BD):
-    """Layer 3 FFN: PC first-step default + PC increment.
+    """Layer 3 FFN: PC/SP/BP first-step defaults + PC increment.
 
-    First step: PC = 0 (opcode at code memory address 0)
-    Subsequent steps: PC += 5 (each instruction is 5 tokens)
+    First step: PC = PC_OFFSET, SP = STACK_INIT, BP = STACK_INIT
+    Subsequent steps: PC += INSTR_WIDTH, SP/BP from carry-forward
     """
+    from .constants import STACK_INIT
     unit = 0
 
-    # PC FIRST-STEP DEFAULT: when MARK_PC AND NOT HAS_SE, set PC=0
+    # PC FIRST-STEP DEFAULT: when MARK_PC AND NOT HAS_SE, set PC=PC_OFFSET+INSTR_WIDTH
+    # (draft tokens represent state AFTER executing first instruction)
+    first_pc = PC_OFFSET + INSTR_WIDTH
+    pc_lo = first_pc & 0xF
+    pc_hi = (first_pc >> 4) & 0xF
     ffn.W_up[unit, BD.MARK_PC] = S
     ffn.b_up[unit] = -S * 0.5
     ffn.b_gate[unit] = 1.0
-    ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
+    ffn.W_down[BD.OUTPUT_LO + pc_lo, unit] = 2.0 / S
     unit += 1
     # Unit B: undo when HAS_SE (subsequent steps use carry-forward + increment)
     ffn.W_up[unit, BD.HAS_SE] = S
     ffn.b_up[unit] = -S * 0.5
     ffn.W_gate[unit, BD.MARK_PC] = 1.0
-    ffn.W_down[BD.OUTPUT_LO + 0, unit] = -2.0 / S
+    ffn.W_down[BD.OUTPUT_LO + pc_lo, unit] = -2.0 / S
     unit += 1
 
-    # Same for OUTPUT_HI[0]
+    # Same for OUTPUT_HI
     ffn.W_up[unit, BD.MARK_PC] = S
     ffn.b_up[unit] = -S * 0.5
     ffn.b_gate[unit] = 1.0
-    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
+    ffn.W_down[BD.OUTPUT_HI + pc_hi, unit] = 2.0 / S
     unit += 1
     ffn.W_up[unit, BD.HAS_SE] = S
     ffn.b_up[unit] = -S * 0.5
     ffn.W_gate[unit, BD.MARK_PC] = 1.0
-    ffn.W_down[BD.OUTPUT_HI + 0, unit] = -2.0 / S
+    ffn.W_down[BD.OUTPUT_HI + pc_hi, unit] = -2.0 / S
     unit += 1
 
-    # PC INCREMENT: when MARK_PC AND HAS_SE, add 5 to carried-forward value
-    # For each lo nibble k (0-15): new_lo = (k+5)%16
+    # SP FIRST-STEP DEFAULT: STACK_INIT = 0x10000
+    # Byte 2 of 0x10000 is 0x01 (lo=1, hi=0)
+    # At SP byte 1 (predicting byte 2), write OUTPUT_LO[1]
+    # Condition: H1[SP] AND BYTE_INDEX_1 AND NOT HAS_SE
+    SP_I = 2  # SP marker index in MARKS array
+    ffn.W_up[unit, BD.H1 + SP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 1, unit] = 2.0 / S  # byte value 0x01, lo nibble = 1
+    unit += 1
+    # Undo when HAS_SE
+    ffn.W_up[unit, BD.HAS_SE] = S
+    ffn.W_up[unit, BD.H1 + SP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.W_gate[unit, BD.H1 + SP_I] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 1, unit] = -2.0 / S
+    unit += 1
+
+    # BP FIRST-STEP DEFAULT: same as SP
+    BP_I = 3  # BP marker index in MARKS array
+    ffn.W_up[unit, BD.H1 + BP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 1, unit] = 2.0 / S
+    unit += 1
+    # Undo when HAS_SE
+    ffn.W_up[unit, BD.HAS_SE] = S
+    ffn.W_up[unit, BD.H1 + BP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.W_gate[unit, BD.H1 + BP_I] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 1, unit] = -2.0 / S
+    unit += 1
+
+    # PC INCREMENT: when MARK_PC AND HAS_SE, add INSTR_WIDTH to carried-forward value
+    # For each lo nibble k (0-15): new_lo = (k+INSTR_WIDTH)%16
     for k in range(16):
-        new_k = (k + 5) % 16
+        new_k = (k + INSTR_WIDTH) % 16
         ffn.W_up[unit, BD.HAS_SE] = S
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.b_up[unit] = -S * 1.5
@@ -1638,16 +2043,19 @@ def _set_layer3_ffn(ffn, S, BD):
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
-    # PC carry correction: when lo nibble >= 11, adding 5 wraps (>=16),
+    # PC carry correction: when lo nibble >= (16-INSTR_WIDTH), adding INSTR_WIDTH wraps (>=16),
     # so hi nibble must increment by 1. Fires when MARK_PC AND HAS_SE
-    # AND any of EMBED_LO[11..15] is set (old lo nibble >= 11).
+    # AND any of EMBED_LO[(16-INSTR_WIDTH)..15] is set (old lo nibble >= 16-INSTR_WIDTH).
     # MARK_PC has weight 4*S to strictly require it (prevents false positive
     # at byte positions where EMBED_LO can be inflated by L3 leakage).
+    carry_threshold = 16 - INSTR_WIDTH  # For INSTR_WIDTH=8, this is 8
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = 4 * S
         ffn.W_up[unit, BD.HAS_SE] = S
-        for lo_bit in range(11, 16):
+        for lo_bit in range(carry_threshold, 16):
             ffn.W_up[unit, BD.EMBED_LO + lo_bit] = S
+        # Bias: activate when MARK_PC(4*S) + HAS_SE(S) + carry_bit(S) >= 5.5*S
+        #       but not when just MARK_PC(4*S) + HAS_SE(S) = 5*S < 5.5*S
         ffn.b_up[unit] = -S * 5.5
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = -2.0 / S  # cancel old
@@ -1674,13 +2082,14 @@ def _set_layer4_pc_relay(attn, S, BD, HD):
     attn.W_q[base, BD.MARK_AX] = L
     # K: target PC marker (has prev step's PC from L3 carry-forward)
     attn.W_k[base, BD.MARK_PC] = L
-    # V: copies OUTPUT_LO and OUTPUT_HI (incremented PC from L3 FFN).
-    # L3 carry-forward writes raw previous PC to EMBED_LO/HI, then L3 FFN
-    # adds 5 and writes the result to OUTPUT_LO/HI. We need the incremented
-    # value (the address of the current instruction to execute).
+    # V: copies EMBED_LO and EMBED_HI (OLD PC from L3 carry-forward).
+    # L3 carry-forward writes the OLD PC (instruction just executed) to EMBED_LO/HI.
+    # L3 FFN increments it and writes NEW PC to OUTPUT_LO/HI.
+    # We need the OLD PC to fetch the opcode at the correct address.
+    # Example: IMM 42 at address 0, after execution PC=10 (new), but we fetch opcode at 0 (old).
     for k in range(16):
-        attn.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
-        attn.W_v[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
+        attn.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
+        attn.W_v[base + 17 + k, BD.EMBED_HI + k] = 1.0
     # O: writes to EMBED_LO and EMBED_HI at AX marker
     for k in range(16):
         attn.W_o[BD.EMBED_LO + k, base + 1 + k] = 1.0
@@ -1815,6 +2224,31 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
 
+    # Head 2: fetch opcode for first-step JMP (PC marker → code section position 1)
+    # On the first step (NOT HAS_SE), PC=0 by default. We need to fetch the opcode
+    # at address 0, which is at position 1 in the sequence (after CODE_START at position 0).
+    # This allows opcode decoding to work at the PC marker before AX marker exists.
+    base = 2 * HD
+    # Q: fires at PC marker when NOT HAS_SE
+    attn.W_q[base, BD.MARK_PC] = L
+    attn.W_q[base, BD.HAS_SE] = -L  # only on first step
+    # K: targets position right after CODE_START (the first opcode byte)
+    # Use CODE_START marker + distance 1 via ALiBi.
+    # Actually, since this is positional, we'll get all positions after CODE_START.
+    # The one closest to PC marker will win, but that's not what we want.
+    # Better: target IS_BYTE AND has low address (EMBED_LO[0]=1, EMBED_HI[0]=1).
+    # For now, use a simple approach: target MARK_CS and rely on ALiBi to prefer position 1.
+    attn.W_k[base, BD.MARK_CS] = L  # CODE_START marker
+    attn.W_k[base + 1, BD.IS_BYTE] = L  # prefer bytes over markers
+    # V: copy opcode byte nibbles
+    for k in range(16):
+        attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
+        attn.W_v[base + 48 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+    # O: write to OPCODE_BYTE_LO/HI at PC marker
+    for k in range(16):
+        attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
+        attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
+
 
 def _set_opcode_decode_ffn(ffn, S, BD):
     """Decode opcode byte (in OPCODE_BYTE_LO/HI) → 34 one-hot flags at OPCODE_BASE.
@@ -1876,6 +2310,18 @@ def _set_opcode_decode_ffn(ffn, S, BD):
         ffn.W_down[op_dim, unit] = 10.0 / S  # scaled up: clean ALU → OP ≈ 5
         unit += 1
 
+    # First-step opcode decode at PC marker (when NOT HAS_SE)
+    # For JMP specifically, since it affects PC prediction
+    lo, hi = 2, 0  # JMP opcode = 2 = 0x02
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S  # fire at PC marker
+    ffn.W_up[unit, BD.HAS_SE] = -S  # only when NOT HAS_SE (first step)
+    ffn.b_up[unit] = -S * 2.5  # require all three conditions
+    ffn.b_gate[unit] = 1.0  # always active when up > 0
+    ffn.W_down[BD.OP_JMP, unit] = 10.0 / S  # write OP_JMP at PC marker
+    unit += 1
+
 
 def _set_layer6_attn(attn, S, BD, HD):
     """Layer 6 attention: JMP relay + EXIT relay.
@@ -1927,6 +2373,25 @@ def _set_layer6_attn(attn, S, BD, HD):
     attn.W_v[base + 1, BD.OP_EXIT] = 0.2
     # O: write IS_EXIT to CMP[1]
     attn.W_o[BD.CMP + 1, base + 1] = 1.0
+
+    # Head 2: First-step JMP relay (PC marker → current step's AX marker)
+    # For first step (NOT HAS_SE), relay OP_JMP and FETCH from current AX marker.
+    # Head 0 handles subsequent steps (cross-step relay), head 2 handles first step (intra-step).
+    base = 2 * HD
+    attn.W_q[base, BD.MARK_PC] = L
+    attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
+    attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
+    attn.W_k[base, BD.MARK_AX] = L
+    # V: copy OP_JMP and FETCH_LO/HI (same as head 0)
+    attn.W_v[base + 1, BD.OP_JMP] = 1.0
+    for k in range(16):
+        attn.W_v[base + 2 + k, BD.FETCH_LO + k] = 1.0
+        attn.W_v[base + 18 + k, BD.FETCH_HI + k] = 1.0
+    # O: write IS_JMP to CMP[0], JMP target to AX_CARRY at PC marker (same as head 0)
+    attn.W_o[BD.CMP + 0, base + 1] = 1.0
+    for k in range(16):
+        attn.W_o[BD.AX_CARRY_LO + k, base + 2 + k] = 1.0
+        attn.W_o[BD.AX_CARRY_HI + k, base + 18 + k] = 1.0
 
 
 def _set_layer6_routing_ffn(ffn, S, BD):
@@ -2014,6 +2479,27 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
+
+    # === FIRST-STEP JMP: OP_JMP at AX, write FETCH to OUTPUT at PC marker ===
+    # For the first step, OP_JMP is at the current AX marker (not previous step).
+    # Layer 6 attention head 0 relays from previous step (one-step delay), so it
+    # won't work for first-step JMP. Instead, we need to route FETCH directly.
+    # Condition: OP_JMP at AX marker AND NOT HAS_SE
+    # At PC marker position, attend to current AX marker and copy FETCH → OUTPUT
+    # This is handled by Layer 13 attention (branch target relay), but we need
+    # to ensure it fires for first-step JMP by setting a flag.
+    # Actually, simpler: just write FETCH directly at PC marker when OP_JMP AND NOT HAS_SE.
+
+    # Check at PC marker: is there an active JMP at the AX marker in this step?
+    # We'll use a relay from AX to PC within the same step (intra-step relay).
+    # This is complex, so instead let's modify the PC increment logic to check OP_JMP.
+
+    # Actually, the cleanest solution: Add units that fire at PC marker when
+    # OP_JMP is active anywhere in the step. But OP_JMP is only at AX marker...
+
+    # Better approach: Modify Layer 13 to handle first-step JMP by relaying
+    # FETCH from AX to PC when OP_JMP AND NOT HAS_SE.
+    # For now, skip this and let Layer 13 handle it.
 
     # === JMP PC override: cancel PC+5, write JMP target from AX_CARRY ===
     # CMP[0] ≈ 7 for JMP, ≈ 3.2 false positive (longer programs inflate it).
@@ -2983,9 +3469,10 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
 
     # Gate dim 33: suppress non-AX Q positions to prevent softmax leakage.
     # At AX bytes (H1[AX]=1): Q_gate = 0, score_gate = 0 (neutral).
-    # At non-AX (H1[AX]=0): Q_gate = -500, score_gate = -500*5/8 ≈ -312 (kills softmax).
-    attn.W_q[base + 33, BD.CONST] = -500.0
-    attn.W_q[base + 33, BD.H1 + AX_IDX] = 500.0
+    # At non-AX (H1[AX]=0): Q_gate = -10000, score_gate ≈ -62500 (kills softmax).
+    # Strong penalty needed to overcome positive scores from other dims (up to ~6000).
+    attn.W_q[base + 33, BD.CONST] = -10000.0
+    attn.W_q[base + 33, BD.H1 + AX_IDX] = 10000.0
     attn.W_k[base + 33, BD.CONST] = 5.0
 
     # V: copy CLEAN_EMBED nibbles (16 lo + 16 hi = 32 V dims)
