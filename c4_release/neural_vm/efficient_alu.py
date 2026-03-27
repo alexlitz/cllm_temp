@@ -9,270 +9,60 @@ Forward pass is standard SwiGLU - no runtime integer ops:
 This is 100% neural - the same forward pass used in any transformer.
 The "intelligence" is in the weight values, not in the architecture.
 
-=== ADD Operation (tested with 65536/65536 correct) ===
-
-Uses direct one-hot to one-hot mapping with carry propagation.
-Two FFN layers:
-  1. Lo nibble: 256 units - computes OUTPUT_LO and carry flag (GEN_LO)
-  2. Hi nibble: 512 units - computes OUTPUT_HI using carry from layer 1
-
-Usage:
-    from efficient_alu import set_efficient_add_output_lo, set_efficient_add_output_hi
-
-    # Bake weights
-    set_efficient_add_output_lo(ffn_lo, S=100.0, BD=_SetDim)
-    set_efficient_add_output_hi(ffn_hi, S=100.0, BD=_SetDim)
-
-    # Forward pass (standard SwiGLU)
-    y1 = ffn_lo(x)  # x has one-hot ALU_LO, ALU_HI, AX_CARRY_LO, AX_CARRY_HI, OP_ADD
-    y2 = ffn_hi(y1) # reads GEN_LO from y1, outputs to OUTPUT_HI
-
-Temporary dimensions (450-499) used for intermediate results between layers.
+All operations use direct one-hot to one-hot mapping for reliability.
 """
 
 import torch
 import torch.nn as nn
 
-# Temporary dimension allocation
+# Temporary dimension for carry/borrow propagation between layers
 TEMP_BASE = 450
-# Decoded scalar values
-A_LO = TEMP_BASE + 0
-A_HI = TEMP_BASE + 1
-B_LO = TEMP_BASE + 2
-B_HI = TEMP_BASE + 3
-# ADD/SUB intermediates
-RAW_SUM_LO = TEMP_BASE + 4
-RAW_SUM_HI = TEMP_BASE + 5
-GEN_LO = TEMP_BASE + 6
-GEN_HI = TEMP_BASE + 7
-CARRY_TO_HI = TEMP_BASE + 8
-# MUL intermediates
-PROD_FULL = TEMP_BASE + 10  # Full 16-bit product (as scalar)
-# SHIFT intermediates
-SHIFT_AMT = TEMP_BASE + 15
-SHIFTED_VAL = TEMP_BASE + 16
-
-
-def bake_onehot_decode(ffn, unit, input_base, output_dim, opcode_dims, S):
-    """
-    Decode one-hot encoding to scalar value.
-
-    Uses 16 units to detect each possible value 0-15.
-    Each unit outputs its value k when input_base[k] is active.
-
-    Args:
-        ffn: FFN module to set weights on
-        unit: Starting hidden unit index
-        input_base: Base dimension of one-hot input (e.g., BD.ALU_LO)
-        output_dim: Dimension to write scalar output
-        opcode_dims: List of opcode dimensions that activate this decode
-        S: SwiGLU scale
-
-    Returns:
-        Next available unit index
-    """
-    for k in range(16):
-        # Detect input_base[k] == 1, output k to output_dim
-        # When input = 1.0: up = silu(S*1 - S*0.5) = silu(0.5*S) ≈ 0.5*S
-        # gate = k, hidden = 0.5*S*k, output = 0.5*S*k * (2/S) = k
-        ffn.W_up.data[unit, input_base + k] = S
-        ffn.b_up.data[unit] = -S * 0.5  # Threshold at 0.5
-
-        # Gate on opcodes, weighted by value k
-        for op_dim in opcode_dims:
-            ffn.W_gate.data[unit, op_dim] = float(k)
-
-        ffn.W_down.data[output_dim, unit] = 2.0 / S  # 2x to compensate for silu(0.5*S)
-        unit += 1
-
-    return unit
-
-
-def bake_cancel_pair(ffn, unit, up_dim, gate_dim, out_dim, S, scale=1.0):
-    """
-    Cancel pair: output = up_value * gate_value * scale
-
-    Uses silu(+S*up)*gate + silu(-S*up)*(-gate) ≈ up*gate when up > 0
-    """
-    ffn.W_up.data[unit, up_dim] = S
-    ffn.W_gate.data[unit, gate_dim] = 1.0
-    ffn.W_down.data[out_dim, unit] = scale / S
-
-    ffn.W_up.data[unit + 1, up_dim] = -S
-    ffn.W_gate.data[unit + 1, gate_dim] = -1.0
-    ffn.W_down.data[out_dim, unit + 1] = scale / S
-
-    return unit + 2
-
-
-def bake_step_pair(ffn, unit, sum_dims_weights, gate_dim, out_dim, threshold, S, out_scale=1.0):
-    """
-    Step pair: output = step(weighted_sum >= threshold) * out_scale
-
-    sum_dims_weights: list of (dim, weight) tuples
-    """
-    # Unit 1: fires when sum >= threshold - 1
-    for dim, w in sum_dims_weights:
-        ffn.W_up.data[unit, dim] = S * w
-        ffn.W_up.data[unit + 1, dim] = S * w
-
-    ffn.b_up.data[unit] = -S * (threshold - 1.0)
-    ffn.b_up.data[unit + 1] = -S * threshold
-
-    ffn.W_gate.data[unit, gate_dim] = 1.0
-    ffn.W_gate.data[unit + 1, gate_dim] = 1.0
-
-    ffn.W_down.data[out_dim, unit] = out_scale / S
-    ffn.W_down.data[out_dim, unit + 1] = -out_scale / S
-
-    return unit + 2
-
-
-def bake_scalar_to_onehot(ffn, unit, scalar_dim, output_base, gate_dim, S, max_val=16):
-    """
-    Convert scalar value back to one-hot encoding.
-
-    Uses step pairs to detect each value 0 to max_val-1.
-    """
-    for k in range(max_val):
-        # Step pair: fires when scalar == k (i.e., >= k and < k+1)
-        ffn.W_up.data[unit, scalar_dim] = S
-        ffn.b_up.data[unit] = -S * (k - 0.5)
-        ffn.W_gate.data[unit, gate_dim] = 1.0
-        ffn.W_down.data[output_base + k, unit] = 1.0 / S
-
-        ffn.W_up.data[unit + 1, scalar_dim] = S
-        ffn.b_up.data[unit + 1] = -S * (k + 0.5)
-        ffn.W_gate.data[unit + 1, gate_dim] = 1.0
-        ffn.W_down.data[output_base + k, unit + 1] = -1.0 / S
-
-        unit += 2
-
-    return unit
+GEN_LO = TEMP_BASE + 0  # Carry/borrow flag from lo nibble
 
 
 # =============================================================================
-# ADD/SUB Implementation
+# ADD Implementation (tested 65536/65536 = 100%)
 # =============================================================================
 
-def set_efficient_add_sub_decode(ffn, S, BD):
+def set_efficient_add_lo(ffn, S, BD, start_unit=0):
     """
-    Layer 1: Decode one-hot inputs to scalars.
+    ADD stage 1: Compute OUTPUT_LO and carry flag (GEN_LO).
 
-    Shared by ADD and SUB operations.
-    """
-    unit = 0
-
-    # Decode ALU_LO -> A_LO (for ADD, SUB, and other ops)
-    unit = bake_onehot_decode(ffn, unit, BD.ALU_LO, A_LO,
-                               [BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_AND, BD.OP_OR, BD.OP_XOR, BD.OP_SHL, BD.OP_SHR], S)
-
-    # Decode ALU_HI -> A_HI
-    unit = bake_onehot_decode(ffn, unit, BD.ALU_HI, A_HI,
-                               [BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_AND, BD.OP_OR, BD.OP_XOR, BD.OP_SHL, BD.OP_SHR], S)
-
-    # Decode AX_CARRY_LO -> B_LO
-    unit = bake_onehot_decode(ffn, unit, BD.AX_CARRY_LO, B_LO,
-                               [BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_AND, BD.OP_OR, BD.OP_XOR, BD.OP_SHL, BD.OP_SHR], S)
-
-    # Decode AX_CARRY_HI -> B_HI
-    unit = bake_onehot_decode(ffn, unit, BD.AX_CARRY_HI, B_HI,
-                               [BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_AND, BD.OP_OR, BD.OP_XOR, BD.OP_SHL, BD.OP_SHR], S)
-
-    return unit
-
-
-def set_efficient_add_compute(ffn, S, BD, start_unit=0):
-    """
-    Compute ADD: raw sums, carries, and final results.
-
-    Assumes decoded scalars are in A_LO, A_HI, B_LO, B_HI.
+    Direct one-hot to one-hot mapping: 256 units.
     """
     unit = start_unit
 
-    # === RAW_SUM_LO = A_LO + B_LO ===
-    # Cancel pair to add two values
-    ffn.W_up.data[unit, BD.OP_ADD] = S
-    ffn.W_gate.data[unit, A_LO] = 1.0
-    ffn.W_gate.data[unit, B_LO] = 1.0
-    ffn.W_down.data[RAW_SUM_LO, unit] = 1.0 / S
-    unit += 1
-
-    ffn.W_up.data[unit, BD.OP_ADD] = -S
-    ffn.W_gate.data[unit, A_LO] = -1.0
-    ffn.W_gate.data[unit, B_LO] = -1.0
-    ffn.W_down.data[RAW_SUM_LO, unit] = 1.0 / S
-    unit += 1
-
-    # === RAW_SUM_HI = A_HI + B_HI ===
-    ffn.W_up.data[unit, BD.OP_ADD] = S
-    ffn.W_gate.data[unit, A_HI] = 1.0
-    ffn.W_gate.data[unit, B_HI] = 1.0
-    ffn.W_down.data[RAW_SUM_HI, unit] = 1.0 / S
-    unit += 1
-
-    ffn.W_up.data[unit, BD.OP_ADD] = -S
-    ffn.W_gate.data[unit, A_HI] = -1.0
-    ffn.W_gate.data[unit, B_HI] = -1.0
-    ffn.W_down.data[RAW_SUM_HI, unit] = 1.0 / S
-    unit += 1
-
-    # === GEN_LO = step(A_LO + B_LO >= 16) ===
-    unit = bake_step_pair(ffn, unit, [(A_LO, 1.0), (B_LO, 1.0)], BD.OP_ADD, GEN_LO, 16.0, S)
-
-    # === GEN_HI = step(A_HI + B_HI >= 16) ===
-    unit = bake_step_pair(ffn, unit, [(A_HI, 1.0), (B_HI, 1.0)], BD.OP_ADD, GEN_HI, 16.0, S)
-
-    # === CARRY_TO_HI = GEN_LO (for 8-bit, no propagate chain needed) ===
-    unit = bake_cancel_pair(ffn, unit, BD.OP_ADD, GEN_LO, CARRY_TO_HI, S)
-
-    return unit
-
-
-def set_efficient_add_output_lo(ffn, S, BD, start_unit=0):
-    """
-    Output stage 1: Compute OUTPUT_LO and carry flag (GEN_LO).
-
-    Uses direct one-hot to one-hot mapping.
-    """
-    unit = start_unit
-
-    # === OUTPUT_LO: direct (a_lo, b_lo) -> result_lo lookup ===
     for a in range(16):
         for b in range(16):
             result = (a + b) % 16
             carry = 1 if (a + b) >= 16 else 0
 
-            # Unit fires when ALU_LO[a] = 1 AND AX_CARRY_LO[b] = 1 AND OP_ADD = 1
+            # 3-way AND: ALU_LO[a] AND AX_CARRY_LO[b] AND OP_ADD
             ffn.W_up.data[unit, BD.ALU_LO + a] = S
             ffn.W_up.data[unit, BD.AX_CARRY_LO + b] = S
             ffn.W_up.data[unit, BD.OP_ADD] = S
-            ffn.b_up.data[unit] = -S * 2.5  # 3-way AND threshold
+            ffn.b_up.data[unit] = -S * 2.5
 
             ffn.W_gate.data[unit, BD.ALU_LO + a] = 1.0
             ffn.W_gate.data[unit, BD.AX_CARRY_LO + b] = 1.0
 
-            # Output to result position (scale by 2 to compensate for silu attenuation)
             ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 2.0 / S
-
-            # Write carry flag to GEN_LO for use by next layer (normalize to 1.0)
             if carry:
-                ffn.W_down.data[GEN_LO, unit] = 1.0 / S  # Output 0.5 per unit, accumulates to ~1.0
+                ffn.W_down.data[GEN_LO, unit] = 1.0 / S
 
             unit += 1
 
     return unit
 
 
-def set_efficient_add_output_hi(ffn, S, BD, start_unit=0):
+def set_efficient_add_hi(ffn, S, BD, start_unit=0):
     """
-    Output stage 2: Compute OUTPUT_HI using carry from GEN_LO.
+    ADD stage 2: Compute OUTPUT_HI using carry from GEN_LO.
 
-    Must run AFTER set_efficient_add_output_lo's FFN output.
+    Must run AFTER set_efficient_add_lo. Uses 512 units.
     """
     unit = start_unit
 
-    # === OUTPUT_HI: depends on carry from lo nibble (GEN_LO from previous layer) ===
     for a in range(16):
         for b in range(16):
             # Case 1: no carry from lo (GEN_LO = 0)
@@ -314,323 +104,90 @@ def set_efficient_add_output_hi(ffn, S, BD, start_unit=0):
     return unit
 
 
-def set_efficient_add_output(ffn, S, BD, start_unit=0):
-    """DEPRECATED: Use set_efficient_add_output_lo and set_efficient_add_output_hi."""
-    raise DeprecationWarning("Use separate lo/hi output functions")
-
-
-def set_efficient_sub_compute(ffn, S, BD, start_unit=0):
-    """
-    Compute SUB: a - b with borrow.
-
-    sub_lo = a_lo - b_lo + 16 (to keep positive)
-    borrow = (a_lo < b_lo)
-    sub_hi = a_hi - b_hi + borrow_correction
-    """
-    unit = start_unit
-
-    # === RAW_DIFF_LO = A_LO - B_LO + 16 (always positive, range 0-31) ===
-    ffn.W_up.data[unit, BD.OP_SUB] = S
-    ffn.W_gate.data[unit, A_LO] = 1.0
-    ffn.W_gate.data[unit, B_LO] = -1.0  # Subtract
-    ffn.b_gate.data[unit] = 16.0  # Add 16 to keep positive
-    ffn.W_down.data[RAW_SUM_LO, unit] = 1.0 / S
-    unit += 1
-
-    ffn.W_up.data[unit, BD.OP_SUB] = -S
-    ffn.W_gate.data[unit, A_LO] = -1.0
-    ffn.W_gate.data[unit, B_LO] = 1.0
-    ffn.b_gate.data[unit] = -16.0
-    ffn.W_down.data[RAW_SUM_LO, unit] = 1.0 / S
-    unit += 1
-
-    # === RAW_DIFF_HI = A_HI - B_HI + 16 ===
-    ffn.W_up.data[unit, BD.OP_SUB] = S
-    ffn.W_gate.data[unit, A_HI] = 1.0
-    ffn.W_gate.data[unit, B_HI] = -1.0
-    ffn.b_gate.data[unit] = 16.0
-    ffn.W_down.data[RAW_SUM_HI, unit] = 1.0 / S
-    unit += 1
-
-    ffn.W_up.data[unit, BD.OP_SUB] = -S
-    ffn.W_gate.data[unit, A_HI] = -1.0
-    ffn.W_gate.data[unit, B_HI] = 1.0
-    ffn.b_gate.data[unit] = -16.0
-    ffn.W_down.data[RAW_SUM_HI, unit] = 1.0 / S
-    unit += 1
-
-    # === BORROW_LO = step(A_LO < B_LO) = step(B_LO > A_LO) ===
-    # borrow when a_lo - b_lo + 16 < 16, i.e., raw_diff_lo < 16
-    # Actually: borrow = step(A_LO < B_LO) = 1 - step(A_LO >= B_LO)
-    # Simpler: borrow = step(raw_diff_lo < 16) = 1 - step(raw_diff_lo >= 16)
-
-    # GEN_LO will hold: 1 if NO borrow (raw_diff >= 16), 0 if borrow
-    unit = bake_step_pair(ffn, unit, [(A_LO, 1.0), (B_LO, -1.0)], BD.OP_SUB, GEN_LO, 0.0, S)
-
-    # CARRY_TO_HI = 1 - GEN_LO (borrow propagation)
-    # We'll handle this in output stage
-
-    return unit
-
-
-def set_efficient_sub_output(ffn, S, BD, start_unit=0):
-    """
-    Convert SUB results to one-hot outputs.
-    """
-    unit = start_unit
-
-    # === OUTPUT_LO: raw_diff_lo mod 16 ===
-    for raw in range(32):
-        result = raw % 16
-
-        ffn.W_up.data[unit, RAW_SUM_LO] = S
-        ffn.b_up.data[unit] = -S * (raw - 0.5)
-        ffn.W_gate.data[unit, BD.OP_SUB] = 1.0
-        ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 1.0 / S
-        unit += 1
-
-        ffn.W_up.data[unit, RAW_SUM_LO] = S
-        ffn.b_up.data[unit] = -S * (raw + 0.5)
-        ffn.W_gate.data[unit, BD.OP_SUB] = 1.0
-        ffn.W_down.data[BD.OUTPUT_LO + result, unit] = -1.0 / S
-        unit += 1
-
-    # === OUTPUT_HI: (raw_diff_hi - borrow) mod 16 ===
-    # GEN_LO = 1 means no borrow, GEN_LO = 0 means borrow
-    # result_hi = raw_diff_hi - (1 - GEN_LO) = raw_diff_hi - 1 + GEN_LO
-
-    for raw in range(32):
-        for no_borrow in range(2):
-            # When GEN_LO = no_borrow, and raw_diff_hi = raw
-            borrow = 1 - no_borrow
-            adjusted = raw - borrow
-            if adjusted < 0:
-                adjusted += 16
-            result = adjusted % 16
-
-            combined_val = raw + 32 * no_borrow
-
-            ffn.W_up.data[unit, RAW_SUM_HI] = S
-            ffn.W_up.data[unit, GEN_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined_val - 0.5)
-            ffn.W_gate.data[unit, BD.OP_SUB] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result, unit] = 0.5 / S
-            unit += 1
-
-            ffn.W_up.data[unit, RAW_SUM_HI] = S
-            ffn.W_up.data[unit, GEN_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined_val + 0.5)
-            ffn.W_gate.data[unit, BD.OP_SUB] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result, unit] = -0.5 / S
-            unit += 1
-
-    # === BORROW output (stored in CARRY) ===
-    # borrow = 1 - GEN_LO, but we detect when A < B overall
-    # For simplicity: borrow = step(A_LO < B_LO) when hi nibbles equal
-    # Full borrow logic is complex, use simplified version
-
-    return unit
-
-
 # =============================================================================
-# MUL Implementation
+# SUB Implementation
 # =============================================================================
 
-def set_efficient_mul(ffn, S, BD, start_unit=0):
+def set_efficient_sub_lo(ffn, S, BD, start_unit=0):
     """
-    Efficient MUL: a * b mod 256
+    SUB stage 1: Compute OUTPUT_LO and borrow flag (GEN_LO).
 
-    Strategy: Compute full 8-bit product as scalar, then extract lo byte.
-    Uses schoolbook: (a_hi*16 + a_lo) * (b_hi*16 + b_lo)
-                   = a_hi*b_hi*256 + (a_hi*b_lo + a_lo*b_hi)*16 + a_lo*b_lo
+    result_lo = (a_lo - b_lo) mod 16
+    borrow = 1 if a_lo < b_lo else 0
 
-    For mod 256: only need a_lo*b_lo + (a_hi*b_lo + a_lo*b_hi)*16 mod 256
+    Uses 256 units.
     """
     unit = start_unit
 
-    # We need the full 8-bit value first: a = a_hi*16 + a_lo, b = b_hi*16 + b_lo
-    # Then compute a*b mod 256
-
-    # For efficiency, compute partial products and combine
-    # P0 = a_lo * b_lo (range 0-225)
-    # P1 = a_lo * b_hi (range 0-225)
-    # P2 = a_hi * b_lo (range 0-225)
-    # result = (P0 + (P1 + P2) * 16) mod 256
-
-    # This is still complex. For now, let's use a lookup-based approach
-    # but organized by nibble products (16x16 = 256 units per product)
-
-    # Actually, let's use the scalar multiplication approach:
-    # 1. Compute A = a_hi * 16 + a_lo (range 0-255)
-    # 2. Compute B = b_hi * 16 + b_lo (range 0-255)
-    # 3. Compute A * B mod 256 using step detection
-
-    # Step 1: Combine nibbles to 8-bit scalar
-    A_FULL = TEMP_BASE + 20
-    B_FULL = TEMP_BASE + 21
-
-    # A_FULL = A_HI * 16 + A_LO
-    ffn.W_up.data[unit, BD.OP_MUL] = S
-    ffn.W_gate.data[unit, A_HI] = 16.0
-    ffn.W_gate.data[unit, A_LO] = 1.0
-    ffn.W_down.data[A_FULL, unit] = 1.0 / S
-    unit += 1
-
-    ffn.W_up.data[unit, BD.OP_MUL] = -S
-    ffn.W_gate.data[unit, A_HI] = -16.0
-    ffn.W_gate.data[unit, A_LO] = -1.0
-    ffn.W_down.data[A_FULL, unit] = 1.0 / S
-    unit += 1
-
-    # B_FULL = B_HI * 16 + B_LO
-    ffn.W_up.data[unit, BD.OP_MUL] = S
-    ffn.W_gate.data[unit, B_HI] = 16.0
-    ffn.W_gate.data[unit, B_LO] = 1.0
-    ffn.W_down.data[B_FULL, unit] = 1.0 / S
-    unit += 1
-
-    ffn.W_up.data[unit, BD.OP_MUL] = -S
-    ffn.W_gate.data[unit, B_HI] = -16.0
-    ffn.W_gate.data[unit, B_LO] = -1.0
-    ffn.W_down.data[B_FULL, unit] = 1.0 / S
-    unit += 1
-
-    # Now we need A * B mod 256
-    # This requires multiplication which SwiGLU can approximate via cancel pairs
-    # But we can't easily multiply two arbitrary scalars...
-
-    # Alternative: Use partial product approach
-    # P0 = a_lo * b_lo: need 16x16 lookup = 256 combinations
-    # But we can factor: for each a_lo value, create step pairs
-
-    # For proof of concept, let's do 16x16 partial product lookups
-    # This is still more efficient than 256x256 full lookup
-
-    P0 = TEMP_BASE + 22  # a_lo * b_lo
-    P1 = TEMP_BASE + 23  # a_lo * b_hi
-    P2 = TEMP_BASE + 24  # a_hi * b_lo
-
-    # P0 = a_lo * b_lo using step detection on each combination
     for a in range(16):
         for b in range(16):
-            product = a * b
-            # Detect a_lo == a AND b_lo == b
-            combined = a + b * 32  # Unique encoding
+            result = (a - b) % 16
+            borrow = 1 if a < b else 0
 
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_MUL] = float(product)
-            ffn.W_down.data[P0, unit] = 1.0 / S
-            unit += 1
+            # 3-way AND: ALU_LO[a] AND AX_CARRY_LO[b] AND OP_SUB
+            ffn.W_up.data[unit, BD.ALU_LO + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b] = S
+            ffn.W_up.data[unit, BD.OP_SUB] = S
+            ffn.b_up.data[unit] = -S * 2.5
 
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_MUL] = float(product)
-            ffn.W_down.data[P0, unit] = -1.0 / S
-            unit += 1
+            ffn.W_gate.data[unit, BD.ALU_LO + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b] = 1.0
 
-    # P1 = a_lo * b_hi
-    for a in range(16):
-        for b in range(16):
-            product = a * b
-            combined = a + b * 32
+            ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 2.0 / S
+            if borrow:
+                ffn.W_down.data[GEN_LO, unit] = 1.0 / S  # GEN_LO = borrow flag
 
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_MUL] = float(product)
-            ffn.W_down.data[P1, unit] = 1.0 / S
-            unit += 1
-
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_MUL] = float(product)
-            ffn.W_down.data[P1, unit] = -1.0 / S
-            unit += 1
-
-    # P2 = a_hi * b_lo
-    for a in range(16):
-        for b in range(16):
-            product = a * b
-            combined = a + b * 32
-
-            ffn.W_up.data[unit, A_HI] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_MUL] = float(product)
-            ffn.W_down.data[P2, unit] = 1.0 / S
-            unit += 1
-
-            ffn.W_up.data[unit, A_HI] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_MUL] = float(product)
-            ffn.W_down.data[P2, unit] = -1.0 / S
             unit += 1
 
     return unit
 
 
-def set_efficient_mul_combine(ffn, S, BD, start_unit=0):
+def set_efficient_sub_hi(ffn, S, BD, start_unit=0):
     """
-    Combine MUL partial products and output.
+    SUB stage 2: Compute OUTPUT_HI using borrow from GEN_LO.
 
-    result = (P0 + (P1 + P2) * 16) mod 256
+    result_hi = (a_hi - b_hi - borrow) mod 16
+
+    Uses 512 units.
     """
     unit = start_unit
 
-    P0 = TEMP_BASE + 22
-    P1 = TEMP_BASE + 23
-    P2 = TEMP_BASE + 24
-    RESULT = TEMP_BASE + 25
+    for a in range(16):
+        for b in range(16):
+            # Case 1: no borrow from lo (GEN_LO = 0)
+            result_no_borrow = (a - b) % 16
+            borrow_out_no = 1 if a < b else 0
 
-    # RESULT = P0 + (P1 + P2) * 16
-    # Range: P0 up to 225, (P1+P2)*16 up to 7200, total up to 7425
-    # We only need mod 256
+            ffn.W_up.data[unit, BD.ALU_HI + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b] = S
+            ffn.W_up.data[unit, BD.OP_SUB] = S
+            ffn.W_up.data[unit, GEN_LO] = -S  # Inhibit when borrow present
+            ffn.b_up.data[unit] = -S * 2.5
 
-    # Combine: RESULT = P0 + P1*16 + P2*16
-    ffn.W_up.data[unit, BD.OP_MUL] = S
-    ffn.W_gate.data[unit, P0] = 1.0
-    ffn.W_gate.data[unit, P1] = 16.0
-    ffn.W_gate.data[unit, P2] = 16.0
-    ffn.W_down.data[RESULT, unit] = 1.0 / S
-    unit += 1
+            ffn.W_gate.data[unit, BD.ALU_HI + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b] = 1.0
 
-    ffn.W_up.data[unit, BD.OP_MUL] = -S
-    ffn.W_gate.data[unit, P0] = -1.0
-    ffn.W_gate.data[unit, P1] = -16.0
-    ffn.W_gate.data[unit, P2] = -16.0
-    ffn.W_down.data[RESULT, unit] = 1.0 / S
-    unit += 1
-
-    # Now output RESULT mod 256 as one-hot nibbles
-    # For each possible result 0-255
-    for r in range(256):
-        r_lo = r % 16
-        r_hi = r // 16
-
-        # Detect RESULT in range [r, r+1) or [r+256, r+257) etc.
-        # Since max is ~7425, need to handle wraparound
-        for mult in range(30):  # Handle values up to 7680
-            val = r + mult * 256
-            if val > 7500:
-                break
-
-            ffn.W_up.data[unit, RESULT] = S
-            ffn.b_up.data[unit] = -S * (val - 0.5)
-            ffn.W_gate.data[unit, BD.OP_MUL] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + r_lo, unit] = 0.1 / S
-            ffn.W_down.data[BD.OUTPUT_HI + r_hi, unit] = 0.1 / S
+            ffn.W_down.data[BD.OUTPUT_HI + result_no_borrow, unit] = 2.0 / S
+            if borrow_out_no:
+                ffn.W_down.data[BD.CARRY, unit] = 2.0 / S  # CARRY = final borrow
             unit += 1
 
-            ffn.W_up.data[unit, RESULT] = S
-            ffn.b_up.data[unit] = -S * (val + 0.5)
-            ffn.W_gate.data[unit, BD.OP_MUL] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + r_lo, unit] = -0.1 / S
-            ffn.W_down.data[BD.OUTPUT_HI + r_hi, unit] = -0.1 / S
+            # Case 2: borrow from lo (GEN_LO = 1)
+            result_with_borrow = (a - b - 1) % 16
+            borrow_out_yes = 1 if a < b or (a == b) else 0  # a - b - 1 < 0 when a <= b
+
+            ffn.W_up.data[unit, BD.ALU_HI + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b] = S
+            ffn.W_up.data[unit, BD.OP_SUB] = S
+            ffn.W_up.data[unit, GEN_LO] = S  # Require borrow present
+            ffn.b_up.data[unit] = -S * 3.5  # 4-way AND
+
+            ffn.W_gate.data[unit, BD.ALU_HI + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b] = 1.0
+
+            ffn.W_down.data[BD.OUTPUT_HI + result_with_borrow, unit] = 2.0 / S
+            if borrow_out_yes:
+                ffn.W_down.data[BD.CARRY, unit] = 2.0 / S
             unit += 1
 
     return unit
@@ -640,138 +197,145 @@ def set_efficient_mul_combine(ffn, S, BD, start_unit=0):
 # BITWISE Implementation (AND, OR, XOR)
 # =============================================================================
 
-def set_efficient_bitwise(ffn, S, BD, start_unit=0):
+def set_efficient_bitwise_lo(ffn, S, BD, start_unit=0):
     """
-    Efficient bitwise ops using bit-level operations.
+    BITWISE stage 1: Compute OUTPUT_LO for AND, OR, XOR.
 
-    For each bit position, extract bit from a and b, compute result.
-    8 bits × 3 ops = 24 result bits to compute.
+    Direct 16×16 lookup per operation. Uses 256×3 = 768 units.
     """
     unit = start_unit
 
-    # For bitwise ops, we work bit-by-bit
-    # Bit k of a = floor(a / 2^k) mod 2
-    #
-    # For 8-bit values:
-    # - Bits 0-3 come from a_lo, bits 4-7 come from a_hi
-    # - Bit k of nibble = floor(nibble / 2^k) mod 2
-
-    # Extract each bit and compute AND/OR/XOR
-    # This requires detecting: (bit_a, bit_b) combinations
-
-    # For nibble n and bit position b (0-3):
-    # bit = step(n >= 2^b) XOR step(n >= 2^(b+1)) XOR step(n >= 3*2^b) XOR ...
-    # Actually simpler: for each bit position, enumerate which nibble values have that bit set
-
-    # Let's use direct enumeration: for each output nibble value
-    # check if it matches the bitwise op result
-
-    # AND output
     for a in range(16):
         for b in range(16):
+            # AND
             result_and = a & b
+            ffn.W_up.data[unit, BD.ALU_LO + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b] = S
+            ffn.W_up.data[unit, BD.OP_AND] = S
+            ffn.b_up.data[unit] = -S * 2.5
+            ffn.W_gate.data[unit, BD.ALU_LO + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b] = 1.0
+            ffn.W_down.data[BD.OUTPUT_LO + result_and, unit] = 2.0 / S
+            unit += 1
+
+            # OR
             result_or = a | b
+            ffn.W_up.data[unit, BD.ALU_LO + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b] = S
+            ffn.W_up.data[unit, BD.OP_OR] = S
+            ffn.b_up.data[unit] = -S * 2.5
+            ffn.W_gate.data[unit, BD.ALU_LO + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b] = 1.0
+            ffn.W_down.data[BD.OUTPUT_LO + result_or, unit] = 2.0 / S
+            unit += 1
+
+            # XOR
             result_xor = a ^ b
-
-            combined = a + b * 32
-
-            # AND: lo nibble
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_AND] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + result_and, unit] = 1.0 / S
+            ffn.W_up.data[unit, BD.ALU_LO + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b] = S
+            ffn.W_up.data[unit, BD.OP_XOR] = S
+            ffn.b_up.data[unit] = -S * 2.5
+            ffn.W_gate.data[unit, BD.ALU_LO + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b] = 1.0
+            ffn.W_down.data[BD.OUTPUT_LO + result_xor, unit] = 2.0 / S
             unit += 1
 
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_AND] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + result_and, unit] = -1.0 / S
-            unit += 1
+    return unit
 
-            # OR: lo nibble
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_OR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + result_or, unit] = 1.0 / S
-            unit += 1
 
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_OR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + result_or, unit] = -1.0 / S
-            unit += 1
+def set_efficient_bitwise_hi(ffn, S, BD, start_unit=0):
+    """
+    BITWISE stage 2: Compute OUTPUT_HI for AND, OR, XOR.
 
-            # XOR: lo nibble
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_XOR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + result_xor, unit] = 1.0 / S
-            unit += 1
+    Direct 16×16 lookup per operation. Uses 256×3 = 768 units.
+    """
+    unit = start_unit
 
-            ffn.W_up.data[unit, A_LO] = S
-            ffn.W_up.data[unit, B_LO] = S * 32
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_XOR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + result_xor, unit] = -1.0 / S
-            unit += 1
-
-    # Same for hi nibble
     for a in range(16):
         for b in range(16):
+            # AND
             result_and = a & b
+            ffn.W_up.data[unit, BD.ALU_HI + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b] = S
+            ffn.W_up.data[unit, BD.OP_AND] = S
+            ffn.b_up.data[unit] = -S * 2.5
+            ffn.W_gate.data[unit, BD.ALU_HI + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b] = 1.0
+            ffn.W_down.data[BD.OUTPUT_HI + result_and, unit] = 2.0 / S
+            unit += 1
+
+            # OR
             result_or = a | b
+            ffn.W_up.data[unit, BD.ALU_HI + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b] = S
+            ffn.W_up.data[unit, BD.OP_OR] = S
+            ffn.b_up.data[unit] = -S * 2.5
+            ffn.W_gate.data[unit, BD.ALU_HI + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b] = 1.0
+            ffn.W_down.data[BD.OUTPUT_HI + result_or, unit] = 2.0 / S
+            unit += 1
+
+            # XOR
             result_xor = a ^ b
-
-            combined = a + b * 32
-
-            # AND: hi nibble
-            ffn.W_up.data[unit, A_HI] = S
-            ffn.W_up.data[unit, B_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_AND] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result_and, unit] = 1.0 / S
+            ffn.W_up.data[unit, BD.ALU_HI + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b] = S
+            ffn.W_up.data[unit, BD.OP_XOR] = S
+            ffn.b_up.data[unit] = -S * 2.5
+            ffn.W_gate.data[unit, BD.ALU_HI + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b] = 1.0
+            ffn.W_down.data[BD.OUTPUT_HI + result_xor, unit] = 2.0 / S
             unit += 1
 
-            ffn.W_up.data[unit, A_HI] = S
-            ffn.W_up.data[unit, B_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_AND] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result_and, unit] = -1.0 / S
-            unit += 1
+    return unit
 
-            # OR: hi nibble
-            ffn.W_up.data[unit, A_HI] = S
-            ffn.W_up.data[unit, B_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_OR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result_or, unit] = 1.0 / S
-            unit += 1
 
-            ffn.W_up.data[unit, A_HI] = S
-            ffn.W_up.data[unit, B_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_OR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result_or, unit] = -1.0 / S
-            unit += 1
+# =============================================================================
+# MUL Implementation (nibble factoring)
+# =============================================================================
 
-            # XOR: hi nibble
-            ffn.W_up.data[unit, A_HI] = S
-            ffn.W_up.data[unit, B_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_XOR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result_xor, unit] = 1.0 / S
-            unit += 1
+def set_efficient_mul(ffn, S, BD, start_unit=0):
+    """
+    MUL: Compute (a * b) mod 256 using nibble factoring.
 
-            ffn.W_up.data[unit, A_HI] = S
-            ffn.W_up.data[unit, B_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_XOR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result_xor, unit] = -1.0 / S
+    a = a_hi*16 + a_lo
+    b = b_hi*16 + b_lo
+    result = (a_lo*b_lo + (a_lo*b_hi + a_hi*b_lo)*16) mod 256
+
+    Note: a_hi*b_hi*256 always >= 256, so doesn't contribute to result mod 256.
+
+    Uses direct 256×256 lookup split across nibble products.
+    For each 8-bit combination, we compute the result.
+    Uses 256×256 = 65536 units but can be factored to ~4096.
+
+    This implementation uses full 8-bit lookup for correctness.
+    """
+    unit = start_unit
+
+    # Full 8-bit × 8-bit lookup: for each (a, b) pair
+    for a in range(256):
+        a_lo, a_hi = a % 16, a // 16
+        for b in range(256):
+            b_lo, b_hi = b % 16, b // 16
+            result = (a * b) % 256
+            r_lo = result % 16
+            r_hi = result // 16
+
+            # 4-way AND: ALU_LO[a_lo] AND ALU_HI[a_hi] AND AX_CARRY_LO[b_lo] AND AX_CARRY_HI[b_hi] AND OP_MUL
+            ffn.W_up.data[unit, BD.ALU_LO + a_lo] = S
+            ffn.W_up.data[unit, BD.ALU_HI + a_hi] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b_hi] = S
+            ffn.W_up.data[unit, BD.OP_MUL] = S
+            ffn.b_up.data[unit] = -S * 4.5  # 5-way AND threshold
+
+            ffn.W_gate.data[unit, BD.ALU_LO + a_lo] = 1.0
+            ffn.W_gate.data[unit, BD.ALU_HI + a_hi] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b_lo] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b_hi] = 1.0
+
+            ffn.W_down.data[BD.OUTPUT_LO + r_lo, unit] = 1.0 / S
+            ffn.W_down.data[BD.OUTPUT_HI + r_hi, unit] = 1.0 / S
+
             unit += 1
 
     return unit
@@ -783,126 +347,159 @@ def set_efficient_bitwise(ffn, S, BD, start_unit=0):
 
 def set_efficient_shift(ffn, S, BD, start_unit=0):
     """
-    Efficient SHIFT using lookup on (value, shift_amount).
+    SHIFT: Compute SHL and SHR using direct lookup.
 
-    For 8-bit value and shift 0-7: 256 * 8 = 2048 combinations per op.
-    But we can optimize by working nibble-wise.
+    shift_amount = b_lo & 7 (0-7, higher bits ignored)
+    SHL: result = (a << shift) mod 256
+    SHR: result = a >> shift
+
+    Uses 256×16×2 = 8192 units (handles all b_lo values 0-15).
     """
     unit = start_unit
 
-    # Decode shift amount (0-7) from B_LO
-    # Already decoded in shared decode stage
+    for a in range(256):
+        a_lo, a_hi = a % 16, a // 16
+        for b_lo in range(16):  # All possible b_lo values
+            shift = b_lo & 7  # Actual shift amount is b_lo mod 8
 
-    # For shifts, we need the full 8-bit value
-    A_FULL = TEMP_BASE + 20
+            # SHL
+            result_shl = (a << shift) % 256
+            r_lo_shl = result_shl % 16
+            r_hi_shl = result_shl // 16
 
-    # Combine nibbles: A_FULL = A_HI * 16 + A_LO
-    ffn.W_up.data[unit, BD.OP_SHL] = S
-    ffn.W_up.data[unit, BD.OP_SHR] = S  # Both ops use same decode
-    ffn.W_gate.data[unit, A_HI] = 16.0
-    ffn.W_gate.data[unit, A_LO] = 1.0
-    ffn.W_down.data[A_FULL, unit] = 1.0 / S
-    unit += 1
+            # 4-way AND: ALU_LO[a_lo] AND ALU_HI[a_hi] AND AX_CARRY_LO[b_lo] AND OP_SHL
+            ffn.W_up.data[unit, BD.ALU_LO + a_lo] = S
+            ffn.W_up.data[unit, BD.ALU_HI + a_hi] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
+            ffn.W_up.data[unit, BD.OP_SHL] = S
+            ffn.b_up.data[unit] = -S * 3.5  # 4-way AND
 
-    ffn.W_up.data[unit, BD.OP_SHL] = -S
-    ffn.W_up.data[unit, BD.OP_SHR] = -S
-    ffn.W_gate.data[unit, A_HI] = -16.0
-    ffn.W_gate.data[unit, A_LO] = -1.0
-    ffn.W_down.data[A_FULL, unit] = 1.0 / S
-    unit += 1
+            ffn.W_gate.data[unit, BD.ALU_LO + a_lo] = 1.0
+            ffn.W_gate.data[unit, BD.ALU_HI + a_hi] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b_lo] = 1.0
 
-    # SHL: for each (value, shift) -> (value << shift) mod 256
-    for val in range(256):
-        for shift in range(8):
-            result = (val << shift) % 256
-            r_lo = result % 16
-            r_hi = result // 16
-
-            combined = val + shift * 256
-
-            ffn.W_up.data[unit, A_FULL] = S
-            ffn.W_up.data[unit, B_LO] = S * 256
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_SHL] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + r_lo, unit] = 0.5 / S
-            ffn.W_down.data[BD.OUTPUT_HI + r_hi, unit] = 0.5 / S
+            ffn.W_down.data[BD.OUTPUT_LO + r_lo_shl, unit] = 1.5 / S
+            ffn.W_down.data[BD.OUTPUT_HI + r_hi_shl, unit] = 1.5 / S
             unit += 1
 
-            ffn.W_up.data[unit, A_FULL] = S
-            ffn.W_up.data[unit, B_LO] = S * 256
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_SHL] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + r_lo, unit] = -0.5 / S
-            ffn.W_down.data[BD.OUTPUT_HI + r_hi, unit] = -0.5 / S
-            unit += 1
+            # SHR
+            result_shr = a >> shift
+            r_lo_shr = result_shr % 16
+            r_hi_shr = result_shr // 16
 
-    # SHR: for each (value, shift) -> value >> shift
-    for val in range(256):
-        for shift in range(8):
-            result = val >> shift
-            r_lo = result % 16
-            r_hi = result // 16
+            ffn.W_up.data[unit, BD.ALU_LO + a_lo] = S
+            ffn.W_up.data[unit, BD.ALU_HI + a_hi] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
+            ffn.W_up.data[unit, BD.OP_SHR] = S
+            ffn.b_up.data[unit] = -S * 3.5
 
-            combined = val + shift * 256
+            ffn.W_gate.data[unit, BD.ALU_LO + a_lo] = 1.0
+            ffn.W_gate.data[unit, BD.ALU_HI + a_hi] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b_lo] = 1.0
 
-            ffn.W_up.data[unit, A_FULL] = S
-            ffn.W_up.data[unit, B_LO] = S * 256
-            ffn.b_up.data[unit] = -S * (combined - 0.5)
-            ffn.W_gate.data[unit, BD.OP_SHR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + r_lo, unit] = 0.5 / S
-            ffn.W_down.data[BD.OUTPUT_HI + r_hi, unit] = 0.5 / S
-            unit += 1
-
-            ffn.W_up.data[unit, A_FULL] = S
-            ffn.W_up.data[unit, B_LO] = S * 256
-            ffn.b_up.data[unit] = -S * (combined + 0.5)
-            ffn.W_gate.data[unit, BD.OP_SHR] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + r_lo, unit] = -0.5 / S
-            ffn.W_down.data[BD.OUTPUT_HI + r_hi, unit] = -0.5 / S
+            ffn.W_down.data[BD.OUTPUT_LO + r_lo_shr, unit] = 1.5 / S
+            ffn.W_down.data[BD.OUTPUT_HI + r_hi_shr, unit] = 1.5 / S
             unit += 1
 
     return unit
 
 
 # =============================================================================
-# Main integration function
+# DIV/MOD Implementation
 # =============================================================================
 
-def count_efficient_units(BD):
-    """Count total hidden units needed for efficient ALU."""
-    S = 100.0
+def set_efficient_div(ffn, S, BD, start_unit=0):
+    """
+    DIV: Compute a // b using direct lookup.
 
-    # Create dummy FFN to count
-    class DummyFFN:
-        def __init__(self):
-            self.W_up = type('obj', (object,), {'data': {}})()
-            self.b_up = type('obj', (object,), {'data': {}})()
-            self.W_gate = type('obj', (object,), {'data': {}})()
-            self.b_gate = type('obj', (object,), {'data': {}})()
-            self.W_down = type('obj', (object,), {'data': {}})()
+    For b=0, result is undefined (we output 0).
 
-            # Track max unit used
-            self.max_unit = 0
+    Uses 256×256 = 65536 units.
+    """
+    unit = start_unit
 
-        def __setitem__(self, key, val):
-            pass
+    for a in range(256):
+        a_lo, a_hi = a % 16, a // 16
+        for b in range(256):
+            b_lo, b_hi = b % 16, b // 16
 
-    # This is a rough estimate
-    decode_units = 64  # 16 × 4 nibbles
-    add_units = 200    # compute + output
-    sub_units = 200
-    mul_units = 1600   # 3 × 16×16 partial products + combine
-    bitwise_units = 1600  # 16×16 × 3 ops × 2 nibbles
-    shift_units = 4096    # 256 × 8 × 2 ops
+            if b == 0:
+                result = 0  # Division by zero -> 0
+            else:
+                result = a // b
 
-    total = decode_units + add_units + sub_units + mul_units + bitwise_units + shift_units
+            r_lo = result % 16
+            r_hi = result // 16
 
-    return {
-        'decode': decode_units,
-        'add': add_units,
-        'sub': sub_units,
-        'mul': mul_units,
-        'bitwise': bitwise_units,
-        'shift': shift_units,
-        'total': total
-    }
+            # 5-way AND
+            ffn.W_up.data[unit, BD.ALU_LO + a_lo] = S
+            ffn.W_up.data[unit, BD.ALU_HI + a_hi] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b_hi] = S
+            ffn.W_up.data[unit, BD.OP_DIV] = S
+            ffn.b_up.data[unit] = -S * 4.5
+
+            ffn.W_gate.data[unit, BD.ALU_LO + a_lo] = 1.0
+            ffn.W_gate.data[unit, BD.ALU_HI + a_hi] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b_lo] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b_hi] = 1.0
+
+            ffn.W_down.data[BD.OUTPUT_LO + r_lo, unit] = 1.0 / S
+            ffn.W_down.data[BD.OUTPUT_HI + r_hi, unit] = 1.0 / S
+
+            unit += 1
+
+    return unit
+
+
+def set_efficient_mod(ffn, S, BD, start_unit=0):
+    """
+    MOD: Compute a % b using direct lookup.
+
+    For b=0, result is undefined (we output a).
+
+    Uses 256×256 = 65536 units.
+    """
+    unit = start_unit
+
+    for a in range(256):
+        a_lo, a_hi = a % 16, a // 16
+        for b in range(256):
+            b_lo, b_hi = b % 16, b // 16
+
+            if b == 0:
+                result = a  # Mod by zero -> return a
+            else:
+                result = a % b
+
+            r_lo = result % 16
+            r_hi = result // 16
+
+            # 5-way AND
+            ffn.W_up.data[unit, BD.ALU_LO + a_lo] = S
+            ffn.W_up.data[unit, BD.ALU_HI + a_hi] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b_hi] = S
+            ffn.W_up.data[unit, BD.OP_MOD] = S
+            ffn.b_up.data[unit] = -S * 4.5
+
+            ffn.W_gate.data[unit, BD.ALU_LO + a_lo] = 1.0
+            ffn.W_gate.data[unit, BD.ALU_HI + a_hi] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b_lo] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b_hi] = 1.0
+
+            ffn.W_down.data[BD.OUTPUT_LO + r_lo, unit] = 1.0 / S
+            ffn.W_down.data[BD.OUTPUT_HI + r_hi, unit] = 1.0 / S
+
+            unit += 1
+
+    return unit
+
+
+# =============================================================================
+# Legacy exports (for compatibility)
+# =============================================================================
+
+# Keep old names for backwards compatibility
+set_efficient_add_output_lo = set_efficient_add_lo
+set_efficient_add_output_hi = set_efficient_add_hi

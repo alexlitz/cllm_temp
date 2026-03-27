@@ -353,15 +353,16 @@ class DivModModule(nn.Module):
                 q = a // b if b > 0 else 0
                 q_lo, q_hi = q % 16, q // 16
 
-                # up: 5-way AND on (a_lo, a_hi, b_lo, b_hi, OP_DIV)
-                # When all 5 match: up = 5S - 4.5S = 0.5S > 0
-                # When any mismatch: up <= 4S - 4.5S = -0.5S < 0, silu ~= 0
+                # up: 6-way AND on (MARK_AX, a_lo, a_hi, b_lo, b_hi, OP_DIV)
+                # When all 6 match: up = 6S - 5.5S = 0.5S > 0
+                # When any mismatch: up <= 5S - 5.5S = -0.5S < 0, silu ~= 0
+                self.W_up.data[unit, BD.MARK_AX] = S  # NEW: only fire at AX marker
                 self.W_up.data[unit, BD.ALU_LO + a_lo] = S
                 self.W_up.data[unit, BD.ALU_HI + a_hi] = S
                 self.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
                 self.W_up.data[unit, BD.AX_CARRY_HI + b_hi] = S
                 self.W_up.data[unit, BD.OP_DIV] = S
-                self.b_up.data[unit] = -4.5 * S
+                self.b_up.data[unit] = -5.5 * S  # Changed threshold for 6-way AND
 
                 # gate: constant positive (gating handled by up path)
                 self.b_gate.data[unit] = 1.0
@@ -381,13 +382,14 @@ class DivModModule(nn.Module):
                 r = a % b if b > 0 else 0
                 r_lo, r_hi = r % 16, r // 16
 
-                # up: 5-way AND on (a_lo, a_hi, b_lo, b_hi, OP_MOD)
+                # up: 6-way AND on (MARK_AX, a_lo, a_hi, b_lo, b_hi, OP_MOD)
+                self.W_up.data[unit, BD.MARK_AX] = S  # NEW: only fire at AX marker
                 self.W_up.data[unit, BD.ALU_LO + a_lo] = S
                 self.W_up.data[unit, BD.ALU_HI + a_hi] = S
                 self.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
                 self.W_up.data[unit, BD.AX_CARRY_HI + b_hi] = S
                 self.W_up.data[unit, BD.OP_MOD] = S
-                self.b_up.data[unit] = -4.5 * S
+                self.b_up.data[unit] = -5.5 * S  # Changed threshold for 6-way AND
 
                 # gate: constant positive
                 self.b_gate.data[unit] = 1.0
@@ -500,11 +502,22 @@ class DivModModule(nn.Module):
             return self._forward_efficient(x)
 
     def _forward_lookup(self, x):
-        """Pure FFN forward: SwiGLU with residual."""
+        """Pure FFN forward: SwiGLU with residual.
+
+        Gate by MARK_AX to ensure DIV/MOD only activates at AX marker positions.
+        On first step at PC marker, MARK_AX=0, so delta is zeroed, preserving JMP target.
+        """
+        BD = _SetDim
         up = F.linear(x, self.W_up, self.b_up)
         gate = F.linear(x, self.W_gate, self.b_gate)
         hidden = F.silu(up) * gate
         delta = F.linear(hidden, self.W_down)
+
+        # Gate delta by MARK_AX: only apply at AX marker positions
+        # Expand MARK_AX to match delta shape: (B, S, 1) * delta (B, S, D)
+        mark_ax_gate = x[..., BD.MARK_AX:BD.MARK_AX+1]  # (B, S, 1)
+        delta = delta * mark_ax_gate  # Broadcast multiplication
+
         return x + delta
 
     def _forward_efficient(self, x):
@@ -1241,6 +1254,11 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
 
     Supports: All non-syscall C4 opcodes (26 of 34 opcode types).
     """
+    # PURITY ENFORCEMENT: Verify model has not been modified to violate purity
+    from .purity_guard import verify_forward_purity, verify_embedding_purity
+    verify_forward_purity(model)
+    verify_embedding_purity(model.embed)
+
     BD = _SetDim
     d = model.d_model
     V = model.vocab_size
