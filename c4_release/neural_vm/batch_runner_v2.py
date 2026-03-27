@@ -212,8 +212,13 @@ class UltraBatchRunner:
         # Code section
         context.append(Token.CODE_START)
         for instr in bytecode:
-            for i in range(8):
-                context.append((instr >> (i * 8)) & 0xFF)
+            # Extract opcode (low byte) and immediate (top 24 bits)
+            op = instr & 0xFF
+            imm = instr >> 8
+            context.append(op)
+            # Add 4 immediate bytes (little-endian)
+            for i in range(4):
+                context.append((imm >> (i * 8)) & 0xFF)
         context.append(Token.CODE_END)
 
         # Data section

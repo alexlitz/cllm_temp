@@ -112,6 +112,24 @@ class FullOpcodeMapper:
         elif opcode == Opcode.PUTCHAR:
             return self._map_putchar()
 
+        # File I/O syscalls (30-33)
+        elif opcode == Opcode.OPEN:
+            return self._map_open()
+        elif opcode == Opcode.READ:
+            return self._map_read()
+        elif opcode == Opcode.CLOS:
+            return self._map_clos()
+        elif opcode == Opcode.PRTF:
+            return self._map_prtf()
+
+        # Memory management (35-37)
+        elif opcode == Opcode.FREE:
+            return self._map_free()
+        elif opcode == Opcode.MSET:
+            return self._map_mset()
+        elif opcode == Opcode.MCMP:
+            return self._map_mcmp()
+
         else:
             raise NotImplementedError(f"Opcode {opcode} not yet mapped to graph")
 
@@ -382,6 +400,112 @@ class FullOpcodeMapper:
         # Copy AX to IO_CHAR mailbox and set flag
         ax = graph.add_input("AX")
         output = graph.add_op(OpType.IO_PUTCHAR_REQUEST, [ax], "io_output")
+
+        return graph
+
+    def _map_open(self) -> ComputationGraph:
+        """OPEN: fd = open(filename, flags) - Syscall request"""
+        graph = ComputationGraph()
+
+        # Syscall type = OPEN (4)
+        syscall_type = graph.add_const(4)
+        type_op = graph.add_op(OpType.MOVE, [syscall_type], "IO_TOOL_CALL_TYPE")
+
+        # Filename pointer in AX
+        ax = graph.add_input("AX")
+        filename = graph.add_op(OpType.MOVE, [ax], "syscall_arg1")
+
+        # Set syscall request flag
+        request = graph.add_op(OpType.SYSCALL_REQUEST, [], "syscall_request")
+
+        return graph
+
+    def _map_read(self) -> ComputationGraph:
+        """READ: n = read(fd, buf, size) - Syscall request"""
+        graph = ComputationGraph()
+
+        # Syscall type = READ (5)
+        syscall_type = graph.add_const(5)
+        type_op = graph.add_op(OpType.MOVE, [syscall_type], "IO_TOOL_CALL_TYPE")
+
+        # Set syscall request flag
+        request = graph.add_op(OpType.SYSCALL_REQUEST, [], "syscall_request")
+
+        return graph
+
+    def _map_clos(self) -> ComputationGraph:
+        """CLOS: close(fd) - Syscall request"""
+        graph = ComputationGraph()
+
+        # Syscall type = CLOSE (6)
+        syscall_type = graph.add_const(6)
+        type_op = graph.add_op(OpType.MOVE, [syscall_type], "IO_TOOL_CALL_TYPE")
+
+        # FD in AX
+        ax = graph.add_input("AX")
+        fd = graph.add_op(OpType.MOVE, [ax], "syscall_arg1")
+
+        # Set syscall request flag
+        request = graph.add_op(OpType.SYSCALL_REQUEST, [], "syscall_request")
+
+        return graph
+
+    def _map_prtf(self) -> ComputationGraph:
+        """PRTF: printf(format, ...) - Syscall request"""
+        graph = ComputationGraph()
+
+        # Syscall type = PRINTF (7)
+        syscall_type = graph.add_const(7)
+        type_op = graph.add_op(OpType.MOVE, [syscall_type], "IO_TOOL_CALL_TYPE")
+
+        # Format string pointer in AX
+        ax = graph.add_input("AX")
+        format_ptr = graph.add_op(OpType.MOVE, [ax], "syscall_arg1")
+
+        # Set syscall request flag
+        request = graph.add_op(OpType.SYSCALL_REQUEST, [], "syscall_request")
+
+        return graph
+
+    def _map_free(self) -> ComputationGraph:
+        """FREE: free(ptr) - Free memory (no-op in bump allocator)"""
+        graph = ComputationGraph()
+
+        # Bump allocator doesn't need to free
+        # Just return successfully (no-op)
+        # In a real implementation, this would update free list
+
+        return graph
+
+    def _map_mset(self) -> ComputationGraph:
+        """MSET: memset(ptr, value, size) - Set memory block"""
+        graph = ComputationGraph()
+
+        # This needs a loop structure, which requires multi-layer
+        # For now, set a flag to indicate memset operation needed
+        # The attention layer will handle the actual memory writes
+
+        # Syscall-like request
+        syscall_type = graph.add_const(8)  # Custom memset type
+        type_op = graph.add_op(OpType.MOVE, [syscall_type], "IO_TOOL_CALL_TYPE")
+
+        request = graph.add_op(OpType.SYSCALL_REQUEST, [], "syscall_request")
+
+        return graph
+
+    def _map_mcmp(self) -> ComputationGraph:
+        """MCMP: n = memcmp(ptr1, ptr2, size) - Compare memory blocks"""
+        graph = ComputationGraph()
+
+        # This needs a loop structure, which requires multi-layer
+        # For now, set a flag to indicate memcmp operation needed
+        # The attention layer will handle the actual comparison
+
+        # Syscall-like request
+        syscall_type = graph.add_const(9)  # Custom memcmp type
+        type_op = graph.add_op(OpType.MOVE, [syscall_type], "IO_TOOL_CALL_TYPE")
+
+        request = graph.add_op(OpType.SYSCALL_REQUEST, [], "syscall_request")
 
         return graph
 

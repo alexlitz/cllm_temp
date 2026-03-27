@@ -2647,15 +2647,20 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     unit += 1
 
     # === SP/BP/STACK0 identity carry (EMBED → OUTPUT passthrough) ===
+    # 2-way AND: MARK_xxx AND NOT IS_BYTE
+    # Prevents activation at byte positions where markers are relayed by attention.
+    # Only activates at actual marker tokens (SP=259, BP=260, STACK0=268).
     for marker_dim in [BD.MARK_SP, BD.MARK_BP, BD.MARK_STACK0]:
         for k in range(16):
             ffn.W_up[unit, marker_dim] = S
+            ffn.W_up[unit, BD.IS_BYTE] = -S  # NOT IS_BYTE
             ffn.b_up[unit] = -S * 0.5
             ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
             ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
             unit += 1
         for k in range(16):
             ffn.W_up[unit, marker_dim] = S
+            ffn.W_up[unit, BD.IS_BYTE] = -S  # NOT IS_BYTE
             ffn.b_up[unit] = -S * 0.5
             ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
             ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -2665,7 +2670,8 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # At SP marker, when PSH: cancel identity carry, write new value.
     # CMP[0] ≈ 1.0 (relayed OP_PSH from L6 attn head 6).
     # Threshold 1.5: CMP[0](1) + MARK_SP(1) = 2 > 1.5 → fires.
-    T_psh = 1.5
+    # DISABLED: CMP[0] has JMP leakage causing false activations (see PSH STACK0 comment)
+    T_psh = 100.0  # DISABLED: was 1.5
     for k in range(16):
         new_k = (k - 8) % 16
         ffn.W_up[unit, BD.CMP + 0] = S  # relayed OP_PSH
@@ -2692,10 +2698,15 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # CMP[0] ≈ 1.0 (relayed OP_PSH). ALU_LO/HI at STACK0 marker has
     # AX_CARRY value (copied by L6 attn head 2). Cancel identity carry
     # and write ALU value.
-    T_psh_s0 = 1.5
+    #
+    # IMPORTANT: CMP[0] can have JMP leakage (~5-7). To prevent false activation,
+    # we disable these units for now until IS_BYTE reliability is fixed.
+    # Temporary workaround: Skip PSH STACK0 units by setting impossible threshold.
+    T_psh_s0 = 100.0  # DISABLED: was 1.5, set to 100 to prevent any activation
     for k in range(16):
         ffn.W_up[unit, BD.CMP + 0] = S  # relayed OP_PSH
         ffn.W_up[unit, BD.MARK_STACK0] = S
+        # ffn.W_up[unit, BD.IS_BYTE] = -S  # NOT IS_BYTE (doesn't work, IS_BYTE cleared)
         ffn.b_up[unit] = -S * T_psh_s0
         # Gate: cancel identity (EMBED_LO) and write AX (ALU_LO from relay)
         ffn.W_gate[unit, BD.EMBED_LO + k] = -1.0
@@ -2705,6 +2716,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.CMP + 0] = S  # relayed OP_PSH
         ffn.W_up[unit, BD.MARK_STACK0] = S
+        # ffn.W_up[unit, BD.IS_BYTE] = -S  # NOT IS_BYTE (doesn't work)
         ffn.b_up[unit] = -S * T_psh_s0
         ffn.W_gate[unit, BD.EMBED_HI + k] = -1.0
         ffn.W_gate[unit, BD.ALU_HI + k] = 1.0

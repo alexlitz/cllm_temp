@@ -254,6 +254,10 @@ class ShiftSelectFFN(nn.Module):
             if coverage > 31:
                 break
 
+        # Positions beyond shift_positions should be 0 for valid shift
+        # We'll suppress output if any higher nibble is non-zero
+        high_nibble_positions = list(range(len(shift_positions), N))
+
         with torch.no_grad():
             W_up = self.flat_ffn.W_up
             b_up = self.flat_ffn.b_up
@@ -287,10 +291,15 @@ class ShiftSelectFFN(nn.Module):
 
                     # 3-unit indicator: step(val == shift_amt)
                     # W_up reads shift amount = sum(NIB_B[i] * base^i)
+                    # Also subtract large penalty for any high nibble to suppress output
                     def set_up(unit, offset):
                         for i in shift_positions:
                             W_up.data[unit, fi(i, ge.NIB_B)] = S * float(base ** i)
                         b_up.data[unit] = -S * float(shift_amt + offset)
+                        # Suppress when any high nibble is non-zero (shift >= 32)
+                        # silu() will clamp to ~0 when input is very negative
+                        for hi_pos in high_nibble_positions:
+                            W_up.data[unit, fi(hi_pos, ge.NIB_B)] = -S * 100.0
 
                     # Unit A: silu(S*(val-k+1)), W_down = +1/S
                     set_up(h, -1)
