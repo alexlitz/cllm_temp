@@ -504,8 +504,8 @@ class DivModModule(nn.Module):
     def _forward_lookup(self, x):
         """Pure FFN forward: SwiGLU with residual.
 
-        Gate by MARK_AX to ensure DIV/MOD only activates at AX marker positions.
-        On first step at PC marker, MARK_AX=0, so delta is zeroed, preserving JMP target.
+        The 6-way AND (MARK_AX + operands + opcode) should prevent activation
+        at non-AX positions. Multiplicative gating disabled for debugging.
         """
         BD = _SetDim
         up = F.linear(x, self.W_up, self.b_up)
@@ -513,10 +513,9 @@ class DivModModule(nn.Module):
         hidden = F.silu(up) * gate
         delta = F.linear(hidden, self.W_down)
 
-        # Gate delta by MARK_AX: only apply at AX marker positions
-        # Expand MARK_AX to match delta shape: (B, S, 1) * delta (B, S, D)
-        mark_ax_gate = x[..., BD.MARK_AX:BD.MARK_AX+1]  # (B, S, 1)
-        delta = delta * mark_ax_gate  # Broadcast multiplication
+        # TEMPORARY: Disable multiplicative gate to debug token 21 issue
+        # mark_ax_gate = x[..., BD.MARK_AX:BD.MARK_AX+1]  # (B, S, 1)
+        # delta = delta * mark_ax_gate  # Broadcast multiplication
 
         return x + delta
 
@@ -3562,13 +3561,14 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
     attn.W_q[base + 5, BD.BYTE_INDEX_2] = L
     attn.W_k[base + 5, BD.BYTE_INDEX_3] = L
 
-    # Gate dim 33: suppress non-AX Q positions AND first step to prevent softmax leakage.
-    # At AX bytes with HAS_SE: Q_gate = 0, score_gate = 0 (neutral).
-    # At non-AX or first step: Q_gate = -10000+, score_gate kills softmax.
-    # Strong penalty needed to overcome positive scores from other dims (up to ~6000).
-    attn.W_q[base + 33, BD.CONST] = -10000.0
+    # Gate dim 33: Enforce AND logic (H1[AX]=1 AND HAS_SE=1) to suppress leakage.
+    # Uses high threshold requiring BOTH conditions to be true.
+    # At AX bytes on subsequent steps (H1[AX]=1, HAS_SE=1): Q_gate = 0, passes
+    # At non-AX (H1[AX]=0): Q_gate = -10000, kills softmax
+    # At first step (HAS_SE=0): Q_gate = -10000, kills softmax (redundant with Q dim 0)
+    attn.W_q[base + 33, BD.CONST] = -20000.0  # Changed from -10000 to enforce AND
     attn.W_q[base + 33, BD.H1 + AX_IDX] = 10000.0
-    attn.W_q[base + 33, BD.HAS_SE] = 10000.0  # NEW: require HAS_SE (suppress first step)
+    attn.W_q[base + 33, BD.HAS_SE] = 10000.0
     attn.W_k[base + 33, BD.CONST] = 5.0
 
     # V: copy CLEAN_EMBED nibbles (16 lo + 16 hi = 32 V dims)

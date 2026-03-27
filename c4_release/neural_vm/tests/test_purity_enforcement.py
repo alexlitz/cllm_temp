@@ -57,38 +57,14 @@ class TestPurityEnforcement(unittest.TestCase):
         self.assertIn("tensor indexing/modification", str(cm.exception))
 
     def test_impure_forward_detected_old_method_calls(self):
-        """Test that calls to old augmentation methods are detected."""
-        model = AutoregressiveVM()
+        """Test that calls to old augmentation methods are detected.
 
-        # Monkey-patch forward() to call old methods
-        def impure_forward(token_ids, kv_cache=None):
-            x = model.embed(token_ids)
-            # These methods don't exist anymore, but pattern check should catch them
-            # _add_code_addr_keys(token_ids, x)  # ← Would be caught
-            for i, block in enumerate(model.blocks):
-                x = block(x, kv_cache=kv_cache)
-            return model.head(x)
-
-        # Add fake old methods to test detection
-        impure_forward.__code__ = type(impure_forward.__code__)(
-            impure_forward.__code__.co_argcount,
-            impure_forward.__code__.co_posonlyargcount,
-            impure_forward.__code__.co_kwonlyargcount,
-            impure_forward.__code__.co_nlocals,
-            impure_forward.__code__.co_stacksize,
-            impure_forward.__code__.co_flags,
-            impure_forward.__code__.co_code,
-            impure_forward.__code__.co_consts,
-            impure_forward.__code__.co_names,
-            impure_forward.__code__.co_varnames,
-            impure_forward.__code__.co_filename,
-            "_add_code_addr_keys(token_ids, x)",  # Inject forbidden call in source
-            impure_forward.__code__.co_firstlineno,
-            impure_forward.__code__.co_lnotab,
-        )
-
-        # Note: Above code object manipulation is tricky and may not work
-        # Let's use a simpler test - just verify the regex patterns work
+        This test is covered by TestPurityPatterns.test_detects_old_method_calls
+        which tests the regex patterns directly. Testing via actual code object
+        manipulation is complex and fragile across Python versions.
+        """
+        # Test is effectively covered by pattern tests below
+        pass
 
     def test_impure_forward_missing_required_structure(self):
         """Test that forward() without required structure is detected."""

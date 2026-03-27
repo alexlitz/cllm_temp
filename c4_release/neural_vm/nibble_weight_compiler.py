@@ -300,6 +300,130 @@ class NibbleWeightEmitter:
 
         self.unit_offset += 3
 
+    def emit_cmp_ne_nibble(self, position: int):
+        """Emit weights for not-equal comparison at nibble position.
+
+        Computes: TEMP[pos] = (NIB_A[pos] != NIB_B[pos]) ? 1 : 0
+        """
+        S = self.reg_map.SCALE
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        temp_slot = self._fi(position, self.reg_map.TEMP)
+
+        # Not-equal is opposite of equal: 1 - eq_result
+        # Unit 0: Write constant 1
+        self._opcode_gate(self.unit_offset)
+        self.b_gate[self.unit_offset] = S
+        self.W_down[temp_slot, self.unit_offset] = 1.0 / S
+
+        # Units 1-3: Subtract equality check (same as emit_cmp_eq)
+        self.W_up[self.unit_offset + 1, a_slot] = S
+        self.W_up[self.unit_offset + 1, b_slot] = -S
+        self.b_up[self.unit_offset + 1] = S
+        self._opcode_gate(self.unit_offset + 1)
+        self.W_down[temp_slot, self.unit_offset + 1] = -1.0 / S
+
+        self.W_up[self.unit_offset + 2, a_slot] = S
+        self.W_up[self.unit_offset + 2, b_slot] = -S
+        self.b_up[self.unit_offset + 2] = 0.0
+        self._opcode_gate(self.unit_offset + 2)
+        self.W_down[temp_slot, self.unit_offset + 2] = 2.0 / S
+
+        self.W_up[self.unit_offset + 3, a_slot] = S
+        self.W_up[self.unit_offset + 3, b_slot] = -S
+        self.b_up[self.unit_offset + 3] = -S
+        self._opcode_gate(self.unit_offset + 3)
+        self.W_down[temp_slot, self.unit_offset + 3] = -1.0 / S
+
+        self.unit_offset += 4
+
+    def emit_cmp_lt_nibble(self, position: int):
+        """Emit weights for less-than comparison at nibble position.
+
+        Computes: TEMP[pos] = (NIB_A[pos] < NIB_B[pos]) ? 1 : 0
+        """
+        S = self.reg_map.SCALE
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        temp_slot = self._fi(position, self.reg_map.TEMP)
+
+        # a < b is equivalent to step(b - a - 1 >= 0)
+        self.W_up[self.unit_offset, b_slot] = S
+        self.W_up[self.unit_offset, a_slot] = -S
+        self.b_up[self.unit_offset] = 0.0  # threshold at 1
+        self._opcode_gate(self.unit_offset)
+        self.W_down[temp_slot, self.unit_offset] = 1.0 / S
+
+        self.unit_offset += 1
+
+    def emit_cmp_gt_nibble(self, position: int):
+        """Emit weights for greater-than comparison at nibble position.
+
+        Computes: TEMP[pos] = (NIB_A[pos] > NIB_B[pos]) ? 1 : 0
+        """
+        S = self.reg_map.SCALE
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        temp_slot = self._fi(position, self.reg_map.TEMP)
+
+        # a > b is equivalent to step(a - b - 1 >= 0)
+        self.W_up[self.unit_offset, a_slot] = S
+        self.W_up[self.unit_offset, b_slot] = -S
+        self.b_up[self.unit_offset] = 0.0  # threshold at 1
+        self._opcode_gate(self.unit_offset)
+        self.W_down[temp_slot, self.unit_offset] = 1.0 / S
+
+        self.unit_offset += 1
+
+    def emit_cmp_le_nibble(self, position: int):
+        """Emit weights for less-or-equal comparison at nibble position.
+
+        Computes: TEMP[pos] = (NIB_A[pos] <= NIB_B[pos]) ? 1 : 0
+        """
+        S = self.reg_map.SCALE
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        temp_slot = self._fi(position, self.reg_map.TEMP)
+
+        # a <= b is equivalent to NOT(a > b) = 1 - step(a - b - 1 >= 0)
+        # Unit 0: Write constant 1
+        self._opcode_gate(self.unit_offset)
+        self.b_gate[self.unit_offset] = S
+        self.W_down[temp_slot, self.unit_offset] = 1.0 / S
+
+        # Unit 1: Subtract step(a - b - 1 >= 0)
+        self.W_up[self.unit_offset + 1, a_slot] = S
+        self.W_up[self.unit_offset + 1, b_slot] = -S
+        self.b_up[self.unit_offset + 1] = 0.0
+        self._opcode_gate(self.unit_offset + 1)
+        self.W_down[temp_slot, self.unit_offset + 1] = -1.0 / S
+
+        self.unit_offset += 2
+
+    def emit_cmp_ge_nibble(self, position: int):
+        """Emit weights for greater-or-equal comparison at nibble position.
+
+        Computes: TEMP[pos] = (NIB_A[pos] >= NIB_B[pos]) ? 1 : 0
+        """
+        S = self.reg_map.SCALE
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        temp_slot = self._fi(position, self.reg_map.TEMP)
+
+        # a >= b is equivalent to step(a - b >= 0)
+        self.W_up[self.unit_offset, a_slot] = S
+        self.W_up[self.unit_offset, b_slot] = -S
+        self.b_up[self.unit_offset] = S
+        self._opcode_gate(self.unit_offset)
+        self.W_down[temp_slot, self.unit_offset] = 1.0 / S
+
+        self.unit_offset += 1
+
     def emit_move_nibble(self, position: int):
         """Emit weights for MOVE at nibble position.
 
@@ -320,6 +444,469 @@ class NibbleWeightEmitter:
         self.W_down[result_slot, self.unit_offset + 1] = 1.0 / S
 
         self.unit_offset += 2
+
+    def emit_flag_set(self, flag_dim: int):
+        """Emit weights to set a flag dimension to 1.0.
+
+        Args:
+            flag_dim: Dimension index of flag to set
+
+        This is a simple constant write operation.
+        """
+        S = self.reg_map.SCALE
+
+        # Unit 0-1: Write 1.0 to flag dimension (cancel pair pattern)
+        self._opcode_gate(self.unit_offset)
+        self.b_gate[self.unit_offset] = S  # Constant S
+        self.W_down[flag_dim, self.unit_offset] = 1.0 / S  # Result = S/S = 1.0
+
+        self._opcode_gate(self.unit_offset + 1)
+        self.b_gate[self.unit_offset + 1] = -S
+        self.W_down[flag_dim, self.unit_offset + 1] = 1.0 / S
+
+        self.unit_offset += 2
+
+    def emit_flag_clear(self, flag_dim: int):
+        """Emit weights to clear a flag dimension to 0.0.
+
+        Args:
+            flag_dim: Dimension index of flag to clear
+
+        Uses subtraction: flag = flag - flag = 0
+        """
+        S = self.reg_map.SCALE
+
+        # Unit 0-1: Read current flag value and subtract it (result = 0)
+        self.W_up[self.unit_offset, flag_dim] = S
+        self._opcode_gate(self.unit_offset)
+        self.W_down[flag_dim, self.unit_offset] = -1.0 / S
+
+        self.W_up[self.unit_offset + 1, flag_dim] = -S
+        self._opcode_gate(self.unit_offset + 1)
+        self.W_down[flag_dim, self.unit_offset + 1] = -1.0 / S
+
+        self.unit_offset += 2
+
+    def emit_mem_read_request(self, src_nibbles: list, mem_addr_start: int, mem_read_flag: int):
+        """Emit weights for memory read request.
+
+        Copies source nibbles to MEM_ADDR mailbox and sets MEM_READ flag.
+
+        Args:
+            src_nibbles: List of (position, slot) tuples for source address nibbles
+            mem_addr_start: Starting dimension of MEM_ADDR mailbox (E.MEM_ADDR_BASE)
+            mem_read_flag: Dimension index of MEM_READ flag (E.MEM_READ)
+        """
+        S = self.reg_map.SCALE
+
+        # Copy each nibble to memory address mailbox
+        for i, (src_pos, src_slot) in enumerate(src_nibbles):
+            src_idx = self._fi(src_pos, src_slot)
+            dest_idx = mem_addr_start + i
+
+            # Cancel pair: copy source nibble to MEM_ADDR[i]
+            self.W_up[self.unit_offset, src_idx] = S
+            self._opcode_gate(self.unit_offset)
+            self.W_down[dest_idx, self.unit_offset] = 1.0 / S
+
+            self.W_up[self.unit_offset + 1, src_idx] = -S
+            self._opcode_gate(self.unit_offset + 1)
+            self.W_down[dest_idx, self.unit_offset + 1] = 1.0 / S
+
+            self.unit_offset += 2
+
+        # Set MEM_READ flag = 1.0
+        self.emit_flag_set(mem_read_flag)
+
+    def emit_mem_write_request(self, addr_nibbles: list, data_nibbles: list,
+                               mem_addr_start: int, mem_data_start: int, mem_write_flag: int):
+        """Emit weights for memory write request.
+
+        Copies address and data nibbles to mailbox and sets MEM_WRITE flag.
+
+        Args:
+            addr_nibbles: List of (position, slot) for address
+            data_nibbles: List of (position, slot) for data
+            mem_addr_start: MEM_ADDR mailbox start (E.MEM_ADDR_BASE)
+            mem_data_start: MEM_DATA mailbox start (E.MEM_DATA_BASE)
+            mem_write_flag: MEM_WRITE flag dimension (E.MEM_WRITE)
+        """
+        S = self.reg_map.SCALE
+
+        # Copy address nibbles
+        for i, (src_pos, src_slot) in enumerate(addr_nibbles):
+            src_idx = self._fi(src_pos, src_slot)
+            dest_idx = mem_addr_start + i
+
+            self.W_up[self.unit_offset, src_idx] = S
+            self._opcode_gate(self.unit_offset)
+            self.W_down[dest_idx, self.unit_offset] = 1.0 / S
+
+            self.W_up[self.unit_offset + 1, src_idx] = -S
+            self._opcode_gate(self.unit_offset + 1)
+            self.W_down[dest_idx, self.unit_offset + 1] = 1.0 / S
+
+            self.unit_offset += 2
+
+        # Copy data nibbles
+        for i, (src_pos, src_slot) in enumerate(data_nibbles):
+            src_idx = self._fi(src_pos, src_slot)
+            dest_idx = mem_data_start + i
+
+            self.W_up[self.unit_offset, src_idx] = S
+            self._opcode_gate(self.unit_offset)
+            self.W_down[dest_idx, self.unit_offset] = 1.0 / S
+
+            self.W_up[self.unit_offset + 1, src_idx] = -S
+            self._opcode_gate(self.unit_offset + 1)
+            self.W_down[dest_idx, self.unit_offset + 1] = 1.0 / S
+
+            self.unit_offset += 2
+
+        # Set MEM_WRITE flag = 1.0
+        self.emit_flag_set(mem_write_flag)
+
+    def emit_pc_conditional(self, cond_slot: int, target_nibbles: list, pc_nibbles: list):
+        """Emit weights for conditional PC update.
+
+        Computes: PC = cond ? target : (PC + instruction_width)
+
+        Args:
+            cond_slot: Dimension index of condition flag (0 or 1)
+            target_nibbles: List of (position, slot) for target address
+            pc_nibbles: List of (position, slot) for current PC
+        """
+        # This is just a SELECT operation applied to PC nibbles
+        # For each nibble position: PC[i] = cond ? target[i] : fallthrough[i]
+
+        S = self.reg_map.SCALE
+
+        for i in range(len(target_nibbles)):
+            tgt_pos, tgt_slot = target_nibbles[i]
+            pc_pos, pc_slot = pc_nibbles[i]
+
+            tgt_idx = self._fi(tgt_pos, tgt_slot)
+            pc_idx = self._fi(pc_pos, pc_slot)
+            result_idx = pc_idx  # Write result back to PC
+
+            # SELECT implementation: result = cond * target + (1 - cond) * fallthrough
+            # Unit 0-1: cond * target
+            self.W_up[self.unit_offset, cond_slot] = S
+            self.W_gate[self.unit_offset, tgt_idx] = 1.0
+            self.W_down[result_idx, self.unit_offset] = 1.0 / S
+
+            self.W_up[self.unit_offset + 1, cond_slot] = -S
+            self.W_gate[self.unit_offset + 1, tgt_idx] = -1.0
+            self.W_down[result_idx, self.unit_offset + 1] = 1.0 / S
+
+            # Unit 2-3: (1 - cond) * fallthrough
+            self.b_up[self.unit_offset + 2] = S  # Constant 1
+            self.W_up[self.unit_offset + 2, cond_slot] = -S  # Subtract cond
+            self.W_gate[self.unit_offset + 2, pc_idx] = 1.0
+            self.W_down[result_idx, self.unit_offset + 2] = 1.0 / S
+
+            self.b_up[self.unit_offset + 3] = -S
+            self.W_up[self.unit_offset + 3, cond_slot] = S
+            self.W_gate[self.unit_offset + 3, pc_idx] = -1.0
+            self.W_down[result_idx, self.unit_offset + 3] = 1.0 / S
+
+            self.unit_offset += 4
+
+    def emit_bitwise_op_nibble(self, position: int, op_type: str):
+        """Emit weights for bitwise operation at nibble position.
+
+        Uses lookup table: one hidden unit per (a, b) pair.
+        For base=16 (nibbles), need 16×16 = 256 units per position.
+
+        Args:
+            position: Nibble position (0-7)
+            op_type: "or", "xor", or "and"
+        """
+        S = self.reg_map.SCALE
+        base = 16
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        result_slot = self._fi(position, self.reg_map.RESULT)
+
+        # Lookup table: 256 units (16×16 combinations)
+        for a in range(base):
+            for b in range(base):
+                # Compute result based on operation
+                if op_type == "or":
+                    result = a | b
+                elif op_type == "xor":
+                    result = a ^ b
+                elif op_type == "and":
+                    result = a & b
+                else:
+                    raise ValueError(f"Unknown bitwise op: {op_type}")
+
+                # Unit detects (a, b) pair and outputs result
+                # Pattern: step(A >= a) AND step(A < a+1) AND step(B >= b) AND step(B < b+1)
+                # Simplified: Use exact match via threshold
+
+                # W_up: detect exact values
+                self.W_up[self.unit_offset, a_slot] = S
+                self.W_up[self.unit_offset, b_slot] = S
+                self.b_up[self.unit_offset] = -S * (a + b - 0.5)  # Threshold
+
+                # W_gate: opcode gating
+                self._opcode_gate(self.unit_offset)
+
+                # W_down: output result
+                self.W_down[result_slot, self.unit_offset] = result / S
+
+                self.unit_offset += 1
+
+    def emit_mul_nibble(self, position: int):
+        """Emit weights for multiplication at nibble position.
+
+        MUL needs carry propagation across nibbles, but for single nibble:
+        result = (a * b) mod 16, carry_out = (a * b) // 16
+        """
+        S = self.reg_map.SCALE
+        base = 16
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        result_slot = self._fi(position, self.reg_map.RESULT)
+        carry_slot = self._fi(position, self.reg_map.CARRY_OUT)
+
+        # Lookup table: 256 units
+        for a in range(base):
+            for b in range(base):
+                product = a * b
+                result = product % base
+                carry = product // base
+
+                # Detect (a, b) pair
+                self.W_up[self.unit_offset, a_slot] = S
+                self.W_up[self.unit_offset, b_slot] = S
+                self.b_up[self.unit_offset] = -S * (a + b - 0.5)
+
+                self._opcode_gate(self.unit_offset)
+
+                # Output result and carry
+                self.W_down[result_slot, self.unit_offset] = result / S
+                self.W_down[carry_slot, self.unit_offset] = carry / S
+
+                self.unit_offset += 1
+
+    def emit_div_nibble(self, position: int):
+        """Emit weights for division at nibble position.
+
+        For single nibble: result = a // b, carry_out = a % b (remainder)
+        Division by zero returns 0.
+        """
+        S = self.reg_map.SCALE
+        base = 16
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        result_slot = self._fi(position, self.reg_map.RESULT)
+        carry_slot = self._fi(position, self.reg_map.CARRY_OUT)
+
+        # Lookup table: 256 units
+        for a in range(base):
+            for b in range(base):
+                if b == 0:
+                    quotient = 0
+                    remainder = a
+                else:
+                    quotient = a // b
+                    remainder = a % b
+
+                # Detect (a, b) pair
+                self.W_up[self.unit_offset, a_slot] = S
+                self.W_up[self.unit_offset, b_slot] = S
+                self.b_up[self.unit_offset] = -S * (a + b - 0.5)
+
+                self._opcode_gate(self.unit_offset)
+
+                # Output quotient and remainder
+                self.W_down[result_slot, self.unit_offset] = quotient / S
+                self.W_down[carry_slot, self.unit_offset] = remainder / S
+
+                self.unit_offset += 1
+
+    def emit_mod_nibble(self, position: int):
+        """Emit weights for modulo at nibble position.
+
+        For single nibble: result = a % b
+        Modulo by zero returns 0.
+        """
+        S = self.reg_map.SCALE
+        base = 16
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        result_slot = self._fi(position, self.reg_map.RESULT)
+
+        # Lookup table: 256 units
+        for a in range(base):
+            for b in range(base):
+                if b == 0:
+                    result = 0
+                else:
+                    result = a % b
+
+                # Detect (a, b) pair
+                self.W_up[self.unit_offset, a_slot] = S
+                self.W_up[self.unit_offset, b_slot] = S
+                self.b_up[self.unit_offset] = -S * (a + b - 0.5)
+
+                self._opcode_gate(self.unit_offset)
+
+                # Output result
+                self.W_down[result_slot, self.unit_offset] = result / S
+
+                self.unit_offset += 1
+
+    def emit_shl_nibble(self, position: int):
+        """Emit weights for shift left at nibble position.
+
+        For single nibble: result = (a << (b % 4)) % 16, carry = (a << (b % 4)) // 16
+        Shift amount limited to 0-3 for nibble size.
+        """
+        S = self.reg_map.SCALE
+        base = 16
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        result_slot = self._fi(position, self.reg_map.RESULT)
+        carry_slot = self._fi(position, self.reg_map.CARRY_OUT)
+
+        # Lookup table: 256 units
+        for a in range(base):
+            for b in range(base):
+                shift_amt = b % 4  # Limit to 0-3
+                shifted = a << shift_amt
+                result = shifted % base
+                carry = shifted // base
+
+                # Detect (a, b) pair
+                self.W_up[self.unit_offset, a_slot] = S
+                self.W_up[self.unit_offset, b_slot] = S
+                self.b_up[self.unit_offset] = -S * (a + b - 0.5)
+
+                self._opcode_gate(self.unit_offset)
+
+                # Output result and carry
+                self.W_down[result_slot, self.unit_offset] = result / S
+                self.W_down[carry_slot, self.unit_offset] = carry / S
+
+                self.unit_offset += 1
+
+    def emit_shr_nibble(self, position: int):
+        """Emit weights for shift right at nibble position.
+
+        For single nibble: result = a >> (b % 4)
+        Shift amount limited to 0-3 for nibble size.
+        """
+        S = self.reg_map.SCALE
+        base = 16
+
+        a_slot = self._fi(position, self.reg_map.NIB_A)
+        b_slot = self._fi(position, self.reg_map.NIB_B)
+        result_slot = self._fi(position, self.reg_map.RESULT)
+
+        # Lookup table: 256 units
+        for a in range(base):
+            for b in range(base):
+                shift_amt = b % 4  # Limit to 0-3
+                result = a >> shift_amt
+
+                # Detect (a, b) pair
+                self.W_up[self.unit_offset, a_slot] = S
+                self.W_up[self.unit_offset, b_slot] = S
+                self.b_up[self.unit_offset] = -S * (a + b - 0.5)
+
+                self._opcode_gate(self.unit_offset)
+
+                # Output result
+                self.W_down[result_slot, self.unit_offset] = result / S
+
+                self.unit_offset += 1
+
+    def emit_io_putchar_request(self, char_nibbles: list, io_char_start: int, io_ready_flag: int):
+        """Emit weights for PUTCHAR I/O request.
+
+        Copies character nibbles to IO_CHAR mailbox and sets IO_OUTPUT_READY flag.
+
+        Args:
+            char_nibbles: List of (position, slot) for character nibbles
+            io_char_start: IO_CHAR mailbox start (E.IO_CHAR)
+            io_ready_flag: IO_OUTPUT_READY flag (E.IO_OUTPUT_READY)
+        """
+        S = self.reg_map.SCALE
+
+        # Copy character nibbles to I/O mailbox
+        for i, (src_pos, src_slot) in enumerate(char_nibbles):
+            src_idx = self._fi(src_pos, src_slot)
+            dest_idx = io_char_start + i
+
+            # Cancel pair: copy nibble
+            self.W_up[self.unit_offset, src_idx] = S
+            self._opcode_gate(self.unit_offset)
+            self.W_down[dest_idx, self.unit_offset] = 1.0 / S
+
+            self.W_up[self.unit_offset + 1, src_idx] = -S
+            self._opcode_gate(self.unit_offset + 1)
+            self.W_down[dest_idx, self.unit_offset + 1] = 1.0 / S
+
+            self.unit_offset += 2
+
+        # Set IO_OUTPUT_READY flag
+        self.emit_flag_set(io_ready_flag)
+
+    def emit_io_getchar_request(self, io_need_input_flag: int):
+        """Emit weights for GETCHAR I/O request.
+
+        Simply sets IO_NEED_INPUT flag.
+
+        Args:
+            io_need_input_flag: IO_NEED_INPUT flag (E.IO_NEED_INPUT)
+        """
+        self.emit_flag_set(io_need_input_flag)
+
+    def emit_stack_push_request(self, sp_nibbles: list, data_nibbles: list,
+                                mem_addr_start: int, mem_data_start: int, mem_write_flag: int):
+        """Emit weights for stack push operation.
+
+        Computes: SP -= 8, *SP = data
+
+        Args:
+            sp_nibbles: List of (position, slot) for SP register
+            data_nibbles: List of (position, slot) for data to push
+            mem_addr_start: MEM_ADDR mailbox start
+            mem_data_start: MEM_DATA mailbox start
+            mem_write_flag: MEM_WRITE flag
+        """
+        S = self.reg_map.SCALE
+
+        # First, decrement SP by 8
+        # For nibble 0 (least significant): SP[0] -= 8
+        sp_pos, sp_slot = sp_nibbles[0]
+        sp_idx = self._fi(sp_pos, sp_slot)
+
+        # Subtract 8 from SP[0]
+        # Cancel pair: SP[0] = SP[0] - 8
+        self.W_up[self.unit_offset, sp_idx] = S
+        self._opcode_gate(self.unit_offset)
+        self.b_gate[self.unit_offset] = -8.0  # Subtract 8
+        self.W_down[sp_idx, self.unit_offset] = 1.0 / S
+
+        self.W_up[self.unit_offset + 1, sp_idx] = -S
+        self._opcode_gate(self.unit_offset + 1)
+        self.b_gate[self.unit_offset + 1] = 8.0
+        self.W_down[sp_idx, self.unit_offset + 1] = 1.0 / S
+
+        self.unit_offset += 2
+
+        # Copy updated SP to MEM_ADDR, data to MEM_DATA, set MEM_WRITE
+        self.emit_mem_write_request(sp_nibbles, data_nibbles,
+                                    mem_addr_start, mem_data_start, mem_write_flag)
 
     def get_weights(self) -> Dict[str, torch.Tensor]:
         """Return weight matrices for PureFFN integration."""
@@ -375,6 +962,8 @@ class NibbleWeightCompiler:
         Returns:
             Dictionary of weight matrices compatible with PureFFN
         """
+        from .embedding import E
+
         emitter = NibbleWeightEmitter(opcode, self.num_positions)
 
         # Emit operation for all nibble positions
@@ -383,12 +972,45 @@ class NibbleWeightCompiler:
                 emitter.emit_add_nibble(pos)
             elif op_type == OpType.SUB:
                 emitter.emit_sub_nibble(pos)
+            elif op_type == OpType.MUL:
+                emitter.emit_mul_nibble(pos)
+            elif op_type == OpType.DIV:
+                emitter.emit_div_nibble(pos)
+            elif op_type == OpType.MOD:
+                emitter.emit_mod_nibble(pos)
             elif op_type == OpType.CMP_EQ:
                 emitter.emit_cmp_eq_nibble(pos)
+            elif op_type == OpType.CMP_NE:
+                emitter.emit_cmp_ne_nibble(pos)
+            elif op_type == OpType.CMP_LT:
+                emitter.emit_cmp_lt_nibble(pos)
+            elif op_type == OpType.CMP_GT:
+                emitter.emit_cmp_gt_nibble(pos)
+            elif op_type == OpType.CMP_LE:
+                emitter.emit_cmp_le_nibble(pos)
+            elif op_type == OpType.CMP_GE:
+                emitter.emit_cmp_ge_nibble(pos)
+            elif op_type == OpType.BIT_OR:
+                emitter.emit_bitwise_op_nibble(pos, "or")
+            elif op_type == OpType.BIT_XOR:
+                emitter.emit_bitwise_op_nibble(pos, "xor")
+            elif op_type == OpType.BIT_AND:
+                emitter.emit_bitwise_op_nibble(pos, "and")
+            elif op_type == OpType.SHL:
+                emitter.emit_shl_nibble(pos)
+            elif op_type == OpType.SHR:
+                emitter.emit_shr_nibble(pos)
             elif op_type == OpType.MOVE:
                 emitter.emit_move_nibble(pos)
             else:
                 raise NotImplementedError(f"OpType {op_type} not yet implemented for nibble compilation")
+
+        # Special case: flag operations (not per-nibble)
+        if op_type == OpType.FLAG_SET:
+            # Example: SET IO_PROGRAM_END flag
+            emitter.emit_flag_set(E.IO_PROGRAM_END)
+        elif op_type == OpType.FLAG_CLEAR:
+            emitter.emit_flag_clear(E.IO_PROGRAM_END)
 
         return emitter.get_weights()
 

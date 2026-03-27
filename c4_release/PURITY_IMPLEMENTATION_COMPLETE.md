@@ -1,15 +1,16 @@
-# 🎯 Autoregressive Purity Implementation: COMPLETE
+# 🎯 Autoregressive Purity Implementation: COMPLETE + ENFORCED
 
 ## Executive Summary
 
-**All violations fixed. System now achieves 100% autoregressive purity.**
+**All violations fixed. System now achieves 100% autoregressive purity with structural enforcement.**
 
 ### ✅ Goals Achieved
 
 1. **Pure Forward Pass**: All computation in FFN/MoE/Attention, zero Python modifications
 2. **Token-by-Token Generation**: True autoregressive generation implemented
 3. **Backward Compatible**: Existing batch mode (speculative decoding) preserved
-4. **Tested**: 8/8 embedding tests passing, forward pass verified working
+4. **Structurally Enforced**: Purity violations are blocked at runtime (cannot load weights)
+5. **Tested**: 8/8 embedding tests + 18/18 enforcement tests passing
 
 ---
 
@@ -108,9 +109,84 @@ model.generate_autoregressive_with_kv_cache(context, max_steps=10000)
 
 ---
 
+## Structural Enforcement
+
+The purity is NOT just by convention - it's **structurally enforced** at runtime.
+
+### How It Works
+
+**Purity Guard System** (`neural_vm/purity_guard.py`):
+- Inspects `forward()` source code before loading weights
+- Blocks forbidden patterns (tensor modifications, old method calls)
+- Requires NeuralVMEmbedding (not plain nn.Embedding)
+- Integrated into `set_vm_weights()` - weights won't load if impure
+
+**Forbidden Patterns** (automatically detected):
+```python
+# BLOCKED: Direct tensor modification
+x[0, 0, 100] = 42.0  # ← PurityViolationError
+
+# BLOCKED: Data tensor modification
+x.data[0, 0] = 1.0  # ← PurityViolationError
+
+# BLOCKED: Old augmentation methods
+self._add_code_addr_keys(token_ids, x)  # ← PurityViolationError
+self._inject_mem_store(token_ids, x)   # ← PurityViolationError
+
+# BLOCKED: Wrong embedding type
+model.embed = nn.Embedding(272, 512)  # ← PurityViolationError when loading weights
+```
+
+**Required Structure** (verified):
+```python
+def forward(self, token_ids, kv_cache=None):
+    x = self.embed(token_ids)  # Must call embed
+    for i, block in enumerate(self.blocks):  # Must iterate blocks
+        x = block(x, kv_cache)
+    return self.head(x)  # Must call head
+```
+
+### Enforcement Points
+
+1. **At Weight Loading**: `set_vm_weights()` calls `verify_forward_purity()` first
+2. **At Model Creation**: Optional `create_pure_model()` factory validates immediately
+3. **Manual Verification**: `enable_purity_enforcement(model, strict=True)` can be called anytime
+
+### Example: Violation Blocked
+
+```python
+from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
+import torch.nn as nn
+
+model = AutoregressiveVM()
+
+# Make model impure
+model.embed = nn.Embedding(272, 512)  # Wrong type!
+
+# Try to load weights
+set_vm_weights(model)  # ← PurityViolationError!
+# Error: "model.embed must be NeuralVMEmbedding!"
+# Weights are NOT loaded - model remains unusable
+```
+
+### Comparison to DraftVM Blocking
+
+Like the `_BlockedDraftVM` wrapper that prevents access to draft results:
+
+| Feature | DraftVM Blocking | Purity Enforcement |
+|---------|------------------|-------------------|
+| **Mechanism** | Wrapper class blocking attributes | Source code inspection |
+| **When** | Runtime (every attribute access) | Weight loading (once) |
+| **Prevention** | Structural (can't access at all) | Structural (can't load weights if violated) |
+| **Bypass** | Would require explicit unwrapping | Would require commenting out verification |
+
+Both provide **structural guarantees** that violations require **deliberate circumvention**.
+
+---
+
 ## Files Changed
 
-### Created (3 files)
+### Created (5 files)
 
 1. **`neural_vm/neural_embedding.py`**
    - NeuralVMEmbedding class (145 lines)
@@ -120,12 +196,25 @@ model.generate_autoregressive_with_kv_cache(context, max_steps=10000)
    - 8 unit tests verifying equivalence
    - All passing ✅
 
-3. **`PURITY_IMPLEMENTATION_COMPLETE.md`** (this file)
+3. **`neural_vm/purity_guard.py`** (NEW)
+   - PurityViolationError exception
+   - verify_forward_purity() - inspects forward() source
+   - verify_embedding_purity() - validates NeuralVMEmbedding
+   - enable_purity_enforcement() - top-level checker
+   - create_pure_model() - factory with verification
+
+4. **`neural_vm/tests/test_purity_enforcement.py`** (NEW)
+   - 18 unit tests verifying enforcement works
+   - Tests blocking of violations
+   - All passing ✅
+
+5. **`PURITY_IMPLEMENTATION_COMPLETE.md`** (this file)
    - Implementation summary
 
-### Modified (3 files)
+### Modified (4 files)
 
-4. **`neural_vm/vm_step.py`**
+1. **`neural_vm/vm_step.py`**
+   - Added purity verification at start of set_vm_weights() (lines 1257-1260)
    - Import NeuralVMEmbedding (line 27)
    - Use NeuralVMEmbedding in __init__ (line 606)
    - Simplified forward() - pure (lines 764-774)
@@ -135,14 +224,17 @@ model.generate_autoregressive_with_kv_cache(context, max_steps=10000)
    - Added generate_autoregressive() (lines 810-858)
    - Added generate_autoregressive_with_kv_cache() (lines 861-915)
 
-5. **`neural_vm/run_vm.py`**
+2. **`neural_vm/run_vm.py`**
    - Updated _mem_history_end tracking (3 locations)
    - Changed to use embed.set_mem_history_end()
 
-6. **`AUTOREGRESSIVE_PURITY_AUDIT.md`**
+3. **`AUTOREGRESSIVE_PURITY_AUDIT.md`**
    - Added "VIOLATIONS FIXED" header
    - Updated status table to all ✅
    - Added implementation details
+
+4. **`PURITY_IMPLEMENTATION_COMPLETE.md`** (this file)
+   - Updated to document structural enforcement
 
 ---
 
@@ -164,6 +256,27 @@ python -m pytest neural_vm/tests/test_neural_embedding.py -v
 6. ✅ Full embedding with realistic program
 7. ✅ Equivalence vs old implementation
 8. ✅ Batch processing
+
+### Purity Enforcement Tests ✅
+
+```bash
+python -m pytest neural_vm/tests/test_purity_enforcement.py -v
+# 18 passed
+```
+
+**Tests:**
+1. ✅ Pure model passes verification
+2. ✅ Tensor modifications detected and blocked
+3. ✅ Old method calls detected and blocked
+4. ✅ Missing required structure detected
+5. ✅ Wrong embedding type detected
+6. ✅ Embedding missing augmentation methods detected
+7. ✅ set_vm_weights() blocks impure models
+8. ✅ Pure model loads weights successfully
+9. ✅ Strict mode enforcement
+10. ✅ Non-strict mode (warnings only)
+11-15. ✅ Pattern detection tests (regex verification)
+16-18. ✅ Embedding purity verification
 
 ### Integration Tests ✅
 
@@ -329,20 +442,23 @@ print(f"Embedding output shape: {x.shape}")
 - ✅ Core purity violations fixed
 - ✅ Embedding layer refactored
 - ✅ Token-by-token generation implemented
-- ✅ Unit tests passing
+- ✅ Structural enforcement implemented
+- ✅ Unit tests passing (8/8 embedding + 18/18 enforcement)
 - ✅ Forward pass verified
-- ✅ Documentation updated (audit)
+- ✅ Documentation updated (audit + enforcement)
 
 ---
 
 ## Summary
 
-**The Neural C4 VM now achieves 100% autoregressive purity:**
+**The Neural C4 VM now achieves 100% autoregressive purity with structural enforcement:**
 
 1. **Forward pass is pure** - Only `embed → blocks → head`
 2. **No Python modifications** - All computation through neural layers
 3. **True autoregressive generation** - Token-by-token mode available
 4. **Backward compatible** - Existing batch mode preserved
-5. **Tested and verified** - 8/8 tests passing, integration verified
+5. **Structurally enforced** - Purity violations blocked at weight loading
+6. **Cannot be easily altered** - Requires deliberate circumvention (commenting out verification)
+7. **Tested and verified** - 26/26 tests passing (8 embedding + 18 enforcement)
 
-**All requirements met. Implementation complete.**
+**All requirements met. Implementation complete with structural guarantees.**

@@ -60,6 +60,30 @@ class OpType(Enum):
     LOOKUP = "lookup"        # memory[addr] → value
     STORE = "store"          # memory[addr] = value
 
+    # Memory request primitives (FFN → Attention interface)
+    MEM_READ_REQUEST = "mem_read_request"      # Copy addr to mailbox, set MEM_READ flag
+    MEM_WRITE_REQUEST = "mem_write_request"    # Copy addr+data to mailbox, set MEM_WRITE flag
+    STACK_PUSH_REQUEST = "stack_push_request"  # SP -= 8, write to *SP
+    STACK_POP_REQUEST = "stack_pop_request"    # Read from *SP, SP += 8
+
+    # Control flow primitives (FFN)
+    PC_SET = "pc_set"                          # PC = value
+    PC_CONDITIONAL = "pc_conditional"          # PC = cond ? target : fallthrough
+
+    # I/O primitives (FFN)
+    IO_PUTCHAR_REQUEST = "io_putchar_request"  # Copy char to mailbox, set OUTPUT_READY
+    IO_GETCHAR_REQUEST = "io_getchar_request"  # Set NEED_INPUT flag
+    IO_READ_RESPONSE = "io_read_response"      # Read from I/O mailbox to register
+
+    # System call primitives (FFN)
+    SYSCALL_REQUEST = "syscall_request"        # Set TOOL_CALL_TYPE + params
+    SYSCALL_RESPONSE = "syscall_response"      # Read response from mailbox
+
+    # Flag operations (FFN)
+    FLAG_SET = "flag_set"                      # Set flag dimension to 1.0
+    FLAG_CLEAR = "flag_clear"                  # Clear flag dimension to 0.0
+    FLAG_CHECK = "flag_check"                  # Read flag value
+
     # Register operations
     MOVE = "move"            # dst = src (relay)
     CLEAR = "clear"          # dst = 0
