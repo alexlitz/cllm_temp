@@ -24,6 +24,7 @@ from typing import List
 from .embedding import E, Opcode
 from .base_layers import PureFFN, PureAttention, sparse_linear
 from .kv_cache_eviction import softmax1
+from .neural_embedding import NeuralVMEmbedding
 from .constants import INSTR_WIDTH, PC_OFFSET
 from .dim_registry import (
     build_default_registry,
@@ -601,7 +602,8 @@ class AutoregressiveVM(nn.Module):
         self.d_model = d_model
         self.max_seq_len = max_seq_len
 
-        self.embed = nn.Embedding(vocab_size, d_model)
+        # Use NeuralVMEmbedding with integrated augmentations
+        self.embed = NeuralVMEmbedding(vocab_size, d_model)
 
         self.blocks = nn.ModuleList(
             [
@@ -759,79 +761,17 @@ class AutoregressiveVM(nn.Module):
         Returns:
             [batch, seq, vocab_size] logits
         """
+        # Pure forward pass: embed → blocks → head
+        # All augmentations (ADDR_KEY, MEM_STORE) are inside NeuralVMEmbedding
         x = self.embed(token_ids)
-        # Pure autoregressive: Code bytes are system prompt input.
-        # ADDR_KEY is computed as part of embedding (position-dependent, weight-based).
-        # Similar to RoPE/ALiBi: positional info in embeddings is acceptable.
-        self._add_code_addr_keys(token_ids, x)
-        # Inject MEM_STORE for historical memory markers (needed for L15 lookup)
-        self._inject_mem_store(token_ids, x)
+
         for i, block in enumerate(self.blocks):
             layer_cache = kv_cache.get_layer_cache(i) if kv_cache is not None else None
             x = block(x, kv_cache=layer_cache)
+
         if self.head.weight.is_sparse:
             return sparse_linear(x, self.head.weight, self.head.bias)
         return self.head(x)
-
-    def _add_code_addr_keys(self, token_ids, x):
-        """Add ADDR_KEY to code byte embeddings (pure autoregressive).
-
-        Code bytes (between CODE_START and CODE_END) are system prompt input.
-        ADDR_KEY is position-dependent metadata added to embeddings,
-        similar to how RoPE adds positional info. This is weight-based:
-        the computation is deterministic from position, no learned parameters.
-
-        Maps byte tokens to sequential addresses starting at 0:
-        - Code byte 0 (first opcode): addr=0
-        - Code byte 1 (imm[0]): addr=1
-        - Code byte 2 (imm[1]): addr=2
-        - etc.
-
-        NOTE: This is SEQUENTIAL addressing, not aligned to INSTR_WIDTH.
-        The model weights were trained with this sequential scheme.
-        """
-        BD = _SetDim
-        B, S = token_ids.shape
-
-        for b in range(B):
-            cs_pos = None
-            for i in range(S):
-                tok = token_ids[b, i].item()
-                if tok == Token.CODE_START:
-                    cs_pos = i
-                elif tok == Token.CODE_END:
-                    break
-                elif cs_pos is not None and tok < 256:
-                    addr = i - cs_pos - 1  # Sequential addressing
-                    if addr < 0:
-                        continue
-                    # Write address as nibbles to ADDR_KEY
-                    lo = addr & 0xF
-                    hi = (addr >> 4) & 0xF
-                    top = (addr >> 8) & 0xF
-                    x[b, i, BD.ADDR_KEY + lo] = 1.0
-                    x[b, i, BD.ADDR_KEY + 16 + hi] = 1.0
-                    x[b, i, BD.ADDR_KEY + 32 + top] = 1.0
-
-    def _inject_mem_store(self, token_ids, x):
-        """Inject MEM_STORE=1.0 on historical MEM markers for L15 K-side.
-
-        Historical MEM sections (from prior store ops retained in context)
-        lack the MEM_STORE flag that L6 head 6 sets for the current step.
-        Without this flag, L15 memory lookup won't match these positions.
-
-        Only injects on MEM markers in the retained history region
-        (prefix_len .. _mem_history_end), not the current step's MEM section.
-        """
-        BD = _SetDim
-        end = getattr(self, '_mem_history_end', 0)
-        if end == 0:
-            return
-        B, S = token_ids.shape
-        for b in range(B):
-            for i in range(min(end, S)):
-                if token_ids[b, i].item() == Token.MEM:
-                    x[b, i, BD.MEM_STORE] = 1.0
 
     @torch.no_grad()
     def generate_next(self, context, temperature=0.0):
@@ -865,6 +805,114 @@ class AutoregressiveVM(nn.Module):
         token_ids = torch.tensor(contexts, dtype=torch.long)  # [B, S]
         logits = self.forward(token_ids)  # [B, S, vocab]
         return logits[:, -1, :].argmax(-1).tolist()  # list of B ints
+
+    @torch.no_grad()
+    def generate_autoregressive(self, context, max_steps=10000, temperature=0.0):
+        """True autoregressive generation: one token at a time.
+
+        This is 100% autoregressive - each token gets a full forward pass
+        through the entire model based on ALL previous tokens. No batch
+        processing, no speculation - just pure sequential generation.
+
+        Args:
+            context: List of token IDs (initial context)
+            max_steps: Maximum tokens to generate
+            temperature: Sampling temperature (0.0 = greedy)
+
+        Returns:
+            list: Extended context with generated tokens
+
+        Note: This is MUCH slower than batch processing (speculative decoding),
+        but represents true autoregressive generation where each token depends
+        on a complete forward pass through all previous context.
+        """
+        context = list(context)  # Copy to avoid modifying input
+
+        for step in range(max_steps):
+            # Truncate if exceeds max length
+            if len(context) > self.max_seq_len:
+                context = context[-self.max_seq_len:]
+
+            # Forward pass on ENTIRE context so far
+            token_ids = torch.tensor([context], dtype=torch.long)
+            logits = self.forward(token_ids)  # [1, len(context), vocab]
+
+            # Predict NEXT token (only the last position)
+            next_logits = logits[0, -1, :]  # [vocab]
+
+            if temperature <= 0.0:
+                # Greedy decoding
+                next_token = next_logits.argmax(-1).item()
+            else:
+                # Sample with temperature
+                probs = torch.softmax(next_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).item()
+
+            # Append and continue
+            context.append(next_token)
+
+            # Check for termination
+            if next_token == Token.HALT:
+                break
+
+        return context
+
+    @torch.no_grad()
+    def generate_autoregressive_with_kv_cache(self, context, max_steps=10000,
+                                              temperature=0.0, kv_cache=None):
+        """Optimized autoregressive generation with KV cache.
+
+        Like generate_autoregressive() but reuses KV cache to avoid
+        recomputing attention for previous tokens. This is faster than
+        naive autoregressive but still slower than batch processing.
+
+        Represents a middle ground between purity and performance.
+
+        Args:
+            context: List of token IDs (initial context)
+            max_steps: Maximum tokens to generate
+            temperature: Sampling temperature (0.0 = greedy)
+            kv_cache: Optional KVCache instance (created if None)
+
+        Returns:
+            list: Extended context with generated tokens
+        """
+        context = list(context)  # Copy to avoid modifying input
+
+        if kv_cache is None:
+            from .kv_cache import KVCache
+            max_len = len(context) + max_steps
+            kv_cache = KVCache(
+                max_batch_size=1,
+                max_seq_len=min(max_len, self.max_seq_len)
+            )
+
+        # Initial forward pass on full context
+        if len(context) > self.max_seq_len:
+            context = context[-self.max_seq_len:]
+        token_ids = torch.tensor([context], dtype=torch.long)
+        logits = self.forward(token_ids, kv_cache=kv_cache)
+
+        for step in range(max_steps):
+            # Predict next token from last position
+            next_logits = logits[0, -1, :]
+
+            if temperature <= 0.0:
+                next_token = next_logits.argmax(-1).item()
+            else:
+                probs = torch.softmax(next_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).item()
+
+            context.append(next_token)
+
+            if next_token == Token.HALT:
+                break
+
+            # Forward pass on ONLY the new token (using KV cache)
+            token_ids = torch.tensor([[next_token]], dtype=torch.long)
+            logits = self.forward(token_ids, kv_cache=kv_cache)
+
+        return context
 
     @torch.no_grad()
     def verify_speculative_step(self, context, draft_tokens):
@@ -1202,7 +1250,8 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
     ALIBI_S = 10.0  # ALiBi slope for threshold heads
 
     # ===== EMBEDDING =====
-    embed = model.embed.weight
+    # Access wrapped nn.Embedding inside NeuralVMEmbedding
+    embed = model.embed.embed.weight
     embed.zero_()
 
     for tok in range(V):
@@ -3460,9 +3509,11 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
     AX_IDX = 1
     base = HD  # head 1 starts at dim 64
 
-    # Q dim 0: IS_BYTE (byte vs marker discrimination)
+    # Q dim 0: IS_BYTE AND HAS_SE (only fire on subsequent steps, not first step)
+    # First step: JMP sets OUTPUT at PC marker via Layer 6, don't overwrite it
     attn.W_q[base + 0, BD.IS_BYTE] = L
-    attn.W_q[base + 0, BD.CONST] = -L / 2
+    attn.W_q[base + 0, BD.HAS_SE] = L * 2  # Strong HAS_SE requirement
+    attn.W_q[base + 0, BD.CONST] = -L * 1.5  # Strong threshold: need IS_BYTE + 2*HAS_SE > 1.5
 
     # Q dim 1: H1[AX_IDX] (AX vs non-AX discrimination)
     attn.W_q[base + 1, BD.H1 + AX_IDX] = L
@@ -3493,12 +3544,13 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
     attn.W_q[base + 5, BD.BYTE_INDEX_2] = L
     attn.W_k[base + 5, BD.BYTE_INDEX_3] = L
 
-    # Gate dim 33: suppress non-AX Q positions to prevent softmax leakage.
-    # At AX bytes (H1[AX]=1): Q_gate = 0, score_gate = 0 (neutral).
-    # At non-AX (H1[AX]=0): Q_gate = -10000, score_gate ≈ -62500 (kills softmax).
+    # Gate dim 33: suppress non-AX Q positions AND first step to prevent softmax leakage.
+    # At AX bytes with HAS_SE: Q_gate = 0, score_gate = 0 (neutral).
+    # At non-AX or first step: Q_gate = -10000+, score_gate kills softmax.
     # Strong penalty needed to overcome positive scores from other dims (up to ~6000).
     attn.W_q[base + 33, BD.CONST] = -10000.0
     attn.W_q[base + 33, BD.H1 + AX_IDX] = 10000.0
+    attn.W_q[base + 33, BD.HAS_SE] = 10000.0  # NEW: require HAS_SE (suppress first step)
     attn.W_k[base + 33, BD.CONST] = 5.0
 
     # V: copy CLEAN_EMBED nibbles (16 lo + 16 hi = 32 V dims)

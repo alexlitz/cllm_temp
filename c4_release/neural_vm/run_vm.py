@@ -237,7 +237,7 @@ class AutoregressiveVMRunner:
         self._last_bp = 0
         self._last_sp = 0
         self._mem_history = {}  # addr → 9-token MEM section (latest wins)
-        self.model._mem_history_end = 0  # reset stale boundary from prior runs
+        self.model.embed.set_mem_history_end(0)  # reset stale boundary from prior runs
         self._pure_attention_report = {
             "enabled": bool(self.pure_attention_memory),
             "blocked_vm_memory_ops": {},
@@ -389,7 +389,7 @@ class AutoregressiveVMRunner:
                 for tokens in self._mem_history.values():
                     mem_flat.extend(tokens)
                 context[prefix_len:] = mem_flat + list(last_step)
-                self.model._mem_history_end = prefix_len + len(mem_flat)
+                self.model.embed.set_mem_history_end(prefix_len + len(mem_flat))
 
             elif next_token == Token.TOOL_CALL:
                 # Model signaled a tool call — extract registers and dispatch
@@ -470,7 +470,7 @@ class AutoregressiveVMRunner:
                 for tokens in self._mem_history.values():
                     mem_flat.extend(tokens)
                 context[prefix_len:] = mem_flat + list(last_step)
-                self.model._mem_history_end = prefix_len + len(mem_flat)
+                self.model.embed.set_mem_history_end(prefix_len + len(mem_flat))
 
             # Halt detection
             if next_token == Token.HALT:

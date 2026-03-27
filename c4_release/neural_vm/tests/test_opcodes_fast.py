@@ -30,7 +30,9 @@ def run_programs_batch_ultra(bytecodes_list, batch_size=256, strict=True):
     Raises:
         AssertionError: If strict=True and transformer predictions are wrong
     """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Use CPU for strict mode to avoid GPU OOM
+    # CUDA uses too much memory with compacted model (~22GB base + activations)
+    device = 'cpu'
     runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
     return runner.run_batch(bytecodes_list)
 
@@ -67,7 +69,7 @@ def _get_imm_cache():
     global _imm_cache
     if _imm_cache is None:
         bytecodes = [[Opcode.IMM | (v << 8), Opcode.EXIT] for v in range(256)]
-        # Use smaller batch size to avoid OOM with strict mode
+        # Batch size 32 works well on CPU with strict mode
         _imm_cache = run_programs_batch_ultra(bytecodes, batch_size=32)
     return _imm_cache
 
@@ -83,7 +85,6 @@ def _get_mul_cache():
             [Opcode.IMM | (a << 8), Opcode.PSH, Opcode.IMM | (b << 8), Opcode.MUL, Opcode.EXIT]
             for a, b in pairs
         ]
-        # Use smaller batch size to avoid OOM
         results = run_programs_batch_ultra(bytecodes, batch_size=32)
         _mul_cache = {pairs[i]: results[i] for i in range(len(pairs))}
     return _mul_cache
@@ -100,7 +101,6 @@ def _get_binop_cache(op):
             [Opcode.IMM | (a << 8), Opcode.PSH, Opcode.IMM | (b << 8), op, Opcode.EXIT]
             for a, b in pairs
         ]
-        # Use smaller batch size to avoid OOM
         results = run_programs_batch_ultra(bytecodes, batch_size=32)
         cache = {pairs[i]: results[i] for i in range(len(pairs))}
         globals()[key] = cache

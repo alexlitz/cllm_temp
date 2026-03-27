@@ -279,12 +279,13 @@ def run_batch_ultra(
     # For large batches, process in chunks to avoid OOM
     if len(bytecodes) > batch_size:
         all_results = []
+        # Create runner once and reuse to avoid recompiling
+        runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
         for i in range(0, len(bytecodes), batch_size):
             chunk = bytecodes[i:i+batch_size]
-            runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
             results = runner.run_batch(chunk)
             all_results.extend(results)
-            del runner
+            # Clear GPU cache between chunks
             if device == 'cuda':
                 torch.cuda.empty_cache()
         return all_results

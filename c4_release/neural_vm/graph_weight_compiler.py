@@ -145,6 +145,23 @@ class ComputationGraph:
         # Topological sort
         return list(nx.topological_sort(G))
 
+    # Helper methods for building graphs
+    def add_input(self, name: str) -> int:
+        """Add an input node (represented as a named virtual register)."""
+        # Input nodes are just virtual register references
+        # They don't emit any weights, just serve as graph inputs
+        return self.add_node(OpType.CONST, [], output_reg=name, params={'input': True})
+
+    def add_const(self, value: float, output_name: Optional[str] = None) -> int:
+        """Add a constant value node."""
+        return self.add_node(OpType.CONST, [], output_reg=output_name,
+                           params={'value': value})
+
+    def add_op(self, op: OpType, inputs: List[int], output_name: Optional[str] = None,
+               params: Optional[Dict] = None) -> int:
+        """Add an operation node."""
+        return self.add_node(op, inputs, output_reg=output_name, params=params)
+
     def print_graph(self):
         """Print computation graph."""
         print("Computation Graph:")

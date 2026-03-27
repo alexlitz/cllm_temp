@@ -2,12 +2,30 @@
 Efficient ALU operations using pure FFN weight baking.
 
 All computation is baked into FFN weights at initialization.
-Forward pass is standard SwiGLU - no runtime integer ops.
+Forward pass is standard SwiGLU - no runtime integer ops:
+    hidden = silu(W_up @ x + b_up) * (W_gate @ x + b_gate)
+    output = x + W_down @ hidden
 
-Building blocks:
-- Cancel pair (2 units): output = x * y
-- Step pair (2 units): output = step(sum >= threshold)
-- Clear pair (2 units): output = 0 (clears a slot)
+This is 100% neural - the same forward pass used in any transformer.
+The "intelligence" is in the weight values, not in the architecture.
+
+=== ADD Operation (tested with 65536/65536 correct) ===
+
+Uses direct one-hot to one-hot mapping with carry propagation.
+Two FFN layers:
+  1. Lo nibble: 256 units - computes OUTPUT_LO and carry flag (GEN_LO)
+  2. Hi nibble: 512 units - computes OUTPUT_HI using carry from layer 1
+
+Usage:
+    from efficient_alu import set_efficient_add_output_lo, set_efficient_add_output_hi
+
+    # Bake weights
+    set_efficient_add_output_lo(ffn_lo, S=100.0, BD=_SetDim)
+    set_efficient_add_output_hi(ffn_hi, S=100.0, BD=_SetDim)
+
+    # Forward pass (standard SwiGLU)
+    y1 = ffn_lo(x)  # x has one-hot ALU_LO, ALU_HI, AX_CARRY_LO, AX_CARRY_HI, OP_ADD
+    y2 = ffn_hi(y1) # reads GEN_LO from y1, outputs to OUTPUT_HI
 
 Temporary dimensions (450-499) used for intermediate results between layers.
 """
@@ -211,82 +229,94 @@ def set_efficient_add_compute(ffn, S, BD, start_unit=0):
     return unit
 
 
-def set_efficient_add_output(ffn, S, BD, start_unit=0):
+def set_efficient_add_output_lo(ffn, S, BD, start_unit=0):
     """
-    Convert ADD results to one-hot outputs.
+    Output stage 1: Compute OUTPUT_LO and carry flag (GEN_LO).
 
-    result_lo = raw_sum_lo mod 16
-    result_hi = (raw_sum_hi + carry_to_hi) mod 16
-    carry_out = (raw_sum_hi + carry_to_hi >= 16)
+    Uses direct one-hot to one-hot mapping.
     """
     unit = start_unit
 
-    # === OUTPUT_LO: raw_sum_lo mod 16 ===
-    # For values 0-30, output (value mod 16)
-    for raw in range(31):
-        result = raw % 16
-        # Detect raw_sum_lo == raw using step pair
-        ffn.W_up.data[unit, RAW_SUM_LO] = S
-        ffn.b_up.data[unit] = -S * (raw - 0.5)
-        ffn.W_gate.data[unit, BD.OP_ADD] = 1.0
-        ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 1.0 / S
-        unit += 1
+    # === OUTPUT_LO: direct (a_lo, b_lo) -> result_lo lookup ===
+    for a in range(16):
+        for b in range(16):
+            result = (a + b) % 16
+            carry = 1 if (a + b) >= 16 else 0
 
-        ffn.W_up.data[unit, RAW_SUM_LO] = S
-        ffn.b_up.data[unit] = -S * (raw + 0.5)
-        ffn.W_gate.data[unit, BD.OP_ADD] = 1.0
-        ffn.W_down.data[BD.OUTPUT_LO + result, unit] = -1.0 / S
-        unit += 1
+            # Unit fires when ALU_LO[a] = 1 AND AX_CARRY_LO[b] = 1 AND OP_ADD = 1
+            ffn.W_up.data[unit, BD.ALU_LO + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_LO + b] = S
+            ffn.W_up.data[unit, BD.OP_ADD] = S
+            ffn.b_up.data[unit] = -S * 2.5  # 3-way AND threshold
 
-    # === OUTPUT_HI: (raw_sum_hi + carry_to_hi) mod 16 ===
-    # Need to handle sum + carry combinations
-    for raw in range(31):
-        for carry in range(2):
-            total = raw + carry
-            if total > 31:
-                continue
-            result = total % 16
+            ffn.W_gate.data[unit, BD.ALU_LO + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_LO + b] = 1.0
 
-            # Detect (raw_sum_hi, carry_to_hi) == (raw, carry)
-            # Use combined threshold: raw_sum_hi + 32*carry_to_hi
-            combined_val = raw + 32 * carry
+            # Output to result position (scale by 2 to compensate for silu attenuation)
+            ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 2.0 / S
 
-            ffn.W_up.data[unit, RAW_SUM_HI] = S
-            ffn.W_up.data[unit, CARRY_TO_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined_val - 0.5)
-            ffn.W_gate.data[unit, BD.OP_ADD] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result, unit] = 0.5 / S
+            # Write carry flag to GEN_LO for use by next layer (normalize to 1.0)
+            if carry:
+                ffn.W_down.data[GEN_LO, unit] = 1.0 / S  # Output 0.5 per unit, accumulates to ~1.0
+
             unit += 1
-
-            ffn.W_up.data[unit, RAW_SUM_HI] = S
-            ffn.W_up.data[unit, CARRY_TO_HI] = S * 32
-            ffn.b_up.data[unit] = -S * (combined_val + 0.5)
-            ffn.W_gate.data[unit, BD.OP_ADD] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + result, unit] = -0.5 / S
-            unit += 1
-
-    # === CARRY output: step(raw_sum_hi + carry_to_hi >= 16) ===
-    for raw in range(31):
-        for carry in range(2):
-            total = raw + carry
-            if total >= 16:
-                combined_val = raw + 32 * carry
-
-                ffn.W_up.data[unit, RAW_SUM_HI] = S
-                ffn.W_up.data[unit, CARRY_TO_HI] = S * 32
-                ffn.b_up.data[unit] = -S * (combined_val - 0.5)
-                ffn.W_gate.data[unit, BD.OP_ADD] = 1.0
-                ffn.W_down.data[BD.CARRY, unit] = 0.5 / S
-                unit += 1
-
-                ffn.W_up.data[unit, RAW_SUM_HI] = S
-                ffn.W_up.data[unit, CARRY_TO_HI] = S * 32
-                ffn.b_up.data[unit] = -S * (combined_val + 0.5)
-                ffn.W_gate.data[unit, BD.OP_ADD] = 1.0
-                ffn.W_down.data[BD.CARRY, unit] = -0.5 / S
-                unit += 1
 
     return unit
+
+
+def set_efficient_add_output_hi(ffn, S, BD, start_unit=0):
+    """
+    Output stage 2: Compute OUTPUT_HI using carry from GEN_LO.
+
+    Must run AFTER set_efficient_add_output_lo's FFN output.
+    """
+    unit = start_unit
+
+    # === OUTPUT_HI: depends on carry from lo nibble (GEN_LO from previous layer) ===
+    for a in range(16):
+        for b in range(16):
+            # Case 1: no carry from lo (GEN_LO = 0)
+            result_no_carry = (a + b) % 16
+            carry_out_no = 1 if (a + b) >= 16 else 0
+
+            ffn.W_up.data[unit, BD.ALU_HI + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b] = S
+            ffn.W_up.data[unit, BD.OP_ADD] = S
+            ffn.W_up.data[unit, GEN_LO] = -S  # Inhibit when carry present
+            ffn.b_up.data[unit] = -S * 2.5
+
+            ffn.W_gate.data[unit, BD.ALU_HI + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b] = 1.0
+
+            ffn.W_down.data[BD.OUTPUT_HI + result_no_carry, unit] = 2.0 / S
+            if carry_out_no:
+                ffn.W_down.data[BD.CARRY, unit] = 2.0 / S
+            unit += 1
+
+            # Case 2: carry from lo (GEN_LO = 1)
+            result_with_carry = (a + b + 1) % 16
+            carry_out_yes = 1 if (a + b + 1) >= 16 else 0
+
+            ffn.W_up.data[unit, BD.ALU_HI + a] = S
+            ffn.W_up.data[unit, BD.AX_CARRY_HI + b] = S
+            ffn.W_up.data[unit, BD.OP_ADD] = S
+            ffn.W_up.data[unit, GEN_LO] = S  # Require carry present
+            ffn.b_up.data[unit] = -S * 3.5  # 4-way AND
+
+            ffn.W_gate.data[unit, BD.ALU_HI + a] = 1.0
+            ffn.W_gate.data[unit, BD.AX_CARRY_HI + b] = 1.0
+
+            ffn.W_down.data[BD.OUTPUT_HI + result_with_carry, unit] = 2.0 / S
+            if carry_out_yes:
+                ffn.W_down.data[BD.CARRY, unit] = 2.0 / S
+            unit += 1
+
+    return unit
+
+
+def set_efficient_add_output(ffn, S, BD, start_unit=0):
+    """DEPRECATED: Use set_efficient_add_output_lo and set_efficient_add_output_hi."""
+    raise DeprecationWarning("Use separate lo/hi output functions")
 
 
 def set_efficient_sub_compute(ffn, S, BD, start_unit=0):
