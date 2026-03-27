@@ -58,8 +58,8 @@ class PureFFN(nn.Module):
     """
     Pure SwiGLU FFN with FINAL forward pass.
 
-    Uses nn.Linear internally for standard PyTorch patterns while
-    providing direct weight access for baking via W_up, W_gate, W_down properties.
+    Subclasses ONLY override _bake_weights() to set weight values.
+    Forward is: output = x + W_down @ (silu(W_up @ x + b_up) * (W_gate @ x + b_gate)) + b_down
     """
 
     def __init__(self, dim: int, hidden_dim: int):
@@ -67,109 +67,50 @@ class PureFFN(nn.Module):
         self.dim = dim
         self.hidden_dim = hidden_dim
 
-        # Use nn.Linear for cleaner code
-        self.up = nn.Linear(dim, hidden_dim, bias=False)
-        self.gate = nn.Linear(dim, hidden_dim, bias=False)
-        self.down = nn.Linear(hidden_dim, dim, bias=True)
-
-        # Additional bias parameters (not used in forward, but used for weight baking)
+        self.W_up = nn.Parameter(torch.zeros(hidden_dim, dim))
         self.b_up = nn.Parameter(torch.zeros(hidden_dim))
+        self.W_gate = nn.Parameter(torch.zeros(hidden_dim, dim))
         self.b_gate = nn.Parameter(torch.zeros(hidden_dim))
-
-        # Zero initialize
-        nn.init.zeros_(self.up.weight)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.zeros_(self.down.weight)
-        nn.init.zeros_(self.down.bias)
+        self.W_down = nn.Parameter(torch.zeros(dim, hidden_dim))
+        self.b_down = nn.Parameter(torch.zeros(dim))
 
         self._bake_weights()
 
-    # Direct weight access for baking (forwards to nn.Linear weights)
-    def __getattr__(self, name):
-        if name in ('W_up', 'W_gate', 'W_down', 'b_up', 'b_gate', 'b_down'):
-            if name == 'W_up':
-                return self.up.weight.data  # Return .data to allow indexed assignment
-            elif name == 'b_up':
-                # Return the actual b_up parameter
-                return object.__getattribute__(self, 'b_up').data
-            elif name == 'W_gate':
-                return self.gate.weight.data
-            elif name == 'b_gate':
-                # Return the actual b_gate parameter
-                return object.__getattribute__(self, 'b_gate').data
-            elif name == 'W_down':
-                return self.down.weight.data
-            elif name == 'b_down':
-                return self.down.bias.data
-        return super().__getattr__(name)
-
-    def __setattr__(self, name, value):
-        # Check for weight/bias assignments (after __init__ has set up the modules)
-        if name in ('W_up', 'W_gate', 'W_down', 'b_up', 'b_gate', 'b_down'):
-            # Use object.__getattribute__ to avoid recursion
-            if not hasattr(self, '_modules'):
-                # Still in __init__, use normal setattr
-                object.__setattr__(self, name, value)
-                return
-
-            # Check if this is an initial assignment (like in __init__)
-            # For b_up, b_gate, b_down, they might not exist yet
-            try:
-                obj_attr = object.__getattribute__(self, name)
-                has_attr = True
-            except AttributeError:
-                has_attr = False
-
-            if not has_attr:
-                # Initial assignment, use normal setattr
-                object.__setattr__(self, name, value)
-                return
-
-            # Reassignment to existing parameter
-            if name == 'W_up':
-                self.up.weight.data = value
-            elif name == 'b_up':
-                object.__getattribute__(self, 'b_up').data = value
-            elif name == 'W_gate':
-                self.gate.weight.data = value
-            elif name == 'b_gate':
-                object.__getattribute__(self, 'b_gate').data = value
-            elif name == 'W_down':
-                self.down.weight.data = value
-            elif name == 'b_down':
-                self.down.bias.data = value
-        else:
-            super().__setattr__(name, value)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """FINAL - Standard SwiGLU FFN. DO NOT OVERRIDE."""
-        up = self.up(x)
-        gate = self.gate(x)
+        """FINAL - Standard SwiGLU with all biases. DO NOT OVERRIDE."""
+        linear = sparse_linear if self.W_up.is_sparse else F.linear
+        up = linear(x, self.W_up, self.b_up)
+        gate = linear(x, self.W_gate, self.b_gate)
         hidden = F.silu(up) * gate
-        return x + self.down(hidden)
+        return x + linear(hidden, self.W_down, self.b_down)
 
     def sparsify(self):
         """Convert weight matrices to COO sparse format."""
-        self.up.weight = nn.Parameter(self.up.weight.data.to_sparse_coo().coalesce())
-        self.gate.weight = nn.Parameter(self.gate.weight.data.to_sparse_coo().coalesce())
-        self.down.weight = nn.Parameter(self.down.weight.data.to_sparse_coo().coalesce())
+        self.W_up = nn.Parameter(self.W_up.data.to_sparse_coo().coalesce())
+        self.W_gate = nn.Parameter(self.W_gate.data.to_sparse_coo().coalesce())
+        self.W_down = nn.Parameter(self.W_down.data.to_sparse_coo().coalesce())
 
     def compact(self, block_size=1):
         """Prune to dense sub-matrices of only active hidden units.
 
-        Identifies hidden units where up, gate, or down have non-zero
+        Identifies hidden units where W_up, W_gate, or W_down have non-zero
         weights, keeps only those rows/columns, and stores dense sub-matrices.
 
         Args:
-            block_size: Align active units to blocks of this size.
+            block_size: Align active units to blocks of this size. block_size=1
+                gives minimal compaction. Larger values (e.g., 32, 64) include
+                padding zeros but give better vectorization and memory alignment.
+
+        Typically reduces 4096 hidden → ~500-2000 active, giving 2-8x speedup
+        over sparse COO and better cache locality than sparse ops.
         """
-        # Get dense weights
-        W_up = self.up.weight.data.to_dense() if self.up.weight.is_sparse else self.up.weight.data
-        W_gate = self.gate.weight.data.to_dense() if self.gate.weight.is_sparse else self.gate.weight.data
-        W_down = self.down.weight.data.to_dense() if self.down.weight.is_sparse else self.down.weight.data
+        # Densify if currently sparse
+        W_up = self.W_up.data.to_dense() if self.W_up.is_sparse else self.W_up.data
+        W_gate = self.W_gate.data.to_dense() if self.W_gate.is_sparse else self.W_gate.data
+        W_down = self.W_down.data.to_dense() if self.W_down.is_sparse else self.W_down.data
         H = W_up.shape[0]
 
-        # Find active hidden units
+        # Find active hidden units (any non-zero weight in up, gate, or down)
         active = (
             (W_up.abs().sum(dim=1) > 0)
             | (W_gate.abs().sum(dim=1) > 0)
@@ -179,6 +120,7 @@ class PureFFN(nn.Module):
         )
 
         if block_size > 1:
+            # Expand active mask to full blocks
             active_blocks = set()
             for idx in active.nonzero(as_tuple=True)[0].tolist():
                 active_blocks.add(idx // block_size)
@@ -196,20 +138,12 @@ class PureFFN(nn.Module):
         self._compact_size = n
         self.hidden_dim = n
 
-        # Replace with compacted Linear layers
-        self.up = nn.Linear(self.dim, n, bias=False)
-        self.gate = nn.Linear(self.dim, n, bias=False)
-        self.down = nn.Linear(n, self.dim, bias=True)
-
-        # Copy weights
-        self.up.weight = nn.Parameter(W_up[active_idx].contiguous())
-        self.gate.weight = nn.Parameter(W_gate[active_idx].contiguous())
-        self.down.weight = nn.Parameter(W_down[:, active_idx].contiguous())
-        nn.init.zeros_(self.down.bias)
-
-        # Copy biases
+        # Extract dense sub-matrices: [n, dim] and [dim, n]
+        self.W_up = nn.Parameter(W_up[active_idx].contiguous())
         self.b_up = nn.Parameter(self.b_up.data[active_idx].contiguous())
+        self.W_gate = nn.Parameter(W_gate[active_idx].contiguous())
         self.b_gate = nn.Parameter(self.b_gate.data[active_idx].contiguous())
+        self.W_down = nn.Parameter(W_down[:, active_idx].contiguous())
 
     def compact_moe(self, opcode_range=None, relay_map=None):
         """Partition compact FFN into MoE experts by opcode.
@@ -222,34 +156,34 @@ class PureFFN(nn.Module):
 
         Args:
             opcode_range: range of dims that are opcode one-hot flags.
-            relay_map: dict mapping additional up weight dims to opcode dims.
+                Default: range(262, 296) for _SetDim opcodes.
+            relay_map: dict mapping additional W_up dims to opcode dims
+                (e.g., CMP relay dims in L6). Values can be int or list of int.
         """
         if opcode_range is None:
-            opcode_range = range(262, 294)
+            opcode_range = range(262, 296)
         if relay_map is None:
             relay_map = {}
 
-        W_up = self.up.weight.data
-        W_gate = self.gate.weight.data
-        b_up = self.b_up.data
-        b_gate = self.b_gate.data
+        W_up = self.W_up.data
+        W_gate = self.W_gate.data
         H = W_up.shape[0]
 
-        # For each unit, find opcode dependencies
-        opcode_to_units = {}
+        # For each unit, find opcode dependencies from W_up and W_gate
+        opcode_to_units = {}  # opcode_dim -> list of unit indices
         shared_indices = []
 
         for i in range(H):
             opcodes = set()
-            # Check W_up for positive opcode weights
+            # Check W_up for positive opcode weights (silu activation gating)
             for d in opcode_range:
                 if d < W_up.shape[1] and W_up[i, d].item() > 0.5:
                     opcodes.add(d)
-            # Check W_gate for significant opcode weights
+            # Check W_gate for significant opcode weights (value gating)
             for d in opcode_range:
                 if d < W_gate.shape[1] and abs(W_gate[i, d].item()) > 0.5:
                     opcodes.add(d)
-            # Check relay dims
+            # Check relay dims in W_up (e.g., CMP[2] → OP_ENT)
             for relay_dim, target in relay_map.items():
                 if relay_dim < W_up.shape[1] and W_up[i, relay_dim].item() > 0.5:
                     if isinstance(target, (list, tuple, set)):
@@ -259,27 +193,28 @@ class PureFFN(nn.Module):
 
             if opcodes:
                 for d in opcodes:
-                    opcode_to_units.setdefault(d, []).append(i)
+                    if d not in opcode_to_units:
+                        opcode_to_units[d] = []
+                    opcode_to_units[d].append(i)
             else:
                 shared_indices.append(i)
 
         if not opcode_to_units:
+            # No opcode-dependent units; skip MoE
             self._moe_shared = None
             self._moe_experts = None
             self._active_opcode = None
             return
-
-        dim = W_up.shape[1]
 
         # Store shared sub-matrices
         if shared_indices:
             idx = torch.tensor(shared_indices, dtype=torch.long)
             self._moe_shared = {
                 'W_up': W_up[idx].contiguous(),
-                'b_up': b_up[idx].contiguous(),
+                'b_up': self.b_up.data[idx].contiguous(),
                 'W_gate': W_gate[idx].contiguous(),
-                'b_gate': b_gate[idx].contiguous(),
-                'W_down': self.down.weight.data[:, idx].contiguous(),
+                'b_gate': self.b_gate.data[idx].contiguous(),
+                'W_down': self.W_down.data[:, idx].contiguous(),
             }
         else:
             self._moe_shared = None
@@ -290,42 +225,42 @@ class PureFFN(nn.Module):
             idx = torch.tensor(sorted(set(units)), dtype=torch.long)
             self._moe_experts[d] = {
                 'W_up': W_up[idx].contiguous(),
-                'b_up': b_up[idx].contiguous(),
+                'b_up': self.b_up.data[idx].contiguous(),
                 'W_gate': W_gate[idx].contiguous(),
-                'b_gate': b_gate[idx].contiguous(),
-                'W_down': self.down.weight.data[:, idx].contiguous(),
+                'b_gate': self.b_gate.data[idx].contiguous(),
+                'W_down': self.W_down.data[:, idx].contiguous(),
             }
 
         self._active_opcode = None
 
-        # Pre-concatenate shared + expert matrices for each opcode
+        # Pre-concatenate shared + expert matrices for each opcode.
+        # Zero-overhead at forward time: set_active_opcode swaps self.W_up etc.
         self._moe_combined = {}
         shared_mats = self._moe_shared
         for d, expert in self._moe_experts.items():
             if shared_mats is not None:
                 self._moe_combined[d] = {
                     'W_up': torch.cat([shared_mats['W_up'], expert['W_up']], dim=0),
-                    'b_up': torch.cat([shared_mats['b_up'], expert['b_up']], dim=0),
+                    'b_up': torch.cat([shared_mats['b_up'], expert['b_up']]),
                     'W_gate': torch.cat([shared_mats['W_gate'], expert['W_gate']], dim=0),
-                    'b_gate': torch.cat([shared_mats['b_gate'], expert['b_gate']], dim=0),
+                    'b_gate': torch.cat([shared_mats['b_gate'], expert['b_gate']]),
                     'W_down': torch.cat([shared_mats['W_down'], expert['W_down']], dim=1),
                 }
             else:
                 self._moe_combined[d] = expert
-
+        # Shared-only fallback (opcodes with no dedicated expert)
         if shared_mats is not None:
             self._moe_combined['_shared'] = shared_mats
-
-        # Full matrices fallback
+        # Full matrices fallback (no opcode known, e.g. prefix processing)
         self._moe_combined['_full'] = {
-            'W_up': W_up,
-            'b_up': b_up,
-            'W_gate': W_gate,
-            'b_gate': b_gate,
-            'W_down': self.down.weight.data,
+            'W_up': self.W_up.data,
+            'b_up': self.b_up.data,
+            'W_gate': self.W_gate.data,
+            'b_gate': self.b_gate.data,
+            'W_down': self.W_down.data,
         }
-
-        # Empty fallback
+        # Empty fallback (opcode has no units at all)
+        dim = self.W_up.shape[1]
         self._moe_combined['_empty'] = {
             'W_up': torch.zeros(0, dim),
             'b_up': torch.zeros(0),
@@ -337,11 +272,11 @@ class PureFFN(nn.Module):
     def _activate_moe(self, opcode_dim):
         """Swap weight tensors to the active opcode's sub-matrices.
 
-        Called by AutoregressiveVM.set_active_opcode().
+        Called by AutoregressiveVM.set_active_opcode(). Zero per-forward overhead:
+        forward() uses self.W_up etc. directly without any MoE checks.
         """
         if self._moe_combined is None:
             return
-
         if opcode_dim is None:
             c = self._moe_combined['_full']
         else:
@@ -350,21 +285,13 @@ class PureFFN(nn.Module):
                 c = self._moe_combined.get('_shared')
             if c is None:
                 c = self._moe_combined['_empty']
-
-        # Swap in the expert weights
-        n = c['W_up'].shape[0]
-        self.up = nn.Linear(self.dim, n, bias=False)
-        self.gate = nn.Linear(self.dim, n, bias=False)
-        self.down = nn.Linear(n, self.dim, bias=True)
-
-        self.up.weight = nn.Parameter(c['W_up'].contiguous())
-        self.gate.weight = nn.Parameter(c['W_gate'].contiguous())
-        self.down.weight = nn.Parameter(c['W_down'].contiguous())
-        nn.init.zeros_(self.down.bias)
-
-        # Swap biases
-        self.b_up = nn.Parameter(c['b_up'].contiguous())
-        self.b_gate = nn.Parameter(c['b_gate'].contiguous())
+        # Use object.__setattr__ to bypass nn.Module's type check
+        # (assigns raw tensors instead of nn.Parameters — fine for inference)
+        object.__setattr__(self, 'W_up', c['W_up'])
+        object.__setattr__(self, 'b_up', c['b_up'])
+        object.__setattr__(self, 'W_gate', c['W_gate'])
+        object.__setattr__(self, 'b_gate', c['b_gate'])
+        object.__setattr__(self, 'W_down', c['W_down'])
 
     def _bake_weights(self):
         """Override to bake operation-specific weights."""
@@ -374,9 +301,6 @@ class PureFFN(nn.Module):
 class PureAttention(nn.Module):
     """
     Pure Attention with FINAL forward pass.
-
-    Uses nn.Linear internally for standard PyTorch patterns while
-    providing direct weight access for baking via W_q, W_k, W_v, W_o properties.
 
     Subclasses ONLY override _bake_weights().
     Used for carry propagation between nibble positions.
@@ -390,48 +314,15 @@ class PureAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.causal = causal
 
-        # Use nn.Linear for cleaner code
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.W_q = nn.Parameter(torch.zeros(dim, dim))
+        self.W_k = nn.Parameter(torch.zeros(dim, dim))
+        self.W_v = nn.Parameter(torch.zeros(dim, dim))
+        self.W_o = nn.Parameter(torch.zeros(dim, dim))
 
-        # Zero initialize
-        nn.init.zeros_(self.q_proj.weight)
-        nn.init.zeros_(self.k_proj.weight)
-        nn.init.zeros_(self.v_proj.weight)
-        nn.init.zeros_(self.out_proj.weight)
-
-        # Default mask is zeros (no masking)
+        # Default mask is zeros (no masking). Child classes override with custom masks.
         self.register_buffer('mask', torch.zeros(E.NUM_POSITIONS, E.NUM_POSITIONS))
 
         self._bake_weights()
-
-    # Direct weight access for baking
-    def __getattr__(self, name):
-        if name in ('W_q', 'W_k', 'W_v', 'W_o'):
-            if name == 'W_q':
-                return self.q_proj.weight.data
-            elif name == 'W_k':
-                return self.k_proj.weight.data
-            elif name == 'W_v':
-                return self.v_proj.weight.data
-            elif name == 'W_o':
-                return self.out_proj.weight.data
-        return super().__getattr__(name)
-
-    def __setattr__(self, name, value):
-        # Redirect weight assignments to nn.Linear weights
-        if name == 'W_q':
-            self.q_proj.weight.data = value
-        elif name == 'W_k':
-            self.k_proj.weight.data = value
-        elif name == 'W_v':
-            self.v_proj.weight.data = value
-        elif name == 'W_o':
-            self.out_proj.weight.data = value
-        else:
-            super().__setattr__(name, value)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """FINAL - Standard attention. DO NOT OVERRIDE."""
@@ -439,20 +330,20 @@ class PureAttention(nn.Module):
         H = self.num_heads
         HD = self.head_dim
 
-        Q = self.q_proj(x).view(B, S, H, HD).transpose(1, 2)
-        K = self.k_proj(x).view(B, S, H, HD).transpose(1, 2)
-        V = self.v_proj(x).view(B, S, H, HD).transpose(1, 2)
+        Q = F.linear(x, self.W_q).view(B, S, H, HD).transpose(1, 2)
+        K = F.linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
+        V = F.linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        # Use mask only if S <= NUM_POSITIONS, otherwise no masking
-        if S <= self.mask.shape[0]:
-            scores = scores + self.mask[:S, :S]
+
+        # Always add mask (mask is zeros when no masking needed)
+        scores = scores + self.mask[:S, :S]
 
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, V)
 
         out = out.transpose(1, 2).contiguous().view(B, S, D)
-        return x + self.out_proj(out)
+        return x + F.linear(out, self.W_o)
 
     def _bake_weights(self):
         """Override to bake attention weights."""
