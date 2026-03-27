@@ -8,6 +8,11 @@ Optimizations:
 4. Early termination: Stop individual programs when they halt
 
 Expected speedup: batch_size * 35x over original runner
+
+STRICT MODE:
+When strict=True, raises AssertionError if transformer predictions don't match
+DraftVM token-by-token. This validates the neural network is actually computing
+correctly, not just getting lucky with speculative execution.
 """
 
 import torch
@@ -39,9 +44,11 @@ class UltraBatchRunner:
         ffn_hidden=4096,
         max_seq_len=4096,
         device='cuda' if torch.cuda.is_available() else 'cpu',
+        strict: bool = False,
     ):
         self.batch_size = batch_size
         self.device = device
+        self.strict = strict
 
         # Create transformer model
         self.model = AutoregressiveVM(
@@ -62,6 +69,7 @@ class UltraBatchRunner:
         self.draft_vms = []
         self.contexts = []
         self.active = []
+        self.current_step = 0  # Track step number for error reporting
 
     def run_batch(
         self,
@@ -83,14 +91,20 @@ class UltraBatchRunner:
 
         # Initialize DraftVMs and contexts
         self.draft_vms = [DraftVM(bc) for bc in bytecodes]
+        # Create default data/argv lists if not provided
+        if data_list is None:
+            data_list = [b''] * n_programs
+        if argv_list is None:
+            argv_list = [[]] * n_programs
         self.contexts = [
-            self._build_context(bc, (data_list or [b''])[i], (argv_list or [[]])[i])
+            self._build_context(bc, data_list[i], argv_list[i])
             for i, bc in enumerate(bytecodes)
         ]
         self.active = [True] * n_programs
 
         # Speculative execution loop
         for step in range(max_steps):
+            self.current_step = step
             if not any(self.active):
                 break
 
@@ -107,7 +121,7 @@ class UltraBatchRunner:
                     draft_tokens_batch.append([Token.HALT] * 35)
 
             # 2. Batch validate all active programs in ONE forward pass
-            self._validate_batch_parallel(draft_tokens_batch)
+            self._validate_batch_parallel(draft_tokens_batch, bytecodes)
 
             # 3. Check for halts
             for i in range(n_programs):
@@ -117,12 +131,19 @@ class UltraBatchRunner:
         # Return exit codes
         return [vm.ax for vm in self.draft_vms]
 
-    def _validate_batch_parallel(self, draft_tokens_batch: List[List[int]]):
+    def _validate_batch_parallel(self, draft_tokens_batch: List[List[int]], bytecodes: List[List[int]]):
         """
         Validate draft tokens for all programs in ONE forward pass.
 
         This is the key optimization: instead of N*35 forward passes,
         we do just 1 forward pass per step that validates all programs.
+
+        Args:
+            draft_tokens_batch: List of draft token lists (35 tokens each)
+            bytecodes: List of bytecode programs (for error reporting)
+
+        Raises:
+            AssertionError: If strict=True and predictions don't match DraftVM
         """
         # Build contexts with drafts appended
         contexts_with_draft = []
@@ -135,9 +156,43 @@ class UltraBatchRunner:
         try:
             # Use the model's batch verification
             accepted_batch = self.model.verify_speculative_batch(contexts_with_draft, draft_lens)
-        except Exception:
+        except Exception as e:
+            if self.strict:
+                raise AssertionError(f"Transformer forward pass failed during strict validation: {e}")
             # Fallback: accept all drafts
             accepted_batch = [35] * len(draft_tokens_batch)
+
+        # STRICT MODE: Verify all active programs had perfect predictions
+        if self.strict:
+            for i, (accepted, active) in enumerate(zip(accepted_batch, self.active)):
+                if active and accepted < 35:
+                    # Find which token failed
+                    ctx_with_draft = contexts_with_draft[i]
+                    ctx_len = len(self.contexts[i])
+                    failed_token_idx = accepted
+
+                    # Get the failing token details
+                    draft_token = draft_tokens_batch[i][failed_token_idx]
+
+                    # Get predicted token by running single forward pass
+                    token_ids = torch.tensor([ctx_with_draft[:ctx_len + failed_token_idx]], dtype=torch.long)
+                    logits = self.model.forward(token_ids)
+                    predicted = logits[0, -1, :].argmax(-1).item()
+
+                    # Format bytecode for error message
+                    bc_str = " ".join([f"{instr:08x}" for instr in bytecodes[i][:5]])
+                    if len(bytecodes[i]) > 5:
+                        bc_str += "..."
+
+                    raise AssertionError(
+                        f"STRICT MODE FAILURE:\n"
+                        f"  Program {i}: {bc_str}\n"
+                        f"  Step: {self.current_step}\n"
+                        f"  Token: {failed_token_idx}/35\n"
+                        f"  Expected (DraftVM): {draft_token}\n"
+                        f"  Predicted (Transformer): {predicted}\n"
+                        f"  Match rate: {accepted}/35 ({100*accepted/35:.1f}%)"
+                    )
 
         # Update contexts with accepted tokens
         for i, (ctx, draft, accepted) in enumerate(zip(self.contexts, draft_tokens_batch, accepted_batch)):
@@ -197,6 +252,7 @@ def run_batch_ultra(
     bytecodes: List[List[int]],
     batch_size: int = 256,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    strict: bool = False,
 ) -> List[int]:
     """
     Convenience function to run batch of programs.
@@ -205,9 +261,13 @@ def run_batch_ultra(
         bytecodes: List of bytecode lists
         batch_size: Maximum batch size
         device: 'cuda' or 'cpu'
+        strict: If True, raise AssertionError when transformer predictions don't match DraftVM
 
     Returns:
         List of exit codes
+
+    Raises:
+        AssertionError: If strict=True and transformer predictions are wrong
     """
-    runner = UltraBatchRunner(batch_size=batch_size, device=device)
+    runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
     return runner.run_batch(bytecodes)

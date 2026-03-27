@@ -16,9 +16,10 @@ from .base_layers import PureFFN, PureAttention, bake_weights
 # Autoregressive VM model
 from .vm_step import (
     AutoregressiveVM, Token, TransformerBlock,
-    CausalSelfAttention, AutoregressiveAttention,
+    AutoregressiveAttention,
     set_vm_weights, _SetDim,
 )
+# Note: CausalSelfAttention removed - incompatible with PureAttention architecture
 
 # VM Runner (autoregressive generation loop)
 from .run_vm import AutoregressiveVMRunner, ToolCall, ToolResponse
@@ -48,7 +49,7 @@ __all__ = [
     'DraftVM',
     'UltraBatchRunner', 'UltraBatchRunnerCached', 'run_batch_ultra',
     'Token', 'TransformerBlock',
-    'CausalSelfAttention', 'AutoregressiveAttention',
+    'AutoregressiveAttention',
     'set_vm_weights', '_SetDim',
     # Utilities
     'softmax1',

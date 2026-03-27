@@ -1154,7 +1154,7 @@ class _SetDim:
 
 
 @torch.no_grad()
-def set_vm_weights(model, enable_tool_calling=False, alu_mode='efficient'):
+def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
     """Set weights into AutoregressiveVM for true neural VM execution.
 
     All computation flows through standard transformer layers (embed →
@@ -1411,9 +1411,6 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='efficient'):
     _set_layer8_sp_gather(attn8, S, BD, HD)
 
     # ===== LAYERS 8-13: ALU Operations =====
-    # Import efficient ALU modules
-    from .efficient_alu import MulModule, ShiftModule, AddSubModule, BitwiseModule
-
     if alu_mode == 'lookup':
         # Use full lookup tables (pure FFN, many parameters)
         ffn8 = model.blocks[8].ffn
@@ -1448,62 +1445,8 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='efficient'):
         ffn13 = model.blocks[13].ffn
         _set_layer13_shifts(ffn13, S, BD)
 
-    elif alu_mode == 'efficient':
-        # Use MagicFloor-based efficient modules (minimal parameters)
-
-        # L10 attention still needed for carry relay and byte passthrough
-        attn10 = model.blocks[10].attn
-        attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
-        attn10.alibi_slopes[1] = 1.0  # head 1: AX byte passthrough (nearest step)
-        _set_layer10_carry_relay(attn10, S, BD, HD)
-        _set_layer10_byte_passthrough(attn10, S, BD, HD)
-
-        # Add efficient ALU modules as post_ops
-        # ADD/SUB after L9
-        model.blocks[9].post_ops.append(AddSubModule(mode='lookup'))
-
-        # BITWISE + DIV/MOD after L10
-        model.blocks[10].post_ops.append(BitwiseModule(mode='lookup'))
-        model.blocks[10].post_ops.append(DivModModule(mode='lookup'))
-
-        # MUL after L10 (replaces L11-L12 FFN)
-        model.blocks[10].post_ops.append(MulModule(mode='lookup'))
-
-        # SHIFT after L10 (replaces L13 FFN)
-        model.blocks[10].post_ops.append(ShiftModule(mode='lookup'))
-
-        # L13 attention still needed for MEM addr gather
-        attn13 = model.blocks[13].attn
-        attn13.alibi_slopes.fill_(0.5)
-        _set_layer13_mem_addr_gather(attn13, S, BD, HD)
-
-    elif alu_mode == 'integer':
-        # Use pure integer operations (zero ALU parameters)
-        from .efficient_alu_v2 import (
-            MulModuleV2, ShiftModuleV2, AddSubModuleV2, BitwiseModuleV2
-        )
-
-        # L10 attention still needed for carry relay and byte passthrough
-        attn10 = model.blocks[10].attn
-        attn10.alibi_slopes[0] = 5.0
-        attn10.alibi_slopes[1] = 1.0
-        _set_layer10_carry_relay(attn10, S, BD, HD)
-        _set_layer10_byte_passthrough(attn10, S, BD, HD)
-
-        # Add V2 integer modules as post_ops (zero parameters)
-        model.blocks[9].post_ops.append(AddSubModuleV2())
-        model.blocks[10].post_ops.append(BitwiseModuleV2())
-        model.blocks[10].post_ops.append(DivModModule(mode='lookup'))
-        model.blocks[10].post_ops.append(MulModuleV2())
-        model.blocks[10].post_ops.append(ShiftModuleV2())
-
-        # L13 attention still needed for MEM addr gather
-        attn13 = model.blocks[13].attn
-        attn13.alibi_slopes.fill_(0.5)
-        _set_layer13_mem_addr_gather(attn13, S, BD, HD)
-
     else:
-        raise ValueError(f"Unknown alu_mode: {alu_mode}. Use 'lookup', 'efficient', or 'integer'.")
+        raise ValueError(f"Unknown alu_mode: {alu_mode}. Use 'lookup'.")
 
     # ===== LAYER 14: MEM byte generation (8 heads) =====
     attn14 = model.blocks[14].attn
@@ -2224,22 +2167,30 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
 
-    # Head 2: fetch opcode for first-step JMP (PC marker → code section position 1)
-    # On the first step (NOT HAS_SE), PC=0 by default. We need to fetch the opcode
-    # at address 0, which is at position 1 in the sequence (after CODE_START at position 0).
-    # This allows opcode decoding to work at the PC marker before AX marker exists.
+    # Head 2: fetch opcode for first-step JMP (PC marker → address 0)
+    # On the first step (NOT HAS_SE), PC=0 by default. Fetch opcode from address 0.
+    # Uses ADDR_KEY matching (same mechanism as head 1, but fires at PC marker not AX).
     base = 2 * HD
-    # Q: fires at PC marker when NOT HAS_SE
+    # Q: fires at PC marker when NOT HAS_SE, queries for address 0
     attn.W_q[base, BD.MARK_PC] = L
     attn.W_q[base, BD.HAS_SE] = -L  # only on first step
-    # K: targets position right after CODE_START (the first opcode byte)
-    # Use CODE_START marker + distance 1 via ALiBi.
-    # Actually, since this is positional, we'll get all positions after CODE_START.
-    # The one closest to PC marker will win, but that's not what we want.
-    # Better: target IS_BYTE AND has low address (EMBED_LO[0]=1, EMBED_HI[0]=1).
-    # For now, use a simple approach: target MARK_CS and rely on ALiBi to prefer position 1.
-    attn.W_k[base, BD.MARK_CS] = L  # CODE_START marker
-    attn.W_k[base + 1, BD.IS_BYTE] = L  # prefer bytes over markers
+    # Q: address 0 (ADDR_KEY_LO[0]=1, ADDR_KEY_HI[0]=1)
+    attn.W_q[base + 0, BD.CONST] = L  # k=0 for LO
+    attn.W_q[base + 16, BD.CONST] = L  # k=0 for HI
+    attn.W_q[base + 32, BD.MARK_PC] = L  # third nibble gate
+
+    # K: match ADDR_KEY nibbles (same as head 1)
+    for k in range(16):
+        attn.W_k[base + k, BD.ADDR_KEY + k] = L
+        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
+    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+
+    # Anti-leakage gate (same as head 1)
+    GATE = 33
+    attn.W_q[base + GATE, BD.MARK_PC] = 500.0
+    attn.W_q[base + GATE, BD.CONST] = -500.0
+    attn.W_k[base + GATE, BD.CONST] = 5.0
+
     # V: copy opcode byte nibbles
     for k in range(16):
         attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
@@ -2248,6 +2199,39 @@ def _set_layer5_fetch(attn, S, BD, HD):
     for k in range(16):
         attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
+
+    # Head 3: fetch immediate for first-step JMP (PC marker → address 1)
+    # Fetches immediate byte at address 1 (first immediate byte) and writes to AX_CARRY.
+    # Layer 6 FFN reads AX_CARRY for JMP target.
+    base = 3 * HD
+    # Q: fires at PC marker when NOT HAS_SE, queries for address 1 (PC+1)
+    attn.W_q[base, BD.MARK_PC] = L
+    attn.W_q[base, BD.HAS_SE] = -L
+    # Q: address 1 (ADDR_KEY_LO[1]=1, ADDR_KEY_HI[0]=1)
+    attn.W_q[base + 1, BD.CONST] = L  # k=1 for LO
+    attn.W_q[base + 16, BD.CONST] = L  # k=0 for HI
+    attn.W_q[base + 32, BD.MARK_PC] = L  # third nibble gate
+
+    # K: match ADDR_KEY nibbles
+    for k in range(16):
+        attn.W_k[base + k, BD.ADDR_KEY + k] = L
+        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
+    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+
+    # Anti-leakage gate
+    GATE = 33
+    attn.W_q[base + GATE, BD.MARK_PC] = 500.0
+    attn.W_q[base + GATE, BD.CONST] = -500.0
+    attn.W_k[base + GATE, BD.CONST] = 5.0
+
+    # V: copy immediate byte nibbles
+    for k in range(16):
+        attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
+        attn.W_v[base + 48 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+    # O: write to AX_CARRY_LO/HI at PC marker (used by L6 FFN for JMP)
+    for k in range(16):
+        attn.W_o[BD.AX_CARRY_LO + k, base + 32 + k] = 1.0
+        attn.W_o[BD.AX_CARRY_HI + k, base + 48 + k] = 1.0
 
 
 def _set_opcode_decode_ffn(ffn, S, BD):
@@ -2531,6 +2515,46 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.CMP + 0] = S
         ffn.b_up[unit] = -S * T_jmp
+        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+        unit += 1
+
+    # === FIRST-STEP JMP PC override: use OP_JMP directly when NOT HAS_SE ===
+    # For first step, CMP[0] isn't set (no previous step to relay from).
+    # Instead, use OP_JMP flag directly (set by L5 FFN opcode decode at PC marker).
+    # Threshold: OP_JMP ≈ 5.0, so T=4.5 separates it from false positives.
+    T_op_jmp = 4.5
+    # Cancel PC+INSTR_WIDTH
+    for k in range(16):
+        ffn.W_up[unit, BD.MARK_PC] = S
+        ffn.W_up[unit, BD.OP_JMP] = S
+        ffn.W_up[unit, BD.HAS_SE] = -S  # only when NOT HAS_SE (first step)
+        ffn.b_up[unit] = -S * (T_op_jmp + 0.5)  # require all three conditions
+        ffn.W_gate[unit, BD.OUTPUT_LO + k] = -1.0
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+        unit += 1
+    for k in range(16):
+        ffn.W_up[unit, BD.MARK_PC] = S
+        ffn.W_up[unit, BD.OP_JMP] = S
+        ffn.W_up[unit, BD.HAS_SE] = -S
+        ffn.b_up[unit] = -S * (T_op_jmp + 0.5)
+        ffn.W_gate[unit, BD.OUTPUT_HI + k] = -1.0
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+        unit += 1
+    # Add JMP target from AX_CARRY (written by L5 head 3)
+    for k in range(16):
+        ffn.W_up[unit, BD.MARK_PC] = S
+        ffn.W_up[unit, BD.OP_JMP] = S
+        ffn.W_up[unit, BD.HAS_SE] = -S
+        ffn.b_up[unit] = -S * (T_op_jmp + 0.5)
+        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+        unit += 1
+    for k in range(16):
+        ffn.W_up[unit, BD.MARK_PC] = S
+        ffn.W_up[unit, BD.OP_JMP] = S
+        ffn.W_up[unit, BD.HAS_SE] = -S
+        ffn.b_up[unit] = -S * (T_op_jmp + 0.5)
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1

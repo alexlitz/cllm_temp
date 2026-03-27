@@ -17,6 +17,11 @@ from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
 
 
+class ValidationError(Exception):
+    """Raised when batch validation fails."""
+    pass
+
+
 @dataclass
 class SpeculationResult:
     """Result of speculative execution."""
@@ -46,6 +51,7 @@ class FastLogicalVM:
         self.pc = 0
         self.halted = False
         self.code = []
+        self.steps = 0
 
     def load(self, bytecode: List[int], data: Optional[bytes] = None):
         """Load bytecode from compiler output."""
@@ -181,6 +187,7 @@ class FastLogicalVM:
 
             steps += 1
 
+        self.steps = steps
         return self.ax
 
 

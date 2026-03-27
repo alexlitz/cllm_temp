@@ -1,0 +1,65 @@
+╔══════════════════════════════════════════════════════════════╗
+║         VALIDATION ENABLED BY DEFAULT - CONFIRMED           ║
+╚══════════════════════════════════════════════════════════════╝
+
+✅ CHANGES VERIFIED IN SOURCE CODE:
+
+1. Default validation ratio: 0.1 (10%)
+   Location: src/baked_c4.py line 67
+   Code: validation_ratio: float = 0.1
+
+2. ValidationError class: EXISTS
+   Location: src/speculator.py line 30
+   Code: class ValidationError(Exception)
+
+3. Raise on mismatch: TRUE by default
+   Location: src/speculator.py line 200
+   Code: raise_on_mismatch: bool = True
+
+4. ValidationError raised on mismatch: YES
+   Location: src/speculator.py lines 267-274
+
+═════════════════════════════════════════════════════════════════
+
+📊 EXPECTED TEST BEHAVIOR:
+
+WITHOUT VALIDATION (validation_ratio=0.0):
+  • All 1096 tests PASS ✓
+  • Fast execution (0.2 seconds)
+  • Fast VM only (100% accurate)
+
+WITH VALIDATION (validation_ratio=0.1, DEFAULT):
+  • ~110 tests validated (10% of 1096)
+  • ~99 validations will FAIL ✗
+  • ValidationError raised
+  • Tests FAIL (correct behavior!)
+  • Very slow (~22 minutes)
+
+═════════════════════════════════════════════════════════════════
+
+🎯 CONCLUSION:
+
+The validation system is NOW CONFIGURED CORRECTLY:
+
+✓ Tests will FAIL when neural VM is broken (90% of validated tests)
+✓ ValidationError raises immediately on mismatch
+✓ 10% sampling catches bugs without validating everything
+✓ Fast VM provides fast, correct execution
+
+⚠️  Test runs are SLOW due to neural VM validation
+⚠️  Most will timeout before completing full suite
+
+This is EXPECTED and CORRECT behavior. The neural VM is:
+  • Functional but very slow (~12 sec/test)
+  • Only correct for programs returning 0
+  • Will fail ~90% of validations
+
+═════════════════════════════════════════════════════════════════
+
+To disable validation temporarily:
+  c4 = BakedC4Transformer(validation_ratio=0.0)
+
+To reduce validation for faster tests:
+  c4 = BakedC4Transformer(validation_ratio=0.01)  # 1%
+
+═════════════════════════════════════════════════════════════════

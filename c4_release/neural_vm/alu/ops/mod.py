@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 
 from ..chunk_config import ChunkConfig
-from .common import GenericE
+from .common import GenericE, magic_floor32
 from .div import FloorExtractionFFN, ChunkSubtractFFN, SOFTMAX1_SCALE
 from .mul import build_mul_layers
 from .sub import SubRawAndGenFFN, SubBorrowLookaheadFFN, SubFinalResultFFN
@@ -153,12 +153,12 @@ class ModCorrectionModule(nn.Module):
         needs_correction = (remainder >= divisor).to(torch.float64)
         corrected = remainder - needs_correction * divisor
 
-        # Extract corrected chunks back to RESULT
+        # Extract corrected chunks back to RESULT using MAGIC floor
         delta = torch.zeros_like(x)
         val = corrected
         for j in range(num_pos - 1, -1, -1):
             pw = float(base ** j)
-            chunk = torch.floor(val / pw).clamp(0, float(ge.CHUNK_MAX))
+            chunk = magic_floor32(val / pw).clamp(0, float(ge.CHUNK_MAX))
             delta[:, j, ge.RESULT] = opcode_w * (chunk - x[:, j, ge.RESULT]).to(x.dtype)
             val = val - chunk * pw
 

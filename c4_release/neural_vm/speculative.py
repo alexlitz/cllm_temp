@@ -17,6 +17,7 @@ Token format per VM step (35 tokens):
 """
 
 from .vm_step import Token
+from .constants import PC_OFFSET, INSTR_WIDTH, pc_to_idx, idx_to_pc, STACK_INIT
 
 
 def _le_bytes(val):
@@ -73,10 +74,10 @@ class DraftVM:
     def __init__(self, bytecode):
         self.code = bytecode  # list of packed instructions
         self.idx = 0          # instruction index
-        self.pc = 2           # PC = idx * 5 + 2
+        self.pc = PC_OFFSET   # Initial PC uses configured offset
         self.ax = 0
-        self.sp = 0
-        self.bp = 0
+        self.sp = STACK_INIT  # Initialize stack pointer to standard location
+        self.bp = STACK_INIT  # Initialize base pointer to standard location
         self.memory = {}      # sparse memory dict (addr -> 32-bit value)
         self.halted = False
         self._last_mem_addr = 0
@@ -107,7 +108,7 @@ class DraftVM:
             imm -= 0x1000000
 
         self.idx += 1
-        self.pc = self.idx * 5 + 2  # default: advance to next instruction
+        self.pc = idx_to_pc(self.idx)  # default: advance to next instruction
         self._last_mem_addr = 0
         self._last_mem_val = 0
 
@@ -116,21 +117,25 @@ class DraftVM:
         elif op == 1:  # IMM
             self.ax = imm & 0xFFFFFFFF
         elif op == 2:  # JMP
-            self.pc = imm & 0xFFFFFFFF
-            self.idx = (imm - 2) // 5
+            # imm is byte address, convert to instruction index
+            self.idx = (imm & 0xFFFFFFFF) // INSTR_WIDTH
+            self.pc = idx_to_pc(self.idx)
         elif op == 3:  # JSR
             self.sp = (self.sp - 8) & 0xFFFFFFFF
             self._mem_write(self.sp, self.pc)  # push return address
-            self.pc = imm & 0xFFFFFFFF
-            self.idx = (imm - 2) // 5
+            # imm is byte address, convert to instruction index
+            self.idx = (imm & 0xFFFFFFFF) // INSTR_WIDTH
+            self.pc = idx_to_pc(self.idx)
         elif op == 4:  # BZ
             if self.ax == 0:
-                self.pc = imm & 0xFFFFFFFF
-                self.idx = (imm - 2) // 5
+                # imm is byte address, convert to instruction index
+                self.idx = (imm & 0xFFFFFFFF) // INSTR_WIDTH
+                self.pc = idx_to_pc(self.idx)
         elif op == 5:  # BNZ
             if self.ax != 0:
-                self.pc = imm & 0xFFFFFFFF
-                self.idx = (imm - 2) // 5
+                # imm is byte address, convert to instruction index
+                self.idx = (imm & 0xFFFFFFFF) // INSTR_WIDTH
+                self.pc = idx_to_pc(self.idx)
         elif op == 6:  # ENT
             self.sp = (self.sp - 8) & 0xFFFFFFFF
             self._mem_write(self.sp, self.bp)
@@ -145,7 +150,7 @@ class DraftVM:
             ret_addr = self._mem_read(self.sp)
             self.sp = (self.sp + 8) & 0xFFFFFFFF
             self.pc = ret_addr & 0xFFFFFFFF
-            self.idx = (ret_addr - 2) // 5
+            self.idx = pc_to_idx(ret_addr)
         elif op == 9:  # LI
             self.ax = self._mem_read(self.ax)
         elif op == 11:  # SI

@@ -1,0 +1,143 @@
+======================================================================
+C4 TRANSFORMER VM - 1000+ TESTS WITH KV CACHE EVICTION
+======================================================================
+
+Total tests: 1096
+Batch size: 128
+KV cache: ENABLED
+
+Grouping tests by execution step count...
+Found 97 unique step counts
+Successfully grouped: 1096/1096 tests
+
+Initializing batched runner...
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'OPCODE_FLAGS' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_LO' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_HI' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L15_attn reads 'ADDR_KEY' but no prior layer writes it
+
+======================================================================
+Running tests...
+======================================================================
+
+[Steps 4] 29 tests (batch=128)... Done (29/1096)
+[Steps 6] 3 tests (batch=95)... Done (32/1096)
+[Steps 7] 262 tests (batch=81)... Done (294/1096)
+[Steps 9] 110 tests (batch=63)... Done (404/1096)
+[Steps 10] 100 tests (batch=57)... Done (504/1096)
+[Steps 11] 25 tests (batch=51)... Done (529/1096)
+[Steps 14] 40 tests (batch=40)... Done (569/1096)
+[Steps 15] 27 tests (batch=38)... Done (596/1096)
+[Steps 16] 4 tests (batch=35)... Done (600/1096)
+[Steps 17] 102 tests (batch=33)... Done (702/1096)
+[Steps 18] 2 tests (batch=31)... Done (704/1096)
+[Steps 19] 2 tests (batch=30)... Done (706/1096)
+[Steps 20] 50 tests (batch=28)... Done (756/1096)
+[Steps 24] 25 tests (batch=23)... Done (781/1096)
+[Steps 25] 25 tests (batch=22)... Done (806/1096)
+[Steps 30] 1 tests (batch=19)... Done (807/1096)
+[Steps 31] 25 tests (batch=18)... Done (832/1096)
+[Steps 36] 6 tests (batch=15)... Done (838/1096)
+[Steps 39] 25 tests (batch=14)... Done (863/1096)
+[Steps 41] 4 tests (batch=13)... Done (867/1096)
+[Steps 42] 5 tests (batch=13)... Done (872/1096)
+[Steps 45] 3 tests (batch=12)... Done (875/1096)
+[Steps 53] 2 tests (batch=10)... Done (877/1096)
+[Steps 56] 3 tests (batch=10)... Done (880/1096)
+[Steps 64] 3 tests (batch=8)... Done (883/1096)
+[Steps 65] 6 tests (batch=8)... Done (889/1096)
+[Steps 71] 4 tests (batch=8)... Done (893/1096)
+[Steps 75] 2 tests (batch=7)... Done (895/1096)
+[Steps 76] 1 tests (batch=7)... Done (896/1096)
+[Steps 87] 1 tests (batch=6)... Done (897/1096)
+[Steps 88] 5 tests (batch=6)... Done (902/1096)
+[Steps 89] 1 tests (batch=6)... Done (903/1096)
+[Steps 90] 2 tests (batch=6)... Done (905/1096)
+[Steps 96] 5 tests (batch=5)... Done (910/1096)
+[Steps 97] 14 tests (batch=5)... Done (924/1096)
+[Steps 105] 1 tests (batch=5)... Done (925/1096)
+[Steps 110] 4 tests (batch=5)... Done (929/1096)
+[Steps 111] 7 tests (batch=5)... Done (936/1096)
+[Steps 115] 2 tests (batch=4)... Done (938/1096)
+[Steps 116] 7 tests (batch=4)... Done (945/1096)
+[Steps 120] 1 tests (batch=4)... Done (946/1096)
+[Steps 123] 5 tests (batch=4)... Done (951/1096)
+[Steps 133] 5 tests (batch=4)... Done (956/1096)
+[Steps 134] 3 tests (batch=4)... Done (959/1096)
+[Steps 135] 1 tests (batch=4)... Done (960/1096)
+[Steps 136] 2 tests (batch=4)... Done (962/1096)
+[Steps 149] 9 tests (batch=4)... Done (971/1096)
+[Steps 150] 1 tests (batch=4)... Done (972/1096)
+[Steps 156] 10 tests (batch=4)... Done (982/1096)
+[Steps 157] 2 tests (batch=4)... Done (984/1096)
+[Steps 161] 5 tests (batch=4)... Done (989/1096)
+[Steps 163] 1 tests (batch=4)... Done (990/1096)
+[Steps 165] 4 tests (batch=4)... Done (994/1096)
+[Steps 175] 9 tests (batch=4)... Done (1003/1096)
+[Steps 176] 5 tests (batch=4)... Done (1008/1096)
+[Steps 180] 5 tests (batch=4)... Done (1013/1096)
+[Steps 187] 3 tests (batch=4)... Done (1016/1096)
+[Steps 195] 1 tests (batch=4)... Done (1017/1096)
+[Steps 196] 2 tests (batch=4)... Done (1019/1096)
+[Steps 201] 5 tests (batch=4)... Done (1024/1096)
+[Steps 203] 4 tests (batch=4)... Done (1028/1096)
+[Steps 211] 1 tests (batch=4)... Done (1029/1096)
+[Steps 216] 3 tests (batch=4)... Done (1032/1096)
+[Steps 226] 4 tests (batch=4)... Done (1036/1096)
+[Steps 227] 2 tests (batch=4)... Done (1038/1096)
+[Steps 235] 3 tests (batch=4)... Done (1041/1096)
+[Steps 236] 2 tests (batch=4)... Done (1043/1096)
+[Steps 249] 7 tests (batch=4)... Done (1050/1096)
+[Steps 253] 1 tests (batch=4)... Done (1051/1096)
+[Steps 255] 1 tests (batch=4)... Done (1052/1096)
+[Steps 256] 1 tests (batch=4)... Done (1053/1096)
+[Steps 259] 1 tests (batch=4)... Done (1054/1096)
+[Steps 269] 1 tests (batch=4)... Done (1055/1096)
+[Steps 276] 1 tests (batch=4)... Done (1056/1096)
+[Steps 283] 2 tests (batch=4)... Done (1058/1096)
+[Steps 285] 2 tests (batch=4)... Done (1060/1096)
+[Steps 296] 4 tests (batch=4)... Done (1064/1096)
+[Steps 307] 2 tests (batch=4)... Done (1066/1096)
+[Steps 330] 1 tests (batch=4)... Done (1067/1096)
+[Steps 355] 1 tests (batch=4)... Done (1068/1096)
+[Steps 360] 2 tests (batch=4)... Done (1070/1096)
+[Steps 379] 1 tests (batch=4)... Done (1071/1096)
+[Steps 390] 1 tests (batch=4)... Done (1072/1096)
+[Steps 403] 1 tests (batch=4)... Done (1073/1096)
+[Steps 420] 1 tests (batch=4)... Done (1074/1096)
+[Steps 427] 2 tests (batch=4)... Done (1076/1096)
+[Steps 435] 1 tests (batch=4)... Done (1077/1096)
+[Steps 449] 1 tests (batch=4)... Done (1078/1096)
+[Steps 451] 3 tests (batch=4)... Done (1081/1096)
+[Steps 475] 1 tests (batch=4)... Done (1082/1096)
+[Steps 499] 1 tests (batch=4)... Done (1083/1096)
+[Steps 737] 5 tests (batch=4)... Done (1088/1096)
+[Steps 1205] 1 tests (batch=4)... Done (1089/1096)
+[Steps 1961] 1 tests (batch=4)... Done (1090/1096)
+[Steps 3185] 4 tests (batch=4)... Done (1094/1096)
+[Steps 5165] 1 tests (batch=4)... Done (1095/1096)
+[Steps 8369] 1 tests (batch=4)... Done (1096/1096)
+
+======================================================================
+RESULTS
+======================================================================
+Total tests: 1096
+Processed: 1096
+Passed: 29
+Failed: 0
+Errors: 1067
+Time: 106.59s (1.8 minutes)
+Speed: 10.3 tests/second
+
+KV Cache Statistics:
+  Tokens cached: 41,296
+  Tokens evicted: 0
+  Cache hits: 16
+  Current total size: 1,424
+
+Validation statistics:
+  Validations: 6
+  Mismatches: 174
+  Match rate: 77.3%
+
+⚠ 1067 errors
