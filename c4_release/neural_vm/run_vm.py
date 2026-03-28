@@ -30,7 +30,7 @@ import warnings
 from typing import List, Optional, Callable, Any, Dict
 from dataclasses import dataclass, field
 
-from .vm_step import AutoregressiveVM, Token
+from .vm_step import AutoregressiveVM, Token, set_vm_weights
 from .embedding import Opcode
 
 # Opcodes that emit TOOL_CALL instead of STEP_END when tool calling is enabled.
@@ -137,6 +137,8 @@ class AutoregressiveVMRunner:
             ffn_hidden=ffn_hidden,
             max_seq_len=max_seq_len,
         )
+        # Load hand-crafted transformer weights for VM execution
+        set_vm_weights(self.model)
         self.model.eval()
 
         # Syscall dispatch table
@@ -1102,17 +1104,20 @@ class AutoregressiveVMRunner:
     def _exec_pc(self):
         """Compute PC of the instruction that was just executed.
 
-        The output PC from the previous step gives us where we WERE.
-        Adding 5 (instruction width) gives the PC of the instruction
-        that just executed in this step, assuming sequential flow from
-        the previous step's output PC.
+        The output PC from the PREVIOUS step is the address where
+        execution will continue (after PC increment or jump). This
+        means the instruction we're CURRENTLY executing is at that
+        address.
 
-        For the very first step, _last_pc is None and we return 0
-        (the first instruction).
+        Example:
+          Step 0: Execute CALL at PC=0, output PC=16 (jump)
+          Step 1: Execute instruction at PC=16 (not PC=21!)
+
+        For the very first step, _last_pc is None and we return 0.
         """
         if self._last_pc is None:
             return 0
-        return (self._last_pc + 5) & 0xFFFFFFFF
+        return self._last_pc
 
     def _handler_lea(self, context, output):
         """LEA -- AX = BP + signed immediate."""
@@ -1149,12 +1154,17 @@ class AutoregressiveVMRunner:
         instr = self._bytecode[exec_idx]
         target = instr >> 8  # raw immediate = jump target PC value
         return_addr = exec_pc
-        new_sp = (self._last_sp - 8) & 0xFFFFFFFF
-        # Override SP (full 32-bit)
+
+        # Read current SP from the just-generated step (not _last_sp which may be stale)
+        current_sp = self._extract_register(context, Token.REG_SP)
+        if current_sp is None:
+            current_sp = self._last_sp
+        new_sp = (current_sp - 8) & 0xFFFFFFFF
+
+        # TEMPORARY: Restore ALL JSR overrides to verify baseline works
+        # TODO: Remove overrides one by one after fixing issues
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        # Override STACK0 = return address
         self._override_register_in_last_step(context, Token.STACK0, return_addr)
-        # Override PC = jump target
         self._override_register_in_last_step(context, Token.REG_PC, target)
         # Store return address in shadow memory
         self._mem_store_word(new_sp, return_addr)
@@ -1174,8 +1184,13 @@ class AutoregressiveVMRunner:
         if imm >= 0x800000:
             imm -= 0x1000000
 
-        old_sp = self._last_sp
-        old_bp = self._last_bp
+        # Read current SP/BP from context (not _last_sp/_last_bp which may be stale)
+        old_sp = self._extract_register(context, Token.REG_SP)
+        if old_sp is None:
+            old_sp = self._last_sp
+        old_bp = self._extract_register(context, Token.REG_BP)
+        if old_bp is None:
+            old_bp = self._last_bp
 
         # Push old BP: *--sp = bp
         push_addr = (old_sp - 8) & 0xFFFFFFFF
@@ -1198,7 +1213,10 @@ class AutoregressiveVMRunner:
         So: saved_bp = mem[old_bp], return_addr = mem[old_bp + 8]
         new_sp = old_bp + 16, new_bp = saved_bp, pc = return_addr
         """
-        old_bp = self._last_bp
+        # Read current BP from context (not _last_bp which may be stale)
+        old_bp = self._extract_register(context, Token.REG_BP)
+        if old_bp is None:
+            old_bp = self._last_bp
         saved_bp = self._mem_load_word(old_bp)
         return_addr = self._mem_load_word(old_bp + 8)
         new_sp = (old_bp + 16) & 0xFFFFFFFF
