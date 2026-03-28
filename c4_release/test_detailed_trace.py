@@ -1,106 +1,66 @@
 #!/usr/bin/env python3
-"""Detailed trace of what the model generates."""
+"""Detailed execution trace."""
+import sys
+sys.path.insert(0, '.')
+import torch
 
-from neural_vm.run_vm import AutoregressiveVMRunner, Token
-from neural_vm.vm_step import set_vm_weights
 from src.compiler import compile_c
+from neural_vm.run_vm import AutoregressiveVMRunner
+from neural_vm.vm_step import Token
+from neural_vm.constants import PC_OFFSET, INSTR_WIDTH
 
-# Compile simple program
-code = "int main() { return 42; }"
-bytecode, data = compile_c(code)
+print(f'PC_OFFSET={PC_OFFSET}, INSTR_WIDTH={INSTR_WIDTH}')
 
-print(f"Program: {code}")
-print(f"Bytecode: {bytecode}")
-print()
+code = 'int main() { return 42; }'
+bytecode, _ = compile_c(code)
 
-# Token name mapping
-TOKEN_NAMES = {
-    Token.CODE_START: "CODE_START",
-    Token.DATA_START: "DATA_START",
-    Token.DATA_END: "DATA_END",
-    Token.SEP: "SEP",
-    Token.REG_PC: "PC",
-    Token.REG_AX: "AX",
-    Token.REG_SP: "SP",
-    Token.REG_BP: "BP",
-    Token.MEM: "MEM",
-    Token.STACK0: "STACK0",
-    Token.STEP_END: "STEP_END",
-    Token.HALT: "HALT",
-}
+# Show bytecode
+print(f'\nBytecode:')
+op_names = {0: 'LEA', 1: 'IMM', 3: 'JSR', 6: 'ENT', 8: 'LEV', 38: 'EXIT'}
+for i in range(len(bytecode)):
+    op = bytecode[i] & 0xFF
+    imm = (bytecode[i] >> 8) & 0xFFFFFFFF
+    pc = i * INSTR_WIDTH + PC_OFFSET
+    print(f'  idx={i} PC={pc:3d}: {op_names.get(op, f"op{op}"):6s} {imm}')
 
-def token_name(tok):
-    if tok in TOKEN_NAMES:
-        return TOKEN_NAMES[tok]
-    elif 0 <= tok <= 255:
-        return f"0x{tok:02x}"
-    else:
-        return str(tok)
+runner = AutoregressiveVMRunner()
+if torch.cuda.is_available():
+    runner.model.cuda()
 
-# Patch runner to capture generated tokens
-class TracingRunner(AutoregressiveVMRunner):
-    def run(self, bytecode, data=b"", argv=None, stdin="", max_steps=100000, tool_handler=None):
-        self._generated_tokens = []
+# Manual step-by-step execution
+runner._bytecode = bytecode
+context = runner._build_context(bytecode, b'', [])
+output = []
 
-        # Capture original generate_next
-        original_generate = self.model.generate_next
+print(f'\nExecution trace:')
+for step_num in range(10):
+    # Generate tokens
+    for i in range(40):
+        next_token = runner.model.generate_next(context)
+        context.append(next_token)
+        if next_token in (Token.STEP_END, Token.HALT):
+            break
 
-        def trace_generate(context):
-            token = original_generate(context)
-            self._generated_tokens.append(token)
-            return token
+    # Extract state
+    pc = runner._extract_register(context, Token.REG_PC)
+    ax = runner._extract_register(context, Token.REG_AX)
 
-        self.model.generate_next = trace_generate
+    # Get executed instruction
+    exec_pc = runner._exec_pc()
+    exec_idx = exec_pc // INSTR_WIDTH
 
-        try:
-            result = super().run(bytecode, data, argv, stdin, max_steps, tool_handler)
-        finally:
-            self.model.generate_next = original_generate
+    if 0 <= exec_idx < len(bytecode):
+        exec_op = bytecode[exec_idx] & 0xFF
+        exec_imm = (bytecode[exec_idx] >> 8) & 0xFFFFFFFF
+        print(f'  Step {step_num}: exec idx={exec_idx} PC={exec_pc} ({op_names.get(exec_op, f"op{exec_op}")}) → out PC={pc} AX={ax}')
 
-        return result
+    # Update runner state
+    runner._last_pc = pc
 
-# Create and run
-runner = TracingRunner()
-set_vm_weights(runner.model)
-runner.model.compact(block_size=32)
-runner.model.compact_moe()
-
-print("Running...\n")
-output, exit_code = runner.run(bytecode, data, max_steps=10)
-
-print(f"Generated {len(runner._generated_tokens)} tokens:\n")
-
-# Print tokens grouped by step
-step = 0
-i = 0
-while i < len(runner._generated_tokens):
-    tok = runner._generated_tokens[i]
-
-    if tok == Token.STEP_END:
-        step += 1
-        print(f"\n--- STEP_END (step {step}) ---\n")
-        i += 1
-    elif tok == Token.HALT:
-        print(f"\n*** HALT ***\n")
-        i += 1
+    # Check for halt
+    if context[-1] == Token.HALT:
+        print(f'\n  HALTED at step {step_num}')
         break
-    elif tok in [Token.REG_PC, Token.REG_AX, Token.REG_SP, Token.REG_BP, Token.STACK0, Token.MEM]:
-        # Register marker - print with its 4 bytes
-        name = token_name(tok)
-        if i + 4 < len(runner._generated_tokens):
-            b0 = runner._generated_tokens[i+1]
-            b1 = runner._generated_tokens[i+2]
-            b2 = runner._generated_tokens[i+3]
-            b3 = runner._generated_tokens[i+4]
-            value = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-            print(f"{name} = 0x{value:08x} ({value})")
-            i += 5
-        else:
-            print(f"{name} (incomplete)")
-            i += 1
-    else:
-        print(f"  {token_name(tok)}")
-        i += 1
 
-print(f"\nExit code: {exit_code}")
-print(f"Expected: 42")
+print(f'\nFinal AX: {ax}')
+print(f'Expected: 42')

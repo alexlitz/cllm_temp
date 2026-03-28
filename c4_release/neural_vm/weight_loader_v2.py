@@ -32,12 +32,12 @@ class CompiledWeightLoader:
         self.allocator = LayerAllocator(use_sharing=use_layer_sharing)
         self.n_layers = self.allocator.total_layers
 
-        # Initialize extractors/compilers
-        self.alu_extractor = ALUWeightExtractor()
-        self.compiler = OpcodeNibbleCompiler(reg_map=None)  # For single-layer ops
-
         # Calculate FFN size
         self.ffn_hidden = self._calculate_min_ffn_size()
+
+        # Initialize extractors/compilers
+        self.alu_extractor = ALUWeightExtractor()
+        self.compiler = OpcodeNibbleCompiler(num_positions=8, ffn_hidden=self.ffn_hidden)
 
         # Track unit usage per layer (for shared layers)
         self.layer_unit_usage = {i: 0 for i in range(self.n_layers)}
@@ -95,8 +95,9 @@ class CompiledWeightLoader:
         h_end = unit_offset + num_units
 
         # Check if we have enough space
-        if h_end > vm.ffn_hidden:
-            raise ValueError(f"Layer {layer_idx}: {op_name} needs {h_end} units, but FFN only has {vm.ffn_hidden}")
+        layer_ffn_hidden = layer.ffn.W_up.shape[0]
+        if h_end > layer_ffn_hidden:
+            raise ValueError(f"Layer {layer_idx}: {op_name} needs {h_end} units, but FFN only has {layer_ffn_hidden}")
 
         # Copy weights
         with torch.no_grad():
@@ -105,7 +106,9 @@ class CompiledWeightLoader:
             layer.ffn.W_gate.data[h_start:h_end, :] = W_gate
             layer.ffn.b_gate.data[h_start:h_end] = b_gate
             layer.ffn.W_down.data[:, h_start:h_end] = W_down
-            layer.ffn.b_down.data[:] += b_down  # Accumulate (multiple ops may write to same output)
+            # Don't accumulate b_down - it should stay zero for gated operations
+            # Each operation's output is gated by its hidden units, so bias accumulation would be wrong
+            # layer.ffn.b_down.data[:] += b_down
 
         if self.verbose:
             nonzero = sum((w.abs() > 1e-9).sum().item() for w in weights.values())
@@ -122,8 +125,8 @@ class CompiledWeightLoader:
         if vm.d_model != 1352:
             raise ValueError(f"VM must have d_model=1352, got {vm.d_model}")
 
-        if vm.n_layers != self.n_layers:
-            raise ValueError(f"VM must have n_layers={self.n_layers}, got {vm.n_layers}")
+        if len(vm.blocks) != self.n_layers:
+            raise ValueError(f"VM must have n_layers={self.n_layers}, got {len(vm.blocks)}")
 
         if self.verbose:
             print("=" * 70)
@@ -282,13 +285,46 @@ class CompiledWeightLoader:
         )
         self.layer_unit_usage[layer_idx] += units_used
 
+    def _extract_nonzero_units(self, weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Extract only the non-zero units from compiled weights.
+
+        compile_opcode returns full FFN-sized tensors but only uses a small fraction.
+        This extracts just the rows/cols that contain non-zero values.
+        """
+        W_up = weights['W_up']
+        b_up = weights['b_up']
+        W_gate = weights['W_gate']
+        b_gate = weights['b_gate']
+        W_down = weights['W_down']
+        b_down = weights['b_down']
+
+        # Find units (rows) that have non-zero values in any weight matrix
+        nonzero_mask = (W_up.abs().sum(dim=1) > 1e-9) | (W_gate.abs().sum(dim=1) > 1e-9)
+        nonzero_indices = torch.where(nonzero_mask)[0]
+
+        if len(nonzero_indices) == 0:
+            raise ValueError("No non-zero units found in weights!")
+
+        # Extract only non-zero units
+        return {
+            'W_up': W_up[nonzero_indices],
+            'b_up': b_up[nonzero_indices],
+            'W_gate': W_gate[nonzero_indices],
+            'b_gate': b_gate[nonzero_indices],
+            'W_down': W_down[:, nonzero_indices],
+            'b_down': b_down,  # Keep full b_down (accumulates across ops)
+        }
+
     def _load_bitwise(self, vm, opcode: int, name: str):
         """Load a bitwise operation (OR/XOR/AND) into layer 0."""
         if self.verbose:
             print(f"\nLoading {name} (1 layer)...")
 
-        # Compile using nibble compiler
-        weights = self.compiler.compile_opcode(opcode, unit_offset=0)
+        # Compile using nibble compiler (returns full FFN-sized tensors)
+        full_weights = self.compiler.compile_opcode(opcode, unit_offset=0)
+
+        # Extract only the non-zero units
+        weights = self._extract_nonzero_units(full_weights)
 
         # All single-layer ops go into layer 0
         layer_idx = 0

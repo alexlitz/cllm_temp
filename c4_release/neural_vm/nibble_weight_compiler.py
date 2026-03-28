@@ -137,26 +137,30 @@ class NibbleWeightEmitter:
         return self.reg_map.flat_index(position, slot)
 
     def _add_opcode_gating(self, unit: int, position: int = 0):
-        """Add scalar opcode gating to make unit fire only for specific opcode.
+        """Add one-hot opcode gating to make unit fire only for specific opcode.
 
-        Uses continuous opcode signal with a threshold window:
-        - Suppresses activation when |opcode - target| > 0.5
-        - Uses high negative bias that's cancelled only when opcode ≈ target
-
-        Strategy: Make b_gate very negative, then add positive contribution
-        only when opcode is in narrow range around target.
+        Uses one-hot encoding at OP_START + opcode for clean, interference-free gating.
+        This matches the gating used by ALU operations, enabling layer sharing.
 
         Args:
             unit: Hidden unit index to gate
-            position: Position to read opcode from (opcodes are replicated, use 0)
+            position: Position to read opcode from (opcodes are shared, use 0)
         """
-        # Use very strong suppression
-        # The idea: make the gate input highly negative by default,
-        # then add just enough positive signal when opcode matches
+        # Use one-hot opcode gating: gate = sigmoid(SCALE * opcode - BIAS)
+        # When opcode=1: gate = sigmoid(SCALE - BIAS) = sigmoid(~0) ≈ 0.5
+        # When opcode=0: gate = sigmoid(0 - BIAS) = sigmoid(-BIAS) ≈ 0
+        #
+        # Choose SCALE and BIAS so that:
+        # - sigmoid(SCALE - BIAS) is high enough to let unit fire
+        # - sigmoid(-BIAS) is low enough to suppress unit
 
-        # For now, accept that scalar gating won't be perfect
-        # Use separate layers for different operation families instead
-        pass  # Disable scalar gating - will use layer separation
+        opcode_slot = self._fi(position, self.reg_map.OP_START + self.opcode)
+
+        SCALE = 20.0  # When opcode=1, contributes +20
+        BIAS = 10.0   # Offset to make sigmoid(-10) ≈ 0
+
+        self.W_gate[unit, opcode_slot] = SCALE
+        self.b_gate[unit] -= BIAS  # Subtract bias so sigmoid(SCALE - BIAS) when opcode=1
 
     def emit_add_nibble(self, position: int):
         """Emit weights for ADD at a specific nibble position.

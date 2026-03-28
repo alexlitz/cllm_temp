@@ -124,6 +124,10 @@ class NibbleVMEmbedding(nn.Module):
             # Encode opcode as scalar value (shared across positions, for continuous gating)
             embedding[:, base_idx + E.OPCODE] = float(opcode)
 
+            # Encode opcode as one-hot (for clean operation gating in shared layers)
+            if 0 <= opcode < E.NUM_OPS:
+                embedding[:, base_idx + E.OP_START + opcode] = 1.0
+
             # Initialize carry to 0
             embedding[:, base_idx + E.CARRY_IN] = 0.0
 

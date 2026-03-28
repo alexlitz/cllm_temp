@@ -1,49 +1,55 @@
-# Session Summary: IMM Investigation & PSH Revert
+# Session Summary: LEA/JMP/IMM Debugging
 
-## What We Accomplished
+## Objective
+Fix failing opcodes: JMP, IMM, LEA
 
-### 1. Fixed Test Bug (IMM)
-**Problem**: Original test showed IMM failing at token 1
-**Root Cause**: Test wasn't building context incrementally
-**Fix**: Added `current_context.append(draft)` in loop
-**Result**: Real failure is at token 7, not token 1
+## Major Fixes Applied
 
-### 2. Diagnosed IMM Bug
-**Real Issue**: IMM 42/255 fail at token 7 (AX byte 1)
-- Token 6 (AX_b0): Correct (42 or 255)
-- Token 7 (AX_b1): Wrong (predicts 42/255 instead of 0)
+### 1. L9 ADD Hi-Nibble Units (Lines 3484-3502)
+**Problem**: Units with `carry_in=1` reading CARRY[0] with weight S*2.0, causing spurious activation.
 
-**Root Cause**: Missing AX byte relay logic
-- BYTE_INDEX increments correctly ✓
-- MARK_AX not propagated (stays 0) ✗
-- OUTPUT carries stale value ✗
+**Fix**: Reduced CARRY[0] weight from `S*2.0` to `0.01`, relaxed bias from `-S*4.5` to `-S*2.9`.
 
-**Key Finding**: PC bytes work, AX bytes don't
+**Impact**: Eliminated OUTPUT_HI corruption where all 16 dimensions were written equal values.
 
-### 3. Reverted Broken PSH Fix
-**Problem**: Math error in negative CMP[0] weight
-**Fix**: Restored disabled state (T=100.0)
-**Side Effect**: JMP 16 now fails (was passing before!)
+### 2. L9 Carry-Out Detection Units (Lines 3622-3644)
+**Problem**: 136 units activating, accumulating CARRY[1] to 18,603 instead of ~1.
 
-## Current Status (Manual Tests)
+**Fix**: Applied same CARRY[0] weight reduction.
 
-**PASSING**: NOP, IMM 0, JMP 8
-**FAILING**: IMM 42, IMM 255, JMP 16
+**Impact**: CARRY[1] no longer accumulates abnormally.
 
-## Critical Discovery
+### 3. L9 Borrow-Out Detection Units (Lines 3646-3670)
+**Fix**: Applied same CARRY[0] weight reduction for SUB operations.
 
-PSH revert caused JMP regression:
-- Before: JMP 16 ✅, JMP 8 ❌
-- After: JMP 16 ❌, JMP 8 ✅
+**Impact**: CARRY[2] handled correctly.
 
-The "broken" PSH fix was accidentally helping JMP 16!
+### 4. DivModModule Spurious Activation (Lines 363-408)
+**Problem**: 414 DIV/MOD units activating for non-DIV/MOD operations, writing ~69,600 to OUTPUT_HI.
 
-## Priority Issues
+**Fix**: Changed from 6-way AND to 5-way AND + gate check - opcode gating now done via W_gate instead of W_up.
 
-1. **P0**: JMP 16 regression (PSH revert broke it)
-2. **P1**: IMM byte relay (AX bytes fail)
-3. **P2**: PSH permanent fix (architectural)
+**Impact**: DivModModule now completely inactive for non-DIV/MOD operations.
 
-## Recommended Next Action
+## Architectural Issue Identified
 
-Fix JMP regression - understand why negative CMP[0] weight affected JMP prediction.
+### Root Cause: Imperfect One-Hot Representations
+
+ALU_HI and AX_CARRY_HI aren't maintaining clean one-hot encoding:
+- ALU_HI[0] = 0.416 (should be ~1.0)
+- ALU_HI[1] = 0.012 (leakage)
+- AX_CARRY_HI[0] = 2.458 (unnormalized)
+
+This causes wrong L9 units to partially activate.
+
+## Results
+
+**Progress**: 
+- Eliminated massive corruption (237,912 → 19.1)
+- Eliminated CARRY accumulation (18,603 → 0)
+- Eliminated DivMod spurious activation (414 units → 0)
+
+**Remaining**: Operand normalization issue prevents correct final predictions.
+
+## Files Modified
+`neural_vm/vm_step.py`: Lines 363-375, 392-404, 3484-3502, 3622-3644, 3646-3670

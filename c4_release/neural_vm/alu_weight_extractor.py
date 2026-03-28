@@ -94,10 +94,11 @@ class ALUWeightExtractor:
         # This can be done with a simple cancel pair for each position
         layer3_weights = self._create_finalize_weights(opcode)
 
+        # Remap all layers to our E format
         return ThreeLayerWeights(
-            layer1=layer1_weights,
-            layer2=layer2_weights,
-            layer3=layer3_weights
+            layer1=self._remap_flattened_weights(layer1_weights),
+            layer2=self._remap_flattened_weights(layer2_weights),
+            layer3=self._remap_flattened_weights(layer3_weights)
         )
 
     def extract_sub_weights(self, opcode: int = Opcode.SUB) -> ThreeLayerWeights:
@@ -125,10 +126,11 @@ class ALUWeightExtractor:
         # For SUB, this is slightly different - need to add base when there's a borrow
         layer3_weights = self._create_sub_finalize_weights(opcode)
 
+        # Remap all layers to our E format
         return ThreeLayerWeights(
-            layer1=layer1_weights,
-            layer2=layer2_weights,
-            layer3=layer3_weights
+            layer1=self._remap_flattened_weights(layer1_weights),
+            layer2=self._remap_flattened_weights(layer2_weights),
+            layer3=self._remap_flattened_weights(layer3_weights)
         )
 
     def _extract_pure_ffn_weights(self, ffn: GenericPureFFN) -> Dict[str, torch.Tensor]:

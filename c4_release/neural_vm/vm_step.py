@@ -2370,16 +2370,18 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
 
-    # Head 2: fetch opcode for first-step JMP (PC marker → address 0)
-    # On the first step (NOT HAS_SE), PC=0 by default. Fetch opcode from address 0.
+    # Head 2: fetch opcode for first-step (PC marker → address PC_OFFSET)
+    # On the first step (NOT HAS_SE), PC = PC_OFFSET. Fetch opcode from address PC_OFFSET.
     # Uses ADDR_KEY matching (same mechanism as head 1, but fires at PC marker not AX).
+    # With PC_OFFSET=2: opcode is at ADDR_KEY=2
+    from .constants import PC_OFFSET
     base = 2 * HD
-    # Q: fires at PC marker when NOT HAS_SE, queries for address 0
+    # Q: fires at PC marker when NOT HAS_SE, queries for address PC_OFFSET
     attn.W_q[base, BD.MARK_PC] = L
     attn.W_q[base, BD.HAS_SE] = -L  # only on first step
-    # Q: address 0 (ADDR_KEY_LO[0]=1, ADDR_KEY_HI[0]=1)
-    attn.W_q[base + 0, BD.CONST] = L  # k=0 for LO
-    attn.W_q[base + 16, BD.CONST] = L  # k=0 for HI
+    # Q: address PC_OFFSET (e.g., 2: ADDR_KEY_LO[2]=1, ADDR_KEY_HI[0]=1)
+    attn.W_q[base + (PC_OFFSET & 0xF), BD.CONST] = L  # lo nibble
+    attn.W_q[base + 16 + ((PC_OFFSET >> 4) & 0xF), BD.CONST] = L  # hi nibble
     attn.W_q[base + 32, BD.MARK_PC] = L  # third nibble gate
 
     # K: match ADDR_KEY nibbles (same as head 1)
@@ -2403,14 +2405,16 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
 
-    # Head 3: fetch immediate for first-step JMP (PC marker → address 1)
-    # Fetches immediate byte at address 1 (first immediate byte) and writes to AX_CARRY.
+    # Head 3: fetch immediate for first-step (PC marker → address PC_OFFSET+1)
+    # Fetches immediate byte 0 at address PC_OFFSET+1 and writes to AX_CARRY.
     # Layer 6 FFN reads AX_CARRY for JMP target.
+    # With PC_OFFSET=2: immediate byte 0 is at ADDR_KEY=3
+    imm_addr = PC_OFFSET + 1
     base = 3 * HD
-    # Q: queries for address 1 (ADDR_KEY_LO[1]=1, ADDR_KEY_HI[0]=1)
-    # NOTE: Q[0] must remain zero - setting it causes address 0/1 to match equally
-    attn.W_q[base + 1, BD.CONST] = L  # k=1 for LO
-    attn.W_q[base + 16, BD.CONST] = L  # k=0 for HI
+    # Q: queries for address PC_OFFSET+1 (e.g., 3: ADDR_KEY_LO[3]=1, ADDR_KEY_HI[0]=1)
+    # NOTE: Q[PC_OFFSET] must remain zero - setting it causes opcode/imm to match equally
+    attn.W_q[base + (imm_addr & 0xF), BD.CONST] = L  # lo nibble
+    attn.W_q[base + 16 + ((imm_addr >> 4) & 0xF), BD.CONST] = L  # hi nibble
     attn.W_q[base + 32, BD.MARK_PC] = L  # third nibble gate
 
     # K: match ADDR_KEY nibbles
@@ -2430,9 +2434,12 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
         attn.W_v[base + 48 + k, BD.CLEAN_EMBED_HI + k] = 1.0
     # O: write to AX_CARRY_LO/HI at PC marker (used by L6 FFN for JMP)
+    # Also write to FETCH_LO/HI for IMM support on first step
     for k in range(16):
         attn.W_o[BD.AX_CARRY_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.AX_CARRY_HI + k, base + 48 + k] = 1.0
+        attn.W_o[BD.FETCH_LO + k, base + 32 + k] = 1.0
+        attn.W_o[BD.FETCH_HI + k, base + 48 + k] = 1.0
 
 
 def _set_opcode_decode_ffn(ffn, S, BD):
@@ -2538,14 +2545,23 @@ def _set_opcode_decode_ffn(ffn, S, BD):
 
 
 def _set_layer6_attn(attn, S, BD, HD):
-    """Layer 6 attention: JMP relay + EXIT relay.
+    """Layer 6 attention: JMP relay + EXIT relay + first-step relays.
 
     Head 0 — JMP relay: At current step's PC marker, attend to previous
-    step's AX marker (d=30). Copy OP_JMP flag and EMBED_LO/HI (JMP target).
+    step's AX marker (d=30). Copy OP_JMP flag and FETCH_LO/HI (JMP target).
     Writes CMP[0] (IS_JMP) and AX_CARRY_LO/HI (JMP target) at PC marker.
 
     Head 1 — EXIT relay: At NEXT_SE positions, attend to current step's
     AX marker (d=28). Copy OP_EXIT flag. Writes CMP[1] (IS_EXIT).
+
+    Head 2 — First-step JMP relay: At PC marker (first step only), attend to
+    current step's AX marker. Copy OP_JMP and FETCH for intra-step JMP.
+
+    Head 3 — JSR relay: At PC marker (all steps), attend to current step's
+    AX marker. Copy OP_JSR flag to TEMP[0] for JSR PC override.
+
+    Head 4 — First-step FETCH relay: At AX marker (first step only), attend to
+    PC marker. Copy FETCH_LO/HI from PC marker to AX marker for IMM routing.
 
     Uses L=50 (large) + ALiBi slope=5.0 (steep) to minimize leakage.
     Attention scale = 1/sqrt(64) = 0.125, so score = L²*0.125 - slope*d.
@@ -2553,7 +2569,7 @@ def _set_layer6_attn(attn, S, BD, HD):
     Head 1 at SE: 50²*0.7*0.125 - 5*28 = 79 (strong). Leakage at Q=0: <0.7%.
     Q guards (-L at MARK_AX) block self-attention at AX markers entirely.
 
-    Heads 2-7: unused (zero weights, identity via residual).
+    Heads 5-7: unused (zero weights, identity via residual).
     """
     L = 50.0
 
@@ -2622,6 +2638,23 @@ def _set_layer6_attn(attn, S, BD, HD):
     # O: write IS_JSR flag to TEMP[0] at PC marker
     # (Layer 5 FFN clears TEMP at PC; Layer 6 attention writes it; Layer 6 FFN reads it)
     attn.W_o[BD.TEMP + 0, base + 1] = 1.0
+
+    # Head 4: First-step FETCH relay (AX marker ← PC marker)
+    # For first step, L5 head 3 writes FETCH_LO/HI at PC marker position.
+    # L6 FFN reads FETCH at AX marker position for IMM routing.
+    # This relay copies FETCH from PC marker to AX marker on first step only.
+    base = 4 * HD
+    attn.W_q[base, BD.MARK_AX] = L
+    attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
+    attn.W_k[base, BD.MARK_PC] = L
+    # V: copy FETCH_LO/HI
+    for k in range(16):
+        attn.W_v[base + k, BD.FETCH_LO + k] = 1.0
+        attn.W_v[base + 16 + k, BD.FETCH_HI + k] = 1.0
+    # O: write to FETCH_LO/HI at AX marker
+    for k in range(16):
+        attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
+        attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
 
 
 def _set_layer6_routing_ffn(ffn, S, BD):
