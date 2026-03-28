@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 
 from .vm_step import AutoregressiveVM, Token, set_vm_weights
 from .embedding import Opcode
+from .constants import INSTR_WIDTH
 
 # Opcodes that emit TOOL_CALL instead of STEP_END when tool calling is enabled.
 # When model emits STEP_END for these (weights not set, or enable_tool_calling=False),
@@ -268,7 +269,7 @@ class AutoregressiveVMRunner:
         output = []
 
         # Set initial opcode for MoE routing (first instruction)
-        init_exec = self._exec_pc() // 5
+        init_exec = self._exec_pc() // INSTR_WIDTH
         if 0 <= init_exec < len(bytecode):
             self.model.set_active_opcode(bytecode[init_exec] & 0xFF)
 
@@ -282,7 +283,7 @@ class AutoregressiveVMRunner:
                 instr_idx = None
                 pc = self._extract_register(context, Token.REG_PC)
                 if pc is not None:
-                    instr_idx = pc // 5
+                    instr_idx = pc // INSTR_WIDTH
                     if 0 <= instr_idx < len(bytecode):
                         op = bytecode[instr_idx] & 0xFF
                         handler = self._syscall_handlers.get(op)
@@ -325,7 +326,7 @@ class AutoregressiveVMRunner:
                             self._track_memory_write(context, op)
                 # Dispatch function-call handlers (use exec_pc, not output pc)
                 exec_op = None
-                exec_idx = self._exec_pc() // 5
+                exec_idx = self._exec_pc() // INSTR_WIDTH
                 if 0 <= exec_idx < len(bytecode):
                     exec_op = bytecode[exec_idx] & 0xFF
                     func_handler = self._func_call_handlers.get(exec_op)
@@ -370,7 +371,7 @@ class AutoregressiveVMRunner:
                     self._last_pc = pc
 
                 # Set next step's active opcode for MoE routing
-                next_exec = self._exec_pc() // 5
+                next_exec = self._exec_pc() // INSTR_WIDTH
                 if 0 <= next_exec < len(bytecode):
                     self.model.set_active_opcode(bytecode[next_exec] & 0xFF)
                 else:
@@ -399,7 +400,7 @@ class AutoregressiveVMRunner:
                 instr_idx = None
                 pc = self._extract_register(context, Token.REG_PC)
                 if pc is not None:
-                    instr_idx = pc // 5
+                    instr_idx = pc // INSTR_WIDTH
                     if 0 <= instr_idx < len(bytecode):
                         op = bytecode[instr_idx] & 0xFF
                         handler = self._syscall_handlers.get(op)
@@ -416,7 +417,7 @@ class AutoregressiveVMRunner:
                             self._track_memory_write(context, op)
                 # Dispatch function-call handlers (use exec_pc, not output pc)
                 exec_op = None
-                exec_idx = self._exec_pc() // 5
+                exec_idx = self._exec_pc() // INSTR_WIDTH
                 if 0 <= exec_idx < len(bytecode):
                     exec_op = bytecode[exec_idx] & 0xFF
                     func_handler = self._func_call_handlers.get(exec_op)
@@ -453,7 +454,7 @@ class AutoregressiveVMRunner:
                     self._last_pc = pc
 
                 # Set next step's active opcode for MoE routing
-                next_exec = self._exec_pc() // 5
+                next_exec = self._exec_pc() // INSTR_WIDTH
                 if 0 <= next_exec < len(bytecode):
                     self.model.set_active_opcode(bytecode[next_exec] & 0xFF)
                 else:
@@ -558,7 +559,7 @@ class AutoregressiveVMRunner:
         pc = self._extract_register(context, Token.REG_PC)
         if pc is None:
             return False
-        instr_idx = pc // 5
+        instr_idx = pc // INSTR_WIDTH
         if 0 <= instr_idx < len(self._bytecode):
             return (self._bytecode[instr_idx] & 0xFF) == Opcode.PUTCHAR
         return False
@@ -885,7 +886,7 @@ class AutoregressiveVMRunner:
         pc = self._extract_register(context, Token.REG_PC)
         if pc is None:
             return
-        instr_idx = pc // 5
+        instr_idx = pc // INSTR_WIDTH
         if 0 <= instr_idx < len(self._bytecode):
             instr = self._bytecode[instr_idx]
             imm = instr >> 8
@@ -1022,7 +1023,7 @@ class AutoregressiveVMRunner:
         pc = self._extract_register(context, Token.REG_PC)
         argc = 0
         if pc is not None:
-            adj_idx = pc // 5 + 1  # next instruction after PRTF
+            adj_idx = pc // INSTR_WIDTH + 1  # next instruction after PRTF
             if 0 <= adj_idx < len(self._bytecode):
                 adj_instr = self._bytecode[adj_idx]
                 adj_op = adj_instr & 0xFF
@@ -1122,7 +1123,7 @@ class AutoregressiveVMRunner:
     def _handler_lea(self, context, output):
         """LEA -- AX = BP + signed immediate."""
         exec_pc = self._exec_pc()
-        exec_idx = exec_pc // 5
+        exec_idx = exec_pc // INSTR_WIDTH
         if exec_idx < 0 or exec_idx >= len(self._bytecode):
             return
         instr = self._bytecode[exec_idx]
@@ -1148,7 +1149,7 @@ class AutoregressiveVMRunner:
         by always overriding PC for JSR.
         """
         exec_pc = self._exec_pc()
-        exec_idx = exec_pc // 5
+        exec_idx = exec_pc // INSTR_WIDTH
         if exec_idx < 0 or exec_idx >= len(self._bytecode):
             return
         instr = self._bytecode[exec_idx]
@@ -1175,7 +1176,7 @@ class AutoregressiveVMRunner:
         *--sp = bp;  bp = sp;  sp -= imm;
         """
         exec_pc = self._exec_pc()
-        exec_idx = exec_pc // 5
+        exec_idx = exec_pc // INSTR_WIDTH
         if exec_idx < 0 or exec_idx >= len(self._bytecode):
             return
         instr = self._bytecode[exec_idx]
@@ -1203,6 +1204,9 @@ class AutoregressiveVMRunner:
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
         self._override_register_in_last_step(context, Token.REG_BP, new_bp)
         self._override_register_in_last_step(context, Token.STACK0, old_bp)
+        # ENT advances PC by INSTR_WIDTH (like other func_call handlers override PC)
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
         # Shadow memory: store old BP at push_addr
         self._mem_store_word(push_addr, old_bp)
 

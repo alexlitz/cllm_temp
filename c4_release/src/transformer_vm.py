@@ -21,6 +21,12 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
 
+# Import INSTR_WIDTH for consistent instruction addressing
+try:
+    from neural_vm.constants import INSTR_WIDTH
+except ImportError:
+    INSTR_WIDTH = 5  # Fallback if neural_vm not available
+
 
 # =============================================================================
 # CONFIGURATION
@@ -382,14 +388,14 @@ class C4TransformerVM(nn.Module):
 
         step = 0
         while step < max_steps and not self.state.halted:
-            if self.state.pc // 8 >= len(self._bytecode):
+            if self.state.pc // INSTR_WIDTH >= len(self._bytecode):
                 break
 
-            instr = self._bytecode[self.state.pc // 8]
+            instr = self._bytecode[self.state.pc // INSTR_WIDTH]
             opcode = instr & 0xFF
             imm = instr >> 8
 
-            self.state.pc += 8
+            self.state.pc += INSTR_WIDTH
             step += 1
 
             # Execute instruction

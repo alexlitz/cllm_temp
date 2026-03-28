@@ -1,36 +1,27 @@
 #!/usr/bin/env python3
-"""Debug the runner to see what tokens are generated."""
+"""Debug runner execution with detailed output."""
+import sys
+sys.path.insert(0, '.')
 
-from neural_vm.run_vm import AutoregressiveVMRunner
-from neural_vm.vm_step import set_vm_weights
 from src.compiler import compile_c
+from neural_vm.run_vm import AutoregressiveVMRunner
 
-# Compile simple program
-code = "int main() { return 42; }"
-bytecode, data = compile_c(code)
+print("Compiling test program...")
+code = 'int main() { return 42; }'
+bytecode, _ = compile_c(code)
+print(f"Bytecode: {len(bytecode)} instructions")
 
-print(f"Bytecode: {bytecode}")
-print(f"Instructions:")
-for i, instr in enumerate(bytecode):
-    op = instr & 0xFF
-    imm = instr >> 8
-    print(f"  {i}: op={op}, imm={imm}")
-
-# Create runner
+print("Creating runner...")
 runner = AutoregressiveVMRunner()
-set_vm_weights(runner.model)
-runner.model.compact(block_size=32)
-runner.model.compact_moe()
 
-# Run with debugging
-print("\nRunning...")
-output, exit_code = runner.run(bytecode, data, max_steps=100)
+print(f"Runner model type: {type(runner.model)}")
+print(f"Has draft_vm: {hasattr(runner, 'draft_vm')}")
 
-print(f"\nOutput: '{output}'")
-print(f"Exit code: {exit_code}")
-print(f"Expected exit code: 42")
-
-# Check internal state
-print(f"\n_last_ax: {runner._last_ax}")
-print(f"_last_pc: {runner._last_pc}")
-print(f"_last_sp: {hex(runner._last_sp) if runner._last_sp else None}")
+print("\nAttempting to run with max_steps=5...")
+try:
+    result = runner.run(bytecode, max_steps=5)
+    print(f"Result after 5 steps: {result}")
+except Exception as e:
+    print(f"ERROR: {e}")
+    import traceback
+    traceback.print_exc()

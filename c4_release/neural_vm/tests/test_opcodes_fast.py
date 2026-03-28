@@ -19,22 +19,27 @@ from neural_vm.embedding import Opcode
 from neural_vm.batch_runner_v2 import UltraBatchRunner, UltraBatchRunnerCached, run_batch_ultra
 
 
+_cached_runner = None
+
 def run_programs_batch_ultra(bytecodes_list, batch_size=256, strict=True):
     """Run multiple programs using ultra-fast speculative batch execution.
 
     Args:
-        strict: If True, fail when transformer predictions don't match DraftVM
+        strict: If True, fail when transformer predictions don't match DraftVM.
+                Default is True to ensure transformer computes correctly.
 
     Returns: list of exit codes
 
     Raises:
         AssertionError: If strict=True and transformer predictions are wrong
     """
-    # Use CPU for strict mode to avoid GPU OOM
+    global _cached_runner
+    # Use CPU to avoid GPU OOM
     # CUDA uses too much memory with compacted model (~22GB base + activations)
     device = 'cpu'
-    runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
-    return runner.run_batch(bytecodes_list)
+    if _cached_runner is None:
+        _cached_runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
+    return _cached_runner.run_batch(bytecodes_list)
 
 
 # =============================================================================

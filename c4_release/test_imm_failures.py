@@ -79,6 +79,9 @@ for value in [42, 255]:
         if not match or i < 10:
             print(f"  Token {i:2d} ({name:8s}): draft={draft:3d}, predicted={predicted:3d} {marker}")
 
+        # Append draft token to build context incrementally
+        current_context.append(draft)
+
     print()
     if all_match:
         print(f"  ✅ IMM {value} ALL TOKENS MATCH")

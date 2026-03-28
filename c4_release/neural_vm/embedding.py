@@ -9,16 +9,28 @@ class E:
     """Embedding dimensions - 8 nibble positions, each with features."""
 
     # Per-nibble features
-    NIB_A = 0          # Operand A nibble (0-15 encoded)
-    NIB_B = 1          # Operand B nibble (0-15 encoded)
-    RAW_SUM = 2        # Raw A + B or A - B (before carry/borrow)
-    CARRY_IN = 3       # Carry/borrow from lower nibble
-    CARRY_OUT = 4      # Carry/borrow to higher nibble
-    RESULT = 5         # Result nibble
-    TEMP = 6           # Temporary storage for multi-step ops
+    NIB_A = 0          # Operand A nibble (0-15 as scalar, for ADD/SUB)
+    NIB_B = 1          # Operand B nibble (0-15 as scalar, for ADD/SUB)
 
-    # Opcode one-hot (shared across positions)
-    OP_START = 7
+    # Binary encoding of nibbles (for exact lookup operations)
+    NIB_A_BIT0 = 2     # Operand A bit 0 (LSB)
+    NIB_A_BIT1 = 3     # Operand A bit 1
+    NIB_A_BIT2 = 4     # Operand A bit 2
+    NIB_A_BIT3 = 5     # Operand A bit 3 (MSB)
+    NIB_B_BIT0 = 6     # Operand B bit 0 (LSB)
+    NIB_B_BIT1 = 7     # Operand B bit 1
+    NIB_B_BIT2 = 8     # Operand B bit 2
+    NIB_B_BIT3 = 9     # Operand B bit 3 (MSB)
+
+    RAW_SUM = 10       # Raw A + B or A - B (before carry/borrow)
+    CARRY_IN = 11      # Carry/borrow from lower nibble
+    CARRY_OUT = 12     # Carry/borrow to higher nibble
+    RESULT = 13        # Result nibble
+    TEMP = 14          # Temporary storage for multi-step ops
+
+    # Opcode encoding (shared across positions)
+    OPCODE = 15        # Scalar opcode value (0-71) for continuous gating
+    OP_START = 16      # Start of one-hot region (deprecated, keeping for compatibility)
     NUM_OPS = 72       # Extended for C4 compatibility (0-38 + 64-66)
 
     # Position encoding
@@ -29,53 +41,53 @@ class E:
     #   - RoPE: Q/K rotation based on position
     # FFN layers then read from POS after position injection.
     # This ensures position comes from positional encoding, not hardcoded values.
-    POS = 79
+    POS = 88           # Shifted by +8 for binary bits, +1 for OPCODE
 
     # I/O Mailbox Slots (for embedding-based I/O)
-    IO_CHAR = 80       # Slots 80-87: Character as nibbles (8 nibbles = 32 bits)
-    IO_OUTPUT_READY = 88   # 1.0 when PUTCHAR has a char to emit
-    IO_INPUT_READY = 89    # 1.0 when external input is available
-    IO_NEED_INPUT = 90     # 1.0 when GETCHAR needs more input
-    IO_PROGRAM_END = 91    # 1.0 when EXIT is called
-    IO_EXIT_CODE = 92      # Exit code value
+    IO_CHAR = 89       # Slots 80-87: Character as nibbles (8 nibbles = 32 bits)
+    IO_OUTPUT_READY = 97   # 1.0 when PUTCHAR has a char to emit
+    IO_INPUT_READY = 98    # 1.0 when external input is available
+    IO_NEED_INPUT = 99     # 1.0 when GETCHAR needs more input
+    IO_PROGRAM_END = 100    # 1.0 when EXIT is called
+    IO_EXIT_CODE = 101      # Exit code value
 
     # Tool-Use Mode Slots
-    IO_TOOL_CALL_TYPE = 93   # Type of tool call (0=none, 1=getchar, 2=putchar, ...)
-    IO_TOOL_CALL_ID = 94     # Unique call ID
-    IO_TOOL_RESPONSE = 95    # Response value from handler
+    IO_TOOL_CALL_TYPE = 102   # Type of tool call (0=none, 1=getchar, 2=putchar, ...)
+    IO_TOOL_CALL_ID = 103     # Unique call ID
+    IO_TOOL_RESPONSE = 104    # Response value from handler
 
     # Argv Mailbox Slots (for plaintext argc/argv passing)
-    IO_ARGC = 96             # Argument count (set before program starts)
-    IO_ARGV_INDEX = 97       # Current argv index being read (0-based)
-    IO_NEED_ARGV = 98        # 1.0 when program needs next argv character
-    IO_ARGV_READY = 99       # 1.0 when argv character is available in IO_CHAR
-    IO_ARGV_END = 100        # 1.0 when current argv string is complete (\0)
-    IO_ALL_ARGV_READ = 101   # 1.0 when all argv strings have been read
+    IO_ARGC = 105             # Argument count (set before program starts)
+    IO_ARGV_INDEX = 106       # Current argv index being read (0-based)
+    IO_NEED_ARGV = 107        # 1.0 when program needs next argv character
+    IO_ARGV_READY = 108       # 1.0 when argv character is available in IO_CHAR
+    IO_ARGV_END = 109        # 1.0 when current argv string is complete (\0)
+    IO_ALL_ARGV_READ = 110   # 1.0 when all argv strings have been read
 
     # Heap management for bump allocator
-    HEAP_BASE = 104          # Base of heap [104:112] (8 nibbles, fixed at program start)
-    HEAP_PTR = 112           # Current allocation pointer [112:120] (bumps upward)
-    HEAP_END = 120           # End of heap [120:128] (for bounds checking)
+    HEAP_BASE = 113          # Base of heap [104:112] (8 nibbles, fixed at program start)
+    HEAP_PTR = 121           # Current allocation pointer [112:120] (bumps upward)
+    HEAP_END = 129           # End of heap [120:128] (for bounds checking)
 
     # AX register for return values (used by malloc)
-    AX_BASE = 128            # AX register [128:136] (8 nibbles)
+    AX_BASE = 137            # AX register [128:136] (8 nibbles)
 
     # Memory interface
-    MEM_ADDR_BASE = 136      # Memory address [136:144] (8 nibbles)
-    MEM_DATA_BASE = 144      # Memory data [144:152] (8 nibbles)
-    MEM_WRITE = 152          # 1.0 = write request pending
-    MEM_READ = 153           # 1.0 = read request pending
-    MEM_READY = 154          # 1.0 = memory operation complete
+    MEM_ADDR_BASE = 145      # Memory address [136:144] (8 nibbles)
+    MEM_DATA_BASE = 153      # Memory data [144:152] (8 nibbles)
+    MEM_WRITE = 161          # 1.0 = write request pending
+    MEM_READ = 162           # 1.0 = read request pending
+    MEM_READY = 163          # 1.0 = memory operation complete
 
     # Shift extraction temp slots (used by unified bit extraction)
-    SHIFT_EXTRACT_A = 155    # Temp slot for bit 2 extraction
-    SHIFT_EXTRACT_B = 156    # Temp slot for bit 3 extraction
+    SHIFT_EXTRACT_A = 164    # Temp slot for bit 2 extraction
+    SHIFT_EXTRACT_B = 165    # Temp slot for bit 3 extraction
 
     # Fused schoolbook MUL temp slots (second pair for double-offset)
-    TEMP_A2 = 157            # Second a_slot for fused double-offset MUL
-    TEMP_B2 = 158            # Second b_slot for fused double-offset MUL
+    TEMP_A2 = 166            # Second a_slot for fused double-offset MUL
+    TEMP_B2 = 167            # Second b_slot for fused double-offset MUL
 
-    DIM = 160          # Total per-position dimension
+    DIM = 169          # Total per-position dimension (was 168)
     NUM_POSITIONS = 8  # 8 nibbles
 
     # Scale for SwiGLU identity (higher = tighter approximations)

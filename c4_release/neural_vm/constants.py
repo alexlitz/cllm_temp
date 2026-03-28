@@ -9,8 +9,10 @@ making the code more maintainable and self-documenting.
 # Instruction Format Constants
 # =============================================================================
 
-# Instruction layout: 1 opcode byte + 4 immediate bytes + 3 padding bytes = 8 total
-INSTR_WIDTH = 8          # Total bytes per instruction in memory
+# Instruction layout: 1 opcode byte + 4 immediate bytes = 5 bytes, plus 3 bytes padding
+# for 8-byte alignment. Model weights were trained with this scheme.
+# Compiler uses * 8 and // 8 for all address calculations.
+INSTR_WIDTH = 8          # Total bytes per instruction slot (5 data + 3 padding)
 OPCODE_SIZE = 1          # Opcode field is 1 byte
 IMMEDIATE_SIZE = 4       # Immediate value field is 4 bytes (32-bit)
 PADDING_SIZE = 3         # Padding bytes to align to 8-byte boundary

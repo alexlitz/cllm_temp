@@ -1,46 +1,28 @@
 #!/usr/bin/env python3
-"""Test runner.run() with minimal steps."""
-
+"""Simple test of AutoregressiveVMRunner."""
 import sys
-import signal
-from neural_vm.run_vm import AutoregressiveVMRunner
-from neural_vm.vm_step import set_vm_weights
+sys.path.insert(0, '.')
+
+import time
 from src.compiler import compile_c
+from neural_vm.run_vm import AutoregressiveVMRunner
 
-def timeout_handler(signum, frame):
-    print("\nTIMEOUT!")
-    sys.exit(124)
+print("Compiling test program...")
+code = 'int main() { return 42; }'
+bytecode, _ = compile_c(code)
+print(f"Bytecode: {len(bytecode)} instructions")
 
-print("Creating runner...")
-sys.stdout.flush()
+print("Testing speculative mode (AutoregressiveVMRunner)...")
 runner = AutoregressiveVMRunner()
 
-print("Setting weights...")
-sys.stdout.flush()
-set_vm_weights(runner.model)
+start = time.time()
+result = runner.run(bytecode, max_steps=100)
+elapsed = time.time() - start
 
-print("Compiling program...")
-sys.stdout.flush()
-source = "int main() { return 0; }"
-bytecode, data = compile_c(source)
-print(f"Bytecode: {bytecode}")
+print(f"✅ Speculative mode completed in {elapsed:.2f}s")
+print(f"Result: {result}")
 
-print("\nRunning with max_steps=2...")
-sys.stdout.flush()
-
-signal.signal(signal.SIGALRM, timeout_handler)
-signal.alarm(30)  # 30 second timeout
-
-try:
-    output, exit_code = runner.run(bytecode, data or b"", argv=[], max_steps=2)
-    signal.alarm(0)
-
-    print(f"Success!")
-    print(f"  Output: {output!r}")
-    print(f"  Exit code: {exit_code}")
-
-except Exception as e:
-    signal.alarm(0)
-    print(f"Error: {e}")
-    import traceback
-    traceback.print_exc()
+if result == ('', 42):
+    print("✅ PASS: Got expected result 42")
+else:
+    print(f"❌ FAIL: Expected ('', 42), got {result}")

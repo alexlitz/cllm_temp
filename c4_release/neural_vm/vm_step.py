@@ -3616,6 +3616,7 @@ def _set_layer9_alu(ffn, S, BD):
     # Opcodes that don't use ALU_LO/HI for binary operations:
     non_alu_opcodes = [
         BD.OP_IMM,   # loads immediate
+        # BD.OP_LEA removed: LEA DOES use ALU (attention head copies BP → ALU, then adds immediate)
         BD.OP_NOP,   # no operation
         BD.OP_JMP,   # unconditional jump
         BD.OP_JSR,   # jump subroutine

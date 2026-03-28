@@ -86,37 +86,45 @@ class Softmax1ReciprocalModule(nn.Module):
     """Compute 1/divisor via softmax1 nibble construction.
 
     Generalizes to any base: score_j = log(base^j * d_j).
+    Pure neural: no Python loops, all tensor operations.
+    Uses fp64 for precision to avoid off-by-one errors.
     """
 
     def __init__(self, ge: GenericE, opcode: int):
         super().__init__()
         self.ge = ge
         self.opcode = opcode
+        self.S = SOFTMAX1_SCALE
+        # Pre-compute base powers as a buffer (no loops in forward)
+        base_powers = torch.tensor(
+            [float(ge.BASE ** j) for j in range(ge.NUM_POSITIONS)],
+            dtype=torch.float64
+        )
+        self.register_buffer('base_powers', base_powers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ge = self.ge
         B, N, D = x.shape
         opcode_w = x[:, 0, ge.OP_START + self.opcode]
 
-        S = SOFTMAX1_SCALE
-        base = ge.BASE
-        num_pos = ge.NUM_POSITIONS
+        # Extract divisor nibbles: [B, num_pos]
+        d = x[:, :ge.NUM_POSITIONS, ge.NIB_B].double()  # Use fp64 for precision
 
-        scores = torch.full((B, num_pos), -S, device=x.device, dtype=x.dtype)
-        for j in range(num_pos):
-            d_j = x[:, j, ge.NIB_B]
-            active = d_j > 0.5
-            val = (d_j * float(base ** j)).clamp(min=0.5)
-            scores[:, j] = torch.where(active, torch.log(val), scores[:, j])
+        # Compute scores = log(base^j * d_j) where d_j > 0, else -S
+        val = (d * self.base_powers).clamp(min=0.5)
+        active = d > 0.5
+        scores = torch.where(active, torch.log(val), torch.full_like(val, -self.S))
 
+        # Softmax1 reciprocal computation in fp64
         mx = scores.max(dim=-1, keepdim=True).values
         ex = torch.exp(scores - mx)
         sum_ex = ex.sum(dim=-1)
         exp_neg_mx = torch.exp(-mx.squeeze(-1))
         reciprocal = exp_neg_mx / sum_ex.clamp(min=1e-30)
 
+        # Write result back in original dtype
         delta = torch.zeros_like(x)
-        delta[:, 0, ge.SLOT_QUOTIENT] = opcode_w * reciprocal
+        delta[:, 0, ge.SLOT_QUOTIENT] = opcode_w * reciprocal.to(x.dtype)
         return x + delta
 
 
@@ -155,80 +163,73 @@ class MultiplyReciprocalFFN(nn.Module):
 class FloorExtractionFFN(nn.Module):
     """Extract floor(Q/base^j) for j=0..N-1 via fp64 MAGIC trick.
 
-    Generalized: eps_j = 2^(-20 - chunk_bits*j), scale_j = 1/base^j.
+    Uses direct tensor operations (not SwiGLU) for batch-stable precision.
+    The MAGIC trick: floor(x) = (x - 0.5 + eps + MAGIC) - MAGIC
+    where MAGIC = 3 * 2^51 forces fp64 to round to nearest integer.
 
-    Hidden units: N (floor) + 1 (MAGIC cancel) + 2*N (clear RESULT) = 3*N + 1.
-    REQUIRES fp64 precision.
+    This is a pure neural implementation - all operations are tensor ops,
+    no Python arithmetic on extracted values.
     """
 
     def __init__(self, ge: GenericE, opcode: int):
         super().__init__()
+        self.ge = ge
+        self.opcode = opcode
         N = ge.NUM_POSITIONS
-        hidden_dim = 3 * N + 1
-
-        # Always use fp64 for MAGIC trick
-        self.flat_ffn = GenericFlattenedFFN(ge, hidden_dim=hidden_dim, dtype=torch.float64)
-        fi = self.flat_ffn._flat_idx
-
-        S = ge.SCALE
         base = ge.BASE
         chunk_bits = ge.config.chunk_bits
-        C = float(2**20)
 
-        with torch.no_grad():
-            W_up = self.flat_ffn.W_up
-            b_up = self.flat_ffn.b_up
-            W_gate = self.flat_ffn.W_gate
-            W_down = self.flat_ffn.W_down
+        # Pre-compute scale factors as buffers (no Python math in forward)
+        scales = torch.tensor([1.0 / float(base ** j) for j in range(N)], dtype=torch.float64)
+        eps_vals = torch.tensor([2.0 ** (-20 - chunk_bits * j) for j in range(N)], dtype=torch.float64)
+        offsets = -(0.5 - eps_vals)  # offset_j for each position
 
-            opcode_idx = fi(0, ge.OP_START + opcode)
-            q_float_idx = fi(0, ge.SLOT_REMAINDER)
-
-            # h=0..N-1: Floor extraction via MAGIC trick
-            for j in range(N):
-                h = j
-                eps_j = 2.0 ** (-20 - chunk_bits * j)
-                scale_j = 1.0 / float(base ** j)
-                offset_j = -(0.5 - eps_j)
-                result_j_idx = fi(j, ge.RESULT)
-
-                W_up[h, q_float_idx] = scale_j
-                W_up[h, opcode_idx] = offset_j
-                b_up[h] = MAGIC
-                W_gate[h, opcode_idx] = 1.0
-                W_down[result_j_idx, h] = 1.0
-
-            # h=N: MAGIC cancellation unit
-            h = N
-            W_up[h, opcode_idx] = C
-            W_gate[h, opcode_idx] = 1.0
-            for j in range(N):
-                result_j_idx = fi(j, ge.RESULT)
-                W_down[result_j_idx, h] = -MAGIC / C
-
-            # h=N+1..3N: Clear old RESULT values
-            for pos in range(N):
-                result_pos_idx = fi(pos, ge.RESULT)
-                h = N + 1 + pos * 2
-                W_up[h, opcode_idx] = S
-                W_gate[h, result_pos_idx] = -1.0
-                W_down[result_pos_idx, h] = 1.0 / S
-
-                h = N + 1 + pos * 2 + 1
-                W_up[h, opcode_idx] = -S
-                W_gate[h, result_pos_idx] = 1.0
-                W_down[result_pos_idx, h] = 1.0 / S
+        self.register_buffer('scales', scales)
+        self.register_buffer('offsets', offsets)
+        self.register_buffer('magic', torch.tensor(MAGIC, dtype=torch.float64))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Cast to fp64 for MAGIC trick, then back
+        """Extract floor values using direct tensor operations with MAGIC trick."""
+        ge = self.ge
+        B, N, D = x.shape
         orig_dtype = x.dtype
-        x64 = x.double()
-        y64 = self.flat_ffn(x64)
-        return y64.to(orig_dtype)
+
+        # Get opcode weight and Q_float in fp64
+        opcode_w = x[:, 0, ge.OP_START + self.opcode].double()  # [B]
+        q_float = x[:, 0, ge.SLOT_REMAINDER].double()  # [B]
+
+        # Compute scaled values for all positions at once: [B, N]
+        # scaled[b, j] = q_float[b] * scales[j] + offsets[j]
+        scaled = q_float[:, None] * self.scales[None, :] + self.offsets[None, :]
+
+        # Apply MAGIC trick for floor: floor(x) = (x + MAGIC) - MAGIC
+        # This works because at MAGIC scale, fp64 can only represent integers
+        floored = (scaled + self.magic) - self.magic
+
+        # Gate by opcode and write to RESULT
+        # First clear old RESULT values, then write new ones
+        delta = torch.zeros_like(x)
+
+        # Clear RESULT at all positions (multiply old value by -opcode_w, add back)
+        old_results = x[:, :ge.NUM_POSITIONS, ge.RESULT]
+        delta[:, :ge.NUM_POSITIONS, ge.RESULT] = -old_results * opcode_w[:, None]
+
+        # Write floored values gated by opcode
+        delta[:, :ge.NUM_POSITIONS, ge.RESULT] += (floored * opcode_w[:, None]).to(orig_dtype)
+
+        return x + delta
 
 
 class FloorExtractionFP32FFN(nn.Module):
     """Extract floor(Q/base^j) for j=0..N-1 via window detection - FP32 SAFE.
+
+    WARNING: This implementation has fundamental limitations for large quotients.
+    For 32-bit division, floor(Q/base^j) for positions 0-3 can exceed 2^24,
+    which is beyond fp32's exact integer range. The window detection approach
+    cannot enumerate all possible floor values efficiently.
+
+    This implementation only works correctly when Q < base^5 (i.e., quotient < 65536).
+    For full 32-bit division support, use the fp64 MAGIC approach instead.
 
     For each position j and nibble value k=0..base-1:
       Detect if floor(Q/base^j) == k using step pairs
@@ -237,7 +238,6 @@ class FloorExtractionFP32FFN(nn.Module):
     RESULT[j] = sum_{k=0}^{base-1} k * step(floor(Q/base^j) == k)
 
     Hidden units: N * base * 4 (step pairs) + 2*N (clear RESULT).
-    Works with fp32 - no IEEE 754 rounding tricks needed.
     """
 
     def __init__(self, ge: GenericE, opcode: int):
@@ -416,6 +416,9 @@ def build_div_layers(config: ChunkConfig, opcode: int, fp32_floor: bool = False)
 
 def build_div_layers_fp32(config: ChunkConfig, opcode: int) -> nn.ModuleList:
     """Build DIV pipeline using fp32-safe floor extraction.
+
+    WARNING: Only works correctly for quotients < 65536 (16-bit results).
+    For full 32-bit division, use the default fp64 MAGIC approach.
 
     Convenience wrapper for build_div_layers with fp32_floor=True.
     """

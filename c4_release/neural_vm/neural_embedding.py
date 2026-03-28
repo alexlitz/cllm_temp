@@ -68,18 +68,25 @@ class NeuralVMEmbedding(nn.Module):
         similar to how RoPE adds positional info. This is weight-based:
         the computation is deterministic from position, no learned parameters.
 
-        Maps byte tokens to sequential addresses starting at 0:
-        - Code byte 0 (first opcode): addr=0
-        - Code byte 1 (imm[0]): addr=1
-        - Code byte 2 (imm[1]): addr=2
-        - etc.
+        Uses INSTR_WIDTH-aligned addressing to match DraftVM PC values:
+        - Instructions are 5 bytes in the token stream (1 opcode + 4 immediate)
+        - But PC addresses use INSTR_WIDTH (8) byte alignment
+        - So: addr = (seq_pos // 5) * 8 + (seq_pos % 5)
 
-        NOTE: This is SEQUENTIAL addressing, not aligned to INSTR_WIDTH.
-        The model weights were designed with this sequential scheme.
+        Examples with INSTR_WIDTH=8:
+        - Code byte 0 (opcode 0): addr=0
+        - Code byte 1 (imm[0]): addr=1
+        - Code byte 4 (imm[3]): addr=4
+        - Code byte 5 (opcode 1): addr=8
+        - Code byte 6 (imm[0]): addr=9
         """
         # Import here to avoid circular dependency
         from .vm_step import _SetDim, Token
+        from .constants import INSTR_WIDTH
         BD = _SetDim
+
+        # Bytes per instruction in token stream (opcode + 4 immediate bytes)
+        BYTES_PER_INSTR = 5
 
         B, S = token_ids.shape
 
@@ -92,9 +99,13 @@ class NeuralVMEmbedding(nn.Module):
                 elif tok == Token.CODE_END:
                     break
                 elif cs_pos is not None and tok < 256:
-                    addr = i - cs_pos - 1  # Sequential addressing
-                    if addr < 0:
+                    seq_pos = i - cs_pos - 1  # Sequential position in code
+                    if seq_pos < 0:
                         continue
+                    # Convert to INSTR_WIDTH-aligned address
+                    instr_idx = seq_pos // BYTES_PER_INSTR
+                    byte_offset = seq_pos % BYTES_PER_INSTR
+                    addr = instr_idx * INSTR_WIDTH + byte_offset
                     # Write address as nibbles to ADDR_KEY (3 nibbles × 16 one-hot)
                     lo = addr & 0xF
                     hi = (addr >> 4) & 0xF

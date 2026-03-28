@@ -125,14 +125,16 @@ class OpcodeNibbleCompiler:
             vm.blocks[9].ffn.b_down.data = weights['b_down']
     """
 
-    def __init__(self, num_positions: int = 8):
+    def __init__(self, num_positions: int = 8, ffn_hidden: int = 70000):
         """Initialize opcode nibble compiler.
 
         Args:
             num_positions: Number of nibble positions (8 for 32-bit)
+            ffn_hidden: FFN hidden dimension (70000 for 4-unit inclusion-exclusion)
         """
         self.num_positions = num_positions
-        self.nibble_compiler = NibbleWeightCompiler(num_positions)
+        self.ffn_hidden = ffn_hidden
+        self.nibble_compiler = NibbleWeightCompiler(num_positions, ffn_hidden=ffn_hidden)
         self.multi_op_compiler = MultiOperationCompiler(num_positions)
         self.multi_layer_gen = MultiLayerWeightGenerator(num_positions)
         self.reg_map = NibbleRegisterMap()
@@ -179,11 +181,11 @@ class OpcodeNibbleCompiler:
         Returns:
             Dictionary of weight matrices for PureFFN:
             {
-                'W_up': [4096, 1280],
-                'b_up': [4096],
-                'W_gate': [4096, 1280],
-                'b_gate': [4096],
-                'W_down': [1280, 4096],
+                'W_up': [ffn_hidden, 1280],
+                'b_up': [ffn_hidden],
+                'W_gate': [ffn_hidden, 1280],
+                'b_gate': [ffn_hidden],
+                'W_down': [1280, ffn_hidden],
                 'b_down': [1280]
             }
 
@@ -353,7 +355,7 @@ class OpcodeNibbleCompiler:
 
         # Check dimensions match
         expected_dim = self.num_positions * self.reg_map.DIM  # 1280
-        expected_hidden = 4096
+        expected_hidden = self.ffn_hidden
 
         if layer.ffn.W_up.shape != (expected_hidden, expected_dim):
             raise ValueError(
