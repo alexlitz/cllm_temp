@@ -14,6 +14,14 @@ Supports:
 from enum import IntEnum
 from typing import List, Dict, Tuple, Optional
 
+# Import constants for instruction addressing
+try:
+    from neural_vm.constants import INSTR_WIDTH, PC_OFFSET
+except ImportError:
+    # Fallback if neural_vm not available
+    INSTR_WIDTH = 8
+    PC_OFFSET = 2
+
 
 class Op(IntEnum):
     """C4 opcodes."""
@@ -351,10 +359,12 @@ class Compiler:
         self.code.append(int(op) + (imm << 8))
 
     def current_addr(self) -> int:
-        return len(self.code) * 8
+        """Get current PC address (includes PC_OFFSET)."""
+        return len(self.code) * INSTR_WIDTH + PC_OFFSET
 
     def patch(self, addr: int, target: int):
-        idx = addr // 8
+        """Patch instruction at addr with new target."""
+        idx = (addr - PC_OFFSET) // INSTR_WIDTH
         op = self.code[idx] & 0xFF
         self.code[idx] = op + (target << 8)
 

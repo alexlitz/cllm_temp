@@ -19,6 +19,10 @@ from dataclasses import dataclass
 from .alu.chunk_config import NIBBLE
 from .alu.ops.add import AddRawAndGenFFN, AddCarryLookaheadFFN
 from .alu.ops.sub import SubRawAndGenFFN, SubBorrowLookaheadFFN
+from .alu.ops.mul import build_mul_layers
+from .alu.ops.shift import build_shl_layers, build_shr_layers
+from .alu.ops.div import build_div_layers
+from .alu.ops.mod import build_mod_layers
 from .alu.ops.common import GenericE, GenericPureFFN, GenericFlattenedFFN
 from .embedding import Opcode
 
@@ -31,12 +35,39 @@ class ThreeLayerWeights:
     layer3: Dict[str, torch.Tensor]  # Finalize (if needed)
 
 
+@dataclass
+class MultiLayerWeights:
+    """Weights for a multi-layer ALU operation (variable number of layers)."""
+    layers: list[Dict[str, torch.Tensor]]  # List of layer weights
+
+
 class ALUWeightExtractor:
     """Extract weights from chunk-generic ALU implementations."""
 
     def __init__(self):
         self.config = NIBBLE
         self.ge = GenericE(self.config)
+
+        # Mapping from GenericE slots to our E slots
+        # GenericE: NIB_A=0, NIB_B=1, RAW_SUM=2, CARRY_IN=3, CARRY_OUT=4, RESULT=5, TEMP=6, OP_START=7
+        # Our E: NIB_A=0, NIB_B=1, (bits 2-9), RAW_SUM=10, CARRY_IN=11, CARRY_OUT=12, RESULT=13, TEMP=14, OPCODE=15, OP_START=16
+        from .embedding import E
+        self.slot_map = {
+            self.ge.NIB_A: E.NIB_A,          # 0 -> 0
+            self.ge.NIB_B: E.NIB_B,          # 1 -> 1
+            self.ge.RAW_SUM: E.RAW_SUM,      # 2 -> 10
+            self.ge.CARRY_IN: E.CARRY_IN,    # 3 -> 11
+            self.ge.CARRY_OUT: E.CARRY_OUT,  # 4 -> 12
+            self.ge.RESULT: E.RESULT,        # 5 -> 13
+            self.ge.TEMP: E.TEMP,            # 6 -> 14
+        }
+        # OP_START mapping: GenericE.OP_START + i -> E.OP_START + i
+        self.op_start_ge = self.ge.OP_START
+        self.op_start_e = E.OP_START
+
+        self.dim_per_pos_ge = self.ge.DIM      # 160
+        self.dim_per_pos_e = E.DIM              # 169
+        self.num_positions = self.ge.NUM_POSITIONS  # 8
 
     def extract_add_weights(self, opcode: int = Opcode.ADD) -> ThreeLayerWeights:
         """Extract 3-layer ADD weights.
@@ -230,6 +261,106 @@ class ALUWeightExtractor:
             'b_down': torch.zeros(d_model),
         }
 
+    def _remap_flattened_weights(self, weights_ge: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Remap weights from GenericE layout (1280) to our E layout (1352).
+
+        Args:
+            weights_ge: Weights in GenericE format (d_model=1280, dim_per_pos=160)
+
+        Returns:
+            Weights in our E format (d_model=1352, dim_per_pos=169)
+        """
+        W_up_ge = weights_ge['W_up']      # [hidden, 1280]
+        b_up_ge = weights_ge['b_up']      # [hidden]
+        W_gate_ge = weights_ge['W_gate']  # [hidden, 1280]
+        b_gate_ge = weights_ge['b_gate']  # [hidden]
+        W_down_ge = weights_ge['W_down']  # [1280, hidden]
+        b_down_ge = weights_ge['b_down']  # [1280]
+
+        hidden = W_up_ge.shape[0]
+        d_model_e = self.num_positions * self.dim_per_pos_e  # 1352
+
+        # Create expanded weight matrices
+        W_up_e = torch.zeros(hidden, d_model_e, dtype=W_up_ge.dtype)
+        W_gate_e = torch.zeros(hidden, d_model_e, dtype=W_gate_ge.dtype)
+        W_down_e = torch.zeros(d_model_e, hidden, dtype=W_down_ge.dtype)
+        b_down_e = torch.zeros(d_model_e, dtype=b_down_ge.dtype)
+
+        # Remap each position
+        for pos in range(self.num_positions):
+            ge_start = pos * self.dim_per_pos_ge
+            e_start = pos * self.dim_per_pos_e
+
+            # Map each slot
+            for slot_ge, slot_e in self.slot_map.items():
+                ge_idx = ge_start + slot_ge
+                e_idx = e_start + slot_e
+
+                # Copy weights for this slot
+                W_up_e[:, e_idx] = W_up_ge[:, ge_idx]
+                W_gate_e[:, e_idx] = W_gate_ge[:, ge_idx]
+                W_down_e[e_idx, :] = W_down_ge[ge_idx, :]
+                b_down_e[e_idx] = b_down_ge[ge_idx]
+
+            # Map opcode slots (OP_START to OP_START+NUM_OPS)
+            for op_offset in range(self.ge.NUM_OPS):
+                ge_idx = ge_start + self.op_start_ge + op_offset
+                e_idx = e_start + self.op_start_e + op_offset
+
+                W_up_e[:, e_idx] = W_up_ge[:, ge_idx]
+                W_gate_e[:, e_idx] = W_gate_ge[:, ge_idx]
+                W_down_e[e_idx, :] = W_down_ge[ge_idx, :]
+                b_down_e[e_idx] = b_down_ge[ge_idx]
+
+            # Map any other slots (like POS=79, SLOT_REMAINDER=8, SLOT_QUOTIENT=9, etc.)
+            # For now, map all remaining slots from GenericE to E
+            for slot_ge in range(self.dim_per_pos_ge):
+                # Skip slots we've already mapped
+                if slot_ge in self.slot_map or (self.op_start_ge <= slot_ge < self.op_start_ge + self.ge.NUM_OPS):
+                    continue
+
+                ge_idx = ge_start + slot_ge
+                e_idx = e_start + slot_ge  # Keep same relative position for unmapped slots
+
+                # Only copy if e_idx is valid
+                if slot_ge < self.dim_per_pos_e:
+                    W_up_e[:, e_idx] = W_up_ge[:, ge_idx]
+                    W_gate_e[:, e_idx] = W_gate_ge[:, ge_idx]
+                    W_down_e[e_idx, :] = W_down_ge[ge_idx, :]
+                    b_down_e[e_idx] = b_down_ge[ge_idx]
+
+        return {
+            'W_up': W_up_e,
+            'b_up': b_up_ge,  # Bias doesn't need remapping
+            'W_gate': W_gate_e,
+            'b_gate': b_gate_ge,  # Bias doesn't need remapping
+            'W_down': W_down_e,
+            'b_down': b_down_e,
+        }
+
+    def _extract_layer_weights(self, layer_module) -> Dict[str, torch.Tensor]:
+        """Extract weights from a layer module (either PureFFN or FlattenedFFN).
+
+        Args:
+            layer_module: Module with either .ffn (GenericPureFFN) or .flat_ffn (GenericFlattenedFFN)
+
+        Returns:
+            Dictionary of weights suitable for AutoregressiveVM (remapped to E layout), or None for non-FFN layers
+        """
+        # Check if it has flat_ffn (GenericFlattenedFFN)
+        if hasattr(layer_module, 'flat_ffn'):
+            weights_ge = self._extract_flattened_ffn_weights(layer_module.flat_ffn)
+            return self._remap_flattened_weights(weights_ge)
+        # Check if it has ffn (GenericPureFFN)
+        elif hasattr(layer_module, 'ffn'):
+            weights_ge = self._extract_pure_ffn_weights(layer_module.ffn)
+            return self._remap_flattened_weights(weights_ge)
+        # Some layers (like Softmax1ReciprocalModule, ModDivScalarModule) compute dynamically
+        # These can't be represented as pure FFN weights
+        # Return None to indicate this layer needs special handling
+        else:
+            return None
+
     def _create_sub_finalize_weights(self, opcode: int) -> Dict[str, torch.Tensor]:
         """Create weights for SUB finalization layer.
 
@@ -280,3 +411,93 @@ class ALUWeightExtractor:
             'W_down': W_down,
             'b_down': torch.zeros(d_model),
         }
+
+    def extract_mul_weights(self, opcode: int = Opcode.MUL) -> MultiLayerWeights:
+        """Extract weights for multi-layer MUL operation.
+
+        Args:
+            opcode: Opcode for gating (default: Opcode.MUL)
+
+        Returns:
+            MultiLayerWeights with 5-7 layers depending on config
+        """
+        layers_list = build_mul_layers(self.config, opcode=opcode)
+        layer_weights = []
+
+        for layer_module in layers_list:
+            weights = self._extract_layer_weights(layer_module)
+            layer_weights.append(weights)
+
+        return MultiLayerWeights(layers=layer_weights)
+
+    def extract_shl_weights(self, opcode: int = Opcode.SHL) -> MultiLayerWeights:
+        """Extract weights for multi-layer SHL operation.
+
+        Args:
+            opcode: Opcode for gating (default: Opcode.SHL)
+
+        Returns:
+            MultiLayerWeights with 1-2 layers (2 for chunk_bits > 1)
+        """
+        layers_list = build_shl_layers(self.config, opcode=opcode)
+        layer_weights = []
+
+        for layer_module in layers_list:
+            weights = self._extract_layer_weights(layer_module)
+            layer_weights.append(weights)
+
+        return MultiLayerWeights(layers=layer_weights)
+
+    def extract_shr_weights(self, opcode: int = Opcode.SHR) -> MultiLayerWeights:
+        """Extract weights for multi-layer SHR operation.
+
+        Args:
+            opcode: Opcode for gating (default: Opcode.SHR)
+
+        Returns:
+            MultiLayerWeights with 1-2 layers (2 for chunk_bits > 1)
+        """
+        layers_list = build_shr_layers(self.config, opcode=opcode)
+        layer_weights = []
+
+        for layer_module in layers_list:
+            weights = self._extract_layer_weights(layer_module)
+            layer_weights.append(weights)
+
+        return MultiLayerWeights(layers=layer_weights)
+
+    def extract_div_weights(self, opcode: int = Opcode.DIV) -> MultiLayerWeights:
+        """Extract weights for multi-layer DIV operation.
+
+        Args:
+            opcode: Opcode for gating (default: Opcode.DIV)
+
+        Returns:
+            MultiLayerWeights with 3-4 layers depending on config
+        """
+        layers_list = build_div_layers(self.config, opcode=opcode, fp32_floor=False)
+        layer_weights = []
+
+        for layer_module in layers_list:
+            weights = self._extract_layer_weights(layer_module)
+            layer_weights.append(weights)
+
+        return MultiLayerWeights(layers=layer_weights)
+
+    def extract_mod_weights(self, opcode: int = Opcode.MOD) -> MultiLayerWeights:
+        """Extract weights for multi-layer MOD operation.
+
+        Args:
+            opcode: Opcode for gating (default: Opcode.MOD)
+
+        Returns:
+            MultiLayerWeights with 4-5 layers depending on config
+        """
+        layers_list = build_mod_layers(self.config, opcode=opcode)
+        layer_weights = []
+
+        for layer_module in layers_list:
+            weights = self._extract_layer_weights(layer_module)
+            layer_weights.append(weights)
+
+        return MultiLayerWeights(layers=layer_weights)

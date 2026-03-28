@@ -27,8 +27,8 @@ PADDING_SIZE = 3         # Padding bytes to align to 8-byte boundary
 # NOTE: Both DraftVM (speculative.py) and neural VM (vm_step.py) must use
 #       the same PC_OFFSET value for consistency.
 # IMPORTANT: Model weights were trained with PC_OFFSET = 2
-# BUT: Current implementation uses PC_OFFSET = 0 for consistency
-PC_OFFSET = 0            # Direct addressing: PC=0 points to first instruction
+# Must match training to ensure correct PC advancement
+PC_OFFSET = 2            # Legacy addressing: PC points to immediate byte (trained value)
 
 # Derived addressing constants
 def pc_to_idx(pc):

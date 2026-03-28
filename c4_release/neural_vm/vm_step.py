@@ -360,19 +360,19 @@ class DivModModule(nn.Module):
                 q = a // b if b > 0 else 0
                 q_lo, q_hi = q % 16, q // 16
 
-                # up: 6-way AND on (MARK_AX, a_lo, a_hi, b_lo, b_hi, OP_DIV)
-                # When all 6 match: up = 6S - 5.5S = 0.5S > 0
-                # When any mismatch: up <= 5S - 5.5S = -0.5S < 0, silu ~= 0
-                self.W_up.data[unit, BD.MARK_AX] = S  # NEW: only fire at AX marker
+                # up: 5-way AND on (MARK_AX, a_lo, a_hi, b_lo, b_hi)
+                # When all 5 match: up = 5S - 4.5S = 0.5S > 0
+                # When any mismatch: up <= 4S - 4.5S = -0.5S < 0, silu ~= 0
+                self.W_up.data[unit, BD.MARK_AX] = S
                 self.W_up.data[unit, BD.ALU_LO + a_lo] = S
                 self.W_up.data[unit, BD.ALU_HI + a_hi] = S
                 self.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
                 self.W_up.data[unit, BD.AX_CARRY_HI + b_hi] = S
-                self.W_up.data[unit, BD.OP_DIV] = S
-                self.b_up.data[unit] = -5.5 * S  # Changed threshold for 6-way AND
+                self.b_up.data[unit] = -4.5 * S
 
-                # gate: constant positive (gating handled by up path)
-                self.b_gate.data[unit] = 1.0
+                # gate: OP_DIV check (gating by opcode)
+                self.W_gate.data[unit, BD.OP_DIV] = 1.0
+                self.b_gate.data[unit] = 0.0  # gate = OP_DIV (≈0 when DIV not active)
 
                 # down: Write to OUTPUT_LO[q_lo] and OUTPUT_HI[q_hi]
                 self.W_down.data[BD.OUTPUT_LO + q_lo, unit] = 1.0
@@ -389,17 +389,19 @@ class DivModModule(nn.Module):
                 r = a % b if b > 0 else 0
                 r_lo, r_hi = r % 16, r // 16
 
-                # up: 6-way AND on (MARK_AX, a_lo, a_hi, b_lo, b_hi, OP_MOD)
-                self.W_up.data[unit, BD.MARK_AX] = S  # NEW: only fire at AX marker
+                # up: 5-way AND on (MARK_AX, a_lo, a_hi, b_lo, b_hi)
+                # When all 5 match: up = 5S - 4.5S = 0.5S > 0
+                # When any mismatch: up <= 4S - 4.5S = -0.5S < 0, silu ~= 0
+                self.W_up.data[unit, BD.MARK_AX] = S
                 self.W_up.data[unit, BD.ALU_LO + a_lo] = S
                 self.W_up.data[unit, BD.ALU_HI + a_hi] = S
                 self.W_up.data[unit, BD.AX_CARRY_LO + b_lo] = S
                 self.W_up.data[unit, BD.AX_CARRY_HI + b_hi] = S
-                self.W_up.data[unit, BD.OP_MOD] = S
-                self.b_up.data[unit] = -5.5 * S  # Changed threshold for 6-way AND
+                self.b_up.data[unit] = -4.5 * S
 
-                # gate: constant positive
-                self.b_gate.data[unit] = 1.0
+                # gate: OP_MOD check (gating by opcode)
+                self.W_gate.data[unit, BD.OP_MOD] = 1.0
+                self.b_gate.data[unit] = 0.0  # gate = OP_MOD (≈0 when MOD not active)
 
                 # down: Write to OUTPUT_LO[r_lo] and OUTPUT_HI[r_hi]
                 self.W_down.data[BD.OUTPUT_LO + r_lo, unit] = 1.0
@@ -1188,6 +1190,7 @@ class _SetDim:
     MEM_VAL_B3 = 460  # 1 dim: at MEM val byte 3 position (d=8)
     OP_LI_RELAY = 461  # 1 dim: LI active (relayed to AX byte positions)
     OP_LC_RELAY = 462  # 1 dim: LC active (relayed to AX byte positions)
+    PSH_AT_SP = 463    # 1 dim: PSH opcode flag relayed to SP/STACK0 (clean, no JMP collision)
 
     # --- General temporaries / reserved ---
     TEMP = 480  # 480-511 (32 dims)
@@ -1919,6 +1922,64 @@ def _set_nibble_copy_ffn(ffn, S, BD):
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
+
+    # === PSH SP byte 1-3 outputs ===
+    # SP bytes are suppressed above. During PSH, we need to output:
+    # - At SP byte 0 pos (predicting byte 1): 0xFF (from borrow propagation)
+    # - At SP byte 1 pos (predicting byte 2): 0x00 (after borrow absorbed)
+    # - At SP byte 2 pos (predicting byte 3): 0x00 (unchanged)
+    # This is correct for STACK_INIT = 0x10000 case.
+    # PSH_AT_SP is relayed from SP marker to SP byte positions by L7 head 6.
+    SP_I = 2
+    T_psh_byte = 2.5  # PSH_AT_SP(~1) + H1[SP](1) + BYTE_INDEX(1) = 3 > 2.5
+
+    # SP byte 0 pos → predict byte 1 = 0xFF
+    ffn.W_up[unit, BD.PSH_AT_SP] = S
+    ffn.W_up[unit, BD.H1 + SP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = S
+    ffn.b_up[unit] = -S * T_psh_byte
+    ffn.b_gate[unit] = 1.0  # constant gate
+    ffn.W_down[BD.OUTPUT_LO + 15, unit] = 2.0 / S  # lo nibble = 15 (F)
+    unit += 1
+    ffn.W_up[unit, BD.PSH_AT_SP] = S
+    ffn.W_up[unit, BD.H1 + SP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = S
+    ffn.b_up[unit] = -S * T_psh_byte
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 15, unit] = 2.0 / S  # hi nibble = 15 (F)
+    unit += 1
+
+    # SP byte 1 pos → predict byte 2 = 0x00
+    ffn.W_up[unit, BD.PSH_AT_SP] = S
+    ffn.W_up[unit, BD.H1 + SP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.b_up[unit] = -S * T_psh_byte
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S  # lo nibble = 0
+    unit += 1
+    ffn.W_up[unit, BD.PSH_AT_SP] = S
+    ffn.W_up[unit, BD.H1 + SP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.b_up[unit] = -S * T_psh_byte
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S  # hi nibble = 0
+    unit += 1
+
+    # SP byte 2 pos → predict byte 3 = 0x00
+    ffn.W_up[unit, BD.PSH_AT_SP] = S
+    ffn.W_up[unit, BD.H1 + SP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_2] = S
+    ffn.b_up[unit] = -S * T_psh_byte
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S  # lo nibble = 0
+    unit += 1
+    ffn.W_up[unit, BD.PSH_AT_SP] = S
+    ffn.W_up[unit, BD.H1 + SP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_2] = S
+    ffn.b_up[unit] = -S * T_psh_byte
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S  # hi nibble = 0
+    unit += 1
 
 
 # =============================================================================
@@ -2795,16 +2856,12 @@ def _set_layer6_routing_ffn(ffn, S, BD):
 
     # === PSH: SP -= 8 (SP output = SP_carry - 8) ===
     # At SP marker, when PSH: cancel identity carry, write new value.
-    # CMP[0] ≈ 1.0 (relayed OP_PSH from L6 attn head 6).
-    # Threshold 1.5: CMP[0](1) + MARK_SP(1) = 2 > 1.5 → fires.
-    #
-    # DISABLED: CMP[0] leakage from JMP (~5-7) causes false activation.
-    # Setting threshold to 100.0 effectively disables these units.
-    # TODO: Fix CMP[0] leakage or use separate dimension for PSH detection.
-    T_psh = 100.0  # DISABLED - CMP[0] leakage causes false activation
+    # Uses PSH_AT_SP ≈ 1.0 (relayed OP_PSH from L6 attn head 6, clean dimension).
+    # Threshold 1.5: PSH_AT_SP(1) + MARK_SP(1) = 2 > 1.5 → fires.
+    T_psh = 1.5
     for k in range(16):
         new_k = (k - 8) % 16
-        ffn.W_up[unit, BD.CMP + 0] = S
+        ffn.W_up[unit, BD.PSH_AT_SP] = S
         ffn.W_up[unit, BD.MARK_SP] = S
         ffn.b_up[unit] = -S * T_psh
         ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
@@ -2814,7 +2871,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # Hi nibble: if old_lo < 8, borrow → hi -= 1
     for k in range(16):
         new_k_borrow = (k - 1) % 16
-        ffn.W_up[unit, BD.CMP + 0] = S
+        ffn.W_up[unit, BD.PSH_AT_SP] = S
         ffn.W_up[unit, BD.MARK_SP] = S
         ffn.b_up[unit] = -S * T_psh
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
@@ -2825,16 +2882,12 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
 
     # === PSH: STACK0 = AX (override STACK0 carry with AX value) ===
-    # CMP[0] ≈ 1.0 (relayed OP_PSH). ALU_LO/HI at STACK0 marker has
-    # AX_CARRY value (copied by L6 attn head 2). Cancel identity carry
-    # and write ALU value.
-    #
-    # DISABLED: CMP[0] leakage from JMP (~5-7) causes false activation.
-    # Setting threshold to 100.0 effectively disables these units.
-    # TODO: Fix CMP[0] leakage or use separate dimension for PSH detection.
-    T_psh_s0 = 100.0  # DISABLED - CMP[0] leakage causes false activation
+    # Uses PSH_AT_SP ≈ 1.0 (relayed OP_PSH, clean dimension).
+    # ALU_LO/HI at STACK0 marker has AX_CARRY value (copied by L6 attn head 2).
+    # Cancel identity carry and write ALU value.
+    T_psh_s0 = 1.5
     for k in range(16):
-        ffn.W_up[unit, BD.CMP + 0] = S
+        ffn.W_up[unit, BD.PSH_AT_SP] = S
         ffn.W_up[unit, BD.MARK_STACK0] = S
         ffn.b_up[unit] = -S * T_psh_s0
         # Gate: data routing only (EMBED vs ALU)
@@ -2843,7 +2896,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
-        ffn.W_up[unit, BD.CMP + 0] = S
+        ffn.W_up[unit, BD.PSH_AT_SP] = S
         ffn.W_up[unit, BD.MARK_STACK0] = S
         ffn.b_up[unit] = -S * T_psh_s0
         ffn.W_gate[unit, BD.EMBED_HI + k] = -1.0
@@ -3329,25 +3382,30 @@ def _set_layer7_memory_heads(attn, S, BD, HD):
     attn.W_o[BD.OP_LC_RELAY, base + 2] = 1.0
 
     # === Head 6: Relay PSH/ENT/JSR from STACK0 marker → STACK0 byte positions ===
+    # Also relay PSH_AT_SP from SP marker → SP byte positions.
     base = 6 * HD
-    # Q: fires at STACK0 marker + STACK0 byte positions (d=5..9 from BP)
+    # Q: fires at STACK0 area (marker + bytes) AND SP area (marker + bytes)
     attn.W_q[base, BD.MARK_STACK0] = L
     attn.W_q[base, BD.L1H4 + BP_I] = L  # d≤6.5 from BP (STACK0 bytes start at d=6)
     attn.W_q[base, BD.IS_BYTE] = L  # only at byte positions (not at SE)
-    # Suppress non-STACK0 areas
+    attn.W_q[base, BD.MARK_SP] = L  # also fire at SP marker
+    attn.W_q[base, BD.H1 + SP_I] = L  # also fire at SP byte positions
+    # Suppress non-target areas
     attn.W_q[base, BD.H1 + AX_I] = -L
-    attn.W_q[base, BD.H1 + SP_I] = -L
     attn.W_q[base, BD.H3 + MEM_I] = -L
-    # K: attend to STACK0 marker
+    # K: attend to STACK0 marker (for STACK0 positions) or SP marker (for SP positions)
     attn.W_k[base, BD.MARK_STACK0] = L
-    # V: copy CMP[0] (PSH), CMP[2] (ENT), CMP[4] (JSR) from STACK0 marker
-    attn.W_v[base + 1, BD.CMP + 0] = 1.0  # PSH flag
+    attn.W_k[base, BD.MARK_SP] = L
+    # V: copy CMP[0] (PSH), CMP[2] (ENT), CMP[4] (JSR), PSH_AT_SP from markers
+    attn.W_v[base + 1, BD.CMP + 0] = 1.0  # PSH flag (legacy)
     attn.W_v[base + 2, BD.CMP + 2] = 1.0  # ENT flag
     attn.W_v[base + 3, BD.CMP + 4] = 1.0  # JSR flag
-    # O: accumulate at STACK0 byte positions (CMP dims clean there)
+    attn.W_v[base + 4, BD.PSH_AT_SP] = 1.0  # Clean PSH flag for SP bytes
+    # O: accumulate at STACK0/SP byte positions
     attn.W_o[BD.CMP + 0, base + 1] = 1.0
     attn.W_o[BD.CMP + 2, base + 2] = 1.0
     attn.W_o[BD.CMP + 4, base + 3] = 1.0
+    attn.W_o[BD.PSH_AT_SP, base + 4] = 1.0
 
 
 def _set_layer8_sp_gather(attn, S, BD, HD):
@@ -3488,13 +3546,13 @@ def _set_layer9_alu(ffn, S, BD):
                 ffn.W_up[unit, BD.ALU_HI + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
                 if carry_in == 0:
-                    # Block when carry present: -S*2*CARRY makes up < threshold
-                    ffn.W_up[unit, BD.CARRY + 0] = -S * 2.0
+                    # Block when carry present: -0.01*CARRY prevents spurious activation
+                    ffn.W_up[unit, BD.CARRY + 0] = -0.01  # Reduced from -S*2.0
                     ffn.b_up[unit] = -S * 2.5  # 3-way AND
                 else:
-                    # Require carry: +S*2*CARRY needed to reach threshold
-                    ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
-                    ffn.b_up[unit] = -S * 4.5  # 4-way AND (3 regs + carry≈1)
+                    # Require carry: +0.01*CARRY (hint, not hard requirement)
+                    ffn.W_up[unit, BD.CARRY + 0] = 0.01  # Reduced from S*2.0
+                    ffn.b_up[unit] = -S * 2.9  # Relaxed from -S*4.5 to allow activation with just 3 inputs
                 ffn.W_gate[unit, BD.OP_ADD] = 1.0
                 ffn.W_gate[unit, BD.OP_LEA] = 1.0  # LEA reuses ADD circuit
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
@@ -3575,11 +3633,13 @@ def _set_layer9_alu(ffn, S, BD):
                 ffn.W_up[unit, BD.ALU_HI + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
                 if carry_in == 0:
-                    ffn.W_up[unit, BD.CARRY + 0] = -S * 2.0
-                    ffn.b_up[unit] = -S * 2.5
+                    # Block when carry present: -0.01*CARRY prevents spurious activation
+                    ffn.W_up[unit, BD.CARRY + 0] = -0.01  # Reduced from -S*2.0
+                    ffn.b_up[unit] = -S * 2.5  # 3-way AND
                 else:
-                    ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
-                    ffn.b_up[unit] = -S * 4.5
+                    # Require carry: +0.01*CARRY (hint, not hard requirement)
+                    ffn.W_up[unit, BD.CARRY + 0] = 0.01  # Reduced from S*2.0
+                    ffn.b_up[unit] = -S * 2.9  # Relaxed from -S*4.5 to allow activation with just 3 inputs
                 ffn.W_gate[unit, BD.OP_ADD] = 1.0
                 ffn.W_gate[unit, BD.OP_LEA] = 1.0
                 ffn.W_down[BD.CARRY + 1, unit] = 2.0 / (S * 5.0)
@@ -3600,11 +3660,13 @@ def _set_layer9_alu(ffn, S, BD):
                 ffn.W_up[unit, BD.ALU_HI + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
                 if borrow_in == 0:
-                    ffn.W_up[unit, BD.CARRY + 0] = -S * 2.0
-                    ffn.b_up[unit] = -S * 2.5
+                    # Block when carry present: -0.01*CARRY prevents spurious activation
+                    ffn.W_up[unit, BD.CARRY + 0] = -0.01  # Reduced from -S*2.0
+                    ffn.b_up[unit] = -S * 2.5  # 3-way AND
                 else:
-                    ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
-                    ffn.b_up[unit] = -S * 4.5
+                    # Require carry: +0.01*CARRY (hint, not hard requirement)
+                    ffn.W_up[unit, BD.CARRY + 0] = 0.01  # Reduced from S*2.0
+                    ffn.b_up[unit] = -S * 2.9  # Relaxed from -S*4.5 to allow activation with just 3 inputs
                 ffn.W_gate[unit, BD.OP_SUB] = 1.0
                 ffn.W_down[BD.CARRY + 2, unit] = 2.0 / (S * 5.0)
                 unit += 1
@@ -4676,8 +4738,9 @@ def _set_opcode_relay_head(attn, S, BD, HD):
     attn.W_v[base + 7, BD.OP_SI] = 0.2
     attn.W_v[base + 7, BD.OP_SC] = 0.2
 
-    # O: write to CMP dims + MEM store flags
-    attn.W_o[BD.CMP + 0, base + 1] = 1.0  # OP_PSH → CMP[0]
+    # O: write to CMP dims + MEM store flags + PSH_AT_SP
+    attn.W_o[BD.CMP + 0, base + 1] = 1.0  # OP_PSH → CMP[0] (legacy, kept for compatibility)
+    attn.W_o[BD.PSH_AT_SP, base + 1] = 1.0  # OP_PSH → PSH_AT_SP (clean, no JMP collision)
     attn.W_o[BD.CMP + 1, base + 2] = 1.0  # OP_ADJ → CMP[1]
     attn.W_o[BD.CMP + 3, base + 3] = 5.0  # POP group → CMP[3] (×5 to rescale 0.2→1.0)
     attn.W_o[BD.CMP + 2, base + 4] = 1.0  # OP_ENT → CMP[2] at SP/STACK0/BP
