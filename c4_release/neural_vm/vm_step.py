@@ -2526,6 +2526,28 @@ def _set_opcode_decode_ffn(ffn, S, BD):
     ffn.W_down[BD.TEMP + 0, unit] = 10.0 / S  # write IS_JSR flag to TEMP[0] at PC marker
     unit += 1
 
+    # IMM first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 1, 0  # IMM opcode = 1 = 0x01
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_IMM, unit] = 10.0 / S  # write OP_IMM at PC marker
+    unit += 1
+
+    # LEA first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 0, 0  # LEA opcode = 0 = 0x00
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_LEA, unit] = 10.0 / S  # write OP_LEA at PC marker
+    unit += 1
+
     # === TEMP clearing at PC marker ===
     # Clear TEMP dims at PC marker to prevent leakage from Layer 5 attention
     # mixing TEMP values from AX marker to PC marker. TEMP is only valid at
@@ -2655,6 +2677,24 @@ def _set_layer6_attn(attn, S, BD, HD):
     for k in range(16):
         attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
         attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
+
+    # Head 5: First-step OP flag relay (AX marker ← PC marker)
+    # For first step, L5 FFN decodes opcodes at PC marker (OP_IMM, OP_LEA, OP_JMP, OP_JSR).
+    # L6 FFN needs these flags at AX marker for routing (IMM, EXIT, NOP, JMP).
+    # This relay copies OP flags from PC marker to AX marker on first step only.
+    # Copy key opcodes: IMM, LEA (add more as needed)
+    base = 5 * HD
+    attn.W_q[base, BD.MARK_AX] = L
+    attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
+    attn.W_k[base, BD.MARK_PC] = L
+    # V: copy OP flags (using first few V dims)
+    attn.W_v[base + 0, BD.OP_IMM] = 1.0
+    attn.W_v[base + 1, BD.OP_LEA] = 1.0
+    attn.W_v[base + 2, BD.OP_JMP] = 1.0
+    # O: write OP flags at AX marker
+    attn.W_o[BD.OP_IMM, base + 0] = 1.0
+    attn.W_o[BD.OP_LEA, base + 1] = 1.0
+    attn.W_o[BD.OP_JMP, base + 2] = 1.0
 
 
 def _set_layer6_routing_ffn(ffn, S, BD):
