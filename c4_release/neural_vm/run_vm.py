@@ -25,7 +25,6 @@ IO strategy:
 
 import os
 import torch
-import sys
 import warnings
 from typing import List, Optional, Callable, Any, Dict
 from dataclasses import dataclass, field
@@ -198,10 +197,24 @@ class AutoregressiveVMRunner:
         # These are runner-side compatibility shims for full 32-bit correctness
         # while the corresponding neural memory paths are being completed.
         self._func_call_handlers = {
+            Opcode.IMM: self._handler_imm,
             Opcode.LEA: self._handler_lea,
             Opcode.JSR: self._handler_jsr,
             Opcode.ENT: self._handler_ent,
             Opcode.LEV: self._handler_lev,
+            # Stack operations
+            Opcode.PSH: self._handler_psh,
+            # Bitwise operations (neural weights broken, using fallback)
+            Opcode.OR: self._handler_or,
+            Opcode.XOR: self._handler_xor,
+            Opcode.AND: self._handler_and,
+            # Shift operations (neural weights broken, using fallback)
+            Opcode.SHL: self._handler_shl,
+            Opcode.SHR: self._handler_shr,
+            # Arithmetic operations (neural weights broken, using fallback)
+            Opcode.MUL: self._handler_mul,
+            Opcode.DIV: self._handler_div,
+            Opcode.MOD: self._handler_mod,
         }
 
         # If True: disable runner VM-memory emulation paths and only allow
@@ -273,15 +286,31 @@ class AutoregressiveVMRunner:
         if 0 <= init_exec < len(bytecode):
             self.model.set_active_opcode(bytecode[init_exec] & 0xFF)
 
+        step_num = 0  # Track step number for debugging
         for _ in range(max_steps * Token.STEP_TOKENS):
             next_token = self.model.generate_next(context)
             context.append(next_token)
 
             if next_token == Token.STEP_END:
+                step_num += 1  # Increment step counter
                 # Extract PC and dispatch syscall handler
                 op = None
                 instr_idx = None
-                pc = self._extract_register(context, Token.REG_PC)
+                exec_pc = self._exec_pc()  # PC being executed this step
+                pc = self._extract_register(context, Token.REG_PC)  # Next PC from output
+                # Get opcode being executed this step
+                exec_idx = exec_pc // INSTR_WIDTH
+                exec_op = None
+                exec_opname = "?"
+                if 0 <= exec_idx < len(bytecode):
+                    exec_op = bytecode[exec_idx] & 0xFF
+                    # Find opcode name
+                    for name in dir(Opcode):
+                        if not name.startswith('_') and getattr(Opcode, name) == exec_op:
+                            exec_opname = name
+                            break
+                print(f"[STEP {step_num}] Executing {exec_opname} at PC={exec_pc}, next PC={pc}", file=sys.stderr)
+
                 if pc is not None:
                     instr_idx = pc // INSTR_WIDTH
                     if 0 <= instr_idx < len(bytecode):
@@ -334,17 +363,32 @@ class AutoregressiveVMRunner:
                         func_handler(context, output)
                     else:
                         # Generic PC advancement for opcodes without handlers
-                        # Model doesn't advance PC neurally for all opcodes, so we do it here
-                        exec_pc = self._exec_pc()
-                        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-                        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+                        # SKIP for opcodes that handle PC themselves (JSR, JMP, BZ, BNZ, LEV, EXIT)
+                        # These opcodes output their own PC values neurally
+                        opcodes_with_neural_pc = {Opcode.JSR, Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.LEV, Opcode.EXIT}
+                        if exec_op not in opcodes_with_neural_pc:
+                            # Model doesn't advance PC neurally for all opcodes, so we do it here
+                            exec_pc = self._exec_pc()
+                            next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+                            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
                 # Update SP/BP/PC tracking (prefer deterministic SP evolution)
                 if 0 <= exec_idx < len(bytecode):
-                    # Function-call handlers (JSR/ENT/LEV) write full SP bytes.
+                    # CRITICAL: Only extract SP for opcodes that modify SP
+                    # PSH, JSR, ENT, LEV modify SP. Binary ops (OR, AND, etc.) also pop stack.
+                    # Don't extract SP for IMM/LEA - they don't modify SP!
                     if exec_op in self._func_call_handlers:
-                        sp = self._extract_register(context, Token.REG_SP)
-                        if sp is not None:
-                            self._last_sp = sp
+                        SP_MODIFYING_OPS = {Opcode.PSH, Opcode.JSR, Opcode.ENT, Opcode.LEV,
+                                           Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.SHL, Opcode.SHR,
+                                           Opcode.MUL, Opcode.DIV, Opcode.MOD}
+                        if exec_op in SP_MODIFYING_OPS:
+                            sp = self._extract_register(context, Token.REG_SP)
+                            if sp is not None:
+                                self._last_sp = sp
+                        # CRITICAL: Only extract BP for ENT/LEV (they actually modify BP)
+                        if exec_op in (Opcode.ENT, Opcode.LEV):
+                            bp = self._extract_register(context, Token.REG_BP)
+                            if bp is not None:
+                                self._last_bp = bp
                     elif op is not None:
                         # Keep runner SP canonical for stack semantics.
                         if op == Opcode.PSH:
@@ -360,7 +404,12 @@ class AutoregressiveVMRunner:
                 # AX multi-byte preservation
                 ax = self._extract_register(context, Token.REG_AX)
                 if ax is not None:
-                    if op in (Opcode.LI, Opcode.LC):
+                    # Check the EXECUTED opcode (exec_op), not the next opcode (op)
+                    # Handlers (IMM, LEA, etc.) set full AX value - extract and trust it
+                    if exec_op in self._func_call_handlers:
+                        # Handlers override full 32-bit AX. Extract the overridden value.
+                        self._last_ax = ax
+                    elif op in (Opcode.LI, Opcode.LC):
                         # L15 produces correct output for all bytes. Trust transformer.
                         self._last_ax = ax
                     else:
@@ -369,17 +418,11 @@ class AutoregressiveVMRunner:
                         self._last_ax = merged
                         self._override_register_in_last_step(context, Token.REG_AX, merged)
 
-                bp = self._extract_register(context, Token.REG_BP)
-                if bp is not None:
-                    self._last_bp = bp
+                # BP tracking moved to func_call_handlers block above (ENT/LEV modify BP)
+                # Don't extract BP from model output for normal opcodes - it's wrong!
                 pc = self._extract_register(context, Token.REG_PC)
-                import sys
-                print(f"[UPDATE] Extracted PC={pc}, _last_pc was {self._last_pc}", file=sys.stderr)
                 if pc is not None:
                     self._last_pc = pc
-                    print(f"[UPDATE] _last_pc now = {self._last_pc}", file=sys.stderr)
-                else:
-                    print(f"[UPDATE] PC is None, keeping _last_pc={self._last_pc}", file=sys.stderr)
 
                 # Set next step's active opcode for MoE routing
                 next_exec = self._exec_pc() // INSTR_WIDTH
@@ -436,10 +479,14 @@ class AutoregressiveVMRunner:
                         func_handler(context, output)
                     else:
                         # Generic PC advancement for opcodes without handlers
-                        # Model doesn't advance PC neurally for all opcodes, so we do it here
-                        exec_pc = self._exec_pc()
-                        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-                        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+                        # SKIP for opcodes that handle PC themselves (JSR, JMP, BZ, BNZ, LEV, EXIT)
+                        # These opcodes output their own PC values neurally
+                        opcodes_with_neural_pc = {Opcode.JSR, Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.LEV, Opcode.EXIT}
+                        if exec_op not in opcodes_with_neural_pc:
+                            # Model doesn't advance PC neurally for all opcodes, so we do it here
+                            exec_pc = self._exec_pc()
+                            next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+                            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
                 # Update SP/BP/PC tracking (prefer deterministic SP evolution)
                 if 0 <= exec_idx < len(bytecode):
                     if exec_op in self._func_call_handlers:
@@ -461,19 +508,17 @@ class AutoregressiveVMRunner:
                 ax = self._extract_register(context, Token.REG_AX)
                 if ax is not None:
                     merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
+                    print(f"[AX] Step {step_num}: neural={ax:08x}, last={self._last_ax:08x}, merged={merged:08x}", file=sys.stderr)
                     self._last_ax = merged
                     self._override_register_in_last_step(context, Token.REG_AX, merged)
+                else:
+                    print(f"[AX] Step {step_num}: AX not found in output", file=sys.stderr)
                 bp = self._extract_register(context, Token.REG_BP)
                 if bp is not None:
                     self._last_bp = bp
                 pc = self._extract_register(context, Token.REG_PC)
-                import sys
-                print(f"[UPDATE] Extracted PC={pc}, _last_pc was {self._last_pc}", file=sys.stderr)
                 if pc is not None:
                     self._last_pc = pc
-                    print(f"[UPDATE] _last_pc now = {self._last_pc}", file=sys.stderr)
-                else:
-                    print(f"[UPDATE] PC is None, keeping _last_pc={self._last_pc}", file=sys.stderr)
 
                 # Set next step's active opcode for MoE routing
                 next_exec = self._exec_pc() // INSTR_WIDTH
@@ -499,11 +544,15 @@ class AutoregressiveVMRunner:
 
             # Halt detection
             if next_token == Token.HALT:
+                print(f"[HALT] Detected at step {step_num}", file=sys.stderr)
                 # Apply AX bytes 1-3 preservation before exiting
                 ax = self._extract_register(context, Token.REG_AX)
                 if ax is not None:
                     merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
+                    print(f"[HALT] AX: neural={ax:08x}, last={self._last_ax:08x}, merged={merged:08x}", file=sys.stderr)
                     self._override_register_in_last_step(context, Token.REG_AX, merged)
+                else:
+                    print(f"[HALT] AX not found, using _last_ax={self._last_ax:08x}", file=sys.stderr)
                 self._pure_attention_report["halted"] = True
                 break
 
@@ -1143,6 +1192,154 @@ class AutoregressiveVMRunner:
             return PC_OFFSET
         return self._last_pc
 
+    def _handler_imm(self, context, output):
+        """IMM -- Load immediate value into AX."""
+        exec_pc = self._exec_pc()
+        exec_idx = exec_pc // INSTR_WIDTH
+        if exec_idx < 0 or exec_idx >= len(self._bytecode):
+            return
+        instr = self._bytecode[exec_idx]
+        imm = instr >> 8
+        # Sign-extend 24-bit immediate
+        if imm >= 0x800000:
+            imm -= 0x1000000
+        self._override_ax_in_last_step(context, imm & 0xFFFFFFFF)
+        # Advance PC
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_psh(self, context, output):
+        """PSH -- Push AX to stack."""
+        ax = self._last_ax
+        new_sp = (self._last_sp - 8) & 0xFFFFFFFF
+        # Store to shadow memory
+        self._mem_store_word(new_sp, ax)
+        # Override SP and STACK0 in context
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_register_in_last_step(context, Token.STACK0, ax)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_or(self, context, output):
+        """OR -- Bitwise OR: AX = pop | AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        result = (lhs | rhs) & 0xFFFFFFFF
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_xor(self, context, output):
+        """XOR -- Bitwise XOR: AX = pop ^ AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        result = (lhs ^ rhs) & 0xFFFFFFFF
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_and(self, context, output):
+        """AND -- Bitwise AND: AX = pop & AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        result = (lhs & rhs) & 0xFFFFFFFF
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_shl(self, context, output):
+        """SHL -- Left shift: AX = pop << AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        result = (lhs << (rhs & 0x1F)) & 0xFFFFFFFF
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_shr(self, context, output):
+        """SHR -- Right shift: AX = pop >> AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        result = (lhs >> (rhs & 0x1F)) & 0xFFFFFFFF
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_mul(self, context, output):
+        """MUL -- Multiply: AX = pop * AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        result = (lhs * rhs) & 0xFFFFFFFF
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_div(self, context, output):
+        """DIV -- Divide: AX = pop / AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        if rhs != 0:
+            result = (lhs // rhs) & 0xFFFFFFFF
+        else:
+            result = 0  # division by zero
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_mod(self, context, output):
+        """MOD -- Modulo: AX = pop % AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        if rhs != 0:
+            result = (lhs % rhs) & 0xFFFFFFFF
+        else:
+            result = 0  # mod by zero
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
     def _handler_lea(self, context, output):
         """LEA -- AX = BP + signed immediate."""
         exec_pc = self._exec_pc()
@@ -1171,18 +1368,14 @@ class AutoregressiveVMRunner:
         cannot fire on the first step. The runner ensures correctness
         by always overriding PC for JSR.
         """
-        import sys
         exec_pc = self._exec_pc()
-        print(f"[JSR] exec_pc={exec_pc}", file=sys.stderr)
         exec_idx = exec_pc // INSTR_WIDTH
-        print(f"[JSR] exec_idx={exec_idx}", file=sys.stderr)
         if exec_idx < 0 or exec_idx >= len(self._bytecode):
             return
         instr = self._bytecode[exec_idx]
         target = instr >> 8  # raw immediate = jump target PC value
         # Return address is the instruction AFTER JSR
         return_addr = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        print(f"[JSR] exec_pc={exec_pc}, return_addr={return_addr}, target={target}", file=sys.stderr)
 
         # Read current SP from the just-generated step (not _last_sp which may be stale)
         current_sp = self._extract_register(context, Token.REG_SP)
@@ -1194,20 +1387,15 @@ class AutoregressiveVMRunner:
         # TODO: Remove overrides one by one after fixing issues
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
         self._override_register_in_last_step(context, Token.STACK0, return_addr)
-        print(f"[JSR] Overriding PC to {target}", file=sys.stderr)
         self._override_register_in_last_step(context, Token.REG_PC, target)
-        print(f"[JSR] PC override complete", file=sys.stderr)
         # Store return address in shadow memory
-        print(f"[JSR] Storing return_addr={return_addr} at shadow memory[{new_sp}]", file=sys.stderr)
         self._mem_store_word(new_sp, return_addr)
-        print(f"[JSR] Shadow memory now: [{new_sp}]={self._mem_load_word(new_sp)}", file=sys.stderr)
 
     def _handler_ent(self, context, output):
         """ENT -- push BP, set new frame, allocate locals.
 
         *--sp = bp;  bp = sp;  sp -= imm;
         """
-        import sys
         print(f"[ENT] Handler called", file=sys.stderr)
         exec_pc = self._exec_pc()
         exec_idx = exec_pc // INSTR_WIDTH
@@ -1258,24 +1446,18 @@ class AutoregressiveVMRunner:
         So: saved_bp = mem[old_bp], return_addr = mem[old_bp + 8]
         new_sp = old_bp + 16, new_bp = saved_bp, pc = return_addr
         """
-        import sys
-        print(f"[LEV] Handler called", file=sys.stderr)
         # Read current BP from context (not _last_bp which may be stale)
         old_bp = self._extract_register(context, Token.REG_BP)
-        print(f"[LEV] old_bp={old_bp}", file=sys.stderr)
         if old_bp is None:
             old_bp = self._last_bp
         saved_bp = self._mem_load_word(old_bp)
         return_addr = self._mem_load_word(old_bp + 8)
         new_sp = (old_bp + 16) & 0xFFFFFFFF
-        print(f"[LEV] saved_bp={saved_bp}, return_addr={return_addr}, new_sp={new_sp}", file=sys.stderr)
 
         # Override all registers
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
         self._override_register_in_last_step(context, Token.REG_BP, saved_bp)
-        print(f"[LEV] Overriding PC to {return_addr}", file=sys.stderr)
         self._override_register_in_last_step(context, Token.REG_PC, return_addr)
-        print(f"[LEV] PC override complete", file=sys.stderr)
         # STACK0 = *new_sp (top of stack after restoring frame)
         stack0_val = self._mem_load_word(new_sp)
         self._override_register_in_last_step(context, Token.STACK0, stack0_val)

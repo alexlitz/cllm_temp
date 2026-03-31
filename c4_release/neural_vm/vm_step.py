@@ -1192,6 +1192,9 @@ class _SetDim:
     OP_LC_RELAY = 462  # 1 dim: LC active (relayed to AX byte positions)
     PSH_AT_SP = 463    # 1 dim: PSH opcode flag relayed to SP/STACK0 (clean, no JMP collision)
 
+    # --- Unified memory execution (code from writable memory) ---
+    MEM_EXEC = 464     # 1 dim: MEM section contains executable code (for L5 fetch)
+
     # --- General temporaries / reserved ---
     TEMP = 480  # 480-511 (32 dims)
 
