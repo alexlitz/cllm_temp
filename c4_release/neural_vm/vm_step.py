@@ -68,7 +68,9 @@ class Token:
     USER_INPUT_START = 269  # Start of user input block (runner-side IO)
     USER_INPUT_END = 270  # End of user input block (runner-side IO)
     TOOL_CALL = 271  # Step-end variant: signals tool call to runner
-    VOCAB_SIZE = 272
+    THINKING_START = 272  # <thinking> tag for conversational I/O mode
+    THINKING_END = 273  # </thinking> tag for conversational I/O mode
+    VOCAB_SIZE = 274
 
     STEP_TOKENS = (
         35  # Tokens per VM step: PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5)+MEM(9)+SE(1)
@@ -2316,6 +2318,8 @@ def _set_layer5_fetch(attn, S, BD, HD):
     L = 20.0
 
     # Head 0: fetch immediate byte (address = PC+1)
+    # Only fires on non-first steps (HAS_SE > 0). For first step, head 3 fetches
+    # immediate at PC marker and head 4 relays to AX marker.
     base = 0 * HD
     # Q: low two nibbles from TEMP (PC+1)
     for k in range(16):
@@ -2338,6 +2342,15 @@ def _set_layer5_fetch(attn, S, BD, HD):
     attn.W_q[base + GATE, BD.MARK_AX] = 500.0
     attn.W_q[base + GATE, BD.CONST] = -500.0
     attn.W_k[base + GATE, BD.CONST] = 5.0
+
+    # HAS_SE gate: only fire on non-first steps (when HAS_SE > 0)
+    # First step uses head 3 (PC marker) + head 4 (relay to AX)
+    # On first step: Q[HAS_SE]=0, Q[CONST]=-500 → score = -312.5 (blocks)
+    # On non-first: Q[HAS_SE]=500, Q[CONST]=-500 → score = 0 (neutral)
+    HAS_SE_GATE = 34
+    attn.W_q[base + HAS_SE_GATE, BD.HAS_SE] = 500.0
+    attn.W_q[base + HAS_SE_GATE, BD.CONST] = -500.0
+    attn.W_k[base + HAS_SE_GATE, BD.CONST] = 5.0
 
     # V: copy byte value nibbles
     for k in range(16):
@@ -2421,9 +2434,11 @@ def _set_layer5_fetch(attn, S, BD, HD):
     base = 3 * HD
     # Q: queries for address PC_OFFSET+1 (e.g., 3: ADDR_KEY_LO[3]=1, ADDR_KEY_HI[0]=1)
     # NOTE: Q[PC_OFFSET] must remain zero - setting it causes opcode/imm to match equally
+    # Queries at BOTH PC and AX markers to write FETCH to both positions
     attn.W_q[base + (imm_addr & 0xF), BD.CONST] = L  # lo nibble
     attn.W_q[base + 16 + ((imm_addr >> 4) & 0xF), BD.CONST] = L  # hi nibble
-    attn.W_q[base + 32, BD.MARK_PC] = L  # third nibble gate
+    attn.W_q[base + 32, BD.MARK_PC] = L  # gate for PC marker
+    attn.W_q[base + 32, BD.MARK_AX] = L  # gate for AX marker (first step)
 
     # K: match ADDR_KEY nibbles
     for k in range(16):
@@ -2431,9 +2446,10 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
     attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
 
-    # Anti-leakage gate
+    # Anti-leakage gate: suppress at non-PC, non-AX positions
     GATE = 33
     attn.W_q[base + GATE, BD.MARK_PC] = 500.0
+    attn.W_q[base + GATE, BD.MARK_AX] = 500.0  # also allow AX marker
     attn.W_q[base + GATE, BD.CONST] = -500.0
     attn.W_k[base + GATE, BD.CONST] = 5.0
 
@@ -2449,21 +2465,7 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.FETCH_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.FETCH_HI + k, base + 48 + k] = 1.0
 
-    # Head 4: First-step FETCH relay (AX marker ← PC marker)
-    # Copy FETCH from PC marker to AX marker on first step only.
-    # This allows Layer 6 FFN to read FETCH at AX marker for IMM/LEA routing.
-    base = 4 * HD
-    attn.W_q[base, BD.MARK_AX] = L
-    attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
-    attn.W_k[base, BD.MARK_PC] = L
-    # V: copy FETCH_LO/HI
-    for k in range(16):
-        attn.W_v[base + k, BD.FETCH_LO + k] = 1.0
-        attn.W_v[base + 16 + k, BD.FETCH_HI + k] = 1.0
-    # O: write to FETCH_LO/HI at AX marker
-    for k in range(16):
-        attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
-        attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
+    # Heads 4-7: unused in Layer 5 fetch
 
 
 def _set_opcode_decode_ffn(ffn, S, BD):
@@ -2845,9 +2847,33 @@ def _set_layer6_attn(attn, S, BD, HD):
     # (Layer 5 FFN clears TEMP at PC; Layer 6 attention writes it; Layer 6 FFN reads it)
     attn.W_o[BD.TEMP + 0, base + 1] = 1.0
 
-    # Head 4: NOTE - Cannot add first-step FETCH relay here due to conflict with
-    # BZ/BNZ relay (below). BZ/BNZ requires Q[MARK_PC]=L and Q[MARK_AX]=-L,
-    # while FETCH relay would need Q[MARK_AX]=L. FETCH will be handled differently.
+    # Head 4: First-step FETCH relay (AX ← PC) + BZ/BNZ relay (PC ← AX)
+    # First step (HAS_SE=0): Query at AX marker, attend to PC marker, copy FETCH
+    # Non-first (HAS_SE>0): Query at PC marker, attend to AX marker, copy BZ/BNZ flags
+    # These are mutually exclusive and share the head via HAS_SE gating.
+    base = 4 * HD
+
+    # FIRST-STEP RELAY: AX marker queries PC marker
+    # Q: fires at AX when HAS_SE=0
+    attn.W_q[base, BD.MARK_AX] = L
+    attn.W_q[base, BD.HAS_SE] = -L  # blocks when HAS_SE>0
+    # K: attend to PC marker
+    attn.W_k[base, BD.MARK_PC] = L
+    # V: copy FETCH (positions 0-31 for first-step)
+    for k in range(16):
+        attn.W_v[base + k, BD.FETCH_LO + k] = 1.0
+        attn.W_v[base + 16 + k, BD.FETCH_HI + k] = 1.0
+    # O: write FETCH at AX marker (same positions)
+    for k in range(16):
+        attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
+        attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
+
+    # BZ/BNZ RELAY: PC marker queries AX marker (non-first steps)
+    # Q: fires at PC when HAS_SE>0 (already has MARK_PC from below, needs HAS_SE guard)
+    attn.W_q[base, BD.MARK_PC] = L
+    # Don't add Q[HAS_SE] here - the absence of -L guard means it fires when HAS_SE>0
+    # K: attend to AX marker (shared with first-step, but different Q position activates)
+    attn.W_k[base, BD.MARK_AX] = L  # NOTE: This is added to existing W_k[MARK_PC]
 
     # Head 5: First-step OP flag relay (AX marker ← PC marker)
     # For first step, L5 FFN decodes opcodes at PC marker (OP_IMM, OP_LEA, OP_EXIT, OP_NOP, OP_JMP, OP_JSR, arithmetic, bitwise, cmp, shift).
@@ -5275,7 +5301,8 @@ def _set_function_call_weights(model, S, BD, HD):
     unit = 850
 
     # --- LEA AX_CARRY override (32 units: 850-881) ---
-    # At AX marker when OP_LEA: write FETCH to AX_CARRY (overwriting contamination).
+    # At AX marker when OP_LEA: copy all FETCH nibbles to AX_CARRY (overwriting contamination).
+    # FETCH is one-hot encoded, so we copy all 16 nibbles without selective gating.
     # The ADD circuitry in L8/L9 then computes AX_CARRY + ALU = FETCH + BP.
     # OP_LEA ≈ 2.4, MARK_AX ≈ 1.0, so sum = 3.4. Use T_lea = 2.5.
     T_lea = 2.5
@@ -5284,14 +5311,23 @@ def _set_function_call_weights(model, S, BD, HD):
         ffn6.W_up[unit, BD.MARK_AX] = S
         ffn6.b_up[unit] = -S * T_lea
         ffn6.W_gate[unit, BD.FETCH_LO + k] = 1.0
-        ffn6.W_down[BD.AX_CARRY_LO + k, unit] = 2.0 / S
+        # Write to ALL AX_CARRY_LO positions (FETCH one-hot distributes across outputs)
+        for j in range(16):
+            if k == j:
+                ffn6.W_down[BD.AX_CARRY_LO + j, unit] = 2.0 / S
+            else:
+                ffn6.W_down[BD.AX_CARRY_LO + j, unit] = -2.0 / S  # cancel residual
         unit += 1
     for k in range(16):
         ffn6.W_up[unit, BD.OP_LEA] = S
         ffn6.W_up[unit, BD.MARK_AX] = S
         ffn6.b_up[unit] = -S * T_lea
         ffn6.W_gate[unit, BD.FETCH_HI + k] = 1.0
-        ffn6.W_down[BD.AX_CARRY_HI + k, unit] = 2.0 / S
+        for j in range(16):
+            if k == j:
+                ffn6.W_down[BD.AX_CARRY_HI + j, unit] = 2.0 / S
+            else:
+                ffn6.W_down[BD.AX_CARRY_HI + j, unit] = -2.0 / S
         unit += 1
 
     # --- JSR SP -= 8 (32 units: 882-913) ---

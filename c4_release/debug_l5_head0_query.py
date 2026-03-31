@@ -1,4 +1,4 @@
-"""Check HAS_SE value on first step."""
+"""Debug what address Layer 5 head 0 queries for."""
 import sys
 sys.path.insert(0, '/home/alexlitz/Documents/misc/c4_release/c4_release')
 
@@ -44,14 +44,24 @@ ax_marker_pos = len(input_tokens) - 1
 with torch.no_grad():
     x = model.embed(torch.tensor([input_tokens], dtype=torch.long))
 
-    # Run through Layer 1 (where HAS_SE is set)
-    for i in range(2):
+    # Run through Layer 4
+    for i in range(5):
         x = model.blocks[i](x)
 
-    print("After Layer 1, AX marker:")
-    has_se = x[0, ax_marker_pos, BD.HAS_SE].item()
-    mark_ax = x[0, ax_marker_pos, BD.MARK_AX].item()
-    print(f"  HAS_SE = {has_se:.4f}")
-    print(f"  MARK_AX = {mark_ax:.4f}")
+    print("After Layer 4, AX marker TEMP (PC+1 query address):")
+    print("TEMP_LO (address low nibble):")
+    for k in range(16):
+        val = x[0, ax_marker_pos, BD.TEMP + k].item()
+        if abs(val) > 0.01:
+            print(f"  TEMP[{k}] = {val:.4f} (address nibble {k})")
     print()
-    print("Expected: HAS_SE = 0.0 (first step)")
+    print("TEMP_HI (address high nibble):")
+    for k in range(16):
+        val = x[0, ax_marker_pos, BD.TEMP + 16 + k].item()
+        if abs(val) > 0.01:
+            print(f"  TEMP[{16+k}] = {val:.4f} (address nibble {k})")
+    print()
+    print("Expected for first step:")
+    print("  TEMP should encode address 1 (PC=0, PC+1=1)")
+    print("  But bytecode immediate is at address 3 (PC_OFFSET+1)")
+    print("  This mismatch causes head 0 to fetch wrong byte!")

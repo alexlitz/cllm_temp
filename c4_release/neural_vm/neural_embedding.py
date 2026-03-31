@@ -338,11 +338,8 @@ class NeuralVMEmbedding(nn.Module):
 
                     prev_pc = pc
                     i += 5  # Skip past REG_PC section
-                elif tok == Token.STEP_END or tok == Token.HALT:
-                    # Reset prev_pc at step boundaries
-                    prev_pc = None
-                    i += 1
                 else:
+                    # Don't reset prev_pc - we want to track jumps across steps
                     i += 1
 
         return jump_targets

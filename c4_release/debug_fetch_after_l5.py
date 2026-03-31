@@ -1,4 +1,4 @@
-"""Check HAS_SE value on first step."""
+"""Check FETCH at AX marker after full Layer 5."""
 import sys
 sys.path.insert(0, '/home/alexlitz/Documents/misc/c4_release/c4_release')
 
@@ -40,18 +40,26 @@ model.eval()
 
 input_tokens = context + expected_tokens[0:6]
 ax_marker_pos = len(input_tokens) - 1
+pc_marker_pos = len(context)
 
 with torch.no_grad():
     x = model.embed(torch.tensor([input_tokens], dtype=torch.long))
 
-    # Run through Layer 1 (where HAS_SE is set)
-    for i in range(2):
+    # Run through full Layer 5
+    for i in range(6):
         x = model.blocks[i](x)
 
-    print("After Layer 1, AX marker:")
-    has_se = x[0, ax_marker_pos, BD.HAS_SE].item()
-    mark_ax = x[0, ax_marker_pos, BD.MARK_AX].item()
-    print(f"  HAS_SE = {has_se:.4f}")
-    print(f"  MARK_AX = {mark_ax:.4f}")
+    print("After Layer 5, PC marker FETCH:")
+    for k in range(16):
+        val = x[0, pc_marker_pos, BD.FETCH_LO + k].item()
+        if abs(val) > 0.01:
+            print(f"  FETCH_LO[{k}] = {val:.4f}")
     print()
-    print("Expected: HAS_SE = 0.0 (first step)")
+
+    print("After Layer 5, AX marker FETCH:")
+    for k in range(16):
+        val = x[0, ax_marker_pos, BD.FETCH_LO + k].item()
+        if abs(val) > 0.01:
+            print(f"  FETCH_LO[{k}] = {val:.4f}")
+    print()
+    print("Expected: FETCH_LO[8] = strong (immediate = 8)")

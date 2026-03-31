@@ -1,4 +1,4 @@
-"""Check HAS_SE value on first step."""
+"""Check when FETCH appears at PC marker."""
 import sys
 sys.path.insert(0, '/home/alexlitz/Documents/misc/c4_release/c4_release')
 
@@ -39,19 +39,21 @@ set_vm_weights(model)
 model.eval()
 
 input_tokens = context + expected_tokens[0:6]
-ax_marker_pos = len(input_tokens) - 1
+pc_marker_pos = len(context)
 
 with torch.no_grad():
     x = model.embed(torch.tensor([input_tokens], dtype=torch.long))
 
-    # Run through Layer 1 (where HAS_SE is set)
-    for i in range(2):
+    # Run through layers one at a time
+    for i in range(6):
         x = model.blocks[i](x)
-
-    print("After Layer 1, AX marker:")
-    has_se = x[0, ax_marker_pos, BD.HAS_SE].item()
-    mark_ax = x[0, ax_marker_pos, BD.MARK_AX].item()
-    print(f"  HAS_SE = {has_se:.4f}")
-    print(f"  MARK_AX = {mark_ax:.4f}")
-    print()
-    print("Expected: HAS_SE = 0.0 (first step)")
+        has_fetch = False
+        for k in range(16):
+            val = x[0, pc_marker_pos, BD.FETCH_LO + k].item()
+            if abs(val) > 0.01:
+                if not has_fetch:
+                    print(f"After Layer {i}, PC marker FETCH:")
+                    has_fetch = True
+                print(f"  FETCH_LO[{k}] = {val:.4f}")
+        if has_fetch:
+            print()

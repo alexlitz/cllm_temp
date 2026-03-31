@@ -119,6 +119,13 @@ class AutoregressiveVMRunner:
     - Build context (system prompt): bytecode + data + argv as tokens
     - Generate tokens autoregressively (model forward + greedy decode)
     - Detect I/O boundary (output bytes, halt)
+
+    Supports two I/O modes:
+    1. Legacy mode (conversational_io=False): Python handlers for I/O syscalls
+    2. Conversational mode (conversational_io=True): Truly autoregressive I/O
+       - Output: Model generates </thinking>, output text, <thinking>
+       - Input: Model extracts from <user_input> tags in context
+       - All I/O is part of the token stream (100% autoregressive)
     """
 
     def __init__(
@@ -129,6 +136,7 @@ class AutoregressiveVMRunner:
         ffn_hidden=4096,
         max_seq_len=4096,
         pure_attention_memory=False,
+        conversational_io=False,
     ):
         self.model = AutoregressiveVM(
             d_model=d_model,
@@ -172,6 +180,13 @@ class AutoregressiveVMRunner:
 
         # Bump allocator state
         self._heap_base = 0x10000  # Start of heap
+
+        # Conversational I/O mode flag
+        # When True, I/O operations are handled autoregressively:
+        # - Output (printf/putchar): Model generates THINKING_END, output text, THINKING_START
+        # - Input (read/getchar): Model extracts from USER_INPUT section in context
+        # When False, I/O operations use Python handlers (legacy mode)
+        self.conversational_io = conversational_io
         self._heap_ptr = 0x10000  # Current allocation pointer
         self._alloc_sizes = {}  # addr → size (for FREE zero-fill)
 
@@ -204,6 +219,12 @@ class AutoregressiveVMRunner:
             Opcode.LEV: self._handler_lev,
             # Stack operations
             Opcode.PSH: self._handler_psh,
+            # Arithmetic operations (neural weights broken, using fallback)
+            Opcode.ADD: self._handler_add,
+            Opcode.SUB: self._handler_sub,
+            Opcode.MUL: self._handler_mul,
+            Opcode.DIV: self._handler_div,
+            Opcode.MOD: self._handler_mod,
             # Bitwise operations (neural weights broken, using fallback)
             Opcode.OR: self._handler_or,
             Opcode.XOR: self._handler_xor,
@@ -211,10 +232,6 @@ class AutoregressiveVMRunner:
             # Shift operations (neural weights broken, using fallback)
             Opcode.SHL: self._handler_shl,
             Opcode.SHR: self._handler_shr,
-            # Arithmetic operations (neural weights broken, using fallback)
-            Opcode.MUL: self._handler_mul,
-            Opcode.DIV: self._handler_div,
-            Opcode.MOD: self._handler_mod,
         }
 
         # If True: disable runner VM-memory emulation paths and only allow
@@ -378,8 +395,8 @@ class AutoregressiveVMRunner:
                     # Don't extract SP for IMM/LEA - they don't modify SP!
                     if exec_op in self._func_call_handlers:
                         SP_MODIFYING_OPS = {Opcode.PSH, Opcode.JSR, Opcode.ENT, Opcode.LEV,
-                                           Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.SHL, Opcode.SHR,
-                                           Opcode.MUL, Opcode.DIV, Opcode.MOD}
+                                           Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.DIV, Opcode.MOD,
+                                           Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.SHL, Opcode.SHR}
                         if exec_op in SP_MODIFYING_OPS:
                             sp = self._extract_register(context, Token.REG_SP)
                             if sp is not None:
@@ -1212,6 +1229,34 @@ class AutoregressiveVMRunner:
         # Override SP and STACK0 in context
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
         self._override_register_in_last_step(context, Token.STACK0, ax)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_add(self, context, output):
+        """ADD -- Addition: AX = pop + AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        result = (lhs + rhs) & 0xFFFFFFFF
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
+        # Advance PC
+        exec_pc = self._exec_pc()
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_sub(self, context, output):
+        """SUB -- Subtraction: AX = pop - AX."""
+        rhs = self._last_ax
+        lhs = self._mem_load_word(self._last_sp)
+        result = (lhs - rhs) & 0xFFFFFFFF
+        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+        # Override SP and AX
+        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_ax_in_last_step(context, result)
         # Advance PC
         exec_pc = self._exec_pc()
         next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
