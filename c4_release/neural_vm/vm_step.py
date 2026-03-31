@@ -5264,23 +5264,22 @@ def _set_function_call_weights(model, S, BD, HD):
     unit = 850
 
     # --- LEA AX_CARRY override (32 units: 850-881) ---
-    # At AX marker when OP_LEA: cancel existing AX_CARRY, write FETCH instead.
+    # At AX marker when OP_LEA: write FETCH to AX_CARRY (overwriting contamination).
     # The ADD circuitry in L8/L9 then computes AX_CARRY + ALU = FETCH + BP.
+    # OP_LEA ≈ 2.4, MARK_AX ≈ 1.0, so sum = 3.4. Use T_lea = 2.5.
+    T_lea = 2.5
     for k in range(16):
         ffn6.W_up[unit, BD.OP_LEA] = S
         ffn6.W_up[unit, BD.MARK_AX] = S
-        ffn6.b_up[unit] = -S * T  # OP_LEA(~5) + MARK_AX(1) = 6 > 4
-        # gate: cancel old AX_CARRY_LO[k], write FETCH_LO[k]
+        ffn6.b_up[unit] = -S * T_lea
         ffn6.W_gate[unit, BD.FETCH_LO + k] = 1.0
-        ffn6.W_gate[unit, BD.AX_CARRY_LO + k] = -1.0
         ffn6.W_down[BD.AX_CARRY_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
         ffn6.W_up[unit, BD.OP_LEA] = S
         ffn6.W_up[unit, BD.MARK_AX] = S
-        ffn6.b_up[unit] = -S * T
+        ffn6.b_up[unit] = -S * T_lea
         ffn6.W_gate[unit, BD.FETCH_HI + k] = 1.0
-        ffn6.W_gate[unit, BD.AX_CARRY_HI + k] = -1.0
         ffn6.W_down[BD.AX_CARRY_HI + k, unit] = 2.0 / S
         unit += 1
 
@@ -5330,7 +5329,7 @@ def _set_function_call_weights(model, S, BD, HD):
         ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
-    # --- JSR PC override: PC = FETCH (jump target) (64 units: 946-1009) ---
+    # --- JSR PC override: PC = FETCH (jump target) (64 units: 978-1041) ---
     # At PC marker when JSR: cancel OUTPUT (PC+5), write FETCH (jump target).
     # Gated on TEMP[0] (IS_JSR flag relayed from AX by L6 head 3).
     # Threshold: relayed OP_JSR ≈ 5.0, so T=4.0 separates it from false positives.

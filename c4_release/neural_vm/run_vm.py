@@ -1207,12 +1207,17 @@ class AutoregressiveVMRunner:
 
         *--sp = bp;  bp = sp;  sp -= imm;
         """
+        import sys
+        print(f"[ENT] Handler called", file=sys.stderr)
         exec_pc = self._exec_pc()
         exec_idx = exec_pc // INSTR_WIDTH
+        print(f"[ENT] exec_pc={exec_pc}, exec_idx={exec_idx}", file=sys.stderr)
         if exec_idx < 0 or exec_idx >= len(self._bytecode):
+            print(f"[ENT] Out of bounds, returning", file=sys.stderr)
             return
         instr = self._bytecode[exec_idx]
         imm = instr >> 8
+        print(f"[ENT] instr=0x{instr:04x}, imm={imm}", file=sys.stderr)
         # Sign-extend 24-bit immediate
         if imm >= 0x800000:
             imm -= 0x1000000
@@ -1224,6 +1229,7 @@ class AutoregressiveVMRunner:
         old_bp = self._extract_register(context, Token.REG_BP)
         if old_bp is None:
             old_bp = self._last_bp
+        print(f"[ENT] old_sp={old_sp}, old_bp={old_bp}", file=sys.stderr)
 
         # Push old BP: *--sp = bp
         push_addr = (old_sp - 8) & 0xFFFFFFFF
@@ -1231,6 +1237,7 @@ class AutoregressiveVMRunner:
         new_bp = push_addr
         # sp -= imm (allocate locals)
         new_sp = (new_bp - imm) & 0xFFFFFFFF
+        print(f"[ENT] push_addr={push_addr}, new_bp={new_bp}, new_sp={new_sp}", file=sys.stderr)
 
         # Override all registers
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
@@ -1240,7 +1247,9 @@ class AutoregressiveVMRunner:
         next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
         self._override_register_in_last_step(context, Token.REG_PC, next_pc)
         # Shadow memory: store old BP at push_addr
+        print(f"[ENT] Storing old_bp={old_bp} at mem[{push_addr}]", file=sys.stderr)
         self._mem_store_word(push_addr, old_bp)
+        print(f"[ENT] Overriding: SP={new_sp}, BP={new_bp}, PC={next_pc}", file=sys.stderr)
 
     def _handler_lev(self, context, output):
         """LEV -- restore frame, return.
