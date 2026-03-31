@@ -2548,6 +2548,160 @@ def _set_opcode_decode_ffn(ffn, S, BD):
     ffn.W_down[BD.OP_LEA, unit] = 10.0 / S  # write OP_LEA at PC marker
     unit += 1
 
+    # EXIT first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 6, 2  # EXIT opcode = 38 = 0x26
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_EXIT, unit] = 10.0 / S
+    unit += 1
+
+    # NOP first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 7, 2  # NOP opcode = 39 = 0x27
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_NOP, unit] = 10.0 / S
+    unit += 1
+
+    # ADD first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 9, 1  # ADD opcode = 25 = 0x19
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_ADD, unit] = 10.0 / S
+    unit += 1
+
+    # SUB first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 10, 1  # SUB opcode = 26 = 0x1A
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_SUB, unit] = 10.0 / S
+    unit += 1
+
+    # MUL first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 11, 1  # MUL opcode = 27 = 0x1B
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_MUL, unit] = 10.0 / S
+    unit += 1
+
+    # DIV first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 12, 1  # DIV opcode = 28 = 0x1C
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_DIV, unit] = 10.0 / S
+    unit += 1
+
+    # MOD first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 13, 1  # MOD opcode = 29 = 0x1D
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_MOD, unit] = 10.0 / S
+    unit += 1
+
+    # OR first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 14, 0  # OR opcode = 14 = 0x0E
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_OR, unit] = 10.0 / S
+    unit += 1
+
+    # XOR first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 15, 0  # XOR opcode = 15 = 0x0F
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_XOR, unit] = 10.0 / S
+    unit += 1
+
+    # AND first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 0, 1  # AND opcode = 16 = 0x10
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_AND, unit] = 10.0 / S
+    unit += 1
+
+    # EQ first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 1, 1  # EQ opcode = 17 = 0x11
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_EQ, unit] = 10.0 / S
+    unit += 1
+
+    # LT first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 3, 1  # LT opcode = 19 = 0x13
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_LT, unit] = 10.0 / S
+    unit += 1
+
+    # SHL first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 7, 1  # SHL opcode = 23 = 0x17
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_SHL, unit] = 10.0 / S
+    unit += 1
+
+    # SHR first-step decode at PC marker (for Layer 6 relay to AX marker)
+    lo, hi = 8, 1  # SHR opcode = 24 = 0x18
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + lo] = S
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + hi] = S
+    ffn.W_up[unit, BD.MARK_PC] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OP_SHR, unit] = 10.0 / S
+    unit += 1
+
     # === TEMP clearing at PC marker ===
     # Clear TEMP dims at PC marker to prevent leakage from Layer 5 attention
     # mixing TEMP values from AX marker to PC marker. TEMP is only valid at
@@ -2585,13 +2739,19 @@ def _set_layer6_attn(attn, S, BD, HD):
     Head 4 — First-step FETCH relay: At AX marker (first step only), attend to
     PC marker. Copy FETCH_LO/HI from PC marker to AX marker for IMM routing.
 
+    Head 5 — First-step OP flag relay: At AX marker (first step only), attend to
+    PC marker. Copy OP_IMM, OP_LEA, OP_JMP, OP_EXIT, OP_NOP, arithmetic/bitwise/
+    comparison/shift flags from PC marker to AX marker for Layer 6 FFN routing.
+    Required because Layer 5 FFN decodes opcodes at PC marker (NOT at AX marker),
+    but Layer 6 FFN needs flags at AX marker. Relays 17 OP flags total.
+
     Uses L=50 (large) + ALiBi slope=5.0 (steep) to minimize leakage.
     Attention scale = 1/sqrt(64) = 0.125, so score = L²*0.125 - slope*d.
     Head 0 at PC: 50²*0.125 - 5*30 = 162 (strong). Leakage at Q=0: <0.7%.
     Head 1 at SE: 50²*0.7*0.125 - 5*28 = 79 (strong). Leakage at Q=0: <0.7%.
     Q guards (-L at MARK_AX) block self-attention at AX markers entirely.
 
-    Heads 5-7: unused (zero weights, identity via residual).
+    Heads 6-7: unused (zero weights, identity via residual).
     """
     L = 50.0
 
@@ -2679,22 +2839,50 @@ def _set_layer6_attn(attn, S, BD, HD):
         attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
 
     # Head 5: First-step OP flag relay (AX marker ← PC marker)
-    # For first step, L5 FFN decodes opcodes at PC marker (OP_IMM, OP_LEA, OP_JMP, OP_JSR).
-    # L6 FFN needs these flags at AX marker for routing (IMM, EXIT, NOP, JMP).
+    # For first step, L5 FFN decodes opcodes at PC marker (OP_IMM, OP_LEA, OP_EXIT, OP_NOP, OP_JMP, OP_JSR, arithmetic, bitwise, cmp, shift).
+    # L6 FFN needs these flags at AX marker for routing (IMM, EXIT, NOP, JMP, arithmetic, etc).
     # This relay copies OP flags from PC marker to AX marker on first step only.
-    # Copy key opcodes: IMM, LEA (add more as needed)
+    # Currently relaying: IMM, LEA, JMP, EXIT, NOP, ADD, SUB, MUL, DIV, MOD, OR, XOR, AND, EQ, LT, SHL, SHR
     base = 5 * HD
     attn.W_q[base, BD.MARK_AX] = L
     attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
     attn.W_k[base, BD.MARK_PC] = L
-    # V: copy OP flags (using first few V dims)
+    # V: copy OP flags (17 total: 5 existing + 12 new)
     attn.W_v[base + 0, BD.OP_IMM] = 1.0
     attn.W_v[base + 1, BD.OP_LEA] = 1.0
     attn.W_v[base + 2, BD.OP_JMP] = 1.0
+    attn.W_v[base + 3, BD.OP_EXIT] = 1.0
+    attn.W_v[base + 4, BD.OP_NOP] = 1.0
+    attn.W_v[base + 5, BD.OP_ADD] = 1.0
+    attn.W_v[base + 6, BD.OP_SUB] = 1.0
+    attn.W_v[base + 7, BD.OP_MUL] = 1.0
+    attn.W_v[base + 8, BD.OP_DIV] = 1.0
+    attn.W_v[base + 9, BD.OP_MOD] = 1.0
+    attn.W_v[base + 10, BD.OP_OR] = 1.0
+    attn.W_v[base + 11, BD.OP_XOR] = 1.0
+    attn.W_v[base + 12, BD.OP_AND] = 1.0
+    attn.W_v[base + 13, BD.OP_EQ] = 1.0
+    attn.W_v[base + 14, BD.OP_LT] = 1.0
+    attn.W_v[base + 15, BD.OP_SHL] = 1.0
+    attn.W_v[base + 16, BD.OP_SHR] = 1.0
     # O: write OP flags at AX marker
     attn.W_o[BD.OP_IMM, base + 0] = 1.0
     attn.W_o[BD.OP_LEA, base + 1] = 1.0
     attn.W_o[BD.OP_JMP, base + 2] = 1.0
+    attn.W_o[BD.OP_EXIT, base + 3] = 1.0
+    attn.W_o[BD.OP_NOP, base + 4] = 1.0
+    attn.W_o[BD.OP_ADD, base + 5] = 1.0
+    attn.W_o[BD.OP_SUB, base + 6] = 1.0
+    attn.W_o[BD.OP_MUL, base + 7] = 1.0
+    attn.W_o[BD.OP_DIV, base + 8] = 1.0
+    attn.W_o[BD.OP_MOD, base + 9] = 1.0
+    attn.W_o[BD.OP_OR, base + 10] = 1.0
+    attn.W_o[BD.OP_XOR, base + 11] = 1.0
+    attn.W_o[BD.OP_AND, base + 12] = 1.0
+    attn.W_o[BD.OP_EQ, base + 13] = 1.0
+    attn.W_o[BD.OP_LT, base + 14] = 1.0
+    attn.W_o[BD.OP_SHL, base + 15] = 1.0
+    attn.W_o[BD.OP_SHR, base + 16] = 1.0
 
 
 def _set_layer6_routing_ffn(ffn, S, BD):
@@ -2861,14 +3049,20 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
     # Add JMP target from AX_CARRY (written by L5 head 3)
+    # JMP immediate is converted: idx = imm // INSTR_WIDTH, PC = idx_to_pc(idx)
+    # idx_to_pc adds PC_OFFSET, so for JMP 0x20: idx=4, PC=4*8+2=34
+    # We need to output PC (not raw immediate), so add PC_OFFSET.
+    # Strategy: nibble shift by +2 for LO, direct copy for HI
     for k in range(16):
+        new_k = (k + 2) % 16  # Add PC_OFFSET=2
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
         ffn.W_up[unit, BD.HAS_SE] = -S
         ffn.b_up[unit] = -S * (T_op_jmp + 0.5)
         ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
-        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+        ffn.W_down[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
         unit += 1
+    # HI nibble: direct copy (assume no carry from LO+2 for simplicity)
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
