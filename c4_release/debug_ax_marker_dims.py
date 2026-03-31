@@ -1,4 +1,4 @@
-"""Check ADDR_KEY values in the context."""
+"""Check what dimensions are available at AX marker after Layer 6 attention."""
 import sys
 sys.path.insert(0, '/home/alexlitz/Documents/misc/c4_release/c4_release')
 
@@ -30,24 +30,34 @@ def build_context(bc):
     return tokens
 
 context = build_context(bytecode)
+draft = DraftVM(bytecode)
+draft.step()
+expected_tokens = draft.draft_tokens()
 
 model = AutoregressiveVM()
 set_vm_weights(model)
 model.eval()
 
-with torch.no_grad():
-    x = model.embed(torch.tensor([context], dtype=torch.long))
+# Teacher forcing up to AX marker
+input_tokens = context + expected_tokens[0:6]
 
-    print("ADDR_KEY at context positions:")
-    for pos in range(min(6, len(context))):
-        addr_key_lo = []
-        addr_key_hi = []
-        for k in range(16):
-            val = x[0, pos, BD.ADDR_KEY + k].item()
-            if abs(val) > 0.01:
-                addr_key_lo.append(k)
-        for k in range(16):
-            val = x[0, pos, BD.ADDR_KEY + 16 + k].item()
-            if abs(val) > 0.01:
-                addr_key_hi.append(k)
-        print(f"  Pos {pos} (token {context[pos]:3d}): LO={addr_key_lo}, HI={addr_key_hi}")
+ax_marker_pos = len(input_tokens) - 1
+
+with torch.no_grad():
+    x = model.embed(torch.tensor([input_tokens], dtype=torch.long))
+
+    # Run through Layer 6 attention
+    for i in range(7):
+        x = model.blocks[i](x)
+
+    print("Dimensions at AX marker after Layer 6:")
+    print(f"  OP_LEA: {x[0, ax_marker_pos, BD.OP_LEA].item():.4f}")
+    print(f"  MARK_AX: {x[0, ax_marker_pos, BD.MARK_AX].item():.4f}")
+    print()
+    print("FETCH_LO:")
+    for k in range(16):
+        val = x[0, ax_marker_pos, BD.FETCH_LO + k].item()
+        if abs(val) > 0.01:
+            print(f"  FETCH_LO[{k}] = {val:.4f}")
+    print()
+    print("Expected: FETCH_LO[8] should be strong for immediate = 8")

@@ -1,4 +1,4 @@
-"""Check ADDR_KEY values in the context."""
+"""Debug all FETCH values."""
 import sys
 sys.path.insert(0, '/home/alexlitz/Documents/misc/c4_release/c4_release')
 
@@ -30,24 +30,38 @@ def build_context(bc):
     return tokens
 
 context = build_context(bytecode)
+draft = DraftVM(bytecode)
+draft.step()
+expected_tokens = draft.draft_tokens()
 
 model = AutoregressiveVM()
 set_vm_weights(model)
 model.eval()
 
-with torch.no_grad():
-    x = model.embed(torch.tensor([context], dtype=torch.long))
+# Teacher forcing up to AX marker
+input_tokens = context + expected_tokens[0:6]
 
-    print("ADDR_KEY at context positions:")
-    for pos in range(min(6, len(context))):
-        addr_key_lo = []
-        addr_key_hi = []
-        for k in range(16):
-            val = x[0, pos, BD.ADDR_KEY + k].item()
-            if abs(val) > 0.01:
-                addr_key_lo.append(k)
-        for k in range(16):
-            val = x[0, pos, BD.ADDR_KEY + 16 + k].item()
-            if abs(val) > 0.01:
-                addr_key_hi.append(k)
-        print(f"  Pos {pos} (token {context[pos]:3d}): LO={addr_key_lo}, HI={addr_key_hi}")
+with torch.no_grad():
+    x = model.embed(torch.tensor([input_tokens], dtype=torch.long))
+    pos = len(input_tokens) - 1
+
+    # Run through Layer 5
+    for i in range(6):
+        x = model.blocks[i](x)
+
+    print("FETCH values at AX marker position:")
+    print()
+    print("FETCH_LO:")
+    for k in range(16):
+        val = x[0, pos, BD.FETCH_LO + k].item()
+        if abs(val) > 0.01:
+            print(f"  FETCH_LO[{k:2d}] = {val:.4f}")
+    print()
+    print("FETCH_HI:")
+    for k in range(16):
+        val = x[0, pos, BD.FETCH_HI + k].item()
+        if abs(val) > 0.01:
+            print(f"  FETCH_HI[{k:2d}] = {val:.4f}")
+    print()
+    print(f"Expected: immediate = 8 (0x08)")
+    print(f"  Low nibble = 8, high nibble = 0")

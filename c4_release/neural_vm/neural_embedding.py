@@ -42,6 +42,14 @@ class NeuralVMEmbedding(nn.Module):
         # (set by KV cache eviction logic)
         self._mem_history_end = 0
 
+        # Track executable memory addresses for unified memory
+        # (set by runner when code is written to memory)
+        self._exec_addrs = set()
+
+        # Autoregressive mode: infer executable regions from token stream
+        # When True, no external add_exec_addr() calls needed
+        self._autoregressive_exec = True
+
     def forward(self, token_ids):
         """Apply embedding + augmentations.
 
@@ -57,6 +65,12 @@ class NeuralVMEmbedding(nn.Module):
         # Apply augmentations in-place (deterministic transformations)
         self._add_code_addr_keys(token_ids, x)
         self._inject_mem_store(token_ids, x)
+
+        # Unified memory: either autoregressive inference or external hints
+        if self._autoregressive_exec:
+            self._inject_mem_exec_autoregressive(token_ids, x)
+        elif self._exec_addrs:
+            self._inject_mem_exec(token_ids, x)
 
         return x
 
@@ -153,3 +167,191 @@ class NeuralVMEmbedding(nn.Module):
             end: Position marking end of historical memory region
         """
         self._mem_history_end = end
+
+    def _inject_mem_exec(self, token_ids, x):
+        """Inject MEM_EXEC and ADDR_KEY on MEM sections containing executable code.
+
+        For unified memory execution: when code is written to memory via SI/SC,
+        the resulting MEM sections need ADDR_KEY so L5 can fetch from them.
+
+        MEM section format: [MEM, addr_b0, addr_b1, addr_b2, addr_b3,
+                             val_b0, val_b1, val_b2, val_b3]
+        - addr bytes are at positions 1-4 from MEM marker
+        - val bytes are at positions 5-8 from MEM marker (these get ADDR_KEY)
+
+        The ADDR_KEY on val bytes equals addr + byte_offset (0-3).
+        """
+        if not self._exec_addrs:
+            return
+
+        from .vm_step import _SetDim, Token
+        BD = _SetDim
+
+        B, S = token_ids.shape
+
+        for b in range(B):
+            i = 0
+            while i < S:
+                tok = token_ids[b, i].item()
+                if tok == Token.MEM and i + 8 < S:
+                    # Extract address from MEM section (bytes 1-4, little-endian)
+                    addr_bytes = [token_ids[b, i + 1 + j].item() for j in range(4)]
+                    addr = addr_bytes[0] | (addr_bytes[1] << 8) | (addr_bytes[2] << 16) | (addr_bytes[3] << 24)
+
+                    # Check if this address is in executable region (word-aligned)
+                    if (addr & ~3) in self._exec_addrs:
+                        # Set MEM_EXEC flag on MEM marker
+                        x[b, i, BD.MEM_EXEC] = 1.0
+
+                        # Add ADDR_KEY to value bytes (positions 5-8)
+                        for byte_off in range(4):
+                            val_pos = i + 5 + byte_off
+                            if val_pos < S:
+                                byte_addr = addr + byte_off
+                                lo = byte_addr & 0xF
+                                hi = (byte_addr >> 4) & 0xF
+                                top = (byte_addr >> 8) & 0xF
+                                x[b, val_pos, BD.ADDR_KEY + lo] = 1.0
+                                x[b, val_pos, BD.ADDR_KEY + 16 + hi] = 1.0
+                                x[b, val_pos, BD.ADDR_KEY + 32 + top] = 1.0
+                    i += 9  # Skip past MEM section
+                else:
+                    i += 1
+
+    def set_exec_addrs(self, addrs):
+        """Set the set of addresses containing executable code.
+
+        Called by runner when tracking which memory regions are executable.
+
+        Args:
+            addrs: Set or iterable of word-aligned addresses
+        """
+        self._exec_addrs = set(a & ~3 for a in addrs)
+
+    def add_exec_addr(self, addr):
+        """Add an address to the executable set.
+
+        Args:
+            addr: Address to mark as executable (will be word-aligned)
+        """
+        self._exec_addrs.add(addr & ~3)
+
+    def clear_exec_addrs(self):
+        """Clear all executable address markers."""
+        self._exec_addrs.clear()
+
+    def _inject_mem_exec_autoregressive(self, token_ids, x):
+        """Infer executable regions from token stream (fully autoregressive).
+
+        This method analyzes the token context to determine which MEM sections
+        contain executable code, without requiring external hints.
+
+        Strategies:
+        1. Von Neumann: All MEM sections get ADDR_KEY (any memory can be code)
+        2. Jump target inference: Detect PC values from jump instructions
+        3. Code region heuristic: Low addresses (< 0x10000) are typically code
+
+        Currently implements strategy 1+3: Von Neumann for code region,
+        which marks MEM sections in the code address range as executable.
+
+        MEM section format: [MEM, addr_b0-3, val_b0-3] (9 tokens)
+        """
+        from .vm_step import _SetDim, Token
+        BD = _SetDim
+
+        # Code region boundary (addresses below this are code, above are data)
+        # This matches C4 convention: code at low addresses, data at 0x10000+
+        CODE_REGION_END = 0x10000
+
+        B, S = token_ids.shape
+
+        # Also collect jump targets from REG_PC sections for precise detection
+        jump_targets = self._extract_jump_targets_autoregressive(token_ids)
+
+        for b in range(B):
+            i = 0
+            while i < S:
+                tok = token_ids[b, i].item()
+                if tok == Token.MEM and i + 8 < S:
+                    # Extract address from MEM section (bytes 1-4, little-endian)
+                    addr_bytes = [token_ids[b, i + 1 + j].item() for j in range(4)]
+                    addr = (addr_bytes[0] | (addr_bytes[1] << 8) |
+                            (addr_bytes[2] << 16) | (addr_bytes[3] << 24))
+
+                    # Determine if this address should be executable:
+                    # 1. Address is in code region (< CODE_REGION_END)
+                    # 2. Address appears as a jump target in context
+                    is_code_region = addr < CODE_REGION_END
+                    is_jump_target = (addr & ~3) in jump_targets
+
+                    if is_code_region or is_jump_target:
+                        # Set MEM_EXEC flag on MEM marker
+                        x[b, i, BD.MEM_EXEC] = 1.0
+
+                        # Add ADDR_KEY to value bytes (positions 5-8)
+                        for byte_off in range(4):
+                            val_pos = i + 5 + byte_off
+                            if val_pos < S:
+                                byte_addr = addr + byte_off
+                                lo = byte_addr & 0xF
+                                hi = (byte_addr >> 4) & 0xF
+                                top = (byte_addr >> 8) & 0xF
+                                x[b, val_pos, BD.ADDR_KEY + lo] = 1.0
+                                x[b, val_pos, BD.ADDR_KEY + 16 + hi] = 1.0
+                                x[b, val_pos, BD.ADDR_KEY + 32 + top] = 1.0
+                    i += 9  # Skip past MEM section
+                else:
+                    i += 1
+
+    def _extract_jump_targets_autoregressive(self, token_ids):
+        """Extract jump target addresses from PC outputs in context.
+
+        When a jump occurs (JMP/JSR/BZ/BNZ), the next PC value is the target.
+        By detecting non-sequential PC changes, we can identify jump targets.
+
+        Returns:
+            Set of word-aligned addresses that appear as jump targets
+        """
+        from .vm_step import Token
+        from .constants import INSTR_WIDTH
+
+        jump_targets = set()
+        B, S = token_ids.shape
+
+        for b in range(B):
+            prev_pc = None
+            i = 0
+            while i < S:
+                tok = token_ids[b, i].item()
+                if tok == Token.REG_PC and i + 4 < S:
+                    # Extract PC value (bytes 1-4, little-endian)
+                    pc_bytes = [token_ids[b, i + 1 + j].item() for j in range(4)]
+                    pc = (pc_bytes[0] | (pc_bytes[1] << 8) |
+                          (pc_bytes[2] << 16) | (pc_bytes[3] << 24))
+
+                    if prev_pc is not None:
+                        # Check if this is a non-sequential PC change (jump)
+                        expected_next = prev_pc + INSTR_WIDTH
+                        if pc != expected_next:
+                            # This PC came from a jump - it's a potential code location
+                            jump_targets.add(pc & ~3)
+
+                    prev_pc = pc
+                    i += 5  # Skip past REG_PC section
+                elif tok == Token.STEP_END or tok == Token.HALT:
+                    # Reset prev_pc at step boundaries
+                    prev_pc = None
+                    i += 1
+                else:
+                    i += 1
+
+        return jump_targets
+
+    def set_autoregressive_exec(self, enabled):
+        """Enable or disable autoregressive executable region detection.
+
+        Args:
+            enabled: If True, infer executable regions from token stream.
+                     If False, use external add_exec_addr() hints.
+        """
+        self._autoregressive_exec = enabled

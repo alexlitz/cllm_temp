@@ -309,7 +309,6 @@ class AutoregressiveVMRunner:
                         if not name.startswith('_') and getattr(Opcode, name) == exec_op:
                             exec_opname = name
                             break
-                print(f"[STEP {step_num}] Executing {exec_opname} at PC={exec_pc}, next PC={pc}", file=sys.stderr)
 
                 if pc is not None:
                     instr_idx = pc // INSTR_WIDTH
@@ -363,10 +362,11 @@ class AutoregressiveVMRunner:
                         func_handler(context, output)
                     else:
                         # Generic PC advancement for opcodes without handlers
-                        # SKIP for opcodes that handle PC themselves (JSR, JMP, BZ, BNZ, LEV, EXIT)
-                        # These opcodes output their own PC values neurally
-                        opcodes_with_neural_pc = {Opcode.JSR, Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.LEV, Opcode.EXIT}
-                        if exec_op not in opcodes_with_neural_pc:
+                        # SKIP for opcodes that handle PC themselves or have handlers
+                        # func_call_handlers handle their own PC advancement
+                        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT}
+                        opcodes_with_pc_handling.update(self._func_call_handlers.keys())
+                        if exec_op not in opcodes_with_pc_handling:
                             # Model doesn't advance PC neurally for all opcodes, so we do it here
                             exec_pc = self._exec_pc()
                             next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
@@ -479,10 +479,11 @@ class AutoregressiveVMRunner:
                         func_handler(context, output)
                     else:
                         # Generic PC advancement for opcodes without handlers
-                        # SKIP for opcodes that handle PC themselves (JSR, JMP, BZ, BNZ, LEV, EXIT)
-                        # These opcodes output their own PC values neurally
-                        opcodes_with_neural_pc = {Opcode.JSR, Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.LEV, Opcode.EXIT}
-                        if exec_op not in opcodes_with_neural_pc:
+                        # SKIP for opcodes that handle PC themselves or have handlers
+                        # func_call_handlers handle their own PC advancement
+                        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT}
+                        opcodes_with_pc_handling.update(self._func_call_handlers.keys())
+                        if exec_op not in opcodes_with_pc_handling:
                             # Model doesn't advance PC neurally for all opcodes, so we do it here
                             exec_pc = self._exec_pc()
                             next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
@@ -508,11 +509,9 @@ class AutoregressiveVMRunner:
                 ax = self._extract_register(context, Token.REG_AX)
                 if ax is not None:
                     merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
-                    print(f"[AX] Step {step_num}: neural={ax:08x}, last={self._last_ax:08x}, merged={merged:08x}", file=sys.stderr)
                     self._last_ax = merged
                     self._override_register_in_last_step(context, Token.REG_AX, merged)
-                else:
-                    print(f"[AX] Step {step_num}: AX not found in output", file=sys.stderr)
+
                 bp = self._extract_register(context, Token.REG_BP)
                 if bp is not None:
                     self._last_bp = bp
@@ -544,15 +543,11 @@ class AutoregressiveVMRunner:
 
             # Halt detection
             if next_token == Token.HALT:
-                print(f"[HALT] Detected at step {step_num}", file=sys.stderr)
                 # Apply AX bytes 1-3 preservation before exiting
                 ax = self._extract_register(context, Token.REG_AX)
                 if ax is not None:
                     merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
-                    print(f"[HALT] AX: neural={ax:08x}, last={self._last_ax:08x}, merged={merged:08x}", file=sys.stderr)
                     self._override_register_in_last_step(context, Token.REG_AX, merged)
-                else:
-                    print(f"[HALT] AX not found, using _last_ax={self._last_ax:08x}", file=sys.stderr)
                 self._pure_attention_report["halted"] = True
                 break
 
@@ -1383,6 +1378,7 @@ class AutoregressiveVMRunner:
             current_sp = self._last_sp
         new_sp = (current_sp - 8) & 0xFFFFFFFF
 
+
         # TEMPORARY: Restore ALL JSR overrides to verify baseline works
         # TODO: Remove overrides one by one after fixing issues
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
@@ -1396,28 +1392,20 @@ class AutoregressiveVMRunner:
 
         *--sp = bp;  bp = sp;  sp -= imm;
         """
-        print(f"[ENT] Handler called", file=sys.stderr)
         exec_pc = self._exec_pc()
         exec_idx = exec_pc // INSTR_WIDTH
-        print(f"[ENT] exec_pc={exec_pc}, exec_idx={exec_idx}", file=sys.stderr)
         if exec_idx < 0 or exec_idx >= len(self._bytecode):
-            print(f"[ENT] Out of bounds, returning", file=sys.stderr)
             return
         instr = self._bytecode[exec_idx]
         imm = instr >> 8
-        print(f"[ENT] instr=0x{instr:04x}, imm={imm}", file=sys.stderr)
         # Sign-extend 24-bit immediate
         if imm >= 0x800000:
             imm -= 0x1000000
 
-        # Read current SP/BP from context (not _last_sp/_last_bp which may be stale)
-        old_sp = self._extract_register(context, Token.REG_SP)
-        if old_sp is None:
-            old_sp = self._last_sp
-        old_bp = self._extract_register(context, Token.REG_BP)
-        if old_bp is None:
-            old_bp = self._last_bp
-        print(f"[ENT] old_sp={old_sp}, old_bp={old_bp}", file=sys.stderr)
+        # CRITICAL: Use _last_sp/_last_bp, NOT model output!
+        # ENT must see JSR's overridden SP. The model output is stale/wrong.
+        old_sp = self._last_sp
+        old_bp = self._last_bp
 
         # Push old BP: *--sp = bp
         push_addr = (old_sp - 8) & 0xFFFFFFFF
@@ -1425,7 +1413,6 @@ class AutoregressiveVMRunner:
         new_bp = push_addr
         # sp -= imm (allocate locals)
         new_sp = (new_bp - imm) & 0xFFFFFFFF
-        print(f"[ENT] push_addr={push_addr}, new_bp={new_bp}, new_sp={new_sp}", file=sys.stderr)
 
         # Override all registers
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
@@ -1435,9 +1422,7 @@ class AutoregressiveVMRunner:
         next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
         self._override_register_in_last_step(context, Token.REG_PC, next_pc)
         # Shadow memory: store old BP at push_addr
-        print(f"[ENT] Storing old_bp={old_bp} at mem[{push_addr}]", file=sys.stderr)
         self._mem_store_word(push_addr, old_bp)
-        print(f"[ENT] Overriding: SP={new_sp}, BP={new_bp}, PC={next_pc}", file=sys.stderr)
 
     def _handler_lev(self, context, output):
         """LEV -- restore frame, return.
@@ -1446,10 +1431,9 @@ class AutoregressiveVMRunner:
         So: saved_bp = mem[old_bp], return_addr = mem[old_bp + 8]
         new_sp = old_bp + 16, new_bp = saved_bp, pc = return_addr
         """
-        # Read current BP from context (not _last_bp which may be stale)
-        old_bp = self._extract_register(context, Token.REG_BP)
-        if old_bp is None:
-            old_bp = self._last_bp
+        # CRITICAL: Use _last_bp, not model output!
+        # LEV must see ENT's overridden BP. The model output is stale/wrong.
+        old_bp = self._last_bp
         saved_bp = self._mem_load_word(old_bp)
         return_addr = self._mem_load_word(old_bp + 8)
         new_sp = (old_bp + 16) & 0xFFFFFFFF

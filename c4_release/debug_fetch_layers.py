@@ -1,4 +1,4 @@
-"""Check ADDR_KEY values in the context."""
+"""Trace FETCH values through layers."""
 import sys
 sys.path.insert(0, '/home/alexlitz/Documents/misc/c4_release/c4_release')
 
@@ -30,24 +30,38 @@ def build_context(bc):
     return tokens
 
 context = build_context(bytecode)
+draft = DraftVM(bytecode)
+draft.step()
+expected_tokens = draft.draft_tokens()
 
 model = AutoregressiveVM()
 set_vm_weights(model)
 model.eval()
 
-with torch.no_grad():
-    x = model.embed(torch.tensor([context], dtype=torch.long))
+# Teacher forcing up to AX marker
+input_tokens = context + expected_tokens[0:6]
 
-    print("ADDR_KEY at context positions:")
-    for pos in range(min(6, len(context))):
-        addr_key_lo = []
-        addr_key_hi = []
+print(f"Context tokens: {context}")
+print(f"Input tokens: {input_tokens}")
+print(f"AX marker position: {len(input_tokens) - 1}")
+print()
+
+with torch.no_grad():
+    x = model.embed(torch.tensor([input_tokens], dtype=torch.long))
+    pos = len(input_tokens) - 1
+
+    print("After embedding:")
+    for k in range(16):
+        val = x[0, pos, BD.FETCH_LO + k].item()
+        if abs(val) > 0.01:
+            print(f"  FETCH_LO[{k}] = {val:.4f}")
+    print()
+
+    for layer_idx in range(6):
+        x = model.blocks[layer_idx](x)
+        print(f"After Layer {layer_idx}:")
         for k in range(16):
-            val = x[0, pos, BD.ADDR_KEY + k].item()
+            val = x[0, pos, BD.FETCH_LO + k].item()
             if abs(val) > 0.01:
-                addr_key_lo.append(k)
-        for k in range(16):
-            val = x[0, pos, BD.ADDR_KEY + 16 + k].item()
-            if abs(val) > 0.01:
-                addr_key_hi.append(k)
-        print(f"  Pos {pos} (token {context[pos]:3d}): LO={addr_key_lo}, HI={addr_key_hi}")
+                print(f"  FETCH_LO[{k}] = {val:.4f}")
+        print()
