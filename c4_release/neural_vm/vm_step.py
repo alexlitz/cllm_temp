@@ -2286,8 +2286,13 @@ def _set_layer4_ffn(ffn, S, BD):
     # Clear TEMP dims at PC marker to prevent them from leaking to Layer 6.
     # TEMP values are only meaningful at AX marker (where PC+1 is computed).
     # At PC marker, TEMP should be zero to prevent spurious BZ/BNZ activation.
+    # EXCEPT: TEMP[0] is used for IS_JSR flag (first-step decode + L6 relay).
     # Condition: MARK_PC (fires at PC marker token)
     for k in range(32):
+        if k == 0:
+            # Skip TEMP[0] - used for IS_JSR flag, leave unit with zero weights
+            unit += 1
+            continue
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.b_up[unit] = -S * 0.5
         ffn.W_gate[unit, BD.TEMP + k] = -1.0
@@ -2434,12 +2439,28 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
         attn.W_v[base + 48 + k, BD.CLEAN_EMBED_HI + k] = 1.0
     # O: write to AX_CARRY_LO/HI at PC marker (used by L6 FFN for JMP)
-    # Also write to FETCH_LO/HI for IMM support on first step
+    # Also write to FETCH_LO/HI at PC marker for first-step immediate
     for k in range(16):
         attn.W_o[BD.AX_CARRY_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.AX_CARRY_HI + k, base + 48 + k] = 1.0
         attn.W_o[BD.FETCH_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.FETCH_HI + k, base + 48 + k] = 1.0
+
+    # Head 4: First-step FETCH relay (AX marker ← PC marker)
+    # Copy FETCH from PC marker to AX marker on first step only.
+    # This allows Layer 6 FFN to read FETCH at AX marker for IMM/LEA routing.
+    base = 4 * HD
+    attn.W_q[base, BD.MARK_AX] = L
+    attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
+    attn.W_k[base, BD.MARK_PC] = L
+    # V: copy FETCH_LO/HI
+    for k in range(16):
+        attn.W_v[base + k, BD.FETCH_LO + k] = 1.0
+        attn.W_v[base + 16 + k, BD.FETCH_HI + k] = 1.0
+    # O: write to FETCH_LO/HI at AX marker
+    for k in range(16):
+        attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
+        attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
 
 
 def _set_opcode_decode_ffn(ffn, S, BD):
@@ -2821,22 +2842,9 @@ def _set_layer6_attn(attn, S, BD, HD):
     # (Layer 5 FFN clears TEMP at PC; Layer 6 attention writes it; Layer 6 FFN reads it)
     attn.W_o[BD.TEMP + 0, base + 1] = 1.0
 
-    # Head 4: First-step FETCH relay (AX marker ← PC marker)
-    # For first step, L5 head 3 writes FETCH_LO/HI at PC marker position.
-    # L6 FFN reads FETCH at AX marker position for IMM routing.
-    # This relay copies FETCH from PC marker to AX marker on first step only.
-    base = 4 * HD
-    attn.W_q[base, BD.MARK_AX] = L
-    attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
-    attn.W_k[base, BD.MARK_PC] = L
-    # V: copy FETCH_LO/HI
-    for k in range(16):
-        attn.W_v[base + k, BD.FETCH_LO + k] = 1.0
-        attn.W_v[base + 16 + k, BD.FETCH_HI + k] = 1.0
-    # O: write to FETCH_LO/HI at AX marker
-    for k in range(16):
-        attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
-        attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
+    # Head 4: NOTE - Cannot add first-step FETCH relay here due to conflict with
+    # BZ/BNZ relay (below). BZ/BNZ requires Q[MARK_PC]=L and Q[MARK_AX]=-L,
+    # while FETCH relay would need Q[MARK_AX]=L. FETCH will be handled differently.
 
     # Head 5: First-step OP flag relay (AX marker ← PC marker)
     # For first step, L5 FFN decodes opcodes at PC marker (OP_IMM, OP_LEA, OP_EXIT, OP_NOP, OP_JMP, OP_JSR, arithmetic, bitwise, cmp, shift).
@@ -5349,20 +5357,20 @@ def _set_function_call_weights(model, S, BD, HD):
         ffn6.W_gate[unit, BD.OUTPUT_HI + k] = -1.0
         ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
-    # Write AX_CARRY_LO/HI (jump target from L5 Head 3 first-step fetch)
-    # Layer 5 Head 3 fetches immediate from address 1 → AX_CARRY at PC marker
+    # Write FETCH_LO/HI (jump target from immediate field)
+    # FIXED: Was reading AX_CARRY (PC+5 return address), now correctly reads FETCH (jump target)
     for k in range(16):
         ffn6.W_up[unit, BD.MARK_PC] = S
         ffn6.W_up[unit, BD.TEMP + 0] = S  # IS_JSR flag from first-step decode or L6 head 3 relay
         ffn6.b_up[unit] = -S * T_jsr_pc
-        ffn6.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
+        ffn6.W_gate[unit, BD.FETCH_LO + k] = 1.0  # FIXED: was AX_CARRY_LO
         ffn6.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
         ffn6.W_up[unit, BD.MARK_PC] = S
         ffn6.W_up[unit, BD.TEMP + 0] = S  # IS_JSR flag from first-step decode or L6 head 3 relay
         ffn6.b_up[unit] = -S * T_jsr_pc
-        ffn6.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
+        ffn6.W_gate[unit, BD.FETCH_HI + k] = 1.0  # FIXED: was AX_CARRY_HI
         ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
