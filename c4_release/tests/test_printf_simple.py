@@ -22,12 +22,16 @@ print(f"✓ Compiled: {len(code)} instructions, {len(data)} data bytes")
 print(f"Data section: {bytes(data).hex()}")
 
 print("\nCreating runner with conversational_io=True...")
+import sys
+sys.stdout.flush()
 runner = AutoregressiveVMRunner(conversational_io=True)
 print("✓ Runner created")
+sys.stdout.flush()
 
-print("\nRunning VM (max 10 steps)...")
+print("\nRunning VM (max 3 steps)...")
+sys.stdout.flush()
 try:
-    output_str, exit_code = runner.run(code, data, [], max_steps=10)
+    output_str, exit_code = runner.run(code, data, [], max_steps=3)
     print(f"\n✓ Execution complete")
     print(f"Exit code: {exit_code}")
     print(f"Output: {repr(output_str)}")

@@ -304,7 +304,10 @@ class AutoregressiveVMRunner:
             self.model.set_active_opcode(bytecode[init_exec] & 0xFF)
 
         step_num = 0  # Track step number for debugging
-        for _ in range(max_steps * Token.STEP_TOKENS):
+        print(f"[DEBUG] Starting generation loop, max_steps={max_steps}, total tokens={max_steps * Token.STEP_TOKENS}")
+        for i in range(max_steps * Token.STEP_TOKENS):
+            if i % 35 == 0:  # Print every step
+                print(f"[DEBUG] Generating token {i}/{max_steps * Token.STEP_TOKENS}, step {i//35}")
             next_token = self.model.generate_next(context)
             context.append(next_token)
 
