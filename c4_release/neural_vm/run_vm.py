@@ -146,7 +146,7 @@ class AutoregressiveVMRunner:
             max_seq_len=max_seq_len,
         )
         # Load hand-crafted transformer weights for VM execution
-        set_vm_weights(self.model)
+        set_vm_weights(self.model, enable_conversational_io=conversational_io)
         self.model.eval()
 
         # Syscall dispatch table
@@ -308,6 +308,33 @@ class AutoregressiveVMRunner:
             next_token = self.model.generate_next(context)
             context.append(next_token)
 
+            # Hybrid conversational I/O: handle THINKING_END
+            if self.conversational_io and next_token == Token.THINKING_END:
+                print(f"[HYBRID] THINKING_END detected at step {step_num}, context len={len(context)}")
+                # Extract format string pointer from STACK0
+                fmt_ptr = self._extract_register(context, Token.STACK0)
+                print(f"[HYBRID] Format string pointer: 0x{fmt_ptr:08x if fmt_ptr else 0}")
+                if fmt_ptr is not None:
+                    # Read format string from memory
+                    fmt_str = []
+                    addr = fmt_ptr
+                    while len(fmt_str) < 256:  # Safety limit
+                        byte_val = self._memory.get(addr, 0)
+                        if byte_val == 0:  # Null terminator
+                            break
+                        fmt_str.append(byte_val)
+                        addr += 1
+
+                    # Emit output bytes (literal string for now, no format specifiers)
+                    print(f"[HYBRID] Format string: {bytes(fmt_str)}")
+                    for byte_val in fmt_str:
+                        context.append(byte_val)
+
+                    # Emit THINKING_START to resume execution
+                    context.append(Token.THINKING_START)
+                    print(f"[HYBRID] Emitted {len(fmt_str)} bytes + THINKING_START")
+                continue
+
             if next_token == Token.STEP_END:
                 step_num += 1  # Increment step counter
                 # Extract PC and dispatch syscall handler
@@ -422,15 +449,26 @@ class AutoregressiveVMRunner:
                 ax = self._extract_register(context, Token.REG_AX)
                 if ax is not None:
                     # Check the EXECUTED opcode (exec_op), not the next opcode (op)
-                    # Handlers (IMM, LEA, etc.) set full AX value - extract and trust it
-                    if exec_op in self._func_call_handlers:
+                    # CRITICAL: Only extract AX for opcodes that ACTUALLY modify AX
+                    # JSR, ENT, LEV modify SP/BP/PC but NOT AX!
+                    AX_MODIFYING_OPS = {Opcode.IMM, Opcode.LEA,
+                                       Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.DIV, Opcode.MOD,
+                                       Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.SHL, Opcode.SHR}
+                    if exec_op in AX_MODIFYING_OPS:
                         # Handlers override full 32-bit AX. Extract the overridden value.
                         self._last_ax = ax
+                    elif exec_op in self._func_call_handlers:
+                        # Handler doesn't modify AX (e.g., JSR, ENT, LEV, PSH)
+                        # Don't extract from model output - use canonical _last_ax value
+                        # CRITICAL: Must override AX in context to preserve correct value!
+                        self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
+                        # Verify the override worked
+                        verify_ax = self._extract_register(context, Token.REG_AX)
                     elif op in (Opcode.LI, Opcode.LC):
                         # L15 produces correct output for all bytes. Trust transformer.
                         self._last_ax = ax
                     else:
-                        # Normal merge: byte 0 from weights, bytes 1-3 from _last_ax
+                        # Normal opcodes: byte 0 from weights, bytes 1-3 from _last_ax
                         merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
                         self._last_ax = merged
                         self._override_register_in_last_step(context, Token.REG_AX, merged)
@@ -560,11 +598,9 @@ class AutoregressiveVMRunner:
 
             # Halt detection
             if next_token == Token.HALT:
-                # Apply AX bytes 1-3 preservation before exiting
-                ax = self._extract_register(context, Token.REG_AX)
-                if ax is not None:
-                    merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
-                    self._override_register_in_last_step(context, Token.REG_AX, merged)
+                # Preserve final AX value before exiting
+                # Use full _last_ax value (not byte merge) because it's the canonical value
+                self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
                 self._pure_attention_report["halted"] = True
                 break
 

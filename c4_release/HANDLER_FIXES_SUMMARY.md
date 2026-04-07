@@ -7,7 +7,7 @@ After reverting `neural_vm/run_vm.py` to an earlier state, opcode handlers for I
 
 ## Solution Applied
 
-### 1. Handler Registration (Lines 200-219)
+### 1. Handler Registration (Lines 214-235)
 Re-registered all handlers in `_func_call_handlers` dictionary:
 ```python
 self._func_call_handlers = {
@@ -17,14 +17,16 @@ self._func_call_handlers = {
     Opcode.ENT: self._handler_ent,
     Opcode.LEV: self._handler_lev,
     Opcode.PSH: self._handler_psh,
+    Opcode.ADD: self._handler_add,  # Added after initial testing
+    Opcode.SUB: self._handler_sub,  # Added after initial testing
+    Opcode.MUL: self._handler_mul,
+    Opcode.DIV: self._handler_div,
+    Opcode.MOD: self._handler_mod,
     Opcode.OR: self._handler_or,
     Opcode.XOR: self._handler_xor,
     Opcode.AND: self._handler_and,
     Opcode.SHL: self._handler_shl,
     Opcode.SHR: self._handler_shr,
-    Opcode.MUL: self._handler_mul,
-    Opcode.DIV: self._handler_div,
-    Opcode.MOD: self._handler_mod,
 }
 ```
 

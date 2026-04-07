@@ -70,7 +70,9 @@ class Token:
     TOOL_CALL = 271  # Step-end variant: signals tool call to runner
     THINKING_START = 272  # <thinking> tag for conversational I/O mode
     THINKING_END = 273  # </thinking> tag for conversational I/O mode
-    VOCAB_SIZE = 274
+    IO_STATE_EMIT_BYTE = 274  # Internal state: emit output byte next
+    IO_STATE_EMIT_THINKING = 275  # Internal state: emit THINKING_START next
+    VOCAB_SIZE = 276
 
     STEP_TOKENS = (
         35  # Tokens per VM step: PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5)+MEM(9)+SE(1)
@@ -1150,13 +1152,42 @@ class _SetDim:
     CLEAN_EMBED_LO = 306  # 306-321 (16 dims)
     # CLEAN_EMBED_HI at 400, see below
 
-    # --- Tool call detection (gap 322-327) ---
+    # --- Tool call detection and I/O state (gap 322-327) ---
     IO_IS_TOOL_CALL = 322  # Combined flag: any of OPEN/READ/CLOS/PRTF active
     NEXT_TOOL_CALL = 323  # Transition flag → emit TOOL_CALL token
+    NEXT_THINKING_START = 324  # Transition flag → emit <thinking> token
+    NEXT_THINKING_END = 325  # Transition flag → emit </thinking> token
+    NEXT_IO_STATE_EMIT_BYTE = 326  # Transition flag → emit IO_STATE_EMIT_BYTE token
+    NEXT_IO_STATE_EMIT_THINKING = 327  # Transition flag → emit IO_STATE_EMIT_THINKING token
+
+    # --- Conversational I/O detection (PRTF/READ specific) ---
+    IO_IS_PRTF = 460  # Flag: PRTF opcode detected (for autoregressive printf)
+    IO_IS_READ = 461  # Flag: READ opcode detected (for autoregressive input)
+    IO_STATE = 462  # State machine: 0=normal, 1=emit_thinking_end, 2=output, 3=emit_thinking_start
+    IO_OUTPUT_COUNT = 463  # Number of output bytes remaining
+    IO_FORMAT_POS = 464  # Position in format string (nibble-encoded)
+
+    # --- Conversational I/O state tracking ---
+    IO_IN_OUTPUT_MODE = 465  # Flag: currently emitting output bytes
+    IO_OUTPUT_COMPLETE = 466  # Flag: format string complete (null terminator)
+    FORMAT_PTR_LO = 467  # Format string pointer lo nibble (16 dims: 467-482)
+    FORMAT_PTR_HI = 483  # Format string pointer hi nibble (16 dims: 483-498)
+    # Note: OUTPUT_BYTE reuses TEMP space (480-511) which is not needed during conversational I/O
+    OUTPUT_BYTE_LO = 480  # Output byte lo nibble (16 dims: 480-495, overlaps TEMP)
+    OUTPUT_BYTE_HI = 496  # Output byte hi nibble (16 dims: 496-511, overlaps TEMP+16)
+
+    # --- Lookback detection (detect previous token type) ---
+    LAST_WAS_THINKING_END = 501  # Flag: previous token was THINKING_END
+    LAST_WAS_THINKING_START = 502  # Flag: previous token was THINKING_START
+    LAST_WAS_BYTE = 503  # Flag: previous token was byte (0-255)
 
     # --- AX carry-forward staging ---
     AX_CARRY_LO = 328  # 328-343
     AX_CARRY_HI = 344  # 344-359
+
+    # --- I/O state detection (gap 360, overlaps ALU_LO start but that's ok) ---
+    LAST_WAS_IO_STATE_EMIT_BYTE = 458  # Flag: last token was IO_STATE_EMIT_BYTE
+    LAST_WAS_IO_STATE_EMIT_THINKING = 459  # Flag: last token was IO_STATE_EMIT_THINKING
 
     # --- ALU result staging ---
     ALU_LO = 360  # 360-375
@@ -1247,7 +1278,7 @@ class _SetDim:
 
 
 @torch.no_grad()
-def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
+def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=False, alu_mode='lookup'):
     """Set weights into AutoregressiveVM for true neural VM execution.
 
     All computation flows through standard transformer layers (embed →
@@ -1260,6 +1291,10 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
             signaling the runner to dispatch via tool_handler callback.
             If False (default), these opcodes emit STEP_END and the runner
             dispatches post-hoc (current behavior).
+        enable_conversational_io: If True, PRTF and READ emit autoregressive
+            I/O sequences: THINKING_END → output bytes → THINKING_START.
+            All I/O happens through transformer token generation.
+            Cannot be used together with enable_tool_calling.
         alu_mode: 'lookup' (default) uses lookup tables baked into FFN weights.
             'efficient' uses multi-layer efficient ALU with neural format conversion.
             Both modes are purely neural (no Python arithmetic in forward pass).
@@ -1338,6 +1373,23 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
     embed[Token.USER_INPUT_START, BD.IS_MARK] = 1.0
     embed[Token.USER_INPUT_END, BD.IS_MARK] = 1.0
 
+    # Thinking tag embeddings (for conversational I/O mode)
+    # These are markers but NOT step-end markers
+    # Add specific markers for lookback detection
+    embed[Token.THINKING_START, BD.IS_MARK] = 1.0
+    embed[Token.THINKING_START, BD.CONST] = 1.0
+    embed[Token.THINKING_START, BD.TEMP + 1] = 1.0  # Unique marker for lookback
+    embed[Token.THINKING_END, BD.IS_MARK] = 1.0
+    embed[Token.THINKING_END, BD.CONST] = 1.0
+    embed[Token.THINKING_END, BD.TEMP + 2] = 1.0  # Unique marker for lookback
+
+    # I/O state tokens (internal markers for state machine)
+    # These control multi-step I/O generation sequences
+    embed[Token.IO_STATE_EMIT_BYTE, BD.IS_MARK] = 1.0
+    embed[Token.IO_STATE_EMIT_BYTE, BD.CONST] = 1.0
+    embed[Token.IO_STATE_EMIT_THINKING, BD.IS_MARK] = 1.0
+    embed[Token.IO_STATE_EMIT_THINKING, BD.CONST] = 1.0
+
     for b in range(256):
         embed[b, BD.IS_BYTE] = 1.0
         embed[b, BD.EMBED_LO + (b & 0xF)] = 1.0
@@ -1395,6 +1447,12 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
     attn2 = model.blocks[2].attn
     attn2.alibi_slopes.fill_(ALIBI_S)
     _set_threshold_attn(attn2, [5.5], [BD.L2H0], ALIBI_S, HD, heads=[0])
+
+    # Conversational I/O: Lookback detection head (detect prev token type)
+    if enable_conversational_io:
+        attn2.alibi_slopes[1] = 10.0  # Steep slope to favor most recent token
+        _set_lookback_detection_head(attn2, S, BD, HD)
+
     ffn2 = model.blocks[2].ffn
     _set_layer2_mem_byte_flags(ffn2, S, BD)
 
@@ -1424,6 +1482,10 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
     _set_stack0_carry_attn(attn3, 4, HD)
     ffn3 = model.blocks[3].ffn
     _set_layer3_ffn(ffn3, S, BD)
+
+    # Conversational I/O: State initialization when entering output mode
+    if enable_conversational_io:
+        _set_conversational_io_state_init(ffn3, S, BD)
 
     # ===== LAYER 4: PC value relay to AX marker =====
     # AX marker reads the current step's PC byte 0 EMBED_LO value.
@@ -1491,6 +1553,17 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
         # L6 FFN: CMP[2] AND NEXT_SE → NEXT_TOOL_CALL (convert SE to TOOL_CALL)
         _set_tool_call_detection(ffn6, S, BD)
 
+    # ===== CONVERSATIONAL I/O (optional) =====
+    if enable_conversational_io:
+        # L5 FFN: decode PRTF/READ → IO_IS_PRTF, IO_IS_READ at AX marker
+        _set_conversational_io_opcode_decode(ffn5, S, BD)
+        # L6 attention heads 6-7: relay IO_IS_PRTF, IO_IS_READ from AX → SE
+        attn6.alibi_slopes[6] = 5.0  # steep ALiBi for head 6
+        attn6.alibi_slopes[7] = 5.0  # steep ALiBi for head 7
+        _set_conversational_io_relay_heads(attn6, S, BD, HD)
+        # L6 FFN: CMP[3]/TEMP[0] AND NEXT_SE → NEXT_THINKING_END (start I/O sequence)
+        _set_conversational_io_state_machine(ffn6, S, BD)
+
     # ===== LAYER 7: Operand gather + memory relay heads =====
     attn7 = model.blocks[7].attn
     attn7.alibi_slopes.fill_(0.5)
@@ -1504,6 +1577,11 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
     attn7.alibi_slopes[6] = 5.0
     _set_layer7_memory_heads(attn7, S, BD, HD)
 
+    # Conversational I/O: Extract format pointer from STACK0
+    if enable_conversational_io:
+        attn7.alibi_slopes[7] = 5.0  # steep to attend back to prev step
+        _set_format_pointer_extraction(attn7, S, BD, HD)
+
     # ===== LAYER 8: ALU + SP→STACK0 addr gather =====
     attn8 = model.blocks[8].attn
     attn8.alibi_slopes.fill_(0.5)
@@ -1514,6 +1592,17 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
         # Use full lookup tables (pure FFN, many parameters)
         ffn8 = model.blocks[8].ffn
         _set_layer8_alu(ffn8, S, BD)
+
+        # Conversational I/O: Position counter increment
+        if enable_conversational_io:
+            _set_format_position_counter(ffn8, S, BD)
+
+        # Conversational I/O: Format string fetch via attention
+        if enable_conversational_io:
+            attn9 = model.blocks[9].attn
+            attn9.alibi_slopes.fill_(0.5)
+            _set_format_string_fetch_head(attn9, S, BD, HD)
+
         ffn9 = model.blocks[9].ffn
         _set_layer9_alu(ffn9, S, BD)
 
@@ -1525,6 +1614,10 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
         _set_layer10_byte_passthrough(attn10, S, BD, HD)
         ffn10 = model.blocks[10].ffn
         _set_layer10_alu(ffn10, S, BD)
+
+        # Conversational I/O: Null terminator detection
+        if enable_conversational_io:
+            _set_null_terminator_detection(ffn10, S, BD)
 
         # ===== LAYER 10.5: Neural DIV/MOD =====
         model.blocks[10].post_ops.append(DivModModule(mode='lookup'))
@@ -1590,6 +1683,10 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
     ffn15 = model.blocks[15].ffn
     _set_nibble_copy_ffn(ffn15, S, BD)
 
+    # Conversational I/O: Output routing (OUTPUT_BYTE → OUTPUT)
+    if enable_conversational_io:
+        _set_conversational_io_output_routing(ffn15, S, BD)
+
     # ===== OUTPUT HEAD =====
     head = model.head
     head.weight.zero_()
@@ -1606,6 +1703,8 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
         BD.NEXT_SE,
         BD.NEXT_HALT,
         BD.NEXT_TOOL_CALL,
+        BD.NEXT_THINKING_START,
+        BD.NEXT_THINKING_END,
     ]
     for b in range(256):
         lo, hi = b & 0xF, (b >> 4) & 0xF
@@ -1632,11 +1731,13 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
         (Token.STEP_END, BD.NEXT_SE),
         (Token.HALT, BD.NEXT_HALT),
         (Token.TOOL_CALL, BD.NEXT_TOOL_CALL),
+        (Token.THINKING_START, BD.NEXT_THINKING_START),
+        (Token.THINKING_END, BD.NEXT_THINKING_END),
     ]:
         head.weight[tok, flag] = 20.0
         head.bias[tok] = -10.0
 
-    # Never output these tokens
+    # Never output these tokens (context markers only, not part of VM execution)
     for tok in [
         Token.CODE_START,
         Token.CODE_END,
@@ -1647,6 +1748,11 @@ def set_vm_weights(model, enable_tool_calling=False, alu_mode='lookup'):
         Token.USER_INPUT_END,
     ]:
         head.bias[tok] = -50.0
+
+    # I/O state tokens can be generated (part of I/O sequence) but suppress by default
+    # They will be enabled when needed by NEXT_IO_STATE_* flags
+    head.bias[Token.IO_STATE_EMIT_BYTE] = -20.0
+    head.bias[Token.IO_STATE_EMIT_THINKING] = -20.0
 
     # ===== CONTRACT VALIDATION =====
     reg = build_default_registry()
@@ -2200,6 +2306,7 @@ def _set_layer3_ffn(ffn, S, BD):
         ffn.W_down[BD.OUTPUT_HI + k, unit] = -2.0 / S  # cancel old
         ffn.W_down[BD.OUTPUT_HI + (k + 1) % 16, unit] = 2.0 / S  # add shifted
         unit += 1
+
 
 
 def _set_layer4_pc_relay(attn, S, BD, HD):
@@ -3773,7 +3880,21 @@ def _set_layer8_alu(ffn, S, BD):
             ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
             ffn.b_up[unit] = -S * 2.5  # 3-way AND
             ffn.W_gate[unit, BD.OP_ADD] = 1.0
-            ffn.W_gate[unit, BD.OP_LEA] = 1.0  # LEA reuses ADD circuit
+            # LEA moved to separate units that read from FETCH
+            ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
+            unit += 1
+
+    # === LEA: lo nibble (256 units) ===
+    # Like ADD but reads from FETCH_LO instead of AX_CARRY_LO
+    # NOTE: ALU values are amplified (~14x) by Layer 6, so use higher threshold
+    for a in range(16):
+        for b in range(16):
+            result = (a + b) % 16
+            ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.ALU_LO + a] = S
+            ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH, not AX_CARRY
+            ffn.b_up[unit] = -S * 15.5  # High threshold: MARK_AX(1) + ALU(~14) + FETCH(1) = 16 > 15.5
+            ffn.W_gate[unit, BD.OP_LEA] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
             unit += 1
 
@@ -3798,8 +3919,20 @@ def _set_layer8_alu(ffn, S, BD):
                 ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
                 ffn.b_up[unit] = -S * 2.5
                 ffn.W_gate[unit, BD.OP_ADD] = 1.0
-                ffn.W_gate[unit, BD.OP_LEA] = 1.0  # LEA reuses ADD circuit
+                # LEA moved to separate units
                 ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)  # normalize: gate≈5 → CARRY≈1
+                unit += 1
+
+    # === LEA carry detection (120 units: pairs where a+b >= 16) ===
+    for a in range(16):
+        for b in range(16):
+            if a + b >= 16:
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ALU_LO + a] = S
+                ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH
+                ffn.b_up[unit] = -S * 15.5  # Match LEA lo nibble threshold
+                ffn.W_gate[unit, BD.OP_LEA] = 1.0
+                ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                 unit += 1
 
     # === SUB borrow detection (120 units: pairs where a < b) ===
@@ -3858,7 +3991,26 @@ def _set_layer9_alu(ffn, S, BD):
                     ffn.W_up[unit, BD.CARRY + 0] = 0.01  # Reduced from S*2.0
                     ffn.b_up[unit] = -S * 2.9  # Relaxed from -S*4.5 to allow activation with just 3 inputs
                 ffn.W_gate[unit, BD.OP_ADD] = 1.0
-                ffn.W_gate[unit, BD.OP_LEA] = 1.0  # LEA reuses ADD circuit
+                # LEA moved to separate units
+                ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
+                unit += 1
+
+    # === LEA hi nibble (no carry 256 + with carry 256 = 512 units) ===
+    # NOTE: ALU_HI is also amplified like ALU_LO, so use high threshold
+    for carry_in in [0, 1]:
+        for a in range(16):
+            for b in range(16):
+                result = (a + b + carry_in) % 16
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ALU_HI + a] = S
+                ffn.W_up[unit, BD.FETCH_HI + b] = S  # Read from FETCH
+                if carry_in == 0:
+                    ffn.W_up[unit, BD.CARRY + 0] = -0.01
+                    ffn.b_up[unit] = -S * 15.5  # High threshold for amplified ALU
+                else:
+                    ffn.W_up[unit, BD.CARRY + 0] = 0.01
+                    ffn.b_up[unit] = -S * 15.9  # Slightly higher for carry case
+                ffn.W_gate[unit, BD.OP_LEA] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
 
@@ -5143,6 +5295,359 @@ def _set_tool_call_detection(ffn, S, BD):
 
 
 # =============================================================================
+# Conversational I/O Detection (PRTF/READ for autoregressive generation)
+# =============================================================================
+
+
+def _set_conversational_io_opcode_decode(ffn, S, BD):
+    """L5 FFN addition: decode PRTF and READ opcodes for conversational I/O mode.
+
+    Detects PRTF (33) and READ (31) opcodes at AX marker and writes to
+    separate flags for autoregressive I/O generation:
+    - PRTF → IO_IS_PRTF ≈ 5.0
+    - READ → IO_IS_READ ≈ 5.0
+
+    This is separate from tool_call detection to enable different routing:
+    - Tool call mode: PRTF/READ → TOOL_CALL token (runner dispatches)
+    - Conversational I/O mode: PRTF/READ → autoregressive sequence
+      (THINKING_END → output bytes → THINKING_START)
+
+    Starts at unit 410 to avoid conflict with tool_call units (400-405).
+
+    PRTF = 33 = 0x21 (lo=1, hi=2)
+    READ = 31 = 0x1F (lo=15, hi=1)
+    """
+    unit = 410
+
+    # PRTF detection
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + 1] = S  # lo nibble = 1
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + 2] = S  # hi nibble = 2
+    ffn.b_up[unit] = -S * 1.5  # both must be ~1
+    ffn.W_gate[unit, BD.MARK_AX] = 1.0  # only at AX marker
+    ffn.W_down[BD.IO_IS_PRTF, unit] = 10.0 / S  # ≈5.0 when active
+    unit += 1
+
+    # READ detection
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + 15] = S  # lo nibble = 15
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + 1] = S  # hi nibble = 1
+    ffn.b_up[unit] = -S * 1.5  # both must be ~1
+    ffn.W_gate[unit, BD.MARK_AX] = 1.0  # only at AX marker
+    ffn.W_down[BD.IO_IS_READ, unit] = 10.0 / S  # ≈5.0 when active
+    unit += 1
+
+
+def _set_conversational_io_relay_heads(attn, S, BD, HD):
+    """L6 attention heads 6-7: relay IO_IS_PRTF and IO_IS_READ from AX → SE.
+
+    Head 6: Relay IO_IS_PRTF
+    - Q: NEXT_SE (query at SE position)
+    - K: MARK_AX (attend to AX marker)
+    - V: copy IO_IS_PRTF
+    - O: write to CMP[3]
+
+    Head 7: Relay IO_IS_READ
+    - Q: NEXT_SE (query at SE position)
+    - K: MARK_AX (attend to AX marker)
+    - V: copy IO_IS_READ
+    - O: write to TEMP[0]
+
+    Uses steep ALiBi slope (5.0) for both heads to overcome distance penalty.
+    """
+    L = 50.0
+
+    # Head 6: PRTF relay
+    base = 6 * HD
+    attn.W_q[base, BD.NEXT_SE] = L
+    attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
+    attn.W_k[base, BD.MARK_AX] = L
+    attn.W_v[base + 1, BD.IO_IS_PRTF] = 1.0
+    attn.W_o[BD.CMP + 3, base + 1] = 1.0
+
+    # Head 7: READ relay
+    base = 7 * HD
+    attn.W_q[base, BD.NEXT_SE] = L
+    attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
+    attn.W_k[base, BD.MARK_AX] = L
+    attn.W_v[base + 1, BD.IO_IS_READ] = 1.0
+    attn.W_o[BD.TEMP + 0, base + 1] = 1.0
+
+
+def _set_conversational_io_state_machine(ffn, S, BD):
+    """L6 FFN addition: Start conversational I/O sequence when PRTF/READ detected.
+
+    State transitions:
+    1. Normal execution (IO_STATE=0)
+    2. PRTF/READ detected → set NEXT_THINKING_END, IO_STATE=1
+    3. After THINKING_END → generate output, IO_STATE=2
+    4. After output complete → set NEXT_THINKING_START, IO_STATE=3
+    5. After THINKING_START → resume normal, IO_STATE=0
+
+    For now, we implement step 2: detect PRTF → start sequence.
+    Steps 3-5 will be added in L13 FFN (state tracking across generation steps).
+
+    Condition: CMP[3] (PRTF flag) AND NEXT_SE
+    - Set NEXT_THINKING_END (emit </thinking> token)
+    - Clear NEXT_SE (suppress STEP_END)
+    - Set IO_STATE = 1 (begin I/O sequence)
+
+    Starts at unit 840 to avoid conflict with tool_call_detection (unit 830).
+    """
+    unit = 840
+
+    # PRTF triggers thinking end
+    ffn.W_up[unit, BD.CMP + 3] = S  # PRTF flag from relay head
+    ffn.W_up[unit, BD.NEXT_SE] = S
+    ffn.b_up[unit] = -S * 3.0  # threshold: need both active
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.NEXT_THINKING_END, unit] = 2.0 / S  # emit THINKING_END
+    ffn.W_down[BD.NEXT_SE, unit] = -2.0 / S  # suppress STEP_END
+    ffn.W_down[BD.IO_STATE, unit] = 2.0 / S  # set IO_STATE = 1
+    unit += 1
+
+    # READ triggers thinking end (similar pattern)
+    ffn.W_up[unit, BD.TEMP + 0] = S  # READ flag from relay head
+    ffn.W_up[unit, BD.NEXT_SE] = S
+    ffn.b_up[unit] = -S * 3.0
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.NEXT_THINKING_END, unit] = 2.0 / S
+    ffn.W_down[BD.NEXT_SE, unit] = -2.0 / S
+    ffn.W_down[BD.IO_STATE, unit] = 2.0 / S
+    unit += 1
+
+
+def _set_lookback_detection_head(attn, S, BD, HD):
+    """L2 attention head 1: Detect previous token type for conversational I/O.
+
+    Looks back at t-1 to detect:
+    - THINKING_START (token 272, has TEMP+1 embedding)
+    - THINKING_END (token 273, has TEMP+2 embedding)
+    - Byte (tokens 0-255, have IS_BYTE embedding)
+
+    Q: CONST (always query from current position)
+    K: CONST (attend to all previous positions, ALiBi will favor t-1)
+    V: Copy markers (TEMP+1, TEMP+2, IS_BYTE)
+    O: Write to lookback flags (LAST_WAS_THINKING_START, etc.)
+
+    With ALiBi slope = 10.0, the most recent token (t-1) will have highest score.
+    """
+    L = 20.0
+    base = 1 * HD  # head 1
+
+    # Q: active at all positions (CONST)
+    attn.W_q[base, BD.CONST] = L
+
+    # K: match all positions (CONST)
+    attn.W_k[base, BD.CONST] = L
+
+    # V: copy markers from previous token
+    attn.W_v[base + 1, BD.TEMP + 1] = 1.0  # THINKING_START marker
+    attn.W_v[base + 2, BD.TEMP + 2] = 1.0  # THINKING_END marker
+    attn.W_v[base + 3, BD.IS_BYTE] = 1.0  # Byte marker
+
+    # O: write to lookback flags
+    attn.W_o[BD.LAST_WAS_THINKING_START, base + 1] = 1.0
+    attn.W_o[BD.LAST_WAS_THINKING_END, base + 2] = 1.0
+    attn.W_o[BD.LAST_WAS_BYTE, base + 3] = 1.0
+
+
+def _set_conversational_io_state_init(ffn, S, BD):
+    """L3 FFN addition: Initialize output mode when LAST_WAS_THINKING_END detected.
+
+    When previous token was THINKING_END:
+    - Set IO_IN_OUTPUT_MODE = 1 (enter output mode)
+    - Initialize IO_FORMAT_POS = 0 (start at beginning of format string)
+
+    This prepares the model to start emitting output bytes from the format string.
+
+    Starts at unit 500 to avoid conflicts with existing L3 FFN logic.
+    """
+    unit = 500
+
+    # Detect LAST_WAS_THINKING_END and activate output mode
+    ffn.W_up[unit, BD.LAST_WAS_THINKING_END] = S
+    ffn.b_up[unit] = -S * 0.5  # threshold: LAST_WAS_THINKING_END ≈ 1.0
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.IO_IN_OUTPUT_MODE, unit] = 2.0 / S  # set flag
+    unit += 1
+
+    # Initialize format position to 0 (nibble encoding: all nibbles zero except set [0]=1)
+    # Actually, we want FORMAT_POS to START at 0, which means all nibbles are 0.
+    # The position will be incremented AFTER fetching each byte.
+    # So we don't need to explicitly set it to 0 here (it defaults to 0).
+    # We'll handle increment in L8 FFN.
+
+
+def _set_format_pointer_extraction(attn, S, BD, HD):
+    """L7 attention: Extract format string pointer from STACK0 when entering output mode.
+
+    When IO_IN_OUTPUT_MODE just activated (after THINKING_END):
+    - Attend back to previous step's STACK0 marker position
+    - Copy EMBED_LO and EMBED_HI (format string pointer byte 0)
+    - Write to FORMAT_PTR_LO and FORMAT_PTR_HI
+
+    For simplicity, we only extract byte 0 of the pointer, supporting format
+    strings at addresses < 256. Full 32-bit pointer extraction requires
+    gathering all 4 STACK0 bytes, which is more complex.
+
+    Uses Head 7 (last available head in L7).
+    """
+    L = 20.0
+    base = 7 * HD  # head 7
+
+    # Q: active when IO_IN_OUTPUT_MODE (just entered output mode)
+    attn.W_q[base, BD.IO_IN_OUTPUT_MODE] = L
+
+    # K: match STACK0 marker from previous step
+    attn.W_k[base, BD.MARK_STACK0] = L
+
+    # V: copy EMBED_LO and EMBED_HI (pointer byte 0)
+    for k in range(16):
+        attn.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
+        attn.W_v[base + 17 + k, BD.EMBED_HI + k] = 1.0
+
+    # O: write to FORMAT_PTR_LO and FORMAT_PTR_HI
+    # Note: FORMAT_PTR_LO is defined as a range (467-482) for 16 nibbles
+    # but we only use the first 16 dims for lo nibble
+    for k in range(16):
+        attn.W_o[BD.FORMAT_PTR_LO + k, base + 1 + k] = 1.0
+        attn.W_o[BD.FORMAT_PTR_HI + k, base + 17 + k] = 1.0
+
+
+def _set_format_position_counter(ffn, S, BD):
+    """L8 FFN addition: Increment format string position counter.
+
+    When LAST_WAS_BYTE AND IO_IN_OUTPUT_MODE (just emitted output byte):
+    - Increment IO_FORMAT_POS by 1
+    - Uses nibble arithmetic (same pattern as PC increment)
+
+    IO_FORMAT_POS starts at 0 and increments after each byte emission.
+    For now, we only support single-nibble positions (0-15), which is
+    enough for format strings up to 15 bytes.
+
+    Starts at unit 600 to avoid conflicts with existing L8 FFN logic.
+    """
+    unit = 600
+
+    # Detect: just emitted a byte (LAST_WAS_BYTE AND IO_IN_OUTPUT_MODE)
+    # Increment IO_FORMAT_POS lo nibble by 1
+    # Pattern: rotate nibble by +1 (k → (k+1)%16)
+    for k in range(16):
+        next_k = (k + 1) % 16
+        ffn.W_up[unit, BD.LAST_WAS_BYTE] = S
+        ffn.W_up[unit, BD.IO_IN_OUTPUT_MODE] = S
+        ffn.b_up[unit] = -S * 1.5  # need both active
+        ffn.W_gate[unit, BD.IO_FORMAT_POS + k] = 1.0  # current position = k
+        ffn.W_down[BD.IO_FORMAT_POS + k, unit] = -2.0 / S  # clear old
+        ffn.W_down[BD.IO_FORMAT_POS + next_k, unit] = 2.0 / S  # set new
+        unit += 1
+
+
+def _set_format_string_fetch_head(attn, S, BD, HD):
+    """L9 attention head: Fetch byte from format string at FORMAT_PTR + FORMAT_POS.
+
+    Similar to L5 code fetch, but queries memory at FORMAT_PTR + FORMAT_POS.
+    When IO_IN_OUTPUT_MODE:
+    - Q: FORMAT_PTR_LO/HI + FORMAT_POS (address to fetch)
+    - K: ADDR_KEY (memory address keys)
+    - V: EMBED_LO/HI (byte value at that address)
+    - O: OUTPUT_BYTE_LO/HI (byte to emit)
+
+    For simplicity, FORMAT_PTR only uses byte 0 (addresses < 256) and
+    FORMAT_POS is a single nibble (positions 0-15).
+
+    Uses Head 0 in L9.
+    """
+    L = 15.0
+    base = 0 * HD  # head 0
+
+    # Q: active when in output mode, query = FORMAT_PTR + FORMAT_POS
+    attn.W_q[base, BD.IO_IN_OUTPUT_MODE] = L
+    # Query nibbles: FORMAT_PTR_LO + FORMAT_POS
+    # For addresses < 256, we have lo nibble = (PTR_lo + POS) % 16, hi nibble = PTR_hi
+    # But addition is complex... let's simplify: just use FORMAT_PTR for now
+    # and ignore FORMAT_POS (always fetch byte 0). We'll fix this later.
+    for k in range(16):
+        attn.W_q[base + 1 + k, BD.FORMAT_PTR_LO + k] = 1.0
+        attn.W_q[base + 17 + k, BD.FORMAT_PTR_HI + k] = 1.0
+
+    # K: match ADDR_KEY (address keys in memory/data section)
+    for k in range(16):
+        attn.W_k[base + 1 + k, BD.ADDR_KEY + k] = L  # lo nibble
+        attn.W_k[base + 17 + k, BD.ADDR_KEY + 16 + k] = L  # hi nibble
+
+    # V: copy byte value (EMBED_LO/HI)
+    for k in range(16):
+        attn.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
+        attn.W_v[base + 17 + k, BD.EMBED_HI + k] = 1.0
+
+    # O: write to OUTPUT_BYTE_LO/HI
+    for k in range(16):
+        attn.W_o[BD.OUTPUT_BYTE_LO + k, base + 1 + k] = 1.0
+        attn.W_o[BD.OUTPUT_BYTE_HI + k, base + 17 + k] = 1.0
+
+
+def _set_null_terminator_detection(ffn, S, BD):
+    """L10 FFN addition: Detect null terminator (byte = 0) in output.
+
+    When IO_IN_OUTPUT_MODE AND OUTPUT_BYTE == 0 (all nibbles zero):
+    - Set IO_OUTPUT_COMPLETE = 1 (format string done)
+    - Clear IO_IN_OUTPUT_MODE (exit output mode)
+    - Set NEXT_THINKING_START (emit THINKING_START next)
+
+    This detects the end of the format string and prepares to resume normal execution.
+
+    Starts at unit 700 to avoid conflicts with existing L10 FFN logic.
+    """
+    unit = 700
+
+    # Detect null byte: OUTPUT_BYTE_LO[0] AND OUTPUT_BYTE_HI[0] (both nibbles = 0)
+    # AND IO_IN_OUTPUT_MODE (currently in output mode)
+    ffn.W_up[unit, BD.OUTPUT_BYTE_LO] = S  # lo nibble [0] = 1
+    ffn.W_up[unit, BD.OUTPUT_BYTE_HI] = S  # hi nibble [0] = 1
+    ffn.W_up[unit, BD.IO_IN_OUTPUT_MODE] = S
+    ffn.b_up[unit] = -S * 2.5  # need all three active
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.IO_OUTPUT_COMPLETE, unit] = 2.0 / S  # set complete flag
+    ffn.W_down[BD.IO_IN_OUTPUT_MODE, unit] = -2.0 / S  # clear output mode
+    ffn.W_down[BD.NEXT_THINKING_START, unit] = 2.0 / S  # emit THINKING_START
+    unit += 1
+
+
+def _set_conversational_io_output_routing(ffn, S, BD):
+    """L15 FFN addition: Route OUTPUT_BYTE to OUTPUT when in output mode.
+
+    When IO_IN_OUTPUT_MODE (emitting output bytes):
+    - Copy OUTPUT_BYTE_LO → OUTPUT_LO (all 16 nibbles)
+    - Copy OUTPUT_BYTE_HI → OUTPUT_HI (all 16 nibbles)
+
+    This routes the fetched format string byte to the output head for emission.
+
+    Note: We don't need to suppress normal OUTPUT routing because IO_IN_OUTPUT_MODE
+    only activates after THINKING_END, at which point we're not in the normal
+    35-token generation cycle.
+
+    Starts at unit 800 to avoid conflicts with existing L15 FFN logic (nibble copy).
+    """
+    unit = 800
+
+    # Copy each OUTPUT_BYTE nibble to corresponding OUTPUT nibble when in output mode
+    for k in range(16):
+        # Lo nibble
+        ffn.W_up[unit, BD.IO_IN_OUTPUT_MODE] = S
+        ffn.b_up[unit] = -S * 0.5
+        ffn.W_gate[unit, BD.OUTPUT_BYTE_LO + k] = 1.0
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+        unit += 1
+
+        # Hi nibble
+        ffn.W_up[unit, BD.IO_IN_OUTPUT_MODE] = S
+        ffn.b_up[unit] = -S * 0.5
+        ffn.W_gate[unit, BD.OUTPUT_BYTE_HI + k] = 1.0
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+        unit += 1
+
+
+# =============================================================================
 # Binary Pop SP Increment (SP += 8 for all binary pop ops)
 # =============================================================================
 
@@ -5300,35 +5805,26 @@ def _set_function_call_weights(model, S, BD, HD):
     # =====================================================================
     unit = 850
 
-    # --- LEA AX_CARRY override (32 units: 850-881) ---
-    # At AX marker when OP_LEA: copy all FETCH nibbles to AX_CARRY (overwriting contamination).
-    # FETCH is one-hot encoded, so we copy all 16 nibbles without selective gating.
-    # The ADD circuitry in L8/L9 then computes AX_CARRY + ALU = FETCH + BP.
-    # OP_LEA ≈ 2.4, MARK_AX ≈ 1.0, so sum = 3.4. Use T_lea = 2.5.
-    T_lea = 2.5
-    for k in range(16):
-        ffn6.W_up[unit, BD.OP_LEA] = S
-        ffn6.W_up[unit, BD.MARK_AX] = S
-        ffn6.b_up[unit] = -S * T_lea
-        ffn6.W_gate[unit, BD.FETCH_LO + k] = 1.0
-        # Write to ALL AX_CARRY_LO positions (FETCH one-hot distributes across outputs)
-        for j in range(16):
-            if k == j:
-                ffn6.W_down[BD.AX_CARRY_LO + j, unit] = 2.0 / S
-            else:
-                ffn6.W_down[BD.AX_CARRY_LO + j, unit] = -2.0 / S  # cancel residual
-        unit += 1
-    for k in range(16):
-        ffn6.W_up[unit, BD.OP_LEA] = S
-        ffn6.W_up[unit, BD.MARK_AX] = S
-        ffn6.b_up[unit] = -S * T_lea
-        ffn6.W_gate[unit, BD.FETCH_HI + k] = 1.0
-        for j in range(16):
-            if k == j:
-                ffn6.W_down[BD.AX_CARRY_HI + j, unit] = 2.0 / S
-            else:
-                ffn6.W_down[BD.AX_CARRY_HI + j, unit] = -2.0 / S
-        unit += 1
+    # --- LEA first-step: Initialize ALU with BP default (2 units: 850-851) ---
+    # For first step, set ALU = BP_default = 0x00010000, byte 0 = 0x00
+    # Gate on: OP_LEA + MARK_AX + NOT HAS_SE
+    # Subsequent steps use Layer 7 attention relay from BP marker.
+    ffn6.W_up[unit, BD.OP_LEA] = S
+    ffn6.W_up[unit, BD.MARK_AX] = S
+    ffn6.W_up[unit, BD.HAS_SE] = -S
+    ffn6.b_up[unit] = -S * 1.5  # OP_LEA(~2.4) + MARK_AX(1) - HAS_SE(0) = 3.4 > 1.5
+    ffn6.b_gate[unit] = 1.0
+    ffn6.W_down[BD.ALU_LO + 0, unit] = 2.0 / S  # nibble 0
+    unit += 1
+    ffn6.W_up[unit, BD.OP_LEA] = S
+    ffn6.W_up[unit, BD.MARK_AX] = S
+    ffn6.W_up[unit, BD.HAS_SE] = -S
+    ffn6.b_up[unit] = -S * 1.5
+    ffn6.b_gate[unit] = 1.0
+    ffn6.W_down[BD.ALU_HI + 0, unit] = 2.0 / S  # nibble 0
+    unit += 1
+    # Units 852-881 unused (reserved)
+    unit += 30
 
     # --- JSR SP -= 8 (32 units: 882-913) ---
     # Same pattern as PSH SP-=8 but gated on CMP[4] (JSR relay).

@@ -41,7 +41,7 @@ class C4Config:
     n_heads: int = 8
     ffn_hidden: int = 4096
     max_seq_len: int = 4096
-    vocab_size: int = 274  # Token.VOCAB_SIZE (includes THINKING_START/END)
+    vocab_size: int = 276  # Token.VOCAB_SIZE (includes thinking tags and I/O state tokens)
     device: str = "cpu"
 
 

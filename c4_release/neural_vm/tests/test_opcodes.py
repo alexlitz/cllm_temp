@@ -738,9 +738,9 @@ class TestModelArchitecture(unittest.TestCase):
     def test_vocab_size(self):
         self.assertEqual(self.model.vocab_size, Token.VOCAB_SIZE)
 
-    def test_vocab_size_is_274(self):
-        """Vocab size is 274: 256 bytes + 18 special tokens (includes THINKING_START/END)."""
-        self.assertEqual(Token.VOCAB_SIZE, 274)
+    def test_vocab_size_is_276(self):
+        """Vocab size is 276: 256 bytes + 20 special tokens (includes thinking tags and I/O state)."""
+        self.assertEqual(Token.VOCAB_SIZE, 276)
 
     def test_step_tokens_is_35(self):
         self.assertEqual(Token.STEP_TOKENS, 35)

@@ -64,23 +64,69 @@ runner = AutoregressiveVMRunner(conversational_io=True)
 
 ---
 
-## 🔄 In Progress (Phase 2: Weight Implementation)
+## ✅ Completed (Phase 2a: Output Layer Infrastructure)
+
+### Thinking Token Infrastructure
+**Status:** ✅ Complete
+
+#### Added Dimension Indices
+- `NEXT_THINKING_START` (324) - Flag to generate `<thinking>` token
+- `NEXT_THINKING_END` (325) - Flag to generate `</thinking>` token
+
+**Files Modified:**
+- `neural_vm/vm_step.py` - Added dimension indices in `_SetDim` class
+
+#### Output Head Routing
+- Added THINKING_START and THINKING_END to next_flags list
+- Added routing logic: When NEXT_THINKING_START/END flags active → emit thinking tokens
+- Suppresses byte logits when thinking flags active
+
+**Code:**
+```python
+for tok, flag in [
+    ...
+    (Token.THINKING_START, BD.NEXT_THINKING_START),
+    (Token.THINKING_END, BD.NEXT_THINKING_END),
+]:
+    head.weight[tok, flag] = 20.0
+    head.bias[tok] = -10.0
+```
+
+#### Token Embeddings
+- Added embeddings for THINKING_START and THINKING_END
+- Marked as IS_MARK (general markers)
+- NOT marked as MARK_SE (not step-end markers)
+- Can appear anywhere in token stream
+
+**Verification:**
+- All 100 quick tests still passing
+- No regressions
+- Infrastructure ready for weight implementation
+
+---
+
+## 🔄 In Progress (Phase 2b: Weight Implementation)
 
 ### Next Steps:
 
-**1. Design L15 Output Layer Modifications**
-- Detect I/O opcodes (PRTF, PUTCHAR, READ, GETCHAR)
-- Generate thinking tags around I/O operations
-- Route to appropriate generation path
+**1. Design I/O Opcode Detection Logic**
+- Detect when PC points to PRTF/PUTCHAR/READ/GETCHAR
+- Extract opcode from current instruction
+- Set flags to trigger thinking tag generation
 
-**2. Implement Output Generation (Printf/Putchar)**
+**2. Implement Thinking Flag Setting Weights**
+- When PRTF detected: Set NEXT_THINKING_END before output
+- After output generated: Set NEXT_THINKING_START
+- Continue with normal STEP_END
+
+**3. Implement Output Generation (Printf/Putchar)**
 - Generate `THINKING_END` token when PRTF/PUTCHAR detected
 - Extract output content from AX or format string
 - Generate output bytes autoregressively
 - Generate `THINKING_START` token to resume execution
 - Continue with normal VM step generation
 
-**3. Implement Input Extraction (Read/Getchar)**
+**4. Implement Input Extraction (Read/Getchar)**
 - Attend back to `USER_INPUT_START`/`USER_INPUT_END` section
 - Extract next byte from user input
 - Track position in input stream
@@ -173,10 +219,14 @@ Model: <generates next VM step>
 | Token additions | ✅ Complete | THINKING_START/END added |
 | Vocab size update | ✅ Complete | 272 → 274 |
 | Mode flag | ✅ Complete | conversational_io parameter |
+| Dimension indices | ✅ Complete | NEXT_THINKING_START/END added |
+| Output head routing | ✅ Complete | Thinking tokens can be generated |
+| Token embeddings | ✅ Complete | THINKING_START/END embedded |
 | Tests passing | ✅ Complete | 100/100 quick tests |
-| Weight design | ⏳ Next | L15 output layer |
-| Output generation | ⏳ Pending | Printf/putchar |
-| Input extraction | ⏳ Pending | Read/getchar |
+| I/O opcode detection | ⏳ Next | Detect PRTF/PUTCHAR/READ/GETCHAR |
+| Thinking flag weights | ⏳ Next | Set flags when I/O detected |
+| Output generation | ⏳ Pending | Printf/putchar logic |
+| Input extraction | ⏳ Pending | Read/getchar logic |
 | Integration testing | ⏳ Pending | End-to-end tests |
 
 ---
@@ -186,10 +236,13 @@ Model: <generates next VM step>
 | Phase | Effort | Status |
 |-------|--------|--------|
 | Foundation (tokens, flags) | 2-3 hours | ✅ Complete |
-| Weight implementation | 8-12 hours | ⏳ Next |
+| Output layer infrastructure | 1-2 hours | ✅ Complete |
+| I/O detection weights | 3-4 hours | ⏳ Next |
+| Output generation weights | 4-6 hours | ⏳ Pending |
+| Input extraction weights | 3-4 hours | ⏳ Pending |
 | Runner integration | 2-3 hours | ⏳ Pending |
 | Testing | 3-4 hours | ⏳ Pending |
-| **Total** | **15-22 hours** | **~20% done** |
+| **Total** | **18-26 hours** | **~30% done** |
 
 ---
 

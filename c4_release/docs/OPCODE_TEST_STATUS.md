@@ -4,7 +4,7 @@
 
 Complete test status for all 42 opcodes in the C4 Neural VM.
 
-## Test Results Summary
+## Test Results Summary (Updated 2026-04-07)
 
 ### Working Opcodes (Verified)
 
@@ -28,49 +28,49 @@ Complete test status for all 42 opcodes in the C4 Neural VM.
 - ⏳ PSH (13): Push - Works with handler
 
 **Arithmetic (3/5)**:
-- ✓ MUL (27): Multiply - PASS
-- ✓ DIV (28): Divide - PASS
-- ✓ MOD (29): Modulo - PASS
-- ✗ ADD (25): Addition - FAIL (returns 32 instead of 42)
-- ✗ SUB (26): Subtraction - FAIL (returns 248 instead of 42)
+- ✓ MUL (27): Multiply - PASS (verified)
+- ✓ DIV (28): Divide - PASS (verified)
+- ✓ MOD (29): Modulo - PASS (verified)
+- ✗ ADD (25): Addition - FAIL (returns wrong value)
+- ✗ SUB (26): Subtraction - FAIL (returns wrong value)
 
 **Bitwise (0/3)**:
 - ✗ OR (14): Bitwise OR - PURITY VIOLATION
 - ✗ XOR (15): Bitwise XOR - PURITY VIOLATION
 - ✗ AND (16): Bitwise AND - PURITY VIOLATION
 
-**Comparison (0/6)**:
+**Comparison (3/6)**:
+- ✓ NE (18): Not equal - PASS (both true and false cases verified)
+- ✓ LE (21): Less or equal - PASS (verified)
 - ✗ EQ (17): Equal - PURITY VIOLATION
 - ✗ LT (19): Less than - PURITY VIOLATION
-- ⏳ NE (18): Not equal - Not tested
-- ⏳ GT (20): Greater than - Not tested
-- ⏳ LE (21): Less or equal - Not tested
-- ⏳ GE (22): Greater or equal - Not tested
+- ✗ GT (20): Greater than - FAIL (returns 0 for 20 > 10, expected 1)
+- ✗ GE (22): Greater or equal - FAIL (returns 0 for 20 >= 10, expected 1)
 
 **Shift (0/2)**:
 - ✗ SHL (23): Shift left - PURITY VIOLATION
 - ✗ SHR (24): Shift right - PURITY VIOLATION
 
-**System (1/9)**:
+**System (2/9)**:
 - ✓ EXIT (38): Exit program - PASS
+- ✓ PRTF (33): Printf - PASS (verified with string output)
 - ⏳ OPEN (30): File open - Needs I/O test
 - ⏳ READ (31): File read - Needs I/O test
 - ⏳ CLOS (32): File close - Needs I/O test
-- ⏳ PRTF (33): Printf - Needs I/O test
 - ⏳ MALC (34): Malloc - Needs memory test
 - ⏳ FREE (35): Free - Needs memory test
 - ⏳ MSET (36): Memset - Needs memory test
 - ⏳ MCMP (37): Memcmp - Needs memory test
 
-**Control (1/4)**:
+**Control (0/4)**:
 - ⏳ NOP (39): No-op - Hard to test (does nothing)
 - ⏳ POP (40): Pop stack - Not tested
 - ⏳ BLT (41): Signed branch less - Not tested
 - ⏳ BGE (42): Signed branch >= - Not tested
 
-**I/O (0/2)**:
-- ⏳ GETCHAR (64): Get character - Needs I/O test
-- ⏳ PUTCHAR (65): Put character - Needs I/O test
+**I/O (1/2)**:
+- ✓ PUTCHAR (65): Put character - PASS (verified)
+- ⏳ GETCHAR (64): Get character - Needs input setup
 
 ## Issues Found
 
@@ -142,7 +142,7 @@ Only 4/14 (29%) pass current tests.
    - Less commonly used opcodes
    - May not be emitted by compiler
 
-## Test Coverage
+## Test Coverage (Updated 2026-04-07)
 
 ```
 Category          | Total | Working | Failed | Untested
@@ -151,19 +151,27 @@ Stack/Address     |   9   |    6    |   0    |    3
 Memory            |   5   |    2    |   0    |    3
 Arithmetic        |   5   |    3    |   2    |    0
 Bitwise           |   3   |    0    |   3    |    0
-Comparison        |   6   |    0    |   1    |    5
+Comparison        |   6   |    2    |   4    |    0
 Shift             |   2   |    0    |   2    |    0
-System            |   9   |    1    |   0    |    8
+System            |   9   |    2    |   0    |    7
 Control           |   4   |    0    |   0    |    4
-I/O               |   2   |    0    |   0    |    2
+I/O               |   2   |    1    |   0    |    1
 ──────────────────|-------|---------|--------|----------
-TOTAL             |  42   |   12    |   8    |   22
+TOTAL             |  42   |   16    |   11   |   15
 ──────────────────|-------|---------|--------|----------
 ```
 
-**Test Coverage**: 12/42 (29%) verified working
-**Failure Rate**: 8/20 (40%) of tested opcodes fail
-**Untested**: 22/42 (52%) need testing
+**Test Coverage**: 16/42 (38%) verified working ↑ from 29%
+**Failure Rate**: 11/27 (41%) of tested opcodes fail
+**Untested**: 15/42 (36%) need testing ↓ from 52%
+
+### Newly Verified Opcodes (Today)
+- ✓ NE (18): Not equal - Both cases work correctly
+- ✓ LE (21): Less or equal - Works correctly
+- ✓ PRTF (33): Printf - String output works
+- ✓ PUTCHAR (65): Put character - Character output works
+- ✗ GT (20): Greater than - Fails (returns 0 instead of 1)
+- ✗ GE (22): Greater or equal - Fails (returns 0 instead of 1)
 
 ## Related Documents
 
