@@ -1691,12 +1691,13 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     if enable_conversational_io:
         # L5 FFN: decode PRTF/READ → IO_IS_PRTF, IO_IS_READ at AX marker
         _set_conversational_io_opcode_decode(ffn5, S, BD)
-        # L6 attention heads 6-7: relay IO_IS_PRTF, IO_IS_READ from AX → SE
+        # L6 attention heads 4-5: relay IO_IS_PRTF, IO_IS_READ from AX → SE
+        # Changed from heads 6-7 to avoid conflict with _set_opcode_relay_head (head 6)
         if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
-            attn6.alibi_slopes[6] = 5.0  # steep ALiBi for head 6
-            attn6.alibi_slopes[7] = 5.0  # steep ALiBi for head 7
+            attn6.alibi_slopes[4] = 5.0  # steep ALiBi for head 4 (PRTF relay)
+            attn6.alibi_slopes[5] = 5.0  # steep ALiBi for head 5 (READ relay)
         _set_conversational_io_relay_heads(attn6, S, BD, HD)
-        # L6 FFN: CMP[3]/TEMP[0] AND NEXT_SE → NEXT_THINKING_END (start I/O sequence)
+        # L6 FFN: CMP[5]/CMP[6] AND NEXT_SE → NEXT_THINKING_END (start I/O sequence)
         _set_conversational_io_state_machine(ffn6, S, BD)
 
     # ===== LAYER 7: Operand gather + memory relay heads =====
@@ -5560,39 +5561,42 @@ def _set_conversational_io_opcode_decode(ffn, S, BD):
 
 
 def _set_conversational_io_relay_heads(attn, S, BD, HD):
-    """L6 attention heads 6-7: relay IO_IS_PRTF and IO_IS_READ from AX → SE.
+    """L6 attention heads 4-5: relay IO_IS_PRTF and IO_IS_READ from AX → SE.
 
-    Head 6: Relay IO_IS_PRTF
+    IMPORTANT: Changed from heads 6-7 to heads 4-5 to avoid conflict with
+    _set_opcode_relay_head() which uses head 6 for PSH/ADJ/pop relay.
+
+    Head 4: Relay IO_IS_PRTF
     - Q: NEXT_SE (query at SE position)
     - K: MARK_AX (attend to AX marker)
     - V: copy IO_IS_PRTF
-    - O: write to CMP[3]
+    - O: write to CMP + 5 (changed from CMP[3] to avoid pop group conflict)
 
-    Head 7: Relay IO_IS_READ
+    Head 5: Relay IO_IS_READ
     - Q: NEXT_SE (query at SE position)
     - K: MARK_AX (attend to AX marker)
     - V: copy IO_IS_READ
-    - O: write to TEMP[0]
+    - O: write to CMP + 6 (changed from TEMP[0] to use dedicated CMP slot)
 
     Uses steep ALiBi slope (5.0) for both heads to overcome distance penalty.
     """
     L = 50.0
 
-    # Head 6: PRTF relay
-    base = 6 * HD
+    # Head 4: PRTF relay
+    base = 4 * HD
     attn.W_q[base, BD.NEXT_SE] = L
     attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
     attn.W_k[base, BD.MARK_AX] = L
     attn.W_v[base + 1, BD.IO_IS_PRTF] = 1.0
-    attn.W_o[BD.CMP + 3, base + 1] = 1.0
+    attn.W_o[BD.CMP + 5, base + 1] = 1.0  # Use CMP[5] instead of CMP[3]
 
-    # Head 7: READ relay
-    base = 7 * HD
+    # Head 5: READ relay
+    base = 5 * HD
     attn.W_q[base, BD.NEXT_SE] = L
     attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
     attn.W_k[base, BD.MARK_AX] = L
     attn.W_v[base + 1, BD.IO_IS_READ] = 1.0
-    attn.W_o[BD.TEMP + 0, base + 1] = 1.0
+    attn.W_o[BD.CMP + 6, base + 1] = 1.0  # Use CMP[6] instead of TEMP[0]
 
 
 def _set_conversational_io_state_machine(ffn, S, BD):
@@ -5608,17 +5612,20 @@ def _set_conversational_io_state_machine(ffn, S, BD):
     For now, we implement step 2: detect PRTF → start sequence.
     Steps 3-5 will be added in L13 FFN (state tracking across generation steps).
 
-    Condition: CMP[3] (PRTF flag) AND NEXT_SE
+    Condition: CMP[5] (PRTF flag) AND NEXT_SE
     - Set NEXT_THINKING_END (emit </thinking> token)
     - Clear NEXT_SE (suppress STEP_END)
     - Set IO_STATE = 1 (begin I/O sequence)
+
+    IMPORTANT: Changed from CMP[3] to CMP[5] and TEMP[0] to CMP[6] to avoid
+    conflicts with _set_opcode_relay_head() which uses CMP[3] for pop group.
 
     Starts at unit 840 to avoid conflict with tool_call_detection (unit 830).
     """
     unit = 840
 
     # PRTF triggers thinking end
-    ffn.W_up[unit, BD.CMP + 3] = S  # PRTF flag from relay head
+    ffn.W_up[unit, BD.CMP + 5] = S  # PRTF flag from relay head (changed from CMP[3])
     ffn.W_up[unit, BD.NEXT_SE] = S
     ffn.b_up[unit] = -S * 3.0  # threshold: need both active
     ffn.b_gate[unit] = 1.0
@@ -5628,7 +5635,7 @@ def _set_conversational_io_state_machine(ffn, S, BD):
     unit += 1
 
     # READ triggers thinking end (similar pattern)
-    ffn.W_up[unit, BD.TEMP + 0] = S  # READ flag from relay head
+    ffn.W_up[unit, BD.CMP + 6] = S  # READ flag from relay head (changed from TEMP[0])
     ffn.W_up[unit, BD.NEXT_SE] = S
     ffn.b_up[unit] = -S * 3.0
     ffn.b_gate[unit] = 1.0

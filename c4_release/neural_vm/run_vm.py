@@ -317,7 +317,7 @@ class AutoregressiveVMRunner:
                 print(f"[HYBRID] THINKING_END detected at step {step_num}, context len={len(context)}")
                 # Extract format string pointer from STACK0
                 fmt_ptr = self._extract_register(context, Token.STACK0)
-                print(f"[HYBRID] Format string pointer: 0x{fmt_ptr:08x if fmt_ptr else 0}")
+                print(f"[HYBRID] Format string pointer: 0x{fmt_ptr:08x}" if fmt_ptr else "[HYBRID] Format string pointer: 0x00000000")
                 if fmt_ptr is not None:
                     # Read format string from memory
                     fmt_str = []
