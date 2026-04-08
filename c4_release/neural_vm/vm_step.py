@@ -80,31 +80,104 @@ class Token:
 
 
 class AutoregressiveAttention(nn.Module):
-    """Multi-head attention with softmax1 (ZFOD) and ALiBi positional bias.
+    """Multi-head attention with softmax1 (ZFOD) and ALiBi/RoPE positional encoding.
 
     NOT a PureAttention subclass — PureAttention.forward() is FINAL and uses
     F.softmax. This class uses softmax1 for zero-fill-on-demand semantics
-    and adds ALiBi bias for recency/latest-write-wins.
+    and supports both ALiBi and RoPE positional encodings via config.
     """
 
-    def __init__(self, dim, num_heads=4, max_seq_len=4096):
+    def __init__(self, dim, num_heads=4, max_seq_len=4096, layer_idx=None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
         self.max_seq_len = max_seq_len
+        self.layer_idx = layer_idx
 
         self.W_q = nn.Parameter(torch.zeros(dim, dim))
         self.W_k = nn.Parameter(torch.zeros(dim, dim))
         self.W_v = nn.Parameter(torch.zeros(dim, dim))
         self.W_o = nn.Parameter(torch.zeros(dim, dim))
 
-        # ALiBi slopes: geometric sequence 2^(-8/n * (i+1)) for each head
-        slopes = torch.tensor(
-            [2.0 ** (-8.0 / num_heads * (i + 1)) for i in range(num_heads)]
+        # Determine positional encoding for this layer
+        try:
+            from .config import get_config
+            config = get_config()
+
+            # Hybrid mode: L0-L2 use ALiBi, rest use RoPE
+            if config.positional_encoding == "hybrid" and layer_idx is not None and layer_idx < 3:
+                self._positional_encoding = "alibi"
+            else:
+                self._positional_encoding = config.positional_encoding
+        except ImportError:
+            # Fallback if config not available (backwards compatibility)
+            self._positional_encoding = "alibi"
+
+        # Initialize ALiBi slopes if using ALiBi (or hybrid mode with layer < 3)
+        use_alibi = (self._positional_encoding == "alibi" or
+                     (self._positional_encoding == "hybrid" and layer_idx is not None and layer_idx < 3))
+        if use_alibi:
+            slopes = torch.tensor(
+                [2.0 ** (-8.0 / num_heads * (i + 1)) for i in range(num_heads)]
+            )
+            self.register_buffer("alibi_slopes", slopes)  # [H]
+        else:
+            self.alibi_slopes = None
+
+        # Initialize RoPE cache if using RoPE (or hybrid mode with layer >= 3)
+        use_rope = (self._positional_encoding == "rope" or
+                    (self._positional_encoding == "hybrid" and layer_idx is not None and layer_idx >= 3))
+        if use_rope:
+            try:
+                from .config import get_config
+                from .base_layers import precompute_rope_cache
+                config = get_config()
+                rope_base = config.rope_base
+            except (ImportError, AttributeError):
+                rope_base = 10000.0
+
+            from .base_layers import precompute_rope_cache
+            cos, sin = precompute_rope_cache(self.head_dim, max_seq_len, base=rope_base)
+            self.register_buffer("_rope_cos", cos)
+            self.register_buffer("_rope_sin", sin)
+        else:
+            self._rope_cos = None
+            self._rope_sin = None
+
+    def _extend_rope_cache(self, new_max_seq_len: int):
+        """Extend RoPE cache to support longer sequences.
+
+        Dynamically extends the cos/sin cache when sequences exceed current max_seq_len.
+        This allows supporting arbitrarily long sequences without pre-allocating huge caches.
+
+        Args:
+            new_max_seq_len: New maximum sequence length to support
+        """
+        if self._rope_cos is None:
+            return  # Not using RoPE
+
+        current_max_len = self._rope_cos.shape[0]
+        if new_max_seq_len <= current_max_len:
+            return  # Already large enough
+
+        # Get RoPE base from config or use default
+        try:
+            from .config import get_config
+            rope_base = get_config().rope_base
+        except (ImportError, AttributeError):
+            rope_base = 10000.0
+
+        # Compute extended cache
+        from .base_layers import precompute_rope_cache
+        cos_new, sin_new = precompute_rope_cache(
+            self.head_dim, new_max_seq_len, base=rope_base, device=self._rope_cos.device
         )
-        self.register_buffer("alibi_slopes", slopes)  # [H]
+
+        # Replace buffers with extended versions
+        self.register_buffer("_rope_cos", cos_new)
+        self.register_buffer("_rope_sin", sin_new)
 
     def sparsify(self):
         """Convert weight matrices to COO sparse format."""
@@ -164,8 +237,9 @@ class AutoregressiveAttention(nn.Module):
         self.register_buffer("_compact_out_idx", out_idx)
         self._is_compact = True
         self.num_heads = len(active_heads)
-        # head_dim stays the same; alibi_slopes shrinks to active heads
-        self.alibi_slopes = self.alibi_slopes[active_heads]
+        # head_dim stays the same; alibi_slopes shrinks to active heads (if present)
+        if self.alibi_slopes is not None:
+            self.alibi_slopes = self.alibi_slopes[active_heads]
 
         # Compact: W_q/K/V[n_out, n_in], W_o[D, n_out]
         self.W_q = nn.Parameter(W_q[out_idx][:, in_idx].contiguous())
@@ -235,17 +309,47 @@ class AutoregressiveAttention(nn.Module):
                 if kv_cache is not None:
                     K, V = kv_cache.update(K, V)
 
+        # Apply RoPE if enabled (check for RoPE cache presence)
+        if self._rope_cos is not None:
+            # Q and K are [B, H, S_q/S_kv, HD]
+            S_q = Q.shape[2]
+            S_kv = K.shape[2]
+
+            # For cached scenarios, queries are at positions [S_kv - S_q, S_kv)
+            # For non-cached scenarios, S_q == S_kv and queries are at [0, S_q)
+            q_offset = S_kv - S_q
+
+            # Dynamically extend RoPE cache if sequence exceeds current cache size
+            # This allows supporting arbitrarily long sequences
+            max_needed = max(S_kv, q_offset + S_q)
+            if max_needed > self._rope_cos.shape[0]:
+                # Extend cache with 50% headroom to reduce frequent reallocations
+                new_max_len = int(max_needed * 1.5)
+                self._extend_rope_cache(new_max_len)
+
+            # Apply RoPE to Q and K
+            from .base_layers import rotate_half
+            cos_q = self._rope_cos[q_offset:q_offset + S_q].unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
+            sin_q = self._rope_sin[q_offset:q_offset + S_q].unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
+            cos_k = self._rope_cos[0:S_kv].unsqueeze(0).unsqueeze(0)  # [1, 1, S_kv, HD]
+            sin_k = self._rope_sin[0:S_kv].unsqueeze(0).unsqueeze(0)  # [1, 1, S_kv, HD]
+
+            Q = (Q * cos_q) + (rotate_half(Q) * sin_q)
+            K = (K * cos_k) + (rotate_half(K) * sin_k)
+
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
-        # ALiBi bias: -slope * |i - j|, computed on-the-fly
+        # ALiBi bias (only if using ALiBi): -slope * |i - j|, computed on-the-fly
         # Note: With KV cache, query length S and key length S_kv may differ
-        S_q = Q.shape[2]  # Query sequence length
-        S_kv = K.shape[2]  # Cached key/value sequence length
-        q_positions = torch.arange(S_q, device=x.device).unsqueeze(1)  # [S_q, 1]
-        k_positions = torch.arange(S_kv, device=x.device).unsqueeze(0)  # [1, S_kv]
-        dist = (q_positions - k_positions).abs().float()  # [S_q, S_kv]
-        alibi = -self.alibi_slopes.view(1, H, 1, 1) * dist  # [1, H, S_q, S_kv]
-        scores = scores + alibi
+        # Check for alibi_slopes presence rather than _positional_encoding string
+        if self.alibi_slopes is not None:
+            S_q = Q.shape[2]  # Query sequence length
+            S_kv = K.shape[2]  # Cached key/value sequence length
+            q_positions = torch.arange(S_q, device=x.device).unsqueeze(1)  # [S_q, 1]
+            k_positions = torch.arange(S_kv, device=x.device).unsqueeze(0)  # [1, S_kv]
+            dist = (q_positions - k_positions).abs().float()  # [S_q, S_kv]
+            alibi = -self.alibi_slopes.view(1, H, 1, 1) * dist  # [1, H, S_q, S_kv]
+            scores = scores + alibi
 
         # Causal mask, computed on-the-fly
         causal_mask = torch.triu(
@@ -642,11 +746,11 @@ class AutoregressiveVM(nn.Module):
             [
                 TransformerBlock(
                     attn=AutoregressiveAttention(
-                        d_model, num_heads=n_heads, max_seq_len=max_seq_len
+                        d_model, num_heads=n_heads, max_seq_len=max_seq_len, layer_idx=i
                     ),
                     ffn=PureFFN(d_model, ffn_hidden),
                 )
-                for _ in range(n_layers)
+                for i in range(n_layers)
             ]
         )
 
@@ -1420,7 +1524,9 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     #   d=8 from MEM → STEP_END              (H2=7.5, H3=8.5)
     #   d=9 from BP → MEM (through STACK0)   (H3=8.5, H4=9.5)
     attn0 = model.blocks[0].attn
-    attn0.alibi_slopes.fill_(ALIBI_S)
+    # ALiBi-specific: set slopes for threshold heads
+    if hasattr(attn0, 'alibi_slopes') and attn0.alibi_slopes is not None:
+        attn0.alibi_slopes.fill_(ALIBI_S)
     _set_threshold_attn(
         attn0,
         [3.5, 4.5, 7.5, 8.5, 9.5, 14.5, 19.5, 24.5],
@@ -1434,8 +1540,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
     # ===== LAYER 1: Fine thresholds + STEP_END detection =====
     attn1 = model.blocks[1].attn
-    attn1.alibi_slopes.fill_(ALIBI_S)
-    attn1.alibi_slopes[3] = 0.0  # Head 3: global attention for SE detection
+    # ALiBi-specific: set slopes for threshold heads
+    if hasattr(attn1, 'alibi_slopes') and attn1.alibi_slopes is not None:
+        attn1.alibi_slopes.fill_(ALIBI_S)
+        attn1.alibi_slopes[3] = 0.0  # Head 3: global attention for SE detection
     _set_threshold_attn(
         attn1,
         [0.5, 1.5, 2.5],
@@ -1459,12 +1567,15 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
     # ===== LAYER 2: Threshold 5.5 + MEM byte position flags =====
     attn2 = model.blocks[2].attn
-    attn2.alibi_slopes.fill_(ALIBI_S)
+    # ALiBi-specific: set slopes for threshold heads
+    if hasattr(attn2, 'alibi_slopes') and attn2.alibi_slopes is not None:
+        attn2.alibi_slopes.fill_(ALIBI_S)
     _set_threshold_attn(attn2, [5.5], [BD.L2H0], ALIBI_S, HD, heads=[0])
 
     # Conversational I/O: Lookback detection head (detect prev token type)
     if enable_conversational_io:
-        attn2.alibi_slopes[1] = 10.0  # Steep slope to favor most recent token
+        if hasattr(attn2, 'alibi_slopes') and attn2.alibi_slopes is not None:
+            attn2.alibi_slopes[1] = 10.0  # Steep slope to favor most recent token
         _set_lookback_detection_head(attn2, S, BD, HD)
 
     ffn2 = model.blocks[2].ffn
@@ -1473,7 +1584,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # ===== LAYER 3: Register carry-forward (PC, AX, SP, BP) + PC update =====
     # All carry-forwards in one layer so values are available for later layers.
     attn3 = model.blocks[3].attn
-    attn3.alibi_slopes.fill_(0.5)
+    if hasattr(attn3, 'alibi_slopes') and attn3.alibi_slopes is not None:
+        attn3.alibi_slopes.fill_(0.5)
     PC_I, AX_I, SP_I, BP_I = 0, 1, 2, 3
     # Head 0: PC carry (prev step PC byte 0 → EMBED at PC marker)
     _set_carry_forward_attn(
@@ -1506,14 +1618,16 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # This must be a SEPARATE layer from the fetch because the fetch
     # needs the result of this relay (can't be intra-layer).
     attn4 = model.blocks[4].attn
-    attn4.alibi_slopes.fill_(0.5)
+    if hasattr(attn4, 'alibi_slopes') and attn4.alibi_slopes is not None:
+        attn4.alibi_slopes.fill_(0.5)
     _set_layer4_pc_relay(attn4, S, BD, HD)
     ffn4 = model.blocks[4].ffn
     _set_layer4_ffn(ffn4, S, BD)
 
     # ===== LAYER 5: Bytecode fetch (imm + opcode) =====
     attn5 = model.blocks[5].attn
-    attn5.alibi_slopes.fill_(0.1)
+    if hasattr(attn5, 'alibi_slopes') and attn5.alibi_slopes is not None:
+        attn5.alibi_slopes.fill_(0.1)
     _set_layer5_fetch(attn5, S, BD, HD)
     ffn5 = model.blocks[5].ffn
     _set_opcode_decode_ffn(ffn5, S, BD)
@@ -1525,12 +1639,13 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # Head 0 (slope=5): PC→AX d=30, score = 50²*0.125 - 150 = 162 ✓
     # Head 1 (slope=5): SE→AX d=28, score = 50²*0.7*0.125 - 140 = 79 ✓
     # At non-target Q=0 positions: score = -5*d, softmax1→≈0 (leakage <0.7%).
-    attn6.alibi_slopes.fill_(0.0)
-    attn6.alibi_slopes[0] = 5.0
-    attn6.alibi_slopes[1] = 5.0
-    attn6.alibi_slopes[2] = 0.5  # STACK0←AX relay: prefer nearest AX marker
-    attn6.alibi_slopes[3] = 0.5  # SP←AX relay: prefer nearest AX marker
-    attn6.alibi_slopes[4] = 5.0  # BZ/BNZ relay: attend to nearest AX marker
+    if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
+        attn6.alibi_slopes.fill_(0.0)
+        attn6.alibi_slopes[0] = 5.0
+        attn6.alibi_slopes[1] = 5.0
+        attn6.alibi_slopes[2] = 0.5  # STACK0←AX relay: prefer nearest AX marker
+        attn6.alibi_slopes[3] = 0.5  # SP←AX relay: prefer nearest AX marker
+        attn6.alibi_slopes[4] = 5.0  # BZ/BNZ relay: attend to nearest AX marker
     _set_layer6_attn(attn6, S, BD, HD)
     ffn6 = model.blocks[6].ffn
     _set_layer6_routing_ffn(ffn6, S, BD)
@@ -1544,8 +1659,9 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     _set_bz_bnz_relay(attn6, S, BD, HD)
 
     # L6 opcode relay: broadcast PSH/ADJ/pop flags from AX → SP/STACK0
-    attn6.alibi_slopes[6] = 5.0
-    attn6.alibi_slopes[7] = 5.0  # JSR PC+5 relay: steep for head 7
+    if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
+        attn6.alibi_slopes[6] = 5.0
+        attn6.alibi_slopes[7] = 5.0  # JSR PC+5 relay: steep for head 7
     _set_opcode_relay_head(attn6, S, BD, HD)
 
     # IO PUTCHAR routing (L6 FFN: sets IO_IS_PUTCHAR, routes AX → OUTPUT)
@@ -1565,7 +1681,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # L5 FFN: decode OPEN/READ/CLOS/PRTF → IO_IS_TOOL_CALL at AX marker
         _set_tool_call_opcode_decode(ffn5, S, BD)
         # L6 attention head 5: relay IO_IS_TOOL_CALL from AX → SE position
-        attn6.alibi_slopes[5] = 5.0  # steep ALiBi for head 5
+        if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
+            attn6.alibi_slopes[5] = 5.0  # steep ALiBi for head 5
         _set_tool_call_relay_head(attn6, S, BD, HD)
         # L6 FFN: CMP[2] AND NEXT_SE → NEXT_TOOL_CALL (convert SE to TOOL_CALL)
         _set_tool_call_detection(ffn6, S, BD)
@@ -1575,33 +1692,40 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # L5 FFN: decode PRTF/READ → IO_IS_PRTF, IO_IS_READ at AX marker
         _set_conversational_io_opcode_decode(ffn5, S, BD)
         # L6 attention heads 6-7: relay IO_IS_PRTF, IO_IS_READ from AX → SE
-        attn6.alibi_slopes[6] = 5.0  # steep ALiBi for head 6
-        attn6.alibi_slopes[7] = 5.0  # steep ALiBi for head 7
+        if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
+            attn6.alibi_slopes[6] = 5.0  # steep ALiBi for head 6
+            attn6.alibi_slopes[7] = 5.0  # steep ALiBi for head 7
         _set_conversational_io_relay_heads(attn6, S, BD, HD)
         # L6 FFN: CMP[3]/TEMP[0] AND NEXT_SE → NEXT_THINKING_END (start I/O sequence)
         _set_conversational_io_state_machine(ffn6, S, BD)
 
     # ===== LAYER 7: Operand gather + memory relay heads =====
     attn7 = model.blocks[7].attn
-    attn7.alibi_slopes.fill_(0.5)
+    if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
+        attn7.alibi_slopes.fill_(0.5)
     _set_layer7_operand_gather(attn7, S, BD, HD)
     # L7 head 1: MEM flag broadcast (MEM marker → MEM byte positions)
-    attn7.alibi_slopes[1] = 5.0  # steep for nearest MEM marker
+    if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
+        attn7.alibi_slopes[1] = 5.0  # steep for nearest MEM marker
     # L7 heads 2-4: Gather prev AX bytes → AX positions (for LI/LC addr)
     # L7 head 5: Relay LI/LC flags → AX byte positions
-    attn7.alibi_slopes[5] = 5.0
+    if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
+        attn7.alibi_slopes[5] = 5.0
     # L7 head 6: Relay PSH/store flags → STACK0 byte positions
-    attn7.alibi_slopes[6] = 5.0
+    if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
+        attn7.alibi_slopes[6] = 5.0
     _set_layer7_memory_heads(attn7, S, BD, HD)
 
     # Conversational I/O: Extract format pointer from STACK0
     if enable_conversational_io:
-        attn7.alibi_slopes[7] = 5.0  # steep to attend back to prev step
+        if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
+            attn7.alibi_slopes[7] = 5.0  # steep to attend back to prev step
         _set_format_pointer_extraction(attn7, S, BD, HD)
 
     # ===== LAYER 8: ALU + SP→STACK0 addr gather =====
     attn8 = model.blocks[8].attn
-    attn8.alibi_slopes.fill_(0.5)
+    if hasattr(attn8, 'alibi_slopes') and attn8.alibi_slopes is not None:
+        attn8.alibi_slopes.fill_(0.5)
     _set_layer8_sp_gather(attn8, S, BD, HD)
 
     # ===== LAYERS 8-13: ALU Operations =====
@@ -1617,7 +1741,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # Conversational I/O: Format string fetch via attention
         if enable_conversational_io:
             attn9 = model.blocks[9].attn
-            attn9.alibi_slopes.fill_(0.5)
+            if hasattr(attn9, 'alibi_slopes') and attn9.alibi_slopes is not None:
+                attn9.alibi_slopes.fill_(0.5)
             _set_format_string_fetch_head(attn9, S, BD, HD)
 
         ffn9 = model.blocks[9].ffn
@@ -1625,8 +1750,9 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
         # ===== LAYER 10: carry relay + AX passthrough + bitwise + cmp =====
         attn10 = model.blocks[10].attn
-        attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
-        attn10.alibi_slopes[1] = 1.0  # head 1: AX byte passthrough (nearest step)
+        if hasattr(attn10, 'alibi_slopes') and attn10.alibi_slopes is not None:
+            attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
+            attn10.alibi_slopes[1] = 1.0  # head 1: AX byte passthrough (nearest step)
         _set_layer10_carry_relay(attn10, S, BD, HD)
         _set_layer10_byte_passthrough(attn10, S, BD, HD)
         ffn10 = model.blocks[10].ffn
@@ -1649,7 +1775,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
         # ===== LAYER 13: SHL/SHR shifts + MEM addr gather =====
         attn13 = model.blocks[13].attn
-        attn13.alibi_slopes.fill_(0.5)
+        if hasattr(attn13, 'alibi_slopes') and attn13.alibi_slopes is not None:
+            attn13.alibi_slopes.fill_(0.5)
         _set_layer13_mem_addr_gather(attn13, S, BD, HD)
         ffn13 = model.blocks[13].ffn
         _set_layer13_shifts(ffn13, S, BD)
@@ -1663,8 +1790,9 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
         # L10: Carry relay + AX passthrough attention (still needed)
         attn10 = model.blocks[10].attn
-        attn10.alibi_slopes[0] = 5.0
-        attn10.alibi_slopes[1] = 1.0
+        if hasattr(attn10, 'alibi_slopes') and attn10.alibi_slopes is not None:
+            attn10.alibi_slopes[0] = 5.0
+            attn10.alibi_slopes[1] = 1.0
         _set_layer10_carry_relay(attn10, S, BD, HD)
         _set_layer10_byte_passthrough(attn10, S, BD, HD)
 
@@ -1679,7 +1807,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
         # L13: Memory addr gather attention (still needed)
         attn13 = model.blocks[13].attn
-        attn13.alibi_slopes.fill_(0.5)
+        if hasattr(attn13, 'alibi_slopes') and attn13.alibi_slopes is not None:
+            attn13.alibi_slopes.fill_(0.5)
         _set_layer13_mem_addr_gather(attn13, S, BD, HD)
 
         # L13 FFN: Neural SHL/SHR
@@ -1690,12 +1819,14 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
     # ===== LAYER 14: MEM byte generation (8 heads) =====
     attn14 = model.blocks[14].attn
-    attn14.alibi_slopes.fill_(0.1)  # slight recency bias for same-step preference
+    if hasattr(attn14, 'alibi_slopes') and attn14.alibi_slopes is not None:
+        attn14.alibi_slopes.fill_(0.1)  # slight recency bias for same-step preference
     _set_layer14_mem_generation(attn14, S, BD, HD)
 
     # ===== LAYER 15: Memory lookup (softmax1 + ALiBi) =====
     attn15 = model.blocks[15].attn
-    attn15.alibi_slopes.fill_(0.01)  # gentle recency bias for latest-write-wins
+    if hasattr(attn15, 'alibi_slopes') and attn15.alibi_slopes is not None:
+        attn15.alibi_slopes.fill_(0.01)  # gentle recency bias for latest-write-wins
     _set_layer15_memory_lookup(attn15, S, BD, HD)
     ffn15 = model.blocks[15].ffn
     _set_nibble_copy_ffn(ffn15, S, BD)
@@ -2213,6 +2344,7 @@ def _set_layer3_ffn(ffn, S, BD):
 
     # PC FIRST-STEP DEFAULT: when MARK_PC AND NOT HAS_SE, set PC=PC_OFFSET+INSTR_WIDTH
     # (draft tokens represent state AFTER executing first instruction)
+    # CRITICAL: Also write to EMBED so L4 attention can relay to AX marker for L5 fetch!
     first_pc = PC_OFFSET + INSTR_WIDTH
     pc_lo = first_pc & 0xF
     pc_hi = (first_pc >> 4) & 0xF
@@ -2220,24 +2352,28 @@ def _set_layer3_ffn(ffn, S, BD):
     ffn.b_up[unit] = -S * 0.5
     ffn.b_gate[unit] = 1.0
     ffn.W_down[BD.OUTPUT_LO + pc_lo, unit] = 2.0 / S
+    ffn.W_down[BD.EMBED_LO + pc_lo, unit] = 2.0 / S  # Also write to EMBED for L4 relay
     unit += 1
     # Unit B: undo when HAS_SE (subsequent steps use carry-forward + increment)
     ffn.W_up[unit, BD.HAS_SE] = S
     ffn.b_up[unit] = -S * 0.5
     ffn.W_gate[unit, BD.MARK_PC] = 1.0
     ffn.W_down[BD.OUTPUT_LO + pc_lo, unit] = -2.0 / S
+    ffn.W_down[BD.EMBED_LO + pc_lo, unit] = -2.0 / S  # Also undo EMBED
     unit += 1
 
-    # Same for OUTPUT_HI
+    # Same for OUTPUT_HI and EMBED_HI
     ffn.W_up[unit, BD.MARK_PC] = S
     ffn.b_up[unit] = -S * 0.5
     ffn.b_gate[unit] = 1.0
     ffn.W_down[BD.OUTPUT_HI + pc_hi, unit] = 2.0 / S
+    ffn.W_down[BD.EMBED_HI + pc_hi, unit] = 2.0 / S  # Also write to EMBED for L4 relay
     unit += 1
     ffn.W_up[unit, BD.HAS_SE] = S
     ffn.b_up[unit] = -S * 0.5
     ffn.W_gate[unit, BD.MARK_PC] = 1.0
     ffn.W_down[BD.OUTPUT_HI + pc_hi, unit] = -2.0 / S
+    ffn.W_down[BD.EMBED_HI + pc_hi, unit] = -2.0 / S  # Also undo EMBED
     unit += 1
 
     # SP DEFAULT: STACK_INIT = 0x10000
@@ -2444,6 +2580,7 @@ def _set_layer5_fetch(attn, S, BD, HD):
     # Head 0: fetch immediate byte (address = PC+1)
     # Only fires on non-first steps (HAS_SE > 0). For first step, head 3 fetches
     # immediate at PC marker and head 4 relays to AX marker.
+    # TEMP contains PC+1 at AX marker (computed by L4 FFN from relayed PC).
     base = 0 * HD
     # Q: low two nibbles from TEMP (PC+1)
     for k in range(16):
@@ -2486,6 +2623,7 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.FETCH_HI + k, base + 48 + k] = 1.0
 
     # Head 1: fetch opcode byte (address = PC)
+    # EMBED_LO/HI at AX marker contain the PC value (relayed by L4 attention).
     base = 1 * HD
     # Q: low two nibbles from EMBED (PC)
     for k in range(16):
@@ -2586,6 +2724,17 @@ def _set_layer5_fetch(attn, S, BD, HD):
     attn.W_q[base + GATE, BD.CONST] = -500.0
     attn.W_k[base + GATE, BD.CONST] = 5.0
 
+    # HAS_SE gate: only fire on first step (when HAS_SE=0)
+    # On first step: Q[HAS_SE]=0, Q[CONST]=-500 → score = -312.5 (blocked by default)
+    # Actually wait, we want OPPOSITE: block when HAS_SE=1, allow when HAS_SE=0
+    # On first step (HAS_SE=0): Q=0-500=-500, K=5 → score = -312.5 (blocks)
+    # Need to fix: on first step should NOT block
+    # Correct approach: Q[HAS_SE]=-500, Q[CONST]=0 → first step (HAS_SE=0): Q=-500*0+0=0 (allow)
+    # Non-first step (HAS_SE=1): Q=-500*1+0=-500, K=5 → score = -312.5 (blocks)
+    HAS_SE_GATE = 34
+    attn.W_q[base + HAS_SE_GATE, BD.HAS_SE] = -500.0
+    attn.W_k[base + HAS_SE_GATE, BD.CONST] = 5.0
+
     # V: copy immediate byte nibbles
     for k in range(16):
         attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
@@ -2620,6 +2769,13 @@ def _set_layer5_fetch(attn, S, BD, HD):
     attn.W_q[base + GATE, BD.MARK_AX] = 500.0
     attn.W_q[base + GATE, BD.CONST] = -500.0
     attn.W_k[base + GATE, BD.CONST] = 5.0
+    # HAS_SE gate: only fire on first step (when HAS_SE = 0)
+    # On first step: Q[HAS_SE]=0, Q[CONST]=-500 → score = -312.5 (blocks from wrong positions)
+    # On non-first: Q[HAS_SE]=500, Q[CONST]=-500 → score = 0 (neutral)
+    # Combined with anti-leakage: non-first + AX = blocked
+    HAS_SE_GATE = 34
+    attn.W_q[base + HAS_SE_GATE, BD.HAS_SE] = -500.0  # negative: block when HAS_SE > 0
+    attn.W_k[base + HAS_SE_GATE, BD.CONST] = 5.0
     # V: copy opcode byte nibbles from matched code position
     for k in range(16):
         attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
@@ -3478,7 +3634,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # 4-way AND in silu: MARK_PC + CMP[2] + CMP[4] + CMP[5] - 3.5
     # All conditions in silu, gate is ONLY the value multiplier.
     # BZ+zero: 1+1+1+1=4 > 3.5 → fires. One missing: 3 < 3.5 → off.
-    T_bz = 3.5
+    T_bz = 5.5
     # Cancel existing PC+5 carry
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
@@ -3511,7 +3667,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
     # Hi nibble, no borrow (target_lo >= 5): copy straight through.
     # Extra condition: any of TEMP[5..15] must be active.
-    T_bz_nb = 4.5  # BZ(4) + one_of_TEMP[5..15](1) = 5 > 4.5
+    T_bz_nb = 6.5  # BZ(4) + one_of_TEMP[5..15](1) = 5 > 4.5
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.CMP + 2] = S
