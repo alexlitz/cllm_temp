@@ -50,11 +50,12 @@ class NeuralVMEmbedding(nn.Module):
         # When True, no external add_exec_addr() calls needed
         self._autoregressive_exec = True
 
-    def forward(self, token_ids):
+    def forward(self, token_ids, active_opcode=None):
         """Apply embedding + augmentations.
 
         Args:
             token_ids: [batch, seq] tensor of token IDs
+            active_opcode: Current active opcode (0-255) or None
 
         Returns:
             x: [batch, seq, d_model] embeddings with augmentations applied
@@ -65,6 +66,13 @@ class NeuralVMEmbedding(nn.Module):
         # Apply augmentations in-place (deterministic transformations)
         self._add_code_addr_keys(token_ids, x)
         self._inject_mem_store(token_ids, x)
+
+        # Inject active opcode flags for conversational I/O detection
+        if active_opcode is not None:
+            self._inject_active_opcode(x, active_opcode)
+
+        # Inject THINKING_START/END markers for lookback detection
+        self._inject_thinking_markers(token_ids, x)
 
         # Unified memory: either autoregressive inference or external hints
         if self._autoregressive_exec:
@@ -102,8 +110,10 @@ class NeuralVMEmbedding(nn.Module):
         from .constants import INSTR_WIDTH, PC_OFFSET
         BD = _SetDim
 
-        # Bytes per instruction in token stream (opcode + 4 immediate bytes)
-        BYTES_PER_INSTR = 5
+        # Bytes per instruction in token stream: opcode + 4 immediate + 3 padding = 8 total
+        # ADDR_KEY is only set for the first 5 bytes (opcode + immediate), not padding
+        BYTES_PER_INSTR = 8  # Total bytes in token stream
+        DATA_BYTES = 5       # Bytes with ADDR_KEY (opcode + 4 immediate)
 
         B, S = token_ids.shape
 
@@ -122,6 +132,11 @@ class NeuralVMEmbedding(nn.Module):
                     # Convert to PC-aligned address
                     instr_idx = seq_pos // BYTES_PER_INSTR
                     byte_offset = seq_pos % BYTES_PER_INSTR
+
+                    # Skip padding bytes (beyond first 5 bytes of instruction)
+                    if byte_offset >= DATA_BYTES:
+                        continue
+
                     # PC = instr_idx * INSTR_WIDTH + PC_OFFSET
                     # Opcode (byte_offset=0): addr = PC
                     # Imm[j] (byte_offset=j+1): addr = PC + j + 1
@@ -167,6 +182,44 @@ class NeuralVMEmbedding(nn.Module):
             end: Position marking end of historical memory region
         """
         self._mem_history_end = end
+
+    def _inject_active_opcode(self, x, active_opcode):
+        """Inject active opcode flags into all positions.
+
+        For conversational I/O: exposes the MoE routing signal globally so
+        L5 FFN can detect PRTF/READ opcodes reliably.
+
+        Args:
+            x: [batch, seq, d_model] embedding tensor (modified in-place)
+            active_opcode: Current opcode value (0-255)
+        """
+        from .vm_step import _SetDim as BD
+
+        if active_opcode == 33:  # PRTF = 0x21
+            x[:, :, BD.ACTIVE_OPCODE_PRTF] = 1.0
+        elif active_opcode == 31:  # READ = 0x1F
+            x[:, :, BD.ACTIVE_OPCODE_READ] = 1.0
+
+    def _inject_thinking_markers(self, token_ids, x):
+        """Inject THINKING_START and THINKING_END markers for lookback detection.
+
+        Sets dedicated marker dimensions (not overlapping with OUTPUT_BYTE)
+        so L2 lookback head can reliably detect these special tokens.
+
+        Args:
+            token_ids: [batch, seq] tensor of token IDs
+            x: [batch, seq, d_model] embedding tensor (modified in-place)
+        """
+        from .vm_step import _SetDim as BD, Token
+
+        B, S = token_ids.shape
+        for b in range(B):
+            for i in range(S):
+                tok = token_ids[b, i].item()
+                if tok == Token.THINKING_START:
+                    x[b, i, BD.MARK_THINKING_START] = 1.0
+                elif tok == Token.THINKING_END:
+                    x[b, i, BD.MARK_THINKING_END] = 1.0
 
     def _inject_mem_exec(self, token_ids, x):
         """Inject MEM_EXEC and ADDR_KEY on MEM sections containing executable code.

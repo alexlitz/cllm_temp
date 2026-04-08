@@ -103,7 +103,7 @@ def verify_forward_purity(model):
 
     # Check for required structure (positive verification)
     required_patterns = {
-        r'self\.embed\s*\(\s*token_ids\s*\)': 'Must call self.embed(token_ids)',
+        r'self\.embed\s*\(\s*token_ids(?:\s*,\s*\w+\s*=\s*[^)]+)?\s*\)': 'Must call self.embed(token_ids)',
         r'for\s+.*\s+in\s+enumerate\s*\(\s*self\.blocks\s*\)': 'Must iterate through self.blocks',
         r'self\.head\s*\(': 'Must call self.head()',
     }

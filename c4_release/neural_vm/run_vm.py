@@ -29,7 +29,8 @@ import warnings
 from typing import List, Optional, Callable, Any, Dict
 from dataclasses import dataclass, field
 
-from .vm_step import AutoregressiveVM, Token, set_vm_weights
+from .vm_step import AutoregressiveVM, Token
+from .weight_setter import set_weights
 from .embedding import Opcode
 from .constants import INSTR_WIDTH, PC_OFFSET
 
@@ -146,7 +147,7 @@ class AutoregressiveVMRunner:
             max_seq_len=max_seq_len,
         )
         # Load hand-crafted transformer weights for VM execution
-        set_vm_weights(self.model, enable_conversational_io=conversational_io)
+        set_weights(self.model, enable_conversational_io=conversational_io)
         self.model.eval()
 
         # Syscall dispatch table
@@ -630,21 +631,27 @@ class AutoregressiveVMRunner:
         """Encode program as token sequence (context prefix).
 
         Format:
-            [CODE_START] op0 imm0_b0 imm0_b1 imm0_b2 imm0_b3 op1 ... [CODE_END]
+            [CODE_START] op0 imm0_b0..b3 pad0..2 op1 imm1_b0..b3 pad0..2 ... [CODE_END]
             [DATA_START] data_bytes... [DATA_END]
             [USER_INPUT_START] byte0 byte1 ... byteN [USER_INPUT_END]  (if stdin)
             argv0_chars... \\0 argv1_chars... \\0
 
-        Each instruction is 5 tokens: opcode byte + 4 immediate bytes (little-endian).
+        Each instruction is 8 tokens: opcode + 4 immediate bytes + 3 padding bytes.
+        This matches INSTR_WIDTH from constants.py (5 data + 3 padding for 8-byte alignment).
         """
+        from .constants import IMMEDIATE_SIZE, PADDING_SIZE
+
         tokens = [Token.CODE_START]
 
         for instr in bytecode:
             op = instr & 0xFF
             imm = instr >> 8
             tokens.append(op)
-            for i in range(4):
+            for i in range(IMMEDIATE_SIZE):
                 tokens.append((imm >> (i * 8)) & 0xFF)
+            # Add padding bytes for 8-byte instruction alignment
+            for _ in range(PADDING_SIZE):
+                tokens.append(0)
 
         tokens.append(Token.CODE_END)
         tokens.append(Token.DATA_START)

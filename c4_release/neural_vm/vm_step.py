@@ -2505,6 +2505,15 @@ def _set_layer5_fetch(attn, S, BD, HD):
     attn.W_q[base + GATE, BD.CONST] = -500.0
     attn.W_k[base + GATE, BD.CONST] = 5.0
 
+    # HAS_SE gate: only fire on non-first steps (when HAS_SE > 0)
+    # First step uses Head 4 (fetches opcode to AX marker at PC_OFFSET)
+    # On first step: Q[HAS_SE]=0, Q[CONST]=-500 → score = -312.5 (blocks)
+    # On non-first: Q[HAS_SE]=500, Q[CONST]=-500 → score = 0 (neutral)
+    HAS_SE_GATE = 34
+    attn.W_q[base + HAS_SE_GATE, BD.HAS_SE] = 500.0
+    attn.W_q[base + HAS_SE_GATE, BD.CONST] = -500.0
+    attn.W_k[base + HAS_SE_GATE, BD.CONST] = 5.0
+
     # V: opcode byte nibbles
     for k in range(16):
         attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
@@ -3082,21 +3091,24 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     """
     unit = 0
     # Threshold with guards: OP + MARK_AX - MARK_PC - IS_BYTE > T
-    # At AX marker (IS_BYTE=0): 5 + 1 - 0 - 0 = 6 > T → T < 6
-    # At AX byte (IS_BYTE=1): 5 + 1 - 0 - 1 = 5 < T (blocked if T ≥ 5)
-    # At PC marker: blocked by -MARK_PC (residual inflation makes this critical)
-    # Setting T = 5.5 ensures: marker fires (6 > 5.5), byte blocked (5 < 5.5)
-    T = 5.5
+    # Step 0: OP=0, MARK_AX=1 → 0 + 16 - 0 - 0 = 16 > 16*T → T < 1.0
+    # Step 1+: OP=5, MARK_AX=1 → 16*5 + 16 - 0 - 0 = 96 > 16*T → T < 6.0
+    # At byte: OP + 16 - 0 - 16 < 16*T → need T > (OP/16), so T=0.5 blocks
+    # At PC marker: OP + 0 - 16 - 0 < 16*T → blocked by -MARK_PC
+    # Setting T = 0.5: step 0 fires (16 > 8), step 1 fires (96 > 8), bytes blocked
+    T = 0.5
 
     # === IMM: FETCH → OUTPUT ===
     # Read from FETCH_LO/HI (clean staging dims written by L5 fetch head 0).
     # These dims have no prior-layer leakage, unlike EMBED_LO/HI which
     # accumulates carry-forward residuals from L3.
-    # FIX: Add -MARK_PC to prevent firing at PC position due to residual inflation.
+    # FIX: Use strong -MARK_PC to block at PC marker. OP_IMM = 5.0 at PC marker
+    # for first-step detection, so we need -6*S to overcome it.
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
+        ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
+        ffn.W_up[unit, BD.MARK_PC] = -S * 6  # Strong block at PC marker (OP_IMM=5 there)
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_LO + k] = 1.0
@@ -3104,8 +3116,9 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
+        ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
+        ffn.W_up[unit, BD.MARK_PC] = -S * 6  # Strong block at PC marker (OP_IMM=5 there)
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_HI + k] = 1.0
@@ -3115,6 +3128,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # === EXIT: AX_CARRY → OUTPUT ===
     for k in range(16):
         ffn.W_up[unit, BD.OP_EXIT] = S
+        ffn.W_up[unit, BD.OP_IMM] = -S * 20  # Strong block IMM crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
@@ -3124,6 +3138,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.OP_EXIT] = S
+        ffn.W_up[unit, BD.OP_IMM] = -S * 20  # Strong block IMM crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
@@ -5796,7 +5811,7 @@ def _set_function_call_weights(model, S, BD, HD):
       - L7 head 1 gathers BP → ALU, L6 FFN replaces AX_CARRY with FETCH
       - L8/L9 ADD gates include OP_LEA
 
-    L5 heads 2-3: ENT relay attention (BP EMBED → TEMP, SP EMBED → TEMP).
+    L5 heads 5-6: ENT relay attention (BP EMBED → TEMP, SP EMBED → TEMP).
     L6 head 7: JSR PC OUTPUT → AX_CARRY at STACK0.
     L6 FFN units 850-1105: LEA/JSR/ENT output routing.
     """
@@ -5807,15 +5822,21 @@ def _set_function_call_weights(model, S, BD, HD):
     T = 4.0  # standard opcode threshold: OP(~5) + MARK_AX(1) = 6 > 4
 
     # =====================================================================
-    # L5 heads 2-3: ENT relay attention
+    # L5 heads 5-6: ENT relay attention (moved from heads 2-3 to avoid conflict
+    # with first-step opcode/immediate fetch in _set_layer5_fetch)
     # =====================================================================
     L5 = 20.0  # matching L5 fetch heads
 
-    # Head 2: BP EMBED → TEMP at STACK0 marker (for ENT: STACK0 = old_BP)
+    # Head 5: BP EMBED → TEMP at STACK0 marker (for ENT: STACK0 = old_BP)
     # Distance d=5 (STACK0 at pos 20, BP at pos 15 in same step)
-    base = 2 * HD
+    base = 5 * HD
     attn5.W_q[base, BD.MARK_STACK0] = L5
     attn5.W_k[base, BD.MARK_BP] = L5
+    # Anti-leakage gate: only fire at STACK0 marker positions
+    GATE = 33
+    attn5.W_q[base + GATE, BD.MARK_STACK0] = 500.0
+    attn5.W_q[base + GATE, BD.CONST] = -500.0
+    attn5.W_k[base + GATE, BD.CONST] = 5.0
     # V: copy EMBED_LO/HI
     for k in range(16):
         attn5.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
@@ -5825,11 +5846,16 @@ def _set_function_call_weights(model, S, BD, HD):
         attn5.W_o[BD.TEMP + k, base + 1 + k] = 1.0
         attn5.W_o[BD.TEMP + 16 + k, base + 17 + k] = 1.0
 
-    # Head 3: SP EMBED → TEMP at BP marker (for ENT: BP = old_SP - 8)
+    # Head 6: SP EMBED → TEMP at BP marker (for ENT: BP = old_SP - 8)
     # Distance d=5 (BP at pos 15, SP at pos 10)
-    base = 3 * HD
+    base = 6 * HD
     attn5.W_q[base, BD.MARK_BP] = L5
     attn5.W_k[base, BD.MARK_SP] = L5
+    # Anti-leakage gate: only fire at BP marker positions
+    GATE = 33
+    attn5.W_q[base + GATE, BD.MARK_BP] = 500.0
+    attn5.W_q[base + GATE, BD.CONST] = -500.0
+    attn5.W_k[base + GATE, BD.CONST] = 5.0
     # V: copy EMBED_LO/HI
     for k in range(16):
         attn5.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
