@@ -71,16 +71,31 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 - ✅ Program with 1 local variable: exit code 42 (correct)
 - ❌ Program with 2 local variables: exit code 16843009 (0x01010101 - wrong!)
 
-**Root Cause**: When loading variable `a` (stored as 10), LI returns 0
-- SI stores values correctly (verified: AX=10, then AX=32 after stores)
-- LI fails to look up stored values from neural memory
-- ADD then computes 0 + garbage = 0x01010101 instead of 10 + 32 = 42
+**Root Cause**: Multiple neural components broken in memory mechanism
+
+**1. Neural MEM Generation (L14) Broken:**
+- L14 should emit MEM sections with `[MEM, addr_bytes[4], value_bytes[4]]`
+- Actual output: `[MEM, 0, 0, 0, 0, 0, 0, 0, 0]` (all zeros!)
+- All SI operations create MEM sections at address 0x00000000 with value 0x00000000
+- MEM sections captured but contain no useful data
+
+**2. Neural STACK0 Register Output Broken:**
+- SI reads store address from STACK0 (value PSH pushed to stack)
+- PSH should set STACK0 = address (e.g., BP-8 = 0x000100e0)
+- Actual STACK0 values: 0x00000000, 0x0000000a, 0x00000020 (garbage!)
+- SI stores to wrong addresses, LI reads from wrong addresses
+
+**3. Combined Effect:**
+- First SI: stores 10 at address 0x00 (should be 0x000100e0)
+- Second SI: stores 32 at address 0x0a (should be 0x000100d8)
+- First LI: reads from 0x20 (should be 0x000100e0) → gets 0
+- Result: 0 + garbage = wrong exit code
 
 **Technical Details**:
-- Bytecode: `LEA -8; LI` should load variable at BP-8
-- Execution: After `LEA -8; LI`, AX becomes 0 instead of 10
-- The L15 softmax1 memory lookup doesn't find the correct stored value
-- Works with 1 variable, fails with 2+ variables
+- L14 address heads (0-3): Should copy SP/STACK0 bytes to MEM addr positions
+- L14 value heads (4-7): Should copy AX bytes to MEM value positions
+- L15 softmax1: Should use MEM sections to look up stored values
+- All three mechanisms failing due to incorrect hand-crafted weights
 
 **Impact**:
 - Programs with 0-1 local variables work
@@ -89,7 +104,11 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 - Arithmetic, control flow, and function calls work correctly
 - Only memory lookup from local variables is affected
 
-**Workaround**: Avoid local variables, or use stack operations manually
+**Solution**: Re-enable LI/LC/SI/SC handlers as workaround
+- Add handlers back to `_syscall_handlers` dict in `neural_vm/run_vm.py`
+- Handlers provide correct memory semantics using shadow memory (`self._memory` dict)
+- Allows programs with 2+ local variables to work correctly
+- Long-term: Fix L14/L15 neural weights for proper memory mechanism
 
 ---
 

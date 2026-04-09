@@ -1756,36 +1756,27 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         _set_conversational_io_state_machine(ffn6, S, BD)
 
     # === BUG FIX 2026-04-09 (part 8c/8g): Patch spurious L6 FFN units ===
-    # Unprogrammed FFN units with random weights can fire spuriously when:
-    # - TEMP/OUTPUT_BYTE dimensions have residual values
-    # - Unit writes to OUTPUT_LO/HI dimensions
-    # This causes incorrect output at marker positions (especially PC marker).
-    # Example: unit 1128 fires on OUTPUT_BYTE_LO residuals at PC marker for EXIT,
-    # writing to OUTPUT_LO[0] and causing prediction of 0 instead of 10.
+    # TEMPORARILY DISABLED to debug test failures
+    # patched_count = 0
+    # for u in range(4096):
+    #     # Check if writes to OUTPUT
+    #     writes_output_lo = ffn6.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
+    #     writes_output_hi = ffn6.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
+    #     if not (writes_output_lo or writes_output_hi):
+    #         continue
     #
-    # This patch MUST run after ALL L6 FFN setup functions (routing, putchar, binary_pop, etc.)
-    # because those functions create units in the 900-1200 range.
-    patched_count = 0
-    for u in range(4096):
-        # Check if writes to OUTPUT
-        writes_output_lo = ffn6.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
-        writes_output_hi = ffn6.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
-        if not (writes_output_lo or writes_output_hi):
-            continue
-
-        # Check for strong TEMP/OUTPUT_BYTE weights
-        temp_weight = ffn6.W_up[u, BD.TEMP:BD.TEMP+32].abs().max().item()
-        output_byte_lo_weight = ffn6.W_up[u, BD.OUTPUT_BYTE_LO:BD.OUTPUT_BYTE_LO+16].abs().max().item()
-        output_byte_hi_weight = ffn6.W_up[u, BD.OUTPUT_BYTE_HI:BD.OUTPUT_BYTE_HI+16].abs().max().item()
-
-        if temp_weight > 50 or output_byte_lo_weight > 50 or output_byte_hi_weight > 50:
-            # Zero out this unit
-            ffn6.W_up[u, :] = 0
-            ffn6.W_gate[u, :] = 0
-            ffn6.W_down[:, u] = 0
-            ffn6.b_up[u] = 0
-            ffn6.b_gate[u] = 0
-            patched_count += 1
+    #     # Check for strong OUTPUT_BYTE weights (TEMP overlaps with OUTPUT_BYTE, so don't check TEMP separately)
+    #     output_byte_lo_weight = ffn6.W_up[u, BD.OUTPUT_BYTE_LO:BD.OUTPUT_BYTE_LO+16].abs().max().item()
+    #     output_byte_hi_weight = ffn6.W_up[u, BD.OUTPUT_BYTE_HI:BD.OUTPUT_BYTE_HI+16].abs().max().item()
+    #
+    #     if output_byte_lo_weight > 50 or output_byte_hi_weight > 50:
+    #         # Zero out this unit
+    #         ffn6.W_up[u, :] = 0
+    #         ffn6.W_gate[u, :] = 0
+    #         ffn6.W_down[:, u] = 0
+    #         ffn6.b_up[u] = 0
+    #         ffn6.b_gate[u] = 0
+    #         patched_count += 1
 
     # ===== LAYER 7: Operand gather + memory relay heads =====
     attn7 = model.blocks[7].attn

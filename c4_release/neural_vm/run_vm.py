@@ -139,6 +139,7 @@ class AutoregressiveVMRunner:
         pure_attention_memory=False,
         conversational_io=False,
         debug_ent_lev=False,
+        debug_memory=False,
     ):
         self.model = AutoregressiveVM(
             d_model=d_model,
@@ -167,11 +168,13 @@ class AutoregressiveVMRunner:
             Opcode.PUTCHAR: self._syscall_putchar,
             Opcode.GETCHAR: self._syscall_getchar,
             # DIV/MOD removed — neural (DivModModule after L10)
-            # LI/LC handlers removed: L15 softmax1 memory lookup produces
-            # correct AX values with MEM section retention + MEM_STORE injection.
-            # SI/SC handlers removed: _track_memory_write provides equivalent
-            # shadow memory updates via L14-generated MEM section extraction.
             # ADJ removed: now 100% neural (L7/L8/L9 SP arithmetic with carry propagation)
+            # LI/LC/SI/SC re-enabled: Neural L14/L15 memory mechanism not working
+            # correctly with 2+ local variables (MEM sections have all-zero addr/val)
+            Opcode.LI: self._syscall_li,
+            Opcode.LC: self._syscall_lc,
+            Opcode.SI: self._syscall_si,
+            Opcode.SC: self._syscall_sc,
             Opcode.MALC: self._syscall_malc,
             Opcode.FREE: self._syscall_free,
             Opcode.CLOS: self._syscall_clos,
@@ -218,6 +221,7 @@ class AutoregressiveVMRunner:
         # Debug flags
         self._debug_ent = debug_ent_lev
         self._debug_lev = debug_ent_lev
+        self._debug_memory = debug_memory
 
         # Function-call handlers dispatched by exec_pc (not output PC).
         # These are runner-side compatibility shims for full 32-bit correctness
@@ -531,6 +535,10 @@ class AutoregressiveVMRunner:
                     mem_section = self._extract_mem_section(context)
                     if mem_section is not None:
                         addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
+                        value = sum((mem_section[5 + j] & 0xFF) << (j * 8) for j in range(4))
+                        if self._debug_memory:
+                            opname = _OPCODE_NAME.get(op, f"OP{op}")
+                            print(f"[MEM STORE] {opname} at 0x{addr:08x} = 0x{value:08x}, captured MEM section", flush=True)
                         self._mem_history[addr] = mem_section
 
                 # Context pruning: keep prefix + retained MEM sections + last step.
@@ -627,6 +635,10 @@ class AutoregressiveVMRunner:
                     mem_section = self._extract_mem_section(context)
                     if mem_section is not None:
                         addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
+                        value = sum((mem_section[5 + j] & 0xFF) << (j * 8) for j in range(4))
+                        if self._debug_memory:
+                            opname = _OPCODE_NAME.get(op, f"OP{op}")
+                            print(f"[MEM STORE] {opname} at 0x{addr:08x} = 0x{value:08x}, captured MEM section", flush=True)
                         self._mem_history[addr] = mem_section
 
                 # Context pruning (same as STEP_END branch)
@@ -833,7 +845,10 @@ class AutoregressiveVMRunner:
         scan_back = Token.STEP_TOKENS + 5
         for i in range(len(context) - 1, max(0, len(context) - scan_back), -1):
             if context[i] == Token.MEM and i + 8 < len(context):
-                return list(context[i:i + 9])
+                mem_section = list(context[i:i + 9])
+                if self._debug_memory:
+                    print(f"  [MEM EXTRACT] Found MEM at index {i}, section tokens: {mem_section}", flush=True)
+                return mem_section
         return None
 
     def _mem_store_word(self, addr, value):
@@ -1009,6 +1024,8 @@ class AutoregressiveVMRunner:
         addr = self._extract_register(context, Token.REG_AX)
         if addr is not None:
             value = self._mem_load_word(addr)
+            if self._debug_memory:
+                print(f"[LI HANDLER] addr=0x{addr:08x}, loaded value=0x{value:08x}", flush=True)
             self._override_ax_in_last_step(context, value & 0xFFFFFFFF)
 
     def _syscall_lc(self, context, output):
@@ -1022,8 +1039,14 @@ class AutoregressiveVMRunner:
         """SI (store int) — memory[STACK0] = AX (32-bit). No AX override."""
         addr = self._extract_stack0(context)
         ax = self._extract_register(context, Token.REG_AX)
+        if self._debug_memory:
+            addr_str = f"0x{addr:08x}" if addr is not None else "None"
+            ax_str = f"0x{ax:08x}" if ax is not None else "None"
+            print(f"[SI HANDLER] addr={addr_str}, ax={ax_str}", flush=True)
         if addr is not None and ax is not None:
             self._mem_store_word(addr, ax)
+            if self._debug_memory:
+                print(f"[SI HANDLER] Stored 0x{ax:08x} at 0x{addr:08x}", flush=True)
 
     def _syscall_sc(self, context, output):
         """SC (store char) — memory[STACK0] = AX & 0xFF (8-bit). No AX override."""
@@ -1528,16 +1551,22 @@ class AutoregressiveVMRunner:
         if current_sp is None:
             current_sp = self._last_sp
 
-        # Neural implementation sets BP = old_SP - 8
-        # We need: SP = (old_SP - 8) - imm = old_SP - 8 - imm
-        # Since current_sp ≈ old_sp (neural doesn't change SP for ENT)
-        new_sp = (current_sp - 8 - imm) & 0xFFFFFFFF
+        # ENT semantics: push BP, set BP=SP, allocate locals
+        # Neural implementation should set BP = old_SP - 8 (after push)
+        # But if neural doesn't work, we need to set it manually
+        old_bp = self._last_bp
+        new_bp = (current_sp - 8) & 0xFFFFFFFF  # SP after pushing old BP
+        new_sp = (current_sp - 8 - imm) & 0xFFFFFFFF  # SP after allocating locals
 
         if hasattr(self, '_debug_ent') and self._debug_ent:
-            print(f"[ENT] PC={exec_pc}, imm={imm}, current_sp=0x{current_sp:08x}, new_sp=0x{new_sp:08x}", flush=True)
+            print(f"[ENT] PC={exec_pc}, imm={imm}, old_bp=0x{old_bp:08x}, current_sp=0x{current_sp:08x}, new_bp=0x{new_bp:08x}, new_sp=0x{new_sp:08x}", flush=True)
 
-        # Override ONLY SP (let neural handle BP, STACK0, MEM)
+        # Store old BP in shadow memory (neural should do this via STACK0/MEM, but ensure it's there)
+        self._mem_store_word(current_sp - 8, old_bp)
+
+        # Override SP and BP
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
+        self._override_register_in_last_step(context, Token.REG_BP, new_bp)
 
     def _handler_lev(self, context, output):
         """LEV -- restore frame, return.
