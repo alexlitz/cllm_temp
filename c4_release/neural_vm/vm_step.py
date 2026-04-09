@@ -1637,16 +1637,6 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     _set_carry_forward_attn(
         attn3, 1, BD.MARK_AX, AX_I, AX_I, HD, BD.AX_CARRY_LO, BD.AX_CARRY_HI
     )
-    # FIX (2026-04-08): Override V weights to copy from OUTPUT instead of EMBED.
-    # _set_carry_forward_attn copies from EMBED by default, but for AX we need OUTPUT
-    # because OUTPUT contains the actual register value after L6-L10 transformations.
-    # This fixes JMP/NOP/EXIT AX corruption bug where AX_CARRY had stale EMBED values.
-    base = 1 * HD  # Head 1
-    for k in range(16):
-        attn3.W_v[base + 1 + k, BD.EMBED_LO + k] = 0.0  # Clear EMBED source
-        attn3.W_v[base + 17 + k, BD.EMBED_HI + k] = 0.0  # Clear EMBED source
-        attn3.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0  # Use OUTPUT instead
-        attn3.W_v[base + 17 + k, BD.OUTPUT_HI + k] = 1.0  # Use OUTPUT instead
     # Head 2: SP carry (prev step SP byte 0 → EMBED at SP marker)
     _set_carry_forward_attn(
         attn3, 2, BD.MARK_SP, SP_I, SP_I, HD, BD.EMBED_LO, BD.EMBED_HI
@@ -1658,33 +1648,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # Head 4: STACK0 carry (prev step STACK0 byte 0 → EMBED at STACK0 marker)
     # Uses STACK0_BYTE0 flag (computed in L1 FFN) as key instead of L1H1/L1H0.
     _set_stack0_carry_attn(attn3, 4, HD)
-
-    # Head 5: AX marker OUTPUT preservation (prev AX marker OUTPUT → current AX marker AX_CARRY)
-    # FIX (2026-04-09): Add dedicated head to copy previous AX marker's OUTPUT to AX_CARRY.
-    # This fixes JMP/NOP/EXIT AX corruption where AX_CARRY had wrong values.
-    # Attends from current AX marker to previous AX marker (not byte 0, but the marker itself).
-    # Only fires on subsequent steps (HAS_SE=1) to avoid issues on first step.
-    base = 5 * HD
-    L = 15.0
-    # Q: Fire at AX marker on subsequent steps only (HAS_SE=1)
-    attn3.W_q[base, BD.MARK_AX] = L
-    attn3.W_q[base, BD.HAS_SE] = L
-    attn3.W_q[base, BD.CONST] = -L * 1.5  # Threshold: need both MARK_AX and HAS_SE
-    # K: Match previous step's AX marker
-    attn3.W_k[base, BD.MARK_AX] = L
-    # V: Copy OUTPUT_LO/HI from previous AX marker (the final register value)
-    for k in range(16):
-        attn3.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
-        attn3.W_v[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
-    # O: Write to AX_CARRY_LO/HI at current AX marker (higher priority than head 1)
-    for k in range(16):
-        attn3.W_o[BD.AX_CARRY_LO + k, base + 1 + k] = 2.0  # Higher weight to override head 1
-        attn3.W_o[BD.AX_CARRY_HI + k, base + 17 + k] = 2.0
-    # Anti-leakage gate
-    GATE = 33
-    attn3.W_q[base + GATE, BD.MARK_AX] = L
-    attn3.W_q[base + GATE, BD.CONST] = -L / 2
-    attn3.W_k[base + GATE, BD.CONST] = L
+    # NOTE: Attempted fix for JMP/NOP/EXIT AX corruption by adding head 5 to copy
+    # previous AX marker OUTPUT to AX_CARRY. This broke pure neural mode (predictions
+    # became all 1's), so the fix was reverted. The bug persists but system remains
+    # functional in hybrid mode.
 
     ffn3 = model.blocks[3].ffn  # Layer 3 (L3) = blocks[3]
     _set_layer3_ffn(ffn3, S, BD)

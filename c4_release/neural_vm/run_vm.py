@@ -213,26 +213,27 @@ class AutoregressiveVMRunner:
         # These are runner-side compatibility shims for full 32-bit correctness
         # while the corresponding neural memory paths are being completed.
         self._func_call_handlers = {
-            Opcode.IMM: self._handler_imm,
-            Opcode.LEA: self._handler_lea,
+            # REMOVED: IMM and LEA now work fully neurally (L6 FFN relay)
+            # Opcode.IMM: self._handler_imm,
+            # Opcode.LEA: self._handler_lea,
             Opcode.JSR: self._handler_jsr,
             Opcode.ENT: self._handler_ent,
             Opcode.LEV: self._handler_lev,
-            # Stack operations
-            Opcode.PSH: self._handler_psh,
-            # Arithmetic operations (neural weights broken, using fallback)
-            Opcode.ADD: self._handler_add,
-            Opcode.SUB: self._handler_sub,
-            Opcode.MUL: self._handler_mul,
-            Opcode.DIV: self._handler_div,
-            Opcode.MOD: self._handler_mod,
-            # Bitwise operations (neural weights broken, using fallback)
-            Opcode.OR: self._handler_or,
-            Opcode.XOR: self._handler_xor,
-            Opcode.AND: self._handler_and,
-            # Shift operations (neural weights broken, using fallback)
-            Opcode.SHL: self._handler_shl,
-            Opcode.SHR: self._handler_shr,
+            # REMOVED: PSH now works fully neurally (L6 FFN SP -= 8)
+            # Opcode.PSH: self._handler_psh,
+            # REMOVED: Arithmetic operations now work fully neurally (L8-L10 ALU)
+            # Opcode.ADD: self._handler_add,
+            # Opcode.SUB: self._handler_sub,
+            # Opcode.MUL: self._handler_mul,
+            # Opcode.DIV: self._handler_div,
+            # Opcode.MOD: self._handler_mod,
+            # REMOVED: Bitwise operations now work fully neurally (L8-L10 ALU)
+            # Opcode.OR: self._handler_or,
+            # Opcode.XOR: self._handler_xor,
+            # Opcode.AND: self._handler_and,
+            # REMOVED: Shift operations now work fully neurally (L8-L10 ALU)
+            # Opcode.SHL: self._handler_shl,
+            # Opcode.SHR: self._handler_shr,
         }
 
         # If True: disable runner VM-memory emulation paths and only allow
