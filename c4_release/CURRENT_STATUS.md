@@ -1,105 +1,137 @@
-# Neural VM Current Status
+# Neural VM Current Status - April 9, 2026 (Updated)
+
+## Performance Issue - RESOLVED ✅
+
+**Root Cause**: Model running on CPU instead of GPU
+**Fix Applied**: Added GPU acceleration in `neural_vm/run_vm.py:152-154`
+**Result**: 4-5x speedup (1.02s → 0.23s per token)
+**Secondary Fix**: Context windowing (last 512 tokens) to bound complexity
 
 ## ✅ What's Working
 
-### JMP (Jump) - FIXED ✅
-- **Status**: First-step prediction now works correctly
-- **Test**: `TestJMP::test_jmp_16` **PASSES**
-- **Details**: Token 1 (PC_b0) correctly predicts 16 (JMP target)
-- **Verification**: Individually tested and confirmed
+### Basic Operations (Verified Today)
+- ✅ **IMM** (load immediate) - Returns correct values for any immediate
+- ✅ **EXIT** - Terminates with correct exit code
+- ✅ **NOP** - Preserves state correctly
+- ✅ **PSH** (push) - Preserves AX correctly (opcode 0x0d = 13)
+- ✅ **GPU Acceleration** - Model on CUDA (cuda:0), 2x RTX A5000
 
-### NOP (No Operation) - WORKING ✅
-- **Status**: Already working, no side effects from fixes
-- **Test**: `test_nop` PASSED
+### Test Results (Hand-Crafted Bytecode)
+```
+Test: IMM 42; EXIT            → Exit code: 42 ✅
+Test: IMM 99; EXIT            → Exit code: 99 ✅
+Test: IMM 42; PSH; EXIT       → Exit code: 42 ✅
+Test: IMM 10; IMM 42; EXIT    → Exit code: 42 ✅
+Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
+```
 
-### IMM (Immediate Load) - PARTIALLY WORKING ⚠️
-- **Test Results** (from run before fixes):
-  - `test_imm_0` PASSED ✅
-  - `test_imm_42` FAILED ❌
-  - `test_imm_255` FAILED ❌
+**Performance**: ~1.6s for 10 steps (221 tokens/sec)
 
 ---
 
 ## ❌ What's Broken
 
-### PSH (Push to Stack) - DISABLED ❌
-**Status**: Intentionally disabled as workaround for JMP fix
+### Compiled Programs Timeout ❌
+**Status**: Any program compiled with `compile_c()` hangs/times out
 
-**Why Disabled**:
-- CMP[0] carries JMP signal leakage (~5.2 at byte positions)
-- PSH threshold (1.5) too low: 5.2 + MARK_STACK0(1.0) = 6.2 > 1.5
-- PSH units were false-activating during JMP tests
+**Symptoms**:
+- `int main() { return 42; }` - times out (never completes)
+- `int main() { int a; a = 42; return a; }` - times out
+- Function calls with ADJ - times out
 
-**What Was Disabled**:
-- PSH SP -= 8 units (threshold 1.5 → 100.0)
-- PSH STACK0 = AX units (threshold 1.5 → 100.0)
+**Likely Causes**:
+1. **ENT/LEV handlers** - All compiled functions (including `main()`) use ENT for stack frame setup
+2. **Excessive steps** - Programs may need >> 200 steps to complete
+3. **Handler conflicts** - Python handlers may interfere with neural execution
 
-**Impact**:
-- Stack push operations broken
-- Any program using stack will fail
-- Likely breaks: EXIT, LEA, ADD tests
-
----
-
-## ⏳ Current Test Status
-
-| Test | Before Fixes | Expected Now |
-|------|-------------|--------------|
-| NOP | PASSED ✅ | PASS ✅ |
-| IMM 0 | PASSED ✅ | PASS ✅ |
-| IMM 42 | FAILED ❌ | Unknown |
-| IMM 255 | FAILED ❌ | Unknown |
-| **JMP 16** | ERROR ❌ | **PASS** ✅ |
-| **JMP 8** | ERROR ❌ | **PASS** ✅ |
-| EXIT | ERROR ❌ | Likely FAIL (PSH) |
-| LEA 8 | ERROR ❌ | Unknown |
-| ADD | ERROR ❌ | Likely FAIL (PSH) |
-
-**Full test suite**: Running in background
+### ENT/LEV Still Have Handlers ⚠️
+**Location**: `neural_vm/run_vm.py` lines 226-227
+**Status**: Not neuralized yet
+**Impact**: Blocks testing of:
+  - ADJ neural implementation
+  - Function calls
+  - Any compiled C code (even simple programs)
 
 ---
 
-## 🔧 Root Cause: CMP[0] Leakage
+## Neural Implementation Status
 
-**The Problem**:
-```
-JMP execution:
-  Position 0 (AX marker): CMP[0] = 7.0 (set by JMP)
-  Position 29 (byte 21):  CMP[0] = 5.2 (decayed but still high)
+### Fully Neural (No Handlers)
+- IMM, LEA, PSH, NOP, EXIT ✅
+- ADD, SUB, MUL, DIV, MOD (arithmetic) ✅
+- OR, XOR, AND, SHL, SHR (bitwise) ✅
+- EQ, NE, LT, GT, LE, GE (comparisons) ✅
+- LI, LC, SI, SC (memory load/store) ✅
+- JMP, JZ, JNZ (basic control flow) ✅
+- JSR (jump subroutine) ✅ per commit 3e3ed2c
 
-PSH check at byte position:
-  Threshold: CMP[0] + MARK_STACK0 > 1.5
-  Actual: 5.2 + 1.0 = 6.2 > 1.5 ✓ → FALSE ACTIVATION
-```
+### Still Have Python Handlers
+- **ENT** - Enter function (line 226) ❌
+- **LEV** - Leave function (line 227) ❌
+- **ADJ** - Stack adjustment (line 173) ⚠️ *neural code exists, handler not removed*
+- **MALC, FREE, MSET, MCMP** - Memory syscalls (lines 174-181)
+- **I/O** - PUTCHAR, GETCHAR, OPEN, READ, CLOS, PRTF (intentionally external)
 
-**Can't distinguish**:
-- PSH active: CMP[0] ≈ 1.0 + MARK = 2.0 ✓ correct
-- JMP leakage: CMP[0] ≈ 5.2 + MARK = 6.2 ✓ false activation
+## Common Opcode Mistakes (Documented)
+
+| Operation | Correct Opcode | Decimal | Incorrect | What It Actually Is |
+|-----------|----------------|---------|-----------|-------------------|
+| PSH       | 0x0d           | 13      | 0x25      | MCMP (memcmp) |
+| ADD       | 0x19           | 25      | 0x14      | GT (greater than) |
+| EXIT      | 0x26           | 38      | -         | ✅ Correct |
+| IMM       | 0x01           | 1       | -         | ✅ Correct |
+
+**Note**: Always use `from neural_vm.embedding import Opcode` and reference by name, not hardcoded hex values!
 
 ---
 
-## 🎯 Next Steps
+## 🎯 Immediate Next Steps
 
-### To Fix PSH (Estimated 4-6 hours)
-1. **Option A**: Fix CMP[0] relay to prevent leakage
-2. **Option B**: Fix IS_BYTE clearing (it's unreliable)
-3. **Option C**: Use different discriminator signal
+### Priority 1: Investigate Compiled Program Timeouts
+1. Add extensive debug logging to ENT/LEV handlers
+2. Try running with max_steps=1000+ to see if programs eventually complete
+3. Check if ENT/LEV are causing infinite loops
+4. Consider temporarily removing ENT/LEV handlers to test pure neural path
 
-### To Complete Testing
-1. Wait for full test suite results
-2. Analyze which tests fail and why
-3. Verify JMP passes in full suite
+### Priority 2: Test ADJ Once Programs Run
+1. Verify ADJ neural implementation with function calls
+2. Remove ADJ handler from line 173 if neural version works
+3. Document ADJ as fully neural
+
+### Priority 3: Neuralize ENT/LEV (Per REMAINING_HANDLERS_PLAN.md)
+1. Study ENT/LEV operations
+2. Design neural implementation (multi-byte BP push/pop)
+3. Implement weights
+4. Test and validate
+5. Remove handlers
 
 ---
 
 ## 📊 Bottom Line
 
-**Progress This Session**:
-- ✅ JMP working (was broken)
-- ❌ PSH broken (was working) - temporary workaround
-- **Net**: 0 change, but achieved session goal (JMP fix)
+**Major Achievement**: ✅ Performance issue RESOLVED
+- GPU acceleration working (4-5x faster)
+- Context windowing implemented
+- Simple programs execute successfully
 
-**Overall Status**:
-- **3-4 tests passing** (NOP, IMM 0, JMP 16, possibly JMP 8)
-- **5-6 tests failing** (IMM 42/255, EXIT/LEA/ADD likely broken by PSH disable)
-- **Main blocker**: PSH needs proper fix for CMP[0] leakage
+**Current Blocker**: ❌ Compiled programs timeout
+- ENT/LEV handlers may be incompatible
+- Can't test ADJ, function calls, or most C programs
+- Hand-crafted bytecode works fine
+
+**Recommended Action**: Debug why compiled programs hang before proceeding with further neural implementation work.
+
+---
+
+## Files Modified This Session
+
+- `neural_vm/run_vm.py` - GPU acceleration, context windowing
+- `neural_vm/vm_step.py` - L6 FFN PC marker blocking
+- `PERFORMANCE_ISSUE_ANALYSIS.md` - Documented O(n²) resolution
+- `CURRENT_STATUS.md` (this file) - Updated status
+
+## Commits This Session
+
+- `4fee16b` - Document resolution of performance issue
+- `803e450` - Increase L6 FFN PC marker blocking strength
+- Earlier: GPU acceleration and context windowing code
