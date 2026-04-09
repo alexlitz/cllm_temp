@@ -1502,9 +1502,17 @@ class AutoregressiveVMRunner:
         self._mem_store_word(new_sp, return_addr)
 
     def _handler_ent(self, context, output):
-        """ENT -- push BP, set new frame, allocate locals.
+        """ENT -- allocate local variables (MINIMAL HANDLER).
 
-        *--sp = bp;  bp = sp;  sp -= imm;
+        Neural implementation handles:
+        - STACK0 = old_BP (L6 FFN units 978-1009)
+        - BP = old_SP - 8 (L6 FFN units 1010-1041)
+        - MEM token for old_BP (L14 STACK0 source)
+
+        This handler ONLY handles:
+        - SP -= (8 + imm) for local variable allocation
+
+        Future: Implement ENT-specific ALU to eliminate this handler.
         """
         exec_pc = self._exec_pc()
         exec_idx = exec_pc // INSTR_WIDTH
@@ -1516,27 +1524,18 @@ class AutoregressiveVMRunner:
         if imm >= 0x800000:
             imm -= 0x1000000
 
-        # CRITICAL: Use _last_sp/_last_bp, NOT model output!
-        # ENT must see JSR's overridden SP. The model output is stale/wrong.
-        old_sp = self._last_sp
-        old_bp = self._last_bp
+        # Read SP from model output (BP and STACK0 are handled neurally)
+        current_sp = self._extract_register(context, Token.REG_SP)
+        if current_sp is None:
+            current_sp = self._last_sp
 
-        # Push old BP: *--sp = bp
-        push_addr = (old_sp - 8) & 0xFFFFFFFF
-        # bp = sp (after push)
-        new_bp = push_addr
-        # sp -= imm (allocate locals)
-        new_sp = (new_bp - imm) & 0xFFFFFFFF
+        # Neural implementation sets BP = old_SP - 8
+        # We need: SP = (old_SP - 8) - imm = old_SP - 8 - imm
+        # Since current_sp ≈ old_sp (neural doesn't change SP for ENT)
+        new_sp = (current_sp - 8 - imm) & 0xFFFFFFFF
 
-        # Override all registers
+        # Override ONLY SP (let neural handle BP, STACK0, MEM)
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_register_in_last_step(context, Token.REG_BP, new_bp)
-        self._override_register_in_last_step(context, Token.STACK0, old_bp)
-        # ENT advances PC by INSTR_WIDTH (like other func_call handlers override PC)
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-        # Shadow memory: store old BP at push_addr
-        self._mem_store_word(push_addr, old_bp)
 
     def _handler_lev(self, context, output):
         """LEV -- restore frame, return.
