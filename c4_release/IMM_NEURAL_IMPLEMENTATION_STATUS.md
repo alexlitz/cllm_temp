@@ -4,9 +4,11 @@
 
 **Goal**: Make IMM instruction execute neurally (without runner fallback)
 
-**Current Status**: PARTIALLY WORKING
+**Current Status**: ALMOST WORKING
 - Exit code 42: ✓ (via runner fallback)
-- Neural execution: ✗ (model generates AX=0)
+- Neural OP_IMM relay: ✓ (OP_IMM reaches AX marker)
+- Neural FETCH relay: ✗ (FETCH not reaching AX marker)
+- Neural execution: ✗ (model still generates AX=0)
 
 ## Fixes Applied
 
@@ -31,113 +33,111 @@ for opcode_value, op_dim in [
 ### Fix 2: SP/BP Default Unit Marker Gates ✓
 
 **Problem**: Layer 3 FFN units 4 & 5 (SP/BP carry propagation) fired at ALL register positions, corrupting AX
-**Location**: `neural_vm/vm_step.py` lines 2434-2454
-**Fix**: Added marker gates to restrict units to SP/BP positions only
+**Location**: `neural_vm/vm_step.py` lines 2467-2483, 2534-2535
+**Fix**: Added marker gates and PC_I definition to restrict units to SP/BP positions only
 
 ```python
-# Unit 4 (SP default)
-ffn.W_gate[unit, BD.MARK_SP] = 1.0  # Only fire at SP positions
+# Marker indices
+PC_I = 0
+SP_I = 2
+BP_I = 3
 
-# Unit 5 (BP default)
-ffn.W_gate[unit, BD.MARK_BP] = 1.0  # Only fire at BP positions
+# SP DEFAULT: gated to MARK_SP positions
+ffn.W_gate[unit, BD.MARK_SP] = 1.0
+
+# BP DEFAULT: gated to MARK_BP positions
+ffn.W_gate[unit, BD.MARK_BP] = 1.0
 ```
 
 **Verification**: ✓ Confirmed gates present, OUTPUT_LO[1]=0 at AX positions
 
-## Remaining Issue: Layer 5 Opcode Fetch Broken ✗
+### Fix 3: Layer 5 Head 7 - Direct OP_* Relay (First Step) ✓
 
-**Problem**: Layer 5 attention not populating OPCODE_BYTE_LO/HI at PC marker
+**Problem**: Layer 5 opcode fetch (OPCODE_BYTE mechanism) not working for first step
+**Location**: `neural_vm/vm_step.py` lines 2912-2973
+**Fix**: Added Head 7 to directly copy OP_* flags from CODE bytes to PC marker on first step
 
-### Expected Flow (from code comments)
+```python
+# Head 7: Direct OP_* flag relay from CODE to PC marker (first step only)
+# Query: PC marker when NOT HAS_SE, address PC_OFFSET
+# Key: match ADDR_KEY in CODE section
+# Value: copy OP_* flags (OP_IMM, OP_LEA, OP_EXIT, etc.)
+# Output: write OP_* flags to PC marker
+base = 7 * HD
+attn.W_q[base, BD.MARK_PC] = L
+attn.W_q[base, BD.HAS_SE] = -L  # only on first step
+# ... 16 OP flags copied
+```
 
-1. **Layer 5 Attention Head 1** (`_set_layer5_fetch`, line 2680-2718):
-   - Query: PC marker looks for ADDR_KEY matching current PC value
-   - Key: CODE section bytes with ADDR_KEY
-   - Value: Copies EMBED_LO/HI (opcode nibbles) from matched CODE byte
-   - Output: Writes to OPCODE_BYTE_LO/HI at PC marker
+**Verification**: ✓ OP_IMM=6.0 at PC marker after Layer 5
 
-2. **Layer 5 FFN Opcode Decode** (`_set_opcode_decode_ffn`, line 2930-2939):
-   - Reads: OPCODE_BYTE_LO[1] AND OPCODE_BYTE_HI[0] (for IMM)
-   - Writes: OP_IMM=5.0 at PC marker (if both nibbles match)
+### Fix 4: Layer 6 Head 5 - OP_* Relay to AX Marker (Existing, Verified) ✓
 
-3. **Layer 5 Attention Head 5** (line 3187-3221):
-   - Relays OP_IMM from PC marker → AX marker
+**Status**: Already implemented in codebase
+**Location**: `neural_vm/vm_step.py` lines 3465-3518
+**Function**: Relays OP_* flags and FETCH from PC marker to AX marker on first step
 
-4. **Layer 6 FFN IMM Routing** (line 3262-3274):
-   - Condition: OP_IMM AND MARK_AX
-   - Action: Route FETCH → OUTPUT
+**Verification**: ✓ OP_IMM=0.351 at AX marker after Layer 6 (relay working)
 
-### Current Observations
+## Current Status
 
-**ADDR_KEY Injection**: ✓ Working
-- IMM opcode at position 1 has ADDR_KEY[2]=1.0 (correct for PC=2 with PC_OFFSET=2)
+### ✓ Working Components
 
-**OPCODE_BYTE Population**: ✗ Broken
-- OPCODE_BYTE_LO/HI remain 0.000 at PC marker through all layers
-- This breaks the entire chain
+1. **OP_IMM in CODE byte**: OP_IMM=1.0 at CODE byte (embedding) ✓
+2. **OP_IMM at PC marker**: OP_IMM=6.0 at PC marker after Layer 5 ✓
+3. **OP_IMM at AX marker**: OP_IMM=0.351 at AX marker after Layer 6 ✓
+4. **FETCH at PC marker**: FETCH_LO[0xa]=1.0, FETCH_HI[0x2]=1.0 after Layer 5 ✓
+5. **Layer 6 Head 5 weights**: Correctly configured for OP and FETCH relay ✓
+6. **Layer 6 FFN routing**: 64 IMM routing units configured ✓
 
-**OP_IMM Appearance**: ⚠️ Appears in Layer 5 but value is wrong
-- OP_IMM jumps from 0.000 → 5.000 in Layer 5
-- But this might be a different mechanism (first-step decode)
+### ✗ Not Working
 
-## Root Cause Hypothesis
+1. **FETCH relay to AX marker**: FETCH remains 0.0 at AX marker after Layer 6 ✗
+2. **OUTPUT generation**: OUTPUT remains 0.0 at AX marker ✗
+3. **Final prediction**: Model predicts AX=0 instead of AX=42 ✗
 
-Layer 5 attention Head 1 is not successfully fetching the opcode byte from CODE to PC marker. Possible reasons:
+## Root Cause Analysis
 
-1. **ADDR_KEY matching not working**: Attention query/key match fails
-2. **PC value wrong at PC marker**: Query doesn't have correct PC to match ADDR_KEY=2
-3. **VALUE weights wrong**: V doesn't copy EMBED_LO/HI correctly
-4. **OUTPUT weights wrong**: W_o doesn't write to OPCODE_BYTE_LO/HI correctly
-5. **HEAD routing issue**: Wrong head index or MoE routing problem
+### The Mystery: Why OP_IMM Relays But FETCH Doesn't
 
-## Diagnostic Tests Run
+**Observation**: Layer 6 Head 5 successfully relays OP_IMM from PC to AX (0.351), but FETCH values remain 0.0 at AX, despite:
+- Same head (Head 5)
+- Same Q/K/V/O mechanism
+- Same PC → AX relay pattern
+- Verified V weights: `W_v[base+17+k, BD.FETCH_LO+k] = 1.0`
+- Verified O weights: `W_o[BD.FETCH_LO+k, base+17+k] = 1.0`
 
-1. ✓ `verify_imm_fix.py`: Confirmed marker gates, found AX=0 issue
-2. ✓ `debug_imm_neural_pathway.py`: Traced layers, found OP_IMM=0 at AX
-3. ✓ `debug_opcode_relay.py`: Found OP_IMM appears in Layer 5 (but value 5.0)
-4. ✓ `debug_opcode_byte.py`: Confirmed OPCODE_BYTE_LO/HI not populated
+**Hypothesis**: Possible causes:
+1. **V matrix dimension conflict**: OP flags use V[base+0..16], FETCH uses V[base+17..48]. Maybe head dimension (HD=64) is too small?
+2. **Attention saturation**: Strong OP_IMM signal (6.0 at PC) might saturate attention, blocking FETCH relay
+3. **Residual interference**: FETCH dims may have residual values that block the relay
+4. **Layer ordering issue**: Maybe FETCH needs to be relayed before Layer 6?
 
 ## Next Steps
 
-### Option A: Debug Layer 5 Attention Fetch (Complex)
-- Trace Layer 5 attention Head 1 Q/K/V/O matrices
-- Check ADDR_KEY matching mechanism
-- Verify PC value propagation to PC marker
-- Fix attention weights if broken
+### Option A: Debug FETCH Relay Mechanism
+1. Check if HD=64 accommodates 49 value dimensions (17 OP + 32 FETCH)
+2. Trace attention scores for Head 5 to see if FETCH values are computed
+3. Check for residual interference in FETCH dims at AX marker
+4. Investigate if V output is saturated
 
-### Option B: Simplify to Direct Embedding Approach (Simpler)
-- Remove opcode fetch mechanism entirely
-- Rely on OP_* flags in embeddings propagating naturally
-- Adjust Layer 5 FFN to read from OP_* dims at PC marker (already set in embeddings)
-- Skip OPCODE_BYTE intermediate representation
+### Option B: Move FETCH Relay to Different Head
+1. Use Layer 6 Head 4 (currently used for BZ/BNZ) or Head 7 for FETCH relay
+2. Keep OP relay in Head 5
+3. Separate the two relay tasks to avoid dimension conflicts
 
-### Option C: Use First-Step Decode Path (Medium)
-- Layer 5 already has "first-step decode at PC marker" (line 2930-2939)
-- This writes OP_IMM=5.0 directly to PC marker
-- Verify this path works
-- Extend it to handle all steps (not just first step)
-
-## Recommendation
-
-**Option B: Direct Embedding Approach** is cleanest:
-
-1. Remove dependency on OPCODE_BYTE_LO/HI
-2. OP_* flags already set in opcode byte embeddings (Fix 1)
-3. Layer 5 attention should relay OP_* from CODE bytes to PC marker
-4. Then existing relay (PC → AX) and routing (AX) will work
-
-**Implementation**:
-- Add Layer 4 or Layer 5 attention head that copies OP_* flags from CODE to PC marker
-- Use ADDR_KEY matching (same mechanism as immediate fetch)
-- Query at PC marker, match ADDR_KEY, copy OP_IMM/OP_EXIT/etc. from CODE byte
-
-This bypasses the broken OPCODE_BYTE mechanism and uses the embeddings we just fixed.
+### Option C: Strengthen FETCH Relay Signal
+1. Increase FETCH values at PC marker (currently 1.0)
+2. Add bias to V/O matrices for FETCH relay
+3. Use dedicated FETCH relay head with stronger weights
 
 ## Files Modified
 
 1. `neural_vm/vm_step.py`:
    - Lines 1519-1559: Added OP_* flags to opcode byte embeddings
-   - Lines 2434-2454: Added marker gates to SP/BP default units
+   - Lines 2467-2483: Added SP/BP marker gates
+   - Lines 2534-2535: Added PC_I definition
+   - Lines 2912-2973: Added Layer 5 Head 7 for first-step OP_* relay
 
 ## Files Created
 
@@ -153,4 +153,5 @@ This bypasses the broken OPCODE_BYTE mechanism and uses the embeddings we just f
 - **Session Start**: Found IMM instruction produces wrong exit code (65536 vs 42)
 - **Root Cause 1**: Layer 3 SP/BP units corrupting AX → Fixed with marker gates
 - **Root Cause 2**: Opcode bytes lack OP_* flags → Fixed in embeddings
-- **Current Block**: Layer 5 opcode fetch not working → Needs fix (Option B recommended)
+- **Root Cause 3**: Layer 5 opcode fetch not working → Fixed with Head 7 direct relay
+- **Current Block**: Layer 6 FETCH relay not working → OP relays but FETCH doesn't

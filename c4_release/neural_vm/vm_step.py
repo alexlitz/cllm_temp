@@ -2208,12 +2208,17 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     # H1[SP/BP]: bytes 0-3 (L3 handles byte 2 default, L15 PSH handles changes)
     SP_I = 2  # SP marker index
     BP_I = 3  # BP marker index
+    AX_I = 1  # AX marker index in MARKS array
     for k in range(16):
-        # Up: fires at byte positions, suppressed at PC marker, SP, BP, and MEM during store ops
+        # Up: fires at byte positions, suppressed at register areas with custom handling
+        # Note: STACK0 uses separate MARK_STACK0 (not in MARKS array), so we use L1H4[BP]
+        # which covers d <= 9.5 from BP marker (STACK0 is at d=5-9 from BP)
         ffn.W_up[unit, BD.IS_BYTE] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S  # Suppress at PC byte 0 only (MARK_PC)
-        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP
-        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP
+        ffn.W_up[unit, BD.MARK_PC] = -S  # Suppress at PC byte 0 (L3 handles increment)
+        ffn.W_up[unit, BD.H1 + AX_I] = -S  # Suppress at AX (L3/L6 handle)
+        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP (L3/L15 PSH handle)
+        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP (L3 default handles)
+        ffn.W_up[unit, BD.L1H4 + BP_I] = -S  # Suppress at STACK0 area (d<=9.5 from BP)
         ffn.W_up[unit, BD.MEM_STORE] = -S  # Suppress at MEM during PSH/SI/SC
         ffn.b_up[unit] = -S * 0.5
         # Gate: copy this specific nibble value
@@ -2224,9 +2229,11 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     # HI nibbles: same logic
     for k in range(16):
         ffn.W_up[unit, BD.IS_BYTE] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S  # Suppress at PC byte 0 only (MARK_PC)
-        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP
-        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP
+        ffn.W_up[unit, BD.MARK_PC] = -S  # Suppress at PC byte 0 (L3 handles increment)
+        ffn.W_up[unit, BD.H1 + AX_I] = -S  # Suppress at AX (L3/L6 handle)
+        ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP (L3/L15 PSH handle)
+        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP (L3 default handles)
+        ffn.W_up[unit, BD.L1H4 + BP_I] = -S  # Suppress at STACK0 area (d<=9.5 from BP)
         ffn.W_up[unit, BD.MEM_STORE] = -S  # Suppress at MEM during PSH/SI/SC
         ffn.b_up[unit] = -S * 0.5
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
@@ -2580,6 +2587,40 @@ def _set_layer3_ffn(ffn, S, BD):
         ffn.b_gate[unit] = 1.0
         ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
         unit += 1
+
+    # STACK0 DEFAULT: bytes 1-3 = 0 (for single-byte results)
+    # At STACK0 byte positions (L1H4[BP]=1), output 0 for bytes 1-3.
+    # For multi-byte results, later layers will override.
+    for byte_idx_dim in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]:
+        # Condition: L1H4[BP] AND BYTE_INDEX_K → OUTPUT = 0
+        # L1H4[BP] = 1 for d <= 9.5 from BP, which covers STACK0 area (d=5-9)
+        ffn.W_up[unit, BD.L1H4 + BP_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
+        unit += 1
+        ffn.W_up[unit, BD.L1H4 + BP_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
+        unit += 1
+
+    # STACK0 first-step default: byte 0 = 0 (empty stack)
+    # At STACK0 marker, when NOT HAS_SE, output 0.
+    ffn.W_up[unit, BD.MARK_STACK0] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 0.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
+    unit += 1
+    ffn.W_up[unit, BD.MARK_STACK0] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * 0.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
+    unit += 1
 
     # PC INCREMENT: when MARK_PC AND HAS_SE, add INSTR_WIDTH to carried-forward value
     # For each lo nibble k (0-15): new_lo = (k+INSTR_WIDTH)%16
