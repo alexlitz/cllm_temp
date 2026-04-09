@@ -31,26 +31,38 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 
 ## ❌ What's Broken
 
-### Compiled Programs Timeout ❌
-**Status**: Any program compiled with `compile_c()` hangs/times out
+### JSR Neural Implementation Not Working ❌
+**Status**: JSR (jump subroutine) does NOT work neurally despite commit claiming it does
 
-**Symptoms**:
-- `int main() { return 42; }` - times out (never completes)
-- `int main() { int a; a = 42; return a; }` - times out
-- Function calls with ADJ - times out
+**Evidence**:
+- With JSR handler disabled: PC advances linearly (0x0a → 0x12 → 0x1a...) instead of jumping
+- CALL instruction at PC=0 should jump to main but doesn't
+- Program loops through garbage instructions forever
 
-**Likely Causes**:
-1. **ENT/LEV handlers** - All compiled functions (including `main()`) use ENT for stack frame setup
-2. **Excessive steps** - Programs may need >> 200 steps to complete
-3. **Handler conflicts** - Python handlers may interfere with neural execution
+**Fix**: Re-enabled JSR handler in `neural_vm/run_vm.py:230`
+- Commit `3e3ed2c` claimed JSR was neuralized but it's not functional
+- Neural weights for JSR exist but don't execute correctly
+- **Requires investigation**: Why doesn't neural JSR work?
 
-### ENT/LEV Still Have Handlers ⚠️
-**Location**: `neural_vm/run_vm.py` lines 226-227
-**Status**: Not neuralized yet
-**Impact**: Blocks testing of:
-  - ADJ neural implementation
-  - Function calls
-  - Any compiled C code (even simple programs)
+### Function Call Stack Broken (JSR/ENT/LEV) ❌
+**Status**: Handlers enabled but don't interact correctly
+
+**With stdlib=False** (6 instruction program):
+- ✅ JSR jumps to main correctly
+- ✅ ENT executes
+- ✅ Main body executes (AX reaches 42)
+- ❌ LEV returns to PC=0 instead of returning past JSR
+- ❌ Infinite loop: JSR → main → LEV → PC=0 → JSR → main...
+
+**Root Cause**: Stack memory read/write broken
+- JSR stores return_addr in shadow memory
+- LEV reads return_addr from memory → gets 0x00000000
+- Memory at BP contains all zeros instead of saved BP and return address
+
+**With stdlib=True** (210 instruction program):
+- ❌ CALL target beyond bytecode (instruction 412, but only 210 instructions)
+- ❌ Stdlib code makes program too large for something
+- ❌ Can't test with stdlib until basic function calls work
 
 ---
 
@@ -87,23 +99,37 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 
 ## 🎯 Immediate Next Steps
 
-### Priority 1: Investigate Compiled Program Timeouts
-1. Add extensive debug logging to ENT/LEV handlers
-2. Try running with max_steps=1000+ to see if programs eventually complete
-3. Check if ENT/LEV are causing infinite loops
-4. Consider temporarily removing ENT/LEV handlers to test pure neural path
+### Priority 1: Fix Stack Memory for Function Calls
+1. **Debug why LEV reads all zeros from memory**
+   - JSR writes return address to `memory[new_sp]`
+   - LEV reads from `memory[old_bp]` → gets 0
+   - Check if BP is being set correctly by ENT
+   - Check if memory writes are being tracked correctly
 
-### Priority 2: Test ADJ Once Programs Run
-1. Verify ADJ neural implementation with function calls
-2. Remove ADJ handler from line 173 if neural version works
-3. Document ADJ as fully neural
+2. **Fix memory read/write in handlers**
+   - Verify `_mem_store_word()` actually writes to `self._memory`
+   - Verify `_mem_load_word()` reads from correct address
+   - Check if shadow memory dict is working
 
-### Priority 3: Neuralize ENT/LEV (Per REMAINING_HANDLERS_PLAN.md)
-1. Study ENT/LEV operations
-2. Design neural implementation (multi-byte BP push/pop)
-3. Implement weights
-4. Test and validate
-5. Remove handlers
+3. **Test simple program without loops**
+   - Get `int main() { return 42; }` to work (stdlib=False)
+   - Should: JSR → ENT → execute → LEV → HALT
+   - Current: JSR → ENT → execute → LEV → PC=0 (loop)
+
+### Priority 2: Fix JSR Neural Implementation
+1. **Investigate why neural JSR doesn't jump**
+   - Check L6 FFN PC override weights
+   - Check if OP_JSR flag is being set correctly
+   - Compare with working JMP neural implementation
+
+2. **Either fix neural JSR or document why handler is needed**
+   - If neural version can't work with hand-crafted weights, keep handler
+   - Update documentation to reflect handler requirement
+
+### Priority 3: Test ADJ Once Function Calls Work
+1. Once simple functions work, test with local variables
+2. Verify ADJ neural implementation
+3. Test more complex programs
 
 ---
 
@@ -112,26 +138,39 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 **Major Achievement**: ✅ Performance issue RESOLVED
 - GPU acceleration working (4-5x faster)
 - Context windowing implemented
-- Simple programs execute successfully
+- Hand-crafted bytecode works perfectly
 
-**Current Blocker**: ❌ Compiled programs timeout
-- ENT/LEV handlers may be incompatible
-- Can't test ADJ, function calls, or most C programs
-- Hand-crafted bytecode works fine
+**Root Causes Identified**:
+1. ❌ **JSR neural implementation doesn't work** - PC doesn't jump (re-enabled handler)
+2. ❌ **Stack memory broken** - LEV reads all zeros instead of saved values
+3. ⚠️ **Stdlib causes issues** - CALL target beyond bytecode length
 
-**Recommended Action**: Debug why compiled programs hang before proceeding with further neural implementation work.
+**Current State**:
+- ✅ Basic operations work (IMM, PSH, NOP, EXIT)
+- ✅ Simple programs execute (but loop infinitely due to stack bug)
+- ✅ AX reaches correct values (42)
+- ❌ Function returns don't work (LEV returns to PC=0)
+- ❌ Can't test with stdlib until basic calls work
+
+**Recommended Action**:
+1. Fix shadow memory read/write in JSR/ENT/LEV handlers
+2. Get simple function call working (no stdlib)
+3. Then investigate JSR neural implementation
+4. Then test ADJ and more complex programs
 
 ---
 
 ## Files Modified This Session
 
-- `neural_vm/run_vm.py` - GPU acceleration, context windowing
+- `neural_vm/run_vm.py` - GPU acceleration, context windowing, JSR re-enable, debug logging
 - `neural_vm/vm_step.py` - L6 FFN PC marker blocking
-- `PERFORMANCE_ISSUE_ANALYSIS.md` - Documented O(n²) resolution
-- `CURRENT_STATUS.md` (this file) - Updated status
+- `PERFORMANCE_ISSUE_ANALYSIS.md` - Documented and resolved O(n²) issue
+- `CURRENT_STATUS.md` (this file) - Comprehensive status update
 
 ## Commits This Session
 
+- `2859913` - Re-enable JSR handler + add debug logging for function calls
+- `e476914` - Update current status: performance fixed, compiled programs timeout
 - `4fee16b` - Document resolution of performance issue
 - `803e450` - Increase L6 FFN PC marker blocking strength
 - Earlier: GPU acceleration and context windowing code
