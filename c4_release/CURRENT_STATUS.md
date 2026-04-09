@@ -1,4 +1,23 @@
-# Neural VM Current Status - April 9, 2026 (Updated)
+# Neural VM Current Status - April 9, 2026 (Updated 18:15)
+
+## 🎉 BREAKTHROUGH: Stack Memory Bug FIXED! (Commit ea8718f)
+
+**Critical Fix Applied**: L14 MEM generation now reads OUTPUT instead of CLEAN_EMBED
+
+**Root Cause**: L14 MEM val heads were reading from CLEAN_EMBED (old token embeddings) instead of OUTPUT (updated register values). This caused LEV to read zeros from memory instead of saved BP/return_addr.
+
+**Fix**: Changed `neural_vm/vm_step.py:5830-5831` to read from OUTPUT_LO/HI dims.
+
+**Test Results**:
+- ✅ Handcrafted bytecode (JSR → ENT → IMM 42 → LEV → EXIT): **Exit code 42** (PASS!)
+- ✅ Stack memory now works correctly for basic function calls
+- ⏭️ Stdlib-compiled programs (210 instructions): Still under investigation
+
+**Impact**: Unblocks path to 100% neural VM - JSR/ENT/LEV handlers can now be removed after further testing.
+
+**Details**: See `SESSION_SUMMARY_L14_FIX.md`
+
+---
 
 ## Performance Issue - RESOLVED ✅
 
