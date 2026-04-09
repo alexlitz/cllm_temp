@@ -25,9 +25,9 @@ from typing import List, Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 import json
 
-from .transformer_vm import C4TransformerVM, NeuralALU, TransformerState
-from .speculator import FastLogicalVM, SpeculativeVM
-from .compiler import compile_c, Compiler
+from ..transformer_vm import C4TransformerVM, NeuralALU, TransformerState
+from ..speculator import FastLogicalVM, SpeculativeVM
+from ..compiler import compile_c, Compiler
 
 
 @dataclass

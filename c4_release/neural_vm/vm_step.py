@@ -5822,10 +5822,13 @@ def _set_layer14_mem_generation(attn, S, BD, HD):
         attn.W_q[base + 34, BD.MEM_STORE] = 250.0
         attn.W_k[base + 34, BD.CONST] = 5.0
 
-        # V: copy CLEAN_EMBED nibbles (from AX or STACK0, determined by attention)
+        # V: copy OUTPUT nibbles (from AX or STACK0, determined by attention)
+        # CRITICAL BUG FIX 2026-04-09: Must read OUTPUT (not CLEAN_EMBED) to see L6 JSR/ENT updates!
+        # L6 FFN writes updated STACK0 value (return_addr for JSR, old_BP for ENT) to OUTPUT dims.
+        # CLEAN_EMBED still contains the old token embedding value, causing LEV to read zeros.
         for k in range(16):
-            attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
-            attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+            attn.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
+            attn.W_v[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
         # V[0]: cancel L3 MEM default (reads CONST=1.0 from source)
         attn.W_v[base + 0, BD.CONST] = 1.0
 
