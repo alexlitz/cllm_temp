@@ -52,7 +52,7 @@ _TOOL_CALL_OPS = {
 # LI/LC removed: L15 softmax1 memory lookup produces correct AX values
 # when MEM sections are retained in context and MEM_STORE is injected.
 _RUNNER_VM_MEMORY_OPS = {
-    Opcode.ADJ,
+    # Opcode.ADJ,  # Now works fully neurally via L7/L8/L9/L6!
     Opcode.MALC,
     Opcode.FREE,
     Opcode.MSET,

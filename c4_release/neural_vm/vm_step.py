@@ -3978,6 +3978,27 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
+    # === ADJ: SP writeback (route AX result → SP marker) ===
+    # ADJ computes new_sp in AX (via ALU), then writes result to SP marker
+    # Cancel identity carry, write AX_CARRY (the computed result)
+    T_adj = 1.5
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_ADJ] = S
+        ffn.W_up[unit, BD.MARK_SP] = S
+        ffn.b_up[unit] = -S * T_adj
+        ffn.W_gate[unit, BD.EMBED_LO + k] = -1.0  # Cancel identity
+        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0  # Write result
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+        unit += 1
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_ADJ] = S
+        ffn.W_up[unit, BD.MARK_SP] = S
+        ffn.b_up[unit] = -S * T_adj
+        ffn.W_gate[unit, BD.EMBED_HI + k] = -1.0  # Cancel identity
+        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0  # Write result
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+        unit += 1
+
     # === BZ PC override: branch if AX == 0 ===
     # CMP[2]=OP_BZ (normalized ≈1), CMP[4]=AX_LO_IS_ZERO, CMP[5]=AX_HI_IS_ZERO
     # 4-way AND in silu: MARK_PC + CMP[2] + CMP[4] + CMP[5] - 3.5
@@ -4272,13 +4293,16 @@ def _set_layer7_operand_gather(attn, S, BD, HD):
         attn.W_o[BD.ALU_LO + k, base + 1 + k] = 1.0
         attn.W_o[BD.ALU_HI + k, base + 17 + k] = 1.0
 
-    # Head 1: LEA — BP OUTPUT → ALU at AX marker
-    # Only fires when OP_LEA active (Q includes OP_LEA); when OP_LEA=0,
-    # Q=0 → score = -slope*d → softmax1 ≈ 0 (no leakage).
+    # Head 1: LEA/ADJ — BP/SP OUTPUT → ALU at AX marker
+    # LEA: fires when OP_LEA active, gathers BP
+    # ADJ: fires when OP_ADJ active, gathers SP
+    # When both inactive, Q=0 → score = -slope*d → softmax1 ≈ 0 (no leakage).
     base = 1 * HD
-    attn.W_q[base, BD.OP_LEA] = L  # only fires when LEA active
-    attn.W_k[base, BD.MARK_BP] = L
-    # V: copy OUTPUT_LO/HI (BP's byte-0 output from L6 identity carry)
+    attn.W_q[base, BD.OP_LEA] = L  # fires when LEA active
+    attn.W_q[base, BD.OP_ADJ] = L  # fires when ADJ active
+    attn.W_k[base, BD.MARK_BP] = L  # attends to BP (for LEA)
+    attn.W_k[base, BD.MARK_SP] = L  # attends to SP (for ADJ)
+    # V: copy OUTPUT_LO/HI (BP's or SP's byte-0 output from L6)
     for k in range(16):
         attn.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
         attn.W_v[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
@@ -4510,6 +4534,32 @@ def _set_layer8_alu(ffn, S, BD):
                 ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                 unit += 1
 
+    # === ADJ: lo nibble (256 units) ===
+    # Like LEA but gates on OP_ADJ instead
+    # ADJ computes: SP = SP + signed_immediate (gathered via L7 head 1)
+    for a in range(16):
+        for b in range(16):
+            result = (a + b) % 16
+            ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.ALU_LO + a] = S
+            ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH (immediate)
+            ffn.b_up[unit] = -S * 15.5  # High threshold like LEA
+            ffn.W_gate[unit, BD.OP_ADJ] = 1.0
+            ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
+            unit += 1
+
+    # === ADJ carry detection (120 units: pairs where a+b >= 16) ===
+    for a in range(16):
+        for b in range(16):
+            if a + b >= 16:
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ALU_LO + a] = S
+                ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH
+                ffn.b_up[unit] = -S * 15.5  # Match ADJ lo nibble threshold
+                ffn.W_gate[unit, BD.OP_ADJ] = 1.0
+                ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
+                unit += 1
+
     # === SUB borrow detection (120 units: pairs where a < b) ===
     for a in range(16):
         for b in range(16):
@@ -4586,6 +4636,26 @@ def _set_layer9_alu(ffn, S, BD):
                     ffn.W_up[unit, BD.CARRY + 0] = 0.01
                     ffn.b_up[unit] = -S * 15.9  # Slightly higher for carry case
                 ffn.W_gate[unit, BD.OP_LEA] = 1.0
+                ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
+                unit += 1
+
+    # === ADJ hi nibble (no carry 256 + with carry 256 = 512 units) ===
+    # Like LEA but gates on OP_ADJ instead
+    # ADJ computes: SP = SP + signed_immediate
+    for carry_in in [0, 1]:
+        for a in range(16):
+            for b in range(16):
+                result = (a + b + carry_in) % 16
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ALU_HI + a] = S
+                ffn.W_up[unit, BD.FETCH_HI + b] = S  # Read from FETCH
+                if carry_in == 0:
+                    ffn.W_up[unit, BD.CARRY + 0] = -0.01
+                    ffn.b_up[unit] = -S * 15.5  # High threshold for amplified ALU
+                else:
+                    ffn.W_up[unit, BD.CARRY + 0] = 0.01
+                    ffn.b_up[unit] = -S * 15.9  # Slightly higher for carry case
+                ffn.W_gate[unit, BD.OP_ADJ] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
 
@@ -4672,7 +4742,9 @@ def _set_layer9_alu(ffn, S, BD):
                     ffn.W_up[unit, BD.CARRY + 0] = 0.01  # Reduced from S*2.0
                     ffn.b_up[unit] = -S * 2.9  # Relaxed from -S*4.5 to allow activation with just 3 inputs
                 ffn.W_gate[unit, BD.OP_ADD] = 1.0
-                ffn.W_gate[unit, BD.OP_LEA] = 1.0
+                # NOTE: OP_LEA removed from gate because LEA = opcode 0, which causes
+                # false positives (many tokens have value 0 and thus OP_LEA=1 in embedding).
+                # If LEA byte carry is needed, add explicit OP_LEA gating with suppression.
                 ffn.W_down[BD.CARRY + 1, unit] = 2.0 / (S * 5.0)
                 unit += 1
 
