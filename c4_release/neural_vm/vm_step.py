@@ -1516,6 +1516,48 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         embed[b, BD.CLEAN_EMBED_LO + (b & 0xF)] = 1.0
         embed[b, BD.CLEAN_EMBED_HI + ((b >> 4) & 0xF)] = 1.0
 
+    # Set OP_* flags for opcode bytes (enables opcode detection)
+    # When code bytes appear at PC marker, these flags identify the instruction type
+    from .embedding import Opcode
+    for opcode_value, op_dim in [
+        (Opcode.LEA, BD.OP_LEA),
+        (Opcode.IMM, BD.OP_IMM),
+        (Opcode.JMP, BD.OP_JMP),
+        (Opcode.JSR, BD.OP_JSR),
+        (Opcode.BZ, BD.OP_BZ),
+        (Opcode.BNZ, BD.OP_BNZ),
+        (Opcode.ENT, BD.OP_ENT),
+        (Opcode.ADJ, BD.OP_ADJ),
+        (Opcode.LEV, BD.OP_LEV),
+        (Opcode.LI, BD.OP_LI),
+        (Opcode.LC, BD.OP_LC),
+        (Opcode.SI, BD.OP_SI),
+        (Opcode.SC, BD.OP_SC),
+        (Opcode.PSH, BD.OP_PSH),
+        (Opcode.OR, BD.OP_OR),
+        (Opcode.XOR, BD.OP_XOR),
+        (Opcode.AND, BD.OP_AND),
+        (Opcode.EQ, BD.OP_EQ),
+        (Opcode.NE, BD.OP_NE),
+        (Opcode.LT, BD.OP_LT),
+        (Opcode.GT, BD.OP_GT),
+        (Opcode.LE, BD.OP_LE),
+        (Opcode.GE, BD.OP_GE),
+        (Opcode.SHL, BD.OP_SHL),
+        (Opcode.SHR, BD.OP_SHR),
+        (Opcode.ADD, BD.OP_ADD),
+        (Opcode.SUB, BD.OP_SUB),
+        (Opcode.MUL, BD.OP_MUL),
+        (Opcode.DIV, BD.OP_DIV),
+        (Opcode.MOD, BD.OP_MOD),
+        (Opcode.EXIT, BD.OP_EXIT),
+        (Opcode.GETCHAR, BD.OP_GETCHAR),
+        (Opcode.PUTCHAR, BD.OP_PUTCHAR),
+        (39, BD.OP_NOP),  # NOP = 39
+    ]:
+        if opcode_value < 256:  # Ensure it's a valid byte value
+            embed[opcode_value, op_dim] = 1.0
+
     # ===== LAYER 0: Step structure via threshold attention (8 heads) =====
     # 35-token step: PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5)+MEM(9)+SE(1)
     # STACK0 does NOT have IS_MARK (would block BP from threshold view).
@@ -1595,6 +1637,16 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     _set_carry_forward_attn(
         attn3, 1, BD.MARK_AX, AX_I, AX_I, HD, BD.AX_CARRY_LO, BD.AX_CARRY_HI
     )
+    # FIX (2026-04-08): Override V weights to copy from OUTPUT instead of EMBED.
+    # _set_carry_forward_attn copies from EMBED by default, but for AX we need OUTPUT
+    # because OUTPUT contains the actual register value after L6-L10 transformations.
+    # This fixes JMP/NOP/EXIT AX corruption bug where AX_CARRY had stale EMBED values.
+    base = 1 * HD  # Head 1
+    for k in range(16):
+        attn3.W_v[base + 1 + k, BD.EMBED_LO + k] = 0.0  # Clear EMBED source
+        attn3.W_v[base + 17 + k, BD.EMBED_HI + k] = 0.0  # Clear EMBED source
+        attn3.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0  # Use OUTPUT instead
+        attn3.W_v[base + 17 + k, BD.OUTPUT_HI + k] = 1.0  # Use OUTPUT instead
     # Head 2: SP carry (prev step SP byte 0 → EMBED at SP marker)
     _set_carry_forward_attn(
         attn3, 2, BD.MARK_SP, SP_I, SP_I, HD, BD.EMBED_LO, BD.EMBED_HI
@@ -1606,6 +1658,34 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # Head 4: STACK0 carry (prev step STACK0 byte 0 → EMBED at STACK0 marker)
     # Uses STACK0_BYTE0 flag (computed in L1 FFN) as key instead of L1H1/L1H0.
     _set_stack0_carry_attn(attn3, 4, HD)
+
+    # Head 5: AX marker OUTPUT preservation (prev AX marker OUTPUT → current AX marker AX_CARRY)
+    # FIX (2026-04-09): Add dedicated head to copy previous AX marker's OUTPUT to AX_CARRY.
+    # This fixes JMP/NOP/EXIT AX corruption where AX_CARRY had wrong values.
+    # Attends from current AX marker to previous AX marker (not byte 0, but the marker itself).
+    # Only fires on subsequent steps (HAS_SE=1) to avoid issues on first step.
+    base = 5 * HD
+    L = 15.0
+    # Q: Fire at AX marker on subsequent steps only (HAS_SE=1)
+    attn3.W_q[base, BD.MARK_AX] = L
+    attn3.W_q[base, BD.HAS_SE] = L
+    attn3.W_q[base, BD.CONST] = -L * 1.5  # Threshold: need both MARK_AX and HAS_SE
+    # K: Match previous step's AX marker
+    attn3.W_k[base, BD.MARK_AX] = L
+    # V: Copy OUTPUT_LO/HI from previous AX marker (the final register value)
+    for k in range(16):
+        attn3.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
+        attn3.W_v[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
+    # O: Write to AX_CARRY_LO/HI at current AX marker (higher priority than head 1)
+    for k in range(16):
+        attn3.W_o[BD.AX_CARRY_LO + k, base + 1 + k] = 2.0  # Higher weight to override head 1
+        attn3.W_o[BD.AX_CARRY_HI + k, base + 17 + k] = 2.0
+    # Anti-leakage gate
+    GATE = 33
+    attn3.W_q[base + GATE, BD.MARK_AX] = L
+    attn3.W_q[base + GATE, BD.CONST] = -L / 2
+    attn3.W_k[base + GATE, BD.CONST] = L
+
     ffn3 = model.blocks[3].ffn  # Layer 3 (L3) = blocks[3]
     _set_layer3_ffn(ffn3, S, BD)
 
@@ -2145,27 +2225,29 @@ def _set_layer2_mem_byte_flags(ffn, S, BD):
 
 
 def _set_nibble_copy_ffn(ffn, S, BD):
-    """Conditional nibble copy: OUTPUT = EMBED for all non-PC byte values.
+    """Conditional nibble copy: OUTPUT = EMBED for all non-PC-marker byte values.
 
-    PC has custom logic in Layer 3 (default + increment), so exclude it.
-    This handles AX, SP, BP, STACK0, and MEM byte values.
+    PC byte 0 has custom logic in Layer 3 (default + increment), so exclude MARK_PC.
+    PC bytes 1-3 use nibble copy (they're simple carry-forward).
+    SP/BP byte 1 uses Layer 3 defaults, so suppress H1[SP/BP].
 
     For first step outputs, this relies on:
     - AX: Set by IMM instruction (fetched in L5, available in EMBED)
     - SP/BP: Initialized to STACK_INIT, need byte 2 = 0x01
     """
-    PC_I = 0  # PC marker index in MARKS array
     unit = 0
-    # LO nibbles: copy when IS_BYTE AND NOT at PC/SP/BP positions
-    # PC/SP/BP have custom initialization logic in Layer 3, so suppress here
+    # LO nibbles: copy when IS_BYTE AND NOT at MARK_PC/H1[SP]/H1[BP] positions
+    # MARK_PC: byte 0 only (L3 handles increment)
+    # H1[SP/BP]: bytes 0-3 (L3 handles byte 2 default, L15 PSH handles changes)
     SP_I = 2  # SP marker index
     BP_I = 3  # BP marker index
     for k in range(16):
-        # Up: fires at byte positions, suppressed at PC/SP/BP
+        # Up: fires at byte positions, suppressed at PC marker, SP, BP, and MEM during store ops
         ffn.W_up[unit, BD.IS_BYTE] = S
-        ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress at PC
+        ffn.W_up[unit, BD.MARK_PC] = -S  # Suppress at PC byte 0 only (MARK_PC)
         ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP
         ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP
+        ffn.W_up[unit, BD.MEM_STORE] = -S  # Suppress at MEM during PSH/SI/SC
         ffn.b_up[unit] = -S * 0.5
         # Gate: copy this specific nibble value
         ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
@@ -2175,9 +2257,10 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     # HI nibbles: same logic
     for k in range(16):
         ffn.W_up[unit, BD.IS_BYTE] = S
-        ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress at PC
+        ffn.W_up[unit, BD.MARK_PC] = -S  # Suppress at PC byte 0 only (MARK_PC)
         ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP
         ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP
+        ffn.W_up[unit, BD.MEM_STORE] = -S  # Suppress at MEM during PSH/SI/SC
         ffn.b_up[unit] = -S * 0.5
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -2378,26 +2461,101 @@ def _set_layer3_ffn(ffn, S, BD):
     unit += 1
 
     # SP DEFAULT: STACK_INIT = 0x10000
-    # Byte 2 of 0x10000 is 0x01 (lo=1, hi=0)
-    # At SP byte 1 (predicting byte 2), write OUTPUT_LO[1]
-    # Condition: H1[SP] AND BYTE_INDEX_1
-    # Fires on ALL steps. PSH/ADJ in Layer 6 will overwrite when needed.
+    # Bytes: 0x00, 0x00, 0x01, 0x00
+    # At SP positions, default to 0 for bytes 0,1,3 and 1 for byte 2.
+    # Later layers (PSH/ADJ) will override when SP changes.
     SP_I = 2  # SP marker index in MARKS array
+
+    # SP bytes 0, 1, 3 = 0
+    for byte_idx_dim in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_2]:
+        # LO nibble = 0
+        ffn.W_up[unit, BD.H1 + SP_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
+        unit += 1
+        # HI nibble = 0
+        ffn.W_up[unit, BD.H1 + SP_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
+        unit += 1
+
+    # SP byte 2 = 0x01 (lo=1, hi=0)
     ffn.W_up[unit, BD.H1 + SP_I] = S
     ffn.W_up[unit, BD.BYTE_INDEX_1] = S
     ffn.b_up[unit] = -S * 1.5
     ffn.b_gate[unit] = 1.0
-    ffn.W_down[BD.OUTPUT_LO + 1, unit] = 2.0 / S  # byte value 0x01, lo nibble = 1
+    ffn.W_down[BD.OUTPUT_LO + 1, unit] = 2.0 / S  # lo nibble = 1
+    unit += 1
+    ffn.W_up[unit, BD.H1 + SP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S  # hi nibble = 0
     unit += 1
 
     # BP DEFAULT: same as SP
     BP_I = 3  # BP marker index in MARKS array
+
+    # BP bytes 0, 1, 3 = 0
+    for byte_idx_dim in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_2]:
+        # LO nibble = 0
+        ffn.W_up[unit, BD.H1 + BP_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
+        unit += 1
+        # HI nibble = 0
+        ffn.W_up[unit, BD.H1 + BP_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
+        unit += 1
+
+    # BP byte 2 = 0x01 (lo=1, hi=0)
     ffn.W_up[unit, BD.H1 + BP_I] = S
     ffn.W_up[unit, BD.BYTE_INDEX_1] = S
     ffn.b_up[unit] = -S * 1.5
     ffn.b_gate[unit] = 1.0
-    ffn.W_down[BD.OUTPUT_LO + 1, unit] = 2.0 / S
+    ffn.W_down[BD.OUTPUT_LO + 1, unit] = 2.0 / S  # lo nibble = 1
     unit += 1
+    ffn.W_up[unit, BD.H1 + BP_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S  # hi nibble = 0
+    unit += 1
+
+    # PC marker index
+    PC_I = 0  # PC marker index in MARKS array
+
+    # PC DEFAULT: bytes 1-3 = 0 (for PC < 256, which covers most small programs)
+    # At byte K position, we predict byte K+1, so:
+    #   - BYTE_INDEX_0 → predict byte 1 (OUTPUT = 0)
+    PC_I = 0  # PC marker index in MARKS array
+    #   - BYTE_INDEX_1 → predict byte 2 (OUTPUT = 0)
+    #   - BYTE_INDEX_2 → predict byte 3 (OUTPUT = 0)
+    # This fires at all PC byte positions 0-2, outputting 0 for bytes 1-3.
+    for byte_idx_dim in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]:
+        # Condition: H1[PC] AND BYTE_INDEX_K → OUTPUT = 0 (for byte K+1)
+        ffn.W_up[unit, BD.H1 + PC_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S  # lo = 0
+        unit += 1
+        # HI nibble also = 0
+        ffn.W_up[unit, BD.H1 + PC_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S  # hi = 0
+        unit += 1
 
     # AX DEFAULT: bytes 1-3 = 0 (for single-byte immediates)
     # Multi-byte results (e.g., ADD with carry) will override in later layers
@@ -2420,6 +2578,40 @@ def _set_layer3_ffn(ffn, S, BD):
         ffn.b_up[unit] = -S * 1.5
         ffn.b_gate[unit] = 1.0
         ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S  # hi = 0
+        unit += 1
+
+    # MEM DEFAULT: all bytes = 0 (for non-memory-writing ops like IMM)
+    # At MEM marker position, predict addr byte 0 = 0
+    # For PSH/SI/SC, L14 will write actual values that override this default.
+    # Condition: MARK_MEM = 1 → OUTPUT = 0
+    MEM_I = 4  # MEM marker index in MARKS array
+    ffn.W_up[unit, BD.MARK_MEM] = S
+    ffn.b_up[unit] = -S * 0.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
+    unit += 1
+    ffn.W_up[unit, BD.MARK_MEM] = S
+    ffn.b_up[unit] = -S * 0.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
+    unit += 1
+
+    # MEM bytes 1-7 also default to 0
+    # At MEM byte positions, H1[MEM]=1, BYTE_INDEX_K=1 for position K+1
+    for byte_idx_dim in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3]:
+        # LO = 0
+        ffn.W_up[unit, BD.H1 + MEM_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
+        unit += 1
+        # HI = 0
+        ffn.W_up[unit, BD.H1 + MEM_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
         unit += 1
 
     # PC INCREMENT: when MARK_PC AND HAS_SE, add INSTR_WIDTH to carried-forward value
@@ -2786,7 +2978,137 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
 
-    # Heads 5-7: unused in Layer 5 fetch
+    # Head 6: Direct OP_* flag relay from CODE to PC marker (non-first steps)
+    # This bypasses the OPCODE_BYTE mechanism and uses the OP_* flags set in embeddings.
+    # For non-first steps, PC value is in EMBED_LO/HI at PC marker (from L4 relay).
+    # Query for current PC address, match CODE byte with that ADDR_KEY, copy OP_* flags.
+    base = 6 * HD
+    # Q: PC marker, address from EMBED_LO/HI (current PC)
+    for k in range(16):
+        attn.W_q[base + k, BD.EMBED_LO + k] = L
+        attn.W_q[base + 16 + k, BD.EMBED_HI + k] = L
+    attn.W_q[base + 32, BD.MARK_PC] = L  # Only at PC marker
+
+    # K: match ADDR_KEY in CODE section
+    for k in range(16):
+        attn.W_k[base + k, BD.ADDR_KEY + k] = L
+        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
+    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+
+    # Anti-leakage gate
+    GATE = 33
+    attn.W_q[base + GATE, BD.MARK_PC] = 500.0
+    attn.W_q[base + GATE, BD.CONST] = -500.0
+    attn.W_k[base + GATE, BD.CONST] = 5.0
+
+    # HAS_SE gate: only fire on non-first steps
+    HAS_SE_GATE = 34
+    attn.W_q[base + HAS_SE_GATE, BD.HAS_SE] = 500.0
+    attn.W_q[base + HAS_SE_GATE, BD.CONST] = -500.0
+    attn.W_k[base + HAS_SE_GATE, BD.CONST] = 5.0
+
+    # V: copy OP_* flags from CODE byte (these are set in embeddings)
+    # Copy the main opcode flags that Layer 6 needs for routing
+    v_offset = 0
+    attn.W_v[base + v_offset, BD.OP_IMM] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_LEA] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_EXIT] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_JMP] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_ADD] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_SUB] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_MUL] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_DIV] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_MOD] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_OR] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_XOR] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_AND] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_EQ] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_LT] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_SHL] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_SHR] = 1.0; v_offset += 1
+
+    # O: write OP_* flags to PC marker
+    o_offset = 0
+    attn.W_o[BD.OP_IMM, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_LEA, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_EXIT, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_JMP, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_ADD, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_SUB, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_MUL, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_DIV, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_MOD, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_OR, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_XOR, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_AND, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_EQ, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_LT, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_SHL, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_SHR, base + o_offset] = 1.0; o_offset += 1
+
+    # Head 7: Direct OP_* flag relay from CODE to PC marker (first step only)
+    # Same as Head 6, but for first step (NOT HAS_SE instead of HAS_SE).
+    # On first step, PC = PC_OFFSET, so query for address PC_OFFSET.
+    base = 7 * HD
+    # Q: PC marker when NOT HAS_SE, queries for address PC_OFFSET
+    attn.W_q[base, BD.MARK_PC] = L
+    attn.W_q[base, BD.HAS_SE] = -L  # only on first step
+    # Q: address PC_OFFSET (e.g., 2: ADDR_KEY_LO[2]=1, ADDR_KEY_HI[0]=1)
+    attn.W_q[base + (PC_OFFSET & 0xF), BD.CONST] = L  # lo nibble
+    attn.W_q[base + 16 + ((PC_OFFSET >> 4) & 0xF), BD.CONST] = L  # hi nibble
+    attn.W_q[base + 32, BD.MARK_PC] = L  # third nibble gate
+
+    # K: match ADDR_KEY in CODE section
+    for k in range(16):
+        attn.W_k[base + k, BD.ADDR_KEY + k] = L
+        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
+    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+
+    # Anti-leakage gate
+    GATE = 33
+    attn.W_q[base + GATE, BD.MARK_PC] = 500.0
+    attn.W_q[base + GATE, BD.CONST] = -500.0
+    attn.W_k[base + GATE, BD.CONST] = 5.0
+
+    # V: copy OP_* flags from CODE byte (these are set in embeddings)
+    v_offset = 0
+    attn.W_v[base + v_offset, BD.OP_IMM] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_LEA] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_EXIT] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_JMP] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_ADD] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_SUB] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_MUL] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_DIV] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_MOD] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_OR] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_XOR] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_AND] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_EQ] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_LT] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_SHL] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_SHR] = 1.0; v_offset += 1
+
+    # O: write OP_* flags to PC marker
+    o_offset = 0
+    attn.W_o[BD.OP_IMM, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_LEA, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_EXIT, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_JMP, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_ADD, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_SUB, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_MUL, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_DIV, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_MOD, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_OR, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_XOR, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_AND, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_EQ, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_LT, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_SHL, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_SHR, base + o_offset] = 1.0; o_offset += 1
+
+    # Head 5: unused in Layer 5 fetch
 
 
 def _set_opcode_decode_ffn(ffn, S, BD):

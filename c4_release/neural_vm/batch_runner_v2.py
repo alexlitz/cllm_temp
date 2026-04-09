@@ -208,7 +208,14 @@ class UltraBatchRunner:
             self.contexts[i] = ctx + draft[:accepted]
 
     def _build_context(self, bytecode: List[int], data: bytes, argv: List[str]) -> List[int]:
-        """Build initial context."""
+        """Build initial context.
+
+        Each instruction is 8 bytes: 1 opcode + 4 immediate + 3 padding.
+        This matches INSTR_WIDTH=8 in constants.py and ensures correct
+        ADDR_KEY injection in the embedding layer.
+        """
+        from .constants import IMMEDIATE_SIZE, PADDING_SIZE
+
         context = []
 
         # Code section
@@ -219,8 +226,11 @@ class UltraBatchRunner:
             imm = instr >> 8
             context.append(op)
             # Add 4 immediate bytes (little-endian)
-            for i in range(4):
+            for i in range(IMMEDIATE_SIZE):
                 context.append((imm >> (i * 8)) & 0xFF)
+            # Add 3 padding bytes for 8-byte instruction alignment
+            for _ in range(PADDING_SIZE):
+                context.append(0)
         context.append(Token.CODE_END)
 
         # Data section

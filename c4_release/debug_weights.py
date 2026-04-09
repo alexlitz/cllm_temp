@@ -1,70 +1,49 @@
 #!/usr/bin/env python3
-"""Debug weight loading."""
-
+"""Check L10 FFN weights for carry application."""
+import os, sys
+sys.path.insert(0, os.getcwd())
 import torch
-from neural_vm.vm_step import AutoregressiveVM
-from neural_vm.weight_loader import CompiledWeightLoader
-from neural_vm.embedding import Opcode, E
+from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, _SetDim
 
-# Create VM
-vm = AutoregressiveVM(d_model=1344, n_layers=16, ffn_hidden=20000)
-vm.eval()
+model = AutoregressiveVM(vocab_size=512, n_layers=16, n_heads=8, ffn_hidden=4096)
+set_vm_weights(model)
+BD = _SetDim
 
-# Load weights
-loader = CompiledWeightLoader(ffn_hidden=20000)
+ffn10 = model.blocks[10].ffn
 
-print("OR offset:", loader.unit_allocations[Opcode.OR])
-print()
+print("=== Byte 0 carry application (units 1600-1632) ===")
+# Byte 0 LO: 16 units
+for u in range(1600, 1616):
+    k = u - 1600
+    gate_val = ffn10.W_gate[u, BD.OUTPUT_LO + k].item()
+    print(f"  unit {u}: OUTPUT_LO[{k}] gate = {gate_val:.2f}")
 
-print("Loading weights...")
-try:
-    result = loader.load_all_weights(vm, verbose=True)
-    print("Load result:", result)
-except Exception as e:
-    print(f"Loading failed: {e}")
-    import traceback
-    traceback.print_exc()
+print("\n=== Byte 0 HI carry (units 1616-1631) ===")
+for u in range(1616, 1632):
+    k = u - 1616
+    gate_lo15 = ffn10.W_gate[u, BD.OUTPUT_LO + 15].item()
+    gate_hik = ffn10.W_gate[u, BD.OUTPUT_HI + k].item()
+    print(f"  unit {u}: OUTPUT_HI[{k}] gate = {gate_hik:.2f}, OUTPUT_LO[15] gate = {gate_lo15:.2f}")
 
-# Check layer 9 (PRIMARY_ALU)
-layer_idx = 9
-layer = vm.blocks[layer_idx]
+print("\n=== Byte 0 carry_1 flag (unit 1632) ===")
+u = 1632
+gate_lo15 = ffn10.W_gate[u, BD.OUTPUT_LO + 15].item()
+gate_hi15 = ffn10.W_gate[u, BD.OUTPUT_HI + 15].item()
+print(f"  unit {u}: OUTPUT_LO[15] = {gate_lo15:.2f}, OUTPUT_HI[15] = {gate_hi15:.2f}")
 
-print()
-print(f"Checking non-zero parameters in layer {layer_idx}:")
-print(f"  W_up non-zero: {(layer.ffn.W_up.data.abs() > 1e-6).sum().item()}")
-print(f"  b_up non-zero: {(layer.ffn.b_up.data.abs() > 1e-6).sum().item()}")
-print(f"  W_gate non-zero: {(layer.ffn.W_gate.data.abs() > 1e-6).sum().item()}")
-print(f"  b_gate non-zero: {(layer.ffn.b_gate.data.abs() > 1e-6).sum().item()}")
-print(f"  W_down non-zero: {(layer.ffn.W_down.data.abs() > 1e-6).sum().item()}")
+print("\n=== Byte 1 LO carry application (units 1633-1648) ===")
+for u in range(1633, 1649):
+    k = u - 1633
+    gate_val = ffn10.W_gate[u, BD.OUTPUT_LO + k].item()
+    up_bi1 = ffn10.W_up[u, BD.BYTE_INDEX_1].item()
+    b_up = ffn10.b_up[u].item()
+    print(f"  unit {u}: OUTPUT_LO[{k}] gate = {gate_val:.2f}, W_up[BI1] = {up_bi1:.0f}, b_up = {b_up:.0f}")
 
-# Check a specific unit for OR(3,5)=7
-OR_offset = loader.unit_allocations[Opcode.OR]
-# For OR at position 0, unit for (a=3, b=5): OR_offset + 0*256 + (3*16 + 5)
-unit_idx = OR_offset + 0 * 256 + (3 * 16 + 5)
-
-print()
-print(f"Unit {unit_idx} for OR(3,5) at position 0:")
-
-# Check W_up weights at NIB_A binary bit slots (position 0)
-pos = 0
-base_idx = pos * 168
-print(f"  W_up values at NIB_A binary bit slots (base_idx={base_idx}):")
-for i in range(4):
-    bit_slot = base_idx + E.NIB_A_BIT0 + i
-    weight = layer.ffn.W_up.data[unit_idx, bit_slot].item()
-    print(f"    NIB_A_BIT{i} (slot {bit_slot}): {weight}")
-
-print(f"  b_up: {layer.ffn.b_up.data[unit_idx].item()}")
-
-# Check W_gate weights at NIB_B binary bit slots
-print(f"  W_gate values at NIB_B binary bit slots:")
-for i in range(4):
-    bit_slot = base_idx + E.NIB_B_BIT0 + i
-    weight = layer.ffn.W_gate.data[unit_idx, bit_slot].item()
-    print(f"    NIB_B_BIT{i} (slot {bit_slot}): {weight}")
-
-print(f"  b_gate: {layer.ffn.b_gate.data[unit_idx].item()}")
-
-# Check W_down
-result_slot = base_idx + E.RESULT
-print(f"  W_down[{result_slot}, {unit_idx}]: {layer.ffn.W_down.data[result_slot, unit_idx].item()}")
+print("\n=== Check for any non-zero gate weights at OUTPUT_LO for units 1633-1648 ===")
+for u in range(1633, 1649):
+    gate_row = ffn10.W_gate[u, BD.OUTPUT_LO:BD.OUTPUT_LO+16].tolist()
+    non_zero = [(i, v) for i, v in enumerate(gate_row) if abs(v) > 0.01]
+    if non_zero:
+        print(f"  unit {u}: {non_zero}")
+    else:
+        print(f"  unit {u}: all zeros")

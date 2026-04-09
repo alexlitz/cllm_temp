@@ -1,0 +1,33 @@
+================================================================================
+Building fresh model from scratch...
+================================================================================
+
+Setting VM weights...
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'OPCODE_FLAGS' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_LO' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_HI' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L15_attn reads 'ADDR_KEY' but no prior layer writes it
+Compacting model...
+Compacting MoE...
+
+Saving to neural_vm/tests/.compact_moe_model.pt...
+Cache file size: 1233.1 MB
+
+================================================================================
+Testing IMM+EXIT...
+================================================================================
+Moving to GPU...
+
+Bytecode: IMM 42; EXIT
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'OPCODE_FLAGS' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_LO' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_HI' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L15_attn reads 'ADDR_KEY' but no prior layer writes it
+Context: 14 tokens
+HALT at token 69
+Exit code: 0
+✗ FAIL: Expected 42, got 0
+
+================================================================================
+FAILURE: Fresh model does not work!
+================================================================================

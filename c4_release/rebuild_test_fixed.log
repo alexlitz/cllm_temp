@@ -1,0 +1,82 @@
+================================================================================
+Building fresh model from scratch...
+================================================================================
+
+Setting VM weights...
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'OPCODE_FLAGS' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_LO' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_HI' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L15_attn reads 'ADDR_KEY' but no prior layer writes it
+Compacting model...
+Compacting MoE...
+
+Saving to neural_vm/tests/.compact_moe_model.pt...
+Cache file size: 1233.1 MB
+
+================================================================================
+Testing IMM+EXIT...
+================================================================================
+Moving to GPU...
+
+Bytecode: IMM 42; EXIT
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'OPCODE_FLAGS' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_LO' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_HI' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L15_attn reads 'ADDR_KEY' but no prior layer writes it
+Context: 20 tokens
+  [0] REG_PC
+  [1] byte_2a
+  [2] byte_00
+  [3] byte_00
+  [4] byte_00
+  [5] REG_AX
+  [6] byte_2a
+  [7] byte_00
+  [8] byte_00
+  [9] byte_00
+  [10] REG_SP
+  [11] byte_00
+  [12] byte_00
+  [13] byte_01
+  [14] byte_00
+  [15] REG_BP
+  [16] byte_00
+  [17] byte_00
+  [18] byte_01
+  [19] byte_00
+  [20] STACK0
+  [21] byte_00
+  [22] byte_00
+  [23] byte_00
+  [24] byte_00
+  [25] MEM
+  [26] byte_00
+  [27] byte_00
+  [28] byte_00
+  [29] byte_00
+  [30] byte_00
+  [31] byte_00
+  [32] byte_00
+  [33] byte_00
+  [34] STEP_END
+  [35] REG_PC
+  [36] byte_32
+  [37] byte_00
+  [38] byte_00
+  [39] byte_00
+  [40] REG_AX
+  [41] byte_01
+  [42] byte_01
+  [43] byte_01
+  [44] byte_01
+  [45] byte_01
+  [46] byte_01
+  [47] byte_01
+  [48] byte_01
+  [49] byte_01
+Exit code: 16843009
+✗ FAIL: Expected 42, got 16843009
+
+================================================================================
+FAILURE: Fresh model does not work!
+================================================================================

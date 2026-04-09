@@ -373,18 +373,22 @@ class AutoregressiveVMRunner:
                         # Transitional runner SP byte corrections for fallback
                         # execution. Disabled in pure-attention mode.
                         if not self.pure_attention_memory:
-                            # Correct SP for binary pop ops (model only handles byte 0)
-                            if op in _BINARY_POP_OPS:
-                                new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-                                self._override_register_in_last_step(
-                                    context, Token.REG_SP, new_sp
-                                )
-                            # PSH SP multi-byte borrow correction
-                            if op == Opcode.PSH:
-                                new_sp = (self._last_sp - 8) & 0xFFFFFFFF
-                                self._override_register_in_last_step(
-                                    context, Token.REG_SP, new_sp
-                                )
+                            # REMOVED: Binary pop SP += 8 correction (now handled neurally in L6 FFN)
+                            # Neural implementation at vm_step.py:6015-6066 handles multi-byte carry
+                            # if op in _BINARY_POP_OPS:
+                            #     new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+                            #     self._override_register_in_last_step(
+                            #         context, Token.REG_SP, new_sp
+                            #     )
+
+                            # REMOVED: PSH SP -= 8 correction (now handled neurally in L6 FFN)
+                            # Neural implementation at vm_step.py:3615-3641 handles multi-byte borrow
+                            # if op == Opcode.PSH:
+                            #     new_sp = (self._last_sp - 8) & 0xFFFFFFFF
+                            #     self._override_register_in_last_step(
+                            #         context, Token.REG_SP, new_sp
+                            #     )
+
                             # ADJ SP multi-byte correction
                             if op == Opcode.ADJ:
                                 instr = bytecode[instr_idx]
@@ -447,8 +451,9 @@ class AutoregressiveVMRunner:
                             if imm >= 0x800000:
                                 imm -= 0x1000000
                             self._last_sp = (self._last_sp + imm) & 0xFFFFFFFF
-                        elif op in _BINARY_POP_OPS:
-                            self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
+                        # REMOVED: Binary pop tracking (now handled neurally)
+                        # elif op in _BINARY_POP_OPS:
+                        #     self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
                 # AX multi-byte preservation
                 ax = self._extract_register(context, Token.REG_AX)
                 if ax is not None:
@@ -562,8 +567,9 @@ class AutoregressiveVMRunner:
                             if imm >= 0x800000:
                                 imm -= 0x1000000
                             self._last_sp = (self._last_sp + imm) & 0xFFFFFFFF
-                        elif op in _BINARY_POP_OPS:
-                            self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
+                        # REMOVED: Binary pop tracking (now handled neurally)
+                        # elif op in _BINARY_POP_OPS:
+                        #     self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
                 # AX multi-byte preservation (same as STEP_END branch)
                 ax = self._extract_register(context, Token.REG_AX)
                 if ax is not None:

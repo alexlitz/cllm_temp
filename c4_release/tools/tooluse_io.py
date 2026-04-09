@@ -23,12 +23,14 @@ requests external action, then resumes with the result.
 """
 
 import sys
+import os
 from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
 import json
 
-sys.path.insert(0, '/Users/alexlitz/Dropbox/Docs/misc/llm_math/c4_release')
+# Add parent directory to path (c4_release root)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from neural_vm import Opcode
 
 
