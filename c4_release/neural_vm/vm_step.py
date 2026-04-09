@@ -3482,20 +3482,22 @@ def _set_layer6_attn(attn, S, BD, HD):
     # O: write IS_EXIT to CMP[1]
     attn.W_o[BD.CMP + 1, base + 1] = 1.0
 
-    # Head 2: First-step JMP relay (PC marker → current step's AX marker)
-    # For first step (NOT HAS_SE), relay OP_JMP and FETCH from current AX marker.
-    # Head 0 handles subsequent steps (cross-step relay), head 2 handles first step (intra-step).
+    # Head 2: First-step JMP relay (PC marker self-attention)
+    # For first step (NOT HAS_SE), copy OP_JMP and FETCH from PC marker to PC marker.
+    # This works with L5 head 3 fix (which no longer writes to AX marker).
+    # Head 0 handles subsequent steps (cross-step relay), head 2 handles first step.
+    # BUG FIX 2026-04-09: Changed key from MARK_AX to MARK_PC to work with L5 head 3 fix.
     base = 2 * HD
     attn.W_q[base, BD.MARK_PC] = L
     attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
     attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
-    attn.W_k[base, BD.MARK_AX] = L
-    # V: copy OP_JMP and FETCH_LO/HI (same as head 0)
+    attn.W_k[base, BD.MARK_PC] = L  # Read from PC marker (not AX marker)
+    # V: copy OP_JMP and FETCH_LO/HI from PC marker
     attn.W_v[base + 1, BD.OP_JMP] = 1.0
     for k in range(16):
         attn.W_v[base + 2 + k, BD.FETCH_LO + k] = 1.0
         attn.W_v[base + 18 + k, BD.FETCH_HI + k] = 1.0
-    # O: write IS_JMP to CMP[0], JMP target to AX_CARRY at PC marker (same as head 0)
+    # O: write IS_JMP to CMP[0], JMP target to AX_CARRY at PC marker
     attn.W_o[BD.CMP + 0, base + 1] = 1.0
     for k in range(16):
         attn.W_o[BD.AX_CARRY_LO + k, base + 2 + k] = 1.0
@@ -3609,9 +3611,12 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # accumulates carry-forward residuals from L3.
     # FIX: Use strong -MARK_PC to block at PC marker. OP_IMM = 5.0 at PC marker
     # for first-step detection, so we need -6*S to overcome it.
+    # BUG FIX 2026-04-09: Added -OP_JMP blocker to prevent IMM routing from firing
+    # when JMP is active (JMP uses FETCH for PC, not for AX).
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
         ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
+        ffn.W_up[unit, BD.OP_JMP] = -S * 20   # Strong block JMP (uses FETCH for PC, not AX)
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 6  # Strong block at PC marker (OP_IMM=5 there)
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
@@ -3622,6 +3627,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
         ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
+        ffn.W_up[unit, BD.OP_JMP] = -S * 20   # Strong block JMP (uses FETCH for PC, not AX)
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 6  # Strong block at PC marker (OP_IMM=5 there)
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
@@ -5731,9 +5737,9 @@ def _set_io_putchar_routing(ffn, S, BD):
 
     GETCHAR is handled entirely runner-side (see run_vm.py).
 
-    Starts at unit 750 to avoid conflict with _set_layer6_routing_ffn (units 0-740).
+    Starts at unit 900 to avoid conflict with _set_layer6_routing_ffn (units 0-898).
     """
-    unit = 750
+    unit = 900
 
     # OP_PUTCHAR AND MARK_AX → IO_IS_PUTCHAR
     T = 4.0
@@ -6334,9 +6340,9 @@ def _set_binary_pop_sp_increment(ffn, S, BD):
     - Hi nibble: (k + 1) % 16 when carry (lo nibble >= 8),
       detected by suppressing EMBED_LO[0..7]
 
-    Uses 32 FFN units starting at offset 790 (after PUTCHAR routing at 750-782).
+    Uses 32 FFN units starting at offset 950 (after PUTCHAR routing at 900-932).
     """
-    unit = 790
+    unit = 950
     T_pop = 1.5  # threshold: MARK_SP(1) + CMP[3](~1) = 2 > 1.5 ✓
 
     # Lo nibble: cancel identity, write (k + 8) % 16
@@ -6471,9 +6477,9 @@ def _set_function_call_weights(model, S, BD, HD):
         attn6.W_o[BD.AX_CARRY_HI + k, base + 17 + k] = 1.0
 
     # =====================================================================
-    # L6 FFN: Function call output routing (units 850-1105)
+    # L6 FFN: Function call output routing (units 1000-1255)
     # =====================================================================
-    unit = 850
+    unit = 1000
 
     # --- LEA first-step: Initialize ALU with BP default (2 units: 850-851) ---
     # For first step, set ALU = BP_default = 0x00010000, byte 0 = 0x00

@@ -374,6 +374,7 @@ class AutoregressiveVMRunner:
                         # Transitional runner SP byte corrections for fallback
                         # execution. Disabled in pure-attention mode.
                         if not self.pure_attention_memory:
+                            pass  # All SP corrections now handled neurally
                             # REMOVED: Binary pop SP += 8 correction (now handled neurally in L6 FFN)
                             # Neural implementation at vm_step.py:6015-6066 handles multi-byte carry
                             # if op in _BINARY_POP_OPS:
@@ -390,16 +391,17 @@ class AutoregressiveVMRunner:
                             #         context, Token.REG_SP, new_sp
                             #     )
 
-                            # ADJ SP multi-byte correction
-                            if op == Opcode.ADJ:
-                                instr = bytecode[instr_idx]
-                                imm = instr >> 8
-                                if imm >= 0x800000:
-                                    imm -= 0x1000000
-                                new_sp = (self._last_sp + imm) & 0xFFFFFFFF
-                                self._override_register_in_last_step(
-                                    context, Token.REG_SP, new_sp
-                                )
+                            # REMOVED: ADJ SP multi-byte correction (now handled neurally)
+                            # Neural implementation at vm_step.py L7/L8/L9/L6 via LEA pattern
+                            # if op == Opcode.ADJ:
+                            #     instr = bytecode[instr_idx]
+                            #     imm = instr >> 8
+                            #     if imm >= 0x800000:
+                            #         imm -= 0x1000000
+                            #     new_sp = (self._last_sp + imm) & 0xFFFFFFFF
+                            #     self._override_register_in_last_step(
+                            #         context, Token.REG_SP, new_sp
+                            #     )
                         # Track memory writes AFTER handler (handler may override SP/STACK0)
                         if self._should_block_track_memory(op):
                             self._record_pure_attention("blocked_track_memory_ops", op)
