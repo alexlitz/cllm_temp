@@ -138,6 +138,7 @@ class AutoregressiveVMRunner:
         max_seq_len=4096,
         pure_attention_memory=False,
         conversational_io=False,
+        debug_ent_lev=False,
     ):
         self.model = AutoregressiveVM(
             d_model=d_model,
@@ -170,7 +171,7 @@ class AutoregressiveVMRunner:
             # correct AX values with MEM section retention + MEM_STORE injection.
             # SI/SC handlers removed: _track_memory_write provides equivalent
             # shadow memory updates via L14-generated MEM section extraction.
-            Opcode.ADJ: self._syscall_adj,
+            # ADJ removed: now 100% neural (L7/L8/L9 SP arithmetic with carry propagation)
             Opcode.MALC: self._syscall_malc,
             Opcode.FREE: self._syscall_free,
             Opcode.CLOS: self._syscall_clos,
@@ -214,6 +215,10 @@ class AutoregressiveVMRunner:
         # Weights carry byte 0 only; runner re-applies bytes 1-3 each step.
         self._last_ax = 0
 
+        # Debug flags
+        self._debug_ent = debug_ent_lev
+        self._debug_lev = debug_ent_lev
+
         # Function-call handlers dispatched by exec_pc (not output PC).
         # These are runner-side compatibility shims for full 32-bit correctness
         # while the corresponding neural memory paths are being completed.
@@ -221,8 +226,8 @@ class AutoregressiveVMRunner:
             # REMOVED: IMM and LEA now work fully neurally (L6 FFN relay)
             # Opcode.IMM: self._handler_imm,
             # Opcode.LEA: self._handler_lea,
-            # REMOVED: JSR now works fully neurally (L6 PC override + STACK0 + L14 MEM token)
-            # Opcode.JSR: self._handler_jsr,
+            # TEMPORARY: Re-enable JSR handler - neural version not working
+            Opcode.JSR: self._handler_jsr,
             Opcode.ENT: self._handler_ent,
             Opcode.LEV: self._handler_lev,
             # REMOVED: PSH now works fully neurally (L6 FFN SP -= 8)
@@ -322,6 +327,15 @@ class AutoregressiveVMRunner:
             generation_context = context[-512:] if len(context) > 512 else context
             next_token = self.model.generate_next(generation_context, use_incremental=False)
             context.append(next_token)
+
+            # Debug: Print step progress
+            if self._debug_ent or self._debug_lev:
+                if i % 35 == 0:  # Every step
+                    pc = self._extract_register(context, Token.REG_PC) if len(context) > 20 else None
+                    ax = self._extract_register(context, Token.REG_AX) if len(context) > 20 else None
+                    pc_val = pc if pc is not None else 0
+                    ax_val = ax if ax is not None else 0
+                    print(f"[STEP {i//35}] token {i}/{max_steps * Token.STEP_TOKENS}, PC=0x{pc_val:08x}, AX=0x{ax_val:08x}", flush=True)
 
             # Hybrid conversational I/O: handle THINKING_END
             if self.conversational_io and next_token == Token.THINKING_END:
@@ -1030,24 +1044,6 @@ class AutoregressiveVMRunner:
         if ax is not None:
             self._override_register_in_last_step(context, Token.STACK0, ax)
 
-    def _syscall_adj(self, context, output):
-        """ADJ — SP += immediate. Override SP in context.
-
-        Reads the signed immediate from bytecode (imm field of the ADJ instruction).
-        """
-        pc = self._extract_register(context, Token.REG_PC)
-        if pc is None:
-            return
-        instr_idx = pc // INSTR_WIDTH
-        if 0 <= instr_idx < len(self._bytecode):
-            instr = self._bytecode[instr_idx]
-            imm = instr >> 8
-            # Sign-extend 24-bit immediate
-            if imm >= 0x800000:
-                imm -= 0x1000000
-            new_sp = (self._last_sp + imm) & 0xFFFFFFFF
-            self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-
     def _syscall_malc(self, context, output):
         """MALC (malloc) — bump allocator. AX = allocated address.
 
@@ -1493,6 +1489,9 @@ class AutoregressiveVMRunner:
         new_sp = (current_sp - 8) & 0xFFFFFFFF
 
 
+        if hasattr(self, '_debug_ent') and self._debug_ent:
+            print(f"[JSR] PC={exec_pc}, target=0x{target:08x}, return_addr=0x{return_addr:08x}, current_sp=0x{current_sp:08x}, new_sp=0x{new_sp:08x}", flush=True)
+
         # TEMPORARY: Restore ALL JSR overrides to verify baseline works
         # TODO: Remove overrides one by one after fixing issues
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
@@ -1534,6 +1533,9 @@ class AutoregressiveVMRunner:
         # Since current_sp ≈ old_sp (neural doesn't change SP for ENT)
         new_sp = (current_sp - 8 - imm) & 0xFFFFFFFF
 
+        if hasattr(self, '_debug_ent') and self._debug_ent:
+            print(f"[ENT] PC={exec_pc}, imm={imm}, current_sp=0x{current_sp:08x}, new_sp=0x{new_sp:08x}", flush=True)
+
         # Override ONLY SP (let neural handle BP, STACK0, MEM)
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
 
@@ -1550,6 +1552,9 @@ class AutoregressiveVMRunner:
         saved_bp = self._mem_load_word(old_bp)
         return_addr = self._mem_load_word(old_bp + 8)
         new_sp = (old_bp + 16) & 0xFFFFFFFF
+
+        if hasattr(self, '_debug_lev') and self._debug_lev:
+            print(f"[LEV] old_bp=0x{old_bp:08x}, saved_bp=0x{saved_bp:08x}, return_addr=0x{return_addr:08x}, new_sp=0x{new_sp:08x}", flush=True)
 
         # Override all registers
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
