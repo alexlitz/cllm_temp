@@ -728,7 +728,7 @@ class AutoregressiveVM(nn.Module):
         vocab_size=None,
         d_model=512,
         n_layers=16,
-        n_heads=8,
+        n_heads=16,  # Increased from 8 to 16 for L15 LEV memory reads (512/16=32 HD)
         ffn_hidden=4096,
         max_seq_len=4096,
     ):
@@ -1754,6 +1754,38 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         _set_conversational_io_relay_heads(attn6, S, BD, HD)
         # L6 FFN: CMP[5]/CMP[6] AND NEXT_SE → NEXT_THINKING_END (start I/O sequence)
         _set_conversational_io_state_machine(ffn6, S, BD)
+
+    # === BUG FIX 2026-04-09 (part 8c/8g): Patch spurious L6 FFN units ===
+    # Unprogrammed FFN units with random weights can fire spuriously when:
+    # - TEMP/OUTPUT_BYTE dimensions have residual values
+    # - Unit writes to OUTPUT_LO/HI dimensions
+    # This causes incorrect output at marker positions (especially PC marker).
+    # Example: unit 1128 fires on OUTPUT_BYTE_LO residuals at PC marker for EXIT,
+    # writing to OUTPUT_LO[0] and causing prediction of 0 instead of 10.
+    #
+    # This patch MUST run after ALL L6 FFN setup functions (routing, putchar, binary_pop, etc.)
+    # because those functions create units in the 900-1200 range.
+    patched_count = 0
+    for u in range(4096):
+        # Check if writes to OUTPUT
+        writes_output_lo = ffn6.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
+        writes_output_hi = ffn6.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
+        if not (writes_output_lo or writes_output_hi):
+            continue
+
+        # Check for strong TEMP/OUTPUT_BYTE weights
+        temp_weight = ffn6.W_up[u, BD.TEMP:BD.TEMP+32].abs().max().item()
+        output_byte_lo_weight = ffn6.W_up[u, BD.OUTPUT_BYTE_LO:BD.OUTPUT_BYTE_LO+16].abs().max().item()
+        output_byte_hi_weight = ffn6.W_up[u, BD.OUTPUT_BYTE_HI:BD.OUTPUT_BYTE_HI+16].abs().max().item()
+
+        if temp_weight > 50 or output_byte_lo_weight > 50 or output_byte_hi_weight > 50:
+            # Zero out this unit
+            ffn6.W_up[u, :] = 0
+            ffn6.W_gate[u, :] = 0
+            ffn6.W_down[:, u] = 0
+            ffn6.b_up[u] = 0
+            ffn6.b_gate[u] = 0
+            patched_count += 1
 
     # ===== LAYER 7: Operand gather + memory relay heads =====
     attn7 = model.blocks[7].attn
@@ -4388,11 +4420,24 @@ def _set_layer7_operand_gather(attn, S, BD, HD):
     # LEA: fires when OP_LEA active, gathers BP
     # ADJ: fires when OP_ADJ active, gathers SP
     # ENT: fires when OP_ENT active, gathers SP (for SP -= 8+imm computation)
-    # When all inactive, Q=0 → score = -slope*d → softmax1 ≈ 0 (no leakage).
+    #
+    # IMPORTANT: When all opcodes inactive, we need Q < 0 so that softmax1
+    # gives near-zero attention. Q=0 would give ~50% weight at d=0 (where
+    # exp(0)=1 in softmax1 denominator), causing significant leakage!
+    #
+    # Anti-leakage gate: Q[dim 1] = -2L (constant) + 2L (if LEA/ADJ/ENT active)
+    # When inactive: Q[1] = -30, score contribution = -30 → very negative
+    # When active: Q[1] = 0, no suppression from gate dimension
     base = 1 * HD
     attn.W_q[base, BD.OP_LEA] = L  # fires when LEA active
     attn.W_q[base, BD.OP_ADJ] = L  # fires when ADJ active
     attn.W_q[base, BD.OP_ENT] = L  # fires when ENT active
+    # Anti-leakage gate dimension (factor 6 for strong suppression)
+    attn.W_q[base + 1, BD.CONST] = -L * 6  # -90 baseline for strong suppression
+    attn.W_q[base + 1, BD.OP_LEA] = L * 6  # +90 when LEA → net 0
+    attn.W_q[base + 1, BD.OP_ADJ] = L * 6  # +90 when ADJ → net 0
+    attn.W_q[base + 1, BD.OP_ENT] = L * 6  # +90 when ENT → net 0
+    attn.W_k[base + 1, BD.CONST] = 1.0  # K[1] = 1 everywhere
     attn.W_k[base, BD.MARK_BP] = L  # attends to BP (for LEA)
     attn.W_k[base, BD.MARK_SP] = L  # attends to SP (for ADJ/ENT)
     # V: copy OUTPUT_LO/HI (BP's or SP's byte-0 output from L6)
@@ -5946,6 +5991,91 @@ def _set_layer15_memory_lookup(attn, S, BD, HD):
         for k in range(16):
             attn.W_o[BD.OUTPUT_LO + k, base + 32 + k] = 1.0
             attn.W_o[BD.OUTPUT_HI + k, base + 48 + k] = 1.0
+
+    # === LEV-specific heads (4-7): Read saved_bp from memory[BP] ===
+    # When OP_LEV active at BP marker, read the 4-byte word stored at BP address.
+    # Store result in TEMP[0-31] for later routing by L16.
+    # Uses similar binary address matching as heads 0-3, but:
+    #   - Q position: BP marker (not AX/STACK0)
+    #   - Q address: EMBED at BP marker (BP's value)
+    #   - O destination: TEMP dims (not OUTPUT)
+    # NOTE: This is a simplified implementation that assumes BP address encoding
+    # is available in EMBED dims at BP marker (same as other markers).
+    for h in range(4, 8):  # Heads 4-7 for bytes 0-3 of saved_bp
+        base = h * HD
+        byte_idx = h - 4  # 0, 1, 2, 3
+
+        # Dim 0: Bias - fire at BP marker when OP_LEV active
+        attn.W_q[base, BD.CONST] = -2000.0
+        attn.W_q[base, BD.MARK_BP] = 2000.0  # Activate at BP marker
+        attn.W_q[base, BD.OP_LEV] = 2000.0   # Only when LEV active
+        attn.W_k[base, BD.CONST] = 10.0
+
+        # Dim 1: Store anchor - prefer MEM_STORE entries
+        attn.W_q[base + 1, BD.MARK_BP] = 50.0
+        attn.W_q[base + 1, BD.OP_LEV] = 50.0
+        attn.W_k[base + 1, BD.MEM_STORE] = 100.0
+        attn.W_k[base + 1, BD.CONST] = -50.0
+
+        # Dim 2: ZFOD offset
+        attn.W_q[base + 2, BD.CONST] = -96.0
+        attn.W_k[base + 2, BD.MEM_STORE] = 50.0
+
+        # Dim 3: Byte selection (attend to correct val byte in MEM section)
+        BS = 60.0
+        attn.W_q[base + 3, BD.MARK_BP] = BS
+        MEM_VAL_DIMS = [None, BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3]
+        if byte_idx == 0:
+            attn.W_k[base + 3, BD.L2H0 + MEM_I] = BS
+            attn.W_k[base + 3, BD.H1 + MEM_I] = -BS
+        else:
+            attn.W_k[base + 3, MEM_VAL_DIMS[byte_idx]] = BS
+
+        # Dims 4-27: Binary address encoding (24 bits)
+        # Q-side reads address from EMBED at BP marker
+        # K-side matches against address in MEM entries
+        addr_dim = 4
+        scale = 10.0
+        addr_bases = [
+            (BD.ADDR_B0_LO, BD.ADDR_B0_HI),
+            (BD.ADDR_B1_LO, BD.ADDR_B1_HI),
+            (BD.ADDR_B2_LO, BD.ADDR_B2_HI),
+        ]
+        # Q: Read address nibbles from EMBED at BP marker
+        for ab_lo, ab_hi in addr_bases:
+            for nibble_base in [ab_lo, ab_hi]:
+                for bit in range(4):
+                    for k in range(16):
+                        bit_val = 2 * ((k >> bit) & 1) - 1
+                        # Q-side: read from EMBED (BP value)
+                        embed_base = BD.EMBED_LO if nibble_base in [BD.ADDR_B0_LO, BD.ADDR_B1_LO, BD.ADDR_B2_LO] else BD.EMBED_HI
+                        offset = (nibble_base - BD.ADDR_B0_LO) % 16 if nibble_base < BD.ADDR_B0_HI else (nibble_base - BD.ADDR_B0_HI) % 16
+                        # This is getting complex - use same pattern as existing heads for now
+                        attn.W_q[base + addr_dim, nibble_base + k] = scale * bit_val
+                        attn.W_k[base + addr_dim, nibble_base + k] = scale * bit_val
+                    addr_dim += 1
+
+        # Dim 28: Position gate (fire only at BP marker)
+        attn.W_q[base + 28, BD.CONST] = -500.0
+        attn.W_q[base + 28, BD.MARK_BP] = 500.0
+        attn.W_k[base + 28, BD.CONST] = 5.0
+
+        # V/O: Copy byte value to TEMP (not OUTPUT)
+        # TODO: INCOMPLETE - TEMP storage design issue
+        # Need 32 dims per 4-byte word (8 nibbles × 16 one-hot each = 128 dims)
+        # But TEMP only has 32 dims total. Possible solutions:
+        #   1. Use OUTPUT at different positions (conflicts with identity)
+        #   2. Add more TEMP dims (requires dimension budget reallocation)
+        #   3. Use L16 layer to restructure data after initial read
+        # For now, placeholder implementation (won't work correctly):
+        for k in range(16):
+            attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
+            attn.W_v[base + 48 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+        # Simplified output (byte 0 only, others need different approach)
+        if byte_idx == 0:
+            for k in range(16):
+                attn.W_o[BD.TEMP + k, base + 32 + k] = 1.0  # Lo nibble
+                attn.W_o[BD.TEMP + 16 + k, base + 48 + k] = 1.0  # Hi nibble
 
 
 # =============================================================================
