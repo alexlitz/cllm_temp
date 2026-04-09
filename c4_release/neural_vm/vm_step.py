@@ -2162,7 +2162,16 @@ def _set_layer2_mem_byte_flags(ffn, S, BD):
     ffn.W_down[BD.MEM_VAL_B3, unit] = 2.0 / S
     unit += 1
 
-    # Extended BYTE_INDEX for STACK0 byte 1-3 (at d=7,8,9 from BP)
+    # Extended BYTE_INDEX for STACK0 byte 0-3 (at d=6,7,8,9 from BP)
+    # BYTE_INDEX_0 at STACK0: d=6 from BP → L1H4[BP]=1 (d≤6.5), H1[BP]=0 (d>4.5)
+    ffn.W_up[unit, BD.L1H4 + BP_I] = S
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.H1 + BP_I] = -1.0
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.BYTE_INDEX_0, unit] = 2.0 / S
+    unit += 1
+
     # BYTE_INDEX_1 at STACK0: d=7 from BP → H2[BP]=1 (d≤7.5), L1H4[BP]=0 (d>6.5)
     ffn.W_up[unit, BD.H2 + BP_I] = S
     ffn.W_up[unit, BD.IS_BYTE] = S
@@ -2211,14 +2220,14 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     AX_I = 1  # AX marker index in MARKS array
     for k in range(16):
         # Up: fires at byte positions, suppressed at register areas with custom handling
-        # Note: STACK0 uses separate MARK_STACK0 (not in MARKS array), so we use L1H4[BP]
+        # Note: STACK0 uses separate MARK_STACK0 (not in MARKS array), so we use H4[BP]
         # which covers d <= 9.5 from BP marker (STACK0 is at d=5-9 from BP)
         ffn.W_up[unit, BD.IS_BYTE] = S
         ffn.W_up[unit, BD.MARK_PC] = -S  # Suppress at PC byte 0 (L3 handles increment)
         ffn.W_up[unit, BD.H1 + AX_I] = -S  # Suppress at AX (L3/L6 handle)
         ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP (L3/L15 PSH handle)
         ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP (L3 default handles)
-        ffn.W_up[unit, BD.L1H4 + BP_I] = -S  # Suppress at STACK0 area (d<=9.5 from BP)
+        ffn.W_up[unit, BD.H4 + BP_I] = -S  # Suppress at STACK0 area (d<=9.5 from BP)
         ffn.W_up[unit, BD.MEM_STORE] = -S  # Suppress at MEM during PSH/SI/SC
         ffn.b_up[unit] = -S * 0.5
         # Gate: copy this specific nibble value
@@ -2233,7 +2242,7 @@ def _set_nibble_copy_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.H1 + AX_I] = -S  # Suppress at AX (L3/L6 handle)
         ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP (L3/L15 PSH handle)
         ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP (L3 default handles)
-        ffn.W_up[unit, BD.L1H4 + BP_I] = -S  # Suppress at STACK0 area (d<=9.5 from BP)
+        ffn.W_up[unit, BD.H4 + BP_I] = -S  # Suppress at STACK0 area (d<=9.5 from BP)
         ffn.W_up[unit, BD.MEM_STORE] = -S  # Suppress at MEM during PSH/SI/SC
         ffn.b_up[unit] = -S * 0.5
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
@@ -2589,19 +2598,25 @@ def _set_layer3_ffn(ffn, S, BD):
         unit += 1
 
     # STACK0 DEFAULT: bytes 1-3 = 0 (for single-byte results)
-    # At STACK0 byte positions (L1H4[BP]=1), output 0 for bytes 1-3.
-    # For multi-byte results, later layers will override.
+    # At STACK0 byte positions, output 0 for bytes 1-3.
+    # STACK0 byte 0: d=6 from BP → L1H4[BP]=1 (d≤6.5)
+    # STACK0 byte 1: d=7 from BP → H2[BP]=1 (d≤7.5), NOT L1H4[BP]
+    # STACK0 byte 2: d=8 from BP → H3[BP]=1 (d≤8.5), NOT H2[BP]
+    # STACK0 byte 3: d=9 from BP → H4[BP]=1 (d≤9.5), NOT H3[BP]
+    # Use H4[BP] (d≤9.5) to cover all STACK0 positions d=5-9.
+    # H1[BP] = 1 for d <= 4.5 from BP (only BP area, not STACK0)
     for byte_idx_dim in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]:
-        # Condition: L1H4[BP] AND BYTE_INDEX_K → OUTPUT = 0
-        # L1H4[BP] = 1 for d <= 9.5 from BP, which covers STACK0 area (d=5-9)
-        ffn.W_up[unit, BD.L1H4 + BP_I] = S
+        # Condition: H4[BP] AND BYTE_INDEX_K AND NOT H1[BP] → OUTPUT = 0
+        ffn.W_up[unit, BD.H4 + BP_I] = S
         ffn.W_up[unit, byte_idx_dim] = S
+        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Exclude BP area
         ffn.b_up[unit] = -S * 1.5
         ffn.b_gate[unit] = 1.0
         ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
         unit += 1
-        ffn.W_up[unit, BD.L1H4 + BP_I] = S
+        ffn.W_up[unit, BD.H4 + BP_I] = S
         ffn.W_up[unit, byte_idx_dim] = S
+        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Exclude BP area
         ffn.b_up[unit] = -S * 1.5
         ffn.b_gate[unit] = 1.0
         ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
@@ -2906,11 +2921,12 @@ def _set_layer5_fetch(attn, S, BD, HD):
     base = 3 * HD
     # Q: queries for address PC_OFFSET+1 (e.g., 3: ADDR_KEY_LO[3]=1, ADDR_KEY_HI[0]=1)
     # NOTE: Q[PC_OFFSET] must remain zero - setting it causes opcode/imm to match equally
-    # Queries at BOTH PC and AX markers to write FETCH to both positions
+    # Queries at PC marker only. L6 head 5 relays FETCH from PC to AX for first-step IMM.
+    # BUG FIX 2026-04-09: Removed AX marker gate to prevent writing jump target to AX_CARRY
+    # at AX marker, which caused JMP to corrupt AX byte 0 (got 16 instead of 0).
     attn.W_q[base + (imm_addr & 0xF), BD.CONST] = L  # lo nibble
     attn.W_q[base + 16 + ((imm_addr >> 4) & 0xF), BD.CONST] = L  # hi nibble
-    attn.W_q[base + 32, BD.MARK_PC] = L  # gate for PC marker
-    attn.W_q[base + 32, BD.MARK_AX] = L  # gate for AX marker (first step)
+    attn.W_q[base + 32, BD.MARK_PC] = L  # gate for PC marker only
 
     # K: match ADDR_KEY nibbles
     for k in range(16):
@@ -2918,10 +2934,9 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
     attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
 
-    # Anti-leakage gate: suppress at non-PC, non-AX positions
+    # Anti-leakage gate: suppress at non-PC positions
     GATE = 33
     attn.W_q[base + GATE, BD.MARK_PC] = 500.0
-    attn.W_q[base + GATE, BD.MARK_AX] = 500.0  # also allow AX marker
     attn.W_q[base + GATE, BD.CONST] = -500.0
     attn.W_k[base + GATE, BD.CONST] = 5.0
 
@@ -2942,11 +2957,14 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_v[base + 48 + k, BD.CLEAN_EMBED_HI + k] = 1.0
     # O: write to AX_CARRY_LO/HI at PC marker (used by L6 FFN for JMP)
     # Also write to FETCH_LO/HI at PC marker for first-step immediate
+    # AMPLIFY FETCH: Use 40.0 instead of 1.0 to compensate for attenuation during
+    # Layer 6 Head 5 relay (FETCH gets attenuated 37x: 1.0→0.027, while OP_IMM
+    # only gets attenuated 17x: 6.0→0.351). With 40.0, FETCH should reach ~1.0 at AX.
     for k in range(16):
         attn.W_o[BD.AX_CARRY_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.AX_CARRY_HI + k, base + 48 + k] = 1.0
-        attn.W_o[BD.FETCH_LO + k, base + 32 + k] = 1.0
-        attn.W_o[BD.FETCH_HI + k, base + 48 + k] = 1.0
+        attn.W_o[BD.FETCH_LO + k, base + 32 + k] = 40.0  # Amplified for relay
+        attn.W_o[BD.FETCH_HI + k, base + 48 + k] = 40.0  # Amplified for relay
 
     # Head 4: Fetch opcode to AX marker for first-step (duplicate of Head 2)
     # Head 2 fetches opcode to PC marker, but opcode decode FFN runs at AX marker.
@@ -5741,13 +5759,15 @@ def _set_opcode_relay_head(attn, S, BD, HD):
     # V[5]: OP_JSR (scaled: ≈5 × 0.2 = ≈1.0)
     attn.W_v[base + 5, BD.OP_JSR] = 0.2
 
-    # V[6]: MEM_STORE flag — any of SI/SC/PSH (scaled: ≈5 × 0.04 × 3 ≈ 0.6)
-    # Actually use 0.2 for each since only one is active: ≈5 × 0.2 = ≈1.0
+    # V[6]: MEM_STORE flag — any of SI/SC/PSH/JSR/ENT (scaled: ≈5 × 0.2 = ≈1.0)
     attn.W_v[base + 6, BD.OP_SI] = 0.2
     attn.W_v[base + 6, BD.OP_SC] = 0.2
     attn.W_v[base + 6, BD.OP_PSH] = 0.2
+    attn.W_v[base + 6, BD.OP_JSR] = 0.2
+    attn.W_v[base + 6, BD.OP_ENT] = 0.2
 
     # V[7]: MEM_ADDR_SRC — SI/SC only (addr from STACK0, not SP)
+    # PSH/JSR/ENT use SP as address source (MEM_ADDR_SRC=0)
     attn.W_v[base + 7, BD.OP_SI] = 0.2
     attn.W_v[base + 7, BD.OP_SC] = 0.2
 
