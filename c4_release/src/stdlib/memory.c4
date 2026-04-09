@@ -1,0 +1,88 @@
+// C4 Standard Library - Memory Management
+// Auto-linked by compiler
+
+// Global heap pointer
+int __heap_ptr;
+
+// malloc - Allocate memory, return address (or 0 on failure)
+int malloc(int size) {
+    int aligned_size;
+    int ptr;
+
+    if (size <= 0) {
+        return 0;
+    }
+
+    // Initialize heap on first call
+    if (__heap_ptr == 0) {
+        __heap_ptr = 0x20000;
+    }
+
+    // Align to 8 bytes (round up to next multiple of 8)
+    aligned_size = ((size + 7) / 8) * 8;
+
+    // Allocate
+    ptr = __heap_ptr;
+    __heap_ptr = __heap_ptr + aligned_size;
+
+    return ptr;
+}
+
+// free - Deallocate memory (no-op in bump allocator)
+int free(int ptr) {
+    return 0;
+}
+
+// memset - Fill memory with byte value, return ptr
+int memset(int ptr, int val, int size) {
+    char *p;
+    int i;
+
+    if (ptr == 0 || size <= 0) {
+        return ptr;
+    }
+
+    p = (char *)ptr;
+    i = 0;
+
+    while (i < size) {
+        *p = val;
+        p = p + 1;
+        i = i + 1;
+    }
+
+    return ptr;
+}
+
+// memcmp - Compare memory regions
+// Returns: 0 if equal, != 0 if different
+int memcmp(int ptr1, int ptr2, int size) {
+    char *p1;
+    char *p2;
+    int i;
+    int diff;
+
+    if (size <= 0) {
+        return 0;
+    }
+
+    if (ptr1 == ptr2) {
+        return 0;
+    }
+
+    p1 = (char *)ptr1;
+    p2 = (char *)ptr2;
+    i = 0;
+
+    while (i < size) {
+        if (*p1 != *p2) {
+            diff = *p1 - *p2;
+            return diff;
+        }
+        p1 = p1 + 1;
+        p2 = p2 + 1;
+        i = i + 1;
+    }
+
+    return 0;
+}

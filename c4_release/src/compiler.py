@@ -13,6 +13,7 @@ Supports:
 
 from enum import IntEnum
 from typing import List, Dict, Tuple, Optional
+from pathlib import Path
 
 # Import constants for instruction addressing
 try:
@@ -347,7 +348,8 @@ class Compiler:
         self.data_base = 0x10000
         self.data: List[int] = []
 
-        syscalls = ['open', 'read', 'close', 'printf', 'malloc', 'free', 'memset', 'memcmp', 'exit']
+        # Syscalls (removed malloc/free/memset/memcmp - now in stdlib)
+        syscalls = ['open', 'read', 'close', 'printf', 'exit']
         for i, name in enumerate(syscalls):
             self.symbols[name] = Symbol(name, 'Sys', INT, Op.OPEN + i)
 
@@ -966,10 +968,31 @@ class Compiler:
                 break
 
 
-def compile_c(source: str) -> Tuple[List[int], List[int]]:
-    """Compile C source, return (code, data)."""
+def compile_c(source: str, link_stdlib: bool = True) -> Tuple[List[int], List[int]]:
+    """Compile C source, return (code, data).
+
+    Args:
+        source: C source code to compile
+        link_stdlib: If True, automatically prepend stdlib (malloc, free, etc.)
+
+    Returns:
+        Tuple of (bytecode, data)
+    """
+    # Auto-link standard library if enabled
+    if link_stdlib:
+        stdlib_path = Path(__file__).parent / 'stdlib' / 'memory.c4'
+        if stdlib_path.exists():
+            stdlib_source = stdlib_path.read_text()
+            # Prepend stdlib to user source (add separator)
+            full_source = stdlib_source + '\n' + source
+        else:
+            # Stdlib not found, compile without it
+            full_source = source
+    else:
+        full_source = source
+
     compiler = Compiler()
-    return compiler.compile(source)
+    return compiler.compile(full_source)
 
 
 __all__ = ['compile_c', 'Compiler', 'Op']
