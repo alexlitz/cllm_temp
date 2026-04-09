@@ -3712,7 +3712,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.OP_NOP] = S
         ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
