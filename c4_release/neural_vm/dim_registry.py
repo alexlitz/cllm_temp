@@ -344,8 +344,13 @@ def build_default_registry() -> DimRegistry:
     # IO PUTCHAR flag
     reg.alloc("IO_IS_PUTCHAR", 296, 1, "OP_PUTCHAR detected this step (L6 FFN)")
 
-    # Reserved (formerly STACK0 staging, available for future use)
-    reg.alloc("RESERVED_297_327", 297, 31, "Reserved (future STACK0/IO)")
+    # ADJ implementation dimensions (SP + signed immediate)
+    reg.alloc("SP_OLD_LO", 297, 8, "ADJ: old SP value low nibbles (4 bytes)")
+    reg.alloc("SP_OLD_HI", 305, 8, "ADJ: old SP value high nibbles (4 bytes)")
+    reg.alloc("ADJ_CARRY", 313, 2, "ADJ: multi-byte carry propagation")
+
+    # Reserved (remaining space for ENT/LEV)
+    reg.alloc("RESERVED_315_327", 315, 13, "Reserved (ENT/LEV staging)")
 
     # AX carry-forward staging
     reg.alloc("AX_CARRY_LO", 328, 16, "Carried-forward AX lo nibble")
