@@ -104,11 +104,18 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 - Arithmetic, control flow, and function calls work correctly
 - Only memory lookup from local variables is affected
 
-**Solution**: Re-enable LI/LC/SI/SC handlers as workaround
-- Add handlers back to `_syscall_handlers` dict in `neural_vm/run_vm.py`
-- Handlers provide correct memory semantics using shadow memory (`self._memory` dict)
-- Allows programs with 2+ local variables to work correctly
-- Long-term: Fix L14/L15 neural weights for proper memory mechanism
+**Solution Attempted**: Re-enable LI/LC/SI/SC handlers ❌ **DOESN'T WORK**
+- Handlers added back to `_syscall_handlers` dict (lines 174-177)
+- BUT handlers depend on reading STACK0 register from model output
+- SI handler reads addr from `_extract_stack0()` → gets garbage (0x00, 0x0a, 0x20)
+- LI handler reads addr from `_extract_register(AX)` → gets garbage
+- **Root cause**: Neural PSH doesn't set STACK0 correctly, so handlers fail too
+
+**Real Solution Required**: Fix neural PSH/STACK0 register generation
+- PSH should output STACK0 = address pushed (e.g., BP-8 = 0x000100e0)
+- Currently outputs garbage values instead of correct addresses
+- This is a fundamental neural weight issue in L6/L7 layers
+- Handlers cannot work around this - they need correct register values from model
 
 ---
 
