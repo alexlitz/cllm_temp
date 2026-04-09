@@ -263,8 +263,6 @@ class AutoregressiveVMRunner:
         Returns:
             (output_string, exit_code) tuple
         """
-        import sys
-        print("[DEBUG-RUN] Entered run() method", flush=True)
         self._bytecode = bytecode
         self._stdin_buffer = list(stdin) if stdin else []
         self._stdin_pos = 0
@@ -274,9 +272,7 @@ class AutoregressiveVMRunner:
         self._last_bp = 0
         self._last_sp = 0
         self._mem_history = {}  # addr → 9-token MEM section (latest wins)
-        print("[DEBUG-RUN] About to call set_mem_history_end(0)", flush=True)
         self.model.embed.set_mem_history_end(0)  # reset stale boundary from prior runs
-        print("[DEBUG-RUN] set_mem_history_end(0) completed", flush=True)
         self._pure_attention_report = {
             "enabled": bool(self.pure_attention_memory),
             "blocked_vm_memory_ops": {},
@@ -284,7 +280,6 @@ class AutoregressiveVMRunner:
             "external_tool_ops": {},
             "halted": False,
         }
-        print("[DEBUG-RUN] Pure attention report initialized", flush=True)
 
         # Load data section into shadow memory at 0x10000
         # C4 compiler uses data_base = 0x10000 (src/compiler.py:339)
@@ -300,44 +295,30 @@ class AutoregressiveVMRunner:
         data_end = 0x10000 + len(data)
         self._heap_base = (data_end + 7) & ~7
         self._heap_ptr = self._heap_base
-        print("[DEBUG-RUN] Heap initialized", flush=True)
 
-        print("[DEBUG-RUN] About to call _build_context", flush=True)
         context = self._build_context(bytecode, data, argv or [], stdin)
-        print(f"[DEBUG-RUN] _build_context completed, context len={len(context)}", flush=True)
         prefix_len = len(context)  # code + data prefix length (immutable)
         output = []
 
         # Set initial opcode for MoE routing (first instruction)
-        print("[DEBUG-RUN] About to compute init_exec", flush=True)
         init_exec = self._exec_pc() // INSTR_WIDTH
-        print(f"[DEBUG-RUN] init_exec={init_exec}, bytecode len={len(bytecode)}", flush=True)
         if 0 <= init_exec < len(bytecode):
             opcode = bytecode[init_exec] & 0xFF
-            print(f"[DEBUG-RUN] About to call set_active_opcode({opcode})", flush=True)
             self.model.set_active_opcode(opcode)
-            print(f"[DEBUG-RUN] set_active_opcode completed", flush=True)
 
-        print("[DEBUG-RUN] About to set step_num=0", flush=True)
         step_num = 0  # Track step number for debugging
 
-        # Create KV cache for efficient generation (avoids O(n²) recomputation)
-        from .kv_cache import KVCache
-        print("[DEBUG-RUN] Creating KV cache...", flush=True)
-        kv_cache = KVCache(max_batch_size=1, max_seq_len=max_steps * Token.STEP_TOKENS + len(context))
-        print(f"[DEBUG-RUN] KV cache created", flush=True)
+        # TODO: KV cache needed! Currently O(n²) - each token reprocesses entire context
+        # Issue: generate_next() doesn't use KV cache, causing exponential slowdown
+        # Fix needed: Implement proper KV cache or use context windowing
+        kv_cache = None  # Disabled for now - causes AttributeError
 
-        print(f"[DEBUG-RUN] step_num set, about to print generation loop start", flush=True)
         print(f"[DEBUG] Starting generation loop, max_steps={max_steps}, total tokens={max_steps * Token.STEP_TOKENS}", flush=True)
         for i in range(max_steps * Token.STEP_TOKENS):
             if i % 35 == 0:  # Print every step
                 print(f"[DEBUG] Generating token {i}/{max_steps * Token.STEP_TOKENS}, step {i//35}", flush=True)
-            if i < 40:  # Debug first 40 tokens (more than 1 step)
-                print(f"[DEBUG-LOOP] Token {i}: about to call generate_next, context len={len(context)}", flush=True)
-            next_token = self.model.generate_next(context, kv_cache=kv_cache)
-            if i < 40:
-                is_special = "STEP_END" if next_token == Token.STEP_END else ("HALT" if next_token == Token.HALT else f"value")
-                print(f"[DEBUG-LOOP] Token {i}: got token {next_token} ({is_special})", flush=True)
+            # TODO: Pass kv_cache once implemented
+            next_token = self.model.generate_next(context)
             context.append(next_token)
 
             # Hybrid conversational I/O: handle THINKING_END
@@ -369,19 +350,15 @@ class AutoregressiveVMRunner:
 
             if next_token == Token.STEP_END:
                 if step_num < 3:
-                    print(f"[DEBUG-STEP] Step {step_num}: STEP_END detected", flush=True)
                 step_num += 1  # Increment step counter
                 # Extract PC and dispatch syscall handler
                 op = None
                 instr_idx = None
                 if step_num <= 3:
-                    print(f"[DEBUG-STEP] Step {step_num-1}: calling _exec_pc()", flush=True)
                 exec_pc = self._exec_pc()  # PC being executed this step
                 if step_num <= 3:
-                    print(f"[DEBUG-STEP] Step {step_num-1}: exec_pc={exec_pc}, calling _extract_register", flush=True)
                 pc = self._extract_register(context, Token.REG_PC)  # Next PC from output
                 if step_num <= 3:
-                    print(f"[DEBUG-STEP] Step {step_num-1}: pc={pc}", flush=True)
                 # Get opcode being executed this step
                 exec_idx = exec_pc // INSTR_WIDTH
                 exec_op = None

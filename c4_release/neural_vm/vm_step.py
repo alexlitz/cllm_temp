@@ -917,12 +917,13 @@ class AutoregressiveVM(nn.Module):
         return self.head(x)
 
     @torch.no_grad()
-    def generate_next(self, context, temperature=0.0):
+    def generate_next(self, context, temperature=0.0, kv_cache=None):
         """Generate next token via greedy or sampled decoding.
 
         Args:
             context: list of integer token IDs
             temperature: 0.0 = greedy (argmax), >0 = sample from softmax
+            kv_cache: Optional KVCache for efficient generation
 
         Returns:
             int: next token ID
@@ -932,7 +933,7 @@ class AutoregressiveVM(nn.Module):
         # Create tensor on same device as model
         device = next(self.parameters()).device
         token_ids = torch.tensor([context], dtype=torch.long, device=device)
-        logits = self.forward(token_ids)[0, -1, :]
+        logits = self.forward(token_ids, kv_cache=kv_cache)[0, -1, :]
         if temperature <= 0.0:
             return logits.argmax(-1).item()
         probs = torch.softmax(logits / temperature, dim=-1)
@@ -1698,10 +1699,9 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     _set_layer6_routing_ffn(ffn6, S, BD)
 
     # L6 relay attention heads (AX→STACK0 for PSH, AX→SP for ADJ)
-    # DISABLED: This function was overwriting heads 2-3 configured by _set_layer6_attn
-    # Heads 2-3 are needed for JMP/JSR relays, which are critical for control flow
-    # PSH/ADJ may work via opcode relay on head 6 instead
-    # _set_layer6_relay_heads(attn6, S, BD, HD)
+    # ENABLED: Uses head 2 which is unused (checked via weight inspection)
+    # This copies AX_CARRY → ALU at STACK0 marker for PSH: STACK0 = AX
+    _set_layer6_relay_heads(attn6, S, BD, HD)
     # L6 BZ/BNZ relay (AX→PC for conditional branches)
     _set_bz_bnz_relay(attn6, S, BD, HD)
 
@@ -3487,11 +3487,16 @@ def _set_layer6_attn(attn, S, BD, HD):
     # This works with L5 head 3 fix (which no longer writes to AX marker).
     # Head 0 handles subsequent steps (cross-step relay), head 2 handles first step.
     # BUG FIX 2026-04-09: Changed key from MARK_AX to MARK_PC to work with L5 head 3 fix.
+    # BUG FIX 2026-04-09 (part 2): Added OP_JMP condition to prevent firing for IMM/NOP/EXIT.
+    # Without this check, head 2 fires for all first-step ops and copies amplified FETCH
+    # to AX_CARRY, causing PC to get the immediate value instead of PC+INSTR_WIDTH.
     base = 2 * HD
     attn.W_q[base, BD.MARK_PC] = L
+    attn.W_q[base, BD.OP_JMP] = L   # Only fire when OP_JMP is active
     attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
     attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
     attn.W_k[base, BD.MARK_PC] = L  # Read from PC marker (not AX marker)
+    attn.W_k[base, BD.OP_JMP] = L   # Match when OP_JMP is active
     # V: copy OP_JMP and FETCH_LO/HI from PC marker
     attn.W_v[base + 1, BD.OP_JMP] = 1.0
     for k in range(16):
@@ -3611,12 +3616,9 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # accumulates carry-forward residuals from L3.
     # FIX: Use strong -MARK_PC to block at PC marker. OP_IMM = 5.0 at PC marker
     # for first-step detection, so we need -6*S to overcome it.
-    # BUG FIX 2026-04-09: Added -OP_JMP blocker to prevent IMM routing from firing
-    # when JMP is active (JMP uses FETCH for PC, not for AX).
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
         ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
-        ffn.W_up[unit, BD.OP_JMP] = -S * 20   # Strong block JMP (uses FETCH for PC, not AX)
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 6  # Strong block at PC marker (OP_IMM=5 there)
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
@@ -3627,7 +3629,6 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
         ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
-        ffn.W_up[unit, BD.OP_JMP] = -S * 20   # Strong block JMP (uses FETCH for PC, not AX)
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 6  # Strong block at PC marker (OP_IMM=5 there)
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
@@ -4243,7 +4244,7 @@ def _set_layer6_relay_heads(attn, S, BD, HD):
     L = 50.0
 
     # Head 6: STACK0 ← AX (AX_CARRY → ALU at STACK0 marker, d=15)
-    # Changed from Head 2 to Head 6 to avoid conflict
+    # Uses head 6 which is unused (heads 0,1,2,3,5,7 are used by other L6 functions)
     base = 6 * HD
     attn.W_q[base, BD.MARK_STACK0] = L
     attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
