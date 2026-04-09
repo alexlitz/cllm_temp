@@ -3654,9 +3654,15 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # OP_IMM ≈ 6.6 at PC marker (higher than expected 5.0), so:
     # activation = S*OP_IMM + S*MARK_AX + (-8*S)*MARK_PC + bias
     #            = 20*6.6 + 20*0 + (-160)*1 + (-10) = 132 - 160 - 10 = -38 (blocked!)
+    # BUG FIX 2026-04-09 (part 8f): Add OP_JMP blocker to prevent crossfire.
+    # At AX marker for JMP: OP_JMP ≈ 11.0, causing spurious activation:
+    # activation = S*OP_IMM + S*MARK_AX + (-20*S)*OP_EXIT + ... - 50
+    #            = 100*0 + 100*1 + 0 + ... - 50 = 50 (fires incorrectly!)
+    # With OP_JMP blocker: 100*0 + 100*1 + (-2000)*11 - 50 = -22050 (blocked!)
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
         ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
+        ffn.W_up[unit, BD.OP_JMP] = -S * 20  # Strong block JMP crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -6*S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
@@ -3667,6 +3673,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
         ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
+        ffn.W_up[unit, BD.OP_JMP] = -S * 20  # Strong block JMP crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -6*S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
@@ -3701,10 +3708,13 @@ def _set_layer6_routing_ffn(ffn, S, BD):
 
     # === NOP: AX_CARRY → OUTPUT ===
     # BUG FIX 2026-04-09 (part 6): Increased MARK_PC blocker from -S to -8*S.
+    # BUG FIX 2026-04-09 (part 8e): Add IS_BYTE blocker to prevent firing at byte positions.
+    # OP_NOP has residual values at PC byte positions, causing spurious activation.
     for k in range(16):
         ffn.W_up[unit, BD.OP_NOP] = S
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -3713,16 +3723,20 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.OP_NOP] = S
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
     # === JMP: AX_CARRY → OUTPUT (preserves AX through JMP) ===
+    # BUG FIX 2026-04-09 (part 8e): Add IS_BYTE blocker to prevent firing at byte positions.
+    # OP_JMP has residual values at PC byte positions, causing spurious activation.
     for k in range(16):
         ffn.W_up[unit, BD.OP_JMP] = S
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -3731,6 +3745,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.OP_JMP] = S
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -4047,6 +4062,28 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
+    # === ENT: SP writeback (route AX result → SP marker) ===
+    # ENT computes new_sp = sp - (8 + imm) in L8/L9 ALU at AX marker
+    # Result is relayed to AX_CARRY by L6 attention, then written to SP marker
+    # Cancel identity carry (EMBED = old SP), write AX_CARRY (new SP)
+    T_ent = 1.5
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_ENT] = S
+        ffn.W_up[unit, BD.MARK_SP] = S
+        ffn.b_up[unit] = -S * T_ent
+        ffn.W_gate[unit, BD.EMBED_LO + k] = -1.0  # Cancel identity
+        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0  # Write result
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+        unit += 1
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_ENT] = S
+        ffn.W_up[unit, BD.MARK_SP] = S
+        ffn.b_up[unit] = -S * T_ent
+        ffn.W_gate[unit, BD.EMBED_HI + k] = -1.0  # Cancel identity
+        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0  # Write result
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+        unit += 1
+
     # === BZ PC override: branch if AX == 0 ===
     # CMP[2]=OP_BZ (normalized ≈1), CMP[4]=AX_LO_IS_ZERO, CMP[5]=AX_HI_IS_ZERO
     # 4-way AND in silu: MARK_PC + CMP[2] + CMP[4] + CMP[5] - 3.5
@@ -4347,15 +4384,17 @@ def _set_layer7_operand_gather(attn, S, BD, HD):
         attn.W_o[BD.ALU_LO + k, base + 1 + k] = 1.0
         attn.W_o[BD.ALU_HI + k, base + 17 + k] = 1.0
 
-    # Head 1: LEA/ADJ — BP/SP OUTPUT → ALU at AX marker
+    # Head 1: LEA/ADJ/ENT — BP/SP OUTPUT → ALU at AX marker
     # LEA: fires when OP_LEA active, gathers BP
     # ADJ: fires when OP_ADJ active, gathers SP
-    # When both inactive, Q=0 → score = -slope*d → softmax1 ≈ 0 (no leakage).
+    # ENT: fires when OP_ENT active, gathers SP (for SP -= 8+imm computation)
+    # When all inactive, Q=0 → score = -slope*d → softmax1 ≈ 0 (no leakage).
     base = 1 * HD
     attn.W_q[base, BD.OP_LEA] = L  # fires when LEA active
     attn.W_q[base, BD.OP_ADJ] = L  # fires when ADJ active
+    attn.W_q[base, BD.OP_ENT] = L  # fires when ENT active
     attn.W_k[base, BD.MARK_BP] = L  # attends to BP (for LEA)
-    attn.W_k[base, BD.MARK_SP] = L  # attends to SP (for ADJ)
+    attn.W_k[base, BD.MARK_SP] = L  # attends to SP (for ADJ/ENT)
     # V: copy OUTPUT_LO/HI (BP's or SP's byte-0 output from L6)
     for k in range(16):
         attn.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
@@ -4628,6 +4667,44 @@ def _set_layer8_alu(ffn, S, BD):
                 ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)  # normalize: gate≈5 → CARRY≈1
                 unit += 1
 
+    # === ENT: lo nibble subtraction (256 units) ===
+    # ENT computes: SP = SP - (8 + signed_immediate)
+    # For lo nibble: result_lo = (sp_lo - (8 + imm_lo)) mod 16
+    # where sp_lo comes from ALU_LO (gathered by L7 head 1)
+    # and imm_lo comes from FETCH_LO (instruction immediate)
+    for sp_lo in range(16):
+        for imm_lo in range(16):
+            effective_b = (8 + imm_lo) % 16  # Add constant offset 8
+            result = (sp_lo - effective_b) % 16
+            ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.ALU_LO + sp_lo] = S  # SP lo nibble from L7
+            ffn.W_up[unit, BD.FETCH_LO + imm_lo] = S  # Immediate lo nibble
+            ffn.b_up[unit] = -S * 15.5  # High threshold like LEA/ADJ
+            ffn.W_gate[unit, BD.OP_ENT] = 1.0
+            ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
+            unit += 1
+
+    # === ENT borrow detection (256 units) ===
+    # Borrow when sp_lo < (8 + imm_lo) mod 16
+    # Must enumerate all cases (not just where borrow occurs) because
+    # the condition depends on the constant 8, not just relative magnitudes
+    for sp_lo in range(16):
+        for imm_lo in range(16):
+            effective_b = (8 + imm_lo) % 16
+            # Check if borrow is needed: sp_lo < effective_b
+            # But need to account for the full byte math: does (8 + imm_lo) >= 16?
+            # If (8 + imm_lo) >= 16, there's a carry out of byte 0 into byte 1
+            full_sum = 8 + imm_lo  # This is in range [8, 23]
+            if sp_lo < (full_sum % 16) or full_sum >= 16:
+                # Need borrow from byte 1
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ALU_LO + sp_lo] = S
+                ffn.W_up[unit, BD.FETCH_LO + imm_lo] = S
+                ffn.b_up[unit] = -S * 15.5
+                ffn.W_gate[unit, BD.OP_ENT] = 1.0
+                ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
+                unit += 1
+
     # === CMP_GROUP flag (1 unit) ===
     # ~1.0 when any comparison opcode active at AX marker.
     # OP flags ≈ 5.0, so silu(S*(5+1-1.5))=S*4.5. Normalize W_down so output ≈ 1.
@@ -4730,6 +4807,29 @@ def _set_layer9_alu(ffn, S, BD):
                     ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
                     ffn.b_up[unit] = -S * 4.5  # 4-way AND (3 regs + borrow≈1)
                 ffn.W_gate[unit, BD.OP_SUB] = 1.0
+                ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
+                unit += 1
+
+    # === ENT hi nibble (no borrow 256 + with borrow 256 = 512 units) ===
+    # ENT computes: SP = SP - (8 + signed_immediate)
+    # For bytes 1-3, we subtract imm_byte with borrow propagation
+    # The +8 offset affects byte 0 only; its overflow propagates as a borrow
+    for borrow_in in [0, 1]:
+        for sp_hi in range(16):
+            for imm_hi in range(16):
+                result = (sp_hi - imm_hi - borrow_in) % 16
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ALU_HI + sp_hi] = S  # SP hi nibble from L7
+                ffn.W_up[unit, BD.FETCH_HI + imm_hi] = S  # Immediate hi nibble
+                if borrow_in == 0:
+                    # No borrow: block when CARRY active
+                    ffn.W_up[unit, BD.CARRY + 0] = -S * 2.0
+                    ffn.b_up[unit] = -S * 15.5  # High threshold like ADJ
+                else:
+                    # With borrow: require CARRY active
+                    ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
+                    ffn.b_up[unit] = -S * 17.5  # Higher threshold (4-way AND)
+                ffn.W_gate[unit, BD.OP_ENT] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
 
