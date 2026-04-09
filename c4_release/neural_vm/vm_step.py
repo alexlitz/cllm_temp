@@ -6627,6 +6627,11 @@ def _set_function_call_weights(model, S, BD, HD):
     attn5.W_q[base + GATE, BD.MARK_BP] = 500.0
     attn5.W_q[base + GATE, BD.CONST] = -500.0
     attn5.W_k[base + GATE, BD.CONST] = 5.0
+    # OP_ENT gate: only fire when ENT opcode is active (prevents TEMP pollution)
+    ENT_GATE = 34
+    attn5.W_q[base + ENT_GATE, BD.OP_ENT] = 500.0
+    attn5.W_q[base + ENT_GATE, BD.CONST] = -500.0
+    attn5.W_k[base + ENT_GATE, BD.CONST] = 5.0
     # V: copy EMBED_LO/HI
     for k in range(16):
         attn5.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
