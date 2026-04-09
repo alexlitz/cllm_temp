@@ -195,11 +195,13 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 - ✅ Stack memory FIXED (ENT handler manages BP and shadow memory)
 - ✅ Function calls WORKING (programs with 0-1 local variables complete successfully)
 
-**New Issue Discovered**:
-- ❌ **LI/SI neural memory lookup fails with 2+ local variables**
-  - Programs with 1 variable: exit code 42 ✅
-  - Programs with 2+ variables: wrong exit codes ❌
-  - Root cause: L15 memory lookup doesn't find stored values correctly
+**Critical Issue Discovered**:
+- ❌ **Neural PSH/STACK0 register generation fundamentally broken**
+  - Programs with 1 variable: exit code 42 ✅ (works by luck)
+  - Programs with 2+ variables: exit code 0 ❌ (completely fails)
+  - Root cause: PSH outputs garbage STACK0 values (0x00, 0x0a, 0x20)
+  - Should output: STACK0 = address pushed (e.g., BP-8 = 0x000100e0)
+  - **Critical**: Even handlers fail because they read garbage STACK0 from model
 
 **Root Causes Still Pending**:
 1. ⚠️ **JSR neural implementation doesn't work** - PC doesn't jump (handler enabled as workaround)
@@ -210,13 +212,17 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 - ✅ Basic operations work (IMM, PSH, NOP, EXIT, arithmetic, control flow)
 - ✅ Function calls work (JSR/ENT/LEV via handlers)
 - ✅ Programs with 0-1 local variables complete successfully
-- ❌ Programs with 2+ local variables return incorrect results
-- ❌ Neural LI/SI memory lookup broken for complex cases
+- ❌ Programs with 2+ local variables BLOCKED - return exit code 0
+- ❌ **CRITICAL**: Neural PSH/STACK0 register generation broken
+- ❌ Handlers can't work around this - they need correct register values
 
 **Recommended Action**:
-1. **Immediate**: Investigate L15 memory lookup mechanism (why fails with 2+ vars?)
-2. **Short-term**: Consider adding LI/SI handlers as workaround
-3. **Long-term**: Fix neural memory mechanism or document limitation
+1. **CRITICAL**: Fix neural PSH to generate correct STACK0 register values
+   - PSH should set STACK0 = address being pushed (e.g., BP-8)
+   - Currently outputs garbage (0x00, 0x0a, 0x20) unrelated to actual addresses
+   - This is likely in L6/L7 register output weights
+2. **After PSH fixed**: Test if LI/SI handlers work correctly
+3. **Long-term**: Fix L14 MEM generation and L15 memory lookup for full neural path
 
 ---
 
