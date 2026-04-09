@@ -3650,13 +3650,15 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # Read from FETCH_LO/HI (clean staging dims written by L5 fetch head 0).
     # These dims have no prior-layer leakage, unlike EMBED_LO/HI which
     # accumulates carry-forward residuals from L3.
-    # FIX: Use strong -MARK_PC to block at PC marker. OP_IMM = 5.0 at PC marker
-    # for first-step detection, so we need -6*S to overcome it.
+    # BUG FIX 2026-04-09 (part 4): Increased MARK_PC blocker from -6*S to -8*S.
+    # OP_IMM ≈ 6.6 at PC marker (higher than expected 5.0), so:
+    # activation = S*OP_IMM + S*MARK_AX + (-8*S)*MARK_PC + bias
+    #            = 20*6.6 + 20*0 + (-160)*1 + (-10) = 132 - 160 - 10 = -38 (blocked!)
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
         ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S * 6  # Strong block at PC marker (OP_IMM=5 there)
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -6*S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_LO + k] = 1.0
@@ -3666,7 +3668,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.OP_IMM] = S
         ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S * 6  # Strong block at PC marker (OP_IMM=5 there)
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -6*S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_HI + k] = 1.0
@@ -3674,11 +3676,13 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
 
     # === EXIT: AX_CARRY → OUTPUT ===
+    # BUG FIX 2026-04-09 (part 5): Increased MARK_PC blocker from -S to -8*S.
+    # OP_EXIT ≈ 6.0 at PC marker, so activation = 20*6 + 20*0 + (-160)*1 + (-10) = -50 (blocked!)
     for k in range(16):
         ffn.W_up[unit, BD.OP_EXIT] = S
         ffn.W_up[unit, BD.OP_IMM] = -S * 20  # Strong block IMM crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
@@ -3688,7 +3692,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.OP_EXIT] = S
         ffn.W_up[unit, BD.OP_IMM] = -S * 20  # Strong block IMM crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
@@ -3696,10 +3700,11 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
 
     # === NOP: AX_CARRY → OUTPUT ===
+    # BUG FIX 2026-04-09 (part 6): Increased MARK_PC blocker from -S to -8*S.
     for k in range(16):
         ffn.W_up[unit, BD.OP_NOP] = S
         ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S

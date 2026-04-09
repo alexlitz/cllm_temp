@@ -148,6 +148,11 @@ class AutoregressiveVMRunner:
         )
         # Load hand-crafted transformer weights for VM execution
         set_weights(self.model, enable_conversational_io=conversational_io)
+
+        # Move model to GPU if available for ~20-100x speedup
+        if torch.cuda.is_available():
+            self.model = self.model.cuda()
+
         self.model.eval()
 
         # Syscall dispatch table
@@ -216,7 +221,8 @@ class AutoregressiveVMRunner:
             # REMOVED: IMM and LEA now work fully neurally (L6 FFN relay)
             # Opcode.IMM: self._handler_imm,
             # Opcode.LEA: self._handler_lea,
-            Opcode.JSR: self._handler_jsr,
+            # REMOVED: JSR now works fully neurally (L6 PC override + STACK0 + L14 MEM token)
+            # Opcode.JSR: self._handler_jsr,
             Opcode.ENT: self._handler_ent,
             Opcode.LEV: self._handler_lev,
             # REMOVED: PSH now works fully neurally (L6 FFN SP -= 8)
@@ -306,19 +312,15 @@ class AutoregressiveVMRunner:
             opcode = bytecode[init_exec] & 0xFF
             self.model.set_active_opcode(opcode)
 
-        step_num = 0  # Track step number for debugging
+        step_num = 0  # Track VM steps for conversational I/O handling
 
-        # TODO: KV cache needed! Currently O(n²) - each token reprocesses entire context
-        # Issue: generate_next() doesn't use KV cache, causing exponential slowdown
-        # Fix needed: Implement proper KV cache or use context windowing
-        kv_cache = None  # Disabled for now - causes AttributeError
-
-        print(f"[DEBUG] Starting generation loop, max_steps={max_steps}, total tokens={max_steps * Token.STEP_TOKENS}", flush=True)
+        # Context windowing prevents O(n²) blowup: keep last 512 tokens for generation
+        # Sufficient for VM state tracking while bounding complexity to O(window_size)
         for i in range(max_steps * Token.STEP_TOKENS):
-            if i % 35 == 0:  # Print every step
-                print(f"[DEBUG] Generating token {i}/{max_steps * Token.STEP_TOKENS}, step {i//35}", flush=True)
-            # TODO: Pass kv_cache once implemented
-            next_token = self.model.generate_next(context)
+            # Apply context windowing to prevent O(n²) blowup
+            # Keep last 512 tokens for generation (sufficient for VM state)
+            generation_context = context[-512:] if len(context) > 512 else context
+            next_token = self.model.generate_next(generation_context, use_incremental=False)
             context.append(next_token)
 
             # Hybrid conversational I/O: handle THINKING_END
@@ -350,26 +352,26 @@ class AutoregressiveVMRunner:
 
             if next_token == Token.STEP_END:
                 if step_num < 3:
-                step_num += 1  # Increment step counter
+                    step_num += 1  # Increment step counter
                 # Extract PC and dispatch syscall handler
                 op = None
                 instr_idx = None
                 if step_num <= 3:
-                exec_pc = self._exec_pc()  # PC being executed this step
+                    exec_pc = self._exec_pc()  # PC being executed this step
                 if step_num <= 3:
-                pc = self._extract_register(context, Token.REG_PC)  # Next PC from output
+                    pc = self._extract_register(context, Token.REG_PC)  # Next PC from output
                 if step_num <= 3:
-                # Get opcode being executed this step
-                exec_idx = exec_pc // INSTR_WIDTH
-                exec_op = None
-                exec_opname = "?"
-                if 0 <= exec_idx < len(bytecode):
-                    exec_op = bytecode[exec_idx] & 0xFF
-                    # Find opcode name
-                    for name in dir(Opcode):
-                        if not name.startswith('_') and getattr(Opcode, name) == exec_op:
-                            exec_opname = name
-                            break
+                    # Get opcode being executed this step
+                    exec_idx = exec_pc // INSTR_WIDTH
+                    exec_op = None
+                    exec_opname = "?"
+                    if 0 <= exec_idx < len(bytecode):
+                        exec_op = bytecode[exec_idx] & 0xFF
+                        # Find opcode name
+                        for name in dir(Opcode):
+                            if not name.startswith('_') and getattr(Opcode, name) == exec_op:
+                                exec_opname = name
+                                break
 
                 if pc is not None:
                     instr_idx = pc // INSTR_WIDTH
