@@ -64,6 +64,33 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 - ❌ Stdlib code makes program too large for something
 - ❌ Can't test with stdlib until basic function calls work
 
+### Neural LI/SI Memory Limitation ⚠️
+**Status**: LI/SI work neurally for simple cases, but fail with 2+ local variables
+
+**Evidence**:
+- ✅ Program with 1 local variable: exit code 42 (correct)
+- ❌ Program with 2 local variables: exit code 16843009 (0x01010101 - wrong!)
+
+**Root Cause**: When loading variable `a` (stored as 10), LI returns 0
+- SI stores values correctly (verified: AX=10, then AX=32 after stores)
+- LI fails to look up stored values from neural memory
+- ADD then computes 0 + garbage = 0x01010101 instead of 10 + 32 = 42
+
+**Technical Details**:
+- Bytecode: `LEA -8; LI` should load variable at BP-8
+- Execution: After `LEA -8; LI`, AX becomes 0 instead of 10
+- The L15 softmax1 memory lookup doesn't find the correct stored value
+- Works with 1 variable, fails with 2+ variables
+
+**Impact**:
+- Programs with 0-1 local variables work
+- Programs with 2+ local variables return incorrect results
+- No ADJ instruction needed - ENT directly allocates local space
+- Arithmetic, control flow, and function calls work correctly
+- Only memory lookup from local variables is affected
+
+**Workaround**: Avoid local variables, or use stack operations manually
+
 ---
 
 ## Neural Implementation Status
@@ -73,7 +100,7 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 - ADD, SUB, MUL, DIV, MOD (arithmetic) ✅
 - OR, XOR, AND, SHL, SHR (bitwise) ✅
 - EQ, NE, LT, GT, LE, GE (comparisons) ✅
-- LI, LC, SI, SC (memory load/store) ✅
+- LI, LC, SI, SC (memory load/store) ⚠️ **Limited**: Works with 0-1 local vars, fails with 2+
 - JMP, JZ, JNZ (basic control flow) ✅
 - JSR (jump subroutine) ✅ per commit 3e3ed2c
 
@@ -99,22 +126,23 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 
 ## 🎯 Immediate Next Steps
 
-### Priority 1: Fix Stack Memory for Function Calls
-1. **Debug why LEV reads all zeros from memory**
-   - JSR writes return address to `memory[new_sp]`
-   - LEV reads from `memory[old_bp]` → gets 0
-   - Check if BP is being set correctly by ENT
-   - Check if memory writes are being tracked correctly
+### Priority 1: Fix Neural LI/SI Memory Lookup (NEW ISSUE)
+**Status**: LI/SI neural implementation fails with 2+ local variables
 
-2. **Fix memory read/write in handlers**
-   - Verify `_mem_store_word()` actually writes to `self._memory`
-   - Verify `_mem_load_word()` reads from correct address
-   - Check if shadow memory dict is working
+1. **Investigate L15 softmax1 memory lookup**
+   - Why does it work with 1 variable but not 2?
+   - Check MEM section retention and addressing
+   - Compare attention patterns for 1-var vs 2-var programs
 
-3. **Test simple program without loops**
-   - Get `int main() { return 42; }` to work (stdlib=False)
-   - Should: JSR → ENT → execute → LEV → HALT
-   - Current: JSR → ENT → execute → LEV → PC=0 (loop)
+2. **Options for fixing**:
+   - **Option A**: Fix neural memory lookup mechanism (L15 weights)
+   - **Option B**: Add LI/SI handlers as temporary workaround
+   - **Option C**: Document limitation and advise users to minimize local vars
+
+3. **Test after fix**:
+   - Verify 2-variable program returns 42
+   - Test 4-variable program
+   - Test nested function calls with local variables
 
 ### Priority 2: Fix JSR Neural Implementation
 1. **Investigate why neural JSR doesn't jump**
@@ -126,37 +154,43 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
    - If neural version can't work with hand-crafted weights, keep handler
    - Update documentation to reflect handler requirement
 
-### Priority 3: Test ADJ Once Function Calls Work
-1. Once simple functions work, test with local variables
-2. Verify ADJ neural implementation
-3. Test more complex programs
+### Priority 3: Investigate PC=0 Loop After ENT
+**Status**: After ENT executes, PC goes to 0 instead of next instruction
+- Affects both programs with and without local variables
+- Programs eventually stabilize and complete successfully
+- May be related to neural weights needing "warm up"
 
 ---
 
 ## 📊 Bottom Line
 
-**Major Achievement**: ✅ Performance issue RESOLVED
-- GPU acceleration working (4-5x faster)
-- Context windowing implemented
-- Hand-crafted bytecode works perfectly
+**Major Achievements**:
+- ✅ Performance issue RESOLVED (GPU acceleration + context windowing)
+- ✅ Stack memory FIXED (ENT handler manages BP and shadow memory)
+- ✅ Function calls WORKING (programs with 0-1 local variables complete successfully)
 
-**Root Causes Identified**:
-1. ❌ **JSR neural implementation doesn't work** - PC doesn't jump (re-enabled handler)
-2. ❌ **Stack memory broken** - LEV reads all zeros instead of saved values
+**New Issue Discovered**:
+- ❌ **LI/SI neural memory lookup fails with 2+ local variables**
+  - Programs with 1 variable: exit code 42 ✅
+  - Programs with 2+ variables: wrong exit codes ❌
+  - Root cause: L15 memory lookup doesn't find stored values correctly
+
+**Root Causes Still Pending**:
+1. ⚠️ **JSR neural implementation doesn't work** - PC doesn't jump (handler enabled as workaround)
+2. ⚠️ **PC goes to 0 after ENT** - Programs loop initially but eventually stabilize
 3. ⚠️ **Stdlib causes issues** - CALL target beyond bytecode length
 
 **Current State**:
-- ✅ Basic operations work (IMM, PSH, NOP, EXIT)
-- ✅ Simple programs execute (but loop infinitely due to stack bug)
-- ✅ AX reaches correct values (42)
-- ❌ Function returns don't work (LEV returns to PC=0)
-- ❌ Can't test with stdlib until basic calls work
+- ✅ Basic operations work (IMM, PSH, NOP, EXIT, arithmetic, control flow)
+- ✅ Function calls work (JSR/ENT/LEV via handlers)
+- ✅ Programs with 0-1 local variables complete successfully
+- ❌ Programs with 2+ local variables return incorrect results
+- ❌ Neural LI/SI memory lookup broken for complex cases
 
 **Recommended Action**:
-1. Fix shadow memory read/write in JSR/ENT/LEV handlers
-2. Get simple function call working (no stdlib)
-3. Then investigate JSR neural implementation
-4. Then test ADJ and more complex programs
+1. **Immediate**: Investigate L15 memory lookup mechanism (why fails with 2+ vars?)
+2. **Short-term**: Consider adding LI/SI handlers as workaround
+3. **Long-term**: Fix neural memory mechanism or document limitation
 
 ---
 
