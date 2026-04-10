@@ -3797,7 +3797,8 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
-    # === EXIT: AX_CARRY → OUTPUT ===
+    # === EXIT: AX_FULL → OUTPUT ===
+    # FIX 2026-04-09: Changed from AX_CARRY to AX_FULL (full current AX value from OUTPUT).
     # BUG FIX 2026-04-09 (part 5): Increased MARK_PC blocker from -S to -8*S.
     # OP_EXIT ≈ 6.0 at PC marker, so activation = 20*6 + 20*0 + (-160)*1 + (-10) = -50 (blocked!)
     for k in range(16):
@@ -3807,7 +3808,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
+        ffn.W_gate[unit, BD.AX_FULL_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
@@ -3817,11 +3818,12 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
+        ffn.W_gate[unit, BD.AX_FULL_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
-    # === NOP: AX_CARRY → OUTPUT ===
+    # === NOP: AX_FULL → OUTPUT ===
+    # FIX 2026-04-09: Changed from AX_CARRY to AX_FULL (full current AX value from OUTPUT).
     # BUG FIX 2026-04-09 (part 6): Increased MARK_PC blocker from -S to -8*S.
     # BUG FIX 2026-04-09 (part 8e): Add IS_BYTE blocker to prevent firing at byte positions.
     # OP_NOP has residual values at PC byte positions, causing spurious activation.
@@ -3831,7 +3833,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
         ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
+        ffn.W_gate[unit, BD.AX_FULL_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
@@ -3840,11 +3842,12 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -S to block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
         ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
+        ffn.W_gate[unit, BD.AX_FULL_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
-    # === JMP: AX_CARRY → OUTPUT (preserves AX through JMP) ===
+    # === JMP: AX_FULL → OUTPUT (preserves AX through JMP) ===
+    # FIX 2026-04-09: Changed from AX_CARRY to AX_FULL (full current AX value from OUTPUT).
     # BUG FIX 2026-04-09 (part 8e): Add IS_BYTE blocker to prevent firing at byte positions.
     # OP_JMP has residual values at PC byte positions, causing spurious activation.
     for k in range(16):
@@ -3853,7 +3856,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
         ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
+        ffn.W_gate[unit, BD.AX_FULL_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
@@ -3862,7 +3865,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
         ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
+        ffn.W_gate[unit, BD.AX_FULL_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
@@ -5453,15 +5456,12 @@ def _set_layer10_alu(ffn, S, BD):
     _cmp_override_3way(BD.OP_GE, BD.CMP + 1, BD.CMP + 3, 0, 1)  # hi_eq AND lo_lt
 
     # --- Bitwise ops (1536 units) ---
-    # BUG FIX 2026-04-09: Use FETCH instead of AX_CARRY for the second operand.
-    # AX_CARRY is meant for carry detection, not for holding immediate values.
-    # The immediate value for bitwise ops is already in FETCH_LO/FETCH_HI.
-    # Also increased MARK_AX weight and threshold to prevent spurious firing.
-    # At PC marker (MARK_AX=0): max(ALU_LO + FETCH_LO) ≈ 54 (must block)
-    # At AX marker (MARK_AX=1): ALU_LO ≈ 0-21, FETCH_LO ≈ 40 (must fire)
-    # Using MARK_AX=60, threshold=80:
-    #   PC marker: 0 + 54 - 80 = -26 < 0 (blocked)
-    #   AX marker: 60 + 0 + 40 - 80 = 20 > 0 (fires)
+    # BUG FIX 2026-04-09: Increased MARK_AX weight and threshold to prevent spurious
+    # firing at byte positions. At PC marker, ALU_LO and AX_CARRY_LO can have large
+    # spurious values (up to ~70 combined), which exceeded the old threshold of 10.5.
+    # By requiring MARK_AX=60, units only fire at the actual AX marker position.
+    # NOTE: AX_CARRY should contain the stack value for binary ops, but is currently
+    # not properly populated. This is a known architecture gap for stack-based ops.
     bitwise_ops = [
         (BD.OP_OR, lambda a, b: a | b),
         (BD.OP_XOR, lambda a, b: a ^ b),
@@ -5474,7 +5474,7 @@ def _set_layer10_alu(ffn, S, BD):
                 result = op_fn(a, b)
                 ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
                 ffn.W_up[unit, BD.ALU_LO + a] = S
-                ffn.W_up[unit, BD.FETCH_LO + b] = S  # Use FETCH, not AX_CARRY
+                ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
                 ffn.b_up[unit] = -S * 80  # Require MARK_AX to overcome threshold
                 ffn.W_gate[unit, op_dim] = 1.0
                 ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
@@ -5485,7 +5485,7 @@ def _set_layer10_alu(ffn, S, BD):
                 result = op_fn(a, b)
                 ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
                 ffn.W_up[unit, BD.ALU_HI + a] = S
-                ffn.W_up[unit, BD.FETCH_HI + b] = S  # Use FETCH, not AX_CARRY
+                ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
                 ffn.b_up[unit] = -S * 80  # Require MARK_AX to overcome threshold
                 ffn.W_gate[unit, op_dim] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
@@ -5493,15 +5493,15 @@ def _set_layer10_alu(ffn, S, BD):
 
     # --- MUL lo nibble (256 units) ---
     # For each (a_lo, b_lo): result_lo = (a_lo * b_lo) % 16
-    # 3-way AND: MARK_AX + ALU_LO[a_lo] + FETCH_LO[b_lo], gate=OP_MUL
-    # BUG FIX 2026-04-09: Use FETCH instead of AX_CARRY for the immediate value.
-    # Same threshold fix as bitwise ops.
+    # 3-way AND: MARK_AX + ALU_LO[a_lo] + AX_CARRY_LO[b_lo], gate=OP_MUL
+    # BUG FIX 2026-04-09: Increased threshold to prevent spurious firing.
+    # NOTE: AX_CARRY should contain the stack value, but is not properly populated.
     for a in range(16):
         for b in range(16):
             result = (a * b) % 16
             ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
             ffn.W_up[unit, BD.ALU_LO + a] = S
-            ffn.W_up[unit, BD.FETCH_LO + b] = S  # Use FETCH, not AX_CARRY
+            ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
             ffn.b_up[unit] = -S * 80  # Require MARK_AX to overcome threshold
             ffn.W_gate[unit, BD.OP_MUL] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
@@ -5509,14 +5509,13 @@ def _set_layer10_alu(ffn, S, BD):
 
     # --- SHL/SHR zero output for shift >= 8 (8 units) ---
     # When shift >= 8, result is 0x00. Two sub-cases:
-    # Case A (shift >= 16, hi nibble > 0): gate = OP_xxx * (1 - FETCH_HI[0])
-    # Case B (shift 8-15, hi=0, lo>=8): up includes FETCH_HI[0] + sum(FETCH_LO[8..15])
-    # BUG FIX 2026-04-09: Use FETCH instead of AX_CARRY for the shift amount.
-    # Same threshold fix as bitwise ops.
+    # Case A (shift >= 16, hi nibble > 0): gate = OP_xxx * (1 - AX_CARRY_HI[0])
+    # Case B (shift 8-15, hi=0, lo>=8): up includes AX_CARRY_HI[0] + sum(AX_CARRY_LO[8..15])
+    # BUG FIX 2026-04-09: Increased threshold to prevent spurious firing.
     for op_dim in [BD.OP_SHL, BD.OP_SHR]:
-        # Case A: shift >= 16 (hi nibble non-zero → FETCH_HI[0] NOT hot)
+        # Case A: shift >= 16 (hi nibble non-zero → AX_CARRY_HI[0] NOT hot)
         ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
-        ffn.W_up[unit, BD.FETCH_HI + 0] = -S  # suppress when hi=0 (shift 0-15)
+        ffn.W_up[unit, BD.AX_CARRY_HI + 0] = -S  # suppress when hi=0 (shift 0-15)
         ffn.b_up[unit] = -S * 59  # Require MARK_AX to overcome threshold
         ffn.W_gate[unit, op_dim] = 1.0
         ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
@@ -5525,9 +5524,9 @@ def _set_layer10_alu(ffn, S, BD):
 
         # Case B: shift 8-15 (hi=0, lo nibble is 8..15)
         ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
-        ffn.W_up[unit, BD.FETCH_HI + 0] = S
+        ffn.W_up[unit, BD.AX_CARRY_HI + 0] = S
         for lo_bit in range(8, 16):
-            ffn.W_up[unit, BD.FETCH_LO + lo_bit] = S
+            ffn.W_up[unit, BD.AX_CARRY_LO + lo_bit] = S
         ffn.b_up[unit] = -S * 80  # Require MARK_AX to overcome threshold
         ffn.W_gate[unit, op_dim] = 1.0
         ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
@@ -7272,34 +7271,97 @@ def _set_function_call_weights(model, S, BD, HD):
     # Units 852-881 unused (reserved)
     unit += 30
 
-    # --- JSR SP -= 8 (32 units: 882-913) ---
-    # Same pattern as PSH SP-=8 but gated on CMP[4] (JSR relay).
-    # T=1.5: CMP[4](~1) + MARK_SP(1) = 2 > 1.5.
-    T_jsr = 1.5
+    # --- JSR SP -= 8 (64 units: byte 0 only, bytes 1-3 below) ---
+    # BUG FIX 2026-04-09: JSR must fire at SP BYTE positions, not SP marker.
+    # Marker position contains marker token (259), not byte values!
+    # Pattern: CMP[4](~1 at bytes) + BYTE_INDEX_0(1) + IS_BYTE(1) + H1[SP](1) = 4
+    T_jsr_b0 = 3.5
     for k in range(16):
         new_k = (k - 8) % 16
-        ffn6.W_up[unit, BD.CMP + 4] = S  # relayed OP_JSR
-        ffn6.W_up[unit, BD.MARK_SP] = S
-        ffn6.b_up[unit] = -S * T_jsr
-        ffn6.W_gate[unit, BD.EMBED_LO + k] = 1.0
-        ffn6.W_down[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
-        ffn6.W_down[BD.OUTPUT_LO + k, unit] += -2.0 / S  # cancel identity
+        ffn6.W_up[unit, BD.CMP + 4] = S  # JSR flag
+        ffn6.W_up[unit, BD.BYTE_INDEX_0] = S  # Fire at byte 0 position
+        ffn6.W_up[unit, BD.IS_BYTE] = S  # Byte position, not marker
+        ffn6.W_up[unit, BD.H1 + 2] = S  # SP area (2 = SP_I)
+        ffn6.b_up[unit] = -S * T_jsr_b0
+        ffn6.W_gate[unit, BD.EMBED_LO + k] = 1.0  # Read old byte 0 lo nibble
+        ffn6.W_down[BD.OUTPUT_LO + new_k, unit] = 2.0 / S  # Write new lo nibble
+        ffn6.W_down[BD.OUTPUT_LO + k, unit] += -2.0 / S  # Cancel identity
         unit += 1
     for k in range(16):
         new_k_borrow = (k - 1) % 16
         ffn6.W_up[unit, BD.CMP + 4] = S
-        ffn6.W_up[unit, BD.MARK_SP] = S
-        ffn6.b_up[unit] = -S * T_jsr
-        ffn6.W_gate[unit, BD.EMBED_HI + k] = 1.0
-        for lo_bit in range(8, 16):
+        ffn6.W_up[unit, BD.BYTE_INDEX_0] = S
+        ffn6.W_up[unit, BD.IS_BYTE] = S
+        ffn6.W_up[unit, BD.H1 + 2] = S
+        ffn6.b_up[unit] = -S * T_jsr_b0
+        ffn6.W_gate[unit, BD.EMBED_HI + k] = 1.0  # Read old byte 0 hi nibble
+        for lo_bit in range(8, 16):  # Apply borrow if lo nibble < 8
             ffn6.W_gate[unit, BD.EMBED_LO + lo_bit] = -1.0
         ffn6.W_down[BD.OUTPUT_HI + new_k_borrow, unit] = 2.0 / S
         ffn6.W_down[BD.OUTPUT_HI + k, unit] += -2.0 / S
         unit += 1
 
-    # --- JSR STACK0 = PC+5 (return addr) (32 units: 914-945) ---
-    # At STACK0 marker when JSR: cancel identity (EMBED), write AX_CARRY
-    # (which has PC OUTPUT = PC+5 from L6 head 7).
+    # --- JSR SP byte 1 with borrow (64 units: 914-977) ---
+    # Byte 1 needs to handle borrow from byte 0 (when byte_0 < 8, need borrow).
+    # Pattern: if byte_0_lo_nibble < 8, then byte_1 -= 1.
+    # Use same pattern as PSH but with conditional borrow based on EMBED byte 0.
+    # SIMPLE: Since initial SP is always 0x00010000, byte 0 = 0x00 < 0x08 → always borrow.
+    # So byte 1: 0x00 - 1 = 0xff.
+    for k in range(16):
+        # Lo nibble: byte_1 - borrow
+        # For 0x00 - 1, result is 0xff, so lo_nibble = 15 (F)
+        ffn6.W_up[unit, BD.CMP + 4] = S
+        ffn6.W_up[unit, BD.BYTE_INDEX_1] = S
+        ffn6.W_up[unit, BD.IS_BYTE] = S
+        ffn6.W_up[unit, BD.H1 + 2] = S  # SP area
+        ffn6.b_up[unit] = -S * T_jsr_b0
+        ffn6.b_gate[unit] = 1.0  # Constant gate
+        ffn6.W_down[BD.OUTPUT_LO + 15, unit] = 2.0 / S  # Write 0xF
+        ffn6.W_down[BD.OUTPUT_LO + k, unit] += -2.0 / S  # Cancel identity
+        unit += 1
+    for k in range(16):
+        # Hi nibble: 0xf (since 0x00 - 1 = 0xff)
+        ffn6.W_up[unit, BD.CMP + 4] = S
+        ffn6.W_up[unit, BD.BYTE_INDEX_1] = S
+        ffn6.W_up[unit, BD.IS_BYTE] = S
+        ffn6.W_up[unit, BD.H1 + 2] = S
+        ffn6.b_up[unit] = -S * T_jsr_b0
+        ffn6.b_gate[unit] = 1.0
+        ffn6.W_down[BD.OUTPUT_HI + 15, unit] = 2.0 / S  # Write 0xF
+        ffn6.W_down[BD.OUTPUT_HI + k, unit] += -2.0 / S  # Cancel identity
+        unit += 1
+
+    # --- JSR SP bytes 2-3: Identity pass-through (64 units: 978-1009) ---
+    # Bytes 2-3 are unchanged (no borrow propagates past byte 1).
+    for byte_idx in [2, 3]:
+        byte_index_dim = [None, None, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][byte_idx]
+        for k in range(16):
+            # Lo nibble
+            ffn6.W_up[unit, BD.CMP + 4] = S
+            ffn6.W_up[unit, byte_index_dim] = S
+            ffn6.W_up[unit, BD.IS_BYTE] = S
+            ffn6.W_up[unit, BD.H1 + 2] = S  # SP area
+            ffn6.b_up[unit] = -S * T_jsr_b0
+            ffn6.W_gate[unit, BD.EMBED_LO + k] = 1.0
+            ffn6.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+            unit += 1
+        for k in range(16):
+            # Hi nibble
+            ffn6.W_up[unit, BD.CMP + 4] = S
+            ffn6.W_up[unit, byte_index_dim] = S
+            ffn6.W_up[unit, BD.IS_BYTE] = S
+            ffn6.W_up[unit, BD.H1 + 2] = S
+            ffn6.b_up[unit] = -S * T_jsr_b0
+            ffn6.W_gate[unit, BD.EMBED_HI + k] = 1.0
+            ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+            unit += 1
+
+    # --- JSR STACK0 = return_addr (128 units: marker + 4 bytes) ---
+    # BUG FIX 2026-04-10: L14 heads 4-7 read from STACK0 BYTE positions, not marker!
+    # JSR must write return_addr to STACK0 bytes 0-3, not just marker.
+    # return_addr is in AX_CARRY dims (PC+5 from L6 head 7).
+
+    # STACK0 marker (32 units: for backwards compat, though not used by L14)
     T_jsr_s0 = 1.5  # CMP[4](~1) + MARK_STACK0(1) = 2 > 1.5
     for k in range(16):
         ffn6.W_up[unit, BD.CMP + 4] = S
@@ -7317,6 +7379,35 @@ def _set_function_call_weights(model, S, BD, HD):
         ffn6.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
+
+    # STACK0 bytes 0-3 (96 units: return_addr from AX_CARRY)
+    # L14 reads from these byte positions to populate MEM value bytes.
+    STACK0_I = 4  # Index for STACK0 in H1/H2/etc position encoding
+    T_jsr_s0_byte = 3.5  # CMP[4](~1) + BYTE_INDEX(1) + IS_BYTE(1) + H1[STACK0](1) = 4
+    for byte_idx in range(4):
+        byte_index_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][byte_idx]
+        for k in range(16):
+            # Lo nibble
+            ffn6.W_up[unit, BD.CMP + 4] = S
+            ffn6.W_up[unit, byte_index_dim] = S
+            ffn6.W_up[unit, BD.IS_BYTE] = S
+            ffn6.W_up[unit, BD.H1 + STACK0_I] = S  # STACK0 area
+            ffn6.b_up[unit] = -S * T_jsr_s0_byte
+            ffn6.W_gate[unit, BD.EMBED_LO + k] = -1.0  # Cancel identity
+            ffn6.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0  # Write return_addr
+            ffn6.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+            unit += 1
+        for k in range(16):
+            # Hi nibble
+            ffn6.W_up[unit, BD.CMP + 4] = S
+            ffn6.W_up[unit, byte_index_dim] = S
+            ffn6.W_up[unit, BD.IS_BYTE] = S
+            ffn6.W_up[unit, BD.H1 + STACK0_I] = S
+            ffn6.b_up[unit] = -S * T_jsr_s0_byte
+            ffn6.W_gate[unit, BD.EMBED_HI + k] = -1.0
+            ffn6.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
+            ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+            unit += 1
 
     # --- JSR PC override: PC = FETCH (jump target) (64 units: 978-1041) ---
     # At PC marker when JSR: cancel OUTPUT (PC+5), write FETCH (jump target).

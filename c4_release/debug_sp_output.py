@@ -1,73 +1,110 @@
-#\!/usr/bin/env python3
-"""Trace OUTPUT at SP marker through layers."""
-import os, sys
-sys.path.insert(0, os.getcwd())
-import torch
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, _SetDim, Token
-from neural_vm.embedding import Opcode
-from neural_vm.speculative import DraftVM
-from neural_vm.constants import IMMEDIATE_SIZE, PADDING_SIZE
+#!/usr/bin/env python3
+"""
+Debug script to check what raw tokens are in the last step context.
+"""
 
-bytecode = [Opcode.IMM | (0 << 8), Opcode.PSH, Opcode.IMM | (0 << 8), Opcode.MUL, Opcode.EXIT]
-vm = DraftVM(bytecode)
-vm.step(); draft_step0 = vm.draft_tokens()
-vm.step(); draft_step1 = vm.draft_tokens()
-vm.step(); draft_step2 = vm.draft_tokens()
+import sys
+sys.path.insert(0, '/home/alexlitz/Documents/misc/c4_release/c4_release')
 
-def build_context(bytecode):
-    context = [Token.CODE_START]
-    for instr in bytecode:
-        op, imm = instr & 0xFF, instr >> 8
-        context.append(op)
-        for i in range(IMMEDIATE_SIZE):
-            context.append((imm >> (i * 8)) & 0xFF)
-        for _ in range(PADDING_SIZE):
-            context.append(0)
-    context.extend([Token.CODE_END, Token.DATA_START, Token.DATA_END])
-    return context
+from src.compiler import compile_c
+from neural_vm.run_vm import AutoregressiveVMRunner
+from neural_vm.vm_step import Token
 
-context = build_context(bytecode)
-full_context = context + draft_step0 + draft_step1 + draft_step2[:11]
+# Simple JSR operation
+code = '''
+int helper() {
+    return 42;
+}
 
-model = AutoregressiveVM(vocab_size=512, n_layers=16, n_heads=8, ffn_hidden=4096)
-set_vm_weights(model)
-model.eval()
-BD = _SetDim
+int main() {
+    return helper();
+}
+'''
 
-activations = {}
-def hook_fn(name):
-    def fn(module, input, output):
-        activations[name] = output[0].detach().clone() if isinstance(output, tuple) else output.detach().clone()
-    return fn
+print("Compiling code...")
+bytecode, data = compile_c(code, link_stdlib=False)
+print(f"✓ Compiled: {len(bytecode)} bytes\n")
 
-for i, block in enumerate(model.blocks):
-    block.attn.register_forward_hook(hook_fn(f'L{i}_attn'))
-    block.ffn.register_forward_hook(hook_fn(f'L{i}_ffn'))
+print("Creating runner...")
+runner = AutoregressiveVMRunner(
+    n_layers=17,
+    pure_attention_memory=False,
+)
 
-token_ids = torch.tensor([full_context], dtype=torch.long)
-with torch.no_grad():
-    logits = model(token_ids)
+# Monkey-patch to intercept context after first JSR
+step_count = [0]
+jsr_found = [False]
 
-print("--- OUTPUT at SP marker (last token) through layers ---")
-print("Expected: lo=8, hi=15 for SP byte 0 = 248 = 0xF8")
-print()
-for layer in range(16):
-    h = activations[f'L{layer}_ffn'][0, -1, :]
-    out_lo = [h[BD.OUTPUT_LO + i].item() for i in range(16)]
-    out_hi = [h[BD.OUTPUT_HI + i].item() for i in range(16)]
-    lo_max_idx, lo_max_val = max(enumerate(out_lo), key=lambda x: x[1])
-    hi_max_idx, hi_max_val = max(enumerate(out_hi), key=lambda x: x[1])
-    
-    # Also show EMBED at marker
-    embed_lo = [h[BD.EMBED_LO + i].item() for i in range(16)]
-    embed_hi = [h[BD.EMBED_HI + i].item() for i in range(16)]
-    emb_lo_max_idx = max(enumerate(embed_lo), key=lambda x: x[1])[0]
-    emb_hi_max_idx = max(enumerate(embed_hi), key=lambda x: x[1])[0]
-    
-    print(f"L{layer:2d}: OUTPUT_LO max={lo_max_idx:2d} ({lo_max_val:6.3f}), OUTPUT_HI max={hi_max_idx:2d} ({hi_max_val:6.3f}) | EMBED_LO max={emb_lo_max_idx}, EMBED_HI max={emb_hi_max_idx}")
-    
-    # Show all significant OUTPUT_LO values
-    if layer >= 5:
-        sig_lo = [(i, v) for i, v in enumerate(out_lo) if abs(v) > 0.5]
-        if sig_lo:
-            print(f"       OUTPUT_LO significant: {sig_lo}")
+original_generate = runner.model.generate
+
+def debug_generate(*args, **kwargs):
+    result = original_generate(*args, **kwargs)
+   
+    step_count[0] += 1
+    if result == Token.STEP_END and step_count[0] == 2:  # After first real operation (JSR)
+        # Extract the last 35 tokens (one step)
+        context = args[0][0].tolist()  # input_ids tensor
+        last_step = context[-35:]
+        
+        print(f"\n{'='*70}")
+        print(f"STEP {step_count[0]}: Last 35 tokens (one execution step)")
+        print(f"{'='*70}\n")
+        
+        # Decode token sequence
+        markers = {
+            257: "REG_PC",
+            258: "REG_AX",
+            259: "REG_SP",
+            260: "REG_BP",
+            261: "STACK0",
+            262: "MEM",
+            263: "STEP_END",
+        }
+        
+        for i, token in enumerate(last_step):
+            if token in markers:
+                print(f"  [{i:2d}] {markers[token]}")
+            elif i in [1,2,3,4]:
+                print(f"  [{i:2d}] PC byte {i-1}: 0x{token:02x}")
+            elif i in [6,7,8,9]:
+                print(f"  [{i:2d}] AX byte {i-6}: 0x{token:02x}")
+            elif i in [11,12,13,14]:
+                print(f"  [{i:2d}] SP byte {i-11}: 0x{token:02x}")
+            elif i in [16,17,18,19]:
+                print(f"  [{i:2d}] BP byte {i-16}: 0x{token:02x}")
+            elif i in [21,22,23,24]:
+                print(f"  [{i:2d}] STACK0 byte {i-21}: 0x{token:02x}")
+            elif i in [26,27,28,29]:
+                print(f"  [{i:2d}] MEM addr byte {i-26}: 0x{token:02x}")
+            elif i in [30,31,32,33]:
+                print(f"  [{i:2d}] MEM val byte {i-30}: 0x{token:02x}")
+            else:
+                print(f"  [{i:2d}] {token}")
+        
+        # Reconstruct values
+        sp_val = sum(last_step[11+i] << (i*8) for i in range(4))
+        mem_addr = sum(last_step[26+i] << (i*8) for i in range(4))
+        mem_val = sum(last_step[30+i] << (i*8) for i in range(4))
+        
+        print(f"\nDecoded values:")
+        print(f"  SP = 0x{sp_val:08x}")
+        print(f"  MEM addr = 0x{mem_addr:08x}")
+        print(f"  MEM val = 0x{mem_val:08x}")
+        print()
+        jsr_found[0] = True
+        
+    return result
+
+runner.model.generate = debug_generate
+
+print("Running VM...\n")
+
+try:
+    result = runner.run(bytecode, data, max_steps=20)
+    print(f"\n{'='*70}")
+    print(f"Exit code: {result.exit_code} (expected 42)")
+    print(f"Steps: {result.steps}")
+except Exception as e:
+    print(f"\nError: {e}")
+    import traceback
+    traceback.print_exc()

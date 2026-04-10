@@ -9,16 +9,16 @@ sys.path.insert(0, '/home/alexlitz/Documents/misc/c4_release/c4_release')
 from src.compiler import compile_c
 from neural_vm.run_vm import AutoregressiveVMRunner
 
-# Simple function that returns a value
+# Function with local variables (triggers ENT)
 code = '''
-int helper() {
-    return 42;
+int helper(int x) {
+    int local;
+    local = x * 2;
+    return local;
 }
 
 int main() {
-    int result;
-    result = helper();
-    return result;
+    return helper(21);
 }
 '''
 
@@ -35,7 +35,8 @@ try:
     runner = AutoregressiveVMRunner(
         n_layers=17,  # Updated for LEV Phase 3
         pure_attention_memory=False,
-        debug_ent_lev=True  # Enable LEV debug output
+        debug_ent_lev=True,  # Enable LEV debug output
+        debug_memory=True    # Enable memory debug output
     )
     result = runner.run(bytecode, data, max_steps=1000)
 

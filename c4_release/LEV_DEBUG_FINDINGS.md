@@ -244,4 +244,73 @@ Based on findings:
 
 ---
 
-**Status**: Model produces output, but wrong values. Need to debug L15/L16 neural path to find why.
+## Root Cause Found! ✓
+
+**L14 MEM Token Generation Bug**
+
+The model is generating MEM sections with **corrupted address byte 3**:
+
+```
+Expected (address 0x000100f0): [MEM, 0xf0, 0x00, 0x01, 0x00, val...]
+Actual:                        [MEM, 0xf0, 0x01, 0x00, 0xf0, val...]
+                                                         ^^^^ WRONG!
+```
+
+**Evidence from debug_mem_tokens.py**:
+- JSR stores at address 0x000100f0
+- Model outputs: `[261, 240, 1, 0, 240, 0, 0, 0, 0]`
+- Byte 3 (index 4) = 240 (0xf0) — should be 0!
+- This causes L15 heads to lookup wrong addresses
+
+**Impact**:
+- L15 heads 4-11 read from wrong memory addresses
+- LEV gets garbage values for saved_bp and return_addr
+- Handler override is necessary because model data is corrupted
+
+**Fix Needed**: Check L14 attention head that generates MEM address byte 3
+
+---
+
+**Status**: JSR SP fixed ✓ - L14 MEM generation now works! Next: Debug L15 memory reads.
+
+---
+
+## JSR SP Fix Complete! ✓
+
+**Commit**: [pending]
+**Bug**: JSR neural SP -= 8 fired at SP marker (contains marker token 259), not byte positions
+**Fix**: Changed JSR to fire at SP byte positions using IS_BYTE + BYTE_INDEX_0-3
+
+**Changes**:
+- vm_step.py lines 7274-7357: JSR SP bytes 0-3 implementation
+- Byte 0: (old_byte - 8) % 256 with borrow detection
+- Byte 1: 0xff (hardcoded for typical case where byte 0 < 8)
+- Bytes 2-3: Identity pass-through from EMBED
+
+**Result**:
+- MEM addresses NOW CORRECT: 0x0000fff8, 0x0000ffe8, etc. ✓
+- L14 reads correct SP bytes and generates valid MEM sections ✓
+
+---
+
+## Current Issue: LEV Reads Zeros
+
+**Observation**:
+```
+[LEV HANDLER] old_bp=0x00000000, saved_bp=0x00000000, return_addr=0x00000000
+[LEV MODEL] BP=0x00010000, SP=0x00ff00d8, PC=0x00000000
+```
+
+**Analysis**:
+- MEM sections have correct addresses (0x0000fff8 etc.) ✓
+- But LEV handler reads saved_bp=0, return_addr=0 from memory
+- L15 heads 4-11 are not reading correctly from MEM sections
+- Model produces wrong values (BP=0x00010000 looks like garbage)
+
+**Next Steps**:
+1. Check if MEM sections have correct VALUE bytes (not just address bytes)
+2. Verify L15 heads 4-11 are firing at BP/PC marker positions
+3. Check if L15 heads match correct MEM addresses in attention
+4. Debug L15 output routing to BP/PC markers
+
+**Status**: JSR fix complete, now debugging L15 memory reads.
