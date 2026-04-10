@@ -366,7 +366,14 @@ class AutoregressiveAttention(nn.Module):
             # W_o is [D, n_out] — full output dim, compact internal dim
             return x + F.linear(out, self.W_o)
         else:
-            out = out.transpose(1, 2).contiguous().view(B, S, D)
+            # Standard case: H * HD == D (e.g., 8 heads × 64 dims = 512)
+            # Non-standard case: H * HD != D (e.g., L15 with 12 heads × 64 dims = 768 != 512)
+            # In non-standard case, W_o projects from H*HD back to D
+            out = out.transpose(1, 2).contiguous()  # [B, S, H, HD]
+            if H * HD == D:
+                out = out.view(B, S, D)
+            else:
+                out = out.view(B, S, H * HD)  # [B, S, 768] for L15
             return x + (sparse_linear if self.W_q.is_sparse else F.linear)(
                 out, self.W_o
             )
@@ -1355,6 +1362,13 @@ class _SetDim:
     # --- Unified memory execution (code from writable memory) ---
     MEM_EXEC = 464     # 1 dim: MEM section contains executable code (for L5 fetch)
 
+    # --- AX full value relay (for PSH STACK0 = AX) ---
+    # FIX 2026-04-09: New dimension for L3 head 5 to copy AX OUTPUT → AX_FULL.
+    # Overlaps FORMAT_PTR (467-498) which is only used during conversational I/O,
+    # NOT during normal PSH/SI/LI operations. Safe overlap.
+    AX_FULL_LO = 467  # 467-482 (16 dims, overlaps FORMAT_PTR_LO)
+    AX_FULL_HI = 483  # 483-498 (16 dims, overlaps FORMAT_PTR_HI)
+
     # --- General temporaries / reserved ---
     TEMP = 480  # 480-511 (32 dims)
 
@@ -1657,10 +1671,33 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # Head 4: STACK0 carry (prev step STACK0 byte 0 → EMBED at STACK0 marker)
     # Uses STACK0_BYTE0 flag (computed in L1 FFN) as key instead of L1H1/L1H0.
     _set_stack0_carry_attn(attn3, 4, HD)
-    # NOTE: Attempted fix for JMP/NOP/EXIT AX corruption by adding head 5 to copy
-    # previous AX marker OUTPUT to AX_CARRY. This broke pure neural mode (predictions
-    # became all 1's), so the fix was reverted. The bug persists but system remains
-    # functional in hybrid mode.
+
+    # Head 5: AX full value relay (prev AX marker OUTPUT → current AX marker AX_FULL)
+    # FIX 2026-04-09: Dedicated dimension (AX_FULL) to avoid conflict with head 1's AX_CARRY.
+    # Previous attempt wrote to AX_CARRY causing additivity conflict (both heads writing
+    # to same dims with total weight 3.0x), resulting in "predictions became all 1's".
+    # Now uses separate AX_FULL dims for PSH STACK0 = AX operation.
+    base = 5 * HD
+    L = 15.0
+    # Q: Fire at AX marker on subsequent steps only (HAS_SE=1)
+    attn3.W_q[base, BD.MARK_AX] = L
+    attn3.W_q[base, BD.HAS_SE] = L
+    attn3.W_q[base, BD.CONST] = -L * 1.5  # Threshold: need both MARK_AX and HAS_SE
+    # K: Match previous step's AX marker
+    attn3.W_k[base, BD.MARK_AX] = L
+    # V: Copy OUTPUT_LO/HI from previous AX marker (the final register value)
+    for k in range(16):
+        attn3.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
+        attn3.W_v[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
+    # O: Write to AX_FULL_LO/HI (NEW - no conflict with head 1!)
+    for k in range(16):
+        attn3.W_o[BD.AX_FULL_LO + k, base + 1 + k] = 1.0
+        attn3.W_o[BD.AX_FULL_HI + k, base + 17 + k] = 1.0
+    # Anti-leakage gate
+    GATE = 33
+    attn3.W_q[base + GATE, BD.MARK_AX] = L
+    attn3.W_q[base + GATE, BD.CONST] = -L / 2
+    attn3.W_k[base + GATE, BD.CONST] = L
 
     ffn3 = model.blocks[3].ffn  # Layer 3 (L3) = blocks[3]
     _set_layer3_ffn(ffn3, S, BD)
@@ -4396,25 +4433,27 @@ def _set_layer6_relay_heads(attn, S, BD, HD):
     2. ADJ operation is not critical for basic arithmetic (ADD/SUB/MUL/DIV)
     3. Can be added back if ADJ support is needed, using a different approach
 
-    Head 6: At STACK0 marker, read AX marker's AX_CARRY → ALU staging.
+    Head 6: At STACK0 marker, read AX marker's AX_FULL → ALU staging.
     This provides the AX value at STACK0 position for PSH (STACK0=AX).
     Distance from STACK0 marker to AX marker = 20-5 = 15 tokens back.
+    FIX 2026-04-09: Now reads from AX_FULL (populated by L3 head 5) instead of
+    AX_CARRY to get the full current AX OUTPUT value.
     """
     L = 50.0
 
-    # Head 6: STACK0 ← AX (AX_CARRY → ALU at STACK0 marker, d=15)
+    # Head 6: STACK0 ← AX (AX_FULL → ALU at STACK0 marker, d=15)
     # NOTE: _set_opcode_relay_head also uses head 6 with V slots 1-7.
     # To avoid conflict, we use V slots 8-33 (26 total, covering 13 dims per nibble).
-    # This provides sufficient precision for byte values with nibbles 0-12.
+    # FIX 2026-04-09: Changed from AX_CARRY to AX_FULL (full 16 dims available).
     base = 6 * HD
     attn.W_q[base, BD.MARK_STACK0] = L
     attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
     attn.W_k[base, BD.MARK_AX] = L
-    # V: copy AX_CARRY_LO/HI (reduced precision: 13 dims each to avoid V slot conflict)
+    # V: copy AX_FULL_LO/HI (reduced precision: 13 dims each to avoid V slot conflict)
     # V slots 8-20 for LO[0:13], V slots 21-33 for HI[0:13]
     for k in range(13):
-        attn.W_v[base + 8 + k, BD.AX_CARRY_LO + k] = 1.0
-        attn.W_v[base + 21 + k, BD.AX_CARRY_HI + k] = 1.0
+        attn.W_v[base + 8 + k, BD.AX_FULL_LO + k] = 1.0
+        attn.W_v[base + 21 + k, BD.AX_FULL_HI + k] = 1.0
     # O: write to ALU_LO/HI at STACK0 marker
     for k in range(13):
         attn.W_o[BD.ALU_LO + k, base + 8 + k] = 1.0
@@ -4901,10 +4940,10 @@ def _set_layer9_alu(ffn, S, BD):
                 unit += 1
 
     # === LEA hi nibble (no carry 256 + with carry 256 = 512 units) ===
-    # BUG FIX 2026-04-09: Require BOTH ALU_HI AND FETCH_HI to be active.
-    # At AX marker: MARK_AX=1, ALU_HI[correct]≈21, FETCH_HI[correct]≈40
-    # Threshold must be > 1+0+40=41 (MARK_AX + FETCH only) but < 1+14+40=55 (all active, min ALU)
-    # Using threshold=45: both active=55-45=10>0, FETCH only=41-45=-4<0
+    # BUG FIX 2026-04-09: Require MARK_AX + ALU_HI + FETCH_HI to all be active.
+    # At PC marker (MARK_AX=0): ALU_HI[wrong]≈12 + FETCH_HI[correct]≈43 = 55 (must block)
+    # At AX marker (MARK_AX=1): 1 + ALU_HI[correct]≈21 + FETCH_HI[correct]≈40 = 62 (must fire)
+    # Using threshold=58: PC marker=55-58=-3<0 (blocked), AX marker=62-58=4>0 (fires)
     for carry_in in [0, 1]:
         for a in range(16):
             for b in range(16):
@@ -4914,10 +4953,10 @@ def _set_layer9_alu(ffn, S, BD):
                 ffn.W_up[unit, BD.FETCH_HI + b] = S  # Read from FETCH
                 if carry_in == 0:
                     ffn.W_up[unit, BD.CARRY + 0] = -0.01
-                    ffn.b_up[unit] = -S * 45  # Require BOTH ALU_HI and FETCH_HI
+                    ffn.b_up[unit] = -S * 58  # Require MARK_AX + ALU_HI + FETCH_HI
                 else:
                     ffn.W_up[unit, BD.CARRY + 0] = 0.01
-                    ffn.b_up[unit] = -S * 45.4  # Slightly higher for carry case
+                    ffn.b_up[unit] = -S * 58.4  # Slightly higher for carry case
                 ffn.W_gate[unit, BD.OP_LEA] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
@@ -4925,7 +4964,7 @@ def _set_layer9_alu(ffn, S, BD):
     # === ADJ hi nibble (no carry 256 + with carry 256 = 512 units) ===
     # Like LEA but gates on OP_ADJ instead
     # ADJ computes: SP = SP + signed_immediate
-    # BUG FIX 2026-04-09: Require BOTH ALU_HI and FETCH_HI (threshold=45)
+    # BUG FIX 2026-04-09: Require MARK_AX + ALU_HI + FETCH_HI (threshold=58)
     for carry_in in [0, 1]:
         for a in range(16):
             for b in range(16):
@@ -4935,10 +4974,10 @@ def _set_layer9_alu(ffn, S, BD):
                 ffn.W_up[unit, BD.FETCH_HI + b] = S  # Read from FETCH
                 if carry_in == 0:
                     ffn.W_up[unit, BD.CARRY + 0] = -0.01
-                    ffn.b_up[unit] = -S * 45  # Require BOTH ALU_HI and FETCH_HI
+                    ffn.b_up[unit] = -S * 58  # Require MARK_AX + ALU_HI + FETCH_HI
                 else:
                     ffn.W_up[unit, BD.CARRY + 0] = 0.01
-                    ffn.b_up[unit] = -S * 45.4  # Slightly higher for carry case
+                    ffn.b_up[unit] = -S * 58.4  # Slightly higher for carry case
                 ffn.W_gate[unit, BD.OP_ADJ] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
@@ -4965,7 +5004,7 @@ def _set_layer9_alu(ffn, S, BD):
     # ENT computes: SP = SP - (8 + signed_immediate)
     # For bytes 1-3, we subtract imm_byte with borrow propagation
     # The +8 offset affects byte 0 only; its overflow propagates as a borrow
-    # BUG FIX 2026-04-09: Require BOTH ALU_HI and FETCH_HI (threshold=45)
+    # BUG FIX 2026-04-09: Require MARK_AX + ALU_HI + FETCH_HI (threshold=58)
     for borrow_in in [0, 1]:
         for sp_hi in range(16):
             for imm_hi in range(16):
@@ -4976,11 +5015,11 @@ def _set_layer9_alu(ffn, S, BD):
                 if borrow_in == 0:
                     # No borrow: block when CARRY active
                     ffn.W_up[unit, BD.CARRY + 0] = -S * 2.0
-                    ffn.b_up[unit] = -S * 45  # Require BOTH ALU_HI and FETCH_HI
+                    ffn.b_up[unit] = -S * 58  # Require MARK_AX + ALU_HI + FETCH_HI
                 else:
                     # With borrow: require CARRY active
                     ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
-                    ffn.b_up[unit] = -S * 47  # Higher threshold (4-way AND)
+                    ffn.b_up[unit] = -S * 60  # Higher threshold (4-way AND)
                 ffn.W_gate[unit, BD.OP_ENT] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
