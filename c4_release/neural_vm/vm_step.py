@@ -3667,12 +3667,14 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     """
     unit = 0
     # Threshold with guards: OP + MARK_AX - MARK_PC - IS_BYTE > T
-    # Step 0: OP=0, MARK_AX=1 → 0 + 16 - 0 - 0 = 16 > 16*T → T < 1.0
-    # Step 1+: OP=5, MARK_AX=1 → 16*5 + 16 - 0 - 0 = 96 > 16*T → T < 6.0
-    # At byte: OP + 16 - 0 - 16 < 16*T → need T > (OP/16), so T=0.5 blocks
-    # At PC marker: OP + 0 - 16 - 0 < 16*T → blocked by -MARK_PC
-    # Setting T = 0.5: step 0 fires (16 > 8), step 1 fires (96 > 8), bytes blocked
-    T = 0.5
+    # BUG FIX 2026-04-09: T=0.5 was far too low! With MARK_AX≈2.0 at later steps,
+    # units fire even when OP_xxx=0: 100*0 + 100*2 - 50 = 150 > 0 (spurious!)
+    #
+    # Correct calculation with S=100 scale:
+    # - Block non-target: S*MARK_AX - S*T < 0 → 200 - 100*T < 0 → T > 2
+    # - Allow target:     S*OP + S*MARK_AX - S*T > 0 → 500 + 100 - 100*T > 0 → T < 6
+    # T=4.0 works: blocks 200-400=-200, allows 600-400=200 (for MARK_AX=1, OP=5)
+    T = 4.0
 
     # === IMM: FETCH → OUTPUT ===
     # Read from FETCH_LO/HI (clean staging dims written by L5 fetch head 0).
@@ -5082,9 +5084,15 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
 
     # Q dim 0: IS_BYTE AND HAS_SE (only fire on subsequent steps, not first step)
     # First step: JMP sets OUTPUT at PC marker via Layer 6, don't overwrite it
-    attn.W_q[base + 0, BD.IS_BYTE] = L
-    attn.W_q[base + 0, BD.HAS_SE] = L * 2  # Strong HAS_SE requirement
-    attn.W_q[base + 0, BD.CONST] = -L * 1.5  # Strong threshold: need IS_BYTE + 2*HAS_SE > 1.5
+    # BUG FIX 2026-04-09: Old weights fired at AX marker (IS_BYTE=0, HAS_SE=2):
+    #   0 + 2*L*2 - 1.5*L = 2.5L > 0 (spurious!)
+    # New weights: require IS_BYTE strongly, weak HAS_SE contribution
+    #   AX marker: 0 + L*2 - 3.5L = -1.5L < 0 (blocked)
+    #   AX byte:   3L + L - 3.5L = 0.5L > 0 (fires)
+    #   First step: 3L + 0 - 3.5L = -0.5L < 0 (blocked)
+    attn.W_q[base + 0, BD.IS_BYTE] = L * 3  # Require IS_BYTE strongly
+    attn.W_q[base + 0, BD.HAS_SE] = L  # Weak HAS_SE (changed from L*2)
+    attn.W_q[base + 0, BD.CONST] = -L * 3.5  # Higher threshold (changed from 1.5)
 
     # Q dim 1: H1[AX_IDX] (AX vs non-AX discrimination)
     attn.W_q[base + 1, BD.H1 + AX_IDX] = L
@@ -5297,6 +5305,13 @@ def _set_layer10_alu(ffn, S, BD):
     _cmp_override_3way(BD.OP_GE, BD.CMP + 1, BD.CMP + 3, 0, 1)  # hi_eq AND lo_lt
 
     # --- Bitwise ops (1536 units) ---
+    # BUG FIX 2026-04-09: Increased MARK_AX weight and threshold to prevent spurious
+    # firing at byte positions. The embedding sets OP_AND/OR/XOR for any token with
+    # that opcode value (e.g., token 16 = Opcode.AND), which caused bitwise FFN units
+    # to fire at PC byte 0 when the byte value happened to match an opcode.
+    # By making MARK_AX dominate the W_up, units only fire at the AX marker position.
+    # Old: MARK_AX*S + ALU*S + AX_CARRY*S - 2.5*S → fired when MARK_AX=0, AX_CARRY=7
+    # New: MARK_AX*10S + ALU*S + AX_CARRY*S - 10.5*S → blocked when MARK_AX=0
     bitwise_ops = [
         (BD.OP_OR, lambda a, b: a | b),
         (BD.OP_XOR, lambda a, b: a ^ b),
@@ -5307,10 +5322,10 @@ def _set_layer10_alu(ffn, S, BD):
         for a in range(16):
             for b in range(16):
                 result = op_fn(a, b)
-                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
                 ffn.W_up[unit, BD.ALU_LO + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
-                ffn.b_up[unit] = -S * 2.5
+                ffn.b_up[unit] = -S * 10.5  # Require MARK_AX to overcome threshold
                 ffn.W_gate[unit, op_dim] = 1.0
                 ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
                 unit += 1
@@ -5318,10 +5333,10 @@ def _set_layer10_alu(ffn, S, BD):
         for a in range(16):
             for b in range(16):
                 result = op_fn(a, b)
-                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
                 ffn.W_up[unit, BD.ALU_HI + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
-                ffn.b_up[unit] = -S * 2.5
+                ffn.b_up[unit] = -S * 10.5  # Require MARK_AX to overcome threshold
                 ffn.W_gate[unit, op_dim] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
@@ -5329,13 +5344,14 @@ def _set_layer10_alu(ffn, S, BD):
     # --- MUL lo nibble (256 units) ---
     # For each (a_lo, b_lo): result_lo = (a_lo * b_lo) % 16
     # 3-way AND: MARK_AX + ALU_LO[a_lo] + AX_CARRY_LO[b_lo], gate=OP_MUL
+    # BUG FIX 2026-04-09: Increased MARK_AX weight (same issue as bitwise ops)
     for a in range(16):
         for b in range(16):
             result = (a * b) % 16
-            ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
             ffn.W_up[unit, BD.ALU_LO + a] = S
             ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
-            ffn.b_up[unit] = -S * 2.5
+            ffn.b_up[unit] = -S * 10.5  # Require MARK_AX to overcome threshold
             ffn.W_gate[unit, BD.OP_MUL] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
             unit += 1
@@ -5344,22 +5360,23 @@ def _set_layer10_alu(ffn, S, BD):
     # When shift >= 8, result is 0x00. Two sub-cases:
     # Case A (shift >= 16, hi nibble > 0): gate = OP_xxx * (1 - AX_CARRY_HI[0])
     # Case B (shift 8-15, hi=0, lo>=8): up includes AX_CARRY_HI[0] + sum(AX_CARRY_LO[8..15])
+    # BUG FIX 2026-04-09: Increased MARK_AX weight (same issue as bitwise ops)
     for op_dim in [BD.OP_SHL, BD.OP_SHR]:
         # Case A: shift >= 16 (hi nibble non-zero → AX_CARRY_HI[0] NOT hot)
-        ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
         ffn.W_up[unit, BD.AX_CARRY_HI + 0] = -S  # suppress when hi=0 (shift 0-15)
-        ffn.b_up[unit] = -S * 0.5
+        ffn.b_up[unit] = -S * 9.5  # Require MARK_AX to overcome threshold
         ffn.W_gate[unit, op_dim] = 1.0
         ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
         ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
         unit += 1
 
         # Case B: shift 8-15 (hi=0, lo nibble is 8..15)
-        ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
         ffn.W_up[unit, BD.AX_CARRY_HI + 0] = S
         for lo_bit in range(8, 16):
             ffn.W_up[unit, BD.AX_CARRY_LO + lo_bit] = S
-        ffn.b_up[unit] = -S * 2.5  # MARK_AX(1) + HI[0](1) + any_lo_8_15(~1) > 2.5
+        ffn.b_up[unit] = -S * 10.5  # Require MARK_AX to overcome threshold
         ffn.W_gate[unit, op_dim] = 1.0
         ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
         ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
@@ -5423,12 +5440,15 @@ def _set_layer10_alu(ffn, S, BD):
         unit += 1
 
     # ADD carry → AX byte 0 only = 0x01: 4-way AND (CARRY[1] + IS_BYTE + BYTE_INDEX_0 + OP_ADD)
+    # BUG FIX 2026-04-09: Old threshold 3.5 was too low. OP_ADD=5.0 gives 500, which
+    # alone exceeds 350. At AX marker (IS_BYTE=0, BYTE_INDEX_0=0): 500-350=150>0 (fires!)
+    # New threshold 5.5: At marker: 500-550=-50<0 (blocked). All 4: 800-550=250>0 (fires)
     for out_dim in [BD.OUTPUT_LO + 1, BD.OUTPUT_HI + 0]:
         ffn.W_up[unit, BD.CARRY + 1] = S
         ffn.W_up[unit, BD.IS_BYTE] = S
         ffn.W_up[unit, BD.BYTE_INDEX_0] = S
         ffn.W_up[unit, BD.OP_ADD] = S  # Only fire during ADD
-        ffn.b_up[unit] = -S * 3.5  # 4-way AND
+        ffn.b_up[unit] = -S * 5.5  # 4-way AND (increased from 3.5)
         ffn.W_gate[unit, BD.H1 + AX_IDX] = 1.0
         ffn.W_down[out_dim, unit] = 10.0 / S
         unit += 1

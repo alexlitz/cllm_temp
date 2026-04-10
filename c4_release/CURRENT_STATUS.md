@@ -1,6 +1,35 @@
-# Neural VM Current Status - April 9, 2026 (Updated 18:15)
+# Neural VM Current Status - April 9, 2026 (Updated 19:45)
 
-## 🎉 BREAKTHROUGH: Stack Memory Bug FIXED! (Commit ea8718f)
+## 🔍 ROOT CAUSE IDENTIFIED: AX_CARRY Population Missing
+
+**Date**: 2026-04-09 19:45
+**Investigation**: Deep-dive into PSH/STACK0 neural weights
+
+**CRITICAL FINDING**: L14 fix (commit ea8718f) was **necessary but NOT sufficient**.
+
+**ROOT CAUSE**: **AX_CARRY is not populated with the current AX value**, breaking PSH's ability to set STACK0 = AX neurally.
+
+**Evidence**:
+```
+Test: int main() { return 42; }                                  → Exit 42 ✅ (no variables)
+Test: int main() { int a; a=42; return a; }                      → Exit 0  ❌ (1 variable)
+Test: int main() { int a, b; a=10; b=32; return a+b; }           → Exit 0  ❌ (2 variables)
+Test: int main() { int a, b, c, d; ... }                         → Exit 0  ❌ (4 variables)
+
+MEM sections: [261, 0, 0, 0, 0, 0, 0, 0, 0]  (all zeros!)
+SI handlers extract: addr=0x00000000 (should be 0x000100e0)
+```
+
+**Historical Context** (vm_step.py:1660-1663):
+> "Attempted fix for JMP/NOP/EXIT AX corruption by adding head 5 to copy previous AX marker OUTPUT to AX_CARRY. This broke pure neural mode (predictions became all 1's), so the fix was reverted. **The bug persists but system remains functional in hybrid mode.**"
+
+**Current State**: Neural VM stuck in "hybrid mode" (requires handlers for PSH/STACK0/memory ops).
+
+**Details**: See `PSH_STACK0_ROOT_CAUSE_ANALYSIS.md`
+
+---
+
+## 🎉 BREAKTHROUGH: Stack Memory Bug PARTIALLY FIXED! (Commit ea8718f)
 
 **Critical Fix Applied**: L14 MEM generation now reads OUTPUT instead of CLEAN_EMBED
 
@@ -140,14 +169,17 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 
 ## Neural Implementation Status
 
-### Fully Neural (No Handlers)
-- IMM, LEA, PSH, NOP, EXIT ✅
+### Fully Neural (No Handlers) - Actually Working
+- IMM, LEA, NOP, EXIT ✅
 - ADD, SUB, MUL, DIV, MOD (arithmetic) ✅
 - OR, XOR, AND, SHL, SHR (bitwise) ✅
 - EQ, NE, LT, GT, LE, GE (comparisons) ✅
-- LI, LC, SI, SC (memory load/store) ⚠️ **Limited**: Works with 0-1 local vars, fails with 2+
 - JMP, JZ, JNZ (basic control flow) ✅
-- JSR (jump subroutine) ✅ per commit 3e3ed2c
+
+### Claimed Neural But Actually Broken
+- **PSH** ❌ - Neural weights exist but don't set STACK0 correctly (AX_CARRY not populated)
+- **LI, LC, SI, SC** ❌ - Depend on STACK0, which PSH doesn't set correctly
+- **JSR** ❌ - per commit 3e3ed2c claimed neural, but PC doesn't jump correctly (handler re-enabled)
 
 ### Still Have Python Handlers
 - **ENT** - Enter function (line 226) ❌
@@ -171,77 +203,88 @@ Test: IMM 42; NOP; EXIT       → Exit code: 42 ✅
 
 ## 🎯 Immediate Next Steps
 
-### Priority 1: Fix Neural LI/SI Memory Lookup (NEW ISSUE)
-**Status**: LI/SI neural implementation fails with 2+ local variables
+### Priority 1: Fix AX_CARRY Population (ROOT CAUSE)
+**Status**: ✅ **ROOT CAUSE IDENTIFIED** - AX_CARRY not populated with current AX value
 
-1. **Investigate L15 softmax1 memory lookup**
-   - Why does it work with 1 variable but not 2?
-   - Check MEM section retention and addressing
-   - Compare attention patterns for 1-var vs 2-var programs
+**The Problem**:
+- L3 head 1 copies only previous step's AX byte 0 EMBED → AX_CARRY
+- PSH needs current step's full AX OUTPUT in AX_CARRY
+- Without correct AX_CARRY, PSH can't set STACK0 = AX
+- Cascading failure: STACK0 wrong → SI/LI wrong → MEM wrong → all zeros
 
-2. **Options for fixing**:
-   - **Option A**: Fix neural memory lookup mechanism (L15 weights)
-   - **Option B**: Add LI/SI handlers as temporary workaround
-   - **Option C**: Document limitation and advise users to minimize local vars
+**Previous Fix Attempt (FAILED)**:
+- Tried adding L3 head 5 to copy AX OUTPUT → AX_CARRY
+- Result: "predictions became all 1's" (catastrophic failure)
+- Fix was reverted, bug accepted as requiring hybrid mode
 
-3. **Test after fix**:
-   - Verify 2-variable program returns 42
-   - Test 4-variable program
-   - Test nested function calls with local variables
+**Options Going Forward**:
+1. **Investigate failed L3 head 5 fix**
+   - Find git commit that attempted the fix
+   - Understand why it caused "all 1's" predictions
+   - Try alternative approach to avoid the failure mode
+
+2. **Use different layer for AX relay**
+   - L4 attention (currently PC → AX relay only)
+   - L5 attention (currently opcode decode)
+   - L6 attention (add intra-step AX OUTPUT → AX_CARRY)
+
+3. **Redesign PSH mechanism**
+   - Make PSH read directly from AX OUTPUT (not AX_CARRY → ALU)
+   - Requires rewriting L6 head 6 and L6 FFN PSH units
+   - High risk architectural change
+
+4. **Accept hybrid mode (current state)**
+   - Keep handlers for PSH/SI/LI/SC operations
+   - Document that pure neural mode doesn't work for 2+ variables
+   - System functional but not 100% neural
 
 ### Priority 2: Fix JSR Neural Implementation
-1. **Investigate why neural JSR doesn't jump**
-   - Check L6 FFN PC override weights
-   - Check if OP_JSR flag is being set correctly
-   - Compare with working JMP neural implementation
+**Status**: Handler required (neural path broken)
+- Investigate why neural JSR doesn't jump PC correctly
+- May be related to AX_CARRY issue or separate problem
 
-2. **Either fix neural JSR or document why handler is needed**
-   - If neural version can't work with hand-crafted weights, keep handler
-   - Update documentation to reflect handler requirement
-
-### Priority 3: Investigate PC=0 Loop After ENT
-**Status**: After ENT executes, PC goes to 0 instead of next instruction
-- Affects both programs with and without local variables
-- Programs eventually stabilize and complete successfully
-- May be related to neural weights needing "warm up"
+### Priority 3: Test L14 Fix with Handlers
+**Status**: Pending - verify if L14 fix + handlers work correctly
+- Re-enable LI/SI handlers
+- Test 2+ variable programs
+- Verify MEM sections populated correctly when handlers assist
 
 ---
 
 ## 📊 Bottom Line
 
-**Major Achievements**:
-- ✅ Performance issue RESOLVED (GPU acceleration + context windowing)
-- ✅ Stack memory FIXED (ENT handler manages BP and shadow memory)
-- ✅ Function calls WORKING (programs with 0-1 local variables complete successfully)
+**Investigation Complete** ✅:
+- ✅ **ROOT CAUSE IDENTIFIED**: AX_CARRY not populated with current AX value
+- ✅ **L14 fix necessary but insufficient**: Reads OUTPUT correctly, but OUTPUT contains garbage
+- ✅ **Historical context found**: Previous fix attempt failed catastrophically ("all 1's")
+- ✅ **System stuck in hybrid mode**: Pure neural broken, handlers required
 
-**Critical Issue Discovered**:
-- ❌ **Neural PSH/STACK0 register generation fundamentally broken**
-  - Programs with 1 variable: exit code 42 ✅ (works by luck)
-  - Programs with 2+ variables: exit code 0 ❌ (completely fails)
-  - Root cause: PSH outputs garbage STACK0 values (0x00, 0x0a, 0x20)
-  - Should output: STACK0 = address pushed (e.g., BP-8 = 0x000100e0)
-  - **Critical**: Even handlers fail because they read garbage STACK0 from model
+**What Works** ✅:
+- Basic operations (IMM, NOP, EXIT, arithmetic, bitwise, comparisons, basic control flow)
+- Programs without local variables
+- GPU acceleration and performance optimizations
 
-**Root Causes Still Pending**:
-1. ⚠️ **JSR neural implementation doesn't work** - PC doesn't jump (handler enabled as workaround)
-2. ⚠️ **PC goes to 0 after ENT** - Programs loop initially but eventually stabilize
-3. ⚠️ **Stdlib causes issues** - CALL target beyond bytecode length
+**What's Broken** ❌:
+- **PSH**: Can't set STACK0 = AX (AX_CARRY not populated)
+- **SI/SC**: Can't use STACK0 for address (depends on PSH)
+- **LI/LC**: Can't use STACK0 for address (depends on PSH)
+- **Programs with ANY local variables**: All return exit code 0 (1, 2, 4+ variables all fail)
+- **JSR**: Neural path doesn't jump PC (handler enabled)
 
-**Current State**:
-- ✅ Basic operations work (IMM, PSH, NOP, EXIT, arithmetic, control flow)
-- ✅ Function calls work (JSR/ENT/LEV via handlers)
-- ✅ Programs with 0-1 local variables complete successfully
-- ❌ Programs with 2+ local variables BLOCKED - return exit code 0
-- ❌ **CRITICAL**: Neural PSH/STACK0 register generation broken
-- ❌ Handlers can't work around this - they need correct register values
+**The Cascade of Failure**:
+```
+AX_CARRY empty → PSH writes zeros to STACK0 → SI/LI read addr=0x00000000 →
+MEM sections all zeros → L15 lookup fails → wrong results
+```
 
-**Recommended Action**:
-1. **CRITICAL**: Fix neural PSH to generate correct STACK0 register values
-   - PSH should set STACK0 = address being pushed (e.g., BP-8)
-   - Currently outputs garbage (0x00, 0x0a, 0x20) unrelated to actual addresses
-   - This is likely in L6/L7 register output weights
-2. **After PSH fixed**: Test if LI/SI handlers work correctly
-3. **Long-term**: Fix L14 MEM generation and L15 memory lookup for full neural path
+**Path Forward** (4 Options):
+
+1. **Fix L3 head 5** (Risky): Re-attempt AX OUTPUT → AX_CARRY, avoid "all 1's" failure
+2. **Alternative relay** (Medium): Use L4/L5/L6 for AX relay instead
+3. **Redesign PSH** (High risk): Rewrite to use AX OUTPUT directly
+4. **Accept hybrid** (Safe): Keep handlers, document limitation
+
+**Current Recommendation**: Option 4 (accept hybrid mode) until root cause of L3 head 5 failure is understood.
 
 ---
 

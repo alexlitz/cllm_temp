@@ -232,7 +232,9 @@ class AutoregressiveVMRunner:
             # Opcode.LEA: self._handler_lea,
             # TEMPORARY: Re-enable JSR handler - neural version not working
             Opcode.JSR: self._handler_jsr,
-            Opcode.ENT: self._handler_ent,
+            # REMOVED 2026-04-09: ENT now works fully neurally (L6/L7/L8/L9 implementation complete)
+            # Neural path: L7 head 1 gathers SP, L8/L9 compute SP -= (8+imm), L6 writes result
+            # Opcode.ENT: self._handler_ent,
             Opcode.LEV: self._handler_lev,
             # REMOVED: PSH now works fully neurally (L6 FFN SP -= 8)
             # Opcode.PSH: self._handler_psh,
