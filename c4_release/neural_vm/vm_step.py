@@ -5453,13 +5453,15 @@ def _set_layer10_alu(ffn, S, BD):
     _cmp_override_3way(BD.OP_GE, BD.CMP + 1, BD.CMP + 3, 0, 1)  # hi_eq AND lo_lt
 
     # --- Bitwise ops (1536 units) ---
-    # BUG FIX 2026-04-09: Increased MARK_AX weight and threshold to prevent spurious
-    # firing at byte positions. The embedding sets OP_AND/OR/XOR for any token with
-    # that opcode value (e.g., token 16 = Opcode.AND), which caused bitwise FFN units
-    # to fire at PC byte 0 when the byte value happened to match an opcode.
-    # By making MARK_AX dominate the W_up, units only fire at the AX marker position.
-    # Old: MARK_AX*S + ALU*S + AX_CARRY*S - 2.5*S → fired when MARK_AX=0, AX_CARRY=7
-    # New: MARK_AX*10S + ALU*S + AX_CARRY*S - 10.5*S → blocked when MARK_AX=0
+    # BUG FIX 2026-04-09: Use FETCH instead of AX_CARRY for the second operand.
+    # AX_CARRY is meant for carry detection, not for holding immediate values.
+    # The immediate value for bitwise ops is already in FETCH_LO/FETCH_HI.
+    # Also increased MARK_AX weight and threshold to prevent spurious firing.
+    # At PC marker (MARK_AX=0): max(ALU_LO + FETCH_LO) ≈ 54 (must block)
+    # At AX marker (MARK_AX=1): ALU_LO ≈ 0-21, FETCH_LO ≈ 40 (must fire)
+    # Using MARK_AX=60, threshold=80:
+    #   PC marker: 0 + 54 - 80 = -26 < 0 (blocked)
+    #   AX marker: 60 + 0 + 40 - 80 = 20 > 0 (fires)
     bitwise_ops = [
         (BD.OP_OR, lambda a, b: a | b),
         (BD.OP_XOR, lambda a, b: a ^ b),
@@ -5470,10 +5472,10 @@ def _set_layer10_alu(ffn, S, BD):
         for a in range(16):
             for b in range(16):
                 result = op_fn(a, b)
-                ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
+                ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
                 ffn.W_up[unit, BD.ALU_LO + a] = S
-                ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
-                ffn.b_up[unit] = -S * 10.5  # Require MARK_AX to overcome threshold
+                ffn.W_up[unit, BD.FETCH_LO + b] = S  # Use FETCH, not AX_CARRY
+                ffn.b_up[unit] = -S * 80  # Require MARK_AX to overcome threshold
                 ffn.W_gate[unit, op_dim] = 1.0
                 ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
                 unit += 1
@@ -5481,50 +5483,52 @@ def _set_layer10_alu(ffn, S, BD):
         for a in range(16):
             for b in range(16):
                 result = op_fn(a, b)
-                ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
+                ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
                 ffn.W_up[unit, BD.ALU_HI + a] = S
-                ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
-                ffn.b_up[unit] = -S * 10.5  # Require MARK_AX to overcome threshold
+                ffn.W_up[unit, BD.FETCH_HI + b] = S  # Use FETCH, not AX_CARRY
+                ffn.b_up[unit] = -S * 80  # Require MARK_AX to overcome threshold
                 ffn.W_gate[unit, op_dim] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
 
     # --- MUL lo nibble (256 units) ---
     # For each (a_lo, b_lo): result_lo = (a_lo * b_lo) % 16
-    # 3-way AND: MARK_AX + ALU_LO[a_lo] + AX_CARRY_LO[b_lo], gate=OP_MUL
-    # BUG FIX 2026-04-09: Increased MARK_AX weight (same issue as bitwise ops)
+    # 3-way AND: MARK_AX + ALU_LO[a_lo] + FETCH_LO[b_lo], gate=OP_MUL
+    # BUG FIX 2026-04-09: Use FETCH instead of AX_CARRY for the immediate value.
+    # Same threshold fix as bitwise ops.
     for a in range(16):
         for b in range(16):
             result = (a * b) % 16
-            ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
+            ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
             ffn.W_up[unit, BD.ALU_LO + a] = S
-            ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
-            ffn.b_up[unit] = -S * 10.5  # Require MARK_AX to overcome threshold
+            ffn.W_up[unit, BD.FETCH_LO + b] = S  # Use FETCH, not AX_CARRY
+            ffn.b_up[unit] = -S * 80  # Require MARK_AX to overcome threshold
             ffn.W_gate[unit, BD.OP_MUL] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
             unit += 1
 
     # --- SHL/SHR zero output for shift >= 8 (8 units) ---
     # When shift >= 8, result is 0x00. Two sub-cases:
-    # Case A (shift >= 16, hi nibble > 0): gate = OP_xxx * (1 - AX_CARRY_HI[0])
-    # Case B (shift 8-15, hi=0, lo>=8): up includes AX_CARRY_HI[0] + sum(AX_CARRY_LO[8..15])
-    # BUG FIX 2026-04-09: Increased MARK_AX weight (same issue as bitwise ops)
+    # Case A (shift >= 16, hi nibble > 0): gate = OP_xxx * (1 - FETCH_HI[0])
+    # Case B (shift 8-15, hi=0, lo>=8): up includes FETCH_HI[0] + sum(FETCH_LO[8..15])
+    # BUG FIX 2026-04-09: Use FETCH instead of AX_CARRY for the shift amount.
+    # Same threshold fix as bitwise ops.
     for op_dim in [BD.OP_SHL, BD.OP_SHR]:
-        # Case A: shift >= 16 (hi nibble non-zero → AX_CARRY_HI[0] NOT hot)
-        ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
-        ffn.W_up[unit, BD.AX_CARRY_HI + 0] = -S  # suppress when hi=0 (shift 0-15)
-        ffn.b_up[unit] = -S * 9.5  # Require MARK_AX to overcome threshold
+        # Case A: shift >= 16 (hi nibble non-zero → FETCH_HI[0] NOT hot)
+        ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
+        ffn.W_up[unit, BD.FETCH_HI + 0] = -S  # suppress when hi=0 (shift 0-15)
+        ffn.b_up[unit] = -S * 59  # Require MARK_AX to overcome threshold
         ffn.W_gate[unit, op_dim] = 1.0
         ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
         ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
         unit += 1
 
         # Case B: shift 8-15 (hi=0, lo nibble is 8..15)
-        ffn.W_up[unit, BD.MARK_AX] = S * 10  # Strong MARK_AX requirement
-        ffn.W_up[unit, BD.AX_CARRY_HI + 0] = S
+        ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
+        ffn.W_up[unit, BD.FETCH_HI + 0] = S
         for lo_bit in range(8, 16):
-            ffn.W_up[unit, BD.AX_CARRY_LO + lo_bit] = S
-        ffn.b_up[unit] = -S * 10.5  # Require MARK_AX to overcome threshold
+            ffn.W_up[unit, BD.FETCH_LO + lo_bit] = S
+        ffn.b_up[unit] = -S * 80  # Require MARK_AX to overcome threshold
         ffn.W_gate[unit, op_dim] = 1.0
         ffn.W_down[BD.OUTPUT_LO + 0, unit] = 2.0 / S
         ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S

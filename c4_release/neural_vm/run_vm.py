@@ -132,7 +132,7 @@ class AutoregressiveVMRunner:
     def __init__(
         self,
         d_model=512,
-        n_layers=16,
+        n_layers=17,  # Updated from 16 for LEV Phase 3 (L16 routing layer)
         n_heads=8,
         ffn_hidden=4096,
         max_seq_len=4096,
@@ -1584,8 +1584,17 @@ class AutoregressiveVMRunner:
         return_addr = self._mem_load_word(old_bp + 8)
         new_sp = (old_bp + 16) & 0xFFFFFFFF
 
+        # DEBUG: Check what model output before handler override
+        model_bp = self._extract_register(context, Token.REG_BP)
+        model_sp = self._extract_register(context, Token.REG_SP)
+        model_pc = self._extract_register(context, Token.REG_PC)
+
         if hasattr(self, '_debug_lev') and self._debug_lev:
-            print(f"[LEV] old_bp=0x{old_bp:08x}, saved_bp=0x{saved_bp:08x}, return_addr=0x{return_addr:08x}, new_sp=0x{new_sp:08x}", flush=True)
+            print(f"[LEV HANDLER] old_bp=0x{old_bp:08x}, saved_bp=0x{saved_bp:08x}, return_addr=0x{return_addr:08x}, new_sp=0x{new_sp:08x}", flush=True)
+            model_bp_val = model_bp if model_bp is not None else 0
+            model_sp_val = model_sp if model_sp is not None else 0
+            model_pc_val = model_pc if model_pc is not None else 0
+            print(f"[LEV MODEL] BP=0x{model_bp_val:08x}, SP=0x{model_sp_val:08x}, PC=0x{model_pc_val:08x}", flush=True)
 
         # Override all registers
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
