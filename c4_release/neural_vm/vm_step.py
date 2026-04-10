@@ -1923,6 +1923,18 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     head_dim = d // 8  # 64 (based on default 8 heads)
     new_q_rows = num_heads_l15 * head_dim  # 12 * 64 = 768
 
+    # Update num_heads and head_dim attributes for forward pass
+    attn15.num_heads = num_heads_l15
+    attn15.head_dim = head_dim
+
+    # Resize ALiBi slopes if present (8 slopes → 12 slopes)
+    if hasattr(attn15, 'alibi_slopes') and attn15.alibi_slopes is not None:
+        # Extend slopes with same geometric sequence pattern
+        new_slopes = torch.tensor(
+            [2.0 ** (-8.0 / num_heads_l15 * (i + 1)) for i in range(num_heads_l15)]
+        )
+        attn15.register_buffer('alibi_slopes', new_slopes)
+
     # Resize W_q, W_k, W_v from (512, 512) to (768, 512)
     # Preserve existing weights in first 512 rows (heads 0-7), zero-initialize new rows (heads 8-11)
     old_W_q = attn15.W_q.data
