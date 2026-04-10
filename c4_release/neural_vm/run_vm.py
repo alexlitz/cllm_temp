@@ -462,6 +462,13 @@ class AutoregressiveVMRunner:
                             self._override_register_in_last_step(context, Token.REG_PC, next_pc)
                 # Update SP/BP/PC tracking (prefer deterministic SP evolution)
                 if 0 <= exec_idx < len(bytecode):
+                    # CRITICAL: Extract BP for ENT/LEV (they actually modify BP)
+                    # This must run even when ENT is not in handlers dict (neural path)
+                    if exec_op in (Opcode.ENT, Opcode.LEV):
+                        bp = self._extract_register(context, Token.REG_BP)
+                        if bp is not None:
+                            self._last_bp = bp
+
                     # CRITICAL: Only extract SP for opcodes that modify SP
                     # PSH, JSR, ENT, LEV modify SP. Binary ops (OR, AND, etc.) also pop stack.
                     # Don't extract SP for IMM/LEA - they don't modify SP!
@@ -473,11 +480,6 @@ class AutoregressiveVMRunner:
                             sp = self._extract_register(context, Token.REG_SP)
                             if sp is not None:
                                 self._last_sp = sp
-                        # CRITICAL: Only extract BP for ENT/LEV (they actually modify BP)
-                        if exec_op in (Opcode.ENT, Opcode.LEV):
-                            bp = self._extract_register(context, Token.REG_BP)
-                            if bp is not None:
-                                self._last_bp = bp
                     elif op is not None:
                         # Keep runner SP canonical for stack semantics.
                         if op == Opcode.PSH:
