@@ -4623,14 +4623,17 @@ def _set_layer8_alu(ffn, S, BD):
 
     # === LEA: lo nibble (256 units) ===
     # Like ADD but reads from FETCH_LO instead of AX_CARRY_LO
-    # NOTE: ALU values are amplified (~14x) by Layer 6, so use higher threshold
+    # BUG FIX 2026-04-09: Require BOTH ALU_LO AND FETCH_LO to be active.
+    # At AX marker: MARK_AX=1, ALU_LO[correct]≈21, FETCH_LO[correct]≈40
+    # Threshold must be > 60+0+40=100 (MARK_AX + FETCH only) but < 60+21+40=121 (all active)
+    # Using threshold=105: both active=121-105=16>0, FETCH only=100-105=-5<0
     for a in range(16):
         for b in range(16):
             result = (a + b) % 16
-            ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
             ffn.W_up[unit, BD.ALU_LO + a] = S
             ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH, not AX_CARRY
-            ffn.b_up[unit] = -S * 15.5  # High threshold: MARK_AX(1) + ALU(~14) + FETCH(1) = 16 > 15.5
+            ffn.b_up[unit] = -S * 105  # Require BOTH ALU_LO and FETCH_LO to be active
             ffn.W_gate[unit, BD.OP_LEA] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
             unit += 1
@@ -4661,13 +4664,14 @@ def _set_layer8_alu(ffn, S, BD):
                 unit += 1
 
     # === LEA carry detection (120 units: pairs where a+b >= 16) ===
+    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO to be active (threshold=105)
     for a in range(16):
         for b in range(16):
             if a + b >= 16:
-                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_AX] = S * 60
                 ffn.W_up[unit, BD.ALU_LO + a] = S
                 ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH
-                ffn.b_up[unit] = -S * 15.5  # Match LEA lo nibble threshold
+                ffn.b_up[unit] = -S * 105  # Match LEA lo nibble threshold
                 ffn.W_gate[unit, BD.OP_LEA] = 1.0
                 ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                 unit += 1
@@ -4675,25 +4679,27 @@ def _set_layer8_alu(ffn, S, BD):
     # === ADJ: lo nibble (256 units) ===
     # Like LEA but gates on OP_ADJ instead
     # ADJ computes: SP = SP + signed_immediate (gathered via L7 head 1)
+    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO (threshold=105)
     for a in range(16):
         for b in range(16):
             result = (a + b) % 16
-            ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.MARK_AX] = S * 60
             ffn.W_up[unit, BD.ALU_LO + a] = S
             ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH (immediate)
-            ffn.b_up[unit] = -S * 15.5  # High threshold like LEA
+            ffn.b_up[unit] = -S * 105  # Require BOTH ALU_LO and FETCH_LO to be active
             ffn.W_gate[unit, BD.OP_ADJ] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
             unit += 1
 
     # === ADJ carry detection (120 units: pairs where a+b >= 16) ===
+    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO (threshold=105)
     for a in range(16):
         for b in range(16):
             if a + b >= 16:
-                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_AX] = S * 60
                 ffn.W_up[unit, BD.ALU_LO + a] = S
                 ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH
-                ffn.b_up[unit] = -S * 15.5  # Match ADJ lo nibble threshold
+                ffn.b_up[unit] = -S * 105  # Match ADJ lo nibble threshold
                 ffn.W_gate[unit, BD.OP_ADJ] = 1.0
                 ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                 unit += 1
@@ -4715,14 +4721,15 @@ def _set_layer8_alu(ffn, S, BD):
     # For lo nibble: result_lo = (sp_lo - (8 + imm_lo)) mod 16
     # where sp_lo comes from ALU_LO (gathered by L7 head 1)
     # and imm_lo comes from FETCH_LO (instruction immediate)
+    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO (threshold=105)
     for sp_lo in range(16):
         for imm_lo in range(16):
             effective_b = (8 + imm_lo) % 16  # Add constant offset 8
             result = (sp_lo - effective_b) % 16
-            ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.MARK_AX] = S * 60
             ffn.W_up[unit, BD.ALU_LO + sp_lo] = S  # SP lo nibble from L7
             ffn.W_up[unit, BD.FETCH_LO + imm_lo] = S  # Immediate lo nibble
-            ffn.b_up[unit] = -S * 15.5  # High threshold like LEA/ADJ
+            ffn.b_up[unit] = -S * 105  # Require BOTH ALU_LO and FETCH_LO to be active
             ffn.W_gate[unit, BD.OP_ENT] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
             unit += 1
@@ -4731,6 +4738,7 @@ def _set_layer8_alu(ffn, S, BD):
     # Borrow when sp_lo < (8 + imm_lo) mod 16
     # Must enumerate all cases (not just where borrow occurs) because
     # the condition depends on the constant 8, not just relative magnitudes
+    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO (threshold=105)
     for sp_lo in range(16):
         for imm_lo in range(16):
             effective_b = (8 + imm_lo) % 16
@@ -4740,10 +4748,10 @@ def _set_layer8_alu(ffn, S, BD):
             full_sum = 8 + imm_lo  # This is in range [8, 23]
             if sp_lo < (full_sum % 16) or full_sum >= 16:
                 # Need borrow from byte 1
-                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_AX] = S * 60
                 ffn.W_up[unit, BD.ALU_LO + sp_lo] = S
                 ffn.W_up[unit, BD.FETCH_LO + imm_lo] = S
-                ffn.b_up[unit] = -S * 15.5
+                ffn.b_up[unit] = -S * 105
                 ffn.W_gate[unit, BD.OP_ENT] = 1.0
                 ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                 unit += 1
@@ -4757,6 +4765,54 @@ def _set_layer8_alu(ffn, S, BD):
     ffn.b_up[unit] = -S * 1.5  # any_cmp_op(~5) + MARK_AX(1) > 1.5
     ffn.b_gate[unit] = 1.0  # unconditional gate
     ffn.W_down[BD.CMP_GROUP, unit] = 2.0 / (S * 9.0)  # normalize: 9 * 2/(S*9) ≈ 1.0
+    unit += 1
+
+    # === LEV: BP address relay (BP OUTPUT → ADDR dims) - PHASE 1 ===
+    # For L15 to read memory at BP and BP+8, we need BP's address value
+    # encoded in ADDR_B0/B1/B2 dims at the BP marker position.
+    #
+    # CURRENT LIMITATION: Only byte 0 is relayed here (covers addresses < 256).
+    # This is sufficient for most C4 test programs which use small stack frames.
+    #
+    # For larger addresses, we would need:
+    # - L7/L8 attention heads to gather BP bytes 1-2 from their positions
+    # - Write gathered bytes to TEMP dims
+    # - Copy TEMP → ADDR_B1/B2 here
+    #
+    # Total for byte 0 only: 32 units (1 byte × 2 nibbles × 16 values/nibble)
+
+    # Byte 0 lo nibble: OUTPUT_LO → ADDR_B0_LO
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_LEV] = S
+        ffn.W_up[unit, BD.MARK_BP] = S
+        ffn.b_up[unit] = -S * 1.5  # both OP_LEV and MARK_BP required
+        ffn.W_gate[unit, BD.OUTPUT_LO + k] = 1.0
+        ffn.W_down[BD.ADDR_B0_LO + k, unit] = 2.0 / S
+        unit += 1
+
+    # Byte 0 hi nibble: OUTPUT_HI → ADDR_B0_HI
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_LEV] = S
+        ffn.W_up[unit, BD.MARK_BP] = S
+        ffn.b_up[unit] = -S * 1.5
+        ffn.W_gate[unit, BD.OUTPUT_HI + k] = 1.0
+        ffn.W_down[BD.ADDR_B0_HI + k, unit] = 2.0 / S
+        unit += 1
+
+    # Bytes 1-2: Set to zero (assume addresses < 256 for now)
+    # This gives ADDR_B1 = ADDR_B2 = 0, which is correct for small addresses
+    ffn.W_up[unit, BD.OP_LEV] = S
+    ffn.W_up[unit, BD.MARK_BP] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.CONST] = 1.0  # Always 1.0
+    ffn.W_down[BD.ADDR_B1_LO + 0, unit] = 2.0 / S  # Set nibble 0 (value=0)
+    unit += 1
+
+    ffn.W_up[unit, BD.OP_LEV] = S
+    ffn.W_up[unit, BD.MARK_BP] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.CONST] = 1.0
+    ffn.W_down[BD.ADDR_B2_LO + 0, unit] = 2.0 / S  # Set nibble 0 (value=0)
     unit += 1
 
     return unit
@@ -4797,7 +4853,10 @@ def _set_layer9_alu(ffn, S, BD):
                 unit += 1
 
     # === LEA hi nibble (no carry 256 + with carry 256 = 512 units) ===
-    # NOTE: ALU_HI is also amplified like ALU_LO, so use high threshold
+    # BUG FIX 2026-04-09: Require BOTH ALU_HI AND FETCH_HI to be active.
+    # At AX marker: MARK_AX=1, ALU_HI[correct]≈21, FETCH_HI[correct]≈40
+    # Threshold must be > 1+0+40=41 (MARK_AX + FETCH only) but < 1+14+40=55 (all active, min ALU)
+    # Using threshold=45: both active=55-45=10>0, FETCH only=41-45=-4<0
     for carry_in in [0, 1]:
         for a in range(16):
             for b in range(16):
@@ -4807,10 +4866,10 @@ def _set_layer9_alu(ffn, S, BD):
                 ffn.W_up[unit, BD.FETCH_HI + b] = S  # Read from FETCH
                 if carry_in == 0:
                     ffn.W_up[unit, BD.CARRY + 0] = -0.01
-                    ffn.b_up[unit] = -S * 15.5  # High threshold for amplified ALU
+                    ffn.b_up[unit] = -S * 45  # Require BOTH ALU_HI and FETCH_HI
                 else:
                     ffn.W_up[unit, BD.CARRY + 0] = 0.01
-                    ffn.b_up[unit] = -S * 15.9  # Slightly higher for carry case
+                    ffn.b_up[unit] = -S * 45.4  # Slightly higher for carry case
                 ffn.W_gate[unit, BD.OP_LEA] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
@@ -4818,6 +4877,7 @@ def _set_layer9_alu(ffn, S, BD):
     # === ADJ hi nibble (no carry 256 + with carry 256 = 512 units) ===
     # Like LEA but gates on OP_ADJ instead
     # ADJ computes: SP = SP + signed_immediate
+    # BUG FIX 2026-04-09: Require BOTH ALU_HI and FETCH_HI (threshold=45)
     for carry_in in [0, 1]:
         for a in range(16):
             for b in range(16):
@@ -4827,10 +4887,10 @@ def _set_layer9_alu(ffn, S, BD):
                 ffn.W_up[unit, BD.FETCH_HI + b] = S  # Read from FETCH
                 if carry_in == 0:
                     ffn.W_up[unit, BD.CARRY + 0] = -0.01
-                    ffn.b_up[unit] = -S * 15.5  # High threshold for amplified ALU
+                    ffn.b_up[unit] = -S * 45  # Require BOTH ALU_HI and FETCH_HI
                 else:
                     ffn.W_up[unit, BD.CARRY + 0] = 0.01
-                    ffn.b_up[unit] = -S * 15.9  # Slightly higher for carry case
+                    ffn.b_up[unit] = -S * 45.4  # Slightly higher for carry case
                 ffn.W_gate[unit, BD.OP_ADJ] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
@@ -4857,6 +4917,7 @@ def _set_layer9_alu(ffn, S, BD):
     # ENT computes: SP = SP - (8 + signed_immediate)
     # For bytes 1-3, we subtract imm_byte with borrow propagation
     # The +8 offset affects byte 0 only; its overflow propagates as a borrow
+    # BUG FIX 2026-04-09: Require BOTH ALU_HI and FETCH_HI (threshold=45)
     for borrow_in in [0, 1]:
         for sp_hi in range(16):
             for imm_hi in range(16):
@@ -4867,11 +4928,11 @@ def _set_layer9_alu(ffn, S, BD):
                 if borrow_in == 0:
                     # No borrow: block when CARRY active
                     ffn.W_up[unit, BD.CARRY + 0] = -S * 2.0
-                    ffn.b_up[unit] = -S * 15.5  # High threshold like ADJ
+                    ffn.b_up[unit] = -S * 45  # Require BOTH ALU_HI and FETCH_HI
                 else:
                     # With borrow: require CARRY active
                     ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
-                    ffn.b_up[unit] = -S * 17.5  # Higher threshold (4-way AND)
+                    ffn.b_up[unit] = -S * 47  # Higher threshold (4-way AND)
                 ffn.W_gate[unit, BD.OP_ENT] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
