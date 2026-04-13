@@ -1329,10 +1329,11 @@ class _SetDim:
 
     # --- Carry / comparison ---
     CARRY = 392  # 392-395 (4 dims: inter-byte carry for ADD/SUB/MUL)
-    CMP = 396  # 396-399 (4 dims: LT, EQ, GT, ZERO)
+    CMP = 396  # 396-403 (8 dims: PSH/ADJ/ENT/POP/JSR/AX_ZERO flags)
 
     # --- Pristine nibble encoding (hi nibble) ---
-    CLEAN_EMBED_HI = 400  # 400-415 (16 dims)
+    # BUG FIX 2026-04-13: Moved from 400 to 404 to avoid collision with CMP[4..7]
+    CLEAN_EMBED_HI = 404  # 404-419 (16 dims, overlaps MUL_ACCUM[0..3] at 416-419)
 
     # --- MUL/DIV staging (also used as FETCH staging in Phase 3) ---
     MUL_ACCUM = 416  # 416-431
@@ -1799,12 +1800,26 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # This causes incorrect output at marker positions (especially PC marker).
     # Example: unit 1128 fires on OUTPUT_BYTE_LO residuals at PC marker for EXIT,
     # writing to OUTPUT_LO[0] and causing prediction of 0 instead of 10.
+    #
+    # NOTE: TEMP (dims 480-511) overlaps with OUTPUT_BYTE_LO (dims 480-495).
+    # JSR PC override and ENT use TEMP legitimately, so we must exclude units
+    # that have positive marker weights (MARK_PC, MARK_STACK0, MARK_BP) which
+    # indicate intentional TEMP usage rather than spurious OUTPUT_BYTE reading.
     patched_count = 0
     for u in range(4096):
         # Check if writes to OUTPUT
         writes_output_lo = ffn6.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
         writes_output_hi = ffn6.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
         if not (writes_output_lo or writes_output_hi):
+            continue
+
+        # Skip units that legitimately use TEMP (JSR PC override, ENT, etc.)
+        # These units have positive MARK_PC, MARK_STACK0, or MARK_BP weight
+        if ffn6.W_up[u, BD.MARK_PC].item() > 10:  # JSR PC override uses S=100
+            continue
+        if ffn6.W_up[u, BD.MARK_STACK0].item() > 10:  # ENT uses TEMP at STACK0
+            continue
+        if ffn6.W_up[u, BD.MARK_BP].item() > 10:  # ENT uses TEMP at BP
             continue
 
         # Check for strong OUTPUT_BYTE weights (TEMP overlaps with OUTPUT_BYTE, so don't check TEMP separately)
@@ -2448,6 +2463,38 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S  # hi nibble = 0
     unit += 1
 
+    # === LEA first-step AX byte 2 output ===
+    # On first step, L10 attention passthrough produces 0 for AX bytes 1-3 (no previous step).
+    # For LEA, AX = BP + imm. BP = 0x10000, so byte 2 = 0x01.
+    # Fires at: CMP[7] (OP_LEA relay) + H1[AX] + IS_BYTE + BYTE_INDEX_1 + NOT HAS_SE
+    # At AX byte 1 position (predicting byte 2 token).
+    # FIX 2026-04-10: First-step LEA was outputting 0x00000000 instead of 0x00010000.
+    # FIX 2026-04-13: Use CMP[7] (relayed from AX marker by L7 head 5) instead of OP_LEA.
+    # CMP[7] ≈ 2.2 at AX byte positions (OP_LEA ≈ 11 * 0.2 relay scaling).
+    # Threshold needs to be high enough that BYTE_INDEX_1 is required (not just CMP[7]+H1+IS_BYTE).
+    # Sum = 5.17, threshold = 4.0 gives margin 1.17 -> silu(1.17) ≈ 0.79 -> output ≈ 3.2
+    T_lea_byte = 4.5  # Lower threshold for stronger activation
+    ffn.W_up[unit, BD.CMP + 7] = S  # OP_LEA relay (set by L7 head 5)
+    ffn.W_up[unit, BD.H1 + AX_I] = S
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S  # Only first step
+    ffn.b_up[unit] = -S * T_lea_byte
+    ffn.b_gate[unit] = 1.0
+    # Write OUTPUT_LO[1] = 1 and cancel any competing OUTPUT_LO[0]
+    ffn.W_down[BD.OUTPUT_LO + 1, unit] = 4.0 / S  # lo nibble = 1 (byte 2 = 0x01), stronger
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = -4.0 / S  # cancel competing lo=0 signal
+    unit += 1
+    ffn.W_up[unit, BD.CMP + 7] = S  # OP_LEA relay (set by L7 head 5)
+    ffn.W_up[unit, BD.H1 + AX_I] = S
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S  # Only first step
+    ffn.b_up[unit] = -S * T_lea_byte
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S  # hi nibble = 0 (byte 2 = 0x01)
+    unit += 1
+
 
 # =============================================================================
 # Instruction Fetch Layers (2-5)
@@ -3019,10 +3066,10 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
 
-    # Head 2: fetch opcode for first-step (PC marker → address PC_OFFSET)
-    # On the first step (NOT HAS_SE), PC = PC_OFFSET. Fetch opcode from address PC_OFFSET.
+    # Head 2: fetch opcode for first-step (PC marker → address PC_OFFSET - 2)
+    # FIX 2026-04-12: PC_OFFSET points to immediate byte, opcode is 2 bytes before
+    # On the first step (NOT HAS_SE), PC = PC_OFFSET.
     # Uses ADDR_KEY matching (same mechanism as head 1, but fires at PC marker not AX).
-    # With PC_OFFSET=2: opcode is at ADDR_KEY=2
     from .constants import PC_OFFSET
     base = 2 * HD
     # Q: fires at PC marker when NOT HAS_SE, queries for address PC_OFFSET
@@ -3054,13 +3101,12 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
 
-    # Head 3: fetch immediate for first-step (PC marker → address PC_OFFSET+1)
-    # Fetches immediate byte 0 at address PC_OFFSET+1 and writes to AX_CARRY.
-    # Layer 6 FFN reads AX_CARRY for JMP target.
-    # With PC_OFFSET=2: immediate byte 0 is at ADDR_KEY=3
+    # Head 3: fetch immediate for first-step (PC marker → address PC_OFFSET + 1)
+    # Fetches immediate byte 0 at address PC_OFFSET+1 and writes to FETCH.
+    # Layer 6 FFN reads FETCH for JMP target.
     imm_addr = PC_OFFSET + 1
     base = 3 * HD
-    # Q: queries for address PC_OFFSET+1 (e.g., 3: ADDR_KEY_LO[3]=1, ADDR_KEY_HI[0]=1)
+    # Q: queries for address imm_addr (e.g., 1: ADDR_KEY_LO[1]=1, ADDR_KEY_HI[0]=1)
     # NOTE: Q[PC_OFFSET] must remain zero - setting it causes opcode/imm to match equally
     # Queries at PC marker only. L6 head 5 relays FETCH from PC to AX for first-step IMM.
     # BUG FIX 2026-04-09: Removed AX marker gate to prevent writing jump target to AX_CARRY
@@ -3183,6 +3229,7 @@ def _set_layer5_fetch(attn, S, BD, HD):
     attn.W_v[base + v_offset, BD.OP_LEA] = 1.0; v_offset += 1
     attn.W_v[base + v_offset, BD.OP_EXIT] = 1.0; v_offset += 1
     attn.W_v[base + v_offset, BD.OP_JMP] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_JSR] = 1.0; v_offset += 1  # ADDED for neural JSR (non-first steps)
     attn.W_v[base + v_offset, BD.OP_ADD] = 1.0; v_offset += 1
     attn.W_v[base + v_offset, BD.OP_SUB] = 1.0; v_offset += 1
     attn.W_v[base + v_offset, BD.OP_MUL] = 1.0; v_offset += 1
@@ -3202,6 +3249,7 @@ def _set_layer5_fetch(attn, S, BD, HD):
     attn.W_o[BD.OP_LEA, base + o_offset] = 1.0; o_offset += 1
     attn.W_o[BD.OP_EXIT, base + o_offset] = 1.0; o_offset += 1
     attn.W_o[BD.OP_JMP, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_JSR, base + o_offset] = 1.0; o_offset += 1  # ADDED for neural JSR (non-first steps)
     attn.W_o[BD.OP_ADD, base + o_offset] = 1.0; o_offset += 1
     attn.W_o[BD.OP_SUB, base + o_offset] = 1.0; o_offset += 1
     attn.W_o[BD.OP_MUL, base + o_offset] = 1.0; o_offset += 1
@@ -3217,7 +3265,6 @@ def _set_layer5_fetch(attn, S, BD, HD):
 
     # Head 7: Direct OP_* flag relay from CODE to PC marker (first step only)
     # Same as Head 6, but for first step (NOT HAS_SE instead of HAS_SE).
-    # On first step, PC = PC_OFFSET, so query for address PC_OFFSET.
     base = 7 * HD
     # Q: PC marker when NOT HAS_SE, queries for address PC_OFFSET
     attn.W_q[base, BD.MARK_PC] = L
@@ -3245,6 +3292,7 @@ def _set_layer5_fetch(attn, S, BD, HD):
     attn.W_v[base + v_offset, BD.OP_LEA] = 1.0; v_offset += 1
     attn.W_v[base + v_offset, BD.OP_EXIT] = 1.0; v_offset += 1
     attn.W_v[base + v_offset, BD.OP_JMP] = 1.0; v_offset += 1
+    attn.W_v[base + v_offset, BD.OP_JSR] = 1.0; v_offset += 1  # ADDED for neural JSR
     attn.W_v[base + v_offset, BD.OP_ADD] = 1.0; v_offset += 1
     attn.W_v[base + v_offset, BD.OP_SUB] = 1.0; v_offset += 1
     attn.W_v[base + v_offset, BD.OP_MUL] = 1.0; v_offset += 1
@@ -3264,6 +3312,7 @@ def _set_layer5_fetch(attn, S, BD, HD):
     attn.W_o[BD.OP_LEA, base + o_offset] = 1.0; o_offset += 1
     attn.W_o[BD.OP_EXIT, base + o_offset] = 1.0; o_offset += 1
     attn.W_o[BD.OP_JMP, base + o_offset] = 1.0; o_offset += 1
+    attn.W_o[BD.OP_JSR, base + o_offset] = 1.0; o_offset += 1  # ADDED for neural JSR
     attn.W_o[BD.OP_ADD, base + o_offset] = 1.0; o_offset += 1
     attn.W_o[BD.OP_SUB, base + o_offset] = 1.0; o_offset += 1
     attn.W_o[BD.OP_MUL, base + o_offset] = 1.0; o_offset += 1
@@ -3653,15 +3702,16 @@ def _set_layer6_attn(attn, S, BD, HD):
         attn.W_o[BD.AX_CARRY_LO + k, base + 2 + k] = 1.0
         attn.W_o[BD.AX_CARRY_HI + k, base + 18 + k] = 1.0
 
-    # Head 3: JSR relay (PC marker → current step's AX marker, ALL steps)
-    # For JSR, we need intra-step relay (like head 2) but without HAS_SE restriction.
-    # JSR executes at step N and needs PC override at step N (not N+1 like JMP).
-    # This relay copies OP_JSR flag from AX to TEMP[0] at PC marker.
-    # (Jump target is already in FETCH dims, no need to relay it.)
+    # Head 3: JSR relay (AX marker → PC marker, FIRST STEP ONLY)
+    # For first step, L5 FFN decodes JSR at PC marker and writes TEMP[0].
+    # This relay is DISABLED (first-step only) because subsequent steps use L5 opcode decode.
+    # BUG FIX 2026-04-13: Added HAS_SE gate to prevent false positive on subsequent steps.
+    # Without HAS_SE gate, this head attends to ALL AX markers in context, including
+    # previous steps' AX markers which may have OP_JSR set (causing PC override on non-JSR steps).
     base = 3 * HD
     attn.W_q[base, BD.MARK_PC] = L
     attn.W_q[base, BD.MARK_AX] = -L  # block at AX marker
-    # No HAS_SE condition - fire on all steps
+    attn.W_q[base, BD.HAS_SE] = -L   # BUG FIX: only fire when NOT HAS_SE (first step)
     attn.W_k[base, BD.MARK_AX] = L
     # V: copy OP_JSR flag only (FETCH already has target)
     attn.W_v[base + 1, BD.OP_JSR] = 1.0
@@ -3678,56 +3728,59 @@ def _set_layer6_attn(attn, S, BD, HD):
     # For first step, L5 FFN decodes opcodes at PC marker (OP_IMM, OP_LEA, OP_EXIT, OP_NOP, OP_JMP, OP_JSR, arithmetic, bitwise, cmp, shift).
     # L6 FFN needs these flags at AX marker for routing (IMM, EXIT, NOP, JMP, arithmetic, etc).
     # This relay copies OP flags from PC marker to AX marker on first step only.
-    # Currently relaying: IMM, LEA, JMP, EXIT, NOP, ADD, SUB, MUL, DIV, MOD, OR, XOR, AND, EQ, LT, SHL, SHR
+    # Currently relaying: IMM, LEA, JMP, JSR, EXIT, NOP, ADD, SUB, MUL, DIV, MOD, OR, XOR, AND, EQ, LT, SHL, SHR
     base = 5 * HD
     attn.W_q[base, BD.MARK_AX] = L
     attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
     attn.W_k[base, BD.MARK_PC] = L
-    # V: copy OP flags (17 total: 5 existing + 12 new)
+    # V: copy OP flags (18 total: added JSR)
     attn.W_v[base + 0, BD.OP_IMM] = 1.0
     attn.W_v[base + 1, BD.OP_LEA] = 1.0
     attn.W_v[base + 2, BD.OP_JMP] = 1.0
-    attn.W_v[base + 3, BD.OP_EXIT] = 1.0
-    attn.W_v[base + 4, BD.OP_NOP] = 1.0
-    attn.W_v[base + 5, BD.OP_ADD] = 1.0
-    attn.W_v[base + 6, BD.OP_SUB] = 1.0
-    attn.W_v[base + 7, BD.OP_MUL] = 1.0
-    attn.W_v[base + 8, BD.OP_DIV] = 1.0
-    attn.W_v[base + 9, BD.OP_MOD] = 1.0
-    attn.W_v[base + 10, BD.OP_OR] = 1.0
-    attn.W_v[base + 11, BD.OP_XOR] = 1.0
-    attn.W_v[base + 12, BD.OP_AND] = 1.0
-    attn.W_v[base + 13, BD.OP_EQ] = 1.0
-    attn.W_v[base + 14, BD.OP_LT] = 1.0
-    attn.W_v[base + 15, BD.OP_SHL] = 1.0
-    attn.W_v[base + 16, BD.OP_SHR] = 1.0
+    attn.W_v[base + 3, BD.OP_JSR] = 1.0  # ADDED: relay JSR flag
+    attn.W_v[base + 4, BD.OP_EXIT] = 1.0
+    attn.W_v[base + 5, BD.OP_NOP] = 1.0
+    attn.W_v[base + 6, BD.OP_ADD] = 1.0
+    attn.W_v[base + 7, BD.OP_SUB] = 1.0
+    attn.W_v[base + 8, BD.OP_MUL] = 1.0
+    attn.W_v[base + 9, BD.OP_DIV] = 1.0
+    attn.W_v[base + 10, BD.OP_MOD] = 1.0
+    attn.W_v[base + 11, BD.OP_OR] = 1.0
+    attn.W_v[base + 12, BD.OP_XOR] = 1.0
+    attn.W_v[base + 13, BD.OP_AND] = 1.0
+    attn.W_v[base + 14, BD.OP_EQ] = 1.0
+    attn.W_v[base + 15, BD.OP_LT] = 1.0
+    attn.W_v[base + 16, BD.OP_SHL] = 1.0
+    attn.W_v[base + 17, BD.OP_SHR] = 1.0
     # O: write OP flags at AX marker
     attn.W_o[BD.OP_IMM, base + 0] = 1.0
     attn.W_o[BD.OP_LEA, base + 1] = 1.0
     attn.W_o[BD.OP_JMP, base + 2] = 1.0
-    attn.W_o[BD.OP_EXIT, base + 3] = 1.0
-    attn.W_o[BD.OP_NOP, base + 4] = 1.0
-    attn.W_o[BD.OP_ADD, base + 5] = 1.0
-    attn.W_o[BD.OP_SUB, base + 6] = 1.0
-    attn.W_o[BD.OP_MUL, base + 7] = 1.0
-    attn.W_o[BD.OP_DIV, base + 8] = 1.0
-    attn.W_o[BD.OP_MOD, base + 9] = 1.0
-    attn.W_o[BD.OP_OR, base + 10] = 1.0
-    attn.W_o[BD.OP_XOR, base + 11] = 1.0
-    attn.W_o[BD.OP_AND, base + 12] = 1.0
-    attn.W_o[BD.OP_EQ, base + 13] = 1.0
-    attn.W_o[BD.OP_LT, base + 14] = 1.0
-    attn.W_o[BD.OP_SHL, base + 15] = 1.0
-    attn.W_o[BD.OP_SHR, base + 16] = 1.0
-    # V: also copy FETCH_LO/HI (positions 17-48) for first-step IMM routing
+    attn.W_o[BD.OP_JSR, base + 3] = 1.0  # ADDED: write JSR flag to AX marker
+    attn.W_o[BD.OP_EXIT, base + 4] = 1.0
+    attn.W_o[BD.OP_NOP, base + 5] = 1.0
+    attn.W_o[BD.OP_ADD, base + 6] = 1.0
+    attn.W_o[BD.OP_SUB, base + 7] = 1.0
+    attn.W_o[BD.OP_MUL, base + 8] = 1.0
+    attn.W_o[BD.OP_DIV, base + 9] = 1.0
+    attn.W_o[BD.OP_MOD, base + 10] = 1.0
+    attn.W_o[BD.OP_OR, base + 11] = 1.0
+    attn.W_o[BD.OP_XOR, base + 12] = 1.0
+    attn.W_o[BD.OP_AND, base + 13] = 1.0  # FIXED: was OP_EQ
+    attn.W_o[BD.OP_EQ, base + 14] = 1.0   # FIXED: was OP_LT
+    attn.W_o[BD.OP_LT, base + 15] = 1.0   # FIXED: was OP_SHL
+    attn.W_o[BD.OP_SHL, base + 16] = 1.0  # FIXED: was OP_SHR
+    attn.W_o[BD.OP_SHR, base + 17] = 1.0
+    # V: also copy FETCH_LO/HI (positions 18-49) for first-step IMM routing
     # This relay was moved from head 4 to avoid BZ/BNZ weight conflicts.
+    # UPDATED: positions shifted from 17 to 18 due to JSR addition
     for k in range(16):
-        attn.W_v[base + 17 + k, BD.FETCH_LO + k] = 1.0
-        attn.W_v[base + 33 + k, BD.FETCH_HI + k] = 1.0
+        attn.W_v[base + 18 + k, BD.FETCH_LO + k] = 1.0
+        attn.W_v[base + 34 + k, BD.FETCH_HI + k] = 1.0
     # O: write FETCH_LO/HI at AX marker
     for k in range(16):
-        attn.W_o[BD.FETCH_LO + k, base + 17 + k] = 1.0
-        attn.W_o[BD.FETCH_HI + k, base + 33 + k] = 1.0
+        attn.W_o[BD.FETCH_LO + k, base + 18 + k] = 1.0
+        attn.W_o[BD.FETCH_HI + k, base + 34 + k] = 1.0
     # HAS_SE gate: block attention when HAS_SE = 1 (non-first steps)
     # Without this gate, softmax1 distributes attention uniformly when Q is zero,
     # causing spurious FETCH relay from step 1 PC marker (which has V[18]=40.0 from L5).
@@ -4607,19 +4660,21 @@ def _set_layer7_memory_heads(attn, S, BD, HD):
             attn.W_o[addr_lo_out + k, base + 1 + k] = 1.0
             attn.W_o[addr_hi_out + k, base + 17 + k] = 1.0
 
-    # === Head 5: Relay OP_LI/OP_LC from AX marker → AX byte positions ===
+    # === Head 5: Relay OP_LI/OP_LC/OP_LEA from AX marker → AX byte positions ===
     base = 5 * HD
     # Q: fires at AX marker + AX bytes
     attn.W_q[base, BD.MARK_AX] = L
     attn.W_q[base, BD.H1 + AX_I] = L  # AX byte positions
     # K: attend to AX marker
     attn.W_k[base, BD.MARK_AX] = L
-    # V: OP_LI and OP_LC (scaled: ≈5 × 0.2 = ≈1.0)
+    # V: OP_LI, OP_LC, OP_LEA (scaled: ≈5 × 0.2 = ≈1.0)
     attn.W_v[base + 1, BD.OP_LI] = 0.2
     attn.W_v[base + 2, BD.OP_LC] = 0.2
+    attn.W_v[base + 3, BD.OP_LEA] = 0.2  # FIX 2026-04-13: Relay LEA for first-step byte 2 output
     # O: write to relay dims (×5 to normalize)
     attn.W_o[BD.OP_LI_RELAY, base + 1] = 1.0
     attn.W_o[BD.OP_LC_RELAY, base + 2] = 1.0
+    attn.W_o[BD.CMP + 7, base + 3] = 1.0  # OP_LEA relay → CMP[7]
 
     # === Head 6: Relay PSH/ENT/JSR from STACK0 marker → STACK0 byte positions ===
     # Also relay PSH_AT_SP from SP marker → SP byte positions.
@@ -6263,7 +6318,10 @@ def _set_layer15_memory_lookup(attn, S, BD, HD):
             byte_idx = h - 8  # 0, 1, 2, 3
 
             # === Dim 0: Bias — fire at PC marker when OP_LEV active ===
-            attn.W_q[base, BD.CONST] = -2000.0
+            # BUG FIX 2026-04-13: Increased bias to -4000 to require BOTH OP_LEV AND MARK_PC.
+            # Previous -2000 bias was cancelled by MARK_PC alone (0 + 2000 = 0),
+            # causing spurious activation at PC marker for non-LEV instructions.
+            attn.W_q[base, BD.CONST] = -4000.0  # FIXED: was -2000
             attn.W_q[base, BD.OP_LEV] = 2000.0   # Only when LEV active
             attn.W_q[base, BD.MARK_PC] = 2000.0  # Activate at PC marker (not BP!)
             attn.W_k[base, BD.CONST] = 10.0
