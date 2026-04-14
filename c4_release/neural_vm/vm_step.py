@@ -1287,17 +1287,18 @@ class _SetDim:
     NEXT_IO_STATE_EMIT_THINKING = 327  # Transition flag → emit IO_STATE_EMIT_THINKING token
 
     # --- Conversational I/O detection (PRTF/READ specific) ---
-    IO_IS_PRTF = 460  # Flag: PRTF opcode detected (for autoregressive printf)
-    IO_IS_READ = 461  # Flag: READ opcode detected (for autoregressive input)
-    IO_STATE = 462  # State machine: 0=normal, 1=emit_thinking_end, 2=output, 3=emit_thinking_start
-    IO_OUTPUT_COUNT = 463  # Number of output bytes remaining
-    IO_FORMAT_POS = 464  # Position in format string (nibble-encoded)
+    # BUG FIX 2026-04-13: Shifted +4 to avoid CLEAN_EMBED_HI/FETCH_LO collision cascade
+    IO_IS_PRTF = 464  # Flag: PRTF opcode detected (aliases MEM_VAL_B3)
+    IO_IS_READ = 465  # Flag: READ opcode detected (aliases OP_LI_RELAY)
+    IO_STATE = 466  # State machine (aliases OP_LC_RELAY)
+    IO_OUTPUT_COUNT = 467  # Number of output bytes remaining (aliases PSH_AT_SP)
+    IO_FORMAT_POS = 468  # Position in format string (aliases MEM_EXEC)
 
     # --- Conversational I/O state tracking ---
-    IO_IN_OUTPUT_MODE = 465  # Flag: currently emitting output bytes
-    IO_OUTPUT_COMPLETE = 466  # Flag: format string complete (null terminator)
-    FORMAT_PTR_LO = 467  # Format string pointer lo nibble (16 dims: 467-482)
-    FORMAT_PTR_HI = 483  # Format string pointer hi nibble (16 dims: 483-498)
+    IO_IN_OUTPUT_MODE = 469  # Flag: currently emitting output bytes
+    IO_OUTPUT_COMPLETE = 470  # Flag: format string complete (null terminator)
+    FORMAT_PTR_LO = 471  # Format string pointer lo nibble (16 dims: 471-486, aliases AX_FULL_LO)
+    FORMAT_PTR_HI = 487  # Format string pointer hi nibble (16 dims: 487-502, aliases AX_FULL_HI)
     # Note: OUTPUT_BYTE reuses TEMP space (480-511) which is not needed during conversational I/O
     OUTPUT_BYTE_LO = 480  # Output byte lo nibble (16 dims: 480-495, overlaps TEMP)
     OUTPUT_BYTE_HI = 496  # Output byte hi nibble (16 dims: 496-511, overlaps TEMP+16)
@@ -1319,9 +1320,9 @@ class _SetDim:
     AX_CARRY_LO = 328  # 328-343
     AX_CARRY_HI = 344  # 344-359
 
-    # --- I/O state detection (gap 360, overlaps ALU_LO start but that's ok) ---
-    LAST_WAS_IO_STATE_EMIT_BYTE = 458  # Flag: last token was IO_STATE_EMIT_BYTE
-    LAST_WAS_IO_STATE_EMIT_THINKING = 459  # Flag: last token was IO_STATE_EMIT_THINKING
+    # --- I/O state detection (shifted +4 to maintain aliases with MEM_VAL_B1/B2) ---
+    LAST_WAS_IO_STATE_EMIT_BYTE = 462  # Flag: last token was IO_STATE_EMIT_BYTE (aliases MEM_VAL_B1)
+    LAST_WAS_IO_STATE_EMIT_THINKING = 463  # Flag: last token was IO_STATE_EMIT_THINKING (aliases MEM_VAL_B2)
 
     # --- ALU result staging ---
     ALU_LO = 360  # 360-375
@@ -1333,13 +1334,14 @@ class _SetDim:
 
     # --- Pristine nibble encoding (hi nibble) ---
     # BUG FIX 2026-04-13: Moved from 400 to 404 to avoid collision with CMP[4..7]
-    CLEAN_EMBED_HI = 404  # 404-419 (16 dims, overlaps MUL_ACCUM[0..3] at 416-419)
+    CLEAN_EMBED_HI = 404  # 404-419 (16 dims)
 
     # --- MUL/DIV staging (also used as FETCH staging in Phase 3) ---
-    MUL_ACCUM = 416  # 416-431
-    DIV_STAGING = 432  # 432-447
-    FETCH_LO = 416  # alias: fetched immediate lo nibble (clean, no prior writes)
-    FETCH_HI = 432  # alias: fetched immediate hi nibble
+    # BUG FIX 2026-04-13: Shifted +4 to avoid CLEAN_EMBED_HI[12..15] collision
+    MUL_ACCUM = 420  # 420-435 (was 416-431)
+    DIV_STAGING = 436  # 436-451 (was 432-447)
+    FETCH_LO = 420  # alias: fetched immediate lo nibble
+    FETCH_HI = 436  # alias: fetched immediate hi nibble
 
     # --- Address hi nibble gathering (reuse ADDR_KEY space at byte positions) ---
     ADDR_B0_HI = 206  # 206-221 (16 dims): hi nibble of gathered addr byte 0
@@ -1347,28 +1349,29 @@ class _SetDim:
     ADDR_B2_HI = 238  # 238-253
 
     # --- L2 threshold head output (7 dims: one per marker type) ---
-    L2H0 = 448  # 448-454: threshold 5.5 from nearest IS_MARK
+    # Shifted +4 (was 448-454, now 452-458)
+    L2H0 = 452  # 452-458: threshold 5.5 from nearest IS_MARK
 
     # --- Memory operation flags ---
-    MEM_STORE = 455  # 1 dim: store op active (SI/SC/PSH), relayed to MEM positions
-    MEM_ADDR_SRC = 456  # 1 dim: 1=addr from STACK0 (SI/SC), 0=addr from SP (PSH)
-    MEM_VAL_B0 = 457  # 1 dim: at MEM val byte 0 position (d=5 from MEM marker)
-    MEM_VAL_B1 = 458  # 1 dim: at MEM val byte 1 position (d=6)
-    MEM_VAL_B2 = 459  # 1 dim: at MEM val byte 2 position (d=7)
-    MEM_VAL_B3 = 460  # 1 dim: at MEM val byte 3 position (d=8)
-    OP_LI_RELAY = 461  # 1 dim: LI active (relayed to AX byte positions)
-    OP_LC_RELAY = 462  # 1 dim: LC active (relayed to AX byte positions)
-    PSH_AT_SP = 463    # 1 dim: PSH opcode flag relayed to SP/STACK0 (clean, no JMP collision)
+    # Shifted +4 (was 455-464, now 459-468)
+    MEM_STORE = 459  # 1 dim: store op active (SI/SC/PSH), relayed to MEM positions
+    MEM_ADDR_SRC = 460  # 1 dim: 1=addr from STACK0 (SI/SC), 0=addr from SP (PSH)
+    MEM_VAL_B0 = 461  # 1 dim: at MEM val byte 0 position (d=5 from MEM marker)
+    MEM_VAL_B1 = 462  # 1 dim: at MEM val byte 1 position (d=6)
+    MEM_VAL_B2 = 463  # 1 dim: at MEM val byte 2 position (d=7)
+    MEM_VAL_B3 = 464  # 1 dim: at MEM val byte 3 position (d=8)
+    OP_LI_RELAY = 465  # 1 dim: LI active (relayed to AX byte positions)
+    OP_LC_RELAY = 466  # 1 dim: LC active (relayed to AX byte positions)
+    PSH_AT_SP = 467    # 1 dim: PSH opcode flag relayed to SP/STACK0 (clean, no JMP collision)
 
     # --- Unified memory execution (code from writable memory) ---
-    MEM_EXEC = 464     # 1 dim: MEM section contains executable code (for L5 fetch)
+    MEM_EXEC = 468     # 1 dim: MEM section contains executable code (for L5 fetch)
 
     # --- AX full value relay (for PSH STACK0 = AX) ---
-    # FIX 2026-04-09: New dimension for L3 head 5 to copy AX OUTPUT → AX_FULL.
-    # Overlaps FORMAT_PTR (467-498) which is only used during conversational I/O,
-    # NOT during normal PSH/SI/LI operations. Safe overlap.
-    AX_FULL_LO = 467  # 467-482 (16 dims, overlaps FORMAT_PTR_LO)
-    AX_FULL_HI = 483  # 483-498 (16 dims, overlaps FORMAT_PTR_HI)
+    # Shifted +4 (was 467-498, now 471-502)
+    # Overlaps FORMAT_PTR which is only used during conversational I/O.
+    AX_FULL_LO = 471  # 471-486 (16 dims, overlaps FORMAT_PTR_LO)
+    AX_FULL_HI = 487  # 487-502 (16 dims, overlaps FORMAT_PTR_HI)
 
     # --- General temporaries / reserved ---
     TEMP = 480  # 480-511 (32 dims)
