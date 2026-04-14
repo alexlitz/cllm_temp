@@ -1543,47 +1543,16 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         embed[b, BD.CLEAN_EMBED_LO + (b & 0xF)] = 1.0
         embed[b, BD.CLEAN_EMBED_HI + ((b >> 4) & 0xF)] = 1.0
 
-    # Set OP_* flags for opcode bytes (enables opcode detection)
-    # When code bytes appear at PC marker, these flags identify the instruction type
-    from .embedding import Opcode
-    for opcode_value, op_dim in [
-        (Opcode.LEA, BD.OP_LEA),
-        (Opcode.IMM, BD.OP_IMM),
-        (Opcode.JMP, BD.OP_JMP),
-        (Opcode.JSR, BD.OP_JSR),
-        (Opcode.BZ, BD.OP_BZ),
-        (Opcode.BNZ, BD.OP_BNZ),
-        (Opcode.ENT, BD.OP_ENT),
-        (Opcode.ADJ, BD.OP_ADJ),
-        (Opcode.LEV, BD.OP_LEV),
-        (Opcode.LI, BD.OP_LI),
-        (Opcode.LC, BD.OP_LC),
-        (Opcode.SI, BD.OP_SI),
-        (Opcode.SC, BD.OP_SC),
-        (Opcode.PSH, BD.OP_PSH),
-        (Opcode.OR, BD.OP_OR),
-        (Opcode.XOR, BD.OP_XOR),
-        (Opcode.AND, BD.OP_AND),
-        (Opcode.EQ, BD.OP_EQ),
-        (Opcode.NE, BD.OP_NE),
-        (Opcode.LT, BD.OP_LT),
-        (Opcode.GT, BD.OP_GT),
-        (Opcode.LE, BD.OP_LE),
-        (Opcode.GE, BD.OP_GE),
-        (Opcode.SHL, BD.OP_SHL),
-        (Opcode.SHR, BD.OP_SHR),
-        (Opcode.ADD, BD.OP_ADD),
-        (Opcode.SUB, BD.OP_SUB),
-        (Opcode.MUL, BD.OP_MUL),
-        (Opcode.DIV, BD.OP_DIV),
-        (Opcode.MOD, BD.OP_MOD),
-        (Opcode.EXIT, BD.OP_EXIT),
-        (Opcode.GETCHAR, BD.OP_GETCHAR),
-        (Opcode.PUTCHAR, BD.OP_PUTCHAR),
-        (39, BD.OP_NOP),  # NOP = 39
-    ]:
-        if opcode_value < 256:  # Ensure it's a valid byte value
-            embed[opcode_value, op_dim] = 1.0
+    # NOTE: OP_* flags are NOT set in the embedding table.
+    # BUG FIX 2026-04-13: Removed embedding OP_* flags because they caused
+    # L6 attention to average OP_LEA across all byte-0 positions (13 CODE bytes
+    # with value 0x00), leaking OP_LEA=0.59 into the PC marker for non-LEA ops.
+    # This triggered L7 head 1 (LEA operand gather), writing spurious ALU values,
+    # which caused L13 shift FFN to corrupt PC OUTPUT from 24 to 8.
+    #
+    # L5 FFN opcode decode (_set_opcode_decode_ffn) properly sets OP_* flags
+    # at MARK_PC/MARK_AX positions using OPCODE_BYTE_LO/HI gating, so embedding
+    # OP_* flags are not needed and cause spurious leakage.
 
     # ===== LAYER 0: Step structure via threshold attention (8 heads) =====
     # 35-token step: PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5)+MEM(9)+SE(1)
@@ -7482,11 +7451,20 @@ def _set_function_call_weights(model, S, BD, HD):
     # At PC marker when JSR: cancel OUTPUT (PC+5), write FETCH (jump target).
     # Gated on TEMP[0] (IS_JSR flag relayed from AX by L6 head 3).
     # Threshold: relayed OP_JSR ≈ 5.0, so T=4.0 separates it from false positives.
+    # BUG FIX 2026-04-13: L6 head 4 (BZ/BNZ relay) unconditionally writes FETCH→TEMP
+    # for all opcodes, polluting TEMP[0] with ~19.93 for NOP/EXIT. Add blockers for
+    # non-JSR opcodes to prevent spurious JSR PC override triggering.
     T_jsr_pc = 4.0
     # Cancel OUTPUT_LO/HI (PC+5)
     for k in range(16):
         ffn6.W_up[unit, BD.MARK_PC] = S
         ffn6.W_up[unit, BD.TEMP + 0] = S  # IS_JSR flag from L6 head 3 relay
+        # BUG FIX: Block non-JSR opcodes that have TEMP[0] pollution from head 4
+        ffn6.W_up[unit, BD.OP_NOP] = -S * 4  # Block NOP
+        ffn6.W_up[unit, BD.OP_EXIT] = -S * 4  # Block EXIT
+        ffn6.W_up[unit, BD.OP_JMP] = -S * 4  # Block JMP (has its own PC override)
+        ffn6.W_up[unit, BD.OP_BZ] = -S * 4  # Block BZ (conditional branch)
+        ffn6.W_up[unit, BD.OP_BNZ] = -S * 4  # Block BNZ (conditional branch)
         ffn6.b_up[unit] = -S * T_jsr_pc
         ffn6.W_gate[unit, BD.OUTPUT_LO + k] = -1.0
         ffn6.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -7494,6 +7472,12 @@ def _set_function_call_weights(model, S, BD, HD):
     for k in range(16):
         ffn6.W_up[unit, BD.MARK_PC] = S
         ffn6.W_up[unit, BD.TEMP + 0] = S  # IS_JSR flag from L6 head 3 relay
+        # BUG FIX: Block non-JSR opcodes
+        ffn6.W_up[unit, BD.OP_NOP] = -S * 4
+        ffn6.W_up[unit, BD.OP_EXIT] = -S * 4
+        ffn6.W_up[unit, BD.OP_JMP] = -S * 4
+        ffn6.W_up[unit, BD.OP_BZ] = -S * 4
+        ffn6.W_up[unit, BD.OP_BNZ] = -S * 4
         ffn6.b_up[unit] = -S * T_jsr_pc
         ffn6.W_gate[unit, BD.OUTPUT_HI + k] = -1.0
         ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -7503,6 +7487,12 @@ def _set_function_call_weights(model, S, BD, HD):
     for k in range(16):
         ffn6.W_up[unit, BD.MARK_PC] = S
         ffn6.W_up[unit, BD.TEMP + 0] = S  # IS_JSR flag from first-step decode or L6 head 3 relay
+        # BUG FIX: Block non-JSR opcodes
+        ffn6.W_up[unit, BD.OP_NOP] = -S * 4
+        ffn6.W_up[unit, BD.OP_EXIT] = -S * 4
+        ffn6.W_up[unit, BD.OP_JMP] = -S * 4
+        ffn6.W_up[unit, BD.OP_BZ] = -S * 4
+        ffn6.W_up[unit, BD.OP_BNZ] = -S * 4
         ffn6.b_up[unit] = -S * T_jsr_pc
         ffn6.W_gate[unit, BD.FETCH_LO + k] = 1.0  # FIXED: was AX_CARRY_LO
         ffn6.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -7510,6 +7500,12 @@ def _set_function_call_weights(model, S, BD, HD):
     for k in range(16):
         ffn6.W_up[unit, BD.MARK_PC] = S
         ffn6.W_up[unit, BD.TEMP + 0] = S  # IS_JSR flag from first-step decode or L6 head 3 relay
+        # BUG FIX: Block non-JSR opcodes
+        ffn6.W_up[unit, BD.OP_NOP] = -S * 4
+        ffn6.W_up[unit, BD.OP_EXIT] = -S * 4
+        ffn6.W_up[unit, BD.OP_JMP] = -S * 4
+        ffn6.W_up[unit, BD.OP_BZ] = -S * 4
+        ffn6.W_up[unit, BD.OP_BNZ] = -S * 4
         ffn6.b_up[unit] = -S * T_jsr_pc
         ffn6.W_gate[unit, BD.FETCH_HI + k] = 1.0  # FIXED: was AX_CARRY_HI
         ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
