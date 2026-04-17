@@ -227,17 +227,26 @@ class AutoregressiveVMRunner:
         # These are runner-side compatibility shims for full 32-bit correctness
         # while the corresponding neural memory paths are being completed.
         self._func_call_handlers = {
-            # REMOVED: IMM and LEA now work fully neurally (L6 FFN relay)
-            # Opcode.IMM: self._handler_imm,
+            # RE-ENABLED 2026-04-16: IMM handler needed to track _last_ax for PRTF format string.
+            # Neural IMM works but we need _last_ax set so PSH can store correct pointer.
+            Opcode.IMM: self._handler_imm,
             # Opcode.LEA: self._handler_lea,
             # TEMPORARY: Re-enable JSR handler - neural version not working
             Opcode.JSR: self._handler_jsr,
-            # REMOVED 2026-04-09: ENT now works fully neurally (L6/L7/L8/L9 implementation complete)
-            # Neural path: L7 head 1 gathers SP, L8/L9 compute SP -= (8+imm), L6 writes result
-            # Opcode.ENT: self._handler_ent,
+            # FIX 2026-04-16: JMP/BZ/BNZ need handlers because neural FETCH
+            # is only available for first step (L5 head 3 uses fixed address)
+            Opcode.JMP: self._handler_jmp,
+            Opcode.BZ: self._handler_bz,
+            Opcode.BNZ: self._handler_bnz,
+            # RE-ENABLED 2026-04-15: ENT handler needed to inject correct MEM section for L15/LEV
+            # Neural ENT generates wrong addresses in MEM tokens (soft encoding issue)
+            # Handler injects correct MEM section so L15 can find saved_bp during LEV
+            Opcode.ENT: self._handler_ent,
+            # PARTIAL 2026-04-16: Neural LEV correctly computes PC (return_addr via L15),
+            # but SP/BP restoration fails (L16 FFN outputs 0). Handler needed for SP/BP.
             Opcode.LEV: self._handler_lev,
-            # REMOVED: PSH now works fully neurally (L6 FFN SP -= 8)
-            # Opcode.PSH: self._handler_psh,
+            # RE-ENABLED: PSH handler needed to track shadow memory for PRTF format string
+            Opcode.PSH: self._handler_psh,
             # REMOVED: Arithmetic operations now work fully neurally (L8-L10 ALU)
             # Opcode.ADD: self._handler_add,
             # Opcode.SUB: self._handler_sub,
@@ -286,8 +295,8 @@ class AutoregressiveVMRunner:
         self._tool_handler = tool_handler
         self._tool_call_id = 0
         self._last_pc = None
-        self._last_bp = 0
-        self._last_sp = 0
+        self._last_bp = 0x10000  # Initial BP (same as model embedding STACK_INIT)
+        self._last_sp = 0x10000  # Initial SP (same as model embedding STACK_INIT)
         self._mem_history = {}  # addr → 9-token MEM section (latest wins)
         self.model.embed.set_mem_history_end(0)  # reset stale boundary from prior runs
         self._pure_attention_report = {
@@ -325,12 +334,16 @@ class AutoregressiveVMRunner:
 
         step_num = 0  # Track VM steps for conversational I/O handling
 
-        # Context windowing prevents O(n²) blowup: keep last 512 tokens for generation
-        # Sufficient for VM state tracking while bounding complexity to O(window_size)
+        # Context windowing prevents O(n²) blowup while preserving CODE section.
+        # The CODE section (bytecode) is needed for L5 fetch heads to read instructions.
+        # Keep prefix (CODE + DATA) + last 512 tokens of dynamic content (MEM + steps).
         for i in range(max_steps * Token.STEP_TOKENS):
-            # Apply context windowing to prevent O(n²) blowup
-            # Keep last 512 tokens for generation (sufficient for VM state)
-            generation_context = context[-512:] if len(context) > 512 else context
+            # Apply context windowing preserving prefix (CODE/DATA sections)
+            # Without prefix, model can't attend to bytecode for instruction fetch
+            if len(context) > prefix_len + 512:
+                generation_context = context[:prefix_len] + context[-512:]
+            else:
+                generation_context = context
             next_token = self.model.generate_next(generation_context, use_incremental=False)
             context.append(next_token)
 
@@ -345,11 +358,17 @@ class AutoregressiveVMRunner:
 
             # Hybrid conversational I/O: handle THINKING_END
             if self.conversational_io and next_token == Token.THINKING_END:
-                print(f"[HYBRID] THINKING_END detected at step {step_num}, context len={len(context)}")
-                # Extract format string pointer from STACK0
+                exec_pc = self._exec_pc()
+                # Extract format string pointer from STACK0 (model output)
                 fmt_ptr = self._extract_register(context, Token.STACK0)
-                print(f"[HYBRID] Format string pointer: 0x{fmt_ptr:08x}" if fmt_ptr else "[HYBRID] Format string pointer: 0x00000000")
-                if fmt_ptr is not None:
+                # FALLBACK: If model outputs 0, read from shadow memory at SP
+                # The format string pointer was pushed to stack before PRTF
+                if not fmt_ptr:
+                    fmt_ptr = self._mem_load_word(self._last_sp)
+                    print(f"[HYBRID] Format ptr from shadow memory at SP=0x{self._last_sp:08x}: 0x{fmt_ptr:08x}")
+                else:
+                    print(f"[HYBRID] Format string pointer: 0x{fmt_ptr:08x}")
+                if fmt_ptr:
                     # Read format string from memory
                     fmt_str = []
                     addr = fmt_ptr
@@ -364,16 +383,34 @@ class AutoregressiveVMRunner:
                     print(f"[HYBRID] Format string: {bytes(fmt_str)}")
                     for byte_val in fmt_str:
                         context.append(byte_val)
+                        output.append(chr(byte_val))  # Convert to char for output buffer
 
                     # Emit THINKING_START to resume execution
                     context.append(Token.THINKING_START)
-                    print(f"[HYBRID] Emitted {len(fmt_str)} bytes + THINKING_START")
+
+                    # Calculate post-PRTF state:
+                    # - PC advances to next instruction
+                    # - SP pops the format string pointer argument
+                    new_pc = exec_pc + INSTR_WIDTH
+                    new_sp = (self._last_sp + 8) & 0xFFFFFFFF
+                    stack0_val = self._mem_load_word(new_sp) if new_sp else 0
+
+                    # Inject synthetic step with correct state
+                    self._inject_synthetic_step(
+                        context, new_pc, self._last_ax, new_sp, self._last_bp, stack0_val
+                    )
+
+                    # Update runner state
+                    self._last_pc = new_pc
+                    self._last_sp = new_sp
+
+                    print(f"[HYBRID] Emitted {len(fmt_str)} bytes + THINKING_START + synthetic step (PC=0x{new_pc:04x}, SP=0x{new_sp:08x})")
                 continue
 
             if next_token == Token.STEP_END:
                 if step_num < 3:
                     step_num += 1  # Increment step counter
-                # Extract PC and dispatch syscall handler
+                # Extract PC and identify opcodes
                 op = None
                 instr_idx = None
                 if step_num <= 3:
@@ -393,6 +430,46 @@ class AutoregressiveVMRunner:
                                 exec_opname = name
                                 break
 
+                # BUG FIX 2026-04-16: Dispatch func_call_handlers BEFORE syscall_handlers.
+                # func_call_handlers process the CURRENT instruction (exec_pc) and set
+                # _last_ax correctly. syscall_handlers process the NEXT instruction (output pc)
+                # and may read _last_ax. If syscall runs first, _last_ax gets clobbered.
+                # Example: PSH step - handler should set STACK0=_last_ax, but _syscall_prtf
+                # (for next instruction) was running first and setting _last_ax=0.
+
+                # Dispatch function-call handlers FIRST (use exec_pc, current instruction)
+                exec_op = None
+                exec_idx = self._exec_pc() // INSTR_WIDTH
+                if 0 <= exec_idx < len(bytecode):
+                    exec_op = bytecode[exec_idx] & 0xFF
+                    func_handler = self._func_call_handlers.get(exec_op)
+                    if func_handler:
+                        func_handler(context, output)
+                    else:
+                        # Generic PC advancement for opcodes without handlers
+                        # SKIP for opcodes that handle PC themselves or have handlers
+                        # func_call_handlers handle their own PC advancement
+                        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT, Opcode.LEV}
+                        opcodes_with_pc_handling.update(self._func_call_handlers.keys())
+                        if exec_op not in opcodes_with_pc_handling:
+                            # Model doesn't advance PC neurally for all opcodes, so we do it here
+                            exec_pc = self._exec_pc()
+                            next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+                            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+                    # BUG FIX 2026-04-16: Override BP for opcodes that don't modify it.
+                    # Only ENT and LEV actually modify BP. All other opcodes should
+                    # preserve _last_bp. Without this, model's wrong BP output persists
+                    # and corrupts L9's BP+8 address calculation for LEV.
+                    # NOTE: Moved outside if/else so it runs even when handler exists.
+                    # Handlers like IMM don't override BP, leaving model's wrong value.
+                    BP_MODIFYING_OPS = {Opcode.ENT, Opcode.LEV}
+                    if exec_op not in BP_MODIFYING_OPS:
+                        if hasattr(self, '_debug_memory') and self._debug_memory:
+                            old_bp = self._extract_register(context, Token.REG_BP)
+                            print(f"[BP OVERRIDE] op=0x{exec_op:02x}, old_bp=0x{old_bp:08x}, new_bp=0x{self._last_bp:08x}", flush=True)
+                        self._override_register_in_last_step(context, Token.REG_BP, self._last_bp)
+
+                # Dispatch syscall_handlers AFTER func_call_handlers (uses output pc for NEXT instruction)
                 if pc is not None:
                     instr_idx = pc // INSTR_WIDTH
                     if 0 <= instr_idx < len(bytecode):
@@ -405,61 +482,12 @@ class AutoregressiveVMRunner:
                                 handler(context, output)
                                 if op in _TOOL_CALL_OPS:
                                     self._record_pure_attention("external_tool_ops", op)
-                        # Transitional runner SP byte corrections for fallback
-                        # execution. Disabled in pure-attention mode.
-                        if not self.pure_attention_memory:
-                            pass  # All SP corrections now handled neurally
-                            # REMOVED: Binary pop SP += 8 correction (now handled neurally in L6 FFN)
-                            # Neural implementation at vm_step.py:6015-6066 handles multi-byte carry
-                            # if op in _BINARY_POP_OPS:
-                            #     new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-                            #     self._override_register_in_last_step(
-                            #         context, Token.REG_SP, new_sp
-                            #     )
-
-                            # REMOVED: PSH SP -= 8 correction (now handled neurally in L6 FFN)
-                            # Neural implementation at vm_step.py:3615-3641 handles multi-byte borrow
-                            # if op == Opcode.PSH:
-                            #     new_sp = (self._last_sp - 8) & 0xFFFFFFFF
-                            #     self._override_register_in_last_step(
-                            #         context, Token.REG_SP, new_sp
-                            #     )
-
-                            # REMOVED: ADJ SP multi-byte correction (now handled neurally)
-                            # Neural implementation at vm_step.py L7/L8/L9/L6 via LEA pattern
-                            # if op == Opcode.ADJ:
-                            #     instr = bytecode[instr_idx]
-                            #     imm = instr >> 8
-                            #     if imm >= 0x800000:
-                            #         imm -= 0x1000000
-                            #     new_sp = (self._last_sp + imm) & 0xFFFFFFFF
-                            #     self._override_register_in_last_step(
-                            #         context, Token.REG_SP, new_sp
-                            #     )
                         # Track memory writes AFTER handler (handler may override SP/STACK0)
                         if self._should_block_track_memory(op):
                             self._record_pure_attention("blocked_track_memory_ops", op)
                         else:
                             self._track_memory_write(context, op)
-                # Dispatch function-call handlers (use exec_pc, not output pc)
-                exec_op = None
-                exec_idx = self._exec_pc() // INSTR_WIDTH
-                if 0 <= exec_idx < len(bytecode):
-                    exec_op = bytecode[exec_idx] & 0xFF
-                    func_handler = self._func_call_handlers.get(exec_op)
-                    if func_handler:
-                        func_handler(context, output)
-                    else:
-                        # Generic PC advancement for opcodes without handlers
-                        # SKIP for opcodes that handle PC themselves or have handlers
-                        # func_call_handlers handle their own PC advancement
-                        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT}
-                        opcodes_with_pc_handling.update(self._func_call_handlers.keys())
-                        if exec_op not in opcodes_with_pc_handling:
-                            # Model doesn't advance PC neurally for all opcodes, so we do it here
-                            exec_pc = self._exec_pc()
-                            next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-                            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
                 # Update SP/BP/PC tracking (prefer deterministic SP evolution)
                 if 0 <= exec_idx < len(bytecode):
                     # CRITICAL: Extract BP for ENT/LEV (they actually modify BP)
@@ -535,13 +563,17 @@ class AutoregressiveVMRunner:
                     self.model.set_active_opcode(None)
 
                 # Capture MEM section from store ops for L15 memory lookup
-                if op in _MEM_STORE_OPS:
+                # BUG FIX 2026-04-16: Use exec_op (currently executing opcode), not op (next opcode).
+                # Old code captured MEM based on next instruction, causing garbage in mem_history.
+                # Note: Handlers already inject correct MEM via _inject_mem_section, so this
+                # capture is only needed for opcodes without handlers (SI/SC neural path).
+                if exec_op in _MEM_STORE_OPS and exec_op not in self._func_call_handlers:
                     mem_section = self._extract_mem_section(context)
                     if mem_section is not None:
                         addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
                         value = sum((mem_section[5 + j] & 0xFF) << (j * 8) for j in range(4))
                         if self._debug_memory:
-                            opname = _OPCODE_NAME.get(op, f"OP{op}")
+                            opname = _OPCODE_NAME.get(exec_op, f"OP{exec_op}")
                             print(f"[MEM STORE] {opname} at 0x{addr:08x} = 0x{value:08x}, captured MEM section", flush=True)
                         self._mem_history[addr] = mem_section
 
@@ -588,13 +620,18 @@ class AutoregressiveVMRunner:
                         # Generic PC advancement for opcodes without handlers
                         # SKIP for opcodes that handle PC themselves or have handlers
                         # func_call_handlers handle their own PC advancement
-                        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT}
+                        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT, Opcode.LEV}
                         opcodes_with_pc_handling.update(self._func_call_handlers.keys())
                         if exec_op not in opcodes_with_pc_handling:
                             # Model doesn't advance PC neurally for all opcodes, so we do it here
                             exec_pc = self._exec_pc()
                             next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
                             self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+                    # BUG FIX 2026-04-16: Override BP for opcodes that don't modify it.
+                    # Moved outside if/else so it runs even when handler exists.
+                    BP_MODIFYING_OPS = {Opcode.ENT, Opcode.LEV}
+                    if exec_op not in BP_MODIFYING_OPS:
+                        self._override_register_in_last_step(context, Token.REG_BP, self._last_bp)
                 # Update SP/BP/PC tracking (prefer deterministic SP evolution)
                 if 0 <= exec_idx < len(bytecode):
                     if exec_op in self._func_call_handlers:
@@ -635,13 +672,17 @@ class AutoregressiveVMRunner:
                     self.model.set_active_opcode(None)
 
                 # Capture MEM section from store ops for L15 memory lookup
-                if op in _MEM_STORE_OPS:
+                # BUG FIX 2026-04-16: Use exec_op (currently executing opcode), not op (next opcode).
+                # Old code captured MEM based on next instruction, causing garbage in mem_history.
+                # Note: Handlers already inject correct MEM via _inject_mem_section, so this
+                # capture is only needed for opcodes without handlers (SI/SC neural path).
+                if exec_op in _MEM_STORE_OPS and exec_op not in self._func_call_handlers:
                     mem_section = self._extract_mem_section(context)
                     if mem_section is not None:
                         addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
                         value = sum((mem_section[5 + j] & 0xFF) << (j * 8) for j in range(4))
                         if self._debug_memory:
-                            opname = _OPCODE_NAME.get(op, f"OP{op}")
+                            opname = _OPCODE_NAME.get(exec_op, f"OP{exec_op}")
                             print(f"[MEM STORE] {opname} at 0x{addr:08x} = 0x{value:08x}, captured MEM section", flush=True)
                         self._mem_history[addr] = mem_section
 
@@ -808,6 +849,40 @@ class AutoregressiveVMRunner:
                     context[i + 1 + j] = (value >> (j * 8)) & 0xFF
                 return
 
+    def _inject_synthetic_step(self, context, pc, ax, sp, bp, stack0=0):
+        """Inject a complete synthetic step into context.
+
+        Used after PRTF handling to resume execution with correct state.
+        Format: [REG_PC, b0..b3, REG_AX, b0..b3, REG_SP, b0..b3,
+                 REG_BP, b0..b3, STACK0, b0..b3, MEM, b0..b8, STEP_END]
+        """
+        # PC: 5 tokens
+        context.append(Token.REG_PC)
+        for i in range(4):
+            context.append((pc >> (i * 8)) & 0xFF)
+        # AX: 5 tokens
+        context.append(Token.REG_AX)
+        for i in range(4):
+            context.append((ax >> (i * 8)) & 0xFF)
+        # SP: 5 tokens
+        context.append(Token.REG_SP)
+        for i in range(4):
+            context.append((sp >> (i * 8)) & 0xFF)
+        # BP: 5 tokens
+        context.append(Token.REG_BP)
+        for i in range(4):
+            context.append((bp >> (i * 8)) & 0xFF)
+        # STACK0: 5 tokens
+        context.append(Token.STACK0)
+        for i in range(4):
+            context.append((stack0 >> (i * 8)) & 0xFF)
+        # MEM: 9 tokens (marker + 8 bytes, all zeros for no-op)
+        context.append(Token.MEM)
+        for _ in range(8):
+            context.append(0)
+        # STEP_END
+        context.append(Token.STEP_END)
+
     def _extract_stack0(self, context):
         """Extract 32-bit STACK0 (*sp) value from the last completed step."""
         return self._extract_register(context, Token.STACK0)
@@ -860,6 +935,33 @@ class AutoregressiveVMRunner:
         value = value & 0xFFFFFFFF
         for i in range(4):
             self._memory[addr + i] = (value >> (i * 8)) & 0xFF
+
+    def _inject_mem_section(self, addr, value):
+        """Inject a MEM section into _mem_history for L15 lookup.
+
+        This bridges the gap between handler-corrected memory and neural L15:
+        - Handlers know the correct addr/value (from tracking state)
+        - L15 reads from MEM sections in context (which may have wrong neural output)
+        - This injects a corrected MEM section so L15 can find the right data
+
+        MEM section format: [MEM, a0, a1, a2, a3, v0, v1, v2, v3]
+        """
+        addr = addr & 0xFFFFFFFF
+        value = value & 0xFFFFFFFF
+        mem_section = [
+            Token.MEM,
+            (addr >> 0) & 0xFF,
+            (addr >> 8) & 0xFF,
+            (addr >> 16) & 0xFF,
+            (addr >> 24) & 0xFF,
+            (value >> 0) & 0xFF,
+            (value >> 8) & 0xFF,
+            (value >> 16) & 0xFF,
+            (value >> 24) & 0xFF,
+        ]
+        self._mem_history[addr] = mem_section
+        if self._debug_memory:
+            print(f"  [MEM INJECT] addr=0x{addr:08x}, value=0x{value:08x}", flush=True)
 
     def _mem_load_word(self, addr):
         """Load a 32-bit value from 4 little-endian bytes in shadow memory."""
@@ -1509,10 +1611,9 @@ class AutoregressiveVMRunner:
         # Return address is the instruction AFTER JSR
         return_addr = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
 
-        # Read current SP from the just-generated step (not _last_sp which may be stale)
-        current_sp = self._extract_register(context, Token.REG_SP)
-        if current_sp is None:
-            current_sp = self._last_sp
+        # CRITICAL: Use _last_sp, not model output!
+        # Model outputs garbage SP values. Runner tracks canonical SP.
+        current_sp = self._last_sp
         new_sp = (current_sp - 8) & 0xFFFFFFFF
 
 
@@ -1524,8 +1625,9 @@ class AutoregressiveVMRunner:
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
         self._override_register_in_last_step(context, Token.STACK0, return_addr)
         self._override_register_in_last_step(context, Token.REG_PC, target)
-        # Store return address in shadow memory
+        # Store return address in shadow memory AND inject MEM section for L15
         self._mem_store_word(new_sp, return_addr)
+        self._inject_mem_section(new_sp, return_addr)
 
     def _handler_ent(self, context, output):
         """ENT -- allocate local variables (MINIMAL HANDLER).
@@ -1550,10 +1652,11 @@ class AutoregressiveVMRunner:
         if imm >= 0x800000:
             imm -= 0x1000000
 
-        # Read SP from model output (BP and STACK0 are handled neurally)
-        current_sp = self._extract_register(context, Token.REG_SP)
-        if current_sp is None:
-            current_sp = self._last_sp
+        # CRITICAL: Use _last_sp, not model output!
+        # Model doesn't correctly track SP across function call sequences.
+        # After JSR pushes return address (SP-=8), model outputs wrong SP value
+        # because it doesn't see the JSR handler's override in its own step's context.
+        current_sp = self._last_sp
 
         # ENT semantics: push BP, set BP=SP, allocate locals
         # Neural implementation should set BP = old_SP - 8 (after push)
@@ -1565,12 +1668,21 @@ class AutoregressiveVMRunner:
         if hasattr(self, '_debug_ent') and self._debug_ent:
             print(f"[ENT] PC={exec_pc}, imm={imm}, old_bp=0x{old_bp:08x}, current_sp=0x{current_sp:08x}, new_bp=0x{new_bp:08x}, new_sp=0x{new_sp:08x}", flush=True)
 
-        # Store old BP in shadow memory (neural should do this via STACK0/MEM, but ensure it's there)
+        # Store old BP in shadow memory AND inject MEM section for L15
         self._mem_store_word(current_sp - 8, old_bp)
+        self._inject_mem_section(current_sp - 8, old_bp)
 
-        # Override SP and BP
+        # Override SP, BP, and PC
+        # BUG FIX 2026-04-16: ENT handler must also override PC to next instruction.
+        # The runner assumes handlers override PC (else branch in line 454 is skipped),
+        # but ENT didn't override PC, causing model's wrong PC=0 to persist.
         self._override_register_in_last_step(context, Token.REG_SP, new_sp)
         self._override_register_in_last_step(context, Token.REG_BP, new_bp)
+        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+        # Track BP for LEV
+        self._last_bp = new_bp
 
     def _handler_lev(self, context, output):
         """LEV -- restore frame, return.
@@ -1605,6 +1717,68 @@ class AutoregressiveVMRunner:
         # STACK0 = *new_sp (top of stack after restoring frame)
         stack0_val = self._mem_load_word(new_sp)
         self._override_register_in_last_step(context, Token.STACK0, stack0_val)
+
+    def _handler_jmp(self, context, output):
+        """JMP -- unconditional jump to target.
+
+        Sets PC to the immediate value (jump target address).
+        This handler is needed because L5 head 3 fetches FETCH only for the
+        first step (uses fixed address PC_OFFSET+1=3), so neural JMP fails
+        for non-first steps.
+        """
+        exec_pc = self._exec_pc()
+        exec_idx = exec_pc // INSTR_WIDTH
+        if exec_idx < 0 or exec_idx >= len(self._bytecode):
+            return
+        instr = self._bytecode[exec_idx]
+        target = instr >> 8  # Jump target PC value
+        self._override_register_in_last_step(context, Token.REG_PC, target)
+
+    def _handler_bz(self, context, output):
+        """BZ -- branch if zero.
+
+        If AX == 0, set PC to target; else PC += INSTR_WIDTH.
+        """
+        exec_pc = self._exec_pc()
+        exec_idx = exec_pc // INSTR_WIDTH
+        if exec_idx < 0 or exec_idx >= len(self._bytecode):
+            return
+        instr = self._bytecode[exec_idx]
+        target = instr >> 8  # Branch target PC value
+
+        # Get AX value to check condition
+        ax = self._extract_register(context, Token.REG_AX)
+        if ax is None:
+            ax = self._last_ax
+
+        if ax == 0:
+            self._override_register_in_last_step(context, Token.REG_PC, target)
+        else:
+            next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+    def _handler_bnz(self, context, output):
+        """BNZ -- branch if not zero.
+
+        If AX != 0, set PC to target; else PC += INSTR_WIDTH.
+        """
+        exec_pc = self._exec_pc()
+        exec_idx = exec_pc // INSTR_WIDTH
+        if exec_idx < 0 or exec_idx >= len(self._bytecode):
+            return
+        instr = self._bytecode[exec_idx]
+        target = instr >> 8  # Branch target PC value
+
+        # Get AX value to check condition
+        ax = self._extract_register(context, Token.REG_AX)
+        if ax is None:
+            ax = self._last_ax
+
+        if ax != 0:
+            self._override_register_in_last_step(context, Token.REG_PC, target)
+        else:
+            next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
 
     def _decode_exit_code(self, context):
         """Extract exit code from the last REG_AX before HALT."""
