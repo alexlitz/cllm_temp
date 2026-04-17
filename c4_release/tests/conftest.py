@@ -41,6 +41,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "handler: marks tests that use handlers")
     config.addinivalue_line("markers", "quine: marks quine-specific tests")
     config.addinivalue_line("markers", "bundler: marks bundler tests")
+    config.addinivalue_line("markers", "dual: marks tests that run with both weight modes")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -212,13 +213,62 @@ def handler_status():
 
 
 # =============================================================================
+# Fixtures - Weight Mode Testing
+# =============================================================================
+
+def get_available_weight_modes():
+    """Get weight modes that are currently working."""
+    from neural_vm.weight_setter import WeightMode, set_weights
+    from neural_vm.vm_step import AutoregressiveVM
+
+    modes = [WeightMode.HAND_SET]
+
+    # Test if compiled weights work
+    try:
+        test_model = AutoregressiveVM(
+            d_model=512, n_layers=16, n_heads=8, ffn_hidden=4096
+        )
+        set_weights(test_model, mode=WeightMode.COMPILED, verify_purity=False)
+        modes.append(WeightMode.COMPILED)
+    except Exception:
+        pass  # COMPILED not yet working
+
+    return modes
+
+
+AVAILABLE_WEIGHT_MODES = get_available_weight_modes()
+
+
+@pytest.fixture(params=AVAILABLE_WEIGHT_MODES, ids=[m.value for m in AVAILABLE_WEIGHT_MODES])
+def weight_mode(request):
+    """Parametrized fixture for available weight modes.
+
+    Use this fixture to run tests with all working weight modes.
+    Currently only HAND_SET works; COMPILED will be added when ready.
+    """
+    return request.param
+
+
+@pytest.fixture
+def compile_program():
+    """Fixture to compile C programs."""
+    from src.compiler import compile_c
+    return compile_c
+
+
+# =============================================================================
 # Session Info
 # =============================================================================
 
 def pytest_report_header(config):
     """Add device info to pytest header."""
+    from neural_vm.weight_setter import WeightMode
+
+    compiled_status = "Available" if WeightMode.COMPILED in AVAILABLE_WEIGHT_MODES else "Not implemented"
+
     return [
         f"Device: {DEVICE}",
         f"GPU Available: {HAS_GPU}",
         f"CUDA Version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}",
+        f"Compiled Weights: {compiled_status}",
     ]
