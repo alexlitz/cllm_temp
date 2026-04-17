@@ -139,7 +139,8 @@ class TestQuineExecution:
         from src.compiler import compile_c
         return compile_c
 
-    @pytest.mark.skip(reason="Slow test - requires ~50000 neural VM steps")
+    @pytest.mark.slow
+    @pytest.mark.quine
     def test_quine_runs_without_error(self, compile_program):
         """Quine executes without error in neural VM."""
         from neural_vm.batch_runner import BatchedSpeculativeRunner
@@ -156,7 +157,8 @@ class TestQuineExecution:
         output, exit_code = results[0]
         assert exit_code == 0
 
-    @pytest.mark.skip(reason="Slow test - requires ~50000 neural VM steps")
+    @pytest.mark.slow
+    @pytest.mark.quine
     def test_quine_produces_output(self, compile_program):
         """Quine produces output."""
         from neural_vm.batch_runner import BatchedSpeculativeRunner
@@ -175,7 +177,8 @@ class TestQuineExecution:
         assert output is not None
         assert len(output) > 100  # Substantial output
 
-    @pytest.mark.skip(reason="Slow test - requires ~50000 neural VM steps")
+    @pytest.mark.slow
+    @pytest.mark.quine
     def test_quine_self_replicates(self, compile_program):
         """Quine output matches its source (self-replication)."""
         from neural_vm.batch_runner import BatchedSpeculativeRunner
@@ -201,6 +204,71 @@ class TestQuineExecution:
         # Output should exactly match source (self-replication)
         assert output_str == source, \
             f"Quine output doesn't match source.\nFirst 100 chars of diff:\nOutput: {output_str[:100]}\nSource: {source[:100]}"
+
+    @pytest.mark.slow
+    @pytest.mark.quine
+    def test_quine_output_compiles(self, compile_program):
+        """Quine output can be re-compiled."""
+        from neural_vm.batch_runner import BatchedSpeculativeRunner
+
+        with open("cllm/quine_cllm.c") as f:
+            source = f.read()
+
+        bytecode, data = compile_program(source)
+
+        runner = BatchedSpeculativeRunner(batch_size=1)
+        results = runner.run_batch([bytecode], [data], max_steps=50000)
+
+        output, exit_code = results[0]
+
+        # Convert output bytes to string
+        if isinstance(output, list):
+            output_str = ''.join(chr(b) for b in output if 0 <= b < 256)
+        elif isinstance(output, bytes):
+            output_str = output.decode('latin-1')
+        else:
+            output_str = str(output)
+
+        # Output should be compilable
+        bytecode2, data2 = compile_program(output_str)
+        assert len(bytecode2) > 0, "Quine output should compile to valid bytecode"
+
+    @pytest.mark.slow
+    @pytest.mark.quine
+    def test_quine_second_generation(self, compile_program):
+        """Quine output, when run, produces same output (transitivity)."""
+        from neural_vm.batch_runner import BatchedSpeculativeRunner
+
+        with open("cllm/quine_cllm.c") as f:
+            source = f.read()
+
+        # First generation
+        bytecode1, data1 = compile_program(source)
+        runner = BatchedSpeculativeRunner(batch_size=1)
+        results1 = runner.run_batch([bytecode1], [data1], max_steps=50000)
+        output1, _ = results1[0]
+
+        if isinstance(output1, list):
+            output1_str = ''.join(chr(b) for b in output1 if 0 <= b < 256)
+        elif isinstance(output1, bytes):
+            output1_str = output1.decode('latin-1')
+        else:
+            output1_str = str(output1)
+
+        # Second generation
+        bytecode2, data2 = compile_program(output1_str)
+        results2 = runner.run_batch([bytecode2], [data2], max_steps=50000)
+        output2, _ = results2[0]
+
+        if isinstance(output2, list):
+            output2_str = ''.join(chr(b) for b in output2 if 0 <= b < 256)
+        elif isinstance(output2, bytes):
+            output2_str = output2.decode('latin-1')
+        else:
+            output2_str = str(output2)
+
+        # Second generation output should match first
+        assert output1_str == output2_str, "Quine should be transitive"
 
 
 class TestQuineBundlerExists:
