@@ -1,0 +1,172 @@
+[project]
+name = "c4-neural-vm"
+version = "1.0.0"
+description = "Neural VM that executes C4 bytecode using a pure autoregressive transformer"
+readme = "docs/README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "C4 Team"}
+]
+keywords = ["neural-network", "transformer", "virtual-machine", "compiler"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.0.0",  # Parallel test execution
+    "ruff>=0.3.0",
+    "black>=24.0.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+]
+onnx = [
+    "onnx>=1.14.0",
+    "onnxruntime>=1.15.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/c4-neural-vm/c4"
+Documentation = "https://github.com/c4-neural-vm/c4/docs"
+Repository = "https://github.com/c4-neural-vm/c4"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["neural_vm*", "src*", "bundler*"]
+
+# =============================================================================
+# Ruff - Fast Python linter
+# =============================================================================
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E731",   # lambda assignment (used in weight setting)
+    "B008",   # function call in default arg (used in fixtures)
+    "SIM108", # ternary instead of if-else (readability)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B", "SIM"]  # Less strict in tests
+"debug_archive/*" = ["ALL"]  # Ignore archived debug scripts
+"test_archive/*" = ["ALL"]  # Ignore archived test scripts
+
+[tool.ruff.lint.isort]
+known-first-party = ["neural_vm", "src", "bundler"]
+
+# =============================================================================
+# Black - Code formatter
+# =============================================================================
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+    | \.mypy_cache
+    | \.pytest_cache
+    | __pycache__
+    | debug_archive
+    | test_archive
+    | archive
+    | old
+    | build
+)/
+'''
+
+# =============================================================================
+# Mypy - Static type checker
+# =============================================================================
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+exclude = [
+    "debug_archive/",
+    "test_archive/",
+    "archive/",
+    "old/",
+    "build/",
+]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
+# =============================================================================
+# Pytest
+# =============================================================================
+[tool.pytest.ini_options]
+testpaths = ["tests", "neural_vm/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (skip with -m 'not slow')",
+    "gpu: marks tests that require GPU",
+    "neural: marks tests that test pure neural execution",
+    "handler: marks tests that use handlers",
+    "quine: marks quine-specific tests",
+    "bundler: marks bundler tests",
+    "dual: marks tests that run with both weight modes",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+# =============================================================================
+# Coverage
+# =============================================================================
+[tool.coverage.run]
+source = ["neural_vm", "src", "bundler"]
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "debug_archive/*",
+    "test_archive/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

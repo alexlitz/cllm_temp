@@ -1,0 +1,65 @@
+# Pre-commit hooks for C4 Neural VM
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # Ruff - Fast Python linter and formatter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.3.4
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        exclude: ^(debug_archive|test_archive|archive|old)/
+      - id: ruff-format
+        exclude: ^(debug_archive|test_archive|archive|old)/
+
+  # Black - Code formatter (backup, ruff-format is primary)
+  # - repo: https://github.com/psf/black
+  #   rev: 24.3.0
+  #   hooks:
+  #     - id: black
+  #       exclude: ^(debug_archive|test_archive|archive|old)/
+
+  # Standard pre-commit hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(debug_archive|test_archive|archive|old)/
+      - id: end-of-file-fixer
+        exclude: ^(debug_archive|test_archive|archive|old)/
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: debug-statements
+        exclude: ^(debug_archive|test_archive|archive|old|neural_vm/debug)/
+
+  # Check for common security issues
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.8
+    hooks:
+      - id: bandit
+        args: [-c, pyproject.toml, --quiet]
+        additional_dependencies: ["bandit[toml]"]
+        exclude: ^(debug_archive|test_archive|archive|old|tests)/
+
+  # Validate pyproject.toml
+  - repo: https://github.com/abravalheri/validate-pyproject
+    rev: v0.16
+    hooks:
+      - id: validate-pyproject
+
+# CI configuration
+ci:
+  autofix_commit_msg: |
+    [pre-commit.ci] auto fixes from pre-commit hooks
+  autofix_prs: true
+  autoupdate_branch: ''
+  autoupdate_commit_msg: '[pre-commit.ci] pre-commit autoupdate'
+  autoupdate_schedule: weekly
+  skip: []
+  submodules: false
