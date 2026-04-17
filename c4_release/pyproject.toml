@@ -30,6 +30,8 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",  # Parallel test execution
+    "pytest-benchmark>=4.0.0",  # Performance benchmarks
+    "hypothesis>=6.0.0",  # Property-based testing
     "ruff>=0.3.0",
     "black>=24.0.0",
     "mypy>=1.0.0",
@@ -144,6 +146,8 @@ markers = [
     "quine: marks quine-specific tests",
     "bundler: marks bundler tests",
     "dual: marks tests that run with both weight modes",
+    "benchmark: marks performance benchmark tests",
+    "property: marks property-based tests (hypothesis)",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
