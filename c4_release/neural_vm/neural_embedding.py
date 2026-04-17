@@ -74,6 +74,9 @@ class NeuralVMEmbedding(nn.Module):
         # Inject THINKING_START/END markers for lookback detection
         self._inject_thinking_markers(token_ids, x)
 
+        # Inject initial PC value for step 0 (no previous step to carry from)
+        self._inject_initial_pc(token_ids, x)
+
         # Unified memory: either autoregressive inference or external hints
         if self._autoregressive_exec:
             self._inject_mem_exec_autoregressive(token_ids, x)
@@ -189,6 +192,9 @@ class NeuralVMEmbedding(nn.Module):
         For conversational I/O: exposes the MoE routing signal globally so
         L5 FFN can detect PRTF/READ opcodes reliably.
 
+        For LEV: sets OP_LEV at all positions so L15 heads 8-11 can do
+        return_addr lookup at PC marker (which comes before AX marker).
+
         Args:
             x: [batch, seq, d_model] embedding tensor (modified in-place)
             active_opcode: Current opcode value (0-255)
@@ -199,6 +205,28 @@ class NeuralVMEmbedding(nn.Module):
             x[:, :, BD.ACTIVE_OPCODE_PRTF] = 1.0
         elif active_opcode == 31:  # READ = 0x1F
             x[:, :, BD.ACTIVE_OPCODE_READ] = 1.0
+        elif active_opcode == 8:  # LEV = 0x08
+            # FIX 2026-04-15: Set OP_LEV at all positions for L15 memory lookup
+            # at PC marker. OP_LEV must be ~5.0 to match L5 FFN decode output.
+            x[:, :, BD.OP_LEV] = 5.0
+        elif active_opcode == 4:  # BZ = 0x04
+            # FIX 2026-04-16: Set OP_BZ at all positions for L6 Head 4 gating.
+            # Without this, the BZ/BNZ relay head fires for ALL opcodes,
+            # writing FETCH to TEMP which overlaps OUTPUT_BYTE and corrupts PC.
+            x[:, :, BD.OP_BZ] = 5.0
+        elif active_opcode == 5:  # BNZ = 0x05
+            # FIX 2026-04-16: Set OP_BNZ at all positions for L6 Head 4 gating.
+            x[:, :, BD.OP_BNZ] = 5.0
+        elif active_opcode == 6:  # ENT = 0x06
+            # FIX 2026-04-17: Set OP_ENT at all positions for L5 attention relay
+            # (BP→TEMP at STACK0, SP→TEMP at BP) and L6 FFN ENT units.
+            # OP_ENT must be ~5.0 to match L5 FFN decode output scale.
+            x[:, :, BD.OP_ENT] = 5.0
+
+        # NOTE: POP group injection disabled for now - needs more work.
+        # The L6 head 6 relay expects OP_* = 5.0 at AX marker, but L9 FFN CARRY
+        # units use OP_* in gate term causing explosions. Need to find a clean solution.
+        pass
 
     def _inject_thinking_markers(self, token_ids, x):
         """Inject THINKING_START and THINKING_END markers for lookback detection.
@@ -220,6 +248,46 @@ class NeuralVMEmbedding(nn.Module):
                     x[b, i, BD.MARK_THINKING_START] = 1.0
                 elif tok == Token.THINKING_END:
                     x[b, i, BD.MARK_THINKING_END] = 1.0
+
+    def _inject_initial_pc(self, token_ids, x):
+        """Inject initial PC value for step 0's PC marker.
+
+        Problem: L3 attention relays previous step's PC OUTPUT to current step's
+        PC marker via EMBED_LO/EMBED_HI. But step 0 has no previous step, so
+        EMBED_LO/EMBED_HI are empty. This causes incorrect PC output for step 0.
+
+        Solution: For the FIRST REG_PC marker in the context (step 0), inject
+        the initial PC value (PC_OFFSET=2) into EMBED_LO/EMBED_HI.
+
+        Detection: Step 0's REG_PC is the first REG_PC token in the context.
+        Subsequent REG_PC tokens (step 1+) get their values from L3 relay.
+
+        Args:
+            token_ids: [batch, seq] tensor of token IDs
+            x: [batch, seq, d_model] embedding tensor (modified in-place)
+        """
+        from .vm_step import _SetDim as BD, Token
+        from .constants import PC_OFFSET
+
+        # Initial PC for step 0 = PC_OFFSET = 2
+        initial_pc = PC_OFFSET
+
+        B, S = token_ids.shape
+        for b in range(B):
+            first_pc_found = False
+            for i in range(S):
+                tok = token_ids[b, i].item()
+                if tok == Token.REG_PC:
+                    if not first_pc_found:
+                        # Step 0's PC marker - inject initial PC value
+                        lo = initial_pc & 0xF
+                        hi = (initial_pc >> 4) & 0xF
+                        x[b, i, BD.EMBED_LO + lo] = 1.0
+                        x[b, i, BD.EMBED_HI + hi] = 1.0
+                        first_pc_found = True
+                    # Note: For step 1+ PC markers, L3 attention will relay
+                    # the previous step's OUTPUT_LO/HI to EMBED_LO/EMBED_HI,
+                    # so we don't need to inject anything.
 
     def _inject_mem_exec(self, token_ids, x):
         """Inject MEM_EXEC and ADDR_KEY on MEM sections containing executable code.
@@ -338,20 +406,40 @@ class NeuralVMEmbedding(nn.Module):
                     is_jump_target = (addr & ~3) in jump_targets
 
                     if is_code_region or is_jump_target:
-                        # Set MEM_EXEC flag on MEM marker
+                        # Set MEM_EXEC flag on MEM marker (for code only)
                         x[b, i, BD.MEM_EXEC] = 1.0
 
-                        # Add ADDR_KEY to value bytes (positions 5-8)
-                        for byte_off in range(4):
-                            val_pos = i + 5 + byte_off
-                            if val_pos < S:
-                                byte_addr = addr + byte_off
-                                lo = byte_addr & 0xF
-                                hi = (byte_addr >> 4) & 0xF
-                                top = (byte_addr >> 8) & 0xF
-                                x[b, val_pos, BD.ADDR_KEY + lo] = 1.0
-                                x[b, val_pos, BD.ADDR_KEY + 16 + hi] = 1.0
-                                x[b, val_pos, BD.ADDR_KEY + 32 + top] = 1.0
+                    # FIX 2026-04-16: Always add ADDR_KEY to ALL MEM sections, not just code.
+                    # This enables L15 memory lookup for LEV (stack), LI/LC/SI/SC (data).
+                    # ADDR_KEY is needed for address matching in attention-based memory reads.
+
+                    # FIX 2026-04-17: Set MEM_STORE on ALL MEM markers for L15 K-side matching.
+                    # L15 attention uses MEM_STORE in K-side to identify store entries.
+                    # Without this, the attention score gets -312.5 penalty and doesn't match.
+                    x[b, i, BD.MEM_STORE] = 2.0  # Same scale as L6 head 6 output
+
+                    # FIX 2026-04-17: Set MEM_VAL_B0-B3 flags on val byte positions for L15 byte selection.
+                    # These flags indicate which value byte each position represents.
+                    # FIX 2026-04-17: Also inject MEM_STORE on val byte positions so that after L7
+                    # broadcast, MEM marker and val bytes have equal MEM_STORE. This prevents dim 37
+                    # suppression from favoring MEM markers over val bytes in L15 attention.
+                    for byte_off in range(4):
+                        val_pos = i + 5 + byte_off
+                        if val_pos < S:
+                            MEM_VAL_DIMS = [BD.MEM_VAL_B0, BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3]
+                            x[b, val_pos, MEM_VAL_DIMS[byte_off]] = 1.0
+                            x[b, val_pos, BD.MEM_STORE] = 2.0  # Match MEM marker injection
+
+                    for byte_off in range(4):
+                        val_pos = i + 5 + byte_off
+                        if val_pos < S:
+                            byte_addr = addr + byte_off
+                            lo = byte_addr & 0xF
+                            hi = (byte_addr >> 4) & 0xF
+                            top = (byte_addr >> 8) & 0xF
+                            x[b, val_pos, BD.ADDR_KEY + lo] = 1.0
+                            x[b, val_pos, BD.ADDR_KEY + 16 + hi] = 1.0
+                            x[b, val_pos, BD.ADDR_KEY + 32 + top] = 1.0
                     i += 9  # Skip past MEM section
                 else:
                     i += 1

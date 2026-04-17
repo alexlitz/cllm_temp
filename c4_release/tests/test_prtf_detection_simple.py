@@ -39,8 +39,8 @@ print("✓ Runner created")
 generated_tokens = []
 original_generate = runner.model.generate_next
 
-def track_tokens(context):
-    token = original_generate(context)
+def track_tokens(context, **kwargs):
+    token = original_generate(context, **kwargs)
     generated_tokens.append(token)
     if token == Token.THINKING_END:
         step_num = len(context) // 35

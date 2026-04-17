@@ -122,27 +122,36 @@ def _set_compiled_weights(
     enable_conversational_io: bool = False,
     alu_mode: str = 'lookup',
 ):
-    """Set weights using compiler-generated approach (development).
+    """Set weights using compiler-generated approach.
 
-    This function will use the weight compiler infrastructure to generate
-    and apply weights to the model. Currently a stub - implementation in progress.
-
-    The compiled approach must produce weights that:
+    Uses UnifiedVMCompiler to generate all weights for the Neural VM.
+    The compiled approach produces weights that:
     1. Pass all tests that hand-set weights pass
     2. Maintain forward pass purity
     3. Support the same features (tool calling, conversational I/O, etc.)
+
+    Args:
+        model: AutoregressiveVM instance
+        enable_tool_calling: Enable tool calling support
+        enable_conversational_io: Enable conversational I/O
+        alu_mode: ALU mode ('lookup' or 'efficient')
     """
-    raise NotImplementedError(
-        "Compiled weight setting is not yet fully implemented.\n"
-        "The weight compiler infrastructure exists (weight_compiler.py, "
-        "graph_weight_compiler.py) but doesn't yet cover all 16 layers.\n"
-        "\n"
-        "To use production weights, use WeightMode.HAND_SET (default).\n"
-        "\n"
-        "To contribute to compiler development, see:\n"
-        "  - neural_vm/weight_compiler.py\n"
-        "  - neural_vm/graph_weight_compiler.py\n"
-        "  - docs/WEIGHT_SETTING_APPROACHES.md"
+    from .unified_compiler import UnifiedVMCompiler
+
+    # Create compiler with model parameters
+    compiler = UnifiedVMCompiler(
+        d_model=model.d_model,
+        n_layers=len(model.blocks),
+        n_heads=model.blocks[0].attn.num_heads,
+        ffn_hidden=model.blocks[0].ffn.W_up.shape[0],
+        alu_mode=alu_mode,
+    )
+
+    # Compile all weights into the model
+    compiler.compile(
+        model,
+        enable_tool_calling=enable_tool_calling,
+        enable_conversational_io=enable_conversational_io,
     )
 
 

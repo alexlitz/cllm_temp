@@ -51,8 +51,8 @@ events = []
 
 # Wrap generate_next to track THINKING tokens
 original_generate = runner.model.generate_next
-def track_generate(context):
-    token = original_generate(context)
+def track_generate(context, **kwargs):
+    token = original_generate(context, **kwargs)
     if token == Token.THINKING_END:
         events.append("THINKING_END generated")
         print("   [EVENT] THINKING_END generated!")
