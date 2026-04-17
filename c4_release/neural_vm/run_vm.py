@@ -140,6 +140,8 @@ class AutoregressiveVMRunner:
         conversational_io=False,
         debug_ent_lev=False,
         debug_memory=False,
+        use_kv_cache=True,
+        max_mem_history=64,
     ):
         self.model = AutoregressiveVM(
             d_model=d_model,
@@ -223,6 +225,14 @@ class AutoregressiveVMRunner:
         self._debug_lev = debug_ent_lev
         self._debug_memory = debug_memory
 
+        # KV cache parameters for memory history eviction
+        # When use_kv_cache=True, _mem_history tracks unique memory addresses accessed
+        # and evicts oldest entries when exceeding max_mem_history (LRU eviction)
+        self.use_kv_cache = use_kv_cache
+        self.max_mem_history = max_mem_history
+        self._mem_history = {}  # addr → token sequence for memory value
+        self._mem_access_order = []  # LRU tracking: most recent at end
+
         # Function-call handlers dispatched by exec_pc (not output PC).
         # These are runner-side compatibility shims for full 32-bit correctness
         # while the corresponding neural memory paths are being completed.
@@ -298,6 +308,7 @@ class AutoregressiveVMRunner:
         self._last_bp = 0x10000  # Initial BP (same as model embedding STACK_INIT)
         self._last_sp = 0x10000  # Initial SP (same as model embedding STACK_INIT)
         self._mem_history = {}  # addr → 9-token MEM section (latest wins)
+        self._mem_access_order = []  # LRU tracking: most recent at end
         self.model.embed.set_mem_history_end(0)  # reset stale boundary from prior runs
         self._pure_attention_report = {
             "enabled": bool(self.pure_attention_memory),
@@ -575,7 +586,7 @@ class AutoregressiveVMRunner:
                         if self._debug_memory:
                             opname = _OPCODE_NAME.get(exec_op, f"OP{exec_op}")
                             print(f"[MEM STORE] {opname} at 0x{addr:08x} = 0x{value:08x}, captured MEM section", flush=True)
-                        self._mem_history[addr] = mem_section
+                        self._track_mem_access(addr, mem_section)
 
                 # Context pruning: keep prefix + retained MEM sections + last step.
                 # MEM sections from prior store ops are needed by L15 softmax1
@@ -684,7 +695,7 @@ class AutoregressiveVMRunner:
                         if self._debug_memory:
                             opname = _OPCODE_NAME.get(exec_op, f"OP{exec_op}")
                             print(f"[MEM STORE] {opname} at 0x{addr:08x} = 0x{value:08x}, captured MEM section", flush=True)
-                        self._mem_history[addr] = mem_section
+                        self._track_mem_access(addr, mem_section)
 
                 # Context pruning (same as STEP_END branch)
                 last_step = context[-(Token.STEP_TOKENS):]
@@ -959,9 +970,30 @@ class AutoregressiveVMRunner:
             (value >> 16) & 0xFF,
             (value >> 24) & 0xFF,
         ]
-        self._mem_history[addr] = mem_section
+        self._track_mem_access(addr, mem_section)
         if self._debug_memory:
             print(f"  [MEM INJECT] addr=0x{addr:08x}, value=0x{value:08x}", flush=True)
+
+    def _track_mem_access(self, addr, mem_section):
+        """Track memory access with LRU eviction when exceeding max_mem_history.
+
+        Args:
+            addr: Memory address accessed
+            mem_section: 9-token MEM section [Token.MEM, addr_bytes[4], value_bytes[4]]
+        """
+        # Update LRU order: remove if exists, then append to end (most recent)
+        if addr in self._mem_access_order:
+            self._mem_access_order.remove(addr)
+        self._mem_access_order.append(addr)
+
+        # Store the memory section
+        self._mem_history[addr] = mem_section
+
+        # LRU eviction: remove oldest entries if exceeding max_mem_history
+        while len(self._mem_history) > self.max_mem_history and self.max_mem_history > 0:
+            oldest_addr = self._mem_access_order.pop(0)
+            if oldest_addr in self._mem_history:
+                del self._mem_history[oldest_addr]
 
     def _mem_load_word(self, addr):
         """Load a 32-bit value from 4 little-endian bytes in shadow memory."""
