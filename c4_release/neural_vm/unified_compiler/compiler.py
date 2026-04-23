@@ -9,7 +9,11 @@ import torch
 from typing import Optional
 
 from .primitives import Primitives, P
-from ..vm_step import _SetDim as BD, Token
+from ..vm_step import (
+    _SetDim as BD, Token,
+    _set_layer6_routing_ffn, _set_io_putchar_routing,
+    _set_binary_pop_sp_increment, _set_function_call_weights,
+)
 from ..embedding import Opcode
 
 
@@ -784,8 +788,7 @@ class UnifiedVMCompiler:
         # K: attend to AX marker
         attn.W_k.data[base, BD.MARK_AX] = L
 
-        # V[0]: OP_LEV (scaled)
-        attn.W_v.data[base + 0, BD.OP_LEV] = 0.2
+        # V[0]: OP_LEV — disabled (injected globally via _inject_active_opcode)
         # V[1]: OP_PSH (scaled)
         attn.W_v.data[base + 1, BD.OP_PSH] = 0.2
         # V[2]: OP_ADJ (scaled)
@@ -827,7 +830,7 @@ class UnifiedVMCompiler:
         attn.W_o.data[BD.OP_JSR, base + 5] = 5.0  # Fix: relay OP_JSR flag itself
         attn.W_o.data[BD.MEM_STORE, base + 6] = 1.0  # store flag
         attn.W_o.data[BD.MEM_ADDR_SRC, base + 7] = 1.0  # addr source
-        attn.W_o.data[BD.OP_LEV, base + 0] = 5.0  # OP_LEV relay (rescale)
+        # OP_LEV relay — disabled (injected globally, relay would double it at PC)
         # O: ALU_LO outputs (for STACK0)
         for k in range(16):
             attn.W_o.data[BD.ALU_LO + k, base + 8 + k] = 1.0
@@ -884,14 +887,14 @@ class UnifiedVMCompiler:
 
         # Head 1: LEA/ADJ/ENT — BP/SP OUTPUT → ALU at AX marker
         base = 1 * HD
+        attn.W_q.data[base, BD.MARK_AX] = L * 10
         attn.W_q.data[base, BD.OP_LEA] = L
         attn.W_q.data[base, BD.OP_ADJ] = L
         attn.W_q.data[base, BD.OP_ENT] = L
+        attn.W_q.data[base, BD.CONST] = -L * 5
         # Anti-leakage gate (dim 1)
         attn.W_q.data[base + 1, BD.CONST] = -L * 2
-        attn.W_q.data[base + 1, BD.OP_LEA] = L * 2
-        attn.W_q.data[base + 1, BD.OP_ADJ] = L * 2
-        attn.W_q.data[base + 1, BD.OP_ENT] = L * 2
+        attn.W_q.data[base + 1, BD.MARK_AX] = L * 3
         attn.W_k.data[base + 1, BD.CONST] = 1.0
         attn.W_k.data[base, BD.MARK_BP] = L
         attn.W_k.data[base, BD.MARK_SP] = L
@@ -1326,7 +1329,7 @@ class UnifiedVMCompiler:
                 attn.W_k.data[base, BD.STACK0_BYTE0] = L
             else:
                 # Bytes 1-3: K matches BYTE_INDEX_J (standard byte positions).
-                byte_idx_dim = [None, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][h]
+                byte_idx_dim = [None, BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][h]
                 attn.W_k.data[base, byte_idx_dim] = L
 
             # Dim 1: SP source bonus (active when MEM_ADDR_SRC=0, i.e., PSH).
@@ -1415,25 +1418,20 @@ class UnifiedVMCompiler:
             attn.W_k.data[base + 1, BD.H1 + AX_I] = L  # AX area bonus (no BP blocker)
 
             # Dim 2: STACK0 source bonus (JSR and ENT only)
-            # Fix: Match manual's actual selection patterns (same as addr heads)
             attn.W_q.data[base + 2, BD.OP_JSR] = L
             attn.W_q.data[base + 2, BD.OP_ENT] = L
             # K: STACK0 byte positions
             if h == 0:
-                # Byte 0: Uses STACK0_BYTE0 flag
                 attn.W_k.data[base + 2, BD.STACK0_BYTE0] = L
             elif h == 1:
-                # Byte 1: L1H4[BP] - H1[BP]
-                attn.W_k.data[base + 2, BD.L1H4 + BP_I] = L
-                attn.W_k.data[base + 2, BD.H1 + BP_I] = -L
-            elif h == 2:
-                # Byte 2: H2[BP] - L1H4[BP]
                 attn.W_k.data[base + 2, BD.H2 + BP_I] = L
                 attn.W_k.data[base + 2, BD.L1H4 + BP_I] = -L
-            elif h == 3:
-                # Byte 3: H3[BP] - H2[BP]
+            elif h == 2:
                 attn.W_k.data[base + 2, BD.H3 + BP_I] = L
                 attn.W_k.data[base + 2, BD.H2 + BP_I] = -L
+            elif h == 3:
+                attn.W_k.data[base + 2, BD.H4 + BP_I] = L
+                attn.W_k.data[base + 2, BD.H3 + BP_I] = -L
             # Suppress non-STACK0 areas when using STACK0 source
             attn.W_k.data[base + 2, BD.H1 + AX_I] = -L
             attn.W_k.data[base + 2, BD.H1 + SP_I] = -L
@@ -1443,9 +1441,9 @@ class UnifiedVMCompiler:
             attn.W_q.data[base + 33, BD.CONST] = -500.0
             attn.W_q.data[base + 33, pos_up] = 500.0
             attn.W_q.data[base + 33, pos_down] = -500.0
-            # Fix: also block at STACK0 marker and STACK0 bytes for position gate
             attn.W_q.data[base + 33, BD.MARK_STACK0] = -500.0
             attn.W_q.data[base + 33, BD.L1H4 + BP_I] = -500.0
+            attn.W_q.data[base + 33, BD.H1 + SP_I] = -500.0
             attn.W_k.data[base + 33, BD.CONST] = 5.0
 
             # Dim 34: MEM_STORE gate
@@ -1465,6 +1463,9 @@ class UnifiedVMCompiler:
             for k in range(16):
                 attn.W_o.data[BD.OUTPUT_LO + k, base + 1 + k] = 1.0
                 attn.W_o.data[BD.OUTPUT_HI + k, base + 17 + k] = 1.0
+            # O: cancel L3 default (OUTPUT_LO[0] and OUTPUT_HI[0] = -1.0)
+            attn.W_o.data[BD.OUTPUT_LO + 0, base + 0] = -1.0
+            attn.W_o.data[BD.OUTPUT_HI + 0, base + 0] = -1.0
             # O: cancel L3 default
             attn.W_o.data[BD.OUTPUT_LO + 0, base + 0] = -1.0
             attn.W_o.data[BD.OUTPUT_HI + 0, base + 0] = -1.0
@@ -1490,7 +1491,7 @@ class UnifiedVMCompiler:
         self._compile_l5_ffn(model.blocks[5].ffn)
 
         # L6 FFN: Output routing (IMM/EXIT/NOP/JMP/PSH/HALT)
-        self._compile_l6_ffn(model.blocks[6].ffn)
+        self._compile_l6_ffn(model.blocks[6].ffn, model=model)
 
         # L8 FFN: ALU lo nibble (ADD/SUB/LEA/ADJ/ENT) + carry/borrow
         self._compile_l8_ffn(model.blocks[8].ffn)
@@ -2117,868 +2118,60 @@ class UnifiedVMCompiler:
             ffn.W_down.data[BD.TEMP + k, unit] = 2.0 / S
             unit += 1
 
-    def _compile_l6_ffn(self, ffn):
-        """Compile L6 FFN (output routing for AX, PC, SP, BP, STACK0).
-
-        This layer routes computed values to OUTPUT_LO/HI for next-token prediction:
-        - IMM: FETCH → OUTPUT
-        - EXIT/NOP/JMP: AX_CARRY → OUTPUT
-        - JMP PC override: cancel PC+5, write JMP target
-        - PSH: SP -= 8, STACK0 = AX
-        - HALT detection
-        - SP/BP/STACK0 identity carry
-        - Function call handling (JSR/ENT/LEV)
-        """
+    def _compile_l6_ffn(self, ffn, model=None):
+        """Compile L6 FFN by delegating to the verified hand-set functions."""
         S = self.S
-        unit = 0
-        T = 4.0  # threshold for opcode + marker detection
+        _set_layer6_routing_ffn(ffn, S, BD)
+        _set_io_putchar_routing(ffn, S, BD)
+        _set_binary_pop_sp_increment(ffn, S, BD)
+        if model is not None:
+            _set_function_call_weights(model, S, BD, self.HD)
 
-        # === IMM: FETCH → OUTPUT ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_IMM] = S
-            ffn.W_up.data[unit, BD.OP_EXIT] = -S * 20
-            ffn.W_up.data[unit, BD.OP_JMP] = -S * 20
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.FETCH_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_IMM] = S
-            ffn.W_up.data[unit, BD.OP_EXIT] = -S * 20
-            ffn.W_up.data[unit, BD.OP_JMP] = -S * 20
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.FETCH_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === EXIT: AX_CARRY → OUTPUT ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_EXIT] = S
-            ffn.W_up.data[unit, BD.OP_IMM] = -S * 20
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_EXIT] = S
-            ffn.W_up.data[unit, BD.OP_IMM] = -S * 20
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === NOP: AX_CARRY → OUTPUT ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_NOP] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S * 10
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_NOP] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S * 10
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === JMP: AX_CARRY → OUTPUT (preserves AX through JMP) ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S * 10
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S * 10
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === JMP PC override: CMP[0] AND MARK_PC → cancel and write target ===
-        T_jmp = 5.5
-        # Cancel OUTPUT
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.CMP + 0] = S
-            ffn.b_up.data[unit] = -S * T_jmp
-            ffn.W_gate.data[unit, BD.OUTPUT_LO + k] = -1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.CMP + 0] = S
-            ffn.b_up.data[unit] = -S * T_jmp
-            ffn.W_gate.data[unit, BD.OUTPUT_HI + k] = -1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-        # Add JMP target from AX_CARRY
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.CMP + 0] = S
-            ffn.b_up.data[unit] = -S * T_jmp
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.CMP + 0] = S
-            ffn.b_up.data[unit] = -S * T_jmp
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === First-step JMP PC override: OP_JMP AND NOT HAS_SE ===
-        T_op_jmp = 4.5
-        # Cancel OUTPUT
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.W_up.data[unit, BD.HAS_SE] = -S
-            ffn.b_up.data[unit] = -S * (T_op_jmp + 0.5)
-            ffn.W_gate.data[unit, BD.OUTPUT_LO + k] = -1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.W_up.data[unit, BD.HAS_SE] = -S
-            ffn.b_up.data[unit] = -S * (T_op_jmp + 0.5)
-            ffn.W_gate.data[unit, BD.OUTPUT_HI + k] = -1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-        # Add JMP target with PC_OFFSET
-        for k in range(16):
-            new_k = (k + 2) % 16  # Add PC_OFFSET=2
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.W_up.data[unit, BD.HAS_SE] = -S
-            ffn.b_up.data[unit] = -S * (T_op_jmp + 0.5)
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.W_up.data[unit, BD.HAS_SE] = -S
-            ffn.b_up.data[unit] = -S * (T_op_jmp + 0.5)
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === All-step JMP PC override: OP_JMP + FETCH ===
-        T_op_jmp_all = 4.5
-        # Cancel OUTPUT
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.b_up.data[unit] = -S * T_op_jmp_all
-            ffn.W_gate.data[unit, BD.OUTPUT_LO + k] = -1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.b_up.data[unit] = -S * T_op_jmp_all
-            ffn.W_gate.data[unit, BD.OUTPUT_HI + k] = -1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-        # Add JMP target from FETCH
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.b_up.data[unit] = -S * T_op_jmp_all
-            ffn.W_gate.data[unit, BD.FETCH_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.OP_JMP] = S
-            ffn.b_up.data[unit] = -S * T_op_jmp_all
-            ffn.W_gate.data[unit, BD.FETCH_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === HALT detection: CMP[1] AND NEXT_SE → NEXT_HALT ===
-        ffn.W_up.data[unit, BD.CMP + 1] = S
-        ffn.W_up.data[unit, BD.NEXT_SE] = S
-        ffn.b_up.data[unit] = -S * 1.3
-        ffn.b_gate.data[unit] = 1.0
-        ffn.W_down.data[BD.NEXT_HALT, unit] = 2.0 / S
-        ffn.W_down.data[BD.NEXT_SE, unit] = -2.0 / S
-        unit += 1
-
-        # === TEMP clearing at PC marker (skip TEMP[0]) ===
-        for k in range(32):
-            if k == 0:
-                unit += 1
+        # Post-hoc patching: zero out spurious units that read OUTPUT_BYTE
+        # (aliased to TEMP) but don't legitimately use it
+        for u in range(4096):
+            writes_output_lo = ffn.W_down.data[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
+            writes_output_hi = ffn.W_down.data[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
+            if not (writes_output_lo or writes_output_hi):
                 continue
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S
-            ffn.b_up.data[unit] = -S * 0.5
-            ffn.W_gate.data[unit, BD.TEMP + k] = -1.0
-            ffn.W_down.data[BD.TEMP + k, unit] = 2.0 / S
-            unit += 1
+            if ffn.W_up.data[u, BD.MARK_PC].item() > 10:
+                continue
+            if ffn.W_up.data[u, BD.MARK_STACK0].item() > 10:
+                continue
+            if ffn.W_up.data[u, BD.MARK_BP].item() > 10:
+                continue
+            ob_lo = ffn.W_up.data[u, BD.OUTPUT_BYTE_LO:BD.OUTPUT_BYTE_LO+16].abs().max().item()
+            ob_hi = ffn.W_up.data[u, BD.OUTPUT_BYTE_HI:BD.OUTPUT_BYTE_HI+16].abs().max().item()
+            if ob_lo > 50 or ob_hi > 50:
+                ffn.W_up.data[u, :] = 0
+                ffn.W_gate.data[u, :] = 0
+                ffn.W_down.data[:, u] = 0
+                ffn.b_up.data[u] = 0
+                ffn.b_gate.data[u] = 0
 
-        # === CMP[3] clearing at PC marker ===
-        # FIX: L6 attention head 6 relays POP group flags to CMP[3] at all
-        # positions it fires (SP, STACK0, BP, PC, MEM). At PC marker, CMP[3] is spurious.
-        ffn.W_up.data[unit, BD.MARK_PC] = S
-        ffn.W_up.data[unit, BD.IS_BYTE] = -S
-        ffn.b_up.data[unit] = -S * 0.5
-        ffn.W_gate.data[unit, BD.CMP + 3] = -1.0  # Self-referential clearing
-        ffn.W_down.data[BD.CMP + 3, unit] = 2.0 / S
-        unit += 1
-
-        # === SP/BP/STACK0 identity carry ===
-        for marker_dim in [BD.MARK_SP, BD.MARK_BP, BD.MARK_STACK0]:
-            for k in range(16):
-                ffn.W_up.data[unit, marker_dim] = S
-                ffn.W_up.data[unit, BD.IS_BYTE] = -S
-                ffn.b_up.data[unit] = -S * 0.5
-                ffn.W_gate.data[unit, BD.EMBED_LO + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-                unit += 1
-            for k in range(16):
-                ffn.W_up.data[unit, marker_dim] = S
-                ffn.W_up.data[unit, BD.IS_BYTE] = -S
-                ffn.b_up.data[unit] = -S * 0.5
-                ffn.W_gate.data[unit, BD.EMBED_HI + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-                unit += 1
-
-        # === PSH: SP -= 8 ===
-        T_psh = 1.5
-        for k in range(16):
-            new_k = (k - 8) % 16
-            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.b_up.data[unit] = -S * T_psh
-            ffn.W_gate.data[unit, BD.EMBED_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] += -2.0 / S  # cancel identity
-            unit += 1
-        # HI nibble with borrow
-        for k in range(16):
-            new_k_borrow = (k - 1) % 16
-            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.b_up.data[unit] = -S * T_psh
-            ffn.W_gate.data[unit, BD.EMBED_HI + k] = 1.0
-            for lo_bit in range(8, 16):
-                ffn.W_gate.data[unit, BD.EMBED_LO + lo_bit] = -1.0
-            ffn.W_down.data[BD.OUTPUT_HI + new_k_borrow, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] += -2.0 / S
-            unit += 1
-
-        # === PSH: STACK0 = AX ===
-        T_psh_s0 = 1.5
-        for k in range(16):
-            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
-            ffn.W_up.data[unit, BD.MARK_STACK0] = S
-            ffn.b_up.data[unit] = -S * T_psh_s0
-            ffn.W_gate.data[unit, BD.EMBED_LO + k] = -1.0
-            ffn.W_gate.data[unit, BD.ALU_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
-            ffn.W_up.data[unit, BD.MARK_STACK0] = S
-            ffn.b_up.data[unit] = -S * T_psh_s0
-            ffn.W_gate.data[unit, BD.EMBED_HI + k] = -1.0
-            ffn.W_gate.data[unit, BD.ALU_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === GETCHAR: AX = AX_CARRY ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_GETCHAR] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_GETCHAR] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === BZ: AX passthrough ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_BZ] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_BZ] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === BNZ: AX passthrough ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_BNZ] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_BNZ] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === PSH: AX passthrough ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_PSH] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_PSH] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === ADJ: AX passthrough (AX unchanged during stack adjust) ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_ADJ] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_ADJ] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === ADJ: SP writeback (route AX result → SP marker) ===
-        T_adj = 1.5
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_ADJ] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.b_up.data[unit] = -S * T_adj
-            ffn.W_gate.data[unit, BD.EMBED_LO + k] = -1.0  # Cancel identity
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0  # Write result
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_ADJ] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.b_up.data[unit] = -S * T_adj
-            ffn.W_gate.data[unit, BD.EMBED_HI + k] = -1.0
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === ENT: SP writeback (route AX result → SP marker) ===
-        # FIX: Add HAS_SE gate. On first step, AX_CARRY is empty (no previous step
-        # to relay from), causing garbage OUTPUT values. First-step ENT SP is
-        # handled by separate units below.
-        T_ent = 2.5  # Threshold: OP_ENT(5) + MARK_SP(1) + HAS_SE(1) = 7 > 2.5
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_ENT] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.W_up.data[unit, BD.HAS_SE] = S  # Only subsequent steps
-            ffn.b_up.data[unit] = -S * T_ent
-            ffn.W_gate.data[unit, BD.EMBED_LO + k] = -1.0
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_ENT] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.W_up.data[unit, BD.HAS_SE] = S  # Only subsequent steps
-            ffn.b_up.data[unit] = -S * T_ent
-            ffn.W_gate.data[unit, BD.EMBED_HI + k] = -1.0
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === ENT first-step SP byte 0 (32 units) ===
-        # On first step, SP starts at 0xFF (stack top). ENT imm computes SP -= 8 + imm.
-        # For byte 0: result = 0x00 - 8 - imm_byte0 = -8 - imm
-        # Lo nibble: (-8 - FETCH_LO) mod 16
-        # Hi nibble: (-1 - FETCH_HI) mod 16 (always borrow from lo since -8 - x < 0)
-        # Condition: OP_ENT + MARK_SP + NOT HAS_SE
-        T_ent_first = 1.5
-        for imm_lo in range(16):
-            result_lo = (-8 - imm_lo) % 16
-            ffn.W_up.data[unit, BD.OP_ENT] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.W_up.data[unit, BD.HAS_SE] = -S * 10  # Block on subsequent steps
-            ffn.b_up.data[unit] = -S * T_ent_first
-            ffn.W_gate.data[unit, BD.FETCH_LO + imm_lo] = 1.0  # Select based on imm lo nibble
-            ffn.W_down.data[BD.OUTPUT_LO + result_lo, unit] = 5.0 / S  # Strong output
-            unit += 1
-        for imm_hi in range(16):
-            result_hi = (-1 - imm_hi) % 16  # Always borrow from lo
-            ffn.W_up.data[unit, BD.OP_ENT] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.W_up.data[unit, BD.HAS_SE] = -S * 10  # Block on subsequent steps
-            ffn.b_up.data[unit] = -S * T_ent_first
-            ffn.W_gate.data[unit, BD.FETCH_HI + imm_hi] = 1.0  # Select based on imm hi nibble
-            ffn.W_down.data[BD.OUTPUT_HI + result_hi, unit] = 5.0 / S  # Strong output
-            unit += 1
-
-        # === LEA: AX = BP + offset ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_LEA] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.ALU_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_LEA] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-            ffn.W_up.data[unit, BD.IS_BYTE] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.ALU_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === Binary ops: AX = ALU result ===
-        binary_ops = [BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                      BD.OP_OR, BD.OP_XOR, BD.OP_AND, BD.OP_EQ, BD.OP_NE,
-                      BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                      BD.OP_SHL, BD.OP_SHR, BD.OP_LI, BD.OP_LC]
-        for op_dim in binary_ops:
-            for k in range(16):
-                ffn.W_up.data[unit, op_dim] = S
-                ffn.W_up.data[unit, BD.MARK_AX] = S
-                ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-                ffn.W_up.data[unit, BD.IS_BYTE] = -S
-                ffn.b_up.data[unit] = -S * T
-                ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-                unit += 1
-            for k in range(16):
-                ffn.W_up.data[unit, op_dim] = S
-                ffn.W_up.data[unit, BD.MARK_AX] = S
-                ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-                ffn.W_up.data[unit, BD.IS_BYTE] = -S
-                ffn.b_up.data[unit] = -S * T
-                ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-                unit += 1
-
-        # === PUTCHAR: AX = AX_CARRY passthrough ===
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_PUTCHAR] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_PUTCHAR] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S
-            ffn.b_up.data[unit] = -S * T
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # === SI/SC: Store operations - AX = popped value (was STACK0) ===
-        for op_dim in [BD.OP_SI, BD.OP_SC]:
-            for k in range(16):
-                ffn.W_up.data[unit, op_dim] = S
-                ffn.W_up.data[unit, BD.MARK_AX] = S
-                ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-                ffn.W_up.data[unit, BD.IS_BYTE] = -S
-                ffn.b_up.data[unit] = -S * T
-                ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-                unit += 1
-            for k in range(16):
-                ffn.W_up.data[unit, op_dim] = S
-                ffn.W_up.data[unit, BD.MARK_AX] = S
-                ffn.W_up.data[unit, BD.MARK_PC] = -S * 8
-                ffn.W_up.data[unit, BD.IS_BYTE] = -S
-                ffn.b_up.data[unit] = -S * T
-                ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-                unit += 1
-
-        # === Binary pop SP increment (SP += 8) ===
-        T_pop = 0.8  # CMP[3] + MARK_SP threshold
-        for k in range(16):
-            new_k = (k + 8) % 16
-            ffn.W_up.data[unit, BD.CMP + 3] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.b_up.data[unit] = -S * T_pop
-            ffn.W_gate.data[unit, BD.EMBED_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] += -2.0 / S
-            unit += 1
-        # HI nibble with carry
-        for k in range(16):
-            new_k_carry = (k + 1) % 16
-            ffn.W_up.data[unit, BD.CMP + 3] = S
-            ffn.W_up.data[unit, BD.MARK_SP] = S
-            ffn.b_up.data[unit] = -S * T_pop
-            ffn.W_gate.data[unit, BD.EMBED_HI + k] = 1.0
-            for lo_bit in range(8, 16):
-                ffn.W_gate.data[unit, BD.EMBED_LO + lo_bit] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + new_k_carry, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] += -2.0 / S
-            unit += 1
-
-        # === Function call handling: JSR/ENT/LEV ===
-        # LEA first-step: Initialize ALU with BP default
-        ffn.W_up.data[unit, BD.OP_LEA] = S
-        ffn.W_up.data[unit, BD.MARK_AX] = S
-        ffn.W_up.data[unit, BD.HAS_SE] = -S
-        ffn.b_up.data[unit] = -S * 1.5
-        ffn.b_gate.data[unit] = 1.0
-        ffn.W_down.data[BD.ALU_LO + 0, unit] = 2.0 / S
-        unit += 1
-        ffn.W_up.data[unit, BD.OP_LEA] = S
-        ffn.W_up.data[unit, BD.MARK_AX] = S
-        ffn.W_up.data[unit, BD.HAS_SE] = -S
-        ffn.b_up.data[unit] = -S * 1.5
-        ffn.b_gate.data[unit] = 1.0
-        ffn.W_down.data[BD.ALU_HI + 0, unit] = 2.0 / S
-        unit += 1
-
-        # Reserve units for more complex JSR/ENT/LEV operations
-        # These are implemented starting at unit 1000 in manual code
-        # For now, we place them starting at current unit position
-
-        # === JSR: SP -= 8 at SP byte positions ===
-        T_jsr_b0 = 3.5
-        STACK0_I = 7  # STACK0 area index for H1
-        for k in range(16):
-            new_k = (k - 8) % 16
-            ffn.W_up.data[unit, BD.CMP + 4] = S  # JSR flag from head 6
-            ffn.W_up.data[unit, BD.BYTE_INDEX_0] = S
-            ffn.W_up.data[unit, BD.IS_BYTE] = S
-            ffn.W_up.data[unit, BD.H1 + 2] = S  # SP area
-            ffn.b_up.data[unit] = -S * T_jsr_b0
-            ffn.W_gate.data[unit, BD.EMBED_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] += -2.0 / S
-            unit += 1
-        # HI nibble with borrow
-        for k in range(16):
-            new_k_borrow = (k - 1) % 16
-            ffn.W_up.data[unit, BD.CMP + 4] = S
-            ffn.W_up.data[unit, BD.BYTE_INDEX_0] = S
-            ffn.W_up.data[unit, BD.IS_BYTE] = S
-            ffn.W_up.data[unit, BD.H1 + 2] = S
-            ffn.b_up.data[unit] = -S * T_jsr_b0
-            ffn.W_gate.data[unit, BD.EMBED_HI + k] = 1.0
-            for lo_bit in range(8):  # borrow when LO < 8
-                ffn.W_gate.data[unit, BD.EMBED_LO + lo_bit] = -1.0
-            ffn.W_down.data[BD.OUTPUT_HI + new_k_borrow, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] += -2.0 / S
-            unit += 1
-
-        # JSR byte 1: write 0xFF (constant)
-        for k in range(16):
-            ffn.W_up.data[unit, BD.CMP + 4] = S
-            ffn.W_up.data[unit, BD.BYTE_INDEX_1] = S
-            ffn.W_up.data[unit, BD.IS_BYTE] = S
-            ffn.W_up.data[unit, BD.H1 + 2] = S
-            ffn.b_up.data[unit] = -S * T_jsr_b0
-            ffn.b_gate.data[unit] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + 15, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] += -2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.CMP + 4] = S
-            ffn.W_up.data[unit, BD.BYTE_INDEX_1] = S
-            ffn.W_up.data[unit, BD.IS_BYTE] = S
-            ffn.W_up.data[unit, BD.H1 + 2] = S
-            ffn.b_up.data[unit] = -S * T_jsr_b0
-            ffn.b_gate.data[unit] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + 15, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] += -2.0 / S
-            unit += 1
-
-        # JSR bytes 2-3: identity passthrough (already handled by carry logic)
-        # (32 units each for bytes 2 and 3)
-        for byte_idx in [2, 3]:
-            byte_index_dim = BD.BYTE_INDEX_2 if byte_idx == 2 else BD.BYTE_INDEX_3
-            for k in range(16):
-                ffn.W_up.data[unit, BD.CMP + 4] = S
-                ffn.W_up.data[unit, byte_index_dim] = S
-                ffn.W_up.data[unit, BD.IS_BYTE] = S
-                ffn.W_up.data[unit, BD.H1 + 2] = S
-                ffn.b_up.data[unit] = -S * T_jsr_b0
-                ffn.W_gate.data[unit, BD.EMBED_LO + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-                unit += 1
-            for k in range(16):
-                ffn.W_up.data[unit, BD.CMP + 4] = S
-                ffn.W_up.data[unit, byte_index_dim] = S
-                ffn.W_up.data[unit, BD.IS_BYTE] = S
-                ffn.W_up.data[unit, BD.H1 + 2] = S
-                ffn.b_up.data[unit] = -S * T_jsr_b0
-                ffn.W_gate.data[unit, BD.EMBED_HI + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-                unit += 1
-
-        # JSR: STACK0 = return_addr (from AX_CARRY)
-        T_jsr_s0 = 1.5
-        for k in range(16):
-            ffn.W_up.data[unit, BD.CMP + 4] = S
-            ffn.W_up.data[unit, BD.MARK_STACK0] = S
-            ffn.b_up.data[unit] = -S * T_jsr_s0
-            ffn.W_gate.data[unit, BD.EMBED_LO + k] = -1.0
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.CMP + 4] = S
-            ffn.W_up.data[unit, BD.MARK_STACK0] = S
-            ffn.b_up.data[unit] = -S * T_jsr_s0
-            ffn.W_gate.data[unit, BD.EMBED_HI + k] = -1.0
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # JSR: STACK0 byte positions
-        T_jsr_s0_byte = 3.5
-        for byte_idx in [0, 1, 2, 3]:
-            byte_index_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][byte_idx]
-            for k in range(16):
-                ffn.W_up.data[unit, BD.CMP + 4] = S
-                ffn.W_up.data[unit, byte_index_dim] = S
-                ffn.W_up.data[unit, BD.IS_BYTE] = S
-                ffn.W_up.data[unit, BD.H1 + STACK0_I] = S
-                ffn.b_up.data[unit] = -S * T_jsr_s0_byte
-                ffn.W_gate.data[unit, BD.EMBED_LO + k] = -1.0
-                ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-                unit += 1
-            for k in range(16):
-                ffn.W_up.data[unit, BD.CMP + 4] = S
-                ffn.W_up.data[unit, byte_index_dim] = S
-                ffn.W_up.data[unit, BD.IS_BYTE] = S
-                ffn.W_up.data[unit, BD.H1 + STACK0_I] = S
-                ffn.b_up.data[unit] = -S * T_jsr_s0_byte
-                ffn.W_gate.data[unit, BD.EMBED_HI + k] = -1.0
-                ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-                ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-                unit += 1
-
-        # JSR: PC override (PC = FETCH target)
-        T_jsr_pc = 1.3
-        # Cancel OUTPUT
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.TEMP + 0] = S  # IS_JSR flag
-            ffn.W_up.data[unit, BD.OP_NOP] = -S * 4
-            ffn.W_up.data[unit, BD.OP_EXIT] = -S * 4
-            ffn.W_up.data[unit, BD.OP_JMP] = -S * 4
-            ffn.W_up.data[unit, BD.OP_BZ] = -S * 4
-            ffn.W_up.data[unit, BD.OP_BNZ] = -S * 4
-            ffn.W_up.data[unit, BD.OP_IMM] = -S * 4
-            ffn.W_up.data[unit, BD.OP_LEV] = -S * 4
-            ffn.W_up.data[unit, BD.OP_ENT] = -S * 4
-            ffn.b_up.data[unit] = -S * T_jsr_pc
-            ffn.W_gate.data[unit, BD.OUTPUT_LO + k] = -1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.TEMP + 0] = S
-            ffn.W_up.data[unit, BD.OP_NOP] = -S * 4
-            ffn.W_up.data[unit, BD.OP_EXIT] = -S * 4
-            ffn.W_up.data[unit, BD.OP_JMP] = -S * 4
-            ffn.W_up.data[unit, BD.OP_BZ] = -S * 4
-            ffn.W_up.data[unit, BD.OP_BNZ] = -S * 4
-            ffn.W_up.data[unit, BD.OP_IMM] = -S * 4
-            ffn.W_up.data[unit, BD.OP_LEV] = -S * 4
-            ffn.W_up.data[unit, BD.OP_ENT] = -S * 4
-            ffn.b_up.data[unit] = -S * T_jsr_pc
-            ffn.W_gate.data[unit, BD.OUTPUT_HI + k] = -1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-        # Add FETCH target
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.TEMP + 0] = S
-            ffn.W_up.data[unit, BD.OP_NOP] = -S * 4
-            ffn.W_up.data[unit, BD.OP_EXIT] = -S * 4
-            ffn.W_up.data[unit, BD.OP_JMP] = -S * 4
-            ffn.W_up.data[unit, BD.OP_BZ] = -S * 4
-            ffn.W_up.data[unit, BD.OP_BNZ] = -S * 4
-            ffn.W_up.data[unit, BD.OP_IMM] = -S * 4
-            ffn.W_up.data[unit, BD.OP_LEV] = -S * 4
-            ffn.W_up.data[unit, BD.OP_ENT] = -S * 4
-            ffn.b_up.data[unit] = -S * T_jsr_pc
-            ffn.W_gate.data[unit, BD.FETCH_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.MARK_PC] = S
-            ffn.W_up.data[unit, BD.TEMP + 0] = S
-            ffn.W_up.data[unit, BD.OP_NOP] = -S * 4
-            ffn.W_up.data[unit, BD.OP_EXIT] = -S * 4
-            ffn.W_up.data[unit, BD.OP_JMP] = -S * 4
-            ffn.W_up.data[unit, BD.OP_BZ] = -S * 4
-            ffn.W_up.data[unit, BD.OP_BNZ] = -S * 4
-            ffn.W_up.data[unit, BD.OP_IMM] = -S * 4
-            ffn.W_up.data[unit, BD.OP_LEV] = -S * 4
-            ffn.W_up.data[unit, BD.OP_ENT] = -S * 4
-            ffn.b_up.data[unit] = -S * T_jsr_pc
-            ffn.W_gate.data[unit, BD.FETCH_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # JSR: AX = FETCH (JSR returns address in AX for C4)
-        T_jsr_ax = 1.5
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_JSR] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.b_up.data[unit] = -S * T_jsr_ax
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_JSR] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.b_up.data[unit] = -S * T_jsr_ax
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # ENT: STACK0 = old_BP (from TEMP)
-        T_ent_s0 = 1.5
-        for k in range(16):
-            ffn.W_up.data[unit, BD.CMP + 2] = S  # OP_ENT relay
-            ffn.W_up.data[unit, BD.MARK_STACK0] = S
-            ffn.b_up.data[unit] = -S * T_ent_s0
-            ffn.W_gate.data[unit, BD.EMBED_LO + k] = -1.0
-            ffn.W_gate.data[unit, BD.TEMP + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.CMP + 2] = S
-            ffn.W_up.data[unit, BD.MARK_STACK0] = S
-            ffn.b_up.data[unit] = -S * T_ent_s0
-            ffn.W_gate.data[unit, BD.EMBED_HI + k] = -1.0
-            ffn.W_gate.data[unit, BD.TEMP + 16 + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # ENT: BP = old_SP - 8 (from TEMP)
-        T_ent_bp = 1.5
-        for k in range(16):
-            new_k = (k - 8) % 16
-            ffn.W_up.data[unit, BD.CMP + 2] = S
-            ffn.W_up.data[unit, BD.MARK_BP] = S
-            ffn.b_up.data[unit] = -S * T_ent_bp
-            ffn.W_gate.data[unit, BD.TEMP + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] += -2.0 / S
-            unit += 1
-        for k in range(16):
-            new_k_borrow = (k - 1) % 16
-            ffn.W_up.data[unit, BD.CMP + 2] = S
-            ffn.W_up.data[unit, BD.MARK_BP] = S
-            ffn.b_up.data[unit] = -S * T_ent_bp
-            ffn.W_gate.data[unit, BD.TEMP + 16 + k] = 1.0
-            for lo_bit in range(8):
-                ffn.W_gate.data[unit, BD.TEMP + lo_bit] = -1.0
-            ffn.W_down.data[BD.OUTPUT_HI + new_k_borrow, unit] = 2.0 / S
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] += -2.0 / S
-            unit += 1
-
-        # ENT: AX = FETCH (ENT N sets AX to N)
-        T_ent_ax = 1.5
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_ENT] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.b_up.data[unit] = -S * T_ent_ax
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_ENT] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.b_up.data[unit] = -S * T_ent_ax
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
-
-        # LEV: AX = AX_CARRY (return value preserved)
-        T_lev_ax = 1.5
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_LEV] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 15
-            ffn.b_up.data[unit] = -S * T_lev_ax
-            ffn.W_gate.data[unit, BD.AX_CARRY_LO + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.OP_LEV] = S
-            ffn.W_up.data[unit, BD.MARK_AX] = S
-            ffn.W_up.data[unit, BD.MARK_PC] = -S * 15
-            ffn.b_up.data[unit] = -S * T_lev_ax
-            ffn.W_gate.data[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
+        # Add MARK_PC/IS_BYTE suppression to units with strong opcode weights
+        for u in range(4096):
+            writes_output_lo = ffn.W_down.data[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
+            writes_output_hi = ffn.W_down.data[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
+            if not (writes_output_lo or writes_output_hi):
+                continue
+            has_strong_opcode = (
+                ffn.W_up.data[u, BD.OP_ENT].abs().item() > 50 or
+                ffn.W_up.data[u, BD.OP_LEV].abs().item() > 50 or
+                ffn.W_up.data[u, BD.OP_JSR].abs().item() > 50 or
+                ffn.W_up.data[u, BD.OP_LEA].abs().item() > 50
+            )
+            has_mark_pc_suppression = ffn.W_up.data[u, BD.MARK_PC].item() < -100
+            is_byte_unit = (
+                ffn.W_up.data[u, BD.IS_BYTE].item() > 5 or
+                ffn.W_up.data[u, BD.BYTE_INDEX_0].item() > 5 or
+                ffn.W_up.data[u, BD.BYTE_INDEX_1].item() > 5 or
+                ffn.W_up.data[u, BD.BYTE_INDEX_2].item() > 5 or
+                ffn.W_up.data[u, BD.BYTE_INDEX_3].item() > 5
+            )
+            if has_strong_opcode and not has_mark_pc_suppression and not is_byte_unit:
+                ffn.W_up.data[u, BD.MARK_PC] = -S * 100
+                ffn.W_up.data[u, BD.IS_BYTE] = -S * 100
 
     def _compile_l8_ffn(self, ffn):
         """Compile L8 FFN: ALU lo nibble (ADD/SUB/LEA/ADJ/ENT) + carry/borrow.
@@ -3126,6 +2319,21 @@ class UnifiedVMCompiler:
         ffn.b_gate.data[unit] = 1.0
         ffn.W_down.data[BD.CMP_GROUP, unit] = 2.0 / (S * 9.0)
         unit += 1
+
+        # === ENT/ADJ first-step ALU defaults (2 units) ===
+        # For first step (NOT HAS_SE), L7 attention can't gather SP
+        # because SP marker is after AX marker (causal attention).
+        # Need ALU_LO[0] and ALU_HI[0] > 0 for SP = 0.
+        for alu_dim, output_weight in [(BD.ALU_LO, 50.0 / S), (BD.ALU_HI, 50.0 / S)]:
+            ffn.W_up.data[unit, BD.OP_ENT] = S / 3
+            ffn.W_up.data[unit, BD.OP_ADJ] = S / 3
+            ffn.W_up.data[unit, BD.MARK_AX] = S * 2
+            ffn.W_up.data[unit, BD.MARK_SP] = -S * 10
+            ffn.W_up.data[unit, BD.HAS_SE] = -S * 10
+            ffn.b_up.data[unit] = -S * 6
+            ffn.b_gate.data[unit] = 1.0
+            ffn.W_down.data[alu_dim + 0, unit] = output_weight
+            unit += 1
 
         # === LEV: BP address relay (BP OUTPUT → ADDR dims) ===
         # Byte 0 lo nibble: OUTPUT_LO → ADDR_B0_LO
@@ -3838,6 +3046,38 @@ class UnifiedVMCompiler:
             ffn.W_down.data[BD.ADDR_KEY + k, unit] = -4.0 / S
             unit += 1
 
+        # === Clear OUTPUT corruption at STACK0 byte positions ===
+        BP_I = 3
+        suppress = S * 100
+        for k in [0, 16]:
+            output_dim = BD.OUTPUT_LO if k == 0 else BD.OUTPUT_HI
+            ffn.W_up.data[unit, BD.H4 + BP_I] = S
+            ffn.W_up.data[unit, BD.H1 + BP_I] = -S * 20
+            ffn.W_up.data[unit, BD.MEM_VAL_B0] = -suppress
+            ffn.W_up.data[unit, BD.MEM_VAL_B1] = -suppress
+            ffn.W_up.data[unit, BD.MEM_VAL_B2] = -suppress
+            ffn.W_up.data[unit, BD.MEM_VAL_B3] = -suppress
+            ffn.W_up.data[unit, BD.MARK_PC] = -suppress
+            ffn.W_up.data[unit, BD.MARK_AX] = -suppress
+            ffn.W_up.data[unit, BD.MARK_SP] = -suppress
+            ffn.W_up.data[unit, BD.MARK_BP] = -suppress
+            ffn.W_up.data[unit, BD.MARK_STACK0] = -suppress
+            ffn.W_up.data[unit, BD.BYTE_INDEX_3] = -suppress
+            ffn.b_up.data[unit] = -S * 0.5
+            ffn.W_gate.data[unit, BD.CONST] = 1.0
+            ffn.W_down.data[output_dim, unit] = 50.0 / S
+            unit += 1
+
+        # === Clear OUTPUT when NEXT_SE is high (predicting STEP_END) ===
+        for out_range in [(BD.OUTPUT_LO, 16), (BD.OUTPUT_HI, 16)]:
+            out_base, count = out_range
+            for k in range(count):
+                ffn.W_up.data[unit, BD.NEXT_SE] = S
+                ffn.b_up.data[unit] = -S * 0.5
+                ffn.W_gate.data[unit, BD.CONST] = 1.0
+                ffn.W_down.data[out_base + k, unit] = -50.0 / S
+                unit += 1
+
     def _compile_l15_ffn(self, ffn):
         """Compile L15 FFN (nibble copy: EMBED → OUTPUT for bytes)."""
         S = self.S
@@ -3966,6 +3206,9 @@ class UnifiedVMCompiler:
         for k in range(16):
             ffn.W_up.data[unit, BD.OP_LEV] = S / 5
             ffn.W_up.data[unit, BD.MARK_SP] = S
+            ffn.W_up.data[unit, BD.MARK_PC] = -S
+            ffn.W_up.data[unit, BD.MARK_AX] = -S
+            ffn.W_up.data[unit, BD.MARK_BP] = -S
             ffn.b_up.data[unit] = -S * 1.5
             ffn.W_gate.data[unit, BD.OUTPUT_LO + k] = -1.0
             ffn.W_down.data[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -3973,6 +3216,9 @@ class UnifiedVMCompiler:
         for k in range(16):
             ffn.W_up.data[unit, BD.OP_LEV] = S / 5
             ffn.W_up.data[unit, BD.MARK_SP] = S
+            ffn.W_up.data[unit, BD.MARK_PC] = -S
+            ffn.W_up.data[unit, BD.MARK_AX] = -S
+            ffn.W_up.data[unit, BD.MARK_BP] = -S
             ffn.b_up.data[unit] = -S * 1.5
             ffn.W_gate.data[unit, BD.OUTPUT_HI + k] = -1.0
             ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -4018,6 +3264,9 @@ class UnifiedVMCompiler:
         for k in range(16):
             ffn.W_up.data[unit, BD.OP_LEV] = S / 5
             ffn.W_up.data[unit, BD.MARK_PC] = S
+            ffn.W_up.data[unit, BD.MARK_AX] = -S
+            ffn.W_up.data[unit, BD.MARK_SP] = -S
+            ffn.W_up.data[unit, BD.MARK_BP] = -S
             ffn.b_up.data[unit] = -S * 1.5
             ffn.W_gate.data[unit, BD.OUTPUT_HI + k] = -1.0
             ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -4052,8 +3301,10 @@ class UnifiedVMCompiler:
             byte_idx_dim = [BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][byte_pos]
             ffn.W_up.data[unit, BD.OP_LEV] = S / 2
             ffn.W_up.data[unit, byte_idx_dim] = S
-            # Suppress at marker positions
             ffn.W_up.data[unit, BD.MARK_PC] = -S * 1.5
+            ffn.W_up.data[unit, BD.MARK_AX] = -S * 10
+            ffn.W_up.data[unit, BD.MARK_SP] = -S * 10
+            ffn.W_up.data[unit, BD.MARK_BP] = -S * 10
             ffn.W_up.data[unit, BD.NEXT_AX] = -S * 1.5
             ffn.W_up.data[unit, BD.NEXT_SP] = -S * 1.5
             ffn.W_up.data[unit, BD.NEXT_BP] = -S * 1.5
@@ -4071,6 +3322,9 @@ class UnifiedVMCompiler:
             ffn.W_up.data[unit, BD.OP_LEV] = S / 2
             ffn.W_up.data[unit, byte_idx_dim] = S
             ffn.W_up.data[unit, BD.MARK_PC] = -S * 1.5
+            ffn.W_up.data[unit, BD.MARK_AX] = -S * 10
+            ffn.W_up.data[unit, BD.MARK_SP] = -S * 10
+            ffn.W_up.data[unit, BD.MARK_BP] = -S * 10
             ffn.W_up.data[unit, BD.NEXT_AX] = -S * 1.5
             ffn.W_up.data[unit, BD.NEXT_SP] = -S * 1.5
             ffn.W_up.data[unit, BD.NEXT_BP] = -S * 1.5
@@ -4088,6 +3342,9 @@ class UnifiedVMCompiler:
             ffn.W_up.data[unit, BD.OP_LEV] = S / 2
             ffn.W_up.data[unit, byte_idx_dim] = S
             ffn.W_up.data[unit, BD.MARK_PC] = -S * 1.5
+            ffn.W_up.data[unit, BD.MARK_AX] = -S * 10
+            ffn.W_up.data[unit, BD.MARK_SP] = -S * 10
+            ffn.W_up.data[unit, BD.MARK_BP] = -S * 10
             ffn.W_up.data[unit, BD.NEXT_AX] = -S * 1.5
             ffn.W_up.data[unit, BD.NEXT_SP] = -S * 1.5
             ffn.W_up.data[unit, BD.NEXT_BP] = -S * 1.5
@@ -4370,7 +3627,7 @@ class UnifiedVMCompiler:
 
                 # Dim 37: Memory position suppression
                 SUPPRESS_DIM = 37
-                attn.W_k.data[base + SUPPRESS_DIM, BD.CONST] = 10000.0
+                attn.W_k.data[base + SUPPRESS_DIM, BD.CONST] = 40000.0
                 attn.W_k.data[base + SUPPRESS_DIM, BD.MEM_STORE] = -10000.0
                 attn.W_q.data[base + SUPPRESS_DIM, BD.CONST] = -1000.0
 

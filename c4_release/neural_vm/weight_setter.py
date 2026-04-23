@@ -196,19 +196,7 @@ def parametrize_weight_modes():
 
     Returns modes that are actually implemented and can be tested.
     """
-    modes = [WeightMode.HAND_SET]
-
-    # Add COMPILED when it's implemented
-    # try:
-    #     # Test if compiled weights work
-    #     from .vm_step import AutoregressiveVM
-    #     test_model = AutoregressiveVM(d_model=64, n_layers=2, n_heads=2, ffn_hidden=128)
-    #     _set_compiled_weights(test_model)
-    #     modes.append(WeightMode.COMPILED)
-    # except NotImplementedError:
-    #     pass
-
-    return modes
+    return [WeightMode.HAND_SET, WeightMode.COMPILED]
 
 
 # =============================================================================

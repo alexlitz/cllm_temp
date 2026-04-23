@@ -77,7 +77,7 @@ class TestHandSetWeights:
         """Create a model for testing."""
         return AutoregressiveVM(
             d_model=512,
-            n_layers=16,
+            n_layers=17,
             n_heads=8,
             ffn_hidden=4096,
         )
@@ -113,25 +113,19 @@ class TestCompiledWeights:
         """Create a model for testing."""
         return AutoregressiveVM(
             d_model=512,
-            n_layers=16,
+            n_layers=17,
             n_heads=8,
             ffn_hidden=4096,
         )
 
-    def test_compiled_mode_not_implemented(self, model):
-        """COMPILED mode raises NotImplementedError (until complete)."""
-        with pytest.raises(NotImplementedError) as exc_info:
-            set_weights(model, mode=WeightMode.COMPILED)
+    def test_compiled_mode_works(self, model):
+        """COMPILED mode successfully sets weights."""
+        set_weights(model, mode=WeightMode.COMPILED)
+        # Verify weights are non-zero
+        assert model.blocks[0].ffn.W_up.abs().max().item() > 0
 
-        assert "not yet fully implemented" in str(exc_info.value)
-        assert "weight_compiler.py" in str(exc_info.value)
-
-    @pytest.mark.skip(reason="Compiled weights not yet implemented")
     def test_compiled_weights_purity(self, model):
-        """Compiled weights pass purity verification.
-
-        This test will be enabled once compiled weights are implemented.
-        """
+        """Compiled weights pass purity verification."""
         set_weights(model, mode=WeightMode.COMPILED, verify_purity=True)
 
 
@@ -143,7 +137,7 @@ class TestPurityEnforcement:
         """Create a model for testing."""
         return AutoregressiveVM(
             d_model=512,
-            n_layers=16,
+            n_layers=17,
             n_heads=8,
             ffn_hidden=4096,
         )
@@ -179,36 +173,38 @@ class TestWeightEquivalence:
         """Create model with hand-set weights."""
         model = AutoregressiveVM(
             d_model=512,
-            n_layers=16,
+            n_layers=17,
             n_heads=8,
             ffn_hidden=4096,
         )
         set_weights(model, mode=WeightMode.HAND_SET, verify_purity=False)
         return model
 
-    @pytest.mark.skip(reason="Compiled weights not yet implemented")
-    def test_outputs_match(self, model_hand):
-        """Hand-set and compiled weights produce matching outputs."""
-        from neural_vm.weight_setter import compare_weight_outputs
-
+    def test_weight_tensors_match(self, model_hand):
+        """Hand-set and compiled weights are numerically identical."""
         model_compiled = AutoregressiveVM(
             d_model=512,
-            n_layers=16,
+            n_layers=17,
             n_heads=8,
             ffn_hidden=4096,
         )
         set_weights(model_compiled, mode=WeightMode.COMPILED, verify_purity=False)
 
-        # Test with some input tokens
-        test_input = torch.randint(0, 256, (1, 10))
-        assert compare_weight_outputs(model_hand, model_compiled, test_input)
+        for i in range(17):
+            bh = model_hand.blocks[i]
+            bc = model_compiled.blocks[i]
+            for name in ['attn.W_q','attn.W_k','attn.W_v','attn.W_o',
+                         'ffn.W_up','ffn.b_up','ffn.W_gate','ffn.b_gate','ffn.W_down']:
+                parts = name.split('.')
+                t_h = getattr(getattr(bh, parts[0]), parts[1])
+                t_c = getattr(getattr(bc, parts[0]), parts[1])
+                assert torch.allclose(t_h, t_c, atol=1e-3), f"L{i} {name} mismatch"
 
-    @pytest.mark.skip(reason="Compiled weights not yet implemented")
     def test_embedding_weights_match(self, model_hand):
         """Embedding weights match between modes."""
         model_compiled = AutoregressiveVM(
             d_model=512,
-            n_layers=16,
+            n_layers=17,
             n_heads=8,
             ffn_hidden=4096,
         )
