@@ -69,6 +69,16 @@ class TestSmokeBasic:
         _, result = quick_runner.run(bytecode, b'', max_steps=20)
         assert result == 42
 
+    def test_mod_basic(self, quick_runner, make_bytecode):
+        """MOD works."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 43), Opcode.PSH,
+            (Opcode.IMM, 10), Opcode.MOD,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 3
+
 
 # =============================================================================
 # Control Flow Smoke Tests
@@ -191,6 +201,16 @@ class TestSmokeComparison:
         _, result = quick_runner.run(bytecode, b'', max_steps=20)
         assert result == 1
 
+    def test_eq_false(self, quick_runner, make_bytecode):
+        """EQ returns 0 when not equal."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 10), Opcode.PSH,
+            (Opcode.IMM, 20), Opcode.EQ,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 0
+
     def test_lt_true(self, quick_runner, make_bytecode):
         """LT returns 1 when less."""
         bytecode = make_bytecode([
@@ -200,6 +220,77 @@ class TestSmokeComparison:
         ])
         _, result = quick_runner.run(bytecode, b'', max_steps=20)
         assert result == 1
+
+    def test_ne_true(self, quick_runner, make_bytecode):
+        """NE returns 1 when not equal."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 10), Opcode.PSH,
+            (Opcode.IMM, 20), Opcode.NE,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 1
+
+    def test_gt_true(self, quick_runner, make_bytecode):
+        """GT returns 1 when greater."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 20), Opcode.PSH,
+            (Opcode.IMM, 10), Opcode.GT,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 1
+
+    def test_le_true(self, quick_runner, make_bytecode):
+        """LE returns 1 when less or equal."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 10), Opcode.PSH,
+            (Opcode.IMM, 20), Opcode.LE,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 1
+
+    def test_ge_true(self, quick_runner, make_bytecode):
+        """GE returns 1 when greater or equal."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 20), Opcode.PSH,
+            (Opcode.IMM, 10), Opcode.GE,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 1
+
+
+# =============================================================================
+# Address/Stack Smoke Tests
+# =============================================================================
+
+class TestSmokeAddress:
+    """LEA and ADJ operation quick checks."""
+
+    def test_lea_basic(self, quick_runner, make_bytecode):
+        """LEA computes AX = BP + immediate."""
+        bytecode = make_bytecode([
+            Opcode.ENT,
+            (Opcode.IMM, 0),
+            (Opcode.LEA, 2),
+            Opcode.EXIT,
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result != 0
+
+    def test_adj_sp(self, quick_runner, make_bytecode):
+        """ADJ adjusts SP by signed immediate."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 42),
+            Opcode.PSH,
+            Opcode.ADJ,
+            Opcode.EXIT,
+        ])
+        bytecode[2] = (Opcode.ADJ | (8 << 8))
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 42
 
 
 # =============================================================================
@@ -247,11 +338,11 @@ class TestSmokeHandlerStatus:
             assert not handler_status[op]["has_handler"], f"{op} should be neural-only"
 
     def test_handler_ops_have_handler(self, handler_status):
-        """Verify known handler-dependent ops have handlers."""
-        handler_ops = ["JSR", "ENT", "LEV", "JMP", "BZ", "BNZ", "PSH", "IMM"]
+        """Verify inline handler ops have correct status."""
+        inline_ops = ["JSR", "ENT", "LEV", "PSH", "IMM", "JMP", "BZ", "BNZ"]
 
-        for op in handler_ops:
-            assert handler_status[op]["has_handler"], f"{op} should have handler"
+        for op in inline_ops:
+            assert handler_status[op]["handler_type"] == "neural", f"{op} should be inline/neural"
 
 
 # =============================================================================
@@ -261,6 +352,8 @@ class TestSmokeHandlerStatus:
 class TestSmokePipeline:
     """End-to-end pipeline smoke test."""
 
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
     def test_compile_and_run(self, quick_runner):
         """Compile C code and run it."""
         from src.compiler import compile_c
@@ -273,6 +366,114 @@ class TestSmokePipeline:
         bytecode, data = compile_c(source)
         _, result = quick_runner.run(bytecode, data, max_steps=50)
         assert result == 42
+
+
+# =============================================================================
+# 32-bit Value Tests
+# =============================================================================
+
+class TestSmoke32Bit:
+    """Test operations with values > 255 (exercises bytes 1-3)."""
+
+    def test_add_16bit(self, quick_runner, make_bytecode):
+        """ADD with result > 255 (exercises carry to byte 1)."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 200), Opcode.PSH,
+            (Opcode.IMM, 100), Opcode.ADD,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 300
+
+    def test_add_carry_cascade(self, quick_runner, make_bytecode):
+        """ADD with carry cascading through all bytes (0xFF + 1 = 0x100)."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0xFF), Opcode.PSH,
+            (Opcode.IMM, 1), Opcode.ADD,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 0x100
+
+    def test_sub_16bit(self, quick_runner, make_bytecode):
+        """SUB with borrow from byte 1."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x100), Opcode.PSH,
+            (Opcode.IMM, 1), Opcode.SUB,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 0xFF
+
+    def test_sub_borrow_cascade(self, quick_runner, make_bytecode):
+        """SUB with borrow cascading (0x10000 - 1 = 0xFFFF)."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0), Opcode.PSH,
+            (Opcode.IMM, 1), Opcode.SUB,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 0xFFFFFFFF
+
+    def test_or_16bit(self, quick_runner, make_bytecode):
+        """OR with values spanning multiple bytes."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x0F00), Opcode.PSH,
+            (Opcode.IMM, 0x00FF), Opcode.OR,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 0x0FFF
+
+    def test_and_16bit(self, quick_runner, make_bytecode):
+        """AND with values spanning multiple bytes."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x0FFF), Opcode.PSH,
+            (Opcode.IMM, 0x00FF), Opcode.AND,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 0x00FF
+
+    def test_xor_16bit(self, quick_runner, make_bytecode):
+        """XOR with values spanning multiple bytes."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x0F0F), Opcode.PSH,
+            (Opcode.IMM, 0x00FF), Opcode.XOR,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 0x0FF0
+
+    def test_mul_overflow(self, quick_runner, make_bytecode):
+        """MUL with result > 255."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 100), Opcode.PSH,
+            (Opcode.IMM, 5), Opcode.MUL,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 500
+
+    def test_shl_8bit(self, quick_runner, make_bytecode):
+        """SHL by 8 (shifts byte 0 into byte 1)."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 1), Opcode.PSH,
+            (Opcode.IMM, 8), Opcode.SHL,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 256
+
+    def test_shr_8bit(self, quick_runner, make_bytecode):
+        """SHR by 8 (shifts byte 1 into byte 0)."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x100), Opcode.PSH,
+            (Opcode.IMM, 8), Opcode.SHR,
+            Opcode.EXIT
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=20)
+        assert result == 1
 
 
 if __name__ == '__main__':

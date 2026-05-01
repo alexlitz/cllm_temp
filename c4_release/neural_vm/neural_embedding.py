@@ -69,7 +69,7 @@ class NeuralVMEmbedding(nn.Module):
 
         # Inject active opcode flags for conversational I/O detection
         if active_opcode is not None:
-            self._inject_active_opcode(x, active_opcode)
+            self._inject_active_opcode(token_ids, x, active_opcode)
 
         # Inject THINKING_START/END markers for lookback detection
         self._inject_thinking_markers(token_ids, x)
@@ -186,8 +186,8 @@ class NeuralVMEmbedding(nn.Module):
         """
         self._mem_history_end = end
 
-    def _inject_active_opcode(self, x, active_opcode):
-        """Inject active opcode flags into all positions.
+    def _inject_active_opcode(self, token_ids, x, active_opcode):
+        """Inject active opcode flags into step output positions only.
 
         For conversational I/O: exposes the MoE routing signal globally so
         L5 FFN can detect PRTF/READ opcodes reliably.
@@ -201,32 +201,17 @@ class NeuralVMEmbedding(nn.Module):
         """
         from .vm_step import _SetDim as BD
 
-        if active_opcode == 33:  # PRTF = 0x21
-            x[:, :, BD.ACTIVE_OPCODE_PRTF] = 1.0
-        elif active_opcode == 31:  # READ = 0x1F
-            x[:, :, BD.ACTIVE_OPCODE_READ] = 1.0
-        elif active_opcode == 8:  # LEV = 0x08
-            # FIX 2026-04-15: Set OP_LEV at all positions for L15 memory lookup
-            # at PC marker. OP_LEV must be ~5.0 to match L5 FFN decode output.
-            x[:, :, BD.OP_LEV] = 5.0
-        elif active_opcode == 4:  # BZ = 0x04
-            # FIX 2026-04-16: Set OP_BZ at all positions for L6 Head 4 gating.
-            # Without this, the BZ/BNZ relay head fires for ALL opcodes,
-            # writing FETCH to TEMP which overlaps OUTPUT_BYTE and corrupts PC.
-            x[:, :, BD.OP_BZ] = 5.0
-        elif active_opcode == 5:  # BNZ = 0x05
-            # FIX 2026-04-16: Set OP_BNZ at all positions for L6 Head 4 gating.
-            x[:, :, BD.OP_BNZ] = 5.0
-        elif active_opcode == 6:  # ENT = 0x06
-            # FIX 2026-04-17: Set OP_ENT at all positions for L5 attention relay
-            # (BP→TEMP at STACK0, SP→TEMP at BP) and L6 FFN ENT units.
-            # OP_ENT must be ~5.0 to match L5 FFN decode output scale.
-            x[:, :, BD.OP_ENT] = 5.0
+        _OPCODE_INJECTION_MAP = {
+            33: BD.ACTIVE_OPCODE_PRTF,  # PRTF - needed for conversational I/O
+            31: BD.ACTIVE_OPCODE_READ,  # READ - needed for conversational I/O
+            8:  BD.OP_LEV,              # LEV - needed for return addr lookup
+            4:  BD.OP_BZ,               # BZ - needed for branch-taken PC override
+            5:  BD.OP_BNZ,              # BNZ - needed for branch-taken PC override
+        }
 
-        # NOTE: POP group injection disabled for now - needs more work.
-        # The L6 head 6 relay expects OP_* = 5.0 at AX marker, but L9 FFN CARRY
-        # units use OP_* in gate term causing explosions. Need to find a clean solution.
-        pass
+        dim = _OPCODE_INJECTION_MAP.get(active_opcode)
+        if dim is not None:
+            x[:, :, dim] = 5.0
 
     def _inject_thinking_markers(self, token_ids, x):
         """Inject THINKING_START and THINKING_END markers for lookback detection.
@@ -252,15 +237,13 @@ class NeuralVMEmbedding(nn.Module):
     def _inject_initial_pc(self, token_ids, x):
         """Inject initial PC value for step 0's PC marker.
 
-        Problem: L3 attention relays previous step's PC OUTPUT to current step's
-        PC marker via EMBED_LO/EMBED_HI. But step 0 has no previous step, so
-        EMBED_LO/EMBED_HI are empty. This causes incorrect PC output for step 0.
+        Step 0's REG_PC has no previous step to carry forward from (L3 relay
+        produces nothing). So we inject PC_OFFSET=2 into EMBED_LO/HI so the
+        model outputs the correct initial PC.
 
-        Solution: For the FIRST REG_PC marker in the context (step 0), inject
-        the initial PC value (PC_OFFSET=2) into EMBED_LO/EMBED_HI.
-
-        Detection: Step 0's REG_PC is the first REG_PC token in the context.
-        Subsequent REG_PC tokens (step 1+) get their values from L3 relay.
+        Detection: Step 0's REG_PC is the ONLY REG_PC in context with no
+        preceding STEP_END. After context pruning, retained previous steps
+        have STEP_END before their REG_PC, so they are not misidentified.
 
         Args:
             token_ids: [batch, seq] tensor of token IDs
@@ -269,25 +252,20 @@ class NeuralVMEmbedding(nn.Module):
         from .vm_step import _SetDim as BD, Token
         from .constants import PC_OFFSET
 
-        # Initial PC for step 0 = PC_OFFSET = 2
         initial_pc = PC_OFFSET
+        lo = initial_pc & 0xF
+        hi = (initial_pc >> 4) & 0xF
 
         B, S = token_ids.shape
         for b in range(B):
-            first_pc_found = False
+            seen_step_end = False
             for i in range(S):
                 tok = token_ids[b, i].item()
-                if tok == Token.REG_PC:
-                    if not first_pc_found:
-                        # Step 0's PC marker - inject initial PC value
-                        lo = initial_pc & 0xF
-                        hi = (initial_pc >> 4) & 0xF
-                        x[b, i, BD.EMBED_LO + lo] = 1.0
-                        x[b, i, BD.EMBED_HI + hi] = 1.0
-                        first_pc_found = True
-                    # Note: For step 1+ PC markers, L3 attention will relay
-                    # the previous step's OUTPUT_LO/HI to EMBED_LO/EMBED_HI,
-                    # so we don't need to inject anything.
+                if tok == Token.STEP_END:
+                    seen_step_end = True
+                elif tok == Token.REG_PC and not seen_step_end:
+                    x[b, i, BD.EMBED_LO + lo] = 1.0
+                    x[b, i, BD.EMBED_HI + hi] = 1.0
 
     def _inject_mem_exec(self, token_ids, x):
         """Inject MEM_EXEC and ADDR_KEY on MEM sections containing executable code.

@@ -92,6 +92,16 @@ _BINARY_POP_OPS = {
     Opcode.SC,
 }
 
+_NEURAL_32BIT_OPS = {
+    Opcode.ADD,
+    Opcode.SUB,
+    Opcode.OR,
+    Opcode.XOR,
+    Opcode.AND,
+}
+
+_RUNNER_ALU_OPS = _BINARY_POP_OPS - _NEURAL_32BIT_OPS - {Opcode.SI, Opcode.SC}
+
 
 @dataclass
 class ToolCall:
@@ -217,9 +227,6 @@ class AutoregressiveVMRunner:
         self._mem_history = {}  # addr → token sequence for memory value
         self._mem_access_order = []  # LRU tracking: most recent at end
 
-        # Function-call handlers dispatched by exec_pc (not output PC).
-        # These are runner-side compatibility shims for full 32-bit correctness
-        # while the corresponding neural memory paths are being completed.
         self._func_call_handlers = {}
 
         # If True: disable runner VM-memory emulation paths and only allow
@@ -403,173 +410,11 @@ class AutoregressiveVMRunner:
                 # Example: PSH step - handler should set STACK0=_last_ax, but _syscall_prtf
                 # (for next instruction) was running first and setting _last_ax=0.
 
-                # Dispatch function-call handlers FIRST (use exec_pc, current instruction)
-                exec_op = None
                 exec_idx = self._exec_pc() // INSTR_WIDTH
-                if 0 <= exec_idx < len(bytecode):
-                    exec_op = bytecode[exec_idx] & 0xFF
-                    func_handler = self._func_call_handlers.get(exec_op)
-                    if func_handler:
-                        func_handler(context, output)
-                    else:
-                        # Generic PC advancement for opcodes without handlers
-                        # SKIP for opcodes that handle PC themselves or have handlers
-                        # func_call_handlers handle their own PC advancement
-                        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT, Opcode.LEV}
-                        opcodes_with_pc_handling.update(self._func_call_handlers.keys())
-                        if exec_op not in opcodes_with_pc_handling:
-                            # Model doesn't advance PC neurally for all opcodes, so we do it here
-                            exec_pc = self._exec_pc()
-                            next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-                            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-                    # BUG FIX 2026-04-16: Override BP for opcodes that don't modify it.
-                    # Only ENT and LEV actually modify BP. All other opcodes should
-                    # preserve _last_bp. Without this, model's wrong BP output persists
-                    # and corrupts L9's BP+8 address calculation for LEV.
-                    # NOTE: Moved outside if/else so it runs even when handler exists.
-                    # Handlers like IMM don't override BP, leaving model's wrong value.
-                    BP_MODIFYING_OPS = {Opcode.ENT, Opcode.LEV}
-                    if exec_op not in BP_MODIFYING_OPS:
-                        if hasattr(self, '_debug_memory') and self._debug_memory:
-                            old_bp = self._extract_register(context, Token.REG_BP)
-                            print(f"[BP OVERRIDE] op=0x{exec_op:02x}, old_bp=0x{old_bp:08x}, new_bp=0x{self._last_bp:08x}", flush=True)
-                        self._override_register_in_last_step(context, Token.REG_BP, self._last_bp)
-
-                # Dispatch syscall_handlers AFTER func_call_handlers (uses output pc for NEXT instruction)
-                if pc is not None:
-                    instr_idx = pc // INSTR_WIDTH
-                    if 0 <= instr_idx < len(bytecode):
-                        op = bytecode[instr_idx] & 0xFF
-                        handler = self._syscall_handlers.get(op)
-                        if handler:
-                            if self._should_block_vm_memory_handler(op):
-                                self._record_pure_attention("blocked_vm_memory_ops", op)
-                            else:
-                                handler(context, output)
-                                if op in _TOOL_CALL_OPS:
-                                    self._record_pure_attention("external_tool_ops", op)
-                        # Track memory writes AFTER handler (handler may override SP/STACK0)
-                        if self._should_block_track_memory(op):
-                            self._record_pure_attention("blocked_track_memory_ops", op)
-                        else:
-                            self._track_memory_write(context, op)
-
-                # Update SP/BP/PC tracking (prefer deterministic SP evolution)
-                if 0 <= exec_idx < len(bytecode):
-                    # CRITICAL: Extract BP for ENT/LEV (they actually modify BP)
-                    # This must run even when ENT is not in handlers dict (neural path)
-                    if exec_op in (Opcode.ENT, Opcode.LEV):
-                        bp = self._extract_register(context, Token.REG_BP)
-                        if bp is not None:
-                            self._last_bp = bp
-
-                    # CRITICAL: Only extract SP for opcodes that modify SP
-                    # PSH, JSR, ENT, LEV modify SP. Binary ops (OR, AND, etc.) also pop stack.
-                    # Don't extract SP for IMM/LEA - they don't modify SP!
-                    if exec_op in self._func_call_handlers:
-                        SP_MODIFYING_OPS = {Opcode.PSH, Opcode.JSR, Opcode.ENT, Opcode.LEV,
-                                           Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.DIV, Opcode.MOD,
-                                           Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.SHL, Opcode.SHR}
-                        if exec_op in SP_MODIFYING_OPS:
-                            sp = self._extract_register(context, Token.REG_SP)
-                            if sp is not None:
-                                self._last_sp = sp
-                    elif op is not None:
-                        # Keep runner SP canonical for stack semantics.
-                        if op == Opcode.PSH:
-                            self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
-                        elif op == Opcode.ADJ:
-                            instr = bytecode[instr_idx]
-                            imm = instr >> 8
-                            if imm >= 0x800000:
-                                imm -= 0x1000000
-                            self._last_sp = (self._last_sp + imm) & 0xFFFFFFFF
-                        # REMOVED: Binary pop tracking (now handled neurally)
-                        # elif op in _BINARY_POP_OPS:
-                        #     self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
-                # AX multi-byte preservation
-                ax = self._extract_register(context, Token.REG_AX)
-                if ax is not None:
-                    # Check the EXECUTED opcode (exec_op), not the next opcode (op)
-                    # CRITICAL: Only extract AX for opcodes that ACTUALLY modify AX
-                    # JSR, ENT, LEV modify SP/BP/PC but NOT AX!
-                    AX_MODIFYING_OPS = {Opcode.IMM, Opcode.LEA,
-                                       Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.DIV, Opcode.MOD,
-                                       Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.SHL, Opcode.SHR}
-                    if exec_op == Opcode.IMM:
-                        exec_pc_imm = self._exec_pc()
-                        exec_idx_imm = exec_pc_imm // INSTR_WIDTH
-                        if 0 <= exec_idx_imm < len(bytecode):
-                            instr = bytecode[exec_idx_imm]
-                            imm = instr >> 8
-                            if imm >= 0x800000:
-                                imm -= 0x1000000
-                            imm &= 0xFFFFFFFF
-                            self._override_ax_in_last_step(context, imm)
-                    elif exec_op in AX_MODIFYING_OPS:
-                        self._last_ax = ax
-                    elif exec_op in self._func_call_handlers:
-                        # Handler doesn't modify AX (e.g., JSR, ENT, LEV, PSH)
-                        # Don't extract from model output - use canonical _last_ax value
-                        # CRITICAL: Must override AX in context to preserve correct value!
-                        self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
-                        # Verify the override worked
-                        verify_ax = self._extract_register(context, Token.REG_AX)
-                    elif op in (Opcode.LI, Opcode.LC):
-                        # L15 produces correct output for all bytes. Trust transformer.
-                        self._last_ax = ax
-                    else:
-                        # Normal opcodes: byte 0 from weights, bytes 1-3 from _last_ax
-                        merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
-                        self._last_ax = merged
-                        self._override_register_in_last_step(context, Token.REG_AX, merged)
-
-                # BP tracking moved to func_call_handlers block above (ENT/LEV modify BP)
-                # Don't extract BP from model output for normal opcodes - it's wrong!
-                pc = self._extract_register(context, Token.REG_PC)
-                if pc is not None:
-                    self._last_pc = pc
-
-                # Set next step's active opcode for MoE routing
-                next_exec = self._exec_pc() // INSTR_WIDTH
-                if 0 <= next_exec < len(bytecode):
-                    self.model.set_active_opcode(bytecode[next_exec] & 0xFF)
-                else:
-                    self.model.set_active_opcode(None)
-
-                # Capture MEM section from store ops for L15 memory lookup
-                # BUG FIX 2026-04-16: Use exec_op (currently executing opcode), not op (next opcode).
-                # Old code captured MEM based on next instruction, causing garbage in mem_history.
-                # Note: Handlers already inject correct MEM via _inject_mem_section, so this
-                # capture is only needed for opcodes without handlers (SI/SC neural path).
-                if exec_op in _MEM_STORE_OPS and exec_op not in self._func_call_handlers:
-                    mem_section = self._extract_mem_section(context)
-                    if mem_section is not None:
-                        addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
-                        value = sum((mem_section[5 + j] & 0xFF) << (j * 8) for j in range(4))
-                        if self._debug_memory:
-                            opname = _OPCODE_NAME.get(exec_op, f"OP{exec_op}")
-                            print(f"[MEM STORE] {opname} at 0x{addr:08x} = 0x{value:08x}, captured MEM section", flush=True)
-                        self._track_mem_access(addr, mem_section)
-
-                if exec_op == Opcode.EXIT:
-                    self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
+                if self._dispatch_step(context, bytecode, exec_idx, prefix_len, output):
                     break
 
-                # Context pruning: keep prefix + retained MEM sections + last step.
-                # MEM sections from prior store ops are needed by L15 softmax1
-                # memory lookup. Deduplication by address ensures latest-wins.
-                last_step = context[-(Token.STEP_TOKENS):]
-                mem_flat = []
-                for tokens in self._mem_history.values():
-                    mem_flat.extend(tokens)
-                context[prefix_len:] = mem_flat + list(last_step)
-                self.model.embed.set_mem_history_end(prefix_len + len(mem_flat))
-
             elif next_token == Token.TOOL_CALL:
-                # Model signaled a tool call — extract registers and dispatch
-                op = None
-                instr_idx = None
                 pc = self._extract_register(context, Token.REG_PC)
                 if pc is not None:
                     instr_idx = pc // INSTR_WIDTH
@@ -577,101 +422,16 @@ class AutoregressiveVMRunner:
                         op = bytecode[instr_idx] & 0xFF
                         handler = self._syscall_handlers.get(op)
                         if handler:
-                            if self._should_block_vm_memory_handler(op):
-                                self._record_pure_attention("blocked_vm_memory_ops", op)
-                            else:
+                            if not self._should_block_vm_memory_handler(op):
                                 handler(context, output)
                                 if op in _TOOL_CALL_OPS:
                                     self._record_pure_attention("external_tool_ops", op)
-                        if self._should_block_track_memory(op):
-                            self._record_pure_attention("blocked_track_memory_ops", op)
-                        else:
+                        if not self._should_block_track_memory(op):
                             self._track_memory_write(context, op)
-                # Dispatch function-call handlers (use exec_pc, not output pc)
-                exec_op = None
+
                 exec_idx = self._exec_pc() // INSTR_WIDTH
-                if 0 <= exec_idx < len(bytecode):
-                    exec_op = bytecode[exec_idx] & 0xFF
-                    func_handler = self._func_call_handlers.get(exec_op)
-                    if func_handler:
-                        func_handler(context, output)
-                    else:
-                        # Generic PC advancement for opcodes without handlers
-                        # SKIP for opcodes that handle PC themselves or have handlers
-                        # func_call_handlers handle their own PC advancement
-                        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT, Opcode.LEV}
-                        opcodes_with_pc_handling.update(self._func_call_handlers.keys())
-                        if exec_op not in opcodes_with_pc_handling:
-                            # Model doesn't advance PC neurally for all opcodes, so we do it here
-                            exec_pc = self._exec_pc()
-                            next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-                            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-                    # BUG FIX 2026-04-16: Override BP for opcodes that don't modify it.
-                    # Moved outside if/else so it runs even when handler exists.
-                    BP_MODIFYING_OPS = {Opcode.ENT, Opcode.LEV}
-                    if exec_op not in BP_MODIFYING_OPS:
-                        self._override_register_in_last_step(context, Token.REG_BP, self._last_bp)
-                # Update SP/BP/PC tracking (prefer deterministic SP evolution)
-                if 0 <= exec_idx < len(bytecode):
-                    if exec_op in self._func_call_handlers:
-                        sp = self._extract_register(context, Token.REG_SP)
-                        if sp is not None:
-                            self._last_sp = sp
-                    elif op is not None:
-                        if op == Opcode.PSH:
-                            self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
-                        elif op == Opcode.ADJ:
-                            instr = bytecode[instr_idx]
-                            imm = instr >> 8
-                            if imm >= 0x800000:
-                                imm -= 0x1000000
-                            self._last_sp = (self._last_sp + imm) & 0xFFFFFFFF
-                        # REMOVED: Binary pop tracking (now handled neurally)
-                        # elif op in _BINARY_POP_OPS:
-                        #     self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
-                # AX multi-byte preservation (same as STEP_END branch)
-                ax = self._extract_register(context, Token.REG_AX)
-                if ax is not None:
-                    merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
-                    self._last_ax = merged
-                    self._override_register_in_last_step(context, Token.REG_AX, merged)
-
-                bp = self._extract_register(context, Token.REG_BP)
-                if bp is not None:
-                    self._last_bp = bp
-                pc = self._extract_register(context, Token.REG_PC)
-                if pc is not None:
-                    self._last_pc = pc
-
-                # Set next step's active opcode for MoE routing
-                next_exec = self._exec_pc() // INSTR_WIDTH
-                if 0 <= next_exec < len(bytecode):
-                    self.model.set_active_opcode(bytecode[next_exec] & 0xFF)
-                else:
-                    self.model.set_active_opcode(None)
-
-                # Capture MEM section from store ops for L15 memory lookup
-                # BUG FIX 2026-04-16: Use exec_op (currently executing opcode), not op (next opcode).
-                # Old code captured MEM based on next instruction, causing garbage in mem_history.
-                # Note: Handlers already inject correct MEM via _inject_mem_section, so this
-                # capture is only needed for opcodes without handlers (SI/SC neural path).
-                if exec_op in _MEM_STORE_OPS and exec_op not in self._func_call_handlers:
-                    mem_section = self._extract_mem_section(context)
-                    if mem_section is not None:
-                        addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
-                        value = sum((mem_section[5 + j] & 0xFF) << (j * 8) for j in range(4))
-                        if self._debug_memory:
-                            opname = _OPCODE_NAME.get(exec_op, f"OP{exec_op}")
-                            print(f"[MEM STORE] {opname} at 0x{addr:08x} = 0x{value:08x}, captured MEM section", flush=True)
-                        self._track_mem_access(addr, mem_section)
-
-                # Context pruning (same as STEP_END branch)
-                last_step = context[-(Token.STEP_TOKENS):]
-                mem_flat = []
-                for tokens in self._mem_history.values():
-                    mem_flat.extend(tokens)
-                context[prefix_len:] = mem_flat + list(last_step)
-                self.model.embed.set_mem_history_end(prefix_len + len(mem_flat))
+                if self._dispatch_step(context, bytecode, exec_idx, prefix_len, output):
+                    break
 
             # Halt detection
             if next_token == Token.HALT:
@@ -699,6 +459,271 @@ class AutoregressiveVMRunner:
         name = _OPCODE_NAME.get(op, str(op))
         slot = self._pure_attention_report[bucket]
         slot[name] = slot.get(name, 0) + 1
+
+    def _compute_alu(self, op, stack_val, ax_val):
+        if op == Opcode.ADD:
+            return (stack_val + ax_val) & 0xFFFFFFFF
+        elif op == Opcode.SUB:
+            return (stack_val - ax_val) & 0xFFFFFFFF
+        elif op == Opcode.MUL:
+            return (stack_val * ax_val) & 0xFFFFFFFF
+        elif op == Opcode.DIV:
+            return (stack_val // ax_val) if ax_val else 0
+        elif op == Opcode.MOD:
+            return (stack_val % ax_val) if ax_val else 0
+        elif op == Opcode.OR:
+            return stack_val | ax_val
+        elif op == Opcode.XOR:
+            return stack_val ^ ax_val
+        elif op == Opcode.AND:
+            return stack_val & ax_val
+        elif op == Opcode.SHL:
+            return (stack_val << ax_val) & 0xFFFFFFFF
+        elif op == Opcode.SHR:
+            return (stack_val >> ax_val) & 0xFFFFFFFF if ax_val < 32 else 0
+        elif op == Opcode.EQ:
+            return 1 if stack_val == ax_val else 0
+        elif op == Opcode.NE:
+            return 1 if stack_val != ax_val else 0
+        elif op == Opcode.LT:
+            sx_s = stack_val - 0x1000000 if stack_val >= 0x800000 else stack_val
+            sx_a = ax_val - 0x1000000 if ax_val >= 0x800000 else ax_val
+            return 1 if sx_s < sx_a else 0
+        elif op == Opcode.GT:
+            sx_s = stack_val - 0x1000000 if stack_val >= 0x800000 else stack_val
+            sx_a = ax_val - 0x1000000 if ax_val >= 0x800000 else ax_val
+            return 1 if sx_s > sx_a else 0
+        elif op == Opcode.LE:
+            sx_s = stack_val - 0x1000000 if stack_val >= 0x800000 else stack_val
+            sx_a = ax_val - 0x1000000 if ax_val >= 0x800000 else ax_val
+            return 1 if sx_s <= sx_a else 0
+        elif op == Opcode.GE:
+            sx_s = stack_val - 0x1000000 if stack_val >= 0x800000 else stack_val
+            sx_a = ax_val - 0x1000000 if ax_val >= 0x800000 else ax_val
+            return 1 if sx_s >= sx_a else 0
+        return 0
+
+    def _signed_imm(self, instr):
+        imm = instr >> 8
+        if imm >= 0x800000:
+            imm -= 0x1000000
+        return imm
+
+    def _dispatch_step(self, context, bytecode, exec_idx, prefix_len, output):
+        exec_op = bytecode[exec_idx] & 0xFF if 0 <= exec_idx < len(bytecode) else None
+        if exec_op is None:
+            return False
+
+        pc = self._extract_register(context, Token.REG_PC)
+        op = None
+        if pc is not None:
+            instr_idx = pc // INSTR_WIDTH
+            if 0 <= instr_idx < len(bytecode):
+                op = bytecode[instr_idx] & 0xFF
+                handler = self._syscall_handlers.get(op)
+                if handler:
+                    if self._should_block_vm_memory_handler(op):
+                        self._record_pure_attention("blocked_vm_memory_ops", op)
+                    else:
+                        handler(context, output)
+                        if op in _TOOL_CALL_OPS:
+                            self._record_pure_attention("external_tool_ops", op)
+                if self._should_block_track_memory(op):
+                    self._record_pure_attention("blocked_track_memory_ops", op)
+                else:
+                    self._track_memory_write(context, op)
+
+        func_handler = self._func_call_handlers.get(exec_op)
+        if func_handler:
+            func_handler(context, output)
+
+        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT,
+                                    Opcode.LEV, Opcode.ENT, Opcode.JSR}
+        opcodes_with_pc_handling.update(self._func_call_handlers.keys())
+        if exec_op not in opcodes_with_pc_handling:
+            next_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
+            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
+
+        if exec_op not in {Opcode.ENT, Opcode.LEV}:
+            self._override_register_in_last_step(context, Token.REG_BP, self._last_bp)
+
+        if 0 <= exec_idx < len(bytecode):
+            if exec_op == Opcode.PSH:
+                self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
+                self._inject_mem_section(self._last_sp, self._last_ax)
+                self._mem_store_word(self._last_sp, self._last_ax)
+                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
+                self._override_register_in_last_step(context, Token.STACK0, self._last_ax)
+            elif exec_op == Opcode.JSR:
+                self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
+                return_addr = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
+                self._inject_mem_section(self._last_sp, return_addr)
+                self._mem_store_word(self._last_sp, return_addr)
+                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
+                self._override_register_in_last_step(context, Token.STACK0, return_addr)
+                jsr_target_idx = bytecode[exec_idx] >> 8
+                jsr_target_pc = self._resolve_target_pc(jsr_target_idx)
+                self._last_pc = jsr_target_pc
+                self._override_register_in_last_step(context, Token.REG_PC, jsr_target_pc)
+            elif exec_op == Opcode.ENT:
+                self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
+                self._inject_mem_section(self._last_sp, self._last_bp)
+                self._mem_store_word(self._last_sp, self._last_bp)
+                self._last_bp = self._last_sp
+                self._override_register_in_last_step(context, Token.REG_BP, self._last_bp)
+                imm = bytecode[exec_idx] >> 8
+                if imm >= 0x800000:
+                    imm -= 0x1000000
+                self._last_sp = (self._last_bp + imm * 4) & 0xFFFFFFFF
+                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
+                self._last_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
+                self._override_register_in_last_step(context, Token.REG_PC, self._last_pc)
+            elif exec_op == Opcode.LEV:
+                saved_bp = self._mem_load_word(self._last_bp) if self._last_bp else 0
+                return_addr = self._mem_load_word(self._last_bp + 8) if self._last_bp else 0
+                if saved_bp:
+                    self._last_bp = saved_bp
+                    self._override_register_in_last_step(context, Token.REG_BP, saved_bp)
+                if return_addr:
+                    self._last_pc = return_addr
+                    self._override_register_in_last_step(context, Token.REG_PC, return_addr)
+                self._last_sp = (self._last_bp + 16) & 0xFFFFFFFF
+                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
+            elif exec_op == Opcode.JMP:
+                target_idx = bytecode[exec_idx] >> 8
+                target_pc = self._resolve_target_pc(target_idx)
+                self._last_pc = target_pc
+                self._override_register_in_last_step(context, Token.REG_PC, target_pc)
+            elif exec_op == Opcode.BZ:
+                target_idx = bytecode[exec_idx] >> 8
+                target_pc = self._resolve_target_pc(target_idx)
+                if self._last_ax == 0:
+                    self._last_pc = target_pc
+                    self._override_register_in_last_step(context, Token.REG_PC, target_pc)
+                else:
+                    self._last_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
+                    self._override_register_in_last_step(context, Token.REG_PC, self._last_pc)
+            elif exec_op == Opcode.BNZ:
+                target_idx = bytecode[exec_idx] >> 8
+                target_pc = self._resolve_target_pc(target_idx)
+                if self._last_ax != 0:
+                    self._last_pc = target_pc
+                    self._override_register_in_last_step(context, Token.REG_PC, target_pc)
+                else:
+                    self._last_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
+                    self._override_register_in_last_step(context, Token.REG_PC, self._last_pc)
+            elif exec_op == Opcode.ADJ:
+                instr = bytecode[exec_idx]
+                imm = instr >> 8
+                if imm >= 0x800000:
+                    imm -= 0x1000000
+                self._last_sp = (self._last_sp + imm) & 0xFFFFFFFF
+                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
+            elif exec_op in _BINARY_POP_OPS:
+                stack_val = self._mem_load_word(self._last_sp) if self._last_sp else 0
+                alu_result = self._compute_alu(exec_op, stack_val, self._last_ax)
+                self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
+                self._last_ax = alu_result
+                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
+                self._override_register_in_last_step(context, Token.REG_AX, alu_result)
+            elif exec_op == Opcode.LI:
+                addr = self._last_ax
+                val = self._mem_load_word(addr)
+                self._last_ax = val
+                self._override_register_in_last_step(context, Token.REG_AX, val)
+            elif exec_op == Opcode.LC:
+                addr = self._last_ax
+                val = self._memory.get(addr, 0)
+                self._last_ax = val
+                self._override_register_in_last_step(context, Token.REG_AX, val)
+            elif exec_op == Opcode.SI:
+                addr = self._mem_load_word(self._last_sp) if self._last_sp else 0
+                self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
+                self._mem_store_word(addr, self._last_ax)
+                self._inject_mem_section(addr, self._last_ax)
+                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
+            elif exec_op == Opcode.SC:
+                addr = self._mem_load_word(self._last_sp) if self._last_sp else 0
+                self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
+                self._memory[addr] = self._last_ax & 0xFF
+                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
+            elif exec_op not in (Opcode.IMM, Opcode.LEA, Opcode.JMP, Opcode.BZ, Opcode.BNZ,
+                                 Opcode.LI, Opcode.LC, Opcode.EXIT, Opcode.NOP):
+                sp_model = self._extract_register(context, Token.REG_SP)
+                if sp_model is not None:
+                    self._last_sp = sp_model
+
+            if exec_op not in (Opcode.PSH, Opcode.JSR, Opcode.ENT, Opcode.LEV, Opcode.ADJ) and exec_op not in _BINARY_POP_OPS:
+                stack0_val = self._mem_load_word(self._last_sp) if self._last_sp else 0
+                self._override_register_in_last_step(context, Token.STACK0, stack0_val)
+
+        ax = self._extract_register(context, Token.REG_AX)
+        if ax is not None:
+            AX_MODIFYING_OPS = {Opcode.IMM, Opcode.LEA,
+                               Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.DIV, Opcode.MOD,
+                               Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.SHL, Opcode.SHR}
+            if exec_op == Opcode.IMM:
+                exec_pc_imm = self._exec_pc()
+                exec_idx_imm = exec_pc_imm // INSTR_WIDTH
+                if 0 <= exec_idx_imm < len(bytecode):
+                    instr = bytecode[exec_idx_imm]
+                    imm = instr >> 8
+                    if imm >= 0x800000:
+                        imm -= 0x1000000
+                    imm &= 0xFFFFFFFF
+                    self._override_ax_in_last_step(context, imm)
+            elif exec_op in AX_MODIFYING_OPS:
+                if exec_op in _BINARY_POP_OPS:
+                    pass
+                elif exec_op == Opcode.LEA:
+                    imm = bytecode[exec_idx] >> 8
+                    if imm >= 0x800000:
+                        imm -= 0x1000000
+                    alu_result = (self._last_bp + imm) & 0xFFFFFFFF
+                    self._last_ax = alu_result
+                    self._override_register_in_last_step(context, Token.REG_AX, alu_result)
+                else:
+                    merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
+                    self._last_ax = merged
+                    self._override_register_in_last_step(context, Token.REG_AX, merged)
+            elif exec_op in (Opcode.PSH, Opcode.JSR, Opcode.ENT, Opcode.LEV,
+                            Opcode.SI, Opcode.SC, Opcode.LI, Opcode.LC,
+                            Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT,
+                            Opcode.NOP, Opcode.ADJ):
+                self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
+            else:
+                merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
+                self._last_ax = merged
+                self._override_register_in_last_step(context, Token.REG_AX, merged)
+
+        if exec_op not in (Opcode.ENT, Opcode.LEV, Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.JSR):
+            pc = self._extract_register(context, Token.REG_PC)
+            if pc is not None:
+                self._last_pc = pc
+
+        next_exec = self._exec_pc() // INSTR_WIDTH
+        if 0 <= next_exec < len(bytecode):
+            self.model.set_active_opcode(bytecode[next_exec] & 0xFF)
+        else:
+            self.model.set_active_opcode(None)
+
+        if exec_op in _MEM_STORE_OPS and exec_op not in self._func_call_handlers:
+            mem_section = self._extract_mem_section(context)
+            if mem_section is not None:
+                addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
+                self._track_mem_access(addr, mem_section)
+
+        if exec_op == Opcode.EXIT:
+            self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
+            return True
+
+        last_step = context[-(Token.STEP_TOKENS):]
+        mem_flat = []
+        for tokens in self._mem_history.values():
+            mem_flat.extend(tokens)
+        context[prefix_len:] = mem_flat + list(last_step)
+        self.model.embed.set_mem_history_end(prefix_len + len(mem_flat))
+        return False
 
     def _build_context(self, bytecode, data, argv, stdin=""):
         """Encode program as token sequence (context prefix).
@@ -1064,116 +1089,6 @@ class AutoregressiveVMRunner:
 
         return "".join(result)
 
-    def _handler_add(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs + rhs) & 0xFFFFFFFF
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-    def _handler_sub(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs - rhs) & 0xFFFFFFFF
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-    def _handler_mul(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs * rhs) & 0xFFFFFFFF
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-    def _handler_div(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs // rhs) & 0xFFFFFFFF if rhs else 0
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-    def _handler_mod(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs % rhs) & 0xFFFFFFFF if rhs else 0
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-    def _handler_or(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs | rhs) & 0xFFFFFFFF
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-    def _handler_xor(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs ^ rhs) & 0xFFFFFFFF
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-    def _handler_and(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs & rhs) & 0xFFFFFFFF
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-    def _handler_shl(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs << (rhs & 0x1F)) & 0xFFFFFFFF
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-    def _handler_shr(self, context, output):
-        rhs = self._last_ax
-        lhs = self._mem_load_word(self._last_sp)
-        result = (lhs >> (rhs & 0x1F)) & 0xFFFFFFFF
-        new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_SP, new_sp)
-        self._override_ax_in_last_step(context, result)
-        exec_pc = self._exec_pc()
-        next_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
     # -----------------------------------------------------------------
     # Syscall handlers
     # -----------------------------------------------------------------
@@ -1336,6 +1251,12 @@ class AutoregressiveVMRunner:
         if self._last_pc is None:
             return PC_OFFSET
         return self._last_pc
+
+    @staticmethod
+    def _resolve_target_pc(target):
+        if target % INSTR_WIDTH == PC_OFFSET:
+            return target
+        return target * INSTR_WIDTH + PC_OFFSET
 
     def _decode_exit_code(self, context):
         """Extract exit code from the last REG_AX before HALT."""

@@ -59,7 +59,7 @@ class BDToGEConverter(nn.Module):
 
             # Copy opcode flags to all positions
             # Map BD opcode dims to GE opcode slots
-            opcode_map = [
+            self.opcode_map = [
                 (BD.OP_ADD, 25),
                 (BD.OP_SUB, 26),
                 (BD.OP_MUL, 27),
@@ -72,7 +72,7 @@ class BDToGEConverter(nn.Module):
                 (BD.OP_MOD, 32),
             ]
             for pos in range(8):
-                for bd_dim_idx, ge_opcode in opcode_map:
+                for bd_dim_idx, ge_opcode in self.opcode_map:
                     self.W_proj[pos, ge.OP_START + ge_opcode, bd_dim_idx] = 1.0
 
     def forward(self, x_bd):
@@ -182,12 +182,10 @@ class GEToBDConverter(nn.Module):
 
         # Apply opcode mask if provided (only write OUTPUT where opcodes are active)
         if opcode_mask is not None:
-            # opcode_mask: [B, seq_len] → expand to [B, seq_len, 1] for broadcasting
-            mask_expanded = opcode_mask[:, :, None]  # [B, seq_len, 1]
-            indicator_lo = indicator_lo * mask_expanded  # [B, seq_len, 16]
-            indicator_hi = indicator_hi * mask_expanded  # [B, seq_len, 16]
+            mask_expanded = opcode_mask[:, :, None]
+            indicator_lo = indicator_lo * mask_expanded
+            indicator_hi = indicator_hi * mask_expanded
 
-        # Write to OUTPUT_LO and OUTPUT_HI (16 consecutive dims each)
         x_bd_out[:, :, BD.OUTPUT_LO:BD.OUTPUT_LO + 16] += indicator_lo * 2.0
         x_bd_out[:, :, BD.OUTPUT_HI:BD.OUTPUT_HI + 16] += indicator_hi * 2.0
 
@@ -258,34 +256,29 @@ class PureNeuralALU(nn.Module):
         # Flatten for efficient layer processing
         x_ge_flat = x_ge.view(B * seq_len, 8, self.ge.DIM)  # [B*seq_len, 8, 160]
 
-        # Run through operation layers
+        x_ge_out = x_ge_flat.clone()
+        opcode_mask_flat = torch.zeros(B * seq_len, device=x_bd.device, dtype=x_bd.dtype)
+
         if self.operations == 'add_sub':
-            # Run ADD layers
             x_add = x_ge_flat.clone()
             for layer in self.add_layers:
                 x_add = layer(x_add)
 
-            # Run SUB layers
             x_sub = x_ge_flat.clone()
             for layer in self.sub_layers:
                 x_sub = layer(x_sub)
 
-            # Select based on opcode (neural selection)
-            # op_add[b*s] is the ADD opcode flag at position 0
-            op_add = x_ge_flat[:, 0, self.ge.OP_START + 25]  # [B*seq_len]
-            op_sub = x_ge_flat[:, 0, self.ge.OP_START + 26]  # [B*seq_len]
+            op_add = x_ge_flat[:, 0, self.ge.OP_START + 25]
+            op_sub = x_ge_flat[:, 0, self.ge.OP_START + 26]
 
-            # Combined opcode mask
-            opcode_mask_flat = op_add + op_sub  # [B*seq_len]
+            op_total = op_add + op_sub
 
-            # Blend results based on active opcode
-            # x_add[:, :, self.ge.RESULT] has shape [B*seq_len, 8]
-            # op_add[:, None] has shape [B*seq_len, 1] for broadcasting
-            x_ge_out = x_ge_flat.clone()
             x_ge_out[:, :, self.ge.RESULT] = (
                 x_add[:, :, self.ge.RESULT] * op_add[:, None] +
                 x_sub[:, :, self.ge.RESULT] * op_sub[:, None]
             )
+
+            opcode_mask_flat = op_total
 
         elif self.operations == 'bitwise':
             x_and = x_ge_flat.clone()
@@ -300,32 +293,32 @@ class PureNeuralALU(nn.Module):
             for layer in self.xor_layers:
                 x_xor = layer(x_xor)
 
-            op_and = x_ge_flat[:, 0, self.ge.OP_START + 30]  # [B*seq_len]
+            op_and = x_ge_flat[:, 0, self.ge.OP_START + 30]
             op_or = x_ge_flat[:, 0, self.ge.OP_START + 28]
             op_xor = x_ge_flat[:, 0, self.ge.OP_START + 29]
 
-            # Combined opcode mask: any bitwise opcode active
-            opcode_mask_flat = op_and + op_or + op_xor  # [B*seq_len]
+            op_total = op_and + op_or + op_xor
 
-            x_ge_out = x_ge_flat.clone()
             x_ge_out[:, :, self.ge.RESULT] = (
                 x_and[:, :, self.ge.RESULT] * op_and[:, None] +
                 x_or[:, :, self.ge.RESULT] * op_or[:, None] +
                 x_xor[:, :, self.ge.RESULT] * op_xor[:, None]
             )
 
+            opcode_mask_flat = op_total
+
         elif self.operations == 'mul':
             x_mul = x_ge_flat.clone()
             for layer in self.mul_layers:
                 x_mul = layer(x_mul)
 
-            op_mul = x_ge_flat[:, 0, self.ge.OP_START + 27]  # [B*seq_len]
+            op_mul = x_ge_flat[:, 0, self.ge.OP_START + 27]
 
-            # Opcode mask
-            opcode_mask_flat = op_mul  # [B*seq_len]
+            x_ge_out[:, :, self.ge.RESULT] = (
+                x_mul[:, :, self.ge.RESULT] * op_mul[:, None]
+            )
 
-            x_ge_out = x_ge_flat.clone()
-            x_ge_out[:, :, self.ge.RESULT] = x_mul[:, :, self.ge.RESULT] * op_mul[:, None]
+            opcode_mask_flat = op_mul
 
         elif self.operations == 'shift':
             x_shl = x_ge_flat.clone()
@@ -336,49 +329,50 @@ class PureNeuralALU(nn.Module):
             for layer in self.shr_layers:
                 x_shr = layer(x_shr)
 
-            op_shl = x_ge_flat[:, 0, self.ge.OP_START + 23]  # [B*seq_len]
+            op_shl = x_ge_flat[:, 0, self.ge.OP_START + 23]
             op_shr = x_ge_flat[:, 0, self.ge.OP_START + 24]
 
-            # Combined opcode mask
-            opcode_mask_flat = op_shl + op_shr  # [B*seq_len]
+            op_total = op_shl + op_shr
 
-            x_ge_out = x_ge_flat.clone()
             x_ge_out[:, :, self.ge.RESULT] = (
                 x_shl[:, :, self.ge.RESULT] * op_shl[:, None] +
                 x_shr[:, :, self.ge.RESULT] * op_shr[:, None]
             )
 
+            opcode_mask_flat = op_total
+
         elif self.operations == 'div_mod':
-            # Run DIV layers (pure tensor operations, batch-stable)
             x_div = x_ge_flat.clone()
             for layer in self.div_layers:
                 x_div = layer(x_div)
 
-            # Run MOD layers (pure tensor operations, batch-stable)
             x_mod = x_ge_flat.clone()
             for layer in self.mod_layers:
                 x_mod = layer(x_mod)
 
-            # Blend based on opcode flags (pure tensor operations)
-            op_div = x_ge_flat[:, 0, self.ge.OP_START + 31]  # [batch]
-            op_mod = x_ge_flat[:, 0, self.ge.OP_START + 32]  # [batch]
+            op_div = x_ge_flat[:, 0, self.ge.OP_START + 31]
+            op_mod = x_ge_flat[:, 0, self.ge.OP_START + 32]
 
-            # Combined opcode mask
-            opcode_mask_flat = op_div + op_mod  # [B*seq_len]
+            op_total = op_div + op_mod
 
-            x_ge_out = x_ge_flat.clone()
             x_ge_out[:, :, self.ge.RESULT] = (
                 x_div[:, :, self.ge.RESULT] * op_div[:, None] +
                 x_mod[:, :, self.ge.RESULT] * op_mod[:, None]
             )
 
+            opcode_mask_flat = op_total
+
         # Reshape back
         x_ge_out = x_ge_out.view(B, seq_len, 8, self.ge.DIM)
 
-        # Reshape opcode mask from [B*seq_len] to [B, seq_len]
         opcode_mask = opcode_mask_flat.view(B, seq_len)
 
-        # Convert GE → BD format with opcode mask
+        # Only write OUTPUT at AX marker positions (MARK_AX > 0.5).
+        # Without this, the ALU writes result "0" at byte positions where
+        # operands are zero, corrupting the passthrough from L10 head 1.
+        mark_ax = x_bd[:, :, BD.MARK_AX]
+        opcode_mask = opcode_mask * (mark_ax > 0.5).float()
+
         x_bd_out = self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
 
         return x_bd_out
