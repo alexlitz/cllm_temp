@@ -88,8 +88,6 @@ _BINARY_POP_OPS = {
     Opcode.AND,
     Opcode.SHL,
     Opcode.SHR,
-    Opcode.SI,
-    Opcode.SC,
 }
 
 _NEURAL_32BIT_OPS = {

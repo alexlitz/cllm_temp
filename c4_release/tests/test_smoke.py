@@ -294,6 +294,42 @@ class TestSmokeAddress:
 
 
 # =============================================================================
+# Memory Operation Smoke Tests
+# =============================================================================
+
+class TestSmokeMemory:
+    """Memory load/store operation quick checks."""
+
+    def test_si_li_roundtrip(self, quick_runner, make_bytecode):
+        """SI stores, LI loads back."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x200),
+            Opcode.PSH,
+            (Opcode.IMM, 42),
+            Opcode.SI,
+            (Opcode.IMM, 0x200),
+            Opcode.LI,
+            Opcode.EXIT,
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=30)
+        assert result == 42
+
+    def test_sc_lc_roundtrip(self, quick_runner, make_bytecode):
+        """SC stores char, LC loads back."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x200),
+            Opcode.PSH,
+            (Opcode.IMM, 42),
+            Opcode.SC,
+            (Opcode.IMM, 0x200),
+            Opcode.LC,
+            Opcode.EXIT,
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=30)
+        assert result == 42
+
+
+# =============================================================================
 # Shift Smoke Tests
 # =============================================================================
 
