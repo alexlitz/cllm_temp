@@ -328,6 +328,69 @@ class TestSmokeMemory:
         _, result = quick_runner.run(bytecode, b'', max_steps=30)
         assert result == 42
 
+    def test_si_li_zero(self, quick_runner, make_bytecode):
+        """SI stores 0, LI loads back 0."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x300),
+            Opcode.PSH,
+            (Opcode.IMM, 0),
+            Opcode.SI,
+            (Opcode.IMM, 0x300),
+            Opcode.LI,
+            Opcode.EXIT,
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=30)
+        assert result == 0
+
+    def test_si_li_multiple_stores(self, quick_runner, make_bytecode):
+        """Multiple SI stores to different addresses, LI loads last one."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x200),
+            Opcode.PSH,
+            (Opcode.IMM, 10),
+            Opcode.SI,
+            (Opcode.IMM, 0x300),
+            Opcode.PSH,
+            (Opcode.IMM, 99),
+            Opcode.SI,
+            (Opcode.IMM, 0x300),
+            Opcode.LI,
+            Opcode.EXIT,
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=40)
+        assert result == 99
+
+    def test_si_li_overwrite(self, quick_runner, make_bytecode):
+        """SI overwrites previous value at same address."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x200),
+            Opcode.PSH,
+            (Opcode.IMM, 10),
+            Opcode.SI,
+            (Opcode.IMM, 0x200),
+            Opcode.PSH,
+            (Opcode.IMM, 55),
+            Opcode.SI,
+            (Opcode.IMM, 0x200),
+            Opcode.LI,
+            Opcode.EXIT,
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=40)
+        assert result == 55
+    def test_si_li_16bit_value(self, quick_runner, make_bytecode):
+        """SI stores a 16-bit value, LI loads it back."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 0x200),
+            Opcode.PSH,
+            (Opcode.IMM, 0x1234),
+            Opcode.SI,
+            (Opcode.IMM, 0x200),
+            Opcode.LI,
+            Opcode.EXIT,
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=30)
+        assert result == 0x1234
+
 
 # =============================================================================
 # Shift Smoke Tests
@@ -510,6 +573,28 @@ class TestSmoke32Bit:
         ])
         _, result = quick_runner.run(bytecode, b'', max_steps=20)
         assert result == 1
+
+
+# =============================================================================
+# Integration Tests
+# =============================================================================
+
+class TestSmokeIntegration:
+    """Multi-step integration tests combining multiple opcodes."""
+
+    def test_cmp_and_branch(self, quick_runner, make_bytecode):
+        """EQ comparison drives BZ branch."""
+        bytecode = make_bytecode([
+            (Opcode.IMM, 5), Opcode.PSH,
+            (Opcode.IMM, 5), Opcode.EQ,
+            (Opcode.BZ, 6),
+            (Opcode.IMM, 42),
+            Opcode.EXIT,
+            (Opcode.IMM, 0),
+            Opcode.EXIT,
+        ])
+        _, result = quick_runner.run(bytecode, b'', max_steps=30)
+        assert result == 42
 
 
 if __name__ == '__main__':
