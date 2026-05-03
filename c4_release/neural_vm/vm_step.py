@@ -572,6 +572,15 @@ class CarryPropagationPostOp(nn.Module):
         add_carry_in = BD.CARRY + (3 if cascade else 1)
         sub_carry_in = BD.CARRY + (3 if cascade else 2)
 
+        non_arith_ops = [
+            BD.OP_LEA, BD.OP_IMM, BD.OP_JMP, BD.OP_JSR, BD.OP_BZ, BD.OP_BNZ,
+            BD.OP_ENT, BD.OP_ADJ, BD.OP_LEV, BD.OP_LI, BD.OP_LC, BD.OP_SI,
+            BD.OP_SC, BD.OP_PSH, BD.OP_OR, BD.OP_XOR, BD.OP_AND, BD.OP_EQ,
+            BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE, BD.OP_SHL,
+            BD.OP_SHR, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD, BD.OP_EXIT, BD.OP_NOP,
+            BD.OP_PUTCHAR, BD.OP_GETCHAR,
+        ]
+
         with torch.no_grad():
             unit = 0
             for lo in range(16):
@@ -585,6 +594,9 @@ class CarryPropagationPostOp(nn.Module):
                     self.W_up.data[unit, byte_dim] = S
                     self.W_up.data[unit, BD.OUTPUT_LO + lo] = S
                     self.W_up.data[unit, BD.OUTPUT_HI + hi] = S
+                    for op_dim in non_arith_ops:
+                        self.W_up.data[unit, op_dim] = -S * 20
+                    self.W_up.data[unit, BD.OP_SUB] = -S * 20
                     self.b_up.data[unit] = -S * 9.5
                     self.W_gate.data[unit, BD.H1 + 1] = 1.0
                     self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
@@ -606,6 +618,9 @@ class CarryPropagationPostOp(nn.Module):
                     self.W_up.data[unit, byte_dim] = S
                     self.W_up.data[unit, BD.OUTPUT_LO + lo] = S
                     self.W_up.data[unit, BD.OUTPUT_HI + hi] = S
+                    for op_dim in non_arith_ops:
+                        self.W_up.data[unit, op_dim] = -S * 20
+                    self.W_up.data[unit, BD.OP_ADD] = -S * 20
                     self.b_up.data[unit] = -S * 9.5
                     self.W_gate.data[unit, BD.H1 + 1] = 1.0
                     self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
@@ -657,8 +672,10 @@ class BitwiseBytePropagationPostOp(nn.Module):
                         self.W_up.data[unit, BD.ALU_LO + b_lo] = S
                         self.W_up.data[unit, BD.IS_BYTE] = S
                         self.W_up.data[unit, BD.H1 + 1] = S
+                        self.W_up.data[unit, BD.MARK_AX] = -S
                         self.b_up.data[unit] = -S * 3.5
                         self.W_gate.data[unit, op_dim] = 1.0
+                        self.W_gate.data[unit, BD.IS_BYTE] = S
                         self.W_down.data[BD.OUTPUT_LO + a_lo, unit] = -2.0 / S
                         self.W_down.data[BD.OUTPUT_LO + r, unit] = 2.0 / S
                         unit += 1
@@ -669,8 +686,10 @@ class BitwiseBytePropagationPostOp(nn.Module):
                         self.W_up.data[unit, BD.ALU_HI + b_hi] = S
                         self.W_up.data[unit, BD.IS_BYTE] = S
                         self.W_up.data[unit, BD.H1 + 1] = S
+                        self.W_up.data[unit, BD.MARK_AX] = -S
                         self.b_up.data[unit] = -S * 3.5
                         self.W_gate.data[unit, op_dim] = 1.0
+                        self.W_gate.data[unit, BD.IS_BYTE] = S
                         self.W_down.data[BD.OUTPUT_HI + a_hi, unit] = -2.0 / S
                         self.W_down.data[BD.OUTPUT_HI + r, unit] = 2.0 / S
                         unit += 1
@@ -1787,9 +1806,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     embed[Token.TOOL_CALL, BD.MARK_SE_ONLY] = 1.0
     embed[Token.TOOL_CALL, BD.CONST] = 1.0
 
-    # IO token embeddings (markers for runner-side stdin framing)
-    embed[Token.USER_INPUT_START, BD.IS_MARK] = 1.0
-    embed[Token.USER_INPUT_END, BD.IS_MARK] = 1.0
+    # IO token embeddings — NOT IS_MARK (would break L0 threshold distance detection)
+    # USER_INPUT tokens are I/O boundaries, not VM execution markers
 
     # Thinking tag embeddings (for conversational I/O mode)
     # These are markers but NOT step-end markers
@@ -4337,61 +4355,21 @@ def _set_layer6_attn(attn, S, BD, HD):
     # Head 5: First-step OP flag relay + FETCH relay (AX marker ← PC marker)
     # For first step, L5 FFN decodes opcodes at PC marker (OP_IMM, OP_LEA, OP_EXIT, OP_NOP, OP_JMP, OP_JSR, arithmetic, bitwise, cmp, shift).
     # L6 FFN needs these flags at AX marker for routing (IMM, EXIT, NOP, JMP, arithmetic, etc).
-    # This relay copies OP flags from PC marker to AX marker on first step only.
-    # Currently relaying: IMM, LEA, JMP, JSR, EXIT, NOP, ADD, SUB, MUL, DIV, MOD, OR, XOR, AND, EQ, LT, SHL, SHR
+    # NOTE: L5 FFN already sets OP_* globally, so we only need to relay FETCH.
+    # The OP_* relay was causing doubling (5.0 from L5 + 5.0 from relay = 10.0).
     base = 5 * HD
     attn.W_q[base, BD.MARK_AX] = L
-    attn.W_q[base, BD.HAS_SE] = -L  # Only fire when NOT HAS_SE (first step)
+    attn.W_q[base, BD.HAS_SE] = -L
     attn.W_k[base, BD.MARK_PC] = L
-    # V: copy OP flags (18 total: added JSR)
-    attn.W_v[base + 0, BD.OP_IMM] = 1.0
-    attn.W_v[base + 1, BD.OP_LEA] = 1.0
-    attn.W_v[base + 2, BD.OP_JMP] = 1.0
-    attn.W_v[base + 3, BD.OP_JSR] = 1.0  # ADDED: relay JSR flag
-    attn.W_v[base + 4, BD.OP_EXIT] = 1.0
-    attn.W_v[base + 5, BD.OP_NOP] = 1.0
-    attn.W_v[base + 6, BD.OP_ADD] = 1.0
-    attn.W_v[base + 7, BD.OP_SUB] = 1.0
-    attn.W_v[base + 8, BD.OP_MUL] = 1.0
-    attn.W_v[base + 9, BD.OP_DIV] = 1.0
-    attn.W_v[base + 10, BD.OP_MOD] = 1.0
-    attn.W_v[base + 11, BD.OP_OR] = 1.0
-    attn.W_v[base + 12, BD.OP_XOR] = 1.0
-    attn.W_v[base + 13, BD.OP_AND] = 1.0
-    attn.W_v[base + 14, BD.OP_EQ] = 1.0
-    attn.W_v[base + 15, BD.OP_LT] = 1.0
-    attn.W_v[base + 16, BD.OP_SHL] = 1.0
-    attn.W_v[base + 17, BD.OP_SHR] = 1.0
-    # O: write OP flags at AX marker
-    attn.W_o[BD.OP_IMM, base + 0] = 1.0
-    attn.W_o[BD.OP_LEA, base + 1] = 1.0
-    attn.W_o[BD.OP_JMP, base + 2] = 1.0
-    attn.W_o[BD.OP_JSR, base + 3] = 1.0  # ADDED: write JSR flag to AX marker
+    # V/O: only relay FETCH (OP_* already set globally by L5 FFN)
+    for k in range(16):
+        attn.W_v[base + k, BD.FETCH_LO + k] = 1.0
+        attn.W_v[base + 16 + k, BD.FETCH_HI + k] = 1.0
+    for k in range(16):
+        attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
+        attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
     attn.W_o[BD.OP_EXIT, base + 4] = 1.0
-    attn.W_o[BD.OP_NOP, base + 5] = 1.0
-    attn.W_o[BD.OP_ADD, base + 6] = 1.0
-    attn.W_o[BD.OP_SUB, base + 7] = 1.0
-    attn.W_o[BD.OP_MUL, base + 8] = 1.0
-    attn.W_o[BD.OP_DIV, base + 9] = 1.0
-    attn.W_o[BD.OP_MOD, base + 10] = 1.0
-    attn.W_o[BD.OP_OR, base + 11] = 1.0
-    attn.W_o[BD.OP_XOR, base + 12] = 1.0
-    attn.W_o[BD.OP_AND, base + 13] = 1.0  # FIXED: was OP_EQ
-    attn.W_o[BD.OP_EQ, base + 14] = 1.0   # FIXED: was OP_LT
-    attn.W_o[BD.OP_LT, base + 15] = 1.0   # FIXED: was OP_SHL
-    attn.W_o[BD.OP_SHL, base + 16] = 1.0  # FIXED: was OP_SHR
-    attn.W_o[BD.OP_SHR, base + 17] = 1.0
-    # V: also copy FETCH_LO/HI (positions 18-49) for first-step IMM routing
-    # This relay was moved from head 4 to avoid BZ/BNZ weight conflicts.
-    # UPDATED: positions shifted from 17 to 18 due to JSR addition
-    for k in range(16):
-        attn.W_v[base + 18 + k, BD.FETCH_LO + k] = 1.0
-        attn.W_v[base + 34 + k, BD.FETCH_HI + k] = 1.0
-    # O: write FETCH_LO/HI at AX marker
-    for k in range(16):
-        attn.W_o[BD.FETCH_LO + k, base + 18 + k] = 1.0
-        attn.W_o[BD.FETCH_HI + k, base + 34 + k] = 1.0
-    # Anti-leakage gate: prevent FETCH writes at non-AX positions (byte positions etc.)
+    # Anti-leakage gate for FETCH relay (prevent writes at non-AX positions)
     # Without this gate, softmax1 distributes attention uniformly at byte positions,
     # and W_o writes garbage FETCH values, overwriting the correct FETCH from L4 FFN.
     # Gate mechanism: Q[slot] = 500 * MARK_AX - 500, K[slot] = 5 * CONST
@@ -4460,18 +4438,18 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_LO + k] = 1.0
-        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / (S * 40.0)
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
-        ffn.W_up[unit, BD.OP_EXIT] = -S * 20  # Strong block EXIT crossfire
-        ffn.W_up[unit, BD.OP_JMP] = -S * 20  # Strong block JMP crossfire
+        ffn.W_up[unit, BD.OP_EXIT] = -S * 20
+        ffn.W_up[unit, BD.OP_JMP] = -S * 20
         ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -6*S to block at PC marker
-        ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8
+        ffn.W_up[unit, BD.IS_BYTE] = -S
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_HI + k] = 1.0
-        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / (S * 40.0)
         unit += 1
 
     # === EXIT: AX_CARRY → OUTPUT ===
@@ -4780,6 +4758,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
 
 
+    
     
     
     

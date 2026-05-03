@@ -124,11 +124,8 @@ def _set_compiled_weights(
 ):
     """Set weights using compiler-generated approach.
 
-    Uses UnifiedVMCompiler to generate all weights for the Neural VM.
-    The compiled approach produces weights that:
-    1. Pass all tests that hand-set weights pass
-    2. Maintain forward pass purity
-    3. Support the same features (tool calling, conversational I/O, etc.)
+    Uses DeclarativeCompiler to generate all weights for the Neural VM.
+    Produces weights identical to the hand-set baseline.
 
     Args:
         model: AutoregressiveVM instance
@@ -136,20 +133,12 @@ def _set_compiled_weights(
         enable_conversational_io: Enable conversational I/O
         alu_mode: ALU mode ('lookup' or 'efficient')
     """
-    from .unified_compiler import UnifiedVMCompiler
+    from .declarative import DeclarativeCompiler
 
-    # Create compiler with model parameters
-    compiler = UnifiedVMCompiler(
-        d_model=model.d_model,
-        n_layers=len(model.blocks),
-        n_heads=model.blocks[0].attn.num_heads,
-        ffn_hidden=model.blocks[0].ffn.W_up.shape[0],
-        alu_mode=alu_mode,
-    )
-
-    # Compile all weights into the model
+    compiler = DeclarativeCompiler()
     compiler.compile(
         model,
+        alu_mode=alu_mode,
         enable_tool_calling=enable_tool_calling,
         enable_conversational_io=enable_conversational_io,
     )

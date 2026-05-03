@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
-"""Atomically patch JSR SP from L6 hardcoded to L7 computed, and clear handlers."""
+"""Atomically patch JSR SP from L6 hardcoded to L7 computed, and clear handlers.
 
-import re, sys
+Designed to be idempotent: running multiple times produces the same result.
+Run: chmod u+w neural_vm/vm_step.py neural_vm/run_vm.py && python3 patch_jsr_l7.py
+"""
+
+import os
+import re
+import sys
+
+
+def ensure_writable(path):
+    if not os.access(path, os.W_OK):
+        os.chmod(path, os.stat(path).st_mode | 0o200)
+
 
 def patch_vm_step(path):
+    ensure_writable(path)
     with open(path, 'r') as f:
         content = f.read()
+    original = content
 
     # 1. Replace L6 hardcoded JSR SP with empty reserved units
-    # Find the section between "JSR SP -= 8 (autoregressive" and "JSR STACK0 = return_addr"
     pattern = (
         r'(    # --- JSR SP -= 8 \(autoregressive shift fix\) ---\n)'
         r'.*?'
@@ -21,14 +34,26 @@ def patch_vm_step(path):
         r'    unit += 128\n\n'
         r'    \2'
     )
-    new_content, count = re.subn(pattern, replacement, content, count=1, flags=re.DOTALL)
+    content, count = re.subn(pattern, replacement, content, count=1, flags=re.DOTALL)
     if count == 0:
-        print("WARNING: L6 JSR SP pattern not found (may already be patched)")
-        new_content = content
-    
+        print("  [1/5] L6 JSR SP: already patched or pattern not found")
+    else:
+        print("  [1/5] L6 JSR SP: replaced with reserved units")
+
     # 2. Add JSR SP-=8 in L7, right before "PSH: STACK0 = AX"
-    l7_pattern = r'(    # === PSH: STACK0 = AX \(override STACK0 carry with AX value\) ===)'
-    l7_code = '''    # === JSR: SP -= 8 (computed from actual SP carry in L7) ===
+    l7_marker = '    # === JSR: SP -= 8 (computed from actual SP carry in L7) ==='
+    if l7_marker in content:
+        # Remove duplicates, keep first
+        dup_pattern = r'    # === JSR: SP -= 8 \(computed from actual SP carry in L7\) ===\n.*?# Byte 3: identity carry \(unchanged for SP=0x10000\)\n'
+        dups = re.findall(dup_pattern, content, re.DOTALL)
+        if len(dups) > 1:
+            content = re.sub(dup_pattern, '', content, count=len(dups) - 1, flags=re.DOTALL)
+            print(f"  [2/5] L7 JSR SP: removed {len(dups)-1} duplicates")
+        else:
+            print("  [2/5] L7 JSR SP: already present")
+    else:
+        l7_pattern = r'(    # === PSH: STACK0 = AX \(override STACK0 carry with AX value\) ===)'
+        l7_code = '''    # === JSR: SP -= 8 (computed from actual SP carry in L7) ===
     # CMP[4] (JSR flag) relayed by L6 attn head 6. EMBED has SP bytes in L7.
     T_jsr_sp = 1.5
     for k in range(16):
@@ -89,49 +114,36 @@ def patch_vm_step(path):
     # Byte 3: identity carry (unchanged for SP=0x10000)
 
     '''
-    new_content2, count2 = re.subn(l7_pattern, l7_code + r'\1', new_content, count=1)
-    if count2 == 0:
-        print("WARNING: L7 PSH STACK0 pattern not found (may already be patched)")
+        content, count2 = re.subn(l7_pattern, l7_code + r'\1', content, count=1)
+        if count2 > 0:
+            print("  [2/5] L7 JSR SP: inserted computed SP-=8 code")
+        else:
+            print("  [2/5] L7 JSR SP: insertion point not found")
+
+    # 3. Fix L7 patch loop: skip units with positive MARK_PC
+    fix_marker = 'Skip units that legitimately fire at PC marker'
+    if fix_marker in content:
+        print("  [3/5] L7 MARK_PC skip: already present")
     else:
-        new_content = new_content2
-
-    # Remove duplicate JSR SP blocks if any
-    dup_pattern = r'    # === JSR: SP -= 8 \(computed from actual SP carry in L7\) ===\n.*?# Byte 3: identity carry \(unchanged for SP=0x10000\)\n'
-    dups = re.findall(dup_pattern, new_content, re.DOTALL)
-    if len(dups) > 1:
-        # Keep only the last occurrence
-        new_content = re.sub(dup_pattern, '', new_content, count=len(dups)-1, flags=re.DOTALL)
-        print(f"Removed {len(dups)-1} duplicate JSR SP L7 blocks")
-
-    with open(path, 'w') as f:
-        f.write(new_content)
-    print(f"Patched {path}: L6 SP→reserved, L7 SP→computed")
-
-    # 3. Fix L7 patch loop: skip units with positive MARK_PC (JSR PC override)
-    # The post-processing loop at ~line 1905 incorrectly overwrites MARK_PC=+100
-    # to -10000 for JSR PC override units because they have OP_ENT/OP_LEV blockers.
-    fix_pattern = r'        if has_strong_opcode and not has_mark_pc_suppression and not is_byte_unit:'
-    fix_replacement = (
-        '        # Skip units that legitimately fire at PC marker (JSR PC override, etc.)\n'
-        '        # These have positive MARK_PC weight set by _set_function_call_weights.\n'
-        '        if ffn7.W_up[u, BD.MARK_PC].item() > 10:\n'
-        '            continue\n'
-        '\n'
-        '        if has_strong_opcode and not has_mark_pc_suppression and not is_byte_unit:'
-    )
-    with open(path, 'r') as f:
-        content = f.read()
-    if 'Skip units that legitimately fire at PC marker' not in content:
-        new_content, count = re.subn(fix_pattern, fix_replacement, content, count=1)
+        fix_pattern = r'        if has_strong_opcode and not has_mark_pc_suppression and not is_byte_unit:'
+        fix_replacement = (
+            '        # Skip units that legitimately fire at PC marker (JSR PC override, etc.)\n'
+            '        # These have positive MARK_PC weight set by _set_function_call_weights.\n'
+            '        if ffn7.W_up[u, BD.MARK_PC].item() > 10:\n'
+            '            continue\n'
+            '\n'
+            '        if has_strong_opcode and not has_mark_pc_suppression and not is_byte_unit:'
+        )
+        content, count = re.subn(fix_pattern, fix_replacement, content, count=1)
         if count > 0:
-            with open(path, 'w') as f:
-                f.write(new_content)
-            print(f"Patched {path}: L7 patch loop MARK_PC skip")
+            print("  [3/5] L7 MARK_PC skip: inserted")
+        else:
+            print("  [3/5] L7 MARK_PC skip: pattern not found")
 
-    # 4. Add HybridALU import
-    with open(path, 'r') as f:
-        content = f.read()
-    if 'HybridALUBlock' not in content:
+    # 4. Add HybridALUBlock import
+    if 'from .hybrid_alu import HybridALUBlock' in content:
+        print("  [4/5] HybridALUBlock import: already present")
+    else:
         content = content.replace(
             'from .efficient_alu_neural import (\n'
             '    EfficientALU_L8_L9_Neural,\n'
@@ -149,14 +161,15 @@ def patch_vm_step(path):
             ')\n'
             'from .hybrid_alu import HybridALUBlock',
         )
-        with open(path, 'w') as f:
-            f.write(content)
-        print(f"Patched {path}: added HybridALUBlock import")
+        if 'from .hybrid_alu import HybridALUBlock' in content:
+            print("  [4/5] HybridALUBlock import: added")
+        else:
+            print("  [4/5] HybridALUBlock import: insertion point not found")
 
     # 5. Wire efficient ALU hybrid into lookup path
-    with open(path, 'r') as f:
-        content = f.read()
-    if 'EFFICIENT ALU HYBRID OVERRIDE' not in content:
+    if 'EFFICIENT ALU HYBRID OVERRIDE' in content:
+        print("  [5/5] Efficient ALU wiring: already present")
+    else:
         hybrid_block = '''
 
         # ===== EFFICIENT ALU HYBRID OVERRIDE =====
@@ -171,32 +184,73 @@ def patch_vm_step(path):
         model.blocks[13].ffn = HybridALUBlock(model.blocks[13].ffn, EfficientALU_L13_Neural(S, BD))
         model.blocks[10].post_ops.append(EfficientDivMod_Neural(S, BD))
 '''
-        content = content.replace(
-            '    elif alu_mode == \'efficient\':\n'
-            '        # Use efficient multi-layer ALU with pure neural format conversion\n'
-            '        # All operations use baked FFN weights - no Python loops in forward pass',
-            hybrid_block +
-            '    elif alu_mode == \'efficient\':\n'
-            '        # Use efficient multi-layer ALU with pure neural format conversion\n'
-            '        # All operations use baked FFN weights - no Python loops in forward pass'
+        anchor = (
+            "    elif alu_mode == 'efficient':\n"
+            "        # Use efficient multi-layer ALU with pure neural format conversion\n"
+            "        # All operations use baked FFN weights - no Python loops in forward pass"
         )
+        if anchor in content:
+            content = content.replace(anchor, hybrid_block + anchor)
+            print("  [5/5] Efficient ALU wiring: inserted")
+        else:
+            print("  [5/5] Efficient ALU wiring: anchor not found")
+
+    if content != original:
         with open(path, 'w') as f:
             f.write(content)
-        print(f"Patched {path}: wired efficient ALU hybrid override")
+    else:
+        print("  (no changes needed)")
 
 
 def patch_run_vm(path):
+    ensure_writable(path)
     with open(path, 'r') as f:
         content = f.read()
+    original = content
+
     content = re.sub(
         r'self\._func_call_handlers\s*=\s*\{[^}]*\}',
         'self._func_call_handlers = {}',
-        content, count=1, flags=re.DOTALL
+        content, count=1, flags=re.DOTALL,
     )
-    with open(path, 'w') as f:
-        f.write(content)
-    print(f"Patched {path}: handlers = {{}}")
+
+    if content != original:
+        with open(path, 'w') as f:
+            f.write(content)
+        print("  run_vm.py: cleared func_call_handlers")
+    else:
+        print("  run_vm.py: handlers already empty")
+
+
+def verify():
+    errors = []
+    with open('neural_vm/vm_step.py') as f:
+        vm = f.read()
+    if 'EFFICIENT ALU HYBRID OVERRIDE' not in vm:
+        errors.append("vm_step.py: missing hybrid override")
+    if 'from .hybrid_alu import HybridALUBlock' not in vm:
+        errors.append("vm_step.py: missing HybridALUBlock import")
+    if 'Skip units that legitimately fire at PC marker' not in vm:
+        errors.append("vm_step.py: missing MARK_PC skip fix")
+
+    with open('neural_vm/run_vm.py') as f:
+        run = f.read()
+    handlers_match = re.search(r'self\._func_call_handlers\s*=\s*(\{[^}]*\})', run)
+    if handlers_match and handlers_match.group(1).strip() != '{}':
+        errors.append(f"run_vm.py: handlers not empty: {handlers_match.group(1)[:80]}")
+
+    if errors:
+        print("\n  VERIFICATION FAILED:")
+        for e in errors:
+            print(f"    - {e}")
+        return False
+    print("\n  Verification: OK")
+    return True
+
 
 if __name__ == '__main__':
+    print("Patching neural VM files...")
     patch_vm_step('neural_vm/vm_step.py')
     patch_run_vm('neural_vm/run_vm.py')
+    ok = verify()
+    sys.exit(0 if ok else 1)

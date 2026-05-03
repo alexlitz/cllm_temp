@@ -73,7 +73,7 @@ class BDToGEConverter(nn.Module):
             ]
             for pos in range(8):
                 for bd_dim_idx, ge_opcode in self.opcode_map:
-                    self.W_proj[pos, ge.OP_START + ge_opcode, bd_dim_idx] = 1.0
+                    self.W_proj[pos, ge.OP_START + ge_opcode, bd_dim_idx] = 0.2
 
     def forward(self, x_bd):
         """
