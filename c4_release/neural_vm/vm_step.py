@@ -591,6 +591,8 @@ class CarryPropagationPostOp(nn.Module):
                     self.W_up.data[unit, add_carry_in] = S
                     self.W_up.data[unit, BD.OP_ADD] = S
                     self.W_up.data[unit, BD.IS_BYTE] = S
+                    self.W_up.data[unit, BD.MARK_AX] = -S * 1000
+                    self.W_up.data[unit, BD.MARK_PC] = -S * 1000
                     self.W_up.data[unit, byte_dim] = S
                     self.W_up.data[unit, BD.OUTPUT_LO + lo] = S
                     self.W_up.data[unit, BD.OUTPUT_HI + hi] = S
@@ -615,6 +617,8 @@ class CarryPropagationPostOp(nn.Module):
                     self.W_up.data[unit, sub_carry_in] = S
                     self.W_up.data[unit, BD.OP_SUB] = S
                     self.W_up.data[unit, BD.IS_BYTE] = S
+                    self.W_up.data[unit, BD.MARK_AX] = -S * 1000
+                    self.W_up.data[unit, BD.MARK_PC] = -S * 1000
                     self.W_up.data[unit, byte_dim] = S
                     self.W_up.data[unit, BD.OUTPUT_LO + lo] = S
                     self.W_up.data[unit, BD.OUTPUT_HI + hi] = S
@@ -675,7 +679,6 @@ class BitwiseBytePropagationPostOp(nn.Module):
                         self.W_up.data[unit, BD.MARK_AX] = -S
                         self.b_up.data[unit] = -S * 3.5
                         self.W_gate.data[unit, op_dim] = 1.0
-                        self.W_gate.data[unit, BD.IS_BYTE] = S
                         self.W_down.data[BD.OUTPUT_LO + a_lo, unit] = -2.0 / S
                         self.W_down.data[BD.OUTPUT_LO + r, unit] = 2.0 / S
                         unit += 1
@@ -689,7 +692,6 @@ class BitwiseBytePropagationPostOp(nn.Module):
                         self.W_up.data[unit, BD.MARK_AX] = -S
                         self.b_up.data[unit] = -S * 3.5
                         self.W_gate.data[unit, op_dim] = 1.0
-                        self.W_gate.data[unit, BD.IS_BYTE] = S
                         self.W_down.data[BD.OUTPUT_HI + a_hi, unit] = -2.0 / S
                         self.W_down.data[BD.OUTPUT_HI + r, unit] = 2.0 / S
                         unit += 1
@@ -4514,19 +4516,21 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.OP_JMP] = S
         ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.HAS_SE] = S
         ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
-        ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0  # Use AX_CARRY (no TEMP overlap)
+        ffn.b_up[unit] = -S * 6.5
+        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.OP_JMP] = S
         ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.HAS_SE] = S
         ffn.W_up[unit, BD.MARK_PC] = -S  # Block at PC marker
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
-        ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0  # Use AX_CARRY (no TEMP overlap)
+        ffn.b_up[unit] = -S * 6.5
+        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
@@ -4558,6 +4562,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.CMP + 0] = S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * T_jmp
         ffn.W_gate[unit, BD.OUTPUT_LO + k] = -1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -4565,6 +4570,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.CMP + 0] = S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * T_jmp
         ffn.W_gate[unit, BD.OUTPUT_HI + k] = -1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -4573,6 +4579,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.CMP + 0] = S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * T_jmp
         ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -4580,6 +4587,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.CMP + 0] = S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * T_jmp
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -4595,6 +4603,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
         ffn.W_up[unit, BD.HAS_SE] = -S  # only when NOT HAS_SE (first step)
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * (T_op_jmp + 0.5)  # require all three conditions
         ffn.W_gate[unit, BD.OUTPUT_LO + k] = -1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -4603,6 +4612,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
         ffn.W_up[unit, BD.HAS_SE] = -S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * (T_op_jmp + 0.5)
         ffn.W_gate[unit, BD.OUTPUT_HI + k] = -1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -4617,6 +4627,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
         ffn.W_up[unit, BD.HAS_SE] = -S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * (T_op_jmp + 0.5)
         ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
@@ -4626,6 +4637,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
         ffn.W_up[unit, BD.HAS_SE] = -S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * (T_op_jmp + 0.5)
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -4641,6 +4653,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * T_op_jmp_all
         ffn.W_gate[unit, BD.OUTPUT_LO + k] = -1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -4648,6 +4661,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * T_op_jmp_all
         ffn.W_gate[unit, BD.OUTPUT_HI + k] = -1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -4656,6 +4670,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * T_op_jmp_all
         ffn.W_gate[unit, BD.FETCH_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
@@ -4663,6 +4678,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.OP_JMP] = S
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.b_up[unit] = -S * T_op_jmp_all
         ffn.W_gate[unit, BD.FETCH_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
@@ -5667,6 +5683,7 @@ def _set_layer8_alu(ffn, S, BD):
         for b in range(16):
             result = (a + b) % 16
             ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.MARK_PC] = -S * 2
             ffn.W_up[unit, BD.ALU_LO + a] = S
             ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
             ffn.b_up[unit] = -S * 2.5  # 3-way AND
@@ -5699,6 +5716,7 @@ def _set_layer8_alu(ffn, S, BD):
         for b in range(16):
             result = (a - b) % 16  # ALU - AX_CARRY = stack - AX
             ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.MARK_PC] = -S * 2
             ffn.W_up[unit, BD.ALU_LO + a] = S
             ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
             ffn.b_up[unit] = -S * 2.5
@@ -5711,6 +5729,7 @@ def _set_layer8_alu(ffn, S, BD):
         for b in range(16):
             if a + b >= 16:
                 ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_PC] = -S * 2
                 ffn.W_up[unit, BD.ALU_LO + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
                 ffn.b_up[unit] = -S * 2.5
@@ -5767,6 +5786,7 @@ def _set_layer8_alu(ffn, S, BD):
         for b in range(16):
             if a < b:  # Borrow when stack_top < AX
                 ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_PC] = -S * 2
                 ffn.W_up[unit, BD.ALU_LO + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
                 ffn.b_up[unit] = -S * 2.5
@@ -5917,6 +5937,33 @@ def _set_layer8_alu(ffn, S, BD):
     # L9 attention head 1 now directly writes BP value to ADDR_B0 at PC marker.
     # Having L8 FFN also write to ADDR_B0 causes interference (values are additive).
     # The 34 units (32 for byte 0 + 2 for bytes 1-2) have been removed.
+
+    # === LEA first-step AX byte 2 output (2 units) ===
+    # FIX 2026-05-04: Moved from L4 FFN (where CMP[7] was not yet available).
+    # L7 attention head 5 relays OP_LEA → CMP[7], available from L7 onward.
+    # At AX byte 1 position (BYTE_INDEX_1), predicting AX byte 2.
+    # BP = 0x10000, so byte 2 = 0x01. Fires only on first step (NOT HAS_SE).
+    AX_I = 1
+    T_lea_byte = 3.5
+    ffn.W_up[unit, BD.CMP + 7] = S
+    ffn.W_up[unit, BD.H1 + AX_I] = S
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * T_lea_byte
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 1, unit] = 4.0 / S
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = -4.0 / S
+    unit += 1
+    ffn.W_up[unit, BD.CMP + 7] = S
+    ffn.W_up[unit, BD.H1 + AX_I] = S
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
+    ffn.b_up[unit] = -S * T_lea_byte
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0 / S
+    unit += 1
 
     return unit
 
@@ -6087,6 +6134,7 @@ def _set_layer9_alu(ffn, S, BD):
             for b in range(16):
                 result = (a + b + carry_in) % 16
                 ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_PC] = -S * 2
                 ffn.W_up[unit, BD.ALU_HI + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
                 if carry_in == 0:
@@ -6154,6 +6202,7 @@ def _set_layer9_alu(ffn, S, BD):
             for b in range(16):
                 result = (a - b - borrow_in) % 16  # ALU - AX_CARRY - borrow
                 ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_PC] = -S * 2
                 ffn.W_up[unit, BD.ALU_HI + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
                 if borrow_in == 0:
@@ -6200,6 +6249,7 @@ def _set_layer9_alu(ffn, S, BD):
     # hi_eq: 16 units — 3-way AND (MARK_AX + ALU_HI[k] + AX_CARRY_HI[k])
     for k in range(16):
         ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.MARK_PC] = -S * 2
         ffn.W_up[unit, BD.ALU_HI + k] = S
         ffn.W_up[unit, BD.AX_CARRY_HI + k] = S
         ffn.b_up[unit] = -S * 2.5
@@ -6210,6 +6260,7 @@ def _set_layer9_alu(ffn, S, BD):
     # lo_eq: 16 units
     for k in range(16):
         ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.MARK_PC] = -S * 2
         ffn.W_up[unit, BD.ALU_LO + k] = S
         ffn.W_up[unit, BD.AX_CARRY_LO + k] = S
         ffn.b_up[unit] = -S * 2.5
@@ -6221,6 +6272,7 @@ def _set_layer9_alu(ffn, S, BD):
     for a in range(16):
         for b in range(a + 1, 16):
             ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.MARK_PC] = -S * 2
             ffn.W_up[unit, BD.ALU_HI + a] = S
             ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
             ffn.b_up[unit] = -S * 2.5
@@ -6232,6 +6284,7 @@ def _set_layer9_alu(ffn, S, BD):
     for a in range(16):
         for b in range(a + 1, 16):
             ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.MARK_PC] = -S * 2
             ffn.W_up[unit, BD.ALU_LO + a] = S
             ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
             ffn.b_up[unit] = -S * 2.5
@@ -6248,6 +6301,7 @@ def _set_layer9_alu(ffn, S, BD):
                 if a + b + carry_in < 16:
                     continue  # no carry-out
                 ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_PC] = -S * 2
                 ffn.W_up[unit, BD.ALU_HI + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
                 if carry_in == 0:
@@ -6279,6 +6333,7 @@ def _set_layer9_alu(ffn, S, BD):
                     if a > b:
                         continue  # no borrow-out when ALU > AX_CARRY (a - b - 1 >= 0)
                 ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_PC] = -S * 2
                 ffn.W_up[unit, BD.ALU_HI + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_HI + b] = S
                 if borrow_in == 0:
@@ -7039,6 +7094,10 @@ def _set_layer10_alu(ffn, S, BD):
         BD.OP_LEA,  # LEA: AX = FETCH + BP (handled by L8/L9 ADD circuit)
         BD.OP_LI,  # L15 provides memory lookup result
         BD.OP_LC,  # L15 provides memory lookup result (byte)
+        BD.OP_JMP,  # L6 handles AX_CARRY -> OUTPUT (gated by HAS_SE)
+        BD.OP_EXIT,  # L6 handles AX_CARRY -> OUTPUT
+        BD.OP_NOP,  # L6 handles AX_CARRY -> OUTPUT
+        BD.OP_PUTCHAR,  # L6 handles AX_CARRY -> OUTPUT
     ]
     for k in range(16):
         ffn.W_up[unit, BD.MARK_AX] = S

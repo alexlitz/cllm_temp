@@ -148,6 +148,7 @@ class AutoregressiveVMRunner:
         debug_memory=False,
         use_kv_cache=True,
         max_mem_history=64,
+        trust_neural_alu=False,
     ):
         self.model = AutoregressiveVM(
             d_model=d_model,
@@ -230,6 +231,7 @@ class AutoregressiveVMRunner:
         # If True: disable runner VM-memory emulation paths and only allow
         # explicit external tool boundary handling.
         self.pure_attention_memory = pure_attention_memory
+        self.trust_neural_alu = trust_neural_alu
         self._pure_attention_report = {}
 
     def run(
@@ -621,11 +623,16 @@ class AutoregressiveVMRunner:
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
             elif exec_op in _BINARY_POP_OPS:
                 stack_val = self._mem_load_word(self._last_sp) if self._last_sp else 0
-                alu_result = self._compute_alu(exec_op, stack_val, self._last_ax)
                 self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
-                self._last_ax = alu_result
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-                self._override_register_in_last_step(context, Token.REG_AX, alu_result)
+                if self.trust_neural_alu:
+                    model_ax = self._extract_register(context, Token.REG_AX)
+                    if model_ax is not None:
+                        self._last_ax = model_ax
+                else:
+                    alu_result = self._compute_alu(exec_op, stack_val, self._last_ax)
+                    self._last_ax = alu_result
+                    self._override_register_in_last_step(context, Token.REG_AX, alu_result)
             elif exec_op == Opcode.LI:
                 addr = self._last_ax
                 val = self._mem_load_word(addr)

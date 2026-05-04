@@ -167,7 +167,7 @@ def neural_only_runner():
     """
     from neural_vm.run_vm import AutoregressiveVMRunner
 
-    runner = AutoregressiveVMRunner()
+    runner = AutoregressiveVMRunner(trust_neural_alu=True)
     runner._func_call_handlers = {}
     runner._syscall_handlers = {}
     return runner
