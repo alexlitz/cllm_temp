@@ -518,18 +518,20 @@ class AutoregressiveVMRunner:
             instr_idx = pc // INSTR_WIDTH
             if 0 <= instr_idx < len(bytecode):
                 op = bytecode[instr_idx] & 0xFF
-                handler = self._syscall_handlers.get(op)
-                if handler:
-                    if self._should_block_vm_memory_handler(op):
-                        self._record_pure_attention("blocked_vm_memory_ops", op)
-                    else:
-                        handler(context, output)
-                        if op in _TOOL_CALL_OPS:
-                            self._record_pure_attention("external_tool_ops", op)
-                if self._should_block_track_memory(op):
-                    self._record_pure_attention("blocked_track_memory_ops", op)
-                else:
-                    self._track_memory_write(context, op)
+        if op is None:
+            op = exec_op
+        handler = self._syscall_handlers.get(op)
+        if handler:
+            if self._should_block_vm_memory_handler(op):
+                self._record_pure_attention("blocked_vm_memory_ops", op)
+            else:
+                handler(context, output)
+                if op in _TOOL_CALL_OPS:
+                    self._record_pure_attention("external_tool_ops", op)
+        if self._should_block_track_memory(op):
+            self._record_pure_attention("blocked_track_memory_ops", op)
+        else:
+            self._track_memory_write(context, op)
 
         func_handler = self._func_call_handlers.get(exec_op)
         if func_handler:
@@ -1191,7 +1193,9 @@ class AutoregressiveVMRunner:
         sp[argc-2..0] = remaining args from second to last.
         """
         # Determine argc by peeking at the next instruction (ADJ n)
-        pc = self._extract_register(context, Token.REG_PC)
+        model_pc = self._extract_register(context, Token.REG_PC)
+        runner_pc = self._exec_pc()
+        pc = model_pc if model_pc is not None and 0 <= (model_pc // INSTR_WIDTH) < len(self._bytecode) else runner_pc
         argc = 0
         if pc is not None:
             adj_idx = pc // INSTR_WIDTH + 1  # next instruction after PRTF

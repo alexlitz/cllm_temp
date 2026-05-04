@@ -450,6 +450,163 @@ class TestIOStatePreservation:
         assert exit_code == 21  # (10 * 2) + 1
 
 
+class TestPRTFOutputContent:
+    """Test that printf produces correct output strings.
+
+    Uses conversational_io=False so _syscall_prtf runs via the STEP_END
+    path with the exec_op fallback for handler dispatch.
+    """
+
+    @pytest.fixture
+    def runner(self):
+        return AutoregressiveVMRunner(conversational_io=False)
+
+    def test_printf_literal_string(self, runner):
+        source = '''
+        int main() {
+            printf("Hello");
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=300)
+        assert exit_code == 0
+        assert "Hello" in output
+
+    def test_printf_with_newline(self, runner):
+        source = '''
+        int main() {
+            printf("Hello World\n");
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=300)
+        assert exit_code == 0
+        assert output == "Hello World\n"
+
+    def test_printf_integer(self, runner):
+        source = '''
+        int main() {
+            int x;
+            x = 42;
+            printf("%d", x);
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=300)
+        assert exit_code == 0
+        assert output == "42"
+
+    def test_printf_integer_in_text(self, runner):
+        source = '''
+        int main() {
+            int x;
+            x = 7;
+            printf("x=%d\n", x);
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=300)
+        assert exit_code == 0
+        assert output == "x=7\n"
+
+    def test_printf_multiple_args(self, runner):
+        source = '''
+        int main() {
+            int a;
+            int b;
+            a = 10;
+            b = 32;
+            printf("%d + %d = %d\n", a, b, a + b);
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=400)
+        assert exit_code == 0
+        assert output == "10 + 32 = 42\n"
+
+    def test_printf_hex_format(self, runner):
+        source = '''
+        int main() {
+            printf("%x", 255);
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=300)
+        assert exit_code == 0
+        assert output == "ff"
+
+    def test_printf_char_format(self, runner):
+        source = '''
+        int main() {
+            printf("%c", 65);
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=300)
+        assert exit_code == 0
+        assert output == "A"
+
+    def test_printf_negative_number(self, runner):
+        source = '''
+        int main() {
+            int x;
+            x = -42;
+            printf("x=%d\n", x);
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=300)
+        assert exit_code == 0
+        assert output == "x=-42\n"
+
+    def test_printf_multiple_calls(self, runner):
+        source = '''
+        int main() {
+            printf("Line 1\n");
+            printf("Line 2\n");
+            printf("Line 3\n");
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=500)
+        assert exit_code == 0
+        assert output == "Line 1\nLine 2\nLine 3\n"
+
+    def test_printf_return_value(self, runner):
+        source = '''
+        int main() {
+            int n;
+            n = printf("Hi");
+            return n;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=300)
+        assert exit_code == 2
+        assert output == "Hi"
+
+    def test_printf_zero(self, runner):
+        source = '''
+        int main() {
+            printf("%d", 0);
+            return 0;
+        }
+        '''
+        bytecode, data = compile_c(source)
+        output, exit_code = runner.run(bytecode, data, max_steps=300)
+        assert exit_code == 0
+        assert output == "0"
+
+
 # Run tests
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
