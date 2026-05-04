@@ -21,6 +21,8 @@ import tempfile
 import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import pytest
 
 
@@ -161,29 +163,29 @@ class TestCRuntimeFilesExist:
 
     def test_neural_runtime_exists(self):
         """Neural runtime C file exists."""
-        path = "bundler/neural_runtime.c"
+        path = os.path.join(_HERE, "bundler/neural_runtime.c")
         assert os.path.exists(path)
         assert os.path.getsize(path) > 10000  # Substantial file
 
     def test_onnx_vm_runtime_exists(self):
         """ONNX VM runtime C file exists."""
-        path = "bundler/onnx_vm_runtime.c"
+        path = os.path.join(_HERE, "bundler/onnx_vm_runtime.c")
         assert os.path.exists(path)
         assert os.path.getsize(path) > 10000
 
     def test_autoregressive_runtime_exists(self):
         """Autoregressive runtime C file exists."""
-        path = "bundler/autoregressive_runtime.c"
+        path = os.path.join(_HERE, "bundler/autoregressive_runtime.c")
         assert os.path.exists(path)
 
     def test_optimized_runtime_exists(self):
         """Optimized runtime C file exists."""
-        path = "bundler/optimized_runtime.c"
+        path = os.path.join(_HERE, "bundler/optimized_runtime.c")
         assert os.path.exists(path)
 
     def test_neural_bundler_c_exists(self):
         """Neural bundler C file exists."""
-        path = "bundler/neural_bundler.c"
+        path = os.path.join(_HERE, "bundler/neural_bundler.c")
         assert os.path.exists(path)
 
 
@@ -192,7 +194,7 @@ class TestCRuntimeStructure:
 
     def test_neural_runtime_has_fixed_point(self):
         """Neural runtime uses fixed-point arithmetic."""
-        with open("bundler/neural_runtime.c") as f:
+        with open(os.path.join(_HERE, "bundler/neural_runtime.c")) as f:
             content = f.read()
 
         # Should have fixed-point functions
@@ -201,7 +203,7 @@ class TestCRuntimeStructure:
 
     def test_neural_runtime_has_vm_ops(self):
         """Neural runtime implements VM operations."""
-        with open("bundler/neural_runtime.c") as f:
+        with open(os.path.join(_HERE, "bundler/neural_runtime.c")) as f:
             content = f.read()
 
         # Should have VM step function
@@ -209,7 +211,7 @@ class TestCRuntimeStructure:
 
     def test_neural_runtime_has_neural_ops(self):
         """Neural runtime implements neural operations."""
-        with open("bundler/neural_runtime.c") as f:
+        with open(os.path.join(_HERE, "bundler/neural_runtime.c")) as f:
             content = f.read()
 
         required = ["matmul", "softmax"]
@@ -218,7 +220,7 @@ class TestCRuntimeStructure:
 
     def test_onnx_runtime_has_operations(self):
         """ONNX runtime implements required operations."""
-        with open("bundler/onnx_vm_runtime.c") as f:
+        with open(os.path.join(_HERE, "bundler/onnx_vm_runtime.c")) as f:
             content = f.read()
 
         # Should have some tensor operations
@@ -318,7 +320,7 @@ int program_data_len = 0;
     def test_neural_runtime_syntax_check(self, has_gcc):
         """Neural runtime C file passes syntax check."""
         result = subprocess.run(
-            ["gcc", "-fsyntax-only", "bundler/neural_runtime.c"],
+            ["gcc", "-fsyntax-only", os.path.join(_HERE, "bundler/neural_runtime.c")],
             capture_output=True,
             text=True,
             timeout=30
