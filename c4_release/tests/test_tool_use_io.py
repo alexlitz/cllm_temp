@@ -163,35 +163,102 @@ class TestToolUseIOHandler:
 class TestToolUseVM:
     """Tests for ToolUseVM execution with tool calls.
 
-    Note: ToolUseVM is a standalone Python VM for testing tool call protocol.
-    These tests are skipped due to path issues in tooluse_io.py.
+    ToolUseVM is a standalone Python VM for testing tool call protocol.
     The actual neural VM tool call mechanism is tested in TestToolCallNeuralVM.
     """
 
-    @pytest.mark.skip(reason="tooluse_io.py has hardcoded path issue")
-    def test_simple_computation_no_io(self):
-        """VM executes simple computation without I/O tool calls."""
-        pass
+    @pytest.fixture
+    def vm_with_handler(self):
+        from tools.tooluse_io import ToolUseVM, ToolUseIOHandler
+        output_buffer = []
+        handler = ToolUseIOHandler(
+            output_callback=lambda s: output_buffer.append(s),
+            input_callback=lambda: "A\n",
+        )
+        vm = ToolUseVM(handler)
+        yield vm, handler, output_buffer
 
-    @pytest.mark.skip(reason="tooluse_io.py has hardcoded path issue")
-    def test_putchar_tool_call(self):
-        """VM generates PUTCHAR tool calls."""
-        pass
+    def test_simple_computation_no_io(self, vm_with_handler):
+        from tools.tooluse_io import Opcode
+        vm, handler, _ = vm_with_handler
+        bytecode = [
+            (Opcode.IMM << 0) | (5 << 8),
+            (Opcode.PSH << 0),
+            (Opcode.IMM << 0) | (3 << 8),
+            (Opcode.ADD << 0),
+            (Opcode.EXIT << 0),
+        ]
+        vm.reset()
+        vm.load(bytecode)
+        result = vm.run()
+        assert result == 8
 
-    @pytest.mark.skip(reason="tooluse_io.py has hardcoded path issue")
-    def test_getchar_tool_call(self):
-        """VM generates GETCHAR tool calls."""
-        pass
+    def test_putchar_tool_call(self, vm_with_handler):
+        from tools.tooluse_io import Opcode
+        vm, handler, output_buffer = vm_with_handler
+        bytecode = [
+            (Opcode.IMM << 0) | (ord('H') << 8),
+            (Opcode.PSH << 0),
+            (Opcode.PUTCHAR << 0),
+            (Opcode.IMM << 0) | (ord('i') << 8),
+            (Opcode.PSH << 0),
+            (Opcode.PUTCHAR << 0),
+            (Opcode.EXIT << 0),
+        ]
+        vm.reset()
+        vm.load(bytecode)
+        vm.run()
+        assert ''.join(output_buffer) == "Hi"
 
-    @pytest.mark.skip(reason="tooluse_io.py has hardcoded path issue")
-    def test_interactive_io_session(self):
-        """VM handles interactive I/O session (read, process, write)."""
-        pass
+    def test_getchar_tool_call(self, vm_with_handler):
+        from tools.tooluse_io import Opcode, ToolCallType
+        vm, handler, _ = vm_with_handler
+        bytecode = [
+            (Opcode.GETCHAR << 0),
+            (Opcode.EXIT << 0),
+        ]
+        vm.reset()
+        vm.load(bytecode)
+        result = vm.run()
+        assert result == ord('A')
+        input_calls = [c for c in handler.call_history if c.call_type == ToolCallType.USER_INPUT]
+        assert len(input_calls) >= 1
 
-    @pytest.mark.skip(reason="tooluse_io.py has hardcoded path issue")
-    def test_printf_tool_call(self):
-        """VM generates PRINTF tool calls with correct parameters."""
-        pass
+    def test_interactive_io_session(self, vm_with_handler):
+        from tools.tooluse_io import Opcode
+        vm, handler, output_buffer = vm_with_handler
+        bytecode = [
+            (Opcode.GETCHAR << 0),
+            (Opcode.PSH << 0),
+            (Opcode.PUTCHAR << 0),
+            (Opcode.EXIT << 0),
+        ]
+        vm.reset()
+        vm.load(bytecode)
+        vm.run()
+        assert ''.join(output_buffer) == "A"
+
+    def test_printf_tool_call(self, vm_with_handler):
+        from tools.tooluse_io import Opcode, ToolCallType
+        vm, handler, _ = vm_with_handler
+        fmt_str = "Value: %d\n"
+        data = bytearray(1024)
+        for i, c in enumerate(fmt_str):
+            data[i] = ord(c)
+        data[len(fmt_str)] = 0
+        bytecode = [
+            (Opcode.IMM << 0) | (42 << 8),
+            (Opcode.PSH << 0),
+            (Opcode.IMM << 0) | (0x10000 << 8),
+            (Opcode.PSH << 0),
+            (Opcode.PRTF << 0),
+            (Opcode.EXIT << 0),
+        ]
+        vm.reset()
+        vm.load(bytecode, bytes(data))
+        vm.run()
+        printf_calls = [c for c in handler.call_history if c.call_type == ToolCallType.PRINTF]
+        assert len(printf_calls) >= 1
 
 
 class TestToolCallNeuralVM:

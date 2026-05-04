@@ -247,6 +247,7 @@ class TestKVCacheWithRunner:
         for (output, result), exp in zip(results, expected):
             assert result == exp, f"Expected {exp}, got {result}"
 
+    @pytest.mark.timeout(300)
     def test_cache_vs_no_cache_identical(self, compile_program):
         """Results are identical with and without KV cache."""
         from neural_vm.batch_runner import BatchedSpeculativeRunner

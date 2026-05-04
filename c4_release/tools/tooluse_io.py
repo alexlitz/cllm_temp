@@ -680,7 +680,7 @@ class ToolUseVM:
             )
             return self.pending_call
 
-        elif op == Opcode.GETC or op == ExtendedOpcode.GETCHAR:
+        elif op == Opcode.GETCHAR or op == ExtendedOpcode.GETCHAR:
             self.pending_call = ToolCall(
                 ToolCallType.USER_INPUT,
                 self._next_call_id(),
@@ -688,7 +688,7 @@ class ToolUseVM:
             )
             return self.pending_call
 
-        elif op == Opcode.PUTC or op == ExtendedOpcode.PUTCHAR:
+        elif op == Opcode.PUTCHAR or op == ExtendedOpcode.PUTCHAR:
             # Note: Don't pop arguments here - caller will use ADJ to clean up
             char = self.memory.get(self.sp, 0) & 0xFF
 
@@ -724,7 +724,7 @@ class ToolUseVM:
                 self.memory[ptr + i] = val
             self.ax = ptr
 
-        elif op == Opcode.MCPY or op == 37:
+        elif op == Opcode.MCMP:
             # memcpy(dst, src, size)
             size = self.memory.get(self.sp, 0)
             self.sp += 8
@@ -883,10 +883,10 @@ if __name__ == "__main__":
     bytecode = [
         (Opcode.IMM << 0) | (ord('H') << 8),
         (Opcode.PSH << 0),
-        (Opcode.PUTC << 0),
+        (Opcode.PUTCHAR << 0),
         (Opcode.IMM << 0) | (ord('i') << 8),
         (Opcode.PSH << 0),
-        (Opcode.PUTC << 0),
+        (Opcode.PUTCHAR << 0),
         (Opcode.EXIT << 0),
     ]
     vm.reset()

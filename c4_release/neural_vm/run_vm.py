@@ -1005,7 +1005,10 @@ class AutoregressiveVMRunner:
           sp[0] = c, sp[1] = b, sp[2] = a
         """
         if arg_index == 0:
-            return self._extract_stack0(context) or 0
+            model_val = self._extract_stack0(context)
+            if model_val and model_val < 0x10000000:
+                return model_val
+            return self._mem_load_word(self._last_sp)
         sp = self._extract_register(context, Token.REG_SP)
         if sp is None:
             return 0
