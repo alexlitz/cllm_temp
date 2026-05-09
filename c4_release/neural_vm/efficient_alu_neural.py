@@ -473,32 +473,46 @@ class PureNeuralALU(nn.Module):
         pass
 
 
-# Convenience classes for each ALU layer
-class EfficientALU_L8_L9_Neural(PureNeuralALU):
-    """Neural ADD/SUB for L8-L9."""
+# Operation-named ALU classes (no layer assumptions — compiler decides placement).
+# Phase 0 rename (2026-05-09): the previous names (EfficientALU_L8_L9_Neural,
+# EfficientALU_L10_Neural, etc.) baked specific layer indices into the class names,
+# violating "compiler determines depth/width". Layer placement is now a compiler
+# concern — the operation name is what's intrinsic.
+class ALUAddSub(PureNeuralALU):
+    """Neural ADD/SUB."""
     def __init__(self, S, BD):
         super().__init__(S, BD, operations='add_sub')
 
 
-class EfficientALU_L10_Neural(PureNeuralALU):
-    """Neural AND/OR/XOR for L10."""
+class ALUAndOrXor(PureNeuralALU):
+    """Neural AND/OR/XOR."""
     def __init__(self, S, BD):
         super().__init__(S, BD, operations='bitwise')
 
 
-class EfficientALU_L11_L12_Neural(PureNeuralALU):
-    """Neural MUL for L11-L12."""
+class ALUMul(PureNeuralALU):
+    """Neural MUL."""
     def __init__(self, S, BD):
         super().__init__(S, BD, operations='mul')
 
 
-class EfficientALU_L13_Neural(PureNeuralALU):
-    """Neural SHL/SHR for L13."""
+class ALUShift(PureNeuralALU):
+    """Neural SHL/SHR."""
     def __init__(self, S, BD):
         super().__init__(S, BD, operations='shift')
 
 
-class EfficientDivMod_Neural(PureNeuralALU):
-    """Neural DIV/MOD replacement for DivModModule."""
+class ALUDivMod(PureNeuralALU):
+    """Neural DIV/MOD."""
     def __init__(self, S, BD):
         super().__init__(S, BD, operations='div_mod')
+
+
+# Backward-compat aliases (deprecated): the layer-named classes still work but
+# are not the preferred name. New code should use the operation-named classes
+# above. These aliases will be removed once the rename has propagated.
+EfficientALU_L8_L9_Neural = ALUAddSub
+EfficientALU_L10_Neural = ALUAndOrXor
+EfficientALU_L11_L12_Neural = ALUMul
+EfficientALU_L13_Neural = ALUShift
+EfficientDivMod_Neural = ALUDivMod
