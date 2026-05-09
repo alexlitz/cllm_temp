@@ -138,9 +138,604 @@ def make_layer3_ffn_op() -> Operation:
     )
 
 
+def make_layer2_mem_byte_flags_op() -> Operation:
+    """L2 FFN: MEM val byte position flags + extended BYTE_INDEX for STACK0."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer2_mem_byte_flags
+        _set_layer2_mem_byte_flags(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer2_mem_byte_flags",
+        reads={"H0", "H1", "H4", "IS_BYTE", "BYTE_INDEX_0",
+               "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
+        writes={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+                "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_nibble_copy_ffn_op() -> Operation:
+    """Conditional nibble copy: OUTPUT = EMBED for non-register byte values."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_nibble_copy_ffn
+        _set_nibble_copy_ffn(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="nibble_copy_ffn",
+        reads={"IS_BYTE", "H1", "H4", "MEM_STORE",
+               "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "MARK_STACK0", "HAS_SE", "CMP"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer4_pc_relay_op() -> Operation:
+    """L4 attention: relay PC marker EMBED → AX marker EMBED."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer4_pc_relay
+        # _set_layer4_pc_relay takes attn, S, BD, HD
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer4_pc_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer4_pc_relay",
+        reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI", "CONST"},
+        writes={"EMBED_LO", "EMBED_HI"},  # at AX marker
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer4_ffn_op() -> Operation:
+    """L4 FFN: compute PC+1/2/3/4 in FETCH dims for L5 fetch."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer4_ffn
+        _set_layer4_ffn(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer4_ffn",
+        reads={"MARK_AX", "MARK_PC", "EMBED_LO", "EMBED_HI",
+               "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "H1"},
+        writes={"FETCH_LO", "FETCH_HI"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer5_fetch_op() -> Operation:
+    """L5 attention: instruction-fetch heads (8 heads)."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer5_fetch
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer5_fetch(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer5_fetch",
+        reads={"MARK_PC", "MARK_AX", "HAS_SE",
+               "FETCH_LO", "FETCH_HI", "EMBED_LO", "EMBED_HI",
+               "ADDR_KEY", "CONST", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "OP_IMM", "OP_LEA", "OP_EXIT", "OP_JMP", "OP_JSR",
+               "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+               "OP_OR", "OP_XOR", "OP_AND",
+               "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
+        writes={"OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
+                "FETCH_LO", "FETCH_HI",
+                "OP_IMM", "OP_LEA", "OP_EXIT", "OP_JMP", "OP_JSR",
+                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+                "OP_OR", "OP_XOR", "OP_AND",
+                "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_opcode_decode_ffn_op() -> Operation:
+    """L5 FFN: decode opcode byte → 34 one-hot OP_* flags at OPCODE_BASE."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_opcode_decode_ffn
+        _set_opcode_decode_ffn(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="opcode_decode_ffn",
+        reads={"OPCODE_BYTE_LO", "OPCODE_BYTE_HI", "MARK_AX", "MARK_PC", "HAS_SE"},
+        writes={"OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
+                "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
+                "OP_SC", "OP_PSH", "OP_OR", "OP_XOR", "OP_AND",
+                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+                "OP_SHL", "OP_SHR", "OP_ADD", "OP_SUB", "OP_MUL",
+                "OP_DIV", "OP_MOD", "OP_EXIT", "OP_NOP",
+                "OP_PUTCHAR", "OP_GETCHAR",
+                "TEMP"},  # JSR writes IS_JSR to TEMP[0]
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer6_attn_op() -> Operation:
+    """L6 attention: relay heads for IS_JMP, IS_EXIT, etc. at PC marker."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer6_attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer6_attn(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer6_attn",
+        reads={"OP_JMP", "OP_EXIT", "OP_JSR", "MARK_AX", "MARK_PC", "MARK_SP",
+               "MARK_STACK0", "NEXT_SE", "FETCH_LO", "FETCH_HI",
+               "PSH_AT_SP", "OP_PSH", "OP_ADJ", "OP_ENT", "OP_LEV",
+               "AX_CARRY_LO", "AX_CARRY_HI"},
+        writes={"CMP", "AX_CARRY_LO", "AX_CARRY_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer6_routing_ffn_op() -> Operation:
+    """L6 FFN: per-opcode routing — write FETCH/AX_CARRY → OUTPUT, etc."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer6_routing_ffn
+        _set_layer6_routing_ffn(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer6_routing_ffn",
+        reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
+               "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
+               "IS_BYTE", "FETCH_LO", "FETCH_HI",
+               "AX_CARRY_LO", "AX_CARRY_HI", "CMP",
+               "OUTPUT_LO", "OUTPUT_HI", "HAS_SE",
+               "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
+               "TEMP", "DIV_STAGING"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer6_relay_heads_op() -> Operation:
+    """L6 head 6/7: STACK0 ← AX relay for PSH."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer6_relay_heads
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer6_relay_heads(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer6_relay_heads",
+        reads={"MARK_STACK0", "MARK_AX", "AX_CARRY_LO", "AX_CARRY_HI"},
+        writes={"ALU_LO", "ALU_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer7_operand_gather_op() -> Operation:
+    """L7 attention: operand A gather (prev STACK0 byte 0 → ALU at AX marker)."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer7_operand_gather
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer7_operand_gather(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer7_operand_gather",
+        reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"ALU_LO", "ALU_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer7_memory_heads_op() -> Operation:
+    """L7 attention heads 1-6: memory + flag broadcast heads."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer7_memory_heads
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer7_memory_heads(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer7_memory_heads",
+        reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
+               "OP_LI", "OP_LC", "OP_PSH", "OP_SI", "OP_SC",
+               "AX_CARRY_LO", "AX_CARRY_HI", "TEMP"},
+        writes={"OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP",
+                "TEMP", "ADDR_KEY"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer8_alu_op() -> Operation:
+    """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer8_alu
+        _set_layer8_alu(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer8_alu",
+        reads={"MARK_AX", "MARK_PC", "ALU_LO", "AX_CARRY_LO", "FETCH_LO",
+               "OP_ADD", "OP_SUB", "OP_LEA",
+               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE"},
+        writes={"OUTPUT_LO", "CARRY", "CMP_GROUP"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer8_multibyte_fetch_op() -> Operation:
+    """L8 attention head 3: fetch CODE bytes at AX byte positions."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer8_multibyte_fetch
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer8_multibyte_fetch(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer8_multibyte_fetch",
+        reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"AX_CARRY_LO", "AX_CARRY_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer8_multibyte_routing_op() -> Operation:
+    """L8 FFN extension: route FETCH → OUTPUT at AX byte positions for IMM."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer8_multibyte_routing
+        _set_layer8_multibyte_routing(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer8_multibyte_routing",
+        reads={"IS_BYTE", "H1", "OP_IMM", "MARK_AX",
+               "AX_CARRY_LO", "AX_CARRY_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer8_sp_gather_op() -> Operation:
+    """L8 attention: SP gather for ADJ/ENT."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer8_sp_gather
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer8_sp_gather(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer8_sp_gather",
+        reads={"MARK_AX", "MARK_SP", "OP_ADJ", "OP_ENT", "OP_LEA",
+               "EMBED_LO", "EMBED_HI"},
+        writes={"ALU_LO", "ALU_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer9_alu_op() -> Operation:
+    """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer9_alu
+        _set_layer9_alu(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer9_alu",
+        reads={"MARK_AX", "MARK_PC", "ALU_HI", "AX_CARRY_HI", "FETCH_HI", "CARRY",
+               "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
+               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+               "ALU_LO", "AX_CARRY_LO"},
+        writes={"OUTPUT_HI", "CMP", "OUTPUT_LO"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer9_lev_addr_relay_op() -> Operation:
+    """L9 attention head 0: BP byte 0 → ADDR_B0 at SP marker for LEV."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer9_lev_addr_relay
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer9_lev_addr_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer9_lev_addr_relay",
+        reads={"MARK_SP", "OP_LEV", "L1H1", "BYTE_INDEX_0",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"ADDR_B0_LO", "ADDR_B0_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
+    """L9 attention head 1: BP byte 0 → ADDR_B0 at PC marker for LEV return."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer9_lev_bp_to_pc_relay
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer9_lev_bp_to_pc_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer9_lev_bp_to_pc_relay",
+        reads={"MARK_PC", "OP_LEV", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "L1H1", "BYTE_INDEX_0"},
+        writes={"ADDR_B0_LO", "ADDR_B0_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer10_carry_relay_op() -> Operation:
+    """L10 attention head 0: relay CARRY flags from AX marker to AX byte positions."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer10_carry_relay
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_carry_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer10_carry_relay",
+        reads={"MARK_AX", "IS_BYTE", "H1", "CARRY"},
+        writes={"CARRY"},  # broadcast
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer10_byte_passthrough_op() -> Operation:
+    """L10 attention head 1: AX byte passthrough across steps."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer10_byte_passthrough
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_byte_passthrough(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer10_byte_passthrough",
+        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "TEMP",
+               "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer10_sp_byte_passthrough_op() -> Operation:
+    """L10 attention head 2: SP byte passthrough."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer10_sp_byte_passthrough
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_sp_byte_passthrough(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer10_sp_byte_passthrough",
+        reads={"IS_BYTE", "HAS_SE", "H1",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer10_psh_stack0_passthrough_op() -> Operation:
+    """L10 attention head 3: PSH STACK0 passthrough."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer10_psh_stack0_passthrough
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_psh_stack0_passthrough(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer10_psh_stack0_passthrough",
+        reads={"MARK_STACK0", "OP_PSH", "AX_CARRY_LO", "AX_CARRY_HI",
+               "OP_LI", "OP_LC", "OP_SI", "OP_SC"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer10_alu_op() -> Operation:
+    """L10 FFN: AND/OR/XOR + DIV/MOD setup."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer10_alu
+        _set_layer10_alu(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer10_alu",
+        reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "ALU_HI", "AX_CARRY_HI",
+               "OP_OR", "OP_XOR", "OP_AND", "OP_DIV", "OP_MOD"},
+        writes={"OUTPUT_LO", "OUTPUT_HI", "DIV_STAGING"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer11_mul_partial_op() -> Operation:
+    """L11 FFN: MUL partial product accumulation."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer11_mul_partial
+        _set_layer11_mul_partial(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer11_mul_partial",
+        reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
+        writes={"MUL_ACCUM"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer12_mul_combine_op() -> Operation:
+    """L12 FFN: combine MUL partial products into final result."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer12_mul_combine
+        _set_layer12_mul_combine(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer12_mul_combine",
+        reads={"MARK_AX", "MUL_ACCUM", "OP_MUL"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer13_mem_addr_gather_op() -> Operation:
+    """L13 attention: gather MEM addr from STACK0 / AX_CARRY for SI/SC/LI/LC."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer13_mem_addr_gather
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer13_mem_addr_gather(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer13_mem_addr_gather",
+        reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
+               "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC", "OP_SI", "OP_SC",
+               "MEM_ADDR_SRC"},
+        writes={"ADDR_B0_LO", "ADDR_B1_LO", "ADDR_B2_LO",
+                "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer13_shifts_op() -> Operation:
+    """L13 FFN: SHL/SHR shifts."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer13_shifts
+        _set_layer13_shifts(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer13_shifts",
+        reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+               "OP_SHL", "OP_SHR"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer14_mem_generation_op() -> Operation:
+    """L14 attention: generate MEM section tokens (addr + value) for SI/SC/PSH."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer14_mem_generation
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer14_mem_generation(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer14_mem_generation",
+        reads={"MARK_MEM", "MARK_SP", "MARK_STACK0", "OP_PSH", "OP_SI", "OP_SC",
+               "OP_JSR", "OP_ENT", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+               "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO", "ADDR_B0_HI",
+               "MEM_STORE", "MEM_ADDR_SRC"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer15_memory_lookup_op() -> Operation:
+    """L15 attention: memory-lookup heads for LI/LC."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer15_memory_lookup
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer15_memory_lookup(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer15_memory_lookup",
+        reads={"MARK_AX", "OP_LI", "OP_LC", "OP_LI_RELAY", "OP_LC_RELAY",
+               "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_KEY", "MARK_MEM",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer16_lev_routing_op() -> Operation:
+    """L16 FFN: LEV routing — SP = BP + 16."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer16_lev_routing
+        _set_layer16_lev_routing(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer16_lev_routing",
+        reads={"MARK_SP", "MARK_PC", "OP_LEV", "ADDR_B0_LO", "ADDR_B0_HI",
+               "TEMP"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Convenience: full operation list
+# ---------------------------------------------------------------------------
+
+def all_core_ops() -> list:
+    """Return the full list of migrated core-VM operations.
+
+    Doesn't include I/O, conversational, or tool-call operations (those need
+    their own migration pass).
+    """
+    return [
+        make_phase_a_ffn_op(),
+        make_layer1_ffn_op(),
+        make_layer2_mem_byte_flags_op(),
+        make_nibble_copy_ffn_op(),
+        make_layer3_ffn_op(),
+        make_layer4_pc_relay_op(),
+        make_layer4_ffn_op(),
+        make_layer5_fetch_op(),
+        make_opcode_decode_ffn_op(),
+        make_layer6_attn_op(),
+        make_layer6_routing_ffn_op(),
+        make_layer6_relay_heads_op(),
+        make_layer7_operand_gather_op(),
+        make_layer7_memory_heads_op(),
+        make_layer8_alu_op(),
+        make_layer8_multibyte_fetch_op(),
+        make_layer8_multibyte_routing_op(),
+        make_layer8_sp_gather_op(),
+        make_layer9_alu_op(),
+        make_layer9_lev_addr_relay_op(),
+        make_layer9_lev_bp_to_pc_relay_op(),
+        make_layer10_carry_relay_op(),
+        make_layer10_byte_passthrough_op(),
+        make_layer10_sp_byte_passthrough_op(),
+        make_layer10_psh_stack0_passthrough_op(),
+        make_layer10_alu_op(),
+        make_layer11_mul_partial_op(),
+        make_layer12_mul_combine_op(),
+        make_layer13_mem_addr_gather_op(),
+        make_layer13_shifts_op(),
+        make_layer14_mem_generation_op(),
+        make_layer15_memory_lookup_op(),
+        make_layer16_lev_routing_op(),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Dim spec compatible with _SetDim
 # ---------------------------------------------------------------------------
+
+# Known limitation of the migration shims:
+#
+# Many ops both *read* and *write* dims like OUTPUT_LO/EMBED_LO. The reads happen
+# at one position (e.g., MARK_PC) and writes at another (e.g., MARK_AX). My
+# Operation declarations use dim *names* without position context, so the compiler
+# can see both ops reading/writing the same name and infer a circular dependency
+# where none truly exists. This is a real architectural limitation of the current
+# LayerCompiler dep model — the next refinement needs per-position reads/writes
+# (e.g., "EMBED_LO@MARK_PC" vs "EMBED_LO@MARK_AX") so the compiler can distinguish
+# "reading the previous position's value" from "writing this position's value".
+#
+# Until that refinement, all_core_ops() compiled together produces a cycle. The
+# work-around for now: the unit tests only exercise small subsets that don't
+# create cycles, and full-spec compilation isn't wired to production.
+
 
 def declare_setdim_compat_dims(compiler) -> None:
     """Declare to a LayerCompiler all dims that match the existing _SetDim layout.
@@ -176,6 +771,7 @@ def declare_setdim_compat_dims(compiler) -> None:
         "MEM_STORE", "MEM_ADDR_SRC",
         "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
         "OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP", "MEM_EXEC",
+        "OPCODE_BASE",
     ]
     # 7-dim threshold head outputs (one per marker type)
     seven_dim = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",
