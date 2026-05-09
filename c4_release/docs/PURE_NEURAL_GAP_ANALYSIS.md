@@ -242,6 +242,34 @@ The architecture has too many tangled layers (L0–L16) all writing to OUTPUT at
 
 3. **DEPRECATED-but-still-wired heads.** L5 attention head 6 is documented as "DEPRECATED: OP_* flags were removed from embeddings (2026-04-13)" but is still wired up. It leaks opcode flags into MARK_PC. Similar dead-but-wired code likely exists elsewhere.
 
+**Phase 0 status (2026-05-09):**
+
+Easy wins captured this session:
+- ✅ All L10 post_ops are PureFFN subclasses (`ComparisonCombine`, `BinaryOpByteZeroingPostOp`, `CarryPropagationPostOp`, `BitwiseBytePropagationPostOp`)
+- ✅ `argmax` removed from `BDToGEConverter` (replaced with linear projection — canonical FFN op)
+- ✅ Right-sizing pass eliminates 80% of dead FFN units (compiler-determined width)
+- ✅ HybridALUBlock at L8 split into 2 separate transformer blocks (lookup_ffn + efficient_alu)
+- ✅ Each L10 post_op moved to its own dedicated transformer block (passthrough attn + single PureFFN)
+- ✅ Model expanded from 17 to 25 blocks via `_expand_wrapper_blocks()` post-construction
+
+The hard core that genuinely requires multi-week work:
+- ❌ `EfficientALU_*_Neural` and `EfficientDivMod_Neural` wrappers each contain BD↔GE format converters around N internal `GenericPureFFN`/`GenericFlattenedFFN` stages. The internal FFNs ARE structurally PureFFNs — but they operate on the GE format `[B, S, 8, 160]`, not the BD residual stream `[B, S, 512]`.
+
+- ❌ Class names like `EfficientALU_L8_L9_Neural`, `EfficientALU_L10_Neural`, `EfficientALU_L11_L12_Neural`, `EfficientALU_L13_Neural`, `EfficientALU_L8_L9` (8-bit), and the entire `_set_layerN_*` function family encode **hardcoded layer assignments**. This violates "compiler determines depth and width" — the layer where any given operation lives should be a compiler decision based on dependencies, not a class name. Renaming requires:
+  - Renaming all `EfficientALU_*` classes to operation-named ones (e.g., `ALUAddSub`, `ALUAndOrXor`, `ALUMul`, `ALUShift`, `ALUDivMod`)
+  - Renaming all `_set_layerN_*` setup functions to operation-named ones
+  - Building a "compiler planner" that decides which logical block index each operation lands at, based on dependency graph
+  - Removing all hardcoded `model.blocks[N]` references in `set_vm_weights` (currently 65+ references)
+
+To split these into single-PureFFN-per-block strictly requires one of:
+- Allocating new dims in the BD residual to hold the intermediate GE state (would inflate `d_model` from 512 to 1792+)
+- Introducing block types with different residual shapes (violates vanilla transformer)
+- Re-baking each ALU stage to compute directly in BD format (substantial weight surgery)
+
+None of these are landable in a single session. The wrappers stay as composite for now, but the model structure is cleaner: there are 5 wrapper blocks (out of 25) instead of wrappers + post_ops being mixed into one block.
+
+---
+
 **Phase 1 + Phase 2 results: 26/29 gate tests pass.**
 
 After strengthening ComparisonCombine's MARK_PC blocker from -10*S to -50*S, simple PSH+ADD/SUB/AND/OR tests pass pure-neural. The blocker fights leaked CMP[0..3] residuals (which can reach ~15 at MARK_PC due to cumulative writes by L6/L7/L8 attention heads in pure-neural mode without runner overrides).
