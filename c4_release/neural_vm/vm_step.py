@@ -2714,19 +2714,24 @@ def _right_size_ffns(model):
     print("  RIGHT-SIZING FFNs (compiler-determined width):")
     total_before = 0
     total_after = 0
-    for i, block in enumerate(model.blocks):
-        ffn = block.ffn
-        # Skip non-standard FFNs (HybridALUBlock etc.) that don't expose W_up directly.
-        if not (hasattr(ffn, 'W_up') and isinstance(getattr(ffn, 'W_up', None), _nn.Parameter)):
-            print(f"    L{i}: skipped ({type(ffn).__name__}, no W_up)")
-            continue
-        W_up = ffn.W_up.data
-        W_gate = ffn.W_gate.data
-        W_down = ffn.W_down.data
-        b_up = ffn.b_up.data
-        b_gate = ffn.b_gate.data if ffn.b_gate is not None else None
 
-        H, D = W_up.shape  # H = hidden_dim, D = d_model
+    def _resize_one(ffn_module, label):
+        nonlocal total_before, total_after
+        if not (hasattr(ffn_module, 'W_up')
+                and isinstance(getattr(ffn_module, 'W_up', None), _nn.Parameter)):
+            # Recurse into HybridALUBlock and similar wrappers that contain standard FFNs.
+            for child_name, child in ffn_module.named_children():
+                _resize_one(child, f"{label}.{child_name}")
+            return
+        W_up = ffn_module.W_up.data
+        W_gate = ffn_module.W_gate.data
+        W_down = ffn_module.W_down.data
+        b_up = ffn_module.b_up.data
+        b_gate = ffn_module.b_gate.data if (
+            hasattr(ffn_module, 'b_gate') and ffn_module.b_gate is not None
+        ) else None
+
+        H, _ = W_up.shape
         active_mask = (
             (W_up.abs().sum(dim=1) > 0)
             | (W_gate.abs().sum(dim=1) > 0)
@@ -2739,38 +2744,42 @@ def _right_size_ffns(model):
         n_active = active_idx.numel()
 
         if n_active == H:
-            # Already right-sized
-            print(f"    L{i}: {H} units (no dead units)")
+            print(f"    {label}: {H} units (no dead units)")
             total_before += H
             total_after += H
-            continue
+            return
         if n_active == 0:
-            # Edge case: no programmed units. Keep at least 1 to avoid empty Linear.
             n_active = 1
             active_idx = _torch.tensor([0], dtype=_torch.long, device=W_up.device)
 
-        # Slice parameters to active units only.
-        new_W_up = _nn.Parameter(W_up[active_idx, :].clone())
-        new_W_gate = _nn.Parameter(W_gate[active_idx, :].clone())
-        new_W_down = _nn.Parameter(W_down[:, active_idx].clone())
-        new_b_up = _nn.Parameter(b_up[active_idx].clone())
-        new_b_gate = _nn.Parameter(b_gate[active_idx].clone()) if b_gate is not None else None
+        # nn.Module forbids reassigning a registered Parameter with a differently-shaped
+        # one. Replace the underlying .data tensors directly (Parameter object identity
+        # preserved, shape changes).
+        ffn_module.W_up.data = W_up[active_idx, :].clone()
+        ffn_module.W_gate.data = W_gate[active_idx, :].clone()
+        ffn_module.W_down.data = W_down[:, active_idx].clone()
+        ffn_module.b_up.data = b_up[active_idx].clone()
+        if b_gate is not None:
+            ffn_module.b_gate.data = b_gate[active_idx].clone()
+        if hasattr(ffn_module, 'hidden_dim'):
+            ffn_module.hidden_dim = n_active
 
-        ffn.W_up = new_W_up
-        ffn.W_gate = new_W_gate
-        ffn.W_down = new_W_down
-        ffn.b_up = new_b_up
-        if new_b_gate is not None:
-            ffn.b_gate = new_b_gate
-        # If FFN has a `hidden_dim` attr, update it.
-        if hasattr(ffn, 'hidden_dim'):
-            ffn.hidden_dim = n_active
-
-        print(f"    L{i}: {H} -> {n_active} units (-{H - n_active} dead)")
+        print(f"    {label}: {H} -> {n_active} units (-{H - n_active} dead)")
         total_before += H
         total_after += n_active
 
-    print(f"  TOTAL FFN units: {total_before} -> {total_after} ({100*total_after/total_before:.1f}% retained)")
+    for i, block in enumerate(model.blocks):
+        _resize_one(block.ffn, f"L{i}.ffn")
+        # Also recurse into post_ops (BinaryOpByteZeroingPostOp, CarryPropagationPostOp,
+        # etc. may contain standard FFNs too)
+        if hasattr(block, 'post_ops'):
+            for j, post_op in enumerate(block.post_ops):
+                _resize_one(post_op, f"L{i}.post_ops[{j}]")
+
+    if total_before == 0:
+        print(f"  TOTAL FFN units: 0")
+    else:
+        print(f"  TOTAL FFN units: {total_before} -> {total_after} ({100*total_after/total_before:.1f}% retained)")
 
 
 def _set_threshold_attn(attn, thresholds, out_bases, slope, HD, heads=None):

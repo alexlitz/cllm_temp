@@ -42,7 +42,7 @@ Beyond the runtime policy, two structural rules apply to the model itself:
 
 1. **Compiler determines network depth and width.** No hardcoded `ffn_hidden=4096` independent of what's actually programmed. Each layer's FFN width = the number of programmed units. Dead/uninitialized units must not exist (they fire on residual noise and break correctness).
 
-2. **Standard FFNs only.** Every block uses a standard SwiGLU FFN of the form `silu(W_up @ x + b_up) * (W_gate @ x + b_gate) → W_down`. No `HybridALUBlock`, no custom layer types. Anything the ALU needs must be expressible as standard FFN units.
+2. **Standard FFNs only.** Every block has exactly **one** FFN module, of the form `output = x + W_down @ (silu(W_up @ x + b_up) * (W_gate @ x + b_gate)) + b_down`. This is `PureFFN` (`base_layers.py:57`). All wrapper / composite FFNs (HybridALUBlock, PureNeuralALU, EfficientDivMod_Neural, post_ops with custom forward) must be **compiled down to this same structure**. The compiler is allowed to allocate as many blocks as needed — multi-stage operations become multiple blocks, each with its own single PureFFN — but no block can contain a multi-FFN wrapper or non-FFN logic. Operations that don't compile to a SwiGLU FFN (e.g., `argmax`, `softmax`, hand-rolled step functions) must be replaced with smooth FFN equivalents or moved into attention.
 
 3. **Vanilla attention only.** Standard multi-head attention, no custom attention variants beyond what a vanilla transformer paper would describe.
 
