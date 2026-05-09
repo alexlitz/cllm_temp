@@ -24,16 +24,22 @@ class NeuralVMEmbedding(nn.Module):
     AutoregressiveVM can be purely: embed → blocks → head with no modifications.
     """
 
-    def __init__(self, vocab_size, d_model):
+    def __init__(self, vocab_size, d_model, dim_positions=None):
         """Initialize neural VM embedding.
 
         Args:
             vocab_size: Number of tokens in vocabulary (typically 272)
             d_model: Embedding dimension (typically 512)
+            dim_positions: Optional dict mapping dim name -> start position.
+                When provided, injection methods use these compiler-allocated
+                positions. When None, falls back to `_SetDim` constants
+                (backward-compat).
         """
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
+        # Phase 0 M4: dim positions from compiler; None means fall back to _SetDim.
+        self._dim_positions = dim_positions
 
         # Standard PyTorch embedding
         self.embed = nn.Embedding(vocab_size, d_model)
@@ -49,6 +55,17 @@ class NeuralVMEmbedding(nn.Module):
         # Autoregressive mode: infer executable regions from token stream
         # When True, no external add_exec_addr() calls needed
         self._autoregressive_exec = True
+
+    def _dim(self, name: str) -> int:
+        """Resolve a dim name to its start position.
+
+        Phase 0 M4: when self._dim_positions is set (compiler mode), use it.
+        Otherwise fall back to _SetDim (hand-set mode).
+        """
+        if self._dim_positions is not None and name in self._dim_positions:
+            return self._dim_positions[name]
+        from .vm_step import _SetDim
+        return getattr(_SetDim, name)
 
     def forward(self, token_ids, active_opcode=None):
         """Apply embedding + augmentations.
@@ -109,9 +126,8 @@ class NeuralVMEmbedding(nn.Module):
         - Instruction 1 imm[0]: ADDR_KEY = 10 + 1 = 11
         """
         # Import here to avoid circular dependency
-        from .vm_step import _SetDim, Token
+        from .vm_step import Token
         from .constants import INSTR_WIDTH, PC_OFFSET
-        BD = _SetDim
 
         # Bytes per instruction in token stream: opcode + 4 immediate + 3 padding = 8 total
         # ADDR_KEY is only set for the first 5 bytes (opcode + immediate), not padding
@@ -119,6 +135,7 @@ class NeuralVMEmbedding(nn.Module):
         DATA_BYTES = 5       # Bytes with ADDR_KEY (opcode + 4 immediate)
 
         B, S = token_ids.shape
+        addr_key = self._dim("ADDR_KEY")
 
         for b in range(B):
             cs_pos = None
@@ -140,17 +157,14 @@ class NeuralVMEmbedding(nn.Module):
                     if byte_offset >= DATA_BYTES:
                         continue
 
-                    # PC = instr_idx * INSTR_WIDTH + PC_OFFSET
-                    # Opcode (byte_offset=0): addr = PC
-                    # Imm[j] (byte_offset=j+1): addr = PC + j + 1
                     addr = instr_idx * INSTR_WIDTH + PC_OFFSET + byte_offset
                     # Write address as nibbles to ADDR_KEY (3 nibbles × 16 one-hot)
                     lo = addr & 0xF
                     hi = (addr >> 4) & 0xF
                     top = (addr >> 8) & 0xF
-                    x[b, i, BD.ADDR_KEY + lo] = 1.0
-                    x[b, i, BD.ADDR_KEY + 16 + hi] = 1.0
-                    x[b, i, BD.ADDR_KEY + 32 + top] = 1.0
+                    x[b, i, addr_key + lo] = 1.0
+                    x[b, i, addr_key + 16 + hi] = 1.0
+                    x[b, i, addr_key + 32 + top] = 1.0
 
     def _inject_mem_store(self, token_ids, x):
         """Inject MEM_STORE=1.0 on historical MEM markers for L15 K-side.
@@ -162,19 +176,18 @@ class NeuralVMEmbedding(nn.Module):
         Only injects on MEM markers in the retained history region
         (0 .. _mem_history_end), not the current step's MEM section.
         """
-        # Import here to avoid circular dependency
-        from .vm_step import _SetDim, Token
-        BD = _SetDim
+        from .vm_step import Token
 
         end = self._mem_history_end
         if end == 0:
             return
 
+        mem_store = self._dim("MEM_STORE")
         B, S = token_ids.shape
         for b in range(B):
             for i in range(min(end, S)):
                 if token_ids[b, i].item() == Token.MEM:
-                    x[b, i, BD.MEM_STORE] = 1.0
+                    x[b, i, mem_store] = 1.0
 
     def set_mem_history_end(self, end):
         """Set the memory history boundary for MEM_STORE injection.
@@ -199,19 +212,16 @@ class NeuralVMEmbedding(nn.Module):
             x: [batch, seq, d_model] embedding tensor (modified in-place)
             active_opcode: Current opcode value (0-255)
         """
-        from .vm_step import _SetDim as BD
-
         _OPCODE_INJECTION_MAP = {
-            33: BD.ACTIVE_OPCODE_PRTF,  # PRTF - needed for conversational I/O
-            31: BD.ACTIVE_OPCODE_READ,  # READ - needed for conversational I/O
-            8:  BD.OP_LEV,              # LEV - needed for return addr lookup
-            4:  BD.OP_BZ,               # BZ - needed for branch-taken PC override
-            5:  BD.OP_BNZ,              # BNZ - needed for branch-taken PC override
+            33: "ACTIVE_OPCODE_PRTF",
+            31: "ACTIVE_OPCODE_READ",
+            8:  "OP_LEV",
+            4:  "OP_BZ",
+            5:  "OP_BNZ",
         }
-
-        dim = _OPCODE_INJECTION_MAP.get(active_opcode)
-        if dim is not None:
-            x[:, :, dim] = 5.0
+        name = _OPCODE_INJECTION_MAP.get(active_opcode)
+        if name is not None:
+            x[:, :, self._dim(name)] = 5.0
 
     def _inject_thinking_markers(self, token_ids, x):
         """Inject THINKING_START and THINKING_END markers for lookback detection.
@@ -223,16 +233,18 @@ class NeuralVMEmbedding(nn.Module):
             token_ids: [batch, seq] tensor of token IDs
             x: [batch, seq, d_model] embedding tensor (modified in-place)
         """
-        from .vm_step import _SetDim as BD, Token
+        from .vm_step import Token
 
+        thinking_start = self._dim("MARK_THINKING_START")
+        thinking_end = self._dim("MARK_THINKING_END")
         B, S = token_ids.shape
         for b in range(B):
             for i in range(S):
                 tok = token_ids[b, i].item()
                 if tok == Token.THINKING_START:
-                    x[b, i, BD.MARK_THINKING_START] = 1.0
+                    x[b, i, thinking_start] = 1.0
                 elif tok == Token.THINKING_END:
-                    x[b, i, BD.MARK_THINKING_END] = 1.0
+                    x[b, i, thinking_end] = 1.0
 
     def _inject_initial_pc(self, token_ids, x):
         """Inject initial PC value for step 0's PC marker.
@@ -249,12 +261,14 @@ class NeuralVMEmbedding(nn.Module):
             token_ids: [batch, seq] tensor of token IDs
             x: [batch, seq, d_model] embedding tensor (modified in-place)
         """
-        from .vm_step import _SetDim as BD, Token
+        from .vm_step import Token
         from .constants import PC_OFFSET
 
         initial_pc = PC_OFFSET
         lo = initial_pc & 0xF
         hi = (initial_pc >> 4) & 0xF
+        embed_lo = self._dim("EMBED_LO")
+        embed_hi = self._dim("EMBED_HI")
 
         B, S = token_ids.shape
         for b in range(B):
@@ -264,8 +278,8 @@ class NeuralVMEmbedding(nn.Module):
                 if tok == Token.STEP_END:
                     seen_step_end = True
                 elif tok == Token.REG_PC and not seen_step_end:
-                    x[b, i, BD.EMBED_LO + lo] = 1.0
-                    x[b, i, BD.EMBED_HI + hi] = 1.0
+                    x[b, i, embed_lo + lo] = 1.0
+                    x[b, i, embed_hi + hi] = 1.0
 
     def _inject_mem_exec(self, token_ids, x):
         """Inject MEM_EXEC and ADDR_KEY on MEM sections containing executable code.
