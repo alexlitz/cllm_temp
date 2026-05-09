@@ -447,11 +447,12 @@ class ComparisonCombine(PureFFN):
         unit = 0
 
         # FIX 2026-05-09: All ComparisonCombine units add a strong MARK_PC blocker.
-        # Without it, leaked OP_NE/OP_GT/OP_GE flags at MARK_PC cause the default
-        # units to fire there (writing OUTPUT_LO[1] = ~50), corrupting PC predictions.
-        # This was breaking PC+8 increment for any program containing PSH because
-        # OP_PSH happens to leak alongside other opcode flags via L5 attention.
-        MARK_PC_BLOCK = -S * 10
+        # Without it, leaked OP_NE/OP_GT/OP_GE flags or CMP[0..3] (which can reach
+        # 14.98 at MARK_PC due to cumulative writes by L6-L8 heads in pure-neural
+        # mode) cause units to fire there (writing OUTPUT_LO[1] = ~50), corrupting
+        # PC predictions. -50*S is enough to dominate even very leaky CMP=15:
+        # up = 100*15(CMP) - 5000*1(MARK_PC) - 150 = -3650 -> silu -> 0.
+        MARK_PC_BLOCK = -S * 50
 
         def _cmp_default(op_dim, default_result):
             nonlocal unit
