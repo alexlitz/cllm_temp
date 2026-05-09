@@ -4663,15 +4663,15 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.OP_JMP] = -S * 20  # Strong block JMP crossfire
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 8  # INCREASED from -6*S to block at PC marker
-        ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
+        # FIX 2026-05-09: was -S, but with W_down upscaled to 2.0/S, even silu(0)≈0.27 at
+        # byte positions started broadcasting the IMM value into AX bytes 1-3 after enough
+        # steps had accumulated residual. Strengthening IS_BYTE blocker to -10*S forces
+        # the byte-position activation to a strongly negative value (silu≈0) so the unit
+        # only fires at MARK_AX where IS_BYTE=0.
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_LO + k] = 1.0
-        # FIX 2026-05-09: was 2.0/(S*40) which produced OUTPUT_LO ~= 0.1 — too weak in
-        # pure-neural mode (loses to byte-0 bias). Scaled up to 2.0/S to match the EXIT/
-        # NOP/JMP routing units. In runner-override mode, bytes are corrected anyway,
-        # so this scale-up has no effect. In pure-neural mode it's the difference between
-        # IMM working and not.
-        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S  # 2.0/(S*40) -> 2.0/S (2026-05-09)
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
@@ -4679,7 +4679,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.OP_JMP] = -S * 20
         ffn.W_up[unit, BD.MARK_AX] = S
         ffn.W_up[unit, BD.MARK_PC] = -S * 8
-        ffn.W_up[unit, BD.IS_BYTE] = -S
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # FIX 2026-05-09 (mirror)
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S  # FIX 2026-05-09 (mirror of LO IMM fix)
