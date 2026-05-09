@@ -245,25 +245,31 @@ class LayerCompiler:
         return result
 
     def _assign_layers(self, topo: List[Operation]) -> Dict[str, int]:
-        """Earliest-layer-first assignment respecting deps and one-attn-one-ffn-per-layer."""
-        # writes[d] = layer where d is written (highest among multiple writers)
+        """Earliest-layer-first assignment respecting deps.
+
+        Multiple ops can share a layer + kind slot if they have the same phase
+        (e.g., two FFN setups that bake into the same block's FFN sequentially).
+        Without phase, each op needs its own layer kind slot.
+        """
         writes_layer: Dict[str, int] = {}
-        # layer_kinds[layer] = set of kinds already used at that layer
-        layer_kinds: Dict[int, Set[str]] = {}
+        # layer_phase_kinds[(layer, kind)] = phase value if a phase-set op is using it
+        layer_phase_kinds: Dict[tuple, Optional[int]] = {}
         assignment: Dict[str, int] = {}
 
         for op in topo:
-            # earliest layer >= max(writes_layer of every read) + 1
             earliest = 0
             for d in op.reads:
                 if d in writes_layer:
                     earliest = max(earliest, writes_layer[d] + 1)
-            # advance until kind slot is free
             layer = earliest
             while True:
-                kinds_used = layer_kinds.setdefault(layer, set())
-                if op.kind not in kinds_used:
-                    kinds_used.add(op.kind)
+                key = (layer, op.kind)
+                existing_phase = layer_phase_kinds.get(key, "unset")
+                if existing_phase == "unset":
+                    layer_phase_kinds[key] = op.phase
+                    break
+                # Slot taken; if same phase, share. Otherwise advance.
+                if op.phase is not None and existing_phase == op.phase:
                     break
                 layer += 1
             assignment[op.name] = layer

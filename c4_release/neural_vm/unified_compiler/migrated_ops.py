@@ -163,7 +163,7 @@ def make_nibble_copy_ffn_op() -> Operation:
 
     return Operation(
         name="nibble_copy_ffn",
-        phase=2,
+        phase=15,
         reads={"IS_BYTE", "H1", "H4", "MEM_STORE",
                "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
@@ -857,6 +857,68 @@ def make_layer3_carry_forward_attn_op() -> Operation:
     )
 
 
+def make_binary_pop_sp_increment_op() -> Operation:
+    """L6 FFN extension: SP += 8 for binary-pop ops (ADD/SUB/etc.)."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_binary_pop_sp_increment
+        _set_binary_pop_sp_increment(ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="binary_pop_sp_increment",
+        phase=6,
+        reads={"MARK_SP", "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+               "OP_OR", "OP_XOR", "OP_AND",
+               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+               "OP_SHL", "OP_SHR", "EMBED_LO", "EMBED_HI",
+               "BYTE_INDEX_0"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
+def make_layer10_stack0_byte_relay_op() -> Operation:
+    """L10 attention: STACK0 byte values relay for AND/OR/XOR multi-byte."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_layer10_stack0_byte_relay
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_stack0_byte_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="layer10_stack0_byte_relay",
+        phase=10,
+        reads={"MARK_AX", "IS_BYTE", "H1", "MARK_STACK0", "STACK0_BYTE0",
+               "TEMP", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"ALU_LO", "ALU_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer9_marker_suppress_op() -> Operation:
+    """L9 FFN extension: marker suppression."""
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import _set_layer9_marker_suppress
+        # _set_layer9_marker_suppress takes (ffn, S, BD, start_unit). We need
+        # to know what start_unit to use. The original code uses unit count
+        # after _set_layer9_alu — for the migration shim we just pass start_unit=0.
+        # This may overlap with layer9_alu's unit assignments; the original calls
+        # them sequentially in the same FFN.
+        _set_layer9_marker_suppress(ffn, S, _as_setdim_proxy(dim_positions), 0)
+
+    return Operation(
+        name="layer9_marker_suppress",
+        phase=9,
+        reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
+               "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+               "OP_OR", "OP_XOR", "OP_AND"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
 def setup_token_embeddings(embed_weight, dim_positions: Dict[str, int] = None) -> None:
     """Bake the per-token embedding values using compiler dim positions.
 
@@ -1081,6 +1143,10 @@ def all_core_ops() -> list:
         make_layer14_mem_generation_op(),
         make_layer15_memory_lookup_op(),
         make_layer16_lev_routing_op(),
+        # Critical additional ops (M3+ continuation)
+        make_binary_pop_sp_increment_op(),
+        make_layer10_stack0_byte_relay_op(),
+        make_layer9_marker_suppress_op(),
     ]
 
 
