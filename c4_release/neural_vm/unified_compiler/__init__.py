@@ -20,7 +20,7 @@ from .compiler import UnifiedVMCompiler
 from .verification import Verifier
 from .builder import BuilderConfig, PruningConfig, IRBuilder
 from .ir import CompilerIR, AttentionOp, FFNOp, LayerSpec
-from .layer_compiler import LayerCompiler, Operation, ModelLayout
+from .layer_compiler import LayerCompiler, Operation, ModelLayout, build_model_from_layout
 
 __all__ = [
     'Primitives',
@@ -37,4 +37,5 @@ __all__ = [
     'LayerCompiler',
     'Operation',
     'ModelLayout',
+    'build_model_from_layout',
 ]

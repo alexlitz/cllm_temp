@@ -244,3 +244,54 @@ class LayerCompiler:
             positions[name] = cursor
             cursor += size
         return positions
+
+
+def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
+    """Construct an AutoregressiveVM from a compiled layout and bake all ops.
+
+    This is the bridge from "layout produced by compiler" to "working model".
+
+    For each layer:
+      - The model's block at that layer index has its attn programmed by all
+        ops with kind="attn" assigned to that layer.
+      - The block's ffn is programmed by all ops with kind="ffn".
+
+    Each op's bake_fn is called with (target_module, dim_positions, S) where
+    target_module is the attn or ffn at the assigned block.
+
+    Note: this assumes a single op per (layer, kind). The layer compiler
+    enforces this via _assign_layers; multiple ops of the same kind would
+    need to be combined upstream into a single op, or split across layers.
+
+    Args:
+        layout: ModelLayout from LayerCompiler.compile()
+        S: SwiGLU activation scale (passed to each bake_fn)
+
+    Returns:
+        AutoregressiveVM instance with weights baked.
+    """
+    # Lazy import to avoid circular dep when unified_compiler is loaded standalone
+    from ..vm_step import AutoregressiveVM
+
+    if layout.n_layers == 0:
+        # Trivial empty layout — return a zero-layer model
+        # (AutoregressiveVM doesn't support 0 layers; we use 1 with no ops baked)
+        n_layers = 1
+    else:
+        n_layers = layout.n_layers
+
+    # Auto d_model is derived from layout, not hardcoded.
+    model = AutoregressiveVM(d_model=layout.d_model, n_layers=n_layers)
+
+    for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer):
+        block = model.blocks[layer_idx]
+        for op in ops_at_layer:
+            if op.kind == "attn":
+                target = block.attn
+            elif op.kind == "ffn":
+                target = block.ffn
+            else:
+                raise ValueError(f"Unknown op kind {op.kind!r}")
+            op.bake_fn(target, layout.dim_positions, S)
+
+    return model

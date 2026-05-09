@@ -10,10 +10,13 @@ These verify that LayerCompiler:
 
 import pytest
 
+import torch
+
 from neural_vm.unified_compiler.layer_compiler import (
     LayerCompiler,
     Operation,
     ModelLayout,
+    build_model_from_layout,
 )
 
 
@@ -247,3 +250,67 @@ class TestRealisticExample:
         add_range = layout.dim_range("ADD_RESULT")
         or_range = layout.dim_range("OR_RESULT")
         assert set(add_range).isdisjoint(set(or_range))
+
+
+class TestBuildModel:
+    """Verify that build_model_from_layout actually constructs a working model."""
+
+    def test_builds_model_with_auto_d_model_and_n_layers(self):
+        c = LayerCompiler()
+        # Declare enough dims to make a non-trivial d_model.
+        c.declare_dim("MARK_PC", 1)
+        c.declare_dim("EMBED", 16)
+        c.declare_dim("OUTPUT", 16)
+
+        bake_calls = []
+
+        def attn_bake(module, dims, S):
+            bake_calls.append(("attn", dims["MARK_PC"], dims["EMBED"]))
+
+        def ffn_bake(module, dims, S):
+            bake_calls.append(("ffn", dims["EMBED"], dims["OUTPUT"]))
+
+        c.add_op(Operation(
+            name="relay", reads={"MARK_PC"}, writes={"EMBED"},
+            kind="attn", bake_fn=attn_bake,
+        ))
+        c.add_op(Operation(
+            name="incr", reads={"EMBED"}, writes={"OUTPUT"},
+            kind="ffn", bake_fn=ffn_bake,
+        ))
+
+        layout = c.compile()
+        # d_model = 1 + 16 + 16 = 33; n_layers = 2 (relay at L0, incr at L1)
+        # AutoregressiveVM rounds d_model to be divisible by n_heads. Since
+        # build_model_from_layout passes layout.d_model directly, we use a
+        # multiple of 8 (default num_heads) by declaring enough dims.
+
+        # Enforce d_model divisibility for AutoregressiveAttention (multi-head)
+        # by padding via an extra unused dim if needed:
+        if layout.d_model % 8 != 0:
+            pad = 8 - (layout.d_model % 8)
+            c.declare_dim("_pad", pad)
+            layout = c.compile()
+
+        model = build_model_from_layout(layout, S=100.0)
+        # Verify model uses the auto-computed d_model and n_layers
+        assert model.d_model == layout.d_model
+        assert len(model.blocks) == max(layout.n_layers, 1)
+        # Verify each bake_fn was called with the right dim positions
+        kinds = {call[0] for call in bake_calls}
+        assert kinds == {"attn", "ffn"}
+        # MARK_PC is at position 0 (declared first)
+        attn_call = next(c for c in bake_calls if c[0] == "attn")
+        assert attn_call[1] == 0  # MARK_PC starts at 0
+        assert attn_call[2] == 1  # EMBED starts after MARK_PC
+
+    def test_no_ops_yields_minimal_model(self):
+        c = LayerCompiler()
+        c.declare_dim("a", 8)
+        c.declare_dim("b", 8)
+        layout = c.compile()
+        # 0 ops -> 0 layers in layout. But AutoregressiveVM needs ≥1 layer.
+        # build_model_from_layout uses 1 in this case.
+        model = build_model_from_layout(layout, S=100.0)
+        assert model.d_model == 16
+        assert len(model.blocks) == 1
