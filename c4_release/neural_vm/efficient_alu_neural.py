@@ -71,9 +71,12 @@ class BDToGEConverter(nn.Module):
                 (BD.OP_DIV, 31),
                 (BD.OP_MOD, 32),
             ]
+            # FIX 2026-05-06: Use 1.0 scaling for opcodes, not 0.2.
+            # The shift layers (ShlPrecomputeFFN, etc.) use opcode values as multipliers
+            # in their gates, so they need the full value of 1.0 when active.
             for pos in range(8):
                 for bd_dim_idx, ge_opcode in self.opcode_map:
-                    self.W_proj[pos, ge.OP_START + ge_opcode, bd_dim_idx] = 0.2
+                    self.W_proj[pos, ge.OP_START + ge_opcode, bd_dim_idx] = 1.0
 
     def forward(self, x_bd):
         """
@@ -84,10 +87,48 @@ class BDToGEConverter(nn.Module):
             x_ge: [B, seq_len, 8, 160] GenericE format
         """
         B, seq_len, _ = x_bd.shape
+        BD = self.BD
 
-        # Project each position: [B, seq_len, 8, 160]
-        # x_ge[b, s, p, d] = sum_k W_proj[p, d, k] * x_bd[b, s, k]
-        x_ge = torch.einsum('pdk,bsk->bspd', self.W_proj, x_bd)
+        # FIX 2026-05-06: Clamp ALU_LO/HI and AX_CARRY_LO/HI to non-negative
+        # L6 FFN clears these to -5.0, and L7 attention only overwrites active indices.
+        # The negative residuals corrupt the scalar conversion (sum of k * one_hot[k]).
+        x_bd_clamped = x_bd.clone()
+        x_bd_clamped[:, :, BD.ALU_LO:BD.ALU_LO + 16] = torch.clamp(x_bd[:, :, BD.ALU_LO:BD.ALU_LO + 16], min=0)
+        x_bd_clamped[:, :, BD.ALU_HI:BD.ALU_HI + 16] = torch.clamp(x_bd[:, :, BD.ALU_HI:BD.ALU_HI + 16], min=0)
+        x_bd_clamped[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16] = torch.clamp(x_bd[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16], min=0)
+        x_bd_clamped[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16] = torch.clamp(x_bd[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16], min=0)
+
+        # FIX 2026-05-09 (Phase 0): Replace argmax with linear projection (weighted sum).
+        # argmax is not a SwiGLU FFN operation per the pure-neural policy. Linear
+        # projection sum_k k * one_hot[k] IS — it's just a matrix multiply, baked
+        # into FFN weights. This requires upstream to keep ALU_LO/HI as clean
+        # one-hot encodings; if a leak makes one_hot[k] > 1.0, the sum overshoots.
+        # We rely on the right-sizing pass + OPCODE_BLOCK_MAP defensive gates to
+        # keep upstream clean enough.
+        B, seq_len, _ = x_bd_clamped.shape
+        x_ge = torch.zeros(B, seq_len, 8, self.ge.DIM, device=x_bd.device, dtype=x_bd.dtype)
+
+        # Linear projection: NIB_A_value = sum_k k * one_hot[k]
+        # Build the [16] coefficient vector once.
+        k_coeffs = torch.arange(16, device=x_bd.device, dtype=x_bd.dtype)
+
+        alu_lo = x_bd_clamped[:, :, BD.ALU_LO:BD.ALU_LO + 16]
+        ax_lo = x_bd_clamped[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16]
+        x_ge[:, :, 0, self.ge.NIB_A] = (alu_lo * k_coeffs).sum(dim=-1)
+        x_ge[:, :, 0, self.ge.NIB_B] = (ax_lo * k_coeffs).sum(dim=-1)
+
+        alu_hi = x_bd_clamped[:, :, BD.ALU_HI:BD.ALU_HI + 16]
+        ax_hi = x_bd_clamped[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16]
+        x_ge[:, :, 1, self.ge.NIB_A] = (alu_hi * k_coeffs).sum(dim=-1)
+        x_ge[:, :, 1, self.ge.NIB_B] = (ax_hi * k_coeffs).sum(dim=-1)
+
+        # Copy opcode flags to all positions.
+        # FIX 2026-05-06: Normalize opcode values to 0/1 by thresholding at 0.5.
+        # The transformer writes opcode flags with various magnitudes (e.g., 5.0),
+        # but the shift layers expect exactly 1.0 when active. Threshold to normalize.
+        for pos in range(8):
+            for bd_dim_idx, ge_opcode in self.opcode_map:
+                x_ge[:, :, pos, self.ge.OP_START + ge_opcode] = (x_bd[:, :, bd_dim_idx] > 0.5).float()
 
         return x_ge
 
@@ -189,6 +230,44 @@ class GEToBDConverter(nn.Module):
         x_bd_out[:, :, BD.OUTPUT_LO:BD.OUTPUT_LO + 16] += indicator_lo * 2.0
         x_bd_out[:, :, BD.OUTPUT_HI:BD.OUTPUT_HI + 16] += indicator_hi * 2.0
 
+        # FIX 2026-05-06: Set carry/borrow flags for multi-byte propagation.
+        # CarryPropagationPostOp expects:
+        #   CARRY[1] for ADD overflow (sum >= 256)
+        #   CARRY[2] for SUB borrow (a < b)
+        # Only set these at AX marker position (where byte 0 is computed).
+        operand_a_lo = x_ge[:, :, 0, self.ge.NIB_A]  # [B, seq_len]
+        operand_a_hi = x_ge[:, :, 1, self.ge.NIB_A]  # [B, seq_len]
+        operand_b_lo = x_ge[:, :, 0, self.ge.NIB_B]  # [B, seq_len]
+        operand_b_hi = x_ge[:, :, 1, self.ge.NIB_B]  # [B, seq_len]
+
+        # Reconstruct byte values: byte = lo + hi * 16
+        operand_a = operand_a_lo + operand_a_hi * 16.0  # [B, seq_len], 0-255
+        operand_b = operand_b_lo + operand_b_hi * 16.0  # [B, seq_len], 0-255
+
+        # ADD carry: sum >= 256
+        sum_ab = operand_a + operand_b
+        add_carry = torch.sigmoid(S * (sum_ab - 255.5))
+
+        # SUB borrow: a < b (i.e., a - b < 0)
+        sub_borrow = torch.sigmoid(S * (operand_b - operand_a - 0.5))
+
+        # Gate on MARK_AX (only at AX marker position)
+        mark_ax = x_bd[:, :, BD.MARK_AX]
+        ax_mask = (mark_ax > 0.5).float()
+
+        # FIX 2026-05-08: Gate CARRY flags by their respective opcodes.
+        # Previously, both CARRY[1] and CARRY[2] were set at all AX markers.
+        # This caused SUB borrow to be set during ADD operations, which triggered
+        # CarryPropagationPostOp's SUB units to fire spuriously.
+        op_add = x_bd[:, :, BD.OP_ADD]
+        op_sub = x_bd[:, :, BD.OP_SUB]
+        add_opcode_mask = (op_add > 1.0).float()  # OP_ADD ≈ 5.0 when active
+        sub_opcode_mask = (op_sub > 1.0).float()  # OP_SUB ≈ 5.0 when active
+
+        # Write CARRY[1] for ADD only, CARRY[2] for SUB only
+        x_bd_out[:, :, BD.CARRY + 1] += add_carry * ax_mask * add_opcode_mask * 2.0
+        x_bd_out[:, :, BD.CARRY + 2] += sub_borrow * ax_mask * sub_opcode_mask * 2.0
+
         return x_bd_out
 
 
@@ -268,8 +347,10 @@ class PureNeuralALU(nn.Module):
             for layer in self.sub_layers:
                 x_sub = layer(x_sub)
 
-            op_add = x_ge_flat[:, 0, self.ge.OP_START + 25]
-            op_sub = x_ge_flat[:, 0, self.ge.OP_START + 26]
+            # FIX 2026-05-06: Opcode values are 0.2 (not 1.0) due to BDToGEConverter scaling.
+            # Normalize to 0/1 before using as multipliers to avoid corrupting results.
+            op_add = (x_ge_flat[:, 0, self.ge.OP_START + 25] > 0.1).float()
+            op_sub = (x_ge_flat[:, 0, self.ge.OP_START + 26] > 0.1).float()
 
             op_total = op_add + op_sub
 
@@ -293,9 +374,10 @@ class PureNeuralALU(nn.Module):
             for layer in self.xor_layers:
                 x_xor = layer(x_xor)
 
-            op_and = x_ge_flat[:, 0, self.ge.OP_START + 30]
-            op_or = x_ge_flat[:, 0, self.ge.OP_START + 28]
-            op_xor = x_ge_flat[:, 0, self.ge.OP_START + 29]
+            # FIX 2026-05-06: Normalize opcode values to 0/1.
+            op_and = (x_ge_flat[:, 0, self.ge.OP_START + 30] > 0.1).float()
+            op_or = (x_ge_flat[:, 0, self.ge.OP_START + 28] > 0.1).float()
+            op_xor = (x_ge_flat[:, 0, self.ge.OP_START + 29] > 0.1).float()
 
             op_total = op_and + op_or + op_xor
 
@@ -312,7 +394,8 @@ class PureNeuralALU(nn.Module):
             for layer in self.mul_layers:
                 x_mul = layer(x_mul)
 
-            op_mul = x_ge_flat[:, 0, self.ge.OP_START + 27]
+            # FIX 2026-05-06: Normalize opcode values to 0/1.
+            op_mul = (x_ge_flat[:, 0, self.ge.OP_START + 27] > 0.1).float()
 
             x_ge_out[:, :, self.ge.RESULT] = (
                 x_mul[:, :, self.ge.RESULT] * op_mul[:, None]
@@ -329,8 +412,9 @@ class PureNeuralALU(nn.Module):
             for layer in self.shr_layers:
                 x_shr = layer(x_shr)
 
-            op_shl = x_ge_flat[:, 0, self.ge.OP_START + 23]
-            op_shr = x_ge_flat[:, 0, self.ge.OP_START + 24]
+            # FIX 2026-05-06: Normalize opcode values to 0/1.
+            op_shl = (x_ge_flat[:, 0, self.ge.OP_START + 23] > 0.1).float()
+            op_shr = (x_ge_flat[:, 0, self.ge.OP_START + 24] > 0.1).float()
 
             op_total = op_shl + op_shr
 
@@ -350,8 +434,9 @@ class PureNeuralALU(nn.Module):
             for layer in self.mod_layers:
                 x_mod = layer(x_mod)
 
-            op_div = x_ge_flat[:, 0, self.ge.OP_START + 31]
-            op_mod = x_ge_flat[:, 0, self.ge.OP_START + 32]
+            # FIX 2026-05-06: Normalize opcode values to 0/1.
+            op_div = (x_ge_flat[:, 0, self.ge.OP_START + 31] > 0.1).float()
+            op_mod = (x_ge_flat[:, 0, self.ge.OP_START + 32] > 0.1).float()
 
             op_total = op_div + op_mod
 
