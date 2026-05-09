@@ -704,6 +704,88 @@ def make_layer16_lev_routing_op() -> Operation:
 # Convenience: full operation list
 # ---------------------------------------------------------------------------
 
+def setup_head_weights(head, dim_positions: Dict[str, int] = None) -> None:
+    """Bake the output-projection head weights using compiler dim positions.
+
+    Phase 0 M4 (2026-05-09): extracted from vm_step.set_vm_weights so the
+    compiler path can call it with auto-allocated dim positions instead of
+    _SetDim constants. When `dim_positions` is None, falls back to _SetDim
+    (backward-compat with hand-set path).
+
+    Args:
+        head: The model.head nn.Linear(d_model, vocab_size) module.
+        dim_positions: Optional dict mapping dim name -> start position.
+    """
+    import torch
+    from ..vm_step import Token, _SetDim
+
+    def D(name):
+        if dim_positions is not None and name in dim_positions:
+            return dim_positions[name]
+        return getattr(_SetDim, name)
+
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.zero_()
+
+        next_flags = [
+            D("NEXT_PC"), D("NEXT_AX"), D("NEXT_SP"), D("NEXT_BP"),
+            D("NEXT_STACK0"), D("NEXT_MEM"), D("NEXT_SE"), D("NEXT_HALT"),
+        ]
+        # Optional flags (only present when conversational I/O is enabled)
+        for opt in ("NEXT_TOOL_CALL", "NEXT_THINKING_START", "NEXT_THINKING_END"):
+            try:
+                next_flags.append(D(opt))
+            except AttributeError:
+                pass
+
+        OUTPUT_LO = D("OUTPUT_LO")
+        OUTPUT_HI = D("OUTPUT_HI")
+        for b in range(256):
+            lo, hi = b & 0xF, (b >> 4) & 0xF
+            head.weight[b, OUTPUT_LO + lo] = 5.0
+            head.weight[b, OUTPUT_HI + hi] = 5.0
+            head.bias[b] = -5.0
+            for flag in next_flags:
+                head.weight[b, flag] += -80.0
+        head.bias[0] = -4.0
+
+        vocab_size = head.weight.shape[0]
+        for tok, flag_name in [
+            (Token.REG_PC, "NEXT_PC"),
+            (Token.REG_AX, "NEXT_AX"),
+            (Token.REG_SP, "NEXT_SP"),
+            (Token.REG_BP, "NEXT_BP"),
+            (Token.STACK0, "NEXT_STACK0"),
+            (Token.MEM, "NEXT_MEM"),
+            (Token.STEP_END, "NEXT_SE"),
+            (Token.HALT, "NEXT_HALT"),
+            (Token.TOOL_CALL, "NEXT_TOOL_CALL"),
+            (Token.THINKING_START, "NEXT_THINKING_START"),
+            (Token.THINKING_END, "NEXT_THINKING_END"),
+        ]:
+            if tok >= vocab_size:
+                continue
+            try:
+                head.weight[tok, D(flag_name)] = 20.0
+                head.bias[tok] = -10.0
+            except AttributeError:
+                pass
+
+        for tok in [
+            Token.CODE_START, Token.CODE_END,
+            Token.DATA_START, Token.DATA_END,
+            Token.SEP, Token.USER_INPUT_START, Token.USER_INPUT_END,
+        ]:
+            if tok < vocab_size:
+                head.bias[tok] = -50.0
+
+        if Token.IO_STATE_EMIT_BYTE < vocab_size:
+            head.bias[Token.IO_STATE_EMIT_BYTE] = -20.0
+        if Token.IO_STATE_EMIT_THINKING < vocab_size:
+            head.bias[Token.IO_STATE_EMIT_THINKING] = -20.0
+
+
 def all_core_ops() -> list:
     """Return the full list of migrated core-VM operations.
 
