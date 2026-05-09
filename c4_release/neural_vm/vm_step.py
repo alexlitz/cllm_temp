@@ -446,10 +446,18 @@ class ComparisonCombine(PureFFN):
         BD = _SetDim
         unit = 0
 
+        # FIX 2026-05-09: All ComparisonCombine units add a strong MARK_PC blocker.
+        # Without it, leaked OP_NE/OP_GT/OP_GE flags at MARK_PC cause the default
+        # units to fire there (writing OUTPUT_LO[1] = ~50), corrupting PC predictions.
+        # This was breaking PC+8 increment for any program containing PSH because
+        # OP_PSH happens to leak alongside other opcode flags via L5 attention.
+        MARK_PC_BLOCK = -S * 10
+
         def _cmp_default(op_dim, default_result):
             nonlocal unit
             self.W_up.data[unit, BD.MARK_AX] = S
             self.W_up.data[unit, op_dim] = S
+            self.W_up.data[unit, BD.MARK_PC] = MARK_PC_BLOCK
             self.b_up.data[unit] = -S * 1.5
             self.b_gate.data[unit] = 1.0
             self.W_down.data[BD.OUTPUT_LO + default_result, unit] = 2.0 / S
@@ -460,6 +468,7 @@ class ComparisonCombine(PureFFN):
             nonlocal unit
             self.W_up.data[unit, BD.MARK_AX] = S
             self.W_up.data[unit, cmp_dim] = S
+            self.W_up.data[unit, BD.MARK_PC] = MARK_PC_BLOCK
             self.b_up.data[unit] = -S * 1.5
             self.W_gate.data[unit, op_dim] = 1.0
             self.W_down.data[BD.OUTPUT_LO + to_result, unit] = 4.0 / S
@@ -471,6 +480,7 @@ class ComparisonCombine(PureFFN):
             self.W_up.data[unit, BD.MARK_AX] = S
             self.W_up.data[unit, cmp_dim1] = S
             self.W_up.data[unit, cmp_dim2] = S
+            self.W_up.data[unit, BD.MARK_PC] = MARK_PC_BLOCK
             self.b_up.data[unit] = -S * 2.5
             self.W_gate.data[unit, op_dim] = 1.0
             self.W_down.data[BD.OUTPUT_LO + to_result, unit] = 4.0 / S
