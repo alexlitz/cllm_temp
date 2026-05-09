@@ -2166,83 +2166,6 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
             ffn6.b_gate[u] = 0
             patched_count += 1
 
-    # === FIX 2026-05-09: Suppress branch/LEV-override units when other opcodes active ===
-    # In pure_neural mode without runner overrides, L5 attention heads leak opcode flags
-    # (OP_JMP, OP_LEV, OP_BZ, OP_BNZ, CMP[0]) into MARK_PC of subsequent steps. Various
-    # FFN units across blocks then fire spuriously, destroying carry-forwarded values.
-    #
-    # Defensive gate: any FFN unit (in any block) that fires with positive OP_JMP/OP_LEV/
-    # OP_BZ/OP_BNZ/CMP[0] weight AND positive MARK_PC weight AND writes to OUTPUT_LO/HI
-    # gets strong negative weights for non-target opcodes. When the actually-active
-    # opcode (e.g., OP_IMM ≈ 5) is set, the unit's `up` becomes strongly negative.
-    # Only the legit branch/LEV opcode lets the unit fire.
-    OPCODE_BLOCK_MAP = {
-        # If unit reads OP_X strongly, block it with all the OTHER opcodes.
-        BD.OP_JMP: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
-        BD.OP_LEV: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
-        BD.OP_BZ:  [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BNZ, BD.OP_JSR],
-        BD.OP_BNZ: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BZ, BD.OP_JSR],
-        # CMP[0] is IS_JMP — same blockers as OP_JMP
-        BD.CMP + 0: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
-                     BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                     BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                     BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                     BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                     BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                     BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
-    }
-    branch_override_patches = 0
-    for block_idx in range(len(model.blocks)):
-        ffn = model.blocks[block_idx].ffn
-        # FFN may have a smaller hidden_dim than 4096; iterate up to actual size
-        hidden_dim = ffn.W_up.shape[0]
-        for u in range(hidden_dim):
-            mark_pc_w = ffn.W_up[u, BD.MARK_PC].item()
-            if mark_pc_w <= 50:  # not a MARK_PC firing unit
-                continue
-            writes_output = (
-                ffn.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
-                or ffn.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
-            )
-            if not writes_output:
-                continue
-            # Find which branch-related signal this unit reads strongly
-            for trigger_dim, blockers in OPCODE_BLOCK_MAP.items():
-                trigger_w = ffn.W_up[u, trigger_dim].item()
-                if trigger_w <= 5:  # not a strong-enough trigger
-                    continue
-                # Apply blockers (strong negative) for the OTHER opcodes
-                for opcode_dim in blockers:
-                    # Don't OVERWRITE existing strong negative weights — take min
-                    cur = ffn.W_up[u, opcode_dim].item()
-                    ffn.W_up[u, opcode_dim] = min(cur, -S)
-                branch_override_patches += 1
-                break  # one trigger is enough
-
     # ===== LAYER 7: Operand gather + memory relay heads =====
     attn7 = model.blocks[7].attn
     if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
@@ -2657,6 +2580,84 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     if errors:
         for e in errors:
             print(f"  CONTRACT: {e}")
+
+    # === FIX 2026-05-09: Suppress branch/LEV-override units when other opcodes active ===
+    # In pure_neural mode without runner overrides, L5 attention heads leak opcode flags
+    # (OP_JMP, OP_LEV, OP_BZ, OP_BNZ, CMP[0]) into MARK_PC of subsequent steps. Various
+    # FFN units across blocks then fire spuriously, destroying carry-forwarded values.
+    #
+    # Defensive gate: any FFN unit (in any block) that fires with positive OP_JMP/OP_LEV/
+    # OP_BZ/OP_BNZ/CMP[0] weight AND positive MARK_PC weight AND writes to OUTPUT_LO/HI
+    # gets strong negative weights for non-target opcodes. When the actually-active
+    # opcode (e.g., OP_IMM ≈ 5) is set, the unit's `up` becomes strongly negative.
+    # Only the legit branch/LEV opcode lets the unit fire.
+    #
+    # IMPORTANT: This patch must run AFTER all layer setups (so all FFN weights are
+    # programmed) and BEFORE _right_size_ffns (so the patch's edits become permanent
+    # in the right-sized result).
+    OPCODE_BLOCK_MAP = {
+        BD.OP_JMP: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
+                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
+        BD.OP_LEV: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP,
+                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
+        BD.OP_BZ:  [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
+                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                    BD.OP_BNZ, BD.OP_JSR],
+        BD.OP_BNZ: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
+                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                    BD.OP_BZ, BD.OP_JSR],
+        BD.CMP + 0: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
+                     BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                     BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                     BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                     BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                     BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                     BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
+    }
+    branch_override_patches = 0
+    for block_idx in range(len(model.blocks)):
+        ffn = model.blocks[block_idx].ffn
+        if not (hasattr(ffn, 'W_up') and isinstance(getattr(ffn, 'W_up', None), nn.Parameter)):
+            continue
+        hidden_dim = ffn.W_up.shape[0]
+        for u in range(hidden_dim):
+            mark_pc_w = ffn.W_up[u, BD.MARK_PC].item()
+            if mark_pc_w <= 50:
+                continue
+            writes_output = (
+                ffn.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
+                or ffn.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
+            )
+            if not writes_output:
+                continue
+            for trigger_dim, blockers in OPCODE_BLOCK_MAP.items():
+                trigger_w = ffn.W_up[u, trigger_dim].item()
+                if trigger_w <= 5:
+                    continue
+                for opcode_dim in blockers:
+                    cur = ffn.W_up[u, opcode_dim].item()
+                    ffn.W_up.data[u, opcode_dim] = min(cur, -S)
+                branch_override_patches += 1
+                break
+    print(f"  BRANCH OVERRIDE PATCH: {branch_override_patches} units gated")
 
     # ===== FIX 2026-05-09: Right-size FFN hidden dimensions to actual programmed units =====
     # The architecture is built with hardcoded ffn_hidden=4096, but most FFNs only program
