@@ -416,7 +416,7 @@ class AutoregressiveAttention(nn.Module):
 #         return x + F.linear(out, self.W_o)
 
 
-class ComparisonCombine(nn.Module):
+class ComparisonCombine(PureFFN):
     """Comparison combine module for EQ/NE/LT/GT/LE/GE.
 
     Reads CMP[0..3] flags from L9 FFN at AX marker position:
@@ -426,21 +426,24 @@ class ComparisonCombine(nn.Module):
     Uses default + override pattern:
     - Default unit writes initial result (0 or 1)
     - Override units flip result based on CMP flags
+
+    Phase 0 conversion (2026-05-09): now subclasses PureFFN so it has the
+    canonical SwiGLU forward (silu(W_up @ x + b_up) * (W_gate @ x + b_gate) → W_down)
+    and is treated structurally like every other FFN by tooling.
     """
 
     def __init__(self, d_model=512, S=100.0):
-        super().__init__()
+        # PureFFN.__init__ calls _bake_weights(); store config first so _bake_weights
+        # can read it. We use object.__setattr__ to bypass nn.Module.__setattr__ since
+        # nn.Module isn't initialized yet at this point.
+        object.__setattr__(self, '_pending_S', S)
+        super().__init__(dim=d_model, hidden_dim=18)
         self.d_model = d_model
         self.S = S
+
+    def _bake_weights(self):
+        S = self._pending_S
         BD = _SetDim
-
-        n_units = 18
-        self.W_up = nn.Parameter(torch.zeros(n_units, d_model))
-        self.b_up = nn.Parameter(torch.zeros(n_units))
-        self.W_gate = nn.Parameter(torch.zeros(n_units, d_model))
-        self.b_gate = nn.Parameter(torch.zeros(n_units))
-        self.W_down = nn.Parameter(torch.zeros(d_model, n_units))
-
         unit = 0
 
         def _cmp_default(op_dim, default_result):
@@ -498,14 +501,8 @@ class ComparisonCombine(nn.Module):
         _cmp_override_2way(BD.OP_GE, BD.CMP + 0, 0, 1)
         _cmp_override_3way(BD.OP_GE, BD.CMP + 1, BD.CMP + 3, 0, 1)
 
-    def forward(self, x):
-        up = F.silu(x @ self.W_up.t() + self.b_up)
-        gate = x @ self.W_gate.t() + self.b_gate
-        hidden = up * gate
-        return x + hidden @ self.W_down.t()
 
-
-class BinaryOpByteZeroingPostOp(nn.Module):
+class BinaryOpByteZeroingPostOp(PureFFN):
     """Post-op that zeros OUTPUT at AX byte positions for ops with byte-0-only results.
 
     For ADD/SUB/MUL/DIV/MOD/SHL/SHR/EQ/NE/LT/GT/LE/GE, the byte 0 result comes from
@@ -515,63 +512,59 @@ class BinaryOpByteZeroingPostOp(nn.Module):
     Note: ADD/SUB with carry will have bytes 1-3 corrected by CarryPropagationPostOp
     which runs AFTER this post-op. So zeroing here is safe - carry propagation adds
     the correct values later.
+
+    Phase 0 conversion (2026-05-09): subclasses PureFFN.
     """
 
     def __init__(self, d_model=512, S=100.0):
-        super().__init__()
+        object.__setattr__(self, '_pending_S', S)
+        super().__init__(dim=d_model, hidden_dim=4)
         self.d_model = d_model
         self.S = S
+
+    def _bake_weights(self):
+        S = self._pending_S
         BD = _SetDim
+        op_dims = [BD.OP_ADD, BD.OP_SUB, BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT,
+                   BD.OP_LE, BD.OP_GE, BD.OP_SHL, BD.OP_SHR,
+                   BD.OP_MUL, BD.OP_DIV, BD.OP_MOD]
 
-        self.W_up = nn.Parameter(torch.zeros(4, d_model))
-        self.b_up = nn.Parameter(torch.zeros(4))
-        self.W_gate = nn.Parameter(torch.zeros(4, d_model))
-        self.b_gate = nn.Parameter(torch.zeros(4))
-        self.W_down = nn.Parameter(torch.zeros(d_model, 4))
+        for unit in range(4):
+            self.W_up.data[unit, BD.IS_BYTE] = S
+            self.W_up.data[unit, BD.H1 + 1] = S
+            self.b_up.data[unit] = -S * 1.5
+            for d in op_dims:
+                self.W_gate.data[unit, d] = 1.0
 
-        with torch.no_grad():
-            # Include ADD/SUB - CarryPropagationPostOp runs later and will add carry values
-            op_dims = [BD.OP_ADD, BD.OP_SUB, BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT,
-                       BD.OP_LE, BD.OP_GE, BD.OP_SHL, BD.OP_SHR,
-                       BD.OP_MUL, BD.OP_DIV, BD.OP_MOD]
-
-            for unit in range(4):
-                self.W_up.data[unit, BD.IS_BYTE] = S
-                self.W_up.data[unit, BD.H1 + 1] = S
-                self.b_up.data[unit] = -S * 1.5
-                for d in op_dims:
-                    self.W_gate.data[unit, d] = 1.0
-
-            for k in range(16):
-                self.W_down.data[BD.OUTPUT_LO + k, 0] = -3.0 / S
-                self.W_down.data[BD.OUTPUT_HI + k, 1] = -3.0 / S
-            self.W_down.data[BD.OUTPUT_LO + 0, 2] = 5.0 / S
-            self.W_down.data[BD.OUTPUT_HI + 0, 3] = 5.0 / S
-
-    def forward(self, x):
-        h = F.silu(x @ self.W_up.T + self.b_up) * (x @ self.W_gate.T + self.b_gate)
-        return x + h @ self.W_down.T
+        for k in range(16):
+            self.W_down.data[BD.OUTPUT_LO + k, 0] = -3.0 / S
+            self.W_down.data[BD.OUTPUT_HI + k, 1] = -3.0 / S
+        self.W_down.data[BD.OUTPUT_LO + 0, 2] = 5.0 / S
+        self.W_down.data[BD.OUTPUT_HI + 0, 3] = 5.0 / S
 
 
-class CarryPropagationPostOp(nn.Module):
+class CarryPropagationPostOp(PureFFN):
     """Post-op for L10 that propagates carry/borrow between adjacent bytes.
 
     Each instance handles one byte level. Three instances are stacked as
     sequential post_ops for the full byte 0→1→2→3 cascade.
+
+    Phase 0 conversion (2026-05-09): subclasses PureFFN.
     """
 
     def __init__(self, d_model=512, S=100.0, byte_idx=0, cascade=False):
-        super().__init__()
+        object.__setattr__(self, '_pending_S', S)
+        object.__setattr__(self, '_pending_byte_idx', byte_idx)
+        object.__setattr__(self, '_pending_cascade', cascade)
+        super().__init__(dim=d_model, hidden_dim=512)
         self.d_model = d_model
         self.S = S
-        BD = _SetDim
-        n_units = 512
 
-        self.W_up = nn.Parameter(torch.zeros(n_units, d_model))
-        self.b_up = nn.Parameter(torch.zeros(n_units))
-        self.W_gate = nn.Parameter(torch.zeros(n_units, d_model))
-        self.b_gate = nn.Parameter(torch.zeros(n_units))
-        self.W_down = nn.Parameter(torch.zeros(d_model, n_units))
+    def _bake_weights(self):
+        S = self._pending_S
+        byte_idx = self._pending_byte_idx
+        cascade = self._pending_cascade
+        BD = _SetDim
 
         byte_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][byte_idx]
         add_carry_in = BD.CARRY + (3 if cascade else 1)
@@ -589,18 +582,11 @@ class CarryPropagationPostOp(nn.Module):
             BD.OP_PUTCHAR, BD.OP_GETCHAR,
         ]
 
+        unit = 0
         with torch.no_grad():
-            unit = 0
             # ADD carry propagation
             # NOTE: At byte positions, OP_ADD is NOT set (only at markers).
             # We use CARRY[1/3] as the discriminator instead - it's only set by ADD overflow.
-            # FIX 2026-05-08: Threshold increased to 9.5 and CARRY weight to 2S.
-            # L10 passthrough adds ~2.0 to OUTPUT for ADD/SUB (to copy bytes 1-3 from prev step).
-            # This makes OUTPUT_LO/HI values ~2.94 instead of ~1.0, requiring higher threshold.
-            # Without CARRY: 294 + 294 + 100 + 100 = 788 < 950, won't fire.
-            # With CARRY[1]=2, weight=2S: 400 + 294 + 294 + 100 + 100 = 1188 > 950, fires.
-            # FIX 2026-05-08: Also suppress when BITWISE_OP (TEMP[3]) is set at byte positions.
-            # TEMP[3] is relayed from marker by L7 head 5 for AND/OR/XOR operations.
             for lo in range(16):
                 for hi in range(16):
                     new_val = lo + hi * 16 + 1
@@ -675,34 +661,29 @@ class CarryPropagationPostOp(nn.Module):
                         self.W_down.data[BD.CARRY + 3, unit] = 2.0 / S
                     unit += 1
 
-    def forward(self, x):
-        h = F.silu(x @ self.W_up.T + self.b_up) * (x @ self.W_gate.T + self.b_gate)
-        return x + h @ self.W_down.T
 
-
-class BitwiseBytePropagationPostOp(nn.Module):
+class BitwiseBytePropagationPostOp(PureFFN):
     """Post-op for L10 that computes AND/OR/XOR at AX byte positions (bytes 1-3).
 
     After head 4 copies STACK0 byte values to ALU_LO/HI at byte positions,
     this reads AX operand from OUTPUT and STACK0 operand from ALU, then
     computes per-nibble bitwise result.
+
+    Phase 0 conversion (2026-05-09): subclasses PureFFN.
     """
 
     def __init__(self, d_model=512, S=100.0):
-        super().__init__()
+        object.__setattr__(self, '_pending_S', S)
+        super().__init__(dim=d_model, hidden_dim=1536)
         self.d_model = d_model
         self.S = S
+
+    def _bake_weights(self):
+        S = self._pending_S
         BD = _SetDim
-        n_units = 1536
 
-        self.W_up = nn.Parameter(torch.zeros(n_units, d_model))
-        self.b_up = nn.Parameter(torch.zeros(n_units))
-        self.W_gate = nn.Parameter(torch.zeros(n_units, d_model))
-        self.b_gate = nn.Parameter(torch.zeros(n_units))
-        self.W_down = nn.Parameter(torch.zeros(d_model, n_units))
-
+        unit = 0
         with torch.no_grad():
-            unit = 0
             # FIX 2026-05-08: Use relayed opcode flags (TEMP[4..6]) instead of original OP_* dims.
             # The original OP_AND/OR/XOR are only set at markers, not at byte positions.
             # L7 head 5 relays them to TEMP[4..6] at AX byte positions.
@@ -750,10 +731,6 @@ class BitwiseBytePropagationPostOp(nn.Module):
                         self.W_down.data[BD.OUTPUT_HI + a_hi, unit] = -2.0 / S
                         self.W_down.data[BD.OUTPUT_HI + r, unit] = 2.0 / S
                         unit += 1
-
-    def forward(self, x):
-        h = F.silu(x @ self.W_up.T + self.b_up) * (x @ self.W_gate.T + self.b_gate)
-        return x + h @ self.W_down.T
 
 
 class DivModModule(nn.Module):
