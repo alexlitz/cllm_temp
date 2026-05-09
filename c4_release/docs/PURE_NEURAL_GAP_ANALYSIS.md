@@ -242,7 +242,18 @@ The architecture has too many tangled layers (L0–L16) all writing to OUTPUT at
 
 3. **DEPRECATED-but-still-wired heads.** L5 attention head 6 is documented as "DEPRECATED: OP_* flags were removed from embeddings (2026-04-13)" but is still wired up. It leaks opcode flags into MARK_PC. Similar dead-but-wired code likely exists elsewhere.
 
-**Phase 1 results (after this session): 12/13 gate tests pass.**
+**Phase 1 + Phase 2 results: 26/29 gate tests pass.**
+
+After strengthening ComparisonCombine's MARK_PC blocker from -10*S to -50*S, simple PSH+ADD/SUB/AND/OR tests pass pure-neural. The blocker fights leaked CMP[0..3] residuals (which can reach ~15 at MARK_PC due to cumulative writes by L6/L7/L8 attention heads in pure-neural mode without runner overrides).
+
+Phase 2 (`tests/test_pure_neural_psh_add.py`): 14/16 passing
+- `test_imm_psh_exit` ✅
+- All `test_add_small` except `[0-5-5]` (ADD 0+5 hits the multi-byte broadcast bug)
+- All `test_sub_small` ✅
+- All `test_and_small` ✅
+- `test_or_small[170-85-255]`, `[0-0-0]` ✅; `[240-15-255]` ❌
+
+**Phase 1 results (this session): 12/13 gate tests pass.**
 
 The remaining failure (`test_five_imms`) is a multi-byte AX broadcast bug. Bytecode `IMM 1, IMM 2, IMM 3, IMM 4, IMM 5, EXIT` returns `0x04040404` after 4 IMMs (byte 0 broadcast across all 4 bytes). Investigation findings:
 
