@@ -55,6 +55,13 @@ class Operation:
     attention or feed-forward.
     `bake_fn(module, dim_positions, S)` is invoked at compile time to actually
     write the weights into the assigned attention or FFN module.
+
+    `phase` is an optional ordering hint. When the dep graph has ambiguity
+    (e.g., two ops both read+write the same dim at different positions, which
+    the dim-name-only dep model can't distinguish), the compiler uses phase to
+    break ties: an edge u→v in the dep graph is dropped if u.phase > v.phase.
+    Smaller phase = earlier. Use the original `_set_layerN_*` layer number as
+    the phase for migrated ops to preserve hand-set order.
     """
 
     name: str
@@ -62,6 +69,7 @@ class Operation:
     writes: Set[str]
     kind: str  # "attn" or "ffn"
     bake_fn: Callable
+    phase: Optional[int] = None
 
     def __hash__(self):
         return hash(self.name)
@@ -176,12 +184,20 @@ class LayerCompiler:
                 writers[d].append(op)
 
         # Build edges: u -> v iff v.reads ∩ u.writes
+        # Drop edges where both ops have phase set AND u.phase > v.phase, i.e.,
+        # the writer comes later in the hand-set order than the reader. These
+        # are spurious deps caused by the dim-name-only dep model (multiple ops
+        # writing the "same" dim at different positions).
         in_edges: Dict[str, Set[str]] = {op.name: set() for op in self.ops}
         out_edges: Dict[str, Set[str]] = {op.name: set() for op in self.ops}
         for v in self.ops:
             for d in v.reads:
                 for u in writers.get(d, ()):
                     if u.name == v.name:
+                        continue
+                    # Phase-based pruning of spurious deps
+                    if (u.phase is not None and v.phase is not None
+                            and u.phase > v.phase):
                         continue
                     in_edges[v.name].add(u.name)
                     out_edges[u.name].add(v.name)

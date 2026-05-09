@@ -36,24 +36,20 @@ def _as_setdim_proxy(dim_positions: Dict[str, int]):
     integer positions that the compiler chose.
 
     Returns an object where `proxy.MARK_PC == dim_positions['MARK_PC']`.
+    Falls back to `_SetDim` for anything not declared (e.g., classmethods like
+    `opcode_dim`, constants like `NUM_OPCODES`).
     """
-    class _Proxy:
-        pass
-    proxy = _Proxy()
-    # Copy ALL _SetDim class attributes that are integers, then override with
-    # compiler positions where declared. This way, references to undeclared
-    # dims (e.g., NUM_OPCODES) still work, while declared dims use compiler
-    # positions.
     from ..vm_step import _SetDim
-    for name in dir(_SetDim):
-        if name.startswith('_'):
-            continue
-        val = getattr(_SetDim, name)
-        if isinstance(val, int):
-            setattr(proxy, name, val)
-    # Override with compiler-declared positions
+
+    class _Proxy:
+        # Inherit class methods and constants from _SetDim via __getattr__ fallback
+        def __getattr__(self, name):
+            return getattr(_SetDim, name)
+
+    proxy = _Proxy()
+    # Override with compiler-declared positions for declared dims
     for name, pos in dim_positions.items():
-        setattr(proxy, name, pos)
+        object.__setattr__(proxy, name, pos)
     return proxy
 
 
@@ -82,6 +78,7 @@ def make_phase_a_ffn_op() -> Operation:
     # H0..H4 ranges, which are size-7 dims.
     return Operation(
         name="phase_a_ffn",
+        phase=0,
         reads={"H0", "H1", "H2", "H3", "H4"},
         writes={"NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
                 "NEXT_STACK0", "NEXT_MEM", "NEXT_SE"},
@@ -105,6 +102,7 @@ def make_layer1_ffn_op() -> Operation:
 
     return Operation(
         name="layer1_ffn",
+        phase=1,
         reads={"L1H0", "L1H1", "L1H2", "L1H4", "H0", "H1", "IS_BYTE"},
         writes={"STACK0_BYTE0", "BYTE_INDEX_0", "BYTE_INDEX_1",
                 "BYTE_INDEX_2", "BYTE_INDEX_3"},
@@ -129,6 +127,7 @@ def make_layer3_ffn_op() -> Operation:
 
     return Operation(
         name="layer3_ffn",
+        phase=3,
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
                "EMBED_LO", "EMBED_HI", "H1", "H4", "OP_LEV",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2"},
@@ -146,6 +145,7 @@ def make_layer2_mem_byte_flags_op() -> Operation:
 
     return Operation(
         name="layer2_mem_byte_flags",
+        phase=2,
         reads={"H0", "H1", "H4", "IS_BYTE", "BYTE_INDEX_0",
                "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
         writes={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
@@ -163,6 +163,7 @@ def make_nibble_copy_ffn_op() -> Operation:
 
     return Operation(
         name="nibble_copy_ffn",
+        phase=2,
         reads={"IS_BYTE", "H1", "H4", "MEM_STORE",
                "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
@@ -183,6 +184,7 @@ def make_layer4_pc_relay_op() -> Operation:
 
     return Operation(
         name="layer4_pc_relay",
+        phase=4,
         reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI", "CONST"},
         writes={"EMBED_LO", "EMBED_HI"},  # at AX marker
         kind="attn",
@@ -198,6 +200,7 @@ def make_layer4_ffn_op() -> Operation:
 
     return Operation(
         name="layer4_ffn",
+        phase=4,
         reads={"MARK_AX", "MARK_PC", "EMBED_LO", "EMBED_HI",
                "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "H1"},
@@ -216,13 +219,15 @@ def make_layer5_fetch_op() -> Operation:
 
     return Operation(
         name="layer5_fetch",
+        phase=5,
+        # Reads: PC/AX markers + FETCH addr (PC+K) + ADDR_KEY (per CODE byte) +
+        #        CLEAN_EMBED (the value at the matched CODE byte).
+        # Note: heads 6/7 also read OP_* via V projection but that's the DEPRECATED
+        # path (OP_* flags were removed from embeddings 2026-04-13). Excluding from
+        # reads since they're not semantically active inputs.
         reads={"MARK_PC", "MARK_AX", "HAS_SE",
                "FETCH_LO", "FETCH_HI", "EMBED_LO", "EMBED_HI",
-               "ADDR_KEY", "CONST", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "OP_IMM", "OP_LEA", "OP_EXIT", "OP_JMP", "OP_JSR",
-               "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
-               "OP_OR", "OP_XOR", "OP_AND",
-               "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
+               "ADDR_KEY", "CONST", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
                 "FETCH_LO", "FETCH_HI",
                 "OP_IMM", "OP_LEA", "OP_EXIT", "OP_JMP", "OP_JSR",
@@ -242,6 +247,7 @@ def make_opcode_decode_ffn_op() -> Operation:
 
     return Operation(
         name="opcode_decode_ffn",
+        phase=5,
         reads={"OPCODE_BYTE_LO", "OPCODE_BYTE_HI", "MARK_AX", "MARK_PC", "HAS_SE"},
         writes={"OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
                 "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
@@ -265,6 +271,7 @@ def make_layer6_attn_op() -> Operation:
 
     return Operation(
         name="layer6_attn",
+        phase=6,
         reads={"OP_JMP", "OP_EXIT", "OP_JSR", "MARK_AX", "MARK_PC", "MARK_SP",
                "MARK_STACK0", "NEXT_SE", "FETCH_LO", "FETCH_HI",
                "PSH_AT_SP", "OP_PSH", "OP_ADJ", "OP_ENT", "OP_LEV",
@@ -283,6 +290,7 @@ def make_layer6_routing_ffn_op() -> Operation:
 
     return Operation(
         name="layer6_routing_ffn",
+        phase=6,
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
@@ -305,6 +313,7 @@ def make_layer6_relay_heads_op() -> Operation:
 
     return Operation(
         name="layer6_relay_heads",
+        phase=6,
         reads={"MARK_STACK0", "MARK_AX", "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
@@ -321,6 +330,7 @@ def make_layer7_operand_gather_op() -> Operation:
 
     return Operation(
         name="layer7_operand_gather",
+        phase=7,
         reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"ALU_LO", "ALU_HI"},
@@ -338,6 +348,7 @@ def make_layer7_memory_heads_op() -> Operation:
 
     return Operation(
         name="layer7_memory_heads",
+        phase=7,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "OP_LI", "OP_LC", "OP_PSH", "OP_SI", "OP_SC",
                "AX_CARRY_LO", "AX_CARRY_HI", "TEMP"},
@@ -356,6 +367,7 @@ def make_layer8_alu_op() -> Operation:
 
     return Operation(
         name="layer8_alu",
+        phase=8,
         reads={"MARK_AX", "MARK_PC", "ALU_LO", "AX_CARRY_LO", "FETCH_LO",
                "OP_ADD", "OP_SUB", "OP_LEA",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE"},
@@ -374,6 +386,7 @@ def make_layer8_multibyte_fetch_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_fetch",
+        phase=8,
         reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
@@ -390,6 +403,7 @@ def make_layer8_multibyte_routing_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_routing",
+        phase=8,
         reads={"IS_BYTE", "H1", "OP_IMM", "MARK_AX",
                "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
@@ -407,6 +421,7 @@ def make_layer8_sp_gather_op() -> Operation:
 
     return Operation(
         name="layer8_sp_gather",
+        phase=8,
         reads={"MARK_AX", "MARK_SP", "OP_ADJ", "OP_ENT", "OP_LEA",
                "EMBED_LO", "EMBED_HI"},
         writes={"ALU_LO", "ALU_HI"},
@@ -423,6 +438,7 @@ def make_layer9_alu_op() -> Operation:
 
     return Operation(
         name="layer9_alu",
+        phase=9,
         reads={"MARK_AX", "MARK_PC", "ALU_HI", "AX_CARRY_HI", "FETCH_HI", "CARRY",
                "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
@@ -442,6 +458,7 @@ def make_layer9_lev_addr_relay_op() -> Operation:
 
     return Operation(
         name="layer9_lev_addr_relay",
+        phase=9,
         reads={"MARK_SP", "OP_LEV", "L1H1", "BYTE_INDEX_0",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
@@ -459,6 +476,7 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
 
     return Operation(
         name="layer9_lev_bp_to_pc_relay",
+        phase=9,
         reads={"MARK_PC", "OP_LEV", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "L1H1", "BYTE_INDEX_0"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
@@ -476,6 +494,7 @@ def make_layer10_carry_relay_op() -> Operation:
 
     return Operation(
         name="layer10_carry_relay",
+        phase=10,
         reads={"MARK_AX", "IS_BYTE", "H1", "CARRY"},
         writes={"CARRY"},  # broadcast
         kind="attn",
@@ -492,6 +511,7 @@ def make_layer10_byte_passthrough_op() -> Operation:
 
     return Operation(
         name="layer10_byte_passthrough",
+        phase=10,
         reads={"IS_BYTE", "HAS_SE", "OP_IMM", "TEMP",
                "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -510,6 +530,7 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
 
     return Operation(
         name="layer10_sp_byte_passthrough",
+        phase=10,
         reads={"IS_BYTE", "HAS_SE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -528,6 +549,7 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
 
     return Operation(
         name="layer10_psh_stack0_passthrough",
+        phase=10,
         reads={"MARK_STACK0", "OP_PSH", "AX_CARRY_LO", "AX_CARRY_HI",
                "OP_LI", "OP_LC", "OP_SI", "OP_SC"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
@@ -544,6 +566,7 @@ def make_layer10_alu_op() -> Operation:
 
     return Operation(
         name="layer10_alu",
+        phase=10,
         reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "ALU_HI", "AX_CARRY_HI",
                "OP_OR", "OP_XOR", "OP_AND", "OP_DIV", "OP_MOD"},
         writes={"OUTPUT_LO", "OUTPUT_HI", "DIV_STAGING"},
@@ -560,6 +583,7 @@ def make_layer11_mul_partial_op() -> Operation:
 
     return Operation(
         name="layer11_mul_partial",
+        phase=11,
         reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
         writes={"MUL_ACCUM"},
         kind="ffn",
@@ -575,6 +599,7 @@ def make_layer12_mul_combine_op() -> Operation:
 
     return Operation(
         name="layer12_mul_combine",
+        phase=12,
         reads={"MARK_AX", "MUL_ACCUM", "OP_MUL"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
@@ -591,6 +616,7 @@ def make_layer13_mem_addr_gather_op() -> Operation:
 
     return Operation(
         name="layer13_mem_addr_gather",
+        phase=13,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC", "OP_SI", "OP_SC",
                "MEM_ADDR_SRC"},
@@ -609,6 +635,7 @@ def make_layer13_shifts_op() -> Operation:
 
     return Operation(
         name="layer13_shifts",
+        phase=13,
         reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                "OP_SHL", "OP_SHR"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
@@ -626,6 +653,7 @@ def make_layer14_mem_generation_op() -> Operation:
 
     return Operation(
         name="layer14_mem_generation",
+        phase=14,
         reads={"MARK_MEM", "MARK_SP", "MARK_STACK0", "OP_PSH", "OP_SI", "OP_SC",
                "OP_JSR", "OP_ENT", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO", "ADDR_B0_HI",
@@ -645,6 +673,7 @@ def make_layer15_memory_lookup_op() -> Operation:
 
     return Operation(
         name="layer15_memory_lookup",
+        phase=15,
         reads={"MARK_AX", "OP_LI", "OP_LC", "OP_LI_RELAY", "OP_LC_RELAY",
                "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_KEY", "MARK_MEM",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -662,6 +691,7 @@ def make_layer16_lev_routing_op() -> Operation:
 
     return Operation(
         name="layer16_lev_routing",
+        phase=16,
         reads={"MARK_SP", "MARK_PC", "OP_LEV", "ADDR_B0_LO", "ADDR_B0_HI",
                "TEMP"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
