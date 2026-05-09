@@ -4589,7 +4589,14 @@ def _set_layer6_attn(attn, S, BD, HD):
     for k in range(16):
         attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
         attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
-    attn.W_o[BD.OP_EXIT, base + 4] = 1.0
+    # FIX 2026-05-09: REMOVED `attn.W_o[BD.OP_EXIT, base + 4] = 1.0`. This was a
+    # leftover OP_* relay (the comment above explicitly says we only relay FETCH
+    # because OP_* is set globally by L5 FFN). Slot 4 is also used by FETCH_LO[4]
+    # relay, so this line caused a slot collision: any byte value with low nibble = 4
+    # (e.g. 100, 4, 20, 36, ...) had FETCH_LO[4] = 40 *also* written into OP_EXIT.
+    # The L6 IMM routing units have W_up[OP_EXIT] = -S*20 = -2000, so OP_EXIT = 40
+    # produced up = -80,000 and the IMM unit didn't fire. test_imm_byte_values[100]
+    # was the visible symptom.
     # Anti-leakage gate for FETCH relay (prevent writes at non-AX positions)
     # Without this gate, softmax1 distributes attention uniformly at byte positions,
     # and W_o writes garbage FETCH values, overwriting the correct FETCH from L4 FFN.
