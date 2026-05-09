@@ -314,3 +314,77 @@ class TestBuildModel:
         model = build_model_from_layout(layout, S=100.0)
         assert model.d_model == 16
         assert len(model.blocks) == 1
+
+
+class TestMigratedOps:
+    """Phase 0 M3: verify wrapped existing _set_layerN_* functions work."""
+
+    def test_phase_a_ffn_compiles_and_bakes(self):
+        """The L0 step-structure FFN (originally _set_phase_a_ffn) wraps cleanly
+        as a LayerCompiler Operation."""
+        from neural_vm.unified_compiler.migrated_ops import (
+            make_phase_a_ffn_op,
+            declare_setdim_compat_dims,
+        )
+
+        c = LayerCompiler()
+        declare_setdim_compat_dims(c)
+        c.add_op(make_phase_a_ffn_op())
+
+        layout = c.compile()
+        # The op reads H0..H4 and writes NEXT_*. The compiler places it at
+        # the earliest legal layer. Since we're declaring all dims as if from
+        # _SetDim and there are no other ops writing H0..H4 (the threshold
+        # heads aren't migrated yet), the dep graph is trivial and phase_a
+        # lands at L0 in the ffn slot.
+        assert layout.n_layers == 1
+        assert layout.ops_at(0)[0].name == "phase_a_ffn"
+
+        # Verify the op can actually bake — build a model and call it.
+        # AutoregressiveVM requires d_model divisible by num_heads (8 default).
+        # The compat dim layout produces a large d_model that may not be
+        # divisible. Pad if needed.
+        if layout.d_model % 8 != 0:
+            pad = 8 - (layout.d_model % 8)
+            c.declare_dim("_pad", pad)
+            layout = c.compile()
+
+        model = build_model_from_layout(layout, S=100.0)
+        # The bake_fn programs the FFN's W_up, b_up, W_gate, b_gate, W_down.
+        # Verify weights got set (non-zero somewhere).
+        ffn = model.blocks[0].ffn
+        assert ffn.W_up.data.abs().sum().item() > 0
+        assert ffn.W_down.data.abs().sum().item() > 0
+
+    def test_three_ffn_ops_assign_to_separate_layers(self):
+        """phase_a, layer1, layer3 each kind=ffn — must take 3 layers."""
+        from neural_vm.unified_compiler.migrated_ops import (
+            make_phase_a_ffn_op,
+            make_layer1_ffn_op,
+            make_layer3_ffn_op,
+            declare_setdim_compat_dims,
+        )
+
+        c = LayerCompiler()
+        declare_setdim_compat_dims(c)
+        # Add in arbitrary order — compiler should still produce a valid layout.
+        c.add_op(make_layer3_ffn_op())
+        c.add_op(make_phase_a_ffn_op())
+        c.add_op(make_layer1_ffn_op())
+
+        layout = c.compile()
+        # Three ffn ops, no attn ops. Each needs its own layer (one ffn slot
+        # per layer).
+        assert layout.n_layers == 3
+        # phase_a writes NEXT_*, doesn't read EMBED_LO/HI or BYTE_INDEX_*, so
+        # it has no dep on layer1 or layer3. Should be at L0.
+        # layer1 reads L1H*/H*/IS_BYTE, writes BYTE_INDEX_*/STACK0_BYTE0.
+        # layer3 reads MARK_*/EMBED_*/H1/H4/BYTE_INDEX_*, writes OUTPUT_*/EMBED_*.
+        # → layer3 depends on layer1 (BYTE_INDEX_*).
+        names_at = [{op.name for op in layout.ops_at(i)} for i in range(layout.n_layers)]
+        # phase_a and layer1 can be in any order at L0/L1; layer3 must be after layer1.
+        assert "layer3_ffn" in names_at[2]
+        # layer1 must be before layer3
+        layer1_idx = next(i for i, ns in enumerate(names_at) if "layer1_ffn" in ns)
+        layer3_idx = next(i for i, ns in enumerate(names_at) if "layer3_ffn" in ns)
+        assert layer1_idx < layer3_idx

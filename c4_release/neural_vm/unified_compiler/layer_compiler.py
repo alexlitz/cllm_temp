@@ -283,15 +283,20 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
     # Auto d_model is derived from layout, not hardcoded.
     model = AutoregressiveVM(d_model=layout.d_model, n_layers=n_layers)
 
-    for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer):
-        block = model.blocks[layer_idx]
-        for op in ops_at_layer:
-            if op.kind == "attn":
-                target = block.attn
-            elif op.kind == "ffn":
-                target = block.ffn
-            else:
-                raise ValueError(f"Unknown op kind {op.kind!r}")
-            op.bake_fn(target, layout.dim_positions, S)
+    # Wrap the entire bake pass in no_grad so bake_fn implementations can do
+    # in-place writes to leaf Parameters (the pattern used throughout
+    # vm_step.py's hand-set weights).
+    import torch as _torch
+    with _torch.no_grad():
+        for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer):
+            block = model.blocks[layer_idx]
+            for op in ops_at_layer:
+                if op.kind == "attn":
+                    target = block.attn
+                elif op.kind == "ffn":
+                    target = block.ffn
+                else:
+                    raise ValueError(f"Unknown op kind {op.kind!r}")
+                op.bake_fn(target, layout.dim_positions, S)
 
     return model
