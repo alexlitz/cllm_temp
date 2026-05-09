@@ -242,6 +242,22 @@ The architecture has too many tangled layers (L0–L16) all writing to OUTPUT at
 
 3. **DEPRECATED-but-still-wired heads.** L5 attention head 6 is documented as "DEPRECATED: OP_* flags were removed from embeddings (2026-04-13)" but is still wired up. It leaks opcode flags into MARK_PC. Similar dead-but-wired code likely exists elsewhere.
 
+**Phase 1 results (after this session): 12/13 gate tests pass.**
+
+The remaining failure (`test_five_imms`) is a multi-byte AX broadcast bug. Bytecode `IMM 1, IMM 2, IMM 3, IMM 4, IMM 5, EXIT` returns `0x04040404` after 4 IMMs (byte 0 broadcast across all 4 bytes). Investigation findings:
+
+1. **Step-count threshold.** First 3 IMMs work; 4th IMM triggers the broadcast.
+2. **Position-dependent.** `IMM 5` followed by 3 NOPs returns 5 correctly. 3 NOPs followed by `IMM 5` returns garbage. The IMM-at-step-≥4 specifically is broken.
+3. **Bug locus.** L8 multi-byte fetch (head 3, `vm_step.py:5857`) reads code bytes at PC+1, PC+2, PC+3, PC+4 for AX byte 0, 1, 2, 3 respectively. The fetched values land in `AX_CARRY_LO/HI` and L8 multi-byte routing copies them to OUTPUT. At step ≥ 4, AX byte 1-3 fetches return the byte 0 value (the lo byte of the immediate) instead of 0x00.
+4. **Verified.** L8 multi-byte routing for byte 0 fires correctly (OUTPUT_LO[4]=8 for IMM 4), but the same routing at byte 1-3 reads AX_CARRY containing 4 instead of 0.
+
+**Hypotheses for the L8 head 3 misread at step ≥ 4:**
+- ALiBi penalty growing with context length might cause attention to spread across multiple code positions, summing the V values into AX_CARRY.
+- L4 FFN's PC+K computation (nibble rotation) might break for PC values that have hi nibble = 1 (PC ≥ 16). Steps 1-3 have PC = 2, 10, 18 (mixed). Step 4 has PC = 26.
+- Anti-leakage gate on L8 head 3 might fail at certain PC values.
+
+This is Phase 3 work — fixing it likely requires rewriting the multi-byte fetch as a proper PureFFN-friendly mechanism rather than the current ALiBi-based attention. It may also be solved by Phase 0's wrapper-elimination since the multi-byte fetch is part of the broader "compile to single PureFFN per block" agenda.
+
 **Realistic next steps for Phase 1 completion:**
 
 The whack-a-mole approach scales poorly. Two cleaner options:
