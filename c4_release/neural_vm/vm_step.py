@@ -508,9 +508,13 @@ class ComparisonCombine(nn.Module):
 class BinaryOpByteZeroingPostOp(nn.Module):
     """Post-op that zeros OUTPUT at AX byte positions for ops with byte-0-only results.
 
-    For MUL/DIV/MOD/SHL/SHR/EQ/NE/LT/GT/LE/GE, the byte 0 result comes from
+    For ADD/SUB/MUL/DIV/MOD/SHL/SHR/EQ/NE/LT/GT/LE/GE, the byte 0 result comes from
     the EfficientALU. Bytes 1-3 get garbage from L10 head 1 passthrough. This
     post_op clears bytes 1-3 to 0x00 for these opcodes.
+
+    Note: ADD/SUB with carry will have bytes 1-3 corrected by CarryPropagationPostOp
+    which runs AFTER this post-op. So zeroing here is safe - carry propagation adds
+    the correct values later.
     """
 
     def __init__(self, d_model=512, S=100.0):
@@ -526,7 +530,8 @@ class BinaryOpByteZeroingPostOp(nn.Module):
         self.W_down = nn.Parameter(torch.zeros(d_model, 4))
 
         with torch.no_grad():
-            op_dims = [BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT,
+            # Include ADD/SUB - CarryPropagationPostOp runs later and will add carry values
+            op_dims = [BD.OP_ADD, BD.OP_SUB, BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT,
                        BD.OP_LE, BD.OP_GE, BD.OP_SHL, BD.OP_SHR,
                        BD.OP_MUL, BD.OP_DIV, BD.OP_MOD]
 
@@ -572,6 +577,9 @@ class CarryPropagationPostOp(nn.Module):
         add_carry_in = BD.CARRY + (3 if cascade else 1)
         sub_carry_in = BD.CARRY + (3 if cascade else 2)
 
+        # FIX 2026-05-08: Wrong byte positions to suppress (prevent firing at wrong byte)
+        wrong_byte_dims = [d for d in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2] if d != byte_dim]
+
         non_arith_ops = [
             BD.OP_LEA, BD.OP_IMM, BD.OP_JMP, BD.OP_JSR, BD.OP_BZ, BD.OP_BNZ,
             BD.OP_ENT, BD.OP_ADJ, BD.OP_LEV, BD.OP_LI, BD.OP_LC, BD.OP_SI,
@@ -583,13 +591,23 @@ class CarryPropagationPostOp(nn.Module):
 
         with torch.no_grad():
             unit = 0
+            # ADD carry propagation
+            # NOTE: At byte positions, OP_ADD is NOT set (only at markers).
+            # We use CARRY[1/3] as the discriminator instead - it's only set by ADD overflow.
+            # FIX 2026-05-08: Threshold increased to 9.5 and CARRY weight to 2S.
+            # L10 passthrough adds ~2.0 to OUTPUT for ADD/SUB (to copy bytes 1-3 from prev step).
+            # This makes OUTPUT_LO/HI values ~2.94 instead of ~1.0, requiring higher threshold.
+            # Without CARRY: 294 + 294 + 100 + 100 = 788 < 950, won't fire.
+            # With CARRY[1]=2, weight=2S: 400 + 294 + 294 + 100 + 100 = 1188 > 950, fires.
+            # FIX 2026-05-08: Also suppress when BITWISE_OP (TEMP[3]) is set at byte positions.
+            # TEMP[3] is relayed from marker by L7 head 5 for AND/OR/XOR operations.
             for lo in range(16):
                 for hi in range(16):
                     new_val = lo + hi * 16 + 1
                     new_lo = new_val & 0xF
                     new_hi = (new_val >> 4) & 0xF
-                    self.W_up.data[unit, add_carry_in] = S
-                    self.W_up.data[unit, BD.OP_ADD] = S
+                    self.W_up.data[unit, add_carry_in] = S * 2  # Stronger CARRY requirement
+                    # Removed: self.W_up.data[unit, BD.OP_ADD] = S
                     self.W_up.data[unit, BD.IS_BYTE] = S
                     self.W_up.data[unit, BD.MARK_AX] = -S * 1000
                     self.W_up.data[unit, BD.MARK_PC] = -S * 1000
@@ -599,7 +617,17 @@ class CarryPropagationPostOp(nn.Module):
                     for op_dim in non_arith_ops:
                         self.W_up.data[unit, op_dim] = -S * 20
                     self.W_up.data[unit, BD.OP_SUB] = -S * 20
-                    self.b_up.data[unit] = -S * 9.5
+                    # Suppress when BITWISE_OP (TEMP[3]) is set - indicates AND/OR/XOR
+                    self.W_up.data[unit, BD.TEMP + 3] = -S * 10
+                    # FIX 2026-05-08: Mutual exclusion with SUB. Suppress when sub_carry_in is set.
+                    # This prevents ADD units from firing during SUB (when CARRY[2] is set).
+                    self.W_up.data[unit, sub_carry_in] = -S * 10
+                    # FIX 2026-05-08: Suppress at wrong byte positions.
+                    # CARRY is relayed to ALL byte positions, so we must explicitly block
+                    # firing at wrong positions (e.g., byte_idx=0 unit shouldn't fire at byte 1).
+                    for wrong_dim in wrong_byte_dims:
+                        self.W_up.data[unit, wrong_dim] = -S * 10
+                    self.b_up.data[unit] = -S * 9.5  # Increased for L10 passthrough OUTPUT values
                     self.W_gate.data[unit, BD.H1 + 1] = 1.0
                     self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
                     self.W_down.data[BD.OUTPUT_HI + hi, unit] = -2.0 / S
@@ -609,13 +637,17 @@ class CarryPropagationPostOp(nn.Module):
                         self.W_down.data[BD.CARRY + 3, unit] = 2.0 / S
                     unit += 1
 
+            # SUB borrow propagation (same threshold adjustment as ADD)
+            # FIX 2026-05-08: Threshold increased to 9.5 and BORROW weight to 2S.
+            # See ADD carry comment above for the math.
+            # FIX 2026-05-08: Also suppress when BITWISE_OP (TEMP[3]) is set.
             for lo in range(16):
                 for hi in range(16):
                     new_val = (lo + hi * 16 - 1) & 0xFF
                     new_lo = new_val & 0xF
                     new_hi = (new_val >> 4) & 0xF
-                    self.W_up.data[unit, sub_carry_in] = S
-                    self.W_up.data[unit, BD.OP_SUB] = S
+                    self.W_up.data[unit, sub_carry_in] = S * 2  # Stronger BORROW requirement
+                    # Removed: self.W_up.data[unit, BD.OP_SUB] = S
                     self.W_up.data[unit, BD.IS_BYTE] = S
                     self.W_up.data[unit, BD.MARK_AX] = -S * 1000
                     self.W_up.data[unit, BD.MARK_PC] = -S * 1000
@@ -625,7 +657,15 @@ class CarryPropagationPostOp(nn.Module):
                     for op_dim in non_arith_ops:
                         self.W_up.data[unit, op_dim] = -S * 20
                     self.W_up.data[unit, BD.OP_ADD] = -S * 20
-                    self.b_up.data[unit] = -S * 9.5
+                    # Suppress when BITWISE_OP (TEMP[3]) is set
+                    self.W_up.data[unit, BD.TEMP + 3] = -S * 10
+                    # FIX 2026-05-08: Mutual exclusion with ADD. Suppress when add_carry_in is set.
+                    # This prevents SUB units from firing during ADD (when CARRY[1] is set).
+                    self.W_up.data[unit, add_carry_in] = -S * 10
+                    # FIX 2026-05-08: Suppress at wrong byte positions.
+                    for wrong_dim in wrong_byte_dims:
+                        self.W_up.data[unit, wrong_dim] = -S * 10
+                    self.b_up.data[unit] = -S * 9.5  # Increased for L10 passthrough OUTPUT values
                     self.W_gate.data[unit, BD.H1 + 1] = 1.0
                     self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
                     self.W_down.data[BD.OUTPUT_HI + hi, unit] = -2.0 / S
@@ -663,10 +703,13 @@ class BitwiseBytePropagationPostOp(nn.Module):
 
         with torch.no_grad():
             unit = 0
+            # FIX 2026-05-08: Use relayed opcode flags (TEMP[4..6]) instead of original OP_* dims.
+            # The original OP_AND/OR/XOR are only set at markers, not at byte positions.
+            # L7 head 5 relays them to TEMP[4..6] at AX byte positions.
             ops = [
-                (BD.OP_AND, lambda a, b: a & b),
-                (BD.OP_OR, lambda a, b: a | b),
-                (BD.OP_XOR, lambda a, b: a ^ b),
+                (BD.TEMP + 4, lambda a, b: a & b),  # Relayed OP_AND
+                (BD.TEMP + 5, lambda a, b: a | b),  # Relayed OP_OR
+                (BD.TEMP + 6, lambda a, b: a ^ b),  # Relayed OP_XOR
             ]
             for op_dim, op_fn in ops:
                 for a_lo in range(16):
@@ -677,6 +720,16 @@ class BitwiseBytePropagationPostOp(nn.Module):
                         self.W_up.data[unit, BD.IS_BYTE] = S
                         self.W_up.data[unit, BD.H1 + 1] = S
                         self.W_up.data[unit, BD.MARK_AX] = -S
+                        # FIX 2026-05-08: Suppress at byte 0 position.
+                        # This post_op computes bitwise results for bytes 1-3 using
+                        # OUTPUT (prev result) and ALU (stack operand). At byte 0,
+                        # OUTPUT contains the L10 passthrough result (next byte prediction),
+                        # not an operand, so we must not modify it.
+                        # Need strong suppression because OUTPUT can have values > 1.0
+                        # (e.g., 2.94 from L10 attention), contributing ~300 to activation.
+                        # At byte 0 with OUTPUT=3.0: 300 + 3S - 4S - 3.5S = 300 - 450 < 0 (blocked)
+                        # At bytes 1-3 with OUTPUT=1.0: 100 + 3S - 0 - 3.5S = 100 - 50 > 0 (fires)
+                        self.W_up.data[unit, BD.BYTE_INDEX_0] = -S * 4
                         self.b_up.data[unit] = -S * 3.5
                         self.W_gate.data[unit, op_dim] = 1.0
                         self.W_down.data[BD.OUTPUT_LO + a_lo, unit] = -2.0 / S
@@ -690,6 +743,8 @@ class BitwiseBytePropagationPostOp(nn.Module):
                         self.W_up.data[unit, BD.IS_BYTE] = S
                         self.W_up.data[unit, BD.H1 + 1] = S
                         self.W_up.data[unit, BD.MARK_AX] = -S
+                        # FIX 2026-05-08: Suppress at byte 0 position (see above)
+                        self.W_up.data[unit, BD.BYTE_INDEX_0] = -S * 4
                         self.b_up.data[unit] = -S * 3.5
                         self.W_gate.data[unit, op_dim] = 1.0
                         self.W_down.data[BD.OUTPUT_HI + a_hi, unit] = -2.0 / S
@@ -2134,6 +2189,83 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
             ffn6.b_gate[u] = 0
             patched_count += 1
 
+    # === FIX 2026-05-09: Suppress branch/LEV-override units when other opcodes active ===
+    # In pure_neural mode without runner overrides, L5 attention heads leak opcode flags
+    # (OP_JMP, OP_LEV, OP_BZ, OP_BNZ, CMP[0]) into MARK_PC of subsequent steps. Various
+    # FFN units across blocks then fire spuriously, destroying carry-forwarded values.
+    #
+    # Defensive gate: any FFN unit (in any block) that fires with positive OP_JMP/OP_LEV/
+    # OP_BZ/OP_BNZ/CMP[0] weight AND positive MARK_PC weight AND writes to OUTPUT_LO/HI
+    # gets strong negative weights for non-target opcodes. When the actually-active
+    # opcode (e.g., OP_IMM ≈ 5) is set, the unit's `up` becomes strongly negative.
+    # Only the legit branch/LEV opcode lets the unit fire.
+    OPCODE_BLOCK_MAP = {
+        # If unit reads OP_X strongly, block it with all the OTHER opcodes.
+        BD.OP_JMP: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
+                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
+        BD.OP_LEV: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP,
+                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
+        BD.OP_BZ:  [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
+                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                    BD.OP_BNZ, BD.OP_JSR],
+        BD.OP_BNZ: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
+                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                    BD.OP_BZ, BD.OP_JSR],
+        # CMP[0] is IS_JMP — same blockers as OP_JMP
+        BD.CMP + 0: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
+                     BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                     BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                     BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                     BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                     BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                     BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
+    }
+    branch_override_patches = 0
+    for block_idx in range(len(model.blocks)):
+        ffn = model.blocks[block_idx].ffn
+        # FFN may have a smaller hidden_dim than 4096; iterate up to actual size
+        hidden_dim = ffn.W_up.shape[0]
+        for u in range(hidden_dim):
+            mark_pc_w = ffn.W_up[u, BD.MARK_PC].item()
+            if mark_pc_w <= 50:  # not a MARK_PC firing unit
+                continue
+            writes_output = (
+                ffn.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
+                or ffn.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
+            )
+            if not writes_output:
+                continue
+            # Find which branch-related signal this unit reads strongly
+            for trigger_dim, blockers in OPCODE_BLOCK_MAP.items():
+                trigger_w = ffn.W_up[u, trigger_dim].item()
+                if trigger_w <= 5:  # not a strong-enough trigger
+                    continue
+                # Apply blockers (strong negative) for the OTHER opcodes
+                for opcode_dim in blockers:
+                    # Don't OVERWRITE existing strong negative weights — take min
+                    cur = ffn.W_up[u, opcode_dim].item()
+                    ffn.W_up[u, opcode_dim] = min(cur, -S)
+                branch_override_patches += 1
+                break  # one trigger is enough
+
     # ===== LAYER 7: Operand gather + memory relay heads =====
     attn7 = model.blocks[7].attn
     if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
@@ -2343,8 +2475,12 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # Use efficient multi-layer ALU with pure neural format conversion
         # All operations use baked FFN weights - no Python loops in forward pass
 
-        # L8-L9: Neural ADD/SUB
-        model.blocks[8].ffn = EfficientALU_L8_L9_Neural(S, BD)
+        # L8 FFN: Set up ALU + multi-byte IMM routing first, then wrap with efficient
+        ffn8 = model.blocks[8].ffn
+        _set_layer8_alu(ffn8, S, BD)
+        _set_layer8_multibyte_routing(ffn8, S, BD)
+        # Wrap original FFN with efficient neural ALU (hybrid mode)
+        model.blocks[8].ffn = HybridALUBlock(ffn8, EfficientALU_L8_L9_Neural(S, BD))
 
         # L10: Carry relay + AX/SP passthrough attention (still needed)
         attn10 = model.blocks[10].attn
@@ -2360,6 +2496,13 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
         # L10 FFN: Neural AND/OR/XOR
         model.blocks[10].ffn = EfficientALU_L10_Neural(S, BD)
+
+        # L10.5: Byte propagation post_ops (same as lookup mode)
+        model.blocks[10].post_ops.append(BinaryOpByteZeroingPostOp(d_model=512, S=S))
+        model.blocks[10].post_ops.append(CarryPropagationPostOp(d_model=512, S=S, byte_idx=0, cascade=False))
+        model.blocks[10].post_ops.append(CarryPropagationPostOp(d_model=512, S=S, byte_idx=1, cascade=True))
+        model.blocks[10].post_ops.append(CarryPropagationPostOp(d_model=512, S=S, byte_idx=2, cascade=True))
+        model.blocks[10].post_ops.append(BitwiseBytePropagationPostOp(d_model=512, S=S))
 
         # L10.5: Comparison combine (EQ/NE/LT/GT/LE/GE)
         model.blocks[10].post_ops.append(ComparisonCombine(S=S))
@@ -2538,7 +2681,96 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         for e in errors:
             print(f"  CONTRACT: {e}")
 
+    # ===== FIX 2026-05-09: Right-size FFN hidden dimensions to actual programmed units =====
+    # The architecture is built with hardcoded ffn_hidden=4096, but most FFNs only program
+    # a fraction of those units (often 100-1000). The unprogrammed units have all-zero
+    # weights but their `b_up` is also 0, which means silu(0)=0.27, and combined with
+    # ANY non-zero gate this produces a non-zero contribution. Multiplied across thousands
+    # of dead units, this accumulates into spurious OUTPUT writes that break correctness
+    # in pure-neural mode.
+    #
+    # Fix: for each block's FFN, identify the actually-programmed units (any non-zero
+    # weight in W_up, W_gate, W_down, or non-zero bias), and replace the FFN matrices
+    # with right-sized versions containing ONLY those units. This is what "the compiler
+    # determines network width" looks like: ffn_hidden becomes per-layer, equal to the
+    # actually-needed unit count.
+    _right_size_ffns(model)
+
     return model
+
+
+def _right_size_ffns(model):
+    """Trim each block's FFN to the actually-programmed unit count.
+
+    Identifies "active" hidden units as those with any non-zero weight in W_up, W_gate,
+    or W_down, or with a non-zero b_up/b_gate. Replaces the FFN's parameters with new
+    parameters sized to the active count, copying only those units.
+
+    Reports per-layer the original vs reduced size.
+    """
+    import torch as _torch
+    import torch.nn as _nn
+
+    print("  RIGHT-SIZING FFNs (compiler-determined width):")
+    total_before = 0
+    total_after = 0
+    for i, block in enumerate(model.blocks):
+        ffn = block.ffn
+        # Skip non-standard FFNs (HybridALUBlock etc.) that don't expose W_up directly.
+        if not (hasattr(ffn, 'W_up') and isinstance(getattr(ffn, 'W_up', None), _nn.Parameter)):
+            print(f"    L{i}: skipped ({type(ffn).__name__}, no W_up)")
+            continue
+        W_up = ffn.W_up.data
+        W_gate = ffn.W_gate.data
+        W_down = ffn.W_down.data
+        b_up = ffn.b_up.data
+        b_gate = ffn.b_gate.data if ffn.b_gate is not None else None
+
+        H, D = W_up.shape  # H = hidden_dim, D = d_model
+        active_mask = (
+            (W_up.abs().sum(dim=1) > 0)
+            | (W_gate.abs().sum(dim=1) > 0)
+            | (W_down.abs().sum(dim=0) > 0)
+            | (b_up.abs() > 0)
+        )
+        if b_gate is not None:
+            active_mask = active_mask | (b_gate.abs() > 0)
+        active_idx = active_mask.nonzero(as_tuple=False).squeeze(-1)
+        n_active = active_idx.numel()
+
+        if n_active == H:
+            # Already right-sized
+            print(f"    L{i}: {H} units (no dead units)")
+            total_before += H
+            total_after += H
+            continue
+        if n_active == 0:
+            # Edge case: no programmed units. Keep at least 1 to avoid empty Linear.
+            n_active = 1
+            active_idx = _torch.tensor([0], dtype=_torch.long, device=W_up.device)
+
+        # Slice parameters to active units only.
+        new_W_up = _nn.Parameter(W_up[active_idx, :].clone())
+        new_W_gate = _nn.Parameter(W_gate[active_idx, :].clone())
+        new_W_down = _nn.Parameter(W_down[:, active_idx].clone())
+        new_b_up = _nn.Parameter(b_up[active_idx].clone())
+        new_b_gate = _nn.Parameter(b_gate[active_idx].clone()) if b_gate is not None else None
+
+        ffn.W_up = new_W_up
+        ffn.W_gate = new_W_gate
+        ffn.W_down = new_W_down
+        ffn.b_up = new_b_up
+        if new_b_gate is not None:
+            ffn.b_gate = new_b_gate
+        # If FFN has a `hidden_dim` attr, update it.
+        if hasattr(ffn, 'hidden_dim'):
+            ffn.hidden_dim = n_active
+
+        print(f"    L{i}: {H} -> {n_active} units (-{H - n_active} dead)")
+        total_before += H
+        total_after += n_active
+
+    print(f"  TOTAL FFN units: {total_before} -> {total_after} ({100*total_after/total_before:.1f}% retained)")
 
 
 def _set_threshold_attn(attn, thresholds, out_bases, slope, HD, heads=None):
@@ -5531,10 +5763,24 @@ def _set_layer7_memory_heads(attn, S, BD, HD):
     attn.W_v[base + 1, BD.OP_LI] = 0.2
     attn.W_v[base + 2, BD.OP_LC] = 0.2
     attn.W_v[base + 3, BD.OP_LEA] = 0.2  # FIX 2026-04-13: Relay LEA for first-step byte 2 output
+    # V: BITWISE_OP = OP_AND + OP_OR + OP_XOR (scaled by 0.2 each, sum ≈ 1.0 when one is active)
+    # FIX 2026-05-08: Relay bitwise op flag to byte positions for L10 passthrough gating
+    attn.W_v[base + 4, BD.OP_AND] = 0.2
+    attn.W_v[base + 4, BD.OP_OR] = 0.2
+    attn.W_v[base + 4, BD.OP_XOR] = 0.2
+    # V: Individual bitwise op flags for BitwiseBytePropagationPostOp
+    # FIX 2026-05-08: Relay individual flags for correct operation dispatch in post-op
+    attn.W_v[base + 5, BD.OP_AND] = 0.2
+    attn.W_v[base + 6, BD.OP_OR] = 0.2
+    attn.W_v[base + 7, BD.OP_XOR] = 0.2
     # O: write to relay dims (×5 to normalize)
     attn.W_o[BD.OP_LI_RELAY, base + 1] = 1.0
     attn.W_o[BD.OP_LC_RELAY, base + 2] = 1.0
     attn.W_o[BD.CMP + 7, base + 3] = 1.0  # OP_LEA relay → CMP[7]
+    attn.W_o[BD.TEMP + 3, base + 4] = 1.0  # BITWISE_OP relay → TEMP[3]
+    attn.W_o[BD.TEMP + 4, base + 5] = 1.0  # OP_AND relay → TEMP[4]
+    attn.W_o[BD.TEMP + 5, base + 6] = 1.0  # OP_OR relay → TEMP[5]
+    attn.W_o[BD.TEMP + 6, base + 7] = 1.0  # OP_XOR relay → TEMP[6]
 
     # === Head 6: Relay PSH/ENT/JSR from STACK0 marker → STACK0 byte positions ===
     # Also relay PSH_AT_SP from SP marker → SP byte positions.
@@ -6632,10 +6878,20 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
     #   With stronger OP_IMM suppression (-3L):
     #   IMM step: 3L + L - 3.5L - 3L = -2.5L < 0 (blocked, preserves multi-byte OUTPUT)
     #   Non-IMM: 3L + L - 3.5L - 0 = 0.5L > 0 (still fires)
+    # FIX 2026-05-08: SUPPRESS passthrough for bitwise ops (TEMP[3] = BITWISE_OP).
+    # For bitwise ops (AND/OR/XOR), BitwiseBytePropagationPostOp computes bytes 1-3.
+    # Passthrough would overwrite OUTPUT with prev step's bytes, corrupting the computation.
+    # For ADD/SUB and other ops, passthrough copies prev step's bytes (typically 0x00).
+    #   Without BITWISE_OP suppression:
+    #   AX byte (any op): 3L + L - 3.5L = 0.5L > 0 (fires)
+    #   With BITWISE_OP suppression (-3L):
+    #   AX byte + bitwise: 3L + L - 3L - 3.5L = -2.5L < 0 (blocked, BitwiseBytePropagation handles)
+    #   AX byte + ADD/SUB: 3L + L + 0 - 3.5L = 0.5L > 0 (fires, passes prev bytes)
     attn.W_q[base + 0, BD.IS_BYTE] = L * 3  # Require IS_BYTE strongly
     attn.W_q[base + 0, BD.HAS_SE] = L  # Weak HAS_SE (changed from L*2)
     attn.W_q[base + 0, BD.OP_IMM] = -L * 3  # Suppress during IMM (preserve multi-byte OUTPUT)
-    attn.W_q[base + 0, BD.CONST] = -L * 3.5  # Higher threshold (changed from 1.5)
+    attn.W_q[base + 0, BD.TEMP + 3] = -L * 3  # SUPPRESS when BITWISE_OP (relayed from L7 head 5)
+    attn.W_q[base + 0, BD.CONST] = -L * 3.5  # Threshold adjusted for suppression
 
     # Q dim 1: H1[AX_IDX] (AX vs non-AX discrimination)
     attn.W_q[base + 1, BD.H1 + AX_IDX] = L

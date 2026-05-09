@@ -149,7 +149,17 @@ class AutoregressiveVMRunner:
         use_kv_cache=True,
         max_mem_history=64,
         trust_neural_alu=False,
+        pure_neural=False,
     ):
+        """Initialize the autoregressive VM runner.
+
+        Args:
+            trust_neural_alu: If True, trust neural network for ALU operations.
+            pure_neural: If True, skip ALL Python overrides and run purely
+                        autoregressively. Use for testing neural correctness.
+                        Note: This means no memory, no control flow handlers -
+                        everything must be computed by the neural network.
+        """
         self.model = AutoregressiveVM(
             d_model=d_model,
             n_layers=n_layers,
@@ -158,7 +168,9 @@ class AutoregressiveVMRunner:
             max_seq_len=max_seq_len,
         )
         # Load hand-crafted transformer weights for VM execution
-        set_weights(self.model, enable_conversational_io=conversational_io)
+        # Use efficient ALU mode when trust_neural_alu=True for pure neural execution
+        alu_mode = 'efficient' if trust_neural_alu else 'lookup'
+        set_weights(self.model, enable_conversational_io=conversational_io, alu_mode=alu_mode)
 
         # Move model to GPU if available for ~20-100x speedup
         if torch.cuda.is_available():
@@ -232,6 +244,7 @@ class AutoregressiveVMRunner:
         # explicit external tool boundary handling.
         self.pure_attention_memory = pure_attention_memory
         self.trust_neural_alu = trust_neural_alu
+        self.pure_neural = pure_neural
         self._pure_attention_report = {}
 
     def run(
@@ -294,11 +307,14 @@ class AutoregressiveVMRunner:
         prefix_len = len(context)  # code + data prefix length (immutable)
         output = []
 
-        # Set initial opcode for MoE routing (first instruction)
-        init_exec = self._exec_pc() // INSTR_WIDTH
-        if 0 <= init_exec < len(bytecode):
-            opcode = bytecode[init_exec] & 0xFF
-            self.model.set_active_opcode(opcode)
+        # FIX 2026-05-09: In pure_neural mode, do not inject the active opcode from
+        # Python — the network must determine the opcode from its own bytecode attention.
+        # Other modes still need the MoE/embedding-injection hint to function.
+        if not self.pure_neural:
+            init_exec = self._exec_pc() // INSTR_WIDTH
+            if 0 <= init_exec < len(bytecode):
+                opcode = bytecode[init_exec] & 0xFF
+                self.model.set_active_opcode(opcode)
 
         step_num = 0  # Track VM steps for conversational I/O handling
 
@@ -316,9 +332,13 @@ class AutoregressiveVMRunner:
             context.append(next_token)
 
             pos_in_step = i % Token.STEP_TOKENS
-            if pos_in_step == Token.STEP_TOKENS - 1 and next_token not in (Token.STEP_END, Token.HALT, Token.TOOL_CALL):
-                context[-1] = Token.STEP_END
-                next_token = Token.STEP_END
+            # FIX 2026-05-09: In pure_neural mode, do NOT force STEP_END at position 34.
+            # The model must predict step boundaries on its own. Other modes still force
+            # for backward compatibility with non-neural step sequencing.
+            if not self.pure_neural:
+                if pos_in_step == Token.STEP_TOKENS - 1 and next_token not in (Token.STEP_END, Token.HALT, Token.TOOL_CALL):
+                    context[-1] = Token.STEP_END
+                    next_token = Token.STEP_END
 
             # Debug: Print step progress
             if self._debug_ent or self._debug_lev:
@@ -415,19 +435,24 @@ class AutoregressiveVMRunner:
                     break
 
             elif next_token == Token.TOOL_CALL:
-                pc = self._extract_register(context, Token.REG_PC)
-                if pc is not None:
-                    instr_idx = pc // INSTR_WIDTH
-                    if 0 <= instr_idx < len(bytecode):
-                        op = bytecode[instr_idx] & 0xFF
-                        handler = self._syscall_handlers.get(op)
-                        if handler:
-                            if not self._should_block_vm_memory_handler(op):
-                                handler(context, output)
-                                if op in _TOOL_CALL_OPS:
-                                    self._record_pure_attention("external_tool_ops", op)
-                        if not self._should_block_track_memory(op):
-                            self._track_memory_write(context, op)
+                # FIX 2026-05-09: In pure_neural mode, do NOT run any Python-side
+                # handler or memory tracking. The model must handle tool-call
+                # semantics autoregressively or fail. We still need to call
+                # _dispatch_step so EXIT detection works.
+                if not self.pure_neural:
+                    pc = self._extract_register(context, Token.REG_PC)
+                    if pc is not None:
+                        instr_idx = pc // INSTR_WIDTH
+                        if 0 <= instr_idx < len(bytecode):
+                            op = bytecode[instr_idx] & 0xFF
+                            handler = self._syscall_handlers.get(op)
+                            if handler:
+                                if not self._should_block_vm_memory_handler(op):
+                                    handler(context, output)
+                                    if op in _TOOL_CALL_OPS:
+                                        self._record_pure_attention("external_tool_ops", op)
+                            if not self._should_block_track_memory(op):
+                                self._track_memory_write(context, op)
 
                 exec_idx = self._exec_pc() // INSTR_WIDTH
                 if self._dispatch_step(context, bytecode, exec_idx, prefix_len, output):
@@ -435,9 +460,12 @@ class AutoregressiveVMRunner:
 
             # Halt detection
             if next_token == Token.HALT:
-                # Preserve final AX value before exiting
-                # Use full _last_ax value (not byte merge) because it's the canonical value
-                self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
+                # FIX 2026-05-09: In pure_neural mode, do NOT override REG_AX.
+                # The model's emitted bytes ARE the result; result extraction
+                # reads them directly via _decode_exit_code().
+                if not self.pure_neural:
+                    # Preserve final AX value before exiting
+                    self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
                 self._pure_attention_report["halted"] = True
                 break
 
@@ -513,6 +541,27 @@ class AutoregressiveVMRunner:
         exec_op = bytecode[exec_idx] & 0xFF if 0 <= exec_idx < len(bytecode) else None
         if exec_op is None:
             return False
+
+        # Pure neural mode: skip ALL Python overrides, let neural network handle everything
+        if self.pure_neural:
+            # Extract PC and AX from neural network output (for tracking and EXIT result)
+            neural_pc = self._extract_register(context, Token.REG_PC)
+            neural_ax = self._extract_register(context, Token.REG_AX)
+            neural_sp = self._extract_register(context, Token.REG_SP)
+            neural_bp = self._extract_register(context, Token.REG_BP)
+
+            # Update tracking from neural outputs (no overrides, just observe)
+            if neural_pc is not None:
+                self._last_pc = neural_pc
+            if neural_ax is not None:
+                self._last_ax = neural_ax
+            if neural_sp is not None:
+                self._last_sp = neural_sp
+            if neural_bp is not None:
+                self._last_bp = neural_bp
+
+            # Only break on EXIT
+            return exec_op == Opcode.EXIT
 
         pc = self._extract_register(context, Token.REG_PC)
         op = None
@@ -708,11 +757,13 @@ class AutoregressiveVMRunner:
             if pc is not None:
                 self._last_pc = pc
 
-        next_exec = self._exec_pc() // INSTR_WIDTH
-        if 0 <= next_exec < len(bytecode):
-            self.model.set_active_opcode(bytecode[next_exec] & 0xFF)
-        else:
-            self.model.set_active_opcode(None)
+        # FIX 2026-05-09: Skip set_active_opcode in pure_neural mode (Python peek at bytecode).
+        if not self.pure_neural:
+            next_exec = self._exec_pc() // INSTR_WIDTH
+            if 0 <= next_exec < len(bytecode):
+                self.model.set_active_opcode(bytecode[next_exec] & 0xFF)
+            else:
+                self.model.set_active_opcode(None)
 
         if exec_op in _MEM_STORE_OPS and exec_op not in self._func_call_handlers:
             mem_section = self._extract_mem_section(context)

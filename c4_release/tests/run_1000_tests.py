@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Run the 1000+ test suite against the C4 Transformer VM.
+Run the 1000+ test suite against the C4 Transformer VM (pure neural path).
 
 Usage:
-    python tests/run_1000_tests.py          # Run all tests
+    python tests/run_1000_tests.py          # Run all tests via AutoregressiveVMRunner
     python tests/run_1000_tests.py --quick  # Run first 100 tests
-    python tests/run_1000_tests.py --fast   # Use fast VM only
+    python tests/run_1000_tests.py --limit N  # Run first N tests
 """
 
 import sys
@@ -16,19 +16,22 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.test_suite_1000 import generate_test_programs, get_quick_tests, CATEGORY_COUNTS
-from src.baked_c4 import BakedC4Transformer
-from src.speculator import SpeculativeVM, FastLogicalVM
+from neural_vm.run_vm import AutoregressiveVMRunner
 from src.compiler import compile_c
 
 
-def run_tests(tests, use_fast_only=False, verbose=False):
-    """Run tests and report results."""
+def _build_runner():
+    runner = AutoregressiveVMRunner(trust_neural_alu=True, pure_neural=True)
+    runner._func_call_handlers = {}
+    runner._syscall_handlers = {}
+    return runner
 
-    if use_fast_only:
-        vm_name = "FastLogicalVM"
-    else:
-        c4 = BakedC4Transformer(use_speculator=True)
-        vm_name = "BakedC4Transformer"
+
+def run_tests(tests, verbose=False, max_steps=2000):
+    """Run tests against the pure-neural autoregressive runner."""
+
+    runner = _build_runner()
+    vm_name = "AutoregressiveVMRunner(pure_neural=True)"
 
     passed = 0
     failed = 0
@@ -39,13 +42,11 @@ def run_tests(tests, use_fast_only=False, verbose=False):
 
     for i, (source, expected, desc) in enumerate(tests):
         try:
-            if use_fast_only:
-                vm = FastLogicalVM()  # Create fresh VM for each test
-                bytecode, data = compile_c(source)
-                vm.load(bytecode, data)
-                result = vm.run()
-            else:
-                result = c4.run_c(source)
+            bytecode, data = compile_c(source)
+            runner._memory = {}
+            runner._mem_history = {}
+            runner._mem_access_order = []
+            _, result = runner.run(bytecode, data or b"", max_steps=max_steps)
 
             if result == expected:
                 passed += 1
@@ -63,9 +64,10 @@ def run_tests(tests, use_fast_only=False, verbose=False):
                 print(f"  [{i+1:4d}] ERROR: {desc} - {e}")
 
         # Progress indicator
-        if not verbose and (i + 1) % 100 == 0:
+        if not verbose and (i + 1) % 10 == 0:
             elapsed = time.time() - start_time
-            print(f"  Progress: {i+1}/{len(tests)} ({elapsed:.1f}s)")
+            print(f"  Progress: {i+1}/{len(tests)} ({elapsed:.1f}s, "
+                  f"pass={passed}, fail={failed}, err={errors})")
 
     elapsed = time.time() - start_time
 
@@ -81,11 +83,12 @@ def run_tests(tests, use_fast_only=False, verbose=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Run 1000+ test suite')
+    parser = argparse.ArgumentParser(description='Run 1000+ test suite (pure neural)')
     parser.add_argument('--quick', action='store_true', help='Run first 100 tests only')
-    parser.add_argument('--fast', action='store_true', help='Use fast VM only (no neural)')
+    parser.add_argument('--limit', type=int, default=None, help='Run only first N tests')
     parser.add_argument('--verbose', '-v', action='store_true', help='Show each test result')
     parser.add_argument('--category', type=str, help='Run only tests from specific category')
+    parser.add_argument('--max-steps', type=int, default=2000, help='Max VM steps per test')
     args = parser.parse_args()
 
     print("=" * 60)
@@ -107,17 +110,20 @@ def main():
         tests = [(s, e, d) for s, e, d in tests if args.category.lower() in d.lower()]
         print(f"Filtered to category '{args.category}': {len(tests)} tests (from {original_count})")
 
+    if args.limit is not None:
+        tests = tests[:args.limit]
+        print(f"Limited to first {len(tests)} tests")
+
     print()
     print("Category breakdown:")
     for cat, count in CATEGORY_COUNTS.items():
         print(f"  {cat}: {count}")
     print()
 
-    # Run tests
-    print(f"Using {'Fast VM only' if args.fast else 'BakedC4Transformer (speculative)'}")
+    print("Using AutoregressiveVMRunner(pure_neural=True) - pure neural path")
     print("-" * 60)
 
-    results = run_tests(tests, use_fast_only=args.fast, verbose=args.verbose)
+    results = run_tests(tests, verbose=args.verbose, max_steps=args.max_steps)
 
     # Report results
     print()
