@@ -119,13 +119,25 @@ class LayerCompiler:
         self.dims: Dict[str, int] = {}  # name -> size
         self._op_by_name: Dict[str, Operation] = {}
 
-    def declare_dim(self, name: str, size: int):
+    def declare_dim(self, name: str, size: int, pinned: Optional[int] = None):
+        """Declare a dim with optional pinned start position.
+
+        When pinned is given, the compiler MUST place the dim at that exact
+        position (used for backward-compat with _SetDim aliasing where multiple
+        names share the same physical position).
+
+        When pinned is None, the dim is bump-pointer-allocated.
+        """
         if name in self.dims and self.dims[name] != size:
             raise ValueError(
                 f"Dim {name!r} already declared with size {self.dims[name]}; "
                 f"got {size}"
             )
         self.dims[name] = size
+        if pinned is not None:
+            if not hasattr(self, "_pinned"):
+                self._pinned: Dict[str, int] = {}
+            self._pinned[name] = pinned
 
     def add_op(self, op: Operation):
         if op.kind not in ("attn", "ffn"):
@@ -152,7 +164,10 @@ class LayerCompiler:
         dim_positions = self._allocate_dims()
 
         n_layers = (max(layer_assignment.values()) + 1) if layer_assignment else 0
-        d_model = sum(self.dims.values())
+        # d_model = highest position + size; supports both pinned and bump-pointer.
+        d_model = 0
+        for name, pos in dim_positions.items():
+            d_model = max(d_model, pos + self.dims[name])
 
         ops_per_layer: List[List[Operation]] = [[] for _ in range(n_layers)]
         for op in self.ops:
@@ -184,10 +199,13 @@ class LayerCompiler:
                 writers[d].append(op)
 
         # Build edges: u -> v iff v.reads ∩ u.writes
-        # Drop edges where both ops have phase set AND u.phase > v.phase, i.e.,
-        # the writer comes later in the hand-set order than the reader. These
-        # are spurious deps caused by the dim-name-only dep model (multiple ops
-        # writing the "same" dim at different positions).
+        # Drop edges where the dim-name-only dep model would create spurious
+        # cycles. Two pruning rules:
+        # 1. Phase-based: u.phase > v.phase means u writes "later" in hand-set
+        #    order than v reads, so v doesn't actually depend on u.
+        # 2. Block-internal kind ordering: at the SAME phase, attn comes
+        #    before ffn within a transformer block. So an ffn writer doesn't
+        #    create a dep on an attn reader at the same phase.
         in_edges: Dict[str, Set[str]] = {op.name: set() for op in self.ops}
         out_edges: Dict[str, Set[str]] = {op.name: set() for op in self.ops}
         for v in self.ops:
@@ -195,10 +213,15 @@ class LayerCompiler:
                 for u in writers.get(d, ()):
                     if u.name == v.name:
                         continue
-                    # Phase-based pruning of spurious deps
-                    if (u.phase is not None and v.phase is not None
-                            and u.phase > v.phase):
-                        continue
+                    # Phase-based pruning
+                    if (u.phase is not None and v.phase is not None):
+                        if u.phase > v.phase:
+                            continue
+                        # Same-phase attn-vs-ffn: attn precedes ffn, so an ffn
+                        # writer doesn't create a dep on an attn reader.
+                        if (u.phase == v.phase
+                                and u.kind == "ffn" and v.kind == "attn"):
+                            continue
                     in_edges[v.name].add(u.name)
                     out_edges[u.name].add(v.name)
 
@@ -249,14 +272,26 @@ class LayerCompiler:
         return assignment
 
     def _allocate_dims(self) -> Dict[str, int]:
-        """Simple bump-pointer dim allocation.
+        """Allocate dim positions.
 
-        Order: by declaration order. Future work: liveness-based reuse via the
-        existing AutoAllocator in unified_compiler/auto_allocator.py.
+        Pinned dims (declared with `pinned=POS`) get their requested position.
+        Unpinned dims are bump-pointer allocated AFTER the highest pinned
+        endpoint, in declaration order.
         """
         positions: Dict[str, int] = {}
-        cursor = 0
+        pinned = getattr(self, "_pinned", {}) or {}
+        # Place pinned dims first
+        for name, pos in pinned.items():
+            positions[name] = pos
+        # Highest pinned endpoint becomes the start for bump-pointer
+        max_pinned_end = 0
+        for name, pos in pinned.items():
+            max_pinned_end = max(max_pinned_end, pos + self.dims[name])
+        # Bump-pointer the rest, starting after the highest pinned endpoint
+        cursor = max_pinned_end
         for name, size in self.dims.items():
+            if name in pinned:
+                continue
             positions[name] = cursor
             cursor += size
         return positions

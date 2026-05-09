@@ -704,6 +704,257 @@ def make_layer16_lev_routing_op() -> Operation:
 # Convenience: full operation list
 # ---------------------------------------------------------------------------
 
+def make_layer0_threshold_attn_op() -> Operation:
+    """L0 attention: 8 threshold heads detecting marker distance."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_threshold_attn
+        proxy = _as_setdim_proxy(dim_positions)
+        ALIBI_S = 10.0
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes.fill_(ALIBI_S)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_threshold_attn(
+            attn,
+            [3.5, 4.5, 7.5, 8.5, 9.5, 14.5, 19.5, 24.5],
+            [proxy.H0, proxy.H1, proxy.H2, proxy.H3, proxy.H4,
+             proxy.H5, proxy.H6, proxy.H7],
+            ALIBI_S, HD,
+        )
+
+    return Operation(
+        name="layer0_threshold_attn",
+        phase=0,
+        reads={"IS_MARK", "CONST"},
+        writes={"H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer1_threshold_attn_op() -> Operation:
+    """L1 attention: 3 fine threshold heads + STEP_END + L1H4."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_threshold_attn
+        proxy = _as_setdim_proxy(dim_positions)
+        ALIBI_S = 10.0
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes.fill_(ALIBI_S)
+            attn.alibi_slopes[3] = 0.0  # global SE detection
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_threshold_attn(
+            attn,
+            [0.5, 1.5, 2.5],
+            [proxy.L1H0, proxy.L1H1, proxy.L1H2],
+            ALIBI_S, HD, heads=[0, 1, 2],
+        )
+        # Head 3: STEP_END existence detection (global)
+        base = 3 * HD
+        attn.W_q[base, proxy.CONST] = 10.0
+        attn.W_k[base, proxy.MARK_SE_ONLY] = 10.0
+        attn.W_v[base + 1, proxy.MARK_SE_ONLY] = 1.0
+        attn.W_o[proxy.HAS_SE, base + 1] = 1.0
+        # Head 4: threshold 6.5 for STACK0 byte 0 identification
+        _set_threshold_attn(
+            attn, [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4]
+        )
+
+    return Operation(
+        name="layer1_threshold_attn",
+        phase=1,
+        reads={"IS_MARK", "MARK_SE_ONLY", "CONST"},
+        writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer2_threshold_attn_op() -> Operation:
+    """L2 attention: threshold 5.5 head."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import _set_threshold_attn
+        proxy = _as_setdim_proxy(dim_positions)
+        ALIBI_S = 10.0
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes.fill_(ALIBI_S)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_threshold_attn(
+            attn, [5.5], [proxy.L2H0], ALIBI_S, HD, heads=[0]
+        )
+
+    return Operation(
+        name="layer2_threshold_attn",
+        phase=2,
+        reads={"IS_MARK", "CONST"},
+        writes={"L2H0"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer3_carry_forward_attn_op() -> Operation:
+    """L3 attention: 7 carry-forward heads (PC, AX, SP, BP, STACK0 + relays)."""
+    def bake(attn, dim_positions, S):
+        from ..vm_step import (_set_carry_forward_attn, _set_stack0_carry_attn,
+                                _SetDim)
+        proxy = _as_setdim_proxy(dim_positions)
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes.fill_(0.5)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        PC_I, AX_I, SP_I, BP_I = 0, 1, 2, 3
+        _set_carry_forward_attn(attn, 0, proxy.MARK_PC, PC_I, PC_I, HD,
+                                proxy.EMBED_LO, proxy.EMBED_HI)
+        _set_carry_forward_attn(attn, 1, proxy.MARK_AX, AX_I, AX_I, HD,
+                                proxy.AX_CARRY_LO, proxy.AX_CARRY_HI)
+        _set_carry_forward_attn(attn, 2, proxy.MARK_SP, SP_I, SP_I, HD,
+                                proxy.EMBED_LO, proxy.EMBED_HI)
+        _set_carry_forward_attn(attn, 3, proxy.MARK_BP, BP_I, BP_I, HD,
+                                proxy.EMBED_LO, proxy.EMBED_HI)
+        _set_stack0_carry_attn(attn, 4, HD)
+        # Heads 5-6: AX_FULL relay + BP→PC for LEV. These reference _SetDim
+        # directly inside _set_carry_forward_attn so the proxy fallback handles
+        # them. For now we replicate the inline code from _set_layer3_attn block:
+        L = 15.0
+        base = 5 * HD
+        attn.W_q[base, proxy.MARK_AX] = L
+        attn.W_q[base, proxy.HAS_SE] = L
+        attn.W_q[base, proxy.CONST] = -L * 1.5
+        attn.W_k[base, proxy.MARK_AX] = L
+        for k in range(16):
+            attn.W_v[base + 1 + k, proxy.OUTPUT_LO + k] = 1.0
+            attn.W_v[base + 17 + k, proxy.OUTPUT_HI + k] = 1.0
+        for k in range(16):
+            attn.W_o[proxy.AX_FULL_LO + k, base + 1 + k] = 1.0
+            attn.W_o[proxy.AX_FULL_HI + k, base + 17 + k] = 1.0
+        GATE = 33
+        attn.W_q[base + GATE, proxy.MARK_AX] = L
+        attn.W_q[base + GATE, proxy.CONST] = -L / 2
+        attn.W_k[base + GATE, proxy.CONST] = L
+        # Head 6: BP carry to PC marker for LEV return_addr
+        base = 6 * HD
+        attn.W_q[base, proxy.MARK_PC] = L
+        attn.W_q[base, proxy.OP_LEV] = L / 5
+        attn.W_q[base, proxy.CONST] = -L * 1.5
+        attn.W_k[base, proxy.L1H1 + BP_I] = L
+        attn.W_k[base, proxy.L1H0 + BP_I] = -L
+        for k in range(16):
+            attn.W_v[base + 1 + k, proxy.CLEAN_EMBED_LO + k] = 1.0
+            attn.W_v[base + 17 + k, proxy.CLEAN_EMBED_HI + k] = 1.0
+        attn.W_q[base + GATE, proxy.MARK_PC] = L
+        attn.W_q[base + GATE, proxy.CONST] = -L / 2
+        attn.W_k[base + GATE, proxy.CONST] = L
+
+    return Operation(
+        name="layer3_carry_forward_attn",
+        phase=3,
+        reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+               "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV", "HAS_SE",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI", "CONST"},
+        writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+                "AX_FULL_LO", "AX_FULL_HI"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def setup_token_embeddings(embed_weight, dim_positions: Dict[str, int] = None) -> None:
+    """Bake the per-token embedding values using compiler dim positions.
+
+    Phase 0 M4 (2026-05-09): extracted from vm_step.set_vm_weights so the
+    compiler path uses auto-allocated positions. Falls back to _SetDim when
+    dim_positions is None.
+
+    Args:
+        embed_weight: nn.Embedding.weight tensor [vocab, d_model].
+        dim_positions: Optional dict mapping dim name -> start position.
+    """
+    import torch
+    from ..vm_step import Token, _SetDim
+
+    def D(name):
+        if dim_positions is not None and name in dim_positions:
+            return dim_positions[name]
+        return getattr(_SetDim, name)
+
+    V = embed_weight.shape[0]
+
+    with torch.no_grad():
+        embed_weight.zero_()
+
+        # CONST=1 for every token
+        const = D("CONST")
+        for tok in range(V):
+            embed_weight[tok, const] = 1.0
+
+        # Marker tokens
+        is_mark = D("IS_MARK")
+        for tok, dim_name in [
+            (Token.REG_PC, "MARK_PC"),
+            (Token.REG_AX, "MARK_AX"),
+            (Token.REG_SP, "MARK_SP"),
+            (Token.REG_BP, "MARK_BP"),
+            (Token.MEM, "MARK_MEM"),
+            (Token.CODE_START, "MARK_CS"),
+        ]:
+            if tok < V:
+                embed_weight[tok, D(dim_name)] = 1.0
+                embed_weight[tok, is_mark] = 1.0
+
+        # STACK0 marker WITHOUT IS_MARK (so threshold heads see BP as nearest)
+        if Token.STACK0 < V:
+            embed_weight[Token.STACK0, D("MARK_STACK0")] = 1.0
+
+        # Step-end / data-end / halt
+        mark_se = D("MARK_SE")
+        for tok in [Token.STEP_END, Token.DATA_END, Token.HALT]:
+            if tok < V:
+                embed_weight[tok, mark_se] = 1.0
+                embed_weight[tok, is_mark] = 1.0
+
+        if Token.STEP_END < V:
+            embed_weight[Token.STEP_END, D("MARK_SE_ONLY")] = 1.0
+
+        if Token.TOOL_CALL < V:
+            embed_weight[Token.TOOL_CALL, mark_se] = 1.0
+            embed_weight[Token.TOOL_CALL, is_mark] = 1.0
+            embed_weight[Token.TOOL_CALL, D("MARK_SE_ONLY")] = 1.0
+            embed_weight[Token.TOOL_CALL, const] = 1.0
+
+        # Thinking markers (try/except in case dims not declared in compiler spec)
+        try:
+            temp = D("TEMP")
+            if Token.THINKING_START < V:
+                embed_weight[Token.THINKING_START, is_mark] = 1.0
+                embed_weight[Token.THINKING_START, const] = 1.0
+                embed_weight[Token.THINKING_START, temp + 1] = 1.0
+            if Token.THINKING_END < V:
+                embed_weight[Token.THINKING_END, is_mark] = 1.0
+                embed_weight[Token.THINKING_END, const] = 1.0
+                embed_weight[Token.THINKING_END, temp + 2] = 1.0
+        except AttributeError:
+            pass
+
+        if Token.IO_STATE_EMIT_BYTE < V:
+            embed_weight[Token.IO_STATE_EMIT_BYTE, is_mark] = 1.0
+            embed_weight[Token.IO_STATE_EMIT_BYTE, const] = 1.0
+        if Token.IO_STATE_EMIT_THINKING < V:
+            embed_weight[Token.IO_STATE_EMIT_THINKING, is_mark] = 1.0
+            embed_weight[Token.IO_STATE_EMIT_THINKING, const] = 1.0
+
+        # Byte tokens 0-255: IS_BYTE + nibble decoding
+        is_byte = D("IS_BYTE")
+        embed_lo = D("EMBED_LO")
+        embed_hi = D("EMBED_HI")
+        clean_lo = D("CLEAN_EMBED_LO")
+        clean_hi = D("CLEAN_EMBED_HI")
+        for b in range(256):
+            embed_weight[b, is_byte] = 1.0
+            embed_weight[b, embed_lo + (b & 0xF)] = 1.0
+            embed_weight[b, embed_hi + ((b >> 4) & 0xF)] = 1.0
+            embed_weight[b, clean_lo + (b & 0xF)] = 1.0
+            embed_weight[b, clean_hi + ((b >> 4) & 0xF)] = 1.0
+
+
 def setup_head_weights(head, dim_positions: Dict[str, int] = None) -> None:
     """Bake the output-projection head weights using compiler dim positions.
 
@@ -793,6 +1044,10 @@ def all_core_ops() -> list:
     their own migration pass).
     """
     return [
+        make_layer0_threshold_attn_op(),
+        make_layer1_threshold_attn_op(),
+        make_layer2_threshold_attn_op(),
+        make_layer3_carry_forward_attn_op(),
         make_phase_a_ffn_op(),
         make_layer1_ffn_op(),
         make_layer2_mem_byte_flags_op(),
@@ -849,16 +1104,16 @@ def all_core_ops() -> list:
 # create cycles, and full-spec compilation isn't wired to production.
 
 
-def declare_setdim_compat_dims(compiler) -> None:
+def declare_setdim_compat_dims(compiler, pin_to_setdim: bool = True) -> None:
     """Declare to a LayerCompiler all dims that match the existing _SetDim layout.
 
-    Every dim has its size and a pinned position equal to its `_SetDim` value
-    (so the compiler outputs the same positions). This is the "backward-compat
-    mode" for the migration: existing weight-setting code can run unchanged
-    against compiler-driven layer assignment.
-
-    For real auto-allocation, drop this function and declare dims with sizes
-    only — the compiler will pack them via bump-pointer or AutoAllocator.
+    Args:
+        compiler: LayerCompiler to declare dims to
+        pin_to_setdim: if True, each dim is pinned to its _SetDim position. This
+            preserves _SetDim's aliasing scheme (e.g., FETCH_LO==MUL_ACCUM at
+            position 420) so existing _set_layerN_* bake_fns work unchanged. If
+            False, dims are bump-pointer allocated by declaration order — useful
+            for testing the auto-allocation path but breaks _SetDim aliases.
     """
     from ..vm_step import _SetDim
     from ..constants import INSTR_WIDTH  # noqa: F401 (touched for completeness)
@@ -904,24 +1159,22 @@ def declare_setdim_compat_dims(compiler) -> None:
     forty_eight_dim = ["ADDR_KEY"]
     thirty_two_dim = ["TEMP"]
 
+    def _declare(name, size):
+        if hasattr(_SetDim, name):
+            pinned = getattr(_SetDim, name) if pin_to_setdim else None
+            compiler.declare_dim(name, size, pinned=pinned)
+
     for name in one_dim:
-        if hasattr(_SetDim, name):
-            compiler.declare_dim(name, 1)
+        _declare(name, 1)
     for name in seven_dim:
-        if hasattr(_SetDim, name):
-            compiler.declare_dim(name, 7)
+        _declare(name, 7)
     for name in sixteen_dim:
-        if hasattr(_SetDim, name):
-            compiler.declare_dim(name, 16)
+        _declare(name, 16)
     for name in four_dim:
-        if hasattr(_SetDim, name):
-            compiler.declare_dim(name, 4)
+        _declare(name, 4)
     for name in eight_dim:
-        if hasattr(_SetDim, name):
-            compiler.declare_dim(name, 8)
+        _declare(name, 8)
     for name in forty_eight_dim:
-        if hasattr(_SetDim, name):
-            compiler.declare_dim(name, 48)
+        _declare(name, 48)
     for name in thirty_two_dim:
-        if hasattr(_SetDim, name):
-            compiler.declare_dim(name, 32)
+        _declare(name, 32)

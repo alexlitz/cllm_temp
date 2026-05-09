@@ -17,6 +17,7 @@ from .migrated_ops import (
     all_core_ops,
     declare_setdim_compat_dims,
     setup_head_weights,
+    setup_token_embeddings,
 )
 
 
@@ -42,20 +43,20 @@ def compile_full_vm(S: float = 100.0):
 
     model = build_model_from_layout(layout, S=S)
 
-    # M4: also bake the head and re-create the embedding with compiler dims
+    # M4 step 2: bake the head with compiler dim positions
     setup_head_weights(model.head, layout.dim_positions)
 
-    # Re-create the embedding to point at compiler dim positions
+    # M4 step 4: bake per-token embedding values with compiler dim positions
+    setup_token_embeddings(model.embed.embed.weight, layout.dim_positions)
+
+    # Re-create the embedding wrapper so its forward-pass augmentations
+    # (ADDR_KEY, MEM_STORE, etc.) use compiler dims.
     from ..neural_embedding import NeuralVMEmbedding
     new_embed = NeuralVMEmbedding(
         vocab_size=model.vocab_size,
         d_model=model.d_model,
         dim_positions=dict(layout.dim_positions),
     )
-    # Copy over the embedding weight tensor (it's per-token, not dim-positional;
-    # but the per-token CLEAN_EMBED/MARK_* setup happens in set_vm_weights which
-    # we haven't migrated yet — for now the embedding values come from the
-    # original setup. This is a remaining M4 task.)
     new_embed.embed.weight.data.copy_(model.embed.embed.weight.data)
     model.embed = new_embed
 
