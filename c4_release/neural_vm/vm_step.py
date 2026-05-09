@@ -4659,7 +4659,12 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.IS_BYTE] = -S  # Block at byte positions, fire at markers
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_LO + k] = 1.0
-        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / (S * 40.0)
+        # FIX 2026-05-09: was 2.0/(S*40) which produced OUTPUT_LO ~= 0.1 — too weak in
+        # pure-neural mode (loses to byte-0 bias). Scaled up to 2.0/S to match the EXIT/
+        # NOP/JMP routing units. In runner-override mode, bytes are corrected anyway,
+        # so this scale-up has no effect. In pure-neural mode it's the difference between
+        # IMM working and not.
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.OP_IMM] = S
@@ -4670,7 +4675,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.IS_BYTE] = -S
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.FETCH_HI + k] = 1.0
-        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / (S * 40.0)
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S  # FIX 2026-05-09 (mirror of LO IMM fix)
         unit += 1
 
     # === EXIT: AX_CARRY → OUTPUT ===
