@@ -2692,55 +2692,77 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 def _expand_wrapper_blocks(model):
     """Phase 0 step: split composite-FFN blocks into multiple single-PureFFN blocks.
 
-    Currently expands HybridALUBlock at any block: stage 0 = lookup_ffn (PureFFN),
-    stage 1 = efficient_alu (still a wrapper, future expansion). Each stage becomes
-    its own transformer block with passthrough attention. The block list grows.
+    Currently expands:
+    - HybridALUBlock: lookup_ffn (PureFFN) + efficient_alu (wrapper, future-expand)
+    - post_ops on any block: each post_op becomes its own block (passthrough attn
+      + that op as ffn)
 
-    Future work: also expand EfficientALU_*_Neural and EfficientDivMod_Neural by
-    walking their internal sub-FFNs (BDToGEConverter, GenericPureFFN per ALU stage,
-    GEToBDConverter) into separate blocks. That requires more careful weight
-    surgery and isn't done here.
+    Each new block gets a passthrough attention (zero-init weights → residual
+    identity via x + attn(x) = x + 0 = x). Semantic execution order is preserved
+    by inserting blocks immediately after the original.
+
+    Future work: walk EfficientALU_*_Neural / EfficientDivMod_Neural internals
+    (BDToGEConverter, GenericPureFFN per ALU stage, GEToBDConverter) into
+    separate blocks too — requires more careful BD↔GE format-shape handling.
     """
     from .hybrid_alu import HybridALUBlock as _HAB
 
+    def _make_passthrough_block(template_attn, ffn_module, layer_idx, d_model):
+        """Build a TransformerBlock with zero-init attention (residual identity)
+        and the given ffn."""
+        attn_passthrough = AutoregressiveAttention(
+            d_model, num_heads=template_attn.num_heads,
+            max_seq_len=template_attn.max_seq_len, layer_idx=layer_idx
+        )
+        return TransformerBlock(attn=attn_passthrough, ffn=ffn_module)
+
+    d_model = model.d_model
     new_blocks = []
-    expansions = 0
+    hab_expansions = 0
+    post_op_expansions = 0
+
     for i, block in enumerate(model.blocks):
+        # Step 1: HybridALUBlock split (if present)
         if isinstance(block.ffn, _HAB):
-            # Replace this block: keep attn, ffn = lookup_ffn (PureFFN), no post_ops.
             lookup_ffn = block.ffn.lookup_ffn
             efficient_alu = block.ffn.efficient_alu
-            original_post_ops = block.post_ops
+            original_post_ops = list(block.post_ops)
 
-            # Block A: original attn + lookup_ffn. NO post_ops (they move to Block B).
+            # Block A: original attn + lookup_ffn (PureFFN), no post_ops yet.
             block.ffn = lookup_ffn
             block.post_ops = nn.ModuleList()
             new_blocks.append(block)
 
-            # Block B: passthrough attn (zero weights = identity via residual) + efficient_alu.
-            # Original post_ops run after Block B's ffn to preserve semantic order.
-            d_model = lookup_ffn.dim if hasattr(lookup_ffn, 'dim') else 512
-            attn_passthrough = AutoregressiveAttention(
-                d_model, num_heads=block.attn.num_heads,
-                max_seq_len=block.attn.max_seq_len, layer_idx=i + 1
-            )
-            new_block = TransformerBlock(attn=attn_passthrough, ffn=efficient_alu)
-            new_block.post_ops = original_post_ops
+            # Block B: passthrough attn + efficient_alu, with post_ops temporarily attached
+            new_block = _make_passthrough_block(block.attn, efficient_alu, i + 1, d_model)
+            new_block.post_ops = nn.ModuleList(original_post_ops)
             new_blocks.append(new_block)
-            expansions += 1
-            print(f"  EXPAND L{i}: HybridALUBlock split into 2 blocks "
-                  f"({type(lookup_ffn).__name__} + {type(efficient_alu).__name__})")
+            hab_expansions += 1
+            print(f"  EXPAND L{i}: HybridALUBlock split (lookup_ffn + efficient_alu)")
         else:
             new_blocks.append(block)
 
-    if expansions > 0:
-        # Replace the model's blocks list. nn.ModuleList doesn't have an in-place
-        # rebuild method, so reassign.
-        model.blocks = nn.ModuleList(new_blocks)
-        # Move to the same device as the rest of the model
+    # Step 2: split post_ops into their own blocks
+    final_blocks = []
+    for block in new_blocks:
+        final_blocks.append(block)
+        if hasattr(block, 'post_ops') and len(block.post_ops) > 0:
+            post_ops_list = list(block.post_ops)
+            block.post_ops = nn.ModuleList()  # remove from this block
+            for op in post_ops_list:
+                # Each post_op becomes its own block
+                new_block = _make_passthrough_block(
+                    block.attn, op, len(final_blocks), d_model
+                )
+                final_blocks.append(new_block)
+                post_op_expansions += 1
+
+    if hab_expansions > 0 or post_op_expansions > 0:
+        model.blocks = nn.ModuleList(final_blocks)
         device = next(model.parameters()).device
         model.blocks = model.blocks.to(device)
-        print(f"  TOTAL EXPANSIONS: {expansions}, n_layers {len(new_blocks) - expansions} -> {len(new_blocks)}")
+        print(f"  PHASE 0 EXPANSIONS: {hab_expansions} HybridALU + {post_op_expansions} post_ops")
+        print(f"  Total blocks: 17 -> {len(final_blocks)}")
 
 
 def _right_size_ffns(model):
