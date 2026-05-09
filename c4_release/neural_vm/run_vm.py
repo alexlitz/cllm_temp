@@ -137,8 +137,8 @@ class AutoregressiveVMRunner:
 
     def __init__(
         self,
-        d_model=512,
-        n_layers=17,  # Updated from 16 for LEV Phase 3 (L16 routing layer)
+        d_model=None,
+        n_layers=None,
         n_heads=8,
         ffn_hidden=4096,
         max_seq_len=4096,
@@ -154,12 +154,36 @@ class AutoregressiveVMRunner:
         """Initialize the autoregressive VM runner.
 
         Args:
+            d_model: Residual stream dimension. None (default) means derive from
+                the compiler (Phase 0 M6).
+            n_layers: Number of transformer blocks. None (default) means derive
+                from the compiler.
             trust_neural_alu: If True, trust neural network for ALU operations.
             pure_neural: If True, skip ALL Python overrides and run purely
-                        autoregressively. Use for testing neural correctness.
-                        Note: This means no memory, no control flow handlers -
-                        everything must be computed by the neural network.
+                        autoregressively.
         """
+        # Phase 0 M6 (2026-05-09): when d_model/n_layers are not explicitly
+        # passed, derive them from the compiler. Used to be hardcoded to
+        # d_model=512, n_layers=17 — those values are now derived facts of
+        # the operation set, not free parameters.
+        if d_model is None or n_layers is None:
+            from .unified_compiler.migrated_ops import (
+                all_core_ops, declare_setdim_compat_dims,
+            )
+            from .unified_compiler import LayerCompiler
+            _c = LayerCompiler()
+            declare_setdim_compat_dims(_c)
+            for _op in all_core_ops():
+                _c.add_op(_op)
+            _layout = _c.compile()
+            if _layout.d_model % n_heads != 0:
+                _pad = n_heads - (_layout.d_model % n_heads)
+                _c.declare_dim("_pad", _pad)
+                _layout = _c.compile()
+            if d_model is None:
+                d_model = _layout.d_model
+            if n_layers is None:
+                n_layers = _layout.n_layers
         self.model = AutoregressiveVM(
             d_model=d_model,
             n_layers=n_layers,

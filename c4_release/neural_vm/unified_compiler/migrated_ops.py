@@ -919,6 +919,80 @@ def make_layer9_marker_suppress_op() -> Operation:
     )
 
 
+def _bake_post_op_into(ffn, post_op_instance, hidden_offset: int = 0) -> int:
+    """Copy a post_op's weights into a target FFN starting at `hidden_offset`.
+
+    The post_op classes (BinaryOpByteZeroingPostOp etc.) are PureFFN subclasses
+    that bake their weights in __init__. We construct one and copy weights into
+    the target block FFN's hidden-unit slots. Returns the next free hidden_offset.
+    """
+    H = post_op_instance.W_up.shape[0]
+    end = hidden_offset + H
+    target_H = ffn.W_up.shape[0]
+    if end > target_H:
+        raise ValueError(
+            f"FFN hidden_dim={target_H} too small for post_op (needs +{H} at offset {hidden_offset})"
+        )
+    ffn.W_up.data[hidden_offset:end, :] = post_op_instance.W_up.data
+    ffn.b_up.data[hidden_offset:end] = post_op_instance.b_up.data
+    ffn.W_gate.data[hidden_offset:end, :] = post_op_instance.W_gate.data
+    ffn.b_gate.data[hidden_offset:end] = post_op_instance.b_gate.data
+    ffn.W_down.data[:, hidden_offset:end] = post_op_instance.W_down.data
+    return end
+
+
+def make_l10_post_ops_combined() -> Operation:
+    """Combined L10 post_ops: BinaryOpByteZeroing + 3x CarryPropagation +
+    BitwiseBytePropagation + ComparisonCombine, baked sequentially into
+    one FFN.
+
+    Originally these were 6 separate post_ops on L10 in vm_step.py. Per Phase 0
+    policy they belong in their own blocks, but for the migration we combine
+    them additively into a single ffn at phase=10.5 so the compiler places
+    them right after layer10_alu.
+    """
+    def bake(ffn, dim_positions, S):
+        from ..vm_step import (
+            BinaryOpByteZeroingPostOp,
+            CarryPropagationPostOp,
+            BitwiseBytePropagationPostOp,
+            ComparisonCombine,
+        )
+        d_model = ffn.W_up.shape[1]
+        offset = 0
+        offset = _bake_post_op_into(ffn, BinaryOpByteZeroingPostOp(d_model, S), offset)
+        offset = _bake_post_op_into(ffn, CarryPropagationPostOp(d_model, S, byte_idx=0, cascade=False), offset)
+        offset = _bake_post_op_into(ffn, CarryPropagationPostOp(d_model, S, byte_idx=1, cascade=True), offset)
+        offset = _bake_post_op_into(ffn, CarryPropagationPostOp(d_model, S, byte_idx=2, cascade=True), offset)
+        offset = _bake_post_op_into(ffn, BitwiseBytePropagationPostOp(d_model, S), offset)
+        offset = _bake_post_op_into(ffn, ComparisonCombine(d_model, S), offset)
+
+    # phase=10.5 so it lands AFTER layer10_alu (phase=10) but BEFORE later layers
+    # which depend on its OUTPUT_LO/HI updates. Note: float phases work because
+    # phase comparison uses < / >.
+    return Operation(
+        name="l10_post_ops_combined",
+        phase=10.5,
+        reads={
+            "MARK_AX", "MARK_PC", "IS_BYTE", "H1",
+            "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+            "OP_SHL", "OP_SHR",
+            "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+            "OP_OR", "OP_XOR", "OP_AND",
+            "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
+            "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC",
+            "OP_SI", "OP_SC", "OP_PSH", "OP_EXIT", "OP_NOP",
+            "OP_PUTCHAR", "OP_GETCHAR",
+            "OUTPUT_LO", "OUTPUT_HI", "ALU_LO", "ALU_HI",
+            "CARRY", "CMP", "TEMP",
+            "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI", "CARRY"},
+        kind="ffn",
+        bake_fn=bake,
+    )
+
+
 def setup_token_embeddings(embed_weight, dim_positions: Dict[str, int] = None) -> None:
     """Bake the per-token embedding values using compiler dim positions.
 
@@ -1147,6 +1221,8 @@ def all_core_ops() -> list:
         make_binary_pop_sp_increment_op(),
         make_layer10_stack0_byte_relay_op(),
         make_layer9_marker_suppress_op(),
+        # L10 post_ops merged into a single phase-10.5 ffn
+        make_l10_post_ops_combined(),
     ]
 
 
