@@ -52,7 +52,6 @@ class TestPureNeuralALUCompleteness:
             Opcode.EXIT,
         ]) == expected
 
-    @pytest.mark.xfail(reason="DIV: efficient_alu_neural.py ALUDivMod / DivModModule not wired in pure-neural")
     @pytest.mark.parametrize("a,b,expected", [
         (20, 5, 4),
         (100, 10, 10),
@@ -68,7 +67,6 @@ class TestPureNeuralALUCompleteness:
             Opcode.EXIT,
         ]) == expected
 
-    @pytest.mark.xfail(reason="MOD: shares DivModModule path with DIV; pure-neural wiring missing")
     @pytest.mark.parametrize("a,b,expected", [
         (7, 3, 1),
         (10, 3, 1),
