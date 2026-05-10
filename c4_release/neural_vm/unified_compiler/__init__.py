@@ -18,24 +18,35 @@ Usage:
 from .primitives import Primitives
 from .compiler import UnifiedVMCompiler
 from .verification import Verifier
-from .builder import BuilderConfig, PruningConfig, IRBuilder
-from .ir import CompilerIR, AttentionOp, FFNOp, LayerSpec
 from .layer_compiler import LayerCompiler, Operation, ModelLayout, build_model_from_layout
+
+# IRBuilder/CompilerIR are part of an in-flight Phase 0 redesign that lives on a
+# parallel branch. Import them when available; fall back gracefully so this
+# package stays importable on branches that don't ship the IR module yet.
+try:
+    from .builder import BuilderConfig, PruningConfig, IRBuilder  # noqa: F401
+    from .ir import CompilerIR, AttentionOp, FFNOp, LayerSpec  # noqa: F401
+    _HAS_IR = True
+except ImportError:
+    _HAS_IR = False
 
 __all__ = [
     'Primitives',
     'UnifiedVMCompiler',
     'Verifier',
-    'BuilderConfig',
-    'PruningConfig',
-    'IRBuilder',
-    'CompilerIR',
-    'AttentionOp',
-    'FFNOp',
-    'LayerSpec',
     # Phase 0 layer-allocation compiler MVP (2026-05-09)
     'LayerCompiler',
     'Operation',
     'ModelLayout',
     'build_model_from_layout',
 ]
+if _HAS_IR:
+    __all__ += [
+        'BuilderConfig',
+        'PruningConfig',
+        'IRBuilder',
+        'CompilerIR',
+        'AttentionOp',
+        'FFNOp',
+        'LayerSpec',
+    ]
