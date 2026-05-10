@@ -23,6 +23,7 @@ from .layer_compiler import LayerCompiler, build_model_from_layout
 from .migrated_ops import (
     all_core_ops,
     declare_setdim_compat_dims,
+    make_alu_divmod_composite_ops,
     make_l10_post_op_attach_op,
     make_l11_alu_mul_bdtoge_op,
     make_l11_alu_mul_carrypass1_op,
@@ -112,6 +113,18 @@ def compile_full_vm(
         compiler.add_op(make_l12_alu_mul_binarylookahead_op())
         compiler.add_op(make_l12_alu_mul_finalcorrection_op())
         compiler.add_op(make_l12_alu_mul_getobd_op())
+
+    # L10 DIV/MOD ALU flattening: 4 cooperating block ops install the
+    # FlattenedDivMod composite (BD→GE, long-division pipeline, GE→BD,
+    # plus an install op that appends to model.blocks[10].post_ops).
+    # Replaces the previous EfficientDivMod_Neural runtime instantiations
+    # (lookup-mode override at vm_step.py and efficient-mode append in
+    # make_l10_post_op_attach_op). All 4 ops share a builder so the install
+    # op (phase=10.8) gets the fully-assembled composite. Both alu_modes
+    # use the flattened composite — its forward is byte-identical to the
+    # previous EfficientDivMod_Neural.
+    for op in make_alu_divmod_composite_ops():
+        compiler.add_op(op)
 
     # Bridge: legacy bake runs the full set_vm_weights pipeline. Marked as
     # phase=999 so it runs after all migrated bakes. Build_model_from_layout

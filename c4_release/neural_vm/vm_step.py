@@ -35,7 +35,6 @@ from .efficient_alu_neural import (
     EfficientALU_L10_Neural,
     EfficientALU_L11_L12_Neural,
     EfficientALU_L13_Neural,
-    EfficientDivMod_Neural,
 )
 from .efficient_alu_addsub_split import AddSub5StageBlock
 from .hybrid_alu import HybridALUBlock
@@ -2178,8 +2177,13 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # (split into 5 successive blocks by `_expand_wrapper_blocks`) instead
         # of the monolithic ALUAddSub. See migrated_ops._make_hybrid_alu_wrap_op
         # which selects AddSub5StageBlock when alu_cls_name == "ALUAddSub".
-        # Replace lookup DivModModule with efficient version
-        model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)
+        # DIV/MOD: previously
+        #   model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)
+        # but the FlattenedDivMod composite is now installed onto
+        # model.blocks[10].post_ops by 4 phase-ordered compiler block ops
+        # (make_alu_divmod_composite_ops) at phases 10.0/10.1/10.2/10.8 —
+        # see efficient_alu_divmod_split.FlattenedDivMod and
+        # migrated_ops.make_l10_alu_divmod_*_op.
     elif alu_mode == 'efficient':
         # Use efficient multi-layer ALU with pure neural format conversion
         # All operations use baked FFN weights - no Python loops in forward pass
@@ -2208,10 +2212,11 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # L10 FFN: Neural AND/OR/XOR
         model.blocks[10].ffn = EfficientALU_L10_Neural(S, BD)
 
-        # L10.5: Byte propagation post_ops + ComparisonCombine + EfficientDivMod_Neural.
+        # L10.5: Byte propagation post_ops + ComparisonCombine.
         # Migrated to compiler block op `l10_post_op_attach` (phase=10.7) which
-        # attaches all 7 modules to model.blocks[10].post_ops before legacy_bake
-        # runs.
+        # attaches the structural post_ops to model.blocks[10].post_ops before
+        # legacy_bake runs. DIV/MOD is now its own composite (FlattenedDivMod)
+        # appended by `make_l10_alu_divmod_install_op` (phase=10.8).
 
         # L11-L12: Neural MUL.
         # MIGRATED 2026-05-10: 9 compiler block ops at L11 (phases 11.0..12.3)
