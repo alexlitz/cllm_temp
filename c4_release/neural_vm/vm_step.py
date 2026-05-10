@@ -2002,13 +2002,17 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     attn8 = model.blocks[8].attn
     if hasattr(attn8, 'alibi_slopes') and attn8.alibi_slopes is not None:
         attn8.alibi_slopes.fill_(0.5)
-    _set_layer8_sp_gather(attn8, S, BD, HD)
+    # MIGRATED 2026-05-10: `_set_layer8_sp_gather(attn8, S, BD, HD)` is now
+    # baked by the compiler block op `layer8_sp_gather_bake` (phase=8.0,
+    # layer_idx=8, migrated=True). See unified_compiler/migrated_ops.py.
 
     # L8 Head 3: Multi-byte IMM fetch at AX byte positions
     # At each AX byte position k (BYTE_INDEX_1/2/3), TEMP contains PC+2/3/4
     # (computed by L4 head 1 + L4 FFN). This head queries the code section
     # using TEMP as address and copies the code byte to FETCH_LO/HI.
-    _set_layer8_multibyte_fetch(attn8, S, BD, HD)
+    # MIGRATED 2026-05-10: `_set_layer8_multibyte_fetch(attn8, S, BD, HD)` is
+    # now baked by the compiler block op `layer8_multibyte_fetch_bake`
+    # (phase=8.1, layer_idx=8, migrated=True).
 
     # L8 Head 4: Relay OP_IMM from AX marker to AX byte positions
     # At AX byte positions (IS_BYTE + H1[AX_I]), attend to AX marker (MARK_AX),

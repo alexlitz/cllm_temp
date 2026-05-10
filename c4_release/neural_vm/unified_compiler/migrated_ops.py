@@ -686,11 +686,18 @@ def make_layer8_alu_op() -> Operation:
 
 
 def make_layer8_multibyte_fetch_op() -> Operation:
-    """L8 attention head 3: fetch CODE bytes at AX byte positions."""
+    """No-op dep anchor for ``layer8_multibyte_fetch_bake``.
+
+    Kept as a ``kind="attn"`` placeholder (no ``migrated`` flag, no
+    ``layer_idx``): its declared reads/writes preserve the LayerCompiler
+    dep-graph topology that places downstream ops at the right
+    model.blocks indices. The actual weight bake now happens in
+    ``make_layer8_multibyte_fetch_bake_op`` (kind="block", layer_idx=8,
+    phase=8.1, migrated=True); this op's bake_fn is a no-op.
+    """
     def bake(attn, dim_positions, S):
-        from ..vm_step import _set_layer8_multibyte_fetch
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer8_multibyte_fetch(attn, S, _as_setdim_proxy(dim_positions), HD)
+        # No-op: actual bake is in `layer8_multibyte_fetch_bake` block op.
+        return
 
     return Operation(
         name="layer8_multibyte_fetch",
@@ -700,6 +707,39 @@ def make_layer8_multibyte_fetch_op() -> Operation:
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         bake_fn=bake,
+    )
+
+
+def make_layer8_multibyte_fetch_bake_op() -> Operation:
+    """Bake ``_set_layer8_multibyte_fetch`` into ``model.blocks[8].attn``.
+
+    Originally an inline call in ``set_vm_weights``:
+        ``_set_layer8_multibyte_fetch(attn8, S, BD, HD)``
+
+    Migrated as ``kind="block"`` with ``layer_idx=8`` and ``migrated=True``:
+    the inline call has been removed, so the bake must happen here.
+    Phase=8.1 so this runs after ``layer8_sp_gather_bake`` (phase=8.0),
+    preserving the legacy in-set_vm_weights ordering. The dep anchor
+    ``layer8_multibyte_fetch`` (kind="attn") preserves the LayerCompiler
+    topology so downstream ops remain placed at their legacy blocks.
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_layer8_multibyte_fetch
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer8_multibyte_fetch(attn, S, proxy, HD)
+
+    return Operation(
+        name="layer8_multibyte_fetch_bake",
+        phase=8.1,
+        reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
+        writes={"AX_CARRY_LO", "AX_CARRY_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=8,
+        migrated=True,
     )
 
 
@@ -721,11 +761,17 @@ def make_layer8_multibyte_routing_op() -> Operation:
 
 
 def make_layer8_sp_gather_op() -> Operation:
-    """L8 attention: SP gather for ADJ/ENT."""
+    """No-op dep anchor for ``layer8_sp_gather_bake``.
+
+    Kept as a ``kind="attn"`` placeholder (no ``migrated`` flag, no
+    ``layer_idx``): its declared reads/writes preserve the LayerCompiler
+    dep-graph topology. The actual weight bake now happens in
+    ``make_layer8_sp_gather_bake_op`` (kind="block", layer_idx=8,
+    phase=8.0, migrated=True); this op's bake_fn is a no-op.
+    """
     def bake(attn, dim_positions, S):
-        from ..vm_step import _set_layer8_sp_gather
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer8_sp_gather(attn, S, _as_setdim_proxy(dim_positions), HD)
+        # No-op: actual bake is in `layer8_sp_gather_bake` block op.
+        return
 
     return Operation(
         name="layer8_sp_gather",
@@ -735,6 +781,43 @@ def make_layer8_sp_gather_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+    )
+
+
+def make_layer8_sp_gather_bake_op() -> Operation:
+    """Bake ``_set_layer8_sp_gather`` into ``model.blocks[8].attn``.
+
+    Originally an inline call in ``set_vm_weights``:
+        ``_set_layer8_sp_gather(attn8, S, BD, HD)``
+
+    Migrated as ``kind="block"`` with ``layer_idx=8`` and ``migrated=True``:
+    the inline call has been removed, so the bake must happen here.
+    Phase=8.0 so this runs before ``layer8_multibyte_fetch_bake``
+    (phase=8.1), preserving the legacy in-set_vm_weights ordering. The
+    dep anchor ``layer8_sp_gather`` (kind="attn") preserves the
+    LayerCompiler topology so downstream ops remain placed at their
+    legacy blocks.
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_layer8_sp_gather
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer8_sp_gather(attn, S, proxy, HD)
+
+    return Operation(
+        name="layer8_sp_gather_bake",
+        phase=8.0,
+        reads={"MARK_STACK0", "MARK_BP", "H1", "H3", "H4",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
+        writes={"ADDR_B0_LO", "ADDR_B0_HI",
+                "ADDR_B1_LO", "ADDR_B1_HI",
+                "ADDR_B2_LO", "ADDR_B2_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=8,
+        migrated=True,
     )
 
 
@@ -3142,9 +3225,15 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_layer7_operand_gather_op(),
         make_layer7_memory_heads_op(),
         make_layer8_alu_op(),
+        # `make_layer8_multibyte_fetch_op` and `make_layer8_sp_gather_op` are
+        # kept as kind="attn" dep anchors so the LayerCompiler topology
+        # remains stable. The actual attn bakes are performed by the
+        # kind="block" migrated ops below (phases 8.0 / 8.1, layer_idx=8).
         make_layer8_multibyte_fetch_op(),
         make_layer8_multibyte_routing_op(),
         make_layer8_sp_gather_op(),
+        make_layer8_sp_gather_bake_op(),
+        make_layer8_multibyte_fetch_bake_op(),
         make_layer9_alu_op(),
         make_layer9_lev_addr_relay_op(),
         make_layer9_lev_bp_to_pc_relay_op(),
