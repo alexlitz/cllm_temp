@@ -9,13 +9,8 @@ Layer count:
   Layer 2: LongDivisionModule — 8 outer iterations of bring-down + trial
            multiply + compare + subtract (24 sub-FFN-equivalent operations)
   Layer 3: EmitDivResultModule — copy SLOT_QUOTIENT[*] → RESULT[*]
-
-The legacy fp64 MAGIC modules (FloorExtractionFFN, ClearDivSlotsFFN with the
-old name, etc.) are retained DEPRECATED below so that any external import
-still resolves; ``build_div_layers`` no longer references them.
 """
 
-import math
 import torch
 import torch.nn as nn
 
@@ -84,52 +79,6 @@ class GatherScalarFFN(nn.Module):
         return self.flat_ffn(x)
 
 
-class Softmax1ReciprocalModule(nn.Module):
-    """Compute 1/divisor via softmax1 nibble construction.
-
-    Generalizes to any base: score_j = log(base^j * d_j).
-    Pure neural: no Python loops, all tensor operations.
-    Uses fp64 for precision to avoid off-by-one errors.
-    """
-
-    def __init__(self, ge: GenericE, opcode: int):
-        super().__init__()
-        self.ge = ge
-        self.opcode = opcode
-        self.S = SOFTMAX1_SCALE
-        # Pre-compute base powers as a buffer (no loops in forward)
-        base_powers = torch.tensor(
-            [float(ge.BASE ** j) for j in range(ge.NUM_POSITIONS)],
-            dtype=torch.float64
-        )
-        self.register_buffer('base_powers', base_powers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        ge = self.ge
-        B, N, D = x.shape
-        opcode_w = x[:, 0, ge.OP_START + self.opcode]
-
-        # Extract divisor nibbles: [B, num_pos]
-        d = x[:, :ge.NUM_POSITIONS, ge.NIB_B].double()  # Use fp64 for precision
-
-        # Compute scores = log(base^j * d_j) where d_j > 0, else -S
-        val = (d * self.base_powers).clamp(min=0.5)
-        active = d > 0.5
-        scores = torch.where(active, torch.log(val), torch.full_like(val, -self.S))
-
-        # Softmax1 reciprocal computation in fp64
-        mx = scores.max(dim=-1, keepdim=True).values
-        ex = torch.exp(scores - mx)
-        sum_ex = ex.sum(dim=-1)
-        exp_neg_mx = torch.exp(-mx.squeeze(-1))
-        reciprocal = exp_neg_mx / sum_ex.clamp(min=1e-30)
-
-        # Write result back in original dtype
-        delta = torch.zeros_like(x)
-        delta[:, 0, ge.SLOT_QUOTIENT] = opcode_w * reciprocal.to(x.dtype)
-        return x + delta
-
-
 class MultiplyReciprocalFFN(nn.Module):
     """Multiply: Q_float = dividend × reciprocal → SLOT_REMAINDER."""
 
@@ -160,66 +109,6 @@ class MultiplyReciprocalFFN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.flat_ffn(x)
-
-
-class FloorExtractionFFN(nn.Module):
-    """Extract floor(Q/base^j) for j=0..N-1 via fp64 MAGIC trick.
-
-    Uses direct tensor operations (not SwiGLU) for batch-stable precision.
-    The MAGIC trick: floor(x) = (x - 0.5 + eps + MAGIC) - MAGIC
-    where MAGIC = 3 * 2^51 forces fp64 to round to nearest integer.
-
-    This is a pure neural implementation - all operations are tensor ops,
-    no Python arithmetic on extracted values.
-    """
-
-    def __init__(self, ge: GenericE, opcode: int):
-        super().__init__()
-        self.ge = ge
-        self.opcode = opcode
-        N = ge.NUM_POSITIONS
-        base = ge.BASE
-        chunk_bits = ge.config.chunk_bits
-
-        # Pre-compute scale factors as buffers (no Python math in forward)
-        scales = torch.tensor([1.0 / float(base ** j) for j in range(N)], dtype=torch.float64)
-        eps_vals = torch.tensor([2.0 ** (-20 - chunk_bits * j) for j in range(N)], dtype=torch.float64)
-        offsets = -(0.5 - eps_vals)  # offset_j for each position
-
-        self.register_buffer('scales', scales)
-        self.register_buffer('offsets', offsets)
-        self.register_buffer('magic', torch.tensor(MAGIC, dtype=torch.float64))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract floor values using direct tensor operations with MAGIC trick."""
-        ge = self.ge
-        B, N, D = x.shape
-        orig_dtype = x.dtype
-
-        # Get opcode weight and Q_float in fp64
-        opcode_w = x[:, 0, ge.OP_START + self.opcode].double()  # [B]
-        q_float = x[:, 0, ge.SLOT_REMAINDER].double()  # [B]
-
-        # Compute scaled values for all positions at once: [B, N]
-        # scaled[b, j] = q_float[b] * scales[j] + offsets[j]
-        scaled = q_float[:, None] * self.scales[None, :] + self.offsets[None, :]
-
-        # Apply MAGIC trick for floor: floor(x) = (x + MAGIC) - MAGIC
-        # This works because at MAGIC scale, fp64 can only represent integers
-        floored = (scaled + self.magic) - self.magic
-
-        # Gate by opcode and write to RESULT
-        # First clear old RESULT values, then write new ones
-        delta = torch.zeros_like(x)
-
-        # Clear RESULT at all positions (multiply old value by -opcode_w, add back)
-        old_results = x[:, :ge.NUM_POSITIONS, ge.RESULT]
-        delta[:, :ge.NUM_POSITIONS, ge.RESULT] = -old_results * opcode_w[:, None]
-
-        # Write floored values gated by opcode
-        delta[:, :ge.NUM_POSITIONS, ge.RESULT] += (floored * opcode_w[:, None]).to(orig_dtype)
-
-        return x + delta
 
 
 class FloorExtractionFP32FFN(nn.Module):
@@ -369,23 +258,6 @@ class ChunkSubtractFFN(nn.Module):
         if self.flat_ffn is None:
             return x
         return self.flat_ffn(x)
-
-
-class DivMergedLayer1(nn.Module):
-    """Layer 1: Clear + Gather + Reciprocal (merged — independent output slots)."""
-
-    def __init__(self, ge: GenericE, opcode: int):
-        super().__init__()
-        self.clear = ClearDivSlotsFFN(ge, opcode)
-        self.gather = GatherScalarFFN(ge, ge.NIB_A, ge.SLOT_DIVIDEND, opcode)
-        self.reciprocal = Softmax1ReciprocalModule(ge, opcode)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # These write to independent slots, so deltas sum correctly
-        d1 = self.clear(x) - x
-        d2 = self.gather(x) - x
-        d3 = self.reciprocal(x) - x
-        return x + d1 + d2 + d3
 
 
 def build_div_layers(config: ChunkConfig, opcode: int, fp32_floor: bool = False) -> nn.ModuleList:
