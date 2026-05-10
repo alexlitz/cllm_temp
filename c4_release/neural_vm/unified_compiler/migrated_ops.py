@@ -661,6 +661,7 @@ def make_layer14_mem_generation_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -680,6 +681,7 @@ def make_layer15_memory_lookup_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -697,6 +699,7 @@ def make_layer16_lev_routing_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
