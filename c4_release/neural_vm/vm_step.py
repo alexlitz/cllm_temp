@@ -6165,10 +6165,16 @@ def _set_layer9_lev_addr_relay(attn, S, BD, HD):
     BP_I = 3  # BP marker index
     base = 0 * HD  # head 0
 
-    # Q: fires at SP marker when OP_LEV active
+    # Q: fires ONLY at SP marker when OP_LEV active.
+    # NOTE 2026-05-09: At L9 input OP_LEV is amplified to ~10 by L6 relays
+    # (not ~5 as the original comment said). With threshold = -2*L:
+    #   SP marker: Q[0] = L + (10 * L/5) - 2L = L (fires)
+    #   any other position (MARK_SP=0): Q[0] = 0 + 2L - 2L = 0 (no fire)
+    # The tight threshold prevents firing at PC/BP markers, where head 1 and
+    # the L8 FFN do their own LEV writes (avoids cross-contamination).
     attn.W_q[base, BD.MARK_SP] = L
-    attn.W_q[base, BD.OP_LEV] = L / 5  # OP_LEV ≈ 5, normalize to ~L
-    attn.W_q[base, BD.CONST] = -2 * L  # need both MARK_SP and OP_LEV
+    attn.W_q[base, BD.OP_LEV] = L / 5  # at L9 input, OP_LEV ~= 10 (amplified by L6)
+    attn.W_q[base, BD.CONST] = -2 * L  # tight threshold; prevents firing at non-SP markers
 
     # K: attend to BP byte 0 (L1H1[BP_I] AND BYTE_INDEX_0)
     # L1H1[BP_I] = 1 when within 2.5 tokens of BP marker
@@ -6214,13 +6220,17 @@ def _set_layer9_lev_bp_to_pc_relay(attn, S, BD, HD):
     BP_I = 3  # BP marker index
     base = 1 * HD  # head 1
 
-    # Q: fires at PC marker when OP_LEV active
-    # FIX 2026-04-16: Reduced threshold from -2*L to -1.5*L so Q[0] > 0 at target.
-    # Old: Q[0] = L + L - 2*L = 0 (K matching disabled!)
-    # New: Q[0] = L + L - 1.5*L = 0.5*L = 25 (K matching works)
+    # Q: fires ONLY at PC marker when OP_LEV active. Mirrors head 0 (see
+    # _set_layer9_lev_addr_relay for the OP_LEV=10 / threshold=-2*L derivation).
+    # FIX 2026-05-09: Restored -2*L from prior -1.5*L. The 2026-04-16 change
+    # assumed OP_LEV ~ 5 at L9 input; in reality OP_LEV ~ 10 (amplified by L6),
+    # so -1.5*L gave Q[0]=0.5*L = 25 at SP marker (spurious). That made head 1
+    # also write to ADDR_B0 at SP marker, doubling head 0's contribution
+    # (LO[8]=6.0 instead of 3.0 for BP=0xE8) and breaking the L9 +8-offset gate
+    # and L16 BP+16 gate downstream.
     attn.W_q[base, BD.MARK_PC] = L
-    attn.W_q[base, BD.OP_LEV] = L / 5  # OP_LEV ≈ 5, normalize to ~L
-    attn.W_q[base, BD.CONST] = -1.5 * L  # need both MARK_PC and OP_LEV
+    attn.W_q[base, BD.OP_LEV] = L / 5  # at L9 input, OP_LEV ~= 10 (amplified by L6)
+    attn.W_q[base, BD.CONST] = -2 * L  # tight threshold matches head 0; prevents SP-marker spurious firing
 
     # K: attend to BP byte 0 (L1H1[BP_I] AND BYTE_INDEX_0)
     # L1H1[BP_I] = 1 when within 2.5 tokens of BP marker
