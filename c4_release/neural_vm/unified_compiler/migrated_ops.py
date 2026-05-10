@@ -1127,6 +1127,37 @@ def make_layer14_clear_output_corruption_op() -> Operation:
     )
 
 
+def make_layer14_clear_mem_marker_output_op() -> Operation:
+    """L14 FFN: Clear OUTPUT at MEM marker for OP_JSR/OP_ENT.
+
+    Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
+    counter on ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops
+    (``layer14_temp_clear``, ``layer14_clear_addr_key_pollution``,
+    ``layer14_clear_output_corruption``). Last in the chain (phase=14.4).
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_layer14_clear_mem_marker_output
+        ffn = block.ffn
+        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        next_unit = _set_layer14_clear_mem_marker_output(
+            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        )
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_clear_mem_marker_output",
+        phase=14.4,
+        reads={"OP_JSR", "OP_ENT", "MARK_MEM", "IS_BYTE",
+               "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
+               "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=14,
+        migrated=True,
+    )
+
+
 def make_layer15_memory_lookup_op() -> Operation:
     """L15 attention: memory-lookup heads for LI/LC."""
     def bake(attn, dim_positions, S):
@@ -1143,6 +1174,33 @@ def make_layer15_memory_lookup_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
+    )
+
+
+def make_layer15_nibble_copy_op() -> Operation:
+    """L15 FFN: Conditional nibble copy OUTPUT = EMBED for non-register byte values.
+
+    Pinned to ``layer_idx=15`` via ``kind="block"`` so the bake hits block 15's
+    FFN regardless of dep-graph placement. ``migrated=True`` claims this bake
+    from the legacy ``set_vm_weights`` pipeline (the inline call has been
+    removed at the original site).
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_nibble_copy_ffn
+        _set_nibble_copy_ffn(block.ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="layer15_nibble_copy",
+        phase=15,
+        reads={"IS_BYTE", "H1", "H4", "MEM_STORE",
+               "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "MARK_STACK0", "HAS_SE", "CMP"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=15,
         migrated=True,
     )
 
@@ -2889,6 +2947,12 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_phase_a_ffn_op(),
         make_layer1_ffn_op(),
         make_layer2_mem_byte_flags_op(),
+        # `make_nibble_copy_ffn_op` (kind="ffn", not migrated) is kept as a
+        # placeholder in the dep graph: removing it shifts the dep-graph layout
+        # for L11/L12 ops. The actual L15 nibble-copy bake is performed by
+        # `make_layer15_nibble_copy_op` (kind="block", layer_idx=15,
+        # migrated=True) below; this kind="ffn" entry is skipped at dispatch
+        # because legacy_bake is present and migrated=False.
         make_nibble_copy_ffn_op(),
         make_layer3_ffn_op(),
         make_layer4_pc_relay_op(),
@@ -2934,7 +2998,9 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_layer14_temp_clear_op(),
         make_layer14_clear_addr_key_pollution_op(),
         make_layer14_clear_output_corruption_op(),
+        make_layer14_clear_mem_marker_output_op(),
         make_layer15_memory_lookup_op(),
+        make_layer15_nibble_copy_op(),
         make_layer16_lev_routing_op(),
         # Critical additional ops (M3+ continuation)
         make_binary_pop_sp_increment_op(),
