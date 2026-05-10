@@ -115,6 +115,7 @@ def make_layer1_ffn_op() -> Operation:
                 "BYTE_INDEX_2", "BYTE_INDEX_3"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -783,6 +784,7 @@ def make_layer1_threshold_attn_op() -> Operation:
         writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
