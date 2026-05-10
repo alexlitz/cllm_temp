@@ -230,6 +230,16 @@ class AddSub5StageBlock(nn.Module):
 
     Mathematically equivalent to ALUAddSub.forward (same computation,
     just split across 5 stage modules sharing state).
+
+    Vanilla refactor (2026-05-10): forward is now an ``nn.Sequential``
+    composition over the 5 stages. Each stage's signature is
+    ``x_bd -> x_bd`` (residual-identity for stages 0-3; stage 4 returns
+    the BD with OUTPUT/CARRY written), so the BD residual is the only
+    tensor threaded by Sequential. The shared ``_AddSubGEState`` lives
+    as a side channel: each stage holds a reference to the same state
+    object, so Sequential does not need to forward it through the call
+    chain. This keeps the standard ``nn.Sequential`` semantics while
+    preserving the cross-stage GE workspace.
     """
 
     def __init__(self, S, BD):
@@ -238,13 +248,24 @@ class AddSub5StageBlock(nn.Module):
         self.BD = BD
         state, s0, s1, s2, s3, s4 = make_addsub_stage_modules(BD, S)
         self.state = state
-        # Use ModuleList to ensure parameters are tracked + .to(device) recurses
-        self.stages = nn.ModuleList([s0, s1, s2, s3, s4])
+        # Vanilla nn.Sequential pipeline over the 5 stages. The shared
+        # `_AddSubGEState` reference each stage carries internally is the
+        # side channel — Sequential only forwards the BD tensor.
+        self.pipeline = nn.Sequential(s0, s1, s2, s3, s4)
+
+    @property
+    def stages(self):
+        """Back-compat: expose the 5 sub-stages as an indexable sequence.
+
+        Older code paths (and the original ModuleList-based implementation)
+        walked `block.ffn.stages[i]`. The canonical container is now the
+        `nn.Sequential` pipeline; expose it under the historical name to
+        avoid duplicate parameter registration.
+        """
+        return self.pipeline
 
     def forward(self, x):
-        for stage in self.stages:
-            x = stage(x)
-        return x
+        return self.pipeline(x)
 
     # Compatibility stubs (mirror PureNeuralALU)
     def compact(self, block_size=1):
