@@ -1,24 +1,19 @@
 """
-Chunk-generic MOD pipeline: DIV + MUL + SUB + correction.
+Chunk-generic MOD pipeline: nibble-level long division (no fp64).
 
-MOD = dividend - floor((dividend-1)/divisor) * divisor, then correct if >= divisor.
-
-The x-1 trick ensures the quotient is never too high:
-  floor((x-1)/n) <= floor(x/n), with gap from (x-1)/n to next int >= 1/n.
-
-Supported configs: NIBBLE, BYTE.
-(Requires both DIV and MUL support; BIT/PAIR overflow fp16 scalar gather,
-HALFWORD/WORD impractical for MUL step pairs.)
+MOD shares the long-division core with DIV: 8 outer iterations produce both
+quotient and remainder simultaneously. The MOD entry point emits the
+remainder; the DIV entry point emits the quotient. See
+``divmod_longdiv.py`` for algorithm details.
 
 Pipeline:
-  Layer 1: ModDivScalarModule — gather + reciprocal + (x-1)*reciprocal in fp64
-  Layer 2: FloorExtractionFFN — MAGIC trick (fp64)
-  Layer 3: ChunkSubtractFFN — extract chunk digits
-  Layer 4: Fp64MulSubModule — MUL(quotient*divisor) + SUB(dividend-product) in fp64
-  Layer 5: ModCorrectionModule (if remainder >= divisor, subtract)
+  Layer 1: ClearDivSlotsFFN — clear scratch slots
+  Layer 2: LongDivisionModule — long division → SLOT_REMAINDER, SLOT_QUOTIENT
+  Layer 3: EmitDivResultModule — copy SLOT_REMAINDER[*] → RESULT[*]
 
-The MUL+SUB stages are run in fp64 to avoid fp32 accumulation errors
-in the carry extraction step pairs (which sum O(100) large terms).
+The legacy fp64 modules (``ModDivScalarModule``, ``Fp64MulSubModule``,
+``ModCorrectionModule``) are retained DEPRECATED below in case any
+external code still imports them. ``build_mod_layers`` no longer uses them.
 """
 
 import torch
@@ -32,14 +27,15 @@ from .sub import SubRawAndGenFFN, SubBorrowLookaheadFFN, SubFinalResultFFN
 
 
 class ModDivScalarModule(nn.Module):
-    """Compute Q_float = (dividend-1) * (1/divisor) in fp64.
+    """DEPRECATED — fp64 scalar (dividend-1) * (1/divisor) stage.
 
-    Replaces DivMergedLayer1 + MultiplyReciprocalFFN for MOD.
-    The entire scalar computation happens in fp64 to avoid
-    precision loss from fp32 gather (scalar up to 4.3e9 > 2^24).
+    Was used by the previous MOD pipeline. The new long-division pipeline
+    in ``divmod_longdiv.py`` does not use this module. Kept only for
+    backward compatibility.
+
+    Compute Q_float = (dividend-1) * (1/divisor) in fp64.
 
     Writes Q_float to SLOT_REMAINDER at position 0.
-    Pure neural: no Python loops in forward, all tensor operations.
     """
 
     def __init__(self, ge: GenericE, opcode: int):
@@ -92,7 +88,13 @@ class ModDivScalarModule(nn.Module):
 
 
 class Fp64MulSubModule(nn.Module):
-    """Run MUL + SUB stages in fp64 to avoid accumulation errors.
+    """DEPRECATED — fp64 MUL + SUB stages from the previous MOD pipeline.
+
+    No longer used by ``build_mod_layers`` (the new long-division pipeline
+    in ``divmod_longdiv.py`` computes the remainder directly during long
+    division and never invokes this module). Retained only for backward
+    compatibility with any external caller that still imports the name —
+    it has no remaining call sites in this repository.
 
     Wraps MUL layers (quotient * divisor) and SUB layers (dividend - product)
     with fp64 upcast/downcast.
@@ -141,13 +143,13 @@ class Fp64MulSubModule(nn.Module):
 
 
 class ModCorrectionModule(nn.Module):
-    """If remainder >= divisor, subtract divisor once.
+    """DEPRECATED — final remainder correction for the previous MOD pipeline.
 
-    After x-1 trick, the quotient is at most 1 too low, so
-    remainder is in [0, 2*divisor-1]. One correction suffices.
+    Not used by the new long-division pipeline in ``divmod_longdiv.py``
+    (which produces an exact remainder directly). Kept only for backward
+    compatibility.
 
-    Pure neural: no Python loops in forward, all tensor operations.
-    Uses MAGIC floor trick for chunk extraction.
+    If remainder >= divisor, subtract divisor once.
     """
 
     def __init__(self, ge: GenericE, opcode: int):
@@ -213,26 +215,9 @@ class ModCorrectionModule(nn.Module):
 
 
 def build_mod_layers(config: ChunkConfig, opcode: int = 29) -> nn.ModuleList:
-    """Build MOD pipeline for NIBBLE/BYTE configs.
+    """Build MOD pipeline using nibble-level long division (no fp64).
 
-    Pipeline: fp64 scalar div → floor extraction → chunk subtract →
-              fp64 MUL+SUB → correction.
+    All arithmetic is fp32. See ``divmod_longdiv.py``.
     """
-    ge = GenericE(config)
-    layers = []
-
-    # 1. Scalar DIV phase in fp64: (dividend-1) * (1/divisor) → SLOT_REMAINDER
-    layers.append(ModDivScalarModule(ge, opcode))
-
-    # 2-3. Floor extraction + chunk subtraction (from DIV pipeline)
-    layers.append(FloorExtractionFFN(ge, opcode))
-    if config.num_positions > 1:
-        layers.append(ChunkSubtractFFN(ge, opcode))
-
-    # 4. MUL + SUB in fp64: quotient*divisor, then dividend-product
-    layers.append(Fp64MulSubModule(ge, opcode, config))
-
-    # 5. Correction: if remainder >= divisor, subtract divisor
-    layers.append(ModCorrectionModule(ge, opcode))
-
-    return nn.ModuleList(layers)
+    from .divmod_longdiv import build_mod_layers_longdiv
+    return build_mod_layers_longdiv(config, opcode)
