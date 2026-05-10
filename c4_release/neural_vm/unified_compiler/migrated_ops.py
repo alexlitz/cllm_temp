@@ -2541,6 +2541,164 @@ def make_branch_override_patch_op() -> Operation:  # noqa: E302
     )
 
 
+def make_l6_dead_unit_zero_op() -> Operation:
+    """Defensive gate that zeros L6 FFN units misreading OUTPUT_BYTE residuals.
+
+    Originally an inline post-pass in `set_vm_weights` (BUG FIX 2026-04-09 part
+    8c/8g). Unprogrammed L6 FFN units can fire spuriously when:
+
+    - they write to OUTPUT_LO/HI (W_down rows in those slices are non-zero), AND
+    - they have strong W_up reads on OUTPUT_BYTE_LO/HI (which carry residual
+      values from the prior IO step), AND
+    - they don't have positive marker weights (MARK_PC, MARK_STACK0, MARK_BP)
+      indicating intentional TEMP usage by JSR PC override / ENT.
+
+    The patch zeros W_up/W_gate rows, W_down columns, and biases for every
+    matching unit so they cannot fire at any position.
+
+    Operates on `model.blocks[6].ffn` (the L6 routing FFN). Phase=1160 so it
+    runs after branch_override_patch (phase=1100) and the head/embedding bakes
+    (1000/1001), and before right_size_ffns (1200) — preserving the original
+    in-set_vm_weights ordering where this pass ran before the right-size pass.
+
+    Migrated=True: the corresponding inline block in `set_vm_weights` has been
+    removed to avoid double-bake.
+    """
+    def bake(model, dim_positions, S):
+        BD = _as_setdim_proxy(dim_positions)
+        ffn6 = model.blocks[6].ffn
+        if not (hasattr(ffn6, 'W_up') and isinstance(getattr(ffn6, 'W_up', None), nn.Parameter)):
+            return
+        hidden_dim = ffn6.W_up.shape[0]
+        patched_count = 0
+        for u in range(hidden_dim):
+            writes_output_lo = (
+                ffn6.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO + 16, u].abs().max().item() > 0.01
+            )
+            writes_output_hi = (
+                ffn6.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI + 16, u].abs().max().item() > 0.01
+            )
+            if not (writes_output_lo or writes_output_hi):
+                continue
+
+            # Skip units that legitimately use TEMP at marker positions.
+            if ffn6.W_up[u, BD.MARK_PC].item() > 10:  # JSR PC override uses S=100
+                continue
+            if ffn6.W_up[u, BD.MARK_STACK0].item() > 10:  # ENT uses TEMP at STACK0
+                continue
+            if ffn6.W_up[u, BD.MARK_BP].item() > 10:  # ENT uses TEMP at BP
+                continue
+
+            output_byte_lo_weight = (
+                ffn6.W_up[u, BD.OUTPUT_BYTE_LO:BD.OUTPUT_BYTE_LO + 16].abs().max().item()
+            )
+            output_byte_hi_weight = (
+                ffn6.W_up[u, BD.OUTPUT_BYTE_HI:BD.OUTPUT_BYTE_HI + 16].abs().max().item()
+            )
+
+            if output_byte_lo_weight > 50 or output_byte_hi_weight > 50:
+                ffn6.W_up.data[u, :] = 0
+                ffn6.W_gate.data[u, :] = 0
+                ffn6.W_down.data[:, u] = 0
+                ffn6.b_up.data[u] = 0
+                ffn6.b_gate.data[u] = 0
+                patched_count += 1
+        if patched_count:
+            print(f"  L6 DEAD-UNIT ZERO: {patched_count} units zeroed")
+
+    return Operation(
+        name="l6_dead_unit_zero",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=1160,
+        migrated=True,
+    )
+
+
+def make_l7_dead_unit_zero_op() -> Operation:
+    """Defensive gate that suppresses L7 FFN units firing at PC marker.
+
+    Originally an inline post-pass in `set_vm_weights` (BUG FIX 2026-04-17).
+    Some FFN units (e.g. units 746/754) carry W_up[OP_ENT]=100, W_up[MARK_SP]=100,
+    b_up=-150 — they're meant for ENT SP byte 0 generation but `OP_ENT * 5 = 500`
+    overcomes the bias even when MARK_SP=0, so they spuriously fire at PC marker
+    positions. The patch adds strong negative MARK_PC and IS_BYTE weights to the
+    matching units so they cannot fire outside their intended marker position.
+
+    Matching criteria:
+      - writes to OUTPUT_LO/HI, AND
+      - has strong (>50) W_up reads on OP_ENT/OP_LEV/OP_JSR/OP_LEA, AND
+      - lacks existing MARK_PC suppression (W_up[MARK_PC] >= -100), AND
+      - is not a byte-position unit (no positive IS_BYTE / BYTE_INDEX_0..3
+        weights >5), AND
+      - does not legitimately fire at PC marker (W_up[MARK_PC] <= 10).
+
+    Operates on `model.blocks[6].ffn` (preserving the original code's choice;
+    the legacy comment claims `blocks[6] = L7` but the same FFN is also the L6
+    routing FFN in the current block layout — the pass is purely defensive and
+    only modifies units matching the criteria above, so co-location is safe).
+
+    Phase=1170 so it runs after the L6 dead-unit zero pass (phase=1160) and
+    before right_size_ffns (1200) — preserving original ordering.
+    """
+    def bake(model, dim_positions, S):
+        BD = _as_setdim_proxy(dim_positions)
+        ffn7 = model.blocks[6].ffn  # blocks[6] = L7 (per original code's comment)
+        if not (hasattr(ffn7, 'W_up') and isinstance(getattr(ffn7, 'W_up', None), nn.Parameter)):
+            return
+        hidden_dim = ffn7.W_up.shape[0]
+        patched_l7_count = 0
+        for u in range(hidden_dim):
+            writes_output_lo = (
+                ffn7.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO + 16, u].abs().max().item() > 0.01
+            )
+            writes_output_hi = (
+                ffn7.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI + 16, u].abs().max().item() > 0.01
+            )
+            if not (writes_output_lo or writes_output_hi):
+                continue
+
+            has_strong_opcode = (
+                ffn7.W_up[u, BD.OP_ENT].abs().item() > 50 or
+                ffn7.W_up[u, BD.OP_LEV].abs().item() > 50 or
+                ffn7.W_up[u, BD.OP_JSR].abs().item() > 50 or
+                ffn7.W_up[u, BD.OP_LEA].abs().item() > 50
+            )
+
+            has_mark_pc_suppression = ffn7.W_up[u, BD.MARK_PC].item() < -100
+
+            is_byte_unit = (
+                ffn7.W_up[u, BD.IS_BYTE].item() > 5 or
+                ffn7.W_up[u, BD.BYTE_INDEX_0].item() > 5 or
+                ffn7.W_up[u, BD.BYTE_INDEX_1].item() > 5 or
+                ffn7.W_up[u, BD.BYTE_INDEX_2].item() > 5 or
+                ffn7.W_up[u, BD.BYTE_INDEX_3].item() > 5
+            )
+
+            # Skip units that legitimately fire at PC marker.
+            if ffn7.W_up[u, BD.MARK_PC].item() > 10:
+                continue
+
+            if has_strong_opcode and not has_mark_pc_suppression and not is_byte_unit:
+                ffn7.W_up.data[u, BD.MARK_PC] = -S * 100  # -1000 when MARK_PC = 1
+                ffn7.W_up.data[u, BD.IS_BYTE] = -S * 100  # -1000 when IS_BYTE = 1
+                patched_l7_count += 1
+        if patched_l7_count:
+            print(f"  L7 DEAD-UNIT ZERO: {patched_l7_count} units suppressed")
+
+    return Operation(
+        name="l7_dead_unit_zero",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=1170,
+        migrated=True,
+    )
+
+
 def make_right_size_ffns_op() -> Operation:
     """Trim each block's FFN hidden dim to actually-programmed unit count."""
     def bake(model, dim_positions, S):
@@ -2782,8 +2940,22 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
-        # Structural post-passes (run after all weight bakes complete).
-        # Migrated 2026-05-10 from inline tail of set_vm_weights.
+        # Model-level post-passes — run in phase order after legacy_bake (999):
+        #   branch_override_patch (1100): suppress spurious branch/LEV-override
+        #     units across all blocks.
+        #   l6_dead_unit_zero    (1160): zero L6 FFN units misreading
+        #     OUTPUT_BYTE residuals.
+        #   l7_dead_unit_zero    (1170): suppress L7 FFN units firing at PC
+        #     marker.
+        #   right_size_ffns      (1200): trim each block's FFN hidden dim to
+        #     actually-programmed unit count.
+        #   expand_wrapper_blocks(1300): split HybridALU + post_op composites
+        #     into separate transformer blocks.
+        # All five carry migrated=True; their inline counterparts inside
+        # set_vm_weights have been removed to avoid double-bake.
+        make_branch_override_patch_op(),
+        make_l6_dead_unit_zero_op(),
+        make_l7_dead_unit_zero_op(),
         make_right_size_ffns_op(),
         make_expand_wrapper_blocks_op(),
     ]
