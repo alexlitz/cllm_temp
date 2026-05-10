@@ -2064,21 +2064,11 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
             patched_count += 1
 
     # ===== LAYER 7: Operand gather + memory relay heads =====
+    # Migrated to compiler ops `layer7_operand_gather` and `layer7_memory_heads`
+    # (phase=7) which bake the attention and ALiBi slope weights via
+    # build_model_from_layout. attn7 is still bound for the conversational I/O
+    # format-pointer extraction head below.
     attn7 = model.blocks[7].attn
-    if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
-        attn7.alibi_slopes.fill_(0.5)
-    _set_layer7_operand_gather(attn7, S, BD, HD)
-    # L7 head 1: MEM flag broadcast (MEM marker → MEM byte positions)
-    if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
-        attn7.alibi_slopes[1] = 5.0  # steep for nearest MEM marker
-    # L7 heads 2-4: Gather prev AX bytes → AX positions (for LI/LC addr)
-    # L7 head 5: Relay LI/LC flags → AX byte positions
-    if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
-        attn7.alibi_slopes[5] = 5.0
-    # L7 head 6: Relay PSH/store flags → STACK0 byte positions
-    if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
-        attn7.alibi_slopes[6] = 5.0
-    _set_layer7_memory_heads(attn7, S, BD, HD)
 
     # === BUG FIX 2026-04-17: Patch spurious L7 FFN units ===
     # Units 746/754 in L7 FFN have W_up[OP_ENT]=100, W_up[MARK_SP]=100, b_up=-150.
