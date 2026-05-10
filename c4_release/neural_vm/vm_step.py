@@ -2353,12 +2353,12 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         model.blocks[10].post_ops.append(DivModModule(mode='lookup'))
 
         # ===== LAYER 11: MUL partial sum staging =====
-        ffn11 = model.blocks[11].ffn
-        _set_layer11_mul_partial(ffn11, S, BD)
+        # Migrated to compiler op `layer11_mul_partial` (phase=11) which bakes
+        # the L11 FFN MUL partial-product weights via build_model_from_layout.
 
         # ===== LAYER 12: MUL hi nibble combine =====
-        ffn12 = model.blocks[12].ffn
-        _set_layer12_mul_combine(ffn12, S, BD)
+        # Migrated to compiler op `layer12_mul_combine` (phase=12) which bakes
+        # the L12 FFN MUL combine weights via build_model_from_layout.
 
         # ===== LAYER 13: SHL/SHR shifts + MEM addr gather =====
         attn13 = model.blocks[13].attn

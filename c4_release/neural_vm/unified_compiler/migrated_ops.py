@@ -588,6 +588,7 @@ def make_layer11_mul_partial_op() -> Operation:
         writes={"MUL_ACCUM"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -604,6 +605,7 @@ def make_layer12_mul_combine_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
