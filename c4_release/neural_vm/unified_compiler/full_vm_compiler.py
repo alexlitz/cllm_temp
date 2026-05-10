@@ -73,7 +73,10 @@ def compile_full_vm(
     declare_setdim_compat_dims(compiler)
 
     # Per-layer ops drive the layout (d_model, n_layers, dim_positions).
-    for op in all_core_ops():
+    # Forward alu_mode so SHL/SHR (and any future alu_mode-aware migrated op)
+    # can branch between the legacy lookup-table bake and the efficient
+    # neural-ALU bake.
+    for op in all_core_ops(alu_mode=alu_mode):
         compiler.add_op(op)
 
     # L10 post_op attach: runs as a migrated block op (phase=10.7) before the
