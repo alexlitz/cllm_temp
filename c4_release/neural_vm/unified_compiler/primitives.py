@@ -531,6 +531,262 @@ class Primitives:
 
         return unit + 1
 
+    # =========================================================================
+    # Set 1 (re-extracted from agent a19962): register-decrement, marker-write,
+    # opcode-gated PC override, byte passthrough chain.
+    # =========================================================================
+
+    @staticmethod
+    def register_decrement_unit(
+        ffn,
+        *,
+        unit: int,
+        register_marker_dim: int,
+        op_gate_dim: int,
+        embed_lo_dim: int,
+        embed_hi_dim: int,
+        output_lo_dim: int,
+        output_hi_dim: int,
+        decrement: int,
+        S: float,
+        op_strength: float = 1.0,
+    ) -> int:
+        """Generate 32 FFN units (16 lo + 16 hi nibble) implementing
+        register -= decrement at a marker token, with hi-nibble borrow.
+
+        Mirrors the PSH/JSR/ENT SP-decrement pattern in
+        `_set_layer6_routing_ffn`. Each unit fires only when both
+        ``op_gate_dim`` and ``register_marker_dim`` are active (threshold
+        T=1.5 against the sum of two unit-magnitude signals scaled by
+        ``S`` and ``op_strength*S`` respectively).
+
+        Lo nibble: rotate by ``-decrement`` (mod 16), cancel identity carry.
+        Hi nibble: borrow (-=1) when the original lo nibble was >= 8, also
+        cancels identity carry.
+        """
+        T = 1.5
+        # Lo nibble: shifted copy + cancel identity
+        for k in range(16):
+            new_k = (k - decrement) % 16
+            ffn.W_up.data[unit, op_gate_dim] = S * op_strength
+            ffn.W_up.data[unit, register_marker_dim] = S
+            ffn.b_up.data[unit] = -S * T
+            ffn.W_gate.data[unit, embed_lo_dim + k] = 1.0
+            ffn.W_down.data[output_lo_dim + new_k, unit] = 2.0 / S
+            ffn.W_down.data[output_lo_dim + k, unit] += -2.0 / S  # cancel identity
+            unit += 1
+        # Hi nibble: borrow when old lo >= 8
+        for k in range(16):
+            new_k_borrow = (k - 1) % 16
+            ffn.W_up.data[unit, op_gate_dim] = S * op_strength
+            ffn.W_up.data[unit, register_marker_dim] = S
+            ffn.b_up.data[unit] = -S * T
+            ffn.W_gate.data[unit, embed_hi_dim + k] = 1.0
+            for lo_bit in range(8, 16):
+                ffn.W_gate.data[unit, embed_lo_dim + lo_bit] = -1.0
+            ffn.W_down.data[output_hi_dim + new_k_borrow, unit] = 2.0 / S
+            ffn.W_down.data[output_hi_dim + k, unit] += -2.0 / S  # cancel identity
+            unit += 1
+        return unit
+
+    @staticmethod
+    def marker_write_unit(
+        ffn,
+        *,
+        unit: int,
+        marker_dim: int,
+        op_gate_dim: int,
+        source_dims,
+        target_dim: int,
+        S: float,
+        magnitude: float = 2.0 / 100.0,
+    ) -> int:
+        """Single FFN unit gated by marker AND op_gate, summing
+        ``source_dims`` (gate-relayed, weight 1.0 each) into ``target_dim``."""
+        ffn.W_up.data[unit, marker_dim] = S
+        ffn.W_up.data[unit, op_gate_dim] = S
+        ffn.b_up.data[unit] = -S * 1.5
+        for src in source_dims:
+            ffn.W_gate.data[unit, src] = 1.0
+        ffn.W_down.data[target_dim, unit] = magnitude
+        return unit + 1
+
+    @staticmethod
+    def opcode_gated_pc_override(
+        ffn,
+        *,
+        unit: int,
+        op_gate_dim: int,
+        mark_pc_dim: int,
+        target_pc_lo_dim: int,
+        target_pc_hi_dim: int,
+        source_lo_dim: int,
+        source_hi_dim: int,
+        S: float,
+        extra_blockers=None,
+    ) -> int:
+        """Generate 64 FFN units (32 cancel + 32 write) implementing an
+        opcode-gated PC override at the PC marker."""
+        T = 4.5
+        blockers = list(extra_blockers) if extra_blockers else []
+
+        # === Cancel phase (32 units): clear OUTPUT_LO/HI ===
+        for k in range(16):
+            ffn.W_up.data[unit, mark_pc_dim] = S
+            ffn.W_up.data[unit, op_gate_dim] = S
+            for d, w in blockers:
+                ffn.W_up.data[unit, d] = w
+            ffn.b_up.data[unit] = -S * T
+            ffn.W_gate.data[unit, target_pc_lo_dim + k] = -1.0
+            ffn.W_down.data[target_pc_lo_dim + k, unit] = 2.0 / S
+            unit += 1
+        for k in range(16):
+            ffn.W_up.data[unit, mark_pc_dim] = S
+            ffn.W_up.data[unit, op_gate_dim] = S
+            for d, w in blockers:
+                ffn.W_up.data[unit, d] = w
+            ffn.b_up.data[unit] = -S * T
+            ffn.W_gate.data[unit, target_pc_hi_dim + k] = -1.0
+            ffn.W_down.data[target_pc_hi_dim + k, unit] = 2.0 / S
+            unit += 1
+        # === Write phase (32 units): copy source -> OUTPUT ===
+        for k in range(16):
+            ffn.W_up.data[unit, mark_pc_dim] = S
+            ffn.W_up.data[unit, op_gate_dim] = S
+            for d, w in blockers:
+                ffn.W_up.data[unit, d] = w
+            ffn.b_up.data[unit] = -S * T
+            ffn.W_gate.data[unit, source_lo_dim + k] = 1.0
+            ffn.W_down.data[target_pc_lo_dim + k, unit] = 2.0 / S
+            unit += 1
+        for k in range(16):
+            ffn.W_up.data[unit, mark_pc_dim] = S
+            ffn.W_up.data[unit, op_gate_dim] = S
+            for d, w in blockers:
+                ffn.W_up.data[unit, d] = w
+            ffn.b_up.data[unit] = -S * T
+            ffn.W_gate.data[unit, source_hi_dim + k] = 1.0
+            ffn.W_down.data[target_pc_hi_dim + k, unit] = 2.0 / S
+            unit += 1
+        return unit
+
+    @staticmethod
+    def byte_passthrough_chain(
+        attn,
+        *,
+        head_idx: int,
+        source_marker_dim: int,
+        target_marker_dim: int,
+        value_lo_dim: int,
+        value_hi_dim: int,
+        suppress_op_dims,
+        S: float,
+        HD: int,
+        alibi_slope: float = 1.0,
+    ) -> None:
+        """Configure a full attention head implementing AX-style byte
+        passthrough across steps via shifted byte matching (Q byte K -> K
+        byte K+1 of prev step)."""
+        L = S
+        base = head_idx * HD
+
+        # Q dim 0: IS_BYTE AND HAS_SE, suppressed by op flags, threshold -3.5L
+        attn.W_q.data[base + 0, BD.IS_BYTE] = L * 3
+        attn.W_q.data[base + 0, BD.HAS_SE] = L
+        for d in suppress_op_dims:
+            attn.W_q.data[base + 0, d] = -L * 3
+        attn.W_q.data[base + 0, BD.CONST] = -L * 3.5
+
+        # Q dim 1: target marker discrimination
+        attn.W_q.data[base + 1, target_marker_dim] = L
+        attn.W_q.data[base + 1, BD.CONST] = -L / 2
+
+        # Q dim 2: suppress byte 3 (predicts next register's marker)
+        attn.W_q.data[base + 2, BD.BYTE_INDEX_3] = -L
+        attn.W_q.data[base + 2, BD.CONST] = L / 2
+
+        # K dim 0: IS_BYTE
+        attn.W_k.data[base + 0, BD.IS_BYTE] = L
+        # K dim 1: source marker (only target-register bytes are strong K)
+        attn.W_k.data[base + 1, source_marker_dim] = L
+        # K dim 2: suppress byte 0 in K (not a valid target for shifted matching)
+        attn.W_k.data[base + 2, BD.BYTE_INDEX_0] = -L
+        attn.W_k.data[base + 2, BD.CONST] = L / 2
+
+        # Shifted byte matching: Q byte K -> K byte K+1 of prev step
+        attn.W_q.data[base + 3, BD.BYTE_INDEX_0] = L
+        attn.W_k.data[base + 3, BD.BYTE_INDEX_1] = L
+        attn.W_q.data[base + 4, BD.BYTE_INDEX_1] = L
+        attn.W_k.data[base + 4, BD.BYTE_INDEX_2] = L
+        attn.W_q.data[base + 5, BD.BYTE_INDEX_2] = L
+        attn.W_k.data[base + 5, BD.BYTE_INDEX_3] = L
+
+        # Gate dim 33: hard AND of target_marker AND HAS_SE (kills leakage)
+        attn.W_q.data[base + 33, BD.CONST] = -20000.0
+        attn.W_q.data[base + 33, target_marker_dim] = 10000.0
+        attn.W_q.data[base + 33, BD.HAS_SE] = 10000.0
+        attn.W_k.data[base + 33, BD.CONST] = 5.0
+
+        # V: copy 16 lo + 16 hi nibbles
+        for k in range(16):
+            attn.W_v.data[base + k, value_lo_dim + k] = 1.0
+            attn.W_v.data[base + 16 + k, value_hi_dim + k] = 1.0
+
+        # O: write to OUTPUT_LO/HI at strength 2.0
+        for k in range(16):
+            attn.W_o.data[BD.OUTPUT_LO + k, base + k] = 2.0
+            attn.W_o.data[BD.OUTPUT_HI + k, base + 16 + k] = 2.0
+
+        # Optional ALiBi slope override for this head
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes.data[head_idx] = alibi_slope
+
+    @staticmethod
+    def register_increment_unit(
+        ffn,
+        *,
+        unit: int,
+        register_marker_dim: int,
+        op_gate_dim: int,
+        embed_lo_dim: int,
+        embed_hi_dim: int,
+        output_lo_dim: int,
+        output_hi_dim: int,
+        increment: int,
+        S: float,
+        op_strength: float = 1.0,
+    ) -> int:
+        """Generate 32 FFN units (16 lo + 16 hi nibble) implementing
+        register += increment at a marker token, with hi-nibble carry.
+
+        Companion to :meth:`register_decrement_unit` -- same shape, opposite
+        direction.
+        """
+        T = 1.5
+        # Lo nibble: shifted copy + cancel identity
+        for k in range(16):
+            new_k = (k + increment) % 16
+            ffn.W_up.data[unit, op_gate_dim] = S * op_strength
+            ffn.W_up.data[unit, register_marker_dim] = S
+            ffn.b_up.data[unit] = -S * T
+            ffn.W_gate.data[unit, embed_lo_dim + k] = 1.0
+            ffn.W_down.data[output_lo_dim + new_k, unit] = 2.0 / S
+            ffn.W_down.data[output_lo_dim + k, unit] += -2.0 / S  # cancel identity
+            unit += 1
+        # Hi nibble: carry when old lo >= 8 (adding 8 overflows lo nibble)
+        for k in range(16):
+            new_k_carry = (k + 1) % 16
+            ffn.W_up.data[unit, op_gate_dim] = S * op_strength
+            ffn.W_up.data[unit, register_marker_dim] = S
+            ffn.b_up.data[unit] = -S * T
+            ffn.W_gate.data[unit, embed_hi_dim + k] = 1.0
+            for lo_bit in range(8):
+                ffn.W_gate.data[unit, embed_lo_dim + lo_bit] = -1.0
+            ffn.W_down.data[output_hi_dim + new_k_carry, unit] = 2.0 / S
+            ffn.W_down.data[output_hi_dim + k, unit] += -2.0 / S  # cancel identity
+            unit += 1
+        return unit
+
 
 # Convenience aliases
 P = Primitives
