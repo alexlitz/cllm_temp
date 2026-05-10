@@ -160,6 +160,7 @@ def make_layer2_mem_byte_flags_op() -> Operation:
                 "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -808,6 +809,7 @@ def make_layer2_threshold_attn_op() -> Operation:
         writes={"L2H0"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 

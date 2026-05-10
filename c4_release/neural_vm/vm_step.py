@@ -1832,20 +1832,15 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # in unified_compiler/migrated_ops.py).
 
     # ===== LAYER 2: Threshold 5.5 + MEM byte position flags =====
-    attn2 = model.blocks[2].attn
-    # ALiBi-specific: set slopes for threshold heads
-    if hasattr(attn2, 'alibi_slopes') and attn2.alibi_slopes is not None:
-        attn2.alibi_slopes.fill_(ALIBI_S)
-    _set_threshold_attn(attn2, [5.5], [BD.L2H0], ALIBI_S, HD, heads=[0])
-
-    # Conversational I/O: Lookback detection head (detect prev token type)
+    # Migrated: L2 threshold attention (head 0) and MEM byte-flags FFN are now
+    # baked via the compiler dispatch (see make_layer2_threshold_attn_op,
+    # make_layer2_mem_byte_flags_op in unified_compiler/migrated_ops.py).
+    # Conversational I/O lookback head remains here (gated, not migrated).
     if enable_conversational_io:
+        attn2 = model.blocks[2].attn
         if hasattr(attn2, 'alibi_slopes') and attn2.alibi_slopes is not None:
             attn2.alibi_slopes[1] = 10.0  # Steep slope to favor most recent token
         _set_lookback_detection_head(attn2, S, BD, HD)
-
-    ffn2 = model.blocks[2].ffn
-    _set_layer2_mem_byte_flags(ffn2, S, BD)
 
     # ===== LAYER 3: Register carry-forward (PC, AX, SP, BP) + PC update =====
     # All carry-forwards in one layer so values are available for later layers.
