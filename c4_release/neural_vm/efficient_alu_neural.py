@@ -490,13 +490,177 @@ class ALUAndOrXor(PureNeuralALU):
         super().__init__(S, BD, operations='bitwise')
 
 
+class _MulPipelineState:
+    """Mutable state passed between Sequential stages of ``FlattenedALUMul``.
+
+    Each stage reads/writes named tensor fields and returns ``self`` so it
+    can be chained inside ``nn.Sequential``. Using an object (rather than a
+    bare tensor tuple) keeps each stage's I/O contract uniform — every stage
+    in the pipeline has the signature ``forward(state) -> state`` — which is
+    exactly what ``nn.Sequential`` requires.
+
+    Fields populated by stage:
+      - ``BDToGEStage``        sets ``x_bd_in``, ``x_ge_flat``, ``x_mul``
+      - mul FFN stages         update ``x_mul``
+      - ``MulCombineStage``    sets ``x_ge_out``, ``opcode_mask``
+      - ``GEToBDStage``        sets ``x_bd_out``
+    """
+
+    __slots__ = (
+        'x_bd_in', 'x_ge_flat', 'x_mul',
+        'x_ge_out', 'opcode_mask', 'x_bd_out',
+    )
+
+    def __init__(self):
+        self.x_bd_in = None
+        self.x_ge_flat = None
+        self.x_mul = None
+        self.x_ge_out = None
+        self.opcode_mask = None
+        self.x_bd_out = None
+
+
+class _BDToGEStage(nn.Module):
+    """Pipeline stage 0 (phase=11.0): BD → GE format conversion.
+
+    Wraps ``BDToGEConverter`` with the uniform ``forward(state) -> state``
+    contract used by every stage in ``FlattenedALUMul.pipeline``. Stashes
+    ``x_bd_in`` (for later AX masking + as the base for ``GEToBDStage``) and
+    initialises ``x_mul`` (the rolling MUL workspace) and ``x_ge_flat`` (the
+    snapshot used for opcode/AX gating after the 7 mul layers run).
+    """
+
+    def __init__(self, BD, ge: GenericE):
+        super().__init__()
+        self.BD = BD
+        self.ge = ge
+        self.bd_to_ge = BDToGEConverter(BD, ge)
+
+    def forward(self, state: _MulPipelineState) -> _MulPipelineState:
+        x_bd = state.x_bd_in
+        B, seq_len, _ = x_bd.shape
+        x_ge = self.bd_to_ge(x_bd)  # [B, seq_len, 8, 160]
+        x_ge_flat = x_ge.view(B * seq_len, 8, self.ge.DIM)
+        state.x_ge_flat = x_ge_flat
+        state.x_mul = x_ge_flat.clone()
+        return state
+
+
+class _MulFFNStage(nn.Module):
+    """Pipeline stage wrapper around one mul-pipeline FFN.
+
+    Holds a single mul sub-FFN (e.g. ``SchoolbookFFN``, ``CarryPassFFN``,
+    ``MulGenPropFFN``, ...) and applies it to ``state.x_mul``. The wrapped
+    FFN itself remains a vanilla ``nn.Module`` with its own ``W_up`` /
+    ``W_gate`` / ``W_down`` parameters — this class is just the adapter
+    that lets it slot into the uniform Sequential pipeline contract.
+    """
+
+    def __init__(self, sub_ffn: nn.Module):
+        super().__init__()
+        self.sub_ffn = sub_ffn
+
+    def forward(self, state: _MulPipelineState) -> _MulPipelineState:
+        state.x_mul = self.sub_ffn(state.x_mul)
+        return state
+
+
+class _MulCombineStage(nn.Module):
+    """Pipeline stage that merges the mul workspace into the GE output.
+
+    Computes the opcode-gated MUL result, restricts OUTPUT writes to AX
+    marker positions, and reshapes back to ``[B, seq_len, 8, DIM]``. Owns
+    no parameters — it is pure tensor algebra (broadcasted multiplies,
+    reshape, threshold mask) and exists as its own ``nn.Module`` so the
+    Sequential pipeline has a single, statically-defined chain of modules
+    rather than ad-hoc Python in ``forward``.
+    """
+
+    def __init__(self, BD, ge: GenericE):
+        super().__init__()
+        self.BD = BD
+        self.ge = ge
+
+    def forward(self, state: _MulPipelineState) -> _MulPipelineState:
+        x_bd = state.x_bd_in
+        x_ge_flat = state.x_ge_flat
+        x_mul = state.x_mul
+        BD = self.BD
+        ge = self.ge
+
+        x_ge_out = x_ge_flat.clone()
+
+        # FIX 2026-05-06: Normalize opcode values to 0/1.
+        op_mul = (x_ge_flat[:, 0, ge.OP_START + 27] > 0.1).float()
+
+        x_ge_out[:, :, ge.RESULT] = x_mul[:, :, ge.RESULT] * op_mul[:, None]
+
+        B, seq_len, _ = x_bd.shape
+        x_ge_out = x_ge_out.view(B, seq_len, 8, ge.DIM)
+        opcode_mask = op_mul.view(B, seq_len)
+
+        # Only write OUTPUT at AX marker positions (MARK_AX > 0.5).
+        mark_ax = x_bd[:, :, BD.MARK_AX]
+        opcode_mask = opcode_mask * (mark_ax > 0.5).float()
+
+        state.x_ge_out = x_ge_out
+        state.opcode_mask = opcode_mask
+        return state
+
+
+class _GEToBDStage(nn.Module):
+    """Final pipeline stage (phase=12.3): GE → BD conversion.
+
+    Wraps ``GEToBDConverter`` and stores its ``[B, seq_len, 512]`` output in
+    ``state.x_bd_out``, which ``FlattenedALUMul.forward`` then returns.
+    """
+
+    def __init__(self, BD, ge: GenericE, S: float):
+        super().__init__()
+        self.BD = BD
+        self.ge = ge
+        self.S = S
+        self.ge_to_bd = GEToBDConverter(BD, ge, S)
+
+    def forward(self, state: _MulPipelineState) -> _MulPipelineState:
+        state.x_bd_out = self.ge_to_bd(
+            state.x_ge_out, state.x_bd_in, opcode_mask=state.opcode_mask,
+        )
+        return state
+
+
 class FlattenedALUMul(nn.Module):
-    """Flattened (compiler-baked) MUL ALU.
+    """Flattened (compiler-baked) MUL ALU — Sequential of vanilla stages.
 
     Byte-identical to ``ALUMul.forward`` (= ``PureNeuralALU(operations='mul').forward``)
     but exposes the BD↔GE converters and the 7 sub-FFN MUL pipeline stages as
     individually-installable submodules so the unified compiler can bake each
     stage as a discrete ``Operation``.
+
+    The pipeline is materialised as a single ``nn.Sequential`` whose stages
+    each implement ``forward(state) -> state``. Once all 9 compiler ops have
+    run, ``self.pipeline`` is::
+
+        nn.Sequential(
+            _BDToGEStage,                  # phase=11.0
+            _MulFFNStage(SchoolbookFFN),   # phase=11.1
+            _MulFFNStage(CarryPassFFN(0)), # phase=11.2
+            _MulFFNStage(CarryPassFFN(1)), # phase=11.3
+            _MulFFNStage(CarryPassFFN(2)), # phase=11.4
+            _MulFFNStage(MulGenPropFFN),   # phase=12.0
+            _MulFFNStage(MulBinaryLookaheadFFN),  # phase=12.1
+            _MulFFNStage(MulFinalCorrectionFFN),  # phase=12.2
+            _MulCombineStage,              # opcode/AX gating + reshape
+            _GEToBDStage,                  # phase=12.3
+        )
+
+    ``forward`` is therefore just::
+
+        state = _MulPipelineState(); state.x_bd_in = x_bd
+        return self.pipeline(state).x_bd_out
+
+    No Python control flow over the sub-modules: the chaining is the
+    declarative ``nn.Sequential`` itself.
 
     Sub-stages, installed by 9 compiler block ops:
 
@@ -521,6 +685,11 @@ class FlattenedALUMul(nn.Module):
     Forward replicates the ``PureNeuralALU`` mul branch byte-for-byte
     (same 0.1-threshold opcode normalization, same MARK_AX-only OUTPUT
     gating).
+
+    Backward-compat properties ``bd_to_ge``, ``ge_to_bd``, and
+    ``mul_layers`` remain readable so existing inspectors / tests continue
+    to work; they are computed from the corresponding stages in
+    ``self._stages``.
     """
 
     def __init__(self, S, BD):
@@ -529,28 +698,55 @@ class FlattenedALUMul(nn.Module):
         self.BD = BD
         self.ge = GenericE(NIBBLE)
 
-        # Sub-stages filled in by 9 compiler ops. Each install_* mutates one
-        # slot or appends to mul_layers. Forward raises if any is missing so
-        # a partial bake fails loudly.
-        self.bd_to_ge = None        # phase=11.0 — BDToGEConverter
-        # mul_layers fills in append order across phases 11.1 .. 12.2.
-        self.mul_layers = nn.ModuleList()
-        self.ge_to_bd = None        # phase=12.3 — GEToBDConverter
+        # Each install_* call appends the corresponding stage to _stages.
+        # Once all 9 stages are installed, ``pipeline`` is a single
+        # nn.Sequential of vanilla nn.Modules — no Python control flow over
+        # sub-modules in forward().
+        self._stages = nn.ModuleList()
+        self.pipeline = None  # nn.Sequential, built lazily after install_getobd
+
+    # --- Backward-compat property accessors (read-only views) ---------
+
+    @property
+    def bd_to_ge(self):
+        """Return the ``BDToGEConverter`` instance, or ``None`` if not yet installed."""
+        for stage in self._stages:
+            if isinstance(stage, _BDToGEStage):
+                return stage.bd_to_ge
+        return None
+
+    @property
+    def ge_to_bd(self):
+        """Return the ``GEToBDConverter`` instance, or ``None`` if not yet installed."""
+        for stage in self._stages:
+            if isinstance(stage, _GEToBDStage):
+                return stage.ge_to_bd
+        return None
+
+    @property
+    def mul_layers(self):
+        """Return the list of MUL sub-FFNs in install order."""
+        return [s.sub_ffn for s in self._stages if isinstance(s, _MulFFNStage)]
 
     # --- Per-stage installers (called by compiler ops) -----------------
 
     def install_bdtoge(self):
-        """phase=11.0: install BD → GE converter."""
-        self.bd_to_ge = BDToGEConverter(self.BD, self.ge)
+        """phase=11.0: install BD → GE converter as the first pipeline stage."""
+        assert len(self._stages) == 0, (
+            f"Expected bd_to_ge to be the first stage; "
+            f"already installed {len(self._stages)} stages"
+        )
+        self._stages.append(_BDToGEStage(self.BD, self.ge))
 
     def install_schoolbook(self):
         """phase=11.1: append the schoolbook partial-product stage."""
         from .alu.ops.mul import SchoolbookFFN
-        assert len(self.mul_layers) == 0, (
-            f"Expected schoolbook to be the first mul layer; "
-            f"already installed {len(self.mul_layers)} layers"
+        # Stages so far: [_BDToGEStage] (1 stage).
+        assert len(self._stages) == 1, (
+            f"Expected schoolbook to be the second stage; "
+            f"already installed {len(self._stages)} stages"
         )
-        self.mul_layers.append(SchoolbookFFN(self.ge, opcode=27))
+        self._stages.append(_MulFFNStage(SchoolbookFFN(self.ge, opcode=27)))
 
     def install_carrypass(self, pass_idx: int):
         """phase=11.2/11.3/11.4: append the i-th carry pass (i=0,1,2)."""
@@ -560,59 +756,78 @@ class FlattenedALUMul(nn.Module):
             f"NIBBLE config has {len(passes)} carry passes; "
             f"asked for pass_idx={pass_idx}"
         )
-        # Slot index in mul_layers: 1 (schoolbook) + pass_idx
-        expected_len = 1 + pass_idx
-        assert len(self.mul_layers) == expected_len, (
-            f"Expected mul_layers length {expected_len} before installing "
-            f"carrypass {pass_idx}; got {len(self.mul_layers)}"
+        # Stages so far: [_BDToGEStage, schoolbook, carry_0..carry_{pass_idx-1}]
+        # → 2 + pass_idx total before this install.
+        expected_len = 2 + pass_idx
+        assert len(self._stages) == expected_len, (
+            f"Expected {expected_len} stages before installing "
+            f"carrypass {pass_idx}; got {len(self._stages)}"
         )
-        self.mul_layers.append(
+        self._stages.append(_MulFFNStage(
             CarryPassFFN(self.ge, opcode=27,
                          max_carry=passes[pass_idx], pass_idx=pass_idx)
-        )
+        ))
 
     def install_genprop(self):
         """phase=12.0: append the gen/prop stage."""
         from .alu.ops.mul import MulGenPropFFN, _compute_carry_passes
         n_passes = len(_compute_carry_passes(self.ge.config))
-        expected_len = 1 + n_passes
-        assert len(self.mul_layers) == expected_len, (
-            f"Expected mul_layers length {expected_len} before genprop; "
-            f"got {len(self.mul_layers)}"
+        # Stages so far: bdtoge + schoolbook + n_passes carry = 2 + n_passes.
+        expected_len = 2 + n_passes
+        assert len(self._stages) == expected_len, (
+            f"Expected {expected_len} stages before genprop; "
+            f"got {len(self._stages)}"
         )
-        self.mul_layers.append(MulGenPropFFN(self.ge, opcode=27))
+        self._stages.append(_MulFFNStage(MulGenPropFFN(self.ge, opcode=27)))
 
     def install_binarylookahead(self):
         """phase=12.1: append the binary carry-lookahead stage."""
         from .alu.ops.mul import MulBinaryLookaheadFFN, _compute_carry_passes
         n_passes = len(_compute_carry_passes(self.ge.config))
-        expected_len = 2 + n_passes
-        assert len(self.mul_layers) == expected_len, (
-            f"Expected mul_layers length {expected_len} before lookahead; "
-            f"got {len(self.mul_layers)}"
+        expected_len = 3 + n_passes
+        assert len(self._stages) == expected_len, (
+            f"Expected {expected_len} stages before lookahead; "
+            f"got {len(self._stages)}"
         )
-        self.mul_layers.append(MulBinaryLookaheadFFN(self.ge, opcode=27))
+        self._stages.append(_MulFFNStage(
+            MulBinaryLookaheadFFN(self.ge, opcode=27)
+        ))
 
     def install_finalcorrection(self):
         """phase=12.2: append the final-correction stage."""
         from .alu.ops.mul import MulFinalCorrectionFFN, _compute_carry_passes
         n_passes = len(_compute_carry_passes(self.ge.config))
-        expected_len = 3 + n_passes
-        assert len(self.mul_layers) == expected_len, (
-            f"Expected mul_layers length {expected_len} before "
-            f"final-correction; got {len(self.mul_layers)}"
+        expected_len = 4 + n_passes
+        assert len(self._stages) == expected_len, (
+            f"Expected {expected_len} stages before "
+            f"final-correction; got {len(self._stages)}"
         )
-        self.mul_layers.append(MulFinalCorrectionFFN(self.ge, opcode=27))
+        self._stages.append(_MulFFNStage(
+            MulFinalCorrectionFFN(self.ge, opcode=27)
+        ))
 
     def install_getobd(self):
-        """phase=12.3: install GE → BD converter."""
-        self.ge_to_bd = GEToBDConverter(self.BD, self.ge, self.S)
+        """phase=12.3: install GE → BD converter and seal the Sequential."""
+        from .alu.ops.mul import _compute_carry_passes
+        n_passes = len(_compute_carry_passes(self.ge.config))
+        # bdtoge + schoolbook + n_passes carry + genprop + lookahead +
+        # finalcorrection = 5 + n_passes.
+        expected_len = 5 + n_passes
+        assert len(self._stages) == expected_len, (
+            f"Expected {expected_len} stages before ge_to_bd; "
+            f"got {len(self._stages)}"
+        )
+        # Append combine + getobd, then materialise the Sequential.
+        self._stages.append(_MulCombineStage(self.BD, self.ge))
+        self._stages.append(_GEToBDStage(self.BD, self.ge, self.S))
+        self.pipeline = nn.Sequential(*self._stages)
 
     # --- Forward (byte-identical to PureNeuralALU mul branch) ----------
 
     def forward(self, x_bd):
-        if (self.bd_to_ge is None or self.ge_to_bd is None or
-                len(self.mul_layers) == 0):
+        if self.pipeline is None:
+            # Reproduce the previous "missing stages" diagnostic so partial
+            # bakes still fail loudly.
             missing = []
             if self.bd_to_ge is None:
                 missing.append('bd_to_ge')
@@ -626,40 +841,10 @@ class FlattenedALUMul(nn.Module):
                 "forward()."
             )
 
-        B, seq_len, _ = x_bd.shape
-        BD = self.BD
-
-        # Convert BD → GE format
-        x_ge = self.bd_to_ge(x_bd)  # [B, seq_len, 8, 160]
-        x_ge_flat = x_ge.view(B * seq_len, 8, self.ge.DIM)
-
-        x_ge_out = x_ge_flat.clone()
-
-        # Run 7-stage MUL pipeline (schoolbook + 3 carry + genprop +
-        # lookahead + final-correction).
-        x_mul = x_ge_flat.clone()
-        for layer in self.mul_layers:
-            x_mul = layer(x_mul)
-
-        # FIX 2026-05-06: Normalize opcode values to 0/1.
-        op_mul = (x_ge_flat[:, 0, self.ge.OP_START + 27] > 0.1).float()
-
-        x_ge_out[:, :, self.ge.RESULT] = (
-            x_mul[:, :, self.ge.RESULT] * op_mul[:, None]
-        )
-
-        opcode_mask_flat = op_mul
-
-        # Reshape back
-        x_ge_out = x_ge_out.view(B, seq_len, 8, self.ge.DIM)
-        opcode_mask = opcode_mask_flat.view(B, seq_len)
-
-        # Only write OUTPUT at AX marker positions (MARK_AX > 0.5).
-        mark_ax = x_bd[:, :, BD.MARK_AX]
-        opcode_mask = opcode_mask * (mark_ax > 0.5).float()
-
-        x_bd_out = self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
-        return x_bd_out
+        state = _MulPipelineState()
+        state.x_bd_in = x_bd
+        out_state = self.pipeline(state)
+        return out_state.x_bd_out
 
     # Stub methods for compatibility with vm_step.py (mirror PureNeuralALU).
     def compact(self, block_size=1):
