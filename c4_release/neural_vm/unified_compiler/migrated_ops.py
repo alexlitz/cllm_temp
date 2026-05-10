@@ -644,11 +644,29 @@ def make_layer13_mem_addr_gather_op() -> Operation:
     )
 
 
-def make_layer13_shifts_op() -> Operation:
-    """L13 FFN: SHL/SHR shifts."""
-    def bake(ffn, dim_positions, S):
-        from ..vm_step import _set_layer13_shifts
-        _set_layer13_shifts(ffn, S, _as_setdim_proxy(dim_positions))
+def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
+    """L13 FFN: SHL/SHR shifts.
+
+    In ``alu_mode='lookup'`` we bake the standard SHL/SHR lookup table via
+    ``_set_layer13_shifts`` into a fresh PureFFN block. In
+    ``alu_mode='efficient'`` SHL/SHR are handled by the dedicated
+    :class:`ALUShift` neural module attached to the original L13 block by
+    ``set_vm_weights``. Running the lookup-table bake in efficient mode
+    causes a *second* SHL/SHR producer to overwrite ALUShift's correct
+    output downstream, so we install a no-op operation instead.
+    """
+    if alu_mode not in ("lookup", "efficient"):
+        raise ValueError(
+            f"alu_mode must be 'lookup' or 'efficient'; got {alu_mode!r}"
+        )
+
+    if alu_mode == "efficient":
+        def bake(ffn, dim_positions, S):
+            return  # ALUShift owns SHL/SHR in efficient mode.
+    else:
+        def bake(ffn, dim_positions, S):
+            from ..vm_step import _set_layer13_shifts
+            _set_layer13_shifts(ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer13_shifts",
@@ -1351,11 +1369,15 @@ def make_legacy_bake_op(
     )
 
 
-def all_core_ops() -> list:
+def all_core_ops(alu_mode: str = "lookup") -> list:
     """Return the full list of migrated core-VM operations.
 
     Doesn't include I/O, conversational, or tool-call operations (those need
     their own migration pass).
+
+    ``alu_mode`` is forwarded to ops whose bake action depends on whether the
+    legacy lookup ALU or the efficient neural ALU owns a given operation
+    (currently: SHL/SHR via ``make_layer13_shifts_op``).
     """
     return [
         make_layer0_threshold_attn_op(),
@@ -1391,7 +1413,7 @@ def all_core_ops() -> list:
         make_layer11_mul_partial_op(),
         make_layer12_mul_combine_op(),
         make_layer13_mem_addr_gather_op(),
-        make_layer13_shifts_op(),
+        make_layer13_shifts_op(alu_mode=alu_mode),
         make_layer14_mem_generation_op(),
         make_layer15_memory_lookup_op(),
         make_layer16_lev_routing_op(),
