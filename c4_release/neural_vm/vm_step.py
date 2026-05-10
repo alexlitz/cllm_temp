@@ -2248,7 +2248,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     ffn14 = model.blocks[14].ffn
     next_unit = _set_layer14_temp_clear(ffn14, S, BD)
     next_unit = _set_layer14_clear_addr_key_pollution(ffn14, S, BD, start_unit=next_unit)
-    _set_layer14_clear_output_corruption(ffn14, S, BD, start_unit=next_unit)
+    next_unit = _set_layer14_clear_output_corruption(ffn14, S, BD, start_unit=next_unit)
+    # FIX 2026-05-10: Cancel L14 attention's -115 OUTPUT corruption at MEM marker
+    # for OP_JSR/OP_ENT (no actual store; L14 attn fires anyway because MEM_STORE=2).
+    _set_layer14_clear_mem_marker_output(ffn14, S, BD, start_unit=next_unit)
 
     # ===== LAYER 15: Memory lookup (softmax1 + ALiBi) =====
     # The 8->12 head LEV resize is a compiler block op now
@@ -4567,6 +4570,50 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
         ffn.b_up[unit] = -S * T
         ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0  # Use AX_CARRY (no TEMP overlap)
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
+        unit += 1
+
+    # === JSR: AX_CARRY → OUTPUT (preserves AX through JSR) ===
+    # FIX 2026-05-10: Without an OP_JSR routing here, OUTPUT at the AX marker
+    # for a JSR step is left at L3's default (cancel-only), which makes AX byte
+    # 0 prediction generate spurious low-order bytes (e.g. 6 for the JSR target
+    # `JSR 18` instead of the preserved AX value 0). The malformed AX bytes
+    # then derail the rest of the step structure: at MEM marker the L14 attn
+    # writes -115 to OUTPUT[0..15], byte tokens get logits ≈ -1100, and the
+    # marker logits (all -10) win the argmax, emitting REG_PC at MEM byte 0.
+    # That spurious PC marker re-anchors the L0 threshold heads on PC instead
+    # of MEM, so H[MEM] no longer fires at d=8 → NEXT_SE stays 0 → STEP_END is
+    # not emitted at the SE slot. Mirror the EXIT/NOP/JMP routing pattern so
+    # AX is preserved across JSR.
+    #
+    # Unlike OP_IMM/OP_EXIT/OP_NOP/OP_JMP, OP_JSR is also relayed to SP/STACK0
+    # markers (CMP[4] / OP_JSR pathway used by L6 head 6 + L7 SP gather). So we
+    # add explicit MARK_SP/BP/STACK0/MEM blockers to keep this unit firing only
+    # at MARK_AX (where MARK_AX=1 and the rest are 0).
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_JSR] = S
+        ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8  # Block at PC marker (OP_JSR active via L5)
+        ffn.W_up[unit, BD.MARK_SP] = -S * 8  # Block at SP marker (OP_JSR relayed)
+        ffn.W_up[unit, BD.MARK_BP] = -S * 8  # Block at BP marker
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 8  # Block at STACK0 (OP_JSR relayed)
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 8  # Block at MEM marker
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
+        ffn.b_up[unit] = -S * T
+        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
+        unit += 1
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_JSR] = S
+        ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8
+        ffn.W_up[unit, BD.MARK_SP] = -S * 8
+        ffn.W_up[unit, BD.MARK_BP] = -S * 8
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 8
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 8
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10
+        ffn.b_up[unit] = -S * T
+        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
@@ -7834,6 +7881,79 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
         ffn.W_down[output_dim, unit] = 50.0 / S
 
         unit += 1
+
+    return unit
+
+
+def _set_layer14_clear_mem_marker_output(ffn, S, BD, start_unit=0):
+    """L14 FFN: Clear OUTPUT at MEM marker for OP_JSR/OP_ENT steps.
+
+    FIX 2026-05-10: For non-store opcodes, OUTPUT at MEM marker is left near 0
+    by L14 attention (which is gated on MEM_STORE). For store opcodes (PSH/SI/
+    SC), L14 attention writes the addr-byte-0 source into OUTPUT at MEM marker
+    so the next position (addr_b0) inherits the correct nibble. This works for
+    PSH/SI/SC.
+
+    But for JSR/ENT (which set MEM_STORE=2 via L6 head 6 + L7 head 7 self-relay
+    of the MEM_STORE flag), the L14 attention scores explode (Q[34]=500 ⇒ score
+    312.5) AND multiple heads end up firing self-attention on the MEM marker
+    itself. Each head's V[0]=CONST contributes -1 to OUTPUT_LO[0]/HI[0] via the
+    L3-default cancel; the dim-1+k V's read OUTPUT_LO/HI of the MEM marker
+    (already non-zero from L3+L6 carry) and re-circulate them; the net effect
+    is that all 16 OUTPUT_LO and 16 OUTPUT_HI dims end up at ≈ -115 (per
+    measurement). This makes every byte token's logit ≈ -1100 (vs marker tokens
+    at -10), so the next position (addr_b0) emits a marker token and the rest
+    of the step structure collapses, breaking the L0 NEXT_SE detection at d=8
+    from MEM. As a result, STEP_END is never emitted and the autoregressive
+    loop hangs.
+
+    Fix: At MEM marker for OP_JSR or OP_ENT, add a positive clearing offset to
+    every OUTPUT_LO/OUTPUT_HI dim, neutralising the L14 attention corruption so
+    byte tokens (logit ≈ -5 with cleared OUTPUT) win over markers (logit ≈ -10)
+    at the next position. The actual MEM addr/val byte values for JSR/ENT come
+    from later layers (L15 memory lookup writes the resolved bytes into
+    OUTPUT at the addr/val byte positions, not at the marker itself).
+    """
+    unit = start_unit
+
+    # Activation conditions:
+    #   - MARK_MEM = 1 (only at MEM marker token)
+    #   - OP_JSR or OP_ENT relayed to MEM marker via L6 head 6 + L7 head 7
+    # b_up = -S * 1.5 → fires only when both MARK_MEM and OP_JSR (or OP_ENT) active.
+    # We want to ADD ≈ +115 per OUTPUT dim to cancel the L14 attention corruption.
+    # Empirically the silu activation is ~152 (varies with OP_JSR strength which
+    # is ~2-8 depending on relays), so OFFSET ≈ 115/152 / S = 0.76/S works.
+    OFFSET = 76.0 / S
+
+    for op_dim in (BD.OP_JSR, BD.OP_ENT):
+        for k in range(16):
+            ffn.W_up[unit, op_dim] = S / 5  # ≈ S (relay value 5 × S/5)
+            ffn.W_up[unit, BD.MARK_MEM] = S
+            # Strong blockers at non-MEM markers + byte positions to keep this
+            # firing only at the MEM marker token itself (not byte positions).
+            ffn.W_up[unit, BD.IS_BYTE] = -S * 10
+            ffn.W_up[unit, BD.MARK_PC] = -S * 10
+            ffn.W_up[unit, BD.MARK_AX] = -S * 10
+            ffn.W_up[unit, BD.MARK_SP] = -S * 10
+            ffn.W_up[unit, BD.MARK_BP] = -S * 10
+            ffn.W_up[unit, BD.MARK_STACK0] = -S * 10
+            ffn.b_up[unit] = -S * 1.5
+            ffn.W_gate[unit, BD.CONST] = 1.0
+            ffn.W_down[BD.OUTPUT_LO + k, unit] = OFFSET
+            unit += 1
+        for k in range(16):
+            ffn.W_up[unit, op_dim] = S / 5
+            ffn.W_up[unit, BD.MARK_MEM] = S
+            ffn.W_up[unit, BD.IS_BYTE] = -S * 10
+            ffn.W_up[unit, BD.MARK_PC] = -S * 10
+            ffn.W_up[unit, BD.MARK_AX] = -S * 10
+            ffn.W_up[unit, BD.MARK_SP] = -S * 10
+            ffn.W_up[unit, BD.MARK_BP] = -S * 10
+            ffn.W_up[unit, BD.MARK_STACK0] = -S * 10
+            ffn.b_up[unit] = -S * 1.5
+            ffn.W_gate[unit, BD.CONST] = 1.0
+            ffn.W_down[BD.OUTPUT_HI + k, unit] = OFFSET
+            unit += 1
 
     return unit
 
