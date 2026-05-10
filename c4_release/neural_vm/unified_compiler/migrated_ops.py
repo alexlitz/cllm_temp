@@ -1775,6 +1775,36 @@ def setup_head_weights(head, dim_positions: Dict[str, int] = None) -> None:
             head.bias[Token.IO_STATE_EMIT_THINKING] = -20.0
 
 
+def make_io_putchar_routing_op() -> Operation:
+    """Bake L6 FFN PUTCHAR routing units (IO_IS_PUTCHAR + AX_CARRY -> OUTPUT).
+
+    Originally an inline call in `set_vm_weights`:
+        `_set_io_putchar_routing(ffn6, S, BD)`
+
+    Operates on `model.blocks[6].ffn` (L6 FFN). Modeled as kind="model" so we
+    can resolve `ffn6` from the model handle inside the bake_fn.
+
+    Phase 998: runs just BEFORE legacy_bake (999) so that the L6 FFN units we
+    program (starting at unit 1500) are present when `_right_size_ffns`
+    (called at the end of legacy_bake) prunes dead units. Running at phase
+    > 999 would write into already-rightsized FFN slots that no longer exist.
+    """
+    def bake(model, dim_positions, S):
+        from ..vm_step import _set_io_putchar_routing
+        proxy = _as_setdim_proxy(dim_positions)
+        _set_io_putchar_routing(model.blocks[6].ffn, S, proxy)
+
+    return Operation(
+        name="io_putchar_routing",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=998,
+        migrated=True,
+    )
+
+
 def make_head_bake_op() -> Operation:
     """Bake the output projection head: byte/marker token logits.
 
@@ -2474,6 +2504,9 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
         # FFN unit writes survive the rightsize pass at end of legacy_bake.
         make_function_call_weights_op(),
+        # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
+        # L6 FFN unit writes survive the rightsize pass at end of legacy_bake.
+        make_io_putchar_routing_op(),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),

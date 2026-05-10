@@ -1915,8 +1915,11 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         attn6.alibi_slopes[7] = 5.0  # JSR PC+5 relay: steep for head 7
     _set_opcode_relay_head(attn6, S, BD, HD)
 
-    # IO PUTCHAR routing (L6 FFN: sets IO_IS_PUTCHAR, routes AX → OUTPUT)
-    _set_io_putchar_routing(ffn6, S, BD)
+    # IO PUTCHAR routing (L6 FFN: sets IO_IS_PUTCHAR, routes AX → OUTPUT) —
+    # MIGRATED: now installed via `make_io_putchar_routing_op` in
+    # `unified_compiler/migrated_ops.py` (kind="model", phase=998 — runs just
+    # BEFORE this legacy_bake's _right_size_ffns so the FFN unit writes
+    # survive). Inline call removed to avoid double-bake.
 
     # Binary pop SP increment (L6 FFN: SP += 8 for binary pop ops)
     _set_binary_pop_sp_increment(ffn6, S, BD)
