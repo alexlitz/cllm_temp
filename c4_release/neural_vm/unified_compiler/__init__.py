@@ -20,13 +20,23 @@ from .compiler import UnifiedVMCompiler
 from .verification import Verifier
 from .layer_compiler import LayerCompiler, Operation, ModelLayout, build_model_from_layout
 
-# Optional imports: builder/ir modules may not be present in this checkout.
+# Optional imports: builder.py, ir.py, and opcodes.py are not tracked on every
+# branch (e.g. fresh worktrees off main). Guard so unified_compiler still imports
+# without these modules; downstream code that needs them can import directly.
 try:
-    from .builder import BuilderConfig, PruningConfig, IRBuilder
-    from .ir import CompilerIR, AttentionOp, FFNOp, LayerSpec
-    _HAVE_IR = True
+    from .builder import BuilderConfig, PruningConfig, IRBuilder  # noqa: F401
 except ImportError:
-    _HAVE_IR = False
+    pass
+
+try:
+    from .ir import CompilerIR, AttentionOp, FFNOp, LayerSpec  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    from .opcodes import *  # noqa: F401,F403
+except ImportError:
+    pass
 
 __all__ = [
     'Primitives',
@@ -38,6 +48,12 @@ __all__ = [
     'ModelLayout',
     'build_model_from_layout',
 ]
-if _HAVE_IR:
-    __all__ += ['BuilderConfig', 'PruningConfig', 'IRBuilder',
-                'CompilerIR', 'AttentionOp', 'FFNOp', 'LayerSpec']
+
+# Extend __all__ with optionally-imported names if they were successfully bound.
+for _name in (
+    'BuilderConfig', 'PruningConfig', 'IRBuilder',
+    'CompilerIR', 'AttentionOp', 'FFNOp', 'LayerSpec',
+):
+    if _name in globals():
+        __all__.append(_name)
+del _name
