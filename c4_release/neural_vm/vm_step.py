@@ -1974,12 +1974,12 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     _set_layer4_ffn(ffn4, S, BD)
 
     # ===== LAYER 5: Bytecode fetch (imm + opcode) =====
-    attn5 = model.blocks[5].attn
-    if hasattr(attn5, 'alibi_slopes') and attn5.alibi_slopes is not None:
-        attn5.alibi_slopes.fill_(0.1)
-    _set_layer5_fetch(attn5, S, BD, HD)
-    ffn5 = model.blocks[5].ffn
-    _set_opcode_decode_ffn(ffn5, S, BD)
+    # Migrated to compiler block ops `layer5_fetch` and `opcode_decode_ffn`
+    # (both phase=5, layer_idx=5) which bake the L5 attention fetch heads
+    # (incl. alibi_slopes=0.1) and L5 FFN opcode decoder via
+    # build_model_from_layout. The companion `_layer5_fetch_dep_anchor` and
+    # `_opcode_decode_ffn_dep_anchor` ops preserve the LayerCompiler dep
+    # graph slot count.
 
     # ===== LAYER 6: JMP/EXIT relay attention + output routing =====
     attn6 = model.blocks[6].attn

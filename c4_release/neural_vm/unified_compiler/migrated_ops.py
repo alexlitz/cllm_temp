@@ -218,9 +218,21 @@ def make_layer4_ffn_op() -> Operation:
 
 
 def make_layer5_fetch_op() -> Operation:
-    """L5 attention: instruction-fetch heads (8 heads)."""
-    def bake(attn, dim_positions, S):
+    """L5 attention: instruction-fetch heads (8 heads).
+
+    Dispatched as a block op pinned to layer_idx=5 so the bake hits the same
+    transformer block (block[5].attn) the legacy path used. Using kind="block"
+    routes through compile_full_vm's block_ops dispatch even when legacy_bake
+    is present, ensuring block[5] receives the L5 fetch logic for pure_neural
+    execution. The companion `_layer5_fetch_dep_anchor` op declares the same
+    reads/writes via kind="attn" so the LayerCompiler's dep graph still
+    reserves a layer slot for it (preserving model n_layers).
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer5_fetch
+        attn = block.attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes.fill_(0.1)
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer5_fetch(attn, S, _as_setdim_proxy(dim_positions), HD)
 
@@ -241,16 +253,55 @@ def make_layer5_fetch_op() -> Operation:
                 "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
                 "OP_OR", "OP_XOR", "OP_AND",
                 "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
+        kind="block",
+        layer_idx=5,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
+def make_layer5_fetch_dep_anchor_op() -> Operation:
+    """No-op companion for layer5_fetch: declares identical reads/writes so
+    the LayerCompiler's dep graph reserves a layer slot for it. The actual
+    bake happens in `layer5_fetch` (kind="block", layer_idx=5); this op's
+    bake is a no-op (its layout-assigned attention block is unrelated to
+    block[5] and is overwritten by legacy_bake of the corresponding L6 attn).
+    """
+    def bake(attn, dim_positions, S):
+        # No-op: actual bake is in `layer5_fetch` block op above.
+        return
+
+    return Operation(
+        name="_layer5_fetch_dep_anchor",
+        phase=5,
+        reads={"MARK_PC", "MARK_AX", "HAS_SE",
+               "FETCH_LO", "FETCH_HI", "EMBED_LO", "EMBED_HI",
+               "ADDR_KEY", "CONST", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
+                "FETCH_LO", "FETCH_HI",
+                "OP_IMM", "OP_LEA", "OP_EXIT", "OP_JMP", "OP_JSR",
+                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+                "OP_OR", "OP_XOR", "OP_AND",
+                "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
         kind="attn",
         bake_fn=bake,
     )
 
 
 def make_opcode_decode_ffn_op() -> Operation:
-    """L5 FFN: decode opcode byte → 34 one-hot OP_* flags at OPCODE_BASE."""
-    def bake(ffn, dim_positions, S):
+    """L5 FFN: decode opcode byte → 34 one-hot OP_* flags at OPCODE_BASE.
+
+    Dispatched as a block op pinned to layer_idx=5 so the bake hits the same
+    transformer block (block[5].ffn) the legacy path used. Using kind="block"
+    routes through compile_full_vm's block_ops dispatch even when legacy_bake
+    is present, ensuring block[5] receives the opcode decode logic for
+    pure_neural execution. The companion `_opcode_decode_ffn_dep_anchor` op
+    declares the same reads/writes via kind="ffn" so the LayerCompiler's dep
+    graph still reserves a layer slot for it (preserving model n_layers).
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_opcode_decode_ffn
-        _set_opcode_decode_ffn(ffn, S, _as_setdim_proxy(dim_positions))
+        _set_opcode_decode_ffn(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="opcode_decode_ffn",
@@ -264,6 +315,35 @@ def make_opcode_decode_ffn_op() -> Operation:
                 "OP_DIV", "OP_MOD", "OP_EXIT", "OP_NOP",
                 "OP_PUTCHAR", "OP_GETCHAR",
                 "TEMP"},  # JSR writes IS_JSR to TEMP[0]
+        kind="block",
+        layer_idx=5,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
+def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
+    """No-op companion for opcode_decode_ffn: declares identical reads/writes
+    so the LayerCompiler's dep graph reserves a layer slot for it. The actual
+    bake happens in `opcode_decode_ffn` (kind="block", layer_idx=5); this op's
+    bake is a no-op.
+    """
+    def bake(ffn, dim_positions, S):
+        # No-op: actual bake is in `opcode_decode_ffn` block op above.
+        return
+
+    return Operation(
+        name="_opcode_decode_ffn_dep_anchor",
+        phase=5,
+        reads={"OPCODE_BYTE_LO", "OPCODE_BYTE_HI", "MARK_AX", "MARK_PC", "HAS_SE"},
+        writes={"OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
+                "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
+                "OP_SC", "OP_PSH", "OP_OR", "OP_XOR", "OP_AND",
+                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+                "OP_SHL", "OP_SHR", "OP_ADD", "OP_SUB", "OP_MUL",
+                "OP_DIV", "OP_MOD", "OP_EXIT", "OP_NOP",
+                "OP_PUTCHAR", "OP_GETCHAR",
+                "TEMP"},
         kind="ffn",
         bake_fn=bake,
     )
@@ -1370,7 +1450,9 @@ def all_core_ops() -> list:
         make_layer4_pc_relay_op(),
         make_layer4_ffn_op(),
         make_layer5_fetch_op(),
+        make_layer5_fetch_dep_anchor_op(),
         make_opcode_decode_ffn_op(),
+        make_opcode_decode_ffn_dep_anchor_op(),
         make_layer6_attn_op(),
         make_layer6_routing_ffn_op(),
         make_layer6_relay_heads_op(),
