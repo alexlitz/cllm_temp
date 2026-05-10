@@ -3565,7 +3565,8 @@ def _set_layer4_ffn(ffn, S, BD):
             ffn.W_gate[unit, BD.TEMP + src] = 1.0
             ffn.W_down[BD.FETCH_LO + k, unit] = 2.0 / S
             unit += 1
-        # Hi nibble: copy TEMP[16..31] → FETCH_HI[0..15]
+        # Hi nibble: default copy TEMP[16..31] → FETCH_HI[0..15]
+        # (no-carry case: PC_lo + offset stays in [0..15])
         for k in range(16):
             ffn.W_up[unit, BD.IS_BYTE] = S
             ffn.W_up[unit, BD.H1 + AX_I] = S
@@ -3574,6 +3575,33 @@ def _set_layer4_ffn(ffn, S, BD):
             ffn.W_gate[unit, BD.TEMP + 16 + k] = 1.0
             ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
             unit += 1
+        # Hi nibble: carry correction when PC_lo + offset >= 16.
+        # TEMP[0..15] is one-hot for PC_lo. Carry occurs when the set bit
+        # c satisfies c >= 16 - offset (i.e., c in [16-offset, 15]).
+        # For each such carry source bit, cancel the default-copy hi value
+        # and add the +1 rotated hi value. Pattern mirrors the PC-marker
+        # fork below (lines further down) but generalized for offset > 1.
+        for carry_src in range(16 - offset, 16):
+            for k in range(16):
+                # Cancel default: subtract TEMP[16+k] when (byte gates) AND TEMP[carry_src]
+                ffn.W_up[unit, BD.IS_BYTE] = S
+                ffn.W_up[unit, BD.H1 + AX_I] = S
+                ffn.W_up[unit, BD.BYTE_INDEX_0 + byte_idx] = S
+                ffn.W_up[unit, BD.TEMP + carry_src] = S
+                ffn.b_up[unit] = -S * 3.5
+                ffn.W_gate[unit, BD.TEMP + 16 + k] = -1.0
+                ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
+                unit += 1
+                # Write rotated: add TEMP[16+(k-1)%16] when (byte gates) AND TEMP[carry_src]
+                hi_src = (k - 1) % 16
+                ffn.W_up[unit, BD.IS_BYTE] = S
+                ffn.W_up[unit, BD.H1 + AX_I] = S
+                ffn.W_up[unit, BD.BYTE_INDEX_0 + byte_idx] = S
+                ffn.W_up[unit, BD.TEMP + carry_src] = S
+                ffn.b_up[unit] = -S * 3.5
+                ffn.W_gate[unit, BD.TEMP + 16 + hi_src] = 1.0
+                ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
+                unit += 1
 
     # === PC+1 at PC marker → FETCH_LO/HI for dynamic immediate fetch ===
     # FIX 2026-04-29: Compute PC+1 at the PC marker and write to FETCH dims.
