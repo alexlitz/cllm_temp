@@ -174,6 +174,18 @@ def neural_only_runner():
 
 
 @pytest.fixture
+def pure_neural_runner():
+    """Runner in pure_neural=True mode (no Python overrides at all).
+
+    The neural network must compute everything from forward pass.
+    Used for Phase 5 JSR/ENT/LEV tests.
+    """
+    from neural_vm.run_vm import AutoregressiveVMRunner
+
+    return AutoregressiveVMRunner(pure_neural=True)
+
+
+@pytest.fixture
 def handler_status():
     """Get current handler registration status."""
     from neural_vm.run_vm import AutoregressiveVMRunner

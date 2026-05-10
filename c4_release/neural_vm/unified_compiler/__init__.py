@@ -18,21 +18,12 @@ Usage:
 from .primitives import Primitives
 from .compiler import UnifiedVMCompiler
 from .verification import Verifier
-from .builder import BuilderConfig, PruningConfig, IRBuilder
-from .ir import CompilerIR, AttentionOp, FFNOp, LayerSpec
 from .layer_compiler import LayerCompiler, Operation, ModelLayout, build_model_from_layout
 
 __all__ = [
     'Primitives',
     'UnifiedVMCompiler',
     'Verifier',
-    'BuilderConfig',
-    'PruningConfig',
-    'IRBuilder',
-    'CompilerIR',
-    'AttentionOp',
-    'FFNOp',
-    'LayerSpec',
     # Phase 0 layer-allocation compiler MVP (2026-05-09)
     'LayerCompiler',
     'Operation',

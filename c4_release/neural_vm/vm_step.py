@@ -8770,6 +8770,24 @@ def _set_layer16_lev_routing(ffn, S, BD):
     # Byte 1 = second byte (should output 0x00, need to clear OUTPUT_LO[10])
     # etc.
     # BUG FIX 2026-04-16: Add MARK_PC penalty. Same issue as OUTPUT_LO[0]/OUTPUT_HI[0] below.
+    #
+    # FIX 2026-05-09 (LEV AX preservation, Phase 5 agent T5):
+    #   The byte 1-3 zeroing units below force OUTPUT_LO[0]=1, OUTPUT_HI[0]=1
+    #   (i.e. byte=0x00) at any BYTE_INDEX_1/2/3 position when OP_LEV is active.
+    #   In non-pure-neural mode OP_LEV is broadcast across all positions, so these
+    #   units fire at AX byte positions 1-3 too — clobbering AX bytes 1-3 with
+    #   0x00 even when AX held a non-trivial multi-byte value across the LEV.
+    #
+    #   We add an H1[AX_I] negative weight: H1[1] = 1 only when AX is the nearest
+    #   marker within 4.5 tokens, i.e. at AX marker (d=0) and AX bytes 1-4 (d=1..4).
+    #   Combined with the existing MARK_AX = -S*10 suppression at the AX marker
+    #   itself, this isolates AX bytes 1-4 and prevents the unit from firing there.
+    #   PC byte 1-4 nearest marker is PC, so H1[PC_I] is on (not H1[AX_I]) — those
+    #   positions still fire correctly. Same for SP/BP/STACK0 byte positions: they
+    #   have their own H1[SP_I]/H1[BP_I] active, not H1[AX_I]. So this change ONLY
+    #   suppresses the unit at AX byte positions (which is what we want).
+    AX_I = 1  # AX index in MARKS half-space encoding (matches _set_phase_a_ffn)
+    AX_BYTE_SUPPRESS = -S * 10  # Strong: must overcome OP_LEV*S/2 = 5*25=125 even with broadcast
     for byte_pos in range(3):  # byte positions 1, 2, 3
         # BYTE_INDEX_1 for byte 1, BYTE_INDEX_2 for byte 2, BYTE_INDEX_3 for byte 3
         byte_idx_dim = [BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][byte_pos]
@@ -8784,6 +8802,8 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_AX] = -S * 10  # Suppress at AX marker (MARK_AX=1 → -1000)
         ffn.W_up[unit, BD.MARK_SP] = -S * 10  # Suppress at SP marker
         ffn.W_up[unit, BD.MARK_BP] = -S * 10  # Suppress at BP marker
+        # FIX 2026-05-09: Suppress at AX byte positions (H1[AX_I]=1, MARK_AX=0)
+        ffn.W_up[unit, BD.H1 + AX_I] = AX_BYTE_SUPPRESS
         ffn.W_up[unit, BD.NEXT_AX] = -S * 1.5
         ffn.W_up[unit, BD.NEXT_SP] = -S * 1.5
         ffn.W_up[unit, BD.NEXT_BP] = -S * 1.5
@@ -8808,6 +8828,8 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.W_up[unit, BD.MARK_SP] = -S * 10
         ffn.W_up[unit, BD.MARK_BP] = -S * 10
+        # FIX 2026-05-09: Suppress at AX byte positions to preserve AX across LEV.
+        ffn.W_up[unit, BD.H1 + AX_I] = AX_BYTE_SUPPRESS
         ffn.W_up[unit, BD.NEXT_AX] = -S * 1.5
         ffn.W_up[unit, BD.NEXT_SP] = -S * 1.5
         ffn.W_up[unit, BD.NEXT_BP] = -S * 1.5
@@ -8831,6 +8853,8 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.W_up[unit, BD.MARK_SP] = -S * 10
         ffn.W_up[unit, BD.MARK_BP] = -S * 10
+        # FIX 2026-05-09: Suppress at AX byte positions to preserve AX across LEV.
+        ffn.W_up[unit, BD.H1 + AX_I] = AX_BYTE_SUPPRESS
         ffn.W_up[unit, BD.NEXT_AX] = -S * 1.5
         ffn.W_up[unit, BD.NEXT_SP] = -S * 1.5
         ffn.W_up[unit, BD.NEXT_BP] = -S * 1.5
