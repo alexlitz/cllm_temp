@@ -866,6 +866,162 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
     )
 
 
+# -- L10 attention bake ops (migrated 2026-05-10) -----------------------------
+#
+# These five ``kind="block", layer_idx=10, migrated=True`` ops bake the five
+# inline ``_set_layer10_*`` attention calls that used to live in
+# ``set_vm_weights`` (both the ``alu_mode == 'lookup'`` and
+# ``alu_mode == 'efficient'`` branches). The inline calls have been removed
+# from both branches; these ops now own the bake. Phases 10.0-10.4 preserve
+# the original ordering. The five ``layer10_*`` kind="attn" placeholders
+# above are retained (no ``migrated=True``) as dep-graph anchors so the
+# LayerCompiler topology does not shift downstream block assignments.
+#
+# All five target ``model.blocks[10].attn`` and run BEFORE legacy_bake (999),
+# so the alibi_slopes mutations and the L10 FFN bake inside set_vm_weights
+# still execute in their original order. The attn weight slots they write
+# are NOT touched by legacy_bake after the inline removals.
+
+
+def make_layer10_carry_relay_bake_op() -> Operation:
+    """Bake ``_set_layer10_carry_relay`` into ``model.blocks[10].attn``.
+
+    Was an inline call in ``set_vm_weights`` (both lookup and efficient
+    branches): ``_set_layer10_carry_relay(attn10, S, BD, HD)``. Inline call
+    removed; this op now owns the bake. Phase=10.0 preserves the original
+    ordering relative to the four sibling L10 attn bake ops below.
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_layer10_carry_relay
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_carry_relay(attn, S, proxy, HD)
+
+    return Operation(
+        name="layer10_carry_relay_bake",
+        phase=10.0,
+        reads={"MARK_AX", "IS_BYTE", "H1", "CARRY", "CONST"},
+        writes={"CARRY"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=10,
+        migrated=True,
+    )
+
+
+def make_layer10_byte_passthrough_bake_op() -> Operation:
+    """Bake ``_set_layer10_byte_passthrough`` into ``model.blocks[10].attn``.
+
+    Was an inline call in ``set_vm_weights`` (both branches):
+    ``_set_layer10_byte_passthrough(attn10, S, BD, HD)``. Inline call
+    removed; this op now owns the bake. Phase=10.1.
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_layer10_byte_passthrough
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_byte_passthrough(attn, S, proxy, HD)
+
+    return Operation(
+        name="layer10_byte_passthrough_bake",
+        phase=10.1,
+        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "TEMP",
+               "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "BYTE_INDEX_3", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=10,
+        migrated=True,
+    )
+
+
+def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
+    """Bake ``_set_layer10_sp_byte_passthrough`` into ``model.blocks[10].attn``.
+
+    Was an inline call in ``set_vm_weights`` (both branches):
+    ``_set_layer10_sp_byte_passthrough(attn10, S, BD, HD)``. Inline call
+    removed; this op now owns the bake. Phase=10.2.
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_layer10_sp_byte_passthrough
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_sp_byte_passthrough(attn, S, proxy, HD)
+
+    return Operation(
+        name="layer10_sp_byte_passthrough_bake",
+        phase=10.2,
+        reads={"IS_BYTE", "HAS_SE", "H1", "PSH_AT_SP", "CMP",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=10,
+        migrated=True,
+    )
+
+
+def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
+    """Bake ``_set_layer10_psh_stack0_passthrough`` into ``model.blocks[10].attn``.
+
+    Was an inline call in ``set_vm_weights`` (both branches):
+    ``_set_layer10_psh_stack0_passthrough(attn10, S, BD, HD)``. Inline call
+    removed; this op now owns the bake. Phase=10.3.
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_layer10_psh_stack0_passthrough
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_psh_stack0_passthrough(attn, S, proxy, HD)
+
+    return Operation(
+        name="layer10_psh_stack0_passthrough_bake",
+        phase=10.3,
+        reads={"MARK_STACK0", "IS_BYTE", "PSH_AT_SP", "H1", "H4",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=10,
+        migrated=True,
+    )
+
+
+def make_layer10_stack0_byte_relay_bake_op() -> Operation:
+    """Bake ``_set_layer10_stack0_byte_relay`` into ``model.blocks[10].attn``.
+
+    Was an inline call in ``set_vm_weights`` (lookup branch only):
+    ``_set_layer10_stack0_byte_relay(attn10, S, BD, HD)``. Inline call
+    removed; this op now owns the bake. Phase=10.4.
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_layer10_stack0_byte_relay
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_layer10_stack0_byte_relay(attn, S, proxy, HD)
+
+    return Operation(
+        name="layer10_stack0_byte_relay_bake",
+        phase=10.4,
+        reads={"IS_BYTE", "HAS_SE", "H1", "H4",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"ALU_LO", "ALU_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=10,
+        migrated=True,
+    )
+
+
 def make_layer10_alu_op() -> Operation:
     """L10 FFN: AND/OR/XOR + DIV/MOD setup."""
     def bake(ffn, dim_positions, S):
@@ -3152,6 +3308,16 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_layer10_byte_passthrough_op(),
         make_layer10_sp_byte_passthrough_op(),
         make_layer10_psh_stack0_passthrough_op(),
+        # 5 block-level bake ops (phases 10.0..10.4): the actual attn weight
+        # bakes for L10 heads 0-4. Inline calls in set_vm_weights have been
+        # removed; these own the bake. The five kind="attn" placeholders above
+        # remain as dep-graph anchors. See docstrings on the individual bake
+        # ops for details.
+        make_layer10_carry_relay_bake_op(),
+        make_layer10_byte_passthrough_bake_op(),
+        make_layer10_sp_byte_passthrough_bake_op(),
+        make_layer10_psh_stack0_passthrough_bake_op(),
+        make_layer10_stack0_byte_relay_bake_op(),
         make_layer10_alu_op(),
         make_layer11_mul_partial_op(),
         make_layer12_mul_combine_op(),
