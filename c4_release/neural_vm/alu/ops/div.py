@@ -1,16 +1,18 @@
 """
-Chunk-generic DIV pipeline: 4 layers.
+Chunk-generic DIV pipeline: nibble-level long division (no fp64).
 
-Layer 1: Clear + Gather + Softmax1 reciprocal (merged)
-Layer 2: Multiply Q_float = dividend × reciprocal
-Layer 3: Floor extraction via fp64 MAGIC trick
-Layer 4: Chunk subtraction: chunk_j = floor_j - base*floor_{j+1}
+Replaces the previous fp64 MAGIC-floor approach with direct schoolbook long
+division on nibble vectors. See ``divmod_longdiv.py`` for the algorithm.
 
-Parameterized by ChunkConfig. Floor extraction generalizes the MAGIC trick:
-  eps_j = 2^(-20 - chunk_bits*j)
-  scale_j = 1/base^j
+Layer count:
+  Layer 1: ClearDivSlotsFFN — clear scratch slots
+  Layer 2: LongDivisionModule — 8 outer iterations of bring-down + trial
+           multiply + compare + subtract (24 sub-FFN-equivalent operations)
+  Layer 3: EmitDivResultModule — copy SLOT_QUOTIENT[*] → RESULT[*]
 
-For single-position configs (WORD), layers 3-4 simplify to direct floor.
+The legacy fp64 MAGIC modules (FloorExtractionFFN, ClearDivSlotsFFN with the
+old name, etc.) are retained DEPRECATED below so that any external import
+still resolves; ``build_div_layers`` no longer references them.
 """
 
 import math
@@ -387,39 +389,20 @@ class DivMergedLayer1(nn.Module):
 
 
 def build_div_layers(config: ChunkConfig, opcode: int, fp32_floor: bool = False) -> nn.ModuleList:
-    """Build 4-layer DIV pipeline for the given chunk config.
+    """Build DIV pipeline using nibble-level long division (no fp64).
 
-    Args:
-        config: Chunk configuration
-        opcode: DIV opcode number
-        fp32_floor: If True, use fp32-safe floor extraction (more params but no fp64).
-                   If False (default), use MAGIC fp64 trick (fewer params but requires fp64).
-
-    Works at all chunk sizes.
+    All arithmetic is fp32. The ``fp32_floor`` argument is retained for
+    backward compatibility but is now ignored — the long-division pipeline
+    has no floor-extraction stage to swap.
     """
-    ge = GenericE(config)
-
-    if fp32_floor:
-        floor_layer = FloorExtractionFP32FFN(ge, opcode)
-    else:
-        floor_layer = FloorExtractionFFN(ge, opcode)
-
-    layers = [
-        DivMergedLayer1(ge, opcode),
-        MultiplyReciprocalFFN(ge, opcode),
-        floor_layer,
-    ]
-    if config.num_positions > 1:
-        layers.append(ChunkSubtractFFN(ge, opcode))
-    return nn.ModuleList(layers)
+    # Defer import to avoid cycles (mod.py also re-exports from div.py).
+    from .divmod_longdiv import build_div_layers_longdiv
+    return build_div_layers_longdiv(config, opcode)
 
 
 def build_div_layers_fp32(config: ChunkConfig, opcode: int) -> nn.ModuleList:
-    """Build DIV pipeline using fp32-safe floor extraction.
+    """Build DIV pipeline using nibble-level long division.
 
-    WARNING: Only works correctly for quotients < 65536 (16-bit results).
-    For full 32-bit division, use the default fp64 MAGIC approach.
-
-    Convenience wrapper for build_div_layers with fp32_floor=True.
+    Backward-compat alias; identical to ``build_div_layers``.
     """
-    return build_div_layers(config, opcode, fp32_floor=True)
+    return build_div_layers(config, opcode)
