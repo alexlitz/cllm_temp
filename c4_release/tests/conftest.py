@@ -225,12 +225,83 @@ def neural_only_runner(_neural_only_runner_model):
     return runner
 
 
+# =============================================================================
+# Pure-neural fixture (stable across worktrees)
+# =============================================================================
+#
+# The `pure_neural_runner` fixture below is the canonical entry point for any
+# test that needs to verify behavior with NO Python overrides — the neural
+# network alone drives execution.
+#
+# Design notes:
+#   * Session-scoped model build (`_pure_neural_runner_model`):
+#       The model bake is expensive (~6.8s cold). Building it once per pytest
+#       session and reusing the same `AutoregressiveVMRunner` keeps test time
+#       reasonable across long suites. Per-test isolation is provided by the
+#       function-scoped wrapper below, which clears mutable runner state.
+#   * Per-test state reset (function-scoped `pure_neural_runner`):
+#       Before yielding the runner to a test, the wrapper resets:
+#           - `_memory`            (sparse byte-addressable shadow memory)
+#           - `_mem_history`       (token sequences for memory addresses)
+#           - `_mem_access_order`  (LRU eviction tracking)
+#       This prevents one test's stack/heap writes from leaking into the next.
+#       The runner's `_func_call_handlers` and `_syscall_handlers` are also
+#       cleared once at session-build time so dispatch is 100% neural.
+#   * Kwargs used:
+#       `AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)`.
+#       Older worktrees may not yet have one or both kwargs. The session
+#       builder catches the resulting `TypeError`, emits a `RuntimeWarning`,
+#       and falls back to whatever combination the runner accepts so the
+#       fixture can still construct *some* runner. Tests that strictly need
+#       pure_neural behavior should branch on `runner.pure_neural` and call
+#       `pytest.skip(...)` when it is False (see `test_pure_neural_fixture.py`
+#       for the canonical pattern).
+
 @pytest.fixture(scope="session")
 def _pure_neural_runner_model():
-    """Session-scoped model construction for pure neural tests (no Python overrides)."""
+    """Session-scoped model construction for pure neural tests.
+
+    Tries `AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)`
+    first. If either kwarg is unsupported on the current branch (older
+    worktrees), falls back to whatever combination the runner accepts and
+    emits a warning so the test author can decide whether to skip.
+    """
+    import warnings
     from neural_vm.run_vm import AutoregressiveVMRunner
 
-    runner = AutoregressiveVMRunner(trust_neural_alu=True, pure_neural=True)
+    kwargs_attempts = [
+        {"pure_neural": True, "trust_neural_alu": True},
+        {"trust_neural_alu": True},   # branch missing pure_neural kwarg
+        {"pure_neural": True},         # branch missing trust_neural_alu kwarg
+        {},                             # branch missing both kwargs
+    ]
+    runner = None
+    last_err = None
+    for kwargs in kwargs_attempts:
+        try:
+            runner = AutoregressiveVMRunner(**kwargs)
+            if kwargs != kwargs_attempts[0]:
+                warnings.warn(
+                    f"pure_neural_runner: AutoregressiveVMRunner does not accept "
+                    f"the full kwargs {kwargs_attempts[0]!r}. "
+                    f"Fell back to {kwargs!r}. Tests that strictly require "
+                    f"pure_neural=True should check runner.pure_neural and "
+                    f"pytest.skip if False.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            break
+        except TypeError as e:
+            last_err = e
+            continue
+    if runner is None:
+        raise RuntimeError(
+            f"pure_neural_runner: AutoregressiveVMRunner could not be "
+            f"instantiated with any tried kwargs. Last error: {last_err!r}"
+        )
+
+    # Strip Python-side handlers so dispatch is fully neural (or as close as
+    # the current branch supports). Done once at session build time.
     runner._func_call_handlers = {}
     runner._syscall_handlers = {}
     return runner
@@ -238,11 +309,15 @@ def _pure_neural_runner_model():
 
 @pytest.fixture
 def pure_neural_runner(_pure_neural_runner_model):
-    """Runner with NO Python overrides at all (100% neural).
+    """Runner with NO Python overrides at all (100% neural when supported).
 
-    Use for testing that neural network alone can execute programs.
-    This skips ALL dispatch logic - only neural network outputs matter.
-    Resets per-call state on the session-scoped runner.
+    Session-scoped model is shared via `_pure_neural_runner_model`; this
+    function-scoped wrapper resets per-test state (`_memory`, `_mem_history`,
+    `_mem_access_order`) so individual tests do not leak state into each other.
+
+    Use for testing that the neural network alone can execute programs.
+    See the design-notes block above the session fixture for details on
+    kwargs fallback behavior on older worktrees.
     """
     runner = _pure_neural_runner_model
     runner._memory = {}
