@@ -1899,7 +1899,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         attn6.alibi_slopes[4] = 5.0  # BZ/BNZ relay: attend to nearest AX marker
     _set_layer6_attn(attn6, S, BD, HD)
     ffn6 = model.blocks[6].ffn
-    _set_layer6_routing_ffn(ffn6, S, BD)
+    # L6 routing FFN (per-opcode FETCH/AX_CARRY → OUTPUT) — MIGRATED: now
+    # installed via `make_layer6_routing_ffn_op` in
+    # `unified_compiler/migrated_ops.py` (kind="block", layer_idx=6,
+    # phase=6.5, migrated=True). Inline call removed to avoid double-bake.
 
     # L6 relay attention heads (AX→STACK0 for PSH, AX→SP for ADJ)
     # ENABLED: Uses head 2 which is unused (checked via weight inspection)
