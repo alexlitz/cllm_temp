@@ -96,6 +96,22 @@ class Fp64MulSubModule(nn.Module):
 
     Wraps MUL layers (quotient * divisor) and SUB layers (dividend - product)
     with fp64 upcast/downcast.
+
+    DO NOT downgrade to fp32. PERF_INVESTIGATION #2 proposed flipping these
+    8.8M params from fp64 to fp32 for ~1.2-1.5x speedup, but empirical testing
+    showed real precision loss:
+      - Phase-7 small-value MOD tests (a, b ≤ 256) still pass after fp32 change.
+      - Exhaustive small-value sweep regresses from 0/9472 → 37/9472 failures,
+        concentrated on a=0 cases (the ``(x-1)`` trick yields q_float ≈ -1/b
+        which the fp32 SwiGLU step pairs leak ~5e-6 of drift on; that drift is
+        amplified by base_powers up to 16^7 ≈ 268M in the downstream
+        ModCorrectionModule gather, breaking the MAGIC floor extraction).
+      - The L0 ModDivScalarModule and L1/L4 MAGIC buffers are already
+        unavoidably fp64 (MAGIC = 3 * 2^51 has no fp32 representation).
+    Switching just these MUL+SUB weights pushes the precision budget over
+    the edge that the magic-floor trick downstream relies on. To win this
+    perf, the algorithm itself (the (x-1) subtraction, gather scales, or
+    correction module) needs to be made drift-tolerant first.
     """
 
     def __init__(self, ge: GenericE, opcode: int, config: ChunkConfig):
