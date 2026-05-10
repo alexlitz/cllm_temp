@@ -1910,12 +1910,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     _set_bz_bnz_relay(attn6, S, BD, HD)
 
     # L6 opcode relay: broadcast PSH/ADJ/pop flags from AX → SP/STACK0
-    # MIGRATED 2026-05-10: `_set_opcode_relay_head` is now installed by
-    # `make_opcode_relay_head_op` in migrated_ops.py (model-level, phase=1002,
-    # migrated=True). The op also sets attn6.alibi_slopes[6]/[7]=5.0 prior to
-    # configuring head 6 (opcode flag relay) and head 7 (JSR PC+5 relay).
-    # Phase=1002 (after legacy_bake's phase=999) is required so the alibi
-    # writes survive the `attn6.alibi_slopes.fill_(0.0)` performed above.
+    if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
+        attn6.alibi_slopes[6] = 5.0
+        attn6.alibi_slopes[7] = 5.0  # JSR PC+5 relay: steep for head 7
+    _set_opcode_relay_head(attn6, S, BD, HD)
 
     # IO PUTCHAR routing (L6 FFN: sets IO_IS_PUTCHAR, routes AX → OUTPUT) —
     # MIGRATED: now installed via `make_io_putchar_routing_op` in

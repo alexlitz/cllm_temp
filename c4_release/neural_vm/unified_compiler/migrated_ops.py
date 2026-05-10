@@ -1259,48 +1259,6 @@ def make_binary_pop_sp_increment_op() -> Operation:
     )
 
 
-def make_opcode_relay_head_op() -> Operation:
-    """L6 attention head 6: relay opcode flags from AX → SP/STACK0/PC markers.
-
-    Originally inline in `set_vm_weights` after `_set_bz_bnz_relay`. The L5 FFN
-    decodes opcodes only at the AX marker, but L6 FFN consumes OP_PSH/OP_ADJ/
-    OP_LEV/OP_JSR/OP_ENT and a pop-group flag at SP, STACK0, BP, PC, and MEM
-    markers. This head copies those flags across markers via head 6. The op
-    also boosts head 7's ALiBi slope (head 7 is the JSR PC+5 relay configured
-    by `_set_function_call_weights`).
-
-    Re-enabled 2026-05-09 with V[0]=0.1, W_o[OP_LEV]=10.0 to unblock Phase 5
-    LEV semantics (PC restoration, SP=BP+16) without doubling OP_LEV in
-    pure_neural mode (where set_active_opcode is skipped).
-
-    Model-level migrated op. Phase=1002 ensures it runs AFTER legacy_bake
-    (phase=999) — legacy_bake calls `attn6.alibi_slopes.fill_(0.0)` while
-    configuring heads 0-5, which would wipe heads 6/7 ALiBi if we ran earlier.
-    Attention weights for head 6 don't conflict with legacy_bake's head 0-5
-    writes, and `_right_size_ffns` (inside legacy_bake) only touches FFN
-    tensors, so attention writes are safe at phase>999.
-    """
-    def bake(model, dim_positions, S):
-        from ..vm_step import _set_opcode_relay_head
-        proxy = _as_setdim_proxy(dim_positions)
-        attn = model.blocks[6].attn
-        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-            attn.alibi_slopes[6] = 5.0
-            attn.alibi_slopes[7] = 5.0  # JSR PC+5 relay: steep for head 7
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _set_opcode_relay_head(attn, S, proxy, HD)
-
-    return Operation(
-        name="opcode_relay_head",
-        reads=set(),
-        writes=set(),
-        kind="model",
-        bake_fn=bake,
-        phase=1002,
-        migrated=True,
-    )
-
-
 def make_layer10_stack0_byte_relay_op() -> Operation:
     """L10 attention: STACK0 byte values relay for AND/OR/XOR multi-byte."""
     def bake(attn, dim_positions, S):
@@ -2540,7 +2498,6 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_layer16_lev_routing_op(),
         # Critical additional ops (M3+ continuation)
         make_binary_pop_sp_increment_op(),
-        make_opcode_relay_head_op(),
         make_layer10_stack0_byte_relay_op(),
         make_layer9_marker_suppress_op(),
         # L8 ALU ADD/SUB flatten (5 ops replacing the monolithic ALUAddSub)
