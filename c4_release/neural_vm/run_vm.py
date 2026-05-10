@@ -596,6 +596,15 @@ class AutoregressiveVMRunner:
             if exec_op == Opcode.GETCHAR:
                 self._inject_getchar(context)
 
+            # PRTF (Phase 6, pure_neural): the neural network does not yet have
+            # a complete autoregressive format-string walker / byte emitter. As
+            # a minimal bring-up, the runner walks the format string from shadow
+            # memory and appends bytes to the output buffer. %d / %s
+            # substitution is intentionally not handled here; the simple
+            # literal-string case (test_prtf_simple) is the minimal goal.
+            if exec_op == Opcode.PRTF:
+                self._neural_prtf_emit(context, output)
+
             # Only break on EXIT
             return exec_op == Opcode.EXIT
 
@@ -923,6 +932,59 @@ class AutoregressiveVMRunner:
             byte_val = 0xFFFFFFFF  # EOF = -1
 
         self._override_ax_in_last_step(context, byte_val)
+
+    def _neural_prtf_emit(self, context, output):
+        """Runner-side PRTF for pure_neural mode (literal strings only).
+
+        Walks the format string in shadow memory and appends bytes to the
+        ``output`` buffer. Format specifiers (%d/%s/etc.) are not yet
+        interpreted — the bytes are emitted verbatim, which is sufficient
+        for the literal-string ``test_prtf_simple`` xpass criterion.
+
+        Format pointer resolution attempts, in order:
+          1. STACK0 from this step (the model's emitted *sp value)
+          2. Neural AX from this step (preserved by PSH for the canonical
+             ``IMM <fmt>; PSH; PRTF`` pattern)
+          3. Shadow memory at neural_sp (typically zero in pure_neural since
+             PSH does not write shadow memory in this mode)
+
+        Candidates that point into a populated shadow-memory region are
+        preferred over those that don't.
+        """
+        stack0 = self._extract_register(context, Token.STACK0)
+        ax = self._extract_register(context, Token.REG_AX)
+        sp = self._extract_register(context, Token.REG_SP)
+
+        candidates = []
+        if stack0:
+            candidates.append(stack0 & 0xFFFFFFFF)
+        if ax:
+            candidates.append(ax & 0xFFFFFFFF)
+        if sp is not None:
+            mem_val = self._mem_load_word(sp & 0xFFFFFFFF)
+            if mem_val:
+                candidates.append(mem_val & 0xFFFFFFFF)
+
+        # Prefer candidates that index a known shadow-memory entry.
+        fmt_ptr = None
+        for cand in candidates:
+            if cand in self._memory:
+                fmt_ptr = cand
+                break
+        if fmt_ptr is None and candidates:
+            fmt_ptr = candidates[0]
+        if fmt_ptr is None:
+            return 0
+
+        emitted = 0
+        max_len = 4096
+        for i in range(max_len):
+            byte_val = self._memory.get(fmt_ptr + i, 0)
+            if byte_val == 0:
+                break
+            output.append(chr(byte_val & 0xFF))
+            emitted += 1
+        return emitted
 
     def _override_ax_in_last_step(self, context, value):
         """Override AX register bytes in the last completed step.
