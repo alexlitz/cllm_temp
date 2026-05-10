@@ -1386,15 +1386,17 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
     Modules attached (lookup mode):
       BinaryOpByteZeroingPostOp,
       CarryPropagationPostOp x3 (byte 0 no-cascade, bytes 1-2 cascade),
-      BitwiseBytePropagationPostOp,
-      DivModModule(mode='lookup').
+      BitwiseBytePropagationPostOp.
+      (DIV/MOD post_op is appended by ``make_l10_alu_divmod_install_op``
+      at phase=10.8 — see ``efficient_alu_divmod_split.FlattenedDivMod``.)
 
     Modules attached (efficient mode):
       BinaryOpByteZeroingPostOp,
       CarryPropagationPostOp x3,
       BitwiseBytePropagationPostOp,
-      ComparisonCombine,
-      EfficientDivMod_Neural.
+      ComparisonCombine.
+      (DIV/MOD post_op is appended by ``make_l10_alu_divmod_install_op``
+      at phase=10.8 — see ``efficient_alu_divmod_split.FlattenedDivMod``.)
 
     The existing `make_l10_post_ops_combined` is unrelated: it bakes the
     LOGIC of the FFN-style post_ops into a single phase-10.5 FFN (a parallel
@@ -1414,9 +1416,6 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             CarryPropagationPostOp,
             BitwiseBytePropagationPostOp,
             ComparisonCombine,
-            DivModModule,
-            EfficientDivMod_Neural,
-            _SetDim,
         )
         # Use the block's d_model when available; fall back to 512 to mirror
         # the previous inline behavior.
@@ -1438,18 +1437,16 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=2, cascade=True)
         )
         block.post_ops.append(BitwiseBytePropagationPostOp(d_model=d_model, S=S))
-        if alu_mode == "lookup":
-            # The lookup-mode HybridALU override in set_vm_weights replaces
-            # this DivModModule with EfficientDivMod_Neural via
-            # `model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)`.
-            block.post_ops.append(DivModModule(mode="lookup"))
-        else:  # efficient
+        if alu_mode == "efficient":
             # Pass the model's actual d_model so the underlying PureFFN's
             # Linear input dim matches the residual stream width. Without
             # this, ComparisonCombine builds a Linear(512, 18) which fails
             # forward when d_model != 512 (e.g., pin_io_only=True paths).
             block.post_ops.append(ComparisonCombine(d_model=d_model, S=S))
-            block.post_ops.append(EfficientDivMod_Neural(S, _SetDim))
+        # DIV/MOD post_op (FlattenedDivMod) appended by
+        # ``make_l10_alu_divmod_install_op`` (phase=10.8). Both modes use the
+        # same flattened composite — its forward is byte-identical to the
+        # previous EfficientDivMod_Neural.
 
     return Operation(
         name="l10_post_op_attach",
@@ -2153,6 +2150,179 @@ def make_function_call_weights_op() -> Operation:
         phase=998,
         migrated=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# L10 DIV/MOD ALU flattening (2026-05-10)
+#
+# The previous lookup-mode override
+#   model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)
+# in ``set_vm_weights`` and the efficient-mode append
+#   block.post_ops.append(EfficientDivMod_Neural(S, _SetDim))
+# in ``make_l10_post_op_attach_op`` both wrapped 3 logical sub-stages
+# (BD→GE convert, long-division pipeline, GE→BD convert) inside a single
+# ``PureNeuralALU(operations='div_mod')`` runtime class (alias
+# ``ALUDivMod`` / ``EfficientDivMod_Neural``). The 4 ops below split that
+# wrapper into discrete compiler operations:
+#
+#   phase=10.0  install BD → GE converter         (FlattenedDivMod.bd_to_ge)
+#   phase=10.1  install long-division pipeline    (FlattenedDivMod.div_layers + mod_layers)
+#                                                  = ClearDivSlotsFFN +
+#                                                    LongDivisionModule +
+#                                                    EmitDivResultModule per opcode
+#   phase=10.2  install GE → BD converter         (FlattenedDivMod.ge_to_bd)
+#   phase=10.8  install composite onto post_ops   (model.blocks[10].post_ops.append)
+#
+# The first 3 stage ops are kind="block", layer_idx=10. They run after
+# `make_l10_post_op_attach_op` (phase=10.7) since 10.0/10.1/10.2 are < 10.7
+# only in numeric-phase comparison — but since BLOCK ops sort by
+# (layer_idx, phase), the smaller phases run FIRST. That's fine: the
+# first 3 ops only construct sub-stages on a builder; nothing depends on
+# `block.post_ops` until the install op (phase=10.8) actually inserts
+# the composite.
+#
+# The install op (phase=10.8, kind="block", layer_idx=10) appends the
+# fully-constructed FlattenedDivMod composite to ``block.post_ops``.
+# It runs AFTER `make_l10_post_op_attach_op` (phase=10.7) which appends
+# the standard L10 post_ops (BinaryOpByteZeroingPostOp etc.) but no longer
+# appends EfficientDivMod_Neural / DivModModule.
+#
+# The legacy lookup-mode override in set_vm_weights
+# (`model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)`) is
+# also removed so the composite isn't clobbered.
+#
+# Forward is byte-identical to the previous EfficientDivMod_Neural — see
+# ``FlattenedDivMod.forward`` in efficient_alu_divmod_split.py.
+# ---------------------------------------------------------------------------
+
+
+class _FlattenedDivModBuilder:
+    """Mutable holder shared across the 4 cooperating ops.
+
+    Each of the 4 ops accesses the same ``FlattenedDivMod`` instance via
+    this builder. Stage ops (phase=10.0/10.1/10.2) install one sub-stage
+    each; the install op (phase=10.8) appends the fully-assembled composite
+    to ``model.blocks[10].post_ops``.
+
+    Idempotent: ``ensure`` returns the existing composite if any.
+    """
+
+    def __init__(self):
+        self.composite = None
+
+    def ensure(self, S, BD_proxy):
+        from ..efficient_alu_divmod_split import FlattenedDivMod
+        if self.composite is None:
+            self.composite = FlattenedDivMod(S, BD_proxy)
+        return self.composite
+
+
+def make_alu_divmod_composite_ops():
+    """Build the 4 cooperating ops (3 stage + 1 install) for FlattenedDivMod.
+
+    Returns ``[bdtoge, longdiv, getobd, install]`` — all sharing the same
+    ``_FlattenedDivModBuilder`` so the install op can append the
+    fully-constructed composite to ``model.blocks[10].post_ops``.
+
+    Stage ops are kind="block", layer_idx=10 (so they have access to the
+    block when needed; their bake_fns operate on the shared builder
+    rather than the block). Install op is kind="block", layer_idx=10.
+    """
+    builder = _FlattenedDivModBuilder()
+
+    def make_bdtoge():
+        def bake(block, dim_positions, S):
+            BD = _as_setdim_proxy(dim_positions)
+            composite = builder.ensure(S, BD)
+            composite.install_bdtoge()
+
+        return Operation(
+            name="l10_alu_divmod_bdtoge",
+            phase=10.0,
+            reads={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+                   "OP_DIV", "OP_MOD"},
+            writes=set(),
+            kind="block",
+            bake_fn=bake,
+            layer_idx=10,
+            migrated=True,
+        )
+
+    def make_longdiv():
+        def bake(block, dim_positions, S):
+            BD = _as_setdim_proxy(dim_positions)
+            composite = builder.ensure(S, BD)
+            composite.install_longdiv()
+
+        return Operation(
+            name="l10_alu_divmod_longdiv",
+            phase=10.1,
+            reads={"OP_DIV", "OP_MOD"},
+            writes=set(),
+            kind="block",
+            bake_fn=bake,
+            layer_idx=10,
+            migrated=True,
+        )
+
+    def make_getobd():
+        def bake(block, dim_positions, S):
+            BD = _as_setdim_proxy(dim_positions)
+            composite = builder.ensure(S, BD)
+            composite.install_getobd()
+
+        return Operation(
+            name="l10_alu_divmod_getobd",
+            phase=10.2,
+            reads={"OP_DIV", "OP_MOD", "MARK_AX"},
+            writes={"OUTPUT_LO", "OUTPUT_HI"},
+            kind="block",
+            bake_fn=bake,
+            layer_idx=10,
+            migrated=True,
+        )
+
+    def make_install():
+        def bake(block, dim_positions, S):
+            if builder.composite is None:
+                # No stage bakes ran (defensive). Skip cleanly.
+                return
+            block.post_ops.append(builder.composite)
+
+        return Operation(
+            name="l10_alu_divmod_install",
+            phase=10.8,
+            reads=set(),
+            writes=set(),
+            kind="block",
+            bake_fn=bake,
+            layer_idx=10,
+            migrated=True,
+        )
+
+    return [make_bdtoge(), make_longdiv(), make_getobd(), make_install()]
+
+
+# Single-op factory shims for callers that want one op (e.g. unit tests).
+# Each returns a fresh builder so the ops aren't entangled across factories.
+def make_l10_alu_divmod_bdtoge_op() -> Operation:
+    """L10 stage 1: BD → GE format conversion (standalone factory)."""
+    return make_alu_divmod_composite_ops()[0]
+
+
+def make_l10_alu_divmod_longdiv_op() -> Operation:
+    """L10 stage 2: long-division pipeline (standalone factory)."""
+    return make_alu_divmod_composite_ops()[1]
+
+
+def make_l10_alu_divmod_getobd_op() -> Operation:
+    """L10 stage 3: GE → BD format conversion (standalone factory)."""
+    return make_alu_divmod_composite_ops()[2]
+
+
+def make_l10_alu_divmod_install_op() -> Operation:
+    """L10 install op: append composite to block.post_ops (standalone factory)."""
+    return make_alu_divmod_composite_ops()[3]
 
 
 def make_legacy_bake_op(
