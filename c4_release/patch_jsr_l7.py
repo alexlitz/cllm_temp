@@ -146,18 +146,16 @@ def patch_vm_step(path):
     else:
         content = content.replace(
             'from .efficient_alu_neural import (\n'
-            '    EfficientALU_L8_L9_Neural,\n'
-            '    EfficientALU_L10_Neural,\n'
-            '    EfficientALU_L11_L12_Neural,\n'
-            '    EfficientALU_L13_Neural,\n'
-            '    EfficientDivMod_Neural,\n'
+            '    ALUAndOrXor,\n'
+            '    ALUMul,\n'
+            '    ALUDivMod,\n'
             ')',
             'from .efficient_alu_neural import (\n'
-            '    EfficientALU_L8_L9_Neural,\n'
-            '    EfficientALU_L10_Neural,\n'
-            '    EfficientALU_L11_L12_Neural,\n'
-            '    EfficientALU_L13_Neural,\n'
-            '    EfficientDivMod_Neural,\n'
+            '    ALUAddSub,\n'
+            '    ALUAndOrXor,\n'
+            '    ALUMul,\n'
+            '    ALUShift,\n'
+            '    ALUDivMod,\n'
             ')\n'
             'from .hybrid_alu import HybridALUBlock',
         )
@@ -176,13 +174,13 @@ def patch_vm_step(path):
         # Wire efficient structural ALU on top of lookup FFN weights.
         # The efficient module replaces OUTPUT for its opcodes (ADD/SUB/etc.)
         # while the lookup FFN handles LEA/ADJ/ENT/CMP/passthrough/etc.
-        model.blocks[8].ffn = HybridALUBlock(model.blocks[8].ffn, EfficientALU_L8_L9_Neural(S, BD))
-        model.blocks[9].ffn = HybridALUBlock(model.blocks[9].ffn, EfficientALU_L8_L9_Neural(S, BD))
-        model.blocks[10].ffn = HybridALUBlock(model.blocks[10].ffn, EfficientALU_L10_Neural(S, BD))
-        model.blocks[11].ffn = HybridALUBlock(model.blocks[11].ffn, EfficientALU_L11_L12_Neural(S, BD))
-        model.blocks[12].ffn = HybridALUBlock(model.blocks[12].ffn, EfficientALU_L11_L12_Neural(S, BD))
-        model.blocks[13].ffn = HybridALUBlock(model.blocks[13].ffn, EfficientALU_L13_Neural(S, BD))
-        model.blocks[10].post_ops.append(EfficientDivMod_Neural(S, BD))
+        model.blocks[8].ffn = HybridALUBlock(model.blocks[8].ffn, ALUAddSub(S, BD))
+        model.blocks[9].ffn = HybridALUBlock(model.blocks[9].ffn, ALUAddSub(S, BD))
+        model.blocks[10].ffn = HybridALUBlock(model.blocks[10].ffn, ALUAndOrXor(S, BD))
+        model.blocks[11].ffn = HybridALUBlock(model.blocks[11].ffn, ALUMul(S, BD))
+        model.blocks[12].ffn = HybridALUBlock(model.blocks[12].ffn, ALUMul(S, BD))
+        model.blocks[13].ffn = HybridALUBlock(model.blocks[13].ffn, ALUShift(S, BD))
+        model.blocks[10].post_ops.append(ALUDivMod(S, BD))
 '''
         anchor = (
             "    elif alu_mode == 'efficient':\n"

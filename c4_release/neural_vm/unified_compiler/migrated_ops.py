@@ -1436,7 +1436,7 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
       CarryPropagationPostOp x3,
       BitwiseBytePropagationPostOp,
       ComparisonCombine,
-      EfficientDivMod_Neural.
+      ALUDivMod.
 
     The existing `make_l10_post_ops_combined` is unrelated: it bakes the
     LOGIC of the FFN-style post_ops into a single phase-10.5 FFN (a parallel
@@ -1457,7 +1457,7 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             BitwiseBytePropagationPostOp,
             ComparisonCombine,
             DivModModule,
-            EfficientDivMod_Neural,
+            ALUDivMod,
             _SetDim,
         )
         # Use the block's d_model when available; fall back to 512 to mirror
@@ -1482,8 +1482,8 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         block.post_ops.append(BitwiseBytePropagationPostOp(d_model=d_model, S=S))
         if alu_mode == "lookup":
             # The lookup-mode HybridALU override in set_vm_weights replaces
-            # this DivModModule with EfficientDivMod_Neural via
-            # `model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)`.
+            # this DivModModule with ALUDivMod via
+            # `model.blocks[10].post_ops[-1] = ALUDivMod(S, BD)`.
             block.post_ops.append(DivModModule(mode="lookup"))
         else:  # efficient
             # Pass the model's actual d_model so the underlying PureFFN's
@@ -1491,7 +1491,7 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             # this, ComparisonCombine builds a Linear(512, 18) which fails
             # forward when d_model != 512 (e.g., pin_io_only=True paths).
             block.post_ops.append(ComparisonCombine(d_model=d_model, S=S))
-            block.post_ops.append(EfficientDivMod_Neural(S, _SetDim))
+            block.post_ops.append(ALUDivMod(S, _SetDim))
 
     return Operation(
         name="l10_post_op_attach",
@@ -1900,7 +1900,7 @@ def make_embedding_bake_op() -> Operation:
 # L11/L12 MUL ALU flattening (2026-05-10)
 #
 # The previous `set_vm_weights` line
-#   model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)  # = ALUMul
+#   model.blocks[11].ffn = ALUMul(S, BD)
 # wrapped 9 logical sub-stages (BD→GE convert, schoolbook partial products,
 # 3 carry-extraction passes, gen/prop, binary carry-lookahead, final
 # correction, GE→BD convert) inside a single `PureNeuralALU(operations='mul')`
