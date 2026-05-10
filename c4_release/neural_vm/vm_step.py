@@ -2245,15 +2245,9 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
 
         # ===== EFFICIENT ALU HYBRID OVERRIDE =====
-        # Wire efficient structural ALU on top of lookup FFN weights.
-        # The efficient module replaces OUTPUT for its opcodes (ADD/SUB/etc.)
-        # while the lookup FFN handles LEA/ADJ/ENT/CMP/passthrough/etc.
-        model.blocks[8].ffn = HybridALUBlock(model.blocks[8].ffn, EfficientALU_L8_L9_Neural(S, BD))
-        model.blocks[9].ffn = HybridALUBlock(model.blocks[9].ffn, EfficientALU_L8_L9_Neural(S, BD))
-        model.blocks[10].ffn = HybridALUBlock(model.blocks[10].ffn, EfficientALU_L10_Neural(S, BD))
-        model.blocks[11].ffn = HybridALUBlock(model.blocks[11].ffn, EfficientALU_L11_L12_Neural(S, BD))
-        model.blocks[12].ffn = HybridALUBlock(model.blocks[12].ffn, EfficientALU_L11_L12_Neural(S, BD))
-        model.blocks[13].ffn = HybridALUBlock(model.blocks[13].ffn, EfficientALU_L13_Neural(S, BD))
+        # The HybridALUBlock wraps for L8-L13 are now provided by migrated
+        # block-ops (l8/l9/l10/l11/l12/l13_hybrid_alu_wrap in migrated_ops.py)
+        # and dispatched at the end of set_vm_weights via _dispatch_migrated_block_ops.
         # Replace lookup DivModModule with efficient version
         model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)
     elif alu_mode == 'efficient':
@@ -2482,10 +2476,34 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # with right-sized versions containing ONLY those units. This is what "the compiler
     # determines network width" looks like: ffn_hidden becomes per-layer, equal to the
     # actually-needed unit count.
+    _dispatch_migrated_block_ops(model, S, alu_mode=alu_mode)
     _right_size_ffns(model)
     _expand_wrapper_blocks(model)
 
     return model
+
+
+def _dispatch_migrated_block_ops(model, S, alu_mode='lookup'):
+    """Run migrated block-level ops on the legacy-baked model.
+
+    Block ops with `migrated=True` claim their bake from set_vm_weights and
+    fire here on the corresponding TransformerBlock. Today this covers the
+    L8-L13 HybridALU wraps; the efficient alu_mode branch still has its
+    inline wraps (TODO: migrate that branch too).
+    """
+    if alu_mode != 'lookup':
+        return
+    from .unified_compiler.migrated_ops import all_hybrid_alu_wrap_ops
+    dim_positions = {
+        name: getattr(_SetDim, name) for name in dir(_SetDim)
+        if not name.startswith('_') and isinstance(getattr(_SetDim, name), int)
+    }
+    for op in all_hybrid_alu_wrap_ops():
+        if op.kind != "block" or not op.migrated:
+            continue
+        if op.layer_idx is None or op.layer_idx >= len(model.blocks):
+            continue
+        op.bake_fn(model.blocks[op.layer_idx], dim_positions, S)
 
 
 def _expand_wrapper_blocks(model):
