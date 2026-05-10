@@ -605,6 +605,42 @@ class AutoregressiveVMRunner:
             if exec_op == Opcode.PRTF:
                 self._neural_prtf_emit(context, output)
 
+            # MEM persistence shim (Phase 7, 2026-05-10): for store ops
+            # (SI/SC/PSH/JSR/ENT), extract the MEM section emitted by the
+            # neural network in the just-completed step and persist it into
+            # _memory + _mem_history so subsequent steps can read it back.
+            #
+            # Without this shim, MEM tokens only live in raw context — when
+            # context grows past the 512-token window, they get truncated and
+            # any later LI/LC for the same address reads zero. The non-
+            # pure_neural branch handles this via _extract_mem_section +
+            # _track_mem_access at lines below; the pure_neural early return
+            # used to skip both.
+            if exec_op in _MEM_STORE_OPS:
+                mem_section = self._extract_mem_section(context)
+                if mem_section is not None:
+                    addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
+                    value = sum((mem_section[5 + j] & 0xFF) << (j * 8) for j in range(4))
+                    # Persist value bytes into _memory so SI/SC value bytes are
+                    # available to LI/LC handlers (none run in pure_neural, but
+                    # keeping _memory consistent helps debugging / inspection).
+                    for j in range(4):
+                        self._memory[(addr + j) & 0xFFFFFFFF] = (value >> (j * 8)) & 0xFF
+                    # Persist into _mem_history so the next step's context
+                    # rebuild includes this MEM section (L15 attention reads
+                    # from _mem_history-derived MEM tokens for LI/LC).
+                    self._track_mem_access(addr, mem_section)
+
+                    # Rebuild context with persisted MEM history so the next
+                    # step's L15 lookup can find this MEM section. Mirrors the
+                    # rebuild done in the non-pure_neural branch (see below).
+                    last_step = context[-(Token.STEP_TOKENS):]
+                    mem_flat = []
+                    for tokens in self._mem_history.values():
+                        mem_flat.extend(tokens)
+                    context[prefix_len:] = mem_flat + list(last_step)
+                    self.model.embed.set_mem_history_end(prefix_len + len(mem_flat))
+
             # Only break on EXIT
             return exec_op == Opcode.EXIT
 

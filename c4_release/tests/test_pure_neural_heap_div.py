@@ -67,6 +67,7 @@ class TestPureNeuralALUCompleteness:
             Opcode.EXIT,
         ]) == expected
 
+
     @pytest.mark.parametrize("a,b,expected", [
         (7, 3, 1),
         (10, 3, 1),
@@ -120,43 +121,48 @@ class TestPureNeuralHeap:
 
     @pytest.mark.xfail(reason="SI/LI: _set_layer14_mem_generation / _set_layer15_memory_lookup / _set_layer7_memory_heads gaps")
     def test_si_then_li(self, pure_neural_runner):
+        # C4 SI semantics: addr = pop, mem[addr] = AX
+        # Push the address first, then load the value into AX, then SI.
         assert _run(pure_neural_runner, [
-            (Opcode.IMM, 100),
-            Opcode.PSH,
-            (Opcode.IMM, 1024),
-            Opcode.SI,
-            (Opcode.IMM, 1024),
-            Opcode.LI,
+            (Opcode.IMM, 1024),  # AX = addr
+            Opcode.PSH,           # push addr
+            (Opcode.IMM, 100),    # AX = value
+            Opcode.SI,            # mem[pop=1024] = AX=100
+            (Opcode.IMM, 1024),   # AX = addr
+            Opcode.LI,            # AX = mem[1024] = 100
             Opcode.EXIT,
         ]) == 100
 
     @pytest.mark.xfail(reason="SC/LC: _set_layer14_mem_generation / _set_layer15_memory_lookup gaps for char-width")
     def test_sc_then_lc(self, pure_neural_runner):
+        # C4 SC semantics: addr = pop, mem[addr] = AX (low byte)
         assert _run(pure_neural_runner, [
-            (Opcode.IMM, ord('A')),
-            Opcode.PSH,
-            (Opcode.IMM, 1024),
-            Opcode.SC,
-            (Opcode.IMM, 1024),
-            Opcode.LC,
+            (Opcode.IMM, 1024),       # AX = addr
+            Opcode.PSH,                # push addr
+            (Opcode.IMM, ord('A')),    # AX = value
+            Opcode.SC,                 # mem[pop=1024] = AX low byte
+            (Opcode.IMM, 1024),        # AX = addr
+            Opcode.LC,                 # AX = mem[1024]
             Opcode.EXIT,
         ]) == 65
 
     @pytest.mark.xfail(reason="Multi-address heap state: depends on per-step memory persistence in pure-neural")
     def test_two_writes_two_reads(self, pure_neural_runner):
+        # C4 SI semantics: addr = pop, mem[addr] = AX
+        # Final AX (returned by EXIT) is the last LI result.
         assert _run(pure_neural_runner, [
-            (Opcode.IMM, 7),
+            (Opcode.IMM, 1024),   # addr
             Opcode.PSH,
-            (Opcode.IMM, 1024),
-            Opcode.SI,
-            (Opcode.IMM, 42),
+            (Opcode.IMM, 7),      # value
+            Opcode.SI,            # mem[1024] = 7
+            (Opcode.IMM, 1032),   # addr
             Opcode.PSH,
+            (Opcode.IMM, 42),     # value
+            Opcode.SI,            # mem[1032] = 42
             (Opcode.IMM, 1032),
-            Opcode.SI,
-            (Opcode.IMM, 1032),
-            Opcode.LI,
+            Opcode.LI,            # AX = mem[1032] = 42
             (Opcode.IMM, 1024),
-            Opcode.LI,
+            Opcode.LI,            # AX = mem[1024] = 7
             Opcode.EXIT,
         ], max_steps=50) == 7
 
