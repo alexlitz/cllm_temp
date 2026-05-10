@@ -490,6 +490,258 @@ class ALUAndOrXor(PureNeuralALU):
         super().__init__(S, BD, operations='bitwise')
 
 
+# ---------------------------------------------------------------------------
+# Flattened AND/OR/XOR pipeline (vanilla nn.Sequential composite).
+#
+# 4 stages, each a separate nn.Module installed at L10.ffn by the compiler:
+#   Stage 0: BD → GE format conversion          (BitwiseBDToGEStage)
+#   Stage 1: per-opcode bit extraction          (BitwiseBitExtractStage)
+#   Stage 2: per-opcode bit combine + opcode    (BitwiseBitCombineStage)
+#            mask merge into RESULT
+#   Stage 3: GE → BD format conversion + write  (BitwiseGEToBDStage)
+#            OUTPUT_LO/HI gated by AX marker
+#
+# The stages share intermediate GE-format state via a `BitwisePipelineState`
+# object so the residual stream (BD-format) never has to carry the GE
+# workspace. Each stage takes ``x_bd`` in and returns ``x_bd`` out (residual
+# identity for stages 0-2, real writeback in stage 3) so the composite forward
+# is a literal `nn.Sequential` chain — vanilla composition, no hand-rolled
+# control flow.
+#
+# Forward semantics are byte-identical to the existing ``ALUAndOrXor.forward``
+# (= ``PureNeuralALU(operations='bitwise').forward``):
+#   - same `BDToGEConverter` weights for stage 0
+#   - same `build_{and,or,xor}_layers` factories for stages 1-2 (each builder
+#     yields [BitExtractFFN, BitCombineFFN]; AND/OR/XOR run in parallel on
+#     cloned GE buffers, then merge via 0.1-threshold opcode mask)
+#   - same MARK_AX > 0.5 gating before GE → BD writeback
+# ---------------------------------------------------------------------------
+
+
+class BitwisePipelineState:
+    """Per-composite scratch space for the 4-stage AND/OR/XOR pipeline.
+
+    Attaches to ``FlattenedALUAndOrXor`` and is referenced by all 4 stage
+    modules. Holds intermediate tensors so each stage runs as a standalone
+    block without serialising the full GE workspace into the BD residual.
+    """
+
+    def __init__(self):
+        self.x_bd_in = None
+        self.x_ge_flat = None    # [B*seq, 8, 160] — initial GE state (clone src)
+        self.x_and = None        # [B*seq, 8, 160] — AND pipeline buffer
+        self.x_or = None         # [B*seq, 8, 160] — OR pipeline buffer
+        self.x_xor = None        # [B*seq, 8, 160] — XOR pipeline buffer
+        self.x_ge_out = None     # [B, seq, 8, 160]  — merged result GE
+        self.opcode_mask = None  # [B, seq] — opcode mask gated by MARK_AX
+
+
+class BitwiseBDToGEStage(nn.Module):
+    """Stage 0: BD → GenericE format conversion.
+
+    Converts the one-hot ALU_LO/HI, AX_CARRY_LO/HI nibbles into scalar
+    NIB_A/NIB_B slots and copies opcode flags into the GE OP_START region.
+    Stashes the converted state for downstream stages and returns x_bd
+    unchanged (residual identity).
+    """
+
+    def __init__(self, S, BD, state: BitwisePipelineState):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.ge = GenericE(NIBBLE)
+        self.state = state
+        self.bd_to_ge = BDToGEConverter(BD, self.ge)
+
+    def forward(self, x_bd):
+        x_ge = self.bd_to_ge(x_bd)  # [B, seq, 8, 160]
+        B, seq_len, _, _ = x_ge.shape
+        x_ge_flat = x_ge.view(B * seq_len, 8, self.ge.DIM)
+        # Initialise per-opcode pipeline buffers as clones of the GE state.
+        self.state.x_bd_in = x_bd
+        self.state.x_ge_flat = x_ge_flat
+        self.state.x_and = x_ge_flat.clone()
+        self.state.x_or = x_ge_flat.clone()
+        self.state.x_xor = x_ge_flat.clone()
+        return x_bd
+
+
+class BitwiseBitExtractStage(nn.Module):
+    """Stage 1: per-opcode bit extraction (BitExtractFFN).
+
+    Each of AND/OR/XOR has its own `BitExtractFFN` (gated on its own opcode)
+    that splits NIB_A and NIB_B into the per-bit temp slots used by the
+    combine stage. Runs all three in parallel on the cloned GE buffers
+    seeded by stage 0. Mirrors the ``layers[0]`` step of `build_and_layers`,
+    `build_or_layers`, `build_xor_layers` from `alu.ops.bitwise`.
+    """
+
+    def __init__(self, S, BD, state: BitwisePipelineState):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.state = state
+        self.ge = GenericE(NIBBLE)
+        # build_and/or/xor_layers each return [BitExtractFFN, CombineFFN]
+        # for non-BIT configs (NIBBLE has chunk_bits=4). Take index 0 here.
+        self.and_extract = build_and_layers(NIBBLE, opcode=30)[0]
+        self.or_extract = build_or_layers(NIBBLE, opcode=28)[0]
+        self.xor_extract = build_xor_layers(NIBBLE, opcode=29)[0]
+
+    def forward(self, x_bd):
+        self.state.x_and = self.and_extract(self.state.x_and)
+        self.state.x_or = self.or_extract(self.state.x_or)
+        self.state.x_xor = self.xor_extract(self.state.x_xor)
+        return x_bd
+
+
+class BitwiseBitCombineStage(nn.Module):
+    """Stage 2: per-opcode bit combine + opcode-mask merge.
+
+    Each of AND/OR/XOR runs its combine FFN (`BitAndCombineClearFFN`,
+    `BitOrCombineClearFFN`, `BitXorCombineClearFFN`) on the per-opcode
+    buffer from stage 1. Outputs are merged into a single GE result buffer
+    via per-opcode masks (opcode value > 0.1 → 1.0). Stashes the merged
+    GE state and the opcode mask for stage 3.
+    """
+
+    def __init__(self, S, BD, state: BitwisePipelineState):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.state = state
+        self.ge = GenericE(NIBBLE)
+        self.and_combine = build_and_layers(NIBBLE, opcode=30)[1]
+        self.or_combine = build_or_layers(NIBBLE, opcode=28)[1]
+        self.xor_combine = build_xor_layers(NIBBLE, opcode=29)[1]
+
+    def forward(self, x_bd):
+        x_and = self.and_combine(self.state.x_and)
+        x_or = self.or_combine(self.state.x_or)
+        x_xor = self.xor_combine(self.state.x_xor)
+
+        ge = self.ge
+        x_ge_flat = self.state.x_ge_flat
+
+        # FIX 2026-05-06: Normalize opcode values to 0/1 (matches PureNeuralALU.forward).
+        op_and = (x_ge_flat[:, 0, ge.OP_START + 30] > 0.1).float()
+        op_or = (x_ge_flat[:, 0, ge.OP_START + 28] > 0.1).float()
+        op_xor = (x_ge_flat[:, 0, ge.OP_START + 29] > 0.1).float()
+        op_total = op_and + op_or + op_xor
+
+        x_ge_out = x_ge_flat.clone()
+        x_ge_out[:, :, ge.RESULT] = (
+            x_and[:, :, ge.RESULT] * op_and[:, None]
+            + x_or[:, :, ge.RESULT] * op_or[:, None]
+            + x_xor[:, :, ge.RESULT] * op_xor[:, None]
+        )
+
+        x_bd_in = self.state.x_bd_in
+        B, seq_len, _ = x_bd_in.shape
+        x_ge_out = x_ge_out.view(B, seq_len, 8, ge.DIM)
+        opcode_mask = op_total.view(B, seq_len)
+
+        # MARK_AX gating (matches PureNeuralALU.forward post-loop step).
+        BD = self.BD
+        mark_ax = x_bd_in[:, :, BD.MARK_AX]
+        opcode_mask = opcode_mask * (mark_ax > 0.5).float()
+
+        self.state.x_ge_out = x_ge_out
+        self.state.opcode_mask = opcode_mask
+        return x_bd
+
+
+class BitwiseGEToBDStage(nn.Module):
+    """Stage 3: GenericE → BD format conversion + write OUTPUT.
+
+    Reads the merged GE RESULT from stage 2 and writes one-hot OUTPUT_LO/HI
+    into x_bd, gated by the AX-marker-aware opcode mask. Returns the
+    updated x_bd as the FFN output.
+    """
+
+    def __init__(self, S, BD, state: BitwisePipelineState):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.state = state
+        self.ge = GenericE(NIBBLE)
+        self.ge_to_bd = GEToBDConverter(BD, self.ge, S)
+
+    def forward(self, x_bd):
+        x_ge_out = self.state.x_ge_out
+        opcode_mask = self.state.opcode_mask
+        x_bd_out = self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
+        return x_bd_out
+
+
+class FlattenedALUAndOrXor(nn.Module):
+    """Vanilla composite AND/OR/XOR FFN: 4 sub-stages run as `nn.Sequential`.
+
+    Drop-in replacement for ``ALUAndOrXor`` (= ``PureNeuralALU(operations=
+    'bitwise')``) at L10. Forward is byte-identical to the original wrapper:
+    same `BDToGEConverter`, same `build_{and,or,xor}_layers` FFNs, same
+    0.1-threshold opcode mask, same MARK_AX gating. The difference is
+    structural — the monolithic forward() is split into 4 stage modules
+    that share intermediate state via a `BitwisePipelineState` and chain
+    via a literal ``nn.Sequential``.
+
+    The 4 sub-stages are exposed as named attributes so a future compiler
+    bake_fn pipeline (analogous to ``make_l13_alu_shift_*_op``) can install
+    each stage independently. Until those compiler ops exist, this class
+    can be instantiated directly as a runtime-equivalent of ALUAndOrXor.
+    """
+
+    def __init__(self, S, BD):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.state = BitwisePipelineState()
+        # Vanilla nn.Sequential composition: each stage takes x_bd → x_bd.
+        # Stages are registered ONLY through `pipeline` (not as direct
+        # attributes) to avoid double-counting in `state_dict()`. Access them
+        # via `bdtoge_stage`/`bit_extract_stage`/`bit_combine_stage`/
+        # `getobd_stage` properties below for readability + compiler-op hooks.
+        self.pipeline = nn.Sequential(
+            BitwiseBDToGEStage(S, BD, self.state),
+            BitwiseBitExtractStage(S, BD, self.state),
+            BitwiseBitCombineStage(S, BD, self.state),
+            BitwiseGEToBDStage(S, BD, self.state),
+        )
+
+    # Named-stage views into `self.pipeline` so external callers (compiler
+    # bake_fns, debug introspection) can fetch a stage without hard-coding
+    # the index. `nn.Sequential` indexing is supported as of PyTorch 1.0+.
+    @property
+    def bdtoge_stage(self) -> BitwiseBDToGEStage:
+        return self.pipeline[0]
+
+    @property
+    def bit_extract_stage(self) -> BitwiseBitExtractStage:
+        return self.pipeline[1]
+
+    @property
+    def bit_combine_stage(self) -> BitwiseBitCombineStage:
+        return self.pipeline[2]
+
+    @property
+    def getobd_stage(self) -> BitwiseGEToBDStage:
+        return self.pipeline[3]
+
+    def forward(self, x_bd):
+        return self.pipeline(x_bd)
+
+    # Stub methods for compatibility with vm_step.py model utilities
+    # (mirror PureNeuralALU).
+    def compact(self, block_size=1):
+        pass
+
+    def sparsify(self):
+        pass
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        pass
+
+
 class FlattenedALUMul(nn.Module):
     """Flattened (compiler-baked) MUL ALU.
 
