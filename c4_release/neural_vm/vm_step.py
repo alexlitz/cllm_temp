@@ -2207,8 +2207,17 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # attaches all 7 modules to model.blocks[10].post_ops before legacy_bake
         # runs.
 
-        # L11-L12: Neural MUL
-        model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)
+        # L11-L12: Neural MUL.
+        # MIGRATED 2026-05-10: 9 compiler block ops at L11 (phases 11.0..12.3)
+        # install a `FlattenedALUMul` module on `model.blocks[11].ffn` BEFORE
+        # legacy_bake (this function) runs. We skip the inline assignment in
+        # that case so the flattened module isn't clobbered. The block ops are
+        # registered in `compile_full_vm` only when alu_mode='efficient'; if
+        # they did not run (e.g., direct `set_vm_weights` invocation), fall
+        # back to the monolithic ALUMul wrapper for backward-compat.
+        from .efficient_alu_neural import FlattenedALUMul as _FlatMul
+        if not isinstance(model.blocks[11].ffn, _FlatMul):
+            model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)
 
         # L13: Memory addr gather attention migrated to compiler op
         # `layer13_mem_addr_gather` (attn) which runs before legacy_bake.
