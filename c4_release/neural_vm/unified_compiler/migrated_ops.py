@@ -993,6 +993,72 @@ def make_l10_post_ops_combined() -> Operation:
     )
 
 
+# ---------------------------------------------------------------------------
+# HybridALU wrap block-ops (migrated from set_vm_weights lines 2377-2382)
+# ---------------------------------------------------------------------------
+#
+# Block-level migration: the lookup-mode ALU layers wrap their lookup FFN with
+# a HybridALUBlock that runs a structural neural ALU on top. Each layer/ALU
+# pairing is a separate op so the compiler can place/reorder/expand them
+# independently in the future.
+#
+# Each factory takes alu_mode='lookup' (production default). Efficient mode is
+# TODO — its semantics differ (replace ffn vs wrap ffn) and need a separate
+# migration pass.
+
+def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
+                             alu_mode: str = 'lookup') -> Operation:
+    if alu_mode != 'lookup':
+        # TODO(efficient-mode): efficient alu_mode REPLACES ffn rather than
+        # wrapping it (see vm_step.py:2385-2434), so the bake_fn semantics
+        # differ. Migrate that branch in a follow-up.
+        raise NotImplementedError(
+            f"alu_mode={alu_mode!r} not yet supported for hybrid wrap ops"
+        )
+
+    def bake(block, dim_positions, S):
+        from ..vm_step import _SetDim
+        from ..hybrid_alu import HybridALUBlock
+        from .. import efficient_alu_neural as eau
+        alu_cls = getattr(eau, alu_cls_name)
+        block.ffn = HybridALUBlock(block.ffn, alu_cls(S, _SetDim))
+
+    return Operation(
+        name=name,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        layer_idx=layer_idx,
+        bake_fn=bake,
+        phase=layer_idx + 0.5,
+        migrated=True,
+    )
+
+
+def make_l8_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_hybrid_alu_wrap_op("l8_hybrid_alu_wrap", 8, "ALUAddSub", alu_mode)
+
+
+def make_l9_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_hybrid_alu_wrap_op("l9_hybrid_alu_wrap", 9, "ALUAddSub", alu_mode)
+
+
+def make_l10_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_hybrid_alu_wrap_op("l10_hybrid_alu_wrap", 10, "ALUAndOrXor", alu_mode)
+
+
+def make_l11_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_hybrid_alu_wrap_op("l11_hybrid_alu_wrap", 11, "ALUMul", alu_mode)
+
+
+def make_l12_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_hybrid_alu_wrap_op("l12_hybrid_alu_wrap", 12, "ALUMul", alu_mode)
+
+
+def make_l13_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_hybrid_alu_wrap_op("l13_hybrid_alu_wrap", 13, "ALUShift", alu_mode)
+
+
 def setup_token_embeddings(embed_weight, dim_positions: Dict[str, int] = None) -> None:
     """Bake the per-token embedding values using compiler dim positions.
 
@@ -1223,6 +1289,13 @@ def all_core_ops() -> list:
         make_layer9_marker_suppress_op(),
         # L10 post_ops merged into a single phase-10.5 ffn
         make_l10_post_ops_combined(),
+        # HybridALU block-op wraps (migrated from set_vm_weights lookup branch)
+        make_l8_hybrid_alu_wrap_op(),
+        make_l9_hybrid_alu_wrap_op(),
+        make_l10_hybrid_alu_wrap_op(),
+        make_l11_hybrid_alu_wrap_op(),
+        make_l12_hybrid_alu_wrap_op(),
+        make_l13_hybrid_alu_wrap_op(),
     ]
 
 

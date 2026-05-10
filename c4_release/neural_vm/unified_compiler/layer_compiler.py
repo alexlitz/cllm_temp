@@ -51,10 +51,14 @@ class Operation:
     """A single declarative operation that the compiler can place at any layer.
 
     `reads` and `writes` are dim names (declared via `compiler.declare_dim(...)`).
-    `kind` is "attn" or "ffn" — determines whether the op programs the block's
-    attention or feed-forward.
+    `kind` is "attn", "ffn", or "block":
+      - "attn": programs the block's attention module
+      - "ffn": programs the block's feed-forward module
+      - "block": targets the whole TransformerBlock (e.g., wrap ffn in a
+        composite module). Block ops bypass dependency analysis and are
+        pinned to `layer_idx`; they fire after attn/ffn ops at that layer.
     `bake_fn(module, dim_positions, S)` is invoked at compile time to actually
-    write the weights into the assigned attention or FFN module.
+    write the weights. For block ops, `module` is the whole TransformerBlock.
 
     `phase` is an optional ordering hint. When the dep graph has ambiguity
     (e.g., two ops both read+write the same dim at different positions, which
@@ -62,14 +66,24 @@ class Operation:
     break ties: an edge u→v in the dep graph is dropped if u.phase > v.phase.
     Smaller phase = earlier. Use the original `_set_layerN_*` layer number as
     the phase for migrated ops to preserve hand-set order.
+
+    `layer_idx` is required when kind="block" — it pins the op to that exact
+    layer index. Ignored for attn/ffn kinds.
+
+    `migrated` marks an op as having claimed its bake from the legacy
+    set_vm_weights path. Both `build_model_from_layout` and the legacy bake's
+    migrated-op dispatch hook respect this flag: when True the op runs in the
+    new path, and the legacy path skips its corresponding inline bake.
     """
 
     name: str
     reads: Set[str]
     writes: Set[str]
-    kind: str  # "attn" or "ffn"
+    kind: str  # "attn", "ffn", or "block"
     bake_fn: Callable
-    phase: Optional[int] = None
+    phase: Optional[float] = None
+    layer_idx: Optional[int] = None
+    migrated: bool = False
 
     def __hash__(self):
         return hash(self.name)
@@ -140,8 +154,10 @@ class LayerCompiler:
             self._pinned[name] = pinned
 
     def add_op(self, op: Operation):
-        if op.kind not in ("attn", "ffn"):
-            raise ValueError(f"op.kind must be 'attn' or 'ffn'; got {op.kind!r}")
+        if op.kind not in ("attn", "ffn", "block"):
+            raise ValueError(f"op.kind must be 'attn', 'ffn', or 'block'; got {op.kind!r}")
+        if op.kind == "block" and op.layer_idx is None:
+            raise ValueError(f"Block op {op.name!r} requires layer_idx")
         if op.name in self._op_by_name:
             raise ValueError(f"Operation name {op.name!r} already added")
         # Validate that every read/write is declared.
@@ -159,8 +175,15 @@ class LayerCompiler:
 
     def compile(self) -> ModelLayout:
         """Produce a ModelLayout from the declared ops and dims."""
-        topo = self._topological_sort()
+        # Block ops are pinned to layer_idx and skip dep analysis.
+        attn_ffn_ops = [op for op in self.ops if op.kind != "block"]
+        block_ops = [op for op in self.ops if op.kind == "block"]
+
+        topo = self._topological_sort(attn_ffn_ops)
         layer_assignment = self._assign_layers(topo)
+        for op in block_ops:
+            layer_assignment[op.name] = op.layer_idx
+
         dim_positions = self._allocate_dims()
 
         n_layers = (max(layer_assignment.values()) + 1) if layer_assignment else 0
@@ -170,7 +193,10 @@ class LayerCompiler:
             d_model = max(d_model, pos + self.dims[name])
 
         ops_per_layer: List[List[Operation]] = [[] for _ in range(n_layers)]
-        for op in self.ops:
+        # attn/ffn first, then block ops, so blocks bake last on their layer.
+        for op in attn_ffn_ops:
+            ops_per_layer[layer_assignment[op.name]].append(op)
+        for op in block_ops:
             ops_per_layer[layer_assignment[op.name]].append(op)
 
         return ModelLayout(
@@ -185,16 +211,18 @@ class LayerCompiler:
     # Internals
     # --------------------------------------------------------------------
 
-    def _topological_sort(self) -> List[Operation]:
+    def _topological_sort(self, ops: Optional[List[Operation]] = None) -> List[Operation]:
         """Return ops sorted so each op comes after every op that writes a dim it reads.
 
         Cycles: writes-then-reads on the same dim across ops is fine (downstream op
         sees upstream's write). A *cycle* would be op A reads dim X written by B,
         and B reads dim Y written by A. We detect cycles and raise.
         """
+        if ops is None:
+            ops = self.ops
         # writers[d] = list of ops that write dim d
         writers: Dict[str, List[Operation]] = {d: [] for d in self.dims}
-        for op in self.ops:
+        for op in ops:
             for d in op.writes:
                 writers[d].append(op)
 
@@ -206,12 +234,15 @@ class LayerCompiler:
         # 2. Block-internal kind ordering: at the SAME phase, attn comes
         #    before ffn within a transformer block. So an ffn writer doesn't
         #    create a dep on an attn reader at the same phase.
-        in_edges: Dict[str, Set[str]] = {op.name: set() for op in self.ops}
-        out_edges: Dict[str, Set[str]] = {op.name: set() for op in self.ops}
-        for v in self.ops:
+        in_edges: Dict[str, Set[str]] = {op.name: set() for op in ops}
+        out_edges: Dict[str, Set[str]] = {op.name: set() for op in ops}
+        op_set = {op.name for op in ops}
+        for v in ops:
             for d in v.reads:
                 for u in writers.get(d, ()):
                     if u.name == v.name:
+                        continue
+                    if u.name not in op_set:
                         continue
                     # Phase-based pruning
                     if (u.phase is not None and v.phase is not None):
@@ -226,9 +257,9 @@ class LayerCompiler:
                     out_edges[u.name].add(v.name)
 
         # Kahn's algorithm
-        ready = [op for op in self.ops if not in_edges[op.name]]
+        ready = [op for op in ops if not in_edges[op.name]]
         # Stable order: by insertion order, so determinism
-        ready.sort(key=lambda o: self.ops.index(o))
+        ready.sort(key=lambda o: ops.index(o))
         result: List[Operation] = []
         while ready:
             op = ready.pop(0)
@@ -237,9 +268,9 @@ class LayerCompiler:
                 in_edges[v_name].discard(op.name)
                 if not in_edges[v_name]:
                     ready.append(self._op_by_name[v_name])
-            ready.sort(key=lambda o: self.ops.index(o))
+            ready.sort(key=lambda o: ops.index(o))
 
-        if len(result) != len(self.ops):
+        if len(result) != len(ops):
             stuck = [name for name, ins in in_edges.items() if ins]
             raise ValueError(f"Dependency cycle detected; stuck ops: {stuck}")
         return result
@@ -303,7 +334,8 @@ class LayerCompiler:
         return positions
 
 
-def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
+def build_model_from_layout(layout: ModelLayout, S: float = 100.0,
+                            legacy_bake: Optional[Set[str]] = None):
     """Construct an AutoregressiveVM from a compiled layout and bake all ops.
 
     This is the bridge from "layout produced by compiler" to "working model".
@@ -312,17 +344,18 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
       - The model's block at that layer index has its attn programmed by all
         ops with kind="attn" assigned to that layer.
       - The block's ffn is programmed by all ops with kind="ffn".
+      - Block ops (kind="block") are dispatched on the whole TransformerBlock
+        after attn/ffn ops at that layer.
 
     Each op's bake_fn is called with (target_module, dim_positions, S) where
-    target_module is the attn or ffn at the assigned block.
-
-    Note: this assumes a single op per (layer, kind). The layer compiler
-    enforces this via _assign_layers; multiple ops of the same kind would
-    need to be combined upstream into a single op, or split across layers.
+    target_module is the attn, ffn, or block depending on op.kind.
 
     Args:
         layout: ModelLayout from LayerCompiler.compile()
         S: SwiGLU activation scale (passed to each bake_fn)
+        legacy_bake: optional set of op-name strings whose bakes are still
+            handled by an external (legacy) path. Ops in this set are skipped
+            UNLESS they have op.migrated=True, in which case they fire here.
 
     Returns:
         AutoregressiveVM instance with weights baked.
@@ -331,27 +364,27 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
     from ..vm_step import AutoregressiveVM
 
     if layout.n_layers == 0:
-        # Trivial empty layout — return a zero-layer model
-        # (AutoregressiveVM doesn't support 0 layers; we use 1 with no ops baked)
         n_layers = 1
     else:
         n_layers = layout.n_layers
 
-    # Auto d_model is derived from layout, not hardcoded.
     model = AutoregressiveVM(d_model=layout.d_model, n_layers=n_layers)
 
-    # Wrap the entire bake pass in no_grad so bake_fn implementations can do
-    # in-place writes to leaf Parameters (the pattern used throughout
-    # vm_step.py's hand-set weights).
     import torch as _torch
     with _torch.no_grad():
         for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer):
             block = model.blocks[layer_idx]
             for op in ops_at_layer:
+                if (legacy_bake is not None
+                        and op.name in legacy_bake
+                        and not op.migrated):
+                    continue
                 if op.kind == "attn":
                     target = block.attn
                 elif op.kind == "ffn":
                     target = block.ffn
+                elif op.kind == "block":
+                    target = block
                 else:
                     raise ValueError(f"Unknown op kind {op.kind!r}")
                 op.bake_fn(target, layout.dim_positions, S)
