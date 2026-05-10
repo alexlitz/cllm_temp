@@ -683,19 +683,39 @@ class Primitives:
         S: float,
         HD: int,
         alibi_slope: float = 1.0,
+        is_byte_strength: float = 3.0,
+        has_se_strength: float = 1.0,
+        suppress_strength: float = 3.0,
+        q0_threshold: float = 3.5,
+        gate_const: float = -20000.0,
+        gate_target_marker: float = 10000.0,
+        gate_has_se: float = 10000.0,
+        gate_extras=None,
     ) -> None:
-        """Configure a full attention head implementing AX-style byte
-        passthrough across steps via shifted byte matching (Q byte K -> K
-        byte K+1 of prev step)."""
+        """Configure a full attention head implementing byte passthrough
+        across steps via shifted byte matching (Q byte K -> K byte K+1 of
+        prev step).
+
+        Mirrors `_set_layer10_byte_passthrough` (AX) and
+        `_set_layer10_sp_byte_passthrough` (SP). Copies
+        ``value_lo_dim`` / ``value_hi_dim`` (16 lo + 16 hi nibbles) into
+        OUTPUT_LO/OUTPUT_HI with strength 2.0.
+
+        Default Q[0] / Q[33] coefficients reproduce the AX function. The
+        SP variant overrides ``is_byte_strength=1.0``, ``has_se_strength=2.0``,
+        ``suppress_strength=2.0``, ``q0_threshold=1.5``, ``gate_const=-30000.0``,
+        and adds ``gate_extras=[(IS_BYTE, 10000), (PSH_AT_SP, -10000),
+        (CMP+3, -10000)]`` to encode the PSH/POP suppression.
+        """
         L = S
         base = head_idx * HD
 
-        # Q dim 0: IS_BYTE AND HAS_SE, suppressed by op flags, threshold -3.5L
-        attn.W_q.data[base + 0, BD.IS_BYTE] = L * 3
-        attn.W_q.data[base + 0, BD.HAS_SE] = L
+        # Q dim 0: IS_BYTE AND HAS_SE, suppressed by op flags
+        attn.W_q.data[base + 0, BD.IS_BYTE] = L * is_byte_strength
+        attn.W_q.data[base + 0, BD.HAS_SE] = L * has_se_strength
         for d in suppress_op_dims:
-            attn.W_q.data[base + 0, d] = -L * 3
-        attn.W_q.data[base + 0, BD.CONST] = -L * 3.5
+            attn.W_q.data[base + 0, d] = -L * suppress_strength
+        attn.W_q.data[base + 0, BD.CONST] = -L * q0_threshold
 
         # Q dim 1: target marker discrimination
         attn.W_q.data[base + 1, target_marker_dim] = L
@@ -722,9 +742,12 @@ class Primitives:
         attn.W_k.data[base + 5, BD.BYTE_INDEX_3] = L
 
         # Gate dim 33: hard AND of target_marker AND HAS_SE (kills leakage)
-        attn.W_q.data[base + 33, BD.CONST] = -20000.0
-        attn.W_q.data[base + 33, target_marker_dim] = 10000.0
-        attn.W_q.data[base + 33, BD.HAS_SE] = 10000.0
+        attn.W_q.data[base + 33, BD.CONST] = gate_const
+        attn.W_q.data[base + 33, target_marker_dim] = gate_target_marker
+        attn.W_q.data[base + 33, BD.HAS_SE] = gate_has_se
+        if gate_extras:
+            for d, w in gate_extras:
+                attn.W_q.data[base + 33, d] = w
         attn.W_k.data[base + 33, BD.CONST] = 5.0
 
         # V: copy 16 lo + 16 hi nibbles

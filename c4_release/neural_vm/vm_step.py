@@ -6777,94 +6777,40 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
     Byte 0's token (AX byte 0 value) is handled by the marker-level AX passthrough
     FFN, which reads AX_CARRY_LO/HI at the AX marker position.
 
-    Anti-leakage:
-      - Q dim 33: large negative bias at non-AX positions (H1[AX]=0) → kills softmax
-      - K dim 1: H1[AX_IDX] → only AX byte positions are strong K targets
-      - At step 0 (no prev AX bytes): Q attends to same-step PC bytes (all 0),
-        producing OUTPUT for token 0 (correct: AX=0 initially)
+    Q[0] gate (default ``byte_passthrough_chain`` coefficients):
+        IS_BYTE*3L + HAS_SE*L + (OP_IMM @ -3L) + (TEMP+3 @ -3L) + CONST*-3.5L
+      - AX marker: 0 + L - 3.5L = -2.5L < 0 (blocked)
+      - AX byte non-IMM non-bitwise: 3L + L - 3.5L = 0.5L > 0 (fires)
+      - First step (HAS_SE=0): 3L + 0 - 3.5L = -0.5L < 0 (blocked)
+      - IMM/BITWISE step at AX byte: 3L + L - 3L - 3.5L = -2.5L < 0 (blocked,
+        preserves multi-byte OUTPUT / lets BitwiseBytePropagation handle)
+
+    Q[33] AND gate: H1[AX] AND HAS_SE (kills leakage at non-AX / first step).
 
     Strength: W_o=2.0, weaker than carry override (≈5.0) so carry wins when active.
     ALiBi slope=1.0: prefers nearest step (d=35 beats d=70).
+
+    2026-05-10: Refactored to call ``Primitives.byte_passthrough_chain``
+    (set 1) for byte-identical weights with the AX-default coefficients.
     """
-    L = S  # attention scale
+    from .unified_compiler.primitives import Primitives as _P
+
     AX_IDX = 1
-    base = HD  # head 1 starts at dim 64
-
-    # Q dim 0: IS_BYTE AND HAS_SE (only fire on subsequent steps, not first step)
-    # First step: JMP sets OUTPUT at PC marker via Layer 6, don't overwrite it
-    # BUG FIX 2026-04-09: Old weights fired at AX marker (IS_BYTE=0, HAS_SE=2):
-    #   0 + 2*L*2 - 1.5*L = 2.5L > 0 (spurious!)
-    # New weights: require IS_BYTE strongly, weak HAS_SE contribution
-    #   AX marker: 0 + L*2 - 3.5L = -1.5L < 0 (blocked)
-    #   AX byte:   3L + L - 3.5L = 0.5L > 0 (fires)
-    #   First step: 3L + 0 - 3.5L = -0.5L < 0 (blocked)
-    #   IMM step: 3L + L - 3.5L - L = 0 (barely blocked, not enough)
-    #   With stronger OP_IMM suppression (-3L):
-    #   IMM step: 3L + L - 3.5L - 3L = -2.5L < 0 (blocked, preserves multi-byte OUTPUT)
-    #   Non-IMM: 3L + L - 3.5L - 0 = 0.5L > 0 (still fires)
-    # FIX 2026-05-08: SUPPRESS passthrough for bitwise ops (TEMP[3] = BITWISE_OP).
-    # For bitwise ops (AND/OR/XOR), BitwiseBytePropagationPostOp computes bytes 1-3.
-    # Passthrough would overwrite OUTPUT with prev step's bytes, corrupting the computation.
-    # For ADD/SUB and other ops, passthrough copies prev step's bytes (typically 0x00).
-    #   Without BITWISE_OP suppression:
-    #   AX byte (any op): 3L + L - 3.5L = 0.5L > 0 (fires)
-    #   With BITWISE_OP suppression (-3L):
-    #   AX byte + bitwise: 3L + L - 3L - 3.5L = -2.5L < 0 (blocked, BitwiseBytePropagation handles)
-    #   AX byte + ADD/SUB: 3L + L + 0 - 3.5L = 0.5L > 0 (fires, passes prev bytes)
-    attn.W_q[base + 0, BD.IS_BYTE] = L * 3  # Require IS_BYTE strongly
-    attn.W_q[base + 0, BD.HAS_SE] = L  # Weak HAS_SE (changed from L*2)
-    attn.W_q[base + 0, BD.OP_IMM] = -L * 3  # Suppress during IMM (preserve multi-byte OUTPUT)
-    attn.W_q[base + 0, BD.TEMP + 3] = -L * 3  # SUPPRESS when BITWISE_OP (relayed from L7 head 5)
-    attn.W_q[base + 0, BD.CONST] = -L * 3.5  # Threshold adjusted for suppression
-
-    # Q dim 1: H1[AX_IDX] (AX vs non-AX discrimination)
-    attn.W_q[base + 1, BD.H1 + AX_IDX] = L
-    attn.W_q[base + 1, BD.CONST] = -L / 2
-
-    # Q dim 2: suppress byte 3 (logits at byte 3 predict SP marker, not a byte)
-    attn.W_q[base + 2, BD.BYTE_INDEX_3] = -L
-    attn.W_q[base + 2, BD.CONST] = L / 2
-
-    # K dim 0: IS_BYTE
-    attn.W_k[base + 0, BD.IS_BYTE] = L
-
-    # K dim 1: H1[AX_IDX] (only AX bytes are strong K targets)
-    attn.W_k[base + 1, BD.H1 + AX_IDX] = L
-
-    # K dim 2: suppress byte 0 in K (not a valid target for shifted matching)
-    attn.W_k[base + 2, BD.BYTE_INDEX_0] = -L
-    attn.W_k[base + 2, BD.CONST] = L / 2
-
-    # Shifted byte matching: Q byte K → K byte K+1
-    # byte 0 (BYTE_INDEX_0) attends to byte 1 (BYTE_INDEX_1) of prev step
-    attn.W_q[base + 3, BD.BYTE_INDEX_0] = L
-    attn.W_k[base + 3, BD.BYTE_INDEX_1] = L
-    # byte 1 (BYTE_INDEX_1) attends to byte 2 (BYTE_INDEX_2) of prev step
-    attn.W_q[base + 4, BD.BYTE_INDEX_1] = L
-    attn.W_k[base + 4, BD.BYTE_INDEX_2] = L
-    # byte 2 (BYTE_INDEX_2) attends to byte 3 (BYTE_INDEX_3) of prev step
-    attn.W_q[base + 5, BD.BYTE_INDEX_2] = L
-    attn.W_k[base + 5, BD.BYTE_INDEX_3] = L
-
-    # Gate dim 33: Enforce AND logic (H1[AX]=1 AND HAS_SE=1) to suppress leakage.
-    # Uses high threshold requiring BOTH conditions to be true.
-    # At AX bytes on subsequent steps (H1[AX]=1, HAS_SE=1): Q_gate = 0, passes
-    # At non-AX (H1[AX]=0): Q_gate = -10000, kills softmax
-    # At first step (HAS_SE=0): Q_gate = -10000, kills softmax (redundant with Q dim 0)
-    attn.W_q[base + 33, BD.CONST] = -20000.0  # Changed from -10000 to enforce AND
-    attn.W_q[base + 33, BD.H1 + AX_IDX] = 10000.0
-    attn.W_q[base + 33, BD.HAS_SE] = 10000.0
-    attn.W_k[base + 33, BD.CONST] = 5.0
-
-    # V: copy CLEAN_EMBED nibbles (16 lo + 16 hi = 32 V dims)
-    for k in range(16):
-        attn.W_v[base + k, BD.CLEAN_EMBED_LO + k] = 1.0
-        attn.W_v[base + 16 + k, BD.CLEAN_EMBED_HI + k] = 1.0
-
-    # O: write to OUTPUT_LO/HI (strength 2.0, weaker than carry ≈5.0)
-    for k in range(16):
-        attn.W_o[BD.OUTPUT_LO + k, base + k] = 2.0
-        attn.W_o[BD.OUTPUT_HI + k, base + 16 + k] = 2.0
+    _P.byte_passthrough_chain(
+        attn,
+        head_idx=1,  # head 1 (base = HD)
+        source_marker_dim=BD.H1 + AX_IDX,
+        target_marker_dim=BD.H1 + AX_IDX,
+        value_lo_dim=BD.CLEAN_EMBED_LO,
+        value_hi_dim=BD.CLEAN_EMBED_HI,
+        # Suppress during IMM (multi-byte) and bitwise ops (TEMP+3 = BITWISE_OP).
+        suppress_op_dims=[BD.OP_IMM, BD.TEMP + 3],
+        S=S,
+        HD=HD,
+        alibi_slope=1.0,
+        # Defaults match AX coefficients (is_byte_strength=3, has_se_strength=1,
+        # suppress_strength=3, q0_threshold=3.5, gate_const=-20000, gate_*=10000).
+    )
 
 
 def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
@@ -6872,6 +6818,7 @@ def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
 
     Similar to AX byte passthrough but for SP. Only fires when PSH_AT_SP = 0
     (i.e., when SP doesn't change). When PSH is active, L6/L15 handle SP values.
+    Also suppressed during binary POP (CMP[3]) since L9/L15 handle SP += 8.
 
     Copies CLEAN_EMBED from previous step's SP bytes 1-3 → OUTPUT at current
     step's SP byte 0-2 positions. Uses shifted byte matching.
@@ -6881,67 +6828,48 @@ def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
       byte 1 pos → prev byte 2 (predicts byte 2 token)
       byte 2 pos → prev byte 3 (predicts byte 3 token)
       byte 3 pos → suppressed (predicts BP marker, not a byte)
+
+    Q[0] gate (SP-specific coefficients):
+        IS_BYTE*L + HAS_SE*2L + (PSH_AT_SP @ -2L) + CONST*-1.5L
+      - SP byte non-PSH non-first: L + 2L - 1.5L = 1.5L > 0 (fires)
+      - First step (HAS_SE=0): L + 0 - 1.5L = -0.5L < 0 (blocked)
+      - PSH step at SP byte: L + 2L - 2L - 1.5L = -0.5L < 0 (blocked)
+
+    Q[33] AND gate: IS_BYTE AND H1[SP] AND HAS_SE AND NOT PSH AND NOT POP
+    (gate_const=-30000 + 3*10000 base; PSH_AT_SP and CMP+3 contribute -10000
+    each via gate_extras to suppress during PSH and binary POP).
+
+    2026-05-10: Refactored to call ``Primitives.byte_passthrough_chain``
+    (set 1) using SP-specific overrides for the Q[0] / Q[33] coefficients.
     """
-    L = S  # attention scale
+    from .unified_compiler.primitives import Primitives as _P
+
     SP_IDX = 2
-    base = 2 * HD  # head 2 starts at dim 128
-
-    # Q dim 0: IS_BYTE AND HAS_SE AND NOT PSH_AT_SP
-    # First step: L3 defaults handle SP, don't interfere
-    # PSH step: L6/L15 PSH units handle SP, don't interfere
-    attn.W_q[base + 0, BD.IS_BYTE] = L
-    attn.W_q[base + 0, BD.HAS_SE] = L * 2  # Strong HAS_SE requirement
-    attn.W_q[base + 0, BD.PSH_AT_SP] = -L * 2  # Suppress during PSH
-    attn.W_q[base + 0, BD.CONST] = -L * 1.5  # Threshold
-
-    # Q dim 1: H1[SP_IDX] (SP vs non-SP discrimination)
-    attn.W_q[base + 1, BD.H1 + SP_IDX] = L
-    attn.W_q[base + 1, BD.CONST] = -L / 2
-
-    # Q dim 2: suppress byte 3 (logits at byte 3 predict BP marker, not a byte)
-    attn.W_q[base + 2, BD.BYTE_INDEX_3] = -L
-    attn.W_q[base + 2, BD.CONST] = L / 2
-
-    # K dim 0: IS_BYTE
-    attn.W_k[base + 0, BD.IS_BYTE] = L
-
-    # K dim 1: H1[SP_IDX] (only SP bytes are strong K targets)
-    attn.W_k[base + 1, BD.H1 + SP_IDX] = L
-
-    # K dim 2: suppress byte 0 in K (not a valid target for shifted matching)
-    attn.W_k[base + 2, BD.BYTE_INDEX_0] = -L
-    attn.W_k[base + 2, BD.CONST] = L / 2
-
-    # Shifted byte matching: Q byte K → K byte K+1
-    attn.W_q[base + 3, BD.BYTE_INDEX_0] = L
-    attn.W_k[base + 3, BD.BYTE_INDEX_1] = L
-    attn.W_q[base + 4, BD.BYTE_INDEX_1] = L
-    attn.W_k[base + 4, BD.BYTE_INDEX_2] = L
-    attn.W_q[base + 5, BD.BYTE_INDEX_2] = L
-    attn.W_k[base + 5, BD.BYTE_INDEX_3] = L
-
-    # Gate dim 33: Enforce AND logic (IS_BYTE=1 AND H1[SP]=1 AND HAS_SE=1 AND NOT PSH AND NOT POP)
-    # PSH_AT_SP suppresses during PSH (SP -= 8)
-    # CMP[3] suppresses during binary POP ops (SP += 8)
-    # At SP byte positions on subsequent non-modifying steps: all conditions met → Q[33] = 0 → passes
-    # During PSH or POP: Q[33] = -30000 + 10000*3 - 10000 = -10000 → suppressed
-    attn.W_q[base + 33, BD.CONST] = -30000.0
-    attn.W_q[base + 33, BD.IS_BYTE] = 10000.0
-    attn.W_q[base + 33, BD.H1 + SP_IDX] = 10000.0
-    attn.W_q[base + 33, BD.HAS_SE] = 10000.0
-    attn.W_q[base + 33, BD.PSH_AT_SP] = -10000.0  # Suppress during PSH
-    attn.W_q[base + 33, BD.CMP + 3] = -10000.0   # Suppress during binary POP (CMP[3])
-    attn.W_k[base + 33, BD.CONST] = 5.0
-
-    # V: copy CLEAN_EMBED nibbles (16 lo + 16 hi = 32 V dims)
-    for k in range(16):
-        attn.W_v[base + k, BD.CLEAN_EMBED_LO + k] = 1.0
-        attn.W_v[base + 16 + k, BD.CLEAN_EMBED_HI + k] = 1.0
-
-    # O: write to OUTPUT_LO/HI (strength 2.0)
-    for k in range(16):
-        attn.W_o[BD.OUTPUT_LO + k, base + k] = 2.0
-        attn.W_o[BD.OUTPUT_HI + k, base + 16 + k] = 2.0
+    _P.byte_passthrough_chain(
+        attn,
+        head_idx=2,  # head 2 (base = 2*HD)
+        source_marker_dim=BD.H1 + SP_IDX,
+        target_marker_dim=BD.H1 + SP_IDX,
+        value_lo_dim=BD.CLEAN_EMBED_LO,
+        value_hi_dim=BD.CLEAN_EMBED_HI,
+        # Q[0] suppression for PSH (SP -= 8 handled elsewhere).
+        suppress_op_dims=[BD.PSH_AT_SP],
+        S=S,
+        HD=HD,
+        alibi_slope=1.0,
+        # SP Q[0] coefficient overrides (not the AX defaults).
+        is_byte_strength=1.0,
+        has_se_strength=2.0,
+        suppress_strength=2.0,
+        q0_threshold=1.5,
+        # SP Q[33] gate uses larger negative bias and three extra AND terms.
+        gate_const=-30000.0,
+        gate_extras=[
+            (BD.IS_BYTE, 10000.0),         # require IS_BYTE
+            (BD.PSH_AT_SP, -10000.0),      # suppress during PSH (SP -= 8)
+            (BD.CMP + 3, -10000.0),        # suppress during binary POP (SP += 8)
+        ],
+    )
 
 
 def _set_layer10_psh_stack0_passthrough(attn, S, BD, HD):
