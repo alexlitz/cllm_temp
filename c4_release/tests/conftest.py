@@ -174,6 +174,23 @@ def neural_only_runner():
 
 
 @pytest.fixture
+def pure_neural_runner():
+    """Pure-neural runner: AutoregressiveVMRunner with all VM-semantic handlers
+    stripped (ALU/control-flow/memory). Mirrors `pure_neural=True` from the
+    M3-M6 branch — no Python overrides for opcodes implemented neurally.
+
+    Tool boundary handlers (PRTF/READ/CLOS/OPEN) are kept so syscalls still
+    function; the autoregressive forward pass alone must produce correct
+    PC/AX/SP/BP and ALU outputs.
+    """
+    from neural_vm.run_vm import AutoregressiveVMRunner
+
+    runner = AutoregressiveVMRunner()
+    runner._func_call_handlers = {}
+    return runner
+
+
+@pytest.fixture
 def handler_status():
     """Get current handler registration status."""
     from neural_vm.run_vm import AutoregressiveVMRunner
