@@ -3357,56 +3357,29 @@ def _set_layer4_ffn(ffn, S, BD):
     #   BYTE_INDEX_1 → generates byte2 → needs FETCH = PC+3
     #   BYTE_INDEX_2 → generates byte3 → needs FETCH = PC+4
     # Condition: IS_BYTE AND H1[AX_I] AND BYTE_INDEX_k (specific byte position)
+    # Hi-nibble has its own carry block: lo + offset >= 16 ⇒ lo ∈ [16-offset, 15]
+    # (each bit triggers the cancel-default + add-rotated +1 pair).
+    # REFACTORED: this is `nibble_rotation_chain` with gate_marker=IS_BYTE,
+    # condition_dims supplying the AX-row + byte-index AND, with_carry=True
+    # (the primitive iterates carry_src ∈ [16-offset, 15] automatically).
+    from .unified_compiler.primitives import Primitives as _P
     AX_I = 1
     for byte_idx in range(0, 3):
         offset = byte_idx + 2  # PC+2, PC+3, PC+4
-        # Lo nibble: rotate TEMP[0..15] by +offset → FETCH_LO[0..15]
-        for k in range(16):
-            src = (k - offset) % 16
-            ffn.W_up[unit, BD.IS_BYTE] = S
-            ffn.W_up[unit, BD.H1 + AX_I] = S
-            ffn.W_up[unit, BD.BYTE_INDEX_0 + byte_idx] = S
-            ffn.b_up[unit] = -S * 2.5
-            ffn.W_gate[unit, BD.TEMP + src] = 1.0
-            ffn.W_down[BD.FETCH_LO + k, unit] = 2.0 / S
-            unit += 1
-        # Hi nibble: default copy TEMP[16..31] → FETCH_HI[0..15]
-        # (no-carry case: PC_lo + offset stays in [0..15])
-        for k in range(16):
-            ffn.W_up[unit, BD.IS_BYTE] = S
-            ffn.W_up[unit, BD.H1 + AX_I] = S
-            ffn.W_up[unit, BD.BYTE_INDEX_0 + byte_idx] = S
-            ffn.b_up[unit] = -S * 2.5
-            ffn.W_gate[unit, BD.TEMP + 16 + k] = 1.0
-            ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
-            unit += 1
-        # Hi nibble: carry correction when PC_lo + offset >= 16.
-        # TEMP[0..15] is one-hot for PC_lo. Carry occurs when the set bit
-        # c satisfies c >= 16 - offset (i.e., c in [16-offset, 15]).
-        # For each such carry source bit, cancel the default-copy hi value
-        # and add the +1 rotated hi value. Pattern mirrors the PC-marker
-        # fork below (lines further down) but generalized for offset > 1.
-        for carry_src in range(16 - offset, 16):
-            for k in range(16):
-                # Cancel default: subtract TEMP[16+k] when (byte gates) AND TEMP[carry_src]
-                ffn.W_up[unit, BD.IS_BYTE] = S
-                ffn.W_up[unit, BD.H1 + AX_I] = S
-                ffn.W_up[unit, BD.BYTE_INDEX_0 + byte_idx] = S
-                ffn.W_up[unit, BD.TEMP + carry_src] = S
-                ffn.b_up[unit] = -S * 3.5
-                ffn.W_gate[unit, BD.TEMP + 16 + k] = -1.0
-                ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
-                unit += 1
-                # Write rotated: add TEMP[16+(k-1)%16] when (byte gates) AND TEMP[carry_src]
-                hi_src = (k - 1) % 16
-                ffn.W_up[unit, BD.IS_BYTE] = S
-                ffn.W_up[unit, BD.H1 + AX_I] = S
-                ffn.W_up[unit, BD.BYTE_INDEX_0 + byte_idx] = S
-                ffn.W_up[unit, BD.TEMP + carry_src] = S
-                ffn.b_up[unit] = -S * 3.5
-                ffn.W_gate[unit, BD.TEMP + 16 + hi_src] = 1.0
-                ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
-                unit += 1
+        unit = _P.nibble_rotation_chain(
+            ffn,
+            unit=unit,
+            gate_marker=BD.IS_BYTE,
+            source_lo_dim=BD.TEMP,
+            source_hi_dim=BD.TEMP + 16,
+            target_lo_dim=BD.FETCH_LO,
+            target_hi_dim=BD.FETCH_HI,
+            offset=offset,
+            with_carry=True,
+            S=S,
+            magnitude=2.0,
+            condition_dims=[BD.H1 + AX_I, BD.BYTE_INDEX_0 + byte_idx],
+        )
 
     # === PC+1 at PC marker → FETCH_LO/HI for dynamic immediate fetch ===
     # FIX 2026-04-29: Compute PC+1 at the PC marker and write to FETCH dims.
@@ -3415,35 +3388,20 @@ def _set_layer4_ffn(ffn, S, BD):
     # This fixes BZ/BNZ branch targets and JMP targets for non-first steps.
     # EMBED_LO/HI at PC marker contains current PC (from L3 carry-forward).
     # Same nibble rotation logic as TEMP at AX marker, but gated on MARK_PC.
-    for k in range(16):
-        src = (k - 1) % 16
-        ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.b_up[unit] = -S * 0.5
-        ffn.W_gate[unit, BD.EMBED_LO + src] = 1.0
-        ffn.W_down[BD.FETCH_LO + k, unit] = 2.0 / S
-        unit += 1
-
-    for k in range(16):
-        ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.b_up[unit] = -S * 0.5
-        ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
-        ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
-        unit += 1
-
-    for k in range(16):
-        ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.EMBED_LO + 15] = S
-        ffn.b_up[unit] = -S * 1.5
-        ffn.W_gate[unit, BD.EMBED_HI + k] = -1.0
-        ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
-        unit += 1
-        src = (k - 1) % 16
-        ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.EMBED_LO + 15] = S
-        ffn.b_up[unit] = -S * 1.5
-        ffn.W_gate[unit, BD.EMBED_HI + src] = 1.0
-        ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
-        unit += 1
+    # REFACTORED: this is the canonical carry-aware (PC+1) rotation at MARK_PC.
+    unit = _P.nibble_rotation_chain(
+        ffn,
+        unit=unit,
+        gate_marker=BD.MARK_PC,
+        source_lo_dim=BD.EMBED_LO,
+        source_hi_dim=BD.EMBED_HI,
+        target_lo_dim=BD.FETCH_LO,
+        target_hi_dim=BD.FETCH_HI,
+        offset=1,
+        with_carry=True,
+        S=S,
+        magnitude=2.0,
+    )
 
 
 def _set_layer5_fetch(attn, S, BD, HD):
