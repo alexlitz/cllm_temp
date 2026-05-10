@@ -16,6 +16,9 @@ FFN Primitives:
 8. nibble_copy - W_gate source, W_down output with optional residual cancel
 9. step_pair - step(>=low) - step(>=high) for binary decisions
 10. threshold_match - W_up marker+conditions, b_up threshold, W_gate, W_down output
+
+Extracted batch B (vm_step direct ports — byte-identical to imperative code):
+- nibble_rotation_chain       : (source + offset) FFN block, optionally carry-aware
 """
 
 import torch
@@ -530,6 +533,186 @@ class Primitives:
         ffn.W_down.data[out_dim, unit] = 1.0 / S
 
         return unit + 1
+
+    # =========================================================================
+    # Extracted batch B (vm_step direct ports — byte-identical to imperative)
+    # =========================================================================
+
+    @staticmethod
+    def nibble_rotation_chain(
+        ffn,
+        *,
+        unit: int,
+        gate_marker: int,
+        source_lo_dim: int,
+        source_hi_dim: int,
+        target_lo_dim: int,
+        target_hi_dim: int,
+        offset: int = 1,
+        with_carry: bool = True,
+        S: float = 100.0,
+        magnitude: float = 2.0,
+        condition_dims: Optional[List[int]] = None,
+        condition_threshold: Optional[float] = None,
+    ) -> int:
+        """Bake an FFN block that writes ``(source + offset) % 256`` to a
+        target nibble pair, gated by an arbitrary AND of dims.
+
+        Direct port of the L4 PC-rotation chains in ``_set_layer4_ffn``
+        (vm_step.py): the offset=1 chain at AX marker, the offset∈{2,3,4}
+        chains at AX byte positions (``with_carry=False`` because the
+        TEMP source already has its carry applied), and the offset=1
+        chain at PC marker → FETCH.
+
+        For ``with_carry=False``: emits ``32`` units (16 lo rotations +
+        16 hi copies). The hi copy assumes the source already has its
+        carry applied (used for the multi-byte AX byte path that reads
+        from TEMP, which itself was filled by an earlier carry-aware
+        chain).
+
+        For ``with_carry=True``: emits ``32 + 32*offset`` units (for
+        offset=1: 64 units total; offset=2: 96; offset=3: 128;
+        offset=4: 160) in the order::
+
+            16 × lo_rotation:
+                W_up[u, gate_marker]            = S       (+ extras)
+                b_up[u]                         = -S*0.5  (or per cond)
+                W_gate[u, source_lo+(k-off)%16] = 1.0
+                W_down[target_lo+k, u]          = magnitude / S
+            16 × hi_default_copy:
+                W_up[u, gate_marker]            = S       (+ extras)
+                b_up[u]                         = -S*0.5  (or per cond)
+                W_gate[u, source_hi+k]          = 1.0
+                W_down[target_hi+k, u]          = magnitude / S
+            for carry_src in range(16-offset, 16):
+              16 × {hi_cancel, hi_rotated} carry pairs:
+                # Cancel default copy when source_lo[carry_src] == 1
+                W_up[u,   gate_marker]                  = S       (+ extras)
+                W_up[u,   source_lo+carry_src]          = S
+                b_up[u]                                 = -S*1.5  (or per cond)
+                W_gate[u, source_hi+k]                  = -1.0
+                W_down[target_hi+k, u]                  = magnitude / S
+                # Add rotated when source_lo[carry_src] == 1
+                W_up[u+1, gate_marker]                  = S       (+ extras)
+                W_up[u+1, source_lo+carry_src]          = S
+                b_up[u+1]                               = -S*1.5  (or per cond)
+                W_gate[u+1, source_hi+(k-1)%16]         = 1.0
+                W_down[target_hi+k, u+1]                = magnitude / S
+
+        For offset=1 (the canonical PC+1 case) carry_src ∈ {15} only,
+        so the carry block emits 32 units (16 cancel + 16 rotated).
+        For offset > 1 there are multiple carry sources (lo + N >= 16
+        means lo ∈ [16-N, 15]), so the carry block emits 32*offset
+        units. The hi-nibble carry block is always a +1 rotation
+        because the carry from a +N lo rotation always contributes
+        exactly +1 to the hi nibble (since lo nibble fits in 4 bits,
+        max sum = 30 → carry ∈ {0, 1}). The lo-rotation source uses
+        ``(k - offset) % 16`` but the hi-carry adjustment is
+        ``(k - 1) % 16`` regardless.
+
+        Math semantics: writes ``(source + offset) mod 256`` to the
+        target nibble pair when the AND of (gate_marker,
+        condition_dims...) is active.
+
+        Args:
+            ffn: FFN module.
+            unit: First free hidden unit. Returns ``unit + 32`` (no
+                carry) or ``unit + 32 + 32*offset`` (with carry; 64
+                for offset=1, 96 for offset=2, etc.).
+            gate_marker: Primary gate dim that scopes the rotation
+                (e.g. ``BD.MARK_AX``, ``BD.MARK_PC``, or — for the
+                multi-byte path that has no marker — ``BD.IS_BYTE``).
+            source_lo_dim, source_hi_dim: Input nibble bases (e.g.
+                ``BD.EMBED_LO``, ``BD.EMBED_HI``). Each is a 16-dim
+                one-hot.
+            target_lo_dim, target_hi_dim: Output nibble bases (e.g.
+                ``BD.TEMP``, ``BD.TEMP+16``).
+            offset: Integer rotation amount (typically 1, 2, 3, 4).
+            with_carry: Emit the +16 carry-correction units (lo[15]==1
+                triggers hi+=1). Set False for the multi-byte case
+                where hi is just copied from a pre-rotated source.
+            S: SwiGLU scale (default 100.0, matches vm_step.py).
+            magnitude: ``W_down`` scale; the bake uses ``magnitude / S``.
+                Default 2.0 matches the standard nibble-write scale.
+            condition_dims: Extra W_up dims (with weight S) that AND
+                with gate_marker (e.g. ``[BD.H1+AX_I,
+                BD.BYTE_INDEX_0]`` for the multi-byte case). Must be a
+                list of ints — all entries get weight S.
+            condition_threshold: Override b_up base threshold. Defaults
+                to ``0.5 + len(condition_dims)`` so b_up = ``-S*0.5``
+                for 0 conditions, ``-S*2.5`` for 2 conditions, etc.
+                Matches the vm_step.py threshold formula.
+
+        Returns:
+            New free unit index.
+        """
+        if condition_dims is None:
+            condition_dims = []
+        n_conds = len(condition_dims)
+        # vm_step uses b_up = -S * (0.5 + n_conds) for the up gate — i.e.
+        # threshold = (gate_marker + sum(condition_dims) - n_conds - 0.5).
+        # For the carry block, threshold steps up by +1 (extra
+        # source_lo+15 constraint) so b_up = -S * (1.5 + n_conds).
+        if condition_threshold is None:
+            base_thresh = 0.5 + n_conds
+        else:
+            base_thresh = condition_threshold
+        carry_thresh = base_thresh + 1.0  # extra source_lo[15] AND
+        u = unit
+        scale = magnitude / S
+
+        # 16 × lo rotation
+        for k in range(16):
+            src = (k - offset) % 16
+            ffn.W_up[u, gate_marker] = S
+            for cd in condition_dims:
+                ffn.W_up[u, cd] = S
+            ffn.b_up[u] = -S * base_thresh
+            ffn.W_gate[u, source_lo_dim + src] = 1.0
+            ffn.W_down[target_lo_dim + k, u] = scale
+            u += 1
+
+        # 16 × hi default copy
+        for k in range(16):
+            ffn.W_up[u, gate_marker] = S
+            for cd in condition_dims:
+                ffn.W_up[u, cd] = S
+            ffn.b_up[u] = -S * base_thresh
+            ffn.W_gate[u, source_hi_dim + k] = 1.0
+            ffn.W_down[target_hi_dim + k, u] = scale
+            u += 1
+
+        if with_carry:
+            # For offset=N, hi-nibble carries when (lo + N) >= 16, i.e.
+            # lo ∈ [16-N, 15]. Emit a (cancel default, write rotated) pair
+            # for each carry source bit, gated on source_lo[carry_src]=1.
+            #   offset=1 → carry_src ∈ {15}        (32 units total)
+            #   offset=2 → carry_src ∈ {14, 15}    (64 units total)
+            #   offset=3 → carry_src ∈ {13, 14, 15} (96 units total)
+            #   offset=4 → carry_src ∈ {12, …, 15} (128 units total)
+            for carry_src in range(16 - offset, 16):
+                for k in range(16):
+                    # Cancel default copy when source_lo[carry_src] == 1
+                    ffn.W_up[u, gate_marker] = S
+                    ffn.W_up[u, source_lo_dim + carry_src] = S
+                    for cd in condition_dims:
+                        ffn.W_up[u, cd] = S
+                    ffn.b_up[u] = -S * carry_thresh
+                    ffn.W_gate[u, source_hi_dim + k] = -1.0
+                    ffn.W_down[target_hi_dim + k, u] = scale
+                    u += 1
+                    # Add rotated +1 when source_lo[carry_src] == 1
+                    hi_src = (k - 1) % 16
+                    ffn.W_up[u, gate_marker] = S
+                    ffn.W_up[u, source_lo_dim + carry_src] = S
+                    for cd in condition_dims:
+                        ffn.W_up[u, cd] = S
+                    ffn.b_up[u] = -S * carry_thresh
+                    ffn.W_gate[u, source_hi_dim + hi_src] = 1.0
+                    ffn.W_down[target_hi_dim + k, u] = scale
+                    u += 1
+
+        return u
 
 
 # Convenience aliases
