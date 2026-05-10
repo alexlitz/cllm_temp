@@ -2078,11 +2078,11 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
             attn10.alibi_slopes[2] = 1.0  # head 2: SP byte passthrough (nearest step)
             attn10.alibi_slopes[3] = 0.5  # head 3: PSH STACK0 passthrough (same step, d=14)
             attn10.alibi_slopes[4] = 1.0  # head 4: STACK0 byte relay for bitwise
-        _set_layer10_carry_relay(attn10, S, BD, HD)
-        _set_layer10_byte_passthrough(attn10, S, BD, HD)
-        _set_layer10_sp_byte_passthrough(attn10, S, BD, HD)
-        _set_layer10_psh_stack0_passthrough(attn10, S, BD, HD)
-        _set_layer10_stack0_byte_relay(attn10, S, BD, HD)
+        # MIGRATED 2026-05-10: 5 inline _set_layer10_* attn bakes
+        # (carry_relay, byte_passthrough, sp_byte_passthrough,
+        # psh_stack0_passthrough, stack0_byte_relay) are now owned by 5
+        # compiler block ops at phases 10.0-10.4 (kind="block",
+        # layer_idx=10, migrated=True) registered in all_core_ops().
         ffn10 = model.blocks[10].ffn
         _set_layer10_alu(ffn10, S, BD)
 
@@ -2145,10 +2145,14 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
             attn10.alibi_slopes[1] = 1.0
             attn10.alibi_slopes[2] = 1.0  # SP byte passthrough
             attn10.alibi_slopes[3] = 0.5  # PSH STACK0 passthrough
-        _set_layer10_carry_relay(attn10, S, BD, HD)
-        _set_layer10_byte_passthrough(attn10, S, BD, HD)
-        _set_layer10_sp_byte_passthrough(attn10, S, BD, HD)
-        _set_layer10_psh_stack0_passthrough(attn10, S, BD, HD)
+        # MIGRATED 2026-05-10: 4 inline _set_layer10_* attn bakes
+        # (carry_relay, byte_passthrough, sp_byte_passthrough,
+        # psh_stack0_passthrough) are now owned by compiler block ops at
+        # phases 10.0-10.3 (kind="block", layer_idx=10, migrated=True)
+        # registered in all_core_ops(). Those ops run regardless of
+        # alu_mode, so this branch no longer duplicates them. (The fifth
+        # L10 attn bake, stack0_byte_relay, was lookup-mode only and is
+        # also now owned by the phase-10.4 block op.)
 
         # L10 FFN: Neural AND/OR/XOR
         model.blocks[10].ffn = ALUAndOrXor(S, BD)
