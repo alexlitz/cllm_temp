@@ -31,3 +31,13 @@ cat_stripped
 # IDE
 .vscode/
 .idea/
+
+# Claude Code agent worktrees and skill data
+.claude/
+
+# Debug/diagnostic session artifacts (preserved on disk, not committed)
+c4_release/debug_archive/
+c4_release/diag_*.py
+c4_release/archive/
+c4_release/baseline_audit.json
+c4_release/NEURAL_VM_STATUS.md
