@@ -8825,12 +8825,15 @@ def _set_opcode_relay_head(attn, S, BD, HD):
     attn.W_v[base + 7, BD.OP_SI] = 0.2
     attn.W_v[base + 7, BD.OP_SC] = 0.2
 
-    # V[0]: OP_LEV relay disabled
-    # BUG FIX 2026-04-17: OP_LEV is now injected at all positions via
-    # _inject_active_opcode() when active_opcode=LEV. The relay here was
-    # doubling OP_LEV at PC marker (5.0 from embed + 5.0 from relay = 10.0),
-    # causing L6 FFN unit 1564 to fire spuriously and corrupt OUTPUT_HI[2].
-    # attn.W_v[base + 0, BD.OP_LEV] = 0.2  # DISABLED
+    # V[0]: OP_LEV relay (re-enabled 2026-05-09 with V=0.1 to avoid doubling)
+    # BUG FIX 2026-04-17 (now obsolete): OP_LEV was previously doubled when
+    # _inject_active_opcode() was active in pure_neural mode.
+    # FIX 2026-05-09 (agent C1.A): In pure_neural mode, set_active_opcode is
+    # skipped, so OP_LEV is set only at AX marker by L5 FFN. Re-enable relay
+    # with V=0.1 (instead of 0.2) so it produces OP_LEV ≈ 5 at PC/SP/byte
+    # positions (matching L5 FFN write at AX marker), avoiding doubling.
+    # This unblocks Phase 5 LEV semantics (PC restoration, SP=BP+16).
+    attn.W_v[base + 0, BD.OP_LEV] = 0.1
 
     # O: write to CMP dims + MEM store flags + PSH_AT_SP
     attn.W_o[BD.CMP + 0, base + 1] = 1.0  # OP_PSH → CMP[0] (legacy, kept for compatibility)
@@ -8843,7 +8846,11 @@ def _set_opcode_relay_head(attn, S, BD, HD):
     attn.W_o[BD.OP_ENT, base + 4] = 5.0  # OP_ENT → OP_ENT dim (×5 to rescale 0.2→1.0)
     attn.W_o[BD.MEM_STORE, base + 6] = 1.0  # store flag → MEM marker
     attn.W_o[BD.MEM_ADDR_SRC, base + 7] = 1.0  # addr source flag → MEM marker
-    # attn.W_o[BD.OP_LEV, base + 0] = 5.0  # DISABLED - see comment above
+    # OP_LEV relay re-enabled 2026-05-09 (agent C1.A): V=0.1 × W_o=10.0 = 1.0
+    # multiplier so OP_LEV ≈ 5 at PC/SP/byte positions (matches L5 FFN write at AX).
+    # In pure_neural mode, set_active_opcode is skipped, so OP_LEV is only set at AX
+    # by L5 FFN; this relay propagates it to PC/SP/byte for L9/L15/L16 LEV gates.
+    attn.W_o[BD.OP_LEV, base + 0] = 10.0  # OP_LEV → OP_LEV dim (×10 to rescale 0.1→1.0)
 
 
 # =============================================================================
