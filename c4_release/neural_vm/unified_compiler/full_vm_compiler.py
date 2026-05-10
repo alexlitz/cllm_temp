@@ -143,12 +143,15 @@ def compile_full_vm(
         # Migrated block ops fire before model ops (which include legacy_bake).
         # `_n_layers_hint` lets block bake_fns gate on total layer count (e.g.
         # the L15 attention resize only fires for >=17-layer models).
+        # Block op binding via target_op_name (resolved from layout) takes
+        # precedence over the legacy layer_idx field.
         for op in sorted(
-            layout.block_ops, key=lambda o: (o.layer_idx, o.phase or 0)
+            layout.block_ops,
+            key=lambda o: (layout.resolve_block_op_layer(o), o.phase or 0),
         ):
             if not op.migrated:
                 continue
-            block = model.blocks[op.layer_idx]
+            block = model.blocks[layout.resolve_block_op_layer(op)]
             block._n_layers_hint = len(model.blocks)
             op.bake_fn(block, layout.dim_positions, S)
 

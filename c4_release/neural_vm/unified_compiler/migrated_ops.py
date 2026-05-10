@@ -1842,7 +1842,59 @@ def all_hybrid_alu_wrap_ops() -> list:
 # create cycles, and full-spec compilation isn't wired to production.
 
 
-def declare_setdim_compat_dims(compiler, pin_to_setdim: bool = True) -> None:
+# IO-required dim names that MUST stay pinned to their _SetDim positions even
+# when the compiler is otherwise free to bump-pointer-allocate. These dims are
+# read or written by external (non-bake) code paths — token embedding setup,
+# the output head, and `NeuralVMEmbedding._inject_*` runtime injectors — that
+# resolve dim positions either through the `_SetDim` enum directly or through
+# `dim_positions` lookups that must agree with `_SetDim` for now.
+#
+# Membership rationale (cross-checked against
+# `c4_release/neural_vm/neural_embedding.py:_inject_*`):
+#
+# - EMBED_LO/HI, OUTPUT_LO/HI: nibble-decode/projection. Token embedding sets
+#   EMBED_*; head reads OUTPUT_*. _inject_initial_pc writes EMBED_*.
+# - MARK_PC/AX/SP/BP/MEM/SE/STACK0/CS/SE_ONLY: per-token marker flags set by
+#   token embedding; threshold heads scan for them.
+# - NEXT_*: head reads these to project to token-type logits.
+# - IS_BYTE/IS_MARK/CONST/HAS_SE/BYTE_INDEX_*: positional flags read by head
+#   gating and by L0 thresholds.
+# - OP_LEV/BZ/BNZ + ACTIVE_OPCODE_PRTF/READ: injected by
+#   `_inject_active_opcode` based on the current opcode hint.
+# - MARK_THINKING_START/END: written by `_inject_thinking_markers` on
+#   THINKING_START/END tokens.
+# - MEM_STORE / MEM_EXEC / ADDR_KEY: written by `_inject_mem_store`,
+#   `_inject_mem_exec[_autoregressive]` for memory ops.
+# - NEXT_TOOL_CALL / NEXT_THINKING_START / NEXT_THINKING_END: optional head
+#   reads when conversational I/O is enabled (see setup_head_weights).
+_IO_REQUIRED_DIMS = frozenset({
+    # Markers (token embedding writes; threshold heads read)
+    "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM", "MARK_SE",
+    "MARK_CS", "MARK_SE_ONLY", "MARK_STACK0",
+    "MARK_THINKING_START", "MARK_THINKING_END",
+    # Positional flags (head + L0 thresholds)
+    "IS_BYTE", "IS_MARK", "CONST", "HAS_SE",
+    "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+    # Nibble encoding (token embed in / head out / _inject_initial_pc)
+    "EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI",
+    "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+    # NEXT_* token-type transition flags (head reads)
+    "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP", "NEXT_STACK0",
+    "NEXT_MEM", "NEXT_SE", "NEXT_HALT",
+    "NEXT_TOOL_CALL", "NEXT_THINKING_START", "NEXT_THINKING_END",
+    # Active-opcode injection slots (_inject_active_opcode)
+    "OP_LEV", "OP_BZ", "OP_BNZ",
+    "ACTIVE_OPCODE_PRTF", "ACTIVE_OPCODE_READ",
+    # Memory injection slots (_inject_mem_store, _inject_mem_exec)
+    "MEM_STORE", "MEM_EXEC", "ADDR_KEY",
+})
+
+
+def declare_setdim_compat_dims(
+    compiler,
+    pin_to_setdim: bool = True,
+    pin_io_only: bool = False,
+) -> None:
     """Declare to a LayerCompiler all dims that match the existing _SetDim layout.
 
     Args:
@@ -1852,6 +1904,15 @@ def declare_setdim_compat_dims(compiler, pin_to_setdim: bool = True) -> None:
             position 420) so existing _set_layerN_* bake_fns work unchanged. If
             False, dims are bump-pointer allocated by declaration order — useful
             for testing the auto-allocation path but breaks _SetDim aliases.
+        pin_io_only: if True, only the dims in `_IO_REQUIRED_DIMS` (the
+            externally-observable dims read/written by token embedding, the
+            output head, and `NeuralVMEmbedding._inject_*` runtime injectors)
+            are pinned to their `_SetDim` positions. Every other dim becomes
+            bump-pointer-allocated by the compiler. This unlocks compiler-driven
+            internal dim allocation while keeping the IO contract intact.
+            Implies `pin_to_setdim=True` for the IO-required subset; the
+            `pin_to_setdim` flag is ignored when `pin_io_only=True`. Defaults
+            to False for backward compatibility.
     """
     from ..vm_step import _SetDim
     from ..constants import INSTR_WIDTH  # noqa: F401 (touched for completeness)
@@ -1861,10 +1922,13 @@ def declare_setdim_compat_dims(compiler, pin_to_setdim: bool = True) -> None:
         "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
         "MARK_SE", "IS_BYTE", "IS_MARK", "CONST", "MARK_CS",
         "MARK_SE_ONLY", "MARK_STACK0",
+        "MARK_THINKING_START", "MARK_THINKING_END",
+        "ACTIVE_OPCODE_PRTF", "ACTIVE_OPCODE_READ",
         "HAS_SE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
         "STACK0_BYTE0", "CMP_GROUP",
         "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP", "NEXT_STACK0",
         "NEXT_MEM", "NEXT_SE", "NEXT_HALT",
+        "NEXT_TOOL_CALL", "NEXT_THINKING_START", "NEXT_THINKING_END",
         "IO_IS_PUTCHAR", "IO_OUTPUT_READY",
         "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
         "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC",
@@ -1898,9 +1962,15 @@ def declare_setdim_compat_dims(compiler, pin_to_setdim: bool = True) -> None:
     thirty_two_dim = ["TEMP"]
 
     def _declare(name, size):
-        if hasattr(_SetDim, name):
+        if not hasattr(_SetDim, name):
+            return
+        if pin_io_only:
+            # Only pin the IO-required subset; everything else is
+            # bump-pointer-allocated by the compiler.
+            pinned = getattr(_SetDim, name) if name in _IO_REQUIRED_DIMS else None
+        else:
             pinned = getattr(_SetDim, name) if pin_to_setdim else None
-            compiler.declare_dim(name, size, pinned=pinned)
+        compiler.declare_dim(name, size, pinned=pinned)
 
     for name in one_dim:
         _declare(name, 1)
