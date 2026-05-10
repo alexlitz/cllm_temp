@@ -2235,12 +2235,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # the L12 FFN MUL combine weights via build_model_from_layout.
 
         # ===== LAYER 13: SHL/SHR shifts + MEM addr gather =====
-        attn13 = model.blocks[13].attn
-        if hasattr(attn13, 'alibi_slopes') and attn13.alibi_slopes is not None:
-            attn13.alibi_slopes.fill_(0.5)
-        _set_layer13_mem_addr_gather(attn13, S, BD, HD)
-        ffn13 = model.blocks[13].ffn
-        _set_layer13_shifts(ffn13, S, BD)
+        # Migrated to compiler ops `layer13_mem_addr_gather` (attn) and
+        # `layer13_shifts` (ffn) via build_model_from_layout's migrated dispatch.
 
 
 
@@ -2284,11 +2280,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # L11-L12: Neural MUL
         model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)
 
-        # L13: Memory addr gather attention (still needed)
-        attn13 = model.blocks[13].attn
-        if hasattr(attn13, 'alibi_slopes') and attn13.alibi_slopes is not None:
-            attn13.alibi_slopes.fill_(0.5)
-        _set_layer13_mem_addr_gather(attn13, S, BD, HD)
+        # L13: Memory addr gather attention migrated to compiler op
+        # `layer13_mem_addr_gather` (attn) which runs before legacy_bake.
 
         # L13 FFN: Neural SHL/SHR
         model.blocks[13].ffn = EfficientALU_L13_Neural(S, BD)

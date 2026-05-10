@@ -350,6 +350,7 @@ def make_layer7_operand_gather_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -376,6 +377,7 @@ def make_layer7_memory_heads_op() -> Operation:
                 "TEMP", "ADDR_KEY"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -633,6 +635,9 @@ def make_layer13_mem_addr_gather_op() -> Operation:
     """L13 attention: gather MEM addr from STACK0 / AX_CARRY for SI/SC/LI/LC."""
     def bake(attn, dim_positions, S):
         from ..vm_step import _set_layer13_mem_addr_gather
+        # Set ALiBi slopes (originally set in set_vm_weights before the bake call).
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer13_mem_addr_gather(attn, S, _as_setdim_proxy(dim_positions), HD)
 
@@ -646,6 +651,7 @@ def make_layer13_mem_addr_gather_op() -> Operation:
                 "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -663,6 +669,7 @@ def make_layer13_shifts_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
