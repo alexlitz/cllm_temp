@@ -84,6 +84,7 @@ def make_phase_a_ffn_op() -> Operation:
                 "NEXT_STACK0", "NEXT_MEM", "NEXT_SE"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -588,6 +589,7 @@ def make_layer11_mul_partial_op() -> Operation:
         writes={"MUL_ACCUM"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -604,6 +606,7 @@ def make_layer12_mul_combine_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -728,6 +731,7 @@ def make_layer0_threshold_attn_op() -> Operation:
         writes={"H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -993,6 +997,90 @@ def make_l10_post_ops_combined() -> Operation:
     )
 
 
+def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
+    """Block-level op: attach L10 post_op modules onto block.post_ops.
+
+    Migrates the inline `model.blocks[10].post_ops.append(...)` calls in
+    `set_vm_weights` for both lookup and efficient ALU modes into a compiler
+    block op. The attached modules are the structural post-FFN passes that
+    `_expand_wrapper_blocks` later splits into their own blocks.
+
+    Modules attached (lookup mode):
+      BinaryOpByteZeroingPostOp,
+      CarryPropagationPostOp x3 (byte 0 no-cascade, bytes 1-2 cascade),
+      BitwiseBytePropagationPostOp,
+      DivModModule(mode='lookup').
+
+    Modules attached (efficient mode):
+      BinaryOpByteZeroingPostOp,
+      CarryPropagationPostOp x3,
+      BitwiseBytePropagationPostOp,
+      ComparisonCombine,
+      EfficientDivMod_Neural.
+
+    The existing `make_l10_post_ops_combined` is unrelated: it bakes the
+    LOGIC of the FFN-style post_ops into a single phase-10.5 FFN (a parallel
+    representation), not the attached module list. Both can coexist.
+
+    phase=10.7: runs after L10 FFN bake (phase=10) and the combined FFN
+    (phase=10.5), but well before structural post-passes (1100+).
+    """
+    if alu_mode not in ("lookup", "efficient"):
+        raise ValueError(
+            f"alu_mode must be 'lookup' or 'efficient'; got {alu_mode!r}"
+        )
+
+    def bake(block, dim_positions, S):
+        from ..vm_step import (
+            BinaryOpByteZeroingPostOp,
+            CarryPropagationPostOp,
+            BitwiseBytePropagationPostOp,
+            ComparisonCombine,
+            DivModModule,
+            EfficientDivMod_Neural,
+            _SetDim,
+        )
+        # Use the block's d_model when available; fall back to 512 to mirror
+        # the previous inline behavior.
+        d_model = 512
+        if hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = 512
+
+        block.post_ops.append(BinaryOpByteZeroingPostOp(d_model=d_model, S=S))
+        block.post_ops.append(
+            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=0, cascade=False)
+        )
+        block.post_ops.append(
+            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=1, cascade=True)
+        )
+        block.post_ops.append(
+            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=2, cascade=True)
+        )
+        block.post_ops.append(BitwiseBytePropagationPostOp(d_model=d_model, S=S))
+        if alu_mode == "lookup":
+            # The lookup-mode HybridALU override in set_vm_weights replaces
+            # this DivModModule with EfficientDivMod_Neural via
+            # `model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)`.
+            block.post_ops.append(DivModModule(mode="lookup"))
+        else:  # efficient
+            block.post_ops.append(ComparisonCombine(S=S))
+            block.post_ops.append(EfficientDivMod_Neural(S, _SetDim))
+
+    return Operation(
+        name="l10_post_op_attach",
+        reads=set(),
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=10.7,
+        layer_idx=10,
+        migrated=True,
+    )
+
+
 def setup_token_embeddings(embed_weight, dim_positions: Dict[str, int] = None) -> None:
     """Bake the per-token embedding values using compiler dim positions.
 
@@ -1173,6 +1261,82 @@ def setup_head_weights(head, dim_positions: Dict[str, int] = None) -> None:
             head.bias[Token.IO_STATE_EMIT_THINKING] = -20.0
 
 
+def make_head_bake_op() -> Operation:
+    """Bake the output projection head: byte/marker token logits.
+
+    Phase=1000 so it runs AFTER legacy_bake (phase=999); the corresponding
+    head section in `set_vm_weights` has been removed to avoid double-bake.
+    """
+    def _bake(model, dim_positions, S):
+        setup_head_weights(model.head, dim_positions)
+
+    return Operation(
+        name="head_bake",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=_bake,
+        phase=1000,
+    )
+
+
+def make_embedding_bake_op() -> Operation:
+    """Bake the per-token embedding table.
+
+    Phase=1001 so it runs AFTER legacy_bake (phase=999) and head_bake (1000);
+    the corresponding embedding section in `set_vm_weights` has been removed
+    to avoid double-bake.
+    """
+    def _bake(model, dim_positions, S):
+        setup_token_embeddings(model.embed.embed.weight, dim_positions)
+
+    return Operation(
+        name="embedding_bake",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=_bake,
+        phase=1001,
+    )
+
+
+def make_legacy_bake_op(
+    *,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+) -> Operation:
+    """Bridge op: invoke the legacy set_vm_weights pipeline as a model-level bake.
+
+    This is the migration bridge — it lets `compile_full_vm` orchestrate the
+    full bake through compiler dispatch even before every individual op has
+    been split into its own compiler Operation. The legacy bake is just one
+    "op" the compiler runs; as individual ops migrate out into their own
+    Operation instances, the legacy pipeline shrinks.
+
+    Phase 999 ensures it runs last, after all other compiler ops. Reads and
+    writes are empty since the dependency graph already orders the per-layer
+    bakes via the per-op Operation declarations.
+    """
+    def _bake(model, dim_positions, S):
+        from ..vm_step import set_vm_weights
+        set_vm_weights(
+            model,
+            enable_tool_calling=enable_tool_calling,
+            enable_conversational_io=enable_conversational_io,
+            alu_mode=alu_mode,
+        )
+
+    return Operation(
+        name="legacy_bake",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=_bake,
+        phase=999,
+    )
+
+
 def all_core_ops() -> list:
     """Return the full list of migrated core-VM operations.
 
@@ -1223,6 +1387,9 @@ def all_core_ops() -> list:
         make_layer9_marker_suppress_op(),
         # L10 post_ops merged into a single phase-10.5 ffn
         make_l10_post_ops_combined(),
+        # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
+        make_head_bake_op(),
+        make_embedding_bake_op(),
     ]
 
 
