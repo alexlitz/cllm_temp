@@ -1951,48 +1951,6 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # L6 FFN: CMP[5]/CMP[6] AND NEXT_SE → NEXT_THINKING_END (start I/O sequence)
         _set_conversational_io_state_machine(ffn6, S, BD)
 
-    # === BUG FIX 2026-04-09 (part 8c/8g): Patch spurious L6 FFN units ===
-    # Unprogrammed FFN units with random weights can fire spuriously when:
-    # - OUTPUT_BYTE dimensions have residual values (from IO operations)
-    # - Unit writes to OUTPUT_LO/HI dimensions
-    # This causes incorrect output at marker positions (especially PC marker).
-    # Example: unit 1128 fires on OUTPUT_BYTE_LO residuals at PC marker for EXIT,
-    # writing to OUTPUT_LO[0] and causing prediction of 0 instead of 10.
-    #
-    # NOTE: TEMP (dims 480-511) overlaps with OUTPUT_BYTE_LO (dims 480-495).
-    # JSR PC override and ENT use TEMP legitimately, so we must exclude units
-    # that have positive marker weights (MARK_PC, MARK_STACK0, MARK_BP) which
-    # indicate intentional TEMP usage rather than spurious OUTPUT_BYTE reading.
-    patched_count = 0
-    for u in range(4096):
-        # Check if writes to OUTPUT
-        writes_output_lo = ffn6.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
-        writes_output_hi = ffn6.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
-        if not (writes_output_lo or writes_output_hi):
-            continue
-
-        # Skip units that legitimately use TEMP (JSR PC override, ENT, etc.)
-        # These units have positive MARK_PC, MARK_STACK0, or MARK_BP weight
-        if ffn6.W_up[u, BD.MARK_PC].item() > 10:  # JSR PC override uses S=100
-            continue
-        if ffn6.W_up[u, BD.MARK_STACK0].item() > 10:  # ENT uses TEMP at STACK0
-            continue
-        if ffn6.W_up[u, BD.MARK_BP].item() > 10:  # ENT uses TEMP at BP
-            continue
-
-        # Check for strong OUTPUT_BYTE weights (TEMP overlaps with OUTPUT_BYTE, so don't check TEMP separately)
-        output_byte_lo_weight = ffn6.W_up[u, BD.OUTPUT_BYTE_LO:BD.OUTPUT_BYTE_LO+16].abs().max().item()
-        output_byte_hi_weight = ffn6.W_up[u, BD.OUTPUT_BYTE_HI:BD.OUTPUT_BYTE_HI+16].abs().max().item()
-
-        if output_byte_lo_weight > 50 or output_byte_hi_weight > 50:
-            # Zero out this unit
-            ffn6.W_up[u, :] = 0
-            ffn6.W_gate[u, :] = 0
-            ffn6.W_down[:, u] = 0
-            ffn6.b_up[u] = 0
-            ffn6.b_gate[u] = 0
-            patched_count += 1
-
     # ===== LAYER 7: Operand gather + memory relay heads =====
     # Migrated to compiler ops `layer7_operand_gather` and `layer7_memory_heads`
     # (phase=7) which bake the attention and ALiBi slope weights via
@@ -2000,55 +1958,16 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # format-pointer extraction head below.
     attn7 = model.blocks[7].attn
 
-    # === BUG FIX 2026-04-17: Patch spurious L7 FFN units ===
-    # Units 746/754 in L7 FFN have W_up[OP_ENT]=100, W_up[MARK_SP]=100, b_up=-150.
-    # They're designed for ENT SP byte 0 generation (0xF0) but also fire at PC marker
-    # because OP_ENT * 5 = 500 overcomes the bias even when MARK_SP = 0.
-    # At PC marker: up_pre = 0 + 500 - 150 = 350 → fires incorrectly
-    # Fix: Add strong MARK_PC negative weight to suppress at PC marker.
-    # MARK_PC = 1 at PC marker, so -1000 * 1 = -1000 kills the unit.
-    ffn7 = model.blocks[6].ffn  # blocks[6] = L7 (0-indexed)
-    patched_l7_count = 0
-    for u in range(4096):
-        # Check if writes to OUTPUT
-        writes_output_lo = ffn7.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
-        writes_output_hi = ffn7.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
-        if not (writes_output_lo or writes_output_hi):
-            continue
-
-        # Check for units that read OP_* strongly but don't have strong MARK_PC negative
-        has_strong_opcode = (
-            ffn7.W_up[u, BD.OP_ENT].abs().item() > 50 or
-            ffn7.W_up[u, BD.OP_LEV].abs().item() > 50 or
-            ffn7.W_up[u, BD.OP_JSR].abs().item() > 50 or
-            ffn7.W_up[u, BD.OP_LEA].abs().item() > 50
-        )
-
-        has_mark_pc_suppression = ffn7.W_up[u, BD.MARK_PC].item() < -100
-
-        # Skip units that are designed to fire at byte positions (have positive IS_BYTE or BYTE_INDEX)
-        # These are legitimate ENT/JSR byte generation units
-        is_byte_unit = (
-            ffn7.W_up[u, BD.IS_BYTE].item() > 5 or
-            ffn7.W_up[u, BD.BYTE_INDEX_0].item() > 5 or
-            ffn7.W_up[u, BD.BYTE_INDEX_1].item() > 5 or
-            ffn7.W_up[u, BD.BYTE_INDEX_2].item() > 5 or
-            ffn7.W_up[u, BD.BYTE_INDEX_3].item() > 5
-        )
-
-        # Skip units that legitimately fire at PC marker (JSR PC override, etc.)
-        # These have positive MARK_PC weight set by _set_function_call_weights.
-        if ffn7.W_up[u, BD.MARK_PC].item() > 10:
-            continue
-
-        if has_strong_opcode and not has_mark_pc_suppression and not is_byte_unit:
-            # Add MARK_PC and IS_BYTE suppression rather than zeroing out
-            # At PC marker: MARK_PC = 1, so -1000 added to up_pre
-            # At any byte position: IS_BYTE = 1, so -1000 added to up_pre
-            # Units should only fire at marker positions (MARK_SP = 1, IS_BYTE = 0)
-            ffn7.W_up[u, BD.MARK_PC] = -S * 100  # -1000 when MARK_PC = 1
-            ffn7.W_up[u, BD.IS_BYTE] = -S * 100  # -1000 when IS_BYTE = 1
-            patched_l7_count += 1
+    # MIGRATED 2026-05-10:
+    #   L6 spurious-unit zero (BUG FIX 2026-04-09 part 8c/8g) ->
+    #     `make_l6_dead_unit_zero_op` (phase=1160, model-level, migrated=True)
+    #   L7 spurious-unit suppress (BUG FIX 2026-04-17) ->
+    #     `make_l7_dead_unit_zero_op` (phase=1170, model-level, migrated=True)
+    # Both ran here previously as inline post-passes patching `model.blocks[6].ffn`
+    # before `_right_size_ffns`. They now run as compiler model ops via
+    # build_model_from_layout in the same relative order (after legacy_bake at
+    # phase=999, after head/embedding bakes at 1000/1001, before right_size at
+    # 1200). See unified_compiler/migrated_ops.py.
 
     # Conversational I/O: Extract format pointer from STACK0
     if enable_conversational_io:
@@ -2293,100 +2212,22 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         for e in errors:
             print(f"  CONTRACT: {e}")
 
-    # === FIX 2026-05-09: Suppress branch/LEV-override units when other opcodes active ===
-    # In pure_neural mode without runner overrides, L5 attention heads leak opcode flags
-    # (OP_JMP, OP_LEV, OP_BZ, OP_BNZ, CMP[0]) into MARK_PC of subsequent steps. Various
-    # FFN units across blocks then fire spuriously, destroying carry-forwarded values.
+    # ===== Model-level post-passes (MIGRATED 2026-05-10) =====
+    # The following five passes are now compiler model ops, dispatched by
+    # build_model_from_layout AFTER legacy_bake at phase=999:
     #
-    # Defensive gate: any FFN unit (in any block) that fires with positive OP_JMP/OP_LEV/
-    # OP_BZ/OP_BNZ/CMP[0] weight AND positive MARK_PC weight AND writes to OUTPUT_LO/HI
-    # gets strong negative weights for non-target opcodes. When the actually-active
-    # opcode (e.g., OP_IMM ≈ 5) is set, the unit's `up` becomes strongly negative.
-    # Only the legit branch/LEV opcode lets the unit fire.
+    #   branch_override_patch (phase=1100, migrated=True)
+    #   l6_dead_unit_zero     (phase=1160, migrated=True)
+    #   l7_dead_unit_zero     (phase=1170, migrated=True)
+    #   right_size_ffns       (phase=1200, migrated=True)
+    #   expand_wrapper_blocks (phase=1300, migrated=True)
     #
-    # IMPORTANT: This patch must run AFTER all layer setups (so all FFN weights are
-    # programmed) and BEFORE _right_size_ffns (so the patch's edits become permanent
-    # in the right-sized result).
-    OPCODE_BLOCK_MAP = {
-        BD.OP_JMP: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
-        BD.OP_LEV: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
-        BD.OP_BZ:  [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BNZ, BD.OP_JSR],
-        BD.OP_BNZ: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BZ, BD.OP_JSR],
-        BD.CMP + 0: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
-                     BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                     BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                     BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                     BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                     BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                     BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
-    }
-    branch_override_patches = 0
-    for block_idx in range(len(model.blocks)):
-        ffn = model.blocks[block_idx].ffn
-        if not (hasattr(ffn, 'W_up') and isinstance(getattr(ffn, 'W_up', None), nn.Parameter)):
-            continue
-        hidden_dim = ffn.W_up.shape[0]
-        for u in range(hidden_dim):
-            mark_pc_w = ffn.W_up[u, BD.MARK_PC].item()
-            if mark_pc_w <= 50:
-                continue
-            writes_output = (
-                ffn.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
-                or ffn.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
-            )
-            if not writes_output:
-                continue
-            for trigger_dim, blockers in OPCODE_BLOCK_MAP.items():
-                trigger_w = ffn.W_up[u, trigger_dim].item()
-                if trigger_w <= 5:
-                    continue
-                for opcode_dim in blockers:
-                    cur = ffn.W_up[u, opcode_dim].item()
-                    ffn.W_up.data[u, opcode_dim] = min(cur, -S)
-                branch_override_patches += 1
-                break
-    print(f"  BRANCH OVERRIDE PATCH: {branch_override_patches} units gated")
-
-    # ===== FIX 2026-05-09: Right-size FFN hidden dimensions to actual programmed units =====
-    # The architecture is built with hardcoded ffn_hidden=4096, but most FFNs only program
-    # a fraction of those units (often 100-1000). The unprogrammed units have all-zero
-    # weights but their `b_up` is also 0, which means silu(0)=0.27, and combined with
-    # ANY non-zero gate this produces a non-zero contribution. Multiplied across thousands
-    # of dead units, this accumulates into spurious OUTPUT writes that break correctness
-    # in pure-neural mode.
-    #
-    # Fix: for each block's FFN, identify the actually-programmed units (any non-zero
-    # weight in W_up, W_gate, W_down, or non-zero bias), and replace the FFN matrices
-    # with right-sized versions containing ONLY those units. This is what "the compiler
-    # determines network width" looks like: ffn_hidden becomes per-layer, equal to the
-    # actually-needed unit count.
+    # Their inline counterparts have been removed from set_vm_weights to avoid
+    # double-bake. The migrated=True flag also gates the legacy bake from
+    # re-running them (see layer_compiler.build_model_from_layout). The
+    # block-op dispatch below is still required because some block-scoped
+    # composites (HybridALU wraps in lookup mode) are baked inside legacy_bake.
     _dispatch_migrated_block_ops(model, S, alu_mode=alu_mode)
-    _right_size_ffns(model)
-    _expand_wrapper_blocks(model)
 
     return model
 
