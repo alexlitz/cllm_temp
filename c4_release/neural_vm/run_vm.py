@@ -30,7 +30,6 @@ from typing import List, Optional, Callable, Any, Dict
 from dataclasses import dataclass, field
 
 from .vm_step import AutoregressiveVM, Token
-from .weight_setter import set_weights
 from .embedding import Opcode
 from .constants import INSTR_WIDTH, PC_OFFSET
 
@@ -135,6 +134,12 @@ class AutoregressiveVMRunner:
        - All I/O is part of the token stream (100% autoregressive)
     """
 
+    # Module-level cache of fully-built models, keyed by config tuple.
+    # Construction (set_vm_weights) is expensive (~10s); session-scoped tests
+    # already cache via fixtures, but this cache helps across processes that
+    # build many runners. Phase 0 (2026-05-09).
+    _MODEL_CACHE = {}
+
     def __init__(
         self,
         d_model=None,
@@ -150,6 +155,7 @@ class AutoregressiveVMRunner:
         max_mem_history=64,
         trust_neural_alu=False,
         pure_neural=False,
+        cache_model=True,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -162,45 +168,29 @@ class AutoregressiveVMRunner:
             pure_neural: If True, skip ALL Python overrides and run purely
                         autoregressively.
         """
-        # Phase 0 M6 (2026-05-09): when d_model/n_layers are not explicitly
-        # passed, derive them from the compiler. Used to be hardcoded to
-        # d_model=512, n_layers=17 — those values are now derived facts of
-        # the operation set, not free parameters.
-        if d_model is None or n_layers is None:
-            from .unified_compiler.migrated_ops import (
-                all_core_ops, declare_setdim_compat_dims,
-            )
-            from .unified_compiler import LayerCompiler
-            _c = LayerCompiler()
-            declare_setdim_compat_dims(_c)
-            for _op in all_core_ops():
-                _c.add_op(_op)
-            _layout = _c.compile()
-            if _layout.d_model % n_heads != 0:
-                _pad = n_heads - (_layout.d_model % n_heads)
-                _c.declare_dim("_pad", _pad)
-                _layout = _c.compile()
-            if d_model is None:
-                d_model = _layout.d_model
-            if n_layers is None:
-                n_layers = _layout.n_layers
-        self.model = AutoregressiveVM(
-            d_model=d_model,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            ffn_hidden=ffn_hidden,
-            max_seq_len=max_seq_len,
-        )
-        # Load hand-crafted transformer weights for VM execution
-        # Use efficient ALU mode when trust_neural_alu=True for pure neural execution
+        # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
+        # compile_full_vm. The compiler derives d_model and n_layers from the
+        # operation set (no hardcoding) and orchestrates the bake pass.
+        # Override d_model/n_layers via explicit args only for tests.
         alu_mode = 'efficient' if trust_neural_alu else 'lookup'
-        set_weights(self.model, enable_conversational_io=conversational_io, alu_mode=alu_mode)
-
-        # Move model to GPU if available for ~20-100x speedup
-        if torch.cuda.is_available():
-            self.model = self.model.cuda()
-
-        self.model.eval()
+        cache_key = (d_model, n_layers, n_heads, ffn_hidden, max_seq_len,
+                     conversational_io, alu_mode)
+        if cache_model and cache_key in AutoregressiveVMRunner._MODEL_CACHE:
+            self.model = AutoregressiveVMRunner._MODEL_CACHE[cache_key]
+        else:
+            from .unified_compiler.full_vm_compiler import compile_full_vm
+            self.model, _layout = compile_full_vm(
+                enable_conversational_io=conversational_io,
+                alu_mode=alu_mode,
+                n_heads=n_heads,
+                ffn_hidden=ffn_hidden,
+                max_seq_len=max_seq_len,
+            )
+            if torch.cuda.is_available():
+                self.model = self.model.cuda()
+            self.model.eval()
+            if cache_model:
+                AutoregressiveVMRunner._MODEL_CACHE[cache_key] = self.model
 
         # Syscall dispatch table
         # NOTE ON PURITY:

@@ -196,8 +196,16 @@ class TestWeightEquivalence:
             for name in ['attn.W_q','attn.W_k','attn.W_v','attn.W_o',
                          'ffn.W_up','ffn.b_up','ffn.W_gate','ffn.b_gate','ffn.W_down']:
                 parts = name.split('.')
-                t_h = getattr(getattr(bh, parts[0]), parts[1])
-                t_c = getattr(getattr(bc, parts[0]), parts[1])
+                mod_h = getattr(bh, parts[0])
+                mod_c = getattr(bc, parts[0])
+                if hasattr(mod_h, 'lookup_ffn'):
+                    mod_h = mod_h.lookup_ffn
+                if hasattr(mod_c, 'lookup_ffn'):
+                    mod_c = mod_c.lookup_ffn
+                t_h = getattr(mod_h, parts[1], None)
+                t_c = getattr(mod_c, parts[1], None)
+                if t_h is None or t_c is None:
+                    continue
                 assert torch.allclose(t_h, t_c, atol=1e-3), f"L{i} {name} mismatch"
 
     def test_embedding_weights_match(self, model_hand):

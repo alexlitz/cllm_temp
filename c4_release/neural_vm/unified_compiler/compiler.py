@@ -9,10 +9,12 @@ import torch
 from typing import Optional
 
 from .primitives import Primitives, P
-from ..vm_step import (
-    _SetDim as BD, Token,
-    _set_layer6_routing_ffn, _set_io_putchar_routing,
-    _set_binary_pop_sp_increment, _set_function_call_weights,
+from ..vm_step import _SetDim as BD, Token
+from ..vm_step_primitives import (
+    set_layer6_routing_ffn,
+    set_io_putchar_routing,
+    set_binary_pop_sp_increment,
+    set_function_call_weights,
 )
 from ..embedding import Opcode
 
@@ -1037,6 +1039,46 @@ class UnifiedVMCompiler:
                 attn.W_o.data[addr_lo_out + k, base + 1 + k] = 1.0
                 attn.W_o.data[addr_hi_out + k, base + 17 + k] = 1.0
 
+        # Heads 3-5: Gather STACK0 bytes 1-3 → ALU at AX bytes 1-3 (multi-byte fix)
+        # For binary operations, we need the stack operand at each byte position.
+        for j in range(3):  # bytes 1, 2, 3
+            byte_idx = j + 1
+            head = 3 + j
+            base = head * HD
+
+            byte_dim = [BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][j]
+
+            # Q: Fire at AX byte position (H1[AX] and BYTE_INDEX_{1,2,3})
+            attn.W_q.data[base, BD.IS_BYTE] = L
+            attn.W_q.data[base, BD.H1 + AX_I] = L
+            attn.W_q.data[base + 1, byte_dim] = L
+            attn.W_q.data[base + 1, BD.CONST] = -L / 2
+
+            # K: Fire at STACK0 byte position (H4[BP] and BYTE_INDEX_{1,2,3})
+            # STACK0 bytes are identified by H4[BP] but not H1[BP] (excludes byte 0)
+            attn.W_k.data[base, BD.IS_BYTE] = L
+            attn.W_k.data[base, BD.H4 + BP_I] = L
+            attn.W_k.data[base, BD.H1 + BP_I] = -L  # exclude byte 0
+            attn.W_k.data[base + 1, byte_dim] = L
+            attn.W_k.data[base + 1, BD.CONST] = -L / 2
+
+            # Anti-leakage gate
+            GATE = 33
+            attn.W_q.data[base + GATE, BD.IS_BYTE] = L
+            attn.W_q.data[base + GATE, BD.H1 + AX_I] = L
+            attn.W_q.data[base + GATE, BD.CONST] = -L * 1.5
+            attn.W_k.data[base + GATE, BD.CONST] = L
+
+            # V: Copy CLEAN_EMBED (pristine nibble values)
+            for k in range(16):
+                attn.W_v.data[base + k, BD.CLEAN_EMBED_LO + k] = 1.0
+                attn.W_v.data[base + 16 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+
+            # O: Write to ALU_LO/ALU_HI at AX byte position
+            for k in range(16):
+                attn.W_o.data[BD.ALU_LO + k, base + k] = 1.0
+                attn.W_o.data[BD.ALU_HI + k, base + 16 + k] = 1.0
+
     def _compile_l9_attention(self, attn):
         """Compile L9 attention (LEV address relay)."""
         HD = self.HD
@@ -1095,6 +1137,63 @@ class UnifiedVMCompiler:
         attn.W_q.data[base + GATE, BD.CONST] = -L / 2
         attn.W_k.data[base + GATE, BD.CONST] = L
 
+        # Head 2: Carry relay (AX marker → AX byte positions) for multi-byte ADD/SUB
+        # Relays CARRY[1] and CARRY[2] so L9 FFN can compute byte 1-3 results
+        base = 2 * HD
+        AX_I = 1
+        # Q: fires at AX byte positions (IS_BYTE AND H1[AX])
+        attn.W_q.data[base, BD.IS_BYTE] = L
+        attn.W_q.data[base, BD.H1 + AX_I] = L  # Require AX register
+        attn.W_q.data[base, BD.CONST] = -L  # Threshold for 2-way AND
+        # K: attend to AX marker
+        attn.W_k.data[base, BD.MARK_AX] = L
+        # Anti-leakage gate
+        attn.W_q.data[base + GATE, BD.IS_BYTE] = L
+        attn.W_q.data[base + GATE, BD.CONST] = -L / 2
+        attn.W_k.data[base + GATE, BD.CONST] = L
+        # V: copy CARRY[1] and CARRY[2] (ADD carry and SUB borrow from byte 0)
+        attn.W_v.data[base + 1, BD.CARRY + 1] = 1.0
+        attn.W_v.data[base + 2, BD.CARRY + 2] = 1.0
+        # O: write to CARRY[1] and CARRY[2] at byte positions
+        attn.W_o.data[BD.CARRY + 1, base + 1] = 1.0
+        attn.W_o.data[BD.CARRY + 2, base + 2] = 1.0
+
+        # Heads 3-5: Copy AX bytes 1-3 from CLEAN_EMBED to AX_CARRY (multi-byte fix)
+        # At AX byte positions, CLEAN_EMBED has the AX byte values from embedding.
+        # We need these in AX_CARRY for the multi-byte ALU operations.
+        AX_I = 1
+        for j in range(3):  # bytes 1, 2, 3
+            head = 3 + j
+            base = head * HD
+
+            byte_dim = [BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][j]
+
+            # Q and K: Self-attention at AX byte position
+            attn.W_q.data[base, BD.IS_BYTE] = L
+            attn.W_q.data[base, BD.H1 + AX_I] = L
+            attn.W_q.data[base + 1, byte_dim] = L
+            attn.W_q.data[base + 1, BD.CONST] = -L / 2
+            attn.W_k.data[base, BD.IS_BYTE] = L
+            attn.W_k.data[base, BD.H1 + AX_I] = L
+            attn.W_k.data[base + 1, byte_dim] = L
+            attn.W_k.data[base + 1, BD.CONST] = -L / 2
+
+            # Anti-leakage gate
+            attn.W_q.data[base + GATE, BD.IS_BYTE] = L
+            attn.W_q.data[base + GATE, BD.H1 + AX_I] = L
+            attn.W_q.data[base + GATE, BD.CONST] = -L * 1.5
+            attn.W_k.data[base + GATE, BD.CONST] = L
+
+            # V: Copy CLEAN_EMBED (has current AX byte value)
+            for k in range(16):
+                attn.W_v.data[base + k, BD.CLEAN_EMBED_LO + k] = 1.0
+                attn.W_v.data[base + 16 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+
+            # O: Write to AX_CARRY_LO/AX_CARRY_HI
+            for k in range(16):
+                attn.W_o.data[BD.AX_CARRY_LO + k, base + k] = 1.0
+                attn.W_o.data[BD.AX_CARRY_HI + k, base + 16 + k] = 1.0
+
     def _compile_l10_attention(self, attn):
         """Compile L10 attention (carry relay + AX/SP byte passthrough)."""
         HD = self.HD
@@ -1122,10 +1221,17 @@ class UnifiedVMCompiler:
         attn.W_o.data[BD.CARRY + 2, base + 2] = 1.0
 
         # Head 1: AX byte passthrough (shifted matching)
+        # MULTI-BYTE FIX: Suppress for ADD/SUB - we compute the result instead
         base = 1 * HD
         attn.W_q.data[base, BD.IS_BYTE] = L * 3
         attn.W_q.data[base, BD.HAS_SE] = L
         attn.W_q.data[base, BD.CONST] = -L * 3.5
+        # Suppress passthrough for ADD/SUB - these ops compute their own result
+        # Also add suppression to K so QK dot product is maximally negative
+        attn.W_q.data[base, BD.OP_ADD] = -L * 20  # Very strong suppression
+        attn.W_q.data[base, BD.OP_SUB] = -L * 20
+        attn.W_k.data[base, BD.OP_ADD] = L * 20  # K contribution makes QK even more negative
+        attn.W_k.data[base, BD.OP_SUB] = L * 20
         attn.W_q.data[base + 1, BD.H1 + AX_IDX] = L
         attn.W_q.data[base + 1, BD.CONST] = -L / 2
         attn.W_q.data[base + 2, BD.BYTE_INDEX_3] = -L
@@ -2119,13 +2225,13 @@ class UnifiedVMCompiler:
             unit += 1
 
     def _compile_l6_ffn(self, ffn, model=None):
-        """Compile L6 FFN by delegating to the verified hand-set functions."""
+        """Compile L6 FFN by delegating to the primitives-based functions."""
         S = self.S
-        _set_layer6_routing_ffn(ffn, S, BD)
-        _set_io_putchar_routing(ffn, S, BD)
-        _set_binary_pop_sp_increment(ffn, S, BD)
+        set_layer6_routing_ffn(ffn, S=S, unit_start=0)
+        set_io_putchar_routing(ffn, S=S, unit_start=1500)
+        set_binary_pop_sp_increment(ffn, S=S, unit_start=2200)
         if model is not None:
-            _set_function_call_weights(model, S, BD, self.HD)
+            set_function_call_weights(model, S=S, HD=self.HD)
 
         # Post-hoc patching: zero out spurious units that read OUTPUT_BYTE
         # (aliased to TEMP) but don't legitimately use it
@@ -2666,8 +2772,83 @@ class UnifiedVMCompiler:
         ffn.W_down.data[BD.ADDR_B2_LO + 1, unit] = 0.67 / S
         unit += 1
 
+        # === MULTI-BYTE ADD/SUB for bytes 1-3 ===
+        # After L8/L9 attention, ALU_LO/HI contains STACK0 bytes and
+        # AX_CARRY_LO/HI contains AX bytes at positions 1-3.
+        # We compute OUTPUT = ALU ± AX_CARRY ± carry/borrow.
+        byte_dims = [BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3]
+        AX_I = 1
+
+        for byte_offset, byte_dim in enumerate(byte_dims):
+            byte_idx = byte_offset + 1  # 1, 2, 3
+
+            # Carry input: byte 1 uses CARRY[1] (hi nibble carry from byte 0)
+            # bytes 2-3 use CARRY[3] (cascaded carry from previous byte)
+            carry_in_dim = BD.CARRY + 1 if byte_idx == 1 else BD.CARRY + 3
+
+            # === ADD lo nibble (512 units: 256 no-carry + 256 with-carry) ===
+            for carry_in in [0, 1]:
+                for a in range(16):
+                    for b in range(16):
+                        result = (a + b + carry_in) % 16
+                        carry_out = 1 if (a + b + carry_in) >= 16 else 0
+                        ffn.W_up.data[unit, BD.IS_BYTE] = S
+                        ffn.W_up.data[unit, BD.H1 + AX_I] = S
+                        ffn.W_up.data[unit, byte_dim] = S
+                        ffn.W_up.data[unit, BD.ALU_LO + a] = S
+                        ffn.W_up.data[unit, BD.AX_CARRY_LO + b] = S
+                        # Block at marker positions
+                        ffn.W_up.data[unit, BD.MARK_AX] = -S * 100
+                        ffn.W_up.data[unit, BD.MARK_PC] = -S * 100
+                        if carry_in == 0:
+                            ffn.W_up.data[unit, carry_in_dim] = -S * 2.0
+                            ffn.b_up.data[unit] = -S * 4.5
+                        else:
+                            ffn.W_up.data[unit, carry_in_dim] = S * 2.0
+                            ffn.b_up.data[unit] = -S * 6.5
+                        ffn.W_gate.data[unit, BD.OP_ADD] = 1.0
+                        ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 2.0 / S
+                        if carry_out and byte_idx < 3:
+                            ffn.W_down.data[BD.CARRY + 3, unit] = 2.0 / (S * 5.0)
+                        unit += 1
+
+            # === ADD hi nibble (512 units: 256 no-carry + 256 with-carry) ===
+            for carry_in in [0, 1]:
+                for a in range(16):
+                    for b in range(16):
+                        result = (a + b + carry_in) % 16
+                        carry_out = 1 if (a + b + carry_in) >= 16 else 0
+                        ffn.W_up.data[unit, BD.IS_BYTE] = S
+                        ffn.W_up.data[unit, BD.H1 + AX_I] = S
+                        ffn.W_up.data[unit, byte_dim] = S
+                        ffn.W_up.data[unit, BD.ALU_HI + a] = S
+                        ffn.W_up.data[unit, BD.AX_CARRY_HI + b] = S
+                        ffn.W_up.data[unit, BD.MARK_AX] = -S * 100
+                        ffn.W_up.data[unit, BD.MARK_PC] = -S * 100
+                        # Hi nibble carry comes from lo nibble carry-out
+                        carry_lo_dim = BD.CARRY + 3
+                        if carry_in == 0:
+                            ffn.W_up.data[unit, carry_lo_dim] = -S * 2.0
+                            ffn.b_up.data[unit] = -S * 4.5
+                        else:
+                            ffn.W_up.data[unit, carry_lo_dim] = S * 2.0
+                            ffn.b_up.data[unit] = -S * 6.5
+                        ffn.W_gate.data[unit, BD.OP_ADD] = 1.0
+                        ffn.W_down.data[BD.OUTPUT_HI + result, unit] = 2.0 / S
+                        if carry_out and byte_idx < 3:
+                            ffn.W_down.data[BD.CARRY + 3, unit] = 2.0 / (S * 5.0)
+                        unit += 1
+
+            # NOTE: SUB multi-byte code moved to L10 FFN due to timing issue.
+            # CARRY[2] (borrow) is set by L9 FFN at AX marker, but L9 attention
+            # runs BEFORE L9 FFN, so it can't relay CARRY[2] to byte positions.
+            # L10 attention runs AFTER L9 FFN, so L10 FFN has correct CARRY[2].
+
     def _compile_l10_ffn(self, ffn):
-        """Compile L10 FFN: Comparison combine + Bitwise ops + MUL lo nibble.
+        """Compile L10 FFN: Comparison combine + Bitwise ops + MUL lo nibble + SUB multi-byte.
+
+        SUB multi-byte code is here (not L9 FFN) because CARRY[2] is set by L9 FFN
+        at AX marker, and L10 attention relays it to byte positions before L10 FFN runs.
 
         Reference: _set_layer10_alu in vm_step.py
         """
@@ -2909,17 +3090,10 @@ class UnifiedVMCompiler:
             ffn.W_down.data[BD.OUTPUT_HI + k, unit] = 2.0 / S
             unit += 1
 
-        # --- Inter-byte carry/borrow override at AX byte positions ---
+        # --- Inter-byte carry override at AX byte positions ---
+        # Note: SUB borrow override removed - L9 FFN computes correct per-byte
+        # SUB result with borrow propagation via CARRY[2] relay.
         AX_IDX = 1
-        # SUB borrow → all AX bytes = 0xFF
-        for out_dim in [BD.OUTPUT_LO + 15, BD.OUTPUT_HI + 15]:
-            ffn.W_up.data[unit, BD.CARRY + 2] = S
-            ffn.W_up.data[unit, BD.IS_BYTE] = S
-            ffn.W_up.data[unit, BD.OP_SUB] = S
-            ffn.b_up.data[unit] = -S * 5.5
-            ffn.W_gate.data[unit, BD.H1 + AX_IDX] = 1.0
-            ffn.W_down.data[out_dim, unit] = 10.0 / S
-            unit += 1
 
         # ADD carry → AX byte 0 only = 0x01
         for out_dim in [BD.OUTPUT_LO + 1, BD.OUTPUT_HI + 0]:
@@ -2931,6 +3105,72 @@ class UnifiedVMCompiler:
             ffn.W_gate.data[unit, BD.H1 + AX_IDX] = 1.0
             ffn.W_down.data[out_dim, unit] = 10.0 / S
             unit += 1
+
+        # === SUB multi-byte (bytes 1-3) ===
+        # This code runs after L10 attention relays CARRY[2] from AX marker.
+        # L9 FFN sets CARRY[2] at AX marker, L10 attention relays it here.
+        for byte_idx in range(1, 4):
+            byte_dim = [BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][byte_idx - 1]
+
+            # SUB lo nibble (256 no-borrow + 256 with-borrow = 512 units per byte)
+            for borrow_in in [0, 1]:
+                for a in range(16):
+                    for b in range(16):
+                        result = (a - b - borrow_in) % 16
+                        borrow_out = 1 if (a - b - borrow_in) < 0 else 0
+
+                        ffn.W_up.data[unit, BD.IS_BYTE] = S
+                        ffn.W_up.data[unit, BD.H1 + AX_IDX] = S
+                        ffn.W_up.data[unit, byte_dim] = S
+                        ffn.W_up.data[unit, BD.ALU_LO + a] = S
+                        ffn.W_up.data[unit, BD.AX_CARRY_LO + b] = S
+                        ffn.W_up.data[unit, BD.MARK_AX] = -S * 100
+                        ffn.W_up.data[unit, BD.MARK_PC] = -S * 100
+
+                        # Borrow input: byte 1 uses CARRY[2], bytes 2-3 use CARRY[3]
+                        borrow_in_dim = BD.CARRY + 2 if byte_idx == 1 else BD.CARRY + 3
+                        if borrow_in == 0:
+                            ffn.W_up.data[unit, borrow_in_dim] = -S * 2.0
+                            ffn.b_up.data[unit] = -S * 4.5
+                        else:
+                            ffn.W_up.data[unit, borrow_in_dim] = S * 2.0
+                            ffn.b_up.data[unit] = -S * 6.5
+
+                        ffn.W_gate.data[unit, BD.OP_SUB] = 1.0
+                        ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 2.0 / S
+                        if borrow_out and byte_idx < 3:
+                            ffn.W_down.data[BD.CARRY + 3, unit] = 2.0 / (S * 5.0)
+                        unit += 1
+
+            # SUB hi nibble (256 no-borrow + 256 with-borrow = 512 units per byte)
+            for borrow_in in [0, 1]:
+                for a in range(16):
+                    for b in range(16):
+                        result = (a - b - borrow_in) % 16
+                        borrow_out = 1 if (a - b - borrow_in) < 0 else 0
+
+                        ffn.W_up.data[unit, BD.IS_BYTE] = S
+                        ffn.W_up.data[unit, BD.H1 + AX_IDX] = S
+                        ffn.W_up.data[unit, byte_dim] = S
+                        ffn.W_up.data[unit, BD.ALU_HI + a] = S
+                        ffn.W_up.data[unit, BD.AX_CARRY_HI + b] = S
+                        ffn.W_up.data[unit, BD.MARK_AX] = -S * 100
+                        ffn.W_up.data[unit, BD.MARK_PC] = -S * 100
+
+                        # Hi nibble borrow comes from lo nibble borrow-out
+                        borrow_lo_dim = BD.CARRY + 3
+                        if borrow_in == 0:
+                            ffn.W_up.data[unit, borrow_lo_dim] = -S * 2.0
+                            ffn.b_up.data[unit] = -S * 4.5
+                        else:
+                            ffn.W_up.data[unit, borrow_lo_dim] = S * 2.0
+                            ffn.b_up.data[unit] = -S * 6.5
+
+                        ffn.W_gate.data[unit, BD.OP_SUB] = 1.0
+                        ffn.W_down.data[BD.OUTPUT_HI + result, unit] = 2.0 / S
+                        if borrow_out and byte_idx < 3:
+                            ffn.W_down.data[BD.CARRY + 3, unit] = 2.0 / (S * 5.0)
+                        unit += 1
 
     def _compile_l11_ffn(self, ffn):
         """Compile L11 FFN: MUL partial products.

@@ -67,9 +67,17 @@ class Operation:
     name: str
     reads: Set[str]
     writes: Set[str]
-    kind: str  # "attn" or "ffn"
+    kind: str  # "attn", "ffn", "block", or "model"
     bake_fn: Callable
     phase: Optional[int] = None
+    # For kind="block" or "model" ops, the layer_idx the op targets (if
+    # block-scoped) or None (if it operates on the whole model).
+    layer_idx: Optional[int] = None
+    # When True, build_model_from_layout dispatches this op's bake_fn even when
+    # legacy_bake is present. Used to incrementally migrate ops out of
+    # legacy_bake — flip to True once the corresponding direct call is removed
+    # from set_vm_weights so the op runs only via the compiler.
+    migrated: bool = False
 
     def __hash__(self):
         return hash(self.name)
@@ -85,6 +93,8 @@ class ModelLayout:
         ops_per_layer: ops_per_layer[i] is the list of ops the compiler placed at layer i
         dim_positions: map of dim_name -> start position in residual stream
         dim_sizes: map of dim_name -> size (so position range is [pos, pos+size))
+        block_ops: block-level ops, each carrying its own layer_idx
+        model_ops: model-level post-pass ops (head, embedding, right-size, etc.)
     """
 
     d_model: int
@@ -92,6 +102,8 @@ class ModelLayout:
     ops_per_layer: List[List[Operation]]
     dim_positions: Dict[str, int]
     dim_sizes: Dict[str, int]
+    block_ops: List[Operation] = field(default_factory=list)
+    model_ops: List[Operation] = field(default_factory=list)
 
     def ops_at(self, layer: int) -> List[Operation]:
         return self.ops_per_layer[layer]
@@ -118,6 +130,10 @@ class LayerCompiler:
         self.ops: List[Operation] = []
         self.dims: Dict[str, int] = {}  # name -> size
         self._op_by_name: Dict[str, Operation] = {}
+        # Block-level and model-level ops are bake-only; they don't participate
+        # in dim-position allocation, so they're held separately.
+        self.block_ops: List[Operation] = []
+        self.model_ops: List[Operation] = []
 
     def declare_dim(self, name: str, size: int, pinned: Optional[int] = None):
         """Declare a dim with optional pinned start position.
@@ -140,8 +156,10 @@ class LayerCompiler:
             self._pinned[name] = pinned
 
     def add_op(self, op: Operation):
-        if op.kind not in ("attn", "ffn"):
-            raise ValueError(f"op.kind must be 'attn' or 'ffn'; got {op.kind!r}")
+        if op.kind not in ("attn", "ffn", "block", "model"):
+            raise ValueError(
+                f"op.kind must be 'attn', 'ffn', 'block', or 'model'; got {op.kind!r}"
+            )
         if op.name in self._op_by_name:
             raise ValueError(f"Operation name {op.name!r} already added")
         # Validate that every read/write is declared.
@@ -150,8 +168,17 @@ class LayerCompiler:
                 raise ValueError(
                     f"Op {op.name!r} references undeclared dim {d!r}"
                 )
-        self.ops.append(op)
         self._op_by_name[op.name] = op
+        if op.kind == "block":
+            if op.layer_idx is None:
+                raise ValueError(
+                    f"Block-scoped op {op.name!r} must specify layer_idx"
+                )
+            self.block_ops.append(op)
+        elif op.kind == "model":
+            self.model_ops.append(op)
+        else:
+            self.ops.append(op)
 
     # --------------------------------------------------------------------
     # Compilation
@@ -173,12 +200,19 @@ class LayerCompiler:
         for op in self.ops:
             ops_per_layer[layer_assignment[op.name]].append(op)
 
+        # n_layers must be at least max(block_ops.layer_idx) + 1 if any
+        # block-scoped ops exist, otherwise their target block won't exist.
+        if self.block_ops:
+            n_layers = max(n_layers, max(o.layer_idx for o in self.block_ops) + 1)
+
         return ModelLayout(
             d_model=d_model,
             n_layers=n_layers,
             ops_per_layer=ops_per_layer,
             dim_positions=dim_positions,
             dim_sizes=dict(self.dims),
+            block_ops=list(self.block_ops),
+            model_ops=list(self.model_ops),
         )
 
     # --------------------------------------------------------------------
@@ -340,6 +374,14 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
     # Auto d_model is derived from layout, not hardcoded.
     model = AutoregressiveVM(d_model=layout.d_model, n_layers=n_layers)
 
+    # If a `legacy_bake` model op is present, it owns the bake pass for any
+    # op that hasn't been individually migrated. Per-op migration: when an op's
+    # `migrated` flag is True, its bake_fn runs even with legacy_bake present.
+    has_legacy_bake = any(o.name == "legacy_bake" for o in layout.model_ops)
+
+    def _should_dispatch(op):
+        return op.migrated or not has_legacy_bake
+
     # Wrap the entire bake pass in no_grad so bake_fn implementations can do
     # in-place writes to leaf Parameters (the pattern used throughout
     # vm_step.py's hand-set weights).
@@ -348,12 +390,32 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
         for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer):
             block = model.blocks[layer_idx]
             for op in ops_at_layer:
+                if not _should_dispatch(op):
+                    continue
                 if op.kind == "attn":
                     target = block.attn
                 elif op.kind == "ffn":
                     target = block.ffn
                 else:
-                    raise ValueError(f"Unknown op kind {op.kind!r}")
+                    raise ValueError(
+                        f"Op {op.name!r} in ops_per_layer has kind={op.kind!r}; "
+                        "expected 'attn' or 'ffn'"
+                    )
                 op.bake_fn(target, layout.dim_positions, S)
+
+        # Block-scoped ops run after all attn/ffn bakes for their layer.
+        for op in sorted(
+            layout.block_ops, key=lambda o: (o.layer_idx, o.phase or 0)
+        ):
+            if not _should_dispatch(op):
+                continue
+            block = model.blocks[op.layer_idx]
+            op.bake_fn(block, layout.dim_positions, S)
+
+        # Model-level ops run last (head, embedding, defensive patches,
+        # right-size, expand wrappers, legacy_bake). Sort by phase.
+        # Always dispatch model ops (head/embedding/legacy_bake all need to run).
+        for op in sorted(layout.model_ops, key=lambda o: (o.phase or 0)):
+            op.bake_fn(model, layout.dim_positions, S)
 
     return model

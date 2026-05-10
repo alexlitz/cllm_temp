@@ -12,3 +12,4 @@ Testing checklist
 - The bundler, bundles programs, the model weights and the program bytecode all together into a single file which runs the bytecode via executing the bundled model in onnx runtime, and passes the 1000+ tests. A version of the bundler written in C4 C should also exist and pass all 1000+ tests
 - The quine, a program which outputs its own source code, runs correctly and passes the 1000+ tests. Should be written in c4 c, run via the model, include the runtime, the model weights and program bytecode.
 - The network structure, it should be 100% a vanilla transformer using MoE, SwiGLU, vanilla attention. None of the operations should be performed in any other way, such as via external memory or custom non-transformer layers. The network should be able to be exported to onnx and run in onnx runtime, still passing all 1000+ tests.
+- Ints should be 32 bits so should addresses and there should be unified memory

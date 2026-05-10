@@ -1814,82 +1814,6 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     HD = d // NH  # head dim (64)
     ALIBI_S = 10.0  # ALiBi slope for threshold heads
 
-    # ===== EMBEDDING =====
-    # Access wrapped nn.Embedding inside NeuralVMEmbedding
-    embed = model.embed.embed.weight
-    embed.zero_()
-
-    for tok in range(V):
-        embed[tok, BD.CONST] = 1.0
-
-    for tok, dim in [
-        (Token.REG_PC, BD.MARK_PC),
-        (Token.REG_AX, BD.MARK_AX),
-        (Token.REG_SP, BD.MARK_SP),
-        (Token.REG_BP, BD.MARK_BP),
-        (Token.MEM, BD.MARK_MEM),
-        (Token.CODE_START, BD.MARK_CS),
-    ]:
-        embed[tok, dim] = 1.0
-        embed[tok, BD.IS_MARK] = 1.0
-
-    # STACK0 has its own marker dim but NOT IS_MARK.
-    # IS_MARK would make threshold heads "see" STACK0 as a marker,
-    # blocking BP from being detected (STACK0 has no MARKS flags,
-    # so all threshold outputs become zero when it's nearest).
-    embed[Token.STACK0, BD.MARK_STACK0] = 1.0
-
-    for tok in [Token.STEP_END, Token.DATA_END, Token.HALT]:
-        embed[tok, BD.MARK_SE] = 1.0
-        embed[tok, BD.IS_MARK] = 1.0
-
-    embed[Token.STEP_END, BD.MARK_SE_ONLY] = 1.0
-
-    # TOOL_CALL: same marker profile as STEP_END (threshold heads see it as step boundary)
-    embed[Token.TOOL_CALL, BD.MARK_SE] = 1.0
-    embed[Token.TOOL_CALL, BD.IS_MARK] = 1.0
-    embed[Token.TOOL_CALL, BD.MARK_SE_ONLY] = 1.0
-    embed[Token.TOOL_CALL, BD.CONST] = 1.0
-
-    # IO token embeddings — NOT IS_MARK (would break L0 threshold distance detection)
-    # USER_INPUT tokens are I/O boundaries, not VM execution markers
-
-    # Thinking tag embeddings (for conversational I/O mode)
-    # These are markers but NOT step-end markers
-    # Add specific markers for lookback detection
-    embed[Token.THINKING_START, BD.IS_MARK] = 1.0
-    embed[Token.THINKING_START, BD.CONST] = 1.0
-    embed[Token.THINKING_START, BD.TEMP + 1] = 1.0  # Unique marker for lookback
-    embed[Token.THINKING_END, BD.IS_MARK] = 1.0
-    embed[Token.THINKING_END, BD.CONST] = 1.0
-    embed[Token.THINKING_END, BD.TEMP + 2] = 1.0  # Unique marker for lookback
-
-    # I/O state tokens (internal markers for state machine)
-    # These control multi-step I/O generation sequences
-    embed[Token.IO_STATE_EMIT_BYTE, BD.IS_MARK] = 1.0
-    embed[Token.IO_STATE_EMIT_BYTE, BD.CONST] = 1.0
-    embed[Token.IO_STATE_EMIT_THINKING, BD.IS_MARK] = 1.0
-    embed[Token.IO_STATE_EMIT_THINKING, BD.CONST] = 1.0
-
-    for b in range(256):
-        embed[b, BD.IS_BYTE] = 1.0
-        embed[b, BD.EMBED_LO + (b & 0xF)] = 1.0
-        embed[b, BD.EMBED_HI + ((b >> 4) & 0xF)] = 1.0
-        # Pristine copies — never written by attention W_o or FFN W_down
-        embed[b, BD.CLEAN_EMBED_LO + (b & 0xF)] = 1.0
-        embed[b, BD.CLEAN_EMBED_HI + ((b >> 4) & 0xF)] = 1.0
-
-    # NOTE: OP_* flags are NOT set in the embedding table.
-    # BUG FIX 2026-04-13: Removed embedding OP_* flags because they caused
-    # L6 attention to average OP_LEA across all byte-0 positions (13 CODE bytes
-    # with value 0x00), leaking OP_LEA=0.59 into the PC marker for non-LEA ops.
-    # This triggered L7 head 1 (LEA operand gather), writing spurious ALU values,
-    # which caused L13 shift FFN to corrupt PC OUTPUT from 24 to 8.
-    #
-    # L5 FFN opcode decode (_set_opcode_decode_ffn) properly sets OP_* flags
-    # at MARK_PC/MARK_AX positions using OPCODE_BYTE_LO/HI gating, so embedding
-    # OP_* flags are not needed and cause spurious leakage.
-
     # ===== LAYER 0: Step structure via threshold attention (8 heads) =====
     # 35-token step: PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5)+MEM(9)+SE(1)
     # STACK0 does NOT have IS_MARK (would block BP from threshold view).
@@ -2345,30 +2269,24 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
             _set_null_terminator_detection(ffn10, S, BD)
 
         # ===== LAYER 10.5: Byte propagation + DIV/MOD =====
-        model.blocks[10].post_ops.append(BinaryOpByteZeroingPostOp(d_model=512, S=S))
-        model.blocks[10].post_ops.append(CarryPropagationPostOp(d_model=512, S=S, byte_idx=0, cascade=False))
-        model.blocks[10].post_ops.append(CarryPropagationPostOp(d_model=512, S=S, byte_idx=1, cascade=True))
-        model.blocks[10].post_ops.append(CarryPropagationPostOp(d_model=512, S=S, byte_idx=2, cascade=True))
-        model.blocks[10].post_ops.append(BitwiseBytePropagationPostOp(d_model=512, S=S))
-        model.blocks[10].post_ops.append(DivModModule(mode='lookup'))
+        # Migrated to compiler block op `l10_post_op_attach` (phase=10.7) which
+        # attaches BinaryOpByteZeroingPostOp + 3x CarryPropagationPostOp +
+        # BitwiseBytePropagationPostOp + DivModModule(mode='lookup') to
+        # model.blocks[10].post_ops before legacy_bake runs.
 
         # ===== LAYER 11: MUL partial sum staging =====
-        ffn11 = model.blocks[11].ffn
-        _set_layer11_mul_partial(ffn11, S, BD)
+        # Migrated to compiler op `layer11_mul_partial` (phase=11) which bakes
+        # the L11 FFN MUL partial-product weights via build_model_from_layout.
 
         # ===== LAYER 12: MUL hi nibble combine =====
-        ffn12 = model.blocks[12].ffn
-        _set_layer12_mul_combine(ffn12, S, BD)
+        # Migrated to compiler op `layer12_mul_combine` (phase=12) which bakes
+        # the L12 FFN MUL combine weights via build_model_from_layout.
 
         # ===== LAYER 13: SHL/SHR shifts + MEM addr gather =====
-        attn13 = model.blocks[13].attn
-        if hasattr(attn13, 'alibi_slopes') and attn13.alibi_slopes is not None:
-            attn13.alibi_slopes.fill_(0.5)
-        _set_layer13_mem_addr_gather(attn13, S, BD, HD)
-        ffn13 = model.blocks[13].ffn
-        _set_layer13_shifts(ffn13, S, BD)
-
-
+        # Migrated to compiler ops `layer13_mem_addr_gather` (attn, phase=13)
+        # and `layer13_shifts` (ffn, phase=13) which run via
+        # build_model_from_layout. ALiBi slopes are now set inside the
+        # layer13_mem_addr_gather bake_fn.
 
         # ===== EFFICIENT ALU HYBRID OVERRIDE =====
         # Wire efficient structural ALU on top of lookup FFN weights.
@@ -2408,27 +2326,17 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # L10 FFN: Neural AND/OR/XOR
         model.blocks[10].ffn = EfficientALU_L10_Neural(S, BD)
 
-        # L10.5: Byte propagation post_ops (same as lookup mode)
-        model.blocks[10].post_ops.append(BinaryOpByteZeroingPostOp(d_model=512, S=S))
-        model.blocks[10].post_ops.append(CarryPropagationPostOp(d_model=512, S=S, byte_idx=0, cascade=False))
-        model.blocks[10].post_ops.append(CarryPropagationPostOp(d_model=512, S=S, byte_idx=1, cascade=True))
-        model.blocks[10].post_ops.append(CarryPropagationPostOp(d_model=512, S=S, byte_idx=2, cascade=True))
-        model.blocks[10].post_ops.append(BitwiseBytePropagationPostOp(d_model=512, S=S))
-
-        # L10.5: Comparison combine (EQ/NE/LT/GT/LE/GE)
-        model.blocks[10].post_ops.append(ComparisonCombine(S=S))
-
-        # L10.5: Pure neural DIV/MOD (no Python math in forward pass)
-        model.blocks[10].post_ops.append(EfficientDivMod_Neural(S, BD))
+        # L10.5: Byte propagation post_ops + ComparisonCombine + EfficientDivMod_Neural.
+        # Migrated to compiler block op `l10_post_op_attach` (phase=10.7) which
+        # attaches all 7 modules to model.blocks[10].post_ops before legacy_bake
+        # runs.
 
         # L11-L12: Neural MUL
         model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)
 
-        # L13: Memory addr gather attention (still needed)
-        attn13 = model.blocks[13].attn
-        if hasattr(attn13, 'alibi_slopes') and attn13.alibi_slopes is not None:
-            attn13.alibi_slopes.fill_(0.5)
-        _set_layer13_mem_addr_gather(attn13, S, BD, HD)
+        # L13: Memory addr gather attention.
+        # Migrated to compiler op `layer13_mem_addr_gather` (phase=13) which
+        # runs via build_model_from_layout and sets ALiBi slopes inline.
 
         # L13 FFN: Neural SHL/SHR
         model.blocks[13].ffn = EfficientALU_L13_Neural(S, BD)
@@ -2516,73 +2424,6 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         ffn16 = model.blocks[16].ffn
         num_units = _set_layer16_lev_routing(ffn16, S, BD)
         print(f"  L16 FFN: {num_units} units for LEV routing (SP = BP + 16)")
-
-    # ===== OUTPUT HEAD =====
-    head = model.head
-    head.weight.zero_()
-    head.bias.zero_()
-
-    # Byte tokens: nibble decoding + marker suppression
-    next_flags = [
-        BD.NEXT_PC,
-        BD.NEXT_AX,
-        BD.NEXT_SP,
-        BD.NEXT_BP,
-        BD.NEXT_STACK0,
-        BD.NEXT_MEM,
-        BD.NEXT_SE,
-        BD.NEXT_HALT,
-        BD.NEXT_TOOL_CALL,
-        BD.NEXT_THINKING_START,
-        BD.NEXT_THINKING_END,
-    ]
-    for b in range(256):
-        lo, hi = b & 0xF, (b >> 4) & 0xF
-        head.weight[b, BD.OUTPUT_LO + lo] = 5.0
-        head.weight[b, BD.OUTPUT_HI + hi] = 5.0
-        head.bias[b] = -5.0
-        # Suppress byte logits when a marker transition is expected.
-        # At marker-generating positions (NEXT_* > 0), byte logits get
-        # a large penalty. At byte-generating positions (all NEXT_* = 0),
-        # no penalty. This prevents OUTPUT_LO/HI noise from causing
-        # bytes to beat markers.
-        for flag in next_flags:
-            head.weight[b, flag] += -80.0
-    head.bias[0] = -4.0
-
-    # Transition tokens (including STACK0)
-    for tok, flag in [
-        (Token.REG_PC, BD.NEXT_PC),
-        (Token.REG_AX, BD.NEXT_AX),
-        (Token.REG_SP, BD.NEXT_SP),
-        (Token.REG_BP, BD.NEXT_BP),
-        (Token.STACK0, BD.NEXT_STACK0),
-        (Token.MEM, BD.NEXT_MEM),
-        (Token.STEP_END, BD.NEXT_SE),
-        (Token.HALT, BD.NEXT_HALT),
-        (Token.TOOL_CALL, BD.NEXT_TOOL_CALL),
-        (Token.THINKING_START, BD.NEXT_THINKING_START),
-        (Token.THINKING_END, BD.NEXT_THINKING_END),
-    ]:
-        head.weight[tok, flag] = 20.0
-        head.bias[tok] = -10.0
-
-    # Never output these tokens (context markers only, not part of VM execution)
-    for tok in [
-        Token.CODE_START,
-        Token.CODE_END,
-        Token.DATA_START,
-        Token.DATA_END,
-        Token.SEP,
-        Token.USER_INPUT_START,
-        Token.USER_INPUT_END,
-    ]:
-        head.bias[tok] = -50.0
-
-    # I/O state tokens can be generated (part of I/O sequence) but suppress by default
-    # They will be enabled when needed by NEXT_IO_STATE_* flags
-    head.bias[Token.IO_STATE_EMIT_BYTE] = -20.0
-    head.bias[Token.IO_STATE_EMIT_THINKING] = -20.0
 
     # ===== CONTRACT VALIDATION =====
     reg = build_default_registry()
@@ -3798,9 +3639,9 @@ def _set_layer4_ffn(ffn, S, BD):
             ffn.W_up[unit, BD.H1 + AX_I] = S
             ffn.W_up[unit, BD.BYTE_INDEX_0 + byte_idx] = S
             ffn.b_up[unit] = -S * 2.5
-        ffn.W_gate[unit, BD.TEMP + 16 + k] = 1.0
-        ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
-        unit += 1
+            ffn.W_gate[unit, BD.TEMP + 16 + k] = 1.0
+            ffn.W_down[BD.FETCH_HI + k, unit] = 2.0 / S
+            unit += 1
 
     # === PC+1 at PC marker → FETCH_LO/HI for dynamic immediate fetch ===
     # FIX 2026-04-29: Compute PC+1 at the PC marker and write to FETCH dims.
