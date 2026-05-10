@@ -2592,99 +2592,15 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         for e in errors:
             print(f"  CONTRACT: {e}")
 
-    # === FIX 2026-05-09: Suppress branch/LEV-override units when other opcodes active ===
-    # In pure_neural mode without runner overrides, L5 attention heads leak opcode flags
-    # (OP_JMP, OP_LEV, OP_BZ, OP_BNZ, CMP[0]) into MARK_PC of subsequent steps. Various
-    # FFN units across blocks then fire spuriously, destroying carry-forwarded values.
-    #
-    # Defensive gate: any FFN unit (in any block) that fires with positive OP_JMP/OP_LEV/
-    # OP_BZ/OP_BNZ/CMP[0] weight AND positive MARK_PC weight AND writes to OUTPUT_LO/HI
-    # gets strong negative weights for non-target opcodes. When the actually-active
-    # opcode (e.g., OP_IMM ≈ 5) is set, the unit's `up` becomes strongly negative.
-    # Only the legit branch/LEV opcode lets the unit fire.
-    #
-    # IMPORTANT: This patch must run AFTER all layer setups (so all FFN weights are
-    # programmed) and BEFORE _right_size_ffns (so the patch's edits become permanent
-    # in the right-sized result).
-    OPCODE_BLOCK_MAP = {
-        BD.OP_JMP: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
-        BD.OP_LEV: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
-        BD.OP_BZ:  [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BNZ, BD.OP_JSR],
-        BD.OP_BNZ: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
-                    BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                    BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                    BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                    BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                    BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                    BD.OP_BZ, BD.OP_JSR],
-        BD.CMP + 0: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
-                     BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                     BD.OP_OR, BD.OP_XOR, BD.OP_AND,
-                     BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                     BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
-                     BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
-                     BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
-    }
-    branch_override_patches = 0
-    for block_idx in range(len(model.blocks)):
-        ffn = model.blocks[block_idx].ffn
-        if not (hasattr(ffn, 'W_up') and isinstance(getattr(ffn, 'W_up', None), nn.Parameter)):
-            continue
-        hidden_dim = ffn.W_up.shape[0]
-        for u in range(hidden_dim):
-            mark_pc_w = ffn.W_up[u, BD.MARK_PC].item()
-            if mark_pc_w <= 50:
-                continue
-            writes_output = (
-                ffn.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
-                or ffn.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
-            )
-            if not writes_output:
-                continue
-            for trigger_dim, blockers in OPCODE_BLOCK_MAP.items():
-                trigger_w = ffn.W_up[u, trigger_dim].item()
-                if trigger_w <= 5:
-                    continue
-                for opcode_dim in blockers:
-                    cur = ffn.W_up[u, opcode_dim].item()
-                    ffn.W_up.data[u, opcode_dim] = min(cur, -S)
-                branch_override_patches += 1
-                break
-    print(f"  BRANCH OVERRIDE PATCH: {branch_override_patches} units gated")
-
-    # ===== FIX 2026-05-09: Right-size FFN hidden dimensions to actual programmed units =====
-    # The architecture is built with hardcoded ffn_hidden=4096, but most FFNs only program
-    # a fraction of those units (often 100-1000). The unprogrammed units have all-zero
-    # weights but their `b_up` is also 0, which means silu(0)=0.27, and combined with
-    # ANY non-zero gate this produces a non-zero contribution. Multiplied across thousands
-    # of dead units, this accumulates into spurious OUTPUT writes that break correctness
-    # in pure-neural mode.
-    #
-    # Fix: for each block's FFN, identify the actually-programmed units (any non-zero
-    # weight in W_up, W_gate, W_down, or non-zero bias), and replace the FFN matrices
-    # with right-sized versions containing ONLY those units. This is what "the compiler
-    # determines network width" looks like: ffn_hidden becomes per-layer, equal to the
-    # actually-needed unit count.
-    _right_size_ffns(model)
-    _expand_wrapper_blocks(model)
+    from .unified_compiler.migrated_ops import (
+        make_branch_override_patch_op,
+        make_right_size_ffns_op,
+        make_expand_wrapper_blocks_op,
+    )
+    for _op in (make_branch_override_patch_op(),
+                make_right_size_ffns_op(),
+                make_expand_wrapper_blocks_op()):
+        _op.bake_fn(model, {}, S)
 
     return model
 

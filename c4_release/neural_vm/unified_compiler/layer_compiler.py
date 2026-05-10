@@ -67,9 +67,10 @@ class Operation:
     name: str
     reads: Set[str]
     writes: Set[str]
-    kind: str  # "attn" or "ffn"
+    kind: str  # "attn", "ffn", or "model"
     bake_fn: Callable
     phase: Optional[int] = None
+    migrated: bool = True
 
     def __hash__(self):
         return hash(self.name)
@@ -85,6 +86,8 @@ class ModelLayout:
         ops_per_layer: ops_per_layer[i] is the list of ops the compiler placed at layer i
         dim_positions: map of dim_name -> start position in residual stream
         dim_sizes: map of dim_name -> size (so position range is [pos, pos+size))
+        model_ops: ops with kind="model" — applied to the whole model post-bake,
+            in ascending `phase` order.
     """
 
     d_model: int
@@ -92,6 +95,7 @@ class ModelLayout:
     ops_per_layer: List[List[Operation]]
     dim_positions: Dict[str, int]
     dim_sizes: Dict[str, int]
+    model_ops: List[Operation] = field(default_factory=list)
 
     def ops_at(self, layer: int) -> List[Operation]:
         return self.ops_per_layer[layer]
@@ -140,8 +144,8 @@ class LayerCompiler:
             self._pinned[name] = pinned
 
     def add_op(self, op: Operation):
-        if op.kind not in ("attn", "ffn"):
-            raise ValueError(f"op.kind must be 'attn' or 'ffn'; got {op.kind!r}")
+        if op.kind not in ("attn", "ffn", "model"):
+            raise ValueError(f"op.kind must be 'attn', 'ffn', or 'model'; got {op.kind!r}")
         if op.name in self._op_by_name:
             raise ValueError(f"Operation name {op.name!r} already added")
         # Validate that every read/write is declared.
@@ -171,7 +175,14 @@ class LayerCompiler:
 
         ops_per_layer: List[List[Operation]] = [[] for _ in range(n_layers)]
         for op in self.ops:
+            if op.kind == "model":
+                continue
             ops_per_layer[layer_assignment[op.name]].append(op)
+
+        # Model-ops are applied after all layer-ops; sort by phase so the
+        # original hand-set order is preserved (smaller phase = earlier).
+        model_ops = [op for op in self.ops if op.kind == "model"]
+        model_ops.sort(key=lambda o: (o.phase if o.phase is not None else 0))
 
         return ModelLayout(
             d_model=d_model,
@@ -179,6 +190,7 @@ class LayerCompiler:
             ops_per_layer=ops_per_layer,
             dim_positions=dim_positions,
             dim_sizes=dict(self.dims),
+            model_ops=model_ops,
         )
 
     # --------------------------------------------------------------------
@@ -257,6 +269,8 @@ class LayerCompiler:
         assignment: Dict[str, int] = {}
 
         for op in topo:
+            if op.kind == "model":
+                continue
             earliest = 0
             for d in op.reads:
                 if d in writes_layer:
@@ -355,5 +369,8 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
                 else:
                     raise ValueError(f"Unknown op kind {op.kind!r}")
                 op.bake_fn(target, layout.dim_positions, S)
+
+        for op in layout.model_ops:
+            op.bake_fn(model, layout.dim_positions, S)
 
     return model
