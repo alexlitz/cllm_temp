@@ -64,6 +64,7 @@ def compile_full_vm(
     n_heads: int = 8,
     ffn_hidden: int = 4096,
     max_seq_len: int = 8192,
+    pin_io_only: bool = False,
 ):
     """Compile and bake a full Neural VM model via the compiler.
 
@@ -73,13 +74,23 @@ def compile_full_vm(
     out of `set_vm_weights` into their own per-layer Operation instances, the
     legacy_bake op shrinks and eventually disappears.
 
+    Args:
+        pin_io_only: when True, only IO-required dims (the externally-
+            observable ones read/written by token embedding, the head, and
+            `_inject_*` runtime injectors) are pinned, and they are pinned to
+            a *compact contiguous block* starting at position 0. Every other
+            dim is bump-pointer-allocated above the IO block, shrinking
+            d_model relative to the legacy `_SetDim`-pinned layout. See
+            `declare_setdim_compat_dims` for details. Defaults to False for
+            backward compatibility.
+
     Returns:
         (model, layout) where:
         - model is an AutoregressiveVM with all weights baked
         - layout is the ModelLayout (d_model, n_layers, dim_positions)
     """
     compiler = LayerCompiler()
-    declare_setdim_compat_dims(compiler)
+    declare_setdim_compat_dims(compiler, pin_io_only=pin_io_only)
 
     # Per-layer ops drive the layout (d_model, n_layers, dim_positions).
     # Forward alu_mode so SHL/SHR (and any future alu_mode-aware migrated op)

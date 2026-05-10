@@ -1434,7 +1434,11 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             # `model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)`.
             block.post_ops.append(DivModModule(mode="lookup"))
         else:  # efficient
-            block.post_ops.append(ComparisonCombine(S=S))
+            # Pass the model's actual d_model so the underlying PureFFN's
+            # Linear input dim matches the residual stream width. Without
+            # this, ComparisonCombine builds a Linear(512, 18) which fails
+            # forward when d_model != 512 (e.g., pin_io_only=True paths).
+            block.post_ops.append(ComparisonCombine(d_model=d_model, S=S))
             block.post_ops.append(EfficientDivMod_Neural(S, _SetDim))
 
     return Operation(
@@ -2580,13 +2584,20 @@ def declare_setdim_compat_dims(
             position 420) so existing _set_layerN_* bake_fns work unchanged. If
             False, dims are bump-pointer allocated by declaration order — useful
             for testing the auto-allocation path but breaks _SetDim aliases.
-        pin_io_only: if True, only the dims in `_IO_REQUIRED_DIMS` (the
+        pin_io_only: if True, the dims in `_IO_REQUIRED_DIMS` (the
             externally-observable dims read/written by token embedding, the
             output head, and `NeuralVMEmbedding._inject_*` runtime injectors)
-            are pinned to their `_SetDim` positions. Every other dim becomes
-            bump-pointer-allocated by the compiler. This unlocks compiler-driven
-            internal dim allocation while keeping the IO contract intact.
-            Implies `pin_to_setdim=True` for the IO-required subset; the
+            are pinned to a *compact, contiguous block starting at position
+            0*, in declaration order. Every non-IO dim is bump-pointer
+            allocated by the compiler above the IO block. This unlocks
+            compiler-driven internal dim allocation AND shrinks d_model:
+            instead of pinning IO dims at their scattered `_SetDim` positions
+            (which span up to ~507 with large gaps, forcing unpinned dims to
+            stack on top for d_model ~1038), they are laid out densely so
+            d_model collapses to roughly (IO total size) + (non-IO total
+            size). Code that still reads `_SetDim.X` *directly* will get the
+            wrong position — all baked weights must resolve dim positions
+            through `dim_positions` (e.g., via `_as_setdim_proxy`). The
             `pin_to_setdim` flag is ignored when `pin_io_only=True`. Defaults
             to False for backward compatibility.
     """
@@ -2637,13 +2648,27 @@ def declare_setdim_compat_dims(
     forty_eight_dim = ["ADDR_KEY"]
     thirty_two_dim = ["TEMP"]
 
+    # Cursor for the compact IO block when pin_io_only=True. IO dims are
+    # pinned at consecutive positions starting at 0, in declaration order
+    # (the order of the `one_dim` / `seven_dim` / ... lists below). Non-IO
+    # dims are left unpinned and bump-pointer-allocated above the IO block
+    # by `_allocate_dims`.
+    io_cursor = [0]
+
     def _declare(name, size):
         if not hasattr(_SetDim, name):
             return
         if pin_io_only:
-            # Only pin the IO-required subset; everything else is
-            # bump-pointer-allocated by the compiler.
-            pinned = getattr(_SetDim, name) if name in _IO_REQUIRED_DIMS else None
+            if name in _IO_REQUIRED_DIMS:
+                # Compact: assign consecutive positions starting at 0,
+                # ignoring _SetDim's scattered legacy positions. Without
+                # this compaction, IO dims pinned at their _SetDim positions
+                # leave huge gaps (max IO position ~507) and force unpinned
+                # dims to stack on top, producing d_model ~1038.
+                pinned = io_cursor[0]
+                io_cursor[0] += size
+            else:
+                pinned = None
         else:
             pinned = getattr(_SetDim, name) if pin_to_setdim else None
         compiler.declare_dim(name, size, pinned=pinned)
