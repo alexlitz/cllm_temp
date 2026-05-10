@@ -1230,22 +1230,32 @@ def make_layer3_carry_forward_attn_op() -> Operation:
 
 
 def make_binary_pop_sp_increment_op() -> Operation:
-    """L6 FFN extension: SP += 8 for binary-pop ops (ADD/SUB/etc.)."""
-    def bake(ffn, dim_positions, S):
+    """L6 FFN extension: SP += 8 for binary-pop ops (ADD/SUB/etc.).
+
+    Originally an inline call in `set_vm_weights`:
+        `_set_binary_pop_sp_increment(ffn6, S, BD)`
+
+    Operates on `model.blocks[6].ffn` (L6 FFN). Modeled as kind="model" so we
+    can resolve `ffn6` from the model handle inside the bake_fn.
+
+    Phase 998: runs just BEFORE legacy_bake (999) so that the L6 FFN units we
+    program (starting at unit 2200) are present when `_right_size_ffns`
+    (called at the end of legacy_bake) prunes dead units. Running at phase
+    > 999 would write into already-rightsized FFN slots that no longer exist.
+    """
+    def bake(model, dim_positions, S):
         from ..vm_step import _set_binary_pop_sp_increment
-        _set_binary_pop_sp_increment(ffn, S, _as_setdim_proxy(dim_positions))
+        proxy = _as_setdim_proxy(dim_positions)
+        _set_binary_pop_sp_increment(model.blocks[6].ffn, S, proxy)
 
     return Operation(
         name="binary_pop_sp_increment",
-        phase=6,
-        reads={"MARK_SP", "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
-               "OP_OR", "OP_XOR", "OP_AND",
-               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
-               "OP_SHL", "OP_SHR", "EMBED_LO", "EMBED_HI",
-               "BYTE_INDEX_0"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
-        kind="ffn",
+        reads=set(),
+        writes=set(),
+        kind="model",
         bake_fn=bake,
+        phase=998,
+        migrated=True,
     )
 
 
