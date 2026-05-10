@@ -1429,7 +1429,13 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
         from ..vm_step import _SetDim
         from ..hybrid_alu import HybridALUBlock
         from .. import efficient_alu_neural as eau
-        alu_cls = getattr(eau, alu_cls_name)
+        # ALUAddSub has been replaced by the 5-stage flattened AddSub5StageBlock
+        # (see efficient_alu_addsub_split.py). Other ALU classes still come
+        # from efficient_alu_neural.
+        if alu_cls_name == "ALUAddSub":
+            from ..efficient_alu_addsub_split import AddSub5StageBlock as alu_cls
+        else:
+            alu_cls = getattr(eau, alu_cls_name)
         block.ffn = HybridALUBlock(block.ffn, alu_cls(S, _SetDim))
 
     return Operation(
@@ -2067,7 +2073,7 @@ def make_legacy_bake_op(
 # Model-level post-passes
 # ---------------------------------------------------------------------------
 
-def make_branch_override_patch_op() -> Operation:
+def make_branch_override_patch_op() -> Operation:  # noqa: E302
     """Defensive gate that suppresses spurious branch/LEV-override FFN units.
 
     Any FFN unit firing with positive MARK_PC AND a positive
@@ -2187,6 +2193,124 @@ def make_expand_wrapper_blocks_op() -> Operation:
     )
 
 
+# ---------------------------------------------------------------------------
+# L8 ALU ADD/SUB flatten: 5 ops replacing the monolithic ALUAddSub wrapper
+# ---------------------------------------------------------------------------
+#
+# These ops correspond 1:1 to the 5 stages of the flattened ADD/SUB pipeline
+# (see efficient_alu_addsub_split.py). Their bake_fns are no-ops because the
+# stage modules are installed by `set_vm_weights` via `AddSub5StageBlock` and
+# split into 5 successive blocks by `_expand_wrapper_blocks`. The ops exist
+# to:
+#
+#   1. Document the data flow / dependency graph for the compiler
+#   2. Reserve their phase slots (8.0..8.4) so the compiler can place
+#      downstream ops correctly
+#   3. Provide hooks for future migration to true bake-FFN-weights ops
+#
+# The runtime model after these ops contains NO `ALUAddSub` instance —
+# only TransformerBlock instances each holding one stage module as ffn.
+
+def make_l8_alu_addsub_bdtoge_op() -> Operation:
+    """Stage 0: BD -> GE format projection (BDToGEConverter equivalent).
+
+    Reads BD-format ALU operand nibbles (ALU_LO/HI, AX_CARRY_LO/HI) and
+    opcode flags. Writes the GE-format intermediate state (consumed by
+    stage 1). Phase=8.0.
+    """
+    def bake(target, dim_positions, S):
+        # Stage modules are installed by set_vm_weights via AddSub5StageBlock,
+        # then split by _expand_wrapper_blocks. No bake-time work here.
+        pass
+
+    return Operation(
+        name="l8_alu_addsub_bdtoge",
+        phase=8.0,
+        reads=set(),
+        writes=set(),
+        kind="model",  # no-op model op; documentation only
+        bake_fn=bake,
+    )
+
+
+def make_l8_alu_addsub_stage1_op() -> Operation:
+    """Stage 1: AddRawAndGenFFN + SubRawAndGenFFN. Phase=8.1.
+
+    Computes RAW_SUM, CARRY_OUT, TEMP for both ADD and SUB pipelines on
+    the GE-format buffer. No BD reads/writes (operates on side-channel).
+    """
+    def bake(target, dim_positions, S):
+        pass
+
+    return Operation(
+        name="l8_alu_addsub_stage1",
+        phase=8.1,
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+    )
+
+
+def make_l8_alu_addsub_stage2_op() -> Operation:
+    """Stage 2: AddCarryLookaheadFFN + SubBorrowLookaheadFFN. Phase=8.2.
+
+    Cross-position carry/borrow propagation. For NIBBLE config (N=8 not 1),
+    this clears CARRY_OUT and TEMP; carry-lookahead structure runs but is
+    a no-op when N positions are independent (each position is its own
+    chunk in the byte-level pipeline).
+    """
+    def bake(target, dim_positions, S):
+        pass
+
+    return Operation(
+        name="l8_alu_addsub_stage2",
+        phase=8.2,
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+    )
+
+
+def make_l8_alu_addsub_stage3_op() -> Operation:
+    """Stage 3: AddFinalResultFFN + SubFinalResultFFN + opcode merge. Phase=8.3.
+
+    Produces RESULT = (RAW_SUM +/- CARRY) mod base for both pipelines, then
+    merges them via opcode mask: RESULT = ADD_RESULT*op_add + SUB_RESULT*op_sub.
+    """
+    def bake(target, dim_positions, S):
+        pass
+
+    return Operation(
+        name="l8_alu_addsub_stage3",
+        phase=8.3,
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+    )
+
+
+def make_l8_alu_addsub_getobd_op() -> Operation:
+    """Stage 4: GE -> BD writeback (GEToBDConverter equivalent). Phase=8.4.
+
+    Reads RESULT from the merged GE buffer, applies AX-marker + opcode
+    masking, and writes OUTPUT_LO/HI + CARRY[1]/CARRY[2] to BD.
+    """
+    def bake(target, dim_positions, S):
+        pass
+
+    return Operation(
+        name="l8_alu_addsub_getobd",
+        phase=8.4,
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+    )
+
+
 def all_core_ops(alu_mode: str = "lookup") -> list:
     """Return the full list of migrated core-VM operations.
 
@@ -2253,6 +2377,12 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_binary_pop_sp_increment_op(),
         make_layer10_stack0_byte_relay_op(),
         make_layer9_marker_suppress_op(),
+        # L8 ALU ADD/SUB flatten (5 ops replacing the monolithic ALUAddSub)
+        make_l8_alu_addsub_bdtoge_op(),
+        make_l8_alu_addsub_stage1_op(),
+        make_l8_alu_addsub_stage2_op(),
+        make_l8_alu_addsub_stage3_op(),
+        make_l8_alu_addsub_getobd_op(),
         # L10 post_ops merged into a single phase-10.5 ffn
         make_l10_post_ops_combined(),
         # L15 attention resize: 8 heads -> 12 heads for LEV (phase=14.9 so it

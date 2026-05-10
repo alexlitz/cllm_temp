@@ -32,12 +32,12 @@ from .dim_registry import (
     ContractValidator,
 )
 from .efficient_alu_neural import (
-    EfficientALU_L8_L9_Neural,
     EfficientALU_L10_Neural,
     EfficientALU_L11_L12_Neural,
     EfficientALU_L13_Neural,
     EfficientDivMod_Neural,
 )
+from .efficient_alu_addsub_split import AddSub5StageBlock
 from .hybrid_alu import HybridALUBlock
 
 
@@ -2174,6 +2174,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # The HybridALUBlock wraps for L8-L13 are now provided by migrated
         # block-ops (l8/l9/l10/l11/l12/l13_hybrid_alu_wrap in migrated_ops.py)
         # and dispatched at the end of set_vm_weights via _dispatch_migrated_block_ops.
+        # NOTE: L8/L9 ADD/SUB now use the 5-stage flattened AddSub5StageBlock
+        # (split into 5 successive blocks by `_expand_wrapper_blocks`) instead
+        # of the monolithic ALUAddSub. See migrated_ops._make_hybrid_alu_wrap_op
+        # which selects AddSub5StageBlock when alu_cls_name == "ALUAddSub".
         # Replace lookup DivModModule with efficient version
         model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)
     elif alu_mode == 'efficient':
@@ -2184,8 +2188,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         ffn8 = model.blocks[8].ffn
         _set_layer8_alu(ffn8, S, BD)
         _set_layer8_multibyte_routing(ffn8, S, BD)
-        # Wrap original FFN with efficient neural ALU (hybrid mode)
-        model.blocks[8].ffn = HybridALUBlock(ffn8, EfficientALU_L8_L9_Neural(S, BD))
+        # Wrap original FFN with the 5-stage flattened ADD/SUB pipeline.
+        # Replaces the monolithic ALUAddSub class. AddSub5StageBlock is split
+        # into 5 individual blocks by `_expand_wrapper_blocks`.
+        model.blocks[8].ffn = HybridALUBlock(ffn8, AddSub5StageBlock(S, BD))
 
         # L10: Carry relay + AX/SP passthrough attention (still needed)
         attn10 = model.blocks[10].attn
