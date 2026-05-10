@@ -184,10 +184,19 @@ def make_nibble_copy_ffn_op() -> Operation:
 
 
 def make_layer4_pc_relay_op() -> Operation:
-    """L4 attention: relay PC marker EMBED → AX marker EMBED."""
-    def bake(attn, dim_positions, S):
+    """L4 attention: relay PC marker EMBED → AX marker EMBED.
+
+    Pinned to ``layer_idx=4`` via ``kind="block"`` because the legacy
+    ``set_vm_weights`` pipeline targets block 4. Without pinning, the
+    dep-graph layer assignment places this op at a later block (e.g. L5/L6),
+    leaving block 4's attn zero-init and breaking the L5 fetch chain
+    (the regression at commit b2d9f4c3).
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer4_pc_relay
-        # _set_layer4_pc_relay takes attn, S, BD, HD
+        attn = block.attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer4_pc_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
 
@@ -196,17 +205,22 @@ def make_layer4_pc_relay_op() -> Operation:
         phase=4,
         reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI", "CONST"},
         writes={"EMBED_LO", "EMBED_HI"},  # at AX marker
-        kind="attn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=4,
         migrated=True,
     )
 
 
 def make_layer4_ffn_op() -> Operation:
-    """L4 FFN: compute PC+1/2/3/4 in FETCH dims for L5 fetch."""
-    def bake(ffn, dim_positions, S):
+    """L4 FFN: compute PC+1/2/3/4 in FETCH dims for L5 fetch.
+
+    Pinned to ``layer_idx=4`` via ``kind="block"``; see
+    ``make_layer4_pc_relay_op``.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer4_ffn
-        _set_layer4_ffn(ffn, S, _as_setdim_proxy(dim_positions))
+        _set_layer4_ffn(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer4_ffn",
@@ -215,8 +229,9 @@ def make_layer4_ffn_op() -> Operation:
                "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "H1"},
         writes={"FETCH_LO", "FETCH_HI"},
-        kind="ffn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=4,
         migrated=True,
     )
 
@@ -413,10 +428,16 @@ def make_layer6_relay_heads_op() -> Operation:
 
 
 def make_layer7_operand_gather_op() -> Operation:
-    """L7 attention: operand A gather (prev STACK0 byte 0 → ALU at AX marker)."""
-    def bake(attn, dim_positions, S):
+    """L7 attention: operand A gather (prev STACK0 byte 0 → ALU at AX marker).
+
+    Pinned to ``layer_idx=7`` via ``kind="block"``: legacy_bake no longer
+    calls ``_set_layer7_operand_gather`` (it was migrated to the compiler),
+    so without pinning the dep-graph would silently bake into a different
+    block and leave block 7 zero-init.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer7_operand_gather
-        # Set ALiBi slopes (originally set in set_vm_weights before the bake call).
+        attn = block.attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
@@ -428,18 +449,21 @@ def make_layer7_operand_gather_op() -> Operation:
         reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"ALU_LO", "ALU_HI"},
-        kind="attn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=7,
         migrated=True,
     )
 
 
 def make_layer7_memory_heads_op() -> Operation:
-    """L7 attention heads 1-6: memory + flag broadcast heads."""
-    def bake(attn, dim_positions, S):
+    """L7 attention heads 1-6: memory + flag broadcast heads.
+
+    Pinned to ``layer_idx=7``. See ``make_layer7_operand_gather_op``.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer7_memory_heads
-        # Per-head ALiBi slopes (originally set in set_vm_weights between the
-        # operand-gather and memory-heads bake calls).
+        attn = block.attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[1] = 5.0  # head 1: MEM flag broadcast
             attn.alibi_slopes[5] = 5.0  # head 5: LI/LC flag relay
@@ -455,8 +479,9 @@ def make_layer7_memory_heads_op() -> Operation:
                "AX_CARRY_LO", "AX_CARRY_HI", "TEMP"},
         writes={"OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP",
                 "TEMP", "ADDR_KEY"},
-        kind="attn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=7,
         migrated=True,
     )
 
@@ -678,44 +703,61 @@ def make_layer10_alu_op() -> Operation:
 
 
 def make_layer11_mul_partial_op() -> Operation:
-    """L11 FFN: MUL partial product accumulation."""
-    def bake(ffn, dim_positions, S):
+    """L11 FFN: MUL partial product accumulation.
+
+    Pinned to ``layer_idx=11`` via ``kind="block"``: dep-graph layer
+    assignment otherwise places this op at L19 (downstream of
+    layer6_routing_ffn at L18); legacy_bake no longer calls
+    ``_set_layer11_mul_partial`` so without pinning block 11 would be
+    zero-init.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer11_mul_partial
-        _set_layer11_mul_partial(ffn, S, _as_setdim_proxy(dim_positions))
+        _set_layer11_mul_partial(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer11_mul_partial",
         phase=11,
         reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
         writes={"MUL_ACCUM"},
-        kind="ffn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=11,
         migrated=True,
     )
 
 
 def make_layer12_mul_combine_op() -> Operation:
-    """L12 FFN: combine MUL partial products into final result."""
-    def bake(ffn, dim_positions, S):
+    """L12 FFN: combine MUL partial products into final result.
+
+    Pinned to ``layer_idx=12`` via ``kind="block"``. See
+    ``make_layer11_mul_partial_op``.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer12_mul_combine
-        _set_layer12_mul_combine(ffn, S, _as_setdim_proxy(dim_positions))
+        _set_layer12_mul_combine(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer12_mul_combine",
         phase=12,
         reads={"MARK_AX", "MUL_ACCUM", "OP_MUL"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
-        kind="ffn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=12,
         migrated=True,
     )
 
 
 def make_layer13_mem_addr_gather_op() -> Operation:
-    """L13 attention: gather MEM addr from STACK0 / AX_CARRY for SI/SC/LI/LC."""
-    def bake(attn, dim_positions, S):
+    """L13 attention: gather MEM addr from STACK0 / AX_CARRY for SI/SC/LI/LC.
+
+    Pinned to ``layer_idx=13`` via ``kind="block"``: dep-graph assignment
+    otherwise lands at L15 (mismatch with legacy block 13).
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer13_mem_addr_gather
-        # Set ALiBi slopes (originally set in set_vm_weights before the bake call).
+        attn = block.attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
@@ -729,14 +771,18 @@ def make_layer13_mem_addr_gather_op() -> Operation:
                "MEM_ADDR_SRC"},
         writes={"ADDR_B0_LO", "ADDR_B1_LO", "ADDR_B2_LO",
                 "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},
-        kind="attn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=13,
         migrated=True,
     )
 
 
 def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
     """L13 FFN: SHL/SHR shifts (lookup-mode entry point).
+
+    Pinned to ``layer_idx=13`` via ``kind="block"``. See
+    ``make_layer13_mem_addr_gather_op``.
 
     In ``alu_mode='lookup'`` we bake the standard SHL/SHR lookup table via
     ``_set_layer13_shifts`` into the L13 PureFFN block.
@@ -756,12 +802,12 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         )
 
     if alu_mode == "efficient":
-        def bake(ffn, dim_positions, S):
+        def bake(block, dim_positions, S):
             return  # ALUShiftComposite (4-stage) owns SHL/SHR in efficient mode.
     else:
-        def bake(ffn, dim_positions, S):
+        def bake(block, dim_positions, S):
             from ..vm_step import _set_layer13_shifts
-            _set_layer13_shifts(ffn, S, _as_setdim_proxy(dim_positions))
+            _set_layer13_shifts(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer13_shifts",
@@ -769,8 +815,9 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                "OP_SHL", "OP_SHR"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
-        kind="ffn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=13,
         migrated=True,
     )
 
