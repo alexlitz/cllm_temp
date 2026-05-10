@@ -2257,17 +2257,18 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # (make_layer14_mem_generation_op, migrated=True)
 
     # L14 FFN: Clear TEMP, ADDR_KEY pollution, and OUTPUT corruption
-    # BUG FIX 2026-04-16:
-    # 1. TEMP[0] has residual value from L5/L6 attention (~2.0) that leaks into OUTPUT
-    # 2. ADDR_KEY dims are aliased with ADDR_B*_HI, causing L9's address gathering
-    #    to pollute ADDR_KEY at non-MEM positions, making L15 attend to wrong places
-    # 3. L14 attention V[0] cancelation corrupts OUTPUT at non-MEM positions (STACK0 bytes)
+    # MIGRATED 2026-05-10 to compiler dispatch (kind="block", layer_idx=14):
+    #   - layer14_temp_clear (phase=14.1)
+    #   - layer14_clear_addr_key_pollution (phase=14.2)
+    #   - layer14_clear_output_corruption (phase=14.3)
+    # All three share `block.ffn._l14_unit_counter` so they chain unit
+    # assignments across the migrated bake_fns.
     ffn14 = model.blocks[14].ffn
-    next_unit = _set_layer14_temp_clear(ffn14, S, BD)
-    next_unit = _set_layer14_clear_addr_key_pollution(ffn14, S, BD, start_unit=next_unit)
-    next_unit = _set_layer14_clear_output_corruption(ffn14, S, BD, start_unit=next_unit)
     # FIX 2026-05-10: Cancel L14 attention's -115 OUTPUT corruption at MEM marker
     # for OP_JSR/OP_ENT (no actual store; L14 attn fires anyway because MEM_STORE=2).
+    # Reads the unit counter populated by the migrated ops; falls back to 0 in
+    # the legacy direct-set_vm_weights path (where the migrated ops didn't run).
+    next_unit = getattr(ffn14, '_l14_unit_counter', 0)
     _set_layer14_clear_mem_marker_output(ffn14, S, BD, start_unit=next_unit)
 
     # ===== LAYER 15: Memory lookup (softmax1 + ALiBi) =====
@@ -7682,7 +7683,7 @@ def _set_layer14_mem_generation(attn, S, BD, HD):
         attn.W_o[BD.OUTPUT_HI + 0, base + 0] = -1.0
 
 
-def _set_layer14_temp_clear(ffn, S, BD):
+def _set_layer14_temp_clear(ffn, S, BD, start_unit=0):
     """L14 FFN: Clear TEMP at PC marker when OP_LEV is active.
 
     BUG FIX 2026-04-16: TEMP[0] has residual value from L5/L6 attention (~2.0).
@@ -7713,7 +7714,7 @@ def _set_layer14_temp_clear(ffn, S, BD):
     the relative scales cancel so the firing-vs-not behavior is unchanged. The
     only consequence is the absolute subtraction magnitude (-2.5 not -5.0).
     """
-    unit = 0
+    unit = start_unit
 
     # Clear TEMP[0] at PC marker when OP_LEV active
     # Only clear TEMP[0] since that's the problematic residual
