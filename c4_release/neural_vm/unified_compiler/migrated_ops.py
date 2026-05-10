@@ -65,13 +65,18 @@ def make_phase_a_ffn_op() -> Operation:
 
     Reads H0/H1/H2/H3/H4 threshold-head outputs (per marker type).
     Writes NEXT_PC, NEXT_AX, NEXT_SP, NEXT_BP, NEXT_STACK0, NEXT_MEM, NEXT_SE.
+
+    Dispatched as a block op pinned to layer_idx=0 so the bake hits the same
+    transformer block (block[0].ffn) the legacy path used. This sidesteps the
+    LayerCompiler's dep-based assignment, which would otherwise place this FFN
+    at L1 (advancing past L0 because it reads H0-H4 written by L0 attn).
     """
     PC_I, AX_I, SP_I, BP_I, MEM_I, SE_I = 0, 1, 2, 3, 4, 5
 
-    def bake(ffn, dim_positions, S):
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_phase_a_ffn
         proxy = _as_setdim_proxy(dim_positions)
-        _set_phase_a_ffn(ffn, S, proxy)
+        _set_phase_a_ffn(block.ffn, S, proxy)
 
     # The threshold heads write 7 dims each (one per marker type), so we
     # express reads as the head-base names; the FFN reads any element in the
@@ -82,7 +87,8 @@ def make_phase_a_ffn_op() -> Operation:
         reads={"H0", "H1", "H2", "H3", "H4"},
         writes={"NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
                 "NEXT_STACK0", "NEXT_MEM", "NEXT_SE"},
-        kind="ffn",
+        kind="block",
+        layer_idx=0,
         bake_fn=bake,
         migrated=True,
     )
@@ -708,9 +714,16 @@ def make_layer16_lev_routing_op() -> Operation:
 # ---------------------------------------------------------------------------
 
 def make_layer0_threshold_attn_op() -> Operation:
-    """L0 attention: 8 threshold heads detecting marker distance."""
-    def bake(attn, dim_positions, S):
+    """L0 attention: 8 threshold heads detecting marker distance.
+
+    Dispatched as a block op pinned to layer_idx=0 so the bake hits the same
+    transformer block (block[0].attn) the legacy path used. Using kind="block"
+    keeps the L0 op aligned with the hand-set block index regardless of
+    LayerCompiler dep-based assignment.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_threshold_attn
+        attn = block.attn
         proxy = _as_setdim_proxy(dim_positions)
         ALIBI_S = 10.0
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
@@ -729,7 +742,8 @@ def make_layer0_threshold_attn_op() -> Operation:
         phase=0,
         reads={"IS_MARK", "CONST"},
         writes={"H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"},
-        kind="attn",
+        kind="block",
+        layer_idx=0,
         bake_fn=bake,
         migrated=True,
     )

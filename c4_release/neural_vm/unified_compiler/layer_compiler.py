@@ -284,14 +284,8 @@ class LayerCompiler:
         Multiple ops can share a layer + kind slot if they have the same phase
         (e.g., two FFN setups that bake into the same block's FFN sequentially).
         Without phase, each op needs its own layer kind slot.
-
-        Same-layer attn→ffn: a transformer block runs attn before ffn, so an
-        ffn op reading a dim written by an attn op at layer L can share layer L
-        (no need to advance to L+1) when both have the same phase.
         """
         writes_layer: Dict[str, int] = {}
-        writes_kind: Dict[str, str] = {}
-        writes_phase: Dict[str, Optional[int]] = {}
         # layer_phase_kinds[(layer, kind)] = phase value if a phase-set op is using it
         layer_phase_kinds: Dict[tuple, Optional[int]] = {}
         assignment: Dict[str, int] = {}
@@ -300,18 +294,7 @@ class LayerCompiler:
             earliest = 0
             for d in op.reads:
                 if d in writes_layer:
-                    w_layer = writes_layer[d]
-                    # Same-layer attn→ffn: an FFN reader can share the layer
-                    # with an ATTN writer if they have the same phase, because
-                    # attn runs before ffn within a transformer block.
-                    same_layer_ok = (
-                        op.kind == "ffn"
-                        and writes_kind.get(d) == "attn"
-                        and op.phase is not None
-                        and writes_phase.get(d) == op.phase
-                    )
-                    needed = w_layer if same_layer_ok else w_layer + 1
-                    earliest = max(earliest, needed)
+                    earliest = max(earliest, writes_layer[d] + 1)
             layer = earliest
             while True:
                 key = (layer, op.kind)
@@ -325,10 +308,7 @@ class LayerCompiler:
                 layer += 1
             assignment[op.name] = layer
             for d in op.writes:
-                if writes_layer.get(d, -1) <= layer:
-                    writes_layer[d] = layer
-                    writes_kind[d] = op.kind
-                    writes_phase[d] = op.phase
+                writes_layer[d] = max(writes_layer.get(d, -1), layer)
         return assignment
 
     def _allocate_dims(self) -> Dict[str, int]:
