@@ -2058,15 +2058,13 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
             _set_format_string_fetch_head(attn9, S, BD, HD)
 
         # LEV ADDR_B0 relay: prev step BP byte 0 → SP marker (for SP = BP + 16)
-        # BUG FIX 2026-04-15: This relay is needed for LEV to work correctly.
-        # Distance from SP marker to prev BP byte 0 is ~29 tokens.
-        attn9 = model.blocks[9].attn
-        if hasattr(attn9, 'alibi_slopes') and attn9.alibi_slopes is not None:
-            attn9.alibi_slopes[0] = 0.2  # head 0: shallow slope for d=29 relay
-            attn9.alibi_slopes[1] = 0.5  # head 1: BP→PC relay for LEV (d=15 tokens)
-        _set_layer9_lev_addr_relay(attn9, S, BD, HD)
-        # FIX 2026-04-15: Relay ADDR_B0 from BP marker to PC marker for return_addr
-        _set_layer9_lev_bp_to_pc_relay(attn9, S, BD, HD)
+        # and the companion BP byte 0 → ADDR_B0 at PC marker for return_addr.
+        # Migrated to compiler block ops `layer9_lev_addr_relay` (phase=9.0)
+        # and `layer9_lev_bp_to_pc_relay` (phase=9.1), both pinned to
+        # layer_idx=9 with migrated=True. They also set attn9.alibi_slopes[0]
+        # and [1] (previously assigned inline here). The migrated ops fire
+        # before legacy_bake in both lookup and efficient ALU modes — the
+        # underlying helpers do the same setup regardless of alu_mode.
 
         ffn9 = model.blocks[9].ffn
         n9 = _set_layer9_alu(ffn9, S, BD)
