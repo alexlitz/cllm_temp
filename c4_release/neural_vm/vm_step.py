@@ -4914,6 +4914,35 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_down[BD.OUTPUT_HI + new_k_borrow, unit] = 2.0 / S
         ffn.W_down[BD.OUTPUT_HI + k, unit] += -2.0 / S
         unit += 1
+
+    # FIX 2026-05-09 (C1.F): SP byte 0 fixup gated on OP_JSR + MARK_SP.
+    # The 32 CMP[4]-gated nibble units above don't fire reliably at MARK_SP
+    # for JSR step 1 — empirically that produced SP=0xFF08 (only the lo
+    # nibble decremented; the hi-nibble borrow was missing). Add two units
+    # gated directly on OP_JSR (relayed to MARK_SP at value ≈ 5.0 by L6 attn
+    # head 6: W_o[OP_JSR, base+5] = 5.0 in _set_opcode_relay_head). Mirrors
+    # the PSH SP-decrement pattern but specialized for SP_init=0x10000:
+    # SP=0x10000, byte 0 LO=0,HI=0; after -=8 → byte 0 = 0xF8 (LO=8,HI=15).
+    # Activation: (S/5)*5 + S*MARK_SP - S*1.5 = 0.5S → silu(50) ≈ 50.
+    # For non-JSR opcodes: OP_JSR ≈ 0 → activation = -0.5S → silu ≈ 0
+    # (no spurious firing; PSH path remains untouched).
+    # LO nibble: write OUTPUT_LO[8], cancel OUTPUT_LO[0] (L3 default).
+    ffn.W_up[unit, BD.OP_JSR] = S / 5
+    ffn.W_up[unit, BD.MARK_SP] = S
+    ffn.b_up[unit] = -S * T_jsr_sp
+    ffn.b_gate[unit] = 1.0  # constant gate
+    ffn.W_down[BD.OUTPUT_LO + 8, unit] = 2.0 / S
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = -2.0 / S  # cancel L3 default (lo=0)
+    unit += 1
+    # HI nibble: write OUTPUT_HI[15], cancel OUTPUT_HI[0].
+    ffn.W_up[unit, BD.OP_JSR] = S / 5
+    ffn.W_up[unit, BD.MARK_SP] = S
+    ffn.b_up[unit] = -S * T_jsr_sp
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 15, unit] = 2.0 / S
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = -2.0 / S  # cancel L3 default (hi=0)
+    unit += 1
+
     # Byte 1 (BYTE_INDEX_0): always 0xFF (borrow propagates from byte 0)
     T_jsr_b1 = 3.5
     ffn.W_up[unit, BD.CMP + 4] = S
