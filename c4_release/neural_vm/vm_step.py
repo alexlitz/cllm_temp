@@ -1826,31 +1826,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # in unified_compiler/migrated_ops.py).
 
     # ===== LAYER 1: Fine thresholds + STEP_END detection =====
-    attn1 = model.blocks[1].attn
-    # ALiBi-specific: set slopes for threshold heads
-    if hasattr(attn1, 'alibi_slopes') and attn1.alibi_slopes is not None:
-        attn1.alibi_slopes.fill_(ALIBI_S)
-        attn1.alibi_slopes[3] = 0.0  # Head 3: global attention for SE detection
-    _set_threshold_attn(
-        attn1,
-        [0.5, 1.5, 2.5],
-        [BD.L1H0, BD.L1H1, BD.L1H2],
-        ALIBI_S,
-        HD,
-        heads=[0, 1, 2],
-    )
-    # Head 3: STEP_END existence detection (global)
-    base = 3 * HD
-    attn1.W_q[base, BD.CONST] = 10.0
-    attn1.W_k[base, BD.MARK_SE_ONLY] = 10.0
-    attn1.W_v[base + 1, BD.MARK_SE_ONLY] = 1.0
-    attn1.W_o[BD.HAS_SE, base + 1] = 1.0
-
-    # Head 4: threshold 6.5 for STACK0 byte 0 identification
-    _set_threshold_attn(attn1, [6.5], [BD.L1H4], ALIBI_S, HD, heads=[4])
-
-    ffn1 = model.blocks[1].ffn
-    _set_layer1_ffn(ffn1, S, BD)
+    # Migrated: L1 threshold attention (heads 0-4 incl. STEP_END global head)
+    # and L1 FFN (STACK0_BYTE0 + BYTE_INDEX flags) are now baked via the
+    # compiler dispatch (see make_layer1_threshold_attn_op, make_layer1_ffn_op
+    # in unified_compiler/migrated_ops.py).
 
     # ===== LAYER 2: Threshold 5.5 + MEM byte position flags =====
     attn2 = model.blocks[2].attn
