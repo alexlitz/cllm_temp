@@ -1081,6 +1081,76 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
     )
 
 
+def make_l15_attention_resize_op() -> Operation:
+    """Resize L15 attention from 8 heads to 12 heads (LEV Phase 2).
+
+    Migrates the inline resize that previously lived in `set_vm_weights`. The
+    extra heads (8-11) hold saved_bp and return_addr reads alongside the
+    existing LI/LC/STACK0 reads (heads 0-3) and val heads (4-7). Required
+    when the model has L16 (>=17 layers) — `_set_layer15_memory_lookup`
+    keys off `attn.num_heads >= 12` to populate the LEV-specific heads.
+
+    Resizes (assuming d=512, head_dim=64): W_q/W_k/W_v (512,512)->(768,512),
+    W_o (512,512)->(512,768), alibi_slopes 8->12. Preserves heads 0-7 weights
+    in the first d rows/cols.
+
+    phase=14.9 places this after L14 (phase=14) and before
+    `_set_layer15_memory_lookup` inside legacy_bake at phase=999.
+    """
+    def bake(block, dim_positions, S):
+        import torch
+
+        # Match the original `len(model.blocks) > 16` guard. The dispatcher
+        # stashes _n_layers_hint just before invoking this bake_fn.
+        n_layers_hint = getattr(block, "_n_layers_hint", None)
+        if n_layers_hint is not None and n_layers_hint <= 16:
+            return
+
+        attn = block.attn
+        if getattr(attn, "num_heads", 8) >= 12:
+            return
+
+        d = attn.W_q.shape[1]
+        head_dim_old = d // attn.num_heads
+        num_heads_new = 12
+        new_q_rows = num_heads_new * head_dim_old
+
+        attn.num_heads = num_heads_new
+        attn.head_dim = head_dim_old
+
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            new_slopes = torch.tensor(
+                [2.0 ** (-8.0 / num_heads_new * (i + 1))
+                 for i in range(num_heads_new)]
+            )
+            attn.register_buffer('alibi_slopes', new_slopes)
+
+        old_W_q = attn.W_q.data
+        old_W_k = attn.W_k.data
+        old_W_v = attn.W_v.data
+        attn.W_q = nn.Parameter(torch.zeros(new_q_rows, d))
+        attn.W_k = nn.Parameter(torch.zeros(new_q_rows, d))
+        attn.W_v = nn.Parameter(torch.zeros(new_q_rows, d))
+        attn.W_q.data[:d, :] = old_W_q
+        attn.W_k.data[:d, :] = old_W_k
+        attn.W_v.data[:d, :] = old_W_v
+
+        old_W_o = attn.W_o.data
+        attn.W_o = nn.Parameter(torch.zeros(d, new_q_rows))
+        attn.W_o.data[:, :d] = old_W_o
+
+    return Operation(
+        name="l15_attention_resize",
+        reads=set(),
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=14.9,
+        layer_idx=15,
+        migrated=True,
+    )
+
+
 def setup_token_embeddings(embed_weight, dim_positions: Dict[str, int] = None) -> None:
     """Bake the per-token embedding values using compiler dim positions.
 
@@ -1387,6 +1457,9 @@ def all_core_ops() -> list:
         make_layer9_marker_suppress_op(),
         # L10 post_ops merged into a single phase-10.5 ffn
         make_l10_post_ops_combined(),
+        # L15 attention resize: 8 heads -> 12 heads for LEV (phase=14.9 so it
+        # fires before _set_layer15_memory_lookup populates the heads).
+        make_l15_attention_resize_op(),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),

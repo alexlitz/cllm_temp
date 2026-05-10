@@ -424,12 +424,14 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
                 op.bake_fn(target, layout.dim_positions, S)
 
         # Block-scoped ops run after all attn/ffn bakes for their layer.
+        # `_n_layers_hint` lets block bake_fns gate on total layer count.
         for op in sorted(
             layout.block_ops, key=lambda o: (o.layer_idx, o.phase or 0)
         ):
             if not _should_dispatch(op):
                 continue
             block = model.blocks[op.layer_idx]
+            block._n_layers_hint = len(model.blocks)
             op.bake_fn(block, layout.dim_positions, S)
 
         # Model-level ops run last (head, embedding, defensive patches,
