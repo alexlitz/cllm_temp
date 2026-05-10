@@ -147,6 +147,10 @@ class AutoregressiveAttention(nn.Module):
             self._rope_cos = None
             self._rope_sin = None
 
+        # PERF: pre-allocated softmax1 anchor (avoids per-call torch.tensor(0.0) allocation
+        # which cProfile showed as ~15% of attention forward time).
+        self.register_buffer("_softmax1_anchor", torch.zeros(()), persistent=False)
+
     def _extend_rope_cache(self, new_max_seq_len: int):
         """Extend RoPE cache to support longer sequences.
 
@@ -358,8 +362,13 @@ class AutoregressiveAttention(nn.Module):
         )
         scores = scores + causal_mask
 
-        # softmax1 for ZFOD
-        attn = softmax1(scores, dim=-1)
+        # softmax1 for ZFOD (inlined with cached anchor=0 buffer to avoid
+        # per-call torch.tensor() allocations; equivalent to softmax1(scores, dim=-1, anchor=0.0)).
+        anchor = self._softmax1_anchor
+        max_val = torch.max(scores.amax(dim=-1, keepdim=True), anchor)
+        exp_scores = torch.exp(scores - max_val)
+        exp_anchor = torch.exp(anchor - max_val)
+        attn = exp_scores / (exp_anchor + exp_scores.sum(dim=-1, keepdim=True))
         out = torch.matmul(attn, V)
 
         if getattr(self, "_is_compact", False):
@@ -1010,7 +1019,7 @@ class AutoregressiveVM(nn.Module):
         n_layers=17,  # Updated from 16 for LEV Phase 3 (L16 routing layer)
         n_heads=8,  # REVERTED from 16: HD=32 broke attention score budgets
         ffn_hidden=4096,
-        max_seq_len=4096,
+        max_seq_len=1024,  # PERF: reduced from 4096; Phase 1 contexts are <100 tokens (1024 leaves headroom)
     ):
         super().__init__()
         if vocab_size is None:
