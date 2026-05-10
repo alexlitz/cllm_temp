@@ -2438,10 +2438,10 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
-        # NOTE: branch_override_patch / right_size_ffns / expand_wrapper_blocks
-        # are NOT added here because they still run inline at the end of
-        # set_vm_weights (legacy_bake). The factory ops exist for future
-        # migration but currently adding them would double-run the work.
+        # Structural post-passes (run after all weight bakes complete).
+        # Migrated 2026-05-10 from inline tail of set_vm_weights.
+        make_right_size_ffns_op(),
+        make_expand_wrapper_blocks_op(),
     ]
 
 

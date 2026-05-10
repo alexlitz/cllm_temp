@@ -2306,7 +2306,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     #
     # IMPORTANT: This patch must run AFTER all layer setups (so all FFN weights are
     # programmed) and BEFORE _right_size_ffns (so the patch's edits become permanent
-    # in the right-sized result).
+    # in the right-sized result). _right_size_ffns now runs as a compiler model op
+    # at phase=1200, after legacy_bake (phase=999) — ordering is preserved.
     OPCODE_BLOCK_MAP = {
         BD.OP_JMP: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
                     BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
@@ -2371,22 +2372,14 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
                 break
     print(f"  BRANCH OVERRIDE PATCH: {branch_override_patches} units gated")
 
-    # ===== FIX 2026-05-09: Right-size FFN hidden dimensions to actual programmed units =====
-    # The architecture is built with hardcoded ffn_hidden=4096, but most FFNs only program
-    # a fraction of those units (often 100-1000). The unprogrammed units have all-zero
-    # weights but their `b_up` is also 0, which means silu(0)=0.27, and combined with
-    # ANY non-zero gate this produces a non-zero contribution. Multiplied across thousands
-    # of dead units, this accumulates into spurious OUTPUT writes that break correctness
-    # in pure-neural mode.
-    #
-    # Fix: for each block's FFN, identify the actually-programmed units (any non-zero
-    # weight in W_up, W_gate, W_down, or non-zero bias), and replace the FFN matrices
-    # with right-sized versions containing ONLY those units. This is what "the compiler
-    # determines network width" looks like: ffn_hidden becomes per-layer, equal to the
-    # actually-needed unit count.
+    # NOTE (2026-05-10): _right_size_ffns and _expand_wrapper_blocks were
+    # migrated out of this inline tail into compiler model ops:
+    #   make_right_size_ffns_op       @ phase=1200  (after legacy_bake/head/embed)
+    #   make_expand_wrapper_blocks_op @ phase=1300
+    # Both run AFTER legacy_bake (phase=999), preserving the original bake
+    # order. The function definitions remain below; the migrated ops call
+    # them via lazy import in unified_compiler/migrated_ops.py.
     _dispatch_migrated_block_ops(model, S, alu_mode=alu_mode)
-    _right_size_ffns(model)
-    _expand_wrapper_blocks(model)
 
     return model
 
