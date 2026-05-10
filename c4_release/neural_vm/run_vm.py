@@ -582,6 +582,20 @@ class AutoregressiveVMRunner:
             if neural_bp is not None:
                 self._last_bp = neural_bp
 
+            # PUTCHAR (Phase 6, pure_neural): the neural network has routed
+            # AX byte 0 -> OUTPUT_LO/HI via _set_io_putchar_routing at L6 FFN.
+            # The runner reads AX byte 0 from the just-completed step and
+            # appends it to the output buffer. No Python override of AX.
+            if exec_op == Opcode.PUTCHAR and neural_ax is not None:
+                output.append(chr(neural_ax & 0xFF))
+
+            # GETCHAR (Phase 6, pure_neural): no neural attention head reads
+            # USER_INPUT_START..USER_INPUT_END into AX yet, so fall back to the
+            # runner-side stdin injection. Gated on exec_op so no other path is
+            # affected.
+            if exec_op == Opcode.GETCHAR:
+                self._inject_getchar(context)
+
             # Only break on EXIT
             return exec_op == Opcode.EXIT
 
