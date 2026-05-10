@@ -357,11 +357,19 @@ class TestMigratedOps:
         assert ffn.W_down.data.abs().sum().item() > 0
 
     def test_three_ffn_ops_assign_to_separate_layers(self):
-        """phase_a, layer1, layer3 each kind=ffn — must take 3 layers."""
+        """phase_a (block@L0), layer1 (ffn), layer3_ffn (block@L3) + dep_anchor.
+
+        ``layer3_ffn`` is a kind="block" op pinned to layer_idx=3 (matches
+        legacy ``model.blocks[3].ffn``); its companion
+        ``_layer3_ffn_dep_anchor`` (kind="ffn", same reads/writes) preserves
+        the dep-graph longest-chain length so downstream migrated ops keep
+        their original layer assignment. Together they require >=4 layers.
+        """
         from neural_vm.unified_compiler.migrated_ops import (
             make_phase_a_ffn_op,
             make_layer1_ffn_op,
             make_layer3_ffn_op,
+            make_layer3_ffn_dep_anchor_op,
             declare_setdim_compat_dims,
         )
 
@@ -369,22 +377,27 @@ class TestMigratedOps:
         declare_setdim_compat_dims(c)
         # Add in arbitrary order — compiler should still produce a valid layout.
         c.add_op(make_layer3_ffn_op())
+        c.add_op(make_layer3_ffn_dep_anchor_op())
         c.add_op(make_phase_a_ffn_op())
         c.add_op(make_layer1_ffn_op())
 
         layout = c.compile()
-        # Three ffn ops, no attn ops. Each needs its own layer (one ffn slot
-        # per layer).
-        assert layout.n_layers == 3
-        # phase_a writes NEXT_*, doesn't read EMBED_LO/HI or BYTE_INDEX_*, so
-        # it has no dep on layer1 or layer3. Should be at L0.
-        # layer1 reads L1H*/H*/IS_BYTE, writes BYTE_INDEX_*/STACK0_BYTE0.
-        # layer3 reads MARK_*/EMBED_*/H1/H4/BYTE_INDEX_*, writes OUTPUT_*/EMBED_*.
-        # → layer3 depends on layer1 (BYTE_INDEX_*).
-        names_at = [{op.name for op in layout.ops_at(i)} for i in range(layout.n_layers)]
-        # phase_a and layer1 can be in any order at L0/L1; layer3 must be after layer1.
-        assert "layer3_ffn" in names_at[2]
-        # layer1 must be before layer3
-        layer1_idx = next(i for i, ns in enumerate(names_at) if "layer1_ffn" in ns)
-        layer3_idx = next(i for i, ns in enumerate(names_at) if "layer3_ffn" in ns)
-        assert layer1_idx < layer3_idx
+        # layer3_ffn pinned to layer_idx=3, so n_layers must be >= 4.
+        assert layout.n_layers >= 4
+        # layer3_ffn binds to layer 3 (block-op resolution).
+        layer3_op = next(o for o in layout.block_ops if o.name == "layer3_ffn")
+        assert layout.resolve_block_op_layer(layer3_op) == 3
+        # phase_a is pinned to layer 0 via kind="block".
+        phase_a_op = next(o for o in layout.block_ops if o.name == "phase_a_ffn")
+        assert layout.resolve_block_op_layer(phase_a_op) == 0
+        # The dep_anchor (kind="ffn") still appears in ops_per_layer to
+        # preserve dep-graph layer count. layer1_ffn writes BYTE_INDEX_*,
+        # which the dep_anchor reads — so the anchor must land after L1.
+        names_at = [{op.name for op in ops} for ops in layout.ops_per_layer]
+        anchor_idx = next(
+            i for i, ns in enumerate(names_at) if "_layer3_ffn_dep_anchor" in ns
+        )
+        layer1_idx = next(
+            i for i, ns in enumerate(names_at) if "layer1_ffn" in ns
+        )
+        assert layer1_idx < anchor_idx
