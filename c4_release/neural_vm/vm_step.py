@@ -1853,13 +1853,14 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # ===== LAYER 3: Register carry-forward (PC, AX, SP, BP) + PC update =====
     # MIGRATED (attn): heads 0-6 (PC/AX/SP/BP/STACK0 carries + AX_FULL relay
     # + BP→PC for LEV) are baked by `make_layer3_carry_forward_attn_op` in
-    # migrated_ops.py via the compiler dispatch. The L3 FFN bake remains here:
-    # `make_layer3_ffn_op` is not flipped to migrated=True because the layer
-    # compiler currently places `layer3_ffn` at a block index (4) that does
-    # not match the legacy layout's block 3 — migrating it would conflict
-    # with L4 FFN at block 4 and break the model.
+    # migrated_ops.py via the compiler dispatch.
+    # MIGRATED (ffn): `_set_layer3_ffn` is now baked by `make_layer3_ffn_op`
+    # (kind="block", layer_idx=3, migrated=True) in migrated_ops.py, with a
+    # `_layer3_ffn_dep_anchor` companion (kind="ffn") to preserve the
+    # dep-graph layer count. Runs before legacy_bake via
+    # build_model_from_layout's block-op dispatch.
     ffn3 = model.blocks[3].ffn  # Layer 3 (L3) = blocks[3]
-    _set_layer3_ffn(ffn3, S, BD)
+    # _set_layer3_ffn(ffn3, S, BD)  # migrated to make_layer3_ffn_op
 
     # Conversational I/O: State initialization when entering output mode
     if enable_conversational_io:

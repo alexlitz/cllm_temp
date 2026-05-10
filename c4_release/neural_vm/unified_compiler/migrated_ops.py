@@ -122,19 +122,55 @@ def make_layer1_ffn_op() -> Operation:
 def make_layer3_ffn_op() -> Operation:
     """L3 FFN: PC/SP/BP first-step defaults + PC byte-0 increment.
 
-    Originally: `_set_layer3_ffn` at vm_step.py:3351.
+    Originally: `_set_layer3_ffn` at vm_step.py:2929.
 
     Reads MARK_PC, MARK_SP, MARK_BP, MARK_STACK0, HAS_SE, EMBED_LO/HI,
     H1, H4, BYTE_INDEX_*, OP_LEV.
     Writes OUTPUT_LO/HI, EMBED_LO/HI.
+
+    Pinned to ``layer_idx=3`` via ``kind="block"`` because the legacy
+    ``set_vm_weights`` pipeline targets ``model.blocks[3].ffn``. Without
+    pinning, the dep-graph layer assignment placed this op at block 4,
+    which would conflict with the L4 FFN bake (the same regression noted
+    on ``make_layer4_pc_relay_op``). The companion
+    ``_layer3_ffn_dep_anchor`` op (kind="ffn") declares identical
+    reads/writes so the LayerCompiler's dep graph still reserves a layer
+    slot for it; otherwise removing the kind="ffn" entry shrinks the
+    longest-chain length and shifts downstream migrated kind="attn" ops
+    (e.g. ``layer14_mem_generation``) to the wrong block.
     """
-    def bake(ffn, dim_positions, S):
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer3_ffn
         proxy = _as_setdim_proxy(dim_positions)
-        _set_layer3_ffn(ffn, S, proxy)
+        _set_layer3_ffn(block.ffn, S, proxy)
 
     return Operation(
         name="layer3_ffn",
+        phase=3,
+        reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
+               "EMBED_LO", "EMBED_HI", "H1", "H4", "OP_LEV",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2"},
+        writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI"},
+        kind="block",
+        layer_idx=3,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
+def make_layer3_ffn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer3_ffn``: declares identical reads/writes so
+    the LayerCompiler's dep graph reserves a layer slot for it. Mirrors
+    ``_layer5_fetch_dep_anchor``: the actual bake happens in
+    ``layer3_ffn`` (kind="block", layer_idx=3); this op's bake is a no-op
+    (its layout-assigned ffn block is unrelated to block[3]).
+    """
+    def bake(ffn, dim_positions, S):
+        # No-op: actual bake is in `layer3_ffn` block op above.
+        return
+
+    return Operation(
+        name="_layer3_ffn_dep_anchor",
         phase=3,
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
                "EMBED_LO", "EMBED_HI", "H1", "H4", "OP_LEV",
@@ -2875,6 +2911,7 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_layer2_mem_byte_flags_op(),
         make_nibble_copy_ffn_op(),
         make_layer3_ffn_op(),
+        make_layer3_ffn_dep_anchor_op(),
         make_layer4_pc_relay_op(),
         make_layer4_ffn_op(),
         make_layer5_fetch_op(),
