@@ -2308,48 +2308,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     _set_layer14_clear_output_corruption(ffn14, S, BD, start_unit=next_unit)
 
     # ===== LAYER 15: Memory lookup (softmax1 + ALiBi) =====
+    # The 8->12 head LEV resize is a compiler block op now
+    # (`make_l15_attention_resize_op`, phase=14.9); attn15 is already
+    # 12 heads here when the model has L16.
     attn15 = model.blocks[15].attn
-
-    # LEV Phase 2: Extend L15 to 12 heads (from default 8) - only if using 17 layers
-    # Only resize if we have L16 (which requires 17 layers total)
-    if len(model.blocks) > 16:
-        # Resize attention matrices: (512, 512) → (768, 512) for 12 heads × 64 dims/head
-        # This allows 3 parallel memory reads: LI/LC/STACK0 (heads 0-3), saved_bp (4-7), return_addr (8-11)
-        import torch
-        d = model.d_model  # 512
-        num_heads_l15 = 12
-        head_dim = d // 8  # 64 (based on default 8 heads)
-        new_q_rows = num_heads_l15 * head_dim  # 12 * 64 = 768
-
-        # Update num_heads and head_dim attributes for forward pass
-        attn15.num_heads = num_heads_l15
-        attn15.head_dim = head_dim
-
-        # Resize ALiBi slopes if present (8 slopes → 12 slopes)
-        if hasattr(attn15, 'alibi_slopes') and attn15.alibi_slopes is not None:
-            # Extend slopes with same geometric sequence pattern
-            new_slopes = torch.tensor(
-                [2.0 ** (-8.0 / num_heads_l15 * (i + 1)) for i in range(num_heads_l15)]
-            )
-            attn15.register_buffer('alibi_slopes', new_slopes)
-
-        # Resize W_q, W_k, W_v from (512, 512) to (768, 512)
-        # Preserve existing weights in first 512 rows (heads 0-7), zero-initialize new rows (heads 8-11)
-        old_W_q = attn15.W_q.data
-        old_W_k = attn15.W_k.data
-        old_W_v = attn15.W_v.data
-        attn15.W_q = nn.Parameter(torch.zeros(new_q_rows, d))
-        attn15.W_k = nn.Parameter(torch.zeros(new_q_rows, d))
-        attn15.W_v = nn.Parameter(torch.zeros(new_q_rows, d))
-        attn15.W_q.data[:d, :] = old_W_q  # Copy existing 512 rows
-        attn15.W_k.data[:d, :] = old_W_k
-        attn15.W_v.data[:d, :] = old_W_v
-
-        # Resize W_o from (512, 512) to (512, 768) - output stays 512-dim, input from 768-dim heads
-        old_W_o = attn15.W_o.data
-        attn15.W_o = nn.Parameter(torch.zeros(d, new_q_rows))
-        attn15.W_o.data[:, :d] = old_W_o  # Copy existing 512 cols
-
     if hasattr(attn15, 'alibi_slopes') and attn15.alibi_slopes is not None:
         attn15.alibi_slopes.fill_(0.01)  # gentle recency bias for latest-write-wins
     # _set_layer15_memory_lookup moved to compiler dispatch
