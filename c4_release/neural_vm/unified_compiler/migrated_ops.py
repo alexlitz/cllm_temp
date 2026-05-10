@@ -389,14 +389,28 @@ def make_layer6_attn_op() -> Operation:
 
 
 def make_layer6_routing_ffn_op() -> Operation:
-    """L6 FFN: per-opcode routing — write FETCH/AX_CARRY → OUTPUT, etc."""
-    def bake(ffn, dim_positions, S):
+    """L6 FFN: per-opcode routing — write FETCH/AX_CARRY → OUTPUT, etc.
+
+    Originally an inline call in `set_vm_weights`:
+        `_set_layer6_routing_ffn(ffn6, S, BD)`
+
+    Pinned to ``layer_idx=6`` via ``kind="block"`` so the bake hits the same
+    transformer block (block[6].ffn) the legacy path used (mirrors the L4 FFN
+    regression fix: dep-graph assignment alone can place a kind="ffn" op on a
+    different block, leaving block[6] unbaked). ``migrated=True`` skips the
+    legacy_bake path for this op; the inline call in ``set_vm_weights`` has
+    been removed to avoid double-bake.
+
+    Phase 6.5: runs AFTER the L6 attention ops (phases 6.0-6.2) and before
+    other L6 FFN extension ops migrated to model-level phase=998.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer6_routing_ffn
-        _set_layer6_routing_ffn(ffn, S, _as_setdim_proxy(dim_positions))
+        _set_layer6_routing_ffn(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer6_routing_ffn",
-        phase=6,
+        phase=6.5,
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
@@ -405,8 +419,10 @@ def make_layer6_routing_ffn_op() -> Operation:
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
                "TEMP", "DIV_STAGING"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
-        kind="ffn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=6,
+        migrated=True,
     )
 
 
