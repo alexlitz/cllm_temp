@@ -1898,7 +1898,12 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         attn6.alibi_slopes[2] = 0.5  # STACK0←AX relay: prefer nearest AX marker
         attn6.alibi_slopes[3] = 0.5  # SP←AX relay: prefer nearest AX marker
         attn6.alibi_slopes[4] = 5.0  # BZ/BNZ relay: attend to nearest AX marker
-    _set_layer6_attn(attn6, S, BD, HD)
+    # _set_layer6_attn — MIGRATED: now baked by `make_layer6_attn_bake_op`
+    # in `unified_compiler/migrated_ops.py` (kind="model", phase=998.5,
+    # migrated=True). The existing `make_layer6_attn_op` (kind="attn") is
+    # kept as a dep anchor so the LayerCompiler dep-graph topology
+    # (downstream L8-L13 ALU placement) is unchanged. Inline call removed
+    # to avoid double-bake.
     ffn6 = model.blocks[6].ffn
     # L6 routing FFN (per-opcode FETCH/AX_CARRY → OUTPUT) — MIGRATED: now
     # installed via `make_layer6_routing_ffn_op` in
@@ -1906,11 +1911,20 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # phase=6.5, migrated=True). Inline call removed to avoid double-bake.
 
     # L6 relay attention heads (AX→STACK0 for PSH, AX→SP for ADJ)
-    # ENABLED: Uses head 2 which is unused (checked via weight inspection)
-    # This copies AX_CARRY → ALU at STACK0 marker for PSH: STACK0 = AX
-    _set_layer6_relay_heads(attn6, S, BD, HD)
-    # L6 BZ/BNZ relay (AX→PC for conditional branches)
-    _set_bz_bnz_relay(attn6, S, BD, HD)
+    # _set_layer6_relay_heads — MIGRATED: now baked by
+    # `make_layer6_relay_heads_bake_op` in `unified_compiler/migrated_ops.py`
+    # (kind="model", phase=998.6, migrated=True; with `make_layer6_relay_heads_op`
+    # kept as a dep anchor). Phase 998.6 places this AFTER
+    # function_call_weights (998), which is required because
+    # _set_layer6_relay_heads's head 7 Q[MARK_STACK0]=50 must override
+    # function_call_weights's head 7 Q[MARK_STACK0]=1050 (PSH semantics
+    # vs JSR; see head 7 comments in _set_layer6_relay_heads). Inline call
+    # removed to avoid double-bake.
+    # L6 BZ/BNZ relay (AX→PC for conditional branches) — MIGRATED: now
+    # baked by `make_layer6_bz_bnz_relay_bake_op` in
+    # `unified_compiler/migrated_ops.py` (kind="model", phase=998.7,
+    # migrated=True). No dep anchor needed (the legacy code never declared
+    # an op for this function). Inline call removed to avoid double-bake.
 
     # L6 opcode relay: broadcast PSH/ADJ/pop flags from AX → SP/STACK0
     if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
