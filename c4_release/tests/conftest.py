@@ -173,6 +173,32 @@ def neural_only_runner():
     return runner
 
 
+@pytest.fixture(scope="session")
+def _pure_neural_runner_model():
+    """Session-scoped model construction for pure neural tests (no Python overrides)."""
+    from neural_vm.run_vm import AutoregressiveVMRunner
+
+    runner = AutoregressiveVMRunner(trust_neural_alu=True, pure_neural=True)
+    runner._func_call_handlers = {}
+    runner._syscall_handlers = {}
+    return runner
+
+
+@pytest.fixture
+def pure_neural_runner(_pure_neural_runner_model):
+    """Runner with NO Python overrides at all (100% neural).
+
+    Use for testing that neural network alone can execute programs.
+    This skips ALL dispatch logic - only neural network outputs matter.
+    Resets per-call state on the session-scoped runner.
+    """
+    runner = _pure_neural_runner_model
+    runner._memory = {}
+    runner._mem_history = {}
+    runner._mem_access_order = []
+    return runner
+
+
 @pytest.fixture
 def handler_status():
     """Get current handler registration status."""
