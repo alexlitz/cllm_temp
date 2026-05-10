@@ -32,12 +32,12 @@ from .dim_registry import (
     ContractValidator,
 )
 from .efficient_alu_neural import (
-    EfficientALU_L8_L9_Neural,
     EfficientALU_L10_Neural,
     EfficientALU_L11_L12_Neural,
     EfficientALU_L13_Neural,
     EfficientDivMod_Neural,
 )
+from .efficient_alu_addsub_split import AddSub5StageBlock
 from .hybrid_alu import HybridALUBlock
 
 
@@ -2285,8 +2285,11 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # Wire efficient structural ALU on top of lookup FFN weights.
         # The efficient module replaces OUTPUT for its opcodes (ADD/SUB/etc.)
         # while the lookup FFN handles LEA/ADJ/ENT/CMP/passthrough/etc.
-        model.blocks[8].ffn = HybridALUBlock(model.blocks[8].ffn, EfficientALU_L8_L9_Neural(S, BD))
-        model.blocks[9].ffn = HybridALUBlock(model.blocks[9].ffn, EfficientALU_L8_L9_Neural(S, BD))
+        # ADD/SUB at L8/L9 now uses the 5-stage flattened wrapper instead
+        # of the monolithic ALUAddSub class. AddSub5StageBlock is split into
+        # 5 individual blocks by `_expand_wrapper_blocks`.
+        model.blocks[8].ffn = HybridALUBlock(model.blocks[8].ffn, AddSub5StageBlock(S, BD))
+        model.blocks[9].ffn = HybridALUBlock(model.blocks[9].ffn, AddSub5StageBlock(S, BD))
         model.blocks[10].ffn = HybridALUBlock(model.blocks[10].ffn, EfficientALU_L10_Neural(S, BD))
         model.blocks[11].ffn = HybridALUBlock(model.blocks[11].ffn, EfficientALU_L11_L12_Neural(S, BD))
         model.blocks[12].ffn = HybridALUBlock(model.blocks[12].ffn, EfficientALU_L11_L12_Neural(S, BD))
@@ -2301,8 +2304,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         ffn8 = model.blocks[8].ffn
         _set_layer8_alu(ffn8, S, BD)
         _set_layer8_multibyte_routing(ffn8, S, BD)
-        # Wrap original FFN with efficient neural ALU (hybrid mode)
-        model.blocks[8].ffn = HybridALUBlock(ffn8, EfficientALU_L8_L9_Neural(S, BD))
+        # Wrap original FFN with the 5-stage flattened ADD/SUB pipeline.
+        # Replaces the monolithic ALUAddSub class. AddSub5StageBlock is split
+        # into 5 individual blocks by `_expand_wrapper_blocks`.
+        model.blocks[8].ffn = HybridALUBlock(ffn8, AddSub5StageBlock(S, BD))
 
         # L10: Carry relay + AX/SP passthrough attention (still needed)
         attn10 = model.blocks[10].attn
