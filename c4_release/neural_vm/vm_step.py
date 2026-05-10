@@ -32,9 +32,9 @@ from .dim_registry import (
     ContractValidator,
 )
 from .efficient_alu_neural import (
-    EfficientALU_L10_Neural,
-    EfficientALU_L11_L12_Neural,
-    EfficientALU_L13_Neural,
+    ALUAndOrXor,
+    ALUMul,
+    ALUDivMod,
 )
 from .efficient_alu_addsub_split import AddSub5StageBlock
 from .hybrid_alu import HybridALUBlock
@@ -2135,7 +2135,7 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         _set_layer10_psh_stack0_passthrough(attn10, S, BD, HD)
 
         # L10 FFN: Neural AND/OR/XOR
-        model.blocks[10].ffn = EfficientALU_L10_Neural(S, BD)
+        model.blocks[10].ffn = ALUAndOrXor(S, BD)
 
         # L10.5: Byte propagation post_ops + ComparisonCombine.
         # Migrated to compiler block op `l10_post_op_attach` (phase=10.7) which
@@ -2153,7 +2153,7 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # back to the monolithic ALUMul wrapper for backward-compat.
         from .efficient_alu_neural import FlattenedALUMul as _FlatMul
         if not isinstance(model.blocks[11].ffn, _FlatMul):
-            model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)
+            model.blocks[11].ffn = ALUMul(S, BD)
 
         # L13: Memory addr gather attention migrated to compiler op
         # `layer13_mem_addr_gather` (attn) which runs before legacy_bake.
@@ -2163,7 +2163,7 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # ALUShiftComposite installed by `make_l13_alu_shift_*_op` ops (4
         # kind="ffn" stage bakes at phase=13 plus a kind="block" install op
         # at phase=13.5). The runtime ``ALUShift`` wrapper is deprecated.
-        # Previously: ``model.blocks[13].ffn = EfficientALU_L13_Neural(S, BD)``
+        # Previously: ``model.blocks[13].ffn = ALUShift(S, BD)``
 
     else:
         raise ValueError(f"Unknown alu_mode: {alu_mode}. Use 'lookup' or 'efficient'.")
@@ -2279,7 +2279,7 @@ def _expand_wrapper_blocks(model):
     identity via x + attn(x) = x + 0 = x). Semantic execution order is preserved
     by inserting blocks immediately after the original.
 
-    Future work: walk EfficientALU_*_Neural / EfficientDivMod_Neural internals
+    Future work: walk ALU* (ALUAddSub/ALUAndOrXor/ALUMul/ALUShift/ALUDivMod) internals
     (BDToGEConverter, GenericPureFFN per ALU stage, GEToBDConverter) into
     separate blocks too — requires more careful BD↔GE format-shape handling.
     """

@@ -1948,7 +1948,7 @@ def make_embedding_bake_op() -> Operation:
 # L11/L12 MUL ALU flattening (2026-05-10)
 #
 # The previous `set_vm_weights` line
-#   model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)  # = ALUMul
+#   model.blocks[11].ffn = ALUMul(S, BD)
 # wrapped 9 logical sub-stages (BD→GE convert, schoolbook partial products,
 # 3 carry-extraction passes, gen/prop, binary carry-lookahead, final
 # correction, GE→BD convert) inside a single `PureNeuralALU(operations='mul')`
