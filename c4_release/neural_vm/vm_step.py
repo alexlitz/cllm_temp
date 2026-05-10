@@ -1940,12 +1940,11 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # AX marker reads the current step's PC byte 0 EMBED_LO value.
     # This must be a SEPARATE layer from the fetch because the fetch
     # needs the result of this relay (can't be intra-layer).
+    # MIGRATED: _set_layer4_pc_relay -> make_layer4_pc_relay_op
+    # MIGRATED: _set_layer4_ffn      -> make_layer4_ffn_op
     attn4 = model.blocks[4].attn
     if hasattr(attn4, 'alibi_slopes') and attn4.alibi_slopes is not None:
         attn4.alibi_slopes.fill_(0.5)
-    _set_layer4_pc_relay(attn4, S, BD, HD)
-    ffn4 = model.blocks[4].ffn
-    _set_layer4_ffn(ffn4, S, BD)
 
     # ===== LAYER 5: Bytecode fetch (imm + opcode) =====
     attn5 = model.blocks[5].attn

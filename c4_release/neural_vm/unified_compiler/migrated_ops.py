@@ -198,6 +198,7 @@ def make_layer4_pc_relay_op() -> Operation:
         writes={"EMBED_LO", "EMBED_HI"},  # at AX marker
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
@@ -216,6 +217,7 @@ def make_layer4_ffn_op() -> Operation:
         writes={"FETCH_LO", "FETCH_HI"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
