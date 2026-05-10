@@ -2293,7 +2293,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     attn14 = model.blocks[14].attn
     if hasattr(attn14, 'alibi_slopes') and attn14.alibi_slopes is not None:
         attn14.alibi_slopes.fill_(0.1)  # slight recency bias for same-step preference
-    _set_layer14_mem_generation(attn14, S, BD, HD)
+    # _set_layer14_mem_generation moved to compiler dispatch
+    # (make_layer14_mem_generation_op, migrated=True)
 
     # L14 FFN: Clear TEMP, ADDR_KEY pollution, and OUTPUT corruption
     # BUG FIX 2026-04-16:
@@ -2351,7 +2352,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
     if hasattr(attn15, 'alibi_slopes') and attn15.alibi_slopes is not None:
         attn15.alibi_slopes.fill_(0.01)  # gentle recency bias for latest-write-wins
-    _set_layer15_memory_lookup(attn15, S, BD, HD)
+    # _set_layer15_memory_lookup moved to compiler dispatch
+    # (make_layer15_memory_lookup_op, migrated=True)
     ffn15 = model.blocks[15].ffn
     _set_nibble_copy_ffn(ffn15, S, BD)
 
@@ -2366,9 +2368,8 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # L16 attention: passthrough (identity via residual)
         # No weights needed - all routing done in FFN
 
-        ffn16 = model.blocks[16].ffn
-        num_units = _set_layer16_lev_routing(ffn16, S, BD)
-        print(f"  L16 FFN: {num_units} units for LEV routing (SP = BP + 16)")
+        # _set_layer16_lev_routing moved to compiler dispatch
+        # (make_layer16_lev_routing_op, migrated=True)
 
     # ===== CONTRACT VALIDATION =====
     reg = build_default_registry()
