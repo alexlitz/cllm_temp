@@ -138,12 +138,15 @@ def compile_full_vm(
                 op.bake_fn(target, layout.dim_positions, S)
 
         # Migrated block ops fire before model ops (which include legacy_bake).
+        # Block op binding via target_op_name (resolved from layout) takes
+        # precedence over the legacy layer_idx field.
         for op in sorted(
-            layout.block_ops, key=lambda o: (o.layer_idx, o.phase or 0)
+            layout.block_ops,
+            key=lambda o: (layout.resolve_block_op_layer(o), o.phase or 0),
         ):
             if not op.migrated:
                 continue
-            block = model.blocks[op.layer_idx]
+            block = model.blocks[layout.resolve_block_op_layer(op)]
             op.bake_fn(block, layout.dim_positions, S)
 
         for op in sorted(layout.model_ops, key=lambda o: (o.phase or 0)):

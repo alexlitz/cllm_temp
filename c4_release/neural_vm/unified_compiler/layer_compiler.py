@@ -78,6 +78,13 @@ class Operation:
     # legacy_bake — flip to True once the corresponding direct call is removed
     # from set_vm_weights so the op runs only via the compiler.
     migrated: bool = False
+    # Op-reference binding for kind="block" ops: when set, the block op binds
+    # to the layer that the named (attn/ffn) op was placed at by the compiler.
+    # Resolved in build_model_from_layout from layout.ops_per_layer. Overrides
+    # `layer_idx` when both are provided. This decouples block ops from
+    # hardcoded layer numbers — they follow whatever layer the compiler picks
+    # for the referenced op.
+    target_op_name: Optional[str] = None
 
     def __hash__(self):
         return hash(self.name)
@@ -111,6 +118,28 @@ class ModelLayout:
     def dim_range(self, name: str) -> range:
         start = self.dim_positions[name]
         return range(start, start + self.dim_sizes[name])
+
+    def resolve_block_op_layer(self, op: 'Operation') -> int:
+        """Return the layer index a kind="block" op binds to.
+
+        `target_op_name` (op-reference binding) takes precedence over the
+        legacy `layer_idx` field. When `target_op_name` is set, the op binds
+        to whichever layer the compiler placed the named attn/ffn op at.
+
+        Raises:
+            ValueError: if `target_op_name` doesn't match any op in the layout.
+        """
+        if op.target_op_name is not None:
+            for layer_idx, ops_at_layer in enumerate(self.ops_per_layer):
+                for placed in ops_at_layer:
+                    if placed.name == op.target_op_name:
+                        return layer_idx
+            raise ValueError(
+                f"Block op {op.name!r} target_op_name "
+                f"{op.target_op_name!r} not found in layout "
+                f"(must reference an attn/ffn op)"
+            )
+        return op.layer_idx
 
 
 class LayerCompiler:
@@ -170,9 +199,10 @@ class LayerCompiler:
                 )
         self._op_by_name[op.name] = op
         if op.kind == "block":
-            if op.layer_idx is None:
+            if op.layer_idx is None and op.target_op_name is None:
                 raise ValueError(
-                    f"Block-scoped op {op.name!r} must specify layer_idx"
+                    f"Block-scoped op {op.name!r} must specify layer_idx or "
+                    f"target_op_name"
                 )
             self.block_ops.append(op)
         elif op.kind == "model":
@@ -201,9 +231,22 @@ class LayerCompiler:
             ops_per_layer[layer_assignment[op.name]].append(op)
 
         # n_layers must be at least max(block_ops.layer_idx) + 1 if any
-        # block-scoped ops exist, otherwise their target block won't exist.
-        if self.block_ops:
-            n_layers = max(n_layers, max(o.layer_idx for o in self.block_ops) + 1)
+        # block-scoped ops with explicit layer_idx exist; otherwise their
+        # target block won't exist. Block ops bound via target_op_name follow
+        # the referenced op's layer (resolved at build time from
+        # layout.ops_per_layer), which by construction is < n_layers.
+        # target_op_name takes precedence: if a block op has both
+        # target_op_name AND layer_idx, the target_op_name path is used and
+        # layer_idx is ignored.
+        layer_idx_block_ops = [
+            o for o in self.block_ops
+            if o.layer_idx is not None and o.target_op_name is None
+        ]
+        if layer_idx_block_ops:
+            n_layers = max(
+                n_layers,
+                max(o.layer_idx for o in layer_idx_block_ops) + 1,
+            )
 
         return ModelLayout(
             d_model=d_model,
@@ -404,12 +447,15 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0):
                 op.bake_fn(target, layout.dim_positions, S)
 
         # Block-scoped ops run after all attn/ffn bakes for their layer.
+        # Block op binding via target_op_name (resolved from layout) takes
+        # precedence over the legacy layer_idx field.
         for op in sorted(
-            layout.block_ops, key=lambda o: (o.layer_idx, o.phase or 0)
+            layout.block_ops,
+            key=lambda o: (layout.resolve_block_op_layer(o), o.phase or 0),
         ):
             if not _should_dispatch(op):
                 continue
-            block = model.blocks[op.layer_idx]
+            block = model.blocks[layout.resolve_block_op_layer(op)]
             op.bake_fn(block, layout.dim_positions, S)
 
         # Model-level ops run last (head, embedding, defensive patches,
