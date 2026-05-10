@@ -9735,15 +9735,28 @@ def _set_function_call_weights(model, S, BD, HD):
     # Add W_down[OUTPUT_LO+0] -= 2.0/S for k=10 unit to cancel L3 default when return_addr=0xA.
     # General fix: Add constant cancelation for OUTPUT_LO[0] via a separate unit.
     T_jsr_s0 = 1.5  # CMP[4](~1) + MARK_STACK0(1) = 2 > 1.5
+    # FIX 2026-05-10 (Phase 4 BZ/BNZ step 2): Add MARK_PC/MARK_AX/IS_BYTE blockers.
+    # Without blockers, the unit fires at PC marker on BZ/BNZ steps because L6 attn
+    # head 4 leaks CMP[4]~2 (AX_LO_IS_ZERO relay) to PC marker. With CMP[4]=2 and
+    # MARK_STACK0=0, up_pre = 0 + 200 - 150 = 50 > 0, so the unit fires and writes
+    # AX_CARRY (the FETCH-fetched immediate) into PC OUTPUT, corrupting PC.
+    # Strong negative blockers ensure these JSR STACK0 units only fire at MARK_STACK0.
+    JSR_S0_BLOCK = -S * 10
     # First: Cancel L3 default OUTPUT_LO[0] with constant gate
     ffn6.W_up[unit, BD.CMP + 4] = S
     ffn6.W_up[unit, BD.MARK_STACK0] = S
+    ffn6.W_up[unit, BD.MARK_PC] = JSR_S0_BLOCK  # FIX 2026-05-10
+    ffn6.W_up[unit, BD.MARK_AX] = JSR_S0_BLOCK  # FIX 2026-05-10
+    ffn6.W_up[unit, BD.IS_BYTE] = JSR_S0_BLOCK  # FIX 2026-05-10
     ffn6.b_up[unit] = -S * T_jsr_s0
     ffn6.W_gate[unit, BD.CONST] = 1.0  # Constant gate
     ffn6.W_down[BD.OUTPUT_LO + 0, unit] = -2.0 / S  # Cancel L3 default
     unit += 1
     ffn6.W_up[unit, BD.CMP + 4] = S
     ffn6.W_up[unit, BD.MARK_STACK0] = S
+    ffn6.W_up[unit, BD.MARK_PC] = JSR_S0_BLOCK  # FIX 2026-05-10
+    ffn6.W_up[unit, BD.MARK_AX] = JSR_S0_BLOCK  # FIX 2026-05-10
+    ffn6.W_up[unit, BD.IS_BYTE] = JSR_S0_BLOCK  # FIX 2026-05-10
     ffn6.b_up[unit] = -S * T_jsr_s0
     ffn6.W_gate[unit, BD.CONST] = 1.0
     ffn6.W_down[BD.OUTPUT_HI + 0, unit] = -2.0 / S  # Cancel L3 default
@@ -9752,6 +9765,9 @@ def _set_function_call_weights(model, S, BD, HD):
     for k in range(16):
         ffn6.W_up[unit, BD.CMP + 4] = S
         ffn6.W_up[unit, BD.MARK_STACK0] = S
+        ffn6.W_up[unit, BD.MARK_PC] = JSR_S0_BLOCK  # FIX 2026-05-10
+        ffn6.W_up[unit, BD.MARK_AX] = JSR_S0_BLOCK  # FIX 2026-05-10
+        ffn6.W_up[unit, BD.IS_BYTE] = JSR_S0_BLOCK  # FIX 2026-05-10
         ffn6.b_up[unit] = -S * T_jsr_s0
         ffn6.W_gate[unit, BD.EMBED_LO + k] = -1.0
         ffn6.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
@@ -9760,6 +9776,9 @@ def _set_function_call_weights(model, S, BD, HD):
     for k in range(16):
         ffn6.W_up[unit, BD.CMP + 4] = S
         ffn6.W_up[unit, BD.MARK_STACK0] = S
+        ffn6.W_up[unit, BD.MARK_PC] = JSR_S0_BLOCK  # FIX 2026-05-10
+        ffn6.W_up[unit, BD.MARK_AX] = JSR_S0_BLOCK  # FIX 2026-05-10
+        ffn6.W_up[unit, BD.IS_BYTE] = JSR_S0_BLOCK  # FIX 2026-05-10
         ffn6.b_up[unit] = -S * T_jsr_s0
         ffn6.W_gate[unit, BD.EMBED_HI + k] = -1.0
         ffn6.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
