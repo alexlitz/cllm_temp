@@ -9433,39 +9433,28 @@ def _set_function_call_weights(model, S, BD, HD):
         ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
 
-    # STACK0 bytes 0-3 (128 units: return_addr from AX_CARRY)
-    # L14 reads from these byte positions to populate MEM value bytes.
-    # FIX 2026-04-16: Use L1H4[BP] AND NOT H1[BP] to identify STACK0 area.
-    # STACK0 is 5-9 positions from BP marker, covered by L1H4[BP] (d≤6.5) but not H1[BP] (d≤4.5).
-    # Threshold: CMP[4](1) + BYTE_INDEX(1) + IS_BYTE(1) + L1H4[BP](1) - H1[BP](0) = 4 > 3.5
-    BP_I = 3  # BP marker index
-    T_jsr_s0_byte = 3.5
-    for byte_idx in range(4):
-        byte_index_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3][byte_idx]
-        for k in range(16):
-            # Lo nibble
-            ffn6.W_up[unit, BD.CMP + 4] = S
-            ffn6.W_up[unit, byte_index_dim] = S
-            ffn6.W_up[unit, BD.IS_BYTE] = S
-            ffn6.W_up[unit, BD.L1H4 + BP_I] = S  # STACK0 is within L1H4 of BP
-            ffn6.W_up[unit, BD.H1 + BP_I] = -S  # But not within H1 of BP
-            ffn6.b_up[unit] = -S * T_jsr_s0_byte
-            ffn6.W_gate[unit, BD.EMBED_LO + k] = -1.0  # Cancel identity
-            ffn6.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0  # Write return_addr
-            ffn6.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            # Hi nibble
-            ffn6.W_up[unit, BD.CMP + 4] = S
-            ffn6.W_up[unit, byte_index_dim] = S
-            ffn6.W_up[unit, BD.IS_BYTE] = S
-            ffn6.W_up[unit, BD.L1H4 + BP_I] = S
-            ffn6.W_up[unit, BD.H1 + BP_I] = -S
-            ffn6.b_up[unit] = -S * T_jsr_s0_byte
-            ffn6.W_gate[unit, BD.EMBED_HI + k] = -1.0
-            ffn6.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
-            ffn6.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
-            unit += 1
+    # STACK0 bytes 0-3 (128 units RESERVED but DISABLED).
+    #
+    # BUG FIX 2026-05-10 (C1.B): These per-byte units broadcast return_addr
+    # byte 0 (from AX_CARRY) into OUTPUT at all four STACK0 byte positions
+    # (J=0..3). Because of the autoregressive shift, OUTPUT at byte J predicts
+    # the *next* token (byte J+1), so byte 0 leaks into bytes 1, 2, 3 instead
+    # of producing 0x00 for return addresses < 256.
+    #
+    # Correct behavior is now achieved by:
+    #   1. The STACK0 *marker* write above (lines ~9419-9434) which puts
+    #      AX_CARRY → OUTPUT at the marker, predicting byte 0 = return_addr[0].
+    #   2. `_set_layer14_clear_output_corruption` which boosts OUTPUT_LO[0]/
+    #      OUTPUT_HI[0] at STACK0 byte positions 0..2, predicting byte value 0
+    #      for bytes 1..3 (return_addr < 256 ⇒ high bytes are 0).
+    #
+    # If we ever need return addresses ≥ 256, replace this disable with a
+    # *shifted* byte-matching attention head (mirror the pattern in
+    # `_set_layer10_byte_passthrough` at vm_step.py:6560), where Q at byte J
+    # routes from prev-step source byte J+1.
+    #
+    # Reserve the 128 unit slots so downstream unit numbering is unchanged.
+    unit += 128
 
     # --- JSR PC override: PC = FETCH (jump target) (64 units: 978-1041) ---
     # At PC marker when JSR: cancel OUTPUT (PC+5), write FETCH (jump target).
