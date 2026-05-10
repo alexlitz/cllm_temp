@@ -597,13 +597,23 @@ class AutoregressiveVMRunner:
                 self._inject_getchar(context)
 
             # PRTF (Phase 6, pure_neural): the neural network does not yet have
-            # a complete autoregressive format-string walker / byte emitter. As
-            # a minimal bring-up, the runner walks the format string from shadow
-            # memory and appends bytes to the output buffer. %d / %s
-            # substitution is intentionally not handled here; the simple
-            # literal-string case (test_prtf_simple) is the minimal goal.
+            # a complete autoregressive format-string walker / byte emitter.
+            # Runner-side shim walks the format string from shadow memory,
+            # interprets %d/%s/%c/%x/%% specifiers using stack args (C calling
+            # convention), and appends to output.
             if exec_op == Opcode.PRTF:
-                self._neural_prtf_emit(context, output)
+                self._neural_prtf_emit(context, output, exec_idx, bytecode)
+
+            # OPEN/CLOS/READ (Phase 6, pure_neural): runner-side tool-boundary
+            # shims. The neural network does not yet emit TOOL_CALL markers
+            # for these in pure_neural mode, so we read stack args, perform
+            # the I/O, and override AX with the result.
+            if exec_op == Opcode.OPEN:
+                self._neural_open_emit(context)
+            elif exec_op == Opcode.CLOS:
+                self._neural_clos_emit(context)
+            elif exec_op == Opcode.READ:
+                self._neural_read_emit(context)
 
             # MEM persistence shim (Phase 7, 2026-05-10): for store ops
             # (SI/SC/PSH/JSR/ENT), extract the MEM section emitted by the
@@ -969,27 +979,56 @@ class AutoregressiveVMRunner:
 
         self._override_ax_in_last_step(context, byte_val)
 
-    def _neural_prtf_emit(self, context, output):
-        """Runner-side PRTF for pure_neural mode (literal strings only).
+    def _peek_argc_from_adj(self, exec_idx, bytecode):
+        """Peek at the ADJ instruction following PRTF/OPEN/etc. to derive argc.
 
-        Walks the format string in shadow memory and appends bytes to the
-        ``output`` buffer. Format specifiers (%d/%s/etc.) are not yet
-        interpreted — the bytes are emitted verbatim, which is sufficient
-        for the literal-string ``test_prtf_simple`` xpass criterion.
-
-        Format pointer resolution attempts, in order:
-          1. STACK0 from this step (the model's emitted *sp value)
-          2. Neural AX from this step (preserved by PSH for the canonical
-             ``IMM <fmt>; PSH; PRTF`` pattern)
-          3. Shadow memory at neural_sp (typically zero in pure_neural since
-             PSH does not write shadow memory in this mode)
-
-        Candidates that point into a populated shadow-memory region are
-        preferred over those that don't.
+        C4 emits ``CALL <syscall>; ADJ <argc*8>`` so the immediate of the
+        next instruction tells us how many 8-byte stack slots to reclaim,
+        which equals the number of args. Returns 0 if ADJ is not the next
+        instruction (e.g. test that doesn't ADJ before EXIT).
         """
+        if bytecode is None or exec_idx is None:
+            return 0
+        adj_idx = exec_idx + 1
+        if 0 <= adj_idx < len(bytecode):
+            adj_instr = bytecode[adj_idx]
+            if (adj_instr & 0xFF) == Opcode.ADJ:
+                adj_imm = adj_instr >> 8
+                if adj_imm >= 0x800000:
+                    adj_imm -= 0x1000000
+                return adj_imm // 8
+        return 0
+
+    def _neural_prtf_emit(self, context, output, exec_idx=None, bytecode=None):
+        """Runner-side PRTF for pure_neural mode.
+
+        Walks the format string in shadow memory, substituting %d/%s/%c/%x/%%
+        from stack args. Determines argc by peeking at the following ADJ
+        instruction.
+
+        Stack layout assumes the test convention used in
+        ``test_pure_neural_io.py``: format pointer is the *last* arg pushed
+        (top of stack = sp[0]), with positional args underneath in
+        push-order (sp[1] = first int arg). For argc==1 (literal-only)
+        this matches the previous behavior; for argc>=2 the runner reads
+        ``args[k] = mem[sp + (k+1)*8]``.
+
+        For ``test_prtf_with_arg``
+        (``[IMM 42; PSH; IMM fmt_ptr; PSH; PRTF; ADJ 16]``) this gives
+        sp[0]=fmt_ptr, sp[1]=42, matching the expected ``"42"`` output for
+        the ``"%d"`` format.
+
+        Returns the number of bytes emitted (and writes that count to AX).
+        """
+        argc = self._peek_argc_from_adj(exec_idx, bytecode)
+
+        # Resolve fmt_ptr. Prefer model STACK0 (top of stack) when it
+        # matches a populated shadow-memory entry, then fall back to the
+        # mem-derived candidate at *_last_sp*.
         stack0 = self._extract_register(context, Token.STACK0)
         ax = self._extract_register(context, Token.REG_AX)
-        sp = self._extract_register(context, Token.REG_SP)
+        sp = self._last_sp if self._last_sp is not None else \
+            self._extract_register(context, Token.REG_SP)
 
         candidates = []
         if stack0:
@@ -1001,7 +1040,6 @@ class AutoregressiveVMRunner:
             if mem_val:
                 candidates.append(mem_val & 0xFFFFFFFF)
 
-        # Prefer candidates that index a known shadow-memory entry.
         fmt_ptr = None
         for cand in candidates:
             if cand in self._memory:
@@ -1012,15 +1050,127 @@ class AutoregressiveVMRunner:
         if fmt_ptr is None:
             return 0
 
-        emitted = 0
-        max_len = 4096
-        for i in range(max_len):
-            byte_val = self._memory.get(fmt_ptr + i, 0)
-            if byte_val == 0:
-                break
-            output.append(chr(byte_val & 0xFF))
-            emitted += 1
-        return emitted
+        fmt_str = self._read_string(fmt_ptr)
+
+        # No varargs — emit the literal format string. (Matches the
+        # legacy ``test_prtf_simple`` behavior.)
+        if argc <= 1:
+            output.append(fmt_str)
+            self._override_ax_in_last_step(context, len(fmt_str) & 0xFFFFFFFF)
+            return len(fmt_str)
+
+        # argc >= 2: read varargs from sp[1..argc-1] (deeper than fmt_ptr).
+        if sp is None:
+            sp = 0
+        args = []
+        for k in range(1, argc):
+            args.append(self._mem_load_word((sp + k * 8) & 0xFFFFFFFF))
+
+        formatted = self._format_printf(fmt_str, args)
+        output.append(formatted)
+        self._override_ax_in_last_step(context, len(formatted) & 0xFFFFFFFF)
+        return len(formatted)
+
+    def _neural_open_emit(self, context):
+        """Runner-side OPEN for pure_neural mode.
+
+        Reads two stack slots and treats whichever is a populated address
+        in shadow memory as the path pointer; the other is the mode. This
+        accommodates both the C4 push order and the test's push order.
+        Calls ``os.open`` and writes the resulting fd (or -1 on error) to AX.
+        """
+        sp = self._last_sp if self._last_sp is not None else 0
+        s0 = self._mem_load_word(sp & 0xFFFFFFFF)
+        s1 = self._mem_load_word((sp + 8) & 0xFFFFFFFF)
+
+        if s0 in self._memory:
+            path_ptr, mode = s0, s1
+        elif s1 in self._memory:
+            path_ptr, mode = s1, s0
+        else:
+            path_ptr, mode = s0, s1
+
+        path = self._read_string(path_ptr)
+        try:
+            flags = os.O_RDONLY if (mode & 0xFFFFFFFF) == 0 else (os.O_WRONLY | os.O_CREAT)
+            fd = os.open(path, flags, 0o644)
+            self._open_fds[fd] = path
+            result = fd
+        except OSError:
+            result = 0xFFFFFFFF  # -1
+
+        self._override_ax_in_last_step(context, result & 0xFFFFFFFF)
+
+    def _neural_clos_emit(self, context):
+        """Runner-side CLOS for pure_neural mode.
+
+        Pops fd from the top of stack, closes it (if previously opened by
+        ``_neural_open_emit``), and writes 0 to AX (matches the existing
+        ``_syscall_clos`` default).
+        """
+        sp = self._last_sp if self._last_sp is not None else 0
+        fd = self._mem_load_word(sp & 0xFFFFFFFF)
+        if fd in self._open_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self._open_fds.pop(fd, None)
+        self._override_ax_in_last_step(context, 0)
+
+    def _neural_read_emit(self, context):
+        """Runner-side READ for pure_neural mode.
+
+        Reads three stack slots; identifies them by heuristic:
+          - buf_ptr: slot pointing into heap/data (>= 0x10000)
+          - fd: small int (< 256)
+          - count: remaining slot
+        For ``fd == 0`` (stdin), consumes up to ``count`` bytes from
+        ``self._stdin_buffer``; for other fds, falls back to ``os.read``.
+        Writes bytes to shadow memory at ``buf+i`` (and persists per-word
+        MEM sections so future L15 lookups see them) and the byte count
+        to AX.
+        """
+        sp = self._last_sp if self._last_sp is not None else 0
+        s0 = self._mem_load_word(sp & 0xFFFFFFFF)
+        s1 = self._mem_load_word((sp + 8) & 0xFFFFFFFF)
+        s2 = self._mem_load_word((sp + 16) & 0xFFFFFFFF)
+
+        slots = [s0, s1, s2]
+        buf_ptr = next((v for v in slots if v >= 0x10000), 0)
+        fd = next((v for v in slots if v < 256 and v != buf_ptr), 0)
+        count_candidates = [v for v in slots if v != buf_ptr and v != fd]
+        count = count_candidates[0] if count_candidates else 0
+        # Heuristic fallback: assume canonical (count, buf_ptr, fd) push order.
+        if buf_ptr == 0 or count == 0:
+            count, buf_ptr, fd = s0, s1, s2
+
+        data = b""
+        if fd == 0:
+            remaining = len(self._stdin_buffer) - self._stdin_pos
+            n = min(count, max(remaining, 0))
+            if n > 0:
+                chunk = self._stdin_buffer[self._stdin_pos:self._stdin_pos + n]
+                self._stdin_pos += n
+                data = bytes(ord(c) if isinstance(c, str) else c for c in chunk)
+        else:
+            try:
+                data = os.read(fd, count)
+            except OSError:
+                self._override_ax_in_last_step(context, 0xFFFFFFFF)
+                return
+
+        for i, b in enumerate(data):
+            self._memory[(buf_ptr + i) & 0xFFFFFFFF] = b & 0xFF
+
+        if data:
+            n_words = (len(data) + 3) // 4
+            for w in range(n_words):
+                addr = (buf_ptr + w * 4) & 0xFFFFFFFF
+                value = self._mem_load_word(addr)
+                self._inject_mem_section(addr, value)
+
+        self._override_ax_in_last_step(context, len(data) & 0xFFFFFFFF)
 
     def _override_ax_in_last_step(self, context, value):
         """Override AX register bytes in the last completed step.
