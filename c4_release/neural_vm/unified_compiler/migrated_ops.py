@@ -1442,6 +1442,130 @@ def make_legacy_bake_op(
     )
 
 
+# ---------------------------------------------------------------------------
+# Model-level post-passes
+# ---------------------------------------------------------------------------
+
+def make_branch_override_patch_op() -> Operation:
+    """Defensive gate that suppresses spurious branch/LEV-override FFN units.
+
+    Any FFN unit firing with positive MARK_PC AND a positive
+    OP_JMP/OP_LEV/OP_BZ/OP_BNZ/CMP[0] trigger AND writing OUTPUT_LO/HI gets
+    strong negative weights for non-target opcodes — only the legit branch/LEV
+    opcode lets the unit fire. Without this, L5 attention leaks opcode flags
+    into MARK_PC of subsequent steps and FFN units fire spuriously.
+    """
+    def bake(model, dim_positions, S):
+        BD = _as_setdim_proxy(dim_positions)
+        OPCODE_BLOCK_MAP = {
+            BD.OP_JMP: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
+                        BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                        BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                        BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                        BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                        BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                        BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
+            BD.OP_LEV: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP,
+                        BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                        BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                        BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                        BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                        BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                        BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
+            BD.OP_BZ:  [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
+                        BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                        BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                        BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                        BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                        BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                        BD.OP_BNZ, BD.OP_JSR],
+            BD.OP_BNZ: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_JMP, BD.OP_LEV,
+                        BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                        BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                        BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                        BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                        BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                        BD.OP_BZ, BD.OP_JSR],
+            BD.CMP + 0: [BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_LEA, BD.OP_LEV,
+                         BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                         BD.OP_OR, BD.OP_XOR, BD.OP_AND,
+                         BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                         BD.OP_SHL, BD.OP_SHR, BD.OP_PSH, BD.OP_LI, BD.OP_LC,
+                         BD.OP_SI, BD.OP_SC, BD.OP_ADJ, BD.OP_ENT,
+                         BD.OP_BZ, BD.OP_BNZ, BD.OP_JSR],
+        }
+        branch_override_patches = 0
+        for block_idx in range(len(model.blocks)):
+            ffn = model.blocks[block_idx].ffn
+            if not (hasattr(ffn, 'W_up') and isinstance(getattr(ffn, 'W_up', None), nn.Parameter)):
+                continue
+            hidden_dim = ffn.W_up.shape[0]
+            for u in range(hidden_dim):
+                mark_pc_w = ffn.W_up[u, BD.MARK_PC].item()
+                if mark_pc_w <= 50:
+                    continue
+                writes_output = (
+                    ffn.W_down[BD.OUTPUT_LO:BD.OUTPUT_LO+16, u].abs().max().item() > 0.01
+                    or ffn.W_down[BD.OUTPUT_HI:BD.OUTPUT_HI+16, u].abs().max().item() > 0.01
+                )
+                if not writes_output:
+                    continue
+                for trigger_dim, blockers in OPCODE_BLOCK_MAP.items():
+                    trigger_w = ffn.W_up[u, trigger_dim].item()
+                    if trigger_w <= 5:
+                        continue
+                    for opcode_dim in blockers:
+                        cur = ffn.W_up[u, opcode_dim].item()
+                        ffn.W_up.data[u, opcode_dim] = min(cur, -S)
+                    branch_override_patches += 1
+                    break
+        print(f"  BRANCH OVERRIDE PATCH: {branch_override_patches} units gated")
+
+    return Operation(
+        name="branch_override_patch",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=1100,
+        migrated=True,
+    )
+
+
+def make_right_size_ffns_op() -> Operation:
+    """Trim each block's FFN hidden dim to actually-programmed unit count."""
+    def bake(model, dim_positions, S):
+        from ..vm_step import _right_size_ffns
+        _right_size_ffns(model)
+
+    return Operation(
+        name="right_size_ffns",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=1200,
+        migrated=True,
+    )
+
+
+def make_expand_wrapper_blocks_op() -> Operation:
+    """Split HybridALUBlock + post_ops into separate transformer blocks."""
+    def bake(model, dim_positions, S):
+        from ..vm_step import _expand_wrapper_blocks
+        _expand_wrapper_blocks(model)
+
+    return Operation(
+        name="expand_wrapper_blocks",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=1300,
+        migrated=True,
+    )
+
+
 def all_core_ops() -> list:
     """Return the full list of migrated core-VM operations.
 
@@ -1495,6 +1619,10 @@ def all_core_ops() -> list:
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
+        # NOTE: branch_override_patch / right_size_ffns / expand_wrapper_blocks
+        # are NOT added here because they still run inline at the end of
+        # set_vm_weights (legacy_bake). The factory ops exist for future
+        # migration but currently adding them would double-run the work.
     ]
 
 

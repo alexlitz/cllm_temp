@@ -227,6 +227,11 @@ class LayerCompiler:
         if self.block_ops:
             n_layers = max(n_layers, max(o.layer_idx for o in self.block_ops) + 1)
 
+        # Model-ops are applied after all layer-ops; sort by phase so the
+        # original hand-set order is preserved (smaller phase = earlier).
+        model_ops = [op for op in self.ops if op.kind == "model"]
+        model_ops.sort(key=lambda o: (o.phase if o.phase is not None else 0))
+
         return ModelLayout(
             d_model=d_model,
             n_layers=n_layers,
@@ -318,6 +323,8 @@ class LayerCompiler:
         assignment: Dict[str, int] = {}
 
         for op in topo:
+            if op.kind == "model":
+                continue
             earliest = 0
             for d in op.reads:
                 if d in writes_layer:
