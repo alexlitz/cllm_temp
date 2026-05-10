@@ -512,7 +512,15 @@ class AutoregressiveVMRunner:
         slot = self._pure_attention_report[bucket]
         slot[name] = slot.get(name, 0) + 1
 
-    def _compute_alu(self, op, stack_val, ax_val):
+    def _compute_alu_legacy(self, op, stack_val, ax_val):
+        """Legacy Python ALU implementation.
+
+        Only used when ``pure_neural=False`` and ``trust_neural_alu=False``. The
+        neural ALU now handles every opcode here; this method exists solely to
+        keep the legacy non-pure-neural path working for tests that have not
+        migrated. Remove together with the rest of the non-pure-neural branch
+        in ``_dispatch_step`` when ``pure_neural=True`` becomes the only mode.
+        """
         if op == Opcode.ADD:
             return (stack_val + ax_val) & 0xFFFFFFFF
         elif op == Opcode.SUB:
@@ -703,7 +711,7 @@ class AutoregressiveVMRunner:
                     if model_ax is not None:
                         self._last_ax = model_ax
                 else:
-                    alu_result = self._compute_alu(exec_op, stack_val, self._last_ax)
+                    alu_result = self._compute_alu_legacy(exec_op, stack_val, self._last_ax)
                     self._last_ax = alu_result
                     self._override_register_in_last_step(context, Token.REG_AX, alu_result)
             elif exec_op == Opcode.LI:
