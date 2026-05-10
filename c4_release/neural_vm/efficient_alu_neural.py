@@ -686,9 +686,205 @@ class ALUMul(PureNeuralALU):
 
 
 class ALUShift(PureNeuralALU):
-    """Neural SHL/SHR."""
+    """Neural SHL/SHR.
+
+    DEPRECATED (2026-05-10): The runtime wrapper class is being eliminated in
+    favor of 4 separate compiler-driven sub-stages (BDToGE → SHL/SHR
+    precompute → SHL/SHR select → GEToBD) installed at L13 by the compiler.
+    See ``ALUShiftComposite`` and ``make_l13_alu_shift_*_op`` in
+    ``unified_compiler/migrated_ops.py``. Kept here for backward compatibility
+    until all callers move to the composite.
+    """
     def __init__(self, S, BD):
         super().__init__(S, BD, operations='shift')
+
+
+# ---------------------------------------------------------------------------
+# Flattened SHL/SHR pipeline (replaces ALUShift wrapper).
+#
+# 4 stages, each a separate nn.Module installed at L13.ffn by the compiler.
+# They share intermediate GE-format state via a ShiftPipelineState object so
+# that the residual stream (BD-format, ~512 dims) does not need to carry the
+# ~1280-dim GE workspace. Forward semantics are byte-identical to ALUShift's
+# forward pass.
+# ---------------------------------------------------------------------------
+
+
+class ShiftPipelineState:
+    """Per-composite scratch space for the 4-stage SHL/SHR pipeline.
+
+    Attaches to ``ALUShiftComposite`` and is referenced by all 4 stage modules.
+    Holds intermediate tensors so each stage can run as a standalone block
+    without serialising the full GE workspace into the BD residual stream.
+    """
+
+    def __init__(self):
+        self.x_bd_in = None
+        self.x_ge = None         # [B, seq, 8, 160]
+        self.x_ge_flat = None    # [B*seq, 8, 160]
+        self.x_shl = None        # [B*seq, 8, 160]
+        self.x_shr = None        # [B*seq, 8, 160]
+        self.x_ge_out = None     # [B, seq, 8, 160]
+        self.opcode_mask = None  # [B, seq]
+
+
+class ShiftBDToGEStage(nn.Module):
+    """Stage 1: BD → GenericE format conversion (formerly ALUShift step 1)."""
+
+    def __init__(self, S, BD, state: ShiftPipelineState):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.ge = GenericE(NIBBLE)
+        self.state = state
+        self.bd_to_ge = BDToGEConverter(BD, self.ge)
+
+    def forward(self, x_bd):
+        # Side-channel: stash converted GE state for downstream stages.
+        x_ge = self.bd_to_ge(x_bd)
+        B, seq_len, _, _ = x_ge.shape
+        x_ge_flat = x_ge.view(B * seq_len, 8, self.ge.DIM)
+        self.state.x_bd_in = x_bd
+        self.state.x_ge = x_ge
+        self.state.x_ge_flat = x_ge_flat
+        return x_bd
+
+
+class ShiftPrecomputeStage(nn.Module):
+    """Stage 2: SHL/SHR sub-chunk precompute (formerly ALUShift step 2a).
+
+    Bakes ``ShlPrecomputeFFN`` and ``ShrPrecomputeFFN`` and runs both on the
+    GE workspace, gated by opcode in their own weights.
+    """
+
+    def __init__(self, S, BD, state: ShiftPipelineState):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.state = state
+        self.ge = GenericE(NIBBLE)
+        # Use the same factory as ALUShift to get [precompute, select] pairs;
+        # take only the precompute (index 0).
+        self.shl_precompute = build_shl_layers(NIBBLE, opcode=23)[0]
+        self.shr_precompute = build_shr_layers(NIBBLE, opcode=24)[0]
+
+    def forward(self, x_bd):
+        x_ge_flat = self.state.x_ge_flat
+        x_shl = x_ge_flat.clone()
+        x_shl = self.shl_precompute(x_shl)
+        x_shr = x_ge_flat.clone()
+        x_shr = self.shr_precompute(x_shr)
+        self.state.x_shl = x_shl
+        self.state.x_shr = x_shr
+        return x_bd
+
+
+class ShiftSelectStage(nn.Module):
+    """Stage 3: SHL/SHR select + opcode-gated combine (formerly ALUShift step 2b)."""
+
+    def __init__(self, S, BD, state: ShiftPipelineState):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.state = state
+        self.ge = GenericE(NIBBLE)
+        # Select FFN is index 1 of build_*_layers.
+        self.shl_select = build_shl_layers(NIBBLE, opcode=23)[1]
+        self.shr_select = build_shr_layers(NIBBLE, opcode=24)[1]
+
+    def forward(self, x_bd):
+        x_shl = self.state.x_shl
+        x_shr = self.state.x_shr
+        x_shl_post = self.shl_select(x_shl)
+        x_shr_post = self.shr_select(x_shr)
+
+        x_ge_flat = self.state.x_ge_flat
+        x_ge_out = x_ge_flat.clone()
+
+        op_shl = (x_ge_flat[:, 0, self.ge.OP_START + 23] > 0.1).float()
+        op_shr = (x_ge_flat[:, 0, self.ge.OP_START + 24] > 0.1).float()
+        op_total = op_shl + op_shr
+
+        x_ge_out[:, :, self.ge.RESULT] = (
+            x_shl_post[:, :, self.ge.RESULT] * op_shl[:, None]
+            + x_shr_post[:, :, self.ge.RESULT] * op_shr[:, None]
+        )
+
+        x_bd_in = self.state.x_bd_in
+        B, seq_len, _ = x_bd_in.shape
+        x_ge_out = x_ge_out.view(B, seq_len, 8, self.ge.DIM)
+        opcode_mask = op_total.view(B, seq_len)
+
+        # Restrict OUTPUT writes to AX marker positions to match ALUShift.
+        BD = self.BD
+        mark_ax = x_bd_in[:, :, BD.MARK_AX]
+        opcode_mask = opcode_mask * (mark_ax > 0.5).float()
+
+        self.state.x_ge_out = x_ge_out
+        self.state.opcode_mask = opcode_mask
+        return x_bd
+
+
+class ShiftGEToBDStage(nn.Module):
+    """Stage 4: GenericE → BD format conversion + write OUTPUT (formerly ALUShift step 3)."""
+
+    def __init__(self, S, BD, state: ShiftPipelineState):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.state = state
+        self.ge = GenericE(NIBBLE)
+        self.ge_to_bd = GEToBDConverter(BD, self.ge, S)
+
+    def forward(self, x_bd):
+        # Use the original BD input (residual identity through stages 1-3 means
+        # x_bd here equals state.x_bd_in for shift opcodes; we still pass the
+        # current x_bd as the destination so unrelated downstream writes are
+        # preserved).
+        x_ge_out = self.state.x_ge_out
+        opcode_mask = self.state.opcode_mask
+        x_bd_out = self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
+        return x_bd_out
+
+
+class ALUShiftComposite(nn.Module):
+    """Composite SHL/SHR FFN replacement: 4 sub-stages run sequentially.
+
+    Replaces ``ALUShift`` (an instance of ``PureNeuralALU(operations='shift')``)
+    as the L13 ``block.ffn`` module. Forward is byte-identical to the
+    ``ALUShift.forward``.
+
+    The 4 sub-stages are exposed as named submodules so that the compiler
+    bake_fns in ``migrated_ops.make_l13_alu_shift_*_op`` can build / inspect
+    each stage independently.
+    """
+
+    def __init__(self, S, BD):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.state = ShiftPipelineState()
+        self.bdtoge_stage = ShiftBDToGEStage(S, BD, self.state)
+        self.precompute_stage = ShiftPrecomputeStage(S, BD, self.state)
+        self.select_stage = ShiftSelectStage(S, BD, self.state)
+        self.getobd_stage = ShiftGEToBDStage(S, BD, self.state)
+
+    def forward(self, x_bd):
+        x = self.bdtoge_stage(x_bd)
+        x = self.precompute_stage(x)
+        x = self.select_stage(x)
+        x = self.getobd_stage(x)
+        return x
+
+    # Stub methods for compatibility with vm_step.py (mirror PureNeuralALU).
+    def compact(self, block_size=1):
+        pass
+
+    def sparsify(self):
+        pass
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        pass
 
 
 class ALUDivMod(PureNeuralALU):

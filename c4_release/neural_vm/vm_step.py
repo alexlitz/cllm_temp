@@ -2223,7 +2223,11 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # `layer13_mem_addr_gather` (attn) which runs before legacy_bake.
 
         # L13 FFN: Neural SHL/SHR
-        model.blocks[13].ffn = EfficientALU_L13_Neural(S, BD)
+        # Migrated 2026-05-10 to the 4-stage compiler-driven
+        # ALUShiftComposite installed by `make_l13_alu_shift_*_op` ops (4
+        # kind="ffn" stage bakes at phase=13 plus a kind="block" install op
+        # at phase=13.5). The runtime ``ALUShift`` wrapper is deprecated.
+        # Previously: ``model.blocks[13].ffn = EfficientALU_L13_Neural(S, BD)``
 
     else:
         raise ValueError(f"Unknown alu_mode: {alu_mode}. Use 'lookup' or 'efficient'.")

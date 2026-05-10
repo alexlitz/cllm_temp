@@ -736,15 +736,19 @@ def make_layer13_mem_addr_gather_op() -> Operation:
 
 
 def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
-    """L13 FFN: SHL/SHR shifts.
+    """L13 FFN: SHL/SHR shifts (lookup-mode entry point).
 
     In ``alu_mode='lookup'`` we bake the standard SHL/SHR lookup table via
-    ``_set_layer13_shifts`` into a fresh PureFFN block. In
-    ``alu_mode='efficient'`` SHL/SHR are handled by the dedicated
-    :class:`ALUShift` neural module attached to the original L13 block by
-    ``set_vm_weights``. Running the lookup-table bake in efficient mode
-    causes a *second* SHL/SHR producer to overwrite ALUShift's correct
-    output downstream, so we install a no-op operation instead.
+    ``_set_layer13_shifts`` into the L13 PureFFN block.
+
+    In ``alu_mode='efficient'`` SHL/SHR are now handled by the 4-stage
+    composite installed via the dedicated
+    ``make_l13_alu_shift_{bdtoge,precompute,select,getobd}_op`` factories
+    (each at phase=13 so they share L13 with ``make_layer13_mem_addr_gather_op``).
+    The 4 ops together replace the runtime ``ALUShift`` wrapper that used to
+    be attached by ``set_vm_weights``. This entry-point is a no-op in
+    efficient mode so the lookup-table bake doesn't overwrite the composite's
+    output.
     """
     if alu_mode not in ("lookup", "efficient"):
         raise ValueError(
@@ -753,7 +757,7 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
 
     if alu_mode == "efficient":
         def bake(ffn, dim_positions, S):
-            return  # ALUShift owns SHL/SHR in efficient mode.
+            return  # ALUShiftComposite (4-stage) owns SHL/SHR in efficient mode.
     else:
         def bake(ffn, dim_positions, S):
             from ..vm_step import _set_layer13_shifts
@@ -769,6 +773,185 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         bake_fn=bake,
         migrated=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# 4-stage SHL/SHR ops (efficient-mode replacement for ALUShift wrapper).
+#
+# Each op is kind="ffn" at phase=13 so the 4 ops + ``layer13_shifts`` all
+# share L13's FFN slot (phase-equality => shared (layer, kind) slot per
+# ``LayerCompiler._assign_layers``). The bake_fns cooperate:
+#
+#   1. bdtoge  : install the ``ALUShiftComposite`` on ``block.ffn`` and assign
+#                the bdtoge stage. Subsequent bakes look up the existing
+#                composite via ``block.ffn``.
+#   2. precompute : assign the precompute stage onto the composite. (No-op if
+#                   the composite was already fully built by another path.)
+#   3. select  : same for select.
+#   4. getobd  : same for getobd.
+#
+# Conceptually these are 4 distinct compiler ops carrying ownership of the
+# 4 sub-FFN stages. Mechanically they share one layer because the rest of
+# ``set_vm_weights`` (legacy_bake) still hardcodes ``model.blocks[14..16]``
+# for downstream layers; spreading the stages across 4 layers would shift
+# those indices and break that legacy bake until it migrates too. Once the
+# downstream legacy bakes follow the layout, the phases can be split into
+# 13.0/13.1/13.2/13.3 and the stages will land in their own layers.
+# ---------------------------------------------------------------------------
+
+
+class _ALUShiftCompositeBuilder:
+    """Mutable holder shared across the 4 stage bake_fns + the install op.
+
+    The compiler may assign the 4 ffn stage ops to whichever block its dep
+    analyser picks (often a block far from the legacy ``model.blocks[13]``).
+    The install op (kind="block", layer_idx=13) is what actually swaps the
+    L13 ``block.ffn`` for the composite. The shared builder lets stage bakes
+    populate the composite from any FFN module they happen to receive.
+    """
+
+    def __init__(self):
+        self.composite = None
+
+    def ensure(self, S, BD_proxy):
+        from ..efficient_alu_neural import ALUShiftComposite
+        if self.composite is None:
+            self.composite = ALUShiftComposite(S, BD_proxy)
+        return self.composite
+
+
+def make_alu_shift_composite_ops():
+    """Build the 5 cooperating ops (4 ffn stages + 1 block install).
+
+    Returns ``[bdtoge, precompute, select, getobd, install]`` — all sharing
+    the same ``_ALUShiftCompositeBuilder`` so the install op can hand the
+    fully-constructed composite to ``model.blocks[13].ffn``.
+    """
+    builder = _ALUShiftCompositeBuilder()
+
+    def make_bdtoge():
+        def bake(ffn, dim_positions, S):
+            from ..efficient_alu_neural import ShiftBDToGEStage
+            BD = _as_setdim_proxy(dim_positions)
+            composite = builder.ensure(S, BD)
+            composite.bdtoge_stage = ShiftBDToGEStage(S, BD, composite.state)
+
+        return Operation(
+            name="l13_alu_shift_bdtoge",
+            phase=13,
+            reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+                   "OP_SHL", "OP_SHR"},
+            writes=set(),
+            kind="ffn",
+            bake_fn=bake,
+            migrated=True,
+        )
+
+    def make_precompute():
+        def bake(ffn, dim_positions, S):
+            from ..efficient_alu_neural import ShiftPrecomputeStage
+            BD = _as_setdim_proxy(dim_positions)
+            composite = builder.ensure(S, BD)
+            composite.precompute_stage = ShiftPrecomputeStage(S, BD, composite.state)
+
+        return Operation(
+            name="l13_alu_shift_precompute",
+            phase=13,
+            reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+                   "OP_SHL", "OP_SHR"},
+            writes=set(),
+            kind="ffn",
+            bake_fn=bake,
+            migrated=True,
+        )
+
+    def make_select():
+        def bake(ffn, dim_positions, S):
+            from ..efficient_alu_neural import ShiftSelectStage
+            BD = _as_setdim_proxy(dim_positions)
+            composite = builder.ensure(S, BD)
+            composite.select_stage = ShiftSelectStage(S, BD, composite.state)
+
+        return Operation(
+            name="l13_alu_shift_select",
+            phase=13,
+            reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+                   "OP_SHL", "OP_SHR"},
+            writes=set(),
+            kind="ffn",
+            bake_fn=bake,
+            migrated=True,
+        )
+
+    def make_getobd():
+        def bake(ffn, dim_positions, S):
+            from ..efficient_alu_neural import ShiftGEToBDStage
+            BD = _as_setdim_proxy(dim_positions)
+            composite = builder.ensure(S, BD)
+            composite.getobd_stage = ShiftGEToBDStage(S, BD, composite.state)
+
+        return Operation(
+            name="l13_alu_shift_getobd",
+            phase=13,
+            reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+                   "OP_SHL", "OP_SHR"},
+            writes={"OUTPUT_LO", "OUTPUT_HI"},
+            kind="ffn",
+            bake_fn=bake,
+            migrated=True,
+        )
+
+    def make_install():
+        def bake(block, dim_positions, S):
+            if builder.composite is None:
+                return  # No stage bakes ran (lookup mode safety).
+            block.ffn = builder.composite
+
+        return Operation(
+            name="l13_alu_shift_install",
+            phase=13.5,
+            reads=set(),
+            writes=set(),
+            kind="block",
+            bake_fn=bake,
+            layer_idx=13,
+            migrated=True,
+        )
+
+    return [
+        make_bdtoge(),
+        make_precompute(),
+        make_select(),
+        make_getobd(),
+        make_install(),
+    ]
+
+
+# Keep individual factory shims for callers that want a single op (e.g.,
+# unit tests). Each returns a fresh builder so the ops aren't entangled.
+def make_l13_alu_shift_bdtoge_op() -> Operation:
+    """L13 FFN stage 1: BD → GenericE format conversion (standalone factory)."""
+    return make_alu_shift_composite_ops()[0]
+
+
+def make_l13_alu_shift_precompute_op() -> Operation:
+    """L13 FFN stage 2: SHL/SHR sub-chunk precompute (standalone factory)."""
+    return make_alu_shift_composite_ops()[1]
+
+
+def make_l13_alu_shift_select_op() -> Operation:
+    """L13 FFN stage 3: shift-select FFN (standalone factory)."""
+    return make_alu_shift_composite_ops()[2]
+
+
+def make_l13_alu_shift_getobd_op() -> Operation:
+    """L13 FFN stage 4: GenericE → BD format conversion (standalone factory)."""
+    return make_alu_shift_composite_ops()[3]
+
+
+def make_l13_alu_shift_install_op() -> Operation:
+    """L13 block op: swap ``model.blocks[13].ffn`` for the composite (standalone factory)."""
+    return make_alu_shift_composite_ops()[4]
 
 
 def make_layer14_mem_generation_op() -> Operation:
@@ -2051,6 +2234,18 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_layer12_mul_combine_op(),
         make_layer13_mem_addr_gather_op(),
         make_layer13_shifts_op(alu_mode=alu_mode),
+        # 4-stage SHL/SHR composite (replaces ALUShift wrapper). Only
+        # meaningful in efficient mode. The 5 ops returned by
+        # ``make_alu_shift_composite_ops`` share a single
+        # ``_ALUShiftCompositeBuilder`` so the kind="block" install op can
+        # hand the fully-constructed composite to ``model.blocks[13].ffn``
+        # regardless of which block the dep analyser placed the kind="ffn"
+        # stage ops at.
+        *(
+            make_alu_shift_composite_ops()
+            if alu_mode == "efficient"
+            else []
+        ),
         make_layer14_mem_generation_op(),
         make_layer15_memory_lookup_op(),
         make_layer16_lev_routing_op(),
