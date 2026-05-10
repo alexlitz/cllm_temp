@@ -1314,6 +1314,275 @@ def make_embedding_bake_op() -> Operation:
     )
 
 
+# ---------------------------------------------------------------------------
+# L11/L12 MUL ALU flattening (2026-05-10)
+#
+# The previous `set_vm_weights` line
+#   model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)  # = ALUMul
+# wrapped 9 logical sub-stages (BD→GE convert, schoolbook partial products,
+# 3 carry-extraction passes, gen/prop, binary carry-lookahead, final
+# correction, GE→BD convert) inside a single `PureNeuralALU(operations='mul')`
+# runtime class. The 9 ops below split that wrapper into discrete compiler
+# operations:
+#
+#   phase=11.0  install BD → GE converter         (FlattenedALUMul.bd_to_ge)
+#   phase=11.1  append SchoolbookFFN              (mul_layers[0])
+#   phase=11.2  append CarryPassFFN(pass_idx=0)   (mul_layers[1])
+#   phase=11.3  append CarryPassFFN(pass_idx=1)   (mul_layers[2])
+#   phase=11.4  append CarryPassFFN(pass_idx=2)   (mul_layers[3])
+#   phase=12.0  append MulGenPropFFN              (mul_layers[4])
+#   phase=12.1  append MulBinaryLookaheadFFN      (mul_layers[5])
+#   phase=12.2  append MulFinalCorrectionFFN      (mul_layers[6])
+#   phase=12.3  install GE → BD converter         (FlattenedALUMul.ge_to_bd)
+#
+# All nine are kind="block", layer_idx=11. Block ops are dispatched after
+# per-layer ops and BEFORE legacy_bake (model op, phase=999), so the flattened
+# module is fully assembled by the time legacy_bake's `set_vm_weights` runs
+# (which no longer touches `model.blocks[11].ffn` for MUL).
+#
+# Forward is byte-identical to the previous ALUMul wrapper — see
+# `FlattenedALUMul.forward` in efficient_alu_neural.py.
+#
+# fp32 only: NIBBLE config keeps dtype = fp32 throughout. CarryPassFFN's
+# fp64-upcast guard (`S * max_value > 2**23`) does not trigger for NIBBLE
+# (max S * max_value ≈ 100 * 1807 = 180700 << 8388608), so all 7 sub-FFNs
+# build fp32 weights and run fp32 forward.
+# ---------------------------------------------------------------------------
+
+def _ensure_l11_mul_module(block, S):
+    """Get or install the FlattenedALUMul module on ``block.ffn``.
+
+    The 9 phase-ordered installer ops each call this helper; the first one
+    (lowest phase) installs the module, the rest re-use it. Idempotent.
+    """
+    from ..efficient_alu_neural import FlattenedALUMul
+    from ..vm_step import _SetDim
+    existing = getattr(block, "ffn", None)
+    if isinstance(existing, FlattenedALUMul):
+        return existing
+    module = FlattenedALUMul(S, _SetDim)
+    block.ffn = module
+    return module
+
+
+def make_l11_alu_mul_bdtoge_op() -> Operation:
+    """phase=11.0: install BD → GE converter on the L11 flattened MUL FFN.
+
+    First op in the chain — instantiates the FlattenedALUMul wrapper on
+    ``block.ffn`` and bakes its `bd_to_ge` sub-FFN (which one-hot → scalar
+    converts ALU_LO/HI and AX_CARRY_LO/HI into the GenericE NIB_A/NIB_B
+    slots used by the schoolbook + carry pipeline).
+
+    Equivalent to the construction of ``self.bd_to_ge`` inside
+    ``PureNeuralALU.__init__(operations='mul')``.
+    """
+    def bake(block, dim_positions, S):
+        module = _ensure_l11_mul_module(block, S)
+        module.install_bdtoge()
+
+    return Operation(
+        name="l11_alu_mul_bdtoge",
+        reads={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=11.0,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
+def make_l11_alu_mul_schoolbook_op() -> Operation:
+    """phase=11.1: append the schoolbook partial-product FFN.
+
+    Computes all N*(N+1)/2 partial products a[i]*b[j] for output position
+    k=i+j, sums them into RESULT[k]. Equivalent to ``layers[0]`` from
+    ``build_mul_layers(NIBBLE, opcode=27)``.
+    """
+    def bake(block, dim_positions, S):
+        module = _ensure_l11_mul_module(block, S)
+        module.install_schoolbook()
+
+    return Operation(
+        name="l11_alu_mul_schoolbook",
+        reads={"OP_MUL"},
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=11.1,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
+def make_l11_alu_mul_carrypass1_op() -> Operation:
+    """phase=11.2: append CarryPassFFN(pass_idx=0).
+
+    First carry-extraction pass; max_carry = 112 for NIBBLE schoolbook
+    output (8 * 15 * 15 // 16 = 112). No incoming carry to add (pass_idx==0).
+    Equivalent to ``layers[1]`` from ``build_mul_layers(NIBBLE, opcode=27)``.
+    """
+    def bake(block, dim_positions, S):
+        module = _ensure_l11_mul_module(block, S)
+        module.install_carrypass(pass_idx=0)
+
+    return Operation(
+        name="l11_alu_mul_carrypass1",
+        reads={"OP_MUL"},
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=11.2,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
+def make_l11_alu_mul_carrypass2_op() -> Operation:
+    """phase=11.3: append CarryPassFFN(pass_idx=1).
+
+    Second carry-extraction pass; max_carry = 7 (= ((base-1) + 112) // base
+    = (15 + 112) // 16). Adds incoming CARRY_OUT from pass 0 to RESULT
+    before extracting new carry. Equivalent to ``layers[2]`` from
+    ``build_mul_layers(NIBBLE, opcode=27)``.
+    """
+    def bake(block, dim_positions, S):
+        module = _ensure_l11_mul_module(block, S)
+        module.install_carrypass(pass_idx=1)
+
+    return Operation(
+        name="l11_alu_mul_carrypass2",
+        reads={"OP_MUL"},
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=11.3,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
+def make_l11_alu_mul_carrypass3_op() -> Operation:
+    """phase=11.4: append CarryPassFFN(pass_idx=2).
+
+    Third carry-extraction pass; max_carry = 1 (= ((base-1) + 7) // base
+    = (15 + 7) // 16). Final carry-extraction pass for NIBBLE; ensures
+    incoming carry to GenProp is <= 1 so the binary lookahead correctness
+    invariant holds. Equivalent to ``layers[3]`` from
+    ``build_mul_layers(NIBBLE, opcode=27)``.
+    """
+    def bake(block, dim_positions, S):
+        module = _ensure_l11_mul_module(block, S)
+        module.install_carrypass(pass_idx=2)
+
+    return Operation(
+        name="l11_alu_mul_carrypass3",
+        reads={"OP_MUL"},
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=11.4,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
+def make_l12_alu_mul_genprop_op() -> Operation:
+    """phase=12.0: append the gen/prop FFN.
+
+    Adds incoming carry from the last carry pass, computes G[i] (RESULT
+    + carry >= base → CARRY_OUT) and P[i] (RESULT + carry == base-1 →
+    TEMP) for the binary carry chain, applies mod-base correction. Equivalent
+    to ``layers[4]`` from ``build_mul_layers(NIBBLE, opcode=27)``.
+    """
+    def bake(block, dim_positions, S):
+        module = _ensure_l11_mul_module(block, S)
+        module.install_genprop()
+
+    return Operation(
+        name="l12_alu_mul_genprop",
+        reads={"OP_MUL"},
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=12.0,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
+def make_l12_alu_mul_binarylookahead_op() -> Operation:
+    """phase=12.1: append the binary carry-lookahead FFN.
+
+    Computes carries C[i] for i=1..N-1 from G/P pairs via N*(N-1)/2
+    AND-gate hidden units, writes them into CARRY_IN, clears G (CARRY_OUT)
+    and P (TEMP). Equivalent to ``layers[5]`` from
+    ``build_mul_layers(NIBBLE, opcode=27)``.
+    """
+    def bake(block, dim_positions, S):
+        module = _ensure_l11_mul_module(block, S)
+        module.install_binarylookahead()
+
+    return Operation(
+        name="l12_alu_mul_binarylookahead",
+        reads={"OP_MUL"},
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=12.1,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
+def make_l12_alu_mul_finalcorrection_op() -> Operation:
+    """phase=12.2: append the final-correction FFN.
+
+    Adds CARRY_IN from the lookahead to RESULT, applies mod-base
+    correction (subtract base when sum >= base), clears CARRY_IN.
+    Equivalent to ``layers[6]`` from ``build_mul_layers(NIBBLE, opcode=27)``.
+    """
+    def bake(block, dim_positions, S):
+        module = _ensure_l11_mul_module(block, S)
+        module.install_finalcorrection()
+
+    return Operation(
+        name="l12_alu_mul_finalcorrection",
+        reads={"OP_MUL"},
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=12.2,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
+def make_l12_alu_mul_getobd_op() -> Operation:
+    """phase=12.3: install GE → BD converter on the L11 flattened MUL FFN.
+
+    Final stage: convert RESULT scalar back to one-hot OUTPUT_LO/HI in BD
+    format (using step-pair detection per nibble value), gated on OP_MUL
+    AND on MARK_AX (so non-AX positions are untouched). Equivalent to the
+    construction of ``self.ge_to_bd`` inside
+    ``PureNeuralALU.__init__(operations='mul')``.
+    """
+    def bake(block, dim_positions, S):
+        module = _ensure_l11_mul_module(block, S)
+        module.install_getobd()
+
+    return Operation(
+        name="l12_alu_mul_getobd",
+        reads=set(),
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        phase=12.3,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
 def make_legacy_bake_op(
     *,
     alu_mode: str = "lookup",

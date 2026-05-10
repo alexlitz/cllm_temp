@@ -490,8 +490,197 @@ class ALUAndOrXor(PureNeuralALU):
         super().__init__(S, BD, operations='bitwise')
 
 
+class FlattenedALUMul(nn.Module):
+    """Flattened (compiler-baked) MUL ALU.
+
+    Byte-identical to ``ALUMul.forward`` (= ``PureNeuralALU(operations='mul').forward``)
+    but exposes the BD↔GE converters and the 7 sub-FFN MUL pipeline stages as
+    individually-installable submodules so the unified compiler can bake each
+    stage as a discrete ``Operation``.
+
+    Sub-stages, installed by 9 compiler block ops:
+
+      - ``bd_to_ge``:           ``BDToGEConverter`` — phase=11.0
+      - ``mul_layers[0]``:      ``SchoolbookFFN``           — phase=11.1
+      - ``mul_layers[1]``:      ``CarryPassFFN(pass_idx=0)``— phase=11.2
+      - ``mul_layers[2]``:      ``CarryPassFFN(pass_idx=1)``— phase=11.3
+      - ``mul_layers[3]``:      ``CarryPassFFN(pass_idx=2)``— phase=11.4
+      - ``mul_layers[4]``:      ``MulGenPropFFN``           — phase=12.0
+      - ``mul_layers[5]``:      ``MulBinaryLookaheadFFN``   — phase=12.1
+      - ``mul_layers[6]``:      ``MulFinalCorrectionFFN``   — phase=12.2
+      - ``ge_to_bd``:           ``GEToBDConverter``         — phase=12.3
+
+    NIBBLE config produces exactly 3 carry passes (verified via
+    ``_compute_carry_passes(NIBBLE) == [112, 7, 1]``), so the pipeline has
+    the canonical 7-stage shape (1 schoolbook + 3 carry + 1 genprop +
+    1 lookahead + 1 final-correction). The ops sort by phase (11.0 .. 12.3)
+    and bind to L11 via ``layer_idx=11`` since the runtime collapses them
+    into a single block forward pass (matching the previous ``ALUMul``
+    that ran as one ``model.blocks[11].ffn`` call).
+
+    Forward replicates the ``PureNeuralALU`` mul branch byte-for-byte
+    (same 0.1-threshold opcode normalization, same MARK_AX-only OUTPUT
+    gating).
+    """
+
+    def __init__(self, S, BD):
+        super().__init__()
+        self.S = S
+        self.BD = BD
+        self.ge = GenericE(NIBBLE)
+
+        # Sub-stages filled in by 9 compiler ops. Each install_* mutates one
+        # slot or appends to mul_layers. Forward raises if any is missing so
+        # a partial bake fails loudly.
+        self.bd_to_ge = None        # phase=11.0 — BDToGEConverter
+        # mul_layers fills in append order across phases 11.1 .. 12.2.
+        self.mul_layers = nn.ModuleList()
+        self.ge_to_bd = None        # phase=12.3 — GEToBDConverter
+
+    # --- Per-stage installers (called by compiler ops) -----------------
+
+    def install_bdtoge(self):
+        """phase=11.0: install BD → GE converter."""
+        self.bd_to_ge = BDToGEConverter(self.BD, self.ge)
+
+    def install_schoolbook(self):
+        """phase=11.1: append the schoolbook partial-product stage."""
+        from .alu.ops.mul import SchoolbookFFN
+        assert len(self.mul_layers) == 0, (
+            f"Expected schoolbook to be the first mul layer; "
+            f"already installed {len(self.mul_layers)} layers"
+        )
+        self.mul_layers.append(SchoolbookFFN(self.ge, opcode=27))
+
+    def install_carrypass(self, pass_idx: int):
+        """phase=11.2/11.3/11.4: append the i-th carry pass (i=0,1,2)."""
+        from .alu.ops.mul import CarryPassFFN, _compute_carry_passes
+        passes = _compute_carry_passes(self.ge.config)
+        assert pass_idx < len(passes), (
+            f"NIBBLE config has {len(passes)} carry passes; "
+            f"asked for pass_idx={pass_idx}"
+        )
+        # Slot index in mul_layers: 1 (schoolbook) + pass_idx
+        expected_len = 1 + pass_idx
+        assert len(self.mul_layers) == expected_len, (
+            f"Expected mul_layers length {expected_len} before installing "
+            f"carrypass {pass_idx}; got {len(self.mul_layers)}"
+        )
+        self.mul_layers.append(
+            CarryPassFFN(self.ge, opcode=27,
+                         max_carry=passes[pass_idx], pass_idx=pass_idx)
+        )
+
+    def install_genprop(self):
+        """phase=12.0: append the gen/prop stage."""
+        from .alu.ops.mul import MulGenPropFFN, _compute_carry_passes
+        n_passes = len(_compute_carry_passes(self.ge.config))
+        expected_len = 1 + n_passes
+        assert len(self.mul_layers) == expected_len, (
+            f"Expected mul_layers length {expected_len} before genprop; "
+            f"got {len(self.mul_layers)}"
+        )
+        self.mul_layers.append(MulGenPropFFN(self.ge, opcode=27))
+
+    def install_binarylookahead(self):
+        """phase=12.1: append the binary carry-lookahead stage."""
+        from .alu.ops.mul import MulBinaryLookaheadFFN, _compute_carry_passes
+        n_passes = len(_compute_carry_passes(self.ge.config))
+        expected_len = 2 + n_passes
+        assert len(self.mul_layers) == expected_len, (
+            f"Expected mul_layers length {expected_len} before lookahead; "
+            f"got {len(self.mul_layers)}"
+        )
+        self.mul_layers.append(MulBinaryLookaheadFFN(self.ge, opcode=27))
+
+    def install_finalcorrection(self):
+        """phase=12.2: append the final-correction stage."""
+        from .alu.ops.mul import MulFinalCorrectionFFN, _compute_carry_passes
+        n_passes = len(_compute_carry_passes(self.ge.config))
+        expected_len = 3 + n_passes
+        assert len(self.mul_layers) == expected_len, (
+            f"Expected mul_layers length {expected_len} before "
+            f"final-correction; got {len(self.mul_layers)}"
+        )
+        self.mul_layers.append(MulFinalCorrectionFFN(self.ge, opcode=27))
+
+    def install_getobd(self):
+        """phase=12.3: install GE → BD converter."""
+        self.ge_to_bd = GEToBDConverter(self.BD, self.ge, self.S)
+
+    # --- Forward (byte-identical to PureNeuralALU mul branch) ----------
+
+    def forward(self, x_bd):
+        if (self.bd_to_ge is None or self.ge_to_bd is None or
+                len(self.mul_layers) == 0):
+            missing = []
+            if self.bd_to_ge is None:
+                missing.append('bd_to_ge')
+            if len(self.mul_layers) == 0:
+                missing.append('mul_layers')
+            if self.ge_to_bd is None:
+                missing.append('ge_to_bd')
+            raise RuntimeError(
+                f"FlattenedALUMul: missing stages {missing}. "
+                "All 9 compiler ops (phase 11.0..12.3) must run before "
+                "forward()."
+            )
+
+        B, seq_len, _ = x_bd.shape
+        BD = self.BD
+
+        # Convert BD → GE format
+        x_ge = self.bd_to_ge(x_bd)  # [B, seq_len, 8, 160]
+        x_ge_flat = x_ge.view(B * seq_len, 8, self.ge.DIM)
+
+        x_ge_out = x_ge_flat.clone()
+
+        # Run 7-stage MUL pipeline (schoolbook + 3 carry + genprop +
+        # lookahead + final-correction).
+        x_mul = x_ge_flat.clone()
+        for layer in self.mul_layers:
+            x_mul = layer(x_mul)
+
+        # FIX 2026-05-06: Normalize opcode values to 0/1.
+        op_mul = (x_ge_flat[:, 0, self.ge.OP_START + 27] > 0.1).float()
+
+        x_ge_out[:, :, self.ge.RESULT] = (
+            x_mul[:, :, self.ge.RESULT] * op_mul[:, None]
+        )
+
+        opcode_mask_flat = op_mul
+
+        # Reshape back
+        x_ge_out = x_ge_out.view(B, seq_len, 8, self.ge.DIM)
+        opcode_mask = opcode_mask_flat.view(B, seq_len)
+
+        # Only write OUTPUT at AX marker positions (MARK_AX > 0.5).
+        mark_ax = x_bd[:, :, BD.MARK_AX]
+        opcode_mask = opcode_mask * (mark_ax > 0.5).float()
+
+        x_bd_out = self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
+        return x_bd_out
+
+    # Stub methods for compatibility with vm_step.py (mirror PureNeuralALU).
+    def compact(self, block_size=1):
+        pass
+
+    def sparsify(self):
+        pass
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        pass
+
+
 class ALUMul(PureNeuralALU):
-    """Neural MUL."""
+    """Neural MUL.
+
+    DEPRECATED 2026-05-10: kept for back-compat only. Use
+    ``FlattenedALUMul`` (assembled by 9 compiler ops at L11 phases
+    11.0/11.1/11.2/11.3/11.4/12.0/12.1/12.2/12.3) instead. ``set_vm_weights``
+    no longer instantiates this class — the compiler installs the flattened
+    version via ``make_l11_alu_mul_*`` / ``make_l12_alu_mul_*`` ops.
+    """
     def __init__(self, S, BD):
         super().__init__(S, BD, operations='mul')
 
