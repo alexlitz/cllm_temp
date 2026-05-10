@@ -554,6 +554,34 @@ class BinaryOpByteZeroingPostOp(PureFFN):
             self.b_up.data[unit] = -S * 1.5
             for d in op_dims:
                 self.W_gate.data[unit, d] = 1.0
+            # FIX 2026-05-10 (Phase 2 bitwise deep): Add TEMP[3] (relayed BITWISE_OP
+            # from L7 head 5) to the gate so AND/OR/XOR also clear OUTPUT at AX
+            # bytes 1-3.
+            #
+            # Why this is needed: For tests like `255 & 255 = 255` (operands and
+            # result both 8-bit), the chain is
+            #   ALUAndOrXor (block 11) writes byte-0 result at marker only
+            #     -> L10 head 1 passthrough copies prev AX bytes 1-3 (== 0 OK)
+            #     -> BinaryOpByteZeroingPostOp skipped (op_dims excluded bitwise)
+            #     -> CarryPropagationPostOp skipped (suppressed by TEMP[3])
+            #     -> BitwiseBytePropagationPostOp gated on TEMP[4..6]
+            # When the L7 head 5 relay (V scaled by 0.2) does not deliver a strong
+            # enough TEMP[4..6] at byte positions (e.g., attention dilution from
+            # multiple AX markers in a long context), bytes 1-3 retain corrupted
+            # passthrough values, producing 0xFFFFFFF0 instead of 0xFF for
+            # `255 & 255 = 255` and similar.
+            #
+            # Adding TEMP[3] to the gate makes this post-op zero bytes 1-3 for
+            # bitwise ops too, putting OUTPUT in a clean state. The later
+            # BitwiseBytePropagationPostOp (block 16) is still free to recompute
+            # bytes 1-3 for genuine multi-byte bitwise operands; for IMM-based
+            # 8-bit operands (where bytes 1-3 should be 0) we are now correct
+            # regardless of the relay's reliability at byte positions.
+            #
+            # Unlike OP_AND/OR/XOR (only at the AX marker), TEMP[3] IS broadcast
+            # to AX byte positions by L7 head 5, so it can reliably gate this
+            # FFN at byte positions.
+            self.W_gate.data[unit, BD.TEMP + 3] = 1.0
 
         for k in range(16):
             self.W_down.data[BD.OUTPUT_LO + k, 0] = -3.0 / S
