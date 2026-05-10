@@ -2186,12 +2186,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # All three share `block.ffn._l14_unit_counter` so they chain unit
     # assignments across the migrated bake_fns.
     ffn14 = model.blocks[14].ffn
-    # FIX 2026-05-10: Cancel L14 attention's -115 OUTPUT corruption at MEM marker
-    # for OP_JSR/OP_ENT (no actual store; L14 attn fires anyway because MEM_STORE=2).
-    # Reads the unit counter populated by the migrated ops; falls back to 0 in
-    # the legacy direct-set_vm_weights path (where the migrated ops didn't run).
-    next_unit = getattr(ffn14, '_l14_unit_counter', 0)
-    _set_layer14_clear_mem_marker_output(ffn14, S, BD, start_unit=next_unit)
+    # _set_layer14_clear_mem_marker_output moved to compiler dispatch
+    # (make_layer14_clear_mem_marker_output_op, kind="block", layer_idx=14,
+    # migrated=True, phase=14.4). The op chains via `block.ffn._l14_unit_counter`
+    # with the other L14 cleanup ops (temp_clear/clear_addr_key/clear_output).
 
     # ===== LAYER 15: Memory lookup (softmax1 + ALiBi) =====
     # The 8->12 head LEV resize is a compiler block op now
@@ -2203,7 +2201,9 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # _set_layer15_memory_lookup moved to compiler dispatch
     # (make_layer15_memory_lookup_op, migrated=True)
     ffn15 = model.blocks[15].ffn
-    _set_nibble_copy_ffn(ffn15, S, BD)
+    # _set_nibble_copy_ffn moved to compiler dispatch
+    # (make_layer15_nibble_copy_op, kind="block", layer_idx=15, migrated=True,
+    # phase=15).
 
     # Conversational I/O: Output routing (OUTPUT_BYTE → OUTPUT)
     if enable_conversational_io:
