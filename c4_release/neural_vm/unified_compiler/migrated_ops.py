@@ -2079,6 +2079,38 @@ def make_l12_alu_mul_getobd_op() -> Operation:
     )
 
 
+def make_function_call_weights_op() -> Operation:
+    """Bake function-call opcode weights (JSR, ENT, LEV, LEA).
+
+    Originally an inline call in `set_vm_weights`:
+        `_set_function_call_weights(model, S, BD, HD)`
+
+    Operates across multiple blocks (L5 attn, L6 attn, L6 ffn) so this is a
+    model-level op.
+
+    Phase 998: runs just BEFORE legacy_bake (999) so that the L6 FFN units
+    we program (1700-2158) are present when `_right_size_ffns` (called at the
+    end of legacy_bake) prunes dead units. Running at phase > 999 would write
+    into already-rightsized FFN slots that no longer exist (IndexError).
+    """
+    def bake(model, dim_positions, S):
+        from ..vm_step import _set_function_call_weights
+        proxy = _as_setdim_proxy(dim_positions)
+        attn5 = model.blocks[5].attn
+        HD = attn5.W_q.shape[0] // attn5.num_heads
+        _set_function_call_weights(model, S, proxy, HD)
+
+    return Operation(
+        name="function_call_weights",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=998,
+        migrated=True,
+    )
+
+
 def make_legacy_bake_op(
     *,
     alu_mode: str = "lookup",
@@ -2435,6 +2467,9 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         # L15 attention resize: 8 heads -> 12 heads for LEV (phase=14.9 so it
         # fires before _set_layer15_memory_lookup populates the heads).
         make_l15_attention_resize_op(),
+        # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
+        # FFN unit writes survive the rightsize pass at end of legacy_bake.
+        make_function_call_weights_op(),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),

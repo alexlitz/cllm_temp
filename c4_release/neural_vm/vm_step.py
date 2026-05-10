@@ -1921,8 +1921,11 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # Binary pop SP increment (L6 FFN: SP += 8 for binary pop ops)
     _set_binary_pop_sp_increment(ffn6, S, BD)
 
-    # Function call opcodes (JSR, ENT, LEV, LEA)
-    _set_function_call_weights(model, S, BD, HD)
+    # Function call opcodes (JSR, ENT, LEV, LEA) — migrated to compiler op
+    # `make_function_call_weights_op` in `unified_compiler/migrated_ops.py`
+    # (kind="model", phase=998 — runs just BEFORE this legacy_bake's
+    # _right_size_ffns so the FFN unit writes survive). Inline call removed
+    # to avoid double-bake.
 
     # Note: GETCHAR is runner-side IO (see run_vm.py). The runner detects
     # GETCHAR opcodes via PC tracking and injects stdin bytes into context.
