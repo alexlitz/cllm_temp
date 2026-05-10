@@ -881,7 +881,7 @@ def make_alu_shift_composite_ops():
             from ..efficient_alu_neural import ShiftBDToGEStage
             BD = _as_setdim_proxy(dim_positions)
             composite = builder.ensure(S, BD)
-            composite.bdtoge_stage = ShiftBDToGEStage(S, BD, composite.state)
+            composite.bdtoge_stage = ShiftBDToGEStage(S, BD)
 
         return Operation(
             name="l13_alu_shift_bdtoge",
@@ -899,7 +899,7 @@ def make_alu_shift_composite_ops():
             from ..efficient_alu_neural import ShiftPrecomputeStage
             BD = _as_setdim_proxy(dim_positions)
             composite = builder.ensure(S, BD)
-            composite.precompute_stage = ShiftPrecomputeStage(S, BD, composite.state)
+            composite.precompute_stage = ShiftPrecomputeStage(S, BD)
 
         return Operation(
             name="l13_alu_shift_precompute",
@@ -917,7 +917,7 @@ def make_alu_shift_composite_ops():
             from ..efficient_alu_neural import ShiftSelectStage
             BD = _as_setdim_proxy(dim_positions)
             composite = builder.ensure(S, BD)
-            composite.select_stage = ShiftSelectStage(S, BD, composite.state)
+            composite.select_stage = ShiftSelectStage(S, BD)
 
         return Operation(
             name="l13_alu_shift_select",
@@ -935,7 +935,7 @@ def make_alu_shift_composite_ops():
             from ..efficient_alu_neural import ShiftGEToBDStage
             BD = _as_setdim_proxy(dim_positions)
             composite = builder.ensure(S, BD)
-            composite.getobd_stage = ShiftGEToBDStage(S, BD, composite.state)
+            composite.getobd_stage = ShiftGEToBDStage(S, BD)
 
         return Operation(
             name="l13_alu_shift_getobd",
