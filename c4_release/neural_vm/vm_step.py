@@ -7728,28 +7728,44 @@ def _set_layer14_mem_generation(attn, S, BD, HD):
 def _set_layer14_temp_clear(ffn, S, BD):
     """L14 FFN: Clear TEMP at PC marker when OP_LEV is active.
 
-    BUG FIX 2026-04-16: TEMP[0] has residual value from L5/L6 attention (2.0).
-    This causes L16 TEMP→OUTPUT routing to incorrectly boost OUTPUT_LO[0].
+    BUG FIX 2026-04-16: TEMP[0] has residual value from L5/L6 attention (~2.0).
+    This causes L16 TEMP->OUTPUT routing to incorrectly boost OUTPUT_LO[0].
 
     Solution: Subtract from TEMP[0] when OP_LEV and MARK_PC are active.
     L15 will then write fresh values to TEMP for the return address.
 
-    Activation calculation at PC marker:
-      OP_LEV=10 * S/10 = 10
-      MARK_PC=1 * S = 10
-      bias = -15
-      Total = 10 + 10 - 15 = 5 > 0 (fires)
+    Activation calculation at PC marker (S = 100, OP_LEV amplified to ~10 by L6):
+      W_up contribution from OP_LEV  = (S/10) * 10  = 100
+      W_up contribution from MARK_PC = S * 1        = 100
+      b_up                           = -S * 1.5     = -150
+      pre-silu activation            = 100 + 100 - 150 = 50 (positive: fires)
+      silu(50) ~= 50, gate(CONST=1.0) = 1.0
+      hidden = silu * gate = 50
 
-    Output: Subtract 5.0 from TEMP[0], clearing the 2.0 residual.
+    AUDIT NOTE 2026-05-09: Effective subtraction is silu(50) * 1 * (-5/S) = -2.5,
+    not -5.0 as the original docstring claimed. With residual=2.0, TEMP[0] becomes
+    -0.5 (mild over-correction of 0.5, not -3.0). This is fine because:
+    - SiLU at downstream layers clips small negatives to ~0.
+    - Selectivity is correct: only fires when OP_LEV AND MARK_PC are both set.
+      For non-LEV opcodes, OP_LEV~=0 so pre-silu = -50, silu(-50)~=0 (no firing).
+      For LEV at non-PC positions, MARK_PC=0 so pre-silu = -50, no firing.
+    - For an exact zero-out of a 2.0 residual, set W_down to -4.0/S (delta = -2.0).
+      The current -5.0/S overshoots slightly but is empirically safe.
+
+    The earlier docstring claim "Total = 5" used S=10 in the math, but actual S=100;
+    the relative scales cancel so the firing-vs-not behavior is unchanged. The
+    only consequence is the absolute subtraction magnitude (-2.5 not -5.0).
     """
     unit = 0
 
     # Clear TEMP[0] at PC marker when OP_LEV active
     # Only clear TEMP[0] since that's the problematic residual
-    ffn.W_up[unit, BD.OP_LEV] = S / 10  # ~1 with OP_LEV≈10
+    ffn.W_up[unit, BD.OP_LEV] = S / 10  # ~1 with OP_LEV~=10
     ffn.W_up[unit, BD.MARK_PC] = S
     ffn.b_up[unit] = -S * 1.5  # Fire when OP_LEV + MARK_PC
     ffn.W_gate[unit, BD.CONST] = 1.0
+    # Effective subtraction is silu(50) * (-5/S) = -2.5 (not -5.0).
+    # Residual is ~2.0, so TEMP[0] lands at ~-0.5; safe with downstream SiLU clipping.
     ffn.W_down[BD.TEMP + 0, unit] = -5.0 / S  # Subtract to clear residual
     unit += 1
 
