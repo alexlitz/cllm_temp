@@ -758,38 +758,80 @@ def make_layer9_alu_op() -> Operation:
 
 
 def make_layer9_lev_addr_relay_op() -> Operation:
-    """L9 attention head 0: BP byte 0 → ADDR_B0 at SP marker for LEV."""
-    def bake(attn, dim_positions, S):
+    """L9 attention head 0: BP byte 0 → ADDR_B0 at SP marker for LEV.
+
+    Originally an inline call inside ``set_vm_weights`` (in the
+    ``alu_mode == 'lookup'`` branch):
+        ``_set_layer9_lev_addr_relay(attn9, S, BD, HD)``
+
+    Migrated as ``kind="block"`` pinned to ``layer_idx=9`` with
+    ``migrated=True``: the inline call has been removed to avoid
+    double-bake. Phase=9.0 to preserve ordering with sibling
+    ``layer9_lev_bp_to_pc_relay`` (phase=9.1). Fires in both lookup
+    and efficient ALU modes — the helper performs identical setup
+    regardless of alu_mode, and the model is built once.
+
+    Also sets ``alibi_slopes[0] = 0.2`` (shallow slope for d=29 relay
+    from SP marker back to previous BP byte 0); previously set inline
+    alongside the legacy bake call.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer9_lev_addr_relay
+        attn = block.attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[0] = 0.2  # head 0: shallow slope for d=29 relay
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer9_lev_addr_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
 
     return Operation(
         name="layer9_lev_addr_relay",
-        phase=9,
+        phase=9.0,
         reads={"MARK_SP", "OP_LEV", "L1H1", "BYTE_INDEX_0",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
-        kind="attn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=9,
+        migrated=True,
     )
 
 
 def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
-    """L9 attention head 1: BP byte 0 → ADDR_B0 at PC marker for LEV return."""
-    def bake(attn, dim_positions, S):
+    """L9 attention head 1: BP byte 0 → ADDR_B0 at PC marker for LEV return.
+
+    Originally an inline call inside ``set_vm_weights`` (in the
+    ``alu_mode == 'lookup'`` branch):
+        ``_set_layer9_lev_bp_to_pc_relay(attn9, S, BD, HD)``
+
+    Migrated as ``kind="block"`` pinned to ``layer_idx=9`` with
+    ``migrated=True``: the inline call has been removed to avoid
+    double-bake. Phase=9.1 so this op runs AFTER
+    ``layer9_lev_addr_relay`` (phase=9.0), matching the legacy
+    in-set_vm_weights ordering. Fires in both lookup and efficient
+    ALU modes — the helper performs identical setup regardless of
+    alu_mode.
+
+    Also sets ``alibi_slopes[1] = 0.5`` (BP→PC relay slope for d=15
+    tokens); previously set inline alongside the legacy bake call.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer9_lev_bp_to_pc_relay
+        attn = block.attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[1] = 0.5  # head 1: BP→PC relay for LEV (d=15 tokens)
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer9_lev_bp_to_pc_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
 
     return Operation(
         name="layer9_lev_bp_to_pc_relay",
-        phase=9,
+        phase=9.1,
         reads={"MARK_PC", "OP_LEV", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "L1H1", "BYTE_INDEX_0"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
-        kind="attn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=9,
+        migrated=True,
     )
 
 
