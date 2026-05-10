@@ -325,6 +325,9 @@ def make_layer7_operand_gather_op() -> Operation:
     """L7 attention: operand A gather (prev STACK0 byte 0 → ALU at AX marker)."""
     def bake(attn, dim_positions, S):
         from ..vm_step import _set_layer7_operand_gather
+        # Set ALiBi slopes (originally set in set_vm_weights before the bake call).
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer7_operand_gather(attn, S, _as_setdim_proxy(dim_positions), HD)
 
@@ -344,6 +347,12 @@ def make_layer7_memory_heads_op() -> Operation:
     """L7 attention heads 1-6: memory + flag broadcast heads."""
     def bake(attn, dim_positions, S):
         from ..vm_step import _set_layer7_memory_heads
+        # Per-head ALiBi slopes (originally set in set_vm_weights between the
+        # operand-gather and memory-heads bake calls).
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[1] = 5.0  # head 1: MEM flag broadcast
+            attn.alibi_slopes[5] = 5.0  # head 5: LI/LC flag relay
+            attn.alibi_slopes[6] = 5.0  # head 6: PSH/store flag relay
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer7_memory_heads(attn, S, _as_setdim_proxy(dim_positions), HD)
 
