@@ -1880,92 +1880,13 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     _set_layer2_mem_byte_flags(ffn2, S, BD)
 
     # ===== LAYER 3: Register carry-forward (PC, AX, SP, BP) + PC update =====
-    # All carry-forwards in one layer so values are available for later layers.
-    attn3 = model.blocks[3].attn
-    if hasattr(attn3, 'alibi_slopes') and attn3.alibi_slopes is not None:
-        attn3.alibi_slopes.fill_(0.5)
-    PC_I, AX_I, SP_I, BP_I = 0, 1, 2, 3
-    # Head 0: PC carry (prev step PC byte 0 → EMBED at PC marker)
-    _set_carry_forward_attn(
-        attn3, 0, BD.MARK_PC, PC_I, PC_I, HD, BD.EMBED_LO, BD.EMBED_HI
-    )
-    # Head 1: AX carry (prev step AX byte 0 EMBED → AX_CARRY staging)
-    # Uses EMBED (not OUTPUT) because at byte positions, OUTPUT is 0 - the computed
-    # result was at the marker position during generation. Once the byte token is
-    # generated and re-embedded, EMBED has the correct value (byte tokens embed to
-    # their byte value in EMBED_LO/HI).
-    _set_carry_forward_attn(
-        attn3, 1, BD.MARK_AX, AX_I, AX_I, HD, BD.AX_CARRY_LO, BD.AX_CARRY_HI
-    )
-    # Head 2: SP carry (prev step SP byte 0 → EMBED at SP marker)
-    _set_carry_forward_attn(
-        attn3, 2, BD.MARK_SP, SP_I, SP_I, HD, BD.EMBED_LO, BD.EMBED_HI
-    )
-    # Head 3: BP carry (prev step BP byte 0 → EMBED at BP marker)
-    _set_carry_forward_attn(
-        attn3, 3, BD.MARK_BP, BP_I, BP_I, HD, BD.EMBED_LO, BD.EMBED_HI
-    )
-    # Head 4: STACK0 carry (prev step STACK0 byte 0 → EMBED at STACK0 marker)
-    # Uses STACK0_BYTE0 flag (computed in L1 FFN) as key instead of L1H1/L1H0.
-    _set_stack0_carry_attn(attn3, 4, HD)
-
-    # Head 5: AX full value relay (prev AX marker OUTPUT → current AX marker AX_FULL)
-    # FIX 2026-04-09: Dedicated dimension (AX_FULL) to avoid conflict with head 1's AX_CARRY.
-    # Previous attempt wrote to AX_CARRY causing additivity conflict (both heads writing
-    # to same dims with total weight 3.0x), resulting in "predictions became all 1's".
-    # Now uses separate AX_FULL dims for PSH STACK0 = AX operation.
-    base = 5 * HD
-    L = 15.0
-    # Q: Fire at AX marker on subsequent steps only (HAS_SE=1)
-    attn3.W_q[base, BD.MARK_AX] = L
-    attn3.W_q[base, BD.HAS_SE] = L
-    attn3.W_q[base, BD.CONST] = -L * 1.5  # Threshold: need both MARK_AX and HAS_SE
-    # K: Match previous step's AX marker
-    attn3.W_k[base, BD.MARK_AX] = L
-    # V: Copy OUTPUT_LO/HI from previous AX marker (the final register value)
-    for k in range(16):
-        attn3.W_v[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
-        attn3.W_v[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
-    # O: Write to AX_FULL_LO/HI (NEW - no conflict with head 1!)
-    for k in range(16):
-        attn3.W_o[BD.AX_FULL_LO + k, base + 1 + k] = 1.0
-        attn3.W_o[BD.AX_FULL_HI + k, base + 17 + k] = 1.0
-    # Anti-leakage gate
-    GATE = 33
-    attn3.W_q[base + GATE, BD.MARK_AX] = L
-    attn3.W_q[base + GATE, BD.CONST] = -L / 2
-    attn3.W_k[base + GATE, BD.CONST] = L
-
-    # FIX 2026-04-15: Head 6: BP carry to PC marker for LEV return_addr lookup
-    # When OP_LEV is active, copy prev step's BP byte 0 to OUTPUT at PC marker.
-    # This is needed because PC marker comes BEFORE AX marker in step output,
-    # so L8 FFN can compute ADDR_B0 at PC marker for heads 8-11 to do BP+8 lookup.
-    # OP_LEV is injected in embedding at all positions when active_opcode=LEV.
-    base = 6 * HD
-    L = 15.0
-    # Q: Fire at PC marker when OP_LEV active
-    attn3.W_q[base, BD.MARK_PC] = L
-    attn3.W_q[base, BD.OP_LEV] = L / 5  # OP_LEV ≈ 5, normalize to ~L
-    attn3.W_q[base, BD.CONST] = -L * 1.5  # Need both MARK_PC and OP_LEV
-    # K: Attend to PREVIOUS step's BP byte 0 (L1H1[BP_I]=1 AND NOT L1H0[BP_I])
-    # L1H1 fires at distances 1.5-2.5 (prev step's bytes)
-    # L1H0 fires at distances 0-1.5 (current step's bytes - suppress these)
-    attn3.W_k[base, BD.L1H1 + BP_I] = L
-    attn3.W_k[base, BD.L1H0 + BP_I] = -L  # Suppress current step's BP byte 0
-    # V: Copy CLEAN_EMBED_LO/HI (prev step's BP byte 0 value)
-    for k in range(16):
-        attn3.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
-        attn3.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
-    # FIX 2026-04-16: Removed OUTPUT_LO/HI writes. L9 attention head 1 now handles
-    # the BP relay to ADDR_B0 at PC marker. The OUTPUT writes were causing interference
-    # with the return_addr that L16 FFN routes to OUTPUT via TEMP.
-    # (Original code wrote to OUTPUT_LO/HI which persisted and corrupted final output)
-    # Anti-leakage gate
-    GATE = 33
-    attn3.W_q[base + GATE, BD.MARK_PC] = L
-    attn3.W_q[base + GATE, BD.CONST] = -L / 2
-    attn3.W_k[base + GATE, BD.CONST] = L
-
+    # MIGRATED (attn): heads 0-6 (PC/AX/SP/BP/STACK0 carries + AX_FULL relay
+    # + BP→PC for LEV) are baked by `make_layer3_carry_forward_attn_op` in
+    # migrated_ops.py via the compiler dispatch. The L3 FFN bake remains here:
+    # `make_layer3_ffn_op` is not flipped to migrated=True because the layer
+    # compiler currently places `layer3_ffn` at a block index (4) that does
+    # not match the legacy layout's block 3 — migrating it would conflict
+    # with L4 FFN at block 4 and break the model.
     ffn3 = model.blocks[3].ffn  # Layer 3 (L3) = blocks[3]
     _set_layer3_ffn(ffn3, S, BD)
 

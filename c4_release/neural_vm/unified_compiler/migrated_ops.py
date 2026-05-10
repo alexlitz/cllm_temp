@@ -872,6 +872,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                 "AX_FULL_LO", "AX_FULL_HI"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
     )
 
 
