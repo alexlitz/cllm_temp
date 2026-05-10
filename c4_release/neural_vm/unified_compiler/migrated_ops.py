@@ -1116,23 +1116,27 @@ def make_layer2_threshold_attn_op() -> Operation:
 
 
 def make_layer3_carry_forward_attn_op() -> Operation:
-    """L3 attention: 7 carry-forward heads (PC, AX, SP, BP, STACK0 + relays)."""
+    """L3 attention: 7 carry-forward heads (PC, AX, SP, BP, STACK0 + relays).
+
+    Heads 0-3 use ``Primitives.carry_forward_attention`` (byte-identical to
+    the legacy ``_set_carry_forward_attn`` — see
+    ``tests/test_primitives_l3_carry_equivalence.py``). Head 4 uses
+    ``_set_stack0_carry_attn`` (different K source). Heads 5-6 stay inline
+    (head 5 reads OUTPUT_*, head 6 has OP_LEV gating + CLEAN_EMBED_*).
+    """
     def bake(attn, dim_positions, S):
-        from ..vm_step import (_set_carry_forward_attn, _set_stack0_carry_attn,
-                                _SetDim)
+        from ..vm_step import _set_stack0_carry_attn
+        from .primitives import Primitives
         proxy = _as_setdim_proxy(dim_positions)
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
         PC_I, AX_I, SP_I, BP_I = 0, 1, 2, 3
-        _set_carry_forward_attn(attn, 0, proxy.MARK_PC, PC_I, PC_I, HD,
-                                proxy.EMBED_LO, proxy.EMBED_HI)
-        _set_carry_forward_attn(attn, 1, proxy.MARK_AX, AX_I, AX_I, HD,
-                                proxy.AX_CARRY_LO, proxy.AX_CARRY_HI)
-        _set_carry_forward_attn(attn, 2, proxy.MARK_SP, SP_I, SP_I, HD,
-                                proxy.EMBED_LO, proxy.EMBED_HI)
-        _set_carry_forward_attn(attn, 3, proxy.MARK_BP, BP_I, BP_I, HD,
-                                proxy.EMBED_LO, proxy.EMBED_HI)
+        cf = Primitives.carry_forward_attention
+        cf(attn, 0, proxy.MARK_PC, PC_I, PC_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD)
+        cf(attn, 1, proxy.MARK_AX, AX_I, AX_I, proxy.AX_CARRY_LO, proxy.AX_CARRY_HI, HD=HD)
+        cf(attn, 2, proxy.MARK_SP, SP_I, SP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD)
+        cf(attn, 3, proxy.MARK_BP, BP_I, BP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD)
         _set_stack0_carry_attn(attn, 4, HD)
         # Heads 5-6: AX_FULL relay + BP→PC for LEV. These reference _SetDim
         # directly inside _set_carry_forward_attn so the proxy fallback handles
