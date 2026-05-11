@@ -501,8 +501,11 @@ def setup_head_weights(head, dim_positions: Dict[str, int] = None) -> None:
 #   `_inject_active_opcode` based on the current opcode hint.
 # - MARK_THINKING_START/END: written by `_inject_thinking_markers` on
 #   THINKING_START/END tokens.
-# - MEM_STORE / MEM_EXEC / ADDR_KEY: written by `_inject_mem_store`,
-#   `_inject_mem_exec[_autoregressive]` for memory ops.
+# - MEM_STORE / ADDR_KEY: written by `_inject_mem_store` /
+#   `_inject_mem_metadata` for memory ops. (MEM_EXEC@468 is retained in the
+#   IO set as a layout placeholder — Phase A 2026-05-11 removed the writes
+#   and external-hints API but kept the dim slot so the compact-IO layout
+#   stays stable. The slot is aliased by IO_FORMAT_POS.)
 # - NEXT_TOOL_CALL / NEXT_THINKING_START / NEXT_THINKING_END: optional head
 #   reads when conversational I/O is enabled (see setup_head_weights).
 _IO_REQUIRED_DIMS = frozenset({
@@ -523,7 +526,8 @@ _IO_REQUIRED_DIMS = frozenset({
     # Active-opcode injection slots (_inject_active_opcode)
     "OP_LEV", "OP_BZ", "OP_BNZ",
     "ACTIVE_OPCODE_PRTF", "ACTIVE_OPCODE_READ",
-    # Memory injection slots (_inject_mem_store, _inject_mem_exec)
+    # Memory injection slots (_inject_mem_store, _inject_mem_metadata).
+    # MEM_EXEC is a retained placeholder — see header comment above.
     "MEM_STORE", "MEM_EXEC", "ADDR_KEY",
 })
 
@@ -585,6 +589,9 @@ def declare_setdim_compat_dims(
         "OP_EXIT", "OP_NOP", "OP_PUTCHAR", "OP_GETCHAR",
         "MEM_STORE", "MEM_ADDR_SRC",
         "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+        # MEM_EXEC is a layout placeholder — its writes were removed in
+        # Phase A (2026-05-11) but the slot is retained so the compact-IO
+        # layout is stable. IO_FORMAT_POS@468 aliases MEM_EXEC.
         "OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP", "MEM_EXEC",
         "OPCODE_BASE",
         # Conversational I/O state (aliases noted in _SetDim):
