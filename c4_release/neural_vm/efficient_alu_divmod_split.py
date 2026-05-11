@@ -443,6 +443,16 @@ class FlattenedDivMod(nn.Module):
         # applied at stage 3 (we only skip when the mask would zero the
         # contribution everywhere). Numerical output is identical when
         # DIV/MOD is active.
+        #
+        # ONNX export: the `.item()` calls would constant-fold the branch
+        # at trace time, baking in "no DIV/MOD ever" and omitting the
+        # entire pipeline from the exported graph. Per
+        # docs/ONNX_EXPORT_STATUS_2026_05_11.md blocker 1, skip the
+        # early-out under tracing and rely on the stage-3 mask for
+        # correctness (downstream writeback is already opcode-gated).
+        if torch.onnx.is_in_onnx_export():
+            return pipeline(x_bd)
+
         BD = self.BD
         op_div_max = x_bd[..., BD.OP_DIV].max()
         op_mod_max = x_bd[..., BD.OP_MOD].max()
