@@ -297,8 +297,10 @@ class NeuralVMEmbedding(nn.Module):
         if not self._exec_addrs:
             return
 
-        from .vm_step import _SetDim, Token
-        BD = _SetDim
+        from .vm_step import Token
+
+        mem_exec = self._dim("MEM_EXEC")
+        addr_key = self._dim("ADDR_KEY")
 
         B, S = token_ids.shape
 
@@ -314,7 +316,7 @@ class NeuralVMEmbedding(nn.Module):
                     # Check if this address is in executable region (word-aligned)
                     if (addr & ~3) in self._exec_addrs:
                         # Set MEM_EXEC flag on MEM marker
-                        x[b, i, BD.MEM_EXEC] = 1.0
+                        x[b, i, mem_exec] = 1.0
 
                         # Add ADDR_KEY to value bytes (positions 5-8)
                         for byte_off in range(4):
@@ -324,9 +326,9 @@ class NeuralVMEmbedding(nn.Module):
                                 lo = byte_addr & 0xF
                                 hi = (byte_addr >> 4) & 0xF
                                 top = (byte_addr >> 8) & 0xF
-                                x[b, val_pos, BD.ADDR_KEY + lo] = 1.0
-                                x[b, val_pos, BD.ADDR_KEY + 16 + hi] = 1.0
-                                x[b, val_pos, BD.ADDR_KEY + 32 + top] = 1.0
+                                x[b, val_pos, addr_key + lo] = 1.0
+                                x[b, val_pos, addr_key + 16 + hi] = 1.0
+                                x[b, val_pos, addr_key + 32 + top] = 1.0
                     i += 9  # Skip past MEM section
                 else:
                     i += 1
@@ -369,8 +371,17 @@ class NeuralVMEmbedding(nn.Module):
 
         MEM section format: [MEM, addr_b0-3, val_b0-3] (9 tokens)
         """
-        from .vm_step import _SetDim, Token
-        BD = _SetDim
+        from .vm_step import Token
+
+        mem_exec = self._dim("MEM_EXEC")
+        mem_store = self._dim("MEM_STORE")
+        addr_key = self._dim("ADDR_KEY")
+        mem_val_dims = [
+            self._dim("MEM_VAL_B0"),
+            self._dim("MEM_VAL_B1"),
+            self._dim("MEM_VAL_B2"),
+            self._dim("MEM_VAL_B3"),
+        ]
 
         # Code region boundary (addresses below this are code, above are data)
         # This matches C4 convention: code at low addresses, data at 0x10000+
@@ -399,7 +410,7 @@ class NeuralVMEmbedding(nn.Module):
 
                     if is_code_region or is_jump_target:
                         # Set MEM_EXEC flag on MEM marker (for code only)
-                        x[b, i, BD.MEM_EXEC] = 1.0
+                        x[b, i, mem_exec] = 1.0
 
                     # FIX 2026-04-16: Always add ADDR_KEY to ALL MEM sections, not just code.
                     # This enables L15 memory lookup for LEV (stack), LI/LC/SI/SC (data).
@@ -408,7 +419,7 @@ class NeuralVMEmbedding(nn.Module):
                     # FIX 2026-04-17: Set MEM_STORE on ALL MEM markers for L15 K-side matching.
                     # L15 attention uses MEM_STORE in K-side to identify store entries.
                     # Without this, the attention score gets -312.5 penalty and doesn't match.
-                    x[b, i, BD.MEM_STORE] = 2.0  # Same scale as L6 head 6 output
+                    x[b, i, mem_store] = 2.0  # Same scale as L6 head 6 output
 
                     # FIX 2026-04-17: Set MEM_VAL_B0-B3 flags on val byte positions for L15 byte selection.
                     # These flags indicate which value byte each position represents.
@@ -418,9 +429,8 @@ class NeuralVMEmbedding(nn.Module):
                     for byte_off in range(4):
                         val_pos = i + 5 + byte_off
                         if val_pos < S:
-                            MEM_VAL_DIMS = [BD.MEM_VAL_B0, BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3]
-                            x[b, val_pos, MEM_VAL_DIMS[byte_off]] = 1.0
-                            x[b, val_pos, BD.MEM_STORE] = 2.0  # Match MEM marker injection
+                            x[b, val_pos, mem_val_dims[byte_off]] = 1.0
+                            x[b, val_pos, mem_store] = 2.0  # Match MEM marker injection
 
                     for byte_off in range(4):
                         val_pos = i + 5 + byte_off
@@ -429,9 +439,9 @@ class NeuralVMEmbedding(nn.Module):
                             lo = byte_addr & 0xF
                             hi = (byte_addr >> 4) & 0xF
                             top = (byte_addr >> 8) & 0xF
-                            x[b, val_pos, BD.ADDR_KEY + lo] = 1.0
-                            x[b, val_pos, BD.ADDR_KEY + 16 + hi] = 1.0
-                            x[b, val_pos, BD.ADDR_KEY + 32 + top] = 1.0
+                            x[b, val_pos, addr_key + lo] = 1.0
+                            x[b, val_pos, addr_key + 16 + hi] = 1.0
+                            x[b, val_pos, addr_key + 32 + top] = 1.0
                     i += 9  # Skip past MEM section
                 else:
                     i += 1

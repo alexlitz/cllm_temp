@@ -87,7 +87,11 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
         # Attach as a post_op (rather than wrapping block.ffn with HybridALUBlock).
         # ``_expand_wrapper_blocks`` then splits each post_op into a passthrough
         # transformer block, preserving the original execution order.
-        block.post_ops.insert(0, alu_cls(S, _SetDim))
+        # Use compiler-allocated dim_positions (via proxy) so the structural
+        # ALU wires inputs to layout-correct residual lanes; bare _SetDim
+        # breaks pin_io_only=True (IO dims sit at different positions there).
+        proxy = _as_setdim_proxy(dim_positions)
+        block.post_ops.insert(0, alu_cls(S, proxy))
 
     # Phase=1180 + layer_idx*0.01: hybrid wraps must fire AFTER all FFN
     # bakes (including L14 cleanup and convo-IO ops at phases 8.5/10.6/15.1)
@@ -546,6 +550,20 @@ def declare_setdim_compat_dims(
         # convo-io migrated ops' reads/writes even when the flag is False.
         "IO_FORMAT_POS", "IO_IN_OUTPUT_MODE", "IO_OUTPUT_COMPLETE",
         "LAST_WAS_BYTE",
+        # Conversational I/O state dims that were previously left out of the
+        # declaration list and fell back to bare `_SetDim` positions via the
+        # proxy. With `pin_io_only=True` those legacy positions collide with
+        # compiler-allocated dims (ALU_LO, AX_FULL_*, OPCODE_BYTE_HI, ...);
+        # declare them so the compiler hands out unique positions. Bake
+        # functions that reference them (L2 lookback head, L3 state init,
+        # null-terminator detection) only fire when conversational I/O is
+        # enabled — they remain unused under the default smoke config but
+        # must have collision-free positions in either layout.
+        "LAST_WAS_THINKING_START", "LAST_WAS_THINKING_END",
+        "LAST_WAS_IO_STATE_EMIT_BYTE", "LAST_WAS_IO_STATE_EMIT_THINKING",
+        "IO_IS_PRTF", "IO_IS_READ", "IO_STATE", "IO_OUTPUT_COUNT",
+        "IO_IS_TOOL_CALL",
+        "NEXT_IO_STATE_EMIT_BYTE", "NEXT_IO_STATE_EMIT_THINKING",
     ]
     # 7-dim threshold head outputs (one per marker type)
     seven_dim = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",

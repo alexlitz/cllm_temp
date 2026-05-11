@@ -179,8 +179,10 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
         else:
             alu_cls = getattr(eau, alu_cls_name)
         # Attach as a post_op; _expand_wrapper_blocks splits it into a
-        # passthrough transformer block downstream.
-        block.post_ops.insert(0, alu_cls(S, _SetDim))
+        # passthrough transformer block downstream. Use proxy(dim_positions)
+        # so pin_io_only=True layouts wire to the correct residual lanes.
+        proxy = _as_setdim_proxy(dim_positions)
+        block.post_ops.insert(0, alu_cls(S, proxy))
 
     # Phase=1180 + layer_idx*0.01: hybrid wraps must fire AFTER all FFN
     # bakes (including L14 cleanup and convo-IO ops at phases 8.5/10.6/15.1)
