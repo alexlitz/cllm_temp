@@ -608,6 +608,67 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
     )
 
 
+def make_opcode_relay_head_op() -> Operation:
+    """L6 attention head 6: relay opcode flags from AX -> SP/STACK0/PC markers.
+
+    Originally an inline call in ``set_vm_weights`` (with two preceding
+    ``attn6.alibi_slopes`` mutations folded in)::
+
+        if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
+            attn6.alibi_slopes[6] = 5.0
+            attn6.alibi_slopes[7] = 5.0  # JSR PC+5 relay: steep for head 7
+        _set_opcode_relay_head(attn6, S, BD, HD)
+
+    The L5 FFN decodes opcodes only at the AX marker, but L6 FFN consumes
+    OP_PSH/OP_ADJ/OP_LEV/OP_JSR/OP_ENT and a pop-group flag at SP, STACK0,
+    BP, PC, and MEM markers. Head 6 copies those flags across markers.
+    ALiBi slope=5.0 is also set on head 7 (used by JSR PC+5 relay configured
+    by ``_set_function_call_weights``).
+
+    Phase=1002 (AFTER ``legacy_bake`` at 999) is REQUIRED because the
+    inline section that this op replaces is preceded inside
+    ``set_vm_weights`` by::
+
+        attn6.alibi_slopes.fill_(0.0)
+        attn6.alibi_slopes[0] = 5.0
+        attn6.alibi_slopes[1] = 5.0
+        ...
+
+    which still fires from inside legacy_bake. Running this op at phase
+    <999 would have its alibi_slopes[6]/[7]=5.0 writes wiped by that
+    ``fill_(0.0)`` call. Phase=1002 also slots cleanly after
+    ``head_bake`` (1000) and ``embedding_bake`` (1001), and before the
+    defensive post-pass ``branch_override_patch`` (1100).
+
+    Head 6 attn weights (W_q/W_k/W_v/W_o) don't conflict with any other
+    L6 attn writes in ``set_vm_weights``: head 0-5 are programmed by
+    ``_set_layer6_attn`` and ``_set_bz_bnz_relay`` (now migrated to
+    phases 998.5/.7), and head 7 Q/K is programmed by
+    ``_set_function_call_weights`` (phase=998) plus
+    ``_set_layer6_relay_heads`` (phase=998.6) — none of which touch
+    head 6 slots, so phase ordering against those is irrelevant.
+    """
+    def bake(model, dim_positions, S):
+        from ..vm_step import _set_opcode_relay_head
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = model.blocks[6].attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[6] = 5.0
+            attn.alibi_slopes[7] = 5.0  # JSR PC+5 relay: steep for head 7
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_opcode_relay_head(attn, S, proxy, HD)
+
+    return Operation(
+        name="opcode_relay_head",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=1002,
+        migrated=True,
+    )
+
+
 def make_layer7_operand_gather_op() -> Operation:
     """L7 attention: operand A gather (prev STACK0 byte 0 → ALU at AX marker).
 
@@ -3498,6 +3559,10 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
+        # L6 attn head 6 opcode relay (phase=1002): runs AFTER legacy_bake's
+        # `attn6.alibi_slopes.fill_(0.0)` so the alibi_slopes[6]/[7]=5.0 writes
+        # survive. See docstring on make_opcode_relay_head_op for details.
+        make_opcode_relay_head_op(),
         # Model-level post-passes — run in phase order after legacy_bake (999):
         #   branch_override_patch (1100): suppress spurious branch/LEV-override
         #     units across all blocks.
