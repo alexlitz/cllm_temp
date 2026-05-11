@@ -45,10 +45,6 @@ from neural_vm.unified_compiler.runtime_audit import (  # noqa: E402
 # =============================================================================
 
 KNOWN_NON_VANILLA_ALLOWLIST = frozenset({
-    # Lookup-mode (default) leftovers.
-    "ALUMul",                     # TODO: remove once hybrid removal completes (L11/L12 MUL FFN)
-    "ALUShift",                   # TODO: remove once hybrid removal completes (L13 SHL/SHR FFN)
-
     # Post-op family: BinaryOpByteZeroingPostOp, CarryPropagationPostOp,
     # BitwiseBytePropagationPostOp, ComparisonCombine were previously listed
     # here. As of 2026-05-11 (a-postops-to-pureffn) they are re-baked into
@@ -61,6 +57,14 @@ KNOWN_NON_VANILLA_ALLOWLIST = frozenset({
     # once ``verify_runtime_is_vanilla`` learned to recognise the
     # "nn.Sequential of PureFFNs" composite pattern via
     # ``_is_pureffn_composite`` (b-audit-recognize-sequential).
+
+    # ``ALUMul`` and ``ALUShift`` (lookup-mode L11/L12 MUL and L13 SHL/SHR
+    # FFN wrappers) were removed from this allowlist on 2026-05-11 once
+    # ``_make_alu_postop_attach_op`` started installing the flattened
+    # ``FlattenedALUMul`` / ``ALUShiftComposite`` composites instead
+    # (lookup-alu-flatten). The two runtime wrapper classes still exist
+    # for back-compat but are no longer attached to ``model.blocks`` by
+    # any compiler path.
 })
 
 
