@@ -134,6 +134,13 @@ def all_core_ops(
         make_layer9_alu_op(),
         make_layer9_lev_addr_relay_op(),
         make_layer9_lev_bp_to_pc_relay_op(),
+        # ALiBi-based memory propagation attention head (phase=9.2).
+        # PROOF-OF-CONCEPT for replacing _inject_mem_store / runner shadow
+        # memory with attention. Registered always so the dep graph and
+        # layer_idx gates see it; bake is a no-op by default (`enable=False`)
+        # so existing tests are byte-identical. See l9_ops.py docstring
+        # for the full design and slope-tuning analysis.
+        make_layer9_alibi_mem_attn_op(enable=False),
         # Convo-I/O L9 attn bake (phase=9.5). Always registered; bake is a
         # no-op when enable_conversational_io is False. Fires regardless of
         # alu_mode; runs AFTER the L9 LEV bakes (phase 9.0/9.1) since the
