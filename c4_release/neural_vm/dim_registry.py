@@ -939,11 +939,10 @@ if __name__ == "__main__":
     print()
 
     import torch
-    from .vm_step import AutoregressiveVM, set_vm_weights
+    from .unified_compiler.full_vm_compiler import compile_full_vm
 
     print("Building model and setting weights...")
-    model = AutoregressiveVM()
-    set_vm_weights(model)
+    model, _ = compile_full_vm()
     print()
 
     # Per-layer summary

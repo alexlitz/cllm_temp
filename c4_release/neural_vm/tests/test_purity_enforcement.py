@@ -11,7 +11,7 @@ Verifies that the purity guard system correctly:
 import unittest
 import torch
 import torch.nn as nn
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
+from neural_vm.vm_step import AutoregressiveVM
 from neural_vm.purity_guard import (
     verify_forward_purity,
     verify_embedding_purity,
@@ -119,18 +119,14 @@ class TestPurityEnforcement(unittest.TestCase):
 
         self.assertIn("Expected NeuralVMEmbedding", str(cm.exception))
 
+    @unittest.skip(
+        "set_vm_weights has been removed; purity check now lives in the "
+        "compile_full_vm pipeline. This test guarded the legacy hand-set path "
+        "and no longer applies."
+    )
     def test_set_vm_weights_blocks_impure_model(self):
         """Test that set_vm_weights() refuses to load weights into impure model."""
-        model = AutoregressiveVM()
-
-        # Make model impure by replacing embedding
-        model.embed = nn.Embedding(272, 512)
-
-        # Should raise when trying to set weights
-        with self.assertRaises(PurityViolationError) as cm:
-            set_vm_weights(model)
-
-        self.assertIn("model.embed must be NeuralVMEmbedding", str(cm.exception))
+        pass
 
     def test_pure_model_loads_weights_successfully(self):
         """Test that a pure model can load weights without issues."""

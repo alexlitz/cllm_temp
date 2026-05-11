@@ -13,7 +13,7 @@ from src.compiler import compile_c
 from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.debugger import VMExecutionTracer
 from neural_vm.contracts import DimensionContract
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, Opcode
+from neural_vm.vm_step import AutoregressiveVM, Opcode
 
 
 class TestDimensionDataflow:
@@ -110,8 +110,8 @@ class TestDimensionContracts:
 
     def test_no_unauthorized_writes(self):
         """No layer should write to reserved dimensions without authorization."""
-        model = AutoregressiveVM()
-        set_vm_weights(model)
+        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        model, _ = compile_full_vm()
 
         violations = DimensionContract.validate_model(model)
 
@@ -126,8 +126,8 @@ class TestDimensionContracts:
 
     def test_contract_validation_runs(self):
         """Test that contract validation runs without errors."""
-        model = AutoregressiveVM()
-        set_vm_weights(model)
+        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        model, _ = compile_full_vm()
 
         # Should not raise exceptions
         violations = DimensionContract.validate_model(model)
@@ -138,8 +138,8 @@ class TestDimensionContracts:
 
     def test_expected_writers_configured(self):
         """Test that expected writers are configured in model."""
-        model = AutoregressiveVM()
-        set_vm_weights(model)
+        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        model, _ = compile_full_vm()
 
         # Check if Layer 3 Head 1 writes to AX_CARRY
         layer3 = model.blocks[3]

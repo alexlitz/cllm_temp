@@ -93,8 +93,9 @@ class BakedPromptVM:
             n_layers: Number of transformer layers
             n_heads: Number of attention heads
             ffn_hidden: FFN hidden dimension
-            bake_weights: If True, call set_vm_weights() to bake all
-                         non-syscall opcodes into the model
+            bake_weights: Retained for backwards compatibility. The runner
+                         always bakes weights via `compile_full_vm` at
+                         construction time; this flag is now a no-op.
         """
         self.system_source = system_source
         self.d_model = d_model
@@ -105,16 +106,14 @@ class BakedPromptVM:
         # Extract function names from system source
         self.available_functions = self._extract_function_names(system_source)
 
-        # Lazy-create runner (imports torch + neural_vm)
+        # Lazy-create runner (imports torch + neural_vm). The runner bakes
+        # weights via `compile_full_vm` internally, so `bake_weights` is now
+        # a no-op kept for backwards compatibility.
         from neural_vm.run_vm import AutoregressiveVMRunner
         self.runner = AutoregressiveVMRunner(
             d_model=d_model, n_layers=n_layers,
             n_heads=n_heads, ffn_hidden=ffn_hidden,
         )
-
-        if bake_weights:
-            from neural_vm.vm_step import set_vm_weights
-            set_vm_weights(self.runner.model)
 
     def _extract_function_names(self, source: str) -> List[str]:
         """Extract function names from C source."""

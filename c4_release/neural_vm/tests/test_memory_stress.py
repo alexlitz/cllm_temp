@@ -15,7 +15,7 @@ Coverage:
 import unittest
 import os
 import torch
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, Token
+from neural_vm.vm_step import AutoregressiveVM, Token
 from neural_vm.embedding import Opcode
 
 
@@ -33,8 +33,8 @@ def _get_model():
             _shared_model = AutoregressiveVM.load_compact(cache_path)
         else:
             print("Creating new model and setting weights (this may take a while)...")
-            _shared_model = AutoregressiveVM()
-            set_vm_weights(_shared_model)
+            from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+            _shared_model, _ = compile_full_vm()
             _shared_model.compact(block_size=32)
             _shared_model.compact_moe()
             print("Saving model cache...")

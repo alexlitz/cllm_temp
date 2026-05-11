@@ -17,7 +17,7 @@ correctly, not just getting lucky with speculative execution.
 
 import torch
 from typing import List, Tuple, Optional
-from .vm_step import AutoregressiveVM, Token, set_vm_weights
+from .vm_step import Token
 from .embedding import Opcode
 from .speculative import DraftVM
 
@@ -50,16 +50,16 @@ class UltraBatchRunner:
         self.device = device
         self.strict = strict
 
-        # Create transformer model
-        self.model = AutoregressiveVM(
-            d_model=d_model,
-            n_layers=n_layers,
+        # Create transformer model via the unified compiler. The compiler is
+        # the single bake authority; d_model/n_layers come from the operation
+        # set. n_heads/ffn_hidden/max_seq_len are passed through.
+        from .unified_compiler.full_vm_compiler import compile_full_vm
+        self.model, _layout = compile_full_vm(
             n_heads=n_heads,
             ffn_hidden=ffn_hidden,
             max_seq_len=max_seq_len,
         )
         self.model.eval()
-        set_vm_weights(self.model)
         self.model.compact(block_size=32)
         self.model.compact_moe()
 
@@ -255,8 +255,8 @@ class UltraBatchRunnerCached(UltraBatchRunner):
     def get_cached_model(cls, batch_size=256):
         """Get or create cached model."""
         if cls._cached_model is None:
-            cls._cached_model = AutoregressiveVM()
-            set_vm_weights(cls._cached_model)
+            from .unified_compiler.full_vm_compiler import compile_full_vm
+            cls._cached_model, _ = compile_full_vm()
             cls._cached_model.compact(block_size=32)
             cls._cached_model.compact_moe()
 

@@ -17,7 +17,7 @@ from .base_layers import PureFFN, PureAttention, bake_weights
 from .vm_step import (
     AutoregressiveVM, Token, TransformerBlock,
     AutoregressiveAttention,
-    set_vm_weights, _SetDim,
+    _SetDim,
 )
 # Note: CausalSelfAttention removed - incompatible with PureAttention architecture
 
@@ -50,7 +50,7 @@ __all__ = [
     'UltraBatchRunner', 'UltraBatchRunnerCached', 'run_batch_ultra',
     'Token', 'TransformerBlock',
     'AutoregressiveAttention',
-    'set_vm_weights', '_SetDim',
+    '_SetDim',
     # Utilities
     'softmax1',
     # Dim registry

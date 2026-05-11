@@ -13,7 +13,7 @@ Expected speedup: N * 10-35x (where N is batch size)
 
 import torch
 from typing import List, Tuple, Optional
-from .vm_step import AutoregressiveVM, Token, set_vm_weights
+from .vm_step import Token
 from .embedding import Opcode
 from .speculative import DraftVM
 
@@ -145,16 +145,16 @@ class BatchedSpeculativeRunner:
         self.use_kv_cache = use_kv_cache
         self.use_sparse = use_sparse
 
-        # Create transformer model
-        self.model = AutoregressiveVM(
-            d_model=d_model,
-            n_layers=n_layers,
+        # Create transformer model via the unified compiler. The compiler is
+        # the single bake authority; d_model/n_layers come from the operation
+        # set and are passed through here as a hint for backwards compatibility.
+        from .unified_compiler.full_vm_compiler import compile_full_vm
+        self.model, _layout = compile_full_vm(
             n_heads=n_heads,
             ffn_hidden=ffn_hidden,
             max_seq_len=max_seq_len,
         )
         self.model.eval()
-        set_vm_weights(self.model)
         self.model.compact(block_size=32)
         self.model.compact_moe()
         if self.use_sparse:

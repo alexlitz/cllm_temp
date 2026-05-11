@@ -8,7 +8,7 @@ All 256 IMM programs are run once and cached; test methods check cached results.
 
 import unittest
 import torch
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, Token, _SetDim
+from neural_vm.vm_step import AutoregressiveVM, Token, _SetDim
 from neural_vm.embedding import Opcode
 
 
@@ -138,8 +138,8 @@ def _get_model():
         if os.path.exists(cache_path):
             _shared_model = AutoregressiveVM.load_compact(cache_path)
         else:
-            _shared_model = AutoregressiveVM()
-            set_vm_weights(_shared_model)
+            from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+            _shared_model, _ = compile_full_vm()
             _shared_model.compact(block_size=32)
             _shared_model.compact_moe()
             _shared_model.save_compact(cache_path)
