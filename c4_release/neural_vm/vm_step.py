@@ -1967,7 +1967,7 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # ===== CONVERSATIONAL I/O (optional) =====
     if enable_conversational_io:
         # L5 FFN: decode PRTF/READ → IO_IS_PRTF, IO_IS_READ at AX marker
-        _set_conversational_io_opcode_decode(ffn5, S, BD)
+        _set_conversational_io_opcode_decode(model.blocks[5].ffn, S, BD)
         # L6 attention heads 4-5: relay IO_IS_PRTF, IO_IS_READ from AX → SE
         # Changed from heads 6-7 to avoid conflict with _set_opcode_relay_head (head 6)
         if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
