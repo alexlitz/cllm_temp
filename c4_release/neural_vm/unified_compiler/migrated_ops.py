@@ -1287,19 +1287,34 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
 
 
 def make_layer10_alu_op() -> Operation:
-    """L10 FFN: AND/OR/XOR + DIV/MOD setup."""
-    def bake(ffn, dim_positions, S):
+    """L10 FFN: AND/OR/XOR + DIV/MOD setup.
+
+    Pinned to ``layer_idx=10`` via ``kind="block"``: the legacy
+    ``set_vm_weights`` lookup branch targeted ``model.blocks[10].ffn``.
+    Without pinning, dep-graph layer assignment could place this op on the
+    wrong block. ``phase=10.2`` is before
+    ``make_l10_post_op_attach_op`` (phase=10.7) and
+    ``make_l10_alu_divmod_install_op`` (phase=10.8) so they don't conflict.
+
+    Migrated 2026-05-10: the inline ``_set_layer10_alu(ffn10, S, BD)`` call
+    in the lookup branch of ``set_vm_weights`` has been removed; this op
+    now owns the bake. (Per Unit 9 diagnosis, this migration is SAFE so
+    long as ``make_l10_post_op_attach_op`` is NOT modified.)
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer10_alu
-        _set_layer10_alu(ffn, S, _as_setdim_proxy(dim_positions))
+        _set_layer10_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer10_alu",
-        phase=10,
+        phase=10.2,
         reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "ALU_HI", "AX_CARRY_HI",
                "OP_OR", "OP_XOR", "OP_AND", "OP_DIV", "OP_MOD"},
         writes={"OUTPUT_LO", "OUTPUT_HI", "DIV_STAGING"},
-        kind="ffn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=10,
+        migrated=True,
     )
 
 

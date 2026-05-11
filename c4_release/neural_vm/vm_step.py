@@ -2106,7 +2106,14 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # compiler block ops at phases 10.0-10.4 (kind="block",
         # layer_idx=10, migrated=True) registered in all_core_ops().
         ffn10 = model.blocks[10].ffn
-        _set_layer10_alu(ffn10, S, BD)
+        # MIGRATED 2026-05-10 (Unit 12): the inline
+        # ``_set_layer10_alu(ffn10, S, BD)`` call is now owned by the
+        # compiler block op ``layer10_alu`` (phase=10.2, kind="block",
+        # layer_idx=10, migrated=True). Phase=10.2 places it BEFORE
+        # ``l10_post_op_attach`` (phase=10.7) and
+        # ``l10_alu_divmod_install`` (phase=10.8). Per Unit 9 diagnosis
+        # this migration is SAFE because ``make_l10_post_op_attach_op``
+        # is intentionally NOT touched here.
 
         # Conversational I/O: Null terminator detection
         if enable_conversational_io:
