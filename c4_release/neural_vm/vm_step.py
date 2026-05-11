@@ -37,7 +37,6 @@ from .efficient_alu_neural import (
     ALUDivMod,
 )
 from .efficient_alu_addsub_split import AddSub5StageBlock
-from .hybrid_alu import HybridALUBlock
 
 
 # =============================================================================
@@ -2147,14 +2146,17 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
 
 
-        # ===== EFFICIENT ALU HYBRID OVERRIDE =====
-        # The HybridALUBlock wraps for L8-L13 are now provided by migrated
+        # ===== EFFICIENT ALU OVERRIDE =====
+        # The L8-L13 ALU post-op attaches are now provided by migrated
         # block-ops (l8/l9/l10/l11/l12/l13_hybrid_alu_wrap in migrated_ops.py)
         # and dispatched at the end of set_vm_weights via _dispatch_migrated_block_ops.
+        # The ops attach the structural ALU module to `block.post_ops` (no
+        # HybridALUBlock wrapper); `_expand_wrapper_blocks` then splits each
+        # post_op into its own passthrough transformer block.
         # NOTE: L8/L9 ADD/SUB now use the 5-stage flattened AddSub5StageBlock
-        # (split into 5 successive blocks by `_expand_wrapper_blocks`) instead
-        # of the monolithic ALUAddSub. See migrated_ops._make_hybrid_alu_wrap_op
-        # which selects AddSub5StageBlock when alu_cls_name == "ALUAddSub".
+        # instead of the monolithic ALUAddSub. See
+        # migrated_ops._make_hybrid_alu_wrap_op which selects AddSub5StageBlock
+        # when alu_cls_name == "ALUAddSub".
         # DIV/MOD: previously
         #   model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)
         # but the FlattenedDivMod composite is now installed onto
@@ -2182,11 +2184,14 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # - `_set_layer8_alu` / `_set_layer8_multibyte_routing` are now baked
         #   as compiler block ops (kind="block", layer_idx=8, migrated=True)
         #   that fire BEFORE legacy_bake regardless of alu_mode.
-        # - The `model.blocks[8].ffn = HybridALUBlock(ffn8, AddSub5StageBlock(S, BD))`
-        #   wrap is now installed by `make_efficient_l8_addsub_wrap_op`
-        #   (kind="model", phase=1002) which runs AFTER legacy_bake so the L8
-        #   ALU bakes have already mutated the original PureFFN by the time
-        #   it gets wrapped. See unified_compiler/migrated_ops.py.
+        # - The L8 AddSub5StageBlock post-op attach is installed by
+        #   `make_efficient_l8_addsub_wrap_op` (kind="model", phase=1002) which
+        #   runs AFTER legacy_bake so the L8 ALU bakes have already mutated the
+        #   original PureFFN by the time it gets attached. As of 2026-05-11 the
+        #   ALU is attached to ``block.post_ops`` instead of wrapping
+        #   ``block.ffn`` with HybridALUBlock; ``_expand_wrapper_blocks`` then
+        #   splits it into its own passthrough block.
+        #   See unified_compiler/migrated_ops.py.
 
         # L10: Carry relay + AX/SP passthrough attention (still needed)
         attn10 = model.blocks[10].attn
@@ -2325,8 +2330,10 @@ def _dispatch_migrated_block_ops(model, S, alu_mode='lookup'):
 
     Block ops with `migrated=True` claim their bake from set_vm_weights and
     fire here on the corresponding TransformerBlock. Today this covers the
-    L8-L13 HybridALU wraps; the efficient alu_mode branch still has its
-    inline wraps (TODO: migrate that branch too).
+    L8-L13 ALU post-op attaches (attaching AddSub5StageBlock/ALUAndOrXor/
+    ALUMul/ALUShift modules to ``block.post_ops``); the efficient alu_mode
+    branch handles its L8 attach via a separate kind="model" op
+    (``make_efficient_l8_addsub_wrap_op``, phase=1002).
     """
     if alu_mode != 'lookup':
         return
@@ -2344,23 +2351,26 @@ def _dispatch_migrated_block_ops(model, S, alu_mode='lookup'):
 
 
 def _expand_wrapper_blocks(model):
-    """Phase 0 step: split composite-FFN blocks into multiple single-PureFFN blocks.
+    """Phase 0 step: split per-block post_ops into successive passthrough blocks.
 
-    Currently expands:
-    - HybridALUBlock: lookup_ffn (PureFFN) + efficient_alu (wrapper, future-expand)
-    - post_ops on any block: each post_op becomes its own block (passthrough attn
-      + that op as ffn)
+    Each post_op on a block becomes its own TransformerBlock with a passthrough
+    attention (zero-init weights → residual identity via x + attn(x) = x + 0 = x)
+    and the post_op as its ffn. Semantic execution order is preserved by
+    inserting these blocks immediately after the original.
 
-    Each new block gets a passthrough attention (zero-init weights → residual
-    identity via x + attn(x) = x + 0 = x). Semantic execution order is preserved
-    by inserting blocks immediately after the original.
+    2026-05-11 (HybridALUBlock removal): previously this also unwrapped
+    ``HybridALUBlock`` (lookup_ffn + efficient_alu) into two successive blocks.
+    HybridALUBlock has been deleted; ALU modules that previously wrapped
+    block.ffn are now attached directly to block.post_ops by the compiler ops
+    in migrated_ops.py (see ``_make_hybrid_alu_wrap_op`` and
+    ``make_efficient_l8_addsub_wrap_op``), so the post_ops expansion path below
+    handles them uniformly with all other structural post-passes
+    (BinaryOpByteZeroingPostOp, CarryPropagationPostOp, FlattenedDivMod, etc.).
 
-    Future work: walk ALU* (ALUAddSub/ALUAndOrXor/ALUMul/ALUShift/ALUDivMod) internals
+    Future work: walk ALU* (ALUAndOrXor/ALUMul/ALUShift/ALUDivMod) internals
     (BDToGEConverter, GenericPureFFN per ALU stage, GEToBDConverter) into
     separate blocks too — requires more careful BD↔GE format-shape handling.
     """
-    from .hybrid_alu import HybridALUBlock as _HAB
-
     def _make_passthrough_block(template_attn, ffn_module, layer_idx, d_model):
         """Build a TransformerBlock with zero-init attention (residual identity)
         and the given ffn."""
@@ -2371,34 +2381,11 @@ def _expand_wrapper_blocks(model):
         return TransformerBlock(attn=attn_passthrough, ffn=ffn_module)
 
     d_model = model.d_model
-    new_blocks = []
-    hab_expansions = 0
     post_op_expansions = 0
 
-    for i, block in enumerate(model.blocks):
-        # Step 1: HybridALUBlock split (if present)
-        if isinstance(block.ffn, _HAB):
-            lookup_ffn = block.ffn.lookup_ffn
-            efficient_alu = block.ffn.efficient_alu
-            original_post_ops = list(block.post_ops)
-
-            # Block A: original attn + lookup_ffn (PureFFN), no post_ops yet.
-            block.ffn = lookup_ffn
-            block.post_ops = nn.ModuleList()
-            new_blocks.append(block)
-
-            # Block B: passthrough attn + efficient_alu, with post_ops temporarily attached
-            new_block = _make_passthrough_block(block.attn, efficient_alu, i + 1, d_model)
-            new_block.post_ops = nn.ModuleList(original_post_ops)
-            new_blocks.append(new_block)
-            hab_expansions += 1
-            print(f"  EXPAND L{i}: HybridALUBlock split (lookup_ffn + efficient_alu)")
-        else:
-            new_blocks.append(block)
-
-    # Step 2: split post_ops into their own blocks
+    # Split post_ops into their own blocks.
     final_blocks = []
-    for block in new_blocks:
+    for block in model.blocks:
         final_blocks.append(block)
         if hasattr(block, 'post_ops') and len(block.post_ops) > 0:
             post_ops_list = list(block.post_ops)
@@ -2411,11 +2398,11 @@ def _expand_wrapper_blocks(model):
                 final_blocks.append(new_block)
                 post_op_expansions += 1
 
-    if hab_expansions > 0 or post_op_expansions > 0:
+    if post_op_expansions > 0:
         model.blocks = nn.ModuleList(final_blocks)
         device = next(model.parameters()).device
         model.blocks = model.blocks.to(device)
-        print(f"  PHASE 0 EXPANSIONS: {hab_expansions} HybridALU + {post_op_expansions} post_ops")
+        print(f"  PHASE 0 EXPANSIONS: {post_op_expansions} post_ops")
         print(f"  Total blocks: 17 -> {len(final_blocks)}")
 
 
@@ -2439,7 +2426,8 @@ def _right_size_ffns(model):
         nonlocal total_before, total_after
         if not (hasattr(ffn_module, 'W_up')
                 and isinstance(getattr(ffn_module, 'W_up', None), _nn.Parameter)):
-            # Recurse into HybridALUBlock and similar wrappers that contain standard FFNs.
+            # Recurse into wrappers (FlattenedALUMul, ALUDivMod, AddSub5StageBlock,
+            # etc.) that contain standard FFNs as children.
             for child_name, child in ffn_module.named_children():
                 _resize_one(child, f"{label}.{child_name}")
             return

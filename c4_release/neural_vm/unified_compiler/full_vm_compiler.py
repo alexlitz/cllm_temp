@@ -122,7 +122,9 @@ def compile_full_vm(
     # stages. All bind to layer_idx=11 (the runtime forward collapses them
     # into one block call). Only registered in efficient mode — lookup mode
     # keeps the `_set_layer11_mul_partial` / `_set_layer12_mul_combine`
-    # lookup tables that are wrapped by HybridALUBlock instead.
+    # lookup tables; the L11 ALUMul module is attached to ``block.post_ops``
+    # by ``make_l11_hybrid_alu_wrap_op`` and split out by
+    # ``_expand_wrapper_blocks``.
     if alu_mode == "efficient":
         compiler.add_op(make_l11_alu_mul_bdtoge_op())
         compiler.add_op(make_l11_alu_mul_schoolbook_op())

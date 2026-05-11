@@ -2313,31 +2313,37 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
 
 
 # ---------------------------------------------------------------------------
-# HybridALU wrap block-ops (migrated from set_vm_weights lines 2377-2382)
+# ALU post-op attach block-ops (migrated from set_vm_weights lines 2377-2382)
 # ---------------------------------------------------------------------------
 #
-# Block-level migration: the lookup-mode ALU layers wrap their lookup FFN with
-# a HybridALUBlock that runs a structural neural ALU on top. Each layer/ALU
-# pairing is a separate op so the compiler can place/reorder/expand them
-# independently in the future.
+# Block-level migration: the lookup-mode ALU layers run a structural neural ALU
+# pipeline AFTER their lookup FFN. Each layer/ALU pairing is a separate op so
+# the compiler can place/reorder/expand them independently.
+#
+# 2026-05-11 (HybridALUBlock removal): previously these ops wrapped
+# ``block.ffn`` with a ``HybridALUBlock(lookup_ffn, alu_module)`` that ran the
+# ALU at runtime. ``_expand_wrapper_blocks`` then split that wrapper into two
+# successive transformer blocks. Now we skip the runtime wrapper entirely:
+# the ALU module is appended directly to ``block.post_ops``, and Step 2 of
+# ``_expand_wrapper_blocks`` (which already splits post_ops into passthrough
+# blocks) handles the rest. Final block layout is byte-identical.
 #
 # Each factory takes alu_mode='lookup' (production default). Efficient mode is
-# TODO — its semantics differ (replace ffn vs wrap ffn) and need a separate
-# migration pass.
+# TODO — its semantics differ (replace ffn vs append post_op) and need a
+# separate migration pass.
 
 def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
                              alu_mode: str = 'lookup') -> Operation:
     if alu_mode != 'lookup':
         # TODO(efficient-mode): efficient alu_mode REPLACES ffn rather than
-        # wrapping it (see vm_step.py:2385-2434), so the bake_fn semantics
-        # differ. Migrate that branch in a follow-up.
+        # attaching a post_op (see vm_step.py:2385-2434), so the bake_fn
+        # semantics differ. Migrate that branch in a follow-up.
         raise NotImplementedError(
-            f"alu_mode={alu_mode!r} not yet supported for hybrid wrap ops"
+            f"alu_mode={alu_mode!r} not yet supported for ALU post-op wrap ops"
         )
 
     def bake(block, dim_positions, S):
         from ..vm_step import _SetDim
-        from ..hybrid_alu import HybridALUBlock
         from .. import efficient_alu_neural as eau
         # ALUAddSub has been replaced by the 5-stage flattened AddSub5StageBlock
         # (see efficient_alu_addsub_split.py). Other ALU classes still come
@@ -2346,7 +2352,17 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
             from ..efficient_alu_addsub_split import AddSub5StageBlock as alu_cls
         else:
             alu_cls = getattr(eau, alu_cls_name)
-        block.ffn = HybridALUBlock(block.ffn, alu_cls(S, _SetDim))
+        # Attach as a post_op (rather than wrapping block.ffn with
+        # HybridALUBlock). _expand_wrapper_blocks Step 2 will split this into
+        # its own passthrough block immediately after the lookup_ffn block,
+        # preserving the original execution order: lookup_ffn → ALU → existing
+        # post_ops (if any).
+        # Insert at position 0 so the ALU runs before any other post_ops that
+        # may have been attached out-of-order. For L10 this also keeps the
+        # ALU ahead of BinaryOpByteZeroing/CarryProp/etc. (attached later at
+        # phase 10.7/10.8) regardless of phase-ordering subtleties.
+        alu_module = alu_cls(S, _SetDim)
+        block.post_ops.insert(0, alu_module)
 
     return Operation(
         name=name,
@@ -2386,17 +2402,20 @@ def make_l13_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
 
 # ---------------------------------------------------------------------------
 # Efficient-mode ALU wrapper installs (migrated from set_vm_weights efficient
-# branch, lines ~2208/2223/2240). Each replaces the original ``block.ffn`` with
-# a wrapper module (HybridALUBlock for L8 ADD/SUB, ALUAndOrXor for L10 bitwise,
-# ALUMul for L11 multiply). Only meaningful in efficient ALU mode; the factories
-# return a no-op operation in lookup mode so callers can register them
-# unconditionally without affecting lookup-mode bakes.
+# branch, lines ~2208/2223/2240). L10/L11 replace the original ``block.ffn``
+# with a structural neural ALU module (ALUAndOrXor for L10 bitwise, ALUMul for
+# L11 multiply). L8 attaches AddSub5StageBlock to ``block.post_ops`` (formerly
+# wrapped block.ffn with HybridALUBlock — removed 2026-05-11). Only meaningful
+# in efficient ALU mode; the factories return a no-op operation in lookup mode
+# so callers can register them unconditionally without affecting lookup-mode
+# bakes.
 #
 # Ordering notes:
 #   - L8: ``_set_layer8_alu`` + ``_set_layer8_multibyte_routing`` still live
 #     inline in legacy_bake (efficient branch) and mutate the original PureFFN.
-#     They must run BEFORE the HybridALUBlock wrap, so the L8 wrap is a
-#     ``kind="model"`` op at phase=1002 (after legacy_bake at phase=999).
+#     They must run BEFORE the AddSub5StageBlock post-op attach, so the L8
+#     wrap is a ``kind="model"`` op at phase=1002 (after legacy_bake at
+#     phase=999).
 #   - L10: nothing else mutates block.ffn after post_op_attach (phase=10.7)
 #     reads its d_model. The wrap runs at phase=10.85 — after post_op_attach
 #     (10.7) and the DIV/MOD install op (10.8), before L11 ops at 11.0.
@@ -2411,10 +2430,17 @@ def make_l13_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
 # ---------------------------------------------------------------------------
 
 def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    """Wrap L8 ``block.ffn`` with ``HybridALUBlock(ffn, AddSub5StageBlock)``.
+    """Attach ``AddSub5StageBlock`` to L8 ``block.post_ops``.
 
-    Migrates the inline efficient-mode wrap at vm_step.py:
+    Migrates the inline efficient-mode wrap at vm_step.py. Previously:
         ``model.blocks[8].ffn = HybridALUBlock(ffn8, AddSub5StageBlock(S, BD))``
+    Now:
+        ``model.blocks[8].post_ops.insert(0, AddSub5StageBlock(S, BD))``
+
+    2026-05-11 (HybridALUBlock removal): switched from wrapping block.ffn to
+    appending a post_op. ``_expand_wrapper_blocks`` Step 2 splits post_ops
+    into their own passthrough transformer blocks, producing the same final
+    layout (lookup_ffn block followed by an AddSub5StageBlock block).
 
     ``kind="model"`` at phase=1002 because the ``_set_layer8_alu`` and
     ``_set_layer8_multibyte_routing`` calls in legacy_bake (phase=999) require
@@ -2424,14 +2450,14 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
     def bake(model, dim_positions, S):
         if alu_mode != 'efficient':
             return
-        from ..hybrid_alu import HybridALUBlock
         from ..efficient_alu_addsub_split import AddSub5StageBlock
         BD = _as_setdim_proxy(dim_positions)
         block = model.blocks[8]
-        # Idempotent guard: if already wrapped (e.g. double dispatch), skip.
-        if isinstance(block.ffn, HybridALUBlock):
+        # Idempotent guard: if AddSub5StageBlock is already attached at the
+        # head of post_ops, skip (e.g. double dispatch).
+        if len(block.post_ops) > 0 and isinstance(block.post_ops[0], AddSub5StageBlock):
             return
-        block.ffn = HybridALUBlock(block.ffn, AddSub5StageBlock(S, BD))
+        block.post_ops.insert(0, AddSub5StageBlock(S, BD))
 
     return Operation(
         name="efficient_l8_addsub_wrap",
@@ -3890,7 +3916,7 @@ def make_right_size_ffns_op() -> Operation:
 
 
 def make_expand_wrapper_blocks_op() -> Operation:
-    """Split HybridALUBlock + post_ops into separate transformer blocks."""
+    """Split post_ops on each block into separate passthrough transformer blocks."""
     def bake(model, dim_positions, S):
         from ..vm_step import _expand_wrapper_blocks
         _expand_wrapper_blocks(model)
