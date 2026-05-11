@@ -327,6 +327,13 @@ class AutoregressiveVMRunner:
         # FIX 2026-05-09: In pure_neural mode, do not inject the active opcode from
         # Python — the network must determine the opcode from its own bytecode attention.
         # Other modes still need the MoE/embedding-injection hint to function.
+        #
+        # CLASSIFICATION (2026-05-11):
+        #   REQUIRED for handler-mode — older bake recipes use
+        #   set_active_opcode as a MoE/embedding hint, which the handler-
+        #   mode dispatch then relies on. Pure_neural successfully omits
+        #   this hint, so once handler-mode retires this whole block
+        #   becomes dead code.
         if not self.pure_neural:
             init_exec = self._exec_pc() // INSTR_WIDTH
             if 0 <= init_exec < len(bytecode):
@@ -352,6 +359,13 @@ class AutoregressiveVMRunner:
             # FIX 2026-05-09: In pure_neural mode, do NOT force STEP_END at position 34.
             # The model must predict step boundaries on its own. Other modes still force
             # for backward compatibility with non-neural step sequencing.
+            #
+            # CLASSIFICATION (2026-05-11):
+            #   REMOVABLE-NOW — Phase 1 confirms pure_neural emits
+            #   STEP_END at the correct position. Handler-mode keeps the
+            #   forced rewrite for legacy bakes that didn't train the
+            #   step-boundary emit. Becomes dead code once handler-mode
+            #   retires.
             if not self.pure_neural:
                 if pos_in_step == Token.STEP_TOKENS - 1 and next_token not in (Token.STEP_END, Token.HALT, Token.TOOL_CALL):
                     context[-1] = Token.STEP_END
@@ -456,6 +470,14 @@ class AutoregressiveVMRunner:
                 # handler or memory tracking. The model must handle tool-call
                 # semantics autoregressively or fail. We still need to call
                 # _dispatch_step so EXIT detection works.
+                #
+                # CLASSIFICATION (2026-05-11):
+                #   EXTERNAL — TOOL_CALL is the entry point for the host-
+                #   side I/O escape hatch (PRTF/OPEN/CLOS/READ). The
+                #   _syscall_handlers + _track_memory_write override here
+                #   mirrors what `_dispatch_step` does for STEP_END.
+                #   Keep until the neural-side TOOL_CALL emit machinery
+                #   subsumes both paths.
                 if not self.pure_neural:
                     pc = self._extract_register(context, Token.REG_PC)
                     if pc is not None:
@@ -480,6 +502,13 @@ class AutoregressiveVMRunner:
                 # FIX 2026-05-09: In pure_neural mode, do NOT override REG_AX.
                 # The model's emitted bytes ARE the result; result extraction
                 # reads them directly via _decode_exit_code().
+                #
+                # CLASSIFICATION (2026-05-11):
+                #   REMOVABLE-NOW — Phase 1 PC tests confirm pure_neural
+                #   emits AX bytes directly at the HALT point, so the
+                #   _last_ax override is redundant. The handler-mode path
+                #   re-asserts `_last_ax` which is just the Python-tracked
+                #   shadow of what the model has already emitted.
                 if not self.pure_neural:
                     # Preserve final AX value before exiting
                     self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
@@ -563,6 +592,45 @@ class AutoregressiveVMRunner:
         return imm
 
     def _dispatch_step(self, context, bytecode, exec_idx, prefix_len, output):
+        # ------------------------------------------------------------------
+        # Handler-mode override inventory (2026-05-11)
+        # ------------------------------------------------------------------
+        # The architectural goal is `pure_neural` everywhere — no Python
+        # fallbacks. Each non-pure_neural branch below is a Python "correction"
+        # of model output and is classified as one of:
+        #
+        #   REMOVABLE-NOW: pure_neural already produces this correctly today
+        #     for at least the smoke-relevant inputs. As of 2026-05-11 base
+        #     b15e428, this is Phase 1 PC/AX coherence for IMM bytes in
+        #     [1, 7, 42, 100, 200] (test_pure_neural_pc.py PASS), the
+        #     test_lev_returns_to_caller variant of LEV, and the runner-side
+        #     PUTCHAR routing in pure_neural (`output.append(chr(neural_ax))`
+        #     above). The handler-mode override is redundant for these.
+        #   REQUIRED: model can't yet produce this autoregressively. Includes:
+        #     - Phase 1 IMM=255 (sign-extension issue, returns 0xFB000000-ish)
+        #     - Phase 2 ADD/PSH (small-operand and bitwise alike)
+        #     - Phase 3 multi-byte ADD/SUB/MUL high-byte
+        #     - Phase 4 BZ/BNZ taken/not-taken
+        #     - Phase 5 JSR-then-LEV simple (test_jsr_then_lev_simple FAIL
+        #       on base b15e428), ENT-imm, nested JSR, callee-writes-AX
+        #     - Phase 7 heap (SI/LI/SC/LC), DIV/MOD/MUL/SHL/SHR
+        #   EXTERNAL: runner-side I/O escape hatch (PRTF/GETCHAR/OPEN/CLOS/
+        #     READ). These may always need a Python shim because they cross
+        #     the VM/host boundary.
+        #
+        # Counts on base b15e428:
+        #   REMOVABLE-NOW: 7 blocks (Phase 1 PC inc, BP preserve, IMM AX,
+        #                  STACK0 mirror, AX preserve, _last_pc mirror, SP
+        #                  passthrough for non-stack ops; plus _func_call_
+        #                  handlers dispatch which is dead by default)
+        #   REQUIRED:      11 blocks (PSH, JSR, ENT, LEV, JMP, BZ, BNZ, ADJ,
+        #                  binary-pop ALU, LI/LC/SI/SC heap, LEA, AX merge)
+        #   EXTERNAL:      1 block (_syscall_handlers dispatch)
+        #
+        # Each block below is tagged inline. See docs/PHASE_*.md for the
+        # phase-by-phase status that drove these classifications.
+        # ------------------------------------------------------------------
+
         exec_op = bytecode[exec_idx] & 0xFF if 0 <= exec_idx < len(bytecode) else None
         if exec_op is None:
             return False
@@ -665,6 +733,10 @@ class AutoregressiveVMRunner:
                 op = bytecode[instr_idx] & 0xFF
         if op is None:
             op = exec_op
+        # EXTERNAL: tool-boundary syscalls (OPEN/CLOS/READ/PRTF). The host-side
+        # implementation may always need a Python shim because these cross the
+        # VM/host I/O boundary. The pure_neural branch has parallel
+        # `_neural_*_emit` shims for the same ops.
         handler = self._syscall_handlers.get(op)
         if handler:
             if self._should_block_vm_memory_handler(op):
@@ -678,10 +750,19 @@ class AutoregressiveVMRunner:
         else:
             self._track_memory_write(context, op)
 
+        # REMOVABLE-NOW: `_func_call_handlers` is empty by default (cleared in
+        # __init__) and is only populated by debug fixtures. The dict-driven
+        # dispatch is dead code in the default path.
         func_handler = self._func_call_handlers.get(exec_op)
         if func_handler:
             func_handler(context, output)
 
+        # REMOVABLE-NOW (Phase 1): PC auto-increment for non-control ops
+        # (IMM/NOP/LEA/ADJ/PSH/LI/LC/SI/SC/binary-pop/...).
+        # Phase 1 (test_pure_neural_pc.py) confirms pure_neural produces
+        # PC+=INSTR_WIDTH correctly across all 13 PC tests. This override
+        # is redundant — could be deleted once the handler-mode default is
+        # retired. Smoke 2/2 + test_smoke.py rely on the legacy path for now.
         opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT,
                                     Opcode.LEV, Opcode.ENT, Opcode.JSR}
         opcodes_with_pc_handling.update(self._func_call_handlers.keys())
@@ -689,17 +770,30 @@ class AutoregressiveVMRunner:
             next_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
             self._override_register_in_last_step(context, Token.REG_PC, next_pc)
 
+        # REMOVABLE-NOW: BP preservation for ops other than ENT/LEV. Phase 1
+        # tests confirm pure_neural already preserves BP across non-frame
+        # ops (BP defaults to STACK_INIT and weights don't disturb it).
         if exec_op not in {Opcode.ENT, Opcode.LEV}:
             self._override_register_in_last_step(context, Token.REG_BP, self._last_bp)
 
         if 0 <= exec_idx < len(bytecode):
             if exec_op == Opcode.PSH:
+                # TODO(phase-2): remove once neural-side PSH SP decrement +
+                # STACK0 store works. Phase 2 (test_pure_neural_psh_add.py)
+                # confirms PSH+EXIT still xfails — model returns garbage AX
+                # after the MEM-store sequence. Required.
                 self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
                 self._inject_mem_section(self._last_sp, self._last_ax)
                 self._mem_store_word(self._last_sp, self._last_ax)
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
                 self._override_register_in_last_step(context, Token.STACK0, self._last_ax)
             elif exec_op == Opcode.JSR:
+                # TODO(phase-5): partly removable. test_jsr_then_lev_simple
+                # (XPASS) and test_lev_returns_to_caller (PASS) confirm the
+                # simple JSR+LEV roundtrip works neurally. But
+                # test_jsr_does_not_clobber_caller_ax, test_nested_jsr, and
+                # test_jsr_callee_writes_ax all xfail. Required for nested /
+                # AX-preservation paths.
                 self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
                 return_addr = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
                 self._inject_mem_section(self._last_sp, return_addr)
@@ -711,6 +805,10 @@ class AutoregressiveVMRunner:
                 self._last_pc = jsr_target_pc
                 self._override_register_in_last_step(context, Token.REG_PC, jsr_target_pc)
             elif exec_op == Opcode.ENT:
+                # TODO(phase-5): remove once _set_layer8_alu subtracts imm
+                # from SP in pure_neural. test_ent_decrements_sp_by_imm xfails
+                # today. ENT with imm=0 may work but nonzero imm fails.
+                # Required.
                 self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
                 self._inject_mem_section(self._last_sp, self._last_bp)
                 self._mem_store_word(self._last_sp, self._last_bp)
@@ -724,6 +822,11 @@ class AutoregressiveVMRunner:
                 self._last_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
                 self._override_register_in_last_step(context, Token.REG_PC, self._last_pc)
             elif exec_op == Opcode.LEV:
+                # TODO(phase-5): remove once
+                # _set_layer9_lev_bp_to_pc_relay restores PC from mem[BP+8].
+                # test_jsr_callee_writes_ax xfails; the simple roundtrip
+                # (test_jsr_then_lev_simple) does work but only because no
+                # writes happen in the callee. Required.
                 saved_bp = self._mem_load_word(self._last_bp) if self._last_bp else 0
                 return_addr = self._mem_load_word(self._last_bp + 8) if self._last_bp else 0
                 if saved_bp:
@@ -735,11 +838,20 @@ class AutoregressiveVMRunner:
                 self._last_sp = (self._last_bp + 16) & 0xFFFFFFFF
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
             elif exec_op == Opcode.JMP:
+                # TODO(phase-4): mostly removable for trivial forward JMP
+                # (test_pure_neural_jmp_bz::test_jmp_forward passes for
+                # `JMP -> NOP -> IMM -> EXIT`). But the smoke pattern
+                # `JMP -> IMM,99 -> IMM,42 -> EXIT` fails neurally. Required
+                # until the operand-specific JMP target-resolution lands.
                 target_idx = bytecode[exec_idx] >> 8
                 target_pc = self._resolve_target_pc(target_idx)
                 self._last_pc = target_pc
                 self._override_register_in_last_step(context, Token.REG_PC, target_pc)
             elif exec_op == Opcode.BZ:
+                # TODO(phase-4): remove once pure_neural BZ taken-path works
+                # (_set_layer4_ffn PC carry-forward bug). All
+                # test_pure_neural_jmp_bz BZ taken/not-taken cases xfail.
+                # Required.
                 target_idx = bytecode[exec_idx] >> 8
                 target_pc = self._resolve_target_pc(target_idx)
                 if self._last_ax == 0:
@@ -749,6 +861,8 @@ class AutoregressiveVMRunner:
                     self._last_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
                     self._override_register_in_last_step(context, Token.REG_PC, self._last_pc)
             elif exec_op == Opcode.BNZ:
+                # TODO(phase-4): remove once pure_neural BNZ taken-path works
+                # (same blocker as BZ). Required.
                 target_idx = bytecode[exec_idx] >> 8
                 target_pc = self._resolve_target_pc(target_idx)
                 if self._last_ax != 0:
@@ -758,6 +872,10 @@ class AutoregressiveVMRunner:
                     self._last_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
                     self._override_register_in_last_step(context, Token.REG_PC, self._last_pc)
             elif exec_op == Opcode.ADJ:
+                # TODO(phase-2): ADJ is "fully neural (migrated)" per F's
+                # matrix but not directly exercised by any test_pure_neural_*
+                # file. Likely removable but unverified — keep as Required
+                # until a Phase 2 test confirms.
                 instr = bytecode[exec_idx]
                 imm = instr >> 8
                 if imm >= 0x800000:
@@ -765,6 +883,15 @@ class AutoregressiveVMRunner:
                 self._last_sp = (self._last_sp + imm) & 0xFFFFFFFF
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
             elif exec_op in _BINARY_POP_OPS:
+                # TODO(phase-2/3): remove once _set_layer9_alu / _set_layer10
+                # _alu read prev STACK0 from MEM and combine with current AX
+                # for all binary ops. Phase 2 small-operand ADD/SUB/AND/OR
+                # xfail; Phase 3 multi-byte carry xfail. Required.
+                # NOTE: when trust_neural_alu=True we trust the model's AX
+                # output (no override); when False we fall back to the legacy
+                # Python ALU. Both paths still do the SP+=8 + STACK0 pop
+                # override, which is the part that's blocked on the neural
+                # MEM-load path.
                 stack_val = self._mem_load_word(self._last_sp) if self._last_sp else 0
                 self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
@@ -777,42 +904,65 @@ class AutoregressiveVMRunner:
                     self._last_ax = alu_result
                     self._override_register_in_last_step(context, Token.REG_AX, alu_result)
             elif exec_op == Opcode.LI:
+                # TODO(phase-7): remove once _set_layer15_memory_lookup
+                # (word-wide LI) works. test_si_then_li xfails. Required.
                 addr = self._last_ax
                 val = self._mem_load_word(addr)
                 self._last_ax = val
                 self._override_register_in_last_step(context, Token.REG_AX, val)
             elif exec_op == Opcode.LC:
+                # TODO(phase-7): remove once _set_layer15_memory_lookup
+                # (char-wide LC) works. test_sc_then_lc xfails. Required.
                 addr = self._last_ax
                 val = self._memory.get(addr, 0)
                 self._last_ax = val
                 self._override_register_in_last_step(context, Token.REG_AX, val)
             elif exec_op == Opcode.SI:
+                # TODO(phase-7): remove once _set_layer14_mem_generation
+                # (word-wide SI) works. Required.
                 addr = self._mem_load_word(self._last_sp) if self._last_sp else 0
                 self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
                 self._mem_store_word(addr, self._last_ax)
                 self._inject_mem_section(addr, self._last_ax)
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
             elif exec_op == Opcode.SC:
+                # TODO(phase-7): remove once _set_layer14_mem_generation
+                # (char-wide SC) works. Required.
                 addr = self._mem_load_word(self._last_sp) if self._last_sp else 0
                 self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
                 self._memory[addr] = self._last_ax & 0xFF
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
             elif exec_op not in (Opcode.IMM, Opcode.LEA, Opcode.JMP, Opcode.BZ, Opcode.BNZ,
                                  Opcode.LI, Opcode.LC, Opcode.EXIT, Opcode.NOP):
+                # REMOVABLE-NOW (Phase 1): for ops that don't otherwise touch
+                # SP, read the model's emitted SP and trust it. Phase 1
+                # confirms IMM/LEA/EXIT/NOP all leave SP untouched neurally.
                 sp_model = self._extract_register(context, Token.REG_SP)
                 if sp_model is not None:
                     self._last_sp = sp_model
 
+            # REMOVABLE-NOW (Phase 1): STACK0 mirroring for ops that don't
+            # touch the stack. Phase 1 IMM/NOP tests confirm STACK0 is
+            # preserved neurally. The override re-reads the same value that
+            # the model already emitted.
             if exec_op not in (Opcode.PSH, Opcode.JSR, Opcode.ENT, Opcode.LEV, Opcode.ADJ) and exec_op not in _BINARY_POP_OPS:
                 stack0_val = self._mem_load_word(self._last_sp) if self._last_sp else 0
                 self._override_register_in_last_step(context, Token.STACK0, stack0_val)
 
+        # AX merge / override block. The non-pure_neural path re-decodes the
+        # immediate from bytecode for IMM and merges high bytes of AX for
+        # multi-byte arith ops. Phase 1 confirms pure_neural emits the IMM
+        # value directly into AX byte 0 (and uses _last_ax for high bytes).
         ax = self._extract_register(context, Token.REG_AX)
         if ax is not None:
             AX_MODIFYING_OPS = {Opcode.IMM, Opcode.LEA,
                                Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.DIV, Opcode.MOD,
                                Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.SHL, Opcode.SHR}
             if exec_op == Opcode.IMM:
+                # REMOVABLE-NOW (Phase 1): pure_neural emits IMM into AX
+                # byte 0 directly (test_pure_neural_pc.py 13/13 PASS). This
+                # override re-derives the same imm from bytecode and
+                # overwrites the model's emitted bytes. Pure overhead.
                 exec_pc_imm = self._exec_pc()
                 exec_idx_imm = exec_pc_imm // INSTR_WIDTH
                 if 0 <= exec_idx_imm < len(bytecode):
@@ -826,6 +976,8 @@ class AutoregressiveVMRunner:
                 if exec_op in _BINARY_POP_OPS:
                     pass
                 elif exec_op == Opcode.LEA:
+                    # TODO(phase-5): remove once ENT establishes BP correctly
+                    # in pure_neural (test_lea_basic xfails). Required.
                     imm = bytecode[exec_idx] >> 8
                     if imm >= 0x800000:
                         imm -= 0x1000000
@@ -833,6 +985,9 @@ class AutoregressiveVMRunner:
                     self._last_ax = alu_result
                     self._override_register_in_last_step(context, Token.REG_AX, alu_result)
                 else:
+                    # TODO(phase-3): remove once multi-byte AX merge works
+                    # in pure_neural for ADD/SUB/AND/OR/XOR/SHL/SHR.
+                    # Required.
                     merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
                     self._last_ax = merged
                     self._override_register_in_last_step(context, Token.REG_AX, merged)
@@ -840,18 +995,32 @@ class AutoregressiveVMRunner:
                             Opcode.SI, Opcode.SC, Opcode.LI, Opcode.LC,
                             Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT,
                             Opcode.NOP, Opcode.ADJ):
+                # REMOVABLE-NOW (Phase 1): AX preservation across ops that
+                # don't modify AX. Phase 1 NOP/EXIT cases confirm pure_neural
+                # already preserves AX. The override re-asserts `_last_ax`,
+                # which is just bookkeeping from the prior step.
                 self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
             else:
+                # REQUIRED catch-all for any AX-modifying op not enumerated
+                # above. Currently unreachable given the AX_MODIFYING_OPS +
+                # non-modifying enumeration covers all opcodes.
                 merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
                 self._last_ax = merged
                 self._override_register_in_last_step(context, Token.REG_AX, merged)
 
+        # REMOVABLE-NOW (Phase 1): mirror the model's emitted PC into
+        # `_last_pc` for ops that don't have explicit PC handling above.
+        # This is observation, not override — but kept here for consistency.
         if exec_op not in (Opcode.ENT, Opcode.LEV, Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.JSR):
             pc = self._extract_register(context, Token.REG_PC)
             if pc is not None:
                 self._last_pc = pc
 
         # FIX 2026-05-09: Skip set_active_opcode in pure_neural mode (Python peek at bytecode).
+        #
+        # CLASSIFICATION (2026-05-11):
+        #   REQUIRED for handler-mode — pairs with the init-time
+        #   set_active_opcode in run(). Removable once handler-mode retires.
         if not self.pure_neural:
             next_exec = self._exec_pc() // INSTR_WIDTH
             if 0 <= next_exec < len(bytecode):
