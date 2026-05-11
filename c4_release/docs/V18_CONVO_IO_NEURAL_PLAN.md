@@ -445,3 +445,35 @@ Future work (separate PRs):
   flip after parity test passes neurally.
 - Phase 2: delete the V18 handler block once the neural path is
   end-to-end stable.
+
+## 8. Phase 1c addendum: positional attention transport bake (2026-05-11)
+
+Phase 1b shipped the capture-side bake
+(``_set_convo_io_prtf_capture`` at L7 FFN units 800-863). That bake
+writes ``POST_PRTF_PC_LO/HI`` and ``POST_PRTF_SP_LO/HI`` cache dims at
+the PRTF AX marker, where the 3b replay band (``_set_convo_io_pc_sp_latch``
+at L6 FFN units 1402-1465) reads them at the post-THINKING_START position.
+
+What was missing: **the residual stream does not propagate dim values
+across positions without an attention head**. Captured PC/SP nibbles
+sat attached to the PRTF AX marker's position; the L6 FFN replay band
+at the post-THINKING_START position saw zero. Phase 1c closes this gap.
+
+The transport bake (``_set_convo_io_prtf_transport`` at L4 attn head 4,
+factory ``make_convo_io_prtf_transport_op`` in ``flag_gated_ops.py``):
+
+- Q (post-THINKING_START position, gated by ``LAST_WAS_THINKING_START``).
+- K (matches PRTF AX marker via ``ACTIVE_OPCODE_PRTF`` AND ``MARK_AX``).
+- V/O copy the four POST_PRTF_PC/SP nibble groups across HD=64 head slots.
+- ALiBi slope = 0.1 (shallow) so the head can reach back ~80 tokens
+  across the variable-length output-byte interlude.
+
+The chain (capture 3c → transport 3d → replay 3b) is byte-aligned at
+the cache-dim level: the V18 plan §3b's POST_PRTF cache dims now have
+a complete writer-reader pair across the variable-length interlude.
+
+Status: Phase 1c shipped (this PR). All three bakes (capture, transport,
+replay) registered in ``all_core_ops()`` with double-gating
+(``enable_conversational_io`` AND per-bake ``enable=False``). Phase 2
+(deleting the V18 handler) is gated on flipping the three ``enable``
+switches together and re-running the convo-IO end-to-end test.

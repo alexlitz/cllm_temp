@@ -2319,6 +2319,7 @@ from .setup_helpers import (
     _set_convo_io_step_resume,
     _set_convo_io_pc_sp_latch,
     _set_convo_io_prtf_capture,
+    _set_convo_io_prtf_transport,
     _set_stack0_carry_attn,
     _set_tool_call_detection,
     _set_tool_call_opcode_decode,

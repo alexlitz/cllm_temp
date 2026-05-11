@@ -512,6 +512,88 @@ def make_convo_io_prtf_capture_op(
     )
 
 
+def make_convo_io_prtf_transport_op(
+    enable_conversational_io: bool = False,
+    enable: bool = False,
+) -> Operation:
+    """L4 attn head 4: V18 Phase 1c PRTF AX-marker transport bake (3d in plan).
+
+    Closes the variable-length transport gap (V18_CONVO_IO_NEURAL_PLAN.md §3,
+    Phase 1c). Pairs with the capture bake (3c, ``convo_io_prtf_capture`` at
+    L7 FFN units 800-863) and the replay bake (3b, ``convo_io_pc_sp_latch`` at
+    L6 FFN units 1402-1465). The capture stages PC/SP nibbles into
+    POST_PRTF_PC/SP cache dims at the PRTF AX marker; this op's attention
+    head reads those nibbles back at the post-THINKING_START position so the
+    replay band has them available at the same position.
+
+    Why an attention head
+    ---------------------
+    POST_PRTF_PC/SP are residual-stream dims, attached to a single token
+    position. Across the variable-length output-byte interlude
+    (THINKING_END → N output bytes → THINKING_START → next step's REG_PC)
+    the residual does NOT propagate from the capture position to the replay
+    position. An attention head with K-gating on (ACTIVE_OPCODE_PRTF AND
+    MARK_AX) and ALiBi recency bias finds the most recent PRTF AX marker
+    and copies the captured nibbles forward.
+
+    Head selection
+    --------------
+    L4 attn has heads 0 (PC relay), 2-3 (SP-to-ADDR_KEY) baked; heads 1,
+    4, 5, 6, 7 are free. We use head 4 here. Phase 4.6 places this AFTER
+    ``layer4_pc_relay`` (phase 4) and ``layer4_sp_to_addr_key`` (phase 4.5)
+    so the per-block fill_(0.5) of alibi slopes has settled before we
+    override slope[4] = 0.1.
+
+    Double-gated: both ``enable_conversational_io`` AND ``enable`` must be
+    True for the bake to fire. Defaults to a no-op for the Phase 1c
+    landing — flip ``enable=True`` once the end-to-end neural convo-IO
+    loop is validated together with the capture (3c) and replay (3b)
+    bakes.
+
+    Pinned to ``layer_idx=4`` via ``kind="block"`` so the bake hits
+    ``model.blocks[4].attn``.
+
+    No collision with existing L4 attn writes:
+      - Head 0 writes EMBED_LO/HI at AX marker (PC relay).
+      - Heads 2-3 write ADDR_B0_HI / ADDR_B1_HI / ADDR_B2_HI at AX marker
+        (SP→ADDR_KEY staging).
+      - Head 4 (this op) writes POST_PRTF_PC_LO/HI (= AX_FULL_LO/HI, dims
+        471/487) and POST_PRTF_SP_LO/HI (= AX_CARRY_LO/HI, dims 328/344)
+        at the post-THINKING_START position. None of the other L4 attn
+        heads write to those dims at the post-THINKING_START position;
+        the dim aliases (AX_FULL/AX_CARRY) are dead at this position
+        because the post-THINKING_START token is not a STACK0 marker (no
+        AX_FULL write) and not an ALU op (no AX_CARRY write).
+    """
+    def bake(block, dim_positions, S):
+        if not (enable_conversational_io and enable):
+            return
+        from ...vm_step import _set_convo_io_prtf_transport
+        attn = block.attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            # Override head 4's slope to be shallow so the head can reach
+            # back across the variable-length output-byte interlude
+            # (typically ~38..78 tokens between resume and PRTF AX marker).
+            # See _set_convo_io_prtf_transport docstring for score-budget
+            # analysis.
+            attn.alibi_slopes[4] = 0.1
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_convo_io_prtf_transport(
+            attn, S, _as_setdim_proxy(dim_positions), HD
+        )
+
+    return Operation(
+        name="convo_io_prtf_transport",
+        phase=4.6,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        layer_idx=4,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
 def make_conversational_io_output_routing_op(
     enable_conversational_io: bool = False,
 ) -> Operation:
