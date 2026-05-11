@@ -1234,9 +1234,10 @@ class AutoregressiveVM(nn.Module):
             relay_maps: dict mapping layer_index -> relay_map for that layer.
                 Default: L6 CMP relay map accounting for position-dependent
                 CMP semantics (head 0/1/4 at PC/SE, head 6 at SP/STACK0).
-            pure_neural: If True, the SoftMoEFFN always uses ``_soft_forward``
-                (all experts run, ONNX-traceable). Otherwise it uses the fast
-                skip-inactive path at runtime.
+            pure_neural: Deprecated no-op. Forwarded to ``SoftMoEFFN`` for
+                back-compat but has no effect on routing — runtime forward
+                is always sparse (skip-inactive). Only ONNX export tracing
+                switches to the all-experts ``_soft_forward`` path.
         """
         from .pure_moe import SoftMoEFFN, build_soft_moe_from_compact_partition
 
