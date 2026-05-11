@@ -474,18 +474,29 @@ class ComparisonCombine(PureFFN):
     and is treated structurally like every other FFN by tooling.
     """
 
-    def __init__(self, d_model=512, S=100.0):
+    def __init__(self, d_model=512, S=100.0, dim_positions=None):
         # PureFFN.__init__ calls _bake_weights(); store config first so _bake_weights
         # can read it. We use object.__setattr__ to bypass nn.Module.__setattr__ since
         # nn.Module isn't initialized yet at this point.
         object.__setattr__(self, '_pending_S', S)
+        # Stash dim_positions BEFORE super().__init__ so _bake_weights (called
+        # from PureFFN.__init__) sees compact positions if provided. Mirrors the
+        # BinaryOpByteZeroingPostOp A1 fix (commit 5fc519d): without this, the
+        # bake writes to legacy `_SetDim` positions which alias unrelated dims
+        # in pin_io_only=True compact layouts.
+        object.__setattr__(self, '_pending_dim_positions', dim_positions)
         super().__init__(dim=d_model, hidden_dim=18)
         self.d_model = d_model
         self.S = S
 
     def _bake_weights(self):
         S = self._pending_S
-        BD = _SetDim
+        dim_positions = getattr(self, '_pending_dim_positions', None)
+        if dim_positions is not None:
+            from .unified_compiler.ops.shared import _as_setdim_proxy
+            BD = _as_setdim_proxy(dim_positions)
+        else:
+            BD = _SetDim
         unit = 0
 
         # FIX 2026-05-09: All ComparisonCombine units add a strong MARK_PC blocker.
@@ -648,10 +659,14 @@ class CarryPropagationPostOp(PureFFN):
     Phase 0 conversion (2026-05-09): subclasses PureFFN.
     """
 
-    def __init__(self, d_model=512, S=100.0, byte_idx=0, cascade=False):
+    def __init__(self, d_model=512, S=100.0, byte_idx=0, cascade=False, dim_positions=None):
         object.__setattr__(self, '_pending_S', S)
         object.__setattr__(self, '_pending_byte_idx', byte_idx)
         object.__setattr__(self, '_pending_cascade', cascade)
+        # Stash dim_positions BEFORE super().__init__ so _bake_weights (called
+        # from PureFFN.__init__) sees compact positions if provided. Mirrors the
+        # BinaryOpByteZeroingPostOp A1 fix (commit 5fc519d).
+        object.__setattr__(self, '_pending_dim_positions', dim_positions)
         super().__init__(dim=d_model, hidden_dim=512)
         self.d_model = d_model
         self.S = S
@@ -660,7 +675,12 @@ class CarryPropagationPostOp(PureFFN):
         S = self._pending_S
         byte_idx = self._pending_byte_idx
         cascade = self._pending_cascade
-        BD = _SetDim
+        dim_positions = getattr(self, '_pending_dim_positions', None)
+        if dim_positions is not None:
+            from .unified_compiler.ops.shared import _as_setdim_proxy
+            BD = _as_setdim_proxy(dim_positions)
+        else:
+            BD = _SetDim
 
         byte_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][byte_idx]
         add_carry_in = BD.CARRY + (3 if cascade else 1)
@@ -768,15 +788,24 @@ class BitwiseBytePropagationPostOp(PureFFN):
     Phase 0 conversion (2026-05-09): subclasses PureFFN.
     """
 
-    def __init__(self, d_model=512, S=100.0):
+    def __init__(self, d_model=512, S=100.0, dim_positions=None):
         object.__setattr__(self, '_pending_S', S)
+        # Stash dim_positions BEFORE super().__init__ so _bake_weights (called
+        # from PureFFN.__init__) sees compact positions if provided. Mirrors the
+        # BinaryOpByteZeroingPostOp A1 fix (commit 5fc519d).
+        object.__setattr__(self, '_pending_dim_positions', dim_positions)
         super().__init__(dim=d_model, hidden_dim=1536)
         self.d_model = d_model
         self.S = S
 
     def _bake_weights(self):
         S = self._pending_S
-        BD = _SetDim
+        dim_positions = getattr(self, '_pending_dim_positions', None)
+        if dim_positions is not None:
+            from .unified_compiler.ops.shared import _as_setdim_proxy
+            BD = _as_setdim_proxy(dim_positions)
+        else:
+            BD = _SetDim
 
         unit = 0
         with torch.no_grad():
