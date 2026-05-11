@@ -252,8 +252,6 @@ class AutoregressiveVMRunner:
         self._mem_history = {}  # addr → token sequence for memory value
         self._mem_access_order = []  # LRU tracking: most recent at end
 
-        self._func_call_handlers = {}
-
         # If True: disable runner VM-memory emulation paths and only allow
         # explicit external tool boundary handling.
         self.pure_attention_memory = pure_attention_memory
@@ -737,32 +735,6 @@ class AutoregressiveVMRunner:
         else:
             self._track_memory_write(context, op)
 
-        # REMOVABLE-NOW: `_func_call_handlers` is empty by default (cleared in
-        # __init__) and is only populated by debug fixtures. The dict-driven
-        # dispatch is dead code in the default path.
-        func_handler = self._func_call_handlers.get(exec_op)
-        if func_handler:
-            func_handler(context, output)
-
-        # REMOVABLE-NOW (Phase 1): PC auto-increment for non-control ops
-        # (IMM/NOP/LEA/ADJ/PSH/LI/LC/SI/SC/binary-pop/...).
-        # Phase 1 (test_pure_neural_pc.py) confirms pure_neural produces
-        # PC+=INSTR_WIDTH correctly across all 13 PC tests. This override
-        # is redundant — could be deleted once the handler-mode default is
-        # retired. Smoke 2/2 + test_smoke.py rely on the legacy path for now.
-        opcodes_with_pc_handling = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT,
-                                    Opcode.LEV, Opcode.ENT, Opcode.JSR}
-        opcodes_with_pc_handling.update(self._func_call_handlers.keys())
-        if exec_op not in opcodes_with_pc_handling:
-            next_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
-            self._override_register_in_last_step(context, Token.REG_PC, next_pc)
-
-        # REMOVABLE-NOW: BP preservation for ops other than ENT/LEV. Phase 1
-        # tests confirm pure_neural already preserves BP across non-frame
-        # ops (BP defaults to STACK_INIT and weights don't disturb it).
-        if exec_op not in {Opcode.ENT, Opcode.LEV}:
-            self._override_register_in_last_step(context, Token.REG_BP, self._last_bp)
-
         if 0 <= exec_idx < len(bytecode):
             if exec_op == Opcode.PSH:
                 # TODO(phase-2): remove once neural-side PSH SP decrement +
@@ -919,81 +891,20 @@ class AutoregressiveVMRunner:
                 self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
                 self._memory[addr] = self._last_ax & 0xFF
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-            elif exec_op not in (Opcode.IMM, Opcode.LEA, Opcode.JMP, Opcode.BZ, Opcode.BNZ,
-                                 Opcode.LI, Opcode.LC, Opcode.EXIT, Opcode.NOP):
-                # REMOVABLE-NOW (Phase 1): for ops that don't otherwise touch
-                # SP, read the model's emitted SP and trust it. Phase 1
-                # confirms IMM/LEA/EXIT/NOP all leave SP untouched neurally.
-                sp_model = self._extract_register(context, Token.REG_SP)
-                if sp_model is not None:
-                    self._last_sp = sp_model
 
-            # REMOVABLE-NOW (Phase 1): STACK0 mirroring for ops that don't
-            # touch the stack. Phase 1 IMM/NOP tests confirm STACK0 is
-            # preserved neurally. The override re-reads the same value that
-            # the model already emitted.
-            if exec_op not in (Opcode.PSH, Opcode.JSR, Opcode.ENT, Opcode.LEV, Opcode.ADJ) and exec_op not in _BINARY_POP_OPS:
-                stack0_val = self._mem_load_word(self._last_sp) if self._last_sp else 0
-                self._override_register_in_last_step(context, Token.STACK0, stack0_val)
-
-        # AX merge / override block. The non-pure_neural path re-decodes the
-        # immediate from bytecode for IMM and merges high bytes of AX for
-        # multi-byte arith ops. Phase 1 confirms pure_neural emits the IMM
-        # value directly into AX byte 0 (and uses _last_ax for high bytes).
+        # AX merge / override block (handler-mode only). Pure_neural already
+        # emits IMM into AX byte 0 directly and preserves AX across non-modifying
+        # ops, so those cases (R6/R4) are intentionally absent here.
         ax = self._extract_register(context, Token.REG_AX)
-        if ax is not None:
-            AX_MODIFYING_OPS = {Opcode.IMM, Opcode.LEA,
-                               Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.DIV, Opcode.MOD,
-                               Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.SHL, Opcode.SHR}
-            if exec_op == Opcode.IMM:
-                # REMOVABLE-NOW (Phase 1): pure_neural emits IMM into AX
-                # byte 0 directly (test_pure_neural_pc.py 13/13 PASS). This
-                # override re-derives the same imm from bytecode and
-                # overwrites the model's emitted bytes. Pure overhead.
-                exec_pc_imm = self._exec_pc()
-                exec_idx_imm = exec_pc_imm // INSTR_WIDTH
-                if 0 <= exec_idx_imm < len(bytecode):
-                    instr = bytecode[exec_idx_imm]
-                    imm = instr >> 8
-                    if imm >= 0x800000:
-                        imm -= 0x1000000
-                    imm &= 0xFFFFFFFF
-                    self._override_ax_in_last_step(context, imm)
-            elif exec_op in AX_MODIFYING_OPS:
-                if exec_op in _BINARY_POP_OPS:
-                    pass
-                elif exec_op == Opcode.LEA:
-                    # TODO(phase-5): remove once ENT establishes BP correctly
-                    # in pure_neural (test_lea_basic xfails). Required.
-                    imm = bytecode[exec_idx] >> 8
-                    if imm >= 0x800000:
-                        imm -= 0x1000000
-                    alu_result = (self._last_bp + imm) & 0xFFFFFFFF
-                    self._last_ax = alu_result
-                    self._override_register_in_last_step(context, Token.REG_AX, alu_result)
-                else:
-                    # TODO(phase-3): remove once multi-byte AX merge works
-                    # in pure_neural for ADD/SUB/AND/OR/XOR/SHL/SHR.
-                    # Required.
-                    merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
-                    self._last_ax = merged
-                    self._override_register_in_last_step(context, Token.REG_AX, merged)
-            elif exec_op in (Opcode.PSH, Opcode.JSR, Opcode.ENT, Opcode.LEV,
-                            Opcode.SI, Opcode.SC, Opcode.LI, Opcode.LC,
-                            Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.EXIT,
-                            Opcode.NOP, Opcode.ADJ):
-                # REMOVABLE-NOW (Phase 1): AX preservation across ops that
-                # don't modify AX. Phase 1 NOP/EXIT cases confirm pure_neural
-                # already preserves AX. The override re-asserts `_last_ax`,
-                # which is just bookkeeping from the prior step.
-                self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
-            else:
-                # REQUIRED catch-all for any AX-modifying op not enumerated
-                # above. Currently unreachable given the AX_MODIFYING_OPS +
-                # non-modifying enumeration covers all opcodes.
-                merged = (ax & 0xFF) | (self._last_ax & 0xFFFFFF00)
-                self._last_ax = merged
-                self._override_register_in_last_step(context, Token.REG_AX, merged)
+        if ax is not None and exec_op == Opcode.LEA:
+            # TODO(phase-5): remove once ENT establishes BP correctly
+            # in pure_neural (test_lea_basic xfails). Required.
+            imm = bytecode[exec_idx] >> 8
+            if imm >= 0x800000:
+                imm -= 0x1000000
+            alu_result = (self._last_bp + imm) & 0xFFFFFFFF
+            self._last_ax = alu_result
+            self._override_register_in_last_step(context, Token.REG_AX, alu_result)
 
         # REMOVABLE-NOW (Phase 1): mirror the model's emitted PC into
         # `_last_pc` for ops that don't have explicit PC handling above.
@@ -1006,7 +917,7 @@ class AutoregressiveVMRunner:
         # MoE routing is tensor-native (see neural_vm.pure_moe.SoftMoEFFN);
         # no per-step weight swap is needed between forward calls.
 
-        if exec_op in _MEM_STORE_OPS and exec_op not in self._func_call_handlers:
+        if exec_op in _MEM_STORE_OPS:
             mem_section = self._extract_mem_section(context)
             if mem_section is not None:
                 addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
