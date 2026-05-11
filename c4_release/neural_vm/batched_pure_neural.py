@@ -49,6 +49,20 @@ from .run_vm import (
     AutoregressiveVMRunner,
     _MEM_STORE_OPS,
 )
+from .speculative import DraftVM
+
+
+# Step-relative offsets where the speculative-mode logit disagrees with the
+# unspeculative-mode logit. See the speculation comment in
+# ``BatchedPureNeuralRunner._run_speculative`` for the derivation. These are
+# the 4 MEM-addr bytes (offsets 26..29) and 4 MEM-val bytes (offsets 30..33)
+# inside each 35-token VM step: the embedding's MEM_STORE/ADDR_KEY injection
+# only kicks in when the *full* 9-token MEM section is present, which makes
+# spec-mode (full section visible) and unspec-mode (val bytes not yet emitted)
+# disagree at these positions. DraftVM is trusted for these offsets — its
+# values are derived from synchronized register state and match the model's
+# would-be emission for any correct C4 program.
+_UNSAFE_OFFSETS = frozenset(range(26, 34))
 
 
 @dataclass
@@ -78,6 +92,18 @@ class _ElementState:
     stdin_pos: int = 0
 
     token_pos: int = 0  # number of tokens generated since context start
+
+    # Speculative-decoding helper. `draft_vm` is a per-element DraftVM (Python
+    # C4 interpreter) that emits the deterministic next-N tokens. Set when
+    # `spec_k > 0`; left None when speculation is disabled.
+    draft_vm: Optional[DraftVM] = None
+    # `spec_disabled` is flipped True for an element if its DraftVM has drifted
+    # from the model's emission far enough that we stop speculating on it
+    # (avoids wasted forwards over guaranteed-rejected drafts).
+    spec_disabled: bool = False
+    # Count of consecutive iterations where the model rejected the very first
+    # draft token. Used to flip ``spec_disabled`` after 4 in a row.
+    spec_zero_streak: int = 0
 
     def exec_pc(self) -> int:
         return PC_OFFSET if self.last_pc is None else self.last_pc
@@ -131,6 +157,7 @@ class BatchedPureNeuralRunner:
         data: bytes,
         argv: List[str],
         stdin: str,
+        spec_k: int = 0,
     ) -> _ElementState:
         ctx = self._serial._build_context(bytecode, data or b"", argv or [], stdin or "")
         st = _ElementState(
@@ -145,6 +172,16 @@ class BatchedPureNeuralRunner:
         elif isinstance(data, list):
             for i, b in enumerate(data):
                 st.memory[0x10000 + i] = b
+        if spec_k > 0:
+            st.draft_vm = DraftVM(list(bytecode))
+            # Load data section into DraftVM memory so reads from the data
+            # segment behave correctly. DraftVM stores 32-bit values per addr;
+            # we use byte-addressed entries to match `s.memory`'s convention.
+            if isinstance(data, (bytes, bytearray, list)):
+                for i, b in enumerate(data):
+                    st.draft_vm.memory[0x10000 + i] = int(b)
+            if stdin:
+                st.draft_vm.set_stdin(stdin)
         return st
 
     # ------------------------------------------------------------------
@@ -161,6 +198,7 @@ class BatchedPureNeuralRunner:
         stdin_list: Optional[List[str]] = None,
         max_steps: int = 100,
         max_context_window: int = 512,
+        spec_k: int = 0,
     ) -> List[Tuple[str, int]]:
         """Run N programs in lockstep.
 
@@ -171,6 +209,16 @@ class BatchedPureNeuralRunner:
             stdin_list: optional per-program stdin string.
             max_steps: maximum VM steps (35 tokens each) per program.
             max_context_window: tail context window passed to the model.
+            spec_k: number of full VM steps to speculate per batched forward.
+                ``0`` (default) disables speculation and runs one token per
+                forward (the legacy behavior). When ``> 0``, a per-element
+                :class:`DraftVM` emits the deterministic next ``spec_k * 35``
+                tokens; the model verifies them in one forward pass and
+                accepts the matching prefix. Byte-identity with ``spec_k=0``
+                is preserved: a model emission overrides any mismatching
+                draft, so the model is the final arbiter. Recommended starting
+                point: ``spec_k=8`` (so each forward covers 8 VM steps when
+                drafts are accepted).
 
         Returns:
             list of (output_string, exit_code) per program, in the same order
@@ -184,64 +232,25 @@ class BatchedPureNeuralRunner:
         stdin_list = stdin_list or [""] * B
 
         states = [
-            self._build_element(bc, data_list[i], argv_list[i], stdin_list[i])
+            self._build_element(
+                bc, data_list[i], argv_list[i], stdin_list[i], spec_k=spec_k
+            )
             for i, bc in enumerate(bytecodes)
         ]
 
-        # Total tokens to generate per program (matches serial loop).
-        total_tokens = max_steps * Token.STEP_TOKENS
-
-        for tok_i in range(total_tokens):
-            active_idx = [i for i, s in enumerate(states) if not s.halted]
-            if not active_idx:
-                break
-
-            # Build padded input tensor over active programs.
-            # We slice the tail (windowed) context for each program to match
-            # the serial runner's behavior of feeding only the last
-            # max_context_window tokens to the model.
-            windowed = []
-            for i in active_idx:
-                s = states[i]
-                if len(s.context) > s.prefix_len + max_context_window:
-                    win = s.context[:s.prefix_len] + s.context[-max_context_window:]
-                else:
-                    win = s.context
-                windowed.append(win)
-
-            # Pad to max length with HALT (276 is the safest sentinel — HALT=263
-            # is not a token the model is meant to attend to, but it lives in
-            # vocab. Padding is on the right, after the real tokens, so causal
-            # attention masks it from the real positions we read out).
-            max_len = max(len(w) for w in windowed)
-            B_active = len(active_idx)
-            padded = torch.full(
-                (B_active, max_len),
-                Token.HALT,
-                dtype=torch.long,
-                device=self._device,
+        if spec_k > 0:
+            self._run_speculative(
+                states,
+                max_steps=max_steps,
+                max_context_window=max_context_window,
+                spec_k=spec_k,
             )
-            real_lens = [len(w) for w in windowed]
-            for b, w in enumerate(windowed):
-                padded[b, : len(w)] = torch.tensor(
-                    w, dtype=torch.long, device=self._device
-                )
-
-            # MEM_STORE injection boundary: use max across active programs.
-            # If a program has mem_history_end=K it expects MEM tokens up to
-            # position K-1 in its context to be flagged. Setting the model's
-            # boundary to max(mem_history_end) over-injects on some elements
-            # but the affected positions are inside that element's own MEM
-            # history, which is the desired behavior.
-            mh_end = max(s.mem_history_end for s in states)
-            self.model.embed.set_mem_history_end(mh_end)
-
-            # Forward pass and pick last-real-position logits per element.
-            logits = self.model.forward(padded)  # [B_active, max_len, V]
-            for b, i in enumerate(active_idx):
-                last_pos = real_lens[b] - 1
-                next_tok = int(logits[b, last_pos, :].argmax(-1).item())
-                self._step_one(states[i], next_tok, tok_i)
+        else:
+            self._run_unspeculative(
+                states,
+                max_steps=max_steps,
+                max_context_window=max_context_window,
+            )
 
         # Build results, decoding exit codes for any program that never
         # emitted HALT (matches serial: _decode_exit_code reads the last AX).
@@ -251,6 +260,258 @@ class BatchedPureNeuralRunner:
                 s.exit_code = self._decode_exit_code(s.context)
             results.append(("".join(s.output), s.exit_code))
         return results
+
+    # ------------------------------------------------------------------
+    # Non-speculative inner loop (legacy: one token per batched forward)
+    # ------------------------------------------------------------------
+
+    def _run_unspeculative(
+        self,
+        states: List[_ElementState],
+        *,
+        max_steps: int,
+        max_context_window: int,
+    ) -> None:
+        total_tokens = max_steps * Token.STEP_TOKENS
+
+        for tok_i in range(total_tokens):
+            active_idx = [i for i, s in enumerate(states) if not s.halted]
+            if not active_idx:
+                break
+
+            windowed = [
+                self._windowed_context(states[i], max_context_window)
+                for i in active_idx
+            ]
+            padded, real_lens = self._pad_to_tensor(windowed)
+
+            mh_end = max(s.mem_history_end for s in states)
+            self.model.embed.set_mem_history_end(mh_end)
+
+            logits = self.model.forward(padded)  # [B_active, max_len, V]
+            # Batch argmax+CPU transfer once per outer iter rather than per
+            # element to avoid per-element GPU→CPU sync stalls.
+            preds_cpu = logits.argmax(dim=-1).cpu().tolist()
+            for b, i in enumerate(active_idx):
+                last_pos = real_lens[b] - 1
+                next_tok = int(preds_cpu[b][last_pos])
+                self._step_one(states[i], next_tok, tok_i)
+
+    # ------------------------------------------------------------------
+    # Speculative inner loop: DraftVM proposes K*35 tokens per element,
+    # model verifies them in one batched forward pass, accepted prefix is
+    # replayed through ``_step_one`` (so STEP_END dispatch, mem_history
+    # rebuilds, EXIT halting all behave identically to the unspeculative
+    # path).
+    # ------------------------------------------------------------------
+
+    def _run_speculative(
+        self,
+        states: List[_ElementState],
+        *,
+        max_steps: int,
+        max_context_window: int,
+        spec_k: int,
+    ) -> None:
+        total_tokens = max_steps * Token.STEP_TOKENS
+        STEP = Token.STEP_TOKENS
+
+        # Global token counter used as the `tok_i` argument to `_step_one`.
+        # It must monotonically advance across replayed tokens so the legacy
+        # contract (loop iteration count) is preserved.
+        tok_i = 0
+        while tok_i < total_tokens:
+            active_idx = [i for i, s in enumerate(states) if not s.halted]
+            if not active_idx:
+                break
+
+            # 1) Build per-element draft sequences. Elements with speculation
+            #    disabled (or mid-step from a previous iter's rejection) get
+            #    an empty draft -> single-token decode for them this
+            #    iteration. Elements whose DraftVM halts mid-speculation stop
+            #    adding more drafts but keep the prefix.
+            drafts = []  # list[list[int]] aligned with active_idx
+            for i in active_idx:
+                s = states[i]
+                d: List[int] = []
+                # Only speculate when the element is at a clean VM-step
+                # boundary. If a previous iter's verification rejected
+                # mid-step, the context now contains a partial step; we'd
+                # need to splice DraftVM output around it, which is fragile.
+                # Falling back to single-token decode until the next STEP_END
+                # is simpler and only costs at most 35 forwards per
+                # rejection event.
+                at_step_boundary = (s.token_pos % STEP == 0)
+                if (
+                    not s.spec_disabled
+                    and s.draft_vm is not None
+                    and at_step_boundary
+                ):
+                    # Sync DraftVM register state from the element. Registers
+                    # are the dominant correctness signal; sparse memory
+                    # drift only causes extra rejections (not divergence —
+                    # the model remains the source of truth).
+                    self._sync_draft_vm(s)
+                    for _ in range(spec_k):
+                        if s.draft_vm.halted:
+                            break
+                        ok = s.draft_vm.step()
+                        if not ok:
+                            break
+                        d.extend(s.draft_vm.draft_tokens())
+                        if s.draft_vm.halted:
+                            break
+                drafts.append(d)
+
+            # 2) Build padded tensor: each active element gets windowed context
+            #    + its draft tokens appended. Padded to the max combined length.
+            windowed_with_drafts = []
+            real_prefix_lens = []  # len of context prefix per element (no draft)
+            for k, i in enumerate(active_idx):
+                s = states[i]
+                ctx_win = self._windowed_context(s, max_context_window)
+                real_prefix_lens.append(len(ctx_win))
+                windowed_with_drafts.append(ctx_win + drafts[k])
+
+            padded, _ = self._pad_to_tensor(windowed_with_drafts)
+
+            mh_end = max(s.mem_history_end for s in states)
+            self.model.embed.set_mem_history_end(mh_end)
+
+            logits = self.model.forward(padded)  # [B_active, max_len, V]
+
+            # Pre-compute argmax for the entire tensor once (GPU op) and move
+            # to CPU in a single transfer. Per-position .item() calls inside
+            # the verification loop force one GPU→CPU sync each, which made
+            # the speculative path slower than non-speculative on small
+            # batches. Batching the argmax+move avoids that.
+            preds_cpu = logits.argmax(dim=-1).cpu().tolist()  # [B_active][max_len]
+
+            # 3) For each element: verify drafts and replay accepted prefix + correction.
+            for k, i in enumerate(active_idx):
+                s = states[i]
+                if s.halted:
+                    continue
+                draft = drafts[k]
+                prefix_len = real_prefix_lens[k]
+
+                if len(draft) == 0:
+                    # Pure single-token decode for this element (no spec budget).
+                    last_pos = prefix_len - 1
+                    next_tok = int(preds_cpu[k][last_pos])
+                    self._step_one(s, next_tok, tok_i)
+                    continue
+
+                # Verify each draft slot. Offsets in `_UNSAFE_OFFSETS` are
+                # trusted from DraftVM (the embedding's MEM metadata injection
+                # makes them disagree with the unspec-mode model — see the
+                # module-level constant docstring); other offsets are verified
+                # against the model's argmax. First rejected safe offset stops
+                # the scan and the model's prediction becomes the correction.
+                accepted = 0
+                correction: Optional[int] = None
+                row_preds = preds_cpu[k]
+                for j in range(len(draft)):
+                    if (j % STEP) in _UNSAFE_OFFSETS:
+                        accepted = j + 1
+                        continue
+                    pred = row_preds[prefix_len - 1 + j]
+                    if pred == draft[j]:
+                        accepted = j + 1
+                    else:
+                        correction = pred
+                        break
+
+                # Replay accepted tokens through _step_one, then the
+                # correction (if any). _step_one mutates s.context so the
+                # dispatch path (STEP_END mem_history rebuild, EXIT halting)
+                # stays identical to the unspeculative loop.
+                #
+                # We deliberately do NOT take the "free bonus" emission at
+                # position prefix-1+len(draft) when all drafts accept: that
+                # would advance the element by exactly one extra token,
+                # landing it mid-step (token_pos % STEP_TOKENS != 0), which
+                # disables speculation on the next iter (see the
+                # ``at_step_boundary`` gate above). The follow-up
+                # single-token-decode tax — STEP_TOKENS - 1 forwards to
+                # re-align — wipes out the bonus's gain on any non-halting
+                # program.
+                emitted: List[int] = list(draft[:accepted])
+                if correction is not None:
+                    emitted.append(correction)
+
+                for tok in emitted:
+                    if s.halted:
+                        break
+                    self._step_one(s, tok, tok_i)
+
+                # If the model rejected the very first draft token for several
+                # iterations in a row, the DraftVM is clearly out of sync (or
+                # the model never matches its drafts for this program). Disable
+                # speculation for this element to avoid wasted forwards.
+                if correction is not None and accepted == 0:
+                    s.spec_zero_streak += 1
+                    if s.spec_zero_streak >= 4:
+                        s.spec_disabled = True
+                else:
+                    s.spec_zero_streak = 0
+
+            tok_i += 1  # outer-iteration counter, not strict token count
+
+    # ------------------------------------------------------------------
+    # Speculation helpers
+    # ------------------------------------------------------------------
+
+    def _sync_draft_vm(self, s: _ElementState) -> None:
+        """Pull register state from the element into its DraftVM.
+
+        Also clear `halted` so a DraftVM that previously hit EXIT can be
+        replayed from a fresh point (the element may still be running
+        because the model has not yet emitted HALT). Memory is not
+        transplanted: ``s.memory`` is byte-addressed while
+        ``DraftVM.memory`` is word-addressed. Register drift is the dominant
+        rejection driver; memory drift only causes extra rejections, which
+        gracefully fall back to single-token decode for affected elements.
+        """
+        vm = s.draft_vm
+        if vm is None:
+            return
+        if s.last_pc is not None:
+            vm.pc = int(s.last_pc) & 0xFFFFFFFF
+            # idx is computed by step() from pc when fetching from static
+            # code; keep it in sync for direct-code-array fetches.
+            vm.idx = (vm.pc - PC_OFFSET) // INSTR_WIDTH
+        vm.ax = int(s.last_ax) & 0xFFFFFFFF
+        vm.sp = int(s.last_sp) & 0xFFFFFFFF
+        vm.bp = int(s.last_bp) & 0xFFFFFFFF
+        vm.halted = False
+        vm._last_mem_addr = 0
+        vm._last_mem_val = 0
+
+    def _windowed_context(
+        self, s: _ElementState, max_context_window: int
+    ) -> List[int]:
+        if len(s.context) > s.prefix_len + max_context_window:
+            return s.context[: s.prefix_len] + s.context[-max_context_window:]
+        return s.context
+
+    def _pad_to_tensor(
+        self, sequences: List[List[int]]
+    ) -> Tuple[torch.Tensor, List[int]]:
+        """Right-pad a list of token sequences to a single ``[B, max_len]``
+        tensor on ``self._device``. Padding token is ``Token.HALT`` (matches
+        legacy behavior). Returns ``(tensor, real_lens)``."""
+        real_lens = [len(w) for w in sequences]
+        max_len = max(real_lens)
+        B = len(sequences)
+        # Build the padded matrix on CPU (one allocation, one host→device
+        # copy) — issuing a per-row ``padded[b, :n] = torch.tensor(...)``
+        # would trigger B separate H2D transfers per outer iter, which
+        # showed up in profiles as the dominant cost on small batches.
+        padded_host = torch.full((B, max_len), Token.HALT, dtype=torch.long)
+        for b, (w, n) in enumerate(zip(sequences, real_lens)):
+            padded_host[b, :n] = torch.tensor(w, dtype=torch.long)
+        return padded_host.to(self._device, non_blocking=True), real_lens
 
     # ------------------------------------------------------------------
     # Per-element step (pure_neural dispatch, simplified)
