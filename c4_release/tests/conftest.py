@@ -326,6 +326,53 @@ def pure_neural_runner(_pure_neural_runner_model):
     return runner
 
 
+# =============================================================================
+# Batched pure-neural runner (optional, additive fixture)
+# =============================================================================
+#
+# `BatchedPureNeuralRunner` runs N programs through one batched forward pass
+# per token instead of N serial passes. Tests that want to opt in can take the
+# `batched_pure_neural_runner` fixture below; it shares the SAME compiled model
+# as `_pure_neural_runner_model` (constructed once at session build time), so
+# fixture cost is amortized identically.
+#
+# Equivalence: every batch element must produce the same `(output, exit_code)`
+# as the serial runner running that program alone. See `test_batched_pure_neural`
+# for element-by-element verification on a small batch.
+#
+# Existing tests are unchanged — this is purely additive. Future refactors can
+# group N tests into a single batched call to cut wall-clock for phases with
+# many uniformly-sized tests (e.g. Phase 1 PC arithmetic, Phase 7 heap+DIV).
+
+@pytest.fixture(scope="session")
+def _batched_pure_neural_runner_model(_pure_neural_runner_model):
+    """Session-scoped BatchedPureNeuralRunner sharing the pure_neural model.
+
+    Wraps the same compiled AutoregressiveVM as `pure_neural_runner` so the
+    expensive bake (`compile_full_vm` + `set_vm_weights`) happens once.
+    """
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+    return BatchedPureNeuralRunner(model_runner=_pure_neural_runner_model)
+
+
+@pytest.fixture
+def batched_pure_neural_runner(_batched_pure_neural_runner_model):
+    """Batched pure-neural runner; opt-in alternative to `pure_neural_runner`.
+
+    Use when a test (or test group) has multiple bytecodes that can run in one
+    batched forward pass — e.g. parameterized over immediate values, or a
+    "phase" gate that runs ~10-25 similar programs. Call:
+
+        results = batched_pure_neural_runner.run_batch(bytecodes, max_steps=N)
+
+    Returns a list of `(output_string, exit_code)` tuples in input order.
+
+    For single-program tests, `pure_neural_runner` is still simpler and just
+    as fast since batch=1 collapses to one forward per token anyway.
+    """
+    return _batched_pure_neural_runner_model
+
+
 @pytest.fixture
 def handler_status():
     """Get current handler registration status."""
