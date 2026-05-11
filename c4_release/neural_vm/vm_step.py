@@ -2264,6 +2264,8 @@ from .setup_helpers import (
     _set_layer9_lev_addr_relay,
     _set_layer9_lev_bp_to_pc_relay,
     _set_null_terminator_detection,
+    _set_convo_io_step_resume,
+    _set_convo_io_pc_sp_latch,
     _set_stack0_carry_attn,
     _set_tool_call_detection,
     _set_tool_call_opcode_decode,

@@ -1883,3 +1883,119 @@ def _set_conversational_io_output_routing(ffn, S, BD):
         ffn.W_gate[unit, BD.OUTPUT_BYTE_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
+
+
+
+# =============================================================================
+# V18 Phase 1: step-resumption + PC/SP latch (V18_CONVO_IO_NEURAL_PLAN.md §3)
+# =============================================================================
+#
+# These two helpers close the gap identified in §3 of the V18 plan: with the
+# existing convo-IO pipeline (L2/L3/L5/L6/L7/L8/L9/L10/L15) plus these two
+# bakes, the model can autonomously emit
+# ``THINKING_END → bytes → THINKING_START → REG_PC → ... → STEP_END`` with no
+# Python intervention.
+#
+# Both are wired into ``set_vm_weights`` only when both
+# ``enable_conversational_io=True`` AND the Phase 1 gates
+# (``enable_convo_io_step_resume`` / ``enable_convo_io_pc_sp_latch``) are
+# True. The Phase 1 gates default to False so this landing is byte-identical
+# to the prior compile (the FFN units below are simply left zero).
+#
+# Unit allocation (kept disjoint from existing convo-IO + V9 PUTCHAR ranges):
+#
+#   L3 FFN unit 1035     — _set_convo_io_step_resume (3a)
+#                          extends _set_conversational_io_state_init at 1034
+#   L6 FFN units 1402-1465 — _set_convo_io_pc_sp_latch (3b) replay unit band
+#                            (32 units for PC nibbles + 32 for SP nibbles).
+#                            Starts at 1402 — directly after the existing
+#                            convo-IO state-machine units 1400-1401 and
+#                            below the V9 PUTCHAR routing band (1500-1532),
+#                            so no overlap with any baked unit today.
+#
+# The latch *capture* side (read MARK_PC/MARK_SP value bytes at the PRTF
+# step and stage them into dedicated cache dims) is intentionally left for
+# Phase 1b; this PR ships the *replay* side and the gate plumbing so the
+# infrastructure is in place and Phase 1b can land an attention bake that
+# wires into the same units.
+
+
+def _set_convo_io_step_resume(ffn, S, BD):
+    """L3 FFN addition (V18 Phase 1, bake 3a): resume normal stepping after
+    ``LAST_WAS_THINKING_START``.
+
+    When the previous token was THINKING_START, this fires:
+    - Set NEXT_PC = 1 (the head decodes Token.REG_PC for the next token,
+      starting a fresh VM step).
+    - Clear IO_STATE (state machine returns to "normal execution").
+    - Clear IO_IN_OUTPUT_MODE (defensive — L10's null_terminator unit
+      already clears it, but re-clearing on the resume edge guarantees the
+      flag is off before the next step's bytes flow through L15 routing).
+
+    This replaces the runner-side line
+    ``self._inject_synthetic_step(context, new_pc, ...)`` in
+    ``run_vm.py:_handle_thinking_end``: instead of Python appending
+    ``REG_PC`` after THINKING_START, the model autoregressively emits
+    Token.REG_PC because NEXT_PC is now set.
+
+    Uses L3 FFN unit 1035 (one above _set_conversational_io_state_init's
+    1034). Pattern mirrors the state-init unit — a single up-projection on
+    LAST_WAS_THINKING_START with a gate bias of 1.0 (no positional
+    constraint needed: the L2 lookback head only sets the flag at t+1 of
+    THINKING_START).
+    """
+    unit = 1035
+
+    ffn.W_up[unit, BD.LAST_WAS_THINKING_START] = S
+    ffn.b_up[unit] = -S * 0.5  # fire when LAST_WAS_THINKING_START ~ 1.0
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.NEXT_PC, unit] = 2.0 / S
+    ffn.W_down[BD.IO_STATE, unit] = -2.0 / S
+    ffn.W_down[BD.IO_IN_OUTPUT_MODE, unit] = -2.0 / S
+
+
+def _set_convo_io_pc_sp_latch(ffn, S, BD):
+    """L6 FFN addition (V18 Phase 1, bake 3b): PC/SP latch replay band.
+
+    When the resumed step's REG_PC / REG_SP value bytes are about to be
+    decoded (gated by LAST_WAS_THINKING_START — the position immediately
+    after the model emitted THINKING_START), this band drives the
+    OUTPUT_LO/HI nibbles for the new step's PC and SP values.
+
+    For the gated-off (enable=False) landing this PR ships, the replay
+    band is wired against the existing AX_FULL / FORMAT_PTR cache dims
+    (which aliase the AX value carried by L3 head 5 / head 7's STACK0
+    grab). Phase 1b will add the explicit capture side at the PRTF AX
+    marker that stages ``exec_pc + 4`` and ``last_sp + 8`` into dedicated
+    cache dims; until that lands, these units stay quiescent because the
+    enable gate is False and the bake is a no-op.
+
+    Unit layout (L6 FFN, starting at 1402, ending at 1465):
+      1402..1417  PC lo nibble replay (16 units, one per nibble value)
+      1418..1433  PC hi nibble replay
+      1434..1449  SP lo nibble replay
+      1450..1465  SP hi nibble replay
+
+    All units gate on LAST_WAS_THINKING_START so they are dormant in the
+    normal 35-token step cycle and only fire on the resume edge.
+
+    Phase 1b will redirect the source dims to dedicated POST_PRTF_PC /
+    POST_PRTF_SP cache dims captured at the PRTF AX marker. For the
+    gated-off landing this PR ships, AX_FULL / FORMAT_PTR are used as
+    staging-source placeholders; the bake is a no-op in production
+    (enable=False) so the choice is inert.
+    """
+    # (source_lo, source_hi) pairs for the PC and SP replay groups.
+    replay_groups = [
+        (BD.AX_FULL_LO,    BD.AX_FULL_HI),     # PC nibbles
+        (BD.FORMAT_PTR_LO, BD.FORMAT_PTR_HI),  # SP nibbles
+    ]
+    unit = 1402
+    for src_lo, src_hi in replay_groups:
+        for src_dim, out_dim in ((src_lo, BD.OUTPUT_LO), (src_hi, BD.OUTPUT_HI)):
+            for k in range(16):
+                ffn.W_up[unit, BD.LAST_WAS_THINKING_START] = S
+                ffn.b_up[unit] = -S * 0.5
+                ffn.W_gate[unit, src_dim + k] = 1.0
+                ffn.W_down[out_dim + k, unit] = 2.0 / S
+                unit += 1
