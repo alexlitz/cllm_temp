@@ -294,6 +294,9 @@ class AutoregressiveVMRunner:
         self._mem_history = {}  # addr → 9-token MEM section (latest wins)
         self._mem_access_order = []  # LRU tracking: most recent at end
         self.model.embed.set_mem_history_end(0)  # reset stale boundary from prior runs
+        # Invalidate the embedding prefix cache so a new program's CODE/DATA
+        # prefix is recomputed (cache is keyed on the leading token sequence).
+        self.model.embed.reset_prefix_cache()
         self._pure_attention_report = {
             "enabled": bool(self.pure_attention_memory),
             "blocked_vm_memory_ops": {},
