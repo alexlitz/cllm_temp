@@ -76,6 +76,34 @@ class NeuralVMEmbedding(nn.Module):
         self._prefix_cache_delta = None
         self._prefix_cache_len = 0
 
+        # === Compiler-baked ADDR_KEY positional encoding (2026-05-11) ===
+        # ADDR_KEY is morally a positional encoding: each code byte position
+        # gets a deterministic one-hot encoding of its byte address (PC), with
+        # the address computed from the position alone (CODE_START is always
+        # at sequence position 0 — see run_vm._build_context).
+        #
+        # We precompute the per-position one-hot ADDR_KEY values as a buffer
+        # of shape ``[max_seq_len, 48]`` at construction time. The 48 dims
+        # correspond to 3 nibbles × 16 one-hot positions. At forward time we
+        # add a bounded slice (positions [1, code_end)) into the ADDR_KEY band
+        # of the residual stream, replacing the per-position Python loop.
+        #
+        # The exact write pattern matches the legacy ``_add_code_addr_keys``:
+        #   - position i (relative to CODE_START at index 0) corresponds to
+        #     code byte offset seq_pos = i - 1
+        #   - byte_offset = seq_pos % 8, instr_idx = seq_pos // 8
+        #   - skip padding bytes where byte_offset >= 5
+        #   - addr = instr_idx * INSTR_WIDTH + PC_OFFSET + byte_offset
+        #   - write one-hots: ADDR_KEY[addr & 0xF], ADDR_KEY[16 + (addr>>4)&0xF],
+        #     ADDR_KEY[32 + (addr>>8)&0xF]
+        #
+        # CODE_END detection still happens dynamically (the buffer is bounded
+        # at apply time so it does not pollute positions past CODE_END). The
+        # buffer is lazily realized — it is filled on first forward() once we
+        # know the actual sequence length to size against.
+        self._addr_key_pos_encoding = None  # lazy: [max_seq_len, 48] buffer
+        self._addr_key_pos_encoding_size = 0  # how many positions are filled
+
     def _dim(self, name: str) -> int:
         """Resolve a dim name to its start position.
 
@@ -245,13 +273,91 @@ class NeuralVMEmbedding(nn.Module):
         self._prefix_cache_delta = delta
         self._prefix_cache_len = prefix_len
 
-    def _add_code_addr_keys(self, token_ids, x):
-        """Add ADDR_KEY to code byte embeddings (pure autoregressive).
+    def _ensure_addr_key_pos_encoding(self, S, device, dtype):
+        """Build (or extend) the precomputed ADDR_KEY positional encoding.
 
-        Code bytes (between CODE_START and CODE_END) are system prompt input.
-        ADDR_KEY is position-dependent metadata added to embeddings,
-        similar to how RoPE adds positional info. This is weight-based:
-        the computation is deterministic from position, no learned parameters.
+        The encoding is a deterministic, position-only one-hot table that
+        replaces the per-position Python loop in the legacy
+        ``_add_code_addr_keys``. It has shape ``[N, 48]`` where N is the
+        number of sequence positions we have filled; entry [pos, :] holds the
+        three one-hot nibble flags for the byte address at that position
+        (or zeros if the position is a non-code-byte slot — padding bytes,
+        the CODE_START token itself, or anything past the code region).
+
+        The buffer is bounded by S and grown lazily: on first call we fill
+        ``max(S, 256)`` positions; subsequent calls grow it if S exceeds the
+        cached capacity. The buffer is registered as a module buffer so it
+        moves with ``.to(device)``.
+
+        Args:
+            S: Required minimum number of positions.
+            device: Target device for the buffer.
+            dtype: Target dtype for the buffer.
+
+        Returns:
+            A tensor of shape ``[capacity, 48]`` on ``device`` with ``dtype``.
+            Caller should slice ``[:S]`` before use.
+        """
+        from .constants import INSTR_WIDTH, PC_OFFSET
+
+        # If we already have a buffer that covers S positions and matches
+        # device/dtype, return it directly.
+        if (self._addr_key_pos_encoding is not None
+                and self._addr_key_pos_encoding_size >= S
+                and self._addr_key_pos_encoding.device == device
+                and self._addr_key_pos_encoding.dtype == dtype):
+            return self._addr_key_pos_encoding
+
+        # Otherwise (re)build at a capacity >= S. Round up so we don't rebuild
+        # on every small S increment.
+        capacity = max(S, max(256, self._addr_key_pos_encoding_size * 2))
+
+        BYTES_PER_INSTR = 8  # Matches legacy: opcode + 4 imm + 3 pad
+        DATA_BYTES = 5       # Bytes that carry ADDR_KEY (opcode + 4 imm)
+
+        enc = torch.zeros(capacity, 48, device=device, dtype=dtype)
+        # CODE_START is at position 0. The first code byte is at position 1.
+        # For each position i in [1, capacity), compute seq_pos = i - 1.
+        for i in range(1, capacity):
+            seq_pos = i - 1
+            byte_offset = seq_pos % BYTES_PER_INSTR
+            if byte_offset >= DATA_BYTES:
+                # Padding byte: legacy injection skips these.
+                continue
+            instr_idx = seq_pos // BYTES_PER_INSTR
+            addr = instr_idx * INSTR_WIDTH + PC_OFFSET + byte_offset
+            lo = addr & 0xF
+            hi = (addr >> 4) & 0xF
+            top = (addr >> 8) & 0xF
+            enc[i, lo] = 1.0
+            enc[i, 16 + hi] = 1.0
+            enc[i, 32 + top] = 1.0
+
+        # Register (or replace) as a non-persistent buffer so .to() moves it.
+        # We avoid ``register_buffer`` for persistent state because the table
+        # is fully deterministic from constants and should not be saved.
+        if hasattr(self, "_buffers") and "_addr_key_pos_encoding_buf" in self._buffers:
+            # Replace existing buffer in place
+            del self._buffers["_addr_key_pos_encoding_buf"]
+        self.register_buffer("_addr_key_pos_encoding_buf", enc, persistent=False)
+        self._addr_key_pos_encoding = self._addr_key_pos_encoding_buf
+        self._addr_key_pos_encoding_size = capacity
+        return self._addr_key_pos_encoding
+
+    def _add_code_addr_keys(self, token_ids, x):
+        """Add ADDR_KEY to code byte embeddings (compiler-baked positional encoding).
+
+        ADDR_KEY is morally a positional encoding: each code byte at sequence
+        position i has a deterministic byte address (PC) that depends ONLY on
+        i (since CODE_START is always at position 0 — see _build_context).
+        L5/L7 attention heads dot-product their query addresses against
+        ``ADDR_KEY`` keys to do content-addressed bytecode fetch.
+
+        Previously this was a per-position Python loop run on every forward
+        call. We now precompute a ``[max_seq_len, 48]`` one-hot table at
+        construction time (lazily, sized by actual S) and add a bounded slice
+        into the residual stream's ADDR_KEY band. CODE_END is detected
+        dynamically and bounds the add so we don't pollute non-code positions.
 
         Uses PC-aligned addressing to match L5 fetch queries:
         - L5 head 1 fetches opcode using EMBED_LO/HI (which holds PC value)
@@ -261,53 +367,60 @@ class NeuralVMEmbedding(nn.Module):
         With PC_OFFSET=2, INSTR_WIDTH=8:
         - Instruction i opcode: PC = i * 8 + 2, ADDR_KEY = PC
         - Instruction i imm[j]: ADDR_KEY = PC + j + 1
-
-        Examples:
-        - Instruction 0 opcode: ADDR_KEY = 0 * 8 + 2 = 2
-        - Instruction 0 imm[0]: ADDR_KEY = 2 + 1 = 3
-        - Instruction 1 opcode: ADDR_KEY = 1 * 8 + 2 = 10
-        - Instruction 1 imm[0]: ADDR_KEY = 10 + 1 = 11
         """
-        # Import here to avoid circular dependency
         from .vm_step import Token
-        from .constants import INSTR_WIDTH, PC_OFFSET
-
-        # Bytes per instruction in token stream: opcode + 4 immediate + 3 padding = 8 total
-        # ADDR_KEY is only set for the first 5 bytes (opcode + immediate), not padding
-        BYTES_PER_INSTR = 8  # Total bytes in token stream
-        DATA_BYTES = 5       # Bytes with ADDR_KEY (opcode + 4 immediate)
 
         B, S = token_ids.shape
         addr_key = self._dim("ADDR_KEY")
 
-        for b in range(B):
-            cs_pos = None
-            for i in range(S):
-                tok = token_ids[b, i].item()
-                if tok == Token.CODE_START:
-                    cs_pos = i
-                elif tok == Token.CODE_END:
-                    break
-                elif cs_pos is not None and tok < 256:
-                    seq_pos = i - cs_pos - 1  # Sequential position in code
-                    if seq_pos < 0:
-                        continue
-                    # Convert to PC-aligned address
-                    instr_idx = seq_pos // BYTES_PER_INSTR
-                    byte_offset = seq_pos % BYTES_PER_INSTR
+        # Find CODE_END per batch row (a small loop, runs once per forward,
+        # not per code byte). The legacy implementation also bounded at
+        # CODE_END and used CODE_START to anchor; here we use the structural
+        # invariant that CODE_START is at position 0 and just find CODE_END.
+        # Different batch rows can in principle have different CODE_END
+        # positions, so we handle the per-row case.
+        # In practice all rows of a single run() share the same context.
 
-                    # Skip padding bytes (beyond first 5 bytes of instruction)
-                    if byte_offset >= DATA_BYTES:
-                        continue
+        # Identify positions that are code bytes per row (tok < 256, between
+        # positions [1, code_end_row)). We compute this via a tensor mask.
+        # token_ids[b, 0] is expected to be CODE_START; CODE_END terminates.
+        code_end_tok = Token.CODE_END
+        # For each batch row, find the first index where token == CODE_END.
+        # We use argmax over a boolean mask of the equality (returns first
+        # True position for tied values).
+        is_code_end = (token_ids == code_end_tok)
+        # If a row has no CODE_END, fall back to scanning whole sequence.
+        has_code_end = is_code_end.any(dim=1)
+        # First-True index per row (or S if absent).
+        # argmax on bool returns the first True if any is True; combine with
+        # has_code_end to default to S.
+        code_end_idx = torch.where(
+            has_code_end,
+            is_code_end.float().argmax(dim=1),
+            torch.full_like(has_code_end, S, dtype=torch.long),
+        )
 
-                    addr = instr_idx * INSTR_WIDTH + PC_OFFSET + byte_offset
-                    # Write address as nibbles to ADDR_KEY (3 nibbles × 16 one-hot)
-                    lo = addr & 0xF
-                    hi = (addr >> 4) & 0xF
-                    top = (addr >> 8) & 0xF
-                    x[b, i, addr_key + lo] = 1.0
-                    x[b, i, addr_key + 16 + hi] = 1.0
-                    x[b, i, addr_key + 32 + top] = 1.0
+        # If the table doesn't cover S yet, build/extend it.
+        enc = self._ensure_addr_key_pos_encoding(S, x.device, x.dtype)
+
+        # The encoding rows for positions [1, code_end_idx[b]) are added to
+        # x[b, :, ADDR_KEY:ADDR_KEY+48]. We build a per-row mask of valid
+        # positions (1 <= pos < code_end_idx[b]) and use it to gate the add.
+        pos_range = torch.arange(S, device=x.device).unsqueeze(0)  # [1, S]
+        # mask[b, i] is True iff position i is in [1, code_end_idx[b])
+        # (and code_end_idx[b] > 0 — i.e. CODE_END was found at index >=1).
+        ce = code_end_idx.unsqueeze(1)  # [B, 1]
+        mask = (pos_range >= 1) & (pos_range < ce)  # [B, S]
+
+        # Build the slice to add. Broadcast enc[:S] over batch and mask out
+        # positions outside [1, code_end_idx[b]).
+        addr_slice = enc[:S].unsqueeze(0)  # [1, S, 48]
+        # Apply mask: zero out positions we shouldn't touch.
+        # Use float mask so we keep dtype.
+        gated = addr_slice * mask.unsqueeze(-1).to(addr_slice.dtype)  # [B, S, 48]
+
+        # In-place add into the ADDR_KEY band of the residual stream.
+        x[:, :, addr_key:addr_key + 48].add_(gated)
 
     def _inject_mem_store(self, token_ids, x, start_pos=0):
         """Inject MEM_STORE=1.0 on historical MEM markers for L15 K-side.
