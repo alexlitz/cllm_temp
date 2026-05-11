@@ -18,6 +18,7 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         writes={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                 "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
         kind="ffn",
+        layer_idx=2,
         bake_fn=bake,
         migrated=True,
     )
@@ -42,6 +43,7 @@ def make_layer2_threshold_attn_op() -> Operation:
         reads={"IS_MARK", "CONST"},
         writes={"L2H0"},
         kind="attn",
+        layer_idx=2,
         bake_fn=bake,
         migrated=True,
     )

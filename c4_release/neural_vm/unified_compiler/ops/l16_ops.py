@@ -17,6 +17,7 @@ def make_layer16_lev_routing_op() -> Operation:
                "TEMP"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
+        layer_idx=16,
         bake_fn=bake,
         migrated=True,
     )
