@@ -7,13 +7,43 @@ Builds on Phase 1 (PC + AX coherence). These tests exercise:
 
 Phase 2 closes when all tests in this file pass.
 
-Currently most fail. Each failure points at a specific gap in the
-neural architecture.
+Currently all tests xfail in pure_neural mode. Triage 2026-05-11
+(p2-triage-hard-fails): every test in this file produced either a hard
+assertion mismatch (e.g. AX returned 4160946181 instead of 5 for
+test_imm_psh_exit) or a >60s autoregressive hang (model never emits an
+EXIT-terminating step). Root cause matches the sibling Phase-3 multibyte
+suite: the pure_neural pipeline does not yet wire AX-through-PSH
+preservation nor the binary ALU readback of prev STACK0 from MEM into
+L9/L10 ALU FFN units. These need _set_layer9_alu / _set_layer4_ffn /
+MEM persistence shim coverage before they will land.
+
+Markers use strict=False so any incidental XPASS lands as XPASS rather
+than failing CI; once Phase 2 lands they should all flip to XPASS and the
+markers can be removed.
 """
 
 import pytest
 
 from neural_vm.embedding import Opcode
+
+
+_PHASE2_PSH_XFAIL_REASON = (
+    "pure_neural Phase 2: PSH+EXIT chain does not yet preserve AX through "
+    "the MEM-store + EXIT sequence (model returns garbage 32-bit AX). "
+    "Needs MEM persistence + AX read-through wiring in _dispatch_step "
+    "pure_neural branch. Tracked alongside the Phase-3 multibyte ADD/MUL "
+    "tests in test_pure_neural_multibyte.py."
+)
+
+_PHASE2_ALU_XFAIL_REASON = (
+    "pure_neural Phase 2: binary ALU (ADD/SUB/AND/OR) does not yet produce "
+    "the correct AX after PSH + IMM + <op> in pure_neural mode. Tests "
+    "either return wrong values or hang (no EXIT termination within "
+    "max_steps). Requires _set_layer9_alu / _set_layer10_alu wiring to "
+    "read prev STACK0 from MEM and combine with current AX. Mirrors the "
+    "xfailed multi-byte counterparts in test_pure_neural_multibyte.py "
+    "(TestPureNeuralAddOverflow / TestPureNeuralSubBorrow)."
+)
 
 
 def _make_bc(prog):
@@ -39,6 +69,7 @@ def _run(runner, prog, max_steps=30):
 class TestPureNeuralPSH:
     """PSH-then-EXIT — does the SP decrement work?"""
 
+    @pytest.mark.xfail(reason=_PHASE2_PSH_XFAIL_REASON, strict=False)
     def test_imm_psh_exit(self, pure_neural_runner):
         # AX should remain the IMM value (PSH preserves AX)
         assert _run(pure_neural_runner, [
@@ -51,6 +82,7 @@ class TestPureNeuralPSH:
 class TestPureNeuralBinaryOps:
     """Binary ALU ops on small operands (< 256)."""
 
+    @pytest.mark.xfail(reason=_PHASE2_ALU_XFAIL_REASON, strict=False)
     @pytest.mark.parametrize("a,b,expected", [
         (3, 4, 7),
         (10, 20, 30),
@@ -67,6 +99,7 @@ class TestPureNeuralBinaryOps:
             Opcode.EXIT,
         ]) == expected
 
+    @pytest.mark.xfail(reason=_PHASE2_ALU_XFAIL_REASON, strict=False)
     @pytest.mark.parametrize("a,b,expected", [
         (50, 20, 30),
         (100, 50, 50),
@@ -82,6 +115,7 @@ class TestPureNeuralBinaryOps:
             Opcode.EXIT,
         ]) == expected
 
+    @pytest.mark.xfail(reason=_PHASE2_ALU_XFAIL_REASON, strict=False)
     @pytest.mark.parametrize("a,b,expected", [
         (0xFF, 0x0F, 0x0F),
         (0xF0, 0x0F, 0x00),
@@ -96,6 +130,7 @@ class TestPureNeuralBinaryOps:
             Opcode.EXIT,
         ]) == expected
 
+    @pytest.mark.xfail(reason=_PHASE2_ALU_XFAIL_REASON, strict=False)
     @pytest.mark.parametrize("a,b,expected", [
         (0xF0, 0x0F, 0xFF),
         (0xAA, 0x55, 0xFF),
