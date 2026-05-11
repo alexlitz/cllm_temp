@@ -249,3 +249,66 @@ Raw weight patches make migration brittle and resist re-baking. New ops should c
 `ALUMul`, `ALUShift`, `ALUAndOrXor`, and `ALUAddSub` are now compiler-installed composites — no more runtime instantiation in `efficient_alu_neural.py`. They still wrap multiple sub-FFNs internally, however.
 
 True "blocks of attn+FFN at runtime" (the future-pure architecture) requires residual-stream BD↔GE conversion, which is unfinished. Until then, the composite is the right factoring: declarative install-time, multi-FFN bake. See ADR-004.
+
+## Compiler migration patterns (2026-05-10)
+
+15+ migration units landed today moving inline bakes out of `set_vm_weights` (a 500+ line function in `c4_release/neural_vm/vm_step.py`) into discrete `Operation` instances in `c4_release/neural_vm/unified_compiler/migrated_ops.py`. Three patterns crystallized; each was rediscovered by multiple agents who debugged their way to it. Pick the right pattern up front to avoid that pain.
+
+### Pattern 1: In-place placeholder → migrated (CLEANEST)
+
+When an op already exists in `all_core_ops()` as a `kind="attn"` or `kind="ffn"` placeholder (i.e., not yet migrated), convert it in place:
+
+- Change `kind="attn"` → `kind="block", layer_idx=N`
+- Change `kind="ffn"` → `kind="block", layer_idx=N`
+- Set `migrated=True`
+- Update `bake_fn` signature from `(ffn, ...)` or `(attn, ...)` to `(block, ...)`, and access `block.attn` / `block.ffn` inside
+- **The dep-graph stays stable** because the op count in `all_core_ops()` is unchanged
+- **No `dep_anchor` companion needed.** This is the cleanest pattern — use it whenever there's an existing placeholder.
+
+**Concrete example**: `migrate-l9-lev-attn-bakes` (Unit E today, commit on main) converted `make_layer9_lev_addr_relay_op` and `make_layer9_lev_bp_to_pc_relay_op` from `kind="attn"` placeholders to migrated block ops without any extra companion.
+
+### Pattern 2: New op + `dep_anchor` companion
+
+When you want to ADD a new migrated op (no existing placeholder to convert), and the dep-graph cares about the count of ops at certain kinds:
+
+- Add a new `kind="block", layer_idx=N, migrated=True` op factory
+- KEEP a (possibly hypothetical) `kind="attn"` / `kind="ffn"` placeholder as a NO-OP companion — it preserves the dep-graph's longest-chain length so downstream layer assignments don't shift
+- Otherwise: removing a `kind="ffn"` node from the dep-graph shrinks the longest chain by 1, shifting all downstream block indices and breaking weight placement
+
+**Concrete examples**:
+- Unit A (`migrate-l3-ffn-op`): added `make_layer3_ffn_dep_anchor_op` as a no-op companion to the new block-pinned `make_layer3_ffn_op`.
+- Unit G (`migrate-l14-l15-ffn-bakes`): kept the existing `make_nibble_copy_ffn_op` (`kind="ffn"`, not migrated) as a layout placeholder. Removing it shifted Block 20/22 assignments and broke smoke.
+- Units D, F (`migrate-l8-attn-bakes`, `migrate-l10-attn-bakes`): same pattern.
+
+### Pattern 3: `kind="model"` for override-ordering
+
+When a bake intentionally OVERRIDES later inline writes (e.g., two functions both write the same attention head weights, and the later write is supposed to win), the migrated op must run AFTER the override target. Since `kind="block"` ops dispatch BEFORE `kind="model"` ops in `build_model_from_layout`, use:
+
+- `kind="model"` with `phase=998.X` (between `make_function_call_weights_op` at 998 and `make_legacy_bake_op` at 999)
+- If the override target is itself a `kind="model"` op, use an even later phase like `phase=1002` (between `make_embedding_bake_op` at 1001 and `make_branch_override_patch_op` at 1100)
+
+**Concrete examples**:
+- Unit B (`migrate-l6-attn-bakes`): L6 `_set_layer6_relay_heads` head-7 writes override `_set_function_call_weights` head-7 writes. Used `kind="model"` phases 998.5 / .6 / .7.
+- Unit 6 (`migrate-everything-unit6`, `_set_opcode_relay_head`): used `kind="model", phase=1002` because the bake's `alibi_slopes[6/7]=5.0` writes get clobbered by an inline `attn6.alibi_slopes.fill_(0.0)` at phase=999 (inside `legacy_bake`).
+
+### Flag-gated ops
+
+For ops gated by `enable_conversational_io` or `enable_tool_calling` flags:
+
+- Register UNCONDITIONALLY in `all_core_ops()` to keep the dep graph stable across flag states
+- Inside the `bake_fn`, check the flag and return early (no-op) when off
+- Thread the flag through `all_core_ops(*, enable_conversational_io=False, enable_tool_calling=False)` keyword args
+- Forward from `compile_full_vm` to `all_core_ops` (see `c4_release/neural_vm/unified_compiler/full_vm_compiler.py`)
+
+**Concrete examples**: Units 1, 2, 3, 4, 5 today all use this pattern.
+
+### Worktree-stale + main-checkout coordination
+
+The `isolation: "worktree"` mechanism creates worktrees from a base commit that may be 100+ commits stale. Migration agents should:
+
+- First try `git checkout main` inside the isolated worktree
+- If `main` isn't a local ref, fall back to creating a dedicated worktree off main HEAD:
+  ```bash
+  git worktree add /tmp/<unit>-wt -b <branch-name> main
+  ```
+- Avoid working directly in `/home/alexlitz/Documents/misc/c4_release/` — that's the coordinator's worktree and concurrent agents will trample each other's edits.
