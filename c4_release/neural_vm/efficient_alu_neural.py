@@ -1090,6 +1090,28 @@ class FlattenedALUMul(nn.Module):
                 "forward()."
             )
 
+        # ---- Opcode-gated early-out (perf optimization, 2026-05-11) ----
+        # The full 9-stage MUL pipeline (BD→GE, schoolbook, 3 carry passes,
+        # gen/prop, binary lookahead, final-correction, combine, GE→BD)
+        # runs unconditionally and is masked to zero at the combine stage
+        # when OP_MUL is not active. For the vast majority of forward
+        # passes, OP_MUL is not active, so this work is pure waste.
+        #
+        # `_MulCombineStage` ultimately gates the writeback on
+        # `OP_MUL>0.1 AND MARK_AX>0.5` per sequence position. If OP_MUL
+        # does not exceed 0.1 anywhere in the batch, the pipeline
+        # contributes nothing and we can return x_bd unchanged. The
+        # `.item()` forces one CPU/GPU sync (~few µs) — a rounding error
+        # compared to the multi-stage pipeline it elides.
+        #
+        # Correctness: this is a strict subset of the mask already
+        # applied at the combine stage (we only skip when the mask would
+        # zero the contribution everywhere). Numerical output is
+        # identical when OP_MUL is active. Mirrors the early-out in
+        # `FlattenedDivMod.forward` (perf-divmod-early-out).
+        if x_bd[..., self.BD.OP_MUL].max().item() < 0.1:
+            return x_bd  # no-op when MUL isn't the active opcode
+
         state = _MulPipelineState()
         state.x_bd_in = x_bd
         out_state = self.pipeline(state)
