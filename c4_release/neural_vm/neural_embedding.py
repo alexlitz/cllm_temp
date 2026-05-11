@@ -189,9 +189,10 @@ class NeuralVMEmbedding(nn.Module):
             self._add_code_addr_keys(token_ids, x)
         self._inject_mem_store(token_ids, x, start_pos=start_pos)
 
-        # Inject THINKING_START/END markers for lookback detection.
-        # Prefix never contains THINKING tokens, so skip those positions.
-        self._inject_thinking_markers(token_ids, x, start_pos=start_pos)
+        # THINKING_START/END markers (MARK_THINKING_START/_END) are now baked
+        # directly into the embedding table (see
+        # ``unified_compiler.ops.shared.setup_token_embeddings``), so no
+        # runtime injection is needed.
 
         # Inject initial PC value for step 0 (no previous step to carry from).
         # The relevant REG_PC marker is past the prefix; skip prefix.
@@ -369,30 +370,6 @@ class NeuralVMEmbedding(nn.Module):
         name = _OPCODE_INJECTION_MAP.get(active_opcode)
         if name is not None:
             x[:, :, self._dim(name)] = 5.0
-
-    def _inject_thinking_markers(self, token_ids, x, start_pos=0):
-        """Inject THINKING_START and THINKING_END markers for lookback detection.
-
-        Sets dedicated marker dimensions (not overlapping with OUTPUT_BYTE)
-        so L2 lookback head can reliably detect these special tokens.
-
-        Args:
-            token_ids: [batch, seq] tensor of token IDs
-            x: [batch, seq, d_model] embedding tensor (modified in-place)
-            start_pos: Skip positions ``< start_pos`` (prefix-cache hint).
-        """
-        from .vm_step import Token
-
-        thinking_start = self._dim("MARK_THINKING_START")
-        thinking_end = self._dim("MARK_THINKING_END")
-        B, S = token_ids.shape
-        for b in range(B):
-            for i in range(start_pos, S):
-                tok = token_ids[b, i].item()
-                if tok == Token.THINKING_START:
-                    x[b, i, thinking_start] = 1.0
-                elif tok == Token.THINKING_END:
-                    x[b, i, thinking_end] = 1.0
 
     def _inject_initial_pc(self, token_ids, x, start_pos=0):
         """Inject initial PC value for step 0's PC marker.

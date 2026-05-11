@@ -127,13 +127,18 @@ class UnifiedVMCompiler:
         embed[Token.USER_INPUT_START, BD.IS_MARK] = 1.0
         embed[Token.USER_INPUT_END, BD.IS_MARK] = 1.0
 
-        # Thinking tags
+        # Thinking tags. MARK_THINKING_START/_END are baked directly into the
+        # embedding table so the runtime
+        # `NeuralVMEmbedding._inject_thinking_markers` loop is unnecessary
+        # (L2's lookback head reads these dims).
         embed[Token.THINKING_START, BD.IS_MARK] = 1.0
         embed[Token.THINKING_START, BD.CONST] = 1.0
         embed[Token.THINKING_START, BD.TEMP + 1] = 1.0
+        embed[Token.THINKING_START, BD.MARK_THINKING_START] = 1.0
         embed[Token.THINKING_END, BD.IS_MARK] = 1.0
         embed[Token.THINKING_END, BD.CONST] = 1.0
         embed[Token.THINKING_END, BD.TEMP + 2] = 1.0
+        embed[Token.THINKING_END, BD.MARK_THINKING_END] = 1.0
 
         # I/O state tokens
         embed[Token.IO_STATE_EMIT_BYTE, BD.IS_MARK] = 1.0
