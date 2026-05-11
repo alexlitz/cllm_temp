@@ -514,6 +514,59 @@ def make_embedding_bake_op() -> Operation:
     )
 
 
+def make_initial_pc_bake_op() -> Operation:
+    """Bake the initial PC value (PC_OFFSET) into the REG_PC token embedding.
+
+    Phase=1001.5 so it runs AFTER `embedding_bake` (1001), which zeros and
+    rewrites the embedding table. By running just after, we add (rather than
+    have-overwritten) the initial-PC pattern on top of the standard REG_PC
+    marker pattern.
+
+    Migration 2026-05-11 (i1): replaces the runtime `_inject_initial_pc`
+    method on NeuralVMEmbedding. The runtime injection wrote +1.0 to
+    EMBED_LO+(PC_OFFSET & 0xF) and +1.0 to EMBED_HI+((PC_OFFSET>>4) & 0xF)
+    only at the FIRST REG_PC marker (one with no preceding STEP_END). The
+    same residual contribution can be produced by baking those +1.0 values
+    into the REG_PC token-embedding row. Because the bake fires at every
+    REG_PC position (steps 1+ too), a pair of L3-FFN cancel units (added
+    inline at `_set_layer3_ffn`) subtracts -1.0 from those same EMBED_LO/HI
+    dims at MARK_PC AND HAS_SE positions — leaving step-1+ residuals
+    bit-identical to the pre-migration behavior.
+    """
+    def _bake(model, dim_positions, S):
+        import torch
+        from ...vm_step import Token
+        from ...constants import PC_OFFSET
+
+        def D(name):
+            if dim_positions is not None and name in dim_positions:
+                return dim_positions[name]
+            from ...vm_step import _SetDim
+            return getattr(_SetDim, name)
+
+        embed_weight = model.embed.embed.weight
+        if Token.REG_PC >= embed_weight.shape[0]:
+            return  # No REG_PC token in vocab (shouldn't happen).
+
+        embed_lo = D("EMBED_LO")
+        embed_hi = D("EMBED_HI")
+        init_pc_lo = PC_OFFSET & 0xF
+        init_pc_hi = (PC_OFFSET >> 4) & 0xF
+
+        with torch.no_grad():
+            embed_weight[Token.REG_PC, embed_lo + init_pc_lo] = 1.0
+            embed_weight[Token.REG_PC, embed_hi + init_pc_hi] = 1.0
+
+    return Operation(
+        name="initial_pc_bake",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=_bake,
+        phase=1001.5,
+    )
+
+
 def make_contract_validation_op() -> Operation:
     """Run the contract validator. Previously inline in set_vm_weights.
 

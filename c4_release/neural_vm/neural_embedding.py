@@ -193,9 +193,11 @@ class NeuralVMEmbedding(nn.Module):
         # Prefix never contains THINKING tokens, so skip those positions.
         self._inject_thinking_markers(token_ids, x, start_pos=start_pos)
 
-        # Inject initial PC value for step 0 (no previous step to carry from).
-        # The relevant REG_PC marker is past the prefix; skip prefix.
-        self._inject_initial_pc(token_ids, x, start_pos=start_pos)
+        # Initial PC value for step 0 (no previous step to carry from) is now
+        # baked into the REG_PC token-embedding row at compile time. See
+        # `make_initial_pc_bake_op` in unified_compiler/ops/model_ops.py and
+        # the matching cancel units in `_set_layer3_ffn` (vm_step.py). The
+        # runtime `_inject_initial_pc` injection is no longer needed.
 
         # Unified memory: either autoregressive inference or external hints.
         # Prefix has no MEM markers; skip prefix positions on cache hit.
@@ -393,44 +395,6 @@ class NeuralVMEmbedding(nn.Module):
                     x[b, i, thinking_start] = 1.0
                 elif tok == Token.THINKING_END:
                     x[b, i, thinking_end] = 1.0
-
-    def _inject_initial_pc(self, token_ids, x, start_pos=0):
-        """Inject initial PC value for step 0's PC marker.
-
-        Step 0's REG_PC has no previous step to carry forward from (L3 relay
-        produces nothing). So we inject PC_OFFSET=2 into EMBED_LO/HI so the
-        model outputs the correct initial PC.
-
-        Detection: Step 0's REG_PC is the ONLY REG_PC in context with no
-        preceding STEP_END. After context pruning, retained previous steps
-        have STEP_END before their REG_PC, so they are not misidentified.
-
-        Args:
-            token_ids: [batch, seq] tensor of token IDs
-            x: [batch, seq, d_model] embedding tensor (modified in-place)
-            start_pos: Skip positions ``< start_pos`` (prefix-cache hint).
-                Safe because the CODE/DATA prefix contains no REG_PC or
-                STEP_END markers, so ``seen_step_end`` stays False there.
-        """
-        from .vm_step import Token
-        from .constants import PC_OFFSET
-
-        initial_pc = PC_OFFSET
-        lo = initial_pc & 0xF
-        hi = (initial_pc >> 4) & 0xF
-        embed_lo = self._dim("EMBED_LO")
-        embed_hi = self._dim("EMBED_HI")
-
-        B, S = token_ids.shape
-        for b in range(B):
-            seen_step_end = False
-            for i in range(start_pos, S):
-                tok = token_ids[b, i].item()
-                if tok == Token.STEP_END:
-                    seen_step_end = True
-                elif tok == Token.REG_PC and not seen_step_end:
-                    x[b, i, embed_lo + lo] = 1.0
-                    x[b, i, embed_hi + hi] = 1.0
 
     def _inject_mem_exec(self, token_ids, x, start_pos=0):
         """Inject MEM_EXEC and ADDR_KEY on MEM sections containing executable code.
