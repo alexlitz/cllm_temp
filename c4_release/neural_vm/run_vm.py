@@ -332,6 +332,15 @@ class AutoregressiveVMRunner:
 
         step_num = 0  # Track VM steps for conversational I/O handling
 
+        # Pure-neural EXIT-detection fallback exec_idx tracker. Each time we
+        # cross a step boundary in pure_neural mode, increment this. We use it
+        # to look up the executing opcode in bytecode for EXIT detection only
+        # — this is the same "read the bytecode to know when EXIT executed"
+        # affordance the policy already allows; it just bypasses the broken
+        # neural PC. Only safe for branch-free programs until the neural PC
+        # is repaired (Phase 4).
+        self._pure_neural_exec_idx = 0
+
         # Context windowing prevents O(n²) blowup while preserving CODE section.
         # The CODE section (bytecode) is needed for L5 fetch heads to read instructions.
         # Keep prefix (CODE + DATA) + last 512 tokens of dynamic content (MEM + steps).
@@ -414,7 +423,39 @@ class AutoregressiveVMRunner:
                     print(f"[HYBRID] Emitted {len(fmt_str)} bytes + THINKING_START + synthetic step (PC=0x{new_pc:04x}, SP=0x{new_sp:08x})")
                 continue
 
-            if next_token == Token.STEP_END:
+            # FIX 2026-05-10: In pure_neural mode, the model does not reliably
+            # emit STEP_END at position 34 — generation degenerates to all-zero
+            # tokens after the first few register markers. Without a STEP_END,
+            # _dispatch_step never runs and the EXIT-detection early-break never
+            # fires, so the loop generates the full max_steps * STEP_TOKENS
+            # tokens. For tests that set max_steps reasonably (e.g. 30), this
+            # is hundreds of seconds of autoregressive generation per test.
+            #
+            # Workaround: at every step boundary (position 34), synthesize a
+            # STEP_END trigger so _dispatch_step (pure_neural branch) gets the
+            # chance to detect exec_op==EXIT and break early. The pure_neural
+            # branch of _dispatch_step does NOT override any context tokens —
+            # it only observes the model's outputs — so this is consistent
+            # with the "Python may detect termination" rule in
+            # docs/PURE_NEURAL_POLICY.md.
+            #
+            # Additionally, because the model's emitted PC is currently wrong
+            # in pure_neural mode (Phase 1 gap), `_exec_pc()` cannot be
+            # trusted to identify which bytecode instruction is being executed.
+            # Track a Python-side branch-free step counter to use as an
+            # alternative exec_idx for EXIT detection. This is the same kind
+            # of "read the bytecode to identify EXIT" that the policy already
+            # permits — we just have to derive the index without trusting the
+            # broken neural PC. For branch-free programs (Phase 1 IMM/NOP
+            # only) the counter is exact; for programs with branches the
+            # neural PC must be repaired upstream before this works (Phase 4).
+            synthetic_step_end = (
+                self.pure_neural
+                and pos_in_step == Token.STEP_TOKENS - 1
+                and next_token not in (Token.STEP_END, Token.HALT, Token.TOOL_CALL)
+            )
+
+            if next_token == Token.STEP_END or synthetic_step_end:
                 if step_num < 3:
                     step_num += 1  # Increment step counter
                 # Extract PC and identify opcodes
@@ -445,8 +486,17 @@ class AutoregressiveVMRunner:
                 # (for next instruction) was running first and setting _last_ax=0.
 
                 exec_idx = self._exec_pc() // INSTR_WIDTH
+                # FIX 2026-05-10: When pure_neural and our PC tracker disagrees
+                # with the Python-side step counter, prefer the step counter
+                # for EXIT detection (neural PC is currently broken in
+                # pure_neural mode). See comment above the synthetic_step_end
+                # block for the policy reasoning.
+                if self.pure_neural and 0 <= self._pure_neural_exec_idx < len(bytecode):
+                    exec_idx = self._pure_neural_exec_idx
                 if self._dispatch_step(context, bytecode, exec_idx, prefix_len, output):
                     break
+                if self.pure_neural:
+                    self._pure_neural_exec_idx += 1
 
             elif next_token == Token.TOOL_CALL:
                 # FIX 2026-05-09: In pure_neural mode, do NOT run any Python-side
