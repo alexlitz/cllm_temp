@@ -132,6 +132,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                 "AX_FULL_LO", "AX_FULL_HI"},
         kind="attn",
+        layer_idx=3,
         bake_fn=bake,
         migrated=True,
     )

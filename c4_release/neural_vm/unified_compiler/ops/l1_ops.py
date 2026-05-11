@@ -24,6 +24,7 @@ def make_layer1_ffn_op() -> Operation:
         writes={"STACK0_BYTE0", "BYTE_INDEX_0", "BYTE_INDEX_1",
                 "BYTE_INDEX_2", "BYTE_INDEX_3"},
         kind="ffn",
+        layer_idx=1,
         bake_fn=bake,
         migrated=True,
     )
@@ -62,6 +63,7 @@ def make_layer1_threshold_attn_op() -> Operation:
         reads={"IS_MARK", "MARK_SE_ONLY", "CONST"},
         writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE"},
         kind="attn",
+        layer_idx=1,
         bake_fn=bake,
         migrated=True,
     )

@@ -39,6 +39,7 @@ def make_layer15_memory_lookup_op() -> Operation:
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
+        layer_idx=15,
         bake_fn=bake,
         migrated=True,
     )

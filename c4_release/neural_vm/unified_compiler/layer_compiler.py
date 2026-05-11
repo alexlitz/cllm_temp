@@ -359,8 +359,22 @@ class LayerCompiler:
         Multiple ops can share a layer + kind slot if they have the same phase
         (e.g., two FFN setups that bake into the same block's FFN sequentially).
         Without phase, each op needs its own layer kind slot.
+
+        Pinning: when an attn/ffn op has an explicit ``layer_idx`` set, the
+        op is placed at exactly that layer (not the dep-graph's
+        earliest-feasible slot). The dep-graph invariant — every read dim's
+        producer is at a strictly-earlier layer, OR at the same layer with
+        lower phase — is enforced as a hard check, so a mispinned layer_idx
+        raises rather than silently corrupting the bake. Pinning was added
+        to fix the L1+ regression where ``migrated=True`` attn/ffn ops with
+        no layer_idx were assigned to the wrong block by the dep-graph; see
+        ``docs/MODEL_REGRESSION_BISECT.md``.
         """
         writes_layer: Dict[str, int] = {}
+        # writers_at_layer[(layer, dim)] = (op_name, phase) for the op that
+        # wrote `dim` to that layer; used to enforce same-layer phase ordering
+        # for pinned ops (read.phase > write.phase).
+        writers_at_layer: Dict[tuple, tuple] = {}
         # layer_phase_kinds[(layer, kind)] = phase value if a phase-set op is using it
         layer_phase_kinds: Dict[tuple, Optional[int]] = {}
         assignment: Dict[str, int] = {}
@@ -372,20 +386,66 @@ class LayerCompiler:
             for d in op.reads:
                 if d in writes_layer:
                     earliest = max(earliest, writes_layer[d] + 1)
-            layer = earliest
-            while True:
-                key = (layer, op.kind)
-                existing_phase = layer_phase_kinds.get(key, "unset")
-                if existing_phase == "unset":
-                    layer_phase_kinds[key] = op.phase
-                    break
-                # Slot taken; if same phase, share. Otherwise advance.
-                if op.phase is not None and existing_phase == op.phase:
-                    break
-                layer += 1
+
+            if op.layer_idx is not None and op.kind in ("attn", "ffn"):
+                # Pinned attn/ffn op — must land at layer_idx exactly.
+                # Validate that every read dim is produced at a strictly
+                # earlier layer, OR at the same layer with a lower phase,
+                # OR at the same layer/phase by an attn op when this op is
+                # an ffn op (within a transformer block, attn runs before
+                # ffn, mirroring the same-phase pruning in _topological_sort).
+                for d in op.reads:
+                    if d not in writes_layer:
+                        continue
+                    write_layer = writes_layer[d]
+                    if write_layer < op.layer_idx:
+                        continue
+                    if write_layer == op.layer_idx:
+                        # Same-layer write/read: allow if (a) writer.phase <
+                        # reader.phase, or (b) attn-then-ffn at same phase.
+                        writer_info = writers_at_layer.get(
+                            (op.layer_idx, d)
+                        )
+                        if writer_info is not None:
+                            writer_name, writer_phase = writer_info
+                            if (op.phase is not None
+                                    and writer_phase is not None
+                                    and writer_phase < op.phase):
+                                continue
+                            writer_op = self._op_by_name.get(writer_name)
+                            if (op.kind == "ffn"
+                                    and writer_op is not None
+                                    and writer_op.kind == "attn"
+                                    and writer_phase == op.phase):
+                                continue
+                    raise ValueError(
+                        f"Op {op.name!r} pinned to layer {op.layer_idx} reads "
+                        f"dim {d!r} which is produced at layer {write_layer} "
+                        f"(must be < {op.layer_idx}, or == with lower phase, "
+                        f"or attn-then-ffn at same phase)"
+                    )
+                layer = op.layer_idx
+            else:
+                layer = earliest
+                while True:
+                    key = (layer, op.kind)
+                    existing_phase = layer_phase_kinds.get(key, "unset")
+                    if existing_phase == "unset":
+                        layer_phase_kinds[key] = op.phase
+                        break
+                    # Slot taken; if same phase, share. Otherwise advance.
+                    if op.phase is not None and existing_phase == op.phase:
+                        break
+                    layer += 1
             assignment[op.name] = layer
             for d in op.writes:
                 writes_layer[d] = max(writes_layer.get(d, -1), layer)
+                # Track writer (name, phase) for same-layer phase-ordering checks.
+                prev = writers_at_layer.get((layer, d))
+                if prev is None or (op.phase is not None
+                                    and (prev[1] is None
+                                         or op.phase > prev[1])):
+                    writers_at_layer[(layer, d)] = (op.name, op.phase)
         return assignment
 
     def _allocate_dims(self) -> Dict[str, int]:

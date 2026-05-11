@@ -20,6 +20,7 @@ def make_layer14_mem_generation_op() -> Operation:
                "MEM_STORE", "MEM_ADDR_SRC"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
+        layer_idx=14,
         bake_fn=bake,
         migrated=True,
     )
