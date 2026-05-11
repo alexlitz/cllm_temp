@@ -607,6 +607,39 @@ class CarryPropagationPostOp(PureFFN):
         self.d_model = d_model
         self.S = S
 
+    def forward(self, x):
+        """Clamp CARRY and OUTPUT to non-negative before the carry-prop FFN.
+
+        FIX 2026-05-11 (D3 Phase 1 multi-IMM): The bitwise L10 attention can
+        leave negative residuals (~-217) on CARRY+1/CARRY+2 and OUTPUT_LO/HI
+        at the REG_AX_mark even when no ALU op is active. The carry-prop
+        units have negative mutual-exclusion weights on these dims (e.g.
+        sub_carry_in = -S*10 in ADD units), so a negative input flips to a
+        large positive contribution, defeating the -S*1000 MARK_AX
+        suppression and firing the unit spuriously.
+
+        Mirrors the FIX 2026-05-06 clamp pattern used in BDToGEConverter for
+        ALU_LO/HI and AX_CARRY_LO/HI.
+        """
+        BD = _SetDim
+        x_clamped = x.clone()
+        x_clamped[..., BD.CARRY + 0:BD.CARRY + 5] = torch.clamp(
+            x[..., BD.CARRY + 0:BD.CARRY + 5], min=0
+        )
+        x_clamped[..., BD.OUTPUT_LO:BD.OUTPUT_LO + 16] = torch.clamp(
+            x[..., BD.OUTPUT_LO:BD.OUTPUT_LO + 16], min=0
+        )
+        x_clamped[..., BD.OUTPUT_HI:BD.OUTPUT_HI + 16] = torch.clamp(
+            x[..., BD.OUTPUT_HI:BD.OUTPUT_HI + 16], min=0
+        )
+        # Compute hidden using clamped input, then add the FFN's output
+        # contribution to the ORIGINAL (unclamped) residual stream so we do
+        # not destroy upstream values.
+        up = F.linear(x_clamped, self.W_up) + self.b_up
+        gate = F.linear(x_clamped, self.W_gate) + self.b_gate
+        hidden = F.silu(up) * gate
+        return x + F.linear(hidden, self.W_down, self.b_down)
+
     def _bake_weights(self):
         S = self._pending_S
         byte_idx = self._pending_byte_idx
@@ -629,6 +662,16 @@ class CarryPropagationPostOp(PureFFN):
             BD.OP_PUTCHAR, BD.OP_GETCHAR,
         ]
 
+        # FIX 2026-05-11 (D3 Phase 1 multi-IMM): Reduce W_up weight on OUTPUT_LO/HI
+        # so the unit only fires when add_carry_in/sub_carry_in is HIGH (real
+        # carry/borrow), not just when OUTPUT happens to be in a particular state.
+        # Previously, OUTPUT_LO/HI weights of +S=100 combined with values ~160
+        # (from L10 attn AX byte passthrough) produced contributions ~16000 that
+        # overwhelmed the suppression bias (-950). Reducing to +S*0.05=5 means
+        # OUTPUT contribution maxes at ~800 (5 * 160), which the bias can offset.
+        out_match_w = S * 0.05
+        carry_thresh = -S * 9.5  # baseline threshold
+
         unit = 0
         with torch.no_grad():
             # ADD carry propagation
@@ -645,8 +688,8 @@ class CarryPropagationPostOp(PureFFN):
                     self.W_up.data[unit, BD.MARK_AX] = -S * 1000
                     self.W_up.data[unit, BD.MARK_PC] = -S * 1000
                     self.W_up.data[unit, byte_dim] = S
-                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = S
-                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = S
+                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = out_match_w
+                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = out_match_w
                     for op_dim in non_arith_ops:
                         self.W_up.data[unit, op_dim] = -S * 20
                     self.W_up.data[unit, BD.OP_SUB] = -S * 20
@@ -660,7 +703,7 @@ class CarryPropagationPostOp(PureFFN):
                     # firing at wrong positions (e.g., byte_idx=0 unit shouldn't fire at byte 1).
                     for wrong_dim in wrong_byte_dims:
                         self.W_up.data[unit, wrong_dim] = -S * 10
-                    self.b_up.data[unit] = -S * 9.5  # Increased for L10 passthrough OUTPUT values
+                    self.b_up.data[unit] = carry_thresh
                     self.W_gate.data[unit, BD.H1 + 1] = 1.0
                     self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
                     self.W_down.data[BD.OUTPUT_HI + hi, unit] = -2.0 / S
@@ -685,8 +728,8 @@ class CarryPropagationPostOp(PureFFN):
                     self.W_up.data[unit, BD.MARK_AX] = -S * 1000
                     self.W_up.data[unit, BD.MARK_PC] = -S * 1000
                     self.W_up.data[unit, byte_dim] = S
-                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = S
-                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = S
+                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = out_match_w
+                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = out_match_w
                     for op_dim in non_arith_ops:
                         self.W_up.data[unit, op_dim] = -S * 20
                     self.W_up.data[unit, BD.OP_ADD] = -S * 20
@@ -698,7 +741,7 @@ class CarryPropagationPostOp(PureFFN):
                     # FIX 2026-05-08: Suppress at wrong byte positions.
                     for wrong_dim in wrong_byte_dims:
                         self.W_up.data[unit, wrong_dim] = -S * 10
-                    self.b_up.data[unit] = -S * 9.5  # Increased for L10 passthrough OUTPUT values
+                    self.b_up.data[unit] = carry_thresh
                     self.W_gate.data[unit, BD.H1 + 1] = 1.0
                     self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
                     self.W_down.data[BD.OUTPUT_HI + hi, unit] = -2.0 / S
@@ -7759,6 +7802,39 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
         ffn.W_down[output_dim, unit] = 50.0 / S
 
         unit += 1
+
+    # === FIX 2026-05-11 (D3 Phase 1 multi-IMM):
+    # Undo uniform OUTPUT_LO/HI pollution from L10 attn at MARK_AX positions
+    # when no ALU op is active. The L10 attention (block 11 in expanded model)
+    # writes a uniform ~-217 offset to all 16 OUTPUT_LO + 16 OUTPUT_HI dims at
+    # REG_AX_mark even when no ALU/bitwise op is active. This buries the IMM
+    # L6 bake's +160 signal, causing the LM head to fall back to marker tokens.
+    # Add +217 back at MARK_AX positions when no ALU op is active.
+    non_alu_op_dims = [
+        BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+        BD.OP_AND, BD.OP_OR, BD.OP_XOR,
+        BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+        BD.OP_SHL, BD.OP_SHR,
+    ]
+    suppress_d3 = S * 100
+    for out_range in [(BD.OUTPUT_LO, 16), (BD.OUTPUT_HI, 16)]:
+        out_base, count = out_range
+        for k in range(count):
+            ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.IS_BYTE] = -suppress_d3
+            ffn.W_up[unit, BD.MARK_PC] = -suppress_d3
+            ffn.W_up[unit, BD.MARK_SP] = -suppress_d3
+            ffn.W_up[unit, BD.MARK_BP] = -suppress_d3
+            ffn.W_up[unit, BD.MARK_STACK0] = -suppress_d3
+            ffn.W_up[unit, BD.MARK_MEM] = -suppress_d3
+            for op_dim in non_alu_op_dims:
+                ffn.W_up[unit, op_dim] = -suppress_d3
+            ffn.b_up[unit] = -S * 0.5
+            ffn.W_gate[unit, BD.CONST] = 1.0
+            # MARK_AX=1 gives W_up @ x ≈ S - S/2 = 50, silu(50) ≈ 50.
+            # hidden = silu(50) * 1 = 50. W_down = 4.34 gives 217 added to each dim.
+            ffn.W_down[out_base + k, unit] = 4.34
+            unit += 1
 
     return unit
 
