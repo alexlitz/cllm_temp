@@ -667,6 +667,44 @@ def make_layer7_memory_heads_op() -> Operation:
     )
 
 
+def make_format_pointer_extraction_op(enable_conversational_io: bool = False) -> Operation:
+    """L7 attention head 7: extract format string pointer from STACK0.
+
+    Originally an inline call in ``set_vm_weights`` (gated by
+    ``enable_conversational_io``):
+        ``_set_format_pointer_extraction(attn7, S, BD, HD)``
+        plus ``attn7.alibi_slopes[7] = 5.0``.
+
+    Migrated as ``kind="block"`` pinned to ``layer_idx=7`` with
+    ``migrated=True``. Registered unconditionally; the bake is a no-op
+    when ``enable_conversational_io`` is False, mirroring the legacy
+    flag gate. Phase=7.5 so this runs AFTER ``layer7_operand_gather``
+    and ``layer7_memory_heads`` (both phase=7) — those bakes fill the
+    same alibi_slopes vector via ``fill_(0.5)``, so the slope[7]=5.0
+    override must apply after them.
+    """
+    def bake(block, dim_positions, S):
+        if not enable_conversational_io:
+            return
+        from ..vm_step import _set_format_pointer_extraction
+        attn = block.attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[7] = 5.0  # steep to attend back to prev step
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_format_pointer_extraction(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="format_pointer_extraction",
+        phase=7.5,
+        reads={"IO_IN_OUTPUT_MODE", "MARK_STACK0", "EMBED_LO", "EMBED_HI"},
+        writes={"FORMAT_PTR_LO", "FORMAT_PTR_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=7,
+        migrated=True,
+    )
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP."""
     def bake(ffn, dim_positions, S):
@@ -682,6 +720,42 @@ def make_layer8_alu_op() -> Operation:
         writes={"OUTPUT_LO", "CARRY", "CMP_GROUP"},
         kind="ffn",
         bake_fn=bake,
+    )
+
+
+def make_format_position_counter_op(enable_conversational_io: bool = False) -> Operation:
+    """L8 FFN: increment IO_FORMAT_POS after each output byte emission.
+
+    Originally an inline call in ``set_vm_weights`` (nested under
+    ``alu_mode == 'lookup'`` + ``enable_conversational_io``):
+        ``_set_format_position_counter(ffn8, S, BD)``.
+
+    Migrated as ``kind="block"`` pinned to ``layer_idx=8`` with
+    ``migrated=True``. Registered unconditionally; the bake is a no-op
+    when ``enable_conversational_io`` is False. The original lookup-mode
+    nesting was a side-effect of convo-io initially being co-located with
+    the lookup ALU bake — the helper itself writes IO_FORMAT_POS units
+    (starting at unit 600) and has no dependency on lookup-mode-specific
+    weights, so this op fires regardless of alu_mode whenever the flag
+    is set. Phase=8.5 so this runs AFTER ``layer8_alu`` (phase=8) since
+    the position-counter units (600-615) intentionally overwrite a slice
+    of the ADD-carry block, matching legacy behavior.
+    """
+    def bake(block, dim_positions, S):
+        if not enable_conversational_io:
+            return
+        from ..vm_step import _set_format_position_counter
+        _set_format_position_counter(block.ffn, S, _as_setdim_proxy(dim_positions))
+
+    return Operation(
+        name="format_position_counter",
+        phase=8.5,
+        reads={"LAST_WAS_BYTE", "IO_IN_OUTPUT_MODE", "IO_FORMAT_POS"},
+        writes={"IO_FORMAT_POS"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=8,
+        migrated=True,
     )
 
 
@@ -911,6 +985,49 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         reads={"MARK_PC", "OP_LEV", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "L1H1", "BYTE_INDEX_0"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=9,
+        migrated=True,
+    )
+
+
+def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> Operation:
+    """L9 attention head 0: fetch byte from format string at FORMAT_PTR+POS.
+
+    Originally an inline call in ``set_vm_weights`` (nested under
+    ``alu_mode == 'lookup'`` + ``enable_conversational_io``):
+        ``_set_format_string_fetch_head(attn9, S, BD, HD)``
+        plus ``attn9.alibi_slopes.fill_(0.5)``.
+
+    Migrated as ``kind="block"`` pinned to ``layer_idx=9`` with
+    ``migrated=True``. Registered unconditionally; the bake is a no-op
+    when ``enable_conversational_io`` is False. The original lookup-mode
+    nesting was incidental — the helper writes only attn head 0 weights
+    and has no dependency on lookup-mode-specific weights, so this op
+    fires regardless of alu_mode whenever the flag is set. Phase=9.5 so
+    this runs AFTER ``layer9_lev_addr_relay`` (phase=9.0) and
+    ``layer9_lev_bp_to_pc_relay`` (phase=9.1); the ``fill_(0.5)`` call
+    intentionally clobbers slopes[0] and [1] that those ops set, matching
+    legacy ordering (the legacy convo-io block ran ``fill_(0.5)`` AFTER
+    the L9 LEV setup as well).
+    """
+    def bake(block, dim_positions, S):
+        if not enable_conversational_io:
+            return
+        from ..vm_step import _set_format_string_fetch_head
+        attn = block.attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes.fill_(0.5)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_format_string_fetch_head(attn, S, _as_setdim_proxy(dim_positions), HD)
+
+    return Operation(
+        name="format_string_fetch_head",
+        phase=9.5,
+        reads={"IO_IN_OUTPUT_MODE", "FORMAT_PTR_LO", "FORMAT_PTR_HI",
+               "ADDR_KEY", "EMBED_LO", "EMBED_HI"},
+        writes={"OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         kind="block",
         bake_fn=bake,
         layer_idx=9,
@@ -3375,15 +3492,24 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
     )
 
 
-def all_core_ops(alu_mode: str = "lookup") -> list:
+def all_core_ops(
+    alu_mode: str = "lookup",
+    *,
+    enable_conversational_io: bool = False,
+) -> list:
     """Return the full list of migrated core-VM operations.
 
-    Doesn't include I/O, conversational, or tool-call operations (those need
-    their own migration pass).
+    Doesn't include I/O or tool-call operations (those need their own
+    migration pass).
 
     ``alu_mode`` is forwarded to ops whose bake action depends on whether the
     legacy lookup ALU or the efficient neural ALU owns a given operation
     (currently: SHL/SHR via ``make_layer13_shifts_op``).
+
+    ``enable_conversational_io`` is forwarded to flag-gated convo-io ops
+    (``make_format_pointer_extraction_op``, ``make_format_position_counter_op``,
+    ``make_format_string_fetch_head_op``). These ops are always registered;
+    their bake_fn is a no-op when the flag is False.
     """
     return [
         make_layer0_threshold_attn_op(),
@@ -3422,7 +3548,19 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_layer6_bz_bnz_relay_bake_op(),
         make_layer7_operand_gather_op(),
         make_layer7_memory_heads_op(),
+        # Convo-I/O L7 attn bake (phase=7.5). Always registered; bake is a
+        # no-op when enable_conversational_io is False. See docstring for
+        # phase/ordering rationale.
+        make_format_pointer_extraction_op(
+            enable_conversational_io=enable_conversational_io
+        ),
         make_layer8_alu_op(),
+        # Convo-I/O L8 FFN bake (phase=8.5). Always registered; bake is a
+        # no-op when enable_conversational_io is False. Fires regardless of
+        # alu_mode (the original lookup-mode nesting was incidental).
+        make_format_position_counter_op(
+            enable_conversational_io=enable_conversational_io
+        ),
         # `make_layer8_multibyte_fetch_op` and `make_layer8_sp_gather_op` are
         # kept as kind="attn" dep anchors so the LayerCompiler topology
         # remains stable. The actual attn bakes are performed by the
@@ -3435,6 +3573,13 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         make_layer9_alu_op(),
         make_layer9_lev_addr_relay_op(),
         make_layer9_lev_bp_to_pc_relay_op(),
+        # Convo-I/O L9 attn bake (phase=9.5). Always registered; bake is a
+        # no-op when enable_conversational_io is False. Fires regardless of
+        # alu_mode; runs AFTER the L9 LEV bakes (phase 9.0/9.1) since the
+        # legacy code also re-filled alibi_slopes after LEV setup.
+        make_format_string_fetch_head_op(
+            enable_conversational_io=enable_conversational_io
+        ),
         make_layer10_carry_relay_op(),
         make_layer10_byte_passthrough_op(),
         make_layer10_sp_byte_passthrough_op(),
@@ -3663,6 +3808,13 @@ def declare_setdim_compat_dims(
         "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
         "OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP", "MEM_EXEC",
         "OPCODE_BASE",
+        # Conversational I/O state (aliases noted in _SetDim):
+        # IO_FORMAT_POS@468 aliases MEM_EXEC, IO_IN_OUTPUT_MODE@469 and
+        # IO_OUTPUT_COMPLETE@470 are dedicated, LAST_WAS_BYTE@503 is
+        # dedicated. Declared unconditionally so the compiler accepts the
+        # convo-io migrated ops' reads/writes even when the flag is False.
+        "IO_FORMAT_POS", "IO_IN_OUTPUT_MODE", "IO_OUTPUT_COMPLETE",
+        "LAST_WAS_BYTE",
     ]
     # 7-dim threshold head outputs (one per marker type)
     seven_dim = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",

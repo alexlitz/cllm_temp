@@ -97,7 +97,10 @@ def compile_full_vm(
     # Forward alu_mode so SHL/SHR (and any future alu_mode-aware migrated op)
     # can branch between the legacy lookup-table bake and the efficient
     # neural-ALU bake.
-    for op in all_core_ops(alu_mode=alu_mode):
+    for op in all_core_ops(
+        alu_mode=alu_mode,
+        enable_conversational_io=enable_conversational_io,
+    ):
         compiler.add_op(op)
 
     # L10 post_op attach: runs as a migrated block op (phase=10.7) before the
