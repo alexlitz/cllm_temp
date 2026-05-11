@@ -1995,10 +1995,12 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # 1200). See unified_compiler/migrated_ops.py.
 
     # Conversational I/O: Extract format pointer from STACK0
-    if enable_conversational_io:
-        if hasattr(attn7, 'alibi_slopes') and attn7.alibi_slopes is not None:
-            attn7.alibi_slopes[7] = 5.0  # steep to attend back to prev step
-        _set_format_pointer_extraction(attn7, S, BD, HD)
+    # MIGRATED 2026-05-10: `_set_format_pointer_extraction(attn7, S, BD, HD)`
+    # and the companion `attn7.alibi_slopes[7] = 5.0` are now baked by the
+    # compiler block op `format_pointer_extraction` (phase=7.5, layer_idx=7,
+    # migrated=True). The op is registered unconditionally; its bake is a
+    # no-op when `enable_conversational_io` is False. See
+    # unified_compiler/migrated_ops.py.
 
     # ===== LAYER 8: ALU + SP→STACK0 addr gather =====
     attn8 = model.blocks[8].attn
@@ -2053,15 +2055,21 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         _set_layer8_multibyte_routing(ffn8, S, BD)
 
         # Conversational I/O: Position counter increment
-        if enable_conversational_io:
-            _set_format_position_counter(ffn8, S, BD)
+        # MIGRATED 2026-05-10: `_set_format_position_counter(ffn8, S, BD)`
+        # is now baked by the compiler block op `format_position_counter`
+        # (phase=8.5, layer_idx=8, migrated=True). The op is registered
+        # unconditionally and fires regardless of alu_mode whenever
+        # `enable_conversational_io` is set (the original lookup-mode
+        # nesting was incidental). See unified_compiler/migrated_ops.py.
 
         # Conversational I/O: Format string fetch via attention
-        if enable_conversational_io:
-            attn9 = model.blocks[9].attn
-            if hasattr(attn9, 'alibi_slopes') and attn9.alibi_slopes is not None:
-                attn9.alibi_slopes.fill_(0.5)
-            _set_format_string_fetch_head(attn9, S, BD, HD)
+        # MIGRATED 2026-05-10: `_set_format_string_fetch_head(attn9, S, BD, HD)`
+        # and the companion `attn9.alibi_slopes.fill_(0.5)` are now baked by
+        # the compiler block op `format_string_fetch_head` (phase=9.5,
+        # layer_idx=9, migrated=True). The op is registered unconditionally
+        # and fires regardless of alu_mode whenever `enable_conversational_io`
+        # is set (the original lookup-mode nesting was incidental). See
+        # unified_compiler/migrated_ops.py.
 
         # LEV ADDR_B0 relay: prev step BP byte 0 → SP marker (for SP = BP + 16)
         # and the companion BP byte 0 → ADDR_B0 at PC marker for return_addr.
