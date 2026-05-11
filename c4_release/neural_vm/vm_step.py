@@ -458,6 +458,21 @@ class AutoregressiveAttention(nn.Module):
 #         return x + F.linear(out, self.W_o)
 
 
+def _resolve_bd(dim_positions):
+    """Return a BD-like object that resolves dim names to compact positions.
+
+    When ``dim_positions`` is a dict of compiler-allocated positions, returns
+    a ``_SetDim`` proxy that maps ``BD.<NAME>`` lookups through the dict;
+    otherwise returns the legacy ``_SetDim`` class. Used by post-op
+    ``_bake_weights`` methods so a single helper replaces the duplicated
+    ``if dim_positions is not None: ... else: BD = _SetDim`` branch.
+    """
+    if dim_positions is None:
+        return _SetDim
+    from .unified_compiler.ops.shared import _as_setdim_proxy
+    return _as_setdim_proxy(dim_positions)
+
+
 class ComparisonCombine(PureFFN):
     """Comparison combine module for EQ/NE/LT/GT/LE/GE.
 
@@ -474,18 +489,23 @@ class ComparisonCombine(PureFFN):
     and is treated structurally like every other FFN by tooling.
     """
 
-    def __init__(self, d_model=512, S=100.0):
+    def __init__(self, d_model=512, S=100.0, dim_positions=None):
         # PureFFN.__init__ calls _bake_weights(); store config first so _bake_weights
         # can read it. We use object.__setattr__ to bypass nn.Module.__setattr__ since
         # nn.Module isn't initialized yet at this point.
         object.__setattr__(self, '_pending_S', S)
+        # Stash dim_positions BEFORE super().__init__ so _bake_weights (called
+        # from PureFFN.__init__) sees compact positions if provided. Without
+        # this, the post-op writes/reads against legacy `_SetDim` positions
+        # which alias unrelated dims under compact (pin_io_only=True) layouts.
+        object.__setattr__(self, '_pending_dim_positions', dim_positions)
         super().__init__(dim=d_model, hidden_dim=18)
         self.d_model = d_model
         self.S = S
 
     def _bake_weights(self):
         S = self._pending_S
-        BD = _SetDim
+        BD = _resolve_bd(getattr(self, '_pending_dim_positions', None))
         unit = 0
 
         # FIX 2026-05-09: All ComparisonCombine units add a strong MARK_PC blocker.
@@ -584,15 +604,7 @@ class BinaryOpByteZeroingPostOp(PureFFN):
 
     def _bake_weights(self):
         S = self._pending_S
-        dim_positions = getattr(self, '_pending_dim_positions', None)
-        if dim_positions is not None:
-            # Use compact dim_positions through the setdim proxy so the bake
-            # function below resolves each `BD.<NAME>` to the compact position
-            # (not the legacy `_SetDim` position).
-            from .unified_compiler.ops.shared import _as_setdim_proxy
-            BD = _as_setdim_proxy(dim_positions)
-        else:
-            BD = _SetDim
+        BD = _resolve_bd(getattr(self, '_pending_dim_positions', None))
         op_dims = [BD.OP_ADD, BD.OP_SUB, BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT,
                    BD.OP_LE, BD.OP_GE, BD.OP_SHL, BD.OP_SHR,
                    BD.OP_MUL, BD.OP_DIV, BD.OP_MOD]
@@ -648,10 +660,13 @@ class CarryPropagationPostOp(PureFFN):
     Phase 0 conversion (2026-05-09): subclasses PureFFN.
     """
 
-    def __init__(self, d_model=512, S=100.0, byte_idx=0, cascade=False):
+    def __init__(self, d_model=512, S=100.0, byte_idx=0, cascade=False, dim_positions=None):
         object.__setattr__(self, '_pending_S', S)
         object.__setattr__(self, '_pending_byte_idx', byte_idx)
         object.__setattr__(self, '_pending_cascade', cascade)
+        # Stash dim_positions BEFORE super().__init__ so _bake_weights (called
+        # from PureFFN.__init__) sees compact positions if provided.
+        object.__setattr__(self, '_pending_dim_positions', dim_positions)
         super().__init__(dim=d_model, hidden_dim=512)
         self.d_model = d_model
         self.S = S
@@ -660,7 +675,7 @@ class CarryPropagationPostOp(PureFFN):
         S = self._pending_S
         byte_idx = self._pending_byte_idx
         cascade = self._pending_cascade
-        BD = _SetDim
+        BD = _resolve_bd(getattr(self, '_pending_dim_positions', None))
 
         byte_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][byte_idx]
         add_carry_in = BD.CARRY + (3 if cascade else 1)
@@ -768,15 +783,18 @@ class BitwiseBytePropagationPostOp(PureFFN):
     Phase 0 conversion (2026-05-09): subclasses PureFFN.
     """
 
-    def __init__(self, d_model=512, S=100.0):
+    def __init__(self, d_model=512, S=100.0, dim_positions=None):
         object.__setattr__(self, '_pending_S', S)
+        # Stash dim_positions BEFORE super().__init__ so _bake_weights (called
+        # from PureFFN.__init__) sees compact positions if provided.
+        object.__setattr__(self, '_pending_dim_positions', dim_positions)
         super().__init__(dim=d_model, hidden_dim=1536)
         self.d_model = d_model
         self.S = S
 
     def _bake_weights(self):
         S = self._pending_S
-        BD = _SetDim
+        BD = _resolve_bd(getattr(self, '_pending_dim_positions', None))
 
         unit = 0
         with torch.no_grad():
