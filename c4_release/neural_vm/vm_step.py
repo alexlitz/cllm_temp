@@ -1938,8 +1938,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # BEFORE this legacy_bake's _right_size_ffns so the FFN unit writes
     # survive). Inline call removed to avoid double-bake.
 
-    # Binary pop SP increment (L6 FFN: SP += 8 for binary pop ops)
-    _set_binary_pop_sp_increment(ffn6, S, BD)
+    # Binary pop SP increment (L6 FFN: SP += 8 for binary pop ops) —
+    # MIGRATED: now installed via `make_binary_pop_sp_increment_op` in
+    # `unified_compiler/migrated_ops.py` (kind="model", phase=998, migrated=True).
+    # Inline call removed to avoid double-bake.
 
     # Function call opcodes (JSR, ENT, LEV, LEA) — migrated to compiler op
     # `make_function_call_weights_op` in `unified_compiler/migrated_ops.py`
