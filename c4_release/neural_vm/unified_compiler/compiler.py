@@ -793,7 +793,15 @@ class UnifiedVMCompiler:
         # K: attend to AX marker
         attn.W_k.data[base, BD.MARK_AX] = L
 
-        # V[0]: OP_LEV — disabled (injected globally via _inject_active_opcode)
+        # V[0]: OP_LEV relay (purity V1: 2026-05-11).
+        # Mirrors vm_step.py:7060. With the L5 PC-marker OP_LEV decode now
+        # in place (all-step), OP_LEV ≈ 5 lands at PC marker autonomously.
+        # This relay propagates OP_LEV from AX → SP/STACK0/BP/PC/MEM for
+        # L9 LEV-BP-to-PC, L14 TEMP clear, and L15/L16 LEV gates.
+        # V=0.1 × W_o=10.0 = 1.0 multiplier so OP_LEV ≈ 5 at relay positions
+        # (matching L5 FFN write at AX). No doubling because
+        # _inject_active_opcode no longer fires for LEV in pure_neural.
+        attn.W_v.data[base + 0, BD.OP_LEV] = 0.1
         # V[1]: OP_PSH (scaled)
         attn.W_v.data[base + 1, BD.OP_PSH] = 0.2
         # V[2]: OP_ADJ (scaled)
@@ -835,7 +843,9 @@ class UnifiedVMCompiler:
         attn.W_o.data[BD.OP_JSR, base + 5] = 5.0  # Fix: relay OP_JSR flag itself
         attn.W_o.data[BD.MEM_STORE, base + 6] = 1.0  # store flag
         attn.W_o.data[BD.MEM_ADDR_SRC, base + 7] = 1.0  # addr source
-        # OP_LEV relay — disabled (injected globally, relay would double it at PC)
+        # OP_LEV relay re-enabled (purity V1, 2026-05-11): V=0.1 × W_o=10.0 = 1.0
+        # multiplier so OP_LEV ≈ 5 at PC/SP/STACK0/BP/MEM (matches L5 FFN write at AX).
+        attn.W_o.data[BD.OP_LEV, base + 0] = 10.0
         # O: ALU_LO outputs (for STACK0)
         for k in range(16):
             attn.W_o.data[BD.ALU_LO + k, base + 8 + k] = 1.0
@@ -2108,6 +2118,22 @@ class UnifiedVMCompiler:
             else:
                 op_dim = getattr(BD, out)
                 ffn.W_down.data[op_dim, unit] = 10.0 / S
+            unit += 1
+
+        # All-step opcode decode at PC marker (no HAS_SE gate).
+        # Purity V1 (2026-05-11): replaces the Python-side _inject_active_opcode
+        # OP_LEV write. Fires on every step at MARK_PC when the fetched opcode
+        # byte equals LEV (lo=8, hi=0), making OP_LEV autoregressive at the PC
+        # marker without requiring an external Python peek at the bytecode.
+        # Mirrors vm_step.py:3235-3252 "All-step opcode decode at PC marker".
+        for op_val, lo, hi in [(Opcode.LEV, 8, 0)]:
+            op_dim = BD.opcode_dim(op_val)
+            ffn.W_up.data[unit, BD.OPCODE_BYTE_LO + lo] = S
+            ffn.W_up.data[unit, BD.OPCODE_BYTE_HI + hi] = S
+            ffn.W_up.data[unit, BD.MARK_PC] = S
+            ffn.b_up.data[unit] = -S * 2.5  # require all three conditions
+            ffn.b_gate.data[unit] = 1.0  # always active when up > 0
+            ffn.W_down.data[op_dim, unit] = 10.0 / S  # OP_LEV ≈ 5 at PC marker
             unit += 1
 
         # TEMP clearing at PC marker to prevent leakage from L5 attention
