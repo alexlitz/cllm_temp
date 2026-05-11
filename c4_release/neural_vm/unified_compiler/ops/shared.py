@@ -344,16 +344,26 @@ def setup_token_embeddings(embed_weight, dim_positions: Dict[str, int] = None) -
             embed_weight[Token.TOOL_CALL, const] = 1.0
 
         # Thinking markers (try/except in case dims not declared in compiler spec)
+        # MARK_THINKING_START/_END are baked directly into the embedding table
+        # so the runtime `NeuralVMEmbedding._inject_thinking_markers` Python
+        # loop is unnecessary — L2's lookback head reads these dims, and an
+        # embedding-table entry is equivalent to a per-position injection for
+        # tokens that only appear as themselves (THINKING_START=272,
+        # THINKING_END=273 are never reused for anything else).
         try:
             temp = D("TEMP")
+            mark_thinking_start = D("MARK_THINKING_START")
+            mark_thinking_end = D("MARK_THINKING_END")
             if Token.THINKING_START < V:
                 embed_weight[Token.THINKING_START, is_mark] = 1.0
                 embed_weight[Token.THINKING_START, const] = 1.0
                 embed_weight[Token.THINKING_START, temp + 1] = 1.0
+                embed_weight[Token.THINKING_START, mark_thinking_start] = 1.0
             if Token.THINKING_END < V:
                 embed_weight[Token.THINKING_END, is_mark] = 1.0
                 embed_weight[Token.THINKING_END, const] = 1.0
                 embed_weight[Token.THINKING_END, temp + 2] = 1.0
+                embed_weight[Token.THINKING_END, mark_thinking_end] = 1.0
         except AttributeError:
             pass
 
@@ -499,8 +509,8 @@ def setup_head_weights(head, dim_positions: Dict[str, int] = None) -> None:
 #   gating and by L0 thresholds.
 # - OP_LEV/BZ/BNZ + ACTIVE_OPCODE_PRTF/READ: injected by
 #   `_inject_active_opcode` based on the current opcode hint.
-# - MARK_THINKING_START/END: written by `_inject_thinking_markers` on
-#   THINKING_START/END tokens.
+# - MARK_THINKING_START/END: baked into the embedding table on
+#   THINKING_START/END tokens (see ``setup_token_embeddings``).
 # - MEM_STORE / ADDR_KEY: written by `_inject_mem_store` /
 #   `_inject_mem_metadata` for memory ops. (MEM_EXEC@468 is retained in the
 #   IO set as a layout placeholder — Phase A 2026-05-11 removed the writes
