@@ -2119,9 +2119,13 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # this migration is SAFE because ``make_l10_post_op_attach_op``
         # is intentionally NOT touched here.
 
-        # Conversational I/O: Null terminator detection
-        if enable_conversational_io:
-            _set_null_terminator_detection(ffn10, S, BD)
+        # Conversational I/O: Null terminator detection — MIGRATED 2026-05-10
+        # to compiler block op `null_terminator_detection` (kind="block",
+        # layer_idx=10, phase=10.6, migrated=True) in
+        # `unified_compiler/migrated_ops.py`. Bake_fn no-ops when
+        # `enable_conversational_io=False` or when alu_mode != 'lookup'
+        # (efficient mode replaces ffn10 with ALUAndOrXor, which lacks the
+        # PureFFN W_*/b_* interface the helper expects).
 
         # ===== LAYER 10.5: Byte propagation + DIV/MOD =====
         # Migrated to compiler block op `l10_post_op_attach` (phase=10.7) which
@@ -2263,9 +2267,12 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # (make_layer15_nibble_copy_op, kind="block", layer_idx=15, migrated=True,
     # phase=15).
 
-    # Conversational I/O: Output routing (OUTPUT_BYTE → OUTPUT)
-    if enable_conversational_io:
-        _set_conversational_io_output_routing(ffn15, S, BD)
+    # Conversational I/O: Output routing (OUTPUT_BYTE → OUTPUT) — MIGRATED
+    # 2026-05-10 to compiler block op `conversational_io_output_routing`
+    # (kind="block", layer_idx=15, phase=15.1, migrated=True) in
+    # `unified_compiler/migrated_ops.py`. Bake_fn no-ops when
+    # `enable_conversational_io=False`. ffn15 is PureFFN in both alu_modes
+    # so the bake is alu_mode-agnostic.
 
     # ===== LAYER 16: LEV register routing (Phase 3) =====
     # Only set up L16 if model has 17+ layers

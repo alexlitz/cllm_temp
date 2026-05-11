@@ -3809,6 +3809,81 @@ def make_layer2_lookback_detection_head_op(
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Conversational I/O tail bakes (L10 + L15)
+# ---------------------------------------------------------------------------
+#
+# These ops migrate the two inline ``_set_null_terminator_detection`` and
+# ``_set_conversational_io_output_routing`` calls out of ``set_vm_weights``.
+# Both are gated by ``enable_conversational_io`` — when the flag is off the
+# bake_fn is a no-op so the op is safe to register unconditionally. The flag
+# is plumbed through ``all_core_ops`` (and from ``compile_full_vm``).
+#
+# L10 null terminator: writes ffn10 units starting at 1864 (above the
+# ~1854 units used by ``_set_layer10_alu``). Pinned to layer_idx=10 via
+# kind="block". The bake is skipped in efficient mode because ffn10 is
+# replaced with an ``ALUAndOrXor`` module (a ``PureNeuralALU`` subclass
+# without the ``W_up``/``W_gate``/``W_down``/``b_up`` PureFFN interface
+# the helper expects). The lookup-branch nesting in the legacy call was
+# necessary, not incidental.
+#
+# L15 output routing: writes ffn15 units starting at 1200 (well above the
+# ~32 units used by ``_set_nibble_copy_ffn``). Pinned to layer_idx=15 via
+# kind="block". ffn15 is a ``PureFFN`` in both alu_modes, so this op
+# always bakes when convo-io is enabled.
+
+
+def make_null_terminator_detection_op(
+    enable_conversational_io: bool = False,
+    alu_mode: str = "lookup",
+) -> Operation:
+    """L10 FFN: null-terminator detection for conversational I/O.
+
+    Originally an inline call in ``set_vm_weights`` (nested inside the
+    ``alu_mode == 'lookup'`` branch under ``if enable_conversational_io:``):
+        ``_set_null_terminator_detection(ffn10, S, BD)``
+
+    The helper writes ``ffn10`` units starting at 1864 (above the ~1854
+    units used by ``_set_layer10_alu``). Detects ``OUTPUT_BYTE == 0`` while
+    ``IO_IN_OUTPUT_MODE`` is active and sets ``IO_OUTPUT_COMPLETE`` +
+    clears ``IO_IN_OUTPUT_MODE`` + emits ``NEXT_THINKING_START``.
+
+    Pinned to ``layer_idx=10`` via ``kind="block"``. Runs in the block-op
+    dispatch loop BEFORE legacy_bake (phase=999), so ``_set_layer10_alu``
+    has not yet populated units 0-1853 when this op writes to units 1864+;
+    the two ranges don't overlap so the order doesn't matter. The phase
+    (10.6) only matters relative to other block ops at layer_idx=10 (none
+    today). All written units survive ``right_size_ffns`` (phase=1200).
+
+    No-op when ``enable_conversational_io=False`` or when
+    ``alu_mode != 'lookup'`` (in efficient mode ffn10 is an
+    ``ALUAndOrXor`` and lacks the PureFFN ``W_*``/``b_*`` interface the
+    helper expects).
+    """
+    if enable_conversational_io and alu_mode == "lookup":
+        def bake(block, dim_positions, S):
+            from ..vm_step import _set_null_terminator_detection
+            _set_null_terminator_detection(
+                block.ffn, S, _as_setdim_proxy(dim_positions)
+            )
+    else:
+        def bake(block, dim_positions, S):
+            return
+
+    return Operation(
+        name="null_terminator_detection",
+        phase=10.6,
+        reads={"OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI", "IO_IN_OUTPUT_MODE"},
+        writes={"IO_OUTPUT_COMPLETE", "IO_IN_OUTPUT_MODE",
+                "NEXT_THINKING_START"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=10,
+        migrated=True,
+    )
+
+
 def make_layer3_convo_io_state_init_op(
     enable_conversational_io: bool = False,
 ) -> Operation:
@@ -3853,6 +3928,52 @@ def make_layer3_convo_io_state_init_op(
     )
 
 
+def make_conversational_io_output_routing_op(
+    enable_conversational_io: bool = False,
+) -> Operation:
+    """L15 FFN: route ``OUTPUT_BYTE_LO/HI`` -> ``OUTPUT_LO/HI`` in output mode.
+
+    Originally an inline call in ``set_vm_weights`` (gated by
+    ``if enable_conversational_io:`` at the top level after the
+    ``alu_mode`` branches):
+        ``_set_conversational_io_output_routing(ffn15, S, BD)``
+
+    The helper writes ``ffn15`` units starting at 1200 (well above the
+    ~32 units used by ``_set_nibble_copy_ffn``), copying each
+    ``OUTPUT_BYTE`` nibble to the corresponding ``OUTPUT`` nibble when
+    ``IO_IN_OUTPUT_MODE`` is set. This emits the fetched format-string
+    byte through the output head.
+
+    Pinned to ``layer_idx=15`` via ``kind="block"``. Phase=15.1 so it
+    runs AFTER ``layer15_nibble_copy`` (phase=15, also layer_idx=15) in
+    the block-op dispatch order. Both run BEFORE legacy_bake (phase=999)
+    and BEFORE ``right_size_ffns`` (phase=1200) prunes dead units. ffn15
+    is a ``PureFFN`` in both alu_modes, so this bake is alu_mode-agnostic.
+
+    No-op when ``enable_conversational_io=False``.
+    """
+    if enable_conversational_io:
+        def bake(block, dim_positions, S):
+            from ..vm_step import _set_conversational_io_output_routing
+            _set_conversational_io_output_routing(
+                block.ffn, S, _as_setdim_proxy(dim_positions)
+            )
+    else:
+        def bake(block, dim_positions, S):
+            return
+
+    return Operation(
+        name="conversational_io_output_routing",
+        phase=15.1,
+        reads={"IO_IN_OUTPUT_MODE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=15,
+        migrated=True,
+    )
+
+
 def all_core_ops(
     alu_mode: str = "lookup",
     *,
@@ -3880,6 +4001,11 @@ def all_core_ops(
     which are always registered but no-op when the flag is False. This keeps
     the registration list (and hence the dep graph / layer count) stable
     across modes.
+
+    Conversational-I/O tail ops (L10 null-terminator detection,
+    L15 output routing) are also flag-gated via ``enable_conversational_io``;
+    L10 null-terminator additionally requires ``alu_mode == 'lookup'`` since
+    ffn10 is replaced with ``ALUAndOrXor`` in efficient mode.
     """
     return [
         make_layer0_threshold_attn_op(),
@@ -4058,6 +4184,18 @@ def all_core_ops(
         make_l7_dead_unit_zero_op(),
         make_right_size_ffns_op(),
         make_expand_wrapper_blocks_op(),
+        # Conversational-I/O tail bakes (gated by enable_conversational_io).
+        # Registered unconditionally; bake_fn is a no-op when the flag is off
+        # so the dep-graph topology is identical regardless of flag state.
+        # See ``make_null_terminator_detection_op`` /
+        # ``make_conversational_io_output_routing_op`` for details.
+        make_null_terminator_detection_op(
+            enable_conversational_io=enable_conversational_io,
+            alu_mode=alu_mode,
+        ),
+        make_conversational_io_output_routing_op(
+            enable_conversational_io=enable_conversational_io,
+        ),
     ]
 
 
@@ -4194,6 +4332,7 @@ def declare_setdim_compat_dims(
         "NEXT_MEM", "NEXT_SE", "NEXT_HALT",
         "NEXT_TOOL_CALL", "NEXT_THINKING_START", "NEXT_THINKING_END",
         "IO_IS_PUTCHAR", "IO_OUTPUT_READY",
+        "IO_IN_OUTPUT_MODE", "IO_OUTPUT_COMPLETE",
         "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
         "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC",
         "OP_SI", "OP_SC", "OP_PSH",
