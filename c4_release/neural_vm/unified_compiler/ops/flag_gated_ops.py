@@ -454,6 +454,64 @@ def make_convo_io_pc_sp_latch_op(
     )
 
 
+def make_convo_io_prtf_capture_op(
+    enable_conversational_io: bool = False,
+    enable: bool = False,
+) -> Operation:
+    """L7 FFN: V18 Phase 1b PRTF AX-marker capture bake (3c in the V18 plan).
+
+    Wires L7 FFN units 800-863 (64 units total) that, at the PRTF AX
+    marker (``ACTIVE_OPCODE_PRTF`` AND ``MARK_AX``), decompose the current
+    step's PC and SP byte-0 nibbles and stage them into the dedicated
+    ``POST_PRTF_PC_LO/HI`` and ``POST_PRTF_SP_LO/HI`` cache dims that the
+    3b replay band (``convo_io_pc_sp_latch`` at L6 FFN units 1402-1465)
+    reads at the resumed step's REG_PC / REG_SP value-byte positions.
+
+    Sources at the AX marker after L4:
+      - PC byte 0 nibbles: ``EMBED_LO/HI`` (set by L4 head 0 ``_set_layer4_pc_relay``).
+      - SP byte 0 nibbles: ``ADDR_B0_HI`` lo / ``ADDR_B1_HI`` hi (set by L4 heads 2-3
+        ``make_layer4_sp_to_addr_key_op``).
+
+    The cache dims alias dead slots at the PRTF AX marker:
+      - POST_PRTF_PC_LO/HI alias AX_FULL_LO/HI (PRTF never PSHes AX).
+      - POST_PRTF_SP_LO/HI alias AX_CARRY_LO/HI (PRTF is not an ALU op).
+
+    Double-gated: both ``enable_conversational_io`` AND ``enable`` must
+    be True for the bake to fire. Defaults to a no-op for the Phase 1b
+    landing — flip ``enable=True`` once the parity test in
+    ``tests/test_v18_convo_io_neural_bakes.py`` passes end-to-end and
+    Phase 2 (deletion of the V18 handler block at ``run_vm.py:534-583``)
+    is ready to land.
+
+    Pinned to ``layer_idx=7`` via ``kind="block"`` so the bake hits
+    ``model.blocks[7].ffn``. Phase 7.6 places this AFTER the L7 FFN main
+    bakes (phase 7.x) so the unit writes layer cleanly. Runs BEFORE
+    ``right_size_ffns`` (phase 1200) so all units survive.
+
+    Unit allocation (kept disjoint from existing baked ranges):
+      - 0-99:    typical L7 FFN main bake range
+      - 800-863: this op (capture-side band)
+    """
+    def bake(block, dim_positions, S):
+        if not (enable_conversational_io and enable):
+            return
+        from ...vm_step import _set_convo_io_prtf_capture
+        _set_convo_io_prtf_capture(
+            block.ffn, S, _as_setdim_proxy(dim_positions)
+        )
+
+    return Operation(
+        name="convo_io_prtf_capture",
+        phase=7.6,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        layer_idx=7,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
 def make_conversational_io_output_routing_op(
     enable_conversational_io: bool = False,
 ) -> Operation:

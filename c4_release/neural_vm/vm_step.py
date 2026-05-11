@@ -1940,6 +1940,25 @@ class _SetDim:
     AX_FULL_LO = 471  # 471-486 (16 dims, overlaps FORMAT_PTR_LO)
     AX_FULL_HI = 487  # 487-502 (16 dims, overlaps FORMAT_PTR_HI)
 
+    # --- V18 Phase 1b: PRTF AX-marker capture cache dims ---
+    # The capture-side bake (``_set_convo_io_prtf_capture``) writes PC and SP
+    # byte-0 nibbles into these dims at the PRTF AX marker, where they are
+    # later read by the L6 replay band (``_set_convo_io_pc_sp_latch``) at the
+    # resumed step's REG_PC / REG_SP value-byte positions. The dims are
+    # aliased onto existing slots that are *dead* at the PRTF AX marker:
+    #   - POST_PRTF_PC_LO/HI alias AX_FULL_LO/HI (471/487). At the PRTF AX
+    #     marker AX_FULL is being staged for ``PSH STACK0 = AX`` of the same
+    #     step — PRTF never PSHes AX, so overwriting AX_FULL there is safe.
+    #   - POST_PRTF_SP_LO/HI alias AX_CARRY_LO/HI (328/344). AX_CARRY is the
+    #     ALU divisor staging slot; PRTF is not an ALU op so AX_CARRY at the
+    #     PRTF AX marker is unused.
+    # The aliasing keeps d_model=512 (no growth) while giving the capture
+    # bake disjoint targets for PC and SP nibbles. See V18_CONVO_IO_NEURAL_PLAN.md §3b.
+    POST_PRTF_PC_LO = 471  # aliases AX_FULL_LO (16 dims, 471-486)
+    POST_PRTF_PC_HI = 487  # aliases AX_FULL_HI (16 dims, 487-502)
+    POST_PRTF_SP_LO = 328  # aliases AX_CARRY_LO (16 dims, 328-343)
+    POST_PRTF_SP_HI = 344  # aliases AX_CARRY_HI (16 dims, 344-359)
+
     # --- General temporaries / reserved ---
     TEMP = 480  # 480-511 (32 dims)
 
@@ -2299,6 +2318,7 @@ from .setup_helpers import (
     _set_null_terminator_detection,
     _set_convo_io_step_resume,
     _set_convo_io_pc_sp_latch,
+    _set_convo_io_prtf_capture,
     _set_stack0_carry_attn,
     _set_tool_call_detection,
     _set_tool_call_opcode_decode,

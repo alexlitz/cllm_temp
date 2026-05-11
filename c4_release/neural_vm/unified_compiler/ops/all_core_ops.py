@@ -273,6 +273,17 @@ def all_core_ops(
             enable_conversational_io=enable_conversational_io,
             enable=False,
         ),
+        # V18 Phase 1b capture-side bake (companion to convo_io_pc_sp_latch).
+        # L7 FFN units 800-863: at the PRTF AX marker, decompose PC and SP
+        # byte-0 nibbles into the POST_PRTF_PC / POST_PRTF_SP cache dims that
+        # the 3b replay band reads at the resumed step's REG_PC / REG_SP
+        # value-byte positions. Double-gated; ``enable=False`` by default —
+        # flip in tandem with convo_io_pc_sp_latch once the end-to-end neural
+        # convo-IO loop is validated. See V18_CONVO_IO_NEURAL_PLAN.md §3.
+        make_convo_io_prtf_capture_op(
+            enable_conversational_io=enable_conversational_io,
+            enable=False,
+        ),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
