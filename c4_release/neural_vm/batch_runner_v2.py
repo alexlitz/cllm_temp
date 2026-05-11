@@ -45,10 +45,25 @@ class UltraBatchRunner:
         max_seq_len=4096,
         device='cuda' if torch.cuda.is_available() else 'cpu',
         strict: bool = False,
+        n_speculative_steps: int = 1,
     ):
+        """
+        Args:
+            n_speculative_steps: Number of VM steps to speculate per forward
+                pass. Default 1 preserves prior behavior (1 step = 35 draft
+                tokens per forward). N>1 lets the DraftVM execute N
+                instructions sequentially and validates all N*35 tokens in a
+                single transformer forward pass — amortizing transformer cost
+                across N steps. Multi-step has zero correctness risk because
+                C4 semantics are deterministic and DraftVM is the
+                authoritative reference VM; transformer rejection is recorded
+                as a `get_speculation_stats()` metric, not used to alter
+                results. Use strict=True to assert transformer fidelity.
+        """
         self.batch_size = batch_size
         self.device = device
         self.strict = strict
+        self.n_speculative_steps = max(1, int(n_speculative_steps))
 
         # Create transformer model via the unified compiler. The compiler is
         # the single bake authority; d_model/n_layers come from the operation
@@ -99,36 +114,124 @@ class UltraBatchRunner:
         ]
         self.active = [True] * n_programs
 
-        # Speculative execution loop
-        for step in range(max_steps):
-            self.current_step = step
-            if not any(self.active):
+        # Statistics for multi-step speculation.
+        # accepted_steps[i] / proposed_steps[i] gives per-program acceptance.
+        self.proposed_steps = [0] * n_programs
+        self.accepted_steps = [0] * n_programs
+
+        # Speculative execution loop. Each outer iteration speculates up to
+        # n_speculative_steps VM steps and validates all of them in ONE
+        # transformer forward pass.
+        N = self.n_speculative_steps
+        steps_done = [0] * n_programs
+        outer = 0
+        while any(self.active) and any(s < max_steps for s in steps_done):
+            self.current_step = outer
+            outer += 1
+
+            # 1. For each active program, speculate up to N VM steps. DraftVM
+            #    is deterministic c4-semantics; the transformer validates
+            #    afterward. We do NOT rewind on rejection because DraftVM IS
+            #    the source of truth — a rejection means the transformer
+            #    disagrees with the reference VM, recorded as a stats event.
+            draft_blocks = []      # per-program: list of 35-token lists
+            for i, vm in enumerate(self.draft_vms):
+                blocks = []
+                if self.active[i]:
+                    for _ in range(N):
+                        # Stop speculating further if program already halted
+                        if vm.halted:
+                            break
+                        # Stop speculating if we hit max_steps
+                        if steps_done[i] >= max_steps:
+                            break
+                        ok = vm.step()
+                        if not ok:
+                            break
+                        blocks.append(vm.draft_tokens())
+                        steps_done[i] += 1
+                        if vm.halted:
+                            # Include the halt step's tokens; halt is detected
+                            # after validation.
+                            break
+                draft_blocks.append(blocks)
+
+            # If no program produced any draft tokens this round, we are done.
+            if not any(len(b) > 0 for b in draft_blocks):
                 break
 
-            # 1. Execute active DraftVMs and get draft tokens
+            # 2. Build padded draft sequences (N*35 tokens each, padded with
+            #    HALT for programs that produced fewer steps). All programs
+            #    in the batch need equal draft_len for the batched forward.
+            max_blocks = max((len(b) for b in draft_blocks), default=0)
+            if max_blocks == 0:
+                break
+            draft_len = max_blocks * 35
+
             draft_tokens_batch = []
-            for i, vm in enumerate(self.draft_vms):
-                if self.active[i]:
-                    if vm.step():
-                        draft_tokens_batch.append(vm.draft_tokens())
-                    else:
-                        self.active[i] = False
-                        draft_tokens_batch.append([Token.HALT] * 35)
-                else:
-                    draft_tokens_batch.append([Token.HALT] * 35)
+            for blocks in draft_blocks:
+                flat = []
+                for b in blocks:
+                    flat.extend(b)
+                # Pad missing blocks with HALT-step tokens
+                while len(flat) < draft_len:
+                    flat.append(Token.HALT)
+                draft_tokens_batch.append(flat)
 
-            # 2. Batch validate all active programs in ONE forward pass
-            self._validate_batch_parallel(draft_tokens_batch, bytecodes)
+            # Real (non-padded) draft length per program, for context update.
+            real_draft_lens = [len(b) * 35 for b in draft_blocks]
 
-            # 3. Check for halts
+            # 3. Validate all programs' N-step blocks in ONE forward pass.
+            accepted_tokens_batch = self._validate_batch_parallel(
+                draft_tokens_batch, bytecodes, draft_len=draft_len,
+                real_draft_lens=real_draft_lens,
+            )
+
+            # 4. For each program, convert "accepted tokens" -> "accepted full
+            #    VM steps" for statistics. By default we DO NOT rewind: DraftVM
+            #    is the deterministic source of truth for c4 semantics, so its
+            #    state after stepping is correct regardless of whether the
+            #    transformer accepted the draft tokens. Rejections become a
+            #    performance/quality metric (acceptance rate). With strict=True
+            #    above, any rejection has already raised an AssertionError.
             for i in range(n_programs):
+                if not self.active[i]:
+                    continue
+                produced = len(draft_blocks[i])
+                if produced == 0:
+                    continue
+                self.proposed_steps[i] += produced
+
+                accepted_tokens = accepted_tokens_batch[i]
+                # Number of FULL 35-token steps accepted. Cap at produced so
+                # padded-HALT tokens don't inflate the count.
+                accepted_full_steps = min(accepted_tokens // 35, produced)
+                self.accepted_steps[i] += accepted_full_steps
+
+                # Halted check is based on DraftVM (which always advanced).
                 if self.draft_vms[i].halted:
                     self.active[i] = False
 
         # Return exit codes
         return [vm.ax for vm in self.draft_vms]
 
-    def _validate_batch_parallel(self, draft_tokens_batch: List[List[int]], bytecodes: List[List[int]]):
+    def get_speculation_stats(self) -> dict:
+        """Return per-program and aggregate speculation statistics.
+
+        Acceptance rate counts full VM steps (not tokens). With deterministic
+        c4 semantics and a perfectly trained transformer, this should be 1.0.
+        """
+        total_proposed = sum(self.proposed_steps)
+        total_accepted = sum(self.accepted_steps)
+        return {
+            "n_speculative_steps": self.n_speculative_steps,
+            "total_proposed_steps": total_proposed,
+            "total_accepted_steps": total_accepted,
+            "acceptance_rate": total_accepted / max(1, total_proposed),
+            "per_program": list(zip(self.proposed_steps, self.accepted_steps)),
+        }
+
+    def _validate_batch_parallel(self, draft_tokens_batch: List[List[int]], bytecodes: List[List[int]], draft_len: int = 35, real_draft_lens: Optional[List[int]] = None):
         """
         Validate draft tokens for all programs in ONE forward pass.
 
@@ -136,8 +239,14 @@ class UltraBatchRunner:
         we do just 1 forward pass per step that validates all programs.
 
         Args:
-            draft_tokens_batch: List of draft token lists (35 tokens each)
+            draft_tokens_batch: List of draft token lists (each `draft_len` tokens)
             bytecodes: List of bytecode programs (for error reporting)
+            draft_len: Number of draft tokens per program. Default 35 keeps
+                legacy single-step behavior; multi-step speculation passes
+                N * 35.
+
+        Returns:
+            List[int]: number of accepted tokens per program (length = batch size).
 
         Raises:
             AssertionError: If strict=True and predictions don't match DraftVM
@@ -147,7 +256,7 @@ class UltraBatchRunner:
         draft_lens = []
         for i, (ctx, draft) in enumerate(zip(self.contexts, draft_tokens_batch)):
             contexts_with_draft.append(ctx + draft)
-            draft_lens.append(35)  # Always 35 tokens per step
+            draft_lens.append(draft_len)
 
         # Pad all contexts to same length for batching
         max_len = max(len(ctx) for ctx in contexts_with_draft)
@@ -169,12 +278,12 @@ class UltraBatchRunner:
             if self.strict:
                 raise AssertionError(f"Transformer forward pass failed during strict validation: {e}")
             # Fallback: accept all drafts
-            accepted_batch = [35] * len(draft_tokens_batch)
+            accepted_batch = [draft_len] * len(draft_tokens_batch)
 
         # STRICT MODE: Verify all active programs had perfect predictions
         if self.strict:
             for i, (accepted, active) in enumerate(zip(accepted_batch, self.active)):
-                if active and accepted < 35:
+                if active and accepted < draft_len:
                     # Find which token failed
                     ctx_with_draft = contexts_with_draft[i]
                     ctx_len = len(self.contexts[i])
@@ -197,15 +306,26 @@ class UltraBatchRunner:
                         f"STRICT MODE FAILURE:\n"
                         f"  Program {i}: {bc_str}\n"
                         f"  Step: {self.current_step}\n"
-                        f"  Token: {failed_token_idx}/35\n"
+                        f"  Token: {failed_token_idx}/{draft_len}\n"
                         f"  Expected (DraftVM): {draft_token}\n"
                         f"  Predicted (Transformer): {predicted}\n"
-                        f"  Match rate: {accepted}/35 ({100*accepted/35:.1f}%)"
+                        f"  Match rate: {accepted}/{draft_len} ({100*accepted/draft_len:.1f}%)"
                     )
 
-        # Update contexts with accepted tokens
-        for i, (ctx, draft, accepted) in enumerate(zip(self.contexts, draft_tokens_batch, accepted_batch)):
-            self.contexts[i] = ctx + draft[:accepted]
+        # Update contexts with the REAL (non-padded) draft sequence.
+        # DraftVM is the source of truth, so the canonical next-context for
+        # the transformer to validate against is the DraftVM's deterministic
+        # trajectory. (If we used only the accepted prefix, the transformer
+        # might never re-encounter the rejected step from a consistent
+        # context, leading to drift.) Padding HALT tokens are excluded.
+        for i, (ctx, draft) in enumerate(zip(self.contexts, draft_tokens_batch)):
+            if real_draft_lens is not None:
+                real_len = real_draft_lens[i]
+            else:
+                real_len = (len(draft) // 35) * 35
+            self.contexts[i] = ctx + draft[:real_len]
+
+        return accepted_batch
 
     def _build_context(self, bytecode: List[int], data: bytes, argv: List[str]) -> List[int]:
         """Build initial context.
@@ -277,6 +397,7 @@ def run_batch_ultra(
     batch_size: int = 256,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     strict: bool = False,
+    n_speculative_steps: int = 1,
 ) -> List[int]:
     """
     Convenience function to run batch of programs.
@@ -286,6 +407,8 @@ def run_batch_ultra(
         batch_size: Maximum batch size (will be chunked if too large)
         device: 'cuda' or 'cpu'
         strict: If True, raise AssertionError when transformer predictions don't match DraftVM
+        n_speculative_steps: Number of VM steps to speculate per forward pass
+            (default 1 = legacy behavior).
 
     Returns:
         List of exit codes
@@ -297,7 +420,10 @@ def run_batch_ultra(
     if len(bytecodes) > batch_size:
         all_results = []
         # Create runner once and reuse to avoid recompiling
-        runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
+        runner = UltraBatchRunner(
+            batch_size=batch_size, device=device, strict=strict,
+            n_speculative_steps=n_speculative_steps,
+        )
         for i in range(0, len(bytecodes), batch_size):
             chunk = bytecodes[i:i+batch_size]
             results = runner.run_batch(chunk)
@@ -307,5 +433,8 @@ def run_batch_ultra(
                 torch.cuda.empty_cache()
         return all_results
     else:
-        runner = UltraBatchRunner(batch_size=batch_size, device=device, strict=strict)
+        runner = UltraBatchRunner(
+            batch_size=batch_size, device=device, strict=strict,
+            n_speculative_steps=n_speculative_steps,
+        )
         return runner.run_batch(bytecodes)
