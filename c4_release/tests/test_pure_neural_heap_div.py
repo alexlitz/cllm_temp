@@ -99,11 +99,10 @@ class TestPureNeuralALUCompleteness:
             Opcode.EXIT,
         ]) == expected
 
-    @pytest.mark.xfail(reason="SHR: _set_layer13_shifts / ALUShift not wired in pure-neural")
     @pytest.mark.parametrize("a,b,expected", [
-        (8, 1, 4),
-        (256, 2, 64),
-        (255, 1, 127),
+        pytest.param(8, 1, 4, marks=pytest.mark.xfail(reason="SHR: _set_layer13_shifts / ALUShift not wired in pure-neural")),
+        pytest.param(256, 2, 64, marks=pytest.mark.xfail(reason="SHR: _set_layer13_shifts / ALUShift not wired in pure-neural")),
+        pytest.param(255, 1, 127, marks=pytest.mark.xfail(reason="SHR: _set_layer13_shifts / ALUShift not wired in pure-neural")),
         (1, 1, 0),
     ])
     def test_shr_small(self, pure_neural_runner, a, b, expected):
