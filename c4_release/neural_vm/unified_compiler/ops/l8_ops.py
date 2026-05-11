@@ -107,6 +107,15 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
     preserving the legacy in-set_vm_weights ordering. The dep anchor
     ``layer8_multibyte_fetch`` (kind="attn") preserves the LayerCompiler
     topology so downstream ops remain placed at their legacy blocks.
+
+    Post-bake adds a K-side MARK_AX exclusion (dim 35) so the head does
+    not score the AX marker as a viable K candidate. Required because the
+    L4 SP-to-ADDR_KEY op (when enabled) stages scale-10 ADDR_KEY content
+    at the AX marker, which would otherwise outscore the scale-1 ADDR_KEY
+    content at MEM val byte positions and cause multibyte_fetch to attend
+    to the AX marker instead of the correct code byte. Safe to apply
+    unconditionally — when L4 SP-staging is off the AX marker carries no
+    ADDR_KEY content and the gate is a no-op.
     """
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer8_multibyte_fetch
@@ -115,11 +124,24 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer8_multibyte_fetch(attn, S, proxy, HD)
 
+        # Dim 35: at firing Q positions (AX bytes: H1[AX_I]=1 + IS_BYTE=1
+        # → Q[35]=50) and K=AX marker (K[35]=-50), produce a -2500 raw
+        # score (-312.5 after /sqrt(HD)=8). Excludes AX marker from
+        # head 3's K candidates so the L4 SP-staged ADDR_KEY at AX marker
+        # does not outscore the correct code byte target.
+        base = 3 * HD
+        AX_MARKER_K_EXCLUDE = 35
+        AX_I = 1
+        attn.W_q[base + AX_MARKER_K_EXCLUDE, proxy.H1 + AX_I] = 100.0
+        attn.W_q[base + AX_MARKER_K_EXCLUDE, proxy.IS_BYTE] = 100.0
+        attn.W_q[base + AX_MARKER_K_EXCLUDE, proxy.CONST] = -150.0
+        attn.W_k[base + AX_MARKER_K_EXCLUDE, proxy.MARK_AX] = -50.0
+
     return Operation(
         name="layer8_multibyte_fetch_bake",
         phase=8.1,
         reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST", "MARK_AX"},
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
         bake_fn=bake,
@@ -328,21 +350,37 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
 
         L = 50.0
 
-        # === Dim 0: bias — fire only at AX marker for POP/LI/LC ===
-        # POP-group flag (CMP[3]) is relayed to AX marker by the L6 opcode
-        # relay head (which fires at AX/SP/STACK0). OP_LI_RELAY/OP_LC_RELAY
-        # are at AX byte positions (not the marker), so for binary ops we
-        # rely primarily on CMP+3 + MARK_AX. The non-fire baseline scores
-        # to -2000 so non-target positions cannot win even with worst-case
-        # address aliasing.
+        # === Dim 0: bias — fire only at AX marker on binary-pop opcodes ===
+        # Coordination with L8 multibyte_fetch (head 3): that head reads
+        # ADDR_KEY across all K positions for multi-byte IMM fetch. With
+        # L4 SP-to-ADDR_KEY staging the AX marker carries ADDR_KEY content
+        # equal to SP, which would otherwise alias as a spurious K-match
+        # candidate for multibyte_fetch. To keep the two heads disjoint
+        # we restrict head 5 to fire only on the binary-pop opcode set
+        # (the same set CMP[3] relays via L6 head 6) and add negative
+        # blockers on OP_LI / OP_LC / OP_IMM / OP_LEA / OP_PSH / OP_JSR /
+        # OP_ENT / OP_LEV / OP_JMP / OP_ADJ / OP_BZ / OP_BNZ / OP_EXIT so
+        # head 5 stays silent on non-binary-pop steps. OP_* flags are
+        # written at the AX marker by L5 FFN (opcode decode) so they are
+        # available here as direct Q-side gates.
         attn.W_q[base, BD.CONST] = -2000.0
         attn.W_q[base, BD.MARK_AX] = 2000.0     # require AX marker
-        # Either POP-group (binary op) OR OP_LI/LC active at AX marker.
-        # CMP+3 may take a step to propagate; OP_LI/OP_LC are set directly
-        # by L5 FFN at AX marker.
-        attn.W_q[base, BD.CMP + 3] = 500.0      # POP group multiplier
-        attn.W_q[base, BD.OP_LI] = 500.0
-        attn.W_q[base, BD.OP_LC] = 500.0
+        # Positive gates: any binary-pop opcode at the AX marker. Each
+        # flag is ~1.0 when active, so a single +500 gate gives Q[0] = 500
+        # when any one fires, comfortably above the -2000 baseline.
+        for op_dim in (BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                       BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                       BD.OP_OR, BD.OP_XOR, BD.OP_AND, BD.OP_SHL, BD.OP_SHR,
+                       BD.OP_SI, BD.OP_SC):
+            attn.W_q[base, op_dim] = 500.0
+        # Negative blockers — guarantee head 5 stays off when LI/LC/IMM/LEA/
+        # PSH/etc. is active even if a binary-pop residual leaks. These
+        # opcodes have their own ADDR_KEY/ALU paths and must not collide.
+        for op_dim in (BD.OP_LI, BD.OP_LC, BD.OP_IMM, BD.OP_LEA,
+                       BD.OP_PSH, BD.OP_JSR, BD.OP_ENT, BD.OP_LEV,
+                       BD.OP_JMP, BD.OP_ADJ, BD.OP_BZ, BD.OP_BNZ,
+                       BD.OP_EXIT):
+            attn.W_q[base, op_dim] = -2000.0
         # Suppress at PC/SP/BP/STACK0/MEM markers — at these positions the
         # ADDR_KEY band carries other information (code addresses, mem
         # addresses) that would alias into this head's address match.
@@ -352,6 +390,22 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         attn.W_q[base, BD.MARK_MEM] = -2000.0
         attn.W_q[base, BD.MARK_STACK0] = -2000.0
         attn.W_k[base, BD.CONST] = 10.0
+        # === Dim 28: K-side AX marker exclusion (self-attention guard) ===
+        # The L4 SP gather writes scale-10 ADDR_KEY content at the AX
+        # marker. At head 5's firing Q position (AX marker), the address
+        # encoding dims (4-27) match that staged content exactly, which
+        # would otherwise drive softmax to self-attend to the AX marker
+        # instead of the MEM val byte we want. The self-match contributes
+        # up to 12 dims * (10 * 10)^2 = 120,000 raw score (= 15,000 after
+        # /sqrt(HD)=8) at AX marker. Q[28]*K[28] = 100 * -2000 = -200,000
+        # raw (= -25,000 after /sqrt(HD)=8) cleanly overwhelms it. This
+        # dim only contributes when BOTH Q-side AND K-side are at AX
+        # marker — i.e. only when head 5 would otherwise self-attend —
+        # giving a clean negative penalty without leaking into non-firing
+        # Q positions or non-AX K positions.
+        AX_K_EXCLUDE = 28
+        attn.W_q[base + AX_K_EXCLUDE, BD.MARK_AX] = 100.0
+        attn.W_k[base + AX_K_EXCLUDE, BD.MARK_AX] = -2000.0
 
         # === Dim 1: store anchor ===
         attn.W_q[base + 1, BD.MARK_AX] = 50.0
@@ -412,7 +466,12 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         # the L8 alu_postop_attach (8.5), keeping all L8 attn bakes in
         # phase order.
         phase=8.45,
-        reads={"MARK_AX", "CMP", "OP_LI", "OP_LC", "MEM_STORE", "L2H0",
+        reads={"MARK_AX", "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+               "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR",
+               "OP_SI", "OP_SC", "OP_LI", "OP_LC", "OP_IMM", "OP_LEA",
+               "OP_PSH", "OP_JSR", "OP_ENT", "OP_LEV", "OP_JMP", "OP_ADJ",
+               "OP_BZ", "OP_BNZ", "OP_EXIT", "MEM_STORE", "L2H0",
                "H1", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO",
                "ADDR_B1_HI", "ADDR_B2_LO", "ADDR_B2_HI",
