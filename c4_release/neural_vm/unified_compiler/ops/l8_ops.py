@@ -262,3 +262,166 @@ def make_layer8_op_imm_relay_op() -> Operation:
     )
 
 
+def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
+    """L8 attention head 5: mem-attention reading mem[SP] → ALU_LO/HI at AX.
+
+    Phase 1 of STACK0_VIA_MEM_ATTENTION_PLAN. Replaces L7 head 0's
+    STACK0_BYTE0-keyed read with a direct ``mem[SP]`` lookup keyed by
+    ADDR_KEY at the AX marker. The ADDR_KEY Q-side is staged by
+    ``make_layer4_sp_to_addr_key_op`` (L4 attn heads 2-3) which writes
+    the live SP value as nibble one-hots into the ADDR_KEY band at the
+    AX marker. The K-side is the ADDR_KEY band at MEM val byte positions
+    populated by ``_inject_mem_metadata`` (no embedding-side changes
+    needed).
+
+    Placement at L8 attn (not L9) is required because the L8 ALU FFN —
+    in efficient mode, the ``AddSub5StageBlock`` post-op — reads ALU_LO
+    and ALU_HI at the AX marker. The head must therefore write
+    ALU_LO/HI BEFORE the L8 FFN/post-op runs. Writing at L9 attn would
+    be too late.
+
+    Design:
+      - Q at AX marker, gated on POP-group / OP_LI_RELAY / OP_LC_RELAY
+        so the head fires for binary ops + loads but not for IMM / NOP.
+      - K at MEM val byte 0, gated on MEM_STORE + MEM_VAL_B0 so only
+        store entries match. The most-recent matching store wins via
+        ALiBi recency (slope tuned identically to the L9 ALiBi head:
+        0.5 = 17.5 score margin per VM step).
+      - Address matching uses the 12-bit (3-nibble) binary encoding
+        identical to L15 head 0 and the L9 ALiBi proof-of-concept.
+        Q-side reads the ADDR_KEY band (ADDR_B0/1/2_HI) staged by L4;
+        K-side reads the same band populated by ``_inject_mem_metadata``.
+      - V/O copy ``CLEAN_EMBED_LO/HI`` from the matching MEM val byte
+        into ``ALU_LO/HI`` at the AX marker — exactly the source/dest
+        L7 head 0 uses today.
+
+    Score budget (per dim, after /sqrt(HD)=8):
+      Dim 0 (Q gate):     -50 at non-fire / +50 at fire
+      Dim 1 (K MEM_STORE): +312.5 at target+store, -312.5 at target+
+                            non-store
+      Dim 2 (K addr-anchor): -600 at store entries (ZFOD baseline)
+      Dim 3 (byte select): +450 at MEM val byte 0
+      Dims 4-27 (addr):    +300 at exact 12-bit match
+      ALiBi (slope 0.5):   -17.5 per VM step distance
+
+    Net at correct match (1 step back): +12.5 - 17.5 ≈ -5 → still attends
+    via softmax1 (the only positive contributor beats the zero anchor).
+    Net at wrong-addr store at same distance: -287.5 - 17.5 → suppressed.
+
+    Disabled by default (``enable=False``). Flip together with
+    ``make_layer4_sp_to_addr_key_op``.
+    """
+    def bake(block, dim_positions, S):
+        if not enable:
+            return
+
+        BD = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        head = 5
+        base = head * HD
+
+        # Slope tuned to favor most-recent matching MEM_STORE.
+        # 1 VM step = 35 tokens; slope 0.5 → 17.5 score margin per step.
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[head] = 0.5
+
+        L = 50.0
+
+        # === Dim 0: bias — fire only at AX marker for POP/LI/LC ===
+        # POP-group flag (CMP[3]) is relayed to AX marker by the L6 opcode
+        # relay head (which fires at AX/SP/STACK0). OP_LI_RELAY/OP_LC_RELAY
+        # are at AX byte positions (not the marker), so for binary ops we
+        # rely primarily on CMP+3 + MARK_AX. The non-fire baseline scores
+        # to -2000 so non-target positions cannot win even with worst-case
+        # address aliasing.
+        attn.W_q[base, BD.CONST] = -2000.0
+        attn.W_q[base, BD.MARK_AX] = 2000.0     # require AX marker
+        # Either POP-group (binary op) OR OP_LI/LC active at AX marker.
+        # CMP+3 may take a step to propagate; OP_LI/OP_LC are set directly
+        # by L5 FFN at AX marker.
+        attn.W_q[base, BD.CMP + 3] = 500.0      # POP group multiplier
+        attn.W_q[base, BD.OP_LI] = 500.0
+        attn.W_q[base, BD.OP_LC] = 500.0
+        # Suppress at PC/SP/BP/STACK0/MEM markers — at these positions the
+        # ADDR_KEY band carries other information (code addresses, mem
+        # addresses) that would alias into this head's address match.
+        attn.W_q[base, BD.MARK_PC] = -2000.0
+        attn.W_q[base, BD.MARK_SP] = -2000.0
+        attn.W_q[base, BD.MARK_BP] = -2000.0
+        attn.W_q[base, BD.MARK_MEM] = -2000.0
+        attn.W_q[base, BD.MARK_STACK0] = -2000.0
+        attn.W_k[base, BD.CONST] = 10.0
+
+        # === Dim 1: store anchor ===
+        attn.W_q[base + 1, BD.MARK_AX] = 50.0
+        attn.W_k[base + 1, BD.MEM_STORE] = 100.0
+        attn.W_k[base + 1, BD.CONST] = -50.0
+
+        # === Dim 2: ZFOD baseline ===
+        attn.W_q[base + 2, BD.CONST] = -96.0
+        attn.W_k[base + 2, BD.MEM_STORE] = 50.0
+
+        # === Dim 3: byte 0 selection (MEM val byte 0) ===
+        BS = 60.0
+        attn.W_q[base + 3, BD.MARK_AX] = BS
+        # MEM val byte 0 is at d=5 from MEM marker: L2H0[MEM]=1, H1[MEM]=0
+        MEM_I = 4
+        attn.W_k[base + 3, BD.L2H0 + MEM_I] = BS
+        attn.W_k[base + 3, BD.H1 + MEM_I] = -BS
+
+        # === Dims 4-27: 24-bit binary address encoding ===
+        # Same encoding as L15 head 0 / L9 ALiBi head: iterate over both
+        # _LO and _HI bases per address byte. Q and K read from the same
+        # residual dims because the L4 SP gather writes into the same
+        # ADDR_B*_HI bands that `_inject_mem_metadata` writes K-side into.
+        # (Q-side ADDR_B*_LO bands carry zero contribution because the
+        # SP-gather only writes HI bands — see make_layer4_sp_to_addr_key_op.)
+        addr_dim = 4
+        scale = 10.0
+        addr_bases = [
+            (BD.ADDR_B0_LO, BD.ADDR_B0_HI),
+            (BD.ADDR_B1_LO, BD.ADDR_B1_HI),
+            (BD.ADDR_B2_LO, BD.ADDR_B2_HI),
+        ]
+        for ab_lo, ab_hi in addr_bases:
+            for nibble_base in [ab_lo, ab_hi]:
+                for bit in range(4):
+                    for k in range(16):
+                        bit_val = 2 * ((k >> bit) & 1) - 1
+                        attn.W_q[base + addr_dim, nibble_base + k] = scale * bit_val
+                        attn.W_k[base + addr_dim, nibble_base + k] = scale * bit_val
+                    addr_dim += 1
+
+        # === V/O: copy CLEAN_EMBED bytes → ALU_LO/HI at AX marker ===
+        # This mirrors L7 head 0 (vm_step.py:_set_layer7_operand_gather)
+        # which writes ALU_LO/HI from STACK0_BYTE0's CLEAN_EMBED. The L8
+        # FFN (lookup ALU or AddSub5StageBlock in efficient mode) consumes
+        # ALU_LO/HI as binary-op operand 2.
+        SCALE_O = 6.0  # match L7 head 0 amplification (overcomes L4 ALU clear)
+        for k in range(16):
+            attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
+            attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+        for k in range(16):
+            attn.W_o[BD.ALU_LO + k, base + 1 + k] = SCALE_O
+            attn.W_o[BD.ALU_HI + k, base + 17 + k] = SCALE_O
+
+    return Operation(
+        name="layer8_mem_to_alu",
+        # Phase 8.45 places this after layer8_op_imm_relay (8.4) and BEFORE
+        # the L8 alu_postop_attach (8.5), keeping all L8 attn bakes in
+        # phase order.
+        phase=8.45,
+        reads={"MARK_AX", "CMP", "OP_LI", "OP_LC", "MEM_STORE", "L2H0",
+               "H1", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
+               "MARK_STACK0", "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO",
+               "ADDR_B1_HI", "ADDR_B2_LO", "ADDR_B2_HI",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
+        writes={"ALU_LO", "ALU_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=8,
+        migrated=True,
+    )
+
+

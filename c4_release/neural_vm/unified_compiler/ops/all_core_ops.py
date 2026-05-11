@@ -91,6 +91,15 @@ def all_core_ops(
         ),
         make_layer4_pc_relay_op(),
         make_layer4_ffn_op(),
+        # STACK0 via mem attention — Phase 1 Q-side: SP → ADDR_KEY at AX
+        # marker (L4 attn heads 2 + 3). Pairs with make_layer8_mem_to_alu_op
+        # (below) to route the binary-op operand-2 path through MEM
+        # attention instead of via STACK0 byte 0. Both are registered for
+        # dep-graph stability but disabled by default; enabling them
+        # together currently regresses test_add_basic via interaction with
+        # the L8 multibyte_fetch K-side (which also reads ADDR_KEY). See
+        # docs/STACK0_VIA_MEM_ATTENTION_PLAN.md.
+        make_layer4_sp_to_addr_key_op(enable=False),
         make_layer5_fetch_op(),
         make_layer5_fetch_dep_anchor_op(),
         make_opcode_decode_ffn_op(),
@@ -131,6 +140,12 @@ def all_core_ops(
         make_layer8_sp_gather_op(),
         make_layer8_sp_gather_bake_op(),
         make_layer8_multibyte_fetch_bake_op(),
+        # STACK0 via mem attention — Phase 1 mem-read: head 5 reads
+        # mem[SP] via ADDR_KEY at AX marker (staged by L4 SP gather above)
+        # and writes the loaded value to ALU_LO/HI for the L8 ALU (efficient
+        # post-op AddSub5StageBlock or lookup FFN) to consume as operand 2.
+        # Disabled by default; see docs/STACK0_VIA_MEM_ATTENTION_PLAN.md.
+        make_layer8_mem_to_alu_op(enable=False),
         make_layer9_alu_op(),
         make_layer9_lev_addr_relay_op(),
         make_layer9_lev_bp_to_pc_relay_op(),

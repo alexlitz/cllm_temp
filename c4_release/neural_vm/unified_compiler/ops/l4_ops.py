@@ -57,3 +57,106 @@ def make_layer4_ffn_op() -> Operation:
     )
 
 
+def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
+    """L4 attention heads 2 + 3: gather SP value → ADDR_KEY at AX marker.
+
+    Phase 1 of STACK0_VIA_MEM_ATTENTION_PLAN — Q-side staging for the
+    mem-attention path that replaces L7 head 0's STACK0_BYTE0 read with a
+    direct ``mem[SP]`` lookup. The mem-attention K-side (in
+    ``_inject_mem_metadata``) already writes ``ADDR_KEY[lo, 16+hi, 32+top]``
+    at MEM val byte positions; this op produces the matching encoding at
+    the AX marker so a downstream attention head (at L8 attn — see
+    ``make_layer8_mem_to_alu_op``) can match on address.
+
+    Encoding (matches ``_inject_mem_metadata`` exactly):
+      - Head 2 fires at AX marker, attends to SP byte 0 position. Copies
+        CLEAN_EMBED_LO → ``ADDR_KEY[0..15]`` (lo nibble of SP byte 0) and
+        CLEAN_EMBED_HI → ``ADDR_KEY[16..31]`` (hi nibble of SP byte 0).
+      - Head 3 fires at AX marker, attends to SP byte 1 position. Copies
+        CLEAN_EMBED_LO → ``ADDR_KEY[32..47]`` (lo nibble of SP byte 1,
+        i.e. the "top" 4 bits of the 12-bit ADDR_KEY space).
+
+    The two heads write to non-overlapping ADDR_KEY sub-bands. Since
+    ADDR_B0_HI/ADDR_B1_HI/ADDR_B2_HI alias the ADDR_KEY band (dims
+    206/222/238), the writes use those aliases for clarity.
+
+    Gating: AX marker AND ``HAS_SE = 1`` (step 1+). Step 0 has no prior
+    MEM section to read from, and the default STACK_INIT SP would
+    otherwise be injected before any PSH has populated memory.
+
+    Disabled by default (``enable=False``); the bake is a guard-clause
+    no-op. Existing tests stay byte-identical until both this op and the
+    L8 mem-to-ALU head are flipped on together.
+    """
+    def bake(block, dim_positions, S):
+        if not enable:
+            return
+
+        BD = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        L = 50.0  # strong gate; overpowers any incidental L7 contamination
+        SP_I = 2  # SP marker index in MARKS array
+        # SCALE > 1 so the SP signal dominates any incidental writes by L7
+        # heads 2-4 (which write prev-AX nibbles into the same ADDR_B*_HI
+        # bands for LI/LC).
+        SCALE_O = 10.0
+
+        def _stage_sp_byte(head_idx, byte_idx_dim, write_lo_to, write_hi_to):
+            """Stage one SP byte into the ADDR_KEY band at the AX marker.
+
+            Each head fires at the AX marker (only on step 1+, gated by
+            HAS_SE) and attends to a single SP byte position, copying the
+            CLEAN_EMBED nibbles into the requested ADDR_B*_HI sub-bands.
+
+            ``write_hi_to`` may be ``None`` for heads that only carry the
+            lo nibble (e.g. SP byte 1's hi nibble extends past the 12-bit
+            ADDR_KEY space and is intentionally dropped).
+            """
+            base = head_idx * HD
+            # Q: AX marker AND HAS_SE = 1 (step 1+). Step 0 has no prior
+            # MEM section to read from, and the default STACK_INIT SP
+            # would corrupt downstream ADDR_KEY readers if injected before
+            # any PSH has populated memory.
+            attn.W_q[base, BD.MARK_AX] = L
+            attn.W_q[base, BD.HAS_SE] = L
+            attn.W_q[base, BD.CONST] = -L * 1.5
+            # K: target SP byte position. BYTE_INDEX_n fires at byte n of
+            # every register; H1[SP_I] localises to the SP byte area
+            # (d=1..4 from the SP marker).
+            attn.W_k[base, byte_idx_dim] = L
+            attn.W_k[base, BD.H1 + SP_I] = L
+            attn.W_k[base, BD.CONST] = -L
+            # Anti-leakage gate dim
+            attn.W_q[base + 33, BD.MARK_AX] = L
+            attn.W_q[base + 33, BD.CONST] = -L / 2
+            attn.W_k[base + 33, BD.CONST] = L
+            # V: copy CLEAN_EMBED nibbles (LO always; HI only if requested)
+            for k in range(16):
+                attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
+                if write_hi_to is not None:
+                    attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+            # O: write into the requested ADDR_KEY sub-band(s)
+            for k in range(16):
+                attn.W_o[write_lo_to + k, base + 1 + k] = SCALE_O
+                if write_hi_to is not None:
+                    attn.W_o[write_hi_to + k, base + 17 + k] = SCALE_O
+
+        # Head 2: SP byte 0 → ADDR_KEY[0..15] (lo nibble) + [16..31] (hi nibble).
+        _stage_sp_byte(2, BD.BYTE_INDEX_0, BD.ADDR_B0_HI, BD.ADDR_B1_HI)
+        # Head 3: SP byte 1 → ADDR_KEY[32..47] (lo nibble only). The hi
+        # nibble of SP byte 1 would extend ADDR_KEY past 48 dims; matches
+        # the 12-bit "top" convention used by `_inject_mem_metadata`.
+        _stage_sp_byte(3, BD.BYTE_INDEX_1, BD.ADDR_B2_HI, None)
+
+    return Operation(
+        name="layer4_sp_to_addr_key",
+        phase=4.5,  # after layer4_pc_relay (phase=4) so its writes don't clobber
+        reads={"MARK_AX", "BYTE_INDEX_0", "BYTE_INDEX_1", "H1",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
+        writes={"ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},  # = ADDR_KEY band
+        kind="block",
+        bake_fn=bake,
+        layer_idx=4,
+        migrated=True,
+    )
