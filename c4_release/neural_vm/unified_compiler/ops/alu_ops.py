@@ -159,49 +159,10 @@ def make_l13_alu_shift_install_op() -> Operation:
 # Each factory takes alu_mode='lookup' (production default). Efficient mode is
 # TODO — its semantics differ (replace ffn vs attach post_op) and need a
 # separate migration pass.
-
-def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
-                               alu_mode: str = 'lookup') -> Operation:
-    if alu_mode != 'lookup':
-        # TODO(efficient-mode): efficient alu_mode REPLACES ffn rather than
-        # attaching to post_ops (see vm_step.py:2385-2434), so the bake_fn
-        # semantics differ. Migrate that branch in a follow-up.
-        raise NotImplementedError(
-            f"alu_mode={alu_mode!r} not yet supported for alu postop attach ops"
-        )
-
-    def bake(block, dim_positions, S):
-        from ...vm_step import _SetDim
-        from ... import efficient_alu_neural as eau
-        # ALUAddSub has been replaced by the 5-stage flattened AddSub5StageBlock
-        # (see efficient_alu_addsub_split.py). Other ALU classes still come
-        # from efficient_alu_neural.
-        if alu_cls_name == "ALUAddSub":
-            from ...efficient_alu_addsub_split import AddSub5StageBlock as alu_cls
-        else:
-            alu_cls = getattr(eau, alu_cls_name)
-        # Attach as a post_op; _expand_wrapper_blocks splits it into a
-        # passthrough transformer block downstream. Use proxy(dim_positions)
-        # so pin_io_only=True layouts wire to the correct residual lanes.
-        proxy = _as_setdim_proxy(dim_positions)
-        block.post_ops.insert(0, alu_cls(S, proxy))
-
-    # Phase=1180 + layer_idx*0.01: ALU post-op attaches must fire AFTER all
-    # FFN bakes (including L14 cleanup and convo-IO ops at phases
-    # 8.5/10.6/15.1) AND AFTER the dead-unit zero passes
-    # (l6_dead_unit_zero=1160, l7_dead_unit_zero=1170 which require the
-    # original PureFFN), but BEFORE right_size_ffns (1200) which prunes dead
-    # units after attaching.
-    return Operation(
-        name=name,
-        reads=set(),
-        writes=set(),
-        kind="block",
-        layer_idx=layer_idx,
-        bake_fn=bake,
-        phase=1180 + layer_idx * 0.01,
-        migrated=True,
-    )
+#
+# The op body (``_make_alu_postop_attach_op``) lives in ``shared.py`` so it can
+# be reused; the factories below just thread the per-layer / per-ALU-class
+# arguments.
 
 
 def make_l8_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:

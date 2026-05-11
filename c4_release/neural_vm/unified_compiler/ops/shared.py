@@ -113,20 +113,29 @@ def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
         from ...vm_step import _SetDim
         from ... import efficient_alu_neural as eau
         # ALUAddSub has been replaced by the 5-stage flattened AddSub5StageBlock
-        # (see efficient_alu_addsub_split.py). Other ALU classes still come
-        # from efficient_alu_neural.
+        # (see efficient_alu_addsub_split.py). ALUMul / ALUShift are likewise
+        # replaced by the already-flattened ``FlattenedALUMul`` /
+        # ``ALUShiftComposite`` composites (nn.Sequential of PureFFNs, byte-
+        # identical forward). Other ALU classes still come from
+        # ``efficient_alu_neural``.
+        proxy = _as_setdim_proxy(dim_positions)
         if alu_cls_name == "ALUAddSub":
             from ...efficient_alu_addsub_split import AddSub5StageBlock as alu_cls
+            instance = alu_cls(S, proxy)
+        elif alu_cls_name == "ALUMul":
+            instance = eau.FlattenedALUMul.build_fully_baked(S, proxy)
+        elif alu_cls_name == "ALUShift":
+            instance = eau.ALUShiftComposite(S, proxy)
         else:
             alu_cls = getattr(eau, alu_cls_name)
+            instance = alu_cls(S, proxy)
         # Attach as a post_op (rather than wrapping block.ffn with HybridALUBlock).
         # ``_expand_wrapper_blocks`` then splits each post_op into a passthrough
         # transformer block, preserving the original execution order.
         # Use compiler-allocated dim_positions (via proxy) so the structural
         # ALU wires inputs to layout-correct residual lanes; bare _SetDim
         # breaks pin_io_only=True (IO dims sit at different positions there).
-        proxy = _as_setdim_proxy(dim_positions)
-        block.post_ops.insert(0, alu_cls(S, proxy))
+        block.post_ops.insert(0, instance)
 
     # Phase=1180 + layer_idx*0.01: hybrid wraps must fire AFTER all FFN
     # bakes (including L14 cleanup and convo-IO ops at phases 8.5/10.6/15.1)

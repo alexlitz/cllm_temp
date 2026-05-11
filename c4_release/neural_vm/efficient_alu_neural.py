@@ -1071,6 +1071,27 @@ class FlattenedALUMul(nn.Module):
         self._stages.append(_GEToBDStage(self.BD, self.ge, self.S))
         self.pipeline = nn.Sequential(*self._stages)
 
+    @classmethod
+    def build_fully_baked(cls, S, BD):
+        """Construct a fully-baked composite with all 9 stages installed.
+
+        Convenience factory for callers that want a drop-in replacement for
+        ``ALUMul(S, BD)`` (which self-bakes in ``__init__``) without running
+        the 9 compiler ops manually. Forward is byte-identical to
+        ``ALUMul.forward`` once this constructor returns.
+        """
+        from .alu.ops.mul import _compute_carry_passes
+        module = cls(S, BD)
+        module.install_bdtoge()
+        module.install_schoolbook()
+        for pass_idx in range(len(_compute_carry_passes(module.ge.config))):
+            module.install_carrypass(pass_idx=pass_idx)
+        module.install_genprop()
+        module.install_binarylookahead()
+        module.install_finalcorrection()
+        module.install_getobd()
+        return module
+
     # --- Forward (byte-identical to PureNeuralALU mul branch) ----------
 
     def forward(self, x_bd):
