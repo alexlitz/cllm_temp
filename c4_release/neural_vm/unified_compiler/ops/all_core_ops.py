@@ -212,15 +212,15 @@ def all_core_ops(
         make_layer14_clear_addr_key_pollution_op(),
         make_layer14_clear_output_corruption_op(),
         make_layer14_clear_mem_marker_output_op(),
-        # V2 ADDR_KEY neural decode (BLOG_SPEC.md:830) — Phase 0 staging.
-        # Replaces NeuralVMEmbedding._inject_mem_metadata's per-val-byte
+        # V2 ADDR_KEY neural decode (BLOG_SPEC.md:830) — flipped on
+        # (2026-05-11, blockers-3-4 PR).  Replaces
+        # NeuralVMEmbedding._inject_mem_metadata's per-val-byte
         # ADDR_KEY[lo, 16+hi, 32+top] one-hot writes with a baked FFN
         # decode reading addr nibbles from L13's mem_addr_gather output.
-        # Disabled by default (enable=False) so existing tests stay
-        # byte-identical; the Python injector continues to own ADDR_KEY
-        # writes until this bake is validated and flipped on.  See
+        # Parity validated by tests/test_addr_key_neural_decode.py (18
+        # cases including carry-overflow); see
         # docs/V2_ADDR_KEY_NEURAL_DECODE_PLAN.md.
-        make_layer14_addr_key_neural_decode_op(enable=False),
+        make_layer14_addr_key_neural_decode_op(enable=True),
         make_layer15_memory_lookup_op(),
         make_layer15_nibble_copy_op(),
         make_layer16_lev_routing_op(),

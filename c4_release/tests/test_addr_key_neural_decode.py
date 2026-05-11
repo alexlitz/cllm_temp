@@ -52,36 +52,44 @@ def test_addr_key_decode_op_is_registered():
     assert "layer14_addr_key_neural_decode" in block_ops_by_name
 
 
-def test_addr_key_decode_op_is_noop_when_disabled():
-    """With enable=False (default), the bake does not touch FFN unit counter.
+def test_addr_key_decode_op_is_active_when_enabled():
+    """With enable=True (production default as of 2026-05-11), the bake
+    installs ~1184 FFN units on the L14 FFN.
 
-    The bake is gated by an early return; it should leave the L14 FFN
-    unit counter unchanged from what the other L14 cleanup ops produced.
-    Verified indirectly: compile_full_vm must succeed and downstream tests
-    must pass (the gate tests cover those).
+    Verifies by inspecting the compiled model that there is at least one
+    FFN unit with nonzero W_up at both ADDR_B0_LO[0] and ADDR_B0_HI[0]
+    simultaneously — the bake's distinctive 3-way AND signature
+    (MEM_VAL_B + ADDR_B0_LO + ADDR_B0_HI).
 
-    Here we verify by inspecting the compiled model that the FFN units
-    used by the OTHER L14 cleanup ops are intact and no new units past
-    that count have nonzero W_up rows referencing ADDR_B0_LO/HI (the
-    new bake's distinctive input signature).
+    The Phase-0 block expansion can move L14's logical FFN onto a
+    different physical block index, so we identify the target block
+    by its ``_l14_unit_counter`` attribute set by the L14 cleanup ops
+    chain rather than indexing ``model.blocks[14]`` directly.
     """
     from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-    from neural_vm.vm_step import _SetDim
 
     model, layout = compile_full_vm()
-    ffn14 = model.blocks[14].ffn
-    # ADDR_B0_LO is at dim 12, ADDR_B0_HI is at dim 206 (= ADDR_KEY).
-    # The new bake's units read 3-way AND across (MEM_VAL_B0 + ADDR_B0_LO +
-    # ADDR_B0_HI). If the gate is off, no FFN unit should have nonzero W_up
-    # at both ADDR_B0_LO[0] and ADDR_B0_HI[0] simultaneously.
-    addr_b0_lo_col = ffn14.W_up.data[:, _SetDim.ADDR_B0_LO + 0]
-    addr_b0_hi_col = ffn14.W_up.data[:, _SetDim.ADDR_B0_HI + 0]
+    # Find the physical block whose FFN owns the L14 cleanup chain.
+    ffn14 = None
+    for blk in model.blocks:
+        ffn = getattr(blk, "ffn", None)
+        if ffn is not None and hasattr(ffn, "_l14_unit_counter"):
+            ffn14 = ffn
+            break
+    assert ffn14 is not None, "no FFN with _l14_unit_counter found"
+
+    # Compiler-allocated positions (not _SetDim — Phase-0 layouts can move).
+    addr_b0_lo_pos = layout.dim_positions["ADDR_B0_LO"]
+    addr_b0_hi_pos = layout.dim_positions["ADDR_B0_HI"]
+    addr_b0_lo_col = ffn14.W_up.data[:, addr_b0_lo_pos + 0]
+    addr_b0_hi_col = ffn14.W_up.data[:, addr_b0_hi_pos + 0]
     both_nonzero = (addr_b0_lo_col != 0) & (addr_b0_hi_col != 0)
-    assert both_nonzero.sum().item() == 0, (
-        f"Expected gate=False to leave no FFN units with both "
-        f"ADDR_B0_LO and ADDR_B0_HI as up-reads; found "
-        f"{both_nonzero.sum().item()} such units. The bake's "
-        f"guard-clause early return must have leaked weights."
+    # One unit per byte_off ∈ {0,1,2,3} for (lo=0, hi=0) → 4 units expected.
+    assert both_nonzero.sum().item() >= 4, (
+        f"Expected gate=True to install at least 4 FFN units with both "
+        f"ADDR_B0_LO[0] and ADDR_B0_HI[0] as up-reads (one per byte_off);"
+        f" found {both_nonzero.sum().item()}. The bake's enable flag may"
+        f" not be wired correctly."
     )
 
 

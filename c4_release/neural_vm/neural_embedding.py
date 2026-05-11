@@ -230,7 +230,6 @@ class NeuralVMEmbedding(nn.Module):
         # entirely skipped on cache hit.
         if not cache_hit:
             self._add_code_addr_keys(token_ids, x)
-        self._inject_mem_store(token_ids, x, start_pos=start_pos)
 
         # THINKING_START/END markers (MARK_THINKING_START/_END) are now baked
         # directly into the embedding table (see
@@ -243,10 +242,14 @@ class NeuralVMEmbedding(nn.Module):
         # the matching cancel units in `_set_layer3_ffn` (vm_step.py). The
         # runtime `_inject_initial_pc` injection is no longer needed.
 
-        # Unified memory: write ADDR_KEY/MEM_STORE/MEM_VAL_Bn metadata on
-        # every MEM section. Prefix has no MEM markers; skip prefix positions
-        # on cache hit.
-        self._inject_mem_metadata(token_ids, x, start_pos=start_pos)
+        # ADDR_KEY nibble decode at MEM val byte positions is now baked
+        # into the L14 FFN (``layer14_addr_key_neural_decode`` in
+        # unified_compiler/ops/l14_ops.py); MEM_VAL_B and MEM_STORE
+        # flags are produced by L2 FFN + L6/L7 attention.  See
+        # docs/V2_ADDR_KEY_NEURAL_DECODE_PLAN.md.  The retained-history
+        # MEM_STORE injection below remains a no-op unless
+        # ``_mem_history_end > 0`` (set by KV-cache eviction).
+        self._inject_mem_store(token_ids, x, start_pos=start_pos)
 
         # --- Populate prefix cache on first call within a run -------------
         if not cache_hit:
@@ -463,75 +466,3 @@ class NeuralVMEmbedding(nn.Module):
             end: Position marking end of historical memory region
         """
         self._mem_history_end = end
-
-    def _inject_mem_metadata(self, token_ids, x, start_pos=0):
-        """Write ADDR_KEY/MEM_STORE/MEM_VAL_Bn metadata on every MEM section.
-
-        Walks the token stream and, for each 9-token MEM section
-        ``[MEM, addr_b0..3, val_b0..3]``, writes the residual dims required
-        by L5 fetch / L8 multibyte / L15 memory lookup:
-
-        - ``MEM_STORE = 2.0`` on the MEM marker and on each val-byte position
-          (matches L6 head 6's scale and prevents L15 K-side dim-37 suppression
-          from favoring the marker over the bytes).
-        - ``MEM_VAL_B{0..3} = 1.0`` on val-byte positions for L15 byte selection.
-        - ``ADDR_KEY + {lo, 16+hi, 32+top}`` on val-byte positions, computed
-          from ``addr + byte_off``, so L5/L8/L15 attention can match by address.
-
-        Args:
-            start_pos: Skip positions ``< start_pos``. Safe when the prefix
-                contains no MEM markers (true for the CODE/DATA system prompt).
-        """
-        from .vm_step import Token
-
-        mem_store = self._dim("MEM_STORE")
-        addr_key = self._dim("ADDR_KEY")
-        mem_val_dims = [
-            self._dim("MEM_VAL_B0"),
-            self._dim("MEM_VAL_B1"),
-            self._dim("MEM_VAL_B2"),
-            self._dim("MEM_VAL_B3"),
-        ]
-
-        B, S = token_ids.shape
-
-        for b in range(B):
-            i = start_pos
-            while i < S:
-                tok = token_ids[b, i].item()
-                if tok == Token.MEM and i + 8 < S:
-                    # Extract address from MEM section (bytes 1-4, little-endian)
-                    addr_bytes = [token_ids[b, i + 1 + j].item() for j in range(4)]
-                    addr = (addr_bytes[0] | (addr_bytes[1] << 8) |
-                            (addr_bytes[2] << 16) | (addr_bytes[3] << 24))
-
-                    # Set MEM_STORE on MEM marker for L15 K-side matching.
-                    # L15 attention uses MEM_STORE in K-side to identify store
-                    # entries. Without this, attention gets -312.5 penalty.
-                    x[b, i, mem_store] = 2.0  # Same scale as L6 head 6 output
-
-                    # Set MEM_VAL_B0-B3 flags + MEM_STORE on val-byte positions
-                    # for L15 byte selection. MEM_STORE on val bytes prevents
-                    # dim-37 suppression from favoring MEM markers over val
-                    # bytes in L15 attention.
-                    for byte_off in range(4):
-                        val_pos = i + 5 + byte_off
-                        if val_pos < S:
-                            x[b, val_pos, mem_val_dims[byte_off]] = 1.0
-                            x[b, val_pos, mem_store] = 2.0  # Match MEM marker
-
-                    # Write ADDR_KEY nibble decomposition on val-byte positions
-                    # so L5/L8/L15 attention can match by address.
-                    for byte_off in range(4):
-                        val_pos = i + 5 + byte_off
-                        if val_pos < S:
-                            byte_addr = addr + byte_off
-                            lo = byte_addr & 0xF
-                            hi = (byte_addr >> 4) & 0xF
-                            top = (byte_addr >> 8) & 0xF
-                            x[b, val_pos, addr_key + lo] = 1.0
-                            x[b, val_pos, addr_key + 16 + hi] = 1.0
-                            x[b, val_pos, addr_key + 32 + top] = 1.0
-                    i += 9  # Skip past MEM section
-                else:
-                    i += 1
