@@ -28,4 +28,4 @@ from .l16_ops import *  # noqa: F401,F403
 from .alu_ops import *  # noqa: F401,F403
 from .flag_gated_ops import *  # noqa: F401,F403
 from .model_ops import *  # noqa: F401,F403
-from .all_core_ops import all_core_ops, all_hybrid_alu_wrap_ops  # noqa: F401
+from .all_core_ops import all_core_ops, all_alu_postop_attach_ops  # noqa: F401

@@ -2218,14 +2218,14 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
 
         # ===== EFFICIENT ALU OVERRIDE =====
         # The L8-L13 ALU post-op attaches are now provided by migrated
-        # block-ops (l8/l9/l10/l11/l12/l13_hybrid_alu_wrap in migrated_ops.py)
+        # block-ops (l8/l9/l10/l11/l12/l13_alu_postop_attach in migrated_ops.py)
         # and dispatched at the end of set_vm_weights via _dispatch_migrated_block_ops.
         # The ops attach the structural ALU module to `block.post_ops` (no
         # HybridALUBlock wrapper); `_expand_wrapper_blocks` then splits each
         # post_op into its own passthrough transformer block.
         # NOTE: L8/L9 ADD/SUB now use the 5-stage flattened AddSub5StageBlock
         # instead of the monolithic ALUAddSub. See
-        # migrated_ops._make_hybrid_alu_wrap_op which selects AddSub5StageBlock
+        # migrated_ops._make_alu_postop_attach_op which selects AddSub5StageBlock
         # when alu_cls_name == "ALUAddSub".
         # DIV/MOD: previously
         #   model.blocks[10].post_ops[-1] = EfficientDivMod_Neural(S, BD)
@@ -2407,12 +2407,12 @@ def _dispatch_migrated_block_ops(model, S, alu_mode='lookup'):
     """
     if alu_mode != 'lookup':
         return
-    from .unified_compiler.migrated_ops import all_hybrid_alu_wrap_ops
+    from .unified_compiler.migrated_ops import all_alu_postop_attach_ops
     dim_positions = {
         name: getattr(_SetDim, name) for name in dir(_SetDim)
         if not name.startswith('_') and isinstance(getattr(_SetDim, name), int)
     }
-    for op in all_hybrid_alu_wrap_ops():
+    for op in all_alu_postop_attach_ops():
         if op.kind != "block" or not op.migrated:
             continue
         if op.layer_idx is None or op.layer_idx >= len(model.blocks):
@@ -2432,7 +2432,7 @@ def _expand_wrapper_blocks(model):
     ``HybridALUBlock`` (lookup_ffn + efficient_alu) into two successive blocks.
     HybridALUBlock has been deleted; ALU modules that previously wrapped
     block.ffn are now attached directly to block.post_ops by the compiler ops
-    in migrated_ops.py (see ``_make_hybrid_alu_wrap_op`` and
+    in migrated_ops.py (see ``_make_alu_postop_attach_op`` and
     ``make_efficient_l8_addsub_wrap_op``), so the post_ops expansion path below
     handles them uniformly with all other structural post-passes
     (BinaryOpByteZeroingPostOp, CarryPropagationPostOp, FlattenedDivMod, etc.).

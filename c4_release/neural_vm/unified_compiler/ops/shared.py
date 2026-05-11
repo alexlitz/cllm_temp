@@ -64,14 +64,14 @@ def _bake_post_op_into(ffn, post_op_instance, hidden_offset: int = 0) -> int:
     return end
 
 
-def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
-                             alu_mode: str = 'lookup') -> Operation:
+def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
+                               alu_mode: str = 'lookup') -> Operation:
     if alu_mode != 'lookup':
         # TODO(efficient-mode): efficient alu_mode REPLACES ffn rather than
         # wrapping it (see vm_step.py:2385-2434), so the bake_fn semantics
         # differ. Migrate that branch in a follow-up.
         raise NotImplementedError(
-            f"alu_mode={alu_mode!r} not yet supported for hybrid wrap ops"
+            f"alu_mode={alu_mode!r} not yet supported for alu postop attach ops"
         )
 
     def bake(block, dim_positions, S):

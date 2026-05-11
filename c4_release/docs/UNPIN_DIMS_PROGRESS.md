@@ -35,7 +35,7 @@ Default has been **left at `False`**.
    injectors) use `self._dim()`** instead of bare `_SetDim` for
    `MEM_EXEC`, `MEM_STORE`, `ADDR_KEY`, `MEM_VAL_B0..B3`.
 
-5. **`_make_hybrid_alu_wrap_op` (lookup-mode L8-L13 ALU wrappers) wires the
+5. **`_make_alu_postop_attach_op` (lookup-mode L8-L13 ALU wrappers) wires the
    structural ALU with `_as_setdim_proxy(dim_positions)`** instead of bare
    `_SetDim`. Previously the proxy was used for the lookup-FFN bakes but the
    ALU sat on top of legacy `_SetDim` positions.

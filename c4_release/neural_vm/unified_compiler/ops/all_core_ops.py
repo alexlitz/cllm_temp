@@ -264,19 +264,19 @@ def all_core_ops(
     ]
 
 
-def all_hybrid_alu_wrap_ops() -> list:
-    """Return the L8-L13 HybridALU wrap ops.
+def all_alu_postop_attach_ops() -> list:
+    """Return the L8-L13 ALU post-op attach ops.
 
-    These are NOT included in all_core_ops() because they wrap the FFN, which
-    must happen AFTER set_vm_weights' legacy bake has populated the FFN
-    weights. Use _dispatch_migrated_block_ops in vm_step.py to fire them at
-    the right time (post-legacy-bake, pre-right-size).
+    These are NOT included in all_core_ops() because they attach the ALU to
+    ``block.post_ops`` AFTER set_vm_weights' legacy bake has populated the
+    FFN weights. Use _dispatch_migrated_block_ops in vm_step.py to fire them
+    at the right time (post-legacy-bake, pre-right-size).
     """
     return [
-        make_l8_hybrid_alu_wrap_op(),
-        make_l9_hybrid_alu_wrap_op(),
-        make_l10_hybrid_alu_wrap_op(),
-        make_l11_hybrid_alu_wrap_op(),
-        make_l12_hybrid_alu_wrap_op(),
-        make_l13_hybrid_alu_wrap_op(),
+        make_l8_alu_postop_attach_op(),
+        make_l9_alu_postop_attach_op(),
+        make_l10_alu_postop_attach_op(),
+        make_l11_alu_postop_attach_op(),
+        make_l12_alu_postop_attach_op(),
+        make_l13_alu_postop_attach_op(),
     ]

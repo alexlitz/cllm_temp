@@ -22,7 +22,7 @@ direct call to `set_vm_weights` from outside the compiler module.
 from .layer_compiler import LayerCompiler, build_model_from_layout
 from .migrated_ops import (
     all_core_ops,
-    all_hybrid_alu_wrap_ops,
+    all_alu_postop_attach_ops,
     declare_setdim_compat_dims,
     make_alu_divmod_composite_ops,
     make_contract_validation_op,
@@ -127,7 +127,7 @@ def compile_full_vm(
     # into one block call). Only registered in efficient mode — lookup mode
     # keeps the `_set_layer11_mul_partial` / `_set_layer12_mul_combine`
     # lookup tables; the L11 ALUMul module is attached to ``block.post_ops``
-    # by ``make_l11_hybrid_alu_wrap_op`` and split out by
+    # by ``make_l11_alu_postop_attach_op`` and split out by
     # ``_expand_wrapper_blocks``.
     if alu_mode == "efficient":
         compiler.add_op(make_l11_alu_mul_bdtoge_op())
@@ -164,20 +164,20 @@ def compile_full_vm(
     #   phase=999.1: L10 alibi_slopes (mode-conditional: lookup vs efficient)
     # phase=8.4 (block op): L8 head 4 OP_IMM relay (previously inline)
     # phase=1199 (model op): contract validation diagnostic
-    # The hybrid_alu_wrap_ops are added below in the lookup branch.
+    # The alu_postop_attach_ops are added below in the lookup branch.
     compiler.add_op(make_residual_alibi_slopes_op())
     compiler.add_op(make_layer10_residual_alibi_slopes_op(alu_mode=alu_mode))
     compiler.add_op(make_layer8_op_imm_relay_op())
     compiler.add_op(make_contract_validation_op())
 
-    # Hybrid ALU wrap ops (lookup mode only): wrap each L8-L13 FFN with a
-    # HybridALUBlock that runs a structural neural ALU on top of the
-    # baked lookup-table FFN. Must run AFTER the L8-L13 FFN bakes complete,
-    # which is naturally the case here because phase=L+0.5 sits AFTER the
-    # block-op phases (8.0-8.5, 9, 10.0-10.85, 11, 12, 13) and the
-    # phase-999 residuals.
+    # ALU post-op attach ops (lookup mode only): attach a structural neural
+    # ALU to each L8-L13 block's ``post_ops`` so it runs on top of the baked
+    # lookup-table FFN. Must run AFTER the L8-L13 FFN bakes complete, which
+    # is naturally the case here because phase=L+0.5 sits AFTER the block-op
+    # phases (8.0-8.5, 9, 10.0-10.85, 11, 12, 13) and the phase-999
+    # residuals.
     if alu_mode == 'lookup':
-        for op in all_hybrid_alu_wrap_ops():
+        for op in all_alu_postop_attach_ops():
             compiler.add_op(op)
 
     layout = compiler.compile()

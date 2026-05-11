@@ -1,7 +1,7 @@
 """ALU composite/wrapping op factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
-from .shared import _as_setdim_proxy, _make_hybrid_alu_wrap_op, _ensure_l11_mul_module
+from .shared import _as_setdim_proxy, _make_alu_postop_attach_op, _ensure_l11_mul_module
 
 
 # ---------------------------------------------------------------------------
@@ -146,26 +146,28 @@ def make_l13_alu_shift_install_op() -> Operation:
 
 
 # ---------------------------------------------------------------------------
-# HybridALU wrap block-ops (migrated from set_vm_weights lines 2377-2382)
+# ALU post-op attach block-ops (migrated from set_vm_weights lines 2377-2382)
 # ---------------------------------------------------------------------------
 #
-# Block-level migration: the lookup-mode ALU layers wrap their lookup FFN with
-# a HybridALUBlock that runs a structural neural ALU on top. Each layer/ALU
-# pairing is a separate op so the compiler can place/reorder/expand them
-# independently in the future.
+# Block-level migration: the lookup-mode ALU layers attach a structural neural
+# ALU to ``block.post_ops`` so it runs on top of the lookup-table FFN. Each
+# layer/ALU pairing is a separate op so the compiler can place/reorder/expand
+# them independently in the future. (Previously these factories built a
+# HybridALUBlock wrapper, hence the legacy name; HybridALUBlock has been
+# removed and the ALU is now attached directly via ``block.post_ops``.)
 #
 # Each factory takes alu_mode='lookup' (production default). Efficient mode is
-# TODO — its semantics differ (replace ffn vs wrap ffn) and need a separate
-# migration pass.
+# TODO — its semantics differ (replace ffn vs attach post_op) and need a
+# separate migration pass.
 
-def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
-                             alu_mode: str = 'lookup') -> Operation:
+def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
+                               alu_mode: str = 'lookup') -> Operation:
     if alu_mode != 'lookup':
         # TODO(efficient-mode): efficient alu_mode REPLACES ffn rather than
-        # wrapping it (see vm_step.py:2385-2434), so the bake_fn semantics
-        # differ. Migrate that branch in a follow-up.
+        # attaching to post_ops (see vm_step.py:2385-2434), so the bake_fn
+        # semantics differ. Migrate that branch in a follow-up.
         raise NotImplementedError(
-            f"alu_mode={alu_mode!r} not yet supported for hybrid wrap ops"
+            f"alu_mode={alu_mode!r} not yet supported for alu postop attach ops"
         )
 
     def bake(block, dim_positions, S):
@@ -184,11 +186,12 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
         proxy = _as_setdim_proxy(dim_positions)
         block.post_ops.insert(0, alu_cls(S, proxy))
 
-    # Phase=1180 + layer_idx*0.01: hybrid wraps must fire AFTER all FFN
-    # bakes (including L14 cleanup and convo-IO ops at phases 8.5/10.6/15.1)
-    # AND AFTER the dead-unit zero passes (l6_dead_unit_zero=1160,
-    # l7_dead_unit_zero=1170 which require the original PureFFN), but BEFORE
-    # right_size_ffns (1200) which prunes dead units after wrapping.
+    # Phase=1180 + layer_idx*0.01: ALU post-op attaches must fire AFTER all
+    # FFN bakes (including L14 cleanup and convo-IO ops at phases
+    # 8.5/10.6/15.1) AND AFTER the dead-unit zero passes
+    # (l6_dead_unit_zero=1160, l7_dead_unit_zero=1170 which require the
+    # original PureFFN), but BEFORE right_size_ffns (1200) which prunes dead
+    # units after attaching.
     return Operation(
         name=name,
         reads=set(),
@@ -201,28 +204,28 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
     )
 
 
-def make_l8_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_hybrid_alu_wrap_op("l8_hybrid_alu_wrap", 8, "ALUAddSub", alu_mode)
+def make_l8_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_alu_postop_attach_op("l8_alu_postop_attach", 8, "ALUAddSub", alu_mode)
 
 
-def make_l9_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_hybrid_alu_wrap_op("l9_hybrid_alu_wrap", 9, "ALUAddSub", alu_mode)
+def make_l9_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_alu_postop_attach_op("l9_alu_postop_attach", 9, "ALUAddSub", alu_mode)
 
 
-def make_l10_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_hybrid_alu_wrap_op("l10_hybrid_alu_wrap", 10, "ALUAndOrXor", alu_mode)
+def make_l10_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_alu_postop_attach_op("l10_alu_postop_attach", 10, "ALUAndOrXor", alu_mode)
 
 
-def make_l11_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_hybrid_alu_wrap_op("l11_hybrid_alu_wrap", 11, "ALUMul", alu_mode)
+def make_l11_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_alu_postop_attach_op("l11_alu_postop_attach", 11, "ALUMul", alu_mode)
 
 
-def make_l12_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_hybrid_alu_wrap_op("l12_hybrid_alu_wrap", 12, "ALUMul", alu_mode)
+def make_l12_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_alu_postop_attach_op("l12_alu_postop_attach", 12, "ALUMul", alu_mode)
 
 
-def make_l13_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_hybrid_alu_wrap_op("l13_hybrid_alu_wrap", 13, "ALUShift", alu_mode)
+def make_l13_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
+    return _make_alu_postop_attach_op("l13_alu_postop_attach", 13, "ALUShift", alu_mode)
 
 
 # ---------------------------------------------------------------------------
