@@ -85,9 +85,13 @@ def neural_runner():
     """Pure neural runner (no speculative decoding).
 
     Use for testing neural correctness.
+
+    PHASE 8 (2026-05-11): Default flipped to pure_neural=True,
+    trust_neural_alu=True. Many tests will fail until Phases 1-7 complete;
+    that is the intended signal for what the neural path still cannot do.
     """
     from neural_vm.run_vm import AutoregressiveVMRunner
-    return AutoregressiveVMRunner()
+    return AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)
 
 
 @pytest.fixture(scope="session")
@@ -108,10 +112,17 @@ def batch_runner():
 
 @pytest.fixture
 def quick_runner():
-    """Quick runner with limited steps for unit tests."""
+    """Quick runner with limited steps for unit tests.
+
+    PHASE 8 (2026-05-11): Default flipped to pure_neural=True,
+    trust_neural_alu=True. The headline smoke suite now exercises the neural
+    path with Python overrides disabled. Tests that the neural network cannot
+    yet handle (most of Phases 2-7) will fail honestly; that is the new CI
+    signal driving Phases 1-7 to completion.
+    """
     from neural_vm.run_vm import AutoregressiveVMRunner
 
-    runner = AutoregressiveVMRunner()
+    runner = AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)
     # Limit max_steps for quick tests
     return runner
 

@@ -56,8 +56,13 @@ class TestSuite1096:
 
     @pytest.fixture(scope="class")
     def runner(self):
-        """Shared runner for all tests in class."""
-        return AutoregressiveVMRunner()
+        """Shared runner for all tests in class.
+
+        PHASE 8 (2026-05-11): Flipped to pure_neural=True, trust_neural_alu=True.
+        Most of the 1096-test suite will fail until Phases 1-7 land; the lower
+        pass rate is the intentional CI signal for what neural still can't do.
+        """
+        return AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)
 
     @pytest.mark.parametrize(
         "source,expected,description",
@@ -78,8 +83,11 @@ class TestSuite1096Quick:
 
     @pytest.fixture(scope="class")
     def runner(self):
-        """Shared runner for quick tests."""
-        return AutoregressiveVMRunner()
+        """Shared runner for quick tests.
+
+        PHASE 8 (2026-05-11): Flipped to pure_neural=True, trust_neural_alu=True.
+        """
+        return AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)
 
     @pytest.mark.parametrize(
         "source,expected,description",
@@ -100,8 +108,11 @@ class TestSuiteCategories:
 
     @pytest.fixture(scope="class")
     def runner(self):
-        """Shared runner."""
-        return AutoregressiveVMRunner()
+        """Shared runner.
+
+        PHASE 8 (2026-05-11): Flipped to pure_neural=True, trust_neural_alu=True.
+        """
+        return AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)
 
     def _filter_tests(self, keyword):
         """Filter tests by keyword in description."""
