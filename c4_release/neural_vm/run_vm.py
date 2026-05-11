@@ -156,6 +156,7 @@ class AutoregressiveVMRunner:
         trust_neural_alu=False,
         pure_neural=False,
         cache_model=True,
+        enable_neural_io_think_protocol=False,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -167,6 +168,11 @@ class AutoregressiveVMRunner:
             trust_neural_alu: If True, trust neural network for ALU operations.
             pure_neural: If True, skip ALL Python overrides and run purely
                         autoregressively.
+            enable_neural_io_think_protocol: If True, route PUTCHAR through the
+                model-emitted ``THINKING_END, byte, THINKING_START`` token
+                stream (BLOG_SPEC.md:851 — canonical neural-I/O mode) instead
+                of the Phase-6 runner-reads-AX path. Defaults False; see
+                ``c4_release/docs/NEURAL_IO_VIA_THINK_PROTOCOL_PLAN.md``.
         """
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
         # compile_full_vm. The compiler derives d_model and n_layers from the
@@ -174,13 +180,15 @@ class AutoregressiveVMRunner:
         # Override d_model/n_layers via explicit args only for tests.
         alu_mode = 'efficient' if trust_neural_alu else 'lookup'
         cache_key = (d_model, n_layers, n_heads, ffn_hidden, max_seq_len,
-                     conversational_io, alu_mode)
+                     conversational_io, alu_mode,
+                     enable_neural_io_think_protocol)
         if cache_model and cache_key in AutoregressiveVMRunner._MODEL_CACHE:
             self.model = AutoregressiveVMRunner._MODEL_CACHE[cache_key]
         else:
             from .unified_compiler.full_vm_compiler import compile_full_vm
             self.model, _layout = compile_full_vm(
                 enable_conversational_io=conversational_io,
+                enable_neural_io_think_protocol=enable_neural_io_think_protocol,
                 alu_mode=alu_mode,
                 n_heads=n_heads,
                 ffn_hidden=ffn_hidden,
@@ -257,6 +265,20 @@ class AutoregressiveVMRunner:
         self.pure_attention_memory = pure_attention_memory
         self.trust_neural_alu = trust_neural_alu
         self.pure_neural = pure_neural
+        # Phase 1 neural-I/O THINK-tag protocol scaffolding.
+        # When True, the runner accepts THINKING_END/byte/THINKING_START tokens
+        # interleaved into the model's PUTCHAR step output (BLOG_SPEC.md:851).
+        # When False (default), the legacy AX-readoff path at run_vm.py:827-828
+        # collects PUTCHAR bytes. The compiler-side bake for this is gated by
+        # the same flag (``make_putchar_think_protocol_op``); both paths are
+        # currently no-ops until the follow-up bake commit lands the weight
+        # wiring (see NEURAL_IO_VIA_THINK_PROTOCOL_PLAN.md).
+        self.enable_neural_io_think_protocol = enable_neural_io_think_protocol
+        # Output-collection state for the THINK-tag protocol. Set True when
+        # the model emits THINKING_END; cleared when it emits THINKING_START.
+        # Byte tokens (0-255) seen while True are appended to ``output`` in
+        # the runner's main loop, bypassing the AX-readoff PUTCHAR path.
+        self._neural_io_collecting_byte = False
         self._pure_attention_report = {}
 
     # Maximum number of consecutive incremental forward calls before flushing
@@ -450,6 +472,10 @@ class AutoregressiveVMRunner:
         self._last_sp = 0x10000  # Initial SP (same as model embedding STACK_INIT)
         # Track last dispatched instruction index for skipped-IO-op detection.
         self._last_dispatched_idx = -1
+        # Reset THINK-tag protocol collector so leftover state from a prior
+        # run() (e.g. truncated PUTCHAR step without a closing THINKING_START)
+        # does not bleed into the next program.
+        self._neural_io_collecting_byte = False
         self._mem_history = {}  # addr → 9-token MEM section (latest wins)
         self._mem_access_order = []  # LRU tracking: most recent at end
         self.model.embed.set_mem_history_end(0)  # reset stale boundary from prior runs
@@ -530,6 +556,29 @@ class AutoregressiveVMRunner:
                     pc_val = pc if pc is not None else 0
                     ax_val = ax if ax is not None else 0
                     print(f"[STEP {i//35}] token {i}/{max_steps * Token.STEP_TOKENS}, PC=0x{pc_val:08x}, AX=0x{ax_val:08x}", flush=True)
+
+            # Phase 1 neural-I/O THINK-tag protocol (BLOG_SPEC.md:851).
+            # When enabled, the model emits THINKING_END at the end of a
+            # PUTCHAR step (replacing STEP_END), then a byte token, then
+            # THINKING_START, then a real STEP_END. The runner collects the
+            # byte into ``output`` and ignores the bookkeeping tokens.
+            #
+            # Gated by ``enable_neural_io_think_protocol`` so the existing
+            # AX-readoff path (run_vm.py:827-828) remains the default until
+            # the full PRTF/GETCHAR/READ bake chain lands. See
+            # ``c4_release/docs/NEURAL_IO_VIA_THINK_PROTOCOL_PLAN.md``.
+            if self.enable_neural_io_think_protocol:
+                if next_token == Token.THINKING_END:
+                    self._neural_io_collecting_byte = True
+                    continue
+                if next_token == Token.THINKING_START:
+                    self._neural_io_collecting_byte = False
+                    continue
+                if self._neural_io_collecting_byte and 0 <= next_token < 256:
+                    # Byte token while in the THINKING_END..THINKING_START
+                    # block: emit to user-visible output stream.
+                    output.append(chr(next_token & 0xFF))
+                    continue
 
             # Hybrid conversational I/O: handle THINKING_END
             if self.conversational_io and next_token == Token.THINKING_END:
@@ -824,7 +873,18 @@ class AutoregressiveVMRunner:
             # AX byte 0 -> OUTPUT_LO/HI via _set_io_putchar_routing at L6 FFN.
             # The runner reads AX byte 0 from the just-completed step and
             # appends it to the output buffer. No Python override of AX.
-            if exec_op == Opcode.PUTCHAR and neural_ax is not None:
+            #
+            # When ``enable_neural_io_think_protocol=True`` the byte was
+            # already collected from the model-emitted token stream
+            # (THINKING_END, byte, THINKING_START — see the main run() loop).
+            # Skip the AX-readoff to avoid double-emission. The compiler-side
+            # bake (``make_putchar_think_protocol_op``) is currently a no-op
+            # stub, so flipping this flag without the follow-up bake will
+            # silently drop PUTCHAR output — that is the intended behavior
+            # for the Phase 1 scaffolding commit (see plan doc).
+            if (exec_op == Opcode.PUTCHAR
+                    and neural_ax is not None
+                    and not self.enable_neural_io_think_protocol):
                 output.append(chr(neural_ax & 0xFF))
 
             # GETCHAR (Phase 6, pure_neural): no neural attention head reads

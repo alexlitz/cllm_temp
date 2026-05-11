@@ -31,6 +31,7 @@ def all_core_ops(
     *,
     enable_conversational_io: bool = False,
     enable_tool_calling: bool = False,
+    enable_neural_io_think_protocol: bool = False,
 ) -> list:
     """Return the full list of migrated core-VM operations.
 
@@ -53,6 +54,14 @@ def all_core_ops(
     which are always registered but no-op when the flag is False. This keeps
     the registration list (and hence the dep graph / layer count) stable
     across modes.
+
+    ``enable_neural_io_think_protocol`` is forwarded to the PUTCHAR
+    THINK-tag protocol bake (``make_putchar_think_protocol_op``).
+    Default False; when True the bake wires up the model-emitted
+    ``THINKING_END, byte, THINKING_START`` sequence at the end of a
+    PUTCHAR step (BLOG_SPEC.md:851). See
+    ``c4_release/docs/NEURAL_IO_VIA_THINK_PROTOCOL_PLAN.md`` for the
+    full design and Phase 2/3 follow-ups (PRTF, GETCHAR, READ).
 
     Conversational-I/O tail ops (L10 null-terminator detection,
     L15 output routing) are also flag-gated via ``enable_conversational_io``;
@@ -236,6 +245,15 @@ def all_core_ops(
         # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
         # L6 FFN unit writes survive the rightsize pass at end of legacy_bake.
         make_io_putchar_routing_op(),
+        # Neural-I/O THINK-tag protocol PUTCHAR bake (phase 6.6): flag-gated.
+        # Always registered for dep-graph stability; bake_fn is a no-op when
+        # ``enable_neural_io_think_protocol=False`` (the default). When
+        # enabled, the model emits THINKING_END, byte token, THINKING_START
+        # at the end of a PUTCHAR step (BLOG_SPEC.md:851 — canonical neural
+        # I/O mode). See c4_release/docs/NEURAL_IO_VIA_THINK_PROTOCOL_PLAN.md.
+        make_putchar_think_protocol_op(
+            enable_neural_io_think_protocol=enable_neural_io_think_protocol,
+        ),
         # Tool-call bakes (phase 998.8): flag-gated. Always registered so the
         # registration list is stable; bake_fn is a no-op when
         # `enable_tool_calling=False`. The 3 ops replace inline calls in
