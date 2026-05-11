@@ -24,7 +24,7 @@ class NeuralVMEmbedding(nn.Module):
     AutoregressiveVM can be purely: embed → blocks → head with no modifications.
     """
 
-    def __init__(self, vocab_size, d_model, dim_positions=None):
+    def __init__(self, vocab_size, d_model, dim_positions=None, max_seq_len=1024):
         """Initialize neural VM embedding.
 
         Args:
@@ -34,10 +34,15 @@ class NeuralVMEmbedding(nn.Module):
                 When provided, injection methods use these compiler-allocated
                 positions. When None, falls back to `_SetDim` constants
                 (backward-compat).
+            max_seq_len: Maximum sequence length this embedding will see.
+                Used to pre-allocate the ADDR_KEY positional-encoding buffer
+                at construction time (rather than lazily growing it) so the
+                traced ONNX graph never embeds a frozen capacity.
         """
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
+        self.max_seq_len = max_seq_len
         # Phase 0 M4: dim positions from compiler; None means fall back to _SetDim.
         self._dim_positions = dim_positions
 
@@ -91,10 +96,16 @@ class NeuralVMEmbedding(nn.Module):
         #
         # CODE_END detection still happens dynamically (the buffer is bounded
         # at apply time so it does not pollute positions past CODE_END). The
-        # buffer is lazily realized — it is filled on first forward() once we
-        # know the actual sequence length to size against.
-        self._addr_key_pos_encoding = None  # lazy: [max_seq_len, 48] buffer
-        self._addr_key_pos_encoding_size = 0  # how many positions are filled
+        # buffer is registered eagerly at ``max_seq_len`` capacity so the
+        # traced ONNX graph never embeds a dynamic capacity check; it lives on
+        # CPU initially and moves with ``.to(device)`` via the registered-buffer
+        # machinery.
+        self._addr_key_pos_encoding_size = int(max_seq_len)
+        self.register_buffer(
+            "_addr_key_pos_encoding_buf",
+            self._build_addr_key_pos_encoding(int(max_seq_len), torch.device("cpu"), torch.float32),
+            persistent=False,
+        )
 
     def _dim(self, name: str) -> int:
         """Resolve a dim name to its start position.
@@ -184,6 +195,19 @@ class NeuralVMEmbedding(nn.Module):
         # Standard embedding lookup
         x = self.embed(token_ids)
 
+        # --- ONNX export fast path ---------------------------------------
+        # The prefix cache is purely a runtime perf optimization (it caches
+        # the augmentation delta for the immutable CODE/DATA prefix region
+        # across forward calls within a single ``run()``). It involves Python
+        # state mutation and a ``.tolist()`` scan that the ONNX tracer can't
+        # capture. When exporting, bypass the cache entirely and run the
+        # un-cached augmentations every call.
+        if torch.onnx.is_in_onnx_export():
+            self._add_code_addr_keys(token_ids, x)
+            self._inject_mem_store(token_ids, x, start_pos=0)
+            self._inject_mem_metadata(token_ids, x, start_pos=0)
+            return x
+
         # --- Prefix cache fast path ---------------------------------------
         # If we have a cached prefix delta that matches the leading tokens,
         # add it in one shot and skip the per-position Python loops on that
@@ -254,44 +278,18 @@ class NeuralVMEmbedding(nn.Module):
         self._prefix_cache_delta = delta
         self._prefix_cache_len = prefix_len
 
-    def _ensure_addr_key_pos_encoding(self, S, device, dtype):
-        """Build (or extend) the precomputed ADDR_KEY positional encoding.
+    def _build_addr_key_pos_encoding(self, capacity, device, dtype):
+        """Compute the ADDR_KEY positional encoding table.
 
         The encoding is a deterministic, position-only one-hot table that
         replaces the per-position Python loop in the legacy
-        ``_add_code_addr_keys``. It has shape ``[N, 48]`` where N is the
-        number of sequence positions we have filled; entry [pos, :] holds the
-        three one-hot nibble flags for the byte address at that position
-        (or zeros if the position is a non-code-byte slot — padding bytes,
-        the CODE_START token itself, or anything past the code region).
-
-        The buffer is bounded by S and grown lazily: on first call we fill
-        ``max(S, 256)`` positions; subsequent calls grow it if S exceeds the
-        cached capacity. The buffer is registered as a module buffer so it
-        moves with ``.to(device)``.
-
-        Args:
-            S: Required minimum number of positions.
-            device: Target device for the buffer.
-            dtype: Target dtype for the buffer.
-
-        Returns:
-            A tensor of shape ``[capacity, 48]`` on ``device`` with ``dtype``.
-            Caller should slice ``[:S]`` before use.
+        ``_add_code_addr_keys``. It has shape ``[capacity, 48]``; entry
+        ``[pos, :]`` holds the three one-hot nibble flags for the byte address
+        at that position (or zeros if the position is a non-code-byte slot —
+        padding bytes, the CODE_START token itself, or anything past the code
+        region).
         """
         from .constants import INSTR_WIDTH, PC_OFFSET
-
-        # If we already have a buffer that covers S positions and matches
-        # device/dtype, return it directly.
-        if (self._addr_key_pos_encoding is not None
-                and self._addr_key_pos_encoding_size >= S
-                and self._addr_key_pos_encoding.device == device
-                and self._addr_key_pos_encoding.dtype == dtype):
-            return self._addr_key_pos_encoding
-
-        # Otherwise (re)build at a capacity >= S. Round up so we don't rebuild
-        # on every small S increment.
-        capacity = max(S, max(256, self._addr_key_pos_encoding_size * 2))
 
         BYTES_PER_INSTR = 8  # Matches legacy: opcode + 4 imm + 3 pad
         DATA_BYTES = 5       # Bytes that carry ADDR_KEY (opcode + 4 imm)
@@ -313,17 +311,43 @@ class NeuralVMEmbedding(nn.Module):
             enc[i, lo] = 1.0
             enc[i, 16 + hi] = 1.0
             enc[i, 32 + top] = 1.0
+        return enc
 
-        # Register (or replace) as a non-persistent buffer so .to() moves it.
-        # We avoid ``register_buffer`` for persistent state because the table
-        # is fully deterministic from constants and should not be saved.
-        if hasattr(self, "_buffers") and "_addr_key_pos_encoding_buf" in self._buffers:
-            # Replace existing buffer in place
-            del self._buffers["_addr_key_pos_encoding_buf"]
-        self.register_buffer("_addr_key_pos_encoding_buf", enc, persistent=False)
-        self._addr_key_pos_encoding = self._addr_key_pos_encoding_buf
-        self._addr_key_pos_encoding_size = capacity
-        return self._addr_key_pos_encoding
+    def _ensure_addr_key_pos_encoding(self, S, device, dtype):
+        """Return the ADDR_KEY positional encoding on the requested device/dtype.
+
+        The buffer is pre-allocated at construction time with capacity
+        ``max_seq_len`` so this method never grows it at forward time. If S
+        exceeds ``max_seq_len`` (rare backward-compat path) we rebuild eagerly,
+        but this branch never fires on the ONNX trace path.
+
+        Args:
+            S: Required minimum number of positions.
+            device: Target device for the buffer.
+            dtype: Target dtype for the buffer.
+
+        Returns:
+            A tensor of shape ``[>=S, 48]`` on ``device`` with ``dtype``.
+            Caller should slice ``[:S]`` before use.
+        """
+        buf = self._addr_key_pos_encoding_buf
+
+        if S > self._addr_key_pos_encoding_size:
+            # Backward-compat path: a caller passed a sequence longer than the
+            # max_seq_len declared at construction. Rebuild at the requested
+            # capacity. Not exercised in ONNX export (max_seq_len is sized to
+            # cover all expected inputs).
+            new_capacity = max(S, self._addr_key_pos_encoding_size * 2)
+            new_buf = self._build_addr_key_pos_encoding(new_capacity, device, dtype)
+            if "_addr_key_pos_encoding_buf" in self._buffers:
+                del self._buffers["_addr_key_pos_encoding_buf"]
+            self.register_buffer("_addr_key_pos_encoding_buf", new_buf, persistent=False)
+            self._addr_key_pos_encoding_size = new_capacity
+            return new_buf
+
+        if buf.device != device or buf.dtype != dtype:
+            return buf.to(device=device, dtype=dtype)
+        return buf
 
     def _add_code_addr_keys(self, token_ids, x):
         """Add ADDR_KEY to code byte embeddings (compiler-baked positional encoding).

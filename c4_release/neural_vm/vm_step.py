@@ -91,6 +91,13 @@ class AutoregressiveAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        # head_dim must tile dim exactly so initial Q/K/V views are well-formed.
+        # (L15 may later bake a wider H*HD that exceeds dim; that path is
+        # handled by W_o projecting back to dim — see forward().)
+        assert num_heads * self.head_dim == dim, (
+            f"num_heads ({num_heads}) * head_dim ({self.head_dim}) must equal "
+            f"dim ({dim})"
+        )
         self.scale = self.head_dim**-0.5
         self.max_seq_len = max_seq_len
         self.layer_idx = layer_idx
@@ -409,14 +416,12 @@ class AutoregressiveAttention(nn.Module):
             # W_o is [D, n_out] — full output dim, compact internal dim
             return x + F.linear(out, self.W_o)
         else:
-            # Standard case: H * HD == D (e.g., 8 heads × 64 dims = 512)
-            # Non-standard case: H * HD != D (e.g., L15 with 12 heads × 64 dims = 768 != 512)
-            # In non-standard case, W_o projects from H*HD back to D
-            out = out.transpose(1, 2).contiguous()  # [B, S, H, HD]
-            if H * HD == D:
-                out = out.view(B, S, D)
-            else:
-                out = out.view(B, S, H * HD)  # [B, S, 768] for L15
+            # Always view as [B, S, H*HD]. In the standard case H*HD == D
+            # (e.g., 8 heads × 64 dims = 512); in the L15 case H*HD > D
+            # (12 heads × 64 dims = 768) and W_o[D, H*HD] projects back to D.
+            # Using H*HD unconditionally keeps both paths shape-correct and
+            # avoids a Python branch that the ONNX tracer would constant-fold.
+            out = out.transpose(1, 2).contiguous().view(B, S, H * HD)
             return x + (sparse_linear if self.W_q.is_sparse else F.linear)(
                 out, self.W_o
             )
@@ -1192,8 +1197,13 @@ class AutoregressiveVM(nn.Module):
         # Used by NeuralVMEmbedding token-time injection (ADDR_KEY, MEM_*).
         self.dim_positions = dim_positions if dim_positions is not None else _SetDim
 
-        # Use NeuralVMEmbedding with integrated augmentations
-        self.embed = NeuralVMEmbedding(vocab_size, d_model, dim_positions=dim_positions)
+        # Use NeuralVMEmbedding with integrated augmentations.
+        # max_seq_len is passed through so the embedding can pre-allocate its
+        # ADDR_KEY positional-encoding buffer at construction time (ONNX trace
+        # cleanliness — no dynamic capacity check).
+        self.embed = NeuralVMEmbedding(
+            vocab_size, d_model, dim_positions=dim_positions, max_seq_len=max_seq_len
+        )
 
         self.blocks = nn.ModuleList(
             [
@@ -1358,7 +1368,12 @@ class AutoregressiveVM(nn.Module):
         x = self.embed(token_ids)
 
         # Incremental path: slice off cached prefix before running blocks.
-        if cached_prefix_len > 0:
+        # ``cached_prefix_len`` is a Python int, so the tracer would constant-
+        # fold this branch to whichever value was used at export time (always
+        # 0 in practice). Gate it behind the ONNX guard so the exported graph
+        # always runs the full-sequence path; eager mode still gets the
+        # incremental fast path when a runner passes ``cached_prefix_len>0``.
+        if not torch.onnx.is_in_onnx_export() and cached_prefix_len > 0:
             x = x[:, cached_prefix_len:, :]
             x_is_new_only = True
         else:
