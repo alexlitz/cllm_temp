@@ -896,10 +896,30 @@ def make_layer8_sp_gather_bake_op() -> Operation:
 
 
 def make_layer9_alu_op() -> Operation:
-    """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0."""
-    def bake(ffn, dim_positions, S):
-        from ..vm_step import _set_layer9_alu
-        _set_layer9_alu(ffn, S, _as_setdim_proxy(dim_positions))
+    """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
+
+    Originally two inline calls inside ``set_vm_weights`` (in the
+    ``alu_mode == 'lookup'`` branch):
+        ``n9 = _set_layer9_alu(ffn9, S, BD)``
+        ``_set_layer9_marker_suppress(ffn9, S, BD, n9)``
+
+    Combined into a single migrated bake_fn that captures ``n9`` and
+    threads it to ``_set_layer9_marker_suppress`` as ``start_unit`` so the
+    two routines share the FFN's hidden-unit allocator. Mirrors the
+    combined-bake pattern proven safe by Unit 9's diagnosis (see
+    ``c4_release/docs/LOOKUP_MODE_BUG_DIAGNOSIS.md``).
+
+    Migrated as ``kind="block"`` pinned to ``layer_idx=9`` with
+    ``migrated=True``; the inline call pair has been removed from
+    ``set_vm_weights`` to avoid double-bake. Phase stays at 9. Fires in
+    both lookup and efficient ALU modes — the lookup-branch nesting was
+    incidental and the helpers themselves are alu_mode-agnostic.
+    """
+    def bake(block, dim_positions, S):
+        from ..vm_step import _set_layer9_alu, _set_layer9_marker_suppress
+        proxy = _as_setdim_proxy(dim_positions)
+        n9 = _set_layer9_alu(block.ffn, S, proxy)
+        _set_layer9_marker_suppress(block.ffn, S, proxy, n9)
 
     return Operation(
         name="layer9_alu",
@@ -909,8 +929,10 @@ def make_layer9_alu_op() -> Operation:
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                "ALU_LO", "AX_CARRY_LO"},
         writes={"OUTPUT_HI", "CMP", "OUTPUT_LO"},
-        kind="ffn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=9,
+        migrated=True,
     )
 
 

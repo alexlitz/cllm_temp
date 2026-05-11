@@ -2081,9 +2081,16 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # before legacy_bake in both lookup and efficient ALU modes — the
         # underlying helpers do the same setup regardless of alu_mode.
 
-        ffn9 = model.blocks[9].ffn
-        n9 = _set_layer9_alu(ffn9, S, BD)
-        _set_layer9_marker_suppress(ffn9, S, BD, n9)
+        # MIGRATED 2026-05-10: the two inline calls
+        #     n9 = _set_layer9_alu(ffn9, S, BD)
+        #     _set_layer9_marker_suppress(ffn9, S, BD, n9)
+        # are now baked together by the compiler block op `layer9_alu`
+        # (phase=9, layer_idx=9, kind="block", migrated=True) in
+        # unified_compiler/migrated_ops.py. The migrated bake_fn captures
+        # `n9` from `_set_layer9_alu` and threads it to
+        # `_set_layer9_marker_suppress` as `start_unit`, preserving the
+        # legacy hidden-unit allocator sharing. Fires in both lookup and
+        # efficient ALU modes (the lookup-branch nesting was incidental).
 
         # ===== LAYER 10: carry relay + AX passthrough + SP passthrough + bitwise + cmp =====
         attn10 = model.blocks[10].attn
