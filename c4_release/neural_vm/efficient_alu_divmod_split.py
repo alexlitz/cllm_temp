@@ -424,6 +424,31 @@ class FlattenedDivMod(nn.Module):
                 "All 3 stage compiler ops (phase 10.0/10.1/10.2) plus "
                 "the install op (phase 10.8) must run before forward()."
             )
+
+        # ---- Opcode-gated early-out (perf optimization, 2026-05-11) ----
+        # The full long-division pipeline (~370 ms/call dominated by an
+        # 8-outer × 15-inner Python loop inside LongDivisionModule) runs
+        # unconditionally and is masked to zero at the GE→BD stage when
+        # neither OP_DIV nor OP_MOD is active. For the vast majority of
+        # tests, neither opcode is active, so this work is pure waste.
+        #
+        # Stage 3 (`_DivModGEToBDStage`) ultimately gates the writeback on
+        # `(OP_DIV>0.1 OR OP_MOD>0.1) AND MARK_AX>0.5` per sequence
+        # position. If neither flag exceeds 0.1 anywhere in the batch,
+        # the pipeline contributes nothing and we can return x_bd
+        # unchanged. The `.item()` forces one CPU/GPU sync (~few µs) — a
+        # rounding error compared to the ~370 ms loop it elides.
+        #
+        # Correctness: this is a strict subset of the mask already
+        # applied at stage 3 (we only skip when the mask would zero the
+        # contribution everywhere). Numerical output is identical when
+        # DIV/MOD is active.
+        BD = self.BD
+        op_div_max = x_bd[..., BD.OP_DIV].max()
+        op_mod_max = x_bd[..., BD.OP_MOD].max()
+        if float(op_div_max.item()) < 0.1 and float(op_mod_max.item()) < 0.1:
+            return x_bd
+
         return pipeline(x_bd)
 
     # Stub methods for compatibility with vm_step.py (mirror PureNeuralALU).
