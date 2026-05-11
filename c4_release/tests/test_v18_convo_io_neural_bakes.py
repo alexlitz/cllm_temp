@@ -37,12 +37,14 @@ import torch
 from neural_vm.setup_helpers import (
     _set_convo_io_pc_sp_latch,
     _set_convo_io_prtf_capture,
+    _set_convo_io_prtf_transport,
     _set_convo_io_step_resume,
 )
 from neural_vm.unified_compiler.ops.all_core_ops import all_core_ops
 from neural_vm.unified_compiler.ops.flag_gated_ops import (
     make_convo_io_pc_sp_latch_op,
     make_convo_io_prtf_capture_op,
+    make_convo_io_prtf_transport_op,
     make_convo_io_step_resume_op,
 )
 from neural_vm.vm_step import _SetDim as BD
@@ -64,6 +66,30 @@ class _StubFFN:
         self.W_down = torch.zeros(d_model, hidden_dim)
         self.b_up = torch.zeros(hidden_dim)
         self.b_gate = torch.zeros(hidden_dim)
+
+
+class _StubAttn:
+    """Minimal attention stub exposing W_q/W_k/W_v/W_o + alibi_slopes
+    that the transport attention bake writes into.
+
+    Production L4 attention has d_model=512, num_heads=8, so the per-head
+    dim HD = 64 and the full Q/K projection shape is (d_model, d_model) =
+    (512, 512). Production stores W_q/W_k/W_v as (n_heads*HD, d_model)
+    tensors which equals (512, 512); W_o is (d_model, n_heads*HD) =
+    (512, 512). The bake helper reads num_heads from
+    ``attn.num_heads`` and shape from ``attn.W_q.shape[0]`` to compute
+    HD, so we replicate that interface here exactly.
+    """
+
+    def __init__(self, d_model: int = 512, num_heads: int = 8):
+        # Match production AutoregressiveAttention layout
+        total = num_heads * (d_model // num_heads)  # = d_model when divisible
+        self.W_q = torch.zeros(total, d_model)
+        self.W_k = torch.zeros(total, d_model)
+        self.W_v = torch.zeros(total, d_model)
+        self.W_o = torch.zeros(d_model, total)
+        self.num_heads = num_heads
+        self.alibi_slopes = torch.zeros(num_heads)
 
 
 # Scaling factor matching the convention used by other convo-IO helpers
@@ -99,12 +125,20 @@ class TestV18Phase1BakesRegistered:
         assert "convo_io_step_resume" in names
         assert "convo_io_pc_sp_latch" in names
         assert "convo_io_prtf_capture" in names
+        assert "convo_io_prtf_transport" in names
 
     def test_prtf_capture_op_registered(self):
         names = {op.name for op in all_core_ops()}
         assert "convo_io_prtf_capture" in names, (
             "convo_io_prtf_capture missing from all_core_ops(). See "
             "V18_CONVO_IO_NEURAL_PLAN.md §3b (Phase 1b capture-side)."
+        )
+
+    def test_prtf_transport_op_registered(self):
+        names = {op.name for op in all_core_ops()}
+        assert "convo_io_prtf_transport" in names, (
+            "convo_io_prtf_transport missing from all_core_ops(). See "
+            "V18_CONVO_IO_NEURAL_PLAN.md §3 (Phase 1c transport-side)."
         )
 
 
@@ -172,6 +206,31 @@ class TestV18Phase1BakesGatedOff:
         op.bake_fn(_Block(ffn), _dim_positions(), S)
         assert torch.all(ffn.W_up == 0)
         assert torch.all(ffn.W_down == 0)
+
+    def test_prtf_transport_noop_when_enable_false(self):
+        op = make_convo_io_prtf_transport_op(
+            enable_conversational_io=True, enable=False
+        )
+        attn = _StubAttn()
+        op.bake_fn(_BlockAttn(attn), _dim_positions(), S)
+        # No Q/K/V/O writes and the alibi slope override does not fire.
+        assert torch.all(attn.W_q == 0)
+        assert torch.all(attn.W_k == 0)
+        assert torch.all(attn.W_v == 0)
+        assert torch.all(attn.W_o == 0)
+        assert torch.all(attn.alibi_slopes == 0)
+
+    def test_prtf_transport_noop_when_convo_io_false(self):
+        op = make_convo_io_prtf_transport_op(
+            enable_conversational_io=False, enable=True
+        )
+        attn = _StubAttn()
+        op.bake_fn(_BlockAttn(attn), _dim_positions(), S)
+        assert torch.all(attn.W_q == 0)
+        assert torch.all(attn.W_k == 0)
+        assert torch.all(attn.W_v == 0)
+        assert torch.all(attn.W_o == 0)
+        assert torch.all(attn.alibi_slopes == 0)
 
 
 class TestV18Phase1StepResumeBake:
@@ -305,6 +364,172 @@ class TestV18Phase1BakesEnabled:
         for u in (800, 815, 816, 831, 832, 847, 848, 863):
             assert ffn.W_up[u, BD.ACTIVE_OPCODE_PRTF] != 0
             assert ffn.W_up[u, BD.MARK_AX] != 0
+
+    def test_prtf_transport_factory_bake_writes_head(self):
+        op = make_convo_io_prtf_transport_op(
+            enable_conversational_io=True, enable=True
+        )
+        attn = _StubAttn()
+        op.bake_fn(_BlockAttn(attn), _dim_positions(), S)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        base = 4 * HD  # head 4
+        # Q-side: fires on LAST_WAS_THINKING_START.
+        assert attn.W_q[base, BD.LAST_WAS_THINKING_START] > 0
+        # K-side: matches ACTIVE_OPCODE_PRTF + MARK_AX.
+        assert attn.W_k[base, BD.ACTIVE_OPCODE_PRTF] > 0
+        assert attn.W_k[base, BD.MARK_AX] > 0
+        # ALiBi slope override on head 4 (shallow so we can reach back
+        # across the output-byte interlude).
+        assert attn.alibi_slopes[4] != 0
+
+
+class TestV18Phase1cPRTFTransportBake:
+    """Direct-call checks on ``_set_convo_io_prtf_transport`` (V18 §3 Phase 1c).
+
+    Verifies the documented contract for the Phase 1c transport-side bake:
+      - L4 attn head 4 (base = 4 * HD = 256 in production with HD=64).
+      - Q-side fires on ``LAST_WAS_THINKING_START`` (the post-THINKING_START
+        edge, set by L2 head 1 lookback detection).
+      - K-side matches the PRTF AX marker (conjunction of
+        ``ACTIVE_OPCODE_PRTF`` AND ``MARK_AX``).
+      - V/O copy the four nibble groups ``POST_PRTF_PC_LO/HI`` and
+        ``POST_PRTF_SP_LO/HI`` from the K position to the Q position.
+      - No write to heads 0/2/3 (already used by L4 main bakes).
+    """
+
+    def test_q_side_gates_on_last_was_thinking_start(self):
+        attn = _StubAttn()
+        _set_convo_io_prtf_transport(attn, S, BD, HD=64)
+        base = 4 * 64
+        assert attn.W_q[base, BD.LAST_WAS_THINKING_START] > 0
+        # Threshold via CONST suppression: prevent spurious firing.
+        assert attn.W_q[base, BD.CONST] < 0
+
+    def test_k_side_matches_prtf_ax_marker(self):
+        attn = _StubAttn()
+        _set_convo_io_prtf_transport(attn, S, BD, HD=64)
+        base = 4 * 64
+        # K writes for both PRTF flag and MARK_AX (the conjunction).
+        assert attn.W_k[base, BD.ACTIVE_OPCODE_PRTF] > 0
+        assert attn.W_k[base, BD.MARK_AX] > 0
+        # Threshold via CONST suppression: requires both flags.
+        assert attn.W_k[base, BD.CONST] < 0
+
+    def test_v_copies_post_prtf_pc_nibbles(self):
+        attn = _StubAttn()
+        _set_convo_io_prtf_transport(attn, S, BD, HD=64)
+        base = 4 * 64
+        # V projection reads POST_PRTF_PC_LO/HI nibbles from K position.
+        for k in range(16):
+            assert attn.W_v[base + 1 + k, BD.POST_PRTF_PC_LO + k] != 0
+            assert attn.W_v[base + 17 + k, BD.POST_PRTF_PC_HI + k] != 0
+
+    def test_v_copies_post_prtf_sp_nibbles(self):
+        attn = _StubAttn()
+        _set_convo_io_prtf_transport(attn, S, BD, HD=64)
+        base = 4 * 64
+        # V projection reads POST_PRTF_SP_LO and POST_PRTF_SP_HI nibbles 0..14.
+        # SP_HI nibble 15 is intentionally dropped (HD-budget constraint;
+        # production stacks have SP < 0x10000000 so the dropped nibble is
+        # identically zero — documented in the bake helper).
+        for k in range(16):
+            assert attn.W_v[base + 33 + k, BD.POST_PRTF_SP_LO + k] != 0
+        for k in range(15):
+            assert attn.W_v[base + 49 + k, BD.POST_PRTF_SP_HI + k] != 0
+
+    def test_o_writes_post_prtf_pc_nibbles(self):
+        attn = _StubAttn()
+        _set_convo_io_prtf_transport(attn, S, BD, HD=64)
+        base = 4 * 64
+        # O projection writes POST_PRTF_PC_LO/HI nibbles at Q position.
+        for k in range(16):
+            assert attn.W_o[BD.POST_PRTF_PC_LO + k, base + 1 + k] != 0
+            assert attn.W_o[BD.POST_PRTF_PC_HI + k, base + 17 + k] != 0
+
+    def test_o_writes_post_prtf_sp_nibbles(self):
+        attn = _StubAttn()
+        _set_convo_io_prtf_transport(attn, S, BD, HD=64)
+        base = 4 * 64
+        for k in range(16):
+            assert attn.W_o[BD.POST_PRTF_SP_LO + k, base + 33 + k] != 0
+        for k in range(15):
+            assert attn.W_o[BD.POST_PRTF_SP_HI + k, base + 49 + k] != 0
+
+    def test_does_not_touch_other_heads(self):
+        """L4 attn heads 0 (PC relay), 2 (SP→ADDR_KEY byte 0), 3 (SP→ADDR_KEY
+        byte 1) are baked by other ops. The transport bake must leave those
+        head bases untouched.
+        """
+        attn = _StubAttn()
+        _set_convo_io_prtf_transport(attn, S, BD, HD=64)
+        for head in (0, 1, 2, 3, 5, 6, 7):
+            base = head * 64
+            # All cells of these heads' Q/K/V/O slots are zero. Span check
+            # over the first slot is sufficient.
+            assert torch.all(attn.W_q[base : base + 64] == 0), (
+                f"head {head} Q should be untouched by transport bake"
+            )
+            assert torch.all(attn.W_k[base : base + 64] == 0), (
+                f"head {head} K should be untouched by transport bake"
+            )
+            assert torch.all(attn.W_v[base : base + 64] == 0), (
+                f"head {head} V should be untouched by transport bake"
+            )
+            # W_o columns: skip head 4 itself.
+            assert torch.all(attn.W_o[:, base : base + 64] == 0), (
+                f"head {head} O should be untouched by transport bake"
+            )
+
+    def test_end_to_end_capture_transport_replay_chain(self):
+        """End-to-end semantic invariant: capture (3c) → transport (3d) →
+        replay (3b) form a closed chain on the POST_PRTF_PC/SP cache dims.
+
+        - Capture writes POST_PRTF_PC_LO/HI and POST_PRTF_SP_LO/HI at the
+          PRTF AX marker.
+        - Transport reads those dims from the PRTF AX marker (via K) and
+          writes them at the post-THINKING_START position (via V/O).
+        - Replay reads those dims from the post-THINKING_START position
+          (via W_gate sources) and writes OUTPUT_LO/HI.
+
+        This test verifies the V and O nibble bands of the transport head
+        cover the SAME dims that the capture writes to and that the replay
+        reads from — so the residual nibbles flow through the chain.
+        """
+        capture_ffn = _StubFFN()
+        replay_ffn = _StubFFN()
+        transport_attn = _StubAttn()
+        _set_convo_io_prtf_capture(capture_ffn, S, BD)
+        _set_convo_io_pc_sp_latch(replay_ffn, S, BD)
+        _set_convo_io_prtf_transport(transport_attn, S, BD, HD=64)
+
+        # PC-side chain: capture → transport → replay all touch POST_PRTF_PC_LO[k]
+        # and POST_PRTF_PC_HI[k] for k in 0..15.
+        base = 4 * 64
+        for k in range(16):
+            # Capture writes POST_PRTF_PC_LO/HI.
+            assert capture_ffn.W_down[BD.POST_PRTF_PC_LO + k, 800 + k] > 0
+            assert capture_ffn.W_down[BD.POST_PRTF_PC_HI + k, 816 + k] > 0
+            # Transport reads (V) and writes (O) POST_PRTF_PC_LO/HI.
+            assert transport_attn.W_v[base + 1 + k, BD.POST_PRTF_PC_LO + k] != 0
+            assert transport_attn.W_v[base + 17 + k, BD.POST_PRTF_PC_HI + k] != 0
+            assert transport_attn.W_o[BD.POST_PRTF_PC_LO + k, base + 1 + k] != 0
+            assert transport_attn.W_o[BD.POST_PRTF_PC_HI + k, base + 17 + k] != 0
+            # Replay reads POST_PRTF_PC_LO/HI (as the W_gate source).
+            assert replay_ffn.W_gate[1402 + k, BD.POST_PRTF_PC_LO + k] != 0
+            assert replay_ffn.W_gate[1418 + k, BD.POST_PRTF_PC_HI + k] != 0
+
+        # SP-side chain: same invariant for POST_PRTF_SP_LO[k] (full 16 nibbles).
+        for k in range(16):
+            assert capture_ffn.W_down[BD.POST_PRTF_SP_LO + k, 832 + k] > 0
+            assert capture_ffn.W_down[BD.POST_PRTF_SP_HI + k, 848 + k] > 0
+            assert transport_attn.W_v[base + 33 + k, BD.POST_PRTF_SP_LO + k] != 0
+            assert transport_attn.W_o[BD.POST_PRTF_SP_LO + k, base + 33 + k] != 0
+            assert replay_ffn.W_gate[1434 + k, BD.POST_PRTF_SP_LO + k] != 0
+            assert replay_ffn.W_gate[1450 + k, BD.POST_PRTF_SP_HI + k] != 0
+        # SP_HI nibbles 0..14 (nibble 15 dropped per HD-budget constraint).
+        for k in range(15):
+            assert transport_attn.W_v[base + 49 + k, BD.POST_PRTF_SP_HI + k] != 0
+            assert transport_attn.W_o[BD.POST_PRTF_SP_HI + k, base + 49 + k] != 0
 
 
 class TestV18Phase1bPRTFCaptureBake:
@@ -443,6 +668,14 @@ class _Block:
 
     def __init__(self, ffn):
         self.ffn = ffn
+
+
+class _BlockAttn:
+    """Minimal block stub that exposes ``attn`` as the attention-bake
+    factories expect (``block.attn``)."""
+
+    def __init__(self, attn):
+        self.attn = attn
 
 
 def _dim_positions():

@@ -330,6 +330,19 @@ def all_core_ops(
             enable_conversational_io=enable_conversational_io,
             enable=False,
         ),
+        # V18 Phase 1c transport-side bake (companion to convo_io_prtf_capture
+        # and convo_io_pc_sp_latch). L4 attn head 4: at the post-THINKING_START
+        # position, attend back across the variable-length output-byte
+        # interlude to the most recent PRTF AX marker and copy the captured
+        # POST_PRTF_PC/SP nibbles forward into the current position's
+        # residual, where the 3b replay band reads them. Double-gated;
+        # ``enable=False`` by default — flip in tandem with the capture/replay
+        # bakes once the end-to-end neural convo-IO loop is validated.
+        # See V18_CONVO_IO_NEURAL_PLAN.md §3, Phase 1c.
+        make_convo_io_prtf_transport_op(
+            enable_conversational_io=enable_conversational_io,
+            enable=False,
+        ),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
