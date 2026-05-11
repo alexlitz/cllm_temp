@@ -706,20 +706,32 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
 
 
 def make_layer8_alu_op() -> Operation:
-    """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP."""
-    def bake(ffn, dim_positions, S):
+    """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
+
+    MIGRATED 2026-05-10 (Wave 2 Unit 10): flipped from kind="ffn" to
+    kind="block" with layer_idx=8, phase=8.2, migrated=True. The inline
+    call ``_set_layer8_alu(ffn8, S, BD)`` in ``set_vm_weights`` (both
+    ``alu_mode == 'lookup'`` and ``alu_mode == 'efficient'`` branches)
+    has been removed; this op now owns the bake. Phase=8.2 places it
+    after format_pointer_extraction (7.5) and the L8 multibyte_fetch
+    bake (8.1), and before format_position_counter (8.5) — matching the
+    legacy in-set_vm_weights ordering.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer8_alu
-        _set_layer8_alu(ffn, S, _as_setdim_proxy(dim_positions))
+        _set_layer8_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer8_alu",
-        phase=8,
+        phase=8.2,
         reads={"MARK_AX", "MARK_PC", "ALU_LO", "AX_CARRY_LO", "FETCH_LO",
                "OP_ADD", "OP_SUB", "OP_LEA",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE"},
         writes={"OUTPUT_LO", "CARRY", "CMP_GROUP"},
-        kind="ffn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=8,
+        migrated=True,
     )
 
 
@@ -818,19 +830,31 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
 
 
 def make_layer8_multibyte_routing_op() -> Operation:
-    """L8 FFN extension: route FETCH → OUTPUT at AX byte positions for IMM."""
-    def bake(ffn, dim_positions, S):
+    """L8 FFN extension: route FETCH → OUTPUT at AX byte positions for IMM.
+
+    MIGRATED 2026-05-10 (Wave 2 Unit 10): flipped from kind="ffn" to
+    kind="block" with layer_idx=8, phase=8.3, migrated=True. The inline
+    call ``_set_layer8_multibyte_routing(ffn8, S, BD)`` in
+    ``set_vm_weights`` (both alu_mode branches) has been removed; this op
+    now owns the bake. Phase=8.3 places it after ``layer8_alu`` (8.2)
+    so the shared unit counter starts after the ALU units (the helper
+    internally re-invokes ``_set_layer8_alu`` to compute ``unit_start``;
+    that re-call is an idempotent overwrite of the same ALU weights).
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_layer8_multibyte_routing
-        _set_layer8_multibyte_routing(ffn, S, _as_setdim_proxy(dim_positions))
+        _set_layer8_multibyte_routing(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer8_multibyte_routing",
-        phase=8,
+        phase=8.3,
         reads={"IS_BYTE", "H1", "OP_IMM", "MARK_AX",
                "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
-        kind="ffn",
+        kind="block",
         bake_fn=bake,
+        layer_idx=8,
+        migrated=True,
     )
 
 

@@ -2045,15 +2045,17 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # ===== LAYERS 8-13: ALU Operations =====
     if alu_mode == 'lookup':
         # Use full lookup tables (pure FFN, many parameters)
-        ffn8 = model.blocks[8].ffn
-        _set_layer8_alu(ffn8, S, BD)
-
-        # Multi-byte IMM: FETCH → OUTPUT routing at AX byte positions
-        # After L8 Head 3 fetches code bytes into FETCH_LO/HI at byte positions,
-        # and L8 Head 4 relays OP_IMM to byte positions, route FETCH → OUTPUT.
-        # Gated on IS_BYTE + H1[AX_I] + OP_IMM, blocked at AX marker (MARK_AX).
-        # Uses unit counter from _set_layer8_alu (starts after ALU units).
-        _set_layer8_multibyte_routing(ffn8, S, BD)
+        # MIGRATED 2026-05-10 (Wave 2 Unit 10):
+        #   - ``_set_layer8_alu(ffn8, S, BD)`` is now baked by the migrated
+        #     block op ``make_layer8_alu_op`` (kind="block", layer_idx=8,
+        #     phase=8.2, migrated=True).
+        #   - ``_set_layer8_multibyte_routing(ffn8, S, BD)`` is now baked by
+        #     ``make_layer8_multibyte_routing_op`` (kind="block",
+        #     layer_idx=8, phase=8.3, migrated=True). The helper internally
+        #     re-invokes ``_set_layer8_alu`` to discover its unit count;
+        #     since ``layer8_alu`` (phase 8.2) fires first, the re-call is
+        #     an idempotent overwrite of the same ALU weights.
+        # See unified_compiler/migrated_ops.py.
 
         # Conversational I/O: Position counter increment
         # MIGRATED 2026-05-10: `_set_format_position_counter(ffn8, S, BD)`
@@ -2145,9 +2147,17 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # All operations use baked FFN weights - no Python loops in forward pass
 
         # L8 FFN: Set up ALU + multi-byte IMM routing first, then wrap with efficient
+        # MIGRATED 2026-05-10 (Wave 2 Unit 10): the inline calls
+        #   _set_layer8_alu(ffn8, S, BD)
+        #   _set_layer8_multibyte_routing(ffn8, S, BD)
+        # are now owned by migrated block ops ``layer8_alu`` (phase 8.2)
+        # and ``layer8_multibyte_routing`` (phase 8.3), both kind="block",
+        # layer_idx=8, migrated=True. They fire BEFORE legacy_bake regardless
+        # of alu_mode, so by the time this branch runs the ALU + routing
+        # weights are already on ``model.blocks[8].ffn``; we just need to
+        # wrap it with the efficient hybrid pipeline. See
+        # unified_compiler/migrated_ops.py.
         ffn8 = model.blocks[8].ffn
-        _set_layer8_alu(ffn8, S, BD)
-        _set_layer8_multibyte_routing(ffn8, S, BD)
         # Wrap original FFN with the 5-stage flattened ADD/SUB pipeline.
         # Replaces the monolithic ALUAddSub class. AddSub5StageBlock is split
         # into 5 individual blocks by `_expand_wrapper_blocks`.
