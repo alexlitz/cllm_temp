@@ -316,3 +316,144 @@ def make_putchar_think_protocol_op(
     )
 
 
+def make_prtf_think_protocol_op(
+    enable_neural_io_think_protocol: bool = False,
+) -> Operation:
+    """L6 FFN: PRTF THINK-tag I/O protocol — multi-byte variable-length
+    output via the existing format-string-walk bake chain.
+
+    See ``c4_release/docs/V9_PRTF_NEURAL_PLAN.md`` for the full Phase 2a
+    design. This op extends the PUTCHAR Phase 1 THINK-tag protocol from
+    single-byte (PUTCHAR) to variable-length (PRTF) output, reusing the
+    existing convo-IO bake chain:
+
+      - L5 FFN units 410-411 (``_set_conversational_io_opcode_decode``):
+        decode PRTF → IO_IS_PRTF.
+      - L6 attn head 4 (``_set_conversational_io_relay_heads``): relay
+        IO_IS_PRTF AX → SE.
+      - L6 FFN units 1400-1401 (``_set_conversational_io_state_machine``):
+        IO_IS_PRTF (CMP[5]) AND NEXT_SE → emit NEXT_THINKING_END.
+      - L7 attn head 7 (``_set_format_pointer_extraction``): extract
+        FORMAT_PTR from previous step's STACK0.
+      - L8 FFN unit 600+ (``_set_format_position_counter``): increment
+        IO_FORMAT_POS on each emitted byte.
+      - L9 attn head 0 (``_set_format_string_fetch_head``): fetch byte
+        at FORMAT_PTR + IO_FORMAT_POS via ADDR_KEY attention.
+      - L10 FFN unit 1864 (``_set_null_terminator_detection``):
+        OUTPUT_BYTE == 0 → emit NEXT_THINKING_START.
+      - L15 FFN unit 1200 (``_set_conversational_io_output_routing``):
+        OUTPUT_BYTE → OUTPUT when IO_IN_OUTPUT_MODE.
+
+    All the above bakes are already in place under
+    ``enable_conversational_io``. This op's role is to:
+      (a) register a stable dep-graph node tying PRTF's THINK protocol
+          to the same ``enable_neural_io_think_protocol`` flag as
+          PUTCHAR;
+      (b) bake any *additional* L6 FFN units that are PRTF-specific and
+          not covered by ``_set_conversational_io_state_machine`` (e.g.
+          end-of-PRTF cleanup that resets IO_FORMAT_POS for the next
+          PRTF call) — deferred to Phase 2b.
+
+    Phase 2a (this commit): bake_fn is a no-op. The full bake chain
+    above is already wired (gated by ``enable_conversational_io``). The
+    next Phase-2b commit will:
+      - Tie ``enable_neural_io_think_protocol`` to imply
+        ``enable_conversational_io`` at the compile-full-vm level so
+        the existing PRTF bakes fire.
+      - Gate the runner-side ``_neural_prtf_emit`` shim off when the
+        flag is True so the model's emitted bytes are not double-
+        emitted alongside the Python format-walk fallback.
+      - Optionally add an L6 FFN unit (~1403) that resets
+        ``IO_FORMAT_POS`` to 0 on ``LAST_WAS_THINKING_START`` so a
+        second PRTF in the same program starts at position 0 of its
+        new format string.
+
+    Gated by ``enable_neural_io_think_protocol`` (default False). When
+    False, the bake_fn is a no-op — matching the PUTCHAR
+    ``make_putchar_think_protocol_op`` pattern. The op stays registered
+    for dep-graph stability regardless of flag state.
+
+    Phase 6.6 (pinned ``layer_idx=6``, ``kind="block"``): runs alongside
+    other L6 block ops so any future FFN unit writes survive
+    ``_right_size_ffns`` (phase=1200) trimming. Same phase as
+    ``make_putchar_think_protocol_op`` and
+    ``make_convo_io_state_machine_op``; reads/writes declared below
+    are disjoint from those two so dispatch order within phase 6.6 is
+    irrelevant.
+    """
+    def bake(block, dim_positions, S):
+        return  # Phase 2a stub; see docstring for the full wiring plan.
+
+    return Operation(
+        name="prtf_think_protocol",
+        phase=6.6,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        layer_idx=6,
+        migrated=True,
+    )
+
+
+def make_open_clos_tool_call_op(
+    enable_tool_calling: bool = False,
+) -> Operation:
+    """L6 FFN: OPEN/CLOS TOOL_CALL boundary opcode — dep-graph anchor.
+
+    Per BLOG_SPEC.md:853, OPEN and CLOS cross the host boundary (file
+    descriptors, ``os.open``/``os.close``) and have no sensible
+    "in the transformer" implementation. The canonical design for these
+    two opcodes is to emit a ``TOOL_CALL`` token at the end of an
+    OPEN/CLOS step, which the runner intercepts to perform the syscall.
+
+    This bake already exists end-to-end under ``enable_tool_calling=True``:
+
+      - L5 FFN units 400-405 (``_set_tool_call_opcode_decode``): decode
+        all 6 I/O opcodes (OPEN=30, READ=31, CLOS=32, PRTF=33,
+        GETCHAR=64, PUTCHAR=65) at the AX marker → IO_IS_TOOL_CALL.
+      - L6 attn head 5 (``_set_tool_call_relay_head``): relay
+        IO_IS_TOOL_CALL AX → SE via ALiBi slope=5.0.
+      - L6 FFN unit 1300 (``_set_tool_call_detection``): CMP[2] AND
+        NEXT_SE → NEXT_TOOL_CALL, clear NEXT_SE. The model emits
+        ``Token.TOOL_CALL`` (271) at the end of an I/O-opcode step.
+
+    Each of those three bakes is wrapped in a no-op-when-False factory
+    in ``flag_gated_ops.py`` (``make_tool_call_*_op``) and registered
+    unconditionally in ``all_core_ops``. When
+    ``enable_tool_calling=True`` is passed to ``compile_full_vm``, all
+    three fire and OPEN/CLOS steps produce TOOL_CALL.
+
+    **This op is dep-graph documentation, not a new weight write.**
+    Its bake_fn is always a no-op (regardless of flag); it exists to
+    register the OPEN/CLOS-specific reads/writes in the dep graph for
+    discoverability and to anchor a future Phase A bake (e.g. an
+    OPEN/CLOS-specific marker dim if we want to distinguish them from
+    PRTF/READ at the TOOL_CALL emission position).
+
+    The runner-side shims ``_neural_open_emit`` and ``_neural_clos_emit``
+    at ``run_vm.py:1450-1495`` remain as the test-suite fallback for the
+    ``pure_neural_runner`` fixture (which sets neither
+    ``enable_tool_calling`` nor a syscall handler). Production builds
+    that need file I/O set ``enable_tool_calling=True`` and get the
+    TOOL_CALL path.
+
+    Phase 6.7 (pinned ``layer_idx=6``, ``kind="block"``): same phase
+    range as the other L6 I/O-related dep anchors. No unit writes
+    occur, so the phase only matters for graph topology.
+    """
+    def bake(block, dim_positions, S):
+        return  # Dep-graph anchor only; see docstring.
+
+    return Operation(
+        name="open_clos_tool_call",
+        phase=6.7,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        layer_idx=6,
+        migrated=True,
+    )
+
+
