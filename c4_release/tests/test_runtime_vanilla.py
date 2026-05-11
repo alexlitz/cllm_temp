@@ -56,12 +56,12 @@ KNOWN_NON_VANILLA_ALLOWLIST = frozenset({
     "FlattenedALUMul",            # TODO: remove once hybrid removal completes (L11/L12 efficient MUL)
     "ALUShiftComposite",          # TODO: remove once hybrid removal completes (L13 efficient SHL/SHR)
 
-    # Post-op family (installed via `block.ffn = ...` after `_expand_wrapper_blocks`
-    # splits HybridALUBlock and post_ops into their own blocks).
-    "BinaryOpByteZeroingPostOp",  # TODO: remove once hybrid removal completes (binary-op byte zero)
-    "CarryPropagationPostOp",     # TODO: remove once hybrid removal completes (ADD/SUB carry propagation)
-    "BitwiseBytePropagationPostOp",  # TODO: remove once hybrid removal completes (bitwise byte propagation)
-    "ComparisonCombine",          # TODO: remove once hybrid removal completes (comparison combine, efficient mode)
+    # Post-op family: BinaryOpByteZeroingPostOp, CarryPropagationPostOp,
+    # BitwiseBytePropagationPostOp, ComparisonCombine were previously listed
+    # here. As of 2026-05-11 (a-postops-to-pureffn) they are re-baked into
+    # vanilla `PureFFN` instances by `_expand_wrapper_blocks` before being
+    # installed as block.ffn, so the audit now sees them as canonical PureFFN.
+    # FlattenedDivMod is the only remaining post-op wrapper.
     "FlattenedDivMod",            # TODO: remove once hybrid removal completes (L10 DIV/MOD composite)
 })
 
