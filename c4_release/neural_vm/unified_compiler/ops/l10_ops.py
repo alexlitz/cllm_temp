@@ -388,7 +388,15 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             except (AttributeError, IndexError):
                 d_model = 512
 
-        block.post_ops.append(BinaryOpByteZeroingPostOp(d_model=d_model, S=S))
+        # Pass dim_positions so the post-op bakes against the compact layout
+        # rather than legacy `_SetDim` positions. Without this, the post-op
+        # writes to `_SetDim.OUTPUT_LO/HI`/reads `_SetDim.H1` etc., which alias
+        # unrelated compact dims (e.g. EMBED_HI[15], OP_LEA..OP_GE), corrupting
+        # OP_* flags whenever the AX byte 0 has hi nibble = 0xF (the IMM 240/
+        # 255 regression).
+        block.post_ops.append(
+            BinaryOpByteZeroingPostOp(d_model=d_model, S=S, dim_positions=dim_positions)
+        )
         block.post_ops.append(
             CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=0, cascade=False)
         )
