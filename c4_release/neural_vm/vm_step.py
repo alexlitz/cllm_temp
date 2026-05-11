@@ -1111,6 +1111,7 @@ class AutoregressiveVM(nn.Module):
         n_heads=8,  # REVERTED from 16: HD=32 broke attention score budgets
         ffn_hidden=4096,
         max_seq_len=1024,  # PERF: reduced from 4096; Phase 1 contexts are <100 tokens (1024 leaves headroom)
+        dim_positions=None,
     ):
         super().__init__()
         if vocab_size is None:
@@ -1119,8 +1120,15 @@ class AutoregressiveVM(nn.Module):
         self.d_model = d_model
         self.max_seq_len = max_seq_len
 
+        # Compiler-allocated dim_positions (None => fall back to _SetDim for
+        # backward-compat callers that construct AutoregressiveVM directly).
+        # Used by:
+        #   - NeuralVMEmbedding token-time injection (ADDR_KEY, MEM_*, opcode flags)
+        #   - set_active_opcode() MoE routing (opcode -> dim lookup)
+        self.dim_positions = dim_positions if dim_positions is not None else _SetDim
+
         # Use NeuralVMEmbedding with integrated augmentations
-        self.embed = NeuralVMEmbedding(vocab_size, d_model)
+        self.embed = NeuralVMEmbedding(vocab_size, d_model, dim_positions=dim_positions)
 
         self.blocks = nn.ModuleList(
             [
@@ -1223,7 +1231,7 @@ class AutoregressiveVM(nn.Module):
         if opcode_value is None:
             dim = None
         else:
-            dim = _SetDim.opcode_dim(opcode_value)
+            dim = _opcode_dim_from_positions(self.dim_positions, opcode_value)
         for block in self.blocks:
             ffn = block.ffn
             if getattr(ffn, "_moe_combined", None) is not None:
@@ -1515,6 +1523,41 @@ class AutoregressiveVM(nn.Module):
 # =============================================================================
 # Weight Setting - Real Neural VM Execution Through Transformer Weights
 # =============================================================================
+
+
+_OPCODE_VALUE_TO_NAME = None
+
+
+def _opcode_value_to_name(op_value):
+    """Reverse-lookup Opcode integer value -> short name (e.g. 25 -> 'ADD').
+
+    `Opcode` is a plain class (not an enum), so we build the int->name map
+    once via class-attribute introspection.
+    """
+    global _OPCODE_VALUE_TO_NAME
+    if _OPCODE_VALUE_TO_NAME is None:
+        _OPCODE_VALUE_TO_NAME = {
+            getattr(Opcode, n): n
+            for n in dir(Opcode)
+            if not n.startswith("_") and isinstance(getattr(Opcode, n), int)
+        }
+    return _OPCODE_VALUE_TO_NAME.get(op_value)
+
+
+def _opcode_dim_from_positions(dim_positions, opcode_value):
+    """Resolve an opcode value to its FFN flag dim from a positions source.
+
+    `dim_positions` is either the `_SetDim` class (legacy/hand-set mode) or
+    a dict[str, int] (compiler-allocated layout). For dicts, we look up the
+    `OP_<NAME>` dim name; for the class, we delegate to `_SetDim.opcode_dim`
+    which performs the same mapping via class attributes.
+    """
+    if isinstance(dim_positions, dict):
+        name = _opcode_value_to_name(opcode_value)
+        if name is None:
+            return None
+        return dim_positions.get(f"OP_{name}")
+    return dim_positions.opcode_dim(opcode_value)
 
 
 # Embedding dimension allocation for set weights (d_model=512)

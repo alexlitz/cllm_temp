@@ -195,6 +195,7 @@ def compile_full_vm(
         n_heads=n_heads,
         ffn_hidden=ffn_hidden,
         max_seq_len=max_seq_len,
+        dim_positions=layout.dim_positions,
     )
 
     # Run all model-level ops via the compiler dispatch. Per-layer ops are
