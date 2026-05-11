@@ -57,12 +57,17 @@ def make_layer0_threshold_attn_op() -> Operation:
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(ALIBI_S)
         HD = attn.W_q.shape[0] // attn.num_heads
+        # Pass proxy as BD= so pin_io_only=True resolves CONST/IS_MARK/MARKS
+        # via dim_positions. In practice these are all IO-pinned so the legacy
+        # fallback agrees, but routing through the proxy keeps the bake honest
+        # if the IO-pin contract ever changes.
         _set_threshold_attn(
             attn,
             [3.5, 4.5, 7.5, 8.5, 9.5, 14.5, 19.5, 24.5],
             [proxy.H0, proxy.H1, proxy.H2, proxy.H3, proxy.H4,
              proxy.H5, proxy.H6, proxy.H7],
             ALIBI_S, HD,
+            BD=proxy,
         )
 
     return Operation(

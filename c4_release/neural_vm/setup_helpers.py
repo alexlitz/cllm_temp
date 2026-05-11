@@ -198,10 +198,12 @@ def _set_cs_threshold_attn(attn, head_idx, threshold, out_dim, slope, HD):
 
     Outputs a single dim (CS component only) instead of full 7-marker vector.
     """
+    import math
     from .vm_step import _SetDim
     BD = _SetDim
     base = head_idx * HD
-    q_val = 8.0 * slope
+    # Scale Q so Q·K/sqrt(HD) = slope*threshold (HD-independent).
+    q_val = math.sqrt(HD) * slope
     attn.W_q[base, BD.CONST] = q_val
     attn.W_k[base, BD.IS_MARK] = threshold
     attn.W_v[base + 1, BD.MARK_CS] = 1.0
@@ -209,15 +211,22 @@ def _set_cs_threshold_attn(attn, head_idx, threshold, out_dim, slope, HD):
 
 
 
-def _set_stack0_carry_attn(attn, head_idx, HD):
+def _set_stack0_carry_attn(attn, head_idx, HD, BD=None):
     """Set attention head for STACK0 carry-forward.
 
     At STACK0 marker positions, attend to previous step's STACK0 byte 0
     (identified by STACK0_BYTE0 flag from L1 FFN).
     Copies EMBED_LO/HI to EMBED_LO/HI at STACK0 marker.
+
+    Args:
+        BD: Optional dim spec (proxy) overriding _SetDim. Pass the compiler
+            proxy from a migrated op so pin_io_only=True layouts wire to the
+            correct residual lanes. Defaults to module-level ``_SetDim`` for
+            backward compatibility with legacy callers (e.g. set_vm_weights).
     """
-    from .vm_step import _SetDim
-    BD = _SetDim
+    if BD is None:
+        from .vm_step import _SetDim
+        BD = _SetDim
     base = head_idx * HD
     L = 15.0
 

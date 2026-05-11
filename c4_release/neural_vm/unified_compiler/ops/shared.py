@@ -25,15 +25,50 @@ def _as_setdim_proxy(dim_positions: Dict[str, int]):
     integer positions that the compiler chose.
 
     Returns an object where `proxy.MARK_PC == dim_positions['MARK_PC']`.
-    Falls back to `_SetDim` for anything not declared (e.g., classmethods like
-    `opcode_dim`, constants like `NUM_OPCODES`).
+    Falls back to `_SetDim` for anything not declared (e.g., constants like
+    ``NUM_OPCODES``).
+
+    Note: ``proxy.opcode_dim(op_val)`` is overridden to resolve via
+    ``dim_positions`` (looking up ``OP_<name>``) rather than ``_SetDim.OP_*``.
+    Without this override, callers like ``_set_opcode_decode_ffn`` would
+    write OP_* flags at the LEGACY ``_SetDim`` positions instead of the
+    compiler-allocated ones, breaking pin_io_only=True layouts.
     """
     from ...vm_step import _SetDim
+    from ...embedding import Opcode
+
+    # Reverse map: Opcode int value -> "OP_<NAME>" string for dim_positions lookup
+    _OP_NAME = {
+        Opcode.LEA: "OP_LEA", Opcode.IMM: "OP_IMM", Opcode.JMP: "OP_JMP",
+        Opcode.JSR: "OP_JSR", Opcode.BZ: "OP_BZ", Opcode.BNZ: "OP_BNZ",
+        Opcode.ENT: "OP_ENT", Opcode.ADJ: "OP_ADJ", Opcode.LEV: "OP_LEV",
+        Opcode.LI: "OP_LI", Opcode.LC: "OP_LC", Opcode.SI: "OP_SI",
+        Opcode.SC: "OP_SC", Opcode.PSH: "OP_PSH",
+        Opcode.OR: "OP_OR", Opcode.XOR: "OP_XOR", Opcode.AND: "OP_AND",
+        Opcode.EQ: "OP_EQ", Opcode.NE: "OP_NE", Opcode.LT: "OP_LT",
+        Opcode.GT: "OP_GT", Opcode.LE: "OP_LE", Opcode.GE: "OP_GE",
+        Opcode.SHL: "OP_SHL", Opcode.SHR: "OP_SHR",
+        Opcode.ADD: "OP_ADD", Opcode.SUB: "OP_SUB", Opcode.MUL: "OP_MUL",
+        Opcode.DIV: "OP_DIV", Opcode.MOD: "OP_MOD",
+        Opcode.EXIT: "OP_EXIT", Opcode.NOP: "OP_NOP",
+        Opcode.PUTCHAR: "OP_PUTCHAR", Opcode.GETCHAR: "OP_GETCHAR",
+    }
 
     class _Proxy:
         # Inherit class methods and constants from _SetDim via __getattr__ fallback
         def __getattr__(self, name):
             return getattr(_SetDim, name)
+
+        def opcode_dim(self, op_value):
+            """Resolve op_value -> dim position via dim_positions (override).
+
+            Falls back to _SetDim.opcode_dim if the OP_<NAME> entry isn't in
+            dim_positions (e.g. opcodes that aren't declared by the compiler).
+            """
+            name = _OP_NAME.get(op_value)
+            if name is not None and name in dim_positions:
+                return dim_positions[name]
+            return _SetDim.opcode_dim(op_value)
 
     proxy = _Proxy()
     # Override with compiler-declared positions for declared dims

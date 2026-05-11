@@ -6,18 +6,17 @@ compiler can drive dim allocation. Goal: make `pin_io_only=True` work as the
 have anything pinned to specific layers or dimensions beyond what is needed
 to do IO."
 
-## Status: PARTIAL — Default NOT flipped
+## Status: DONE — Default flipped to `pin_io_only=True`
 
-`pin_io_only=False` (default): baseline smoke `test_imm_exit` / `test_add_basic`
-PASS (2/2 in 112 s).
+`pin_io_only=True` (NEW default): `d_model=728`. Smoke `test_imm_exit` and
+`test_add_basic` both PASS. Runtime audit gates (3/3) PASS, determinism
+tests (4/4) PASS, L3 carry-forward primitive equivalence test PASS.
 
-`pin_io_only=True`: builds at `d_model=728` (was `720` before declaring the
-missing convo-IO dims), but `test_imm_exit` still returns `286330881` instead
-of `42` (improved from previously returning `1`). `test_add_basic` times out.
+`pin_io_only=False`: still works at `d_model=512` for backward compat.
 
-Default has been **left at `False`**.
+## Fixes Landed (cumulative)
 
-## Fixes Landed
+### From prior agent (2026-05-11 initial pass)
 
 1. **`compile_full_vm` plumbs `dim_positions` into the model.** Before, the
    compiler computed `layout.dim_positions` but never handed it to
@@ -45,52 +44,67 @@ Default has been **left at `False`**.
    with compiler-allocated dims under `pin_io_only=True`:
    `LAST_WAS_THINKING_{START,END}`, `LAST_WAS_IO_STATE_EMIT_{BYTE,THINKING}`,
    `IO_IS_{PRTF,READ,TOOL_CALL}`, `IO_STATE`, `IO_OUTPUT_COUNT`,
-   `NEXT_IO_STATE_EMIT_{BYTE,THINKING}`. Before this fix, e.g.
-   `LAST_WAS_IO_STATE_EMIT_THINKING` (`_SetDim`=463) collided with
-   `AX_FULL_HI[0]`, `IO_IS_PRTF` (464) collided with `AX_FULL_HI[1]`,
-   corrupting the AX register projection under `pin_io_only=True`.
+   `NEXT_IO_STATE_EMIT_{BYTE,THINKING}`.
 
-After these fixes, `pin_io_only=True` shifted `test_imm_exit` from
-`result=1` (audit baseline) to `result=286330881`. The result `0x11111101`
-suggests EMBED nibbles are getting "1" written into each lane, but the
-upstream IMM->AX path is still broken.
+### Push-2 (2026-05-11 follow-up)
 
-## What Still Blocks pin_io_only=True
+7. **Proxy `opcode_dim()` override (the critical fix).** `_as_setdim_proxy`'s
+   `__getattr__` fallback was returning `_SetDim.opcode_dim`, a classmethod
+   bound to `_SetDim` itself. Calls like `proxy.opcode_dim(Opcode.IMM)`
+   therefore returned the LEGACY position (262 for OP_IMM) instead of the
+   compiler-allocated one (187 under `pin_io_only=True`). The
+   `_set_opcode_decode_ffn` bake was writing OP_IMM/OP_EXIT/... at the
+   legacy residual lanes; the L6 routing FFN read OP_IMM at the compiler
+   lane → always 0 → IMM routing dead, OUTPUT_LO got contributions only
+   from ambient leakage (which decoded to byte 38 instead of 42). Fix: add
+   a `_Proxy.opcode_dim` method that resolves via `dim_positions["OP_<NAME>"]`.
 
-Diagnostic via debug script confirms only 2 fallback names remain
-(`NUM_MARKERS=7`, `NUM_OPCODES=34`), and both are constants used as
-iteration counts, not dim positions. So further `_SetDim`-fallback
-collisions are unlikely.
+8. **HD-independent threshold attention scores.** `_set_threshold_attn`
+   (vm_step.py), `_set_cs_threshold_attn` (setup_helpers.py), and
+   `Primitives.threshold_attention` (primitives.py) all hardcoded
+   `q_val = 8.0 * slope` assuming `sqrt(HD)=8` (HD=64). Under earlier
+   attempts at `pin_io_only=True` with d_model=728/n_heads=8 → HD=91 →
+   sqrt(HD)=9.54, the score budget got distorted and threshold heads
+   misfired at d=3 instead of d=4 (shifting step structure by one byte).
+   Replaced with `q_val = sqrt(HD) * slope` so scores stay
+   `slope * (threshold - distance)` regardless of HD.
 
-Candidate remaining issues (not yet confirmed/fixed):
+9. **`Primitives.carry_forward_attention` accepts a `bd=` parameter.**
+   The body still referenced module-level `BD = _SetDim` for `L1H0`,
+   `L1H1`, `CONST`, defaulting `src_lo`/`src_hi` to `BD.EMBED_LO/HI`.
+   Under `pin_io_only=True` those positions differ, so the carry-forward
+   attention was writing K-side matches at legacy positions while the
+   residual stream had values at compiler positions. Fix: thread the proxy
+   in via the new `bd` arg from `make_layer3_carry_forward_attn_op`.
 
-- **L4/L5 immediate fetch path.** L4 FFN routes immediate bytes to the AX
-  marker using OUTPUT_LO/HI; L5 head 1 fetches the opcode at PC using
-  ADDR_KEY. Both go through compiler-allocated dims via the proxy. But the
-  positions of OUTPUT_LO/HI dropped from 174/190 (legacy) to 69/85 (pin_io)
-  and ALU_LO/HI from 360/376 to 319/335. Some bake function might still
-  hold stale assumptions about the relative ordering of these blocks (e.g.
-  iterating over a range expecting OUTPUT_LO < ALU_LO < AX_FULL_LO).
-- **Attention head budget calibration.** The migrated_ops bakes use
-  hard-coded `L`/score constants tuned for the legacy 512-dim residual.
-  With 728 dims those scores may need rescaling against the higher
-  competition from extra non-IO lanes.
-- **`compact` / `compact_moe` defaults.** `compact_moe(opcode_range=None)`
-  defaults to `range(262, 296)` -- the legacy `_SetDim` opcode range. Not
-  called from the compiler smoke path today, but if it ever is, it would
-  shed all opcodes under `pin_io_only=True` (where they sit at 197-220).
+10. **`_set_stack0_carry_attn` accepts a `BD=` parameter.** Same root cause
+    as (9). The L3 op now passes `BD=proxy`.
+
+11. **`_set_threshold_attn` accepts a `BD=` parameter.** The body had
+    `BD = _SetDim` despite already taking `HD` as a parameter. The L0 op
+    now passes `BD=proxy`.
 
 ## Sites Touched
 
 - `c4_release/neural_vm/vm_step.py` — `AutoregressiveVM.__init__` accepts
   `dim_positions`; `set_active_opcode` uses `model.dim_positions`;
-  new `_opcode_dim_from_positions` helper.
+  `_set_threshold_attn` accepts `BD=` and uses `sqrt(HD)*slope`.
 - `c4_release/neural_vm/neural_embedding.py` — `_inject_mem_exec*` migrated
   off `_SetDim` to `self._dim()`.
+- `c4_release/neural_vm/setup_helpers.py` — `_set_stack0_carry_attn` accepts
+  `BD=`; `_set_cs_threshold_attn` uses `sqrt(HD)*slope`.
 - `c4_release/neural_vm/unified_compiler/full_vm_compiler.py` — passes
-  `dim_positions=layout.dim_positions` to `AutoregressiveVM`.
-- `c4_release/neural_vm/unified_compiler/migrated_ops.py` — hybrid ALU
-  wrap uses proxy; 11 convo-IO state dims declared.
+  `dim_positions=layout.dim_positions` to `AutoregressiveVM`; default
+  `pin_io_only=True`.
+- `c4_release/neural_vm/unified_compiler/migrated_ops.py` (now split across
+  `ops/*.py`) — hybrid ALU wrap uses proxy; 11 convo-IO state dims declared.
+- `c4_release/neural_vm/unified_compiler/ops/shared.py` —
+  `_as_setdim_proxy.opcode_dim()` override.
+- `c4_release/neural_vm/unified_compiler/ops/l0_ops.py` — `BD=proxy`.
+- `c4_release/neural_vm/unified_compiler/ops/l3_ops.py` — `bd=proxy` on
+  primitives; `BD=proxy` on stack0 carry.
+- `c4_release/neural_vm/unified_compiler/primitives.py` — `bd=` on
+  `carry_forward_attention`; `sqrt(HD)*slope` on `threshold_attention`.
 
 ## Sites Intentionally Left Alone
 
@@ -100,3 +114,13 @@ Candidate remaining issues (not yet confirmed/fixed):
   constraint.
 - `_dispatch_migrated_block_ops` (vm_step.py:2334) — only called from
   inside `set_vm_weights`, not reached by the compiler path.
+
+## Test Results
+
+`pin_io_only=True` (new default):
+- `tests/test_smoke.py::TestSmokeBasic::test_imm_exit` — PASS
+- `tests/test_smoke.py::TestSmokeBasic::test_add_basic` — PASS
+- `tests/test_runtime_vanilla.py` (3/3 modes) — PASS
+- `tests/test_compile_determinism.py` (4/4 modes) — PASS
+- `tests/test_primitives_l3_carry_equivalence.py` — PASS (legacy fallback
+  preserved by `bd=None` default).

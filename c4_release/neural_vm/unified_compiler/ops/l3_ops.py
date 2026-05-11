@@ -84,11 +84,13 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         PC_I, AX_I, SP_I, BP_I = 0, 1, 2, 3
         cf = Primitives.carry_forward_attention
-        cf(attn, 0, proxy.MARK_PC, PC_I, PC_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD)
-        cf(attn, 1, proxy.MARK_AX, AX_I, AX_I, proxy.AX_CARRY_LO, proxy.AX_CARRY_HI, HD=HD)
-        cf(attn, 2, proxy.MARK_SP, SP_I, SP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD)
-        cf(attn, 3, proxy.MARK_BP, BP_I, BP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD)
-        _set_stack0_carry_attn(attn, 4, HD)
+        # Pass proxy as bd= so pin_io_only=True layouts resolve L1H0/L1H1/CONST
+        # to the compiler-allocated positions rather than legacy _SetDim ones.
+        cf(attn, 0, proxy.MARK_PC, PC_I, PC_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
+        cf(attn, 1, proxy.MARK_AX, AX_I, AX_I, proxy.AX_CARRY_LO, proxy.AX_CARRY_HI, HD=HD, bd=proxy)
+        cf(attn, 2, proxy.MARK_SP, SP_I, SP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
+        cf(attn, 3, proxy.MARK_BP, BP_I, BP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
+        _set_stack0_carry_attn(attn, 4, HD, BD=proxy)
         # Heads 5-6: AX_FULL relay + BP→PC for LEV. These reference _SetDim
         # directly inside _set_carry_forward_attn so the proxy fallback handles
         # them. For now we replicate the inline code from _set_layer3_attn block:
