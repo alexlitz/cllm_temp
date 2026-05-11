@@ -36,11 +36,13 @@ import torch
 
 from neural_vm.setup_helpers import (
     _set_convo_io_pc_sp_latch,
+    _set_convo_io_prtf_capture,
     _set_convo_io_step_resume,
 )
 from neural_vm.unified_compiler.ops.all_core_ops import all_core_ops
 from neural_vm.unified_compiler.ops.flag_gated_ops import (
     make_convo_io_pc_sp_latch_op,
+    make_convo_io_prtf_capture_op,
     make_convo_io_step_resume_op,
 )
 from neural_vm.vm_step import _SetDim as BD
@@ -96,6 +98,14 @@ class TestV18Phase1BakesRegistered:
         }
         assert "convo_io_step_resume" in names
         assert "convo_io_pc_sp_latch" in names
+        assert "convo_io_prtf_capture" in names
+
+    def test_prtf_capture_op_registered(self):
+        names = {op.name for op in all_core_ops()}
+        assert "convo_io_prtf_capture" in names, (
+            "convo_io_prtf_capture missing from all_core_ops(). See "
+            "V18_CONVO_IO_NEURAL_PLAN.md §3b (Phase 1b capture-side)."
+        )
 
 
 class TestV18Phase1BakesGatedOff:
@@ -138,6 +148,24 @@ class TestV18Phase1BakesGatedOff:
 
     def test_pc_sp_latch_noop_when_convo_io_false(self):
         op = make_convo_io_pc_sp_latch_op(
+            enable_conversational_io=False, enable=True
+        )
+        ffn = _StubFFN()
+        op.bake_fn(_Block(ffn), _dim_positions(), S)
+        assert torch.all(ffn.W_up == 0)
+        assert torch.all(ffn.W_down == 0)
+
+    def test_prtf_capture_noop_when_enable_false(self):
+        op = make_convo_io_prtf_capture_op(
+            enable_conversational_io=True, enable=False
+        )
+        ffn = _StubFFN()
+        op.bake_fn(_Block(ffn), _dim_positions(), S)
+        assert torch.all(ffn.W_up == 0)
+        assert torch.all(ffn.W_down == 0)
+
+    def test_prtf_capture_noop_when_convo_io_false(self):
+        op = make_convo_io_prtf_capture_op(
             enable_conversational_io=False, enable=True
         )
         ffn = _StubFFN()
@@ -265,6 +293,146 @@ class TestV18Phase1BakesEnabled:
         # Span check: each unit in the band is wired.
         for u in (1402, 1417, 1418, 1433, 1434, 1465):
             assert ffn.W_up[u, BD.LAST_WAS_THINKING_START] != 0
+
+    def test_prtf_capture_factory_bake_writes_band(self):
+        op = make_convo_io_prtf_capture_op(
+            enable_conversational_io=True, enable=True
+        )
+        ffn = _StubFFN()
+        op.bake_fn(_Block(ffn), _dim_positions(), S)
+        # Span check: each unit in the capture band fires on
+        # ACTIVE_OPCODE_PRTF + MARK_AX.
+        for u in (800, 815, 816, 831, 832, 847, 848, 863):
+            assert ffn.W_up[u, BD.ACTIVE_OPCODE_PRTF] != 0
+            assert ffn.W_up[u, BD.MARK_AX] != 0
+
+
+class TestV18Phase1bPRTFCaptureBake:
+    """Direct-call checks on ``_set_convo_io_prtf_capture`` (V18 §3b/3c).
+
+    Verifies the documented contract for the Phase 1b capture-side bake:
+      - Writes L7 FFN units 800-863 (64 units total: 16 each for
+        PC lo/hi nibbles + 16 each for SP lo/hi nibbles).
+      - Every unit gates on the conjunction of ``ACTIVE_OPCODE_PRTF`` AND
+        ``MARK_AX`` (the PRTF AX marker).
+      - PC-source nibble units (800-831) gate on ``EMBED_LO/HI``; SP-source
+        nibble units (832-863) gate on ``ADDR_B0_HI`` / ``ADDR_B1_HI``.
+      - Down-projections write to the dedicated cache dims:
+        POST_PRTF_PC_LO/HI (aliases AX_FULL_LO/HI) and POST_PRTF_SP_LO/HI
+        (aliases AX_CARRY_LO/HI).
+      - No spillover above unit 863 or below unit 800.
+    """
+
+    def test_writes_64_units_in_correct_range(self):
+        ffn = _StubFFN()
+        _set_convo_io_prtf_capture(ffn, S, BD)
+
+        for u in range(800, 864):
+            assert ffn.W_up[u, BD.ACTIVE_OPCODE_PRTF] != 0, (
+                f"unit {u} should fire on ACTIVE_OPCODE_PRTF"
+            )
+            assert ffn.W_up[u, BD.MARK_AX] != 0, (
+                f"unit {u} should fire on MARK_AX"
+            )
+
+    def test_no_spillover_outside_band(self):
+        ffn = _StubFFN()
+        _set_convo_io_prtf_capture(ffn, S, BD)
+
+        # Below 800 and above 863 should be untouched.
+        assert torch.all(ffn.W_up[799] == 0)
+        assert torch.all(ffn.W_up[864:870] == 0)
+
+    def test_pc_capture_sources_are_embed(self):
+        """Units 800-831 read PC nibbles from EMBED_LO/HI (set at the AX
+        marker by L4 head 0's PC relay)."""
+        ffn = _StubFFN()
+        _set_convo_io_prtf_capture(ffn, S, BD)
+
+        # PC lo nibbles: units 800-815 gate on EMBED_LO[k].
+        for k in range(16):
+            assert ffn.W_gate[800 + k, BD.EMBED_LO + k] != 0
+        # PC hi nibbles: units 816-831 gate on EMBED_HI[k].
+        for k in range(16):
+            assert ffn.W_gate[816 + k, BD.EMBED_HI + k] != 0
+
+    def test_sp_capture_sources_are_addr_key(self):
+        """Units 832-863 read SP byte-0 nibbles from the ADDR_KEY band
+        (set at the AX marker by L4 heads 2-3's SP-to-ADDR_KEY relay)."""
+        ffn = _StubFFN()
+        _set_convo_io_prtf_capture(ffn, S, BD)
+
+        # SP lo nibbles: units 832-847 gate on ADDR_B0_HI[k] (= ADDR_KEY lo).
+        for k in range(16):
+            assert ffn.W_gate[832 + k, BD.ADDR_B0_HI + k] != 0
+        # SP hi nibbles: units 848-863 gate on ADDR_B1_HI[k] (= ADDR_KEY hi).
+        for k in range(16):
+            assert ffn.W_gate[848 + k, BD.ADDR_B1_HI + k] != 0
+
+    def test_pc_capture_targets_are_post_prtf_pc(self):
+        """Down-projection of units 800-831 writes into POST_PRTF_PC_LO/HI
+        (the cache dims read by the 3b replay band)."""
+        ffn = _StubFFN()
+        _set_convo_io_prtf_capture(ffn, S, BD)
+
+        for k in range(16):
+            # PC lo nibble unit k writes POST_PRTF_PC_LO[k].
+            assert ffn.W_down[BD.POST_PRTF_PC_LO + k, 800 + k] > 0
+            # PC hi nibble unit k writes POST_PRTF_PC_HI[k].
+            assert ffn.W_down[BD.POST_PRTF_PC_HI + k, 816 + k] > 0
+
+    def test_sp_capture_targets_are_post_prtf_sp(self):
+        ffn = _StubFFN()
+        _set_convo_io_prtf_capture(ffn, S, BD)
+
+        for k in range(16):
+            assert ffn.W_down[BD.POST_PRTF_SP_LO + k, 832 + k] > 0
+            assert ffn.W_down[BD.POST_PRTF_SP_HI + k, 848 + k] > 0
+
+    def test_round_trip_writes_match_replay_reads(self):
+        """Capture (3c) + replay (3b) round trip: the W_down targets of
+        the capture band must be the W_gate sources of the replay band.
+
+        This is the load-bearing semantic invariant of Phase 1b: the
+        capture bake stages PC/SP nibbles into cache dims, and the replay
+        bake reads from those same cache dims to drive OUTPUT_LO/HI on
+        the resumed REG_PC / REG_SP value bytes.
+        """
+        capture_ffn = _StubFFN()
+        replay_ffn = _StubFFN()
+        _set_convo_io_prtf_capture(capture_ffn, S, BD)
+        _set_convo_io_pc_sp_latch(replay_ffn, S, BD)
+
+        # Replay PC lo units 1402-1417 gate on POST_PRTF_PC_LO[k].
+        # Capture PC lo units 800-815 write POST_PRTF_PC_LO[k].
+        for k in range(16):
+            assert replay_ffn.W_gate[1402 + k, BD.POST_PRTF_PC_LO + k] != 0
+            assert capture_ffn.W_down[BD.POST_PRTF_PC_LO + k, 800 + k] > 0
+        # Replay PC hi units 1418-1433 gate on POST_PRTF_PC_HI[k].
+        # Capture PC hi units 816-831 write POST_PRTF_PC_HI[k].
+        for k in range(16):
+            assert replay_ffn.W_gate[1418 + k, BD.POST_PRTF_PC_HI + k] != 0
+            assert capture_ffn.W_down[BD.POST_PRTF_PC_HI + k, 816 + k] > 0
+        # Replay SP lo units 1434-1449 gate on POST_PRTF_SP_LO[k].
+        for k in range(16):
+            assert replay_ffn.W_gate[1434 + k, BD.POST_PRTF_SP_LO + k] != 0
+            assert capture_ffn.W_down[BD.POST_PRTF_SP_LO + k, 832 + k] > 0
+        # Replay SP hi units 1450-1465 gate on POST_PRTF_SP_HI[k].
+        for k in range(16):
+            assert replay_ffn.W_gate[1450 + k, BD.POST_PRTF_SP_HI + k] != 0
+            assert capture_ffn.W_down[BD.POST_PRTF_SP_HI + k, 848 + k] > 0
+
+    def test_does_not_overlap_layer7_main_bake_range(self):
+        """Capture units 800-863 do not overlap with the typical L7 FFN
+        main bake range (units below ~100)."""
+        ffn = _StubFFN()
+        _set_convo_io_prtf_capture(ffn, S, BD)
+
+        # Below the capture band is untouched.
+        for u in range(0, 800):
+            assert torch.all(ffn.W_up[u] == 0), (
+                f"unit {u} below capture band should be untouched"
+            )
 
 
 # ----- helpers ---------------------------------------------------------------
