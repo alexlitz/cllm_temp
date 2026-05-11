@@ -356,6 +356,104 @@ def make_null_terminator_detection_op(
     )
 
 
+def make_convo_io_step_resume_op(
+    enable_conversational_io: bool = False,
+    enable: bool = False,
+) -> Operation:
+    """L3 FFN: V18 Phase 1 step-resumption bake (3a in the V18 plan).
+
+    Wires the L3 FFN unit 1035 that fires on ``LAST_WAS_THINKING_START``:
+    sets ``NEXT_PC = 1`` (so the head emits ``Token.REG_PC`` for the next
+    token, starting a fresh VM step) and clears ``IO_STATE`` /
+    ``IO_IN_OUTPUT_MODE``. Closes the "missing transition" in
+    ``_set_conversational_io_state_machine``'s state-machine docstring
+    (V18_CONVO_IO_NEURAL_PLAN.md §3a).
+
+    Double-gated: both ``enable_conversational_io`` AND ``enable`` must be
+    True for the bake to fire. The two-gate design lets this op stay
+    registered in ``all_core_ops()`` (so the dep graph is stable) and
+    safely defaults to a no-op for the Phase 1 landing. Flip ``enable=True``
+    once the parity test in
+    ``tests/test_v18_convo_io_neural_bakes.py`` passes end-to-end.
+
+    Pinned to ``layer_idx=3`` via ``kind="block"`` so the bake hits
+    ``model.blocks[3].ffn`` (matching the legacy direct-FFN access for
+    convo-IO state init). Phase 3.2 places this AFTER
+    ``layer3_convo_io_state_init`` (phase 3.1) — that op writes unit 1034,
+    this one writes unit 1035, so the explicit phase ordering guarantees
+    no collision regardless of dispatch order tweaks.
+    """
+    def bake(block, dim_positions, S):
+        if not (enable_conversational_io and enable):
+            return
+        from ...vm_step import _set_convo_io_step_resume
+        _set_convo_io_step_resume(
+            block.ffn, S, _as_setdim_proxy(dim_positions)
+        )
+
+    return Operation(
+        name="convo_io_step_resume",
+        phase=3.2,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        layer_idx=3,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
+def make_convo_io_pc_sp_latch_op(
+    enable_conversational_io: bool = False,
+    enable: bool = False,
+) -> Operation:
+    """L6 FFN: V18 Phase 1 PC/SP latch replay band (3b in the V18 plan).
+
+    Wires L6 FFN units 1402-1465 (64 units total) that, on the
+    LAST_WAS_THINKING_START edge, drive ``OUTPUT_LO/HI`` from the
+    staged PC and SP nibbles (so the resumed step's REG_PC / REG_SP
+    value bytes carry the post-PRTF advanced PC and popped SP rather
+    than relying on the runner's ``_inject_synthetic_step`` to supply
+    them).
+
+    Unit allocation is non-overlapping with existing baked ranges:
+      - 1400-1401: existing ``_set_conversational_io_state_machine``
+      - 1402-1465: this op
+      - 1500-1532: V9 PUTCHAR routing (PHASE_6_PUTCHAR_BAKE_SPEC.md)
+      - 1700-2158: function_call_weights
+      - 2200+:     binary_pop_sp_increment
+
+    Double-gated: both ``enable_conversational_io`` AND ``enable`` must be
+    True for the bake to fire. Defaults to a no-op for the Phase 1 landing
+    — flip ``enable=True`` once the companion *capture*-side attention
+    bake (Phase 1b) lands and the parity test passes end-to-end.
+
+    Pinned to ``layer_idx=6`` via ``kind="block"`` so the bake hits
+    ``model.blocks[6].ffn``. Phase 6.7 places this AFTER
+    ``convo_io_state_machine`` (phase 6.6) so the state-machine units
+    (1400-1401) are in place before this op writes units 1402+. Both
+    run BEFORE ``right_size_ffns`` (phase 1200) so all units survive.
+    """
+    def bake(block, dim_positions, S):
+        if not (enable_conversational_io and enable):
+            return
+        from ...vm_step import _set_convo_io_pc_sp_latch
+        _set_convo_io_pc_sp_latch(
+            block.ffn, S, _as_setdim_proxy(dim_positions)
+        )
+
+    return Operation(
+        name="convo_io_pc_sp_latch",
+        phase=6.7,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        layer_idx=6,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
 def make_conversational_io_output_routing_op(
     enable_conversational_io: bool = False,
 ) -> Operation:

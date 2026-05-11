@@ -255,6 +255,20 @@ def all_core_ops(
         make_convo_io_state_machine_op(
             enable_conversational_io=enable_conversational_io
         ),
+        # V18 Phase 1 bakes (step resumption + PC/SP latch). Both are
+        # double-gated: ``enable_conversational_io`` AND ``enable`` must
+        # be True. ``enable=False`` by default — flip once the parity
+        # test in tests/test_v18_convo_io_neural_bakes.py passes
+        # end-to-end and Phase 1b (the latch *capture* side at the PRTF
+        # AX marker) is in place. See V18_CONVO_IO_NEURAL_PLAN.md §3.
+        make_convo_io_step_resume_op(
+            enable_conversational_io=enable_conversational_io,
+            enable=False,
+        ),
+        make_convo_io_pc_sp_latch_op(
+            enable_conversational_io=enable_conversational_io,
+            enable=False,
+        ),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
