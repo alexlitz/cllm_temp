@@ -309,7 +309,11 @@ def make_l10_post_ops_combined() -> Operation:
         offset = _bake_post_op_into(ffn, CarryPropagationPostOp(d_model, S, byte_idx=1, cascade=True), offset)
         offset = _bake_post_op_into(ffn, CarryPropagationPostOp(d_model, S, byte_idx=2, cascade=True), offset)
         offset = _bake_post_op_into(ffn, BitwiseBytePropagationPostOp(d_model, S), offset)
-        offset = _bake_post_op_into(ffn, ComparisonCombine(d_model, S), offset)
+        # Thread dim_positions so OP_*/CMP/OUTPUT writes land on compact
+        # residual lanes (mirrors A1's BinaryOpByteZeroingPostOp; commit 5fc519d).
+        offset = _bake_post_op_into(
+            ffn, ComparisonCombine(d_model, S, dim_positions=dim_positions), offset
+        )
 
     # phase=10.5 so it lands AFTER layer10_alu (phase=10) but BEFORE later layers
     # which depend on its OUTPUT_LO/HI updates. Note: float phases work because
@@ -412,7 +416,11 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             # Linear input dim matches the residual stream width. Without
             # this, ComparisonCombine builds a Linear(512, 18) which fails
             # forward when d_model != 512 (e.g., pin_io_only=True paths).
-            block.post_ops.append(ComparisonCombine(d_model=d_model, S=S))
+            # Thread dim_positions so the bake resolves OP_*/CMP/OUTPUT via
+            # the compact layout (mirrors BinaryOpByteZeroingPostOp).
+            block.post_ops.append(
+                ComparisonCombine(d_model=d_model, S=S, dim_positions=dim_positions)
+            )
         # DIV/MOD post_op (FlattenedDivMod) appended by
         # ``make_l10_alu_divmod_install_op`` (phase=10.8). Both modes use the
         # same flattened composite — its forward is byte-identical to the

@@ -474,18 +474,27 @@ class ComparisonCombine(PureFFN):
     and is treated structurally like every other FFN by tooling.
     """
 
-    def __init__(self, d_model=512, S=100.0):
-        # PureFFN.__init__ calls _bake_weights(); store config first so _bake_weights
-        # can read it. We use object.__setattr__ to bypass nn.Module.__setattr__ since
-        # nn.Module isn't initialized yet at this point.
+    def __init__(self, d_model=512, S=100.0, dim_positions=None):
+        # PureFFN.__init__ calls _bake_weights(); stash config first so it can
+        # read pending_* via object.__setattr__ (nn.Module not yet initialized).
+        # Threading dim_positions matches the A1 pattern (commit 5fc519d): bake
+        # against the compact layout when pin_io_only=True so OP_*/CMP/OUTPUT
+        # writes land on the compiler-allocated residual lanes, not the legacy
+        # _SetDim positions which alias unrelated dims under that layout.
         object.__setattr__(self, '_pending_S', S)
+        object.__setattr__(self, '_pending_dim_positions', dim_positions)
         super().__init__(dim=d_model, hidden_dim=18)
         self.d_model = d_model
         self.S = S
 
     def _bake_weights(self):
         S = self._pending_S
-        BD = _SetDim
+        dim_positions = getattr(self, '_pending_dim_positions', None)
+        if dim_positions is not None:
+            from .unified_compiler.ops.shared import _as_setdim_proxy
+            BD = _as_setdim_proxy(dim_positions)
+        else:
+            BD = _SetDim
         unit = 0
 
         # FIX 2026-05-09: All ComparisonCombine units add a strong MARK_PC blocker.
