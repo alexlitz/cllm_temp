@@ -4113,9 +4113,13 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     unit += 1
 
     # === BZ PC override: branch if AX == 0 ===
-    # CMP[2]=OP_BZ (normalized ≈1), CMP[4]=AX_LO_IS_ZERO, CMP[5]=AX_HI_IS_ZERO
-    # 4-way AND in silu: MARK_PC + CMP[2] + CMP[4] + CMP[5] - 3.5
-    # All conditions in silu, gate is ONLY the value multiplier.
+    # FIX 2026-05-11: Use OP_BZ directly (scaled S/5 so OP_BZ=5 → contrib=S)
+    # instead of CMP[2] (which was always ~0 because the BZ/BNZ relay couldn't
+    # source OP_BZ from a position that had it set). OP_BZ is local at PC
+    # marker via L5 decode, so a direct read works without an extra relay.
+    # CMP[4]=AX_LO_IS_ZERO, CMP[5]=AX_HI_IS_ZERO (set by L6 head 4 relay from
+    # step (N-1)'s AX byte 0).
+    # 4-way AND in silu: MARK_PC + OP_BZ_scaled + CMP[4] + CMP[5] - 3.5
     # BZ+zero: 1+1+1+1=4 > 3.5 → fires. One missing: 3 < 3.5 → off.
     #
     # FIX 2026-04-16: Add IS_BYTE suppression. CMP[5] is reused for PRTF flag
@@ -4128,7 +4132,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # Cancel existing PC+5 carry
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 2] = S
+        ffn.W_up[unit, BD.OP_BZ] = S / 5.0  # OP_BZ=5 → contrib=S (≈ CMP[2]=1 scaled)
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.CMP + 5] = S
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
@@ -4138,7 +4142,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 2] = S
+        ffn.W_up[unit, BD.OP_BZ] = S / 5.0
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.CMP + 5] = S
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10  # Block at byte positions
@@ -4152,7 +4156,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # FIX 2026-04-16: Add MARK_STACK0 suppression.
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 2] = S
+        ffn.W_up[unit, BD.OP_BZ] = S / 5.0
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.CMP + 5] = S
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10
@@ -4163,7 +4167,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 2] = S
+        ffn.W_up[unit, BD.OP_BZ] = S / 5.0
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.CMP + 5] = S
         ffn.W_up[unit, BD.IS_BYTE] = -S * 10
@@ -4174,11 +4178,14 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
 
     # === BNZ PC override: branch if AX != 0 ===
+    # FIX 2026-05-11: Replaced CMP[3] (always 0 - relay couldn't source OP_BNZ)
+    # with OP_BNZ/5 (local at PC marker via L5 decode). Same fix pattern as
+    # BZ override above.
     # Two exclusive groups. All conditions in silu, gate ONLY for value.
-    # CMP[3]=OP_BNZ (normalized ≈1), CMP[4]=lo_zero, CMP[5]=hi_zero.
+    # OP_BNZ_scaled = S*(OP_BNZ/5) ≈ S, CMP[4]=lo_zero, CMP[5]=hi_zero.
     #
     # Group A: lo nibble is nonzero
-    #   up = S*(MARK_PC + CMP[3] - CMP[4]) - S*1.5
+    #   up = S*(MARK_PC + OP_BNZ/5 - CMP[4]) - S*1.5
     #   BNZ + lo_nonzero: 1+1-0=2 > 1.5 → fires
     #   BNZ + lo_zero: 1+1-1=1 < 1.5 → off
     #   gate = just the value (cancel or write)
@@ -4186,7 +4193,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # Cancel existing OUTPUT
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 3] = S
+        ffn.W_up[unit, BD.OP_BNZ] = S / 5.0  # OP_BNZ=5 in pure_neural (only 1 OPCODE_BYTE_LO match via head 5, no leak)
         ffn.W_up[unit, BD.CMP + 4] = -S
         ffn.b_up[unit] = -S * T_bnz
         ffn.W_gate[unit, BD.OUTPUT_LO + k] = -1.0
@@ -4194,7 +4201,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 3] = S
+        ffn.W_up[unit, BD.OP_BNZ] = S / 5.0  # OP_BNZ=5 in pure_neural (only 1 OPCODE_BYTE_LO match via head 5, no leak)
         ffn.W_up[unit, BD.CMP + 4] = -S
         ffn.b_up[unit] = -S * T_bnz
         ffn.W_gate[unit, BD.OUTPUT_HI + k] = -1.0
@@ -4203,7 +4210,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # Write target directly to OUTPUT (FIX 2026-04-29: removed -5 remap)
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 3] = S
+        ffn.W_up[unit, BD.OP_BNZ] = S / 5.0  # OP_BNZ=5 in pure_neural (only 1 OPCODE_BYTE_LO match via head 5, no leak)
         ffn.W_up[unit, BD.CMP + 4] = -S
         ffn.b_up[unit] = -S * T_bnz
         ffn.W_gate[unit, BD.FETCH_LO + k] = 1.0
@@ -4211,7 +4218,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 3] = S
+        ffn.W_up[unit, BD.OP_BNZ] = S / 5.0  # OP_BNZ=5 in pure_neural (only 1 OPCODE_BYTE_LO match via head 5, no leak)
         ffn.W_up[unit, BD.CMP + 4] = -S
         ffn.b_up[unit] = -S * T_bnz
         ffn.W_gate[unit, BD.FETCH_HI + k] = 1.0
@@ -4219,7 +4226,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
 
     # Group B: lo IS zero but hi is nonzero
-    #   up = S*(MARK_PC + CMP[3] + CMP[4] - CMP[5]) - S*2.5
+    #   up = S*(MARK_PC + OP_BNZ/5 + CMP[4] - CMP[5]) - S*2.5
     #   BNZ + lo_zero + hi_nonzero: 1+1+1-0=3 > 2.5 → fires
     #   BNZ + lo_zero + hi_zero (AX=0): 1+1+1-1=2 < 2.5 → off
     #   gate = just the value
@@ -4227,7 +4234,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # Cancel existing OUTPUT
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 3] = S
+        ffn.W_up[unit, BD.OP_BNZ] = S / 5.0  # OP_BNZ=5 in pure_neural (only 1 OPCODE_BYTE_LO match via head 5, no leak)
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.CMP + 5] = -S
         ffn.b_up[unit] = -S * T_bnz_b
@@ -4236,7 +4243,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 3] = S
+        ffn.W_up[unit, BD.OP_BNZ] = S / 5.0  # OP_BNZ=5 in pure_neural (only 1 OPCODE_BYTE_LO match via head 5, no leak)
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.CMP + 5] = -S
         ffn.b_up[unit] = -S * T_bnz_b
@@ -4246,7 +4253,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # Write target directly to OUTPUT (FIX 2026-04-29: removed -5 remap)
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 3] = S
+        ffn.W_up[unit, BD.OP_BNZ] = S / 5.0  # OP_BNZ=5 in pure_neural (only 1 OPCODE_BYTE_LO match via head 5, no leak)
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.CMP + 5] = -S
         ffn.b_up[unit] = -S * T_bnz_b
@@ -4255,7 +4262,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         unit += 1
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
-        ffn.W_up[unit, BD.CMP + 3] = S
+        ffn.W_up[unit, BD.OP_BNZ] = S / 5.0  # OP_BNZ=5 in pure_neural (only 1 OPCODE_BYTE_LO match via head 5, no leak)
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.CMP + 5] = -S
         ffn.b_up[unit] = -S * T_bnz_b
@@ -4634,7 +4641,17 @@ def _set_layer8_alu(ffn, S, BD):
         for b in range(16):
             result = (a + b) % 16
             ffn.W_up[unit, BD.MARK_AX] = S
-            ffn.W_up[unit, BD.MARK_PC] = -S * 2
+            # FIX 2026-05-11: Bumped MARK_PC blocker from -S*2 to -S*4. At step
+            # 1+ PC marker, the L6 head 0 JMP relay writes AX_CARRY_LO (the
+            # carried JMP target) to ~3.0 even when OP_JMP=0 (residual leakage
+            # from FETCH at the relayed AX marker). Combined with ALU_LO
+            # leakage from L7 attention (~2.0 at PC marker), the original
+            # -S*2 blocker is overcome: up = -200 + 100*2 + 100*3 - 250 = 52,
+            # silu(52)*OP_ADD(spurious 1.0 from L5 head 6 leak) = 52 →
+            # contrib +1 to OUTPUT_LO[0], which overrides the L3 PC+8
+            # increment for BZ not_taken (causing wrong PC). Stronger -S*4
+            # blocker: up = -400 + 500 - 250 = -150 → silu≈0.
+            ffn.W_up[unit, BD.MARK_PC] = -S * 4
             ffn.W_up[unit, BD.ALU_LO + a] = S
             ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
             ffn.b_up[unit] = -S * 2.5  # 3-way AND
@@ -4667,7 +4684,9 @@ def _set_layer8_alu(ffn, S, BD):
         for b in range(16):
             result = (a - b) % 16  # ALU - AX_CARRY = stack - AX
             ffn.W_up[unit, BD.MARK_AX] = S
-            ffn.W_up[unit, BD.MARK_PC] = -S * 2
+            # FIX 2026-05-11: Bumped MARK_PC blocker from -S*2 to -S*4 (see
+            # ADD lo nibble unit above for full rationale on L6 JMP relay leak).
+            ffn.W_up[unit, BD.MARK_PC] = -S * 4
             ffn.W_up[unit, BD.ALU_LO + a] = S
             ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
             ffn.b_up[unit] = -S * 2.5
@@ -4680,7 +4699,8 @@ def _set_layer8_alu(ffn, S, BD):
         for b in range(16):
             if a + b >= 16:
                 ffn.W_up[unit, BD.MARK_AX] = S
-                ffn.W_up[unit, BD.MARK_PC] = -S * 2
+                # FIX 2026-05-11: Bumped MARK_PC blocker from -S*2 to -S*4.
+                ffn.W_up[unit, BD.MARK_PC] = -S * 4
                 ffn.W_up[unit, BD.ALU_LO + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
                 ffn.b_up[unit] = -S * 2.5
@@ -4737,7 +4757,8 @@ def _set_layer8_alu(ffn, S, BD):
         for b in range(16):
             if a < b:  # Borrow when stack_top < AX
                 ffn.W_up[unit, BD.MARK_AX] = S
-                ffn.W_up[unit, BD.MARK_PC] = -S * 2
+                # FIX 2026-05-11: Bumped MARK_PC blocker from -S*2 to -S*4.
+                ffn.W_up[unit, BD.MARK_PC] = -S * 4
                 ffn.W_up[unit, BD.ALU_LO + a] = S
                 ffn.W_up[unit, BD.AX_CARRY_LO + b] = S
                 ffn.b_up[unit] = -S * 2.5
