@@ -23,6 +23,18 @@ from neural_vm.embedding import Opcode
 class TestSmokeBasic:
     """Quick sanity checks - should all pass in <5 seconds."""
 
+    def test_runtime_vanilla_audit(self):
+        """Runtime audit gate: model.blocks must not contain any non-allowlisted
+        non-vanilla modules. Guards against future code adding new ALU/wrapper
+        modules without explicit opt-in. See tests/test_runtime_vanilla.py for
+        the allowlist baseline and TODOs.
+        """
+        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        from tests.test_runtime_vanilla import _assert_audit_clean_or_allowlisted
+
+        model, _ = compile_full_vm()
+        _assert_audit_clean_or_allowlisted(model, mode_label="smoke/default")
+
     def test_imm_exit(self, quick_runner, make_bytecode):
         """IMM + EXIT works."""
         bytecode = make_bytecode([(Opcode.IMM, 42), Opcode.EXIT])
