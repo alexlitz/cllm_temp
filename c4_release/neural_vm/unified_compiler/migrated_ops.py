@@ -3492,6 +3492,100 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
     )
 
 
+def make_layer2_lookback_detection_head_op(
+    enable_conversational_io: bool = False,
+) -> Operation:
+    """L2 attention head 1: detect previous token type for conversational I/O.
+
+    Originally an inline call in ``set_vm_weights`` (gated by
+    ``enable_conversational_io``):
+        attn2.alibi_slopes[1] = 10.0
+        _set_lookback_detection_head(attn2, S, BD, HD)
+
+    Migrated as ``kind="block"`` pinned to ``layer_idx=2`` with
+    ``migrated=True``. Phase=2.1 so this runs AFTER
+    ``make_layer2_threshold_attn_op`` (phase=2), which fills all alibi
+    slopes to 10.0 — the explicit ``[1] = 10.0`` is therefore a no-op
+    today but preserved verbatim for parity with the legacy inline
+    setup.
+
+    The bake is unconditional in shape (always registered to keep the
+    dep-graph stable), but the body is a no-op when
+    ``enable_conversational_io`` is False so no weights are touched
+    outside of conversational-I/O mode.
+    """
+    def bake(block, dim_positions, S):
+        if not enable_conversational_io:
+            return
+        attn = block.attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[1] = 10.0  # Steep slope to favor most recent token
+        proxy = _as_setdim_proxy(dim_positions)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        from ..vm_step import _set_lookback_detection_head
+        _set_lookback_detection_head(attn, S, proxy, HD)
+
+    return Operation(
+        name="layer2_lookback_detection_head",
+        phase=2.1,
+        # Reads: CONST (Q/K gate), MARK_THINKING_START/END + IS_BYTE (V copy).
+        # Writes go to LAST_WAS_THINKING_START/END/BYTE which are not
+        # declared in declare_setdim_compat_dims (conversational-I/O-only
+        # dims); the bake resolves them via the _SetDim fallback in
+        # _as_setdim_proxy, so no compiler-tracked write edge is needed.
+        reads={"CONST", "MARK_THINKING_START", "MARK_THINKING_END", "IS_BYTE"},
+        writes=set(),
+        kind="block",
+        layer_idx=2,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
+def make_layer3_convo_io_state_init_op(
+    enable_conversational_io: bool = False,
+) -> Operation:
+    """L3 FFN addition: initialize output mode when LAST_WAS_THINKING_END.
+
+    Originally an inline call in ``set_vm_weights`` (gated by
+    ``enable_conversational_io``):
+        _set_conversational_io_state_init(ffn3, S, BD)
+
+    Migrated as ``kind="block"`` pinned to ``layer_idx=3`` with
+    ``migrated=True``. Phase=3.1 so this runs AFTER
+    ``make_layer3_ffn_op`` (phase=3) and writes into a distinct FFN
+    unit range (starts at unit 1034, above the L3 / L6-routing unit
+    counters), so the writes layer cleanly on top.
+
+    The bake is unconditional in shape (always registered to keep the
+    dep-graph stable), but the body is a no-op when
+    ``enable_conversational_io`` is False so no FFN units are touched
+    outside of conversational-I/O mode.
+    """
+    def bake(block, dim_positions, S):
+        if not enable_conversational_io:
+            return
+        proxy = _as_setdim_proxy(dim_positions)
+        from ..vm_step import _set_conversational_io_state_init
+        _set_conversational_io_state_init(block.ffn, S, proxy)
+
+    return Operation(
+        name="layer3_convo_io_state_init",
+        phase=3.1,
+        # Reads/writes use LAST_WAS_THINKING_END and IO_IN_OUTPUT_MODE,
+        # which are not declared in declare_setdim_compat_dims
+        # (conversational-I/O-only dims); the bake resolves them via the
+        # _SetDim fallback in _as_setdim_proxy, so no compiler-tracked
+        # edges are needed.
+        reads=set(),
+        writes=set(),
+        kind="block",
+        layer_idx=3,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
 def all_core_ops(
     alu_mode: str = "lookup",
     *,
@@ -3499,22 +3593,30 @@ def all_core_ops(
 ) -> list:
     """Return the full list of migrated core-VM operations.
 
-    Doesn't include I/O or tool-call operations (those need their own
-    migration pass).
+    Doesn't include I/O or tool-call-handler operations (those need their own
+    migration pass). Flag-gated ops are always registered to keep the dep
+    graph stable; their bake bodies are no-ops when the flag is False.
 
     ``alu_mode`` is forwarded to ops whose bake action depends on whether the
     legacy lookup ALU or the efficient neural ALU owns a given operation
     (currently: SHL/SHR via ``make_layer13_shifts_op``).
 
     ``enable_conversational_io`` is forwarded to flag-gated convo-io ops
-    (``make_format_pointer_extraction_op``, ``make_format_position_counter_op``,
-    ``make_format_string_fetch_head_op``). These ops are always registered;
-    their bake_fn is a no-op when the flag is False.
+    (L2 lookback detection head, L3 convo-I/O state init,
+    ``make_format_pointer_extraction_op``, ``make_format_position_counter_op``,
+    ``make_format_string_fetch_head_op``). All are always registered; their
+    bake_fn is a no-op when the flag is False.
     """
     return [
         make_layer0_threshold_attn_op(),
         make_layer1_threshold_attn_op(),
         make_layer2_threshold_attn_op(),
+        # Conversational-I/O L2 lookback head: phase=2.1 so it bakes after
+        # the L2 threshold attention (phase=2). Body is a no-op unless
+        # ``enable_conversational_io`` is True.
+        make_layer2_lookback_detection_head_op(
+            enable_conversational_io=enable_conversational_io,
+        ),
         make_layer3_carry_forward_attn_op(),
         make_phase_a_ffn_op(),
         make_layer1_ffn_op(),
@@ -3528,6 +3630,13 @@ def all_core_ops(
         make_nibble_copy_ffn_op(),
         make_layer3_ffn_op(),
         make_layer3_ffn_dep_anchor_op(),
+        # Conversational-I/O L3 state init: phase=3.1 so it bakes after
+        # the L3 FFN (phase=3) and writes into FFN units above the L3 /
+        # L6-routing unit ranges. Body is a no-op unless
+        # ``enable_conversational_io`` is True.
+        make_layer3_convo_io_state_init_op(
+            enable_conversational_io=enable_conversational_io,
+        ),
         make_layer4_pc_relay_op(),
         make_layer4_ffn_op(),
         make_layer5_fetch_op(),

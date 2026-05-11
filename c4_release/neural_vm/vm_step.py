@@ -1843,12 +1843,11 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # Migrated: L2 threshold attention (head 0) and MEM byte-flags FFN are now
     # baked via the compiler dispatch (see make_layer2_threshold_attn_op,
     # make_layer2_mem_byte_flags_op in unified_compiler/migrated_ops.py).
-    # Conversational I/O lookback head remains here (gated, not migrated).
-    if enable_conversational_io:
-        attn2 = model.blocks[2].attn
-        if hasattr(attn2, 'alibi_slopes') and attn2.alibi_slopes is not None:
-            attn2.alibi_slopes[1] = 10.0  # Steep slope to favor most recent token
-        _set_lookback_detection_head(attn2, S, BD, HD)
+    # MIGRATED 2026-05-10: conversational-I/O lookback detection head
+    # (``_set_lookback_detection_head`` + ``alibi_slopes[1] = 10.0``) is now
+    # baked by ``make_layer2_lookback_detection_head_op`` (kind="block",
+    # layer_idx=2, phase=2.1, migrated=True) in migrated_ops.py. The bake
+    # body is a no-op when ``enable_conversational_io`` is False.
 
     # ===== LAYER 3: Register carry-forward (PC, AX, SP, BP) + PC update =====
     # MIGRATED (attn): heads 0-6 (PC/AX/SP/BP/STACK0 carries + AX_FULL relay
@@ -1859,12 +1858,13 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # `_layer3_ffn_dep_anchor` companion (kind="ffn") to preserve the
     # dep-graph layer count. Runs before legacy_bake via
     # build_model_from_layout's block-op dispatch.
-    ffn3 = model.blocks[3].ffn  # Layer 3 (L3) = blocks[3]
-    # _set_layer3_ffn(ffn3, S, BD)  # migrated to make_layer3_ffn_op
-
-    # Conversational I/O: State initialization when entering output mode
-    if enable_conversational_io:
-        _set_conversational_io_state_init(ffn3, S, BD)
+    # L3 FFN (``_set_layer3_ffn``) migrated to ``make_layer3_ffn_op``
+    # (kind="block", layer_idx=3, migrated=True).
+    # MIGRATED 2026-05-10: conversational-I/O state initialization
+    # (``_set_conversational_io_state_init``) is now baked by
+    # ``make_layer3_convo_io_state_init_op`` (kind="block", layer_idx=3,
+    # phase=3.1, migrated=True) in migrated_ops.py. The bake body is a
+    # no-op when ``enable_conversational_io`` is False.
 
     # ===== LAYER 4: PC value relay to AX marker =====
     # AX marker reads the current step's PC byte 0 EMBED_LO value.

@@ -96,7 +96,9 @@ def compile_full_vm(
     # Per-layer ops drive the layout (d_model, n_layers, dim_positions).
     # Forward alu_mode so SHL/SHR (and any future alu_mode-aware migrated op)
     # can branch between the legacy lookup-table bake and the efficient
-    # neural-ALU bake.
+    # neural-ALU bake. Forward enable_conversational_io / enable_tool_calling
+    # to flag-gated ops (registered unconditionally to keep the dep graph
+    # stable) so they fire their bakes when the corresponding flag is on.
     for op in all_core_ops(
         alu_mode=alu_mode,
         enable_conversational_io=enable_conversational_io,
