@@ -172,12 +172,11 @@ class NeuralVMEmbedding(nn.Module):
         prefix_slice = token_ids[0, :cache_len].detach().to(cached.device)
         return torch.equal(prefix_slice, cached)
 
-    def forward(self, token_ids, active_opcode=None):
+    def forward(self, token_ids):
         """Apply embedding + augmentations.
 
         Args:
             token_ids: [batch, seq] tensor of token IDs
-            active_opcode: Current active opcode (0-255) or None
 
         Returns:
             x: [batch, seq, d_model] embeddings with augmentations applied
@@ -226,19 +225,8 @@ class NeuralVMEmbedding(nn.Module):
         self._inject_mem_metadata(token_ids, x, start_pos=start_pos)
 
         # --- Populate prefix cache on first call within a run -------------
-        # Populate the cache BEFORE applying ``_inject_active_opcode`` so that
-        # opcode-dependent writes are NOT baked into the cached delta. The
-        # active opcode may change between forward calls, and its writes are
-        # absolute ``x[:, :, dim] = 5.0`` rather than additive — caching them
-        # in the delta would leave stale opcode dims set on opcode changes.
         if not cache_hit:
             self._populate_prefix_cache(token_ids, x)
-
-        # Inject active opcode flags for conversational I/O detection.
-        # This writes globally across all positions; not cached because the
-        # opcode value can change between forward calls within a single run.
-        if active_opcode is not None:
-            self._inject_active_opcode(token_ids, x, active_opcode)
 
         return x
 
@@ -451,30 +439,6 @@ class NeuralVMEmbedding(nn.Module):
             end: Position marking end of historical memory region
         """
         self._mem_history_end = end
-
-    def _inject_active_opcode(self, token_ids, x, active_opcode):
-        """Inject active opcode flags into step output positions only.
-
-        For conversational I/O: exposes the MoE routing signal globally so
-        L5 FFN can detect PRTF/READ opcodes reliably.
-
-        For LEV: sets OP_LEV at all positions so L15 heads 8-11 can do
-        return_addr lookup at PC marker (which comes before AX marker).
-
-        Args:
-            x: [batch, seq, d_model] embedding tensor (modified in-place)
-            active_opcode: Current opcode value (0-255)
-        """
-        _OPCODE_INJECTION_MAP = {
-            33: "ACTIVE_OPCODE_PRTF",
-            31: "ACTIVE_OPCODE_READ",
-            8:  "OP_LEV",
-            4:  "OP_BZ",
-            5:  "OP_BNZ",
-        }
-        name = _OPCODE_INJECTION_MAP.get(active_opcode)
-        if name is not None:
-            x[:, :, self._dim(name)] = 5.0
 
     def _inject_mem_metadata(self, token_ids, x, start_pos=0):
         """Write ADDR_KEY/MEM_STORE/MEM_VAL_Bn metadata on every MEM section.

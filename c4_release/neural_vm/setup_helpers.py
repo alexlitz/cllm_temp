@@ -492,7 +492,7 @@ def _set_layer5_fetch(attn, S, BD, HD):
 
     # Head 5: Fetch opcode byte to OPCODE_BYTE at PC marker on non-first steps.
     # This enables opcode decode at PC marker (via L5 FFN) for BZ/BNZ/LEV/EXIT
-    # without relying on _inject_active_opcode. Uses dynamic PC from EMBED_LO/HI.
+    # using dynamic PC from EMBED_LO/HI.
     # HAS_SE gate: only fires on non-first steps (Head 2 handles first step).
     base = 5 * HD
     for k in range(16):
@@ -1522,7 +1522,8 @@ def _set_bz_bnz_relay(attn, S, BD, HD):
     # FIX 2026-04-16: Gate on OP_BZ or OP_BNZ to prevent firing for other opcodes.
     # Without this gate, the head fires for ALL opcodes and writes FETCH to TEMP,
     # which overlaps OUTPUT_BYTE (dims 480-511), corrupting PC byte generation.
-    # OP_BZ and OP_BNZ are now injected at 5.0 via _inject_active_opcode.
+    # OP_BZ and OP_BNZ reach 5.0 via the L5 PC-marker opcode decode (see
+    # vm_step.py: all-step PC-marker decode block).
     # Score budget:
     #   At PC marker without OP_BZ/BNZ: 50 - 65 = -15 (blocked)
     #   At PC marker with OP_BZ=5: 50 - 65 + 50 = 35 (fires)

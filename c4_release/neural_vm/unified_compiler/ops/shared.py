@@ -507,8 +507,10 @@ def setup_head_weights(head, dim_positions: Dict[str, int] = None) -> None:
 # - NEXT_*: head reads these to project to token-type logits.
 # - IS_BYTE/IS_MARK/CONST/HAS_SE/BYTE_INDEX_*: positional flags read by head
 #   gating and by L0 thresholds.
-# - OP_LEV/BZ/BNZ + ACTIVE_OPCODE_PRTF/READ: injected by
-#   `_inject_active_opcode` based on the current opcode hint.
+# - OP_LEV/BZ/BNZ: decoded at MARK_PC by the L5 FFN all-step PC-marker
+#   opcode decode (see vm_step.py); set at MARK_AX by the standard L5
+#   opcode decoder. ACTIVE_OPCODE_PRTF/READ: legacy conversational-I/O
+#   layout placeholders (no longer written from Python).
 # - MARK_THINKING_START/END: baked into the embedding table on
 #   THINKING_START/END tokens (see ``setup_token_embeddings``).
 # - MEM_STORE / ADDR_KEY: written by `_inject_mem_store` /
@@ -533,7 +535,8 @@ _IO_REQUIRED_DIMS = frozenset({
     "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP", "NEXT_STACK0",
     "NEXT_MEM", "NEXT_SE", "NEXT_HALT",
     "NEXT_TOOL_CALL", "NEXT_THINKING_START", "NEXT_THINKING_END",
-    # Active-opcode injection slots (_inject_active_opcode)
+    # Active-opcode dims (decoded at PC by L5 FFN; layout retained for
+    # ACTIVE_OPCODE_PRTF/READ as conversational-I/O placeholders).
     "OP_LEV", "OP_BZ", "OP_BNZ",
     "ACTIVE_OPCODE_PRTF", "ACTIVE_OPCODE_READ",
     # Memory injection slots (_inject_mem_store, _inject_mem_metadata).
