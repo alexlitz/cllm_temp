@@ -2,21 +2,22 @@
 """Count total non-zero parameters in Neural VM with efficient vs lookup ALU."""
 
 import torch
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
-from neural_vm.batch_runner_v2 import ALUConfig
+from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
 
 print('Building models and counting parameters...')
 print('=' * 70)
 
 # Efficient model
 print('\nBuilding model with EFFICIENT ALU...')
-model_eff = AutoregressiveVM(d_model=512, n_layers=16, n_heads=8, ffn_hidden=4096, max_seq_len=512)
-set_vm_weights(model_eff, alu_config=ALUConfig.efficient_nibble())
+model_eff, _ = compile_full_vm(
+    alu_mode='efficient', n_heads=8, ffn_hidden=4096, max_seq_len=512
+)
 
 # Lookup model
 print('Building model with LOOKUP tables...')
-model_lookup = AutoregressiveVM(d_model=512, n_layers=16, n_heads=8, ffn_hidden=4096, max_seq_len=512)
-set_vm_weights(model_lookup, alu_config=ALUConfig.all_nibble())
+model_lookup, _ = compile_full_vm(
+    alu_mode='lookup', n_heads=8, ffn_hidden=4096, max_seq_len=512
+)
 
 # Count total parameters
 print('\nCounting parameters...')

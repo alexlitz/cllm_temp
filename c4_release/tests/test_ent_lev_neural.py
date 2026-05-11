@@ -15,9 +15,9 @@ import pytest
 import torch
 
 from neural_vm.run_vm import AutoregressiveVMRunner
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
 from neural_vm.debug import ExecutionTracer, WeightInspector, StateComparator
 from neural_vm.weight_modules import FunctionCallWeights, WeightConfig
+from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
 from src.compiler import compile_c
 
 
@@ -68,14 +68,12 @@ class TestENTLEVTracing:
 
     @pytest.fixture
     def model(self):
-        """Create model with weights."""
-        model = AutoregressiveVM(
-            d_model=512,
-            n_layers=16,
-            n_heads=8,
-            ffn_hidden=4096,
-        )
-        set_vm_weights(model)
+        """Create model with weights via the unified compiler.
+
+        compile_full_vm derives n_layers and d_model from the registered ops;
+        the historical n_heads=8, ffn_hidden=4096 are preserved for parity.
+        """
+        model, _ = compile_full_vm(n_heads=8, ffn_hidden=4096)
         return model
 
     @pytest.fixture
@@ -241,14 +239,8 @@ class TestFunctionCallWeightsDiagnostic:
 
     @pytest.fixture
     def model(self):
-        """Create model with weights."""
-        model = AutoregressiveVM(
-            d_model=512,
-            n_layers=16,
-            n_heads=8,
-            ffn_hidden=4096,
-        )
-        set_vm_weights(model)
+        """Create model with weights via the unified compiler."""
+        model, _ = compile_full_vm(n_heads=8, ffn_hidden=4096)
         return model
 
     def test_diagnose_function_call_weights(self, model):

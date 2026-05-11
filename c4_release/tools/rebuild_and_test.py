@@ -3,8 +3,9 @@
 
 import torch
 import os
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, Token
+from neural_vm.vm_step import Token
 from neural_vm.embedding import Opcode
+from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
 
 def build_and_save_model():
     """Build model with weights and save to cache."""
@@ -12,9 +13,8 @@ def build_and_save_model():
     print("Building fresh model from scratch...")
     print("=" * 80)
 
-    model = AutoregressiveVM()
-    print("\nSetting VM weights...")
-    set_vm_weights(model)
+    print("\nCompiling VM via unified compiler...")
+    model, _ = compile_full_vm()
 
     print("Compacting model...")
     model.compact(block_size=32)

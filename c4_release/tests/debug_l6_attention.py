@@ -8,14 +8,14 @@ import torch
 import sys
 sys.path.insert(0, '/home/alexlitz/Documents/misc/c4_release/c4_release')
 
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, _SetDim, Token
+from neural_vm.vm_step import _SetDim, Token
 from neural_vm.embedding import Opcode, E
+from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
 
 def main():
-    # Create model
-    model = AutoregressiveVM()
+    # Create model via the unified compiler.
+    model, _ = compile_full_vm()
     model.eval()
-    set_vm_weights(model)
 
     BD = _SetDim
 

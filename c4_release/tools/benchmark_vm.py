@@ -9,10 +9,13 @@ Measures:
 
 import torch
 import time
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, Token
+from neural_vm.vm_step import Token
 from neural_vm.embedding import Opcode
 from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.speculative import DraftVM
+
+# AutoregressiveVMRunner builds the model via the unified compiler
+# (compile_full_vm). No explicit set_vm_weights call is needed.
 
 # Test bytecode: 6 * 7 = 42
 BYTECODE_MUL = [
@@ -30,7 +33,6 @@ def benchmark_transformer_runner():
     print("=" * 60)
 
     runner = AutoregressiveVMRunner()
-    set_vm_weights(runner.model)
     runner.model.compact(block_size=32)
     runner.model.compact_moe()
 
@@ -95,7 +97,6 @@ def count_transformer_steps():
     AutoregressiveVMRunner.model.__class__.generate_next = counting_generate
 
     runner = AutoregressiveVMRunner()
-    set_vm_weights(runner.model)
     runner.model.compact(block_size=32)
     runner.model.compact_moe()
 
@@ -123,7 +124,6 @@ def benchmark_gpu():
     print("=" * 60)
 
     runner = AutoregressiveVMRunner()
-    set_vm_weights(runner.model)
     runner.model.compact(block_size=32)
     runner.model.compact_moe()
     runner.model.cuda()

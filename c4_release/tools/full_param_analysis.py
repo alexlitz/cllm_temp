@@ -1,13 +1,12 @@
 """Full model parameter analysis."""
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
+from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
 
 print("Full Model Parameter Analysis")
 print("="*70)
 
 # Efficient mode
 print("\n[EFFICIENT MODE]")
-vm_eff = AutoregressiveVM()
-set_vm_weights(vm_eff, alu_mode='efficient')
+vm_eff, _ = compile_full_vm(alu_mode='efficient')
 
 eff_total = sum(p.numel() for p in vm_eff.parameters())
 eff_nonzero = sum((p != 0).sum().item() for p in vm_eff.parameters())
@@ -35,8 +34,7 @@ for key in sorted(eff_breakdown.keys()):
 # Lookup mode
 print("\n" + "="*70)
 print("\n[LOOKUP MODE]")
-vm_lookup = AutoregressiveVM()
-set_vm_weights(vm_lookup, alu_mode='lookup')
+vm_lookup, _ = compile_full_vm(alu_mode='lookup')
 
 lookup_total = sum(p.numel() for p in vm_lookup.parameters())
 lookup_nonzero = sum((p != 0).sum().item() for p in vm_lookup.parameters())

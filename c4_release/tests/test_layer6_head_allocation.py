@@ -29,7 +29,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, _SetDim
+from neural_vm.vm_step import _SetDim
+from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
 
 BD = _SetDim
 
@@ -42,8 +43,7 @@ def test_ax_carry_preservation():
     print("="*80)
     print("\nTest 1: AX_CARRY preservation at AX marker\n")
 
-    model = AutoregressiveVM()
-    set_vm_weights(model)
+    model, _ = compile_full_vm()
 
     layer6 = model.blocks[6]
     attn6 = layer6.attn
@@ -139,8 +139,7 @@ def test_head6_no_conflict():
     print("="*80)
     print("\nTest 3: Head 6 configuration consistency\n")
 
-    model = AutoregressiveVM()
-    set_vm_weights(model)
+    model, _ = compile_full_vm()
 
     layer6 = model.blocks[6]
     attn6 = layer6.attn

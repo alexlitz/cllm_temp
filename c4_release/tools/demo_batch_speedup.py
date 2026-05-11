@@ -16,7 +16,7 @@ Expected speedups:
 
 import time
 import torch
-from neural_vm.vm_step import set_vm_weights, Token
+from neural_vm.vm_step import Token
 from neural_vm.embedding import Opcode
 from neural_vm.fast_runner import SpeculativeRunner
 from neural_vm.batch_runner import BatchedSpeculativeRunner
