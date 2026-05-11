@@ -1136,9 +1136,7 @@ class AutoregressiveVM(nn.Module):
 
         # Compiler-allocated dim_positions (None => fall back to _SetDim for
         # backward-compat callers that construct AutoregressiveVM directly).
-        # Used by:
-        #   - NeuralVMEmbedding token-time injection (ADDR_KEY, MEM_*, opcode flags)
-        #   - set_active_opcode() MoE routing (opcode -> dim lookup)
+        # Used by NeuralVMEmbedding token-time injection (ADDR_KEY, MEM_*).
         self.dim_positions = dim_positions if dim_positions is not None else _SetDim
 
         # Use NeuralVMEmbedding with integrated augmentations
@@ -1157,9 +1155,6 @@ class AutoregressiveVM(nn.Module):
         )
 
         self.head = nn.Linear(d_model, vocab_size)
-
-        # Store current active opcode for embedding augmentation
-        self._active_opcode = None
 
     def sparsify(self):
         """Convert all weight matrices to COO sparse format for faster inference."""
@@ -1275,21 +1270,6 @@ class AutoregressiveVM(nn.Module):
             )
             block.ffn = soft_moe.to(device=ffn.W_up.device, dtype=ffn.W_up.dtype)
 
-    def set_active_opcode(self, opcode_value):
-        """Update the model's active-opcode hint for embedding-side injection.
-
-        Spec-compliant SoftMoEFFN reads the routing signal directly from
-        ``x[:, :, opcode_dim]`` (set at the MARK_PC position by L5 fetch), so
-        no per-step weight swap is performed here. The only side effect is
-        storing ``opcode_value`` so ``NeuralVMEmbedding._inject_active_opcode``
-        can emit the I/O-detection hints for PRTF/READ/LEV/BZ/BNZ.
-
-        Kept as a public method for backward compatibility with existing
-        callers (tests, batch runners, transformer_first_runner). New code
-        should rely on the tensor-native routing in ``SoftMoEFFN`` instead.
-        """
-        self._active_opcode = opcode_value
-
     def save_compact(self, path):
         """Save compacted model to disk (avoids re-computing compact on load)."""
         torch.save(self, path)
@@ -1311,7 +1291,7 @@ class AutoregressiveVM(nn.Module):
         """
         # Pure forward pass: embed → blocks → head
         # All augmentations (ADDR_KEY, MEM_STORE) are inside NeuralVMEmbedding
-        x = self.embed(token_ids, active_opcode=self._active_opcode)
+        x = self.embed(token_ids)
 
         for i, block in enumerate(self.blocks):
             layer_cache = kv_cache.get_layer_cache(i) if kv_cache is not None else None
@@ -3234,7 +3214,7 @@ def _set_opcode_decode_ffn(ffn, S, BD):
 
     # All-step opcode decode at PC marker for opcodes that need early knowledge.
     # These fire at MARK_PC on ALL steps (no HAS_SE gate), enabling BZ/BNZ/LEV/EXIT
-    # routing at the PC marker without relying on _inject_active_opcode.
+    # routing at the PC marker (replaces the legacy active-opcode injection).
     for op_val, lo, hi in [
         (Opcode.BZ, 4, 0),
         (Opcode.BNZ, 5, 0),
@@ -7049,14 +7029,11 @@ def _set_opcode_relay_head(attn, S, BD, HD):
     attn.W_v[base + 7, BD.OP_SI] = 0.2
     attn.W_v[base + 7, BD.OP_SC] = 0.2
 
-    # V[0]: OP_LEV relay (re-enabled 2026-05-09 with V=0.1 to avoid doubling)
-    # BUG FIX 2026-04-17 (now obsolete): OP_LEV was previously doubled when
-    # _inject_active_opcode() was active in pure_neural mode.
-    # FIX 2026-05-09 (agent C1.A): In pure_neural mode, set_active_opcode is
-    # skipped, so OP_LEV is set only at AX marker by L5 FFN. Re-enable relay
-    # with V=0.1 (instead of 0.2) so it produces OP_LEV ≈ 5 at PC/SP/byte
-    # positions (matching L5 FFN write at AX marker), avoiding doubling.
-    # This unblocks Phase 5 LEV semantics (PC restoration, SP=BP+16).
+    # V[0]: OP_LEV relay (V=0.1 to avoid doubling).
+    # OP_LEV is set only at AX marker by L5 FFN; this relay produces
+    # OP_LEV ≈ 5 at PC/SP/byte positions (matching the L5 FFN write at
+    # AX marker), avoiding doubling. Unblocks Phase 5 LEV semantics
+    # (PC restoration, SP=BP+16).
     attn.W_v[base + 0, BD.OP_LEV] = 0.1
 
     # O: write to CMP dims + MEM store flags + PSH_AT_SP
@@ -7070,10 +7047,10 @@ def _set_opcode_relay_head(attn, S, BD, HD):
     attn.W_o[BD.OP_ENT, base + 4] = 5.0  # OP_ENT → OP_ENT dim (×5 to rescale 0.2→1.0)
     attn.W_o[BD.MEM_STORE, base + 6] = 1.0  # store flag → MEM marker
     attn.W_o[BD.MEM_ADDR_SRC, base + 7] = 1.0  # addr source flag → MEM marker
-    # OP_LEV relay re-enabled 2026-05-09 (agent C1.A): V=0.1 × W_o=10.0 = 1.0
-    # multiplier so OP_LEV ≈ 5 at PC/SP/byte positions (matches L5 FFN write at AX).
-    # In pure_neural mode, set_active_opcode is skipped, so OP_LEV is only set at AX
-    # by L5 FFN; this relay propagates it to PC/SP/byte for L9/L15/L16 LEV gates.
+    # OP_LEV relay: V=0.1 × W_o=10.0 = 1.0 multiplier so OP_LEV ≈ 5 at
+    # PC/SP/byte positions (matches L5 FFN write at AX). OP_LEV is set only
+    # at AX by L5 FFN; this relay propagates it to PC/SP/byte for L9/L15/L16
+    # LEV gates.
     attn.W_o[BD.OP_LEV, base + 0] = 10.0  # OP_LEV → OP_LEV dim (×10 to rescale 0.1→1.0)
 
 

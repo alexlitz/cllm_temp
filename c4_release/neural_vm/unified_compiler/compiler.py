@@ -793,7 +793,7 @@ class UnifiedVMCompiler:
         # K: attend to AX marker
         attn.W_k.data[base, BD.MARK_AX] = L
 
-        # V[0]: OP_LEV — disabled (injected globally via _inject_active_opcode)
+        # V[0]: OP_LEV — disabled (would double the L5 AX-marker decode)
         # V[1]: OP_PSH (scaled)
         attn.W_v.data[base + 1, BD.OP_PSH] = 0.2
         # V[2]: OP_ADJ (scaled)
