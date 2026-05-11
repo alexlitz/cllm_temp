@@ -44,7 +44,6 @@ def _run(runner, prog, max_steps=60):
 class TestPureNeuralJSRLEVSimple:
     """Smallest possible call/return — must pass before anything else."""
 
-    @pytest.mark.xfail(reason="Actual=0 expected=7. JSR/LEV roundtrip clobbers AX in pure_neural mode; suspect _set_layer14_mem_generation not pushing return-addr correctly and _set_layer9_alu writing into AX lane")
     def test_jsr_then_lev_simple(self, pure_neural_runner):
         # main: 0:IMM 7, 1:JSR -> idx 3, 2:EXIT
         # callee: 3:ENT 0, 4:LEV
@@ -70,7 +69,6 @@ class TestPureNeuralJSRLEVSimple:
             Opcode.LEV,
         ]) == 42
 
-    @pytest.mark.xfail(reason="LEV PC restoration broken: _set_layer16_lev_routing fails to route popped return-addr back to PC; runner exhausts max_steps without reaching caller EXIT (which would set AX=0 here, but the bug is failure-to-reach-EXIT, not the value)")
     def test_lev_returns_to_caller(self, pure_neural_runner):
         # main: 0:JSR -> idx 2, 1:EXIT (target). callee: 2:ENT 0, 3:LEV.
         # On a working roundtrip PC reaches idx 1 and EXIT triggers with the
