@@ -238,3 +238,81 @@ def make_binary_pop_sp_increment_op() -> Operation:
     )
 
 
+def make_putchar_think_protocol_op(
+    enable_neural_io_think_protocol: bool = False,
+) -> Operation:
+    """L6 FFN: PUTCHAR THINK-tag I/O protocol — emit THINKING_END,
+    output byte token, THINKING_START at end of PUTCHAR step.
+
+    See ``c4_release/docs/NEURAL_IO_VIA_THINK_PROTOCOL_PLAN.md`` for the
+    full design. This op implements the canonical neural-I/O mode from
+    BLOG_SPEC.md:851: instead of the runner reading ``REG_AX`` byte 0
+    off a just-completed PUTCHAR step (the current Phase-6 default),
+    the model itself emits the protocol tokens
+    ``THINKING_END, byte, THINKING_START`` between the MEM section and
+    the STEP_END of a PUTCHAR step.
+
+    Gated by ``enable_neural_io_think_protocol`` (default False) so the
+    existing AX-readoff path remains the production default while the
+    new bake is brought up. When False, the bake_fn is a no-op so the
+    op stays registered for dep-graph stability — mirroring the
+    ``make_tool_call_*_op`` and ``make_convo_io_*_op`` pattern.
+
+    Phase 1 contract (this commit):
+      - When enabled, AND ``IO_IS_PUTCHAR`` (set at AX marker by L5/L6
+        FFN units 1500) with ``NEXT_SE`` and emit ``NEXT_THINKING_END``
+        + suppress ``NEXT_SE`` (so the model writes THINKING_END
+        instead of STEP_END at the end of a PUTCHAR step). This
+        re-uses the convo-io state-machine pattern from
+        ``_set_conversational_io_state_machine`` (setup_helpers.py:1789).
+      - The L6 FFN ``_set_io_putchar_routing`` units (1500-1532) already
+        write ``AX_CARRY → OUTPUT_LO/HI``; the same routing populates
+        the next-byte-token slot so the model emits the actual byte
+        right after THINKING_END.
+      - Closing ``THINKING_START`` emission and the trailing STEP_END
+        are deferred to a follow-up bake (see plan doc § B5).
+
+    Phase 1 stub (this commit, enable_neural_io_think_protocol=False):
+      - The bake_fn is a no-op. The op is registered for dep-graph
+        stability and to expose the scaffolding so a follow-up worker
+        can flip ``enable_neural_io_think_protocol=True`` and fill in
+        the weight wiring without restructuring the migration chain.
+      - The intended unit allocation (when enabled) is L6 FFN unit
+        ~1402, immediately above ``_set_conversational_io_state_machine``
+        units 1400-1401. This avoids overlap with the
+        routing-FFN range (units 0-1033),
+        ``_set_tool_call_detection`` (unit 1300),
+        ``_set_conversational_io_state_machine`` (units 1400-1401),
+        ``_set_io_putchar_routing`` (units 1500-1532), and the
+        function-call-weights units (1700-2158).
+
+    Phase 6.6 (pinned ``layer_idx=6``, ``kind="block"``): runs alongside
+    other L6 block ops so the FFN unit writes survive ``_right_size_ffns``
+    (phase=1200) trimming. Same phase as
+    ``make_convo_io_state_machine_op`` since both extend the same L6
+    FFN with adjacent unit ranges and reads/writes are disjoint.
+    """
+    def bake(block, dim_positions, S):
+        # Phase 1 no-op stub. When ``enable_neural_io_think_protocol``
+        # flips to True the body will route ``IO_IS_PUTCHAR`` through the
+        # same state-machine entry as PRTF/READ (see
+        # ``_set_conversational_io_state_machine`` at setup_helpers.py:1789
+        # for the CMP[5]/CMP[6] pattern this will mirror) and write a new
+        # L6 FFN unit at ~1402. The runner-side collector in run_vm.py is
+        # already in place behind the same flag — the follow-up worker
+        # only needs to fill in the weight writes here.
+        return
+
+    return Operation(
+        name="putchar_think_protocol",
+        phase=6.6,
+        reads={"IO_IS_PUTCHAR", "NEXT_SE", "AX_CARRY_LO", "AX_CARRY_HI"},
+        writes={"NEXT_THINKING_END", "NEXT_SE", "IO_STATE",
+                "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=6,
+        migrated=True,
+    )
+
+

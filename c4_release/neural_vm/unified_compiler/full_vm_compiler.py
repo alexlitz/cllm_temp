@@ -68,6 +68,7 @@ def compile_full_vm(
     *,
     enable_conversational_io: bool = False,
     enable_tool_calling: bool = False,
+    enable_neural_io_think_protocol: bool = False,
     alu_mode: str = "lookup",
     n_heads: int = 8,
     ffn_hidden: int = 4096,
@@ -110,6 +111,7 @@ def compile_full_vm(
         alu_mode=alu_mode,
         enable_conversational_io=enable_conversational_io,
         enable_tool_calling=enable_tool_calling,
+        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
     ):
         compiler.add_op(op)
 
