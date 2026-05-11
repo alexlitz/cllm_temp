@@ -250,87 +250,117 @@ class AutoregressiveAttention(nn.Module):
         self.W_v = nn.Parameter(W_v[out_idx][:, in_idx].contiguous())
         self.W_o = nn.Parameter(W_o[:, out_idx].contiguous())
 
-    def forward(self, x, kv_cache=None):
+    def forward(self, x, kv_cache=None, x_is_new_only=False):
         """
         Forward pass with optional KV caching.
 
         Args:
-            x: Input tensor [B, S, D] - full sequence including cached positions
-            kv_cache: Optional TransformerKVCache for incremental generation
+            x: Input tensor [B, S, D].
+                - Default mode (``x_is_new_only=False``): ``x`` is the full
+                  sequence including positions already in the cache. Q/K/V are
+                  computed for all positions, and K/V for the trailing new
+                  positions are appended to ``kv_cache``. Output shape: [B, S, D].
+                - Incremental mode (``x_is_new_only=True``): ``x`` contains ONLY
+                  the new tokens. Q/K/V are computed only for these new tokens.
+                  K/V are appended to ``kv_cache``; attention uses the full
+                  (cached + new) K/V. Output shape: [B, new_tokens, D].
+            kv_cache: Optional TransformerKVCache for incremental generation.
+            x_is_new_only: When True, ``x`` contains only new tokens beyond the
+                cached prefix (incremental generation path).
 
         Returns:
-            Output tensor [B, S, D]
+            Output tensor; see notes above for shape semantics.
         """
         B, S, D = x.shape
         H = self.num_heads
         HD = self.head_dim
 
+        # Number of positions already cached (0 when no/empty cache).
+        cached_len = kv_cache.cache_size if (kv_cache is not None) else 0
+
         if getattr(self, "_is_compact", False):
             # Compact path: gather active dims → dense matmul → scatter
             x_in = x[:, :, self._compact_in_idx]  # [B, S, n_in]
             n_out = len(self._compact_out_idx)
-            Q = F.linear(x_in, self.W_q).view(B, S, H, n_out // H).transpose(1, 2)
-
-            # KV caching: only compute for new tokens
-            if kv_cache is not None and kv_cache.cache_size > 0:
-                # Only compute K/V for new tokens (last tokens in sequence)
-                new_tokens = S - kv_cache.cache_size
-                if new_tokens > 0:
-                    x_new = x_in[:, -new_tokens:, :]
-                    K_new = F.linear(x_new, self.W_k).view(B, new_tokens, H, n_out // H).transpose(1, 2)
-                    V_new = F.linear(x_new, self.W_v).view(B, new_tokens, H, n_out // H).transpose(1, 2)
-                    K, V = kv_cache.update(K_new, V_new)
-                else:
-                    # All tokens are cached, use cache directly
-                    K, V = kv_cache.cached_k, kv_cache.cached_v
+            if x_is_new_only:
+                # Compute Q/K/V only for new tokens (all of x).
+                Q = F.linear(x_in, self.W_q).view(B, S, H, n_out // H).transpose(1, 2)
+                K_new = F.linear(x_in, self.W_k).view(B, S, H, n_out // H).transpose(1, 2)
+                V_new = F.linear(x_in, self.W_v).view(B, S, H, n_out // H).transpose(1, 2)
             else:
-                # No cache or empty cache: compute all K/V
-                K = F.linear(x_in, self.W_k).view(B, S, H, n_out // H).transpose(1, 2)
-                V = F.linear(x_in, self.W_v).view(B, S, H, n_out // H).transpose(1, 2)
-                if kv_cache is not None:
-                    K, V = kv_cache.update(K, V)
+                # Legacy mode: x is full sequence. Compute Q for all; K/V only
+                # for trailing new tokens (S - cached_len).
+                Q = F.linear(x_in, self.W_q).view(B, S, H, n_out // H).transpose(1, 2)
+                new_tokens = S - cached_len if kv_cache is not None else S
+                if kv_cache is not None and cached_len > 0 and new_tokens > 0:
+                    x_new_in = x_in[:, -new_tokens:, :]
+                    K_new = F.linear(x_new_in, self.W_k).view(B, new_tokens, H, n_out // H).transpose(1, 2)
+                    V_new = F.linear(x_new_in, self.W_v).view(B, new_tokens, H, n_out // H).transpose(1, 2)
+                elif kv_cache is not None and cached_len > 0 and new_tokens == 0:
+                    # All tokens are cached, K_new/V_new are empty; we'll just
+                    # reuse cached K/V directly without updating.
+                    K_new = None
+                    V_new = None
+                else:
+                    K_new = F.linear(x_in, self.W_k).view(B, S, H, n_out // H).transpose(1, 2)
+                    V_new = F.linear(x_in, self.W_v).view(B, S, H, n_out // H).transpose(1, 2)
         else:
             linear = sparse_linear if self.W_q.is_sparse else F.linear
-            Q = linear(x, self.W_q).view(B, S, H, HD).transpose(1, 2)
-
-            # KV caching: only compute for new tokens
-            if kv_cache is not None and kv_cache.cache_size > 0:
-                # Only compute K/V for new tokens
-                new_tokens = S - kv_cache.cache_size
-                if new_tokens > 0:
+            if x_is_new_only:
+                Q = linear(x, self.W_q).view(B, S, H, HD).transpose(1, 2)
+                K_new = linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
+                V_new = linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
+            else:
+                Q = linear(x, self.W_q).view(B, S, H, HD).transpose(1, 2)
+                new_tokens = S - cached_len if kv_cache is not None else S
+                if kv_cache is not None and cached_len > 0 and new_tokens > 0:
                     x_new = x[:, -new_tokens:, :]
                     K_new = linear(x_new, self.W_k).view(B, new_tokens, H, HD).transpose(1, 2)
                     V_new = linear(x_new, self.W_v).view(B, new_tokens, H, HD).transpose(1, 2)
-                    K, V = kv_cache.update(K_new, V_new)
+                elif kv_cache is not None and cached_len > 0 and new_tokens == 0:
+                    K_new = None
+                    V_new = None
                 else:
-                    # All tokens are cached
-                    K, V = kv_cache.cached_k, kv_cache.cached_v
+                    K_new = linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
+                    V_new = linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
+
+        # If we have a KV cache, append new K/V (if any) and use the full
+        # (cached + new) K/V tensors for attention.
+        if kv_cache is not None:
+            if K_new is None:
+                # All cached, no new tokens.
+                K, V = kv_cache.cached_k, kv_cache.cached_v
             else:
-                # No cache: compute all K/V
-                K = linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
-                V = linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
-                if kv_cache is not None:
-                    K, V = kv_cache.update(K, V)
+                K, V = kv_cache.update(K_new, V_new)
+        else:
+            K, V = K_new, V_new
 
         # Apply RoPE if enabled (check for RoPE cache presence)
         if self._rope_cos is not None:
-            # Q and K are [B, H, S_q/S_kv, HD]
+            # Q is [B, H, S_q, HD] where S_q = new_tokens.
+            # K is [B, H, S_kv, HD] where S_kv = cached_len + new_tokens.
             S_q = Q.shape[2]
             S_kv = K.shape[2]
 
-            # For cached scenarios, queries are at positions [S_kv - S_q, S_kv)
-            # For non-cached scenarios, S_q == S_kv and queries are at [0, S_q)
+            # Queries are at positions [S_kv - S_q, S_kv); keys/values span [0, S_kv).
             q_offset = S_kv - S_q
 
-            # Dynamically extend RoPE cache if sequence exceeds current cache size
-            # This allows supporting arbitrarily long sequences
+            # Dynamically extend RoPE cache if sequence exceeds current cache size.
             max_needed = max(S_kv, q_offset + S_q)
             if max_needed > self._rope_cos.shape[0]:
-                # Extend cache with 50% headroom to reduce frequent reallocations
                 new_max_len = int(max_needed * 1.5)
                 self._extend_rope_cache(new_max_len)
 
-            # Apply RoPE to Q and K
+            # Apply RoPE to Q and K. Q gets the slice for new-token positions;
+            # K_new (the just-computed slice that needs rotation) must be rotated
+            # at its absolute positions. Because ``K_new`` was already concatenated
+            # into ``K`` inside ``kv_cache.update`` we must rotate ``K`` in full
+            # only the first time (when cached_len == 0); otherwise the cache
+            # already holds rotated K's and we must only rotate the new slice in
+            # place inside ``K``. To keep this simple and avoid breaking the
+            # existing semantics, we rotate the full K tensor each call — this is
+            # correct because the cache stores the raw (un-rotated) K_new, and we
+            # rotate per-call (matches the existing pre-cache code's behavior).
             from .base_layers import rotate_half
             cos_q = self._rope_cos[q_offset:q_offset + S_q].unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
             sin_q = self._rope_sin[q_offset:q_offset + S_q].unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
@@ -342,21 +372,26 @@ class AutoregressiveAttention(nn.Module):
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
-        # ALiBi bias (only if using ALiBi): -slope * |i - j|, computed on-the-fly
-        # Note: With KV cache, query length S and key length S_kv may differ
-        # Check for alibi_slopes presence rather than _positional_encoding string
+        # ALiBi bias: -slope * |i - j| using absolute positions.
+        # Q positions span [cached_len, cached_len + new_tokens),
+        # K positions span [0, cached_len + new_tokens).
+        S_q = Q.shape[2]
+        S_kv = K.shape[2]
         if self.alibi_slopes is not None:
-            S_q = Q.shape[2]  # Query sequence length
-            S_kv = K.shape[2]  # Cached key/value sequence length
-            q_positions = torch.arange(S_q, device=x.device).unsqueeze(1)  # [S_q, 1]
+            q_positions = torch.arange(S_kv - S_q, S_kv, device=x.device).unsqueeze(1)  # [S_q, 1]
             k_positions = torch.arange(S_kv, device=x.device).unsqueeze(0)  # [1, S_kv]
             dist = (q_positions - k_positions).abs().float()  # [S_q, S_kv]
             alibi = -self.alibi_slopes.view(1, H, 1, 1) * dist  # [1, H, S_q, S_kv]
             scores = scores + alibi
 
-        # Causal mask, computed on-the-fly
+        # Causal mask: position i (absolute = cached_len + i) attends to j only if
+        # j <= cached_len + i, i.e. mask out j > cached_len + i.
+        # In row-coordinates: row r=0..S_q-1, col c=0..S_kv-1; mask if c > (S_kv - S_q) + r.
+        # That is: triu with diagonal = (S_kv - S_q + 1).
+        q_offset_rel = S_kv - S_q
         causal_mask = torch.triu(
-            torch.full((S_q, S_kv), float("-inf"), device=x.device), diagonal=1
+            torch.full((S_q, S_kv), float("-inf"), device=x.device),
+            diagonal=q_offset_rel + 1,
         )
         scores = scores + causal_mask
 
@@ -1073,8 +1108,8 @@ class TransformerBlock(nn.Module):
         self.ffn = ffn
         self.post_ops = nn.ModuleList()
 
-    def forward(self, x, kv_cache=None):
-        x = self.attn(x, kv_cache=kv_cache)
+    def forward(self, x, kv_cache=None, x_is_new_only=False):
+        x = self.attn(x, kv_cache=kv_cache, x_is_new_only=x_is_new_only)
         x = self.ffn(x)
         for op in self.post_ops:
             x = op(x)
@@ -1281,23 +1316,40 @@ class AutoregressiveVM(nn.Module):
         """Move model to CPU, including MoE tensors."""
         return self.to('cpu')
 
-    def forward(self, token_ids, kv_cache=None):
+    def forward(self, token_ids, kv_cache=None, cached_prefix_len=0):
         """Forward pass: token IDs -> logits.
 
         Args:
-            token_ids: [batch, seq] integer token IDs
-            kv_cache: Optional LayerKVCache for incremental decoding
+            token_ids: [batch, seq] integer token IDs (full sequence).
+            kv_cache: Optional LayerKVCache for incremental decoding.
+            cached_prefix_len: Number of leading positions already represented
+                in ``kv_cache``. When > 0, only the trailing positions
+                ``token_ids[:, cached_prefix_len:]`` are run through the
+                transformer blocks (Q/K/V computed only for new positions;
+                attention pulls past K/V from the cache). The embedding is
+                still computed over the FULL ``token_ids`` so context-sensitive
+                augmentations (e.g. _inject_mem_exec_autoregressive scanning
+                MEM markers) see all prior positions. Returns logits of shape
+                ``[batch, seq - cached_prefix_len, vocab_size]`` when > 0.
 
         Returns:
-            [batch, seq, vocab_size] logits
+            ``[batch, seq, vocab_size]`` logits when ``cached_prefix_len == 0``,
+            else ``[batch, seq - cached_prefix_len, vocab_size]``.
         """
         # Pure forward pass: embed → blocks → head
         # All augmentations (ADDR_KEY, MEM_STORE) are inside NeuralVMEmbedding
         x = self.embed(token_ids, active_opcode=self._active_opcode)
 
+        # Incremental path: slice off cached prefix before running blocks.
+        if cached_prefix_len > 0:
+            x = x[:, cached_prefix_len:, :]
+            x_is_new_only = True
+        else:
+            x_is_new_only = False
+
         for i, block in enumerate(self.blocks):
             layer_cache = kv_cache.get_layer_cache(i) if kv_cache is not None else None
-            x = block(x, kv_cache=layer_cache)
+            x = block(x, kv_cache=layer_cache, x_is_new_only=x_is_new_only)
 
         if self.head.weight.is_sparse:
             return sparse_linear(x, self.head.weight, self.head.bias)
