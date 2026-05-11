@@ -72,7 +72,7 @@ def compile_full_vm(
     n_heads: int = 8,
     ffn_hidden: int = 4096,
     max_seq_len: int = 8192,
-    pin_io_only: bool = False,
+    pin_io_only: bool = True,
 ):
     """Compile and bake a full Neural VM model via the compiler.
 

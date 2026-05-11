@@ -2611,19 +2611,32 @@ def _right_size_ffns(model):
         print(f"  TOTAL FFN units: {total_before} -> {total_after} ({100*total_after/total_before:.1f}% retained)")
 
 
-def _set_threshold_attn(attn, thresholds, out_bases, slope, HD, heads=None):
+def _set_threshold_attn(attn, thresholds, out_bases, slope, HD, heads=None, BD=None):
     """Set threshold-based attention heads for marker distance detection.
 
     Each head detects whether the nearest marker is within `threshold` tokens.
     Uses ALiBi: score = slope*(threshold - distance), giving a sharp sigmoid.
+
+    Args:
+        BD: Optional dim spec (proxy) overriding _SetDim. Pass the compiler
+            proxy from a migrated op so pin_io_only=True layouts wire to the
+            correct residual lanes. Defaults to module-level ``_SetDim`` for
+            backward compatibility with legacy callers (e.g. set_vm_weights).
     """
-    BD = _SetDim
+    if BD is None:
+        BD = _SetDim
     if heads is None:
         heads = list(range(len(thresholds)))
 
+    import math
+    sqrt_hd = math.sqrt(HD)
     for i, (h, t) in enumerate(zip(heads, thresholds)):
         base = h * HD
-        q_val = 8.0 * slope  # sqrt(HD) = 8
+        # q_val scales with sqrt(HD) so Q·K / sqrt(HD) = slope * threshold
+        # regardless of HD. Previously hardcoded 8.0 (assuming HD=64), which
+        # broke score budgets when pin_io_only=True makes d_model=728
+        # (HD=91, sqrt(HD)=9.54).
+        q_val = sqrt_hd * slope
         attn.W_q[base, BD.CONST] = q_val
         attn.W_k[base, BD.IS_MARK] = t
         for m, src in enumerate(BD.MARKS):

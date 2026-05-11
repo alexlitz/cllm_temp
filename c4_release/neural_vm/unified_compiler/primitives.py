@@ -61,8 +61,11 @@ class Primitives:
             slope: ALiBi slope (default 10.0)
             HD: Head dimension (default 64)
         """
+        import math
         base = head_idx * HD
-        q_val = 8.0 * slope  # sqrt(HD) = 8
+        # q_val scales with sqrt(HD) so Q·K / sqrt(HD) = slope * threshold
+        # regardless of HD. Previously hardcoded 8.0 (HD=64 assumption).
+        q_val = math.sqrt(HD) * slope
 
         attn.W_q.data[base, BD.CONST] = q_val
         attn.W_k.data[base, BD.IS_MARK] = threshold
@@ -84,6 +87,7 @@ class Primitives:
         src_lo: Optional[int] = None,
         src_hi: Optional[int] = None,
         L: float = 15.0,
+        bd=None,
     ):
         """Set attention head for register carry-forward.
 
@@ -109,20 +113,24 @@ class Primitives:
             src_lo: Source low nibble dim (default EMBED_LO)
             src_hi: Source high nibble dim (default EMBED_HI)
             L: Attention weight scale (default 15.0)
+            bd: Optional dim spec (proxy) overriding module-level BD for L1H0,
+                L1H1, CONST, EMBED_LO/HI lookups. Pass the compiler proxy here
+                so pin_io_only=True layouts wire to the correct residual lanes.
         """
+        spec = bd if bd is not None else BD
         base = head_idx * HD
 
         if src_lo is None:
-            src_lo = BD.EMBED_LO
+            src_lo = spec.EMBED_LO
         if src_hi is None:
-            src_hi = BD.EMBED_HI
+            src_hi = spec.EMBED_HI
 
         # Q: fires at target marker
         attn.W_q.data[base, marker_dim] = L
 
         # K: fires at previous step's byte 0 (L1H1 AND NOT L1H0)
-        attn.W_k.data[base, BD.L1H1 + l1h1_idx] = L
-        attn.W_k.data[base, BD.L1H0 + l1h0_idx] = -L
+        attn.W_k.data[base, spec.L1H1 + l1h1_idx] = L
+        attn.W_k.data[base, spec.L1H0 + l1h0_idx] = -L
 
         # V: copy source nibbles
         for k in range(16):
@@ -137,8 +145,8 @@ class Primitives:
         # Anti-leakage gate (dim 33)
         GATE = 33
         attn.W_q.data[base + GATE, marker_dim] = L
-        attn.W_q.data[base + GATE, BD.CONST] = -L / 2
-        attn.W_k.data[base + GATE, BD.CONST] = L
+        attn.W_q.data[base + GATE, spec.CONST] = -L / 2
+        attn.W_k.data[base + GATE, spec.CONST] = L
 
     @staticmethod
     def memory_lookup_attention(
