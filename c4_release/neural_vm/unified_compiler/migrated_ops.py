@@ -1949,9 +1949,27 @@ def make_layer0_threshold_attn_op() -> Operation:
 
 
 def make_layer1_threshold_attn_op() -> Operation:
-    """L1 attention: 3 fine threshold heads + STEP_END + L1H4."""
-    def bake(attn, dim_positions, S):
+    """L1 attention: 3 fine threshold heads + STEP_END + L1H4.
+
+    Pinned to ``layer_idx=1`` via ``kind="block"``. Without pinning, the
+    LayerCompiler dep-graph places this op at block 0 alongside the L0
+    ``layer0_threshold_attn`` (also pinned to block 0). Both ops use head 0
+    and write to ``W_k[head*HD, IS_MARK]``: since L0 is a block op that
+    runs AFTER L1 (attn ops first, block ops last), L0 would overwrite
+    L1's K threshold (0.5) with its own (3.5), corrupting the L1H0 / L1H1
+    semantics. The downstream L3 PC carry-forward attention then keys on
+    a malformed L1H1/L1H0 pattern and self-attends instead of finding the
+    previous step's PC byte 0.
+
+    The companion ``_layer1_threshold_attn_dep_anchor`` op (kind="attn")
+    declares identical reads/writes so the LayerCompiler's dep graph
+    still reserves a layer slot for it; otherwise removing the kind="attn"
+    entry shrinks the longest-chain length and shifts downstream attn ops
+    to the wrong block.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_threshold_attn
+        attn = block.attn
         proxy = _as_setdim_proxy(dim_positions)
         ALIBI_S = 10.0
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
@@ -1980,16 +1998,46 @@ def make_layer1_threshold_attn_op() -> Operation:
         phase=1,
         reads={"IS_MARK", "MARK_SE_ONLY", "CONST"},
         writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE"},
-        kind="attn",
+        kind="block",
+        layer_idx=1,
         bake_fn=bake,
         migrated=True,
     )
 
 
-def make_layer2_threshold_attn_op() -> Operation:
-    """L2 attention: threshold 5.5 head."""
+def make_layer1_threshold_attn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer1_threshold_attn``: declares identical
+    reads/writes so the LayerCompiler's dep graph reserves a layer slot.
+    Mirrors ``_layer3_ffn_dep_anchor``: the actual bake happens in
+    ``layer1_threshold_attn`` (kind="block", layer_idx=1); this op's bake
+    is a no-op.
+    """
     def bake(attn, dim_positions, S):
+        return
+
+    return Operation(
+        name="_layer1_threshold_attn_dep_anchor",
+        phase=1,
+        reads={"IS_MARK", "MARK_SE_ONLY", "CONST"},
+        writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE"},
+        kind="attn",
+        bake_fn=bake,
+    )
+
+
+def make_layer2_threshold_attn_op() -> Operation:
+    """L2 attention: threshold 5.5 head.
+
+    Pinned to ``layer_idx=2`` via ``kind="block"`` for the same reason as
+    ``layer1_threshold_attn``: L0 (block_op, layer 0) and the original L1
+    (originally placed at layer 0 alongside L0) both wrote to head 0 of
+    block 0, causing K-threshold corruption. With L1 now pinned to block
+    1, L2 must move to block 2 to avoid the symmetric conflict between
+    L1 (head 0) and L2 (head 0) at block 1.
+    """
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_threshold_attn
+        attn = block.attn
         proxy = _as_setdim_proxy(dim_positions)
         ALIBI_S = 10.0
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
@@ -2004,9 +2052,27 @@ def make_layer2_threshold_attn_op() -> Operation:
         phase=2,
         reads={"IS_MARK", "CONST"},
         writes={"L2H0"},
-        kind="attn",
+        kind="block",
+        layer_idx=2,
         bake_fn=bake,
         migrated=True,
+    )
+
+
+def make_layer2_threshold_attn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer2_threshold_attn``; see
+    ``make_layer1_threshold_attn_dep_anchor_op`` docstring.
+    """
+    def bake(attn, dim_positions, S):
+        return
+
+    return Operation(
+        name="_layer2_threshold_attn_dep_anchor",
+        phase=2,
+        reads={"IS_MARK", "CONST"},
+        writes={"L2H0"},
+        kind="attn",
+        bake_fn=bake,
     )
 
 
@@ -2018,10 +2084,20 @@ def make_layer3_carry_forward_attn_op() -> Operation:
     ``tests/test_primitives_l3_carry_equivalence.py``). Head 4 uses
     ``_set_stack0_carry_attn`` (different K source). Heads 5-6 stay inline
     (head 5 reads OUTPUT_*, head 6 has OP_LEV gating + CLEAN_EMBED_*).
+
+    Pinned to ``layer_idx=3`` via ``kind="block"``. With L1 / L2 threshold
+    ops pinned to blocks 1 / 2 (see ``make_layer1_threshold_attn_op``),
+    this op must move to block 3 so its 7 heads do not collide with the
+    L2 threshold op (head 0) at block 2. Without this fix, the L3 head 0
+    K projection (``L1H1[PC] * L - L1H0[PC] * L``) gets overwritten by
+    the L2 threshold's ``W_k[0, IS_MARK]=5.5`` write, breaking the
+    previous-step PC-byte-0 source identification that drives the L3
+    carry-forward attention.
     """
-    def bake(attn, dim_positions, S):
+    def bake(block, dim_positions, S):
         from ..vm_step import _set_stack0_carry_attn
         from .primitives import Primitives
+        attn = block.attn
         proxy = _as_setdim_proxy(dim_positions)
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
@@ -2075,9 +2151,31 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                "EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                 "AX_FULL_LO", "AX_FULL_HI"},
-        kind="attn",
+        kind="block",
+        layer_idx=3,
         bake_fn=bake,
         migrated=True,
+    )
+
+
+def make_layer3_carry_forward_attn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer3_carry_forward_attn``; see
+    ``make_layer1_threshold_attn_dep_anchor_op`` docstring.
+    """
+    def bake(attn, dim_positions, S):
+        return
+
+    return Operation(
+        name="_layer3_carry_forward_attn_dep_anchor",
+        phase=3,
+        reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+               "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV", "HAS_SE",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI", "CONST"},
+        writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+                "AX_FULL_LO", "AX_FULL_HI"},
+        kind="attn",
+        bake_fn=bake,
     )
 
 
@@ -4419,7 +4517,9 @@ def all_core_ops(
     return [
         make_layer0_threshold_attn_op(),
         make_layer1_threshold_attn_op(),
+        make_layer1_threshold_attn_dep_anchor_op(),
         make_layer2_threshold_attn_op(),
+        make_layer2_threshold_attn_dep_anchor_op(),
         # Conversational-I/O L2 lookback head: phase=2.1 so it bakes after
         # the L2 threshold attention (phase=2). Body is a no-op unless
         # ``enable_conversational_io`` is True.
@@ -4427,6 +4527,7 @@ def all_core_ops(
             enable_conversational_io=enable_conversational_io,
         ),
         make_layer3_carry_forward_attn_op(),
+        make_layer3_carry_forward_attn_dep_anchor_op(),
         make_phase_a_ffn_op(),
         make_layer1_ffn_op(),
         make_layer2_mem_byte_flags_op(),
