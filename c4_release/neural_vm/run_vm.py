@@ -261,6 +261,165 @@ class AutoregressiveVMRunner:
         self.pure_neural = pure_neural
         self._pure_attention_report = {}
 
+    # Maximum number of consecutive incremental forward calls before flushing
+    # the KV cache. Empirically, the c4 VM model's L15 (memory-lookup) attention
+    # uses very steep softmax that amplifies float non-associativity in the
+    # incremental matmul path; after ~34 incremental calls in a row the drift
+    # accumulates enough to flip an argmax. Flushing the cache periodically
+    # forces a single full forward (no cache) call which resets the drift to
+    # zero. ``35`` matches one VM step (the natural boundary) and was verified
+    # to yield byte-identical output across multiple programs.
+    _KV_INCREMENTAL_FLUSH = 35
+
+    def _reset_kv_cache(self):
+        """Reset/clear the autoregressive attention KV cache.
+
+        Called at the start of each ``run()`` and whenever the runner detects
+        that the cached prefix has been invalidated (active_opcode change,
+        major context shift, etc.). Lazily-allocates the LayerKVCache on first
+        use (after we know the device + layer count from the model).
+        """
+        self._kv_cache_obj = None
+        self._kv_cached_tokens = []  # tokens currently represented in the cache
+        self._kv_cached_opcode = object()  # sentinel; mismatch on first call
+        self._kv_incremental_count = 0  # number of consecutive incremental calls
+
+    def _get_or_build_kv_cache(self):
+        """Lazily build the LayerKVCache, sized to match the model.
+
+        Returns None when ``use_kv_cache`` is disabled.
+        """
+        if not self.use_kv_cache:
+            return None
+        if self._kv_cache_obj is not None:
+            return self._kv_cache_obj
+        from .kv_cache import LayerKVCache
+        n_layers = len(self.model.blocks)
+        # We don't actually use ``num_heads``/``head_dim`` on the LayerKVCache
+        # itself because the per-layer caches just store whatever K/V tensors
+        # the attention layer passes in; only ``max_tokens`` matters for the
+        # sliding-window evict path, which we set generously here.
+        device = next(self.model.parameters()).device
+        self._kv_cache_obj = LayerKVCache(
+            num_layers=n_layers,
+            max_tokens=self.model.max_seq_len,
+            num_heads=self.model.blocks[0].attn.num_heads,
+            head_dim=self.model.blocks[0].attn.head_dim,
+            device=device,
+        )
+        self._kv_cached_tokens = []
+        return self._kv_cache_obj
+
+    def _kv_common_prefix_len(self, new_tokens):
+        """Length of the longest matching leading subsequence of ``new_tokens``
+        with the currently-cached tokens.
+        """
+        cached = self._kv_cached_tokens
+        n = min(len(cached), len(new_tokens))
+        i = 0
+        while i < n and cached[i] == new_tokens[i]:
+            i += 1
+        return i
+
+    def _trim_kv_cache(self, keep_len):
+        """Trim per-layer caches to ``keep_len`` positions.
+
+        Used when the input sequence shares only ``keep_len`` leading tokens
+        with the cached state (e.g. last position was overwritten, or a middle
+        slice changed). Layers' K/V at positions ``>= keep_len`` are dropped.
+        """
+        if self._kv_cache_obj is None:
+            return
+        for layer_cache in self._kv_cache_obj.caches:
+            if layer_cache.cached_k is None:
+                continue
+            cur = layer_cache.cache_size
+            if keep_len >= cur:
+                continue
+            if keep_len <= 0:
+                layer_cache.cached_k = None
+                layer_cache.cached_v = None
+                layer_cache.cache_size = 0
+            else:
+                layer_cache.cached_k = layer_cache.cached_k[:, :, :keep_len, :]
+                layer_cache.cached_v = layer_cache.cached_v[:, :, :keep_len, :]
+                layer_cache.cache_size = keep_len
+        # Also trim the tracking list.
+        self._kv_cached_tokens = self._kv_cached_tokens[:keep_len]
+
+    def _generate_next_cached(self, generation_context):
+        """Generate next token reusing per-layer KV caches across forward calls.
+
+        Behavior:
+        - If ``use_kv_cache`` is False or the model's current ``_active_opcode``
+          differs from the cached opcode, falls back to a fresh forward pass
+          and rebuilds the cache from scratch.
+        - Otherwise computes the longest matching leading subsequence between
+          ``generation_context`` and the currently-cached tokens; trims the
+          per-layer caches to that length; runs the model on only the new
+          tokens (``cached_prefix_len`` argument).
+
+        Returns:
+            int: argmax-decoded next-token id (matches ``model.generate_next``
+            with ``temperature=0.0``).
+        """
+        if not self.use_kv_cache:
+            return self.model.generate_next(generation_context, use_incremental=False)
+
+        # Active opcode is part of the embedding (writes globally at all
+        # positions when in the injection set). When it changes, the cached
+        # K/V at past positions are stale, so we invalidate.
+        cur_opcode = getattr(self.model, "_active_opcode", None)
+        if cur_opcode != self._kv_cached_opcode:
+            self._reset_kv_cache()
+            self._kv_cached_opcode = cur_opcode
+
+        # Periodically flush the cache to bound the accumulated float-drift
+        # caused by non-associativity in the incremental matmul path. The
+        # affected attention layer (L15, ``num_heads=12``, memory lookup)
+        # uses very steep softmax over binary-address-matching keys; small
+        # numerical drift in upstream K/V (computed via a long chain of
+        # successive 1-token matmuls vs a single batch matmul) compounds
+        # and flips an argmax. Empirically the threshold is ~35 incremental
+        # calls (one VM step); we conservatively flush at that boundary.
+        if self._kv_incremental_count >= self._KV_INCREMENTAL_FLUSH:
+            self._reset_kv_cache()
+            self._kv_cached_opcode = cur_opcode
+
+        kv_cache = self._get_or_build_kv_cache()
+        prefix_len = self._kv_common_prefix_len(generation_context)
+        self._trim_kv_cache(prefix_len)
+
+        # Build the token tensor on the model's device.
+        device = next(self.model.parameters()).device
+        token_ids = torch.tensor([generation_context], dtype=torch.long, device=device)
+
+        # Run model.forward with cached_prefix_len. When prefix_len == len(context)
+        # there are zero new tokens — uncommon (would mean we asked for next-token
+        # twice with identical context); in that case run a normal forward.
+        if prefix_len >= len(generation_context):
+            # No new tokens — re-run on full context (rare; defensive).
+            self._reset_kv_cache()
+            self._kv_cached_opcode = cur_opcode
+            logits = self.model.forward(token_ids, kv_cache=self._get_or_build_kv_cache(),
+                                        cached_prefix_len=0)
+            next_token = logits[0, -1, :].argmax(-1).item()
+            self._kv_cached_tokens = list(generation_context)
+            return next_token
+
+        with torch.no_grad():
+            logits = self.model.forward(
+                token_ids,
+                kv_cache=kv_cache,
+                cached_prefix_len=prefix_len,
+            )
+        # When cached_prefix_len > 0, logits has shape [1, new_tokens, vocab];
+        # the next-token prediction is the LAST position.
+        next_token = logits[0, -1, :].argmax(-1).item()
+        self._kv_cached_tokens = list(generation_context)
+        self._kv_incremental_count += 1
+        return next_token
+
     def run(
         self,
         bytecode,
@@ -299,6 +458,11 @@ class AutoregressiveVMRunner:
         # Invalidate the embedding prefix cache so a new program's CODE/DATA
         # prefix is recomputed (cache is keyed on the leading token sequence).
         self.model.embed.reset_prefix_cache()
+        # Reset the KV cache for autoregressive attention (per-run state).
+        # ``self.use_kv_cache`` (constructor arg) gates this; when True the
+        # runner reuses K/V across forward calls, recomputing only the new
+        # tokens beyond the longest matching prefix.
+        self._reset_kv_cache()
         self._pure_attention_report = {
             "enabled": bool(self.pure_attention_memory),
             "blocked_vm_memory_ops": {},
@@ -341,7 +505,7 @@ class AutoregressiveVMRunner:
                 generation_context = context[:prefix_len] + context[-512:]
             else:
                 generation_context = context
-            next_token = self.model.generate_next(generation_context, use_incremental=False)
+            next_token = self._generate_next_cached(generation_context)
             context.append(next_token)
 
             pos_in_step = i % Token.STEP_TOKENS

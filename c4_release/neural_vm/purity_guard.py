@@ -69,15 +69,18 @@ def verify_forward_purity(model):
 
     code = '\n'.join(code_lines)
 
-    # Check for forbidden patterns (Python tensor modifications)
+    # Check for forbidden patterns (Python tensor modifications).
+    # We match WRITES (lhs subscript assignment) rather than any indexing —
+    # ``x = x[:, k:, :]`` is a slice rebind (not a tensor modification) and is
+    # permitted by the incremental KV-cache path.
     forbidden_patterns = {
-        r'\bx\s*\[': 'Direct tensor indexing/modification (x[...])',
+        r'(?<![=!<>])\bx\s*\[[^\]]*\]\s*(?:=(?!=)|\+=|-=|\*=|/=|//=|\|=|&=|\^=)': 'Direct tensor write (x[...] = ...)',
         r'\bx\.data\s*\[': 'Direct data tensor modification (x.data[...])',
-        r'embeddings?\s*\[': 'Direct embedding modification',
+        r'embeddings?\s*\[[^\]]*\]\s*(?:=(?!=)|\+=|-=|\*=|/=|//=|\|=|&=|\^=)': 'Direct embedding modification',
         r'_add_code_addr_keys\s*\(': 'Call to old augmentation method _add_code_addr_keys()',
         r'_inject_mem_store\s*\(': 'Call to old augmentation method _inject_mem_store()',
-        r'\.item\(\)\s*\n\s*x\[': 'Python loop with tensor assignment',
-        r'for\s+.*\s+in\s+range\(.*\):\s*\n\s+.*x\[': 'Python loop modifying embeddings',
+        r'\.item\(\)\s*\n\s*x\[[^\]]*\]\s*=': 'Python loop with tensor assignment',
+        r'for\s+.*\s+in\s+range\(.*\):\s*\n\s+.*x\[[^\]]*\]\s*=': 'Python loop modifying embeddings',
     }
 
     violations = []
