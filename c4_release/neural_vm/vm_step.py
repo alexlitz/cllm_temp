@@ -1953,15 +1953,16 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # GETCHAR opcodes via PC tracking and injects stdin bytes into context.
 
     # ===== TOOL CALLING (optional) =====
-    if enable_tool_calling:
-        # L5 FFN: decode OPEN/READ/CLOS/PRTF → IO_IS_TOOL_CALL at AX marker
-        _set_tool_call_opcode_decode(ffn5, S, BD)
-        # L6 attention head 5: relay IO_IS_TOOL_CALL from AX → SE position
-        if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
-            attn6.alibi_slopes[5] = 5.0  # steep ALiBi for head 5
-        _set_tool_call_relay_head(attn6, S, BD, HD)
-        # L6 FFN: CMP[2] AND NEXT_SE → NEXT_TOOL_CALL (convert SE to TOOL_CALL)
-        _set_tool_call_detection(ffn6, S, BD)
+    # MIGRATED: The 3 tool-call bakes (L5 FFN opcode decode, L6 attn head 5
+    # relay, L6 FFN NEXT_TOOL_CALL detection) plus the
+    # `attn6.alibi_slopes[5] = 5.0` mutation are now baked by 3 compiler
+    # model-ops in `unified_compiler/migrated_ops.py`:
+    #   - make_tool_call_opcode_decode_op
+    #   - make_tool_call_relay_head_op   (folds the alibi_slopes[5] write)
+    #   - make_tool_call_detection_op
+    # All three are kind="model" at phase 998.8, registered unconditionally
+    # in `all_core_ops(enable_tool_calling=...)`; bake_fns no-op when the
+    # flag is False. Inline calls removed to avoid double-bake.
 
     # ===== CONVERSATIONAL I/O (optional) =====
     if enable_conversational_io:

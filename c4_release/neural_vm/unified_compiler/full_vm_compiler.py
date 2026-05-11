@@ -102,6 +102,7 @@ def compile_full_vm(
     for op in all_core_ops(
         alu_mode=alu_mode,
         enable_conversational_io=enable_conversational_io,
+        enable_tool_calling=enable_tool_calling,
     ):
         compiler.add_op(op)
 

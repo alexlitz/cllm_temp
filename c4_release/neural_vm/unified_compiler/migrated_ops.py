@@ -2542,6 +2542,151 @@ def make_io_putchar_routing_op() -> Operation:
     )
 
 
+# ---------------------------------------------------------------------------
+# Tool-calling bakes (gated by enable_tool_calling)
+#
+# The 3 ops below replace inline calls in set_vm_weights that fire only when
+# `enable_tool_calling=True`:
+#   _set_tool_call_opcode_decode(ffn5, S, BD)  -> L5 FFN units 400-405
+#   _set_tool_call_relay_head(attn6, S, BD, HD) -> L6 attn head 5
+#   _set_tool_call_detection(ffn6, S, BD)      -> L6 FFN unit 1300
+#
+# All three are kind="model" at phase 998.8: they run AFTER io_putchar_routing
+# (998), function_call_weights (998), the L6 attn/relay bakes (998.5/.6/.7)
+# but BEFORE legacy_bake (999) and its right_size_ffns (phase 1200), so the
+# FFN unit writes survive the rightsize pass. None of the units they touch
+# (400-405 in L5 FFN, 1300 in L6 FFN, head 5 in L6 attn) conflict with the
+# other ops dispatched at phase < 998.8.
+#
+# Each factory takes `enable_tool_calling=False`; when False the bake_fn is
+# a no-op (the op is always registered to keep the registration list stable
+# regardless of mode). The L6 attn's `alibi_slopes[5] = 5.0` mutation that
+# used to live inline next to _set_tool_call_relay_head is folded into the
+# relay-head bake_fn so the op is self-contained.
+# ---------------------------------------------------------------------------
+
+
+def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operation:
+    """Bake L5 FFN tool-call opcode decoder (IO opcodes -> IO_IS_TOOL_CALL).
+
+    Originally an inline call in `set_vm_weights` (inside `if enable_tool_calling:`):
+        `_set_tool_call_opcode_decode(ffn5, S, BD)`
+
+    Operates on `model.blocks[5].ffn`. Modeled as `kind="model"` so the bake_fn
+    can resolve ffn5 from the model handle, matching `make_io_putchar_routing_op`.
+
+    Phase 998.8: runs after the L5 main FFN bakes (phase ~5-6) and the L6
+    bake ops (998.x), and before legacy_bake (999) so the unit writes survive
+    `_right_size_ffns` (which runs inside legacy_bake).
+
+    When `enable_tool_calling=False`, the bake_fn is a no-op so the op can be
+    unconditionally registered in `all_core_ops()` without changing behavior.
+    """
+    if enable_tool_calling:
+        def bake(model, dim_positions, S):
+            from ..vm_step import _set_tool_call_opcode_decode
+            _set_tool_call_opcode_decode(
+                model.blocks[5].ffn, S, _as_setdim_proxy(dim_positions),
+            )
+    else:
+        def bake(model, dim_positions, S):
+            return  # disabled when enable_tool_calling=False
+
+    return Operation(
+        name="tool_call_opcode_decode",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=998.8,
+        migrated=True,
+    )
+
+
+def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation:
+    """Bake L6 attention head 5 for tool-call relay (IO_IS_TOOL_CALL AX -> SE).
+
+    Originally two inline statements in `set_vm_weights` (inside
+    `if enable_tool_calling:`):
+        `attn6.alibi_slopes[5] = 5.0`
+        `_set_tool_call_relay_head(attn6, S, BD, HD)`
+
+    Both folded into this single op so the bake is self-contained: the
+    alibi_slopes mutation lives next to the head bake that depends on it.
+
+    Operates on `model.blocks[6].attn`. Modeled as `kind="model"` so the
+    bake_fn can resolve attn6 from the model handle (and look up HD), matching
+    `make_layer6_attn_bake_op`.
+
+    Phase 998.8: runs after the L6 attn bakes (`layer6_attn_bake` 998.5,
+    `layer6_relay_heads_bake` 998.6, `layer6_bz_bnz_relay_bake` 998.7) which
+    fill_(0.0) and then set heads 0-4/6-7. Head 5 is left at 0.0 by those
+    earlier bakes — this op sets head 5's alibi slope and its Q/K/V/O slots.
+    Runs before legacy_bake (999).
+
+    When `enable_tool_calling=False`, the bake_fn is a no-op.
+    """
+    if enable_tool_calling:
+        def bake(model, dim_positions, S):
+            from ..vm_step import _set_tool_call_relay_head
+            attn = model.blocks[6].attn
+            if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+                attn.alibi_slopes[5] = 5.0  # steep ALiBi for head 5
+            HD = attn.W_q.shape[0] // attn.num_heads
+            _set_tool_call_relay_head(
+                attn, S, _as_setdim_proxy(dim_positions), HD,
+            )
+    else:
+        def bake(model, dim_positions, S):
+            return  # disabled when enable_tool_calling=False
+
+    return Operation(
+        name="tool_call_relay_head",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=998.8,
+        migrated=True,
+    )
+
+
+def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
+    """Bake L6 FFN tool-call detection unit (CMP[2] AND NEXT_SE -> NEXT_TOOL_CALL).
+
+    Originally an inline call in `set_vm_weights` (inside `if enable_tool_calling:`):
+        `_set_tool_call_detection(ffn6, S, BD)`
+
+    Operates on `model.blocks[6].ffn` unit 1300. Modeled as `kind="model"` so
+    the bake_fn can resolve ffn6 from the model handle, matching
+    `make_io_putchar_routing_op`.
+
+    Phase 998.8: runs after the L6 FFN main bakes (phase 6.5) and before
+    legacy_bake (999) so unit 1300 survives `_right_size_ffns`.
+
+    When `enable_tool_calling=False`, the bake_fn is a no-op.
+    """
+    if enable_tool_calling:
+        def bake(model, dim_positions, S):
+            from ..vm_step import _set_tool_call_detection
+            _set_tool_call_detection(
+                model.blocks[6].ffn, S, _as_setdim_proxy(dim_positions),
+            )
+    else:
+        def bake(model, dim_positions, S):
+            return  # disabled when enable_tool_calling=False
+
+    return Operation(
+        name="tool_call_detection",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=998.8,
+        migrated=True,
+    )
+
+
 def make_head_bake_op() -> Operation:
     """Bake the output projection head: byte/marker token logits.
 
@@ -3590,12 +3735,13 @@ def all_core_ops(
     alu_mode: str = "lookup",
     *,
     enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
 ) -> list:
     """Return the full list of migrated core-VM operations.
 
-    Doesn't include I/O or tool-call-handler operations (those need their own
-    migration pass). Flag-gated ops are always registered to keep the dep
-    graph stable; their bake bodies are no-ops when the flag is False.
+    Doesn't include I/O operations (those need their own migration pass).
+    Flag-gated ops are always registered to keep the dep graph stable; their
+    bake bodies are no-ops when the flag is False.
 
     ``alu_mode`` is forwarded to ops whose bake action depends on whether the
     legacy lookup ALU or the efficient neural ALU owns a given operation
@@ -3606,6 +3752,12 @@ def all_core_ops(
     ``make_format_pointer_extraction_op``, ``make_format_position_counter_op``,
     ``make_format_string_fetch_head_op``). All are always registered; their
     bake_fn is a no-op when the flag is False.
+
+    ``enable_tool_calling`` is forwarded to the 3 tool-call ops
+    (`tool_call_opcode_decode`, `tool_call_relay_head`, `tool_call_detection`)
+    which are always registered but no-op when the flag is False. This keeps
+    the registration list (and hence the dep graph / layer count) stable
+    across modes.
     """
     return [
         make_layer0_threshold_attn_op(),
@@ -3749,6 +3901,16 @@ def all_core_ops(
         # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
         # L6 FFN unit writes survive the rightsize pass at end of legacy_bake.
         make_io_putchar_routing_op(),
+        # Tool-call bakes (phase 998.8): flag-gated. Always registered so the
+        # registration list is stable; bake_fn is a no-op when
+        # `enable_tool_calling=False`. The 3 ops replace inline calls in
+        # set_vm_weights at L5 FFN (opcode decode units 400-405), L6 attn
+        # head 5 (relay), and L6 FFN unit 1300 (NEXT_TOOL_CALL detection).
+        # The L6 attn alibi_slopes[5]=5.0 mutation is folded into the relay
+        # op so the bake is self-contained.
+        make_tool_call_opcode_decode_op(enable_tool_calling=enable_tool_calling),
+        make_tool_call_relay_head_op(enable_tool_calling=enable_tool_calling),
+        make_tool_call_detection_op(enable_tool_calling=enable_tool_calling),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
