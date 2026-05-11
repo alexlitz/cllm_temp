@@ -4,12 +4,80 @@
 **Branch:** `purity-audit`
 **Base:** `main` @ 9d9965b
 
+---
+
+## AMENDMENT 2026-05-11 (post-canonical-spec correction)
+
+The original audit cited `old/BLOG_POST.md` (now deleted) as the architectural
+authority. That was the wrong file. The **canonical spec** is now
+[`BLOG_SPEC.md`](BLOG_SPEC.md) in this directory. Key directive (line 3 of
+the spec):
+
+> "...100% pure transformer with no exotic architecture choices...
+> **no encoder-decoder no python loop other than the standard generation
+> loop, no auxiliary memory or python variables, no special memory
+> management or special masking**, just a standard auto regressive decode
+> only transformer and generation loop and things that are actually done
+> in real LLMs for optimizations."
+
+And on I/O (line 851):
+
+> "...In neural I/O mode (the default), stdin and stdout are handled
+> **purely through transformer attention with no runner intervention**."
+
+This rewrites the **"blog-spec intentional" categorization** below. Per
+the canonical spec, the only acceptable Python infrastructure is:
+1. The standard autoregressive generation loop.
+2. Tool-calling mode (opt-in, NOT the default): `Token.TOOL_CALL` boundary
+   to host syscalls (V8/V16) — `c4_release/docs/BLOG_SPEC.md:851` carves
+   this out as the opt-in mode.
+
+Everything else, including the items the old audit marked "deferred-
+architectural / pragmatic per blog", is a real violation per the canonical:
+
+- **V2** `_inject_mem_metadata` ADDR_KEY decode — NOT pragmatic, must be
+  neural (the spec line 830 describes the binary-key + per-byte AND + MoE
+  one-hot mask mechanism explicitly).
+- **V5** `_memory` dict — NOT pragmatic, must be replaced by neural memory
+  via KV cache + ALiBi mem-attention.
+- **V6** `_mem_history` — same; replace via KV cache retention.
+- **V9** pure_neural shims (`_neural_prtf_emit`, `_neural_open_emit`,
+  `_neural_clos_emit`, `_neural_read_emit`, `_inject_getchar`) — NOT
+  intentional in neural I/O mode. Spec line 851 says stdout/stdin via THINK
+  tag protocol: model emits THINK_END, a visible char byte, then re-enters
+  THINK_START. Input bytes injected between USER_INPUT_START/END markers
+  and read via position-tracking heads + nibble cascade.
+- **V10** pure_neural MEM-persistence shim — context-rewriting Python loop;
+  violates "no python loop other than the standard generation loop". Must
+  go.
+- **V11** stdin buffer — acceptable only inside tool-calling mode; in
+  neural I/O mode the bytes must arrive via USER_INPUT_START/END markers
+  in the token stream.
+- **V17** `_decode_exit_code` — debatable. Result extraction is on the
+  generation-loop boundary, similar to reading sampled tokens; probably
+  OK but flag for review.
+
+**What stays acceptable:**
+- V8/V16: tool-calling mode opt-in (opcode → TOOL_CALL → host syscall →
+  AX override). Per spec line 842-849, this is an intentional second mode.
+- V20: prefix-embedding cache. It's a memoisation of deterministic
+  computation, not Python state.
+
+**Net headline (corrected):** the *pure_neural-blocking* set is now closer
+to ~10 items, not 2. The "blog-spec intentional" pile collapses to ~2
+(V8/V16 in tool-calling mode only). See the
+[`STACK0_VIA_MEM_ATTENTION_PLAN.md`](STACK0_VIA_MEM_ATTENTION_PLAN.md) and
+the in-flight ALiBi mem-attention work for the V3/V5/V6/V10 path.
+
+---
+
 This document inventories the **remaining Python state that is folded back
 into the neural model** after today's purity migrations land (I1 bake of
 initial PC, I2 positional-encoding of ADDR_KEY, I3 thinking marker bake, B2
 deletion of MEM_EXEC, and the in-flight alibi-mem-attention migration for
 `_inject_mem_store`). It is intended as a complete TODO map for future
-purity work, cross-referenced against the blog post architectural intent.
+purity work, cross-referenced against the blog post architectural intent
+(now [`BLOG_SPEC.md`](BLOG_SPEC.md), not the deleted `old/BLOG_POST.md`).
 
 The audit covers four surfaces:
 
