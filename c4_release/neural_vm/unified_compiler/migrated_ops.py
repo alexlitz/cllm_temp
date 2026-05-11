@@ -2348,6 +2348,11 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
             alu_cls = getattr(eau, alu_cls_name)
         block.ffn = HybridALUBlock(block.ffn, alu_cls(S, _SetDim))
 
+    # Phase=1180 + layer_idx*0.01: hybrid wraps must fire AFTER all FFN
+    # bakes (including L14 cleanup and convo-IO ops at phases 8.5/10.6/15.1)
+    # AND AFTER the dead-unit zero passes (l6_dead_unit_zero=1160,
+    # l7_dead_unit_zero=1170 which require the original PureFFN), but BEFORE
+    # right_size_ffns (1200) which prunes dead units after wrapping.
     return Operation(
         name=name,
         reads=set(),
@@ -2355,7 +2360,7 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
         kind="block",
         layer_idx=layer_idx,
         bake_fn=bake,
-        phase=layer_idx + 0.5,
+        phase=1180 + layer_idx * 0.01,
         migrated=True,
     )
 
@@ -3587,40 +3592,179 @@ def make_l10_alu_divmod_install_op() -> Operation:
     return make_alu_divmod_composite_ops()[3]
 
 
-def make_legacy_bake_op(
-    *,
-    alu_mode: str = "lookup",
-    enable_conversational_io: bool = False,
-    enable_tool_calling: bool = False,
-) -> Operation:
-    """Bridge op: invoke the legacy set_vm_weights pipeline as a model-level bake.
+def make_residual_alibi_slopes_op() -> Operation:
+    """Bake the residual ALiBi-slope mutations previously inline in set_vm_weights.
 
-    This is the migration bridge — it lets `compile_full_vm` orchestrate the
-    full bake through compiler dispatch even before every individual op has
-    been split into its own compiler Operation. The legacy bake is just one
-    "op" the compiler runs; as individual ops migrate out into their own
-    Operation instances, the legacy pipeline shrinks.
+    Migrated 2026-05-11 (architectural milestone — final piece of the
+    set_vm_weights → compiler-ops migration). Replaces the per-layer
+    ``attn.alibi_slopes.fill_(...)`` and ``alibi_slopes[i] = ...`` writes
+    that used to live in the inline body of ``set_vm_weights``:
 
-    Phase 999 ensures it runs last, after all other compiler ops. Reads and
-    writes are empty since the dependency graph already orders the per-layer
-    bakes via the per-op Operation declarations.
+      - L6 (head 0..4): fill_(0.0), then [0]=5.0, [1]=5.0, [2]=0.5,
+        [3]=0.5, [4]=5.0 — must run BEFORE the legacy_bake retirement
+        because ``make_opcode_relay_head_op`` (phase=1002) writes
+        [6]=5.0 / [7]=5.0 and relies on the head-6/7 slots already being
+        zero (per the docstring's "fill_(0.0) wipes" argument).
+      - L8: fill_(0.5) — head-3/4 multibyte fetch / OP_IMM relay use
+        the L8-wide gentle recency.
+      - L10 head 0..4 (lookup) / 0..3 (efficient): steep carry relay +
+        gentle byte passthrough slopes. Mode-conditional.
+      - L14: fill_(0.1) — slight recency bias for MEM generation.
+      - L15: fill_(0.01) — gentle latest-write-wins bias for memory lookup.
+
+    Phase=999 places this exactly where ``legacy_bake`` used to run,
+    preserving the previous override contract relative to phase-1002
+    ``opcode_relay_head`` (which still needs to write [6]/[7]=5.0
+    AFTER the L6 fill_(0.0)).
     """
     def _bake(model, dim_positions, S):
-        from ..vm_step import set_vm_weights
-        set_vm_weights(
-            model,
-            enable_tool_calling=enable_tool_calling,
-            enable_conversational_io=enable_conversational_io,
-            alu_mode=alu_mode,
-        )
+        # L6: head 0..4 slopes
+        attn6 = model.blocks[6].attn
+        if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
+            attn6.alibi_slopes.fill_(0.0)
+            attn6.alibi_slopes[0] = 5.0
+            attn6.alibi_slopes[1] = 5.0
+            attn6.alibi_slopes[2] = 0.5  # STACK0←AX relay: prefer nearest AX marker
+            attn6.alibi_slopes[3] = 0.5  # SP←AX relay: prefer nearest AX marker
+            attn6.alibi_slopes[4] = 5.0  # BZ/BNZ relay: attend to nearest AX marker
+
+        # L8: per-layer recency
+        attn8 = model.blocks[8].attn
+        if hasattr(attn8, 'alibi_slopes') and attn8.alibi_slopes is not None:
+            attn8.alibi_slopes.fill_(0.5)
+
+        # L14: slight recency bias for same-step preference
+        if len(model.blocks) > 14:
+            attn14 = model.blocks[14].attn
+            if hasattr(attn14, 'alibi_slopes') and attn14.alibi_slopes is not None:
+                attn14.alibi_slopes.fill_(0.1)
+
+        # L15: gentle recency bias for latest-write-wins
+        if len(model.blocks) > 15:
+            attn15 = model.blocks[15].attn
+            if hasattr(attn15, 'alibi_slopes') and attn15.alibi_slopes is not None:
+                attn15.alibi_slopes.fill_(0.01)
 
     return Operation(
-        name="legacy_bake",
+        name="residual_alibi_slopes",
         reads=set(),
         writes=set(),
         kind="model",
         bake_fn=_bake,
         phase=999,
+        migrated=True,
+    )
+
+
+def make_layer10_residual_alibi_slopes_op(alu_mode: str = 'lookup') -> Operation:
+    """Bake the residual L10 ALiBi-slope mutations previously inline in set_vm_weights.
+
+    Mode-conditional: in lookup mode, head 0..4 slopes are written
+    (carry relay + 3 byte-passthrough heads + STACK0 byte relay for
+    bitwise). In efficient mode, head 0..3 slopes are written (no
+    STACK0 byte relay — that was lookup-only).
+
+    Phase=999.1 places this after ``residual_alibi_slopes`` (phase 999)
+    so it runs in the same "post-block-ops, pre-post-passes" window the
+    legacy bake occupied.
+    """
+    def _bake(model, dim_positions, S):
+        if len(model.blocks) <= 10:
+            return
+        attn10 = model.blocks[10].attn
+        if not (hasattr(attn10, 'alibi_slopes') and attn10.alibi_slopes is not None):
+            return
+        attn10.alibi_slopes[0] = 5.0  # head 0: steep slope for carry relay
+        attn10.alibi_slopes[1] = 1.0  # head 1: AX byte passthrough
+        attn10.alibi_slopes[2] = 1.0  # head 2: SP byte passthrough
+        attn10.alibi_slopes[3] = 0.5  # head 3: PSH STACK0 passthrough
+        if alu_mode == 'lookup':
+            attn10.alibi_slopes[4] = 1.0  # head 4: STACK0 byte relay for bitwise
+
+    return Operation(
+        name="layer10_residual_alibi_slopes",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=_bake,
+        phase=999.1,
+        migrated=True,
+    )
+
+
+def make_layer8_op_imm_relay_op() -> Operation:
+    """L8 head 4: Relay OP_IMM from AX marker to AX byte positions.
+
+    Migrated 2026-05-11 from the inline block at vm_step.py:2029-2043 that
+    programmed attn8 head 4's Q/K/V/O slots for OP_IMM relay (with a GATE4
+    sub-head). At AX byte positions (IS_BYTE + H1[AX_I]), this head attends
+    to AX marker (MARK_AX) and copies OP_IMM to byte positions.
+
+    Phase=8.4 places it AFTER ``layer8_multibyte_routing`` (8.3) but BEFORE
+    the L8 hybrid_alu_wrap (phase 8.5) so attention bakes complete before
+    the FFN wrap.
+    """
+    def _bake(block, dim_positions, S):
+        BD = _as_setdim_proxy(dim_positions)
+        attn8 = block.attn
+        HD = attn8.W_q.shape[0] // attn8.num_heads
+        base = 4 * HD
+        AX_I = 1
+        L8_relay = 20.0
+        attn8.W_q[base, BD.IS_BYTE] = L8_relay
+        attn8.W_q[base, BD.H1 + AX_I] = L8_relay
+        attn8.W_q[base, BD.CONST] = -L8_relay * 1.5
+        attn8.W_k[base, BD.MARK_AX] = L8_relay
+        attn8.W_k[base, BD.IS_BYTE] = -L8_relay * 10
+        attn8.W_k[base, BD.CONST] = L8_relay * 0.5
+        attn8.W_v[base, BD.OP_IMM] = 1.0
+        attn8.W_o[BD.OP_IMM, base] = 1.0
+        GATE4 = 1
+        attn8.W_q[base + GATE4, BD.IS_BYTE] = 500.0
+        attn8.W_q[base + GATE4, BD.CONST] = -500.0
+        attn8.W_k[base + GATE4, BD.CONST] = 5.0
+
+    return Operation(
+        name="layer8_op_imm_relay",
+        reads={"IS_BYTE", "H1", "MARK_AX", "OP_IMM", "CONST"},
+        writes={"OP_IMM"},
+        kind="block",
+        bake_fn=_bake,
+        layer_idx=8,
+        phase=8.4,
+        migrated=True,
+    )
+
+
+def make_contract_validation_op() -> Operation:
+    """Run the contract validator. Previously inline in set_vm_weights.
+
+    The validator prints any contract errors but does not raise — it's
+    diagnostic only. Kept as a compiler op so the diagnostic still fires
+    after every full bake. Phase=1199 (just before ``right_size_ffns``
+    at 1200) so all layer/block/model bakes have completed.
+    """
+    def _bake(model, dim_positions, S):
+        from ..dim_registry import (
+            build_default_registry,
+            build_default_contracts,
+            ContractValidator,
+        )
+        reg = build_default_registry()
+        contracts = build_default_contracts(reg)
+        errors = ContractValidator(reg, contracts).validate()
+        if errors:
+            for e in errors:
+                print(f"  CONTRACT: {e}")
+
+    return Operation(
+        name="contract_validation",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=_bake,
+        phase=1199,
+        migrated=True,
     )
 
 
