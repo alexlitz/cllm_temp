@@ -2409,6 +2409,33 @@ def _set_layer3_ffn(ffn, S, BD):
     ffn.W_down[BD.EMBED_HI + pc_hi, unit] = -2.0 / S  # Also undo EMBED
     unit += 1
 
+    # INITIAL_PC_BAKE CANCEL: undo the REG_PC token-embedding initial-PC bake
+    # at MARK_PC AND HAS_SE positions (i.e. every step-1+ PC marker).
+    #
+    # Migration 2026-05-11 (i1): the runtime `_inject_initial_pc` injection in
+    # NeuralVMEmbedding (which wrote EMBED_LO+PC_OFFSET_LO=1.0 and
+    # EMBED_HI+PC_OFFSET_HI=1.0 only at step-0's REG_PC) was replaced by
+    # baking that pattern directly into the REG_PC token-embedding row. The
+    # bake naturally fires at every REG_PC position, so step-1+ PC markers
+    # also pick up the +1.0/+1.0 contribution and would corrupt the L3
+    # carry-forward result on EMBED_LO/HI. These two cancel units subtract
+    # -1.0 from EMBED_LO+PC_OFFSET_LO and EMBED_HI+PC_OFFSET_HI when
+    # MARK_PC AND HAS_SE — restoring step-1+ behavior to the exact pre-bake
+    # residual stream. See `make_initial_pc_bake_op` in
+    # unified_compiler/ops/model_ops.py for the embedding-side bake.
+    init_pc_lo = PC_OFFSET & 0xF
+    init_pc_hi = (PC_OFFSET >> 4) & 0xF
+    ffn.W_up[unit, BD.HAS_SE] = S
+    ffn.b_up[unit] = -S * 0.5
+    ffn.W_gate[unit, BD.MARK_PC] = 1.0
+    ffn.W_down[BD.EMBED_LO + init_pc_lo, unit] = -1.0 / S
+    unit += 1
+    ffn.W_up[unit, BD.HAS_SE] = S
+    ffn.b_up[unit] = -S * 0.5
+    ffn.W_gate[unit, BD.MARK_PC] = 1.0
+    ffn.W_down[BD.EMBED_HI + init_pc_hi, unit] = -1.0 / S
+    unit += 1
+
     # SP DEFAULT: STACK_INIT = 0x10000
     # Bytes: 0x00, 0x00, 0x01, 0x00
     # At SP positions, default to 0 for bytes 0,1,3 and 1 for byte 2.

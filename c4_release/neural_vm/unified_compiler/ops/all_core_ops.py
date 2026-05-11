@@ -227,6 +227,10 @@ def all_core_ops(
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
+        # Initial-PC bake: writes the PC_OFFSET pattern into the REG_PC
+        # token-embedding row (replaces the runtime `_inject_initial_pc`).
+        # Phase=1001.5 so it runs just AFTER embedding_bake (1001).
+        make_initial_pc_bake_op(),
         # L6 attn head 6 opcode relay (phase=1002): runs AFTER legacy_bake's
         # `attn6.alibi_slopes.fill_(0.0)` so the alibi_slopes[6]/[7]=5.0 writes
         # survive. See docstring on make_opcode_relay_head_op for details.
