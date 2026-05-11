@@ -36,7 +36,6 @@ def _run(runner, prog, max_steps=8):
 class TestPureNeuralJMP:
     """Unconditional jumps."""
 
-    @pytest.mark.xfail(reason="pure_neural JMP not yet supported (PC never redirects, hangs at step 1)")
     def test_jmp_forward(self, pure_neural_runner):
         assert _run(pure_neural_runner, [
             (Opcode.JMP, 2),
