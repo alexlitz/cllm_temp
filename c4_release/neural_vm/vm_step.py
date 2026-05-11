@@ -1926,11 +1926,13 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
     # migrated=True). No dep anchor needed (the legacy code never declared
     # an op for this function). Inline call removed to avoid double-bake.
 
-    # L6 opcode relay: broadcast PSH/ADJ/pop flags from AX → SP/STACK0
-    if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
-        attn6.alibi_slopes[6] = 5.0
-        attn6.alibi_slopes[7] = 5.0  # JSR PC+5 relay: steep for head 7
-    _set_opcode_relay_head(attn6, S, BD, HD)
+    # L6 opcode relay (head 6 + alibi_slopes[6/7]=5.0) — MIGRATED: now
+    # installed via `make_opcode_relay_head_op` in
+    # `unified_compiler/migrated_ops.py` (kind="model", phase=1002,
+    # migrated=True). Phase=1002 (AFTER legacy_bake's phase=999) is required
+    # so the op's alibi_slopes[6]/[7]=5.0 writes survive the
+    # `attn6.alibi_slopes.fill_(0.0)` performed inline above. Inline call
+    # removed to avoid double-bake.
 
     # IO PUTCHAR routing (L6 FFN: sets IO_IS_PUTCHAR, routes AX → OUTPUT) —
     # MIGRATED: now installed via `make_io_putchar_routing_op` in
