@@ -534,15 +534,30 @@ class BinaryOpByteZeroingPostOp(PureFFN):
     Phase 0 conversion (2026-05-09): subclasses PureFFN.
     """
 
-    def __init__(self, d_model=512, S=100.0):
+    def __init__(self, d_model=512, S=100.0, dim_positions=None):
         object.__setattr__(self, '_pending_S', S)
+        # Stash dim_positions BEFORE super().__init__ so _bake_weights (called
+        # from PureFFN.__init__) sees compact positions if provided. Without
+        # this, the post-op writes to legacy `_SetDim` positions which collide
+        # with unrelated dims in compact (pin_io_only=True) layouts — e.g.
+        # `_SetDim.H1 + 1 = 68` aliases compact `EMBED_HI[15]`, triggering this
+        # post-op for any AX byte whose hi nibble is 0xF (the IMM 240/255 bug).
+        object.__setattr__(self, '_pending_dim_positions', dim_positions)
         super().__init__(dim=d_model, hidden_dim=4)
         self.d_model = d_model
         self.S = S
 
     def _bake_weights(self):
         S = self._pending_S
-        BD = _SetDim
+        dim_positions = getattr(self, '_pending_dim_positions', None)
+        if dim_positions is not None:
+            # Use compact dim_positions through the setdim proxy so the bake
+            # function below resolves each `BD.<NAME>` to the compact position
+            # (not the legacy `_SetDim` position).
+            from .unified_compiler.ops.shared import _as_setdim_proxy
+            BD = _as_setdim_proxy(dim_positions)
+        else:
+            BD = _SetDim
         op_dims = [BD.OP_ADD, BD.OP_SUB, BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT,
                    BD.OP_LE, BD.OP_GE, BD.OP_SHL, BD.OP_SHR,
                    BD.OP_MUL, BD.OP_DIV, BD.OP_MOD]
