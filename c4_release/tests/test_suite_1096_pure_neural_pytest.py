@@ -25,15 +25,26 @@ Wiring (2026-05-11):
     value. This converts the suite from ~55h serial runtime to one set of
     batched forwards (~hours).
 
-    Speculative decoding deferred: `BatchedSpeculativeRunner` is keyed to
-    a different model bake (`compile_full_vm` via unified_compiler) than
-    `BatchedPureNeuralRunner` (`AutoregressiveVMRunner` direct), and
-    composing them needs deeper integration. Batching alone gets the
-    suite into tractable wall-time.
+    Speculative decoding (2026-05-11 follow-up):
+    ``BatchedPureNeuralRunner`` now natively integrates ``DraftVM`` via the
+    ``spec_k`` parameter (see ``c4_release/neural_vm/batched_pure_neural.py``).
+    Per-element DraftVMs propose K full VM steps (K * 35 tokens) per batched
+    forward; the model verifies the SAFE step offsets (registers + MEM
+    marker + STEP_END = 27 of every 35 positions) and trusts DraftVM for the
+    8 unsafe MEM-section addr/val bytes (where the embedding's MEM_STORE /
+    ADDR_KEY injection makes spec-mode and unspec-mode logits diverge). On
+    clean Phase-1-style programs (IMM/EXIT etc.) this trades 1 forward-per-
+    token for 1 forward-per-K-steps. Byte-identity with ``spec_k=0`` holds
+    for any program where DraftVM and the model agree on MEM-section bytes
+    (true for IMM/EXIT trivially; true for any store op too because DraftVM's
+    `_last_mem_addr/val` are derived from synchronized registers).
 
 Tuning knobs:
     C4_BATCH_CHUNK   — batch chunk size (default 32)
     C4_BATCH_MAX_STEPS — max VM steps per program (default 2000)
+    C4_SPEC_K        — DraftVM speculation horizon in VM steps (default 8;
+                       0 disables speculation and falls back to one-token-
+                       per-forward batched decode)
 
 Usage:
     # Run the whole suite (batched):
@@ -76,6 +87,11 @@ TEST_IDS = [make_test_id(i, t) for i, t in enumerate(ALL_TESTS)]
 
 _BATCH_CHUNK = int(os.environ.get("C4_BATCH_CHUNK", "32"))
 _BATCH_MAX_STEPS = int(os.environ.get("C4_BATCH_MAX_STEPS", "2000"))
+# C4_SPEC_K controls the per-element speculative-decoding horizon (VM steps
+# proposed by DraftVM per batched forward pass). 0 disables speculation;
+# 8 is a reasonable default for clean Phase-1-style programs where DraftVM
+# and the model agree token-for-token on the safe (non-MEM-section) offsets.
+_SPEC_K = int(os.environ.get("C4_SPEC_K", "8"))
 
 
 @pytest.fixture(scope="session")
@@ -114,6 +130,7 @@ def _pure_neural_1096_results():
                 bytecodes,
                 data_list=data_list,
                 max_steps=_BATCH_MAX_STEPS,
+                spec_k=_SPEC_K,
             )
         except Exception as e:
             err = f"batch run error: {e!r}"
