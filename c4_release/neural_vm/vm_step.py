@@ -1962,17 +1962,17 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         _set_tool_call_detection(ffn6, S, BD)
 
     # ===== CONVERSATIONAL I/O (optional) =====
-    if enable_conversational_io:
-        # L5 FFN: decode PRTF/READ → IO_IS_PRTF, IO_IS_READ at AX marker
-        _set_conversational_io_opcode_decode(ffn5, S, BD)
-        # L6 attention heads 4-5: relay IO_IS_PRTF, IO_IS_READ from AX → SE
-        # Changed from heads 6-7 to avoid conflict with _set_opcode_relay_head (head 6)
-        if hasattr(attn6, 'alibi_slopes') and attn6.alibi_slopes is not None:
-            attn6.alibi_slopes[4] = 5.0  # steep ALiBi for head 4 (PRTF relay)
-            attn6.alibi_slopes[5] = 5.0  # steep ALiBi for head 5 (READ relay)
-        _set_conversational_io_relay_heads(attn6, S, BD, HD)
-        # L6 FFN: CMP[5]/CMP[6] AND NEXT_SE → NEXT_THINKING_END (start I/O sequence)
-        _set_conversational_io_state_machine(ffn6, S, BD)
+    # MIGRATED: the three convo-I/O bakes (L5 opcode_decode / L6 relay_heads /
+    # L6 state_machine) are now compiler block ops
+    # ``make_convo_io_opcode_decode_op`` (phase 5.6, layer_idx=5),
+    # ``make_convo_io_relay_heads_op`` (phase 6.3, layer_idx=6), and
+    # ``make_convo_io_state_machine_op`` (phase 6.6, layer_idx=6) in
+    # ``unified_compiler/migrated_ops.py``. All three are gated by
+    # ``enable_conversational_io`` (factory parameter, threaded through
+    # ``all_core_ops`` and ``compile_full_vm``). The relay_heads bake folds
+    # the two ALiBi slope mutations (attn6.alibi_slopes[4]=5.0 for PRTF,
+    # [5]=5.0 for READ) into the migrated op. Inline calls and the ALiBi
+    # mutations removed to avoid double-bake.
 
     # ===== LAYER 7: Operand gather + memory relay heads =====
     # Migrated to compiler ops `layer7_operand_gather` and `layer7_memory_heads`

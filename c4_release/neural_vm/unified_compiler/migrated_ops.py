@@ -2425,6 +2425,141 @@ def make_io_putchar_routing_op() -> Operation:
     )
 
 
+def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Operation:
+    """Bake ``_set_conversational_io_opcode_decode`` into ``model.blocks[5].ffn``.
+
+    Originally an inline call in ``set_vm_weights`` under
+    ``if enable_conversational_io:``:
+        ``_set_conversational_io_opcode_decode(ffn5, S, BD)``
+
+    Decodes PRTF/READ opcodes at the AX marker and writes IO_IS_PRTF /
+    IO_IS_READ flags (L5 FFN units 410-411). Gated by
+    ``enable_conversational_io``: when the flag is False the bake_fn is a
+    no-op so the op can remain registered for dep-graph stability. The op
+    is pinned to ``layer_idx=5`` via ``kind="block"`` so the bake hits
+    ``model.blocks[5].ffn`` (matching the legacy direct-FFN access). Block
+    ops run BEFORE legacy_bake (phase 999) and right_size_ffns (phase 1200),
+    so the FFN units we write survive rightsize trimming.
+
+    Phase 5.6 places this AFTER ``opcode_decode_ffn`` (phase 5; same L5 FFN)
+    so its base opcode decoder is in place before the convo_io extension
+    units are added, matching the legacy in-set_vm_weights ordering.
+    """
+    def bake(block, dim_positions, S):
+        if not enable_conversational_io:
+            return
+        from ..vm_step import _set_conversational_io_opcode_decode
+        _set_conversational_io_opcode_decode(
+            block.ffn, S, _as_setdim_proxy(dim_positions)
+        )
+
+    return Operation(
+        name="convo_io_opcode_decode",
+        phase=5.6,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        layer_idx=5,
+        migrated=True,
+    )
+
+
+def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Operation:
+    """Bake ``_set_conversational_io_relay_heads`` into ``model.blocks[6].attn``.
+
+    Originally an inline call in ``set_vm_weights`` under
+    ``if enable_conversational_io:`` (with two ALiBi slope mutations folded
+    in here for self-containment):
+        ``attn6.alibi_slopes[4] = 5.0  # PRTF relay``
+        ``attn6.alibi_slopes[5] = 5.0  # READ relay``
+        ``_set_conversational_io_relay_heads(attn6, S, BD, HD)``
+
+    Programs L6 attention heads 4-5 to relay IO_IS_PRTF / IO_IS_READ from
+    the AX marker → SE position. Head 4 also shares Q/K rows with
+    ``_set_bz_bnz_relay`` (programmed at phase 998.7) but writes
+    non-overlapping dim columns (Q[NEXT_SE/ACTIVE_OPCODE_PRTF] vs
+    Q[MARK_PC/OP_BZ/OP_BNZ]; V[base+37] vs V[base+1..36]; O[CMP+5,base+37]
+    vs O[CMP+5,base+4]).
+
+    Phase 999.5 (``kind="model"``): MUST run AFTER ``legacy_bake`` (999)
+    because legacy_bake's L6 setup begins with
+    ``attn6.alibi_slopes.fill_(0.0)`` followed by per-head slope assignments
+    for heads 0-4 / 6-7. A block-op phase (which would run before the model
+    ops including legacy_bake) sees its alibi slopes for heads 4-5 clobbered
+    by that fill_. Running here, after legacy_bake's slope setup, preserves
+    the ``alibi_slopes[4]=5.0, [5]=5.0`` writes. The Q/K/V/O writes are also
+    additive into legacy-untouched cells (legacy_bake no longer programs L6
+    attn Q/K/V/O — those came from ``make_layer6_attn_bake_op`` at 998.5).
+
+    Gated by ``enable_conversational_io``: bake_fn is a no-op when False.
+    """
+    def bake(model, dim_positions, S):
+        if not enable_conversational_io:
+            return
+        from ..vm_step import _set_conversational_io_relay_heads
+        attn = model.blocks[6].attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[4] = 5.0  # PRTF relay
+            attn.alibi_slopes[5] = 5.0  # READ relay
+        HD = attn.W_q.shape[0] // attn.num_heads
+        _set_conversational_io_relay_heads(
+            attn, S, _as_setdim_proxy(dim_positions), HD
+        )
+
+    return Operation(
+        name="convo_io_relay_heads",
+        phase=999.5,
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
+def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Operation:
+    """Bake ``_set_conversational_io_state_machine`` into ``model.blocks[6].ffn``.
+
+    Originally an inline call in ``set_vm_weights`` under
+    ``if enable_conversational_io:``:
+        ``_set_conversational_io_state_machine(ffn6, S, BD)``
+
+    Programs the L6 FFN state-machine entry: CMP[5]/CMP[6] AND NEXT_SE →
+    emit NEXT_THINKING_END, suppress NEXT_SE, set IO_STATE = 1. Writes
+    L6 FFN units 1400-1401 (separate from the routing-FFN units 0-1033
+    and the function-call-weights units 1700-2158).
+
+    Gated by ``enable_conversational_io``: bake_fn is a no-op when False.
+    Pinned to ``layer_idx=6`` via ``kind="block"`` so the bake hits
+    ``model.blocks[6].ffn``. Block ops run BEFORE right_size_ffns
+    (phase 1200), so the FFN units we write survive rightsize trimming.
+
+    Phase 6.6 places this AFTER ``layer6_routing_ffn`` (phase 6.5) so the
+    convo-io extension units are appended after the base routing FFN, and
+    BEFORE the model-level FFN bakes at phase 998 (function_call_weights,
+    io_putchar_routing) which write higher-numbered units.
+    """
+    def bake(block, dim_positions, S):
+        if not enable_conversational_io:
+            return
+        from ..vm_step import _set_conversational_io_state_machine
+        _set_conversational_io_state_machine(
+            block.ffn, S, _as_setdim_proxy(dim_positions)
+        )
+
+    return Operation(
+        name="convo_io_state_machine",
+        phase=6.6,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        layer_idx=6,
+        migrated=True,
+    )
+
+
 def make_head_bake_op() -> Operation:
     """Bake the output projection head: byte/marker token logits.
 
@@ -3375,11 +3510,16 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
     )
 
 
-def all_core_ops(alu_mode: str = "lookup") -> list:
+def all_core_ops(
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+) -> list:
     """Return the full list of migrated core-VM operations.
 
-    Doesn't include I/O, conversational, or tool-call operations (those need
-    their own migration pass).
+    Doesn't include I/O or tool-call operations (those need their own
+    migration pass). The conversational-I/O ops are always registered to
+    keep the dep-graph stable, but their bake_fns are no-ops when
+    ``enable_conversational_io`` is False.
 
     ``alu_mode`` is forwarded to ops whose bake action depends on whether the
     legacy lookup ALU or the efficient neural ALU owns a given operation
@@ -3495,6 +3635,21 @@ def all_core_ops(alu_mode: str = "lookup") -> list:
         # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
         # L6 FFN unit writes survive the rightsize pass at end of legacy_bake.
         make_io_putchar_routing_op(),
+        # Conversational-I/O bakes (3 block ops, all gated by
+        # ``enable_conversational_io``). When the flag is False each bake_fn
+        # is a no-op so the dep-graph layout stays stable. Phases 5.6 / 6.3 /
+        # 6.6 place these alongside the existing L5/L6 FFN + L6 attn bakes,
+        # ahead of the model-level bakes at phase 998. Inline calls in
+        # set_vm_weights have been removed to avoid double-bake.
+        make_convo_io_opcode_decode_op(
+            enable_conversational_io=enable_conversational_io
+        ),
+        make_convo_io_relay_heads_op(
+            enable_conversational_io=enable_conversational_io
+        ),
+        make_convo_io_state_machine_op(
+            enable_conversational_io=enable_conversational_io
+        ),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
         make_embedding_bake_op(),
