@@ -46,15 +46,8 @@ from neural_vm.unified_compiler.runtime_audit import (  # noqa: E402
 
 KNOWN_NON_VANILLA_ALLOWLIST = frozenset({
     # Lookup-mode (default) leftovers.
-    "AddSub5StageBlock",          # TODO: remove once hybrid removal completes (L8/L9 ADD/SUB FFN)
-    "ALUAndOrXor",                # TODO: remove once hybrid removal completes (L10 bitwise FFN)
     "ALUMul",                     # TODO: remove once hybrid removal completes (L11/L12 MUL FFN)
     "ALUShift",                   # TODO: remove once hybrid removal completes (L13 SHL/SHR FFN)
-
-    # Efficient-mode flattened ALU composites — still non-vanilla wrappers,
-    # not vanilla `nn.Sequential` of Linear yet.
-    "FlattenedALUMul",            # TODO: remove once hybrid removal completes (L11/L12 efficient MUL)
-    "ALUShiftComposite",          # TODO: remove once hybrid removal completes (L13 efficient SHL/SHR)
 
     # Post-op family (installed via `block.ffn = ...` after `_expand_wrapper_blocks`
     # splits HybridALUBlock and post_ops into their own blocks).
@@ -62,7 +55,16 @@ KNOWN_NON_VANILLA_ALLOWLIST = frozenset({
     "CarryPropagationPostOp",     # TODO: remove once hybrid removal completes (ADD/SUB carry propagation)
     "BitwiseBytePropagationPostOp",  # TODO: remove once hybrid removal completes (bitwise byte propagation)
     "ComparisonCombine",          # TODO: remove once hybrid removal completes (comparison combine, efficient mode)
-    "FlattenedDivMod",            # TODO: remove once hybrid removal completes (L10 DIV/MOD composite)
+
+    # Note: the 5 vanilla-flattened ALU composites — ``FlattenedALUMul``,
+    # ``AddSub5StageBlock``, ``FlattenedDivMod``, ``ALUShiftComposite``,
+    # and ``ALUAndOrXor`` — were removed from this allowlist on 2026-05-11
+    # once ``verify_runtime_is_vanilla`` learned to recognise the
+    # "nn.Sequential of PureFFNs" composite pattern via
+    # ``_is_pureffn_composite``. Each of the 5 classes carries no learned
+    # parameters of its own; every parameter-bearing leaf inside them is a
+    # ``GenericPureFFN``, so the audit now (correctly) reports them as
+    # vanilla.
 })
 
 

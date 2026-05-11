@@ -140,6 +140,110 @@ def _class_name(obj) -> str:
     return type(obj).__name__
 
 
+# Names of FFN-equivalent parameter signatures. A module is "PureFFN-equivalent"
+# if it owns these four parameters as ``nn.Parameter`` tensors (the canonical
+# SwiGLU FFN shape: up + gate + down projections plus the up-projection bias).
+# ``b_gate`` / ``b_down`` are technically also present on ``PureFFN``, but the
+# canonical four are sufficient to identify the shape unambiguously.
+_PUREFFN_PARAM_NAMES = ("W_up", "W_gate", "W_down", "b_up")
+
+
+def _is_pureffn_equivalent(module) -> bool:
+    """Return True if `module` exposes the PureFFN parameter signature.
+
+    A module is "PureFFN-equivalent" if it has the four canonical FFN
+    parameters (``W_up``, ``W_gate``, ``W_down``, ``b_up``) as
+    ``nn.Parameter`` tensors. This catches both:
+
+      - ``PureFFN`` itself and direct subclasses, and
+      - ``GenericFlattenedFFN``-style wrappers that re-export the same
+        parameters as ``@property`` views onto a held ``ffn`` member.
+
+    Shape sanity: ``W_up.shape == W_gate.shape``, ``W_down.shape ==
+    W_up.T.shape``, and ``b_up.shape == (W_up.shape[0],)`` are required so
+    that an unrelated module that happens to define same-named buffers
+    won't slip through.
+    """
+    for pname in _PUREFFN_PARAM_NAMES:
+        if not hasattr(module, pname):
+            return False
+    try:
+        W_up = module.W_up
+        W_gate = module.W_gate
+        W_down = module.W_down
+        b_up = module.b_up
+    except Exception:
+        return False
+    # All four must be tensors.
+    if not all(isinstance(t, torch.Tensor) for t in (W_up, W_gate, W_down, b_up)):
+        return False
+    # SwiGLU shape contract: W_up [H, D], W_gate [H, D], W_down [D, H],
+    # b_up [H]. Allow either dense or sparse-coo layouts.
+    if W_up.ndim != 2 or W_gate.ndim != 2 or W_down.ndim != 2 or b_up.ndim != 1:
+        return False
+    if W_up.shape != W_gate.shape:
+        return False
+    H, D = W_up.shape
+    if W_down.shape != (D, H):
+        return False
+    if b_up.shape != (H,):
+        return False
+    return True
+
+
+def _is_sequential_of_pureffns(module) -> bool:
+    """Return True if `module` is an ``nn.Sequential`` whose every child is
+    PureFFN-equivalent (or recursively a Sequential-of-PureFFNs).
+
+    This recognises the "compiler-baked composite" pattern: an ALU pipeline
+    whose forward is a literal ``nn.Sequential`` chain over vanilla FFN
+    stages, with no exotic parameter-bearing modules in between.
+
+    Pure orchestration wrappers (no direct parameters of their own) that
+    hold a single PureFFN-equivalent inside are also accepted, so e.g.
+    ``GenericFlattenedFFN`` (a wrapper around a ``PureFFN``) and stage
+    adapters like ``_MulFFNStage(sub_ffn=...)`` qualify.
+    """
+    if not isinstance(module, nn.Sequential):
+        return False
+    if len(module) == 0:
+        return False
+    for child in module:
+        if not _is_pureffn_composite(child):
+            return False
+    return True
+
+
+def _is_pureffn_composite(module) -> bool:
+    """Return True if `module` is either a PureFFN, a Sequential-of-PureFFNs,
+    or an orchestration wrapper whose every parameter-bearing leaf is
+    PureFFN-equivalent.
+
+    The third case is what makes the 5 compiler-baked ALU composites
+    (``FlattenedALUMul``, ``AddSub5StageBlock``, ``FlattenedDivMod``,
+    ``ALUShiftComposite``, ``ALUAndOrXor``) classify as vanilla: each is a
+    stack of FFN-like sub-stages (the parameter-bearing leaves are all
+    PureFFNs) wrapped in pure-Python control flow that carries no learned
+    parameters of its own.
+    """
+    if _is_pureffn_equivalent(module):
+        return True
+    if isinstance(module, nn.Sequential):
+        return _is_sequential_of_pureffns(module)
+    # Walk the module tree. Every leaf that owns ``nn.Parameter`` instances
+    # directly must be PureFFN-equivalent. Wrapper modules (no direct
+    # parameters of their own) are transparent.
+    found_any = False
+    for sub in module.modules():
+        # ``modules()`` yields ``module`` itself first; treat it like any
+        # other node — its parameters (if any) must be PureFFN-equivalent.
+        if list(sub._parameters.keys()):
+            if not _is_pureffn_equivalent(sub):
+                return False
+            found_any = True
+    return found_any
+
+
 def _is_vanilla_ffn(module) -> bool:
     """Return True if `module` is a standard FFN.
 
@@ -148,6 +252,14 @@ def _is_vanilla_ffn(module) -> bool:
       - nn.Identity (passthrough).
       - A pure nn.Linear or a tiny nn.Sequential of nn.Linear / SiLU / GELU
         (treats common transformer FFN forms as vanilla).
+      - An ``nn.Sequential`` whose every child is PureFFN-equivalent
+        (canonical "compiler-baked composite" pattern: a stack of vanilla
+        FFN sub-stages chained via Sequential).
+      - A composite wrapper whose parameter-bearing leaves are all
+        PureFFN-equivalent (catches ALU composites like ``FlattenedALUMul``
+        / ``AddSub5StageBlock`` / ``FlattenedDivMod`` / ``ALUShiftComposite``
+        / ``ALUAndOrXor`` that hold an ``nn.Sequential`` pipeline of
+        PureFFN-based stages under a top-level wrapper class).
     """
     name = _class_name(module)
     if name in VANILLA_FFN_CLASSES:
@@ -158,7 +270,18 @@ def _is_vanilla_ffn(module) -> bool:
         return True
     if isinstance(module, nn.Sequential):
         allowed = (nn.Linear, nn.SiLU, nn.GELU, nn.ReLU, nn.Identity, nn.Dropout)
-        return all(isinstance(m, allowed) for m in module)
+        if all(isinstance(m, allowed) for m in module):
+            return True
+        # New: nn.Sequential of PureFFN-equivalents is also vanilla.
+        if _is_sequential_of_pureffns(module):
+            return True
+        return False
+    # Composite wrapper whose leaves are all PureFFN-equivalent (the 5
+    # compiler-baked ALU composites). Only opt in for modules that have
+    # at least one parameter-bearing leaf — bare wrappers (e.g. format
+    # converters with no params) should still be flagged.
+    if _is_pureffn_composite(module):
+        return True
     return False
 
 
