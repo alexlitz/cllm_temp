@@ -518,140 +518,45 @@ def _set_layer5_fetch(attn, S, BD, HD):
         attn.W_o[BD.OPCODE_BYTE_LO + k, base + 32 + k] = 1.0
         attn.W_o[BD.OPCODE_BYTE_HI + k, base + 48 + k] = 1.0
 
-    # Head 6: Direct OP_* flag relay from CODE to PC marker (non-first steps)
-    # DEPRECATED: OP_* flags were removed from embeddings (2026-04-13).
-    # Head 5 + L5 FFN opcode decode now provides OP_* at PC marker.
-    # This bypasses the OPCODE_BYTE mechanism and uses the OP_* flags set in embeddings.
-    # For non-first steps, PC value is in EMBED_LO/HI at PC marker (from L4 relay).
-    # Query for current PC address, match CODE byte with that ADDR_KEY, copy OP_* flags.
-    base = 6 * HD
-    # Q: PC marker, address from EMBED_LO/HI (current PC)
-    for k in range(16):
-        attn.W_q[base + k, BD.EMBED_LO + k] = L
-        attn.W_q[base + 16 + k, BD.EMBED_HI + k] = L
-    attn.W_q[base + 32, BD.MARK_PC] = L  # Only at PC marker
+    # Head 6: DELETED 2026-05-11.
+    #
+    # Previously: "Direct OP_* flag relay from CODE to PC marker (non-first
+    # steps)". Marked DEPRECATED on 2026-04-13 because OP_* flags were
+    # removed from CODE-byte token embeddings. After that removal the head
+    # had no functional value on its own — V[base + slot] reads OP_<NAME>
+    # from the matched CODE byte, but those dims are all 0 on byte tokens.
+    #
+    # Worse, the head's V slots [base+1 .. base+16] COLLIDE with the
+    # ``_set_function_call_weights`` ENT-relay writes on the SAME L5 attn:
+    #   attn5.W_v[6*HD + 1 + k, EMBED_LO + k] = 1.0  (BP→TEMP ENT relay)
+    # On byte token N, EMBED_LO[N & 0xF] = 1.0. That value gets aliased
+    # onto OP_LEA / OP_EXIT / OP_JMP / OP_JSR / OP_ADD / OP_SUB / ...
+    # via the deprecated head 6 W_v rows. The deprecated head's Q/K fire
+    # at the PC marker on every non-first step, so the byte-value bits of
+    # the current PC-byte get written to those OP_* dims at PC. With BZ
+    # opcode = 4, EMBED_LO[4] = 1 leaks into OP_ADD (slot 5), which the
+    # branch_override_patch then treats as a "non-BZ opcode active"
+    # blocker and silences the BZ taken-path override unit.
+    #
+    # OP_BZ/BNZ/LEV/EXIT/JMP at PC come from the L5 FFN all-step decode
+    # (vm_step.py:3271-3285), and the remaining OP_* flags propagate via
+    # the L6 opcode_relay_head (AX → PC/SP/STACK0/BP/MEM). Head 6 here
+    # was redundant, so we zero it out to eliminate the collision.
+    #
+    # NOTE: Q[base + k]/K[base + k] (slots 0..32) of head 6 are still
+    # written by _set_function_call_weights for the BP→TEMP ENT relay;
+    # those rows write *different* dim positions (MARK_STACK0, MARK_BP,
+    # EMBED_LO/HI vs EMBED_LO/HI, ADDR_KEY), and the two attentions are
+    # gated by mutually exclusive markers (STACK0 vs PC). So leaving the
+    # ENT-relay Q/K/V/O in place is safe; only the deprecated PC-marker
+    # OP_* relay needs to go.
 
-    # K: match ADDR_KEY in CODE section
-    for k in range(16):
-        attn.W_k[base + k, BD.ADDR_KEY + k] = L
-        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
-    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
-
-    # Anti-leakage gate
-    GATE = 33
-    attn.W_q[base + GATE, BD.MARK_PC] = 500.0
-    attn.W_q[base + GATE, BD.CONST] = -500.0
-    attn.W_k[base + GATE, BD.CONST] = 5.0
-
-    # HAS_SE gate: only fire on non-first steps
-    HAS_SE_GATE = 34
-    attn.W_q[base + HAS_SE_GATE, BD.HAS_SE] = 500.0
-    attn.W_q[base + HAS_SE_GATE, BD.CONST] = -500.0
-    attn.W_k[base + HAS_SE_GATE, BD.CONST] = 5.0
-
-    # V: copy OP_* flags from CODE byte (these are set in embeddings)
-    # Copy the main opcode flags that Layer 6 needs for routing
-    v_offset = 0
-    attn.W_v[base + v_offset, BD.OP_IMM] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_LEA] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_EXIT] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_JMP] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_JSR] = 1.0; v_offset += 1  # ADDED for neural JSR (non-first steps)
-    attn.W_v[base + v_offset, BD.OP_ADD] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_SUB] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_MUL] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_DIV] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_MOD] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_OR] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_XOR] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_AND] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_EQ] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_LT] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_SHL] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_SHR] = 1.0; v_offset += 1
-
-    # O: write OP_* flags to PC marker
-    o_offset = 0
-    attn.W_o[BD.OP_IMM, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_LEA, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_EXIT, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_JMP, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_JSR, base + o_offset] = 1.0; o_offset += 1  # ADDED for neural JSR (non-first steps)
-    attn.W_o[BD.OP_ADD, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_SUB, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_MUL, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_DIV, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_MOD, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_OR, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_XOR, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_AND, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_EQ, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_LT, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_SHL, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_SHR, base + o_offset] = 1.0; o_offset += 1
-
-    # Head 7: Direct OP_* flag relay from CODE to PC marker (first step only)
-    # Same as Head 6, but for first step (NOT HAS_SE instead of HAS_SE).
-    base = 7 * HD
-    # Q: PC marker when NOT HAS_SE, queries for address PC_OFFSET
-    attn.W_q[base, BD.MARK_PC] = L
-    attn.W_q[base, BD.HAS_SE] = -L  # only on first step
-    # Q: address PC_OFFSET (e.g., 2: ADDR_KEY_LO[2]=1, ADDR_KEY_HI[0]=1)
-    attn.W_q[base + (PC_OFFSET & 0xF), BD.CONST] = L  # lo nibble
-    attn.W_q[base + 16 + ((PC_OFFSET >> 4) & 0xF), BD.CONST] = L  # hi nibble
-    attn.W_q[base + 32, BD.MARK_PC] = L  # third nibble gate
-
-    # K: match ADDR_KEY in CODE section
-    for k in range(16):
-        attn.W_k[base + k, BD.ADDR_KEY + k] = L
-        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
-    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
-
-    # Anti-leakage gate
-    GATE = 33
-    attn.W_q[base + GATE, BD.MARK_PC] = 500.0
-    attn.W_q[base + GATE, BD.CONST] = -500.0
-    attn.W_k[base + GATE, BD.CONST] = 5.0
-
-    # V: copy OP_* flags from CODE byte (these are set in embeddings)
-    v_offset = 0
-    attn.W_v[base + v_offset, BD.OP_IMM] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_LEA] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_EXIT] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_JMP] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_JSR] = 1.0; v_offset += 1  # ADDED for neural JSR
-    attn.W_v[base + v_offset, BD.OP_ADD] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_SUB] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_MUL] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_DIV] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_MOD] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_OR] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_XOR] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_AND] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_EQ] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_LT] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_SHL] = 1.0; v_offset += 1
-    attn.W_v[base + v_offset, BD.OP_SHR] = 1.0; v_offset += 1
-
-    # O: write OP_* flags to PC marker
-    o_offset = 0
-    attn.W_o[BD.OP_IMM, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_LEA, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_EXIT, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_JMP, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_JSR, base + o_offset] = 1.0; o_offset += 1  # ADDED for neural JSR
-    attn.W_o[BD.OP_ADD, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_SUB, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_MUL, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_DIV, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_MOD, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_OR, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_XOR, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_AND, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_EQ, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_LT, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_SHL, base + o_offset] = 1.0; o_offset += 1
-    attn.W_o[BD.OP_SHR, base + o_offset] = 1.0; o_offset += 1
+    # Head 7: DELETED 2026-05-11 alongside Head 6 — same DEPRECATED rationale.
+    # Head 7 was the first-step (NOT HAS_SE) counterpart; the first-step
+    # PC-marker OP_* flags are now written directly by the L5 FFN
+    # first-step decodes (vm_step.py:3054-3249). No active L5 attn writer
+    # collides with Head 7's V slots today, but we drop it for symmetry and
+    # to prevent the same class of latent collision in the future.
 
 
 
