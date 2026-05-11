@@ -42,12 +42,6 @@ def _run(runner, prog, max_steps=30):
 class TestPureNeuralLongIMMSequences:
     """Multi-IMM dispatch beyond Phase 1's 5-IMM ceiling."""
 
-    @pytest.mark.xfail(
-        reason="Phase 1 fixed multi-IMM dispatch up through 5 IMMs; the "
-               "_set_layer4_ffn carry-aware rotation needs extension to "
-               "handle 6+ IMMs (being worked by another agent).",
-        strict=False,
-    )
     def test_six_imms(self, pure_neural_runner):
         assert _run(pure_neural_runner, [
             (Opcode.IMM, 1),
@@ -59,12 +53,6 @@ class TestPureNeuralLongIMMSequences:
             Opcode.EXIT,
         ]) == 6
 
-    @pytest.mark.xfail(
-        reason="Phase 1 fixed multi-IMM dispatch up through 5 IMMs; the "
-               "_set_layer4_ffn carry-aware rotation needs extension to "
-               "handle 10+ IMMs (being worked by another agent).",
-        strict=False,
-    )
     def test_ten_imms(self, pure_neural_runner):
         assert _run(pure_neural_runner, [
             (Opcode.IMM, 1),
