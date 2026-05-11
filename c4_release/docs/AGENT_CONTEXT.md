@@ -82,17 +82,18 @@ Authoritative source: `c4_release/neural_vm/embedding.py`. Search for `class Opc
 ## Compiler / migration architecture
 
 - `LayerCompiler` in `unified_compiler/layer_compiler.py` manages the bake.
-- Each migrated `_set_layerN_*` function has an `Operation` factory in `unified_compiler/migrated_ops.py`.
-- `Operation` has `migrated: bool` (default False). When True, `build_model_from_layout` dispatches its `bake_fn` even when `legacy_bake` is present.
-- `legacy_bake` is a model-level Operation that wraps `set_vm_weights`. As ops migrate, set_vm_weights' inline calls are removed and the corresponding `Operation.migrated` flag is set to True.
+- `compile_full_vm` (in `unified_compiler/full_vm_compiler.py`) is the **sole bake authority**. `make_legacy_bake_op` was deleted (2026-05-11); there is no `legacy_bake` bridge op anymore. `set_vm_weights` still exists in `vm_step.py` but is **backward-compat only** for direct external callers — the compiler does not invoke it.
+- Each migrated `_set_layerN_*` function has an `Operation` factory in `unified_compiler/ops/lN_ops.py` (per-layer modules). `unified_compiler/migrated_ops.py` is now a 30-line re-export shim — import from `ops/` directly for new code.
+- `Operation` has `migrated: bool` (default False). All compiler-installed ops are now `migrated=True` since `legacy_bake` is gone.
 - Block-scoped ops (`kind="block"`, `layer_idx=N`) target a specific layer.
 - Model-scoped ops (`kind="model"`) operate on the whole model.
+- Phase ordering still references the historical 998/999/1001/1002 slots in many op docstrings/phases — these used to bracket `legacy_bake@999`. The numbers persist as ordering anchors even though no bake op runs at 999 anymore.
 
 ## Test files (per phase)
 
 | Phase | Test file | Branch (if not on main) | Status |
 |---|---|---|---|
-| 1 | `tests/test_pure_neural_pc.py` | main | 13/13 ✓ |
+| 1 | `tests/test_pure_neural_pc.py` | main | 13/13 ✓ (closed 2026-05-11) |
 | 2 | `tests/test_pure_neural_psh_add.py` | main | 10/16 |
 | 2-ext | `tests/test_pure_neural_phase2_ext.py` | branch (not on main) | new |
 | 3 | `tests/test_pure_neural_multibyte.py` | `phase3-multibyte-pure-neural-tests` | 9 xfail |
@@ -120,14 +121,12 @@ Session-scoped — model build is cached across tests. ~6.8s cold, ~0s warm.
 ## Known good / known bad
 
 **Pure-neural confirmed working:**
-- IMM 5 → 5
-- IMM, IMM, IMM (1-5 sequential) — Phase 1 indentation fix landed
+- Phase 1 (PC/AX coherence): 13/13 — all IMM/NOP sequences, including 5+ sequential IMMs (CarryProp clamp + L14 OUTPUT restore landed 2026-05-11)
 - ADD/SUB with non-zero operands
 - DIV (4 cases), MOD (4 cases)
 - MUL and SHR likely also work (under-tested)
 
 **Pure-neural confirmed NOT working:**
-- 6+ sequential IMMs (root in different layer than `_set_layer4_ffn` carry-aware)
 - Bitwise AND/OR/XOR (root deeper than threshold; bitwise threshold theory disproved)
 - Zero-edge: ADD(0, 5) — bug is in PSH(0) STACK0 byte 0 emission
 - LEV semantics — OP_LEV relay disabled at L6 head 6, so all L9/L15/L16 LEV gates never fire
@@ -195,9 +194,9 @@ Before reporting "fix didn't work" or "function is broken":
 
 ### Block-op pinning is required during migration
 
-When the compiler-assigned layer differs from the legacy `model.blocks[N]` layer, migrated `_set_layerN_*` ops MUST use `kind="block"` with an explicit `layer_idx=N` until the corresponding `set_vm_weights` references are removed. If you forget to pin, the bake silently writes weights to the wrong block — no error, just incorrect output.
+When the compiler-assigned layer differs from the legacy `model.blocks[N]` layer, migrated `_set_layerN_*` ops MUST use `kind="block"` with an explicit `layer_idx=N`. If you forget to pin, the bake silently writes weights to the wrong block — no error, just incorrect output.
 
-Rule of thumb: if there is still a legacy reference to the old block index in `set_vm_weights`, the migrated `Operation` factory must declare `kind="block", layer_idx=N`.
+**As of 2026-05-11**, `LayerCompiler._assign_layers` also honors `layer_idx` for `kind="attn"` and `kind="ffn"` ops (commit `b101578` / `293f189`): a pinned attn/ffn op lands at exactly its `layer_idx`, and the dep-graph invariant (every read dim's producer is at a strictly-earlier layer, OR same-layer with lower phase, OR attn-then-ffn at same phase) is enforced as a hard check. Previously dep-graph placement could silently shift migrated attn/ffn ops to the wrong block (see `docs/MODEL_REGRESSION_BISECT.md`). New rule: any migrated attn/ffn op that targets a specific semantic block should declare `layer_idx=N`.
 
 See ADR-001 (`docs/adrs/ADR-001-target-op-name.md`) for the binding rationale.
 
@@ -248,11 +247,13 @@ Raw weight patches make migration brittle and resist re-baking. New ops should c
 
 `ALUMul`, `ALUShift`, `ALUAndOrXor`, and `ALUAddSub` are now compiler-installed composites — no more runtime instantiation in `efficient_alu_neural.py`. They still wrap multiple sub-FFNs internally, however.
 
+`HybridALUBlock` (the lookup-mode wrapper that ran a structural neural ALU on top of a lookup-table FFN) was **deleted 2026-05-11** (commit `45b1f14`). ALU modules that previously needed the wrapper are now attached as `block.post_ops` and split out by `_expand_wrapper_blocks` at runtime. Some `make_*_hybrid_alu_wrap_op` factories and doc comments still reference "HybridALUBlock" — those are historical naming; the actual wrapper class is gone.
+
 True "blocks of attn+FFN at runtime" (the future-pure architecture) requires residual-stream BD↔GE conversion, which is unfinished. Until then, the composite is the right factoring: declarative install-time, multi-FFN bake. See ADR-004.
 
-## Compiler migration patterns (2026-05-10)
+## Compiler migration patterns (2026-05-10/11)
 
-15+ migration units landed today moving inline bakes out of `set_vm_weights` (a 500+ line function in `c4_release/neural_vm/vm_step.py`) into discrete `Operation` instances in `c4_release/neural_vm/unified_compiler/migrated_ops.py`. Three patterns crystallized; each was rediscovered by multiple agents who debugged their way to it. Pick the right pattern up front to avoid that pain.
+15+ migration units in the 2026-05-10/11 window moved inline bakes out of `set_vm_weights` into discrete `Operation` instances. The op factories now live in per-layer modules under `c4_release/neural_vm/unified_compiler/ops/lN_ops.py` (split out 2026-05-11, commit `c3d8427`); `migrated_ops.py` is a 30-line re-export shim. As of 2026-05-11, `make_legacy_bake_op` has been deleted (commit `0b77e62`) and the compiler is the sole bake authority. Three patterns crystallized; each was rediscovered by multiple agents who debugged their way to it. Pick the right pattern up front to avoid that pain.
 
 ### Pattern 1: In-place placeholder → migrated (CLEANEST)
 
@@ -282,14 +283,14 @@ When you want to ADD a new migrated op (no existing placeholder to convert), and
 
 ### Pattern 3: `kind="model"` for override-ordering
 
-When a bake intentionally OVERRIDES later inline writes (e.g., two functions both write the same attention head weights, and the later write is supposed to win), the migrated op must run AFTER the override target. Since `kind="block"` ops dispatch BEFORE `kind="model"` ops in `build_model_from_layout`, use:
+When a bake intentionally OVERRIDES earlier writes from other model ops (e.g., two functions both write the same attention head weights, and the later write is supposed to win), the migrated op must run AFTER the override target. Since `kind="block"` ops dispatch BEFORE `kind="model"` ops in `build_model_from_layout`, use:
 
-- `kind="model"` with `phase=998.X` (between `make_function_call_weights_op` at 998 and `make_legacy_bake_op` at 999)
-- If the override target is itself a `kind="model"` op, use an even later phase like `phase=1002` (between `make_embedding_bake_op` at 1001 and `make_branch_override_patch_op` at 1100)
+- `kind="model"` with a phase in the 998/1001/1002 ordering anchors (these slots used to bracket `legacy_bake@999`, which is now deleted; the numbers persist as ordering anchors).
+- Phases 998.X sit before the phase-999 residual-alibi-slopes bake; phases 1002+ sit after embedding/head bakes.
 
 **Concrete examples**:
 - Unit B (`migrate-l6-attn-bakes`): L6 `_set_layer6_relay_heads` head-7 writes override `_set_function_call_weights` head-7 writes. Used `kind="model"` phases 998.5 / .6 / .7.
-- Unit 6 (`migrate-everything-unit6`, `_set_opcode_relay_head`): used `kind="model", phase=1002` because the bake's `alibi_slopes[6/7]=5.0` writes get clobbered by an inline `attn6.alibi_slopes.fill_(0.0)` at phase=999 (inside `legacy_bake`).
+- Unit 6 (`migrate-everything-unit6`, `_set_opcode_relay_head`): used `kind="model", phase=1002` because the bake's `alibi_slopes[6/7]=5.0` writes were clobbered by an earlier inline `attn6.alibi_slopes.fill_(0.0)` previously at phase=999 in `legacy_bake`.
 
 ### Flag-gated ops
 
