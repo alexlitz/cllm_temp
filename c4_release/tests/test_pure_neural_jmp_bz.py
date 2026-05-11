@@ -10,7 +10,15 @@ pure_neural mode does not yet redirect PC for any branch op.
 
 import pytest
 
+from neural_vm.constants import INSTR_WIDTH, PC_OFFSET
 from neural_vm.embedding import Opcode
+
+
+# Branch opcodes whose immediate is an instruction *index*. The neural model's
+# L6 PC override sets PC = imm directly (no idx*INSTR_WIDTH multiply), and the
+# C4 compiler emits imm = idx*INSTR_WIDTH + PC_OFFSET. So the tests must encode
+# branch targets as PC values, not raw indices.
+BRANCH_OPS = {Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.JSR}
 
 
 def _make_bc(prog):
@@ -18,6 +26,8 @@ def _make_bc(prog):
     for item in prog:
         if isinstance(item, tuple):
             op, imm = item
+            if op in BRANCH_OPS:
+                imm = imm * INSTR_WIDTH + PC_OFFSET
             bc.append((imm << 8) | op)
         else:
             bc.append(item)
@@ -44,7 +54,6 @@ class TestPureNeuralJMP:
             Opcode.EXIT,
         ]) == 9
 
-    @pytest.mark.xfail(reason="pure_neural JMP not yet supported at step >=2 (L5 head 3 fixed-address lookup)")
     def test_jmp_from_step_2(self, pure_neural_runner):
         assert _run(pure_neural_runner, [
             (Opcode.IMM, 5),
@@ -55,7 +64,6 @@ class TestPureNeuralJMP:
             Opcode.EXIT,
         ]) == 7
 
-    @pytest.mark.xfail(reason="pure_neural backward JMP not yet supported (L5 fetch addr stale across steps)")
     def test_jmp_backward(self, pure_neural_runner):
         assert _run(pure_neural_runner, [
             (Opcode.IMM, 5),
