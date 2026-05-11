@@ -2,9 +2,9 @@
 Spec-compliant Soft Mixture-of-Experts FFN for the Neural VM.
 
 Replaces the legacy ``PureFFN.compact_moe`` + ``AutoregressiveVM.set_active_opcode``
-runtime weight-swap path. All experts run in parallel and are soft-blended by
-opcode-onehot signals read directly from the activation tensor — no Python-side
-dispatch, no ``object.__setattr__`` weight mutation, no bytecode peek.
+runtime weight-swap path. Routing is driven by opcode-onehot signals read
+directly from the activation tensor — no Python-side dispatch, no
+``object.__setattr__`` weight mutation, no bytecode peek.
 
 Architecture::
 
@@ -14,16 +14,21 @@ Where ``opcode_weight[i]`` is the value at the embedding dim that encodes
 "opcode i is active" (set by an earlier layer, e.g. L5 fetch which decodes
 the opcode byte from the bytecode at the PC position).
 
-The routing signal is **pooled across sequence positions** (max over seq) so
-that a single per-batch weight steers the residual blend. This matches the
-intent of the legacy ``set_active_opcode`` path (one active opcode per step)
-while being tensor-only and ONNX-traceable.
+The routing signal is pooled across sequence positions so a single per-batch
+weight steers the residual blend. This matches the intent of the legacy
+``set_active_opcode`` path (one active opcode per step) while remaining
+tensor-only and ONNX-traceable.
 
-Fast path: at runtime ``forward`` skips experts whose pooled weight is below
-``threshold`` (uses ``.item()`` for branching — fine for handler-mode inference
-but invalid under ONNX tracing). When ``torch.onnx.is_in_onnx_export()`` is
-true OR ``pure_neural`` is set on the module, ``_soft_forward`` runs all
-experts in parallel with no Python control flow.
+Runtime path (always on for inference): ``forward`` skips experts whose pooled
+weight is below ``threshold`` using ``.item()`` for branching. For one-hot
+opcode routing this is functionally equivalent to top-1 dispatch — exactly
+one expert (the one whose opcode is active for the current step) runs per
+forward call, matching the legacy ``set_active_opcode`` behavior.
+
+ONNX export path: when ``torch.onnx.is_in_onnx_export()`` returns True, the
+fast path's Python control flow is unsafe (``.item()`` breaks the graph), so
+``_soft_forward`` runs every expert in parallel with no Python branching.
+This path is reserved exclusively for tracing — never used at runtime.
 """
 
 import torch
@@ -46,9 +51,11 @@ class SoftMoEFFN(nn.Module):
             Neural VM this is e.g. ``_SetDim.OP_ADD = 287``, ``OP_SUB = 288``,
             etc. Read directly via ``x[:, :, dim]``.
         threshold: Skip experts whose pooled weight is below this value in the
-            fast forward path. Has no effect on the ONNX/pure-neural soft path.
-        pure_neural: If True, always use ``_soft_forward`` (no Python control
-            flow, ONNX-traceable). Default False (fast path with skip-inactive).
+            runtime forward path. Has no effect on the ONNX soft path.
+        pure_neural: Deprecated. Retained as a no-op constructor kwarg for
+            backward compatibility — the sparse skip-inactive path now runs
+            in every runtime mode (only ``torch.onnx.is_in_onnx_export()``
+            switches to the all-experts soft path).
     """
 
     def __init__(
@@ -74,15 +81,21 @@ class SoftMoEFFN(nn.Module):
         )
         self.num_experts = len(experts)
         self.threshold = threshold
+        # No-op: kept for back-compat with existing callers (e.g.
+        # ``build_soft_moe_from_compact_partition(..., pure_neural=...)``).
+        # Routing no longer reads this flag — only ONNX export switches paths.
         self.pure_neural = pure_neural
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Default: fast path with skip-inactive routing.
+        """Sparse routing: only experts whose opcode signal is active run.
 
-        Falls through to ``_soft_forward`` under ONNX tracing or when
-        ``pure_neural=True`` so the resulting graph is static.
+        For one-hot opcode routing (the canonical Neural VM case) exactly one
+        expert fires per forward call — equivalent to top-1 dispatch.
+
+        The all-experts ``_soft_forward`` path runs only under ONNX export
+        tracing, where ``.item()``-based skipping would break the static graph.
         """
-        if self.pure_neural or torch.onnx.is_in_onnx_export():
+        if torch.onnx.is_in_onnx_export():
             return self._soft_forward(x)
 
         # Per-position routing: weight is the opcode-onehot value at every
@@ -111,7 +124,8 @@ class SoftMoEFFN(nn.Module):
 
         No Python control flow (the ``for`` loop unrolls statically at trace
         time because ``num_experts`` and each ``opcode_dim`` are Python ints).
-        No ``.item()`` calls.
+        No ``.item()`` calls. Reserved exclusively for ONNX export — never
+        executed at runtime.
         """
         output = torch.zeros_like(x)
         for i in range(self.num_experts):
@@ -123,7 +137,12 @@ class SoftMoEFFN(nn.Module):
         return x + output
 
     def set_pure_neural(self, flag: bool) -> None:
-        """Toggle between fast (skip-inactive) and soft (all-experts) paths."""
+        """Deprecated no-op kept for back-compat.
+
+        Runtime routing is always sparse (skip-inactive); only ONNX export
+        tracing switches to the all-experts soft path. The flag is recorded
+        on the module but has no effect on ``forward``.
+        """
         self.pure_neural = bool(flag)
 
     def sparsify(self) -> None:
@@ -170,7 +189,9 @@ def build_soft_moe_from_compact_partition(
             ``compact_moe``'s opcode-affinity scan).
         shared_indices: List of hidden-unit indices that are opcode-independent.
         dim: Model embedding dim (``d_model``).
-        pure_neural: Default ``pure_neural`` value for the resulting module.
+        pure_neural: Deprecated no-op (forwarded to ``SoftMoEFFN`` for
+            back-compat). Routing is always sparse at runtime; only ONNX
+            export switches to the all-experts path.
 
     Returns:
         A ``SoftMoEFFN`` whose ``experts`` are per-opcode ``PureFFN`` modules
