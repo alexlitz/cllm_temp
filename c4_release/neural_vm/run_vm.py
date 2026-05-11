@@ -788,7 +788,7 @@ class AutoregressiveVMRunner:
                 self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
                 self._override_register_in_last_step(context, Token.STACK0, return_addr)
                 jsr_target_idx = bytecode[exec_idx] >> 8
-                jsr_target_pc = self._resolve_target_pc(jsr_target_idx)
+                jsr_target_pc = self._resolve_target_pc(jsr_target_idx, bytecode)
                 self._last_pc = jsr_target_pc
                 self._override_register_in_last_step(context, Token.REG_PC, jsr_target_pc)
             elif exec_op == Opcode.ENT:
@@ -831,7 +831,7 @@ class AutoregressiveVMRunner:
                 # `JMP -> IMM,99 -> IMM,42 -> EXIT` fails neurally. Required
                 # until the operand-specific JMP target-resolution lands.
                 target_idx = bytecode[exec_idx] >> 8
-                target_pc = self._resolve_target_pc(target_idx)
+                target_pc = self._resolve_target_pc(target_idx, bytecode)
                 self._last_pc = target_pc
                 self._override_register_in_last_step(context, Token.REG_PC, target_pc)
             elif exec_op == Opcode.BZ:
@@ -840,7 +840,7 @@ class AutoregressiveVMRunner:
                 # test_pure_neural_jmp_bz BZ taken/not-taken cases xfail.
                 # Required.
                 target_idx = bytecode[exec_idx] >> 8
-                target_pc = self._resolve_target_pc(target_idx)
+                target_pc = self._resolve_target_pc(target_idx, bytecode)
                 if self._last_ax == 0:
                     self._last_pc = target_pc
                     self._override_register_in_last_step(context, Token.REG_PC, target_pc)
@@ -851,7 +851,7 @@ class AutoregressiveVMRunner:
                 # TODO(phase-4): remove once pure_neural BNZ taken-path works
                 # (same blocker as BZ). Required.
                 target_idx = bytecode[exec_idx] >> 8
-                target_pc = self._resolve_target_pc(target_idx)
+                target_pc = self._resolve_target_pc(target_idx, bytecode)
                 if self._last_ax != 0:
                     self._last_pc = target_pc
                     self._override_register_in_last_step(context, Token.REG_PC, target_pc)
@@ -1749,8 +1749,25 @@ class AutoregressiveVMRunner:
             return PC_OFFSET
         return self._last_pc
 
-    @staticmethod
-    def _resolve_target_pc(target):
+    def _resolve_target_pc(self, target, bytecode=None):
+        """Resolve a branch target to a PC value.
+
+        Tests historically use raw instruction indices (e.g., `(JMP, 2)`
+        meaning "jump to instruction 2"), while the C4 compiler emits PC
+        values directly (idx*INSTR_WIDTH + PC_OFFSET). We disambiguate as
+        follows:
+
+        - If ``target`` looks like a raw index (less than the number of
+          instructions in ``bytecode``), prefer the raw-index interpretation.
+          This avoids the historical bug where ``target=2`` (raw idx 2) was
+          mis-read as PC=2 (instruction 0) because ``2 % INSTR_WIDTH == PC_OFFSET``.
+        - Otherwise, if ``target`` is byte-aligned to the PC scheme
+          (``target % INSTR_WIDTH == PC_OFFSET``), treat it as an already-encoded
+          PC value (compiler-emitted convention).
+        - Fallback: treat as a raw index and convert.
+        """
+        if bytecode is not None and 0 <= target < len(bytecode):
+            return target * INSTR_WIDTH + PC_OFFSET
         if target % INSTR_WIDTH == PC_OFFSET:
             return target
         return target * INSTR_WIDTH + PC_OFFSET
