@@ -1980,8 +1980,19 @@ def make_layer1_threshold_attn_op() -> Operation:
         phase=1,
         reads={"IS_MARK", "MARK_SE_ONLY", "CONST"},
         writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE"},
-        kind="attn",
-        bake_fn=bake,
+        # FIX 2026-05-11 (Phase 5 root-cause): pin to block 1 via kind="block"+
+        # layer_idx=1 so this op doesn't get mis-placed into block 0's attn
+        # slot. The previous kind="attn" form let LayerCompiler._assign_layers
+        # assign this op to block 0 (the (0, "attn") slot was unclaimed because
+        # layer0_threshold uses kind="block"), causing block 0's L0 threshold
+        # bake to overwrite W_q/W_k while L1's W_o (writes to L1H0/L1H1/L1H2)
+        # remained — so L1H0/L1H1/L1H2 ended up using L0's coarse thresholds
+        # (3.5/4.5/7.5) instead of (0.5/1.5/2.5). That broke L3 PC carry-
+        # forward (K = L1H1 - L1H0 = 0 at byte positions) and every multi-step
+        # pure_neural test downstream. See docs/PHASE_5_LEV_INSTRUMENTATION.md.
+        kind="block",
+        layer_idx=1,
+        bake_fn=lambda block, dp, S: bake(block.attn, dp, S),
         migrated=True,
     )
 
@@ -2004,8 +2015,12 @@ def make_layer2_threshold_attn_op() -> Operation:
         phase=2,
         reads={"IS_MARK", "CONST"},
         writes={"L2H0"},
-        kind="attn",
-        bake_fn=bake,
+        # FIX 2026-05-11 (Phase 5 root-cause): pin to block 2 via kind="block"+
+        # layer_idx=2 for the same reason as layer1_threshold_attn — prevents
+        # collision with layer0_threshold's block op on the (0, "attn") slot.
+        kind="block",
+        layer_idx=2,
+        bake_fn=lambda block, dp, S: bake(block.attn, dp, S),
         migrated=True,
     )
 
