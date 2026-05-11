@@ -254,6 +254,34 @@ def all_core_ops(
         make_putchar_think_protocol_op(
             enable_neural_io_think_protocol=enable_neural_io_think_protocol,
         ),
+        # Neural-I/O THINK-tag protocol PRTF bake (phase 6.6): flag-gated
+        # under the same ``enable_neural_io_think_protocol`` switch as
+        # PUTCHAR. Phase 2a: bake_fn is a no-op stub — the full
+        # PRTF byte-emission chain is already baked under
+        # ``enable_conversational_io`` (L5/L6/L7/L8/L9/L10/L15 helpers
+        # in setup_helpers.py + vm_step.py). This op anchors the
+        # PRTF-specific reads/writes in the dep graph and exposes the
+        # scaffolding so a Phase-2b worker can flip the flag to True
+        # and bake any additional cleanup units (e.g. IO_FORMAT_POS
+        # reset) without restructuring the migration chain.
+        # See c4_release/docs/V9_PRTF_NEURAL_PLAN.md for the full design.
+        make_prtf_think_protocol_op(
+            enable_neural_io_think_protocol=enable_neural_io_think_protocol,
+        ),
+        # OPEN/CLOS TOOL_CALL boundary-opcode dep anchor (phase 6.7).
+        # Per BLOG_SPEC.md:853, these two opcodes are not candidates
+        # for neural I/O (file descriptors cross the host boundary).
+        # The canonical design is to emit a TOOL_CALL token at step end
+        # so the runner can perform os.open/os.close — already baked
+        # under ``enable_tool_calling=True`` via make_tool_call_*_op
+        # below. This op's bake_fn is always a no-op; it exists to
+        # document the OPEN/CLOS reads/writes in the dep graph and to
+        # anchor a future Phase A bake (e.g. an OPEN/CLOS-specific
+        # marker dim). See c4_release/docs/V9_PRTF_NEURAL_PLAN.md
+        # § Phase A.
+        make_open_clos_tool_call_op(
+            enable_tool_calling=enable_tool_calling,
+        ),
         # Tool-call bakes (phase 998.8): flag-gated. Always registered so the
         # registration list is stable; bake_fn is a no-op when
         # `enable_tool_calling=False`. The 3 ops replace inline calls in
