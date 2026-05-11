@@ -463,7 +463,11 @@ class AutoregressiveVMRunner:
             (output_string, exit_code) tuple
         """
         self._bytecode = bytecode
-        self._stdin_buffer = list(stdin) if stdin else []
+        # V11 (2026-05-11): in pure_neural / neural-I/O mode stdin bytes
+        # live in the token stream between USER_INPUT_START/END markers (see
+        # `_build_context`, per BLOG_SPEC.md:851); the runner-side buffer is
+        # only used by the legacy tool-calling shims and stays empty.
+        self._stdin_buffer = [] if self.pure_neural else list(stdin or "")
         self._stdin_pos = 0
         self._tool_handler = tool_handler
         self._tool_call_id = 0
@@ -887,10 +891,9 @@ class AutoregressiveVMRunner:
                     and not self.enable_neural_io_think_protocol):
                 output.append(chr(neural_ax & 0xFF))
 
-            # GETCHAR (Phase 6, pure_neural): no neural attention head reads
-            # USER_INPUT_START..USER_INPUT_END into AX yet, so fall back to the
-            # runner-side stdin injection. Gated on exec_op so no other path is
-            # affected.
+            # GETCHAR: `_inject_getchar` short-circuits in pure_neural (V11);
+            # see its docstring. Call left in place so the tool-calling path
+            # stays symmetric.
             if exec_op == Opcode.GETCHAR:
                 self._inject_getchar(context)
 
@@ -1273,7 +1276,13 @@ class AutoregressiveVMRunner:
         to read from the stdin buffer in its weights.
 
         If stdin is exhausted, injects -1 (0xFFFFFFFF) for EOF.
+
+        No-op in pure_neural / neural-I/O mode (V11, 2026-05-11): stdin
+        bytes live between USER_INPUT_START/END markers in the token stream
+        and the neural GETCHAR bake routes them into REG_AX.
         """
+        if self.pure_neural:
+            return
         if self._stdin_pos < len(self._stdin_buffer):
             byte_val = ord(self._stdin_buffer[self._stdin_pos])
             self._stdin_pos += 1
