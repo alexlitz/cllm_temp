@@ -2,22 +2,19 @@
 """Simple parameter count for Neural VM."""
 
 import torch
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
+from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
 
 print('Building Neural VM and counting parameters...')
 print('=' * 70)
 
-# Create model
-model = AutoregressiveVM(
-    d_model=512,
-    n_layers=16,
+# Build via the compiler (single bake authority). The compiler derives
+# d_model and n_layers from the op set; we override n_heads, ffn_hidden, and
+# max_seq_len to match the historical configuration counted here.
+model, _layout = compile_full_vm(
     n_heads=8,
     ffn_hidden=4096,
-    max_seq_len=512
+    max_seq_len=512,
 )
-
-# Set weights (uses default configuration)
-set_vm_weights(model)
 
 print('\nCounting parameters...')
 

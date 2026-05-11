@@ -16,7 +16,8 @@ from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.debugger import VMExecutionTracer, ExecutionTrace
 from neural_vm.contracts import validate_and_print
 from neural_vm.step_debugger import StepDebugger
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, Opcode
+from neural_vm.vm_step import Opcode
+from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
 
 
 def demo_execution_tracer():
@@ -80,8 +81,7 @@ def demo_contract_validation():
     print("DEMO 3: DIMENSION CONTRACT VALIDATION")
     print("="*80 + "\n")
 
-    model = AutoregressiveVM()
-    set_vm_weights(model)
+    model, _ = compile_full_vm()
 
     print("Validating dimension contracts...\n")
     violations = validate_and_print(model)

@@ -16,11 +16,14 @@ Expected results:
 
 import time
 import torch
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, Token
+from neural_vm.vm_step import Token
 from neural_vm.embedding import Opcode
 from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.fast_runner import SpeculativeRunner
 from neural_vm.speculative import DraftVM
+
+# AutoregressiveVMRunner builds the model via the unified compiler
+# (compile_full_vm). No explicit set_vm_weights call is needed.
 
 # Test bytecode: fibonacci(10) = 55
 FIB_BYTECODE = """
@@ -100,7 +103,6 @@ def test_original_runner():
     print("WARNING: This is VERY slow (~50-300s)")
 
     runner = AutoregressiveVMRunner()
-    set_vm_weights(runner.model)
     runner.model.compact(block_size=32)
     runner.model.compact_moe()
 

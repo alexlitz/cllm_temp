@@ -26,15 +26,9 @@ class TestTransformerArchitecture:
 
     @pytest.fixture
     def model(self):
-        """Create a fresh model for testing."""
-        from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
-        model = AutoregressiveVM(
-            d_model=512,
-            n_layers=16,
-            n_heads=8,
-            ffn_hidden=4096
-        )
-        set_vm_weights(model)
+        """Create a fresh model for testing via the unified compiler."""
+        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        model, _ = compile_full_vm(n_heads=8, ffn_hidden=4096)
         return model
 
     def test_model_has_embedding(self, model):
@@ -259,15 +253,9 @@ class TestNoCustomOperations:
 
     @pytest.fixture
     def model(self):
-        """Create model for testing."""
-        from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
-        model = AutoregressiveVM(
-            d_model=512,
-            n_layers=16,
-            n_heads=8,
-            ffn_hidden=4096
-        )
-        set_vm_weights(model)
+        """Create model for testing via the unified compiler."""
+        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        model, _ = compile_full_vm(n_heads=8, ffn_hidden=4096)
         return model
 
     def test_forward_produces_logits(self, model):
