@@ -76,7 +76,6 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
 
     def bake(block, dim_positions, S):
         from ...vm_step import _SetDim
-        from ...hybrid_alu import HybridALUBlock
         from ... import efficient_alu_neural as eau
         # ALUAddSub has been replaced by the 5-stage flattened AddSub5StageBlock
         # (see efficient_alu_addsub_split.py). Other ALU classes still come
@@ -85,7 +84,10 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
             from ...efficient_alu_addsub_split import AddSub5StageBlock as alu_cls
         else:
             alu_cls = getattr(eau, alu_cls_name)
-        block.ffn = HybridALUBlock(block.ffn, alu_cls(S, _SetDim))
+        # Attach as a post_op (rather than wrapping block.ffn with HybridALUBlock).
+        # ``_expand_wrapper_blocks`` then splits each post_op into a passthrough
+        # transformer block, preserving the original execution order.
+        block.post_ops.insert(0, alu_cls(S, _SetDim))
 
     # Phase=1180 + layer_idx*0.01: hybrid wraps must fire AFTER all FFN
     # bakes (including L14 cleanup and convo-IO ops at phases 8.5/10.6/15.1)

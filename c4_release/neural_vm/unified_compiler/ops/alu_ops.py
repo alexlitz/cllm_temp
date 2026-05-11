@@ -170,7 +170,6 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
 
     def bake(block, dim_positions, S):
         from ...vm_step import _SetDim
-        from ...hybrid_alu import HybridALUBlock
         from ... import efficient_alu_neural as eau
         # ALUAddSub has been replaced by the 5-stage flattened AddSub5StageBlock
         # (see efficient_alu_addsub_split.py). Other ALU classes still come
@@ -179,7 +178,9 @@ def _make_hybrid_alu_wrap_op(name: str, layer_idx: int, alu_cls_name: str,
             from ...efficient_alu_addsub_split import AddSub5StageBlock as alu_cls
         else:
             alu_cls = getattr(eau, alu_cls_name)
-        block.ffn = HybridALUBlock(block.ffn, alu_cls(S, _SetDim))
+        # Attach as a post_op; _expand_wrapper_blocks splits it into a
+        # passthrough transformer block downstream.
+        block.post_ops.insert(0, alu_cls(S, _SetDim))
 
     # Phase=1180 + layer_idx*0.01: hybrid wraps must fire AFTER all FFN
     # bakes (including L14 cleanup and convo-IO ops at phases 8.5/10.6/15.1)
@@ -262,14 +263,15 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
     def bake(model, dim_positions, S):
         if alu_mode != 'efficient':
             return
-        from ...hybrid_alu import HybridALUBlock
         from ...efficient_alu_addsub_split import AddSub5StageBlock
         BD = _as_setdim_proxy(dim_positions)
         block = model.blocks[8]
-        # Idempotent guard: if already wrapped (e.g. double dispatch), skip.
-        if isinstance(block.ffn, HybridALUBlock):
+        addsub = AddSub5StageBlock(S, BD)
+        # Idempotent guard: if already attached, skip.
+        if any(isinstance(po, AddSub5StageBlock) for po in block.post_ops):
             return
-        block.ffn = HybridALUBlock(block.ffn, AddSub5StageBlock(S, BD))
+        # Attach as post_op; _expand_wrapper_blocks splits it downstream.
+        block.post_ops.insert(0, addsub)
 
     return Operation(
         name="efficient_l8_addsub_wrap",
