@@ -49,22 +49,18 @@ KNOWN_NON_VANILLA_ALLOWLIST = frozenset({
     "ALUMul",                     # TODO: remove once hybrid removal completes (L11/L12 MUL FFN)
     "ALUShift",                   # TODO: remove once hybrid removal completes (L13 SHL/SHR FFN)
 
-    # Post-op family (installed via `block.ffn = ...` after `_expand_wrapper_blocks`
-    # splits HybridALUBlock and post_ops into their own blocks).
-    "BinaryOpByteZeroingPostOp",  # TODO: remove once hybrid removal completes (binary-op byte zero)
-    "CarryPropagationPostOp",     # TODO: remove once hybrid removal completes (ADD/SUB carry propagation)
-    "BitwiseBytePropagationPostOp",  # TODO: remove once hybrid removal completes (bitwise byte propagation)
-    "ComparisonCombine",          # TODO: remove once hybrid removal completes (comparison combine, efficient mode)
+    # Post-op family: BinaryOpByteZeroingPostOp, CarryPropagationPostOp,
+    # BitwiseBytePropagationPostOp, ComparisonCombine were previously listed
+    # here. As of 2026-05-11 (a-postops-to-pureffn) they are re-baked into
+    # vanilla `PureFFN` instances by `_expand_wrapper_blocks` before being
+    # installed as block.ffn, so the audit now sees them as canonical PureFFN.
 
-    # Note: the 5 vanilla-flattened ALU composites — ``FlattenedALUMul``,
+    # The 5 vanilla-flattened ALU composites — ``FlattenedALUMul``,
     # ``AddSub5StageBlock``, ``FlattenedDivMod``, ``ALUShiftComposite``,
-    # and ``ALUAndOrXor`` — were removed from this allowlist on 2026-05-11
+    # ``ALUAndOrXor`` — were removed from this allowlist on 2026-05-11
     # once ``verify_runtime_is_vanilla`` learned to recognise the
     # "nn.Sequential of PureFFNs" composite pattern via
-    # ``_is_pureffn_composite``. Each of the 5 classes carries no learned
-    # parameters of its own; every parameter-bearing leaf inside them is a
-    # ``GenericPureFFN``, so the audit now (correctly) reports them as
-    # vanilla.
+    # ``_is_pureffn_composite`` (b-audit-recognize-sequential).
 })
 
 
