@@ -53,9 +53,13 @@ architectural / pragmatic per blog", is a real violation per the canonical:
 - **V11** stdin buffer — acceptable only inside tool-calling mode; in
   neural I/O mode the bytes must arrive via USER_INPUT_START/END markers
   in the token stream.
-- **V17** `_decode_exit_code` — debatable. Result extraction is on the
-  generation-loop boundary, similar to reading sampled tokens; probably
-  OK but flag for review.
+- **V17** `_decode_exit_code` — **GREEN, acceptable per spec** (reviewed
+  2026-05-11, see [`V17_DECODE_EXIT_CODE_OK.md`](V17_DECODE_EXIT_CODE_OK.md)).
+  Result extraction is on the generation-loop boundary, runs after
+  `model.forward` is no longer called, reads only the token sequence the
+  model emitted (not `self._memory` or any shadow state), and does not
+  feed anything back into the model. Same category as a real LLM's
+  final-token decode.
 
 **What stays acceptable:**
 - V8/V16: tool-calling mode opt-in (opcode → TOOL_CALL → host syscall →
@@ -109,7 +113,7 @@ The audit covers four surfaces:
 | V14 | `_inject_thinking_markers` (I3 in flight) | `neural_embedding.py:476-498` | deferred-architectural | NO (token-deterministic, like positional encoding) | already in flight (I3) |
 | V15 | `_add_code_addr_keys` (I2 landed) | `neural_embedding.py:337-413` | LANDED — now a precomputed buffer | NO | done |
 | V16 | TOOL_CALL host shim path (handler-mode side) | `run_vm.py:468-498,1613-1753` | external I/O | NO (intentional) | N/A |
-| V17 | `_decode_exit_code` post-run | `run_vm.py:1780-1788` | allowed per policy | NO (result extraction) | N/A |
+| V17 | `_decode_exit_code` post-run | `run_vm.py:2001-2009` | GREEN — acceptable per spec ([review](V17_DECODE_EXIT_CODE_OK.md)) | NO (result extraction) | N/A |
 | V18 | Conversational-I/O THINKING_END handling | `run_vm.py:384-432` | gated off in pure_neural | NO (handler-mode only) | M (separate convo-io migration) |
 | V19 | `_func_call_handlers` dict | `run_vm.py:255,756-758` | dead by default | NO (empty default) | S (delete) |
 | V20 | Prefix-embedding cache | `neural_embedding.py:51-70,162-264` | optimisation, not violation | NO | N/A |
@@ -514,9 +518,20 @@ if exec_op in _MEM_STORE_OPS:
 
 ## V17 — `_decode_exit_code` post-run
 
-**File/lines:** `c4_release/neural_vm/run_vm.py:1780-1788`
+**File/lines:** `c4_release/neural_vm/run_vm.py:2001-2009`
 
-**Severity:** **Explicitly allowed per `PURE_NEURAL_POLICY.md`** §1.1 ("Result extraction"). Reads REG_AX bytes from final context. No Python state injected back into model.
+**Status (2026-05-11 review):** **GREEN — acceptable per
+[`BLOG_SPEC.md`](BLOG_SPEC.md) line 3.** See
+[`V17_DECODE_EXIT_CODE_OK.md`](V17_DECODE_EXIT_CODE_OK.md) for the
+one-paragraph justification.
+
+**Severity:** **Explicitly allowed per `PURE_NEURAL_POLICY.md`** §1.1
+("Result extraction"). Reads REG_AX bytes from the final context (the
+token sequence the model emitted), not `self._memory` or any shadow
+state. Runs only after the autoregressive loop has terminated, so it
+cannot fold Python state back into a `model.forward` call. Direct
+analogue of an LLM serving stack reading sampled tokens after `stop`.
+Function is already at the irreducible 9-line minimum.
 
 ---
 
