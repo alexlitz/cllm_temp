@@ -286,7 +286,6 @@ class C4TransformerVM(nn.Module):
 
         # Import the actual autoregressive VM
         try:
-            from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
             from neural_vm.run_vm import AutoregressiveVMRunner
 
             self._use_neural_vm = True
@@ -297,8 +296,7 @@ class C4TransformerVM(nn.Module):
                 ffn_hidden=self.config.ffn_hidden,
                 max_seq_len=self.config.max_seq_len,
             )
-            # Set weights for actual VM execution
-            set_vm_weights(self._runner.model)
+            # AutoregressiveVMRunner builds and bakes weights via compile_full_vm.
             self._runner.model.compact(block_size=32)
             self._runner.model.compact_moe()
 

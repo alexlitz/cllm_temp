@@ -106,13 +106,18 @@ def _set_hand_weights(
     enable_conversational_io: bool = False,
     alu_mode: str = 'lookup',
 ):
-    """Set weights using hand-crafted approach (production)."""
-    from .vm_step import set_vm_weights
-    set_vm_weights(
-        model,
-        enable_tool_calling=enable_tool_calling,
-        enable_conversational_io=enable_conversational_io,
-        alu_mode=alu_mode,
+    """DEPRECATED: hand-set weights are no longer supported.
+
+    The legacy `vm_step.set_vm_weights()` function has been removed. The
+    unified compiler (`compile_full_vm`) is now the single bake authority,
+    and it constructs its own AutoregressiveVM rather than baking into a
+    pre-existing one. Callers should switch to `compile_full_vm(...)` and
+    use the returned model directly.
+    """
+    raise NotImplementedError(
+        "WeightMode.HAND_SET is no longer supported: vm_step.set_vm_weights "
+        "has been removed. Use neural_vm.unified_compiler.full_vm_compiler."
+        "compile_full_vm(...) which builds and bakes the model in one step."
     )
 
 

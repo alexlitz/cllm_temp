@@ -232,11 +232,10 @@ def validate_and_print(model: AutoregressiveVM):
 
 
 if __name__ == "__main__":
-    from .vm_step import AutoregressiveVM, set_vm_weights
+    from .unified_compiler.full_vm_compiler import compile_full_vm
 
     print("Validating Neural VM dimension contracts...\n")
 
-    model = AutoregressiveVM()
-    set_vm_weights(model)
+    model, _ = compile_full_vm()
 
     validate_and_print(model)

@@ -291,12 +291,11 @@ class TestDefaultContracts(unittest.TestCase):
 
 
 class TestIntegration(unittest.TestCase):
-    def test_set_vm_weights_runs_validation(self):
-        """set_vm_weights should complete without raising."""
-        import torch
-        from neural_vm.vm_step import AutoregressiveVM, set_vm_weights
-        model = AutoregressiveVM()
-        set_vm_weights(model)  # should not raise
+    def test_compile_full_vm_runs_validation(self):
+        """compile_full_vm should complete without raising (replaces the legacy
+        ``set_vm_weights`` validation gate)."""
+        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        compile_full_vm()  # should not raise
 
 
 if __name__ == "__main__":

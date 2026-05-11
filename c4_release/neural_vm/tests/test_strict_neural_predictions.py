@@ -11,7 +11,7 @@ even when transformer predictions are wrong.
 
 import unittest
 import torch
-from neural_vm.vm_step import AutoregressiveVM, set_vm_weights, Token
+from neural_vm.vm_step import AutoregressiveVM, Token
 from neural_vm.embedding import Opcode
 from neural_vm.speculative import DraftVM
 
@@ -36,8 +36,8 @@ class StrictNeuralPredictionTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = AutoregressiveVM()
-        set_vm_weights(cls.model)
+        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        cls.model, _ = compile_full_vm()
         cls.model.compact(block_size=32)
         cls.model.compact_moe()
         cls.model.eval()
