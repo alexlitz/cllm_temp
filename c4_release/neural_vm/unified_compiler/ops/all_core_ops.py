@@ -24,6 +24,10 @@ from .l16_ops import *  # noqa: F401,F403
 from .alu_ops import *  # noqa: F401,F403
 from .flag_gated_ops import *  # noqa: F401,F403
 from .model_ops import *  # noqa: F401,F403
+from .user_input_ops import (  # noqa: F401
+    make_layer5_user_input_gather_op,
+    make_layer6_getchar_routing_op,
+)
 
 
 def all_core_ops(
@@ -111,6 +115,12 @@ def all_core_ops(
         make_layer4_sp_to_addr_key_op(enable=True),
         make_layer5_fetch_op(),
         make_layer5_fetch_dep_anchor_op(),
+        # V9 GETCHAR neural read scaffolding (BLOG_SPEC.md:851).
+        # Phase 1: registered but disabled (enable=False). The runner-side
+        # _inject_getchar shim still owns byte transfer until phase 2
+        # widens L5 to 10 heads + allocates STDIN_BYTE dims. See
+        # docs/V9_GETCHAR_READ_NEURAL_PLAN.md.
+        make_layer5_user_input_gather_op(enable=False),
         make_opcode_decode_ffn_op(),
         make_opcode_decode_ffn_dep_anchor_op(),
         make_layer6_attn_op(),
@@ -282,6 +292,12 @@ def all_core_ops(
         make_open_clos_tool_call_op(
             enable_tool_calling=enable_tool_calling,
         ),
+        # V9 GETCHAR routing (BLOG_SPEC.md:851). Phase 998.9: mirrors
+        # io_putchar_routing in shape — routes STDIN_BYTE_LO/HI -> AX_CARRY
+        # at GETCHAR & MARK_AX so AX byte 0 receives the gathered USER_INPUT
+        # byte. Phase 1: registered but disabled. See
+        # docs/V9_GETCHAR_READ_NEURAL_PLAN.md §3.3.
+        make_layer6_getchar_routing_op(enable=False),
         # Tool-call bakes (phase 998.8): flag-gated. Always registered so the
         # registration list is stable; bake_fn is a no-op when
         # `enable_tool_calling=False`. The 3 ops replace inline calls in

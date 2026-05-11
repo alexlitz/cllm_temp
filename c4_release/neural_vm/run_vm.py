@@ -1271,9 +1271,16 @@ class AutoregressiveVMRunner:
     def _inject_getchar(self, context):
         """Runner-side GETCHAR: inject next stdin byte into context.
 
-        This is NOT autoregressive — the runner directly overwrites the
-        AX register bytes the model generated. The model has no mechanism
-        to read from the stdin buffer in its weights.
+        This is the V11 stdin-buffer + V9 AX-override shim. The spec
+        (BLOG_SPEC.md:851) says GETCHAR should read the byte via
+        position-tracking attention into the USER_INPUT_START/END block
+        (which `_build_context` already emits in the prefix). The neural
+        bake for that read lives in
+        `unified_compiler/ops/user_input_ops.py` (Phase 1: registered but
+        disabled); until those bakes are flipped on, the runner overrides
+        REG_AX directly from `_stdin_buffer`.
+
+        See docs/V9_GETCHAR_READ_NEURAL_PLAN.md for the migration plan.
 
         If stdin is exhausted, injects -1 (0xFFFFFFFF) for EOF.
 
@@ -1565,6 +1572,16 @@ class AutoregressiveVMRunner:
 
     def _neural_read_emit(self, context):
         """Runner-side READ for pure_neural mode.
+
+        This is the V11 stdin-buffer + V9 memory-write shim. The spec
+        (BLOG_SPEC.md:851) says stdin bytes arrive in the token stream
+        between USER_INPUT_START/END markers and READ should gather them
+        via attention into shadow memory. The neural READ bake is a
+        follow-up to the GETCHAR bake (see
+        docs/V9_GETCHAR_READ_NEURAL_PLAN.md §6); until both are flipped
+        on, this Python shim consumes ``_stdin_buffer`` and writes the
+        bytes into shadow memory + injects MEM sections so subsequent
+        L15 reads see them.
 
         Reads three stack slots; identifies them by heuristic:
           - buf_ptr: slot pointing into heap/data (>= 0x10000)
