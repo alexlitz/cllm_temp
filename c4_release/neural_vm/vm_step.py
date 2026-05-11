@@ -1779,8 +1779,11 @@ class _SetDim:
     OP_LC_RELAY = 466  # 1 dim: LC active (relayed to AX byte positions)
     PSH_AT_SP = 467    # 1 dim: PSH opcode flag relayed to SP/STACK0 (clean, no JMP collision)
 
-    # --- Unified memory execution (code from writable memory) ---
-    MEM_EXEC = 468     # 1 dim: MEM section contains executable code (for L5 fetch)
+    # --- Unified memory execution (DEPRECATED Phase A 2026-05-11) ---
+    # MEM_EXEC writes were removed (no model consumer); retained as a layout
+    # placeholder so the compact-IO compiler block stays stable. The slot is
+    # aliased by IO_FORMAT_POS@468 above for conversational I/O.
+    MEM_EXEC = 468     # 1 dim: deprecated; retained as IO_FORMAT_POS alias
 
     # --- AX full value relay (for PSH STACK0 = AX) ---
     # Shifted +4 (was 467-498, now 471-502)
