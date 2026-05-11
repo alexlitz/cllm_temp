@@ -304,12 +304,23 @@ def make_l10_post_ops_combined() -> Operation:
         )
         d_model = ffn.W_up.shape[1]
         offset = 0
-        offset = _bake_post_op_into(ffn, BinaryOpByteZeroingPostOp(d_model, S), offset)
-        offset = _bake_post_op_into(ffn, CarryPropagationPostOp(d_model, S, byte_idx=0, cascade=False), offset)
-        offset = _bake_post_op_into(ffn, CarryPropagationPostOp(d_model, S, byte_idx=1, cascade=True), offset)
-        offset = _bake_post_op_into(ffn, CarryPropagationPostOp(d_model, S, byte_idx=2, cascade=True), offset)
-        offset = _bake_post_op_into(ffn, BitwiseBytePropagationPostOp(d_model, S), offset)
-        offset = _bake_post_op_into(ffn, ComparisonCombine(d_model, S), offset)
+        # Thread dim_positions so each fresh post-op instance bakes against
+        # the compact layout, matching the per-block post_op attach path.
+        offset = _bake_post_op_into(
+            ffn, BinaryOpByteZeroingPostOp(d_model, S, dim_positions=dim_positions), offset)
+        offset = _bake_post_op_into(
+            ffn, CarryPropagationPostOp(d_model, S, byte_idx=0, cascade=False,
+                                        dim_positions=dim_positions), offset)
+        offset = _bake_post_op_into(
+            ffn, CarryPropagationPostOp(d_model, S, byte_idx=1, cascade=True,
+                                        dim_positions=dim_positions), offset)
+        offset = _bake_post_op_into(
+            ffn, CarryPropagationPostOp(d_model, S, byte_idx=2, cascade=True,
+                                        dim_positions=dim_positions), offset)
+        offset = _bake_post_op_into(
+            ffn, BitwiseBytePropagationPostOp(d_model, S, dim_positions=dim_positions), offset)
+        offset = _bake_post_op_into(
+            ffn, ComparisonCombine(d_model, S, dim_positions=dim_positions), offset)
 
     # phase=10.5 so it lands AFTER layer10_alu (phase=10) but BEFORE later layers
     # which depend on its OUTPUT_LO/HI updates. Note: float phases work because
@@ -388,31 +399,41 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             except (AttributeError, IndexError):
                 d_model = 512
 
-        # Pass dim_positions so the post-op bakes against the compact layout
-        # rather than legacy `_SetDim` positions. Without this, the post-op
-        # writes to `_SetDim.OUTPUT_LO/HI`/reads `_SetDim.H1` etc., which alias
-        # unrelated compact dims (e.g. EMBED_HI[15], OP_LEA..OP_GE), corrupting
-        # OP_* flags whenever the AX byte 0 has hi nibble = 0xF (the IMM 240/
-        # 255 regression).
+        # Pass dim_positions so each post-op bakes against the compact layout
+        # rather than legacy `_SetDim` positions. Without this, the post-ops
+        # write to / read from `_SetDim.OUTPUT_LO/HI/CARRY/H1/OP_*` etc.,
+        # which alias unrelated compact dims (e.g. `_SetDim.H1+1=68` aliases
+        # compact `EMBED_HI[15]`; `_SetDim.CARRY=392` aliases a different
+        # compact slot, etc.), corrupting OUTPUT/CARRY/CMP flags and silently
+        # zeroing or scrambling the binary-op result. Threading dim_positions
+        # to all 4 post-op classes is the L10 counterpart of the L1 fix in
+        # commit 5fc519d (BinaryOpByteZeroingPostOp).
         block.post_ops.append(
             BinaryOpByteZeroingPostOp(d_model=d_model, S=S, dim_positions=dim_positions)
         )
         block.post_ops.append(
-            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=0, cascade=False)
+            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=0, cascade=False,
+                                   dim_positions=dim_positions)
         )
         block.post_ops.append(
-            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=1, cascade=True)
+            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=1, cascade=True,
+                                   dim_positions=dim_positions)
         )
         block.post_ops.append(
-            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=2, cascade=True)
+            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=2, cascade=True,
+                                   dim_positions=dim_positions)
         )
-        block.post_ops.append(BitwiseBytePropagationPostOp(d_model=d_model, S=S))
+        block.post_ops.append(
+            BitwiseBytePropagationPostOp(d_model=d_model, S=S, dim_positions=dim_positions)
+        )
         if alu_mode == "efficient":
             # Pass the model's actual d_model so the underlying PureFFN's
             # Linear input dim matches the residual stream width. Without
             # this, ComparisonCombine builds a Linear(512, 18) which fails
             # forward when d_model != 512 (e.g., pin_io_only=True paths).
-            block.post_ops.append(ComparisonCombine(d_model=d_model, S=S))
+            block.post_ops.append(
+                ComparisonCombine(d_model=d_model, S=S, dim_positions=dim_positions)
+            )
         # DIV/MOD post_op (FlattenedDivMod) appended by
         # ``make_l10_alu_divmod_install_op`` (phase=10.8). Both modes use the
         # same flattened composite — its forward is byte-identical to the
