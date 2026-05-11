@@ -39,12 +39,6 @@ def _run(runner, prog, data=b"", stdin="", max_steps=30):
 class TestPureNeuralPutchar:
     """PUTCHAR — model must route AX byte to OUTPUT autoregressively."""
 
-    @pytest.mark.xfail(
-        reason="PUTCHAR has no neural OUTPUT path in pure_neural mode; "
-               "_syscall_handlers are skipped and there is no autoregressive "
-               "byte-emit weight in the current model.",
-        strict=False,
-    )
     def test_putchar_one_char(self, pure_neural_runner):
         out, _ = _run(pure_neural_runner, [
             (Opcode.IMM, ord('A')),
@@ -53,10 +47,6 @@ class TestPureNeuralPutchar:
         ])
         assert out == "A"
 
-    @pytest.mark.xfail(
-        reason="PUTCHAR neural emit path missing — same as test_putchar_one_char.",
-        strict=False,
-    )
     def test_putchar_two_chars(self, pure_neural_runner):
         out, _ = _run(pure_neural_runner, [
             (Opcode.IMM, ord('A')),
@@ -112,11 +102,6 @@ class TestPureNeuralPrtf:
 class TestPureNeuralGetchar:
     """GETCHAR — model must inject next stdin byte into AX."""
 
-    @pytest.mark.xfail(
-        reason="GETCHAR neural USER_INPUT attention head not baked; "
-               "_inject_getchar is bypassed in pure_neural mode.",
-        strict=False,
-    )
     def test_getchar_returns_byte(self, pure_neural_runner):
         _, ax = _run(pure_neural_runner, [
             Opcode.GETCHAR,
@@ -128,12 +113,6 @@ class TestPureNeuralGetchar:
 class TestPureNeuralFileOps:
     """OPEN/CLOS lifecycle — pure tool-boundary, no neural fallback."""
 
-    @pytest.mark.xfail(
-        reason="OPEN/CLOS are pure tool-boundary calls; with handlers "
-               "disabled in pure_neural and no neural _set_layer7_memory_heads "
-               "path for filename addressing, no fd is produced.",
-        strict=False,
-    )
     def test_open_close_cycle_xfail(self, pure_neural_runner):
         # Filename "x\0" at DATA[0]
         data = b"x\x00"
