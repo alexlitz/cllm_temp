@@ -96,8 +96,14 @@ def compile_full_vm(
     # Per-layer ops drive the layout (d_model, n_layers, dim_positions).
     # Forward alu_mode so SHL/SHR (and any future alu_mode-aware migrated op)
     # can branch between the legacy lookup-table bake and the efficient
-    # neural-ALU bake.
-    for op in all_core_ops(alu_mode=alu_mode):
+    # neural-ALU bake. Forward enable_conversational_io so the L10
+    # null-terminator detection and L15 output-routing tail bakes can
+    # activate (no-op when the flag is off; registered unconditionally so
+    # the dep-graph topology is independent of the flag).
+    for op in all_core_ops(
+        alu_mode=alu_mode,
+        enable_conversational_io=enable_conversational_io,
+    ):
         compiler.add_op(op)
 
     # L10 post_op attach: runs as a migrated block op (phase=10.7) before the
