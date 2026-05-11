@@ -324,21 +324,8 @@ class AutoregressiveVMRunner:
         prefix_len = len(context)  # code + data prefix length (immutable)
         output = []
 
-        # FIX 2026-05-09: In pure_neural mode, do not inject the active opcode from
-        # Python — the network must determine the opcode from its own bytecode attention.
-        # Other modes still need the MoE/embedding-injection hint to function.
-        #
-        # CLASSIFICATION (2026-05-11):
-        #   REQUIRED for handler-mode — older bake recipes use
-        #   set_active_opcode as a MoE/embedding hint, which the handler-
-        #   mode dispatch then relies on. Pure_neural successfully omits
-        #   this hint, so once handler-mode retires this whole block
-        #   becomes dead code.
-        if not self.pure_neural:
-            init_exec = self._exec_pc() // INSTR_WIDTH
-            if 0 <= init_exec < len(bytecode):
-                opcode = bytecode[init_exec] & 0xFF
-                self.model.set_active_opcode(opcode)
+        # The MoE routing signal is read tensor-natively inside SoftMoEFFN
+        # (see neural_vm.pure_moe); no Python-side bytecode peek required.
 
         step_num = 0  # Track VM steps for conversational I/O handling
 
@@ -1016,17 +1003,8 @@ class AutoregressiveVMRunner:
             if pc is not None:
                 self._last_pc = pc
 
-        # FIX 2026-05-09: Skip set_active_opcode in pure_neural mode (Python peek at bytecode).
-        #
-        # CLASSIFICATION (2026-05-11):
-        #   REQUIRED for handler-mode — pairs with the init-time
-        #   set_active_opcode in run(). Removable once handler-mode retires.
-        if not self.pure_neural:
-            next_exec = self._exec_pc() // INSTR_WIDTH
-            if 0 <= next_exec < len(bytecode):
-                self.model.set_active_opcode(bytecode[next_exec] & 0xFF)
-            else:
-                self.model.set_active_opcode(None)
+        # MoE routing is tensor-native (see neural_vm.pure_moe.SoftMoEFFN);
+        # no per-step weight swap is needed between forward calls.
 
         if exec_op in _MEM_STORE_OPS and exec_op not in self._func_call_handlers:
             mem_section = self._extract_mem_section(context)
