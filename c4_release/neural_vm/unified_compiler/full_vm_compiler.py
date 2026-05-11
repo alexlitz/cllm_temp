@@ -24,6 +24,9 @@ from .migrated_ops import (
     all_core_ops,
     declare_setdim_compat_dims,
     make_alu_divmod_composite_ops,
+    make_efficient_l8_addsub_wrap_op,
+    make_efficient_l10_andorxor_wrap_op,
+    make_efficient_l11_alumul_wrap_op,
     make_l10_post_op_attach_op,
     make_l11_alu_mul_bdtoge_op,
     make_l11_alu_mul_carrypass1_op,
@@ -130,6 +133,13 @@ def compile_full_vm(
         compiler.add_op(make_l12_alu_mul_binarylookahead_op())
         compiler.add_op(make_l12_alu_mul_finalcorrection_op())
         compiler.add_op(make_l12_alu_mul_getobd_op())
+
+        # Efficient-mode ALU wrapper installs — replace the inline
+        # ``model.blocks[N].ffn = ...`` assignments previously in legacy_bake's
+        # efficient branch. See migrated_ops for ordering notes.
+        compiler.add_op(make_efficient_l8_addsub_wrap_op(alu_mode=alu_mode))
+        compiler.add_op(make_efficient_l10_andorxor_wrap_op(alu_mode=alu_mode))
+        compiler.add_op(make_efficient_l11_alumul_wrap_op(alu_mode=alu_mode))
 
     # L10 DIV/MOD ALU flattening: 4 cooperating block ops install the
     # FlattenedDivMod composite (BD→GE, long-division pipeline, GE→BD,

@@ -2178,10 +2178,15 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # wrap it with the efficient hybrid pipeline. See
         # unified_compiler/migrated_ops.py.
         ffn8 = model.blocks[8].ffn
-        # Wrap original FFN with the 5-stage flattened ADD/SUB pipeline.
-        # Replaces the monolithic ALUAddSub class. AddSub5StageBlock is split
-        # into 5 individual blocks by `_expand_wrapper_blocks`.
-        model.blocks[8].ffn = HybridALUBlock(ffn8, AddSub5StageBlock(S, BD))
+        # MIGRATED 2026-05-10 (Wave 2 Unit 10 + Wave 1 Unit 8):
+        # - `_set_layer8_alu` / `_set_layer8_multibyte_routing` are now baked
+        #   as compiler block ops (kind="block", layer_idx=8, migrated=True)
+        #   that fire BEFORE legacy_bake regardless of alu_mode.
+        # - The `model.blocks[8].ffn = HybridALUBlock(ffn8, AddSub5StageBlock(S, BD))`
+        #   wrap is now installed by `make_efficient_l8_addsub_wrap_op`
+        #   (kind="model", phase=1002) which runs AFTER legacy_bake so the L8
+        #   ALU bakes have already mutated the original PureFFN by the time
+        #   it gets wrapped. See unified_compiler/migrated_ops.py.
 
         # L10: Carry relay + AX/SP passthrough attention (still needed)
         attn10 = model.blocks[10].attn
@@ -2200,7 +2205,10 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # also now owned by the phase-10.4 block op.)
 
         # L10 FFN: Neural AND/OR/XOR
-        model.blocks[10].ffn = ALUAndOrXor(S, BD)
+        # MIGRATED 2026-05-10 (Unit 8): now installed by the compiler op
+        # `make_efficient_l10_andorxor_wrap_op` (kind="block", layer_idx=10,
+        # phase=10.85) which runs BEFORE legacy_bake. Previously:
+        #   ``model.blocks[10].ffn = ALUAndOrXor(S, BD)``
 
         # L10.5: Byte propagation post_ops + ComparisonCombine.
         # Migrated to compiler block op `l10_post_op_attach` (phase=10.7) which
@@ -2211,14 +2219,14 @@ def set_vm_weights(model, enable_tool_calling=False, enable_conversational_io=Fa
         # L11-L12: Neural MUL.
         # MIGRATED 2026-05-10: 9 compiler block ops at L11 (phases 11.0..12.3)
         # install a `FlattenedALUMul` module on `model.blocks[11].ffn` BEFORE
-        # legacy_bake (this function) runs. We skip the inline assignment in
-        # that case so the flattened module isn't clobbered. The block ops are
-        # registered in `compile_full_vm` only when alu_mode='efficient'; if
-        # they did not run (e.g., direct `set_vm_weights` invocation), fall
-        # back to the monolithic ALUMul wrapper for backward-compat.
-        from .efficient_alu_neural import FlattenedALUMul as _FlatMul
-        if not isinstance(model.blocks[11].ffn, _FlatMul):
-            model.blocks[11].ffn = ALUMul(S, BD)
+        # legacy_bake (this function) runs. The monolithic `ALUMul` fallback
+        # (used by direct `set_vm_weights` callers that don't run the 9
+        # flattening ops) is now installed by the compiler op
+        # `make_efficient_l11_alumul_wrap_op` (kind="block", layer_idx=11,
+        # phase=11.05) — see migrated_ops.py. Previously:
+        #   ``from .efficient_alu_neural import FlattenedALUMul as _FlatMul``
+        #   ``if not isinstance(model.blocks[11].ffn, _FlatMul):``
+        #   ``    model.blocks[11].ffn = ALUMul(S, BD)``
 
         # L13: Memory addr gather attention migrated to compiler op
         # `layer13_mem_addr_gather` (attn) which runs before legacy_bake.

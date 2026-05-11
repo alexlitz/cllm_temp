@@ -2384,6 +2384,136 @@ def make_l13_hybrid_alu_wrap_op(alu_mode: str = 'lookup') -> Operation:
     return _make_hybrid_alu_wrap_op("l13_hybrid_alu_wrap", 13, "ALUShift", alu_mode)
 
 
+# ---------------------------------------------------------------------------
+# Efficient-mode ALU wrapper installs (migrated from set_vm_weights efficient
+# branch, lines ~2208/2223/2240). Each replaces the original ``block.ffn`` with
+# a wrapper module (HybridALUBlock for L8 ADD/SUB, ALUAndOrXor for L10 bitwise,
+# ALUMul for L11 multiply). Only meaningful in efficient ALU mode; the factories
+# return a no-op operation in lookup mode so callers can register them
+# unconditionally without affecting lookup-mode bakes.
+#
+# Ordering notes:
+#   - L8: ``_set_layer8_alu`` + ``_set_layer8_multibyte_routing`` still live
+#     inline in legacy_bake (efficient branch) and mutate the original PureFFN.
+#     They must run BEFORE the HybridALUBlock wrap, so the L8 wrap is a
+#     ``kind="model"`` op at phase=1002 (after legacy_bake at phase=999).
+#   - L10: nothing else mutates block.ffn after post_op_attach (phase=10.7)
+#     reads its d_model. The wrap runs at phase=10.85 — after post_op_attach
+#     (10.7) and the DIV/MOD install op (10.8), before L11 ops at 11.0.
+#   - L11: ``layer11_mul_partial`` (phase=11) writes to ``block.ffn.W_up`` of
+#     the original PureFFN, and the 9 FlattenedALUMul installer ops (phases
+#     11.0..12.3) replace ``block.ffn`` with a flattened composite. Our wrap
+#     runs at phase=11.05 — after both — and skips the install when
+#     ``FlattenedALUMul`` is already present (the normal flow). This matches
+#     the previous behavior where set_vm_weights' inline
+#     ``model.blocks[11].ffn = ALUMul(...)`` was skipped when FlattenedALUMul
+#     was already present.
+# ---------------------------------------------------------------------------
+
+def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    """Wrap L8 ``block.ffn`` with ``HybridALUBlock(ffn, AddSub5StageBlock)``.
+
+    Migrates the inline efficient-mode wrap at vm_step.py:
+        ``model.blocks[8].ffn = HybridALUBlock(ffn8, AddSub5StageBlock(S, BD))``
+
+    ``kind="model"`` at phase=1002 because the ``_set_layer8_alu`` and
+    ``_set_layer8_multibyte_routing`` calls in legacy_bake (phase=999) require
+    the original PureFFN with ``.W_up`` etc. The wrap must happen AFTER those
+    calls populate the lookup FFN.
+    """
+    def bake(model, dim_positions, S):
+        if alu_mode != 'efficient':
+            return
+        from ..hybrid_alu import HybridALUBlock
+        from ..efficient_alu_addsub_split import AddSub5StageBlock
+        BD = _as_setdim_proxy(dim_positions)
+        block = model.blocks[8]
+        # Idempotent guard: if already wrapped (e.g. double dispatch), skip.
+        if isinstance(block.ffn, HybridALUBlock):
+            return
+        block.ffn = HybridALUBlock(block.ffn, AddSub5StageBlock(S, BD))
+
+    return Operation(
+        name="efficient_l8_addsub_wrap",
+        reads=set(),
+        writes=set(),
+        kind="model",
+        bake_fn=bake,
+        phase=1002,
+        migrated=True,
+    )
+
+
+def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    """Replace L10 ``block.ffn`` with ``ALUAndOrXor(S, BD)`` (= bitwise neural ALU).
+
+    Migrates the inline efficient-mode assignment at vm_step.py:
+        ``model.blocks[10].ffn = EfficientALU_L10_Neural(S, BD)``
+    (``EfficientALU_L10_Neural`` is an alias for ``ALUAndOrXor``.)
+
+    ``kind="block"`` at phase=10.85 — runs after ``l10_post_op_attach``
+    (phase=10.7, which inspects ``block.ffn.W_up`` to derive d_model) and the
+    DIV/MOD install (phase=10.8); before any L11 ops at phase=11.0.
+    """
+    def bake(block, dim_positions, S):
+        if alu_mode != 'efficient':
+            return
+        from ..efficient_alu_neural import ALUAndOrXor
+        BD = _as_setdim_proxy(dim_positions)
+        block.ffn = ALUAndOrXor(S, BD)
+
+    return Operation(
+        name="efficient_l10_andorxor_wrap",
+        reads=set(),
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=10.85,
+        layer_idx=10,
+        migrated=True,
+    )
+
+
+def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    """Replace L11 ``block.ffn`` with ``ALUMul(S, BD)`` (= MUL neural ALU).
+
+    Migrates the inline efficient-mode fallback at vm_step.py:
+        ``model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)``
+    (``EfficientALU_L11_L12_Neural`` is an alias for ``ALUMul``.)
+
+    ``kind="block"`` at phase=11.05 — runs AFTER ``layer11_mul_partial``
+    (phase=11) which writes to ``block.ffn.W_up`` of the original PureFFN, and
+    AFTER ``l11_alu_mul_bdtoge`` (phase=11.0) which installs
+    ``FlattenedALUMul``. Our isinstance check below makes the wrap a no-op
+    when ``FlattenedALUMul`` is already installed (the normal compile_full_vm
+    flow). The install path remains a fallback for direct ``set_vm_weights``
+    callers that don't run the 9 flattening ops.
+    """
+    def bake(block, dim_positions, S):
+        if alu_mode != 'efficient':
+            return
+        from ..efficient_alu_neural import ALUMul, FlattenedALUMul
+        # Don't clobber FlattenedALUMul if a sibling op already installed it
+        # (the normal compile_full_vm flow). The 9 ``FlattenedALUMul`` installer
+        # ops at phases 11.0..12.3 run alongside us; the bdtoge op (phase=11.0)
+        # runs first and we skip the ALUMul install when it already did so.
+        if isinstance(block.ffn, FlattenedALUMul):
+            return
+        BD = _as_setdim_proxy(dim_positions)
+        block.ffn = ALUMul(S, BD)
+
+    return Operation(
+        name="efficient_l11_alumul_wrap",
+        reads=set(),
+        writes=set(),
+        kind="block",
+        bake_fn=bake,
+        phase=11.05,
+        layer_idx=11,
+        migrated=True,
+    )
+
+
 def make_l15_attention_resize_op() -> Operation:
     """Resize L15 attention from 8 heads to 12 heads (LEV Phase 2).
 
