@@ -227,7 +227,7 @@ def make_layer8_op_imm_relay_op() -> Operation:
     to AX marker (MARK_AX) and copies OP_IMM to byte positions.
 
     Phase=8.4 places it AFTER ``layer8_multibyte_routing`` (8.3) but BEFORE
-    the L8 hybrid_alu_wrap (phase 8.5) so attention bakes complete before
+    the L8 alu_postop_attach (phase 8.5) so attention bakes complete before
     the FFN wrap.
     """
     def _bake(block, dim_positions, S):
