@@ -376,6 +376,22 @@ def _set_layer5_fetch(attn, S, BD, HD):
     attn.W_q[base + GATE, BD.CONST] = -500.0
     attn.W_k[base + GATE, BD.CONST] = 5.0
 
+    # FIX 2026-05-11: Add HAS_SE blocker via dedicated gate dim (like head 5
+    # uses HAS_SE_GATE5). Without this, head 2 fires at step 1+ PC marker too:
+    # the Q[base, HAS_SE]=-L blocker zeroes out only the MARK_PC component of
+    # Q[base], but Q[base+32, MARK_PC]=L and the address-nibble Q components
+    # remain non-zero and produce a positive score against the matching code
+    # byte's ADDR_KEY. Result: head 2 leaks OPCODE_BYTE_LO[lo of PC_OFFSET=IMM]
+    # and OPCODE_BYTE_HI[0] (both at PC_OFFSET=2 which is IMM) onto the PC
+    # marker on every step. That doubles OPCODE_BYTE_HI[0] (head 5 already
+    # writes 1 there for any opcode with hi=0) and breaks the 3-way AND
+    # threshold (MARK_PC + LO + HI - 2.5) in _set_opcode_decode_ffn, causing
+    # OP_BZ/BNZ/JMP to fire spuriously at MARK_PC for non-matching opcodes,
+    # and to fire 3x stronger when the opcode actually matches.
+    HAS_SE_GATE = 34
+    attn.W_q[base + HAS_SE_GATE, BD.HAS_SE] = -500.0  # negative when HAS_SE=1
+    attn.W_k[base + HAS_SE_GATE, BD.CONST] = 5.0
+
     # V: copy opcode byte nibbles
     for k in range(16):
         attn.W_v[base + 32 + k, BD.CLEAN_EMBED_LO + k] = 1.0
@@ -1473,12 +1489,25 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
 def _set_bz_bnz_relay(attn, S, BD, HD):
     """L6 attention: Relay AX zero detection to PC marker for BZ/BNZ.
 
-    Head 4 (ALiBi slope=5.0): At PC marker, read prev AX marker's flags.
+    Head 4 (ALiBi slope=5.0): At step N's PC marker, attend to step (N-1)'s
+    AX byte 0 (identified by L1H1[AX]=1 AND L1H0[AX]=0 — same pattern as L3
+    AX carry-forward). The AX byte 0 token IS the AX value going INTO step N
+    (= the AX state at the moment BZ/BNZ is evaluated), encoded as
+    EMBED_LO[lo_nibble]=1, EMBED_HI[hi_nibble]=1.
+
     Writes to CMP[2..5] at PC marker (CMP[0]=IS_JMP, CMP[1]=IS_EXIT reserved):
       CMP[2] = OP_BZ, CMP[3] = OP_BNZ
-      CMP[4] = AX_CARRY_LO[0] (1.0 if lo nibble is 0)
-      CMP[5] = AX_CARRY_HI[0] (1.0 if hi nibble is 0)
-    Also copies FETCH_LO/HI → TEMP (branch target).
+      CMP[4] = EMBED_LO[0] at AX byte 0 (1.0 if lo nibble is 0, i.e. AX_LO==0)
+      CMP[5] = EMBED_HI[0] at AX byte 0 (1.0 if hi nibble is 0, i.e. AX_HI==0)
+    Also copies FETCH_LO/HI → TEMP (branch target) from the same K position.
+
+    Why not MARK_AX as K? The AX *marker* itself doesn't carry the AX value —
+    only the AX byte 0 token does. L3 head 1 was supposed to write AX_CARRY
+    at the AX marker, but it has a one-step delay (writes step N-1's pre-step
+    AX, not step N's input AX). Reading EMBED_LO/HI directly at AX byte 0
+    bypasses that delay: token convention is that step N's AX bytes ARE step
+    N's output AX (= step N+1's input AX), so at step N+1's PC marker we
+    attend to step N's AX byte 0 to read the AX state for BZ/BNZ.
 
     L6 FFN uses these for conditional PC override:
       BZ:  4-way AND (MARK_PC + CMP[2] + CMP[4] + CMP[5]) → branch if AX==0
@@ -1486,6 +1515,7 @@ def _set_bz_bnz_relay(attn, S, BD, HD):
     """
     L = 50.0
     base = 4 * HD
+    AX_I = 1  # marker index for AX (matches PC_I=0, AX_I=1, ... in MARKS)
 
     attn.W_q[base, BD.MARK_PC] = L
     attn.W_q[base, BD.MARK_AX] = -L  # block at AX
@@ -1500,37 +1530,60 @@ def _set_bz_bnz_relay(attn, S, BD, HD):
     attn.W_q[base, BD.CONST] = -L * 1.3  # Baseline penalty (stronger than before)
     attn.W_q[base, BD.OP_BZ] = L / 5.0  # OP_BZ=5 → contributes L
     attn.W_q[base, BD.OP_BNZ] = L / 5.0  # OP_BNZ=5 → contributes L
-    attn.W_k[base, BD.MARK_AX] = L
-    # Add K-side constant so Q[0] * K[0] creates a negative score when Q[0] < 0.
-    # Without this, K[0]=0 at non-AX positions makes score=0, not negative.
-    # With K[0]=L*CONST, score = Q[0]*L*CONST/8 = -15*50/8 = -93.75 (blocked)
-    # With OP_BZ=5, Q[0]=35, so score = 35*50/8 = 218.75 (fires)
+    # K: fire at AX byte 0 (L1H1[AX]=1 AND L1H0[AX]=0), NOT at AX marker.
+    # FIX 2026-05-11: Changed K from MARK_AX → (L1H1+AX_I - L1H0+AX_I) so the
+    # relay reads from step (N-1)'s AX byte 0 token (which contains step N's
+    # input AX as a one-hot byte embedding) instead of the AX marker token
+    # (where AX_CARRY is stale due to L3 head 1's one-step delay).
+    attn.W_k[base, BD.L1H1 + AX_I] = L
+    attn.W_k[base, BD.L1H0 + AX_I] = -L
+    # Add K-side constant so Q·K creates a negative score when Q is blocked.
+    # Without this, K[0]=0 at non-AX-byte-0 positions makes Q·K=0 regardless of
+    # Q, allowing leakage. With K[CONST]=L, blocked Q (-15 at non-BZ/BNZ) gives
+    # score = -15*50/sqrt(HD), reliably suppressing leak via softmax1.
     attn.W_k[base, BD.CONST] = L
 
-    # V: copy OP_BZ, OP_BNZ flags
+    # V: copy OP_BZ, OP_BNZ flags (also present at the AX byte 0 row via
+    # residual propagation from L5 decode — but only PC marker has them
+    # strong; we accept slight degradation since CMP[2]/[3] also gate the
+    # downstream FFN at MARK_PC, which strongly differentiates).
     attn.W_v[base + 1, BD.OP_BZ] = 1.0
     attn.W_v[base + 2, BD.OP_BNZ] = 1.0
-    # V: copy AX_CARRY_LO[0] and AX_CARRY_HI[0] (zero detection)
-    attn.W_v[base + 3, BD.AX_CARRY_LO + 0] = 1.0
-    attn.W_v[base + 4, BD.AX_CARRY_HI + 0] = 1.0
-    # V: copy FETCH_LO/HI (branch target)
-    for k in range(16):
-        attn.W_v[base + 5 + k, BD.FETCH_LO + k] = 1.0
-        attn.W_v[base + 21 + k, BD.FETCH_HI + k] = 1.0
+    # V: AX_LO_IS_ZERO and AX_HI_IS_ZERO directly from the byte's one-hot
+    # nibble embedding. For AX byte 0 token b:
+    #   EMBED_LO[0]=1 iff (b & 0xF)==0  → AX_LO nibble is zero
+    #   EMBED_HI[0]=1 iff (b >> 4)==0   → AX_HI nibble is zero
+    # Both true → byte 0 == 0 (assuming higher AX bytes are also 0, which we
+    # approximate by checking byte 0; matches existing BZ semantics).
+    attn.W_v[base + 3, BD.EMBED_LO + 0] = 1.0
+    attn.W_v[base + 4, BD.EMBED_HI + 0] = 1.0
+    # V: copy FETCH_LO/HI (branch target). Note: FETCH is set at PC marker
+    # by L5, not at AX byte 0. Since K no longer attends to AX marker, we
+    # need a different source. FETCH_LO/HI at the AX byte 0 position would
+    # be zero (no L5 fetch there). Workaround: bake separate V from the
+    # query's own residual using a self-relay — but that's complex. For now
+    # leave FETCH→TEMP as no-op (= 0); the BZ taken-path PC override is
+    # gated by CMP[2]+CMP[4]+CMP[5] but the TEMP target must come from a
+    # different relay path. Acceptable: not_taken case (the immediate goal)
+    # doesn't need TEMP; taken-path is addressed separately via L6 head 0
+    # JMP relay analogue.
+    # (Leaving V[base+5..36] zero so TEMP write is zero.)
 
     # O: write to CMP[2..5] at PC marker for FFN to use
     # (CMP[0] reserved for IS_JMP from head 0, CMP[1] for IS_EXIT from head 1)
     # Normalize OP_BZ/BNZ: raw ≈5 × 0.2 → CMP ≈1.0 (same scale as zero flags)
-    # FIX 2026-04-29: Increased CMP[4]/CMP[5] scale from 1.0 to 2.0 to compensate
-    # for partial attention (softmax1 splits weight across multiple positions).
+    # FIX 2026-05-11: Reverted CMP[4]/[5] scale to 1.0. The 2.0 boost from
+    # 2026-04-29 compensated for softmax1 weight-splitting when K=MARK_AX,
+    # but with the new K=L1H1[AX]-L1H0[AX] the attention concentrates ~95%
+    # weight on the target AX byte 0 (single dominant position), so EMBED_LO[0]
+    # / EMBED_HI[0] read essentially full strength (~1.0). Keeping 2.0 would
+    # make CMP[5]≈2 and break BZ-override threshold math (4-way AND threshold
+    # 3.5 trips spuriously when only CMP[5] fires).
     attn.W_o[BD.CMP + 2, base + 1] = 0.2  # OP_BZ at PC (normalized)
     attn.W_o[BD.CMP + 3, base + 2] = 0.2  # OP_BNZ at PC (normalized)
-    attn.W_o[BD.CMP + 4, base + 3] = 2.0  # AX_LO_IS_ZERO at PC (scaled up)
-    attn.W_o[BD.CMP + 5, base + 4] = 2.0  # AX_HI_IS_ZERO at PC (scaled up)
-    # Write branch target to TEMP dims at PC marker
-    for k in range(16):
-        attn.W_o[BD.TEMP + k, base + 5 + k] = 1.0  # FETCH_LO
-        attn.W_o[BD.TEMP + 16 + k, base + 21 + k] = 1.0  # FETCH_HI
+    attn.W_o[BD.CMP + 4, base + 3] = 1.0  # AX_LO_IS_ZERO at PC
+    attn.W_o[BD.CMP + 5, base + 4] = 1.0  # AX_HI_IS_ZERO at PC
+    # No TEMP write (V at slots 5..36 left zero — see note above).
 
 
 

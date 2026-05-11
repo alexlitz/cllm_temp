@@ -80,8 +80,15 @@ class TestPureNeuralBZ:
             Opcode.EXIT,
         ]) == 7
 
-    @pytest.mark.xfail(reason="pure_neural BZ fall-through not yet supported (hangs at BZ at step 1)")
-    @pytest.mark.parametrize("imm", [1, 5, 255])
+    @pytest.mark.parametrize("imm", [
+        1,
+        5,
+        pytest.param(255, marks=pytest.mark.xfail(
+            reason="IMM 255 returns 4210752255 in pure_neural mode — "
+            "pre-existing IMM-large-byte regression unrelated to BZ "
+            "(test_pure_neural_pc::test_imm_byte_values[255] fails identically)"
+        )),
+    ])
     def test_bz_not_taken(self, pure_neural_runner, imm):
         assert _run(pure_neural_runner, [
             (Opcode.IMM, imm),
@@ -106,7 +113,6 @@ class TestPureNeuralBNZ:
             Opcode.EXIT,
         ]) == 7
 
-    @pytest.mark.xfail(reason="pure_neural BNZ fall-through not yet supported (hangs at BNZ at step 1)")
     def test_bnz_not_taken(self, pure_neural_runner):
         assert _run(pure_neural_runner, [
             (Opcode.IMM, 0),
