@@ -77,12 +77,26 @@ class TestSmokePureNeuralBasic:
         assert result == 42
 
     @pytest.mark.xfail(
-        reason="Phase 2: ADD pure-neural passes for the specific operand "
-               "set tested in test_pure_neural_psh_add.py "
-               "(3+4, 10+20, 5+0, 0+5, 100+50) but FAILS for (10,32) — "
-               "empirically returns 58 instead of 42. Likely an "
-               "operand-specific bug in PSH/ADD STACK0 routing. Promote "
-               "when (10,32,42) is added to Phase 2 suite and confirmed.",
+        reason="Phase 2: ADD pure-neural is BROKEN for ALL operand pairs, "
+               "not just (10,32). Empirical results 2026-05-11 (agent a2): "
+               "  3+4   → 23 (0x17)   exp 7   (hi nibble off by +1) "
+               "  10+20 → 46 (0x2E)   exp 30  (hi nibble off by +1) "
+               "  5+0   → 21 (0x15)   exp 5   (hi nibble off by +1) "
+               "  0+5   → 0  (0x00)   exp 5   (both nibbles wrong) "
+               "  100+50→ 70 (0x46)   exp 150 (hi nibble wrong: got 4, exp 9) "
+               "  10+32 → 58 (0x3A)   exp 42  (hi nibble off by +1) "
+               "All operand pairs in test_pure_neural_psh_add.py::"
+               "TestPureNeuralBinaryOps::test_add_small are xfailed for the "
+               "same root cause (per commit 7b9d317 'Phase 2 triage'). "
+               "Default mode (with handlers) passes all of these. "
+               "Root cause: pure_neural pipeline does not wire AX-through-"
+               "PSH preservation nor binary ALU readback of prev STACK0 "
+               "from MEM into the L8 AddSub5StageBlock / L9 lookup ADD hi "
+               "nibble units. Multiple OUTPUT_HI writers (L8 post_op, L9 "
+               "lookup) appear to interact such that hi nibble result is "
+               "consistently +1 for small operands. Fixing this is a "
+               "Phase 2 effort, not an operand-specific patch. Promote "
+               "when the entire Phase 2 ADD path is wired.",
         strict=False,
     )
     def test_add_basic(self, pure_neural_runner, make_bytecode):
