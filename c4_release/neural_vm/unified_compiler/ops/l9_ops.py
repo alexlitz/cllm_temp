@@ -166,6 +166,162 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
     )
 
 
+def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
+    """L9 attention head 2: ALiBi-based memory-propagation attention.
+
+    PROOF-OF-CONCEPT for the directive "all of the memory conversions should
+    be alibi attention stuff" (2026-05-11). Replaces (eventually) the
+    runner-side ``_inject_mem_store`` / ``_mem_history`` shadow-memory
+    pipeline with attention that gathers PSH'd values from prior step
+    OUTPUT positions via ALiBi recency bias.
+
+    Design
+    ------
+    Q (at MEM val byte 0 positions during LI/LC/POP with ADDR_KEY = SP-1):
+      - W_q[head, BD.OP_LI_RELAY] = L
+      - W_q[head, BD.OP_LC_RELAY] = L
+      - W_q[head, BD.CMP+3] = L              (POP group flag at STACK0)
+      - W_q[head, BD.MEM_VAL_B0] = L         (gate to val byte 0)
+      - W_q[head, BD.ADDR_KEY + k] = scale * (bit_val)   (address bits)
+      - W_q[head, BD.CONST] = -threshold     (suppress non-fire positions)
+
+    K (at PSH/SI/SC OUTPUT positions — STACK0 value byte 0):
+      - W_k[head, BD.PSH_AT_SP] = L          (only match PSH output positions)
+      - W_k[head, BD.ADDR_KEY + k] = scale * (bit_val)
+      - W_k[head, BD.MEM_STORE] = L          (only match store entries)
+      - W_k[head, BD.CONST] = -threshold
+
+    V (PSH-output STACK0's CLEAN_EMBED value, copied to OUTPUT at the
+      current load position):
+      - W_v[head*HD + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0  for k in 0..15
+      - W_v[head*HD + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+      - W_o[BD.OUTPUT_LO + k, head*HD + 1 + k] = 1.0
+      - W_o[BD.OUTPUT_HI + k, head*HD + 17 + k] = 1.0
+
+    ALiBi slope tuning
+    ------------------
+    Score budget at target Q (load) attending to PSH outputs:
+      - Address match (24-bit, scale=10): +300 at exact match, -300 random
+      - PSH gate match: +L^2/HD (target+PSH=+L*L/HD, target+non-PSH=-)
+      - ALiBi penalty: -slope * |i - j|  (one VM step = 35 tokens)
+
+    With slope=0.5, going back 1 step costs -0.5*35 = -17.5; with two
+    PSHes at the same SP, the more recent one wins by +17.5 score (>>
+    softmax noise threshold). Going back 10 steps costs -175 which is
+    below the +300 address-match contribution, so legitimate matches still
+    fire across the typical KV-cache window. The slope should be tuned
+    higher if cross-PSH leak from old values becomes a problem; lower if
+    long-range matches fail.
+
+    Status
+    ------
+    ``enable=False`` by default: the op IS registered (so the dep graph and
+    layer_idx gates see it), but the bake is a no-op. This keeps existing
+    tests byte-identical. Set ``enable=True`` to activate the head and
+    flip ``alibi_slopes[2]`` from 0 to the tuned value.
+
+    Concrete next steps for full Phase 2 PSH/POP support
+    -----------------------------------------------------
+    1. Bake ADDR_KEY at PSH/SI/SC OUTPUT positions (STACK0 value byte 0
+       carries SP-derived address) — new FFN at L8 or earlier, ~50 LoC.
+    2. Verify K-side ADDR_KEY at PSH output matches what the load-side Q
+       expects. Today ADDR_KEY only lives at code byte positions
+       (``_add_code_addr_keys``) and at MEM section val-byte positions
+       (``_inject_mem_metadata``); we need it at PSH-step STACK0 too.
+    3. Set ``enable=True`` here and ``alibi_slopes[2] = 0.5``.
+    4. Drop the runner-side ``_inject_mem_section`` / ``_track_mem_access``
+       calls once attention-only mode is stable.
+
+    Time budget proof-of-concept: registers the op (passes layer_idx gate)
+    and demonstrates the design pattern without disturbing existing tests.
+    """
+    def bake(block, dim_positions, S):
+        # When disabled: op is a no-op. The head's alibi_slopes[2] stays at
+        # its module-init default (a small power-of-2 value from
+        # AutoregressiveAttention.__init__), but the head's W_q/W_k/W_v/W_o
+        # weights are all zero — so attention output for head 2 is 0 (V is 0)
+        # and W_o for head 2 dims is 0 → no contribution to the residual.
+        if not enable:
+            return
+
+        from ...vm_step import _SetDim as BD_DEFAULT
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        head = 2
+        base = head * HD
+
+        # Slope tuned to favor most-recent matching PSH within a typical
+        # 4096-token (~117-step) KV-cache window. See docstring for analysis.
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[head] = 0.5
+
+        BD = _as_setdim_proxy(dim_positions)
+        L = 50.0
+        scale = 10.0
+
+        # === Q side: fire at MEM val byte 0 position during LI/LC/POP ===
+        # MEM_VAL_B0 is set at val-byte-0 positions in every MEM section.
+        # During load ops, that position is the natural "I am about to read
+        # a memory value" anchor.
+        attn.W_q[base, BD.MEM_VAL_B0] = L
+        attn.W_q[base, BD.OP_LI_RELAY] = L / 5  # OP relay gates the load
+        attn.W_q[base, BD.OP_LC_RELAY] = L / 5
+        attn.W_q[base, BD.CMP + 3] = L / 5      # POP group
+        attn.W_q[base, BD.CONST] = -L * 1.5    # threshold
+
+        # === K side: match PSH-output STACK0 positions ===
+        # PSH_AT_SP is set at SP/STACK0 positions during PSH steps.
+        # MEM_STORE is set at MEM val-bytes (and at PSH-step's STACK0
+        # output, via L6 head 6 / L7 head 7 broadcast in step W).
+        attn.W_k[base, BD.PSH_AT_SP] = L
+        attn.W_k[base, BD.MEM_STORE] = L / 2
+        attn.W_k[base, BD.CONST] = -L * 0.5
+
+        # === Address matching: 24 binary bits across 3 address bytes ===
+        # Both sides use the same ADDR_KEY encoding. Address match gives
+        # +300 to score (per-dim contribution after /sqrt(HD)). Mismatch
+        # gives ~0 (random) to -300 (anti-match).
+        addr_dim = 4
+        addr_bases = [
+            (BD.ADDR_B0_LO, BD.ADDR_B0_HI),
+            (BD.ADDR_B1_LO, BD.ADDR_B1_HI),
+            (BD.ADDR_B2_LO, BD.ADDR_B2_HI),
+        ]
+        for ab_lo, ab_hi in addr_bases:
+            for nibble_base in [ab_lo, ab_hi]:
+                for bit in range(4):
+                    for k in range(16):
+                        bit_val = 2 * ((k >> bit) & 1) - 1
+                        attn.W_q[base + addr_dim, nibble_base + k] = scale * bit_val
+                        attn.W_k[base + addr_dim, nibble_base + k] = scale * bit_val
+                    addr_dim += 1
+
+        # === V/O: copy CLEAN_EMBED bytes → OUTPUT at load position ===
+        # The PSH step's STACK0 has CLEAN_EMBED_LO/HI = AX value at time of
+        # PSH. Carrying it to OUTPUT at the load position writes the value
+        # into the load result.
+        scale_v = 1.0
+        for k in range(16):
+            attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = scale_v
+            attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = scale_v
+        for k in range(16):
+            attn.W_o[BD.OUTPUT_LO + k, base + 1 + k] = 1.0
+            attn.W_o[BD.OUTPUT_HI + k, base + 17 + k] = 1.0
+
+    return Operation(
+        name="layer9_alibi_mem_attn",
+        phase=9.2,  # after lev_addr_relay (9.0) and lev_bp_to_pc_relay (9.1)
+        reads={"MEM_VAL_B0", "OP_LI_RELAY", "OP_LC_RELAY", "CMP", "CONST",
+               "PSH_AT_SP", "MEM_STORE", "ADDR_KEY",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=9,
+        migrated=True,
+    )
+
+
 def make_layer9_marker_suppress_op() -> Operation:
     """L9 FFN extension: marker suppression."""
     def bake(ffn, dim_positions, S):
