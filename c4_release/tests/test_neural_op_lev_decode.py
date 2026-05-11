@@ -55,7 +55,9 @@ class TestNeuralOpLevDecode:
             pytest.skip("Requires pure_neural=True runner")
 
         # Precondition: no Python peek at the bytecode.
-        assert runner.model._active_opcode is None, (
+        # The ``_active_opcode`` weight-swap path was retired in commit 16efeeb;
+        # the attribute may now be absent (which is also "no Python peek").
+        assert getattr(runner.model, "_active_opcode", None) is None, (
             "Test precondition: pure_neural runner must have "
             "_active_opcode=None (no Python peek)"
         )
@@ -118,6 +120,11 @@ class TestNeuralOpLevDecode:
             if not pc_positions:
                 continue
             first_pc = pc_positions[0]
+            # Skip KV-cached forwards (shape [1,1,D]) where indexing first_pc
+            # would be out of bounds — only full-context forwards have the
+            # captured residual covering the whole token sequence.
+            if first_pc >= c["after_L5"].shape[1]:
+                continue
             l5 = c["after_L5"][0, first_pc, op_lev_dim].item()
             l6 = c["after_L6"][0, first_pc, op_lev_dim].item()
             if l5 > best_l5:
