@@ -1171,20 +1171,43 @@ class AutoregressiveVM(nn.Module):
             if compact_attn:
                 block.attn.compact(block_size=block_size)
 
-    def compact_moe(self, opcode_range=None, relay_maps=None):
-        """Apply MoE partitioning to all FFN layers by opcode.
+    def compact_moe(self, opcode_range=None, relay_maps=None, pure_neural=False):
+        """Convert all FFN layers to spec-compliant SoftMoEFFN modules.
 
-        After compact(), further partitions each FFN's hidden units into
-        shared (always computed) and per-opcode experts (only computed for
-        that opcode). Call set_active_opcode() before each step.
+        After compact(), each block's FFN is partitioned into per-opcode
+        experts. The block's ``.ffn`` is then REPLACED with a ``SoftMoEFFN``
+        that runs all experts in parallel and soft-blends them by reading the
+        opcode-onehot routing signal directly from the activation tensor
+        (``x[:, :, opcode_dim]``).
+
+        This is the spec-compliant path: no Python-side dispatch, no weight
+        swapping between forward calls, ONNX-traceable. The previous
+        ``set_active_opcode`` weight-swap path has been retired.
 
         Args:
             opcode_range: range of opcode one-hot dims (default: 262-296).
             relay_maps: dict mapping layer_index -> relay_map for that layer.
                 Default: L6 CMP relay map accounting for position-dependent
                 CMP semantics (head 0/1/4 at PC/SE, head 6 at SP/STACK0).
+            pure_neural: If True, the SoftMoEFFN always uses ``_soft_forward``
+                (all experts run, ONNX-traceable). Otherwise it uses the fast
+                skip-inactive path at runtime.
         """
+        from .pure_moe import SoftMoEFFN, build_soft_moe_from_compact_partition
+
         BD = _SetDim
+        # Resolve opcode-flag dims from the dim_positions layout (compiler-
+        # allocated) when available; fall back to the hand-set _SetDim block
+        # at 262-296. Without this the partition would scan the wrong column
+        # range and silently return no opcode-dependent units.
+        if opcode_range is None:
+            if isinstance(self.dim_positions, dict):
+                opcode_range = [
+                    v for k, v in self.dim_positions.items()
+                    if k.startswith("OP_")
+                ]
+            else:
+                opcode_range = range(262, 296)
         if relay_maps is None:
             # CMP dims are overloaded at different positions:
             #   CMP[0]: IS_JMP at PC (head 0) + PSH at SP/STACK0 (head 6)
@@ -1194,47 +1217,63 @@ class AutoregressiveVM(nn.Module):
             #   CMP[4]: AX_LO_IS_ZERO at PC (head 4) + JSR at SP/STACK0 (head 6)
             #   CMP[5]: AX_HI_IS_ZERO at PC (head 4)
             # Map each CMP to ALL opcodes whose units depend on it.
+            def D(name):
+                if isinstance(self.dim_positions, dict) and name in self.dim_positions:
+                    return self.dim_positions[name]
+                return getattr(BD, name)
+            CMP = D("CMP")
             pop_ops = [
-                BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                BD.OP_OR, BD.OP_XOR, BD.OP_AND, BD.OP_SHL, BD.OP_SHR,
-                BD.OP_SI, BD.OP_SC,
+                D("OP_ADD"), D("OP_SUB"), D("OP_MUL"), D("OP_DIV"), D("OP_MOD"),
+                D("OP_EQ"), D("OP_NE"), D("OP_LT"), D("OP_GT"), D("OP_LE"), D("OP_GE"),
+                D("OP_OR"), D("OP_XOR"), D("OP_AND"), D("OP_SHL"), D("OP_SHR"),
+                D("OP_SI"), D("OP_SC"),
             ]
             relay_maps = {
                 6: {
-                    BD.CMP + 0: [BD.OP_JMP, BD.OP_PSH],
-                    BD.CMP + 1: [BD.OP_EXIT, BD.OP_ADJ],
-                    BD.CMP + 2: [BD.OP_ENT, BD.OP_BZ],
-                    BD.CMP + 3: pop_ops + [BD.OP_BNZ],
-                    BD.CMP + 4: [BD.OP_JSR, BD.OP_BZ, BD.OP_BNZ],
-                    BD.CMP + 5: [BD.OP_BZ, BD.OP_BNZ],
+                    CMP + 0: [D("OP_JMP"), D("OP_PSH")],
+                    CMP + 1: [D("OP_EXIT"), D("OP_ADJ")],
+                    CMP + 2: [D("OP_ENT"), D("OP_BZ")],
+                    CMP + 3: pop_ops + [D("OP_BNZ")],
+                    CMP + 4: [D("OP_JSR"), D("OP_BZ"), D("OP_BNZ")],
+                    CMP + 5: [D("OP_BZ"), D("OP_BNZ")],
                 }
             }
         for i, block in enumerate(self.blocks):
             relay = relay_maps.get(i)
-            block.ffn.compact_moe(opcode_range=opcode_range, relay_map=relay)
+            ffn = block.ffn
+            # Non-PureFFN blocks (ALU composites, FlattenedPureFFN wrappers,
+            # already-converted SoftMoEFFN) never participated in the legacy
+            # MoE path and are skipped here too.
+            if not isinstance(ffn, PureFFN):
+                continue
+            opcode_to_units, shared_indices = _partition_compact_ffn_by_opcode(
+                ffn, opcode_range=opcode_range, relay_map=relay
+            )
+            if not opcode_to_units:
+                continue
+            soft_moe = build_soft_moe_from_compact_partition(
+                ffn,
+                opcode_to_units=opcode_to_units,
+                shared_indices=shared_indices,
+                dim=ffn.W_up.shape[1],
+                pure_neural=pure_neural,
+            )
+            block.ffn = soft_moe.to(device=ffn.W_up.device, dtype=ffn.W_up.dtype)
 
     def set_active_opcode(self, opcode_value):
-        """Set the active opcode for MoE routing in all FFN layers.
+        """Update the model's active-opcode hint for embedding-side injection.
 
-        Swaps weight tensors to the active opcode's sub-matrices.
-        Zero per-forward overhead: forward() is unchanged.
+        Spec-compliant SoftMoEFFN reads the routing signal directly from
+        ``x[:, :, opcode_dim]`` (set at the MARK_PC position by L5 fetch), so
+        no per-step weight swap is performed here. The only side effect is
+        storing ``opcode_value`` so ``NeuralVMEmbedding._inject_active_opcode``
+        can emit the I/O-detection hints for PRTF/READ/LEV/BZ/BNZ.
 
-        Args:
-            opcode_value: Opcode enum value (e.g., Opcode.ADD), or None
-                to use full matrices (prefix processing).
+        Kept as a public method for backward compatibility with existing
+        callers (tests, batch runners, transformer_first_runner). New code
+        should rely on the tensor-native routing in ``SoftMoEFFN`` instead.
         """
-        # Store opcode for embedding augmentation
         self._active_opcode = opcode_value
-
-        if opcode_value is None:
-            dim = None
-        else:
-            dim = _opcode_dim_from_positions(self.dim_positions, opcode_value)
-        for block in self.blocks:
-            ffn = block.ffn
-            if getattr(ffn, "_moe_combined", None) is not None:
-                ffn._activate_moe(dim)
 
     def save_compact(self, path):
         """Save compacted model to disk (avoids re-computing compact on load)."""
@@ -1244,42 +1283,6 @@ class AutoregressiveVM(nn.Module):
     def load_compact(path):
         """Load a previously compacted model from disk."""
         return torch.load(path, weights_only=False)
-
-    def to(self, device):
-        """Move model to device, including MoE tensors.
-
-        Overrides nn.Module.to() to also move MoE weight dictionaries
-        that are stored as raw tensors (not Parameters/buffers).
-        """
-        result = super().to(device)
-        # Move MoE tensors in each block's FFN
-        for block in self.blocks:
-            ffn = block.ffn
-            if hasattr(ffn, '_moe_combined') and ffn._moe_combined is not None:
-                for key, tensors in ffn._moe_combined.items():
-                    for k, v in tensors.items():
-                        if isinstance(v, torch.Tensor):
-                            ffn._moe_combined[key][k] = v.to(device)
-            if hasattr(ffn, '_moe_shared') and ffn._moe_shared is not None:
-                for k, v in ffn._moe_shared.items():
-                    if isinstance(v, torch.Tensor):
-                        ffn._moe_shared[k] = v.to(device)
-            if hasattr(ffn, '_moe_experts') and ffn._moe_experts is not None:
-                for opcode, expert in ffn._moe_experts.items():
-                    for k, v in expert.items():
-                        if isinstance(v, torch.Tensor):
-                            ffn._moe_experts[opcode][k] = v.to(device)
-        return result
-
-    def cuda(self, device=None):
-        """Move model to CUDA, including MoE tensors."""
-        if device is None:
-            device = torch.cuda.current_device()
-        return self.to(device)
-
-    def cpu(self):
-        """Move model to CPU, including MoE tensors."""
-        return self.to('cpu')
 
     def forward(self, token_ids, kv_cache=None):
         """Forward pass: token IDs -> logits.
@@ -1541,6 +1544,71 @@ def _opcode_value_to_name(op_value):
             if not n.startswith("_") and isinstance(getattr(Opcode, n), int)
         }
     return _OPCODE_VALUE_TO_NAME.get(op_value)
+
+
+def _partition_compact_ffn_by_opcode(ffn, opcode_range=None, relay_map=None):
+    """Analyze a compacted ``PureFFN`` and group hidden units by opcode affinity.
+
+    Used by ``AutoregressiveVM.compact_moe`` to drive the SoftMoEFFN
+    construction. Each hidden unit is classified by inspecting its
+    ``W_up``/``W_gate`` weights for opcode-onehot column activity
+    (``> 0.5``). Units that fire only for a given opcode are grouped under
+    that opcode dim; units with no opcode dependence are "shared".
+
+    Args:
+        ffn: A ``PureFFN`` (already ``compact()``-ed).
+        opcode_range: Iterable of opcode-flag dims. The caller is responsible
+            for supplying the right range — for the compiler-allocated layout
+            this is the set of ``dim_positions["OP_*"]`` values; for the
+            hand-set ``_SetDim`` layout it is ``range(262, 296)``.
+        relay_map: Optional dict mapping additional W_up dims (e.g. CMP relay
+            dims in L6) to opcode dims. Values can be an int or a sequence
+            of ints (one unit may relay to multiple opcodes).
+
+    Returns:
+        ``(opcode_to_units, shared_indices)`` — a dict mapping each opcode
+        dim to a sorted list of hidden-unit indices, plus a list of indices
+        for the opcode-independent shared units. ``opcode_to_units`` may be
+        empty (the FFN has no opcode-dependent units, e.g. it's a fetch /
+        passthrough layer).
+    """
+    if opcode_range is None:
+        opcode_range = range(262, 296)
+    if relay_map is None:
+        relay_map = {}
+
+    W_up = ffn.W_up.data
+    W_gate = ffn.W_gate.data
+    H = W_up.shape[0]
+
+    opcode_to_units: dict = {}
+    shared_indices: list = []
+
+    for i in range(H):
+        opcodes = set()
+        # Check W_up for positive opcode weights (silu activation gating).
+        for d in opcode_range:
+            if d < W_up.shape[1] and W_up[i, d].item() > 0.5:
+                opcodes.add(d)
+        # Check W_gate for significant opcode weights (value gating).
+        for d in opcode_range:
+            if d < W_gate.shape[1] and abs(W_gate[i, d].item()) > 0.5:
+                opcodes.add(d)
+        # Check relay dims in W_up (e.g. CMP[2] -> OP_ENT).
+        for relay_dim, target in relay_map.items():
+            if relay_dim < W_up.shape[1] and W_up[i, relay_dim].item() > 0.5:
+                if isinstance(target, (list, tuple, set)):
+                    opcodes.update(target)
+                else:
+                    opcodes.add(target)
+
+        if opcodes:
+            for d in opcodes:
+                opcode_to_units.setdefault(d, []).append(i)
+        else:
+            shared_indices.append(i)
+
+    return opcode_to_units, shared_indices
 
 
 def _opcode_dim_from_positions(dim_positions, opcode_value):
