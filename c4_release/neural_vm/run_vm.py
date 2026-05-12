@@ -163,6 +163,7 @@ class AutoregressiveVMRunner:
         kv_cache_pruning_tau=0.99,
         kv_cache_pruning_eps=1e-6,
         enable_divergence_bail=True,
+        enable_moe_routing=True,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -186,6 +187,17 @@ class AutoregressiveVMRunner:
                 context. Lets failing pure_neural tests fail in seconds
                 instead of hitting the pytest timeout. Set False for debug
                 runs where you want to see the full token stream.
+            enable_moe_routing: If True (default), call ``model.compact()`` +
+                ``model.compact_moe()`` after construction so each FFN layer's
+                opcode-dependent hidden units are partitioned into per-opcode
+                ``SoftMoEFFN`` experts. This is the canonical spec-compliant
+                routing path (matches what the production batch_runner_v2 and
+                fast_runner already do). The runtime forward path is
+                semantically equivalent to the dense FFN — for a single active
+                opcode, exactly one expert fires (sparse top-1 dispatch via
+                ``.item()``) — but SoftMoEFFN is now on the live audit/test
+                path, no longer a code-graveyard module. Set False to keep
+                the dense compacted FFN (the previous default behavior).
         """
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
         # compile_full_vm. The compiler derives d_model and n_layers from the
@@ -194,7 +206,8 @@ class AutoregressiveVMRunner:
         alu_mode = 'efficient' if trust_neural_alu else 'lookup'
         cache_key = (d_model, n_layers, n_heads, ffn_hidden, max_seq_len,
                      conversational_io, alu_mode,
-                     enable_neural_io_think_protocol)
+                     enable_neural_io_think_protocol,
+                     bool(enable_moe_routing))
         if cache_model and cache_key in AutoregressiveVMRunner._MODEL_CACHE:
             self.model = AutoregressiveVMRunner._MODEL_CACHE[cache_key]
         else:
@@ -210,6 +223,15 @@ class AutoregressiveVMRunner:
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
             self.model.eval()
+            # Wire SoftMoEFFN routing onto the production path. Mirrors what
+            # batch_runner_v2/fast_runner already do post-construction; gated
+            # by ``enable_moe_routing`` so tests can opt out and exercise the
+            # dense compacted FFN path. compact() must run first because
+            # _partition_compact_ffn_by_opcode reads the already-compacted
+            # hidden-unit layout.
+            if enable_moe_routing:
+                self.model.compact(block_size=32)
+                self.model.compact_moe()
             if cache_model:
                 AutoregressiveVMRunner._MODEL_CACHE[cache_key] = self.model
 
@@ -307,6 +329,11 @@ class AutoregressiveVMRunner:
         self._kv_pruning_stats = {"calls": 0, "evicted_total": 0,
                                   "evicted_by_similarity": 0,
                                   "evicted_by_zero_v": 0}
+
+        # MoE routing flag — recorded for diagnostic visibility. ``compact()``
+        # + ``compact_moe()`` already ran above (gated by the same flag), so
+        # this is purely informational at the runner level.
+        self.enable_moe_routing = bool(enable_moe_routing)
 
         # Divergence-bail configuration. When True (default), `run` watches for
         # pathological autoregressive states (PC stuck at 0, PC looping on one
