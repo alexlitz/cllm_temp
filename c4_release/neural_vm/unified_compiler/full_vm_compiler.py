@@ -20,6 +20,30 @@ direct call to `set_vm_weights` from outside the compiler module.
 """
 
 from .layer_compiler import LayerCompiler, build_model_from_layout
+
+# Re-exported analyzer entry points so callers don't need to reach into
+# `layer_compiler` directly. The compiler also runs both scans automatically
+# from `LayerCompiler.compile()`; these helpers exist for tests / debugging
+# tools that want to inspect the registries without rebuilding the model.
+
+
+def detect_staleness_violations(compiler: LayerCompiler):
+    """Run the staleness-invariant scan on an already-populated compiler.
+
+    Returns the list of warning messages produced. See
+    `LayerCompiler._detect_staleness_violations` for the algorithm and
+    `c4_release/docs/STALENESS_INVARIANTS.md` for the bake-author API.
+    """
+    return compiler._detect_staleness_violations()
+
+
+def build_staleness_registry(compiler: LayerCompiler):
+    """Return (producers, consumers) registries for inspection.
+
+    Each registry maps ``(dim_name, register_name)`` -> list of
+    ``(op_name, phase)`` tuples across attn / ffn / block / model ops.
+    """
+    return compiler.build_staleness_registry()
 from .migrated_ops import (
     all_core_ops,
     all_alu_postop_attach_ops,

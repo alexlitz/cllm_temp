@@ -149,6 +149,16 @@ def all_core_ops(
         make_format_pointer_extraction_op(
             enable_conversational_io=enable_conversational_io
         ),
+        # L8 attn head 6 AX_CARRY refresh from prev step AX marker OUTPUT
+        # (commit 3d1b700). Always registered for the staleness analyzer
+        # (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md) so its
+        # ``produces`` annotation participates in the in-step producer
+        # check that guards the L8 ALU's ``consumes_fresh AX_CARRY_LO``
+        # contract. Bake body is no-op (``enable=False``) until the full
+        # production wiring is validated end-to-end; the active head-6
+        # bake currently lives in ``unified_compiler/compiler.py`` (the
+        # UnifiedVMCompiler path, see commit 3d1b700).
+        make_layer8_head6_ax_carry_refresh_op(enable=False),
         make_layer8_alu_op(),
         # Convo-I/O L8 FFN bake (phase=8.5). Always registered; bake is a
         # no-op when enable_conversational_io is False. Fires regardless of

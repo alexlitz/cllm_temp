@@ -31,6 +31,18 @@ def make_layer8_alu_op() -> Operation:
         bake_fn=bake,
         layer_idx=8,
         migrated=True,
+        # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
+        # The L8 lookup ALU consumes the *current step's* AX value via
+        # AX_CARRY_LO at the AX marker (operand 1 for ADD/SUB/LEA at the
+        # AX byte 0 position). Without an in-step producer, AX_CARRY_LO
+        # carries the prev-prev step's value (the stale-AX_CARRY bug
+        # observed in the IMM 10 / PSH / IMM 32 / ADD sequence, fixed by
+        # the L8 head 6 AX_CARRY refresh in commit 3d1b700). The
+        # ``layer8_head6_ax_carry_refresh`` op (phase=8.05) is the
+        # canonical in-step producer.
+        consumes_fresh={
+            "AX_CARRY_LO": "AX_byte0",
+        },
     )
 
 
@@ -176,6 +188,15 @@ def make_layer8_multibyte_routing_op() -> Operation:
         bake_fn=bake,
         layer_idx=8,
         migrated=True,
+        # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
+        # This op produces the fresh AX-byte-0 OUTPUT for IMM (routes
+        # AX_CARRY -> OUTPUT at AX byte positions). The L6 routing FFN
+        # produces AX_byte0 OUTPUT for the other AX-emitting opcodes; this
+        # L8 FFN extension covers the IMM multi-byte path.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI": "AX_byte0",
+        },
     )
 
 
@@ -237,6 +258,109 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=8,
         migrated=True,
+    )
+
+
+def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
+    """L8 attn head 6: refresh AX_CARRY_LO/HI from prev step's AX marker OUTPUT.
+
+    Mirrors the head-6 bake added to ``UnifiedVMCompiler._compile_l8_attention``
+    in commit ``3d1b700`` (2026-05-12, fix-phase2-ax-carry-refresh). The bake
+    reads ``OUTPUT_LO/HI`` from the previous step's AX marker (excluding the
+    *current* AX marker via anti-OP_* gates) and writes the result to the
+    current step's ``AX_CARRY_LO/HI``.
+
+    Status: ``enable=False`` by default — the production ``full_vm_compiler``
+    path does not yet route this bake (today's head-6 fix lives only in the
+    separate ``UnifiedVMCompiler`` path, see ``unified_compiler/compiler.py``).
+    The Operation is still registered (always) so its ``produces`` annotation
+    participates in the staleness-invariant scan. Setting ``enable=True``
+    flips the bake on so this op owns the head-6 weight programming in the
+    ``full_vm_compiler`` path; until that wiring is validated end-to-end the
+    default stays off to keep the production build byte-identical.
+
+    The ``produces`` declaration is the canonical proof-of-concept for the
+    staleness analyzer (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md):
+    removing this op from ``all_core_ops`` would leave the L8 ALU op (which
+    declares ``consumes_fresh={"AX_CARRY_LO": "AX_byte0", ...}``) without an
+    in-step producer, surfacing today's stale-AX_CARRY bug at compile time.
+    """
+    def _bake(block, dim_positions, S):
+        if not enable:
+            return
+        BD = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        base = 6 * HD
+        AX_CARRY_L = 50.0  # head-local Q/K scale
+        # Q[base+0]: fire only at current step's AX marker on subsequent
+        # steps (HAS_SE = 1). The CONST baseline blocks first-step fires.
+        attn.W_q.data[base, BD.MARK_AX] = AX_CARRY_L
+        attn.W_q.data[base, BD.HAS_SE] = AX_CARRY_L
+        attn.W_q.data[base, BD.CONST] = -AX_CARRY_L * 1.5
+        # K[base+0]: match AX marker at any past position.
+        attn.W_k.data[base, BD.MARK_AX] = AX_CARRY_L
+        # V copies OUTPUT_LO/HI from the matched AX marker.
+        for k in range(16):
+            attn.W_v.data[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
+            attn.W_v.data[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
+        # O writes to AX_CARRY_LO/HI at the query position (current AX marker).
+        for k in range(16):
+            attn.W_o.data[BD.AX_CARRY_LO + k, base + 1 + k] = 1.0
+            attn.W_o.data[BD.AX_CARRY_HI + k, base + 17 + k] = 1.0
+        # Anti-leakage gate (dim 33): suppress at non-AX-marker queries.
+        GATE = 33
+        attn.W_q.data[base + GATE, BD.MARK_AX] = AX_CARRY_L
+        attn.W_q.data[base + GATE, BD.CONST] = -AX_CARRY_L / 2
+        attn.W_k.data[base + GATE, BD.CONST] = AX_CARRY_L
+        # Anti-op gates: exclude the current AX marker from K via anti-OP_*.
+        anti_ops = [
+            BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_JMP, BD.OP_JSR, BD.OP_LEV,
+            BD.OP_BZ, BD.OP_BNZ, BD.OP_PSH, BD.OP_ADJ, BD.OP_ENT,
+            BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+            BD.OP_AND, BD.OP_OR, BD.OP_XOR,
+            BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+            BD.OP_SHL, BD.OP_SHR,
+            BD.OP_LI, BD.OP_LC, BD.OP_LEA,
+        ]
+        ANTI_OP_SLOT_START = 34
+        for j, op_dim in enumerate(anti_ops):
+            slot = ANTI_OP_SLOT_START + j
+            if slot >= HD:
+                break
+            attn.W_q.data[base + slot, op_dim] = -AX_CARRY_L
+            attn.W_k.data[base + slot, op_dim] = AX_CARRY_L
+
+    return Operation(
+        name="layer8_head6_ax_carry_refresh",
+        # Phase 8.05 places it between layer8_sp_gather_bake (8.0) and
+        # layer8_multibyte_fetch_bake (8.1) so the AX_CARRY refresh
+        # completes before any downstream L8 op that consumes_fresh
+        # AX_CARRY_LO/HI fires. The exact phase number is not load-bearing
+        # for the staleness analyzer (it only checks producer.phase <=
+        # consumer.phase); 8.05 keeps the L8 attn bakes contiguous.
+        phase=8.05,
+        reads={"MARK_AX", "HAS_SE", "OUTPUT_LO", "OUTPUT_HI", "CONST",
+               "OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR", "OP_LEV",
+               "OP_BZ", "OP_BNZ", "OP_PSH", "OP_ADJ", "OP_ENT",
+               "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+               "OP_AND", "OP_OR", "OP_XOR",
+               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+               "OP_SHL", "OP_SHR",
+               "OP_LI", "OP_LC", "OP_LEA"},
+        writes={"AX_CARRY_LO", "AX_CARRY_HI"},
+        kind="block",
+        bake_fn=_bake,
+        layer_idx=8,
+        # Always migrated=True so the bake runs when enable=True; when
+        # enable=False the bake body is a no-op so production behavior is
+        # unchanged. The Operation itself stays in the registry either way
+        # so the staleness analyzer can see its ``produces`` annotation.
+        migrated=True,
+        produces={
+            "AX_CARRY_LO": "AX_byte0",
+            "AX_CARRY_HI": "AX_byte0",
+        },
     )
 
 
