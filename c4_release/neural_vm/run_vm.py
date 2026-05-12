@@ -270,7 +270,19 @@ class AutoregressiveVMRunner:
                 # of guarding on the exact size of the first block's
                 # ``W_up`` and recompiling for every subsequent block.
                 _dynamo.config.force_parameter_static_shapes = False
-                self.model = torch.compile(self.model, mode=compile_mode)
+                # Standard-recipe (2026-05-12): force ``dynamic=True`` so
+                # the seq-dim is traced symbolically. Without this, Dynamo
+                # specializes on the exact seq_len it sees on the first
+                # forward and recompiles for every new seq_len during
+                # autoregressive decoding (the "9 distinct sizes" warning).
+                # See ``c4_release/docs/TORCH_COMPILE_BENCHMARK.md`` for the
+                # full benchmark trail (Recipes A/B/C). The data-dependent
+                # ``.item()`` early-outs (efficient_alu_divmod_split.py:459
+                # et al.) are guarded by ``torch.compiler.is_compiling()``
+                # so the compiled graph runs the full pipeline.
+                self.model = torch.compile(
+                    self.model, mode=compile_mode, dynamic=True
+                )
             if cache_model:
                 AutoregressiveVMRunner._MODEL_CACHE[cache_key] = self.model
         self.compile_mode = compile_mode
@@ -596,6 +608,30 @@ class AutoregressiveVMRunner:
                 if max_seq_len is not None and len(ctx) > max_seq_len:
                     ctx = ctx[-max_seq_len:]
                 token_ids = torch.tensor([ctx], dtype=torch.long, device=device)
+                # Recipe A (2026-05-12): on the FIRST compiled forward,
+                # mark the seq dim as dynamic with explicit bounds. This
+                # tells Dynamo to produce a single graph parameterized
+                # over the seq dim, instead of specializing on the exact
+                # seq_len of this call. Subsequent calls with different
+                # seq_len reuse the compiled graph. The runner caches
+                # ``_marked_dynamic_seq`` so we only call ``mark_dynamic``
+                # once per process — repeated calls are warned on (and
+                # are no-ops anyway once the guard is established).
+                if not getattr(self, "_marked_dynamic_seq", False):
+                    try:
+                        import torch._dynamo as _dynamo
+                        _dynamo.mark_dynamic(
+                            token_ids, 1,
+                            min=1,
+                            max=max_seq_len or 2048,
+                        )
+                    except Exception:
+                        # ``mark_dynamic`` may not exist on older PyTorch
+                        # versions or may fail on a non-eager tensor.
+                        # Compile still works (just without the explicit
+                        # symbolic bound); fall back silently.
+                        pass
+                    self._marked_dynamic_seq = True
                 # ``reduce-overhead`` captures a CUDA graph per compiled
                 # submodule and reuses an output buffer across calls. We
                 # must mark a "step boundary" before each top-level forward
