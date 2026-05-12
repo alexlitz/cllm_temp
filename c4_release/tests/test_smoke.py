@@ -12,19 +12,30 @@ Batched wiring (2026-05-12, branch ``batch-smoke-tests-via-fixture``):
     pure-neural decode (~45-100s per test). With ~42 tests using
     ``quick_runner``, the suite took ~30-60+ minutes sequentially.
 
-    Now: a session-scoped fixture (``_smoke_batched_results``) collects every
-    smoke test's (name, bytecode, max_steps) at module import, runs the whole
-    set through ``BatchedPureNeuralRunner.run_batch(...)`` in one shot (with
-    ``spec_k=int(os.environ.get("C4_SMOKE_SPEC_K", "8"))``), and caches
-    ``{name: (output, exit_code, err)}`` for the rest of the session. Each
-    test method becomes a thin lookup-and-assert.
+    Initial fix (commit ``944d5df``): a single session-scoped fixture
+    batched all ~42 programs through ``BatchedPureNeuralRunner.run_batch``.
+    Total wall ~370s. But ``run_batch`` runs until the longest-running
+    program halts, so the single longest program (e.g.
+    ``TestSmokeMemory::test_si_li_multiple_stores`` at max_steps=40) drove
+    the wall time for all 42.
+
+    Refactor (2026-05-12, branch ``smoke-per-class-batching``): one
+    session-scoped fixture per test class (``_smoke_basic_results``,
+    ``_smoke_controlflow_results``, ``_smoke_memory_results``, etc.). Each
+    fixture batches only the programs in its own class through
+    ``BatchedPureNeuralRunner.run_batch(...)``. Variance shrinks because
+    tests in the same class share similar ``max_steps`` budgets, so each
+    per-class batch's longest member is close to the per-class average.
+    Total wall = sum of per-class walls, but each per-class wall is much
+    smaller than the single ``max(all max_steps)`` we paid before. (See
+    the per-class wall-time table in the PR description.)
 
     Equivalence with the serial path is preserved because every batch element
     runs through the same compiled neural model as ``quick_runner``; see
     ``c4_release/neural_vm/batched_pure_neural.py`` for the per-element state
     machine. Tests with custom assertions (e.g. ``result != 0``,
     ``result == 42 or result == 0``) keep those checks intact via per-entry
-    ``assert_fn`` callables.
+    ``check`` callables.
 
 Tuning knobs:
     C4_SMOKE_SPEC_K — DraftVM speculation horizon in VM steps (default 8;
@@ -54,6 +65,7 @@ Out of scope (still use ``quick_runner`` / other fixtures):
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -612,60 +624,67 @@ _INTEGRATION_TESTS = [
 ]
 
 
-# Master registry — ordered list of every batched smoke entry. Order matches
-# the slot index returned by ``BatchedPureNeuralRunner.run_batch``.
-_ALL_SMOKE_TESTS = (
-    _BASIC_TESTS
-    + _CF_TESTS
-    + _FUNC_TESTS
-    + _BITWISE_TESTS
-    + _CMP_TESTS
-    + _ADDR_TESTS
-    + _MEM_TESTS
-    + _SHIFT_TESTS
-    + _BIT32_TESTS
-    + _INTEGRATION_TESTS
-)
+# Master registry — ordered list of every batched smoke entry, grouped by
+# the test class that owns it. Each per-class fixture below batches only its
+# own group through ``BatchedPureNeuralRunner.run_batch``. Grouping by class
+# keeps tests with similar ``max_steps`` budgets together so each batch's
+# longest member is close to the per-class average, which reduces wall-time
+# variance vs. one giant 42-program batch (where the single ``max(max_steps)``
+# drove the wall for every test).
+_SMOKE_GROUPS = {
+    "basic":         _BASIC_TESTS,
+    "controlflow":   _CF_TESTS,
+    "functioncall":  _FUNC_TESTS,
+    "bitwise":       _BITWISE_TESTS,
+    "comparison":    _CMP_TESTS,
+    "address":       _ADDR_TESTS,
+    "memory":        _MEM_TESTS,
+    "shift":         _SHIFT_TESTS,
+    "bit32":         _BIT32_TESTS,
+    "integration":   _INTEGRATION_TESTS,
+}
 
 
 # Detect duplicate names early so a typo can't silently shadow a result.
 _seen = set()
-for _t in _ALL_SMOKE_TESTS:
-    assert _t["name"] not in _seen, f"duplicate smoke test name: {_t['name']}"
-    _seen.add(_t["name"])
-del _seen
+for _group in _SMOKE_GROUPS.values():
+    for _t in _group:
+        assert _t["name"] not in _seen, f"duplicate smoke test name: {_t['name']}"
+        _seen.add(_t["name"])
+del _seen, _group, _t
+
+
+# Flat list kept for any external introspection (e.g. PR diffs / test
+# selection scripts that walk every smoke test by name).
+_ALL_SMOKE_TESTS = [t for group in _SMOKE_GROUPS.values() for t in group]
 
 
 _SMOKE_SPEC_K = int(os.environ.get("C4_SMOKE_SPEC_K", "8"))
 
 
 # =============================================================================
-# Session-scoped batched-results fixture
+# Per-class session-scoped batched-results fixtures
 # =============================================================================
 
 
-@pytest.fixture(scope="session")
-def _smoke_batched_results(_batched_pure_neural_runner_model):
-    """Run every entry in ``_ALL_SMOKE_TESTS`` through
-    ``BatchedPureNeuralRunner.run_batch`` once per pytest session.
+def _run_group_batch(runner, tests, group_label=""):
+    """Run one group of smoke tests through ``run_batch`` and return a
+    ``{name: (output, exit_code, err)}`` dict for that group.
 
-    Returns: ``{name: (output, exit_code, err)}``. ``err`` is ``None`` on
-    success; on a batch-level failure it's a string and ``exit_code`` is
-    ``None``. We catch the batch-run exception so a single bad program
-    doesn't poison the rest of the session.
+    ``err`` is ``None`` on success; on a batch-level failure it's a string
+    and ``exit_code`` is ``None``. We catch the batch-run exception so a
+    single bad program doesn't poison the rest of the session.
 
-    Uses the SAME compiled model as ``pure_neural_runner`` via the
-    session-scoped ``_batched_pure_neural_runner_model`` fixture defined
-    in ``conftest.py`` (so the expensive ``compile_full_vm`` bake happens
-    exactly once across the whole pytest session, shared with any other
-    batched suite running in the same process).
+    When ``C4_SMOKE_TIMING=1`` is set, prints a one-line per-group wall-
+    time summary to stderr (program count, max_steps, elapsed seconds) so
+    benchmarks can compare per-class walls against the prior all-42 wall
+    without parsing pytest internals.
     """
-    runner = _batched_pure_neural_runner_model
+    bytecodes = [t["bytecode"] for t in tests]
+    max_steps = max(t["max_steps"] for t in tests)
+    names = [t["name"] for t in tests]
 
-    bytecodes = [t["bytecode"] for t in _ALL_SMOKE_TESTS]
-    max_steps = max(t["max_steps"] for t in _ALL_SMOKE_TESTS)
-    names = [t["name"] for t in _ALL_SMOKE_TESTS]
-
+    t0 = time.perf_counter()
     try:
         batch_results = runner.run_batch(
             bytecodes,
@@ -675,11 +694,76 @@ def _smoke_batched_results(_batched_pure_neural_runner_model):
     except Exception as e:
         err = f"batch run error: {e!r}"
         return {n: ("", None, err) for n in names}
+    elapsed = time.perf_counter() - t0
+
+    if os.environ.get("C4_SMOKE_TIMING") == "1" and group_label:
+        print(
+            f"[smoke-timing] {group_label:>13s}: "
+            f"N={len(tests):2d} max_steps={max_steps:3d} wall={elapsed:7.2f}s",
+            file=sys.stderr,
+            flush=True,
+        )
 
     results = {}
     for name, (output, exit_code) in zip(names, batch_results):
         results[name] = (output, exit_code, None)
     return results
+
+
+# All per-class fixtures share the SAME compiled model via the session-
+# scoped ``_batched_pure_neural_runner_model`` fixture in ``conftest.py`` —
+# so the expensive ``compile_full_vm`` bake happens exactly once across the
+# whole pytest session, not once per class.
+
+
+@pytest.fixture(scope="session")
+def _smoke_basic_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _BASIC_TESTS, "basic")
+
+
+@pytest.fixture(scope="session")
+def _smoke_controlflow_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _CF_TESTS, "controlflow")
+
+
+@pytest.fixture(scope="session")
+def _smoke_functioncall_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _FUNC_TESTS, "functioncall")
+
+
+@pytest.fixture(scope="session")
+def _smoke_bitwise_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _BITWISE_TESTS, "bitwise")
+
+
+@pytest.fixture(scope="session")
+def _smoke_comparison_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _CMP_TESTS, "comparison")
+
+
+@pytest.fixture(scope="session")
+def _smoke_address_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _ADDR_TESTS, "address")
+
+
+@pytest.fixture(scope="session")
+def _smoke_memory_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _MEM_TESTS, "memory")
+
+
+@pytest.fixture(scope="session")
+def _smoke_shift_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _SHIFT_TESTS, "shift")
+
+
+@pytest.fixture(scope="session")
+def _smoke_bit32_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _BIT32_TESTS, "bit32")
+
+
+@pytest.fixture(scope="session")
+def _smoke_integration_results(_batched_pure_neural_runner_model):
+    return _run_group_batch(_batched_pure_neural_runner_model, _INTEGRATION_TESTS, "integration")
 
 
 def _lookup_and_check(results, name):
@@ -699,23 +783,23 @@ def _lookup_and_check(results, name):
 class TestSmokeBasic:
     """Quick sanity checks - should all pass in <5 seconds."""
 
-    def test_imm_exit(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeBasic::test_imm_exit")
+    def test_imm_exit(self, _smoke_basic_results):
+        _lookup_and_check(_smoke_basic_results, "TestSmokeBasic::test_imm_exit")
 
-    def test_add_basic(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeBasic::test_add_basic")
+    def test_add_basic(self, _smoke_basic_results):
+        _lookup_and_check(_smoke_basic_results, "TestSmokeBasic::test_add_basic")
 
-    def test_sub_basic(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeBasic::test_sub_basic")
+    def test_sub_basic(self, _smoke_basic_results):
+        _lookup_and_check(_smoke_basic_results, "TestSmokeBasic::test_sub_basic")
 
-    def test_mul_basic(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeBasic::test_mul_basic")
+    def test_mul_basic(self, _smoke_basic_results):
+        _lookup_and_check(_smoke_basic_results, "TestSmokeBasic::test_mul_basic")
 
-    def test_div_basic(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeBasic::test_div_basic")
+    def test_div_basic(self, _smoke_basic_results):
+        _lookup_and_check(_smoke_basic_results, "TestSmokeBasic::test_div_basic")
 
-    def test_mod_basic(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeBasic::test_mod_basic")
+    def test_mod_basic(self, _smoke_basic_results):
+        _lookup_and_check(_smoke_basic_results, "TestSmokeBasic::test_mod_basic")
 
 
 # =============================================================================
@@ -725,14 +809,14 @@ class TestSmokeBasic:
 class TestSmokeControlFlow:
     """Control flow quick checks."""
 
-    def test_jmp_forward(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeControlFlow::test_jmp_forward")
+    def test_jmp_forward(self, _smoke_controlflow_results):
+        _lookup_and_check(_smoke_controlflow_results, "TestSmokeControlFlow::test_jmp_forward")
 
-    def test_bz_branch(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeControlFlow::test_bz_branch")
+    def test_bz_branch(self, _smoke_controlflow_results):
+        _lookup_and_check(_smoke_controlflow_results, "TestSmokeControlFlow::test_bz_branch")
 
-    def test_bnz_branch(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeControlFlow::test_bnz_branch")
+    def test_bnz_branch(self, _smoke_controlflow_results):
+        _lookup_and_check(_smoke_controlflow_results, "TestSmokeControlFlow::test_bnz_branch")
 
 
 # =============================================================================
@@ -742,8 +826,8 @@ class TestSmokeControlFlow:
 class TestSmokeFunctionCall:
     """Function call quick checks."""
 
-    def test_simple_function(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeFunctionCall::test_simple_function")
+    def test_simple_function(self, _smoke_functioncall_results):
+        _lookup_and_check(_smoke_functioncall_results, "TestSmokeFunctionCall::test_simple_function")
 
 
 # =============================================================================
@@ -753,14 +837,14 @@ class TestSmokeFunctionCall:
 class TestSmokeBitwise:
     """Bitwise operation quick checks."""
 
-    def test_or_basic(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeBitwise::test_or_basic")
+    def test_or_basic(self, _smoke_bitwise_results):
+        _lookup_and_check(_smoke_bitwise_results, "TestSmokeBitwise::test_or_basic")
 
-    def test_and_basic(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeBitwise::test_and_basic")
+    def test_and_basic(self, _smoke_bitwise_results):
+        _lookup_and_check(_smoke_bitwise_results, "TestSmokeBitwise::test_and_basic")
 
-    def test_xor_basic(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeBitwise::test_xor_basic")
+    def test_xor_basic(self, _smoke_bitwise_results):
+        _lookup_and_check(_smoke_bitwise_results, "TestSmokeBitwise::test_xor_basic")
 
 
 # =============================================================================
@@ -770,26 +854,26 @@ class TestSmokeBitwise:
 class TestSmokeComparison:
     """Comparison operation quick checks."""
 
-    def test_eq_true(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeComparison::test_eq_true")
+    def test_eq_true(self, _smoke_comparison_results):
+        _lookup_and_check(_smoke_comparison_results, "TestSmokeComparison::test_eq_true")
 
-    def test_eq_false(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeComparison::test_eq_false")
+    def test_eq_false(self, _smoke_comparison_results):
+        _lookup_and_check(_smoke_comparison_results, "TestSmokeComparison::test_eq_false")
 
-    def test_lt_true(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeComparison::test_lt_true")
+    def test_lt_true(self, _smoke_comparison_results):
+        _lookup_and_check(_smoke_comparison_results, "TestSmokeComparison::test_lt_true")
 
-    def test_ne_true(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeComparison::test_ne_true")
+    def test_ne_true(self, _smoke_comparison_results):
+        _lookup_and_check(_smoke_comparison_results, "TestSmokeComparison::test_ne_true")
 
-    def test_gt_true(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeComparison::test_gt_true")
+    def test_gt_true(self, _smoke_comparison_results):
+        _lookup_and_check(_smoke_comparison_results, "TestSmokeComparison::test_gt_true")
 
-    def test_le_true(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeComparison::test_le_true")
+    def test_le_true(self, _smoke_comparison_results):
+        _lookup_and_check(_smoke_comparison_results, "TestSmokeComparison::test_le_true")
 
-    def test_ge_true(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeComparison::test_ge_true")
+    def test_ge_true(self, _smoke_comparison_results):
+        _lookup_and_check(_smoke_comparison_results, "TestSmokeComparison::test_ge_true")
 
 
 # =============================================================================
@@ -799,11 +883,11 @@ class TestSmokeComparison:
 class TestSmokeAddress:
     """LEA and ADJ operation quick checks."""
 
-    def test_lea_basic(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeAddress::test_lea_basic")
+    def test_lea_basic(self, _smoke_address_results):
+        _lookup_and_check(_smoke_address_results, "TestSmokeAddress::test_lea_basic")
 
-    def test_adj_sp(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeAddress::test_adj_sp")
+    def test_adj_sp(self, _smoke_address_results):
+        _lookup_and_check(_smoke_address_results, "TestSmokeAddress::test_adj_sp")
 
 
 # =============================================================================
@@ -813,23 +897,23 @@ class TestSmokeAddress:
 class TestSmokeMemory:
     """Memory load/store operation quick checks."""
 
-    def test_si_li_roundtrip(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeMemory::test_si_li_roundtrip")
+    def test_si_li_roundtrip(self, _smoke_memory_results):
+        _lookup_and_check(_smoke_memory_results, "TestSmokeMemory::test_si_li_roundtrip")
 
-    def test_sc_lc_roundtrip(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeMemory::test_sc_lc_roundtrip")
+    def test_sc_lc_roundtrip(self, _smoke_memory_results):
+        _lookup_and_check(_smoke_memory_results, "TestSmokeMemory::test_sc_lc_roundtrip")
 
-    def test_si_li_zero(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeMemory::test_si_li_zero")
+    def test_si_li_zero(self, _smoke_memory_results):
+        _lookup_and_check(_smoke_memory_results, "TestSmokeMemory::test_si_li_zero")
 
-    def test_si_li_multiple_stores(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeMemory::test_si_li_multiple_stores")
+    def test_si_li_multiple_stores(self, _smoke_memory_results):
+        _lookup_and_check(_smoke_memory_results, "TestSmokeMemory::test_si_li_multiple_stores")
 
-    def test_si_li_overwrite(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeMemory::test_si_li_overwrite")
+    def test_si_li_overwrite(self, _smoke_memory_results):
+        _lookup_and_check(_smoke_memory_results, "TestSmokeMemory::test_si_li_overwrite")
 
-    def test_si_li_16bit_value(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeMemory::test_si_li_16bit_value")
+    def test_si_li_16bit_value(self, _smoke_memory_results):
+        _lookup_and_check(_smoke_memory_results, "TestSmokeMemory::test_si_li_16bit_value")
 
 
 # =============================================================================
@@ -839,11 +923,11 @@ class TestSmokeMemory:
 class TestSmokeShift:
     """Shift operation quick checks."""
 
-    def test_shl(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeShift::test_shl")
+    def test_shl(self, _smoke_shift_results):
+        _lookup_and_check(_smoke_shift_results, "TestSmokeShift::test_shl")
 
-    def test_shr(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeShift::test_shr")
+    def test_shr(self, _smoke_shift_results):
+        _lookup_and_check(_smoke_shift_results, "TestSmokeShift::test_shr")
 
 
 # =============================================================================
@@ -903,35 +987,35 @@ class TestSmokePipeline:
 class TestSmoke32Bit:
     """Test operations with values > 255 (exercises bytes 1-3)."""
 
-    def test_add_16bit(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_add_16bit")
+    def test_add_16bit(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_add_16bit")
 
-    def test_add_carry_cascade(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_add_carry_cascade")
+    def test_add_carry_cascade(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_add_carry_cascade")
 
-    def test_sub_16bit(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_sub_16bit")
+    def test_sub_16bit(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_sub_16bit")
 
-    def test_sub_borrow_cascade(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_sub_borrow_cascade")
+    def test_sub_borrow_cascade(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_sub_borrow_cascade")
 
-    def test_or_16bit(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_or_16bit")
+    def test_or_16bit(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_or_16bit")
 
-    def test_and_16bit(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_and_16bit")
+    def test_and_16bit(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_and_16bit")
 
-    def test_xor_16bit(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_xor_16bit")
+    def test_xor_16bit(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_xor_16bit")
 
-    def test_mul_overflow(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_mul_overflow")
+    def test_mul_overflow(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_mul_overflow")
 
-    def test_shl_8bit(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_shl_8bit")
+    def test_shl_8bit(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_shl_8bit")
 
-    def test_shr_8bit(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmoke32Bit::test_shr_8bit")
+    def test_shr_8bit(self, _smoke_bit32_results):
+        _lookup_and_check(_smoke_bit32_results, "TestSmoke32Bit::test_shr_8bit")
 
 
 # =============================================================================
@@ -941,8 +1025,8 @@ class TestSmoke32Bit:
 class TestSmokeIntegration:
     """Multi-step integration tests combining multiple opcodes."""
 
-    def test_cmp_and_branch(self, _smoke_batched_results):
-        _lookup_and_check(_smoke_batched_results, "TestSmokeIntegration::test_cmp_and_branch")
+    def test_cmp_and_branch(self, _smoke_integration_results):
+        _lookup_and_check(_smoke_integration_results, "TestSmokeIntegration::test_cmp_and_branch")
 
 
 if __name__ == '__main__':
