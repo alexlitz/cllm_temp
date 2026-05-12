@@ -1052,6 +1052,96 @@ class UnifiedVMCompiler:
                 attn.W_o.data[addr_lo_out + k, base + 1 + k] = 1.0
                 attn.W_o.data[addr_hi_out + k, base + 17 + k] = 1.0
 
+        # Head 6: AX_CARRY refresh from prev step's AX marker OUTPUT.
+        #
+        # Phase 8 fix (2026-05-12, fix-phase2-ax-carry-refresh):
+        # The legacy AX_CARRY chain (L3 head 1) reads EMBED_LO/HI from the prev
+        # step's AX byte 0 token. That works only when the AX byte 0 token was
+        # emitted correctly upstream — which itself depends on AX_CARRY being
+        # correct at the prev step's AX marker. The diagnostic agent observed
+        # the chain breaking at the ADD step in the sequence
+        # ``IMM 10 / PSH / IMM 32 / ADD``: AX_CARRY_LO at the ADD step's AX
+        # marker landed on 10 (stale, from IMM 10 two steps back) instead of
+        # 32, producing ``ALU + AX_CARRY = 10 + 10 = 20`` (compounding with
+        # the parallel L4-ALU_HI leakage to give the observed 0/74/124 output
+        # instead of 42).
+        #
+        # This head closes the gap by reading OUTPUT_LO/HI directly from the
+        # previous step's AX marker (which holds the *current* AX value the
+        # model is about to emit, written by L6 routing FFN for IMM / EXIT /
+        # NOP / JMP / JSR / BZ / BNZ / PSH / ADJ). The L8 attn input sees
+        # those writes because L6 FFN runs before L8 attn. The cached V at
+        # the prev AX marker therefore reflects the prev step's final AX byte
+        # 0 value.
+        #
+        # Selecting prev (vs current) AX marker
+        # -------------------------------------
+        # Both the current step's AX marker (the just-emitted query position)
+        # and any past AX marker have ``MARK_AX = 1`` and would match a plain
+        # ``K[MARK_AX]`` head. We exclude the current AX marker by anti-
+        # matching the per-step OP_* flag set at the AX marker by L5 FFN
+        # opcode decode: at the current step the active OP_* (e.g. OP_ADD)
+        # is +5 at the AX marker, while at prev step's AX marker (cached at
+        # prev forward pass L8 attn input) the OP_* is whatever prev step
+        # decoded (e.g. OP_IMM). Anti-matching ALL OP_* dims means the
+        # current AX marker self-match collapses by ``L^2 * 25`` per active
+        # op (one op is active at each AX marker after L5 decode), driving
+        # the self-score deeply negative. Prev AX markers with a DIFFERENT
+        # active OP_* contribute 0 to the anti-match, leaving the baseline
+        # ``L^2`` from the MARK_AX match. ALiBi (slope 0.5) then breaks ties
+        # in favor of the MOST RECENT prev AX marker (the one immediately
+        # preceding the current step).
+        base = 6 * HD
+        AX_CARRY_L = 50.0  # head-local Q/K scale (independent of compiler L=15.0)
+        # Q[base+0]: fire only at current step's AX marker on subsequent
+        # steps (HAS_SE = 1). The CONST baseline blocks first-step fires.
+        attn.W_q.data[base, BD.MARK_AX] = AX_CARRY_L
+        attn.W_q.data[base, BD.HAS_SE] = AX_CARRY_L
+        attn.W_q.data[base, BD.CONST] = -AX_CARRY_L * 1.5
+        # K[base+0]: match AX marker at any past position.
+        attn.W_k.data[base, BD.MARK_AX] = AX_CARRY_L
+
+        # V copies OUTPUT_LO/HI from the matched AX marker.
+        for k in range(16):
+            attn.W_v.data[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
+            attn.W_v.data[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
+        # O writes to AX_CARRY_LO/HI at the query position (current AX marker).
+        for k in range(16):
+            attn.W_o.data[BD.AX_CARRY_LO + k, base + 1 + k] = 1.0
+            attn.W_o.data[BD.AX_CARRY_HI + k, base + 17 + k] = 1.0
+
+        # Anti-leakage gate (dim 33): suppress at non-AX-marker queries.
+        GATE = 33
+        attn.W_q.data[base + GATE, BD.MARK_AX] = AX_CARRY_L
+        attn.W_q.data[base + GATE, BD.CONST] = -AX_CARRY_L / 2
+        attn.W_k.data[base + GATE, BD.CONST] = AX_CARRY_L
+
+        # Anti-op gates (dims 34..63): exclude the current AX marker from K.
+        # Each row contributes ``-AX_CARRY_L^2 * x[op] * y[op]`` to the q·k
+        # score. The current AX marker self-match has its single active op
+        # firing at BOTH q and k positions (since L5 decode marks the AX
+        # marker with the step's OP_*), producing a strongly-negative score
+        # contribution. Prev AX markers with a DIFFERENT active op contribute
+        # 0 (one op active at prev, a different op active at current, no
+        # overlap), leaving only the positive ``L^2`` from the MARK_AX
+        # match plus the ALiBi distance penalty.
+        anti_ops = [
+            BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_JMP, BD.OP_JSR, BD.OP_LEV,
+            BD.OP_BZ, BD.OP_BNZ, BD.OP_PSH, BD.OP_ADJ, BD.OP_ENT,
+            BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+            BD.OP_AND, BD.OP_OR, BD.OP_XOR,
+            BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+            BD.OP_SHL, BD.OP_SHR,
+            BD.OP_LI, BD.OP_LC, BD.OP_LEA,
+        ]
+        ANTI_OP_SLOT_START = 34
+        for j, op_dim in enumerate(anti_ops):
+            slot = ANTI_OP_SLOT_START + j
+            if slot >= HD:
+                break  # do not overflow head_dim
+            attn.W_q.data[base + slot, op_dim] = -AX_CARRY_L
+            attn.W_k.data[base + slot, op_dim] = AX_CARRY_L
+
     def _compile_l9_attention(self, attn):
         """Compile L9 attention (LEV address relay)."""
         HD = self.HD
