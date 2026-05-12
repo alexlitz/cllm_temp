@@ -1131,13 +1131,14 @@ class FlattenedALUMul(nn.Module):
         # identical when OP_MUL is active. Mirrors the early-out in
         # `FlattenedDivMod.forward` (perf-divmod-early-out).
         #
-        # ONNX export: the `.item()` call would constant-fold the branch
-        # at trace time, baking in "no MUL ever" and omitting the entire
-        # pipeline from the exported graph. Per
-        # docs/ONNX_EXPORT_STATUS_2026_05_11.md blocker 2, skip the
-        # early-out under tracing and rely on the combine-stage mask for
-        # correctness (downstream writeback is already opcode-gated).
+        # ONNX export & torch.compile: the `.item()` call would force a
+        # CPU/GPU sync and graph break. Under tracing or compilation we
+        # always run the full pipeline; the combine-stage mask zeroes the
+        # writeback correctly when MUL is inactive, so output stays
+        # byte-identical. Per docs/ONNX_EXPORT_STATUS_2026_05_11.md
+        # blocker 2.
         if (not torch.onnx.is_in_onnx_export()
+                and not torch.compiler.is_compiling()
                 and x_bd[..., self.BD.OP_MUL].max().item() < 0.1):
             return x_bd  # no-op when MUL isn't the active opcode
 

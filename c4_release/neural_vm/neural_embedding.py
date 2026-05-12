@@ -195,20 +195,28 @@ class NeuralVMEmbedding(nn.Module):
         # Standard embedding lookup
         x = self.embed(token_ids)
 
-        # --- ONNX export fast path ---------------------------------------
+        # --- ONNX export / torch.compile fast path -----------------------
         # The prefix cache is purely a runtime perf optimization (it caches
         # the augmentation delta for the immutable CODE/DATA prefix region
         # across forward calls within a single ``run()``). It involves Python
-        # state mutation and a ``.tolist()`` scan that the ONNX tracer can't
-        # capture. When exporting, bypass the cache entirely and run the
-        # un-cached augmentations every call.
+        # state mutation and a ``.tolist()`` scan that the ONNX tracer and
+        # ``torch.compile``'s Dynamo tracer can't capture. When exporting
+        # or compiling, bypass the cache entirely and run the un-cached
+        # augmentations every call.
         #
-        # We also avoid the pre-allocated ADDR_KEY buffer (which would freeze
-        # the traced graph at ``max_seq_len`` capacity); instead we recompute
-        # the ADDR_KEY positional encoding from scratch with ``torch.arange``
-        # so the exported model accepts *any* sequence length at inference.
+        # ONNX export additionally uses the pure-tensor ADDR_KEY computation
+        # (``_compute_addr_keys``) instead of the pre-allocated buffer so the
+        # exported model accepts *any* sequence length at inference. Under
+        # ``torch.compile`` the buffer path is fine (single shape, traceable).
         if torch.onnx.is_in_onnx_export():
             self._compute_addr_keys(token_ids, x)
+            self._inject_mem_store(token_ids, x, start_pos=0)
+            return x
+        if torch.compiler.is_compiling():
+            # torch.compile path: avoid the prefix cache (Python state) and
+            # use the buffer-based addr_keys (single static shape — fine for
+            # Dynamo trace, unlike ONNX which needs dynamic seq_len).
+            self._add_code_addr_keys(token_ids, x)
             self._inject_mem_store(token_ids, x, start_pos=0)
             return x
 
