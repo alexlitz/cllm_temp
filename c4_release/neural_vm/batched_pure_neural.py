@@ -39,6 +39,7 @@ Output equivalence:
 from __future__ import annotations
 
 import torch
+from collections import deque
 from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
 
@@ -50,6 +51,23 @@ from .run_vm import (
     _MEM_STORE_OPS,
 )
 from .speculative import DraftVM
+
+
+# Adaptive speculative-K tuning knobs. The runner accepts ``spec_k <= 0`` as a
+# sentinel that enables adaptive mode: each element tracks its own
+# ``adaptive_k`` starting at ``_ADAPTIVE_START_K`` and a rolling rejection
+# rate over the last ``_ADAPTIVE_WINDOW`` batched-forward iterations. On high
+# rejection (>= ``_ADAPTIVE_BACKOFF_THRESHOLD``) the per-element K halves
+# (floor ``_ADAPTIVE_MIN_K``); on consistent acceptance
+# (<= ``_ADAPTIVE_RAMP_THRESHOLD``) it doubles (cap ``_ADAPTIVE_MAX_K``).
+# Per-element bookkeeping lets a batch that mixes programs (some perfectly
+# predicted, some flaky) auto-tune each slot independently.
+_ADAPTIVE_START_K = 32
+_ADAPTIVE_MIN_K = 1
+_ADAPTIVE_MAX_K = 64
+_ADAPTIVE_WINDOW = 10
+_ADAPTIVE_BACKOFF_THRESHOLD = 0.5
+_ADAPTIVE_RAMP_THRESHOLD = 0.1
 
 
 # Step-relative offsets where the speculative-mode logit disagrees with the
@@ -105,6 +123,18 @@ class _ElementState:
     # draft token. Used to flip ``spec_disabled`` after 4 in a row.
     spec_zero_streak: int = 0
 
+    # Adaptive spec-K state. ``adaptive_k`` is the current per-element draft
+    # horizon in VM steps. ``recent_rejections`` is a rolling window of
+    # rejection-rate samples (one per batched forward where this element was
+    # speculated): each sample is in [0.0, 1.0] = (rejected_tokens /
+    # drafted_tokens). The window is bounded by ``_ADAPTIVE_WINDOW`` (oldest
+    # samples drop off automatically). When ``adaptive_k`` is 0 the element
+    # is in non-adaptive mode (legacy fixed-K path).
+    adaptive_k: int = 0
+    recent_rejections: deque = field(
+        default_factory=lambda: deque(maxlen=_ADAPTIVE_WINDOW)
+    )
+
     def exec_pc(self) -> int:
         return PC_OFFSET if self.last_pc is None else self.last_pc
 
@@ -158,6 +188,7 @@ class BatchedPureNeuralRunner:
         argv: List[str],
         stdin: str,
         spec_k: int = 0,
+        adaptive_start_k: int = 0,
     ) -> _ElementState:
         ctx = self._serial._build_context(bytecode, data or b"", argv or [], stdin or "")
         st = _ElementState(
@@ -172,7 +203,9 @@ class BatchedPureNeuralRunner:
         elif isinstance(data, list):
             for i, b in enumerate(data):
                 st.memory[0x10000 + i] = b
-        if spec_k > 0:
+        if adaptive_start_k > 0:
+            st.adaptive_k = adaptive_start_k
+        if spec_k > 0 or adaptive_start_k > 0:
             st.draft_vm = DraftVM(list(bytecode))
             # Load data section into DraftVM memory so reads from the data
             # segment behave correctly. DraftVM stores 32-bit values per addr;
@@ -210,15 +243,21 @@ class BatchedPureNeuralRunner:
             max_steps: maximum VM steps (35 tokens each) per program.
             max_context_window: tail context window passed to the model.
             spec_k: number of full VM steps to speculate per batched forward.
-                ``0`` (default) disables speculation and runs one token per
-                forward (the legacy behavior). When ``> 0``, a per-element
-                :class:`DraftVM` emits the deterministic next ``spec_k * 35``
-                tokens; the model verifies them in one forward pass and
-                accepts the matching prefix. Byte-identity with ``spec_k=0``
-                is preserved: a model emission overrides any mismatching
-                draft, so the model is the final arbiter. Recommended starting
-                point: ``spec_k=8`` (so each forward covers 8 VM steps when
-                drafts are accepted).
+                ``0`` disables speculation entirely and runs one token per
+                forward (the legacy non-speculative batched behavior). A
+                **negative** value (e.g. ``-1``) is a sentinel that enables
+                **adaptive** per-element speculation: each batch slot starts
+                at ``_ADAPTIVE_START_K`` and dynamically halves / doubles its
+                horizon based on its rolling rejection rate over the last
+                ``_ADAPTIVE_WINDOW`` batched forwards. A **positive** value
+                runs every element at that fixed K (no adaptation). When
+                speculation is enabled, a per-element :class:`DraftVM` emits
+                the deterministic next ``K * 35`` tokens; the model verifies
+                them in one forward pass and accepts the matching prefix.
+                Byte-identity with ``spec_k=0`` is preserved: a model
+                emission overrides any mismatching draft, so the model is
+                the final arbiter. Recommended: ``spec_k=-1`` (adaptive)
+                for mixed workloads; ``spec_k=32`` for known-clean batches.
 
         Returns:
             list of (output_string, exit_code) per program, in the same order
@@ -231,19 +270,40 @@ class BatchedPureNeuralRunner:
         argv_list = argv_list or [[]] * B
         stdin_list = stdin_list or [""] * B
 
+        # Adaptive mode: ``spec_k < 0`` is the sentinel. ``spec_k == 0`` keeps
+        # the legacy non-speculative path; ``spec_k > 0`` keeps the legacy
+        # fixed-K path. Adaptive mode reuses the same speculative loop but each
+        # element carries its own ``adaptive_k`` that is updated post-forward.
+        adaptive = spec_k < 0
+        adaptive_start_k = _ADAPTIVE_START_K if adaptive else 0
+
         states = [
             self._build_element(
-                bc, data_list[i], argv_list[i], stdin_list[i], spec_k=spec_k
+                bc,
+                data_list[i],
+                argv_list[i],
+                stdin_list[i],
+                spec_k=spec_k if not adaptive else 0,
+                adaptive_start_k=adaptive_start_k,
             )
             for i, bc in enumerate(bytecodes)
         ]
 
-        if spec_k > 0:
+        if adaptive:
+            self._run_speculative(
+                states,
+                max_steps=max_steps,
+                max_context_window=max_context_window,
+                spec_k=0,
+                adaptive=True,
+            )
+        elif spec_k > 0:
             self._run_speculative(
                 states,
                 max_steps=max_steps,
                 max_context_window=max_context_window,
                 spec_k=spec_k,
+                adaptive=False,
             )
         else:
             self._run_unspeculative(
@@ -312,9 +372,18 @@ class BatchedPureNeuralRunner:
         max_steps: int,
         max_context_window: int,
         spec_k: int,
+        adaptive: bool = False,
     ) -> None:
         total_tokens = max_steps * Token.STEP_TOKENS
         STEP = Token.STEP_TOKENS
+
+        # Maximum sequence length the model accepts. We cap per-element K so
+        # the windowed context + drafts never overflows. The cap is also
+        # bounded by ``max_context_window`` (the tail kept after windowing).
+        # If the model exposes ``max_seq_len`` we use it; otherwise we fall
+        # back to ``max_context_window`` (which is always a hard ceiling on
+        # the forward-input length anyway).
+        model_max_seq = int(getattr(self.model, "max_seq_len", max_context_window))
 
         # Global token counter used as the `tok_i` argument to `_step_one`.
         # It must monotonically advance across replayed tokens so the legacy
@@ -331,6 +400,7 @@ class BatchedPureNeuralRunner:
             #    iteration. Elements whose DraftVM halts mid-speculation stop
             #    adding more drafts but keep the prefix.
             drafts = []  # list[list[int]] aligned with active_idx
+            per_elem_k = []  # K actually used this iter, aligned with active_idx
             for i in active_idx:
                 s = states[i]
                 d: List[int] = []
@@ -342,17 +412,35 @@ class BatchedPureNeuralRunner:
                 # is simpler and only costs at most 35 forwards per
                 # rejection event.
                 at_step_boundary = (s.token_pos % STEP == 0)
+                # Pick K for this element this iteration:
+                #   * Adaptive mode reads ``s.adaptive_k`` (updated below).
+                #   * Fixed mode uses the global ``spec_k``.
+                # Then cap by available context room: drafts append to the
+                # windowed context, and the forward must fit under
+                # ``model_max_seq``. The windowed context length is bounded
+                # above by ``prefix_len + max_context_window`` (see
+                # ``_windowed_context``).
+                base_k = s.adaptive_k if adaptive else spec_k
+                # Estimate the windowed-context length to compute room.
+                est_ctx_len = min(
+                    len(s.context),
+                    s.prefix_len + max_context_window,
+                )
+                room_tokens = max(0, model_max_seq - est_ctx_len)
+                room_k = room_tokens // STEP
+                effective_k = max(0, min(base_k, room_k))
                 if (
                     not s.spec_disabled
                     and s.draft_vm is not None
                     and at_step_boundary
+                    and effective_k > 0
                 ):
                     # Sync DraftVM register state from the element. Registers
                     # are the dominant correctness signal; sparse memory
                     # drift only causes extra rejections (not divergence —
                     # the model remains the source of truth).
                     self._sync_draft_vm(s)
-                    for _ in range(spec_k):
+                    for _ in range(effective_k):
                         if s.draft_vm.halted:
                             break
                         ok = s.draft_vm.step()
@@ -362,6 +450,7 @@ class BatchedPureNeuralRunner:
                         if s.draft_vm.halted:
                             break
                 drafts.append(d)
+                per_elem_k.append(effective_k)
 
             # 2) Build padded tensor: each active element gets windowed context
             #    + its draft tokens appended. Padded to the max combined length.
@@ -455,6 +544,27 @@ class BatchedPureNeuralRunner:
                         s.spec_disabled = True
                 else:
                     s.spec_zero_streak = 0
+
+                # Adaptive K bookkeeping. Record rejection rate for this
+                # iteration (rejected_tokens / drafted_tokens) and adjust K
+                # only when the window has at least a few samples (avoids
+                # over-reacting to a single iter). High rejection rate halves
+                # K (with a floor), low rate doubles it (with a ceiling).
+                if adaptive and len(draft) > 0:
+                    rej = (len(draft) - accepted) / len(draft)
+                    s.recent_rejections.append(rej)
+                    if len(s.recent_rejections) >= 3:
+                        avg_rej = sum(s.recent_rejections) / len(s.recent_rejections)
+                        if avg_rej >= _ADAPTIVE_BACKOFF_THRESHOLD:
+                            new_k = max(_ADAPTIVE_MIN_K, s.adaptive_k // 2)
+                            if new_k != s.adaptive_k:
+                                s.adaptive_k = new_k
+                                s.recent_rejections.clear()
+                        elif avg_rej <= _ADAPTIVE_RAMP_THRESHOLD:
+                            new_k = min(_ADAPTIVE_MAX_K, s.adaptive_k * 2)
+                            if new_k != s.adaptive_k:
+                                s.adaptive_k = new_k
+                                s.recent_rejections.clear()
 
             tok_i += 1  # outer-iteration counter, not strict token count
 
