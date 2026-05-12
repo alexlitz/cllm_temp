@@ -637,5 +637,12 @@ def make_conversational_io_output_routing_op(
         bake_fn=bake,
         layer_idx=15,
         migrated=True,
+        # ``_set_conversational_io_output_routing`` writes units 1200..1231
+        # (16 LO + 16 HI = 32 units; see setup_helpers.py:1777). The op is
+        # registered unconditionally, but the bake body is a no-op when
+        # ``enable_conversational_io`` is False — so we only request the
+        # 1232-unit allocation in that mode. In lookup mode the L15 FFN
+        # falls back to ``layer15_nibble_copy``'s 40 units.
+        ffn_units_used=1232 if enable_conversational_io else None,
     )
 

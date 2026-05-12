@@ -83,6 +83,10 @@ def make_layer15_nibble_copy_op() -> Operation:
         bake_fn=bake,
         layer_idx=15,
         migrated=True,
+        # ``_set_nibble_copy_ffn`` writes 40 units (see vm_step.py:2411):
+        #   16 LO copy + 16 HI copy + 2 PSH SP byte0 + 2 PSH SP byte1 +
+        #   2 PSH SP byte2 + 2 LEA first-step AX byte2 = 40.
+        ffn_units_used=40,
     )
 
 

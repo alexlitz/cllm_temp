@@ -257,6 +257,7 @@ def compile_full_vm(
     max_seq_len: int = 8192,
     pin_io_only: bool = True,
     disk_cache: bool = True,
+    use_dynamic_ffn: bool = True,
 ):
     """Compile and bake a full Neural VM model via the compiler.
 
@@ -286,6 +287,13 @@ def compile_full_vm(
             callers (``run_vm``, batch runners) only read those four
             fields, so the cache is transparent to them; tests that
             inspect the per-op placement should pass ``disk_cache=False``.
+        use_dynamic_ffn: when True (default), use ``layout.ffn_widths`` to
+            pre-size each block's PureFFN to the exact unit count its ops
+            need, avoiding the allocate-4096-then-trim overhead. Blocks
+            without any FFN-annotated op fall back to ``ffn_hidden`` (4096)
+            and are trimmed by ``_right_size_ffns`` post-bake. Set to False
+            to force the legacy allocate-4096-everywhere path (used for
+            byte-identity comparison).
 
     Returns:
         (model, layout) where:
@@ -405,11 +413,22 @@ def compile_full_vm(
     # n_heads, and max_seq_len that AutoregressiveVM expects.
     from ..vm_step import AutoregressiveVM
 
+    # Per-block FFN hidden_dim from layout when use_dynamic_ffn is on.
+    # Blocks without an annotated op are absent from ``layout.ffn_widths``
+    # and fall back to ``ffn_hidden`` inside AutoregressiveVM.__init__'s
+    # dict-dispatch path; those still get trimmed by ``_right_size_ffns``
+    # post-bake. As ops accumulate ``ffn_units_used`` annotations, more
+    # blocks land in the dict and skip the allocate-then-trim overhead.
+    if use_dynamic_ffn and layout.ffn_widths:
+        ffn_hidden_arg = layout.ffn_widths
+    else:
+        ffn_hidden_arg = ffn_hidden
+
     model = AutoregressiveVM(
         d_model=layout.d_model,
         n_layers=layout.n_layers,
         n_heads=n_heads,
-        ffn_hidden=ffn_hidden,
+        ffn_hidden=ffn_hidden_arg,
         max_seq_len=max_seq_len,
         dim_positions=layout.dim_positions,
     )

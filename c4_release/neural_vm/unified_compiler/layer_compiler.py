@@ -152,6 +152,19 @@ class Operation:
     # Defaults to an empty set so existing ops remain back-compat (opt-in).
     # See c4_release/docs/DIM_OWNERSHIP_REGISTRY.md for the bake-author API.
     claims: Set[Tuple[int, str, str, Optional[str]]] = field(default_factory=set)
+    # Max FFN-hidden unit index (exclusive) this op writes at its layer. Used
+    # by the compiler to pre-size each block's PureFFN hidden_dim per-layer
+    # instead of allocating 4096 units everywhere and trimming after bake via
+    # ``_right_size_ffns``. When None (default), the op is treated as "unknown
+    # width" and the block falls back to the default ffn_hidden (4096) —
+    # ``_right_size_ffns`` still trims those blocks. As authors annotate their
+    # ops, blocks accumulate exact widths and skip trim allocation.
+    #
+    # Set this to the number of FFN hidden units the op's bake_fn writes into
+    # at its target layer (e.g., L0's phase_a_ffn writes units 0..6 -> set to
+    # 7). For ops that don't touch FFN (pure attn ops, model ops writing
+    # alibi_slopes/head weights, etc.) leave as None.
+    ffn_units_used: Optional[int] = None
     # Residual-dim staleness invariants (Phase 3 / Agent G of
     # ARCH_LEAKAGE_FIX_PLAN.md). Both fields are opt-in (default empty):
     #
@@ -192,6 +205,12 @@ class ModelLayout:
         dim_sizes: map of dim_name -> size (so position range is [pos, pos+size))
         block_ops: block-level ops, each carrying its own layer_idx
         model_ops: model-level post-pass ops (head, embedding, right-size, etc.)
+        ffn_widths: per-block FFN hidden_dim, computed as the max
+            ``ffn_units_used`` across all ops targeting each block. Layers
+            without any annotated FFN op are omitted (caller treats as the
+            default ffn_hidden — 4096 by default). Used by ``compile_full_vm``
+            to pre-size ``PureFFN.hidden_dim`` per-block, avoiding the
+            allocate-4096-then-trim-via-``_right_size_ffns`` overhead.
     """
 
     d_model: int
@@ -201,6 +220,7 @@ class ModelLayout:
     dim_sizes: Dict[str, int]
     block_ops: List[Operation] = field(default_factory=list)
     model_ops: List[Operation] = field(default_factory=list)
+    ffn_widths: Dict[int, int] = field(default_factory=dict)
 
     def ops_at(self, layer: int) -> List[Operation]:
         return self.ops_per_layer[layer]
@@ -439,6 +459,44 @@ class LayerCompiler:
         model_ops = [op for op in self.ops if op.kind == "model"]
         model_ops.sort(key=lambda o: (o.phase if o.phase is not None else 0))
 
+        # Aggregate per-block FFN widths from ``Operation.ffn_units_used``
+        # annotations. Walk every op that lands at a specific layer (attn/ffn
+        # via ``ops_per_layer``, block ops via their resolved layer) and
+        # take the per-block max. Ops without an annotation contribute
+        # nothing; blocks with no annotated op are omitted from the dict
+        # so the caller falls back to the default ffn_hidden (4096) and
+        # ``_right_size_ffns`` still trims them. This makes annotation a
+        # purely incremental migration — partial coverage = partial speedup.
+        ffn_widths: Dict[int, int] = {}
+        for layer_idx, ops_at_layer in enumerate(ops_per_layer):
+            for op in ops_at_layer:
+                if op.ffn_units_used is not None:
+                    prev = ffn_widths.get(layer_idx, 0)
+                    if op.ffn_units_used > prev:
+                        ffn_widths[layer_idx] = op.ffn_units_used
+        # Block ops in ``self.block_ops`` may target layers via either
+        # explicit ``layer_idx`` or (resolved later) ``target_op_name``. For
+        # the latter we use the same op-name -> layer map we built above.
+        op_layer = {
+            op.name: layer_idx
+            for layer_idx, ops_at_layer in enumerate(ops_per_layer)
+            for op in ops_at_layer
+        }
+        for op in self.block_ops:
+            if op.ffn_units_used is None:
+                continue
+            if op.target_op_name is not None:
+                target_layer = op_layer.get(op.target_op_name)
+                if target_layer is None:
+                    # Block op references an op not in ops_per_layer; defer
+                    # to the trim fallback (don't record a partial width).
+                    continue
+            else:
+                target_layer = op.layer_idx
+            prev = ffn_widths.get(target_layer, 0)
+            if op.ffn_units_used > prev:
+                ffn_widths[target_layer] = op.ffn_units_used
+
         return ModelLayout(
             d_model=d_model,
             n_layers=n_layers,
@@ -447,6 +505,7 @@ class LayerCompiler:
             dim_sizes=dict(self.dims),
             block_ops=list(self.block_ops),
             model_ops=list(self.model_ops),
+            ffn_widths=ffn_widths,
         )
 
     # --------------------------------------------------------------------
