@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from .vm_step import AutoregressiveVM, Token
 from .embedding import Opcode
 from .constants import INSTR_WIDTH, PC_OFFSET
+from .speculative import DraftVM
 
 # Opcodes that emit TOOL_CALL instead of STEP_END when tool calling is enabled.
 # When model emits STEP_END for these (weights not set, or enable_tool_calling=False),
@@ -64,6 +65,17 @@ _RUNNER_TRACKED_MEMORY_OPS = {Opcode.ENT, Opcode.JSR}
 
 # Store ops whose MEM sections are retained in context for L15 memory lookup.
 _MEM_STORE_OPS = {Opcode.SI, Opcode.SC, Opcode.PSH, Opcode.ENT, Opcode.JSR}
+
+# Step-relative offsets where the speculative-mode logit disagrees with the
+# unspeculative-mode logit. Mirrors
+# :data:`neural_vm.batched_pure_neural._UNSAFE_OFFSETS`. The 4 MEM-addr bytes
+# (offsets 26..29) and 4 MEM-val bytes (offsets 30..33) inside each 35-token
+# VM step are trusted from DraftVM because the embedding's MEM_STORE/ADDR_KEY
+# injection only kicks in when the *full* 9-token MEM section is present —
+# which makes spec-mode (full section visible) and unspec-mode (val bytes not
+# yet emitted) disagree at these positions even though both would emit the
+# same final tokens for any correct C4 program.
+_SPEC_UNSAFE_OFFSETS = frozenset(range(26, 34))
 
 _OPCODE_NAME = {
     v: k for k, v in vars(Opcode).items() if k.isupper() and isinstance(v, int)
@@ -164,6 +176,7 @@ class AutoregressiveVMRunner:
         kv_cache_pruning_eps=1e-6,
         enable_divergence_bail=True,
         compile_mode=None,
+        spec_k=0,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -209,6 +222,20 @@ class AutoregressiveVMRunner:
                 ``torch.compiler.cudagraph_mark_step_begin()`` between
                 successive outer ``run()`` calls — the runner inserts
                 this automatically.
+            spec_k: Number of full VM steps to speculate per batched forward
+                in the serial generation loop. ``0`` (default) preserves the
+                legacy one-forward-per-token behavior. When ``> 0`` and
+                ``pure_neural=True``, a per-run :class:`DraftVM` emits the
+                deterministic next ``spec_k * STEP_TOKENS`` tokens; the model
+                verifies them in one forward pass and accepts the matching
+                prefix. Byte-identity with ``spec_k=0`` is preserved because
+                the model emission overrides any mismatching draft (the model
+                is the final arbiter). Recommended starting point: ``spec_k=8``
+                (matches :class:`BatchedPureNeuralRunner`'s default for the
+                1098 suite). Non-pure_neural runners fall back to the legacy
+                path even when ``spec_k > 0``: the Python-side overrides in
+                ``_dispatch_step`` require per-token inspection, which
+                speculation would break.
         """
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
         # compile_full_vm. The compiler derives d_model and n_layers from the
@@ -409,6 +436,23 @@ class AutoregressiveVMRunner:
         # Bail-state diagnostics from the most recent `run()`. Populated only
         # when a divergence signal fires; otherwise None.
         self.last_divergence_signal = None
+
+        # Speculative-decoding configuration. ``spec_k`` is the number of full
+        # VM steps a per-run :class:`DraftVM` emits per batched forward pass.
+        # 0 disables speculation entirely (legacy single-token autoregressive
+        # loop). Speculation is only honored when ``pure_neural=True`` because
+        # the non-pure path's ``_dispatch_step`` mutates state per-token (PSH
+        # SP decrement, JSR/LEV stack rewrites, etc.) which is incompatible
+        # with replaying a batch of accepted draft tokens.
+        self.spec_k = int(spec_k) if spec_k else 0
+        # Per-run draft state. ``_draft_vm`` is the Python C4 interpreter used
+        # to propose deterministic next-N tokens; ``_spec_disabled_for_run``
+        # is flipped if the model rejects the first draft for several iters
+        # in a row (DraftVM out of sync) so we stop wasting forwards.
+        self._draft_vm = None
+        self._spec_disabled_for_run = False
+        self._spec_zero_streak = 0
+        self._spec_should_break = False
 
     # Maximum number of consecutive incremental forward calls before flushing
     # the KV cache. Empirically, the c4 VM model's L15 (memory-lookup) attention
@@ -757,6 +801,26 @@ class AutoregressiveVMRunner:
         # The MoE routing signal is read tensor-natively inside SoftMoEFFN
         # (see neural_vm.pure_moe); no Python-side bytecode peek required.
 
+        # Speculative-decoding gate: only honored when pure_neural=True. The
+        # non-pure path's _dispatch_step mutates state per-token (PSH SP, JSR
+        # stack rewrites, runner ALU corrections) which is incompatible with
+        # replaying a batch of accepted draft tokens in one shot.
+        if self.spec_k > 0 and self.pure_neural:
+            self._draft_vm = DraftVM(list(bytecode))
+            # Load data section into DraftVM memory (byte-addressed, matching
+            # the runner's _memory convention) so PRTF/READ in DraftVM see
+            # the same initial state.
+            if isinstance(data, (bytes, bytearray, list)):
+                for di, b in enumerate(data):
+                    self._draft_vm.memory[0x10000 + di] = int(b)
+            if stdin:
+                self._draft_vm.set_stdin(stdin)
+            self._spec_disabled_for_run = False
+            self._spec_zero_streak = 0
+            return self._run_speculative(
+                context, bytecode, prefix_len, output, max_steps
+            )
+
         step_num = 0  # Track VM steps for conversational I/O handling
 
         # ---- Divergence-bail detection state (per-run) ----
@@ -1082,6 +1146,260 @@ class AutoregressiveVMRunner:
                 break
 
         return "".join(output), self._decode_exit_code(context)
+
+    # ------------------------------------------------------------------
+    # Speculative-decoding loop (serial, pure_neural=True only).
+    #
+    # Mirrors BatchedPureNeuralRunner._run_speculative but for batch=1 with
+    # the full per-token dispatch path of the legacy autoregressive loop.
+    # DraftVM emits the deterministic next K*35 tokens; the model verifies
+    # them in a single forward pass and accepts the matching prefix. Byte-
+    # identity with spec_k=0 is preserved because the model's argmax is the
+    # final arbiter (mismatching drafts are rejected and replaced).
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _run_speculative(self, context, bytecode, prefix_len, output, max_steps):
+        """Speculative-decoding generation loop (pure_neural=True path).
+
+        Args:
+            context: token list (mutated). On entry, holds the prefix
+                produced by :meth:`_build_context`.
+            bytecode: packed-instruction list for DraftVM and dispatch.
+            prefix_len: number of immutable prefix tokens (CODE/DATA/argv).
+            output: list to which PUTCHAR / PRTF bytes are appended.
+            max_steps: maximum VM steps; the loop emits at most
+                ``max_steps * STEP_TOKENS`` tokens.
+
+        Returns:
+            ``(output_str, exit_code)`` matching the legacy ``run()`` signature.
+        """
+        STEP = Token.STEP_TOKENS
+        total_tokens = max_steps * STEP
+        spec_k = self.spec_k
+
+        # Token-emission counter (mirrors `i` in the legacy loop). When the
+        # next emitted token is at a clean VM-step boundary we attempt
+        # speculation; otherwise we single-token decode until the next
+        # boundary (no different from the legacy path for those positions).
+        token_pos = 0
+        # Flag set by ``_apply_token_spec`` when EXIT or HALT dispatch decides
+        # the run is over. Mirrors the ``break`` in the legacy loop.
+        self._spec_should_break = False
+
+        while token_pos < total_tokens:
+            if self._spec_should_break:
+                break
+
+            # Once the DraftVM drifts far enough from the model's emission
+            # that we've seen 4 zero-accept iters in a row, drop out of
+            # speculation entirely and finish via the legacy KV-cached
+            # path. This is dramatically faster than per-token fresh
+            # forwards for the remainder of the run because the cache lets
+            # each forward process only the new token; the spec-path
+            # always processes the full windowed context.
+            if self._spec_disabled_for_run:
+                self._run_speculative_fallback_kv_cached(
+                    context, bytecode, prefix_len, output,
+                    start_i=token_pos, total_tokens=total_tokens,
+                )
+                break
+
+            at_step_boundary = (token_pos % STEP == 0)
+
+            # Build draft only when we are at a clean step boundary. Mid-
+            # step we fall back to one-token decode (still through this
+            # method) so per-step dispatch state (e.g. mem_history rebuild)
+            # stays correctly aligned.
+            draft: List[int] = []
+            if (
+                spec_k > 0
+                and at_step_boundary
+                and self._draft_vm is not None
+            ):
+                self._sync_draft_vm_from_runner()
+                for _ in range(spec_k):
+                    if self._draft_vm.halted:
+                        break
+                    if not self._draft_vm.step():
+                        break
+                    draft.extend(self._draft_vm.draft_tokens())
+                    if self._draft_vm.halted:
+                        break
+
+            # Windowed context (matches the legacy path's 512-token tail).
+            if len(context) > prefix_len + 512:
+                gen_ctx = context[: prefix_len] + context[-512:]
+            else:
+                gen_ctx = list(context)
+
+            # Build the full sequence (windowed prefix + drafts) and run a
+            # single forward pass. Speculation deliberately bypasses the KV
+            # cache: the cache only buys us anything when forward calls
+            # share a long common prefix that grows by one token at a time;
+            # here we are running a single full forward over the windowed
+            # context per outer iter, and a fresh forward avoids the
+            # incremental-matmul drift discussed in ``_KV_INCREMENTAL_FLUSH``.
+            seq = gen_ctx + draft
+            device = next(self.model.parameters()).device
+            tensor = torch.tensor([seq], dtype=torch.long, device=device)
+            logits = self.model.forward(tensor)
+            preds = logits[0].argmax(dim=-1).cpu().tolist()  # [len(seq)]
+            prefix_end = len(gen_ctx)
+
+            if not draft:
+                # Pure single-token decode (no spec budget this iter — only
+                # happens for the first iter post-spec-rejection while we
+                # re-align to a step boundary; the disabled-spec branch
+                # above handles the long-term fallback).
+                next_token = int(preds[prefix_end - 1])
+                self._apply_token_spec(
+                    context, next_token, token_pos, bytecode, prefix_len, output
+                )
+                if self._spec_should_break:
+                    break
+                token_pos += 1
+                continue
+
+            # Verify drafts position-by-position. Unsafe offsets are trusted
+            # from DraftVM; safe offsets are accepted only when model argmax
+            # matches. First-rejected safe offset stops the scan and the
+            # model's prediction becomes the correction token.
+            accepted = 0
+            correction: Optional[int] = None
+            for j in range(len(draft)):
+                if (j % STEP) in _SPEC_UNSAFE_OFFSETS:
+                    accepted = j + 1
+                    continue
+                pred = int(preds[prefix_end - 1 + j])
+                if pred == draft[j]:
+                    accepted = j + 1
+                else:
+                    correction = pred
+                    break
+
+            emitted: List[int] = list(draft[:accepted])
+            if correction is not None:
+                emitted.append(correction)
+
+            for tok in emitted:
+                if self._spec_should_break:
+                    break
+                self._apply_token_spec(
+                    context, tok, token_pos, bytecode, prefix_len, output
+                )
+                token_pos += 1
+
+            # Cap consecutive zero-accept iterations: if the model rejects
+            # the very first draft token several iters in a row the DraftVM
+            # is out of sync (or never matches for this program); disable
+            # speculation for the remainder of the run. The next iter will
+            # detect ``_spec_disabled_for_run`` and switch to the legacy
+            # KV-cached path via ``_run_speculative_fallback_kv_cached``.
+            if correction is not None and accepted == 0:
+                self._spec_zero_streak += 1
+                if self._spec_zero_streak >= 4:
+                    self._spec_disabled_for_run = True
+            else:
+                self._spec_zero_streak = 0
+
+        return "".join(output), self._decode_exit_code(context)
+
+    def _run_speculative_fallback_kv_cached(
+        self, context, bytecode, prefix_len, output,
+        *, start_i, total_tokens,
+    ):
+        """Legacy KV-cached single-token loop, used when speculation is
+        disabled mid-run.
+
+        Mirrors the body of the legacy ``run()`` loop for ``pure_neural=True``
+        from token index ``start_i`` onward. Resets the KV cache once on
+        entry because the cache state from the spec-path's fresh-forward
+        passes is stale: those forwards bypassed the cache machinery and
+        the cache contents may not reflect the current ``context``. After
+        reset, ``_generate_next_cached`` rebuilds the cache from scratch on
+        the first call and uses incremental decoding thereafter.
+        """
+        # Drop any cache state inherited from the spec path; the spec
+        # forwards bypass the cache so its contents are unrelated to the
+        # current context. Without this reset, the prefix-match check in
+        # `_generate_next_cached` would either find a stale match (wrong
+        # K/V) or do a full recompute that wastes the first incremental
+        # call.
+        self._reset_kv_cache()
+        for i in range(start_i, total_tokens):
+            if self._spec_should_break:
+                break
+            if len(context) > prefix_len + 512:
+                gen_ctx = context[: prefix_len] + context[-512:]
+            else:
+                gen_ctx = context
+            next_token = self._generate_next_cached(gen_ctx)
+            self._apply_token_spec(
+                context, next_token, i, bytecode, prefix_len, output
+            )
+
+    def _sync_draft_vm_from_runner(self) -> None:
+        """Pull current runner register state into the DraftVM.
+
+        Memory is NOT copied: ``self._memory`` is byte-addressed while
+        :class:`DraftVM` uses word-addressed storage (and tracks bytes
+        separately in ``_mem_bytes``). Register drift is the dominant
+        rejection driver; memory drift only causes extra rejections, which
+        gracefully fall back to single-token decode for the affected step.
+        """
+        vm = self._draft_vm
+        if vm is None:
+            return
+        if self._last_pc is not None:
+            vm.pc = int(self._last_pc) & 0xFFFFFFFF
+            vm.idx = (vm.pc - PC_OFFSET) // INSTR_WIDTH
+        vm.ax = int(self._last_ax) & 0xFFFFFFFF
+        vm.sp = int(self._last_sp) & 0xFFFFFFFF
+        vm.bp = int(self._last_bp) & 0xFFFFFFFF
+        vm.halted = False
+        vm._last_mem_addr = 0
+        vm._last_mem_val = 0
+
+    def _apply_token_spec(
+        self, context, next_token, i, bytecode, prefix_len, output
+    ) -> None:
+        """Apply one already-decided token to the run state.
+
+        Mirrors the body of the legacy ``run()`` loop for a single token: it
+        appends the token to ``context``, dispatches STEP_END / TOOL_CALL /
+        HALT through ``_dispatch_step``, and flips ``_spec_should_break`` if
+        the run should terminate (EXIT / HALT). The speculative outer loop
+        in :meth:`_run_speculative` calls this for each accepted draft token
+        plus any correction.
+
+        Pure-neural-only paths (``self.pure_neural=True``): the THINK-tag
+        protocol and conversational-IO branches are intentionally skipped
+        because speculation is gated on ``pure_neural=True`` upstream and
+        DraftVM does not produce THINKING_END/THINKING_START tokens.
+        """
+        context.append(next_token)
+
+        if next_token == Token.STEP_END:
+            exec_idx = self._exec_pc() // INSTR_WIDTH
+            if self._dispatch_step(context, bytecode, exec_idx, prefix_len, output):
+                self._spec_should_break = True
+                return
+            return
+
+        if next_token == Token.TOOL_CALL:
+            # pure_neural path: no Python-side handler, just dispatch for
+            # EXIT detection (mirrors run() branch).
+            exec_idx = self._exec_pc() // INSTR_WIDTH
+            if self._dispatch_step(context, bytecode, exec_idx, prefix_len, output):
+                self._spec_should_break = True
+                return
+            return
+
+        if next_token == Token.HALT:
+            # pure_neural: do NOT override REG_AX (model emitted it).
+            self._pure_attention_report["halted"] = True
+            self._spec_should_break = True
+            return
 
     def get_pure_attention_report(self):
         """Return diagnostics for pure-attention-memory mode."""

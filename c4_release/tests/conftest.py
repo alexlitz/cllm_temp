@@ -82,16 +82,25 @@ def fast_runner():
 
 @pytest.fixture(scope="session")
 def neural_runner():
-    """Pure neural runner (no speculative decoding).
+    """Pure neural runner with optional speculative decoding.
 
     Use for testing neural correctness.
 
     PHASE 8 (2026-05-11): Default flipped to pure_neural=True,
     trust_neural_alu=True. Many tests will fail until Phases 1-7 complete;
     that is the intended signal for what the neural path still cannot do.
+
+    Speculative decoding: ``spec_k`` defaults to 8 (matching
+    ``BatchedPureNeuralRunner.run_batch``'s default for the 1098 suite) and
+    is controlled by the ``C4_TEST_SPEC_K`` env var. Set ``C4_TEST_SPEC_K=0``
+    to fall back to the legacy single-token-per-forward path (useful when
+    bisecting whether a regression is speculation-specific).
     """
     from neural_vm.run_vm import AutoregressiveVMRunner
-    return AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)
+    spec_k = int(os.environ.get("C4_TEST_SPEC_K", "8"))
+    return AutoregressiveVMRunner(
+        pure_neural=True, trust_neural_alu=True, spec_k=spec_k,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -119,10 +128,20 @@ def quick_runner():
     path with Python overrides disabled. Tests that the neural network cannot
     yet handle (most of Phases 2-7) will fail honestly; that is the new CI
     signal driving Phases 1-7 to completion.
+
+    Speculative decoding: ``spec_k`` defaults to 8 (matching
+    ``BatchedPureNeuralRunner.run_batch``'s default for the 1098 suite) and
+    is controlled by the ``C4_TEST_SPEC_K`` env var. With ``spec_k=8`` each
+    forward verifies up to 8 VM steps (280 tokens) at once; per-test wall
+    time drops substantially when the DraftVM stays in sync with the model.
+    Set ``C4_TEST_SPEC_K=0`` to fall back to one forward per token.
     """
     from neural_vm.run_vm import AutoregressiveVMRunner
 
-    runner = AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)
+    spec_k = int(os.environ.get("C4_TEST_SPEC_K", "8"))
+    runner = AutoregressiveVMRunner(
+        pure_neural=True, trust_neural_alu=True, spec_k=spec_k,
+    )
     # Limit max_steps for quick tests
     return runner
 
@@ -182,10 +201,21 @@ def _neural_only_runner_model():
 
 @pytest.fixture(scope="session")
 def _pure_neural_runner_model():
-    """Session-scoped model construction for pure neural tests (no Python overrides)."""
+    """Session-scoped model construction for pure neural tests (no Python overrides).
+
+    Note: superseded by the second definition further below in this file
+    (which has the kwargs-fallback chain for older worktrees). Python picks
+    the later definition; this stub remains for ordering safety only.
+    """
     from neural_vm.run_vm import AutoregressiveVMRunner
 
-    runner = AutoregressiveVMRunner(trust_neural_alu=True, pure_neural=True)
+    spec_k = int(os.environ.get("C4_TEST_SPEC_K", "8"))
+    try:
+        runner = AutoregressiveVMRunner(
+            trust_neural_alu=True, pure_neural=True, spec_k=spec_k,
+        )
+    except TypeError:
+        runner = AutoregressiveVMRunner(trust_neural_alu=True, pure_neural=True)
     runner._func_call_handlers = {}
     runner._syscall_handlers = {}
     return runner
@@ -272,16 +302,24 @@ def neural_only_runner(_neural_only_runner_model):
 def _pure_neural_runner_model():
     """Session-scoped model construction for pure neural tests.
 
-    Tries `AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)`
-    first. If either kwarg is unsupported on the current branch (older
-    worktrees), falls back to whatever combination the runner accepts and
+    Tries ``AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True,
+    spec_k=<env>)`` first. If any kwarg is unsupported on the current branch
+    (older worktrees), falls back through progressively reduced kwargs and
     emits a warning so the test author can decide whether to skip.
+
+    Speculative decoding: ``spec_k`` defaults to 8 (matching the 1098 suite)
+    and is overridable via ``C4_TEST_SPEC_K``. Set ``C4_TEST_SPEC_K=0`` to
+    disable speculation. On branches that don't yet have the ``spec_k``
+    kwarg this fixture transparently drops it and runs single-token decode.
     """
     import warnings
     from neural_vm.run_vm import AutoregressiveVMRunner
 
+    spec_k = int(os.environ.get("C4_TEST_SPEC_K", "8"))
+
     kwargs_attempts = [
-        {"pure_neural": True, "trust_neural_alu": True},
+        {"pure_neural": True, "trust_neural_alu": True, "spec_k": spec_k},
+        {"pure_neural": True, "trust_neural_alu": True},  # branch missing spec_k
         {"trust_neural_alu": True},   # branch missing pure_neural kwarg
         {"pure_neural": True},         # branch missing trust_neural_alu kwarg
         {},                             # branch missing both kwargs
