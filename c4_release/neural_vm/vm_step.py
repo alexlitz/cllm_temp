@@ -342,52 +342,82 @@ class AutoregressiveAttention(nn.Module):
         else:
             K, V = K_new, V_new
 
+        # Resolve absolute position ids for Q and K.
+        #
+        # When the cache has ``cached_pos_ids`` populated (post pos_ids
+        # tracking — see ``LayerKVCache``), pull positions directly so that
+        # ALiBi/RoPE distances reflect the *original* token positions even
+        # after middle-position eviction by the pruner (KV_CACHE_PRUNING_SPEC
+        # §9). When no cache is present (or it predates pos_ids), fall back
+        # to the legacy ``arange`` numbering (which equals
+        # ``cached_pos_ids`` whenever no pruning has occurred).
+        S_q = Q.shape[2]
+        S_kv = K.shape[2]
+        if (kv_cache is not None
+                and getattr(kv_cache, "cached_pos_ids", None) is not None
+                and kv_cache.cached_pos_ids.shape[-1] == S_kv):
+            # cached_pos_ids: [B, S_kv]. Use batch 0 (positions are duplicated
+            # across batch since the time axis is shared).
+            k_pos_1d = kv_cache.cached_pos_ids[0].to(x.device)  # [S_kv]
+            q_pos_1d = k_pos_1d[S_kv - S_q:]  # [S_q]  (newly appended slice)
+        else:
+            q_pos_1d = torch.arange(S_kv - S_q, S_kv, device=x.device)
+            k_pos_1d = torch.arange(S_kv, device=x.device)
+
         # Apply RoPE if enabled (check for RoPE cache presence)
         if self._rope_cos is not None:
             # Q is [B, H, S_q, HD] where S_q = new_tokens.
             # K is [B, H, S_kv, HD] where S_kv = cached_len + new_tokens.
-            S_q = Q.shape[2]
-            S_kv = K.shape[2]
-
-            # Queries are at positions [S_kv - S_q, S_kv); keys/values span [0, S_kv).
-            q_offset = S_kv - S_q
-
-            # Dynamically extend RoPE cache if sequence exceeds current cache size.
-            max_needed = max(S_kv, q_offset + S_q)
+            # Dynamically extend RoPE cache if max position id exceeds current cache size.
+            # When pos_ids come from the legacy arange path the slice path
+            # below works without the gather; only the cache-aware branch
+            # needs index_select since pos_ids may be non-contiguous after
+            # pruning.
+            use_pos_gather = (
+                kv_cache is not None
+                and getattr(kv_cache, "cached_pos_ids", None) is not None
+                and kv_cache.cached_pos_ids.shape[-1] == S_kv
+            )
+            if use_pos_gather:
+                max_needed = int(max(k_pos_1d.max().item() + 1, q_pos_1d.max().item() + 1))
+            else:
+                max_needed = S_kv
             if max_needed > self._rope_cos.shape[0]:
                 new_max_len = int(max_needed * 1.5)
                 self._extend_rope_cache(new_max_len)
 
-            # Apply RoPE to Q and K. Q gets the slice for new-token positions;
-            # K_new (the just-computed slice that needs rotation) must be rotated
-            # at its absolute positions. Because ``K_new`` was already concatenated
-            # into ``K`` inside ``kv_cache.update`` we must rotate ``K`` in full
-            # only the first time (when cached_len == 0); otherwise the cache
-            # already holds rotated K's and we must only rotate the new slice in
-            # place inside ``K``. To keep this simple and avoid breaking the
-            # existing semantics, we rotate the full K tensor each call — this is
-            # correct because the cache stores the raw (un-rotated) K_new, and we
-            # rotate per-call (matches the existing pre-cache code's behavior).
+            # Apply RoPE to Q and K. Q gets cos/sin indexed at the new tokens'
+            # absolute positions; K is rotated in full because the cache stores
+            # the raw (un-rotated) K_new and we rotate per-call (matches the
+            # legacy pre-cache code's behavior).
             from .base_layers import rotate_half
-            cos_q = self._rope_cos[q_offset:q_offset + S_q].unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
-            sin_q = self._rope_sin[q_offset:q_offset + S_q].unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
-            cos_k = self._rope_cos[0:S_kv].unsqueeze(0).unsqueeze(0)  # [1, 1, S_kv, HD]
-            sin_k = self._rope_sin[0:S_kv].unsqueeze(0).unsqueeze(0)  # [1, 1, S_kv, HD]
+            if use_pos_gather:
+                cos_q = self._rope_cos.index_select(0, q_pos_1d).unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
+                sin_q = self._rope_sin.index_select(0, q_pos_1d).unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
+                cos_k = self._rope_cos.index_select(0, k_pos_1d).unsqueeze(0).unsqueeze(0)  # [1, 1, S_kv, HD]
+                sin_k = self._rope_sin.index_select(0, k_pos_1d).unsqueeze(0).unsqueeze(0)  # [1, 1, S_kv, HD]
+            else:
+                q_offset = S_kv - S_q
+                cos_q = self._rope_cos[q_offset:q_offset + S_q].unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
+                sin_q = self._rope_sin[q_offset:q_offset + S_q].unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
+                cos_k = self._rope_cos[0:S_kv].unsqueeze(0).unsqueeze(0)  # [1, 1, S_kv, HD]
+                sin_k = self._rope_sin[0:S_kv].unsqueeze(0).unsqueeze(0)  # [1, 1, S_kv, HD]
 
             Q = (Q * cos_q) + (rotate_half(Q) * sin_q)
             K = (K * cos_k) + (rotate_half(K) * sin_k)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
-        # ALiBi bias: -slope * |i - j| using absolute positions.
-        # Q positions span [cached_len, cached_len + new_tokens),
-        # K positions span [0, cached_len + new_tokens).
-        S_q = Q.shape[2]
-        S_kv = K.shape[2]
+        # ALiBi bias: -slope * |q_pos - k_pos| using *absolute* positions
+        # (per KV_CACHE_PRUNING_SPEC §9: surviving positions retain their
+        # original indices, so distance computation uses pos_ids — NOT the
+        # cache sequence index).
         if self.alibi_slopes is not None:
-            q_positions = torch.arange(S_kv - S_q, S_kv, device=x.device).unsqueeze(1)  # [S_q, 1]
-            k_positions = torch.arange(S_kv, device=x.device).unsqueeze(0)  # [1, S_kv]
-            dist = (q_positions - k_positions).abs().float()  # [S_q, S_kv]
+            # When no pruning has occurred q_pos_1d / k_pos_1d are arange-like
+            # (and equal to the slice computation used pre-pos_ids). Keeping
+            # the same Python int branch when no cache is present makes the
+            # ONNX tracer happy.
+            dist = (q_pos_1d.unsqueeze(1) - k_pos_1d.unsqueeze(0)).abs().float()  # [S_q, S_kv]
             alibi = -self.alibi_slopes.view(1, H, 1, 1) * dist  # [1, H, S_q, S_kv]
             scores = scores + alibi
 
