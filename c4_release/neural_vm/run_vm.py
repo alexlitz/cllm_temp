@@ -164,6 +164,7 @@ class AutoregressiveVMRunner:
         kv_cache_pruning_eps=1e-6,
         enable_divergence_bail=True,
         compile_mode=None,
+        enable_cuda_graphs=False,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -209,7 +210,28 @@ class AutoregressiveVMRunner:
                 ``torch.compiler.cudagraph_mark_step_begin()`` between
                 successive outer ``run()`` calls — the runner inserts
                 this automatically.
+            enable_cuda_graphs: Opt-in flag for manual CUDA-graph capture
+                of the per-step forward (distinct from ``compile_mode=
+                "reduce-overhead"`` which uses Inductor's own per-block
+                capture). Currently a stub: setting True raises
+                ``NotImplementedError``. The exploratory benchmark in
+                ``c4_release/neural_vm/cuda_graph_bench.py`` found that
+                manual capture is ~3× **slower** than eager for this
+                model (compute-bound, not launch-overhead-bound) and
+                requires removing several `.any()` / `.item()` sync
+                points from the model forward to make capture succeed.
+                See ``c4_release/docs/CUDA_GRAPHS_MULTI_STEP.md``.
+                Default ``False``.
         """
+        if enable_cuda_graphs:
+            raise NotImplementedError(
+                "AutoregressiveVMRunner: enable_cuda_graphs=True is a stub. "
+                "Manual CUDA-graph capture was prototyped and found to be "
+                "slower than eager forward on this model (compute-bound). "
+                "See c4_release/docs/CUDA_GRAPHS_MULTI_STEP.md for the "
+                "investigation and tradeoff analysis."
+            )
+        self.enable_cuda_graphs = bool(enable_cuda_graphs)
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
         # compile_full_vm. The compiler derives d_model and n_layers from the
         # operation set (no hardcoding) and orchestrates the bake pass.
