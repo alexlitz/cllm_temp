@@ -5,10 +5,17 @@ from .shared import _as_setdim_proxy
 
 
 def make_layer2_mem_byte_flags_op() -> Operation:
-    """L2 FFN: MEM val byte position flags + extended BYTE_INDEX for STACK0."""
+    """L2 FFN: MEM val byte position flags + extended BYTE_INDEX for STACK0.
+
+    Uses units [0, 8). Records the next free unit on
+    ``ffn._l2_unit_counter`` so chained ops (e.g.
+    ``make_layer2_initial_pc_bake_cancel_op``) can start above this range.
+    """
     def bake(ffn, dim_positions, S):
         from ...vm_step import _set_layer2_mem_byte_flags
         _set_layer2_mem_byte_flags(ffn, S, _as_setdim_proxy(dim_positions))
+        # The legacy bake fills units 0..7 (4 MEM_VAL_BN + 4 BYTE_INDEX_*).
+        ffn._l2_unit_counter = max(getattr(ffn, "_l2_unit_counter", 0), 8)
 
     return Operation(
         name="layer2_mem_byte_flags",
@@ -18,6 +25,92 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         writes={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                 "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
         kind="ffn",
+        layer_idx=2,
+        bake_fn=bake,
+        migrated=True,
+    )
+
+
+def make_layer2_initial_pc_bake_cancel_op() -> Operation:
+    """L2 FFN: cancel the REG_PC token-embedding initial-PC bake at MARK_PC AND HAS_SE.
+
+    The token-embedding bake ``make_initial_pc_bake_op`` (phase=1001.5) adds
+    ``EMBED_LO[PC_OFFSET & 0xF] += 1.0`` and ``EMBED_HI[(PC_OFFSET >> 4) & 0xF]
+    += 1.0`` at EVERY REG_PC token. This is intentional for step 0 (the
+    first PC marker needs PC=PC_OFFSET in EMBED so L4 attention can relay
+    it to AX for L5's first-step opcode fetch), but at step 1+ it pollutes
+    the residual stream — specifically EMBED_LO[init_pc_lo] persists at
+    +1.0 even though the carry-forward attention has written the real
+    prev-PC nibbles into EMBED_LO/HI.
+
+    The legacy fix inlined two cancel units in ``_set_layer3_ffn`` (vm_step
+    lines ~2598-2609) that subtract from EMBED_LO/HI at MARK_PC AND
+    HAS_SE. Those cancels live in the SAME FFN block as the PC INCREMENT
+    units, so the FFN's input residual still carries the +1.0 spurious
+    contribution — and PC INCREMENT (which reads EMBED_LO[k] for every
+    nibble k) leaks a phantom +1.0 contribution at OUTPUT_LO[
+    (init_pc_lo + INSTR_WIDTH) % 16]. For PC_OFFSET=2, INSTR_WIDTH=8 the
+    leak lands at OUTPUT_LO[10], aliasing with the FIRST-STEP DEFAULT's
+    target (also OUTPUT_LO[10]) and corrupting step-1+ PC byte 0 by
+    +INSTR_WIDTH, breaking ``test_two_imms``, ``test_jmp_from_step_2``,
+    ``test_jmp_backward``, and the smoke ``test_add_basic`` multi-step.
+
+    Cancelling the bake at L2 FFN (which runs strictly BEFORE L3 FFN)
+    makes L3 see EMBED_LO[init_pc_lo]=0 at step 1+ MARK_PC, eliminating
+    the leak entirely. Step 0's MARK_PC has HAS_SE=0 (no STEP_END in
+    context yet), so the cancel does not fire and EMBED_LO[init_pc_lo]
+    remains +1.0 for L4 first-step relay. The strength is -2.0/S × 50 =
+    -1.0 (exact match for the +1.0 bake).
+
+    Pinned to ``layer_idx=2``, ``kind="block"`` (so the bake can access
+    the same FFN as ``make_layer2_mem_byte_flags_op`` and chain unit
+    allocation via ``ffn._l2_unit_counter``). Phase=2.5 so it runs after
+    ``make_layer2_mem_byte_flags_op`` (phase=2).
+    """
+    def bake(block, dim_positions, S):
+        from ...constants import PC_OFFSET
+
+        def D(name):
+            if dim_positions is not None and name in dim_positions:
+                return dim_positions[name]
+            from ...vm_step import _SetDim
+            return getattr(_SetDim, name)
+
+        ffn = block.ffn
+        unit = getattr(ffn, "_l2_unit_counter", 0)
+        init_pc_lo = PC_OFFSET & 0xF
+        init_pc_hi = (PC_OFFSET >> 4) & 0xF
+
+        MARK_PC = D("MARK_PC")
+        HAS_SE = D("HAS_SE")
+        EMBED_LO = D("EMBED_LO")
+        EMBED_HI = D("EMBED_HI")
+
+        # Cancel EMBED_LO[init_pc_lo] when MARK_PC AND HAS_SE.
+        # up = S * HAS_SE - S/2 → +S/2 at HAS_SE=1, silu(+S/2) ≈ S/2.
+        # gate = MARK_PC → 1.0 at PC marker.
+        # hidden = S/2, W_down = -2.0/S → contribution = -1.0.
+        ffn.W_up.data[unit, HAS_SE] = S
+        ffn.b_up.data[unit] = -S * 0.5
+        ffn.W_gate.data[unit, MARK_PC] = 1.0
+        ffn.W_down.data[EMBED_LO + init_pc_lo, unit] = -2.0 / S
+        unit += 1
+
+        # Cancel EMBED_HI[init_pc_hi] (mirror of the LO cancel).
+        ffn.W_up.data[unit, HAS_SE] = S
+        ffn.b_up.data[unit] = -S * 0.5
+        ffn.W_gate.data[unit, MARK_PC] = 1.0
+        ffn.W_down.data[EMBED_HI + init_pc_hi, unit] = -2.0 / S
+        unit += 1
+
+        ffn._l2_unit_counter = unit
+
+    return Operation(
+        name="layer2_initial_pc_bake_cancel",
+        phase=2.5,
+        reads={"MARK_PC", "HAS_SE"},
+        writes={"EMBED_LO", "EMBED_HI"},
+        kind="block",
         layer_idx=2,
         bake_fn=bake,
         migrated=True,
