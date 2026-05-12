@@ -1584,13 +1584,31 @@ def _set_conversational_io_opcode_decode(ffn, S, BD):
 
     Detects PRTF (33) and READ (31) opcodes at AX marker and writes to
     separate flags for autoregressive I/O generation:
-    - PRTF → IO_IS_PRTF ≈ 5.0
-    - READ → IO_IS_READ ≈ 5.0
+    - PRTF → IO_IS_PRTF ≈ 5.0  (AND ACTIVE_OPCODE_PRTF for downstream gates)
+    - READ → IO_IS_READ ≈ 5.0  (AND ACTIVE_OPCODE_READ)
 
     This is separate from tool_call detection to enable different routing:
     - Tool call mode: PRTF/READ → TOOL_CALL token (runner dispatches)
     - Conversational I/O mode: PRTF/READ → autoregressive sequence
       (THINKING_END → output bytes → THINKING_START)
+
+    2026-05-12 fix: the previous bake assumed ``ACTIVE_OPCODE_PRTF`` was
+    populated by the embedding (Python ``set_active_opcode`` peek). That
+    Python peek was retired in commit 16efeeb — no layer writes
+    ``ACTIVE_OPCODE_PRTF`` autoregressively. Result: ``IO_IS_PRTF`` stayed
+    at zero on every PRTF step, the L6 relay never fired, the L6 FFN
+    state-machine never emitted ``NEXT_THINKING_END`` at NEXT_SE, and the
+    model emitted plain ``STEP_END`` instead of ``THINKING_END`` for
+    printf.
+
+    New: decode the PRTF/READ opcode bytes directly via
+    OPCODE_BYTE_LO/HI nibbles (the same pattern used by
+    ``_set_tool_call_opcode_decode`` for ``IO_IS_TOOL_CALL``). Each
+    opcode contributes one FFN unit per output flag, gated on MARK_AX so
+    the write only lands at the AX marker. We also write
+    ``ACTIVE_OPCODE_PRTF`` / ``ACTIVE_OPCODE_READ`` from the same units so
+    downstream bakes that read those dims (e.g. L4 attn head 4 / L7 FFN
+    capture / L6 attn head 4) see the activation at the AX position.
 
     Starts at unit 410 to avoid conflict with tool_call units (400-405).
 
@@ -1599,18 +1617,28 @@ def _set_conversational_io_opcode_decode(ffn, S, BD):
     """
     unit = 410
 
-    # PRTF detection via ACTIVE_OPCODE_PRTF flag (set by embedding)
-    ffn.W_up[unit, BD.ACTIVE_OPCODE_PRTF] = S  # 1.0 when PRTF is active
-    ffn.b_up[unit] = -S * 0.5  # threshold: active when ACTIVE_OPCODE_PRTF ≈ 1
-    ffn.b_gate[unit] = 1.0  # always gate (no position restriction needed)
+    # PRTF (lo=1, hi=2): writes IO_IS_PRTF AND ACTIVE_OPCODE_PRTF at AX marker
+    # Threshold: -S*1.5 so the 2-way AND (OPCODE_BYTE_LO[1]=1 +
+    # OPCODE_BYTE_HI[2]=1 + MARK_AX gate) fires only at the PRTF AX marker.
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + 1] = S  # PRTF lo nibble
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + 2] = S  # PRTF hi nibble
+    ffn.b_up[unit] = -S * 1.5  # both nibbles must be ~1
+    ffn.W_gate[unit, BD.MARK_AX] = 1.0  # only at AX marker
     ffn.W_down[BD.IO_IS_PRTF, unit] = 10.0 / S  # ≈5.0 when active
+    # Also write ACTIVE_OPCODE_PRTF (≈1.0) so downstream bakes (L4 attn
+    # head 4 transport K-side, L7 FFN capture, L6 attn head 4 Q-gate) see
+    # the flag at the AX marker.
+    ffn.W_down[BD.ACTIVE_OPCODE_PRTF, unit] = 2.0 / S  # ≈1.0
     unit += 1
 
-    # READ detection via ACTIVE_OPCODE_READ flag
-    ffn.W_up[unit, BD.ACTIVE_OPCODE_READ] = S
-    ffn.b_up[unit] = -S * 0.5
-    ffn.b_gate[unit] = 1.0
-    ffn.W_down[BD.IO_IS_READ, unit] = 10.0 / S
+    # READ (lo=15, hi=1): writes IO_IS_READ AND ACTIVE_OPCODE_READ at AX marker
+    ffn.W_up[unit, BD.OPCODE_BYTE_LO + 15] = S  # READ lo nibble
+    ffn.W_up[unit, BD.OPCODE_BYTE_HI + 1] = S  # READ hi nibble
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.MARK_AX] = 1.0  # only at AX marker
+    ffn.W_down[BD.IO_IS_READ, unit] = 10.0 / S  # ≈5.0
+    ffn.W_down[BD.ACTIVE_OPCODE_READ, unit] = 2.0 / S  # ≈1.0
+    unit += 1
 
 
 
