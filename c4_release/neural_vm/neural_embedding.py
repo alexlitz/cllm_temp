@@ -195,14 +195,15 @@ class NeuralVMEmbedding(nn.Module):
         # Standard embedding lookup
         x = self.embed(token_ids)
 
-        # --- ONNX export fast path ---------------------------------------
+        # --- ONNX export / torch.compile fast path -----------------------
         # The prefix cache is purely a runtime perf optimization (it caches
         # the augmentation delta for the immutable CODE/DATA prefix region
         # across forward calls within a single ``run()``). It involves Python
-        # state mutation and a ``.tolist()`` scan that the ONNX tracer can't
-        # capture. When exporting, bypass the cache entirely and run the
-        # un-cached augmentations every call.
-        if torch.onnx.is_in_onnx_export():
+        # state mutation and a ``.tolist()`` scan that the ONNX tracer and
+        # ``torch.compile``'s Dynamo tracer can't capture. When exporting
+        # or compiling, bypass the cache entirely and run the un-cached
+        # augmentations every call.
+        if torch.onnx.is_in_onnx_export() or torch.compiler.is_compiling():
             self._add_code_addr_keys(token_ids, x)
             self._inject_mem_store(token_ids, x, start_pos=0)
             self._inject_mem_metadata(token_ids, x, start_pos=0)

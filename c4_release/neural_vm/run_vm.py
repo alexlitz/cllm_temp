@@ -157,6 +157,7 @@ class AutoregressiveVMRunner:
         pure_neural=False,
         cache_model=True,
         enable_neural_io_think_protocol=False,
+        compile_mode=None,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -173,15 +174,40 @@ class AutoregressiveVMRunner:
                 stream (BLOG_SPEC.md:851 — canonical neural-I/O mode) instead
                 of the Phase-6 runner-reads-AX path. Defaults False; see
                 ``c4_release/docs/NEURAL_IO_VIA_THINK_PROTOCOL_PLAN.md``.
+            compile_mode: Pass-through to ``torch.compile``. One of:
+                ``None`` / ``"none"`` (do not compile; default),
+                ``"reduce-overhead"`` (CUDA-graph capture),
+                ``"max-autotune"`` (kernel autotune), or any string accepted
+                by ``torch.compile(mode=...)``. Default ``None``: callers
+                must opt in to compile explicitly. Auto-enabling compile
+                conflicts with the byte-identity KV-cache tests, which need
+                the un-compiled incremental path to still be exercised.
+
+                Caveat (2026-05-12): the production model has ~30 blocks
+                with distinct FFN shapes after right-sizing + post-op
+                expansion. Compiling the whole forward causes Dynamo to
+                re-trace per block under default settings; we set
+                ``recompile_limit=128`` and
+                ``force_parameter_static_shapes=False`` to mitigate, but
+                first-run compilation can still take minutes. Subsequent
+                runs at the same seq-length should reuse the cached
+                graphs. CUDA-graphs (``reduce-overhead``) additionally
+                requires an output-buffer mark via
+                ``torch.compiler.cudagraph_mark_step_begin()`` between
+                successive outer ``run()`` calls — the runner inserts
+                this automatically.
         """
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
         # compile_full_vm. The compiler derives d_model and n_layers from the
         # operation set (no hardcoding) and orchestrates the bake pass.
         # Override d_model/n_layers via explicit args only for tests.
         alu_mode = 'efficient' if trust_neural_alu else 'lookup'
+        # Normalize compile_mode to a plain "none" sentinel when not set.
+        if compile_mode is None:
+            compile_mode = "none"
         cache_key = (d_model, n_layers, n_heads, ffn_hidden, max_seq_len,
                      conversational_io, alu_mode,
-                     enable_neural_io_think_protocol)
+                     enable_neural_io_think_protocol, compile_mode)
         if cache_model and cache_key in AutoregressiveVMRunner._MODEL_CACHE:
             self.model = AutoregressiveVMRunner._MODEL_CACHE[cache_key]
         else:
@@ -197,8 +223,44 @@ class AutoregressiveVMRunner:
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
             self.model.eval()
+            if compile_mode and compile_mode != "none":
+                # The model has ~30 blocks with distinct FFN shapes (each
+                # block was right-sized by ``_right_size_ffns``). Compiling
+                # the whole model's ``forward`` as one frame causes Dynamo
+                # to retrace per-block because ``block.ffn.W_up`` has a
+                # different shape on each iteration of the ``for block
+                # in self.blocks`` loop. The default
+                # ``recompile_limit=8`` is too low for ~30 blocks, so we
+                # bump it. Each retrace specializes Inductor to that
+                # block's shapes; subsequent forwards reuse the cached
+                # graphs.
+                #
+                # Why compile the whole model (not each block individually)?
+                # Per-block ``block.compile()`` creates one CUDA graph
+                # per block under ``reduce-overhead``, and each block's
+                # captured-graph output buffer aliases its input buffer
+                # — which means the *next* block's CUDA graph reads from
+                # a buffer the previous graph has reused. This raises
+                # "tensor output of CUDAGraphs that has been overwritten
+                # by a subsequent run". Wrapping the entire forward as
+                # one compile unit captures one big graph (no inter-block
+                # reuse), avoiding that hazard.
+                import torch._dynamo as _dynamo
+                _dynamo.config.recompile_limit = max(
+                    _dynamo.config.recompile_limit, 128
+                )
+                # Each block has different parameter shapes (post
+                # ``_right_size_ffns``). Disabling
+                # ``force_parameter_static_shapes`` lets Dynamo treat
+                # parameter shapes as dynamic across the per-block sub-
+                # frames, so it folds them into one shared trace instead
+                # of guarding on the exact size of the first block's
+                # ``W_up`` and recompiling for every subsequent block.
+                _dynamo.config.force_parameter_static_shapes = False
+                self.model = torch.compile(self.model, mode=compile_mode)
             if cache_model:
                 AutoregressiveVMRunner._MODEL_CACHE[cache_key] = self.model
+        self.compile_mode = compile_mode
 
         # Syscall dispatch table
         # NOTE ON PURITY:
@@ -255,7 +317,19 @@ class AutoregressiveVMRunner:
         # KV cache parameters for memory history eviction
         # When use_kv_cache=True, _mem_history tracks unique memory addresses accessed
         # and evicts oldest entries when exceeding max_mem_history (LRU eviction)
-        self.use_kv_cache = use_kv_cache
+        #
+        # ``torch.compile`` interaction: the per-layer KV cache mutates
+        # ``layer_cache.cached_k / cached_v`` in place from Python, which
+        # ``torch.compile`` cannot trace cleanly (it would produce a fresh
+        # subgraph per cache-update and re-tracing on every step). When a
+        # ``compile_mode`` is active we therefore disable the incremental
+        # KV-cache fast path and let each forward call process the full
+        # token sequence — the compiled graph reuses the same CUDA-graph
+        # capture across calls of equal shape, which is the much larger win.
+        if compile_mode and compile_mode != "none":
+            self.use_kv_cache = False
+        else:
+            self.use_kv_cache = use_kv_cache
         self.max_mem_history = max_mem_history
         self._mem_history = {}  # addr → token sequence for memory value
         self._mem_access_order = []  # LRU tracking: most recent at end
@@ -384,6 +458,33 @@ class AutoregressiveVMRunner:
             with ``temperature=0.0``).
         """
         if not self.use_kv_cache:
+            # When ``torch.compile`` is active, call ``self.model(...)``
+            # directly so the OptimizedModule's __call__ is invoked
+            # (and the compiled graph runs). ``model.generate_next`` is a
+            # method on the underlying ``AutoregressiveVM`` and would call
+            # the un-compiled forward.
+            if self.compile_mode and self.compile_mode != "none":
+                device = next(self.model.parameters()).device
+                # ``max_seq_len`` lives on the original AutoregressiveVM;
+                # we just call ``self.model(...)`` directly so each block's
+                # compiled forward runs.
+                max_seq_len = getattr(self.model, "max_seq_len", None)
+                ctx = list(generation_context)
+                if max_seq_len is not None and len(ctx) > max_seq_len:
+                    ctx = ctx[-max_seq_len:]
+                token_ids = torch.tensor([ctx], dtype=torch.long, device=device)
+                # ``reduce-overhead`` captures a CUDA graph per compiled
+                # submodule and reuses an output buffer across calls. We
+                # must mark a "step boundary" before each top-level forward
+                # so the previous step's output buffers are released for
+                # reuse (otherwise the second call raises "tensor output of
+                # CUDAGraphs has been overwritten"). This is a no-op when
+                # CUDA graphs aren't actually in use (e.g. CPU / non-RO
+                # modes).
+                torch.compiler.cudagraph_mark_step_begin()
+                with torch.no_grad():
+                    logits = self.model(token_ids)
+                return int(logits[0, -1, :].argmax(-1).item())
             return self.model.generate_next(generation_context, use_incremental=False)
 
         # Active opcode is part of the embedding (writes globally at all
