@@ -54,6 +54,10 @@ def make_phase_a_ffn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        # ``_set_phase_a_ffn`` writes one FFN hidden unit per transition in
+        # the 7-entry ``transitions`` list (SE→PC, PC→AX, AX→SP, SP→BP,
+        # BP→STACK0, STACK0→MEM, MEM→SE). Units 0..6.
+        ffn_units_used=7,
     )
 
 

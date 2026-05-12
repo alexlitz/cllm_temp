@@ -1255,13 +1255,27 @@ class AutoregressiveVM(nn.Module):
             vocab_size, d_model, dim_positions=dim_positions, max_seq_len=max_seq_len
         )
 
+        # ``ffn_hidden`` accepts either a scalar (every block gets that
+        # many hidden units — the legacy contract; relies on
+        # ``_right_size_ffns`` to trim post-bake) or a dict[int, int] of
+        # per-block widths from the compiler's ``ModelLayout.ffn_widths``.
+        # Blocks missing from the dict fall back to ``default_hidden`` so
+        # partial annotation coverage is safe — un-annotated blocks still
+        # get trimmed by ``_right_size_ffns``.
+        if isinstance(ffn_hidden, dict):
+            ffn_widths = ffn_hidden
+            default_hidden = 4096
+        else:
+            ffn_widths = {}
+            default_hidden = ffn_hidden
+
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
                     attn=AutoregressiveAttention(
                         d_model, num_heads=n_heads, max_seq_len=max_seq_len, layer_idx=i
                     ),
-                    ffn=PureFFN(d_model, ffn_hidden),
+                    ffn=PureFFN(d_model, ffn_widths.get(i, default_hidden)),
                 )
                 for i in range(n_layers)
             ]

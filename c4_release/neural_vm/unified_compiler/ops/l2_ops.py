@@ -48,6 +48,10 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        # ``_set_layer2_mem_byte_flags`` writes 8 units (4 MEM_VAL_B* +
+        # 4 BYTE_INDEX_*); ``_l2_unit_counter`` is bumped to 8 after this op
+        # so the cancel op below starts at unit 8.
+        ffn_units_used=8,
     )
 
 
@@ -148,6 +152,11 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        # Allocates 2 FFN units starting at ``ffn._l2_unit_counter`` (which
+        # ``make_layer2_mem_byte_flags_op`` sets to 8). Result: writes units
+        # 8 and 9 -> max index 10. The aggregator takes the per-block max
+        # across all annotated ops, so reporting 10 here covers both.
+        ffn_units_used=10,
     )
 
 

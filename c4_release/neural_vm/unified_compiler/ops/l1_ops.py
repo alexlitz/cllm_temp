@@ -42,6 +42,9 @@ def make_layer1_ffn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        # ``_set_layer1_ffn`` writes 5 units (one per output: STACK0_BYTE0,
+        # BYTE_INDEX_0..3). See setup_helpers.py:_set_layer1_ffn.
+        ffn_units_used=5,
     )
 
 

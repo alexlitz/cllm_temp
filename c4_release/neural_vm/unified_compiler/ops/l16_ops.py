@@ -20,6 +20,14 @@ def make_layer16_lev_routing_op() -> Operation:
         layer_idx=16,
         bake_fn=bake,
         migrated=True,
+        # ``_set_layer16_lev_routing`` writes 121 units (vm_step.py:6845):
+        #   16 (cancel OUTPUT_LO at SP) + 16 (cancel OUTPUT_HI at SP) +
+        #   16 (SP=BP+16 lo) + 16 (SP=BP+16 hi) +
+        #   16 (cancel OUTPUT_HI at PC) + 16 (TEMP_LO→OUTPUT_LO) +
+        #   16 (TEMP_HI→OUTPUT_HI) + 3 (clear OUTPUT_LO[10] byte 1-3) +
+        #   3 (set OUTPUT_LO[0] byte 1-3) + 3 (set OUTPUT_HI[0] byte 1-3)
+        #   = 121. The bytes 1-3 blocks (if False) are disabled.
+        ffn_units_used=121,
     )
 
 
