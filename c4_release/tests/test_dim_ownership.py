@@ -1,21 +1,29 @@
 """Tests for the dim-ownership claim registry.
 
 The registry is the Phase 1 / Agent B deliverable from
-``c4_release/docs/ARCH_LEAKAGE_FIX_PLAN.md``. It detects when two ops claim
-the same ``(layer_idx, scope, identifier)`` triple at compile time and
-emits a warning (not a hard fail yet — opt-in framework instrumentation).
+``c4_release/docs/ARCH_LEAKAGE_FIX_PLAN.md`` (extended with column-
+granularity per the Phase 3 / Agent F follow-up). It detects when two
+ops claim the same ``(layer_idx, scope, identifier, column)`` 4-tuple
+at compile time and emits a warning (not a hard fail yet — opt-in
+framework instrumentation).
 
 These tests verify:
 
 1. A synthetic Operation with overlapping claims triggers a warning.
 2. The registry collects all opted-in claims across attn/ffn/block/model ops.
 3. A non-overlapping pair triggers no warning.
-4. Malformed claims (wrong tuple shape / unknown scope / non-int layer)
-   raise at ``add_op`` time.
-5. The production model build emits no claim-collision warnings — only a
+4. Same row + different column does NOT warn (column-granular registry).
+5. Same row + same column DOES warn.
+6. Malformed claims (wrong tuple shape / unknown scope / non-int layer /
+   non-str column / column on ``embed_row``) raise at ``add_op`` time.
+7. 3-tuple legacy claims are auto-promoted to ``column=None`` and still
+   collide with each other / with explicit ``column=None`` 4-tuples.
+8. The production model build emits no claim-collision warnings — only a
    handful of ops are currently annotated and they're meant to be disjoint;
    any warning here surfaces a real latent collision that warrants
-   investigation (per the plan doc).
+   investigation (per the plan doc). The historical row-level false
+   positive at ``(5, "attn_W_v", "5_32")`` is now resolved by column
+   granularity — no allowlist needed.
 """
 
 import warnings
@@ -112,9 +120,20 @@ class TestClaimValidation:
     def test_malformed_tuple_rejected(self):
         c = LayerCompiler()
         c.declare_dim("X", 1)
-        # Wrong arity.
+        # Wrong arity (only 2 elems — not 3-tuple or 4-tuple).
         bad_op = _op("bad", reads=["X"], writes=["X"],
-                     claims={(0, "attn_W_v")})  # only 2 elems
+                     claims={(0, "attn_W_v")})
+        with pytest.raises(ValueError, match="malformed claim"):
+            c.add_op(bad_op)
+
+    def test_too_many_elements_rejected(self):
+        c = LayerCompiler()
+        c.declare_dim("X", 1)
+        # Wrong arity (5 elems — not 3-tuple or 4-tuple).
+        bad_op = _op(
+            "bad", reads=["X"], writes=["X"],
+            claims={(0, "attn_W_v", "0_0", "EMBED_LO+0", "extra")},
+        )
         with pytest.raises(ValueError, match="malformed claim"):
             c.add_op(bad_op)
 
@@ -133,6 +152,118 @@ class TestClaimValidation:
                      claims={(0, "attn_W_v", 5)})
         with pytest.raises(ValueError, match="identifier must be str"):
             c.add_op(bad_op)
+
+    def test_non_str_column_rejected(self):
+        c = LayerCompiler()
+        c.declare_dim("X", 1)
+        bad_op = _op(
+            "bad", reads=["X"], writes=["X"],
+            claims={(0, "attn_W_v", "0_0", 7)},
+        )
+        with pytest.raises(ValueError, match="column must be str or None"):
+            c.add_op(bad_op)
+
+    def test_embed_row_with_column_rejected(self):
+        """``embed_row`` is row-granular; column must be None."""
+        c = LayerCompiler()
+        c.declare_dim("X", 1)
+        bad_op = _op(
+            "bad", reads=["X"], writes=["X"],
+            claims={(0, "embed_row", "42", "TOK_FIELD+0")},
+        )
+        with pytest.raises(ValueError,
+                           match="scope 'embed_row' must have column=None"):
+            c.add_op(bad_op)
+
+    def test_legacy_3tuple_promoted_to_4tuple(self):
+        """A 3-tuple claim is auto-promoted to 4-tuple with column=None."""
+        c = LayerCompiler()
+        c.declare_dim("X", 1)
+        c.declare_dim("OUT", 1)
+        op = _op("legacy", reads=["X"], writes=["OUT"],
+                 claims={(0, "attn_W_v", "0_0")})
+        c.add_op(op)
+        # add_op rewrites op.claims to 4-tuple form in-place.
+        assert (0, "attn_W_v", "0_0", None) in op.claims
+        # Registry sees the promoted form.
+        reg = c.build_claim_registry()
+        assert (0, "attn_W_v", "0_0", None) in reg
+
+
+# ----------------------------------------------------------------------
+# Column-granularity tests (the headline feature)
+# ----------------------------------------------------------------------
+
+class TestColumnGranularity:
+    """Same-row, different-column claims must not collide."""
+
+    def test_same_row_different_column_no_warn(self):
+        """The motivating L5 head 5 row 32 case: column-disjoint writes."""
+        a = _op("layer5_fetch_like",
+                claims={(5, "attn_W_v", "5_32", "CLEAN_EMBED_LO+0")})
+        b = _op("function_call_weights_like",
+                claims={(5, "attn_W_v", "5_32", "EMBED_HI+15")})
+        c = _make_compiler_with_disjoint_writers(a, b)
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            c.compile()
+        assert _collect_claim_warnings(wlist) == [], (
+            "column-disjoint same-row writes must not collide"
+        )
+
+    def test_same_row_same_column_warns(self):
+        """Two ops writing identical (row, column) DO collide."""
+        a = _op("writer_a",
+                claims={(5, "attn_W_v", "6_5", "EMBED_LO+4")})
+        b = _op("writer_b",
+                claims={(5, "attn_W_v", "6_5", "EMBED_LO+4")})
+        c = _make_compiler_with_disjoint_writers(a, b)
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            c.compile()
+        msgs = _collect_claim_warnings(wlist)
+        assert len(msgs) == 1, f"expected 1 warning, got {msgs!r}"
+        assert "column='EMBED_LO+4'" in msgs[0]
+        assert "writer_a" in msgs[0] and "writer_b" in msgs[0]
+
+    def test_legacy_3tuple_collides_with_legacy_3tuple(self):
+        """Two row-only legacy claims still collide (back-compat)."""
+        a = _op("legacy_a", claims={(5, "attn_W_v", "6_5")})
+        b = _op("legacy_b", claims={(5, "attn_W_v", "6_5")})
+        c = _make_compiler_with_disjoint_writers(a, b)
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            c.compile()
+        msgs = _collect_claim_warnings(wlist)
+        assert len(msgs) == 1, f"expected 1 warning, got {msgs!r}"
+
+    def test_legacy_3tuple_and_4tuple_with_none_column_collide(self):
+        """3-tuple promotes to column=None; matches explicit None 4-tuple."""
+        a = _op("legacy", claims={(5, "attn_W_v", "6_5")})
+        b = _op("explicit_none",
+                claims={(5, "attn_W_v", "6_5", None)})
+        c = _make_compiler_with_disjoint_writers(a, b)
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            c.compile()
+        msgs = _collect_claim_warnings(wlist)
+        assert len(msgs) == 1, (
+            "3-tuple and 4-tuple-with-None must collide as equivalent"
+        )
+
+    def test_legacy_3tuple_does_not_collide_with_explicit_column(self):
+        """A legacy 3-tuple (column=None) and a 4-tuple with a real
+        column string sit at different registry keys: column=None is a
+        literal value, not a wildcard. This lets partial migration of
+        peer ops to column granularity proceed without spurious warnings."""
+        a = _op("legacy_row_only", claims={(5, "attn_W_v", "6_5")})
+        b = _op("annotated",
+                claims={(5, "attn_W_v", "6_5", "EMBED_LO+4")})
+        c = _make_compiler_with_disjoint_writers(a, b)
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            c.compile()
+        assert _collect_claim_warnings(wlist) == []
 
 
 # ----------------------------------------------------------------------
@@ -224,67 +355,78 @@ class TestSyntheticCollision:
 # ----------------------------------------------------------------------
 
 def test_build_claim_registry_aggregates_all_op_kinds():
-    """Claims from attn/ffn/block/model ops all flow into the registry."""
+    """Claims from attn/ffn/block/model ops all flow into the registry.
+
+    All entries are 4-tuples: 3-tuple claims are promoted to
+    ``(layer, scope, identifier, None)`` at ``add_op`` time.
+    """
     c = LayerCompiler()
     c.declare_dim("X", 1)
     c.add_op(_op(
         "attn_op", kind="attn", reads=["X"], writes=["X"],
-        claims={(0, "attn_W_q", "0_0")},
+        claims={(0, "attn_W_q", "0_0")},  # legacy 3-tuple
     ))
     c.add_op(_op(
         "ffn_op", kind="ffn", reads=["X"], writes=["X"],
-        claims={(0, "ffn_W_up", "u0")},
+        claims={(0, "ffn_W_up", "u0", "X+0")},  # 4-tuple
     ))
     c.add_op(_op(
         "block_op", kind="block", reads=["X"], writes=["X"],
-        layer_idx=0, claims={(0, "attn_W_v", "0_0")},
+        layer_idx=0,
+        claims={(0, "attn_W_v", "0_0", "X+0")},
     ))
     c.add_op(_op(
         "model_op", kind="model", reads=["X"], writes=["X"],
-        claims={(0, "embed_row", "42")},
+        claims={(0, "embed_row", "42")},  # embed_row: column must be None
     ))
     reg = c.build_claim_registry()
     keys = set(reg.keys())
-    assert (0, "attn_W_q", "0_0") in keys
-    assert (0, "ffn_W_up", "u0") in keys
-    assert (0, "attn_W_v", "0_0") in keys
-    assert (0, "embed_row", "42") in keys
+    # 4-tuple form everywhere.
+    assert (0, "attn_W_q", "0_0", None) in keys
+    assert (0, "ffn_W_up", "u0", "X+0") in keys
+    assert (0, "attn_W_v", "0_0", "X+0") in keys
+    assert (0, "embed_row", "42", None) in keys
+
+
+def test_4tuple_validation_smoke():
+    """Smoke test: 4-tuple validation accepts well-formed shapes."""
+    c = LayerCompiler()
+    c.declare_dim("IN", 1)
+    c.declare_dim("OUT", 1)
+    # All these should validate cleanly.
+    for claim in [
+        (0, "attn_W_v", "0_0", "EMBED_LO+0"),
+        (0, "attn_W_q", "1_5", None),
+        (0, "ffn_W_up", "1700", "OPCODE_BYTE_LO+0"),
+        (0, "embed_row", "42", None),
+        (0, "attn_W_o", "7_31", "TEMP+15"),
+    ]:
+        op = _op(f"op_{hash(claim)}", reads=["IN"], writes=["OUT"],
+                 claims={claim})
+        # Need a fresh compiler since op names overlap with prior iterations
+        cc = LayerCompiler()
+        cc.declare_dim("IN", 1)
+        cc.declare_dim("OUT", 1)
+        cc.add_op(op)
 
 
 # ----------------------------------------------------------------------
 # Production-model smoke test
 # ----------------------------------------------------------------------
 
-# Known-benign claim-collision findings in the production model. Each entry
-# documents a (layer, scope, identifier) that today's bakes do legitimately
-# both touch, but at distinct (row, col) cells of the same row — the row-
-# granularity registry can't see column-level disjointness. These should be
-# revisited once the framework gains position-aware writes (Phase 3 / Agent
-# F of ARCH_LEAKAGE_FIX_PLAN.md):
-#
-#   (5, "attn_W_v", "5_32"): both ``layer5_fetch`` (CLEAN_EMBED_LO[0] →
-#       OPCODE_BYTE_LO[0]) and ``function_call_weights`` (EMBED_HI[15] →
-#       TEMP[31]) write to row 5*HD+32. Different input columns; different
-#       Q/K marker gates (PC vs STACK0). Output values do not alias because
-#       at any given position only one head's softmax is nonzero — V is
-#       projected through W_o only where the attention pattern places mass,
-#       and the two heads never fire at the same position.
-KNOWN_BENIGN_COLLISIONS = frozenset({
-    (5, "attn_W_v", "5_32"),
-})
-
-
 @pytest.mark.timeout(300)
-def test_production_compile_emits_no_unexpected_collision_warnings():
-    """Build the production VM and assert only known-benign collisions.
+def test_production_compile_emits_no_collision_warnings():
+    """Build the production VM and assert zero claim-collision warnings.
 
     Only a few ops are currently annotated (``layer5_fetch`` and
-    ``function_call_weights``). The registry surfaces a known-benign
-    boundary collision at ``(5, "attn_W_v", "5_32")`` — both ops touch
-    row ``5*HD+32`` but at distinct (row, col) cells with mutually
-    exclusive Q/K gating; see ``KNOWN_BENIGN_COLLISIONS`` above. Any
-    *additional* collision is a real latent bug to investigate (per
-    ARCH_LEAKAGE_FIX_PLAN.md).
+    ``function_call_weights``). With column-granularity claims, the
+    historical row-level false positive at
+    ``(5, "attn_W_v", "5_32")`` — where ``layer5_fetch`` writes
+    ``CLEAN_EMBED_LO[0]`` and ``function_call_weights`` writes
+    ``EMBED_HI[15]`` to the same row but disjoint columns — is no
+    longer surfaced. The ``KNOWN_BENIGN_COLLISIONS`` allowlist has
+    been retired. Any collision warning here is a real latent bug to
+    investigate (per ARCH_LEAKAGE_FIX_PLAN.md).
     """
     from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
         compile_full_vm,
@@ -295,24 +437,9 @@ def test_production_compile_emits_no_unexpected_collision_warnings():
         # Default args mirror the bake path used by the headline tests.
         compile_full_vm()
 
-    # Parse each "DIM-OWNERSHIP COLLISION" message back into a key so we
-    # can compare against the allowlist symbolically.
-    import re
-    pattern = re.compile(
-        r"layer=(\d+) scope='([^']+)' identifier='([^']+)'"
-    )
-    unexpected = []
-    for msg in _collect_claim_warnings(wlist):
-        m = pattern.search(msg)
-        if m is None:
-            unexpected.append(msg)
-            continue
-        key = (int(m.group(1)), m.group(2), m.group(3))
-        if key not in KNOWN_BENIGN_COLLISIONS:
-            unexpected.append(msg)
-
-    assert not unexpected, (
-        "Production compile emitted unexpected dim-ownership collisions "
-        "(beyond the known-benign allowlist) — investigate before "
-        "extending claim coverage.\n  " + "\n  ".join(unexpected)
+    msgs = _collect_claim_warnings(wlist)
+    assert msgs == [], (
+        "Production compile emitted dim-ownership collision warnings "
+        "(column-granular registry should resolve all known-benign "
+        "row-level false positives).\n  " + "\n  ".join(msgs)
     )
