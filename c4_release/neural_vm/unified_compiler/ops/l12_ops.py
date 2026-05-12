@@ -23,6 +23,13 @@ def make_layer12_mul_combine_op() -> Operation:
         bake_fn=bake,
         layer_idx=12,
         migrated=True,
+        # Staleness invariants: L12 MUL combine consumes the same operands
+        # as L11 MUL partial (ALU_HI for a_hi, AX_CARRY_LO for b_lo) at the
+        # AX marker. These must be the in-step fresh values.
+        consumes_fresh={
+            "ALU_HI": "AX_byte0",
+            "AX_CARRY_LO": "AX_byte0",
+        },
     )
 
 

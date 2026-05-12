@@ -17,6 +17,25 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         # The legacy bake fills units 0..7 (4 MEM_VAL_BN + 4 BYTE_INDEX_*).
         ffn._l2_unit_counter = max(getattr(ffn, "_l2_unit_counter", 0), 8)
 
+    # Dim-ownership claims: ``_set_layer2_mem_byte_flags`` writes units 0..7
+    # (see setup_helpers.py:_set_layer2_mem_byte_flags). Each unit writes a
+    # unique W_down output dim:
+    #   unit 0: MEM_VAL_B0
+    #   unit 1: MEM_VAL_B1
+    #   unit 2: MEM_VAL_B2
+    #   unit 3: MEM_VAL_B3
+    #   unit 4: BYTE_INDEX_0  (STACK0 byte 0)
+    #   unit 5: BYTE_INDEX_1  (STACK0 byte 1)
+    #   unit 6: BYTE_INDEX_2  (STACK0 byte 2)
+    #   unit 7: BYTE_INDEX_3  (STACK0 byte 3)
+    _claims = set()
+    _outputs = [
+        "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+        "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+    ]
+    for u, out_dim in enumerate(_outputs):
+        _claims.add((2, "ffn_W_down", str(u), f"{out_dim}+0"))
+
     return Operation(
         name="layer2_mem_byte_flags",
         phase=2,
@@ -28,6 +47,7 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         layer_idx=2,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -105,6 +125,19 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
 
         ffn._l2_unit_counter = unit
 
+    # Dim-ownership claims: two FFN units (allocated at the L2 unit counter,
+    # which is 8 after _set_layer2_mem_byte_flags). Each writes one EMBED
+    # nibble.  PC_OFFSET is a runtime constant from constants.py, so resolve
+    # init_pc_lo/hi at op-construction time for the claim columns.
+    from ...constants import PC_OFFSET as _PC_OFFSET
+    _init_pc_lo = _PC_OFFSET & 0xF
+    _init_pc_hi = (_PC_OFFSET >> 4) & 0xF
+    _claims = set()
+    # Unit 8: cancels EMBED_LO[init_pc_lo]. W_down[EMBED_LO+init_pc_lo, 8].
+    _claims.add((2, "ffn_W_down", "8", f"EMBED_LO+{_init_pc_lo}"))
+    # Unit 9: cancels EMBED_HI[init_pc_hi].
+    _claims.add((2, "ffn_W_down", "9", f"EMBED_HI+{_init_pc_hi}"))
+
     return Operation(
         name="layer2_initial_pc_bake_cancel",
         phase=2.5,
@@ -114,6 +147,7 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         layer_idx=2,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -130,6 +164,16 @@ def make_layer2_threshold_attn_op() -> Operation:
             attn, [5.5], [proxy.L2H0], ALIBI_S, HD, heads=[0]
         )
 
+    # Dim-ownership claims: 1 threshold head on L2 attn, head 0 writing L2H0.
+    _claims = set()
+    _MARKS = ["MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+              "MARK_MEM", "MARK_SE", "MARK_CS"]
+    for m, mark in enumerate(_MARKS):
+        _claims.add((2, "attn_W_v", f"0_{1 + m}", f"{mark}+0"))
+        _claims.add((2, "attn_W_o", f"0_{1 + m}", f"L2H0+{m}"))
+    _claims.add((2, "attn_W_q", "0_0", "CONST+0"))
+    _claims.add((2, "attn_W_k", "0_0", "IS_MARK+0"))
+
     return Operation(
         name="layer2_threshold_attn",
         phase=2,
@@ -139,6 +183,7 @@ def make_layer2_threshold_attn_op() -> Operation:
         layer_idx=2,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
     )
 
 

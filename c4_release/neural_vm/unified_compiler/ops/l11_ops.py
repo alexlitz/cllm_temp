@@ -26,6 +26,16 @@ def make_layer11_mul_partial_op() -> Operation:
         bake_fn=bake,
         layer_idx=11,
         migrated=True,
+        # Staleness invariants (Phase 3 / Agent G): the L11 MUL partial unit
+        # consumes ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) at
+        # the AX marker for OP_MUL. Both must be the *current* step's fresh
+        # values to produce the correct partial product.
+        consumes_fresh={
+            "ALU_LO": "AX_byte0",
+            "ALU_HI": "AX_byte0",
+            "AX_CARRY_LO": "AX_byte0",
+            "AX_CARRY_HI": "AX_byte0",
+        },
     )
 
 

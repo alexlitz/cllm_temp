@@ -25,6 +25,21 @@ def make_phase_a_ffn_op() -> Operation:
         proxy = _as_setdim_proxy(dim_positions)
         _set_phase_a_ffn(block.ffn, S, proxy)
 
+    # Dim-ownership claims: ``_set_phase_a_ffn`` writes units 0..6 (one per
+    # marker transition) into the L0 FFN. The W_up rows read H0..H4 marker
+    # threshold outputs; W_down rows write NEXT_* dims. The 7 units are
+    # stable across builds (always start at unit 0, one per transition).
+    _claims = set()
+    # Each transition row writes (unit, NEXT_* slot). Use NEXT_* dim names
+    # as the column tag since W_down[NEXT_*, unit] = 2.0/S.
+    # See _set_phase_a_ffn in vm_step.py for the transition list.
+    _next_dim_names = [
+        "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
+        "NEXT_STACK0", "NEXT_MEM", "NEXT_SE",
+    ]
+    for u, next_dim in enumerate(_next_dim_names):
+        _claims.add((0, "ffn_W_down", str(u), f"{next_dim}+0"))
+
     # The threshold heads write 7 dims each (one per marker type), so we
     # express reads as the head-base names; the FFN reads any element in the
     # H0..H4 ranges, which are size-7 dims.
@@ -38,6 +53,7 @@ def make_phase_a_ffn_op() -> Operation:
         layer_idx=0,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -80,6 +96,30 @@ def make_layer0_threshold_attn_op() -> Operation:
         head1_base = 1 * HD
         attn.W_k[head1_base, proxy.IS_MARK] *= 2.0
 
+    # Dim-ownership claims: ``_set_threshold_attn`` writes per head h:
+    #   W_q[h*HD, CONST]    : the head's bias (slot 0)
+    #   W_k[h*HD, IS_MARK]  : K-side mark detector (slot 0)
+    #   W_v[h*HD + 1 + m, MARKS[m]]  : V slot 1..7 (one per marker)
+    #   W_o[out_base + m, h*HD + 1 + m] : O column 1..7
+    # For 8 heads (h=0..7) writing to H0..H7 output bases.
+    # MARKS = [MARK_PC, MARK_AX, MARK_SP, MARK_BP, MARK_MEM, MARK_SE, MARK_CS]
+    _claims = set()
+    _MARKS = ["MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+              "MARK_MEM", "MARK_SE", "MARK_CS"]
+    _OUT_BASES = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"]
+    for h in range(8):
+        # V slots 1..7: each reads MARKS[m] column.
+        for m, mark in enumerate(_MARKS):
+            _claims.add((0, "attn_W_v", f"{h}_{1 + m}", f"{mark}+0"))
+        # Q slot 0: CONST column.
+        _claims.add((0, "attn_W_q", f"{h}_0", "CONST+0"))
+        # K slot 0: IS_MARK column.
+        _claims.add((0, "attn_W_k", f"{h}_0", "IS_MARK+0"))
+        # O writes 7 columns of W_o[out_base+m, h*HD + 1 + m]; in the
+        # attn_W_o scope the identifier is column-of-W_o = "<head>_<slot>".
+        for m, out_base in enumerate([_OUT_BASES[h]] * 7):
+            _claims.add((0, "attn_W_o", f"{h}_{1 + m}", f"{out_base}+{m}"))
+
     return Operation(
         name="layer0_threshold_attn",
         phase=0,
@@ -89,6 +129,7 @@ def make_layer0_threshold_attn_op() -> Operation:
         layer_idx=0,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
     )
 
 

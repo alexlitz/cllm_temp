@@ -124,6 +124,41 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         attn.W_q[base + GATE, proxy.CONST] = -L / 2
         attn.W_k[base + GATE, proxy.CONST] = L
 
+    # Dim-ownership claims: 7 carry-forward attention heads.
+    #   Heads 0-3: Primitives.carry_forward_attention writes V slots 1..32:
+    #     W_v[h*HD + 1 + k, src_lo + k]    for k=0..15 (slot 1..16)
+    #     W_v[h*HD + 17 + k, src_hi + k]   for k=0..15 (slot 17..32)
+    #   Plus W_q[base, marker], W_k[base, L1H1], W_k[base, L1H0] and the
+    #   GATE=33 row.  We capture the V/O row claims (the load-bearing
+    #   slot/column pairs that can collide with other ops).
+    #
+    #   Head 0 (PC): src=EMBED_LO/HI, out=EMBED_LO/HI
+    #   Head 1 (AX): src=EMBED_LO/HI, out=AX_CARRY_LO/HI
+    #   Head 2 (SP): src=EMBED_LO/HI, out=EMBED_LO/HI
+    #   Head 3 (BP): src=EMBED_LO/HI, out=EMBED_LO/HI
+    #   Head 4 (STACK0): _set_stack0_carry_attn — see helper for details
+    #   Head 5 (AX_FULL): inline V[OUTPUT_LO/HI] → AX_FULL_LO/HI
+    #   Head 6 (BP→PC LEV): inline V[CLEAN_EMBED_LO/HI] → (out via inline)
+    _claims = set()
+    _heads_cf = [
+        (0, "EMBED_LO", "EMBED_HI"),
+        (1, "EMBED_LO", "EMBED_HI"),
+        (2, "EMBED_LO", "EMBED_HI"),
+        (3, "EMBED_LO", "EMBED_HI"),
+    ]
+    for h, src_lo, src_hi in _heads_cf:
+        for k in range(16):
+            _claims.add((3, "attn_W_v", f"{h}_{1 + k}", f"{src_lo}+{k}"))
+            _claims.add((3, "attn_W_v", f"{h}_{17 + k}", f"{src_hi}+{k}"))
+    # Head 5: AX_FULL relay V slots from OUTPUT_LO/HI.
+    for k in range(16):
+        _claims.add((3, "attn_W_v", f"5_{1 + k}", f"OUTPUT_LO+{k}"))
+        _claims.add((3, "attn_W_v", f"5_{17 + k}", f"OUTPUT_HI+{k}"))
+    # Head 6: BP→PC LEV relay V slots from CLEAN_EMBED_LO/HI.
+    for k in range(16):
+        _claims.add((3, "attn_W_v", f"6_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((3, "attn_W_v", f"6_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer3_carry_forward_attn",
         phase=3,
@@ -137,6 +172,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         layer_idx=3,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
     )
 
 
