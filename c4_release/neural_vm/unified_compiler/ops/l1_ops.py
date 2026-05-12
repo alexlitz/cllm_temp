@@ -45,6 +45,7 @@ def make_layer1_threshold_attn_op() -> Operation:
             [0.5, 1.5, 2.5],
             [proxy.L1H0, proxy.L1H1, proxy.L1H2],
             ALIBI_S, HD, heads=[0, 1, 2],
+            BD=proxy,
         )
         # Head 3: STEP_END existence detection (global)
         base = 3 * HD
@@ -54,7 +55,7 @@ def make_layer1_threshold_attn_op() -> Operation:
         attn.W_o[proxy.HAS_SE, base + 1] = 1.0
         # Head 4: threshold 6.5 for STACK0 byte 0 identification
         _set_threshold_attn(
-            attn, [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4]
+            attn, [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4], BD=proxy,
         )
 
     return Operation(

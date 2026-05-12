@@ -127,7 +127,7 @@ def make_layer2_threshold_attn_op() -> Operation:
             attn.alibi_slopes.fill_(ALIBI_S)
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_threshold_attn(
-            attn, [5.5], [proxy.L2H0], ALIBI_S, HD, heads=[0]
+            attn, [5.5], [proxy.L2H0], ALIBI_S, HD, heads=[0], BD=proxy,
         )
 
     return Operation(
