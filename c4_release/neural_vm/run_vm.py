@@ -26,6 +26,7 @@ IO strategy:
 import os
 import torch
 import warnings
+from collections import deque
 from typing import List, Optional, Callable, Any, Dict
 from dataclasses import dataclass, field
 
@@ -161,6 +162,7 @@ class AutoregressiveVMRunner:
         kv_cache_pruning_min_size=256,
         kv_cache_pruning_tau=0.99,
         kv_cache_pruning_eps=1e-6,
+        enable_divergence_bail=True,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -177,6 +179,13 @@ class AutoregressiveVMRunner:
                 stream (BLOG_SPEC.md:851 — canonical neural-I/O mode) instead
                 of the Phase-6 runner-reads-AX path. Defaults False; see
                 ``c4_release/docs/NEURAL_IO_VIA_THINK_PROTOCOL_PLAN.md``.
+            enable_divergence_bail: If True (default), detect pathological
+                autoregressive loops (PC stuck at 0, PC looping on one
+                instruction, no STEP_END emitted for many tokens, exec_idx
+                cycle) and bail out early — returning whatever AX is in
+                context. Lets failing pure_neural tests fail in seconds
+                instead of hitting the pytest timeout. Set False for debug
+                runs where you want to see the full token stream.
         """
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
         # compile_full_vm. The compiler derives d_model and n_layers from the
@@ -298,6 +307,17 @@ class AutoregressiveVMRunner:
         self._kv_pruning_stats = {"calls": 0, "evicted_total": 0,
                                   "evicted_by_similarity": 0,
                                   "evicted_by_zero_v": 0}
+
+        # Divergence-bail configuration. When True (default), `run` watches for
+        # pathological autoregressive states (PC stuck at 0, PC looping on one
+        # instruction, missing STEP_END boundaries, exec_idx cycles) and breaks
+        # out of the generation loop returning the partial output. Lets failing
+        # pure_neural tests finish in seconds instead of timing out at 180s.
+        # Disable for debug runs where the full token stream is required.
+        self.enable_divergence_bail = enable_divergence_bail
+        # Bail-state diagnostics from the most recent `run()`. Populated only
+        # when a divergence signal fires; otherwise None.
+        self.last_divergence_signal = None
 
     # Maximum number of consecutive incremental forward calls before flushing
     # the KV cache. Empirically, the c4 VM model's L15 (memory-lookup) attention
@@ -609,6 +629,63 @@ class AutoregressiveVMRunner:
 
         step_num = 0  # Track VM steps for conversational I/O handling
 
+        # ---- Divergence-bail detection state (per-run) ----
+        # See `enable_divergence_bail` docstring on `__init__`. We watch for
+        # pathological autoregressive states that indicate the model has lost
+        # the plot and would just spin until the pytest timeout.
+        self.last_divergence_signal = None
+        pc_history = deque(maxlen=10)
+        exec_idx_history = deque(maxlen=10)
+        steps_since_last_step_end = 0
+        dispatch_count = 0  # number of VM steps actually dispatched
+
+        def _bail_check():
+            """Return a (signal_name, detail) tuple if divergence detected, else None.
+
+            Called only after a successful `_dispatch_step` (i.e. at STEP_END /
+            TOOL_CALL), so `pc_history` and `exec_idx_history` reflect post-
+            dispatch state. We need at least a few dispatched steps before any
+            check can fire — otherwise a fresh program with last_pc=0 would
+            bail immediately.
+            """
+            # Signal 1: PC stuck at 0 for >=5 consecutive dispatched steps
+            # (model lost PC tracking; last_pc has collapsed to 0).
+            if len(pc_history) >= 5 and dispatch_count > 3:
+                last5 = list(pc_history)[-5:]
+                if all(p == 0 for p in last5):
+                    return ("pc_stuck_at_zero",
+                            f"last 5 PCs all 0 after {dispatch_count} dispatched steps")
+
+            # Signal 2: PC repeating a single non-zero value for >=5 consecutive
+            # steps (infinite loop on one instruction — never advancing by
+            # INSTR_WIDTH).
+            if len(pc_history) >= 5:
+                last5 = list(pc_history)[-5:]
+                if last5[0] != 0 and all(p == last5[0] for p in last5):
+                    return ("pc_repeating",
+                            f"last 5 PCs all 0x{last5[0]:x} (no advance)")
+
+            # Signal 3: exec_idx oscillates over a tiny set near program start
+            # (model collapsed; e.g. bouncing between exec_idx 0 and 1 forever).
+            # Conservative form: full 10-entry window must (a) contain at most
+            # 3 distinct exec_idx values, all in [0, 5], AND (b) PC history
+            # over the same window contains at most 3 distinct values. Legit
+            # C loops typically have larger PCs and/or longer bodies and won't
+            # trip this gate.
+            if (len(exec_idx_history) == exec_idx_history.maxlen
+                    and len(pc_history) == pc_history.maxlen):
+                ei_set = set(exec_idx_history)
+                pc_set = set(pc_history)
+                if (len(ei_set) <= 3
+                        and max(ei_set) <= 5
+                        and len(pc_set) <= 3):
+                    return ("exec_idx_cycle",
+                            f"exec_idx oscillating over {sorted(ei_set)} "
+                            f"with PC set {sorted(pc_set)} (model collapsed)")
+
+            return None
+
+
         # Context windowing prevents O(n²) blowup while preserving CODE section.
         # The CODE section (bytecode) is needed for L5 fetch heads to read instructions.
         # Keep prefix (CODE + DATA) + last 512 tokens of dynamic content (MEM + steps).
@@ -621,6 +698,32 @@ class AutoregressiveVMRunner:
                 generation_context = context
             next_token = self._generate_next_cached(generation_context)
             context.append(next_token)
+
+            # Divergence signal #4: STEP_END never emitted for a long time
+            # (model lost the well-formed-step structure entirely). Checked
+            # every token so a runaway loop is caught even without dispatch.
+            # Threshold = ~14 STEP_TOKENS-worth (35*14 = 490 → round to 500).
+            # In pure_neural mode the model is supposed to emit STEP_END at
+            # the natural step boundary, but some bakes don't reliably do so;
+            # the bail in those cases is still safe because AX is read via
+            # `_decode_exit_code` from the last REG_AX in context. Failing
+            # degeneration loops can produce many thousands of stray tokens
+            # before pytest-timeout, so 500 keeps them well under 180s.
+            steps_since_last_step_end += 1
+            if (self.enable_divergence_bail
+                    and steps_since_last_step_end > 500):
+                self.last_divergence_signal = (
+                    "no_step_end",
+                    f"no STEP_END for {steps_since_last_step_end} tokens"
+                )
+                warnings.warn(
+                    "AutoregressiveVMRunner.run: divergence detected — "
+                    f"{self.last_divergence_signal[0]}: "
+                    f"{self.last_divergence_signal[1]}. Bailing early.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                break
 
             pos_in_step = i % Token.STEP_TOKENS
             # FIX 2026-05-09: In pure_neural mode, do NOT force STEP_END at position 34.
@@ -760,6 +863,26 @@ class AutoregressiveVMRunner:
                 # ``enable_kv_cache_pruning=True`` was passed to ``__init__``.
                 self._maybe_prune_kv_cache(context, prefix_len)
 
+                # Divergence detection: update post-dispatch state and check
+                # for pathological signals. STEP_END resets the no-STEP_END
+                # counter; PC/exec_idx history feeds the cycle / stuck checks.
+                steps_since_last_step_end = 0
+                pc_history.append(self._last_pc if self._last_pc is not None else 0)
+                exec_idx_history.append(exec_idx)
+                dispatch_count += 1
+                if self.enable_divergence_bail:
+                    signal = _bail_check()
+                    if signal is not None:
+                        self.last_divergence_signal = signal
+                        warnings.warn(
+                            "AutoregressiveVMRunner.run: divergence detected — "
+                            f"{signal[0]}: {signal[1]}. Bailing early after "
+                            f"{dispatch_count} dispatched steps.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        break
+
             elif next_token == Token.TOOL_CALL:
                 # FIX 2026-05-09: In pure_neural mode, do NOT run any Python-side
                 # handler or memory tracking. The model must handle tool-call
@@ -791,6 +914,24 @@ class AutoregressiveVMRunner:
                 exec_idx = self._exec_pc() // INSTR_WIDTH
                 if self._dispatch_step(context, bytecode, exec_idx, prefix_len, output):
                     break
+
+                # Divergence detection: mirror the STEP_END branch above.
+                steps_since_last_step_end = 0
+                pc_history.append(self._last_pc if self._last_pc is not None else 0)
+                exec_idx_history.append(exec_idx)
+                dispatch_count += 1
+                if self.enable_divergence_bail:
+                    signal = _bail_check()
+                    if signal is not None:
+                        self.last_divergence_signal = signal
+                        warnings.warn(
+                            "AutoregressiveVMRunner.run: divergence detected — "
+                            f"{signal[0]}: {signal[1]}. Bailing early after "
+                            f"{dispatch_count} dispatched steps.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        break
 
             # Halt detection
             if next_token == Token.HALT:
