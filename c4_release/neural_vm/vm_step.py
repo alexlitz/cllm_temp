@@ -3707,6 +3707,35 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S  # FIX 2026-05-09 (mirror of LO IMM fix)
         unit += 1
 
+    # === IMM: refresh AX_CARRY staging at the AX marker ===
+    # Later ALU layers consume AX_CARRY as the current AX operand. The carry
+    # path can retain the previous AX value after an IMM; replace it with the
+    # fetched immediate while it is still clean in FETCH_LO/HI.
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_IMM] = S / 5
+        ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10
+        ffn.W_up[unit, BD.OP_EXIT] = -S * 20
+        ffn.W_up[unit, BD.OP_JMP] = -S * 20
+        ffn.b_up[unit] = -S * 1.5
+        ffn.W_gate[unit, BD.FETCH_LO + k] = 1.0
+        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = -1.0
+        ffn.W_down[BD.AX_CARRY_LO + k, unit] = 2.0 / S
+        unit += 1
+    for k in range(16):
+        ffn.W_up[unit, BD.OP_IMM] = S / 5
+        ffn.W_up[unit, BD.MARK_AX] = S
+        ffn.W_up[unit, BD.MARK_PC] = -S * 8
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10
+        ffn.W_up[unit, BD.OP_EXIT] = -S * 20
+        ffn.W_up[unit, BD.OP_JMP] = -S * 20
+        ffn.b_up[unit] = -S * 1.5
+        ffn.W_gate[unit, BD.FETCH_HI + k] = 1.0
+        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = -1.0
+        ffn.W_down[BD.AX_CARRY_HI + k, unit] = 2.0 / S
+        unit += 1
+
     # === EXIT: AX_CARRY → OUTPUT ===
     # FIX 2026-04-16: Changed BACK from AX_FULL to AX_CARRY.
     # AX_FULL (dims 471-502) overlaps with TEMP (dims 480-511), causing PC+1
