@@ -13,6 +13,34 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # =============================================================================
+# torch.compile mode helper
+# =============================================================================
+
+def _resolve_compile_mode(pure_neural: bool) -> str:
+    """Resolve the ``compile_mode`` to pass to ``AutoregressiveVMRunner``.
+
+    Reads ``C4_COMPILE_MODE`` from the environment. When unset, defaults to
+    ``"none"`` (opt-in compile only) — first-run torch.compile warmup is
+    >8 minutes on the current production model (see
+    ``c4_release/docs/TORCH_COMPILE_BENCHMARK.md``). The legacy KV-cache
+    byte-identity tests also depend on the un-compiled incremental forward
+    path, which ``compile_mode != "none"`` disables.
+
+    Accepted values match ``torch.compile(mode=...)`` plus ``"none"`` /
+    ``"None"`` to opt out explicitly. Tests/CI can opt into compile by
+    setting ``C4_COMPILE_MODE=reduce-overhead`` (or ``max-autotune``).
+    """
+    # Default stays "none" pending compile-warmup improvements (see
+    # TORCH_COMPILE_BENCHMARK.md). ``pure_neural`` is accepted for forward
+    # compatibility so callers don't need to change once the default flips.
+    del pure_neural  # currently unused; kept for forward compat
+    mode = os.environ.get("C4_COMPILE_MODE", "none")
+    if mode in ("None", "none", ""):
+        return "none"
+    return mode
+
+
+# =============================================================================
 # GPU Detection
 # =============================================================================
 
@@ -89,9 +117,19 @@ def neural_runner():
     PHASE 8 (2026-05-11): Default flipped to pure_neural=True,
     trust_neural_alu=True. Many tests will fail until Phases 1-7 complete;
     that is the intended signal for what the neural path still cannot do.
+
+    torch.compile is OFF by default (first-run compile is >8 min on this
+    model). Opt in via ``C4_COMPILE_MODE=reduce-overhead`` (or another
+    ``torch.compile(mode=...)`` value). See
+    ``c4_release/docs/TORCH_COMPILE_BENCHMARK.md`` for measurements.
     """
     from neural_vm.run_vm import AutoregressiveVMRunner
-    return AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)
+    compile_mode = _resolve_compile_mode(pure_neural=True)
+    return AutoregressiveVMRunner(
+        pure_neural=True,
+        trust_neural_alu=True,
+        compile_mode=compile_mode,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -119,10 +157,20 @@ def quick_runner():
     path with Python overrides disabled. Tests that the neural network cannot
     yet handle (most of Phases 2-7) will fail honestly; that is the new CI
     signal driving Phases 1-7 to completion.
+
+    torch.compile is OFF by default (first-run compile is >8 min on this
+    model). Opt in via ``C4_COMPILE_MODE=reduce-overhead`` (or another
+    ``torch.compile(mode=...)`` value). See
+    ``c4_release/docs/TORCH_COMPILE_BENCHMARK.md`` for measurements.
     """
     from neural_vm.run_vm import AutoregressiveVMRunner
 
-    runner = AutoregressiveVMRunner(pure_neural=True, trust_neural_alu=True)
+    compile_mode = _resolve_compile_mode(pure_neural=True)
+    runner = AutoregressiveVMRunner(
+        pure_neural=True,
+        trust_neural_alu=True,
+        compile_mode=compile_mode,
+    )
     # Limit max_steps for quick tests
     return runner
 
