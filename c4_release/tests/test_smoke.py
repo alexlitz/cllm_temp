@@ -941,20 +941,35 @@ class TestSmokeHandlerStatus:
     """
 
     def test_neural_ops_no_handler(self, handler_status):
-        """Verify arithmetic/bitwise/shift ops have no handlers."""
+        """Verify neural-only ops (ALU + control + IMM/EXIT) have no Python handler.
+
+        After V7 REMOVABLE cleanup, only host-boundary syscalls
+        (OPEN/READ/CLOS/PRTF) keep Python handlers; everything else is
+        neural-only.
+        """
         neural_ops = ["ADD", "SUB", "MUL", "DIV", "MOD",
                       "OR", "XOR", "AND", "SHL", "SHR",
-                      "EQ", "NE", "LT", "GT", "LE", "GE"]
+                      "EQ", "NE", "LT", "GT", "LE", "GE",
+                      "IMM", "EXIT"]
 
         for op in neural_ops:
             assert not handler_status[op]["has_handler"], f"{op} should be neural-only"
 
     def test_handler_ops_have_handler(self, handler_status):
-        """Verify inline handler ops have correct status."""
-        inline_ops = ["JSR", "ENT", "LEV", "PSH", "IMM", "JMP", "BZ", "BNZ"]
+        """Verify host-boundary syscall ops have a Python handler.
 
-        for op in inline_ops:
-            assert handler_status[op]["handler_type"] == "neural", f"{op} should be inline/neural"
+        The runner's ``_syscall_handlers`` dict currently registers
+        OPEN/READ/CLOS/PRTF. GETCHAR/PUTCHAR are reserved boundary ops
+        that flow through the conversational-IO path instead and are
+        therefore not in the dict today.
+        """
+        handler_ops = ["PRTF", "OPEN", "CLOS", "READ"]
+
+        for op in handler_ops:
+            assert handler_status[op]["has_handler"], f"{op} should have a Python handler"
+            assert handler_status[op]["handler_type"] == "syscall", (
+                f"{op} should be a syscall handler, got {handler_status[op]['handler_type']}"
+            )
 
 
 # =============================================================================
