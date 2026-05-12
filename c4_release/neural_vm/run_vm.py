@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from .vm_step import AutoregressiveVM, Token
 from .embedding import Opcode
 from .constants import INSTR_WIDTH, PC_OFFSET
+from .speculative import DraftVM
 
 # Opcodes that emit TOOL_CALL instead of STEP_END when tool calling is enabled.
 # When model emits STEP_END for these (weights not set, or enable_tool_calling=False),
@@ -180,12 +181,22 @@ class AutoregressiveVMRunner:
                 of the Phase-6 runner-reads-AX path. Defaults False; see
                 ``c4_release/docs/NEURAL_IO_VIA_THINK_PROTOCOL_PLAN.md``.
             enable_divergence_bail: If True (default), detect pathological
-                autoregressive loops (PC stuck at 0, PC looping on one
-                instruction, no STEP_END emitted for many tokens, exec_idx
-                cycle) and bail out early — returning whatever AX is in
-                context. Lets failing pure_neural tests fail in seconds
-                instead of hitting the pytest timeout. Set False for debug
-                runs where you want to see the full token stream.
+                autoregressive loops and bail out early — returning whatever
+                AX is in context. Lets failing pure_neural tests fail in
+                seconds instead of hitting the pytest timeout. Set False for
+                debug runs where you want to see the full token stream.
+
+                Primary signal is ``draft_divergence``: per emitted token
+                the model's argmax is compared to :class:`DraftVM`'s
+                deterministic prediction; a rolling-window mismatch rate
+                >= 0.5 (25 of last 50 tokens disagree) means the model is
+                no longer tracking the correct trace and we bail. The
+                older heuristic signals (``pc_stuck_at_zero``,
+                ``pc_repeating``, ``exec_idx_cycle``, ``no_step_end``) are
+                still checked as a fallback for tests run with a bytecode
+                that DraftVM cannot interpret, but they're only allowed to
+                fire after ``draft_divergence`` has had a chance to (it
+                fires first whenever it has signal).
         """
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
         # compile_full_vm. The compiler derives d_model and n_layers from the
@@ -318,6 +329,23 @@ class AutoregressiveVMRunner:
         # Bail-state diagnostics from the most recent `run()`. Populated only
         # when a divergence signal fires; otherwise None.
         self.last_divergence_signal = None
+        # DraftVM (deterministic Python C4 interpreter) — instantiated per
+        # ``run()`` call inside ``_init_draft_vm``. The per-step draft
+        # tokens it produces drive the primary `draft_divergence` bail
+        # signal. ``None`` outside of a run() or when DraftVM is disabled.
+        self._draft_vm: Optional[DraftVM] = None
+        self._draft_step_tokens: Optional[List[int]] = None
+
+    # DraftVM-divergence bail thresholds. Window is 50 tokens (~1.4 VM steps
+    # of 35 tokens each); threshold of 0.5 means >=25 of the last 50 tokens
+    # disagree with DraftVM. The window/threshold pair was chosen so a
+    # well-behaved program (rare 1-2 mismatches around MEM addr/val from
+    # spec-vs-unspec embedding metadata) never trips, while a model that
+    # has lost the plot (PC stuck at 0, AX random, etc.) trips within
+    # roughly one VM step of bad output. Calibrate carefully if changing —
+    # the smoke + Phase 1 PC tests are the regression gate.
+    _DRAFT_BAIL_WINDOW = 50
+    _DRAFT_BAIL_RATE = 0.5
 
     # Maximum number of consecutive incremental forward calls before flushing
     # the KV cache. Empirically, the c4 VM model's L15 (memory-lookup) attention
@@ -341,6 +369,85 @@ class AutoregressiveVMRunner:
         self._kv_cached_tokens = []  # tokens currently represented in the cache
         self._kv_cached_opcode = object()  # sentinel; mismatch on first call
         self._kv_incremental_count = 0  # number of consecutive incremental calls
+
+    def _init_draft_vm(self, bytecode, data, stdin):
+        """Build a fresh :class:`DraftVM` for divergence-detection.
+
+        Returns ``None`` if divergence-bail is disabled (no DraftVM needed) or
+        if DraftVM construction fails (e.g. unsupported bytecode). Loads the
+        data section into DraftVM memory the same way ``run()`` loads it into
+        ``self._memory``, and primes stdin so the deterministic interpreter
+        sees the same input the runner does.
+        """
+        if not self.enable_divergence_bail:
+            return None
+        try:
+            vm = DraftVM(list(bytecode))
+        except Exception:
+            return None
+        data = data or b""
+        if isinstance(data, (bytes, bytearray)):
+            for i, b in enumerate(data):
+                vm.memory[0x10000 + i] = int(b)
+        elif isinstance(data, list):
+            for i, b in enumerate(data):
+                vm.memory[0x10000 + i] = int(b)
+        if stdin:
+            vm.set_stdin(stdin)
+        return vm
+
+    def _sync_draft_vm_from_runner(self):
+        """Pull register state from the runner into ``self._draft_vm``.
+
+        Mirrors :meth:`BatchedPureNeuralRunner._sync_draft_vm`. Memory is
+        not transplanted: ``self._memory`` is byte-addressed while
+        :class:`DraftVM`'s ``memory`` is word-addressed. Register drift is
+        the dominant correctness signal for divergence; memory drift just
+        produces extra mismatches (acceptable — divergence-bail tolerates
+        some natural disagreement).
+        """
+        vm = self._draft_vm
+        if vm is None:
+            return
+        if self._last_pc is not None:
+            vm.pc = int(self._last_pc) & 0xFFFFFFFF
+            vm.idx = (vm.pc - PC_OFFSET) // INSTR_WIDTH
+        vm.ax = int(self._last_ax) & 0xFFFFFFFF
+        vm.sp = int(self._last_sp) & 0xFFFFFFFF
+        vm.bp = int(self._last_bp) & 0xFFFFFFFF
+        vm.halted = False
+        vm._last_mem_addr = 0
+        vm._last_mem_val = 0
+
+    def _refresh_draft_step(self):
+        """Advance ``self._draft_vm`` by one instruction and stash its 35
+        draft tokens into ``self._draft_step_tokens``.
+
+        Called at every STEP_END / TOOL_CALL boundary. On the first call
+        (before any model emission) ``self._last_pc`` may still be None;
+        in that case we skip the sync and let DraftVM run from its
+        constructor-initialized state (PC=PC_OFFSET, AX=0, SP=BP=STACK_INIT).
+        """
+        vm = self._draft_vm
+        if vm is None:
+            self._draft_step_tokens = None
+            return
+        if self._last_pc is not None:
+            self._sync_draft_vm_from_runner()
+        try:
+            advanced = vm.step()
+        except Exception:
+            # DraftVM choked on this instruction — give up on the draft
+            # signal for the rest of the run. The heuristic fallback
+            # signals are still active.
+            self._draft_vm = None
+            self._draft_step_tokens = None
+            return
+        if not advanced:
+            # DraftVM is halted or out of code — nothing to compare against.
+            self._draft_step_tokens = None
+            return
+        self._draft_step_tokens = vm.draft_tokens()
 
     def _get_or_build_kv_cache(self):
         """Lazily build the LayerKVCache, sized to match the model.
@@ -639,6 +746,40 @@ class AutoregressiveVMRunner:
         steps_since_last_step_end = 0
         dispatch_count = 0  # number of VM steps actually dispatched
 
+        # ---- DraftVM-divergence signal state (per-run) ----
+        # DraftVM is a deterministic Python C4 interpreter
+        # (``neural_vm.speculative.DraftVM``). It produces the correct
+        # next-token at every offset within a VM step (35 tokens per step:
+        # REG_PC + 4, REG_AX + 4, REG_SP + 4, REG_BP + 4, STACK0 + 4,
+        # MEM + 4 addr + 4 val, STEP_END/HALT). We sync DraftVM's registers
+        # from the runner's tracked state at every step boundary, then ask
+        # it for the next 35 tokens; per token emitted by the model we
+        # compare and record agreement / disagreement in a sliding window.
+        # When the rolling rejection rate climbs above ``_DRAFT_BAIL_RATE``
+        # over a window of ``_DRAFT_BAIL_WINDOW`` tokens, we bail out — the
+        # model has clearly stopped tracking the correct trace.
+        #
+        # Some bytecodes hit code paths DraftVM doesn't model (e.g.
+        # runner-side syscall shims that bake non-C4 effects into the
+        # stream). In that case we set ``_draft_vm`` to None at construction
+        # below and the comparison is a no-op; the heuristic fallback
+        # signals are still active.
+        self._draft_vm = self._init_draft_vm(bytecode, data, stdin)
+        # Current draft for the in-progress VM step (length 35) — refreshed
+        # at every STEP_END / TOOL_CALL boundary.
+        self._draft_step_tokens: Optional[List[int]] = None
+        # Sliding window of bool: True == model disagreed with DraftVM.
+        draft_mismatch_history = deque(maxlen=self._DRAFT_BAIL_WINDOW)
+        # Per-VM-step position counter (0..34). Reset to 0 on every
+        # STEP_END / TOOL_CALL. Note we cannot rely on the global
+        # `pos_in_step = i % Token.STEP_TOKENS` because TOOL_CALL /
+        # HALT may not arrive at exact 35-token alignment (the runner
+        # injects extra tokens around THINK-tag protocol, etc.).
+        draft_step_pos = 0
+        # Prime the first draft step (before any model emission).
+        if self._draft_vm is not None:
+            self._refresh_draft_step()
+
         def _bail_check():
             """Return a (signal_name, detail) tuple if divergence detected, else None.
 
@@ -699,18 +840,50 @@ class AutoregressiveVMRunner:
             next_token = self._generate_next_cached(generation_context)
             context.append(next_token)
 
-            # Divergence signal #4: STEP_END never emitted for a long time
+            # Primary divergence signal: compare against DraftVM's
+            # deterministic prediction for this token offset within the
+            # current VM step. The 50-token sliding window absorbs the
+            # natural occasional mismatch (MEM addr/val embedding-metadata
+            # corner cases, transient model noise) while still tripping
+            # within roughly one VM step of a true divergence. See class
+            # constants ``_DRAFT_BAIL_WINDOW``, ``_DRAFT_BAIL_RATE``.
+            if (self.enable_divergence_bail
+                    and self._draft_step_tokens is not None
+                    and draft_step_pos < len(self._draft_step_tokens)):
+                draft_tok = self._draft_step_tokens[draft_step_pos]
+                draft_mismatch_history.append(next_token != draft_tok)
+            draft_step_pos += 1
+
+            if (self.enable_divergence_bail
+                    and len(draft_mismatch_history) == draft_mismatch_history.maxlen):
+                mismatches = sum(draft_mismatch_history)
+                window = len(draft_mismatch_history)
+                if mismatches / window >= self._DRAFT_BAIL_RATE:
+                    self.last_divergence_signal = (
+                        "draft_divergence",
+                        f"{mismatches} of last {window} tokens disagree with DraftVM"
+                    )
+                    warnings.warn(
+                        "AutoregressiveVMRunner.run: divergence detected — "
+                        f"{self.last_divergence_signal[0]}: "
+                        f"{self.last_divergence_signal[1]}. Bailing early.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    break
+
+            # Fallback signal #4: STEP_END never emitted for a long time
             # (model lost the well-formed-step structure entirely). Checked
             # every token so a runaway loop is caught even without dispatch.
             # Threshold = ~14 STEP_TOKENS-worth (35*14 = 490 → round to 500).
-            # In pure_neural mode the model is supposed to emit STEP_END at
-            # the natural step boundary, but some bakes don't reliably do so;
-            # the bail in those cases is still safe because AX is read via
-            # `_decode_exit_code` from the last REG_AX in context. Failing
-            # degeneration loops can produce many thousands of stray tokens
-            # before pytest-timeout, so 500 keeps them well under 180s.
+            # This is the last line of defense for runs where DraftVM is
+            # unavailable (no `_draft_vm`) or where the model emits a
+            # plausible but never-terminating step pattern that doesn't
+            # disagree often enough with DraftVM to trip the primary
+            # signal. With the primary signal active, this rarely fires.
             steps_since_last_step_end += 1
             if (self.enable_divergence_bail
+                    and self._draft_vm is None
                     and steps_since_last_step_end > 500):
                 self.last_divergence_signal = (
                     "no_step_end",
@@ -870,6 +1043,12 @@ class AutoregressiveVMRunner:
                 pc_history.append(self._last_pc if self._last_pc is not None else 0)
                 exec_idx_history.append(exec_idx)
                 dispatch_count += 1
+                # Advance DraftVM by one instruction and stash the next
+                # 35 draft tokens; reset the per-step position counter so
+                # the next batch of token comparisons line up correctly.
+                if self._draft_vm is not None:
+                    self._refresh_draft_step()
+                draft_step_pos = 0
                 if self.enable_divergence_bail:
                     signal = _bail_check()
                     if signal is not None:
@@ -920,6 +1099,12 @@ class AutoregressiveVMRunner:
                 pc_history.append(self._last_pc if self._last_pc is not None else 0)
                 exec_idx_history.append(exec_idx)
                 dispatch_count += 1
+                # Mirror STEP_END: re-sync + advance DraftVM and reset the
+                # per-step position counter so subsequent token compares
+                # are aligned with the new VM step.
+                if self._draft_vm is not None:
+                    self._refresh_draft_step()
+                draft_step_pos = 0
                 if self.enable_divergence_bail:
                     signal = _bail_check()
                     if signal is not None:
