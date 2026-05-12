@@ -387,6 +387,41 @@ class DraftVM:
         self.stdin_buf = data
         self.stdin_pos = 0
 
+    def predict_steps(self, max_steps=2000):
+        """Run this DraftVM until HALT or ``max_steps``, return the number of
+        VM steps actually executed.
+
+        This is a cheap upfront prediction (~10 us/step in pure Python) used by
+        :class:`BatchedPureNeuralRunner` to bucket programs by similar predicted
+        length before batching. Long-running programs that don't halt within
+        ``max_steps`` simply return ``max_steps`` and get bucketed into the
+        longest bucket — the model will then run them to its own max-steps cap.
+
+        Notes:
+            * Reads from stdin are honored when ``set_stdin`` was called before
+              this method. Programs that read more bytes than available will
+              halt early (READ returns 0) — same behavior as a real run.
+            * Programs that loop forever (no EXIT, no bounded loop) cap at
+              ``max_steps``. Caller should treat that as "long bucket".
+            * This method does NOT reset DraftVM state — call on a fresh
+              instance, or save and restore state externally if you need to
+              keep using the same VM after prediction.
+
+        Args:
+            max_steps: hard cap on steps executed.
+
+        Returns:
+            Integer number of steps executed (in ``[0, max_steps]``).
+        """
+        steps = 0
+        while steps < max_steps:
+            if not self.step():
+                break
+            steps += 1
+            if self.halted:
+                break
+        return steps
+
     def draft_tokens(self):
         """Encode current state as 35 tokens."""
         tokens = []
