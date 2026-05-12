@@ -110,6 +110,16 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer10_carry_relay(attn, S, proxy, HD)
 
+    # Dim-ownership claims: L10 attn head 0 CARRY relay (AX marker → AX bytes).
+    #   W_v[0*HD + 1, CARRY + 1]  (CARRY[1] = ADD byte carry)
+    #   W_v[0*HD + 2, CARRY + 2]  (CARRY[2] = SUB byte borrow)
+    #   W_o[CARRY + 1, 0*HD + 1]
+    #   W_o[CARRY + 2, 0*HD + 2]
+    _claims = {
+        (10, "attn_W_v", "0_1", "CARRY+1"),
+        (10, "attn_W_v", "0_2", "CARRY+2"),
+    }
+
     return Operation(
         name="layer10_carry_relay_bake",
         phase=10.0,
@@ -119,6 +129,7 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -136,6 +147,17 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer10_byte_passthrough(attn, S, proxy, HD)
 
+    # Dim-ownership claims: L10 attn head 1 AX byte passthrough.
+    # ``byte_passthrough_chain`` writes V slots 0..31 + O writes OUTPUT_LO/HI:
+    #   W_v[1*HD + k, CLEAN_EMBED_LO + k]    for k=0..15
+    #   W_v[1*HD + 16 + k, CLEAN_EMBED_HI + k]  for k=0..15
+    #   W_o[OUTPUT_LO + k, 1*HD + k]         for k=0..15
+    #   W_o[OUTPUT_HI + k, 1*HD + 16 + k]    for k=0..15
+    _claims = set()
+    for k in range(16):
+        _claims.add((10, "attn_W_v", f"1_{k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((10, "attn_W_v", f"1_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer10_byte_passthrough_bake",
         phase=10.1,
@@ -147,6 +169,7 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -164,6 +187,14 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer10_sp_byte_passthrough(attn, S, proxy, HD)
 
+    # Dim-ownership claims: L10 attn head 2 SP byte passthrough.
+    #   W_v[2*HD + k, CLEAN_EMBED_LO + k]      for k=0..15
+    #   W_v[2*HD + 16 + k, CLEAN_EMBED_HI + k] for k=0..15
+    _claims = set()
+    for k in range(16):
+        _claims.add((10, "attn_W_v", f"2_{k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((10, "attn_W_v", f"2_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer10_sp_byte_passthrough_bake",
         phase=10.2,
@@ -175,6 +206,7 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -192,6 +224,14 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer10_psh_stack0_passthrough(attn, S, proxy, HD)
 
+    # Dim-ownership claims: L10 attn head 3 PSH STACK0 passthrough.
+    #   W_v[3*HD + k, CLEAN_EMBED_LO + k]      for k=0..15
+    #   W_v[3*HD + 16 + k, CLEAN_EMBED_HI + k] for k=0..15
+    _claims = set()
+    for k in range(16):
+        _claims.add((10, "attn_W_v", f"3_{k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((10, "attn_W_v", f"3_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer10_psh_stack0_passthrough_bake",
         phase=10.3,
@@ -203,6 +243,7 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -220,6 +261,14 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer10_stack0_byte_relay(attn, S, proxy, HD)
 
+    # Dim-ownership claims: L10 attn head 4 STACK0-byte-relay (→ ALU at AX byte).
+    #   W_v[4*HD + k, CLEAN_EMBED_LO + k]      for k=0..15
+    #   W_v[4*HD + 16 + k, CLEAN_EMBED_HI + k] for k=0..15
+    _claims = set()
+    for k in range(16):
+        _claims.add((10, "attn_W_v", f"4_{k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((10, "attn_W_v", f"4_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer10_stack0_byte_relay_bake",
         phase=10.4,
@@ -231,6 +280,7 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -263,6 +313,16 @@ def make_layer10_alu_op() -> Operation:
         bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        # Staleness invariants (Phase 3 / Agent G): L10 ALU consumes
+        # ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) at the AX
+        # marker for bitwise OR/XOR/AND + DIV/MOD setup. Both must be
+        # current-step fresh values.
+        consumes_fresh={
+            "ALU_LO": "AX_byte0",
+            "ALU_HI": "AX_byte0",
+            "AX_CARRY_LO": "AX_byte0",
+            "AX_CARRY_HI": "AX_byte0",
+        },
     )
 
 

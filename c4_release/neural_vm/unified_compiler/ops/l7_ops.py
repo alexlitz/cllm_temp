@@ -20,6 +20,18 @@ def make_layer7_operand_gather_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer7_operand_gather(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims: L7 attn heads 0 + 1 operand gather.
+    #   Head 0 V slot 1+k reads CLEAN_EMBED_LO+k (STACK0 byte 0 → ALU_LO at AX)
+    #   Head 0 V slot 17+k reads CLEAN_EMBED_HI+k (STACK0 byte 0 → ALU_HI at AX)
+    #   Head 1 V slot 1+k reads OUTPUT_LO+k (BP/SP OUTPUT → ALU_LO at AX for LEA/ADJ/ENT)
+    #   Head 1 V slot 17+k reads OUTPUT_HI+k
+    _claims = set()
+    for k in range(16):
+        _claims.add((7, "attn_W_v", f"0_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((7, "attn_W_v", f"0_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+        _claims.add((7, "attn_W_v", f"1_{1 + k}", f"OUTPUT_LO+{k}"))
+        _claims.add((7, "attn_W_v", f"1_{17 + k}", f"OUTPUT_HI+{k}"))
+
     return Operation(
         name="layer7_operand_gather",
         phase=7,
@@ -30,6 +42,15 @@ def make_layer7_operand_gather_op() -> Operation:
         bake_fn=bake,
         layer_idx=7,
         migrated=True,
+        claims=_claims,
+        # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
+        # L7 head 0 + head 1 produce the fresh in-step ALU_LO/HI at the AX
+        # marker (operand A for binary ops + LEA destination address).
+        # L8 ALU and L9 ALU consume these via their AX-marker reads.
+        produces={
+            "ALU_LO": "AX_byte0",
+            "ALU_HI": "AX_byte0",
+        },
     )
 
 
@@ -48,6 +69,30 @@ def make_layer7_memory_heads_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer7_memory_heads(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims: L7 memory heads 2-4 (gather prev AX bytes →
+    # ADDR_B*_LO/HI).
+    #   For head h in {2, 3, 4}:
+    #     W_v[h*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15
+    #     W_v[h*HD + 17 + k, CLEAN_EMBED_HI + k]   for k=0..15
+    #   Head 5: scalar relay flags, each at distinct V slot/column.
+    #   Head 6: scalar PSH/ENT/JSR relays.
+    #   Head 7: scalar MEM marker flag broadcast.
+    _claims = set()
+    for h in range(2, 5):
+        for k in range(16):
+            _claims.add((7, "attn_W_v", f"{h}_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+            _claims.add((7, "attn_W_v", f"{h}_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+    # Head 5 scalar relays (V slots 1..8 → distinct output dims).
+    _claims.add((7, "attn_W_v", "5_1", "OP_LI+0"))
+    _claims.add((7, "attn_W_v", "5_2", "OP_LC+0"))
+    _claims.add((7, "attn_W_v", "5_3", "OP_LEA+0"))
+    _claims.add((7, "attn_W_v", "5_8", "OP_JSR+0"))
+    # Head 7 MEM flag broadcast.
+    _claims.add((7, "attn_W_v", "7_1", "MEM_STORE+0"))
+    _claims.add((7, "attn_W_v", "7_2", "MEM_ADDR_SRC+0"))
+    _claims.add((7, "attn_W_v", "7_3", "OP_JSR+0"))
+    _claims.add((7, "attn_W_v", "7_4", "OP_ENT+0"))
+
     return Operation(
         name="layer7_memory_heads",
         phase=7,
@@ -60,6 +105,7 @@ def make_layer7_memory_heads_op() -> Operation:
         bake_fn=bake,
         layer_idx=7,
         migrated=True,
+        claims=_claims,
     )
 
 

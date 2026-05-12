@@ -42,6 +42,12 @@ def make_layer9_alu_op() -> Operation:
         bake_fn=bake,
         layer_idx=9,
         migrated=True,
+        # Staleness invariants: the L9 ALU consumes ALU_HI as operand A hi
+        # nibble at the AX marker. Produced by ``layer7_operand_gather`` (L7
+        # head 0 + head 1, phase=7) at AX byte 0.
+        consumes_fresh={
+            "ALU_HI": "AX_byte0",
+        },
     )
 
 
@@ -71,6 +77,16 @@ def make_layer9_lev_addr_relay_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer9_lev_addr_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims: L9 attn head 0 LEV addr relay.
+    #   W_v[0*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15
+    #   W_v[0*HD + 17 + k, CLEAN_EMBED_HI + k]   for k=0..15
+    #   W_o[ADDR_B0_LO + k, 0*HD + 1 + k]         for k=0..15
+    #   W_o[ADDR_B0_HI + k, 0*HD + 17 + k]        for k=0..15
+    _claims = set()
+    for k in range(16):
+        _claims.add((9, "attn_W_v", f"0_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((9, "attn_W_v", f"0_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer9_lev_addr_relay",
         phase=9.0,
@@ -81,6 +97,7 @@ def make_layer9_lev_addr_relay_op() -> Operation:
         bake_fn=bake,
         layer_idx=9,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -110,6 +127,16 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer9_lev_bp_to_pc_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims: L9 attn head 1 LEV BP→PC relay.
+    #   W_v[1*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15
+    #   W_v[1*HD + 17 + k, CLEAN_EMBED_HI + k]   for k=0..15
+    #   W_o[ADDR_B0_LO + k, 1*HD + 1 + k]         for k=0..15
+    #   W_o[ADDR_B0_HI + k, 1*HD + 17 + k]        for k=0..15
+    _claims = set()
+    for k in range(16):
+        _claims.add((9, "attn_W_v", f"1_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((9, "attn_W_v", f"1_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer9_lev_bp_to_pc_relay",
         phase=9.1,
@@ -120,6 +147,7 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         bake_fn=bake,
         layer_idx=9,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -308,6 +336,14 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
             attn.W_o[BD.OUTPUT_LO + k, base + 1 + k] = 1.0
             attn.W_o[BD.OUTPUT_HI + k, base + 17 + k] = 1.0
 
+    # Dim-ownership claims: L9 attn head 2 ALiBi mem attn.
+    # When enable=True, V slots 1..32 carry CLEAN_EMBED to OUTPUT.
+    _claims = set()
+    if enable:
+        for k in range(16):
+            _claims.add((9, "attn_W_v", f"2_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+            _claims.add((9, "attn_W_v", f"2_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer9_alibi_mem_attn",
         phase=9.2,  # after lev_addr_relay (9.0) and lev_bp_to_pc_relay (9.1)
@@ -319,6 +355,7 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         bake_fn=bake,
         layer_idx=9,
         migrated=True,
+        claims=_claims,
     )
 
 

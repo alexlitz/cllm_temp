@@ -11,6 +11,18 @@ def make_layer14_mem_generation_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer14_mem_generation(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims: L14 attn 8 heads MEM generation.
+    # Each head writes V slots 1..32 reading CLEAN_EMBED + OUTPUT.  For V
+    # slots, the CLEAN_EMBED column is the load-bearing "source" — the
+    # +OUTPUT addition just lets V pick up either side (marker or byte
+    # position). We claim only the CLEAN_EMBED rows (OUTPUT collisions on
+    # the same V slot are recurring in this op family and acceptable).
+    _claims = set()
+    for h in range(8):
+        for k in range(16):
+            _claims.add((14, "attn_W_v", f"{h}_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+            _claims.add((14, "attn_W_v", f"{h}_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer14_mem_generation",
         phase=14,
@@ -23,6 +35,7 @@ def make_layer14_mem_generation_op() -> Operation:
         layer_idx=14,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
     )
 
 

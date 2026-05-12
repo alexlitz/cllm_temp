@@ -21,6 +21,16 @@ def make_layer4_pc_relay_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer4_pc_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims: L4 attn heads 0 + 1 PC relay.
+    #   Head 0: V slots 1..32 read EMBED_LO/HI → EMBED_LO/HI at AX marker.
+    #   Head 1: V slots 1..32 read EMBED_LO/HI → TEMP[0..31] at AX byte pos.
+    _claims = set()
+    for k in range(16):
+        _claims.add((4, "attn_W_v", f"0_{1 + k}", f"EMBED_LO+{k}"))
+        _claims.add((4, "attn_W_v", f"0_{17 + k}", f"EMBED_HI+{k}"))
+        _claims.add((4, "attn_W_v", f"1_{1 + k}", f"EMBED_LO+{k}"))
+        _claims.add((4, "attn_W_v", f"1_{17 + k}", f"EMBED_HI+{k}"))
+
     return Operation(
         name="layer4_pc_relay",
         phase=4,
@@ -30,6 +40,7 @@ def make_layer4_pc_relay_op() -> Operation:
         bake_fn=bake,
         layer_idx=4,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -149,6 +160,22 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         # the 12-bit "top" convention used by `_inject_mem_metadata`.
         _stage_sp_byte(3, BD.BYTE_INDEX_1, BD.ADDR_B2_HI, None)
 
+    # Dim-ownership claims: L4 attn heads 2 + 3 SP-to-ADDR_KEY staging.
+    # Each head writes V slots 1..32 + O writes into ADDR_B*_HI sub-bands.
+    #   Head 2: SP byte 0 → ADDR_B0_HI (lo) + ADDR_B1_HI (hi).
+    #     W_v[2*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15
+    #     W_v[2*HD + 17 + k, CLEAN_EMBED_HI + k]   for k=0..15
+    #   Head 3: SP byte 1 → ADDR_B2_HI (lo only).
+    #     W_v[3*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15
+    # Only meaningful when enable=True; we declare claims unconditionally so
+    # the registry can catch latent collisions once the op is enabled.
+    _claims = set()
+    if enable:
+        for k in range(16):
+            _claims.add((4, "attn_W_v", f"2_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+            _claims.add((4, "attn_W_v", f"2_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+            _claims.add((4, "attn_W_v", f"3_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+
     return Operation(
         name="layer4_sp_to_addr_key",
         phase=4.5,  # after layer4_pc_relay (phase=4) so its writes don't clobber
@@ -159,4 +186,5 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         bake_fn=bake,
         layer_idx=4,
         migrated=True,
+        claims=_claims,
     )

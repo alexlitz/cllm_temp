@@ -31,6 +31,19 @@ def make_layer15_memory_lookup_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer15_memory_lookup(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims: L15 attn heads 0-3 (memory lookup).
+    # Each head writes V slots 32..47 + 48..63 reading CLEAN_EMBED_LO/HI:
+    #   W_v[h*HD + 32 + k, CLEAN_EMBED_LO + k]   for k=0..15
+    #   W_v[h*HD + 48 + k, CLEAN_EMBED_HI + k]   for k=0..15
+    # When num_heads >= 12 (LEV-aware build), heads 4-11 are also active;
+    # we restrict claims to heads 0-3 which are the universal load heads
+    # to keep the claim set stable across head-count configurations.
+    _claims = set()
+    for h in range(4):
+        for k in range(16):
+            _claims.add((15, "attn_W_v", f"{h}_{32 + k}", f"CLEAN_EMBED_LO+{k}"))
+            _claims.add((15, "attn_W_v", f"{h}_{48 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer15_memory_lookup",
         phase=15,
@@ -42,6 +55,7 @@ def make_layer15_memory_lookup_op() -> Operation:
         layer_idx=15,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
     )
 
 

@@ -42,6 +42,12 @@ def make_layer8_alu_op() -> Operation:
         # canonical in-step producer.
         consumes_fresh={
             "AX_CARRY_LO": "AX_byte0",
+            # ALU_LO at AX marker is the operand-A input to ADD/SUB/LEA.
+            # Produced by ``layer7_operand_gather`` (phase=7, L7 head 0 +
+            # head 1) at the AX byte 0 position. Without an in-step
+            # producer, ALU_LO would carry stale prev-step values, breaking
+            # binary-op semantics for any operand A computation.
+            "ALU_LO": "AX_byte0",
         },
     )
 
@@ -149,6 +155,14 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         attn.W_q[base + AX_MARKER_K_EXCLUDE, proxy.CONST] = -150.0
         attn.W_k[base + AX_MARKER_K_EXCLUDE, proxy.MARK_AX] = -50.0
 
+    # Dim-ownership claims: L8 attn head 3 multibyte fetch.
+    #   W_v[3*HD + 32 + k, CLEAN_EMBED_LO + k]  for k=0..15 (slot 32..47)
+    #   W_v[3*HD + 48 + k, CLEAN_EMBED_HI + k]  for k=0..15 (slot 48..63)
+    _claims = set()
+    for k in range(16):
+        _claims.add((8, "attn_W_v", f"3_{32 + k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((8, "attn_W_v", f"3_{48 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer8_multibyte_fetch_bake",
         phase=8.1,
@@ -159,6 +173,7 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=8,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -245,6 +260,14 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer8_sp_gather(attn, S, proxy, HD)
 
+    # Dim-ownership claims: L8 attn heads 0-2 SP gather (SP bytes → ADDR_B*).
+    # Each head writes V slots 1..32 reading CLEAN_EMBED_LO/HI.
+    _claims = set()
+    for h in range(3):
+        for k in range(16):
+            _claims.add((8, "attn_W_v", f"{h}_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+            _claims.add((8, "attn_W_v", f"{h}_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer8_sp_gather_bake",
         phase=8.0,
@@ -258,6 +281,7 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=8,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -396,6 +420,18 @@ def make_layer8_op_imm_relay_op() -> Operation:
         attn8.W_q[base + GATE4, BD.CONST] = -500.0
         attn8.W_k[base + GATE4, BD.CONST] = 5.0
 
+    # Dim-ownership claims: L8 attn head 4 OP_IMM relay.
+    #   W_q[4*HD, IS_BYTE], W_q[4*HD, H1+AX_I], W_q[4*HD, CONST]
+    #   W_k[4*HD, MARK_AX], W_k[4*HD, IS_BYTE], W_k[4*HD, CONST]
+    #   W_v[4*HD, OP_IMM]
+    #   W_o[OP_IMM, 4*HD]
+    #   GATE4 = 1 sub-head: W_q[4*HD+1, IS_BYTE], W_q[4*HD+1, CONST]
+    #                       W_k[4*HD+1, CONST]
+    _claims = {
+        (8, "attn_W_v", "4_0", "OP_IMM+0"),
+        (8, "attn_W_o", "4_0", "OP_IMM+0"),
+    }
+
     return Operation(
         name="layer8_op_imm_relay",
         reads={"IS_BYTE", "H1", "MARK_AX", "OP_IMM", "CONST"},
@@ -405,6 +441,7 @@ def make_layer8_op_imm_relay_op() -> Operation:
         layer_idx=8,
         phase=8.4,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -584,6 +621,21 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
             attn.W_o[BD.ALU_LO + k, base + 1 + k] = SCALE_O
             attn.W_o[BD.ALU_HI + k, base + 17 + k] = SCALE_O
 
+    # Dim-ownership claims: L8 attn head 5 mem-to-ALU.
+    # Only claim load-bearing V/O slot/column pairs (not the dense Q/K gates
+    # which are head-local and unlikely to collide with other ops).
+    #   W_v[5*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15 (V slot 1..16)
+    #   W_v[5*HD + 17 + k, CLEAN_EMBED_HI + k]   for k=0..15 (V slot 17..32)
+    #   W_o[ALU_LO + k, 5*HD + 1 + k]            for k=0..15
+    #   W_o[ALU_HI + k, 5*HD + 17 + k]           for k=0..15
+    # Conditional on enable=True; declared unconditionally so the registry
+    # catches latent collisions once the op is enabled.
+    _claims = set()
+    if enable:
+        for k in range(16):
+            _claims.add((8, "attn_W_v", f"5_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+            _claims.add((8, "attn_W_v", f"5_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer8_mem_to_alu",
         # Phase 8.45 places this after layer8_op_imm_relay (8.4) and BEFORE
@@ -605,6 +657,7 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         bake_fn=bake,
         layer_idx=8,
         migrated=True,
+        claims=_claims,
     )
 
 

@@ -18,6 +18,16 @@ def make_layer13_mem_addr_gather_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer13_mem_addr_gather(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims: L13 attn heads 0-2 mem addr gather. Each head
+    # writes V slots 1..32 reading CLEAN_EMBED_LO/HI:
+    #   W_v[h*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15
+    #   W_v[h*HD + 17 + k, CLEAN_EMBED_HI + k]   for k=0..15
+    _claims = set()
+    for h in range(3):
+        for k in range(16):
+            _claims.add((13, "attn_W_v", f"{h}_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+            _claims.add((13, "attn_W_v", f"{h}_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+
     return Operation(
         name="layer13_mem_addr_gather",
         phase=13,
@@ -30,6 +40,7 @@ def make_layer13_mem_addr_gather_op() -> Operation:
         bake_fn=bake,
         layer_idx=13,
         migrated=True,
+        claims=_claims,
     )
 
 
@@ -74,6 +85,16 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         bake_fn=bake,
         layer_idx=13,
         migrated=True,
+        # Staleness invariants: L13 shift FFN consumes ALU_LO/HI (value to
+        # shift) and AX_CARRY_LO (shift amount) at the AX marker for
+        # OP_SHL / OP_SHR. Only meaningful when alu_mode='lookup' fires the
+        # bake; in efficient mode the composite owns the consumes-fresh
+        # chain via its own stages.
+        consumes_fresh={
+            "ALU_LO": "AX_byte0",
+            "ALU_HI": "AX_byte0",
+            "AX_CARRY_LO": "AX_byte0",
+        } if alu_mode == "lookup" else {},
     )
 
 
