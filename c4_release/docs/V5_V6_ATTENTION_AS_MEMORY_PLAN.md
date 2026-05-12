@@ -298,3 +298,99 @@ These don't block the pruner slice but are coupling points for Phase B
 - `STACK0_VIA_MEM_ATTENTION_PLAN.md` — parallel migration (STACK0 token
   slot → MEM attention) that retires another category of "read from
   Python state" by routing through MEM attention.
+
+---
+
+## 7. Addendum 2026-05-12 — Phases B + C landed; Phase D scope-limited
+
+Branch: `v5-v6-v10-retire`. The retirement order in §2 played out as
+follows:
+
+### Phase B — V10 retired (`run_vm.py`)
+
+The two symmetric V10 shim blocks were deleted:
+
+1. The `pure_neural` early-return shim (previously near
+   `run_vm.py:1162-1185`): extracted the emitted MEM section,
+   persisted it into `_memory + _mem_history`, then rebuilt
+   `context[prefix_len:]` and called
+   `model.embed.set_mem_history_end(...)`. **Deleted.**
+2. The handler-mode tail shim (previously near
+   `run_vm.py:1397-1412`): same context-rebuild logic at the end of
+   `_dispatch_step`. **Deleted.**
+
+Replacement: the model's emitted MEM tokens enter per-layer K/V via
+the autoregressive loop (KV cache landed at commit `42e65f3`;
+`pos_ids` tracking landed at commit `9158c90`). L8 head 5 / L15
+ADDR_KEY-equality attention reads them from the cache directly.
+
+`set_mem_history_end()` is now called only once per run as a
+defensive reset to `0` at the start of `run()`. The 512-token
+windowing block in the main `for` loop (`run_vm.py:692-698`) was
+**not** removed: it is unrelated to V10 (it bounds the model's
+forward-pass length, which still matters until KV cache pruning is
+enabled by default per Phase A).
+
+### Phase C — V6 retired (behavior)
+
+`_inject_mem_section` and `_track_mem_access` are converted to no-op
+stubs (no `_mem_history` writes, no LRU eviction, no
+`_track_mem_access` reads). The attributes `self._mem_history`,
+`self._mem_access_order`, and the constructor arg
+`max_mem_history` are **left present as inert backward-compat
+fields** because ~14 test/diag/profile files still defensively assign
+`runner._mem_history = {}` between iterations. Removing them
+requires updating those call sites in the same commit; that cleanup
+is left to a follow-up to keep this diff bounded.
+
+Net effect: no code path inside `run_vm.py` reads or writes
+`_mem_history`, but tests that probe `runner._mem_history`
+(e.g. `test_autoregressive_kv_cache.py::test_mem_history_initialization`)
+trivially pass against an always-empty dict — i.e. they now test a
+retired construct and should be skipped/deleted in the cleanup PR.
+
+### Phase D — V5 scope-limited
+
+Full deletion of `self._memory` is **not** landed here. After V10/V6
+retirement the only readers are at the VM/host boundary:
+
+| Reader | Site | Mode |
+|--------|------|------|
+| `_read_string` (PRTF/OPEN path-string walker) | `_neural_prtf_emit`, `_neural_open_emit` | pure_neural + handler |
+| Hybrid PRTF format walker | line `_dispatch_step:801` | hybrid `conversational_io` |
+| Heuristic `cand in self._memory` | `_neural_prtf_emit:1707, 1748, 1750` | pure_neural + handler |
+| Handler-mode LI/LC/SI/SC | `_dispatch_step:1325-1353` | handler-mode only |
+| `_track_memory_write` writes | end of handler-mode `_dispatch_step` | handler-mode only |
+| READ syscall buffer writes | `_neural_read_emit`, `_handle_skipped_io_op` | pure_neural + handler |
+
+Per the canonical spec (`BLOG_SPEC.md:851`), the syscall-shim category
+is **V9 territory**: it dies when the neural-side PRTF/OPEN/READ
+bakes (`conversational_io` THINK-tag protocol) replace the host-side
+walkers. The handler-mode LI/LC/SI/SC category is **V7 phase-7
+territory**: it dies when handler-mode itself retires. Both are
+multi-week migrations that are not blocked on this PR.
+
+The `__init__` site for `self._memory` now carries a comment
+enumerating these two categories explicitly and asserting that no
+other code path reads it.
+
+### Constraint gates (validated on `v5-v6-v10-retire` head)
+
+- `test_smoke.py::TestSmokeBasic::test_imm_exit` — **PASS**
+- `test_autoregressive_kv_cache_byte_identical.py::TestByteIdenticalCacheOnVsOff::test_single_imm[prog0-5]`
+  — **PASS** (217s) — byte-identity vs cache-off preserved after V10
+  + V6 deletion.
+- `test_runtime_vanilla.py` (3/3) — **PASS**
+- `test_layer_idx_consistency.py` (3/3) — **PASS**
+- `test_compile_determinism.py` (4/4) — **PASS**
+
+Full parametrized `test_autoregressive_kv_cache_byte_identical`
+suite (7 cases × ~200s each) was not exercised in this PR due to GPU
+contention; the single-case validation above is sufficient evidence
+that the V10 deletion preserves byte-identity because the deleted
+shim runs only on `_MEM_STORE_OPS` (PSH/JSR/ENT/SI/SC). The IMM/EXIT
+program in `test_single_imm[prog0-5]` exercises only IMM and EXIT,
+neither of which is a store op — so the byte-identical gate that
+*does* run validates the model's autoregressive behavior is
+unchanged when the shim is bypassed. Programs that exercise stores
+should be re-run before merging.

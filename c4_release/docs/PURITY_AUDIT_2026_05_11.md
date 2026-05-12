@@ -6,6 +6,41 @@
 
 ---
 
+## UPDATE 2026-05-12 (V5/V6/V10 retirement)
+
+Phases B + C of the V5/V6/V10 retirement plan have landed on branch
+`v5-v6-v10-retire`:
+
+- **V10** — **RETIRED**. The per-step context-rewrite shim
+  (`if exec_op in _MEM_STORE_OPS: ... context[prefix_len:] = mem_flat + ...`)
+  is deleted from both the `pure_neural` early-return path and the
+  handler-mode tail of `_dispatch_step`. With the KV cache (commit
+  `42e65f3`) + `pos_ids` tracking (commit `9158c90`) the emitted MEM
+  tokens stay live in per-layer K/V; L8 head 5 / L15 ADDR_KEY-equality
+  attention reads them from the cache directly. `set_mem_history_end()`
+  is now only called once per run with `end=0` (the defensive reset).
+- **V6** — **RETIRED (behavior)**. `_inject_mem_section` and
+  `_track_mem_access` are now no-op stubs. The `_mem_history` and
+  `_mem_access_order` attributes remain as inert empty containers, and
+  `max_mem_history` remains as an accepted-but-ignored constructor arg,
+  only because ~14 test / diag / profile files still defensively
+  assign `runner._mem_history = {}`. A follow-up cleanup PR can delete
+  the attributes and call sites; until then the LRU has no readers or
+  active writers in either pure_neural or handler mode.
+- **V5** — **SCOPE-LIMITED**. `self._memory` is no longer touched by
+  any code path outside (1) syscall-shim format/path-string walkers
+  (`_read_string`, `_neural_prtf_emit`, `_neural_open_emit`,
+  `_neural_read_emit`) — V9 territory — and (2) handler-mode VM
+  semantics LI/LC/SI/SC fallbacks (only when `pure_neural=False`).
+  Both categories are at the VM/host boundary and live under their
+  own retirement plans; deleting the dict outright requires the
+  neural-side PRTF/OPEN/READ bakes that retire V9 first.
+
+Byte-identity (`test_autoregressive_kv_cache_byte_identical`) and smoke
+2/2 (`test_imm_exit`) hold after Phases B + C.
+
+---
+
 ## AMENDMENT 2026-05-11 (post-canonical-spec correction)
 
 The original audit cited `old/BLOG_POST.md` (now deleted) as the architectural

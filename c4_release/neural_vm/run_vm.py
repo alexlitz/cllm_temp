@@ -304,10 +304,21 @@ class AutoregressiveVMRunner:
         self._heap_ptr = 0x10000  # Current allocation pointer
         self._alloc_sizes = {}  # addr → size (for FREE zero-fill)
 
-        # Shadow memory: sparse dict tracking all stores (PSH, SI, SC, etc.)
-        # Enables runner-side syscalls to read stack arguments beyond STACK0.
-        # All entries are byte-granularity (addr → uint8).
-        self._memory = {}  # addr → byte value
+        # V5 SCOPE-LIMITED (2026-05-12): ``_memory`` (addr → uint8) is the
+        # runner-side shadow byte memory. After V10 retire it has TWO
+        # remaining categories of readers, both at the VM/host boundary:
+        #   1. Syscall-shim format/path-string walkers
+        #      (`_read_string`, `_neural_prtf_emit`,
+        #      `_neural_open_emit`) — these resolve the C-string at a
+        #      pointer baked into the bytecode. V9 territory; will
+        #      retire when the conversational-IO neural-side PRTF/OPEN
+        #      bake replaces the host-side walker.
+        #   2. Handler-mode VM-semantic LI/LC/SI/SC fallbacks
+        #      (`_dispatch_step` handler branch) — only reached when
+        #      ``pure_neural=False``. Phase-7 territory.
+        # No code path outside (1) and (2) reads ``_memory``. In
+        # pure_neural mode only (1) is active.
+        self._memory = {}
 
         # SP tracking for multi-byte correctness (PSH/ADJ handlers use this)
         self._last_sp = 0
@@ -327,25 +338,31 @@ class AutoregressiveVMRunner:
         self._debug_lev = debug_ent_lev
         self._debug_memory = debug_memory
 
-        # KV cache parameters for memory history eviction
-        # When use_kv_cache=True, _mem_history tracks unique memory addresses accessed
-        # and evicts oldest entries when exceeding max_mem_history (LRU eviction)
+        # KV cache (autoregressive K/V reuse).
         #
         # ``torch.compile`` interaction: the per-layer KV cache mutates
         # ``layer_cache.cached_k / cached_v`` in place from Python, which
-        # ``torch.compile`` cannot trace cleanly (it would produce a fresh
-        # subgraph per cache-update and re-tracing on every step). When a
-        # ``compile_mode`` is active we therefore disable the incremental
-        # KV-cache fast path and let each forward call process the full
-        # token sequence — the compiled graph reuses the same CUDA-graph
-        # capture across calls of equal shape, which is the much larger win.
+        # ``torch.compile`` cannot trace cleanly. When a ``compile_mode`` is
+        # active we therefore disable the incremental KV-cache fast path
+        # and let each forward call process the full token sequence — the
+        # compiled graph reuses the same CUDA-graph capture across calls.
         if compile_mode and compile_mode != "none":
             self.use_kv_cache = False
         else:
             self.use_kv_cache = use_kv_cache
+        # V6 RETIRED (2026-05-12): ``_mem_history`` (addr → 9-token MEM
+        # section) and its LRU companion ``_mem_access_order`` previously
+        # held a Python-side mirror of past stores that the V10 shim
+        # re-emitted into the live context every step. With V10 retired
+        # the LRU has no readers; the attributes remain as empty dicts /
+        # lists only because external diag/profile scripts still assign
+        # ``runner._mem_history = {}`` defensively. ``max_mem_history``
+        # is retained as an accepted-but-ignored constructor arg for the
+        # same reason (existing tests pass it through). All three are
+        # slated for full deletion once those call sites migrate.
         self.max_mem_history = max_mem_history
-        self._mem_history = {}  # addr → token sequence for memory value
-        self._mem_access_order = []  # LRU tracking: most recent at end
+        self._mem_history = {}
+        self._mem_access_order = []
 
         # If True: disable runner VM-memory emulation paths and only allow
         # explicit external tool boundary handling.
@@ -1249,41 +1266,16 @@ class AutoregressiveVMRunner:
             elif exec_op == Opcode.READ:
                 self._neural_read_emit(context)
 
-            # MEM persistence shim (Phase 7, 2026-05-10): for store ops
-            # (SI/SC/PSH/JSR/ENT), extract the MEM section emitted by the
-            # neural network in the just-completed step and persist it into
-            # _memory + _mem_history so subsequent steps can read it back.
-            #
-            # Without this shim, MEM tokens only live in raw context — when
-            # context grows past the 512-token window, they get truncated and
-            # any later LI/LC for the same address reads zero. The non-
-            # pure_neural branch handles this via _extract_mem_section +
-            # _track_mem_access at lines below; the pure_neural early return
-            # used to skip both.
-            if exec_op in _MEM_STORE_OPS:
-                mem_section = self._extract_mem_section(context)
-                if mem_section is not None:
-                    addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
-                    value = sum((mem_section[5 + j] & 0xFF) << (j * 8) for j in range(4))
-                    # Persist value bytes into _memory so SI/SC value bytes are
-                    # available to LI/LC handlers (none run in pure_neural, but
-                    # keeping _memory consistent helps debugging / inspection).
-                    for j in range(4):
-                        self._memory[(addr + j) & 0xFFFFFFFF] = (value >> (j * 8)) & 0xFF
-                    # Persist into _mem_history so the next step's context
-                    # rebuild includes this MEM section (L15 attention reads
-                    # from _mem_history-derived MEM tokens for LI/LC).
-                    self._track_mem_access(addr, mem_section)
-
-                    # Rebuild context with persisted MEM history so the next
-                    # step's L15 lookup can find this MEM section. Mirrors the
-                    # rebuild done in the non-pure_neural branch (see below).
-                    last_step = context[-(Token.STEP_TOKENS):]
-                    mem_flat = []
-                    for tokens in self._mem_history.values():
-                        mem_flat.extend(tokens)
-                    context[prefix_len:] = mem_flat + list(last_step)
-                    self.model.embed.set_mem_history_end(prefix_len + len(mem_flat))
+            # V10 RETIRED (2026-05-12): the runner-side MEM persistence
+            # shim previously extracted the just-emitted MEM section into
+            # ``_memory``/``_mem_history`` and rewrote
+            # ``context[prefix_len:]`` so L15 could re-find historical MEM
+            # sections. With the KV cache landed (commit 42e65f3) +
+            # pos_ids tracking (commit 9158c90) the model's emitted MEM
+            # tokens already populate per-layer K/V; L8 head 5 / L15
+            # ADDR_KEY-equality attention reads them from the cache
+            # directly. Per BLOG_SPEC.md line 3 — "no auxiliary memory or
+            # python variables".
 
             # Only break on EXIT
             return exec_op == Opcode.EXIT
@@ -1495,22 +1487,17 @@ class AutoregressiveVMRunner:
         # MoE routing is tensor-native (see neural_vm.pure_moe.SoftMoEFFN);
         # no per-step weight swap is needed between forward calls.
 
-        if exec_op in _MEM_STORE_OPS:
-            mem_section = self._extract_mem_section(context)
-            if mem_section is not None:
-                addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
-                self._track_mem_access(addr, mem_section)
+        # V10 RETIRED (2026-05-12): the handler-mode MEM persistence shim
+        # previously rebuilt ``context[prefix_len:]`` from ``_mem_history``
+        # every step + called ``set_mem_history_end``. With the KV cache
+        # the emitted MEM tokens stay in per-layer K/V; L15 reads them
+        # from the cache directly. The runner no longer windows / rewrites
+        # the dynamic context. Per BLOG_SPEC.md line 3.
 
         if exec_op == Opcode.EXIT:
             self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
             return True
 
-        last_step = context[-(Token.STEP_TOKENS):]
-        mem_flat = []
-        for tokens in self._mem_history.values():
-            mem_flat.extend(tokens)
-        context[prefix_len:] = mem_flat + list(last_step)
-        self.model.embed.set_mem_history_end(prefix_len + len(mem_flat))
         return False
 
     def _build_context(self, bytecode, data, argv, stdin=""):
@@ -2078,52 +2065,31 @@ class AutoregressiveVMRunner:
             self._memory[addr + i] = (value >> (i * 8)) & 0xFF
 
     def _inject_mem_section(self, addr, value):
-        """Inject a MEM section into _mem_history for L15 lookup.
+        """V6 RETIRED (2026-05-12): no-op.
 
-        This bridges the gap between handler-corrected memory and neural L15:
-        - Handlers know the correct addr/value (from tracking state)
-        - L15 reads from MEM sections in context (which may have wrong neural output)
-        - This injects a corrected MEM section so L15 can find the right data
-
-        MEM section format: [MEM, a0, a1, a2, a3, v0, v1, v2, v3]
+        Previously appended a synthetic 9-token MEM section to the
+        runner-side ``_mem_history`` LRU so the (V10) context-rewrite
+        could re-emit it for L15 attention. With V10 retired the LRU
+        has no readers; this method is kept as a no-op only to avoid
+        having to delete the ~6 handler-mode call sites in this file
+        in the same commit. Subsequent cleanup may delete the callers
+        and this stub.
         """
-        addr = addr & 0xFFFFFFFF
-        value = value & 0xFFFFFFFF
-        mem_section = [
-            Token.MEM,
-            (addr >> 0) & 0xFF,
-            (addr >> 8) & 0xFF,
-            (addr >> 16) & 0xFF,
-            (addr >> 24) & 0xFF,
-            (value >> 0) & 0xFF,
-            (value >> 8) & 0xFF,
-            (value >> 16) & 0xFF,
-            (value >> 24) & 0xFF,
-        ]
-        self._track_mem_access(addr, mem_section)
         if self._debug_memory:
-            print(f"  [MEM INJECT] addr=0x{addr:08x}, value=0x{value:08x}", flush=True)
+            print(
+                f"  [MEM INJECT noop] addr=0x{addr & 0xFFFFFFFF:08x}, "
+                f"value=0x{value & 0xFFFFFFFF:08x}",
+                flush=True,
+            )
 
     def _track_mem_access(self, addr, mem_section):
-        """Track memory access with LRU eviction when exceeding max_mem_history.
+        """V6 RETIRED (2026-05-12): no-op.
 
-        Args:
-            addr: Memory address accessed
-            mem_section: 9-token MEM section [Token.MEM, addr_bytes[4], value_bytes[4]]
+        Previously evicted oldest entries via LRU when
+        ``len(_mem_history) > max_mem_history``. With V10 retired,
+        ``_mem_history`` has no readers and no writers.
         """
-        # Update LRU order: remove if exists, then append to end (most recent)
-        if addr in self._mem_access_order:
-            self._mem_access_order.remove(addr)
-        self._mem_access_order.append(addr)
-
-        # Store the memory section
-        self._mem_history[addr] = mem_section
-
-        # LRU eviction: remove oldest entries if exceeding max_mem_history
-        while len(self._mem_history) > self.max_mem_history and self.max_mem_history > 0:
-            oldest_addr = self._mem_access_order.pop(0)
-            if oldest_addr in self._mem_history:
-                del self._mem_history[oldest_addr]
+        return
 
     def _mem_load_word(self, addr):
         """Load a 32-bit value from 4 little-endian bytes in shadow memory."""
