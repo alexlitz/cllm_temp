@@ -282,19 +282,14 @@ def prune_kv_cache(
     if not victims:
         return stats
 
-    # 4. Build keep-mask + apply uniformly across layers.
+    # 4. Build keep-mask + delegate the layer-uniform apply to LayerKVCache.
+    # Spec §3.3: keep-mask must be identical across layers. The
+    # ``LayerKVCache.prune`` API is the single chokepoint that enforces
+    # that invariant and keeps ``cached_pos_ids`` in lock-step with K/V.
     keep = [p for p in range(cache_size) if p not in victims]
     device = layer0.cached_k.device
     keep_idx = torch.tensor(keep, dtype=torch.long, device=device)
+    new_size = kv_cache.prune(keep_idx)
 
-    for c in kv_cache.caches:
-        if c.cached_k is None:
-            continue
-        c.cached_k = c.cached_k.index_select(2, keep_idx).contiguous()
-        c.cached_v = c.cached_v.index_select(2, keep_idx).contiguous()
-        c.cache_size = len(keep)
-        c.stats.current_size = c.cache_size
-        c.stats.tokens_evicted += (cache_size - len(keep))
-
-    stats.final_size = len(keep)
+    stats.final_size = new_size
     return stats

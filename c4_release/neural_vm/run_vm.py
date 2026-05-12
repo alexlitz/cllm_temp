@@ -157,6 +157,10 @@ class AutoregressiveVMRunner:
         pure_neural=False,
         cache_model=True,
         enable_neural_io_think_protocol=False,
+        enable_kv_cache_pruning=False,
+        kv_cache_pruning_min_size=256,
+        kv_cache_pruning_tau=0.99,
+        kv_cache_pruning_eps=1e-6,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -281,6 +285,20 @@ class AutoregressiveVMRunner:
         self._neural_io_collecting_byte = False
         self._pure_attention_report = {}
 
+        # KV cache pruning (KV_CACHE_PRUNING_SPEC.md §2.1 + §2.2).
+        # Defaults OFF: byte-identity vs cache-off requires no pruning.
+        # When enabled, ``run()`` invokes ``prune_kv_cache`` at every
+        # STEP_END boundary (cheap because the pruner short-circuits when
+        # ``cache_size <= min_cache_size``).
+        self.enable_kv_cache_pruning = bool(enable_kv_cache_pruning)
+        self.kv_cache_pruning_min_size = int(kv_cache_pruning_min_size)
+        self.kv_cache_pruning_tau = float(kv_cache_pruning_tau)
+        self.kv_cache_pruning_eps = float(kv_cache_pruning_eps)
+        # Per-run stats counter for visibility / debugging.
+        self._kv_pruning_stats = {"calls": 0, "evicted_total": 0,
+                                  "evicted_by_similarity": 0,
+                                  "evicted_by_zero_v": 0}
+
     # Maximum number of consecutive incremental forward calls before flushing
     # the KV cache. Empirically, the c4 VM model's L15 (memory-lookup) attention
     # uses very steep softmax that amplifies float non-associativity in the
@@ -341,6 +359,65 @@ class AutoregressiveVMRunner:
             i += 1
         return i
 
+    def _maybe_prune_kv_cache(self, context, prefix_len):
+        """Run the two-rule KV pruner at a STEP_END boundary.
+
+        No-op unless ``self.enable_kv_cache_pruning`` and the cache exists.
+
+        Note on the prefix-reuse mirror: the runner tracks
+        ``_kv_cached_tokens`` as a *dense* list whose i-th entry is the
+        token at cache index ``i``. Pruning removes middle positions, so
+        the cache is no longer a strict prefix of the runner's context.
+        The cleanest way to preserve correctness without rewriting the
+        prefix-match logic is to invalidate the runner-side mirror after
+        a pruning event (forcing a full rebuild on the next forward).
+        This trades a one-step cache miss for the memory savings of the
+        prune. ``cached_pos_ids`` still survives in the underlying
+        ``LayerKVCache`` for any future call paths that want to use
+        position-aware reuse.
+        """
+        if not self.enable_kv_cache_pruning:
+            return
+        if self._kv_cache_obj is None:
+            return
+        layer0 = self._kv_cache_obj.caches[0] if self._kv_cache_obj.caches else None
+        if layer0 is None or layer0.cached_k is None:
+            return
+        if layer0.cache_size <= self.kv_cache_pruning_min_size:
+            return
+
+        from .kv_cache_pruning import prune_kv_cache
+
+        # The pruner needs a token-id sequence aligned with the K/V sequence
+        # axis. We feed ``_kv_cached_tokens`` which is the runner's
+        # ground-truth mirror of "what's in the cache, in order".
+        cache_seq = self._kv_cached_tokens
+        if len(cache_seq) < layer0.cache_size:
+            # Defensive: skip when the mirror is out-of-sync with the
+            # tensor (shouldn't happen, but better than a crash).
+            return
+
+        stats = prune_kv_cache(
+            self._kv_cache_obj,
+            cache_seq,
+            prefix_len=prefix_len,
+            tau=self.kv_cache_pruning_tau,
+            eps=self.kv_cache_pruning_eps,
+            min_cache_size=self.kv_cache_pruning_min_size,
+        )
+
+        if stats.total_evicted > 0:
+            self._kv_pruning_stats["calls"] += 1
+            self._kv_pruning_stats["evicted_total"] += stats.total_evicted
+            self._kv_pruning_stats["evicted_by_similarity"] += stats.evicted_by_similarity
+            self._kv_pruning_stats["evicted_by_zero_v"] += stats.evicted_by_zero_v
+            # Invalidate the prefix-match mirror: the cache is no longer a
+            # contiguous prefix of the context. ``_kv_cached_tokens=[]``
+            # forces the next ``_kv_common_prefix_len`` to return 0, which
+            # triggers a full cache rebuild. We also clear the underlying
+            # cache to keep the two in lockstep.
+            self._reset_kv_cache()
+
     def _trim_kv_cache(self, keep_len):
         """Trim per-layer caches to ``keep_len`` positions.
 
@@ -359,11 +436,20 @@ class AutoregressiveVMRunner:
             if keep_len <= 0:
                 layer_cache.cached_k = None
                 layer_cache.cached_v = None
+                layer_cache.cached_pos_ids = None
                 layer_cache.cache_size = 0
+                layer_cache.next_pos_id = 0
             else:
                 layer_cache.cached_k = layer_cache.cached_k[:, :, :keep_len, :]
                 layer_cache.cached_v = layer_cache.cached_v[:, :, :keep_len, :]
+                if layer_cache.cached_pos_ids is not None:
+                    layer_cache.cached_pos_ids = layer_cache.cached_pos_ids[:, :keep_len]
                 layer_cache.cache_size = keep_len
+                # Rewind the next-position counter so subsequent appends
+                # continue contiguously from ``keep_len``. The cache mirror
+                # is a strict prefix here (trim only removes the tail), so
+                # positions stay 0..keep_len-1.
+                layer_cache.next_pos_id = keep_len
         # Also trim the tracking list.
         self._kv_cached_tokens = self._kv_cached_tokens[:keep_len]
 
@@ -668,6 +754,11 @@ class AutoregressiveVMRunner:
                 exec_idx = self._exec_pc() // INSTR_WIDTH
                 if self._dispatch_step(context, bytecode, exec_idx, prefix_len, output):
                     break
+
+                # STEP_END boundary is the natural place to invoke KV cache
+                # pruning (KV_CACHE_PRUNING_SPEC.md §3.2). No-op unless
+                # ``enable_kv_cache_pruning=True`` was passed to ``__init__``.
+                self._maybe_prune_kv_cache(context, prefix_len)
 
             elif next_token == Token.TOOL_CALL:
                 # FIX 2026-05-09: In pure_neural mode, do NOT run any Python-side
