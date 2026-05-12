@@ -259,6 +259,13 @@ def all_core_ops(
         # boosting OUTPUT_*[0] at AX byte positions 1-3 when OP_LC_RELAY is
         # active. Mirrors the JSR variant above. Unblocks test_sc_then_lc.
         make_layer14_lc_ax_bytes_zero_op(),
+        # Non-carry ALU bytes 1-3 zeroing (V7 Block 13, per
+        # V7_HEAP_OPS_NEURAL_PLAN.md §2): for AND/OR/XOR/SHR the result is
+        # byte-sized so AX bytes 1-3 must be 0. Mirrors the JSR/LC variants.
+        # Gates on TEMP[7] (NOCARRY_ALU_OP relay added to L7 head 5 V slot 9
+        # in the same commit). Backup for the L10 BinaryOpByteZeroingPostOp
+        # against downstream L11-L14 contamination.
+        make_layer14_alu_nocarry_ax_bytes_zero_op(),
         make_layer15_memory_lookup_op(),
         make_layer15_nibble_copy_op(),
         make_layer16_lev_routing_op(),

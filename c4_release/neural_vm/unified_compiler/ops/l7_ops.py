@@ -53,9 +53,19 @@ def make_layer7_memory_heads_op() -> Operation:
         phase=7,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "OP_LI", "OP_LC", "OP_PSH", "OP_SI", "OP_SC",
+               # V7 Block 13 (2026-05-12): head 5 now reads OP_AND/OP_OR/OP_XOR
+               # /OP_SHR for the new V slot 9 (NOCARRY_ALU_OP relay → TEMP[7])
+               # used by ``_set_layer14_alu_nocarry_ax_bytes_zero``.
+               "OP_AND", "OP_OR", "OP_XOR", "OP_SHR",
+               "OP_JSR",  # head 5 V slot 8 (existing, declared for completeness)
                "AX_CARRY_LO", "AX_CARRY_HI", "TEMP"},
         writes={"OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP",
-                "TEMP", "ADDR_KEY"},
+                "TEMP", "ADDR_KEY",
+                # V7 Block 13 (2026-05-12): head 5 V slot 9 writes the
+                # NOCARRY_ALU_OP relay to TEMP[7]. (TEMP is already in writes
+                # but listed here for clarity.) Head 5 also writes the OP_JSR
+                # relay back to OP_JSR at AX byte positions (added 2026-05-12).
+                "OP_JSR"},
         kind="block",
         bake_fn=bake,
         layer_idx=7,
