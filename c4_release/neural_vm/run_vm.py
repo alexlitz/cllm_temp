@@ -177,6 +177,7 @@ class AutoregressiveVMRunner:
         enable_divergence_bail=True,
         compile_mode=None,
         spec_k=0,
+        enable_cuda_graphs=False,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -232,11 +233,23 @@ class AutoregressiveVMRunner:
                 the model emission overrides any mismatching draft (the model
                 is the final arbiter). Recommended starting point: ``spec_k=8``
                 (matches :class:`BatchedPureNeuralRunner`'s default for the
-                1098 suite). Non-pure_neural runners fall back to the legacy
-                path even when ``spec_k > 0``: the Python-side overrides in
-                ``_dispatch_step`` require per-token inspection, which
-                speculation would break.
+                1098 suite).
+            enable_cuda_graphs: Opt-in flag for manual CUDA-graph capture
+                of the per-step forward. Currently a stub: setting True raises
+                ``NotImplementedError``. The exploratory benchmark in
+                ``c4_release/neural_vm/cuda_graph_bench.py`` found that
+                manual capture is ~3× **slower** than eager for this model
+                (compute-bound). See ``c4_release/docs/CUDA_GRAPHS_MULTI_STEP.md``.
         """
+        if enable_cuda_graphs:
+            raise NotImplementedError(
+                "AutoregressiveVMRunner: enable_cuda_graphs=True is a stub. "
+                "Manual CUDA-graph capture was prototyped and found to be "
+                "slower than eager forward on this model (compute-bound). "
+                "See c4_release/docs/CUDA_GRAPHS_MULTI_STEP.md for the "
+                "investigation and tradeoff analysis."
+            )
+        self.enable_cuda_graphs = bool(enable_cuda_graphs)
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
         # compile_full_vm. The compiler derives d_model and n_layers from the
         # operation set (no hardcoding) and orchestrates the bake pass.
