@@ -25,8 +25,8 @@ The probe uses `|W_q|` / `|W_k|` column-magnitude to identify each head's 'gate'
 
 ## Summary
 
-- Active heads passing (mass >= 99.0%): **40**
-- Active heads failing: **36** (primary leakage: **4**, probe artifacts: **32**)
+- Active heads passing (mass >= 99.0%): **42**
+- Active heads failing: **34** (primary leakage: **1**, probe artifacts: **33**)
 - QK-coupled heads (probe ambiguous, informational): **0**
 - Dormant heads (no gates, informational): **168**
 - Total heads audited: 244
@@ -37,10 +37,7 @@ These heads register a positive `s_target` (the synthetic K pattern *was* the st
 
 | Layer | Head | mass@target | mass@runner-up | runner-up pos | s_target | gap (logits) | ALiBi slope | scale | fix recommendation |
 |------:|-----:|-----------:|--------------:|--------------:|---------:|-------------:|-----------:|------:|:--------------------|
-| 0 | 1 | 0.9867 | 0.0066 | 8 | 5.000 | 5.000 | 10 | 0.1048 | bump K-scale ~2.0x (raise s_target) |
-| 5 | 5 | 0.0000 | 1.0000 | 8 | 125.394 | -136.677 | 0.1 | 0.1048 | raise ALiBi slope 0.1 -> ~1 (close gap@runner-up dist 4) |
-| 6 | 5 | 0.1000 | 0.1000 | 0 | 0.000 | 0.000 | 0 | 0.1048 | bump K-scale ~10.0x (raise s_target); raise ALiBi slope 0 -> ~1 (close gap@runner-up dist 4) |
-| 7 | 5 | 0.9473 | 0.0262 | 8 | 3.586 | 3.586 | 5 | 0.1048 | bump K-scale ~2.0x (raise s_target); close gap by ~2.0x via Q*K bump |
+| 5 | 5 | 0.0000 | 1.0000 | 8 | 121.794 | -140.277 | 1 | 0.1048 | close gap by ~10.0x via Q*K bump |
 
 ## Failing heads — probable probe artifacts (review only)
 
@@ -56,6 +53,7 @@ These heads have **negative** `s_target` against the synthetic K pattern, which 
 | 5 | 4 | 0.1075 | -0.400 | -0.300 | 0.1 | mild negative score; may indicate Q-K mismatch (head's intended use needs a different residual setup than the audit constructs) |
 | 6 | 2 | 0.0000 | -526.142 | -526.142 | 0.5 | synthetic input lights an anti-gate dim (W has strong negative weight); audit can't measure real-context sharpness |
 | 6 | 3 | 0.0385 | -2.000 | -2.000 | 0.5 | mild negative score; may indicate Q-K mismatch (head's intended use needs a different residual setup than the audit constructs) |
+| 6 | 5 | 0.0071 | -4.000 | -4.000 | 1 | mild negative score; may indicate Q-K mismatch (head's intended use needs a different residual setup than the audit constructs) |
 | 6 | 7 | 0.0000 | -5995.224 | -5995.224 | 5 | synthetic input lights an anti-gate dim (W has strong negative weight); audit can't measure real-context sharpness |
 | 7 | 0 | 0.0385 | -2.000 | -2.000 | 0.5 | mild negative score; may indicate Q-K mismatch (head's intended use needs a different residual setup than the audit constructs) |
 | 7 | 2 | 0.0000 | -25.586 | -25.586 | 0.5 | mild negative score; may indicate Q-K mismatch (head's intended use needs a different residual setup than the audit constructs) |
@@ -85,6 +83,7 @@ These heads have **negative** `s_target` against the synthetic K pattern, which 
 
 | Layer | Head | mass@target | gap (logits) | ALiBi slope |
 |------:|-----:|-----------:|-------------:|-----------:|
+| 0 | 1 | 1.0000 | 50.000 | 10 |
 | 0 | 2 | 1.0000 | 35.000 | 10 |
 | 0 | 3 | 1.0000 | 45.000 | 10 |
 | 0 | 4 | 1.0000 | 55.000 | 10 |
@@ -114,6 +113,7 @@ These heads have **negative** `s_target` against the synthetic K pattern, which 
 | 6 | 4 | 1.0000 | 84.828 | 5 |
 | 6 | 6 | 1.0000 | 1854.499 | 5 |
 | 7 | 1 | 1.0000 | 637.964 | 5 |
+| 7 | 5 | 1.0000 | 27.173 | 5 |
 | 10 | 0 | 1.0000 | 891.842 | 0.2 |
 | 10 | 1 | 1.0000 | 893.042 | 0.5 |
 | 12 | 0 | 1.0000 | 2116.570 | 5 |

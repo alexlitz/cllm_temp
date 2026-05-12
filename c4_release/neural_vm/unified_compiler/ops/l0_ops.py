@@ -69,6 +69,16 @@ def make_layer0_threshold_attn_op() -> Operation:
             ALIBI_S, HD,
             BD=proxy,
         )
+        # Softmax-sharpness fix (head 1): the H1 (d<=4.5) threshold head
+        # passes its scoring budget on the synthetic K target (Q*K/sqrt(HD)
+        # = slope*threshold = 45, then ALiBi at d=4 deducts 40 -> s_target=5)
+        # but the softmax mass tops out at ~98.7% because s_target=5 only
+        # barely clears the softmax1 anchor (need s_target >~ ln(99)+margin).
+        # Audit doc 87442ad recommends "bump K-scale ~2.0x (raise s_target)"
+        # — implemented here by doubling W_k[base_H1, IS_MARK] so Q*K
+        # doubles and s_target lifts from 5 to ~50.
+        head1_base = 1 * HD
+        attn.W_k[head1_base, proxy.IS_MARK] *= 2.0
 
     return Operation(
         name="layer0_threshold_attn",

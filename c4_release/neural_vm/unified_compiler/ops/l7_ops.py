@@ -47,6 +47,16 @@ def make_layer7_memory_heads_op() -> Operation:
             attn.alibi_slopes[6] = 5.0  # head 6: PSH/store flag relay
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer7_memory_heads(attn, S, _as_setdim_proxy(dim_positions), HD)
+        # Softmax-sharpness fix (head 5 — LI/LC/LEA flag relay): the audit
+        # (87442ad) flags head 5 with mass=0.9473, s_target=3.586, gap=3.586,
+        # slope=5. The single-Q-cell K side (W_k[base, MARK_AX]=L with L=15)
+        # gives only 3.6 nats of headroom against softmax1 anchor — close to
+        # but not above ln(99) ~= 4.6 for >=99% mass. Audit recommends
+        # "bump K-scale ~2.0x (raise s_target); close gap by ~2.0x via Q*K
+        # bump". Doubling W_k[base, MARK_AX] doubles s_target and the gap
+        # simultaneously (since the runner-up here is the softmax1 anchor),
+        # lifting mass above 99%.
+        attn.W_k[5 * HD] *= 2.0
 
     return Operation(
         name="layer7_memory_heads",
