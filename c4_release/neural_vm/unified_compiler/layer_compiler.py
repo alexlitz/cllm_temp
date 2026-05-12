@@ -131,6 +131,29 @@ class Operation:
     # Defaults to an empty set so existing ops remain back-compat (opt-in).
     # See c4_release/docs/DIM_OWNERSHIP_REGISTRY.md for the bake-author API.
     claims: Set[Tuple[int, str, str]] = field(default_factory=set)
+    # Residual-dim staleness invariants (Phase 3 / Agent G of
+    # ARCH_LEAKAGE_FIX_PLAN.md). Both fields are opt-in (default empty):
+    #
+    #   ``produces``: maps a residual dim name to the *register* name whose
+    #       fresh value this op writes. E.g. the L8 attn head 6 (commit
+    #       3d1b700) declares
+    #       ``produces={"AX_CARRY_LO": "AX_byte0",
+    #                   "AX_CARRY_HI": "AX_byte0"}``
+    #       because it writes the prev-step AX byte 0 value into AX_CARRY_LO
+    #       and AX_CARRY_HI at the current AX marker.
+    #
+    #   ``consumes_fresh``: maps a residual dim name to the register the op
+    #       expects to read a fresh in-step value from. The analyzer warns
+    #       when a dim is declared ``consumes_fresh`` but no earlier-phase
+    #       op in the same step ``produces`` the same (dim, register).
+    #       Use this only for in-step freshness — ops that rely solely on
+    #       cross-step values (e.g. L3 head 1's prev-step EMBED_LO/HI relay
+    #       into AX_CARRY) should leave ``consumes_fresh`` empty.
+    #
+    # See c4_release/docs/STALENESS_INVARIANTS.md for the bake-author API
+    # and the canonical AX_CARRY example.
+    produces: Dict[str, str] = field(default_factory=dict)
+    consumes_fresh: Dict[str, str] = field(default_factory=dict)
 
     def __hash__(self):
         return hash(self.name)
@@ -243,6 +266,32 @@ class LayerCompiler:
                 raise ValueError(
                     f"Op {op.name!r} references undeclared dim {d!r}"
                 )
+        # Validate staleness invariants (Phase 3 / Agent G of
+        # ARCH_LEAKAGE_FIX_PLAN.md). Both ``produces`` and ``consumes_fresh``
+        # map declared dim names to register identifiers.
+        for fname, mapping in (("produces", op.produces),
+                               ("consumes_fresh", op.consumes_fresh)):
+            if not isinstance(mapping, dict):
+                raise ValueError(
+                    f"Op {op.name!r} {fname} must be a dict; "
+                    f"got {type(mapping).__name__}"
+                )
+            for dim_name, register in mapping.items():
+                if not isinstance(dim_name, str):
+                    raise ValueError(
+                        f"Op {op.name!r} {fname} dim name must be str; "
+                        f"got {dim_name!r}"
+                    )
+                if not isinstance(register, str):
+                    raise ValueError(
+                        f"Op {op.name!r} {fname}[{dim_name!r}] register "
+                        f"must be str; got {register!r}"
+                    )
+                if dim_name not in self.dims:
+                    raise ValueError(
+                        f"Op {op.name!r} {fname} references undeclared dim "
+                        f"{dim_name!r}"
+                    )
         # Validate dim-ownership claims (if any).
         for claim in op.claims:
             if not (isinstance(claim, tuple) and len(claim) == 3):
@@ -294,6 +343,11 @@ class LayerCompiler:
         # Run claim-collision scan first so warnings fire even if subsequent
         # compile stages raise (e.g., dependency cycle).
         self._detect_claim_collisions()
+        # Run staleness-invariant scan: warn when a consumer declares a dim
+        # as ``consumes_fresh`` but no earlier-phase op in the same step
+        # produces the same dim+register. The analyzer needs the per-op
+        # phase ordering, which is fully available at this point.
+        self._detect_staleness_violations()
 
         # Block ops are pinned to layer_idx and skip dep analysis.
         attn_ffn_ops = [op for op in self.ops if op.kind != "block"]
@@ -398,6 +452,98 @@ class LayerCompiler:
                 )
                 _warnings.warn(msg, stacklevel=3)
                 messages.append(msg)
+        return messages
+
+    # --------------------------------------------------------------------
+    # Residual-dim staleness invariants (Phase 3 / Agent G of
+    # ARCH_LEAKAGE_FIX_PLAN.md). Each Operation may declare:
+    #
+    #   ``produces``       : Dict[dim_name, register_name]
+    #   ``consumes_fresh`` : Dict[dim_name, register_name]
+    #
+    # The analyzer scans every op that declares ``consumes_fresh`` and asks:
+    # is there *some other op in the same step* whose ``phase`` precedes this
+    # op's phase AND which ``produces`` the same (dim, register)?  If not, it
+    # warns -- the consumer is reading a stale (cross-step / leftover) value.
+    #
+    # "Same step" maps to a single forward pass; the dep graph + phase order
+    # is the temporal ordering inside a step (smaller phase = earlier). Two
+    # ops at the SAME phase can fire in either order (same-phase tie); we
+    # treat ``producer.phase <= consumer.phase`` as an "in-step producer" so
+    # tightly-paired ops (e.g., bake_ops sharing a phase number) still count.
+    #
+    # Ops with no ``phase`` (None) are considered "unordered" -- they can
+    # only count as in-step producers for consumers that also have no phase.
+    # In practice every annotated op should set ``phase`` for the analyzer
+    # to be useful.
+    # --------------------------------------------------------------------
+
+    def build_staleness_registry(self) -> Tuple[
+        Dict[Tuple[str, str], List[Tuple[str, Optional[float]]]],
+        Dict[Tuple[str, str], List[Tuple[str, Optional[float]]]],
+    ]:
+        """Return (producers, consumers) registries keyed by (dim, register).
+
+        Each registry maps ``(dim_name, register_name)`` -> list of
+        ``(op_name, phase)`` pairs collected across ``self.ops``,
+        ``self.block_ops``, and ``self.model_ops``. Exposed publicly so
+        tests can inspect the staleness graph without re-running compile.
+        """
+        producers: Dict[Tuple[str, str], List[Tuple[str, Optional[float]]]] = {}
+        consumers: Dict[Tuple[str, str], List[Tuple[str, Optional[float]]]] = {}
+        all_ops = list(self.ops) + list(self.block_ops) + list(self.model_ops)
+        for op in all_ops:
+            for dim_name, register in op.produces.items():
+                producers.setdefault(
+                    (dim_name, register), []
+                ).append((op.name, op.phase))
+            for dim_name, register in op.consumes_fresh.items():
+                consumers.setdefault(
+                    (dim_name, register), []
+                ).append((op.name, op.phase))
+        return producers, consumers
+
+    def _detect_staleness_violations(self) -> List[str]:
+        """Scan the staleness registry; warn on each consumer without an
+        in-step producer.
+
+        Returns the list of warning messages produced (so tests can
+        inspect them without recapturing warnings).
+        """
+        import warnings as _warnings
+
+        producers, consumers = self.build_staleness_registry()
+        messages: List[str] = []
+        # Deterministic ordering for stable test output.
+        for key in sorted(consumers.keys()):
+            dim_name, register = key
+            for consumer_name, consumer_phase in sorted(consumers[key]):
+                # An in-step producer is any op that produces the same
+                # (dim, register) at a phase <= consumer.phase. Consumers
+                # without a phase only accept producers without a phase.
+                in_step_producer = None
+                for prod_name, prod_phase in producers.get(key, ()):
+                    if prod_name == consumer_name:
+                        # An op that both produces and consumes_fresh the
+                        # same (dim, register) self-satisfies the invariant.
+                        in_step_producer = prod_name
+                        break
+                    if consumer_phase is None:
+                        if prod_phase is None:
+                            in_step_producer = prod_name
+                            break
+                    elif prod_phase is not None and prod_phase <= consumer_phase:
+                        in_step_producer = prod_name
+                        break
+                if in_step_producer is None:
+                    msg = (
+                        f"STALENESS VIOLATION: op {consumer_name!r} "
+                        f"consumes_fresh dim={dim_name!r} "
+                        f"register={register!r} but no earlier-phase op in "
+                        f"the same step produces it"
+                    )
+                    _warnings.warn(msg, stacklevel=3)
+                    messages.append(msg)
         return messages
 
     # --------------------------------------------------------------------
