@@ -86,11 +86,19 @@ class AutoregressiveAttention(nn.Module):
     and supports both ALiBi and RoPE positional encodings via config.
     """
 
-    def __init__(self, dim, num_heads=4, max_seq_len=4096, layer_idx=None):
+    def __init__(self, dim, num_heads=4, max_seq_len=4096, layer_idx=None,
+                 use_flash_attention=True):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        # When True, ``forward`` routes through PyTorch 2.x's
+        # ``F.scaled_dot_product_attention`` (SDPA), which auto-selects
+        # Flash Attention 2 / mem-efficient / math backends. Default ON for
+        # speed; can be flipped to False for byte-identity / numeric debug.
+        # ONNX export always falls back to the manual path (Flash kernels are
+        # not traceable). See c4_release/docs/FLASH_ATTENTION_INTEGRATION.md.
+        self.use_flash_attention = use_flash_attention
         # head_dim must tile dim exactly so initial Q/K/V views are well-formed.
         # (L15 may later bake a wider H*HD that exceeds dim; that path is
         # handled by W_o projecting back to dim — see forward().)
@@ -406,20 +414,24 @@ class AutoregressiveAttention(nn.Module):
             Q = (Q * cos_q) + (rotate_half(Q) * sin_q)
             K = (K * cos_k) + (rotate_half(K) * sin_k)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-
+        # ----------------------------------------------------------------
+        # Build the additive bias matrix (ALiBi + causal + per-head mask).
+        # SDPA accepts this as ``attn_mask``; the manual path adds it to
+        # ``scores`` before softmax1. Bias shape broadcasts from ``[1, H, S_q,
+        # S_kv]`` (or ``[B, H, S_q, S_kv]`` when per-head mask is active).
+        # ----------------------------------------------------------------
         # ALiBi bias: -slope * |q_pos - k_pos| using *absolute* positions
         # (per KV_CACHE_PRUNING_SPEC §9: surviving positions retain their
         # original indices, so distance computation uses pos_ids — NOT the
         # cache sequence index).
+        bias = None
         if self.alibi_slopes is not None:
             # When no pruning has occurred q_pos_1d / k_pos_1d are arange-like
             # (and equal to the slice computation used pre-pos_ids). Keeping
             # the same Python int branch when no cache is present makes the
             # ONNX tracer happy.
             dist = (q_pos_1d.unsqueeze(1) - k_pos_1d.unsqueeze(0)).abs().float()  # [S_q, S_kv]
-            alibi = -self.alibi_slopes.view(1, H, 1, 1) * dist  # [1, H, S_q, S_kv]
-            scores = scores + alibi
+            bias = -self.alibi_slopes.view(1, H, 1, 1) * dist  # [1, H, S_q, S_kv]
 
         # Causal mask: position i (absolute = cached_len + i) attends to j only if
         # j <= cached_len + i, i.e. mask out j > cached_len + i.
@@ -430,7 +442,10 @@ class AutoregressiveAttention(nn.Module):
             torch.full((S_q, S_kv), float("-inf"), device=x.device),
             diagonal=q_offset_rel + 1,
         )
-        scores = scores + causal_mask
+        if bias is None:
+            bias = causal_mask.view(1, 1, S_q, S_kv)
+        else:
+            bias = bias + causal_mask.view(1, 1, S_q, S_kv)
 
         # Per-head soft-eviction mask (Phase B): when the pruner has set
         # ``per_head_keep_mask`` on this layer's cache, each head's logits
@@ -450,16 +465,76 @@ class AutoregressiveAttention(nn.Module):
                 torch.zeros((), device=x.device),
                 torch.full((), float("-inf"), device=x.device),
             )
-            scores = scores + head_mask_neginf.unsqueeze(2)  # [B, H, 1, S_kv]
+            # head_mask broadcasts over S_q: [B, H, 1, S_kv] + [..., S_q, S_kv]
+            bias = bias + head_mask_neginf.unsqueeze(2)
 
-        # softmax1 for ZFOD (inlined with cached anchor=0 buffer to avoid
-        # per-call torch.tensor() allocations; equivalent to softmax1(scores, dim=-1, anchor=0.0)).
-        anchor = self._softmax1_anchor
-        max_val = torch.max(scores.amax(dim=-1, keepdim=True), anchor)
-        exp_scores = torch.exp(scores - max_val)
-        exp_anchor = torch.exp(anchor - max_val)
-        attn = exp_scores / (exp_anchor + exp_scores.sum(dim=-1, keepdim=True))
-        out = torch.matmul(attn, V)
+        # ----------------------------------------------------------------
+        # Select attention backend.
+        #
+        # SDPA path: appends a "sink" K/V column of zeros so that
+        #   softmax([scores, 0]) = exp(scores) / (1 + sum(exp(scores)))
+        # which exactly matches softmax1 with anchor=0. V=0 at the sink
+        # column means that column contributes 0 to the output, so the
+        # remaining V rows are weighted exactly like softmax1.
+        #
+        # Disable SDPA when: (a) the toggle is off, (b) sparse Q weights
+        # were detected earlier (sparse_linear path implies CPU-friendly
+        # debug runs that already expect manual numerics), or (c) we're
+        # tracing for ONNX export — Flash kernels are not export-traceable.
+        # ----------------------------------------------------------------
+        use_sdpa = (
+            self.use_flash_attention
+            and not torch.onnx.is_in_onnx_export()
+            and not self.W_q.is_sparse
+        )
+
+        if use_sdpa:
+            # Append softmax1 sink: an extra K/V column with K=0 (score=0
+            # vs any Q) and V=0 (no contribution to output). The bias
+            # also needs a zero column appended so the sink score stays 0
+            # after the bias add inside SDPA.
+            sink_k = torch.zeros(
+                K.shape[0], K.shape[1], 1, K.shape[3],
+                dtype=K.dtype, device=K.device,
+            )
+            sink_v = torch.zeros(
+                V.shape[0], V.shape[1], 1, V.shape[3],
+                dtype=V.dtype, device=V.device,
+            )
+            K_s = torch.cat([K, sink_k], dim=2)
+            V_s = torch.cat([V, sink_v], dim=2)
+
+            # Bias gains a sink column of 0 (so score against sink = 0).
+            # Promote bias to bias.dtype that matches Q for SDPA contract.
+            bias_sink = torch.zeros(
+                bias.shape[0], bias.shape[1], bias.shape[2], 1,
+                dtype=bias.dtype, device=bias.device,
+            )
+            bias_with_sink = torch.cat([bias, bias_sink], dim=-1)
+            # SDPA expects attn_mask in Q's dtype to land on the Flash
+            # backend (math/mem-efficient also accept it). The bias may be
+            # float32 from the ALiBi distance computation; cast to Q dtype.
+            attn_mask = bias_with_sink.to(Q.dtype)
+
+            out = F.scaled_dot_product_attention(
+                Q, K_s, V_s,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,  # causal is baked into ``attn_mask``
+                scale=self.scale,
+            )
+        else:
+            scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+            scores = scores + bias
+
+            # softmax1 for ZFOD (inlined with cached anchor=0 buffer to avoid
+            # per-call torch.tensor() allocations; equivalent to softmax1(scores, dim=-1, anchor=0.0)).
+            anchor = self._softmax1_anchor
+            max_val = torch.max(scores.amax(dim=-1, keepdim=True), anchor)
+            exp_scores = torch.exp(scores - max_val)
+            exp_anchor = torch.exp(anchor - max_val)
+            attn = exp_scores / (exp_anchor + exp_scores.sum(dim=-1, keepdim=True))
+            out = torch.matmul(attn, V)
 
         if getattr(self, "_is_compact", False):
             out = out.transpose(1, 2).contiguous().view(B, S, n_out)
@@ -1234,6 +1309,7 @@ class AutoregressiveVM(nn.Module):
         ffn_hidden=4096,
         max_seq_len=1024,  # PERF: reduced from 4096; Phase 1 contexts are <100 tokens (1024 leaves headroom)
         dim_positions=None,
+        use_flash_attention=True,
     ):
         super().__init__()
         if vocab_size is None:
@@ -1241,6 +1317,7 @@ class AutoregressiveVM(nn.Module):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.max_seq_len = max_seq_len
+        self.use_flash_attention = use_flash_attention
 
         # Compiler-allocated dim_positions (None => fall back to _SetDim for
         # backward-compat callers that construct AutoregressiveVM directly).
@@ -1259,7 +1336,8 @@ class AutoregressiveVM(nn.Module):
             [
                 TransformerBlock(
                     attn=AutoregressiveAttention(
-                        d_model, num_heads=n_heads, max_seq_len=max_seq_len, layer_idx=i
+                        d_model, num_heads=n_heads, max_seq_len=max_seq_len, layer_idx=i,
+                        use_flash_attention=use_flash_attention,
                     ),
                     ffn=PureFFN(d_model, ffn_hidden),
                 )
@@ -2084,7 +2162,8 @@ def _expand_wrapper_blocks(model):
         and the given ffn."""
         attn_passthrough = AutoregressiveAttention(
             d_model, num_heads=template_attn.num_heads,
-            max_seq_len=template_attn.max_seq_len, layer_idx=layer_idx
+            max_seq_len=template_attn.max_seq_len, layer_idx=layer_idx,
+            use_flash_attention=getattr(template_attn, "use_flash_attention", True),
         )
         return TransformerBlock(attn=attn_passthrough, ffn=ffn_module)
 
