@@ -193,25 +193,12 @@ def _set_layer2_mem_byte_flags(ffn, S, BD):
 
 
 
-def _set_cs_threshold_attn(attn, head_idx, threshold, out_dim, slope, HD):
-    """Set a single threshold head that only detects CODE_START distance.
-
-    Outputs a single dim (CS component only) instead of full 7-marker vector.
-    """
-    import math
-    from .vm_step import _SetDim
-    BD = _SetDim
-    base = head_idx * HD
-    # Scale Q so Q·K/sqrt(HD) = slope*threshold (HD-independent).
-    q_val = math.sqrt(HD) * slope
-    attn.W_q[base, BD.CONST] = q_val
-    attn.W_k[base, BD.IS_MARK] = threshold
-    attn.W_v[base + 1, BD.MARK_CS] = 1.0
-    attn.W_o[out_dim, base + 1] = 1.0
+# Note: ``_set_cs_threshold_attn`` (a single CS-only threshold attention head)
+# previously lived here. It had no live callers (only an import-only re-export
+# in vm_step.py) and was deleted per BD_SETDIM_HARDCODE_AUDIT M2.
 
 
-
-def _set_stack0_carry_attn(attn, head_idx, HD, BD=None):
+def _set_stack0_carry_attn(attn, head_idx, HD, BD):
     """Set attention head for STACK0 carry-forward.
 
     At STACK0 marker positions, attend to previous step's STACK0 byte 0
@@ -219,14 +206,17 @@ def _set_stack0_carry_attn(attn, head_idx, HD, BD=None):
     Copies EMBED_LO/HI to EMBED_LO/HI at STACK0 marker.
 
     Args:
-        BD: Optional dim spec (proxy) overriding _SetDim. Pass the compiler
-            proxy from a migrated op so pin_io_only=True layouts wire to the
-            correct residual lanes. Defaults to module-level ``_SetDim`` for
-            backward compatibility with legacy callers (e.g. set_vm_weights).
+        BD: Required dim spec (proxy or ``_SetDim``). Callers must pass a
+            compiler proxy from a migrated op so pin_io_only=True layouts
+            wire to the correct residual lanes. The previous ``BD=None``
+            legacy fallback was removed per BD_SETDIM_HARDCODE_AUDIT M3
+            (the sole caller in ``unified_compiler/ops/l3_ops.py`` always
+            passes ``BD=proxy``).
     """
     if BD is None:
-        from .vm_step import _SetDim
-        BD = _SetDim
+        raise TypeError(
+            "_set_stack0_carry_attn requires BD (use _as_setdim_proxy(dim_positions))"
+        )
     base = head_idx * HD
     L = 15.0
 
@@ -245,7 +235,7 @@ def _set_stack0_carry_attn(attn, head_idx, HD, BD=None):
         attn.W_o[BD.EMBED_LO + k, base + 1 + k] = 1.0
         attn.W_o[BD.EMBED_HI + k, base + 17 + k] = 1.0
 
-    # Anti-leakage gate (same as _set_carry_forward_attn)
+    # Anti-leakage gate (same shape as Primitives.carry_forward_attention)
     GATE = 33
     attn.W_q[base + GATE, BD.MARK_STACK0] = L
     attn.W_q[base + GATE, BD.CONST] = -L / 2

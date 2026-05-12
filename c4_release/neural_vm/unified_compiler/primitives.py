@@ -94,7 +94,8 @@ class Primitives:
         At marker positions, attends to the previous step's corresponding byte 0
         (identified by L1H1_marker AND NOT L1H0_marker pattern).
 
-        Pattern from _set_carry_forward_attn (vm_step.py:2552-2599):
+        Pattern (formerly in the legacy ``_set_carry_forward_attn`` helper,
+        deleted per BD_SETDIM_HARDCODE_AUDIT M1):
           Q[0] = marker_dim * L
           K[0] = L1H1 * L - L1H0 * L
           V[1:17] = src_lo nibble, V[17:33] = src_hi nibble

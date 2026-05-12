@@ -1319,6 +1319,13 @@ class AutoregressiveVM(nn.Module):
         """
         from .pure_moe import SoftMoEFFN, build_soft_moe_from_compact_partition
 
+        # BD_SETDIM_HARDCODE_AUDIT M5: this ``BD = _SetDim`` assignment is
+        # structurally correct. The ``D(name)`` resolver below checks
+        # ``self.dim_positions`` (the compact / compiler-allocated layout)
+        # *first* and only falls back to ``getattr(BD, name)`` when no
+        # per-block layout is in scope (e.g. legacy hand-set test fixtures).
+        # See the explicit ``isinstance(self.dim_positions, dict)`` branch
+        # below and the ``D(name)`` helper a few lines down.
         BD = _SetDim
         # Resolve opcode-flag dims from the dim_positions layout (compiler-
         # allocated) when available; fall back to the hand-set _SetDim block
@@ -2256,13 +2263,17 @@ def _set_threshold_attn(attn, thresholds, out_bases, slope, HD, heads=None, BD=N
     Uses ALiBi: score = slope*(threshold - distance), giving a sharp sigmoid.
 
     Args:
-        BD: Optional dim spec (proxy) overriding _SetDim. Pass the compiler
-            proxy from a migrated op so pin_io_only=True layouts wire to the
-            correct residual lanes. Defaults to module-level ``_SetDim`` for
-            backward compatibility with legacy callers (e.g. set_vm_weights).
+        BD: Required dim spec (proxy or ``_SetDim``). Callers must pass a
+            compiler proxy from a migrated op so pin_io_only=True layouts
+            wire to the correct residual lanes. The previous ``BD=None``
+            legacy fallback was removed per BD_SETDIM_HARDCODE_AUDIT M4 —
+            all 4 live callers in ``unified_compiler/ops/{l0,l1,l2}_ops.py``
+            already pass ``BD=_as_setdim_proxy(dim_positions)``.
     """
     if BD is None:
-        BD = _SetDim
+        raise TypeError(
+            "_set_threshold_attn requires BD (use _as_setdim_proxy(dim_positions))"
+        )
     if heads is None:
         heads = list(range(len(thresholds)))
 
@@ -2346,7 +2357,6 @@ from .setup_helpers import (
     _set_conversational_io_output_routing,
     _set_conversational_io_relay_heads,
     _set_conversational_io_state_machine,
-    _set_cs_threshold_attn,
     _set_layer10_byte_passthrough,
     _set_layer10_carry_relay,
     _set_layer10_psh_stack0_passthrough,
@@ -2534,58 +2544,14 @@ def _set_nibble_copy_ffn(ffn, S, BD):
 # =============================================================================
 # Instruction Fetch Layers (2-5)
 # =============================================================================
-
-
-def _set_carry_forward_attn(
-    attn, head_idx, marker_dim, l1h1_idx, l1h0_idx, HD, out_lo, out_hi, slope=0.5,
-    src_lo=None, src_hi=None
-):
-    """Set attention head for register carry-forward.
-
-    At marker positions, attends to the previous step's corresponding byte 0
-    (identified by L1H1_marker AND NOT L1H0_marker pattern).
-    Copies src_lo/src_hi (default EMBED_LO/HI) from the target to out_lo/out_hi.
-
-    Args:
-        src_lo, src_hi: Source dimensions to copy from. Defaults to EMBED_LO/HI.
-                        For AX carry, use OUTPUT_LO/HI to get computed value.
-
-    Anti-leakage gate (dim 33): at non-target markers, Q[gate] = -L/2
-    combined with K[gate] = L gives score penalty -L²/(2√HD) ≈ -14,
-    suppressing self-attention leakage (exp(-14) ≈ 8e-7).
-    """
-    BD = _SetDim
-    base = head_idx * HD
-    L = 15.0
-
-    # Default source is EMBED (for PC/SP/BP), but AX needs OUTPUT
-    if src_lo is None:
-        src_lo = BD.EMBED_LO
-    if src_hi is None:
-        src_hi = BD.EMBED_HI
-
-    attn.W_q[base, marker_dim] = L
-    attn.W_k[base, BD.L1H1 + l1h1_idx] = L
-    attn.W_k[base, BD.L1H0 + l1h0_idx] = -L
-
-    for k in range(16):
-        attn.W_v[base + 1 + k, src_lo + k] = 1.0
-        attn.W_v[base + 17 + k, src_hi + k] = 1.0
-
-    for k in range(16):
-        attn.W_o[out_lo + k, base + 1 + k] = 1.0
-        attn.W_o[out_hi + k, base + 17 + k] = 1.0
-
-    # Anti-leakage gate: suppress attention at non-target marker positions.
-    # At target (marker_dim=1): Q[gate] = L - L/2 = +L/2, score += +L²/(2√HD) ≈ +14
-    # At non-target (marker_dim=0): Q[gate] = -L/2, score += -L²/(2√HD) ≈ -14
-    GATE = 33
-    attn.W_q[base + GATE, marker_dim] = L
-    attn.W_q[base + GATE, BD.CONST] = -L / 2
-    attn.W_k[base + GATE, BD.CONST] = L
-
-
-    # (L2 FFN reserved for prompt/bootstrap memory wiring.)
+#
+# Note: the legacy ``_set_carry_forward_attn`` helper that previously lived
+# here was deleted (BD_SETDIM_HARDCODE_AUDIT M1) once all live callers had
+# migrated to ``unified_compiler.primitives.Primitives.carry_forward_attention``
+# (which threads ``bd=`` through the proxy). The byte-equivalence test that
+# pinned the two implementations together was retired in the same commit.
+#
+# (L2 FFN reserved for prompt/bootstrap memory wiring.)
 
 
 def _set_layer3_ffn(ffn, S, BD):

@@ -69,9 +69,9 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
 def make_layer3_carry_forward_attn_op() -> Operation:
     """L3 attention: 7 carry-forward heads (PC, AX, SP, BP, STACK0 + relays).
 
-    Heads 0-3 use ``Primitives.carry_forward_attention`` (byte-identical to
-    the legacy ``_set_carry_forward_attn`` — see
-    ``tests/test_primitives_l3_carry_equivalence.py``). Head 4 uses
+    Heads 0-3 use ``Primitives.carry_forward_attention`` (the canonical
+    proxy-aware implementation; the legacy ``_set_carry_forward_attn``
+    helper was deleted per BD_SETDIM_HARDCODE_AUDIT M1). Head 4 uses
     ``_set_stack0_carry_attn`` (different K source). Heads 5-6 stay inline
     (head 5 reads OUTPUT_*, head 6 has OP_LEV gating + CLEAN_EMBED_*).
     """
@@ -91,9 +91,9 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         cf(attn, 2, proxy.MARK_SP, SP_I, SP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
         cf(attn, 3, proxy.MARK_BP, BP_I, BP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
         _set_stack0_carry_attn(attn, 4, HD, BD=proxy)
-        # Heads 5-6: AX_FULL relay + BP→PC for LEV. These reference _SetDim
-        # directly inside _set_carry_forward_attn so the proxy fallback handles
-        # them. For now we replicate the inline code from _set_layer3_attn block:
+        # Heads 5-6: AX_FULL relay + BP→PC for LEV. We replicate the inline
+        # code from the legacy ``_set_layer3_attn`` block here, routing every
+        # dim through ``proxy`` so pin_io_only=True layouts resolve correctly:
         L = 15.0
         base = 5 * HD
         attn.W_q[base, proxy.MARK_AX] = L

@@ -110,72 +110,96 @@ They are listed for completeness because Agent C should not change them, but
 they should be deleted (or downgraded to a `_resolve_bd` call) when their
 dead-caller status is confirmed by a follow-up.
 
-#### M1: `_set_carry_forward_attn` (dead — no callers)
+#### M1: `_set_carry_forward_attn` (dead — no callers) — ✅ DELETED
 
-- File: `c4_release/neural_vm/vm_step.py:2519-2566`.
+- File: `c4_release/neural_vm/vm_step.py:2519-2566` (now removed).
 - Line 2537: `BD = _SetDim` (hardcoded, no `BD` parameter).
-- Callers: **none** in the production graph (the only call sites in
-  `vm_step.py.current` and `setup_helpers.py:248` refer to it by name only;
-  the actual carry-forward is wired through
-  `c4_release/neural_vm/unified_compiler/primitives.py:78
-  ::Primitives.carry_forward_attention` which takes `bd=None`).
-- Fix: delete, or thread `BD=None` like `_set_threshold_attn` already does.
-- Priority: MEDIUM (the dead body still compiles, so a future caller could
-  re-introduce the legacy pin without noticing).
+- Callers: **none** in the production graph. The only live caller was the
+  byte-equivalence test `c4_release/tests/test_primitives_l3_carry_equivalence.py`
+  which existed *specifically* to pin the legacy helper against the new
+  `Primitives.carry_forward_attention`. Production wiring goes through
+  `c4_release/neural_vm/unified_compiler/primitives.py::Primitives.carry_forward_attention`
+  (takes `bd=None`).
+- Resolution (cleanup-bd-setdim-medium): deleted the function from
+  `vm_step.py` and the now-purposeless equivalence test. Replaced with a
+  brief sentinel comment in `vm_step.py` so future re-introduction is
+  immediately visible in code review. Doc references in `l3_ops.py` and
+  `primitives.py` updated to call out the deletion rather than point at
+  the old line numbers.
 
-#### M2: `_set_cs_threshold_attn` (dead — no callers)
+#### M2: `_set_cs_threshold_attn` (dead — no callers) — ✅ DELETED
 
-- File: `c4_release/neural_vm/setup_helpers.py:196-210`.
+- File: `c4_release/neural_vm/setup_helpers.py:196-210` (now removed).
 - Line 203: `BD = _SetDim` (hardcoded, no `BD` parameter).
 - Callers: **none** (only an import-only re-export at `vm_step.py:2329`; no
-  `_set_cs_threshold_attn(...)` call site exists in the active source).
-- Fix: delete, or thread `BD=None`.
-- Priority: MEDIUM.
+  `_set_cs_threshold_attn(...)` call site existed in the active source).
+- Resolution (cleanup-bd-setdim-medium): deleted the function from
+  `setup_helpers.py` and removed the re-export from `vm_step.py`. A short
+  sentinel comment is left in place so re-introduction is visible in
+  review.
 
-#### M3: `_set_stack0_carry_attn` BD=None fallback
+#### M3: `_set_stack0_carry_attn` BD=None fallback — ✅ HARDENED
 
 - File: `c4_release/neural_vm/setup_helpers.py:214-260`.
-- Lines 227-229: `if BD is None: from .vm_step import _SetDim; BD = _SetDim`.
+- Lines 227-229: previously `if BD is None: from .vm_step import _SetDim; BD = _SetDim`.
 - Callers: `c4_release/neural_vm/unified_compiler/ops/l3_ops.py:93`
-  (always passes `BD=proxy`). The fallback is reachable only from legacy
+  (always passes `BD=proxy`). The fallback was reachable only from legacy
   hand-set callers that no longer exist.
-- Fix: drop the fallback, require `BD` to be passed.
-- Priority: MEDIUM (defensive fallback that hides the legacy layout if a
-  future caller forgets to pass BD).
+- Resolution (cleanup-bd-setdim-medium): signature changed to require `BD`
+  (still accepted as the 4th positional / kwarg, defaulting to `None` for
+  the explicit error). The implicit `_SetDim` fallback is replaced with a
+  `TypeError` so missing-BD bugs surface at bake time instead of silently
+  pinning to the legacy layout. Docstring updated to spell out the new
+  contract.
 
-#### M4: `_set_threshold_attn` BD=None fallback
+#### M4: `_set_threshold_attn` BD=None fallback — ✅ HARDENED
 
 - File: `c4_release/neural_vm/vm_step.py:2232-2264`.
-- Line 2245: `if BD is None: BD = _SetDim`.
-- Callers: `unified_compiler/ops/l0_ops.py:64`, `l1_ops.py:43,56`, `l2_ops.py:36`
-  — all pass `BD=proxy`.
-- Fix: drop the fallback (or keep with a deprecation comment).
-- Priority: MEDIUM (same shape as M3).
+- Line 2245: previously `if BD is None: BD = _SetDim`.
+- Callers: `unified_compiler/ops/l0_ops.py:64`, `l1_ops.py:43,56`,
+  `l2_ops.py:129`. The audit originally claimed *all* of these passed
+  `BD=proxy`; in fact only `l0_ops.py` did. `l1_ops.py` and `l2_ops.py`
+  silently relied on the legacy `_SetDim` fallback, so under
+  `pin_io_only=True` they would bake into the wrong residual columns.
+- Resolution (cleanup-bd-setdim-medium):
+  1. `_set_threshold_attn` now raises `TypeError` when `BD is None`
+     (previously it pinned to the legacy `_SetDim` layout).
+  2. The three legacy-fallback call sites in `l1_ops.py` and `l2_ops.py`
+     were updated to explicitly forward `BD=proxy`. This is functionally
+     equivalent under the default layout (CONST / IS_MARK / MARKS are
+     IO-pinned) but unblocks any future non-IO-pinned compact layout.
 
-#### M5: `compact_moe` `BD = _SetDim` resolver fallback
+#### M5: `compact_moe` `BD = _SetDim` resolver fallback — ✅ DOCUMENTED
 
 - File: `c4_release/neural_vm/vm_step.py:1300-1344`.
 - Line 1302: `BD = _SetDim` then `D(name)` falls back to `getattr(BD, name)`.
 - Callers: `c4_release/neural_vm/vm_step.py::AutoregressiveVM.compact_moe`
-  is called from `_expand_wrapper_blocks` and runtime code paths that already
-  pass `self.dim_positions`. The fallback is only used when `dim_positions`
-  is not a dict.
-- Fix: structurally correct — the resolver checks `isinstance(self.dim_positions, dict)`
-  first and only falls back to `_SetDim` when no compact layout is in scope.
-  Listed for completeness; **no change needed**.
-- Priority: MEDIUM (technically correct but worth confirming the
-  non-dict-dim_positions path is exercised only by tests).
+  is called from `_expand_wrapper_blocks` and runtime code paths that
+  already pass `self.dim_positions`. The fallback is only used when
+  `dim_positions` is not a dict.
+- Resolution (cleanup-bd-setdim-medium): structurally correct — the
+  resolver checks `isinstance(self.dim_positions, dict)` first and only
+  falls back to `_SetDim` when no compact layout is in scope. An
+  inline comment block at the `BD = _SetDim` line now spells out the
+  contract so future readers don't mistake it for a legacy pin.
 
 ### MEDIUM priority — Production helpers that still hardcode `_SetDim`
 
 #### M6: `setup_helpers.py::_set_cs_threshold_attn` — already covered (M2).
 
-#### M7: `efficient_alu_neural.py::PureNeuralALU` baking constructor
+#### M7: `efficient_alu_neural.py::PureNeuralALU` baking constructor — ✅ CONFIRMED
 
-- File: `c4_release/neural_vm/efficient_alu_neural.py:281` (`def __init__(self, S, BD, operations='add_sub')`).
-- Status: takes `BD` as a constructor parameter — callers in `_make_alu_postop_attach_op`
-  pass `_as_setdim_proxy(dim_positions)`. **Properly threaded.** Listed only
-  to confirm; **no change needed**.
+- File: `c4_release/neural_vm/efficient_alu_neural.py:281`
+  (`def __init__(self, S, BD, operations='add_sub')`).
+- Verification (cleanup-bd-setdim-medium): `BD` is a positional required
+  constructor parameter; the class is no longer actively instantiated in
+  the production graph (the split ALU implementations
+  `efficient_alu_addsub_split.py` / `efficient_alu_divmod_split.py` are
+  used instead). The remaining references are docstrings calling these
+  out as the historical equivalent. The split implementations themselves
+  thread `BD` through their constructors and are called from
+  `_make_alu_postop_attach_op` with `_as_setdim_proxy(dim_positions)`.
+  **Properly threaded; no change needed.**
 
 ### LOW priority (debug / test / dead code)
 
@@ -204,8 +228,15 @@ These hardcode `_SetDim` but are not on the production forward path:
 
 ```
 Total hardcoded refs (production path): 14
-  HIGH (production PureFFN / nn.Module): 1   (H1: _ensure_l11_mul_module)
-  MEDIUM (bake helpers / fallbacks):     6   (M1-M6; M5 is structurally correct, M7 already threaded)
+  HIGH (production PureFFN / nn.Module): 1   (H1: _ensure_l11_mul_module — open)
+  MEDIUM (bake helpers / fallbacks):     0 remaining
+    M1, M2 ........................ DELETED (cleanup-bd-setdim-medium)
+    M3, M4 ........................ HARDENED — BD now required, TypeError on None
+    M5 ............................ DOCUMENTED — structurally correct (resolver
+                                     consults dim_positions dict first)
+    M7 ............................ CONFIRMED — PureNeuralALU takes BD as required
+                                     ctor param; class is no longer actively
+                                     instantiated (split ALUs are used instead)
   LOW (tests / debug / dead):           ~18  (see table)
   Already threaded (A1, P2):             4   (ComparisonCombine, BinaryOpByteZeroingPostOp,
                                               CarryPropagationPostOp, BitwiseBytePropagationPostOp)
@@ -246,17 +277,16 @@ unrelated dim under compact, identical in shape to the A1 IMM 240/255 bug.
 
 ## Recommended next action
 
-1. **H1 fix** (this is the only HIGH item): add `dim_positions=None` to
+1. **H1 fix** (the only remaining HIGH item): add `dim_positions=None` to
    `_ensure_l11_mul_module` and route through `_as_setdim_proxy`. Mirror the
    threading in `_make_alu_postop_attach_op` in the same file. Update the 9
    callers in `alu_ops.py` to forward `dim_positions`. Re-bake test:
    `test_smoke.py::test_mul_basic` (will still time out from orthogonal
    Phase 2 issues, but `test_runtime_vanilla` should stay green).
-2. **M1, M2 deletion**: confirm via grep that `_set_carry_forward_attn` and
-   `_set_cs_threshold_attn` are never called, then delete or downgrade the
-   `BD = _SetDim` line to a `BD: Optional = None` fallback for safety.
-3. **M3, M4** are defensive fallbacks; they can be left or tightened. Lowest
-   risk and lowest value.
+2. ~~**M1, M2 deletion**~~ — done in cleanup-bd-setdim-medium.
+3. ~~**M3, M4** defensive fallback tightening~~ — done in
+   cleanup-bd-setdim-medium; both now raise `TypeError` when `BD is None`
+   and all live callers explicitly forward `BD=proxy`.
 
 ## Gate suite
 
