@@ -459,6 +459,50 @@ class AutoregressiveVMRunner:
         self._kv_cached_tokens = []
         return self._kv_cache_obj
 
+    def _preload_kv_cache_with_prefix(self, prefix_tokens):
+        """Eagerly populate the KV cache with K/V for the immutable prefix.
+
+        The CODE/DATA/argv prefix (positions 0..``len(prefix_tokens)``) does
+        not change within a single ``run()``. We run one forward pass over
+        the prefix with a freshly-allocated cache so that every subsequent
+        ``_generate_next_cached`` call only needs to compute K/V for the
+        newly-appended tokens.
+
+        This replaces the retired ``NeuralVMEmbedding`` prefix-embedding-delta
+        cache (V20). The KV cache subsumes it cleanly: it stores the actual
+        K/V tensors that attention reads, not just the embedding-layer
+        modifications. No-op when ``use_kv_cache`` is False.
+
+        Args:
+            prefix_tokens: List of integer token IDs comprising the immutable
+                prefix (typically the output of ``_build_context``).
+        """
+        if not self.use_kv_cache:
+            return
+        if not prefix_tokens:
+            return
+        kv_cache = self._get_or_build_kv_cache()
+        device = next(self.model.parameters()).device
+        token_ids = torch.tensor([prefix_tokens], dtype=torch.long, device=device)
+        with torch.no_grad():
+            # cached_prefix_len=0: this is the first call into the cache; the
+            # full prefix becomes the cached state.
+            self.model.forward(
+                token_ids,
+                kv_cache=kv_cache,
+                cached_prefix_len=0,
+            )
+        self._kv_cached_tokens = list(prefix_tokens)
+        # Reset the incremental-flush counter so the preload itself doesn't
+        # count against the per-step flush budget.
+        self._kv_incremental_count = 0
+        # Match the current model active_opcode so the next
+        # ``_generate_next_cached`` call does not see a sentinel mismatch and
+        # discard the preload. ``_active_opcode`` was retired with the
+        # SoftMoEFFN migration so ``cur_opcode`` is ``None`` in practice, but
+        # we use the same getattr pattern as the generator to stay in sync.
+        self._kv_cached_opcode = getattr(self.model, "_active_opcode", None)
+
     def _kv_common_prefix_len(self, new_tokens):
         """Length of the longest matching leading subsequence of ``new_tokens``
         with the currently-cached tokens.
@@ -719,9 +763,6 @@ class AutoregressiveVMRunner:
         self._mem_history = {}  # addr → 9-token MEM section (latest wins)
         self._mem_access_order = []  # LRU tracking: most recent at end
         self.model.embed.set_mem_history_end(0)  # reset stale boundary from prior runs
-        # Invalidate the embedding prefix cache so a new program's CODE/DATA
-        # prefix is recomputed (cache is keyed on the leading token sequence).
-        self.model.embed.reset_prefix_cache()
         # Reset the KV cache for autoregressive attention (per-run state).
         # ``self.use_kv_cache`` (constructor arg) gates this; when True the
         # runner reuses K/V across forward calls, recomputing only the new
@@ -753,6 +794,17 @@ class AutoregressiveVMRunner:
         context = self._build_context(bytecode, data, argv or [], stdin)
         prefix_len = len(context)  # code + data prefix length (immutable)
         output = []
+
+        # Preload the per-layer KV cache with the immutable CODE/DATA/argv
+        # prefix. The prefix never changes within a single ``run()``, so its
+        # K/V tensors are reusable across every subsequent forward call.
+        # Without this preload, the first ``_generate_next_cached`` call would
+        # process the entire prefix from scratch; with it, the very first
+        # autoregressive step only needs to compute K/V for the newly-appended
+        # tokens. This replaces the retired ``NeuralVMEmbedding`` prefix
+        # cache (V20 in PURITY_AUDIT_2026_05_11.md): the KV cache subsumes
+        # its role at the proper level (transformer K/V, not embedding deltas).
+        self._preload_kv_cache_with_prefix(context)
 
         # The MoE routing signal is read tensor-natively inside SoftMoEFFN
         # (see neural_vm.pure_moe); no Python-side bytecode peek required.

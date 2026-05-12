@@ -53,25 +53,11 @@ class NeuralVMEmbedding(nn.Module):
         # (set by KV cache eviction logic)
         self._mem_history_end = 0
 
-        # === Prefix embedding cache (perf optimization, 2026-05-11) ===
-        # Many of the augmentations below loop over the entire context, but
-        # the CODE/DATA prefix tokens (positions 0..CODE_END/DATA_END) never
-        # change within a single ``run()``. We cache the augmentation outputs
-        # for that prefix region and apply them as a single in-place add.
-        #
-        # Cache invariants:
-        #   - ``_prefix_cache_token_ids``: 1D LongTensor of prefix tokens (CPU).
-        #   - ``_prefix_cache_delta``: [1, prefix_len, d_model] tensor of the
-        #     augmentation modifications applied to the prefix region. Added
-        #     to the un-augmented embedding output on cache hit.
-        #   - ``_prefix_cache_len``: int, number of prefix positions cached.
-        #
-        # The cache is invalidated whenever the leading tokens of the input
-        # differ from the cached prefix (e.g. new ``run()`` with different
-        # bytecode) via ``reset_prefix_cache()`` or automatic mismatch check.
-        self._prefix_cache_token_ids = None
-        self._prefix_cache_delta = None
-        self._prefix_cache_len = 0
+        # V20 (NeuralVMEmbedding prefix-embedding-delta cache) was retired
+        # 2026-05-12. Its role is now subsumed by the unified per-layer KV
+        # cache prefix preload in ``AutoregressiveVMRunner._preload_kv_cache_with_prefix``,
+        # which stores actual K/V tensors at the correct (post-transformer)
+        # level rather than embedding-layer modifications.
 
         # === Compiler-baked ADDR_KEY positional encoding (2026-05-11) ===
         # ADDR_KEY is morally a positional encoding: each code byte position
@@ -118,71 +104,6 @@ class NeuralVMEmbedding(nn.Module):
         from .vm_step import _SetDim
         return getattr(_SetDim, name)
 
-    def reset_prefix_cache(self):
-        """Invalidate the prefix-embedding cache.
-
-        Called at the start of each ``run()`` to ensure the cache does not
-        survive across distinct bytecode programs. Also called by callers
-        that mutate the embedding inputs in ways the cache doesn't track.
-        """
-        self._prefix_cache_token_ids = None
-        self._prefix_cache_delta = None
-        self._prefix_cache_len = 0
-
-    def _compute_prefix_len(self, token_ids):
-        """Find the length of the immutable CODE/DATA prefix in token_ids.
-
-        Returns the index just after CODE_END (and DATA_END if present),
-        i.e. the boundary up to which augmentations are deterministic and
-        cacheable. Returns 0 if no CODE_END is found in the first batch row.
-        """
-        from .vm_step import Token
-
-        # Use batch row 0 as the authority; the prefix is identical across
-        # batch elements in practice (build_context produces a single sequence
-        # that is broadcast). If token_ids has fewer rows or shorter seq we
-        # bail out and don't cache.
-        if token_ids.dim() != 2 or token_ids.shape[0] < 1:
-            return 0
-        row = token_ids[0]
-        S = row.shape[0]
-        # Find CODE_END (and, optionally, DATA_END to extend the cache).
-        # Use tensor.tolist() over a bounded prefix (we don't need to scan
-        # past the end of the typical prefix; bytecode prefixes are short).
-        # In practice the entire context is short for the prefix scan.
-        row_list = row.tolist()
-        code_end_idx = -1
-        for i, tok in enumerate(row_list):
-            if tok == Token.CODE_END:
-                code_end_idx = i
-                break
-        if code_end_idx < 0:
-            return 0
-        # Try to extend to DATA_END if it appears shortly after CODE_END.
-        # The standard layout is CODE_END, DATA_START, ..., DATA_END.
-        end_idx = code_end_idx
-        for j in range(code_end_idx + 1, min(S, code_end_idx + 1 + 4096)):
-            if row_list[j] == Token.DATA_END:
-                end_idx = j
-                break
-            # If we hit something other than DATA_START / data bytes (which
-            # are always < 256 ints), bail out at DATA_END heuristic check.
-        # Cache length is end_idx + 1 (inclusive of the END marker).
-        return end_idx + 1
-
-    def _prefix_cache_matches(self, token_ids):
-        """Return True if cached prefix matches the leading tokens of ``token_ids``."""
-        if self._prefix_cache_token_ids is None:
-            return False
-        cache_len = self._prefix_cache_len
-        if cache_len == 0 or token_ids.shape[1] < cache_len:
-            return False
-        # Compare on the same device (cache lives on CPU; bring slice to CPU).
-        cached = self._prefix_cache_token_ids
-        # token_ids[0, :cache_len] vs cached; both are 1D long tensors.
-        prefix_slice = token_ids[0, :cache_len].detach().to(cached.device)
-        return torch.equal(prefix_slice, cached)
-
     def forward(self, token_ids):
         """Apply embedding + augmentations.
 
@@ -195,53 +116,22 @@ class NeuralVMEmbedding(nn.Module):
         # Standard embedding lookup
         x = self.embed(token_ids)
 
-        # --- ONNX export / torch.compile fast path -----------------------
-        # The prefix cache is purely a runtime perf optimization (it caches
-        # the augmentation delta for the immutable CODE/DATA prefix region
-        # across forward calls within a single ``run()``). It involves Python
-        # state mutation and a ``.tolist()`` scan that the ONNX tracer and
-        # ``torch.compile``'s Dynamo tracer can't capture. When exporting
-        # or compiling, bypass the cache entirely and run the un-cached
-        # augmentations every call.
-        #
-        # ONNX export additionally uses the pure-tensor ADDR_KEY computation
+        # --- ONNX export fast path ---------------------------------------
+        # ONNX export uses the pure-tensor ADDR_KEY computation
         # (``_compute_addr_keys``) instead of the pre-allocated buffer so the
-        # exported model accepts *any* sequence length at inference. Under
-        # ``torch.compile`` the buffer path is fine (single shape, traceable).
+        # exported model accepts *any* sequence length at inference.
         if torch.onnx.is_in_onnx_export():
             self._compute_addr_keys(token_ids, x)
             self._inject_mem_store(token_ids, x, start_pos=0)
             return x
-        if torch.compiler.is_compiling():
-            # torch.compile path: avoid the prefix cache (Python state) and
-            # use the buffer-based addr_keys (single static shape — fine for
-            # Dynamo trace, unlike ONNX which needs dynamic seq_len).
-            self._add_code_addr_keys(token_ids, x)
-            self._inject_mem_store(token_ids, x, start_pos=0)
-            return x
 
-        # --- Prefix cache fast path ---------------------------------------
-        # If we have a cached prefix delta that matches the leading tokens,
-        # add it in one shot and skip the per-position Python loops on that
-        # region. The augmentations that scan the full sequence accept a
-        # ``start_pos`` parameter so they only process positions beyond the
-        # cached prefix.
-        cache_hit = self._prefix_cache_matches(token_ids)
-        if cache_hit:
-            cache_len = self._prefix_cache_len
-            delta = self._prefix_cache_delta
-            # Broadcast delta (shape [1, cache_len, d_model]) over batch.
-            x[:, :cache_len, :].add_(delta.to(x.device, dtype=x.dtype))
-            start_pos = cache_len
-        else:
-            start_pos = 0
-
-        # Apply augmentations. ``start_pos`` lets us skip the cached region
-        # for methods that scan token-by-token. Methods whose work is fully
-        # local to the prefix (only ``_add_code_addr_keys`` today) are
-        # entirely skipped on cache hit.
-        if not cache_hit:
-            self._add_code_addr_keys(token_ids, x)
+        # ADDR_KEY positional encoding for code-byte positions.
+        # ``_add_code_addr_keys`` is a tensor op (precomputed buffer) so it
+        # runs cheaply on every forward. V20 (NeuralVMEmbedding prefix
+        # embedding-delta cache) was retired 2026-05-12; the unified KV
+        # cache prefix preload in ``AutoregressiveVMRunner`` now caches K/V
+        # at the proper transformer level instead.
+        self._add_code_addr_keys(token_ids, x)
 
         # THINKING_START/END markers (MARK_THINKING_START/_END) are now baked
         # directly into the embedding table (see
@@ -261,37 +151,9 @@ class NeuralVMEmbedding(nn.Module):
         # docs/V2_ADDR_KEY_NEURAL_DECODE_PLAN.md.  The retained-history
         # MEM_STORE injection below remains a no-op unless
         # ``_mem_history_end > 0`` (set by KV-cache eviction).
-        self._inject_mem_store(token_ids, x, start_pos=start_pos)
-
-        # --- Populate prefix cache on first call within a run -------------
-        if not cache_hit:
-            self._populate_prefix_cache(token_ids, x)
+        self._inject_mem_store(token_ids, x, start_pos=0)
 
         return x
-
-    def _populate_prefix_cache(self, token_ids, x):
-        """Cache the augmentation delta for the immutable prefix region.
-
-        The delta is computed by subtracting the un-augmented embedding from
-        the fully-augmented embedding for positions ``[0, prefix_len)``. On
-        subsequent forward passes with matching leading tokens, the delta is
-        added directly, bypassing the per-position Python loops.
-        """
-        prefix_len = self._compute_prefix_len(token_ids)
-        if prefix_len <= 0:
-            # Nothing to cache (e.g. context shorter than CODE_END).
-            return
-        # Re-run the unaugmented embedding lookup on the prefix tokens only
-        # so we can isolate the additive contribution of the augmentations.
-        with torch.no_grad():
-            row = token_ids[0:1, :prefix_len]
-            unaug = self.embed(row)
-            delta = (x[0:1, :prefix_len, :] - unaug).detach()
-        # Store the cache. Keep the token IDs on CPU so device transfers
-        # (e.g. for runs that share an embedding across devices) stay cheap.
-        self._prefix_cache_token_ids = token_ids[0, :prefix_len].detach().cpu().clone()
-        self._prefix_cache_delta = delta
-        self._prefix_cache_len = prefix_len
 
     def _build_addr_key_pos_encoding(self, capacity, device, dtype):
         """Compute the ADDR_KEY positional encoding table.
