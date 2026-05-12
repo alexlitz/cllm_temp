@@ -432,6 +432,26 @@ class AutoregressiveAttention(nn.Module):
         )
         scores = scores + causal_mask
 
+        # Per-head soft-eviction mask (Phase B): when the pruner has set
+        # ``per_head_keep_mask`` on this layer's cache, each head's logits
+        # for positions where ``mask[b, h, s] == False`` are pushed to
+        # ``-inf`` so the head ignores that K/V row. Shape is
+        # ``[B, H, S_kv]`` → broadcast against scores' ``[B, H, S_q, S_kv]``.
+        # ``None`` is the legacy "no per-head masking" path — bit-identical
+        # to pre-Phase-B behaviour.
+        if (
+            kv_cache is not None
+            and getattr(kv_cache, "per_head_keep_mask", None) is not None
+            and kv_cache.per_head_keep_mask.shape[-1] == S_kv
+        ):
+            head_keep = kv_cache.per_head_keep_mask.to(x.device)  # [B, H, S_kv]
+            head_mask_neginf = torch.where(
+                head_keep,
+                torch.zeros((), device=x.device),
+                torch.full((), float("-inf"), device=x.device),
+            )
+            scores = scores + head_mask_neginf.unsqueeze(2)  # [B, H, 1, S_kv]
+
         # softmax1 for ZFOD (inlined with cached anchor=0 buffer to avoid
         # per-call torch.tensor() allocations; equivalent to softmax1(scores, dim=-1, anchor=0.0)).
         anchor = self._softmax1_anchor

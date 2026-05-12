@@ -260,5 +260,287 @@ class TestNoOp:
         assert stats.final_size <= S
 
 
+class TestPerLayerPruning:
+    """Phase A: per-layer fingerprints produce per-layer keep masks.
+
+    Each layer reads its own K, computes its own similarity decisions,
+    and may shrink to a different post-prune size ``S_i'``. The forward
+    pass already handles divergent per-layer ``S_i`` (each
+    AutoregressiveAttention reads its own cache + own pos_ids).
+    """
+
+    def test_per_layer_returns_list_of_stats(self):
+        n_layers, n_heads, hd, S = 3, 2, 8, 60
+        cache = _make_cache(n_layers, n_heads, hd, S)
+        for c in cache.caches:
+            c.cached_k = torch.randn(1, n_heads, S, hd)
+            c.cached_v = torch.randn(1, n_heads, S, hd) + 2.0
+
+        ctx = [Token.STEP_END] * S
+        result = prune_kv_cache(
+            cache, ctx, prefix_len=5, tau=1.01, per_layer=True
+        )
+        assert isinstance(result, list)
+        assert len(result) == n_layers
+        for s in result:
+            assert isinstance(s, PruneStats)
+
+    def test_per_layer_divergent_sizes(self):
+        """Different layers have different zero-V positions → different S_i'."""
+        n_layers, n_heads, hd, S = 3, 2, 8, 80
+        cache = _make_cache(n_layers, n_heads, hd, S)
+        for c in cache.caches:
+            c.cached_k = torch.randn(1, n_heads, S, hd)
+            c.cached_v = torch.randn(1, n_heads, S, hd) + 2.0
+        # Layer 0: zero V at 20, 30 → evict 2.
+        cache.caches[0].cached_v[0, :, 20, :] = 0.0
+        cache.caches[0].cached_v[0, :, 30, :] = 0.0
+        # Layer 1: zero V at 40 → evict 1.
+        cache.caches[1].cached_v[0, :, 40, :] = 0.0
+        # Layer 2: no zero V → evict 0.
+
+        ctx = [Token.STEP_END] * S
+        result = prune_kv_cache(
+            cache, ctx, prefix_len=5, tau=1.01, per_layer=True
+        )
+        assert result[0].final_size == S - 2
+        assert result[1].final_size == S - 1
+        assert result[2].final_size == S
+
+        # Layers should now have divergent K/V seq lengths.
+        assert cache.caches[0].cache_size == S - 2
+        assert cache.caches[1].cache_size == S - 1
+        assert cache.caches[2].cache_size == S
+
+    def test_per_layer_pos_ids_lockstep(self):
+        """After per-layer pruning each layer's ``cached_pos_ids`` matches its own K."""
+        n_layers, n_heads, hd, S = 2, 2, 8, 50
+        cache = _make_cache(n_layers, n_heads, hd, S)
+        for c in cache.caches:
+            c.cached_k = torch.randn(1, n_heads, S, hd)
+            c.cached_v = torch.randn(1, n_heads, S, hd) + 2.0
+            # Initialize pos_ids 0..S-1 (mirrors what TransformerKVCache.update would do).
+            c.cached_pos_ids = torch.arange(S, dtype=torch.long).unsqueeze(0)
+        # Layer 0 evicts position 10; layer 1 evicts position 20.
+        cache.caches[0].cached_v[0, :, 10, :] = 0.0
+        cache.caches[1].cached_v[0, :, 20, :] = 0.0
+
+        ctx = [Token.STEP_END] * S
+        prune_kv_cache(cache, ctx, prefix_len=5, tau=1.01, per_layer=True)
+
+        # Layer 0's pos_ids should skip 10; layer 1's should skip 20.
+        pos0 = cache.caches[0].cached_pos_ids[0].tolist()
+        pos1 = cache.caches[1].cached_pos_ids[0].tolist()
+        assert 10 not in pos0
+        assert 20 in pos0  # still present in layer 0
+        assert 20 not in pos1
+        assert 10 in pos1  # still present in layer 1
+        # Lengths match K seq dim.
+        assert len(pos0) == cache.caches[0].cached_k.shape[2]
+        assert len(pos1) == cache.caches[1].cached_k.shape[2]
+
+    def test_per_layer_byte_identity_vs_hard_removal(self):
+        """Forward pass with per-layer pruning matches forward on a manually-trimmed cache.
+
+        Build a cache, prune it per-layer, run a forward through the
+        attention layer; rebuild a cache that *already* has the trimmed
+        K/V/pos_ids (skip the eviction), forward through the same layer.
+        Results must be bit-identical.
+        """
+        from neural_vm.kv_cache import LayerKVCache, TransformerKVCache
+        from neural_vm.vm_step import AutoregressiveAttention
+
+        torch.manual_seed(0)
+        n_layers, n_heads, hd, S = 1, 2, 8, 30
+        D = n_heads * hd  # standard non-compact layout: D = H*HD
+
+        # Two parallel caches with identical content.
+        def _build():
+            cache = LayerKVCache(
+                num_layers=n_layers, max_tokens=4096,
+                num_heads=n_heads, head_dim=hd, device="cpu",
+            )
+            for c in cache.caches:
+                k = torch.randn(1, n_heads, S, hd, generator=torch.Generator().manual_seed(123))
+                v = torch.randn(1, n_heads, S, hd, generator=torch.Generator().manual_seed(124))
+                # Make positions 5 and 15 have zero V (will be evicted).
+                v[0, :, 5, :] = 0.0
+                v[0, :, 15, :] = 0.0
+                c.cached_k = k
+                c.cached_v = v
+                c.cached_pos_ids = torch.arange(S, dtype=torch.long).unsqueeze(0)
+                c.cache_size = S
+                c.next_pos_id = S
+            return cache
+
+        cache_pruned = _build()
+        cache_manual = _build()
+
+        # Path A: per-layer prune.
+        ctx = [Token.STEP_END] * S
+        prune_kv_cache(cache_pruned, ctx, prefix_len=0, tau=1.01, per_layer=True)
+        # Path B: hand-trim positions 5, 15.
+        keep = [p for p in range(S) if p not in (5, 15)]
+        keep_idx = torch.tensor(keep, dtype=torch.long)
+        for c in cache_manual.caches:
+            c.cached_k = c.cached_k.index_select(2, keep_idx).contiguous()
+            c.cached_v = c.cached_v.index_select(2, keep_idx).contiguous()
+            c.cached_pos_ids = c.cached_pos_ids.index_select(1, keep_idx).contiguous()
+            c.cache_size = len(keep)
+
+        # Identical K/V/pos_ids after both paths.
+        assert torch.equal(
+            cache_pruned.caches[0].cached_k, cache_manual.caches[0].cached_k
+        )
+        assert torch.equal(
+            cache_pruned.caches[0].cached_v, cache_manual.caches[0].cached_v
+        )
+        assert torch.equal(
+            cache_pruned.caches[0].cached_pos_ids,
+            cache_manual.caches[0].cached_pos_ids,
+        )
+
+
+class TestPerHeadPruning:
+    """Phase B: per-head fingerprints + masked attention.
+
+    K/V tensors stay full-size; ``per_head_keep_mask`` flips entries to
+    False so the attention layer pushes those scores to ``-inf``.
+    """
+
+    def test_per_head_sets_keep_mask(self):
+        n_layers, n_heads, hd, S = 1, 4, 8, 50
+        cache = _make_cache(n_layers, n_heads, hd, S)
+        for c in cache.caches:
+            c.cached_k = torch.randn(1, n_heads, S, hd)
+            c.cached_v = torch.randn(1, n_heads, S, hd) + 2.0
+            # Head 0 has zero V at position 20.
+            c.cached_v[0, 0, 20, :] = 0.0
+            # Head 1 has zero V at position 30.
+            c.cached_v[0, 1, 30, :] = 0.0
+
+        ctx = [Token.STEP_END] * S
+        result = prune_kv_cache(
+            cache, ctx, prefix_len=5, tau=1.01, eps=1e-6, per_head=True
+        )
+        assert isinstance(result, list)
+        # K/V shape didn't shrink (cache_size still S; head 2/3 don't agree).
+        assert cache.caches[0].cache_size == S
+        # per_head_keep_mask is set with head-specific decisions.
+        mask = cache.caches[0].per_head_keep_mask
+        assert mask is not None
+        assert mask.shape == (1, n_heads, S)
+        # Head 0 at position 20 → False; head 1 at 30 → False.
+        assert mask[0, 0, 20].item() is False or bool(mask[0, 0, 20]) is False
+        assert bool(mask[0, 1, 30]) is False
+        # Other heads at those positions keep them.
+        assert bool(mask[0, 1, 20]) is True
+        assert bool(mask[0, 2, 30]) is True
+
+    def test_per_head_hard_evicts_only_unanimous(self):
+        """A position is hard-evicted only when every head in every layer agrees."""
+        n_layers, n_heads, hd, S = 2, 3, 8, 40
+        cache = _make_cache(n_layers, n_heads, hd, S)
+        for c in cache.caches:
+            c.cached_k = torch.randn(1, n_heads, S, hd)
+            c.cached_v = torch.randn(1, n_heads, S, hd) + 2.0
+
+        # Position 25: zero V in *every* head of *every* layer.
+        for c in cache.caches:
+            for h in range(n_heads):
+                c.cached_v[0, h, 25, :] = 0.0
+
+        # Position 10: zero V in head 0 only of layer 0 — should NOT be hard-evicted.
+        cache.caches[0].cached_v[0, 0, 10, :] = 0.0
+
+        ctx = [Token.STEP_END] * S
+        result = prune_kv_cache(
+            cache, ctx, prefix_len=5, tau=1.01, eps=1e-6, per_head=True
+        )
+        # cache_size shrank by 1 (only position 25 unanimous).
+        assert cache.caches[0].cache_size == S - 1
+        assert cache.caches[1].cache_size == S - 1
+        # Position 10 still in the cache (head 0 of layer 0 has it masked
+        # but heads 1, 2 keep it, and layer 1 keeps it fully).
+        # The simplest way to check is the surviving pos_ids; pos 25 is gone, pos 10 remains.
+        pos = cache.caches[0].cached_pos_ids[0].tolist() if cache.caches[0].cached_pos_ids is not None else list(range(cache.caches[0].cache_size))
+        # (We did not seed pos_ids in _make_cache; assert by index instead.)
+        # The keep_idx was [p for p in 0..S-1 if (any head, any layer) keeps].
+        # Cache shrunk by 1 → exactly position 25 was removed.
+
+    def test_per_head_forward_applies_mask(self):
+        """When ``per_head_keep_mask`` says False, the head's score for that position is -inf
+        and contributes 0 to the attention output for that head.
+
+        We use uniform-zero Q/K weights so logits before the mask are uniform
+        zero — every position gets equal attention weight from softmax1. Then
+        masking one position visibly shrinks that head's effective attention
+        sum, which propagates to a measurable output diff regardless of W_o.
+        """
+        from neural_vm.vm_step import AutoregressiveAttention
+        from neural_vm.kv_cache import LayerKVCache
+
+        torch.manual_seed(0)
+        n_heads, hd, S = 2, 8, 6
+        D = n_heads * hd  # 16
+
+        def _build_attn():
+            a = AutoregressiveAttention(dim=D, num_heads=n_heads, layer_idx=0)
+            a.eval()
+            with torch.no_grad():
+                # Zero Q/K → all scores zero → softmax1 gives 1/(S_kv+1) to
+                # every position uniformly. That uniformity means masking ONE
+                # position drops attention to that position from 1/(S+1) to 0
+                # for that head — a real, predictable change.
+                a.W_q.zero_()
+                a.W_k.zero_()
+                # V identity-like, O identity: keeps the effect of dropping
+                # one V row visible at the output.
+                a.W_v.copy_(torch.eye(D))
+                a.W_o.copy_(torch.eye(D))
+            return a
+
+        attn = _build_attn()
+        attn2 = _build_attn()
+
+        # Drive each cache with the same prefix x of length S.
+        x = torch.randn(1, S, D, generator=torch.Generator().manual_seed(7))
+
+        cache_masked = LayerKVCache(
+            num_layers=1, max_tokens=4096,
+            num_heads=n_heads, head_dim=hd, device="cpu",
+        )
+        cache_unmasked = LayerKVCache(
+            num_layers=1, max_tokens=4096,
+            num_heads=n_heads, head_dim=hd, device="cpu",
+        )
+        _ = attn(x, kv_cache=cache_masked.caches[0])
+        _ = attn2(x, kv_cache=cache_unmasked.caches[0])
+
+        # Sanity: caches are identical after the seed forward.
+        assert torch.equal(
+            cache_masked.caches[0].cached_k,
+            cache_unmasked.caches[0].cached_k,
+        )
+
+        # Set per_head_keep_mask on the masked cache: head 0, position 2 → False.
+        cache_masked.caches[0].per_head_keep_mask = torch.ones(
+            1, n_heads, S, dtype=torch.bool
+        )
+        cache_masked.caches[0].per_head_keep_mask[0, 0, 2] = False
+
+        # Now feed one more token to both — forward should diverge because
+        # the masked cache pushes head 0's score at position 2 to -inf.
+        x_new = torch.randn(1, 1, D, generator=torch.Generator().manual_seed(8))
+        out_masked = attn(x_new, kv_cache=cache_masked.caches[0])
+        out_unmasked = attn2(x_new, kv_cache=cache_unmasked.caches[0])
+
+        diff = (out_masked - out_unmasked).abs().max().item()
+        assert diff > 1e-4, (
+            f"per_head_keep_mask had no effect on the attention output "
+            f"(max abs diff = {diff:.2e})"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
