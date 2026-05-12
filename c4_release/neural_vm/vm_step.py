@@ -6332,6 +6332,86 @@ def _set_layer14_jsr_ax_bytes_zero(ffn, S, BD, start_unit=0):
     return unit
 
 
+def _set_layer14_lc_ax_bytes_zero(ffn, S, BD, start_unit=0):
+    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_LC is active.
+
+    FIX (V7 Phase 7a): Per C4's LC (load-char) semantics, the loaded value is a
+    single byte placed in AX byte 0; AX bytes 1-3 must be 0. L15 attention
+    head 0 writes the resolved memory byte into ``OUTPUT_LO/HI`` at the AX
+    byte 0 position (gated by OP_LI_RELAY/OP_LC_RELAY + CMP+3). Heads 1-3
+    fire for LI (writing AX bytes 1-3 from the loaded word), but for LC they
+    must be suppressed so bytes 1-3 emit 0.
+
+    Approach mirrors ``_set_layer14_jsr_ax_bytes_zero`` (FIX 2026-05-12,
+    commit ced1f6b): at AX byte positions 1-3 (IS_BYTE + H1[AX] + NOT
+    BYTE_INDEX_0) when OP_LC_RELAY is active, write -3/S to every
+    OUTPUT_LO[k] / OUTPUT_HI[k] and +5/S to OUTPUT_LO[0] / OUTPUT_HI[0] so
+    the byte-value-0 token wins argmax — emitting AX bytes 1-3 = 0x00.
+    Byte 0 is protected by a strong BYTE_INDEX_0 blocker (-S * 4) so this
+    op does NOT override the L15 head 0 load result at byte 0.
+
+    OP_LC_RELAY at AX byte positions is supplied by L7 head 5 (V slot 2,
+    already wired in ``_set_layer7_memory_heads``).
+
+    Activation calculation (S=100):
+      W_up: IS_BYTE=1, H1+AX=1 → +2S = +200
+      W_up: BYTE_INDEX_0 * -S * 4: at byte 0, contributes -400 → pre-silu
+            = 200 - 150 - 400 = -350 → silu ≈ 0 (blocked at byte 0)
+      b_up: -S * 1.5 = -150
+      Gate: OP_LC_RELAY ≈ 1.0 at AX byte positions (via L7 head 5 relay)
+      pre-silu at bytes 1-3 = 50, silu ≈ 50, gate = 1.0, hidden = 50
+      Writes: -3/S * 50 = -1.5 to each OUTPUT_LO/HI[k] (k=0..15)
+              +5/S * 50 = +2.5 to OUTPUT_LO[0]/OUTPUT_HI[0]
+      Net at bytes 1-3: OUTPUT_LO[0]/HI[0] = +1.0 (boost),
+        OUTPUT_LO[k>0]/HI[k>0] = -1.5 → byte-value-0 wins.
+
+    Non-LC opcodes: OP_LC_RELAY ≈ 0 at AX byte positions → gate ≈ 0 → no
+    firing. At byte 0 (any op): the BYTE_INDEX_0 = -S*4 blocker forces
+    pre-silu < 0 → silu ≈ 0 → no firing.
+    """
+    unit = start_unit
+
+    # Unit 0: -3/S on all OUTPUT_LO[k] (bytes 1-3 only — byte 0 blocked)
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S  # H1 at AX marker index (AX_I = 1)
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 4  # Block at AX byte 0 position
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.OP_LC_RELAY] = 1.0
+    for k in range(16):
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = -3.0 / S
+    unit += 1
+
+    # Unit 1: -3/S on all OUTPUT_HI[k] (bytes 1-3 only)
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 4
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.OP_LC_RELAY] = 1.0
+    for k in range(16):
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = -3.0 / S
+    unit += 1
+
+    # Unit 2: +5/S boost on OUTPUT_LO[0] (bytes 1-3 only)
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 4
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.OP_LC_RELAY] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = 5.0 / S
+    unit += 1
+
+    # Unit 3: +5/S boost on OUTPUT_HI[0] (bytes 1-3 only)
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 4
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.OP_LC_RELAY] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 5.0 / S
+    unit += 1
+
+    return unit
+
+
 # =============================================================================
 # L15: Memory lookup (softmax1 + binary address matching)
 # =============================================================================
