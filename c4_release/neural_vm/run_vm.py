@@ -164,6 +164,7 @@ class AutoregressiveVMRunner:
         kv_cache_pruning_eps=1e-6,
         enable_divergence_bail=True,
         compile_mode=None,
+        enable_moe_routing=False,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -209,6 +210,32 @@ class AutoregressiveVMRunner:
                 ``torch.compiler.cudagraph_mark_step_begin()`` between
                 successive outer ``run()`` calls — the runner inserts
                 this automatically.
+            enable_moe_routing: If True, call ``model.compact()`` +
+                ``model.compact_moe()`` after construction so each FFN
+                layer's opcode-dependent hidden units are partitioned into
+                per-opcode ``SoftMoEFFN`` experts plus a shared FFN. This
+                is the standard top-K MoE path (Mixtral/DeepSeek/Qwen-
+                style): only the K experts selected by the OP_* one-hot
+                router actually run per token. For C4 ``top_k=1`` is the
+                natural choice — exactly one opcode is active per step.
+
+                **Defaults False.**  Byte-identity to the dense compacted
+                FFN is NOT achievable with the current partition: see
+                ``c4_release/docs/MOE_ROUTING_AUDIT.md`` for details.
+                Briefly, the partition labels a hidden unit as
+                "opcode-X-specific" via ``W_up[i, OP_X] > 0.5``, but
+                that unit's full row of W_up still picks up contributions
+                from OTHER input dims at non-MARK_PC positions in the
+                dense path. Routing those units to an opcode-gated expert
+                drops their non-MARK_PC contribution. ``test_imm_exit``
+                returns 42 with ``enable_moe_routing=False`` (dense) and
+                43 with ``enable_moe_routing=True`` (standard top-K MoE).
+                A future partition that's tight under one-hot routing
+                would close this gap.
+
+                Set True to enable the top-K MoE path for diagnostics
+                / A-B experiments or where the byte-identity gap is
+                acceptable.
         """
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
         # compile_full_vm. The compiler derives d_model and n_layers from the
@@ -220,7 +247,8 @@ class AutoregressiveVMRunner:
             compile_mode = "none"
         cache_key = (d_model, n_layers, n_heads, ffn_hidden, max_seq_len,
                      conversational_io, alu_mode,
-                     enable_neural_io_think_protocol, compile_mode)
+                     enable_neural_io_think_protocol, compile_mode,
+                     bool(enable_moe_routing))
         if cache_model and cache_key in AutoregressiveVMRunner._MODEL_CACHE:
             self.model = AutoregressiveVMRunner._MODEL_CACHE[cache_key]
         else:
@@ -236,6 +264,16 @@ class AutoregressiveVMRunner:
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
             self.model.eval()
+            # Wire standard top-K SoftMoEFFN routing onto the production
+            # path. ``compact()`` must run first because
+            # ``_partition_compact_ffn_by_opcode`` reads the
+            # already-compacted hidden-unit layout. Gated by
+            # ``enable_moe_routing`` so tests can opt out and exercise the
+            # dense compacted FFN.  Applied BEFORE ``torch.compile`` so the
+            # compiled graph captures the SoftMoEFFN forward.
+            if enable_moe_routing:
+                self.model.compact(block_size=32)
+                self.model.compact_moe()
             if compile_mode and compile_mode != "none":
                 # The model has ~30 blocks with distinct FFN shapes (each
                 # block was right-sized by ``_right_size_ffns``). Compiling
@@ -398,6 +436,12 @@ class AutoregressiveVMRunner:
         self._kv_pruning_stats = {"calls": 0, "evicted_total": 0,
                                   "evicted_by_similarity": 0,
                                   "evicted_by_zero_v": 0}
+
+        # MoE routing flag — recorded for diagnostic visibility.
+        # ``compact()`` + ``compact_moe()`` already ran above (gated by
+        # the same flag), so this is purely informational at the runner
+        # level.
+        self.enable_moe_routing = bool(enable_moe_routing)
 
         # Divergence-bail configuration. When True (default), `run` watches for
         # pathological autoregressive states (PC stuck at 0, PC looping on one

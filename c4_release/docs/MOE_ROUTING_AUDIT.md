@@ -202,3 +202,80 @@ If ONNX/sparse compatibility is not required for the foreseeable future and runt
 - Archived spec-compliant implementation:
   - `/home/alexlitz/Documents/misc/c4_release/neural_vm/archive/pure_moe.py` (class `MoE`, alias `SoftMoEFFN`)
   - `/home/alexlitz/Documents/misc/c4_release/neural_vm/archive/vm_step_legacy.py`
+
+---
+
+## 8. 2026-05-12 Addendum: Standard top-K MoE pivot
+
+The May-2026 conversion to a Soft-MoE-style `SoftMoEFFN` (commits `2e853c3`,
+`8b0aa42`, `66bf21e`, `ce2a704`) and the subsequent wiring of `compact_moe()`
+into `AutoregressiveVMRunner` (commit `7d7b93d`, branch `wire-moe-routing-default`)
+landed a `SoftMoEFFN` that pooled routing weights across the sequence and
+soft-blended all experts. That regressed `test_imm_exit` from 42 to 43 in
+pure_neural mode — the soft-blend semantics differed from both the dense
+compacted FFN and the legacy weight-swap path.
+
+Per user feedback (this branch, `moe-standard-topk-routing`), the soft-MoE
+approach is moot: the desired routing is **standard top-K MoE**
+(Mixtral/DeepSeek/Qwen-style), where only the K experts selected by the
+router actually run per token. For C4 with one-hot OP_* routing, `top_k=1`
+is the natural choice — exactly one opcode is active per VM step.
+
+### 8.1 Current state (this branch)
+
+- `pure_moe.SoftMoEFFN` is **rewritten** as a standard top-K MoE:
+  - Sparse per-expert dispatch (Mixtral-style): only the routed experts'
+    sub-batch of tokens runs through each expert. Memory-efficient.
+  - Raw one-hot routing gates (no softmax renormalization): the OP_*
+    dim's exact value is the gate. Active opcode → gate=1.0; non-active
+    → gate=0.0. Softmax would smear uniform weights at non-MARK_PC
+    positions, breaking the intended sparse-dispatch semantics.
+  - Always-on `shared_ffn`: opcode-INDEPENDENT hidden units form a small
+    PureFFN that runs at every position (DeepSeek shared-expert pattern).
+    `b_down` lives here so it applies once.
+  - Class name `SoftMoEFFN` retained for back-compat; `StandardMoEFFN`
+    is the preferred forward-looking alias.
+- `build_soft_moe_from_compact_partition()` constructs the new MoE from
+  the same `compact_moe` partition output (shared_indices + opcode_to_units),
+  but now splits shared into the always-on `shared_ffn` and each expert
+  holds ONLY its opcode-specific units.
+- `AutoregressiveVMRunner` exposes `enable_moe_routing: bool`. **Defaults
+  False** — see §8.2 below.
+
+### 8.2 Byte-identity gap (open)
+
+`enable_moe_routing=True` does NOT produce byte-identical output to
+`enable_moe_routing=False` on the production model. `test_imm_exit` returns
+42 with MoE off and 43 with MoE on — the same regression observed on
+`wire-moe-routing-default`. Root cause:
+
+The `_partition_compact_ffn_by_opcode` partition labels a hidden unit as
+opcode-X-specific via `W_up[i, OP_X_dim] > 0.5` (plus a CMP relay map at L6).
+But those units still have NON-ZERO weights in OTHER columns of W_up, so in
+the dense path they receive substantial activation contributions from
+non-opcode input dims at non-MARK_PC positions. Routing those units to an
+opcode-gated expert (gate=0 at non-MARK_PC) drops their non-MARK_PC
+contribution.
+
+Empirical probe: L6.ffn on a random non-opcode input produces a delta of
+~3.2e+03; the equivalent MoE produces ~1.7e+02. Diff ~3.1e+03. This
+propagates through the model and shifts the output token.
+
+### 8.3 Path forward (not implemented here)
+
+To make `enable_moe_routing=True` byte-identical to the dense path, one of:
+
+1. **Re-bake** the production FFNs so that opcode-specific units truly
+   only fire when the opcode is active (e.g. `b_up` set so non-opcode
+   silu is exactly 0). Invasive bake change.
+2. **Tighter partition** that labels a unit as opcode-X-specific only if
+   its output contribution is provably zero outside MARK_PC. May yield
+   far fewer expert-routable units and reduce the MoE win.
+3. **Accept the divergence** and re-bake the model with the MoE routing
+   in the loop (so the production weights are tuned for MoE semantics).
+
+The current branch lands the structural rewrite (the **top-K MoE module
+itself is now correct as a transformer MoE primitive**) and the runner
+flag plumbing, but defers the bake-side reconciliation. `enable_moe_routing=True`
+remains an opt-in flag for A/B experimentation; the default keeps the
+working dense path.
