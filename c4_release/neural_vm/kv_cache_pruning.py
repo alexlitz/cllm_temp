@@ -32,7 +32,7 @@ and the LRU MEM history in ``run_vm.py``).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 
 import torch
 import torch.nn.functional as F
@@ -129,11 +129,32 @@ def _layer0_key_fingerprint(layer_cache) -> Optional[torch.Tensor]:
 
     Returns ``None`` if the layer cache is empty.
     """
+    return _layer_key_fingerprint(layer_cache)
+
+
+def _layer_key_fingerprint(layer_cache) -> Optional[torch.Tensor]:
+    """Compute per-position head-averaged K fingerprint for *this* layer.
+
+    Same shape contract as ``_layer0_key_fingerprint`` (``[S, HD]``) — the
+    only difference is the caller chooses which layer's K to read. Used by
+    per-layer pruning (Phase A) where each layer's similarity decisions
+    are based on that layer's own K, not layer 0's.
+    """
     K = layer_cache.cached_k
     if K is None:
         return None
-    # K: [B, H, S, HD]. Take batch 0 and mean across heads.
     return K[0].mean(dim=0)  # [S, HD]
+
+
+def _layer_per_head_key(layer_cache) -> Optional[torch.Tensor]:
+    """Per-head K (no head-averaging) for Phase B per-head fingerprints.
+
+    Returns ``[H, S, HD]`` for batch 0, or ``None``.
+    """
+    K = layer_cache.cached_k
+    if K is None:
+        return None
+    return K[0]  # [H, S, HD]
 
 
 def _layer0_value_norms(layer_cache) -> Optional[torch.Tensor]:
@@ -141,12 +162,24 @@ def _layer0_value_norms(layer_cache) -> Optional[torch.Tensor]:
 
     Returns ``None`` if the layer cache is empty.
     """
+    return _layer_value_norms(layer_cache)
+
+
+def _layer_value_norms(layer_cache) -> Optional[torch.Tensor]:
+    """Per-position head-averaged V L2 norms for *this* layer (``[S]``)."""
     V = layer_cache.cached_v
     if V is None:
         return None
-    # V: [B, H, S, HD]. Take batch 0, mean across heads, then L2 norm.
     avg = V[0].mean(dim=0)  # [S, HD]
     return avg.norm(dim=-1)  # [S]
+
+
+def _layer_per_head_value_norms(layer_cache) -> Optional[torch.Tensor]:
+    """Per-head V L2 norms for Phase B (``[H, S]``)."""
+    V = layer_cache.cached_v
+    if V is None:
+        return None
+    return V[0].norm(dim=-1)  # [H, S]
 
 
 def _find_similarity_victims(
@@ -190,6 +223,41 @@ def _find_similarity_victims(
     return [bucket_positions[k] for k in victim_local]
 
 
+def _victims_for_layer(
+    K_fp: torch.Tensor,
+    V_norms: Optional[torch.Tensor],
+    buckets: Dict[str, List[int]],
+    prefix_len: int,
+    tau: float,
+    eps: float,
+    stats: PruneStats,
+) -> set:
+    """Compute victim positions for one (K_fp, V_norms) pair.
+
+    Mutates ``stats`` in place for similarity / zero-V counts and per-bucket
+    breakdown. Returns the set of victim positions.
+    """
+    victims: set = set()
+    for name, positions in buckets.items():
+        if len(positions) < 2:
+            continue
+        bucket_victims = _find_similarity_victims(K_fp, positions, tau)
+        if bucket_victims:
+            stats.per_bucket[name] = stats.per_bucket.get(name, 0) + len(bucket_victims)
+            stats.evicted_by_similarity += len(bucket_victims)
+            victims.update(bucket_victims)
+    if V_norms is not None:
+        zero_mask = V_norms < eps
+        zero_positions = zero_mask.nonzero(as_tuple=False).flatten().tolist()
+        zero_unprotected = [
+            p for p in zero_positions if p >= prefix_len and p not in victims
+        ]
+        if zero_unprotected:
+            stats.evicted_by_zero_v += len(zero_unprotected)
+            victims.update(zero_unprotected)
+    return victims
+
+
 def prune_kv_cache(
     kv_cache,
     context: Sequence[int],
@@ -197,12 +265,36 @@ def prune_kv_cache(
     tau: float = 0.99,
     eps: float = 1e-6,
     min_cache_size: int = 0,
-) -> PruneStats:
+    per_layer: bool = False,
+    per_head: bool = False,
+) -> Union[PruneStats, List[PruneStats]]:
     """Run two-rule pruning on a ``LayerKVCache`` (in-place).
 
-    Implements ``docs/KV_CACHE_PRUNING_SPEC.md`` §2.1 + §2.2 + §4.2.
+    Implements ``docs/KV_CACHE_PRUNING_SPEC.md`` §2.1 + §2.2 + §4.2 plus
+    the Phase A (per-layer) and Phase B (per-head) extensions.
 
-    Algorithm:
+    Three modes:
+
+    - **Uniform** (default, ``per_layer=False``, ``per_head=False``):
+      Single layer-0 fingerprint drives a keep-mask shared across all
+      layers. Returns a single ``PruneStats``.
+    - **Per-layer** (``per_layer=True``): Each layer computes its own
+      fingerprint from its own K (not layer 0's) and its own keep-mask.
+      Different layers may shrink to different sizes ``S_i'``. Returns a
+      ``List[PruneStats]``, one per layer.
+    - **Per-head** (``per_head=True``): Each (layer, head) pair gets its
+      own keep decision. The K/V tensors stay full-size (one row per
+      original cached position) but ``per_head_keep_mask`` flips entries
+      to ``False`` so the attention layer masks those scores to ``-inf``.
+      Hard global eviction only fires if *all* heads in *all* layers
+      agree to drop a row. Returns a ``List[PruneStats]`` per layer.
+
+    ``per_layer`` and ``per_head`` are independent. If both are False, the
+    legacy uniform path runs. If both are True, per-head fingerprints
+    drive each layer's per-head decisions and a global keep-mask still
+    rides on AND-across-heads-and-layers.
+
+    Algorithm (uniform):
 
     1. Bucket each cached position by source token type using
        ``context`` (the runner's live token list, which the caller
@@ -215,7 +307,6 @@ def prune_kv_cache(
     4. Build a ``keep_idx`` LongTensor and call ``index_select(dim=2,
        index=keep_idx)`` on every layer's ``cached_k``/``cached_v``.
 
-    The keep-mask is shared across all layers (spec §3.3).
     The prefix region ``[0, prefix_len)`` is never evicted.
 
     Args:
@@ -231,58 +322,67 @@ def prune_kv_cache(
             Spec §3.2 recommends ``256`` for runtime callers; defaulting
             to ``0`` here keeps the function policy-free so the runner
             integration (and unit tests) can choose.
+        per_layer: when True, compute per-layer fingerprints and return a
+            ``List[PruneStats]``.
+        per_head: when True, compute per-head fingerprints and apply via
+            ``per_head_keep_mask`` (soft eviction). Returns a
+            ``List[PruneStats]``.
 
     Returns:
-        ``PruneStats`` with eviction counts and per-bucket breakdown.
+        ``PruneStats`` (uniform) or ``List[PruneStats]`` (per-layer /
+        per-head). In per-head mode the stats record "soft" evictions
+        — the cache rows are not removed unless all heads agree.
     """
-    stats = PruneStats()
     if not kv_cache.caches:
-        return stats
+        empty = PruneStats()
+        return [empty] if (per_layer or per_head) else empty
 
     layer0 = kv_cache.caches[0]
     if layer0.cached_k is None:
-        return stats
+        empty = PruneStats()
+        return (
+            [PruneStats() for _ in kv_cache.caches]
+            if (per_layer or per_head)
+            else empty
+        )
 
     cache_size = layer0.cache_size
-    stats.initial_size = cache_size
-    stats.final_size = cache_size
 
     if cache_size <= min_cache_size or cache_size <= prefix_len:
-        return stats
+        if per_layer or per_head:
+            return [
+                PruneStats(initial_size=cache_size, final_size=cache_size)
+                for _ in kv_cache.caches
+            ]
+        return PruneStats(initial_size=cache_size, final_size=cache_size)
 
-    # 1. Bucket positions by source token.
+    # Bucket positions once — the bucket assignment is purely about
+    # source-token type, not the K vectors, so it's shared across modes.
     buckets = bucket_positions(context, prefix_len, cache_size)
 
-    # 2. Per-bucket key-similarity eviction.
-    K_fp = _layer0_key_fingerprint(layer0)
+    if per_head:
+        return _prune_per_head(
+            kv_cache, buckets, prefix_len, tau, eps
+        )
+
+    if per_layer:
+        return _prune_per_layer(
+            kv_cache, buckets, prefix_len, tau, eps
+        )
+
+    # Uniform path: drive everything off layer 0.
+    stats = PruneStats(initial_size=cache_size, final_size=cache_size)
+    K_fp = _layer_key_fingerprint(layer0)
     if K_fp is None:
         return stats
 
-    victims: set = set()
-    for name, positions in buckets.items():
-        if len(positions) < 2:
-            continue
-        bucket_victims = _find_similarity_victims(K_fp, positions, tau)
-        if bucket_victims:
-            stats.per_bucket[name] = len(bucket_victims)
-            stats.evicted_by_similarity += len(bucket_victims)
-            victims.update(bucket_victims)
-
-    # 3. Zero-V eviction.
-    V_norms = _layer0_value_norms(layer0)
-    if V_norms is not None:
-        # Skip the protected prefix range.
-        zero_mask = V_norms < eps
-        zero_positions = zero_mask.nonzero(as_tuple=False).flatten().tolist()
-        zero_unprotected = [p for p in zero_positions if p >= prefix_len and p not in victims]
-        if zero_unprotected:
-            stats.evicted_by_zero_v = len(zero_unprotected)
-            victims.update(zero_unprotected)
-
+    V_norms = _layer_value_norms(layer0)
+    victims = _victims_for_layer(
+        K_fp, V_norms, buckets, prefix_len, tau, eps, stats
+    )
     if not victims:
         return stats
 
-    # 4. Build keep-mask + delegate the layer-uniform apply to LayerKVCache.
     # Spec §3.3: keep-mask must be identical across layers. The
     # ``LayerKVCache.prune`` API is the single chokepoint that enforces
     # that invariant and keeps ``cached_pos_ids`` in lock-step with K/V.
@@ -293,3 +393,174 @@ def prune_kv_cache(
 
     stats.final_size = new_size
     return stats
+
+
+def _prune_per_layer(
+    kv_cache,
+    buckets: Dict[str, List[int]],
+    prefix_len: int,
+    tau: float,
+    eps: float,
+) -> List[PruneStats]:
+    """Phase A: each layer computes its own fingerprint + keep-mask.
+
+    Each layer can shrink to its own ``S_i'``. ``LayerKVCache.prune``
+    handles the per-layer index_select including ``cached_pos_ids``, so
+    ``AutoregressiveAttention.forward`` keeps reading the right pos_ids
+    per layer.
+    """
+    per_layer_stats: List[PruneStats] = []
+    per_layer_keep: List[torch.Tensor] = []
+    any_eviction = False
+
+    for layer_cache in kv_cache.caches:
+        stats = PruneStats()
+        if layer_cache.cached_k is None:
+            per_layer_stats.append(stats)
+            # Pass an empty index tensor; LayerKVCache.prune treats this
+            # layer as already-empty and leaves it alone.
+            per_layer_keep.append(
+                torch.zeros(0, dtype=torch.long)
+            )
+            continue
+
+        layer_size = layer_cache.cache_size
+        stats.initial_size = layer_size
+        stats.final_size = layer_size
+
+        K_fp = _layer_key_fingerprint(layer_cache)
+        V_norms = _layer_value_norms(layer_cache)
+        if K_fp is None:
+            per_layer_stats.append(stats)
+            # Keep everything (identity).
+            keep_idx = torch.arange(
+                layer_size, dtype=torch.long, device=layer_cache.cached_k.device
+            )
+            per_layer_keep.append(keep_idx)
+            continue
+
+        victims = _victims_for_layer(
+            K_fp, V_norms, buckets, prefix_len, tau, eps, stats
+        )
+        device = layer_cache.cached_k.device
+        if victims:
+            keep = [p for p in range(layer_size) if p not in victims]
+            keep_idx = torch.tensor(keep, dtype=torch.long, device=device)
+            any_eviction = True
+        else:
+            keep_idx = torch.arange(layer_size, dtype=torch.long, device=device)
+        per_layer_keep.append(keep_idx)
+        per_layer_stats.append(stats)
+
+    if any_eviction:
+        new_sizes = kv_cache.prune(per_layer_keep)
+        for s, ns in zip(per_layer_stats, new_sizes):
+            s.final_size = ns
+
+    return per_layer_stats
+
+
+def _prune_per_head(
+    kv_cache,
+    buckets: Dict[str, List[int]],
+    prefix_len: int,
+    tau: float,
+    eps: float,
+) -> List[PruneStats]:
+    """Phase B: per-(layer, head) decisions via ``per_head_keep_mask``.
+
+    For each head h in each layer L:
+    - Compute per-head K fingerprint (no head-average).
+    - Run the §2.1 / §2.2 rules at head granularity.
+    - Soft-evict via ``per_head_keep_mask[B, h, S] = False`` so the
+      forward pass masks those scores to ``-inf``.
+
+    A row is hard-evicted (deleted from K/V) only when every head in
+    every layer agrees to drop it — i.e. for position ``s``,
+    ``all_layers ∧_h per_head_keep_mask[:, h, s] == False``. This keeps
+    memory bounded while still allowing different heads to disagree on
+    cheap rows.
+    """
+    per_layer_stats: List[PruneStats] = []
+
+    # AND across all (layer, head) of the keep mask. Initialized to "keep"
+    # and flipped to False at any (layer, head) that votes evict.
+    layer0 = kv_cache.caches[0]
+    cache_size = layer0.cache_size
+    device = layer0.cached_k.device
+
+    global_evict_vote = torch.ones(
+        cache_size, dtype=torch.bool, device=device
+    )  # True = at least one head voted to keep.
+
+    for layer_cache in kv_cache.caches:
+        stats = PruneStats()
+        if layer_cache.cached_k is None:
+            per_layer_stats.append(stats)
+            continue
+
+        layer_size = layer_cache.cache_size
+        stats.initial_size = layer_size
+        stats.final_size = layer_size  # per-head doesn't shrink rows.
+
+        K_per_head = _layer_per_head_key(layer_cache)  # [H, S, HD]
+        V_norms_per_head = _layer_per_head_value_norms(layer_cache)  # [H, S]
+
+        if K_per_head is None:
+            per_layer_stats.append(stats)
+            continue
+
+        H = K_per_head.shape[0]
+        S = K_per_head.shape[1]
+        dev = K_per_head.device
+
+        # Build or fetch per-head keep mask: [B, H, S]; initialize to all True.
+        if (
+            layer_cache.per_head_keep_mask is None
+            or layer_cache.per_head_keep_mask.shape[-1] != S
+        ):
+            B = layer_cache.cached_k.shape[0]
+            layer_cache.per_head_keep_mask = torch.ones(
+                B, H, S, dtype=torch.bool, device=dev
+            )
+
+        # Decisions per head.
+        for h in range(H):
+            K_fp_h = K_per_head[h]  # [S, HD]
+            V_norms_h = V_norms_per_head[h] if V_norms_per_head is not None else None
+            head_victims = _victims_for_layer(
+                K_fp_h, V_norms_h, buckets, prefix_len, tau, eps, stats
+            )
+            if head_victims:
+                idx = torch.tensor(
+                    sorted(head_victims), dtype=torch.long, device=dev
+                )
+                layer_cache.per_head_keep_mask[:, h, idx] = False
+
+        # Update global evict vote: a position is hard-evictable only when
+        # *every* head in this layer voted False. We compute the per-layer
+        # AND of "did all heads vote evict?" = ``~any_head_keeps``.
+        # Across layers we AND those together (a position survives globally
+        # if any (layer, head) wants to keep it).
+        any_head_keeps_layer = layer_cache.per_head_keep_mask[0].any(dim=0)  # [S]
+        global_evict_vote = global_evict_vote & any_head_keeps_layer
+
+        per_layer_stats.append(stats)
+
+    # global_evict_vote[s] = True means at least one (layer, head) wants
+    # to keep position s. We hard-evict positions where the vote is False
+    # (i.e. all heads in all layers said evict), and only outside the
+    # prefix region.
+    keep_bool = global_evict_vote.clone()
+    if prefix_len > 0:
+        keep_bool[:prefix_len] = True  # protected prefix.
+
+    # Only hard-evict if at least one position is fully out-voted.
+    if (~keep_bool).any():
+        keep_idx = keep_bool.nonzero(as_tuple=False).flatten()
+        new_size = kv_cache.prune(keep_idx)
+        for s in per_layer_stats:
+            if s.initial_size > 0:
+                s.final_size = new_size
+
+    return per_layer_stats
