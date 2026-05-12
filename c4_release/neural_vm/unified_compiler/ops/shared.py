@@ -154,18 +154,33 @@ def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
     )
 
 
-def _ensure_l11_mul_module(block, S):
+def _ensure_l11_mul_module(block, S, dim_positions=None):
     """Get or install the FlattenedALUMul module on ``block.ffn``.
 
     The 9 phase-ordered installer ops each call this helper; the first one
     (lowest phase) installs the module, the rest re-use it. Idempotent.
+
+    Args:
+        block: target transformer block (FlattenedALUMul is installed on
+            ``block.ffn``).
+        S: number of sequence positions (passed through to FlattenedALUMul).
+        dim_positions: optional dict mapping dim name -> start position. When
+            provided, FlattenedALUMul receives a `_SetDim`-shaped proxy whose
+            attribute values are the compiler-allocated positions; without
+            this, the sub-stages (BDToGEConverter, _BDToGEStage,
+            _MulCombineStage, _GEToBDStage) bake weights at the legacy
+            ``_SetDim`` positions and silently mis-address ALU_LO/HI,
+            AX_CARRY_LO/HI, OP_MUL, OUTPUT_LO/HI etc. under
+            ``pin_io_only=True``. Falls back to raw ``_SetDim`` when None
+            (legacy hand-set callers).
     """
     from ...efficient_alu_neural import FlattenedALUMul
     from ...vm_step import _SetDim
     existing = getattr(block, "ffn", None)
     if isinstance(existing, FlattenedALUMul):
         return existing
-    module = FlattenedALUMul(S, _SetDim)
+    BD = _as_setdim_proxy(dim_positions) if dim_positions is not None else _SetDim
+    module = FlattenedALUMul(S, BD)
     block.ffn = module
     return module
 
