@@ -99,8 +99,8 @@ architectural / pragmatic per blog", is a real violation per the canonical:
 **What stays acceptable:**
 - V8/V16: tool-calling mode opt-in (opcode → TOOL_CALL → host syscall →
   AX override). Per spec line 842-849, this is an intentional second mode.
-- V20: prefix-embedding cache. It's a memoisation of deterministic
-  computation, not Python state.
+- V20: prefix-embedding cache — retired 2026-05-12; replaced by the
+  unified KV cache prefix preload (`_preload_kv_cache_with_prefix`).
 
 **Net headline (corrected):** the *pure_neural-blocking* set is now closer
 to ~10 items, not 2. The "blog-spec intentional" pile collapses to ~2
@@ -151,7 +151,7 @@ The audit covers four surfaces:
 | V17 | `_decode_exit_code` post-run | `run_vm.py:2001-2009` | GREEN — acceptable per spec ([review](V17_DECODE_EXIT_CODE_OK.md)) | NO (result extraction) | N/A |
 | V18 | Conversational-I/O THINKING_END handling | `run_vm.py:384-432` | gated off in pure_neural | NO (handler-mode only) | M (separate convo-io migration) |
 | V19 | `_func_call_handlers` dict | `run_vm.py:255,756-758` | dead by default | NO (empty default) | S (delete) |
-| V20 | Prefix-embedding cache | `neural_embedding.py:51-70,162-264` | optimisation, not violation | NO | N/A |
+| V20 | Prefix-embedding cache | retired 2026-05-12 — replaced by unified KV cache prefix preload (`run_vm.py:_preload_kv_cache_with_prefix`) | retired | N/A | N/A |
 
 **Headline counts (post-I1/I3/B2/alibi-mem):**
 
@@ -596,15 +596,11 @@ Function is already at the irreducible 9-line minimum.
 
 ---
 
-## V20 — Prefix-embedding cache
+## V20 — Prefix-embedding cache (RETIRED 2026-05-12)
 
-**File/lines:** `c4_release/neural_vm/neural_embedding.py:51-70,162-264`
+**Status:** retired — replaced by unified KV cache prefix preload.
 
-**What it does:** Caches the augmentation delta for the immutable CODE/DATA prefix region across calls within a single `run()`. On cache hit, applies the delta as a single in-place add and skips per-position Python loops for cached positions.
-
-**Severity:** optimisation, not a violation. The cached values are exactly what `_inject_*` would produce on every call; this is just memoisation.
-
-**Note:** the cache invalidates on different bytecode (`reset_prefix_cache()` is called at the top of every `run()`). It does **not** survive `_inject_active_opcode` writes (line 226-230 comment): the active-opcode dim writes are excluded from the cache because they can change between forwards within a run.
+**Replacement:** `AutoregressiveVMRunner._preload_kv_cache_with_prefix` (`run_vm.py`) eagerly populates the per-layer `LayerKVCache` with K/V tensors for the immutable CODE/DATA/argv prefix at the start of each `run()`. Subsequent `model.forward` calls pass `cached_prefix_len=prefix_end`, so attention reuses the prefix K/V directly. The KV cache subsumes the role of the old embedding-layer delta cache at the proper level (transformer K/V, not embedding modifications), and the prefix-cache state (`_prefix_cache_*`, `reset_prefix_cache`, `_compute_prefix_len`, `_prefix_cache_matches`, `_populate_prefix_cache`) was deleted from `NeuralVMEmbedding` (~100 lines).
 
 ---
 
@@ -643,7 +639,7 @@ Function is already at the irreducible 9-line minimum.
 - V12 set_active_opcode call sites
 - V18 conversational-I/O
 - V19 `_func_call_handlers`
-- V20 prefix cache (already an optimisation, not a violation)
+- V20 prefix cache (retired 2026-05-12 — replaced by unified KV cache prefix preload)
 
 ---
 
@@ -686,7 +682,7 @@ spec.
 - Deferred-architectural (intentional per blog): **3** (V2, V5, V6)
 - Cosmetic / dead-code-after-handler-retires: **5** (V1, V4, V12, V18, V19)
 - External / always-Python: **5** (V8, V9, V11, V16, V17)
-- LANDED / in-flight: **4** (V3 alibi-in-flight, V13 I1-in-flight, V14 I3-in-flight, V15 I2-landed)
-- Optimisation, not violation: **1** (V20)
+- LANDED / in-flight: **5** (V3 alibi-in-flight, V13 I1-in-flight, V14 I3-in-flight, V15 I2-landed, V20 retired 2026-05-12)
+- Optimisation, not violation: **0** (V20 was the last; now retired)
 
 **Total residual surface tracked: 20 items.**
