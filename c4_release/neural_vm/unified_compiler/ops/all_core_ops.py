@@ -86,6 +86,12 @@ def all_core_ops(
         make_phase_a_ffn_op(),
         make_layer1_ffn_op(),
         make_layer2_mem_byte_flags_op(),
+        # Cancels the REG_PC token-embedding initial-PC bake at step-1+ PC
+        # markers (MARK_PC AND HAS_SE). Runs at L2 (phase=2.5) so L3 FFN's
+        # PC INCREMENT sees a clean EMBED_LO/HI — see docstring on the
+        # factory for why the prior L3-inline cancel leaks via PC
+        # INCREMENT reading the FFN's input residual.
+        make_layer2_initial_pc_bake_cancel_op(),
         # `make_nibble_copy_ffn_op` (kind="ffn", not migrated) is kept as a
         # placeholder in the dep graph: removing it shifts the dep-graph layout
         # for L11/L12 ops. The actual L15 nibble-copy bake is performed by

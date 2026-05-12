@@ -2611,31 +2611,33 @@ def _set_layer3_ffn(ffn, S, BD):
     ffn.W_down[BD.EMBED_HI + pc_hi, unit] = -2.0 / S  # Also undo EMBED
     unit += 1
 
-    # INITIAL_PC_BAKE CANCEL: undo the REG_PC token-embedding initial-PC bake
-    # at MARK_PC AND HAS_SE positions (i.e. every step-1+ PC marker).
+    # INITIAL_PC_BAKE CANCEL: previously cancelled the REG_PC token-embedding
+    # initial-PC bake (``make_initial_pc_bake_op`` in
+    # unified_compiler/ops/model_ops.py) here at MARK_PC AND HAS_SE.
     #
-    # Migration 2026-05-11 (i1): the runtime `_inject_initial_pc` injection in
-    # NeuralVMEmbedding (which wrote EMBED_LO+PC_OFFSET_LO=1.0 and
-    # EMBED_HI+PC_OFFSET_HI=1.0 only at step-0's REG_PC) was replaced by
-    # baking that pattern directly into the REG_PC token-embedding row. The
-    # bake naturally fires at every REG_PC position, so step-1+ PC markers
-    # also pick up the +1.0/+1.0 contribution and would corrupt the L3
-    # carry-forward result on EMBED_LO/HI. These two cancel units subtract
-    # -1.0 from EMBED_LO+PC_OFFSET_LO and EMBED_HI+PC_OFFSET_HI when
-    # MARK_PC AND HAS_SE — restoring step-1+ behavior to the exact pre-bake
-    # residual stream. See `make_initial_pc_bake_op` in
-    # unified_compiler/ops/model_ops.py for the embedding-side bake.
+    # 2026-05-12 (Phase-1 PC carry fix): moved to L2 FFN
+    # (``make_layer2_initial_pc_bake_cancel_op``) because the cancel needs
+    # to land BEFORE L3's PC INCREMENT reads EMBED_LO[k]. Inlining the
+    # cancel inside L3 FFN only modified the OUTPUT residual, so PC
+    # INCREMENT (which reads the FFN's INPUT residual EMBED_LO[k]) still
+    # leaked a phantom contribution from the polluted
+    # EMBED_LO[init_pc_lo]=+1.0 nibble into
+    # OUTPUT_LO[(init_pc_lo + INSTR_WIDTH) % 16] — aliasing onto the
+    # FIRST-STEP DEFAULT slot and corrupting every step-1+ PC byte 0 by
+    # +INSTR_WIDTH (broke ``test_two_imms``, ``test_jmp_from_step_2``,
+    # ``test_jmp_backward``, smoke ``test_add_basic`` multi-step).
+    #
+    # The two cancel units below are kept as no-ops to preserve the L3
+    # FFN unit count / right-sizing footprint; their W_down stays zero so
+    # they contribute nothing to the residual. Removing them entirely
+    # would shift downstream unit indices in this bake and risk subtle
+    # regressions; leaving them as zero-write placeholders is a tiny
+    # 2-unit cost that ``_right_size_ffns`` later prunes anyway.
     init_pc_lo = PC_OFFSET & 0xF
     init_pc_hi = (PC_OFFSET >> 4) & 0xF
-    ffn.W_up[unit, BD.HAS_SE] = S
-    ffn.b_up[unit] = -S * 0.5
-    ffn.W_gate[unit, BD.MARK_PC] = 1.0
-    ffn.W_down[BD.EMBED_LO + init_pc_lo, unit] = -1.0 / S
+    # (no-op placeholder: cancel now happens at L2)
     unit += 1
-    ffn.W_up[unit, BD.HAS_SE] = S
-    ffn.b_up[unit] = -S * 0.5
-    ffn.W_gate[unit, BD.MARK_PC] = 1.0
-    ffn.W_down[BD.EMBED_HI + init_pc_hi, unit] = -1.0 / S
+    # (no-op placeholder: cancel now happens at L2)
     unit += 1
 
     # SP DEFAULT: STACK_INIT = 0x10000
