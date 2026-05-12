@@ -202,10 +202,14 @@ class NeuralVMEmbedding(nn.Module):
         # state mutation and a ``.tolist()`` scan that the ONNX tracer can't
         # capture. When exporting, bypass the cache entirely and run the
         # un-cached augmentations every call.
+        #
+        # We also avoid the pre-allocated ADDR_KEY buffer (which would freeze
+        # the traced graph at ``max_seq_len`` capacity); instead we recompute
+        # the ADDR_KEY positional encoding from scratch with ``torch.arange``
+        # so the exported model accepts *any* sequence length at inference.
         if torch.onnx.is_in_onnx_export():
-            self._add_code_addr_keys(token_ids, x)
+            self._compute_addr_keys(token_ids, x)
             self._inject_mem_store(token_ids, x, start_pos=0)
-            self._inject_mem_metadata(token_ids, x, start_pos=0)
             return x
 
         # --- Prefix cache fast path ---------------------------------------
@@ -351,6 +355,87 @@ class NeuralVMEmbedding(nn.Module):
         if buf.device != device or buf.dtype != dtype:
             return buf.to(device=device, dtype=dtype)
         return buf
+
+    def _compute_addr_keys(self, token_ids, x):
+        """Pure-tensor ADDR_KEY injection for ONNX export at arbitrary seq_len.
+
+        This is the dynamic-shape counterpart to :meth:`_add_code_addr_keys`.
+        The buffer-based path pre-allocates ``[max_seq_len, 48]`` at
+        construction time, which freezes the traced ONNX graph at that
+        capacity. To make the exported model usable at any sequence length,
+        we recompute the ADDR_KEY one-hot table from scratch with
+        ``torch.arange(S)`` so the graph has no constant capacity edge.
+
+        The encoding produced here is bit-identical to the buffer path:
+        - position 0 is CODE_START; first code byte at position 1
+        - seq_pos = i - 1; byte_offset = seq_pos % 8; instr_idx = seq_pos // 8
+        - byte_offset >= 5 are padding bytes (skipped)
+        - addr = instr_idx * INSTR_WIDTH + PC_OFFSET + byte_offset
+        - write one-hot at ADDR_KEY[addr & 0xF], 16+(addr>>4)&0xF, 32+(addr>>8)&0xF
+        - bounded by code_end_idx (position of first CODE_END token)
+
+        Args:
+            token_ids: [batch, seq] LongTensor of token IDs.
+            x: [batch, seq, d_model] residual stream; modified in-place.
+        """
+        import torch.nn.functional as F
+        from .constants import INSTR_WIDTH, PC_OFFSET
+        from .vm_step import Token
+
+        BYTES_PER_INSTR = 8  # opcode + 4 imm + 3 pad
+        DATA_BYTES = 5       # bytes that carry ADDR_KEY
+
+        B, S = token_ids.shape
+        addr_key = self._dim("ADDR_KEY")
+        device = x.device
+        dtype = x.dtype
+
+        # --- position-only address computation -----------------------------
+        pos = torch.arange(S, device=device, dtype=torch.long)  # [S]
+        seq_pos = pos - 1
+        byte_offset = seq_pos % BYTES_PER_INSTR
+        instr_idx = seq_pos // BYTES_PER_INSTR
+        addr = instr_idx * INSTR_WIDTH + PC_OFFSET + byte_offset  # [S]
+
+        # Per-position validity: seq_pos >= 0 AND non-padding byte.
+        pos_valid = (seq_pos >= 0) & (byte_offset < DATA_BYTES)  # [S] bool
+
+        # --- code_end_idx as a tensor (no .item()) -------------------------
+        # A position is "before the first CODE_END" iff cumsum of CODE_END hits
+        # up to and including that position is zero. We compute this per batch
+        # row. ``cumsum`` works in ONNX and avoids any Python int conversion.
+        is_code_end = (token_ids == Token.CODE_END).to(torch.long)  # [B, S]
+        before_code_end = (is_code_end.cumsum(dim=1) == 0)          # [B, S]
+
+        # Combined per-(b,i) mask: position is a valid code byte slot.
+        mask = before_code_end & pos_valid.unsqueeze(0)             # [B, S]
+        mask_f = mask.to(dtype).unsqueeze(-1)                       # [B, S, 1]
+
+        # --- one-hot scatter for the three nibbles -------------------------
+        # Use arithmetic (mod / floor-div) instead of bitwise AND/SHIFT: ONNX
+        # does not support bitwise ops on non-bool ints in opset 17. The
+        # results are identical to ``addr & 0xF`` / ``(addr >> k) & 0xF`` for
+        # non-negative addresses, and we mask out the only seq_pos<0 case
+        # (i==0, CODE_START itself) via ``pos_valid``.
+        # ``.clamp(0, 15)`` is a defensive guard so F.one_hot never sees an
+        # out-of-range index on traced runs that may temporarily produce a
+        # negative value before the mask gates it to zero.
+        lo = (addr % 16).clamp(min=0, max=15)
+        hi = ((addr // 16) % 16).clamp(min=0, max=15)
+        top = ((addr // 256) % 16).clamp(min=0, max=15)
+        one_hot_lo = F.one_hot(lo, num_classes=16).to(dtype)         # [S, 16]
+        one_hot_hi = F.one_hot(hi, num_classes=16).to(dtype)         # [S, 16]
+        one_hot_top = F.one_hot(top, num_classes=16).to(dtype)       # [S, 16]
+        # Concatenate to [S, 48] in the order (lo, hi, top) to match the
+        # legacy buffer layout (lo at [0..16), hi at [16..32), top at [32..48)).
+        enc = torch.cat([one_hot_lo, one_hot_hi, one_hot_top], dim=-1)  # [S, 48]
+
+        # Broadcast over batch and apply mask.
+        addr_slice = enc.unsqueeze(0)                                # [1, S, 48]
+        gated = addr_slice * mask_f                                  # [B, S, 48]
+
+        # In-place add into the ADDR_KEY band of the residual stream.
+        x[:, :, addr_key:addr_key + 48].add_(gated)
 
     def _add_code_addr_keys(self, token_ids, x):
         """Add ADDR_KEY to code byte embeddings (compiler-baked positional encoding).
