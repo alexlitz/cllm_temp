@@ -146,6 +146,47 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
     )
 
 
+def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
+    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_JSR is active.
+
+    FIX 2026-05-12 (fix-jsr-ax-bytes-1-3): Per C4's 8-bit-AX convention, AX
+    bytes 1-3 must be 0. For OP_JSR, the L9 ALU JSR-preserve routing writes
+    the previous AX byte 0 at MARK_AX (correctly emitting AX byte 0), but
+    bytes 1-3 of AX are predicted at AX byte 0/1/2 positions where L14
+    attention / L7 head 1 SP gather contaminate OUTPUT with SP/PC bytes.
+
+    This op mirrors ``BinaryOpByteZeroingPostOp``: at AX byte positions
+    (IS_BYTE + H1[AX]) when OP_JSR is active, write -3/S to every OUTPUT_LO
+    /OUTPUT_HI nibble dim and +5/S to OUTPUT_LO[0]/OUTPUT_HI[0], so the
+    byte-value-0 token wins argmax — producing AX bytes 1-3 = 0x00. OP_JSR
+    is broadcast to AX byte positions by L7 head 5 (V slot 8, also new in
+    this commit).
+
+    Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
+    counter ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
+    Phase 14.6: runs AFTER ``layer14_addr_key_neural_decode`` (14.5).
+    """
+    def bake(block, dim_positions, S):
+        from ...vm_step import _set_layer14_jsr_ax_bytes_zero
+        ffn = block.ffn
+        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        next_unit = _set_layer14_jsr_ax_bytes_zero(
+            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        )
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_jsr_ax_bytes_zero",
+        phase=14.6,
+        reads={"OP_JSR", "IS_BYTE", "H1", "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=14,
+        migrated=True,
+    )
+
+
 def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
     """Bake the BLOG_SPEC.md:830 ADDR_KEY nibble decode into ``ffn``.
 

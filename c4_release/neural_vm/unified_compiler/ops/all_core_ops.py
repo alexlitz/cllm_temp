@@ -231,6 +231,12 @@ def all_core_ops(
         # cases including carry-overflow); see
         # docs/V2_ADDR_KEY_NEURAL_DECODE_PLAN.md.
         make_layer14_addr_key_neural_decode_op(enable=True),
+        # JSR AX bytes 1-3 zeroing (fix-jsr-ax-bytes-1-3, 2026-05-12):
+        # Restores C4's 8-bit-AX convention (AX bytes 1-3 = 0x00) across
+        # JSR by zeroing OUTPUT at AX byte positions when OP_JSR is active.
+        # Unblocks Phase 5 JSR/ENT/LEV roundtrip tests (returns 7 instead
+        # of 0xF8030063). See docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md.
+        make_layer14_jsr_ax_bytes_zero_op(),
         make_layer15_memory_lookup_op(),
         make_layer15_nibble_copy_op(),
         make_layer16_lev_routing_op(),
