@@ -368,7 +368,7 @@ def make_l11_alu_mul_bdtoge_op() -> Operation:
     ``PureNeuralALU.__init__(operations='mul')``.
     """
     def bake(block, dim_positions, S):
-        module = _ensure_l11_mul_module(block, S)
+        module = _ensure_l11_mul_module(block, S, dim_positions=dim_positions)
         module.install_bdtoge()
 
     return Operation(
@@ -391,7 +391,7 @@ def make_l11_alu_mul_schoolbook_op() -> Operation:
     ``build_mul_layers(NIBBLE, opcode=27)``.
     """
     def bake(block, dim_positions, S):
-        module = _ensure_l11_mul_module(block, S)
+        module = _ensure_l11_mul_module(block, S, dim_positions=dim_positions)
         module.install_schoolbook()
 
     return Operation(
@@ -414,7 +414,7 @@ def make_l11_alu_mul_carrypass1_op() -> Operation:
     Equivalent to ``layers[1]`` from ``build_mul_layers(NIBBLE, opcode=27)``.
     """
     def bake(block, dim_positions, S):
-        module = _ensure_l11_mul_module(block, S)
+        module = _ensure_l11_mul_module(block, S, dim_positions=dim_positions)
         module.install_carrypass(pass_idx=0)
 
     return Operation(
@@ -438,7 +438,7 @@ def make_l11_alu_mul_carrypass2_op() -> Operation:
     ``build_mul_layers(NIBBLE, opcode=27)``.
     """
     def bake(block, dim_positions, S):
-        module = _ensure_l11_mul_module(block, S)
+        module = _ensure_l11_mul_module(block, S, dim_positions=dim_positions)
         module.install_carrypass(pass_idx=1)
 
     return Operation(
@@ -463,7 +463,7 @@ def make_l11_alu_mul_carrypass3_op() -> Operation:
     ``build_mul_layers(NIBBLE, opcode=27)``.
     """
     def bake(block, dim_positions, S):
-        module = _ensure_l11_mul_module(block, S)
+        module = _ensure_l11_mul_module(block, S, dim_positions=dim_positions)
         module.install_carrypass(pass_idx=2)
 
     return Operation(
@@ -487,7 +487,7 @@ def make_l12_alu_mul_genprop_op() -> Operation:
     to ``layers[4]`` from ``build_mul_layers(NIBBLE, opcode=27)``.
     """
     def bake(block, dim_positions, S):
-        module = _ensure_l11_mul_module(block, S)
+        module = _ensure_l11_mul_module(block, S, dim_positions=dim_positions)
         module.install_genprop()
 
     return Operation(
@@ -511,7 +511,7 @@ def make_l12_alu_mul_binarylookahead_op() -> Operation:
     ``build_mul_layers(NIBBLE, opcode=27)``.
     """
     def bake(block, dim_positions, S):
-        module = _ensure_l11_mul_module(block, S)
+        module = _ensure_l11_mul_module(block, S, dim_positions=dim_positions)
         module.install_binarylookahead()
 
     return Operation(
@@ -534,7 +534,7 @@ def make_l12_alu_mul_finalcorrection_op() -> Operation:
     Equivalent to ``layers[6]`` from ``build_mul_layers(NIBBLE, opcode=27)``.
     """
     def bake(block, dim_positions, S):
-        module = _ensure_l11_mul_module(block, S)
+        module = _ensure_l11_mul_module(block, S, dim_positions=dim_positions)
         module.install_finalcorrection()
 
     return Operation(
@@ -559,7 +559,7 @@ def make_l12_alu_mul_getobd_op() -> Operation:
     ``PureNeuralALU.__init__(operations='mul')``.
     """
     def bake(block, dim_positions, S):
-        module = _ensure_l11_mul_module(block, S)
+        module = _ensure_l11_mul_module(block, S, dim_positions=dim_positions)
         module.install_getobd()
 
     return Operation(
