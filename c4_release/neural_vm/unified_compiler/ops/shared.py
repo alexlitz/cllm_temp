@@ -17,6 +17,85 @@ from ..layer_compiler import Operation
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Reverse map (lazily populated): Opcode int value -> "OP_<NAME>" string
+# for dim_positions lookup. Module-level so _SetDimProxy can be pickled.
+_OP_NAME_CACHE: Dict[int, str] = {}
+
+
+def _opcode_name_map() -> Dict[int, str]:
+    """Return (and lazily build) the Opcode -> "OP_<NAME>" lookup map."""
+    if _OP_NAME_CACHE:
+        return _OP_NAME_CACHE
+    from ...embedding import Opcode
+    _OP_NAME_CACHE.update({
+        Opcode.LEA: "OP_LEA", Opcode.IMM: "OP_IMM", Opcode.JMP: "OP_JMP",
+        Opcode.JSR: "OP_JSR", Opcode.BZ: "OP_BZ", Opcode.BNZ: "OP_BNZ",
+        Opcode.ENT: "OP_ENT", Opcode.ADJ: "OP_ADJ", Opcode.LEV: "OP_LEV",
+        Opcode.LI: "OP_LI", Opcode.LC: "OP_LC", Opcode.SI: "OP_SI",
+        Opcode.SC: "OP_SC", Opcode.PSH: "OP_PSH",
+        Opcode.OR: "OP_OR", Opcode.XOR: "OP_XOR", Opcode.AND: "OP_AND",
+        Opcode.EQ: "OP_EQ", Opcode.NE: "OP_NE", Opcode.LT: "OP_LT",
+        Opcode.GT: "OP_GT", Opcode.LE: "OP_LE", Opcode.GE: "OP_GE",
+        Opcode.SHL: "OP_SHL", Opcode.SHR: "OP_SHR",
+        Opcode.ADD: "OP_ADD", Opcode.SUB: "OP_SUB", Opcode.MUL: "OP_MUL",
+        Opcode.DIV: "OP_DIV", Opcode.MOD: "OP_MOD",
+        Opcode.EXIT: "OP_EXIT", Opcode.NOP: "OP_NOP",
+        Opcode.PUTCHAR: "OP_PUTCHAR", Opcode.GETCHAR: "OP_GETCHAR",
+    })
+    return _OP_NAME_CACHE
+
+
+class _SetDimProxy:
+    """BD-like object that resolves dim names via compiler-allocated positions.
+
+    Module-level (not a closure) so instances of this class can be pickled —
+    several runtime modules (``efficient_byte_alu``, ``efficient_wrappers``)
+    hold a proxy as ``self.BD``, which means the model object must be
+    picklable for the ``compile_full_vm`` on-disk cache to work.
+
+    Falls back to ``_SetDim`` for any attribute not in ``dim_positions``
+    (e.g. constants like ``NUM_OPCODES``). ``opcode_dim`` resolves via
+    ``dim_positions`` so OP_* writes land at compiler-allocated positions
+    even under ``pin_io_only=True`` layouts.
+    """
+
+    def __init__(self, dim_positions: Dict[str, int]):
+        # Store the dim_positions dict so __getattr__ / opcode_dim can use it
+        # and so pickling round-trips correctly.
+        object.__setattr__(self, "_dim_positions", dict(dim_positions))
+        # Mirror declared dim positions as instance attributes for fast access
+        # (matches the closure-based proxy's behavior).
+        for name, pos in dim_positions.items():
+            object.__setattr__(self, name, pos)
+
+    def __getattr__(self, name):
+        # __getattr__ only fires when normal lookup failed (so the mirrored
+        # attrs above shadow this path for declared dims).
+        from ...vm_step import _SetDim
+        return getattr(_SetDim, name)
+
+    def __getstate__(self):
+        # Only persist the dim_positions; on load __setstate__ re-mirrors them.
+        return {"_dim_positions": self._dim_positions}
+
+    def __setstate__(self, state):
+        object.__setattr__(self, "_dim_positions", dict(state["_dim_positions"]))
+        for name, pos in self._dim_positions.items():
+            object.__setattr__(self, name, pos)
+
+    def opcode_dim(self, op_value):
+        """Resolve op_value -> dim position via dim_positions (override).
+
+        Falls back to _SetDim.opcode_dim if the OP_<NAME> entry isn't in
+        dim_positions (e.g. opcodes that aren't declared by the compiler).
+        """
+        from ...vm_step import _SetDim
+        name = _opcode_name_map().get(op_value)
+        if name is not None and name in self._dim_positions:
+            return self._dim_positions[name]
+        return _SetDim.opcode_dim(op_value)
+
+
 def _as_setdim_proxy(dim_positions: Dict[str, int]):
     """Build an object that mimics _SetDim using compiler dim positions.
 
@@ -34,47 +113,7 @@ def _as_setdim_proxy(dim_positions: Dict[str, int]):
     write OP_* flags at the LEGACY ``_SetDim`` positions instead of the
     compiler-allocated ones, breaking pin_io_only=True layouts.
     """
-    from ...vm_step import _SetDim
-    from ...embedding import Opcode
-
-    # Reverse map: Opcode int value -> "OP_<NAME>" string for dim_positions lookup
-    _OP_NAME = {
-        Opcode.LEA: "OP_LEA", Opcode.IMM: "OP_IMM", Opcode.JMP: "OP_JMP",
-        Opcode.JSR: "OP_JSR", Opcode.BZ: "OP_BZ", Opcode.BNZ: "OP_BNZ",
-        Opcode.ENT: "OP_ENT", Opcode.ADJ: "OP_ADJ", Opcode.LEV: "OP_LEV",
-        Opcode.LI: "OP_LI", Opcode.LC: "OP_LC", Opcode.SI: "OP_SI",
-        Opcode.SC: "OP_SC", Opcode.PSH: "OP_PSH",
-        Opcode.OR: "OP_OR", Opcode.XOR: "OP_XOR", Opcode.AND: "OP_AND",
-        Opcode.EQ: "OP_EQ", Opcode.NE: "OP_NE", Opcode.LT: "OP_LT",
-        Opcode.GT: "OP_GT", Opcode.LE: "OP_LE", Opcode.GE: "OP_GE",
-        Opcode.SHL: "OP_SHL", Opcode.SHR: "OP_SHR",
-        Opcode.ADD: "OP_ADD", Opcode.SUB: "OP_SUB", Opcode.MUL: "OP_MUL",
-        Opcode.DIV: "OP_DIV", Opcode.MOD: "OP_MOD",
-        Opcode.EXIT: "OP_EXIT", Opcode.NOP: "OP_NOP",
-        Opcode.PUTCHAR: "OP_PUTCHAR", Opcode.GETCHAR: "OP_GETCHAR",
-    }
-
-    class _Proxy:
-        # Inherit class methods and constants from _SetDim via __getattr__ fallback
-        def __getattr__(self, name):
-            return getattr(_SetDim, name)
-
-        def opcode_dim(self, op_value):
-            """Resolve op_value -> dim position via dim_positions (override).
-
-            Falls back to _SetDim.opcode_dim if the OP_<NAME> entry isn't in
-            dim_positions (e.g. opcodes that aren't declared by the compiler).
-            """
-            name = _OP_NAME.get(op_value)
-            if name is not None and name in dim_positions:
-                return dim_positions[name]
-            return _SetDim.opcode_dim(op_value)
-
-    proxy = _Proxy()
-    # Override with compiler-declared positions for declared dims
-    for name, pos in dim_positions.items():
-        object.__setattr__(proxy, name, pos)
-    return proxy
+    return _SetDimProxy(dim_positions)
 
 
 def _bake_post_op_into(ffn, post_op_instance, hidden_offset: int = 0) -> int:

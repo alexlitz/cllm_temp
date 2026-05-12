@@ -17,9 +17,29 @@ Pipeline:
 
 Output: an AutoregressiveVM with all weights baked via the compiler. No
 direct call to `set_vm_weights` from outside the compiler module.
+
+On-disk cache
+-------------
+``compile_full_vm`` is deterministic (see ``tests/test_compile_determinism``),
+so an on-disk cache keyed on source bytes + kwargs lets pytest processes (and
+any other short-lived caller) skip the ~40-70 s bake on cache hit. The cache
+file holds the post-bake model (including the right-sized FFNs, attached
+post_ops, and any wrapper modules such as ``FlattenedALUMul`` /
+``ALUDivMod`` that the bake pipeline swaps in), so loading reproduces the
+compiled model byte-identically without re-running any bake_fn. Pass
+``disk_cache=False`` to bypass.
 """
 
-from .layer_compiler import LayerCompiler, build_model_from_layout
+import hashlib
+import json
+import logging
+import os
+import pathlib
+import tempfile
+
+from .layer_compiler import LayerCompiler, ModelLayout, build_model_from_layout
+
+_logger = logging.getLogger(__name__)
 
 # Re-exported analyzer entry points so callers don't need to reach into
 # `layer_compiler` directly. The compiler also runs both scans automatically
@@ -87,6 +107,144 @@ def derive_layout(num_heads: int = 8):
     return layout
 
 
+_CACHE_FORMAT_VERSION = 1
+
+
+def _cache_dir() -> pathlib.Path:
+    """Return the disk-cache directory, honoring ``C4_VM_CACHE_DIR``."""
+    env = os.environ.get("C4_VM_CACHE_DIR")
+    if env:
+        return pathlib.Path(env)
+    return pathlib.Path.home() / ".cache" / "c4_release" / "compiled_vm"
+
+
+def _hash_source_bytes() -> str:
+    """SHA256 of every compiler source file that affects bake output.
+
+    Includes every ``.py`` file under ``unified_compiler/`` (this module's
+    package) plus ``neural_vm/vm_step.py`` (the helpers some bake_fns still
+    call into directly). Files are read in sorted-path order so the hash is
+    stable across hosts.
+    """
+    pkg_dir = pathlib.Path(__file__).resolve().parent
+    repo_neural_vm = pkg_dir.parent
+    sources = sorted(pkg_dir.rglob("*.py"))
+    extra = repo_neural_vm / "vm_step.py"
+    if extra.exists():
+        sources.append(extra)
+    h = hashlib.sha256()
+    for path in sources:
+        h.update(str(path.relative_to(repo_neural_vm)).encode("utf-8"))
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _cache_key(kwargs_snapshot: dict) -> str:
+    """Build the cache key = SHA256(source bytes + kwargs JSON + format ver)."""
+    h = hashlib.sha256()
+    h.update(_hash_source_bytes().encode("utf-8"))
+    h.update(b"\0")
+    h.update(
+        json.dumps(kwargs_snapshot, sort_keys=True, default=repr).encode("utf-8")
+    )
+    h.update(b"\0")
+    h.update(str(_CACHE_FORMAT_VERSION).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
+    """Load a cached compile from ``path``. Returns ``(model, layout)`` or None.
+
+    On any load failure (missing, corrupt, key collision, version mismatch)
+    returns None and the caller falls through to the recompile path. A bad
+    file is deleted so the next run won't keep tripping over it.
+    """
+    if not path.exists():
+        return None
+    import torch as _torch
+
+    try:
+        payload = _torch.load(path, weights_only=False, map_location="cpu")
+    except Exception as exc:
+        _logger.warning(
+            "compile_full_vm: failed to load cache %s (%s); recompiling",
+            path, exc,
+        )
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+
+    saved_kwargs = payload.get("kwargs_snapshot")
+    if saved_kwargs != kwargs_snapshot:
+        # Hash collision (vanishingly unlikely) — fall through to recompile
+        # without deleting; a future call with the original kwargs may still
+        # want this entry.
+        _logger.warning(
+            "compile_full_vm: cache %s kwargs_snapshot mismatch "
+            "(saved=%r, requested=%r); recompiling",
+            path, saved_kwargs, kwargs_snapshot,
+        )
+        return None
+    if payload.get("format_version") != _CACHE_FORMAT_VERSION:
+        return None
+
+    model = payload["model"]
+    layout = ModelLayout(
+        d_model=payload["d_model"],
+        n_layers=payload["n_layers"],
+        ops_per_layer=[[] for _ in range(payload["n_layers"])],
+        dim_positions=payload["dim_positions"],
+        dim_sizes=payload["dim_sizes"],
+    )
+    return model, layout
+
+
+def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
+    """Save the compiled model to ``path`` atomically. Best-effort.
+
+    Saves the full model object so loading reproduces the post-bake state
+    (including right-sized FFN shapes and wrapper modules attached during
+    the bake) without re-running any bake_fn.
+    """
+    import torch as _torch
+
+    payload = {
+        "format_version": _CACHE_FORMAT_VERSION,
+        "model": model,
+        "d_model": layout.d_model,
+        "n_layers": layout.n_layers,
+        "dim_positions": dict(layout.dim_positions),
+        "dim_sizes": dict(layout.dim_sizes),
+        "kwargs_snapshot": kwargs_snapshot,
+    }
+    tmp_path = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write: save to a temp file alongside the target, then replace.
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        os.close(fd)
+        tmp_path = pathlib.Path(tmp_name)
+        _torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+        tmp_path = None  # replaced; nothing to clean up
+    except Exception as exc:
+        _logger.warning(
+            "compile_full_vm: failed to save cache %s (%s); returning "
+            "in-memory model anyway",
+            path, exc,
+        )
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
 def compile_full_vm(
     S: float = 100.0,
     *,
@@ -98,6 +256,7 @@ def compile_full_vm(
     ffn_hidden: int = 4096,
     max_seq_len: int = 8192,
     pin_io_only: bool = True,
+    disk_cache: bool = True,
 ):
     """Compile and bake a full Neural VM model via the compiler.
 
@@ -116,12 +275,41 @@ def compile_full_vm(
             d_model relative to the legacy `_SetDim`-pinned layout. See
             `declare_setdim_compat_dims` for details. Defaults to False for
             backward compatibility.
+        disk_cache: when True (default), look up / write a persistent
+            on-disk cache so successive Python processes (e.g. pytest
+            workers) skip the bake pipeline. See module docstring for the
+            cache-key construction and the ``C4_VM_CACHE_DIR`` override.
+            On cache hit the returned layout's ``ops_per_layer`` /
+            ``block_ops`` / ``model_ops`` are empty (the bake ran in the
+            producer process); only ``d_model``, ``n_layers``,
+            ``dim_positions``, and ``dim_sizes`` are populated. Runtime
+            callers (``run_vm``, batch runners) only read those four
+            fields, so the cache is transparent to them; tests that
+            inspect the per-op placement should pass ``disk_cache=False``.
 
     Returns:
         (model, layout) where:
         - model is an AutoregressiveVM with all weights baked
         - layout is the ModelLayout (d_model, n_layers, dim_positions)
     """
+    kwargs_snapshot = {
+        "S": S,
+        "enable_conversational_io": enable_conversational_io,
+        "enable_tool_calling": enable_tool_calling,
+        "enable_neural_io_think_protocol": enable_neural_io_think_protocol,
+        "alu_mode": alu_mode,
+        "n_heads": n_heads,
+        "ffn_hidden": ffn_hidden,
+        "max_seq_len": max_seq_len,
+        "pin_io_only": pin_io_only,
+    }
+    cache_path = None
+    if disk_cache:
+        cache_path = _cache_dir() / f"{_cache_key(kwargs_snapshot)}.pt"
+        cached = _try_load_cached(cache_path, kwargs_snapshot)
+        if cached is not None:
+            return cached
+
     compiler = LayerCompiler()
     declare_setdim_compat_dims(compiler, pin_io_only=pin_io_only)
 
@@ -267,5 +455,8 @@ def compile_full_vm(
 
         for op in sorted(layout.model_ops, key=lambda o: (o.phase or 0)):
             op.bake_fn(model, layout.dim_positions, S)
+
+    if cache_path is not None:
+        _try_save_cached(cache_path, model, layout, kwargs_snapshot)
 
     return model, layout
