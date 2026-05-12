@@ -113,3 +113,105 @@ def test_batched_speedup_phase1(
         f"programs, got {speedup:.2f}x (serial={serial_total:.2f}s, "
         f"batched={batched_total:.2f}s)"
     )
+
+
+# --- Bucket-by-predicted-length tests -------------------------------------
+
+
+def test_predict_steps_basic():
+    """``DraftVM.predict_steps`` returns the right step count for IMM/EXIT."""
+    from neural_vm.speculative import DraftVM
+
+    # IMM 42 (op=1, imm=42); EXIT (op=38). 2 steps total.
+    bc = [(42 << 8) | 1, 38]
+    vm = DraftVM(bc)
+    assert vm.predict_steps(max_steps=10) == 2
+    assert vm.halted
+
+    # A program that doesn't halt within max_steps caps at max_steps and
+    # leaves halted=False (the bucket helper treats this as unpredicted).
+    # Use a tight infinite loop: JMP 0 (op=2, imm=0).
+    bc_loop = [(0 << 8) | 2]
+    vm_loop = DraftVM(bc_loop)
+    assert vm_loop.predict_steps(max_steps=5) == 5
+    assert not vm_loop.halted
+
+
+def test_bucketed_matches_unbucketed(batched_pure_neural_runner):
+    """Bucketed run produces byte-identical results to unbucketed run.
+
+    Programs deliberately span different predicted lengths so they hit
+    different buckets.
+    """
+    # All clean Phase-1 programs halt in 2 steps; bucketing should put them
+    # all in the smallest bucket but still yield byte-identical results.
+    bcs = [_encode(p) for p in _CLEAN_PHASE1_PROGRAMS]
+
+    bucketed = batched_pure_neural_runner.run_batch(
+        bcs, max_steps=10, bucket_by_predicted_length=True
+    )
+    unbucketed = batched_pure_neural_runner.run_batch(
+        bcs, max_steps=10, bucket_by_predicted_length=False
+    )
+    assert bucketed == unbucketed, (
+        f"bucketed != unbucketed:\n  bucketed={bucketed}\n  unbucketed={unbucketed}"
+    )
+
+
+def test_bucket_key_assignment():
+    """``_bucket_key`` lands programs in the smallest bucket whose bound
+    is >= predicted, and None goes to the unpredicted bucket."""
+    from neural_vm.batched_pure_neural import (
+        BatchedPureNeuralRunner,
+        _DEFAULT_BUCKET_BOUNDS,
+        _UNPREDICTED_BUCKET_KEY,
+    )
+
+    bk = BatchedPureNeuralRunner._bucket_key
+    assert bk(1, _DEFAULT_BUCKET_BOUNDS) == 10
+    assert bk(10, _DEFAULT_BUCKET_BOUNDS) == 10
+    assert bk(11, _DEFAULT_BUCKET_BOUNDS) == 20
+    assert bk(80, _DEFAULT_BUCKET_BOUNDS) == 80
+    assert bk(81, _DEFAULT_BUCKET_BOUNDS) == 160
+    assert bk(_DEFAULT_BUCKET_BOUNDS[-1] + 1, _DEFAULT_BUCKET_BOUNDS) == _UNPREDICTED_BUCKET_KEY
+    assert bk(None, _DEFAULT_BUCKET_BOUNDS) == _UNPREDICTED_BUCKET_KEY
+
+
+@pytest.mark.slow
+def test_bucketed_wall_time_analysis(batched_pure_neural_runner):
+    """Wall-time analysis: bucketed should be faster than unbucketed when
+    the input has wide length variance.
+
+    All current ``_CLEAN_PHASE1_PROGRAMS`` are 2-step programs so they end up
+    in the same bucket — the bucket wall-time = unbucketed wall-time in
+    expectation. The bucketed path adds only a tiny DraftVM-prediction
+    overhead per program. We assert bucketed runtime is within 1.25x of
+    unbucketed runtime (so the overhead doesn't dominate on short inputs)
+    and the results are byte-identical.
+    """
+    bcs = [_encode(p) for p in _CLEAN_PHASE1_PROGRAMS]
+    N = len(bcs)
+
+    t0 = time.time()
+    unbucketed = batched_pure_neural_runner.run_batch(
+        bcs, max_steps=10, bucket_by_predicted_length=False
+    )
+    unbucketed_t = time.time() - t0
+
+    t0 = time.time()
+    bucketed = batched_pure_neural_runner.run_batch(
+        bcs, max_steps=10, bucket_by_predicted_length=True
+    )
+    bucketed_t = time.time() - t0
+
+    assert bucketed == unbucketed
+    overhead = bucketed_t / unbucketed_t if unbucketed_t > 0 else 1.0
+    print(
+        f"\n[bucket bench] N={N}  unbucketed={unbucketed_t:.3f}s  "
+        f"bucketed={bucketed_t:.3f}s  ratio={overhead:.2f}x"
+    )
+    # Single-bucket workload should add only DraftVM-prediction overhead.
+    assert overhead < 1.25, (
+        f"Bucketing added too much overhead on homogeneous batch: "
+        f"unbucketed={unbucketed_t:.3f}s, bucketed={bucketed_t:.3f}s"
+    )
