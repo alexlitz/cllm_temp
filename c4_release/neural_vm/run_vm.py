@@ -876,11 +876,17 @@ class AutoregressiveVMRunner:
             # (model lost the well-formed-step structure entirely). Checked
             # every token so a runaway loop is caught even without dispatch.
             # Threshold = ~14 STEP_TOKENS-worth (35*14 = 490 → round to 500).
-            # This is the last line of defense for runs where DraftVM is
-            # unavailable (no `_draft_vm`) or where the model emits a
-            # plausible but never-terminating step pattern that doesn't
-            # disagree often enough with DraftVM to trip the primary
-            # signal. With the primary signal active, this rarely fires.
+            #
+            # GATED on `self._draft_vm is None`: this heuristic produces
+            # false positives on passing single-IMM tests where the model
+            # correctly emits end-of-program tokens but doesn't reliably
+            # interleave STEP_END (those tests still pass because
+            # `_decode_exit_code` reads AX from context; the bail just
+            # added a spurious warning). When DraftVM is available, the
+            # `draft_divergence` primary signal is strictly stronger and
+            # this fallback is suppressed to eliminate the false
+            # positives. Bytecodes that DraftVM can't model fall back to
+            # this signal.
             steps_since_last_step_end += 1
             if (self.enable_divergence_bail
                     and self._draft_vm is None
