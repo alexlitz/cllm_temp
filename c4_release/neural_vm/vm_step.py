@@ -4791,6 +4791,19 @@ def _set_layer7_memory_heads(attn, S, BD, HD):
     # OP_JSR is set, so AX bytes 1-3 emit byte value 0 per C4's 8-bit-AX
     # convention. See docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md for the diagnosis.
     attn.W_v[base + 8, BD.OP_JSR] = 0.2
+    # V: NOCARRY_ALU_OP relay = OP_AND | OP_OR | OP_XOR | OP_SHR (V7 Block 13,
+    # fix-v7-block13-ax-merge, 2026-05-12). Per C4's 8-bit-AX convention these
+    # non-carry ALU ops produce 8-bit results so AX bytes 1-3 must be 0.
+    # Single combined relay sums the four opcode flags (scaled by 0.2 each,
+    # ≈1.0 when any is active) for the L14 cleanup unit
+    # ``_set_layer14_alu_nocarry_ax_bytes_zero`` to gate on. Same pattern as
+    # TEMP[3] (BITWISE_OP for AND/OR/XOR) but extended to include OP_SHR.
+    # Output dim is TEMP[7] (free per audit of TEMP slot usage: 0/3/4/5/6 used
+    # by other relays; 1/2/7..15 free; 16..31 reserved for AX_FULL/SP relays).
+    attn.W_v[base + 9, BD.OP_AND] = 0.2
+    attn.W_v[base + 9, BD.OP_OR] = 0.2
+    attn.W_v[base + 9, BD.OP_XOR] = 0.2
+    attn.W_v[base + 9, BD.OP_SHR] = 0.2
     # O: write to relay dims (×5 to normalize)
     attn.W_o[BD.OP_LI_RELAY, base + 1] = 1.0
     attn.W_o[BD.OP_LC_RELAY, base + 2] = 1.0
@@ -4803,6 +4816,8 @@ def _set_layer7_memory_heads(attn, S, BD, HD):
     # with existing L6 head 6 OP_JSR writes (which target PC/SP/STACK0/BP/MEM,
     # disjoint from AX byte positions), so no double-counting.
     attn.W_o[BD.OP_JSR, base + 8] = 5.0
+    # O: write NOCARRY_ALU_OP relay → TEMP[7] (×5 to normalize 0.2→1.0).
+    attn.W_o[BD.TEMP + 7, base + 9] = 1.0
 
     # === Head 6: Relay PSH/ENT/JSR from STACK0 marker → STACK0 byte positions ===
     # Also relay PSH_AT_SP from SP marker → SP byte positions.
@@ -6451,6 +6466,98 @@ def _set_layer14_lc_ax_bytes_zero(ffn, S, BD, start_unit=0):
     ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 4
     ffn.b_up[unit] = -S * 1.5
     ffn.W_gate[unit, BD.OP_LC_RELAY] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 5.0 / S
+    unit += 1
+
+    return unit
+
+
+def _set_layer14_alu_nocarry_ax_bytes_zero(ffn, S, BD, start_unit=0):
+    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when a non-carry ALU op
+    is active (V7 Block 13, fix-v7-block13-ax-merge, 2026-05-12).
+
+    Per C4's 8-bit-AX-with-32-bit-register convention, ALU ops on byte-sized
+    operands produce a byte-sized result; AX bytes 1-3 must be 0. For
+    non-carry ops (AND/OR/XOR/SHR) the result is byte-sized by construction
+    (the operation can only shrink or preserve the byte width), so bytes 1-3
+    are always 0.
+
+    The L10 ``BinaryOpByteZeroingPostOp`` already attempts this clearing,
+    but in compact-layout / efficient ALU runs the gate (which sums OP_*
+    dims at byte positions) can be diluted: OP_AND/OR/XOR are only at
+    MARK_AX (L7 head 5 relays them via TEMP[3], which is reliable), while
+    OP_SHR is not relayed at all. Even when the L10 post-op fires, downstream
+    layers L11-L14 (MUL accumulators, mem_addr_gather, L14 attention bleed)
+    can recontaminate OUTPUT at bytes 1-3 before the residual reaches L15
+    output decode. This L14 cleanup runs AFTER all such contamination
+    sources and BEFORE L15, restoring AX bytes 1-3 = 0x00.
+
+    Mirrors ``_set_layer14_jsr_ax_bytes_zero`` and
+    ``_set_layer14_lc_ax_bytes_zero``: at AX byte positions 1-3 (IS_BYTE +
+    H1[AX] + NOT BYTE_INDEX_0) when ``TEMP[7]`` (NOCARRY_ALU_OP relay = OP_AND
+    | OP_OR | OP_XOR | OP_SHR) is active, write -3/S to every
+    OUTPUT_LO[k] / OUTPUT_HI[k] and +5/S to OUTPUT_LO[0] / OUTPUT_HI[0] so
+    the byte-value-0 token wins argmax — producing AX bytes 1-3 = 0x00. The
+    BYTE_INDEX_0 blocker (-S * 4) protects byte 0 (where the actual ALU
+    result lives) from being overwritten.
+
+    TEMP[7] is supplied by L7 head 5 (V slot 9, also added in this commit):
+    ``W_v[base+9, OP_AND/OP_OR/OP_XOR/OP_SHR] = 0.2`` and
+    ``W_o[TEMP+7, base+9] = 1.0`` (5x normalization). The combined V values
+    give ≈1.0 at AX byte positions when any of the four ops is active.
+
+    Activation calculation (S=100):
+      W_up: IS_BYTE=1, H1+AX=1 → +2S = +200
+      W_up: BYTE_INDEX_0 * -S * 4 (at byte 0: -400 → blocked; at bytes 1-3: 0)
+      b_up: -S * 1.5 = -150
+      Gate: TEMP[7] ≈ 1.0 at AX byte positions (via L7 head 5 relay)
+      pre-silu at bytes 1-3 = 50, silu ≈ 50, gate = 1.0, hidden = 50
+      Writes: -3/S * 50 = -1.5 to each OUTPUT_LO/HI[k] (k=0..15)
+              +5/S * 50 = +2.5 to OUTPUT_LO[0]/OUTPUT_HI[0]
+      Net at bytes 1-3: OUTPUT_LO[0]/HI[0] = +1.0 (boost),
+        OUTPUT_LO[k>0]/HI[k>0] = -1.5 → byte-value-0 wins argmax.
+
+    Non-target opcodes: TEMP[7] ≈ 0 at AX byte positions → gate ≈ 0 → no
+    firing. At byte 0 (any op): BYTE_INDEX_0 = -S*4 blocker forces pre-silu
+    < 0 → silu ≈ 0 → no firing.
+    """
+    unit = start_unit
+
+    # Unit 0: -3/S on all OUTPUT_LO[k] (bytes 1-3 only — byte 0 blocked)
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S  # H1 at AX marker index (AX_I = 1)
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 4  # Block at AX byte 0 position
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.TEMP + 7] = 1.0  # NOCARRY_ALU_OP relay
+    for k in range(16):
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = -3.0 / S
+    unit += 1
+
+    # Unit 1: -3/S on all OUTPUT_HI[k] (bytes 1-3 only)
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 4
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.TEMP + 7] = 1.0
+    for k in range(16):
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = -3.0 / S
+    unit += 1
+
+    # Unit 2: +5/S boost on OUTPUT_LO[0] (bytes 1-3 only)
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 4
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.TEMP + 7] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = 5.0 / S
+    unit += 1
+
+    # Unit 3: +5/S boost on OUTPUT_HI[0] (bytes 1-3 only)
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 4
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.TEMP + 7] = 1.0
     ffn.W_down[BD.OUTPUT_HI + 0, unit] = 5.0 / S
     unit += 1
 

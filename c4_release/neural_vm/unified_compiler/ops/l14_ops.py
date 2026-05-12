@@ -200,6 +200,52 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
     )
 
 
+def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
+    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when a non-carry ALU
+    op is active (V7 Block 13, fix-v7-block13-ax-merge, 2026-05-12).
+
+    Per ``c4_release/docs/V7_HEAP_OPS_NEURAL_PLAN.md`` §2 (AX merge): for
+    non-carry ALU ops (AND/OR/XOR/SHR), AX bytes 1-3 must be 0 per C4's
+    8-bit-AX-with-32-bit-register convention. The L10
+    ``BinaryOpByteZeroingPostOp`` already attempts this clearing but can be
+    overridden by downstream contamination at L11-L14 (MUL accumulators,
+    L14 mem_addr_gather attention bleed, etc.). This L14 cleanup runs AFTER
+    those sources and BEFORE L15 to restore AX bytes 1-3 = 0x00.
+
+    Mirrors ``make_layer14_jsr_ax_bytes_zero_op`` and
+    ``make_layer14_lc_ax_bytes_zero_op``: gates on ``TEMP[7]`` (NOCARRY_ALU_OP
+    relay = OP_AND | OP_OR | OP_XOR | OP_SHR, supplied by L7 head 5 V slot
+    9, also new in this commit) at AX byte positions 1-3, blocks at byte 0
+    via ``BYTE_INDEX_0 = -S*4``, and zeros bytes 1-3 by writing -3/S to
+    every OUTPUT_LO/HI nibble dim and +5/S to OUTPUT_LO[0] / OUTPUT_HI[0].
+
+    Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
+    counter ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
+    Phase 14.8: runs AFTER ``layer14_lc_ax_bytes_zero`` (14.7) — JSR / LC /
+    nocarry-ALU gate on disjoint relays (OP_JSR vs OP_LC_RELAY vs TEMP[7])
+    so the relative order within 14.6-14.8 only matters for unit allocation.
+    """
+    def bake(block, dim_positions, S):
+        from ...vm_step import _set_layer14_alu_nocarry_ax_bytes_zero
+        ffn = block.ffn
+        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        next_unit = _set_layer14_alu_nocarry_ax_bytes_zero(
+            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        )
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_alu_nocarry_ax_bytes_zero",
+        phase=14.8,
+        reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_0", "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=14,
+        migrated=True,
+    )
+
+
 def make_layer14_lc_ax_bytes_zero_op() -> Operation:
     """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_LC is active.
 
