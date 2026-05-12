@@ -186,6 +186,17 @@ def make_residual_alibi_slopes_op() -> Operation:
             attn6.alibi_slopes[2] = 0.5  # STACK0←AX relay: prefer nearest AX marker
             attn6.alibi_slopes[3] = 0.5  # SP←AX relay: prefer nearest AX marker
             attn6.alibi_slopes[4] = 5.0  # BZ/BNZ relay: attend to nearest AX marker
+            # Softmax-sharpness fix (head 5 — first-step OP flag / FETCH
+            # relay programmed by _set_layer6_attn). The audit (87442ad)
+            # flagged head 5 with slope=0 leading to mass=0.10 at the
+            # synthetic K target — the AX-marker-to-PC-marker hop is at
+            # distance 4 in the audit context, and with slope=0 the head
+            # has no positional preference between target and runner-up.
+            # Raising slope to 1.0 closes the gap (1.0 * 4 = 4 nats per
+            # the audit's gap recommendation). Paired with the K-scale
+            # 10x bump in make_layer6_attn_bake_op (phase 998.5) so the
+            # head clears the 99% sharpness threshold in strict mode.
+            attn6.alibi_slopes[5] = 1.0
 
         # L8: per-layer recency
         attn8 = model.blocks[8].attn

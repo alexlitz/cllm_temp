@@ -124,6 +124,18 @@ def make_layer6_attn_bake_op() -> Operation:
         attn = model.blocks[6].attn
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer6_attn(attn, S, _as_setdim_proxy(dim_positions), HD)
+        # Softmax-sharpness fix (head 5 — first-step OP flag / FETCH relay):
+        # The audit (87442ad) flags this head as a primary leakage candidate
+        # with mass=0.10, s_target=0, slope=0 in the bare-model probe. The
+        # head's main Q/K cells (Q[MARK_AX]=L, K[MARK_PC]=L with L=50) give
+        # Q*K/sqrt(HD) = L*L/sqrt(HD) ~= 274 in real contexts where both
+        # gates light, but the synthetic audit lights only the K gate, so
+        # s_target collapses to ~0. To compensate AND give the head extra
+        # headroom against softmax1 leakage even in real contexts, scale
+        # head 5's K column by 10x ("bump K-scale ~10.0x"). The Q side is
+        # unchanged; this makes the read at the MARK_PC position 10x more
+        # selective without touching the V/O routing.
+        attn.W_k[5 * HD] *= 10.0
 
     return Operation(
         name="layer6_attn_bake",

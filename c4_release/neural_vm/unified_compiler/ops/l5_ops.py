@@ -20,6 +20,17 @@ def make_layer5_fetch_op() -> Operation:
         attn = block.attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.1)
+            # Softmax-sharpness fix (head 5): s_target=125 is already strong
+            # but ALiBi slope=0.1 over the synthetic Q->K distance of 4
+            # contributes only 0.4 nats of positional separation. The
+            # runner-up dim sits at the Q position (distance 0), so the
+            # 0.4-nat gap is not enough to drown it (mass@target = 0.0).
+            # Audit doc 87442ad recommends "raise ALiBi slope 0.1 -> ~1.0"
+            # — implemented here. The other L5 heads keep slope=0.1 because
+            # they attend to nearby positions (fetch operand bytes within
+            # the current step); head 5 wants steeper recency to suppress
+            # cross-step distractors.
+            attn.alibi_slopes[5] = 1.0
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer5_fetch(attn, S, _as_setdim_proxy(dim_positions), HD)
 
