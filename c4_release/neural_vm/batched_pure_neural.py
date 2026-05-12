@@ -70,6 +70,23 @@ _ADAPTIVE_BACKOFF_THRESHOLD = 0.5
 _ADAPTIVE_RAMP_THRESHOLD = 0.1
 
 
+# Bucket boundaries (in predicted VM steps) for length-aware batching. A
+# program with predicted_steps P lands in the smallest bucket whose upper
+# bound is >= P. The "+inf" tail bucket holds anything DraftVM couldn't
+# bound (e.g. programs that hit the prediction-cap without halting, or
+# programs whose DraftVM raised an error). Tuned with a 2x ratio so each
+# bucket's slowest program is at most 2x the bucket's fastest, which caps
+# wasted padding at ~50%.
+#
+# Within a bucket programs still pad to the longest member's length. The
+# wall-time win is: instead of one batch padded to max(P_i), we get B
+# batches each padded to its own max — usually a big win when the input
+# has wide length variance (1098-suite typical).
+_DEFAULT_BUCKET_BOUNDS: tuple = (10, 20, 40, 80, 160, 320, 640, 1280, 2560)
+# Sentinel for unbounded / unpredicted programs.
+_UNPREDICTED_BUCKET_KEY = "unpredicted"
+
+
 # Step-relative offsets where the speculative-mode logit disagrees with the
 # unspeculative-mode logit. See the speculation comment in
 # ``BatchedPureNeuralRunner._run_speculative`` for the derivation. These are
@@ -232,6 +249,9 @@ class BatchedPureNeuralRunner:
         max_steps: int = 100,
         max_context_window: int = 512,
         spec_k: int = 0,
+        bucket_by_predicted_length: bool = True,
+        bucket_bounds: Optional[tuple] = None,
+        batch_chunk: Optional[int] = None,
     ) -> List[Tuple[str, int]]:
         """Run N programs in lockstep.
 
@@ -258,6 +278,30 @@ class BatchedPureNeuralRunner:
                 emission overrides any mismatching draft, so the model is
                 the final arbiter. Recommended: ``spec_k=-1`` (adaptive)
                 for mixed workloads; ``spec_k=32`` for known-clean batches.
+            bucket_by_predicted_length: when True (default), run DraftVM
+                upfront on each program to predict its step count, then group
+                programs into buckets of similar predicted length (2x ratio
+                per bucket) and batch each bucket independently. Pure speed
+                optimization: every program in a single mega-batch pads to
+                ``max(P_i)``, while bucketed batches pad to each bucket's max.
+                Set ``False`` to use the legacy single-batch behavior.
+                Per-program ``(output, exit_code)`` results are byte-identical
+                regardless of this flag — bucketing only changes the order
+                programs are run through the model; results are reassembled
+                into input order before return.
+            bucket_bounds: optional tuple of bucket upper bounds (in
+                predicted VM steps). Default is ``_DEFAULT_BUCKET_BOUNDS``
+                = ``(10, 20, 40, 80, 160, 320, 640, 1280, 2560)``. A program
+                with predicted P steps lands in the smallest bucket whose
+                bound is >= P; anything larger goes in the "unpredicted"
+                long-tail bucket. Ignored when
+                ``bucket_by_predicted_length`` is False.
+            batch_chunk: optional cap on programs per single batched
+                forward. When set, each bucket is split into chunks of at
+                most ``batch_chunk`` programs (so a very large bucket
+                doesn't bloat one tensor). Default ``None`` runs each bucket
+                as one batch. Ignored when
+                ``bucket_by_predicted_length`` is False.
 
         Returns:
             list of (output_string, exit_code) per program, in the same order
@@ -269,6 +313,53 @@ class BatchedPureNeuralRunner:
         data_list = data_list or [b""] * B
         argv_list = argv_list or [[]] * B
         stdin_list = stdin_list or [""] * B
+
+        # Length-aware bucketing dispatch. When enabled, we predict each
+        # program's step count via DraftVM, sort descending, bucket by 2x
+        # length ratio, and run each bucket as its own ``_run_batch_core``
+        # invocation. Results are reassembled into the original input order.
+        if bucket_by_predicted_length and B > 1:
+            return self._run_bucketed(
+                bytecodes,
+                data_list=data_list,
+                argv_list=argv_list,
+                stdin_list=stdin_list,
+                max_steps=max_steps,
+                max_context_window=max_context_window,
+                spec_k=spec_k,
+                bucket_bounds=bucket_bounds or _DEFAULT_BUCKET_BOUNDS,
+                batch_chunk=batch_chunk,
+            )
+
+        return self._run_batch_core(
+            bytecodes,
+            data_list=data_list,
+            argv_list=argv_list,
+            stdin_list=stdin_list,
+            max_steps=max_steps,
+            max_context_window=max_context_window,
+            spec_k=spec_k,
+        )
+
+    # ------------------------------------------------------------------
+    # Core run path (no bucketing). Used directly by ``run_batch`` when
+    # bucketing is disabled, and called per-bucket from ``_run_bucketed``.
+    # ------------------------------------------------------------------
+
+    def _run_batch_core(
+        self,
+        bytecodes: List[List[int]],
+        *,
+        data_list: List,
+        argv_list: List,
+        stdin_list: List,
+        max_steps: int,
+        max_context_window: int,
+        spec_k: int,
+    ) -> List[Tuple[str, int]]:
+        B = len(bytecodes)
+        if B == 0:
+            return []
 
         # Adaptive mode: ``spec_k < 0`` is the sentinel. ``spec_k == 0`` keeps
         # the legacy non-speculative path; ``spec_k > 0`` keeps the legacy
@@ -320,6 +411,137 @@ class BatchedPureNeuralRunner:
                 s.exit_code = self._decode_exit_code(s.context)
             results.append(("".join(s.output), s.exit_code))
         return results
+
+    # ------------------------------------------------------------------
+    # Length-aware bucketing: predict each program's step count via
+    # DraftVM, group by 2x length ratio, run each bucket as its own batch.
+    # ------------------------------------------------------------------
+
+    def _predict_steps(self, bytecode, data, stdin, max_steps: int) -> Optional[int]:
+        """Run DraftVM upfront to predict step count. Returns None if the
+        DraftVM raised or hit max_steps without halting (treat as
+        unpredicted)."""
+        try:
+            vm = DraftVM(list(bytecode))
+            if isinstance(data, (bytes, bytearray, list)):
+                for i, b in enumerate(data):
+                    vm.memory[0x10000 + i] = int(b)
+            if stdin:
+                vm.set_stdin(stdin)
+            steps = vm.predict_steps(max_steps=max_steps)
+        except Exception:
+            return None
+        # If DraftVM hit the cap without halting, treat as "unpredicted"
+        # (long-tail bucket) so we don't underestimate it.
+        if not vm.halted:
+            return None
+        return steps
+
+    @staticmethod
+    def _bucket_key(predicted_steps: Optional[int], bucket_bounds: tuple):
+        """Map a predicted step count to a bucket key (the bucket's upper
+        bound), or ``_UNPREDICTED_BUCKET_KEY`` if unbounded.
+
+        Bucket keys are the upper bound integers from ``bucket_bounds``;
+        sorting buckets by key descending (with the unpredicted bucket last
+        in the iteration order) lets us run long programs first — DraftVM's
+        prediction is most reliable on those, and getting them off the
+        critical path early benefits any continuous-batching layer below.
+        """
+        if predicted_steps is None:
+            return _UNPREDICTED_BUCKET_KEY
+        for bound in bucket_bounds:
+            if predicted_steps <= bound:
+                return bound
+        return _UNPREDICTED_BUCKET_KEY
+
+    def _run_bucketed(
+        self,
+        bytecodes: List[List[int]],
+        *,
+        data_list: List,
+        argv_list: List,
+        stdin_list: List,
+        max_steps: int,
+        max_context_window: int,
+        spec_k: int,
+        bucket_bounds: tuple,
+        batch_chunk: Optional[int],
+    ) -> List[Tuple[str, int]]:
+        """Predict per-program lengths, bucket by 2x ratio, run each bucket
+        separately, then re-assemble results in input order.
+
+        Byte-identity invariant: per-program results must NOT depend on which
+        bucket a program lands in or the order programs were run. We achieve
+        this by running each bucket via ``_run_batch_core`` (which builds an
+        independent ``_ElementState`` per program — no cross-program shared
+        mutable state, modulo the shared model — and the model itself is
+        stateless under ``torch.no_grad`` forwards).
+        """
+        B = len(bytecodes)
+
+        # 1) Predict per-program step counts. Cap DraftVM at ``max_steps``
+        #    (same cap the model uses) so a runaway loop in a single program
+        #    can't burn unbounded prediction time.
+        predicted = [
+            self._predict_steps(bytecodes[i], data_list[i], stdin_list[i], max_steps)
+            for i in range(B)
+        ]
+
+        # 2) Assign each program to a bucket. Bucket key is the upper bound.
+        bucket_members: dict = {}  # key -> list[orig_idx]
+        for i, p in enumerate(predicted):
+            key = self._bucket_key(p, bucket_bounds)
+            bucket_members.setdefault(key, []).append(i)
+
+        # 3) Iterate buckets in descending-size order (longest first), within
+        #    each bucket sort members descending by predicted steps (so the
+        #    rare program at the top of the bucket pads itself out, not the
+        #    many smaller programs below). The unpredicted bucket runs last.
+        ordered_keys = sorted(
+            (k for k in bucket_members if k != _UNPREDICTED_BUCKET_KEY),
+            key=lambda k: -int(k),
+        )
+        if _UNPREDICTED_BUCKET_KEY in bucket_members:
+            ordered_keys.append(_UNPREDICTED_BUCKET_KEY)
+
+        # 4) Run each bucket; map results back to original positions.
+        out: List[Optional[Tuple[str, int]]] = [None] * B
+        for key in ordered_keys:
+            members = bucket_members[key]
+            # Sort within bucket: largest-predicted first (so spec/adaptive K
+            # warmup happens on the slowest member; smaller members halt early
+            # and stop padding the tensor).
+            members.sort(
+                key=lambda i: -(predicted[i] if predicted[i] is not None else max_steps)
+            )
+            # Optionally sub-chunk a very large bucket to avoid bloating one
+            # tensor. ``batch_chunk=None`` means one chunk per bucket.
+            chunk_size = batch_chunk if batch_chunk and batch_chunk > 0 else len(members)
+            for chunk_start in range(0, len(members), chunk_size):
+                chunk_idx = members[chunk_start:chunk_start + chunk_size]
+                chunk_bcs = [bytecodes[i] for i in chunk_idx]
+                chunk_data = [data_list[i] for i in chunk_idx]
+                chunk_argv = [argv_list[i] for i in chunk_idx]
+                chunk_stdin = [stdin_list[i] for i in chunk_idx]
+                # ``max_steps`` is per-program and not affected by bucketing.
+                chunk_results = self._run_batch_core(
+                    chunk_bcs,
+                    data_list=chunk_data,
+                    argv_list=chunk_argv,
+                    stdin_list=chunk_stdin,
+                    max_steps=max_steps,
+                    max_context_window=max_context_window,
+                    spec_k=spec_k,
+                )
+                for local_j, orig_i in enumerate(chunk_idx):
+                    out[orig_i] = chunk_results[local_j]
+
+        # Defensive: every slot must be filled.
+        for i, v in enumerate(out):
+            if v is None:
+                out[i] = ("", 0)
+        return out  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
     # Non-speculative inner loop (legacy: one token per batched forward)
