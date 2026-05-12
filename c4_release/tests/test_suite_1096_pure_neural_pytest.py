@@ -87,11 +87,33 @@ TEST_IDS = [make_test_id(i, t) for i, t in enumerate(ALL_TESTS)]
 
 _BATCH_CHUNK = int(os.environ.get("C4_BATCH_CHUNK", "32"))
 _BATCH_MAX_STEPS = int(os.environ.get("C4_BATCH_MAX_STEPS", "2000"))
+
+
 # C4_SPEC_K controls the per-element speculative-decoding horizon (VM steps
-# proposed by DraftVM per batched forward pass). 0 disables speculation;
-# 8 is a reasonable default for clean Phase-1-style programs where DraftVM
-# and the model agree token-for-token on the safe (non-MEM-section) offsets.
-_SPEC_K = int(os.environ.get("C4_SPEC_K", "8"))
+# proposed by DraftVM per batched forward pass). Accepted values:
+#   * Integer ``0``  — disables speculation (one-token-per-forward batched
+#     decode).
+#   * Positive int   — fixed-K speculation: every element drafts ``K`` full
+#     VM steps per forward.
+#   * Negative int   — sentinel for adaptive mode (per-element K, starts at
+#     ``_ADAPTIVE_START_K`` in batched_pure_neural.py and ramps up/down
+#     based on rolling rejection rate).
+#   * String ``"adaptive"`` — alias for the negative-int sentinel.
+# Default is ``"adaptive"`` (since DraftVM is deterministic — for programs
+# the model handles correctly, every proposed token is accepted, giving us
+# K-fold speedup per forward and we want to push K as high as the model
+# permits per element).
+def _parse_spec_k(raw: str) -> int:
+    raw = (raw or "").strip().lower()
+    if raw == "adaptive":
+        return -1
+    try:
+        return int(raw)
+    except ValueError:
+        return -1
+
+
+_SPEC_K = _parse_spec_k(os.environ.get("C4_SPEC_K", "adaptive"))
 
 
 @pytest.fixture(scope="session")
