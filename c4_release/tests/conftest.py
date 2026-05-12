@@ -493,12 +493,11 @@ def handler_status():
 
     status = {}
     for name, op in all_ops:
-        has_func = op in runner._func_call_handlers
         has_sys = op in runner._syscall_handlers
         status[name] = {
             "opcode": op,
-            "has_handler": has_func or has_sys,
-            "handler_type": "func" if has_func else ("syscall" if has_sys else "neural"),
+            "has_handler": has_sys,
+            "handler_type": "syscall" if has_sys else "neural",
         }
 
     return status
