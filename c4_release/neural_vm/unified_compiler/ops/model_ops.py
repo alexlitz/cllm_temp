@@ -58,25 +58,59 @@ def make_function_call_weights_op() -> Operation:
 
     # Dim-ownership claims (see c4_release/docs/DIM_OWNERSHIP_REGISTRY.md).
     # `_set_function_call_weights` programs three ENT/JSR relay attention
-    # heads. Each head writes V slots [base+1..base+16] (EMBED_LO/CLEAN_LO
-    # path) and [base+17..base+32] (EMBED_HI/CLEAN_HI path):
-    #   L5 attn5 head 5: BP→TEMP at STACK0 marker (ENT: STACK0 = old_BP)
-    #   L5 attn5 head 6: SP→TEMP at BP marker     (ENT: BP = old_SP - 8)
+    # heads. Each head writes V slots [base+1..base+16] (low-nibble path)
+    # and [base+17..base+32] (high-nibble path):
+    #
+    #   L5 attn5 head 5: BP→TEMP at STACK0 (ENT: STACK0 = old_BP)
+    #     W_v[5*HD + 1 + k, EMBED_LO + k]    for k=0..15 (slot 1..16)
+    #     W_v[5*HD + 17 + k, EMBED_HI + k]   for k=0..15 (slot 17..32)
+    #   L5 attn5 head 6: SP→TEMP at BP        (ENT: BP = old_SP - 8)
+    #     W_v[6*HD + 1 + k, EMBED_LO + k]    for k=0..15
+    #     W_v[6*HD + 17 + k, EMBED_HI + k]   for k=0..15
     #   L6 attn6 head 7: PC OUTPUT→AX_CARRY at STACK0 (JSR return addr)
+    #     W_v[7*HD + 1 + k, OUTPUT_LO + k]   for k=0..15
+    #     W_v[7*HD + 17 + k, OUTPUT_HI + k]  for k=0..15
+    #
+    # The 4-tuple claim's ``column`` records the input dim + offset so the
+    # registry can distinguish co-tenants of the same row that touch
+    # disjoint input columns. In particular, this op's L5 head 5 slot 32
+    # claim is (5, "attn_W_v", "5_32", "EMBED_HI+15") — column-disjoint
+    # from layer5_fetch's (5, "attn_W_v", "5_32", "CLEAN_EMBED_LO+0"). The
+    # row-only registry treated this as a benign collision via
+    # ``KNOWN_BENIGN_COLLISIONS`` in tests; the column-aware registry
+    # detects the disjointness automatically.
+    #
     # Historical context: the deprecated `_set_layer5_fetch` head 6 (deleted
-    # 2026-05-11, commit c1a5398) wrote V slots 1..16 on the same matrix.
-    # Both ops claimed `(5, "attn_W_v", "6_<k>")` for k in 1..16 — exactly
-    # the kind of latent collision this registry catches.
+    # 2026-05-11, commit c1a5398) wrote V slots 1..16 on the same matrix
+    # using `attn.W_v[6*HD + 1 + k, EMBED_LO + k]`. That collided with
+    # this op's head 6 ENT relay at *the same column*:
+    # ``(5, "attn_W_v", "6_<k>", "EMBED_LO+<k-1>")`` for k=1..16 — the
+    # kind of true collision the column-aware registry still catches.
     _claims = set()
-    # L5 attn5 head 5 ENT relay (slots 1..32)
-    for slot in range(1, 33):
-        _claims.add((5, "attn_W_v", f"5_{slot}"))
-    # L5 attn5 head 6 ENT relay (slots 1..32)
-    for slot in range(1, 33):
-        _claims.add((5, "attn_W_v", f"6_{slot}"))
-    # L6 attn6 head 7 JSR relay (slots 1..32)
-    for slot in range(1, 33):
-        _claims.add((6, "attn_W_v", f"7_{slot}"))
+    # L5 attn5 head 5 ENT relay
+    for k in range(16):
+        _claims.add(
+            (5, "attn_W_v", f"5_{1 + k}", f"EMBED_LO+{k}")
+        )
+        _claims.add(
+            (5, "attn_W_v", f"5_{17 + k}", f"EMBED_HI+{k}")
+        )
+    # L5 attn5 head 6 ENT relay
+    for k in range(16):
+        _claims.add(
+            (5, "attn_W_v", f"6_{1 + k}", f"EMBED_LO+{k}")
+        )
+        _claims.add(
+            (5, "attn_W_v", f"6_{17 + k}", f"EMBED_HI+{k}")
+        )
+    # L6 attn6 head 7 JSR PC OUTPUT relay
+    for k in range(16):
+        _claims.add(
+            (6, "attn_W_v", f"7_{1 + k}", f"OUTPUT_LO+{k}")
+        )
+        _claims.add(
+            (6, "attn_W_v", f"7_{17 + k}", f"OUTPUT_HI+{k}")
+        )
 
     return Operation(
         name="function_call_weights",

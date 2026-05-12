@@ -124,13 +124,34 @@ class Operation:
     # hardcoded layer numbers — they follow whatever layer the compiler picks
     # for the referenced op.
     target_op_name: Optional[str] = None
-    # Dim-ownership claims. Each tuple is (layer_idx, scope, identifier).
+    # Dim-ownership claims. Each tuple is
+    # ``(layer_idx, scope, identifier, column)``.
     # See ALLOWED_CLAIM_SCOPES for the legal scope strings. The compiler's
     # `_detect_claim_collisions` cross-checks claims at compile time and
-    # warns when two ops claim the same (layer_idx, scope, identifier).
+    # warns when two ops claim the same
+    # ``(layer_idx, scope, identifier, column)`` 4-tuple.
+    #
+    # `column` is the input-dim coordinate the claim writes into:
+    #   - For attn scopes (``attn_W_v/k/q/o``): a string identifying the
+    #     input dim + offset, e.g. ``"CLEAN_EMBED_LO+0"`` or
+    #     ``"EMBED_HI+15"``. This distinguishes two ops that both write the
+    #     same row but at distinct columns — the case the row-only registry
+    #     produced false positives for.
+    #   - For ffn scopes (``ffn_W_up/down/gate``): same convention, the
+    #     input-dim name + offset.
+    #   - For ``embed_row`` scope: ``None`` (one row is one unit; no
+    #     column granularity).
+    #
+    # Backwards-compatible legacy 3-tuple ``(layer_idx, scope, identifier)``
+    # is accepted at ``add_op`` time and auto-promoted to a 4-tuple with
+    # ``column=None``. Existing 3-tuple call sites continue to work; the
+    # collision detector treats ``column=None`` claims as wildcard for the
+    # purposes of grouping (so two legacy 3-tuple writes to the same row
+    # still collide as before).
+    #
     # Defaults to an empty set so existing ops remain back-compat (opt-in).
     # See c4_release/docs/DIM_OWNERSHIP_REGISTRY.md for the bake-author API.
-    claims: Set[Tuple[int, str, str]] = field(default_factory=set)
+    claims: Set[Tuple[int, str, str, Optional[str]]] = field(default_factory=set)
     # Residual-dim staleness invariants (Phase 3 / Agent G of
     # ARCH_LEAKAGE_FIX_PLAN.md). Both fields are opt-in (default empty):
     #
@@ -292,14 +313,22 @@ class LayerCompiler:
                         f"Op {op.name!r} {fname} references undeclared dim "
                         f"{dim_name!r}"
                     )
-        # Validate dim-ownership claims (if any).
+        # Validate dim-ownership claims (if any). Accept legacy 3-tuple
+        # ``(layer_idx, scope, identifier)`` and auto-promote to 4-tuple with
+        # ``column=None`` for back-compat with pre-column-granularity ops.
+        promoted: Set[Tuple[int, str, str, Optional[str]]] = set()
         for claim in op.claims:
-            if not (isinstance(claim, tuple) and len(claim) == 3):
+            if not isinstance(claim, tuple) or len(claim) not in (3, 4):
                 raise ValueError(
                     f"Op {op.name!r} has malformed claim {claim!r}; "
-                    "expected (layer_idx, scope, identifier)"
+                    "expected (layer_idx, scope, identifier) or "
+                    "(layer_idx, scope, identifier, column)"
                 )
-            layer_idx, scope, identifier = claim
+            if len(claim) == 3:
+                layer_idx, scope, identifier = claim
+                column: Optional[str] = None
+            else:
+                layer_idx, scope, identifier, column = claim
             if not isinstance(layer_idx, int):
                 raise ValueError(
                     f"Op {op.name!r} claim {claim!r}: layer_idx must be int"
@@ -313,6 +342,20 @@ class LayerCompiler:
                 raise ValueError(
                     f"Op {op.name!r} claim {claim!r}: identifier must be str"
                 )
+            if column is not None and not isinstance(column, str):
+                raise ValueError(
+                    f"Op {op.name!r} claim {claim!r}: column must be str "
+                    f"or None"
+                )
+            # ``embed_row`` scope is row-granular only: a column value
+            # there is meaningless. Enforce the convention.
+            if scope == "embed_row" and column is not None:
+                raise ValueError(
+                    f"Op {op.name!r} claim {claim!r}: scope 'embed_row' "
+                    f"must have column=None (row-granular only)"
+                )
+            promoted.add((layer_idx, scope, identifier, column))
+        op.claims = promoted
         self._op_by_name[op.name] = op
         if op.kind == "block":
             if op.layer_idx is None and op.target_op_name is None:
@@ -415,23 +458,47 @@ class LayerCompiler:
     # breaking the legacy bake path.
     # --------------------------------------------------------------------
 
-    def build_claim_registry(self) -> Dict[Tuple[int, str, str], List[str]]:
-        """Return registry: (layer_idx, scope, identifier) -> [op_name, ...].
+    def build_claim_registry(
+        self,
+    ) -> Dict[Tuple[int, str, str, Optional[str]], List[str]]:
+        """Return registry:
+        ``(layer_idx, scope, identifier, column) -> [op_name, ...]``.
 
         Aggregates `Operation.claims` across `self.ops`, `self.block_ops`,
         and `self.model_ops`. Used by `_detect_claim_collisions`; exposed
         publicly so tests / debugging tools can inspect the full claims
         graph without re-running compile.
+
+        Claims are always 4-tuples here: ``add_op`` promotes legacy
+        3-tuples to ``(layer, scope, identifier, None)`` at registration.
         """
-        registry: Dict[Tuple[int, str, str], List[str]] = {}
+        registry: Dict[Tuple[int, str, str, Optional[str]], List[str]] = {}
         all_ops = list(self.ops) + list(self.block_ops) + list(self.model_ops)
         for op in all_ops:
             for claim in op.claims:
+                # `add_op` guarantees 4-tuple shape; tolerate 3-tuple as a
+                # belt-and-suspenders fallback (e.g., op constructed via a
+                # path that bypassed add_op validation in tests).
+                if len(claim) == 3:
+                    claim = (claim[0], claim[1], claim[2], None)
                 registry.setdefault(claim, []).append(op.name)
         return registry
 
     def _detect_claim_collisions(self) -> List[str]:
         """Scan the claim registry for collisions; warn on each.
+
+        Two claims collide only when their full 4-tuple
+        ``(layer, scope, identifier, column)`` matches. Same row + different
+        column is NOT a collision — that's exactly the column-disjoint case
+        the row-only registry produced false positives for (see the L5
+        head 5 row 32 motivating example in the task / commit history).
+
+        ``column=None`` is treated as a literal value, not a wildcard:
+        a legacy 3-tuple claim and a 4-tuple claim with column=None match,
+        but a 4-tuple with column=None does not collide with a 4-tuple
+        with column='CLEAN_EMBED_LO+0'. This keeps annotated ops free of
+        spurious warnings when they upgrade to column granularity ahead
+        of their peers — partial migration is safe.
 
         Returns the list of warning messages produced (so tests can
         inspect them without recapturing warnings).
@@ -440,14 +507,23 @@ class LayerCompiler:
 
         registry = self.build_claim_registry()
         messages: List[str] = []
-        # Deterministic ordering for stable test output.
-        for key in sorted(registry.keys()):
+        # Deterministic ordering for stable test output. The 4th element
+        # (column) may be ``None``, which sorts non-lexically against
+        # strings; coerce to "" for the sort key only.
+        def _sort_key(k):
+            return (k[0], k[1], k[2], "" if k[3] is None else k[3])
+
+        for key in sorted(registry.keys(), key=_sort_key):
             owners = registry[key]
             if len(owners) >= 2:
-                layer_idx, scope, identifier = key
+                layer_idx, scope, identifier, column = key
+                col_str = (
+                    f" column={column!r}" if column is not None else ""
+                )
                 msg = (
                     f"DIM-OWNERSHIP COLLISION: layer={layer_idx} "
-                    f"scope={scope!r} identifier={identifier!r} "
+                    f"scope={scope!r} identifier={identifier!r}"
+                    f"{col_str} "
                     f"claimed by {len(owners)} ops: {sorted(owners)!r}"
                 )
                 _warnings.warn(msg, stacklevel=3)

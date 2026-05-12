@@ -25,15 +25,33 @@ def make_layer5_fetch_op() -> Operation:
 
     # Dim-ownership claims (see c4_release/docs/DIM_OWNERSHIP_REGISTRY.md).
     # `_set_layer5_fetch` writes attn5.W_v rows {base+32+k, base+48+k} for
-    # k in 0..15 across heads 0..5 (V slots 32..47 and 48..63 per head).
+    # k in 0..15 across heads 0..5 (V slots 32..47 and 48..63 per head):
+    #
+    #   W_v[head*HD + 32 + k, CLEAN_EMBED_LO + k] = 1.0   (slot 32..47)
+    #   W_v[head*HD + 48 + k, CLEAN_EMBED_HI + k] = 1.0   (slot 48..63)
+    #
+    # The 4-tuple claim's ``column`` carries the input-dim name + offset so
+    # that a column-disjoint co-tenant on the same row (e.g.,
+    # ``function_call_weights``' EMBED_HI+15 ENT relay on row 5_32) does
+    # NOT register as a collision. Pre-column-granularity registry treated
+    # this as ``(5, "attn_W_v", "5_32")`` and produced one false positive
+    # that lived in ``KNOWN_BENIGN_COLLISIONS``; now retired.
+    #
     # Heads 6 and 7 were deleted on 2026-05-11 (commit c1a5398) to break
     # the latent collision with `_set_function_call_weights`' head 6 ENT
     # relay (V slots 1..16) — the registry would have caught that as
-    # (5, "attn_W_v", "6_<k>") for k in 1..16.
+    # (5, "attn_W_v", "6_<k>", "EMBED_LO+<k>") for k in 1..16.
     _claims = set()
     for head in range(6):  # heads 0..5
-        for slot in range(32, 64):
-            _claims.add((5, "attn_W_v", f"{head}_{slot}"))
+        for k in range(16):  # k = 0..15
+            slot_lo = 32 + k
+            slot_hi = 48 + k
+            _claims.add(
+                (5, "attn_W_v", f"{head}_{slot_lo}", f"CLEAN_EMBED_LO+{k}")
+            )
+            _claims.add(
+                (5, "attn_W_v", f"{head}_{slot_hi}", f"CLEAN_EMBED_HI+{k}")
+            )
 
     return Operation(
         name="layer5_fetch",
