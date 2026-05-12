@@ -4716,6 +4716,16 @@ def _set_layer7_memory_heads(attn, S, BD, HD):
     attn.W_v[base + 5, BD.OP_AND] = 0.2
     attn.W_v[base + 6, BD.OP_OR] = 0.2
     attn.W_v[base + 7, BD.OP_XOR] = 0.2
+    # V: OP_JSR relay for AX-bytes-1-3 zeroing at L14
+    # FIX 2026-05-12 (fix-jsr-ax-bytes-1-3): Broadcast OP_JSR from AX marker to AX
+    # byte positions so the L14 FFN ``_set_layer14_jsr_ax_bytes_zero`` cleanup can
+    # gate on OP_JSR at byte positions. Without this, OP_JSR is only present at
+    # AX marker (L5 decode) and at PC/SP/STACK0/BP/MEM markers (L6 head 6 relay),
+    # leaving AX byte positions unaware of JSR active. The L14 cleanup zeros
+    # OUTPUT_LO/HI nibble 1..15 (and boosts nibble 0) at IS_BYTE + H1[AX] when
+    # OP_JSR is set, so AX bytes 1-3 emit byte value 0 per C4's 8-bit-AX
+    # convention. See docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md for the diagnosis.
+    attn.W_v[base + 8, BD.OP_JSR] = 0.2
     # O: write to relay dims (×5 to normalize)
     attn.W_o[BD.OP_LI_RELAY, base + 1] = 1.0
     attn.W_o[BD.OP_LC_RELAY, base + 2] = 1.0
@@ -4724,6 +4734,10 @@ def _set_layer7_memory_heads(attn, S, BD, HD):
     attn.W_o[BD.TEMP + 4, base + 5] = 1.0  # OP_AND relay → TEMP[4]
     attn.W_o[BD.TEMP + 5, base + 6] = 1.0  # OP_OR relay → TEMP[5]
     attn.W_o[BD.TEMP + 6, base + 7] = 1.0  # OP_XOR relay → TEMP[6]
+    # O: write OP_JSR back to OP_JSR dim (×5 to normalize 0.2→1.0). Additive
+    # with existing L6 head 6 OP_JSR writes (which target PC/SP/STACK0/BP/MEM,
+    # disjoint from AX byte positions), so no double-counting.
+    attn.W_o[BD.OP_JSR, base + 8] = 5.0
 
     # === Head 6: Relay PSH/ENT/JSR from STACK0 marker → STACK0 byte positions ===
     # Also relay PSH_AT_SP from SP marker → SP byte positions.
@@ -6219,6 +6233,81 @@ def _set_layer14_clear_mem_marker_output(ffn, S, BD, start_unit=0):
             ffn.W_gate[unit, BD.CONST] = 1.0
             ffn.W_down[BD.OUTPUT_HI + k, unit] = OFFSET
             unit += 1
+
+    return unit
+
+
+def _set_layer14_jsr_ax_bytes_zero(ffn, S, BD, start_unit=0):
+    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_JSR is active.
+
+    FIX 2026-05-12 (fix-jsr-ax-bytes-1-3): For a JSR step, C4's calling
+    convention preserves AX across the call. Per the 8-bit-AX convention, AX
+    bytes 1-3 must be 0. The L9 ALU JSR-preserve routing (vm_step.py:3647-3689)
+    correctly writes prev step's AX byte 0 (from ``AX_CARRY_LO/HI``) to OUTPUT
+    at MARK_AX so the next emitted token (AX byte 0) carries the preserved
+    value. ``AX_CARRY_LO/HI`` for k=1..15 is 0 (carry-forward is single-byte),
+    so OUTPUT_LO/HI[1..15] at MARK_AX inherits 0 contribution from L9 — but
+    L14 attention, L7 head 1 SP gather, and other layers add SP/PC-derived
+    contamination into OUTPUT at AX byte positions, so the actual emitted
+    AX byte 1/2/3 tokens come out non-zero (observed: 0xf8030063 from
+    docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md).
+
+    Solution mirrors ``BinaryOpByteZeroingPostOp`` (vm_step.py:583): at AX
+    byte positions (IS_BYTE + H1[AX]) when OP_JSR is active, write -3/S to
+    every OUTPUT_LO[k] and OUTPUT_HI[k] dim and +5/S to OUTPUT_LO[0] and
+    OUTPUT_HI[0], so the byte-value-0 token wins argmax. The result is AX
+    bytes 1-3 = 0x00, matching C4's 8-bit-AX convention.
+
+    OP_JSR at AX byte positions is supplied by L7 head 5's new V slot 8
+    (added in the same commit; see ``_set_layer7_memory_heads``).
+
+    Activation calculation (S=100):
+      W_up: IS_BYTE=1, H1+AX=1 → +2S = +200
+      b_up: -S * 1.5 = -150
+      Gate: OP_JSR ≈ 1.0 at AX byte positions (via L7 head 5 relay)
+      pre-silu = 50, silu ≈ 50, gate = 1.0, hidden = 50
+      Writes: -3/S * 50 = -1.5 to each OUTPUT_LO/HI[k] (k=0..15)
+              +5/S * 50 = +2.5 to OUTPUT_LO[0]/OUTPUT_HI[0]
+      Net: OUTPUT_LO[0]/HI[0] = +1.0 (boost), OUTPUT_LO[k>0]/HI[k>0] = -1.5
+      → byte-value-0 token wins argmax at AX byte positions.
+
+    Non-JSR opcodes: OP_JSR ≈ 0 at AX byte positions → gate ≈ 0 → no firing.
+    """
+    unit = start_unit
+
+    # Unit 0: -3/S on all OUTPUT_LO[k]
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S  # H1 at AX marker index (AX_I = 1)
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.OP_JSR] = 1.0
+    for k in range(16):
+        ffn.W_down[BD.OUTPUT_LO + k, unit] = -3.0 / S
+    unit += 1
+
+    # Unit 1: -3/S on all OUTPUT_HI[k]
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.OP_JSR] = 1.0
+    for k in range(16):
+        ffn.W_down[BD.OUTPUT_HI + k, unit] = -3.0 / S
+    unit += 1
+
+    # Unit 2: +5/S boost on OUTPUT_LO[0]
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.OP_JSR] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = 5.0 / S
+    unit += 1
+
+    # Unit 3: +5/S boost on OUTPUT_HI[0]
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.OP_JSR] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 5.0 / S
+    unit += 1
 
     return unit
 
