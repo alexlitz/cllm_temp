@@ -4691,17 +4691,18 @@ def _set_layer6_relay_heads(attn, S, BD, HD):
         attn.W_v[base6 + 8 + k, BD.AX_CARRY_LO + k] = 1.0
         attn.W_o[BD.ALU_LO + k, base6 + 8 + k] = 1.0
 
-    # Head 7: HI nibble (slots 0-15)
-    # NOTE: Head 7 was reserved for JSR, but JSR Q activates at different positions
-    # (STACK0 for return address push), so there's no conflict with PSH Q (also STACK0).
-    # The Q weights are additive, so both PSH and JSR can use head 7 at STACK0.
+    # Head 7: HI nibble (slots 33-48)
+    # Function-call weights also use head 7 for JSR return-address push and
+    # occupy slots 1-32. Keep PSH HI in a disjoint slot range so JSR OUTPUT
+    # values cannot leak through the ALU_HI projection.
     base7 = 7 * HD
-    attn.W_q[base7, BD.MARK_STACK0] = L
+    attn.W_q[base7, BD.MARK_STACK0] = L + L * 20
     attn.W_q[base7, BD.MARK_AX] = -L  # block at AX marker
+    attn.W_q[base7, BD.CONST] = -L * 20
     attn.W_k[base7, BD.MARK_AX] = L
     for k in range(16):
-        attn.W_v[base7 + k, BD.AX_CARRY_HI + k] = 1.0
-        attn.W_o[BD.ALU_HI + k, base7 + k] = 1.0
+        attn.W_v[base7 + 33 + k, BD.AX_CARRY_HI + k] = 1.0
+        attn.W_o[BD.ALU_HI + k, base7 + 33 + k] = 1.0
 
 
 # =============================================================================

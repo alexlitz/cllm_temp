@@ -862,16 +862,18 @@ class UnifiedVMCompiler:
         attn.W_k.data[base, BD.MARK_AX] = L
         attn.W_k.data[base, BD.MARK_PC] = 30.0  # Fix: manual uses 30, not L
         attn.W_k.data[base, BD.OP_JSR] = -20.0  # Fix: suppress for JSR
-        # V[0-15]: AX_CARRY_HI (for PSH: ALU = AX value)
+        # V[33-48]: AX_CARRY_HI (for PSH: ALU = AX value).
+        # Slots 1-32 are used by the JSR return-address path; keep PSH HI
+        # disjoint so OUTPUT_LO/HI cannot leak into ALU_HI.
         for k in range(16):
-            attn.W_v.data[base + k, BD.AX_CARRY_HI + k] = 1.0
+            attn.W_v.data[base + 33 + k, BD.AX_CARRY_HI + k] = 1.0
         # V[1-32]: OUTPUT_LO/HI (for JSR: STACK0 = return address = PC+5)
         for k in range(16):
             attn.W_v.data[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
             attn.W_v.data[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
         # O[ALU_HI]: PSH output
         for k in range(16):
-            attn.W_o.data[BD.ALU_HI + k, base + k] = 1.0
+            attn.W_o.data[BD.ALU_HI + k, base + 33 + k] = 1.0
         # O[AX_CARRY]: JSR output (return address at STACK0)
         for k in range(16):
             attn.W_o.data[BD.AX_CARRY_LO + k, base + 1 + k] = 1.0
