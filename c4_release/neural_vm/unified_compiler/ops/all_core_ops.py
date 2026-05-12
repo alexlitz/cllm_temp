@@ -253,6 +253,12 @@ def all_core_ops(
         # Unblocks Phase 5 JSR/ENT/LEV roundtrip tests (returns 7 instead
         # of 0xF8030063). See docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md.
         make_layer14_jsr_ax_bytes_zero_op(),
+        # LC byte 1-3 zeroing (V7 Phase 7a, per V7_HEAP_OPS_NEURAL_PLAN.md):
+        # LC is a 1-byte load (char) so AX bytes 1-3 must be 0. L15 head 0
+        # writes the loaded byte at AX byte 0; this op zeros bytes 1-3 by
+        # boosting OUTPUT_*[0] at AX byte positions 1-3 when OP_LC_RELAY is
+        # active. Mirrors the JSR variant above. Unblocks test_sc_then_lc.
+        make_layer14_lc_ax_bytes_zero_op(),
         make_layer15_memory_lookup_op(),
         make_layer15_nibble_copy_op(),
         make_layer16_lev_routing_op(),

@@ -187,6 +187,53 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
     )
 
 
+def make_layer14_lc_ax_bytes_zero_op() -> Operation:
+    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_LC is active.
+
+    FIX V7 Phase 7a (LC byte clearing, per V7_HEAP_OPS_NEURAL_PLAN.md):
+    Per C4's LC (load-char) semantics, the loaded value is a single byte
+    placed in AX byte 0; AX bytes 1-3 must be 0. L15 attention head 0
+    writes the resolved memory byte into ``OUTPUT_LO/HI`` at the AX byte 0
+    position. Heads 1-3 fire for LI (writing AX bytes 1-3 from the loaded
+    word), but for LC they must be suppressed so bytes 1-3 emit 0.
+
+    Mirrors ``make_layer14_jsr_ax_bytes_zero_op``: at AX byte positions
+    1-3 (IS_BYTE + H1[AX] + NOT BYTE_INDEX_0) when OP_LC_RELAY is active,
+    write -3/S to every OUTPUT_LO/HI nibble dim and +5/S to OUTPUT_LO[0]
+    / OUTPUT_HI[0] so the byte-value-0 token wins argmax — producing AX
+    bytes 1-3 = 0x00. Byte 0 is protected by a strong BYTE_INDEX_0
+    blocker so this op does NOT override the L15 head 0 load result.
+
+    OP_LC_RELAY at AX byte positions is supplied by L7 head 5 (V slot 2,
+    already wired in ``_set_layer7_memory_heads``).
+
+    Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
+    counter ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
+    Phase 14.7: runs AFTER ``layer14_jsr_ax_bytes_zero`` (14.6) — the JSR
+    and LC ops gate on disjoint relays (OP_JSR vs OP_LC_RELAY) so the
+    relative order within phase 14.6-14.7 only matters for unit allocation.
+    """
+    def bake(block, dim_positions, S):
+        from ...vm_step import _set_layer14_lc_ax_bytes_zero
+        ffn = block.ffn
+        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        next_unit = _set_layer14_lc_ax_bytes_zero(
+            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        )
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_lc_ax_bytes_zero",
+        phase=14.7,
+        reads={"OP_LC_RELAY", "IS_BYTE", "H1", "BYTE_INDEX_0", "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        layer_idx=14,
+        migrated=True,
+    )
+
+
 def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
     """Bake the BLOG_SPEC.md:830 ADDR_KEY nibble decode into ``ffn``.
 
