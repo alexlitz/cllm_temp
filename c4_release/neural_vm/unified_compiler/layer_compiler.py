@@ -43,7 +43,34 @@ Example:
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+
+# Allowed `scope` values for `Operation.claims`. Each scope tags a class of
+# weight slots whose ownership can collide across bakes:
+#
+#   attn_W_v / attn_W_k / attn_W_q / attn_W_o : a single row of an attention
+#       module's W_v / W_k / W_q / W_o projection. Row index encodes
+#       (head_idx * HD) + slot, so the identifier is "<head_idx>_<slot>".
+#       Today's L5 head 6 collision (commit c1a5398) lived here: both the
+#       deprecated `_set_layer5_fetch` head 6 V relay and
+#       `_set_function_call_weights`' ENT BP→TEMP relay claimed rows
+#       6*HD+1 .. 6*HD+16 on `attn5.W_v`.
+#   ffn_W_up / ffn_W_down / ffn_W_gate : one hidden-unit row of an FFN's
+#       W_up / W_down / W_gate matrix. Identifier is the hidden-unit index
+#       as a string, e.g. "1700".
+#   embed_row : one row of the token-embedding table. Identifier is the
+#       token-id as a string.
+#
+# These tags are conventions enforced by the registry; bake authors pick the
+# tag matching the matrix slot they overwrite. The registry only checks for
+# duplicate (layer_idx, scope, identifier) keys — it does not validate that
+# the tag matches the underlying matrix.
+ALLOWED_CLAIM_SCOPES = frozenset({
+    "attn_W_v", "attn_W_k", "attn_W_q", "attn_W_o",
+    "ffn_W_up", "ffn_W_down", "ffn_W_gate",
+    "embed_row",
+})
 
 
 @dataclass
@@ -97,6 +124,13 @@ class Operation:
     # hardcoded layer numbers — they follow whatever layer the compiler picks
     # for the referenced op.
     target_op_name: Optional[str] = None
+    # Dim-ownership claims. Each tuple is (layer_idx, scope, identifier).
+    # See ALLOWED_CLAIM_SCOPES for the legal scope strings. The compiler's
+    # `_detect_claim_collisions` cross-checks claims at compile time and
+    # warns when two ops claim the same (layer_idx, scope, identifier).
+    # Defaults to an empty set so existing ops remain back-compat (opt-in).
+    # See c4_release/docs/DIM_OWNERSHIP_REGISTRY.md for the bake-author API.
+    claims: Set[Tuple[int, str, str]] = field(default_factory=set)
 
     def __hash__(self):
         return hash(self.name)
@@ -209,6 +243,27 @@ class LayerCompiler:
                 raise ValueError(
                     f"Op {op.name!r} references undeclared dim {d!r}"
                 )
+        # Validate dim-ownership claims (if any).
+        for claim in op.claims:
+            if not (isinstance(claim, tuple) and len(claim) == 3):
+                raise ValueError(
+                    f"Op {op.name!r} has malformed claim {claim!r}; "
+                    "expected (layer_idx, scope, identifier)"
+                )
+            layer_idx, scope, identifier = claim
+            if not isinstance(layer_idx, int):
+                raise ValueError(
+                    f"Op {op.name!r} claim {claim!r}: layer_idx must be int"
+                )
+            if scope not in ALLOWED_CLAIM_SCOPES:
+                raise ValueError(
+                    f"Op {op.name!r} claim {claim!r}: scope {scope!r} not in "
+                    f"{sorted(ALLOWED_CLAIM_SCOPES)}"
+                )
+            if not isinstance(identifier, str):
+                raise ValueError(
+                    f"Op {op.name!r} claim {claim!r}: identifier must be str"
+                )
         self._op_by_name[op.name] = op
         if op.kind == "block":
             if op.layer_idx is None and op.target_op_name is None:
@@ -227,7 +282,19 @@ class LayerCompiler:
     # --------------------------------------------------------------------
 
     def compile(self) -> ModelLayout:
-        """Produce a ModelLayout from the declared ops and dims."""
+        """Produce a ModelLayout from the declared ops and dims.
+
+        Also runs the dim-ownership claim collision scan: if two ops have
+        opted into `Operation.claims` and claim the same
+        (layer_idx, scope, identifier) tuple, a warning is printed via
+        `warnings.warn`. The scan is opt-in (each op's claims default to
+        empty), so legacy ops without claims don't participate and a clean
+        compile prints nothing.
+        """
+        # Run claim-collision scan first so warnings fire even if subsequent
+        # compile stages raise (e.g., dependency cycle).
+        self._detect_claim_collisions()
+
         # Block ops are pinned to layer_idx and skip dep analysis.
         attn_ffn_ops = [op for op in self.ops if op.kind != "block"]
         block_ops = [op for op in self.ops if op.kind == "block"]
@@ -284,6 +351,54 @@ class LayerCompiler:
             block_ops=list(self.block_ops),
             model_ops=list(self.model_ops),
         )
+
+    # --------------------------------------------------------------------
+    # Dim-ownership claim collision detection (Phase 1, Agent B of
+    # ARCH_LEAKAGE_FIX_PLAN.md). Opt-in: each Operation.claims defaults to
+    # an empty set, so unannotated ops don't participate. As bake authors
+    # add claims to their factories, the scan grows coverage. Collisions
+    # warn via `warnings.warn` so they surface in test output without
+    # breaking the legacy bake path.
+    # --------------------------------------------------------------------
+
+    def build_claim_registry(self) -> Dict[Tuple[int, str, str], List[str]]:
+        """Return registry: (layer_idx, scope, identifier) -> [op_name, ...].
+
+        Aggregates `Operation.claims` across `self.ops`, `self.block_ops`,
+        and `self.model_ops`. Used by `_detect_claim_collisions`; exposed
+        publicly so tests / debugging tools can inspect the full claims
+        graph without re-running compile.
+        """
+        registry: Dict[Tuple[int, str, str], List[str]] = {}
+        all_ops = list(self.ops) + list(self.block_ops) + list(self.model_ops)
+        for op in all_ops:
+            for claim in op.claims:
+                registry.setdefault(claim, []).append(op.name)
+        return registry
+
+    def _detect_claim_collisions(self) -> List[str]:
+        """Scan the claim registry for collisions; warn on each.
+
+        Returns the list of warning messages produced (so tests can
+        inspect them without recapturing warnings).
+        """
+        import warnings as _warnings
+
+        registry = self.build_claim_registry()
+        messages: List[str] = []
+        # Deterministic ordering for stable test output.
+        for key in sorted(registry.keys()):
+            owners = registry[key]
+            if len(owners) >= 2:
+                layer_idx, scope, identifier = key
+                msg = (
+                    f"DIM-OWNERSHIP COLLISION: layer={layer_idx} "
+                    f"scope={scope!r} identifier={identifier!r} "
+                    f"claimed by {len(owners)} ops: {sorted(owners)!r}"
+                )
+                _warnings.warn(msg, stacklevel=3)
+                messages.append(msg)
+        return messages
 
     # --------------------------------------------------------------------
     # Internals

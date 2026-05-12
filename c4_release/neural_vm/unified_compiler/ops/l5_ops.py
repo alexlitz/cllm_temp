@@ -23,6 +23,18 @@ def make_layer5_fetch_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_layer5_fetch(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims (see c4_release/docs/DIM_OWNERSHIP_REGISTRY.md).
+    # `_set_layer5_fetch` writes attn5.W_v rows {base+32+k, base+48+k} for
+    # k in 0..15 across heads 0..5 (V slots 32..47 and 48..63 per head).
+    # Heads 6 and 7 were deleted on 2026-05-11 (commit c1a5398) to break
+    # the latent collision with `_set_function_call_weights`' head 6 ENT
+    # relay (V slots 1..16) — the registry would have caught that as
+    # (5, "attn_W_v", "6_<k>") for k in 1..16.
+    _claims = set()
+    for head in range(6):  # heads 0..5
+        for slot in range(32, 64):
+            _claims.add((5, "attn_W_v", f"{head}_{slot}"))
+
     return Operation(
         name="layer5_fetch",
         phase=5,
@@ -44,6 +56,7 @@ def make_layer5_fetch_op() -> Operation:
         layer_idx=5,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
     )
 
 

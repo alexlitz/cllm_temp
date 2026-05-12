@@ -56,6 +56,28 @@ def make_function_call_weights_op() -> Operation:
         HD = attn5.W_q.shape[0] // attn5.num_heads
         _set_function_call_weights(model, S, proxy, HD)
 
+    # Dim-ownership claims (see c4_release/docs/DIM_OWNERSHIP_REGISTRY.md).
+    # `_set_function_call_weights` programs three ENT/JSR relay attention
+    # heads. Each head writes V slots [base+1..base+16] (EMBED_LO/CLEAN_LO
+    # path) and [base+17..base+32] (EMBED_HI/CLEAN_HI path):
+    #   L5 attn5 head 5: BP→TEMP at STACK0 marker (ENT: STACK0 = old_BP)
+    #   L5 attn5 head 6: SP→TEMP at BP marker     (ENT: BP = old_SP - 8)
+    #   L6 attn6 head 7: PC OUTPUT→AX_CARRY at STACK0 (JSR return addr)
+    # Historical context: the deprecated `_set_layer5_fetch` head 6 (deleted
+    # 2026-05-11, commit c1a5398) wrote V slots 1..16 on the same matrix.
+    # Both ops claimed `(5, "attn_W_v", "6_<k>")` for k in 1..16 — exactly
+    # the kind of latent collision this registry catches.
+    _claims = set()
+    # L5 attn5 head 5 ENT relay (slots 1..32)
+    for slot in range(1, 33):
+        _claims.add((5, "attn_W_v", f"5_{slot}"))
+    # L5 attn5 head 6 ENT relay (slots 1..32)
+    for slot in range(1, 33):
+        _claims.add((5, "attn_W_v", f"6_{slot}"))
+    # L6 attn6 head 7 JSR relay (slots 1..32)
+    for slot in range(1, 33):
+        _claims.add((6, "attn_W_v", f"7_{slot}"))
+
     return Operation(
         name="function_call_weights",
         reads=set(),
@@ -64,6 +86,7 @@ def make_function_call_weights_op() -> Operation:
         bake_fn=bake,
         phase=998,
         migrated=True,
+        claims=_claims,
     )
 
 
