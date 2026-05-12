@@ -477,3 +477,36 @@ replay) registered in ``all_core_ops()`` with double-gating
 (``enable_conversational_io`` AND per-bake ``enable=False``). Phase 2
 (deleting the V18 handler) is gated on flipping the three ``enable``
 switches together and re-running the convo-IO end-to-end test.
+
+## 9. Phase 2 entry, attempt 1 (2026-05-12): enables flipped, handler retained
+
+Branch ``v18-phase2-delete-handler`` flipped all four V18 inner ``enable``
+switches to ``True`` in ``all_core_ops.py`` (step_resume, pc_sp_latch,
+prtf_capture, prtf_transport). The 38 bake unit tests
+(``tests/test_v18_convo_io_neural_bakes.py``) and the 7 parity tests
+(``tests/test_v18_convo_io_neural_parity.py``) still pass. The full
+constraint gate (smoke + runtime_vanilla + layer_idx_consistency +
+compile_determinism) is green.
+
+What blocks Phase 2 handler deletion: an end-to-end smoke loop running
+``model.forward`` autoregressively against a ``printf("Hi");`` program
+with ``enable_conversational_io=True`` did NOT emit ``Token.THINKING_END``
+within 300 generated tokens. The model emitted normal step tokens (REG_PC,
+REG_AX, REG_SP, REG_BP, STACK0, MEM, STEP_END) but never triggered the
+L6 FFN state-machine bake (units 1400-1401) that should fire
+``NEXT_THINKING_END`` at the PRTF step's NEXT_SE position.
+
+Per the Phase 2 spec the handler at ``run_vm.py:776-825`` is retained;
+deletion is gated on the smoke loop producing the full
+``THINKING_END → bytes → THINKING_START → REG_PC`` chain autoregressively.
+The bake gate flips themselves are safe (and bake unit tests + parity
+tests verify the unit-layout invariants).
+
+Likely root cause to investigate next: either (a) the convo-IO opcode
+decode L5 path needs ``IO_IS_PRTF`` to be set during the PRTF step's AX
+marker — verify that runs with the new gate flip; or (b) the L6 relay
+head's CMP[5] write doesn't propagate to the L6 FFN state-machine units
+1400-1401 in the production residual layout; or (c) the embedding-level
+opcode decode for PRTF isn't asserting ``ACTIVE_OPCODE_PRTF`` early
+enough in the step. The bake unit tests cover the FFN weight pattern
+but not the upstream CMP/IO_IS_PRTF data flow.

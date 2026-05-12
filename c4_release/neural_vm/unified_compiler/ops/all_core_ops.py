@@ -333,43 +333,35 @@ def all_core_ops(
         make_convo_io_state_machine_op(
             enable_conversational_io=enable_conversational_io
         ),
-        # V18 Phase 1 bakes (step resumption + PC/SP latch). Both are
-        # double-gated: ``enable_conversational_io`` AND ``enable`` must
-        # be True. ``enable=False`` by default — flip once the parity
-        # test in tests/test_v18_convo_io_neural_bakes.py passes
-        # end-to-end and Phase 1b (the latch *capture* side at the PRTF
-        # AX marker) is in place. See V18_CONVO_IO_NEURAL_PLAN.md §3.
+        # V18 Phase 2 bakes (step resumption + PC/SP latch + PRTF capture +
+        # PRTF transport). All four are double-gated:
+        # ``enable_conversational_io`` AND ``enable`` must be True. Inner
+        # ``enable=True`` flipped (Phase 2 entry, 2026-05-12) so the bakes
+        # form the full ``capture(3c) → transport(3d) → replay(3b)`` chain
+        # plus the ``step_resume(3a)`` head-routing flip whenever
+        # ``enable_conversational_io=True`` reaches the compiler.
+        #
+        # Status: bake unit tests pass, but the end-to-end round-trip with
+        # ``enable_conversational_io=True`` does not yet emit THINKING_END
+        # from the model — the V18 Python handler block at run_vm.py:776-825
+        # therefore remains the production path. Removing it is gated on
+        # the smoke loop emitting THINKING_END → bytes → THINKING_START →
+        # REG_PC autonomously. See V18_CONVO_IO_NEURAL_PLAN.md §3 / Phase 2.
         make_convo_io_step_resume_op(
             enable_conversational_io=enable_conversational_io,
-            enable=False,
+            enable=True,
         ),
         make_convo_io_pc_sp_latch_op(
             enable_conversational_io=enable_conversational_io,
-            enable=False,
+            enable=True,
         ),
-        # V18 Phase 1b capture-side bake (companion to convo_io_pc_sp_latch).
-        # L7 FFN units 800-863: at the PRTF AX marker, decompose PC and SP
-        # byte-0 nibbles into the POST_PRTF_PC / POST_PRTF_SP cache dims that
-        # the 3b replay band reads at the resumed step's REG_PC / REG_SP
-        # value-byte positions. Double-gated; ``enable=False`` by default —
-        # flip in tandem with convo_io_pc_sp_latch once the end-to-end neural
-        # convo-IO loop is validated. See V18_CONVO_IO_NEURAL_PLAN.md §3.
         make_convo_io_prtf_capture_op(
             enable_conversational_io=enable_conversational_io,
-            enable=False,
+            enable=True,
         ),
-        # V18 Phase 1c transport-side bake (companion to convo_io_prtf_capture
-        # and convo_io_pc_sp_latch). L4 attn head 4: at the post-THINKING_START
-        # position, attend back across the variable-length output-byte
-        # interlude to the most recent PRTF AX marker and copy the captured
-        # POST_PRTF_PC/SP nibbles forward into the current position's
-        # residual, where the 3b replay band reads them. Double-gated;
-        # ``enable=False`` by default — flip in tandem with the capture/replay
-        # bakes once the end-to-end neural convo-IO loop is validated.
-        # See V18_CONVO_IO_NEURAL_PLAN.md §3, Phase 1c.
         make_convo_io_prtf_transport_op(
             enable_conversational_io=enable_conversational_io,
-            enable=False,
+            enable=True,
         ),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
