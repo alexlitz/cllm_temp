@@ -20,6 +20,20 @@ def make_layer8_alu_op() -> Operation:
         from ...vm_step import _set_layer8_alu
         _set_layer8_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
 
+    # Dim-ownership claims: L8 ALU FFN unit 0 = ADD(a=0, b=0) → OUTPUT_LO+0.
+    # This is the canonical first ADD lo-nibble cluster anchor (see
+    # ``_set_layer8_alu`` at vm_step.py:4986+). Unit 0 reads MARK_AX,
+    # MARK_PC, ALU_LO+0, AX_CARRY_LO+0 in W_up; OP_ADD in W_gate; and
+    # writes OUTPUT_LO+0 in W_down. Declaring the W_up + W_down rows of
+    # unit 0 is a partial-claim anchor: it pins the head of the ADD
+    # cluster without re-declaring all 2055 units.
+    _claims = {
+        (8, "ffn_W_up", "0", "MARK_AX+0"),
+        (8, "ffn_W_up", "0", "ALU_LO+0"),
+        (8, "ffn_W_up", "0", "AX_CARRY_LO+0"),
+        (8, "ffn_W_down", "0", "OUTPUT_LO+0"),
+    }
+
     return Operation(
         name="layer8_alu",
         phase=8.2,
@@ -31,6 +45,7 @@ def make_layer8_alu_op() -> Operation:
         bake_fn=bake,
         layer_idx=8,
         migrated=True,
+        claims=_claims,
         # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
         # The L8 lookup ALU consumes the *current step's* AX value via
         # AX_CARRY_LO at the AX marker (operand 1 for ADD/SUB/LEA at the
@@ -48,6 +63,15 @@ def make_layer8_alu_op() -> Operation:
             # producer, ALU_LO would carry stale prev-step values, breaking
             # binary-op semantics for any operand A computation.
             "ALU_LO": "AX_byte0",
+        },
+        # Produces the OUTPUT_LO byte-0 result for ADD/SUB/LEA, plus CARRY
+        # (ADD byte carry / SUB borrow) and CMP_GROUP (comparison group
+        # flag) at the AX byte 0 position. The L8 ALU is the lo-nibble
+        # producer; the matching hi-nibble side lives in ``layer9_alu``.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "CARRY": "AX_byte0",
+            "CMP_GROUP": "AX_byte0",
         },
     )
 

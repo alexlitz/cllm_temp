@@ -56,6 +56,15 @@ def make_layer15_memory_lookup_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        # Produces the loaded memory byte values in OUTPUT_LO/HI at AX byte 0
+        # (LI/LC load destination) and at STACK0 byte positions (POP group
+        # *SP read for binary ops). The L15 attn heads attend to the matching
+        # MEM val byte position via ADDR_KEY and copy CLEAN_EMBED into
+        # OUTPUT. Marker "AX_byte0" is the canonical AX-side anchor.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI": "AX_byte0",
+        },
     )
 
 
