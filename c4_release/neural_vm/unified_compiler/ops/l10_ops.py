@@ -179,6 +179,17 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: relays CLEAN_EMBED from the previous step's
+        # AX bytes 1-3 into OUTPUT_LO/HI at the current step's AX byte
+        # positions 0-2 (shifted byte matching for the autoregressive
+        # offset). Byte 0's AX marker value is handled separately by the
+        # marker-level AX passthrough FFN. Marker label "AX_byte0" follows
+        # the convention used by ``layer8_multibyte_routing`` for AX-byte
+        # output writes.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI": "AX_byte0",
+        },
     )
 
 
@@ -216,6 +227,16 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: relays CLEAN_EMBED from the previous step's
+        # SP bytes 1-3 into OUTPUT_LO/HI at the current step's SP byte
+        # positions 0-2 (when NOT PSH, NOT binary POP). When PSH is active,
+        # L6/L15 handle SP value updates instead. Register label "SP_byte0"
+        # marks the SP-byte-position write context for the staleness
+        # analyzer.
+        produces={
+            "OUTPUT_LO": "SP_byte0",
+            "OUTPUT_HI": "SP_byte0",
+        },
     )
 
 
@@ -253,6 +274,15 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: copies CLEAN_EMBED from prior-step STACK0
+        # byte positions into OUTPUT_LO/HI at the current step's STACK0
+        # byte positions (PSH passthrough so the newly-pushed value
+        # appears at STACK0). Register label "STACK0_byte0" marks the
+        # STACK0-byte-position write context.
+        produces={
+            "OUTPUT_LO": "STACK0_byte0",
+            "OUTPUT_HI": "STACK0_byte0",
+        },
     )
 
 
@@ -290,6 +320,15 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: at AX byte positions, attends to STACK0
+        # byte positions in the previous step and copies CLEAN_EMBED
+        # nibbles into ALU_LO/HI -- the operand-A source for the L10
+        # ``BitwiseBytePropagationPostOp`` (which reads ALU+OUTPUT to
+        # compute the multi-byte bitwise result).
+        produces={
+            "ALU_LO": "AX_byte0",
+            "ALU_HI": "AX_byte0",
+        },
     )
 
 
@@ -331,6 +370,15 @@ def make_layer10_alu_op() -> Operation:
             "ALU_HI": "AX_byte0",
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
+        },
+        # Produces the fresh AND/OR/XOR + comparison-combine result at the
+        # AX marker (gated on MARK_AX in every up-projection unit) into
+        # OUTPUT_LO/HI, plus the DIV/MOD setup units into DIV_STAGING.
+        # Marker label "AX_byte0" matches the canonical AX-result convention.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI": "AX_byte0",
+            "DIV_STAGING": "AX_byte0",
         },
         # ``_set_layer10_alu`` writes the comparison-combine (18 units) +
         # bitwise-cross-product (~1536) + AX passthrough (~32) + DIV/MOD

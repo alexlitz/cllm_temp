@@ -41,6 +41,20 @@ def make_layer13_mem_addr_gather_op() -> Operation:
         layer_idx=13,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: gathers MEM addr-byte CLEAN_EMBED nibbles
+        # from MEM addr positions (d=1..3 from MEM marker) into ADDR_B*_LO/HI
+        # at MEM val byte positions (d=5..8 from MEM marker) -- the L15
+        # K-side address keys for the value read/write. The register
+        # context is "MEM_VAL_byte0" since the writes land at MEM-val byte
+        # positions, not at the AX marker.
+        produces={
+            "ADDR_B0_LO": "MEM_VAL_byte0",
+            "ADDR_B1_LO": "MEM_VAL_byte0",
+            "ADDR_B2_LO": "MEM_VAL_byte0",
+            "ADDR_B0_HI": "MEM_VAL_byte0",
+            "ADDR_B1_HI": "MEM_VAL_byte0",
+            "ADDR_B2_HI": "MEM_VAL_byte0",
+        },
     )
 
 
@@ -94,6 +108,18 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
             "ALU_LO": "AX_byte0",
             "ALU_HI": "AX_byte0",
             "AX_CARRY_LO": "AX_byte0",
+        } if alu_mode == "lookup" else {},
+        # Produces the fresh SHL/SHR result at the AX marker (gated on
+        # MARK_AX + OP_SHL/OP_SHR via 5-way AND units): writes
+        # ``(value << s) & 0xFF`` (SHL) or ``(value >> s) & 0xFF`` (SHR)
+        # into OUTPUT_LO/HI for shift amounts 0..7. Shift >= 8 is handled
+        # by L10 zero-output units (so they reach OUTPUT via a different
+        # path). Only the lookup-mode bake actually emits the units; in
+        # efficient mode the 4-stage shift composite (alu_ops.py)
+        # produces OUTPUT_LO/HI through its own getobd stage.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI": "AX_byte0",
         } if alu_mode == "lookup" else {},
     )
 
