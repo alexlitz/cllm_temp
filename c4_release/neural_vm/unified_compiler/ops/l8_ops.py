@@ -85,6 +85,15 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         bake_fn=bake,
         layer_idx=8,
         migrated=True,
+        # Staleness invariants: this FFN increments IO_FORMAT_POS by 1 on
+        # any position where LAST_WAS_BYTE AND IO_IN_OUTPUT_MODE are both
+        # set (a just-emitted output byte). Position is the AX marker on
+        # the next step where format_string_fetch_head reads it. No-op when
+        # enable_conversational_io=False. The fresh in-step producer of
+        # IO_FORMAT_POS at AX_byte0 lives here.
+        produces={
+            "IO_FORMAT_POS": "AX_byte0",
+        },
     )
 
 
@@ -174,6 +183,17 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         layer_idx=8,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: head 3 fires at AX byte positions (IS_BYTE +
+        # H1[AX_I] gated), queries the code-section ADDR_KEY for the
+        # FETCH_LO/HI-derived address (PC+2/3/4 computed by L4 FFN), and
+        # writes the fetched code byte's CLEAN_EMBED nibbles into
+        # AX_CARRY_LO/HI -- so the L8 multibyte_routing FFN can copy them
+        # into OUTPUT_LO/HI for multi-byte IMM. AX byte 1 is the canonical
+        # first multi-byte slot.
+        produces={
+            "AX_CARRY_LO": "AX_byte1",
+            "AX_CARRY_HI": "AX_byte1",
+        },
     )
 
 
@@ -449,6 +469,16 @@ def make_layer8_op_imm_relay_op() -> Operation:
         phase=8.4,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: head 4 fires at AX byte positions
+        # (IS_BYTE + H1[AX_I] Q gate), attends to the AX marker
+        # (K[MARK_AX]=L), and copies OP_IMM forward so the L8
+        # multibyte_routing FFN can gate on it at byte positions 1/2/3.
+        # Declared at AX_byte1 (the first multi-byte slot) -- the same
+        # write fires at AX_byte2 and AX_byte3 too, but the verifier only
+        # needs one canonical position to confirm the producer fired.
+        produces={
+            "OP_IMM": "AX_byte1",
+        },
     )
 
 

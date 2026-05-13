@@ -86,6 +86,18 @@ def make_layer5_fetch_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
+        # Head 1 writes the fresh opcode byte nibbles at the AX marker, head 4
+        # mirrors it for first-step (NOT HAS_SE) — together they produce the
+        # in-step OPCODE_BYTE_LO/HI value the L5 FFN opcode_decode_ffn reads
+        # at MARK_AX. Head 0 also writes FETCH_LO/HI at the AX marker for the
+        # immediate-fetch path (PC+1 lookup on non-first steps).
+        produces={
+            "OPCODE_BYTE_LO": "AX_byte0",
+            "OPCODE_BYTE_HI": "AX_byte0",
+            "FETCH_LO": "AX_byte0",
+            "FETCH_HI": "AX_byte0",
+        },
     )
 
 
@@ -148,6 +160,24 @@ def make_opcode_decode_ffn_op() -> Operation:
         layer_idx=5,
         bake_fn=bake,
         migrated=True,
+        # Staleness invariants: this FFN decodes OPCODE_BYTE_LO/HI -> 34 one-hot
+        # OP_* flags fired at the AX marker (W_gate=MARK_AX per opcode unit).
+        # Downstream L6/L7/L8/L9 ops read these flags as AX-marker-fresh gates
+        # for routing/ALU. The first-step path also writes OP_JMP/JSR/IMM/LEA/
+        # EXIT/NOP and the binary-op family at MARK_PC so L6 head 0 can relay
+        # them forward; only the AX-marker producer is the canonical fresh
+        # source consumers downstream of phase=5 expect.
+        produces={
+            "OP_ADD": "AX_byte0",
+            "OP_SUB": "AX_byte0",
+            "OP_IMM": "AX_byte0",
+            "OP_EXIT": "AX_byte0",
+            "OP_NOP": "AX_byte0",
+            "OP_JMP": "AX_byte0",
+            "OP_JSR": "AX_byte0",
+            "OP_LEA": "AX_byte0",
+            "OP_PSH": "AX_byte0",
+        },
     )
 
 
