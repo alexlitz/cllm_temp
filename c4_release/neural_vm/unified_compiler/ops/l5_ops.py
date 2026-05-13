@@ -116,6 +116,7 @@ def make_layer5_fetch_dep_anchor_op() -> Operation:
                 "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
         kind="attn",
         bake_fn=bake,
+        declarative_authority="declarative",
         smoke_tests=set(),
         spec_section=None,
     )
@@ -181,8 +182,8 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
                 "TEMP"},
         kind="ffn",
         bake_fn=bake,
+        declarative_authority="declarative",
         smoke_tests=set(),
         spec_section=None,
     )
-
 

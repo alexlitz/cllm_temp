@@ -120,6 +120,7 @@ def make_layer8_multibyte_fetch_op() -> Operation:
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         bake_fn=bake,
+        declarative_authority="declarative",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
@@ -259,6 +260,7 @@ def make_layer8_sp_gather_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+        declarative_authority="declarative",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -692,5 +694,4 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
-
 

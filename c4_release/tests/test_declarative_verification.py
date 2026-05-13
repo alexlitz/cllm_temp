@@ -779,6 +779,40 @@ class TestDeclarativeAuthorityAudit:
     def test_known_helper_wrapper_is_reported_as_wrapper(self, report):
         assert "binary_pop_sp_increment" in report.legacy_wrapper_ops
 
+    def test_no_production_ops_remain_unclassified(self, report):
+        assert report.unclassified_ops == []
+
+    def test_explicit_noop_anchors_are_declarative_topology(self, report):
+        for name in (
+            "_layer3_ffn_dep_anchor",
+            "_layer5_fetch_dep_anchor",
+            "_opcode_decode_ffn_dep_anchor",
+            "layer8_multibyte_fetch",
+            "layer8_sp_gather",
+        ):
+            assert name in report.authoritative_ops
+            assert report.explicit_sources[name] == "declarative"
+
+    def test_explicit_model_bakes_are_declarative(self, report):
+        for name in (
+            "embedding_bake",
+            "head_bake",
+            "initial_pc_bake",
+            "l10_post_ops_combined",
+        ):
+            assert name in report.authoritative_ops
+            assert report.explicit_sources[name] == "declarative"
+
+    def test_addsub_stage_placeholders_track_wrapper_authority(self, report):
+        for name in (
+            "l8_alu_addsub_getobd",
+            "l8_alu_addsub_stage1",
+            "l8_alu_addsub_stage2",
+            "l8_alu_addsub_stage3",
+        ):
+            assert name in report.legacy_wrapper_ops
+            assert report.explicit_sources[name] == "legacy_wrapper"
+
     def test_format_includes_summary_counts(self, report):
         formatted = report.format()
         assert formatted.startswith("=== Declarative authority audit ===")

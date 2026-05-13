@@ -592,6 +592,7 @@ def make_head_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         phase=1000,
+        declarative_authority="declarative",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -614,6 +615,7 @@ def make_embedding_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         phase=1001,
+        declarative_authority="declarative",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -669,6 +671,7 @@ def make_initial_pc_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         phase=1001.5,
+        declarative_authority="declarative",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

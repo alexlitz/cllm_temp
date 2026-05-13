@@ -1,8 +1,53 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..primitives import Primitives
 from .shared import _as_setdim_proxy
 from .shared import _bake_post_op_into
+
+
+def _bake_layer10_byte_passthrough_head(attn, BD, S, HD) -> None:
+    """Declarative L10 head 1 AX byte passthrough spec."""
+    AX_IDX = 1
+    Primitives.byte_passthrough_chain(
+        attn,
+        head_idx=1,
+        source_marker_dim=BD.H1 + AX_IDX,
+        target_marker_dim=BD.H1 + AX_IDX,
+        value_lo_dim=BD.CLEAN_EMBED_LO,
+        value_hi_dim=BD.CLEAN_EMBED_HI,
+        suppress_op_dims=[BD.OP_IMM, BD.TEMP + 3],
+        S=S,
+        HD=HD,
+        alibi_slope=1.0,
+    )
+
+
+def _bake_layer10_sp_byte_passthrough_head(attn, BD, S, HD) -> None:
+    """Declarative L10 head 2 SP byte passthrough spec."""
+    SP_IDX = 2
+    Primitives.byte_passthrough_chain(
+        attn,
+        head_idx=2,
+        source_marker_dim=BD.H1 + SP_IDX,
+        target_marker_dim=BD.H1 + SP_IDX,
+        value_lo_dim=BD.CLEAN_EMBED_LO,
+        value_hi_dim=BD.CLEAN_EMBED_HI,
+        suppress_op_dims=[BD.PSH_AT_SP],
+        S=S,
+        HD=HD,
+        alibi_slope=1.0,
+        is_byte_strength=1.0,
+        has_se_strength=2.0,
+        suppress_strength=2.0,
+        q0_threshold=1.5,
+        gate_const=-30000.0,
+        gate_extras=[
+            (BD.IS_BYTE, 10000.0),
+            (BD.PSH_AT_SP, -10000.0),
+            (BD.CMP + 3, -10000.0),
+        ],
+    )
 
 
 def make_layer10_carry_relay_op() -> Operation:
@@ -27,9 +72,10 @@ def make_layer10_carry_relay_op() -> Operation:
 def make_layer10_byte_passthrough_op() -> Operation:
     """L10 attention head 1: AX byte passthrough across steps."""
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_layer10_byte_passthrough
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_byte_passthrough(attn, S, _as_setdim_proxy(dim_positions), HD)
+        _bake_layer10_byte_passthrough_head(
+            attn, _as_setdim_proxy(dim_positions), S, HD
+        )
 
     return Operation(
         name="layer10_byte_passthrough",
@@ -40,6 +86,7 @@ def make_layer10_byte_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        declarative_authority="spec_generated",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -48,9 +95,10 @@ def make_layer10_byte_passthrough_op() -> Operation:
 def make_layer10_sp_byte_passthrough_op() -> Operation:
     """L10 attention head 2: SP byte passthrough."""
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_layer10_sp_byte_passthrough
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_sp_byte_passthrough(attn, S, _as_setdim_proxy(dim_positions), HD)
+        _bake_layer10_sp_byte_passthrough_head(
+            attn, _as_setdim_proxy(dim_positions), S, HD
+        )
 
     return Operation(
         name="layer10_sp_byte_passthrough",
@@ -61,6 +109,7 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        declarative_authority="spec_generated",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -157,11 +206,10 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
     removed; this op now owns the bake. Phase=10.1.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer10_byte_passthrough
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_byte_passthrough(attn, S, proxy, HD)
+        _bake_layer10_byte_passthrough_head(attn, proxy, S, HD)
 
     # Dim-ownership claims: L10 attn head 1 AX byte passthrough.
     # ``byte_passthrough_chain`` writes V slots 0..31 + O writes OUTPUT_LO/HI:
@@ -185,6 +233,7 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        declarative_authority="spec_generated",
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -199,11 +248,10 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
     removed; this op now owns the bake. Phase=10.2.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer10_sp_byte_passthrough
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_sp_byte_passthrough(attn, S, proxy, HD)
+        _bake_layer10_sp_byte_passthrough_head(attn, proxy, S, HD)
 
     # Dim-ownership claims: L10 attn head 2 SP byte passthrough.
     #   W_v[2*HD + k, CLEAN_EMBED_LO + k]      for k=0..15
@@ -224,6 +272,7 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        declarative_authority="spec_generated",
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -454,6 +503,7 @@ def make_l10_post_ops_combined() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "CARRY"},
         kind="ffn",
         bake_fn=bake,
+        declarative_authority="declarative",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -562,5 +612,3 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
-
-

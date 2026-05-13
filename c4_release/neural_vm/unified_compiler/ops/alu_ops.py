@@ -922,6 +922,7 @@ def make_l8_alu_addsub_bdtoge_op() -> Operation:
         writes=set(),
         kind="model",  # no-op model op; documentation only
         bake_fn=bake,
+        declarative_authority="legacy_wrapper",
         smoke_tests={
             "TestSmoke32Bit::test_add_16bit",
             "TestSmoke32Bit::test_sub_16bit",
@@ -949,6 +950,7 @@ def make_l8_alu_addsub_stage1_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_authority="legacy_wrapper",
         smoke_tests={
             "TestSmoke32Bit::test_add_16bit",
             "TestSmoke32Bit::test_sub_16bit",
@@ -978,6 +980,7 @@ def make_l8_alu_addsub_stage2_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_authority="legacy_wrapper",
         smoke_tests={
             "TestSmoke32Bit::test_add_16bit",
             "TestSmoke32Bit::test_sub_16bit",
@@ -1005,6 +1008,7 @@ def make_l8_alu_addsub_stage3_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_authority="legacy_wrapper",
         smoke_tests={
             "TestSmoke32Bit::test_add_16bit",
             "TestSmoke32Bit::test_sub_16bit",
@@ -1032,6 +1036,7 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_authority="legacy_wrapper",
         smoke_tests={
             "TestSmoke32Bit::test_add_16bit",
             "TestSmoke32Bit::test_sub_16bit",
@@ -1041,4 +1046,3 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
-

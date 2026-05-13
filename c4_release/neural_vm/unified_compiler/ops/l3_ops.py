@@ -69,6 +69,7 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI"},
         kind="ffn",
         bake_fn=bake,
+        declarative_authority="declarative",
         smoke_tests=set(),
         spec_section=None,
     )
@@ -230,4 +231,3 @@ def make_layer3_convo_io_state_init_op(
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
-
