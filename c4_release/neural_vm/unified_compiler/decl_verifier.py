@@ -747,22 +747,9 @@ def verify_produces_consumes_dynamic(
         ))
         return report
 
-    # Collect ops with produces or consumes_fresh.
-    all_ops = []
-    for ops_at in layout.ops_per_layer:
-        all_ops.extend(ops_at)
-    all_ops.extend(layout.block_ops)
-    all_ops.extend(layout.model_ops)
-
-    seen: Set[str] = set()
-    candidates = []
-    for op in all_ops:
-        if op.name in seen:
-            continue
-        seen.add(op.name)
-        if op.produces or op.consumes_fresh:
-            candidates.append(op)
-
+    candidates = _collect_unique_ops_with(
+        layout, lambda op: bool(op.produces or op.consumes_fresh)
+    )
     if not candidates:
         return report
 
@@ -793,18 +780,7 @@ def verify_produces_consumes_dynamic(
 
     for op in candidates:
         res = DynamicVerificationResult(op_name=op.name)
-        # Locate the op's layer.
-        layer_idx = None
-        if op.kind == "block":
-            try:
-                layer_idx = layout.resolve_block_op_layer(op)
-            except ValueError:
-                layer_idx = op.layer_idx
-        elif op.kind in ("attn", "ffn"):
-            for lidx, ops_at in enumerate(layout.ops_per_layer):
-                if any(o.name == op.name for o in ops_at):
-                    layer_idx = lidx
-                    break
+        layer_idx = _resolve_op_layer(layout, op)
 
         if layer_idx is None or layer_idx + 1 >= len(per_layer_residuals):
             res.notes.append("could not locate op layer for dynamic check")
@@ -871,6 +847,472 @@ def _build_synthetic_imm_exit(layout):
 
     token_tensor = torch.tensor([tokens], dtype=torch.long)
     return token_tensor, [ax_pos]
+
+
+# ---------------------------------------------------------------------------
+# Mode B+: multi-step produces/consumes verification
+# ---------------------------------------------------------------------------
+#
+# The original Mode B (``verify_produces_consumes_dynamic`` above) runs a
+# synthetic 1-instruction probe through the compiled model. Cascade bugs --
+# where an op fires correctly on step 1 but its byte-relay state fails to
+# propagate to step 2/3/4 -- never surface inside a single step boundary.
+# The audit doc + the 2026-05-12 L6/L10 STACK0 byte-relay debugging cycle
+# repeatedly flagged this gap.
+#
+# ``verify_produces_consumes_multistep`` closes that gap by:
+#   1. Compiling a real bytecode program (hand-built via opcode/imm
+#      packing -- see ``_build_multistep_probe``).
+#   2. Running the compiled model forward over a context that includes
+#      ``n_steps`` worth of real DraftVM-generated step tokens (each step
+#      adds 35 tokens to the sequence: PC/AX/SP/BP/STACK0/MEM/STEP_END).
+#   3. For each annotated op + each step, inspecting the residual stream
+#      at the marker (or byte) position implied by the produces register
+#      name and reporting a drift entry when the residual is ~0 despite a
+#      non-empty ``produces[dim]`` declaration.
+#
+# The probe deliberately uses non-cached forward (single full forward pass
+# over the whole context); the per-layer residuals are captured by
+# iterating ``model.blocks`` directly, mirroring the Mode B pattern. This
+# avoids KV-cache edge cases (eviction, _is_new_only) which matter for
+# inference speed but not for liveness probing.
+
+
+@dataclass
+class MultistepDriftEntry:
+    """A single (op, step, dim, register) drift observation."""
+    op_name: str
+    step: int  # 1-indexed step within the n_steps run
+    dim: str
+    register: str
+    position: int  # token position inspected
+    observed: float  # abs-max residual value observed (~0 means drift)
+
+
+@dataclass
+class MultistepVerificationResult:
+    """Per-op outcome of multistep dynamic verification."""
+    op_name: str
+    layer_idx: Optional[int] = None
+    notes: List[str] = field(default_factory=list)
+    drift: List[MultistepDriftEntry] = field(default_factory=list)
+
+
+@dataclass
+class MultistepVerificationReport:
+    """Aggregate report across all multistep-verified ops."""
+    n_steps: int = 0
+    program_summary: str = ""
+    results: List[MultistepVerificationResult] = field(default_factory=list)
+
+    def has_drift(self) -> bool:
+        return any(r.drift for r in self.results)
+
+    def drift_entries(self) -> List[MultistepDriftEntry]:
+        """Flat list of every drift entry across all results, in op order."""
+        out: List[MultistepDriftEntry] = []
+        for r in self.results:
+            out.extend(r.drift)
+        return out
+
+    def format(self) -> str:
+        lines = [
+            "=== Multistep produces/consumes verification report ===",
+            f"Program: {self.program_summary}",
+            f"Steps: {self.n_steps}",
+            f"Ops inspected: {len(self.results)}",
+            f"Drift entries: {len(self.drift_entries())}",
+        ]
+        for r in self.results:
+            status = "OK" if not r.drift else "DRIFT"
+            layer_tag = (
+                f" (layer {r.layer_idx})" if r.layer_idx is not None else ""
+            )
+            lines.append(f"  [{status}] {r.op_name}{layer_tag}")
+            for n in r.notes:
+                lines.append(f"     NOTE: {n}")
+            for d in r.drift:
+                lines.append(
+                    f"     DRIFT: step={d.step} dim={d.dim!r} "
+                    f"register={d.register!r} pos={d.position} "
+                    f"observed_abs_max={d.observed:.3e}"
+                )
+        return "\n".join(lines)
+
+
+def _collect_unique_ops_with(layout, predicate: Callable[[Operation], bool]) -> List[Operation]:
+    """Walk every op in ``layout`` (per-layer, block, model) and return
+    those matching ``predicate``, de-duplicated by ``op.name``.
+
+    Used by Mode B and Mode B+ to gather candidate ops with non-empty
+    ``produces``/``consumes_fresh`` annotations.
+    """
+    seen: Set[str] = set()
+    out: List[Operation] = []
+    for ops_at in layout.ops_per_layer:
+        for op in ops_at:
+            if op.name in seen:
+                continue
+            seen.add(op.name)
+            if predicate(op):
+                out.append(op)
+    for op in layout.block_ops:
+        if op.name in seen:
+            continue
+        seen.add(op.name)
+        if predicate(op):
+            out.append(op)
+    for op in layout.model_ops:
+        if op.name in seen:
+            continue
+        seen.add(op.name)
+        if predicate(op):
+            out.append(op)
+    return out
+
+
+def _resolve_op_layer(layout, op) -> Optional[int]:
+    """Return the layer index an op binds to, or None if unresolvable.
+
+    Mirrors the locate-layer logic Mode B (``verify_produces_consumes_dynamic``)
+    and Mode B+ (``verify_produces_consumes_multistep``) share. Model ops
+    return ``op.layer_idx`` (may be None for whole-model ops).
+    """
+    if op.kind == "block":
+        try:
+            return layout.resolve_block_op_layer(op)
+        except ValueError:
+            return op.layer_idx
+    if op.kind in ("attn", "ffn"):
+        for lidx, ops_at in enumerate(layout.ops_per_layer):
+            if any(o.name == op.name for o in ops_at):
+                return lidx
+        return None
+    # model ops: respect op.layer_idx hint, None means whole-model.
+    return op.layer_idx
+
+
+# Token offsets within a single 35-token VM step. See ``Token.STEP_TOKENS``
+# in ``vm_step.py`` -- the format is REG_PC(5) + REG_AX(5) + REG_SP(5) +
+# REG_BP(5) + STACK0(5) + MEM(9) + STEP_END(1).
+_STEP_TOKEN_OFFSETS = {
+    "REG_PC": 0,    "PC_byte0": 1, "PC_byte1": 2, "PC_byte2": 3, "PC_byte3": 4,
+    "REG_AX": 5,    "AX_byte0": 6, "AX_byte1": 7, "AX_byte2": 8, "AX_byte3": 9,
+    "REG_SP": 10,   "SP_byte0": 11, "SP_byte1": 12, "SP_byte2": 13, "SP_byte3": 14,
+    "REG_BP": 15,   "BP_byte0": 16, "BP_byte1": 17, "BP_byte2": 18, "BP_byte3": 19,
+    "STACK0": 20,   "STACK0_byte0": 21, "STACK0_byte1": 22,
+                    "STACK0_byte2": 23, "STACK0_byte3": 24,
+    "MEM": 25,
+    "MEM_ADDR_byte0": 26, "MEM_ADDR_byte1": 27,
+    "MEM_ADDR_byte2": 28, "MEM_ADDR_byte3": 29,
+    "MEM_VAL_byte0": 30, "MEM_VAL_byte1": 31,
+    "MEM_VAL_byte2": 32, "MEM_VAL_byte3": 33,
+    "STEP_END": 34,
+}
+
+
+def _resolve_register_offset(register: str) -> Optional[int]:
+    """Map an ``Operation.produces`` register name to a step-relative offset.
+
+    The produces convention uses register names like ``"AX_byte0"`` (the
+    byte position immediately after REG_AX) or ``"STACK0_byte0"``. For
+    register names with the bare-marker convention (``"AX"``, ``"STACK0"``,
+    ``"AX_marker"``, ...) we fall back to the REG_* marker position itself.
+    Returns None if the name can't be resolved -- caller should record a
+    note rather than a drift entry.
+    """
+    if register in _STEP_TOKEN_OFFSETS:
+        return _STEP_TOKEN_OFFSETS[register]
+    # Common alias normalization: "AX" -> "REG_AX", "AX_marker" -> "REG_AX".
+    bare = register.replace("_marker", "")
+    if bare in ("AX", "PC", "SP", "BP"):
+        return _STEP_TOKEN_OFFSETS[f"REG_{bare}"]
+    if bare == "STACK0":
+        return _STEP_TOKEN_OFFSETS["STACK0"]
+    if bare == "MEM":
+        return _STEP_TOKEN_OFFSETS["MEM"]
+    return None
+
+
+def _pack_instr(opcode: int, imm: int = 0) -> int:
+    """Pack ``opcode | (imm << 8)`` the way C4's bytecode list expects.
+
+    Matches the encoding in ``DraftVM.__init__`` / ``DraftVM.step`` which
+    reads ``op = instr & 0xFF`` and ``imm = instr >> 8`` from each entry.
+    The runner-side context builder (``BatchedSpeculativeRunner._build_context``
+    in batch_runner.py) splits each entry into 8 little-endian bytes for
+    CODE_START.
+    """
+    return (opcode & 0xFF) | ((imm & 0xFFFFFF) << 8)
+
+
+# Canonical ADD-cascade program used by the multistep probe. The byte-level
+# semantics are:
+#   step 1: IMM 10        -> AX = 10
+#   step 2: PSH           -> push AX, SP -= 8, STACK0 = 10
+#   step 3: IMM 32        -> AX = 32 (PSH STACK0 byte-relay should keep STACK0=10)
+#   step 4: ADD           -> pop STACK0 into operand, AX = 10 + 32 = 42
+#   step 5: EXIT          -> halt
+# This is the program the cascade-bug debugging agents have been chasing:
+# the L6/L10/STK0 byte-relay ops must produce STACK0 bytes at steps 2 AND 3
+# (PSH writes them, then the carry-forward op on the IMM step preserves
+# them so the ADD step can read them).
+_ADD_CASCADE_PROGRAM = [
+    _pack_instr(1, 10),   # IMM 10
+    _pack_instr(13, 0),   # PSH
+    _pack_instr(1, 32),   # IMM 32
+    _pack_instr(25, 0),   # ADD
+    _pack_instr(38, 0),   # EXIT
+]
+
+
+def _build_multistep_probe(
+    layout,
+    program: List[int],
+    n_steps: int,
+) -> Tuple[torch.Tensor, List[Dict[str, int]], List[str]]:
+    """Build a multi-step token sequence: bytecode + n_steps of DraftVM-emitted
+    step tokens. Returns ``(token_tensor, step_markers, step_summaries)``.
+
+    ``token_tensor`` has shape ``[1, T]`` with T = header_len + n_steps * 35.
+
+    ``step_markers[k]`` is a dict mapping each REG_*/STACK0/MEM marker name
+    (as well as the byte slots like ``"AX_byte0"``) to its absolute token
+    position in the full sequence for step ``k`` (0-indexed). Callers use
+    these positions to look up per-marker residuals after running the
+    model.
+
+    ``step_summaries[k]`` is a short human-readable string of the step's
+    register state (e.g. ``"PC=8 AX=10 SP=ffffffff"``).
+
+    Note: this builder leverages ``DraftVM`` from ``speculative.py`` as
+    a ground-truth oracle for the per-step token bytes. We do NOT feed
+    those tokens back through DraftVM for verification -- we only use
+    DraftVM to construct a faithful token sequence the production model
+    would generate. The verifier is what evaluates the model's residuals.
+    """
+    from ..vm_step import Token
+    from ..speculative import DraftVM
+
+    tokens: List[int] = []
+    # Code section (8 bytes per instruction, little-endian) -- matches
+    # ``BatchedSpeculativeRunner._build_context``.
+    tokens.append(Token.CODE_START)
+    for instr in program:
+        for i in range(8):
+            tokens.append((instr >> (i * 8)) & 0xFF)
+    tokens.append(Token.CODE_END)
+    # Empty data section.
+    tokens.append(Token.DATA_START)
+    tokens.append(Token.DATA_END)
+
+    vm = DraftVM(program)
+    step_markers: List[Dict[str, int]] = []
+    step_summaries: List[str] = []
+    for k in range(n_steps):
+        if not vm.step():
+            # VM halted before n_steps; pad with HALT tokens so callers
+            # see the cap was reached, but mark these slots as such.
+            step_markers.append({})
+            step_summaries.append("(halted)")
+            tokens.extend([Token.HALT] * 35)
+            continue
+        step_tokens = vm.draft_tokens()
+        base = len(tokens)
+        marker_map: Dict[str, int] = {
+            name: base + offset
+            for name, offset in _STEP_TOKEN_OFFSETS.items()
+        }
+        step_markers.append(marker_map)
+        step_summaries.append(
+            f"PC={vm.pc:x} AX={vm.ax:x} SP={vm.sp:x} "
+            f"BP={vm.bp:x} STK0={vm._mem_read(vm.sp):x}"
+        )
+        tokens.extend(step_tokens)
+
+    token_tensor = torch.tensor([tokens], dtype=torch.long)
+    return token_tensor, step_markers, step_summaries
+
+
+def verify_produces_consumes_multistep(
+    model=None,
+    layout=None,
+    program: Optional[List[int]] = None,
+    n_steps: int = 4,
+    *,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    S: float = 100.0,
+    n_heads: int = 8,
+    epsilon: float = 1e-2,
+) -> MultistepVerificationReport:
+    """Multi-step dynamic check on ``produces`` declarations.
+
+    For each op with a non-empty ``produces`` annotation, runs the compiled
+    model forward over a context containing ``n_steps`` worth of real VM
+    step tokens (built by ``_build_multistep_probe``) and inspects the
+    residual stream post-op-layer at the step-marker position implied by
+    the produces register name. A drift entry is recorded when the residual
+    abs-max at that position is below ``epsilon`` -- the op's bake_fn
+    declared a non-zero write but no value arrived in the residual at the
+    declared register on that step.
+
+    Cascade bugs (op fires on step 1 but byte-relay state fails to
+    propagate to step 2/3) show up here as drift entries on the later
+    steps even though step 1 is clean -- precisely the inversion the
+    1-instruction Mode B probe misses.
+
+    Args:
+        model, layout: optional pre-built model + layout to reuse. When
+            either is None, both are built via ``compile_full_vm`` using
+            the keyword config args below. Reusing a model is the common
+            case for tests that want to run multiple probes (and saves
+            ~70s of bake time per call).
+        program: list of packed bytecode instructions (``opcode | imm<<8``).
+            Defaults to the canonical ADD-cascade program (IMM 10; PSH;
+            IMM 32; ADD; EXIT) which is the smoking-gun smoke for the
+            L6/L10/STK0 byte-relay cascade.
+        n_steps: number of VM steps to drive forward. The model must have
+            ``max_seq_len`` >= ``len(bytecode_header) + n_steps * 35``.
+        epsilon: noise threshold. Residuals with abs-max below this are
+            considered "not written" for the purposes of liveness probing.
+            Set to 1e-2 by default -- below typical post-FFN/attn residual
+            noise (~1e-3) but above legitimate bake-time eps.
+
+    Returns:
+        ``MultistepVerificationReport`` -- inspect ``.drift_entries()`` or
+        ``.format()``.
+    """
+    if program is None:
+        program = list(_ADD_CASCADE_PROGRAM)
+
+    report = MultistepVerificationReport(
+        n_steps=n_steps,
+        program_summary=" ".join(
+            f"0x{instr:016x}" for instr in program
+        ),
+    )
+
+    if model is None or layout is None:
+        from .full_vm_compiler import compile_full_vm
+        try:
+            model, layout = compile_full_vm(
+                S=S,
+                alu_mode=alu_mode,
+                enable_conversational_io=enable_conversational_io,
+                n_heads=n_heads,
+            )
+        except Exception as exc:
+            report.results.append(MultistepVerificationResult(
+                op_name="<compile_full_vm>",
+                notes=[f"compile failed: {exc!r}"],
+            ))
+            return report
+
+    candidates = _collect_unique_ops_with(layout, lambda op: bool(op.produces))
+    if not candidates:
+        return report
+
+    # Build the multistep probe + run the model.
+    try:
+        token_tensor, step_markers, step_summaries = _build_multistep_probe(
+            layout, program, n_steps,
+        )
+    except Exception as exc:
+        report.results.append(MultistepVerificationResult(
+            op_name="<build_multistep_probe>",
+            notes=[f"could not construct multistep probe: {exc!r}"],
+        ))
+        return report
+
+    # Honor model.max_seq_len if available so we fail loudly rather than
+    # silently truncating attention.
+    max_len = getattr(model, "max_seq_len", None)
+    if max_len is not None and token_tensor.shape[1] > max_len:
+        report.results.append(MultistepVerificationResult(
+            op_name="<context_too_long>",
+            notes=[
+                f"context len {token_tensor.shape[1]} exceeds model "
+                f"max_seq_len {max_len}; reduce n_steps or rebuild model"
+            ],
+        ))
+        return report
+
+    try:
+        with torch.no_grad():
+            x = model.embed(token_tensor)
+            per_layer_residuals = [x.detach().clone()]
+            for block in model.blocks:
+                x = block(x)
+                per_layer_residuals.append(x.detach().clone())
+    except Exception as exc:
+        report.results.append(MultistepVerificationResult(
+            op_name="<forward>",
+            notes=[f"forward pass failed: {exc!r}"],
+        ))
+        return report
+
+    for op in candidates:
+        result = MultistepVerificationResult(op_name=op.name)
+        layer_idx = _resolve_op_layer(layout, op)
+        result.layer_idx = layer_idx
+
+        if layer_idx is None or layer_idx + 1 >= len(per_layer_residuals):
+            # Fall back to the final residual (after all blocks). This
+            # gives model-op annotations a chance to be checked too.
+            inspect_layer = len(per_layer_residuals) - 1
+            result.notes.append(
+                f"layer_idx unresolved (kind={op.kind}); "
+                f"inspecting final post-block residual instead"
+            )
+        else:
+            inspect_layer = layer_idx + 1
+
+        post_residual = per_layer_residuals[inspect_layer]  # [B, T, D]
+
+        # For each step + each (dim, register) produces declaration,
+        # inspect the residual at the resolved position.
+        for step_idx, marker_map in enumerate(step_markers):
+            if not marker_map:
+                # Step was unreachable (VM halted earlier). Don't flag.
+                continue
+            step_k = step_idx + 1  # 1-indexed for reporting
+            for dim_name, register in op.produces.items():
+                if dim_name not in layout.dim_positions:
+                    result.notes.append(
+                        f"step {step_k}: produces {dim_name!r}: "
+                        f"dim not in layout"
+                    )
+                    continue
+                offset = _resolve_register_offset(register)
+                if offset is None:
+                    result.notes.append(
+                        f"step {step_k}: produces {dim_name!r}={register!r}: "
+                        f"register name not resolvable to a step offset"
+                    )
+                    continue
+                # marker_map["REG_PC"] is the step's base position (REG_PC
+                # is at relative offset 0); add the in-step offset to land
+                # on the register-specific slot.
+                pos = marker_map["REG_PC"] + offset
+                d_start = layout.dim_positions[dim_name]
+                d_size = layout.dim_sizes.get(dim_name, 1)
+                slice_vals = post_residual[0, pos, d_start:d_start + d_size]
+                obs_abs = float(slice_vals.abs().max().item())
+                if obs_abs < epsilon:
+                    result.drift.append(MultistepDriftEntry(
+                        op_name=op.name,
+                        step=step_k,
+                        dim=dim_name,
+                        register=register,
+                        position=pos,
+                        observed=obs_abs,
+                    ))
+
+        report.results.append(result)
+
+    return report
 
 
 # ---------------------------------------------------------------------------
