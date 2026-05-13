@@ -164,6 +164,15 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
         bake_fn=bake,
         layer_idx=7,
         migrated=True,
+        # Staleness invariants: head 7 fires when IO_IN_OUTPUT_MODE just
+        # activated, attends to the previous step's STACK0 marker, and
+        # writes EMBED_LO/HI (format string pointer byte 0) into
+        # FORMAT_PTR_LO/HI at the firing Q position. Skipped when
+        # enable_conversational_io=False (no-op bake).
+        produces={
+            "FORMAT_PTR_LO": "STACK0",
+            "FORMAT_PTR_HI": "STACK0",
+        },
     )
 
 

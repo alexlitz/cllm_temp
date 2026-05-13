@@ -127,6 +127,15 @@ def make_layer9_lev_addr_relay_op() -> Operation:
         layer_idx=9,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: head 0 fires only at the SP marker (Q gated on
+        # MARK_SP + OP_LEV) and attends to the previous step's BP byte 0
+        # (K[L1H1[BP_I] + BYTE_INDEX_0]) to write CLEAN_EMBED nibbles into
+        # ADDR_B0_LO/HI at the current SP marker. This is the in-step source
+        # the L16 LEV FFN reads when computing new SP = old_BP + 16.
+        produces={
+            "ADDR_B0_LO": "REG_SP",
+            "ADDR_B0_HI": "REG_SP",
+        },
     )
 
 
@@ -177,6 +186,15 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         layer_idx=9,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: head 1 fires at the PC marker (Q gated on
+        # MARK_PC + OP_LEV) and attends back to the previous step's BP byte 0
+        # (K[L1H1[BP_I] + BYTE_INDEX_0]) to write CLEAN_EMBED nibbles into
+        # ADDR_B0_LO/HI at the current PC marker. Produces the in-step LEV
+        # return address that L13 attn relays into the next PC.
+        produces={
+            "ADDR_B0_LO": "REG_PC",
+            "ADDR_B0_HI": "REG_PC",
+        },
     )
 
 
@@ -220,6 +238,16 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
         bake_fn=bake,
         layer_idx=9,
         migrated=True,
+        # Staleness invariants: when enable_conversational_io=True, head 0
+        # queries memory at FORMAT_PTR (the byte 0 of the format string
+        # pointer) and writes the matched code byte's EMBED nibbles into
+        # OUTPUT_BYTE_LO/HI at the AX marker (Q gated on IO_IN_OUTPUT_MODE
+        # which is set at the AX marker). Bake is a no-op when the flag is
+        # off so the op stays registered for the staleness scan.
+        produces={
+            "OUTPUT_BYTE_LO": "AX_byte0",
+            "OUTPUT_BYTE_HI": "AX_byte0",
+        },
     )
 
 
@@ -385,6 +413,17 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         layer_idx=9,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: when enable=True, head 2 attends from
+        # MEM_VAL_B0 query positions back to PSH-output STACK0 byte 0
+        # K-positions matched on ADDR_KEY, then copies the PSH'd
+        # CLEAN_EMBED nibbles into OUTPUT_LO/HI at MEM val byte 0 (the
+        # MEM_VAL_byte0 register). The op is registered unconditionally
+        # so the staleness analyzer can pick up the declaration once
+        # ``enable=True``; when False the bake is a no-op.
+        produces={
+            "OUTPUT_LO": "MEM_VAL_byte0",
+            "OUTPUT_HI": "MEM_VAL_byte0",
+        },
     )
 
 

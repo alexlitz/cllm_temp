@@ -69,6 +69,17 @@ def make_layer6_routing_ffn_op() -> Operation:
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        # Staleness invariants: this FFN routes the per-opcode result to
+        # OUTPUT at the AX marker for IMM (FETCH->OUTPUT) and for EXIT /
+        # NOP / JSR / JMP (AX_CARRY->OUTPUT). All five OP_* gating units
+        # are conditioned on MARK_AX with byte-position blockers, so the
+        # canonical fresh OUTPUT_byte0 producer for these single-byte AX
+        # opcodes lives here. The L8 multibyte_routing op produces the
+        # multi-byte-IMM OUTPUT extension at AX byte 1+.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI": "AX_byte0",
+        },
     )
 
 
@@ -183,6 +194,18 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         migrated=True,
+        # Staleness invariants: head 6 + head 7 fire at the STACK0 marker
+        # (Q[MARK_STACK0]=L, K[MARK_AX]=L) and copy AX_CARRY_LO/HI into
+        # ALU_LO/HI -- this is the PSH "STACK0 <- AX" semantic relay that
+        # L7 head 0 / L8 mem heads read off at later steps. The fresh
+        # in-step producer of ALU_LO/HI at the STACK0_byte0 position lives
+        # here. (Empty reads/writes on the Operation reflect the
+        # kind="model" anchor convention; the dep-graph wiring is provided
+        # by the matching `layer6_relay_heads` attn anchor.)
+        produces={
+            "ALU_LO": "STACK0",
+            "ALU_HI": "STACK0",
+        },
     )
 
 
