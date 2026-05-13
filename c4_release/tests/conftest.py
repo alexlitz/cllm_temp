@@ -492,6 +492,7 @@ def handler_status():
     ]
 
     status = {}
+    phase6_status = runner.get_phase6_syscall_status()
     for name, op in all_ops:
         has_sys = op in runner._syscall_handlers
         status[name] = {
@@ -499,6 +500,12 @@ def handler_status():
             "has_handler": has_sys,
             "handler_type": "syscall" if has_sys else "neural",
         }
+        if name in phase6_status:
+            status[name].update({
+                "phase6_status": phase6_status[name]["status"],
+                "neural_complete": phase6_status[name]["neural_complete"],
+                "diagnostic": phase6_status[name]["diagnostic"],
+            })
 
     return status
 

@@ -995,6 +995,13 @@ class TestSmokeHandlerStatus:
                 f"{op} should be a syscall handler, got {handler_status[op]['handler_type']}"
             )
 
+    def test_phase6_prtf_read_status_is_explicit(self, handler_status):
+        """Document the current PRTF/READ Phase 6 boundary status."""
+        for op in ["PRTF", "READ"]:
+            assert handler_status[op]["phase6_status"] == "external-shim"
+            assert handler_status[op]["neural_complete"] is False
+            assert handler_status[op]["diagnostic"]
+
 
 # =============================================================================
 # Quick Full Pipeline (slow / unchanged)

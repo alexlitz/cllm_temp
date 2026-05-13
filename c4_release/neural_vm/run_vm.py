@@ -45,6 +45,39 @@ _TOOL_CALL_OPS = {
     Opcode.CLOS,
 }
 
+_PHASE6_SYSCALL_STATUS = {
+    Opcode.PRTF: {
+        "opcode": Opcode.PRTF,
+        "name": "PRTF",
+        "handler": "_syscall_prtf",
+        "pure_neural_shim": "_neural_prtf_emit",
+        "status": "external-shim",
+        "boundary": "host-output",
+        "implemented": True,
+        "neural_complete": False,
+        "diagnostic": (
+            "Formats via runner shadow-memory string walker; pure_neural "
+            "uses skipped-op/stall recovery until neural format walking and "
+            "byte emission land."
+        ),
+    },
+    Opcode.READ: {
+        "opcode": Opcode.READ,
+        "name": "READ",
+        "handler": "_syscall_read",
+        "pure_neural_shim": "_neural_read_emit",
+        "status": "external-shim",
+        "boundary": "host-input",
+        "implemented": True,
+        "neural_complete": False,
+        "diagnostic": (
+            "Consumes host stdin/fd bytes and writes runner shadow memory; "
+            "pure_neural uses skipped-op/stall recovery until neural "
+            "USER_INPUT gather plus memory writeback lands."
+        ),
+    },
+}
+
 # Runner-side fallback ops (blocked in pure_attention_memory mode).
 # These mutate/consult shadow memory or apply runner semantic corrections.
 # SI/SC removed: _track_memory_write handles shadow updates from MEM tokens.
@@ -484,6 +517,7 @@ class AutoregressiveVMRunner:
         # the runner's main loop, bypassing the AX-readoff PUTCHAR path.
         self._neural_io_collecting_byte = False
         self._pure_attention_report = {}
+        self._phase6_syscall_events = []
 
         # KV cache pruning (KV_CACHE_PRUNING_SPEC.md §2.1 + §2.2).
         # Defaults OFF: byte-identity vs cache-off requires no pruning.
@@ -1018,6 +1052,7 @@ class AutoregressiveVMRunner:
             "external_tool_ops": {},
             "halted": False,
         }
+        self._phase6_syscall_events = []
 
         # Load data section into shadow memory at 0x10000
         # C4 compiler uses data_base = 0x10000 (src/compiler.py:339)
@@ -1730,6 +1765,31 @@ class AutoregressiveVMRunner:
         """Return diagnostics for pure-attention-memory mode."""
         return dict(self._pure_attention_report)
 
+    def get_phase6_syscall_status(self):
+        """Return static Phase 6 status for PRTF/READ syscall boundaries."""
+        return {
+            spec["name"]: dict(spec)
+            for spec in _PHASE6_SYSCALL_STATUS.values()
+        }
+
+    def get_phase6_syscall_diagnostics(self):
+        """Return Phase 6 status plus per-run PRTF/READ shim events."""
+        status = self.get_phase6_syscall_status()
+        unresolved = [
+            {
+                "name": spec["name"],
+                "status": spec["status"],
+                "diagnostic": spec["diagnostic"],
+            }
+            for spec in status.values()
+            if not spec["neural_complete"]
+        ]
+        return {
+            "status": status,
+            "events": list(self._phase6_syscall_events),
+            "unresolved": unresolved,
+        }
+
     def _should_block_vm_memory_handler(self, op):
         return self.pure_attention_memory and op in _RUNNER_VM_MEMORY_OPS
 
@@ -1742,6 +1802,18 @@ class AutoregressiveVMRunner:
         name = _OPCODE_NAME.get(op, str(op))
         slot = self._pure_attention_report[bucket]
         slot[name] = slot.get(name, 0) + 1
+
+    def _record_phase6_syscall_event(self, op, path, **details):
+        spec = _PHASE6_SYSCALL_STATUS.get(op)
+        if spec is None:
+            return
+        event = {
+            "name": spec["name"],
+            "opcode": int(op),
+            "path": path,
+        }
+        event.update(details)
+        self._phase6_syscall_events.append(event)
 
     def _compute_alu_legacy(self, op, stack_val, ax_val):
         """Legacy Python ALU implementation.
@@ -2365,12 +2437,20 @@ class AutoregressiveVMRunner:
             if argc <= 1:
                 output.append(fmt_str)
                 self._override_ax_in_last_step(context, len(fmt_str) & 0xFFFFFFFF)
+                self._record_phase6_syscall_event(
+                    op, "pure_neural_skipped_op", exec_idx=skipped_idx,
+                    argc=argc, bytes=len(fmt_str),
+                )
                 return
             # args[1..] correspond to sp[1..], i.e. earlier pushes.
             varargs = args[1:argc]
             formatted = self._format_printf(fmt_str, varargs)
             output.append(formatted)
             self._override_ax_in_last_step(context, len(formatted) & 0xFFFFFFFF)
+            self._record_phase6_syscall_event(
+                op, "pure_neural_skipped_op", exec_idx=skipped_idx,
+                argc=argc, bytes=len(formatted),
+            )
             return
         if op == Opcode.READ:
             argc = self._peek_argc_from_adj(skipped_idx, bytecode)
@@ -2416,6 +2496,10 @@ class AutoregressiveVMRunner:
                     value = self._mem_load_word(addr)
                     self._inject_mem_section(addr, value)
             self._override_ax_in_last_step(context, len(data) & 0xFFFFFFFF)
+            self._record_phase6_syscall_event(
+                op, "pure_neural_skipped_op", exec_idx=skipped_idx,
+                fd=fd, buf_ptr=buf_ptr, count=count, bytes=len(data),
+            )
             return
         if op == Opcode.OPEN:
             argc = self._peek_argc_from_adj(skipped_idx, bytecode)
@@ -2601,6 +2685,10 @@ class AutoregressiveVMRunner:
         if argc <= 1:
             output.append(fmt_str)
             self._override_ax_in_last_step(context, len(fmt_str) & 0xFFFFFFFF)
+            self._record_phase6_syscall_event(
+                Opcode.PRTF, "pure_neural_direct", exec_idx=exec_idx,
+                argc=argc, bytes=len(fmt_str),
+            )
             return len(fmt_str)
 
         # argc >= 2: read varargs from sp[1..argc-1] (deeper than fmt_ptr).
@@ -2613,6 +2701,10 @@ class AutoregressiveVMRunner:
         formatted = self._format_printf(fmt_str, args)
         output.append(formatted)
         self._override_ax_in_last_step(context, len(formatted) & 0xFFFFFFFF)
+        self._record_phase6_syscall_event(
+            Opcode.PRTF, "pure_neural_direct", exec_idx=exec_idx,
+            argc=argc, bytes=len(formatted),
+        )
         return len(formatted)
 
     def _neural_open_emit(self, context):
@@ -2725,6 +2817,10 @@ class AutoregressiveVMRunner:
                 self._inject_mem_section(addr, value)
 
         self._override_ax_in_last_step(context, len(data) & 0xFFFFFFFF)
+        self._record_phase6_syscall_event(
+            Opcode.READ, "pure_neural_direct", fd=fd, buf_ptr=buf_ptr,
+            count=count, bytes=len(data),
+        )
 
     def _override_ax_in_last_step(self, context, value):
         """Override AX register bytes in the last completed step.
@@ -3058,6 +3154,11 @@ class AutoregressiveVMRunner:
                 result = 0xFFFFFFFF  # -1
 
         self._override_ax_in_last_step(context, result & 0xFFFFFFFF)
+        self._record_phase6_syscall_event(
+            Opcode.READ, "handler", fd=fd, buf_ptr=buf_ptr, count=count,
+            bytes=result if result != 0xFFFFFFFF else 0,
+            success=(result != 0xFFFFFFFF),
+        )
 
     def _syscall_prtf(self, context, output):
         """PRTF (printf) — formatted print, optionally via tool_handler.
@@ -3112,6 +3213,10 @@ class AutoregressiveVMRunner:
             result = len(formatted)
 
         self._override_ax_in_last_step(context, result & 0xFFFFFFFF)
+        self._record_phase6_syscall_event(
+            Opcode.PRTF, "handler", argc=argc, bytes=result,
+            success=True,
+        )
 
     def _exec_pc(self):
         """Compute PC of the instruction that was just executed.
