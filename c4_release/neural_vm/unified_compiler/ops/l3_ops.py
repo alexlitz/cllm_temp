@@ -64,6 +64,17 @@ def make_layer3_ffn_op() -> Operation:
             "OUTPUT_LO": "PC_marker",
             "OUTPUT_HI": "PC_marker",
         },
+        # Tier A preconditions: the PC update fires every step (the PC
+        # increment is opcode-agnostic — every instruction advances PC
+        # unless the opcode rewrites it). It requires MARK_PC active at
+        # the PC marker so the FFN writes land there.
+        requires={
+            "MARK_PC": "set_at_PC",
+        },
+        # ``opcodes``: empty -- fires every step regardless of opcode.
+        # The opcode-coverage detector treats L3 FFN as a legitimate
+        # always-on emission op (L0-L3 emission band).
+        opcodes=set(),
     )
 
 

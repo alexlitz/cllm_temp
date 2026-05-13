@@ -45,6 +45,34 @@ def make_layer1_ffn_op() -> Operation:
         # ``_set_layer1_ffn`` writes 5 units (one per output: STACK0_BYTE0,
         # BYTE_INDEX_0..3). See setup_helpers.py:_set_layer1_ffn.
         ffn_units_used=5,
+        # Tier A annotations.
+        # ``produces``: STACK0_BYTE0 + BYTE_INDEX_* are emitted at each
+        # STACK0 byte 0 / byte-index position respectively. The
+        # convention "STACK0_byte0" pins the byte-0 register in the step
+        # token block; matching downstream consumers (e.g. L6/L7 STACK0
+        # byte-relay heads) read at this anchor.
+        produces={
+            "STACK0_BYTE0": "STACK0_byte0",
+            "BYTE_INDEX_0": "STACK0_byte0",
+            "BYTE_INDEX_1": "STACK0_byte1",
+            "BYTE_INDEX_2": "STACK0_byte2",
+            "BYTE_INDEX_3": "STACK0_byte3",
+        },
+        # ``opcodes``: L1 emits STACK0_BYTE0 every step from token-position
+        # features (threshold attention over L1H4); it is NOT opcode-gated,
+        # so the set is empty. The opcode-coverage detector treats L0-L3
+        # FFN ops with empty opcodes as legitimate emission ops.
+        opcodes=set(),
+        # ``reset_after_step``: STACK0_BYTE0 is re-emitted by this op on
+        # every step from raw token features; it should NOT carry stale
+        # values across the step boundary. The BYTE_INDEX_* flags are
+        # likewise per-step. If a future change makes any of these
+        # cross-step-persistent, drop the offending name from this set.
+        reset_after_step={
+            "STACK0_BYTE0",
+            "BYTE_INDEX_0", "BYTE_INDEX_1",
+            "BYTE_INDEX_2", "BYTE_INDEX_3",
+        },
     )
 
 

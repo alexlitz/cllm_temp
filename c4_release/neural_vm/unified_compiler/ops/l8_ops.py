@@ -73,6 +73,23 @@ def make_layer8_alu_op() -> Operation:
             "CARRY": "AX_byte0",
             "CMP_GROUP": "AX_byte0",
         },
+        # Tier A preconditions: the L8 lookup ALU consumes operand A
+        # (ALU_LO) and the prev-step AX carry (AX_CARRY_LO) at the AX
+        # marker. Both must be set at AX before this op runs (produced
+        # by L7 head 0 and L8 head 6 respectively).
+        requires={
+            "ALU_LO": "set_at_AX",
+            "AX_CARRY_LO": "set_at_AX",
+            "MARK_AX": "set_at_AX",
+        },
+        # Tier A opcode gating: L8 FFN's ALU cluster fires for the binary
+        # ALU + comparison opcodes. ADD/SUB/LEA share the carry path;
+        # EQ..GE share the CMP_GROUP path. (AND/OR/XOR live on L10; MUL
+        # on L11+; DIV/MOD on L10+; SHL/SHR on L13.)
+        opcodes={
+            "OP_ADD", "OP_SUB", "OP_LEA",
+            "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+        },
     )
 
 

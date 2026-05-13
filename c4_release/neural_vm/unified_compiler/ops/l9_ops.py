@@ -71,6 +71,22 @@ def make_layer9_alu_op() -> Operation:
             "OUTPUT_HI": "AX_byte0",
             "CMP": "AX_byte0",
         },
+        # Tier A preconditions: operand A hi nibble (ALU_HI) and the
+        # prev-step AX carry hi (AX_CARRY_HI) at the AX marker. CARRY
+        # itself is computed by L8 at the same AX byte 0 position.
+        requires={
+            "ALU_HI": "set_at_AX",
+            "AX_CARRY_HI": "set_at_AX",
+            "MARK_AX": "set_at_AX",
+        },
+        # Tier A opcode gating: L9 FFN's ALU cluster handles the hi
+        # nibble + bitwise byte-0 ops. SHL/SHR live on L13; MUL on L11+;
+        # DIV/MOD on L10+. Compare opcodes share the CMP cluster path.
+        opcodes={
+            "OP_ADD", "OP_SUB",
+            "OP_AND", "OP_OR", "OP_XOR",
+            "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+        },
         # ``_set_layer9_alu`` writes the ADD/LEA/SUB/AND/OR/XOR/CMP/etc.
         # cross-product cluster (~3398 units), and the bake chains into
         # ``_set_layer9_marker_suppress`` for 7 more NEXT_* suppression

@@ -51,6 +51,23 @@ def make_layer7_operand_gather_op() -> Operation:
             "ALU_LO": "AX_byte0",
             "ALU_HI": "AX_byte0",
         },
+        # Tier A preconditions: head 0 attends back to the previous step's
+        # STACK0 byte 0 (operand B for binary ALU) at the current AX
+        # marker. STACK0_BYTE0 must be set within the prior step's
+        # 35-token window (the PSH step's L1 emission), and MARK_AX must
+        # be active at the AX marker position so the gather lands on AX.
+        requires={
+            "STACK0_BYTE0": "within_one_step",
+            "MARK_AX": "set_at_AX",
+        },
+        # Tier A opcode gating: head 0 fires for binary ALU operations
+        # (operand B gather from prev STACK0); head 1 fires for LEA/ADJ/
+        # ENT (BP/SP -> OUTPUT relay). The combined op declares the union.
+        opcodes={
+            "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+            "OP_AND", "OP_OR", "OP_XOR", "OP_SHL", "OP_SHR",
+            "OP_LEA", "OP_ADJ", "OP_ENT",
+        },
     )
 
 
