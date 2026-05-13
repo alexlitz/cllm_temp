@@ -36,10 +36,118 @@ import logging
 import os
 import pathlib
 import tempfile
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
 from .layer_compiler import LayerCompiler, ModelLayout, build_model_from_layout
 
 _logger = logging.getLogger(__name__)
+
+
+_REQUIRE_DECLARATIVE_BAKE_ENV = "C4_REQUIRE_DECLARATIVE_BAKE"
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on", "strict", "error"})
+
+
+class DeclarativeBakeRequirementError(RuntimeError):
+    """Raised by the opt-in authoritative declarative-bake gate."""
+
+
+@dataclass(frozen=True)
+class DeclarativeBakeAuthorityReport:
+    """Diagnostic report for the authoritative declarative-bake gate."""
+
+    legacy_model_ops: Sequence[str]
+    non_migrated_layer_ops: Sequence[str]
+    non_migrated_block_ops: Sequence[str]
+    unowned_wrapper_model_ops: Sequence[str]
+
+    @property
+    def ok(self) -> bool:
+        return not (
+            self.legacy_model_ops
+            or self.non_migrated_layer_ops
+            or self.non_migrated_block_ops
+            or self.unowned_wrapper_model_ops
+        )
+
+    def format(self) -> str:
+        lines = [
+            "Authoritative declarative bake is not yet available.",
+            "The default compile path is unchanged; this report only appears "
+            f"when {_REQUIRE_DECLARATIVE_BAKE_ENV}=1 or "
+            "require_declarative_bake=True.",
+        ]
+        sections = [
+            ("legacy model ops", self.legacy_model_ops),
+            ("non-migrated layer ops", self.non_migrated_layer_ops),
+            ("non-migrated block ops", self.non_migrated_block_ops),
+            ("unowned wrapper/model bakes", self.unowned_wrapper_model_ops),
+        ]
+        for label, names in sections:
+            if not names:
+                continue
+            sample = ", ".join(names[:12])
+            if len(names) > 12:
+                sample += f", ... (+{len(names) - 12} more)"
+            lines.append(f"- {label}: {len(names)} [{sample}]")
+        return "\n".join(lines)
+
+
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _is_unowned_wrapper_model_op(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        "wrapper" in lowered
+        or "wrap" in lowered
+        or lowered == "expand_wrapper_blocks"
+    )
+
+
+def inspect_declarative_bake_authority(
+    layout: ModelLayout,
+) -> DeclarativeBakeAuthorityReport:
+    """Return remaining blockers for an authoritative declarative bake.
+
+    This is intentionally conservative and diagnostic-only by default. The
+    gate treats ``legacy_bake`` as a hard blocker, any non-migrated per-layer
+    or block op as still relying on skipped/legacy ownership, and wrapper
+    model ops as still structurally unowned by declarative per-layer bakes.
+    """
+    legacy_model_ops = sorted(
+        op.name for op in layout.model_ops if op.name == "legacy_bake"
+    )
+    non_migrated_layer_ops = sorted({
+        op.name
+        for ops_at_layer in layout.ops_per_layer
+        for op in ops_at_layer
+        if not op.migrated
+    })
+    non_migrated_block_ops = sorted(
+        op.name for op in layout.block_ops if not op.migrated
+    )
+    unowned_wrapper_model_ops = sorted(
+        op.name
+        for op in layout.model_ops
+        if _is_unowned_wrapper_model_op(op.name)
+    )
+    return DeclarativeBakeAuthorityReport(
+        legacy_model_ops=legacy_model_ops,
+        non_migrated_layer_ops=non_migrated_layer_ops,
+        non_migrated_block_ops=non_migrated_block_ops,
+        unowned_wrapper_model_ops=unowned_wrapper_model_ops,
+    )
+
+
+def enforce_declarative_bake_authority(layout: ModelLayout) -> DeclarativeBakeAuthorityReport:
+    """Raise if the layout still needs non-authoritative bake paths."""
+    report = inspect_declarative_bake_authority(layout)
+    if not report.ok:
+        raise DeclarativeBakeRequirementError(report.format())
+    return report
 
 # Re-exported analyzer entry points so callers don't need to reach into
 # `layer_compiler` directly. The compiler also runs both scans automatically
@@ -258,6 +366,7 @@ def compile_full_vm(
     pin_io_only: bool = True,
     disk_cache: bool = True,
     use_dynamic_ffn: bool = True,
+    require_declarative_bake: Optional[bool] = None,
 ):
     """Compile and bake a full Neural VM model via the compiler.
 
@@ -294,12 +403,20 @@ def compile_full_vm(
             and are trimmed by ``_right_size_ffns`` post-bake. Set to False
             to force the legacy allocate-4096-everywhere path (used for
             byte-identity comparison).
+        require_declarative_bake: opt-in enforcement gate for the migration
+            endpoint. ``None`` (default) follows ``C4_REQUIRE_DECLARATIVE_BAKE``.
+            When true, compile fails before model bake if the layout still
+            contains ``legacy_bake``, non-migrated layer/block ops, or wrapper
+            model bakes that are not owned by declarative per-layer ops.
 
     Returns:
         (model, layout) where:
         - model is an AutoregressiveVM with all weights baked
         - layout is the ModelLayout (d_model, n_layers, dim_positions)
     """
+    if require_declarative_bake is None:
+        require_declarative_bake = _env_flag_enabled(_REQUIRE_DECLARATIVE_BAKE_ENV)
+
     kwargs_snapshot = {
         "S": S,
         "enable_conversational_io": enable_conversational_io,
@@ -312,7 +429,7 @@ def compile_full_vm(
         "pin_io_only": pin_io_only,
     }
     cache_path = None
-    if disk_cache:
+    if disk_cache and not require_declarative_bake:
         cache_path = _cache_dir() / f"{_cache_key(kwargs_snapshot)}.pt"
         cached = _try_load_cached(cache_path, kwargs_snapshot)
         if cached is not None:
@@ -407,6 +524,9 @@ def compile_full_vm(
         pad = n_heads - (layout.d_model % n_heads)
         compiler.declare_dim("_pad", pad)
         layout = compiler.compile()
+
+    if require_declarative_bake:
+        enforce_declarative_bake_authority(layout)
 
     # Build the model with d_model/n_layers from the compiler. We override
     # the default size from build_model_from_layout to set ffn_hidden,

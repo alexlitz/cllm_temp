@@ -41,6 +41,11 @@ def make_layer13_mem_addr_gather_op() -> Operation:
         layer_idx=13,
         migrated=True,
         claims=_claims,
+        smoke_tests={
+            "TestSmokeMemory::test_sc_lc_roundtrip",
+            "TestSmokeMemory::test_si_li_roundtrip",
+        },
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -95,6 +100,13 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
             "ALU_HI": "AX_byte0",
             "AX_CARRY_LO": "AX_byte0",
         } if alu_mode == "lookup" else {},
+        smoke_tests={
+            "TestSmoke32Bit::test_shl_8bit",
+            "TestSmoke32Bit::test_shr_8bit",
+            "TestSmokeShift::test_shl",
+            "TestSmokeShift::test_shr",
+        },
+        spec_section="BLOG_SPEC.md#shifts",
     )
 
 

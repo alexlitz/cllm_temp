@@ -36,6 +36,11 @@ def make_layer11_mul_partial_op() -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
+        smoke_tests={
+            "TestSmoke32Bit::test_mul_overflow",
+            "TestSmokeBasic::test_mul_basic",
+        },
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 

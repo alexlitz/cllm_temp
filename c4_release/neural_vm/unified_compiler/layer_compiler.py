@@ -73,6 +73,13 @@ ALLOWED_CLAIM_SCOPES = frozenset({
 })
 
 
+ALLOWED_DECLARATIVE_AUTHORITY = frozenset({
+    "declarative",
+    "spec_generated",
+    "legacy_wrapper",
+})
+
+
 @dataclass
 class Operation:
     """A single declarative operation that the compiler can place at any layer.
@@ -196,6 +203,30 @@ class Operation:
     # and the canonical AX_CARRY example.
     produces: Dict[str, str] = field(default_factory=dict)
     consumes_fresh: Dict[str, str] = field(default_factory=dict)
+    # Tier B declarative-verifier annotations. These are opt-in and default
+    # to no-op values so existing operation declarations remain valid:
+    #
+    #   alibi_slopes: head_idx -> expected attn.alibi_slopes value for ops
+    #       that explicitly write a layer's ALiBi slope buffer.
+    #   postcondition: residual cell -> invariant name, e.g.
+    #       {"OUTPUT_LO": "monotonic_non_decreasing"}.
+    #   step_idx: allowed VM steps for an op, using None/"every",
+    #       "after_first", or a set of 0-indexed step numbers.
+    alibi_slopes: Dict[int, float] = field(default_factory=dict)
+    postcondition: Dict[str, str] = field(default_factory=dict)
+    step_idx: Optional[object] = None
+    # Tier C discoverability annotations. These are bookkeeping-only: smoke
+    # coverage and spec coverage audits consume them, but they do not affect
+    # compile placement or baking. ``compaction_safe`` is default-true so ops
+    # opt out only when a known FFN footprint must remain in the shared expert.
+    smoke_tests: Set[str] = field(default_factory=set)
+    spec_section: Optional[str] = None
+    compaction_safe: bool = True
+    # Where this op's bake authority currently comes from. ``None`` means the
+    # op has not been audited/classified yet. ``declarative`` and
+    # ``spec_generated`` are authoritative declarative paths; ``legacy_wrapper``
+    # marks an opaque wrapper around legacy bake code.
+    declarative_authority: Optional[str] = None
 
     def __hash__(self):
         return hash(self.name)
@@ -341,6 +372,91 @@ class LayerCompiler:
                         f"Op {op.name!r} {fname} references undeclared dim "
                         f"{dim_name!r}"
                     )
+        # Validate Tier B annotations. Postcondition cell names are resolved
+        # by the detector because they may include an index suffix like
+        # ``OUTPUT_LO[3]``.
+        if not isinstance(op.alibi_slopes, dict):
+            raise ValueError(
+                f"Op {op.name!r} alibi_slopes must be a dict; "
+                f"got {type(op.alibi_slopes).__name__}"
+            )
+        for head_idx, slope in op.alibi_slopes.items():
+            if not isinstance(head_idx, int):
+                raise ValueError(
+                    f"Op {op.name!r} alibi_slopes key must be int "
+                    f"(head index); got {head_idx!r}"
+                )
+            if not isinstance(slope, (int, float)):
+                raise ValueError(
+                    f"Op {op.name!r} alibi_slopes[{head_idx!r}] must be "
+                    f"int|float; got {slope!r}"
+                )
+        if not isinstance(op.postcondition, dict):
+            raise ValueError(
+                f"Op {op.name!r} postcondition must be a dict; "
+                f"got {type(op.postcondition).__name__}"
+            )
+        for cell_name, invariant in op.postcondition.items():
+            if not isinstance(cell_name, str):
+                raise ValueError(
+                    f"Op {op.name!r} postcondition key must be str; "
+                    f"got {cell_name!r}"
+                )
+            if not isinstance(invariant, str):
+                raise ValueError(
+                    f"Op {op.name!r} postcondition[{cell_name!r}] must "
+                    f"be str; got {invariant!r}"
+                )
+        if op.step_idx is not None:
+            if isinstance(op.step_idx, str):
+                if op.step_idx not in ("every", "after_first"):
+                    raise ValueError(
+                        f"Op {op.name!r} step_idx str must be 'every' "
+                        f"or 'after_first'; got {op.step_idx!r}"
+                    )
+            elif isinstance(op.step_idx, set):
+                for idx in op.step_idx:
+                    if not isinstance(idx, int):
+                        raise ValueError(
+                            f"Op {op.name!r} step_idx set entries must "
+                            f"be int; got {idx!r}"
+                        )
+            else:
+                raise ValueError(
+                    f"Op {op.name!r} step_idx must be None, a set of ints, "
+                    f"'every', or 'after_first'; got "
+                    f"{type(op.step_idx).__name__}"
+                )
+        if not isinstance(op.smoke_tests, set):
+            raise ValueError(
+                f"Op {op.name!r} smoke_tests must be a set; "
+                f"got {type(op.smoke_tests).__name__}"
+            )
+        for entry in op.smoke_tests:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"Op {op.name!r} smoke_tests entry must be str; "
+                    f"got {entry!r}"
+                )
+        if op.spec_section is not None and not isinstance(op.spec_section, str):
+            raise ValueError(
+                f"Op {op.name!r} spec_section must be str or None; "
+                f"got {type(op.spec_section).__name__}"
+            )
+        if not isinstance(op.compaction_safe, bool):
+            raise ValueError(
+                f"Op {op.name!r} compaction_safe must be bool; "
+                f"got {type(op.compaction_safe).__name__}"
+            )
+        if (
+            op.declarative_authority is not None
+            and op.declarative_authority not in ALLOWED_DECLARATIVE_AUTHORITY
+        ):
+            allowed = ", ".join(sorted(ALLOWED_DECLARATIVE_AUTHORITY))
+            raise ValueError(
+                f"Op {op.name!r} declarative_authority must be one of "
+                f"{allowed} or None; got {op.declarative_authority!r}"
+            )
         # Validate dim-ownership claims (if any). Accept legacy 3-tuple
         # ``(layer_idx, scope, identifier)`` and auto-promote to 4-tuple with
         # ``column=None`` for back-compat with pre-column-granularity ops.

@@ -74,6 +74,8 @@ def make_layer5_user_input_gather_op(enable: bool = False) -> Operation:
         layer_idx=5,
         bake_fn=bake,
         migrated=True,
+        smoke_tests=set(),
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -121,4 +123,6 @@ def make_layer6_getchar_routing_op(enable: bool = False) -> Operation:
         bake_fn=bake,
         phase=998.9,
         migrated=True,
+        smoke_tests=set(),
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )

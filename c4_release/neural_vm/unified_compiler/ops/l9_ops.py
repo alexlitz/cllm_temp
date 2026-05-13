@@ -54,6 +54,26 @@ def make_layer9_alu_op() -> Operation:
         # units. Cumulative L9 FFN max: 3405. No other op writes to L9
         # FFN so this op holds the per-layer width annotation.
         ffn_units_used=3405,
+        smoke_tests={
+            "TestSmoke32Bit::test_add_16bit",
+            "TestSmoke32Bit::test_and_16bit",
+            "TestSmoke32Bit::test_or_16bit",
+            "TestSmoke32Bit::test_sub_16bit",
+            "TestSmoke32Bit::test_xor_16bit",
+            "TestSmokeBasic::test_add_basic",
+            "TestSmokeBasic::test_sub_basic",
+            "TestSmokeBitwise::test_and_basic",
+            "TestSmokeBitwise::test_or_basic",
+            "TestSmokeBitwise::test_xor_basic",
+            "TestSmokeComparison::test_eq_false",
+            "TestSmokeComparison::test_eq_true",
+            "TestSmokeComparison::test_ge_true",
+            "TestSmokeComparison::test_gt_true",
+            "TestSmokeComparison::test_le_true",
+            "TestSmokeComparison::test_lt_true",
+            "TestSmokeComparison::test_ne_true",
+        },
+        spec_section="BLOG_SPEC.md#binary-ALU",
     )
 
 
@@ -104,6 +124,8 @@ def make_layer9_lev_addr_relay_op() -> Operation:
         layer_idx=9,
         migrated=True,
         claims=_claims,
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#function-calls",
     )
 
 
@@ -154,6 +176,8 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         layer_idx=9,
         migrated=True,
         claims=_claims,
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#function-calls",
     )
 
 
@@ -197,6 +221,8 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
         bake_fn=bake,
         layer_idx=9,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
 
 
@@ -362,6 +388,8 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         layer_idx=9,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
@@ -385,6 +413,8 @@ def make_layer9_marker_suppress_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 

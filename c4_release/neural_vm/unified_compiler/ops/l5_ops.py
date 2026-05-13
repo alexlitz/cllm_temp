@@ -86,6 +86,8 @@ def make_layer5_fetch_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
 
 
@@ -114,6 +116,8 @@ def make_layer5_fetch_dep_anchor_op() -> Operation:
                 "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests=set(),
+        spec_section=None,
     )
 
 
@@ -148,6 +152,8 @@ def make_opcode_decode_ffn_op() -> Operation:
         layer_idx=5,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
 
 
@@ -175,6 +181,8 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
                 "TEMP"},
         kind="ffn",
         bake_fn=bake,
+        smoke_tests=set(),
+        spec_section=None,
     )
 
 

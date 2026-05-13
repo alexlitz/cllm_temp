@@ -32,6 +32,8 @@ def make_io_putchar_routing_op() -> Operation:
         bake_fn=bake,
         phase=998,
         migrated=True,
+        smoke_tests=set(),
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -131,6 +133,11 @@ def make_function_call_weights_op() -> Operation:
         # layer_idx field doesn't affect their bake execution.
         layer_idx=6,
         ffn_units_used=2278,
+        smoke_tests={
+            "TestSmokeFunctionCall::test_simple_function",
+        },
+        spec_section="BLOG_SPEC.md#function-calls",
+        compaction_safe=False,
     )
 
 
@@ -189,9 +196,13 @@ def make_opcode_relay_head_op() -> Operation:
         reads=set(),
         writes=set(),
         kind="model",
+        layer_idx=6,
         bake_fn=bake,
         phase=1002,
         migrated=True,
+        alibi_slopes={6: 5.0, 7: 5.0},
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
 
 
@@ -267,6 +278,8 @@ def make_residual_alibi_slopes_op() -> Operation:
         bake_fn=_bake,
         phase=999,
         migrated=True,
+        smoke_tests=set(),
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
@@ -358,6 +371,8 @@ def make_branch_override_patch_op() -> Operation:  # noqa: E302
         bake_fn=bake,
         phase=1100,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#control-flow",
     )
 
 
@@ -434,6 +449,8 @@ def make_l6_dead_unit_zero_op() -> Operation:
         bake_fn=bake,
         phase=1160,
         migrated=True,
+        smoke_tests=set(),
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -516,6 +533,8 @@ def make_l7_dead_unit_zero_op() -> Operation:
         bake_fn=bake,
         phase=1170,
         migrated=True,
+        smoke_tests=set(),
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -533,6 +552,8 @@ def make_right_size_ffns_op() -> Operation:
         bake_fn=bake,
         phase=1200,
         migrated=True,
+        smoke_tests=set(),
+        spec_section=None,
     )
 
 
@@ -550,6 +571,8 @@ def make_expand_wrapper_blocks_op() -> Operation:
         bake_fn=bake,
         phase=1300,
         migrated=True,
+        smoke_tests=set(),
+        spec_section=None,
     )
 
 
@@ -569,6 +592,8 @@ def make_head_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         phase=1000,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -589,6 +614,8 @@ def make_embedding_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         phase=1001,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -642,6 +669,8 @@ def make_initial_pc_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         phase=1001.5,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -674,5 +703,6 @@ def make_contract_validation_op() -> Operation:
         bake_fn=_bake,
         phase=1199,
         migrated=True,
+        smoke_tests=set(),
+        spec_section=None,
     )
-

@@ -19,6 +19,8 @@ def make_layer10_carry_relay_op() -> Operation:
         writes={"CARRY"},  # broadcast
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -38,6 +40,8 @@ def make_layer10_byte_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -57,6 +61,8 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -75,6 +81,8 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -130,6 +138,14 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        smoke_tests={
+            "TestSmoke32Bit::test_add_16bit",
+            "TestSmoke32Bit::test_sub_16bit",
+            "TestSmokeAddress::test_lea_basic",
+            "TestSmokeBasic::test_add_basic",
+            "TestSmokeBasic::test_sub_basic",
+        },
+        spec_section="BLOG_SPEC.md#binary-ALU",
     )
 
 
@@ -170,6 +186,8 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -207,6 +225,8 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -244,6 +264,8 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        smoke_tests={"TestSmokeBasic::test_add_basic"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -281,6 +303,8 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -328,6 +352,24 @@ def make_layer10_alu_op() -> Operation:
         # setup units, reaching unit 1845. No other op writes to L10 FFN
         # so this op holds the per-layer width annotation.
         ffn_units_used=1846,
+        smoke_tests={
+            "TestSmoke32Bit::test_and_16bit",
+            "TestSmoke32Bit::test_or_16bit",
+            "TestSmoke32Bit::test_xor_16bit",
+            "TestSmokeBasic::test_div_basic",
+            "TestSmokeBasic::test_mod_basic",
+            "TestSmokeBitwise::test_and_basic",
+            "TestSmokeBitwise::test_or_basic",
+            "TestSmokeBitwise::test_xor_basic",
+            "TestSmokeComparison::test_eq_false",
+            "TestSmokeComparison::test_eq_true",
+            "TestSmokeComparison::test_ge_true",
+            "TestSmokeComparison::test_gt_true",
+            "TestSmokeComparison::test_le_true",
+            "TestSmokeComparison::test_lt_true",
+            "TestSmokeComparison::test_ne_true",
+        },
+        spec_section="BLOG_SPEC.md#binary-ALU",
     )
 
 
@@ -347,6 +389,8 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -410,6 +454,8 @@ def make_l10_post_ops_combined() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "CARRY"},
         kind="ffn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -513,6 +559,8 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         phase=10.7,
         layer_idx=10,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 

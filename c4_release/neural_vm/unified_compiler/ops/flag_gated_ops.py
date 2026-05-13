@@ -61,6 +61,8 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
         bake_fn=bake,
         phase=998.8,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#tool-use-mode",
     )
 
 
@@ -101,6 +103,8 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
         bake_fn=bake,
         layer_idx=5,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -149,6 +153,8 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
         bake_fn=bake,
         phase=998.8,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#tool-use-mode",
     )
 
 
@@ -202,6 +208,8 @@ def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Oper
         kind="model",
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -238,6 +246,8 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
         bake_fn=bake,
         phase=998.8,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#tool-use-mode",
     )
 
 
@@ -280,6 +290,8 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -363,6 +375,8 @@ def make_null_terminator_detection_op(
             1865 if (enable_conversational_io and alu_mode == "lookup")
             else None
         ),
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -410,6 +424,8 @@ def make_convo_io_step_resume_op(
         layer_idx=3,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -461,6 +477,8 @@ def make_convo_io_pc_sp_latch_op(
         layer_idx=6,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -519,6 +537,8 @@ def make_convo_io_prtf_capture_op(
         layer_idx=7,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -601,6 +621,8 @@ def make_convo_io_prtf_transport_op(
         layer_idx=4,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -654,5 +676,7 @@ def make_conversational_io_output_routing_op(
         # 1232-unit allocation in that mode. In lookup mode the L15 FFN
         # falls back to ``layer15_nibble_copy``'s 40 units.
         ffn_units_used=1232 if enable_conversational_io else None,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 

@@ -31,6 +31,8 @@ def make_layer6_attn_op() -> Operation:
         writes={"CMP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -69,6 +71,13 @@ def make_layer6_routing_ffn_op() -> Operation:
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        smoke_tests={
+            "TestSmokeBasic::test_imm_exit",
+            "TestSmokeControlFlow::test_jmp_forward",
+            "TestSmokeFunctionCall::test_simple_function",
+            "all",
+        },
+        spec_section="BLOG_SPEC.md#function-calls",
     )
 
 
@@ -93,6 +102,8 @@ def make_layer6_relay_heads_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -145,6 +156,8 @@ def make_layer6_attn_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -183,6 +196,8 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -217,6 +232,11 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         migrated=True,
+        smoke_tests={
+            "TestSmokeControlFlow::test_bnz_branch",
+            "TestSmokeControlFlow::test_bz_branch",
+        },
+        spec_section="BLOG_SPEC.md#control-flow",
     )
 
 
@@ -247,6 +267,8 @@ def make_binary_pop_sp_increment_op() -> Operation:
         bake_fn=bake,
         phase=998,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -325,6 +347,8 @@ def make_putchar_think_protocol_op(
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -405,6 +429,8 @@ def make_prtf_think_protocol_op(
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -466,6 +492,8 @@ def make_open_clos_tool_call_op(
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#tool-use-mode",
     )
 
 

@@ -58,6 +58,9 @@ def make_phase_a_ffn_op() -> Operation:
         # the 7-entry ``transitions`` list (SE→PC, PC→AX, AX→SP, SP→BP,
         # BP→STACK0, STACK0→MEM, MEM→SE). Units 0..6.
         ffn_units_used=7,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+        compaction_safe=True,
     )
 
 
@@ -70,7 +73,7 @@ def make_layer0_threshold_attn_op() -> Operation:
     LayerCompiler dep-based assignment.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_threshold_attn
+        from ..primitives import Primitives
         attn = block.attn
         proxy = _as_setdim_proxy(dim_positions)
         ALIBI_S = 10.0
@@ -81,13 +84,14 @@ def make_layer0_threshold_attn_op() -> Operation:
         # via dim_positions. In practice these are all IO-pinned so the legacy
         # fallback agrees, but routing through the proxy keeps the bake honest
         # if the IO-pin contract ever changes.
-        _set_threshold_attn(
+        Primitives.generate_threshold_attention_heads(
             attn,
             [3.5, 4.5, 7.5, 8.5, 9.5, 14.5, 19.5, 24.5],
             [proxy.H0, proxy.H1, proxy.H2, proxy.H3, proxy.H4,
              proxy.H5, proxy.H6, proxy.H7],
-            ALIBI_S, HD,
-            BD=proxy,
+            ALIBI_S,
+            HD,
+            bd=proxy,
         )
         # Softmax-sharpness fix (head 1): the H1 (d<=4.5) threshold head
         # passes its scoring budget on the synthetic K target (Q*K/sqrt(HD)
@@ -134,6 +138,7 @@ def make_layer0_threshold_attn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
-
 

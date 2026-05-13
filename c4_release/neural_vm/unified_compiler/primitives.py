@@ -22,8 +22,74 @@ Extracted batch B (vm_step direct ports — byte-identical to imperative code):
 """
 
 import torch
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Union
 from ..vm_step import _SetDim as BD
+
+
+@dataclass(frozen=True)
+class AttentionProjectionWrite:
+    """One declarative write into an attention projection matrix.
+
+    ``slot`` is head-local: generated row = ``head_idx * HD + slot``.
+    ``dim`` is the residual-stream column for W_q/W_k/W_v, or the
+    residual-stream row for W_o. This intentionally uses already-resolved
+    dim positions so the primitive works with both legacy ``_SetDim`` and
+    compiler-allocated dim proxies.
+    """
+
+    slot: int
+    dim: int
+    weight: float
+
+
+@dataclass(frozen=True)
+class AttentionOutputWrite:
+    """One declarative W_o write from a head-local value slot to residual dim."""
+
+    out_dim: int
+    slot: int
+    weight: float
+
+
+@dataclass(frozen=True)
+class DeclarativeAttentionHeadSpec:
+    """Structural attention-head bake spec.
+
+    This is the first step toward docs/DECLARATIVE_BAKE_VISION.md: operation
+    bakes can describe Q/K/V/O structure as data and let a shared generator
+    emit the matrix writes. The spec is intentionally low-level enough to be
+    byte-identical with existing imperative helpers.
+    """
+
+    head_idx: int
+    q: Tuple[AttentionProjectionWrite, ...] = field(default_factory=tuple)
+    k: Tuple[AttentionProjectionWrite, ...] = field(default_factory=tuple)
+    v: Tuple[AttentionProjectionWrite, ...] = field(default_factory=tuple)
+    o: Tuple[AttentionOutputWrite, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class ThresholdAttentionHeadSpec:
+    """Declarative spec for legacy ``_set_threshold_attn`` marker heads."""
+
+    head_idx: int
+    threshold: float
+    out_base: int
+    slope: float = 10.0
+    bd: object = BD
+
+
+def AP(slot: int, dim: int, weight: float) -> AttentionProjectionWrite:
+    """Compact constructor for declarative attention Q/K/V writes."""
+
+    return AttentionProjectionWrite(slot=slot, dim=dim, weight=weight)
+
+
+def AO(out_dim: int, slot: int, weight: float) -> AttentionOutputWrite:
+    """Compact constructor for declarative attention output writes."""
+
+    return AttentionOutputWrite(out_dim=out_dim, slot=slot, weight=weight)
 
 
 class Primitives:
@@ -32,6 +98,110 @@ class Primitives:
     # =========================================================================
     # Attention Primitives
     # =========================================================================
+
+    @staticmethod
+    def generate_attention_head(attn, spec: DeclarativeAttentionHeadSpec, HD: int):
+        """Emit Q/K/V/O matrix writes for one declarative attention head."""
+
+        base = spec.head_idx * HD
+        for write in spec.q:
+            attn.W_q.data[base + write.slot, write.dim] = write.weight
+        for write in spec.k:
+            attn.W_k.data[base + write.slot, write.dim] = write.weight
+        for write in spec.v:
+            attn.W_v.data[base + write.slot, write.dim] = write.weight
+        for write in spec.o:
+            attn.W_o.data[write.out_dim, base + write.slot] = write.weight
+
+    @staticmethod
+    def generate_attention_heads(attn, specs, HD: int):
+        """Emit Q/K/V/O matrix writes for multiple declarative heads."""
+
+        for spec in specs:
+            Primitives.generate_attention_head(attn, spec, HD)
+
+    @staticmethod
+    def threshold_attention_head_spec(
+        spec: ThresholdAttentionHeadSpec,
+        HD: int,
+    ) -> DeclarativeAttentionHeadSpec:
+        """Lower a threshold-attention spec to raw Q/K/V/O writes."""
+
+        import math
+
+        bd = spec.bd
+        q_val = math.sqrt(HD) * spec.slope
+        v_writes = tuple(
+            AP(1 + m, src, 1.0)
+            for m, src in enumerate(bd.MARKS)
+        )
+        o_writes = tuple(
+            AO(spec.out_base + m, 1 + m, 1.0)
+            for m in range(bd.NUM_MARKERS)
+        )
+        return DeclarativeAttentionHeadSpec(
+            head_idx=spec.head_idx,
+            q=(AP(0, bd.CONST, q_val),),
+            k=(AP(0, bd.IS_MARK, spec.threshold),),
+            v=v_writes,
+            o=o_writes,
+        )
+
+    @staticmethod
+    def threshold_attention_head_specs(
+        thresholds,
+        out_bases,
+        slope: float,
+        HD: int,
+        heads=None,
+        bd=None,
+    ):
+        """Build declarative specs equivalent to ``_set_threshold_attn``.
+
+        ``bd`` is required for migrated compiler layouts so CONST/IS_MARK/MARKS
+        resolve through the active dim-position proxy instead of the legacy enum.
+        """
+
+        if bd is None:
+            raise TypeError(
+                "threshold_attention_head_specs requires bd "
+                "(use _as_setdim_proxy(dim_positions))"
+            )
+        if heads is None:
+            heads = list(range(len(thresholds)))
+        return tuple(
+            Primitives.threshold_attention_head_spec(
+                ThresholdAttentionHeadSpec(
+                    head_idx=h,
+                    threshold=t,
+                    out_base=out_bases[i],
+                    slope=slope,
+                    bd=bd,
+                ),
+                HD,
+            )
+            for i, (h, t) in enumerate(zip(heads, thresholds))
+        )
+
+    @staticmethod
+    def generate_threshold_attention_heads(
+        attn,
+        thresholds,
+        out_bases,
+        slope: float,
+        HD: int,
+        heads=None,
+        bd=None,
+    ):
+        """Emit threshold-attention heads from declarative specs."""
+
+        Primitives.generate_attention_heads(
+            attn,
+            Primitives.threshold_attention_head_specs(
+                thresholds, out_bases, slope, HD, heads=heads, bd=bd
+            ),
+            HD,
+        )
 
     @staticmethod
     def threshold_attention(
@@ -61,18 +231,15 @@ class Primitives:
             slope: ALiBi slope (default 10.0)
             HD: Head dimension (default 64)
         """
-        import math
-        base = head_idx * HD
-        # q_val scales with sqrt(HD) so Q·K / sqrt(HD) = slope * threshold
-        # regardless of HD. Previously hardcoded 8.0 (HD=64 assumption).
-        q_val = math.sqrt(HD) * slope
-
-        attn.W_q.data[base, BD.CONST] = q_val
-        attn.W_k.data[base, BD.IS_MARK] = threshold
-
-        for m, src in enumerate(BD.MARKS):
-            attn.W_v.data[base + 1 + m, src] = 1.0
-            attn.W_o.data[out_base + m, base + 1 + m] = 1.0
+        Primitives.generate_threshold_attention_heads(
+            attn,
+            [threshold],
+            [out_base],
+            slope,
+            HD,
+            heads=[head_idx],
+            bd=BD,
+        )
 
     @staticmethod
     def carry_forward_attention(

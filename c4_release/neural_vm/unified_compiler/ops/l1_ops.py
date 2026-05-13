@@ -45,25 +45,32 @@ def make_layer1_ffn_op() -> Operation:
         # ``_set_layer1_ffn`` writes 5 units (one per output: STACK0_BYTE0,
         # BYTE_INDEX_0..3). See setup_helpers.py:_set_layer1_ffn.
         ffn_units_used=5,
+        postcondition={
+            "STACK0_BYTE0": "0_or_1",
+        },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
 def make_layer1_threshold_attn_op() -> Operation:
     """L1 attention: 3 fine threshold heads + STEP_END + L1H4."""
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_threshold_attn
+        from ..primitives import Primitives
         proxy = _as_setdim_proxy(dim_positions)
         ALIBI_S = 10.0
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(ALIBI_S)
             attn.alibi_slopes[3] = 0.0  # global SE detection
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_threshold_attn(
+        Primitives.generate_threshold_attention_heads(
             attn,
             [0.5, 1.5, 2.5],
             [proxy.L1H0, proxy.L1H1, proxy.L1H2],
-            ALIBI_S, HD, heads=[0, 1, 2],
-            BD=proxy,
+            ALIBI_S,
+            HD,
+            heads=[0, 1, 2],
+            bd=proxy,
         )
         # Head 3: STEP_END existence detection (global)
         base = 3 * HD
@@ -72,8 +79,8 @@ def make_layer1_threshold_attn_op() -> Operation:
         attn.W_v[base + 1, proxy.MARK_SE_ONLY] = 1.0
         attn.W_o[proxy.HAS_SE, base + 1] = 1.0
         # Head 4: threshold 6.5 for STACK0 byte 0 identification
-        _set_threshold_attn(
-            attn, [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4], BD=proxy,
+        Primitives.generate_threshold_attention_heads(
+            attn, [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4], bd=proxy,
         )
 
     # Dim-ownership claims: 5 heads on L1 attn.
@@ -107,6 +114,6 @@ def make_layer1_threshold_attn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
-
-

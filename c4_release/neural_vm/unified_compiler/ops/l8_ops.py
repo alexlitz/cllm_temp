@@ -49,6 +49,14 @@ def make_layer8_alu_op() -> Operation:
             # binary-op semantics for any operand A computation.
             "ALU_LO": "AX_byte0",
         },
+        smoke_tests={
+            "TestSmokeBasic::test_add_basic",
+            "TestSmokeBasic::test_sub_basic",
+            "TestSmoke32Bit::test_add_16bit",
+            "TestSmoke32Bit::test_sub_16bit",
+        },
+        spec_section="BLOG_SPEC.md#binary-ALU",
+        compaction_safe=True,
     )
 
 
@@ -85,6 +93,8 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         bake_fn=bake,
         layer_idx=8,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -110,6 +120,8 @@ def make_layer8_multibyte_fetch_op() -> Operation:
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
 
 
@@ -174,6 +186,8 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         layer_idx=8,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
 
 
@@ -219,6 +233,8 @@ def make_layer8_multibyte_routing_op() -> Operation:
         # (phase=8.2) writes the 0-2022 cluster; this op holds the
         # per-layer max and dominates the dynamic-FFN allocation for L8.
         ffn_units_used=2055,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#mixture-of-experts-routing",
     )
 
 
@@ -243,6 +259,8 @@ def make_layer8_sp_gather_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -289,6 +307,8 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         layer_idx=8,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -392,6 +412,8 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -449,6 +471,8 @@ def make_layer8_op_imm_relay_op() -> Operation:
         phase=8.4,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -665,6 +689,8 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         layer_idx=8,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 

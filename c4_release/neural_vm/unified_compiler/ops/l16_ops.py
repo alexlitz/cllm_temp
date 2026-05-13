@@ -28,6 +28,8 @@ def make_layer16_lev_routing_op() -> Operation:
         #   3 (set OUTPUT_LO[0] byte 1-3) + 3 (set OUTPUT_HI[0] byte 1-3)
         #   = 121. The bytes 1-3 blocks (if False) are disabled.
         ffn_units_used=121,
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#function-calls",
     )
 
 

@@ -52,6 +52,8 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         # 4 BYTE_INDEX_*); ``_l2_unit_counter`` is bumped to 8 after this op
         # so the cancel op below starts at unit 8.
         ffn_units_used=8,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -157,20 +159,23 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         # 8 and 9 -> max index 10. The aggregator takes the per-block max
         # across all annotated ops, so reporting 10 here covers both.
         ffn_units_used=10,
+        step_idx={0},
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
 def make_layer2_threshold_attn_op() -> Operation:
     """L2 attention: threshold 5.5 head."""
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_threshold_attn
+        from ..primitives import Primitives
         proxy = _as_setdim_proxy(dim_positions)
         ALIBI_S = 10.0
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(ALIBI_S)
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_threshold_attn(
-            attn, [5.5], [proxy.L2H0], ALIBI_S, HD, heads=[0], BD=proxy,
+        Primitives.generate_threshold_attention_heads(
+            attn, [5.5], [proxy.L2H0], ALIBI_S, HD, heads=[0], bd=proxy,
         )
 
     # Dim-ownership claims: 1 threshold head on L2 attn, head 0 writing L2H0.
@@ -193,6 +198,8 @@ def make_layer2_threshold_attn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -243,6 +250,6 @@ def make_layer2_lookback_detection_head_op(
         layer_idx=2,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
-
-

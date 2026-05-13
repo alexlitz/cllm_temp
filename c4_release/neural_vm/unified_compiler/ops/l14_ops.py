@@ -36,6 +36,13 @@ def make_layer14_mem_generation_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={
+            "TestSmokeBasic::test_add_basic",
+            "TestSmokeFunctionCall::test_simple_function",
+            "TestSmokeMemory::test_sc_lc_roundtrip",
+            "TestSmokeMemory::test_si_li_roundtrip",
+        },
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -65,6 +72,8 @@ def make_layer14_temp_clear_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#function-calls",
     )
 
 
@@ -95,6 +104,8 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -125,6 +136,8 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -156,6 +169,8 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -197,6 +212,8 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#function-calls",
     )
 
 
@@ -252,6 +269,17 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         # sufficient — the compiler aggregates per-layer max across all
         # ops, so this single annotation suffices for L14 dynamic sizing.
         ffn_units_used=1311,
+        smoke_tests={
+            "TestSmoke32Bit::test_and_16bit",
+            "TestSmoke32Bit::test_or_16bit",
+            "TestSmoke32Bit::test_shr_8bit",
+            "TestSmoke32Bit::test_xor_16bit",
+            "TestSmokeBitwise::test_and_basic",
+            "TestSmokeBitwise::test_or_basic",
+            "TestSmokeBitwise::test_xor_basic",
+            "TestSmokeShift::test_shr",
+        },
+        spec_section="BLOG_SPEC.md#shifts",
     )
 
 
@@ -299,6 +327,8 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"TestSmokeMemory::test_sc_lc_roundtrip"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -486,6 +516,8 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 

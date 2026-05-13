@@ -41,6 +41,8 @@ def make_layer4_pc_relay_op() -> Operation:
         layer_idx=4,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -70,6 +72,8 @@ def make_layer4_ffn_op() -> Operation:
         # PC+1@PC marker (64) chains for a total of 544 units (0..543).
         # See bake body in vm_step.py:_set_layer4_ffn.
         ffn_units_used=544,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -192,4 +196,6 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         layer_idx=4,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
     )

@@ -40,6 +40,12 @@ def make_layer3_ffn_op() -> Operation:
         layer_idx=3,
         bake_fn=bake,
         migrated=True,
+        postcondition={
+            "OUTPUT_LO": "monotonic_non_decreasing",
+        },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+        compaction_safe=True,
     )
 
 
@@ -63,6 +69,8 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI"},
         kind="ffn",
         bake_fn=bake,
+        smoke_tests=set(),
+        spec_section=None,
     )
 
 
@@ -173,6 +181,8 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -217,6 +227,7 @@ def make_layer3_convo_io_state_init_op(
         layer_idx=3,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
-
 

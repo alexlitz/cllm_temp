@@ -21,6 +21,8 @@ def make_nibble_copy_ffn_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -56,6 +58,11 @@ def make_layer15_memory_lookup_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={
+            "TestSmokeMemory::test_sc_lc_roundtrip",
+            "TestSmokeMemory::test_si_li_roundtrip",
+        },
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -87,6 +94,8 @@ def make_layer15_nibble_copy_op() -> Operation:
         #   16 LO copy + 16 HI copy + 2 PSH SP byte0 + 2 PSH SP byte1 +
         #   2 PSH SP byte2 + 2 LEA first-step AX byte2 = 40.
         ffn_units_used=40,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -157,6 +166,8 @@ def make_l15_attention_resize_op() -> Operation:
         phase=14.9,
         layer_idx=15,
         migrated=True,
+        smoke_tests=set(),
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
