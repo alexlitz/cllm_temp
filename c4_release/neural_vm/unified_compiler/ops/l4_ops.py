@@ -52,6 +52,8 @@ def make_layer4_pc_relay_op() -> Operation:
             "EMBED_LO": "AX_marker",
             "EMBED_HI": "AX_marker",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -91,6 +93,8 @@ def make_layer4_ffn_op() -> Operation:
             "FETCH_LO": "PC_marker",
             "FETCH_HI": "PC_marker",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 
@@ -213,4 +217,6 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         layer_idx=4,
         migrated=True,
         claims=_claims,
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )

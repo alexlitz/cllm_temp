@@ -46,6 +46,8 @@ def make_layer14_mem_generation_op() -> Operation:
             "OUTPUT_LO": "MEM_val_byte0",
             "OUTPUT_HI": "MEM_val_byte0",
         },
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -75,6 +77,8 @@ def make_layer14_temp_clear_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -105,6 +109,8 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -143,6 +149,8 @@ def make_layer14_clear_output_corruption_op() -> Operation:
             "OUTPUT_LO": "STACK0_byte0",
             "OUTPUT_HI": "STACK0_byte0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -174,6 +182,8 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -224,6 +234,8 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
             "OUTPUT_LO": "AX_byte1",
             "OUTPUT_HI": "AX_byte1",
         },
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 
@@ -287,6 +299,8 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
             "OUTPUT_LO": "AX_byte1",
             "OUTPUT_HI": "AX_byte1",
         },
+        smoke_tests={"TestSmokeBitwise::test_or_basic", "TestSmokeBitwise::test_and_basic", "TestSmokeBitwise::test_xor_basic", "TestSmoke32Bit::test_or_16bit", "TestSmoke32Bit::test_and_16bit", "TestSmoke32Bit::test_xor_16bit"},
+        spec_section="BLOG_SPEC.md#bitwise-operations",
     )
 
 
@@ -342,6 +356,8 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
             "OUTPUT_LO": "AX_byte1",
             "OUTPUT_HI": "AX_byte1",
         },
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -529,6 +545,8 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 

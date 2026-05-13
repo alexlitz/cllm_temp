@@ -77,6 +77,8 @@ def make_layer9_alu_op() -> Operation:
         # units. Cumulative L9 FFN max: 3405. No other op writes to L9
         # FFN so this op holds the per-layer width annotation.
         ffn_units_used=3405,
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#addition-implementation",
     )
 
 
@@ -136,6 +138,8 @@ def make_layer9_lev_addr_relay_op() -> Operation:
             "ADDR_B0_LO": "REG_SP",
             "ADDR_B0_HI": "REG_SP",
         },
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 
@@ -195,6 +199,8 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
             "ADDR_B0_LO": "REG_PC",
             "ADDR_B0_HI": "REG_PC",
         },
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 
@@ -248,6 +254,8 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
             "OUTPUT_BYTE_LO": "AX_byte0",
             "OUTPUT_BYTE_HI": "AX_byte0",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -424,6 +432,8 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
             "OUTPUT_LO": "MEM_VAL_byte0",
             "OUTPUT_HI": "MEM_VAL_byte0",
         },
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -447,6 +457,8 @@ def make_layer9_marker_suppress_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 

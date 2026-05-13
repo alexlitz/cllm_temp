@@ -54,6 +54,8 @@ def make_layer1_ffn_op() -> Operation:
         produces={
             "STACK0_BYTE0": "STACK0_byte0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -116,6 +118,8 @@ def make_layer1_threshold_attn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 

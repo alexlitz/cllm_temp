@@ -31,6 +31,8 @@ def make_layer6_attn_op() -> Operation:
         writes={"CMP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
@@ -80,6 +82,8 @@ def make_layer6_routing_ffn_op() -> Operation:
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 
@@ -104,6 +108,8 @@ def make_layer6_relay_heads_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
@@ -156,6 +162,8 @@ def make_layer6_attn_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
@@ -206,6 +214,8 @@ def make_layer6_relay_heads_bake_op() -> Operation:
             "ALU_LO": "STACK0",
             "ALU_HI": "STACK0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
@@ -268,6 +278,8 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
         produces={
             "CMP": "PC_marker",
         },
+        smoke_tests={"TestSmokeControlFlow::test_jmp_forward", "TestSmokeControlFlow::test_bz_branch", "TestSmokeControlFlow::test_bnz_branch", "TestSmokeIntegration::test_cmp_and_branch"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 
@@ -298,6 +310,8 @@ def make_binary_pop_sp_increment_op() -> Operation:
         bake_fn=bake,
         phase=998,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -376,6 +390,8 @@ def make_putchar_think_protocol_op(
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -456,6 +472,8 @@ def make_prtf_think_protocol_op(
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -517,6 +535,8 @@ def make_open_clos_tool_call_op(
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#tool-use-mode",
     )
 
 

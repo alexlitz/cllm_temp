@@ -181,6 +181,9 @@ def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
     # AND AFTER the dead-unit zero passes (l6_dead_unit_zero=1160,
     # l7_dead_unit_zero=1170 which require the original PureFFN), but BEFORE
     # right_size_ffns (1200) which prunes dead units after wrapping.
+    smoke, spec = _ALU_POSTOP_BOOKKEEPING.get(
+        alu_cls_name, _ALU_POSTOP_BOOKKEEPING_FALLBACK,
+    )
     return Operation(
         name=name,
         reads=set(),
@@ -190,7 +193,59 @@ def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
         bake_fn=bake,
         phase=1180 + layer_idx * 0.01,
         migrated=True,
+        smoke_tests=set(smoke),
+        spec_section=spec,
     )
+
+
+# Per-ALU-class bookkeeping for ``_make_alu_postop_attach_op``: maps the
+# ALU class name to the (smoke_tests, spec_section) pair the audit
+# detectors credit against. Frozen tuples so callers ``set(...)`` into a
+# fresh set per Operation (mutation safety).
+_ALU_POSTOP_BOOKKEEPING = {
+    "ALUAddSub": (
+        (
+            "TestSmokeBasic::test_add_basic",
+            "TestSmokeBasic::test_sub_basic",
+            "TestSmoke32Bit::test_add_16bit",
+            "TestSmoke32Bit::test_sub_16bit",
+            "TestSmoke32Bit::test_add_carry_cascade",
+            "TestSmoke32Bit::test_sub_borrow_cascade",
+        ),
+        "BLOG_SPEC.md#addition-implementation",
+    ),
+    "ALUMul": (
+        (
+            "TestSmokeBasic::test_mul_basic",
+            "TestSmoke32Bit::test_mul_overflow",
+        ),
+        "BLOG_SPEC.md#multiplication-implementation",
+    ),
+    "ALUShift": (
+        (
+            "TestSmokeShift::test_shl",
+            "TestSmokeShift::test_shr",
+            "TestSmoke32Bit::test_shl_8bit",
+            "TestSmoke32Bit::test_shr_8bit",
+        ),
+        "BLOG_SPEC.md#shifts",
+    ),
+    "ALUAndOrXor": (
+        (
+            "TestSmokeBitwise::test_or_basic",
+            "TestSmokeBitwise::test_and_basic",
+            "TestSmokeBitwise::test_xor_basic",
+            "TestSmoke32Bit::test_or_16bit",
+            "TestSmoke32Bit::test_and_16bit",
+            "TestSmoke32Bit::test_xor_16bit",
+        ),
+        "BLOG_SPEC.md#bitwise-operations",
+    ),
+}
+_ALU_POSTOP_BOOKKEEPING_FALLBACK = (
+    ("TestSmokePipeline::test_compile_and_run",),
+    "BLOG_SPEC.md#the-operations",
+)
 
 
 def _ensure_l11_mul_module(block, S, dim_positions=None):

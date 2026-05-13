@@ -146,6 +146,8 @@ def make_layer7_memory_heads_op() -> Operation:
         layer_idx=7,
         migrated=True,
         claims=_claims,
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -193,6 +195,8 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
             "FORMAT_PTR_LO": "STACK0",
             "FORMAT_PTR_HI": "STACK0",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 

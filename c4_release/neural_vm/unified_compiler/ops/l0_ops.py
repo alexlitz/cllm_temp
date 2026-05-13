@@ -179,6 +179,8 @@ def make_layer0_threshold_attn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 

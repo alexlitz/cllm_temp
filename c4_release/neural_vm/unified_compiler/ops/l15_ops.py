@@ -21,6 +21,8 @@ def make_nibble_copy_ffn_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-building-blocks",
     )
 
 
@@ -65,6 +67,8 @@ def make_layer15_memory_lookup_op() -> Operation:
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
         },
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -105,6 +109,8 @@ def make_layer15_nibble_copy_op() -> Operation:
             "OUTPUT_LO": "STACK0_byte0",
             "OUTPUT_HI": "STACK0_byte0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-building-blocks",
     )
 
 
@@ -175,6 +181,8 @@ def make_l15_attention_resize_op() -> Operation:
         phase=14.9,
         layer_idx=15,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 

@@ -44,6 +44,8 @@ def make_layer11_mul_partial_op() -> Operation:
         produces={
             "MUL_ACCUM": "AX_byte0",
         },
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 

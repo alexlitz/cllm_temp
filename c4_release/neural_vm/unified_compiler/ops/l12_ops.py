@@ -42,6 +42,8 @@ def make_layer12_mul_combine_op() -> Operation:
         produces={
             "OUTPUT_HI": "AX_byte0",
         },
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 

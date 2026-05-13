@@ -37,6 +37,8 @@ def make_layer16_lev_routing_op() -> Operation:
             "OUTPUT_LO": "SP",
             "OUTPUT_HI": "SP",
         },
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 

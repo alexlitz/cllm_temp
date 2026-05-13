@@ -55,6 +55,8 @@ def make_layer13_mem_addr_gather_op() -> Operation:
             "ADDR_B1_HI": "MEM_VAL_byte0",
             "ADDR_B2_HI": "MEM_VAL_byte0",
         },
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -121,6 +123,8 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
         } if alu_mode == "lookup" else {},
+        smoke_tests={"TestSmokeShift::test_shl", "TestSmokeShift::test_shr", "TestSmoke32Bit::test_shl_8bit", "TestSmoke32Bit::test_shr_8bit"},
+        spec_section="BLOG_SPEC.md#shifts",
     )
 
 

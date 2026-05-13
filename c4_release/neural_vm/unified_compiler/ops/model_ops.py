@@ -32,6 +32,8 @@ def make_io_putchar_routing_op() -> Operation:
         bake_fn=bake,
         phase=998,
         migrated=True,
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -235,6 +237,8 @@ def make_opcode_relay_head_op() -> Operation:
             "MEM_STORE": "MEM",
             "MEM_ADDR_SRC": "MEM",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 
@@ -310,6 +314,8 @@ def make_residual_alibi_slopes_op() -> Operation:
         bake_fn=_bake,
         phase=999,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
@@ -401,6 +407,8 @@ def make_branch_override_patch_op() -> Operation:  # noqa: E302
         bake_fn=bake,
         phase=1100,
         migrated=True,
+        smoke_tests={"TestSmokeControlFlow::test_jmp_forward", "TestSmokeControlFlow::test_bz_branch", "TestSmokeControlFlow::test_bnz_branch", "TestSmokeIntegration::test_cmp_and_branch"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 
@@ -477,6 +485,8 @@ def make_l6_dead_unit_zero_op() -> Operation:
         bake_fn=bake,
         phase=1160,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#mixture-of-experts-routing",
     )
 
 
@@ -559,6 +569,8 @@ def make_l7_dead_unit_zero_op() -> Operation:
         bake_fn=bake,
         phase=1170,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#mixture-of-experts-routing",
     )
 
 
@@ -576,6 +588,8 @@ def make_right_size_ffns_op() -> Operation:
         bake_fn=bake,
         phase=1200,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#mixture-of-experts-routing",
     )
 
 
@@ -593,6 +607,8 @@ def make_expand_wrapper_blocks_op() -> Operation:
         bake_fn=bake,
         phase=1300,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-building-blocks",
     )
 
 
@@ -612,6 +628,8 @@ def make_head_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         phase=1000,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#baking-prompts-programs-into-the-transformer-weights",
     )
 
 
@@ -632,6 +650,8 @@ def make_embedding_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         phase=1001,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#baking-prompts-programs-into-the-transformer-weights",
     )
 
 
@@ -685,6 +705,8 @@ def make_initial_pc_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         phase=1001.5,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#baking-prompts-programs-into-the-transformer-weights",
     )
 
 
@@ -717,5 +739,6 @@ def make_contract_validation_op() -> Operation:
         bake_fn=_bake,
         phase=1199,
         migrated=True,
+        smoke_tests={"all"},
     )
 

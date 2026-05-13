@@ -68,6 +68,8 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
         produces={
             "IO_IS_TOOL_CALL": "AX",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#tool-use-mode",
     )
 
 
@@ -116,6 +118,8 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
             "IO_IS_PRTF": "AX",
             "IO_IS_READ": "AX",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -171,6 +175,8 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
         produces={
             "IO_IS_TOOL_CALL": "STEP_END",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#tool-use-mode",
     )
 
 
@@ -232,6 +238,8 @@ def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Oper
             "IO_IS_PRTF": "STEP_END",
             "IO_IS_READ": "STEP_END",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -274,6 +282,8 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
         produces={
             "NEXT_TOOL_CALL": "STEP_END",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#tool-use-mode",
     )
 
 
@@ -324,6 +334,8 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
             "NEXT_THINKING_END": "STEP_END",
             "IO_STATE": "STEP_END",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -416,6 +428,8 @@ def make_null_terminator_detection_op(
             "IO_OUTPUT_COMPLETE": "STEP_END",
             "NEXT_THINKING_START": "STEP_END",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -463,6 +477,8 @@ def make_convo_io_step_resume_op(
         layer_idx=3,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -514,6 +530,8 @@ def make_convo_io_pc_sp_latch_op(
         layer_idx=6,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -572,6 +590,8 @@ def make_convo_io_prtf_capture_op(
         layer_idx=7,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -654,6 +674,8 @@ def make_convo_io_prtf_transport_op(
         layer_idx=4,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -715,5 +737,7 @@ def make_conversational_io_output_routing_op(
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 

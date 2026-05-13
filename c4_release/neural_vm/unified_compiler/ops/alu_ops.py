@@ -36,6 +36,8 @@ def make_alu_shift_composite_ops():
             kind="ffn",
             bake_fn=bake,
             migrated=True,
+            smoke_tests={"TestSmokeShift::test_shl", "TestSmokeShift::test_shr", "TestSmoke32Bit::test_shl_8bit", "TestSmoke32Bit::test_shr_8bit"},
+            spec_section="BLOG_SPEC.md#shifts",
         )
 
     def make_precompute():
@@ -54,6 +56,8 @@ def make_alu_shift_composite_ops():
             kind="ffn",
             bake_fn=bake,
             migrated=True,
+            smoke_tests={"TestSmokeShift::test_shl", "TestSmokeShift::test_shr", "TestSmoke32Bit::test_shl_8bit", "TestSmoke32Bit::test_shr_8bit"},
+            spec_section="BLOG_SPEC.md#shifts",
         )
 
     def make_select():
@@ -72,6 +76,8 @@ def make_alu_shift_composite_ops():
             kind="ffn",
             bake_fn=bake,
             migrated=True,
+            smoke_tests={"TestSmokeShift::test_shl", "TestSmokeShift::test_shr", "TestSmoke32Bit::test_shl_8bit", "TestSmoke32Bit::test_shr_8bit"},
+            spec_section="BLOG_SPEC.md#shifts",
         )
 
     def make_getobd():
@@ -90,6 +96,8 @@ def make_alu_shift_composite_ops():
             kind="ffn",
             bake_fn=bake,
             migrated=True,
+            smoke_tests={"TestSmokeShift::test_shl", "TestSmokeShift::test_shr", "TestSmoke32Bit::test_shl_8bit", "TestSmoke32Bit::test_shr_8bit"},
+            spec_section="BLOG_SPEC.md#shifts",
         )
 
     def make_install():
@@ -107,6 +115,8 @@ def make_alu_shift_composite_ops():
             bake_fn=bake,
             layer_idx=13,
             migrated=True,
+            smoke_tests={"TestSmokeShift::test_shl", "TestSmokeShift::test_shr", "TestSmoke32Bit::test_shl_8bit", "TestSmoke32Bit::test_shr_8bit"},
+            spec_section="BLOG_SPEC.md#shifts",
         )
 
     return [
@@ -247,6 +257,8 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
         bake_fn=bake,
         phase=1002,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#addition-implementation",
     )
 
 
@@ -277,6 +289,8 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         phase=10.85,
         layer_idx=10,
         migrated=True,
+        smoke_tests={"TestSmokeBitwise::test_or_basic", "TestSmokeBitwise::test_and_basic", "TestSmokeBitwise::test_xor_basic", "TestSmoke32Bit::test_or_16bit", "TestSmoke32Bit::test_and_16bit", "TestSmoke32Bit::test_xor_16bit"},
+        spec_section="BLOG_SPEC.md#bitwise-operations",
     )
 
 
@@ -317,6 +331,8 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         phase=11.05,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -380,6 +396,8 @@ def make_l11_alu_mul_bdtoge_op() -> Operation:
         phase=11.0,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -403,6 +421,8 @@ def make_l11_alu_mul_schoolbook_op() -> Operation:
         phase=11.1,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -426,6 +446,8 @@ def make_l11_alu_mul_carrypass1_op() -> Operation:
         phase=11.2,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -450,6 +472,8 @@ def make_l11_alu_mul_carrypass2_op() -> Operation:
         phase=11.3,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -475,6 +499,8 @@ def make_l11_alu_mul_carrypass3_op() -> Operation:
         phase=11.4,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -499,6 +525,8 @@ def make_l12_alu_mul_genprop_op() -> Operation:
         phase=12.0,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -523,6 +551,8 @@ def make_l12_alu_mul_binarylookahead_op() -> Operation:
         phase=12.1,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -546,6 +576,8 @@ def make_l12_alu_mul_finalcorrection_op() -> Operation:
         phase=12.2,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -571,6 +603,8 @@ def make_l12_alu_mul_getobd_op() -> Operation:
         phase=12.3,
         layer_idx=11,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_mul_basic", "TestSmoke32Bit::test_mul_overflow"},
+        spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
 
 
@@ -649,6 +683,8 @@ def make_alu_divmod_composite_ops():
             bake_fn=bake,
             layer_idx=10,
             migrated=True,
+            smoke_tests={"TestSmokeBasic::test_div_basic", "TestSmokeBasic::test_mod_basic"},
+            spec_section="BLOG_SPEC.md#division-implementation",
         )
 
     def make_longdiv():
@@ -666,6 +702,8 @@ def make_alu_divmod_composite_ops():
             bake_fn=bake,
             layer_idx=10,
             migrated=True,
+            smoke_tests={"TestSmokeBasic::test_div_basic", "TestSmokeBasic::test_mod_basic"},
+            spec_section="BLOG_SPEC.md#division-implementation",
         )
 
     def make_getobd():
@@ -683,6 +721,8 @@ def make_alu_divmod_composite_ops():
             bake_fn=bake,
             layer_idx=10,
             migrated=True,
+            smoke_tests={"TestSmokeBasic::test_div_basic", "TestSmokeBasic::test_mod_basic"},
+            spec_section="BLOG_SPEC.md#division-implementation",
         )
 
     def make_install():
@@ -701,6 +741,8 @@ def make_alu_divmod_composite_ops():
             bake_fn=bake,
             layer_idx=10,
             migrated=True,
+            smoke_tests={"TestSmokeBasic::test_div_basic", "TestSmokeBasic::test_mod_basic"},
+            spec_section="BLOG_SPEC.md#division-implementation",
         )
 
     return [make_bdtoge(), make_longdiv(), make_getobd(), make_install()]
@@ -761,6 +803,8 @@ def make_layer10_residual_alibi_slopes_op(alu_mode: str = 'lookup') -> Operation
         bake_fn=_bake,
         phase=999.1,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_div_basic", "TestSmokeBasic::test_mod_basic"},
+        spec_section="BLOG_SPEC.md#division-implementation",
     )
 
 
@@ -801,6 +845,8 @@ def make_l8_alu_addsub_bdtoge_op() -> Operation:
         writes=set(),
         kind="model",  # no-op model op; documentation only
         bake_fn=bake,
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#addition-implementation",
     )
 
 
@@ -820,6 +866,8 @@ def make_l8_alu_addsub_stage1_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#addition-implementation",
     )
 
 
@@ -841,6 +889,8 @@ def make_l8_alu_addsub_stage2_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#addition-implementation",
     )
 
 
@@ -860,6 +910,8 @@ def make_l8_alu_addsub_stage3_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#addition-implementation",
     )
 
 
@@ -879,5 +931,7 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#addition-implementation",
     )
 

@@ -132,6 +132,8 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         produces={
             "IO_FORMAT_POS": "AX_byte0",
         },
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 
@@ -157,6 +159,8 @@ def make_layer8_multibyte_fetch_op() -> Operation:
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
 
 
@@ -232,6 +236,8 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
             "AX_CARRY_LO": "AX_byte1",
             "AX_CARRY_HI": "AX_byte1",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
 
 
@@ -277,6 +283,8 @@ def make_layer8_multibyte_routing_op() -> Operation:
         # (phase=8.2) writes the 0-2022 cluster; this op holds the
         # per-layer max and dominates the dynamic-FFN allocation for L8.
         ffn_units_used=2055,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
 
 
@@ -301,6 +309,8 @@ def make_layer8_sp_gather_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -347,6 +357,8 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         layer_idx=8,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -450,6 +462,8 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#basic-arithmetic",
     )
 
 
@@ -517,6 +531,8 @@ def make_layer8_op_imm_relay_op() -> Operation:
         produces={
             "OP_IMM": "AX_byte1",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#c4-opcodes-and-how-they-are-implemented-in-c4",
     )
 
 
@@ -733,6 +749,8 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         layer_idx=8,
         migrated=True,
         claims=_claims,
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip", "TestSmokeMemory::test_sc_lc_roundtrip", "TestSmokeMemory::test_si_li_zero", "TestSmokeMemory::test_si_li_multiple_stores", "TestSmokeMemory::test_si_li_overwrite", "TestSmokeMemory::test_si_li_16bit_value"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 

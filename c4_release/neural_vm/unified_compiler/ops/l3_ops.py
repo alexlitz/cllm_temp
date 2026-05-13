@@ -96,6 +96,7 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI"},
         kind="ffn",
         bake_fn=bake,
+        smoke_tests={"all"},
     )
 
 
@@ -206,6 +207,8 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
@@ -250,6 +253,8 @@ def make_layer3_convo_io_state_init_op(
         layer_idx=3,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"TestSmokeHandlerStatus::test_neural_ops_no_handler", "TestSmokeHandlerStatus::test_handler_ops_have_handler"},
+        spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
 
 

@@ -63,6 +63,8 @@ def make_layer2_mem_byte_flags_op() -> Operation:
             "MEM_VAL_B2": "MEM_VAL_byte1",
             "MEM_VAL_B3": "MEM_VAL_byte2",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 
@@ -168,6 +170,8 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         # 8 and 9 -> max index 10. The aggregator takes the per-block max
         # across all annotated ops, so reporting 10 here covers both.
         ffn_units_used=10,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#baking-prompts-programs-into-the-transformer-weights",
     )
 
 
@@ -204,6 +208,8 @@ def make_layer2_threshold_attn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
@@ -254,6 +260,8 @@ def make_layer2_lookback_detection_head_op(
         layer_idx=2,
         bake_fn=bake,
         migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 

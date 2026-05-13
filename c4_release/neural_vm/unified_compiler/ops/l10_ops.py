@@ -19,6 +19,8 @@ def make_layer10_carry_relay_op() -> Operation:
         writes={"CARRY"},  # broadcast
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#addition-implementation",
     )
 
 
@@ -38,6 +40,8 @@ def make_layer10_byte_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -57,6 +61,8 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -75,6 +81,8 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -139,6 +147,8 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         produces={
             "CARRY": "AX_byte0",
         },
+        smoke_tests={"TestSmokeBasic::test_add_basic", "TestSmokeBasic::test_sub_basic", "TestSmoke32Bit::test_add_16bit", "TestSmoke32Bit::test_sub_16bit", "TestSmoke32Bit::test_add_carry_cascade", "TestSmoke32Bit::test_sub_borrow_cascade"},
+        spec_section="BLOG_SPEC.md#addition-implementation",
     )
 
 
@@ -190,6 +200,8 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -237,6 +249,8 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
             "OUTPUT_LO": "SP_byte0",
             "OUTPUT_HI": "SP_byte0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -283,6 +297,8 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
             "OUTPUT_LO": "STACK0_byte0",
             "OUTPUT_HI": "STACK0_byte0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -329,6 +345,8 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
             "ALU_LO": "AX_byte0",
             "ALU_HI": "AX_byte0",
         },
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -385,6 +403,8 @@ def make_layer10_alu_op() -> Operation:
         # setup units, reaching unit 1845. No other op writes to L10 FFN
         # so this op holds the per-layer width annotation.
         ffn_units_used=1846,
+        smoke_tests={"TestSmokeBitwise::test_or_basic", "TestSmokeBitwise::test_and_basic", "TestSmokeBitwise::test_xor_basic", "TestSmoke32Bit::test_or_16bit", "TestSmoke32Bit::test_and_16bit", "TestSmoke32Bit::test_xor_16bit"},
+        spec_section="BLOG_SPEC.md#bitwise-operations",
     )
 
 
@@ -404,6 +424,8 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 
@@ -467,6 +489,8 @@ def make_l10_post_ops_combined() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "CARRY"},
         kind="ffn",
         bake_fn=bake,
+        smoke_tests={"TestSmokeBasic::test_div_basic", "TestSmokeBasic::test_mod_basic"},
+        spec_section="BLOG_SPEC.md#division-implementation",
     )
 
 
@@ -570,6 +594,8 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         phase=10.7,
         layer_idx=10,
         migrated=True,
+        smoke_tests={"TestSmokeBasic::test_div_basic", "TestSmokeBasic::test_mod_basic"},
+        spec_section="BLOG_SPEC.md#division-implementation",
     )
 
 
