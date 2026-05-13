@@ -87,6 +87,15 @@ def make_layer15_nibble_copy_op() -> Operation:
         #   16 LO copy + 16 HI copy + 2 PSH SP byte0 + 2 PSH SP byte1 +
         #   2 PSH SP byte2 + 2 LEA first-step AX byte2 = 40.
         ffn_units_used=40,
+        # Staleness invariants: the dominant write is EMBED -> OUTPUT at
+        # STACK0 byte positions during PSH (bytes 0/1/2 of SP/AX get copied
+        # to STACK0 byte slots). Canonical register: STACK0_byte0 — the same
+        # nibble-copy shape applies at STACK0_byte1/2 by symmetry; the LEA
+        # first-step AX byte 2 path is a secondary minority writer.
+        produces={
+            "OUTPUT_LO": "STACK0_byte0",
+            "OUTPUT_HI": "STACK0_byte0",
+        },
     )
 
 

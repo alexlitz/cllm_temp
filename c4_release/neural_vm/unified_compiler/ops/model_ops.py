@@ -131,6 +131,18 @@ def make_function_call_weights_op() -> Operation:
         # layer_idx field doesn't affect their bake execution.
         layer_idx=6,
         ffn_units_used=2278,
+        # Staleness invariants: the function-call relay heads write the
+        # canonical saved-register relays at STACK0 (ENT stores old_BP via
+        # L5 head 5; JSR stores return-PC via L6 head 7 into AX_CARRY) and
+        # at BP (ENT stores old_SP via L5 head 6 into TEMP). Pick STACK0
+        # as the canonical register for the AX_CARRY-shaped JSR-return-PC
+        # relay; BP for the SP-saving ENT path is documented in the
+        # docstring but only single-register produces is supported.
+        produces={
+            "AX_CARRY_LO": "STACK0",
+            "AX_CARRY_HI": "STACK0",
+            "TEMP": "STACK0",
+        },
     )
 
 
@@ -192,6 +204,26 @@ def make_opcode_relay_head_op() -> Operation:
         bake_fn=bake,
         phase=1002,
         migrated=True,
+        # Staleness invariants: L6 attn head 6 attends to AX marker from
+        # SP/STACK0/BP/PC/MEM markers and copies scaled opcode flags + relays.
+        # The head's V slots write CMP/OP_LEV/OP_JSR/OP_ENT/PSH_AT_SP +
+        # MEM_STORE/MEM_ADDR_SRC at those query markers. Annotating the
+        # most consumer-relevant produces below; the marker chosen is the
+        # downstream consumer's site of read.
+        produces={
+            # CMP[0..4] relays (PSH/ADJ/POP-group/ENT/JSR) used by L6 FFN
+            # at SP, STACK0, BP positions.
+            "CMP": "STACK0",
+            "PSH_AT_SP": "SP",
+            "OP_JSR": "STACK0",
+            "OP_ENT": "STACK0",
+            # OP_LEV relay needed at PC marker by L9 PC restoration and L15
+            # heads 8-11, plus L16 LEV routing.
+            "OP_LEV": "PC",
+            # MEM-store flag relays at MEM marker for L13/L14 stores.
+            "MEM_STORE": "MEM",
+            "MEM_ADDR_SRC": "MEM",
+        },
     )
 
 

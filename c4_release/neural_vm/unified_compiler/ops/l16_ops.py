@@ -28,6 +28,15 @@ def make_layer16_lev_routing_op() -> Operation:
         #   3 (set OUTPUT_LO[0] byte 1-3) + 3 (set OUTPUT_HI[0] byte 1-3)
         #   = 121. The bytes 1-3 blocks (if False) are disabled.
         ffn_units_used=121,
+        # Staleness invariants: on OP_LEV, this FFN writes SP=BP+16 nibbles
+        # to OUTPUT at MARK_SP and the return PC (TEMP) to OUTPUT at MARK_PC.
+        # Canonical register: SP — the SP-marker emission is the primary
+        # consumer-facing output (the PC-marker return-address emission shares
+        # the same OUTPUT_LO/HI write pattern with a parallel set of units).
+        produces={
+            "OUTPUT_LO": "SP",
+            "OUTPUT_HI": "SP",
+        },
     )
 
 

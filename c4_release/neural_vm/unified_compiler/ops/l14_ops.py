@@ -125,6 +125,14 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        # Staleness invariants: boosts OUTPUT[0] at STACK0 byte positions to
+        # counter attention bleed from L14 mem_generation. Canonical
+        # register: STACK0_byte0 (representative of the byte slots being
+        # corrected; the same shape applies at byte 1/2/3 by symmetry).
+        produces={
+            "OUTPUT_LO": "STACK0_byte0",
+            "OUTPUT_HI": "STACK0_byte0",
+        },
     )
 
 
@@ -197,6 +205,15 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        # Staleness invariants: at AX byte positions 1/2/3 (gated by OP_JSR
+        # + IS_BYTE + H1[AX]) this op writes +5/S to OUTPUT_LO[0]/OUTPUT_HI[0]
+        # so the byte-value-0 token wins argmax (AX bytes 1-3 = 0x00).
+        # Picking AX_byte1 as the canonical produces register — the residual
+        # write is the same shape at AX_byte2/AX_byte3 by symmetry.
+        produces={
+            "OUTPUT_LO": "AX_byte1",
+            "OUTPUT_HI": "AX_byte1",
+        },
     )
 
 
@@ -252,6 +269,14 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         # sufficient — the compiler aggregates per-layer max across all
         # ops, so this single annotation suffices for L14 dynamic sizing.
         ffn_units_used=1311,
+        # Staleness invariants: at AX byte positions 1/2/3 (gated by TEMP[7] =
+        # NOCARRY_ALU_OP relay, IS_BYTE + H1[AX], BYTE_INDEX_0 blocker) write
+        # +5/S to OUTPUT_LO[0]/OUTPUT_HI[0] so AX bytes 1-3 emit 0x00 for
+        # AND/OR/XOR/SHR. Canonical register: AX_byte1.
+        produces={
+            "OUTPUT_LO": "AX_byte1",
+            "OUTPUT_HI": "AX_byte1",
+        },
     )
 
 
@@ -299,6 +324,14 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        # Staleness invariants: mirrors layer14_jsr_ax_bytes_zero — at AX byte
+        # positions 1/2/3 (gated by OP_LC_RELAY + IS_BYTE + H1[AX], BYTE_INDEX_0
+        # blocker) write +5/S to OUTPUT_LO[0]/OUTPUT_HI[0] so byte-value-0
+        # tokens win argmax. Canonical register: AX_byte1.
+        produces={
+            "OUTPUT_LO": "AX_byte1",
+            "OUTPUT_HI": "AX_byte1",
+        },
     )
 
 

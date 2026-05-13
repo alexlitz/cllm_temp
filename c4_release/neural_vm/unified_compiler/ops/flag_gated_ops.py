@@ -61,6 +61,13 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
         bake_fn=bake,
         phase=998.8,
         migrated=True,
+        # Staleness invariants: L5 FFN units 400-405 decode IO opcodes at
+        # the AX marker and set IO_IS_TOOL_CALL when an IO opcode is active.
+        # No-op unless ``enable_tool_calling=True`` — under default config
+        # this op is inert and the produces annotation documents intent.
+        produces={
+            "IO_IS_TOOL_CALL": "AX",
+        },
     )
 
 
@@ -101,6 +108,14 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
         bake_fn=bake,
         layer_idx=5,
         migrated=True,
+        # Staleness invariants: L5 FFN units 410-411 decode PRTF/READ
+        # opcodes at the AX marker. No-op unless
+        # ``enable_conversational_io=True`` — under default config the
+        # op is inert and the produces annotation documents intent.
+        produces={
+            "IO_IS_PRTF": "AX",
+            "IO_IS_READ": "AX",
+        },
     )
 
 
@@ -149,6 +164,13 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
         bake_fn=bake,
         phase=998.8,
         migrated=True,
+        # Staleness invariants: L6 attn head 5 attends from the SE position
+        # back to the AX marker and relays IO_IS_TOOL_CALL forward so the
+        # SE/MEM-marker FFN can branch on it. Inert by default
+        # (``enable_tool_calling=False``).
+        produces={
+            "IO_IS_TOOL_CALL": "STEP_END",
+        },
     )
 
 
@@ -202,6 +224,14 @@ def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Oper
         kind="model",
         bake_fn=bake,
         migrated=True,
+        # Staleness invariants: L6 attn heads 4 (PRTF) + 5 (READ) relay
+        # IO_IS_PRTF / IO_IS_READ from the AX marker to the SE position
+        # for downstream FFN state-machine branching. Inert by default
+        # (``enable_conversational_io=False``).
+        produces={
+            "IO_IS_PRTF": "STEP_END",
+            "IO_IS_READ": "STEP_END",
+        },
     )
 
 
@@ -238,6 +268,12 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
         bake_fn=bake,
         phase=998.8,
         migrated=True,
+        # Staleness invariants: L6 FFN unit 1300 fires on CMP[2]+NEXT_SE
+        # at the SE position and writes NEXT_TOOL_CALL. Inert by default
+        # (``enable_tool_calling=False``).
+        produces={
+            "NEXT_TOOL_CALL": "STEP_END",
+        },
     )
 
 
@@ -280,6 +316,14 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        # Staleness invariants: L6 FFN units 1400-1401 fire at the SE
+        # position (CMP[5]/CMP[6] + NEXT_SE) and emit NEXT_THINKING_END
+        # + suppress NEXT_SE + set IO_STATE = 1. Inert by default
+        # (``enable_conversational_io=False``).
+        produces={
+            "NEXT_THINKING_END": "STEP_END",
+            "IO_STATE": "STEP_END",
+        },
     )
 
 
@@ -363,6 +407,15 @@ def make_null_terminator_detection_op(
             1865 if (enable_conversational_io and alu_mode == "lookup")
             else None
         ),
+        # Staleness invariants: L10 FFN unit 1864 detects OUTPUT_BYTE == 0
+        # while IO_IN_OUTPUT_MODE is active and emits the
+        # IO_OUTPUT_COMPLETE / NEXT_THINKING_START transition at the SE
+        # position (last token in the step). Inert by default
+        # (``enable_conversational_io=False`` or efficient ALU mode).
+        produces={
+            "IO_OUTPUT_COMPLETE": "STEP_END",
+            "NEXT_THINKING_START": "STEP_END",
+        },
     )
 
 
@@ -654,5 +707,13 @@ def make_conversational_io_output_routing_op(
         # 1232-unit allocation in that mode. In lookup mode the L15 FFN
         # falls back to ``layer15_nibble_copy``'s 40 units.
         ffn_units_used=1232 if enable_conversational_io else None,
+        # Staleness invariants: L15 FFN copies OUTPUT_BYTE nibbles to
+        # OUTPUT nibbles when IO_IN_OUTPUT_MODE is set, so the fetched
+        # format-string byte emits through the output head at byte 0.
+        # Inert by default (``enable_conversational_io=False``).
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI": "AX_byte0",
+        },
     )
 
