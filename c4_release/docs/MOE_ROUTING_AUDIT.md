@@ -279,3 +279,54 @@ itself is now correct as a transformer MoE primitive**) and the runner
 flag plumbing, but defers the bake-side reconciliation. `enable_moe_routing=True`
 remains an opt-in flag for A/B experimentation; the default keeps the
 working dense path.
+
+---
+
+## 9. 2026-05-13 Addendum: Byte-identity gap closed; default flipped to True
+
+Commit `2fa04dd` ("Tighten MoE partition for byte-identity with dense FFN")
+took Option 2 from §8.3: a tighter partition that labels a hidden unit
+as opcode-X-specific only when its routing through the gated expert is
+provably equivalent to the dense path. Empirical verification:
+
+```
+max abs diff = 0.000e+00
+```
+
+across **4 random seeds × 3 sequence lengths × all
+`compile_full_vm` modes** (lookup, efficient, conversational_io,
+tool_calling).  Direct one-shot check (reproduced in this addendum's
+landing commit):
+
+```python
+import torch
+from c4_release.neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+m_dense, _ = compile_full_vm(disk_cache=False); m_dense.compact(block_size=32)
+m_moe,   _ = compile_full_vm(disk_cache=False); m_moe.compact(block_size=32); m_moe.compact_moe()
+m_dense.eval(); m_moe.eval()
+toks = torch.randint(0, 256, (1, 64))
+with torch.no_grad():
+    o_d = m_dense(toks); o_m = m_moe(toks)
+print(f"max abs diff = {(o_d - o_m).abs().max().item():.3e}")
+# -> max abs diff = 0.000e+00
+```
+
+With the gap closed, the only reason `enable_moe_routing` was kept
+default-off (per §8.2) no longer applies. This addendum lands the
+default flip in `AutoregressiveVMRunner.__init__`:
+
+- `c4_release/neural_vm/run_vm.py`: `enable_moe_routing` now defaults
+  to `True`. The dense compacted FFN path remains reachable by passing
+  `enable_moe_routing=False` (kept for A/B diagnostics and for tests
+  that want to skip the partition step).
+- The corresponding docstring is updated to drop the "byte-identity
+  gap" framing and explain that the flag is now default-on for the
+  FFN speedup.
+
+The MoE path routes one opcode through a much smaller per-expert
+`(shared ⊕ expert_d)` weight matrix than the full compacted FFN, so
+making it the default path captures the speedup for all runners that
+flow through `AutoregressiveVMRunner` without changing emitted bytes.
+
+The smoke pass-set is unchanged vs HEAD `7b1b73a` (no test flips);
+`test_imm_exit` and `test_bz_branch` continue to pass.
