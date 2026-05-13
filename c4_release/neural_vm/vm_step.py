@@ -1474,12 +1474,17 @@ class AutoregressiveVM(nn.Module):
             )
             if not opcode_to_units:
                 continue
+            # The tightener zeroes every OP_* and CMP-relay dim on its
+            # synthetic batch; pass the full ranges or relay-mapped units
+            # would look dirty just because their relay dim is non-zero.
             soft_moe = build_soft_moe_from_compact_partition(
                 ffn,
                 opcode_to_units=opcode_to_units,
                 shared_indices=shared_indices,
                 dim=ffn.W_up.shape[1],
                 pure_neural=pure_neural,
+                opcode_dims_all=list(opcode_range),
+                relay_dims=list(relay.keys()) if relay else (),
             )
             block.ffn = soft_moe.to(device=ffn.W_up.device, dtype=ffn.W_up.dtype)
 
