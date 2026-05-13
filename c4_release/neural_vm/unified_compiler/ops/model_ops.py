@@ -32,6 +32,11 @@ def make_io_putchar_routing_op() -> Operation:
         bake_fn=bake,
         phase=998,
         migrated=True,
+        # Tier A opcode gating: every unit reads W_up[OP_PUTCHAR] (see
+        # _set_io_putchar_routing in vm_step.py:7433). Sets the
+        # IO_IS_PUTCHAR flag and routes AX_CARRY -> OUTPUT only when
+        # PUTCHAR is the active opcode.
+        opcodes={"OP_PUTCHAR"},
     )
 
 

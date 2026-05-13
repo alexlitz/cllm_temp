@@ -1138,13 +1138,40 @@ _ADD_CASCADE_PROGRAM = [
 ]
 
 
+def _step_active_opcode(program: List[int], step_idx: int, vm) -> Optional[str]:
+    """Return the ``OP_<NAME>`` string for the opcode executed at ``step_idx``.
+
+    Reads the program slot at the VM's *previous* ``idx`` (the opcode that
+    just executed when the caller invoked ``vm.step()`` returning True).
+    Used by the opcode-gating helper to know which OP_* dim should be
+    "active" at a given step so the verifier can skip produces/requires
+    checks on ops gated to a different opcode.
+
+    Returns ``None`` when the program ran out of static instructions (e.g.
+    after EXIT or off-program PC). Callers treat ``None`` as "unknown" and
+    fall back to running the full check (no gating).
+    """
+    from .ops.shared import _opcode_name_map
+    # vm.idx points one past the last-executed instruction (DraftVM
+    # increments idx in ``step()``); ``vm.idx - 1`` is the instruction
+    # whose opcode the just-finished step ran. Memory-execution paths
+    # (vm.idx == len(code)) fall back to None — we don't try to decode
+    # opcodes from memory for the gating heuristic.
+    last_idx = vm.idx - 1
+    if last_idx < 0 or last_idx >= len(program):
+        return None
+    op_val = program[last_idx] & 0xFF
+    return _opcode_name_map().get(op_val)
+
+
 def _build_multistep_probe(
     layout,
     program: List[int],
     n_steps: int,
-) -> Tuple[torch.Tensor, List[Dict[str, int]], List[str]]:
+) -> Tuple[torch.Tensor, List[Dict[str, int]], List[str], List[Optional[str]]]:
     """Build a multi-step token sequence: bytecode + n_steps of DraftVM-emitted
-    step tokens. Returns ``(token_tensor, step_markers, step_summaries)``.
+    step tokens. Returns ``(token_tensor, step_markers, step_summaries,
+    step_active_opcodes)``.
 
     ``token_tensor`` has shape ``[1, T]`` with T = header_len + n_steps * 35.
 
@@ -1156,6 +1183,12 @@ def _build_multistep_probe(
 
     ``step_summaries[k]`` is a short human-readable string of the step's
     register state (e.g. ``"PC=8 AX=10 SP=ffffffff"``).
+
+    ``step_active_opcodes[k]`` is the ``"OP_<NAME>"`` string for the opcode
+    executed at step k (or ``None`` if the step ran off-program / from
+    memory). Used by the opcode-gating helper in the produces/requires
+    verifiers so they skip checks on ops whose ``opcodes`` set does not
+    include the step's active opcode.
 
     Note: this builder leverages ``DraftVM`` from ``speculative.py`` as
     a ground-truth oracle for the per-step token bytes. We do NOT feed
@@ -1181,12 +1214,14 @@ def _build_multistep_probe(
     vm = DraftVM(program)
     step_markers: List[Dict[str, int]] = []
     step_summaries: List[str] = []
+    step_active_opcodes: List[Optional[str]] = []
     for k in range(n_steps):
         if not vm.step():
             # VM halted before n_steps; pad with HALT tokens so callers
             # see the cap was reached, but mark these slots as such.
             step_markers.append({})
             step_summaries.append("(halted)")
+            step_active_opcodes.append(None)
             tokens.extend([Token.HALT] * 35)
             continue
         step_tokens = vm.draft_tokens()
@@ -1200,10 +1235,34 @@ def _build_multistep_probe(
             f"PC={vm.pc:x} AX={vm.ax:x} SP={vm.sp:x} "
             f"BP={vm.bp:x} STK0={vm._mem_read(vm.sp):x}"
         )
+        step_active_opcodes.append(_step_active_opcode(program, k, vm))
         tokens.extend(step_tokens)
 
     token_tensor = torch.tensor([tokens], dtype=torch.long)
-    return token_tensor, step_markers, step_summaries
+    return token_tensor, step_markers, step_summaries, step_active_opcodes
+
+
+def _op_active_at_step(op: Operation, active_opcode: Optional[str]) -> bool:
+    """Return whether ``op`` should fire on a step where ``active_opcode``
+    is the executing opcode.
+
+    Auto-gating rule:
+      - If ``op.opcodes`` is empty -> the op is "always-on" (e.g. L0-L3
+        emission band, PC update). Returns True.
+      - If ``active_opcode`` is None (unknown / off-program) -> return True
+        (be conservative; don't suppress drift on ambiguous steps).
+      - Otherwise -> return ``active_opcode in op.opcodes``.
+
+    This is the load-bearing helper for the produces/requires auto-gating:
+    when the active opcode doesn't activate the op, the op's
+    ``produces``/``requires`` declarations should not be expected to fire
+    (a missing produces dim is benign, not drift).
+    """
+    if not op.opcodes:
+        return True
+    if active_opcode is None:
+        return True
+    return active_opcode in op.opcodes
 
 
 def verify_produces_consumes_multistep(
@@ -1288,7 +1347,8 @@ def verify_produces_consumes_multistep(
 
     # Build the multistep probe + run the model.
     try:
-        token_tensor, step_markers, step_summaries = _build_multistep_probe(
+        (token_tensor, step_markers, step_summaries,
+         step_active_opcodes) = _build_multistep_probe(
             layout, program, n_steps,
         )
     except Exception as exc:
@@ -1367,6 +1427,16 @@ def verify_produces_consumes_multistep(
                 # Step was unreachable (VM halted earlier). Don't flag.
                 continue
             step_k = step_idx + 1  # 1-indexed for reporting
+            # Opcode auto-gating: skip the produces check when the op
+            # declares ``opcodes`` and the step's active opcode is not in
+            # the declared set. Ops with empty ``opcodes`` are always
+            # checked. See ``_op_active_at_step``.
+            active_opcode = (
+                step_active_opcodes[step_idx]
+                if step_idx < len(step_active_opcodes) else None
+            )
+            if not _op_active_at_step(op, active_opcode):
+                continue
             for dim_name, register in op.produces.items():
                 # Skip sentinel keys in mixed produces dicts.
                 if dim_name in _SENTINEL_PRODUCES:
@@ -1556,7 +1626,7 @@ def verify_reset_after_step(
         return report
 
     try:
-        token_tensor, step_markers, _ = _build_multistep_probe(
+        token_tensor, step_markers, _, _ = _build_multistep_probe(
             layout, program, n_steps,
         )
     except Exception as exc:
@@ -1710,7 +1780,8 @@ def verify_requires(
         return report
 
     try:
-        token_tensor, step_markers, _ = _build_multistep_probe(
+        (token_tensor, step_markers, _,
+         step_active_opcodes) = _build_multistep_probe(
             layout, program, n_steps,
         )
     except Exception as exc:
@@ -1761,6 +1832,16 @@ def verify_requires(
                 if not marker_map:
                     continue
                 step_k = step_idx + 1
+                # Opcode auto-gating: skip the requires check when the op
+                # declares ``opcodes`` and the step's active opcode is not
+                # in the declared set. Ops with empty ``opcodes`` are
+                # always checked. See ``_op_active_at_step``.
+                active_opcode = (
+                    step_active_opcodes[step_idx]
+                    if step_idx < len(step_active_opcodes) else None
+                )
+                if not _op_active_at_step(op, active_opcode):
+                    continue
                 if kind == "within_one_step":
                     # The op's natural anchor is the AX marker; the
                     # "within one step" window is the 35 tokens ending

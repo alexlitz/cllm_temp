@@ -152,6 +152,11 @@ def make_layer9_lev_addr_relay_op() -> Operation:
             "ADDR_B0_LO": "REG_SP",
             "ADDR_B0_HI": "REG_SP",
         },
+        # Tier A opcode gating: head 0 Q reads MARK_SP AND OP_LEV (see
+        # _set_layer9_lev_addr_relay). The relay fires only when OP_LEV
+        # is active at the SP marker -- it stages the BP byte 0 for L16's
+        # LEV SP = BP + 16 computation. Other opcodes leave head 0 silent.
+        opcodes={"OP_LEV"},
     )
 
 
@@ -211,6 +216,11 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
             "ADDR_B0_LO": "REG_PC",
             "ADDR_B0_HI": "REG_PC",
         },
+        # Tier A opcode gating: head 1 Q reads MARK_PC AND OP_LEV (see
+        # _set_layer9_lev_bp_to_pc_relay). The relay fires only when OP_LEV
+        # is active and stages the return-address byte for the next PC
+        # prediction. Other opcodes leave head 1 silent.
+        opcodes={"OP_LEV"},
     )
 
 

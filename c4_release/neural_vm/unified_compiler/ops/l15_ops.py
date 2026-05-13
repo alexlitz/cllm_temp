@@ -65,6 +65,13 @@ def make_layer15_memory_lookup_op() -> Operation:
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
         },
+        # Tier A opcode gating: heads 0-3 Q reads gate on OP_LI/OP_LC
+        # (and their AX-byte relays). The lookup also fires on the POP
+        # path for binary ALU ops via the *SP-read at STACK0 byte positions,
+        # but that fires regardless of opcode (it's a structural read).
+        # Declare the LI/LC activation set since those are the gating
+        # opcodes for the AX-byte0 load destination.
+        opcodes={"OP_LI", "OP_LC"},
     )
 
 

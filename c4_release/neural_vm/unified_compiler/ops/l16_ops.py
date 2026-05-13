@@ -37,6 +37,11 @@ def make_layer16_lev_routing_op() -> Operation:
             "OUTPUT_LO": "SP",
             "OUTPUT_HI": "SP",
         },
+        # Tier A opcode gating: every unit reads W_up[OP_LEV] (see
+        # _set_layer16_lev_routing in vm_step.py:6845). The FFN fires only
+        # when OP_LEV is active and computes SP=BP+16 plus the return-PC
+        # emission. Other opcodes leave all 121 units silent.
+        opcodes={"OP_LEV"},
     )
 
 
