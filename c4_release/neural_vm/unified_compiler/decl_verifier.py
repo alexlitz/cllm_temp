@@ -1316,6 +1316,563 @@ def verify_produces_consumes_multistep(
 
 
 # ---------------------------------------------------------------------------
+# Tier A annotation detectors: reset_after_step, requires, opcode coverage.
+#
+# These supplement the Mode A (static claim) and Mode B/B+ (dynamic
+# produces/consumes) verifiers with cascade-bug-targeted checks introduced
+# in 2026-05-13 to debug the L6/L10 STACK0 byte-relay cascade. Each
+# detector reads Tier A annotations on ``Operation`` (``reset_after_step``,
+# ``requires``, ``opcodes``) and reports drift entries when the
+# annotation's invariant fails to hold against the multi-step probe's
+# residual stream (for reset/requires) or against the compiler's op
+# registry (for opcode coverage).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TierADriftEntry:
+    """A single (op, step, dim, kind) drift observation for the Tier A
+    detectors (``verify_reset_after_step`` / ``verify_requires``).
+
+    ``kind`` is ``"reset_after_step"`` or ``"requires:<constraint>"``.
+    """
+    op_name: str
+    step: int  # 1-indexed step within the n_steps run
+    dim: str
+    kind: str
+    position: int  # token position inspected
+    observed: float  # abs-max residual value at the position (or 0 if absent)
+
+
+@dataclass
+class TierAReport:
+    """Aggregate per-detector report. Mirrors ``MultistepVerificationReport``
+    shape for easy interop with the existing multistep pipeline.
+    """
+    detector: str  # "reset_after_step" or "requires"
+    n_steps: int = 0
+    drift: List[TierADriftEntry] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    def has_drift(self) -> bool:
+        return bool(self.drift)
+
+    def format(self) -> str:
+        lines = [
+            f"=== Tier A {self.detector} verification report ===",
+            f"Steps inspected: {self.n_steps}",
+            f"Drift entries: {len(self.drift)}",
+        ]
+        for d in self.drift:
+            lines.append(
+                f"  DRIFT: op={d.op_name!r} step={d.step} "
+                f"dim={d.dim!r} kind={d.kind!r} "
+                f"pos={d.position} observed_abs_max={d.observed:.3e}"
+            )
+        for n in self.notes:
+            lines.append(f"  NOTE: {n}")
+        return "\n".join(lines)
+
+
+def _run_multistep_forward(model, token_tensor):
+    """Run a forward pass capturing per-layer residuals.
+
+    Returns ``per_layer_residuals`` -- a list of length ``n_layers + 1``
+    where index 0 is the embedding output and index k+1 is the output
+    after block k. Returns ``None`` on error (caller adds a note).
+    """
+    try:
+        with torch.no_grad():
+            x = model.embed(token_tensor)
+            per_layer_residuals = [x.detach().clone()]
+            for block in model.blocks:
+                x = block(x)
+                per_layer_residuals.append(x.detach().clone())
+        return per_layer_residuals
+    except Exception:
+        return None
+
+
+def verify_reset_after_step(
+    model=None,
+    layout=None,
+    program: Optional[List[int]] = None,
+    n_steps: int = 4,
+    *,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    S: float = 100.0,
+    n_heads: int = 8,
+    epsilon: float = 1e-2,
+) -> TierAReport:
+    """Multi-step check on ``Operation.reset_after_step`` declarations.
+
+    For each op with a non-empty ``reset_after_step`` set, runs the
+    compiled model over a context with ``n_steps`` of real VM step tokens
+    and inspects the residual at the START of each step (the REG_PC
+    marker token position, offset 0 in the 35-token step block) AFTER the
+    op's layer has run. Any non-zero value in a ``reset_after_step`` dim
+    at that pre-block position is a drift entry — the dim leaked across
+    the step boundary instead of being reset by L0/L1 emission.
+
+    The detector inspects the residual at step k's REG_PC position on
+    the layer immediately AFTER the annotated op (so the op's writes are
+    visible). Step 1 is the canonical "fresh start" reference; later
+    steps are where the leakage shows up.
+
+    Returns a ``TierAReport`` with one drift entry per (op, step, dim)
+    violation. An empty report means every annotated reset is honored.
+    """
+    if program is None:
+        program = list(_ADD_CASCADE_PROGRAM)
+
+    report = TierAReport(detector="reset_after_step", n_steps=n_steps)
+
+    if model is None or layout is None:
+        from .full_vm_compiler import compile_full_vm
+        try:
+            model, layout = compile_full_vm(
+                S=S,
+                alu_mode=alu_mode,
+                enable_conversational_io=enable_conversational_io,
+                n_heads=n_heads,
+            )
+        except Exception as exc:
+            report.notes.append(f"compile failed: {exc!r}")
+            return report
+
+    candidates = _collect_unique_ops_with(
+        layout, lambda op: bool(op.reset_after_step)
+    )
+    if not candidates:
+        report.notes.append("no ops declare reset_after_step")
+        return report
+
+    try:
+        token_tensor, step_markers, _ = _build_multistep_probe(
+            layout, program, n_steps,
+        )
+    except Exception as exc:
+        report.notes.append(f"could not construct multistep probe: {exc!r}")
+        return report
+
+    max_len = getattr(model, "max_seq_len", None)
+    if max_len is not None and token_tensor.shape[1] > max_len:
+        report.notes.append(
+            f"context len {token_tensor.shape[1]} exceeds model "
+            f"max_seq_len {max_len}"
+        )
+        return report
+
+    per_layer_residuals = _run_multistep_forward(model, token_tensor)
+    if per_layer_residuals is None:
+        report.notes.append("forward pass failed")
+        return report
+
+    for op in candidates:
+        layer_idx = _resolve_op_layer(layout, op)
+        if layer_idx is None or layer_idx + 1 >= len(per_layer_residuals):
+            inspect_layer = len(per_layer_residuals) - 1
+        else:
+            inspect_layer = layer_idx + 1
+        post_residual = per_layer_residuals[inspect_layer]
+
+        for step_idx, marker_map in enumerate(step_markers):
+            if not marker_map:
+                continue
+            step_k = step_idx + 1
+            # Inspect the REG_PC position (step start) for each declared
+            # reset dim. Step 1 is the baseline -- a non-zero reset dim
+            # there is suspicious too but doesn't indicate leakage, just a
+            # buggy initialization. We still flag it for completeness.
+            pos = marker_map["REG_PC"]
+            for dim_name in op.reset_after_step:
+                if dim_name not in layout.dim_positions:
+                    report.notes.append(
+                        f"op={op.name!r} step={step_k}: reset dim "
+                        f"{dim_name!r} not in layout"
+                    )
+                    continue
+                d_start = layout.dim_positions[dim_name]
+                d_size = layout.dim_sizes.get(dim_name, 1)
+                slice_vals = post_residual[0, pos, d_start:d_start + d_size]
+                obs_abs = float(slice_vals.abs().max().item())
+                if obs_abs >= epsilon:
+                    report.drift.append(TierADriftEntry(
+                        op_name=op.name,
+                        step=step_k,
+                        dim=dim_name,
+                        kind="reset_after_step",
+                        position=pos,
+                        observed=obs_abs,
+                    ))
+
+    return report
+
+
+# Mapping from a marker-name suffix in ``set_at_<MARKER>`` to the step
+# offset table used by the requires detector. We accept the canonical
+# 4-register markers (AX/SP/PC/BP) plus STACK0 / MEM.
+_MARKER_OFFSETS = {
+    "AX": _STEP_TOKEN_OFFSETS["REG_AX"],
+    "SP": _STEP_TOKEN_OFFSETS["REG_SP"],
+    "PC": _STEP_TOKEN_OFFSETS["REG_PC"],
+    "BP": _STEP_TOKEN_OFFSETS["REG_BP"],
+    "STACK0": _STEP_TOKEN_OFFSETS["STACK0"],
+    "MEM": _STEP_TOKEN_OFFSETS["MEM"],
+}
+
+
+def _parse_requires_constraint(constraint: str) -> Tuple[str, Optional[str], Optional[int]]:
+    """Parse a ``requires`` constraint string.
+
+    Returns ``(kind, marker, value)``:
+      - ``("within_one_step", None, None)`` for the lookback constraint.
+      - ``("set_at_<MARKER>", marker_name, None)`` for set-at constraints.
+      - ``("set_at_<MARKER>", marker_name, value)`` for ``"<int>:set_at_X"``.
+      - ``("unknown", None, None)`` if the constraint can't be parsed.
+    """
+    value: Optional[int] = None
+    rest = constraint
+    if ":" in constraint:
+        prefix, rest = constraint.split(":", 1)
+        try:
+            value = int(prefix)
+        except ValueError:
+            return ("unknown", None, None)
+    if rest == "within_one_step":
+        return ("within_one_step", None, value)
+    if rest.startswith("set_at_"):
+        marker = rest[len("set_at_"):]
+        if marker in _MARKER_OFFSETS:
+            return (rest, marker, value)
+    return ("unknown", None, None)
+
+
+def verify_requires(
+    model=None,
+    layout=None,
+    program: Optional[List[int]] = None,
+    n_steps: int = 4,
+    *,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    S: float = 100.0,
+    n_heads: int = 8,
+    epsilon: float = 1e-2,
+) -> TierAReport:
+    """Multi-step check on ``Operation.requires`` declarations.
+
+    For each op with non-empty ``requires``, runs the model and inspects
+    the residual just BEFORE the op's layer (i.e. on the layer ``layer_idx``
+    pre-block residual) at the position implied by the constraint:
+
+      - ``"within_one_step"``: look at the 35 tokens preceding the AX
+        marker; the dim must be non-zero at SOME position in that window.
+      - ``"set_at_<MARKER>"``: the dim must be non-zero at the named
+        marker (AX/SP/PC/BP/STACK0/MEM) for the inspected step.
+      - ``"<value>:set_at_<MARKER>"``: same, but additionally the residual
+        slice must encode the integer ``<value>`` (lo nibble; we use a
+        loose ``abs(byte0_value - value) < 0.5`` check).
+
+    Violations are recorded as drift entries on the inspection step. As
+    with reset_after_step, we sample each step the multistep probe drives.
+    """
+    if program is None:
+        program = list(_ADD_CASCADE_PROGRAM)
+
+    report = TierAReport(detector="requires", n_steps=n_steps)
+
+    if model is None or layout is None:
+        from .full_vm_compiler import compile_full_vm
+        try:
+            model, layout = compile_full_vm(
+                S=S,
+                alu_mode=alu_mode,
+                enable_conversational_io=enable_conversational_io,
+                n_heads=n_heads,
+            )
+        except Exception as exc:
+            report.notes.append(f"compile failed: {exc!r}")
+            return report
+
+    candidates = _collect_unique_ops_with(layout, lambda op: bool(op.requires))
+    if not candidates:
+        report.notes.append("no ops declare requires")
+        return report
+
+    try:
+        token_tensor, step_markers, _ = _build_multistep_probe(
+            layout, program, n_steps,
+        )
+    except Exception as exc:
+        report.notes.append(f"could not construct multistep probe: {exc!r}")
+        return report
+
+    max_len = getattr(model, "max_seq_len", None)
+    if max_len is not None and token_tensor.shape[1] > max_len:
+        report.notes.append(
+            f"context len {token_tensor.shape[1]} exceeds model "
+            f"max_seq_len {max_len}"
+        )
+        return report
+
+    per_layer_residuals = _run_multistep_forward(model, token_tensor)
+    if per_layer_residuals is None:
+        report.notes.append("forward pass failed")
+        return report
+
+    for op in candidates:
+        layer_idx = _resolve_op_layer(layout, op)
+        # Inspect the residual just BEFORE the op runs: that's the output
+        # of the previous block, which is index ``layer_idx`` in our
+        # per_layer_residuals list (0 = embed, k+1 = post-block k).
+        if layer_idx is None:
+            inspect_layer = 0
+        else:
+            inspect_layer = min(layer_idx, len(per_layer_residuals) - 1)
+        pre_residual = per_layer_residuals[inspect_layer]
+
+        for dim_name, constraint in op.requires.items():
+            if dim_name not in layout.dim_positions:
+                report.notes.append(
+                    f"op={op.name!r}: requires dim {dim_name!r} not in layout"
+                )
+                continue
+            kind, marker, value = _parse_requires_constraint(constraint)
+            if kind == "unknown":
+                report.notes.append(
+                    f"op={op.name!r}: requires[{dim_name!r}]={constraint!r} "
+                    f"not parseable; skipping"
+                )
+                continue
+            d_start = layout.dim_positions[dim_name]
+            d_size = layout.dim_sizes.get(dim_name, 1)
+
+            for step_idx, marker_map in enumerate(step_markers):
+                if not marker_map:
+                    continue
+                step_k = step_idx + 1
+                if kind == "within_one_step":
+                    # The op's natural anchor is the AX marker; the
+                    # "within one step" window is the 35 tokens ending
+                    # at AX (one VM step). This spans the CURRENT step's
+                    # REG_PC..AX prefix plus the PREVIOUS step's tail.
+                    # We anchor at REG_AX of the inspection step and look
+                    # back 35 tokens; if the step has no prior step (k=1)
+                    # we clamp at 0.
+                    ax_pos = marker_map["REG_AX"]
+                    lookback_start = max(0, ax_pos - 35)
+                    window = pre_residual[
+                        0, lookback_start:ax_pos + 1,
+                        d_start:d_start + d_size
+                    ]
+                    obs_abs = float(window.abs().max().item())
+                    if obs_abs < epsilon:
+                        report.drift.append(TierADriftEntry(
+                            op_name=op.name,
+                            step=step_k,
+                            dim=dim_name,
+                            kind=f"requires:{constraint}",
+                            position=lookback_start,
+                            observed=obs_abs,
+                        ))
+                    continue
+                # set_at_<MARKER> family
+                if marker is None or marker not in _MARKER_OFFSETS:
+                    continue
+                pos = marker_map["REG_PC"] + _MARKER_OFFSETS[marker]
+                slice_vals = pre_residual[0, pos, d_start:d_start + d_size]
+                obs_abs = float(slice_vals.abs().max().item())
+                if obs_abs < epsilon:
+                    report.drift.append(TierADriftEntry(
+                        op_name=op.name,
+                        step=step_k,
+                        dim=dim_name,
+                        kind=f"requires:{constraint}",
+                        position=pos,
+                        observed=obs_abs,
+                    ))
+                    continue
+                if value is not None:
+                    # Value precondition: the dim's byte 0 lo nibble must
+                    # encode ``value``. The residual slice at a marker is
+                    # typically a nibble-encoded byte; we just check
+                    # whether the byte-0 lo nibble matches loosely.
+                    encoded = float(slice_vals[0].item()) if d_size >= 1 else 0.0
+                    if abs(encoded - float(value)) > 0.5:
+                        report.drift.append(TierADriftEntry(
+                            op_name=op.name,
+                            step=step_k,
+                            dim=dim_name,
+                            kind=f"requires:{constraint}:value_mismatch",
+                            position=pos,
+                            observed=encoded,
+                        ))
+
+    return report
+
+
+# Canonical C4 opcode names. Sourced from
+# ``ops/shared.py``'s opcode -> "OP_<NAME>" map. Used as the universe of
+# opcodes the opcode-coverage detector iterates over.
+_KNOWN_C4_OPCODES = frozenset({
+    "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
+    "OP_ENT", "OP_ADJ", "OP_LEV",
+    "OP_LI", "OP_LC", "OP_SI", "OP_SC", "OP_PSH",
+    "OP_OR", "OP_XOR", "OP_AND",
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+    "OP_SHL", "OP_SHR",
+    "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+    "OP_EXIT", "OP_NOP", "OP_PUTCHAR", "OP_GETCHAR",
+})
+
+
+@dataclass
+class OpcodeCoverageReport:
+    """Aggregate report of opcode coverage across the compiled op set.
+
+    ``coverage`` maps ``OP_*`` -> list of op names that declare it in
+    their ``opcodes`` annotation. ``unreachable`` is the subset with
+    empty coverage. ``suspicious_unannotated`` is the list of FFN ops
+    outside the L0-L3 emission band whose ``opcodes`` is empty (the
+    heuristic from the Tier A spec: most FFN ops should be opcode-gated).
+    """
+    coverage: Dict[str, List[str]] = field(default_factory=dict)
+    unreachable: List[str] = field(default_factory=list)
+    suspicious_unannotated: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    def has_drift(self) -> bool:
+        return bool(self.unreachable) or bool(self.suspicious_unannotated)
+
+    def format(self) -> str:
+        lines = [
+            "=== Tier A opcode coverage report ===",
+            f"Opcodes tracked: {len(self.coverage)}",
+            f"Unreachable opcodes (no op declares): {len(self.unreachable)}",
+            f"Suspicious unannotated FFN ops: "
+            f"{len(self.suspicious_unannotated)}",
+        ]
+        for opcode in sorted(self.coverage.keys()):
+            owners = self.coverage[opcode]
+            tag = "UNREACHABLE" if not owners else "OK"
+            lines.append(f"  [{tag}] {opcode}: {owners}")
+        for op_name in self.suspicious_unannotated:
+            lines.append(f"  SUSPICIOUS: {op_name} (FFN op with no opcodes)")
+        for n in self.notes:
+            lines.append(f"  NOTE: {n}")
+        return "\n".join(lines)
+
+
+def verify_opcode_coverage(compile_fn: Optional[Callable] = None) -> OpcodeCoverageReport:
+    """Static check on ``Operation.opcodes`` annotations.
+
+    Walks every op in the compiled layout (per-layer attn/ffn, block, and
+    model ops) and builds a matrix from each known C4 opcode to the list
+    of ops declaring it. Flags:
+      - ``unreachable``: opcodes that NO op declares. A non-empty list
+        means part of the ISA has no implementation cluster -- usually
+        because the produces-sweep agents haven't filled in ``opcodes``
+        yet (expected on a fresh annotation pass).
+      - ``suspicious_unannotated``: FFN ops whose ``opcodes`` set is
+        empty AND that live OUTSIDE the L0-L3 step-emission band (those
+        layers fire every step regardless of opcode, so they're expected
+        to leave ``opcodes`` empty).
+
+    ``compile_fn`` defaults to ``_build_layout_only`` with production
+    args; callers can pass an alternate compile function for tests that
+    want to verify against a synthetic compiler (e.g. a unit-test
+    LayerCompiler with a few ops manually added).
+    """
+    report = OpcodeCoverageReport()
+
+    if compile_fn is None:
+        try:
+            layout = _build_layout_only(
+                alu_mode="lookup",
+                enable_conversational_io=False,
+                enable_tool_calling=False,
+                n_heads=8,
+            )
+        except Exception as exc:
+            report.notes.append(f"compile failed: {exc!r}")
+            return report
+    else:
+        try:
+            layout = compile_fn()
+        except Exception as exc:
+            report.notes.append(f"compile_fn failed: {exc!r}")
+            return report
+
+    # Initialize every known opcode with an empty owner list.
+    coverage: Dict[str, List[str]] = {op: [] for op in _KNOWN_C4_OPCODES}
+
+    # Walk all ops and accumulate opcode declarations.
+    seen: Set[str] = set()
+    all_ops: List[Operation] = []
+    for ops_at in layout.ops_per_layer:
+        for op in ops_at:
+            if op.name in seen:
+                continue
+            seen.add(op.name)
+            all_ops.append(op)
+    for op in layout.block_ops:
+        if op.name in seen:
+            continue
+        seen.add(op.name)
+        all_ops.append(op)
+    for op in layout.model_ops:
+        if op.name in seen:
+            continue
+        seen.add(op.name)
+        all_ops.append(op)
+
+    for op in all_ops:
+        for opcode in op.opcodes:
+            # Track even non-canonical opcodes (in case the produces-sweep
+            # agents introduce new names); we just add them to coverage.
+            coverage.setdefault(opcode, []).append(op.name)
+
+    report.coverage = coverage
+    report.unreachable = sorted(
+        opcode for opcode, owners in coverage.items()
+        if opcode in _KNOWN_C4_OPCODES and not owners
+    )
+
+    # Suspicious unannotated FFN ops: kind == "ffn" or kind == "block" at
+    # layer_idx >= 4, with empty opcodes set AND non-empty reads/writes
+    # (so we don't flag pure no-op anchors). L0-L3 ops fire every step
+    # to emit the canonical step tokens, so empty opcodes there is fine.
+    L_EMIT_BAND = 4
+    for op in all_ops:
+        if op.opcodes:
+            continue
+        if op.kind == "model":
+            continue
+        if op.kind == "attn":
+            # Many attn ops are not opcode-gated (they gather context for
+            # downstream FFN clusters). Skip.
+            continue
+        # Try to resolve the op's layer.
+        layer_idx = _resolve_op_layer(layout, op)
+        if layer_idx is None:
+            continue
+        if layer_idx < L_EMIT_BAND:
+            continue
+        # Only flag ops with non-trivial reads/writes (skip dep anchors).
+        if not (op.reads or op.writes):
+            continue
+        if not op.bake_fn:
+            continue
+        report.suspicious_unannotated.append(op.name)
+
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Convenience top-level entry point
 # ---------------------------------------------------------------------------
 
