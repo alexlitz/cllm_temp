@@ -25,10 +25,22 @@ def make_layer12_mul_combine_op() -> Operation:
         migrated=True,
         # Staleness invariants: L12 MUL combine consumes the same operands
         # as L11 MUL partial (ALU_HI for a_hi, AX_CARRY_LO for b_lo) at the
-        # AX marker. These must be the in-step fresh values.
+        # AX marker. These must be the in-step fresh values. Also consumes
+        # the fresh MUL_ACCUM (TEMP+partial) just written by
+        # ``layer11_mul_partial`` at the AX marker (phase 11 < 12).
         consumes_fresh={
             "ALU_HI": "AX_byte0",
             "AX_CARRY_LO": "AX_byte0",
+            "MUL_ACCUM": "AX_byte0",
+        },
+        # Produces the fresh MUL hi-nibble result at the AX marker (gated
+        # on MARK_AX + OP_MUL): ``result_hi = (partial + a_hi*b_lo) % 16``
+        # is written via 4-way AND units into OUTPUT_HI. ``_set_layer12_mul_combine``
+        # itself writes only OUTPUT_HI (not OUTPUT_LO); the lo-nibble was
+        # already populated upstream in L10's MUL units, so the staleness
+        # contract only covers the hi half emitted here.
+        produces={
+            "OUTPUT_HI": "AX_byte0",
         },
     )
 

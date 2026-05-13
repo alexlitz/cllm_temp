@@ -36,6 +36,14 @@ def make_layer11_mul_partial_op() -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
+        # Produces the fresh MUL partial product staging at the AX marker
+        # (gated on MARK_AX + OP_MUL). The lookup-mode MUL pipeline
+        # computes ``partial = (carry + a_lo * b_hi) % 16`` into MUL_ACCUM
+        # (== TEMP[partial] via _SetDim aliasing) for the L12 hi-nibble
+        # combine to read.
+        produces={
+            "MUL_ACCUM": "AX_byte0",
+        },
     )
 
 
