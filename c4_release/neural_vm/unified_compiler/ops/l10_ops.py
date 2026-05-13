@@ -323,6 +323,11 @@ def make_layer10_alu_op() -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
+        # ``_set_layer10_alu`` writes the comparison-combine (18 units) +
+        # bitwise-cross-product (~1536) + AX passthrough (~32) + DIV/MOD
+        # setup units, reaching unit 1845. No other op writes to L10 FFN
+        # so this op holds the per-layer width annotation.
+        ffn_units_used=1846,
     )
 
 
