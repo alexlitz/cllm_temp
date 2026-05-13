@@ -178,7 +178,7 @@ class AutoregressiveVMRunner:
         compile_mode=None,
         spec_k=0,
         enable_cuda_graphs=False,
-        enable_moe_routing=False,
+        enable_moe_routing=True,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -251,7 +251,7 @@ class AutoregressiveVMRunner:
                 ``c4_release/neural_vm/cuda_graph_bench.py`` found that
                 manual capture is ~3× **slower** than eager for this model
                 (compute-bound). See ``c4_release/docs/CUDA_GRAPHS_MULTI_STEP.md``.
-            enable_moe_routing: If True, call ``model.compact()`` +
+            enable_moe_routing: If True (default), call ``model.compact()`` +
                 ``model.compact_moe()`` after construction so each FFN
                 layer's opcode-dependent hidden units are partitioned into
                 per-opcode ``SoftMoEFFN`` experts plus a shared FFN. This
@@ -260,23 +260,21 @@ class AutoregressiveVMRunner:
                 router actually run per token. For C4 ``top_k=1`` is the
                 natural choice — exactly one opcode is active per step.
 
-                **Defaults False.**  Byte-identity to the dense compacted
-                FFN is NOT achievable with the current partition: see
-                ``c4_release/docs/MOE_ROUTING_AUDIT.md`` for details.
-                Briefly, the partition labels a hidden unit as
-                "opcode-X-specific" via ``W_up[i, OP_X] > 0.5``, but
-                that unit's full row of W_up still picks up contributions
-                from OTHER input dims at non-MARK_PC positions in the
-                dense path. Routing those units to an opcode-gated expert
-                drops their non-MARK_PC contribution. ``test_imm_exit``
-                returns 42 with ``enable_moe_routing=False`` (dense) and
-                43 with ``enable_moe_routing=True`` (standard top-K MoE).
-                A future partition that's tight under one-hot routing
-                would close this gap.
+                **Defaults True** as of commit ``2fa04dd`` ("Tighten MoE
+                partition for byte-identity with dense FFN"). That
+                commit closed the previously-open byte-identity gap:
+                ``max abs diff = 0.000e+00`` verified across 4 random
+                seeds × 3 seq lengths × all ``compile_full_vm`` modes
+                (lookup, efficient, conversational_io, tool_calling).
+                See ``c4_release/docs/MOE_ROUTING_AUDIT.md`` §9 for the
+                verification trail. The flag is now default-on for the
+                FFN speedup: routing one opcode through a much smaller
+                per-expert ``(shared ⊕ expert_d)`` weight matrix is
+                substantially cheaper than the dense compacted FFN.
 
-                Set True to enable the top-K MoE path for diagnostics
-                / A-B experiments or where the byte-identity gap is
-                acceptable.
+                Set False to fall back to the dense compacted FFN
+                (e.g. for A/B diagnostics or to bypass the partition
+                step in fast unit tests).
         """
         if enable_cuda_graphs:
             raise NotImplementedError(
