@@ -26,10 +26,17 @@ sys.path.insert(
 
 
 from c4_release.neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
+    MultistepDriftEntry,
+    MultistepVerificationReport,
     OpVerificationResult,
     StaticVerificationReport,
+    _ADD_CASCADE_PROGRAM,
+    _build_multistep_probe,
+    _pack_instr,
+    _resolve_register_offset,
     verify_claims_static,
     verify_produces_consumes_dynamic,
+    verify_produces_consumes_multistep,
 )
 from c4_release.neural_vm.unified_compiler.layer_compiler import (  # noqa: E402
     LayerCompiler,
@@ -271,3 +278,185 @@ class TestDynamicVerification:
         report = verify_produces_consumes_dynamic()
         # Just sanity-check that we got a structured report back.
         assert isinstance(report.results, list)
+
+
+# ----------------------------------------------------------------------
+# Mode B+: multistep produces verification (validator marker)
+# ----------------------------------------------------------------------
+
+
+class TestUnitMultistepProbe:
+    """Unit tests for the multistep probe builder / register resolver.
+
+    These do not invoke ``compile_full_vm`` so they run in well under a
+    second. The pyramid keeps the expensive validator tests below from
+    blocking trivial regressions in the builder logic.
+    """
+
+    def test_resolve_register_offset_byte_names(self):
+        # ``AX_byte0`` is offset 6 within a 35-token step (REG_AX at 5,
+        # then 4 byte slots).
+        assert _resolve_register_offset("AX_byte0") == 6
+        assert _resolve_register_offset("AX_byte3") == 9
+        assert _resolve_register_offset("STACK0_byte0") == 21
+        assert _resolve_register_offset("STACK0_byte3") == 24
+
+    def test_resolve_register_offset_bare_marker(self):
+        # ``AX``/``AX_marker`` both fall back to REG_AX's offset (5).
+        assert _resolve_register_offset("AX") == 5
+        assert _resolve_register_offset("AX_marker") == 5
+        assert _resolve_register_offset("STACK0") == 20
+        assert _resolve_register_offset("REG_PC") == 0
+
+    def test_resolve_register_offset_unknown_returns_none(self):
+        assert _resolve_register_offset("BOGUS") is None
+        assert _resolve_register_offset("") is None
+
+    def test_pack_instr(self):
+        # IMM 10 -> opcode=1, imm=10 -> 0x00000a01.
+        assert _pack_instr(1, 10) == 0x0a01
+        # ADD -> opcode=25 -> 0x19.
+        assert _pack_instr(25, 0) == 0x19
+
+    def test_build_multistep_probe_add_cascade(self):
+        """Builder runs the canonical ADD program and emits 4 step markers
+        with correct PC/AX/SP/STACK0 evolution.
+
+        This is the smoke that confirms ``DraftVM.draft_tokens`` agrees
+        with our offset table: AX hits 10 on step 1, STACK0 hits 10 on
+        step 2 (after PSH), AX hits 32 on step 3 (after IMM 32), and
+        AX hits 42 on step 4 (after ADD).
+        """
+        # Layout is unused by the builder (only by the verifier), so a
+        # stub is fine.
+        class _StubLayout:  # noqa: D401
+            pass
+
+        token_tensor, markers, summaries = _build_multistep_probe(
+            _StubLayout(), _ADD_CASCADE_PROGRAM, n_steps=4,
+        )
+        assert token_tensor.shape == (1, 184), (
+            "header (12) + 4 steps * 35 = 152 + 12 = 184; "
+            f"got shape={tuple(token_tensor.shape)}"
+        )
+        assert len(markers) == 4
+        assert len(summaries) == 4
+        # Spot-check summaries: after step 1 (IMM 10), AX=0xa. After
+        # step 4 (ADD), AX=0x2a (= 42).
+        assert "AX=a" in summaries[0]
+        assert "AX=2a" in summaries[3]
+        # Each marker map carries 35 entries (one per step-token offset).
+        assert len(markers[0]) == 35
+        # AX_byte0 of step 2 should land in the second step's window.
+        # Header = 1 (CODE_START) + 5*8 (40 bytes) + 1 (CODE_END) + 1
+        # (DATA_START) + 1 (DATA_END) = 44. Step 1 starts at 44,
+        # REG_AX at 44+5=49, step 2 starts at 44+35=79, REG_AX at 84.
+        assert markers[0]["REG_AX"] == 49
+        assert markers[1]["REG_AX"] == 84
+        assert markers[1]["AX_byte0"] == 85
+        assert markers[1]["STACK0_byte0"] == 100
+
+
+@pytest.mark.validator
+class TestMultistepProbe:
+    """Mode B+ multistep dynamic verifier on the production model.
+
+    These tests are expensive (~70s for the model bake plus a forward
+    pass). They live behind ``-m validator`` so smoke runs skip them by
+    default; CI can opt in via ``pytest -m validator``.
+
+    Class-scoped fixture caches the compiled model so all tests in the
+    class share one bake.
+    """
+
+    @pytest.fixture(scope="class")
+    def compiled(self):
+        # Build the model once for the whole class -- saves ~70s per
+        # test case relative to letting each call rebuild.
+        from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
+            compile_full_vm,
+        )
+        model, layout = compile_full_vm(
+            S=100.0, alu_mode="lookup",
+            enable_conversational_io=False, n_heads=8,
+        )
+        model.eval()
+        return model, layout
+
+    def test_clean_imm_exit_program_has_no_drift(self, compiled):
+        """Multistep probe on a tiny IMM/EXIT program emits no drift.
+
+        Step 1: IMM 7 (AX=7). Step 2: EXIT. The 3 ops currently annotated
+        with ``produces`` (layer7_operand_gather, layer8_multibyte_routing,
+        layer8_head6_ax_carry_refresh) all target AX_byte0 / ALU_*. On the
+        IMM step the model populates AX bytes, so the produces-liveness
+        check should pass for the live steps. The post-EXIT step may also
+        have residue from the prior step (causal attention). This test
+        pins the baseline: a benign program produces no drift entries.
+        """
+        model, layout = compiled
+        program = [_pack_instr(1, 7), _pack_instr(38, 0)]  # IMM 7; EXIT
+        report = verify_produces_consumes_multistep(
+            model=model, layout=layout, program=program, n_steps=2,
+        )
+        # We allow some drift entries on the EXIT step (step 2) where
+        # the model has nothing to compute -- but the IMM step (step 1)
+        # should never drift for AX_byte0 producers.
+        step1_drift = [
+            d for d in report.drift_entries()
+            if d.step == 1 and d.register == "AX_byte0"
+        ]
+        assert not step1_drift, (
+            "IMM 7 step should populate AX_byte0 residual at every "
+            "AX_byte0-producing op's post-layer residual. Drift on step "
+            f"1 indicates a real declaration regression: {step1_drift}"
+        )
+
+    def test_add_cascade_surfaces_stack0_drift_if_annotated(self, compiled):
+        """Multistep probe on IMM/PSH/IMM/ADD/EXIT surfaces STACK0 drift
+        if any L6/L10/STK0-carry op declares ``produces[STACK0_byte*]``.
+
+        At time of writing (2026-05-13) no such annotations exist, so
+        this test skips with a reason that points at the Tier 1
+        annotation agent. Once they land, this test asserts the probe
+        actually surfaces the smoking-gun cascade.
+        """
+        model, layout = compiled
+        # Look for any op with a STACK0 register annotation.
+        all_ops = []
+        for ops_at in layout.ops_per_layer:
+            all_ops.extend(ops_at)
+        all_ops.extend(layout.block_ops)
+        all_ops.extend(layout.model_ops)
+        stk0_producers = [
+            op for op in all_ops
+            if any(
+                "STACK0" in reg or "STK0" in reg
+                for reg in op.produces.values()
+            )
+        ]
+        if not stk0_producers:
+            pytest.skip(
+                "no op declares produces=...STACK0_byte*...; Tier 1 "
+                "annotation agent will fill these in. Until then the "
+                "cascade verifier has no targets to flag."
+            )
+        report = verify_produces_consumes_multistep(
+            model=model, layout=layout,
+            program=list(_ADD_CASCADE_PROGRAM), n_steps=4,
+        )
+        # When STACK0 producers exist, the cascade program should
+        # exercise them across steps 2/3 (PSH + IMM-after-PSH). At
+        # least one drift entry on step 3 with a STACK0 register is
+        # the canonical smoking-gun signature.
+        stk0_step3_drift = [
+            d for d in report.drift_entries()
+            if d.step >= 3 and "STACK0" in d.register
+        ]
+        assert stk0_step3_drift, (
+            "Expected cascade drift on step 3+ for STACK0 register "
+            "produces annotations. None observed. Either the cascade "
+            "bug is fixed (great!) or the STACK0 producers are not "
+            "actually expected to fire on step 3. Report:\n"
+            + report.format()
+        )
