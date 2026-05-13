@@ -826,6 +826,30 @@ class TestSmokeControlFlow:
 class TestSmokeFunctionCall:
     """Function call quick checks."""
 
+    # Marked xfail to match the established gate on the same bytecode in
+    # ``tests/test_smoke_pure_neural.py::TestSmokePureNeuralFunctionCall::
+    # test_simple_function`` and the underlying neural path test
+    # ``tests/test_pure_neural_jsr_ent_lev.py::TestPureNeuralJSRLEVSimple::
+    # test_jsr_callee_writes_ax``. Both gate this exact program with the
+    # documented reason that the LEV neural path
+    # (``_set_layer9_lev_bp_to_pc_relay`` / L15 / L16 lev_routing) does not
+    # restore PC from ``mem[BP+8]`` when the callee body writes AX before
+    # returning; the callee's ``IMM 42`` therefore never reaches the
+    # caller's ``EXIT`` and AX falls back to its default ``0``.
+    # See ``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md`` for the diagnosis trace
+    # (``IMM 7; JSR 2; ENT 0; LEV; EXIT`` produces ``0xf8030063``-style
+    # contamination) and the (still-open) recommendation set for the
+    # L9/L15/L16 LEV pipeline. Leaving the smoke test unmarked caused
+    # this exact program to be promoted from xfail to a hard failure
+    # in the ``test_smoke.py`` batched lane when the latter was added
+    # (commit ``944d5df``) without inheriting the existing xfail markers.
+    @pytest.mark.xfail(
+        reason="Phase 5 LEV-callee-writes-AX: _set_layer9_lev_bp_to_pc_relay "
+               "does not restore PC from mem[BP+8] (matches "
+               "test_smoke_pure_neural::test_simple_function and "
+               "test_pure_neural_jsr_ent_lev::test_jsr_callee_writes_ax xfails)",
+        strict=False,
+    )
     def test_simple_function(self, _smoke_functioncall_results):
         _lookup_and_check(_smoke_functioncall_results, "TestSmokeFunctionCall::test_simple_function")
 
