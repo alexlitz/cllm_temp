@@ -148,6 +148,8 @@ markers = [
     "dual: marks tests that run with both weight modes",
     "benchmark: marks performance benchmark tests",
     "property: marks property-based tests (hypothesis)",
+    "validator: declarative verifier tests (static claims + dynamic produces/consumes). Run with `pytest -m validator`. Skipped by default in smoke since the verifier adds ~60s wall.",
+    "validator_strict: declarative verifier strict-mode tests (flag UNDECLARED WRITEs as failures). Opt-in nightly only.",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
