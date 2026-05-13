@@ -346,7 +346,7 @@ class TestUnitMultistepProbe:
         class _StubLayout:  # noqa: D401
             pass
 
-        token_tensor, markers, summaries = _build_multistep_probe(
+        token_tensor, markers, summaries, active_ops = _build_multistep_probe(
             _StubLayout(), _ADD_CASCADE_PROGRAM, n_steps=4,
         )
         assert token_tensor.shape == (1, 184), (
@@ -398,45 +398,39 @@ class TestMultistepProbe:
         return model, layout
 
     def test_clean_imm_exit_program_has_no_drift(self, compiled):
-        """Multistep probe on a tiny IMM/EXIT program emits no drift for
-        the AX-byte ALU operand producers (ALU_LO/ALU_HI/OUTPUT_LO/HI).
+        """Multistep probe on a tiny IMM/EXIT program emits no drift on
+        any AX_byte0 producer once Tier A opcode gating is honored.
 
-        Step 1: IMM 7 (AX=7). Step 2: EXIT. The L7 head 0/1 operand
-        gather (``layer7_operand_gather``) writes ALU_LO/HI on every
-        step regardless of opcode, so its produces annotations MUST
-        surface at the AX byte 0 residual position on step 1.
+        Step 1: IMM 7 (AX=7). Step 2: EXIT. With ``opcodes`` annotations
+        in place on L7 operand_gather (binary ALU + LEA/ADJ/ENT) and on
+        L8/L9 ALU (ADD/SUB/LEA + EQ..GE etc.), the verifier auto-gates
+        the ``produces`` checks: dims like CARRY/CMP_GROUP/CMP on L8/L9/
+        L10 are only expected to fire when an opcode in the op's
+        ``opcodes`` set is active for the step. IMM (step 1) and EXIT
+        (step 2) are NOT in any of those sets, so the verifier should
+        skip those produces checks and surface no drift.
 
-        ALU-only producers (e.g. CARRY/CMP_GROUP/CMP on L8/L9/L10) are
-        EXCLUDED from this check because IMM 7 does not exercise those
-        paths -- the produces annotations there are opcode-gated in
-        practice but not yet declared via Tier A ``opcodes`` annotations.
-        This test is intentionally narrow so a benign IMM program does
-        not over-trigger. Once opcode-gating is fully declared (Tier A
-        ``opcodes`` sweep), this test can be tightened to assert no drift
-        across ANY AX_byte0 producer.
+        L7's operand_gather declares ``opcodes`` covering binary ALU +
+        LEA/ADJ/ENT — none of which fire on IMM/EXIT — so even ALU_LO/HI
+        produces are now opcode-gated and skipped on IMM/EXIT steps.
+        The expected drift count is therefore 0 across every op for this
+        program.
         """
         model, layout = compiled
         program = [_pack_instr(1, 7), _pack_instr(38, 0)]  # IMM 7; EXIT
         report = verify_produces_consumes_multistep(
             model=model, layout=layout, program=program, n_steps=2,
         )
-        # We allow drift entries on EXIT (step 2) where the model has
-        # nothing to compute, AND on ALU-only dims (CARRY/CMP*/OUTPUT)
-        # whose produces is opcode-gated by ADD/SUB/CMP. Step 1 ALU_LO/HI
-        # at AX_byte0 are the *load-bearing* AX-byte producers IMM
-        # exercises: L7's operand_gather writes them every step.
-        AX_OPERAND_DIMS = {"ALU_LO", "ALU_HI"}
-        step1_operand_drift = [
-            d for d in report.drift_entries()
-            if d.step == 1
-            and d.register == "AX_byte0"
-            and d.dim in AX_OPERAND_DIMS
-        ]
-        assert not step1_operand_drift, (
-            "IMM 7 step should populate ALU_LO/HI residual at L7's "
-            "operand_gather (the one always-on AX_byte0 producer). "
-            f"Drift on step 1 indicates a real declaration regression: "
-            f"{step1_operand_drift}"
+        # With opcode auto-gating, ALL produces checks skip when the
+        # op's opcodes don't include IMM/EXIT. The test asserts no drift
+        # on either step.
+        all_drift = report.drift_entries()
+        assert not all_drift, (
+            "IMM 7 / EXIT program produced drift under opcode-gated "
+            "produces verification. Either an op declared opcodes that "
+            "incorrectly include OP_IMM or OP_EXIT, or an op is missing "
+            "its opcodes annotation entirely. "
+            f"Drift entries: {all_drift}"
         )
 
     def test_add_cascade_surfaces_stack0_drift_if_annotated(self, compiled):
@@ -819,17 +813,6 @@ class TestOpcodeCoverage:
         for opcode in _KNOWN_C4_OPCODES:
             assert opcode.startswith("OP_"), opcode
 
-    @pytest.mark.xfail(
-        reason=(
-            "Most C4 opcodes are unreachable in opcode coverage until "
-            "the produces-sweep agents fill in `opcodes` on every op. "
-            "Tier A only seeds 5 example annotations (covering ADD/SUB/"
-            "LEA/ADJ/ENT + EQ..GE + AND/OR/XOR/MUL/DIV/MOD/SHL/SHR via "
-            "L7/L8/L9). Opcodes like OP_IMM, OP_JMP, OP_JSR, OP_BZ, "
-            "OP_BNZ, OP_LEV, OP_LI/LC/SI/SC, OP_PSH, OP_EXIT, OP_NOP, "
-            "OP_PUTCHAR/GETCHAR are not yet declared on any op."
-        )
-    )
     def test_every_opcode_has_at_least_one_op(self):
         """Strong invariant: every C4 opcode has at least one op handling it.
 

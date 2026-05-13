@@ -74,6 +74,9 @@ def make_layer5_user_input_gather_op(enable: bool = False) -> Operation:
         layer_idx=5,
         bake_fn=bake,
         migrated=True,
+        # Tier A opcode gating: Head A is gated on OP_GETCHAR (Q reads
+        # OP_GETCHAR & MARK_AX). Declared even though enable=False today.
+        opcodes={"OP_GETCHAR"},
     )
 
 
@@ -121,4 +124,10 @@ def make_layer6_getchar_routing_op(enable: bool = False) -> Operation:
         bake_fn=bake,
         phase=998.9,
         migrated=True,
+        # Tier A opcode gating: when enabled, this op routes
+        # STDIN_BYTE_LO/HI -> AX_CARRY at OP_GETCHAR & MARK_AX. Declared
+        # even though enable=False today so the opcode-coverage detector
+        # sees OP_GETCHAR as reachable. (Inert ops are still scanned for
+        # the opcodes coverage matrix.)
+        opcodes={"OP_GETCHAR"},
     )

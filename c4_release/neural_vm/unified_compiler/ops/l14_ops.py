@@ -46,6 +46,10 @@ def make_layer14_mem_generation_op() -> Operation:
             "OUTPUT_LO": "MEM_val_byte0",
             "OUTPUT_HI": "MEM_val_byte0",
         },
+        # Tier A opcode gating: the 8 attention heads generate MEM section
+        # tokens for PSH/SI/SC/JSR/ENT (Q-side reads OP_PSH/SI/SC/JSR/ENT).
+        # Other opcodes leave the MEM-byte OUTPUT untouched.
+        opcodes={"OP_PSH", "OP_SI", "OP_SC", "OP_JSR", "OP_ENT"},
     )
 
 
@@ -75,6 +79,9 @@ def make_layer14_temp_clear_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        # Tier A opcode gating: clears TEMP[0] at PC marker only when
+        # OP_LEV is active (see _set_layer14_temp_clear).
+        opcodes={"OP_LEV"},
     )
 
 
@@ -174,6 +181,10 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        # Tier A opcode gating: clears OUTPUT at MEM marker only for
+        # OP_JSR/OP_ENT (W_up reads OP_JSR, OP_ENT in
+        # _set_layer14_clear_mem_marker_output).
+        opcodes={"OP_JSR", "OP_ENT"},
     )
 
 
@@ -224,6 +235,9 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
             "OUTPUT_LO": "AX_byte1",
             "OUTPUT_HI": "AX_byte1",
         },
+        # Tier A opcode gating: only fires when OP_JSR is active at AX
+        # byte positions 1-3 (zero AX bytes for JSR's preserved AX).
+        opcodes={"OP_JSR"},
     )
 
 
@@ -287,6 +301,9 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
             "OUTPUT_LO": "AX_byte1",
             "OUTPUT_HI": "AX_byte1",
         },
+        # Tier A opcode gating: only fires for nocarry ALU ops AND/OR/XOR/SHR
+        # (gated by TEMP[7] = NOCARRY_ALU_OP relay).
+        opcodes={"OP_AND", "OP_OR", "OP_XOR", "OP_SHR"},
     )
 
 
@@ -342,6 +359,10 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
             "OUTPUT_LO": "AX_byte1",
             "OUTPUT_HI": "AX_byte1",
         },
+        # Tier A opcode gating: only fires for OP_LC (gated by OP_LC_RELAY
+        # from L7 head 5 V slot 2). LC writes a single byte into AX byte 0
+        # only; bytes 1-3 must be 0.
+        opcodes={"OP_LC"},
     )
 
 

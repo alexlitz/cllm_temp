@@ -139,6 +139,15 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         produces={
             "CARRY": "AX_byte0",
         },
+        # Tier A opcode gating: this attn head relays CARRY[1] (ADD carry)
+        # and CARRY[2] (SUB borrow) from the AX marker into the AX byte
+        # positions. The CARRY values are only meaningful when the L8 ALU
+        # was active (binary ADD or SUB); the relay still mechanically
+        # copies zero on other opcodes, but the produces declaration is
+        # only honored when the underlying ALU produces the carry. Mark
+        # the activating opcode set so the verifier auto-gates the
+        # produces[CARRY] check accordingly.
+        opcodes={"OP_ADD", "OP_SUB", "OP_LEA"},
     )
 
 
@@ -283,6 +292,11 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
             "OUTPUT_LO": "STACK0_byte0",
             "OUTPUT_HI": "STACK0_byte0",
         },
+        # Tier A opcode gating: head 3 reads PSH_AT_SP (the L1H4 marker for
+        # PSH-active SP positions) and copies the AX byte values into the
+        # current step's STACK0 byte positions. Only fires on OP_PSH (the
+        # PSH-at-SP gate is the load-bearing condition).
+        opcodes={"OP_PSH"},
     )
 
 
@@ -379,6 +393,15 @@ def make_layer10_alu_op() -> Operation:
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
             "DIV_STAGING": "AX_byte0",
+        },
+        # Tier A opcode gating: L10 ALU clusters fire for bitwise ops
+        # (AND/OR/XOR) + DIV/MOD setup. The W_up reads OP_OR/OP_XOR/OP_AND
+        # /OP_DIV/OP_MOD per unit. Comparison-combine units also fire for
+        # the comparison opcodes (EQ..GE) consuming CMP from L8/L9.
+        opcodes={
+            "OP_AND", "OP_OR", "OP_XOR",
+            "OP_DIV", "OP_MOD",
+            "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
         },
         # ``_set_layer10_alu`` writes the comparison-combine (18 units) +
         # bitwise-cross-product (~1536) + AX passthrough (~32) + DIV/MOD

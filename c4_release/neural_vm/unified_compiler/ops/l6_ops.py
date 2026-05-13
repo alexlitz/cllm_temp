@@ -80,6 +80,15 @@ def make_layer6_routing_ffn_op() -> Operation:
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
         },
+        # Tier A opcode gating: the FFN body wires W_up[OP_IMM]=S,
+        # W_up[OP_EXIT]=S, W_up[OP_NOP]=S, W_up[OP_JSR]=S, W_up[OP_JMP]=S
+        # for the five 16-unit gating clusters (vm_step.py:3682-3832).
+        # Each cluster fires only when one of these five opcodes is active
+        # at the AX marker. (Other opcodes go through dedicated downstream
+        # ops: ADD/SUB/LEA via L8 ALU; PSH via L6 relay heads; LI/LC/SI/SC
+        # via L13-L15 mem path; BZ/BNZ via L6 bz_bnz_relay_bake; LEV via
+        # L9 lev_*; PUTCHAR/GETCHAR via L5 conv_io_opcode_decode.)
+        opcodes={"OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR"},
     )
 
 
@@ -268,6 +277,14 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
         produces={
             "CMP": "PC_marker",
         },
+        # Tier A opcode gating: head 4's V slot 1 reads OP_BZ, slot 2 reads
+        # OP_BNZ (setup_helpers.py:1384 in _set_bz_bnz_relay). The relay
+        # only writes meaningful CMP[2..5] flags when one of OP_BZ or
+        # OP_BNZ is active at the AX marker (the relay attends back to AX
+        # from PC and copies the opcode flag into CMP). Other opcodes still
+        # technically pass through the head but write zeros, so we declare
+        # the activating opcodes for this op.
+        opcodes={"OP_BZ", "OP_BNZ"},
     )
 
 

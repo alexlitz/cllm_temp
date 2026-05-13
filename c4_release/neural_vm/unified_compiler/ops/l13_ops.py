@@ -55,6 +55,11 @@ def make_layer13_mem_addr_gather_op() -> Operation:
             "ADDR_B1_HI": "MEM_VAL_byte0",
             "ADDR_B2_HI": "MEM_VAL_byte0",
         },
+        # Tier A opcode gating: heads 0-2 Q reads gate on the LI/LC/SI/SC
+        # opcode flags (see _set_layer13_mem_addr_gather). Only the four
+        # mem opcodes activate the address gather; other opcodes leave the
+        # ADDR_B*_LO/HI dims untouched.
+        opcodes={"OP_LI", "OP_LC", "OP_SI", "OP_SC"},
     )
 
 
@@ -121,6 +126,10 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
         } if alu_mode == "lookup" else {},
+        # Tier A opcode gating: every shift unit reads W_up[OP_SHL]/W_up[OP_SHR]
+        # (see _set_layer13_shifts). Other opcodes leave the shift FFN
+        # silent.
+        opcodes={"OP_SHL", "OP_SHR"},
     )
 
 
