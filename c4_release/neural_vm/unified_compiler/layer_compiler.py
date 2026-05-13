@@ -73,6 +73,16 @@ ALLOWED_CLAIM_SCOPES = frozenset({
 })
 
 
+# Sentinel ``produces`` keys for ops that intentionally don't fit the
+# standard ``{dim: marker}`` schema. ``__module_replacement`` flags ops
+# that swap a whole submodule (``block.ffn = ...``) instead of writing
+# weight cells; ``__structural`` flags compiler machinery (right-size,
+# expand-wrapper, contract validation) or writes to non-residual buffers
+# like ``attn.alibi_slopes``. The decl_verifier skips Mode B / B+ drift
+# detection for ops whose ``produces`` consists only of sentinel keys.
+SENTINEL_PRODUCES_KEYS = frozenset({"__module_replacement", "__structural"})
+
+
 @dataclass
 class Operation:
     """A single declarative operation that the compiler can place at any layer.
@@ -318,6 +328,13 @@ class LayerCompiler:
         # Validate staleness invariants (Phase 3 / Agent G of
         # ARCH_LEAKAGE_FIX_PLAN.md). Both ``produces`` and ``consumes_fresh``
         # map declared dim names to register identifiers.
+        #
+        # Sentinel keys (``SENTINEL_PRODUCES_KEYS``) are exempt from the
+        # "must be a declared dim" check -- they document that the op
+        # intentionally falls outside the standard residual-dim schema
+        # (e.g. swaps a whole submodule, writes attn.alibi_slopes, etc.).
+        # Sentinels are only valid in ``produces``; ``consumes_fresh`` always
+        # requires real dim names.
         for fname, mapping in (("produces", op.produces),
                                ("consumes_fresh", op.consumes_fresh)):
             if not isinstance(mapping, dict):
@@ -336,6 +353,11 @@ class LayerCompiler:
                         f"Op {op.name!r} {fname}[{dim_name!r}] register "
                         f"must be str; got {register!r}"
                     )
+                if fname == "produces" and dim_name in SENTINEL_PRODUCES_KEYS:
+                    # Sentinel produces -- ``register`` is a free-form
+                    # descriptor of what was replaced / what compiler
+                    # machinery ran. Skip the declared-dim check.
+                    continue
                 if dim_name not in self.dims:
                     raise ValueError(
                         f"Op {op.name!r} {fname} references undeclared dim "
@@ -648,8 +670,14 @@ class LayerCompiler:
         producers: Dict[Tuple[str, str], List[Tuple[str, Optional[float]]]] = {}
         consumers: Dict[Tuple[str, str], List[Tuple[str, Optional[float]]]] = {}
         all_ops = list(self.ops) + list(self.block_ops) + list(self.model_ops)
+        # Sentinel keys document module-replacement / structural ops; they
+        # don't represent real (dim, register) pairs and must not appear in
+        # the staleness registry (otherwise consumers couldn't find their
+        # real producers because the registry would dispatch to a sentinel).
         for op in all_ops:
             for dim_name, register in op.produces.items():
+                if dim_name in SENTINEL_PRODUCES_KEYS:
+                    continue
                 producers.setdefault(
                     (dim_name, register), []
                 ).append((op.name, op.phase))

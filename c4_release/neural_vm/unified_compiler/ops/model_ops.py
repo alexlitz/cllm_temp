@@ -131,6 +131,22 @@ def make_function_call_weights_op() -> Operation:
         # layer_idx field doesn't affect their bake execution.
         layer_idx=6,
         ffn_units_used=2278,
+        # Layer-pinned produces: this op writes V-relays across L5 attn
+        # (heads 5/6 ENT relays) and L6 attn (head 7 JSR PC return-addr
+        # relay). The ``@L<N>`` suffix tells the multistep probe to
+        # inspect the named layer's post-block residual rather than the
+        # final residual (the ``kind="model"`` fallback). These produces
+        # fire only on ENT / JSR steps; the default cascade probe (IMM/
+        # PSH/IMM/ADD/EXIT) won't exercise them, but the annotation
+        # documents the dim-flow + lets future probes target it.
+        #   - L5 head 5: TEMP at STACK0 marker := old BP (ENT)
+        #   - L5 head 6: TEMP at BP marker     := old SP (ENT)
+        #   - L6 head 7: AX_CARRY_LO/HI at STACK0 := return addr (JSR)
+        produces={
+            'TEMP': 'STACK0_marker@L5',
+            'AX_CARRY_LO': 'STACK0_marker@L6',
+            'AX_CARRY_HI': 'STACK0_marker@L6',
+        },
     )
 
 
@@ -192,6 +208,21 @@ def make_opcode_relay_head_op() -> Operation:
         bake_fn=bake,
         phase=1002,
         migrated=True,
+        # Layer-pinned produces: head 6 writes CMP / PSH_AT_SP relays at
+        # the L6 post-block residual, sourced from OP_* flags decoded by
+        # L5 FFN at the AX marker. The ``@L6`` suffix tells the multistep
+        # probe to inspect L6's post-block residual rather than the final
+        # residual (the default ``kind="model"`` fallback).
+        #   - CMP[0]    at SP marker  := OP_PSH    (PSH dispatch)
+        #   - PSH_AT_SP at SP marker  := OP_PSH    (clean PSH flag)
+        #   - CMP[1]    at SP marker  := OP_ADJ
+        # The probe walks step-relative offsets within a single step's
+        # 35-token window; the register names match the step-token offset
+        # table in ``decl_verifier.py``.
+        produces={
+            'CMP': 'SP_marker@L6',
+            'PSH_AT_SP': 'SP_marker@L6',
+        },
     )
 
 
@@ -267,6 +298,12 @@ def make_residual_alibi_slopes_op() -> Operation:
         bake_fn=_bake,
         phase=999,
         migrated=True,
+        # Structural sentinel: this op writes ``attn.alibi_slopes`` on
+        # L6/L8/L14/L15 -- positional-bias buffers, not residual-stream
+        # cells. The dynamic verifier inspects residual values at marker
+        # positions and has no way to verify alibi slope writes. See
+        # _SENTINEL_PRODUCES in ``decl_verifier.py``.
+        produces={'__structural': 'alibi_slopes@L6,L8,L14,L15'},
     )
 
 
@@ -533,6 +570,11 @@ def make_right_size_ffns_op() -> Operation:
         bake_fn=bake,
         phase=1200,
         migrated=True,
+        # Structural sentinel: this op trims each block's PureFFN
+        # ``hidden_dim`` to the actually-programmed unit count -- pure
+        # compiler machinery, no residual-dim writes. See
+        # _SENTINEL_PRODUCES in ``decl_verifier.py``.
+        produces={'__structural': 'right_size_ffns'},
     )
 
 
@@ -550,6 +592,11 @@ def make_expand_wrapper_blocks_op() -> Operation:
         bake_fn=bake,
         phase=1300,
         migrated=True,
+        # Structural sentinel: this op splits each HybridALUBlock /
+        # post_ops attachment into separate TransformerBlock instances
+        # -- pure compiler machinery (rewires module topology), no
+        # residual-dim writes. See _SENTINEL_PRODUCES.
+        produces={'__structural': 'expand_wrapper_blocks'},
     )
 
 
@@ -674,5 +721,9 @@ def make_contract_validation_op() -> Operation:
         bake_fn=_bake,
         phase=1199,
         migrated=True,
+        # Structural sentinel: this op is diagnostic-only -- it runs the
+        # ContractValidator and prints any errors but writes nothing.
+        # See _SENTINEL_PRODUCES in ``decl_verifier.py``.
+        produces={'__structural': 'contract_validation'},
     )
 

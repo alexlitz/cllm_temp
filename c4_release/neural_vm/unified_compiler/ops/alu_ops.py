@@ -107,6 +107,11 @@ def make_alu_shift_composite_ops():
             bake_fn=bake,
             layer_idx=13,
             migrated=True,
+            # Module-replacement sentinel: install the fully-constructed
+            # L13 shift composite onto ``block.ffn``. The per-stage write
+            # ops above (bdtoge/precompute/select/getobd) carry their
+            # own residual-dim ``produces`` declarations.
+            produces={'__module_replacement': 'L13.ffn'},
         )
 
     return [
@@ -247,6 +252,12 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
         bake_fn=bake,
         phase=1002,
         migrated=True,
+        # Module-replacement sentinel: this op swaps a whole submodule
+        # (``model.blocks[8].ffn`` -> HybridALUBlock) rather than writing
+        # individual weight cells. The dynamic verifier (Mode B / B+)
+        # skips drift detection for sentinel ops; static (Mode A)
+        # snapshot diffing remains unaffected.
+        produces={'__module_replacement': 'L8.ffn'},
     )
 
 
@@ -277,6 +288,11 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         phase=10.85,
         layer_idx=10,
         migrated=True,
+        # Module-replacement sentinel: efficient-mode ALU swap replaces
+        # ``block.ffn`` with ``ALUAndOrXor``; no weight cells are written
+        # into the original PureFFN. See _SENTINEL_PRODUCES in
+        # ``decl_verifier.py``.
+        produces={'__module_replacement': 'L10.ffn'},
     )
 
 
@@ -317,6 +333,10 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         phase=11.05,
         layer_idx=11,
         migrated=True,
+        # Module-replacement sentinel: efficient-mode ALU swap replaces
+        # ``block.ffn`` with ``ALUMul`` (when FlattenedALUMul isn't already
+        # installed); no weight cells are written into the original PureFFN.
+        produces={'__module_replacement': 'L11.ffn'},
     )
 
 
@@ -701,6 +721,11 @@ def make_alu_divmod_composite_ops():
             bake_fn=bake,
             layer_idx=10,
             migrated=True,
+            # Module-replacement sentinel: append the fully-constructed
+            # FlattenedDivMod composite to ``block.post_ops``; the
+            # per-stage write ops above (bdtoge/longdiv/getobd) carry
+            # their own residual-dim ``produces`` declarations.
+            produces={'__module_replacement': 'L10.post_ops[FlattenedDivMod]'},
         )
 
     return [make_bdtoge(), make_longdiv(), make_getobd(), make_install()]
@@ -761,6 +786,11 @@ def make_layer10_residual_alibi_slopes_op(alu_mode: str = 'lookup') -> Operation
         bake_fn=_bake,
         phase=999.1,
         migrated=True,
+        # Structural sentinel: this op writes L10 ``attn.alibi_slopes``
+        # (head 0..4 in lookup mode, 0..3 in efficient mode) -- a
+        # positional-bias buffer, not residual-stream cells. See
+        # _SENTINEL_PRODUCES in ``decl_verifier.py``.
+        produces={'__structural': 'alibi_slopes@L10'},
     )
 
 

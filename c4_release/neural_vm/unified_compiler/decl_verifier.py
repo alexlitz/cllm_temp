@@ -59,7 +59,36 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 
-from .layer_compiler import LayerCompiler, Operation
+from .layer_compiler import LayerCompiler, Operation, SENTINEL_PRODUCES_KEYS
+
+# Module-local alias for backwards-compat with callers that imported
+# the constant from ``decl_verifier``. New code should import directly
+# from ``layer_compiler``.
+_SENTINEL_PRODUCES = SENTINEL_PRODUCES_KEYS
+
+
+def _is_sentinel_produces(produces: Dict[str, str]) -> bool:
+    """Return True if ``produces`` contains ONLY sentinel keys.
+
+    Sentinel keys (``SENTINEL_PRODUCES_KEYS``) document ops that fall
+    outside the standard ``{dim: marker}`` schema -- module-replacement
+    ops (``block.ffn = ...``) or structural compiler machinery. The
+    dynamic verifier (Mode B / Mode B+) skips drift detection for
+    sentinel-only ops; mixed dicts still get their real dims checked.
+    """
+    if not produces:
+        return False
+    return all(k in SENTINEL_PRODUCES_KEYS for k in produces.keys())
+
+
+def _sentinel_kind(produces: Dict[str, str]) -> str:
+    """Return ``"module-replacement"`` or ``"structural"`` for a sentinel
+    op's ``produces`` dict. ``module-replacement`` wins when both keys
+    are present (unlikely; module-swap implies structural rewiring).
+    """
+    if "__module_replacement" in produces:
+        return "module-replacement"
+    return "structural"
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +809,16 @@ def verify_produces_consumes_dynamic(
 
     for op in candidates:
         res = DynamicVerificationResult(op_name=op.name)
+
+        # Sentinel-only ``produces`` -> skip Mode B drift detection.
+        if _is_sentinel_produces(op.produces):
+            res.notes.append(
+                f"sentinel produces ({_sentinel_kind(op.produces)}): "
+                f"skipping dynamic drift check"
+            )
+            report.results.append(res)
+            continue
+
         layer_idx = _resolve_op_layer(layout, op)
 
         if layer_idx is None or layer_idx + 1 >= len(per_layer_residuals):
@@ -797,6 +836,9 @@ def verify_produces_consumes_dynamic(
         ax_pos = mark_ax_positions[0]
 
         for dim_name in op.produces.keys():
+            # Skip sentinel keys in mixed produces dicts.
+            if dim_name in _SENTINEL_PRODUCES:
+                continue
             if dim_name not in layout.dim_positions:
                 res.drift.append(f"produces {dim_name!r}: dim not in layout")
                 continue
@@ -896,6 +938,15 @@ class MultistepVerificationResult:
     layer_idx: Optional[int] = None
     notes: List[str] = field(default_factory=list)
     drift: List[MultistepDriftEntry] = field(default_factory=list)
+    # True when the op's ``produces`` annotation consists entirely of
+    # sentinel keys (``__module_replacement`` / ``__structural``). The
+    # multistep probe doesn't run residual liveness checks against such
+    # ops; they're reported here so the report still acknowledges them.
+    # ``drift`` is always empty when ``is_sentinel`` is True.
+    is_sentinel: bool = False
+    # Free-form tag of which sentinel kind applied (``module-replacement``
+    # or ``structural``). None for non-sentinel ops.
+    sentinel_kind: Optional[str] = None
 
 
 @dataclass
@@ -924,7 +975,10 @@ class MultistepVerificationReport:
             f"Drift entries: {len(self.drift_entries())}",
         ]
         for r in self.results:
-            status = "OK" if not r.drift else "DRIFT"
+            if r.is_sentinel:
+                status = f"SENTINEL/{r.sentinel_kind}"
+            else:
+                status = "OK" if not r.drift else "DRIFT"
             layer_tag = (
                 f" (layer {r.layer_idx})" if r.layer_idx is not None else ""
             )
@@ -1011,27 +1065,45 @@ _STEP_TOKEN_OFFSETS = {
 }
 
 
-def _resolve_register_offset(register: str) -> Optional[int]:
-    """Map an ``Operation.produces`` register name to a step-relative offset.
+def _resolve_register_offset(
+    register: str,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Map an ``Operation.produces`` register name to ``(step_offset, layer)``.
 
     The produces convention uses register names like ``"AX_byte0"`` (the
     byte position immediately after REG_AX) or ``"STACK0_byte0"``. For
     register names with the bare-marker convention (``"AX"``, ``"STACK0"``,
     ``"AX_marker"``, ...) we fall back to the REG_* marker position itself.
-    Returns None if the name can't be resolved -- caller should record a
-    note rather than a drift entry.
+
+    Optionally, the register name may carry a trailing ``@L<N>`` suffix
+    (e.g. ``"PC_marker@L6"`` or ``"AX_byte0@L8"``) which pins the layer
+    whose post-block residual the multistep probe inspects. This is
+    required for ``kind="model"`` ops that write to a specific layer's
+    weights -- without it, the probe falls back to the final
+    post-block residual which is wrong for layer-specific writes.
+
+    Returns ``(offset, layer_idx)`` where ``layer_idx`` is None when the
+    register lacks the suffix. ``offset`` is None when the name can't
+    be resolved -- caller should record a note rather than a drift entry.
     """
-    if register in _STEP_TOKEN_OFFSETS:
-        return _STEP_TOKEN_OFFSETS[register]
+    base = register
+    layer_pin: Optional[int] = None
+    if "@L" in register:
+        base, layer_str = register.rsplit("@L", 1)
+        try:
+            layer_pin = int(layer_str)
+        except ValueError:
+            # Malformed suffix; treat as unresolvable so caller emits a note.
+            return None, None
+    if base in _STEP_TOKEN_OFFSETS:
+        return _STEP_TOKEN_OFFSETS[base], layer_pin
     # Common alias normalization: "AX" -> "REG_AX", "AX_marker" -> "REG_AX".
-    bare = register.replace("_marker", "")
+    bare = base.replace("_marker", "")
     if bare in ("AX", "PC", "SP", "BP"):
-        return _STEP_TOKEN_OFFSETS[f"REG_{bare}"]
-    if bare == "STACK0":
-        return _STEP_TOKEN_OFFSETS["STACK0"]
-    if bare == "MEM":
-        return _STEP_TOKEN_OFFSETS["MEM"]
-    return None
+        return _STEP_TOKEN_OFFSETS[f"REG_{bare}"], layer_pin
+    if bare in ("STACK0", "MEM"):
+        return _STEP_TOKEN_OFFSETS[bare], layer_pin
+    return None, layer_pin
 
 
 def _pack_instr(opcode: int, imm: int = 0) -> int:
@@ -1258,18 +1330,35 @@ def verify_produces_consumes_multistep(
         layer_idx = _resolve_op_layer(layout, op)
         result.layer_idx = layer_idx
 
+        # Sentinel-only ``produces`` -> tag and skip drift detection.
+        if _is_sentinel_produces(op.produces):
+            kind = _sentinel_kind(op.produces)
+            result.is_sentinel = True
+            result.sentinel_kind = kind
+            descriptor = next(iter(op.produces.values()), "")
+            result.notes.append(
+                f"sentinel produces ({kind}): {descriptor!r}; "
+                f"skipping multistep drift check"
+            )
+            report.results.append(result)
+            continue
+
+        # Default residual layer (op-binding layer + 1). Per-register
+        # ``@L<N>`` suffixes override this on a register-by-register basis.
         if layer_idx is None or layer_idx + 1 >= len(per_layer_residuals):
             # Fall back to the final residual (after all blocks). This
             # gives model-op annotations a chance to be checked too.
-            inspect_layer = len(per_layer_residuals) - 1
-            result.notes.append(
-                f"layer_idx unresolved (kind={op.kind}); "
-                f"inspecting final post-block residual instead"
-            )
+            default_inspect_layer = len(per_layer_residuals) - 1
+            if not any("@L" in r for r in op.produces.values()):
+                # Only warn when none of the registers carry an @L pin --
+                # ops that pin every register don't need the fallback.
+                result.notes.append(
+                    f"layer_idx unresolved (kind={op.kind}); "
+                    f"inspecting final post-block residual instead "
+                    f"(register-level @L<N> pins still honored)"
+                )
         else:
-            inspect_layer = layer_idx + 1
-
-        post_residual = per_layer_residuals[inspect_layer]  # [B, T, D]
+            default_inspect_layer = layer_idx + 1
 
         # For each step + each (dim, register) produces declaration,
         # inspect the residual at the resolved position.
@@ -1279,19 +1368,36 @@ def verify_produces_consumes_multistep(
                 continue
             step_k = step_idx + 1  # 1-indexed for reporting
             for dim_name, register in op.produces.items():
+                # Skip sentinel keys in mixed produces dicts.
+                if dim_name in _SENTINEL_PRODUCES:
+                    continue
                 if dim_name not in layout.dim_positions:
                     result.notes.append(
                         f"step {step_k}: produces {dim_name!r}: "
                         f"dim not in layout"
                     )
                     continue
-                offset = _resolve_register_offset(register)
+                offset, pinned_layer = _resolve_register_offset(register)
                 if offset is None:
                     result.notes.append(
                         f"step {step_k}: produces {dim_name!r}={register!r}: "
                         f"register name not resolvable to a step offset"
                     )
                     continue
+                # Per-register @L<N> override takes precedence over the
+                # op-layer default. Clamp to valid range and warn if out.
+                if pinned_layer is not None:
+                    if pinned_layer + 1 >= len(per_layer_residuals):
+                        result.notes.append(
+                            f"step {step_k}: produces {dim_name!r}={register!r}: "
+                            f"@L{pinned_layer} out of range "
+                            f"({len(per_layer_residuals)-1} blocks); skipping"
+                        )
+                        continue
+                    inspect_layer = pinned_layer + 1
+                else:
+                    inspect_layer = default_inspect_layer
+                post_residual = per_layer_residuals[inspect_layer]  # [B,T,D]
                 # marker_map["REG_PC"] is the step's base position (REG_PC
                 # is at relative offset 0); add the in-step offset to land
                 # on the register-specific slot.
