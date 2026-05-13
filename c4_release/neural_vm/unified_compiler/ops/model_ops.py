@@ -132,14 +132,18 @@ def make_function_call_weights_op() -> Operation:
         layer_idx=6,
         ffn_units_used=2278,
         # Layer-pinned produces: this op writes V-relays across L5 attn
-        # (heads 5/6 ENT relays) and L6 attn (head 7 JSR PC return-addr).
-        # ``@L<N>`` suffix tells the multistep probe which layer's
-        # post-block residual to inspect (rather than the final residual,
-        # the kind="model" fallback). Produces fire only on ENT/JSR steps.
+        # (heads 5/6 ENT relays for ENT-old_BP / ENT-old_SP) and L6 attn
+        # (head 7 JSR PC return-addr). ``@<op_name>`` references the layer
+        # where the named op landed, resolved at verify time via ``layout``
+        # -- so dynamic layer reallocation (kind="block" deps shifting the
+        # topo order) can't silently invalidate the pin like a hard-coded
+        # ``@L<N>`` would. ``layer5_fetch`` (kind="block", layer_idx=5)
+        # and ``layer6_routing_ffn`` (kind="block", layer_idx=6) are the
+        # canonical anchor ops at those layers.
         produces={
-            'TEMP': 'STACK0_marker@L5',
-            'AX_CARRY_LO': 'STACK0_marker@L6',
-            'AX_CARRY_HI': 'STACK0_marker@L6',
+            'TEMP': 'STACK0_marker@layer5_fetch',
+            'AX_CARRY_LO': 'STACK0_marker@layer6_routing_ffn',
+            'AX_CARRY_HI': 'STACK0_marker@layer6_routing_ffn',
         },
         # Tier C: V-relay units fire on every step regardless of OP_JSR/ENT
         # (MoE pathology — units write into non-opcode dims). 2fa04dd kept
@@ -213,16 +217,19 @@ def make_opcode_relay_head_op() -> Operation:
         migrated=True,
         # Layer-pinned produces: head 6 writes CMP/PSH_AT_SP/OP_*/MEM relays
         # at L6's post-block residual, sourced from OP_* flags decoded by
-        # L5 FFN at AX. ``@L6`` tells the multistep probe to inspect L6's
-        # post-block residual instead of the final (kind="model" fallback).
+        # L5 FFN at AX. ``@layer6_routing_ffn`` resolves to whichever layer
+        # the L6-pinned routing FFN landed at (currently layer_idx=6); the
+        # probe inspects that layer's post-block residual instead of the
+        # final residual (the kind="model" default). See
+        # ``make_function_call_weights_op`` for rationale on op-name pins.
         produces={
-            'CMP': 'SP_marker@L6',
-            'PSH_AT_SP': 'SP_marker@L6',
-            'OP_JSR': 'STACK0_marker@L6',
-            'OP_ENT': 'STACK0_marker@L6',
-            'OP_LEV': 'PC_marker@L6',
-            'MEM_STORE': 'MEM_marker@L6',
-            'MEM_ADDR_SRC': 'MEM_marker@L6',
+            'CMP': 'SP_marker@layer6_routing_ffn',
+            'PSH_AT_SP': 'SP_marker@layer6_routing_ffn',
+            'OP_JSR': 'STACK0_marker@layer6_routing_ffn',
+            'OP_ENT': 'STACK0_marker@layer6_routing_ffn',
+            'OP_LEV': 'PC_marker@layer6_routing_ffn',
+            'MEM_STORE': 'MEM_marker@layer6_routing_ffn',
+            'MEM_ADDR_SRC': 'MEM_marker@layer6_routing_ffn',
         },
     )
 
