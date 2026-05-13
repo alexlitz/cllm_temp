@@ -94,11 +94,38 @@ def make_layer0_threshold_attn_op() -> Operation:
         # = slope*threshold = 45, then ALiBi at d=4 deducts 40 -> s_target=5)
         # but the softmax mass tops out at ~98.7% because s_target=5 only
         # barely clears the softmax1 anchor (need s_target >~ ln(99)+margin).
-        # Audit doc 87442ad recommends "bump K-scale ~2.0x (raise s_target)"
-        # — implemented here by doubling W_k[base_H1, IS_MARK] so Q*K
-        # doubles and s_target lifts from 5 to ~50.
+        # Audit doc 87442ad recommended "bump K-scale ~2.0x (raise s_target)";
+        # the original implementation doubled W_k[head1_base, IS_MARK] only.
+        #
+        # Bug fix 2026-05-12 (fix-phase2-3-psh-stack0):
+        # Doubling W_k alone doubled Q*K/sqrt(HD) from 45 to 90 *without*
+        # changing the ALiBi slope, which shifted the H1 score
+        # zero-crossing from d=4.5 to d=9. Concrete consequences:
+        #
+        #   - H1[BP_I] (and H1[PC_I], H1[AX_I], etc.) stayed near 1.0
+        #     across d=5..8 from any IS_MARK token instead of falling to 0.
+        #   - phase_a_ffn's NEXT_STACK0 unit fires on "H1[BP_I] AND NOT
+        #     H0[BP_I]"; with the wider H1 this was true at d=4..8 (5
+        #     positions in a row), so the LM head emitted 5 STACK0
+        #     marker tokens on PSH steps instead of marker + 4 value
+        #     bytes. L1 FFN's STACK0_BYTE0 flag attached at the wrong
+        #     positions and L7 head 0 (operand gather) read CLEAN_EMBED
+        #     from the wrong column, so ADD's operand A came back as 0
+        #     (test_add_basic 10+32 -> 32 instead of 42).
+        #
+        # The fix: pair the K-scale bump with a matching slope bump on
+        # head 1 so BOTH Q*K and slope*d sides scale together — keeping
+        # the zero-crossing at d=4.5 while sharpening softmax mass at
+        # d=4 from 98.7% to ~99.995%. Many downstream consumers
+        # (L3 carry-forward, L4 PC relay, L7 operand gather, L8/L10 byte
+        # passthrough heads, L16 LEV routing FFN, etc.) read H1[*_I] as
+        # a position-band selector with the contract "fires only when
+        # nearest IS_MARK is within d=4". Restoring that contract here
+        # avoids fanning the fix out to every consumer.
         head1_base = 1 * HD
         attn.W_k[head1_base, proxy.IS_MARK] *= 2.0
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[1] = ALIBI_S * 2.0
 
     # Dim-ownership claims: ``_set_threshold_attn`` writes per head h:
     #   W_q[h*HD, CONST]    : the head's bias (slot 0)
