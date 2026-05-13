@@ -328,6 +328,90 @@ MoE = SoftMoEFFN
 StandardMoEFFN = SoftMoEFFN
 
 
+def _tighten_partition_by_no_opcode_firing(
+    compact_ffn: PureFFN,
+    opcode_to_units: dict,
+    shared_indices: list,
+    opcode_dims_all: Sequence[int],
+    relay_dims: Sequence[int] = (),
+    epsilon: float = 1e-4,
+    batch_size: int = 1024,
+    seed: int = 0,
+) -> tuple:
+    """Re-classify opcode-specific units that still fire without their opcode.
+
+    Path A from ``c4_release/docs/MOE_ROUTING_AUDIT.md`` §8.3: the legacy
+    ``_partition_compact_ffn_by_opcode`` labels a hidden unit as opcode-X
+    specific when ``W_up[i, OP_X] > 0.5`` (plus a CMP relay map). But the
+    same unit can still pick up substantial activation from OTHER input
+    dims at non-MARK_PC positions. Routing it to an opcode-gated expert
+    (gate=0 when OP_X is inactive) drops that contribution, breaking
+    byte-identity with the dense FFN.
+
+    This pass empirically measures each candidate unit's silu*gate
+    contribution on a "no-opcode" synthetic batch (random residual values,
+    OP_* and relay dims forced to zero). Units whose max contribution
+    exceeds ``epsilon`` are moved to the shared expert. Clean units (those
+    that truly fire only when their opcode is active) stay in their expert.
+
+    Returns:
+        ``(tightened_opcode_to_units, tightened_shared_indices)``.
+    """
+    W_up = compact_ffn.W_up.data
+    b_up = compact_ffn.b_up.data
+    W_gate = compact_ffn.W_gate.data
+    b_gate = compact_ffn.b_gate.data
+
+    D = W_up.shape[1]
+    device = W_up.device
+    dtype = W_up.dtype
+
+    # Gaussian residual-stream values with OP_* and relay dims forced to
+    # zero — simulates the non-MARK_PC positions where the MoE routing
+    # gate is 0 but other dims still carry signal.
+    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+    x = torch.randn(batch_size, D, generator=gen).to(device=device, dtype=dtype)
+    excluded_idx = sorted(
+        {int(d) for d in opcode_dims_all} | {int(d) for d in relay_dims}
+    )
+    excluded_idx = [d for d in excluded_idx if 0 <= d < D]
+    if excluded_idx:
+        x.index_fill_(
+            -1,
+            torch.tensor(excluded_idx, dtype=torch.long, device=device),
+            0.0,
+        )
+
+    # We test the hidden activation (silu*gate), not the post-W_down delta,
+    # so units with small W_down columns still get flagged when they'd
+    # compose with downstream layers.
+    with torch.no_grad():
+        up = F.linear(x, W_up, b_up)
+        gate = F.linear(x, W_gate, b_gate)
+        unit_max = (F.silu(up) * gate).abs().amax(dim=0).tolist()
+
+    dirty: set = set()
+    tight_opcode_to_units: dict = {}
+    for opcode_dim, units in opcode_to_units.items():
+        kept = [int(i) for i in units if unit_max[i] <= epsilon]
+        dirty.update(int(i) for i in units if unit_max[i] > epsilon)
+        if kept:
+            tight_opcode_to_units[opcode_dim] = kept
+
+    # A relay-mapped unit may have been kept under one opcode and flagged
+    # dirty under another; drop those leftovers now that the full dirty
+    # set is known.
+    for opcode_dim in list(tight_opcode_to_units.keys()):
+        cleaned = [i for i in tight_opcode_to_units[opcode_dim] if i not in dirty]
+        if cleaned:
+            tight_opcode_to_units[opcode_dim] = cleaned
+        else:
+            del tight_opcode_to_units[opcode_dim]
+
+    tight_shared = sorted(set(shared_indices).union(dirty))
+    return tight_opcode_to_units, tight_shared
+
+
 def build_soft_moe_from_compact_partition(
     compact_ffn: PureFFN,
     opcode_to_units: dict,
@@ -335,6 +419,10 @@ def build_soft_moe_from_compact_partition(
     dim: int,
     pure_neural: bool = False,
     top_k: int = 1,
+    tighten: bool = True,
+    tighten_epsilon: float = 1e-4,
+    opcode_dims_all: Sequence[int] = None,
+    relay_dims: Sequence[int] = (),
 ) -> SoftMoEFFN:
     """Construct a top-K ``SoftMoEFFN`` from an already-partitioned compact FFN.
 
@@ -353,11 +441,42 @@ def build_soft_moe_from_compact_partition(
         pure_neural: Back-compat no-op forwarded to ``SoftMoEFFN``.
         top_k: Number of experts to route per token. Defaults to 1 because
             C4 dispatches exactly one opcode per step.
+        tighten: When True (default), run the Path A "no-opcode firing"
+            tightening pass that re-routes any opcode-specific unit which
+            still produces non-trivial output on a synthetic batch with
+            all OP_* / relay dims zeroed. Units that fail this test go to
+            the shared expert so their dense-path contribution at
+            non-MARK_PC positions is preserved (closes the byte-identity
+            gap described in ``MOE_ROUTING_AUDIT.md`` §8). Set to False
+            for the legacy (non-byte-identical) partition.
+        tighten_epsilon: Threshold for "non-trivial" firing. Units whose
+            ``max|silu(up) * gate|`` on the no-opcode batch exceeds this
+            value are reclassified as shared.
+        opcode_dims_all: Full set of OP_* dims to zero on the no-opcode
+            synthetic batch. Defaults to the keys of ``opcode_to_units``.
+            Callers with a wider opcode range (compiler-allocated layout)
+            should pass it explicitly so unused OP_* dims are also zeroed.
+        relay_dims: Additional dims (e.g. CMP relay columns) to zero on
+            the synthetic batch. Without this, units that depend on a CMP
+            relay dim would appear "dirty" simply because the relay dim
+            is non-zero in the random batch.
 
     Returns:
         ``SoftMoEFFN`` with one expert per opcode, optional shared FFN,
         and the routing-dim list pre-populated.
     """
+    if tighten:
+        if opcode_dims_all is None:
+            opcode_dims_all = list(opcode_to_units.keys())
+        opcode_to_units, shared_indices = _tighten_partition_by_no_opcode_firing(
+            compact_ffn,
+            opcode_to_units,
+            shared_indices,
+            opcode_dims_all=opcode_dims_all,
+            relay_dims=relay_dims,
+            epsilon=tighten_epsilon,
+        )
+
     W_up = compact_ffn.W_up.data
     b_up = compact_ffn.b_up.data
     W_gate = compact_ffn.W_gate.data
