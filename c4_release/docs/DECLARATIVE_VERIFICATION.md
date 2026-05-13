@@ -199,6 +199,67 @@ production default), Mode B reports it as inert; with `enable=True`,
 Mode B verifies the AX_CARRY_LO/HI residual at the AX marker becomes
 non-zero after the L8 attention layer runs.
 
+## Routine execution
+
+The verifier is gated behind the `validator` pytest marker so smoke
+runs (`pytest`) skip it by default. Routine execution paths:
+
+### `make validate`
+
+The headline target. Runs every test under `-m validator` with short
+tracebacks:
+
+```bash
+cd c4_release
+make validate         # Mode A + Mode B+ multistep cascade probe
+make validate-strict  # opt-in strict-mode (currently empty marker set)
+```
+
+`make validate` is the recommended invocation for contributors before
+opening a PR and for the nightly cadence. Wall clock is ~60-90s on a
+warm cache; the multistep tests share one bake via a class-scoped
+fixture.
+
+### Pre-commit hook
+
+The local `validator` hook in `c4_release/.pre-commit-config.yaml`
+runs `pytest -m validator --tb=line -q` at the **pre-push** stage
+(not pre-commit). Pre-push was chosen because the verifier wall is too
+heavy for the sub-second budget pre-commit needs. To enable:
+
+```bash
+pip install pre-commit
+pre-commit install --hook-type pre-push
+```
+
+To run on every commit instead, change `stages: [pre-push]` to
+`stages: [pre-commit]` in the config (not recommended on slow
+machines).
+
+### `C4_VALIDATE_ON_COMPILE=1`
+
+Run Mode A as a warn-only sanity check at the end of every
+`compile_full_vm()` call. Drift is reported via `warnings.warn` (and
+optionally `print(report.format())` if `C4_VALIDATE_VERBOSE=1`); the
+compile never fails. Useful when chasing a regression because every
+test that builds the model becomes a verifier run.
+
+```bash
+C4_VALIDATE_ON_COMPILE=1 pytest c4_release/tests/test_smoke.py -v
+C4_VALIDATE_ON_COMPILE=1 C4_VALIDATE_VERBOSE=1 python -m my_repro
+```
+
+Default is off; production builds are unaffected.
+
+### When to use each
+
+| Path | Cost | When |
+|------|------|------|
+| `make validate` | 60-90s | Local dev pre-PR; nightly CI |
+| Pre-push hook | 60-90s | Every `git push` (after `pre-commit install --hook-type pre-push`) |
+| `C4_VALIDATE_ON_COMPILE=1` | adds 60-90s per compile | Regression hunting; never in production |
+| `pytest -m validator_strict` | varies | Opt-in nightly when ops adopt full-coverage claims |
+
 ## Future work
 
 - Extend the verifier to cover `embed_row` claims end-to-end (currently

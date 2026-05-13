@@ -53,6 +53,22 @@ repos:
     hooks:
       - id: validate-pyproject
 
+  # Declarative op verifier (validator marker).
+  # Gated to ``pre-push`` rather than ``pre-commit`` because the full
+  # verifier bake-and-probe runs ~60-90s on a warm cache. Pre-commit
+  # should stay sub-second; pre-push is the right place for the heavier
+  # gate. To run on every commit instead, change ``stages`` to
+  # ``[pre-commit]``.
+  - repo: local
+    hooks:
+      - id: validator
+        name: Declarative verifier (validator marker)
+        entry: pytest -m validator --tb=line -q
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]
+
 # CI configuration
 ci:
   autofix_commit_msg: |
