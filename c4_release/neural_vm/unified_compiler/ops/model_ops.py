@@ -143,6 +143,17 @@ def make_function_call_weights_op() -> Operation:
             "AX_CARRY_HI": "STACK0",
             "TEMP": "STACK0",
         },
+        # Tier C annotations: V-relay units write into NON-opcode dims
+        # (EMBED_LO/HI columns at unrelated rows), firing on every step
+        # regardless of OP_JSR/OP_ENT — the MoE pathology fixed in 2fa04dd.
+        # compaction_safe=False so verify_compaction_safety cross-checks
+        # that _tighten_partition_by_no_opcode_firing keeps these units in
+        # the shared expert.
+        smoke_tests={
+            "TestSmokeFunctionCall::test_simple_function",
+        },
+        spec_section="BLOG_SPEC.md#function-calls",
+        compaction_safe=False,
     )
 
 

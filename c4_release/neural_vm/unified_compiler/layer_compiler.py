@@ -196,6 +196,44 @@ class Operation:
     # and the canonical AX_CARRY example.
     produces: Dict[str, str] = field(default_factory=dict)
     consumes_fresh: Dict[str, str] = field(default_factory=dict)
+    # Tier C discoverability annotations (opt-in bookkeeping; default empty/safe
+    # so all existing ops remain back-compat).
+    #
+    #   ``smoke_tests``: set of ``"TestClass::test_method"`` identifiers
+    #       naming the smoke tests claimed to exercise this op. The
+    #       ``audit_smoke_coverage`` detector in ``decl_verifier`` builds a
+    #       coverage matrix from this annotation and flags ops with empty
+    #       ``smoke_tests`` as untested. The values are bookkeeping only --
+    #       nothing automatically derives the mapping from a real smoke run,
+    #       so the annotation is intentionally a hand-curated list. The
+    #       sentinel value ``"all"`` is allowed and means "this op fires on
+    #       every program" (e.g. ``make_layer3_ffn_op`` which writes the PC
+    #       byte 0 first-step default on every step).
+    #
+    #   ``spec_section``: optional reference to a section in
+    #       ``c4_release/docs/BLOG_SPEC.md`` that motivates this op. Two
+    #       formats are accepted by ``audit_spec_coverage``:
+    #         - heading anchor: ``"BLOG_SPEC.md#binary-ALU"`` -- matched
+    #           case-insensitively against the slugified heading text.
+    #         - line range:     ``"BLOG_SPEC.md:451-490"`` -- matched
+    #           by inclusive 1-indexed line range against the file.
+    #       ``None`` (the default) marks the op as undocumented; the
+    #       detector reports the count of undocumented ops as an
+    #       informational warning.
+    #
+    #   ``compaction_safe``: whether the op's FFN output is safe to MoE-route
+    #       (i.e. the op's FFN hidden units are one-hot-opcode-gated).
+    #       Defaults to ``True`` -- the conservative assumption is that an
+    #       op IS MoE-safe unless flagged otherwise. Set to ``False`` to
+    #       force the op's units into the shared expert; the
+    #       ``verify_compaction_safety`` detector cross-checks
+    #       ``compaction_safe=False`` declarations against the actual MoE
+    #       partition (``_partition_compact_ffn_by_opcode`` +
+    #       ``_tighten_partition_by_no_opcode_firing``) and warns when an
+    #       op's units are misclassified.
+    smoke_tests: Set[str] = field(default_factory=set)
+    spec_section: Optional[str] = None
+    compaction_safe: bool = True
 
     def __hash__(self):
         return hash(self.name)
@@ -341,6 +379,29 @@ class LayerCompiler:
                         f"Op {op.name!r} {fname} references undeclared dim "
                         f"{dim_name!r}"
                     )
+        # Validate Tier C discoverability annotations (opt-in, default empty
+        # values so unannotated ops never fail this check).
+        if not isinstance(op.smoke_tests, set):
+            raise ValueError(
+                f"Op {op.name!r} smoke_tests must be a set; "
+                f"got {type(op.smoke_tests).__name__}"
+            )
+        for entry in op.smoke_tests:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"Op {op.name!r} smoke_tests entry must be str; "
+                    f"got {entry!r}"
+                )
+        if op.spec_section is not None and not isinstance(op.spec_section, str):
+            raise ValueError(
+                f"Op {op.name!r} spec_section must be str or None; "
+                f"got {type(op.spec_section).__name__}"
+            )
+        if not isinstance(op.compaction_safe, bool):
+            raise ValueError(
+                f"Op {op.name!r} compaction_safe must be bool; "
+                f"got {type(op.compaction_safe).__name__}"
+            )
         # Validate dim-ownership claims (if any). Accept legacy 3-tuple
         # ``(layer_idx, scope, identifier)`` and auto-promote to 4-tuple with
         # ``column=None`` for back-compat with pre-column-granularity ops.

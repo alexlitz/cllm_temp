@@ -61,9 +61,7 @@ def make_phase_a_ffn_op() -> Operation:
         # Staleness invariants: NEXT_* flags fire at the token that
         # immediately precedes the corresponding marker (position N
         # predicts position N+1). The LM head consumes these to emit
-        # the next marker token. We pin each NEXT_* to the token that
-        # writes it; threshold-head differences make these deterministic
-        # across all steps.
+        # the next marker token.
         produces={
             "NEXT_AX": "PC_byte3",
             "NEXT_SP": "AX_byte3",
@@ -73,6 +71,11 @@ def make_phase_a_ffn_op() -> Operation:
             "NEXT_SE": "MEM_VAL_byte3",
             "NEXT_PC": "STEP_END",
         },
+        # Tier C: fires every program; marker transitions are opcode-independent
+        # so the MoE partition correctly keeps these units in the shared expert.
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+        compaction_safe=True,
     )
 
 

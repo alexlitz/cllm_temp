@@ -26,15 +26,21 @@ sys.path.insert(
 
 
 from c4_release.neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
+    CompactionSafetyReport,
     MultistepDriftEntry,
     MultistepVerificationReport,
     OpVerificationResult,
+    SmokeCoverageReport,
+    SpecCoverageReport,
     StaticVerificationReport,
     _ADD_CASCADE_PROGRAM,
     _build_multistep_probe,
     _pack_instr,
     _resolve_register_offset,
+    audit_smoke_coverage,
+    audit_spec_coverage,
     verify_claims_static,
+    verify_compaction_safety,
     verify_produces_consumes_dynamic,
     verify_produces_consumes_multistep,
 )
@@ -460,3 +466,144 @@ class TestMultistepProbe:
             "actually expected to fire on step 3. Report:\n"
             + report.format()
         )
+
+
+# ----------------------------------------------------------------------
+# Tier C discoverability bookkeeping audits
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.validator
+class TestSmokeCoverageBookkeeping:
+    """Bookkeeping check on ``Operation.smoke_tests`` annotations.
+
+    Not a correctness gate -- the audit reports ops with empty
+    ``smoke_tests`` as an informational warning so future test-coverage
+    work can prioritize them. The only hard invariant: at least one op
+    must declare a non-empty ``smoke_tests`` set, otherwise the
+    annotation infrastructure has silently regressed.
+    """
+
+    @pytest.fixture(scope="class")
+    def report(self):
+        return audit_smoke_coverage()
+
+    def test_at_least_one_op_has_smoke_tests(self, report):
+        annotated = [
+            name for name, tests in report.coverage.items() if tests
+        ]
+        assert annotated, (
+            "no op declares smoke_tests; Tier C annotation infrastructure "
+            "regressed (empty across the board)."
+        )
+
+    def test_known_tier_c_examples_present(self, report):
+        """The example ops the Tier C agent annotated must be in coverage."""
+        for name in ("layer8_alu", "layer7_operand_gather",
+                     "function_call_weights", "phase_a_ffn", "layer3_ffn"):
+            assert name in report.coverage, (
+                f"op {name!r} missing from smoke-coverage audit -- did "
+                f"its registration drift out of all_core_ops?"
+            )
+        # The 5 example ops should all carry non-empty smoke_tests.
+        for name in ("layer8_alu", "layer7_operand_gather",
+                     "function_call_weights", "phase_a_ffn", "layer3_ffn"):
+            assert report.coverage[name], (
+                f"op {name!r} declared no smoke_tests after the Tier C "
+                f"annotation pass."
+            )
+
+    def test_untested_op_count_informational(self, report):
+        """Surfaces untested op count without failing.
+
+        The actual list is informational so a future agent can pick up
+        coverage targets. We do not assert on the count -- a fresh
+        annotation campaign will draw it down over time.
+        """
+        # Bookkeeping only: print/format so failures surface the list.
+        formatted = report.format()
+        assert formatted.startswith("=== Smoke coverage bookkeeping ===")
+
+
+@pytest.mark.validator
+class TestSpecCoverage:
+    """Bookkeeping check on ``Operation.spec_section`` annotations.
+
+    Like the smoke-coverage audit this is informational (the BLOG_SPEC
+    file evolves independently of the op set). The only hard invariant:
+    at least one op declares a non-empty ``spec_section`` and the spec
+    file itself parses to at least one heading.
+    """
+
+    @pytest.fixture(scope="class")
+    def report(self):
+        return audit_spec_coverage()
+
+    def test_at_least_one_op_has_spec_section(self, report):
+        annotated_ops = sum(len(ops) for ops in report.coverage.values())
+        assert annotated_ops >= 1, (
+            "no op declares spec_section; Tier C annotation infrastructure "
+            "regressed (BLOG_SPEC cross-reference vanished)."
+        )
+
+    def test_spec_file_parses_headings(self, report):
+        assert len(report.all_sections) >= 1, (
+            "BLOG_SPEC.md parsed zero headings -- spec file moved or "
+            "audit's heading regex broke."
+        )
+
+    def test_known_tier_c_examples_have_spec(self, report):
+        annotated_op_names: set = set()
+        for ops in report.coverage.values():
+            annotated_op_names.update(ops)
+        for name in ("layer8_alu", "function_call_weights"):
+            assert name in annotated_op_names, (
+                f"op {name!r} did not receive a spec_section in the "
+                f"Tier C annotation pass."
+            )
+
+
+@pytest.mark.validator
+class TestCompactionSafety:
+    """Bookkeeping check on ``Operation.compaction_safe`` annotations.
+
+    The audit cross-checks ``compaction_safe=False`` declarations against
+    a MoE partition when one is provided. The current test runs the audit
+    WITHOUT a partition -- the MoE partition only exists post-compact,
+    which is a heavy operation. We document the available partition_unavailable
+    flag and assert the declarations are well-formed (no orphan flags).
+    A follow-up agent can wire the actual partition through to get the
+    full cross-check.
+    """
+
+    @pytest.fixture(scope="class")
+    def report(self):
+        return verify_compaction_safety()
+
+    def test_audit_runs_and_reports_unsafe_ops(self, report):
+        assert isinstance(report, CompactionSafetyReport)
+        # Bookkeeping invariant: at least one op was annotated either
+        # way. The default is compaction_safe=True, so declared_safe
+        # should always be populated post-compile.
+        assert report.declared_safe, (
+            "no op declares compaction_safe=True; default-True invariant "
+            "regressed."
+        )
+
+    def test_known_unsafe_op_flagged(self, report):
+        """The example ``function_call_weights`` is the canonical
+        compaction-unsafe op -- its V-relay units fire on non-opcode
+        positions (the MoE pathology fixed in commit 2fa04dd).
+        """
+        assert "function_call_weights" in report.declared_unsafe, (
+            "function_call_weights should be declared compaction_safe=False "
+            "per Tier C example annotation."
+        )
+
+    def test_partition_unavailable_yields_empty_mismatches(self, report):
+        """When the audit runs without a partition, mismatches is empty
+        and partition_unavailable=True. Documents the invariant for
+        future agents that wire a real partition through.
+        """
+        if report.partition_unavailable:
+            assert not report.mismatches
