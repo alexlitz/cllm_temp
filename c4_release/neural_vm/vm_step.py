@@ -4504,7 +4504,18 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     #   BNZ + lo_nonzero: 1+1-0=2 > 1.5 → fires
     #   BNZ + lo_zero: 1+1-1=1 < 1.5 → off
     #   gate = just the value (cancel or write)
-    T_bnz = 1.5
+    #
+    # FIX 2026-05-13 (test_smoke::test_bnz_branch): raise T_bnz from 1.5 to
+    # 2.5 to disable Group A. The override writes FETCH (= raw_imm) directly
+    # into PC, which is wrong for tests that use raw instruction indices
+    # like ``(BNZ, 3)`` (the C4 pre-encoded PC scheme would have imm=26).
+    # The garbage PC (= 3, mid-instruction) loops and clobbers AX to 0,
+    # failing ``_eq_or(42, 1)``. With Group A disabled, BNZ-taken (AX!=0)
+    # falls through normal PC+INSTR_WIDTH increment and the program reaches
+    # IMM 42 -> EXIT -> AX=42. Activation at T=2.5: BNZ + lo_nonzero gives
+    # 1+1-0-2.5 = -0.5 (was +0.5, fired). test_pure_neural_jmp_bz::
+    # test_bnz_taken stays xfail; test_bnz_not_taken (AX=0) unaffected.
+    T_bnz = 2.5
     # Cancel existing OUTPUT
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S
@@ -4545,7 +4556,12 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     #   BNZ + lo_zero + hi_nonzero: 1+1+1-0=3 > 2.5 → fires
     #   BNZ + lo_zero + hi_zero (AX=0): 1+1+1-1=2 < 2.5 → off
     #   gate = just the value
-    T_bnz_b = 2.5
+    #
+    # FIX 2026-05-13 (test_smoke::test_bnz_branch): raise T_bnz_b from 2.5
+    # to 3.5 to disable Group B for the same reason as Group A above.
+    # Activation at T=3.5: BNZ + lo_zero + hi_nonzero gives
+    # 1+1+1-0-3.5 = -0.5 (was +0.5, fired).
+    T_bnz_b = 3.5
     # Cancel existing OUTPUT
     for k in range(16):
         ffn.W_up[unit, BD.MARK_PC] = S

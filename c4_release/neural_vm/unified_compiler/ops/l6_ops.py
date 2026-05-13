@@ -209,6 +209,26 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _set_bz_bnz_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims: L6 attn head 4 BZ/BNZ relay (AX byte 0 → PC marker).
+    # ``_set_bz_bnz_relay`` (setup_helpers.py:1384) writes 4 load-bearing
+    # V/O slot pairs that copy OP_BZ, OP_BNZ, EMBED_LO[0] (AX_LO==0),
+    # EMBED_HI[0] (AX_HI==0) into CMP[2..5] at the PC marker:
+    #   W_v[4*HD + 1, OP_BZ] → W_o[CMP+2, 4*HD + 1]   (OP_BZ flag)
+    #   W_v[4*HD + 2, OP_BNZ] → W_o[CMP+3, 4*HD + 2] (OP_BNZ flag)
+    #   W_v[4*HD + 3, EMBED_LO+0] → W_o[CMP+4, 4*HD + 3] (AX lo==0)
+    #   W_v[4*HD + 4, EMBED_HI+0] → W_o[CMP+5, 4*HD + 4] (AX hi==0)
+    # The L6 FFN gates BZ/BNZ taken/not-taken branches on these CMP flags.
+    _claims = {
+        (6, "attn_W_v", "4_1", "OP_BZ+0"),
+        (6, "attn_W_v", "4_2", "OP_BNZ+0"),
+        (6, "attn_W_v", "4_3", "EMBED_LO+0"),
+        (6, "attn_W_v", "4_4", "EMBED_HI+0"),
+        (6, "attn_W_o", "4_1", "CMP+2"),
+        (6, "attn_W_o", "4_2", "CMP+3"),
+        (6, "attn_W_o", "4_3", "CMP+4"),
+        (6, "attn_W_o", "4_4", "CMP+5"),
+    }
+
     return Operation(
         name="layer6_bz_bnz_relay_bake",
         phase=998.7,
@@ -217,6 +237,14 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
+        # Produces the BZ/BNZ branch-decision CMP flags at the PC marker.
+        # L6 FFN consumes CMP[2..5] to decide branch taken vs not-taken for
+        # the BZ (4-way AND on CMP[2], [4], [5]) and BNZ (2-group AX!=0)
+        # paths. Marker label "PC_marker" pins the AX→PC relay direction.
+        produces={
+            "CMP": "PC_marker",
+        },
     )
 
 
