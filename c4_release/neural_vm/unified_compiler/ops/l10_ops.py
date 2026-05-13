@@ -570,6 +570,14 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         phase=10.7,
         layer_idx=10,
         migrated=True,
+        # Module-replacement sentinel: this op installs hand-written
+        # post_op modules (BinaryOpByteZeroingPostOp / CarryPropagationPostOp
+        # / BitwiseBytePropagationPostOp / ComparisonCombine) onto
+        # ``block.post_ops`` instead of writing weight cells into the
+        # original PureFFN. The static (Mode A) check has no per-cell
+        # writes to verify; the dynamic check would look in the wrong
+        # spot. See _SENTINEL_PRODUCES in ``decl_verifier.py``.
+        produces={'__module_replacement': 'L10.post_ops'},
     )
 
 

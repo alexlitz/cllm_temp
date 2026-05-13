@@ -131,24 +131,20 @@ def make_function_call_weights_op() -> Operation:
         # layer_idx field doesn't affect their bake execution.
         layer_idx=6,
         ffn_units_used=2278,
-        # Staleness invariants: the function-call relay heads write the
-        # canonical saved-register relays at STACK0 (ENT stores old_BP via
-        # L5 head 5; JSR stores return-PC via L6 head 7 into AX_CARRY) and
-        # at BP (ENT stores old_SP via L5 head 6 into TEMP). Pick STACK0
-        # as the canonical register for the AX_CARRY-shaped JSR-return-PC
-        # relay; BP for the SP-saving ENT path is documented in the
-        # docstring but only single-register produces is supported.
+        # Layer-pinned produces: this op writes V-relays across L5 attn
+        # (heads 5/6 ENT relays) and L6 attn (head 7 JSR PC return-addr).
+        # ``@L<N>`` suffix tells the multistep probe which layer's
+        # post-block residual to inspect (rather than the final residual,
+        # the kind="model" fallback). Produces fire only on ENT/JSR steps.
         produces={
-            "AX_CARRY_LO": "STACK0",
-            "AX_CARRY_HI": "STACK0",
-            "TEMP": "STACK0",
+            'TEMP': 'STACK0_marker@L5',
+            'AX_CARRY_LO': 'STACK0_marker@L6',
+            'AX_CARRY_HI': 'STACK0_marker@L6',
         },
-        # Tier C annotations: V-relay units write into NON-opcode dims
-        # (EMBED_LO/HI columns at unrelated rows), firing on every step
-        # regardless of OP_JSR/OP_ENT — the MoE pathology fixed in 2fa04dd.
-        # compaction_safe=False so verify_compaction_safety cross-checks
-        # that _tighten_partition_by_no_opcode_firing keeps these units in
-        # the shared expert.
+        # Tier C: V-relay units fire on every step regardless of OP_JSR/ENT
+        # (MoE pathology — units write into non-opcode dims). 2fa04dd kept
+        # them in the shared expert; this flag lets verify_compaction_safety
+        # cross-check that.
         smoke_tests={
             "TestSmokeFunctionCall::test_simple_function",
         },
@@ -215,25 +211,18 @@ def make_opcode_relay_head_op() -> Operation:
         bake_fn=bake,
         phase=1002,
         migrated=True,
-        # Staleness invariants: L6 attn head 6 attends to AX marker from
-        # SP/STACK0/BP/PC/MEM markers and copies scaled opcode flags + relays.
-        # The head's V slots write CMP/OP_LEV/OP_JSR/OP_ENT/PSH_AT_SP +
-        # MEM_STORE/MEM_ADDR_SRC at those query markers. Annotating the
-        # most consumer-relevant produces below; the marker chosen is the
-        # downstream consumer's site of read.
+        # Layer-pinned produces: head 6 writes CMP/PSH_AT_SP/OP_*/MEM relays
+        # at L6's post-block residual, sourced from OP_* flags decoded by
+        # L5 FFN at AX. ``@L6`` tells the multistep probe to inspect L6's
+        # post-block residual instead of the final (kind="model" fallback).
         produces={
-            # CMP[0..4] relays (PSH/ADJ/POP-group/ENT/JSR) used by L6 FFN
-            # at SP, STACK0, BP positions.
-            "CMP": "STACK0",
-            "PSH_AT_SP": "SP",
-            "OP_JSR": "STACK0",
-            "OP_ENT": "STACK0",
-            # OP_LEV relay needed at PC marker by L9 PC restoration and L15
-            # heads 8-11, plus L16 LEV routing.
-            "OP_LEV": "PC",
-            # MEM-store flag relays at MEM marker for L13/L14 stores.
-            "MEM_STORE": "MEM",
-            "MEM_ADDR_SRC": "MEM",
+            'CMP': 'SP_marker@L6',
+            'PSH_AT_SP': 'SP_marker@L6',
+            'OP_JSR': 'STACK0_marker@L6',
+            'OP_ENT': 'STACK0_marker@L6',
+            'OP_LEV': 'PC_marker@L6',
+            'MEM_STORE': 'MEM_marker@L6',
+            'MEM_ADDR_SRC': 'MEM_marker@L6',
         },
     )
 
@@ -310,6 +299,12 @@ def make_residual_alibi_slopes_op() -> Operation:
         bake_fn=_bake,
         phase=999,
         migrated=True,
+        # Structural sentinel: this op writes ``attn.alibi_slopes`` on
+        # L6/L8/L14/L15 -- positional-bias buffers, not residual-stream
+        # cells. The dynamic verifier inspects residual values at marker
+        # positions and has no way to verify alibi slope writes. See
+        # _SENTINEL_PRODUCES in ``decl_verifier.py``.
+        produces={'__structural': 'alibi_slopes@L6,L8,L14,L15'},
     )
 
 
@@ -576,6 +571,11 @@ def make_right_size_ffns_op() -> Operation:
         bake_fn=bake,
         phase=1200,
         migrated=True,
+        # Structural sentinel: this op trims each block's PureFFN
+        # ``hidden_dim`` to the actually-programmed unit count -- pure
+        # compiler machinery, no residual-dim writes. See
+        # _SENTINEL_PRODUCES in ``decl_verifier.py``.
+        produces={'__structural': 'right_size_ffns'},
     )
 
 
@@ -593,6 +593,11 @@ def make_expand_wrapper_blocks_op() -> Operation:
         bake_fn=bake,
         phase=1300,
         migrated=True,
+        # Structural sentinel: this op splits each HybridALUBlock /
+        # post_ops attachment into separate TransformerBlock instances
+        # -- pure compiler machinery (rewires module topology), no
+        # residual-dim writes. See _SENTINEL_PRODUCES.
+        produces={'__structural': 'expand_wrapper_blocks'},
     )
 
 
@@ -717,5 +722,9 @@ def make_contract_validation_op() -> Operation:
         bake_fn=_bake,
         phase=1199,
         migrated=True,
+        # Structural sentinel: this op is diagnostic-only -- it runs the
+        # ContractValidator and prints any errors but writes nothing.
+        # See _SENTINEL_PRODUCES in ``decl_verifier.py``.
+        produces={'__structural': 'contract_validation'},
     )
 

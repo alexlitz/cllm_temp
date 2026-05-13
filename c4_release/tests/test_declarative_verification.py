@@ -301,22 +301,40 @@ class TestUnitMultistepProbe:
 
     def test_resolve_register_offset_byte_names(self):
         # ``AX_byte0`` is offset 6 within a 35-token step (REG_AX at 5,
-        # then 4 byte slots).
-        assert _resolve_register_offset("AX_byte0") == 6
-        assert _resolve_register_offset("AX_byte3") == 9
-        assert _resolve_register_offset("STACK0_byte0") == 21
-        assert _resolve_register_offset("STACK0_byte3") == 24
+        # then 4 byte slots). ``_resolve_register_offset`` now returns
+        # ``(offset, layer_pin)`` -- layer_pin is None when the name
+        # lacks an @L<N> suffix.
+        assert _resolve_register_offset("AX_byte0") == (6, None)
+        assert _resolve_register_offset("AX_byte3") == (9, None)
+        assert _resolve_register_offset("STACK0_byte0") == (21, None)
+        assert _resolve_register_offset("STACK0_byte3") == (24, None)
 
     def test_resolve_register_offset_bare_marker(self):
         # ``AX``/``AX_marker`` both fall back to REG_AX's offset (5).
-        assert _resolve_register_offset("AX") == 5
-        assert _resolve_register_offset("AX_marker") == 5
-        assert _resolve_register_offset("STACK0") == 20
-        assert _resolve_register_offset("REG_PC") == 0
+        assert _resolve_register_offset("AX") == (5, None)
+        assert _resolve_register_offset("AX_marker") == (5, None)
+        assert _resolve_register_offset("STACK0") == (20, None)
+        assert _resolve_register_offset("STACK0_marker") == (20, None)
+        assert _resolve_register_offset("REG_PC") == (0, None)
 
     def test_resolve_register_offset_unknown_returns_none(self):
-        assert _resolve_register_offset("BOGUS") is None
-        assert _resolve_register_offset("") is None
+        assert _resolve_register_offset("BOGUS") == (None, None)
+        assert _resolve_register_offset("") == (None, None)
+
+    def test_resolve_register_offset_with_layer_suffix(self):
+        # ``@L<N>`` suffix pins the layer for multistep probe inspection.
+        # Multi-layer model ops use this to tell the probe which post-
+        # block residual to read (the default fallback for kind="model"
+        # ops without a resolvable layer is the final post-block residual,
+        # which is wrong for layer-specific writes).
+        assert _resolve_register_offset("AX_byte0@L8") == (6, 8)
+        assert _resolve_register_offset("STACK0_marker@L6") == (20, 6)
+        assert _resolve_register_offset("PC_marker@L6") == (0, 6)
+        assert _resolve_register_offset("REG_AX@L5") == (5, 5)
+        # Malformed @L suffix -> offset None, layer None.
+        assert _resolve_register_offset("AX_byte0@Lfoo") == (None, None)
+        # Unknown base name with valid suffix -> offset None, layer set.
+        assert _resolve_register_offset("BOGUS@L7") == (None, 7)
 
     def test_pack_instr(self):
         # IMM 10 -> opcode=1, imm=10 -> 0x00000a01.
@@ -363,6 +381,134 @@ class TestUnitMultistepProbe:
         assert markers[1]["STACK0_byte0"] == 100
 
 
+class TestSentinelProduces:
+    """Unit tests for the ``__module_replacement`` / ``__structural``
+    sentinel ``produces`` keys.
+
+    Sentinel-only ops document that they intentionally fall outside the
+    standard residual-dim schema -- module-replacement ops swap a whole
+    submodule (e.g. ``block.ffn = HybridALUBlock(...)``) while structural
+    ops are compiler machinery (right-size FFNs, expand wrapper blocks,
+    contract validation) or write non-residual buffers (alibi_slopes).
+    Mode B / Mode B+ skip drift detection for sentinel ops; the report
+    tags them as ``is_sentinel=True``.
+    """
+
+    def test_is_sentinel_produces_helper(self):
+        from c4_release.neural_vm.unified_compiler.decl_verifier import (
+            _is_sentinel_produces,
+        )
+        assert _is_sentinel_produces({'__module_replacement': 'L8.ffn'})
+        assert _is_sentinel_produces({'__structural': 'compiler_machinery'})
+        # Mixed dicts (sentinel + real dim) are NOT sentinel-only --
+        # the real dims still get checked.
+        assert not _is_sentinel_produces({
+            '__structural': 'x', 'CARRY': 'AX_byte0',
+        })
+        assert not _is_sentinel_produces({'CARRY': 'AX_byte0'})
+        assert not _is_sentinel_produces({})
+
+    def test_add_op_accepts_sentinel_produces(self):
+        """``LayerCompiler.add_op`` must accept sentinel-only produces
+        without requiring the sentinel keys to be declared dims.
+
+        The standard validation path rejects undeclared dim names in
+        ``produces``; sentinels are special-cased so module-replacement
+        ops (which don't write to residual dims at all) can still
+        document their non-cellular behavior.
+        """
+        compiler = LayerCompiler()
+        compiler.declare_dim("FOO", 1)
+        op = Operation(
+            name="sentinel_op",
+            reads=set(),
+            writes=set(),
+            kind="model",
+            bake_fn=lambda model, dim_positions, S: None,
+            produces={'__module_replacement': 'L8.ffn'},
+        )
+        # Should not raise.
+        compiler.add_op(op)
+
+    def test_add_op_rejects_undeclared_real_dim_alongside_sentinel(self):
+        """Mixed dicts: sentinel keys are exempt but real dim names
+        must still be declared. This prevents accidental typo'd
+        keys from being silently treated as sentinels.
+        """
+        compiler = LayerCompiler()
+        compiler.declare_dim("FOO", 1)
+        op = Operation(
+            name="bad_op",
+            reads=set(),
+            writes=set(),
+            kind="model",
+            bake_fn=lambda model, dim_positions, S: None,
+            produces={
+                '__structural': 'machinery',
+                'NOT_DECLARED': 'AX_byte0',
+            },
+        )
+        with pytest.raises(ValueError, match="references undeclared dim"):
+            compiler.add_op(op)
+
+    def test_sentinel_excluded_from_staleness_registry(self):
+        """Sentinel keys must not appear in the producers registry so
+        they don't accidentally satisfy consumes_fresh lookups for real
+        downstream consumers.
+        """
+        compiler = LayerCompiler()
+        compiler.declare_dim("CARRY", 16)
+        sentinel_op = Operation(
+            name="sentinel",
+            reads=set(),
+            writes=set(),
+            kind="model",
+            bake_fn=lambda model, dim_positions, S: None,
+            produces={'__module_replacement': 'L8.ffn'},
+        )
+        compiler.add_op(sentinel_op)
+        producers, _ = compiler.build_staleness_registry()
+        # Neither sentinel key nor its dummy register should appear.
+        assert not any(
+            k[0].startswith("__") for k in producers.keys()
+        ), f"sentinel keys leaked into producers registry: {producers}"
+
+    def test_multistep_report_tags_sentinel_ops(self):
+        """When ``verify_produces_consumes_multistep`` runs an op with
+        sentinel-only produces, its result row must carry
+        ``is_sentinel=True`` and an empty drift list -- the probe should
+        never flag a sentinel op as drifting.
+        """
+        from c4_release.neural_vm.unified_compiler.decl_verifier import (
+            MultistepVerificationResult,
+            MultistepVerificationReport,
+        )
+        # Synthetic result simulating the multistep loop's output.
+        sentinel_result = MultistepVerificationResult(
+            op_name="efficient_l8_addsub_wrap",
+            is_sentinel=True,
+            sentinel_kind="module-replacement",
+            notes=["sentinel produces (module-replacement)"],
+        )
+        normal_result = MultistepVerificationResult(
+            op_name="layer7_operand_gather",
+            drift=[],
+        )
+        report = MultistepVerificationReport(
+            n_steps=2, program_summary="(synthetic)",
+            results=[sentinel_result, normal_result],
+        )
+        # Sentinel ops are reported (not skipped silently) and tagged.
+        assert sentinel_result.is_sentinel is True
+        assert sentinel_result.sentinel_kind == "module-replacement"
+        assert sentinel_result.drift == []
+        # ``has_drift`` ignores sentinel ops (their drift is always empty).
+        assert report.has_drift() is False
+        # ``format`` surfaces the sentinel tag in the status string.
+        out = report.format()
+        assert "SENTINEL/module-replacement" in out
+
+
 @pytest.mark.validator
 class TestMultistepProbe:
     """Mode B+ multistep dynamic verifier on the production model.
@@ -388,6 +534,56 @@ class TestMultistepProbe:
         )
         model.eval()
         return model, layout
+
+    def test_sentinel_ops_tagged_in_production_report(self):
+        """The multistep report on the production model should tag the
+        annotated sentinel ops with ``is_sentinel=True`` (and never
+        flag them as drifting).
+
+        Annotated sentinel ops (close-produces-annotation-gap, 2026-05-13):
+          module-replacement: efficient_l8_addsub_wrap,
+              efficient_l10_andorxor_wrap, efficient_l11_alumul_wrap,
+              l10_post_op_attach, l10_alu_divmod_install,
+              l13_alu_shift_install.
+          structural: right_size_ffns, expand_wrapper_blocks,
+              contract_validation, residual_alibi_slopes,
+              layer10_residual_alibi_slopes.
+
+        Note: this test does not reuse the class fixture's ``compiled``
+        because the disk-cache path drops ``block_ops``/``model_ops`` from
+        the loaded layout (see ``_try_load_cached`` in
+        ``full_vm_compiler.py``), and the verifier needs those ops to
+        enumerate sentinel-tagged annotations. We rebuild with
+        ``disk_cache=False`` to populate the full op list.
+        """
+        from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
+            compile_full_vm,
+        )
+        model, layout = compile_full_vm(
+            S=100.0, alu_mode="lookup",
+            enable_conversational_io=False, n_heads=8,
+            disk_cache=False,
+        )
+        model.eval()
+        program = [_pack_instr(1, 7), _pack_instr(38, 0)]  # IMM 7; EXIT
+        report = verify_produces_consumes_multistep(
+            model=model, layout=layout, program=program, n_steps=2,
+        )
+        sentinel_results = [r for r in report.results if r.is_sentinel]
+        # We annotated multiple sentinel ops; at least 4 should appear in
+        # the lookup-mode layout (efficient-only ops like
+        # ``efficient_l8_addsub_wrap`` are inert in lookup mode but still
+        # registered, so they're collected too).
+        assert len(sentinel_results) >= 4, (
+            f"expected >=4 sentinel-tagged results; got {len(sentinel_results)}: "
+            f"{[r.op_name for r in sentinel_results]}"
+        )
+        for r in sentinel_results:
+            assert r.sentinel_kind in ("module-replacement", "structural")
+            assert r.drift == [], (
+                f"sentinel op {r.op_name!r} flagged as drifting -- "
+                f"sentinel ops must never produce drift entries"
+            )
 
     def test_clean_imm_exit_program_has_no_drift(self, compiled):
         """Multistep probe on a tiny IMM/EXIT program emits no drift.
