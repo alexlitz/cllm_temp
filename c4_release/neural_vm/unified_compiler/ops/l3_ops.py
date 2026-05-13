@@ -40,6 +40,16 @@ def make_layer3_ffn_op() -> Operation:
         layer_idx=3,
         bake_fn=bake,
         migrated=True,
+        # Staleness invariants: at the PC marker, this FFN writes
+        # OUTPUT_LO/HI on every step (first-step default = PC_OFFSET +
+        # INSTR_WIDTH; subsequent steps = prev PC + INSTR_WIDTH via the
+        # PC INCREMENT block). L4's PC relay + L5 fetch consume the PC at
+        # the PC marker; the OUTPUT_LO/HI values are the load-bearing
+        # produces (PC byte-0 nibbles for the next-step token prediction).
+        produces={
+            "OUTPUT_LO": "PC_marker",
+            "OUTPUT_HI": "PC_marker",
+        },
     )
 
 

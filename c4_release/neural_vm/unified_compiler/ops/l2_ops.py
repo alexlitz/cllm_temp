@@ -52,6 +52,17 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         # 4 BYTE_INDEX_*); ``_l2_unit_counter`` is bumped to 8 after this op
         # so the cancel op below starts at unit 8.
         ffn_units_used=8,
+        # Staleness invariants: MEM_VAL_B0..3 fire at the token positions
+        # immediately preceding each MEM val byte (d=4..7 from REG_MEM),
+        # so the LM head can predict each val byte. L13/L14 mem-write
+        # paths consume MEM_VAL_B* as "we are at val byte N" position
+        # selectors.
+        produces={
+            "MEM_VAL_B0": "MEM_ADDR_byte3",
+            "MEM_VAL_B1": "MEM_VAL_byte0",
+            "MEM_VAL_B2": "MEM_VAL_byte1",
+            "MEM_VAL_B3": "MEM_VAL_byte2",
+        },
     )
 
 

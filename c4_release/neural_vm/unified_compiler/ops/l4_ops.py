@@ -41,6 +41,17 @@ def make_layer4_pc_relay_op() -> Operation:
         layer_idx=4,
         migrated=True,
         claims=_claims,
+        # Staleness invariants: head 0 fires at the AX marker (Q at
+        # MARK_AX) and copies the PC marker's EMBED_LO/HI (carry-forward
+        # PC value from prev step, or first-step default) into the AX
+        # marker's EMBED. L5 fetch consumes EMBED at AX to query the
+        # opcode at that address. Head 1 separately writes TEMP at AX
+        # byte positions for multi-byte IMM fetch — not annotated here
+        # since TEMP is intermediate.
+        produces={
+            "EMBED_LO": "AX_marker",
+            "EMBED_HI": "AX_marker",
+        },
     )
 
 
@@ -70,6 +81,16 @@ def make_layer4_ffn_op() -> Operation:
         # PC+1@PC marker (64) chains for a total of 544 units (0..543).
         # See bake body in vm_step.py:_set_layer4_ffn.
         ffn_units_used=544,
+        # Staleness invariants: this FFN computes (PC+1) at the PC marker
+        # via the trailing ``nibble_rotation_chain`` (target dims =
+        # FETCH_LO/HI, gate = MARK_PC). L5 fetch consumes FETCH_LO/HI at
+        # PC marker as the immediate-byte address query. The earlier
+        # PC+1 chain (gate = MARK_AX, target = TEMP) is intermediate so
+        # not annotated.
+        produces={
+            "FETCH_LO": "PC_marker",
+            "FETCH_HI": "PC_marker",
+        },
     )
 
 
