@@ -164,6 +164,14 @@ class Operation:
     # at its target layer (e.g., L0's phase_a_ffn writes units 0..6 -> set to
     # 7). For ops that don't touch FFN (pure attn ops, model ops writing
     # alibi_slopes/head weights, etc.) leave as None.
+    #
+    # For ``kind="model"`` ops that write to a specific block's FFN (e.g.
+    # ``function_call_weights`` writing L6 FFN units 1700-2158), set
+    # ``layer_idx`` to the target block index. The compiler folds the
+    # annotation into ``ModelLayout.ffn_widths`` for that layer so the
+    # dynamic-FFN allocator pre-sizes it correctly. ``layer_idx`` on a
+    # model op is otherwise informational — model ops are dispatched
+    # against the whole model regardless of this field.
     ffn_units_used: Optional[int] = None
     # Residual-dim staleness invariants (Phase 3 / Agent G of
     # ARCH_LEAKAGE_FIX_PLAN.md). Both fields are opt-in (default empty):
@@ -496,6 +504,19 @@ class LayerCompiler:
             prev = ffn_widths.get(target_layer, 0)
             if op.ffn_units_used > prev:
                 ffn_widths[target_layer] = op.ffn_units_used
+        # Model-level ops (kind="model") may also write to a specific block's
+        # FFN — e.g. ``function_call_weights`` writes L6 FFN units 1700-2277.
+        # When such an op declares ``layer_idx`` + ``ffn_units_used``, fold
+        # it into the per-block width aggregate so the dynamic-FFN allocator
+        # pre-sizes the block large enough. Model ops without a ``layer_idx``
+        # (e.g. head/embedding bakes that touch every block) stay out of the
+        # aggregate and rely on the legacy ``_right_size_ffns`` trim.
+        for op in self.model_ops:
+            if op.ffn_units_used is None or op.layer_idx is None:
+                continue
+            prev = ffn_widths.get(op.layer_idx, 0)
+            if op.ffn_units_used > prev:
+                ffn_widths[op.layer_idx] = op.ffn_units_used
 
         return ModelLayout(
             d_model=d_model,

@@ -212,6 +212,13 @@ def make_layer8_multibyte_routing_op() -> Operation:
             "OUTPUT_LO": "AX_byte0",
             "OUTPUT_HI": "AX_byte0",
         },
+        # ``_set_layer8_multibyte_routing`` re-invokes ``_set_layer8_alu``
+        # internally to recover the ALU-final unit cursor (~2023) and then
+        # appends 32 multibyte-IMM routing units, reaching unit 2054 — so
+        # the L8 FFN needs 2055 hidden units total. Sibling ``layer8_alu``
+        # (phase=8.2) writes the 0-2022 cluster; this op holds the
+        # per-layer max and dominates the dynamic-FFN allocation for L8.
+        ffn_units_used=2055,
     )
 
 

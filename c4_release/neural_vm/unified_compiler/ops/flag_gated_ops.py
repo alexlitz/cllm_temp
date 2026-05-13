@@ -353,6 +353,16 @@ def make_null_terminator_detection_op(
         bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        # When ``enable_conversational_io=True`` AND ``alu_mode='lookup'``,
+        # the helper writes L10 FFN unit 1864 (single unit). That sits
+        # above ``layer10_alu``'s 0-1845 cluster, so the L10 FFN must be
+        # sized to 1865 hidden units in this mode. The compiler takes the
+        # per-layer max across this op + ``layer10_alu`` (1846), so the
+        # net dynamic width becomes 1865 here.
+        ffn_units_used=(
+            1865 if (enable_conversational_io and alu_mode == "lookup")
+            else None
+        ),
     )
 
 

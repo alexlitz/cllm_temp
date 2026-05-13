@@ -48,6 +48,12 @@ def make_layer9_alu_op() -> Operation:
         consumes_fresh={
             "ALU_HI": "AX_byte0",
         },
+        # ``_set_layer9_alu`` writes the ADD/LEA/SUB/AND/OR/XOR/CMP/etc.
+        # cross-product cluster (~3398 units), and the bake chains into
+        # ``_set_layer9_marker_suppress`` for 7 more NEXT_* suppression
+        # units. Cumulative L9 FFN max: 3405. No other op writes to L9
+        # FFN so this op holds the per-layer width annotation.
+        ffn_units_used=3405,
     )
 
 

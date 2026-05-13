@@ -65,6 +65,11 @@ def make_layer4_ffn_op() -> Operation:
         bake_fn=bake,
         layer_idx=4,
         migrated=True,
+        # ``_set_layer4_ffn`` writes the PC+1 (lo/hi/carry = 64 units) +
+        # TEMP-clear (32) + multi-byte PC+2/+3/+4 (96+128+160 = 384) +
+        # PC+1@PC marker (64) chains for a total of 544 units (0..543).
+        # See bake body in vm_step.py:_set_layer4_ffn.
+        ffn_units_used=544,
     )
 
 

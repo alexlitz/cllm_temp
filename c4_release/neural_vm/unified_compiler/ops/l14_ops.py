@@ -243,6 +243,15 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         bake_fn=bake,
         layer_idx=14,
         migrated=True,
+        # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1311
+        # after this op runs). The chain is: temp_clear (1 unit) →
+        # clear_addr_key_pollution (48) → clear_output_corruption (2) →
+        # clear_mem_marker_output (64) → addr_key_neural_decode (1184) →
+        # jsr_ax_bytes_zero (4) → lc_ax_bytes_zero (4) → this op (4).
+        # Annotating only the chain tail with the cumulative max is
+        # sufficient — the compiler aggregates per-layer max across all
+        # ops, so this single annotation suffices for L14 dynamic sizing.
+        ffn_units_used=1311,
     )
 
 
