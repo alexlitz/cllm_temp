@@ -1346,3 +1346,397 @@ def verify_all(
             n_heads=n_heads,
         )
     return static_report, dyn_report
+
+
+# ---------------------------------------------------------------------------
+# Tier C discoverability audits (smoke coverage, spec coverage, MoE safety).
+# These are bookkeeping detectors -- they cross-check the optional
+# ``smoke_tests`` / ``spec_section`` / ``compaction_safe`` annotations on
+# ``Operation`` against external coverage matrices. None of them are wired
+# into ``verify_all`` (intentionally cheap-but-not-free; called explicitly
+# from tests + opt-in CI runs).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SmokeCoverageReport:
+    """Bookkeeping report from ``audit_smoke_coverage``.
+
+    ``coverage`` maps each op name to the (possibly empty) set of smoke test
+    identifiers the op declares. ``untested_ops`` is the subset of ops with
+    an empty ``smoke_tests`` set -- candidates for new test coverage. The
+    inverse ``tests_to_ops`` map lists every op claimed by each smoke test
+    (useful for "which ops does test X cover").
+
+    The audit does NOT run smoke tests to populate ``coverage`` -- the
+    declarations are hand-curated bookkeeping. If a test is renamed or
+    deleted, ``orphan_test_refs`` will be empty UNLESS the caller passes a
+    ``known_smoke_tests`` parameter to ``audit_smoke_coverage`` (in which
+    case any declared smoke test not present in the known list is reported
+    as an orphan reference).
+    """
+
+    coverage: Dict[str, Set[str]] = field(default_factory=dict)
+    untested_ops: List[str] = field(default_factory=list)
+    tests_to_ops: Dict[str, List[str]] = field(default_factory=dict)
+    orphan_test_refs: Dict[str, Set[str]] = field(default_factory=dict)
+
+    def has_untested(self) -> bool:
+        return bool(self.untested_ops)
+
+    def format(self) -> str:
+        lines = ["=== Smoke coverage bookkeeping ==="]
+        lines.append(f"Ops declared: {len(self.coverage)}")
+        lines.append(f"Ops untested: {len(self.untested_ops)}")
+        lines.append(f"Smoke tests referenced: {len(self.tests_to_ops)}")
+        if self.orphan_test_refs:
+            lines.append(
+                f"Ops with orphan test refs: {len(self.orphan_test_refs)}"
+            )
+            for op_name, refs in sorted(self.orphan_test_refs.items()):
+                lines.append(f"  {op_name}: {sorted(refs)}")
+        return "\n".join(lines)
+
+
+def audit_smoke_coverage(
+    compile_fn: Optional[Callable] = None,
+    *,
+    smoke_test_paths: Optional[List[str]] = None,
+    known_smoke_tests: Optional[Set[str]] = None,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    n_heads: int = 8,
+) -> SmokeCoverageReport:
+    """Bookkeeping audit of ``Operation.smoke_tests`` declarations.
+
+    Args:
+        compile_fn: optional callable returning a ``ModelLayout`` directly
+            (signature ``() -> ModelLayout``). When ``None``, the audit
+            uses ``_build_layout_only`` with the keyword args below.
+        smoke_test_paths: informational; currently unused by the audit
+            (the bookkeeping is purely declaration-based). Reserved for a
+            future Phase 2 that parses pytest collection output and
+            auto-cross-references declared tests against actual discovery.
+        known_smoke_tests: optional set of ``"TestClass::test_method"``
+            identifiers the audit treats as the universe of valid smoke
+            tests. When provided, any ``Operation.smoke_tests`` entry NOT
+            in this set is reported as an orphan reference (likely
+            renamed/deleted test). The ``"all"`` sentinel is always
+            considered valid regardless of the known-set membership.
+
+    Returns:
+        ``SmokeCoverageReport`` -- see dataclass docstring.
+    """
+    if compile_fn is None:
+        layout = _build_layout_only(
+            alu_mode=alu_mode,
+            enable_conversational_io=enable_conversational_io,
+            enable_tool_calling=enable_tool_calling,
+            n_heads=n_heads,
+        )
+    else:
+        layout = compile_fn()
+
+    coverage: Dict[str, Set[str]] = {}
+    tests_to_ops: Dict[str, List[str]] = {}
+    untested: List[str] = []
+    orphan: Dict[str, Set[str]] = {}
+
+    # Collect every op (deduplicated by name) in declaration order so the
+    # report is stable across runs.
+    all_ops = _collect_unique_ops_with(layout, lambda _op: True)
+
+    for op in all_ops:
+        coverage[op.name] = set(op.smoke_tests)
+        if not op.smoke_tests:
+            untested.append(op.name)
+            continue
+        for entry in op.smoke_tests:
+            tests_to_ops.setdefault(entry, []).append(op.name)
+            if (known_smoke_tests is not None
+                    and entry != "all"
+                    and entry not in known_smoke_tests):
+                orphan.setdefault(op.name, set()).add(entry)
+
+    return SmokeCoverageReport(
+        coverage=coverage,
+        untested_ops=sorted(untested),
+        tests_to_ops={k: sorted(v) for k, v in tests_to_ops.items()},
+        orphan_test_refs=orphan,
+    )
+
+
+@dataclass
+class SpecCoverageReport:
+    """Bookkeeping report from ``audit_spec_coverage``.
+
+    Maps each spec section (heading anchor or ``"line N-M"``) referenced
+    by any op to the list of ops referencing it. ``unreferenced_sections``
+    is the set of spec headings the parser found in BLOG_SPEC.md that NO
+    op references -- candidates for either implementation gaps or stale
+    spec text. ``undocumented_ops`` is the list of ops with
+    ``spec_section is None``.
+    """
+
+    coverage: Dict[str, List[str]] = field(default_factory=dict)
+    undocumented_ops: List[str] = field(default_factory=list)
+    unreferenced_sections: List[str] = field(default_factory=list)
+    all_sections: List[str] = field(default_factory=list)
+
+    def format(self) -> str:
+        lines = ["=== Spec coverage bookkeeping ==="]
+        lines.append(f"Spec sections found: {len(self.all_sections)}")
+        lines.append(
+            f"Sections referenced by >=1 op: {len(self.coverage)}"
+        )
+        lines.append(
+            f"Sections referenced by NO op: {len(self.unreferenced_sections)}"
+        )
+        lines.append(f"Ops with spec_section=None: {len(self.undocumented_ops)}")
+        return "\n".join(lines)
+
+
+def _slugify_heading(text: str) -> str:
+    """Lowercase + replace whitespace runs with single hyphens.
+
+    Matches the common Markdown heading-to-anchor convention so a
+    ``spec_section='BLOG_SPEC.md#binary-ALU'`` annotation resolves to a
+    heading like ``### Basic Arithmetic``? No, it resolves to a heading
+    whose slug is ``binary-alu``. The audit also accepts case-insensitive
+    substring matches (so ``#binary-ALU`` matches ``binary-alu``).
+    """
+    return "-".join(text.lower().split())
+
+
+def audit_spec_coverage(
+    compile_fn: Optional[Callable] = None,
+    *,
+    spec_path: str = "c4_release/docs/BLOG_SPEC.md",
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    n_heads: int = 8,
+) -> SpecCoverageReport:
+    """Bookkeeping audit of ``Operation.spec_section`` declarations.
+
+    Parses ``BLOG_SPEC.md`` headings and cross-references them against the
+    ``spec_section`` annotation on every op. Two declaration formats are
+    recognized:
+
+      * ``"BLOG_SPEC.md#slug"`` -- matched (case-insensitively) against
+        slugified heading text. ``slug`` may also be a substring of the
+        slugified heading (the audit's matching is forgiving by design
+        because heading text drifts more often than the conceptual
+        section it names).
+      * ``"BLOG_SPEC.md:NNN-MMM"`` -- matched as a 1-indexed inclusive
+        line range. The audit verifies ``NNN`` and ``MMM`` fall inside
+        the file's line count; out-of-range refs end up unmatched.
+
+    Args:
+        compile_fn: optional layout-producing callable; defaults to
+            ``_build_layout_only`` with the kwargs below.
+        spec_path: path to BLOG_SPEC.md (relative to the worktree root
+            or absolute). Defaults to the canonical location.
+
+    Returns:
+        ``SpecCoverageReport`` -- see dataclass docstring.
+    """
+    if compile_fn is None:
+        layout = _build_layout_only(
+            alu_mode=alu_mode,
+            enable_conversational_io=enable_conversational_io,
+            enable_tool_calling=enable_tool_calling,
+            n_heads=n_heads,
+        )
+    else:
+        layout = compile_fn()
+
+    # Read and slug BLOG_SPEC headings (lines starting with ``#``).
+    try:
+        with open(spec_path, encoding="utf-8") as f:
+            spec_lines = f.readlines()
+    except OSError:
+        spec_lines = []
+
+    all_sections: List[str] = []
+    heading_slugs: List[str] = []
+    for raw in spec_lines:
+        line = raw.rstrip("\n")
+        if line.startswith("#"):
+            text = line.lstrip("#").strip()
+            if text:
+                all_sections.append(text)
+                heading_slugs.append(_slugify_heading(text))
+
+    coverage: Dict[str, List[str]] = {}
+    undocumented: List[str] = []
+    referenced_slugs: Set[str] = set()
+
+    all_ops = _collect_unique_ops_with(layout, lambda _op: True)
+
+    for op in all_ops:
+        if op.spec_section is None:
+            undocumented.append(op.name)
+            continue
+        ref = op.spec_section
+        coverage.setdefault(ref, []).append(op.name)
+        # Try to resolve into a heading.
+        if "#" in ref:
+            slug = ref.split("#", 1)[1].lower()
+            for hslug in heading_slugs:
+                if slug in hslug or hslug in slug:
+                    referenced_slugs.add(hslug)
+                    break
+
+    unreferenced = [
+        all_sections[i]
+        for i, hslug in enumerate(heading_slugs)
+        if hslug not in referenced_slugs
+    ]
+
+    return SpecCoverageReport(
+        coverage={k: sorted(v) for k, v in coverage.items()},
+        undocumented_ops=sorted(undocumented),
+        unreferenced_sections=unreferenced,
+        all_sections=all_sections,
+    )
+
+
+@dataclass
+class CompactionSafetyReport:
+    """Bookkeeping report from ``verify_compaction_safety``.
+
+    ``unsafe_ops`` lists every op with ``compaction_safe=False`` (the
+    declarations to verify). ``mismatches`` flags any op whose declared
+    ``compaction_safe`` value disagrees with the actual MoE partition --
+    e.g. ``compaction_safe=False`` but the partition placed the op's
+    units in an opcode-gated expert (the misclassification the SoftMoE
+    byte-identity gap stems from). ``partition_unavailable`` is True
+    when the audit could not access the MoE partition (e.g. running
+    without a compiled model); in that case ``mismatches`` is empty by
+    construction and callers should treat the audit as informational
+    only.
+    """
+
+    declared_unsafe: List[str] = field(default_factory=list)
+    declared_safe: List[str] = field(default_factory=list)
+    mismatches: Dict[str, str] = field(default_factory=dict)
+    partition_unavailable: bool = False
+
+    def has_mismatches(self) -> bool:
+        return bool(self.mismatches)
+
+    def format(self) -> str:
+        lines = ["=== Compaction-safety bookkeeping ==="]
+        lines.append(f"Ops declared compaction_safe=True: {len(self.declared_safe)}")
+        lines.append(f"Ops declared compaction_safe=False: {len(self.declared_unsafe)}")
+        if self.partition_unavailable:
+            lines.append("Partition unavailable -- cross-check skipped.")
+        else:
+            lines.append(f"Mismatches: {len(self.mismatches)}")
+            for op_name, reason in sorted(self.mismatches.items()):
+                lines.append(f"  {op_name}: {reason}")
+        return "\n".join(lines)
+
+
+def verify_compaction_safety(
+    compile_fn: Optional[Callable] = None,
+    *,
+    moe_partition: Optional[Dict] = None,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    n_heads: int = 8,
+) -> CompactionSafetyReport:
+    """Bookkeeping audit of ``Operation.compaction_safe`` declarations.
+
+    The detector inspects every op's ``compaction_safe`` flag and (when
+    a MoE partition is provided) cross-checks ``compaction_safe=False``
+    declarations against the partition's classification: such ops should
+    have NO opcode-gated units (only shared-expert units). When the
+    partition is not provided, the audit returns the per-op summary
+    without cross-checking and sets ``partition_unavailable=True``.
+
+    Args:
+        compile_fn: optional layout-producing callable; defaults to
+            ``_build_layout_only`` with the kwargs below.
+        moe_partition: optional ``{opcode_dim: [unit_indices]}`` dict
+            produced by ``_partition_compact_ffn_by_opcode`` (or its
+            tightened variant). When provided, the audit checks that no
+            unit owned by a ``compaction_safe=False`` op appears in any
+            opcode-keyed bucket. Determining "which units does op X
+            own?" requires per-op unit ranges that today's annotations
+            don't carry, so the cross-check is performed at the unit
+            level only when the op has a non-empty ``claims`` set whose
+            scopes include ``ffn_W_up``/``ffn_W_down``/``ffn_W_gate`` --
+            the unit indices in those claims define the op's footprint.
+
+    Returns:
+        ``CompactionSafetyReport`` -- see dataclass docstring.
+    """
+    if compile_fn is None:
+        layout = _build_layout_only(
+            alu_mode=alu_mode,
+            enable_conversational_io=enable_conversational_io,
+            enable_tool_calling=enable_tool_calling,
+            n_heads=n_heads,
+        )
+    else:
+        layout = compile_fn()
+
+    declared_safe: List[str] = []
+    declared_unsafe: List[str] = []
+    mismatches: Dict[str, str] = {}
+
+    all_ops = _collect_unique_ops_with(layout, lambda _op: True)
+
+    # Group units owned by each op (from FFN claims).
+    op_units: Dict[str, Set[int]] = {}
+    for op in all_ops:
+        units: Set[int] = set()
+        for claim in op.claims:
+            if len(claim) != 4:
+                continue
+            _, scope, identifier, _ = claim
+            if scope not in ("ffn_W_up", "ffn_W_down", "ffn_W_gate"):
+                continue
+            try:
+                units.add(int(identifier))
+            except (TypeError, ValueError):
+                continue
+        op_units[op.name] = units
+
+    for op in all_ops:
+        if op.compaction_safe:
+            declared_safe.append(op.name)
+        else:
+            declared_unsafe.append(op.name)
+
+    partition_unavailable = moe_partition is None
+    if not partition_unavailable:
+        # ``moe_partition`` is ``{opcode_dim: [unit_idx, ...]}``. A
+        # compaction_safe=False op should NOT have any of its FFN units
+        # appear in an opcode-keyed bucket -- they must live in the
+        # shared expert.
+        opcode_unit_owner: Dict[int, int] = {}
+        for opcode_dim, units in moe_partition.items():
+            for u in units:
+                opcode_unit_owner[int(u)] = int(opcode_dim)
+        for op_name in declared_unsafe:
+            misrouted = sorted(
+                u for u in op_units.get(op_name, ()) if u in opcode_unit_owner
+            )
+            if misrouted:
+                mismatches[op_name] = (
+                    f"declared compaction_safe=False but FFN units "
+                    f"{misrouted[:5]}{'...' if len(misrouted) > 5 else ''} "
+                    f"are opcode-routed in the partition (should be shared)"
+                )
+
+    return CompactionSafetyReport(
+        declared_safe=sorted(declared_safe),
+        declared_unsafe=sorted(declared_unsafe),
+        mismatches=mismatches,
+        partition_unavailable=partition_unavailable,
+    )

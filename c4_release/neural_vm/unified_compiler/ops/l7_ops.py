@@ -51,6 +51,26 @@ def make_layer7_operand_gather_op() -> Operation:
             "ALU_LO": "AX_byte0",
             "ALU_HI": "AX_byte0",
         },
+        # Tier C annotations: L7 operand gather is the attention-only op
+        # that stages ALU_LO/HI from STACK0 byte 0 / OUTPUT_LO/HI at the
+        # AX marker for the downstream L8/L9 ALU. Exercised by every ALU
+        # smoke test (the FFN side reads ALU_*; without this op operand A
+        # is zero). ``compaction_safe=True`` is technically vacuous for an
+        # attention-only op (no FFN units to partition) but keeps the
+        # invariant uniform.
+        smoke_tests={
+            "TestSmokeBasic::test_add_basic",
+            "TestSmokeBasic::test_sub_basic",
+            "TestSmoke32Bit::test_add_16bit",
+            "TestSmoke32Bit::test_sub_16bit",
+            "TestSmokeBitwise::test_and_basic",
+            "TestSmokeBitwise::test_or_basic",
+            "TestSmokeBitwise::test_xor_basic",
+            "TestSmokeComparison::test_eq_basic",
+            "TestSmokeComparison::test_ne_basic",
+        },
+        spec_section="BLOG_SPEC.md#the-attention-layer",
+        compaction_safe=True,
     )
 
 

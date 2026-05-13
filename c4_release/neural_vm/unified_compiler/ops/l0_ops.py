@@ -58,6 +58,18 @@ def make_phase_a_ffn_op() -> Operation:
         # the 7-entry ``transitions`` list (SE→PC, PC→AX, AX→SP, SP→BP,
         # BP→STACK0, STACK0→MEM, MEM→SE). Units 0..6.
         ffn_units_used=7,
+        # Tier C annotations: phase_a_ffn fires on every program (it emits
+        # the next-marker flag at each STEP boundary), so every smoke test
+        # exercises it -- ``"all"`` is the audit sentinel. The 7 units read
+        # H0..H4 threshold heads + write NEXT_* dims, which are not opcode
+        # gated; but the unit is also OPCODE-INDEPENDENT (marker transitions
+        # don't depend on the current opcode), so the MoE partition's
+        # shared-expert assignment is the correct classification --
+        # ``compaction_safe=True`` because the partition naturally keeps
+        # these units in the shared expert (no opcode-onehot W_up entries).
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+        compaction_safe=True,
     )
 
 

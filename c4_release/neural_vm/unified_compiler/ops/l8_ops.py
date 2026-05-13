@@ -73,6 +73,20 @@ def make_layer8_alu_op() -> Operation:
             "CARRY": "AX_byte0",
             "CMP_GROUP": "AX_byte0",
         },
+        # Tier C annotations: L8 ALU is the canonical binary-op lo-nibble
+        # producer for ADD/SUB/LEA + CMP_GROUP. The smoke tests below
+        # exercise its FFN units end-to-end. The L8 ALU FFN's W_up rows
+        # for the ADD/SUB cluster are OP_ADD/OP_SUB-gated (unit 0 reads
+        # OP_ADD in W_gate; sibling units mirror the pattern), making the
+        # op fully MoE-compactable.
+        smoke_tests={
+            "TestSmokeBasic::test_add_basic",
+            "TestSmokeBasic::test_sub_basic",
+            "TestSmoke32Bit::test_add_16bit",
+            "TestSmoke32Bit::test_sub_16bit",
+        },
+        spec_section="BLOG_SPEC.md#binary-ALU",
+        compaction_safe=True,
     )
 
 

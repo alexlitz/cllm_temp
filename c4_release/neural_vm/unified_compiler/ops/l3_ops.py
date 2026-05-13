@@ -64,6 +64,14 @@ def make_layer3_ffn_op() -> Operation:
             "OUTPUT_LO": "PC_marker",
             "OUTPUT_HI": "PC_marker",
         },
+        # Tier C annotations: L3 FFN PC byte 0 first-step is fired by
+        # every program (every step writes the PC byte 0 OUTPUT/EMBED at
+        # the PC marker). The W_up rows here read MARK_PC / HAS_SE /
+        # marker dims rather than OP_*, so the units are correctly
+        # classified as shared (opcode-independent) by the MoE partition.
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+        compaction_safe=True,
     )
 
 

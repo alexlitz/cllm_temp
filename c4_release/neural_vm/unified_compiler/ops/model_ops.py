@@ -131,6 +131,22 @@ def make_function_call_weights_op() -> Operation:
         # layer_idx field doesn't affect their bake execution.
         layer_idx=6,
         ffn_units_used=2278,
+        # Tier C annotations: function-call weights program the JSR/ENT/LEV
+        # V-relay rows across L5 attn heads 5/6 and L6 attn head 7, plus
+        # L6 FFN units 1700-2277. The V-relay units write into NON-opcode
+        # dims (EMBED_LO/HI columns at unrelated rows), so they fire on
+        # every step regardless of OP_JSR/OP_ENT -- this is the exact
+        # MoE pathology the SoftMoE byte-identity fix in commit 2fa04dd
+        # addressed (units classified as opcode-X-specific but firing on
+        # non-MARK_PC positions where OP_X=0). Mark compaction_safe=False
+        # so verify_compaction_safety cross-checks that the partition's
+        # ``_tighten_partition_by_no_opcode_firing`` pass keeps these
+        # units in the shared expert.
+        smoke_tests={
+            "TestSmokeFunctionCall::test_simple_function",
+        },
+        spec_section="BLOG_SPEC.md#function-calls",
+        compaction_safe=False,
     )
 
 
