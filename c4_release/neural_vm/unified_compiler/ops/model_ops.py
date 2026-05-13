@@ -124,15 +124,15 @@ def make_function_call_weights_op() -> Operation:
         migrated=True,
         claims=_claims,
         # ``_set_function_call_weights`` writes L6 FFN units starting at
-        # 1700 (LEA/JSR/ENT/LEV output routing) and reaching unit 2277 with
+        # 1700 (LEA/JSR/ENT/LEV output routing) and reaching unit 2293 with
         # the trailing LEV-AX-byte routing pairs (``vm_step.py:8230+``).
-        # Annotating this op with the per-layer max (2278) lets the
+        # Annotating this op with the per-layer max (2294) lets the
         # dynamic-FFN allocator pre-size L6 instead of falling back to 4096
         # and trimming post-bake. ``layer_idx=6`` is purely a sizing hint —
         # model ops are dispatched against the whole model and the
         # layer_idx field doesn't affect their bake execution.
         layer_idx=6,
-        ffn_units_used=2278,
+        ffn_units_used=2294,
         smoke_tests={
             "TestSmokeFunctionCall::test_simple_function",
         },
