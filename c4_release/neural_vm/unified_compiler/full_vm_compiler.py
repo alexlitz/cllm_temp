@@ -295,6 +295,16 @@ def compile_full_vm(
             to force the legacy allocate-4096-everywhere path (used for
             byte-identity comparison).
 
+    Environment variables:
+        C4_VALIDATE_ON_COMPILE: when set to ``"1"``, run Mode A of the
+            declarative verifier (``verify_claims_static``) at the end of
+            compile as a warn-only sanity check. Drift is surfaced via
+            ``warnings.warn`` and never fails the compile -- the verifier
+            is opt-in diagnostic, not a production gate. Default off.
+        C4_VALIDATE_VERBOSE: when set to ``"1"`` alongside
+            ``C4_VALIDATE_ON_COMPILE``, print the full verifier report to
+            stdout instead of just the summary warning.
+
     Returns:
         (model, layout) where:
         - model is an AutoregressiveVM with all weights baked
@@ -477,5 +487,29 @@ def compile_full_vm(
 
     if cache_path is not None:
         _try_save_cached(cache_path, model, layout, kwargs_snapshot)
+
+    # Opt-in declarative verifier hook. Gated on C4_VALIDATE_ON_COMPILE
+    # so it never runs in production builds; tests / CI flip it on to
+    # surface declaration drift at compile time. Always warn-only --
+    # the verifier is diagnostic, never a hard fail.
+    if os.environ.get("C4_VALIDATE_ON_COMPILE") == "1":
+        import warnings
+        try:
+            from .decl_verifier import verify_claims_static
+            report = verify_claims_static()
+            if report.has_errors():
+                warnings.warn(
+                    f"C4_VALIDATE_ON_COMPILE=1: declarative verifier "
+                    f"surfaced {len(report.results)} drift entries. "
+                    f"Set C4_VALIDATE_VERBOSE=1 for details.",
+                    stacklevel=2,
+                )
+                if os.environ.get("C4_VALIDATE_VERBOSE") == "1":
+                    print(report.format())
+        except Exception as e:
+            # Validator is opt-in diagnostic -- never fail compile.
+            warnings.warn(
+                f"C4_VALIDATE_ON_COMPILE: verifier raised {e}; continuing"
+            )
 
     return model, layout

@@ -460,3 +460,33 @@ class TestMultistepProbe:
             "actually expected to fire on step 3. Report:\n"
             + report.format()
         )
+
+
+# ----------------------------------------------------------------------
+# Routine execution: env-gated auto-run-on-compile
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.validator
+class TestRoutineExecution:
+    """Smoke that ``C4_VALIDATE_ON_COMPILE=1`` does not break compile.
+
+    The env var asks ``compile_full_vm`` to run Mode A as a warn-only
+    sanity check after baking the model. It must:
+
+      1. Not raise (the validator is opt-in diagnostic).
+      2. Not change the returned model/layout shape.
+
+    Anything else (drift warnings, etc.) is informational only.
+    """
+
+    def test_validate_on_compile_env_gate(self, monkeypatch):
+        from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
+            compile_full_vm,
+        )
+
+        monkeypatch.setenv("C4_VALIDATE_ON_COMPILE", "1")
+        model, layout = compile_full_vm(disk_cache=False)
+        assert layout.d_model > 0
+        assert layout.n_layers > 0
+        assert model is not None
