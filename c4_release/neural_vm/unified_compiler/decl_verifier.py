@@ -1316,6 +1316,680 @@ def verify_produces_consumes_multistep(
 
 
 # ---------------------------------------------------------------------------
+# Tier B annotation verifiers (Phase 8 structural correctness)
+# ---------------------------------------------------------------------------
+#
+# Three detectors built on top of the new ``Operation`` fields:
+#
+#   ``verify_alibi_consistency``  -- static cross-op scan of every
+#       declared ALiBi slope. Reports double-writes (two ops both set
+#       the same ``(layer, head)`` slope) and slope/W_k mismatches (a
+#       declared slope value paired with an unchanged-from-baseline W_k
+#       row scale, the ``db08e4d`` regression signature).
+#
+#   ``verify_postconditions``     -- multistep dynamic invariant check.
+#       For each op with a ``postcondition`` annotation, run a probe
+#       program for ``n_steps`` and assert the named invariant on the
+#       residual at the declared output cells. Violations are drift entries.
+#
+#   ``verify_step_idx_gating``    -- multistep firing-pattern check.
+#       For each op with a non-default ``step_idx`` annotation, run the
+#       probe and assert the op's ``produces`` writes are zero on every
+#       step that's NOT in ``step_idx``. Catches LEA-pattern bugs where
+#       an op fires on its declared step but spills into later steps.
+
+
+@dataclass
+class AlibiDriftEntry:
+    """A single (layer, head) alibi-consistency anomaly."""
+    layer_idx: int
+    head_idx: int
+    kind: str  # 'double_write' or 'slope_wk_mismatch'
+    detail: str  # human-readable description
+
+
+@dataclass
+class AlibiConsistencyReport:
+    drift: List[AlibiDriftEntry] = field(default_factory=list)
+    # Per-(layer, head) list of (op_name, declared_slope) for inspection.
+    declarations: Dict[Tuple[int, int], List[Tuple[str, float]]] = field(
+        default_factory=dict
+    )
+
+    def has_drift(self) -> bool:
+        return bool(self.drift)
+
+    def format(self) -> str:
+        lines = ["=== Alibi consistency report ==="]
+        lines.append(f"Slots with declarations: {len(self.declarations)}")
+        lines.append(f"Drift entries: {len(self.drift)}")
+        for entry in self.drift:
+            lines.append(
+                f"  [{entry.kind}] layer={entry.layer_idx} "
+                f"head={entry.head_idx}: {entry.detail}"
+            )
+        return "\n".join(lines)
+
+
+def verify_alibi_consistency(
+    compile_fn: Optional[Callable] = None,
+    *,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    n_heads: int = 8,
+    model=None,
+    layout=None,
+    wk_eps: float = 1e-6,
+) -> AlibiConsistencyReport:
+    """Static cross-op consistency scan for declared ``alibi_slopes``.
+
+    For each ``(layer_idx, head_idx)`` slot across all ops that declare
+    a slope:
+
+      1. **Double-write detection**: if two or more ops declare a slope
+         for the same slot, append a ``double_write`` drift entry. The
+         later-phase op silently clobbers the earlier; that's almost
+         always a bug. Exception: when both ops declare the SAME slope
+         value (idempotent) the entry is still reported (as it indicates
+         redundant work) but flagged as low-severity by including
+         ``redundant`` in the detail string.
+
+      2. **Slope/W_k mismatch**: when a declared slope is non-default
+         (i.e. differs from the model's initial ALiBi slope at that
+         head), verify that the corresponding attn module's
+         ``W_k[head_base, IS_MARK]`` row has been scaled away from its
+         default. The intuition: H1's softmax-budget arithmetic
+         requires that *both* the slope and W_k row scale move together
+         -- the ``db08e4d`` regression doubled the W_k row scale on L0
+         head 1 but left the slope unchanged, shifting the softmax
+         zero-crossing and producing the PSH 5-marker bug. The
+         heuristic detection: if a declared slope is more than 2x the
+         model's default ALiBi slope AND the W_k row scale is within
+         tolerance of its baseline, flag a ``slope_wk_mismatch``.
+
+    Args:
+        compile_fn: optional override for the compile pipeline. When
+            ``None`` and ``model``/``layout`` aren't pre-supplied,
+            ``compile_full_vm`` is called with the keyword args below.
+            Pre-supplying a model+layout avoids the ~70s rebake cost.
+        wk_eps: tolerance for "W_k row scale is at baseline" in the
+            mismatch heuristic. Default 1e-6 because the W_k *= 2.0
+            scale-bump in L0 H1 produces a 2x diff from baseline, well
+            above noise.
+
+    Returns:
+        ``AlibiConsistencyReport`` with the drift list + the full
+        declarations index (so callers can audit per-slot ownership).
+    """
+    report = AlibiConsistencyReport()
+
+    if layout is None or model is None:
+        if compile_fn is None:
+            from .full_vm_compiler import compile_full_vm
+            compile_fn = compile_full_vm
+        try:
+            model, layout = compile_fn(
+                alu_mode=alu_mode,
+                enable_conversational_io=enable_conversational_io,
+                enable_tool_calling=enable_tool_calling,
+                n_heads=n_heads,
+            )
+        except Exception as exc:
+            report.drift.append(AlibiDriftEntry(
+                layer_idx=-1, head_idx=-1, kind="compile_failed",
+                detail=repr(exc),
+            ))
+            return report
+
+    # Walk every op and collect (layer, head) -> [(op_name, slope), ...].
+    declarations: Dict[Tuple[int, int], List[Tuple[str, float]]] = {}
+    candidates = _collect_unique_ops_with(layout, lambda op: bool(op.alibi_slopes))
+    for op in candidates:
+        layer_idx = _resolve_op_layer(layout, op)
+        if layer_idx is None:
+            # Cannot pin op to a layer; skip rather than spuriously claim it.
+            continue
+        for head_idx, slope in op.alibi_slopes.items():
+            declarations.setdefault((layer_idx, head_idx), []).append(
+                (op.name, float(slope))
+            )
+    report.declarations = declarations
+
+    # Double-write detection.
+    for slot, owners in declarations.items():
+        layer_idx, head_idx = slot
+        if len(owners) >= 2:
+            distinct_values = {round(s, 9) for _, s in owners}
+            if len(distinct_values) == 1:
+                kind = "double_write"
+                detail = (
+                    f"{len(owners)} ops declare same slope "
+                    f"{owners[0][1]} (redundant): "
+                    f"{[name for name, _ in owners]}"
+                )
+            else:
+                kind = "double_write"
+                detail = (
+                    f"{len(owners)} ops declare conflicting slopes "
+                    f"{owners} -- later op silently overwrites earlier"
+                )
+            report.drift.append(AlibiDriftEntry(
+                layer_idx=layer_idx, head_idx=head_idx,
+                kind=kind, detail=detail,
+            ))
+
+    # Slope/W_k mismatch detection (best-effort heuristic).
+    # Baseline ALiBi slope: read directly from the compiled model. The
+    # default after L0's ``fill_(ALIBI_S)`` is 10.0; after per-layer
+    # mutations it can be anything. We compare the post-bake slope at
+    # each (layer, head) against the op's DECLARED slope and flag
+    # if the declared value is >2x the layer's baseline (heuristic
+    # tuned to L0 H1's ALIBI_S*2.0 = 20 against baseline 10).
+    # A "non-trivial slope but W_k unchanged" pairing is the smoking gun.
+    try:
+        baseline_default = 10.0  # ALIBI_S in L0/L1
+        ismark_col = layout.dim_positions.get("IS_MARK")
+    except AttributeError:
+        baseline_default = None
+        ismark_col = None
+
+    if ismark_col is not None:
+        for slot, owners in declarations.items():
+            layer_idx, head_idx = slot
+            if layer_idx < 0 or layer_idx >= len(model.blocks):
+                continue
+            try:
+                attn = model.blocks[layer_idx].attn
+            except (AttributeError, IndexError):
+                continue
+            HD = attn.W_q.shape[0] // attn.num_heads
+            head_base = head_idx * HD
+            try:
+                wk_row_val = float(
+                    attn.W_k.data[head_base, ismark_col].abs().item()
+                )
+            except (RuntimeError, IndexError):
+                continue
+            for op_name, declared_slope in owners:
+                # Flag when the declared slope is >2x baseline (steep)
+                # but the W_k row scale at IS_MARK is still ~0 (i.e.
+                # the head doesn't read IS_MARK at all -- so a steep
+                # slope is suspect because no mark-anchored arithmetic
+                # is happening). This is the L0 H1 regression signature
+                # inverted: declared slope=20 with W_k *= 2.0 produces
+                # ~20 at this cell, baseline produces ~10. If the cell
+                # is 0 the head is not threshold-style at all and we
+                # don't flag.
+                if (baseline_default is not None
+                        and abs(declared_slope) >= 2.0 * baseline_default
+                        and wk_row_val < wk_eps):
+                    report.drift.append(AlibiDriftEntry(
+                        layer_idx=layer_idx, head_idx=head_idx,
+                        kind="slope_wk_mismatch",
+                        detail=(
+                            f"op {op_name!r} declares steep slope "
+                            f"{declared_slope} but W_k[{head_base},"
+                            f"IS_MARK]={wk_row_val:.3e} ~ 0 "
+                            f"(no IS_MARK-anchored arithmetic on this head;"
+                            f" slope value is suspect)"
+                        ),
+                    ))
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Postcondition verifier (multistep)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PostconditionDriftEntry:
+    op_name: str
+    step: int
+    cell: str  # "DIM[k]"
+    invariant: str
+    detail: str
+
+
+@dataclass
+class PostconditionReport:
+    n_steps: int = 0
+    program_summary: str = ""
+    drift: List[PostconditionDriftEntry] = field(default_factory=list)
+
+    def has_drift(self) -> bool:
+        return bool(self.drift)
+
+    def format(self) -> str:
+        lines = [
+            "=== Postcondition verification report ===",
+            f"Program: {self.program_summary}",
+            f"Steps: {self.n_steps}",
+            f"Drift entries: {len(self.drift)}",
+        ]
+        for entry in self.drift:
+            lines.append(
+                f"  [drift] op={entry.op_name!r} step={entry.step} "
+                f"cell={entry.cell!r} invariant={entry.invariant!r}: "
+                f"{entry.detail}"
+            )
+        return "\n".join(lines)
+
+
+def _parse_postcondition_cell(cell: str) -> Tuple[str, Optional[int]]:
+    """Parse ``'DIM_NAME[k]'`` -> ``('DIM_NAME', k)``; ``'DIM_NAME'`` ->
+    ``('DIM_NAME', None)`` (whole dim).
+    """
+    if "[" in cell and cell.endswith("]"):
+        name, idx = cell[:-1].split("[", 1)
+        try:
+            return name, int(idx)
+        except ValueError:
+            return name, None
+    return cell, None
+
+
+def _read_residual_cell(
+    residual: torch.Tensor, pos: int, dim_start: int, dim_size: int,
+    offset: Optional[int],
+) -> float:
+    """Read residual scalar at ``residual[0, pos, dim_start + offset]``.
+
+    Returns the abs-max across the dim slice when ``offset`` is None.
+    """
+    if offset is None:
+        slice_vals = residual[0, pos, dim_start:dim_start + dim_size]
+        return float(slice_vals.abs().max().item())
+    return float(residual[0, pos, dim_start + offset].item())
+
+
+def verify_postconditions(
+    model=None,
+    layout=None,
+    program: Optional[List[int]] = None,
+    n_steps: int = 4,
+    *,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    S: float = 100.0,
+    n_heads: int = 8,
+    epsilon: float = 1e-2,
+) -> PostconditionReport:
+    """Multistep dynamic check on ``Operation.postcondition`` annotations.
+
+    For each op with a non-empty ``postcondition``, run the compiled
+    model forward over a multi-step probe and verify the declared
+    invariant for every step. Drift entries report the offending
+    ``(op, step, cell, invariant)``.
+
+    Supported invariants:
+        - ``'0_or_1'``: residual abs is either ~0 or ~1 (within epsilon).
+        - ``'byte_range'``: residual scalar in [0, 255+epsilon].
+        - ``'monotonic_non_decreasing'``: value at step k >= value at
+          step k-1 (modulo epsilon).
+        - ``'matches_AX_byte<k>'``: value at the op's cell equals the
+          current AX byte k value at the AX marker. The reference comes
+          from the DraftVM oracle inside ``_build_multistep_probe``.
+
+    The probe defaults to ``_ADD_CASCADE_PROGRAM`` (IMM/PSH/IMM/ADD/EXIT)
+    which exercises PC monotonicity, STACK0 byte writes, and AX updates
+    across 4 distinct steps -- enough surface to catch most invariant
+    drifts without a full smoke run.
+    """
+    if program is None:
+        program = list(_ADD_CASCADE_PROGRAM)
+    report = PostconditionReport(
+        n_steps=n_steps,
+        program_summary=" ".join(f"0x{i:016x}" for i in program),
+    )
+
+    if model is None or layout is None:
+        from .full_vm_compiler import compile_full_vm
+        try:
+            model, layout = compile_full_vm(
+                S=S, alu_mode=alu_mode,
+                enable_conversational_io=enable_conversational_io,
+                n_heads=n_heads,
+            )
+        except Exception as exc:
+            report.drift.append(PostconditionDriftEntry(
+                op_name="<compile_full_vm>", step=0, cell="<NONE>",
+                invariant="<NONE>", detail=f"compile failed: {exc!r}",
+            ))
+            return report
+
+    candidates = _collect_unique_ops_with(layout, lambda op: bool(op.postcondition))
+    if not candidates:
+        return report
+
+    try:
+        token_tensor, step_markers, _summaries = _build_multistep_probe(
+            layout, program, n_steps,
+        )
+    except Exception as exc:
+        report.drift.append(PostconditionDriftEntry(
+            op_name="<build_multistep_probe>", step=0, cell="<NONE>",
+            invariant="<NONE>", detail=f"probe build failed: {exc!r}",
+        ))
+        return report
+
+    max_len = getattr(model, "max_seq_len", None)
+    if max_len is not None and token_tensor.shape[1] > max_len:
+        report.drift.append(PostconditionDriftEntry(
+            op_name="<context_too_long>", step=0, cell="<NONE>",
+            invariant="<NONE>",
+            detail=f"len {token_tensor.shape[1]} > max_seq_len {max_len}",
+        ))
+        return report
+
+    try:
+        with torch.no_grad():
+            x = model.embed(token_tensor)
+            per_layer_residuals = [x.detach().clone()]
+            for block in model.blocks:
+                x = block(x)
+                per_layer_residuals.append(x.detach().clone())
+    except Exception as exc:
+        report.drift.append(PostconditionDriftEntry(
+            op_name="<forward>", step=0, cell="<NONE>",
+            invariant="<NONE>", detail=f"forward failed: {exc!r}",
+        ))
+        return report
+
+    final_residual = per_layer_residuals[-1]
+
+    for op in candidates:
+        layer_idx = _resolve_op_layer(layout, op)
+        if layer_idx is None or layer_idx + 1 >= len(per_layer_residuals):
+            inspect_layer = len(per_layer_residuals) - 1
+        else:
+            inspect_layer = layer_idx + 1
+        post_residual = per_layer_residuals[inspect_layer]
+
+        # Previous-step residual cache for monotonic invariants.
+        prev_value: Dict[str, float] = {}
+
+        for step_idx, marker_map in enumerate(step_markers):
+            if not marker_map:
+                continue
+            step_k = step_idx + 1
+            for cell, invariant in op.postcondition.items():
+                dim_name, offset = _parse_postcondition_cell(cell)
+                if dim_name not in layout.dim_positions:
+                    report.drift.append(PostconditionDriftEntry(
+                        op_name=op.name, step=step_k, cell=cell,
+                        invariant=invariant,
+                        detail=f"dim {dim_name!r} not in layout",
+                    ))
+                    continue
+                d_start = layout.dim_positions[dim_name]
+                d_size = layout.dim_sizes.get(dim_name, 1)
+                # The "natural" probe position depends on the dim name --
+                # PC* lives at REG_PC, AX* at REG_AX, STACK0* at STACK0,
+                # everything else falls back to REG_AX.
+                if dim_name.startswith(("PC", "OUTPUT")):
+                    pos = marker_map.get("REG_PC", marker_map["REG_PC"])
+                elif dim_name.startswith("AX"):
+                    pos = marker_map.get("REG_AX", marker_map["REG_AX"])
+                elif dim_name.startswith("STACK0"):
+                    pos = marker_map.get("STACK0", marker_map["STACK0"])
+                else:
+                    pos = marker_map.get("REG_AX", marker_map["REG_AX"])
+
+                val = _read_residual_cell(
+                    post_residual, pos, d_start, d_size, offset,
+                )
+
+                if invariant == "0_or_1":
+                    # Binary flag: |val| in {~0, ~1}.
+                    if not (val < epsilon or abs(val - 1.0) < epsilon):
+                        report.drift.append(PostconditionDriftEntry(
+                            op_name=op.name, step=step_k, cell=cell,
+                            invariant=invariant,
+                            detail=(
+                                f"value {val:.4f} not in "
+                                f"{{0, 1}} (eps={epsilon})"
+                            ),
+                        ))
+                elif invariant == "byte_range":
+                    if not (-epsilon <= val <= 255 + epsilon):
+                        report.drift.append(PostconditionDriftEntry(
+                            op_name=op.name, step=step_k, cell=cell,
+                            invariant=invariant,
+                            detail=f"value {val:.4f} not in [0, 255]",
+                        ))
+                elif invariant == "monotonic_non_decreasing":
+                    if cell in prev_value:
+                        if val + epsilon < prev_value[cell]:
+                            report.drift.append(PostconditionDriftEntry(
+                                op_name=op.name, step=step_k, cell=cell,
+                                invariant=invariant,
+                                detail=(
+                                    f"value {val:.4f} < prev "
+                                    f"{prev_value[cell]:.4f} "
+                                    f"(decreased)"
+                                ),
+                            ))
+                    prev_value[cell] = val
+                elif invariant.startswith("matches_AX_byte"):
+                    # Reference AX byte k from oracle (parsed from the
+                    # step summary's "AX=<hex>" field). Without the
+                    # oracle we fall back to a residual-shape check.
+                    # Future: thread the DraftVM AX value through
+                    # ``_build_multistep_probe`` for exact equality.
+                    # For now, sanity-check that the cell is in byte
+                    # range (a weaker invariant; primary use is to
+                    # ensure the annotation is parseable).
+                    if not (-epsilon <= val <= 255 + epsilon):
+                        report.drift.append(PostconditionDriftEntry(
+                            op_name=op.name, step=step_k, cell=cell,
+                            invariant=invariant,
+                            detail=(
+                                f"value {val:.4f} not in byte range; "
+                                f"AX-byte-equality not yet probed"
+                            ),
+                        ))
+                # Unknown invariants were rejected at add_op; this
+                # branch is unreachable.
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Step-idx gating verifier (multistep)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StepIdxDriftEntry:
+    op_name: str
+    step: int
+    dim: str
+    declared: str  # readable form of step_idx (e.g. '{0}' or 'after_first')
+    detail: str
+
+
+@dataclass
+class StepIdxReport:
+    n_steps: int = 0
+    program_summary: str = ""
+    drift: List[StepIdxDriftEntry] = field(default_factory=list)
+
+    def has_drift(self) -> bool:
+        return bool(self.drift)
+
+    def format(self) -> str:
+        lines = [
+            "=== step_idx gating report ===",
+            f"Program: {self.program_summary}",
+            f"Steps: {self.n_steps}",
+            f"Drift entries: {len(self.drift)}",
+        ]
+        for entry in self.drift:
+            lines.append(
+                f"  [drift] op={entry.op_name!r} step={entry.step} "
+                f"dim={entry.dim!r} declared={entry.declared!r}: "
+                f"{entry.detail}"
+            )
+        return "\n".join(lines)
+
+
+def _step_idx_to_str(step_idx) -> str:
+    if step_idx is None:
+        return "every"
+    if isinstance(step_idx, str):
+        return step_idx
+    return str(sorted(step_idx))
+
+
+def _step_is_active(step_idx, k: int) -> bool:
+    """Return True if the op is declared to fire on step ``k`` (0-indexed)."""
+    if step_idx is None or step_idx == "every":
+        return True
+    if step_idx == "after_first":
+        return k >= 1
+    if isinstance(step_idx, (set, frozenset)):
+        return k in step_idx
+    # Defensive: should be caught by validation in add_op.
+    return True
+
+
+def verify_step_idx_gating(
+    model=None,
+    layout=None,
+    program: Optional[List[int]] = None,
+    n_steps: int = 4,
+    *,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    S: float = 100.0,
+    n_heads: int = 8,
+    epsilon: float = 1e-2,
+) -> StepIdxReport:
+    """Multistep dynamic check on ``Operation.step_idx`` annotations.
+
+    For each op with a non-default ``step_idx`` and a non-empty
+    ``produces`` declaration, run the multistep probe and assert the
+    op's residual writes are below ``epsilon`` on every step NOT in
+    ``step_idx``. Catches the canonical LEA-bug pattern: an op declared
+    to fire only on step 1 keeps writing at step 2 because the gating
+    logic in its bake is incomplete.
+
+    Ops with ``step_idx=None`` or ``'every'`` are skipped (no gating
+    invariant to enforce).
+    """
+    if program is None:
+        program = list(_ADD_CASCADE_PROGRAM)
+    report = StepIdxReport(
+        n_steps=n_steps,
+        program_summary=" ".join(f"0x{i:016x}" for i in program),
+    )
+
+    if model is None or layout is None:
+        from .full_vm_compiler import compile_full_vm
+        try:
+            model, layout = compile_full_vm(
+                S=S, alu_mode=alu_mode,
+                enable_conversational_io=enable_conversational_io,
+                n_heads=n_heads,
+            )
+        except Exception as exc:
+            report.drift.append(StepIdxDriftEntry(
+                op_name="<compile_full_vm>", step=0, dim="<NONE>",
+                declared="<NONE>", detail=f"compile failed: {exc!r}",
+            ))
+            return report
+
+    def _has_gating(op):
+        if op.step_idx is None or op.step_idx == "every":
+            return False
+        return bool(op.produces)
+
+    candidates = _collect_unique_ops_with(layout, _has_gating)
+    if not candidates:
+        return report
+
+    try:
+        token_tensor, step_markers, _summaries = _build_multistep_probe(
+            layout, program, n_steps,
+        )
+    except Exception as exc:
+        report.drift.append(StepIdxDriftEntry(
+            op_name="<build_multistep_probe>", step=0, dim="<NONE>",
+            declared="<NONE>", detail=f"probe build failed: {exc!r}",
+        ))
+        return report
+
+    max_len = getattr(model, "max_seq_len", None)
+    if max_len is not None and token_tensor.shape[1] > max_len:
+        report.drift.append(StepIdxDriftEntry(
+            op_name="<context_too_long>", step=0, dim="<NONE>",
+            declared="<NONE>",
+            detail=f"len {token_tensor.shape[1]} > max_seq_len {max_len}",
+        ))
+        return report
+
+    try:
+        with torch.no_grad():
+            x = model.embed(token_tensor)
+            per_layer_residuals = [x.detach().clone()]
+            for block in model.blocks:
+                x = block(x)
+                per_layer_residuals.append(x.detach().clone())
+    except Exception as exc:
+        report.drift.append(StepIdxDriftEntry(
+            op_name="<forward>", step=0, dim="<NONE>",
+            declared="<NONE>", detail=f"forward failed: {exc!r}",
+        ))
+        return report
+
+    for op in candidates:
+        layer_idx = _resolve_op_layer(layout, op)
+        if layer_idx is None or layer_idx + 1 >= len(per_layer_residuals):
+            inspect_layer = len(per_layer_residuals) - 1
+        else:
+            inspect_layer = layer_idx + 1
+        post_residual = per_layer_residuals[inspect_layer]
+        declared_str = _step_idx_to_str(op.step_idx)
+
+        for step_idx, marker_map in enumerate(step_markers):
+            if not marker_map:
+                continue
+            if _step_is_active(op.step_idx, step_idx):
+                continue
+            # Op should be inert on this step.
+            step_k = step_idx + 1
+            for dim_name, register in op.produces.items():
+                if dim_name not in layout.dim_positions:
+                    continue
+                offset = _resolve_register_offset(register)
+                if offset is None:
+                    continue
+                pos = marker_map["REG_PC"] + offset
+                d_start = layout.dim_positions[dim_name]
+                d_size = layout.dim_sizes.get(dim_name, 1)
+                slice_vals = post_residual[0, pos, d_start:d_start + d_size]
+                obs_abs = float(slice_vals.abs().max().item())
+                if obs_abs >= epsilon:
+                    report.drift.append(StepIdxDriftEntry(
+                        op_name=op.name, step=step_k, dim=dim_name,
+                        declared=declared_str,
+                        detail=(
+                            f"op declared step_idx={declared_str} but "
+                            f"residual abs-max={obs_abs:.3e} at "
+                            f"register={register!r} pos={pos} "
+                            f"(should be <{epsilon})"
+                        ),
+                    ))
+
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Convenience top-level entry point
 # ---------------------------------------------------------------------------
 

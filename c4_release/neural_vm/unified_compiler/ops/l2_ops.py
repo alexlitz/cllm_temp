@@ -157,6 +157,15 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         # 8 and 9 -> max index 10. The aggregator takes the per-block max
         # across all annotated ops, so reporting 10 here covers both.
         ffn_units_used=10,
+        # Tier B: step_idx='after_first'. The cancel only fires when the
+        # gate ``MARK_PC AND HAS_SE`` resolves true; step 0's MARK_PC has
+        # HAS_SE=0 (no STEP_END token in context yet), so the cancel is
+        # inert on step 0. From step 1 onward the prior step's STEP_END
+        # makes HAS_SE=1, so the cancel fires every subsequent step.
+        # ``verify_step_idx_gating`` asserts the op's residual writes are
+        # ~0 at the step 0 MARK_PC position; any non-zero output there
+        # is a regression that re-introduces the +INSTR_WIDTH PC drift.
+        step_idx="after_first",
     )
 
 

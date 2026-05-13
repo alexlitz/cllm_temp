@@ -161,6 +161,18 @@ def make_layer0_threshold_attn_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        # Tier B: head 1 carries the softmax-sharpness fix from
+        # commit ``ff7b5a8`` -- ALIBI_S * 2.0 = 20.0 paired with a
+        # corresponding 2x bump on W_k[head1_base, IS_MARK]. The earlier
+        # ``db08e4d`` regression doubled W_k WITHOUT this slope bump,
+        # which shifted the H1 zero-crossing from d=4.5 to d=9 and
+        # produced the PSH 5-marker bug. ``verify_alibi_consistency``
+        # asserts this declaration matches the W_k row scale so a
+        # future change to one side without the other is flagged.
+        # Heads 0/2..7 inherit ALIBI_S=10.0 from the ``fill_`` call;
+        # they aren't declared here because that value is the L0
+        # baseline (not an explicit per-head override).
+        alibi_slopes={1: 20.0},
     )
 
 

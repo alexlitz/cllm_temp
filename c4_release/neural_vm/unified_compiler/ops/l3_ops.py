@@ -64,6 +64,19 @@ def make_layer3_ffn_op() -> Operation:
             "OUTPUT_LO": "PC_marker",
             "OUTPUT_HI": "PC_marker",
         },
+        # Tier B: the PC byte 0 prediction at the PC marker is the
+        # input PC + INSTR_WIDTH (modulo branch/jump). Over a linear
+        # IMM cascade (no jumps) the PC value at OUTPUT_LO+pc_lo at
+        # the PC marker is monotonically non-decreasing across steps:
+        # PC=8, 16, 24, ... The invariant is per-cell; we encode the
+        # PC byte 0 lo-nibble cell as the most stable witness. A
+        # decrease here means a backward jump executed without an
+        # OP_BACKWARD_JMP annotation (or a regression in L3 increment
+        # arithmetic). ``verify_postconditions`` records each step's
+        # cell value and flags any decrease against the prior step.
+        postcondition={
+            f"OUTPUT_LO[{_pc_lo}]": "monotonic_non_decreasing",
+        },
     )
 
 

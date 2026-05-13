@@ -45,6 +45,19 @@ def make_layer1_ffn_op() -> Operation:
         # ``_set_layer1_ffn`` writes 5 units (one per output: STACK0_BYTE0,
         # BYTE_INDEX_0..3). See setup_helpers.py:_set_layer1_ffn.
         ffn_units_used=5,
+        # Tier B: each of the 5 outputs is a binary flag. STACK0_BYTE0
+        # is 1 at the STACK0 BYTE 0 position, 0 elsewhere; BYTE_INDEX_k
+        # is 1 at the k-th byte of any multi-byte field, 0 elsewhere.
+        # ``verify_postconditions`` asserts each cell's residual is
+        # within epsilon of 0 or 1 on every step. Spillover (a fractional
+        # value) indicates threshold logic regressed.
+        postcondition={
+            "STACK0_BYTE0[0]": "0_or_1",
+            "BYTE_INDEX_0[0]": "0_or_1",
+            "BYTE_INDEX_1[0]": "0_or_1",
+            "BYTE_INDEX_2[0]": "0_or_1",
+            "BYTE_INDEX_3[0]": "0_or_1",
+        },
     )
 
 

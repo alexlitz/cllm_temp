@@ -192,6 +192,15 @@ def make_opcode_relay_head_op() -> Operation:
         bake_fn=bake,
         phase=1002,
         migrated=True,
+        # Tier B: this op mutates ``attn6.alibi_slopes[6]`` and
+        # ``attn6.alibi_slopes[7]`` to 5.0 each. The aggregate consistency
+        # check uses this to detect double-writes against
+        # ``residual_alibi_slopes`` (which earlier fills L6 head 0..4 but
+        # leaves heads 6/7 alone) and any future op that tries to claim
+        # the same slot. ``layer_idx=6`` is set so the verifier can pin
+        # this op to L6 when scanning declarations.
+        alibi_slopes={6: 5.0, 7: 5.0},
+        layer_idx=6,
     )
 
 

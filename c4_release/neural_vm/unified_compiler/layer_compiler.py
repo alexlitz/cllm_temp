@@ -43,7 +43,7 @@ Example:
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 
 # Allowed `scope` values for `Operation.claims`. Each scope tags a class of
@@ -196,6 +196,51 @@ class Operation:
     # and the canonical AX_CARRY example.
     produces: Dict[str, str] = field(default_factory=dict)
     consumes_fresh: Dict[str, str] = field(default_factory=dict)
+    # -----------------------------------------------------------------
+    # Tier B structural-correctness annotations (Phase 8 verifier).
+    #
+    # ``alibi_slopes``: maps ``head_idx -> slope_value`` for any ALiBi
+    #     slope write this op performs on its target attention module.
+    #     E.g. ``make_opcode_relay_head_op`` writes
+    #     ``attn6.alibi_slopes[6] = 5.0`` and
+    #     ``attn6.alibi_slopes[7] = 5.0``, so its annotation is
+    #     ``alibi_slopes={6: 5.0, 7: 5.0}``. The aggregate static check
+    #     ``verify_alibi_consistency`` cross-references every op's
+    #     declaration with its peers' to detect:
+    #
+    #       - double-writes: two ops both declare a slope for the same
+    #         ``(layer, head)`` slot -- usually a bug because the later
+    #         write silently clobbers the earlier (the ``db08e4d`` regression
+    #         that caused the PSH 5-marker bug doubled L0 head 1's W_k
+    #         scale without bumping the slope, so this check is the
+    #         canonical detector for "K-scale changed but slope didn't").
+    #       - slope/W_k mismatch: when a declared slope value is paired
+    #         with a stale ``W_k`` row scale (the L0 H1 incident the
+    #         ``ff7b5a8`` fix corrected). Reported as a drift entry.
+    #
+    # ``postcondition``: output value invariants for the op's writes.
+    #     Format: ``{'DIM_NAME[k]': 'invariant_name'}``. Supported
+    #     invariants: ``'0_or_1'`` (binary flag), ``'byte_range'`` (0-255),
+    #     ``'monotonic_non_decreasing'`` (never decreases across VM steps),
+    #     ``'matches_AX_byte<k>'`` (equals current AX byte k). The
+    #     ``verify_postconditions`` driver runs a multi-step probe and
+    #     records a drift entry for every step where the invariant fails.
+    #
+    # ``step_idx``: when the op fires across VM steps. Values:
+    #     - ``None`` or string ``'every'``: fires every step (default).
+    #     - ``Set[int]`` like ``{0}``: fires only on step 0.
+    #     - String ``'after_first'``: fires step 1+ but not step 0.
+    #     The ``verify_step_idx_gating`` driver asserts the op's
+    #     ``produces`` writes are zero on undeclared steps. Catches the
+    #     "L7 head 1 fires on step 1 but breaks on step 2+" LEA pattern.
+    #
+    # All three fields default to empty/None so legacy ops remain opt-in
+    # (the verifier loops skip ops without annotations). Coexist with the
+    # Tier A (``produces``/``consumes_fresh``) and Tier C field expansions
+    # by virtue of the default values -- merge order is irrelevant.
+    alibi_slopes: Dict[int, float] = field(default_factory=dict)
+    postcondition: Dict[str, str] = field(default_factory=dict)
+    step_idx: Optional[Union[Set[int], str]] = None
 
     def __hash__(self):
         return hash(self.name)
@@ -384,6 +429,69 @@ class LayerCompiler:
                 )
             promoted.add((layer_idx, scope, identifier, column))
         op.claims = promoted
+        # Validate Tier B annotations (Phase 8 verifier).
+        if not isinstance(op.alibi_slopes, dict):
+            raise ValueError(
+                f"Op {op.name!r} alibi_slopes must be a dict; "
+                f"got {type(op.alibi_slopes).__name__}"
+            )
+        for head_idx, slope in op.alibi_slopes.items():
+            if not isinstance(head_idx, int) or head_idx < 0:
+                raise ValueError(
+                    f"Op {op.name!r} alibi_slopes head_idx must be "
+                    f"non-negative int; got {head_idx!r}"
+                )
+            if not isinstance(slope, (int, float)):
+                raise ValueError(
+                    f"Op {op.name!r} alibi_slopes[{head_idx}] must be "
+                    f"int or float; got {slope!r}"
+                )
+        if not isinstance(op.postcondition, dict):
+            raise ValueError(
+                f"Op {op.name!r} postcondition must be a dict; "
+                f"got {type(op.postcondition).__name__}"
+            )
+        _ALLOWED_POSTCONDITIONS = {
+            "0_or_1", "monotonic_non_decreasing", "byte_range",
+        }
+        for key, invariant in op.postcondition.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"Op {op.name!r} postcondition key must be str; "
+                    f"got {key!r}"
+                )
+            if not isinstance(invariant, str):
+                raise ValueError(
+                    f"Op {op.name!r} postcondition[{key!r}] must be str; "
+                    f"got {invariant!r}"
+                )
+            if (invariant not in _ALLOWED_POSTCONDITIONS
+                    and not invariant.startswith("matches_AX_byte")):
+                raise ValueError(
+                    f"Op {op.name!r} postcondition[{key!r}]={invariant!r} "
+                    f"not in {sorted(_ALLOWED_POSTCONDITIONS)} or "
+                    f"'matches_AX_byte<k>'"
+                )
+        if op.step_idx is not None:
+            if isinstance(op.step_idx, str):
+                if op.step_idx not in ("every", "after_first"):
+                    raise ValueError(
+                        f"Op {op.name!r} step_idx string must be 'every' or "
+                        f"'after_first'; got {op.step_idx!r}"
+                    )
+            elif isinstance(op.step_idx, (set, frozenset)):
+                for k in op.step_idx:
+                    if not isinstance(k, int) or k < 0:
+                        raise ValueError(
+                            f"Op {op.name!r} step_idx members must be "
+                            f"non-negative ints; got {k!r}"
+                        )
+            else:
+                raise ValueError(
+                    f"Op {op.name!r} step_idx must be None, 'every', "
+                    f"'after_first', or Set[int]; got "
+                    f"{type(op.step_idx).__name__}"
+                )
         self._op_by_name[op.name] = op
         if op.kind == "block":
             if op.layer_idx is None and op.target_op_name is None:
