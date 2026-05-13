@@ -4695,9 +4695,24 @@ def _set_layer6_relay_heads(attn, S, BD, HD):
     # NOTE: Head 7 was reserved for JSR, but JSR Q activates at different positions
     # (STACK0 for return address push), so there's no conflict with PSH Q (also STACK0).
     # The Q weights are additive, so both PSH and JSR can use head 7 at STACK0.
+    #
+    # FIX 2026-05-12: ``_set_function_call_weights`` writes head 7 Q[CONST]=-1000
+    # as a baseline suppressor for non-STACK0 positions (so the JSR variant
+    # doesn't leak at PC/AX/BP markers). When this relay setup runs AFTER the
+    # JSR bake (phase 998.6 > 998), assigning Q[MARK_STACK0]=50 (rather than
+    # 1050) and leaving Q[CONST]=-1000 made Q at STACK0 = 50 - 1000 = -950
+    # (negative — head 7 fires NOWHERE). Result: ALU_HI at the STACK0 marker
+    # was never populated during PSH, so the L6 PSH FFN's gate (-EMBED_HI +
+    # ALU_HI) wrote 0 to OUTPUT_HI; the L14 byte-emit head then argmaxed the
+    # hi nibble to 0 even when the source AX value's hi nibble was nonzero.
+    # The lo nibble (head 6) worked because head 6's Q has no CONST baseline.
+    # Mirror the JSR-side Q gate exactly (MARK_STACK0=1050, CONST=-1000) so
+    # Q at STACK0 = 50 (fires), Q elsewhere ≈ -1000 (suppressed) — matching
+    # what head 6 effectively gets without the JSR contamination.
     base7 = 7 * HD
-    attn.W_q[base7, BD.MARK_STACK0] = L
+    attn.W_q[base7, BD.MARK_STACK0] = L + L * 20  # +1050 at STACK0 (cancels Q[CONST]=-1000)
     attn.W_q[base7, BD.MARK_AX] = -L  # block at AX marker
+    attn.W_q[base7, BD.CONST] = -L * 20  # -1000 baseline (suppress non-STACK0 positions)
     attn.W_k[base7, BD.MARK_AX] = L
     for k in range(16):
         attn.W_v[base7 + k, BD.AX_CARRY_HI + k] = 1.0
@@ -7085,6 +7100,18 @@ def _set_layer16_lev_routing(ffn, S, BD):
     # because ADDR_B0_LO[8]=12 from +8 offset makes OP_LEV + ADDR_B0 > threshold.
     # BUG FIX 2026-04-16: Increased MARK_PC penalty from -S*5 to -S*15 to overcome
     # ADDR_B0_LO[8]=12 contribution. Calc: 10 + 0 - 150 + 120 - 30 = -50 < 0 (blocked).
+    # FIX 2026-05-12: Add MARK_STACK0 / MARK_MEM / MARK_SE exclusions. Without
+    # them, the units' threshold (-3S) was overcome at the STACK0 marker by
+    # ADDR_B0_LO/HI contamination leaking out of the L4 SP→ADDR_KEY staging
+    # head (enable=True since 2026-05-11). On a PSH STK0 marker, ADDR_B0_HI[0]
+    # ≈ 4.34 (softmax1 partial-attention leak from L4 head 2 firing at the
+    # AX marker), so the unit's W_gate[ADDR_B0_HI[0]] amplifier fired
+    # full-strength even with OP_LEV=0 and MARK_SP=0: up = -3S + S*4.34 =
+    # +134, silu(134)*4.34 = 581, W_down to OUTPUT_HI[1] = 0.02 → +11.63.
+    # That dominated the 5*OUTPUT_HI[0]≈4.95 from the (correctly populated)
+    # L6 PSH FFN, causing the STACK0 byte 0 token argmax to flip to byte 26
+    # (lo=10, hi=1) instead of 10. Marker exclusions block the unit at
+    # any non-SP marker outright; LEV only writes at SP so this is safe.
     for k in range(16):
         # Result lo nibble = k (adding 16 to nibble k gives k with carry)
         # FIX 2026-04-16: Gate on ADDR_B0_LO[k] instead of CONST to prevent spurious firing
@@ -7094,6 +7121,9 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_BP] = -S * 15  # Exclude BP marker (must overcome ADDR_B0*S)
         ffn.W_up[unit, BD.MARK_PC] = -S * 15  # Exclude PC marker (must overcome ADDR_B0[8]=12*S)
         ffn.W_up[unit, BD.MARK_AX] = -S * 50  # FIX 2026-04-16: Exclude AX marker (ADDR_B0 contamination ~40*S)
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 15  # FIX 2026-05-12: Exclude STACK0 marker
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 15  # FIX 2026-05-12: Exclude MEM marker
+        ffn.W_up[unit, BD.MARK_SE] = -S * 15  # FIX 2026-05-12: Exclude STEP_END marker
         # FIX 2026-04-16: Suppress at byte positions (BYTE_INDEX=1 at bytes, =0 at markers)
         # ADDR_B0 contamination causes spurious firing at byte positions, need strong suppression.
         ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 10  # Suppress at byte 0 positions
@@ -7117,6 +7147,9 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_BP] = -S * 15  # Exclude BP marker (must overcome ADDR_B0*S)
         ffn.W_up[unit, BD.MARK_PC] = -S * 15  # Exclude PC marker (must overcome ADDR_B0*S)
         ffn.W_up[unit, BD.MARK_AX] = -S * 50  # FIX 2026-04-16: Exclude AX marker
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 15  # FIX 2026-05-12: Exclude STACK0 marker
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 15  # FIX 2026-05-12: Exclude MEM marker
+        ffn.W_up[unit, BD.MARK_SE] = -S * 15  # FIX 2026-05-12: Exclude STEP_END marker
         # FIX 2026-04-16: Suppress at byte positions
         ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 10
         ffn.W_up[unit, BD.BYTE_INDEX_1] = -S * 10
