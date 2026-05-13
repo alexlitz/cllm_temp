@@ -58,8 +58,9 @@ def make_layer3_ffn_op() -> Operation:
         # Produces the PC byte-0 token prediction (OUTPUT_LO/HI at the PC
         # marker) for the first step (PC=PC_OFFSET+INSTR_WIDTH default) and
         # the EMBED_LO/HI relay that feeds L4's PC-marker → AX-marker hop.
-        # Marker label "PC_marker" pins the convention used by downstream
-        # control-flow ops (BZ/BNZ relay, JMP, etc.).
+        # Staleness invariant: L4 PC relay + L5 fetch consume the PC at the
+        # PC marker; OUTPUT_LO/HI are the load-bearing produces (PC byte-0
+        # nibbles for the next-step token prediction).
         produces={
             "OUTPUT_LO": "PC_marker",
             "OUTPUT_HI": "PC_marker",

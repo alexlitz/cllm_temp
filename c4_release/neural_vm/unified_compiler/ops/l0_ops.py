@@ -58,6 +58,21 @@ def make_phase_a_ffn_op() -> Operation:
         # the 7-entry ``transitions`` list (SE→PC, PC→AX, AX→SP, SP→BP,
         # BP→STACK0, STACK0→MEM, MEM→SE). Units 0..6.
         ffn_units_used=7,
+        # Staleness invariants: NEXT_* flags fire at the token that
+        # immediately precedes the corresponding marker (position N
+        # predicts position N+1). The LM head consumes these to emit
+        # the next marker token. We pin each NEXT_* to the token that
+        # writes it; threshold-head differences make these deterministic
+        # across all steps.
+        produces={
+            "NEXT_AX": "PC_byte3",
+            "NEXT_SP": "AX_byte3",
+            "NEXT_BP": "SP_byte3",
+            "NEXT_STACK0": "BP_byte3",
+            "NEXT_MEM": "STACK0_byte3",
+            "NEXT_SE": "MEM_VAL_byte3",
+            "NEXT_PC": "STEP_END",
+        },
     )
 
 

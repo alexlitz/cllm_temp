@@ -45,6 +45,15 @@ def make_layer1_ffn_op() -> Operation:
         # ``_set_layer1_ffn`` writes 5 units (one per output: STACK0_BYTE0,
         # BYTE_INDEX_0..3). See setup_helpers.py:_set_layer1_ffn.
         ffn_units_used=5,
+        # Staleness invariants: STACK0_BYTE0 fires at the STACK0 byte 0
+        # token (d=6 from BP marker, identified by L1H4[BP] AND NOT
+        # H1[BP] AND IS_BYTE). L3 head 4 (stack0 carry-forward) and L7
+        # head 0 (operand gather) both target this flag as their K-side
+        # — the load-bearing consumer is L7's operand-A gather for
+        # binary ALU ops.
+        produces={
+            "STACK0_BYTE0": "STACK0_byte0",
+        },
     )
 
 
