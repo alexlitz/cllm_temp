@@ -29,6 +29,20 @@ def make_layer3_ffn_op() -> Operation:
         proxy = _as_setdim_proxy(dim_positions)
         _set_layer3_ffn(block.ffn, S, proxy)
 
+    # Dim-ownership claims: L3 FFN PC first-step default. ``_set_layer3_ffn``
+    # (vm_step.py:2655) unit 0 programs the PC byte 0 lo-nibble OUTPUT/EMBED
+    # writes at the PC marker: MARK_PC → OUTPUT_LO + pc_lo + EMBED_LO + pc_lo
+    # where pc_lo = (PC_OFFSET + INSTR_WIDTH) & 0xF. Sibling units (1, 2, 3)
+    # follow the same canonical pattern (HAS_SE undo + HI nibble); declaring
+    # unit 0's cells is the partial-claim anchor for the PC byte 0 cluster.
+    from ...constants import PC_OFFSET, INSTR_WIDTH
+    _pc_lo = (PC_OFFSET + INSTR_WIDTH) & 0xF
+    _claims = {
+        (3, "ffn_W_up", "0", "MARK_PC+0"),
+        (3, "ffn_W_down", "0", f"OUTPUT_LO+{_pc_lo}"),
+        (3, "ffn_W_down", "0", f"EMBED_LO+{_pc_lo}"),
+    }
+
     return Operation(
         name="layer3_ffn",
         phase=3,
@@ -40,6 +54,16 @@ def make_layer3_ffn_op() -> Operation:
         layer_idx=3,
         bake_fn=bake,
         migrated=True,
+        claims=_claims,
+        # Produces the PC byte-0 token prediction (OUTPUT_LO/HI at the PC
+        # marker) for the first step (PC=PC_OFFSET+INSTR_WIDTH default) and
+        # the EMBED_LO/HI relay that feeds L4's PC-marker → AX-marker hop.
+        # Marker label "PC_marker" pins the convention used by downstream
+        # control-flow ops (BZ/BNZ relay, JMP, etc.).
+        produces={
+            "OUTPUT_LO": "PC_marker",
+            "OUTPUT_HI": "PC_marker",
+        },
     )
 
 

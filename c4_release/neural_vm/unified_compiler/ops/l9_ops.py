@@ -30,6 +30,19 @@ def make_layer9_alu_op() -> Operation:
         n9 = _set_layer9_alu(block.ffn, S, proxy)
         _set_layer9_marker_suppress(block.ffn, S, proxy, n9)
 
+    # Dim-ownership claims: L9 ALU FFN unit 0 = ADD hi nibble (carry_in=0,
+    # a=0, b=0) → OUTPUT_HI+0. Canonical first ADD hi-nibble cluster anchor
+    # (see ``_set_layer9_alu`` at vm_step.py:5344+). Unit 0 reads MARK_AX,
+    # ALU_HI+0, AX_CARRY_HI+0, CARRY+0 in W_up and writes OUTPUT_HI+0 in
+    # W_down. Partial-claim convention: anchor the cluster head without
+    # re-declaring all ~3398 ALU/CMP units.
+    _claims = {
+        (9, "ffn_W_up", "0", "MARK_AX+0"),
+        (9, "ffn_W_up", "0", "ALU_HI+0"),
+        (9, "ffn_W_up", "0", "AX_CARRY_HI+0"),
+        (9, "ffn_W_down", "0", "OUTPUT_HI+0"),
+    }
+
     return Operation(
         name="layer9_alu",
         phase=9,
@@ -42,11 +55,21 @@ def make_layer9_alu_op() -> Operation:
         bake_fn=bake,
         layer_idx=9,
         migrated=True,
+        claims=_claims,
         # Staleness invariants: the L9 ALU consumes ALU_HI as operand A hi
         # nibble at the AX marker. Produced by ``layer7_operand_gather`` (L7
         # head 0 + head 1, phase=7) at AX byte 0.
         consumes_fresh={
             "ALU_HI": "AX_byte0",
+        },
+        # Produces the hi-nibble OUTPUT_HI byte-0 result for ADD/SUB/LEA/
+        # ADJ (with carry-in from the L8 ALU's CARRY output), plus the
+        # comparison flags CMP[0..N] for the OP_EQ/NE/LT/GT/LE/GE cluster.
+        # Matches the L8 ALU lo-nibble producer; together they form the
+        # canonical AX-byte-0 ALU output pair.
+        produces={
+            "OUTPUT_HI": "AX_byte0",
+            "CMP": "AX_byte0",
         },
         # ``_set_layer9_alu`` writes the ADD/LEA/SUB/AND/OR/XOR/CMP/etc.
         # cross-product cluster (~3398 units), and the bake chains into

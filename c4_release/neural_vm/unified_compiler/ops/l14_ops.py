@@ -36,6 +36,16 @@ def make_layer14_mem_generation_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         claims=_claims,
+        # Produces the MEM section's address + value byte tokens for
+        # SI/SC/PSH/JSR/ENT steps: the 8 heads write OUTPUT_LO/HI at MEM
+        # addr/val byte positions, gathering from AX_CARRY at the AX
+        # marker and from STACK0 at PSH steps. Marker label
+        # "MEM_val_byte0" pins the convention used downstream by the L15
+        # memory_lookup consumer.
+        produces={
+            "OUTPUT_LO": "MEM_val_byte0",
+            "OUTPUT_HI": "MEM_val_byte0",
+        },
     )
 
 

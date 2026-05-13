@@ -130,6 +130,15 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         layer_idx=10,
         migrated=True,
         claims=_claims,
+        # Produces CARRY[1] (ADD byte carry) and CARRY[2] (SUB byte borrow)
+        # at AX byte positions (relayed from the AX marker by attention).
+        # Marker label "AX_byte0" follows the convention used by sibling
+        # L8/L10 producers; the underlying bake writes at byte positions
+        # 0..2 via the IS_BYTE Q-gate but the contract is the same for the
+        # staleness analyzer.
+        produces={
+            "CARRY": "AX_byte0",
+        },
     )
 
 
