@@ -1067,6 +1067,7 @@ _STEP_TOKEN_OFFSETS = {
 
 def _resolve_register_offset(
     register: str,
+    layout=None,
 ) -> Tuple[Optional[int], Optional[int]]:
     """Map an ``Operation.produces`` register name to ``(step_offset, layer)``.
 
@@ -1075,26 +1076,41 @@ def _resolve_register_offset(
     register names with the bare-marker convention (``"AX"``, ``"STACK0"``,
     ``"AX_marker"``, ...) we fall back to the REG_* marker position itself.
 
-    Optionally, the register name may carry a trailing ``@L<N>`` suffix
-    (e.g. ``"PC_marker@L6"`` or ``"AX_byte0@L8"``) which pins the layer
-    whose post-block residual the multistep probe inspects. This is
-    required for ``kind="model"`` ops that write to a specific layer's
-    weights -- without it, the probe falls back to the final
-    post-block residual which is wrong for layer-specific writes.
+    Optionally, the register name may carry a trailing ``@<op_name>``
+    suffix (e.g. ``"PC_marker@opcode_relay_head"`` or
+    ``"STACK0_marker@function_call_weights"``) which pins the layer to
+    wherever ``LayerCompiler`` placed the referenced op. This is required
+    for ``kind="model"`` ops whose effect is observable on a specific
+    block's post-block residual but whose own ``layer_idx`` hint is just
+    a sizing hint, not a dispatch target. Op-name references survive
+    dynamic layer reallocation; literal ``@L<N>`` pins do not (and were
+    removed -- they hard-coded layer indices that the compiler is free
+    to reassign).
+
+    Layer resolution requires the ``layout`` parameter -- when ``layout``
+    is None, an op-name suffix is treated as unresolvable (offset is
+    still returned so the resolver can be exercised in isolation by
+    unit tests).
 
     Returns ``(offset, layer_idx)`` where ``layer_idx`` is None when the
-    register lacks the suffix. ``offset`` is None when the name can't
-    be resolved -- caller should record a note rather than a drift entry.
+    register lacks a suffix (or when the suffix could not be resolved
+    against ``layout``). ``offset`` is None when the name can't be
+    resolved -- caller should record a note rather than a drift entry.
     """
     base = register
     layer_pin: Optional[int] = None
-    if "@L" in register:
-        base, layer_str = register.rsplit("@L", 1)
-        try:
-            layer_pin = int(layer_str)
-        except ValueError:
-            # Malformed suffix; treat as unresolvable so caller emits a note.
+    if "@" in register:
+        base, op_name = register.rsplit("@", 1)
+        if not op_name:
+            # Malformed (trailing "@"); treat as unresolvable.
             return None, None
+        if layout is not None:
+            layer_pin = _layer_idx_for_op_name(layout, op_name)
+            if layer_pin is None:
+                # Op-name suffix that can't be resolved against the
+                # layout is unrecoverable: callers can't pick a residual
+                # to inspect, so surface this as a note.
+                return None, None
     if base in _STEP_TOKEN_OFFSETS:
         return _STEP_TOKEN_OFFSETS[base], layer_pin
     # Common alias normalization: "AX" -> "REG_AX", "AX_marker" -> "REG_AX".
@@ -1104,6 +1120,36 @@ def _resolve_register_offset(
     if bare in ("STACK0", "MEM"):
         return _STEP_TOKEN_OFFSETS[bare], layer_pin
     return None, layer_pin
+
+
+def _layer_idx_for_op_name(layout, op_name: str) -> Optional[int]:
+    """Resolve an op name to the layer it landed at in ``layout``.
+
+    Looks the op up by name across ``ops_per_layer``, ``block_ops``,
+    and ``model_ops``, then delegates to ``_resolve_op_layer`` so the
+    block-op / kind dispatch lives in one place. Returns None when no
+    op with that name is found, or when the matched op has no
+    resolvable layer (whole-model ops with no ``layer_idx`` hint).
+    """
+    op = _find_op_by_name(layout, op_name)
+    if op is None:
+        return None
+    return _resolve_op_layer(layout, op)
+
+
+def _find_op_by_name(layout, op_name: str) -> Optional[Operation]:
+    """Return the Operation with the given name in ``layout``, or None."""
+    for ops_at in layout.ops_per_layer:
+        for placed in ops_at:
+            if placed.name == op_name:
+                return placed
+    for op in layout.block_ops:
+        if op.name == op_name:
+            return op
+    for op in layout.model_ops:
+        if op.name == op_name:
+            return op
+    return None
 
 
 def _pack_instr(opcode: int, imm: int = 0) -> int:
@@ -1404,18 +1450,19 @@ def verify_produces_consumes_multistep(
             continue
 
         # Default residual layer (op-binding layer + 1). Per-register
-        # ``@L<N>`` suffixes override this on a register-by-register basis.
+        # ``@<op_name>`` suffixes override this on a register-by-register
+        # basis (resolved via the layout, so dynamic re-allocation is safe).
         if layer_idx is None or layer_idx + 1 >= len(per_layer_residuals):
             # Fall back to the final residual (after all blocks). This
             # gives model-op annotations a chance to be checked too.
             default_inspect_layer = len(per_layer_residuals) - 1
-            if not any("@L" in r for r in op.produces.values()):
-                # Only warn when none of the registers carry an @L pin --
-                # ops that pin every register don't need the fallback.
+            if not any("@" in r for r in op.produces.values()):
+                # Only warn when none of the registers carry an op-name
+                # pin -- ops that pin every register don't need the fallback.
                 result.notes.append(
                     f"layer_idx unresolved (kind={op.kind}); "
                     f"inspecting final post-block residual instead "
-                    f"(register-level @L<N> pins still honored)"
+                    f"(register-level @<op_name> pins still honored)"
                 )
         else:
             default_inspect_layer = layer_idx + 1
@@ -1447,20 +1494,22 @@ def verify_produces_consumes_multistep(
                         f"dim not in layout"
                     )
                     continue
-                offset, pinned_layer = _resolve_register_offset(register)
+                offset, pinned_layer = _resolve_register_offset(
+                    register, layout=layout
+                )
                 if offset is None:
                     result.notes.append(
                         f"step {step_k}: produces {dim_name!r}={register!r}: "
-                        f"register name not resolvable to a step offset"
+                        f"register name (or @<op_name> suffix) not resolvable"
                     )
                     continue
-                # Per-register @L<N> override takes precedence over the
-                # op-layer default. Clamp to valid range and warn if out.
+                # Per-register @<op_name> override takes precedence over
+                # the op-layer default. Clamp to valid range and warn if out.
                 if pinned_layer is not None:
                     if pinned_layer + 1 >= len(per_layer_residuals):
                         result.notes.append(
                             f"step {step_k}: produces {dim_name!r}={register!r}: "
-                            f"@L{pinned_layer} out of range "
+                            f"pinned layer {pinned_layer} out of range "
                             f"({len(per_layer_residuals)-1} blocks); skipping"
                         )
                         continue

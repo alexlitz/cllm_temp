@@ -329,20 +329,75 @@ class TestUnitMultistepProbe:
         assert _resolve_register_offset("BOGUS") == (None, None)
         assert _resolve_register_offset("") == (None, None)
 
-    def test_resolve_register_offset_with_layer_suffix(self):
-        # ``@L<N>`` suffix pins the layer for multistep probe inspection.
-        # Multi-layer model ops use this to tell the probe which post-
-        # block residual to read (the default fallback for kind="model"
-        # ops without a resolvable layer is the final post-block residual,
-        # which is wrong for layer-specific writes).
-        assert _resolve_register_offset("AX_byte0@L8") == (6, 8)
-        assert _resolve_register_offset("STACK0_marker@L6") == (20, 6)
-        assert _resolve_register_offset("PC_marker@L6") == (0, 6)
-        assert _resolve_register_offset("REG_AX@L5") == (5, 5)
-        # Malformed @L suffix -> offset None, layer None.
-        assert _resolve_register_offset("AX_byte0@Lfoo") == (None, None)
-        # Unknown base name with valid suffix -> offset None, layer set.
-        assert _resolve_register_offset("BOGUS@L7") == (None, 7)
+    def test_resolve_register_offset_with_op_name_suffix(self):
+        # ``@<op_name>`` suffix pins the layer for multistep probe
+        # inspection by referring to whichever layer ``LayerCompiler``
+        # placed the named op at. Layer resolution requires the
+        # ``layout`` parameter -- without it, the base offset is still
+        # returned but layer_pin is None.
+        # When ``layout=None`` (unit-test mode), the base name still
+        # resolves to its offset; the layer_pin is None.
+        assert _resolve_register_offset("AX_byte0@some_op") == (6, None)
+        assert _resolve_register_offset("STACK0_marker@some_op") == (20, None)
+        assert _resolve_register_offset("PC_marker@some_op") == (0, None)
+        assert _resolve_register_offset("REG_AX@some_op") == (5, None)
+        # Malformed (trailing @) -> offset None, layer None.
+        assert _resolve_register_offset("AX_byte0@") == (None, None)
+
+        # With a layout, op-name references resolve to the matching
+        # layer. Build a minimal fake layout exposing the three
+        # registries the resolver walks.
+        from c4_release.neural_vm.unified_compiler.layer_compiler import (
+            Operation, ModelLayout,
+        )
+        noop = lambda *a, **kw: None  # noqa: E731
+        op_at_l3 = Operation(
+            name="placed_at_l3",
+            reads=set(), writes=set(),
+            kind="attn",
+            bake_fn=noop,
+        )
+        block_op = Operation(
+            name="block_at_l5",
+            reads=set(), writes=set(),
+            kind="block",
+            layer_idx=5,
+            bake_fn=noop,
+        )
+        model_op = Operation(
+            name="model_with_hint",
+            reads=set(), writes=set(),
+            kind="model",
+            layer_idx=6,
+            bake_fn=noop,
+        )
+        layout = ModelLayout(
+            d_model=8,
+            n_layers=8,
+            ops_per_layer=[[] for _ in range(8)],
+            dim_positions={},
+            dim_sizes={},
+            block_ops=[block_op],
+            model_ops=[model_op],
+        )
+        layout.ops_per_layer[3].append(op_at_l3)
+
+        # ops_per_layer hit (attn op).
+        assert _resolve_register_offset(
+            "AX_byte0@placed_at_l3", layout=layout
+        ) == (6, 3)
+        # block_ops hit (layer_idx=5).
+        assert _resolve_register_offset(
+            "STACK0_marker@block_at_l5", layout=layout
+        ) == (20, 5)
+        # model_ops hit (layer_idx hint = 6).
+        assert _resolve_register_offset(
+            "REG_AX@model_with_hint", layout=layout
+        ) == (5, 6)
+        # Unknown op-name -> unresolvable (offset None, layer None).
+        assert _resolve_register_offset(
+            "AX_byte0@nonexistent_op", layout=layout
+        ) == (None, None)
 
     def test_pack_instr(self):
         # IMM 10 -> opcode=1, imm=10 -> 0x00000a01.
