@@ -244,6 +244,47 @@ class Operation:
     smoke_tests: Set[str] = field(default_factory=set)
     spec_section: Optional[str] = None
     compaction_safe: bool = True
+    # Tier A annotations (debugging cascade bugs).
+    #
+    #   ``reset_after_step``: residual dims that should be zero at the
+    #       start of each new VM step (typically re-emitted by L0/L1 from
+    #       token-position features). Catches "leaks across step boundary"
+    #       bugs where a dim set at step N still has non-zero value at the
+    #       beginning of step N+1's pre-block position. See
+    #       ``decl_verifier.verify_reset_after_step`` for the detector.
+    #
+    #   ``requires``: preconditions on residual state BEFORE the op fires.
+    #       Maps dim name to a distance/anchor constraint string:
+    #         - ``"within_one_step"``: dim must be set (non-zero) within
+    #           the last 35 tokens (one VM step) of the op's inspection
+    #           position. Catches stale-relay bugs where a producer wrote
+    #           the dim two steps ago and the relay didn't keep it fresh.
+    #         - ``"set_at_AX"`` / ``"set_at_SP"`` / ``"set_at_PC"`` /
+    #           ``"set_at_BP"``: dim must be non-zero at the current
+    #           AX/SP/PC/BP marker position for the inspected step.
+    #         - ``"<value>:set_at_AX"`` etc.: dim must equal ``<value>``
+    #           (integer) at the named marker — exact-value precondition
+    #           rather than just "non-zero". Use sparingly; the integer
+    #           comparison is approximate (within ``epsilon``).
+    #       See ``decl_verifier.verify_requires`` for the detector.
+    #
+    #   ``opcodes``: which ``OP_*`` dims activate this op. ``set()`` means
+    #       "any opcode" or "no opcode gating" (the op fires every step,
+    #       e.g. an L3 PC update or the L1 STACK0_BYTE0 emission). A
+    #       non-empty set declares the op is part of a particular opcode's
+    #       implementation cluster. Used by
+    #       ``decl_verifier.verify_opcode_coverage`` to surface unreachable
+    #       opcodes (no op declares ``opcodes``) or under-annotated FFN
+    #       layers (most FFN ops should be opcode-gated; an empty
+    #       ``opcodes`` set on an FFN op outside L0/L1/L3 is suspicious).
+    #
+    # All three default to empty for back-compat: existing ops are
+    # unchanged until annotated. Detectors only report on annotated ops
+    # (or, in the case of ``opcodes`` coverage, only flag opcodes with
+    # zero declarers — never flag unannotated ops).
+    reset_after_step: Set[str] = field(default_factory=set)
+    requires: Dict[str, str] = field(default_factory=dict)
+    opcodes: Set[str] = field(default_factory=set)
 
     def __hash__(self):
         return hash(self.name)
@@ -424,6 +465,65 @@ class LayerCompiler:
                 f"Op {op.name!r} compaction_safe must be bool; "
                 f"got {type(op.compaction_safe).__name__}"
             )
+        # Validate Tier A annotations (reset_after_step, requires, opcodes).
+        # All three default to empty; only validate the types + that any
+        # named dims are declared. ``opcodes`` is intentionally NOT cross-
+        # checked against the declared dims set because opcode dims like
+        # OP_ADD/OP_SUB live in the SetDim-compat dim namespace which is
+        # populated by ``declare_setdim_compat_dims`` BEFORE the ops are
+        # added, so they'll be present for the canonical Tier A use case;
+        # but tests that build standalone compilers without the full SetDim
+        # bootstrap should be able to declare ops with opcodes referencing
+        # not-yet-declared dims (the detector flags this as a warning, not
+        # a hard error).
+        if not isinstance(op.reset_after_step, set):
+            raise ValueError(
+                f"Op {op.name!r} reset_after_step must be a set; "
+                f"got {type(op.reset_after_step).__name__}"
+            )
+        for dim_name in op.reset_after_step:
+            if not isinstance(dim_name, str):
+                raise ValueError(
+                    f"Op {op.name!r} reset_after_step entry must be str; "
+                    f"got {dim_name!r}"
+                )
+            if dim_name not in self.dims:
+                raise ValueError(
+                    f"Op {op.name!r} reset_after_step references undeclared "
+                    f"dim {dim_name!r}"
+                )
+        if not isinstance(op.requires, dict):
+            raise ValueError(
+                f"Op {op.name!r} requires must be a dict; "
+                f"got {type(op.requires).__name__}"
+            )
+        for dim_name, constraint in op.requires.items():
+            if not isinstance(dim_name, str):
+                raise ValueError(
+                    f"Op {op.name!r} requires dim name must be str; "
+                    f"got {dim_name!r}"
+                )
+            if not isinstance(constraint, str):
+                raise ValueError(
+                    f"Op {op.name!r} requires[{dim_name!r}] constraint "
+                    f"must be str; got {constraint!r}"
+                )
+            if dim_name not in self.dims:
+                raise ValueError(
+                    f"Op {op.name!r} requires references undeclared dim "
+                    f"{dim_name!r}"
+                )
+        if not isinstance(op.opcodes, set):
+            raise ValueError(
+                f"Op {op.name!r} opcodes must be a set; "
+                f"got {type(op.opcodes).__name__}"
+            )
+        for opcode in op.opcodes:
+            if not isinstance(opcode, str):
+                raise ValueError(
+                    f"Op {op.name!r} opcodes entry must be str; "
+                    f"got {opcode!r}"
+                )
         # Validate dim-ownership claims (if any). Accept legacy 3-tuple
         # ``(layer_idx, scope, identifier)`` and auto-promote to 4-tuple with
         # ``column=None`` for back-compat with pre-column-granularity ops.

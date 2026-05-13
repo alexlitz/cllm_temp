@@ -45,14 +45,31 @@ def make_layer1_ffn_op() -> Operation:
         # ``_set_layer1_ffn`` writes 5 units (one per output: STACK0_BYTE0,
         # BYTE_INDEX_0..3). See setup_helpers.py:_set_layer1_ffn.
         ffn_units_used=5,
-        # Staleness invariants: STACK0_BYTE0 fires at the STACK0 byte 0
-        # token (d=6 from BP marker, identified by L1H4[BP] AND NOT
-        # H1[BP] AND IS_BYTE). L3 head 4 (stack0 carry-forward) and L7
-        # head 0 (operand gather) both target this flag as their K-side
-        # — the load-bearing consumer is L7's operand-A gather for
-        # binary ALU ops.
+        # Staleness invariants + Tier A produces. STACK0_BYTE0 fires at
+        # the STACK0 byte 0 token (d=6 from BP marker, identified by
+        # L1H4[BP] AND NOT H1[BP] AND IS_BYTE). L3 head 4 (stack0
+        # carry-forward) and L7 head 0 (operand gather) both target this
+        # flag as their K-side. BYTE_INDEX_* are emitted at the matching
+        # STACK0_byteN positions.
         produces={
             "STACK0_BYTE0": "STACK0_byte0",
+            "BYTE_INDEX_0": "STACK0_byte0",
+            "BYTE_INDEX_1": "STACK0_byte1",
+            "BYTE_INDEX_2": "STACK0_byte2",
+            "BYTE_INDEX_3": "STACK0_byte3",
+        },
+        # ``opcodes``: L1 emits STACK0_BYTE0 every step from token-position
+        # features (threshold attention over L1H4); it is NOT opcode-gated,
+        # so the set is empty. The opcode-coverage detector treats L0-L3
+        # FFN ops with empty opcodes as legitimate emission ops.
+        opcodes=set(),
+        # ``reset_after_step``: STACK0_BYTE0 is re-emitted by this op on
+        # every step from raw token features; it should NOT carry stale
+        # values across the step boundary.
+        reset_after_step={
+            "STACK0_BYTE0",
+            "BYTE_INDEX_0", "BYTE_INDEX_1",
+            "BYTE_INDEX_2", "BYTE_INDEX_3",
         },
     )
 
