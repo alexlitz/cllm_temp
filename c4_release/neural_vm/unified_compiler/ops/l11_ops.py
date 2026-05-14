@@ -12,6 +12,10 @@ def make_layer11_mul_partial_op() -> Operation:
     layer6_routing_ffn at L18); legacy_bake no longer calls
     ``_set_layer11_mul_partial`` so without pinning block 11 would be
     zero-init.
+
+    Declarations-only note: intentionally unsupported until the
+    ``_set_layer11_mul_partial`` lookup-table helper is lowered into explicit
+    FFN units or a structural stage module.
     """
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer11_mul_partial
@@ -42,5 +46,4 @@ def make_layer11_mul_partial_op() -> Operation:
         },
         spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
-
 

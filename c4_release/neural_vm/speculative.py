@@ -260,6 +260,27 @@ class DraftVM:
         self._mem_bytes[addr + 2] = (imm_unsigned >> 8) & 0xFF
         self._mem_bytes[addr + 3] = (imm_unsigned >> 16) & 0xFF
 
+    def _resolve_static_target_idx(self, target):
+        """Resolve a branch/call target to a static-code index if possible.
+
+        Hand-written tests use instruction indexes (``JSR 3`` means code[3]).
+        Some compiler paths use PC-style addresses (``idx_to_pc(i)``). Support
+        both forms so DraftVM remains a faithful deterministic oracle.
+        """
+        target = int(target)
+        if 0 <= target < len(self.code):
+            return target
+
+        pc_idx = pc_to_idx(target)
+        if 0 <= pc_idx < len(self.code) and idx_to_pc(pc_idx) == target:
+            return pc_idx
+
+        byte_idx = target // INSTR_WIDTH
+        if 0 <= byte_idx < len(self.code) and target % INSTR_WIDTH == 0:
+            return byte_idx
+
+        return None
+
     def step(self):
         """Execute one instruction. Returns True if executed, False if halted/done."""
         if self.halted:
@@ -296,8 +317,8 @@ class DraftVM:
         elif op == 2:  # JMP
             # imm is byte address - check if within static code or memory
             target = imm & 0xFFFFFFFF
-            target_idx = target // INSTR_WIDTH
-            if target_idx < len(self.code):
+            target_idx = self._resolve_static_target_idx(target)
+            if target_idx is not None:
                 self.idx = target_idx
                 self.pc = idx_to_pc(self.idx)
             else:
@@ -309,8 +330,8 @@ class DraftVM:
             self._mem_write(self.sp, self.pc)  # push return address
             # imm is byte address - check if within static code or memory
             target = imm & 0xFFFFFFFF
-            target_idx = target // INSTR_WIDTH
-            if target_idx < len(self.code):
+            target_idx = self._resolve_static_target_idx(target)
+            if target_idx is not None:
                 self.idx = target_idx
                 self.pc = idx_to_pc(self.idx)
             else:
@@ -321,8 +342,8 @@ class DraftVM:
             if self.ax == 0:
                 # imm is byte address - check if within static code or memory
                 target = imm & 0xFFFFFFFF
-                target_idx = target // INSTR_WIDTH
-                if target_idx < len(self.code):
+                target_idx = self._resolve_static_target_idx(target)
+                if target_idx is not None:
                     self.idx = target_idx
                     self.pc = idx_to_pc(self.idx)
                 else:
@@ -332,8 +353,8 @@ class DraftVM:
             if self.ax != 0:
                 # imm is byte address - check if within static code or memory
                 target = imm & 0xFFFFFFFF
-                target_idx = target // INSTR_WIDTH
-                if target_idx < len(self.code):
+                target_idx = self._resolve_static_target_idx(target)
+                if target_idx is not None:
                     self.idx = target_idx
                     self.pc = idx_to_pc(self.idx)
                 else:
@@ -356,10 +377,16 @@ class DraftVM:
             self.idx = pc_to_idx(ret_addr)
         elif op == 9:  # LI
             self.ax = self._mem_read(self.ax)
+        elif op == 10:  # LC
+            self.ax = self._mem_read(self.ax) & 0xFF
         elif op == 11:  # SI
             addr = self._mem_read(self.sp)
             self.sp = (self.sp + 8) & 0xFFFFFFFF
             self._mem_write(addr, self.ax)
+        elif op == 12:  # SC
+            addr = self._mem_read(self.sp)
+            self.sp = (self.sp + 8) & 0xFFFFFFFF
+            self._mem_write(addr, self.ax & 0xFF)
         elif op == 13:  # PSH
             self.sp = (self.sp - 8) & 0xFFFFFFFF
             self._mem_write(self.sp, self.ax)

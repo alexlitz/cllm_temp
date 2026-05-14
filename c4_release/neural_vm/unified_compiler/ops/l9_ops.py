@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -96,12 +97,15 @@ def make_layer9_lev_addr_relay_op() -> Operation:
     alongside the legacy bake call.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer9_lev_addr_relay
         attn = block.attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[0] = 0.2  # head 0: shallow slope for d=29 relay
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer9_lev_addr_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+        Primitives.generate_attention_head(
+            attn,
+            _layer9_lev_addr_relay_head_spec(_as_setdim_proxy(dim_positions)),
+            HD,
+        )
 
     # Dim-ownership claims: L9 attn head 0 LEV addr relay.
     #   W_v[0*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15
@@ -121,8 +125,10 @@ def make_layer9_lev_addr_relay_op() -> Operation:
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=9,
         migrated=True,
+        declarative_authority="spec_generated",
         claims=_claims,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
@@ -148,12 +154,15 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
     tokens); previously set inline alongside the legacy bake call.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer9_lev_bp_to_pc_relay
         attn = block.attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[1] = 0.5  # head 1: BP→PC relay for LEV (d=15 tokens)
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer9_lev_bp_to_pc_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+        Primitives.generate_attention_head(
+            attn,
+            _layer9_lev_bp_to_pc_relay_head_spec(_as_setdim_proxy(dim_positions)),
+            HD,
+        )
 
     # Dim-ownership claims: L9 attn head 1 LEV BP→PC relay.
     #   W_v[1*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15
@@ -173,11 +182,77 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=9,
         migrated=True,
+        declarative_authority="spec_generated",
         claims=_claims,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
+    )
+
+
+def _layer9_lev_addr_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L9 head 0: previous BP byte0 -> ADDR_B0 at SP marker."""
+
+    L = 50.0
+    BP_I = 3
+    GATE = 33
+    v = []
+    o = []
+    for k in range(16):
+        v.append(AP(1 + k, BD.CLEAN_EMBED_LO + k, 3.0))
+        v.append(AP(17 + k, BD.CLEAN_EMBED_HI + k, 3.0))
+        o.append(AO(BD.ADDR_B0_LO + k, 1 + k, 1.0))
+        o.append(AO(BD.ADDR_B0_HI + k, 17 + k, 1.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=0,
+        q=(
+            AP(0, BD.MARK_SP, L),
+            AP(0, BD.OP_LEV, L / 5),
+            AP(0, BD.CONST, -2 * L),
+            AP(GATE, BD.MARK_SP, L),
+            AP(GATE, BD.CONST, -L / 2),
+        ),
+        k=(
+            AP(0, BD.L1H1 + BP_I, L),
+            AP(0, BD.BYTE_INDEX_0, L),
+            AP(GATE, BD.CONST, L),
+        ),
+        v=tuple(v),
+        o=tuple(o),
+    )
+
+
+def _layer9_lev_bp_to_pc_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L9 head 1: previous BP byte0 -> ADDR_B0 at PC marker."""
+
+    L = 50.0
+    BP_I = 3
+    GATE = 33
+    v = []
+    o = []
+    for k in range(16):
+        v.append(AP(1 + k, BD.CLEAN_EMBED_LO + k, 3.0))
+        v.append(AP(17 + k, BD.CLEAN_EMBED_HI + k, 3.0))
+        o.append(AO(BD.ADDR_B0_LO + k, 1 + k, 1.0))
+        o.append(AO(BD.ADDR_B0_HI + k, 17 + k, 1.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=1,
+        q=(
+            AP(0, BD.MARK_PC, L),
+            AP(0, BD.OP_LEV, L / 5),
+            AP(0, BD.CONST, -2 * L),
+            AP(GATE, BD.MARK_PC, L),
+            AP(GATE, BD.CONST, -L / 2),
+        ),
+        k=(
+            AP(0, BD.L1H1 + BP_I, L),
+            AP(0, BD.BYTE_INDEX_0, L),
+            AP(GATE, BD.CONST, L),
+        ),
+        v=tuple(v),
+        o=tuple(o),
     )
 
 
@@ -219,6 +294,7 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
         writes={"OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake if not enable_conversational_io else None,
         layer_idx=9,
         migrated=True,
         smoke_tests={"all"},
@@ -385,6 +461,7 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake if not enable else None,
         layer_idx=9,
         migrated=True,
         claims=_claims,
@@ -394,15 +471,18 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
 
 
 def make_layer9_marker_suppress_op() -> Operation:
-    """L9 FFN extension: marker suppression."""
+    """No-op dep anchor for marker suppression owned by ``layer9_alu``.
+
+    ``make_layer9_alu_op`` owns the true migrated bake: it calls
+    ``_set_layer9_alu`` and then threads the returned unit cursor into
+    ``_set_layer9_marker_suppress``. This standalone op remains only to
+    preserve dependency topology for downstream audits; baking the helper here
+    would either overlap L9 ALU units or double-write marker-suppression
+    weights.
+    """
     def bake(ffn, dim_positions, S):
-        from ...vm_step import _set_layer9_marker_suppress
-        # _set_layer9_marker_suppress takes (ffn, S, BD, start_unit). We need
-        # to know what start_unit to use. The original code uses unit count
-        # after _set_layer9_alu — for the migration shim we just pass start_unit=0.
-        # This may overlap with layer9_alu's unit assignments; the original calls
-        # them sequentially in the same FFN.
-        _set_layer9_marker_suppress(ffn, S, _as_setdim_proxy(dim_positions), 0)
+        # No-op: actual bake is chained from `layer9_alu`.
+        return
 
     return Operation(
         name="layer9_marker_suppress",
@@ -413,8 +493,8 @@ def make_layer9_marker_suppress_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
-
-

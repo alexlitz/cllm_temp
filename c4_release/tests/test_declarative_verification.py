@@ -227,6 +227,13 @@ class TestDeclarativeAuthorityMetadata:
         }
         assert report.inferred_sources == {"migrated_op": "declarative"}
 
+    def test_l6_attention_bakes_remain_wrappers_until_smoke_safe(self):
+        report = audit_declarative_authority()
+
+        for name in ("layer6_attn_bake", "layer6_relay_heads_bake"):
+            assert name in report.legacy_wrapper_ops
+            assert name not in report.authoritative_ops
+
 
 # ----------------------------------------------------------------------
 # End-to-end production verifier run
@@ -787,11 +794,15 @@ class TestDeclarativeAuthorityAudit:
             "_layer3_ffn_dep_anchor",
             "_layer5_fetch_dep_anchor",
             "_opcode_decode_ffn_dep_anchor",
+        ):
+            assert name in report.authoritative_ops
+            assert report.explicit_sources[name] == "topology_anchor"
+        for name in (
             "layer8_multibyte_fetch",
             "layer8_sp_gather",
         ):
             assert name in report.authoritative_ops
-            assert report.explicit_sources[name] == "declarative"
+            assert report.explicit_sources[name] == "topology_anchor"
 
     def test_explicit_model_bakes_are_declarative(self, report):
         for name in (
@@ -803,15 +814,17 @@ class TestDeclarativeAuthorityAudit:
             assert name in report.authoritative_ops
             assert report.explicit_sources[name] == "declarative"
 
-    def test_addsub_stage_placeholders_track_wrapper_authority(self, report):
+    def test_addsub_stage_anchors_are_spec_generated_authority(self, report):
         for name in (
+            "l8_alu_addsub_bdtoge",
             "l8_alu_addsub_getobd",
             "l8_alu_addsub_stage1",
             "l8_alu_addsub_stage2",
             "l8_alu_addsub_stage3",
         ):
-            assert name in report.legacy_wrapper_ops
-            assert report.explicit_sources[name] == "legacy_wrapper"
+            assert name in report.authoritative_ops
+            assert name not in report.legacy_wrapper_ops
+            assert report.explicit_sources[name] == "spec_generated"
 
     def test_format_includes_summary_counts(self, report):
         formatted = report.format()

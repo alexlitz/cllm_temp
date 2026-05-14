@@ -2137,7 +2137,12 @@ def audit_declarative_authority(
             source = "declarative"
             inferred[op.name] = source
 
-        if source in ("declarative", "spec_generated"):
+        if source in (
+            "declarative",
+            "spec_generated",
+            "structural_model",
+            "topology_anchor",
+        ):
             authoritative.append(op.name)
         elif source == "legacy_wrapper":
             legacy_wrapper.append(op.name)

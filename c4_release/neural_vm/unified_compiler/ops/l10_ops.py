@@ -1,9 +1,31 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
-from ..primitives import Primitives
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 from .shared import _bake_post_op_into
+
+
+def _bake_layer10_carry_relay_head(attn, BD, S, HD) -> None:
+    """Declarative L10 head 0 carry relay spec."""
+    AX_IDX = 1
+    L = S
+    Primitives.generate_attention_head(
+        attn,
+        DeclarativeAttentionHeadSpec(
+            head_idx=0,
+            q=(
+                AP(0, BD.IS_BYTE, L),
+                AP(0, BD.CONST, -L / 2),
+                AP(33, BD.H1 + AX_IDX, L),
+                AP(33, BD.CONST, -L / 2),
+            ),
+            k=(AP(0, BD.MARK_AX, L), AP(33, BD.CONST, L)),
+            v=(AP(1, BD.CARRY + 1, 1.0), AP(2, BD.CARRY + 2, 1.0)),
+            o=(AO(BD.CARRY + 1, 1, 1.0), AO(BD.CARRY + 2, 2, 1.0)),
+        ),
+        HD,
+    )
 
 
 def _bake_layer10_byte_passthrough_head(attn, BD, S, HD) -> None:
@@ -50,12 +72,118 @@ def _bake_layer10_sp_byte_passthrough_head(attn, BD, S, HD) -> None:
     )
 
 
+def _bake_layer10_psh_stack0_passthrough_head(attn, BD, S, HD) -> None:
+    """Declarative L10 head 3 PSH STACK0 passthrough spec."""
+    AX_IDX = 1
+    BP_IDX = 3
+    L = S
+    q = [
+        AP(0, BD.IS_BYTE, L),
+        AP(1, BD.H4 + BP_IDX, L),
+        AP(1, BD.H1 + BP_IDX, -L),
+        AP(1, BD.CONST, -L / 2),
+        AP(2, BD.BYTE_INDEX_3, -L),
+        AP(2, BD.CONST, L / 2),
+        AP(3, BD.PSH_AT_SP, L),
+        AP(3, BD.CONST, -L / 2),
+        AP(4, BD.BYTE_INDEX_0, L),
+        AP(5, BD.BYTE_INDEX_1, L),
+        AP(6, BD.BYTE_INDEX_2, L),
+        AP(33, BD.CONST, -30000.0),
+        AP(33, BD.IS_BYTE, 10000.0),
+        AP(33, BD.H4 + BP_IDX, 10000.0),
+        AP(33, BD.H1 + BP_IDX, -10000.0),
+        AP(33, BD.PSH_AT_SP, 10000.0),
+        AP(33, BD.MARK_STACK0, -10000.0),
+    ]
+    k = [
+        AP(0, BD.IS_BYTE, L),
+        AP(1, BD.H1 + AX_IDX, L),
+        AP(2, BD.BYTE_INDEX_0, -L),
+        AP(2, BD.CONST, L / 2),
+        AP(4, BD.BYTE_INDEX_1, L),
+        AP(5, BD.BYTE_INDEX_2, L),
+        AP(6, BD.BYTE_INDEX_3, L),
+        AP(33, BD.CONST, 5.0),
+    ]
+    v = []
+    o = []
+    for k_idx in range(16):
+        v.append(AP(k_idx, BD.CLEAN_EMBED_LO + k_idx, 1.0))
+        v.append(AP(16 + k_idx, BD.CLEAN_EMBED_HI + k_idx, 1.0))
+        o.append(AO(BD.OUTPUT_LO + k_idx, k_idx, 3.0))
+        o.append(AO(BD.OUTPUT_HI + k_idx, 16 + k_idx, 3.0))
+    Primitives.generate_attention_head(
+        attn,
+        DeclarativeAttentionHeadSpec(
+            head_idx=3,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ),
+        HD,
+    )
+
+
+def _bake_layer10_stack0_byte_relay_head(attn, BD, S, HD) -> None:
+    """Declarative L10 head 4 STACK0 byte relay spec."""
+    AX_IDX = 1
+    SP_IDX = 2
+    BP_IDX = 3
+    L = S
+    q = [
+        AP(0, BD.IS_BYTE, L),
+        AP(0, BD.H1 + AX_IDX, L),
+        AP(0, BD.CONST, -L * 1.5),
+        AP(1, BD.BYTE_INDEX_0, L),
+        AP(2, BD.BYTE_INDEX_1, L),
+        AP(3, BD.BYTE_INDEX_2, L),
+        AP(4, BD.BYTE_INDEX_3, -L),
+        AP(4, BD.CONST, L / 2),
+        AP(33, BD.CONST, -20000.0),
+        AP(33, BD.IS_BYTE, 10000.0),
+        AP(33, BD.H1 + AX_IDX, 10000.0),
+        AP(33, BD.HAS_SE, 10000.0),
+    ]
+    k = [
+        AP(0, BD.IS_BYTE, L),
+        AP(1, BD.H4 + BP_IDX, L),
+        AP(1, BD.H1 + BP_IDX, -2 * L),
+        AP(1, BD.H1 + SP_IDX, -2 * L),
+        AP(1, BD.H1 + AX_IDX, -L),
+        AP(2, BD.BYTE_INDEX_1, L),
+        AP(3, BD.BYTE_INDEX_2, L),
+        AP(33, BD.CONST, 5.0),
+    ]
+    v = []
+    o = []
+    for k_idx in range(16):
+        v.append(AP(k_idx, BD.CLEAN_EMBED_LO + k_idx, 1.0))
+        v.append(AP(16 + k_idx, BD.CLEAN_EMBED_HI + k_idx, 1.0))
+        o.append(AO(BD.ALU_LO + k_idx, k_idx, 2.0))
+        o.append(AO(BD.ALU_HI + k_idx, 16 + k_idx, 2.0))
+    Primitives.generate_attention_head(
+        attn,
+        DeclarativeAttentionHeadSpec(
+            head_idx=4,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ),
+        HD,
+    )
+
+
 def make_layer10_carry_relay_op() -> Operation:
-    """L10 attention head 0: relay CARRY flags from AX marker to AX byte positions."""
+    """Topology anchor for L10 head 0 carry relay.
+
+    The actual weight bake is owned by ``layer10_carry_relay_bake`` below,
+    pinned to ``model.blocks[10].attn``.
+    """
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_layer10_carry_relay
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_carry_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+        return None
 
     return Operation(
         name="layer10_carry_relay",
@@ -64,18 +192,22 @@ def make_layer10_carry_relay_op() -> Operation:
         writes={"CARRY"},  # broadcast
         kind="attn",
         bake_fn=bake,
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
 
 
 def make_layer10_byte_passthrough_op() -> Operation:
-    """L10 attention head 1: AX byte passthrough across steps."""
+    """Topology anchor for L10 head 1 AX byte passthrough.
+
+    The spec-generated weight bake is owned by
+    ``layer10_byte_passthrough_bake`` below, pinned to
+    ``model.blocks[10].attn``.
+    """
     def bake(attn, dim_positions, S):
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _bake_layer10_byte_passthrough_head(
-            attn, _as_setdim_proxy(dim_positions), S, HD
-        )
+        return None
 
     return Operation(
         name="layer10_byte_passthrough",
@@ -86,19 +218,22 @@ def make_layer10_byte_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
-        declarative_authority="spec_generated",
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
 
 
 def make_layer10_sp_byte_passthrough_op() -> Operation:
-    """L10 attention head 2: SP byte passthrough."""
+    """Topology anchor for L10 head 2 SP byte passthrough.
+
+    The spec-generated weight bake is owned by
+    ``layer10_sp_byte_passthrough_bake`` below, pinned to
+    ``model.blocks[10].attn``.
+    """
     def bake(attn, dim_positions, S):
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _bake_layer10_sp_byte_passthrough_head(
-            attn, _as_setdim_proxy(dim_positions), S, HD
-        )
+        return None
 
     return Operation(
         name="layer10_sp_byte_passthrough",
@@ -109,18 +244,22 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
-        declarative_authority="spec_generated",
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
 
 
 def make_layer10_psh_stack0_passthrough_op() -> Operation:
-    """L10 attention head 3: PSH STACK0 passthrough."""
+    """Topology anchor for L10 head 3 PSH STACK0 passthrough.
+
+    The actual weight bake is owned by
+    ``layer10_psh_stack0_passthrough_bake`` below, pinned to
+    ``model.blocks[10].attn``.
+    """
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_layer10_psh_stack0_passthrough
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_psh_stack0_passthrough(attn, S, _as_setdim_proxy(dim_positions), HD)
+        return None
 
     return Operation(
         name="layer10_psh_stack0_passthrough",
@@ -130,6 +269,8 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -143,8 +284,8 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
 # ``alu_mode == 'efficient'`` branches). The inline calls have been removed
 # from both branches; these ops now own the bake. Phases 10.0-10.4 preserve
 # the original ordering. The five ``layer10_*`` kind="attn" placeholders
-# above are retained (no ``migrated=True``) as dep-graph anchors so the
-# LayerCompiler topology does not shift downstream block assignments.
+# above are retained as migrated no-op dep-graph anchors so the LayerCompiler
+# topology does not shift downstream block assignments.
 #
 # All five target ``model.blocks[10].attn`` and run BEFORE legacy_bake (999),
 # so the alibi_slopes mutations and the L10 FFN bake inside set_vm_weights
@@ -161,11 +302,10 @@ def make_layer10_carry_relay_bake_op() -> Operation:
     ordering relative to the four sibling L10 attn bake ops below.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer10_carry_relay
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_carry_relay(attn, S, proxy, HD)
+        _bake_layer10_carry_relay_head(attn, proxy, S, HD)
 
     # Dim-ownership claims: L10 attn head 0 CARRY relay (AX marker → AX bytes).
     #   W_v[0*HD + 1, CARRY + 1]  (CARRY[1] = ADD byte carry)
@@ -184,8 +324,10 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         writes={"CARRY"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        declarative_authority="spec_generated",
         claims=_claims,
         smoke_tests={
             "TestSmoke32Bit::test_add_16bit",
@@ -231,6 +373,7 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=10,
         migrated=True,
         declarative_authority="spec_generated",
@@ -270,6 +413,7 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=10,
         migrated=True,
         declarative_authority="spec_generated",
@@ -287,11 +431,10 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
     removed; this op now owns the bake. Phase=10.3.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer10_psh_stack0_passthrough
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_psh_stack0_passthrough(attn, S, proxy, HD)
+        _bake_layer10_psh_stack0_passthrough_head(attn, proxy, S, HD)
 
     # Dim-ownership claims: L10 attn head 3 PSH STACK0 passthrough.
     #   W_v[3*HD + k, CLEAN_EMBED_LO + k]      for k=0..15
@@ -310,8 +453,10 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        declarative_authority="spec_generated",
         claims=_claims,
         smoke_tests={"TestSmokeBasic::test_add_basic"},
         spec_section="BLOG_SPEC.md#registers",
@@ -326,11 +471,10 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
     removed; this op now owns the bake. Phase=10.4.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer10_stack0_byte_relay
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_stack0_byte_relay(attn, S, proxy, HD)
+        _bake_layer10_stack0_byte_relay_head(attn, proxy, S, HD)
 
     # Dim-ownership claims: L10 attn head 4 STACK0-byte-relay (→ ALU at AX byte).
     #   W_v[4*HD + k, CLEAN_EMBED_LO + k]      for k=0..15
@@ -349,8 +493,10 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=10,
         migrated=True,
+        declarative_authority="spec_generated",
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -371,6 +517,11 @@ def make_layer10_alu_op() -> Operation:
     in the lookup branch of ``set_vm_weights`` has been removed; this op
     now owns the bake. (Per Unit 9 diagnosis, this migration is SAFE so
     long as ``make_l10_post_op_attach_op`` is NOT modified.)
+
+    Declarations-only note: intentionally unsupported until the
+    ``_set_layer10_alu`` lookup-table helper is lowered into explicit FFN
+    units or a structural stage module. Tagging the helper itself as
+    declarations-only would hide the remaining imperative weight generator.
     """
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer10_alu
@@ -423,11 +574,13 @@ def make_layer10_alu_op() -> Operation:
 
 
 def make_layer10_stack0_byte_relay_op() -> Operation:
-    """L10 attention: STACK0 byte values relay for AND/OR/XOR multi-byte."""
+    """Topology anchor for L10 head 4 STACK0 byte relay.
+
+    The actual weight bake is owned by ``layer10_stack0_byte_relay_bake``
+    above, pinned to ``model.blocks[10].attn``.
+    """
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_layer10_stack0_byte_relay
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer10_stack0_byte_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+        return None
 
     return Operation(
         name="layer10_stack0_byte_relay",
@@ -438,6 +591,8 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -503,6 +658,8 @@ def make_l10_post_ops_combined() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "CARRY"},
         kind="ffn",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        migrated=True,
         declarative_authority="declarative",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -606,9 +763,11 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         writes=set(),
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         phase=10.7,
         layer_idx=10,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

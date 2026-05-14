@@ -77,6 +77,8 @@ ALLOWED_DECLARATIVE_AUTHORITY = frozenset({
     "declarative",
     "spec_generated",
     "legacy_wrapper",
+    "structural_model",
+    "topology_anchor",
 })
 
 
@@ -93,6 +95,10 @@ class Operation:
         pinned to `layer_idx`; they fire after attn/ffn ops at that layer.
     `bake_fn(module, dim_positions, S)` is invoked at compile time to actually
     write the weights. For block ops, `module` is the whole TransformerBlock.
+    `declarative_bake_fn(module, dim_positions, S)` is the opt-in
+    declarations-only implementation. When declarations-only baking is enabled,
+    the dispatcher refuses to call `bake_fn` and only runs this generator (or
+    skips `topology_anchor` ops, which intentionally write no weights).
 
     `phase` is an optional ordering hint. When the dep graph has ambiguity
     (e.g., two ops both read+write the same dim at different positions, which
@@ -115,6 +121,7 @@ class Operation:
     writes: Set[str]
     kind: str  # "attn", "ffn", "block", or "model"
     bake_fn: Callable
+    declarative_bake_fn: Optional[Callable] = None
     phase: Optional[float] = None
     # For kind="block" or "model" ops, the layer_idx the op targets (if
     # block-scoped) or None (if it operates on the whole model).
@@ -224,12 +231,64 @@ class Operation:
     compaction_safe: bool = True
     # Where this op's bake authority currently comes from. ``None`` means the
     # op has not been audited/classified yet. ``declarative`` and
-    # ``spec_generated`` are authoritative declarative paths; ``legacy_wrapper``
-    # marks an opaque wrapper around legacy bake code.
+    # ``spec_generated`` are authoritative declarative paths;
+    # ``structural_model`` marks compiler-owned whole-model structural passes;
+    # ``topology_anchor`` marks no-op graph-shape anchors whose paired block
+    # op owns the actual bake; ``legacy_wrapper`` marks an opaque wrapper
+    # around legacy bake code.
     declarative_authority: Optional[str] = None
 
     def __hash__(self):
         return hash(self.name)
+
+
+class DeclarationsOnlyBakeError(RuntimeError):
+    """Raised when declarations-only mode reaches an imperative-only op."""
+
+    def __init__(self, unsupported_ops: List[str]):
+        self.unsupported_ops = tuple(sorted(unsupported_ops))
+        sample = ", ".join(self.unsupported_ops[:20])
+        if len(self.unsupported_ops) > 20:
+            sample += f", ... (+{len(self.unsupported_ops) - 20} more)"
+        super().__init__(
+            "Declarations-only bake cannot run because some dispatched ops do "
+            "not expose declarative_bake_fn and are not topology anchors: "
+            f"{sample}"
+        )
+
+
+def operation_supports_declarations_only(op: Operation) -> bool:
+    """Return whether ``op`` can run without its imperative ``bake_fn``."""
+
+    return (
+        op.declarative_bake_fn is not None
+        or op.declarative_authority == "topology_anchor"
+    )
+
+
+def validate_declarations_only_ops(ops: List[Operation]):
+    """Raise when any op in dispatch order lacks a declarations-only bake."""
+
+    unsupported = [
+        op.name for op in ops if not operation_supports_declarations_only(op)
+    ]
+    if unsupported:
+        raise DeclarationsOnlyBakeError(unsupported)
+
+
+def dispatch_operation_bake(op: Operation, target, dim_positions, S, *,
+                            declarations_only: bool = False):
+    """Dispatch one operation through either the normal or declarations-only path."""
+
+    if not declarations_only:
+        op.bake_fn(target, dim_positions, S)
+        return
+    if op.declarative_bake_fn is not None:
+        op.declarative_bake_fn(target, dim_positions, S)
+        return
+    if op.declarative_authority == "topology_anchor":
+        return
+    raise DeclarationsOnlyBakeError([op.name])
 
 
 @dataclass
@@ -1008,7 +1067,8 @@ class LayerCompiler:
 
 
 def build_model_from_layout(layout: ModelLayout, S: float = 100.0,
-                            legacy_bake: Optional[Set[str]] = None):
+                            legacy_bake: Optional[Set[str]] = None,
+                            declarations_only: bool = False):
     """Construct an AutoregressiveVM from a compiled layout and bake all ops.
 
     This is the bridge from "layout produced by compiler" to "working model".
@@ -1029,6 +1089,9 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0,
         legacy_bake: optional set of op-name strings whose bakes are still
             handled by an external (legacy) path. Ops in this set are skipped
             UNLESS they have op.migrated=True, in which case they fire here.
+        declarations_only: when True, refuse to call imperative ``bake_fn``
+            bodies. Only ``declarative_bake_fn`` generators and topology
+            anchors may dispatch.
 
     Returns:
         AutoregressiveVM instance with weights baked.
@@ -1051,47 +1114,69 @@ def build_model_from_layout(layout: ModelLayout, S: float = 100.0,
     def _should_dispatch(op):
         return op.migrated or not has_legacy_bake
 
+    per_layer_dispatch = [
+        (layer_idx, op)
+        for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer)
+        for op in ops_at_layer
+        if _should_dispatch(op)
+    ]
+    block_dispatch = [
+        op for op in sorted(
+            layout.block_ops,
+            key=lambda o: (layout.resolve_block_op_layer(o), o.phase or 0),
+        )
+        if _should_dispatch(op)
+    ]
+    model_dispatch = sorted(layout.model_ops, key=lambda o: (o.phase or 0))
+    if declarations_only:
+        validate_declarations_only_ops(
+            [op for _, op in per_layer_dispatch]
+            + block_dispatch
+            + model_dispatch
+        )
+
     # Wrap the entire bake pass in no_grad so bake_fn implementations can do
     # in-place writes to leaf Parameters (the pattern used throughout
     # vm_step.py's hand-set weights).
     import torch as _torch
     with _torch.no_grad():
-        for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer):
+        for layer_idx, op in per_layer_dispatch:
             block = model.blocks[layer_idx]
-            for op in ops_at_layer:
-                if not _should_dispatch(op):
-                    continue
-                if op.kind == "attn":
-                    target = block.attn
-                elif op.kind == "ffn":
-                    target = block.ffn
-                elif op.kind == "block":
-                    target = block
-                else:
-                    raise ValueError(
-                        f"Op {op.name!r} in ops_per_layer has kind={op.kind!r}; "
-                        "expected 'attn' or 'ffn'"
-                    )
-                op.bake_fn(target, layout.dim_positions, S)
+            if op.kind == "attn":
+                target = block.attn
+            elif op.kind == "ffn":
+                target = block.ffn
+            elif op.kind == "block":
+                target = block
+            else:
+                raise ValueError(
+                    f"Op {op.name!r} in ops_per_layer has kind={op.kind!r}; "
+                    "expected 'attn' or 'ffn'"
+                )
+            dispatch_operation_bake(
+                op, target, layout.dim_positions, S,
+                declarations_only=declarations_only,
+            )
 
         # Block-scoped ops run after all attn/ffn bakes for their layer.
         # `_n_layers_hint` lets block bake_fns gate on total layer count.
         # Block op binding via target_op_name (resolved from layout) takes
         # precedence over the legacy layer_idx field.
-        for op in sorted(
-            layout.block_ops,
-            key=lambda o: (layout.resolve_block_op_layer(o), o.phase or 0),
-        ):
-            if not _should_dispatch(op):
-                continue
+        for op in block_dispatch:
             block = model.blocks[layout.resolve_block_op_layer(op)]
             block._n_layers_hint = len(model.blocks)
-            op.bake_fn(block, layout.dim_positions, S)
+            dispatch_operation_bake(
+                op, block, layout.dim_positions, S,
+                declarations_only=declarations_only,
+            )
 
         # Model-level ops run last (head, embedding, defensive patches,
         # right-size, expand wrappers, legacy_bake). Sort by phase.
         # Always dispatch model ops (head/embedding/legacy_bake all need to run).
-        for op in sorted(layout.model_ops, key=lambda o: (o.phase or 0)):
-            op.bake_fn(model, layout.dim_positions, S)
+        for op in model_dispatch:
+            dispatch_operation_bake(
+                op, model, layout.dim_positions, S,
+                declarations_only=declarations_only,
+            )
 
     return model

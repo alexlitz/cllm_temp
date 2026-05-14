@@ -9,6 +9,10 @@ def make_layer12_mul_combine_op() -> Operation:
 
     Pinned to ``layer_idx=12`` via ``kind="block"``. See
     ``make_layer11_mul_partial_op``.
+
+    Declarations-only note: intentionally unsupported until the
+    ``_set_layer12_mul_combine`` lookup-table helper is lowered into explicit
+    FFN units or a structural stage module.
     """
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer12_mul_combine
@@ -36,5 +40,4 @@ def make_layer12_mul_combine_op() -> Operation:
         },
         spec_section="BLOG_SPEC.md#multiplication-implementation",
     )
-
 

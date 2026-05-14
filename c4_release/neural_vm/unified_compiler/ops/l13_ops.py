@@ -58,6 +58,10 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
     In ``alu_mode='lookup'`` we bake the standard SHL/SHR lookup table via
     ``_set_layer13_shifts`` into the L13 PureFFN block.
 
+    Declarations-only note: lookup mode is intentionally unsupported until
+    ``_set_layer13_shifts`` is lowered into explicit FFN units. Efficient mode
+    is represented by the structural 4-stage composite ops instead.
+
     In ``alu_mode='efficient'`` SHL/SHR are now handled by the 4-stage
     composite installed via the dedicated
     ``make_l13_alu_shift_{bdtoge,precompute,select,getobd}_op`` factories
@@ -108,5 +112,4 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         },
         spec_section="BLOG_SPEC.md#shifts",
     )
-
 

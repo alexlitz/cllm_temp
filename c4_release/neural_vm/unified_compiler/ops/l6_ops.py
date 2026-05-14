@@ -1,25 +1,22 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
 def make_layer6_attn_op() -> Operation:
     """L6 attention: relay heads for IS_JMP, IS_EXIT, etc. at PC marker.
 
-    Kept as a ``kind="attn"`` dep anchor (no ``migrated`` flag, no
-    ``layer_idx``): its declared reads/writes preserve the LayerCompiler
-    dep-graph topology that places downstream ops (e.g. ALU layers L8-L13)
-    at the right model.blocks indices. The actual weight bake now happens
-    in ``make_layer6_attn_bake_op`` (kind="model", phase=998.5, migrated=True);
-    this op's bake_fn is preserved for the legacy pure_neural path (when
-    ``legacy_bake`` is absent) but does no work in production where
-    legacy_bake owns the dispatch.
+    Kept as a migrated ``kind="attn"`` dep anchor: its declared reads/writes
+    preserve the LayerCompiler dep-graph topology that places downstream ops
+    (e.g. ALU layers L8-L13) at the right model.blocks indices. The actual
+    weight bake happens in ``make_layer6_attn_bake_op`` (kind="model",
+    phase=998.5, migrated=True).
     """
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_layer6_attn
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer6_attn(attn, S, _as_setdim_proxy(dim_positions), HD)
+        # No-op: actual bake is in `layer6_attn_bake` model op below.
+        return
 
     return Operation(
         name="layer6_attn",
@@ -30,7 +27,10 @@ def make_layer6_attn_op() -> Operation:
                "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"CMP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
+        layer_idx=6,
         bake_fn=bake,
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -66,7 +66,7 @@ def make_layer6_routing_ffn_op() -> Operation:
                "OUTPUT_LO", "OUTPUT_HI", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
                "TEMP", "DIV_STAGING"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
         bake_fn=bake,
         layer_idx=6,
@@ -84,40 +84,144 @@ def make_layer6_routing_ffn_op() -> Operation:
 def make_layer6_relay_heads_op() -> Operation:
     """L6 head 6/7: STACK0 ← AX relay for PSH.
 
-    Kept as a ``kind="attn"`` dep anchor (no ``migrated`` flag, no
-    ``layer_idx``): its declared reads/writes preserve the LayerCompiler
-    dep-graph topology. The actual weight bake now happens in
-    ``make_layer6_relay_heads_bake_op`` (kind="model", phase=998.6,
+    Kept as a migrated ``kind="attn"`` dep anchor: its declared reads/writes
+    preserve the LayerCompiler dep-graph topology. The actual weight bake now
+    happens in ``make_layer6_relay_heads_bake_op`` (kind="model", phase=998.6,
     migrated=True).
     """
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_layer6_relay_heads
-        HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer6_relay_heads(attn, S, _as_setdim_proxy(dim_positions), HD)
+        # No-op: actual bake is in `layer6_relay_heads_bake` model op below.
+        return
 
     return Operation(
         name="layer6_relay_heads",
-        phase=6,
+        phase=6.1,
         reads={"MARK_STACK0", "MARK_AX", "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
+        layer_idx=6,
         bake_fn=bake,
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
 
 
+def _bake_layer6_attn_spec(attn, BD, HD):
+    """Spec writer for L6 heads 0-5.
+
+    This is the declarative replacement for the old `_set_layer6_attn`
+    wrapper: each section owns one head and writes only the rows described by
+    the L6 relay comments below.
+    """
+    L = 50.0
+
+    # Head 0: later-step JMP relay, PC marker reads previous AX marker.
+    base = 0 * HD
+    attn.W_q[base, BD.MARK_PC] = L
+    attn.W_q[base, BD.MARK_AX] = -L
+    attn.W_q[base, BD.HAS_SE] = L * 20
+    attn.W_q[base, BD.CONST] = -L * 20
+    attn.W_k[base, BD.MARK_AX] = L
+    attn.W_k[base, BD.CONST] = 1.0
+    attn.W_v[base + 1, BD.OP_JMP] = 1.0
+    for k in range(16):
+        attn.W_v[base + 2 + k, BD.FETCH_LO + k] = 1.0
+        attn.W_v[base + 18 + k, BD.FETCH_HI + k] = 1.0
+        attn.W_o[BD.AX_CARRY_LO + k, base + 2 + k] = 1.0
+        attn.W_o[BD.AX_CARRY_HI + k, base + 18 + k] = 1.0
+    attn.W_o[BD.CMP + 0, base + 1] = 1.0
+
+    # Head 1: EXIT relay, NEXT_SE reads current AX marker.
+    base = 1 * HD
+    attn.W_q[base, BD.NEXT_SE] = L
+    attn.W_q[base, BD.MARK_AX] = -L
+    attn.W_k[base, BD.MARK_AX] = L
+    attn.W_v[base + 1, BD.OP_EXIT] = 0.2
+    attn.W_o[BD.CMP + 1, base + 1] = 1.0
+
+    # Head 2: first-step JMP relay, PC marker self-attends to fetched target.
+    base = 2 * HD
+    attn.W_q[base, BD.MARK_PC] = L
+    attn.W_q[base, BD.HAS_SE] = -L
+    attn.W_q[base, BD.MARK_AX] = -L
+    attn.W_q[base, BD.OP_JMP] = L * 20
+    attn.W_q[base, BD.CONST] = -L * 20
+    attn.W_k[base, BD.MARK_PC] = L
+    attn.W_v[base + 1, BD.OP_JMP] = 1.0
+    for k in range(16):
+        attn.W_v[base + 2 + k, BD.FETCH_LO + k] = 1.0
+        attn.W_v[base + 18 + k, BD.FETCH_HI + k] = 1.0
+        attn.W_o[BD.AX_CARRY_LO + k, base + 2 + k] = 1.0
+        attn.W_o[BD.AX_CARRY_HI + k, base + 18 + k] = 1.0
+    attn.W_o[BD.CMP + 0, base + 1] = 1.0
+
+    # Head 3: first-step JSR relay, AX marker to PC marker.
+    base = 3 * HD
+    attn.W_q[base, BD.MARK_PC] = L
+    attn.W_q[base, BD.MARK_AX] = -L
+    attn.W_q[base, BD.HAS_SE] = -L
+    attn.W_k[base, BD.MARK_AX] = L
+    attn.W_v[base + 1, BD.OP_JSR] = 1.0
+    attn.W_o[BD.TEMP + 0, base + 1] = 1.0
+
+    # Head 4 is reserved for layer6_bz_bnz_relay_bake.
+
+    # Head 5: first-step FETCH relay, PC marker to AX marker.
+    base = 5 * HD
+    attn.W_q[base, BD.MARK_AX] = L
+    attn.W_q[base, BD.HAS_SE] = -L
+    attn.W_k[base, BD.MARK_PC] = L
+    for k in range(16):
+        attn.W_v[base + k, BD.FETCH_LO + k] = 1.0
+        attn.W_v[base + 16 + k, BD.FETCH_HI + k] = 1.0
+        attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
+        attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
+    fetch_gate = 50
+    attn.W_q[base + fetch_gate, BD.MARK_AX] = 500.0
+    attn.W_q[base + fetch_gate, BD.CONST] = -500.0
+    attn.W_k[base + fetch_gate, BD.CONST] = 5.0
+    has_se_gate = 49
+    attn.W_q[base + has_se_gate, BD.HAS_SE] = -500.0
+    attn.W_k[base + has_se_gate, BD.CONST] = 5.0
+
+
+def _bake_layer6_relay_heads_spec(attn, BD, HD):
+    """Spec writer for L6 PSH relay heads 6-7."""
+    L = 50.0
+
+    # Head 6: STACK0 reads AX_CARRY_LO from AX into ALU_LO.
+    base = 6 * HD
+    attn.W_q[base, BD.MARK_STACK0] = L
+    attn.W_q[base, BD.MARK_AX] = -L
+    attn.W_k[base, BD.MARK_AX] = L
+    for k in range(16):
+        attn.W_v[base + 8 + k, BD.AX_CARRY_LO + k] = 1.0
+        attn.W_o[BD.ALU_LO + k, base + 8 + k] = 1.0
+
+    # Head 7: STACK0 reads AX_CARRY_HI from AX into ALU_HI.
+    base = 7 * HD
+    attn.W_q[base, BD.MARK_STACK0] = L + L * 20
+    attn.W_q[base, BD.MARK_AX] = -L
+    attn.W_q[base, BD.CONST] = -L * 20
+    attn.W_k[base, BD.MARK_AX] = L
+    for k in range(16):
+        attn.W_v[base + 33 + k, BD.AX_CARRY_HI + k] = 1.0
+        attn.W_o[BD.ALU_HI + k, base + 33 + k] = 1.0
+
+
 def make_layer6_attn_bake_op() -> Operation:
-    """Bake ``_set_layer6_attn`` into ``model.blocks[6].attn``.
+    """Bake the L6 attention head spec into ``model.blocks[6].attn``.
 
     Originally an inline call in ``set_vm_weights``:
         ``_set_layer6_attn(attn6, S, BD, HD)``
 
-    Migrated as ``kind="model"`` with ``migrated=True``: the inline call
-    has been removed, so the bake must happen here. Phase=998.5 so this
-    op runs AFTER ``function_call_weights`` (998) but BEFORE
-    ``legacy_bake`` (999), matching the legacy in-set_vm_weights ordering
-    where _set_layer6_attn ran after function_call_weights.
+    Migrated as ``kind="model"`` with ``migrated=True`` and now owned by the
+    local spec writer above, so this op no longer calls the legacy helper.
+    Phase=998.5 so this op runs AFTER ``function_call_weights`` (998) but
+    BEFORE ``legacy_bake`` (999), matching the legacy in-set_vm_weights
+    ordering where _set_layer6_attn ran after function_call_weights.
 
     A model-level op (rather than ``kind="block"`` pinned to ``layer_idx=6``)
     is required because compile_full_vm dispatches block ops BEFORE all
@@ -155,6 +259,7 @@ def make_layer6_attn_bake_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -162,13 +267,14 @@ def make_layer6_attn_bake_op() -> Operation:
 
 
 def make_layer6_relay_heads_bake_op() -> Operation:
-    """Bake ``_set_layer6_relay_heads`` into ``model.blocks[6].attn``.
+    """Bake the L6 PSH relay head spec into ``model.blocks[6].attn``.
 
     Originally an inline call in ``set_vm_weights``:
         ``_set_layer6_relay_heads(attn6, S, BD, HD)``
 
-    Migrated as ``kind="model"`` with ``migrated=True``: the inline call
-    has been removed. Phase=998.6 so this op runs AFTER
+    Migrated as ``kind="model"`` with ``migrated=True`` and now owned by the
+    local spec writer above, so this op no longer calls the legacy helper.
+    Phase=998.6 so this op runs AFTER
     ``function_call_weights`` (998) AND AFTER ``layer6_attn_bake`` (998.5)
     but BEFORE ``legacy_bake`` (999).
 
@@ -195,6 +301,7 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -231,12 +338,47 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         smoke_tests={
             "TestSmokeControlFlow::test_bnz_branch",
             "TestSmokeControlFlow::test_bz_branch",
         },
         spec_section="BLOG_SPEC.md#control-flow",
+    )
+
+
+def _layer6_bz_bnz_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L6 head 4: relay BZ/BNZ and AX-byte-zero flags."""
+
+    L = 50.0
+    AX_I = 1
+    return DeclarativeAttentionHeadSpec(
+        head_idx=4,
+        q=(
+            AP(0, BD.MARK_PC, L),
+            AP(0, BD.MARK_AX, -L),
+            AP(0, BD.CONST, -L * 1.3),
+            AP(0, BD.OP_BZ, L / 5.0),
+            AP(0, BD.OP_BNZ, L / 5.0),
+        ),
+        k=(
+            AP(0, BD.L1H1 + AX_I, L),
+            AP(0, BD.L1H0 + AX_I, -L),
+            AP(0, BD.CONST, L),
+        ),
+        v=(
+            AP(1, BD.OP_BZ, 1.0),
+            AP(2, BD.OP_BNZ, 1.0),
+            AP(3, BD.EMBED_LO + 0, 1.0),
+            AP(4, BD.EMBED_HI + 0, 1.0),
+        ),
+        o=(
+            AO(BD.CMP + 2, 1, 0.2),
+            AO(BD.CMP + 3, 2, 0.2),
+            AO(BD.CMP + 4, 3, 1.0),
+            AO(BD.CMP + 5, 4, 1.0),
+        ),
     )
 
 
@@ -345,6 +487,7 @@ def make_putchar_think_protocol_op(
                 "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=6,
         migrated=True,
         smoke_tests={"all"},
@@ -427,6 +570,7 @@ def make_prtf_think_protocol_op(
         writes=set(),
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=6,
         migrated=True,
         smoke_tests={"all"},
@@ -490,10 +634,9 @@ def make_open_clos_tool_call_op(
         writes=set(),
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=6,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
     )
-
-

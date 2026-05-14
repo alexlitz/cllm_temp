@@ -14,12 +14,14 @@ def make_layer7_operand_gather_op() -> Operation:
     block and leave block 7 zero-init.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer7_operand_gather
         attn = block.attn
+        BD = _as_setdim_proxy(dim_positions)
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer7_operand_gather(attn, S, _as_setdim_proxy(dim_positions), HD)
+        Primitives.generate_attention_heads(
+            attn, _layer7_operand_gather_head_specs(BD), HD
+        )
 
     # Dim-ownership claims: L7 attn heads 0 + 1 operand gather.
     #   Head 0 V slot 1+k reads CLEAN_EMBED_LO+k (STACK0 byte 0 → ALU_LO at AX)
@@ -36,11 +38,13 @@ def make_layer7_operand_gather_op() -> Operation:
     return Operation(
         name="layer7_operand_gather",
         phase=7,
-        reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA", "OP_ADJ", "OP_ENT",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "OUTPUT_LO", "OUTPUT_HI"},
         writes={"ALU_LO", "ALU_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=7,
         migrated=True,
         claims=_claims,
@@ -65,6 +69,54 @@ def make_layer7_operand_gather_op() -> Operation:
         },
         spec_section="BLOG_SPEC.md#the-attention-layer",
         compaction_safe=True,
+    )
+
+
+def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Declarative replacement for ``vm_step._set_layer7_operand_gather``."""
+
+    L = 15.0
+    AX_I = 1
+
+    return (
+        DeclarativeAttentionHeadSpec(
+            head_idx=0,
+            q=(AP(0, BD.MARK_AX, L), AP(0, BD.OP_LEA, -L)),
+            k=(AP(0, BD.STACK0_BYTE0, L),),
+            v=(
+                _band_projection_writes(1, BD.CLEAN_EMBED_LO)
+                + _band_projection_writes(17, BD.CLEAN_EMBED_HI)
+            ),
+            o=(
+                _band_output_writes(BD.ALU_LO, 1, 6.0)
+                + _band_output_writes(BD.ALU_HI, 17, 6.0)
+            ),
+        ),
+        DeclarativeAttentionHeadSpec(
+            head_idx=1,
+            q=(
+                AP(0, BD.MARK_AX, L * 10),
+                AP(0, BD.OP_LEA, L),
+                AP(0, BD.OP_ADJ, L),
+                AP(0, BD.OP_ENT, L),
+                AP(0, BD.CONST, -L * 5),
+                AP(1, BD.CONST, -L * 2),
+                AP(1, BD.MARK_AX, L * 3),
+            ),
+            k=(
+                AP(0, BD.MARK_BP, L),
+                AP(0, BD.MARK_SP, L),
+                AP(1, BD.CONST, 1.0),
+            ),
+            v=(
+                _band_projection_writes(1, BD.OUTPUT_LO)
+                + _band_projection_writes(17, BD.OUTPUT_HI)
+            ),
+            o=(
+                _band_output_writes(BD.ALU_LO, 1)
+                + _band_output_writes(BD.ALU_HI, 17)
+            ),
+        ),
     )
 
 
@@ -126,9 +178,10 @@ def make_layer7_memory_heads_op() -> Operation:
                 # NOCARRY_ALU_OP relay to TEMP[7]. (TEMP is already in writes
                 # but listed here for clarity.) Head 5 also writes the OP_JSR
                 # relay back to OP_JSR at AX byte positions (added 2026-05-12).
-                "OP_JSR"},
+        "OP_JSR"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=7,
         migrated=True,
         claims=_claims,
@@ -326,9 +379,9 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
         writes={"FORMAT_PTR_LO", "FORMAT_PTR_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake if not enable_conversational_io else None,
         layer_idx=7,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
-

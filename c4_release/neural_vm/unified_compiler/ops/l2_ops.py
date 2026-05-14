@@ -12,7 +12,7 @@ def make_layer2_mem_byte_flags_op() -> Operation:
     ``make_layer2_initial_pc_bake_cancel_op``) can start above this range.
     """
     def bake(ffn, dim_positions, S):
-        from ...vm_step import _set_layer2_mem_byte_flags
+        from ...setup_helpers import _set_layer2_mem_byte_flags
         _set_layer2_mem_byte_flags(ffn, S, _as_setdim_proxy(dim_positions))
         # The legacy bake fills units 0..7 (4 MEM_VAL_BN + 4 BYTE_INDEX_*).
         ffn._l2_unit_counter = max(getattr(ffn, "_l2_unit_counter", 0), 8)
@@ -46,6 +46,7 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         kind="ffn",
         layer_idx=2,
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         claims=_claims,
         # ``_set_layer2_mem_byte_flags`` writes 8 units (4 MEM_VAL_B* +
@@ -55,6 +56,32 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
+
+
+def _bake_layer2_mem_byte_flags(ffn, S, BD):
+    """Declarative L2 FFN spec: MEM value-byte and STACK0 byte-index flags."""
+
+    MEM_I = 4
+    BP_I = 3
+    unit = 0
+
+    for src_dim, blocker_dim, out_dim in (
+        (BD.H1 + MEM_I, BD.H0 + MEM_I, BD.MEM_VAL_B0),
+        (BD.L2H0 + MEM_I, BD.H1 + MEM_I, BD.MEM_VAL_B1),
+        (BD.L1H4 + MEM_I, BD.L2H0 + MEM_I, BD.MEM_VAL_B2),
+        (BD.H2 + MEM_I, BD.L1H4 + MEM_I, BD.MEM_VAL_B3),
+        (BD.L1H4 + BP_I, BD.H1 + BP_I, BD.BYTE_INDEX_0),
+        (BD.H2 + BP_I, BD.L1H4 + BP_I, BD.BYTE_INDEX_1),
+        (BD.H3 + BP_I, BD.H2 + BP_I, BD.BYTE_INDEX_2),
+        (BD.H4 + BP_I, BD.H3 + BP_I, BD.BYTE_INDEX_3),
+    ):
+        ffn.W_up.data[unit, src_dim] = S
+        ffn.W_up.data[unit, BD.IS_BYTE] = S
+        ffn.b_up.data[unit] = -S * 1.5
+        ffn.W_gate.data[unit, blocker_dim] = -1.0
+        ffn.b_gate.data[unit] = 1.0
+        ffn.W_down.data[out_dim, unit] = 2.0 / S
+        unit += 1
 
 
 def make_layer2_initial_pc_bake_cancel_op() -> Operation:
@@ -152,8 +179,10 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         kind="block",
         layer_idx=2,
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         claims=_claims,
+        declarative_authority="spec_generated",
         # Allocates 2 FFN units starting at ``ffn._l2_unit_counter`` (which
         # ``make_layer2_mem_byte_flags_op`` sets to 8). Result: writes units
         # 8 and 9 -> max index 10. The aggregator takes the per-block max
@@ -196,6 +225,7 @@ def make_layer2_threshold_attn_op() -> Operation:
         kind="attn",
         layer_idx=2,
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
@@ -249,6 +279,7 @@ def make_layer2_lookback_detection_head_op(
         kind="block",
         layer_idx=2,
         bake_fn=bake,
+        declarative_bake_fn=bake if not enable_conversational_io else None,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",

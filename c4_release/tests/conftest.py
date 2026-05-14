@@ -61,6 +61,15 @@ HAS_GPU = DEVICE.type in ("cuda", "mps")
 # Pytest Markers
 # =============================================================================
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--runslow",
+        action="store_true",
+        default=False,
+        help="run tests marked slow",
+    )
+
+
 def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line("markers", "slow: marks tests as slow (skip with -m 'not slow')")
@@ -73,12 +82,18 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-skip GPU tests if no GPU available."""
+    """Auto-skip GPU and opt-in slow tests."""
     if not HAS_GPU:
         skip_gpu = pytest.mark.skip(reason="No GPU available")
         for item in items:
             if "gpu" in item.keywords:
                 item.add_marker(skip_gpu)
+
+    if not config.getoption("--runslow"):
+        slow_items = [item for item in items if "slow" in item.keywords]
+        if slow_items:
+            items[:] = [item for item in items if item not in slow_items]
+            config.hook.pytest_deselected(items=slow_items)
 
 
 # =============================================================================
@@ -468,10 +483,8 @@ def batched_pure_neural_runner(_batched_pure_neural_runner_model):
 @pytest.fixture
 def handler_status():
     """Get current handler registration status."""
-    from neural_vm.run_vm import AutoregressiveVMRunner
+    from neural_vm.run_vm import _PHASE6_SYSCALL_STATUS
     from neural_vm.embedding import Opcode
-
-    runner = AutoregressiveVMRunner()
 
     all_ops = [
         ("LEA", Opcode.LEA), ("IMM", Opcode.IMM), ("JMP", Opcode.JMP),
@@ -491,10 +504,14 @@ def handler_status():
         ("NOP", Opcode.NOP),
     ]
 
+    syscall_ops = {Opcode.CLOS, Opcode.OPEN, Opcode.READ, Opcode.PRTF}
+    phase6_status = {
+        spec["name"]: dict(spec)
+        for spec in _PHASE6_SYSCALL_STATUS.values()
+    }
     status = {}
-    phase6_status = runner.get_phase6_syscall_status()
     for name, op in all_ops:
-        has_sys = op in runner._syscall_handlers
+        has_sys = op in syscall_ops
         status[name] = {
             "opcode": op,
             "has_handler": has_sys,

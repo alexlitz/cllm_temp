@@ -4,6 +4,13 @@ from ..layer_compiler import Operation
 from .shared import _as_setdim_proxy, _make_alu_postop_attach_op, _ensure_l11_mul_module
 
 
+def _mark_structural_declarations(op: Operation) -> Operation:
+    """Mark module-assembly ops as safe for declarations-only dispatch."""
+    op.declarative_bake_fn = op.bake_fn
+    op.declarative_authority = "structural_model"
+    return op
+
+
 # ---------------------------------------------------------------------------
 # 4-stage SHL/SHR ops (efficient-mode replacement for ALUShift wrapper).
 # See shared._ALUShiftCompositeBuilder for the shared builder class.
@@ -201,27 +208,39 @@ def make_l13_alu_shift_install_op() -> Operation:
 
 
 def make_l8_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_alu_postop_attach_op("l8_alu_postop_attach", 8, "ALUAddSub", alu_mode)
+    return _mark_structural_declarations(
+        _make_alu_postop_attach_op("l8_alu_postop_attach", 8, "ALUAddSub", alu_mode)
+    )
 
 
 def make_l9_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_alu_postop_attach_op("l9_alu_postop_attach", 9, "ALUAddSub", alu_mode)
+    return _mark_structural_declarations(
+        _make_alu_postop_attach_op("l9_alu_postop_attach", 9, "ALUAddSub", alu_mode)
+    )
 
 
 def make_l10_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_alu_postop_attach_op("l10_alu_postop_attach", 10, "ALUAndOrXor", alu_mode)
+    return _mark_structural_declarations(
+        _make_alu_postop_attach_op("l10_alu_postop_attach", 10, "ALUAndOrXor", alu_mode)
+    )
 
 
 def make_l11_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_alu_postop_attach_op("l11_alu_postop_attach", 11, "ALUMul", alu_mode)
+    return _mark_structural_declarations(
+        _make_alu_postop_attach_op("l11_alu_postop_attach", 11, "ALUMul", alu_mode)
+    )
 
 
 def make_l12_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_alu_postop_attach_op("l12_alu_postop_attach", 12, "ALUMul", alu_mode)
+    return _mark_structural_declarations(
+        _make_alu_postop_attach_op("l12_alu_postop_attach", 12, "ALUMul", alu_mode)
+    )
 
 
 def make_l13_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _make_alu_postop_attach_op("l13_alu_postop_attach", 13, "ALUShift", alu_mode)
+    return _mark_structural_declarations(
+        _make_alu_postop_attach_op("l13_alu_postop_attach", 13, "ALUShift", alu_mode)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -746,8 +765,10 @@ def make_alu_divmod_composite_ops():
             writes=set(),
             kind="block",
             bake_fn=bake,
+            declarative_bake_fn=bake,
             layer_idx=10,
             migrated=True,
+            declarative_authority="structural_model",
         smoke_tests={
             "TestSmokeBasic::test_div_basic",
             "TestSmokeBasic::test_mod_basic",
@@ -768,8 +789,10 @@ def make_alu_divmod_composite_ops():
             writes=set(),
             kind="block",
             bake_fn=bake,
+            declarative_bake_fn=bake,
             layer_idx=10,
             migrated=True,
+            declarative_authority="structural_model",
         smoke_tests={
             "TestSmokeBasic::test_div_basic",
             "TestSmokeBasic::test_mod_basic",
@@ -790,8 +813,10 @@ def make_alu_divmod_composite_ops():
             writes={"OUTPUT_LO", "OUTPUT_HI"},
             kind="block",
             bake_fn=bake,
+            declarative_bake_fn=bake,
             layer_idx=10,
             migrated=True,
+            declarative_authority="structural_model",
         smoke_tests={
             "TestSmokeBasic::test_div_basic",
             "TestSmokeBasic::test_mod_basic",
@@ -813,8 +838,10 @@ def make_alu_divmod_composite_ops():
             writes=set(),
             kind="block",
             bake_fn=bake,
+            declarative_bake_fn=bake,
             layer_idx=10,
             migrated=True,
+            declarative_authority="structural_model",
         smoke_tests={
             "TestSmokeBasic::test_div_basic",
             "TestSmokeBasic::test_mod_basic",
@@ -878,15 +905,18 @@ def make_layer10_residual_alibi_slopes_op(alu_mode: str = 'lookup') -> Operation
         writes=set(),
         kind="model",
         bake_fn=_bake,
+        declarative_bake_fn=_bake,
         phase=999.1,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#the-attention-layer",
     )
 
 
 # ---------------------------------------------------------------------------
-# L8 ALU ADD/SUB flatten: 5 ops replacing the monolithic ALUAddSub wrapper
+# L8 ALU ADD/SUB flatten: 5 spec-stage anchors replacing the monolithic
+# ALUAddSub wrapper
 # ---------------------------------------------------------------------------
 #
 # These ops correspond 1:1 to the 5 stages of the flattened ADD/SUB pipeline
@@ -900,8 +930,18 @@ def make_layer10_residual_alibi_slopes_op(alu_mode: str = 'lookup') -> Operation
 #      downstream ops correctly
 #   3. Provide hooks for future migration to true bake-FFN-weights ops
 #
-# The runtime model after these ops contains NO `ALUAddSub` instance —
-# only TransformerBlock instances each holding one stage module as ffn.
+# The runtime model after these ops contains NO `ALUAddSub` instance. The
+# compiler-owned L8 ALU attach op installs `AddSub5StageBlock`, whose
+# `nn.Sequential` pipeline is generated from these five stages and validated
+# byte-for-byte against `PureNeuralALU(operations="add_sub")`.
+
+_L8_ADDSUB_SMOKE_TESTS = {
+    "TestSmoke32Bit::test_add_16bit",
+    "TestSmoke32Bit::test_sub_16bit",
+    "TestSmokeAddress::test_lea_basic",
+    "TestSmokeBasic::test_add_basic",
+    "TestSmokeBasic::test_sub_basic",
+}
 
 def make_l8_alu_addsub_bdtoge_op() -> Operation:
     """Stage 0: BD -> GE format projection (BDToGEConverter equivalent).
@@ -922,14 +962,9 @@ def make_l8_alu_addsub_bdtoge_op() -> Operation:
         writes=set(),
         kind="model",  # no-op model op; documentation only
         bake_fn=bake,
-        declarative_authority="legacy_wrapper",
-        smoke_tests={
-            "TestSmoke32Bit::test_add_16bit",
-            "TestSmoke32Bit::test_sub_16bit",
-            "TestSmokeAddress::test_lea_basic",
-            "TestSmokeBasic::test_add_basic",
-            "TestSmokeBasic::test_sub_basic",
-        },
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
 
@@ -950,14 +985,9 @@ def make_l8_alu_addsub_stage1_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_authority="legacy_wrapper",
-        smoke_tests={
-            "TestSmoke32Bit::test_add_16bit",
-            "TestSmoke32Bit::test_sub_16bit",
-            "TestSmokeAddress::test_lea_basic",
-            "TestSmokeBasic::test_add_basic",
-            "TestSmokeBasic::test_sub_basic",
-        },
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
 
@@ -980,14 +1010,9 @@ def make_l8_alu_addsub_stage2_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_authority="legacy_wrapper",
-        smoke_tests={
-            "TestSmoke32Bit::test_add_16bit",
-            "TestSmoke32Bit::test_sub_16bit",
-            "TestSmokeAddress::test_lea_basic",
-            "TestSmokeBasic::test_add_basic",
-            "TestSmokeBasic::test_sub_basic",
-        },
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
 
@@ -1008,14 +1033,9 @@ def make_l8_alu_addsub_stage3_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_authority="legacy_wrapper",
-        smoke_tests={
-            "TestSmoke32Bit::test_add_16bit",
-            "TestSmoke32Bit::test_sub_16bit",
-            "TestSmokeAddress::test_lea_basic",
-            "TestSmokeBasic::test_add_basic",
-            "TestSmokeBasic::test_sub_basic",
-        },
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
 
@@ -1036,13 +1056,8 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_authority="legacy_wrapper",
-        smoke_tests={
-            "TestSmoke32Bit::test_add_16bit",
-            "TestSmoke32Bit::test_sub_16bit",
-            "TestSmokeAddress::test_lea_basic",
-            "TestSmokeBasic::test_add_basic",
-            "TestSmokeBasic::test_sub_basic",
-        },
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )

@@ -7124,6 +7124,9 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_BP] = -S * 15  # Exclude BP marker (must overcome ADDR_B0*S)
         ffn.W_up[unit, BD.MARK_PC] = -S * 15  # Exclude PC marker (must overcome ADDR_B0[8]=12*S)
         ffn.W_up[unit, BD.MARK_AX] = -S * 50  # FIX 2026-04-16: Exclude AX marker (ADDR_B0 contamination ~40*S)
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 15  # Exclude STACK0 marker
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 15  # Exclude MEM marker
+        ffn.W_up[unit, BD.MARK_SE] = -S * 15  # Exclude STEP_END marker
         # FIX 2026-04-16: Suppress at byte positions (BYTE_INDEX=1 at bytes, =0 at markers)
         # ADDR_B0 contamination causes spurious firing at byte positions, need strong suppression.
         ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 10  # Suppress at byte 0 positions
@@ -7147,6 +7150,9 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_BP] = -S * 15  # Exclude BP marker (must overcome ADDR_B0*S)
         ffn.W_up[unit, BD.MARK_PC] = -S * 15  # Exclude PC marker (must overcome ADDR_B0*S)
         ffn.W_up[unit, BD.MARK_AX] = -S * 50  # FIX 2026-04-16: Exclude AX marker
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 15  # Exclude STACK0 marker
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 15  # Exclude MEM marker
+        ffn.W_up[unit, BD.MARK_SE] = -S * 15  # Exclude STEP_END marker
         # FIX 2026-04-16: Suppress at byte positions
         ffn.W_up[unit, BD.BYTE_INDEX_0] = -S * 10
         ffn.W_up[unit, BD.BYTE_INDEX_1] = -S * 10
@@ -7347,6 +7353,9 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_AX] = -S * 10  # Suppress at AX marker (MARK_AX=1 → -1000)
         ffn.W_up[unit, BD.MARK_SP] = -S * 10  # Suppress at SP marker
         ffn.W_up[unit, BD.MARK_BP] = -S * 10  # Suppress at BP marker
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 10  # Suppress at STACK0 marker
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 10  # Suppress at MEM marker
+        ffn.W_up[unit, BD.MARK_SE] = -S * 10  # Suppress at STEP_END marker
         # FIX 2026-05-09: Suppress at AX byte positions (H1[AX_I]=1, MARK_AX=0)
         ffn.W_up[unit, BD.H1 + AX_I] = AX_BYTE_SUPPRESS
         ffn.W_up[unit, BD.NEXT_AX] = -S * 1.5
@@ -7373,6 +7382,9 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.W_up[unit, BD.MARK_SP] = -S * 10
         ffn.W_up[unit, BD.MARK_BP] = -S * 10
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 10
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 10
+        ffn.W_up[unit, BD.MARK_SE] = -S * 10
         # FIX 2026-05-09: Suppress at AX byte positions to preserve AX across LEV.
         ffn.W_up[unit, BD.H1 + AX_I] = AX_BYTE_SUPPRESS
         ffn.W_up[unit, BD.NEXT_AX] = -S * 1.5
@@ -7398,6 +7410,9 @@ def _set_layer16_lev_routing(ffn, S, BD):
         ffn.W_up[unit, BD.MARK_AX] = -S * 10
         ffn.W_up[unit, BD.MARK_SP] = -S * 10
         ffn.W_up[unit, BD.MARK_BP] = -S * 10
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 10
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 10
+        ffn.W_up[unit, BD.MARK_SE] = -S * 10
         # FIX 2026-05-09: Suppress at AX byte positions to preserve AX across LEV.
         ffn.W_up[unit, BD.H1 + AX_I] = AX_BYTE_SUPPRESS
         ffn.W_up[unit, BD.NEXT_AX] = -S * 1.5

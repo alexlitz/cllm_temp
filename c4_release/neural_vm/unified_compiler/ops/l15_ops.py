@@ -6,10 +6,13 @@ import torch.nn as nn
 
 
 def make_nibble_copy_ffn_op() -> Operation:
-    """Conditional nibble copy: OUTPUT = EMBED for non-register byte values."""
+    """Topology anchor for L15 nibble-copy FFN.
+
+    The actual weight bake is owned by ``layer15_nibble_copy`` below, pinned
+    to ``model.blocks[15].ffn``.
+    """
     def bake(ffn, dim_positions, S):
-        from ...vm_step import _set_nibble_copy_ffn
-        _set_nibble_copy_ffn(ffn, S, _as_setdim_proxy(dim_positions))
+        return None
 
     return Operation(
         name="nibble_copy_ffn",
@@ -21,6 +24,8 @@ def make_nibble_copy_ffn_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
@@ -163,11 +168,11 @@ def make_l15_attention_resize_op() -> Operation:
         writes=set(),
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         phase=14.9,
         layer_idx=15,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )
-
-

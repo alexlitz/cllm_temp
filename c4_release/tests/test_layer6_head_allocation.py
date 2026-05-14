@@ -27,10 +27,15 @@ Date: 2026-04-08
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from types import SimpleNamespace
 
 import torch
-from neural_vm.vm_step import _SetDim
+from neural_vm.vm_step import AutoregressiveAttention, _SetDim
 from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from neural_vm.unified_compiler.ops.l6_ops import (
+    make_layer6_attn_bake_op,
+    make_layer6_relay_heads_bake_op,
+)
 
 BD = _SetDim
 
@@ -170,6 +175,43 @@ def test_head6_no_conflict():
         torch.cuda.empty_cache()
 
     return result
+
+
+def test_l6_spec_generated_bake_key_weights():
+    """Pin the spec-owned L6 attn/relay bake cells that used to be wrappers."""
+    attn = AutoregressiveAttention(dim=512, num_heads=8)
+    model = SimpleNamespace(
+        blocks=[SimpleNamespace(attn=None) for _ in range(7)]
+    )
+    model.blocks[6].attn = attn
+
+    with torch.no_grad():
+        make_layer6_attn_bake_op().bake_fn(model, {}, 100.0)
+        make_layer6_relay_heads_bake_op().bake_fn(model, {}, 100.0)
+
+    HD = attn.head_dim
+
+    # layer6_attn_bake: head 5 FETCH relay plus the local sharpness bump.
+    head5 = 5 * HD
+    assert attn.W_q[head5, BD.MARK_AX].item() == 50.0
+    assert attn.W_q[head5, BD.HAS_SE].item() == -50.0
+    assert attn.W_k[head5, BD.MARK_PC].item() == 500.0
+    assert attn.W_o[BD.FETCH_LO + 7, head5 + 7].item() == 1.0
+    assert attn.W_o[BD.FETCH_HI + 7, head5 + 16 + 7].item() == 1.0
+
+    # layer6_relay_heads_bake: PSH STACK0 reads AX_CARRY into ALU staging.
+    head6 = 6 * HD
+    head7 = 7 * HD
+    assert attn.W_q[head6, BD.MARK_STACK0].item() == 50.0
+    assert attn.W_v[head6 + 8 + 15, BD.AX_CARRY_LO + 15].item() == 1.0
+    assert attn.W_o[BD.ALU_LO + 15, head6 + 8 + 15].item() == 1.0
+    assert attn.W_q[head7, BD.MARK_STACK0].item() == 1050.0
+    assert attn.W_q[head7, BD.CONST].item() == -1000.0
+    assert attn.W_v[head7 + 33 + 15, BD.AX_CARRY_HI + 15].item() == 1.0
+    assert attn.W_o[BD.ALU_HI + 15, head7 + 33 + 15].item() == 1.0
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':

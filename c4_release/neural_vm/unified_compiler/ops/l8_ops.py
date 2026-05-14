@@ -1,7 +1,16 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+def _band_projection_writes(slot_base: int, dim_base: int, weight: float = 1.0):
+    return tuple(AP(slot_base + k, dim_base + k, weight) for k in range(16))
+
+
+def _band_output_writes(dim_base: int, slot_base: int, weight: float = 1.0):
+    return tuple(AO(dim_base + k, slot_base + k, weight) for k in range(16))
 
 
 def make_layer8_alu_op() -> Operation:
@@ -91,6 +100,7 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         writes={"IO_FORMAT_POS"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake if not enable_conversational_io else None,
         layer_idx=8,
         migrated=True,
         smoke_tests={"all"},
@@ -101,8 +111,8 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
 def make_layer8_multibyte_fetch_op() -> Operation:
     """No-op dep anchor for ``layer8_multibyte_fetch_bake``.
 
-    Kept as a ``kind="attn"`` placeholder (no ``migrated`` flag, no
-    ``layer_idx``): its declared reads/writes preserve the LayerCompiler
+    Kept as a ``kind="attn"`` placeholder with explicit declarative
+    authority metadata: its declared reads/writes preserve the LayerCompiler
     dep-graph topology that places downstream ops at the right
     model.blocks indices. The actual weight bake now happens in
     ``make_layer8_multibyte_fetch_bake_op`` (kind="block", layer_idx=8,
@@ -120,7 +130,8 @@ def make_layer8_multibyte_fetch_op() -> Operation:
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         bake_fn=bake,
-        declarative_authority="declarative",
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
@@ -149,24 +160,12 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
     ADDR_KEY content and the gate is a no-op.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer8_multibyte_fetch
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer8_multibyte_fetch(attn, S, proxy, HD)
-
-        # Dim 35: at firing Q positions (AX bytes: H1[AX_I]=1 + IS_BYTE=1
-        # → Q[35]=50) and K=AX marker (K[35]=-50), produce a -2500 raw
-        # score (-312.5 after /sqrt(HD)=8). Excludes AX marker from
-        # head 3's K candidates so the L4 SP-staged ADDR_KEY at AX marker
-        # does not outscore the correct code byte target.
-        base = 3 * HD
-        AX_MARKER_K_EXCLUDE = 35
-        AX_I = 1
-        attn.W_q[base + AX_MARKER_K_EXCLUDE, proxy.H1 + AX_I] = 100.0
-        attn.W_q[base + AX_MARKER_K_EXCLUDE, proxy.IS_BYTE] = 100.0
-        attn.W_q[base + AX_MARKER_K_EXCLUDE, proxy.CONST] = -150.0
-        attn.W_k[base + AX_MARKER_K_EXCLUDE, proxy.MARK_AX] = -50.0
+        Primitives.generate_attention_head(
+            attn, _layer8_multibyte_fetch_head_spec(proxy), HD
+        )
 
     # Dim-ownership claims: L8 attn head 3 multibyte fetch.
     #   W_v[3*HD + 32 + k, CLEAN_EMBED_LO + k]  for k=0..15 (slot 32..47)
@@ -184,11 +183,56 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=8,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
+    )
+
+
+def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative replacement for ``vm_step._set_layer8_multibyte_fetch``."""
+
+    L = 20.0
+    AX_I = 1
+    return DeclarativeAttentionHeadSpec(
+        head_idx=3,
+        q=(
+            tuple(AP(k, BD.FETCH_LO + k, L) for k in range(16))
+            + tuple(AP(16 + k, BD.FETCH_HI + k, L) for k in range(16))
+            + (
+                AP(32, BD.IS_BYTE, L),
+                AP(33, BD.IS_BYTE, 500.0),
+                AP(33, BD.CONST, -500.0),
+                AP(34, BD.H1 + AX_I, 500.0),
+                AP(34, BD.CONST, -500.0),
+                # AX marker K exclusion added after the original helper.
+                AP(35, BD.H1 + AX_I, 100.0),
+                AP(35, BD.IS_BYTE, 100.0),
+                AP(35, BD.CONST, -150.0),
+            )
+        ),
+        k=(
+            tuple(AP(k, BD.ADDR_KEY + k, L) for k in range(16))
+            + tuple(AP(16 + k, BD.ADDR_KEY + 16 + k, L) for k in range(16))
+            + (
+                AP(32, BD.ADDR_KEY + 32, L),
+                AP(33, BD.CONST, 5.0),
+                AP(34, BD.CONST, 5.0),
+                AP(35, BD.MARK_AX, -50.0),
+            )
+        ),
+        v=(
+            _band_projection_writes(32, BD.CLEAN_EMBED_LO, 3.0)
+            + _band_projection_writes(48, BD.CLEAN_EMBED_HI, 3.0)
+        ),
+        o=(
+            _band_output_writes(BD.AX_CARRY_LO, 32)
+            + _band_output_writes(BD.AX_CARRY_HI, 48)
+        ),
     )
 
 
@@ -242,8 +286,8 @@ def make_layer8_multibyte_routing_op() -> Operation:
 def make_layer8_sp_gather_op() -> Operation:
     """No-op dep anchor for ``layer8_sp_gather_bake``.
 
-    Kept as a ``kind="attn"`` placeholder (no ``migrated`` flag, no
-    ``layer_idx``): its declared reads/writes preserve the LayerCompiler
+    Kept as a ``kind="attn"`` placeholder with explicit declarative
+    authority metadata: its declared reads/writes preserve the LayerCompiler
     dep-graph topology. The actual weight bake now happens in
     ``make_layer8_sp_gather_bake_op`` (kind="block", layer_idx=8,
     phase=8.0, migrated=True); this op's bake_fn is a no-op.
@@ -260,7 +304,8 @@ def make_layer8_sp_gather_op() -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         bake_fn=bake,
-        declarative_authority="declarative",
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -281,11 +326,12 @@ def make_layer8_sp_gather_bake_op() -> Operation:
     legacy blocks.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer8_sp_gather
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer8_sp_gather(attn, S, proxy, HD)
+        Primitives.generate_attention_heads(
+            attn, _layer8_sp_gather_head_specs(proxy), HD
+        )
 
     # Dim-ownership claims: L8 attn heads 0-2 SP gather (SP bytes → ADDR_B*).
     # Each head writes V slots 1..32 reading CLEAN_EMBED_LO/HI.
@@ -306,12 +352,60 @@ def make_layer8_sp_gather_bake_op() -> Operation:
                 "ADDR_B2_LO", "ADDR_B2_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=8,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Declarative replacement for ``vm_step._set_layer8_sp_gather``."""
+
+    L = 15.0
+    AX_I = 1
+    SP_I = 2
+    BP_I = 3
+    MEM_I = 4
+
+    specs: list[DeclarativeAttentionHeadSpec] = []
+    for j in range(3):
+        byte_idx_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][j]
+        addr_lo_out = [BD.ADDR_B0_LO, BD.ADDR_B1_LO, BD.ADDR_B2_LO][j]
+        addr_hi_out = [BD.ADDR_B0_HI, BD.ADDR_B1_HI, BD.ADDR_B2_HI][j]
+        specs.append(
+            DeclarativeAttentionHeadSpec(
+                head_idx=j,
+                q=(
+                    AP(0, BD.MARK_STACK0, L),
+                    AP(0, BD.H4 + BP_I, L),
+                    AP(0, BD.H1 + AX_I, -L),
+                    AP(0, BD.H1 + SP_I, -L),
+                    AP(0, BD.H3 + MEM_I, -L),
+                    AP(0, BD.MARK_BP, -L),
+                    AP(33, BD.MARK_STACK0, L),
+                    AP(33, BD.CONST, -L / 2),
+                ),
+                k=(
+                    AP(0, byte_idx_dim, L),
+                    AP(0, BD.H1 + SP_I, L),
+                    AP(33, BD.CONST, L),
+                ),
+                v=(
+                    _band_projection_writes(1, BD.CLEAN_EMBED_LO)
+                    + _band_projection_writes(17, BD.CLEAN_EMBED_HI)
+                ),
+                o=(
+                    _band_output_writes(addr_lo_out, 1)
+                    + _band_output_writes(addr_hi_out, 17)
+                ),
+            )
+        )
+
+    return tuple(specs)
 
 
 def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
@@ -404,6 +498,7 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
         bake_fn=_bake,
+        declarative_bake_fn=_bake if not enable else None,
         layer_idx=8,
         # Always migrated=True so the bake runs when enable=True; when
         # enable=False the bake body is a no-op so production behavior is
@@ -435,21 +530,9 @@ def make_layer8_op_imm_relay_op() -> Operation:
         BD = _as_setdim_proxy(dim_positions)
         attn8 = block.attn
         HD = attn8.W_q.shape[0] // attn8.num_heads
-        base = 4 * HD
-        AX_I = 1
-        L8_relay = 20.0
-        attn8.W_q[base, BD.IS_BYTE] = L8_relay
-        attn8.W_q[base, BD.H1 + AX_I] = L8_relay
-        attn8.W_q[base, BD.CONST] = -L8_relay * 1.5
-        attn8.W_k[base, BD.MARK_AX] = L8_relay
-        attn8.W_k[base, BD.IS_BYTE] = -L8_relay * 10
-        attn8.W_k[base, BD.CONST] = L8_relay * 0.5
-        attn8.W_v[base, BD.OP_IMM] = 1.0
-        attn8.W_o[BD.OP_IMM, base] = 1.0
-        GATE4 = 1
-        attn8.W_q[base + GATE4, BD.IS_BYTE] = 500.0
-        attn8.W_q[base + GATE4, BD.CONST] = -500.0
-        attn8.W_k[base + GATE4, BD.CONST] = 5.0
+        Primitives.generate_attention_head(
+            attn8, _layer8_op_imm_relay_head_spec(BD), HD
+        )
 
     # Dim-ownership claims: L8 attn head 4 OP_IMM relay.
     #   W_q[4*HD, IS_BYTE], W_q[4*HD, H1+AX_I], W_q[4*HD, CONST]
@@ -469,12 +552,39 @@ def make_layer8_op_imm_relay_op() -> Operation:
         writes={"OP_IMM"},
         kind="block",
         bake_fn=_bake,
+        declarative_bake_fn=_bake,
+        declarative_authority="spec_generated",
         layer_idx=8,
         phase=8.4,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative replacement for the L8 head-4 OP_IMM relay bake."""
+
+    AX_I = 1
+    L8_relay = 20.0
+    return DeclarativeAttentionHeadSpec(
+        head_idx=4,
+        q=(
+            AP(0, BD.IS_BYTE, L8_relay),
+            AP(0, BD.H1 + AX_I, L8_relay),
+            AP(0, BD.CONST, -L8_relay * 1.5),
+            AP(1, BD.IS_BYTE, 500.0),
+            AP(1, BD.CONST, -500.0),
+        ),
+        k=(
+            AP(0, BD.MARK_AX, L8_relay),
+            AP(0, BD.IS_BYTE, -L8_relay * 10),
+            AP(0, BD.CONST, L8_relay * 0.5),
+            AP(1, BD.CONST, 5.0),
+        ),
+        v=(AP(0, BD.OP_IMM, 1.0),),
+        o=(AO(BD.OP_IMM, 0, 1.0),),
     )
 
 
@@ -688,10 +798,10 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         writes={"ALU_LO", "ALU_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake if not enable else None,
         layer_idx=8,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
-

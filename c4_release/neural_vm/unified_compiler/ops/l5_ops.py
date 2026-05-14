@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -16,8 +17,9 @@ def make_layer5_fetch_op() -> Operation:
     reserves a layer slot for it (preserving model n_layers).
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer5_fetch
+        from ...setup_helpers import _set_layer5_fetch
         attn = block.attn
+        BD = _as_setdim_proxy(dim_positions)
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.1)
             # Softmax-sharpness fix (head 5): s_target=125 is already strong
@@ -32,7 +34,7 @@ def make_layer5_fetch_op() -> Operation:
             # cross-step distractors.
             attn.alibi_slopes[5] = 1.0
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer5_fetch(attn, S, _as_setdim_proxy(dim_positions), HD)
+        _set_layer5_fetch(attn, S, BD, HD)
 
     # Dim-ownership claims (see c4_release/docs/DIM_OWNERSHIP_REGISTRY.md).
     # `_set_layer5_fetch` writes attn5.W_v rows {base+32+k, base+48+k} for
@@ -84,11 +86,170 @@ def make_layer5_fetch_op() -> Operation:
         kind="block",
         layer_idx=5,
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
+
+
+def _band_projection_writes(slot_base: int, dim_base: int, weight: float = 1.0):
+    return tuple(AP(slot_base + k, dim_base + k, weight) for k in range(16))
+
+
+def _band_output_writes(dim_base: int, slot_base: int, weight: float = 1.0):
+    return tuple(AO(dim_base + k, slot_base + k, weight) for k in range(16))
+
+
+def _addr_key_match_writes(BD, weight: float):
+    return (
+        tuple(AP(k, BD.ADDR_KEY + k, weight) for k in range(16))
+        + tuple(AP(16 + k, BD.ADDR_KEY + 16 + k, weight) for k in range(16))
+        + (AP(32, BD.ADDR_KEY + 32, weight),)
+    )
+
+
+def _code_fetch_v_writes(BD, weight: float = 1.0):
+    return (
+        _band_projection_writes(32, BD.CLEAN_EMBED_LO, weight)
+        + _band_projection_writes(48, BD.CLEAN_EMBED_HI, weight)
+    )
+
+
+def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Declarative replacement for ``setup_helpers._set_layer5_fetch``."""
+
+    from ...constants import PC_OFFSET
+
+    L = 20.0
+
+    def ax_gate(slot: int = 33):
+        return (
+            (AP(slot, BD.MARK_AX, 500.0), AP(slot, BD.CONST, -500.0)),
+            (AP(slot, BD.CONST, 5.0),),
+        )
+
+    def pc_gate(slot: int = 33):
+        return (
+            (AP(slot, BD.MARK_PC, 500.0), AP(slot, BD.CONST, -500.0)),
+            (AP(slot, BD.CONST, 5.0),),
+        )
+
+    ax_q_gate, ax_k_gate = ax_gate()
+    pc_q_gate, pc_k_gate = pc_gate()
+    pc_lo = PC_OFFSET & 0xF
+    pc_hi = (PC_OFFSET >> 4) & 0xF
+
+    specs = [
+        # Head 0: non-first-step immediate fetch at AX from TEMP=PC+1.
+        DeclarativeAttentionHeadSpec(
+            head_idx=0,
+            q=(
+                tuple(AP(k, BD.TEMP + k, L) for k in range(16))
+                + tuple(AP(16 + k, BD.TEMP + 16 + k, L) for k in range(16))
+                + (AP(32, BD.MARK_AX, L),)
+                + ax_q_gate
+                + (AP(34, BD.HAS_SE, 500.0), AP(34, BD.CONST, -500.0))
+            ),
+            k=_addr_key_match_writes(BD, L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
+            v=_code_fetch_v_writes(BD),
+            o=(
+                _band_output_writes(BD.FETCH_LO, 32)
+                + _band_output_writes(BD.FETCH_HI, 48)
+            ),
+        ),
+        # Head 1: non-first-step opcode fetch at AX from relayed PC.
+        DeclarativeAttentionHeadSpec(
+            head_idx=1,
+            q=(
+                tuple(AP(k, BD.EMBED_LO + k, L) for k in range(16))
+                + tuple(AP(16 + k, BD.EMBED_HI + k, L) for k in range(16))
+                + (AP(32, BD.MARK_AX, L),)
+                + ax_q_gate
+                + (AP(34, BD.HAS_SE, 500.0), AP(34, BD.CONST, -500.0))
+            ),
+            k=_addr_key_match_writes(BD, L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
+            v=_code_fetch_v_writes(BD),
+            o=(
+                _band_output_writes(BD.OPCODE_BYTE_LO, 32)
+                + _band_output_writes(BD.OPCODE_BYTE_HI, 48)
+            ),
+        ),
+        # Head 2: first-step opcode fetch at PC marker.
+        DeclarativeAttentionHeadSpec(
+            head_idx=2,
+            q=(
+                AP(0, BD.MARK_PC, L),
+                AP(0, BD.HAS_SE, -L),
+                AP(pc_lo, BD.CONST, L),
+                AP(16 + pc_hi, BD.CONST, L),
+                AP(32, BD.MARK_PC, L),
+                *pc_q_gate,
+                AP(34, BD.HAS_SE, -500.0),
+            ),
+            k=_addr_key_match_writes(BD, L) + pc_k_gate + (AP(34, BD.CONST, 5.0),),
+            v=_code_fetch_v_writes(BD),
+            o=(
+                _band_output_writes(BD.OPCODE_BYTE_LO, 32)
+                + _band_output_writes(BD.OPCODE_BYTE_HI, 48)
+            ),
+        ),
+        # Head 3: dynamic immediate fetch at PC marker.
+        DeclarativeAttentionHeadSpec(
+            head_idx=3,
+            q=(
+                tuple(AP(k, BD.FETCH_LO + k, L) for k in range(16))
+                + tuple(AP(16 + k, BD.FETCH_HI + k, L) for k in range(16))
+                + (AP(32, BD.MARK_PC, L),)
+                + pc_q_gate
+            ),
+            k=_addr_key_match_writes(BD, L) + pc_k_gate,
+            v=_code_fetch_v_writes(BD),
+            o=(
+                _band_output_writes(BD.FETCH_LO, 32, 40.0)
+                + _band_output_writes(BD.FETCH_HI, 48, 40.0)
+            ),
+        ),
+        # Head 4: first-step opcode fetch at AX marker.
+        DeclarativeAttentionHeadSpec(
+            head_idx=4,
+            q=(
+                AP(0, BD.MARK_AX, L),
+                AP(0, BD.HAS_SE, -L),
+                AP(pc_lo, BD.CONST, L),
+                AP(16 + pc_hi, BD.CONST, L),
+                AP(32, BD.MARK_AX, L),
+                *ax_q_gate,
+                AP(34, BD.HAS_SE, -500.0),
+            ),
+            k=_addr_key_match_writes(BD, L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
+            v=_code_fetch_v_writes(BD),
+            o=(
+                _band_output_writes(BD.OPCODE_BYTE_LO, 32)
+                + _band_output_writes(BD.OPCODE_BYTE_HI, 48)
+            ),
+        ),
+        # Head 5: non-first-step opcode fetch at PC marker.
+        DeclarativeAttentionHeadSpec(
+            head_idx=5,
+            q=(
+                tuple(AP(k, BD.EMBED_LO + k, L) for k in range(16))
+                + tuple(AP(16 + k, BD.EMBED_HI + k, L) for k in range(16))
+                + (AP(32, BD.MARK_PC, L),)
+                + pc_q_gate
+                + (AP(34, BD.HAS_SE, 500.0), AP(34, BD.CONST, -500.0))
+            ),
+            k=_addr_key_match_writes(BD, L) + pc_k_gate + (AP(34, BD.CONST, 5.0),),
+            v=_code_fetch_v_writes(BD),
+            o=(
+                _band_output_writes(BD.OPCODE_BYTE_LO, 32)
+                + _band_output_writes(BD.OPCODE_BYTE_HI, 48)
+            ),
+        ),
+    ]
+
+    return tuple(specs)
 
 
 def make_layer5_fetch_dep_anchor_op() -> Operation:
@@ -116,7 +277,8 @@ def make_layer5_fetch_dep_anchor_op() -> Operation:
                 "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
         kind="attn",
         bake_fn=bake,
-        declarative_authority="declarative",
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests=set(),
         spec_section=None,
     )
@@ -152,10 +314,117 @@ def make_opcode_decode_ffn_op() -> Operation:
         kind="block",
         layer_idx=5,
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
+
+
+def _bake_opcode_decode_ffn(ffn, S, BD):
+    """Declarative L5 FFN spec: opcode-byte one-hot decode."""
+
+    from ...embedding import Opcode
+
+    unit = 0
+    opcodes = [
+        (Opcode.LEA, 0, 0),
+        (Opcode.IMM, 1, 0),
+        (Opcode.JMP, 2, 0),
+        (Opcode.JSR, 3, 0),
+        (Opcode.BZ, 4, 0),
+        (Opcode.BNZ, 5, 0),
+        (Opcode.ENT, 6, 0),
+        (Opcode.ADJ, 7, 0),
+        (Opcode.LEV, 8, 0),
+        (Opcode.LI, 9, 0),
+        (Opcode.LC, 10, 0),
+        (Opcode.SI, 11, 0),
+        (Opcode.SC, 12, 0),
+        (Opcode.PSH, 13, 0),
+        (Opcode.OR, 14, 0),
+        (Opcode.XOR, 15, 0),
+        (Opcode.AND, 0, 1),
+        (Opcode.EQ, 1, 1),
+        (Opcode.NE, 2, 1),
+        (Opcode.LT, 3, 1),
+        (Opcode.GT, 4, 1),
+        (Opcode.LE, 5, 1),
+        (Opcode.GE, 6, 1),
+        (Opcode.SHL, 7, 1),
+        (Opcode.SHR, 8, 1),
+        (Opcode.ADD, 9, 1),
+        (Opcode.SUB, 10, 1),
+        (Opcode.MUL, 11, 1),
+        (Opcode.DIV, 12, 1),
+        (Opcode.MOD, 13, 1),
+        (Opcode.EXIT, 6, 2),
+        (Opcode.NOP, 7, 2),
+        (Opcode.PUTCHAR, 1, 4),
+        (Opcode.GETCHAR, 0, 4),
+    ]
+    for op_val, lo, hi in opcodes:
+        ffn.W_up.data[unit, BD.OPCODE_BYTE_LO + lo] = S
+        ffn.W_up.data[unit, BD.OPCODE_BYTE_HI + hi] = S
+        ffn.b_up.data[unit] = -S * 1.5
+        ffn.W_gate.data[unit, BD.MARK_AX] = 1.0
+        ffn.W_down.data[BD.opcode_dim(op_val), unit] = 10.0 / S
+        unit += 1
+
+    first_step_opcodes = [
+        (2, 0, BD.OP_JMP),
+        (3, 0, BD.TEMP + 0),
+        (1, 0, BD.OP_IMM),
+        (0, 0, BD.OP_LEA),
+        (6, 2, BD.OP_EXIT),
+        (7, 2, BD.OP_NOP),
+        (9, 1, BD.OP_ADD),
+        (10, 1, BD.OP_SUB),
+        (11, 1, BD.OP_MUL),
+        (12, 1, BD.OP_DIV),
+        (13, 1, BD.OP_MOD),
+        (14, 0, BD.OP_OR),
+        (15, 0, BD.OP_XOR),
+        (0, 1, BD.OP_AND),
+        (1, 1, BD.OP_EQ),
+        (3, 1, BD.OP_LT),
+        (7, 1, BD.OP_SHL),
+        (8, 1, BD.OP_SHR),
+    ]
+    for lo, hi, out_dim in first_step_opcodes:
+        ffn.W_up.data[unit, BD.OPCODE_BYTE_LO + lo] = S
+        ffn.W_up.data[unit, BD.OPCODE_BYTE_HI + hi] = S
+        ffn.W_up.data[unit, BD.MARK_PC] = S
+        ffn.W_up.data[unit, BD.HAS_SE] = -S
+        ffn.b_up.data[unit] = -S * 2.5
+        ffn.b_gate.data[unit] = 1.0
+        ffn.W_down.data[out_dim, unit] = 10.0 / S
+        unit += 1
+
+    for k in range(32):
+        if k == 0:
+            unit += 1
+            continue
+        ffn.W_up.data[unit, BD.MARK_PC] = S
+        ffn.b_up.data[unit] = -S * 0.5
+        ffn.W_gate.data[unit, BD.TEMP + k] = -1.0
+        ffn.W_down.data[BD.TEMP + k, unit] = 2.0 / S
+        unit += 1
+
+    for op_val, lo, hi in (
+        (Opcode.BZ, 4, 0),
+        (Opcode.BNZ, 5, 0),
+        (Opcode.LEV, 8, 0),
+        (Opcode.EXIT, 6, 2),
+        (Opcode.JMP, 2, 0),
+    ):
+        ffn.W_up.data[unit, BD.OPCODE_BYTE_LO + lo] = S
+        ffn.W_up.data[unit, BD.OPCODE_BYTE_HI + hi] = S
+        ffn.W_up.data[unit, BD.MARK_PC] = S
+        ffn.b_up.data[unit] = -S * 2.5
+        ffn.b_gate.data[unit] = 1.0
+        ffn.W_down.data[BD.opcode_dim(op_val), unit] = 10.0 / S
+        unit += 1
 
 
 def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
@@ -182,8 +451,8 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
                 "TEMP"},
         kind="ffn",
         bake_fn=bake,
-        declarative_authority="declarative",
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests=set(),
         spec_section=None,
     )
-

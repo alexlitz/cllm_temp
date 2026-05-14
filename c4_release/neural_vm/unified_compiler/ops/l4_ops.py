@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -16,10 +17,11 @@ def make_layer4_pc_relay_op() -> Operation:
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer4_pc_relay
         attn = block.attn
+        proxy = _as_setdim_proxy(dim_positions)
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer4_pc_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+        _set_layer4_pc_relay(attn, S, proxy, HD)
 
     # Dim-ownership claims: L4 attn heads 0 + 1 PC relay.
     #   Head 0: V slots 1..32 read EMBED_LO/HI → EMBED_LO/HI at AX marker.
@@ -38,11 +40,61 @@ def make_layer4_pc_relay_op() -> Operation:
         writes={"EMBED_LO", "EMBED_HI"},  # at AX marker
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=4,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _layer4_pc_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Declarative L4 heads 0-1: PC marker relay to AX marker/bytes."""
+
+    L = 15.0
+    AX_I = 1
+    return (
+        DeclarativeAttentionHeadSpec(
+            head_idx=0,
+            q=(
+                AP(0, BD.MARK_AX, L),
+                AP(33, BD.MARK_AX, L),
+                AP(33, BD.CONST, -L / 2),
+            ),
+            k=(AP(0, BD.MARK_PC, L), AP(33, BD.CONST, L)),
+            v=(
+                tuple(AP(1 + k, BD.EMBED_LO + k, 1.0) for k in range(16))
+                + tuple(AP(17 + k, BD.EMBED_HI + k, 1.0) for k in range(16))
+            ),
+            o=(
+                tuple(AO(BD.EMBED_LO + k, 1 + k, 1.0) for k in range(16))
+                + tuple(AO(BD.EMBED_HI + k, 17 + k, 1.0) for k in range(16))
+            ),
+        ),
+        DeclarativeAttentionHeadSpec(
+            head_idx=1,
+            q=(
+                AP(0, BD.IS_BYTE, L),
+                AP(0, BD.H1 + AX_I, L),
+                AP(0, BD.CONST, -L * 1.5),
+                AP(33, BD.IS_BYTE, 500.0),
+                AP(33, BD.CONST, -500.0),
+            ),
+            k=(
+                AP(0, BD.MARK_PC, L),
+                AP(0, BD.CONST, L * 0.5),
+                AP(33, BD.CONST, 5.0),
+            ),
+            v=(
+                tuple(AP(1 + k, BD.EMBED_LO + k, 1.0) for k in range(16))
+                + tuple(AP(17 + k, BD.EMBED_HI + k, 1.0) for k in range(16))
+            ),
+            o=(
+                tuple(AO(BD.TEMP + k, 1 + k, 1.0) for k in range(16))
+                + tuple(AO(BD.TEMP + 16 + k, 17 + k, 1.0) for k in range(16))
+            ),
+        ),
     )
 
 
@@ -65,6 +117,7 @@ def make_layer4_ffn_op() -> Operation:
         writes={"FETCH_LO", "FETCH_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         layer_idx=4,
         migrated=True,
         # ``_set_layer4_ffn`` writes the PC+1 (lo/hi/carry = 64 units) +
@@ -74,6 +127,69 @@ def make_layer4_ffn_op() -> Operation:
         ffn_units_used=544,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _bake_layer4_ffn(ffn, S, BD):
+    """Declarative L4 FFN spec: PC+1/2/3/4 fetch-address rotations."""
+
+    unit = 0
+
+    unit = Primitives.nibble_rotation_chain(
+        ffn,
+        unit=unit,
+        gate_marker=BD.MARK_AX,
+        source_lo_dim=BD.EMBED_LO,
+        source_hi_dim=BD.EMBED_HI,
+        target_lo_dim=BD.TEMP,
+        target_hi_dim=BD.TEMP + 16,
+        offset=1,
+        with_carry=True,
+        S=S,
+        magnitude=2.0,
+    )
+
+    # Preserve unit numbering from the legacy helper: TEMP[0] is reserved for
+    # IS_JSR, so its clearing unit remains an empty placeholder.
+    for k in range(32):
+        if k == 0:
+            unit += 1
+            continue
+        ffn.W_up.data[unit, BD.MARK_PC] = S
+        ffn.b_up.data[unit] = -S * 0.5
+        ffn.W_gate.data[unit, BD.TEMP + k] = -1.0
+        ffn.W_down.data[BD.TEMP + k, unit] = 2.0 / S
+        unit += 1
+
+    AX_I = 1
+    for byte_idx in range(3):
+        unit = Primitives.nibble_rotation_chain(
+            ffn,
+            unit=unit,
+            gate_marker=BD.IS_BYTE,
+            source_lo_dim=BD.TEMP,
+            source_hi_dim=BD.TEMP + 16,
+            target_lo_dim=BD.FETCH_LO,
+            target_hi_dim=BD.FETCH_HI,
+            offset=byte_idx + 2,
+            with_carry=True,
+            S=S,
+            magnitude=2.0,
+            condition_dims=[BD.H1 + AX_I, BD.BYTE_INDEX_0 + byte_idx],
+        )
+
+    Primitives.nibble_rotation_chain(
+        ffn,
+        unit=unit,
+        gate_marker=BD.MARK_PC,
+        source_lo_dim=BD.EMBED_LO,
+        source_hi_dim=BD.EMBED_HI,
+        target_lo_dim=BD.FETCH_LO,
+        target_hi_dim=BD.FETCH_HI,
+        offset=1,
+        with_carry=True,
+        S=S,
+        magnitude=2.0,
     )
 
 
@@ -193,6 +309,7 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         writes={"ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},  # = ADDR_KEY band
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake if not enable else None,
         layer_idx=4,
         migrated=True,
         claims=_claims,

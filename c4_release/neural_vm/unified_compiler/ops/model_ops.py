@@ -1,6 +1,7 @@
 """Model-level and post-pass op factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
 from .shared import _as_setdim_proxy, setup_token_embeddings, setup_head_weights
 
@@ -198,11 +199,83 @@ def make_opcode_relay_head_op() -> Operation:
         kind="model",
         layer_idx=6,
         bake_fn=bake,
+        declarative_bake_fn=bake,
         phase=1002,
         migrated=True,
         alibi_slopes={6: 5.0, 7: 5.0},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
+    )
+
+
+def _opcode_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L6 head 6: relay opcode flags from AX to active markers."""
+
+    L = 50.0
+    SP_I = 2
+    BP_I = 3
+    pop_op_dims = (
+        BD.OP_ADD,
+        BD.OP_SUB,
+        BD.OP_MUL,
+        BD.OP_DIV,
+        BD.OP_MOD,
+        BD.OP_EQ,
+        BD.OP_NE,
+        BD.OP_LT,
+        BD.OP_GT,
+        BD.OP_LE,
+        BD.OP_GE,
+        BD.OP_OR,
+        BD.OP_XOR,
+        BD.OP_AND,
+        BD.OP_SHL,
+        BD.OP_SHR,
+        BD.OP_SI,
+        BD.OP_SC,
+    )
+    v = [
+        AP(1, BD.OP_PSH, 0.2),
+        AP(2, BD.OP_ADJ, 0.2),
+        AP(4, BD.OP_ENT, 0.2),
+        AP(5, BD.OP_JSR, 0.2),
+        AP(6, BD.OP_SI, 0.2),
+        AP(6, BD.OP_SC, 0.2),
+        AP(6, BD.OP_PSH, 0.2),
+        AP(6, BD.OP_JSR, 0.2),
+        AP(6, BD.OP_ENT, 0.2),
+        AP(7, BD.OP_SI, 0.2),
+        AP(7, BD.OP_SC, 0.2),
+        AP(0, BD.OP_LEV, 0.1),
+    ]
+    v.extend(AP(3, op_dim, 0.04) for op_dim in pop_op_dims)
+    return DeclarativeAttentionHeadSpec(
+        head_idx=6,
+        q=(
+            AP(0, BD.MARK_SP, L),
+            AP(0, BD.H1 + SP_I, L),
+            AP(0, BD.MARK_STACK0, L),
+            AP(0, BD.L1H4 + BP_I, L),
+            AP(0, BD.MARK_BP, L),
+            AP(0, BD.MARK_PC, L),
+            AP(0, BD.MARK_MEM, L),
+            AP(0, BD.MARK_AX, -L),
+        ),
+        k=(AP(0, BD.MARK_AX, L),),
+        v=tuple(v),
+        o=(
+            AO(BD.CMP + 0, 1, 1.0),
+            AO(BD.PSH_AT_SP, 1, 1.0),
+            AO(BD.CMP + 1, 2, 1.0),
+            AO(BD.CMP + 3, 3, 5.0),
+            AO(BD.CMP + 2, 4, 1.0),
+            AO(BD.CMP + 4, 5, 1.0),
+            AO(BD.OP_JSR, 5, 5.0),
+            AO(BD.OP_ENT, 4, 5.0),
+            AO(BD.MEM_STORE, 6, 1.0),
+            AO(BD.MEM_ADDR_SRC, 7, 1.0),
+            AO(BD.OP_LEV, 0, 10.0),
+        ),
     )
 
 
@@ -276,8 +349,10 @@ def make_residual_alibi_slopes_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=_bake,
+        declarative_bake_fn=_bake,
         phase=999,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#the-attention-layer",
     )
@@ -550,8 +625,10 @@ def make_right_size_ffns_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         phase=1200,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests=set(),
         spec_section=None,
     )
@@ -569,8 +646,10 @@ def make_expand_wrapper_blocks_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         phase=1300,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests=set(),
         spec_section=None,
     )
@@ -591,6 +670,7 @@ def make_head_bake_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=_bake,
+        declarative_bake_fn=_bake,
         phase=1000,
         declarative_authority="declarative",
         smoke_tests={"all"},
@@ -614,6 +694,7 @@ def make_embedding_bake_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=_bake,
+        declarative_bake_fn=_bake,
         phase=1001,
         declarative_authority="declarative",
         smoke_tests={"all"},
@@ -670,6 +751,7 @@ def make_initial_pc_bake_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=_bake,
+        declarative_bake_fn=_bake,
         phase=1001.5,
         declarative_authority="declarative",
         smoke_tests={"all"},
@@ -704,8 +786,10 @@ def make_contract_validation_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=_bake,
+        declarative_bake_fn=_bake,
         phase=1199,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests=set(),
         spec_section=None,
     )

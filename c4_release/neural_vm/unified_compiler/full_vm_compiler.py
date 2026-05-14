@@ -39,7 +39,13 @@ import tempfile
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
-from .layer_compiler import LayerCompiler, ModelLayout, build_model_from_layout
+from .layer_compiler import (
+    LayerCompiler,
+    ModelLayout,
+    build_model_from_layout,
+    dispatch_operation_bake,
+    validate_declarations_only_ops,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -57,6 +63,7 @@ class DeclarativeBakeAuthorityReport:
     """Diagnostic report for the authoritative declarative-bake gate."""
 
     legacy_model_ops: Sequence[str]
+    legacy_wrapper_ops: Sequence[str]
     non_migrated_layer_ops: Sequence[str]
     non_migrated_block_ops: Sequence[str]
     unowned_wrapper_model_ops: Sequence[str]
@@ -65,6 +72,7 @@ class DeclarativeBakeAuthorityReport:
     def ok(self) -> bool:
         return not (
             self.legacy_model_ops
+            or self.legacy_wrapper_ops
             or self.non_migrated_layer_ops
             or self.non_migrated_block_ops
             or self.unowned_wrapper_model_ops
@@ -79,6 +87,7 @@ class DeclarativeBakeAuthorityReport:
         ]
         sections = [
             ("legacy model ops", self.legacy_model_ops),
+            ("legacy wrapper ops", self.legacy_wrapper_ops),
             ("non-migrated layer ops", self.non_migrated_layer_ops),
             ("non-migrated block ops", self.non_migrated_block_ops),
             ("unowned wrapper/model bakes", self.unowned_wrapper_model_ops),
@@ -98,13 +107,17 @@ def _env_flag_enabled(name: str) -> bool:
     return value is not None and value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
-def _is_unowned_wrapper_model_op(name: str) -> bool:
+_AUTHORITATIVE_DECLARATIVE_SOURCES = frozenset({
+    "declarative",
+    "spec_generated",
+    "structural_model",
+    "topology_anchor",
+})
+
+
+def _looks_like_wrapper_model_op(name: str) -> bool:
     lowered = name.lower()
-    return (
-        "wrapper" in lowered
-        or "wrap" in lowered
-        or lowered == "expand_wrapper_blocks"
-    )
+    return "wrapper" in lowered or "wrap" in lowered
 
 
 def inspect_declarative_bake_authority(
@@ -115,10 +128,20 @@ def inspect_declarative_bake_authority(
     This is intentionally conservative and diagnostic-only by default. The
     gate treats ``legacy_bake`` as a hard blocker, any non-migrated per-layer
     or block op as still relying on skipped/legacy ownership, and wrapper
-    model ops as still structurally unowned by declarative per-layer bakes.
+    model ops as still structurally unowned unless they carry an explicit
+    compiler-owned authority marker. Explicit legacy wrappers are always
+    blockers, regardless of their name.
     """
     legacy_model_ops = sorted(
         op.name for op in layout.model_ops if op.name == "legacy_bake"
+    )
+    all_ops = [
+        *(op for ops_at_layer in layout.ops_per_layer for op in ops_at_layer),
+        *layout.block_ops,
+        *layout.model_ops,
+    ]
+    legacy_wrapper_ops = sorted(
+        op.name for op in all_ops if op.declarative_authority == "legacy_wrapper"
     )
     non_migrated_layer_ops = sorted({
         op.name
@@ -132,10 +155,14 @@ def inspect_declarative_bake_authority(
     unowned_wrapper_model_ops = sorted(
         op.name
         for op in layout.model_ops
-        if _is_unowned_wrapper_model_op(op.name)
+        if (
+            _looks_like_wrapper_model_op(op.name)
+            and op.declarative_authority not in _AUTHORITATIVE_DECLARATIVE_SOURCES
+        )
     )
     return DeclarativeBakeAuthorityReport(
         legacy_model_ops=legacy_model_ops,
+        legacy_wrapper_ops=legacy_wrapper_ops,
         non_migrated_layer_ops=non_migrated_layer_ops,
         non_migrated_block_ops=non_migrated_block_ops,
         unowned_wrapper_model_ops=unowned_wrapper_model_ops,
@@ -367,6 +394,7 @@ def compile_full_vm(
     disk_cache: bool = True,
     use_dynamic_ffn: bool = True,
     require_declarative_bake: Optional[bool] = None,
+    declarations_only: bool = False,
 ):
     """Compile and bake a full Neural VM model via the compiler.
 
@@ -408,6 +436,11 @@ def compile_full_vm(
             When true, compile fails before model bake if the layout still
             contains ``legacy_bake``, non-migrated layer/block ops, or wrapper
             model bakes that are not owned by declarative per-layer ops.
+        declarations_only: opt-in prototype runner for the end-state bake.
+            When true, compile refuses to call imperative ``Operation.bake_fn``
+            bodies and only dispatches ``declarative_bake_fn`` generators (plus
+            no-op topology anchors). This also enforces declarative authority
+            and bypasses the disk cache so unsupported ops are visible.
 
     Returns:
         (model, layout) where:
@@ -416,6 +449,8 @@ def compile_full_vm(
     """
     if require_declarative_bake is None:
         require_declarative_bake = _env_flag_enabled(_REQUIRE_DECLARATIVE_BAKE_ENV)
+    if declarations_only:
+        require_declarative_bake = True
 
     kwargs_snapshot = {
         "S": S,
@@ -429,7 +464,7 @@ def compile_full_vm(
         "pin_io_only": pin_io_only,
     }
     cache_path = None
-    if disk_cache and not require_declarative_bake:
+    if disk_cache and not require_declarative_bake and not declarations_only:
         cache_path = _cache_dir() / f"{_cache_key(kwargs_snapshot)}.pt"
         cached = _try_load_cached(cache_path, kwargs_snapshot)
         if cached is not None:
@@ -559,41 +594,63 @@ def compile_full_vm(
     # their bakes run on the freshly-built model before set_vm_weights edits.
     # Block ops with migrated=True are dispatched similarly.
     import torch as _torch
+    per_layer_dispatch = [
+        (layer_idx, op)
+        for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer)
+        for op in ops_at_layer
+        if op.migrated
+    ]
+    block_dispatch = [
+        op for op in sorted(
+            layout.block_ops,
+            key=lambda o: (layout.resolve_block_op_layer(o), o.phase or 0),
+        )
+        if op.migrated
+    ]
+    model_dispatch = sorted(layout.model_ops, key=lambda o: (o.phase or 0))
+    if declarations_only:
+        validate_declarations_only_ops(
+            [op for _, op in per_layer_dispatch]
+            + block_dispatch
+            + model_dispatch
+        )
+
     with _torch.no_grad():
         # Migrated per-layer ops fire before block/model ops.
-        for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer):
+        for layer_idx, op in per_layer_dispatch:
             block = model.blocks[layer_idx]
-            for op in ops_at_layer:
-                if not op.migrated:
-                    continue
-                if op.kind == "attn":
-                    target = block.attn
-                elif op.kind == "ffn":
-                    target = block.ffn
-                else:
-                    raise ValueError(
-                        f"Op {op.name!r} in ops_per_layer has kind={op.kind!r}; "
-                        "expected 'attn' or 'ffn'"
-                    )
-                op.bake_fn(target, layout.dim_positions, S)
+            if op.kind == "attn":
+                target = block.attn
+            elif op.kind == "ffn":
+                target = block.ffn
+            else:
+                raise ValueError(
+                    f"Op {op.name!r} in ops_per_layer has kind={op.kind!r}; "
+                    "expected 'attn' or 'ffn'"
+                )
+            dispatch_operation_bake(
+                op, target, layout.dim_positions, S,
+                declarations_only=declarations_only,
+            )
 
         # Migrated block ops fire before model ops (which include legacy_bake).
         # `_n_layers_hint` lets block bake_fns gate on total layer count (e.g.
         # the L15 attention resize only fires for >=17-layer models).
         # Block op binding via target_op_name (resolved from layout) takes
         # precedence over the legacy layer_idx field.
-        for op in sorted(
-            layout.block_ops,
-            key=lambda o: (layout.resolve_block_op_layer(o), o.phase or 0),
-        ):
-            if not op.migrated:
-                continue
+        for op in block_dispatch:
             block = model.blocks[layout.resolve_block_op_layer(op)]
             block._n_layers_hint = len(model.blocks)
-            op.bake_fn(block, layout.dim_positions, S)
+            dispatch_operation_bake(
+                op, block, layout.dim_positions, S,
+                declarations_only=declarations_only,
+            )
 
-        for op in sorted(layout.model_ops, key=lambda o: (o.phase or 0)):
-            op.bake_fn(model, layout.dim_positions, S)
+        for op in model_dispatch:
+            dispatch_operation_bake(
+                op, model, layout.dim_positions, S,
+                declarations_only=declarations_only,
+            )
 
     if cache_path is not None:
         _try_save_cached(cache_path, model, layout, kwargs_snapshot)

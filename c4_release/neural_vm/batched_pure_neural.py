@@ -151,7 +151,6 @@ class _ElementState:
     recent_rejections: deque = field(
         default_factory=lambda: deque(maxlen=_ADAPTIVE_WINDOW)
     )
-
     def exec_pc(self) -> int:
         return PC_OFFSET if self.last_pc is None else self.last_pc
 

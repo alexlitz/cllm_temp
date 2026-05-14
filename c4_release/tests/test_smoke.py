@@ -33,14 +33,13 @@ Batched wiring (2026-05-12, branch ``batch-smoke-tests-via-fixture``):
     Equivalence with the serial path is preserved because every batch element
     runs through the same compiled neural model as ``quick_runner``; see
     ``c4_release/neural_vm/batched_pure_neural.py`` for the per-element state
-    machine. Tests with custom assertions (e.g. ``result != 0``,
-    ``result == 42 or result == 0``) keep those checks intact via per-entry
-    ``check`` callables.
+    machine. Tests with custom assertions (e.g. ``result != 0``) keep those
+    checks intact via per-entry ``check`` callables.
 
 Tuning knobs:
-    C4_SMOKE_SPEC_K — DraftVM speculation horizon in VM steps (default 8;
-                      0 disables speculation and falls back to one-token-
-                      per-forward batched decode).
+    C4_SMOKE_SPEC_K — DraftVM speculation horizon in VM steps (default 0 for
+                      neural-authoritative smoke; set >0 only for speculative
+                      performance experiments).
     C4_SMOKE_MAX_STEPS_CAP — override the per-program ``max_steps`` cap
                       (default: use the per-test's own ``max_steps`` value).
                       Useful for stress-testing edge cases.
@@ -112,14 +111,6 @@ def _eq(expected):
     """Build an equality-check function for the common ``result == X`` case."""
     def check(result, _expected=expected):
         assert result == _expected, f"expected {_expected}, got {result}"
-    return check
-
-
-def _eq_or(*allowed):
-    """Build a multi-value check function (used by control-flow smoke tests
-    that accept either the neural-path or fallback value)."""
-    def check(result, _allowed=allowed):
-        assert result in _allowed, f"expected one of {_allowed}, got {result}"
     return check
 
 
@@ -204,8 +195,7 @@ _CF_TESTS = [
             Opcode.EXIT,
         ]),
         "max_steps": 15,
-        # Per the original test: 42 (neural) or 0 (neural-path broken).
-        "check": _eq_or(42, 0),
+        "check": _eq(42),
     },
     {
         "name": "TestSmokeControlFlow::test_bz_branch",
@@ -217,7 +207,7 @@ _CF_TESTS = [
             Opcode.EXIT,
         ]),
         "max_steps": 15,
-        "check": _eq_or(42, 0),
+        "check": _eq(42),
     },
     {
         "name": "TestSmokeControlFlow::test_bnz_branch",
@@ -229,7 +219,7 @@ _CF_TESTS = [
             Opcode.EXIT,
         ]),
         "max_steps": 15,
-        "check": _eq_or(42, 1),
+        "check": _eq(42),
     },
 ]
 
@@ -659,7 +649,7 @@ del _seen, _group, _t
 _ALL_SMOKE_TESTS = [t for group in _SMOKE_GROUPS.values() for t in group]
 
 
-_SMOKE_SPEC_K = int(os.environ.get("C4_SMOKE_SPEC_K", "8"))
+_SMOKE_SPEC_K = int(os.environ.get("C4_SMOKE_SPEC_K", "0"))
 
 
 # =============================================================================
@@ -826,30 +816,6 @@ class TestSmokeControlFlow:
 class TestSmokeFunctionCall:
     """Function call quick checks."""
 
-    # Marked xfail to match the established gate on the same bytecode in
-    # ``tests/test_smoke_pure_neural.py::TestSmokePureNeuralFunctionCall::
-    # test_simple_function`` and the underlying neural path test
-    # ``tests/test_pure_neural_jsr_ent_lev.py::TestPureNeuralJSRLEVSimple::
-    # test_jsr_callee_writes_ax``. Both gate this exact program with the
-    # documented reason that the LEV neural path
-    # (``_set_layer9_lev_bp_to_pc_relay`` / L15 / L16 lev_routing) does not
-    # restore PC from ``mem[BP+8]`` when the callee body writes AX before
-    # returning; the callee's ``IMM 42`` therefore never reaches the
-    # caller's ``EXIT`` and AX falls back to its default ``0``.
-    # See ``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md`` for the diagnosis trace
-    # (``IMM 7; JSR 2; ENT 0; LEV; EXIT`` produces ``0xf8030063``-style
-    # contamination) and the (still-open) recommendation set for the
-    # L9/L15/L16 LEV pipeline. Leaving the smoke test unmarked caused
-    # this exact program to be promoted from xfail to a hard failure
-    # in the ``test_smoke.py`` batched lane when the latter was added
-    # (commit ``944d5df``) without inheriting the existing xfail markers.
-    @pytest.mark.xfail(
-        reason="Phase 5 LEV-callee-writes-AX: _set_layer9_lev_bp_to_pc_relay "
-               "does not restore PC from mem[BP+8] (matches "
-               "test_smoke_pure_neural::test_simple_function and "
-               "test_pure_neural_jsr_ent_lev::test_jsr_callee_writes_ax xfails)",
-        strict=False,
-    )
     def test_simple_function(self, _smoke_functioncall_results):
         _lookup_and_check(_smoke_functioncall_results, "TestSmokeFunctionCall::test_simple_function")
 

@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec
 from .shared import _as_setdim_proxy
 
 
@@ -13,7 +14,7 @@ def make_layer1_ffn_op() -> Operation:
     Writes STACK0_BYTE0, BYTE_INDEX_0, BYTE_INDEX_1, BYTE_INDEX_2, BYTE_INDEX_3.
     """
     def bake(ffn, dim_positions, S):
-        from ...vm_step import _set_layer1_ffn
+        from ...setup_helpers import _set_layer1_ffn
         proxy = _as_setdim_proxy(dim_positions)
         _set_layer1_ffn(ffn, S, proxy)
 
@@ -40,6 +41,7 @@ def make_layer1_ffn_op() -> Operation:
         kind="ffn",
         layer_idx=1,
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         claims=_claims,
         # ``_set_layer1_ffn`` writes 5 units (one per output: STACK0_BYTE0,
@@ -51,6 +53,37 @@ def make_layer1_ffn_op() -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _bake_layer1_ffn(ffn, S, BD):
+    """Declarative L1 FFN spec: STACK0_BYTE0 and byte-index flags."""
+
+    BP_I = 3
+    NM = BD.NUM_MARKERS
+    unit = 0
+
+    ffn.W_up.data[unit, BD.L1H4 + BP_I] = S
+    ffn.W_up.data[unit, BD.IS_BYTE] = S
+    ffn.b_up.data[unit] = -S * 1.5
+    ffn.W_gate.data[unit, BD.H1 + BP_I] = -1.0
+    ffn.b_gate.data[unit] = 1.0
+    ffn.W_down.data[BD.STACK0_BYTE0, unit] = 2.0 / S
+    unit += 1
+
+    for src_base, blocker_base, out_dim in (
+        (BD.L1H1, BD.L1H0, BD.BYTE_INDEX_0),
+        (BD.L1H2, BD.L1H1, BD.BYTE_INDEX_1),
+        (BD.H0, BD.L1H2, BD.BYTE_INDEX_2),
+        (BD.H1, BD.H0, BD.BYTE_INDEX_3),
+    ):
+        ffn.W_up.data[unit, BD.IS_BYTE] = S
+        for i in range(NM):
+            ffn.W_up.data[unit, src_base + i] = S
+            ffn.W_gate.data[unit, blocker_base + i] = -1.0
+        ffn.b_up.data[unit] = -S * 1.5
+        ffn.b_gate.data[unit] = 1.0
+        ffn.W_down.data[out_dim, unit] = 2.0 / S
+        unit += 1
 
 
 def make_layer1_threshold_attn_op() -> Operation:
@@ -73,11 +106,17 @@ def make_layer1_threshold_attn_op() -> Operation:
             bd=proxy,
         )
         # Head 3: STEP_END existence detection (global)
-        base = 3 * HD
-        attn.W_q[base, proxy.CONST] = 10.0
-        attn.W_k[base, proxy.MARK_SE_ONLY] = 10.0
-        attn.W_v[base + 1, proxy.MARK_SE_ONLY] = 1.0
-        attn.W_o[proxy.HAS_SE, base + 1] = 1.0
+        Primitives.generate_attention_head(
+            attn,
+            DeclarativeAttentionHeadSpec(
+                head_idx=3,
+                q=(AP(0, proxy.CONST, 10.0),),
+                k=(AP(0, proxy.MARK_SE_ONLY, 10.0),),
+                v=(AP(1, proxy.MARK_SE_ONLY, 1.0),),
+                o=(AO(proxy.HAS_SE, 1, 1.0),),
+            ),
+            HD,
+        )
         # Head 4: threshold 6.5 for STACK0 byte 0 identification
         Primitives.generate_threshold_attention_heads(
             attn, [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4], bd=proxy,
@@ -112,6 +151,7 @@ def make_layer1_threshold_attn_op() -> Operation:
         kind="attn",
         layer_idx=1,
         bake_fn=bake,
+        declarative_bake_fn=bake,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},

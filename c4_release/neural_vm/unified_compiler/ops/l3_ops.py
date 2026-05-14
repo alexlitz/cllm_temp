@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec
 from .shared import _as_setdim_proxy
 
 
@@ -69,7 +70,8 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI"},
         kind="ffn",
         bake_fn=bake,
-        declarative_authority="declarative",
+        migrated=True,
+        declarative_authority="topology_anchor",
         smoke_tests=set(),
         spec_section=None,
     )
@@ -100,9 +102,8 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         cf(attn, 2, proxy.MARK_SP, SP_I, SP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
         cf(attn, 3, proxy.MARK_BP, BP_I, BP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
         _set_stack0_carry_attn(attn, 4, HD, BD=proxy)
-        # Heads 5-6: AX_FULL relay + BP→PC for LEV. We replicate the inline
-        # code from the legacy ``_set_layer3_attn`` block here, routing every
-        # dim through ``proxy`` so pin_io_only=True layouts resolve correctly:
+        # Heads 5-6: AX_FULL relay + BP->PC for LEV. Keep this inline to
+        # preserve the legacy slot layout exactly.
         L = 15.0
         base = 5 * HD
         attn.W_q[base, proxy.MARK_AX] = L
@@ -119,7 +120,6 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         attn.W_q[base + GATE, proxy.MARK_AX] = L
         attn.W_q[base + GATE, proxy.CONST] = -L / 2
         attn.W_k[base + GATE, proxy.CONST] = L
-        # Head 6: BP carry to PC marker for LEV return_addr
         base = 6 * HD
         attn.W_q[base, proxy.MARK_PC] = L
         attn.W_q[base, proxy.OP_LEV] = L / 5
@@ -145,7 +145,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
     #   Head 1 (AX): src=EMBED_LO/HI, out=AX_CARRY_LO/HI
     #   Head 2 (SP): src=EMBED_LO/HI, out=EMBED_LO/HI
     #   Head 3 (BP): src=EMBED_LO/HI, out=EMBED_LO/HI
-    #   Head 4 (STACK0): _set_stack0_carry_attn — see helper for details
+    #   Head 4 (STACK0): declarative STACK0_BYTE0 carry head spec below
     #   Head 5 (AX_FULL): inline V[OUTPUT_LO/HI] → AX_FULL_LO/HI
     #   Head 6 (BP→PC LEV): inline V[CLEAN_EMBED_LO/HI] → (out via inline)
     _claims = set()
@@ -176,7 +176,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
-                "AX_FULL_LO", "AX_FULL_HI"},
+                "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         layer_idx=3,
         bake_fn=bake,
@@ -184,6 +184,92 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _stack0_carry_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L3 head 4: previous STACK0 byte0 -> current STACK0 marker."""
+
+    L = 15.0
+    q = [AP(0, BD.MARK_STACK0, L)]
+    k = [AP(0, BD.STACK0_BYTE0, L), AP(33, BD.CONST, L)]
+    v = []
+    o = []
+    for k_idx in range(16):
+        v.append(AP(1 + k_idx, BD.EMBED_LO + k_idx, 1.0))
+        v.append(AP(17 + k_idx, BD.EMBED_HI + k_idx, 1.0))
+        o.append(AO(BD.EMBED_LO + k_idx, 1 + k_idx, 1.0))
+        o.append(AO(BD.EMBED_HI + k_idx, 17 + k_idx, 1.0))
+    for k_idx in range(1, 16):
+        o.append(AO(BD.OUTPUT_LO + k_idx, 1 + k_idx, 1.0))
+        o.append(AO(BD.OUTPUT_HI + k_idx, 17 + k_idx, 1.0))
+    q.append(AP(33, BD.MARK_STACK0, L))
+    q.append(AP(33, BD.CONST, -L / 2))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=4,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+    )
+
+
+def _ax_full_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L3 head 5: current AX output byte -> AX_FULL."""
+
+    L = 15.0
+    GATE = 33
+    q = [
+        AP(0, BD.MARK_AX, L),
+        AP(0, BD.HAS_SE, L),
+        AP(0, BD.CONST, -L * 1.5),
+        AP(GATE, BD.MARK_AX, L),
+        AP(GATE, BD.CONST, -L / 2),
+    ]
+    k = [AP(0, BD.MARK_AX, L), AP(GATE, BD.CONST, L)]
+    v = []
+    o = []
+    for k_idx in range(16):
+        v.append(AP(1 + k_idx, BD.OUTPUT_LO + k_idx, 1.0))
+        v.append(AP(17 + k_idx, BD.OUTPUT_HI + k_idx, 1.0))
+        o.append(AO(BD.AX_FULL_LO + k_idx, 1 + k_idx, 1.0))
+        o.append(AO(BD.AX_FULL_HI + k_idx, 17 + k_idx, 1.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=5,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+    )
+
+
+def _lev_bp_to_pc_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L3 head 6: BP byte carry source for LEV return address."""
+
+    L = 15.0
+    BP_I = 3
+    GATE = 33
+    q = [
+        AP(0, BD.MARK_PC, L),
+        AP(0, BD.OP_LEV, L / 5),
+        AP(0, BD.CONST, -L * 1.5),
+        AP(GATE, BD.MARK_PC, L),
+        AP(GATE, BD.CONST, -L / 2),
+    ]
+    k = [
+        AP(0, BD.L1H1 + BP_I, L),
+        AP(0, BD.L1H0 + BP_I, -L),
+        AP(GATE, BD.CONST, L),
+    ]
+    v = []
+    for k_idx in range(16):
+        v.append(AP(1 + k_idx, BD.CLEAN_EMBED_LO + k_idx, 1.0))
+        v.append(AP(17 + k_idx, BD.CLEAN_EMBED_HI + k_idx, 1.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=6,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
     )
 
 
@@ -227,6 +313,7 @@ def make_layer3_convo_io_state_init_op(
         kind="block",
         layer_idx=3,
         bake_fn=bake,
+        declarative_bake_fn=bake if not enable_conversational_io else None,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
