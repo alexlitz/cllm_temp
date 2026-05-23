@@ -1396,6 +1396,7 @@ class UnifiedVMCompiler:
         """
         HD = self.HD
         L = 15.0
+        PC_I = 0
         MEM_I = 4
         AX_I = 1
         SP_I = 2
@@ -1576,6 +1577,25 @@ class UnifiedVMCompiler:
             # O: cancel L3 default
             attn.W_o.data[BD.OUTPUT_LO + 0, base + 0] = -1.0
             attn.W_o.data[BD.OUTPUT_HI + 0, base + 0] = -1.0
+
+        # Non-MEM target blocker. Source-selection rows can overpower the
+        # original position gate at PC/AX/BP/STACK0 byte positions, which
+        # makes the MEM generator leak OUTPUT into control-flow steps.
+        target_block_s = 2000.0
+        for head in range(8):
+            base = head * HD
+            for dim in (
+                BD.MARK_PC,
+                BD.MARK_AX,
+                BD.MARK_BP,
+                BD.MARK_STACK0,
+                BD.H1 + PC_I,
+                BD.H1 + AX_I,
+                BD.H1 + BP_I,
+                BD.H4 + BP_I,
+            ):
+                attn.W_q.data[base + 38, dim] = -target_block_s
+            attn.W_k.data[base + 38, BD.CONST] = 5.0
 
     def _compile_ffn_layers(self, model):
         """Compile FFN weights for all layers."""
@@ -3518,6 +3538,8 @@ class UnifiedVMCompiler:
         """Compile L15 attention (memory lookup with optional LEV support)."""
         HD = self.HD
         L = 15.0
+        PC_I = 0
+        AX_I = 1
         MEM_I = 4
         BP_I = 3
 
@@ -3543,6 +3565,14 @@ class UnifiedVMCompiler:
             attn.W_q.data[base, BD.MARK_PC] = -25000.0
             attn.W_q.data[base, BD.MARK_SP] = -100000.0
             attn.W_k.data[base, BD.CONST] = 10.0
+            attn.W_q.data[base + 29, BD.H1 + PC_I] = -20000.0
+            attn.W_k.data[base + 29, BD.CONST] = 5.0
+            attn.W_q.data[base + 30, BD.H1 + AX_I] = -20000.0
+            attn.W_k.data[base + 30, BD.CONST] = 5.0
+            attn.W_q.data[base + 31, BD.OP_LI_RELAY] = 20000.0
+            if h == 0:
+                attn.W_q.data[base + 31, BD.OP_LC_RELAY] = 20000.0
+            attn.W_k.data[base + 31, BD.MEM_STORE] = 5.0
 
             # Dim 1: Store anchor
             attn.W_q.data[base + 1, BD.OP_LI_RELAY] = 50.0

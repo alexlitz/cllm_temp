@@ -2,7 +2,7 @@
 
 Measurement of the opt-in `compile_mode="reduce-overhead"` (and other
 `torch.compile` modes) path landed in commit `ce2a704`
-("Add torch.compile support + grouped-GEMM SoftMoE + .item() blockers").
+("Add torch.compile support + grouped-GEMM StandardMoE + .item() blockers").
 
 ## Environment
 
@@ -206,7 +206,7 @@ kernel.
 
 For this model, every block has a different shape, so Inductor must
 codegen 26 distinct Triton kernels per forward. The codegen pass for a
-single complex kernel (multi-head attention + soft-MoE FFN + post-ops
+single complex kernel (multi-head attention + standard MoE FFN + post-ops
 + RMSNorm) is ~10-30 s of CPU compile work, so the full-model compile
 is 5-15 minutes of CPU even before CUDA-graph capture.
 

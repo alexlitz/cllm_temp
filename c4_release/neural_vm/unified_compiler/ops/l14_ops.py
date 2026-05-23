@@ -1,6 +1,8 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -9,7 +11,11 @@ def make_layer14_mem_generation_op() -> Operation:
     def bake(attn, dim_positions, S):
         from ...vm_step import _set_layer14_mem_generation
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer14_mem_generation(attn, S, _as_setdim_proxy(dim_positions), HD)
+        proxy = _as_setdim_proxy(dim_positions)
+        _set_layer14_mem_generation(attn, S, proxy, HD)
+        _clear_l14_mem_generation_overbroad_sp_suppression(attn, proxy, HD)
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes[:8] = 5.0
 
     # Dim-ownership claims: L14 attn 8 heads MEM generation.
     # Each head writes V slots 1..32 reading CLEAN_EMBED + OUTPUT.  For V
@@ -29,13 +35,18 @@ def make_layer14_mem_generation_op() -> Operation:
         reads={"MARK_MEM", "MARK_SP", "MARK_STACK0", "OP_PSH", "OP_SI", "OP_SC",
                "OP_JSR", "OP_ENT", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO", "ADDR_B0_HI",
-               "MEM_STORE", "MEM_ADDR_SRC"},
+               "MEM_STORE", "MEM_ADDR_SRC", "STACK0_BYTE0", "L1H0", "L1H1", "L1H2",
+               "H0", "H1", "L1H4", "H2", "H3", "H4",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3", "IS_BYTE"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
         layer_idx=14,
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
+        alibi_slopes={head: 5.0 for head in range(8)},
         smoke_tests={
             "TestSmokeBasic::test_add_basic",
             "TestSmokeFunctionCall::test_simple_function",
@@ -44,6 +55,277 @@ def make_layer14_mem_generation_op() -> Operation:
         },
         spec_section="BLOG_SPEC.md#memory",
     )
+
+
+def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Relay staged wide-ALU byte 1 from the AX marker to AX byte 0."""
+
+    AX_I = 1
+    q = [
+        AP(0, BD.IS_BYTE, 100.0),
+        AP(0, BD.H1 + AX_I, 100.0),
+        AP(0, BD.BYTE_INDEX_0, 100.0),
+        AP(0, BD.BYTE_INDEX_1, -1000.0),
+        AP(0, BD.BYTE_INDEX_2, -1000.0),
+        AP(0, BD.BYTE_INDEX_3, -1000.0),
+        AP(0, BD.CONST, -250.0),
+        AP(1, BD.IS_BYTE, 100.0),
+        AP(1, BD.H1 + AX_I, 100.0),
+        AP(1, BD.BYTE_INDEX_0, 100.0),
+        AP(1, BD.BYTE_INDEX_1, -1000.0),
+        AP(1, BD.BYTE_INDEX_2, -1000.0),
+        AP(1, BD.BYTE_INDEX_3, -1000.0),
+        AP(1, BD.CONST, -250.0),
+        AP(33, BD.IS_BYTE, 10000.0),
+        AP(33, BD.H1 + AX_I, 10000.0),
+        AP(33, BD.BYTE_INDEX_0, 10000.0),
+        AP(33, BD.BYTE_INDEX_1, -100000.0),
+        AP(33, BD.BYTE_INDEX_2, -100000.0),
+        AP(33, BD.BYTE_INDEX_3, -100000.0),
+        AP(33, BD.CONST, -25000.0),
+        AP(34, BD.OP_LI_RELAY, -10000.0),
+        AP(34, BD.OP_LC_RELAY, -10000.0),
+    ]
+    k = [
+        AP(0, BD.MARK_AX, 100.0),
+        AP(1, BD.OP_MUL, 100.0),
+        AP(1, BD.OP_SHL, 100.0),
+        AP(33, BD.CONST, 5.0),
+        AP(34, BD.CONST, 5.0),
+    ]
+    v = []
+    o = []
+    for idx in range(16):
+        v.append(AP(1 + idx, BD.AX_FULL_LO + idx, 1.0))
+        v.append(AP(17 + idx, BD.AX_FULL_HI + idx, 1.0))
+        o.append(AO(BD.OUTPUT_LO + idx, 1 + idx, 20.0))
+        o.append(AO(BD.OUTPUT_HI + idx, 17 + idx, 20.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=8,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+    )
+
+
+def _layer14_alu_high_byte_relay_ir(dim_positions, HD) -> CompilerIR:
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_layer14_alu_high_byte_relay_spec(BD))
+    return ir
+
+
+def make_layer14_alu_high_byte_relay_op() -> Operation:
+    """L15 attention: relay staged MUL/SHL result byte 1 into AX bytes.
+
+    The wide ALU composites stage result byte 1 in AX_FULL_LO/HI at the AX
+    marker. The autoregressive token stream then needs the following AX byte
+    token to emit that staged byte. This declarative head copies the staged
+    byte from the current step's AX marker to the AX byte-0 query position.
+    It lives in the resized L15 attention block because the base L14 attention
+    has only heads 0-7 occupied by MEM generation.
+    """
+
+    def bake(target, dim_positions, S):
+        del S
+        attn = getattr(target, "attn", target)
+        proxy = _as_setdim_proxy(dim_positions)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        Primitives.generate_attention_head(
+            attn,
+            _layer14_alu_high_byte_relay_spec(proxy),
+            HD,
+        )
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes[8] = 1.0
+
+    _claims = set()
+    for k in range(16):
+        _claims.add((15, "attn_W_v", f"8_{1 + k}", f"AX_FULL_LO+{k}"))
+        _claims.add((15, "attn_W_v", f"8_{17 + k}", f"AX_FULL_HI+{k}"))
+
+    return Operation(
+        name="layer15_alu_high_byte_relay",
+        phase=15.05,
+        reads={"IS_BYTE", "H1", "BYTE_INDEX_0", "MARK_AX", "OP_MUL",
+               "OP_SHL", "OP_LI_RELAY", "OP_LC_RELAY",
+               "AX_FULL_LO", "AX_FULL_HI", "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        layer_idx=15,
+        bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir_factory=_layer14_alu_high_byte_relay_ir,
+        migrated=True,
+        claims=_claims,
+        alibi_slopes={8: 1.0},
+        smoke_tests={
+            "TestSmoke32Bit::test_mul_overflow",
+            "TestSmoke32Bit::test_shl_8bit",
+        },
+        spec_section="BLOG_SPEC.md#wide-alu-byte-relay",
+    )
+
+
+def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
+    """Keep L14 MEM generation live when H1[SP] also fires at MEM positions.
+
+    The legacy helper suppresses queries whenever ``H1[SP]`` is high to avoid
+    early SP-byte pollution. In the strict autoregressive trace, ``H1[SP]`` is
+    also high at the MEM marker, so heads 0-3 select the softmax1 sink instead
+    of the SP marker and emit zero address bytes. The position gate already
+    suppresses non-MEM targets strongly; this removes only the overbroad
+    H1[SP] query penalties.
+    """
+
+    pc_i = 0
+    ax_i = 1
+    sp_i = 2
+    bp_i = 3
+    mem_i = 4
+    for head in range(8):
+        base = head * HD
+        attn.W_q.data[base, BD.H1 + sp_i] = 0.0
+        # MEM_STORE is represented with strength 2 at MEM positions, so the
+        # legacy +/-500 position gate can exactly cancel the +500 MEM_STORE
+        # gate at non-target MEM offsets. Doubling the position gate leaves
+        # target positions at zero net gate but makes non-target heads stay
+        # below the softmax1 sink.
+        attn.W_q.data[base + 33, :] *= 2.0
+        attn.W_q.data[base + 33, BD.H1 + sp_i] = 0.0
+        # L14's sources are the prior SP/AX/STACK0 sections. Once MEM bytes
+        # start emitting, their BYTE_INDEX flags are more recent than the true
+        # sources and can win via ALiBi. Use an otherwise-unused score slot to
+        # exclude the current MEM section as an attention source for every head.
+        attn.W_q.data[base + 35, BD.CONST] = 40.0
+        attn.W_k.data[base + 35, BD.MARK_MEM] = -40.0
+        attn.W_k.data[base + 35, BD.H3 + 4] = -40.0
+
+        # The legacy position gate was calibrated before the stricter
+        # source-bonus rows below. In neural-authoritative smoke, PC/AX/BP
+        # byte queries can still overcome that gate and make MEM generation
+        # write OUTPUT outside the MEM section. Add a separate non-MEM target
+        # blocker that stays inactive at the real MEM addr/value targets.
+        target_block_s = 2000.0
+        for dim in (
+            BD.MARK_PC,
+            BD.MARK_AX,
+            BD.MARK_BP,
+            BD.MARK_STACK0,
+            BD.H1 + pc_i,
+            BD.H1 + ax_i,
+            BD.H1 + bp_i,
+            BD.H4 + bp_i,
+        ):
+            attn.W_q.data[base + 38, dim] = -target_block_s
+        attn.W_k.data[base + 38, BD.CONST] = 5.0
+
+    # Head 0 predicts address byte 0 from the SP marker for PSH. The legacy
+    # source bonus keyed only on H1[SP], which is active on SP byte positions
+    # but not on the SP marker where byte 0's fresh OUTPUT lives.
+    attn.W_k.data[1, BD.MARK_SP] = 45.0
+    # Heads 1-3 can read the already-emitted SP byte tokens directly. The
+    # old shifted-OUTPUT path is fragile in strict neural mode; this bonus is
+    # active only for PSH because Q[base+1] flips negative when MEM_ADDR_SRC=1.
+    # Suppress the BP/STACK0 span on the same source dimension: BYTE_INDEX_*
+    # is deliberately global, and without this guard the nearer STACK0 zero
+    # bytes beat the SP address bytes under ALiBi in strict autoregressive
+    # smoke.
+    for head in range(4):
+        attn.W_k.data[head * HD + 1, BD.H4 + bp_i] = -30.0
+        attn.W_k.data[head * HD + 1, BD.MARK_STACK0] = -30.0
+    for head, byte_dim in (
+        (1, BD.BYTE_INDEX_1),
+        (2, BD.BYTE_INDEX_2),
+        (3, BD.BYTE_INDEX_3),
+    ):
+        # These heads now source the SP/STACK0 byte token directly, so reading
+        # that token's OUTPUT would mix in the source position's prediction for
+        # the following byte (usually the L3 zero default). Keep CLEAN_EMBED as
+        # the only payload source while retaining V[0]'s default cancel.
+        base = head * HD
+        attn.W_v.data[base + 0, BD.CONST] = 1.0
+        for k in range(16):
+            attn.W_v.data[base + 1 + k, BD.OUTPUT_LO + k] = 0.0
+            attn.W_v.data[base + 17 + k, BD.OUTPUT_HI + k] = 0.0
+        attn.W_k.data[head * HD + 1, byte_dim] = 45.0
+
+    # SI/SC addresses must come from the current STACK0 byte tokens directly.
+    # The legacy MEM_ADDR_SRC row selected the preceding byte (and head 0 could
+    # still prefer the STACK0 marker), which is wrong once the current stack
+    # bytes already exist in the autoregressive context. Keep the existing
+    # MEM_ADDR_SRC query row, but retarget its keys to bytes 0..3.
+    si_source_s = 60.0
+    for head in range(4):
+        base = head * HD
+        for dim in (
+            BD.STACK0_BYTE0,
+            BD.H1 + bp_i,
+            BD.L1H4 + bp_i,
+            BD.H2 + bp_i,
+            BD.H3 + bp_i,
+            BD.H4 + bp_i,
+            BD.MARK_STACK0,
+            BD.H1 + ax_i,
+            BD.H1 + sp_i,
+        ):
+            attn.W_k.data[base + 2, dim] = 0.0
+        attn.W_k.data[base + 2, BD.MARK_STACK0] = -si_source_s
+        attn.W_k.data[base + 2, BD.H1 + ax_i] = -si_source_s
+        attn.W_k.data[base + 2, BD.H1 + sp_i] = -si_source_s
+        if head == 0:
+            attn.W_k.data[base + 2, BD.L1H4 + bp_i] = si_source_s
+            attn.W_k.data[base + 2, BD.H1 + bp_i] = -si_source_s
+        elif head == 1:
+            attn.W_k.data[base + 2, BD.H2 + bp_i] = si_source_s
+            attn.W_k.data[base + 2, BD.L1H4 + bp_i] = -si_source_s
+        elif head == 2:
+            attn.W_k.data[base + 2, BD.H3 + bp_i] = si_source_s
+            attn.W_k.data[base + 2, BD.H2 + bp_i] = -si_source_s
+        else:
+            attn.W_k.data[base + 2, BD.H4 + bp_i] = si_source_s
+            attn.W_k.data[base + 2, BD.H3 + bp_i] = -si_source_s
+
+    # Value heads source AX for PSH/SI/SC and STACK0 for JSR/ENT. With the
+    # steeper L14 ALiBi slope, the old H1[AX] bonus is not strong enough to
+    # beat the softmax1 sink from MEM value positions. This score slot makes
+    # the source choice explicit without changing the payload path.
+    source_s = 50.0
+    for head in range(4, 8):
+        base = head * HD
+        # The value heads double the CLEAN_EMBED nibble payload to overcome
+        # downstream defaults. Keep V[0] as a matched cancel so nonzero bytes
+        # beat the L3 zero default while real zero bytes still emit 0.
+        attn.W_v.data[base + 0, BD.CONST] = 2.0
+        for k in range(16):
+            attn.W_v.data[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 2.0
+            attn.W_v.data[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 2.0
+        attn.W_q.data[base + 36, BD.CONST] = source_s
+        attn.W_q.data[base + 36, BD.OP_JSR] = -2.0 * source_s
+        attn.W_q.data[base + 36, BD.OP_ENT] = -2.0 * source_s
+        attn.W_k.data[base + 36, BD.H1 + ax_i] = source_s
+        attn.W_k.data[base + 36, BD.H1 + sp_i] = -source_s
+        attn.W_k.data[base + 36, BD.H4 + bp_i] = -source_s
+        # STACK0 value bytes carry H4[BP], while the STACK0 marker carries
+        # both H4[BP] and MARK_STACK0. For JSR/ENT the query is negative, so
+        # H4[BP]'s negative K makes STACK0 bytes attractive. Give the marker a
+        # matching positive term so it nets to zero instead of winning as a
+        # payload-less source.
+        attn.W_k.data[base + 36, BD.MARK_STACK0] = source_s
+        attn.W_k.data[base + 36, BD.MARK_MEM] = -source_s
+        attn.W_k.data[base + 36, BD.H3 + mem_i] = -source_s
+
+        # PSH store values are sourced from AX. STACK0 is generated later in
+        # the same step and is not authoritative for the MEM value bytes here.
+
+        # SI/SC AX preservation now happens late in L16 before the MEM value
+        # bytes are generated. Keep the source selector byte-indexed on the
+        # current AX bytes; the previous "prefer older AX" penalty makes byte 0
+        # lose to the nearer byte 3 zero under strict neural ALiBi.
+        attn.W_q.data[base + 37, :] = 0.0
+        attn.W_k.data[base + 37, :] = 0.0
 
 
 def make_layer14_temp_clear_op() -> Operation:
@@ -70,6 +352,8 @@ def make_layer14_temp_clear_op() -> Operation:
         writes={"TEMP"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
@@ -102,6 +386,8 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
         writes={"ADDR_KEY"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
         smoke_tests={"all"},
@@ -129,11 +415,13 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         name="layer14_clear_output_corruption",
         phase=14.3,
         reads={"H4", "H1", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
-               "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
-               "BYTE_INDEX_3", "CONST"},
+               "OP_JSR", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
+               "MARK_STACK0", "IS_BYTE", "BYTE_INDEX_3", "PSH_AT_SP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
         smoke_tests={"all"},
@@ -167,6 +455,8 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
@@ -210,6 +500,8 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
@@ -254,21 +546,23 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
     return Operation(
         name="layer14_alu_nocarry_ax_bytes_zero",
         phase=14.8,
-        reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_0", "CONST"},
+        reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
         # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1311
         # after this op runs). The chain is: temp_clear (1 unit) →
-        # clear_addr_key_pollution (48) → clear_output_corruption (2) →
+        # clear_addr_key_pollution (48) → clear_output_corruption (3) →
         # clear_mem_marker_output (64) → addr_key_neural_decode (1184) →
         # jsr_ax_bytes_zero (4) → lc_ax_bytes_zero (4) → this op (4).
         # Annotating only the chain tail with the cumulative max is
         # sufficient — the compiler aggregates per-layer max across all
         # ops, so this single annotation suffices for L14 dynamic sizing.
-        ffn_units_used=1311,
+        ffn_units_used=1312,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",
@@ -321,10 +615,12 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
     return Operation(
         name="layer14_lc_ax_bytes_zero",
         phase=14.7,
-        reads={"OP_LC_RELAY", "IS_BYTE", "H1", "BYTE_INDEX_0", "CONST"},
+        reads={"OP_LC_RELAY", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
         smoke_tests={"TestSmokeMemory::test_sc_lc_roundtrip"},
@@ -514,10 +810,10 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         writes={"ADDR_KEY"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
-
-

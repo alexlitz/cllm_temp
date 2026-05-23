@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -39,11 +40,13 @@ def make_layer7_operand_gather_op() -> Operation:
         name="layer7_operand_gather",
         phase=7,
         reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA", "OP_ADJ", "OP_ENT",
+               "CONST",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "OUTPUT_LO", "OUTPUT_HI"},
         writes={"ALU_LO", "ALU_HI"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer7_operand_gather_ir,
         declarative_authority="spec_generated",
         layer_idx=7,
         migrated=True,
@@ -72,6 +75,13 @@ def make_layer7_operand_gather_op() -> Operation:
     )
 
 
+def _layer7_operand_gather_ir(dim_positions, HD) -> CompilerIR:
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.extend(_layer7_operand_gather_head_specs(BD))
+    return ir
+
+
 def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     """Declarative replacement for ``vm_step._set_layer7_operand_gather``."""
 
@@ -81,8 +91,13 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
     return (
         DeclarativeAttentionHeadSpec(
             head_idx=0,
-            q=(AP(0, BD.MARK_AX, L), AP(0, BD.OP_LEA, -L)),
-            k=(AP(0, BD.STACK0_BYTE0, L),),
+            q=(
+                AP(0, BD.MARK_AX, L),
+                AP(0, BD.OP_LEA, -L),
+                AP(33, BD.MARK_AX, L),
+                AP(33, BD.CONST, -L / 2),
+            ),
+            k=(AP(0, BD.STACK0_BYTE0, L), AP(33, BD.CONST, L)),
             v=(
                 _band_projection_writes(1, BD.CLEAN_EMBED_LO)
                 + _band_projection_writes(17, BD.CLEAN_EMBED_HI)
@@ -150,11 +165,15 @@ def make_layer7_memory_heads_op() -> Operation:
         for k in range(16):
             _claims.add((7, "attn_W_v", f"{h}_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
             _claims.add((7, "attn_W_v", f"{h}_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
-    # Head 5 scalar relays (V slots 1..8 → distinct output dims).
+    # Head 5 scalar relays (V slots 1..13 → distinct output dims).
     _claims.add((7, "attn_W_v", "5_1", "OP_LI+0"))
     _claims.add((7, "attn_W_v", "5_2", "OP_LC+0"))
     _claims.add((7, "attn_W_v", "5_3", "OP_LEA+0"))
     _claims.add((7, "attn_W_v", "5_8", "OP_JSR+0"))
+    _claims.add((7, "attn_W_v", "5_10", "OP_SI+0"))
+    _claims.add((7, "attn_W_v", "5_11", "OP_SC+0"))
+    _claims.add((7, "attn_W_v", "5_12", "OP_ADD+0"))
+    _claims.add((7, "attn_W_v", "5_13", "OP_SUB+0"))
     # Head 7 MEM flag broadcast.
     _claims.add((7, "attn_W_v", "7_1", "MEM_STORE+0"))
     _claims.add((7, "attn_W_v", "7_2", "MEM_ADDR_SRC+0"))
@@ -166,9 +185,9 @@ def make_layer7_memory_heads_op() -> Operation:
         phase=7,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "OP_LI", "OP_LC", "OP_PSH", "OP_SI", "OP_SC",
-               # V7 Block 13 (2026-05-12): head 5 now reads OP_AND/OP_OR/OP_XOR
-               # /OP_SHR for the new V slot 9 (NOCARRY_ALU_OP relay → TEMP[7])
-               # used by ``_set_layer14_alu_nocarry_ax_bytes_zero``.
+               "OP_ADD", "OP_SUB",
+               # Head 5 reads OP_AND/OP_OR/OP_XOR for the bitwise byte
+               # propagation relays and OP_SHR for the byte-zero cleanup relay.
                "OP_AND", "OP_OR", "OP_XOR", "OP_SHR",
                "OP_JSR",  # head 5 V slot 8 (existing, declared for completeness)
                "AX_CARRY_LO", "AX_CARRY_HI", "TEMP"},
@@ -178,16 +197,24 @@ def make_layer7_memory_heads_op() -> Operation:
                 # NOCARRY_ALU_OP relay to TEMP[7]. (TEMP is already in writes
                 # but listed here for clarity.) Head 5 also writes the OP_JSR
                 # relay back to OP_JSR at AX byte positions (added 2026-05-12).
-        "OP_JSR"},
+        "OP_JSR", "OP_SI", "OP_SC"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer7_memory_heads_ir,
         layer_idx=7,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
+
+
+def _layer7_memory_heads_ir(dim_positions, HD) -> CompilerIR:
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.extend(_layer7_memory_head_specs(BD))
+    return ir
 
 
 def _band_projection_writes(slot_base: int, dim_base: int, weight: float = 1.0):
@@ -273,7 +300,7 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
             )
         )
 
-    # Head 5: Relay OP_LI/OP_LC/LEA/bitwise/JSR/no-carry flags from AX marker.
+    # Head 5: Relay OP_LI/OP_LC/LEA/bitwise/JSR/no-carry/add/sub flags from AX marker.
     # The K scale is doubled here to preserve the softmax-sharpness fix that
     # previously ran as a post-helper row multiply in ``bake``.
     specs.append(
@@ -292,10 +319,11 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
                 AP(6, BD.OP_OR, 0.2),
                 AP(7, BD.OP_XOR, 0.2),
                 AP(8, BD.OP_JSR, 0.2),
-                AP(9, BD.OP_AND, 0.2),
-                AP(9, BD.OP_OR, 0.2),
-                AP(9, BD.OP_XOR, 0.2),
                 AP(9, BD.OP_SHR, 0.2),
+                AP(10, BD.OP_SI, 0.2),
+                AP(11, BD.OP_SC, 0.2),
+                AP(12, BD.OP_ADD, 0.2),
+                AP(13, BD.OP_SUB, 0.2),
             ),
             o=(
                 AO(BD.OP_LI_RELAY, 1, 1.0),
@@ -307,6 +335,10 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
                 AO(BD.TEMP + 6, 7, 1.0),
                 AO(BD.OP_JSR, 8, 5.0),
                 AO(BD.TEMP + 7, 9, 1.0),
+                AO(BD.OP_SI, 10, 5.0),
+                AO(BD.OP_SC, 11, 5.0),
+                AO(BD.TEMP + 8, 12, 1.0),
+                AO(BD.TEMP + 9, 13, 1.0),
             ),
         )
     )
@@ -363,14 +395,18 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
     override must apply after them.
     """
     def bake(block, dim_positions, S):
+        del S
         if not enable_conversational_io:
             return
-        from ...vm_step import _set_format_pointer_extraction
         attn = block.attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[7] = 5.0  # steep to attend back to prev step
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_format_pointer_extraction(attn, S, _as_setdim_proxy(dim_positions), HD)
+        Primitives.generate_attention_head(
+            attn,
+            _format_pointer_extraction_spec(_as_setdim_proxy(dim_positions)),
+            HD,
+        )
 
     return Operation(
         name="format_pointer_extraction",
@@ -379,9 +415,40 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
         writes={"FORMAT_PTR_LO", "FORMAT_PTR_HI"},
         kind="block",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_conversational_io else None,
+        declarative_bake_fn=bake,
+        compiler_ir_factory=(
+            _format_pointer_extraction_ir
+            if enable_conversational_io else None
+        ),
+        declarative_authority="spec_generated",
         layer_idx=7,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _format_pointer_extraction_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_format_pointer_extraction_spec(proxy))
+    return ir
+
+
+def _format_pointer_extraction_spec(BD) -> DeclarativeAttentionHeadSpec:
+    L = 20.0
+    v = []
+    o = []
+    for k in range(16):
+        v.append(AP(1 + k, BD.EMBED_LO + k, 1.0))
+        v.append(AP(17 + k, BD.EMBED_HI + k, 1.0))
+        o.append(AO(BD.FORMAT_PTR_LO + k, 1 + k, 1.0))
+        o.append(AO(BD.FORMAT_PTR_HI + k, 17 + k, 1.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=7,
+        q=(AP(0, BD.IO_IN_OUTPUT_MODE, L),),
+        k=(AP(0, BD.MARK_STACK0, L),),
+        v=tuple(v),
+        o=tuple(o),
     )

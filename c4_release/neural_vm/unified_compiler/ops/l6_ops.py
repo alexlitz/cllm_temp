@@ -1,8 +1,1576 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ..layer_compiler import Operation
+from ..ir import FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT = 320
+L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT = 384
+L6_IMM_FETCH_ROUTE_START_UNIT = 0
+L6_IMM_FETCH_ROUTE_END_UNIT = 32
+L6_IMM_CARRY_REFRESH_START_UNIT = 32
+L6_IMM_CARRY_REFRESH_END_UNIT = 64
+L6_EXIT_AX_ROUTE_START_UNIT = 64
+L6_EXIT_AX_ROUTE_END_UNIT = 96
+L6_NOP_AX_ROUTE_START_UNIT = 96
+L6_NOP_AX_ROUTE_END_UNIT = 128
+L6_JSR_AX_ROUTE_START_UNIT = 128
+L6_JSR_AX_ROUTE_END_UNIT = 160
+L6_JMP_AX_ROUTE_START_UNIT = 160
+L6_JMP_AX_ROUTE_END_UNIT = 192
+L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT = 192
+L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT = 256
+L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT = 256
+L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT = 320
+L6_HALT_DETECT_START_UNIT = 384
+L6_HALT_DETECT_END_UNIT = 385
+L6_TEMP_CLEANUP_START_UNIT = 385
+L6_TEMP_CLEANUP_RULE_START_UNIT = 386
+L6_TEMP_CLEANUP_END_UNIT = 417
+L6_CMP3_CLEANUP_START_UNIT = 417
+L6_CMP3_CLEANUP_END_UNIT = 418
+L6_STACK_IDENTITY_START_UNIT = 418
+L6_STACK_IDENTITY_END_UNIT = 514
+L6_PSH_SP_DECREMENT_START_UNIT = 514
+L6_PSH_SP_DECREMENT_END_UNIT = 546
+L6_JSR_SP_DECREMENT_START_UNIT = 546
+L6_JSR_SP_DECREMENT_END_UNIT = 578
+L6_JSR_SP_FIXUP_START_UNIT = 578
+L6_JSR_SP_FIXUP_END_UNIT = 580
+L6_JSR_SP_BYTES_START_UNIT = 580
+L6_JSR_SP_BYTES_END_UNIT = 584
+L6_PSH_STACK0_WRITEBACK_START_UNIT = 584
+L6_PSH_STACK0_WRITEBACK_END_UNIT = 616
+L6_GETCHAR_AX_ROUTE_START_UNIT = 616
+L6_GETCHAR_AX_ROUTE_END_UNIT = 648
+L6_BZ_AX_ROUTE_START_UNIT = 648
+L6_BZ_AX_ROUTE_END_UNIT = 680
+L6_BNZ_AX_ROUTE_START_UNIT = 680
+L6_BNZ_AX_ROUTE_END_UNIT = 712
+L6_PSH_AX_ROUTE_START_UNIT = 712
+L6_PSH_AX_ROUTE_END_UNIT = 744
+L6_ADJ_AX_ROUTE_START_UNIT = 744
+L6_ADJ_AX_ROUTE_END_UNIT = 776
+L6_ADJ_SP_WRITEBACK_START_UNIT = 776
+L6_ADJ_SP_WRITEBACK_END_UNIT = 808
+L6_ENT_SP_WRITEBACK_START_UNIT = 808
+L6_ENT_SP_WRITEBACK_END_UNIT = 840
+L6_ENT_FIRST_STEP_SP_BYTE0_START_UNIT = 840
+L6_ENT_FIRST_STEP_SP_BYTE0_END_UNIT = 872
+L6_ENT_FIRST_STEP_SP_BYTES_START_UNIT = 872
+L6_ENT_FIRST_STEP_SP_BYTES_END_UNIT = 878
+L6_BZ_PC_OVERRIDE_START_UNIT = 878
+L6_BZ_PC_OVERRIDE_END_UNIT = 942
+L6_BNZ_PC_OVERRIDE_START_UNIT = 942
+L6_BNZ_PC_OVERRIDE_END_UNIT = 1070
+L6_OPCODE_CONTAMINATION_CLEANUP_START_UNIT = 1070
+L6_OPCODE_CONTAMINATION_CLEANUP_END_UNIT = 1102
+L6_MEM_LEAKAGE_CLEANUP_START_UNIT = 1102
+L6_MEM_LEAKAGE_CLEANUP_END_UNIT = 1104
+L6_ALU_CLEAR_START_UNIT = 1104
+L6_ALU_CLEAR_END_UNIT = 1136
+L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2200
+L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2232
+
+
+def _clear_ffn_unit_band(ffn, start: int, end: int) -> None:
+    """Clear one hidden-unit band before an IR lowering claims it."""
+
+    ffn.W_up.data[start:end, :] = 0
+    ffn.b_up.data[start:end] = 0
+    ffn.W_gate.data[start:end, :] = 0
+    ffn.b_gate.data[start:end] = 0
+    ffn.W_down.data[:, start:end] = 0
+
+
+def _pc_target_lo_from_index(k: int) -> int:
+    return (k * 8 + 2) & 0xF
+
+
+def _pc_target_hi_from_index(k: int) -> int:
+    return ((k * 8 + 2) >> 4) & 0xF
+
+
+def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 all-step JMP PC override units 320..383."""
+
+    rules = []
+    threshold = 4.5
+    conditions = (
+        ("MARK_PC", 1.0),
+        ("OP_JMP", 1.0),
+        ("MARK_AX", -10.0),
+    )
+    write_scale = 2.0 / S
+
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_jmp_all_step_cancel_{band}_{k}",
+                conditions=conditions,
+                threshold=threshold,
+                gate=f"{output_base}+{k}",
+                gate_weight=-1.0,
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_jmp_all_step_fetch_lo_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"FETCH_LO+{k}",
+            writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_jmp_all_step_fetch_hi_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"FETCH_LO+{k}",
+            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
+        ))
+
+    return tuple(rules)
+
+
+def _layer6_imm_fetch_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 IMM FETCH -> OUTPUT units 0..31."""
+
+    rules = []
+    conditions = (
+        ("OP_IMM", 1.0),
+        ("OP_EXIT", -20.0),
+        ("OP_JMP", -20.0),
+        ("MARK_AX", 1.0),
+        ("MARK_PC", -8.0),
+        ("IS_BYTE", -10.0),
+    )
+    write_scale = 2.0 / S
+    for band, source_base, output_base in (
+        ("lo", "FETCH_LO", "OUTPUT_LO"),
+        ("hi", "FETCH_HI", "OUTPUT_HI"),
+    ):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_imm_fetch_to_output_{band}_{k}",
+                conditions=conditions,
+                threshold=4.0,
+                gate=f"{source_base}+{k}",
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+    return tuple(rules)
+
+
+def _layer6_imm_carry_refresh_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 IMM AX_CARRY refresh units 32..63."""
+
+    rules = []
+    conditions = (
+        ("OP_IMM", 0.2),
+        ("MARK_AX", 1.0),
+        ("MARK_PC", -8.0),
+        ("IS_BYTE", -10.0),
+        ("OP_EXIT", -20.0),
+        ("OP_JMP", -20.0),
+    )
+    write_scale = 2.0 / S
+    for band, fetch_base, carry_base in (
+        ("lo", "FETCH_LO", "AX_CARRY_LO"),
+        ("hi", "FETCH_HI", "AX_CARRY_HI"),
+    ):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_imm_carry_refresh_{band}_{k}",
+                conditions=conditions,
+                threshold=1.5,
+                gate_terms=(
+                    (f"{fetch_base}+{k}", 1.0),
+                    (f"{carry_base}+{k}", -1.0),
+                ),
+                writes=((f"{carry_base}+{k}", write_scale),),
+            ))
+    return tuple(rules)
+
+
+def _layer6_exit_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 EXIT AX_CARRY -> OUTPUT units 64..95."""
+
+    return _layer6_ax_output_route_rules(
+        name_prefix="l6_exit_ax_to_output",
+        threshold=4.0,
+        conditions=(
+            ("OP_EXIT", 1.0),
+            ("OP_IMM", -20.0),
+            ("MARK_AX", 1.0),
+            ("MARK_PC", -8.0),
+            ("IS_BYTE", -1.0),
+        ),
+        S=S,
+    )
+
+
+def _layer6_nop_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 NOP AX_CARRY -> OUTPUT units 96..127."""
+
+    return _layer6_ax_output_route_rules(
+        name_prefix="l6_nop_ax_to_output",
+        threshold=4.0,
+        conditions=(
+            ("OP_NOP", 1.0),
+            ("MARK_AX", 1.0),
+            ("MARK_PC", -8.0),
+            ("IS_BYTE", -10.0),
+        ),
+        S=S,
+    )
+
+
+def _layer6_jsr_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 JSR AX_CARRY -> OUTPUT units 128..159."""
+
+    return _layer6_ax_output_route_rules(
+        name_prefix="l6_jsr_ax_to_output",
+        threshold=4.0,
+        conditions=(
+            ("OP_JSR", 1.0),
+            ("MARK_AX", 1.0),
+            ("MARK_PC", -8.0),
+            ("MARK_SP", -8.0),
+            ("MARK_BP", -8.0),
+            ("MARK_STACK0", -8.0),
+            ("MARK_MEM", -8.0),
+            ("IS_BYTE", -10.0),
+        ),
+        S=S,
+    )
+
+
+def _layer6_jmp_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 JMP AX_CARRY -> OUTPUT units 160..191."""
+
+    return _layer6_ax_output_route_rules(
+        name_prefix="l6_jmp_ax_to_output",
+        threshold=6.5,
+        conditions=(
+            ("OP_JMP", 1.0),
+            ("MARK_AX", 1.0),
+            ("HAS_SE", 1.0),
+            ("MARK_PC", -1.0),
+            ("IS_BYTE", -10.0),
+        ),
+        S=S,
+    )
+
+
+def _layer6_delayed_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 delayed JMP PC override units 192..255."""
+
+    rules = []
+    conditions = (
+        ("MARK_PC", 1.0),
+        ("CMP+0", 1.0),
+        ("MARK_AX", -10.0),
+        ("CONST", -1000.0),
+    )
+    write_scale = 2.0 / S
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_delayed_jmp_cancel_{band}_{k}",
+                conditions=conditions,
+                threshold=5.5,
+                gate=f"{output_base}+{k}",
+                gate_weight=-1.0,
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_delayed_jmp_target_lo_{k}",
+            conditions=conditions,
+            threshold=5.5,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_delayed_jmp_target_hi_{k}",
+            conditions=conditions,
+            threshold=5.5,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _layer6_first_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 first-step JMP PC override units 256..319."""
+
+    rules = []
+    conditions = (
+        ("MARK_PC", 1.0),
+        ("OP_JMP", 1.0),
+        ("HAS_SE", -1.0),
+        ("MARK_AX", -10.0),
+    )
+    write_scale = 2.0 / S
+    threshold = 5.0
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_first_step_jmp_cancel_{band}_{k}",
+                conditions=conditions,
+                threshold=threshold,
+                gate=f"{output_base}+{k}",
+                gate_weight=-1.0,
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_first_step_jmp_target_lo_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_first_step_jmp_target_hi_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _layer6_halt_detect_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 EXIT halt conversion unit 384."""
+
+    write_scale = 2.0 / S
+    return (
+        FFNRule.constant_write(
+            name="l6_exit_halt_detect",
+            conditions=(("CMP+1", 1.0), ("NEXT_SE", 1.0)),
+            threshold=1.3,
+            writes=(
+                ("NEXT_HALT", write_scale),
+                ("NEXT_SE", -write_scale),
+            ),
+        ),
+    )
+
+
+def _layer6_temp_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 TEMP[1..31] cleanup units 386..416."""
+
+    write_scale = 2.0 / S
+    return tuple(
+        FFNRule.gated_write(
+            name=f"l6_temp_cleanup_{k}",
+            conditions=(("MARK_PC", 1.0), ("IS_BYTE", -1.0)),
+            threshold=0.5,
+            gate=f"TEMP+{k}",
+            gate_weight=-1.0,
+            writes=((f"TEMP+{k}", write_scale),),
+        )
+        for k in range(1, 32)
+    )
+
+
+def _layer6_cmp3_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 CMP[3] cleanup unit 417."""
+
+    write_scale = 2.0 / S
+    return (
+        FFNRule.gated_write(
+            name="l6_cmp3_cleanup",
+            conditions=(("MARK_PC", 1.0), ("IS_BYTE", -1.0)),
+            threshold=0.5,
+            gate="CMP+3",
+            gate_weight=-1.0,
+            writes=(("CMP+3", write_scale),),
+        ),
+    )
+
+
+def _layer6_stack_identity_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 SP/BP/STACK0 identity units 418..513."""
+
+    rules = []
+    write_scale = 2.0 / S
+    for marker_name in ("MARK_SP", "MARK_BP", "MARK_STACK0"):
+        label = marker_name.removeprefix("MARK_").lower()
+        conditions = (
+            (marker_name, 1.0),
+            ("IS_BYTE", -1.0),
+            ("HAS_SE", 1.0),
+        )
+        for band, source_base, output_base in (
+            ("lo", "EMBED_LO", "OUTPUT_LO"),
+            ("hi", "EMBED_HI", "OUTPUT_HI"),
+        ):
+            for k in range(16):
+                rules.append(FFNRule.gated_write(
+                    name=f"l6_{label}_identity_{band}_{k}",
+                    conditions=conditions,
+                    threshold=2.5,
+                    gate=f"{source_base}+{k}",
+                    writes=((f"{output_base}+{k}", write_scale),),
+                ))
+    return tuple(rules)
+
+
+def _layer6_psh_sp_decrement_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 PSH SP decrement units 514..545."""
+
+    return _layer6_sp_decrement_rules(
+        name_prefix="l6_psh_sp_decrement",
+        conditions=(("PSH_AT_SP", 1.0), ("MARK_SP", 1.0)),
+        threshold=1.5,
+        S=S,
+    )
+
+
+def _layer6_jsr_sp_decrement_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 JSR SP decrement units 546..577."""
+
+    return _layer6_sp_decrement_rules(
+        name_prefix="l6_jsr_sp_decrement",
+        conditions=(("CMP+4", 1.0), ("MARK_SP", 1.0)),
+        threshold=1.5,
+        S=S,
+    )
+
+
+def _layer6_sp_decrement_rules(
+    *,
+    name_prefix: str,
+    conditions: tuple[tuple[str, float], ...],
+    threshold: float,
+    S: float,
+) -> tuple[FFNRule, ...]:
+    rules = []
+    write_scale = 2.0 / S
+    for k in range(16):
+        new_k = (k - 8) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"{name_prefix}_lo_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"EMBED_LO+{k}",
+            writes=(
+                (f"OUTPUT_LO+{new_k}", write_scale),
+                (f"OUTPUT_LO+{k}", -write_scale),
+            ),
+        ))
+    for k in range(16):
+        new_k_borrow = (k - 1) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"{name_prefix}_hi_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate_terms=(
+                ((f"EMBED_HI+{k}"), 1.0),
+                ("EMBED_LO+8", -1.0),
+                ("EMBED_LO+9", -1.0),
+                ("EMBED_LO+10", -1.0),
+                ("EMBED_LO+11", -1.0),
+                ("EMBED_LO+12", -1.0),
+                ("EMBED_LO+13", -1.0),
+                ("EMBED_LO+14", -1.0),
+                ("EMBED_LO+15", -1.0),
+            ),
+            writes=(
+                (f"OUTPUT_HI+{new_k_borrow}", write_scale),
+                (f"OUTPUT_HI+{k}", -write_scale),
+            ),
+        ))
+    return tuple(rules)
+
+
+def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 JSR SP byte-0 fixup units 578..579."""
+
+    write_scale = 2.0 / S
+    return (
+        FFNRule.constant_write(
+            name="l6_jsr_sp_fixup_lo",
+            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0)),
+            threshold=1.5,
+            writes=(
+                ("OUTPUT_LO+8", write_scale),
+                ("OUTPUT_LO+0", -write_scale),
+            ),
+        ),
+        FFNRule.constant_write(
+            name="l6_jsr_sp_fixup_hi",
+            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0)),
+            threshold=1.5,
+            writes=(
+                ("OUTPUT_HI+15", write_scale),
+                ("OUTPUT_HI+0", -write_scale),
+            ),
+        ),
+    )
+
+
+def _layer6_jsr_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 JSR SP byte fixups units 580..583."""
+
+    rules = []
+    specs = (
+        ("byte1", "BYTE_INDEX_0", 15, 15),
+        ("byte2", "BYTE_INDEX_1", 0, 0),
+    )
+    for label, byte_index, lo, hi in specs:
+        conditions = (
+            ("CMP+4", 1.0),
+            (byte_index, 1.0),
+            ("IS_BYTE", 1.0),
+            ("H1+2", 1.0),
+        )
+        rules.append(FFNRule.gated_write(
+            name=f"l6_jsr_sp_{label}_lo",
+            conditions=conditions,
+            threshold=3.5,
+            gate="CONST",
+            writes=((f"OUTPUT_LO+{lo}", 10.0 / S),),
+        ))
+        rules.append(FFNRule.gated_write(
+            name=f"l6_jsr_sp_{label}_hi",
+            conditions=conditions,
+            threshold=3.5,
+            gate="CONST",
+            writes=((f"OUTPUT_HI+{hi}", 10.0 / S),),
+        ))
+    return tuple(rules)
+
+
+def _layer6_psh_stack0_writeback_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 PSH STACK0 writeback units 584..615."""
+
+    rules = []
+    write_scale = 2.0 / S
+    conditions = (("PSH_AT_SP", 1.0), ("MARK_STACK0", 1.0))
+    for band, embed_base, alu_base, output_base in (
+        ("lo", "EMBED_LO", "ALU_LO", "OUTPUT_LO"),
+        ("hi", "EMBED_HI", "ALU_HI", "OUTPUT_HI"),
+    ):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_psh_stack0_writeback_{band}_{k}",
+                conditions=conditions,
+                threshold=1.5,
+                gate_terms=(
+                    (f"{embed_base}+{k}", -1.0),
+                    (f"{alu_base}+{k}", 1.0),
+                ),
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+    return tuple(rules)
+
+
+def _layer6_getchar_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 GETCHAR AX passthrough units 616..647."""
+
+    return _layer6_ax_output_route_rules(
+        name_prefix="l6_getchar_ax_to_output",
+        threshold=4.0,
+        conditions=(
+            ("OP_GETCHAR", 1.0),
+            ("MARK_AX", 1.0),
+            ("MARK_PC", -1.0),
+        ),
+        S=S,
+    )
+
+
+def _layer6_bz_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 BZ AX passthrough units 648..679."""
+
+    return _layer6_ax_output_route_rules(
+        name_prefix="l6_bz_ax_to_output",
+        threshold=4.0,
+        conditions=(
+            ("OP_BZ", 1.0),
+            ("MARK_AX", 1.0),
+            ("MARK_PC", -1.0),
+        ),
+        S=S,
+    )
+
+
+def _layer6_bnz_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 BNZ AX passthrough units 680..711."""
+
+    return _layer6_ax_output_route_rules(
+        name_prefix="l6_bnz_ax_to_output",
+        threshold=4.0,
+        conditions=(
+            ("OP_BNZ", 1.0),
+            ("MARK_AX", 1.0),
+            ("MARK_PC", -1.0),
+        ),
+        S=S,
+    )
+
+
+def _layer6_psh_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 PSH AX passthrough units 712..743."""
+
+    return _layer6_ax_output_route_rules(
+        name_prefix="l6_psh_ax_to_output",
+        threshold=4.0,
+        conditions=(
+            ("OP_PSH", 1.0),
+            ("MARK_AX", 1.0),
+            ("MARK_PC", -1.0),
+        ),
+        S=S,
+    )
+
+
+def _layer6_adj_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 ADJ AX passthrough units 744..775."""
+
+    return _layer6_ax_output_route_rules(
+        name_prefix="l6_adj_ax_to_output",
+        threshold=4.0,
+        conditions=(
+            ("OP_ADJ", 1.0),
+            ("MARK_AX", 1.0),
+            ("MARK_PC", -1.0),
+        ),
+        S=S,
+    )
+
+
+def _layer6_adj_sp_writeback_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 ADJ SP writeback units 776..807."""
+
+    return _layer6_stack_writeback_rules(
+        name_prefix="l6_adj_sp_writeback",
+        conditions=(("OP_ADJ", 1.0), ("MARK_SP", 1.0)),
+        threshold=1.5,
+        S=S,
+    )
+
+
+def _layer6_ent_sp_writeback_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 ENT SP writeback units 808..839."""
+
+    return _layer6_stack_writeback_rules(
+        name_prefix="l6_ent_sp_writeback",
+        conditions=(
+            ("OP_ENT", 1.0),
+            ("MARK_SP", 1.0),
+            ("HAS_SE", 1.0),
+        ),
+        threshold=2.5,
+        S=S,
+    )
+
+
+def _layer6_ent_first_step_sp_byte0_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 ENT first-step SP byte 0 units 840..871."""
+
+    rules = []
+    conditions = (
+        ("OP_ENT", 1.0),
+        ("MARK_SP", 1.0),
+        ("HAS_SE", -10.0),
+    )
+    for imm_lo in range(16):
+        result_lo = (-8 - imm_lo) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"l6_ent_first_step_sp_byte0_lo_{imm_lo}",
+            conditions=conditions,
+            threshold=1.5,
+            gate=f"FETCH_LO+{imm_lo}",
+            writes=((f"OUTPUT_LO+{result_lo}", 5.0 / S),),
+        ))
+    for imm_hi in range(16):
+        result_hi = (-1 - imm_hi) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"l6_ent_first_step_sp_byte0_hi_{imm_hi}",
+            conditions=conditions,
+            threshold=1.5,
+            gate=f"FETCH_HI+{imm_hi}",
+            writes=((f"OUTPUT_HI+{result_hi}", 5.0 / S),),
+        ))
+    return tuple(rules)
+
+
+def _layer6_ent_first_step_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 ENT first-step SP bytes 1..3 units 872..877."""
+
+    rules = []
+    conditions_by_byte = (
+        ("byte1", "BYTE_INDEX_0", 15, 15, 10.0 / S),
+        ("byte2", "BYTE_INDEX_1", 0, 0, 5.0 / S),
+        ("byte3", "BYTE_INDEX_2", 0, 0, 5.0 / S),
+    )
+    for label, byte_index, lo, hi, scale in conditions_by_byte:
+        conditions = (
+            ("OP_ENT", 1.0),
+            (byte_index, 1.0),
+            ("IS_BYTE", 1.0),
+            ("H1+2", 1.0),
+            ("HAS_SE", -10.0),
+        )
+        rules.append(FFNRule.gated_write(
+            name=f"l6_ent_first_step_sp_{label}_lo",
+            conditions=conditions,
+            threshold=4.0,
+            gate="CONST",
+            writes=((f"OUTPUT_LO+{lo}", scale),),
+        ))
+        rules.append(FFNRule.gated_write(
+            name=f"l6_ent_first_step_sp_{label}_hi",
+            conditions=conditions,
+            threshold=4.0,
+            gate="CONST",
+            writes=((f"OUTPUT_HI+{hi}", scale),),
+        ))
+    return tuple(rules)
+
+
+def _layer6_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 BZ PC override units 878..941."""
+
+    rules = []
+    cancel_conditions = (
+        ("MARK_PC", 1.0),
+        ("OP_BZ", 0.2),
+        ("CMP+4", 1.0),
+        ("CMP+5", 1.0),
+        ("IS_BYTE", -10.0),
+    )
+    target_conditions = cancel_conditions + (("MARK_STACK0", -10.0),)
+    write_scale = 2.0 / S
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_bz_cancel_{band}_{k}",
+                conditions=cancel_conditions,
+                threshold=3.5,
+                gate=f"{output_base}+{k}",
+                gate_weight=-1.0,
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_bz_target_lo_{k}",
+            conditions=target_conditions,
+            threshold=3.5,
+            gate=f"FETCH_LO+{k}",
+            writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_bz_target_hi_{k}",
+            conditions=target_conditions,
+            threshold=3.5,
+            gate=f"FETCH_LO+{k}",
+            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _layer6_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 BNZ PC override units 942..1069."""
+
+    rules = []
+    write_scale = 2.0 / S
+    groups = (
+        (
+            "lo_nonzero",
+            (("MARK_PC", 1.0), ("OP_BNZ", 0.2), ("CMP+4", -1.0)),
+            1.5,
+        ),
+        (
+            "hi_nonzero",
+            (
+                ("MARK_PC", 1.0),
+                ("OP_BNZ", 0.2),
+                ("CMP+4", 1.0),
+                ("CMP+5", -1.0),
+            ),
+            2.5,
+        ),
+    )
+    for group, conditions, threshold in groups:
+        for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+            for k in range(16):
+                rules.append(FFNRule.gated_write(
+                    name=f"l6_bnz_{group}_cancel_{band}_{k}",
+                    conditions=conditions,
+                    threshold=threshold,
+                    gate=f"{output_base}+{k}",
+                    gate_weight=-1.0,
+                    writes=((f"{output_base}+{k}", write_scale),),
+                ))
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_bnz_{group}_target_lo_{k}",
+                conditions=conditions,
+                threshold=threshold,
+                gate=f"FETCH_LO+{k}",
+                writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
+            ))
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_bnz_{group}_target_hi_{k}",
+                conditions=conditions,
+                threshold=threshold,
+                gate=f"FETCH_LO+{k}",
+                writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
+            ))
+    return tuple(rules)
+
+
+def _layer6_tail_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for L6 opcode/MEM/ALU cleanup units 1070..1135."""
+
+    rules = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_opcode_lo_cleanup_{k}",
+            conditions=(("MARK_AX", 1.0),),
+            threshold=0.5,
+            gate=f"OPCODE_BYTE_LO+{k}",
+            gate_weight=-1.0,
+            writes=((f"ADDR_B0_LO+{k}", 2.0 / S),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_opcode_hi_cleanup_{k}",
+            conditions=(("MARK_AX", 1.0),),
+            threshold=0.5,
+            gate=f"OPCODE_BYTE_HI+{k}",
+            gate_weight=-1.0,
+            writes=((f"ADDR_B1_LO+{k}", 2.0 / S),),
+        ))
+    for dim_name in ("MEM_STORE", "MEM_ADDR_SRC"):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_{dim_name.lower()}_leakage_cleanup",
+            conditions=(
+                ("MARK_SP", 1.0),
+                ("MARK_STACK0", 1.0),
+                ("MARK_BP", 1.0),
+            ),
+            threshold=0.5,
+            gate=dim_name,
+            gate_weight=-1.0,
+            writes=((dim_name, 2.0 / S),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.constant_write(
+            name=f"l6_alu_lo_clear_{k}",
+            conditions=(("MARK_AX", 1.0),),
+            threshold=0.5,
+            writes=((f"ALU_LO+{k}", -10.0 / S),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.constant_write(
+            name=f"l6_alu_hi_clear_{k}",
+            conditions=(("MARK_AX", 1.0),),
+            threshold=0.5,
+            writes=((f"ALU_HI+{k}", -10.0 / S),),
+        ))
+    return tuple(rules)
+
+
+def _layer6_stack_writeback_rules(
+    *,
+    name_prefix: str,
+    conditions: tuple[tuple[str, float], ...],
+    threshold: float,
+    S: float,
+) -> tuple[FFNRule, ...]:
+    rules = []
+    write_scale = 2.0 / S
+    for band, embed_base, carry_base, output_base in (
+        ("lo", "EMBED_LO", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "EMBED_HI", "AX_CARRY_HI", "OUTPUT_HI"),
+    ):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"{name_prefix}_{band}_{k}",
+                conditions=conditions,
+                threshold=threshold,
+                gate_terms=(
+                    (f"{embed_base}+{k}", -1.0),
+                    (f"{carry_base}+{k}", 1.0),
+                ),
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+    return tuple(rules)
+
+
+def _layer6_ax_output_route_rules(
+    *,
+    name_prefix: str,
+    threshold: float,
+    conditions: tuple[tuple[str, float], ...],
+    S: float,
+) -> tuple[FFNRule, ...]:
+    rules = []
+    write_scale = 2.0 / S
+    for band, source_base, output_base in (
+        ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "AX_CARRY_HI", "OUTPUT_HI"),
+    ):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"{name_prefix}_{band}_{k}",
+                conditions=conditions,
+                threshold=threshold,
+                gate=f"{source_base}+{k}",
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+    return tuple(rules)
+
+
+def _lower_layer6_ffn_rules(
+    ffn,
+    rules: tuple[FFNRule, ...],
+    S: float,
+    BD,
+    *,
+    unit: int,
+) -> int:
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=unit,
+        S=S,
+    )
+
+
+def _lower_layer6_imm_fetch_route_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_IMM_FETCH_ROUTE_START_UNIT,
+) -> int:
+    """Lower the IR-authored IMM FETCH route band into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_imm_fetch_route_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
+def _lower_layer6_imm_carry_refresh_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_IMM_CARRY_REFRESH_START_UNIT,
+) -> int:
+    """Lower the IR-authored IMM carry refresh band into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_imm_carry_refresh_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
+def _lower_layer6_ax_output_route_ir(ffn, S: float, BD) -> tuple[int, int, int, int]:
+    """Lower IR-authored EXIT/NOP/JSR/JMP AX-output route bands."""
+
+    exit_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_exit_ax_route_rules(S),
+        S,
+        BD,
+        unit=L6_EXIT_AX_ROUTE_START_UNIT,
+    )
+    nop_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_nop_ax_route_rules(S),
+        S,
+        BD,
+        unit=L6_NOP_AX_ROUTE_START_UNIT,
+    )
+    jsr_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_jsr_ax_route_rules(S),
+        S,
+        BD,
+        unit=L6_JSR_AX_ROUTE_START_UNIT,
+    )
+    jmp_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_jmp_ax_route_rules(S),
+        S,
+        BD,
+        unit=L6_JMP_AX_ROUTE_START_UNIT,
+    )
+    return exit_end, nop_end, jsr_end, jmp_end
+
+
+def _lower_layer6_delayed_jmp_pc_override_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
+) -> int:
+    """Lower the IR-authored delayed JMP override band into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_delayed_jmp_pc_override_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
+def _lower_layer6_first_step_jmp_pc_override_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT,
+) -> int:
+    """Lower the IR-authored first-step JMP override band into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_first_step_jmp_pc_override_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
+def _lower_layer6_halt_detect_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_HALT_DETECT_START_UNIT,
+) -> int:
+    """Lower the IR-authored HALT conversion unit into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_halt_detect_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
+def _lower_layer6_temp_cleanup_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_TEMP_CLEANUP_RULE_START_UNIT,
+) -> int:
+    """Lower the IR-authored TEMP cleanup band into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_temp_cleanup_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
+def _lower_layer6_cmp3_cleanup_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_CMP3_CLEANUP_START_UNIT,
+) -> int:
+    """Lower the IR-authored CMP[3] cleanup unit into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_cmp3_cleanup_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
+def _lower_layer6_stack_identity_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_STACK_IDENTITY_START_UNIT,
+) -> int:
+    """Lower the IR-authored stack marker identity band into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_stack_identity_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
+def _lower_layer6_stack_arithmetic_ir(ffn, S: float, BD) -> tuple[int, int, int, int, int]:
+    """Lower IR-authored PSH/JSR stack arithmetic bands."""
+
+    psh_sp_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_psh_sp_decrement_rules(S),
+        S,
+        BD,
+        unit=L6_PSH_SP_DECREMENT_START_UNIT,
+    )
+    jsr_sp_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_jsr_sp_decrement_rules(S),
+        S,
+        BD,
+        unit=L6_JSR_SP_DECREMENT_START_UNIT,
+    )
+    jsr_fixup_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_jsr_sp_fixup_rules(S),
+        S,
+        BD,
+        unit=L6_JSR_SP_FIXUP_START_UNIT,
+    )
+    jsr_bytes_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_jsr_sp_bytes_rules(S),
+        S,
+        BD,
+        unit=L6_JSR_SP_BYTES_START_UNIT,
+    )
+    psh_stack0_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_psh_stack0_writeback_rules(S),
+        S,
+        BD,
+        unit=L6_PSH_STACK0_WRITEBACK_START_UNIT,
+    )
+    return (
+        psh_sp_end,
+        jsr_sp_end,
+        jsr_fixup_end,
+        jsr_bytes_end,
+        psh_stack0_end,
+    )
+
+
+def _lower_layer6_late_ax_output_route_ir(ffn, S: float, BD) -> tuple[int, int, int, int, int]:
+    """Lower IR-authored GETCHAR/BZ/BNZ/PSH/ADJ AX-output route bands."""
+
+    getchar_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_getchar_ax_route_rules(S),
+        S,
+        BD,
+        unit=L6_GETCHAR_AX_ROUTE_START_UNIT,
+    )
+    bz_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_bz_ax_route_rules(S),
+        S,
+        BD,
+        unit=L6_BZ_AX_ROUTE_START_UNIT,
+    )
+    bnz_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_bnz_ax_route_rules(S),
+        S,
+        BD,
+        unit=L6_BNZ_AX_ROUTE_START_UNIT,
+    )
+    psh_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_psh_ax_route_rules(S),
+        S,
+        BD,
+        unit=L6_PSH_AX_ROUTE_START_UNIT,
+    )
+    adj_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_adj_ax_route_rules(S),
+        S,
+        BD,
+        unit=L6_ADJ_AX_ROUTE_START_UNIT,
+    )
+    return getchar_end, bz_end, bnz_end, psh_end, adj_end
+
+
+def _lower_layer6_stack_writeback_ir(ffn, S: float, BD) -> tuple[int, int]:
+    """Lower IR-authored ADJ/ENT SP writeback bands."""
+
+    adj_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_adj_sp_writeback_rules(S),
+        S,
+        BD,
+        unit=L6_ADJ_SP_WRITEBACK_START_UNIT,
+    )
+    ent_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_ent_sp_writeback_rules(S),
+        S,
+        BD,
+        unit=L6_ENT_SP_WRITEBACK_START_UNIT,
+    )
+    return adj_end, ent_end
+
+
+def _lower_layer6_ent_first_step_ir(ffn, S: float, BD) -> tuple[int, int]:
+    """Lower IR-authored ENT first-step SP bands."""
+
+    byte0_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_ent_first_step_sp_byte0_rules(S),
+        S,
+        BD,
+        unit=L6_ENT_FIRST_STEP_SP_BYTE0_START_UNIT,
+    )
+    bytes_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_ent_first_step_sp_bytes_rules(S),
+        S,
+        BD,
+        unit=L6_ENT_FIRST_STEP_SP_BYTES_START_UNIT,
+    )
+    return byte0_end, bytes_end
+
+
+def _lower_layer6_branch_pc_override_ir(ffn, S: float, BD) -> tuple[int, int]:
+    """Lower IR-authored BZ/BNZ PC override bands."""
+
+    bz_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_bz_pc_override_rules(S),
+        S,
+        BD,
+        unit=L6_BZ_PC_OVERRIDE_START_UNIT,
+    )
+    bnz_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_bnz_pc_override_rules(S),
+        S,
+        BD,
+        unit=L6_BNZ_PC_OVERRIDE_START_UNIT,
+    )
+    return bz_end, bnz_end
+
+
+def _lower_layer6_tail_cleanup_ir(ffn, S: float, BD) -> int:
+    """Lower IR-authored L6 tail cleanup bands."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_tail_cleanup_rules(S),
+        S,
+        BD,
+        unit=L6_OPCODE_CONTAMINATION_CLEANUP_START_UNIT,
+    )
+
+
+def _lower_layer6_all_step_jmp_pc_override_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
+) -> int:
+    """Lower the IR-authored all-step JMP override band into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_all_step_jmp_pc_override_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
+def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
+    """Bake L6 routing FFN via the smoke-stable legacy wrapper.
+
+    The CompilerIR lowerers below have parity coverage for individual unit
+    bands, but strict neural smoke still depends on the full legacy L6 bake
+    until the generated specs preserve PSH/ADD autoregressive step structure.
+    """
+
+    from ...vm_step import _set_layer6_routing_ffn
+
+    _set_layer6_routing_ffn(ffn, S, BD)
+    unit = 1476
+
+    # Strict neural PSH needs STACK0 byte 0 to be exactly AX. The legacy
+    # writeback cancels EMBED and adds ALU, but a tiny residual OUTPUT_HI[1]
+    # can beat OUTPUT_HI[0] at the STACK0 marker and emit 0x1a instead of
+    # 0x0a. Do a local marker-only OUTPUT rewrite from the relayed ALU value.
+    for output_base, alu_base in (
+        (BD.OUTPUT_LO, BD.ALU_LO),
+        (BD.OUTPUT_HI, BD.ALU_HI),
+    ):
+        for k in range(16):
+            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
+            ffn.W_up.data[unit, BD.MARK_STACK0] = S
+            ffn.b_up.data[unit] = -S * 1.5
+            ffn.W_gate.data[unit, output_base + k] = -1.0
+            ffn.W_down.data[output_base + k, unit] = 2.0 / S
+            unit += 1
+        for k in range(16):
+            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
+            ffn.W_up.data[unit, BD.MARK_STACK0] = S
+            ffn.b_up.data[unit] = -S * 1.5
+            ffn.W_gate.data[unit, alu_base + k] = 1.0
+            ffn.W_down.data[output_base + k, unit] = 2.0 / S
+            unit += 1
+        for k in range(16):
+            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
+            ffn.W_up.data[unit, BD.MARK_STACK0] = S
+            ffn.W_up.data[unit, alu_base + k] = S
+            ffn.b_up.data[unit] = -S * 2.5
+            ffn.b_gate.data[unit] = 1.0
+            ffn.W_down.data[output_base + k, unit] = 3.0 / S
+            unit += 1
+    return
+    _clear_ffn_unit_band(
+        ffn,
+        L6_IMM_FETCH_ROUTE_START_UNIT,
+        L6_IMM_FETCH_ROUTE_END_UNIT,
+    )
+    imm_end = _lower_layer6_imm_fetch_route_ir(ffn, S, BD)
+    if imm_end != L6_IMM_FETCH_ROUTE_END_UNIT:
+        raise AssertionError(
+            "L6 IMM fetch route IR lowered to unexpected unit "
+            f"{imm_end}; expected {L6_IMM_FETCH_ROUTE_END_UNIT}"
+        )
+    _clear_ffn_unit_band(
+        ffn,
+        L6_IMM_CARRY_REFRESH_START_UNIT,
+        L6_IMM_CARRY_REFRESH_END_UNIT,
+    )
+    imm_carry_end = _lower_layer6_imm_carry_refresh_ir(ffn, S, BD)
+    if imm_carry_end != L6_IMM_CARRY_REFRESH_END_UNIT:
+        raise AssertionError(
+            "L6 IMM carry refresh IR lowered to unexpected unit "
+            f"{imm_carry_end}; expected {L6_IMM_CARRY_REFRESH_END_UNIT}"
+        )
+    for start, end in (
+        (L6_EXIT_AX_ROUTE_START_UNIT, L6_EXIT_AX_ROUTE_END_UNIT),
+        (L6_NOP_AX_ROUTE_START_UNIT, L6_NOP_AX_ROUTE_END_UNIT),
+        (L6_JSR_AX_ROUTE_START_UNIT, L6_JSR_AX_ROUTE_END_UNIT),
+        (L6_JMP_AX_ROUTE_START_UNIT, L6_JMP_AX_ROUTE_END_UNIT),
+    ):
+        _clear_ffn_unit_band(ffn, start, end)
+    route_ends = _lower_layer6_ax_output_route_ir(ffn, S, BD)
+    expected_ends = (
+        L6_EXIT_AX_ROUTE_END_UNIT,
+        L6_NOP_AX_ROUTE_END_UNIT,
+        L6_JSR_AX_ROUTE_END_UNIT,
+        L6_JMP_AX_ROUTE_END_UNIT,
+    )
+    if route_ends != expected_ends:
+        raise AssertionError(
+            "L6 AX-output route IR lowered to unexpected units "
+            f"{route_ends}; expected {expected_ends}"
+        )
+    for start, end in (
+        (
+            L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
+            L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT,
+        ),
+        (
+            L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT,
+            L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT,
+        ),
+    ):
+        _clear_ffn_unit_band(ffn, start, end)
+    delayed_end = _lower_layer6_delayed_jmp_pc_override_ir(ffn, S, BD)
+    if delayed_end != L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 delayed JMP PC override IR lowered to unexpected unit "
+            f"{delayed_end}; expected {L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT}"
+        )
+    first_step_end = _lower_layer6_first_step_jmp_pc_override_ir(ffn, S, BD)
+    if first_step_end != L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 first-step JMP PC override IR lowered to unexpected unit "
+            f"{first_step_end}; expected "
+            f"{L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT}"
+        )
+    _clear_ffn_unit_band(
+        ffn,
+        L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
+        L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT,
+    )
+    end = _lower_layer6_all_step_jmp_pc_override_ir(ffn, S, BD)
+    if end != L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 all-step JMP PC override IR lowered to unexpected unit "
+            f"{end}; expected {L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT}"
+        )
+    for start, end in (
+        (L6_HALT_DETECT_START_UNIT, L6_HALT_DETECT_END_UNIT),
+        (L6_TEMP_CLEANUP_START_UNIT, L6_TEMP_CLEANUP_END_UNIT),
+        (L6_CMP3_CLEANUP_START_UNIT, L6_CMP3_CLEANUP_END_UNIT),
+        (L6_STACK_IDENTITY_START_UNIT, L6_STACK_IDENTITY_END_UNIT),
+    ):
+        _clear_ffn_unit_band(ffn, start, end)
+    halt_end = _lower_layer6_halt_detect_ir(ffn, S, BD)
+    if halt_end != L6_HALT_DETECT_END_UNIT:
+        raise AssertionError(
+            "L6 HALT detect IR lowered to unexpected unit "
+            f"{halt_end}; expected {L6_HALT_DETECT_END_UNIT}"
+        )
+    temp_end = _lower_layer6_temp_cleanup_ir(ffn, S, BD)
+    if temp_end != L6_TEMP_CLEANUP_END_UNIT:
+        raise AssertionError(
+            "L6 TEMP cleanup IR lowered to unexpected unit "
+            f"{temp_end}; expected {L6_TEMP_CLEANUP_END_UNIT}"
+        )
+    cmp3_end = _lower_layer6_cmp3_cleanup_ir(ffn, S, BD)
+    if cmp3_end != L6_CMP3_CLEANUP_END_UNIT:
+        raise AssertionError(
+            "L6 CMP[3] cleanup IR lowered to unexpected unit "
+            f"{cmp3_end}; expected {L6_CMP3_CLEANUP_END_UNIT}"
+        )
+    stack_identity_end = _lower_layer6_stack_identity_ir(ffn, S, BD)
+    if stack_identity_end != L6_STACK_IDENTITY_END_UNIT:
+        raise AssertionError(
+            "L6 stack identity IR lowered to unexpected unit "
+            f"{stack_identity_end}; expected {L6_STACK_IDENTITY_END_UNIT}"
+        )
+    for start, end in (
+        (L6_PSH_SP_DECREMENT_START_UNIT, L6_PSH_SP_DECREMENT_END_UNIT),
+        (L6_JSR_SP_DECREMENT_START_UNIT, L6_JSR_SP_DECREMENT_END_UNIT),
+        (L6_JSR_SP_FIXUP_START_UNIT, L6_JSR_SP_FIXUP_END_UNIT),
+        (L6_JSR_SP_BYTES_START_UNIT, L6_JSR_SP_BYTES_END_UNIT),
+        (
+            L6_PSH_STACK0_WRITEBACK_START_UNIT,
+            L6_PSH_STACK0_WRITEBACK_END_UNIT,
+        ),
+    ):
+        _clear_ffn_unit_band(ffn, start, end)
+    stack_arithmetic_ends = _lower_layer6_stack_arithmetic_ir(ffn, S, BD)
+    expected_stack_arithmetic_ends = (
+        L6_PSH_SP_DECREMENT_END_UNIT,
+        L6_JSR_SP_DECREMENT_END_UNIT,
+        L6_JSR_SP_FIXUP_END_UNIT,
+        L6_JSR_SP_BYTES_END_UNIT,
+        L6_PSH_STACK0_WRITEBACK_END_UNIT,
+    )
+    if stack_arithmetic_ends != expected_stack_arithmetic_ends:
+        raise AssertionError(
+            "L6 stack arithmetic IR lowered to unexpected units "
+            f"{stack_arithmetic_ends}; expected "
+            f"{expected_stack_arithmetic_ends}"
+        )
+    for start, end in (
+        (L6_GETCHAR_AX_ROUTE_START_UNIT, L6_GETCHAR_AX_ROUTE_END_UNIT),
+        (L6_BZ_AX_ROUTE_START_UNIT, L6_BZ_AX_ROUTE_END_UNIT),
+        (L6_BNZ_AX_ROUTE_START_UNIT, L6_BNZ_AX_ROUTE_END_UNIT),
+        (L6_PSH_AX_ROUTE_START_UNIT, L6_PSH_AX_ROUTE_END_UNIT),
+        (L6_ADJ_AX_ROUTE_START_UNIT, L6_ADJ_AX_ROUTE_END_UNIT),
+    ):
+        _clear_ffn_unit_band(ffn, start, end)
+    late_route_ends = _lower_layer6_late_ax_output_route_ir(ffn, S, BD)
+    expected_late_route_ends = (
+        L6_GETCHAR_AX_ROUTE_END_UNIT,
+        L6_BZ_AX_ROUTE_END_UNIT,
+        L6_BNZ_AX_ROUTE_END_UNIT,
+        L6_PSH_AX_ROUTE_END_UNIT,
+        L6_ADJ_AX_ROUTE_END_UNIT,
+    )
+    if late_route_ends != expected_late_route_ends:
+        raise AssertionError(
+            "L6 late AX-output route IR lowered to unexpected units "
+            f"{late_route_ends}; expected {expected_late_route_ends}"
+        )
+    for start, end in (
+        (L6_ADJ_SP_WRITEBACK_START_UNIT, L6_ADJ_SP_WRITEBACK_END_UNIT),
+        (L6_ENT_SP_WRITEBACK_START_UNIT, L6_ENT_SP_WRITEBACK_END_UNIT),
+    ):
+        _clear_ffn_unit_band(ffn, start, end)
+    stack_writeback_ends = _lower_layer6_stack_writeback_ir(ffn, S, BD)
+    expected_stack_writeback_ends = (
+        L6_ADJ_SP_WRITEBACK_END_UNIT,
+        L6_ENT_SP_WRITEBACK_END_UNIT,
+    )
+    if stack_writeback_ends != expected_stack_writeback_ends:
+        raise AssertionError(
+            "L6 stack writeback IR lowered to unexpected units "
+            f"{stack_writeback_ends}; expected {expected_stack_writeback_ends}"
+        )
+    for start, end in (
+        (
+            L6_ENT_FIRST_STEP_SP_BYTE0_START_UNIT,
+            L6_ENT_FIRST_STEP_SP_BYTE0_END_UNIT,
+        ),
+        (
+            L6_ENT_FIRST_STEP_SP_BYTES_START_UNIT,
+            L6_ENT_FIRST_STEP_SP_BYTES_END_UNIT,
+        ),
+    ):
+        _clear_ffn_unit_band(ffn, start, end)
+    ent_first_step_ends = _lower_layer6_ent_first_step_ir(ffn, S, BD)
+    expected_ent_first_step_ends = (
+        L6_ENT_FIRST_STEP_SP_BYTE0_END_UNIT,
+        L6_ENT_FIRST_STEP_SP_BYTES_END_UNIT,
+    )
+    if ent_first_step_ends != expected_ent_first_step_ends:
+        raise AssertionError(
+            "L6 ENT first-step IR lowered to unexpected units "
+            f"{ent_first_step_ends}; expected {expected_ent_first_step_ends}"
+        )
+    for start, end in (
+        (L6_BZ_PC_OVERRIDE_START_UNIT, L6_BZ_PC_OVERRIDE_END_UNIT),
+        (L6_BNZ_PC_OVERRIDE_START_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT),
+    ):
+        _clear_ffn_unit_band(ffn, start, end)
+    branch_ends = _lower_layer6_branch_pc_override_ir(ffn, S, BD)
+    expected_branch_ends = (
+        L6_BZ_PC_OVERRIDE_END_UNIT,
+        L6_BNZ_PC_OVERRIDE_END_UNIT,
+    )
+    if branch_ends != expected_branch_ends:
+        raise AssertionError(
+            "L6 branch override IR lowered to unexpected units "
+            f"{branch_ends}; expected {expected_branch_ends}"
+        )
+    _clear_ffn_unit_band(
+        ffn,
+        L6_OPCODE_CONTAMINATION_CLEANUP_START_UNIT,
+        L6_ALU_CLEAR_END_UNIT,
+    )
+    tail_cleanup_end = _lower_layer6_tail_cleanup_ir(ffn, S, BD)
+    if tail_cleanup_end != L6_ALU_CLEAR_END_UNIT:
+        raise AssertionError(
+            "L6 tail cleanup IR lowered to unexpected unit "
+            f"{tail_cleanup_end}; expected {L6_ALU_CLEAR_END_UNIT}"
+        )
 
 
 def make_layer6_attn_op() -> Operation:
@@ -53,8 +1621,11 @@ def make_layer6_routing_ffn_op() -> Operation:
     other L6 FFN extension ops migrated to model-level phase=998.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer6_routing_ffn
-        _set_layer6_routing_ffn(block.ffn, S, _as_setdim_proxy(dim_positions))
+        _bake_layer6_routing_ffn(
+            block.ffn,
+            S,
+            _as_setdim_proxy(dim_positions),
+        )
 
     return Operation(
         name="layer6_routing_ffn",
@@ -69,6 +1640,8 @@ def make_layer6_routing_ffn_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=6,
         migrated=True,
         smoke_tests={
@@ -235,22 +1808,14 @@ def make_layer6_attn_bake_op() -> Operation:
     at their legacy block indices.
     """
     def bake(model, dim_positions, S):
-        from ...vm_step import _set_layer6_attn
+        del S
         attn = model.blocks[6].attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer6_attn(attn, S, _as_setdim_proxy(dim_positions), HD)
-        # Softmax-sharpness fix (head 5 — first-step OP flag / FETCH relay):
-        # The audit (87442ad) flags this head as a primary leakage candidate
-        # with mass=0.10, s_target=0, slope=0 in the bare-model probe. The
-        # head's main Q/K cells (Q[MARK_AX]=L, K[MARK_PC]=L with L=50) give
-        # Q*K/sqrt(HD) = L*L/sqrt(HD) ~= 274 in real contexts where both
-        # gates light, but the synthetic audit lights only the K gate, so
-        # s_target collapses to ~0. To compensate AND give the head extra
-        # headroom against softmax1 leakage even in real contexts, scale
-        # head 5's K column by 10x ("bump K-scale ~10.0x"). The Q side is
-        # unchanged; this makes the read at the MARK_PC position 10x more
-        # selective without touching the V/O routing.
-        attn.W_k[5 * HD] *= 10.0
+        _bake_layer6_attn_spec(attn, _as_setdim_proxy(dim_positions), HD)
+        # Keep the first-step FETCH relay sharp enough to select the PC marker
+        # under strict neural smoke; the base spec stays byte-identical to the
+        # legacy helper and this bake owns the production-only scale bump.
+        attn.W_k.data[5 * HD] *= 10.0
 
     return Operation(
         name="layer6_attn_bake",
@@ -260,6 +1825,7 @@ def make_layer6_attn_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -289,10 +1855,10 @@ def make_layer6_relay_heads_bake_op() -> Operation:
     above preserves the LayerCompiler topology.
     """
     def bake(model, dim_positions, S):
-        from ...vm_step import _set_layer6_relay_heads
+        del S
         attn = model.blocks[6].attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer6_relay_heads(attn, S, _as_setdim_proxy(dim_positions), HD)
+        _bake_layer6_relay_heads_spec(attn, _as_setdim_proxy(dim_positions), HD)
 
     return Operation(
         name="layer6_relay_heads_bake",
@@ -302,6 +1868,7 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -326,10 +1893,13 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
     function, so its absence from the dep graph is the existing baseline.
     """
     def bake(model, dim_positions, S):
-        from ...vm_step import _set_bz_bnz_relay
         attn = model.blocks[6].attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_bz_bnz_relay(attn, S, _as_setdim_proxy(dim_positions), HD)
+        Primitives.generate_attention_head(
+            attn,
+            _layer6_bz_bnz_relay_head_spec(_as_setdim_proxy(dim_positions)),
+            HD,
+        )
 
     return Operation(
         name="layer6_bz_bnz_relay_bake",
@@ -397,9 +1967,8 @@ def make_binary_pop_sp_increment_op() -> Operation:
     > 999 would write into already-rightsized FFN slots that no longer exist.
     """
     def bake(model, dim_positions, S):
-        from ...vm_step import _set_binary_pop_sp_increment
         proxy = _as_setdim_proxy(dim_positions)
-        _set_binary_pop_sp_increment(model.blocks[6].ffn, S, proxy)
+        _lower_layer6_binary_pop_sp_increment_ir(model.blocks[6].ffn, S, proxy)
 
     return Operation(
         name="binary_pop_sp_increment",
@@ -407,10 +1976,69 @@ def make_binary_pop_sp_increment_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         phase=998,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for SP += 8 after binary pop-style ops."""
+
+    rules = []
+    write_scale = 2.0 / S
+    conditions = (
+        ("MARK_SP", 1.0),
+        ("CMP+3", 1.0),
+    )
+    for k in range(16):
+        new_k = (k + 8) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"l6_binary_pop_sp_lo_{k}",
+            conditions=conditions,
+            threshold=1.5,
+            gate=f"EMBED_LO+{k}",
+            writes=(
+                (f"OUTPUT_LO+{new_k}", write_scale),
+                (f"OUTPUT_LO+{k}", -write_scale),
+            ),
+        ))
+
+    for k in range(16):
+        new_k_carry = (k + 1) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"l6_binary_pop_sp_hi_{k}",
+            conditions=conditions,
+            threshold=1.5,
+            gate=f"EMBED_HI+{k}",
+            gate_terms=tuple(
+                (f"EMBED_LO+{lo_bit}", -1.0)
+                for lo_bit in range(8)
+            ),
+            writes=(
+                (f"OUTPUT_HI+{new_k_carry}", write_scale),
+                (f"OUTPUT_HI+{k}", -write_scale),
+            ),
+        ))
+    return tuple(rules)
+
+
+def _lower_layer6_binary_pop_sp_increment_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_BINARY_POP_SP_INCREMENT_START_UNIT,
+) -> int:
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_binary_pop_sp_increment_rules(S),
+        S,
+        BD,
+        unit=unit,
     )
 
 

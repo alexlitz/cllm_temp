@@ -572,7 +572,7 @@ class ExtractShiftBit2FFN(PureFFN):
     Result is stored in CARRY_OUT. Only position 0 matters (where shift amount is).
     Broadcast attention will copy position 0's value to all positions.
 
-    Note: SoftMoE wrapper handles opcode gating.
+    Note: StandardMoE wrapper handles opcode gating.
     """
 
     def __init__(self, opcode: int):
@@ -626,7 +626,7 @@ class ExtractShiftBit3FFN(PureFFN):
 
     Result is stored in CARRY_IN. Only position 0 matters.
 
-    Note: SoftMoE wrapper handles opcode gating.
+    Note: StandardMoE wrapper handles opcode gating.
     """
 
     def __init__(self, opcode: int):
@@ -1086,7 +1086,7 @@ class ZeroInvalidAfterShiftLeftFFN(PureFFN):
     Zero CARRY_OUT at positions 0..nibble_shift-1 after a left shift.
 
     Uses step(POS < nibble_shift) via SwiGLU to zero CARRY_OUT at invalid positions.
-    Opcode gating handled by SoftMoEFFN wrapper.
+    Opcode gating handled by StandardMoEFFN wrapper.
     """
 
     def __init__(self, nibble_shift: int):
@@ -1114,7 +1114,7 @@ class ZeroInvalidAfterShiftRightFFN(PureFFN):
     Zero CARRY_OUT at positions (8-nibble_shift)..7 after a right shift.
 
     Uses step(POS >= threshold) via SwiGLU to zero CARRY_OUT at invalid positions.
-    Opcode gating handled by SoftMoEFFN wrapper.
+    Opcode gating handled by StandardMoEFFN wrapper.
     """
 
     def __init__(self, nibble_shift: int):

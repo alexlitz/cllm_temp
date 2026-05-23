@@ -9,13 +9,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.unified_compiler.ops.l10_ops import (  # noqa: E402
     _bake_layer10_byte_passthrough_head,
+    _bake_layer10_bp_byte_passthrough_head,
+    _bake_layer10_carry_relay_head,
+    _bake_layer10_psh_stack0_passthrough_head,
     _bake_layer10_sp_byte_passthrough_head,
+    _bake_layer10_stack0_byte_relay_head,
 )
 from neural_vm.vm_step import (  # noqa: E402
     AutoregressiveAttention,
     _SetDim,
     _set_layer10_byte_passthrough,
+    _set_layer10_bp_byte_passthrough,
+    _set_layer10_carry_relay,
+    _set_layer10_psh_stack0_passthrough,
     _set_layer10_sp_byte_passthrough,
+    _set_layer10_stack0_byte_relay,
 )
 
 
@@ -45,6 +53,18 @@ def test_l10_ax_byte_passthrough_spec_matches_legacy_helper():
     _assert_attention_equal(legacy, generated)
 
 
+def test_l10_carry_relay_spec_matches_legacy_helper():
+    legacy = _new_attention()
+    generated = _new_attention()
+    hd = legacy.W_q.shape[0] // legacy.num_heads
+
+    with torch.no_grad():
+        _set_layer10_carry_relay(legacy, 100.0, _SetDim, hd)
+        _bake_layer10_carry_relay_head(generated, _SetDim, 100.0, hd)
+
+    _assert_attention_equal(legacy, generated)
+
+
 def test_l10_sp_byte_passthrough_spec_matches_legacy_helper():
     legacy = _new_attention()
     generated = _new_attention()
@@ -53,5 +73,41 @@ def test_l10_sp_byte_passthrough_spec_matches_legacy_helper():
     with torch.no_grad():
         _set_layer10_sp_byte_passthrough(legacy, 100.0, _SetDim, hd)
         _bake_layer10_sp_byte_passthrough_head(generated, _SetDim, 100.0, hd)
+
+    _assert_attention_equal(legacy, generated)
+
+
+def test_l10_bp_byte_passthrough_spec_matches_legacy_helper():
+    legacy = _new_attention()
+    generated = _new_attention()
+    hd = legacy.W_q.shape[0] // legacy.num_heads
+
+    with torch.no_grad():
+        _set_layer10_bp_byte_passthrough(legacy, 100.0, _SetDim, hd)
+        _bake_layer10_bp_byte_passthrough_head(generated, _SetDim, 100.0, hd)
+
+    _assert_attention_equal(legacy, generated)
+
+
+def test_l10_psh_stack0_passthrough_spec_matches_legacy_helper():
+    legacy = _new_attention()
+    generated = _new_attention()
+    hd = legacy.W_q.shape[0] // legacy.num_heads
+
+    with torch.no_grad():
+        _set_layer10_psh_stack0_passthrough(legacy, 100.0, _SetDim, hd)
+        _bake_layer10_psh_stack0_passthrough_head(generated, _SetDim, 100.0, hd)
+
+    _assert_attention_equal(legacy, generated)
+
+
+def test_l10_stack0_byte_relay_spec_matches_legacy_helper():
+    legacy = _new_attention()
+    generated = _new_attention()
+    hd = legacy.W_q.shape[0] // legacy.num_heads
+
+    with torch.no_grad():
+        _set_layer10_stack0_byte_relay(legacy, 100.0, _SetDim, hd)
+        _bake_layer10_stack0_byte_relay_head(generated, _SetDim, 100.0, hd)
 
     _assert_attention_equal(legacy, generated)

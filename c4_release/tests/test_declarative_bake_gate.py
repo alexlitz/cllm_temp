@@ -8,6 +8,12 @@ from c4_release.neural_vm.unified_compiler.layer_compiler import (
     Operation,
     dispatch_operation_bake,
 )
+from c4_release.neural_vm.unified_compiler.ops.l11_ops import (
+    make_layer11_mul_partial_op,
+)
+from c4_release.neural_vm.unified_compiler.ops.l12_ops import (
+    make_layer12_mul_combine_op,
+)
 
 
 def _op(name, *, kind="attn", migrated=True):
@@ -138,32 +144,41 @@ def test_declarations_only_dispatch_skips_topology_anchor():
     )
 
 
-def test_compile_full_vm_declarations_only_reports_unsupported_ops():
-    with pytest.raises(DeclarationsOnlyBakeError) as exc:
-        fvc.compile_full_vm(declarations_only=True, disk_cache=False)
+def test_compile_full_vm_declarations_only_builds_authoritative_path():
+    model, layout = fvc.compile_full_vm(declarations_only=True, disk_cache=False)
 
-    message = str(exc.value)
-    assert "declarative_bake_fn" in message
-    assert exc.value.unsupported_ops
-    assert "embedding_bake" not in exc.value.unsupported_ops
-    assert "head_bake" not in exc.value.unsupported_ops
-    assert "initial_pc_bake" not in exc.value.unsupported_ops
-    assert "l10_post_ops_combined" not in exc.value.unsupported_ops
-    assert "l10_post_op_attach" not in exc.value.unsupported_ops
-    assert "l10_alu_divmod_bdtoge" not in exc.value.unsupported_ops
-    assert "l10_alu_divmod_longdiv" not in exc.value.unsupported_ops
-    assert "l10_alu_divmod_getobd" not in exc.value.unsupported_ops
-    assert "l10_alu_divmod_install" not in exc.value.unsupported_ops
-    assert "l10_alu_postop_attach" not in exc.value.unsupported_ops
-    assert "l11_alu_postop_attach" not in exc.value.unsupported_ops
-    assert "l12_alu_postop_attach" not in exc.value.unsupported_ops
-    assert "l13_alu_postop_attach" not in exc.value.unsupported_ops
-    assert "layer10_psh_stack0_passthrough_bake" not in exc.value.unsupported_ops
-    assert "layer10_stack0_byte_relay_bake" not in exc.value.unsupported_ops
-    assert "layer10_alu" in exc.value.unsupported_ops
-    assert "layer11_mul_partial" in exc.value.unsupported_ops
-    assert "layer12_mul_combine" in exc.value.unsupported_ops
-    assert "layer13_shifts" in exc.value.unsupported_ops
+    assert model.blocks
+    assert layout.d_model > 0
+    assert not any(op.name == "legacy_bake" for op in layout.model_ops)
+
+
+def test_compile_full_vm_declarations_only_env_selects_authoritative_path(monkeypatch):
+    monkeypatch.setenv("C4_DECLARATIONS_ONLY_BAKE", "1")
+
+    model, layout = fvc.compile_full_vm(disk_cache=False)
+
+    assert model.blocks
+    assert layout.d_model > 0
+    assert not any(op.name == "legacy_bake" for op in layout.model_ops)
+
+
+def test_efficient_alu_disables_legacy_lookup_mul_bakes():
+    class ExplodingBlock:
+        @property
+        def ffn(self):
+            raise AssertionError("efficient ALU must not touch lookup MUL FFN")
+
+    for op in (
+        make_layer11_mul_partial_op(alu_mode="efficient"),
+        make_layer12_mul_combine_op(alu_mode="efficient"),
+    ):
+        dispatch_operation_bake(
+            op,
+            ExplodingBlock(),
+            {},
+            100.0,
+            declarations_only=True,
+        )
 
 
 def test_declarative_bake_authority_report_allows_topology_anchors():

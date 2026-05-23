@@ -2,7 +2,7 @@
 Mixture-of-Experts Layer with opcode-based gating.
 
 Default: skips inactive experts for fast runtime (~13x speedup with 1 active opcode).
-ONNX export: auto-detects tracing and runs all experts with soft gating.
+ONNX export: auto-detects tracing and runs all experts with static gating.
 
 Architecture:
     output = x + sum_i(opcode_weight[i] * (expert[i](x) - x))
@@ -49,10 +49,10 @@ class MoE(nn.Module):
         """
         Default forward: skip inactive experts for fast runtime.
 
-        Auto-detects ONNX export and uses soft forward for tracing.
+        Auto-detects ONNX export and uses a static forward for tracing.
         """
         if torch.onnx.is_in_onnx_export():
-            return self._soft_forward(x)
+            return self._trace_forward(x)
 
         opcode_weights = x[:, 0, E.OP_START:E.OP_START + E.NUM_OPS]  # [batch, NUM_OPS]
 
@@ -78,9 +78,9 @@ class MoE(nn.Module):
 
         return x + output
 
-    def _soft_forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _trace_forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        ONNX-compatible soft forward: run all experts, weight by opcode.
+        ONNX-compatible static forward: run all experts, weight by opcode.
 
         No Python control flow — pure tensor operations.
         Uses Python ints (static at trace time) for ONNX compatibility.
@@ -98,8 +98,8 @@ class MoE(nn.Module):
 
 
 # Backward compatibility aliases
-SoftMoEFFN = MoE
-SoftMoEAttention = MoE
+StandardMoEFFN = MoE
+StandardMoEAttention = MoE
 EarlyExitMoEFFN = MoE
 
 

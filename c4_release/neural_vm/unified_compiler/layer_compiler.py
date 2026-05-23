@@ -42,8 +42,9 @@ Example:
     # layout.ops_at(1) = [pc_increment]
 """
 
+import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 
 # Allowed `scope` values for `Operation.claims`. Each scope tags a class of
@@ -122,6 +123,16 @@ class Operation:
     kind: str  # "attn", "ffn", "block", or "model"
     bake_fn: Callable
     declarative_bake_fn: Optional[Callable] = None
+    # Declarative compiler IR owned by this operation. When populated, this is
+    # the semantic source of truth: bake functions should lower this IR to
+    # weights, and verifiers/debuggers can symbolically interpret the same IR.
+    compiler_ir: Optional[Any] = None
+    # Late-bound IR factory for specs that need compiler-allocated dim
+    # positions or the active attention head dimension. Called as
+    # ``compiler_ir_factory(dim_positions, head_dim)`` by symbolic/debug
+    # tooling and, in declarations-only mode, by the bake dispatcher when no
+    # direct ``compiler_ir`` or ``declarative_bake_fn`` is present.
+    compiler_ir_factory: Optional[Callable] = None
     phase: Optional[float] = None
     # For kind="block" or "model" ops, the layer_idx the op targets (if
     # block-scoped) or None (if it operates on the whole model).
@@ -237,19 +248,82 @@ class Operation:
     # op owns the actual bake; ``legacy_wrapper`` marks an opaque wrapper
     # around legacy bake code.
     declarative_authority: Optional[str] = None
+    # Human-facing semantic label for reports/work queues. ``name`` remains
+    # the stable programmatic identity; reports should prefer this label so
+    # dynamic placement does not leak old physical layer numbers into user
+    # facing blocker lists.
+    semantic_label: Optional[str] = None
 
     def __hash__(self):
         return hash(self.name)
 
 
+_LAYER_PREFIX_RE = re.compile(r"^_?layer\d+_")
+_L_PREFIX_RE = re.compile(r"^l\d+_")
+_SEMANTIC_NAME_OVERRIDES = {
+    "layer3_carry_forward_attn": "PC carry-forward attention",
+    "layer3_ffn": "initial-PC cancellation FFN",
+    "layer4_sp_to_addr_key": "SP-to-address-key relay",
+    "layer6_routing_ffn": "opcode routing FFN",
+    "layer8_alu": "add/sub ALU lookup",
+    "layer8_mem_to_alu": "memory-to-ALU relay",
+    "layer8_multibyte_routing": "multibyte routing",
+    "layer9_alu": "comparison ALU lookup",
+    "layer10_alu": "boolean/shift ALU lookup",
+    "layer11_mul_partial": "multiply partial lookup",
+    "layer12_mul_combine": "multiply combine lookup",
+    "layer13_mem_addr_gather": "memory-address gather",
+    "layer13_shifts": "shift lookup",
+    "layer14_addr_key_neural_decode": "address-key neural decode",
+    "layer14_alu_nocarry_ax_bytes_zero": "ALU no-carry AX-byte zeroing",
+    "layer14_clear_addr_key_pollution": "address-key pollution clear",
+    "layer14_clear_mem_marker_output": "memory-marker output clear",
+    "layer14_clear_output_corruption": "output corruption clear",
+    "layer14_jsr_ax_bytes_zero": "JSR AX-byte zeroing",
+    "layer14_lc_ax_bytes_zero": "LC AX-byte zeroing",
+    "layer14_mem_generation": "memory generation",
+    "layer14_temp_clear": "TEMP clear",
+    "layer15_memory_lookup": "memory lookup",
+    "layer15_nibble_copy": "nibble copy",
+    "layer16_lev_routing": "LEV routing",
+}
+
+
+def operation_display_label(op: Operation) -> str:
+    """Return a human-facing semantic label for an operation.
+
+    ``Operation.name`` is intentionally stable and may retain historical
+    layer-number prefixes. Display labels are for reports and queues where
+    dynamic placement makes those prefixes misleading.
+    """
+
+    if op.semantic_label:
+        return op.semantic_label
+    if op.name in _SEMANTIC_NAME_OVERRIDES:
+        return _SEMANTIC_NAME_OVERRIDES[op.name]
+    label = _LAYER_PREFIX_RE.sub("", op.name)
+    label = _L_PREFIX_RE.sub("", label)
+    return label or op.name
+
+
 class DeclarationsOnlyBakeError(RuntimeError):
     """Raised when declarations-only mode reaches an imperative-only op."""
 
-    def __init__(self, unsupported_ops: List[str]):
-        self.unsupported_ops = tuple(sorted(unsupported_ops))
-        sample = ", ".join(self.unsupported_ops[:20])
-        if len(self.unsupported_ops) > 20:
-            sample += f", ... (+{len(self.unsupported_ops) - 20} more)"
+    def __init__(
+        self,
+        unsupported_ops: List[str],
+        unsupported_display_labels: Optional[List[str]] = None,
+    ):
+        if unsupported_display_labels is None:
+            unsupported_display_labels = list(unsupported_ops)
+        pairs = sorted(zip(unsupported_ops, unsupported_display_labels))
+        self.unsupported_ops = tuple(op for op, _ in pairs)
+        self.unsupported_display_labels = tuple(label for _, label in pairs)
+        sample = ", ".join(self.unsupported_display_labels[:20])
+        if len(self.unsupported_display_labels) > 20:
+            sample += (
+                f", ... (+{len(self.unsupported_display_labels) - 20} more)"
+            )
         super().__init__(
             "Declarations-only bake cannot run because some dispatched ops do "
             "not expose declarative_bake_fn and are not topology anchors: "
@@ -261,6 +335,10 @@ def operation_supports_declarations_only(op: Operation) -> bool:
     """Return whether ``op`` can run without its imperative ``bake_fn``."""
 
     return (
+        op.compiler_ir is not None
+        or
+        op.compiler_ir_factory is not None
+        or
         op.declarative_bake_fn is not None
         or op.declarative_authority == "topology_anchor"
     )
@@ -269,11 +347,14 @@ def operation_supports_declarations_only(op: Operation) -> bool:
 def validate_declarations_only_ops(ops: List[Operation]):
     """Raise when any op in dispatch order lacks a declarations-only bake."""
 
-    unsupported = [
-        op.name for op in ops if not operation_supports_declarations_only(op)
+    unsupported_ops = [
+        op for op in ops if not operation_supports_declarations_only(op)
     ]
-    if unsupported:
-        raise DeclarationsOnlyBakeError(unsupported)
+    if unsupported_ops:
+        raise DeclarationsOnlyBakeError(
+            [op.name for op in unsupported_ops],
+            [operation_display_label(op) for op in unsupported_ops],
+        )
 
 
 def dispatch_operation_bake(op: Operation, target, dim_positions, S, *,
@@ -286,9 +367,64 @@ def dispatch_operation_bake(op: Operation, target, dim_positions, S, *,
     if op.declarative_bake_fn is not None:
         op.declarative_bake_fn(target, dim_positions, S)
         return
+    if op.compiler_ir is not None:
+        _dispatch_operation_ir(op, target, dim_positions, S, op.compiler_ir)
+        return
+    if op.compiler_ir_factory is not None:
+        _dispatch_operation_ir(
+            op,
+            target,
+            dim_positions,
+            S,
+            _make_operation_ir(op, target, dim_positions),
+        )
+        return
     if op.declarative_authority == "topology_anchor":
         return
-    raise DeclarationsOnlyBakeError([op.name])
+    raise DeclarationsOnlyBakeError([op.name], [operation_display_label(op)])
+
+
+def _make_operation_ir(op: Operation, target, dim_positions):
+    factory = op.compiler_ir_factory
+    if factory is None:
+        raise DeclarationsOnlyBakeError([op.name], [operation_display_label(op)])
+
+    attn = target
+    if op.kind == "block":
+        attn = getattr(target, "attn", None)
+    if attn is None or not hasattr(attn, "W_q"):
+        head_dim = 64
+    else:
+        head_dim = attn.W_q.shape[0] // attn.num_heads
+    return factory(dim_positions, head_dim)
+
+
+def _dispatch_operation_ir(op: Operation, target, dim_positions, S, ir):
+    """Lower an op-owned CompilerIR into its target module."""
+
+    if ir is None:
+        raise DeclarationsOnlyBakeError([op.name], [operation_display_label(op)])
+    if op.kind == "ffn":
+        ir.lower_ffn(target, dim_positions, layer_idx=0, start_unit=0, S=S)
+        return
+    if op.kind == "attn":
+        head_dim = target.W_q.shape[0] // target.num_heads
+        ir.lower_attention(target, head_dim, layer_idx=0)
+        return
+    if op.kind == "block":
+        if getattr(target, "attn", None) is not None:
+            head_dim = target.attn.W_q.shape[0] // target.attn.num_heads
+            ir.lower_attention(target.attn, head_dim, layer_idx=0)
+        if getattr(target, "ffn", None) is not None:
+            ir.lower_ffn(
+                target.ffn,
+                dim_positions,
+                layer_idx=0,
+                start_unit=0,
+                S=S,
+            )
+        return
+    raise DeclarationsOnlyBakeError([op.name], [operation_display_label(op)])
 
 
 @dataclass
@@ -515,6 +651,11 @@ class LayerCompiler:
             raise ValueError(
                 f"Op {op.name!r} declarative_authority must be one of "
                 f"{allowed} or None; got {op.declarative_authority!r}"
+            )
+        if op.semantic_label is not None and not isinstance(op.semantic_label, str):
+            raise ValueError(
+                f"Op {op.name!r} semantic_label must be str or None; "
+                f"got {type(op.semantic_label).__name__}"
             )
         # Validate dim-ownership claims (if any). Accept legacy 3-tuple
         # ``(layer_idx, scope, identifier)`` and auto-promote to 4-tuple with

@@ -262,9 +262,9 @@ ALLOWED_FORWARD_CLASSES = {
     'PureFFN',
     'PureAttention',
     'MoE',
-    'SoftMoEFFN',
-    'SoftMoEAttention',
-    'UnifiedMoEBlock',  # Composition of SoftMoE layers
+    'StandardMoEFFN',
+    'StandardMoEAttention',
+    'UnifiedMoEBlock',  # Composition of StandardMoE layers
     # Note: PureALU is now nn.Sequential (no custom forward)
 }
 
@@ -522,7 +522,7 @@ def main():
         print("  - Replace .item() with tensor operations")
         print("\nTo fix unauthorized forward():")
         print("  - Inherit from PureFFN or PureAttention")
-        print("  - Or compose using SoftMoEFFN/SoftMoEAttention")
+        print("  - Or compose using StandardMoEFFN/StandardMoEAttention")
 
     return exit_code
 

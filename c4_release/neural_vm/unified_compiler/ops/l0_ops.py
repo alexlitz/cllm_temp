@@ -1,7 +1,59 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
+from ..primitives import Primitives
 from .shared import _as_setdim_proxy
+
+
+def _phase_a_ffn_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for the L0 marker-transition detector."""
+
+    PC_I, AX_I, SP_I, BP_I, MEM_I, SE_I = 0, 1, 2, 3, 4, 5
+    write_scale = 2.0 / S
+    transitions = (
+        (f"H0+{SE_I}", None, "NEXT_PC"),
+        (f"H1+{PC_I}", f"H0+{PC_I}", "NEXT_AX"),
+        (f"H1+{AX_I}", f"H0+{AX_I}", "NEXT_SP"),
+        (f"H1+{SP_I}", f"H0+{SP_I}", "NEXT_BP"),
+        (f"H1+{BP_I}", f"H0+{BP_I}", "NEXT_STACK0"),
+        (f"H4+{BP_I}", f"H3+{BP_I}", "NEXT_MEM"),
+        (f"H3+{MEM_I}", f"H2+{MEM_I}", "NEXT_SE"),
+    )
+    rules = []
+    for idx, (up_dim, gate_dim, out_dim) in enumerate(transitions):
+        if gate_dim is None:
+            rules.append(FFNRule.constant_write(
+                name=f"phase_a_{idx}_{out_dim.lower()}",
+                conditions=((up_dim, 1.0),),
+                threshold=0.3,
+                writes=((out_dim, write_scale),),
+            ))
+        else:
+            rules.append(FFNRule.gated_write(
+                name=f"phase_a_{idx}_{out_dim.lower()}",
+                conditions=((up_dim, 1.0),),
+                threshold=0.3,
+                gate_terms=((gate_dim, -1.0),),
+                gate_bias=1.0,
+                writes=((out_dim, write_scale),),
+            ))
+    return tuple(rules)
+
+
+def _phase_a_ffn_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_phase_a_ffn_rules(S))
+    return ir
+
+
+def _bake_phase_a_ffn(ffn, S, BD) -> int:
+    rules = _phase_a_ffn_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(ffn, rules, dim_positions, S=S)
 
 
 def make_phase_a_ffn_op() -> Operation:
@@ -18,12 +70,9 @@ def make_phase_a_ffn_op() -> Operation:
     LayerCompiler's dep-based assignment, which would otherwise place this FFN
     at L1 (advancing past L0 because it reads H0-H4 written by L0 attn).
     """
-    PC_I, AX_I, SP_I, BP_I, MEM_I, SE_I = 0, 1, 2, 3, 4, 5
-
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_phase_a_ffn
         proxy = _as_setdim_proxy(dim_positions)
-        _set_phase_a_ffn(block.ffn, S, proxy)
+        _bake_phase_a_ffn(block.ffn, S, proxy)
 
     # Dim-ownership claims: ``_set_phase_a_ffn`` writes units 0..6 (one per
     # marker transition) into the L0 FFN. The W_up rows read H0..H4 marker
@@ -53,6 +102,8 @@ def make_phase_a_ffn_op() -> Operation:
         layer_idx=0,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_phase_a_ffn_ir(),
+        declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
         # ``_set_phase_a_ffn`` writes one FFN hidden unit per transition in
@@ -94,17 +145,9 @@ def make_layer0_threshold_attn_op() -> Operation:
             HD,
             bd=proxy,
         )
-        # Softmax-sharpness fix (head 1): the H1 (d<=4.5) threshold head
-        # passes its scoring budget on the synthetic K target (Q*K/sqrt(HD)
-        # = slope*threshold = 45, then ALiBi at d=4 deducts 40 -> s_target=5)
-        # but the softmax mass tops out at ~98.7% because s_target=5 only
-        # barely clears the softmax1 anchor (need s_target >~ ln(99)+margin).
-        # Audit doc 87442ad recommends "bump K-scale ~2.0x (raise s_target)"
-        # — implemented here by doubling W_k[base_H1, IS_MARK] so Q*K
-        # doubles and s_target lifts from 5 to ~50.
-        head1_base = 1 * HD
-        attn.W_k[head1_base, proxy.IS_MARK] *= 2.0
-
+        # H1's 4.5-token cutoff is semantically load-bearing: L1 marks
+        # STACK0 byte 0 with L1H4[BP] AND NOT H1[BP]. Scaling this head makes
+        # H1 fire at STACK0 byte 0 and blocks ADD/POP operand gather.
     # Dim-ownership claims: ``_set_threshold_attn`` writes per head h:
     #   W_q[h*HD, CONST]    : the head's bias (slot 0)
     #   W_k[h*HD, IS_MARK]  : K-side mark detector (slot 0)

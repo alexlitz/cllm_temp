@@ -4,7 +4,7 @@ VM Step (Legacy) - Non-autoregressive VM pipeline.
 Chains: Register Read -> PureALU -> Register Write -> PC Update
 into a single forward pass with NO Python control flow.
 
-All stages are PureFFN subclasses wrapped in SoftMoEFFN for opcode routing.
+All stages are PureFFN subclasses wrapped in StandardMoEFFN for opcode routing.
 The runner only handles I/O boundaries and memory interface.
 
 Architecture (45 layers):

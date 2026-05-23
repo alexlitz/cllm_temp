@@ -234,7 +234,12 @@ class _DivModGEToBDStage(nn.Module):
         mark_ax = x_bd[:, :, BD.MARK_AX]
         opcode_mask = opcode_mask * (mark_ax > 0.5).float()
 
-        x_bd_out = self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
+        x_bd_out = self.ge_to_bd(
+            x_ge_out,
+            x_bd,
+            opcode_mask=opcode_mask,
+            emit_carry=False,
+        )
         return x_bd_out
 
 

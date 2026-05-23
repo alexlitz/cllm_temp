@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import time
 import pytest
+import torch
 
 from neural_vm.embedding import Opcode
 
@@ -175,6 +176,174 @@ def test_bucket_key_assignment():
     assert bk(81, _DEFAULT_BUCKET_BOUNDS) == 160
     assert bk(_DEFAULT_BUCKET_BOUNDS[-1] + 1, _DEFAULT_BUCKET_BOUNDS) == _UNPREDICTED_BUCKET_KEY
     assert bk(None, _DEFAULT_BUCKET_BOUNDS) == _UNPREDICTED_BUCKET_KEY
+
+
+def test_dispatch_early_exits_when_neural_pc_points_to_exit(monkeypatch):
+    """The strict raw-neural path should stop once emitted PC reaches EXIT."""
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.constants import INSTR_WIDTH
+    from neural_vm.vm_step import Token
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    state = _ElementState(
+        bytecode=_encode([(Opcode.IMM, 42), Opcode.EXIT]),
+        context=[],
+        prefix_len=0,
+        last_pc=0,
+    )
+
+    registers = {
+        Token.REG_PC: INSTR_WIDTH,
+        Token.REG_AX: 42,
+        Token.REG_SP: 0x10000,
+        Token.REG_BP: 0x10000,
+    }
+    monkeypatch.setattr(
+        runner,
+        "_extract_register",
+        lambda _context, marker: registers.get(marker),
+    )
+
+    runner._dispatch_pure_neural(state)
+
+    assert state.halted is True
+    assert state.exit_code == 42
+    assert state.last_pc == INSTR_WIDTH
+    assert state.last_ax == 42
+
+
+def test_speculation_guard_blocks_call_frame_opcodes():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+    from neural_vm.speculative import DraftVM
+
+    bytecode = _encode([
+        (Opcode.JSR, 3),
+        Opcode.EXIT,
+        Opcode.NOP,
+        (Opcode.ENT, 0),
+        (Opcode.IMM, 42),
+        Opcode.LEV,
+    ])
+
+    vm = DraftVM(bytecode)
+    assert not BatchedPureNeuralRunner._draft_opcode_safe_for_speculation(vm)
+
+    vm.idx = 4
+    vm.pc = 34
+    assert BatchedPureNeuralRunner._draft_opcode_safe_for_speculation(vm)
+
+    vm.idx = 5
+    vm.pc = 42
+    assert not BatchedPureNeuralRunner._draft_opcode_safe_for_speculation(vm)
+
+
+def test_declarative_halt_horizon_marks_overrun_as_divergence():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.vm_step import Token
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    runner._dispatch_pure_neural = lambda _state: None
+    state = _ElementState(
+        bytecode=_encode([(Opcode.IMM, 42), Opcode.EXIT]),
+        context=[],
+        prefix_len=0,
+        token_pos=Token.STEP_TOKENS - 1,
+        expected_steps=1,
+    )
+
+    runner._step_one(state, Token.STEP_END, 0)
+
+    assert state.halted is True
+    assert state.exit_code is None
+
+
+class _FakeBatchedModel:
+    def __init__(self):
+        self.calls = []
+
+    def forward(self, token_ids, kv_cache=None, cached_prefix_len=0):
+        self.calls.append({
+            "kv_cache": kv_cache,
+            "cached_prefix_len": cached_prefix_len,
+            "shape": tuple(token_ids.shape),
+        })
+        batch, seq_len = token_ids.shape
+        out_len = seq_len - cached_prefix_len if cached_prefix_len > 0 else seq_len
+        logits = torch.zeros((batch, out_len, 8), dtype=torch.float32)
+        logits[:, :, 3] = 1.0
+        return logits
+
+
+def _fake_kv_runner(*, verify):
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    runner.model = _FakeBatchedModel()
+    runner._device = torch.device("cpu")
+    runner.use_kv_cache = True
+    runner.kv_cache_verify = verify
+    runner.kv_cache_verify_interval = 1
+    runner.kv_cache_max_tokens = 32
+    runner._kv_cache_obj = None
+    runner._kv_active_idx = (0, 1)
+    runner._kv_cached_rows = [[10, 11, 12], [20, 21, 22]]
+    runner._kv_incremental_count = 0
+    runner._kv_stats = {
+        "calls": 0,
+        "hits": 0,
+        "fallbacks": 0,
+        "mismatches": 0,
+        "eviction_pressure": 0,
+        "verifications": 0,
+        "fresh_forwards": 0,
+        "kv_forwards": 0,
+        "verification_forwards": 0,
+        "cache_rebuilds": 0,
+        "reused_token_slots": 0,
+    }
+    runner._get_or_build_kv_cache = lambda: object()
+    return runner
+
+
+def test_batched_kv_verify_off_does_not_run_fresh_verification():
+    runner = _fake_kv_runner(verify=False)
+
+    preds, pred_start, real_lens = runner._forward_argmax_batch(
+        [[10, 11, 12, 13], [20, 21, 22, 23]],
+        [0, 1],
+        first_logit_pos=2,
+    )
+
+    assert pred_start == 2
+    assert real_lens == [4, 4]
+    assert preds == [[3, 3], [3, 3]]
+    assert len(runner.model.calls) == 1
+    assert runner.model.calls[0]["kv_cache"] is not None
+    assert runner.model.calls[0]["cached_prefix_len"] == 2
+    assert runner._kv_stats["calls"] == 1
+    assert runner._kv_stats["hits"] == 1
+    assert runner._kv_stats["kv_forwards"] == 1
+    assert runner._kv_stats["fresh_forwards"] == 0
+    assert runner._kv_stats["verifications"] == 0
+    assert runner._kv_stats["verification_forwards"] == 0
+    assert runner._kv_stats["reused_token_slots"] == 4
+
+
+def test_batched_kv_verify_on_runs_one_fresh_verification():
+    runner = _fake_kv_runner(verify=True)
+
+    runner._forward_argmax_batch(
+        [[10, 11, 12, 13], [20, 21, 22, 23]],
+        [0, 1],
+        first_logit_pos=2,
+    )
+
+    assert len(runner.model.calls) == 2
+    assert runner.model.calls[0]["kv_cache"] is not None
+    assert runner.model.calls[1]["kv_cache"] is None
+    assert runner._kv_stats["kv_forwards"] == 1
+    assert runner._kv_stats["verifications"] == 1
+    assert runner._kv_stats["verification_forwards"] == 1
 
 
 @pytest.mark.slow

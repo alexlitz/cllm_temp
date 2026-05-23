@@ -191,7 +191,17 @@ class _AddSubGEToBD(nn.Module):
         mark_ax = x_bd[:, :, BD.MARK_AX]
         opcode_mask = opcode_mask * (mark_ax > 0.5).float()
 
-        x_bd_out = self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
+        # The transitional L8 block still contains legacy lookup ADD/SUB
+        # units before this efficient post-op. Let this stage be authoritative
+        # for active ADD/SUB markers by clearing the legacy marker result and
+        # intra-byte carry lanes before GE->BD writes the neural result.
+        active = opcode_mask[:, :, None]
+        x_bd_clean = x_bd.clone()
+        x_bd_clean[:, :, BD.OUTPUT_LO:BD.OUTPUT_LO + 16] *= (1.0 - active)
+        x_bd_clean[:, :, BD.OUTPUT_HI:BD.OUTPUT_HI + 16] *= (1.0 - active)
+        x_bd_clean[:, :, BD.CARRY:BD.CARRY + 3] *= (1.0 - active)
+
+        x_bd_out = self.ge_to_bd(x_ge_out, x_bd_clean, opcode_mask=opcode_mask)
         return x_bd_out
 
     # Stub methods for compatibility with vm_step.py model utilities.

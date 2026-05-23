@@ -741,3 +741,7 @@ def declare_setdim_compat_dims(
         _declare(name, 48)
     for name in thirty_two_dim:
         _declare(name, 32)
+    # Internal-only STACK0 byte flags. Declare these last so adding them does
+    # not renumber any pre-existing compiler-allocated non-IO dims.
+    for name in ("STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3"):
+        _declare(name, 1)

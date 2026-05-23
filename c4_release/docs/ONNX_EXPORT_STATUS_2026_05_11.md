@@ -48,7 +48,7 @@ Validation:
 | `NeuralVMEmbedding._add_code_addr_keys` | Vectorized: `torch.where` + `argmax` + masked add. No `.item()`. The trace specializes `S` to 200 (acceptable). |
 | `TransformerBlock.forward` | `attn → ffn → post_ops`. No `.item()`. |
 | `AutoregressiveAttention.forward` (default path, `kv_cache=None`, `x_is_new_only=False`) | Pure tensor ops including ALiBi+RoPE+softmax1. The only Python branches (`if kv_cache is not None`, `if S_kv > rope_capacity`, `if H*HD == D`) are constant-folded at trace time and irrelevant when `kv_cache=None`. |
-| `SoftMoEFFN` | `torch.onnx.is_in_onnx_export()` correctly routes to `_soft_forward` (all-experts parallel, no `.item()`). 17 such modules in the model — all traced clean. |
+| `StandardMoEFFN` | Standard top-K MoE module. The eager path is sparse expert dispatch and avoids executing zero-gate tokens. |
 | All ALU post_ops (`BinaryOpByteZeroingPostOp`, `CarryPropagationPostOp`, `BitwiseBytePropagationPostOp`, `ComparisonCombine`) | Pure `PureFFN` subclasses; tensor-only. |
 | ALU MUL/DIVMOD multi-stage `nn.Sequential` pipelines (post-early-out) | Stages themselves are FFN/linear; tracing collapses them. |
 
@@ -73,8 +73,7 @@ Each entry below documents:
   active, so the constant-folded branch returns `x_bd` unchanged. The
   exported graph **omits the entire long-division pipeline** — DIV/MOD
   would produce wrong results in the ONNX runtime.
-- **Fix** (≤30 lines): replace with a tensor-only soft gate identical
-  to the strategy used by `SoftMoEFFN._soft_forward`. Compute
+- **Fix** (≤30 lines): replace with a tensor-only opcode gate. Compute
   `pipeline(x_bd)` unconditionally; let the existing stage-3 mask
   (`(OP_DIV>0.1 OR OP_MOD>0.1) AND MARK_AX>0.5`) zero out the writeback.
   This is what the perf comment already says is the strict-subset

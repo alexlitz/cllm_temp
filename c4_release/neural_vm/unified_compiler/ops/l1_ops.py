@@ -1,7 +1,8 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
-from ..primitives import AO, AP, DeclarativeAttentionHeadSpec
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -14,9 +15,8 @@ def make_layer1_ffn_op() -> Operation:
     Writes STACK0_BYTE0, BYTE_INDEX_0, BYTE_INDEX_1, BYTE_INDEX_2, BYTE_INDEX_3.
     """
     def bake(ffn, dim_positions, S):
-        from ...setup_helpers import _set_layer1_ffn
         proxy = _as_setdim_proxy(dim_positions)
-        _set_layer1_ffn(ffn, S, proxy)
+        _bake_layer1_ffn(ffn, S, proxy)
 
     # Dim-ownership claims: L1 FFN writes 5 units at fixed positions:
     #   unit 0: STACK0_BYTE0
@@ -89,7 +89,6 @@ def _bake_layer1_ffn(ffn, S, BD):
 def make_layer1_threshold_attn_op() -> Operation:
     """L1 attention: 3 fine threshold heads + STEP_END + L1H4."""
     def bake(attn, dim_positions, S):
-        from ..primitives import Primitives
         proxy = _as_setdim_proxy(dim_positions)
         ALIBI_S = 10.0
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
@@ -152,8 +151,35 @@ def make_layer1_threshold_attn_op() -> Operation:
         layer_idx=1,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer1_threshold_ir,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _layer1_threshold_ir(dim_positions, HD) -> CompilerIR:
+    proxy = _as_setdim_proxy(dim_positions)
+    ALIBI_S = 10.0
+    ir = CompilerIR()
+    specs = list(Primitives.threshold_attention_head_specs(
+        [0.5, 1.5, 2.5],
+        [proxy.L1H0, proxy.L1H1, proxy.L1H2],
+        ALIBI_S,
+        HD,
+        heads=[0, 1, 2],
+        bd=proxy,
+    ))
+    specs.append(DeclarativeAttentionHeadSpec(
+        head_idx=3,
+        q=(AP(0, proxy.CONST, 10.0),),
+        k=(AP(0, proxy.MARK_SE_ONLY, 10.0),),
+        v=(AP(1, proxy.MARK_SE_ONLY, 1.0),),
+        o=(AO(proxy.HAS_SE, 1, 1.0),),
+    ))
+    specs.extend(Primitives.threshold_attention_head_specs(
+        [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4], bd=proxy,
+    ))
+    ir.layer(0).attention.extend(specs)
+    return ir

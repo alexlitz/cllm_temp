@@ -284,32 +284,18 @@ class AutoregressiveVMRunner:
                 ``c4_release/neural_vm/cuda_graph_bench.py`` found that
                 manual capture is ~3× **slower** than eager for this model
                 (compute-bound). See ``c4_release/docs/CUDA_GRAPHS_MULTI_STEP.md``.
-            enable_moe_routing: If True, call ``model.compact()`` +
-                ``model.compact_moe()`` after construction so each FFN
-                layer's opcode-dependent hidden units are partitioned into
-                per-opcode ``SoftMoEFFN`` experts plus a shared FFN. This
-                is the standard top-K MoE path (Mixtral/DeepSeek/Qwen-
-                style): only the K experts selected by the OP_* one-hot
-                router actually run per token. For C4 ``top_k=1`` is the
-                natural choice — exactly one opcode is active per step.
+            enable_moe_routing: If True, request
+                ``compile_full_vm(enable_moe_routing=True)`` so the compiler
+                emits a model whose eligible FFN layers are already
+                partitioned into per-opcode ``StandardMoEFFN`` experts plus a
+                shared FFN. This is the standard top-K MoE path
+                (Mixtral/DeepSeek/Qwen-style): only the K experts selected by
+                the OP_* one-hot router run per token. For C4 ``top_k=1`` is
+                the natural choice.
 
-                **Defaults False.**  Byte-identity to the dense compacted
-                FFN is NOT achievable with the current partition: see
-                ``c4_release/docs/MOE_ROUTING_AUDIT.md`` for details.
-                Briefly, the partition labels a hidden unit as
-                "opcode-X-specific" via ``W_up[i, OP_X] > 0.5``, but
-                that unit's full row of W_up still picks up contributions
-                from OTHER input dims at non-MARK_PC positions in the
-                dense path. Routing those units to an opcode-gated expert
-                drops their non-MARK_PC contribution. ``test_imm_exit``
-                returns 42 with ``enable_moe_routing=False`` (dense) and
-                43 with ``enable_moe_routing=True`` (standard top-K MoE).
-                A future partition that's tight under one-hot routing
-                would close this gap.
-
-                Set True to enable the top-K MoE path for diagnostics
-                / A-B experiments or where the byte-identity gap is
-                acceptable.
+                Defaults False until the MoE-on smoke gate is promoted to the
+                primary testing path. The compiler-owned transform is cached
+                separately from the dense model.
         """
         if enable_cuda_graphs:
             raise NotImplementedError(
@@ -343,20 +329,15 @@ class AutoregressiveVMRunner:
                 n_heads=n_heads,
                 ffn_hidden=ffn_hidden,
                 max_seq_len=max_seq_len,
+                enable_moe_routing=enable_moe_routing,
             )
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
             self.model.eval()
-            # Wire standard top-K SoftMoEFFN routing onto the production
-            # path. ``compact()`` must run first because
-            # ``_partition_compact_ffn_by_opcode`` reads the
-            # already-compacted hidden-unit layout. Gated by
-            # ``enable_moe_routing`` so tests can opt out and exercise the
-            # dense compacted FFN.  Applied BEFORE ``torch.compile`` so the
-            # compiled graph captures the SoftMoEFFN forward.
-            if enable_moe_routing:
-                self.model.compact(block_size=32)
-                self.model.compact_moe()
+            # Standard top-K MoE routing is emitted by
+            # compile_full_vm(enable_moe_routing=True) so the compiler/cache
+            # owns the structural transform and compiled graphs see the
+            # final module topology.
             if compile_mode and compile_mode != "none":
                 # The model has ~30 blocks with distinct FFN shapes (each
                 # block was right-sized by ``_right_size_ffns``). Compiling
@@ -752,7 +733,7 @@ class AutoregressiveVMRunner:
         # Match the current model active_opcode so the next
         # ``_generate_next_cached`` call does not see a sentinel mismatch and
         # discard the preload. ``_active_opcode`` was retired with the
-        # SoftMoEFFN migration so ``cur_opcode`` is ``None`` in practice, but
+        # StandardMoEFFN migration so ``cur_opcode`` is ``None`` in practice, but
         # we use the same getattr pattern as the generator to stay in sync.
         self._kv_cached_opcode = getattr(self.model, "_active_opcode", None)
 
@@ -1084,7 +1065,7 @@ class AutoregressiveVMRunner:
         # its role at the proper level (transformer K/V, not embedding deltas).
         self._preload_kv_cache_with_prefix(context)
 
-        # The MoE routing signal is read tensor-natively inside SoftMoEFFN
+        # The MoE routing signal is read tensor-natively inside StandardMoEFFN
         # (see neural_vm.pure_moe); no Python-side bytecode peek required.
 
         # Speculative-decoding gate: only honored when pure_neural=True. The
@@ -1566,18 +1547,33 @@ class AutoregressiveVMRunner:
 
             at_step_boundary = (token_pos % STEP == 0)
 
+            # Windowed context (matches the legacy path's 512-token tail).
+            if len(context) > prefix_len + 512:
+                gen_ctx = context[: prefix_len] + context[-512:]
+            else:
+                gen_ctx = list(context)
+
+            # Cap the draft horizon to the compiled model/cache window. The
+            # batched runner already does this; the serial path needs the
+            # same guard because very long fixed K values can otherwise build
+            # verifier tensors longer than the model's KV cache can represent
+            # as a strict prefix.
+            model_max_seq = int(getattr(self.model, "max_seq_len", len(gen_ctx)))
+            room_tokens = max(0, model_max_seq - len(gen_ctx))
+            effective_spec_k = min(spec_k, room_tokens // STEP)
+
             # Build draft only when we are at a clean step boundary. Mid-
             # step we fall back to one-token decode (still through this
             # method) so per-step dispatch state (e.g. mem_history rebuild)
             # stays correctly aligned.
             draft: List[int] = []
             if (
-                spec_k > 0
+                effective_spec_k > 0
                 and at_step_boundary
                 and self._draft_vm is not None
             ):
                 self._sync_draft_vm_from_runner()
-                for _ in range(spec_k):
+                for _ in range(effective_spec_k):
                     if self._draft_vm.halted:
                         break
                     if not self._draft_vm.step():
@@ -1586,32 +1582,25 @@ class AutoregressiveVMRunner:
                     if self._draft_vm.halted:
                         break
 
-            # Windowed context (matches the legacy path's 512-token tail).
-            if len(context) > prefix_len + 512:
-                gen_ctx = context[: prefix_len] + context[-512:]
-            else:
-                gen_ctx = list(context)
-
             # Build the full sequence (windowed prefix + drafts) and run a
-            # single forward pass. Speculation deliberately bypasses the KV
-            # cache: the cache only buys us anything when forward calls
-            # share a long common prefix that grows by one token at a time;
-            # here we are running a single full forward over the windowed
-            # context per outer iter, and a fresh forward avoids the
-            # incremental-matmul drift discussed in ``_KV_INCREMENTAL_FLUSH``.
+            # single verifier forward. When KV caching is enabled, reuse the
+            # common prefix and recompute from the final context token onward:
+            # logits at position ``prefix_end - 1`` are what verify draft[0],
+            # so caching through ``prefix_end`` would skip the first verifier
+            # logit we need.
             seq = gen_ctx + draft
-            device = next(self.model.parameters()).device
-            tensor = torch.tensor([seq], dtype=torch.long, device=device)
-            logits = self.model.forward(tensor)
-            preds = logits[0].argmax(dim=-1).cpu().tolist()  # [len(seq)]
             prefix_end = len(gen_ctx)
+            preds, pred_start, _used_kv = self._forward_speculative_verifier(
+                seq,
+                first_logit_pos=max(0, prefix_end - 1),
+            )
 
             if not draft:
                 # Pure single-token decode (no spec budget this iter — only
                 # happens for the first iter post-spec-rejection while we
                 # re-align to a step boundary; the disabled-spec branch
                 # above handles the long-term fallback).
-                next_token = int(preds[prefix_end - 1])
+                next_token = int(preds[prefix_end - 1 - pred_start])
                 self._apply_token_spec(
                     context, next_token, token_pos, bytecode, prefix_len, output
                 )
@@ -1630,7 +1619,7 @@ class AutoregressiveVMRunner:
                 if (j % STEP) in _SPEC_UNSAFE_OFFSETS:
                     accepted = j + 1
                     continue
-                pred = int(preds[prefix_end - 1 + j])
+                pred = int(preds[prefix_end - 1 + j - pred_start])
                 if pred == draft[j]:
                     accepted = j + 1
                 else:
@@ -1663,6 +1652,64 @@ class AutoregressiveVMRunner:
                 self._spec_zero_streak = 0
 
         return "".join(output), self._decode_exit_code(context)
+
+    def _forward_speculative_verifier(self, seq, *, first_logit_pos):
+        """Run a speculative verifier forward and return argmax tokens.
+
+        ``first_logit_pos`` is the earliest absolute position in ``seq`` whose
+        next-token logits the caller will inspect. For speculative decoding
+        this is the final real-context token, because that logit verifies the
+        first drafted token. The KV cache may therefore cover only positions
+        strictly before ``first_logit_pos``.
+
+        Returns:
+            ``(preds, pred_start, used_kv)`` where ``preds[k]`` is the argmax
+            for absolute sequence position ``pred_start + k``.
+        """
+        device = next(self.model.parameters()).device
+        tensor = torch.tensor([seq], dtype=torch.long, device=device)
+
+        if not self.use_kv_cache:
+            logits = self.model.forward(tensor)
+            return logits[0].argmax(dim=-1).cpu().tolist(), 0, False
+
+        cur_opcode = getattr(self.model, "_active_opcode", None)
+        if cur_opcode != self._kv_cached_opcode:
+            self._reset_kv_cache()
+            self._kv_cached_opcode = cur_opcode
+
+        if self._kv_incremental_count >= self._KV_INCREMENTAL_FLUSH:
+            self._reset_kv_cache()
+            self._kv_cached_opcode = cur_opcode
+
+        prefix_match = self._kv_common_prefix_len(seq)
+        cached_prefix_len = min(prefix_match, int(first_logit_pos))
+        self._trim_kv_cache(cached_prefix_len)
+
+        kv_cache = self._get_or_build_kv_cache()
+        logits = self.model.forward(
+            tensor,
+            kv_cache=kv_cache,
+            cached_prefix_len=cached_prefix_len,
+        )
+        cached_preds = logits[0].argmax(dim=-1).cpu().tolist()
+
+        # Correctness guard for incremental K/V reuse and eviction/trimming:
+        # compare the cached verifier outputs against a fresh full-window
+        # forward for every position the speculative verifier may inspect. If
+        # they differ, invalidate the cache and make the fresh logits
+        # authoritative. This keeps KV cache as an optimization only.
+        fresh_logits = self.model.forward(tensor)
+        fresh_preds = fresh_logits[0].argmax(dim=-1).cpu().tolist()
+        fresh_tail = fresh_preds[cached_prefix_len:]
+        if cached_preds != fresh_tail:
+            self._reset_kv_cache()
+            self._kv_cached_opcode = cur_opcode
+            return fresh_preds, 0, False
+
+        self._kv_cached_tokens = list(seq)
+        self._kv_incremental_count += 1
+        return cached_preds, cached_prefix_len, True
 
     def _run_speculative_fallback_kv_cached(
         self, context, bytecode, prefix_len, output,
@@ -2025,8 +2072,21 @@ class AutoregressiveVMRunner:
             # directly. Per BLOG_SPEC.md line 3 — "no auxiliary memory or
             # python variables".
 
-            # Only break on EXIT
-            return exec_op == Opcode.EXIT
+            # Stop on EXIT, and also stop immediately after a completed step
+            # whose model-emitted PC points at EXIT. The latter mirrors
+            # BatchedPureNeuralRunner: the current step's AX is already the
+            # architectural return value, and asking the model to emit an
+            # additional EXIT step can clobber byte positions that are not
+            # semantically needed for the result.
+            if exec_op == Opcode.EXIT:
+                return True
+            if self._last_pc is not None:
+                next_idx = self._last_pc // INSTR_WIDTH
+                if 0 <= next_idx < len(bytecode):
+                    next_op = bytecode[next_idx] & 0xFF
+                    if next_op == Opcode.EXIT:
+                        return True
+            return False
 
         pc = self._extract_register(context, Token.REG_PC)
         op = None
@@ -2232,7 +2292,7 @@ class AutoregressiveVMRunner:
             if pc is not None:
                 self._last_pc = pc
 
-        # MoE routing is tensor-native (see neural_vm.pure_moe.SoftMoEFFN);
+        # MoE routing is tensor-native (see neural_vm.pure_moe.StandardMoEFFN);
         # no per-step weight swap is needed between forward calls.
 
         # V10 RETIRED (2026-05-12): the handler-mode MEM persistence shim

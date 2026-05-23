@@ -61,10 +61,21 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 
-from .layer_compiler import LayerCompiler, Operation
+from .layer_compiler import LayerCompiler, Operation, operation_display_label
 
 
 _LEGACY_HELPER_CALL_RE = re.compile(r"\b_set_[A-Za-z0-9_]+\(")
+_LAYER_PREFIX_RE = re.compile(r"^(?:layer|l)\d+_")
+
+
+def semantic_op_label(op_name: str) -> str:
+    """Return a placement-neutral display label for an operation name.
+
+    Operation names are stable IDs and still carry historical layer prefixes
+    in many places. Reports should avoid implying those prefixes are the
+    authority now that placement can be resolved dynamically.
+    """
+    return _LAYER_PREFIX_RE.sub("", op_name)
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +368,11 @@ def _diff_block_by_ptr(
     uncategorized = 0
 
     attn = block.attn
-    head_dim = attn.W_q.shape[0] // num_heads
+    # Some migrated attention bakes resize individual blocks to add auxiliary
+    # heads. Decode ownership against the block's actual head count; using the
+    # compile-wide default aliases expanded heads to the wrong ``head_slot`` ids.
+    actual_num_heads = int(getattr(attn, "num_heads", num_heads))
+    head_dim = attn.W_q.shape[0] // actual_num_heads
     for attr_name, scope in _ATTN_MATRICES:
         param = getattr(attn, attr_name, None)
         if param is None:
@@ -373,7 +388,7 @@ def _diff_block_by_ptr(
         for r, c in zip(rows.tolist(), cols.tolist()):
             claim = _decode_attn_cell(
                 layer_idx, scope, r, c,
-                num_heads=num_heads, head_dim=head_dim,
+                num_heads=actual_num_heads, head_dim=head_dim,
                 dim_ranges=dim_ranges,
             )
             if claim is None:
@@ -688,6 +703,7 @@ def _build_result(
 @dataclass
 class DynamicVerificationResult:
     op_name: str
+    display_label: Optional[str] = None
     notes: List[str] = field(default_factory=list)
     drift: List[str] = field(default_factory=list)
 
@@ -703,7 +719,8 @@ class DynamicVerificationReport:
         lines = ["=== Dynamic produces/consumes verification report ==="]
         for r in self.results:
             status = "OK" if not r.drift else "DRIFT"
-            lines.append(f"  [{status}] {r.op_name}")
+            label = r.display_label or r.op_name
+            lines.append(f"  [{status}] {label} (op={r.op_name})")
             for n in r.notes:
                 lines.append(f"     NOTE: {n}")
             for d in r.drift:
@@ -797,7 +814,10 @@ def verify_produces_consumes_dynamic(
         return report
 
     for op in candidates:
-        res = DynamicVerificationResult(op_name=op.name)
+        res = DynamicVerificationResult(
+            op_name=op.name,
+            display_label=operation_display_label(op),
+        )
         # Locate the op's layer.
         layer_idx = None
         if op.kind == "block":
@@ -922,6 +942,7 @@ class MultistepDriftEntry:
 class MultistepVerificationResult:
     """Per-op outcome of multistep dynamic verification."""
     op_name: str
+    display_label: Optional[str] = None
     layer_idx: Optional[int] = None
     notes: List[str] = field(default_factory=list)
     drift: List[MultistepDriftEntry] = field(default_factory=list)
@@ -954,10 +975,12 @@ class MultistepVerificationReport:
         ]
         for r in self.results:
             status = "OK" if not r.drift else "DRIFT"
-            layer_tag = (
-                f" (layer {r.layer_idx})" if r.layer_idx is not None else ""
+            placement_tag = (
+                f" (placement_idx={r.layer_idx})"
+                if r.layer_idx is not None else ""
             )
-            lines.append(f"  [{status}] {r.op_name}{layer_tag}")
+            label = r.display_label or r.op_name
+            lines.append(f"  [{status}] {label} (op={r.op_name}){placement_tag}")
             for n in r.notes:
                 lines.append(f"     NOTE: {n}")
             for d in r.drift:
@@ -966,6 +989,67 @@ class MultistepVerificationReport:
                     f"register={d.register!r} pos={d.position} "
                     f"observed_abs_max={d.observed:.3e}"
                 )
+        return "\n".join(lines)
+
+
+@dataclass
+class SymbolicDeclarationProducer:
+    """Declaration-side producer for one VM register slot."""
+    op_name: str
+    display_label: str
+    dim: str
+    register: str
+    layer_idx: Optional[int] = None
+
+
+@dataclass
+class SymbolicDeclarationStep:
+    """One step of a declaration-only register responsibility trace."""
+    step: int
+    active_opcode: Optional[str]
+    state_summary: str
+    producers_by_register: Dict[str, List[SymbolicDeclarationProducer]] = field(default_factory=dict)
+    missing_registers: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SymbolicDeclarationTraceReport:
+    """Symbolic view of declarations over a concrete probe program.
+
+    This does not execute the neural model and does not feed expected values
+    into inference. It is a debugging map from expected VM register slots to
+    ops that declare they produce those slots.
+    """
+    n_steps: int = 0
+    program_summary: str = ""
+    watched_registers: Tuple[str, ...] = ()
+    steps: List[SymbolicDeclarationStep] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    def has_missing(self) -> bool:
+        return any(step.missing_registers for step in self.steps)
+
+    def format(self) -> str:
+        lines = [
+            "=== Symbolic declaration trace ===",
+            f"Program: {self.program_summary}",
+            f"Steps: {self.n_steps}",
+            "Watched registers: " + ", ".join(self.watched_registers),
+        ]
+        for step in self.steps:
+            opcode = step.active_opcode or "HALTED"
+            lines.append(f"  step {step.step}: opcode={opcode} {step.state_summary}")
+            for reg in self.watched_registers:
+                producers = step.producers_by_register.get(reg, [])
+                if not producers:
+                    lines.append(f"     MISSING: {reg}")
+                    continue
+                labels = ", ".join(
+                    f"{p.display_label}({p.dim})" for p in producers
+                )
+                lines.append(f"     {reg}: {labels}")
+        for note in self.notes:
+            lines.append(f"  NOTE: {note}")
         return "\n".join(lines)
 
 
@@ -1021,6 +1105,21 @@ def _pack_instr(opcode: int, imm: int = 0) -> int:
     CODE_START.
     """
     return (opcode & 0xFF) | ((imm & 0xFFFFFF) << 8)
+
+
+def _opcode_value_to_symbol(opcode: int) -> str:
+    """Return the short Opcode constant name for an encoded opcode byte."""
+    try:
+        from ..embedding import Opcode
+        for name in dir(Opcode):
+            if name.startswith("_"):
+                continue
+            value = getattr(Opcode, name)
+            if isinstance(value, int) and value == opcode:
+                return name
+    except Exception:
+        pass
+    return f"OP_{opcode}"
 
 
 # Canonical ADD-cascade program used by the multistep probe. The byte-level
@@ -1109,6 +1208,32 @@ def _build_multistep_probe(
 
     token_tensor = torch.tensor([tokens], dtype=torch.long)
     return token_tensor, step_markers, step_summaries
+
+
+def _build_symbolic_probe_opcodes(
+    program: List[int],
+    n_steps: int,
+) -> List[Optional[str]]:
+    """Return the opcode executed at each DraftVM probe step.
+
+    DraftVM is used here only as a diagnostic oracle for the probe path, just
+    like ``_build_multistep_probe``. The returned names are not consumed by
+    the runner or used to substitute model output.
+    """
+    from ..speculative import DraftVM
+
+    vm = DraftVM(program)
+    out: List[Optional[str]] = []
+    for _ in range(n_steps):
+        if vm.halted or vm.idx >= len(vm.code):
+            out.append(None)
+            continue
+        opcode = vm.code[vm.idx] & 0xFF
+        if not vm.step():
+            out.append(None)
+            continue
+        out.append(_opcode_value_to_symbol(opcode))
+    return out
 
 
 def verify_produces_consumes_multistep(
@@ -1246,7 +1371,10 @@ def verify_produces_consumes_multistep(
         return report
 
     for op in candidates:
-        result = MultistepVerificationResult(op_name=op.name)
+        result = MultistepVerificationResult(
+            op_name=op.name,
+            display_label=operation_display_label(op),
+        )
 
         # Resolve op's layer (same logic Mode B uses).
         layer_idx = None
@@ -1408,6 +1536,105 @@ def _resolve_op_layer(layout, op: Operation) -> Optional[int]:
         if any(placed.name == op.name for placed in ops_at):
             return layer_idx
     return op.layer_idx
+
+
+_ADD_CASCADE_WATCHED_REGISTERS = (
+    "AX_byte0",
+    "SP_byte0", "SP_byte1", "SP_byte2", "SP_byte3",
+    "BP_byte0", "BP_byte1", "BP_byte2", "BP_byte3",
+    "STACK0_byte0", "STACK0_byte1", "STACK0_byte2", "STACK0_byte3",
+)
+
+
+def trace_symbolic_declarations(
+    layout=None,
+    program: Optional[List[int]] = None,
+    n_steps: int = 4,
+    *,
+    watched_registers: Optional[Tuple[str, ...]] = None,
+    alu_mode: str = "lookup",
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    n_heads: int = 8,
+) -> SymbolicDeclarationTraceReport:
+    """Build a declaration-only responsibility trace for a probe program.
+
+    The trace answers: for each watched VM register byte at each step, which
+    ops declare ``produces={dim: register}`` for that slot? It is intentionally
+    symbolic: no neural forward pass, no runner interaction, and no DraftVM
+    result substitution.
+    """
+    if program is None:
+        program = list(_ADD_CASCADE_PROGRAM)
+    if watched_registers is None:
+        watched_registers = _ADD_CASCADE_WATCHED_REGISTERS
+
+    report = SymbolicDeclarationTraceReport(
+        n_steps=n_steps,
+        program_summary=" ".join(f"0x{instr:016x}" for instr in program),
+        watched_registers=watched_registers,
+    )
+
+    if layout is None:
+        try:
+            layout = _build_layout_only(
+                alu_mode=alu_mode,
+                enable_conversational_io=enable_conversational_io,
+                enable_tool_calling=enable_tool_calling,
+                n_heads=n_heads,
+            )
+        except Exception as exc:
+            report.notes.append(f"layout build failed: {exc!r}")
+            return report
+
+    try:
+        _, _, step_summaries = _build_multistep_probe(layout, program, n_steps)
+        active_opcodes = _build_symbolic_probe_opcodes(program, n_steps)
+    except Exception as exc:
+        report.notes.append(f"probe build failed: {exc!r}")
+        return report
+
+    producers_by_register: Dict[str, List[SymbolicDeclarationProducer]] = {
+        reg: [] for reg in watched_registers
+    }
+    for op in _collect_unique_ops_with(layout, lambda candidate: bool(candidate.produces)):
+        layer_idx = _resolve_op_layer(layout, op)
+        for dim_name, register in op.produces.items():
+            if register not in producers_by_register:
+                continue
+            producers_by_register[register].append(SymbolicDeclarationProducer(
+                op_name=op.name,
+                display_label=operation_display_label(op),
+                dim=dim_name,
+                register=register,
+                layer_idx=layer_idx,
+            ))
+
+    for step_idx in range(n_steps):
+        step_producers = {
+            reg: list(producers)
+            for reg, producers in producers_by_register.items()
+            if producers
+        }
+        missing = [
+            reg for reg in watched_registers
+            if not step_producers.get(reg)
+        ]
+        report.steps.append(SymbolicDeclarationStep(
+            step=step_idx + 1,
+            active_opcode=(
+                active_opcodes[step_idx]
+                if step_idx < len(active_opcodes) else None
+            ),
+            state_summary=(
+                step_summaries[step_idx]
+                if step_idx < len(step_summaries) else "(missing)"
+            ),
+            producers_by_register=step_producers,
+            missing_registers=missing,
+        ))
+
+    return report
 
 
 def _resolve_alibi_layer(layout, op: Operation) -> Optional[int]:
@@ -2055,6 +2282,7 @@ class DeclarativeAuthorityReport:
     authoritative_ops: List[str] = field(default_factory=list)
     legacy_wrapper_ops: List[str] = field(default_factory=list)
     unclassified_ops: List[str] = field(default_factory=list)
+    semantic_labels: Dict[str, str] = field(default_factory=dict)
     explicit_sources: Dict[str, str] = field(default_factory=dict)
     inferred_sources: Dict[str, str] = field(default_factory=dict)
 
@@ -2078,6 +2306,9 @@ class DeclarativeAuthorityReport:
         lines.append(f"Explicit source markers: {len(self.explicit_sources)}")
         lines.append(f"Inferred source markers: {len(self.inferred_sources)}")
         return "\n".join(lines)
+
+    def semantic_label(self, op_name: str) -> str:
+        return self.semantic_labels.get(op_name, semantic_op_label(op_name))
 
 
 def _looks_like_opaque_legacy_wrapper(op: Operation) -> bool:
@@ -2125,8 +2356,10 @@ def audit_declarative_authority(
     unclassified: List[str] = []
     explicit: Dict[str, str] = {}
     inferred: Dict[str, str] = {}
+    semantic_labels: Dict[str, str] = {}
 
     for op in _collect_unique_ops_with(layout, lambda _op: True):
+        semantic_labels[op.name] = operation_display_label(op)
         source = op.declarative_authority
         if source is not None:
             explicit[op.name] = source
@@ -2153,6 +2386,7 @@ def audit_declarative_authority(
         authoritative_ops=sorted(authoritative),
         legacy_wrapper_ops=sorted(legacy_wrapper),
         unclassified_ops=sorted(unclassified),
+        semantic_labels=dict(sorted(semantic_labels.items())),
         explicit_sources=explicit,
         inferred_sources=inferred,
     )

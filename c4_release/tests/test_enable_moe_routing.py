@@ -1,17 +1,17 @@
 """Verify ``enable_moe_routing`` plumbing and the standard top-K
-``SoftMoEFFN`` structural contract.
+``StandardMoEFFN`` structural contract.
 
 Tests covered:
   1. The default (``enable_moe_routing=False``) leaves all FFN blocks
-     as dense PureFFN / ALU composites — no SoftMoEFFN.
-  2. ``enable_moe_routing=True`` installs SoftMoEFFN modules on the
+     as dense PureFFN / ALU composites — no StandardMoEFFN.
+  2. ``enable_moe_routing=True`` installs StandardMoEFFN modules on the
      blocks listed by the legacy ``compact_moe`` partition (L6, L8, L10,
      L12, L17, L20, L22, L24 in the current model).
-  3. Each installed SoftMoEFFN has ``top_k == 1`` (the C4 natural choice)
+  3. Each installed StandardMoEFFN has ``top_k == 1`` (the C4 natural choice)
      and exposes the per-expert ``expert_opcode_dims`` routing list.
   4. The runner records ``enable_moe_routing`` on ``self`` for diagnostic
      visibility.
-  5. Structural correctness: each ``SoftMoEFFN.experts[i]`` is a
+  5. Structural correctness: each ``StandardMoEFFN.experts[i]`` is a
      ``PureFFN`` with the expert's specific hidden units only; the
      ``shared_ffn`` holds the opcode-independent units (or a 1-unit
      dummy carrying ``b_down`` when the partition has no shared
@@ -36,16 +36,17 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.run_vm import AutoregressiveVMRunner  # noqa: E402
-from neural_vm.pure_moe import SoftMoEFFN, StandardMoEFFN  # noqa: E402
+from neural_vm.pure_moe import StandardMoEFFN  # noqa: E402
 from neural_vm.base_layers import PureFFN  # noqa: E402
+from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm  # noqa: E402
 
 
-def _count_softmoe_blocks(model):
-    return sum(1 for b in model.blocks if isinstance(b.ffn, SoftMoEFFN))
+def _count_standard_moe_blocks(model):
+    return sum(1 for b in model.blocks if isinstance(b.ffn, StandardMoEFFN))
 
 
 def test_default_keeps_dense_ffn():
-    """Default constructor does NOT install SoftMoEFFN (byte-identity
+    """Default constructor does NOT install StandardMoEFFN (byte-identity
     to the dense path is preserved). This locks in the post-pivot
     default state — see audit doc §8.2."""
     runner = AutoregressiveVMRunner(
@@ -53,33 +54,50 @@ def test_default_keeps_dense_ffn():
         trust_neural_alu=True,
         cache_model=False,
     )
-    n_softmoe = _count_softmoe_blocks(runner.model)
-    assert n_softmoe == 0, (
-        f"Default ``enable_moe_routing=False`` expected zero SoftMoEFFN "
-        f"blocks, found {n_softmoe}/{len(runner.model.blocks)}."
+    n_moe = _count_standard_moe_blocks(runner.model)
+    assert n_moe == 0, (
+        f"Default ``enable_moe_routing=False`` expected zero StandardMoEFFN "
+        f"blocks, found {n_moe}/{len(runner.model.blocks)}."
     )
     assert runner.enable_moe_routing is False
 
 
-def test_enable_moe_routing_true_installs_softmoe():
-    """``enable_moe_routing=True`` puts SoftMoEFFN on the live path."""
+def test_enable_moe_routing_true_installs_standard_moe():
+    """``enable_moe_routing=True`` puts StandardMoEFFN on the live path."""
     runner = AutoregressiveVMRunner(
         pure_neural=True,
         trust_neural_alu=True,
         enable_moe_routing=True,
         cache_model=False,
     )
-    n_softmoe = _count_softmoe_blocks(runner.model)
-    assert n_softmoe > 0, (
+    n_moe = _count_standard_moe_blocks(runner.model)
+    assert n_moe > 0, (
         f"Expected ``enable_moe_routing=True`` to install at least one "
-        f"SoftMoEFFN block, but found {n_softmoe} of "
+        f"StandardMoEFFN block, but found {n_moe} of "
         f"{len(runner.model.blocks)}."
     )
     assert runner.enable_moe_routing is True
 
 
-def test_softmoeffn_is_top_k_one_with_shared_expert():
-    """Every installed SoftMoEFFN has the standard top-K MoE shape:
+def test_compiler_can_emit_standard_moe():
+    """The compiler can directly emit the MoE module topology.
+
+    This keeps MoE out of runner-local post-processing, so cache keys and
+    downstream graph compilers see the final module structure.
+    """
+    model, _layout = compile_full_vm(
+        enable_moe_routing=True,
+        disk_cache=False,
+    )
+    n_moe = _count_standard_moe_blocks(model)
+    assert n_moe > 0, (
+        "compile_full_vm(enable_moe_routing=True) should emit at least "
+        "one StandardMoEFFN block"
+    )
+
+
+def test_standard_moe_is_top_k_one_with_shared_expert():
+    """Every installed StandardMoEFFN has the standard top-K MoE shape:
     ``top_k=1`` (C4 dispatches one opcode per step), a ``shared_ffn``,
     and a list of per-expert opcode dims matching the experts list.
     """
@@ -89,8 +107,8 @@ def test_softmoeffn_is_top_k_one_with_shared_expert():
         enable_moe_routing=True,
         cache_model=False,
     )
-    moe_blocks = [b for b in runner.model.blocks if isinstance(b.ffn, SoftMoEFFN)]
-    assert moe_blocks, "Expected at least one SoftMoEFFN block."
+    moe_blocks = [b for b in runner.model.blocks if isinstance(b.ffn, StandardMoEFFN)]
+    assert moe_blocks, "Expected at least one StandardMoEFFN block."
     for block in moe_blocks:
         m = block.ffn
         assert m.top_k == 1, f"top_k should default to 1 for C4; got {m.top_k}"
@@ -99,18 +117,12 @@ def test_softmoeffn_is_top_k_one_with_shared_expert():
         for e in m.experts:
             assert isinstance(e, PureFFN)
         # Always-on shared path (DeepSeek-style shared expert).
-        assert m._has_shared, "SoftMoEFFN should carry an always-on shared FFN"
+        assert m._has_shared, "StandardMoEFFN should carry an always-on shared FFN"
         assert isinstance(m.shared_ffn, PureFFN)
 
 
-def test_standardmoeffn_is_alias_for_softmoeffn():
-    """``StandardMoEFFN`` is the forward-looking name; it aliases
-    ``SoftMoEFFN`` so external callers can use either."""
-    assert StandardMoEFFN is SoftMoEFFN
-
-
 def test_topk_routing_picks_correct_expert():
-    """Build a tiny SoftMoEFFN with two experts gated by dims 5 and 6.
+    """Build a tiny StandardMoEFFN with two experts gated by dims 5 and 6.
     Verify that at a position with OP_dim_5=1.0, expert 0 fires (gate=1.0);
     at a position with OP_dim_6=1.0, expert 1 fires; at a position with
     neither, no expert fires (gate=0.0 → no contribution beyond shared)."""
@@ -148,7 +160,7 @@ def test_topk_routing_picks_correct_expert():
             f.W_up.data[0, 4] = 1.0  # gate on dim 4
             f.b_up.data[0] = 0.0
 
-    moe = SoftMoEFFN(
+    moe = StandardMoEFFN(
         experts=[e0, e1],
         expert_opcode_dims=[5, 6],
         shared_ffn=shared,
@@ -176,8 +188,6 @@ def test_topk_routing_picks_correct_expert():
         for f in (e0, e1):
             f.b_up.data[0] = 1.0  # silu(1.0) ≈ 0.73 → non-zero hidden
             f.W_up.data.zero_()
-    # Rebuild the stacked buffers since the per-expert weights changed.
-    moe._build_stacked_weights()
     out = moe(x)
     delta = (out - x)[0, :, 0]
     assert torch.is_tensor(delta)
@@ -198,9 +208,9 @@ def test_topk_routing_picks_correct_expert():
 
 
 def test_empty_moe_is_passthrough():
-    """SoftMoEFFN with zero experts and no shared FFN is identity."""
+    """StandardMoEFFN with zero experts and no shared FFN is identity."""
     D = 4
-    moe = SoftMoEFFN(
+    moe = StandardMoEFFN(
         experts=[],
         expert_opcode_dims=[],
         shared_ffn=None,
@@ -208,7 +218,7 @@ def test_empty_moe_is_passthrough():
     )
     x = torch.randn(1, 3, D)
     out = moe(x)
-    assert torch.allclose(out, x), "Empty SoftMoEFFN should be identity"
+    assert torch.allclose(out, x), "Empty StandardMoEFFN should be identity"
 
 
 if __name__ == "__main__":

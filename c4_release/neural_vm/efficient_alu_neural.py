@@ -93,10 +93,26 @@ class BDToGEConverter(nn.Module):
         # L6 FFN clears these to -5.0, and L7 attention only overwrites active indices.
         # The negative residuals corrupt the scalar conversion (sum of k * one_hot[k]).
         x_bd_clamped = x_bd.clone()
-        x_bd_clamped[:, :, BD.ALU_LO:BD.ALU_LO + 16] = torch.clamp(x_bd[:, :, BD.ALU_LO:BD.ALU_LO + 16], min=0)
-        x_bd_clamped[:, :, BD.ALU_HI:BD.ALU_HI + 16] = torch.clamp(x_bd[:, :, BD.ALU_HI:BD.ALU_HI + 16], min=0)
-        x_bd_clamped[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16] = torch.clamp(x_bd[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16], min=0)
-        x_bd_clamped[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16] = torch.clamp(x_bd[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16], min=0)
+        # BD nibble bands are semantically one-hot. Attention relays can
+        # attenuate or amplify the active lane, and values near ADD/SUB modulo
+        # thresholds are especially sensitive to tiny amplitude drift. Decode
+        # the one-hot bands by threshold before scalar projection so e.g.
+        # an active lane arriving as 0.994 still means exactly nibble 8.
+        def _clean_onehot(band):
+            return (torch.clamp(band, min=0, max=1) > 0.5).to(dtype=x_bd.dtype)
+
+        x_bd_clamped[:, :, BD.ALU_LO:BD.ALU_LO + 16] = _clean_onehot(
+            x_bd[:, :, BD.ALU_LO:BD.ALU_LO + 16]
+        )
+        x_bd_clamped[:, :, BD.ALU_HI:BD.ALU_HI + 16] = _clean_onehot(
+            x_bd[:, :, BD.ALU_HI:BD.ALU_HI + 16]
+        )
+        x_bd_clamped[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16] = _clean_onehot(
+            x_bd[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16]
+        )
+        x_bd_clamped[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16] = _clean_onehot(
+            x_bd[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16]
+        )
 
         # FIX 2026-05-09 (Phase 0): Replace argmax with linear projection (weighted sum).
         # argmax is not a SwiGLU FFN operation per the pure-neural policy. Linear
@@ -121,6 +137,32 @@ class BDToGEConverter(nn.Module):
         ax_hi = x_bd_clamped[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16]
         x_ge[:, :, 1, self.ge.NIB_A] = (alu_hi * k_coeffs).sum(dim=-1)
         x_ge[:, :, 1, self.ge.NIB_B] = (ax_hi * k_coeffs).sum(dim=-1)
+
+        # Wide binary ops need the next stack byte available to the generic
+        # NIBBLE pipeline. L8 attention stages stack byte 1 into AX_FULL_* at
+        # the AX marker; map that into operand-A GE positions 2/3 only while
+        # a wide ALU opcode is active, so stale AX_FULL usage elsewhere stays
+        # invisible to the generic converter.
+        if hasattr(BD, "AX_FULL_LO") and hasattr(BD, "AX_FULL_HI"):
+            wide_op = (
+                (x_bd[:, :, BD.OP_MUL] > 0.5)
+                | (x_bd[:, :, BD.OP_SHL] > 0.5)
+                | (x_bd[:, :, BD.OP_SHR] > 0.5)
+            ).to(dtype=x_bd.dtype)
+            ax_marker = (x_bd[:, :, BD.MARK_AX] > 0.5).to(dtype=x_bd.dtype)
+            wide_marker = wide_op * ax_marker
+            ax_full_lo = _clean_onehot(
+                x_bd[:, :, BD.AX_FULL_LO:BD.AX_FULL_LO + 16],
+            )
+            ax_full_hi = _clean_onehot(
+                x_bd[:, :, BD.AX_FULL_HI:BD.AX_FULL_HI + 16],
+            )
+            x_ge[:, :, 2, self.ge.NIB_A] = (
+                ax_full_lo * k_coeffs
+            ).sum(dim=-1) * wide_marker
+            x_ge[:, :, 3, self.ge.NIB_A] = (
+                ax_full_hi * k_coeffs
+            ).sum(dim=-1) * wide_marker
 
         # Copy opcode flags to all positions.
         # FIX 2026-05-06: Normalize opcode values to 0/1 by thresholding at 0.5.
@@ -183,7 +225,7 @@ class GEToBDConverter(nn.Module):
         self.out_pos_lo = 0
         self.out_pos_hi = 1
 
-    def forward(self, x_ge, x_bd, opcode_mask=None):
+    def forward(self, x_ge, x_bd, opcode_mask=None, emit_carry=True):
         """
         Args:
             x_ge: [B, seq_len, 8, 160] GenericE format with RESULT filled
@@ -191,6 +233,10 @@ class GEToBDConverter(nn.Module):
             opcode_mask: [B, seq_len] Optional mask indicating where opcodes are active.
                         If None, writes OUTPUT unconditionally (backward compat).
                         If provided, only writes OUTPUT where mask > 0.5.
+            emit_carry: Whether to write ADD/SUB inter-byte CARRY flags. Only
+                        add/sub ALU stages should do this; later bitwise/mul/
+                        div/shift stages can see stale OP_ADD/OP_SUB relay
+                        dims and must not rewrite carry state.
 
         Returns:
             x_bd_out: [B, seq_len, 512] with OUTPUT_LO/HI updated
@@ -230,6 +276,43 @@ class GEToBDConverter(nn.Module):
         x_bd_out[:, :, BD.OUTPUT_LO:BD.OUTPUT_LO + 16] += indicator_lo * 2.0
         x_bd_out[:, :, BD.OUTPUT_HI:BD.OUTPUT_HI + 16] += indicator_hi * 2.0
 
+        # Stage result byte 1 at AX markers for the autoregressive byte
+        # relay. The marker itself predicts byte 0; the following AX byte
+        # token predicts byte 1 by attending back to these staged nibbles.
+        if hasattr(BD, "AX_FULL_LO") and hasattr(BD, "AX_FULL_HI"):
+            result_b1_lo = x_ge[:, :, 2, self.ge.RESULT]
+            result_b1_hi = x_ge[:, :, 3, self.ge.RESULT]
+            diff_b1_lo = result_b1_lo[:, :, None] - k_vals[None, None, :]
+            diff_b1_hi = result_b1_hi[:, :, None] - k_vals[None, None, :]
+            indicator_b1_lo = (
+                torch.sigmoid(S * (diff_b1_lo + 0.5))
+                - torch.sigmoid(S * (diff_b1_lo - 0.5))
+            )
+            indicator_b1_hi = (
+                torch.sigmoid(S * (diff_b1_hi + 0.5))
+                - torch.sigmoid(S * (diff_b1_hi - 0.5))
+            )
+            wide_op = (
+                (x_bd[:, :, BD.OP_MUL] > 0.5)
+                | (x_bd[:, :, BD.OP_SHL] > 0.5)
+                | (x_bd[:, :, BD.OP_SHR] > 0.5)
+            ).to(dtype=x_bd.dtype)
+            ax_marker = (x_bd[:, :, BD.MARK_AX] > 0.5).to(dtype=x_bd.dtype)
+            wide_mask = wide_op * ax_marker
+            if opcode_mask is not None:
+                wide_mask = wide_mask * opcode_mask
+            wide_mask_expanded = wide_mask[:, :, None]
+            lo_slice = slice(BD.AX_FULL_LO, BD.AX_FULL_LO + 16)
+            hi_slice = slice(BD.AX_FULL_HI, BD.AX_FULL_HI + 16)
+            x_bd_out[:, :, lo_slice] = (
+                x_bd_out[:, :, lo_slice] * (1.0 - wide_mask_expanded)
+                + indicator_b1_lo * wide_mask_expanded * 2.0
+            )
+            x_bd_out[:, :, hi_slice] = (
+                x_bd_out[:, :, hi_slice] * (1.0 - wide_mask_expanded)
+                + indicator_b1_hi * wide_mask_expanded * 2.0
+            )
+
         # FIX 2026-05-06: Set carry/borrow flags for multi-byte propagation.
         # CarryPropagationPostOp expects:
         #   CARRY[1] for ADD overflow (sum >= 256)
@@ -261,12 +344,13 @@ class GEToBDConverter(nn.Module):
         # CarryPropagationPostOp's SUB units to fire spuriously.
         op_add = x_bd[:, :, BD.OP_ADD]
         op_sub = x_bd[:, :, BD.OP_SUB]
-        add_opcode_mask = (op_add > 1.0).float()  # OP_ADD ≈ 5.0 when active
-        sub_opcode_mask = (op_sub > 1.0).float()  # OP_SUB ≈ 5.0 when active
+        add_opcode_mask = (op_add > 0.5).float()
+        sub_opcode_mask = (op_sub > 0.5).float()
 
-        # Write CARRY[1] for ADD only, CARRY[2] for SUB only
-        x_bd_out[:, :, BD.CARRY + 1] += add_carry * ax_mask * add_opcode_mask * 2.0
-        x_bd_out[:, :, BD.CARRY + 2] += sub_borrow * ax_mask * sub_opcode_mask * 2.0
+        if emit_carry:
+            # Write CARRY[1] for ADD only, CARRY[2] for SUB only.
+            x_bd_out[:, :, BD.CARRY + 1] += add_carry * ax_mask * add_opcode_mask * 2.0
+            x_bd_out[:, :, BD.CARRY + 2] += sub_borrow * ax_mask * sub_opcode_mask * 2.0
 
         return x_bd_out
 
@@ -458,7 +542,12 @@ class PureNeuralALU(nn.Module):
         mark_ax = x_bd[:, :, BD.MARK_AX]
         opcode_mask = opcode_mask * (mark_ax > 0.5).float()
 
-        x_bd_out = self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
+        x_bd_out = self.ge_to_bd(
+            x_ge_out,
+            x_bd,
+            opcode_mask=opcode_mask,
+            emit_carry=(self.operations == 'add_sub'),
+        )
 
         return x_bd_out
 
@@ -621,7 +710,10 @@ class _GEToBDStage(nn.Module):
 
     def forward(self, state: _MulPipelineState) -> _MulPipelineState:
         state.x_bd_out = self.ge_to_bd(
-            state.x_ge_out, state.x_bd_in, opcode_mask=state.opcode_mask,
+            state.x_ge_out,
+            state.x_bd_in,
+            opcode_mask=state.opcode_mask,
+            emit_carry=False,
         )
         return state
 
@@ -806,7 +898,12 @@ class BitwiseGEToBDStage(nn.Module):
     def forward(self, x_bd):
         x_ge_out = self.state.x_ge_out
         opcode_mask = self.state.opcode_mask
-        x_bd_out = self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
+        x_bd_out = self.ge_to_bd(
+            x_ge_out,
+            x_bd,
+            opcode_mask=opcode_mask,
+            emit_carry=False,
+        )
         return x_bd_out
 
 
@@ -1284,7 +1381,12 @@ class ShiftGEToBDStage(nn.Module):
         self.ge_to_bd = GEToBDConverter(BD, self.ge, S)
 
     def forward(self, x_ge_out, x_bd, opcode_mask):
-        return self.ge_to_bd(x_ge_out, x_bd, opcode_mask=opcode_mask)
+        return self.ge_to_bd(
+            x_ge_out,
+            x_bd,
+            opcode_mask=opcode_mask,
+            emit_carry=False,
+        )
 
 
 class ALUShiftComposite(nn.Module):

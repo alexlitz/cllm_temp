@@ -350,7 +350,7 @@ class PureAttention(nn.Module):
 ```
 
 ```python
-class SoftMoEFFN(nn.Module):
+class StandardMoEFFN(nn.Module):
     """
     Soft Mixture-of-Experts FFN layer.
 

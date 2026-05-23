@@ -34,6 +34,7 @@ from c4_release.neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
     SmokeCoverageReport,
     SpecCoverageReport,
     StaticVerificationReport,
+    SymbolicDeclarationTraceReport,
     _ADD_CASCADE_PROGRAM,
     _build_multistep_probe,
     _pack_instr,
@@ -41,6 +42,8 @@ from c4_release.neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
     audit_declarative_authority,
     audit_smoke_coverage,
     audit_spec_coverage,
+    semantic_op_label,
+    trace_symbolic_declarations,
     verify_claims_static,
     verify_compaction_safety,
     verify_produces_consumes_dynamic,
@@ -164,6 +167,11 @@ class TestOpVerificationResult:
 
 
 class TestDeclarativeAuthorityMetadata:
+    def test_semantic_op_label_strips_legacy_layer_prefixes(self):
+        assert semantic_op_label("layer14_mem_generation") == "mem_generation"
+        assert semantic_op_label("l6_dead_unit_zero") == "dead_unit_zero"
+        assert semantic_op_label("function_call_weights") == "function_call_weights"
+
     def test_invalid_authority_marker_rejected(self):
         compiler = LayerCompiler()
         with pytest.raises(ValueError, match="declarative_authority"):
@@ -221,18 +229,20 @@ class TestDeclarativeAuthorityMetadata:
         assert report.authoritative_ops == ["migrated_op", "spec_generated_op"]
         assert report.legacy_wrapper_ops == ["legacy_wrapper_op"]
         assert report.unclassified_ops == ["unknown_op"]
+        assert report.semantic_label("spec_generated_op") == "spec_generated_op"
         assert report.explicit_sources == {
             "legacy_wrapper_op": "legacy_wrapper",
             "spec_generated_op": "spec_generated",
         }
         assert report.inferred_sources == {"migrated_op": "declarative"}
 
-    def test_l6_attention_bakes_remain_wrappers_until_smoke_safe(self):
+    def test_l6_attention_bakes_are_spec_generated_after_smoke_safe_migration(self):
         report = audit_declarative_authority()
 
         for name in ("layer6_attn_bake", "layer6_relay_heads_bake"):
-            assert name in report.legacy_wrapper_ops
-            assert name not in report.authoritative_ops
+            assert name in report.authoritative_ops
+            assert name not in report.legacy_wrapper_ops
+            assert report.explicit_sources[name] == "spec_generated"
 
 
 # ----------------------------------------------------------------------
@@ -435,6 +445,31 @@ class TestUnitMultistepProbe:
         assert markers[1]["REG_AX"] == 84
         assert markers[1]["AX_byte0"] == 85
         assert markers[1]["STACK0_byte0"] == 100
+
+    def test_symbolic_declaration_trace_reports_missing_registers(self):
+        class _StubLayout:  # noqa: D401
+            ops_per_layer = [[Operation(
+                name="synthetic_ax0_producer",
+                reads=set(),
+                writes={"AX_CARRY_LO"},
+                kind="ffn",
+                bake_fn=lambda *args, **kwargs: None,
+                produces={"AX_CARRY_LO": "AX_byte0"},
+            )]]
+            block_ops = []
+            model_ops = []
+
+        report = trace_symbolic_declarations(
+            layout=_StubLayout(),
+            program=[_pack_instr(1, 7), _pack_instr(38, 0)],
+            n_steps=2,
+            watched_registers=("AX_byte0", "STACK0_byte0"),
+        )
+        assert isinstance(report, SymbolicDeclarationTraceReport)
+        assert report.steps[0].active_opcode == "IMM"
+        assert report.steps[0].producers_by_register["AX_byte0"]
+        assert "STACK0_byte0" in report.steps[0].missing_registers
+        assert "MISSING: STACK0_byte0" in report.format()
 
 
 @pytest.mark.validator
@@ -776,15 +811,14 @@ class TestDeclarativeAuthorityAudit:
     def test_audit_runs_and_reports_nonzero_counts(self, report):
         assert isinstance(report, DeclarativeAuthorityReport)
         assert report.authoritative_count > 0
-        assert report.legacy_wrapper_count > 0
         assert (
             report.authoritative_count
             + report.legacy_wrapper_count
             + report.unclassified_count
         ) > 0
 
-    def test_known_helper_wrapper_is_reported_as_wrapper(self, report):
-        assert "binary_pop_sp_increment" in report.legacy_wrapper_ops
+    def test_no_production_ops_remain_wrappers(self, report):
+        assert report.legacy_wrapper_ops == []
 
     def test_no_production_ops_remain_unclassified(self, report):
         assert report.unclassified_ops == []

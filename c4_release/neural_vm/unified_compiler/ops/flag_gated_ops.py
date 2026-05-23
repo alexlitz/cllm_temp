@@ -1,6 +1,8 @@
 """Flag-gated factories (tool-call + conversational I/O). See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -90,9 +92,10 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
     def bake(block, dim_positions, S):
         if not enable_conversational_io:
             return
-        from ...vm_step import _set_conversational_io_opcode_decode
-        _set_conversational_io_opcode_decode(
-            block.ffn, S, _as_setdim_proxy(dim_positions)
+        _lower_convo_io_opcode_decode_ir(
+            block.ffn,
+            S,
+            _as_setdim_proxy(dim_positions),
         )
 
     return Operation(
@@ -102,11 +105,61 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
         writes=set(),
         kind="block",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_conversational_io else None,
         layer_idx=5,
         migrated=True,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        ffn_units_used=412 if enable_conversational_io else None,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+    )
+
+
+def _convo_io_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
+    write_io = 10.0 / S
+    write_active = 2.0 / S
+    return (
+        FFNRule.gated_write(
+            name="convo_io_decode_prtf",
+            conditions=(
+                ("OPCODE_BYTE_LO+1", 1.0),
+                ("OPCODE_BYTE_HI+2", 1.0),
+            ),
+            threshold=1.5,
+            gate="MARK_AX",
+            writes=(
+                ("IO_IS_PRTF", write_io),
+                ("ACTIVE_OPCODE_PRTF", write_active),
+            ),
+        ),
+        FFNRule.gated_write(
+            name="convo_io_decode_read",
+            conditions=(
+                ("OPCODE_BYTE_LO+15", 1.0),
+                ("OPCODE_BYTE_HI+1", 1.0),
+            ),
+            threshold=1.5,
+            gate="MARK_AX",
+            writes=(
+                ("IO_IS_READ", write_io),
+                ("ACTIVE_OPCODE_READ", write_active),
+            ),
+        ),
+    )
+
+
+def _lower_convo_io_opcode_decode_ir(ffn, S: float, BD) -> int:
+    rules = _convo_io_opcode_decode_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=410,
+        S=S,
     )
 
 
@@ -191,16 +244,18 @@ def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Oper
     Gated by ``enable_conversational_io``: bake_fn is a no-op when False.
     """
     def bake(model, dim_positions, S):
+        del S
         if not enable_conversational_io:
             return
-        from ...vm_step import _set_conversational_io_relay_heads
         attn = model.blocks[6].attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[4] = 5.0  # PRTF relay
             attn.alibi_slopes[5] = 5.0  # READ relay
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_conversational_io_relay_heads(
-            attn, S, _as_setdim_proxy(dim_positions), HD
+        Primitives.generate_attention_heads(
+            attn,
+            _convo_io_relay_head_specs(_as_setdim_proxy(dim_positions)),
+            HD,
         )
 
     return Operation(
@@ -210,10 +265,50 @@ def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Oper
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_conversational_io else None,
+        declarative_bake_fn=bake,
+        compiler_ir_factory=(
+            _convo_io_relay_heads_ir
+            if enable_conversational_io else None
+        ),
+        declarative_authority="spec_generated",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+    )
+
+
+def _convo_io_relay_heads_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.extend(_convo_io_relay_head_specs(proxy))
+    return ir
+
+
+def _convo_io_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    L = 50.0
+    return (
+        DeclarativeAttentionHeadSpec(
+            head_idx=4,
+            q=(
+                AP(0, BD.NEXT_SE, L),
+                AP(0, BD.MARK_AX, -L),
+                AP(0, BD.ACTIVE_OPCODE_PRTF, L * 1.5),
+            ),
+            k=(AP(0, BD.MARK_AX, L),),
+            v=(AP(37, BD.IO_IS_PRTF, 1.0),),
+            o=(AO(BD.CMP + 5, 37, 1.0),),
+        ),
+        DeclarativeAttentionHeadSpec(
+            head_idx=5,
+            q=(
+                AP(0, BD.NEXT_SE, L),
+                AP(0, BD.MARK_AX, -L),
+            ),
+            k=(AP(0, BD.MARK_AX, L),),
+            v=(AP(1, BD.IO_IS_READ, 1.0),),
+            o=(AO(BD.CMP + 6, 1, 1.0),),
+        ),
     )
 
 
@@ -281,9 +376,10 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
     def bake(block, dim_positions, S):
         if not enable_conversational_io:
             return
-        from ...vm_step import _set_conversational_io_state_machine
-        _set_conversational_io_state_machine(
-            block.ffn, S, _as_setdim_proxy(dim_positions)
+        _lower_convo_io_state_machine_ir(
+            block.ffn,
+            S,
+            _as_setdim_proxy(dim_positions),
         )
 
     return Operation(
@@ -293,11 +389,50 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         writes=set(),
         kind="block",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_conversational_io else None,
         layer_idx=6,
         migrated=True,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        ffn_units_used=1402 if enable_conversational_io else None,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+    )
+
+
+def _convo_io_state_machine_rules(S: float) -> tuple[FFNRule, ...]:
+    write_scale = 2.0 / S
+    rules = []
+    for flag_name, flag_dim in (
+        ("prtf", "CMP+5"),
+        ("read", "CMP+6"),
+    ):
+        rules.append(FFNRule.gated_write(
+            name=f"convo_io_state_machine_{flag_name}",
+            conditions=((flag_dim, 1.0),),
+            threshold=0.5,
+            gate="NEXT_SE",
+            gate_weight=10.0,
+            writes=(
+                ("NEXT_THINKING_END", write_scale),
+                ("NEXT_SE", -write_scale),
+                ("IO_STATE", write_scale),
+            ),
+        ))
+    return tuple(rules)
+
+
+def _lower_convo_io_state_machine_ir(ffn, S: float, BD) -> int:
+    rules = _convo_io_state_machine_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=1400,
+        S=S,
     )
 
 
@@ -419,9 +554,10 @@ def make_convo_io_step_resume_op(
     def bake(block, dim_positions, S):
         if not (enable_conversational_io and enable):
             return
-        from ...vm_step import _set_convo_io_step_resume
-        _set_convo_io_step_resume(
-            block.ffn, S, _as_setdim_proxy(dim_positions)
+        _lower_convo_io_step_resume_ir(
+            block.ffn,
+            S,
+            _as_setdim_proxy(dim_positions),
         )
 
     return Operation(
@@ -432,10 +568,43 @@ def make_convo_io_step_resume_op(
         kind="block",
         layer_idx=3,
         bake_fn=bake,
-        declarative_bake_fn=bake if not (enable_conversational_io and enable) else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         migrated=True,
+        ffn_units_used=1036 if (enable_conversational_io and enable) else None,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+    )
+
+
+def _convo_io_step_resume_rules(S: float) -> tuple[FFNRule, ...]:
+    write_scale = 2.0 / S
+    return (
+        FFNRule.constant_write(
+            name="convo_io_step_resume",
+            conditions=(("LAST_WAS_THINKING_START", 1.0),),
+            threshold=0.5,
+            writes=(
+                ("NEXT_PC", write_scale),
+                ("IO_STATE", -write_scale),
+                ("IO_IN_OUTPUT_MODE", -write_scale),
+            ),
+        ),
+    )
+
+
+def _lower_convo_io_step_resume_ir(ffn, S: float, BD) -> int:
+    rules = _convo_io_step_resume_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=1035,
+        S=S,
     )
 
 
@@ -473,9 +642,10 @@ def make_convo_io_pc_sp_latch_op(
     def bake(block, dim_positions, S):
         if not (enable_conversational_io and enable):
             return
-        from ...vm_step import _set_convo_io_pc_sp_latch
-        _set_convo_io_pc_sp_latch(
-            block.ffn, S, _as_setdim_proxy(dim_positions)
+        _lower_convo_io_pc_sp_latch_ir(
+            block.ffn,
+            S,
+            _as_setdim_proxy(dim_positions),
         )
 
     return Operation(
@@ -486,10 +656,49 @@ def make_convo_io_pc_sp_latch_op(
         kind="block",
         layer_idx=6,
         bake_fn=bake,
-        declarative_bake_fn=bake if not (enable_conversational_io and enable) else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         migrated=True,
+        ffn_units_used=1466 if (enable_conversational_io and enable) else None,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+    )
+
+
+def _convo_io_pc_sp_latch_rules(S: float) -> tuple[FFNRule, ...]:
+    write_scale = 2.0 / S
+    rules = []
+    for src_lo, src_hi in (
+        ("POST_PRTF_PC_LO", "POST_PRTF_PC_HI"),
+        ("POST_PRTF_SP_LO", "POST_PRTF_SP_HI"),
+    ):
+        for source_base, output_base in (
+            (src_lo, "OUTPUT_LO"),
+            (src_hi, "OUTPUT_HI"),
+        ):
+            for k in range(16):
+                rules.append(FFNRule.gated_write(
+                    name=f"convo_io_latch_{source_base.lower()}_{k}",
+                    conditions=(("LAST_WAS_THINKING_START", 1.0),),
+                    threshold=0.5,
+                    gate=f"{source_base}+{k}",
+                    writes=((f"{output_base}+{k}", write_scale),),
+                ))
+    return tuple(rules)
+
+
+def _lower_convo_io_pc_sp_latch_ir(ffn, S: float, BD) -> int:
+    rules = _convo_io_pc_sp_latch_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=1402,
+        S=S,
     )
 
 
@@ -534,9 +743,10 @@ def make_convo_io_prtf_capture_op(
     def bake(block, dim_positions, S):
         if not (enable_conversational_io and enable):
             return
-        from ...vm_step import _set_convo_io_prtf_capture
-        _set_convo_io_prtf_capture(
-            block.ffn, S, _as_setdim_proxy(dim_positions)
+        _lower_convo_io_prtf_capture_ir(
+            block.ffn,
+            S,
+            _as_setdim_proxy(dim_positions),
         )
 
     return Operation(
@@ -547,10 +757,52 @@ def make_convo_io_prtf_capture_op(
         kind="block",
         layer_idx=7,
         bake_fn=bake,
-        declarative_bake_fn=bake if not (enable_conversational_io and enable) else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         migrated=True,
+        ffn_units_used=864 if (enable_conversational_io and enable) else None,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+    )
+
+
+def _convo_io_prtf_capture_rules(S: float) -> tuple[FFNRule, ...]:
+    write_scale = 2.0 / S
+    rules = []
+    for src_lo, src_hi, dst_lo, dst_hi in (
+        ("EMBED_LO", "EMBED_HI", "POST_PRTF_PC_LO", "POST_PRTF_PC_HI"),
+        ("ADDR_B0_HI", "ADDR_B1_HI", "POST_PRTF_SP_LO", "POST_PRTF_SP_HI"),
+    ):
+        for source_base, dest_base in (
+            (src_lo, dst_lo),
+            (src_hi, dst_hi),
+        ):
+            for k in range(16):
+                rules.append(FFNRule.gated_write(
+                    name=f"convo_io_capture_{dest_base.lower()}_{k}",
+                    conditions=(
+                        ("ACTIVE_OPCODE_PRTF", 1.0),
+                        ("MARK_AX", 1.0),
+                    ),
+                    threshold=1.5,
+                    gate=f"{source_base}+{k}",
+                    writes=((f"{dest_base}+{k}", write_scale),),
+                ))
+    return tuple(rules)
+
+
+def _lower_convo_io_prtf_capture_ir(ffn, S: float, BD) -> int:
+    rules = _convo_io_prtf_capture_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=800,
+        S=S,
     )
 
 
@@ -608,9 +860,9 @@ def make_convo_io_prtf_transport_op(
         AX_FULL write) and not an ALU op (no AX_CARRY write).
     """
     def bake(block, dim_positions, S):
+        del S
         if not (enable_conversational_io and enable):
             return
-        from ...vm_step import _set_convo_io_prtf_transport
         attn = block.attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             # Override head 4's slope to be shallow so the head can reach
@@ -620,8 +872,10 @@ def make_convo_io_prtf_transport_op(
             # analysis.
             attn.alibi_slopes[4] = 0.1
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_convo_io_prtf_transport(
-            attn, S, _as_setdim_proxy(dim_positions), HD
+        Primitives.generate_attention_head(
+            attn,
+            _convo_io_prtf_transport_spec(_as_setdim_proxy(dim_positions)),
+            HD,
         )
 
     return Operation(
@@ -632,10 +886,52 @@ def make_convo_io_prtf_transport_op(
         kind="block",
         layer_idx=4,
         bake_fn=bake,
-        declarative_bake_fn=bake if not (enable_conversational_io and enable) else None,
+        declarative_bake_fn=bake,
+        compiler_ir_factory=(
+            _convo_io_prtf_transport_ir
+            if (enable_conversational_io and enable) else None
+        ),
+        declarative_authority="spec_generated",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+    )
+
+
+def _convo_io_prtf_transport_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_convo_io_prtf_transport_spec(proxy))
+    return ir
+
+
+def _convo_io_prtf_transport_spec(BD) -> DeclarativeAttentionHeadSpec:
+    L = 50.0
+    v = []
+    o = []
+    for slot_offset, dim_base, count in (
+        (1, BD.POST_PRTF_PC_LO, 16),
+        (17, BD.POST_PRTF_PC_HI, 16),
+        (33, BD.POST_PRTF_SP_LO, 16),
+        (49, BD.POST_PRTF_SP_HI, 15),
+    ):
+        for k in range(count):
+            v.append(AP(slot_offset + k, dim_base + k, 1.0))
+            o.append(AO(dim_base + k, slot_offset + k, 1.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=4,
+        q=(
+            AP(0, BD.LAST_WAS_THINKING_START, L),
+            AP(0, BD.CONST, -L * 0.5),
+        ),
+        k=(
+            AP(0, BD.ACTIVE_OPCODE_PRTF, L),
+            AP(0, BD.MARK_AX, L),
+            AP(0, BD.CONST, -L),
+        ),
+        v=tuple(v),
+        o=tuple(o),
     )
 
 

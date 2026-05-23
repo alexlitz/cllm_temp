@@ -1,8 +1,8 @@
 """
 Standard top-K Mixture-of-Experts FFN for the Neural VM.
 
-Replaces the previous Soft-MoE-style parallel-blending implementation with
-a Mixtral/DeepSeek/Qwen-style top-K MoE: only the K selected experts run
+Replaces the previous parallel-blending implementation with a
+Mixtral/DeepSeek/Qwen-style top-K MoE: only the K selected experts run
 per token, gated by the router. For C4 we use ``top_k=1`` because exactly
 one opcode is active per step (the OP_* one-hot dim selects the expert).
 
@@ -42,19 +42,14 @@ Shared vs. routed units:
     shared FFN (one application; experts carry zero ``b_down``).
 
 Forward implementation:
-    We compute all experts' outputs via a batched (grouped-GEMM) matmul,
-    then multiply by a one-hot top-K mask to retain only the K selected
-    experts' contributions. Mathematically this IS "only the routed experts
-    run" because non-selected experts get multiplied by zero. The compute
-    pattern is one fused batched op (no Python loops over experts, no
-    ``.item()``), ``torch.compile`` / ONNX-trace clean.
+    Sparse standard MoE dispatch. The router reads opcode one-hot dims, filters
+    out zero-gate tokens, runs only experts with routed tokens, and scatters
+    their gated deltas back into the residual stream. Non-MARK_PC positions
+    have zero opcode logits, so they do not execute a routed expert.
 
-Backward-compatibility:
-    - Class name ``SoftMoEFFN`` is retained (this module supersedes the
-      original Soft-MoE; the name is historical).
-    - ``MoE`` is an alias for ``SoftMoEFFN``.
-    - ``build_soft_moe_from_compact_partition(...)`` still constructs the
-      MoE from a compacted PureFFN partition; the API is unchanged.
+Public names:
+    - ``StandardMoEFFN`` is the implementation used by compiler output.
+    - ``MoE`` is an alias for ``StandardMoEFFN``.
 """
 
 from typing import List, Sequence
@@ -63,10 +58,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .base_layers import PureFFN
+from .base_layers import PureFFN, sparse_linear
 
 
-class SoftMoEFFN(nn.Module):
+def _linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None) -> torch.Tensor:
+    if weight.is_sparse:
+        return sparse_linear(x, weight, bias)
+    return F.linear(x, weight, bias)
+
+
+def _ffn_delta(ffn: PureFFN, x: torch.Tensor) -> torch.Tensor:
+    up = _linear(x, ffn.W_up, ffn.b_up)
+    gate = _linear(x, ffn.W_gate, ffn.b_gate)
+    hidden = F.silu(up) * gate
+    return _linear(hidden, ffn.W_down, ffn.b_down)
+
+
+class StandardMoEFFN(nn.Module):
     """Standard top-K transformer MoE with opcode-onehot routing.
 
     Args:
@@ -125,92 +133,28 @@ class SoftMoEFFN(nn.Module):
         # Optional always-on shared FFN (DeepSeek-style shared expert).
         # We hold ``None`` if absent so PyTorch doesn't register a dummy
         # sub-module; callers that want a shared path pass one explicitly
-        # from ``build_soft_moe_from_compact_partition``.
+        # from ``build_standard_moe_from_compact_partition``.
         self.shared_ffn = shared_ffn  # nn.Module | None
         self._has_shared = shared_ffn is not None
 
-        # Stacked weight buffers for the grouped-GEMM all-experts compute
-        # (we mask down to top-K post-hoc). One forward = one batched matmul
-        # over all experts; the top-K mask zeros non-selected experts.
-        self._build_stacked_weights()
-
-    def _build_stacked_weights(self) -> None:
-        """Pack each expert's ``W_up`` / ``W_gate`` / ``W_down`` plus biases
-        into a batched-expert tensor of shape ``[E, H_max, D]`` (or its
-        transpose for ``W_down``). Experts with hidden_dim < H_max are
-        zero-padded; padded rows contribute zero because ``silu(0)*0=0``
-        and ``W_down[:, pad]=0``.
-        """
-        if self.num_experts == 0:
-            self.register_buffer("W_up_stack", torch.zeros(0))
-            self.register_buffer("W_gate_stack", torch.zeros(0))
-            self.register_buffer("W_down_stack", torch.zeros(0))
-            self.register_buffer("b_up_stack", torch.zeros(0))
-            self.register_buffer("b_gate_stack", torch.zeros(0))
-            self.register_buffer("b_down_stack", torch.zeros(0))
-            self._stack_dim = 0
-            self._stack_h_max = 0
-            return
-
         d_model = None
-        hidden_dims: List[int] = []
         for i, expert in enumerate(self.experts):
             if not isinstance(expert, PureFFN):
                 raise TypeError(
-                    f"SoftMoEFFN expects PureFFN experts; "
+                    f"StandardMoEFFN expects PureFFN experts; "
                     f"expert {i} is {type(expert).__name__}"
                 )
             W_up = expert.W_up.data
             if W_up.is_sparse:
                 W_up = W_up.to_dense()
-            H_i, D_i = W_up.shape
+            _, D_i = W_up.shape
             if d_model is None:
                 d_model = D_i
             elif D_i != d_model:
                 raise ValueError(
-                    f"SoftMoEFFN experts must share d_model; "
+                    f"StandardMoEFFN experts must share d_model; "
                     f"expert {i} has D={D_i}, expected {d_model}"
                 )
-            hidden_dims.append(H_i)
-
-        H_max = max(hidden_dims) if hidden_dims else 0
-        E = self.num_experts
-        device = self.experts[0].W_up.device
-        dtype = self.experts[0].W_up.dtype
-
-        W_up_stack = torch.zeros(E, H_max, d_model, device=device, dtype=dtype)
-        W_gate_stack = torch.zeros(E, H_max, d_model, device=device, dtype=dtype)
-        W_down_stack = torch.zeros(E, d_model, H_max, device=device, dtype=dtype)
-        b_up_stack = torch.zeros(E, H_max, device=device, dtype=dtype)
-        b_gate_stack = torch.zeros(E, H_max, device=device, dtype=dtype)
-        b_down_stack = torch.zeros(E, d_model, device=device, dtype=dtype)
-
-        for i, expert in enumerate(self.experts):
-            H_i = hidden_dims[i]
-            W_up = expert.W_up.data
-            W_gate = expert.W_gate.data
-            W_down = expert.W_down.data
-            if W_up.is_sparse:
-                W_up = W_up.to_dense()
-            if W_gate.is_sparse:
-                W_gate = W_gate.to_dense()
-            if W_down.is_sparse:
-                W_down = W_down.to_dense()
-            W_up_stack[i, :H_i, :].copy_(W_up)
-            W_gate_stack[i, :H_i, :].copy_(W_gate)
-            W_down_stack[i, :, :H_i].copy_(W_down)
-            b_up_stack[i, :H_i].copy_(expert.b_up.data)
-            b_gate_stack[i, :H_i].copy_(expert.b_gate.data)
-            b_down_stack[i, :].copy_(expert.b_down.data)
-
-        self.register_buffer("W_up_stack", W_up_stack)
-        self.register_buffer("W_gate_stack", W_gate_stack)
-        self.register_buffer("W_down_stack", W_down_stack)
-        self.register_buffer("b_up_stack", b_up_stack)
-        self.register_buffer("b_gate_stack", b_gate_stack)
-        self.register_buffer("b_down_stack", b_down_stack)
-        self._stack_dim = d_model
-        self._stack_h_max = H_max
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Top-K MoE forward (sparse per-expert dispatch).
@@ -247,7 +191,7 @@ class SoftMoEFFN(nn.Module):
         # Always-on shared expert path runs first; it handles the
         # opcode-independent units and ``b_down`` at every position.
         if self._has_shared:
-            out = self.shared_ffn(x)  # = x + delta_shared (PureFFN residual)
+            out = x + _ffn_delta(self.shared_ffn, x)
         else:
             out = x
 
@@ -264,48 +208,52 @@ class SoftMoEFFN(nn.Module):
         idx = self.expert_opcode_dims_buf.to(device=x.device)
         router_logits = x.index_select(-1, idx)  # [B,S,E]
 
-        # Top-K selection. ``topk_vals`` IS the gate (raw one-hot value):
-        # no softmax renormalization — see class docstring.
-        topk_vals, topk_indices = router_logits.topk(K, dim=-1)  # [B,S,K]
-
         # Flatten (B,S) into one token axis. Sparse dispatch operates on
         # the flat (N, D) view.
         N = B * S
         x_flat = x.reshape(N, D)
-        delta_flat = torch.zeros_like(x_flat)
-        topk_indices_flat = topk_indices.reshape(N, K)
-        topk_vals_flat = topk_vals.reshape(N, K)
+        if not self._has_shared:
+            out = out.clone()
+        out_flat = out.reshape(N, D)
+        router_logits_flat = router_logits.reshape(N, E)
 
         # Detect tracing-mode once (avoids repeated check inside loop).
         is_tracing = torch.jit.is_tracing() or torch.onnx.is_in_onnx_export()
 
-        # Per-expert dispatch loop. ``num_experts`` is a Python int so
-        # this unrolls at trace time. For each expert e: gather tokens
-        # routed to it, run the expert, scatter the gated delta back.
-        for e in range(E):
-            mask_per_k = (topk_indices_flat == e)  # [N, K] bool
-            mask = mask_per_k.any(dim=-1)  # [N] bool
-            # Sum gates across the K slots where this expert is chosen.
-            # For top-1 with one-hot routing this is exactly the raw
-            # one-hot at expert e's opcode dim (0.0 or 1.0).
-            gate = (mask_per_k.to(topk_vals_flat.dtype) * topk_vals_flat).sum(
-                dim=-1, keepdim=True
-            )  # [N, 1]
-            # Python-side early-out for empty routing. Skipping when no
-            # token routes to this expert is a big win in eager mode
-            # (avoids spurious 0-token expert calls). Under tracing we
-            # always run the full body for graph-static behavior.
-            if not is_tracing and not bool(mask.any()):
-                continue
-            x_e = x_flat[mask]  # [N_e, D]
-            gate_e = gate[mask]  # [N_e, 1]
-            # Expert is a PureFFN whose forward is ``x + delta_e``; we
-            # subtract ``x_e`` to recover the delta only.
-            expert_out = self.experts[e](x_e.unsqueeze(0)).squeeze(0) - x_e
-            delta_flat[mask] = delta_flat[mask] + gate_e * expert_out
+        if K == 1:
+            # Fast path for C4's opcode-onehot router. Avoid ``topk`` entirely
+            # and, critically, ignore all zero-gate tokens. Plain topk over an
+            # all-zero router row picks expert 0, which would waste a full
+            # expert call on every non-MARK_PC position before multiplying by
+            # zero.
+            for e in range(E):
+                gate = router_logits_flat[:, e : e + 1]  # [N,1]
+                mask = gate.squeeze(-1).ne(0)
+                if not is_tracing and not bool(mask.any()):
+                    continue
+                x_e = x_flat[mask]  # [N_e,D]
+                gate_e = gate[mask]  # [N_e,1]
+                expert_delta = _ffn_delta(self.experts[e], x_e)
+                out_flat[mask] = out_flat[mask] + gate_e * expert_delta
+        else:
+            # Generic top-K path. ``topk_vals`` is the raw gate, not a softmax.
+            topk_vals, topk_indices = router_logits.topk(K, dim=-1)  # [B,S,K]
+            topk_indices_flat = topk_indices.reshape(N, K)
+            topk_vals_flat = topk_vals.reshape(N, K)
+            for e in range(E):
+                mask_per_k = (topk_indices_flat == e)  # [N,K]
+                gate = (
+                    mask_per_k.to(topk_vals_flat.dtype) * topk_vals_flat
+                ).sum(dim=-1, keepdim=True)  # [N,1]
+                mask = mask_per_k.any(dim=-1) & gate.squeeze(-1).ne(0)
+                if not is_tracing and not bool(mask.any()):
+                    continue
+                x_e = x_flat[mask]
+                gate_e = gate[mask]
+                expert_delta = _ffn_delta(self.experts[e], x_e)
+                out_flat[mask] = out_flat[mask] + gate_e * expert_delta
 
-        delta = delta_flat.reshape(B, S, D)
-        return out + delta
+        return out
 
     def set_pure_neural(self, flag: bool) -> None:
         """Deprecated no-op kept for back-compat."""
@@ -320,12 +268,9 @@ class SoftMoEFFN(nn.Module):
             self.shared_ffn.sparsify()
 
 
-# Backward-compatibility alias.
-MoE = SoftMoEFFN
-# Forward-looking name. The module's behavior is now standard top-K MoE
-# (Mixtral/DeepSeek/Qwen), not Soft MoE; ``StandardMoEFFN`` is the
-# preferred alias for new code.
-StandardMoEFFN = SoftMoEFFN
+# Primary public name. This module implements standard top-K MoE
+# (Mixtral/DeepSeek/Qwen-style).
+MoE = StandardMoEFFN
 
 
 def _tighten_partition_by_no_opcode_firing(
@@ -412,7 +357,7 @@ def _tighten_partition_by_no_opcode_firing(
     return tight_opcode_to_units, tight_shared
 
 
-def build_soft_moe_from_compact_partition(
+def build_standard_moe_from_compact_partition(
     compact_ffn: PureFFN,
     opcode_to_units: dict,
     shared_indices: list,
@@ -423,8 +368,8 @@ def build_soft_moe_from_compact_partition(
     tighten_epsilon: float = 1e-4,
     opcode_dims_all: Sequence[int] = None,
     relay_dims: Sequence[int] = (),
-) -> SoftMoEFFN:
-    """Construct a top-K ``SoftMoEFFN`` from an already-partitioned compact FFN.
+) -> StandardMoEFFN:
+    """Construct a top-K ``StandardMoEFFN`` from an already-partitioned compact FFN.
 
     Mirrors the partition produced by ``_partition_compact_ffn_by_opcode``
     and ``PureFFN.compact_moe``. Each opcode-specific unit set becomes one
@@ -438,7 +383,7 @@ def build_soft_moe_from_compact_partition(
             assignment.
         shared_indices: Indices of opcode-independent hidden units.
         dim: Model embedding dim (``d_model``).
-        pure_neural: Back-compat no-op forwarded to ``SoftMoEFFN``.
+        pure_neural: Back-compat no-op forwarded to ``StandardMoEFFN``.
         top_k: Number of experts to route per token. Defaults to 1 because
             C4 dispatches exactly one opcode per step.
         tighten: When True (default), run the Path A "no-opcode firing"
@@ -462,7 +407,7 @@ def build_soft_moe_from_compact_partition(
             is non-zero in the random batch.
 
     Returns:
-        ``SoftMoEFFN`` with one expert per opcode, optional shared FFN,
+        ``StandardMoEFFN`` with one expert per opcode, optional shared FFN,
         and the routing-dim list pre-populated.
     """
     if tighten:
@@ -535,7 +480,7 @@ def build_soft_moe_from_compact_partition(
         experts.append(expert)
         opcode_dims.append(opcode_dim)
 
-    return SoftMoEFFN(
+    return StandardMoEFFN(
         experts=experts,
         expert_opcode_dims=opcode_dims,
         shared_ffn=shared_ffn,

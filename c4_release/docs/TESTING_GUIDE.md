@@ -6,6 +6,16 @@
 
 ## Quick Start
 
+### Run Strict Neural Smoke
+```bash
+C4_SMOKE_SPEC_K=0 C4_SMOKE_TIMING=1 timeout 1800 \
+  python -m pytest c4_release/tests/test_smoke.py -v --tb=short --timeout=900
+```
+
+`C4_SMOKE_SPEC_K=0` is the authoritative default: raw neural decode, no
+DraftVM result substitution, and no DraftVM length bucketing. See
+`docs/NEURAL_SMOKE_GATE.md` for the phased order and timeout policy.
+
 ### Run Fast Smoke Test (< 10 seconds)
 ```bash
 cd c4_release

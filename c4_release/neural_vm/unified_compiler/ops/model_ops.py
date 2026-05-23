@@ -1,5 +1,6 @@
 """Model-level and post-pass op factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
@@ -31,10 +32,13 @@ def make_io_putchar_routing_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         phase=998,
         migrated=True,
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+        semantic_label="putchar output routing",
     )
 
 
@@ -121,6 +125,8 @@ def make_function_call_weights_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         phase=998,
         migrated=True,
         claims=_claims,
@@ -139,6 +145,7 @@ def make_function_call_weights_op() -> Operation:
         },
         spec_section="BLOG_SPEC.md#function-calls",
         compaction_safe=False,
+        semantic_label="function-call routing",
     )
 
 
@@ -183,14 +190,14 @@ def make_opcode_relay_head_op() -> Operation:
     head 6 slots, so phase ordering against those is irrelevant.
     """
     def bake(model, dim_positions, S):
-        from ...vm_step import _set_opcode_relay_head
+        del S
         proxy = _as_setdim_proxy(dim_positions)
         attn = model.blocks[6].attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[6] = 5.0
             attn.alibi_slopes[7] = 5.0  # JSR PC+5 relay: steep for head 7
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_opcode_relay_head(attn, S, proxy, HD)
+        Primitives.generate_attention_head(attn, _opcode_relay_head_spec(proxy), HD)
 
     return Operation(
         name="opcode_relay_head",
@@ -200,12 +207,21 @@ def make_opcode_relay_head_op() -> Operation:
         layer_idx=6,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_opcode_relay_head_ir,
+        declarative_authority="spec_generated",
         phase=1002,
         migrated=True,
         alibi_slopes={6: 5.0, 7: 5.0},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
+
+
+def _opcode_relay_head_ir(dim_positions, HD) -> CompilerIR:
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_opcode_relay_head_spec(proxy))
+    return ir
 
 
 def _opcode_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
@@ -296,7 +312,7 @@ def make_residual_alibi_slopes_op() -> Operation:
         the L8-wide gentle recency.
       - L10 head 0..4 (lookup) / 0..3 (efficient): steep carry relay +
         gentle byte passthrough slopes. Mode-conditional.
-      - L14: fill_(0.1) — slight recency bias for MEM generation.
+      - L14: fill_(5.0) — steep latest-source bias for MEM generation.
       - L15: fill_(0.01) — gentle latest-write-wins bias for memory lookup.
 
     Phase=999 places this exactly where ``legacy_bake`` used to run,
@@ -330,18 +346,26 @@ def make_residual_alibi_slopes_op() -> Operation:
         attn8 = model.blocks[8].attn
         if hasattr(attn8, 'alibi_slopes') and attn8.alibi_slopes is not None:
             attn8.alibi_slopes.fill_(0.5)
+            # Head 3 fetches IMM bytes from the static code prefix by exact
+            # ADDR_KEY. A steep recency penalty makes long smoke contexts lose
+            # the code-byte match to the zero anchor, leaving stale AX_CARRY.
+            attn8.alibi_slopes[3] = 0.1
 
-        # L14: slight recency bias for same-step preference
+        # L14: steep recency bias so MEM generation chooses the current
+        # step's SP/AX source instead of blending in prior-step markers.
         if len(model.blocks) > 14:
             attn14 = model.blocks[14].attn
             if hasattr(attn14, 'alibi_slopes') and attn14.alibi_slopes is not None:
-                attn14.alibi_slopes.fill_(0.1)
+                attn14.alibi_slopes.fill_(5.0)
 
-        # L15: gentle recency bias for latest-write-wins
+        # L15: load heads are last-write-wins. Keep heads 4+ gentle for LEV
+        # auxiliary reads, but make the primary LI/LC/STACK0 heads prefer the
+        # newest valid store strongly enough to beat stale address residue.
         if len(model.blocks) > 15:
             attn15 = model.blocks[15].attn
             if hasattr(attn15, 'alibi_slopes') and attn15.alibi_slopes is not None:
                 attn15.alibi_slopes.fill_(0.01)
+                attn15.alibi_slopes[:4] = 30.0
 
     return Operation(
         name="residual_alibi_slopes",
@@ -444,8 +468,10 @@ def make_branch_override_patch_op() -> Operation:  # noqa: E302
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         phase=1100,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#control-flow",
     )
@@ -522,8 +548,10 @@ def make_l6_dead_unit_zero_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         phase=1160,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -606,8 +634,10 @@ def make_l7_dead_unit_zero_op() -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
+        declarative_bake_fn=bake,
         phase=1170,
         migrated=True,
+        declarative_authority="structural_model",
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )

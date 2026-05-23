@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -38,6 +39,8 @@ def make_layer8_alu_op() -> Operation:
         writes={"OUTPUT_LO", "CARRY", "CMP_GROUP"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=8,
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
@@ -90,8 +93,11 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
     def bake(block, dim_positions, S):
         if not enable_conversational_io:
             return
-        from ...vm_step import _set_format_position_counter
-        _set_format_position_counter(block.ffn, S, _as_setdim_proxy(dim_positions))
+        _lower_format_position_counter_ir(
+            block.ffn,
+            S,
+            _as_setdim_proxy(dim_positions),
+        )
 
     return Operation(
         name="format_position_counter",
@@ -100,11 +106,49 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         writes={"IO_FORMAT_POS"},
         kind="block",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_conversational_io else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=8,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _format_position_counter_rules(S: float) -> tuple[FFNRule, ...]:
+    rules = []
+    write_scale = 2.0 / S
+    conditions = (
+        ("LAST_WAS_BYTE", 1.0),
+        ("IO_IN_OUTPUT_MODE", 1.0),
+    )
+    for k in range(16):
+        next_k = (k + 1) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"format_pos_inc_{k}",
+            conditions=conditions,
+            threshold=1.5,
+            gate=f"IO_FORMAT_POS+{k}",
+            writes=(
+                (f"IO_FORMAT_POS+{k}", -write_scale),
+                (f"IO_FORMAT_POS+{next_k}", write_scale),
+            ),
+        ))
+    return tuple(rules)
+
+
+def _lower_format_position_counter_ir(ffn, S: float, BD) -> int:
+    rules = _format_position_counter_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=600,
+        S=S,
     )
 
 
@@ -185,12 +229,20 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir_factory=_layer8_multibyte_fetch_ir,
         layer_idx=8,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
+
+
+def _layer8_multibyte_fetch_ir(dim_positions, HD) -> CompilerIR:
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_layer8_multibyte_fetch_head_spec(BD))
+    return ir
 
 
 def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
@@ -249,8 +301,16 @@ def make_layer8_multibyte_routing_op() -> Operation:
     that re-call is an idempotent overwrite of the same ALU weights).
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer8_multibyte_routing
-        _set_layer8_multibyte_routing(block.ffn, S, _as_setdim_proxy(dim_positions))
+        from ...vm_step import _set_layer8_alu
+
+        proxy = _as_setdim_proxy(dim_positions)
+        unit_start = _set_layer8_alu(block.ffn, S, proxy)
+        lower_layer8_multibyte_routing_ir(
+            block.ffn,
+            S,
+            proxy,
+            start_unit=unit_start,
+        )
 
     return Operation(
         name="layer8_multibyte_routing",
@@ -260,6 +320,9 @@ def make_layer8_multibyte_routing_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=make_layer8_multibyte_routing_ir(),
         layer_idx=8,
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
@@ -280,6 +343,64 @@ def make_layer8_multibyte_routing_op() -> Operation:
         ffn_units_used=2055,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#mixture-of-experts-routing",
+    )
+
+
+def make_layer8_multibyte_routing_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer8_multibyte_routing_rules(S))
+    return ir
+
+
+def _layer8_multibyte_routing_rules(S: float) -> tuple[FFNRule, ...]:
+    """Declarative L8 multibyte IMM routing extension after the ALU units."""
+
+    rules = []
+    conditions = (
+        ("IS_BYTE", 1.0),
+        ("H1+1", 1.0),
+        ("OP_IMM", 1.0),
+        ("MARK_AX", -4.0),
+    )
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l8_multibyte_route_lo_{k}",
+            conditions=conditions,
+            threshold=6.5,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", 8.0 / S),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l8_multibyte_route_hi_{k}",
+            conditions=conditions,
+            threshold=6.5,
+            gate=f"AX_CARRY_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", 8.0 / S),),
+        ))
+    return tuple(rules)
+
+
+def lower_layer8_multibyte_routing_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    start_unit: int,
+) -> int:
+    """Lower L8 multibyte IMM routing rules and return the next unit."""
+
+    rules = _layer8_multibyte_routing_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=start_unit,
+        S=S,
     )
 
 
@@ -354,12 +475,20 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir_factory=_layer8_sp_gather_ir,
         layer_idx=8,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _layer8_sp_gather_ir(dim_positions, HD) -> CompilerIR:
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.extend(_layer8_sp_gather_head_specs(BD))
+    return ir
 
 
 def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
@@ -392,6 +521,7 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
                 k=(
                     AP(0, byte_idx_dim, L),
                     AP(0, BD.H1 + SP_I, L),
+                    AP(0, BD.CMP + 3, -L),
                     AP(33, BD.CONST, L),
                 ),
                 v=(
@@ -554,6 +684,7 @@ def make_layer8_op_imm_relay_op() -> Operation:
         bake_fn=_bake,
         declarative_bake_fn=_bake,
         declarative_authority="spec_generated",
+        compiler_ir_factory=_layer8_op_imm_relay_ir,
         layer_idx=8,
         phase=8.4,
         migrated=True,
@@ -561,6 +692,13 @@ def make_layer8_op_imm_relay_op() -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _layer8_op_imm_relay_ir(dim_positions, HD) -> CompilerIR:
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_layer8_op_imm_relay_head_spec(BD))
+    return ir
 
 
 def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
@@ -728,6 +866,28 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         attn.W_k[base + 3, BD.L2H0 + MEM_I] = BS
         attn.W_k[base + 3, BD.H1 + MEM_I] = -BS
 
+        # === Dim 29: hard value-byte gate ===
+        # Address bytes can carry an exact ADDR_B match and swamp the softer
+        # byte-selection bonus above. Require the same d=5 MEM value-byte
+        # predicate with a stronger signed gate so address bytes cannot win.
+        VAL_GATE = 29
+        VG = 200.0
+        attn.W_q[base + VAL_GATE, BD.MARK_AX] = VG
+        attn.W_k[base + VAL_GATE, BD.CONST] = -100.0
+        attn.W_k[base + VAL_GATE, BD.L2H0 + MEM_I] = 300.0
+        attn.W_k[base + VAL_GATE, BD.H1 + MEM_I] = -300.0
+
+        # === Dim 30: hard store gate ===
+        # Default MEM sections from non-store steps can share the same value
+        # byte position and partially match a polluted ADDR_KEY query. Require
+        # an actual historical store strongly enough that non-store MEM value
+        # bytes cannot beat the stored stack value (observed on MUL 6*7).
+        STORE_GATE = 30
+        SG = 100.0
+        attn.W_q[base + STORE_GATE, BD.MARK_AX] = SG
+        attn.W_k[base + STORE_GATE, BD.MEM_STORE] = SG
+        attn.W_k[base + STORE_GATE, BD.CONST] = -SG / 2
+
         # === Dims 4-27: 24-bit binary address encoding ===
         # Same encoding as L15 head 0 / L9 ALiBi head: iterate over both
         # _LO and _HI bases per address byte. Q and K read from the same
@@ -760,9 +920,97 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         for k in range(16):
             attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
             attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+        # Matched default cancel: the upstream ALU clear leaves ALU_LO[0] and
+        # ALU_HI[0] positive. Adding a fetched nonzero nibble without canceling
+        # that default makes legacy L9 nibble gates see two active values
+        # (0 and the real nibble), which can create false SUB byte borrows.
+        # When the fetched nibble really is zero, the CLEAN_EMBED[0] write below
+        # restores the zero slot by the same amount this cancel subtracts.
+        attn.W_v[base + 0, BD.CONST] = 1.0
         for k in range(16):
             attn.W_o[BD.ALU_LO + k, base + 1 + k] = SCALE_O
             attn.W_o[BD.ALU_HI + k, base + 17 + k] = SCALE_O
+        attn.W_o[BD.ALU_LO + 0, base + 0] = -SCALE_O
+        attn.W_o[BD.ALU_HI + 0, base + 0] = -SCALE_O
+
+        # Head 7: stack byte 1 staging for wide ALU ops. SHL/MUL need the
+        # full generic pipeline result byte 1 later; SHR by a full byte needs
+        # stack byte 1 available at the marker before the shift pipeline runs.
+        # Stage the historical MEM value byte 1 into AX_FULL_* at the AX
+        # marker. GE conversion consumes AX_FULL_* as operand-A positions 2/3.
+        head = 7
+        base = head * HD
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[head] = 0.5
+
+        attn.W_q[base, BD.CONST] = -2000.0
+        attn.W_q[base, BD.MARK_AX] = 2000.0
+        for op_dim in (BD.OP_MUL, BD.OP_SHL, BD.OP_SHR):
+            attn.W_q[base, op_dim] = 500.0
+        for op_dim in (BD.OP_LI, BD.OP_LC, BD.OP_IMM, BD.OP_LEA,
+                       BD.OP_PSH, BD.OP_JSR, BD.OP_ENT, BD.OP_LEV,
+                       BD.OP_JMP, BD.OP_ADJ, BD.OP_BZ, BD.OP_BNZ,
+                       BD.OP_EXIT):
+            attn.W_q[base, op_dim] = -2000.0
+        for marker_dim in (BD.MARK_PC, BD.MARK_SP, BD.MARK_BP,
+                           BD.MARK_MEM, BD.MARK_STACK0):
+            attn.W_q[base, marker_dim] = -2000.0
+        attn.W_k[base, BD.CONST] = 10.0
+
+        AX_K_EXCLUDE = 28
+        attn.W_q[base + AX_K_EXCLUDE, BD.MARK_AX] = 100.0
+        attn.W_k[base + AX_K_EXCLUDE, BD.MARK_AX] = -2000.0
+
+        attn.W_q[base + 1, BD.MARK_AX] = 50.0
+        attn.W_k[base + 1, BD.MEM_STORE] = 100.0
+        attn.W_k[base + 1, BD.CONST] = -50.0
+
+        attn.W_q[base + 2, BD.CONST] = -96.0
+        attn.W_k[base + 2, BD.MEM_STORE] = 50.0
+
+        # Select MEM value byte 1. In the autoregressive MEM layout,
+        # MEM_VAL_B1 marks value byte 0 and MEM_VAL_B2 marks value byte 1.
+        BS = 60.0
+        attn.W_q[base + 3, BD.MARK_AX] = BS
+        attn.W_k[base + 3, BD.MEM_VAL_B2] = BS
+
+        VAL_GATE = 29
+        VG = 200.0
+        attn.W_q[base + VAL_GATE, BD.MARK_AX] = VG
+        attn.W_k[base + VAL_GATE, BD.CONST] = -100.0
+        attn.W_k[base + VAL_GATE, BD.MEM_VAL_B2] = 300.0
+
+        STORE_GATE = 30
+        SG = 100.0
+        attn.W_q[base + STORE_GATE, BD.MARK_AX] = SG
+        attn.W_k[base + STORE_GATE, BD.MEM_STORE] = SG
+        attn.W_k[base + STORE_GATE, BD.CONST] = -SG / 2
+
+        addr_dim = 4
+        scale = 10.0
+        addr_bases = [
+            (BD.ADDR_B0_LO, BD.ADDR_B0_HI),
+            (BD.ADDR_B1_LO, BD.ADDR_B1_HI),
+            (BD.ADDR_B2_LO, BD.ADDR_B2_HI),
+        ]
+        for ab_lo, ab_hi in addr_bases:
+            for nibble_base in [ab_lo, ab_hi]:
+                for bit in range(4):
+                    for k in range(16):
+                        bit_val = 2 * ((k >> bit) & 1) - 1
+                        attn.W_q[base + addr_dim, nibble_base + k] = scale * bit_val
+                        attn.W_k[base + addr_dim, nibble_base + k] = scale * bit_val
+                    addr_dim += 1
+
+        for k in range(16):
+            attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
+            attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+        attn.W_v[base + 0, BD.CONST] = 1.0
+        for k in range(16):
+            attn.W_o[BD.AX_FULL_LO + k, base + 1 + k] = SCALE_O
+            attn.W_o[BD.AX_FULL_HI + k, base + 17 + k] = SCALE_O
+        attn.W_o[BD.AX_FULL_LO + 0, base + 0] = -SCALE_O
+        attn.W_o[BD.AX_FULL_HI + 0, base + 0] = -SCALE_O
 
     # Dim-ownership claims: L8 attn head 5 mem-to-ALU.
     # Only claim load-bearing V/O slot/column pairs (not the dense Q/K gates
@@ -778,6 +1026,8 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         for k in range(16):
             _claims.add((8, "attn_W_v", f"5_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
             _claims.add((8, "attn_W_v", f"5_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+            _claims.add((8, "attn_W_v", f"7_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+            _claims.add((8, "attn_W_v", f"7_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
 
     return Operation(
         name="layer8_mem_to_alu",
@@ -790,15 +1040,16 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
                "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR",
                "OP_SI", "OP_SC", "OP_LI", "OP_LC", "OP_IMM", "OP_LEA",
                "OP_PSH", "OP_JSR", "OP_ENT", "OP_LEV", "OP_JMP", "OP_ADJ",
-               "OP_BZ", "OP_BNZ", "OP_EXIT", "MEM_STORE", "L2H0",
+               "OP_BZ", "OP_BNZ", "OP_EXIT", "MEM_STORE", "MEM_VAL_B2", "L2H0",
                "H1", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO",
                "ADDR_B1_HI", "ADDR_B2_LO", "ADDR_B2_HI",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
-        writes={"ALU_LO", "ALU_HI"},
+        writes={"ALU_LO", "ALU_HI", "AX_FULL_LO", "AX_FULL_HI"},
         kind="block",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=8,
         migrated=True,
         claims=_claims,

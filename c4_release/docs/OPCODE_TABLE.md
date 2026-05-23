@@ -438,12 +438,12 @@ class AddRawSumFFN(PureFFN):
 
 Weights are **frozen after baking** - no training, no gradient updates.
 
-### SoftMoE Routing
+### StandardMoE Routing
 
 Operations share layers via **Soft Mixture of Experts**:
 
 ```python
-class SoftMoEFFN(nn.Module):
+class StandardMoEFFN(nn.Module):
     """Routes inputs to operation-specific experts based on opcode one-hot."""
 
     def forward(self, x):
@@ -500,11 +500,11 @@ SCHOOLBOOK MUL (multiple layers)
 └─ Partial products + accumulation
 
 CARRY PROPAGATION (×10 iterations)
-├─ SoftMoEFFN: CarryPropagateFFN (flattened, routes across 8 positions)
-├─ SoftMoEFFN: ZeroFirstCarryFFN
-├─ SoftMoEFFN: ClearCarryOutFFN
-├─ SoftMoEFFN: CarryIterFFN
-└─ SoftMoEFFN: ClearCarryInFFN
+├─ StandardMoEFFN: CarryPropagateFFN (flattened, routes across 8 positions)
+├─ StandardMoEFFN: ZeroFirstCarryFFN
+├─ StandardMoEFFN: ClearCarryOutFFN
+├─ StandardMoEFFN: CarryIterFFN
+└─ StandardMoEFFN: ClearCarryInFFN
 
 DIV ITERATIONS (×16)
 └─ DivIterFFN
@@ -578,7 +578,7 @@ FINALIZATION (FFN)
 | Finalization | ~4 | FFN |
 | **Total** | **~120** | Mixed |
 
-**Note:** Most layers are no-ops for most opcodes (SoftMoE routing). Effective depth depends on operation.
+**Note:** Most layers are no-ops for most opcodes (StandardMoE routing). Effective depth depends on operation.
 
 ---
 
@@ -586,19 +586,19 @@ FINALIZATION (FFN)
 
 ### Execution Model
 
-Each VM instruction is executed via **one forward pass** through the ~120 layers. The embedding tensor flows through ALL layers, with SoftMoE routing ensuring only the relevant expert's output is kept.
+Each VM instruction is executed via **one forward pass** through the ~120 layers. The embedding tensor flows through ALL layers, with StandardMoE routing ensuring only the relevant expert's output is kept.
 
 ```
 Input Embedding: [batch, 8, 160]  # 8 nibble positions × 160 dim
     ↓
 ┌─────────────────────────────────────────┐
-│ Layer 1 (SoftMoEFFN): Stage 1a          │
+│ Layer 1 (StandardMoEFFN): Stage 1a          │
 │   - Identity experts run for inactive   │
 │   - Only active opcode's expert computes│
 └─────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────────┐
-│ Layer 2-6 (SoftMoEFFN): Stages 1b-1f    │
+│ Layer 2-6 (StandardMoEFFN): Stages 1b-1f    │
 └─────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────────┐
@@ -668,7 +668,7 @@ x: [batch, 8, dim]  # 8 nibble positions
 
 ### Control Flow Between Layers
 
-**Opcode gating:** Each SoftMoE layer outputs:
+**Opcode gating:** Each StandardMoE layer outputs:
 ```python
 output = sum(
     x[:, :, E.OP_START + op] * expert_output
@@ -710,7 +710,7 @@ EXIT:
 |-------|-------:|--------------|
 | Fetch | 0 | PC → instruction (via inter-token attention to CODE) |
 | Decode | 1 | Opcode one-hot written to embedding |
-| Execute | 2-119 | ALU computation via SoftMoE layers |
+| Execute | 2-119 | ALU computation via StandardMoE layers |
 | Writeback | 120 | Results in RESULT slot, PC incremented |
 
 **Total: ~120 layers per instruction, executed as one forward pass.**

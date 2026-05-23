@@ -51,6 +51,8 @@ _logger = logging.getLogger(__name__)
 
 
 _REQUIRE_DECLARATIVE_BAKE_ENV = "C4_REQUIRE_DECLARATIVE_BAKE"
+_DECLARATIONS_ONLY_BAKE_ENV = "C4_DECLARATIONS_ONLY_BAKE"
+_ENABLE_MOE_ROUTING_ENV = "C4_ENABLE_MOE_ROUTING"
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on", "strict", "error"})
 
 
@@ -242,7 +244,7 @@ def derive_layout(num_heads: int = 8):
     return layout
 
 
-_CACHE_FORMAT_VERSION = 1
+_CACHE_FORMAT_VERSION = 2
 
 
 def _cache_dir() -> pathlib.Path:
@@ -256,17 +258,16 @@ def _cache_dir() -> pathlib.Path:
 def _hash_source_bytes() -> str:
     """SHA256 of every compiler source file that affects bake output.
 
-    Includes every ``.py`` file under ``unified_compiler/`` (this module's
-    package) plus ``neural_vm/vm_step.py`` (the helpers some bake_fns still
-    call into directly). Files are read in sorted-path order so the hash is
-    stable across hosts.
+    Includes every ``.py`` file under ``neural_vm/``. The compiler still calls
+    helper modules outside ``unified_compiler/`` during bake and post-bake
+    transforms (for example MoE routing and efficient ALU composites), so
+    hashing only the compiler package can leave stale compiled-model caches
+    after a helper implementation changes. Files are read in sorted-path order
+    so the hash is stable across hosts.
     """
     pkg_dir = pathlib.Path(__file__).resolve().parent
     repo_neural_vm = pkg_dir.parent
-    sources = sorted(pkg_dir.rglob("*.py"))
-    extra = repo_neural_vm / "vm_step.py"
-    if extra.exists():
-        sources.append(extra)
+    sources = sorted(repo_neural_vm.rglob("*.py"))
     h = hashlib.sha256()
     for path in sources:
         h.update(str(path.relative_to(repo_neural_vm)).encode("utf-8"))
@@ -393,6 +394,7 @@ def compile_full_vm(
     pin_io_only: bool = True,
     disk_cache: bool = True,
     use_dynamic_ffn: bool = True,
+    enable_moe_routing: Optional[bool] = None,
     require_declarative_bake: Optional[bool] = None,
     declarations_only: bool = False,
 ):
@@ -431,6 +433,11 @@ def compile_full_vm(
             and are trimmed by ``_right_size_ffns`` post-bake. Set to False
             to force the legacy allocate-4096-everywhere path (used for
             byte-identity comparison).
+        enable_moe_routing: when true, emit the compiler-built model with
+            FFN blocks converted to standard top-1 ``StandardMoEFFN`` experts.
+            ``None`` (default) follows ``C4_ENABLE_MOE_ROUTING``. This is a
+            compiler-owned structural transform and is included in the
+            persistent compile cache key.
         require_declarative_bake: opt-in enforcement gate for the migration
             endpoint. ``None`` (default) follows ``C4_REQUIRE_DECLARATIVE_BAKE``.
             When true, compile fails before model bake if the layout still
@@ -447,6 +454,10 @@ def compile_full_vm(
         - model is an AutoregressiveVM with all weights baked
         - layout is the ModelLayout (d_model, n_layers, dim_positions)
     """
+    if not declarations_only:
+        declarations_only = _env_flag_enabled(_DECLARATIONS_ONLY_BAKE_ENV)
+    if enable_moe_routing is None:
+        enable_moe_routing = _env_flag_enabled(_ENABLE_MOE_ROUTING_ENV)
     if require_declarative_bake is None:
         require_declarative_bake = _env_flag_enabled(_REQUIRE_DECLARATIVE_BAKE_ENV)
     if declarations_only:
@@ -462,10 +473,14 @@ def compile_full_vm(
         "ffn_hidden": ffn_hidden,
         "max_seq_len": max_seq_len,
         "pin_io_only": pin_io_only,
+        "enable_moe_routing": bool(enable_moe_routing),
+        "require_declarative_bake": bool(require_declarative_bake),
+        "declarations_only": bool(declarations_only),
     }
     cache_path = None
+    cache_key = _cache_key(kwargs_snapshot) if disk_cache else None
     if disk_cache and not require_declarative_bake and not declarations_only:
-        cache_path = _cache_dir() / f"{_cache_key(kwargs_snapshot)}.pt"
+        cache_path = _cache_dir() / f"{cache_key}.pt"
         cached = _try_load_cached(cache_path, kwargs_snapshot)
         if cached is not None:
             return cached
@@ -563,31 +578,6 @@ def compile_full_vm(
     if require_declarative_bake:
         enforce_declarative_bake_authority(layout)
 
-    # Build the model with d_model/n_layers from the compiler. We override
-    # the default size from build_model_from_layout to set ffn_hidden,
-    # n_heads, and max_seq_len that AutoregressiveVM expects.
-    from ..vm_step import AutoregressiveVM
-
-    # Per-block FFN hidden_dim from layout when use_dynamic_ffn is on.
-    # Blocks without an annotated op are absent from ``layout.ffn_widths``
-    # and fall back to ``ffn_hidden`` inside AutoregressiveVM.__init__'s
-    # dict-dispatch path; those still get trimmed by ``_right_size_ffns``
-    # post-bake. As ops accumulate ``ffn_units_used`` annotations, more
-    # blocks land in the dict and skip the allocate-then-trim overhead.
-    if use_dynamic_ffn and layout.ffn_widths:
-        ffn_hidden_arg = layout.ffn_widths
-    else:
-        ffn_hidden_arg = ffn_hidden
-
-    model = AutoregressiveVM(
-        d_model=layout.d_model,
-        n_layers=layout.n_layers,
-        n_heads=n_heads,
-        ffn_hidden=ffn_hidden_arg,
-        max_seq_len=max_seq_len,
-        dim_positions=layout.dim_positions,
-    )
-
     # Run all model-level ops via the compiler dispatch. Per-layer ops are
     # skipped (by default) because legacy_bake is present and owns them.
     # Per-layer ops with migrated=True are dispatched before legacy_bake so
@@ -614,6 +604,41 @@ def compile_full_vm(
             + block_dispatch
             + model_dispatch
         )
+        if disk_cache:
+            # Declarations-only is the authoritative endpoint, but it must
+            # still validate ownership before a cache hit can bypass the bake.
+            # The layout compile + validation above is cheap; loading here
+            # keeps unsupported imperative ops visible while avoiding repeated
+            # 40s+ model bakes in smoke/1096 test runs.
+            cache_path = _cache_dir() / f"{cache_key}.pt"
+            cached = _try_load_cached(cache_path, kwargs_snapshot)
+            if cached is not None:
+                return cached
+
+    # Build the model with d_model/n_layers from the compiler. We override
+    # the default size from build_model_from_layout to set ffn_hidden,
+    # n_heads, and max_seq_len that AutoregressiveVM expects.
+    from ..vm_step import AutoregressiveVM
+
+    # Per-block FFN hidden_dim from layout when use_dynamic_ffn is on.
+    # Blocks without an annotated op are absent from ``layout.ffn_widths``
+    # and fall back to ``ffn_hidden`` inside AutoregressiveVM.__init__'s
+    # dict-dispatch path; those still get trimmed by ``_right_size_ffns``
+    # post-bake. As ops accumulate ``ffn_units_used`` annotations, more
+    # blocks land in the dict and skip the allocate-then-trim overhead.
+    if use_dynamic_ffn and layout.ffn_widths:
+        ffn_hidden_arg = layout.ffn_widths
+    else:
+        ffn_hidden_arg = ffn_hidden
+
+    model = AutoregressiveVM(
+        d_model=layout.d_model,
+        n_layers=layout.n_layers,
+        n_heads=n_heads,
+        ffn_hidden=ffn_hidden_arg,
+        max_seq_len=max_seq_len,
+        dim_positions=layout.dim_positions,
+    )
 
     with _torch.no_grad():
         # Migrated per-layer ops fire before block/model ops.
@@ -651,6 +676,14 @@ def compile_full_vm(
                 op, model, layout.dim_positions, S,
                 declarations_only=declarations_only,
             )
+
+    if enable_moe_routing:
+        # Compiler-owned MoE emission: callers receive a model whose routed
+        # FFNs are already represented as tensor-native top-1 experts. Keep
+        # this after all bakes so the partition observes final weights, and
+        # before cache save so MoE artifacts are reused across test runs.
+        model.compact(block_size=32)
+        model.compact_moe()
 
     if cache_path is not None:
         _try_save_cached(cache_path, model, layout, kwargs_snapshot)

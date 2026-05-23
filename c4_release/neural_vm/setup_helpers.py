@@ -171,6 +171,7 @@ def _set_layer2_mem_byte_flags(ffn, S, BD):
     ffn.W_gate[unit, BD.L1H4 + BP_I] = -1.0
     ffn.b_gate[unit] = 1.0
     ffn.W_down[BD.BYTE_INDEX_1, unit] = 2.0 / S
+    ffn.W_down[BD.STACK0_BYTE1, unit] = 2.0 / S
     unit += 1
 
     # BYTE_INDEX_2 at STACK0: d=8 from BP → H3[BP]=1 (d≤8.5), H2[BP]=0 (d>7.5)
@@ -180,6 +181,7 @@ def _set_layer2_mem_byte_flags(ffn, S, BD):
     ffn.W_gate[unit, BD.H2 + BP_I] = -1.0
     ffn.b_gate[unit] = 1.0
     ffn.W_down[BD.BYTE_INDEX_2, unit] = 2.0 / S
+    ffn.W_down[BD.STACK0_BYTE2, unit] = 2.0 / S
     unit += 1
 
     # BYTE_INDEX_3 at STACK0: d=9 from BP → H4[BP]=1 (d≤9.5), H3[BP]=0 (d>8.5)
@@ -189,6 +191,7 @@ def _set_layer2_mem_byte_flags(ffn, S, BD):
     ffn.W_gate[unit, BD.H3 + BP_I] = -1.0
     ffn.b_gate[unit] = 1.0
     ffn.W_down[BD.BYTE_INDEX_3, unit] = 2.0 / S
+    ffn.W_down[BD.STACK0_BYTE3, unit] = 2.0 / S
     unit += 1
 
 
@@ -577,6 +580,11 @@ def _set_layer7_operand_gather(attn, S, BD, HD):
     attn.W_q[base, BD.MARK_AX] = L
     attn.W_q[base, BD.OP_LEA] = -L  # suppress STACK0→ALU for LEA
     attn.W_k[base, BD.STACK0_BYTE0] = L
+    # Anti-leakage gate: keep the head silent at AX byte positions. Without
+    # this, q=0 at bytes still averages historical STACK0 values into ALU.
+    attn.W_q[base + 33, BD.MARK_AX] = L
+    attn.W_q[base + 33, BD.CONST] = -L / 2
+    attn.W_k[base + 33, BD.CONST] = L
     # V: copy CLEAN_EMBED_LO/HI from STACK0 byte 0 (pristine, not inflated)
     for k in range(16):
         attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
@@ -834,7 +842,8 @@ def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
 
     Similar to AX byte passthrough but for SP. Only fires when PSH_AT_SP = 0
     (i.e., when SP doesn't change). When PSH is active, L6/L15 handle SP values.
-    Also suppressed during binary POP (CMP[3]) since L9/L15 handle SP += 8.
+    During binary POP (CMP[3]), this head still carries old upper SP bytes;
+    the declarative pop-carry tail then increments the carried byte values.
 
     Copies CLEAN_EMBED from previous step's SP bytes 1-3 → OUTPUT at current
     step's SP byte 0-2 positions. Uses shifted byte matching.
@@ -851,9 +860,9 @@ def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
       - First step (HAS_SE=0): L + 0 - 1.5L = -0.5L < 0 (blocked)
       - PSH step at SP byte: L + 2L - 2L - 1.5L = -0.5L < 0 (blocked)
 
-    Q[33] AND gate: IS_BYTE AND H1[SP] AND HAS_SE AND NOT PSH AND NOT POP
-    (gate_const=-30000 + 3*10000 base; PSH_AT_SP and CMP+3 contribute -10000
-    each via gate_extras to suppress during PSH and binary POP).
+    Q[33] AND gate: IS_BYTE AND H1[SP] AND HAS_SE AND NOT PSH
+    (gate_const=-30000 + 3*10000 base; PSH_AT_SP contributes -10000
+    via gate_extras to suppress during PSH).
 
     2026-05-10: Refactored to call ``Primitives.byte_passthrough_chain``
     (set 1) using SP-specific overrides for the Q[0] / Q[33] coefficients.
@@ -882,8 +891,53 @@ def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
         gate_const=-30000.0,
         gate_extras=[
             (BD.IS_BYTE, 10000.0),         # require IS_BYTE
+            (BD.MARK_SP, 10000.0),         # allow SP marker carry-forward
             (BD.PSH_AT_SP, -10000.0),      # suppress during PSH (SP -= 8)
-            (BD.CMP + 3, -10000.0),        # suppress during binary POP (SP += 8)
+        ],
+    )
+
+    marker_s = 300.0
+    base = 2 * HD
+    attn.W_q[base + 34, BD.MARK_SP] = marker_s
+    attn.W_q[base + 34, BD.HAS_SE] = marker_s
+    attn.W_q[base + 34, BD.PSH_AT_SP] = -2.0 * marker_s
+    attn.W_q[base + 34, BD.CMP + 3] = -2.0 * marker_s
+    attn.W_q[base + 34, BD.CONST] = -marker_s
+    attn.W_q[base + 35, BD.MARK_SP] = marker_s
+    attn.W_q[base + 35, BD.HAS_SE] = marker_s
+    attn.W_q[base + 35, BD.PSH_AT_SP] = -2.0 * marker_s
+    attn.W_q[base + 35, BD.CMP + 3] = -2.0 * marker_s
+    attn.W_q[base + 35, BD.CONST] = -marker_s
+    attn.W_k[base + 34, BD.H1 + SP_IDX] = marker_s
+    attn.W_k[base + 35, BD.BYTE_INDEX_0] = marker_s
+
+
+
+def _set_layer10_bp_byte_passthrough(attn, S, BD, HD):
+    """L10 attention head 7: BP byte 0-2 passthrough across ordinary steps."""
+    from .unified_compiler.primitives import Primitives as _P
+
+    BP_IDX = 3
+    _P.byte_passthrough_chain(
+        attn,
+        head_idx=7,
+        source_marker_dim=BD.H1 + BP_IDX,
+        target_marker_dim=BD.H1 + BP_IDX,
+        value_lo_dim=BD.CLEAN_EMBED_LO,
+        value_hi_dim=BD.CLEAN_EMBED_HI,
+        suppress_op_dims=[BD.OP_ENT, BD.OP_LEV],
+        S=S,
+        HD=HD,
+        alibi_slope=1.0,
+        is_byte_strength=1.0,
+        has_se_strength=2.0,
+        suppress_strength=2.0,
+        q0_threshold=1.5,
+        gate_const=-30000.0,
+        gate_extras=[
+            (BD.IS_BYTE, 10000.0),
+            (BD.OP_ENT, -10000.0),
+            (BD.OP_LEV, -10000.0),
         ],
     )
 
@@ -981,52 +1035,142 @@ def _set_layer10_psh_stack0_passthrough(attn, S, BD, HD):
 
 
 def _set_layer10_stack0_byte_relay(attn, S, BD, HD):
-    """L10 attention head 4: copy STACK0 bytes from previous step to ALU at AX bytes.
+    """L10 attention heads 4-6: STACK0 byte relays.
 
-    At AX byte positions, attends to STACK0 byte positions in the PREVIOUS step
-    and copies CLEAN_EMBED nibbles → ALU_LO/HI. The BitwiseBytePropagationPostOp
-    then reads ALU (STACK0 operand) + OUTPUT (AX operand) to compute bitwise result.
+    Heads 4-5 copy stack-memory bytes to ALU at AX bytes. Head 6 carries
+    STACK0 bytes 1-3 across non-stack-mutating steps; L3 already carries
+    byte 0 at the STACK0 marker.
     """
-    L = S
     AX_IDX = 1
-    SP_IDX = 2
-    BP_IDX = 3
     base = 4 * HD
 
-    attn.W_q[base + 0, BD.IS_BYTE] = L
-    attn.W_q[base + 0, BD.H1 + AX_IDX] = L
-    attn.W_q[base + 0, BD.CONST] = -L * 1.5
+    attn.W_q[base + 0, BD.CONST] = -3000.0
+    attn.W_q[base + 0, BD.IS_BYTE] = 1000.0
+    attn.W_q[base + 0, BD.H1 + AX_IDX] = 1000.0
+    attn.W_q[base + 0, BD.TEMP + 3] = 1000.0
+    attn.W_q[base + 0, BD.BYTE_INDEX_3] = -3000.0
+    attn.W_k[base + 0, BD.CONST] = 10.0
 
-    attn.W_q[base + 1, BD.BYTE_INDEX_0] = L
-    attn.W_q[base + 2, BD.BYTE_INDEX_1] = L
-    attn.W_q[base + 3, BD.BYTE_INDEX_2] = L
+    attn.W_q[base + 1, BD.TEMP + 3] = 50.0
+    attn.W_k[base + 1, BD.MEM_STORE] = 100.0
+    attn.W_k[base + 1, BD.MARK_MEM] = -200.0
+    attn.W_k[base + 1, BD.CONST] = -50.0
 
-    attn.W_q[base + 4, BD.BYTE_INDEX_3] = -L
-    attn.W_q[base + 4, BD.CONST] = L / 2
+    for slot, byte_idx_dim, mem_val_dim in (
+        (31, BD.BYTE_INDEX_0, BD.MEM_VAL_B2),
+        (32, BD.BYTE_INDEX_1, BD.MEM_VAL_B3),
+    ):
+        attn.W_q[base + slot, byte_idx_dim] = 60.0
+        attn.W_k[base + slot, mem_val_dim] = 60.0
+    attn.W_q[base + 34, BD.BYTE_INDEX_2] = 60.0
+    attn.W_k[base + 34, BD.H3 + 4] = 60.0
+    attn.W_k[base + 34, BD.H2 + 4] = -60.0
 
-    attn.W_k[base + 0, BD.IS_BYTE] = L
-
-    attn.W_k[base + 1, BD.H4 + BP_IDX] = L
-    attn.W_k[base + 1, BD.H1 + BP_IDX] = -2 * L
-    attn.W_k[base + 1, BD.H1 + SP_IDX] = -2 * L
-    attn.W_k[base + 1, BD.H1 + AX_IDX] = -L
-
-    attn.W_k[base + 2, BD.BYTE_INDEX_1] = L
-    attn.W_k[base + 3, BD.BYTE_INDEX_2] = L
-
-    attn.W_q[base + 33, BD.CONST] = -20000.0
+    attn.W_q[base + 33, BD.CONST] = -30000.0
     attn.W_q[base + 33, BD.IS_BYTE] = 10000.0
     attn.W_q[base + 33, BD.H1 + AX_IDX] = 10000.0
-    attn.W_q[base + 33, BD.HAS_SE] = 10000.0
+    attn.W_q[base + 33, BD.TEMP + 3] = 10000.0
+    attn.W_q[base + 33, BD.BYTE_INDEX_3] = -10000.0
     attn.W_k[base + 33, BD.CONST] = 5.0
+
+    attn.W_v[base + 0, BD.CONST] = 1.0
+    for k in range(16):
+        attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
+        attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+
+    for k in range(16):
+        attn.W_o[BD.ALU_LO + k, base + 0] = -8.0
+        attn.W_o[BD.ALU_HI + k, base + 0] = -8.0
+        attn.W_o[BD.ALU_LO + k, base + 1 + k] = 11.0
+        attn.W_o[BD.ALU_HI + k, base + 17 + k] = 11.0
+
+    # Head 5: non-bitwise STACK0 byte relay. This leaves the bitwise-sensitive
+    # head 4 scoring untouched while letting ADD/SUB byte post-ops recover
+    # higher STACK0 bytes from the stored MEM row. TEMP[3] is the bitwise relay
+    # and suppresses this head.
+    base = 5 * HD
+    attn.W_q[base + 0, BD.CONST] = -3000.0
+    attn.W_q[base + 0, BD.IS_BYTE] = 1000.0
+    attn.W_q[base + 0, BD.H1 + AX_IDX] = 1000.0
+    attn.W_q[base + 0, BD.CMP + 3] = 150000.0
+    attn.W_q[base + 0, BD.TEMP + 3] = -3000.0
+    attn.W_q[base + 0, BD.BYTE_INDEX_3] = -3000.0
+    attn.W_k[base + 0, BD.CONST] = 10.0
+
+    attn.W_q[base + 1, BD.CMP + 3] = 1000.0
+    attn.W_q[base + 1, BD.TEMP + 3] = -1000.0
+    attn.W_k[base + 1, BD.MEM_STORE] = 100.0
+    attn.W_k[base + 1, BD.MARK_MEM] = -200.0
+    attn.W_k[base + 1, BD.CONST] = -50.0
+
+    for slot, byte_idx_dim, mem_val_dim in (
+        (31, BD.BYTE_INDEX_0, BD.MEM_VAL_B2),
+        (32, BD.BYTE_INDEX_1, BD.MEM_VAL_B3),
+    ):
+        attn.W_q[base + slot, byte_idx_dim] = 60.0
+        attn.W_k[base + slot, mem_val_dim] = 60.0
+    attn.W_q[base + 34, BD.BYTE_INDEX_2] = 60.0
+    attn.W_k[base + 34, BD.H3 + 4] = 60.0
+    attn.W_k[base + 34, BD.H2 + 4] = -60.0
+
+    attn.W_q[base + 33, BD.CONST] = -30000.0
+    attn.W_q[base + 33, BD.IS_BYTE] = 10000.0
+    attn.W_q[base + 33, BD.H1 + AX_IDX] = 10000.0
+    attn.W_q[base + 33, BD.CMP + 3] = 1500000.0
+    attn.W_q[base + 33, BD.TEMP + 3] = -30000.0
+    attn.W_q[base + 33, BD.BYTE_INDEX_3] = -10000.0
+    attn.W_k[base + 33, BD.CONST] = 5.0
+
+    for k in range(16):
+        attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
+        attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+        attn.W_o[BD.ALU_LO + k, base + 1 + k] = 1.0
+        attn.W_o[BD.ALU_HI + k, base + 17 + k] = 1.0
+
+    # Head 6: non-mutating STACK0 upper-byte carry. Query at current STACK0
+    # byte K and read the latest previous STACK0 byte K+1, so the output at
+    # byte K predicts byte K+1 autoregressively. PSH/pop/function-call stack
+    # updates have dedicated paths and are suppressed here.
+    base = 6 * HD
+    attn.W_q[base + 0, BD.PSH_AT_SP] = -300.0
+    attn.W_q[base + 0, BD.OP_PSH] = -300.0
+    attn.W_q[base + 0, BD.CMP + 0] = -300.0
+    attn.W_q[base + 0, BD.CMP + 1] = -300.0
+    attn.W_q[base + 0, BD.CMP + 2] = -300.0
+    attn.W_q[base + 0, BD.CMP + 4] = -300.0
+    attn.W_q[base + 0, BD.OP_LEV] = -300.0
+
+    byte_match = 5.0 * S
+    attn.W_q[base + 4, BD.STACK0_BYTE0] = byte_match
+    attn.W_k[base + 4, BD.STACK0_BYTE1] = byte_match
+    attn.W_q[base + 5, BD.STACK0_BYTE1] = byte_match
+    attn.W_k[base + 5, BD.STACK0_BYTE2] = byte_match
+    attn.W_q[base + 6, BD.STACK0_BYTE2] = byte_match
+    attn.W_k[base + 6, BD.STACK0_BYTE3] = byte_match
+
+    attn.W_q[base + 33, BD.CONST] = -15000.0
+    attn.W_q[base + 33, BD.HAS_SE] = 10000.0
+    attn.W_q[base + 33, BD.PSH_AT_SP] = -30000.0
+    attn.W_q[base + 33, BD.OP_PSH] = -30000.0
+    attn.W_q[base + 33, BD.CMP + 0] = -30000.0
+    attn.W_q[base + 33, BD.CMP + 1] = -30000.0
+    attn.W_q[base + 33, BD.CMP + 2] = -30000.0
+    attn.W_q[base + 33, BD.CMP + 4] = -30000.0
+    attn.W_q[base + 33, BD.OP_LEV] = -30000.0
+    attn.W_q[base + 33, BD.STACK0_BYTE0] = 10000.0
+    attn.W_q[base + 33, BD.STACK0_BYTE1] = 10000.0
+    attn.W_q[base + 33, BD.STACK0_BYTE2] = 10000.0
+    attn.W_q[base + 33, BD.STACK0_BYTE3] = -30000.0
+    attn.W_k[base + 33, BD.CONST] = 100.0
 
     for k in range(16):
         attn.W_v[base + k, BD.CLEAN_EMBED_LO + k] = 1.0
         attn.W_v[base + 16 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+        attn.W_o[BD.OUTPUT_LO + k, base + k] = 3.0
+        attn.W_o[BD.OUTPUT_HI + k, base + 16 + k] = 3.0
 
-    for k in range(16):
-        attn.W_o[BD.ALU_LO + k, base + k] = 2.0
-        attn.W_o[BD.ALU_HI + k, base + 16 + k] = 2.0
+    if getattr(attn, "alibi_slopes", None) is not None:
+        attn.alibi_slopes.data[6] = 1.0
 
 
 
@@ -1359,6 +1503,10 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
         ffn.W_up[unit, BD.MARK_SP] = -suppress
         ffn.W_up[unit, BD.MARK_BP] = -suppress
         ffn.W_up[unit, BD.MARK_STACK0] = -suppress
+        # PSH writes the pushed AX value through the dedicated STACK0 byte
+        # path. The old zero-default cleanup is only safe for non-PSH STACK0
+        # bytes; otherwise multi-byte addresses like 0x200 lose byte 1.
+        ffn.W_up[unit, BD.PSH_AT_SP] = -suppress
 
         # Suppress at BYTE_INDEX_3 positions - byte 3's OUTPUT should predict
         # the NEXT marker (MEM), not force byte value 0.
@@ -1376,6 +1524,23 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
         ffn.W_down[output_dim, unit] = 50.0 / S
 
         unit += 1
+
+    # JSR's STACK0 marker emits the return address byte. L6 has already
+    # routed the low/high nibbles from AX_CARRY, but L14 MEM-generation heads
+    # cancel the L3 zero-default high nibble at the marker. Reassert HI[0] only
+    # for the current JSR STACK0 marker; bytes are handled by the units above.
+    ffn.W_up[unit, BD.OP_JSR] = S / 5
+    ffn.W_up[unit, BD.MARK_STACK0] = S
+    ffn.W_up[unit, BD.IS_BYTE] = -S * 10
+    ffn.W_up[unit, BD.MARK_PC] = -suppress
+    ffn.W_up[unit, BD.MARK_AX] = -suppress
+    ffn.W_up[unit, BD.MARK_SP] = -suppress
+    ffn.W_up[unit, BD.MARK_BP] = -suppress
+    ffn.W_up[unit, BD.MARK_MEM] = -suppress
+    ffn.b_up[unit] = -S * 1.5
+    ffn.W_gate[unit, BD.CONST] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 50.0 / S
+    unit += 1
 
     return unit
 

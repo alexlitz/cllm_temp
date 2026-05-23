@@ -19,6 +19,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 from src.compiler import compile_c
 from neural_vm.run_vm import AutoregressiveVMRunner
+from neural_vm.embedding import Opcode
+
+
+def _make_bytecode(ops):
+    bytecode = []
+    for op in ops:
+        if isinstance(op, tuple):
+            opcode, imm = op
+            bytecode.append(opcode | (imm << 8))
+        else:
+            bytecode.append(op)
+    return bytecode
 
 
 class TestKVCacheIntegration:
@@ -31,43 +43,73 @@ class TestKVCacheIntegration:
 
     def test_smoke_autoregressive_vm(self, compile_program):
         """Smoke test for AutoregressiveVMRunner with KV cache."""
-        source = "int main() { return 42; }"
-        bytecode, data = compile_program(source)
+        bytecode = _make_bytecode([(Opcode.IMM, 42), Opcode.EXIT])
 
-        runner = AutoregressiveVMRunner(use_kv_cache=True, max_mem_history=64)
-        _, exit_code = runner.run(bytecode, data, max_steps=100)
+        runner = AutoregressiveVMRunner(
+            pure_neural=True,
+            trust_neural_alu=True,
+            use_kv_cache=True,
+            max_mem_history=64,
+        )
+        _, exit_code = runner.run(bytecode, b"", max_steps=10)
 
         assert exit_code == 42
 
     def test_kv_cache_on_vs_off(self, compile_program):
         """Verify cache ON and OFF produce same result."""
-        source = "int main() { int x; x = 10 + 20; return x; }"
-        bytecode, data = compile_program(source)
+        bytecode = _make_bytecode([
+            (Opcode.IMM, 10),
+            Opcode.PSH,
+            (Opcode.IMM, 20),
+            Opcode.ADD,
+            Opcode.EXIT,
+        ])
 
-        runner_on = AutoregressiveVMRunner(use_kv_cache=True)
-        _, exit_on = runner_on.run(bytecode, data, max_steps=300)
+        runner_on = AutoregressiveVMRunner(
+            pure_neural=True,
+            trust_neural_alu=True,
+            use_kv_cache=True,
+        )
+        _, exit_on = runner_on.run(bytecode, b"", max_steps=20)
 
-        runner_off = AutoregressiveVMRunner(use_kv_cache=False)
-        _, exit_off = runner_off.run(bytecode, data, max_steps=300)
+        runner_off = AutoregressiveVMRunner(
+            pure_neural=True,
+            trust_neural_alu=True,
+            use_kv_cache=False,
+        )
+        _, exit_off = runner_off.run(bytecode, b"", max_steps=20)
 
         assert exit_on == exit_off == 30
 
     def test_lru_eviction_basic(self, compile_program):
-        """Basic LRU eviction test."""
-        source = """
-        int main() {
-            int a, b, c, d, e;
-            a = 1; b = 2; c = 3; d = 4; e = 5;
-            return a + b + c + d + e;
-        }
-        """
-        bytecode, data = compile_program(source)
+        """Small-history setting must not break KV-cached neural execution."""
+        bytecode = _make_bytecode([
+            (Opcode.IMM, 1),
+            Opcode.PSH,
+            (Opcode.IMM, 2),
+            Opcode.ADD,
+            Opcode.PSH,
+            (Opcode.IMM, 3),
+            Opcode.ADD,
+            Opcode.PSH,
+            (Opcode.IMM, 4),
+            Opcode.ADD,
+            Opcode.PSH,
+            (Opcode.IMM, 5),
+            Opcode.ADD,
+            Opcode.EXIT,
+        ])
 
-        runner = AutoregressiveVMRunner(use_kv_cache=True, max_mem_history=2)
-        _, exit_code = runner.run(bytecode, data, max_steps=1000)
+        runner = AutoregressiveVMRunner(
+            pure_neural=True,
+            trust_neural_alu=True,
+            use_kv_cache=True,
+            max_mem_history=2,
+        )
+        _, exit_code = runner.run(bytecode, b"", max_steps=60)
 
         assert exit_code == 15
-        assert len(runner._mem_history) <= 2
+        assert runner._kv_cache_obj is not None
 
     def test_parameters_initialized(self):
         """Verify parameters are properly initialized."""

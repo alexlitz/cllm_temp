@@ -549,7 +549,7 @@ def build_fast_mod_layers():
     2. Broadcast MSB (PureAttention) - reuses BroadcastAttention
     3. Conditional subtract (PureFFN)
 
-    Returns list of (layer, [opcodes]) tuples for SoftMoEFFN wrapping.
+    Returns list of (layer, [opcodes]) tuples for StandardMoEFFN wrapping.
     """
     from .pure_moe import MoE
     from .reduce_ffn import BroadcastAttention

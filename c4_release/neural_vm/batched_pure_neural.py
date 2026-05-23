@@ -38,6 +38,7 @@ Output equivalence:
 
 from __future__ import annotations
 
+import os
 import torch
 from collections import deque
 from typing import List, Optional, Tuple
@@ -53,18 +54,29 @@ from .run_vm import (
 from .speculative import DraftVM
 
 
-# Adaptive speculative-K tuning knobs. The runner accepts ``spec_k <= 0`` as a
-# sentinel that enables adaptive mode: each element tracks its own
-# ``adaptive_k`` starting at ``_ADAPTIVE_START_K`` and a rolling rejection
-# rate over the last ``_ADAPTIVE_WINDOW`` batched-forward iterations. On high
-# rejection (>= ``_ADAPTIVE_BACKOFF_THRESHOLD``) the per-element K halves
-# (floor ``_ADAPTIVE_MIN_K``); on consistent acceptance
+# Adaptive speculative-K tuning knobs. The runner treats ``spec_k < 0`` as
+# the adaptive sentinel. ``spec_k == 0`` is the raw neural path: one model
+# token per forward with no speculative DraftVM. In adaptive mode each element
+# tracks its own ``adaptive_k`` starting at ``_ADAPTIVE_START_K`` and a rolling
+# rejection rate over the last ``_ADAPTIVE_WINDOW`` batched-forward iterations.
+# On high rejection (>= ``_ADAPTIVE_BACKOFF_THRESHOLD``) the per-element K
+# halves (floor ``_ADAPTIVE_MIN_K``); on consistent acceptance
 # (<= ``_ADAPTIVE_RAMP_THRESHOLD``) it doubles (cap ``_ADAPTIVE_MAX_K``).
 # Per-element bookkeeping lets a batch that mixes programs (some perfectly
 # predicted, some flaky) auto-tune each slot independently.
-_ADAPTIVE_START_K = 32
-_ADAPTIVE_MIN_K = 1
-_ADAPTIVE_MAX_K = 64
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+_ADAPTIVE_START_K = max(1, _env_int("C4_ADAPTIVE_START_K", 32))
+_ADAPTIVE_MIN_K = max(1, _env_int("C4_ADAPTIVE_MIN_K", 1))
+_ADAPTIVE_MAX_K = max(_ADAPTIVE_MIN_K, _env_int("C4_ADAPTIVE_MAX_K", 64))
 _ADAPTIVE_WINDOW = 10
 _ADAPTIVE_BACKOFF_THRESHOLD = 0.5
 _ADAPTIVE_RAMP_THRESHOLD = 0.1
@@ -99,6 +111,24 @@ _UNPREDICTED_BUCKET_KEY = "unpredicted"
 # would-be emission for any correct C4 program.
 _UNSAFE_OFFSETS = frozenset(range(26, 34))
 
+# Some opcodes are neural-authoritative in raw one-token decoding but are not
+# safe speculation boundaries yet. In particular, call-frame control changes
+# rewrite PC/SP/BP in ways where a long DraftVM continuation can poison the
+# verifier tensor and produce persistent first-token rejection. We still test
+# these ops through the neural path; we just do not append DraftVM futures for
+# them.
+_SPEC_UNSAFE_OPS = frozenset({
+    int(Opcode.JSR),
+    int(Opcode.ENT),
+    int(Opcode.LEV),
+    int(Opcode.OPEN),
+    int(Opcode.READ),
+    int(Opcode.CLOS),
+    int(Opcode.PRTF),
+    int(Opcode.GETCHAR),
+    int(Opcode.PUTCHAR),
+})
+
 
 @dataclass
 class _ElementState:
@@ -111,7 +141,7 @@ class _ElementState:
     prefix_len: int
     output: List[str] = field(default_factory=list)
     halted: bool = False
-    exit_code: int = 0
+    exit_code: Optional[int] = 0
 
     last_pc: Optional[int] = None
     last_ax: int = 0
@@ -139,6 +169,11 @@ class _ElementState:
     # Count of consecutive iterations where the model rejected the very first
     # draft token. Used to flip ``spec_disabled`` after 4 in a row.
     spec_zero_streak: int = 0
+    # Declarative/DraftVM-predicted halt horizon. When set, this is not an
+    # arbitrary test cap: it is the exact number of VM steps the declarative
+    # program semantics need to halt. If the neural path is still running after
+    # this many generated steps, it has diverged.
+    expected_steps: Optional[int] = None
 
     # Adaptive spec-K state. ``adaptive_k`` is the current per-element draft
     # horizon in VM steps. ``recent_rejections`` is a rolling window of
@@ -176,7 +211,38 @@ class BatchedPureNeuralRunner:
         n_heads=8,
         ffn_hidden=4096,
         max_seq_len=4096,
+        use_kv_cache: Optional[bool] = None,
+        kv_cache_max_tokens: Optional[int] = None,
+        kv_cache_verify: Optional[bool] = None,
+        kv_cache_verify_interval: Optional[int] = None,
+        enable_moe_routing: Optional[bool] = None,
     ):
+        if use_kv_cache is None:
+            use_kv_cache = os.environ.get("C4_BATCH_USE_KV_CACHE") == "1"
+        if kv_cache_verify is None:
+            raw_verify = os.environ.get("C4_BATCH_KV_VERIFY", "0").strip().lower()
+            kv_cache_verify = raw_verify not in {"", "0", "false", "no", "off"}
+            if kv_cache_verify_interval is None:
+                if raw_verify in {"sample", "sampled", "periodic"}:
+                    kv_cache_verify_interval = _env_int(
+                        "C4_BATCH_KV_VERIFY_INTERVAL", 32
+                    )
+                else:
+                    try:
+                        numeric_verify = int(raw_verify)
+                    except ValueError:
+                        numeric_verify = 1
+                    kv_cache_verify_interval = max(1, numeric_verify)
+        if kv_cache_verify_interval is None:
+            kv_cache_verify_interval = _env_int("C4_BATCH_KV_VERIFY_INTERVAL", 1)
+        if kv_cache_max_tokens is None:
+            raw_max_tokens = os.environ.get("C4_BATCH_KV_MAX_TOKENS")
+            kv_cache_max_tokens = int(raw_max_tokens) if raw_max_tokens else None
+        if enable_moe_routing is None:
+            enable_moe_routing = (
+                os.environ.get("C4_BATCH_ENABLE_MOE_ROUTING") == "1"
+                or os.environ.get("C4_ENABLE_MOE_ROUTING") == "1"
+            )
         if model_runner is None:
             model_runner = AutoregressiveVMRunner(
                 d_model=d_model,
@@ -186,12 +252,219 @@ class BatchedPureNeuralRunner:
                 max_seq_len=max_seq_len,
                 pure_neural=True,
                 trust_neural_alu=True,
+                enable_moe_routing=enable_moe_routing,
             )
             model_runner._func_call_handlers = {}
             model_runner._syscall_handlers = {}
         self._serial = model_runner
         self.model = model_runner.model
         self._device = next(self.model.parameters()).device
+        self.enable_moe_routing = bool(
+            getattr(model_runner, "enable_moe_routing", enable_moe_routing)
+        )
+        self.use_kv_cache = bool(use_kv_cache)
+        self.kv_cache_verify = bool(kv_cache_verify)
+        self.kv_cache_verify_interval = max(1, int(kv_cache_verify_interval))
+        self.spec_fail_fast = (
+            os.environ.get("C4_SPEC_FAIL_FAST", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
+        self.kv_cache_max_tokens = int(
+            kv_cache_max_tokens or getattr(self.model, "max_seq_len", max_seq_len)
+        )
+        self._kv_cache_obj = None
+        self._kv_active_idx: Optional[Tuple[int, ...]] = None
+        self._kv_cached_rows: List[List[int]] = []
+        self._kv_incremental_count = 0
+        self._kv_stats = {
+            "calls": 0,
+            "hits": 0,
+            "fallbacks": 0,
+            "mismatches": 0,
+            "eviction_pressure": 0,
+            "verifications": 0,
+            "fresh_forwards": 0,
+            "kv_forwards": 0,
+            "verification_forwards": 0,
+            "cache_rebuilds": 0,
+            "reused_token_slots": 0,
+        }
+        self._spec_stats = {}
+        self._reset_spec_stats()
+
+    # ------------------------------------------------------------------
+    # Batched KV cache
+    # ------------------------------------------------------------------
+
+    def _reset_kv_cache(self) -> None:
+        self._kv_cache_obj = None
+        self._kv_active_idx = None
+        self._kv_cached_rows = []
+        self._kv_incremental_count = 0
+
+    def _reset_spec_stats(self) -> None:
+        self._spec_stats = {
+            "iterations": 0,
+            "drafted": 0,
+            "accepted": 0,
+            "full_accepts": 0,
+            "corrections": 0,
+            "first_token_rejects": 0,
+            "fail_fast": 0,
+            "no_draft_slots": 0,
+            "unsafe_opcode_stops": 0,
+            "max_effective_k": 0,
+        }
+
+    def _get_or_build_kv_cache(self):
+        if not self.use_kv_cache:
+            return None
+        if self._kv_cache_obj is not None:
+            return self._kv_cache_obj
+        from .kv_cache import LayerKVCache
+
+        first_attn = self.model.blocks[0].attn
+        self._kv_cache_obj = LayerKVCache(
+            num_layers=len(self.model.blocks),
+            max_tokens=self.kv_cache_max_tokens,
+            num_heads=first_attn.num_heads,
+            head_dim=first_attn.head_dim,
+            device=self._device,
+        )
+        return self._kv_cache_obj
+
+    @staticmethod
+    def _common_prefix_len(a: List[int], b: List[int]) -> int:
+        n = min(len(a), len(b))
+        i = 0
+        while i < n and a[i] == b[i]:
+            i += 1
+        return i
+
+    def _trim_kv_cache(self, keep_len: int) -> None:
+        if self._kv_cache_obj is None:
+            return
+        keep_len = int(max(0, keep_len))
+        for layer_cache in self._kv_cache_obj.caches:
+            if layer_cache.cached_k is None:
+                continue
+            cur = layer_cache.cache_size
+            if keep_len >= cur:
+                continue
+            if keep_len <= 0:
+                layer_cache.cached_k = None
+                layer_cache.cached_v = None
+                layer_cache.cached_pos_ids = None
+                layer_cache.per_head_keep_mask = None
+                layer_cache.cache_size = 0
+                layer_cache.next_pos_id = 0
+            else:
+                layer_cache.cached_k = layer_cache.cached_k[:, :, :keep_len, :]
+                layer_cache.cached_v = layer_cache.cached_v[:, :, :keep_len, :]
+                if layer_cache.cached_pos_ids is not None:
+                    layer_cache.cached_pos_ids = layer_cache.cached_pos_ids[:, :keep_len]
+                if layer_cache.per_head_keep_mask is not None:
+                    layer_cache.per_head_keep_mask = layer_cache.per_head_keep_mask[
+                        :, :, :keep_len
+                    ]
+                layer_cache.cache_size = keep_len
+                layer_cache.next_pos_id = keep_len
+        self._kv_cached_rows = [row[:keep_len] for row in self._kv_cached_rows]
+
+    def _batched_kv_common_prefix(
+        self, active_idx: List[int], sequences: List[List[int]]
+    ) -> int:
+        active_tuple = tuple(active_idx)
+        if self._kv_active_idx != active_tuple:
+            self._reset_kv_cache()
+            self._kv_active_idx = active_tuple
+            return 0
+        if len(self._kv_cached_rows) != len(sequences):
+            return 0
+        if not self._kv_cached_rows:
+            return 0
+        return min(
+            self._common_prefix_len(cached, current)
+            for cached, current in zip(self._kv_cached_rows, sequences)
+        )
+
+    def _forward_argmax_batch(
+        self,
+        sequences: List[List[int]],
+        active_idx: List[int],
+        *,
+        first_logit_pos: int,
+    ) -> Tuple[List[List[int]], int, List[int]]:
+        """Forward a padded active batch and return argmax rows.
+
+        When batched KV is enabled, all active rows share one
+        ``cached_prefix_len``. That prefix is the longest unchanged prefix
+        common to every active row, capped to the earliest logit any caller
+        will inspect. If a cached pass disagrees with a fresh pass, the fresh
+        logits are returned and the cache is discarded.
+        """
+        padded, real_lens = self._pad_to_tensor(sequences)
+        if not self.use_kv_cache:
+            self._kv_stats["fresh_forwards"] += 1
+            logits = self.model.forward(padded)
+            return logits.argmax(dim=-1).cpu().tolist(), 0, real_lens
+
+        max_len = padded.shape[1]
+        first_logit_pos = int(max(0, min(first_logit_pos, max_len - 1)))
+
+        # If the requested tensor itself is larger than the hard cache window,
+        # running through KV would evict keys before attention uses them. Keep
+        # correctness simple: count the pressure and use the fresh path.
+        if max_len > self.kv_cache_max_tokens:
+            self._kv_stats["eviction_pressure"] += 1
+            self._reset_kv_cache()
+            self._kv_stats["fresh_forwards"] += 1
+            logits = self.model.forward(padded)
+            return logits.argmax(dim=-1).cpu().tolist(), 0, real_lens
+
+        if self._kv_incremental_count >= 35:
+            self._reset_kv_cache()
+
+        prefix_match = self._batched_kv_common_prefix(active_idx, sequences)
+        cached_prefix_len = min(prefix_match, first_logit_pos)
+        self._trim_kv_cache(cached_prefix_len)
+
+        kv_cache = self._get_or_build_kv_cache()
+        self._kv_stats["calls"] += 1
+        self._kv_stats["kv_forwards"] += 1
+        self._kv_stats["cache_rebuilds"] += int(cached_prefix_len == 0)
+        self._kv_stats["reused_token_slots"] += cached_prefix_len * len(sequences)
+        logits = self.model.forward(
+            padded,
+            kv_cache=kv_cache,
+            cached_prefix_len=cached_prefix_len,
+        )
+        cached_preds = logits.argmax(dim=-1).cpu().tolist()
+
+        if (
+            self.kv_cache_verify
+            and cached_prefix_len > 0
+            and (
+                self.kv_cache_verify_interval <= 1
+                or self._kv_stats["calls"] % self.kv_cache_verify_interval == 0
+            )
+        ):
+            self._kv_stats["verifications"] += 1
+            self._kv_stats["verification_forwards"] += 1
+            fresh_logits = self.model.forward(padded)
+            fresh_preds = fresh_logits.argmax(dim=-1).cpu().tolist()
+            fresh_tail = [row[cached_prefix_len:] for row in fresh_preds]
+            if cached_preds != fresh_tail:
+                self._kv_stats["mismatches"] += 1
+                self._kv_stats["fallbacks"] += 1
+                self._reset_kv_cache()
+                return fresh_preds, 0, real_lens
+
+        self._kv_stats["hits"] += int(cached_prefix_len > 0)
+        self._kv_active_idx = tuple(active_idx)
+        self._kv_cached_rows = [list(seq) for seq in sequences]
+        self._kv_incremental_count += 1
+        return cached_preds, cached_prefix_len, real_lens
 
     # ------------------------------------------------------------------
     # Context construction
@@ -205,6 +478,7 @@ class BatchedPureNeuralRunner:
         stdin: str,
         spec_k: int = 0,
         adaptive_start_k: int = 0,
+        expected_steps: Optional[int] = None,
     ) -> _ElementState:
         ctx = self._serial._build_context(bytecode, data or b"", argv or [], stdin or "")
         st = _ElementState(
@@ -212,6 +486,7 @@ class BatchedPureNeuralRunner:
             context=list(ctx),
             prefix_len=len(ctx),
             stdin_buffer=list(stdin) if stdin else [],
+            expected_steps=expected_steps,
         )
         if isinstance(data, (bytes, bytearray)):
             for i, b in enumerate(data):
@@ -245,9 +520,10 @@ class BatchedPureNeuralRunner:
         data_list: Optional[List[bytes]] = None,
         argv_list: Optional[List[List[str]]] = None,
         stdin_list: Optional[List[str]] = None,
-        max_steps: int = 100,
+        max_steps: Optional[int] = 100,
         max_context_window: int = 512,
         spec_k: int = 0,
+        expected_steps_list: Optional[List[Optional[int]]] = None,
         bucket_by_predicted_length: bool = True,
         bucket_bounds: Optional[tuple] = None,
         batch_chunk: Optional[int] = None,
@@ -259,7 +535,10 @@ class BatchedPureNeuralRunner:
             data_list: optional per-program data section bytes.
             argv_list: optional per-program argv list.
             stdin_list: optional per-program stdin string.
-            max_steps: maximum VM steps (35 tokens each) per program.
+            max_steps: maximum VM steps (35 tokens each) per program. Pass
+                ``None`` only when ``expected_steps_list`` is provided; in that
+                mode the runner uses the declarative halt horizons instead of
+                a fixed cap.
             max_context_window: tail context window passed to the model.
             spec_k: number of full VM steps to speculate per batched forward.
                 ``0`` disables speculation entirely and runs one token per
@@ -312,6 +591,7 @@ class BatchedPureNeuralRunner:
         data_list = data_list or [b""] * B
         argv_list = argv_list or [[]] * B
         stdin_list = stdin_list or [""] * B
+        expected_steps_list = expected_steps_list or [None] * B
 
         # Length-aware bucketing dispatch. When enabled, we predict each
         # program's step count via DraftVM, sort descending, bucket by 2x
@@ -326,6 +606,7 @@ class BatchedPureNeuralRunner:
                 max_steps=max_steps,
                 max_context_window=max_context_window,
                 spec_k=spec_k,
+                expected_steps_list=expected_steps_list,
                 bucket_bounds=bucket_bounds or _DEFAULT_BUCKET_BOUNDS,
                 batch_chunk=batch_chunk,
             )
@@ -338,6 +619,7 @@ class BatchedPureNeuralRunner:
             max_steps=max_steps,
             max_context_window=max_context_window,
             spec_k=spec_k,
+            expected_steps_list=expected_steps_list,
         )
 
     # ------------------------------------------------------------------
@@ -352,13 +634,16 @@ class BatchedPureNeuralRunner:
         data_list: List,
         argv_list: List,
         stdin_list: List,
-        max_steps: int,
+        max_steps: Optional[int],
         max_context_window: int,
         spec_k: int,
+        expected_steps_list: Optional[List[Optional[int]]] = None,
     ) -> List[Tuple[str, int]]:
         B = len(bytecodes)
         if B == 0:
             return []
+        self._reset_kv_cache()
+        self._reset_spec_stats()
 
         # Adaptive mode: ``spec_k < 0`` is the sentinel. ``spec_k == 0`` keeps
         # the legacy non-speculative path; ``spec_k > 0`` keeps the legacy
@@ -375,6 +660,11 @@ class BatchedPureNeuralRunner:
                 stdin_list[i],
                 spec_k=spec_k if not adaptive else 0,
                 adaptive_start_k=adaptive_start_k,
+                expected_steps=(
+                    expected_steps_list[i]
+                    if expected_steps_list is not None
+                    else None
+                ),
             )
             for i, bc in enumerate(bytecodes)
         ]
@@ -461,9 +751,10 @@ class BatchedPureNeuralRunner:
         data_list: List,
         argv_list: List,
         stdin_list: List,
-        max_steps: int,
+        max_steps: Optional[int],
         max_context_window: int,
         spec_k: int,
+        expected_steps_list: List[Optional[int]],
         bucket_bounds: tuple,
         batch_chunk: Optional[int],
     ) -> List[Tuple[str, int]]:
@@ -479,13 +770,20 @@ class BatchedPureNeuralRunner:
         """
         B = len(bytecodes)
 
-        # 1) Predict per-program step counts. Cap DraftVM at ``max_steps``
-        #    (same cap the model uses) so a runaway loop in a single program
-        #    can't burn unbounded prediction time.
-        predicted = [
-            self._predict_steps(bytecodes[i], data_list[i], stdin_list[i], max_steps)
-            for i in range(B)
-        ]
+        # 1) Predict per-program step counts for length-aware bucketing. When
+        #    declarative halt horizons are supplied, use them directly instead
+        #    of applying a fixed prediction cap.
+        if any(p is not None for p in expected_steps_list):
+            predicted = list(expected_steps_list)
+        else:
+            if max_steps is None:
+                raise ValueError(
+                    "max_steps=None requires expected_steps_list for bucketing"
+                )
+            predicted = [
+                self._predict_steps(bytecodes[i], data_list[i], stdin_list[i], max_steps)
+                for i in range(B)
+            ]
 
         # 2) Assign each program to a bucket. Bucket key is the upper bound.
         bucket_members: dict = {}  # key -> list[orig_idx]
@@ -512,7 +810,11 @@ class BatchedPureNeuralRunner:
             # warmup happens on the slowest member; smaller members halt early
             # and stop padding the tensor).
             members.sort(
-                key=lambda i: -(predicted[i] if predicted[i] is not None else max_steps)
+                key=lambda i: -(
+                    predicted[i]
+                    if predicted[i] is not None
+                    else (max_steps if max_steps is not None else 0)
+                )
             )
             # Optionally sub-chunk a very large bucket to avoid bloating one
             # tensor. ``batch_chunk=None`` means one chunk per bucket.
@@ -523,6 +825,7 @@ class BatchedPureNeuralRunner:
                 chunk_data = [data_list[i] for i in chunk_idx]
                 chunk_argv = [argv_list[i] for i in chunk_idx]
                 chunk_stdin = [stdin_list[i] for i in chunk_idx]
+                chunk_expected = [expected_steps_list[i] for i in chunk_idx]
                 # ``max_steps`` is per-program and not affected by bucketing.
                 chunk_results = self._run_batch_core(
                     chunk_bcs,
@@ -532,6 +835,7 @@ class BatchedPureNeuralRunner:
                     max_steps=max_steps,
                     max_context_window=max_context_window,
                     spec_k=spec_k,
+                    expected_steps_list=chunk_expected,
                 )
                 for local_j, orig_i in enumerate(chunk_idx):
                     out[orig_i] = chunk_results[local_j]
@@ -550,10 +854,10 @@ class BatchedPureNeuralRunner:
         self,
         states: List[_ElementState],
         *,
-        max_steps: int,
+        max_steps: Optional[int],
         max_context_window: int,
     ) -> None:
-        total_tokens = max_steps * Token.STEP_TOKENS
+        total_tokens = self._total_token_budget(states, max_steps)
 
         for tok_i in range(total_tokens):
             active_idx = [i for i, s in enumerate(states) if not s.halted]
@@ -564,18 +868,17 @@ class BatchedPureNeuralRunner:
                 self._windowed_context(states[i], max_context_window)
                 for i in active_idx
             ]
-            padded, real_lens = self._pad_to_tensor(windowed)
-
             mh_end = max(s.mem_history_end for s in states)
             self.model.embed.set_mem_history_end(mh_end)
 
-            logits = self.model.forward(padded)  # [B_active, max_len, V]
-            # Batch argmax+CPU transfer once per outer iter rather than per
-            # element to avoid per-element GPU→CPU sync stalls.
-            preds_cpu = logits.argmax(dim=-1).cpu().tolist()
+            preds_cpu, pred_start, real_lens = self._forward_argmax_batch(
+                windowed,
+                active_idx,
+                first_logit_pos=min(len(seq) for seq in windowed) - 1,
+            )
             for b, i in enumerate(active_idx):
                 last_pos = real_lens[b] - 1
-                next_tok = int(preds_cpu[b][last_pos])
+                next_tok = int(preds_cpu[b][last_pos - pred_start])
                 self._step_one(states[i], next_tok, tok_i)
 
     # ------------------------------------------------------------------
@@ -590,12 +893,12 @@ class BatchedPureNeuralRunner:
         self,
         states: List[_ElementState],
         *,
-        max_steps: int,
+        max_steps: Optional[int],
         max_context_window: int,
         spec_k: int,
         adaptive: bool = False,
     ) -> None:
-        total_tokens = max_steps * Token.STEP_TOKENS
+        total_tokens = self._total_token_budget(states, max_steps)
         STEP = Token.STEP_TOKENS
 
         # Maximum sequence length the model accepts. We cap per-element K so
@@ -614,6 +917,7 @@ class BatchedPureNeuralRunner:
             active_idx = [i for i, s in enumerate(states) if not s.halted]
             if not active_idx:
                 break
+            self._spec_stats["iterations"] += 1
 
             # 1) Build per-element draft sequences. Elements with speculation
             #    disabled (or mid-step from a previous iter's rejection) get
@@ -650,6 +954,10 @@ class BatchedPureNeuralRunner:
                 room_tokens = max(0, model_max_seq - est_ctx_len)
                 room_k = room_tokens // STEP
                 effective_k = max(0, min(base_k, room_k))
+                self._spec_stats["max_effective_k"] = max(
+                    self._spec_stats["max_effective_k"],
+                    int(effective_k),
+                )
                 if (
                     not s.spec_disabled
                     and s.draft_vm is not None
@@ -661,7 +969,11 @@ class BatchedPureNeuralRunner:
                     # drift only causes extra rejections (not divergence —
                     # the model remains the source of truth).
                     self._sync_draft_vm(s)
+                    unsafe_stop = False
                     for _ in range(effective_k):
+                        if not self._draft_opcode_safe_for_speculation(s.draft_vm):
+                            unsafe_stop = True
+                            break
                         if s.draft_vm.halted:
                             break
                         ok = s.draft_vm.step()
@@ -670,6 +982,12 @@ class BatchedPureNeuralRunner:
                         d.extend(s.draft_vm.draft_tokens())
                         if s.draft_vm.halted:
                             break
+                    if unsafe_stop:
+                        self._spec_stats["unsafe_opcode_stops"] += 1
+                if len(d) == 0:
+                    self._spec_stats["no_draft_slots"] += 1
+                else:
+                    self._spec_stats["drafted"] += len(d)
                 drafts.append(d)
                 per_elem_k.append(effective_k)
 
@@ -683,19 +1001,18 @@ class BatchedPureNeuralRunner:
                 real_prefix_lens.append(len(ctx_win))
                 windowed_with_drafts.append(ctx_win + drafts[k])
 
-            padded, _ = self._pad_to_tensor(windowed_with_drafts)
-
             mh_end = max(s.mem_history_end for s in states)
             self.model.embed.set_mem_history_end(mh_end)
 
-            logits = self.model.forward(padded)  # [B_active, max_len, V]
-
-            # Pre-compute argmax for the entire tensor once (GPU op) and move
-            # to CPU in a single transfer. Per-position .item() calls inside
-            # the verification loop force one GPU→CPU sync each, which made
-            # the speculative path slower than non-speculative on small
-            # batches. Batching the argmax+move avoids that.
-            preds_cpu = logits.argmax(dim=-1).cpu().tolist()  # [B_active][max_len]
+            # Pre-compute argmax for the verifier tensor once (GPU op) and
+            # move to CPU in a single transfer. With KV enabled this may
+            # return only the suffix from ``pred_start`` onward; every caller
+            # indexes relative to that start.
+            preds_cpu, pred_start, _ = self._forward_argmax_batch(
+                windowed_with_drafts,
+                active_idx,
+                first_logit_pos=min(real_prefix_lens) - 1,
+            )
 
             # 3) For each element: verify drafts and replay accepted prefix + correction.
             for k, i in enumerate(active_idx):
@@ -708,7 +1025,7 @@ class BatchedPureNeuralRunner:
                 if len(draft) == 0:
                     # Pure single-token decode for this element (no spec budget).
                     last_pos = prefix_len - 1
-                    next_tok = int(preds_cpu[k][last_pos])
+                    next_tok = int(preds_cpu[k][last_pos - pred_start])
                     self._step_one(s, next_tok, tok_i)
                     continue
 
@@ -725,12 +1042,17 @@ class BatchedPureNeuralRunner:
                     if (j % STEP) in _UNSAFE_OFFSETS:
                         accepted = j + 1
                         continue
-                    pred = row_preds[prefix_len - 1 + j]
+                    pred = row_preds[prefix_len - 1 + j - pred_start]
                     if pred == draft[j]:
                         accepted = j + 1
                     else:
                         correction = pred
                         break
+                self._spec_stats["accepted"] += accepted
+                if correction is None:
+                    self._spec_stats["full_accepts"] += 1
+                else:
+                    self._spec_stats["corrections"] += 1
 
                 # Replay accepted tokens through _step_one, then the
                 # correction (if any). _step_one mutates s.context so the
@@ -760,9 +1082,20 @@ class BatchedPureNeuralRunner:
                 # the model never matches its drafts for this program). Disable
                 # speculation for this element to avoid wasted forwards.
                 if correction is not None and accepted == 0:
+                    self._spec_stats["first_token_rejects"] += 1
                     s.spec_zero_streak += 1
                     if s.spec_zero_streak >= 4:
-                        s.spec_disabled = True
+                        if self.spec_fail_fast:
+                            # Neural-authoritative gate: persistent first-token
+                            # disagreement means this program has already
+                            # diverged. Stop spending GPU time trying to
+                            # recover via one-token fallback; surface a hard
+                            # per-test failure instead.
+                            s.exit_code = None
+                            s.halted = True
+                            self._spec_stats["fail_fast"] += 1
+                        else:
+                            s.spec_disabled = True
                 else:
                     s.spec_zero_streak = 0
 
@@ -788,6 +1121,25 @@ class BatchedPureNeuralRunner:
                                 s.recent_rejections.clear()
 
             tok_i += 1  # outer-iteration counter, not strict token count
+
+    @staticmethod
+    def _total_token_budget(
+        states: List[_ElementState],
+        max_steps: Optional[int],
+    ) -> int:
+        """Return the outer decode budget for this batch.
+
+        With ``max_steps=None`` every active element must have a declarative
+        halt horizon. This is a semantic budget, not a fixed test cap: running
+        past it means the neural execution failed to halt where the declarations
+        say it must.
+        """
+        if max_steps is not None:
+            return int(max_steps) * Token.STEP_TOKENS
+        expected = [s.expected_steps for s in states if s.expected_steps is not None]
+        if not expected:
+            raise ValueError("max_steps=None requires declarative expected_steps")
+        return max(expected) * Token.STEP_TOKENS
 
     # ------------------------------------------------------------------
     # Speculation helpers
@@ -818,6 +1170,25 @@ class BatchedPureNeuralRunner:
         vm.halted = False
         vm._last_mem_addr = 0
         vm._last_mem_val = 0
+
+    @staticmethod
+    def _draft_opcode_safe_for_speculation(vm: DraftVM) -> bool:
+        """Return whether DraftVM's current opcode may be appended as draft.
+
+        Unsafe opcodes still execute neurally through the normal one-token path.
+        This guard only prevents long speculative continuations from being used
+        as verifier context across call-frame or external-I/O boundaries.
+        """
+        if vm.halted:
+            return True
+        if 0 <= vm.idx < len(vm.code):
+            op = vm.code[vm.idx] & 0xFF
+        else:
+            fetched = vm._fetch_instr_from_memory(vm.pc)
+            if fetched is None:
+                return False
+            op, _imm = fetched
+        return int(op) not in _SPEC_UNSAFE_OPS
 
     def _windowed_context(
         self, s: _ElementState, max_context_window: int
@@ -851,6 +1222,7 @@ class BatchedPureNeuralRunner:
     def _step_one(self, s: _ElementState, next_token: int, tok_i: int) -> None:
         """Append ``next_token`` to ``s.context`` and run pure_neural dispatch
         if it is a STEP_END / TOOL_CALL / HALT boundary."""
+        del tok_i
         s.context.append(next_token)
         s.token_pos += 1
 
@@ -861,6 +1233,16 @@ class BatchedPureNeuralRunner:
 
         if next_token == Token.STEP_END or next_token == Token.TOOL_CALL:
             self._dispatch_pure_neural(s)
+            if s.halted:
+                return
+
+        if (
+            s.expected_steps is not None
+            and s.token_pos >= s.expected_steps * Token.STEP_TOKENS
+            and not s.halted
+        ):
+            s.exit_code = None
+            s.halted = True
             return
 
     # ------------------------------------------------------------------
@@ -927,22 +1309,10 @@ class BatchedPureNeuralRunner:
                 self._serial._neural_read_emit(s.context)
             self._unborrow_serial_state(s)
 
-        # MEM persistence shim for store ops.
-        if exec_op in _MEM_STORE_OPS:
-            mem_section = self._extract_mem_section(s.context)
-            if mem_section is not None:
-                addr = sum((mem_section[1 + j] & 0xFF) << (j * 8) for j in range(4))
-                value = sum((mem_section[5 + j] & 0xFF) << (j * 8) for j in range(4))
-                for j in range(4):
-                    s.memory[(addr + j) & 0xFFFFFFFF] = (value >> (j * 8)) & 0xFF
-                self._track_mem_access(s, addr, mem_section)
-                # Rebuild context: prefix + mem_history + last_step.
-                last_step = s.context[-Token.STEP_TOKENS :]
-                mem_flat = []
-                for tokens in s.mem_history.values():
-                    mem_flat.extend(tokens)
-                s.context[s.prefix_len :] = mem_flat + list(last_step)
-                s.mem_history_end = s.prefix_len + len(mem_flat)
+        # V10-retired parity with the serial pure-neural runner: do not mirror
+        # stores into Python memory and do not rewrite the generated context.
+        # Historical MEM sections remain in the autoregressive context/KV path;
+        # L15 is responsible for reading them neurally.
 
         if exec_op == Opcode.EXIT:
             # In serial, EXIT is detected and the loop breaks; HALT is the
@@ -952,6 +1322,20 @@ class BatchedPureNeuralRunner:
             # a serial run where the loop also exits).
             s.exit_code = self._decode_exit_code(s.context)
             s.halted = True
+            return
+
+        # Neural-authoritative early exit: after a completed step, the model's
+        # emitted PC is the next instruction address and the emitted AX is the
+        # value EXIT would return. If that next instruction is EXIT, stop here
+        # instead of asking the model to generate an extra EXIT step whose
+        # register/default bytes are not semantically needed for the result.
+        if s.last_pc is not None:
+            next_idx = s.last_pc // INSTR_WIDTH
+            if 0 <= next_idx < len(s.bytecode):
+                next_op = s.bytecode[next_idx] & 0xFF
+                if next_op == Opcode.EXIT:
+                    s.exit_code = int(s.last_ax) & 0xFFFFFFFF
+                    s.halted = True
 
     # ------------------------------------------------------------------
     # Helpers reused from serial runner (small enough to inline)

@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -15,13 +16,16 @@ def make_layer4_pc_relay_op() -> Operation:
     (the regression at commit b2d9f4c3).
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer4_pc_relay
         attn = block.attn
         proxy = _as_setdim_proxy(dim_positions)
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_layer4_pc_relay(attn, S, proxy, HD)
+        Primitives.generate_attention_heads(
+            attn,
+            _layer4_pc_relay_head_specs(proxy),
+            HD,
+        )
 
     # Dim-ownership claims: L4 attn heads 0 + 1 PC relay.
     #   Head 0: V slots 1..32 read EMBED_LO/HI → EMBED_LO/HI at AX marker.
@@ -41,12 +45,20 @@ def make_layer4_pc_relay_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer4_pc_relay_ir,
         layer_idx=4,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _layer4_pc_relay_ir(dim_positions, HD) -> CompilerIR:
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.extend(_layer4_pc_relay_head_specs(proxy))
+    return ir
 
 
 def _layer4_pc_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
@@ -105,8 +117,7 @@ def make_layer4_ffn_op() -> Operation:
     ``make_layer4_pc_relay_op``.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer4_ffn
-        _set_layer4_ffn(block.ffn, S, _as_setdim_proxy(dim_positions))
+        _bake_layer4_ffn(block.ffn, S, _as_setdim_proxy(dim_positions))
 
     return Operation(
         name="layer4_ffn",
@@ -309,7 +320,8 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         writes={"ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},  # = ADDR_KEY band
         kind="block",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=4,
         migrated=True,
         claims=_claims,

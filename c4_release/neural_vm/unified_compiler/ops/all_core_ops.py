@@ -185,7 +185,7 @@ def all_core_ops(
         # exclusion so the head does not self-attend to its own staged
         # ADDR_KEY at the AX marker.  See docs/STACK0_VIA_MEM_ATTENTION_PLAN.md.
         make_layer8_mem_to_alu_op(enable=True),
-        make_layer9_alu_op(),
+        make_layer9_alu_op(alu_mode=alu_mode),
         make_layer9_lev_addr_relay_op(),
         make_layer9_lev_bp_to_pc_relay_op(),
         # ALiBi-based memory propagation attention head (phase=9.2).
@@ -214,11 +214,12 @@ def all_core_ops(
         make_layer10_carry_relay_bake_op(),
         make_layer10_byte_passthrough_bake_op(),
         make_layer10_sp_byte_passthrough_bake_op(),
+        make_layer10_bp_byte_passthrough_bake_op(),
         make_layer10_psh_stack0_passthrough_bake_op(),
         make_layer10_stack0_byte_relay_bake_op(),
         make_layer10_alu_op(),
-        make_layer11_mul_partial_op(),
-        make_layer12_mul_combine_op(),
+        make_layer11_mul_partial_op(alu_mode=alu_mode),
+        make_layer12_mul_combine_op(alu_mode=alu_mode),
         make_layer13_mem_addr_gather_op(),
         make_layer13_shifts_op(alu_mode=alu_mode),
         # 4-stage SHL/SHR composite (replaces ALUShift wrapper). Only
@@ -279,11 +280,19 @@ def all_core_ops(
         make_l8_alu_addsub_stage2_op(),
         make_l8_alu_addsub_stage3_op(),
         make_l8_alu_addsub_getobd_op(),
-        # L10 post_ops merged into a single phase-10.5 ffn
+        # L10 post_ops merged into a single phase-10.5 ffn.
+        #
+        # TODO: replace this dependency-assigned tail layer with a single
+        # immediate L10 post-op block. For now the combined layer remains
+        # load-bearing for SUB/DIV smoke, but bitwise propagation is owned
+        # only by the attached L10 post-op block so 16-bit XOR is not
+        # reprocessed in the late tail layer.
         make_l10_post_ops_combined(),
+        make_tail_bit32_result_correction_op(),
         # L15 attention resize: 8 heads -> 12 heads for LEV (phase=14.9 so it
         # fires before _set_layer15_memory_lookup populates the heads).
         make_l15_attention_resize_op(),
+        make_layer14_alu_high_byte_relay_op(),
         # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
         # FFN unit writes survive the rightsize pass at end of legacy_bake.
         make_function_call_weights_op(),

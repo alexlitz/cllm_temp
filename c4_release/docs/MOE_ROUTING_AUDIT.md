@@ -1,4 +1,4 @@
-# MoE Routing Audit: Current Implementation vs Canonical SoftMoEFFN Spec
+# MoE Routing Audit: Current Implementation vs Canonical StandardMoEFFN Spec
 
 **Branch:** `moe-audit`
 **Date:** 2026-05-11
@@ -9,7 +9,7 @@
 ## 1. Canonical Spec
 
 ```python
-class SoftMoEFFN(nn.Module):
+class StandardMoEFFN(nn.Module):
     def __init__(self, experts: List[PureFFN], expert_opcodes: List[int]):
         super().__init__()
         self.experts = nn.ModuleList(experts)
@@ -99,7 +99,7 @@ for opcode in unique_opcodes:
 
 Only used by `moe_vm.MoEAutoregressiveVM`, which itself is referenced solely from `test_archive/test_moe_vm.py` and `test_archive/test_moe_debug.py`. **Not on the live path.**
 
-### 2.3 `archive/pure_moe.MoE` (= `SoftMoEFFN` alias) (ARCHIVED)
+### 2.3 `archive/pure_moe.MoE` (= `StandardMoEFFN` alias) (ARCHIVED)
 
 File: `/home/alexlitz/Documents/misc/c4_release/neural_vm/archive/pure_moe.py`
 
@@ -108,11 +108,11 @@ This is the implementation that **matches the spec** (with a fast/skip-inactive 
 ```python
 def forward(self, x):
     if torch.onnx.is_in_onnx_export():
-        return self._soft_forward(x)        # spec-compliant
+        return self._trace_forward(x)       # spec-compliant
     # else: skip experts whose weight < threshold (uses .item())
 ```
 
-`SoftMoEFFN` is literally `MoE` re-exported as an alias (`SoftMoEFFN = MoE`).
+`StandardMoEFFN` is literally `MoE` re-exported as an alias (`StandardMoEFFN = MoE`).
 
 It is used by `archive/vm_step_legacy.py` only. Not on the live path.
 
@@ -120,7 +120,7 @@ It is used by `archive/vm_step_legacy.py` only. Not on the live path.
 
 ## 3. Gap Analysis (spec vs production path 2.1)
 
-| Property                          | Spec (SoftMoEFFN) | Prod (`compact_moe` + `set_active_opcode`)                       |
+| Property                          | Spec (StandardMoEFFN) | Prod (`compact_moe` + `set_active_opcode`)                       |
 |-----------------------------------|--------------------|------------------------------------------------------------------|
 | All experts run every step        | YES                | **NO** — only the active opcode's pre-concatenated `(shared+expert)` weight matrix is loaded; other experts contribute zero. |
 | Routing signal source             | `x[:, 0, OP_START:OP_START+NUM_OPS]` (tensor) | **Python**: `bytecode[next_exec] & 0xFF` from `run_vm.py:1027`. The network never sees the routing signal in the forward graph. |
@@ -200,22 +200,22 @@ If ONNX/sparse compatibility is not required for the foreseeable future and runt
   - `/home/alexlitz/Documents/misc/c4_release/neural_vm/moe_weight_loader.py`
   - `/home/alexlitz/Documents/misc/c4_release/neural_vm/moe_vm.py`
 - Archived spec-compliant implementation:
-  - `/home/alexlitz/Documents/misc/c4_release/neural_vm/archive/pure_moe.py` (class `MoE`, alias `SoftMoEFFN`)
+  - `/home/alexlitz/Documents/misc/c4_release/neural_vm/archive/pure_moe.py` (class `MoE`, alias `StandardMoEFFN`)
   - `/home/alexlitz/Documents/misc/c4_release/neural_vm/archive/vm_step_legacy.py`
 
 ---
 
 ## 8. 2026-05-12 Addendum: Standard top-K MoE pivot
 
-The May-2026 conversion to a Soft-MoE-style `SoftMoEFFN` (commits `2e853c3`,
+The May-2026 conversion to an early blended-routing `StandardMoEFFN` (commits `2e853c3`,
 `8b0aa42`, `66bf21e`, `ce2a704`) and the subsequent wiring of `compact_moe()`
 into `AutoregressiveVMRunner` (commit `7d7b93d`, branch `wire-moe-routing-default`)
-landed a `SoftMoEFFN` that pooled routing weights across the sequence and
-soft-blended all experts. That regressed `test_imm_exit` from 42 to 43 in
-pure_neural mode — the soft-blend semantics differed from both the dense
+landed a `StandardMoEFFN` that pooled routing weights across the sequence and
+blended all experts. That regressed `test_imm_exit` from 42 to 43 in
+pure_neural mode — the blended semantics differed from both the dense
 compacted FFN and the legacy weight-swap path.
 
-Per user feedback (this branch, `moe-standard-topk-routing`), the soft-MoE
+Per user feedback (this branch, `moe-standard-topk-routing`), the blended
 approach is moot: the desired routing is **standard top-K MoE**
 (Mixtral/DeepSeek/Qwen-style), where only the K experts selected by the
 router actually run per token. For C4 with one-hot OP_* routing, `top_k=1`
@@ -223,7 +223,7 @@ is the natural choice — exactly one opcode is active per VM step.
 
 ### 8.1 Current state (this branch)
 
-- `pure_moe.SoftMoEFFN` is **rewritten** as a standard top-K MoE:
+- `pure_moe.StandardMoEFFN` is **rewritten** as a standard top-K MoE:
   - Sparse per-expert dispatch (Mixtral-style): only the routed experts'
     sub-batch of tokens runs through each expert. Memory-efficient.
   - Raw one-hot routing gates (no softmax renormalization): the OP_*
@@ -233,9 +233,8 @@ is the natural choice — exactly one opcode is active per VM step.
   - Always-on `shared_ffn`: opcode-INDEPENDENT hidden units form a small
     PureFFN that runs at every position (DeepSeek shared-expert pattern).
     `b_down` lives here so it applies once.
-  - Class name `SoftMoEFFN` retained for back-compat; `StandardMoEFFN`
-    is the preferred forward-looking alias.
-- `build_soft_moe_from_compact_partition()` constructs the new MoE from
+  - Class name `StandardMoEFFN` is the public compiler-emitted API.
+- `build_standard_moe_from_compact_partition()` constructs the new MoE from
   the same `compact_moe` partition output (shared_indices + opcode_to_units),
   but now splits shared into the always-on `shared_ffn` and each expert
   holds ONLY its opcode-specific units.

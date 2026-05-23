@@ -1,7 +1,8 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..ir import FFNRule
 from ..layer_compiler import Operation
-from ..primitives import AO, AP, DeclarativeAttentionHeadSpec
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -11,8 +12,8 @@ def make_layer3_ffn_op() -> Operation:
     Originally: `_set_layer3_ffn` at vm_step.py:2929.
 
     Reads MARK_PC, MARK_SP, MARK_BP, MARK_STACK0, HAS_SE, EMBED_LO/HI,
-    H1, H4, BYTE_INDEX_*, OP_LEV.
-    Writes OUTPUT_LO/HI, EMBED_LO/HI.
+    H1, H4, BYTE_INDEX_*, OP_LEV, NEXT_STACK0.
+    Writes OUTPUT_LO/HI, EMBED_LO/HI, NEXT_STACK0.
 
     Pinned to ``layer_idx=3`` via ``kind="block"`` because the legacy
     ``set_vm_weights`` pipeline targets ``model.blocks[3].ffn``. Without
@@ -35,11 +36,15 @@ def make_layer3_ffn_op() -> Operation:
         phase=3,
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
                "EMBED_LO", "EMBED_HI", "H1", "H4", "OP_LEV",
-               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2"},
-        writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI"},
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "NEXT_STACK0"},
+        writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
+                "NEXT_STACK0"},
         kind="block",
         layer_idx=3,
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         migrated=True,
         postcondition={
             "OUTPUT_LO": "monotonic_non_decreasing",
@@ -66,8 +71,10 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         phase=3,
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
                "EMBED_LO", "EMBED_HI", "H1", "H4", "OP_LEV",
-               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2"},
-        writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI"},
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "NEXT_STACK0"},
+        writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
+                "NEXT_STACK0"},
         kind="ffn",
         bake_fn=bake,
         migrated=True,
@@ -87,7 +94,6 @@ def make_layer3_carry_forward_attn_op() -> Operation:
     (head 5 reads OUTPUT_*, head 6 has OP_LEV gating + CLEAN_EMBED_*).
     """
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_stack0_carry_attn
         from ..primitives import Primitives
         proxy = _as_setdim_proxy(dim_positions)
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
@@ -101,37 +107,15 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         cf(attn, 1, proxy.MARK_AX, AX_I, AX_I, proxy.AX_CARRY_LO, proxy.AX_CARRY_HI, HD=HD, bd=proxy)
         cf(attn, 2, proxy.MARK_SP, SP_I, SP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
         cf(attn, 3, proxy.MARK_BP, BP_I, BP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
-        _set_stack0_carry_attn(attn, 4, HD, BD=proxy)
-        # Heads 5-6: AX_FULL relay + BP->PC for LEV. Keep this inline to
-        # preserve the legacy slot layout exactly.
-        L = 15.0
-        base = 5 * HD
-        attn.W_q[base, proxy.MARK_AX] = L
-        attn.W_q[base, proxy.HAS_SE] = L
-        attn.W_q[base, proxy.CONST] = -L * 1.5
-        attn.W_k[base, proxy.MARK_AX] = L
-        for k in range(16):
-            attn.W_v[base + 1 + k, proxy.OUTPUT_LO + k] = 1.0
-            attn.W_v[base + 17 + k, proxy.OUTPUT_HI + k] = 1.0
-        for k in range(16):
-            attn.W_o[proxy.AX_FULL_LO + k, base + 1 + k] = 1.0
-            attn.W_o[proxy.AX_FULL_HI + k, base + 17 + k] = 1.0
-        GATE = 33
-        attn.W_q[base + GATE, proxy.MARK_AX] = L
-        attn.W_q[base + GATE, proxy.CONST] = -L / 2
-        attn.W_k[base + GATE, proxy.CONST] = L
-        base = 6 * HD
-        attn.W_q[base, proxy.MARK_PC] = L
-        attn.W_q[base, proxy.OP_LEV] = L / 5
-        attn.W_q[base, proxy.CONST] = -L * 1.5
-        attn.W_k[base, proxy.L1H1 + BP_I] = L
-        attn.W_k[base, proxy.L1H0 + BP_I] = -L
-        for k in range(16):
-            attn.W_v[base + 1 + k, proxy.CLEAN_EMBED_LO + k] = 1.0
-            attn.W_v[base + 17 + k, proxy.CLEAN_EMBED_HI + k] = 1.0
-        attn.W_q[base + GATE, proxy.MARK_PC] = L
-        attn.W_q[base + GATE, proxy.CONST] = -L / 2
-        attn.W_k[base + GATE, proxy.CONST] = L
+        Primitives.generate_attention_heads(
+            attn,
+            (
+                _stack0_carry_head_spec(proxy),
+                _ax_full_relay_head_spec(proxy),
+                _lev_bp_to_pc_head_spec(proxy),
+            ),
+            HD,
+        )
 
     # Dim-ownership claims: 7 carry-forward attention heads.
     #   Heads 0-3: Primitives.carry_forward_attention writes V slots 1..32:
@@ -180,6 +164,8 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         kind="attn",
         layer_idx=3,
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
@@ -200,9 +186,6 @@ def _stack0_carry_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         v.append(AP(17 + k_idx, BD.EMBED_HI + k_idx, 1.0))
         o.append(AO(BD.EMBED_LO + k_idx, 1 + k_idx, 1.0))
         o.append(AO(BD.EMBED_HI + k_idx, 17 + k_idx, 1.0))
-    for k_idx in range(1, 16):
-        o.append(AO(BD.OUTPUT_LO + k_idx, 1 + k_idx, 1.0))
-        o.append(AO(BD.OUTPUT_HI + k_idx, 17 + k_idx, 1.0))
     q.append(AP(33, BD.MARK_STACK0, L))
     q.append(AP(33, BD.CONST, -L / 2))
     return DeclarativeAttentionHeadSpec(
@@ -297,8 +280,7 @@ def make_layer3_convo_io_state_init_op(
         if not enable_conversational_io:
             return
         proxy = _as_setdim_proxy(dim_positions)
-        from ...vm_step import _set_conversational_io_state_init
-        _set_conversational_io_state_init(block.ffn, S, proxy)
+        _lower_layer3_convo_io_state_init_ir(block.ffn, S, proxy)
 
     return Operation(
         name="layer3_convo_io_state_init",
@@ -313,8 +295,36 @@ def make_layer3_convo_io_state_init_op(
         kind="block",
         layer_idx=3,
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_conversational_io else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         migrated=True,
+        ffn_units_used=1035 if enable_conversational_io else None,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+    )
+
+
+def _layer3_convo_io_state_init_rules(S: float) -> tuple[FFNRule, ...]:
+    return (
+        FFNRule.constant_write(
+            name="convo_io_enter_output_mode",
+            conditions=(("LAST_WAS_THINKING_END", 1.0),),
+            threshold=0.5,
+            writes=(("IO_IN_OUTPUT_MODE", 2.0 / S),),
+        ),
+    )
+
+
+def _lower_layer3_convo_io_state_init_ir(ffn, S: float, BD) -> int:
+    rules = _layer3_convo_io_state_init_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=1034,
+        S=S,
     )

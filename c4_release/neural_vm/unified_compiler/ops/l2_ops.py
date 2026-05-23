@@ -1,6 +1,8 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -12,8 +14,7 @@ def make_layer2_mem_byte_flags_op() -> Operation:
     ``make_layer2_initial_pc_bake_cancel_op``) can start above this range.
     """
     def bake(ffn, dim_positions, S):
-        from ...setup_helpers import _set_layer2_mem_byte_flags
-        _set_layer2_mem_byte_flags(ffn, S, _as_setdim_proxy(dim_positions))
+        _bake_layer2_mem_byte_flags(ffn, S, _as_setdim_proxy(dim_positions))
         # The legacy bake fills units 0..7 (4 MEM_VAL_BN + 4 BYTE_INDEX_*).
         ffn._l2_unit_counter = max(getattr(ffn, "_l2_unit_counter", 0), 8)
 
@@ -25,15 +26,21 @@ def make_layer2_mem_byte_flags_op() -> Operation:
     #   unit 2: MEM_VAL_B2
     #   unit 3: MEM_VAL_B3
     #   unit 4: BYTE_INDEX_0  (STACK0 byte 0)
-    #   unit 5: BYTE_INDEX_1  (STACK0 byte 1)
-    #   unit 6: BYTE_INDEX_2  (STACK0 byte 2)
-    #   unit 7: BYTE_INDEX_3  (STACK0 byte 3)
+    #   unit 5: BYTE_INDEX_1 + STACK0_BYTE1  (STACK0 byte 1)
+    #   unit 6: BYTE_INDEX_2 + STACK0_BYTE2  (STACK0 byte 2)
+    #   unit 7: BYTE_INDEX_3 + STACK0_BYTE3  (STACK0 byte 3)
     _claims = set()
     _outputs = [
         "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
         "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
     ]
     for u, out_dim in enumerate(_outputs):
+        _claims.add((2, "ffn_W_down", str(u), f"{out_dim}+0"))
+    for u, out_dim in (
+        (5, "STACK0_BYTE1"),
+        (6, "STACK0_BYTE2"),
+        (7, "STACK0_BYTE3"),
+    ):
         _claims.add((2, "ffn_W_down", str(u), f"{out_dim}+0"))
 
     return Operation(
@@ -42,7 +49,8 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         reads={"H0", "H1", "H4", "IS_BYTE", "BYTE_INDEX_0",
                "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
         writes={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
-                "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
+                "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+                "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3"},
         kind="ffn",
         layer_idx=2,
         bake_fn=bake,
@@ -71,16 +79,20 @@ def _bake_layer2_mem_byte_flags(ffn, S, BD):
         (BD.L1H4 + MEM_I, BD.L2H0 + MEM_I, BD.MEM_VAL_B2),
         (BD.H2 + MEM_I, BD.L1H4 + MEM_I, BD.MEM_VAL_B3),
         (BD.L1H4 + BP_I, BD.H1 + BP_I, BD.BYTE_INDEX_0),
-        (BD.H2 + BP_I, BD.L1H4 + BP_I, BD.BYTE_INDEX_1),
-        (BD.H3 + BP_I, BD.H2 + BP_I, BD.BYTE_INDEX_2),
-        (BD.H4 + BP_I, BD.H3 + BP_I, BD.BYTE_INDEX_3),
+        (BD.H2 + BP_I, BD.L1H4 + BP_I, (BD.BYTE_INDEX_1, BD.STACK0_BYTE1)),
+        (BD.H3 + BP_I, BD.H2 + BP_I, (BD.BYTE_INDEX_2, BD.STACK0_BYTE2)),
+        (BD.H4 + BP_I, BD.H3 + BP_I, (BD.BYTE_INDEX_3, BD.STACK0_BYTE3)),
     ):
         ffn.W_up.data[unit, src_dim] = S
         ffn.W_up.data[unit, BD.IS_BYTE] = S
         ffn.b_up.data[unit] = -S * 1.5
         ffn.W_gate.data[unit, blocker_dim] = -1.0
         ffn.b_gate.data[unit] = 1.0
-        ffn.W_down.data[out_dim, unit] = 2.0 / S
+        if isinstance(out_dim, tuple):
+            for dim in out_dim:
+                ffn.W_down.data[dim, unit] = 2.0 / S
+        else:
+            ffn.W_down.data[out_dim, unit] = 2.0 / S
         unit += 1
 
 
@@ -197,7 +209,6 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
 def make_layer2_threshold_attn_op() -> Operation:
     """L2 attention: threshold 5.5 head."""
     def bake(attn, dim_positions, S):
-        from ..primitives import Primitives
         proxy = _as_setdim_proxy(dim_positions)
         ALIBI_S = 10.0
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
@@ -226,11 +237,26 @@ def make_layer2_threshold_attn_op() -> Operation:
         layer_idx=2,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer2_threshold_ir,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _layer2_threshold_ir(dim_positions, HD) -> CompilerIR:
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.extend(Primitives.threshold_attention_head_specs(
+        [5.5],
+        [proxy.L2H0],
+        10.0,
+        HD,
+        heads=[0],
+        bd=proxy,
+    ))
+    return ir
 
 
 def make_layer2_lookback_detection_head_op(
@@ -256,6 +282,7 @@ def make_layer2_lookback_detection_head_op(
     outside of conversational-I/O mode.
     """
     def bake(block, dim_positions, S):
+        del S
         if not enable_conversational_io:
             return
         attn = block.attn
@@ -263,8 +290,11 @@ def make_layer2_lookback_detection_head_op(
             attn.alibi_slopes[1] = 10.0  # Steep slope to favor most recent token
         proxy = _as_setdim_proxy(dim_positions)
         HD = attn.W_q.shape[0] // attn.num_heads
-        from ...vm_step import _set_lookback_detection_head
-        _set_lookback_detection_head(attn, S, proxy, HD)
+        Primitives.generate_attention_head(
+            attn,
+            _layer2_lookback_detection_head_spec(proxy),
+            HD,
+        )
 
     return Operation(
         name="layer2_lookback_detection_head",
@@ -279,8 +309,40 @@ def make_layer2_lookback_detection_head_op(
         kind="block",
         layer_idx=2,
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_conversational_io else None,
+        declarative_bake_fn=bake,
+        compiler_ir_factory=(
+            _layer2_lookback_detection_head_ir
+            if enable_conversational_io else None
+        ),
+        declarative_authority="spec_generated",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _layer2_lookback_detection_head_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_layer2_lookback_detection_head_spec(proxy))
+    return ir
+
+
+def _layer2_lookback_detection_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    L = 20.0
+    return DeclarativeAttentionHeadSpec(
+        head_idx=1,
+        q=(AP(0, BD.CONST, L),),
+        k=(AP(0, BD.CONST, L),),
+        v=(
+            AP(1, BD.MARK_THINKING_START, 1.0),
+            AP(2, BD.MARK_THINKING_END, 1.0),
+            AP(3, BD.IS_BYTE, 1.0),
+        ),
+        o=(
+            AO(BD.LAST_WAS_THINKING_START, 1, 1.0),
+            AO(BD.LAST_WAS_THINKING_END, 2, 1.0),
+            AO(BD.LAST_WAS_BYTE, 3, 1.0),
+        ),
     )

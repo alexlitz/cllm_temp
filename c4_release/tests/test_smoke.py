@@ -39,10 +39,18 @@ Batched wiring (2026-05-12, branch ``batch-smoke-tests-via-fixture``):
 Tuning knobs:
     C4_SMOKE_SPEC_K — DraftVM speculation horizon in VM steps (default 0 for
                       neural-authoritative smoke; set >0 only for speculative
-                      performance experiments).
-    C4_SMOKE_MAX_STEPS_CAP — override the per-program ``max_steps`` cap
-                      (default: use the per-test's own ``max_steps`` value).
+                      performance experiments). The default 0 also disables
+                      DraftVM length bucketing, so the smoke gate runs the raw
+                      one-token-at-a-time neural path. Results are always
+                      decoded from model-emitted context, never substituted
+                      from DraftVM state.
+    C4_SMOKE_MAX_STEPS_CAP — override the per-group ``max_steps`` cap
+                      (default: use the max of the group's test budgets).
                       Useful for stress-testing edge cases.
+    C4_SMOKE_EXECUTOR — ``batched`` (default) runs class groups through
+                      ``BatchedPureNeuralRunner``. ``serial-kv`` runs each
+                      entry through the shared serial ``AutoregressiveVMRunner``
+                      so speculative verification exercises the KV cache.
 
 Coexists with:
     - ``test_suite_1096_pure_neural_pytest.py`` (1096 batched suite, commit
@@ -650,6 +658,9 @@ _ALL_SMOKE_TESTS = [t for group in _SMOKE_GROUPS.values() for t in group]
 
 
 _SMOKE_SPEC_K = int(os.environ.get("C4_SMOKE_SPEC_K", "0"))
+_SMOKE_MAX_STEPS_CAP = os.environ.get("C4_SMOKE_MAX_STEPS_CAP")
+_SMOKE_MAX_STEPS_CAP = int(_SMOKE_MAX_STEPS_CAP) if _SMOKE_MAX_STEPS_CAP else None
+_SMOKE_EXECUTOR = os.environ.get("C4_SMOKE_EXECUTOR", "batched").strip().lower()
 
 
 # =============================================================================
@@ -672,14 +683,49 @@ def _run_group_batch(runner, tests, group_label=""):
     """
     bytecodes = [t["bytecode"] for t in tests]
     max_steps = max(t["max_steps"] for t in tests)
+    if _SMOKE_MAX_STEPS_CAP is not None:
+        max_steps = _SMOKE_MAX_STEPS_CAP
     names = [t["name"] for t in tests]
 
     t0 = time.perf_counter()
+    if _SMOKE_EXECUTOR in ("serial", "serial-kv", "kv") and hasattr(runner, "_serial"):
+        serial_runner = getattr(runner, "_serial", runner)
+        old_spec_k = getattr(serial_runner, "spec_k", None)
+        try:
+            if old_spec_k is not None:
+                serial_runner.spec_k = _SMOKE_SPEC_K
+            batch_results = []
+            for bytecode in bytecodes:
+                batch_results.append(
+                    serial_runner.run(bytecode, b"", max_steps=max_steps)
+                )
+        except Exception as e:
+            err = f"serial run error: {e!r}"
+            return {n: ("", None, err) for n in names}
+        finally:
+            if old_spec_k is not None:
+                serial_runner.spec_k = old_spec_k
+        elapsed = time.perf_counter() - t0
+        if os.environ.get("C4_SMOKE_TIMING") == "1" and group_label:
+            cache_state = "kv" if getattr(serial_runner, "use_kv_cache", False) else "no-kv"
+            print(
+                f"[smoke-timing] {group_label:>13s}: "
+                f"N={len(tests):2d} max_steps={max_steps:3d} "
+                f"executor=serial-{cache_state} wall={elapsed:7.2f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+        results = {}
+        for name, (output, exit_code) in zip(names, batch_results):
+            results[name] = (output, exit_code, None)
+        return results
+
     try:
         batch_results = runner.run_batch(
             bytecodes,
             max_steps=max_steps,
             spec_k=_SMOKE_SPEC_K,
+            bucket_by_predicted_length=(_SMOKE_SPEC_K != 0),
         )
     except Exception as e:
         err = f"batch run error: {e!r}"
@@ -700,60 +746,266 @@ def _run_group_batch(runner, tests, group_label=""):
     return results
 
 
+class TestSmokeHarnessConfig:
+    """Cheap harness checks that do not construct the neural model."""
+
+    def test_spec_k_zero_disables_draftvm_bucketing(self, monkeypatch):
+        """Strict smoke default must stay raw neural, not DraftVM-assisted."""
+
+        class FakeRunner:
+            def __init__(self):
+                self.kwargs = None
+
+            def run_batch(self, bytecodes, **kwargs):
+                self.kwargs = kwargs
+                return [("", 123) for _ in bytecodes]
+
+        fake = FakeRunner()
+        monkeypatch.setattr(sys.modules[__name__], "_SMOKE_SPEC_K", 0)
+
+        results = _run_group_batch(
+            fake,
+            [
+                {
+                    "name": "harness::raw",
+                    "bytecode": _make_bytecode([(Opcode.IMM, 123), Opcode.EXIT]),
+                    "max_steps": 2,
+                    "check": _eq(123),
+                }
+            ],
+            "harness",
+        )
+
+        assert results["harness::raw"] == ("", 123, None)
+        assert fake.kwargs["spec_k"] == 0
+        assert fake.kwargs["bucket_by_predicted_length"] is False
+
+    def test_positive_spec_k_enables_spec_experiment_bucketing(self, monkeypatch):
+        """Speculative smoke experiments keep the length-bucket speed path."""
+
+        class FakeRunner:
+            def __init__(self):
+                self.kwargs = None
+
+            def run_batch(self, bytecodes, **kwargs):
+                self.kwargs = kwargs
+                return [("", 7) for _ in bytecodes]
+
+        fake = FakeRunner()
+        monkeypatch.setattr(sys.modules[__name__], "_SMOKE_SPEC_K", 8)
+
+        _run_group_batch(
+            fake,
+            [
+                {
+                    "name": "harness::spec",
+                    "bytecode": _make_bytecode([(Opcode.IMM, 7), Opcode.EXIT]),
+                    "max_steps": 2,
+                    "check": _eq(7),
+                }
+            ],
+            "harness",
+        )
+
+        assert fake.kwargs["spec_k"] == 8
+        assert fake.kwargs["bucket_by_predicted_length"] is True
+
+    def test_max_steps_cap_overrides_group_max(self, monkeypatch):
+        """Documented C4_SMOKE_MAX_STEPS_CAP must drive run_batch max_steps."""
+
+        class FakeRunner:
+            def __init__(self):
+                self.kwargs = None
+
+            def run_batch(self, bytecodes, **kwargs):
+                self.kwargs = kwargs
+                return [("", 1) for _ in bytecodes]
+
+        fake = FakeRunner()
+        monkeypatch.setattr(sys.modules[__name__], "_SMOKE_SPEC_K", 0)
+        monkeypatch.setattr(sys.modules[__name__], "_SMOKE_MAX_STEPS_CAP", 77)
+
+        _run_group_batch(
+            fake,
+            [
+                {
+                    "name": "harness::cap_a",
+                    "bytecode": _make_bytecode([(Opcode.IMM, 1), Opcode.EXIT]),
+                    "max_steps": 2,
+                    "check": _eq(1),
+                },
+                {
+                    "name": "harness::cap_b",
+                    "bytecode": _make_bytecode([(Opcode.IMM, 1), Opcode.EXIT]),
+                    "max_steps": 40,
+                    "check": _eq(1),
+                },
+            ],
+            "harness",
+        )
+
+        assert fake.kwargs["max_steps"] == 77
+
+    def test_lookup_and_check_exposes_neural_result_mismatch(self, monkeypatch):
+        """A wrong raw-neural exit code must fail, not be papered over."""
+
+        entry = {
+            "name": "harness::mismatch",
+            "bytecode": _make_bytecode([(Opcode.IMM, 42), Opcode.EXIT]),
+            "max_steps": 2,
+            "check": _eq(42),
+        }
+        monkeypatch.setattr(sys.modules[__name__], "_ALL_SMOKE_TESTS", [entry])
+
+        with pytest.raises(AssertionError, match="expected 42, got 7"):
+            _lookup_and_check({"harness::mismatch": ("", 7, None)}, "harness::mismatch")
+
+    def test_lookup_and_check_reports_batch_errors(self, monkeypatch):
+        """Batch-level raw-neural failures must surface as pytest failures."""
+
+        entry = {
+            "name": "harness::batch_error",
+            "bytecode": _make_bytecode([(Opcode.IMM, 42), Opcode.EXIT]),
+            "max_steps": 2,
+            "check": _eq(42),
+        }
+        monkeypatch.setattr(sys.modules[__name__], "_ALL_SMOKE_TESTS", [entry])
+
+        with pytest.raises(pytest.fail.Exception, match="harness::batch_error: batch run error"):
+            _lookup_and_check(
+                {"harness::batch_error": ("", None, "batch run error: RuntimeError('boom')")},
+                "harness::batch_error",
+            )
+
+    def test_selected_group_filter_keeps_focused_pytest_runs_narrow(self):
+        """Selecting two smoke tests should not execute the whole class batch."""
+
+        class FakeItem:
+            def __init__(self, nodeid):
+                self.nodeid = nodeid
+
+        class FakeSession:
+            items = [
+                FakeItem("c4_release/tests/test_smoke.py::TestSmokeBasic::test_imm_exit"),
+                FakeItem("c4_release/tests/test_smoke.py::TestSmokeBasic::test_add_basic"),
+            ]
+
+        class FakeRequest:
+            session = FakeSession()
+
+        selected = _selected_group_tests(FakeRequest(), _BASIC_TESTS)
+
+        assert [t["name"] for t in selected] == [
+            "TestSmokeBasic::test_imm_exit",
+            "TestSmokeBasic::test_add_basic",
+        ]
+
+
 # All per-class fixtures share the SAME compiled model via the session-
 # scoped ``_batched_pure_neural_runner_model`` fixture in ``conftest.py`` —
 # so the expensive ``compile_full_vm`` bake happens exactly once across the
 # whole pytest session, not once per class.
 
 
-@pytest.fixture(scope="session")
-def _smoke_basic_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _BASIC_TESTS, "basic")
+def _selected_group_tests(request, tests):
+    """Return only group entries selected by pytest, preserving group order."""
+    selected_nodeids = [item.nodeid for item in request.session.items]
+    selected = [
+        test
+        for test in tests
+        if any(nodeid.endswith(f"::{test['name']}") for nodeid in selected_nodeids)
+    ]
+    return selected or tests
 
 
 @pytest.fixture(scope="session")
-def _smoke_controlflow_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _CF_TESTS, "controlflow")
+def _smoke_basic_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _BASIC_TESTS),
+        "basic",
+    )
 
 
 @pytest.fixture(scope="session")
-def _smoke_functioncall_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _FUNC_TESTS, "functioncall")
+def _smoke_controlflow_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _CF_TESTS),
+        "controlflow",
+    )
 
 
 @pytest.fixture(scope="session")
-def _smoke_bitwise_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _BITWISE_TESTS, "bitwise")
+def _smoke_functioncall_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _FUNC_TESTS),
+        "functioncall",
+    )
 
 
 @pytest.fixture(scope="session")
-def _smoke_comparison_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _CMP_TESTS, "comparison")
+def _smoke_bitwise_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _BITWISE_TESTS),
+        "bitwise",
+    )
 
 
 @pytest.fixture(scope="session")
-def _smoke_address_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _ADDR_TESTS, "address")
+def _smoke_comparison_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _CMP_TESTS),
+        "comparison",
+    )
 
 
 @pytest.fixture(scope="session")
-def _smoke_memory_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _MEM_TESTS, "memory")
+def _smoke_address_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _ADDR_TESTS),
+        "address",
+    )
 
 
 @pytest.fixture(scope="session")
-def _smoke_shift_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _SHIFT_TESTS, "shift")
+def _smoke_memory_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _MEM_TESTS),
+        "memory",
+    )
 
 
 @pytest.fixture(scope="session")
-def _smoke_bit32_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _BIT32_TESTS, "bit32")
+def _smoke_shift_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _SHIFT_TESTS),
+        "shift",
+    )
 
 
 @pytest.fixture(scope="session")
-def _smoke_integration_results(_batched_pure_neural_runner_model):
-    return _run_group_batch(_batched_pure_neural_runner_model, _INTEGRATION_TESTS, "integration")
+def _smoke_bit32_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _BIT32_TESTS),
+        "bit32",
+    )
+
+
+@pytest.fixture(scope="session")
+def _smoke_integration_results(request, _batched_pure_neural_runner_model):
+    return _run_group_batch(
+        _batched_pure_neural_runner_model,
+        _selected_group_tests(request, _INTEGRATION_TESTS),
+        "integration",
+    )
 
 
 def _lookup_and_check(results, name):

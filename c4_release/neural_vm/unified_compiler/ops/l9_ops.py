@@ -1,11 +1,12 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
-def make_layer9_alu_op() -> Operation:
+def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 
     Originally two inline calls inside ``set_vm_weights`` (in the
@@ -29,6 +30,8 @@ def make_layer9_alu_op() -> Operation:
         from ...vm_step import _set_layer9_alu, _set_layer9_marker_suppress
         proxy = _as_setdim_proxy(dim_positions)
         n9 = _set_layer9_alu(block.ffn, S, proxy)
+        if alu_mode == "efficient":
+            _suppress_l9_legacy_addsub_writes(block.ffn, proxy)
         _set_layer9_marker_suppress(block.ffn, S, proxy, n9)
 
     return Operation(
@@ -38,9 +41,11 @@ def make_layer9_alu_op() -> Operation:
                "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                "ALU_LO", "AX_CARRY_LO"},
-        writes={"OUTPUT_HI", "CMP", "OUTPUT_LO"},
+        writes={"OUTPUT_HI", "CMP", "OUTPUT_LO", "CARRY"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=9,
         migrated=True,
         # Staleness invariants: the L9 ALU consumes ALU_HI as operand A hi
@@ -76,6 +81,32 @@ def make_layer9_alu_op() -> Operation:
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
+
+
+def _suppress_l9_legacy_addsub_writes(ffn, BD) -> None:
+    """Let the efficient add/sub block own byte carry/borrow state.
+
+    L8/L9 legacy nibble logic leaves ``CARRY[0]`` as an intra-byte
+    carry/borrow signal. The efficient AddSub5StageBlock that now runs before
+    L9 computes the full byte result and the byte-level ``CARRY[1]/CARRY[2]``
+    needed by the later carry-propagation post-ops. L9's legacy ADD/SUB
+    hi-nibble units see amplified raw one-hot operands at the AX marker in the
+    efficient path and can swamp the already-correct marker result. Zero just
+    those ADD/SUB legacy output units and the legacy carry rows; comparisons,
+    LEA/ADJ/ENT, and bitwise units remain intact.
+    """
+
+    # _set_layer9_alu unit layout:
+    #   0..511: ADD hi nibble
+    #   512..1023: LEA hi nibble
+    #   1024..1535: ADJ hi nibble
+    #   1536..2047: SUB hi nibble
+    add_units = slice(0, 512)
+    sub_units = slice(1536, 2048)
+    ffn.W_down.data[BD.OUTPUT_HI:BD.OUTPUT_HI + 16, add_units] = 0.0
+    ffn.W_down.data[BD.OUTPUT_HI:BD.OUTPUT_HI + 16, sub_units] = 0.0
+    ffn.W_down.data[BD.CARRY + 1, :] = 0.0
+    ffn.W_down.data[BD.CARRY + 2, :] = 0.0
 
 
 def make_layer9_lev_addr_relay_op() -> Operation:
@@ -126,6 +157,7 @@ def make_layer9_lev_addr_relay_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer9_lev_addr_relay_ir,
         layer_idx=9,
         migrated=True,
         declarative_authority="spec_generated",
@@ -183,6 +215,7 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer9_lev_bp_to_pc_relay_ir,
         layer_idx=9,
         migrated=True,
         declarative_authority="spec_generated",
@@ -190,6 +223,20 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
+
+
+def _layer9_lev_addr_relay_ir(dim_positions, HD) -> CompilerIR:
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_layer9_lev_addr_relay_head_spec(BD))
+    return ir
+
+
+def _layer9_lev_bp_to_pc_relay_ir(dim_positions, HD) -> CompilerIR:
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_layer9_lev_bp_to_pc_relay_head_spec(BD))
+    return ir
 
 
 def _layer9_lev_addr_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
@@ -277,14 +324,18 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
     the L9 LEV setup as well).
     """
     def bake(block, dim_positions, S):
+        del S
         if not enable_conversational_io:
             return
-        from ...vm_step import _set_format_string_fetch_head
         attn = block.attn
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
-        _set_format_string_fetch_head(attn, S, _as_setdim_proxy(dim_positions), HD)
+        Primitives.generate_attention_head(
+            attn,
+            _format_string_fetch_head_spec(_as_setdim_proxy(dim_positions)),
+            HD,
+        )
 
     return Operation(
         name="format_string_fetch_head",
@@ -294,11 +345,48 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
         writes={"OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         kind="block",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_conversational_io else None,
+        declarative_bake_fn=bake,
+        compiler_ir_factory=(
+            _format_string_fetch_head_ir
+            if enable_conversational_io else None
+        ),
+        declarative_authority="spec_generated",
         layer_idx=9,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
+    )
+
+
+def _format_string_fetch_head_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_format_string_fetch_head_spec(proxy))
+    return ir
+
+
+def _format_string_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    L = 15.0
+    q = [AP(0, BD.IO_IN_OUTPUT_MODE, L)]
+    k = []
+    v = []
+    o = []
+    for idx in range(16):
+        q.append(AP(1 + idx, BD.FORMAT_PTR_LO + idx, 1.0))
+        q.append(AP(17 + idx, BD.FORMAT_PTR_HI + idx, 1.0))
+        k.append(AP(1 + idx, BD.ADDR_KEY + idx, L))
+        k.append(AP(17 + idx, BD.ADDR_KEY + 16 + idx, L))
+        v.append(AP(1 + idx, BD.EMBED_LO + idx, 1.0))
+        v.append(AP(17 + idx, BD.EMBED_HI + idx, 1.0))
+        o.append(AO(BD.OUTPUT_BYTE_LO + idx, 1 + idx, 1.0))
+        o.append(AO(BD.OUTPUT_BYTE_HI + idx, 17 + idx, 1.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=0,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
     )
 
 

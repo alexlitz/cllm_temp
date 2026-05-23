@@ -38,6 +38,8 @@ def make_layer13_mem_addr_gather_op() -> Operation:
                 "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=13,
         migrated=True,
         claims=_claims,
@@ -58,9 +60,9 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
     In ``alu_mode='lookup'`` we bake the standard SHL/SHR lookup table via
     ``_set_layer13_shifts`` into the L13 PureFFN block.
 
-    Declarations-only note: lookup mode is intentionally unsupported until
-    ``_set_layer13_shifts`` is lowered into explicit FFN units. Efficient mode
-    is represented by the structural 4-stage composite ops instead.
+    Declarations-only note: lookup mode is exposed through the migrated owner
+    so strict builds do not fall back to legacy model bake. Efficient mode is
+    represented by the structural 4-stage composite ops instead.
 
     In ``alu_mode='efficient'`` SHL/SHR are now handled by the 4-stage
     composite installed via the dedicated
@@ -92,6 +94,8 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         layer_idx=13,
         migrated=True,
         # Staleness invariants: L13 shift FFN consumes ALU_LO/HI (value to
@@ -112,4 +116,3 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         },
         spec_section="BLOG_SPEC.md#shifts",
     )
-

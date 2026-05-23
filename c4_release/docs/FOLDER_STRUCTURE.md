@@ -14,7 +14,7 @@ neural_vm/
 ├── embedding.py          # E class: embedding slots, opcodes, dimensions
 ├── base_layers.py        # PureFFN, PureAttention base classes
 ├── pure_alu.py           # PureALU: main ALU (nn.Sequential, no Python control)
-├── pure_moe.py           # SoftMoEFFN: Mixture-of-Experts routing
+├── pure_moe.py           # StandardMoEFFN: Mixture-of-Experts routing
 │
 ├── arithmetic_ops.py     # ADD, SUB operations
 ├── bitwise_ops.py        # AND, OR, XOR operations
@@ -151,7 +151,7 @@ Exported model weights and ONNX files.
    - Example: `W_up[0, E.NIB_A] = SCALE` enables ADD operation
    - No gradient updates, no training loop
 
-3. **ONNX Compatible**: `SoftMoEFFN` uses static indices
+3. **ONNX Compatible**: `StandardMoEFFN` uses static indices
    - All experts run, opcode one-hot selects output
    - Exportable via `neural_vm.onnx_export.export_to_onnx()`
 

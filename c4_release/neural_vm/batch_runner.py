@@ -144,6 +144,7 @@ class BatchedSpeculativeRunner:
         self.validate_every = validate_every
         self.use_kv_cache = use_kv_cache
         self.use_sparse = use_sparse
+        self.kv_cache_max_tokens = int(kv_cache_max_tokens)
 
         # Create transformer model via the unified compiler. The compiler is
         # the single bake authority; d_model/n_layers come from the operation
@@ -166,12 +167,13 @@ class BatchedSpeculativeRunner:
             from neural_vm.kv_cache import LayerKVCache
             import torch
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            head_dim = d_model // n_heads
+            num_layers = len(self.model.blocks)
+            first_attn = self.model.blocks[0].attn
             self.kv_cache = LayerKVCache(
-                num_layers=n_layers,
+                num_layers=num_layers,
                 max_tokens=kv_cache_max_tokens,
-                num_heads=n_heads,
-                head_dim=head_dim,
+                num_heads=first_attn.num_heads,
+                head_dim=first_attn.head_dim,
                 device=device
             )
 
@@ -313,11 +315,17 @@ class BatchedSpeculativeRunner:
             else:
                 padded_contexts.append(ctx)
 
-        # Use the model's batch verification method
+        kv_cache = self._prepare_kv_cache_for_validation(max_len, len(padded_contexts))
+
+        # Use the model's batch verification method. KV cache is an
+        # optimization only: when the verifier sequence is longer than the
+        # cache can retain, validating against evicted K/V would be unable to
+        # produce authoritative logits for the dropped positions, so we run a
+        # fresh full verifier instead.
         accepted_batch = self.model.verify_speculative_batch(
             padded_contexts,
             draft_lens,
-            kv_cache=self.kv_cache
+            kv_cache=kv_cache
         )
 
         # Update contexts with accepted tokens
@@ -325,6 +333,40 @@ class BatchedSpeculativeRunner:
             self.contexts[i] = ctx + draft[:accepted]
 
         return accepted_batch
+
+    def _clear_kv_cache_storage(self) -> None:
+        """Drop cached tensors while preserving cumulative stats."""
+        if self.kv_cache is None:
+            return
+        for cache in self.kv_cache.caches:
+            cache.cached_k = None
+            cache.cached_v = None
+            cache.cached_pos_ids = None
+            cache.per_head_keep_mask = None
+            cache.cache_size = 0
+            cache.next_pos_id = 0
+            cache.stats.current_size = 0
+
+    def _record_eviction_pressure(self, seq_len: int, batch_size: int) -> None:
+        """Record cache pressure when correctness requires fresh validation."""
+        if self.kv_cache is None:
+            return
+        evicted = max(0, seq_len - self.kv_cache_max_tokens) * batch_size
+        cached = seq_len * batch_size
+        retained = min(seq_len, self.kv_cache_max_tokens) * batch_size
+        for cache in self.kv_cache.caches:
+            cache.stats.tokens_cached += cached
+            cache.stats.tokens_evicted += evicted
+            cache.stats.current_size = retained
+
+    def _prepare_kv_cache_for_validation(self, seq_len: int, batch_size: int):
+        if self.kv_cache is None:
+            return None
+        self._clear_kv_cache_storage()
+        if seq_len > self.kv_cache_max_tokens:
+            self._record_eviction_pressure(seq_len, batch_size)
+            return None
+        return self.kv_cache
 
     def _build_context(
         self,

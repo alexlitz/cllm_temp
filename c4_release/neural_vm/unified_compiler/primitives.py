@@ -23,7 +23,7 @@ Extracted batch B (vm_step direct ports — byte-identical to imperative code):
 
 import torch
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Mapping, Optional, Tuple, Union
 from ..vm_step import _SetDim as BD
 
 
@@ -462,6 +462,54 @@ class Primitives:
                 ffn.W_down.data[dim, unit] = weight
 
         return unit + 1
+
+    @staticmethod
+    def lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions: Mapping[str, int],
+        *,
+        start_unit: int = 0,
+        S: float = 100.0,
+    ) -> int:
+        """Lower named ``FFNRule`` data through ``CompilerIR``.
+
+        This keeps migrated bakes data-first while preserving the exact
+        low-level SwiGLU matrix writes used by the legacy primitives.
+        """
+
+        from .ir import CompilerIR
+
+        ir = CompilerIR()
+        ir.layer(0).ffn.rules.extend(rules)
+        return ir.lower_ffn(
+            ffn,
+            dim_positions,
+            start_unit=start_unit,
+            S=S,
+        )
+
+    @staticmethod
+    def ffn_rule_dim_names(rules) -> Tuple[str, ...]:
+        """Return base dimension names referenced by ``FFNRule`` data."""
+
+        names = set()
+        for rule in rules:
+            for term in rule.conditions:
+                names.add(term.dim.name)
+            if rule.gate is not None:
+                names.add(rule.gate.name)
+            for term in rule.gate_terms:
+                names.add(term.dim.name)
+            for write in rule.writes:
+                names.add(write.dim.name)
+        return tuple(sorted(names))
+
+    @staticmethod
+    def dim_positions_from_bd(bd, names: Iterable[str]):
+        """Build the named dim map expected by ``CompilerIR.lower_ffn``."""
+
+        return {name: getattr(bd, name) for name in names}
 
     @staticmethod
     def cancel_pair(

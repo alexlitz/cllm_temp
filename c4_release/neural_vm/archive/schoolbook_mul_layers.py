@@ -46,7 +46,7 @@ class ZeroInvalidPositionsFFN(PureFFN):
 
 
 class ClearSlotForMulFFN(PureFFN):
-    """Clear a specific slot unconditionally (opcode gating done by SoftMoE wrapper)."""
+    """Clear a specific slot unconditionally (opcode gating done by StandardMoE wrapper)."""
     def __init__(self, slot: int):
         self.slot = slot
         super().__init__(E.DIM, hidden_dim=2)
@@ -54,7 +54,7 @@ class ClearSlotForMulFFN(PureFFN):
     def _bake_weights(self):
         S = E.SCALE
         with torch.no_grad():
-            # Unconditional clear - SoftMoE handles opcode gating
+            # Unconditional clear - StandardMoE handles opcode gating
             self.b_up[0] = S
             self.W_gate[0, self.slot] = -1.0
             self.W_down[self.slot, 0] = 1.0 / S
@@ -89,7 +89,7 @@ class ShiftBAttention(PureAttention):
     """
     Shift b values: position k reads b[k-offset] to destination slot.
     Invalid positions (k < offset) read from self (will be zeroed later).
-    Opcode gating done by SoftMoE wrapper.
+    Opcode gating done by StandardMoE wrapper.
     """
     def __init__(self, offset: int, dest_slot: int):
         self.offset = offset
