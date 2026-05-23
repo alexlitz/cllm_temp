@@ -983,7 +983,12 @@ class AddSubBytePropagationPostOp(PureFFN):
                             self.W_up.data[unit, alu_base + a] = S * 2
                             self.W_up.data[unit, out_base + b] = S
                             for other in range(16):
-                                if other != b:
+                                # Full-model high-byte rows retain a small
+                                # stale zero residual from earlier passthrough
+                                # bakes. Treat that as neutral; other
+                                # nonmatching nibbles still block fanout from
+                                # amplified ALU residuals alone.
+                                if other != b and other != 0:
                                     self.W_up.data[unit, out_base + other] = -S * 15
                             self.W_up.data[unit, BD.IS_BYTE] = S
                             self.W_up.data[unit, BD.H1 + 1] = S
@@ -1007,6 +1012,8 @@ class AddSubBytePropagationPostOp(PureFFN):
                             self.b_up.data[unit] = -S * 16.25
                             self.W_gate.data[unit, BD.CONST] = 1.0
                             self.W_down.data[out_base + b, unit] = -(4.0 / 3.0) / S
+                            if b != 0 and result != 0:
+                                self.W_down.data[out_base + 0, unit] = -(4.0 / 3.0) / S
                             self.W_down.data[out_base + result, unit] = 2.0 / S
                             unit += 1
 

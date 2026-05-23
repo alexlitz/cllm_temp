@@ -300,6 +300,7 @@ def _fake_kv_runner(*, verify):
         "verification_forwards": 0,
         "cache_rebuilds": 0,
         "reused_token_slots": 0,
+        "spec_fresh_bypass": 0,
     }
     runner._get_or_build_kv_cache = lambda: object()
     return runner
@@ -327,6 +328,28 @@ def test_batched_kv_verify_off_does_not_run_fresh_verification():
     assert runner._kv_stats["verifications"] == 0
     assert runner._kv_stats["verification_forwards"] == 0
     assert runner._kv_stats["reused_token_slots"] == 4
+
+
+def test_batched_kv_can_be_bypassed_for_speculative_verifier():
+    runner = _fake_kv_runner(verify=False)
+
+    preds, pred_start, real_lens = runner._forward_argmax_batch(
+        [[10, 11, 12, 13], [20, 21, 22, 23]],
+        [0, 1],
+        first_logit_pos=2,
+        allow_kv=False,
+    )
+
+    assert pred_start == 0
+    assert real_lens == [4, 4]
+    assert preds == [[3, 3, 3, 3], [3, 3, 3, 3]]
+    assert len(runner.model.calls) == 1
+    assert runner.model.calls[0]["kv_cache"] is None
+    assert runner.model.calls[0]["cached_prefix_len"] == 0
+    assert runner._kv_stats["calls"] == 0
+    assert runner._kv_stats["kv_forwards"] == 0
+    assert runner._kv_stats["fresh_forwards"] == 1
+    assert runner._kv_stats["spec_fresh_bypass"] == 1
 
 
 def test_batched_kv_verify_on_runs_one_fresh_verification():

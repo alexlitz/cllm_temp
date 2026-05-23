@@ -1485,6 +1485,7 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
     # Only boost OUTPUT_LO[0] and OUTPUT_HI[0]
     for k in [0, 16]:  # 0 = OUTPUT_LO[0], 16 = OUTPUT_HI[0]
         output_dim = BD.OUTPUT_LO if k == 0 else BD.OUTPUT_HI
+        band_dim = output_dim
 
         # Fire at STACK0 byte area (d=5-9 from BP marker, excludes marker itself)
         # Use H4[BP] (d≤9.5) AND NOT H1[BP] (d>4.5) to select d ∈ (4.5, 9.5]
@@ -1507,10 +1508,20 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
         # path. The old zero-default cleanup is only safe for non-PSH STACK0
         # bytes; otherwise multi-byte addresses like 0x200 lose byte 1.
         ffn.W_up[unit, BD.PSH_AT_SP] = -suppress
+        # Pop-group arithmetic/comparison ops also need the real STACK0 bytes
+        # available downstream. L6 relays that group as CMP[3] onto STACK0
+        # byte positions; do not force those bytes back to zero.
+        ffn.W_up[unit, BD.CMP + 3] = -suppress
 
         # Suppress at BYTE_INDEX_3 positions - byte 3's OUTPUT should predict
         # the NEXT marker (MEM), not force byte value 0.
         ffn.W_up[unit, BD.BYTE_INDEX_3] = -suppress
+
+        # Preserve an already-computed nonzero nibble. This cleanup is a
+        # zero-default repair; it should not turn a supported 0x02/0x03 stack
+        # byte back into 0x00 after L10 has produced the arithmetic result.
+        for nonzero in range(1, 16):
+            ffn.W_up[unit, band_dim + nonzero] = -S * 2
 
         # Bias for activation
         ffn.b_up[unit] = -S * 0.5

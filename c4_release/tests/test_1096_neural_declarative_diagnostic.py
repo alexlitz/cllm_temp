@@ -10,11 +10,14 @@ This is intentionally opt-in because it builds/runs the neural VM.  Example:
 The diagnostic uses declarative symbolic execution as the oracle for both the
 expected exit value and the halt horizon.  Rows are printed only for programs
 where neural execution diverges from declarative execution.
+
+Set C4_1096_TRACE_FAILURES=1 to rerun failing rows and print the first emitted
+token mismatch plus an output-head/residual diagnosis for that symbolic token.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import sys
 from typing import Iterable, List, Optional, Sequence, TextIO
@@ -38,11 +41,159 @@ def _parse_spec_k(raw: str) -> int:
         return -1
 
 
+def _parse_trace_limit(raw: str) -> int:
+    raw = (raw or "").strip().lower()
+    if raw in {"", "none", "all"}:
+        return 1_000_000
+    return max(0, int(raw))
+
+
 def _shorten(text: str, width: int = 72) -> str:
     text = " ".join(text.split())
     if len(text) <= width:
         return text
     return text[: width - 3] + "..."
+
+
+_STEP_SLOT_NAMES = (
+    "REG_PC",
+    "PC_byte0",
+    "PC_byte1",
+    "PC_byte2",
+    "PC_byte3",
+    "REG_AX",
+    "AX_byte0",
+    "AX_byte1",
+    "AX_byte2",
+    "AX_byte3",
+    "REG_SP",
+    "SP_byte0",
+    "SP_byte1",
+    "SP_byte2",
+    "SP_byte3",
+    "REG_BP",
+    "BP_byte0",
+    "BP_byte1",
+    "BP_byte2",
+    "BP_byte3",
+    "STACK0",
+    "STACK0_byte0",
+    "STACK0_byte1",
+    "STACK0_byte2",
+    "STACK0_byte3",
+    "MEM",
+    "MEM_addr0",
+    "MEM_addr1",
+    "MEM_addr2",
+    "MEM_addr3",
+    "MEM_value0",
+    "MEM_value1",
+    "MEM_value2",
+    "MEM_value3",
+    "STEP_END",
+)
+
+
+def _token_name(token: Optional[int]) -> str:
+    if token is None:
+        return "<missing>"
+    if 0 <= token < 256:
+        return f"0x{token:02x}"
+    try:
+        from neural_vm.vm_step import Token
+    except Exception:
+        return str(token)
+    for name, value in vars(Token).items():
+        if name.isupper() and value == token:
+            return name
+    return str(token)
+
+
+@dataclass(frozen=True)
+class SymbolicExpectedExecution:
+    """Teacher-forced token stream implied by declarative symbolic execution."""
+
+    context: List[int]
+    prefix_len: int
+    steps: int
+    exit_code: Optional[int]
+    halted: bool
+
+
+@dataclass(frozen=True)
+class TokenDivergence:
+    """First emitted-token mismatch between neural and symbolic streams."""
+
+    token_index: int
+    generated_index: int
+    step: int
+    offset: int
+    slot: str
+    expected_token: Optional[int]
+    neural_token: Optional[int]
+
+    def format(self) -> str:
+        return (
+            f"first_token_divergence=step{self.step}:{self.slot} "
+            f"abs={self.token_index} gen={self.generated_index} "
+            f"expected={_token_name(self.expected_token)} "
+            f"neural={_token_name(self.neural_token)}"
+        )
+
+
+@dataclass(frozen=True)
+class ResidualSupportSnapshot:
+    """How strongly one residual snapshot supports the expected token."""
+
+    label: str
+    block_index: Optional[int]
+    original_layer_index: Optional[int]
+    expected_token: int
+    neural_token: Optional[int]
+    argmax_token: int
+    expected_logit: float
+    argmax_logit: float
+    neural_logit: Optional[float]
+    expected_margin: float
+    residual_note: str = ""
+
+    @property
+    def supports_expected(self) -> bool:
+        return self.argmax_token == self.expected_token
+
+    def format(self) -> str:
+        block = "-" if self.block_index is None else str(self.block_index)
+        layer = (
+            "-"
+            if self.original_layer_index is None
+            else str(self.original_layer_index)
+        )
+        neural = (
+            ""
+            if self.neural_token is None or self.neural_logit is None
+            else f" neural_logit={self.neural_logit:+.2f}"
+        )
+        note = f" {self.residual_note}" if self.residual_note else ""
+        return (
+            f"block={block} layer={layer} label={self.label!r} "
+            f"expected={_token_name(self.expected_token)} "
+            f"argmax={_token_name(self.argmax_token)} "
+            f"expected_logit={self.expected_logit:+.2f} "
+            f"argmax_logit={self.argmax_logit:+.2f} "
+            f"margin={self.expected_margin:+.2f}"
+            f"{neural}{note}"
+        )
+
+
+@dataclass(frozen=True)
+class ResidualDivergenceReport:
+    """Layer-by-layer residual/head support diagnosis for one token mismatch."""
+
+    kind: str
+    snapshot: ResidualSupportSnapshot
+
+    def format(self) -> str:
+        return f"residual_diagnosis={self.kind} {self.snapshot.format()}"
 
 
 @dataclass(frozen=True)
@@ -57,6 +208,9 @@ class NeuralDeclarativeDiagnosticRow:
     neural_exit: Optional[int]
     neural_output: str = ""
     error: Optional[str] = None
+    first_token_divergence: Optional[TokenDivergence] = None
+    residual_diagnosis: Optional[ResidualDivergenceReport] = None
+    trace_error: Optional[str] = None
 
     @property
     def status(self) -> str:
@@ -68,6 +222,10 @@ class NeuralDeclarativeDiagnosticRow:
             return "neural-divergence"
         return "ok"
 
+    @property
+    def suite_declarative_match(self) -> bool:
+        return self.declarative_exit == (self.suite_expected & 0xFFFFFFFF)
+
     def format(self) -> str:
         output = (
             f" output={self.neural_output!r}"
@@ -75,16 +233,458 @@ class NeuralDeclarativeDiagnosticRow:
             else ""
         )
         error = f" error={self.error}" if self.error else ""
+        trace_error = (
+            f" trace_error={self.trace_error}"
+            if self.trace_error is not None
+            else ""
+        )
+        token_divergence = (
+            f" {self.first_token_divergence.format()}"
+            if self.first_token_divergence is not None
+            else ""
+        )
+        residual = (
+            f" {self.residual_diagnosis.format()}"
+            if self.residual_diagnosis is not None
+            else ""
+        )
         return (
             f"[1096-diag] id={self.test_idx:04d} "
             f"status={self.status} "
+            f"suite_decl={'match' if self.suite_declarative_match else 'mismatch'} "
             f"desc={_shorten(self.description)!r} "
             f"expected={self.suite_expected & 0xFFFFFFFF} "
             f"decl={self.declarative_exit} "
             f"decl_steps={self.declarative_steps} "
             f"neural={self.neural_exit}"
-            f"{output}{error}"
+            f"{output}{error}{trace_error}{token_divergence}{residual}"
         )
+
+
+def _build_context_prefix(bytecode: Sequence[int], data: Sequence[int] | bytes) -> List[int]:
+    from neural_vm.constants import IMMEDIATE_SIZE, PADDING_SIZE
+    from neural_vm.vm_step import Token
+
+    tokens = [Token.CODE_START]
+    for instr in bytecode:
+        op = instr & 0xFF
+        imm = instr >> 8
+        tokens.append(op)
+        for i in range(IMMEDIATE_SIZE):
+            tokens.append((imm >> (i * 8)) & 0xFF)
+        for _ in range(PADDING_SIZE):
+            tokens.append(0)
+    tokens.extend([Token.CODE_END, Token.DATA_START])
+    tokens.extend(int(b) & 0xFF for b in data)
+    tokens.append(Token.DATA_END)
+    return tokens
+
+
+def _append_symbolic_step_tokens(context: List[int], state, step_trace) -> None:
+    from neural_vm.vm_step import Token
+
+    def append_u32(value: int) -> None:
+        value &= 0xFFFFFFFF
+        for i in range(4):
+            context.append((value >> (i * 8)) & 0xFF)
+
+    context.append(Token.REG_PC)
+    append_u32(state.pc)
+    context.append(Token.REG_AX)
+    append_u32(state.ax)
+    context.append(Token.REG_SP)
+    append_u32(state.sp)
+    context.append(Token.REG_BP)
+    append_u32(state.bp)
+    context.append(Token.STACK0)
+    append_u32(state.mem_read(state.sp))
+    context.append(Token.MEM)
+    append_u32(step_trace.mem_addr)
+    append_u32(step_trace.mem_value)
+    context.append(Token.STEP_END if not state.halted else Token.HALT)
+
+
+def _build_symbolic_expected_execution(
+    bytecode: Sequence[int],
+    data: Sequence[int] | bytes,
+) -> SymbolicExpectedExecution:
+    from neural_vm.unified_compiler.symbolic_program import (
+        SymbolicDeclarativeProgramRunner,
+    )
+
+    symbolic = SymbolicDeclarativeProgramRunner()
+    state = symbolic.init_state(bytecode, data)
+    context = _build_context_prefix(bytecode, data)
+    prefix_len = len(context)
+    while symbolic.step(state):
+        _append_symbolic_step_tokens(context, state, state.trace[-1])
+        if state.halted:
+            break
+    return SymbolicExpectedExecution(
+        context=context,
+        prefix_len=prefix_len,
+        steps=state.steps,
+        exit_code=state.ax if state.halted else None,
+        halted=state.halted,
+    )
+
+
+def _slot_name(offset: int) -> str:
+    if 0 <= offset < len(_STEP_SLOT_NAMES):
+        return _STEP_SLOT_NAMES[offset]
+    return f"offset{offset}"
+
+
+def _first_token_divergence(
+    expected: SymbolicExpectedExecution,
+    neural_context: Sequence[int],
+) -> Optional[TokenDivergence]:
+    from neural_vm.vm_step import Token
+
+    first_generated = expected.prefix_len
+    limit = min(len(expected.context), len(neural_context))
+    token_index = None
+    for i in range(first_generated, limit):
+        if expected.context[i] != neural_context[i]:
+            token_index = i
+            break
+    if token_index is None:
+        if len(neural_context) < len(expected.context):
+            token_index = len(neural_context)
+        elif len(neural_context) > len(expected.context):
+            token_index = len(expected.context)
+        else:
+            return None
+
+    generated_index = token_index - first_generated
+    step = generated_index // Token.STEP_TOKENS
+    offset = generated_index % Token.STEP_TOKENS
+    expected_token = (
+        expected.context[token_index]
+        if token_index < len(expected.context)
+        else None
+    )
+    neural_token = (
+        int(neural_context[token_index])
+        if token_index < len(neural_context)
+        else None
+    )
+    return TokenDivergence(
+        token_index=token_index,
+        generated_index=generated_index,
+        step=step,
+        offset=offset,
+        slot=_slot_name(offset),
+        expected_token=expected_token,
+        neural_token=neural_token,
+    )
+
+
+def _capture_single_neural_context(
+    runner,
+    bytecode: Sequence[int],
+    data: Sequence[int] | bytes,
+    *,
+    expected_steps: Optional[int],
+    spec_k: int,
+    max_context_window: int,
+) -> List[int]:
+    from neural_vm import batched_pure_neural as bpn
+
+    runner._reset_kv_cache()
+    runner._reset_spec_stats()
+    adaptive = spec_k < 0
+    state = runner._build_element(
+        list(bytecode),
+        data,
+        [],
+        "",
+        spec_k=spec_k if not adaptive else 0,
+        adaptive_start_k=bpn._ADAPTIVE_START_K if adaptive else 0,
+        expected_steps=expected_steps,
+    )
+    if adaptive:
+        runner._run_speculative(
+            [state],
+            max_steps=None,
+            max_context_window=max_context_window,
+            spec_k=0,
+            adaptive=True,
+        )
+    elif spec_k > 0:
+        runner._run_speculative(
+            [state],
+            max_steps=None,
+            max_context_window=max_context_window,
+            spec_k=spec_k,
+            adaptive=False,
+        )
+    else:
+        runner._run_unspeculative(
+            [state],
+            max_steps=None,
+            max_context_window=max_context_window,
+        )
+    return list(state.context)
+
+
+def _dim(model, name: str) -> int:
+    from neural_vm.vm_step import _SetDim
+
+    positions = getattr(model, "dim_positions", None)
+    if isinstance(positions, dict) and name in positions:
+        return int(positions[name])
+    return int(getattr(_SetDim, name))
+
+
+_NEXT_FLAG_BY_TOKEN_NAME = {
+    "REG_PC": "NEXT_PC",
+    "REG_AX": "NEXT_AX",
+    "REG_SP": "NEXT_SP",
+    "REG_BP": "NEXT_BP",
+    "STACK0": "NEXT_STACK0",
+    "MEM": "NEXT_MEM",
+    "STEP_END": "NEXT_SE",
+    "HALT": "NEXT_HALT",
+    "TOOL_CALL": "NEXT_TOOL_CALL",
+    "THINKING_START": "NEXT_THINKING_START",
+    "THINKING_END": "NEXT_THINKING_END",
+}
+
+
+def _next_flag_for_token(token: int) -> Optional[str]:
+    from neural_vm.vm_step import Token
+
+    for token_name, flag_name in _NEXT_FLAG_BY_TOKEN_NAME.items():
+        if getattr(Token, token_name, None) == token:
+            return flag_name
+    return None
+
+
+def _residual_note_for_token(vec, model, token: int) -> str:
+    import torch
+
+    if 0 <= token < 256:
+        out_lo = _dim(model, "OUTPUT_LO")
+        out_hi = _dim(model, "OUTPUT_HI")
+        lo = token & 0xF
+        hi = (token >> 4) & 0xF
+        lo_band = vec[out_lo : out_lo + 16]
+        hi_band = vec[out_hi : out_hi + 16]
+        lo_arg = int(torch.argmax(lo_band).item())
+        hi_arg = int(torch.argmax(hi_band).item())
+        return (
+            f"OUT_LO[{lo}]={float(lo_band[lo].item()):+.2f} "
+            f"arg={lo_arg}/{float(lo_band[lo_arg].item()):+.2f} "
+            f"OUT_HI[{hi}]={float(hi_band[hi].item()):+.2f} "
+            f"arg={hi_arg}/{float(hi_band[hi_arg].item()):+.2f}"
+        )
+
+    flag_name = _next_flag_for_token(token)
+    if flag_name is None:
+        return ""
+    try:
+        flag_value = float(vec[_dim(model, flag_name)].item())
+    except (AttributeError, KeyError):
+        return f"{flag_name}=<missing-dim>"
+    return f"{flag_name}={flag_value:+.2f}"
+
+
+def _head_logits(model, x_at_pos):
+    from neural_vm.vm_step import sparse_linear
+
+    weight = model.head.weight
+    if getattr(weight, "is_sparse", False):
+        return sparse_linear(
+            x_at_pos.unsqueeze(0),
+            model.head.weight,
+            model.head.bias,
+        ).squeeze(0)
+    return model.head(x_at_pos.unsqueeze(0)).squeeze(0)
+
+
+def _residual_support_snapshot(
+    *,
+    model,
+    x,
+    pos: int,
+    label: str,
+    block_index: Optional[int],
+    expected_token: int,
+    neural_token: Optional[int],
+) -> ResidualSupportSnapshot:
+    import torch
+
+    vec = x[0, pos]
+    logits = _head_logits(model, vec)
+    argmax_token = int(torch.argmax(logits).item())
+    expected_logit = float(logits[expected_token].item())
+    argmax_logit = float(logits[argmax_token].item())
+    masked = logits.clone()
+    masked[expected_token] = float("-inf")
+    best_other = float(masked.max().item())
+    neural_logit = (
+        float(logits[neural_token].item())
+        if neural_token is not None and 0 <= neural_token < logits.numel()
+        else None
+    )
+    return ResidualSupportSnapshot(
+        label=label,
+        block_index=block_index,
+        original_layer_index=None,
+        expected_token=expected_token,
+        neural_token=neural_token,
+        argmax_token=argmax_token,
+        expected_logit=expected_logit,
+        argmax_logit=argmax_logit,
+        neural_logit=neural_logit,
+        expected_margin=expected_logit - best_other,
+        residual_note=_residual_note_for_token(vec, model, expected_token),
+    )
+
+
+def _block_label(block, block_index: int) -> tuple[str, Optional[int]]:
+    attn = getattr(block, "attn", None)
+    original_layer = getattr(attn, "layer_idx", None)
+    ffn = getattr(block, "ffn", None)
+    w_up = getattr(ffn, "W_up", None)
+    width = None if w_up is None else int(w_up.shape[0])
+    width_part = "" if width is None else f" width={width}"
+    layer_part = "-" if original_layer is None else str(original_layer)
+    return f"block{block_index} layer={layer_part}{width_part}", original_layer
+
+
+def _window_expected_prefix_for_prediction(
+    expected: SymbolicExpectedExecution,
+    *,
+    token_index: int,
+    max_context_window: int,
+) -> tuple[List[int], int]:
+    prefix = expected.context[:token_index]
+    if len(prefix) <= expected.prefix_len + max_context_window:
+        return prefix, len(prefix) - 1
+    windowed = prefix[: expected.prefix_len] + prefix[-max_context_window:]
+    return windowed, len(windowed) - 1
+
+
+def _trace_residual_support_for_divergence(
+    runner,
+    expected: SymbolicExpectedExecution,
+    divergence: TokenDivergence,
+    *,
+    max_context_window: int,
+) -> Optional[ResidualDivergenceReport]:
+    if divergence.expected_token is None or divergence.token_index <= 0:
+        return None
+
+    import torch
+
+    model = runner.model
+    expected_token = int(divergence.expected_token)
+    neural_token = divergence.neural_token
+    prefix, logit_pos = _window_expected_prefix_for_prediction(
+        expected,
+        token_index=divergence.token_index,
+        max_context_window=max_context_window,
+    )
+    if not prefix:
+        return None
+
+    device = next(model.parameters()).device
+    token_ids = torch.tensor([prefix], dtype=torch.long, device=device)
+    model.embed.set_mem_history_end(0)
+
+    snapshots: List[ResidualSupportSnapshot] = []
+    with torch.no_grad():
+        x = model.embed(token_ids)
+        snapshots.append(
+            _residual_support_snapshot(
+                model=model,
+                x=x,
+                pos=logit_pos,
+                label="embed",
+                block_index=None,
+                expected_token=expected_token,
+                neural_token=neural_token,
+            )
+        )
+        for block_index, block in enumerate(model.blocks):
+            x = block(x)
+            label, original_layer = _block_label(block, block_index)
+            snapshot = _residual_support_snapshot(
+                model=model,
+                x=x,
+                pos=logit_pos,
+                label=label,
+                block_index=block_index,
+                expected_token=expected_token,
+                neural_token=neural_token,
+            )
+            snapshots.append(
+                replace(snapshot, original_layer_index=original_layer)
+            )
+
+    saw_support = False
+    for snapshot in snapshots:
+        if snapshot.supports_expected:
+            saw_support = True
+            continue
+        if saw_support:
+            return ResidualDivergenceReport(
+                kind="first-loss-after-symbolic-support",
+                snapshot=snapshot,
+            )
+
+    final = snapshots[-1]
+    if final.supports_expected:
+        return ResidualDivergenceReport(
+            kind="no-residual-divergence-on-teacher-forced-prefix",
+            snapshot=final,
+        )
+    return ResidualDivergenceReport(
+        kind="expected-token-never-wins",
+        snapshot=final,
+    )
+
+
+def _attach_failure_trace(
+    row: NeuralDeclarativeDiagnosticRow,
+    *,
+    runner,
+    bytecode: Sequence[int],
+    data: Sequence[int] | bytes,
+    expected_steps: Optional[int],
+    spec_k: int,
+    max_context_window: int,
+) -> NeuralDeclarativeDiagnosticRow:
+    try:
+        expected = _build_symbolic_expected_execution(bytecode, data)
+        neural_context = _capture_single_neural_context(
+            runner,
+            bytecode,
+            data,
+            expected_steps=expected_steps,
+            spec_k=spec_k,
+            max_context_window=max_context_window,
+        )
+        first = _first_token_divergence(expected, neural_context)
+        residual = (
+            _trace_residual_support_for_divergence(
+                runner,
+                expected,
+                first,
+                max_context_window=max_context_window,
+            )
+            if first is not None
+            else None
+        )
+        return replace(
+            row,
+            first_token_divergence=first,
+            residual_diagnosis=residual,
+        )
+    except Exception as exc:
+        return replace(row, trace_error=f"{exc!r}")
 
 
 def _selected_1096_tests(
@@ -112,6 +712,8 @@ def run_1096_neural_declarative_diagnostic(
     spec_k: int = 0,
     max_context_window: int = 512,
     model_max_seq_len: int = 4096,
+    trace_failures: bool = False,
+    trace_failure_limit: int = 8,
 ) -> List[NeuralDeclarativeDiagnosticRow]:
     """Run a focused 1096 slice and return declarative/neural comparison rows."""
 
@@ -124,6 +726,7 @@ def run_1096_neural_declarative_diagnostic(
     symbolic_runner = SymbolicDeclarativeProgramRunner()
     neural_runner = BatchedPureNeuralRunner(max_seq_len=model_max_seq_len)
     rows: List[NeuralDeclarativeDiagnosticRow] = []
+    traced_failures = 0
 
     for start in range(0, len(selected), chunk_size):
         chunk = selected[start : start + chunk_size]
@@ -178,6 +781,8 @@ def run_1096_neural_declarative_diagnostic(
                     description,
                     decl_exit,
                     decl_steps,
+                    bytecode,
+                    data,
                 )
             )
             bytecodes.append(bytecode)
@@ -204,6 +809,8 @@ def run_1096_neural_declarative_diagnostic(
                 description,
                 decl_exit,
                 decl_steps,
+                _bytecode,
+                _data,
             ) in compiled_slots:
                 rows.append(
                     NeuralDeclarativeDiagnosticRow(
@@ -225,19 +832,35 @@ def run_1096_neural_declarative_diagnostic(
             description,
             decl_exit,
             decl_steps,
+            bytecode,
+            data,
         ), (neural_output, neural_exit) in zip(compiled_slots, neural_results):
             del slot
-            rows.append(
-                NeuralDeclarativeDiagnosticRow(
-                    test_idx=idx,
-                    description=description,
-                    suite_expected=expected,
-                    declarative_exit=decl_exit,
-                    declarative_steps=decl_steps,
-                    neural_exit=neural_exit,
-                    neural_output=neural_output,
-                )
+            row = NeuralDeclarativeDiagnosticRow(
+                test_idx=idx,
+                description=description,
+                suite_expected=expected,
+                declarative_exit=decl_exit,
+                declarative_steps=decl_steps,
+                neural_exit=neural_exit,
+                neural_output=neural_output,
             )
+            if (
+                trace_failures
+                and traced_failures < trace_failure_limit
+                and row.status == "neural-divergence"
+            ):
+                row = _attach_failure_trace(
+                    row,
+                    runner=neural_runner,
+                    bytecode=bytecode,
+                    data=data,
+                    expected_steps=decl_steps,
+                    spec_k=spec_k,
+                    max_context_window=max_context_window,
+                )
+                traced_failures += 1
+            rows.append(row)
 
     return rows
 
@@ -272,9 +895,90 @@ def test_diagnostic_row_format_is_concise():
 
     assert "id=0007" in text
     assert "status=neural-divergence" in text
+    assert "suite_decl=match" in text
     assert "decl=768" in text
     assert "decl_steps=5" in text
     assert "neural=512" in text
+
+
+def test_first_token_divergence_reports_symbolic_step_slot():
+    from neural_vm.vm_step import Token
+
+    expected = SymbolicExpectedExecution(
+        context=[
+            Token.CODE_START,
+            Token.CODE_END,
+            Token.REG_PC,
+            0x02,
+            0x00,
+            0x00,
+        ],
+        prefix_len=2,
+        steps=1,
+        exit_code=0,
+        halted=True,
+    )
+    neural = [
+        Token.CODE_START,
+        Token.CODE_END,
+        Token.REG_PC,
+        0x0A,
+        0x00,
+        0x00,
+    ]
+
+    divergence = _first_token_divergence(expected, neural)
+
+    assert divergence is not None
+    assert divergence.step == 0
+    assert divergence.offset == 1
+    assert divergence.slot == "PC_byte0"
+    assert divergence.expected_token == 0x02
+    assert divergence.neural_token == 0x0A
+
+
+def test_row_format_includes_token_and_residual_diagnostics():
+    token_divergence = TokenDivergence(
+        token_index=42,
+        generated_index=7,
+        step=0,
+        offset=7,
+        slot="AX_byte1",
+        expected_token=0x05,
+        neural_token=0x03,
+    )
+    residual = ResidualDivergenceReport(
+        kind="first-loss-after-symbolic-support",
+        snapshot=ResidualSupportSnapshot(
+            label="block24 layer=15 width=42",
+            block_index=24,
+            original_layer_index=15,
+            expected_token=0x05,
+            neural_token=0x03,
+            argmax_token=0x03,
+            expected_logit=4.0,
+            argmax_logit=6.0,
+            neural_logit=6.0,
+            expected_margin=-2.0,
+            residual_note="OUT_LO[5]=+0.91 arg=3/+1.09",
+        ),
+    )
+    row = NeuralDeclarativeDiagnosticRow(
+        test_idx=5,
+        description="ADD residual overwrite case",
+        suite_expected=1450,
+        declarative_exit=1450,
+        declarative_steps=5,
+        neural_exit=938,
+        first_token_divergence=token_divergence,
+        residual_diagnosis=residual,
+    )
+
+    text = row.format()
+
+    assert "first_token_divergence=step0:AX_byte1" in text
+    assert "residual_diagnosis=first-loss-after-symbolic-support" in text
+    assert "block=24 layer=15" in text
 
 
 def test_1096_neural_declarative_diagnostic_slice():
@@ -288,6 +992,12 @@ def test_1096_neural_declarative_diagnostic_slice():
     spec_k = _parse_spec_k(os.environ.get("C4_SPEC_K", "0"))
     max_context_window = int(os.environ.get("C4_BATCH_CONTEXT_WINDOW", "512"))
     model_max_seq_len = int(os.environ.get("C4_BATCH_MODEL_MAX_SEQ_LEN", "4096"))
+    trace_failures = os.environ.get(
+        "C4_1096_TRACE_FAILURES", "1"
+    ).strip().lower() not in {"", "0", "false", "no", "off"}
+    trace_failure_limit = _parse_trace_limit(
+        os.environ.get("C4_1096_TRACE_LIMIT", "8")
+    )
 
     rows = run_1096_neural_declarative_diagnostic(
         offset=offset,
@@ -296,6 +1006,8 @@ def test_1096_neural_declarative_diagnostic_slice():
         spec_k=spec_k,
         max_context_window=max_context_window,
         model_max_seq_len=model_max_seq_len,
+        trace_failures=trace_failures,
+        trace_failure_limit=trace_failure_limit,
     )
     divergences = print_divergence_rows(rows)
 

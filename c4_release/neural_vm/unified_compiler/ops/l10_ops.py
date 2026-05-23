@@ -391,8 +391,8 @@ def _layer10_nonbitwise_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttenti
     for k_idx in range(16):
         v.append(AP(1 + k_idx, BD.CLEAN_EMBED_LO + k_idx, 1.0))
         v.append(AP(17 + k_idx, BD.CLEAN_EMBED_HI + k_idx, 1.0))
-        o.append(AO(BD.ALU_LO + k_idx, 1 + k_idx, 1.0))
-        o.append(AO(BD.ALU_HI + k_idx, 17 + k_idx, 1.0))
+        o.append(AO(BD.ALU_LO + k_idx, 1 + k_idx, 6.0))
+        o.append(AO(BD.ALU_HI + k_idx, 17 + k_idx, 6.0))
     return DeclarativeAttentionHeadSpec(
         head_idx=5,
         q=tuple(q),
@@ -1061,6 +1061,15 @@ def make_l10_post_ops_combined() -> Operation:
             if carry_base is not None:
                 for carry_offset in (1, 2, 3):
                     ffn.W_up.data[:offset, carry_base + carry_offset] = -S * 1000
+            temp_base = dim_positions.get("TEMP")
+            if temp_base is not None:
+                # L7 relays ADD/SUB to TEMP[8]/TEMP[9] at AX byte rows, and
+                # the wide ALU path relays MUL byte-1 ownership to TEMP[10].
+                # This late dependency-tail copy of legacy post-ops must not
+                # rerun byte logic after the immediate structural blocks have
+                # already materialized the authoritative result.
+                for temp_offset in (8, 9, 10):
+                    ffn.W_up.data[:offset, temp_base + temp_offset] = -S * 1000
 
     # phase=10.5 so it lands AFTER layer10_alu (phase=10) but BEFORE later layers
     # which depend on its OUTPUT_LO/HI updates. Note: float phases work because
@@ -1091,6 +1100,23 @@ def make_l10_post_ops_combined() -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _strengthen_l10_carry_wrong_byte_blockers(post_op, BD, byte_idx: int, S: float) -> None:
+    """Harden L10-attached carry post-ops against compact-layout byte leakage."""
+
+    byte_dims = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]
+    for wrong_dim in (dim for i, dim in enumerate(byte_dims) if i != byte_idx):
+        if wrong_dim < post_op.W_up.data.shape[1]:
+            post_op.W_up.data[:, wrong_dim] = -S * 10000
+
+
+def _strengthen_l10_first_carry_delta(post_op, BD) -> None:
+    """Give L10 byte-0 carry enough margin on AX high-byte passthrough rows."""
+
+    for base in (BD.OUTPUT_LO, BD.OUTPUT_HI):
+        if base + 16 <= post_op.W_down.data.shape[0]:
+            post_op.W_down.data[base:base + 16, :] *= 1.5
 
 
 def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
@@ -1136,6 +1162,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("IS_BYTE", 5.0),
                 ("HAS_SE", 5.0),
                 ("H1+2", 20.0),
+                ("H1+1", -1000.0),
+                ("H1+3", -1000.0),
                 (f"BYTE_INDEX_{byte_idx}", 5.0),
                 ("CMP+3", 1.0),
                 ("MARK_SP", -10000.0),
@@ -1208,7 +1236,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         non_add_blockers = (
             ("CARRY+2", -1000.0),
             ("TEMP+3", -1000.0),
-            ("TEMP+10", -1000.0),
             ("OP_EQ", -1000000.0),
             ("OP_NE", -1000000.0),
             ("OP_LT", -1000000.0),
@@ -1228,10 +1255,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("H1+1", 20.0),
                 (f"BYTE_INDEX_{byte_idx}", 5.0),
                 ("CARRY+1", 20.0),
+                ("TEMP+8", 100.0),
             ) + marker_blockers + non_add_blockers
-            threshold = 90.0
+            threshold = 250.0
 
             for old_value in range(256):
+                old_lo = old_value & 0xF
                 rules.append(
                     FFNRule.constant_write(
                         name=(
@@ -1239,9 +1268,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             f"{old_value:02x}"
                         ),
                         conditions=base_conditions + (
-                            (f"OUTPUT_LO+{old_value & 0xF}", 1.0),
+                            (f"OUTPUT_LO+{old_lo}", 1.0),
                             (f"OUTPUT_HI+{old_value >> 4}", 1.0),
-                            (f"ALU_LO+{old_value & 0xF}", 5.0),
+                            (f"ALU_LO+{old_lo}", 20.0),
+                        ) + tuple(
+                            (f"OUTPUT_LO+{other}", -25.0)
+                            for other in range(16)
+                            if other != old_lo
                         ),
                         threshold=threshold,
                         writes=byte_writes(
@@ -1370,7 +1403,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             conditions=(
                 ("IS_BYTE", 1.0),
                 ("HAS_SE", 1.0),
-                ("H1+3", 1.0),
+                ("H1+3", 20.0),
                 ("H1+1", -100.0),
                 ("H1+2", -100.0),
                 ("BYTE_INDEX_1", 1.0),
@@ -1392,7 +1425,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_LE", -1000.0),
                 ("OP_GE", -1000.0),
             ),
-            threshold=4.0,
+            threshold=22.0,
             writes=byte_writes(0x01, strength=500.0),
         ),
         *wide_mul_byte1_preserve_rules(),
@@ -1453,10 +1486,17 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_sub_borrow_byte1_00",
             conditions=ax_byte0 + (
-                ("CARRY+2", 0.5),
+                ("MARK_AX", -1000.0),
+                ("OP_IMM", -1000.0),
+                ("TEMP+8", -20000.0),
+                ("TEMP+9", 100.0),
+                ("CARRY+2", 100.0),
                 ("ALU_LO+1", 1.0),
+                ("OUTPUT_LO+1", -100.0),
+                ("OUTPUT_LO+0", 10.0),
+                ("OUTPUT_HI+0", 1.0),
             ),
-            threshold=4.5,
+            threshold=1000.0,
             writes=byte_writes(0x00),
         ),
         # 16-bit AND's high byte must zero; CMP/TEMP distinguish AND from
@@ -1507,6 +1547,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             name="tail_shr_marker_byte0_01",
             conditions=(
                 ("MARK_AX", 1.0),
+                ("IS_BYTE", -100.0),
                 ("H1+1", 1.0),
                 ("TEMP+7", 1.0),
                 ("OP_SHR", 0.2),
@@ -1571,7 +1612,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=8.0,
             writes=byte_writes(0x00, strength=1000.0),
         ),
-    ) + ax_add_carry_rules() + sp_pop_carry_rules()
+    ) + sp_pop_carry_rules()
 
 
 def make_tail_bit32_result_correction_op() -> Operation:
@@ -1674,6 +1715,7 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             CarryPropagationPostOp,
             BitwiseBytePropagationPostOp,
             ComparisonCombine,
+            _SetDim,
         )
         # Use the block's d_model when available; fall back to 512 to mirror
         # the previous inline behavior.
@@ -1699,18 +1741,25 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         block.post_ops.append(
             AddSubBytePropagationPostOp(d_model=d_model, S=S, dim_positions=dim_positions)
         )
-        block.post_ops.append(
-            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=0, cascade=False,
-                                   dim_positions=dim_positions)
+        BD = _as_setdim_proxy(dim_positions) if isinstance(dim_positions, dict) else _SetDim
+        carry0 = CarryPropagationPostOp(
+            d_model=d_model, S=S, byte_idx=0, cascade=False,
+            dim_positions=dim_positions,
         )
-        block.post_ops.append(
-            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=1, cascade=True,
-                                   dim_positions=dim_positions)
+        _strengthen_l10_first_carry_delta(carry0, BD)
+        block.post_ops.append(carry0)
+        carry1 = CarryPropagationPostOp(
+            d_model=d_model, S=S, byte_idx=1, cascade=True,
+            dim_positions=dim_positions,
         )
-        block.post_ops.append(
-            CarryPropagationPostOp(d_model=d_model, S=S, byte_idx=2, cascade=True,
-                                   dim_positions=dim_positions)
+        _strengthen_l10_carry_wrong_byte_blockers(carry1, BD, byte_idx=1, S=S)
+        block.post_ops.append(carry1)
+        carry2 = CarryPropagationPostOp(
+            d_model=d_model, S=S, byte_idx=2, cascade=True,
+            dim_positions=dim_positions,
         )
+        _strengthen_l10_carry_wrong_byte_blockers(carry2, BD, byte_idx=2, S=S)
+        block.post_ops.append(carry2)
         block.post_ops.append(
             BitwiseBytePropagationPostOp(d_model=d_model, S=S, dim_positions=dim_positions)
         )

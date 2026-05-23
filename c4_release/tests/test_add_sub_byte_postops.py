@@ -80,6 +80,16 @@ def test_add_byte_base_requires_matching_output_nibble_under_alu_amplification()
     _assert_no_positive_non_targets(out, 0x02)
 
 
+def test_add_byte_base_tolerates_stale_zero_output_residual():
+    x = _add_byte1_input(692, 758, alu_amp=6.0)
+    x[0, 0, BD.OUTPUT_LO + 0] = 0.94
+
+    out = AddSubBytePropagationPostOp()(x)
+
+    assert _decode_output_byte(out) == 0x04
+    _assert_no_positive_non_targets(out, 0x04)
+
+
 def test_add_carry_requires_matching_output_nibbles_under_carry_drift():
     x = _add_byte1_input(654, 114, carry=2.2)
     base = AddSubBytePropagationPostOp()(x)

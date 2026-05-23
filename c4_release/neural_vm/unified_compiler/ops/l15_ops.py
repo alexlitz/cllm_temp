@@ -236,7 +236,7 @@ def make_layer15_memory_lookup_op() -> Operation:
                "MEM_ADDR_SRC",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "MARK_STACK0", "IS_BYTE",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "H1", "H2", "H3", "L2H0",
+               "H1", "H2", "H3", "L2H0", "TEMP",
                "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "CMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="attn",
@@ -390,6 +390,15 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
         for k in range(16):
             attn.W_o.data[BD.OUTPUT_LO + k, base + 32 + k] = value_scale
             attn.W_o.data[BD.OUTPUT_HI + k, base + 48 + k] = value_scale
+
+        # L15 lookup is load-only. ADD/SUB rows can still carry stale ADDR_KEY
+        # residue, and L10 marks arithmetic byte propagation through TEMP+8/9.
+        # Force those queries to the softmax1 zero sink so L15 cannot overwrite
+        # the arithmetic output that L10 just produced.
+        addsub_blocker = 41
+        attn.W_q.data[base + addsub_blocker, BD.TEMP + 8] = 10000.0
+        attn.W_q.data[base + addsub_blocker, BD.TEMP + 9] = 10000.0
+        attn.W_k.data[base + addsub_blocker, BD.CONST] = -20.0
 
         # A load-only source gate must not be the thing that keeps L15 quiet
         # during current store generation. Add an explicit current-MEM query

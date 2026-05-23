@@ -85,6 +85,8 @@ def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(33, BD.CONST, -25000.0),
         AP(34, BD.OP_LI_RELAY, -10000.0),
         AP(34, BD.OP_LC_RELAY, -10000.0),
+        AP(35, BD.TEMP + 8, 10000.0),
+        AP(35, BD.TEMP + 9, 10000.0),
     ]
     k = [
         AP(0, BD.MARK_AX, 100.0),
@@ -92,6 +94,7 @@ def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(1, BD.OP_SHL, 100.0),
         AP(33, BD.CONST, 5.0),
         AP(34, BD.CONST, 5.0),
+        AP(35, BD.CONST, -20.0),
     ]
     v = []
     o = []
@@ -150,7 +153,7 @@ def make_layer14_alu_high_byte_relay_op() -> Operation:
         phase=15.05,
         reads={"IS_BYTE", "H1", "BYTE_INDEX_0", "MARK_AX", "OP_MUL",
                "OP_SHL", "OP_LI_RELAY", "OP_LC_RELAY",
-               "AX_FULL_LO", "AX_FULL_HI", "CONST"},
+               "AX_FULL_LO", "AX_FULL_HI", "TEMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         layer_idx=15,
@@ -416,7 +419,8 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         phase=14.3,
         reads={"H4", "H1", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "OP_JSR", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
-               "MARK_STACK0", "IS_BYTE", "BYTE_INDEX_3", "PSH_AT_SP", "CONST"},
+               "MARK_STACK0", "IS_BYTE", "BYTE_INDEX_3", "PSH_AT_SP", "CMP",
+               "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,

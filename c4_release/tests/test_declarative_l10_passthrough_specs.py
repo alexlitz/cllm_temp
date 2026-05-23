@@ -109,5 +109,12 @@ def test_l10_stack0_byte_relay_spec_matches_legacy_helper():
     with torch.no_grad():
         _set_layer10_stack0_byte_relay(legacy, 100.0, _SetDim, hd)
         _bake_layer10_stack0_byte_relay_head(generated, _SetDim, 100.0, hd)
+        # The compiler-owned nonbitwise head intentionally strengthens the
+        # STACK0 high-byte relay so L10 ADD/SUB base propagation sees the same
+        # ALU amplitude it was calibrated for in the full compact model.
+        base = 5 * hd
+        for k in range(16):
+            legacy.W_o[_SetDim.ALU_LO + k, base + 1 + k] = 6.0
+            legacy.W_o[_SetDim.ALU_HI + k, base + 17 + k] = 6.0
 
     _assert_attention_equal(legacy, generated)

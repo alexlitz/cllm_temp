@@ -288,6 +288,7 @@ class BatchedPureNeuralRunner:
             "verification_forwards": 0,
             "cache_rebuilds": 0,
             "reused_token_slots": 0,
+            "spec_fresh_bypass": 0,
         }
         self._spec_stats = {}
         self._reset_spec_stats()
@@ -394,6 +395,7 @@ class BatchedPureNeuralRunner:
         active_idx: List[int],
         *,
         first_logit_pos: int,
+        allow_kv: bool = True,
     ) -> Tuple[List[List[int]], int, List[int]]:
         """Forward a padded active batch and return argmax rows.
 
@@ -404,7 +406,9 @@ class BatchedPureNeuralRunner:
         logits are returned and the cache is discarded.
         """
         padded, real_lens = self._pad_to_tensor(sequences)
-        if not self.use_kv_cache:
+        if not self.use_kv_cache or not allow_kv:
+            if self.use_kv_cache and not allow_kv:
+                self._kv_stats["spec_fresh_bypass"] += 1
             self._kv_stats["fresh_forwards"] += 1
             logits = self.model.forward(padded)
             return logits.argmax(dim=-1).cpu().tolist(), 0, real_lens
@@ -1012,6 +1016,7 @@ class BatchedPureNeuralRunner:
                 windowed_with_drafts,
                 active_idx,
                 first_logit_pos=min(real_prefix_lens) - 1,
+                allow_kv=not any(drafts),
             )
 
             # 3) For each element: verify drafts and replay accepted prefix + correction.
