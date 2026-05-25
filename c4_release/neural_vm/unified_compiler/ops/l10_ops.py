@@ -1723,7 +1723,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         ("MARK_MEM", -10000.0),
                     ),
                     threshold=150.0,
-                    writes=byte_writes(0xFF, strength=1.0e24),
+                    writes=byte_writes(0xFF, strength=5000.0),
                 )
             )
         return tuple(rules)
@@ -1828,10 +1828,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("MARK_SP", -1000000.0),
             ("MARK_BP", -1000000.0),
             ("MARK_MEM", -1000000.0),
-            ("H1+0", -1.0e12),
-            ("H1+1", -1.0e12),
-            ("H1+2", -1.0e12),
-            ("H1+3", -1.0e12),
+            ("H1+0", -1000.0),
+            ("H1+1", -1000.0),
+            ("H1+2", -1000.0),
+            ("H1+3", -1000.0),
         )
         rules = []
         for lo in range(16):
@@ -1853,6 +1853,60 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         threshold=25.0,
                         gate="MARK_STACK0",
                         writes=byte_writes(value, strength=2000.0),
+                    )
+                )
+        return tuple(rules)
+
+    def stack0_store_top_e8_from_e0_output_rules() -> tuple[FFNRule, ...]:
+        """Restore top-store values for the e0->e8 local-store transition.
+
+        L15 blocks the stale historical lookup for ``SI`` when the pre-pop
+        stack top is ``0xffe8`` and the pre-pop SP address band is still
+        ``0xffe0``. That leaves the correct current store value in OUTPUT, but
+        the older non-top zeroing rule still matches the broad e8/e0 address
+        shape. Require L15's strengthened ADDR_B0_HI[0] signal so this restore
+        applies only after that current-top-store path has been disambiguated.
+        """
+
+        base_conditions = (
+            ("MARK_STACK0", 5.0),
+            ("HAS_SE", 1.0),
+            ("CMP+3", 0.5),
+            ("MEM_STORE", 1.0),
+            ("EMBED_LO+8", 10.0),
+            ("EMBED_HI+14", 1.0),
+            ("ADDR_B0_LO+0", 1.0),
+            ("ADDR_B0_HI+0", 10.0),
+            ("IS_BYTE", -1000000.0),
+            ("MARK_AX", -1000000.0),
+            ("MARK_PC", -1000000.0),
+            ("MARK_SP", -1000000.0),
+            ("MARK_BP", -1000000.0),
+            ("MARK_MEM", -1000000.0),
+            ("H1+0", -1000.0),
+            ("H1+1", -1000.0),
+            ("H1+2", -1000.0),
+            ("H1+3", -1000.0),
+        )
+        rules = []
+        for lo in range(16):
+            for hi in range(16):
+                if lo == 0 and hi == 0:
+                    continue
+                value = lo | (hi << 4)
+                rules.append(
+                    FFNRule.gated_write(
+                        name=(
+                            "tail_stack0_store_top_e8_from_e0_byte_"
+                            f"{value:02x}"
+                        ),
+                        conditions=base_conditions + (
+                            (f"OUTPUT_LO+{lo}", 0.001),
+                            (f"OUTPUT_HI+{hi}", 0.001),
+                        ),
+                        threshold=55.0,
+                        gate="MARK_STACK0",
+                        writes=byte_writes(value, strength=5000.0),
                     )
                 )
         return tuple(rules)
@@ -1995,12 +2049,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("OP_GT", -1000000.0),
             ("OP_LE", -1000000.0),
             ("OP_GE", -1000000.0),
-            ("OP_SI", -1000.0),
-            ("OP_SC", -1000.0),
-            ("OP_LI", -1000.0),
-            ("OP_LC", -1000.0),
+            ("OP_SI", -1000000.0),
+            ("OP_SC", -1000000.0),
+            ("OP_LI", -1000000.0),
+            ("OP_LC", -1000000.0),
             ("OP_ENT", -1000000.0),
-            ("MEM_STORE", -1000.0),
+            ("MEM_STORE", -1000000.0),
         )
         return (
             FFNRule.constant_write(
@@ -2101,7 +2155,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ),
                     threshold=340.0,
                     gate="TEMP+8",
-                    writes=byte_writes(lo, strength=1.0e24),
+                    writes=byte_writes(lo, strength=1.0e12),
                 )
             )
         return tuple(rules)
@@ -2208,7 +2262,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     else f"tail_wide_mul_byte1_preserve_{high_nibble:01x}{low_nibble:01x}"
                 )
                 temp_block = non_mul_block if high_nibble == 0 else -1_000_000_000.0
-                add_temp_block = non_mul_block if high_nibble == 0 else -1_000_000_000.0
+                add_temp_block = non_mul_block
                 sub_temp_block = non_mul_block
                 has_weight = (
                     3_000_000_000_000_000.0
@@ -2473,6 +2527,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *stack0_pop_loaded_output_rules(),
         *stack0_store_loaded_output_rules(),
         *stack0_store_top_e0_output_rules(),
+        *stack0_store_top_e8_from_e0_output_rules(),
         # Non-memory binary pops should emit a zero MEM row. Store/load ops
         # have dedicated memory paths and block this cleanup.
         FFNRule.constant_write(
