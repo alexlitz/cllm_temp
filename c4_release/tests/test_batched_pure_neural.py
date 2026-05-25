@@ -257,6 +257,52 @@ def test_declarative_halt_horizon_marks_overrun_as_divergence():
     assert state.exit_code is None
 
 
+def test_windowed_context_does_not_duplicate_memory_history_without_eviction():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.vm_step import Token
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    prefix = [Token.CODE_START, Token.CODE_END]
+    mem_section = [Token.MEM, 1, 0, 0, 0, 7, 0, 0, 0]
+    dynamic = [Token.REG_AX, 7, 0, 0, 0] + mem_section + [Token.STEP_END]
+    state = _ElementState(
+        bytecode=[],
+        context=prefix + dynamic,
+        prefix_len=len(prefix),
+        mem_history={1: mem_section},
+        mem_access_order=[1],
+    )
+
+    windowed = runner._windowed_context(state, max_context_window=128)
+
+    assert windowed == prefix + dynamic
+    assert state.mem_history_end == 0
+
+
+def test_windowed_context_splices_only_evicted_memory_history():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.vm_step import Token
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    prefix = [Token.CODE_START, Token.CODE_END]
+    evicted_mem = [Token.MEM, 1, 0, 0, 0, 7, 0, 0, 0]
+    retained_mem = [Token.MEM, 2, 0, 0, 0, 9, 0, 0, 0]
+    tail = [Token.REG_AX, 9, 0, 0, 0] + retained_mem + [Token.STEP_END]
+    dynamic = evicted_mem + [Token.REG_PC, 2, 0, 0, 0] + tail
+    state = _ElementState(
+        bytecode=[],
+        context=prefix + dynamic,
+        prefix_len=len(prefix),
+        mem_history={1: evicted_mem, 2: retained_mem},
+        mem_access_order=[1, 2],
+    )
+
+    windowed = runner._windowed_context(state, max_context_window=len(tail))
+
+    assert windowed == prefix + evicted_mem + tail
+    assert state.mem_history_end == len(prefix) + len(evicted_mem)
+
+
 class _FakeBatchedModel:
     def __init__(self):
         self.calls = []
@@ -284,6 +330,7 @@ def _fake_kv_runner(*, verify):
     runner.kv_cache_verify = verify
     runner.kv_cache_verify_interval = 1
     runner.kv_cache_max_tokens = 32
+    runner.kv_flush_interval = 0
     runner._kv_cache_obj = None
     runner._kv_active_idx = (0, 1)
     runner._kv_cached_rows = [[10, 11, 12], [20, 21, 22]]
@@ -367,6 +414,22 @@ def test_batched_kv_verify_on_runs_one_fresh_verification():
     assert runner._kv_stats["kv_forwards"] == 1
     assert runner._kv_stats["verifications"] == 1
     assert runner._kv_stats["verification_forwards"] == 1
+
+
+def test_batched_kv_flush_interval_rebuilds_cache():
+    runner = _fake_kv_runner(verify=False)
+    runner.kv_flush_interval = 1
+    runner._kv_incremental_count = 1
+
+    runner._forward_argmax_batch(
+        [[10, 11, 12, 13], [20, 21, 22, 23]],
+        [0, 1],
+        first_logit_pos=2,
+    )
+
+    assert runner.model.calls[0]["cached_prefix_len"] == 0
+    assert runner._kv_stats["cache_rebuilds"] == 1
+    assert runner._kv_stats["hits"] == 0
 
 
 @pytest.mark.slow

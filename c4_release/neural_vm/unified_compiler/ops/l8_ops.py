@@ -222,7 +222,7 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
     return Operation(
         name="layer8_multibyte_fetch_bake",
         phase=8.1,
-        reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1",
+        reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1", "HAS_SE",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST", "MARK_AX"},
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
@@ -250,31 +250,39 @@ def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
 
     L = 20.0
     AX_I = 1
+    TOP = 36
     return DeclarativeAttentionHeadSpec(
         head_idx=3,
         q=(
             tuple(AP(k, BD.FETCH_LO + k, L) for k in range(16))
             + tuple(AP(16 + k, BD.FETCH_HI + k, L) for k in range(16))
+            + tuple(AP(TOP + k, BD.ADDR_KEY + 32 + k, L) for k in range(16))
             + (
                 AP(32, BD.IS_BYTE, L),
                 AP(33, BD.IS_BYTE, 500.0),
                 AP(33, BD.CONST, -500.0),
                 AP(34, BD.H1 + AX_I, 500.0),
                 AP(34, BD.CONST, -500.0),
-                # AX marker K exclusion added after the original helper.
+                # AX register K exclusion added after the original helper.
+                # The byte-position queries can carry staged ADDR_KEY, so
+                # without blocking AX byte K candidates they self-attend to
+                # the old AX byte value and pollute AX_CARRY before routing.
                 AP(35, BD.H1 + AX_I, 100.0),
                 AP(35, BD.IS_BYTE, 100.0),
                 AP(35, BD.CONST, -150.0),
+                AP(TOP, BD.CONST, L),
+                AP(TOP, BD.HAS_SE, -L),
             )
         ),
         k=(
             tuple(AP(k, BD.ADDR_KEY + k, L) for k in range(16))
             + tuple(AP(16 + k, BD.ADDR_KEY + 16 + k, L) for k in range(16))
+            + tuple(AP(TOP + k, BD.ADDR_KEY + 32 + k, L) for k in range(16))
             + (
-                AP(32, BD.ADDR_KEY + 32, L),
                 AP(33, BD.CONST, 5.0),
                 AP(34, BD.CONST, 5.0),
                 AP(35, BD.MARK_AX, -50.0),
+                AP(35, BD.H1 + AX_I, -50.0),
             )
         ),
         v=(
@@ -467,7 +475,7 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         phase=8.0,
         reads={"MARK_STACK0", "MARK_BP", "H1", "H3", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CMP", "CONST"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI",
                 "ADDR_B1_LO", "ADDR_B1_HI",
                 "ADDR_B2_LO", "ADDR_B2_HI"},

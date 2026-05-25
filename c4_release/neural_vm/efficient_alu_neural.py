@@ -142,12 +142,19 @@ class BDToGEConverter(nn.Module):
         # NIBBLE pipeline. L8 attention stages stack byte 1 into AX_FULL_* at
         # the AX marker; map that into operand-A GE positions 2/3 only while
         # a wide ALU opcode is active, so stale AX_FULL usage elsewhere stays
-        # invisible to the generic converter.
+        # invisible to the generic converter. DIV/MOD also use the 32-bit
+        # long-division pipeline, so they must receive this byte just like
+        # MUL/SHL/SHR instead of silently dividing only the low byte.
         if hasattr(BD, "AX_FULL_LO") and hasattr(BD, "AX_FULL_HI"):
+            divmod_op = (
+                (x_bd[:, :, BD.OP_DIV] > 0.5)
+                | (x_bd[:, :, BD.OP_MOD] > 0.5)
+            )
             wide_op = (
                 (x_bd[:, :, BD.OP_MUL] > 0.5)
                 | (x_bd[:, :, BD.OP_SHL] > 0.5)
                 | (x_bd[:, :, BD.OP_SHR] > 0.5)
+                | divmod_op
             ).to(dtype=x_bd.dtype)
             ax_marker = (x_bd[:, :, BD.MARK_AX] > 0.5).to(dtype=x_bd.dtype)
             wide_marker = wide_op * ax_marker
@@ -157,12 +164,47 @@ class BDToGEConverter(nn.Module):
             ax_full_hi = _clean_onehot(
                 x_bd[:, :, BD.AX_FULL_HI:BD.AX_FULL_HI + 16],
             )
+            ax_full_present = (
+                (ax_full_lo.sum(dim=-1) + ax_full_hi.sum(dim=-1)) > 0.5
+            ).to(dtype=x_bd.dtype)
+
+            # DIV/MOD run at the AX marker. When AX_FULL was not explicitly
+            # staged there, recover operand-A byte 1 from the latest prior
+            # STACK0 byte-1 row in the autoregressive prefix.
+            prev_stack_lo = torch.zeros_like(ax_full_lo)
+            prev_stack_hi = torch.zeros_like(ax_full_hi)
+            if hasattr(BD, "STACK0_BYTE1"):
+                pos_idx = torch.arange(seq_len, device=x_bd.device).view(1, seq_len)
+                stack1 = x_bd[:, :, BD.STACK0_BYTE1] > 0.5
+                scores = torch.where(stack1, pos_idx, torch.full_like(pos_idx, -1))
+                latest_score, latest_idx = torch.cummax(scores, dim=1)
+                gather_idx = latest_idx[:, :, None].expand(-1, -1, 16)
+                clean_lo = _clean_onehot(
+                    x_bd[:, :, BD.CLEAN_EMBED_LO:BD.CLEAN_EMBED_LO + 16]
+                )
+                clean_hi = _clean_onehot(
+                    x_bd[:, :, BD.CLEAN_EMBED_HI:BD.CLEAN_EMBED_HI + 16]
+                )
+                valid = (latest_score >= 0)[:, :, None].to(dtype=x_bd.dtype)
+                prev_stack_lo = torch.gather(clean_lo, 1, gather_idx) * valid
+                prev_stack_hi = torch.gather(clean_hi, 1, gather_idx) * valid
+            divmod_fallback = (
+                divmod_op.to(dtype=x_bd.dtype)
+                * ax_marker
+                * (1.0 - ax_full_present)
+            )
+            ax_full_lo_scalar = (ax_full_lo * k_coeffs).sum(dim=-1)
+            ax_full_hi_scalar = (ax_full_hi * k_coeffs).sum(dim=-1)
+            prev_stack_lo_scalar = (prev_stack_lo * k_coeffs).sum(dim=-1)
+            prev_stack_hi_scalar = (prev_stack_hi * k_coeffs).sum(dim=-1)
             x_ge[:, :, 2, self.ge.NIB_A] = (
-                ax_full_lo * k_coeffs
-            ).sum(dim=-1) * wide_marker
+                ax_full_lo_scalar * wide_marker
+                + prev_stack_lo_scalar * divmod_fallback
+            )
             x_ge[:, :, 3, self.ge.NIB_A] = (
-                ax_full_hi * k_coeffs
-            ).sum(dim=-1) * wide_marker
+                ax_full_hi_scalar * wide_marker
+                + prev_stack_hi_scalar * divmod_fallback
+            )
 
         # Copy opcode flags to all positions.
         # FIX 2026-05-06: Normalize opcode values to 0/1 by thresholding at 0.5.
@@ -296,6 +338,8 @@ class GEToBDConverter(nn.Module):
                 (x_bd[:, :, BD.OP_MUL] > 0.5)
                 | (x_bd[:, :, BD.OP_SHL] > 0.5)
                 | (x_bd[:, :, BD.OP_SHR] > 0.5)
+                | (x_bd[:, :, BD.OP_DIV] > 0.5)
+                | (x_bd[:, :, BD.OP_MOD] > 0.5)
             ).to(dtype=x_bd.dtype)
             ax_marker = (x_bd[:, :, BD.MARK_AX] > 0.5).to(dtype=x_bd.dtype)
             wide_mask = wide_op * ax_marker

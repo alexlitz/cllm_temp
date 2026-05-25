@@ -1,6 +1,8 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
-from ..ir import CompilerIR, FFNRule
+from dataclasses import replace
+
+from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -112,7 +114,13 @@ def _bake_layer10_byte_passthrough_head(attn, BD, S, HD) -> None:
             target_marker_dim=BD.H1 + AX_IDX,
             value_lo_dim=BD.CLEAN_EMBED_LO,
             value_hi_dim=BD.CLEAN_EMBED_HI,
-            suppress_op_dims=[BD.OP_IMM, BD.TEMP + 3],
+            suppress_op_dims=[
+                BD.OP_IMM,
+                BD.OP_LI_RELAY,
+                BD.OP_LC_RELAY,
+                BD.TEMP + 3,
+                BD.CMP + 3,
+            ],
             S=S,
         ),
         HD,
@@ -322,9 +330,12 @@ def _layer10_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
         AP(1, BD.MARK_MEM, -200.0),
         AP(1, BD.CONST, -50.0),
         AP(31, BD.MEM_VAL_B2, 60.0),
+        AP(31, BD.STACK0_BYTE1, 60.0),
         AP(32, BD.MEM_VAL_B3, 60.0),
+        AP(32, BD.STACK0_BYTE2, 60.0),
         AP(34, BD.H3 + 4, 60.0),
         AP(34, BD.H2 + 4, -60.0),
+        AP(34, BD.STACK0_BYTE3, 60.0),
         AP(33, BD.CONST, 5.0),
     ]
     v = []
@@ -361,10 +372,14 @@ def _layer10_nonbitwise_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttenti
         AP(0, BD.IS_BYTE, 1000.0),
         AP(0, BD.H1 + AX_IDX, 1000.0),
         AP(0, BD.CMP + 3, 150000.0),
-        AP(0, BD.TEMP + 3, -3000.0),
+        AP(0, BD.TEMP + 3, -500.0),
         AP(0, BD.BYTE_INDEX_3, -3000.0),
         AP(1, BD.CMP + 3, 1000.0),
-        AP(1, BD.TEMP + 3, -1000.0),
+        # Do not put a negative TEMP[3] term in this match slot: the MEM
+        # marker key uses negative MARK_MEM/CONST terms there, so weak
+        # TEMP[3] residue turns into positive evidence for the wrong row.
+        # The high-magnitude TEMP[3] blockers in slots 0 and 33 still suppress
+        # true bitwise rows without polluting the stack-byte selection score.
         AP(31, BD.BYTE_INDEX_0, 60.0),
         AP(32, BD.BYTE_INDEX_1, 60.0),
         AP(34, BD.BYTE_INDEX_2, 60.0),
@@ -372,7 +387,7 @@ def _layer10_nonbitwise_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttenti
         AP(33, BD.IS_BYTE, 10000.0),
         AP(33, BD.H1 + AX_IDX, 10000.0),
         AP(33, BD.CMP + 3, 1500000.0),
-        AP(33, BD.TEMP + 3, -30000.0),
+        AP(33, BD.TEMP + 3, -5000.0),
         AP(33, BD.BYTE_INDEX_3, -10000.0),
     ]
     k = [
@@ -381,9 +396,12 @@ def _layer10_nonbitwise_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttenti
         AP(1, BD.MARK_MEM, -200.0),
         AP(1, BD.CONST, -50.0),
         AP(31, BD.MEM_VAL_B2, 60.0),
+        AP(31, BD.STACK0_BYTE1, 60.0),
         AP(32, BD.MEM_VAL_B3, 60.0),
+        AP(32, BD.STACK0_BYTE2, 60.0),
         AP(34, BD.H3 + 4, 60.0),
         AP(34, BD.H2 + 4, -60.0),
+        AP(34, BD.STACK0_BYTE3, 60.0),
         AP(33, BD.CONST, 5.0),
     ]
     v = []
@@ -403,13 +421,25 @@ def _layer10_nonbitwise_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttenti
 
 
 def _layer10_stack0_persistence_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
-    """Carry STACK0 upper bytes across non-stack-mutating steps.
+    """Carry and update STACK0 bytes.
 
     L3 carries STACK0 byte 0 at the marker. This head handles bytes 1-3 by
     querying at the preceding byte position and reading the latest previous
     STACK0 byte through ALiBi preference.
+
+    STORE rows are mutating: after SI/SC, the popped SP points at the just
+    written local, so STACK0 must come from the current AX bytes. The store
+    subroute below uses extra source-match slots so it dominates the ordinary
+    persistence source and reads same-step AX byte 0..3 for STACK0
+    marker/byte0/byte1/byte2 respectively.
     """
+    AX_IDX = 1
     M = 5.0 * S
+    STORE_TARGET = 50.0 * S
+    STORE_GATE = 5.0 * S
+    STORE_CMP = 5.0 * S
+    STORE_HAS_SE = 5.0 * S
+    STORE_BIAS = -55.0 * S
     q = [
         AP(0, BD.PSH_AT_SP, -300.0),
         AP(0, BD.OP_PSH, -300.0),
@@ -421,6 +451,34 @@ def _layer10_stack0_persistence_head_spec(BD, S) -> DeclarativeAttentionHeadSpec
         AP(4, BD.STACK0_BYTE0, M),
         AP(5, BD.STACK0_BYTE1, M),
         AP(6, BD.STACK0_BYTE2, M),
+        AP(7, BD.CONST, STORE_BIAS),
+        AP(7, BD.MEM_STORE, STORE_GATE),
+        AP(7, BD.CMP + 3, STORE_CMP),
+        AP(7, BD.HAS_SE, STORE_HAS_SE),
+        AP(7, BD.MARK_STACK0, STORE_TARGET),
+        AP(8, BD.CONST, STORE_BIAS),
+        AP(8, BD.MEM_STORE, STORE_GATE),
+        AP(8, BD.CMP + 3, STORE_CMP),
+        AP(8, BD.HAS_SE, STORE_HAS_SE),
+        AP(8, BD.STACK0_BYTE0, STORE_TARGET),
+        AP(9, BD.CONST, STORE_BIAS),
+        AP(9, BD.MEM_STORE, STORE_GATE),
+        AP(9, BD.CMP + 3, STORE_CMP),
+        AP(9, BD.HAS_SE, STORE_HAS_SE),
+        AP(9, BD.STACK0_BYTE1, STORE_TARGET),
+        AP(10, BD.CONST, STORE_BIAS),
+        AP(10, BD.MEM_STORE, STORE_GATE),
+        AP(10, BD.CMP + 3, STORE_CMP),
+        AP(10, BD.HAS_SE, STORE_HAS_SE),
+        AP(10, BD.STACK0_BYTE2, STORE_TARGET),
+        AP(11, BD.CONST, STORE_BIAS),
+        AP(11, BD.MEM_STORE, STORE_GATE),
+        AP(11, BD.CMP + 3, STORE_CMP),
+        AP(11, BD.HAS_SE, STORE_HAS_SE),
+        AP(11, BD.MARK_STACK0, STORE_TARGET),
+        AP(11, BD.STACK0_BYTE0, STORE_TARGET),
+        AP(11, BD.STACK0_BYTE1, STORE_TARGET),
+        AP(11, BD.STACK0_BYTE2, STORE_TARGET),
         AP(33, BD.CONST, -15000.0),
         AP(33, BD.HAS_SE, 10000.0),
         AP(33, BD.PSH_AT_SP, -30000.0),
@@ -439,6 +497,11 @@ def _layer10_stack0_persistence_head_spec(BD, S) -> DeclarativeAttentionHeadSpec
         AP(4, BD.STACK0_BYTE1, M),
         AP(5, BD.STACK0_BYTE2, M),
         AP(6, BD.STACK0_BYTE3, M),
+        AP(7, BD.BYTE_INDEX_0, M),
+        AP(8, BD.BYTE_INDEX_1, M),
+        AP(9, BD.BYTE_INDEX_2, M),
+        AP(10, BD.BYTE_INDEX_3, M),
+        AP(11, BD.H1 + AX_IDX, M),
         AP(33, BD.CONST, 100.0),
     ]
     v = []
@@ -479,7 +542,13 @@ def _layer10_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
         target_marker_dim=proxy.H1 + AX_IDX,
         value_lo_dim=proxy.CLEAN_EMBED_LO,
         value_hi_dim=proxy.CLEAN_EMBED_HI,
-        suppress_op_dims=[proxy.OP_IMM, proxy.TEMP + 3],
+        suppress_op_dims=[
+            proxy.OP_IMM,
+            proxy.OP_LI_RELAY,
+            proxy.OP_LC_RELAY,
+            proxy.TEMP + 3,
+            proxy.CMP + 3,
+        ],
         S=100.0,
     ))
     return ir
@@ -711,7 +780,7 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
     return Operation(
         name="layer10_byte_passthrough_bake",
         phase=10.1,
-        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "TEMP",
+        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "OP_LC_RELAY", "TEMP",
                "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
@@ -999,6 +1068,40 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
     )
 
 
+def _suppress_ffn_on_step_boundary(ffn, dim_positions, S: float, units: int | None = None) -> None:
+    """Require a marker or byte-lane signal for byte/marker cleanup FFNs."""
+
+    def resolve_dim(name: str):
+        if isinstance(dim_positions, dict) and name in dim_positions:
+            return dim_positions[name]
+        proxy = _as_setdim_proxy(dim_positions if isinstance(dim_positions, dict) else {})
+        return getattr(proxy, name, None)
+
+    const_dim = resolve_dim("CONST")
+    if const_dim is None:
+        return
+    unit_count = ffn.W_up.data.shape[0] if units is None else units
+    if const_dim >= ffn.W_up.data.shape[1]:
+        return
+    strength = S * 10_000_000
+    ffn.W_up.data[:unit_count, const_dim] -= strength
+    for structural_name in (
+        "IS_BYTE",
+        "MARK_AX",
+        "MARK_PC",
+        "MARK_SP",
+        "MARK_BP",
+        "MARK_STACK0",
+        "MARK_MEM",
+    ):
+        structural_dim = resolve_dim(structural_name)
+        if (
+            structural_dim is not None
+            and structural_dim < ffn.W_up.data.shape[1]
+        ):
+            ffn.W_up.data[:unit_count, structural_dim] += strength
+
+
 def make_l10_post_ops_combined() -> Operation:
     """Combined L10 post_ops: BinaryOpByteZeroing + 3x CarryPropagation +
     ComparisonCombine, baked sequentially into one FFN.
@@ -1024,6 +1127,7 @@ def make_l10_post_ops_combined() -> Operation:
         # the compact layout, matching the per-block post_op attach path.
         offset = _bake_post_op_into(
             ffn, BinaryOpByteZeroingPostOp(d_model, S, dim_positions=dim_positions), offset)
+        carry_start = offset
         offset = _bake_post_op_into(
             ffn, CarryPropagationPostOp(d_model, S, byte_idx=0, cascade=False,
                                         dim_positions=dim_positions), offset)
@@ -1033,8 +1137,21 @@ def make_l10_post_ops_combined() -> Operation:
         offset = _bake_post_op_into(
             ffn, CarryPropagationPostOp(d_model, S, byte_idx=2, cascade=True,
                                         dim_positions=dim_positions), offset)
+        carry_end = offset
         offset = _bake_post_op_into(
             ffn, ComparisonCombine(d_model, S, dim_positions=dim_positions), offset)
+        # The attached L10 post-op pipeline is now the authoritative carry
+        # implementation. This late dependency-assigned copy sees very large
+        # downstream OUTPUT residuals, and the legacy carry units can turn
+        # those into runaway byte rewrites even when the earlier byte result
+        # is already correct. Keep zeroing/comparison here, but remove the
+        # stale carry slice entirely.
+        if carry_end > carry_start:
+            ffn.W_up.data[carry_start:carry_end, :].zero_()
+            ffn.b_up.data[carry_start:carry_end].zero_()
+            ffn.W_gate.data[carry_start:carry_end, :].zero_()
+            ffn.b_gate.data[carry_start:carry_end].zero_()
+            ffn.W_down.data[:, carry_start:carry_end].zero_()
         # This combined post-op block is dependency-assigned late in the
         # expanded model. The structural L10 post-op blocks already own ADD/SUB
         # carry propagation at the correct point in the pipeline; re-running
@@ -1046,6 +1163,7 @@ def make_l10_post_ops_combined() -> Operation:
         if isinstance(dim_positions, dict):
             for suppress_name in (
                 "OP_IMM",
+                "OP_JMP",
                 "OP_LI_RELAY",
                 "OP_LC_RELAY",
                 "OP_ADD",
@@ -1060,7 +1178,7 @@ def make_l10_post_ops_combined() -> Operation:
             carry_base = dim_positions.get("CARRY")
             if carry_base is not None:
                 for carry_offset in (1, 2, 3):
-                    ffn.W_up.data[:offset, carry_base + carry_offset] = -S * 1000
+                    ffn.W_up.data[:offset, carry_base + carry_offset] = -S * 1000000
             temp_base = dim_positions.get("TEMP")
             if temp_base is not None:
                 # L7 relays ADD/SUB to TEMP[8]/TEMP[9] at AX byte rows, and
@@ -1069,7 +1187,29 @@ def make_l10_post_ops_combined() -> Operation:
                 # rerun byte logic after the immediate structural blocks have
                 # already materialized the authoritative result.
                 for temp_offset in (8, 9, 10):
-                    ffn.W_up.data[:offset, temp_base + temp_offset] = -S * 1000
+                    ffn.W_up.data[:offset, temp_base + temp_offset] = -S * 1000000
+            cmp_base = dim_positions.get("CMP")
+            if cmp_base is not None:
+                # L7 relays LEA to CMP[7] at AX byte rows. LEA bytes are
+                # already materialized by L16; the dependency-tail copy of L10
+                # post-ops must not rerun carry propagation over them.
+                ffn.W_up.data[:offset, cmp_base + 7] = -S * 1000
+            h1_base = dim_positions.get("H1")
+            if h1_base is not None:
+                # This dependency-assigned copy of the L10 byte post-ops runs
+                # after many later corrections, where nonmatching OUTPUT
+                # nibbles can be strongly negative. The legacy carry detectors
+                # use negative OUTPUT blockers; on PC byte rows those blockers
+                # become large positive evidence and can erase L3's PC-byte
+                # output. The L10 byte post-ops are AX-oriented, so suppress the
+                # whole combined block across the PC byte span.
+                ffn.W_up.data[:offset, h1_base + 0] = -S * 10000
+            # The dependency-assigned copy is byte/marker cleanup. At
+            # step-boundary prediction rows there is no marker and no byte
+            # lane yet, so stale OUTPUT residue can make the legacy units
+            # overwhelm the next marker token. Require a structural row signal
+            # while leaving real marker and byte rows unchanged.
+            _suppress_ffn_on_step_boundary(ffn, dim_positions, S, units=offset)
 
     # phase=10.5 so it lands AFTER layer10_alu (phase=10) but BEFORE later layers
     # which depend on its OUTPUT_LO/HI updates. Note: float phases work because
@@ -1078,7 +1218,7 @@ def make_l10_post_ops_combined() -> Operation:
         name="l10_post_ops_combined",
         phase=10.5,
         reads={
-            "MARK_AX", "MARK_PC", "IS_BYTE", "H1",
+            "CONST", "MARK_AX", "MARK_PC", "IS_BYTE", "H1",
             "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
             "OP_SHL", "OP_SHR",
             "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
@@ -1097,6 +1237,7 @@ def make_l10_post_ops_combined() -> Operation:
         declarative_bake_fn=bake,
         migrated=True,
         declarative_authority="declarative",
+        ffn_units_used=1846,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1105,10 +1246,39 @@ def make_l10_post_ops_combined() -> Operation:
 def _strengthen_l10_carry_wrong_byte_blockers(post_op, BD, byte_idx: int, S: float) -> None:
     """Harden L10-attached carry post-ops against compact-layout byte leakage."""
 
-    byte_dims = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]
-    for wrong_dim in (dim for i, dim in enumerate(byte_dims) if i != byte_idx):
+    byte_dims = [
+        BD.BYTE_INDEX_0,
+        BD.BYTE_INDEX_1,
+        BD.BYTE_INDEX_2,
+        BD.BYTE_INDEX_3,
+    ]
+    for i, wrong_dim in enumerate(byte_dims):
+        if i == byte_idx or wrong_dim >= post_op.W_up.data.shape[1]:
+            continue
+        # The next byte lane can carry a small softmax residual on true rows
+        # (for example BYTE_INDEX_1 ~= 0.013 while predicting from byte 0).
+        # Far byte lanes should remain hard blockers because late OUTPUT
+        # cleanup can leave large negative residue that otherwise inverts the
+        # nibble blockers.
+        post_op.W_up.data[:, wrong_dim] = (
+            -S * 20 if i == byte_idx + 1 else -S * 100000
+        )
+
+
+def _strengthen_l10_addsub_wrong_byte_blockers(post_op, BD, S: float) -> None:
+    """Harden L10-attached ADD/SUB byte-0 post-op against byte-span leakage."""
+
+    # AddSubBytePropagationPostOp's first 1024 units are the byte-0 ADD/SUB
+    # base rules. In the compact full model, BP byte3 rows can carry large
+    # negative OUTPUT/ALU residue, turning weak wrong-byte blockers into false
+    # positives. Leave the later borrow-continuation units untouched because
+    # they intentionally target byte indexes 1 and 2.
+    main_units = min(1024, int(post_op.W_up.data.shape[0]))
+    if BD.BYTE_INDEX_1 < post_op.W_up.data.shape[1]:
+        post_op.W_up.data[:main_units, BD.BYTE_INDEX_1] = -S * 20
+    for wrong_dim in (BD.BYTE_INDEX_2, BD.BYTE_INDEX_3):
         if wrong_dim < post_op.W_up.data.shape[1]:
-            post_op.W_up.data[:, wrong_dim] = -S * 10000
+            post_op.W_up.data[:main_units, wrong_dim] = -S * 100000
 
 
 def _strengthen_l10_first_carry_delta(post_op, BD) -> None:
@@ -1117,6 +1287,19 @@ def _strengthen_l10_first_carry_delta(post_op, BD) -> None:
     for base in (BD.OUTPUT_LO, BD.OUTPUT_HI):
         if base + 16 <= post_op.W_down.data.shape[0]:
             post_op.W_down.data[base:base + 16, :] *= 1.5
+
+
+def _suppress_l10_addsub_on_wide_alu(post_op, BD, S: float) -> None:
+    """Legacy hook retained for compatibility.
+
+    ``TEMP+10`` is not a stable wide-ALU-only signature in the compact
+    declarative layout: L4 PC staging also writes it at ordinary AX byte
+    positions.  The attached ADD/SUB byte post-op is already gated by the
+    explicit L7 ADD/SUB relays (``TEMP+8`` / ``TEMP+9``), so a blanket
+    ``TEMP+10`` blocker suppresses valid high-byte arithmetic.
+    """
+
+    del post_op, BD, S
 
 
 def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
@@ -1131,7 +1314,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             writes.append((f"OUTPUT_HI+{k}", strength if k == hi else -strength))
         return tuple(writes)
 
-    def clear_byte_output_writes(strength: float = 100.0):
+    def clear_output_writes(strength: float = 100.0):
         writes = []
         for k in range(16):
             writes.append((f"OUTPUT_LO+{k}", -strength))
@@ -1147,7 +1330,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         """
 
         rules = []
-        for byte_idx in range(3):
+        # Carry propagation is valid through byte 2 for the C4 stack range.
+        # Byte 3 is the zero high byte; a previous byte token of 0x00 is
+        # ambiguous there and is handled by tail_sp_pop_byte3_zero instead.
+        for byte_idx in range(2):
             if byte_idx == 0:
                 carry_terms = (
                     (("CLEAN_EMBED_HI+0", 1.0),)
@@ -1155,16 +1341,26 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 )
             else:
                 carry_terms = (
-                    ("CLEAN_EMBED_LO+0", 1.0),
-                    ("CLEAN_EMBED_HI+0", 1.0),
+                    ("CLEAN_EMBED_LO+0", 30.0),
+                    ("CLEAN_EMBED_HI+0", 30.0),
+                ) + tuple(
+                    (f"CLEAN_EMBED_LO+{k}", -30.0) for k in range(1, 16)
+                ) + tuple(
+                    (f"CLEAN_EMBED_HI+{k}", -30.0) for k in range(1, 16)
                 )
+            byte_index_terms = (
+                (f"BYTE_INDEX_{byte_idx}", 5.0),
+            ) + tuple(
+                (f"BYTE_INDEX_{other}", -100.0)
+                for other in range(4)
+                if other != byte_idx
+            )
             base_conditions = (
                 ("IS_BYTE", 5.0),
                 ("HAS_SE", 5.0),
                 ("H1+2", 20.0),
                 ("H1+1", -1000.0),
                 ("H1+3", -1000.0),
-                (f"BYTE_INDEX_{byte_idx}", 5.0),
                 ("CMP+3", 1.0),
                 ("MARK_SP", -10000.0),
                 ("MARK_AX", -10000.0),
@@ -1178,14 +1374,15 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_GT", -1000000.0),
                 ("OP_LE", -1000000.0),
                 ("OP_GE", -1000000.0),
-            ) + carry_terms
+            ) + byte_index_terms + carry_terms
 
             if byte_idx == 0:
                 rules.append(
-                    FFNRule.constant_write(
+                    FFNRule.gated_write(
                         name="tail_sp_pop_carry_byte1_zero",
                         conditions=base_conditions,
                         threshold=40.5,
+                        gate="H1+2",
                         writes=byte_writes(0x00, strength=150.0),
                     )
                 )
@@ -1193,7 +1390,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
 
             for old_value in range(256):
                 rules.append(
-                    FFNRule.constant_write(
+                    FFNRule.gated_write(
                         name=(
                             f"tail_sp_pop_carry_byte{byte_idx + 1}_"
                             f"{old_value:02x}"
@@ -1202,11 +1399,399 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             (f"OUTPUT_LO+{old_value & 0xF}", 0.1),
                             (f"OUTPUT_HI+{old_value >> 4}", 0.1),
                         ),
-                        threshold=41.1,
+                        threshold=90.0,
+                        gate="H1+2",
                         writes=byte_writes(
                             (old_value + 1) & 0xFF,
                             strength=5000.0,
                         ),
+                    )
+                )
+        return tuple(rules)
+
+    def sp_pop_marker_increment_rules() -> tuple[FFNRule, ...]:
+        """Late SP-marker correction for binary-pop ``SP += 8``.
+
+        The L6 binary-pop unit range overlaps later function-call units in the
+        expanded declarative layout, so the marker can still stage the old SP
+        byte. Correct the marker prediction from the staged OUTPUT byte when
+        the binary-pop relay is active.
+        """
+
+        base_conditions = (
+            ("MARK_SP", 1.0),
+            ("HAS_SE", 1.0),
+            ("CMP+3", 1.5),
+            ("MARK_AX", -100.0),
+            ("MARK_PC", -100.0),
+                ("MARK_BP", -100.0),
+                ("MARK_STACK0", -100.0),
+                ("MARK_MEM", -100.0),
+                ("OP_ENT", -1000000.0),
+                ("OP_SI", -1000000.0),
+                ("OP_SC", -1000000.0),
+                ("OP_LI", -1000000.0),
+                ("OP_LC", -1000000.0),
+                ("MEM_STORE", -1000.0),
+                ("IS_BYTE", -100.0),
+            )
+        return (
+            FFNRule.gated_write(
+                name="tail_sp_pop_marker_e0_to_e8",
+                conditions=base_conditions + (
+                    ("OUTPUT_LO+0", 0.1),
+                    ("OUTPUT_HI+14", 2.0),
+                    ("OUTPUT_LO+8", -0.1),
+                    ("OUTPUT_HI+13", -10.0),
+                    ("OUTPUT_HI+0", -0.05),
+                ),
+                threshold=9.0,
+                gate="MARK_SP",
+                writes=byte_writes(0xE8, strength=300.0),
+            ),
+            FFNRule.gated_write(
+                name="tail_sp_pop_marker_d0_to_d8",
+                conditions=(
+                    ("MARK_SP", 1.0),
+                    ("HAS_SE", 1.0),
+                    ("CMP+3", 0.5),
+                    ("EMBED_LO+0", 1.0),
+                    ("EMBED_HI+13", 1.0),
+                    ("MARK_AX", -100.0),
+                    ("MARK_PC", -100.0),
+                    ("MARK_BP", -100.0),
+                    ("MARK_STACK0", -100.0),
+                    ("MARK_MEM", -100.0),
+                    ("OP_ENT", -1000000.0),
+                    ("OP_LEV", -1000000.0),
+                    ("PSH_AT_SP", -1000000.0),
+                    ("IS_BYTE", -100.0),
+                ),
+                threshold=5.5,
+                gate="MARK_SP",
+                writes=byte_writes(0xD8, strength=500.0),
+            ),
+            FFNRule.gated_write(
+                name="tail_sp_pop_marker_d8_to_e0",
+                conditions=(
+                    ("MARK_SP", 1.0),
+                    ("HAS_SE", 1.0),
+                    ("CMP+3", 0.5),
+                    ("EMBED_LO+8", 1.0),
+                    ("EMBED_HI+13", 1.0),
+                    ("MARK_AX", -100.0),
+                    ("MARK_PC", -100.0),
+                    ("MARK_BP", -100.0),
+                    ("MARK_STACK0", -100.0),
+                    ("MARK_MEM", -100.0),
+                    ("OP_ENT", -1000000.0),
+                    ("OP_LEV", -1000000.0),
+                    ("PSH_AT_SP", -1000000.0),
+                    ("IS_BYTE", -100.0),
+                ),
+                threshold=5.5,
+                gate="MARK_SP",
+                writes=byte_writes(0xE0, strength=500.0),
+            ),
+        )
+
+    def sp_pop_byte1_preserve_rules() -> tuple[FFNRule, ...]:
+        """Preserve SP byte 1 after the marker-lane ``e0 -> e8`` correction.
+
+        The SP marker correction repairs byte 0 for binary-pop ``SP += 8``.
+        At the following byte position, the L10 ALU tail can still leak AX
+        low-nibble residue into SP byte 1. The just-emitted ``0xe8`` byte and
+        the binary-pop relay form a narrow signature for the no-carry case,
+        where stack byte 1 must remain ``0xff``.
+        """
+
+        return (
+            FFNRule.constant_write(
+                name="tail_sp_pop_byte1_ff_after_e0",
+                conditions=(
+                    ("IS_BYTE", 5.0),
+                    ("HAS_SE", 5.0),
+                    ("H1+2", 20.0),
+                    ("H1+1", -1000.0),
+                    ("H1+3", -1000.0),
+                    ("BYTE_INDEX_0", 5.0),
+                    ("CMP+3", 1.0),
+                    ("CLEAN_EMBED_LO+0", 1.0),
+                    ("CLEAN_EMBED_HI+14", 1.0),
+                    ("MARK_SP", -10000.0),
+                    ("MARK_AX", -10000.0),
+                    ("MARK_PC", -10000.0),
+                    ("MARK_BP", -10000.0),
+                    ("MARK_STACK0", -10000.0),
+                    ("MARK_MEM", -10000.0),
+                    ("OP_EQ", -1000000.0),
+                    ("OP_NE", -1000000.0),
+                    ("OP_LT", -1000000.0),
+                    ("OP_GT", -1000000.0),
+                    ("OP_LE", -1000000.0),
+                    ("OP_GE", -1000000.0),
+                ),
+                threshold=40.5,
+                writes=byte_writes(0xFF, strength=5000.0),
+            ),
+            FFNRule.constant_write(
+                name="tail_sp_pop_byte1_ff_after_d8",
+                conditions=(
+                    ("IS_BYTE", 5.0),
+                    ("HAS_SE", 5.0),
+                    ("H1+2", 20.0),
+                    ("H1+1", -1000.0),
+                    ("H1+3", -1000.0),
+                    ("BYTE_INDEX_0", 5.0),
+                    ("CMP+3", 1.0),
+                    ("CLEAN_EMBED_LO+8", 1.0),
+                    ("CLEAN_EMBED_HI+13", 1.0),
+                    ("MARK_SP", -10000.0),
+                    ("MARK_AX", -10000.0),
+                    ("MARK_PC", -10000.0),
+                    ("MARK_BP", -10000.0),
+                    ("MARK_STACK0", -10000.0),
+                    ("MARK_MEM", -10000.0),
+                    ("OP_EQ", -1000000.0),
+                    ("OP_NE", -1000000.0),
+                    ("OP_LT", -1000000.0),
+                    ("OP_GT", -1000000.0),
+                    ("OP_LE", -1000000.0),
+                    ("OP_GE", -1000000.0),
+                ),
+                threshold=40.5,
+                writes=byte_writes(0xFF, strength=5000.0),
+            ),
+            FFNRule.constant_write(
+                name="tail_sp_pop_byte1_ff_after_e8",
+                conditions=(
+                    ("IS_BYTE", 5.0),
+                    ("HAS_SE", 5.0),
+                    ("H1+2", 20.0),
+                    ("H1+1", -1000.0),
+                    ("H1+3", -1000.0),
+                    ("BYTE_INDEX_0", 5.0),
+                    ("CMP+3", 1.0),
+                    ("CLEAN_EMBED_LO+8", 30.0),
+                    ("CLEAN_EMBED_HI+14", 30.0),
+                    ("STACK0_BYTE0", -1000.0),
+                    ("MARK_SP", -10000.0),
+                    ("MARK_AX", -10000.0),
+                    ("MARK_PC", -10000.0),
+                    ("MARK_BP", -10000.0),
+                    ("MARK_STACK0", -10000.0),
+                    ("MARK_MEM", -10000.0),
+                    ("OP_EQ", -1000000.0),
+                    ("OP_NE", -1000000.0),
+                    ("OP_LT", -1000000.0),
+                    ("OP_GT", -1000000.0),
+                    ("OP_LE", -1000000.0),
+                    ("OP_GE", -1000000.0),
+                ),
+                threshold=85.0,
+                writes=byte_writes(0xFF, strength=5000.0),
+            ),
+        )
+
+    def stack0_pushed_addr_byte1_preserve_rules() -> tuple[FFNRule, ...]:
+        """Preserve byte 1 for pushed local addresses in STACK0.
+
+        With shallow L15 memory recency, STACK0 byte positions can pick the
+        zero sink even though the preceding STACK0 byte 0 already emitted a
+        local address such as ``0xe8``. The next byte is the stack high byte
+        ``0xff``.
+        """
+
+        return (
+            FFNRule.constant_write(
+                name="tail_stack0_pushed_addr_byte1_ff_after_e8",
+                conditions=(
+                    ("IS_BYTE", 5.0),
+                    ("HAS_SE", 5.0),
+                    ("STACK0_BYTE0", 20.0),
+                    ("BYTE_INDEX_0", 5.0),
+                    ("CLEAN_EMBED_LO+8", 30.0),
+                    ("CLEAN_EMBED_HI+14", 30.0),
+                    *(
+                        (f"CLEAN_EMBED_LO+{k}", -100.0)
+                        for k in range(16)
+                        if k != 8
+                    ),
+                    *(
+                        (f"CLEAN_EMBED_HI+{k}", -100.0)
+                        for k in range(16)
+                        if k != 14
+                    ),
+                    ("MARK_AX", -10000.0),
+                    ("MARK_PC", -10000.0),
+                    ("MARK_SP", -10000.0),
+                    ("MARK_BP", -10000.0),
+                    ("MARK_STACK0", -10000.0),
+                    ("MARK_MEM", -10000.0),
+                ),
+                threshold=85.0,
+                writes=byte_writes(0xFF, strength=5000.0),
+            ),
+        )
+
+    def stack0_store_nonzero_pair_rules() -> tuple[FFNRule, ...]:
+        """Late STACK0 store correction for nonzero ALU byte pairs.
+
+        Store steps can leave the STACK0 marker carrying SP byte-0 residue
+        even though the current ALU bands still contain the stored byte. Limit
+        this correction to CMP[3] store rows and byte values with nonzero low
+        and high nibbles; zero-nibble cases need a stronger disambiguator
+        because ALU zero pollution is also present on these rows.
+        """
+
+        base_conditions = (
+            ("MARK_STACK0", 1.0),
+            ("HAS_SE", 1.0),
+            ("CMP+3", 0.5),
+            ("MEM_STORE", 1.0),
+            ("IS_BYTE", -100.0),
+            ("MARK_AX", -100.0),
+            ("MARK_PC", -100.0),
+            ("MARK_SP", -100.0),
+            ("MARK_BP", -100.0),
+            ("MARK_MEM", -100.0),
+        )
+        rules = []
+        for lo in range(1, 16):
+            for hi in range(1, 16):
+                value = lo | (hi << 4)
+                rules.append(
+                    FFNRule.constant_write(
+                        name=f"tail_stack0_store_byte_{value:02x}",
+                        conditions=base_conditions + (
+                            (f"ALU_LO+{lo}", 1.0),
+                            (f"ALU_HI+{hi}", 1.0),
+                        ),
+                        threshold=5.5,
+                        writes=byte_writes(value, strength=1000.0),
+                    )
+                )
+        return tuple(rules)
+
+    def stack0_pop_loaded_output_rules() -> tuple[FFNRule, ...]:
+        """Let strong L15 STACK0 memory loads beat stale pop-marker cleanup."""
+
+        base_conditions = (
+            ("MARK_STACK0", 1.0),
+            ("HAS_SE", 1.0),
+            ("CMP+3", 0.5),
+            ("MEM_STORE", -100.0),
+            ("IS_BYTE", -100.0),
+            ("MARK_AX", -1000000.0),
+            ("MARK_PC", -100.0),
+            ("MARK_SP", -100.0),
+            ("MARK_BP", -100.0),
+            ("MARK_MEM", -100.0),
+            ("OP_EQ", -1000000.0),
+            ("OP_NE", -1000000.0),
+            ("OP_LT", -1000000.0),
+            ("OP_GT", -1000000.0),
+            ("OP_LE", -1000000.0),
+            ("OP_GE", -1000000.0),
+        )
+        rules = []
+        for lo in range(16):
+            for hi in range(16):
+                if lo == 0 and hi == 0:
+                    continue
+                value = lo | (hi << 4)
+                rules.append(
+                    FFNRule.gated_write(
+                        name=f"tail_stack0_pop_loaded_byte_{value:02x}",
+                        conditions=base_conditions + (
+                            (f"OUTPUT_LO+{lo}", 0.1),
+                            (f"OUTPUT_HI+{hi}", 0.1),
+                        ),
+                        threshold=10.5,
+                        gate="MARK_STACK0",
+                        writes=byte_writes(value, strength=500.0),
+                    )
+                )
+        return tuple(rules)
+
+    def stack0_store_top_e0_output_rules() -> tuple[FFNRule, ...]:
+        """Restore nonzero store-top values when SP points at the stored cell."""
+
+        base_conditions = (
+            ("MARK_STACK0", 5.0),
+            ("HAS_SE", 1.0),
+            ("CMP+3", 0.5),
+            ("MEM_STORE", 1.0),
+            ("EMBED_LO+0", 10.0),
+            ("EMBED_HI+14", 1.0),
+            ("IS_BYTE", -1000000.0),
+            ("MARK_AX", -1000000.0),
+            ("MARK_PC", -1000000.0),
+            ("MARK_SP", -1000000.0),
+            ("MARK_BP", -1000000.0),
+            ("MARK_MEM", -1000000.0),
+        )
+        rules = []
+        for lo in range(16):
+            for hi in range(16):
+                if lo == 0 and hi == 0:
+                    continue
+                value = lo | (hi << 4)
+                if value == 0xE0:
+                    continue
+                rules.append(
+                    FFNRule.gated_write(
+                        name=f"tail_stack0_store_top_e0_byte_{value:02x}",
+                        conditions=base_conditions + (
+                            (f"ALU_LO+{lo}", 1.0),
+                            (f"ALU_HI+{hi}", 1.0),
+                            (f"OUTPUT_LO+{lo}", 0.001),
+                            (f"OUTPUT_HI+{hi}", 0.001),
+                        ),
+                        threshold=25.0,
+                        gate="MARK_STACK0",
+                        writes=byte_writes(value, strength=2000.0),
+                    )
+                )
+        return tuple(rules)
+
+    def stack0_store_loaded_output_rules() -> tuple[FFNRule, ...]:
+        """Let strong L15 store/pop STACK0 memory loads beat stale cleanup.
+
+        SI/SC pops the address and exposes memory[post-pop SP] as the next
+        STACK0.  L10/L14 can still leave the just-stored AX byte in OUTPUT,
+        and the stale cleanup rules above zero that residue.  When L15 has
+        actually resolved a historical nonzero stack value, its OUTPUT signal
+        is much larger than the current-AX residue, so restore it here.
+        """
+
+        base_conditions = (
+            ("HAS_SE", 1.0),
+            ("CMP+3", 0.5),
+            ("MEM_STORE", 1.0),
+            ("IS_BYTE", -100.0),
+            ("MARK_AX", -1000000.0),
+            ("MARK_PC", -1000000.0),
+            ("MARK_SP", -1000000.0),
+            ("MARK_BP", -1000000.0),
+            ("MARK_MEM", -1000000.0),
+        )
+        rules = []
+        for lo in range(16):
+            for hi in range(16):
+                if lo == 0 and hi == 0:
+                    continue
+                value = lo | (hi << 4)
+                rules.append(
+                    FFNRule.gated_write(
+                        name=f"tail_stack0_store_loaded_byte_{value:02x}",
+                        conditions=base_conditions + (
+                            (f"OUTPUT_LO+{lo}", 1.0),
+                            (f"OUTPUT_HI+{hi}", 1.0),
+                        ),
+                        threshold=25.0,
+                        gate="MARK_STACK0",
+                        writes=byte_writes(value, strength=5000.0),
                     )
                 )
         return tuple(rules)
@@ -1226,7 +1811,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         """
 
         marker_blockers = (
-            ("MARK_AX", -10000.0),
+            ("MARK_AX", -1000000.0),
             ("MARK_PC", -10000.0),
             ("MARK_SP", -10000.0),
             ("MARK_BP", -10000.0),
@@ -1285,6 +1870,110 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 )
         return tuple(rules)
 
+    def ax_add_no_carry_zero_rules() -> tuple[FFNRule, ...]:
+        """Clear ADD byte 1 when both operand high bytes and carry are zero."""
+
+        marker_blockers = (
+            ("MARK_AX", -1000000.0),
+            ("MARK_PC", -10000.0),
+            ("MARK_SP", -20000000.0),
+            ("MARK_BP", -10000.0),
+            ("MARK_STACK0", -20000000.0),
+            ("MARK_MEM", -10000.0),
+            ("H1+2", -1000000.0),
+            ("H1+3", -1000000.0),
+            ("H1+4", -1000000.0),
+        )
+        non_add_blockers = (
+            ("OP_IMM", -1000000.0),
+            ("OP_EQ", -1000000.0),
+            ("OP_NE", -1000000.0),
+            ("OP_LT", -1000000.0),
+            ("OP_GT", -1000000.0),
+            ("OP_LE", -1000000.0),
+            ("OP_GE", -1000000.0),
+            ("OP_SI", -1000.0),
+            ("OP_SC", -1000.0),
+            ("OP_LI", -1000.0),
+            ("OP_LC", -1000.0),
+            ("OP_ENT", -1000000.0),
+            ("MEM_STORE", -1000.0),
+        )
+        return (
+            FFNRule.constant_write(
+                name="tail_ax_add_no_carry_byte1_00",
+                conditions=(
+                    ("IS_BYTE", 5.0),
+                    ("HAS_SE", 5.0),
+                    ("H1+1", 20.0),
+                    ("BYTE_INDEX_0", 5.0),
+                    ("TEMP+8", 100.0),
+                    ("CARRY+1", -10000.0),
+                    ("ALU_LO+0", 10.0),
+                    ("ALU_HI+0", 20.0),
+                    ("AX_CARRY_HI+0", 20.0),
+                ) + tuple(
+                    (f"ALU_LO+{other}", -50.0)
+                    for other in range(1, 16)
+                ) + tuple(
+                    (f"AX_CARRY_LO+{other}", -2000.0)
+                    for other in range(1, 16)
+                ) + marker_blockers + non_add_blockers,
+                threshold=300.0,
+                writes=byte_writes(0x00, strength=5000.0),
+            ),
+        )
+
+    def ax_add_byte1_high_zero_rules() -> tuple[FFNRule, ...]:
+        """Assert high nibble zero for low 16-bit ADD byte-1 rows.
+
+        The ADD byte-1 low nibble can be correct while stale cleanup residue
+        leaves OUTPUT_HI[1..15] above OUTPUT_HI[0]. Limit this to rows where
+        both operand byte high nibbles are zero; wider byte-1 sums need a
+        separate carry-aware high-nibble rule.
+        """
+
+        marker_blockers = (
+            ("MARK_AX", -1000000.0),
+            ("MARK_PC", -10000.0),
+            ("MARK_SP", -10000.0),
+            ("MARK_BP", -10000.0),
+            ("MARK_STACK0", -10000.0),
+            ("MARK_MEM", -10000.0),
+        )
+        non_add_blockers = (
+            ("CARRY+2", -1000.0),
+            ("TEMP+9", -1000.0),
+            ("OP_EQ", -1000000.0),
+            ("OP_NE", -1000000.0),
+            ("OP_LT", -1000000.0),
+            ("OP_GT", -1000000.0),
+            ("OP_LE", -1000000.0),
+            ("OP_GE", -1000000.0),
+            ("OP_SI", -1000.0),
+            ("OP_SC", -1000.0),
+            ("OP_LI", -1000.0),
+            ("OP_LC", -1000.0),
+        )
+        writes = [("OUTPUT_HI+0", 5000.0)]
+        writes.extend((f"OUTPUT_HI+{other}", -5000.0) for other in range(1, 16))
+        return (
+            FFNRule.constant_write(
+                name="tail_ax_add_byte1_hi_zero",
+                conditions=(
+                    ("IS_BYTE", 5.0),
+                    ("HAS_SE", 5.0),
+                    ("H1+1", 20.0),
+                    ("BYTE_INDEX_0", 5.0),
+                    ("TEMP+8", 100.0),
+                    ("ALU_HI+0", 20.0),
+                    ("AX_CARRY_HI+0", 20.0),
+                ) + marker_blockers + non_add_blockers,
+                threshold=250.0,
+                writes=tuple(writes),
+            ),
+        )
+
     def wide_mul_byte1_preserve_rules() -> tuple[FFNRule, ...]:
         """Keep the staged MUL byte-1 value authoritative through the tail.
 
@@ -1295,43 +1984,138 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         nibble.
         """
 
+        non_mul_block = -1_000_000_000_000_000_000_000_000_000_000.0
+        non_mul_blockers = (
+            ("OP_ADD", non_mul_block),
+            ("OP_SUB", non_mul_block),
+            ("OP_DIV", non_mul_block),
+            ("OP_MOD", non_mul_block),
+            ("OP_SHL", non_mul_block),
+            ("OP_SHR", non_mul_block),
+            ("OP_AND", non_mul_block),
+            ("OP_OR", non_mul_block),
+            ("OP_XOR", non_mul_block),
+        )
         rules = []
-        for low_nibble in range(16):
-            rules.append(
-                FFNRule.constant_write(
-                    name=f"tail_wide_mul_byte1_preserve_{low_nibble:01x}",
-                    conditions=ax_byte0 + (
-                        ("TEMP+10", 1.0),
-                        ("OP_EQ", -1000.0),
-                        ("OP_NE", -1000.0),
-                        ("OP_LT", -1000.0),
-                        ("OP_GT", -1000.0),
-                        ("OP_LE", -1000.0),
-                        ("OP_GE", -1000.0),
-                        (f"OUTPUT_LO+{low_nibble}", 0.01),
-                        ("OUTPUT_HI+0", 0.01),
-                    ),
-                    threshold=4.65,
-                    writes=byte_writes(low_nibble, strength=5000.0),
+        for high_nibble in range(16):
+            for low_nibble in range(16):
+                byte_value = (high_nibble << 4) | low_nibble
+                name = (
+                    f"tail_wide_mul_byte1_preserve_{low_nibble:01x}"
+                    if high_nibble == 0
+                    else f"tail_wide_mul_byte1_preserve_{high_nibble:01x}{low_nibble:01x}"
                 )
-            )
+                temp_block = non_mul_block if high_nibble == 0 else -1_000_000_000.0
+                add_temp_block = non_mul_block if high_nibble == 0 else -1_000_000_000.0
+                sub_temp_block = non_mul_block
+                has_weight = (
+                    3_000_000_000_000_000.0
+                    if high_nibble == 0
+                    else 30_000_000_000_000.0
+                )
+                output_weight = (
+                    100_000_000.0
+                    if high_nibble == 0
+                    else 1_000_000_000.0
+                )
+                threshold = (
+                    3_000_005_000_000_000.0
+                    if high_nibble == 0
+                    else 30_030_000_000_000.0
+                )
+                span_blockers = (
+                    ("H1+2", -100_000_000_000_000_000.0),
+                    ("H1+3", -100_000_000_000_000_000.0),
+                    ("H1+4", -100_000_000_000_000_000.0),
+                )
+                rules.append(
+                    FFNRule.gated_write(
+                        name=name,
+                        conditions=ax_byte0 + (
+                            ("HAS_SE", has_weight),
+                            ("TEMP+10", 1_000_000_000.0),
+                            ("OP_EQ", -1000.0),
+                            ("OP_NE", -1000.0),
+                            ("OP_LT", -1000.0),
+                            ("OP_GT", -1000.0),
+                            ("OP_LE", -1000.0),
+                            ("OP_GE", -1000.0),
+                            ("OP_JSR", -1_000_000_000_000.0),
+                            ("OP_ENT", -1_000_000_000_000.0),
+                            ("OP_LEV", -1_000_000_000_000.0),
+                            (f"OUTPUT_LO+{low_nibble}", output_weight),
+                            (f"OUTPUT_HI+{high_nibble}", output_weight),
+                            ("TEMP+4", temp_block),
+                            ("TEMP+5", temp_block),
+                            ("TEMP+6", temp_block),
+                            ("TEMP+8", add_temp_block),
+                            ("TEMP+9", sub_temp_block),
+                        ) + span_blockers + non_mul_blockers,
+                        threshold=threshold,
+                        gate="BYTE_INDEX_0",
+                        writes=byte_writes(byte_value, strength=10_000_000.0),
+                    )
+                )
         return tuple(rules)
 
     ax_byte0 = (
         ("IS_BYTE", 1.0),
         ("H1+1", 1.0),
+        ("H1+2", -1_000_000_000_000.0),
+        ("H1+3", -1_000_000_000_000.0),
+        ("H1+4", -1_000_000_000_000.0),
         ("BYTE_INDEX_0", 1.0),
-        ("MARK_AX", -200.0),
+        ("BYTE_INDEX_1", -1_000_000_000.0),
+        ("BYTE_INDEX_2", -1_000_000_000.0),
+        ("BYTE_INDEX_3", -1_000_000_000.0),
+        ("MARK_AX", -1000000.0),
+        ("MARK_PC", -1000000.0),
+        ("MARK_SP", -1000000.0),
+        ("MARK_BP", -1000000.0),
+        ("MARK_STACK0", -1000000.0),
+        ("MARK_MEM", -1000000.0),
+        ("OP_LEA", -1000.0),
+        ("OP_JMP", -1000000.0),
+        ("OP_ADJ", -1000.0),
+        ("OP_ENT", -1000.0),
     )
     si_ax_byte0 = (
         ("IS_BYTE", 1.0),
         ("H1+1", 20.0),
         ("BYTE_INDEX_0", 20.0),
+        ("BYTE_INDEX_1", -1_000_000_000_000_000.0),
+        ("BYTE_INDEX_2", -1_000_000_000_000_000.0),
+        ("BYTE_INDEX_3", -1_000_000_000_000_000.0),
         ("MARK_AX", -200.0),
         ("OP_SI", 20.0),
+        ("MEM_STORE", 20.0),
     )
 
-    return (
+    def pc_byte_span_blocked(rules: tuple[FFNRule, ...]) -> tuple[FFNRule, ...]:
+        """Keep late tail fixes from rewriting PC byte predictions."""
+
+        blocker = ConditionTerm(DimRef.parse("H1+0"), -1_000_000.0)
+        blocked = []
+        for rule in rules:
+            if rule.name == "tail_clear_output_after_byte3":
+                blocked.append(rule)
+            else:
+                blocked.append(replace(rule, conditions=rule.conditions + (blocker,)))
+        return tuple(blocked)
+
+    def step_end_transition_blocked(rules: tuple[FFNRule, ...]) -> tuple[FFNRule, ...]:
+        """Keep byte-tail repairs from competing with STEP_END marker emission."""
+
+        blocker = ConditionTerm(DimRef.parse("NEXT_SE"), -1_000_000.0)
+        blocked = []
+        for rule in rules:
+            if rule.name == "tail_clear_output_before_step_end":
+                blocked.append(rule)
+            else:
+                blocked.append(replace(rule, conditions=rule.conditions + (blocker,)))
+        return tuple(blocked)
+
+    rules = (
         # Binary-pop ops consume the top stack cell. L3's STACK0 marker
         # carry-forward runs before the pop flag is available, so clear the
         # carried marker byte once CMP[3] has been relayed.
@@ -1341,7 +2125,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
                 ("CMP+3", 0.5),
+                ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
+                ("MARK_PC", -100.0),
+                ("MARK_SP", -100.0),
+                ("MARK_BP", -100.0),
+                ("MARK_MEM", -100.0),
+                ("MEM_STORE", -100.0),
                 ("OP_EQ", -1000000.0),
                 ("OP_NE", -1000000.0),
                 ("OP_LT", -1000000.0),
@@ -1352,26 +2142,134 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=2.5,
             writes=byte_writes(0x00, strength=150.0),
         ),
-        # At the final SP byte position, byte-output residue can beat the
-        # following REG_BP marker. Clear byte logits for binary-pop SP byte 3.
+        # When a binary op pops the value at SP=d8, the next stack cell is the
+        # saved local address at e8. The generic pop-marker zero rule above
+        # clears stale carried STACK0 bytes; this narrower rule restores the
+        # revealed address needed by update/store expressions.
         FFNRule.constant_write(
-            name="tail_sp_pop_byte3_marker_clear",
+            name="tail_stack0_pop_reveals_saved_addr_e8",
+            conditions=(
+                ("MARK_STACK0", 1.0),
+                ("HAS_SE", 1.0),
+                ("CMP+3", 25.0),
+                ("ADDR_B0_LO+8", 2.0),
+                ("ADDR_B0_HI+13", 2.0),
+                ("ADDR_B0_LO+0", -5.0),
+                ("MEM_STORE", -100.0),
+                ("IS_BYTE", -100.0),
+                ("MARK_AX", -1000000.0),
+                ("MARK_PC", -100.0),
+                ("MARK_SP", -100.0),
+                ("MARK_BP", -100.0),
+                ("MARK_MEM", -100.0),
+            ),
+            threshold=100.0,
+            writes=byte_writes(0xE8, strength=500.0),
+        ),
+        # Store pops only make the stored AX value the new STACK0 when the
+        # store address equals the post-pop SP. For local stores such as
+        # BP-8 with a larger frame, the store address remains above the new
+        # SP; the STACK0 marker should therefore be zero, not the stored AX.
+        FFNRule.constant_write(
+            name="tail_stack0_store_non_top_zero",
+            conditions=(
+                ("MARK_STACK0", 1.0),
+                ("HAS_SE", 1.0),
+                ("CMP+3", 10.0),
+                ("MEM_STORE", 20.0),
+                ("EMBED_LO+0", -20.0),
+                ("EMBED_LO+8", 1.0),
+                ("EMBED_HI+14", 1.0),
+                ("ADDR_B0_LO+8", 1.0),
+                ("ADDR_B0_HI+13", 1.0),
+                ("ADDR_B0_HI+14", -10.0),
+                ("IS_BYTE", -100.0),
+                ("MARK_AX", -1000000.0),
+                ("MARK_PC", -100.0),
+                ("MARK_SP", -100.0),
+                ("MARK_BP", -100.0),
+                ("MARK_MEM", -100.0),
+            ),
+            threshold=50.0,
+            writes=byte_writes(0x00, strength=1000.0),
+        ),
+        FFNRule.constant_write(
+            name="tail_stack0_store_non_top_zero_e8_from_e0",
+            conditions=(
+                ("MARK_STACK0", 100.0),
+                ("HAS_SE", 1.0),
+                ("CMP+3", 10.0),
+                ("MEM_STORE", 200.0),
+                ("EMBED_LO+0", -100.0),
+                ("EMBED_LO+8", 1.0),
+                ("EMBED_HI+14", 1.0),
+                ("ADDR_B0_LO+0", 1.0),
+                ("ADDR_B0_HI+14", 1.0),
+                ("ADDR_B0_LO+8", -20.0),
+                ("IS_BYTE", -1000.0),
+                ("MARK_AX", -1000000.0),
+                ("MARK_PC", -1000.0),
+                ("MARK_SP", -1000.0),
+                ("MARK_BP", -1000.0),
+                ("MARK_MEM", -1000.0),
+            ),
+            threshold=240.0,
+            writes=byte_writes(0x00, strength=1000.0),
+        ),
+        FFNRule.constant_write(
+            name="tail_stack0_store_non_top_zero_e0",
+            conditions=(
+                ("MARK_STACK0", 1.0),
+                ("HAS_SE", 1.0),
+                ("CMP+3", 0.5),
+                ("MEM_STORE", 1.0),
+                ("EMBED_LO+0", 1.0),
+                ("EMBED_HI+14", 1.0),
+                ("IS_BYTE", -100.0),
+                ("MARK_AX", -1000000.0),
+                ("MARK_PC", -100.0),
+                ("MARK_SP", -100.0),
+                ("MARK_BP", -100.0),
+                ("MARK_MEM", -100.0),
+            ),
+            threshold=5.8,
+            writes=byte_writes(0x00, strength=1000.0),
+        ),
+        # At the final SP byte position, byte-output residue can beat the
+        # stack-base high byte. Assert the zero byte for binary-pop SP byte 3.
+        FFNRule.gated_write(
+            name="tail_sp_pop_byte3_zero",
             conditions=(
                 ("IS_BYTE", 5.0),
                 ("HAS_SE", 5.0),
                 ("H1+2", 20.0),
-                ("BYTE_INDEX_3", 5.0),
+                ("H1+1", -1_000_000_000_000_000_000_000_000_000_000.0),
+                ("BYTE_INDEX_0", -10000.0),
+                ("BYTE_INDEX_1", -10000.0),
+                ("BYTE_INDEX_3", -10000.0),
                 ("CMP+3", 1.0),
-                ("MARK_SP", -10000.0),
-                ("MARK_AX", -10000.0),
-                ("MARK_PC", -10000.0),
-                ("MARK_BP", -10000.0),
-                ("MARK_STACK0", -10000.0),
-                ("MARK_MEM", -10000.0),
+                ("OUTPUT_LO+0", 100.0),
+                ("MARK_SP", -100000000.0),
+                ("MARK_AX", -100000000.0),
+                ("MARK_PC", -100000000.0),
+                ("MARK_BP", -100000000.0),
+                ("MARK_STACK0", -100000000.0),
+                ("MARK_MEM", -100000000.0),
+                ("STACK0_BYTE0", -10000.0),
+                ("STACK0_BYTE1", -10000.0),
+                ("STACK0_BYTE2", -10000.0),
+                ("STACK0_BYTE3", -10000.0),
             ),
-            threshold=38.0,
-            writes=clear_byte_output_writes(strength=1000.0),
+            threshold=180.0,
+            gate="BYTE_INDEX_2",
+            writes=byte_writes(0x00, strength=10000.0),
         ),
+        *sp_pop_marker_increment_rules(),
+        *sp_pop_byte1_preserve_rules(),
+        *stack0_pushed_addr_byte1_preserve_rules(),
+        *stack0_pop_loaded_output_rules(),
+        *stack0_store_loaded_output_rules(),
+        *stack0_store_top_e0_output_rules(),
         # Non-memory binary pops should emit a zero MEM row. Store/load ops
         # have dedicated memory paths and block this cleanup.
         FFNRule.constant_write(
@@ -1380,7 +2278,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
                 ("CMP+3", 0.5),
+                ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
+                ("MARK_PC", -100.0),
+                ("MARK_SP", -100.0),
+                ("MARK_BP", -100.0),
+                ("MARK_STACK0", -100.0),
                 ("OP_EQ", -1000000.0),
                 ("OP_NE", -1000000.0),
                 ("OP_LT", -1000000.0),
@@ -1391,6 +2294,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_SC", -100.0),
                 ("OP_LI", -100.0),
                 ("OP_LC", -100.0),
+                ("MEM_STORE", -100.0),
             ),
             threshold=2.5,
             writes=byte_writes(0x00, strength=500.0),
@@ -1398,7 +2302,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # BP is stable across ordinary binary ops. The L10 BP passthrough
         # carries byte 2 as a weak 0x01 signal; reinforce it when no frame op
         # is rewriting BP.
-        FFNRule.constant_write(
+        FFNRule.gated_write(
             name="tail_bp_byte2_preserve_01",
             conditions=(
                 ("IS_BYTE", 1.0),
@@ -1407,6 +2311,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("H1+1", -100.0),
                 ("H1+2", -100.0),
                 ("BYTE_INDEX_1", 1.0),
+                ("BYTE_INDEX_0", -1_000_000.0),
+                ("BYTE_INDEX_2", -1_000_000.0),
+                ("BYTE_INDEX_3", -1_000_000.0),
                 ("OUTPUT_LO+1", 0.1),
                 ("OUTPUT_LO+0", -0.2),
                 ("OUTPUT_HI+0", 0.1),
@@ -1417,6 +2324,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_STACK0", -100.0),
                 ("MARK_MEM", -100.0),
                 ("OP_ENT", -100.0),
+                ("OP_LEA", -1000.0),
                 ("OP_LEV", -100.0),
                 ("OP_EQ", -1000.0),
                 ("OP_NE", -1000.0),
@@ -1426,20 +2334,43 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_GE", -1000.0),
             ),
             threshold=22.0,
+            gate="H1+3",
             writes=byte_writes(0x01, strength=500.0),
         ),
+        *ax_add_no_carry_zero_rules(),
+        *ax_add_byte1_high_zero_rules(),
         *wide_mul_byte1_preserve_rules(),
+        FFNRule.gated_write(
+            name="tail_ax_add_byte1_carry_high2_03",
+            conditions=ax_byte0 + (
+                ("BYTE_INDEX_1", -1000.0),
+                ("BYTE_INDEX_2", -1000.0),
+                ("BYTE_INDEX_3", -1000.0),
+                ("TEMP+8", 10.0),
+                ("TEMP+9", -1000.0),
+                ("CARRY+1", 1.0),
+                ("CARRY+2", -1000.0),
+                ("FETCH_HI+1", 0.1),
+                ("OUTPUT_LO+3", 0.001),
+                ("OUTPUT_LO+6", -10.0),
+                ("OUTPUT_LO+7", -10.0),
+                ("OP_IMM", -1000.0),
+            ),
+            threshold=1000.0,
+            gate="CARRY+1",
+            writes=byte_writes(0x03, strength=5000.0),
+        ),
         # SHL-by-8 loses byte 1 to the same tail, but its signature is a huge
         # OUTPUT_LO[1] plus carry residue rather than MUL's OUTPUT_LO[2].
-        FFNRule.constant_write(
+        FFNRule.gated_write(
             name="tail_wide_shl_byte1_01",
             conditions=ax_byte0 + (
+                ("OP_SHL", 100.0),
                 ("EMBED_LO+0", 1.0),
                 ("EMBED_HI+0", 1.0),
-                ("CARRY+3", 0.01),
-                ("OUTPUT_LO+1", 0.001),
             ),
-            threshold=7.5,
+            threshold=90.0,
+            gate="CARRY+3",
             writes=byte_writes(0x01),
         ),
         # SI preserves AX while writing memory. The dependency-expanded tail
@@ -1447,7 +2378,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # prepared the right 16-bit value. OP_SI is relayed to AX byte
         # positions by L7; the HI-nibble comparison distinguishes a real
         # nonzero stored high byte from the common zero-high-byte store cases.
-        FFNRule.constant_write(
+        FFNRule.gated_write(
             name="tail_si_ax_byte1_12",
             conditions=si_ax_byte0 + (
                 ("OP_EQ", -1000.0),
@@ -1460,10 +2391,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OUTPUT_HI+1", 0.5),
                 ("OUTPUT_HI+0", -0.5),
             ),
-            threshold=141.0,
+            threshold=161.0,
+            gate="MEM_STORE",
             writes=byte_writes(0x12, strength=300.0),
         ),
-        FFNRule.constant_write(
+        FFNRule.gated_write(
             name="tail_si_ax_byte1_00",
             conditions=si_ax_byte0 + (
                 ("OP_EQ", -1000.0),
@@ -1476,14 +2408,15 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OUTPUT_HI+0", 0.5),
                 ("OUTPUT_HI+1", -0.5),
             ),
-            threshold=141.5,
+            threshold=161.5,
+            gate="MEM_STORE",
             writes=byte_writes(0x00, strength=300.0),
         ),
         # SUB 0x0100-1 carries borrow residue in CARRY[2]/[3] and must clear
         # byte 1 to zero; the old tail currently leaves 0x01 there. Use
         # CARRY[2] instead of CARRY[3] so wide MUL/SHL carry residue does not
         # accidentally trigger the zeroing rule.
-        FFNRule.constant_write(
+        FFNRule.gated_write(
             name="tail_sub_borrow_byte1_00",
             conditions=ax_byte0 + (
                 ("MARK_AX", -1000.0),
@@ -1492,11 +2425,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("TEMP+9", 100.0),
                 ("CARRY+2", 100.0),
                 ("ALU_LO+1", 1.0),
-                ("OUTPUT_LO+1", -100.0),
-                ("OUTPUT_LO+0", 10.0),
-                ("OUTPUT_HI+0", 1.0),
+                ("OUTPUT_LO+1", -5.0),
+                ("OUTPUT_LO+3", -5.0),
+                ("OUTPUT_LO+5", -5.0),
+                ("OUTPUT_LO+6", -5.0),
             ),
-            threshold=1000.0,
+            threshold=250.0,
+            gate="CARRY+2",
             writes=byte_writes(0x00),
         ),
         # 16-bit AND's high byte must zero; CMP/TEMP distinguish AND from
@@ -1517,7 +2452,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # OR/XOR byte 1 should remain 0x0f. The late tail inflates it to
         # 0x1e; TEMP[4] distinguishes AND and is used here as a blocker so
         # the AND-zeroing rule above remains authoritative for AND.
-        FFNRule.constant_write(
+        FFNRule.gated_write(
             name="tail_or_xor_byte1_0f",
             conditions=ax_byte0 + (
                 ("TEMP+3", 1.0),
@@ -1526,36 +2461,75 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+14", 0.001),
             ),
             threshold=5.5,
+            gate="BYTE_INDEX_0",
             writes=byte_writes(0x0F),
         ),
         # SHR by 8 also needs byte 1 cleared after the marker correction emits
         # byte 0 as 0x01; TEMP[7] is the reliable non-carry/SHR signature at
         # byte positions.
-        FFNRule.constant_write(
+        FFNRule.gated_write(
             name="tail_shr_byte1_00",
             conditions=ax_byte0 + (
                 ("TEMP+7", 1.0),
                 ("OUTPUT_LO+1", 0.001),
             ),
-            threshold=3.5,
+            threshold=3.9,
+            gate="TEMP+7",
             writes=byte_writes(0x00),
         ),
         # SHR by 8 currently computes byte 0 as 0x06 at the AX marker. OP_SHR
         # is still visible at the marker, so correct the marker prediction
         # before byte generation proceeds.
-        FFNRule.constant_write(
+        FFNRule.gated_write(
             name="tail_shr_marker_byte0_01",
             conditions=(
                 ("MARK_AX", 1.0),
+                ("MARK_PC", -10000.0),
+                ("MARK_SP", -10000.0),
+                ("MARK_BP", -10000.0),
+                ("MARK_STACK0", -10000.0),
+                ("MARK_MEM", -10000.0),
                 ("IS_BYTE", -100.0),
                 ("H1+1", 1.0),
                 ("TEMP+7", 1.0),
-                ("OP_SHR", 0.2),
+                ("OP_SHR", 100.0),
                 ("OP_IMM", -100.0),
-                ("OUTPUT_LO+6", 0.5),
+                ("OUTPUT_LO+6", 0.1),
             ),
-            threshold=4.5,
+            threshold=102.0,
+            gate="MARK_AX",
             writes=byte_writes(0x01),
+        ),
+        FFNRule.constant_write(
+            name="tail_ax_add_byte1_missing_stack_high_02",
+            conditions=(
+                ("IS_BYTE", 10.0),
+                ("HAS_SE", 10.0),
+                ("H1+1", 20.0),
+                ("BYTE_INDEX_0", 10.0),
+                ("BYTE_INDEX_1", -1000.0),
+                ("TEMP+8", 50.0),
+                ("TEMP+9", -1_000_000_000_000_000_000_000_000_000_000.0),
+                ("CARRY+1", 100.0),
+                ("FETCH_HI+1", 1000.0),
+                ("OUTPUT_LO+1", 0.01),
+                ("OUTPUT_LO+3", -1.0),
+                ("OUTPUT_LO+4", -1.0),
+                ("OUTPUT_LO+5", -1.0),
+                ("OUTPUT_LO+6", -1.0),
+                ("OUTPUT_LO+7", -1.0),
+                ("MARK_AX", -1000000.0),
+                ("MARK_PC", -1000000.0),
+                ("MARK_SP", -1000000.0),
+                ("MARK_BP", -1000000.0),
+                ("MARK_STACK0", -1000000.0),
+                ("MARK_MEM", -1000000.0),
+                ("H1+2", -1000000.0),
+                ("H1+3", -1000000.0),
+                ("H1+4", -1000000.0),
+            ),
+            threshold=1450.0,
+            writes=byte_writes(0x02, strength=5000.0),
         ),
         # Comparison combine still sees amplified CMP residuals in the
         # expanded strict path. These two marker-only corrections restore the
@@ -1575,7 +2549,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_EQ", 1.0),
-                ("CMP+1", -0.5),
+                ("CMP+1", -1.0),
+                ("CMP+2", -1.0),
             ),
             threshold=4.5,
             writes=byte_writes(0x00, strength=1000.0),
@@ -1590,6 +2565,18 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             threshold=7.0,
             writes=byte_writes(0x01, strength=1000.0),
+        ),
+        FFNRule.constant_write(
+            name="tail_cmp_le_eq_prefix_false_00",
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("OP_LE", 1.0),
+                ("CMP+1", 0.1),
+                ("CMP+2", -1.0),
+                ("CMP+3", -1.0),
+            ),
+            threshold=6.0,
+            writes=byte_writes(0x00, strength=1000.0),
         ),
         FFNRule.constant_write(
             name="tail_cmp_lt_false_00",
@@ -1612,7 +2599,67 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=8.0,
             writes=byte_writes(0x00, strength=1000.0),
         ),
+        # Keep this appended after the legacy tail rules so existing generated
+        # unit indexes remain stable. It repairs SP marker d8->e0 when the
+        # staged value exists only in OUTPUT, not in EMBED.
+        FFNRule.gated_write(
+            name="tail_sp_pop_marker_output_d8_to_e0",
+            conditions=(
+                ("CONST", -100000000.0),
+                ("MARK_SP", 100000000.0),
+                ("HAS_SE", 1000.0),
+                ("CMP+3", 100.0),
+                ("OUTPUT_LO+8", 10.0),
+                ("OUTPUT_HI+13", 1.0),
+                ("MARK_AX", -1000.0),
+                ("MARK_PC", -1000.0),
+                ("MARK_BP", -1000.0),
+                ("MARK_STACK0", -1000.0),
+                ("MARK_MEM", -1000.0),
+                ("OP_ENT", -1000000.0),
+                ("OP_LEV", -1000000.0),
+                ("PSH_AT_SP", -1000000.0),
+                ("IS_BYTE", -100.0),
+            ),
+            threshold=1405.0,
+            gate="MARK_SP",
+            writes=byte_writes(0xE0, strength=5000.0),
+        ),
+        FFNRule.gated_write(
+            name="tail_clear_output_after_byte3",
+            conditions=(
+                ("IS_BYTE", 1.0),
+                ("BYTE_INDEX_3", 1.0),
+                ("MARK_AX", -1000.0),
+                ("MARK_PC", -1000.0),
+                ("MARK_SP", -1000.0),
+                ("MARK_BP", -1000.0),
+                ("MARK_STACK0", -1000.0),
+                ("MARK_MEM", -1000.0),
+                ("MEM_VAL_B0", -1000.0),
+            ),
+            threshold=1.5,
+            gate="BYTE_INDEX_3",
+            writes=clear_output_writes(strength=10_000_000_000.0),
+        ),
+        FFNRule.gated_write(
+            name="tail_clear_output_before_step_end",
+            conditions=(
+                ("IS_BYTE", 1.0),
+                ("NEXT_SE", 1.0),
+                ("MARK_AX", -1000.0),
+                ("MARK_PC", -1000.0),
+                ("MARK_SP", -1000.0),
+                ("MARK_BP", -1000.0),
+                ("MARK_STACK0", -1000.0),
+                ("MARK_MEM", -1000.0),
+            ),
+            threshold=1.5,
+            gate="NEXT_SE",
+            writes=clear_output_writes(strength=10_000_000_000.0),
+        ),
     ) + sp_pop_carry_rules()
+    return step_end_transition_blocked(pc_byte_span_blocked(rules))
 
 
 def make_tail_bit32_result_correction_op() -> Operation:
@@ -1630,6 +2677,7 @@ def make_tail_bit32_result_correction_op() -> Operation:
             Primitives.ffn_rule_dim_names(rules),
         )
         Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        _suppress_ffn_on_step_boundary(ffn, dim_map, S)
         block.post_ops.append(ffn)
 
     ir = CompilerIR()
@@ -1639,15 +2687,18 @@ def make_tail_bit32_result_correction_op() -> Operation:
         name="tail_bit32_result_correction",
         phase=17.1,
         reads={
-            "IS_BYTE", "HAS_SE", "H1",
+            "CONST", "IS_BYTE", "HAS_SE", "H1",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
             "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
-            "MARK_MEM", "OP_SHR", "OP_IMM",
+            "MARK_MEM", "NEXT_SE", "OP_SHL", "OP_SHR", "OP_IMM", "OP_JSR",
             "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
             "OP_ENT", "OP_LEV", "OP_SI", "OP_SC", "OP_LI", "OP_LC",
+            "OP_ADD", "OP_SUB", "OP_DIV", "OP_MOD", "OP_AND", "OP_OR",
+            "OP_XOR",
             "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-            "TEMP", "CMP", "CARRY", "ALU_LO", "ALU_HI",
-            "OUTPUT_LO", "OUTPUT_HI",
+            "TEMP", "CMP", "CARRY", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "FETCH_HI",
+            "OUTPUT_LO", "OUTPUT_HI", "MEM_STORE",
+            "ADDR_B0_LO", "ADDR_B0_HI",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
@@ -1735,42 +2786,58 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         # zeroing or scrambling the binary-op result. Threading dim_positions
         # to all 4 post-op classes is the L10 counterpart of the L1 fix in
         # commit 5fc519d (BinaryOpByteZeroingPostOp).
-        block.post_ops.append(
-            BinaryOpByteZeroingPostOp(d_model=d_model, S=S, dim_positions=dim_positions)
+        zeroing = BinaryOpByteZeroingPostOp(
+            d_model=d_model, S=S, dim_positions=dim_positions
         )
-        block.post_ops.append(
-            AddSubBytePropagationPostOp(d_model=d_model, S=S, dim_positions=dim_positions)
-        )
+        _suppress_ffn_on_step_boundary(zeroing, dim_positions, S)
+        block.post_ops.append(zeroing)
         BD = _as_setdim_proxy(dim_positions) if isinstance(dim_positions, dict) else _SetDim
+        addsub = AddSubBytePropagationPostOp(
+            d_model=d_model,
+            S=S,
+            dim_positions=dim_positions,
+        )
+        _strengthen_l10_addsub_wrong_byte_blockers(addsub, BD, S)
+        _suppress_l10_addsub_on_wide_alu(addsub, BD, S)
+        _suppress_ffn_on_step_boundary(addsub, dim_positions, S)
+        block.post_ops.append(addsub)
         carry0 = CarryPropagationPostOp(
             d_model=d_model, S=S, byte_idx=0, cascade=False,
             dim_positions=dim_positions,
         )
+        _strengthen_l10_carry_wrong_byte_blockers(carry0, BD, byte_idx=0, S=S)
         _strengthen_l10_first_carry_delta(carry0, BD)
+        _suppress_ffn_on_step_boundary(carry0, dim_positions, S)
         block.post_ops.append(carry0)
         carry1 = CarryPropagationPostOp(
             d_model=d_model, S=S, byte_idx=1, cascade=True,
             dim_positions=dim_positions,
         )
         _strengthen_l10_carry_wrong_byte_blockers(carry1, BD, byte_idx=1, S=S)
+        _suppress_ffn_on_step_boundary(carry1, dim_positions, S)
         block.post_ops.append(carry1)
         carry2 = CarryPropagationPostOp(
             d_model=d_model, S=S, byte_idx=2, cascade=True,
             dim_positions=dim_positions,
         )
         _strengthen_l10_carry_wrong_byte_blockers(carry2, BD, byte_idx=2, S=S)
+        _suppress_ffn_on_step_boundary(carry2, dim_positions, S)
         block.post_ops.append(carry2)
-        block.post_ops.append(
-            BitwiseBytePropagationPostOp(d_model=d_model, S=S, dim_positions=dim_positions)
+        bitwise = BitwiseBytePropagationPostOp(
+            d_model=d_model, S=S, dim_positions=dim_positions
         )
+        _suppress_ffn_on_step_boundary(bitwise, dim_positions, S)
+        block.post_ops.append(bitwise)
         if alu_mode == "efficient":
             # Pass the model's actual d_model so the underlying PureFFN's
             # Linear input dim matches the residual stream width. Without
             # this, ComparisonCombine builds a Linear(512, 18) which fails
             # forward when d_model != 512 (e.g., pin_io_only=True paths).
-            block.post_ops.append(
-                ComparisonCombine(d_model=d_model, S=S, dim_positions=dim_positions)
+            compare = ComparisonCombine(
+                d_model=d_model, S=S, dim_positions=dim_positions
             )
+            _suppress_ffn_on_step_boundary(compare, dim_positions, S)
+            block.post_ops.append(compare)
         # DIV/MOD post_op (FlattenedDivMod) appended by
         # ``make_l10_alu_divmod_install_op`` (phase=10.8). Both modes use the
         # same flattened composite — its forward is byte-identical to the

@@ -244,7 +244,7 @@ def derive_layout(num_heads: int = 8):
     return layout
 
 
-_CACHE_FORMAT_VERSION = 2
+_CACHE_FORMAT_VERSION = 3
 
 
 def _cache_dir() -> pathlib.Path:
@@ -364,7 +364,12 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
         fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
         os.close(fd)
         tmp_path = pathlib.Path(tmp_name)
-        _torch.save(payload, tmp_path)
+        # The default zip writer has been observed to fail near the end of
+        # this large model payload with a small "unexpected pos" mismatch on
+        # some hosts. The legacy stream format is slower to write but has been
+        # reliable for this cache, and cache reads remain transparent through
+        # torch.load(..., weights_only=False).
+        _torch.save(payload, tmp_path, _use_new_zipfile_serialization=False)
         os.replace(tmp_path, path)
         tmp_path = None  # replaced; nothing to clean up
     except Exception as exc:

@@ -90,6 +90,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 from tests.test_suite_1000 import generate_test_programs
+from tests.declarative_oracle import declarative_oracle_for_program
 from src.compiler import compile_c
 
 
@@ -204,7 +205,7 @@ def _selected_programs(request):
     return selected
 
 
-def _declarative_expected_result(bytecode, data):
+def _declarative_expected_result(bytecode, data, *, suite_expected=None, label="program"):
     """Return the declarative result for this program.
 
     The pure-neural suite should not use an arbitrary max-step cap. For
@@ -212,21 +213,13 @@ def _declarative_expected_result(bytecode, data):
     expected halt horizon and final result. The neural run must match both the
     declaration-derived result and the declaration-derived halt horizon.
     """
-    from neural_vm.unified_compiler.symbolic_program import (
-        SymbolicDeclarativeProgramRunner,
-    )
-
-    state = SymbolicDeclarativeProgramRunner().run(
+    return declarative_oracle_for_program(
         bytecode,
         data,
+        suite_expected=suite_expected,
+        label=label,
         max_steps=None,
-    )
-    return {
-        "output": state.get_output(),
-        "exit_code": state.ax if state.halted else None,
-        "steps": state.steps if state.halted else None,
-        "halted": state.halted,
-    }
+    ).as_dict()
 
 
 @pytest.fixture(scope="session")
@@ -274,21 +267,24 @@ def _pure_neural_1096_results(request):
         for j, (source, expected, _desc) in enumerate(chunk):
             try:
                 bc, data = compile_c(source)
-                decl = _declarative_expected_result(bc, data)
+                decl = _declarative_expected_result(
+                    bc,
+                    data,
+                    suite_expected=expected,
+                    label=chunk_ids[j],
+                )
+                declarative_results.append(decl)
+                if decl.get("error") is not None:
+                    compile_errs[j] = decl["error"]
+                    bytecodes.append([38])  # EXIT placeholder; compile_err overrides.
+                    data_list.append(b"")
+                    expected_steps.append(1 if _BATCH_MAX_STEPS is None else None)
+                    continue
                 bytecodes.append(bc)
                 data_list.append(data)
-                declarative_results.append(decl)
                 expected_steps.append(
                     decl["steps"] if _BATCH_MAX_STEPS is None else None
                 )
-                if not decl["halted"]:
-                    compile_errs[j] = "declarative execution did not halt"
-                elif decl["exit_code"] != (expected & 0xFFFFFFFF):
-                    compile_errs[j] = (
-                        "suite expected disagrees with declarative result: "
-                        f"expected={expected} declarative={decl['exit_code']} "
-                        f"decl_steps={decl['steps']}"
-                    )
             except Exception as e:
                 compile_errs[j] = f"compile/declarative error: {e!r}"
                 bytecodes.append([38])  # EXIT placeholder; compile_err overrides.
@@ -298,6 +294,7 @@ def _pure_neural_1096_results(request):
                     "exit_code": None,
                     "steps": 1,
                     "halted": False,
+                    "error": compile_errs[j],
                 })
                 expected_steps.append(1 if _BATCH_MAX_STEPS is None else None)
         compile_elapsed = time.perf_counter() - t_compile0
@@ -434,7 +431,7 @@ class TestSuite1096PureNeural:
                 "output": None,
                 "exit_code": None,
                 "err": "not in batched results",
-                "declarative": {"exit_code": None, "steps": None},
+                "declarative": {"exit_code": None, "steps": None, "error": None},
                 "suite_expected": expected,
             },
         )

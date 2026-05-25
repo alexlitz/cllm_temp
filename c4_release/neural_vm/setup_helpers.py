@@ -257,6 +257,21 @@ def _set_layer5_fetch(attn, S, BD, HD):
     available as memory entries keyed by address.
     """
     L = 20.0
+    ADDR_L = 20.0
+
+    def set_addr_key_k(base, top_slot_base=35):
+        for kk in range(16):
+            attn.W_k[base + kk, BD.ADDR_KEY + kk] = ADDR_L
+            attn.W_k[base + 16 + kk, BD.ADDR_KEY + 16 + kk] = ADDR_L
+            attn.W_k[base + top_slot_base + kk, BD.ADDR_KEY + 32 + kk] = ADDR_L
+
+    def set_dynamic_top_q(base, top_slot_base=35):
+        for kk in range(16):
+            attn.W_q[base + top_slot_base + kk, BD.ADDR_KEY + 32 + kk] = ADDR_L
+
+    def set_first_step_top0_q(base, top_slot_base=35):
+        attn.W_q[base + top_slot_base, BD.CONST] = ADDR_L
+        attn.W_q[base + top_slot_base, BD.HAS_SE] = -ADDR_L
 
     # Head 0: fetch immediate byte (address = PC+1)
     # Only fires on non-first steps (HAS_SE > 0). For first step, head 3 fetches
@@ -265,17 +280,15 @@ def _set_layer5_fetch(attn, S, BD, HD):
     base = 0 * HD
     # Q: low two nibbles from TEMP (PC+1)
     for k in range(16):
-        attn.W_q[base + k, BD.TEMP + k] = L
-        attn.W_q[base + 16 + k, BD.TEMP + 16 + k] = L
+        attn.W_q[base + k, BD.TEMP + k] = ADDR_L
+        attn.W_q[base + 16 + k, BD.TEMP + 16 + k] = ADDR_L
+    set_dynamic_top_q(base)
     # third address nibble fixed to zero (for <= 255 code addresses),
     # gated to AX marker to avoid global leakage.
     attn.W_q[base + 32, BD.MARK_AX] = L
 
     # K: address nibbles from memory key space
-    for k in range(16):
-        attn.W_k[base + k, BD.ADDR_KEY + k] = L
-        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
-    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+    set_addr_key_k(base)
 
     # Anti-leakage gate: suppress head activity at non-AX positions.
     # Must overwhelm worst-case address match (~+50 from 33 addr dims).
@@ -308,15 +321,13 @@ def _set_layer5_fetch(attn, S, BD, HD):
     base = 1 * HD
     # Q: low two nibbles from EMBED (PC)
     for k in range(16):
-        attn.W_q[base + k, BD.EMBED_LO + k] = L
-        attn.W_q[base + 16 + k, BD.EMBED_HI + k] = L
+        attn.W_q[base + k, BD.EMBED_LO + k] = ADDR_L
+        attn.W_q[base + 16 + k, BD.EMBED_HI + k] = ADDR_L
+    set_dynamic_top_q(base)
     attn.W_q[base + 32, BD.MARK_AX] = L
 
     # K: address nibbles from memory key space
-    for k in range(16):
-        attn.W_k[base + k, BD.ADDR_KEY + k] = L
-        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
-    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+    set_addr_key_k(base)
 
     # Anti-leakage gate: suppress head activity at non-AX positions.
     GATE = 33
@@ -350,18 +361,14 @@ def _set_layer5_fetch(attn, S, BD, HD):
     from .constants import PC_OFFSET
     base = 2 * HD
     # Q: fires at PC marker when NOT HAS_SE, queries for address PC_OFFSET
-    attn.W_q[base, BD.MARK_PC] = L
-    attn.W_q[base, BD.HAS_SE] = -L  # only on first step
     # Q: address PC_OFFSET (e.g., 2: ADDR_KEY_LO[2]=1, ADDR_KEY_HI[0]=1)
-    attn.W_q[base + (PC_OFFSET & 0xF), BD.CONST] = L  # lo nibble
-    attn.W_q[base + 16 + ((PC_OFFSET >> 4) & 0xF), BD.CONST] = L  # hi nibble
+    attn.W_q[base + (PC_OFFSET & 0xF), BD.CONST] = ADDR_L  # lo nibble
+    attn.W_q[base + 16 + ((PC_OFFSET >> 4) & 0xF), BD.CONST] = ADDR_L  # hi nibble
+    attn.W_q[base + 35 + ((PC_OFFSET >> 8) & 0xF), BD.CONST] = ADDR_L  # top nibble
     attn.W_q[base + 32, BD.MARK_PC] = L  # third nibble gate
 
     # K: match ADDR_KEY nibbles (same as head 1)
-    for k in range(16):
-        attn.W_k[base + k, BD.ADDR_KEY + k] = L
-        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
-    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+    set_addr_key_k(base)
 
     # Anti-leakage gate (same as head 1)
     GATE = 33
@@ -403,15 +410,14 @@ def _set_layer5_fetch(attn, S, BD, HD):
     # Q: read dynamic address from FETCH_LO/HI (PC+1 computed by L4 FFN)
     # FETCH is one-hot: only one lo and one hi position are active (~0.73).
     for k in range(16):
-        attn.W_q[base + k, BD.FETCH_LO + k] = L
-        attn.W_q[base + 16 + k, BD.FETCH_HI + k] = L
+        attn.W_q[base + k, BD.FETCH_LO + k] = ADDR_L
+        attn.W_q[base + 16 + k, BD.FETCH_HI + k] = ADDR_L
+    set_dynamic_top_q(base)
+    set_first_step_top0_q(base)
     attn.W_q[base + 32, BD.MARK_PC] = L  # gate for PC marker only
 
     # K: match ADDR_KEY nibbles
-    for k in range(16):
-        attn.W_k[base + k, BD.ADDR_KEY + k] = L
-        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
-    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+    set_addr_key_k(base)
 
     # Anti-leakage gate: suppress at non-PC positions
     GATE = 33
@@ -451,17 +457,13 @@ def _set_layer5_fetch(attn, S, BD, HD):
     # (Cannot relay from Head 2 since attention reads from input, not other heads' outputs.)
     base = 4 * HD
     # Q: fires at AX marker when NOT HAS_SE (first step), queries for address PC_OFFSET
-    attn.W_q[base, BD.MARK_AX] = L
-    attn.W_q[base, BD.HAS_SE] = -L  # only on first step
     # Q: address PC_OFFSET (e.g., 2: ADDR_KEY_LO[2]=1, ADDR_KEY_HI[0]=1)
-    attn.W_q[base + (PC_OFFSET & 0xF), BD.CONST] = L  # lo nibble
-    attn.W_q[base + 16 + ((PC_OFFSET >> 4) & 0xF), BD.CONST] = L  # hi nibble
+    attn.W_q[base + (PC_OFFSET & 0xF), BD.CONST] = ADDR_L  # lo nibble
+    attn.W_q[base + 16 + ((PC_OFFSET >> 4) & 0xF), BD.CONST] = ADDR_L  # hi nibble
+    attn.W_q[base + 35 + ((PC_OFFSET >> 8) & 0xF), BD.CONST] = ADDR_L  # top nibble
     attn.W_q[base + 32, BD.MARK_AX] = L  # third nibble gate
     # K: match ADDR_KEY nibbles (code byte addresses)
-    for k in range(16):
-        attn.W_k[base + k, BD.ADDR_KEY + k] = L
-        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
-    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+    set_addr_key_k(base)
     # Anti-leakage gate: suppress at non-AX positions
     GATE = 33
     attn.W_q[base + GATE, BD.MARK_AX] = 500.0
@@ -489,13 +491,11 @@ def _set_layer5_fetch(attn, S, BD, HD):
     # HAS_SE gate: only fires on non-first steps (Head 2 handles first step).
     base = 5 * HD
     for k in range(16):
-        attn.W_q[base + k, BD.EMBED_LO + k] = L
-        attn.W_q[base + 16 + k, BD.EMBED_HI + k] = L
+        attn.W_q[base + k, BD.EMBED_LO + k] = ADDR_L
+        attn.W_q[base + 16 + k, BD.EMBED_HI + k] = ADDR_L
+    set_dynamic_top_q(base)
     attn.W_q[base + 32, BD.MARK_PC] = L
-    for k in range(16):
-        attn.W_k[base + k, BD.ADDR_KEY + k] = L
-        attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
-    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+    set_addr_key_k(base)
     GATE5 = 33
     attn.W_q[base + GATE5, BD.MARK_PC] = 500.0
     attn.W_q[base + GATE5, BD.CONST] = -500.0
@@ -1127,10 +1127,10 @@ def _set_layer10_stack0_byte_relay(attn, S, BD, HD):
         attn.W_o[BD.ALU_LO + k, base + 1 + k] = 1.0
         attn.W_o[BD.ALU_HI + k, base + 17 + k] = 1.0
 
-    # Head 6: non-mutating STACK0 upper-byte carry. Query at current STACK0
-    # byte K and read the latest previous STACK0 byte K+1, so the output at
-    # byte K predicts byte K+1 autoregressively. PSH/pop/function-call stack
-    # updates have dedicated paths and are suppressed here.
+    # Head 6: STACK0 carry/update. Query at current STACK0 byte K and read the
+    # latest previous STACK0 byte K+1 for non-mutating steps. On STORE rows the
+    # popped SP points at the just-written local, so the extra source-match
+    # slots read the current AX bytes into STACK0 and dominate persistence.
     base = 6 * HD
     attn.W_q[base + 0, BD.PSH_AT_SP] = -300.0
     attn.W_q[base + 0, BD.OP_PSH] = -300.0
@@ -1141,12 +1141,39 @@ def _set_layer10_stack0_byte_relay(attn, S, BD, HD):
     attn.W_q[base + 0, BD.OP_LEV] = -300.0
 
     byte_match = 5.0 * S
+    store_target = 50.0 * S
+    store_gate = 5.0 * S
+    store_cmp = 5.0 * S
+    store_has_se = 5.0 * S
+    store_bias = -55.0 * S
     attn.W_q[base + 4, BD.STACK0_BYTE0] = byte_match
     attn.W_k[base + 4, BD.STACK0_BYTE1] = byte_match
     attn.W_q[base + 5, BD.STACK0_BYTE1] = byte_match
     attn.W_k[base + 5, BD.STACK0_BYTE2] = byte_match
     attn.W_q[base + 6, BD.STACK0_BYTE2] = byte_match
     attn.W_k[base + 6, BD.STACK0_BYTE3] = byte_match
+    for slot in (7, 8, 9, 10, 11):
+        attn.W_q[base + slot, BD.CONST] = store_bias
+        attn.W_q[base + slot, BD.MEM_STORE] = store_gate
+        attn.W_q[base + slot, BD.CMP + 3] = store_cmp
+        attn.W_q[base + slot, BD.HAS_SE] = store_has_se
+    attn.W_q[base + 7, BD.MARK_STACK0] = store_target
+    attn.W_k[base + 7, BD.BYTE_INDEX_0] = byte_match
+    attn.W_q[base + 8, BD.STACK0_BYTE0] = store_target
+    attn.W_k[base + 8, BD.BYTE_INDEX_1] = byte_match
+    attn.W_q[base + 9, BD.STACK0_BYTE1] = store_target
+    attn.W_k[base + 9, BD.BYTE_INDEX_2] = byte_match
+    attn.W_q[base + 10, BD.STACK0_BYTE2] = store_target
+    attn.W_k[base + 10, BD.BYTE_INDEX_3] = byte_match
+
+    for dim in (
+        BD.MARK_STACK0,
+        BD.STACK0_BYTE0,
+        BD.STACK0_BYTE1,
+        BD.STACK0_BYTE2,
+    ):
+        attn.W_q[base + 11, dim] = store_target
+    attn.W_k[base + 11, BD.H1 + AX_IDX] = byte_match
 
     attn.W_q[base + 33, BD.CONST] = -15000.0
     attn.W_q[base + 33, BD.HAS_SE] = 10000.0
@@ -1400,6 +1427,59 @@ def _set_layer14_temp_clear(ffn, S, BD, start_unit=0):
     return unit
 
 
+def _set_layer14_clear_addsub_temp_negative_residue(ffn, S, BD, start_unit=0):
+    """L14 FFN: clamp negative ADD/SUB relay residue before late tail rules.
+
+    ``TEMP[8]`` / ``TEMP[9]`` are positive ADD/SUB byte relays. On unrelated
+    rows they can carry tiny negative attention dust (around 1e-22). The late
+    result tail intentionally uses very large negative blockers on these lanes,
+    so that dust can become a huge false-positive activation. This clamp is
+    sign-selective: positive relays are left unchanged, while negative residue
+    is lifted back to approximately zero.
+    """
+    unit = start_unit
+
+    for temp_offset in (8, 9):
+        ffn.W_up[unit, BD.TEMP + temp_offset] = -S
+        ffn.W_gate[unit, BD.CONST] = 1.0
+        # For small negative x, silu(-S*x) ~= -S*x/2, so 2/S cancels x.
+        ffn.W_down[BD.TEMP + temp_offset, unit] = 2.0 / S
+        unit += 1
+
+    return unit
+
+
+def _set_layer14_add_byte1_high_zero_cleanup(ffn, S, BD, start_unit=0):
+    """L14 FFN: keep ADD byte-1 high nibble at zero before tail repair.
+
+    The base layer-14 FFN can leave large positive OUTPUT_HI[1..15] residue on
+    ADD AX byte-0 rows, where the next emitted token is AX byte 1. The final
+    dependency tail treats that residue as a wide-MUL byte-preserve signature.
+    ADD slice operands here still require byte-1 high nibble zero, so clear the
+    nonzero high-nibble band while leaving the computed low nibble alone.
+    """
+    unit = start_unit
+    AX_I = 1
+
+    ffn.W_up[unit, BD.IS_BYTE] = S
+    ffn.W_up[unit, BD.H1 + AX_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = S
+    ffn.W_up[unit, BD.TEMP + 8] = S
+    ffn.W_up[unit, BD.TEMP + 9] = -S * 10
+    ffn.W_up[unit, BD.BYTE_INDEX_1] = -S * 10
+    ffn.W_up[unit, BD.BYTE_INDEX_2] = -S * 10
+    ffn.W_up[unit, BD.BYTE_INDEX_3] = -S * 10
+    ffn.W_up[unit, BD.MARK_AX] = -S * 100
+    ffn.b_up[unit] = -S * 3.5
+    ffn.W_gate[unit, BD.CONST] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = 50.0 / S
+    for nonzero in range(1, 16):
+        ffn.W_down[BD.OUTPUT_HI + nonzero, unit] = -5000.0 / S
+    unit += 1
+
+    return unit
+
+
 
 def _set_layer14_clear_addr_key_pollution(ffn, S, BD, start_unit=0):
     """L14 FFN: Clear ADDR_KEY pollution at non-MEM, non-marker positions.
@@ -1480,7 +1560,11 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
 
     # Suppression value (prevents firing at MEM and register markers)
     suppress = S * 100
+    PC_I = 0
+    AX_I = 1
+    SP_I = 2
     BP_I = 3  # Index for BP marker in threshold dims
+    MEM_I = 4
 
     # Only boost OUTPUT_LO[0] and OUTPUT_HI[0]
     for k in [0, 16]:  # 0 = OUTPUT_LO[0], 16 = OUTPUT_HI[0]
@@ -1497,13 +1581,22 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
         ffn.W_up[unit, BD.MEM_VAL_B1] = -suppress
         ffn.W_up[unit, BD.MEM_VAL_B2] = -suppress
         ffn.W_up[unit, BD.MEM_VAL_B3] = -suppress
+        ffn.W_up[unit, BD.H1 + MEM_I] = -suppress
+        ffn.W_up[unit, BD.H3 + MEM_I] = -suppress
 
         # Suppress at register markers where OUTPUT is needed
         ffn.W_up[unit, BD.MARK_PC] = -suppress
         ffn.W_up[unit, BD.MARK_AX] = -suppress
         ffn.W_up[unit, BD.MARK_SP] = -suppress
         ffn.W_up[unit, BD.MARK_BP] = -suppress
+        ffn.W_up[unit, BD.MARK_MEM] = -suppress
         ffn.W_up[unit, BD.MARK_STACK0] = -suppress
+        # Register byte rows can also sit inside the broad H4[BP] window.
+        # This cleanup is only for STACK0-like rows; do not let it erase
+        # actual PC/AX/SP byte outputs such as IMM AX byte 1.
+        ffn.W_up[unit, BD.H1 + PC_I] = -suppress
+        ffn.W_up[unit, BD.H1 + AX_I] = -suppress
+        ffn.W_up[unit, BD.H1 + SP_I] = -suppress
         # PSH writes the pushed AX value through the dedicated STACK0 byte
         # path. The old zero-default cleanup is only safe for non-PSH STACK0
         # bytes; otherwise multi-byte addresses like 0x200 lose byte 1.
@@ -1512,7 +1605,12 @@ def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
         # available downstream. L6 relays that group as CMP[3] onto STACK0
         # byte positions; do not force those bytes back to zero.
         ffn.W_up[unit, BD.CMP + 3] = -suppress
-
+        # ADD/SUB byte rows can carry large signed OUTPUT residue after the
+        # byte correction post-ops. The low-nibble zero-default repair is only
+        # for STACK0 cleanup; do not let it zero AX arithmetic byte results.
+        if k == 0:
+            ffn.W_up[unit, BD.TEMP + 8] = -S * 1e20
+            ffn.W_up[unit, BD.TEMP + 9] = -S * 1e20
         # Suppress at BYTE_INDEX_3 positions - byte 3's OUTPUT should predict
         # the NEXT marker (MEM), not force byte value 0.
         ffn.W_up[unit, BD.BYTE_INDEX_3] = -suppress
@@ -1602,6 +1700,13 @@ def _set_bz_bnz_relay(attn, S, BD, HD):
     attn.W_q[base, BD.CONST] = -L * 1.3  # Baseline penalty (stronger than before)
     attn.W_q[base, BD.OP_BZ] = L / 5.0  # OP_BZ=5 → contributes L
     attn.W_q[base, BD.OP_BNZ] = L / 5.0  # OP_BNZ=5 → contributes L
+    # PC byte 0 also needs AX-zero flags so it can predict byte1(target) for
+    # taken branches whose target PC is above 255.
+    branch_pc_byte0_relay = 5
+    attn.W_q[base + branch_pc_byte0_relay, BD.IS_BYTE] = 60.0
+    attn.W_q[base + branch_pc_byte0_relay, BD.H1 + 0] = 60.0
+    attn.W_q[base + branch_pc_byte0_relay, BD.BYTE_INDEX_0] = 60.0
+    attn.W_q[base + branch_pc_byte0_relay, BD.MARK_PC] = -60.0
     # K: fire at AX byte 0 (L1H1[AX]=1 AND L1H0[AX]=0), NOT at AX marker.
     # FIX 2026-05-11: Changed K from MARK_AX → (L1H1+AX_I - L1H0+AX_I) so the
     # relay reads from step (N-1)'s AX byte 0 token (which contains step N's
@@ -1614,6 +1719,8 @@ def _set_bz_bnz_relay(attn, S, BD, HD):
     # Q, allowing leakage. With K[CONST]=L, blocked Q (-15 at non-BZ/BNZ) gives
     # score = -15*50/sqrt(HD), reliably suppressing leak via softmax1.
     attn.W_k[base, BD.CONST] = L
+    attn.W_k[base + branch_pc_byte0_relay, BD.L1H1 + AX_I] = L
+    attn.W_k[base + branch_pc_byte0_relay, BD.L1H0 + AX_I] = -L
 
     # V: copy OP_BZ, OP_BNZ flags (also present at the AX byte 0 row via
     # residual propagation from L5 decode — but only PC marker has them

@@ -28,20 +28,24 @@ def make_layer4_pc_relay_op() -> Operation:
         )
 
     # Dim-ownership claims: L4 attn heads 0 + 1 PC relay.
-    #   Head 0: V slots 1..32 read EMBED_LO/HI → EMBED_LO/HI at AX marker.
-    #   Head 1: V slots 1..32 read EMBED_LO/HI → TEMP[0..31] at AX byte pos.
+    #   Head 0: V slots 1..32 read EMBED_LO/HI → EMBED_LO/HI at AX marker;
+    #           V slots 33..48 read ADDR_KEY top nibble → AX ADDR_KEY top.
+    #   Head 1: V slots 1..32 read EMBED_LO/HI → TEMP[0..31] at AX byte pos;
+    #           V slots 33..48 read ADDR_KEY top nibble → byte ADDR_KEY top.
     _claims = set()
     for k in range(16):
         _claims.add((4, "attn_W_v", f"0_{1 + k}", f"EMBED_LO+{k}"))
         _claims.add((4, "attn_W_v", f"0_{17 + k}", f"EMBED_HI+{k}"))
         _claims.add((4, "attn_W_v", f"1_{1 + k}", f"EMBED_LO+{k}"))
         _claims.add((4, "attn_W_v", f"1_{17 + k}", f"EMBED_HI+{k}"))
+        _claims.add((4, "attn_W_v", f"0_{33 + k}", f"ADDR_KEY+{32 + k}"))
+        _claims.add((4, "attn_W_v", f"1_{33 + k}", f"ADDR_KEY+{32 + k}"))
 
     return Operation(
         name="layer4_pc_relay",
         phase=4,
-        reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI", "CONST"},
-        writes={"EMBED_LO", "EMBED_HI"},  # at AX marker
+        reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI", "ADDR_KEY", "CONST"},
+        writes={"EMBED_LO", "EMBED_HI", "ADDR_KEY"},  # at AX marker/bytes
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -78,10 +82,12 @@ def _layer4_pc_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
             v=(
                 tuple(AP(1 + k, BD.EMBED_LO + k, 1.0) for k in range(16))
                 + tuple(AP(17 + k, BD.EMBED_HI + k, 1.0) for k in range(16))
+                + tuple(AP(33 + k, BD.ADDR_KEY + 32 + k, 1.0) for k in range(16))
             ),
             o=(
                 tuple(AO(BD.EMBED_LO + k, 1 + k, 1.0) for k in range(16))
                 + tuple(AO(BD.EMBED_HI + k, 17 + k, 1.0) for k in range(16))
+                + tuple(AO(BD.ADDR_KEY + 32 + k, 33 + k, 1.0) for k in range(16))
             ),
         ),
         DeclarativeAttentionHeadSpec(
@@ -101,10 +107,12 @@ def _layer4_pc_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
             v=(
                 tuple(AP(1 + k, BD.EMBED_LO + k, 1.0) for k in range(16))
                 + tuple(AP(17 + k, BD.EMBED_HI + k, 1.0) for k in range(16))
+                + tuple(AP(33 + k, BD.ADDR_KEY + 32 + k, 1.0) for k in range(16))
             ),
             o=(
                 tuple(AO(BD.TEMP + k, 1 + k, 1.0) for k in range(16))
                 + tuple(AO(BD.TEMP + 16 + k, 17 + k, 1.0) for k in range(16))
+                + tuple(AO(BD.ADDR_KEY + 32 + k, 33 + k, 1.0) for k in range(16))
             ),
         ),
     )

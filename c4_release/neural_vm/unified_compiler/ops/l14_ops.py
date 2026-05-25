@@ -6,6 +6,108 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
+def _resolve_dim(dim_positions, name: str):
+    if isinstance(dim_positions, dict) and name in dim_positions:
+        return dim_positions[name]
+    proxy = _as_setdim_proxy(dim_positions if isinstance(dim_positions, dict) else {})
+    return getattr(proxy, name, None)
+
+
+def _guard_l14_output_units_on_step_boundary(
+    ffn,
+    dim_positions,
+    S: float,
+    start_unit: int,
+    end_unit: int,
+) -> None:
+    """Stop L14 OUTPUT cleanup units from firing between VM rows."""
+
+    if end_unit <= start_unit:
+        return
+    const_dim = _resolve_dim(dim_positions, "CONST")
+    output_lo = _resolve_dim(dim_positions, "OUTPUT_LO")
+    output_hi = _resolve_dim(dim_positions, "OUTPUT_HI")
+    if (
+        const_dim is None
+        or output_lo is None
+        or output_hi is None
+        or const_dim >= ffn.W_up.data.shape[1]
+    ):
+        return
+    output_dims = [
+        *(output_lo + i for i in range(16) if output_lo + i < ffn.W_down.data.shape[0]),
+        *(output_hi + i for i in range(16) if output_hi + i < ffn.W_down.data.shape[0]),
+    ]
+    if not output_dims:
+        return
+    # This guard is only a boundary bias: it should suppress rows with no VM
+    # structure, not override the cleanup rule's own blockers. Add the large
+    # positive side only on structural dims the unit already uses positively;
+    # otherwise a generic IS_BYTE/MEM_VAL_B* allow-list can invert explicit
+    # blockers and make cleanup units fire on MEM value bytes.
+    strength = S * 10_000_000
+    marker_dims = [
+        _resolve_dim(dim_positions, name)
+        for name in (
+            "MARK_AX",
+            "MARK_PC",
+            "MARK_SP",
+            "MARK_BP",
+            "MARK_STACK0",
+            "MARK_MEM",
+        )
+    ]
+    ranged_positive_dims = []
+    for base_name in (
+        "H0",
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "L1H0",
+        "L1H1",
+        "L1H2",
+        "L1H4",
+        "L2H0",
+    ):
+        base_dim = _resolve_dim(dim_positions, base_name)
+        if base_dim is None:
+            continue
+        ranged_positive_dims.extend(base_dim + offset for offset in range(5))
+    allow_dims = [
+        dim
+        for dim in (*marker_dims, *ranged_positive_dims)
+        if dim is not None and dim < ffn.W_up.data.shape[1]
+    ]
+    next_marker_dims = [
+        _resolve_dim(dim_positions, name)
+        for name in (
+            "NEXT_PC",
+            "NEXT_AX",
+            "NEXT_SP",
+            "NEXT_BP",
+            "NEXT_STACK0",
+            "NEXT_MEM",
+            "NEXT_SE",
+            "NEXT_HALT",
+        )
+    ]
+    next_marker_dims = [
+        dim
+        for dim in next_marker_dims
+        if dim is not None and dim < ffn.W_up.data.shape[1]
+    ]
+    for unit in range(start_unit, end_unit):
+        if float(ffn.W_down.data[output_dims, unit].abs().sum()) == 0.0:
+            continue
+        ffn.W_up.data[unit, const_dim] -= strength
+        for structural_dim in allow_dims:
+            if float(ffn.W_up.data[unit, structural_dim]) > 0.0:
+                ffn.W_up.data[unit, structural_dim] += strength
+        for next_dim in next_marker_dims:
+            ffn.W_up.data[unit, next_dim] -= 2 * strength
+
+
 def make_layer14_mem_generation_op() -> Operation:
     """L14 attention: generate MEM section tokens (addr + value) for SI/SC/PSH."""
     def bake(attn, dim_positions, S):
@@ -87,6 +189,13 @@ def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(34, BD.OP_LC_RELAY, -10000.0),
         AP(35, BD.TEMP + 8, 10000.0),
         AP(35, BD.TEMP + 9, 10000.0),
+        AP(36, BD.IS_BYTE, 1000.0),
+        AP(36, BD.H1 + AX_I, 1000.0),
+        AP(36, BD.BYTE_INDEX_0, 1000.0),
+        AP(36, BD.BYTE_INDEX_1, -3000.0),
+        AP(36, BD.BYTE_INDEX_2, -3000.0),
+        AP(36, BD.BYTE_INDEX_3, -3000.0),
+        AP(36, BD.MARK_AX, -1000.0),
     ]
     k = [
         AP(0, BD.MARK_AX, 100.0),
@@ -95,6 +204,9 @@ def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(33, BD.CONST, 5.0),
         AP(34, BD.CONST, 5.0),
         AP(35, BD.CONST, -20.0),
+        AP(36, BD.CONST, -100.0),
+        AP(36, BD.OP_MUL, 200.0),
+        AP(36, BD.OP_SHL, 200.0),
     ]
     v = []
     o = []
@@ -211,10 +323,11 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
         # byte queries can still overcome that gate and make MEM generation
         # write OUTPUT outside the MEM section. Add a separate non-MEM target
         # blocker that stays inactive at the real MEM addr/value targets.
-        target_block_s = 2000.0
+        target_block_s = 5000.0
         for dim in (
             BD.MARK_PC,
             BD.MARK_AX,
+            BD.MARK_SP,
             BD.MARK_BP,
             BD.MARK_STACK0,
             BD.H1 + pc_i,
@@ -224,6 +337,20 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
         ):
             attn.W_q.data[base + 38, dim] = -target_block_s
         attn.W_k.data[base + 38, BD.CONST] = 5.0
+
+    # Address heads own only the MEM marker/address-byte lanes.  Keep them off
+    # the MEM value lanes so their address source rows cannot overwrite stored
+    # value bytes during ENT/JSR.
+    for head in range(4):
+        base = head * HD
+        attn.W_q.data[base + 38, BD.H1 + sp_i] = -target_block_s
+        for dim in (
+            BD.MEM_VAL_B0,
+            BD.MEM_VAL_B1,
+            BD.MEM_VAL_B2,
+            BD.MEM_VAL_B3,
+        ):
+            attn.W_q.data[base + 38, dim] = -target_block_s
 
     # Head 0 predicts address byte 0 from the SP marker for PSH. The legacy
     # source bonus keyed only on H1[SP], which is active on SP byte positions
@@ -253,17 +380,17 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
         for k in range(16):
             attn.W_v.data[base + 1 + k, BD.OUTPUT_LO + k] = 0.0
             attn.W_v.data[base + 17 + k, BD.OUTPUT_HI + k] = 0.0
-        attn.W_k.data[head * HD + 1, byte_dim] = 45.0
+        attn.W_k.data[head * HD + 1, byte_dim] = 60.0
 
-    # SI/SC addresses must come from the current STACK0 byte tokens directly.
-    # The legacy MEM_ADDR_SRC row selected the preceding byte (and head 0 could
-    # still prefer the STACK0 marker), which is wrong once the current stack
-    # bytes already exist in the autoregressive context. Keep the existing
-    # MEM_ADDR_SRC query row, but retarget its keys to bytes 0..3.
-    si_source_s = 60.0
+    # SI/SC addresses come from the stack top before the pop.  By the time the
+    # MEM section is emitted, the current step's STACK0 bytes have already been
+    # regenerated to the post-pop value.  Those current rows carry MEM_STORE
+    # leakage, so block them and let the most recent pre-store STACK0 row win.
+    si_source_s = 200.0
     for head in range(4):
         base = head * HD
         for dim in (
+            BD.MEM_STORE,
             BD.STACK0_BYTE0,
             BD.H1 + bp_i,
             BD.L1H4 + bp_i,
@@ -275,21 +402,89 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
             BD.H1 + sp_i,
         ):
             attn.W_k.data[base + 2, dim] = 0.0
-        attn.W_k.data[base + 2, BD.MARK_STACK0] = -si_source_s
+        attn.W_k.data[base + 2, BD.MEM_STORE] = -4.0 * si_source_s
         attn.W_k.data[base + 2, BD.H1 + ax_i] = -si_source_s
         attn.W_k.data[base + 2, BD.H1 + sp_i] = -si_source_s
         if head == 0:
-            attn.W_k.data[base + 2, BD.L1H4 + bp_i] = si_source_s
-            attn.W_k.data[base + 2, BD.H1 + bp_i] = -si_source_s
+            # SI/SC byte 0 must come from the pre-store stack-top byte. The
+            # STACK0 marker can still carry the just-stored AX byte before the
+            # late tail correction, which would turn the store value into the
+            # store address.
+            attn.W_k.data[base + 2, BD.STACK0_BYTE0] = si_source_s
         elif head == 1:
+            attn.W_k.data[base + 2, BD.MARK_STACK0] = -si_source_s
             attn.W_k.data[base + 2, BD.H2 + bp_i] = si_source_s
             attn.W_k.data[base + 2, BD.L1H4 + bp_i] = -si_source_s
         elif head == 2:
+            attn.W_k.data[base + 2, BD.MARK_STACK0] = -si_source_s
             attn.W_k.data[base + 2, BD.H3 + bp_i] = si_source_s
             attn.W_k.data[base + 2, BD.H2 + bp_i] = -si_source_s
         else:
+            attn.W_k.data[base + 2, BD.MARK_STACK0] = -si_source_s
             attn.W_k.data[base + 2, BD.H4 + bp_i] = si_source_s
             attn.W_k.data[base + 2, BD.H3 + bp_i] = -si_source_s
+
+    # ENT stores the old BP at the freshly established frame address
+    # (BP = old SP - 8). Address heads must therefore source BP, not the
+    # final SP value after local allocation.
+    ent_addr_s = 50.0
+    ent_wrong_target_s = 500.0
+    for head in range(4):
+        base = head * HD
+        attn.W_q.data[base + 39, BD.OP_ENT] = ent_addr_s
+        attn.W_q.data[base + 39, BD.HAS_SE] = ent_addr_s * 3.0
+        attn.W_q.data[base + 39, BD.CONST] = -ent_addr_s * 6.0
+        if head == 0:
+            attn.W_q.data[base + 39, BD.IS_BYTE] = -12.0 * ent_addr_s
+            attn.W_k.data[base + 39, BD.MARK_BP] = ent_addr_s
+            continue
+        attn.W_k.data[base + 39, BD.H1 + bp_i] = 0.0
+        attn.W_q.data[base + 40, BD.OP_ENT] = ent_addr_s
+        attn.W_q.data[base + 40, BD.HAS_SE] = 0.0
+        attn.W_q.data[base + 40, BD.CONST] = 0.0
+        for dim in (BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2):
+            attn.W_q.data[base + 40, dim] = 0.0
+        allowed_query_dim = (
+            BD.BYTE_INDEX_0,
+            BD.BYTE_INDEX_1,
+            BD.BYTE_INDEX_2,
+        )[head - 1]
+        for dim in (
+            BD.BYTE_INDEX_0,
+            BD.BYTE_INDEX_1,
+            BD.BYTE_INDEX_2,
+            BD.BYTE_INDEX_3,
+        ):
+            if dim != allowed_query_dim:
+                attn.W_q.data[base + 40, dim] = -ent_wrong_target_s
+        attn.W_k.data[base + 40, BD.H1 + bp_i] = ent_addr_s
+        attn.W_k.data[
+            base + 40,
+            (BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3)[head - 1],
+        ] = ent_addr_s
+    # At the MEM marker only head 0 should emit address byte 0. Heads 1-3 use
+    # the already-emitted address bytes as their query positions, and the ENT
+    # source rows can otherwise overpower their non-target position gate and
+    # add zero-byte defaults into addr byte 0.
+    mem_marker_block_s = 300.0
+    for head in range(1, 4):
+        base = head * HD
+        attn.W_q.data[base + 41, BD.MARK_MEM] = -mem_marker_block_s
+        attn.W_k.data[base + 41, BD.CONST] = mem_marker_block_s
+    ent_target_gate_s = 200.0
+    for head, query_dim in (
+        (1, BD.BYTE_INDEX_0),
+        (2, BD.BYTE_INDEX_1),
+        (3, BD.BYTE_INDEX_2),
+    ):
+        base = head * HD
+        attn.W_q.data[base + 42, BD.CONST] = 0.0
+        attn.W_q.data[base + 42, BD.OP_ENT] = 0.0
+        attn.W_q.data[base + 42, query_dim] = 0.0
+        attn.W_k.data[base + 42, BD.CONST] = 0.0
+        attn.W_q.data[base + 43, BD.CONST] = -ent_target_gate_s
+        attn.W_q.data[base + 43, BD.H3 + mem_i] = ent_target_gate_s
+        attn.W_k.data[base + 43, BD.CONST] = ent_target_gate_s
 
     # Value heads source AX for PSH/SI/SC and STACK0 for JSR/ENT. With the
     # steeper L14 ALiBi slope, the old H1[AX] bonus is not strong enough to
@@ -309,7 +504,11 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
         attn.W_q.data[base + 36, BD.OP_JSR] = -2.0 * source_s
         attn.W_q.data[base + 36, BD.OP_ENT] = -2.0 * source_s
         attn.W_k.data[base + 36, BD.H1 + ax_i] = source_s
-        attn.W_k.data[base + 36, BD.H1 + sp_i] = -source_s
+        # Keep SP neutral for the value-source selector. With JSR/ENT the
+        # query row is negative so a negative H1[SP] key makes the current SP
+        # byte an attractive source; that corrupts the same step's SP byte
+        # outputs by rereading SP_byte0 as SP_byte1.
+        attn.W_k.data[base + 36, BD.H1 + sp_i] = 0.0
         attn.W_k.data[base + 36, BD.H4 + bp_i] = -source_s
         # STACK0 value bytes carry H4[BP], while the STACK0 marker carries
         # both H4[BP] and MARK_STACK0. For JSR/ENT the query is negative, so
@@ -317,8 +516,60 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
         # matching positive term so it nets to zero instead of winning as a
         # payload-less source.
         attn.W_k.data[base + 36, BD.MARK_STACK0] = source_s
-        attn.W_k.data[base + 36, BD.MARK_MEM] = -source_s
-        attn.W_k.data[base + 36, BD.H3 + mem_i] = -source_s
+        # MEM-source exclusion is handled by the sign-stable row 35 above.
+        # Do not put MEM dims on this sign-flipping selector row: for ENT/JSR
+        # the query is negative, so negative MEM keys make the current MEM
+        # section look like a source and beat the intended STACK0 bytes.
+        attn.W_k.data[base + 36, BD.MARK_MEM] = 0.0
+        attn.W_k.data[base + 36, BD.H3 + mem_i] = 0.0
+
+        # Heads 4-7 generate MEM value bytes only. Keep them silent while the
+        # MEM marker and address bytes are being emitted; heads 0-3 own those
+        # address positions. Value byte 0 is predicted from the BYTE_INDEX_3
+        # query, so only byte indexes 0..2 are blocked here.
+        value_target_block_s = 15000.0
+        for dim in (
+            BD.MARK_MEM,
+            BD.BYTE_INDEX_0,
+            BD.BYTE_INDEX_1,
+            BD.BYTE_INDEX_2,
+        ):
+            attn.W_q.data[base + 38, dim] = -value_target_block_s
+        mem_val_dims = (
+            BD.MEM_VAL_B0,
+            BD.MEM_VAL_B1,
+            BD.MEM_VAL_B2,
+            BD.MEM_VAL_B3,
+        )
+        own_value_idx = head - 4
+        for idx, dim in enumerate(mem_val_dims):
+            if idx != own_value_idx:
+                attn.W_q.data[base + 38, dim] = -value_target_block_s
+
+        # ENT stores the caller's old BP. After a normal call prologue that
+        # old BP lives in the previous JSR step's BP byte rows, not in the
+        # current STACK0 rows used by JSR's return-address store.
+        ent_old_bp_s = 80.0
+        ent_value_target_s = 1000.0
+        source_byte_dim = (
+            BD.BYTE_INDEX_0,
+            BD.BYTE_INDEX_1,
+            BD.BYTE_INDEX_2,
+            BD.BYTE_INDEX_3,
+        )[own_value_idx]
+        target_query_dim = (
+            BD.MEM_VAL_B0,
+            BD.MEM_VAL_B1,
+            BD.MEM_VAL_B2,
+            BD.MEM_VAL_B3,
+        )[own_value_idx]
+        attn.W_q.data[base + 44, BD.OP_ENT] = ent_old_bp_s
+        attn.W_k.data[base + 44, BD.OP_JSR] = ent_old_bp_s
+        attn.W_k.data[base + 44, BD.H1 + bp_i] = ent_old_bp_s
+        attn.W_k.data[base + 44, source_byte_dim] = ent_old_bp_s
+        attn.W_q.data[base + 45, BD.CONST] = -0.9 * ent_value_target_s
+        attn.W_q.data[base + 45, target_query_dim] = ent_value_target_s
+        attn.W_k.data[base + 45, BD.CONST] = ent_value_target_s
 
         # PSH store values are sourced from AX. STACK0 is generated later in
         # the same step and is not authoritative for the MEM value bytes here.
@@ -329,6 +580,17 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
         # lose to the nearer byte 3 zero under strict neural ALiBi.
         attn.W_q.data[base + 37, :] = 0.0
         attn.W_k.data[base + 37, :] = 0.0
+
+    # The legacy MEM-generation heads use V slot 0 as the matched zero-nibble
+    # cancel. A full cancel leaves real zero nibbles at exactly the same logit
+    # as every wrong nibble in that band, so batched GEMM/SDPA rounding can
+    # choose any token with the same other nibble. Keep the cancel strong
+    # enough to suppress zero when the copied nibble is nonzero, but leave a
+    # positive margin when the copied nibble itself is zero.
+    for head in range(8):
+        base = head * HD
+        attn.W_o.data[BD.OUTPUT_LO + 0, base + 0] = -0.5
+        attn.W_o.data[BD.OUTPUT_HI + 0, base + 0] = -0.5
 
 
 def make_layer14_temp_clear_op() -> Operation:
@@ -341,18 +603,31 @@ def make_layer14_temp_clear_op() -> Operation:
     """
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer14_temp_clear
+        from ...setup_helpers import (
+            _set_layer14_add_byte1_high_zero_cleanup,
+            _set_layer14_clear_addsub_temp_negative_residue,
+        )
         ffn = block.ffn
         start_unit = getattr(ffn, "_l14_unit_counter", 0)
         next_unit = _set_layer14_temp_clear(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
+        next_unit = _set_layer14_clear_addsub_temp_negative_residue(
+            ffn, S, _as_setdim_proxy(dim_positions), start_unit=next_unit
+        )
+        next_unit = _set_layer14_add_byte1_high_zero_cleanup(
+            ffn, S, _as_setdim_proxy(dim_positions), start_unit=next_unit
+        )
+        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
     return Operation(
         name="layer14_temp_clear",
         phase=14.1,
-        reads={"OP_LEV", "MARK_PC", "CONST"},
-        writes={"TEMP"},
+        reads={"OP_LEV", "MARK_PC", "TEMP", "IS_BYTE", "H1",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "BYTE_INDEX_3", "MARK_AX", "CONST"},
+        writes={"TEMP", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -378,6 +653,7 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
         next_unit = _set_layer14_clear_addr_key_pollution(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
+        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
     return Operation(
@@ -412,6 +688,7 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         next_unit = _set_layer14_clear_output_corruption(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
+        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
     return Operation(
@@ -448,6 +725,7 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         next_unit = _set_layer14_clear_mem_marker_output(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
+        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
     return Operation(
@@ -495,6 +773,7 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         next_unit = _set_layer14_jsr_ax_bytes_zero(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
+        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
     return Operation(
@@ -545,6 +824,7 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         next_unit = _set_layer14_alu_nocarry_ax_bytes_zero(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
+        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
     return Operation(
@@ -558,15 +838,16 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
-        # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1311
-        # after this op runs). The chain is: temp_clear (1 unit) →
+        # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1314
+        # after this op runs). The chain is: temp_clear + temp residue clamp
+        # + ADD byte-1 high cleanup (4 units) →
         # clear_addr_key_pollution (48) → clear_output_corruption (3) →
         # clear_mem_marker_output (64) → addr_key_neural_decode (1184) →
         # jsr_ax_bytes_zero (4) → lc_ax_bytes_zero (4) → this op (4).
         # Annotating only the chain tail with the cumulative max is
         # sufficient — the compiler aggregates per-layer max across all
         # ops, so this single annotation suffices for L14 dynamic sizing.
-        ffn_units_used=1312,
+        ffn_units_used=1315,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",
@@ -614,6 +895,7 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         next_unit = _set_layer14_lc_ax_bytes_zero(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
+        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
     return Operation(
@@ -803,6 +1085,7 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         next_unit = _bake_addr_key_neural_decode(
             ffn, dim_positions, S, start_unit=start_unit
         )
+        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
     return Operation(

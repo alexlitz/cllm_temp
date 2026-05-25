@@ -358,14 +358,25 @@ def make_residual_alibi_slopes_op() -> Operation:
             if hasattr(attn14, 'alibi_slopes') and attn14.alibi_slopes is not None:
                 attn14.alibi_slopes.fill_(5.0)
 
-        # L15: load heads are last-write-wins. Keep heads 4+ gentle for LEV
-        # auxiliary reads, but make the primary LI/LC/STACK0 heads prefer the
-        # newest valid store strongly enough to beat stale address residue.
+        # L15: load heads are last-write-wins only among matching addresses.
+        # Keep the primary LI/LC/STACK0 heads as a small recency tie-breaker
+        # so a newer write to a different local slot cannot beat address match.
         if len(model.blocks) > 15:
             attn15 = model.blocks[15].attn
             if hasattr(attn15, 'alibi_slopes') and attn15.alibi_slopes is not None:
                 attn15.alibi_slopes.fill_(0.01)
-                attn15.alibi_slopes[:4] = 30.0
+                attn15.alibi_slopes[:4] = 0.05
+                # L15 can be widened by declarative block ops before this
+                # residual slope pass. Preserve steep recency on those
+                # single-purpose heads; otherwise SI/SC MEM addr0 blends many
+                # historical STACK0 byte-0 rows instead of choosing the
+                # nearest pre-store address row.
+                if attn15.alibi_slopes.numel() > 8:
+                    attn15.alibi_slopes[8] = 1.0
+                if attn15.alibi_slopes.numel() > 12:
+                    attn15.alibi_slopes[12] = 1.0
+                if attn15.alibi_slopes.numel() > 13:
+                    attn15.alibi_slopes[13] = 1.0
 
     return Operation(
         name="residual_alibi_slopes",
@@ -523,6 +534,12 @@ def make_l6_dead_unit_zero_op() -> Operation:
             if ffn6.W_up[u, BD.MARK_STACK0].item() > 10:  # ENT uses TEMP at STACK0
                 continue
             if ffn6.W_up[u, BD.MARK_BP].item() > 10:  # ENT uses TEMP at BP
+                continue
+            if (
+                ffn6.W_up[u, BD.IS_BYTE].item() > 10
+                and ffn6.W_up[u, BD.H1 + 0].item() > 10
+                and ffn6.W_up[u, BD.BYTE_INDEX_0].item() > 10
+            ):
                 continue
 
             output_byte_lo_weight = (

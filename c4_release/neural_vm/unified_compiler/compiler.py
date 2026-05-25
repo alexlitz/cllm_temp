@@ -2327,6 +2327,18 @@ class UnifiedVMCompiler:
         S = self.S
         unit = 0
 
+        def block_non_ax_marker_sites(unit_idx: int) -> None:
+            for blocker_dim in (
+                BD.MARK_PC,
+                BD.MARK_SP,
+                BD.MARK_BP,
+                BD.MARK_STACK0,
+                BD.MARK_MEM,
+                BD.MARK_SE,
+                BD.IS_BYTE,
+            ):
+                ffn.W_up.data[unit_idx, blocker_dim] = -S * 1000
+
         # === ADD: lo nibble (256 units) ===
         for a in range(16):
             for b in range(16):
@@ -2341,14 +2353,16 @@ class UnifiedVMCompiler:
 
         # === LEA: lo nibble (256 units) ===
         # Like ADD but reads from FETCH_LO instead of AX_CARRY_LO
-        # Require BOTH ALU_LO AND FETCH_LO to be active (threshold=105)
+        # Require BOTH ALU_LO AND FETCH_LO to be active. FETCH_LO is one-hot
+        # in the declarative path, so amplify it locally.
         for a in range(16):
             for b in range(16):
                 result = (a + b) % 16
                 ffn.W_up.data[unit, BD.MARK_AX] = S * 60
+                block_non_ax_marker_sites(unit)
                 ffn.W_up.data[unit, BD.ALU_LO + a] = S
-                ffn.W_up.data[unit, BD.FETCH_LO + b] = S
-                ffn.b_up.data[unit] = -S * 105
+                ffn.W_up.data[unit, BD.FETCH_LO + b] = S * 20
+                ffn.b_up.data[unit] = -S * 85
                 ffn.W_gate.data[unit, BD.OP_LEA] = 1.0
                 ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 2.0 / S
                 unit += 1
@@ -2383,9 +2397,10 @@ class UnifiedVMCompiler:
             for b in range(16):
                 if a + b >= 16:
                     ffn.W_up.data[unit, BD.MARK_AX] = S * 60
+                    block_non_ax_marker_sites(unit)
                     ffn.W_up.data[unit, BD.ALU_LO + a] = S
-                    ffn.W_up.data[unit, BD.FETCH_LO + b] = S
-                    ffn.b_up.data[unit] = -S * 105
+                    ffn.W_up.data[unit, BD.FETCH_LO + b] = S * 20
+                    ffn.b_up.data[unit] = -S * 85
                     ffn.W_gate.data[unit, BD.OP_LEA] = 1.0
                     ffn.W_down.data[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                     unit += 1
@@ -2396,9 +2411,10 @@ class UnifiedVMCompiler:
             for b in range(16):
                 result = (a + b) % 16
                 ffn.W_up.data[unit, BD.MARK_AX] = S * 60
+                block_non_ax_marker_sites(unit)
                 ffn.W_up.data[unit, BD.ALU_LO + a] = S
-                ffn.W_up.data[unit, BD.FETCH_LO + b] = S
-                ffn.b_up.data[unit] = -S * 105
+                ffn.W_up.data[unit, BD.FETCH_LO + b] = S * 20
+                ffn.b_up.data[unit] = -S * 85
                 ffn.W_gate.data[unit, BD.OP_ADJ] = 1.0
                 ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 2.0 / S
                 unit += 1
@@ -2408,9 +2424,10 @@ class UnifiedVMCompiler:
             for b in range(16):
                 if a + b >= 16:
                     ffn.W_up.data[unit, BD.MARK_AX] = S * 60
+                    block_non_ax_marker_sites(unit)
                     ffn.W_up.data[unit, BD.ALU_LO + a] = S
-                    ffn.W_up.data[unit, BD.FETCH_LO + b] = S
-                    ffn.b_up.data[unit] = -S * 105
+                    ffn.W_up.data[unit, BD.FETCH_LO + b] = S * 20
+                    ffn.b_up.data[unit] = -S * 85
                     ffn.W_gate.data[unit, BD.OP_ADJ] = 1.0
                     ffn.W_down.data[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                     unit += 1
@@ -2434,9 +2451,10 @@ class UnifiedVMCompiler:
                 effective_b = (8 + imm_lo) % 16
                 result = (sp_lo - effective_b) % 16
                 ffn.W_up.data[unit, BD.MARK_AX] = S * 60
+                block_non_ax_marker_sites(unit)
                 ffn.W_up.data[unit, BD.ALU_LO + sp_lo] = S
-                ffn.W_up.data[unit, BD.FETCH_LO + imm_lo] = S
-                ffn.b_up.data[unit] = -S * 105
+                ffn.W_up.data[unit, BD.FETCH_LO + imm_lo] = S * 20
+                ffn.b_up.data[unit] = -S * 85
                 ffn.W_gate.data[unit, BD.OP_ENT] = 1.0
                 ffn.W_down.data[BD.OUTPUT_LO + result, unit] = 2.0 / S
                 unit += 1
@@ -2447,9 +2465,10 @@ class UnifiedVMCompiler:
                 full_sum = 8 + imm_lo
                 if sp_lo < (full_sum % 16) or full_sum >= 16:
                     ffn.W_up.data[unit, BD.MARK_AX] = S * 60
+                    block_non_ax_marker_sites(unit)
                     ffn.W_up.data[unit, BD.ALU_LO + sp_lo] = S
-                    ffn.W_up.data[unit, BD.FETCH_LO + imm_lo] = S
-                    ffn.b_up.data[unit] = -S * 105
+                    ffn.W_up.data[unit, BD.FETCH_LO + imm_lo] = S * 20
+                    ffn.b_up.data[unit] = -S * 85
                     ffn.W_gate.data[unit, BD.OP_ENT] = 1.0
                     ffn.W_down.data[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                     unit += 1
@@ -2522,6 +2541,18 @@ class UnifiedVMCompiler:
         S = self.S
         unit = 0
 
+        def block_non_ax_marker_sites(unit_idx: int) -> None:
+            for blocker_dim in (
+                BD.MARK_PC,
+                BD.MARK_SP,
+                BD.MARK_BP,
+                BD.MARK_STACK0,
+                BD.MARK_MEM,
+                BD.MARK_SE,
+                BD.IS_BYTE,
+            ):
+                ffn.W_up.data[unit_idx, blocker_dim] = -S * 1000
+
         # === ADD hi nibble (no carry 256 + with carry 256 = 512 units) ===
         for carry_in in [0, 1]:
             for a in range(16):
@@ -2545,15 +2576,16 @@ class UnifiedVMCompiler:
             for a in range(16):
                 for b in range(16):
                     result = (a + b + carry_in) % 16
-                    ffn.W_up.data[unit, BD.MARK_AX] = S
+                    ffn.W_up.data[unit, BD.MARK_AX] = S * 20
+                    block_non_ax_marker_sites(unit)
                     ffn.W_up.data[unit, BD.ALU_HI + a] = S
-                    ffn.W_up.data[unit, BD.FETCH_HI + b] = S
+                    ffn.W_up.data[unit, BD.FETCH_HI + b] = S * 20
                     if carry_in == 0:
-                        ffn.W_up.data[unit, BD.CARRY + 0] = -0.01
-                        ffn.b_up.data[unit] = -S * 58
+                        ffn.W_up.data[unit, BD.CARRY + 0] = -S * 8.0
+                        ffn.b_up.data[unit] = -S * 42
                     else:
-                        ffn.W_up.data[unit, BD.CARRY + 0] = 0.01
-                        ffn.b_up.data[unit] = -S * 58.4
+                        ffn.W_up.data[unit, BD.CARRY + 0] = S * 8.0
+                        ffn.b_up.data[unit] = -S * 50
                     ffn.W_gate.data[unit, BD.OP_LEA] = 1.0
                     ffn.W_down.data[BD.OUTPUT_HI + result, unit] = 2.0 / S
                     unit += 1
@@ -2563,15 +2595,16 @@ class UnifiedVMCompiler:
             for a in range(16):
                 for b in range(16):
                     result = (a + b + carry_in) % 16
-                    ffn.W_up.data[unit, BD.MARK_AX] = S
+                    ffn.W_up.data[unit, BD.MARK_AX] = S * 20
+                    block_non_ax_marker_sites(unit)
                     ffn.W_up.data[unit, BD.ALU_HI + a] = S
-                    ffn.W_up.data[unit, BD.FETCH_HI + b] = S
+                    ffn.W_up.data[unit, BD.FETCH_HI + b] = S * 20
                     if carry_in == 0:
-                        ffn.W_up.data[unit, BD.CARRY + 0] = -0.01
-                        ffn.b_up.data[unit] = -S * 58
+                        ffn.W_up.data[unit, BD.CARRY + 0] = -S * 8.0
+                        ffn.b_up.data[unit] = -S * 42
                     else:
-                        ffn.W_up.data[unit, BD.CARRY + 0] = 0.01
-                        ffn.b_up.data[unit] = -S * 58.4
+                        ffn.W_up.data[unit, BD.CARRY + 0] = S * 8.0
+                        ffn.b_up.data[unit] = -S * 50
                     ffn.W_gate.data[unit, BD.OP_ADJ] = 1.0
                     ffn.W_down.data[BD.OUTPUT_HI + result, unit] = 2.0 / S
                     unit += 1
@@ -2600,16 +2633,16 @@ class UnifiedVMCompiler:
             for sp_hi in range(16):
                 for imm_hi in range(16):
                     result = (sp_hi - imm_hi - borrow_in) % 16
-                    ffn.W_up.data[unit, BD.MARK_AX] = S
-                    ffn.W_up.data[unit, BD.MARK_SP] = -S * 2.0  # Block at SP marker
+                    ffn.W_up.data[unit, BD.MARK_AX] = S * 20
+                    block_non_ax_marker_sites(unit)
                     ffn.W_up.data[unit, BD.ALU_HI + sp_hi] = S
-                    ffn.W_up.data[unit, BD.FETCH_HI + imm_hi] = S
+                    ffn.W_up.data[unit, BD.FETCH_HI + imm_hi] = S * 20
                     if borrow_in == 0:
-                        ffn.W_up.data[unit, BD.CARRY + 0] = -S * 2.0
-                        ffn.b_up.data[unit] = -S * 58
+                        ffn.W_up.data[unit, BD.CARRY + 0] = -S * 8.0
+                        ffn.b_up.data[unit] = -S * 42
                     else:
-                        ffn.W_up.data[unit, BD.CARRY + 0] = S * 2.0
-                        ffn.b_up.data[unit] = -S * 60
+                        ffn.W_up.data[unit, BD.CARRY + 0] = S * 8.0
+                        ffn.b_up.data[unit] = -S * 50
                     ffn.W_gate.data[unit, BD.OP_ENT] = 1.0
                     ffn.W_down.data[BD.OUTPUT_HI + result, unit] = 2.0 / S
                     unit += 1
@@ -3794,6 +3827,14 @@ class UnifiedVMCompiler:
                         attn.W_o.data[BD.TEMP + k, base + 32 + k] = 1.0
                         attn.W_o.data[BD.TEMP + 16 + k, base + 48 + k] = 1.0
                 # Heads 9-11: No O projection (they write at byte positions later)
+
+        # Keep the imperative compiler's L15 lookup guards in parity with the
+        # declarative L15 op. This is still a legacy-wrapper entrypoint, so use
+        # the shared post-bake helper until L15 attention is fully generated
+        # from declarations.
+        from .ops.l15_ops import _suppress_l15_lookup_during_current_store_generation
+
+        _suppress_l15_lookup_during_current_store_generation(attn, BD, HD)
 
     def _compile_output_head(self, model):
         """Compile output head (lm_head) weights."""

@@ -712,9 +712,9 @@ class BinaryOpByteZeroingPostOp(PureFFN):
     the EfficientALU. Bytes 1-3 get garbage from L10 head 1 passthrough. This
     post_op clears bytes 1-3 to 0x00 for these opcodes.
 
-    Note: ADD/SUB with carry will have bytes 1-3 corrected by CarryPropagationPostOp
-    which runs AFTER this post-op. So zeroing here is safe - carry propagation adds
-    the correct values later.
+    ADD/SUB bytes are handled by the dedicated AddSubBytePropagationPostOp and
+    CarryPropagationPostOp chain. Keeping them out of this generic zeroing pass
+    avoids making high-byte ADD/SUB rows fight a stale zero baseline.
 
     Phase 0 conversion (2026-05-09): subclasses PureFFN.
     """
@@ -728,57 +728,52 @@ class BinaryOpByteZeroingPostOp(PureFFN):
         # `_SetDim.H1 + 1 = 68` aliases compact `EMBED_HI[15]`, triggering this
         # post-op for any AX byte whose hi nibble is 0xF (the IMM 240/255 bug).
         object.__setattr__(self, '_pending_dim_positions', dim_positions)
-        super().__init__(dim=d_model, hidden_dim=4)
+        # Four units handle byte-0-only non-bitwise ops through opcode gates.
+        # Four more handle bitwise rows, with TEMP[3] in the thresholded
+        # detector rather than only in the multiplicative gate. Weak TEMP[3]
+        # residue is common on unrelated IMM/ADD byte rows and must not zero
+        # their high bytes.
+        super().__init__(dim=d_model, hidden_dim=8)
         self.d_model = d_model
         self.S = S
 
     def _bake_weights(self):
         S = self._pending_S
         BD = _resolve_bd(getattr(self, '_pending_dim_positions', None))
-        op_dims = [BD.OP_ADD, BD.OP_SUB, BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT,
+        op_dims = [BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT,
                    BD.OP_LE, BD.OP_GE, BD.OP_SHL, BD.OP_SHR,
                    BD.OP_MUL, BD.OP_DIV, BD.OP_MOD]
+
+        def wire_zeroing_writes(unit_offset: int) -> None:
+            self.W_down.data[BD.OUTPUT_LO + 0, unit_offset + 2] = 5.0 / S
+            self.W_down.data[BD.OUTPUT_HI + 0, unit_offset + 3] = 5.0 / S
+            for k in range(16):
+                self.W_down.data[BD.OUTPUT_LO + k, unit_offset + 0] = -3.0 / S
+                self.W_down.data[BD.OUTPUT_HI + k, unit_offset + 1] = -3.0 / S
 
         for unit in range(4):
             self.W_up.data[unit, BD.IS_BYTE] = S
             self.W_up.data[unit, BD.H1 + 1] = S
+            self.W_up.data[unit, BD.TEMP + 8] = -S * 1000
+            self.W_up.data[unit, BD.TEMP + 9] = -S * 1000
             self.b_up.data[unit] = -S * 1.5
             for d in op_dims:
                 self.W_gate.data[unit, d] = 1.0
-            # FIX 2026-05-10 (Phase 2 bitwise deep): Add TEMP[3] (relayed BITWISE_OP
-            # from L7 head 5) to the gate so AND/OR/XOR also clear OUTPUT at AX
-            # bytes 1-3.
-            #
-            # Why this is needed: For tests like `255 & 255 = 255` (operands and
-            # result both 8-bit), the chain is
-            #   ALUAndOrXor (block 11) writes byte-0 result at marker only
-            #     -> L10 head 1 passthrough copies prev AX bytes 1-3 (== 0 OK)
-            #     -> BinaryOpByteZeroingPostOp skipped (op_dims excluded bitwise)
-            #     -> CarryPropagationPostOp skipped (suppressed by TEMP[3])
-            #     -> BitwiseBytePropagationPostOp gated on TEMP[4..6]
-            # When the L7 head 5 relay (V scaled by 0.2) does not deliver a strong
-            # enough TEMP[4..6] at byte positions (e.g., attention dilution from
-            # multiple AX markers in a long context), bytes 1-3 retain corrupted
-            # passthrough values, producing 0xFFFFFFF0 instead of 0xFF for
-            # `255 & 255 = 255` and similar.
-            #
-            # Adding TEMP[3] to the gate makes this post-op zero bytes 1-3 for
-            # bitwise ops too, putting OUTPUT in a clean state. The later
-            # BitwiseBytePropagationPostOp (block 16) is still free to recompute
-            # bytes 1-3 for genuine multi-byte bitwise operands; for IMM-based
-            # 8-bit operands (where bytes 1-3 should be 0) we are now correct
-            # regardless of the relay's reliability at byte positions.
-            #
-            # Unlike OP_AND/OR/XOR (only at the AX marker), TEMP[3] IS broadcast
-            # to AX byte positions by L7 head 5, so it can reliably gate this
-            # FFN at byte positions.
+
+        for unit in range(4, 8):
+            # Bitwise relays can appear as weak residue on unrelated byte rows.
+            # Keep TEMP[3] in this thresholded detector so only a full relay
+            # produces a zeroing write.
+            self.W_up.data[unit, BD.IS_BYTE] = S
+            self.W_up.data[unit, BD.H1 + 1] = S
+            self.W_up.data[unit, BD.TEMP + 3] = S
+            self.W_up.data[unit, BD.TEMP + 8] = -S * 1000
+            self.W_up.data[unit, BD.TEMP + 9] = -S * 1000
+            self.b_up.data[unit] = -S * 2.5
             self.W_gate.data[unit, BD.TEMP + 3] = 1.0
 
-        for k in range(16):
-            self.W_down.data[BD.OUTPUT_LO + k, 0] = -3.0 / S
-            self.W_down.data[BD.OUTPUT_HI + k, 1] = -3.0 / S
-        self.W_down.data[BD.OUTPUT_LO + 0, 2] = 5.0 / S
-        self.W_down.data[BD.OUTPUT_HI + 0, 3] = 5.0 / S
+        wire_zeroing_writes(0)
+        wire_zeroing_writes(4)
 
 
 class CarryPropagationPostOp(PureFFN):
@@ -817,8 +812,14 @@ class CarryPropagationPostOp(PureFFN):
         # after MUL. True carry/borrow relays are ~2.0; this threshold admits
         # that relay with normal byte/output predicates while blocking
         # output-only matches.
-        carry_weight = 5.0
-        carry_threshold = 13.5
+        # Make the carry/borrow relay mandatory without letting it swamp the
+        # nibble match. The gate also depends on the carry relay, so stale
+        # positive/negative OUTPUT residue cannot mutate rows when CARRY == 0.
+        carry_weight = 1.0
+        output_weight = 20.0
+        mismatch_weight = 0.0
+        carry_threshold = 56.0
+        cascade_carry_threshold = 40.0
 
         # FIX 2026-05-08: Wrong byte positions to suppress (prevent firing at wrong byte)
         wrong_byte_dims = [d for d in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2] if d != byte_dim]
@@ -844,16 +845,17 @@ class CarryPropagationPostOp(PureFFN):
                     self.W_up.data[unit, add_carry_in] = S * carry_weight
                     # Removed: self.W_up.data[unit, BD.OP_ADD] = S
                     self.W_up.data[unit, BD.IS_BYTE] = S
-                    self.W_up.data[unit, BD.MARK_AX] = -S * 1000
-                    self.W_up.data[unit, BD.MARK_PC] = -S * 1000
+                    self.W_up.data[unit, BD.H1 + 1] = S
+                    self.W_up.data[unit, BD.MARK_AX] = -S * 5000
+                    self.W_up.data[unit, BD.MARK_PC] = -S * 5000
                     self.W_up.data[unit, byte_dim] = S
-                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = S
-                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = S
+                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = S * output_weight
+                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = S * output_weight
                     for other in range(16):
                         if other != lo:
-                            self.W_up.data[unit, BD.OUTPUT_LO + other] = -S * 3
+                            self.W_up.data[unit, BD.OUTPUT_LO + other] = -S * mismatch_weight
                         if other != hi:
-                            self.W_up.data[unit, BD.OUTPUT_HI + other] = -S * 3
+                            self.W_up.data[unit, BD.OUTPUT_HI + other] = -S * mismatch_weight
                     for op_dim in non_arith_ops:
                         self.W_up.data[unit, op_dim] = -S * 20
                     self.W_up.data[unit, BD.OP_SUB] = -S * 20
@@ -878,14 +880,16 @@ class CarryPropagationPostOp(PureFFN):
                     # uses a lower carry coefficient plus a tighter threshold:
                     # it admits the real zero byte, but rejects nonmatching
                     # high/low nibble cases that otherwise fan out.
-                    self.b_up.data[unit] = -S * (carry_threshold + (1.0 if cascade else 0.0))
-                    self.W_gate.data[unit, BD.H1 + 1] = 1.0
+                    self.b_up.data[unit] = -S * (
+                        cascade_carry_threshold if cascade else carry_threshold
+                    )
+                    self.W_gate.data[unit, add_carry_in] = 0.5
                     self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
                     self.W_down.data[BD.OUTPUT_HI + hi, unit] = -2.0 / S
                     self.W_down.data[BD.OUTPUT_LO + new_lo, unit] = 2.0 / S
                     self.W_down.data[BD.OUTPUT_HI + new_hi, unit] = 2.0 / S
                     if lo == 15 and hi == 15 and byte_idx < 2:
-                        self.W_down.data[BD.CARRY + 3, unit] = (4.0 / 3.0) / S
+                        self.W_down.data[BD.CARRY + 3, unit] = 2.0 / S
                     unit += 1
 
             # SUB borrow propagation (same threshold adjustment as ADD)
@@ -900,16 +904,17 @@ class CarryPropagationPostOp(PureFFN):
                     self.W_up.data[unit, sub_carry_in] = S * carry_weight
                     # Removed: self.W_up.data[unit, BD.OP_SUB] = S
                     self.W_up.data[unit, BD.IS_BYTE] = S
-                    self.W_up.data[unit, BD.MARK_AX] = -S * 1000
-                    self.W_up.data[unit, BD.MARK_PC] = -S * 1000
+                    self.W_up.data[unit, BD.H1 + 1] = S
+                    self.W_up.data[unit, BD.MARK_AX] = -S * 5000
+                    self.W_up.data[unit, BD.MARK_PC] = -S * 5000
                     self.W_up.data[unit, byte_dim] = S
-                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = S
-                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = S
+                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = S * output_weight
+                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = S * output_weight
                     for other in range(16):
                         if other != lo:
-                            self.W_up.data[unit, BD.OUTPUT_LO + other] = -S * 3
+                            self.W_up.data[unit, BD.OUTPUT_LO + other] = -S * mismatch_weight
                         if other != hi:
-                            self.W_up.data[unit, BD.OUTPUT_HI + other] = -S * 3
+                            self.W_up.data[unit, BD.OUTPUT_HI + other] = -S * mismatch_weight
                     for op_dim in non_arith_ops:
                         self.W_up.data[unit, op_dim] = -S * 20
                     self.W_up.data[unit, BD.OP_ADD] = -S * 20
@@ -928,14 +933,16 @@ class CarryPropagationPostOp(PureFFN):
                     for wrong_dim in wrong_byte_dims:
                         self.W_up.data[unit, wrong_dim] = -S * 10
                     # Match the ADD threshold: OUTPUT alone is not a borrow.
-                    self.b_up.data[unit] = -S * (carry_threshold + (1.0 if cascade else 0.0))
-                    self.W_gate.data[unit, BD.H1 + 1] = 1.0
+                    self.b_up.data[unit] = -S * (
+                        cascade_carry_threshold if cascade else carry_threshold
+                    )
+                    self.W_gate.data[unit, sub_carry_in] = 0.5
                     self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
                     self.W_down.data[BD.OUTPUT_HI + hi, unit] = -2.0 / S
                     self.W_down.data[BD.OUTPUT_LO + new_lo, unit] = 2.0 / S
                     self.W_down.data[BD.OUTPUT_HI + new_hi, unit] = 2.0 / S
                     if lo == 0 and hi == 0 and byte_idx < 2:
-                        self.W_down.data[BD.CARRY + 3, unit] = (4.0 / 3.0) / S
+                        self.W_down.data[BD.CARRY + 3, unit] = 2.0 / S
                     unit += 1
 
 
@@ -981,24 +988,27 @@ class AddSubBytePropagationPostOp(PureFFN):
                         for b in range(16):
                             result = op_fn(a, b)
                             self.W_up.data[unit, alu_base + a] = S * 2
-                            self.W_up.data[unit, out_base + b] = S
+                            self.W_up.data[unit, out_base + b] = S * 2
                             for other in range(16):
-                                # Full-model high-byte rows retain a small
-                                # stale zero residual from earlier passthrough
-                                # bakes. Treat that as neutral; other
-                                # nonmatching nibbles still block fanout from
-                                # amplified ALU residuals alone.
+                                # Penalize positive nonmatching nibbles, but
+                                # keep the weight small enough that negative
+                                # cleanup residue cannot become evidence and
+                                # fan out across many units.
                                 if other != b and other != 0:
-                                    self.W_up.data[unit, out_base + other] = -S * 15
+                                    self.W_up.data[unit, out_base + other] = -S * 0.5
                             self.W_up.data[unit, BD.IS_BYTE] = S
                             self.W_up.data[unit, BD.H1 + 1] = S
+                            for wrong_h1 in (0, 2, 3, 4, 5, 6):
+                                self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10000
                             self.W_up.data[unit, BD.BYTE_INDEX_0] = S
                             self.W_up.data[unit, BD.BYTE_INDEX_1] = -S * 10
                             self.W_up.data[unit, BD.BYTE_INDEX_2] = -S * 10
                             self.W_up.data[unit, BD.BYTE_INDEX_3] = -S * 10
-                            self.W_up.data[unit, op_dim] = S
+                            self.W_up.data[unit, op_dim] = S * 10
                             self.W_up.data[unit, suppress_op_dim] = -S * 10
-                            self.W_up.data[unit, BD.TEMP + 3] = -S * 10
+                            self.W_up.data[unit, BD.CMP + 7] = -S * 1000
+                            self.W_up.data[unit, BD.TEMP + 3] = -S
+                            self.W_up.data[unit, BD.NEXT_SE] = -S * 10000
                             for marker_dim in (
                                 BD.MARK_AX,
                                 BD.MARK_PC,
@@ -1009,11 +1019,11 @@ class AddSubBytePropagationPostOp(PureFFN):
                                 BD.MARK_SE,
                             ):
                                 self.W_up.data[unit, marker_dim] = -S * 10000
-                            self.b_up.data[unit] = -S * 16.25
+                            self.b_up.data[unit] = -S * 26.35
                             self.W_gate.data[unit, BD.CONST] = 1.0
-                            self.W_down.data[out_base + b, unit] = -(4.0 / 3.0) / S
+                            self.W_down.data[out_base + b, unit] = -2.0 / S
                             if b != 0 and result != 0:
-                                self.W_down.data[out_base + 0, unit] = -(4.0 / 3.0) / S
+                                self.W_down.data[out_base + 0, unit] = -2.0 / S
                             self.W_down.data[out_base + result, unit] = 2.0 / S
                             unit += 1
 
@@ -1035,12 +1045,16 @@ class AddSubBytePropagationPostOp(PureFFN):
                 for out_base in (BD.OUTPUT_LO, BD.OUTPUT_HI):
                     self.W_up.data[unit, BD.CARRY + 2] = S
                     self.W_up.data[unit, BD.CARRY + 1] = -S * 10
+                    self.W_up.data[unit, BD.CMP + 7] = -S * 1000
                     self.W_up.data[unit, BD.IS_BYTE] = S
                     self.W_up.data[unit, BD.H1 + 1] = S
+                    for wrong_h1 in (0, 2, 3, 4, 5, 6):
+                        self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10000
                     self.W_up.data[unit, byte_dim] = S
                     self.W_up.data[unit, BD.CLEAN_EMBED_LO + 15] = S * 2
                     self.W_up.data[unit, BD.CLEAN_EMBED_HI + 15] = S * 2
                     self.W_up.data[unit, BD.TEMP + 3] = -S * 10
+                    self.W_up.data[unit, BD.NEXT_SE] = -S * 10000
                     for wrong_dim in wrong_byte_dims:
                         self.W_up.data[unit, wrong_dim] = -S * 10
                     for marker_dim in (
@@ -1117,12 +1131,23 @@ class BitwiseBytePropagationPostOp(PureFFN):
                         self.W_up.data[unit, BD.MARK_STACK0] = -S * 10000
                         self.W_up.data[unit, BD.MARK_MEM] = -S * 10000
                         self.W_up.data[unit, BD.MARK_SE] = -S * 10000
-                        # ADD/SUB leave CARRY relays active at AX byte
-                        # positions. Those residuals must not satisfy the
-                        # bitwise detector via stale TEMP/ALU values.
-                        self.W_up.data[unit, BD.CARRY + 1] = -S * 10
-                        self.W_up.data[unit, BD.CARRY + 2] = -S * 10
-                        self.W_up.data[unit, BD.CARRY + 3] = -S * 10
+                        # Byte positions do not carry MARK_* flags. This
+                        # post-op is valid only in the AX byte span; block
+                        # other register byte spans explicitly so large late
+                        # OUTPUT/TEMP residuals cannot masquerade as bitwise
+                        # AX-byte evidence.
+                        self.W_up.data[unit, BD.H1 + 0] = -S * 10000
+                        self.W_up.data[unit, BD.H1 + 2] = -S * 10000
+                        self.W_up.data[unit, BD.H1 + 3] = -S * 10000
+                        # ADD/SUB/wide ALU rows can carry very large OUTPUT
+                        # and ALU residue at AX bytes. This detector is valid
+                        # only for relayed bitwise op rows (TEMP[4..6]).
+                        self.W_up.data[unit, BD.TEMP + 8] = -S * 10000
+                        self.W_up.data[unit, BD.TEMP + 9] = -S * 10000
+                        self.W_up.data[unit, BD.TEMP + 10] = -S * 10000
+                        self.W_up.data[unit, BD.CARRY + 1] = -S * 10000
+                        self.W_up.data[unit, BD.CARRY + 2] = -S * 10000
+                        self.W_up.data[unit, BD.CARRY + 3] = -S * 10000
                         # Autoregressive alignment: BYTE_INDEX_0/1/2 queries
                         # predict AX bytes 1/2/3. Only BYTE_INDEX_3 predicts
                         # the following marker and must be blocked here.
@@ -1138,7 +1163,7 @@ class BitwiseBytePropagationPostOp(PureFFN):
                         # cleared nibbles can be negative, and a negative
                         # SwiGLU gate would invert the write instead of
                         # suppressing it.
-                        self.W_gate.data[unit, BD.CONST] = 1.0
+                        self.W_gate.data[unit, op_dim] = 1.0
                         self.W_down.data[BD.OUTPUT_LO + a_lo, unit] = -2.0 / S
                         self.W_down.data[BD.OUTPUT_LO + r, unit] = 2.0 / S
                         unit += 1
@@ -1157,15 +1182,21 @@ class BitwiseBytePropagationPostOp(PureFFN):
                         self.W_up.data[unit, BD.MARK_STACK0] = -S * 10000
                         self.W_up.data[unit, BD.MARK_MEM] = -S * 10000
                         self.W_up.data[unit, BD.MARK_SE] = -S * 10000
+                        self.W_up.data[unit, BD.H1 + 0] = -S * 10000
+                        self.W_up.data[unit, BD.H1 + 2] = -S * 10000
+                        self.W_up.data[unit, BD.H1 + 3] = -S * 10000
                         # See low-nibble branch above.
-                        self.W_up.data[unit, BD.CARRY + 1] = -S * 10
-                        self.W_up.data[unit, BD.CARRY + 2] = -S * 10
-                        self.W_up.data[unit, BD.CARRY + 3] = -S * 10
+                        self.W_up.data[unit, BD.TEMP + 8] = -S * 10000
+                        self.W_up.data[unit, BD.TEMP + 9] = -S * 10000
+                        self.W_up.data[unit, BD.TEMP + 10] = -S * 10000
+                        self.W_up.data[unit, BD.CARRY + 1] = -S * 10000
+                        self.W_up.data[unit, BD.CARRY + 2] = -S * 10000
+                        self.W_up.data[unit, BD.CARRY + 3] = -S * 10000
                         # See low-nibble branch above for the AR alignment.
                         self.W_up.data[unit, BD.BYTE_INDEX_3] = -S * 10
                         self.W_up.data[unit, BD.H4 + 3] = -S * 10000
                         self.b_up.data[unit] = -S * 12.5
-                        self.W_gate.data[unit, BD.CONST] = 1.0
+                        self.W_gate.data[unit, op_dim] = 1.0
                         self.W_down.data[BD.OUTPUT_HI + a_hi, unit] = -2.0 / S
                         self.W_down.data[BD.OUTPUT_HI + r, unit] = 2.0 / S
                         unit += 1
@@ -2698,6 +2729,7 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     - SP/BP: Initialized to STACK_INIT, need byte 2 = 0x01
     """
     unit = 0
+
     # LO nibbles: copy when IS_BYTE AND NOT at register areas with custom handling
     # PC: ALL bytes have custom handling (L3 for byte 0, L3 defaults for bytes 1-3)
     # SP/BP: bytes 0-3 (L3 handles byte 2 default, L15 PSH handles changes)
@@ -3228,10 +3260,12 @@ def _set_layer4_pc_relay(attn, S, BD, HD):
     for k in range(16):
         attn.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
         attn.W_v[base + 17 + k, BD.EMBED_HI + k] = 1.0
+        attn.W_v[base + 33 + k, BD.ADDR_KEY + 32 + k] = 1.0
     # O: writes to EMBED_LO and EMBED_HI at AX marker
     for k in range(16):
         attn.W_o[BD.EMBED_LO + k, base + 1 + k] = 1.0
         attn.W_o[BD.EMBED_HI + k, base + 17 + k] = 1.0
+        attn.W_o[BD.ADDR_KEY + 32 + k, base + 33 + k] = 1.0
 
     # Anti-leakage gate: suppress at non-AX positions
     GATE = 33
@@ -3256,10 +3290,12 @@ def _set_layer4_pc_relay(attn, S, BD, HD):
     for k in range(16):
         attn.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
         attn.W_v[base + 17 + k, BD.EMBED_HI + k] = 1.0
+        attn.W_v[base + 33 + k, BD.ADDR_KEY + 32 + k] = 1.0
     # O: write to TEMP dims at byte positions (PC value staging for L4 FFN)
     for k in range(16):
         attn.W_o[BD.TEMP + k, base + 1 + k] = 1.0
         attn.W_o[BD.TEMP + 16 + k, base + 17 + k] = 1.0
+        attn.W_o[BD.ADDR_KEY + 32 + k, base + 33 + k] = 1.0
     # Anti-leakage gate: suppress at non-byte positions
     GATE1 = 33
     attn.W_q[base + GATE1, BD.IS_BYTE] = 500.0
@@ -3839,6 +3875,18 @@ def _set_layer6_attn(attn, S, BD, HD):
     for k in range(16):
         attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
         attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
+    # Branch byte-1 relay: PC byte 0 re-reads the PC marker so L6 FFN can
+    # emit byte1(target) for taken BZ/BNZ targets above 255.
+    attn.W_v[base + 32, BD.OP_BZ] = 1.0
+    attn.W_v[base + 33, BD.OP_BNZ] = 1.0
+    attn.W_o[BD.OP_BZ, base + 32] = 1.0
+    attn.W_o[BD.OP_BNZ, base + 33] = 1.0
+    branch_pc_byte0_relay = 52
+    attn.W_q[base + branch_pc_byte0_relay, BD.IS_BYTE] = 300.0
+    attn.W_q[base + branch_pc_byte0_relay, BD.H1 + 0] = 300.0
+    attn.W_q[base + branch_pc_byte0_relay, BD.BYTE_INDEX_0] = 300.0
+    attn.W_q[base + branch_pc_byte0_relay, BD.MARK_PC] = -300.0
+    attn.W_k[base + branch_pc_byte0_relay, BD.MARK_PC] = 50.0
     # FIX 2026-05-09: REMOVED `attn.W_o[BD.OP_EXIT, base + 4] = 1.0`. This was a
     # leftover OP_* relay (the comment above explicitly says we only relay FETCH
     # because OP_* is set globally by L5 FFN). Slot 4 is also used by FETCH_LO[4]
@@ -3857,6 +3905,14 @@ def _set_layer6_attn(attn, S, BD, HD):
     attn.W_q[base + FETCH_GATE, BD.MARK_AX] = 500.0
     attn.W_q[base + FETCH_GATE, BD.CONST] = -500.0
     attn.W_k[base + FETCH_GATE, BD.CONST] = 5.0
+    # AX byte rows also carry MARK_AX, but they need L4's PC+2/3/4 FETCH
+    # address, not the first immediate byte relayed from the PC marker.
+    AX_BYTE_FETCH_BLOCKER = 53
+    attn.W_q[base + AX_BYTE_FETCH_BLOCKER, BD.H1 + 1] = -6500.0
+    attn.W_q[base + AX_BYTE_FETCH_BLOCKER, BD.IS_BYTE] = -6500.0
+    attn.W_q[base + AX_BYTE_FETCH_BLOCKER, BD.MARK_AX] = 6500.0
+    attn.W_q[base + AX_BYTE_FETCH_BLOCKER, BD.H1 + 0] = 6500.0
+    attn.W_k[base + AX_BYTE_FETCH_BLOCKER, BD.CONST] = 5.0
     # HAS_SE gate: block attention when HAS_SE = 1 (non-first steps)
     # Without this gate, softmax1 distributes attention uniformly when Q is zero,
     # causing spurious FETCH relay from step 1 PC marker (which has V[18]=40.0 from L5).
@@ -3865,6 +3921,14 @@ def _set_layer6_attn(attn, S, BD, HD):
     HAS_SE_GATE = 49  # Free slot after FETCH_HI (slots 0-48 used)
     attn.W_q[base + HAS_SE_GATE, BD.HAS_SE] = -500.0
     attn.W_k[base + HAS_SE_GATE, BD.CONST] = 5.0
+    # After a JSR into a function prologue, relay the ENT immediate from AX
+    # to SP so declarative SP-write rules can handle larger frame sizes.
+    ent_sp_fetch_gate = 51
+    attn.W_q[base + ent_sp_fetch_gate, BD.MARK_SP] = 500.0
+    attn.W_q[base + ent_sp_fetch_gate, BD.HAS_SE] = 500.0
+    attn.W_q[base + ent_sp_fetch_gate, BD.CONST] = -500.0
+    attn.W_k[base + ent_sp_fetch_gate, BD.MARK_AX] = 5.0
+    attn.W_k[base + ent_sp_fetch_gate, BD.OP_ENT] = 5.0
 
 
 def _set_layer6_routing_ffn(ffn, S, BD):
@@ -4297,10 +4361,10 @@ def _set_layer6_routing_ffn(ffn, S, BD):
             ffn.W_up[unit, marker_dim] = S
             ffn.W_up[unit, BD.IS_BYTE] = -S  # NOT IS_BYTE
             ffn.W_up[unit, BD.HAS_SE] = S
-            # Marker residuals are around 2.0 at emitted register markers.
+            # Marker residuals are around 1.0 in the compact declarative path.
             # Require HAS_SE so this identity path is disabled on the
             # synthetic first step, where L3 owns SP/BP/STACK0 defaults.
-            ffn.b_up[unit] = -S * 2.5
+            ffn.b_up[unit] = -S * 1.5
             ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
             ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
             unit += 1
@@ -4308,7 +4372,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
             ffn.W_up[unit, marker_dim] = S
             ffn.W_up[unit, BD.IS_BYTE] = -S  # NOT IS_BYTE
             ffn.W_up[unit, BD.HAS_SE] = S
-            ffn.b_up[unit] = -S * 2.5
+            ffn.b_up[unit] = -S * 1.5
             ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
             ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
             unit += 1
@@ -4335,7 +4399,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         ffn.b_up[unit] = -S * T_psh
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         for lo_bit in range(8, 16):
-            ffn.W_gate[unit, BD.EMBED_LO + lo_bit] = -1.0
+            ffn.W_up[unit, BD.EMBED_LO + lo_bit] = -S
         ffn.W_down[BD.OUTPUT_HI + new_k_borrow, unit] = 2.0 / S
         ffn.W_down[BD.OUTPUT_HI + k, unit] += -2.0 / S  # cancel identity
         unit += 1
@@ -4355,6 +4419,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         new_k = (k - 8) % 16
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.MARK_SP] = S
+        ffn.W_up[unit, BD.HAS_SE] = -S
         ffn.b_up[unit] = -S * T_jsr_sp
         ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
@@ -4364,10 +4429,11 @@ def _set_layer6_routing_ffn(ffn, S, BD):
         new_k_borrow = (k - 1) % 16
         ffn.W_up[unit, BD.CMP + 4] = S
         ffn.W_up[unit, BD.MARK_SP] = S
+        ffn.W_up[unit, BD.HAS_SE] = -S
         ffn.b_up[unit] = -S * T_jsr_sp
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         for lo_bit in range(8, 16):
-            ffn.W_gate[unit, BD.EMBED_LO + lo_bit] = -1.0
+            ffn.W_up[unit, BD.EMBED_LO + lo_bit] = -S
         ffn.W_down[BD.OUTPUT_HI + new_k_borrow, unit] = 2.0 / S
         ffn.W_down[BD.OUTPUT_HI + k, unit] += -2.0 / S
         unit += 1
@@ -4386,6 +4452,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # LO nibble: write OUTPUT_LO[8], cancel OUTPUT_LO[0] (L3 default).
     ffn.W_up[unit, BD.OP_JSR] = S / 5
     ffn.W_up[unit, BD.MARK_SP] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
     ffn.b_up[unit] = -S * T_jsr_sp
     ffn.b_gate[unit] = 1.0  # constant gate
     ffn.W_down[BD.OUTPUT_LO + 8, unit] = 2.0 / S
@@ -4394,6 +4461,7 @@ def _set_layer6_routing_ffn(ffn, S, BD):
     # HI nibble: write OUTPUT_HI[15], cancel OUTPUT_HI[0].
     ffn.W_up[unit, BD.OP_JSR] = S / 5
     ffn.W_up[unit, BD.MARK_SP] = S
+    ffn.W_up[unit, BD.HAS_SE] = -S
     ffn.b_up[unit] = -S * T_jsr_sp
     ffn.b_gate[unit] = 1.0
     ffn.W_down[BD.OUTPUT_HI + 15, unit] = 2.0 / S
@@ -5220,6 +5288,9 @@ def _set_layer8_multibyte_fetch(attn, S, BD, HD):
     for k in range(16):
         attn.W_q[base + k, BD.FETCH_LO + k] = L
         attn.W_q[base + 16 + k, BD.FETCH_HI + k] = L
+        attn.W_q[base + 36 + k, BD.ADDR_KEY + 32 + k] = L
+    attn.W_q[base + 36, BD.CONST] = L
+    attn.W_q[base + 36, BD.HAS_SE] = -L
     # Third nibble gate: require IS_BYTE to avoid leakage at markers
     attn.W_q[base + 32, BD.IS_BYTE] = L
 
@@ -5227,7 +5298,7 @@ def _set_layer8_multibyte_fetch(attn, S, BD, HD):
     for k in range(16):
         attn.W_k[base + k, BD.ADDR_KEY + k] = L
         attn.W_k[base + 16 + k, BD.ADDR_KEY + 16 + k] = L
-    attn.W_k[base + 32, BD.ADDR_KEY + 32] = L
+        attn.W_k[base + 36 + k, BD.ADDR_KEY + 32 + k] = L
 
     # Anti-leakage gate: suppress at non-byte positions
     GATE = 33
@@ -5270,6 +5341,20 @@ def _set_layer8_alu(ffn, S, BD):
     """
     unit = 0
 
+    def _block_non_ax_marker_sites(unit_idx: int) -> None:
+        # LEA/ADJ/ENT fetch operands can be scale-40 at non-AX marker sites.
+        # These units are only valid at the AX marker.
+        for blocker_dim in (
+            BD.MARK_PC,
+            BD.MARK_SP,
+            BD.MARK_BP,
+            BD.MARK_STACK0,
+            BD.MARK_MEM,
+            BD.MARK_SE,
+            BD.IS_BYTE,
+        ):
+            ffn.W_up[unit_idx, blocker_dim] = -S * 1000
+
     # === ADD: lo nibble (256 units) ===
     for a in range(16):
         for b in range(16):
@@ -5296,17 +5381,17 @@ def _set_layer8_alu(ffn, S, BD):
 
     # === LEA: lo nibble (256 units) ===
     # Like ADD but reads from FETCH_LO instead of AX_CARRY_LO
-    # BUG FIX 2026-04-09: Require BOTH ALU_LO AND FETCH_LO to be active.
-    # At AX marker: MARK_AX=1, ALU_LO[correct]≈21, FETCH_LO[correct]≈40
-    # Threshold must be > 60+0+40=100 (MARK_AX + FETCH only) but < 60+21+40=121 (all active)
-    # Using threshold=105: both active=121-105=16>0, FETCH only=100-105=-5<0
+    # Require both ALU_LO and FETCH_LO to be active. FETCH_LO is now a clean
+    # one-hot band in the declarative path, so amplify it locally instead of
+    # assuming the older scale-40 activation.
     for a in range(16):
         for b in range(16):
             result = (a + b) % 16
             ffn.W_up[unit, BD.MARK_AX] = S * 60  # Strong MARK_AX requirement
+            _block_non_ax_marker_sites(unit)
             ffn.W_up[unit, BD.ALU_LO + a] = S
-            ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH, not AX_CARRY
-            ffn.b_up[unit] = -S * 105  # Require BOTH ALU_LO and FETCH_LO to be active
+            ffn.W_up[unit, BD.FETCH_LO + b] = S * 20  # Read from FETCH, not AX_CARRY
+            ffn.b_up[unit] = -S * 80.5
             ffn.W_gate[unit, BD.OP_LEA] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
             unit += 1
@@ -5344,14 +5429,15 @@ def _set_layer8_alu(ffn, S, BD):
                 unit += 1
 
     # === LEA carry detection (120 units: pairs where a+b >= 16) ===
-    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO to be active (threshold=105)
+    # Require BOTH ALU_LO and FETCH_LO to be active; FETCH_LO is one-hot here.
     for a in range(16):
         for b in range(16):
             if a + b >= 16:
                 ffn.W_up[unit, BD.MARK_AX] = S * 60
+                _block_non_ax_marker_sites(unit)
                 ffn.W_up[unit, BD.ALU_LO + a] = S
-                ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH
-                ffn.b_up[unit] = -S * 105  # Match LEA lo nibble threshold
+                ffn.W_up[unit, BD.FETCH_LO + b] = S * 20  # Read from FETCH
+                ffn.b_up[unit] = -S * 80.5
                 ffn.W_gate[unit, BD.OP_LEA] = 1.0
                 ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                 unit += 1
@@ -5359,27 +5445,29 @@ def _set_layer8_alu(ffn, S, BD):
     # === ADJ: lo nibble (256 units) ===
     # Like LEA but gates on OP_ADJ instead
     # ADJ computes: SP = SP + signed_immediate (gathered via L7 head 1)
-    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO (threshold=105)
+    # Require BOTH ALU_LO and FETCH_LO; FETCH_LO is one-hot here.
     for a in range(16):
         for b in range(16):
             result = (a + b) % 16
             ffn.W_up[unit, BD.MARK_AX] = S * 60
+            _block_non_ax_marker_sites(unit)
             ffn.W_up[unit, BD.ALU_LO + a] = S
-            ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH (immediate)
-            ffn.b_up[unit] = -S * 105  # Require BOTH ALU_LO and FETCH_LO to be active
+            ffn.W_up[unit, BD.FETCH_LO + b] = S * 20  # Read from FETCH (immediate)
+            ffn.b_up[unit] = -S * 85
             ffn.W_gate[unit, BD.OP_ADJ] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
             unit += 1
 
     # === ADJ carry detection (120 units: pairs where a+b >= 16) ===
-    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO (threshold=105)
+    # Require BOTH ALU_LO and FETCH_LO; FETCH_LO is one-hot here.
     for a in range(16):
         for b in range(16):
             if a + b >= 16:
                 ffn.W_up[unit, BD.MARK_AX] = S * 60
+                _block_non_ax_marker_sites(unit)
                 ffn.W_up[unit, BD.ALU_LO + a] = S
-                ffn.W_up[unit, BD.FETCH_LO + b] = S  # Read from FETCH
-                ffn.b_up[unit] = -S * 105  # Match ADJ lo nibble threshold
+                ffn.W_up[unit, BD.FETCH_LO + b] = S * 20  # Read from FETCH
+                ffn.b_up[unit] = -S * 85
                 ffn.W_gate[unit, BD.OP_ADJ] = 1.0
                 ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                 unit += 1
@@ -5405,15 +5493,16 @@ def _set_layer8_alu(ffn, S, BD):
     # For lo nibble: result_lo = (sp_lo - (8 + imm_lo)) mod 16
     # where sp_lo comes from ALU_LO (gathered by L7 head 1)
     # and imm_lo comes from FETCH_LO (instruction immediate)
-    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO (threshold=105)
+    # Require BOTH ALU_LO and FETCH_LO; FETCH_LO is one-hot here.
     for sp_lo in range(16):
         for imm_lo in range(16):
             effective_b = (8 + imm_lo) % 16  # Add constant offset 8
             result = (sp_lo - effective_b) % 16
             ffn.W_up[unit, BD.MARK_AX] = S * 60
+            _block_non_ax_marker_sites(unit)
             ffn.W_up[unit, BD.ALU_LO + sp_lo] = S  # SP lo nibble from L7
-            ffn.W_up[unit, BD.FETCH_LO + imm_lo] = S  # Immediate lo nibble
-            ffn.b_up[unit] = -S * 105  # Require BOTH ALU_LO and FETCH_LO to be active
+            ffn.W_up[unit, BD.FETCH_LO + imm_lo] = S * 20  # Immediate lo nibble
+            ffn.b_up[unit] = -S * 85
             ffn.W_gate[unit, BD.OP_ENT] = 1.0
             ffn.W_down[BD.OUTPUT_LO + result, unit] = 2.0 / S
             unit += 1
@@ -5422,7 +5511,7 @@ def _set_layer8_alu(ffn, S, BD):
     # Borrow when sp_lo < (8 + imm_lo) mod 16
     # Must enumerate all cases (not just where borrow occurs) because
     # the condition depends on the constant 8, not just relative magnitudes
-    # BUG FIX 2026-04-09: Require BOTH ALU_LO and FETCH_LO (threshold=105)
+    # Require BOTH ALU_LO and FETCH_LO; FETCH_LO is one-hot here.
     for sp_lo in range(16):
         for imm_lo in range(16):
             effective_b = (8 + imm_lo) % 16
@@ -5433,9 +5522,10 @@ def _set_layer8_alu(ffn, S, BD):
             if sp_lo < (full_sum % 16) or full_sum >= 16:
                 # Need borrow from byte 1
                 ffn.W_up[unit, BD.MARK_AX] = S * 60
+                _block_non_ax_marker_sites(unit)
                 ffn.W_up[unit, BD.ALU_LO + sp_lo] = S
-                ffn.W_up[unit, BD.FETCH_LO + imm_lo] = S
-                ffn.b_up[unit] = -S * 105
+                ffn.W_up[unit, BD.FETCH_LO + imm_lo] = S * 20
+                ffn.b_up[unit] = -S * 85
                 ffn.W_gate[unit, BD.OP_ENT] = 1.0
                 ffn.W_down[BD.CARRY + 0, unit] = 2.0 / (S * 5.0)
                 unit += 1
@@ -5629,6 +5719,20 @@ def _set_layer9_alu(ffn, S, BD):
     """
     unit = 0
 
+    def _block_non_ax_marker_sites(unit_idx: int) -> None:
+        # LEA/ADJ/ENT fetch operands can be scale-40 at non-AX marker sites.
+        # These units are only valid at the AX marker.
+        for blocker_dim in (
+            BD.MARK_PC,
+            BD.MARK_SP,
+            BD.MARK_BP,
+            BD.MARK_STACK0,
+            BD.MARK_MEM,
+            BD.MARK_SE,
+            BD.IS_BYTE,
+        ):
+            ffn.W_up[unit_idx, blocker_dim] = -S * 1000
+
     # === ADD hi nibble (no carry 256 + with carry 256 = 512 units) ===
     for carry_in in [0, 1]:
         for a in range(16):
@@ -5654,23 +5758,23 @@ def _set_layer9_alu(ffn, S, BD):
                 unit += 1
 
     # === LEA hi nibble (no carry 256 + with carry 256 = 512 units) ===
-    # BUG FIX 2026-04-09: Require MARK_AX + ALU_HI + FETCH_HI to all be active.
-    # At PC marker (MARK_AX=0): ALU_HI[wrong]≈12 + FETCH_HI[correct]≈43 = 55 (must block)
-    # At AX marker (MARK_AX=1): 1 + ALU_HI[correct]≈21 + FETCH_HI[correct]≈40 = 62 (must fire)
-    # Using threshold=58: PC marker=55-58=-3<0 (blocked), AX marker=62-58=4>0 (fires)
+    # Require MARK_AX + ALU_HI + FETCH_HI. FETCH_HI is one-hot in the
+    # declarative path, so amplify MARK_AX and FETCH_HI locally. Thresholds
+    # still block PC-marker ALU/FETCH leakage and discriminate carry state.
     for carry_in in [0, 1]:
         for a in range(16):
             for b in range(16):
                 result = (a + b + carry_in) % 16
-                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_AX] = S * 20
+                _block_non_ax_marker_sites(unit)
                 ffn.W_up[unit, BD.ALU_HI + a] = S
-                ffn.W_up[unit, BD.FETCH_HI + b] = S  # Read from FETCH
+                ffn.W_up[unit, BD.FETCH_HI + b] = S * 20  # Read from FETCH
                 if carry_in == 0:
-                    ffn.W_up[unit, BD.CARRY + 0] = -0.01
-                    ffn.b_up[unit] = -S * 58  # Require MARK_AX + ALU_HI + FETCH_HI
+                    ffn.W_up[unit, BD.CARRY + 0] = -S * 8.0
+                    ffn.b_up[unit] = -S * 40.5
                 else:
-                    ffn.W_up[unit, BD.CARRY + 0] = 0.01
-                    ffn.b_up[unit] = -S * 58.4  # Slightly higher for carry case
+                    ffn.W_up[unit, BD.CARRY + 0] = S * 8.0
+                    ffn.b_up[unit] = -S * 48.5
                 ffn.W_gate[unit, BD.OP_LEA] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
@@ -5678,20 +5782,21 @@ def _set_layer9_alu(ffn, S, BD):
     # === ADJ hi nibble (no carry 256 + with carry 256 = 512 units) ===
     # Like LEA but gates on OP_ADJ instead
     # ADJ computes: SP = SP + signed_immediate
-    # BUG FIX 2026-04-09: Require MARK_AX + ALU_HI + FETCH_HI (threshold=58)
+    # Require MARK_AX + ALU_HI + FETCH_HI; FETCH_HI is one-hot here.
     for carry_in in [0, 1]:
         for a in range(16):
             for b in range(16):
                 result = (a + b + carry_in) % 16
-                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.MARK_AX] = S * 20
+                _block_non_ax_marker_sites(unit)
                 ffn.W_up[unit, BD.ALU_HI + a] = S
-                ffn.W_up[unit, BD.FETCH_HI + b] = S  # Read from FETCH
+                ffn.W_up[unit, BD.FETCH_HI + b] = S * 20  # Read from FETCH
                 if carry_in == 0:
-                    ffn.W_up[unit, BD.CARRY + 0] = -0.01
-                    ffn.b_up[unit] = -S * 58  # Require MARK_AX + ALU_HI + FETCH_HI
+                    ffn.W_up[unit, BD.CARRY + 0] = -S * 8.0
+                    ffn.b_up[unit] = -S * 42
                 else:
-                    ffn.W_up[unit, BD.CARRY + 0] = 0.01
-                    ffn.b_up[unit] = -S * 58.4  # Slightly higher for carry case
+                    ffn.W_up[unit, BD.CARRY + 0] = S * 8.0
+                    ffn.b_up[unit] = -S * 50
                 ffn.W_gate[unit, BD.OP_ADJ] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
@@ -5720,7 +5825,7 @@ def _set_layer9_alu(ffn, S, BD):
     # ENT computes: SP = SP - (8 + signed_immediate)
     # For bytes 1-3, we subtract imm_byte with borrow propagation
     # The +8 offset affects byte 0 only; its overflow propagates as a borrow
-    # BUG FIX 2026-04-09: Require MARK_AX + ALU_HI + FETCH_HI (threshold=58)
+    # Require MARK_AX + ALU_HI + FETCH_HI; FETCH_HI is one-hot here.
     # BUG FIX 2026-04-17: Add MARK_SP blocker. When OP_ENT is amplified to 22+,
     # the gate opens fully and ALU_HI[0]=58 at SP marker meets the threshold,
     # causing OUTPUT_HI[15] to be written instead of OUTPUT_HI[0].
@@ -5728,18 +5833,18 @@ def _set_layer9_alu(ffn, S, BD):
         for sp_hi in range(16):
             for imm_hi in range(16):
                 result = (sp_hi - imm_hi - borrow_in) % 16
-                ffn.W_up[unit, BD.MARK_AX] = S
-                ffn.W_up[unit, BD.MARK_SP] = -S * 2.0  # Block at SP marker
+                ffn.W_up[unit, BD.MARK_AX] = S * 20
+                _block_non_ax_marker_sites(unit)
                 ffn.W_up[unit, BD.ALU_HI + sp_hi] = S  # SP hi nibble from L7
-                ffn.W_up[unit, BD.FETCH_HI + imm_hi] = S  # Immediate hi nibble
+                ffn.W_up[unit, BD.FETCH_HI + imm_hi] = S * 20  # Immediate hi nibble
                 if borrow_in == 0:
                     # No borrow: block when CARRY active
-                    ffn.W_up[unit, BD.CARRY + 0] = -S * 2.0
-                    ffn.b_up[unit] = -S * 58  # Require MARK_AX + ALU_HI + FETCH_HI
+                    ffn.W_up[unit, BD.CARRY + 0] = -S * 8.0
+                    ffn.b_up[unit] = -S * 42
                 else:
                     # With borrow: require CARRY active
-                    ffn.W_up[unit, BD.CARRY + 0] = S * 2.0
-                    ffn.b_up[unit] = -S * 60  # Higher threshold (4-way AND)
+                    ffn.W_up[unit, BD.CARRY + 0] = S * 8.0
+                    ffn.b_up[unit] = -S * 50
                 ffn.W_gate[unit, BD.OP_ENT] = 1.0
                 ffn.W_down[BD.OUTPUT_HI + result, unit] = 2.0 / S
                 unit += 1
@@ -6856,8 +6961,9 @@ def _set_layer14_alu_nocarry_ax_bytes_zero(ffn, S, BD, start_unit=0):
     # Unit 0: -3/S on all OUTPUT_LO[k] (bytes 1-3 only — byte 0 blocked)
     ffn.W_up[unit, BD.IS_BYTE] = S
     ffn.W_up[unit, BD.H1 + 1] = S  # H1 at AX marker index (AX_I = 1)
+    ffn.W_up[unit, BD.TEMP + 7] = S * 4
     ffn.W_up[unit, BD.BYTE_INDEX_3] = -S * 4  # Block after AX byte 3.
-    ffn.b_up[unit] = -S * 1.5
+    ffn.b_up[unit] = -S * 5.0
     ffn.W_gate[unit, BD.TEMP + 7] = 1.0  # NOCARRY_ALU_OP relay
     for k in range(16):
         ffn.W_down[BD.OUTPUT_LO + k, unit] = -3.0 / S
@@ -6866,8 +6972,9 @@ def _set_layer14_alu_nocarry_ax_bytes_zero(ffn, S, BD, start_unit=0):
     # Unit 1: -3/S on all OUTPUT_HI[k] (bytes 1-3 only)
     ffn.W_up[unit, BD.IS_BYTE] = S
     ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.W_up[unit, BD.TEMP + 7] = S * 4
     ffn.W_up[unit, BD.BYTE_INDEX_3] = -S * 4
-    ffn.b_up[unit] = -S * 1.5
+    ffn.b_up[unit] = -S * 5.0
     ffn.W_gate[unit, BD.TEMP + 7] = 1.0
     for k in range(16):
         ffn.W_down[BD.OUTPUT_HI + k, unit] = -3.0 / S
@@ -6876,8 +6983,9 @@ def _set_layer14_alu_nocarry_ax_bytes_zero(ffn, S, BD, start_unit=0):
     # Unit 2: +5/S boost on OUTPUT_LO[0] (bytes 1-3 only)
     ffn.W_up[unit, BD.IS_BYTE] = S
     ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.W_up[unit, BD.TEMP + 7] = S * 4
     ffn.W_up[unit, BD.BYTE_INDEX_3] = -S * 4
-    ffn.b_up[unit] = -S * 1.5
+    ffn.b_up[unit] = -S * 5.0
     ffn.W_gate[unit, BD.TEMP + 7] = 1.0
     ffn.W_down[BD.OUTPUT_LO + 0, unit] = 5.0 / S
     unit += 1
@@ -6885,8 +6993,9 @@ def _set_layer14_alu_nocarry_ax_bytes_zero(ffn, S, BD, start_unit=0):
     # Unit 3: +5/S boost on OUTPUT_HI[0] (bytes 1-3 only)
     ffn.W_up[unit, BD.IS_BYTE] = S
     ffn.W_up[unit, BD.H1 + 1] = S
+    ffn.W_up[unit, BD.TEMP + 7] = S * 4
     ffn.W_up[unit, BD.BYTE_INDEX_3] = -S * 4
-    ffn.b_up[unit] = -S * 1.5
+    ffn.b_up[unit] = -S * 5.0
     ffn.W_gate[unit, BD.TEMP + 7] = 1.0
     ffn.W_down[BD.OUTPUT_HI + 0, unit] = 5.0 / S
     unit += 1
@@ -7372,6 +7481,14 @@ def _set_layer15_memory_lookup(attn, S, BD, HD):
                     attn.W_o[BD.TEMP + 16 + k, base + 48 + k] = 1.0
             # Heads 9-11: No O projection (they write at byte positions later)
 
+    # Keep legacy_bake's L15 lookup guards in parity with the declarative L15
+    # op while L15 attention is still a legacy-wrapper surface.
+    from .unified_compiler.ops.l15_ops import (
+        _suppress_l15_lookup_during_current_store_generation,
+    )
+
+    _suppress_l15_lookup_during_current_store_generation(attn, BD, HD)
+
 
 # =============================================================================
 # L16: LEV register routing (Phase 3)
@@ -7617,19 +7734,19 @@ def _set_layer16_lev_routing(ffn, S, BD):
     # Add TEMP values to OUTPUT
     for k in range(16):
         # TEMP_LO[k] → OUTPUT_LO[k] at PC marker
-        ffn.W_up[unit, BD.OP_LEV] = S / 10
+        ffn.W_up[unit, BD.OP_LEV] = S
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.TEMP + k] = S
-        ffn.b_up[unit] = -S * 2.0
+        ffn.b_up[unit] = -S * 3.5
         ffn.W_gate[unit, BD.CONST] = 1.0
         ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
         unit += 1
     for k in range(16):
         # TEMP_HI[k] → OUTPUT_HI[k] at PC marker
-        ffn.W_up[unit, BD.OP_LEV] = S / 10
+        ffn.W_up[unit, BD.OP_LEV] = S
         ffn.W_up[unit, BD.MARK_PC] = S
         ffn.W_up[unit, BD.TEMP + 16 + k] = S
-        ffn.b_up[unit] = -S * 2.0
+        ffn.b_up[unit] = -S * 3.5
         ffn.W_gate[unit, BD.CONST] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
         unit += 1
@@ -8179,7 +8296,7 @@ def _set_binary_pop_sp_increment(ffn, S, BD):
         ffn.b_up[unit] = -S * T_pop
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         for lo_bit in range(8):
-            ffn.W_gate[unit, BD.EMBED_LO + lo_bit] = -1.0
+            ffn.W_up[unit, BD.EMBED_LO + lo_bit] = -S
         ffn.W_down[BD.OUTPUT_HI + new_k_carry, unit] = 2.0 / S
         ffn.W_down[BD.OUTPUT_HI + k, unit] += -2.0 / S  # cancel identity
         unit += 1
@@ -8318,18 +8435,19 @@ def _set_function_call_weights(model, S, BD, HD):
 
     # --- LEA first-step: Initialize ALU with BP default (2 units: 850-851) ---
     # For first step, set ALU = BP_default = 0x00010000, byte 0 = 0x00
-    # Gate on: OP_LEA + MARK_AX + NOT HAS_SE
+    # Gate on: OP_LEA + MARK_AX + NOT HAS_SE. OP_LEA is now a strong decoded
+    # flag (~5), so HAS_SE must dominate it on later steps.
     # Subsequent steps use Layer 7 attention relay from BP marker.
     ffn6.W_up[unit, BD.OP_LEA] = S
     ffn6.W_up[unit, BD.MARK_AX] = S
-    ffn6.W_up[unit, BD.HAS_SE] = -S
-    ffn6.b_up[unit] = -S * 1.5  # OP_LEA(~2.4) + MARK_AX(1) - HAS_SE(0) = 3.4 > 1.5
+    ffn6.W_up[unit, BD.HAS_SE] = -S * 10
+    ffn6.b_up[unit] = -S * 1.5
     ffn6.b_gate[unit] = 1.0
     ffn6.W_down[BD.ALU_LO + 0, unit] = 2.0 / S  # nibble 0
     unit += 1
     ffn6.W_up[unit, BD.OP_LEA] = S
     ffn6.W_up[unit, BD.MARK_AX] = S
-    ffn6.W_up[unit, BD.HAS_SE] = -S
+    ffn6.W_up[unit, BD.HAS_SE] = -S * 10
     ffn6.b_up[unit] = -S * 1.5
     ffn6.b_gate[unit] = 1.0
     ffn6.W_down[BD.ALU_HI + 0, unit] = 2.0 / S  # nibble 0
@@ -8585,7 +8703,7 @@ def _set_function_call_weights(model, S, BD, HD):
         ffn6.W_gate[unit, BD.TEMP + 16 + k] = 1.0  # old SP hi nibble
         # Detect borrow: old SP lo < 8 → TEMP[8..15] not hot
         for lo_bit in range(8, 16):
-            ffn6.W_gate[unit, BD.TEMP + lo_bit] = -1.0
+            ffn6.W_up[unit, BD.TEMP + lo_bit] = -S
         ffn6.W_down[BD.OUTPUT_HI + new_k_borrow, unit] = 2.0 / S
         ffn6.W_down[BD.OUTPUT_HI + k, unit] += -2.0 / S
         unit += 1

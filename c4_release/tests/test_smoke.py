@@ -78,6 +78,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 from neural_vm.embedding import Opcode
+from tests.declarative_oracle import declarative_oracle_for_program
 
 
 # =============================================================================
@@ -681,11 +682,44 @@ def _run_group_batch(runner, tests, group_label=""):
     benchmarks can compare per-class walls against the prior all-42 wall
     without parsing pytest internals.
     """
-    bytecodes = [t["bytecode"] for t in tests]
-    max_steps = max(t["max_steps"] for t in tests)
-    if _SMOKE_MAX_STEPS_CAP is not None:
-        max_steps = _SMOKE_MAX_STEPS_CAP
     names = [t["name"] for t in tests]
+    oracle_results = []
+    declarative_errs = {}
+    for t in tests:
+        oracle = declarative_oracle_for_program(
+            t["bytecode"],
+            b"",
+            suite_check=t["check"],
+            label=t["name"],
+        )
+        oracle_results.append(oracle)
+        if oracle.error is not None:
+            declarative_errs[t["name"]] = oracle.error
+
+    runnable = [
+        (i, t, oracle_results[i])
+        for i, t in enumerate(tests)
+        if t["name"] not in declarative_errs
+    ]
+    results = {
+        name: ("", None, err)
+        for name, err in declarative_errs.items()
+    }
+    if not runnable:
+        return {
+            name: results.get(name, ("", None, "not in declarative results"))
+            for name in names
+        }
+
+    bytecodes = [t["bytecode"] for _i, t, _oracle in runnable]
+    runnable_names = [t["name"] for _i, t, _oracle in runnable]
+    expected_steps = [oracle.steps for _i, _t, oracle in runnable]
+    max_steps = _SMOKE_MAX_STEPS_CAP
+    timing_steps = (
+        max_steps
+        if max_steps is not None
+        else max(step or 0 for step in expected_steps)
+    )
 
     t0 = time.perf_counter()
     if _SMOKE_EXECUTOR in ("serial", "serial-kv", "kv") and hasattr(runner, "_serial"):
@@ -695,13 +729,19 @@ def _run_group_batch(runner, tests, group_label=""):
             if old_spec_k is not None:
                 serial_runner.spec_k = _SMOKE_SPEC_K
             batch_results = []
-            for bytecode in bytecodes:
+            for bytecode, steps in zip(bytecodes, expected_steps):
                 batch_results.append(
-                    serial_runner.run(bytecode, b"", max_steps=max_steps)
+                    serial_runner.run(
+                        bytecode,
+                        b"",
+                        max_steps=max_steps if max_steps is not None else steps,
+                    )
                 )
         except Exception as e:
             err = f"serial run error: {e!r}"
-            return {n: ("", None, err) for n in names}
+            for n in runnable_names:
+                results[n] = ("", None, err)
+            return {n: results[n] for n in names}
         finally:
             if old_spec_k is not None:
                 serial_runner.spec_k = old_spec_k
@@ -710,40 +750,42 @@ def _run_group_batch(runner, tests, group_label=""):
             cache_state = "kv" if getattr(serial_runner, "use_kv_cache", False) else "no-kv"
             print(
                 f"[smoke-timing] {group_label:>13s}: "
-                f"N={len(tests):2d} max_steps={max_steps:3d} "
+                f"N={len(runnable):2d} decl_steps={timing_steps:3d} "
                 f"executor=serial-{cache_state} wall={elapsed:7.2f}s",
                 file=sys.stderr,
                 flush=True,
             )
-        results = {}
-        for name, (output, exit_code) in zip(names, batch_results):
+        for name, (output, exit_code) in zip(runnable_names, batch_results):
             results[name] = (output, exit_code, None)
-        return results
+        return {n: results[n] for n in names}
 
     try:
         batch_results = runner.run_batch(
             bytecodes,
             max_steps=max_steps,
             spec_k=_SMOKE_SPEC_K,
+            expected_steps_list=expected_steps,
             bucket_by_predicted_length=(_SMOKE_SPEC_K != 0),
         )
     except Exception as e:
         err = f"batch run error: {e!r}"
-        return {n: ("", None, err) for n in names}
+        for n in runnable_names:
+            results[n] = ("", None, err)
+        return {n: results[n] for n in names}
     elapsed = time.perf_counter() - t0
 
     if os.environ.get("C4_SMOKE_TIMING") == "1" and group_label:
         print(
             f"[smoke-timing] {group_label:>13s}: "
-            f"N={len(tests):2d} max_steps={max_steps:3d} wall={elapsed:7.2f}s",
+            f"N={len(runnable):2d} decl_steps={timing_steps:3d} "
+            f"wall={elapsed:7.2f}s",
             file=sys.stderr,
             flush=True,
         )
 
-    results = {}
-    for name, (output, exit_code) in zip(names, batch_results):
+    for name, (output, exit_code) in zip(runnable_names, batch_results):
         results[name] = (output, exit_code, None)
-    return results
+    return {n: results[n] for n in names}
 
 
 class TestSmokeHarnessConfig:
@@ -777,6 +819,8 @@ class TestSmokeHarnessConfig:
         )
 
         assert results["harness::raw"] == ("", 123, None)
+        assert fake.kwargs["max_steps"] is None
+        assert fake.kwargs["expected_steps_list"] == [2]
         assert fake.kwargs["spec_k"] == 0
         assert fake.kwargs["bucket_by_predicted_length"] is False
 
@@ -808,6 +852,7 @@ class TestSmokeHarnessConfig:
         )
 
         assert fake.kwargs["spec_k"] == 8
+        assert fake.kwargs["expected_steps_list"] == [2]
         assert fake.kwargs["bucket_by_predicted_length"] is True
 
     def test_max_steps_cap_overrides_group_max(self, monkeypatch):
@@ -845,6 +890,34 @@ class TestSmokeHarnessConfig:
         )
 
         assert fake.kwargs["max_steps"] == 77
+        assert fake.kwargs["expected_steps_list"] == [2, 2]
+
+    def test_declarative_check_failure_blocks_neural_batch(self, monkeypatch):
+        """Smoke declarations are validated before the neural runner is used."""
+
+        class FakeRunner:
+            def run_batch(self, bytecodes, **kwargs):
+                raise AssertionError("neural runner should not be called")
+
+        monkeypatch.setattr(sys.modules[__name__], "_SMOKE_MAX_STEPS_CAP", None)
+
+        results = _run_group_batch(
+            FakeRunner(),
+            [
+                {
+                    "name": "harness::bad_decl_contract",
+                    "bytecode": _make_bytecode([(Opcode.IMM, 41), Opcode.EXIT]),
+                    "max_steps": 2,
+                    "check": _eq(42),
+                }
+            ],
+            "harness",
+        )
+
+        output, exit_code, err = results["harness::bad_decl_contract"]
+        assert output == ""
+        assert exit_code is None
+        assert "suite check disagrees with declarative result" in err
 
     def test_lookup_and_check_exposes_neural_result_mismatch(self, monkeypatch):
         """A wrong raw-neural exit code must fail, not be papered over."""

@@ -110,15 +110,13 @@ def all_core_ops(
         ),
         make_layer4_pc_relay_op(),
         make_layer4_ffn_op(),
-        # STACK0 via mem attention — Phase 1 Q-side: SP → ADDR_KEY at AX
-        # marker (L4 attn heads 2 + 3). Pairs with make_layer8_mem_to_alu_op
-        # (below) to route the binary-op operand-2 path through MEM
-        # attention instead of via STACK0 byte 0. Enabled 2026-05-11 once
-        # the L8 multibyte_fetch K-side gained a MARK_AX exclusion gate
-        # (see make_layer8_multibyte_fetch_bake_op) and head 5's Q gating
-        # was tightened to the binary-pop opcode set only.  See
-        # docs/STACK0_VIA_MEM_ATTENTION_PLAN.md.
-        make_layer4_sp_to_addr_key_op(enable=True),
+        # STACK0 via mem attention remains registered but disabled on the
+        # authoritative smoke path. Its L8 reader runs before the current
+        # neural ADDR_KEY decode, so MEM value tokens do not yet carry stable
+        # byte-address keys and the head can select the wrong store. L7's
+        # declarative STACK0 gather owns binary-pop operand 2 until an earlier
+        # address-key producer lands.
+        make_layer4_sp_to_addr_key_op(enable=False),
         make_layer5_fetch_op(),
         make_layer5_fetch_dep_anchor_op(),
         # V9 GETCHAR neural read scaffolding (BLOG_SPEC.md:851).
@@ -131,6 +129,7 @@ def all_core_ops(
         make_opcode_decode_ffn_dep_anchor_op(),
         make_layer6_attn_op(),
         make_layer6_routing_ffn_op(),
+        make_layer6_ent_after_jsr_sp_byte0_fixup_op(),
         make_layer6_relay_heads_op(),
         # 3 model-level bake ops (phase 998.5/.6/.7): the actual
         # _set_layer6_attn / _set_layer6_relay_heads / _set_bz_bnz_relay
@@ -175,16 +174,10 @@ def all_core_ops(
         make_layer8_sp_gather_op(),
         make_layer8_sp_gather_bake_op(),
         make_layer8_multibyte_fetch_bake_op(),
-        # STACK0 via mem attention — Phase 1 mem-read: head 5 reads
-        # mem[SP] via ADDR_KEY at AX marker (staged by L4 SP gather above)
-        # and writes the loaded value to ALU_LO/HI for the L8 ALU (efficient
-        # post-op AddSub5StageBlock or lookup FFN) to consume as operand 2.
-        # Enabled 2026-05-11 together with make_layer4_sp_to_addr_key_op;
-        # head 5 Q gates on the binary-pop opcode set only (negative
-        # blockers on OP_LI/LC/IMM/LEA/...) and adds a K-side MARK_AX
-        # exclusion so the head does not self-attend to its own staged
-        # ADDR_KEY at the AX marker.  See docs/STACK0_VIA_MEM_ATTENTION_PLAN.md.
-        make_layer8_mem_to_alu_op(enable=True),
+        # Paired with the disabled L4 SP-to-ADDR_KEY staging above. Keep the
+        # op in the registry for topology/claims coverage, but leave the bake
+        # off until MEM value-byte address keys exist before L8.
+        make_layer8_mem_to_alu_op(enable=False),
         make_layer9_alu_op(alu_mode=alu_mode),
         make_layer9_lev_addr_relay_op(),
         make_layer9_lev_bp_to_pc_relay_op(),
@@ -289,10 +282,13 @@ def all_core_ops(
         # reprocessed in the late tail layer.
         make_l10_post_ops_combined(),
         make_tail_bit32_result_correction_op(),
-        # L15 attention resize: 8 heads -> 12 heads for LEV (phase=14.9 so it
-        # fires before _set_layer15_memory_lookup populates the heads).
+        # L15 attention resize: add LEV/ALU/store-disambiguation heads
+        # (phase=14.9 so it fires before _set_layer15_memory_lookup populates
+        # the heads).
         make_l15_attention_resize_op(),
         make_layer14_alu_high_byte_relay_op(),
+        make_layer15_store_stack0_sp_byte0_addr_op(),
+        make_layer15_si_mem_addr0_from_stack0_op(),
         # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
         # FFN unit writes survive the rightsize pass at end of legacy_bake.
         make_function_call_weights_op(),

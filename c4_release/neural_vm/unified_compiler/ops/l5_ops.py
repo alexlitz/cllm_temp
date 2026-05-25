@@ -21,18 +21,10 @@ def make_layer5_fetch_op() -> Operation:
         attn = block.attn
         BD = _as_setdim_proxy(dim_positions)
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-            attn.alibi_slopes.fill_(0.1)
-            # Softmax-sharpness fix (head 5): s_target=125 is already strong
-            # but ALiBi slope=0.1 over the synthetic Q->K distance of 4
-            # contributes only 0.4 nats of positional separation. The
-            # runner-up dim sits at the Q position (distance 0), so the
-            # 0.4-nat gap is not enough to drown it (mass@target = 0.0).
-            # Audit doc 87442ad recommends "raise ALiBi slope 0.1 -> ~1.0"
-            # — implemented here. The other L5 heads keep slope=0.1 because
-            # they attend to nearby positions (fetch operand bytes within
-            # the current step); head 5 wants steeper recency to suppress
-            # cross-step distractors.
-            attn.alibi_slopes[5] = 1.0
+            attn.alibi_slopes.fill_(0.0)
+            # L5 fetch heads read immutable code bytes by exact ADDR_KEY.
+            # Recency bias makes later same-low-address aliases compete with
+            # the exact code-prefix match once programs cross larger offsets.
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_heads(
             attn,
@@ -114,11 +106,11 @@ def _band_output_writes(dim_base: int, slot_base: int, weight: float = 1.0):
     return tuple(AO(dim_base + k, slot_base + k, weight) for k in range(16))
 
 
-def _addr_key_match_writes(BD, weight: float):
+def _addr_key_match_writes(BD, weight: float, top_slot_base: int = 35):
     return (
         tuple(AP(k, BD.ADDR_KEY + k, weight) for k in range(16))
         + tuple(AP(16 + k, BD.ADDR_KEY + 16 + k, weight) for k in range(16))
-        + (AP(32, BD.ADDR_KEY + 32, weight),)
+        + tuple(AP(top_slot_base + k, BD.ADDR_KEY + 32 + k, weight) for k in range(16))
     )
 
 
@@ -135,6 +127,7 @@ def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     from ...constants import PC_OFFSET
 
     L = 20.0
+    ADDR_L = 20.0
 
     def ax_gate(slot: int = 33):
         return (
@@ -152,19 +145,31 @@ def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     pc_q_gate, pc_k_gate = pc_gate()
     pc_lo = PC_OFFSET & 0xF
     pc_hi = (PC_OFFSET >> 4) & 0xF
+    pc_top = (PC_OFFSET >> 8) & 0xF
+    TOP = 35
+
+    def dynamic_top_q():
+        return tuple(AP(TOP + k, BD.ADDR_KEY + 32 + k, ADDR_L) for k in range(16))
+
+    def first_step_top0_q():
+        return (
+            AP(TOP, BD.CONST, ADDR_L),
+            AP(TOP, BD.HAS_SE, -ADDR_L),
+        )
 
     specs = [
         # Head 0: non-first-step immediate fetch at AX from TEMP=PC+1.
         DeclarativeAttentionHeadSpec(
             head_idx=0,
             q=(
-                tuple(AP(k, BD.TEMP + k, L) for k in range(16))
-                + tuple(AP(16 + k, BD.TEMP + 16 + k, L) for k in range(16))
+                tuple(AP(k, BD.TEMP + k, ADDR_L) for k in range(16))
+                + tuple(AP(16 + k, BD.TEMP + 16 + k, ADDR_L) for k in range(16))
                 + (AP(32, BD.MARK_AX, L),)
+                + dynamic_top_q()
                 + ax_q_gate
                 + (AP(34, BD.HAS_SE, 500.0), AP(34, BD.CONST, -500.0))
             ),
-            k=_addr_key_match_writes(BD, L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
+            k=_addr_key_match_writes(BD, ADDR_L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
             v=_code_fetch_v_writes(BD),
             o=(
                 _band_output_writes(BD.FETCH_LO, 32)
@@ -175,13 +180,14 @@ def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
         DeclarativeAttentionHeadSpec(
             head_idx=1,
             q=(
-                tuple(AP(k, BD.EMBED_LO + k, L) for k in range(16))
-                + tuple(AP(16 + k, BD.EMBED_HI + k, L) for k in range(16))
+                tuple(AP(k, BD.EMBED_LO + k, ADDR_L) for k in range(16))
+                + tuple(AP(16 + k, BD.EMBED_HI + k, ADDR_L) for k in range(16))
                 + (AP(32, BD.MARK_AX, L),)
+                + dynamic_top_q()
                 + ax_q_gate
                 + (AP(34, BD.HAS_SE, 500.0), AP(34, BD.CONST, -500.0))
             ),
-            k=_addr_key_match_writes(BD, L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
+            k=_addr_key_match_writes(BD, ADDR_L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
             v=_code_fetch_v_writes(BD),
             o=(
                 _band_output_writes(BD.OPCODE_BYTE_LO, 32)
@@ -192,15 +198,14 @@ def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
         DeclarativeAttentionHeadSpec(
             head_idx=2,
             q=(
-                AP(0, BD.MARK_PC, L),
-                AP(0, BD.HAS_SE, -L),
-                AP(pc_lo, BD.CONST, L),
-                AP(16 + pc_hi, BD.CONST, L),
+                AP(pc_lo, BD.CONST, ADDR_L),
+                AP(16 + pc_hi, BD.CONST, ADDR_L),
                 AP(32, BD.MARK_PC, L),
+                AP(TOP + pc_top, BD.CONST, ADDR_L),
                 *pc_q_gate,
                 AP(34, BD.HAS_SE, -500.0),
             ),
-            k=_addr_key_match_writes(BD, L) + pc_k_gate + (AP(34, BD.CONST, 5.0),),
+            k=_addr_key_match_writes(BD, ADDR_L) + pc_k_gate + (AP(34, BD.CONST, 5.0),),
             v=_code_fetch_v_writes(BD),
             o=(
                 _band_output_writes(BD.OPCODE_BYTE_LO, 32)
@@ -211,12 +216,14 @@ def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
         DeclarativeAttentionHeadSpec(
             head_idx=3,
             q=(
-                tuple(AP(k, BD.FETCH_LO + k, L) for k in range(16))
-                + tuple(AP(16 + k, BD.FETCH_HI + k, L) for k in range(16))
+                tuple(AP(k, BD.FETCH_LO + k, ADDR_L) for k in range(16))
+                + tuple(AP(16 + k, BD.FETCH_HI + k, ADDR_L) for k in range(16))
                 + (AP(32, BD.MARK_PC, L),)
+                + dynamic_top_q()
+                + first_step_top0_q()
                 + pc_q_gate
             ),
-            k=_addr_key_match_writes(BD, L) + pc_k_gate,
+            k=_addr_key_match_writes(BD, ADDR_L) + pc_k_gate,
             v=_code_fetch_v_writes(BD),
             o=(
                 _band_output_writes(BD.FETCH_LO, 32, 40.0)
@@ -227,15 +234,14 @@ def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
         DeclarativeAttentionHeadSpec(
             head_idx=4,
             q=(
-                AP(0, BD.MARK_AX, L),
-                AP(0, BD.HAS_SE, -L),
-                AP(pc_lo, BD.CONST, L),
-                AP(16 + pc_hi, BD.CONST, L),
+                AP(pc_lo, BD.CONST, ADDR_L),
+                AP(16 + pc_hi, BD.CONST, ADDR_L),
                 AP(32, BD.MARK_AX, L),
+                AP(TOP + pc_top, BD.CONST, ADDR_L),
                 *ax_q_gate,
                 AP(34, BD.HAS_SE, -500.0),
             ),
-            k=_addr_key_match_writes(BD, L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
+            k=_addr_key_match_writes(BD, ADDR_L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
             v=_code_fetch_v_writes(BD),
             o=(
                 _band_output_writes(BD.OPCODE_BYTE_LO, 32)
@@ -246,13 +252,14 @@ def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
         DeclarativeAttentionHeadSpec(
             head_idx=5,
             q=(
-                tuple(AP(k, BD.EMBED_LO + k, L) for k in range(16))
-                + tuple(AP(16 + k, BD.EMBED_HI + k, L) for k in range(16))
+                tuple(AP(k, BD.EMBED_LO + k, ADDR_L) for k in range(16))
+                + tuple(AP(16 + k, BD.EMBED_HI + k, ADDR_L) for k in range(16))
                 + (AP(32, BD.MARK_PC, L),)
+                + dynamic_top_q()
                 + pc_q_gate
                 + (AP(34, BD.HAS_SE, 500.0), AP(34, BD.CONST, -500.0))
             ),
-            k=_addr_key_match_writes(BD, L) + pc_k_gate + (AP(34, BD.CONST, 5.0),),
+            k=_addr_key_match_writes(BD, ADDR_L) + pc_k_gate + (AP(34, BD.CONST, 5.0),),
             v=_code_fetch_v_writes(BD),
             o=(
                 _band_output_writes(BD.OPCODE_BYTE_LO, 32)

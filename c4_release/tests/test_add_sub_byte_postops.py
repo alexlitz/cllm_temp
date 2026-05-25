@@ -3,6 +3,7 @@ import torch
 
 from c4_release.neural_vm.vm_step import (
     AddSubBytePropagationPostOp,
+    BinaryOpByteZeroingPostOp,
     CarryPropagationPostOp,
     _SetDim as BD,
 )
@@ -90,6 +91,84 @@ def test_add_byte_base_tolerates_stale_zero_output_residual():
     _assert_no_positive_non_targets(out, 0x04)
 
 
+def test_add_byte_base_tolerates_weak_bitwise_residue():
+    x = _add_byte1_input(0x0300, 0x0100, alu_amp=6.0)
+    x[0, 0, BD.TEMP + 3] = 0.305
+    x[0, 0, BD.OUTPUT_LO + 0] = 0.94
+    x[0, 0, BD.OUTPUT_LO + 1] = 2.0
+    x[0, 0, BD.OUTPUT_HI + 0] = 2.94
+
+    out = AddSubBytePropagationPostOp()(x)
+
+    assert _decode_output_byte(out) == 0x04
+    _assert_no_positive_non_targets(out, 0x04)
+
+
+def test_add_byte_base_blocks_step_end_transition_rows():
+    x = _add_byte1_input(654, 114, alu_amp=6.0)
+    x[0, 0, BD.NEXT_SE] = 1.0
+
+    out = AddSubBytePropagationPostOp()(x)
+
+    assert torch.allclose(
+        out[0, 0, BD.OUTPUT_LO:BD.OUTPUT_LO + 16],
+        x[0, 0, BD.OUTPUT_LO:BD.OUTPUT_LO + 16],
+    )
+    assert torch.allclose(
+        out[0, 0, BD.OUTPUT_HI:BD.OUTPUT_HI + 16],
+        x[0, 0, BD.OUTPUT_HI:BD.OUTPUT_HI + 16],
+    )
+
+
+@pytest.mark.parametrize("op_dim", [BD.OP_ADD, BD.OP_SUB])
+def test_binary_zeroing_skips_add_sub_byte_rows(op_dim):
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, BD.IS_BYTE] = 1.0
+    x[0, 0, BD.H1 + 1] = 1.0
+    x[0, 0, op_dim] = 5.0
+    x[0, 0, BD.TEMP + 3] = 1.0
+    x[0, 0, BD.TEMP + (8 if op_dim == BD.OP_ADD else 9)] = 1.0
+    x[0, 0, BD.OUTPUT_LO + 3] = 2.0
+    x[0, 0, BD.OUTPUT_HI + 0] = 2.0
+
+    out = BinaryOpByteZeroingPostOp()(x)
+
+    assert out[0, 0, BD.OUTPUT_LO + 3] == 2.0
+    assert out[0, 0, BD.OUTPUT_HI + 0] == 2.0
+    assert abs(float(out[0, 0, BD.OUTPUT_LO + 0])) < 1e-6
+
+
+def test_binary_zeroing_still_zeros_bitwise_byte_rows():
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, BD.IS_BYTE] = 1.0
+    x[0, 0, BD.H1 + 1] = 1.0
+    x[0, 0, BD.TEMP + 3] = 1.0
+    x[0, 0, BD.OUTPUT_LO + 3] = 2.0
+    x[0, 0, BD.OUTPUT_HI + 3] = 2.0
+
+    out = BinaryOpByteZeroingPostOp()(x)
+
+    assert out[0, 0, BD.OUTPUT_LO + 0] > 0.0
+    assert out[0, 0, BD.OUTPUT_HI + 0] > 0.0
+    assert out[0, 0, BD.OUTPUT_LO + 3] < 2.0
+    assert out[0, 0, BD.OUTPUT_HI + 3] < 2.0
+
+
+def test_binary_zeroing_blocks_weak_bitwise_residue():
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, BD.IS_BYTE] = 1.0
+    x[0, 0, BD.H1 + 1] = 1.0
+    x[0, 0, BD.TEMP + 3] = 0.3037
+    x[0, 0, BD.OUTPUT_LO + 3] = 2.0
+    x[0, 0, BD.OUTPUT_HI + 0] = 2.0
+
+    out = BinaryOpByteZeroingPostOp()(x)
+
+    assert out[0, 0, BD.OUTPUT_LO + 3] == 2.0
+    assert out[0, 0, BD.OUTPUT_HI + 0] == 2.0
+    assert abs(float(out[0, 0, BD.OUTPUT_LO + 0])) < 1e-6
+
+
 def test_add_carry_requires_matching_output_nibbles_under_carry_drift():
     x = _add_byte1_input(654, 114, carry=2.2)
     base = AddSubBytePropagationPostOp()(x)
@@ -97,6 +176,39 @@ def test_add_carry_requires_matching_output_nibbles_under_carry_drift():
 
     assert _decode_output_byte(out) == 0x03
     _assert_no_positive_non_targets(out, 0x03)
+
+
+@pytest.mark.parametrize("marker_dim", [BD.MARK_AX, BD.MARK_PC])
+def test_add_carry_blocks_marker_rows_with_double_carry_relay(marker_dim):
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, BD.H1 + 1] = 1.0
+    x[0, 0, marker_dim] = 1.0
+    x[0, 0, BD.CARRY + 1] = 2.0
+    x[0, 0, BD.OUTPUT_LO + 0] = 2.0
+    x[0, 0, BD.OUTPUT_HI + 0] = 2.0
+
+    out = CarryPropagationPostOp(byte_idx=0, cascade=False)(x)
+
+    assert abs(float(out[0, 0, BD.OUTPUT_LO + 0]) - 2.0) < 1e-5
+    assert abs(float(out[0, 0, BD.OUTPUT_HI + 0]) - 2.0) < 1e-5
+    assert abs(float(out[0, 0, BD.OUTPUT_LO + 1])) < 1e-5
+
+
+@pytest.mark.parametrize("marker_dim", [BD.MARK_AX, BD.MARK_PC])
+def test_sub_borrow_blocks_marker_rows_with_double_borrow_relay(marker_dim):
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, BD.H1 + 1] = 1.0
+    x[0, 0, marker_dim] = 1.0
+    x[0, 0, BD.CARRY + 2] = 2.0
+    x[0, 0, BD.OUTPUT_LO + 0] = 2.0
+    x[0, 0, BD.OUTPUT_HI + 0] = 2.0
+
+    out = CarryPropagationPostOp(byte_idx=0, cascade=False)(x)
+
+    assert abs(float(out[0, 0, BD.OUTPUT_LO + 0]) - 2.0) < 1e-5
+    assert abs(float(out[0, 0, BD.OUTPUT_HI + 0]) - 2.0) < 1e-5
+    assert abs(float(out[0, 0, BD.OUTPUT_LO + 15])) < 1e-5
+    assert abs(float(out[0, 0, BD.OUTPUT_HI + 15])) < 1e-5
 
 
 def test_add_cascade_uses_relayed_add_flag_for_shared_carry():

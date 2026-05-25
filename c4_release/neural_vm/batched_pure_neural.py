@@ -237,7 +237,16 @@ class BatchedPureNeuralRunner:
             kv_cache_verify_interval = _env_int("C4_BATCH_KV_VERIFY_INTERVAL", 1)
         if kv_cache_max_tokens is None:
             raw_max_tokens = os.environ.get("C4_BATCH_KV_MAX_TOKENS")
-            kv_cache_max_tokens = int(raw_max_tokens) if raw_max_tokens else None
+            if raw_max_tokens:
+                kv_cache_max_tokens = int(raw_max_tokens)
+            elif use_kv_cache:
+                # Neural memory loads read historical MEM tokens through K/V.
+                # A small sliding window silently turns older stores into ZFOD;
+                # keep a long cache by default and let explicit env settings
+                # opt back into bounded eviction experiments.
+                kv_cache_max_tokens = 65_536
+            else:
+                kv_cache_max_tokens = None
         if enable_moe_routing is None:
             enable_moe_routing = (
                 os.environ.get("C4_BATCH_ENABLE_MOE_ROUTING") == "1"
@@ -271,6 +280,10 @@ class BatchedPureNeuralRunner:
         )
         self.kv_cache_max_tokens = int(
             kv_cache_max_tokens or getattr(self.model, "max_seq_len", max_seq_len)
+        )
+        self.kv_flush_interval = max(
+            0,
+            _env_int("C4_BATCH_KV_FLUSH_INTERVAL", 0),
         )
         self._kv_cache_obj = None
         self._kv_active_idx: Optional[Tuple[int, ...]] = None
@@ -426,7 +439,10 @@ class BatchedPureNeuralRunner:
             logits = self.model.forward(padded)
             return logits.argmax(dim=-1).cpu().tolist(), 0, real_lens
 
-        if self._kv_incremental_count >= 35:
+        if (
+            self.kv_flush_interval > 0
+            and self._kv_incremental_count >= self.kv_flush_interval
+        ):
             self._reset_kv_cache()
 
         prefix_match = self._batched_kv_common_prefix(active_idx, sequences)
@@ -1198,9 +1214,33 @@ class BatchedPureNeuralRunner:
     def _windowed_context(
         self, s: _ElementState, max_context_window: int
     ) -> List[int]:
-        if len(s.context) > s.prefix_len + max_context_window:
-            return s.context[: s.prefix_len] + s.context[-max_context_window:]
-        return s.context
+        dynamic_full = s.context[s.prefix_len:]
+        if len(dynamic_full) <= max_context_window:
+            # The current context still contains every emitted MEM section.
+            # Re-splicing tracked history here duplicates old MEM rows and
+            # shifts dynamic positions, so keep the byte stream identical to
+            # the model's actual autoregressive context.
+            s.mem_history_end = 0
+            return s.context[:]
+
+        dynamic = dynamic_full[-max_context_window:]
+        mem_tokens: List[int] = []
+
+        def contains_section(tokens: List[int], section: List[int]) -> bool:
+            if not section or len(section) > len(tokens):
+                return False
+            limit = len(tokens) - len(section) + 1
+            for start in range(limit):
+                if tokens[start : start + len(section)] == section:
+                    return True
+            return False
+
+        for addr in s.mem_access_order:
+            section = s.mem_history[addr]
+            if not contains_section(dynamic, section):
+                mem_tokens.extend(section)
+        s.mem_history_end = s.prefix_len + len(mem_tokens) if mem_tokens else 0
+        return s.context[: s.prefix_len] + mem_tokens + dynamic
 
     def _pad_to_tensor(
         self, sequences: List[List[int]]
@@ -1314,10 +1354,16 @@ class BatchedPureNeuralRunner:
                 self._serial._neural_read_emit(s.context)
             self._unborrow_serial_state(s)
 
-        # V10-retired parity with the serial pure-neural runner: do not mirror
-        # stores into Python memory and do not rewrite the generated context.
-        # Historical MEM sections remain in the autoregressive context/KV path;
-        # L15 is responsible for reading them neurally.
+        # Preserve model-emitted MEM sections as cache/window metadata only.
+        # This does not compute or substitute VM values; it keeps the neural
+        # store tokens addressable after tail windowing so L15 can read them.
+        if exec_op in _MEM_STORE_OPS:
+            mem_section = self._extract_mem_section(s.context)
+            if mem_section is not None:
+                addr = 0
+                for j in range(4):
+                    addr |= (int(mem_section[1 + j]) & 0xFF) << (j * 8)
+                self._track_mem_access(s, addr, mem_section)
 
         if exec_op == Opcode.EXIT:
             # In serial, EXIT is detected and the loop breaks; HALT is the

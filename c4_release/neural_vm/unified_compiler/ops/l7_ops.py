@@ -94,8 +94,13 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
             q=(
                 AP(0, BD.MARK_AX, L),
                 AP(0, BD.OP_LEA, -L),
+                AP(0, BD.OP_ADJ, -L),
+                AP(0, BD.OP_ENT, -L),
                 AP(33, BD.MARK_AX, L),
                 AP(33, BD.CONST, -L / 2),
+                AP(33, BD.OP_LEA, -L * 10),
+                AP(33, BD.OP_ADJ, -L * 10),
+                AP(33, BD.OP_ENT, -L * 10),
             ),
             k=(AP(0, BD.STACK0_BYTE0, L), AP(33, BD.CONST, L)),
             v=(
@@ -128,8 +133,8 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
                 + _band_projection_writes(17, BD.OUTPUT_HI)
             ),
             o=(
-                _band_output_writes(BD.ALU_LO, 1)
-                + _band_output_writes(BD.ALU_HI, 17)
+                _band_output_writes(BD.ALU_LO, 1, 6.0)
+                + _band_output_writes(BD.ALU_HI, 17, 6.0)
             ),
         ),
     )

@@ -3,6 +3,7 @@
 import torch
 
 from neural_vm.vm_step import _SetDim, _set_layer6_routing_ffn
+from neural_vm.unified_compiler.ir import CompilerIR
 from neural_vm.unified_compiler.ops.l6_ops import (
     L6_ADJ_AX_ROUTE_END_UNIT,
     L6_ADJ_AX_ROUTE_START_UNIT,
@@ -14,6 +15,8 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     L6_BNZ_AX_ROUTE_START_UNIT,
     L6_BNZ_PC_OVERRIDE_END_UNIT,
     L6_BNZ_PC_OVERRIDE_START_UNIT,
+    L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT,
+    L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
     L6_BZ_AX_ROUTE_END_UNIT,
     L6_BZ_AX_ROUTE_START_UNIT,
     L6_BZ_PC_OVERRIDE_END_UNIT,
@@ -36,6 +39,8 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     L6_ENT_FIRST_STEP_SP_BYTE0_START_UNIT,
     L6_ENT_FIRST_STEP_SP_BYTES_END_UNIT,
     L6_ENT_FIRST_STEP_SP_BYTES_START_UNIT,
+    L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT,
+    L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT,
     L6_IMM_CARRY_REFRESH_END_UNIT,
     L6_IMM_CARRY_REFRESH_START_UNIT,
     L6_IMM_FETCH_ROUTE_END_UNIT,
@@ -70,10 +75,12 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     L6_TEMP_CLEANUP_START_UNIT,
     L6_TEMP_CLEANUP_RULE_START_UNIT,
     _bake_layer6_routing_ffn,
+    _bake_layer6_attn_spec,
     _layer6_adj_ax_route_rules,
     _layer6_adj_sp_writeback_rules,
     _layer6_bnz_ax_route_rules,
     _layer6_bnz_pc_override_rules,
+    _layer6_branch_pc_byte1_override_rules,
     _layer6_bz_ax_route_rules,
     _layer6_bz_pc_override_rules,
     _layer6_cmp3_cleanup_rules,
@@ -85,6 +92,7 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     _layer6_ent_sp_writeback_rules,
     _layer6_ent_first_step_sp_byte0_rules,
     _layer6_ent_first_step_sp_bytes_rules,
+    _layer6_ent_after_jsr_sp_byte0_fixup_rules,
     _layer6_imm_carry_refresh_rules,
     _layer6_imm_fetch_route_rules,
     _layer6_jmp_ax_route_rules,
@@ -107,7 +115,9 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     _lower_layer6_imm_carry_refresh_ir,
     _lower_layer6_late_ax_output_route_ir,
     _lower_layer6_branch_pc_override_ir,
+    _lower_layer6_branch_pc_byte1_override_ir,
     _lower_layer6_ent_first_step_ir,
+    _lower_layer6_ent_after_jsr_sp_byte0_fixup_ir,
     _lower_layer6_stack_arithmetic_ir,
     _lower_layer6_stack_writeback_ir,
     _lower_layer6_tail_cleanup_ir,
@@ -126,6 +136,21 @@ class _StubFFN:
         self.W_gate = torch.zeros(hidden_dim, d_model)
         self.b_gate = torch.zeros(hidden_dim)
         self.W_down = torch.zeros(d_model, hidden_dim)
+
+
+class _StubAttn:
+    def __init__(self, *, d_model: int = 512, num_heads: int = 8):
+        self.num_heads = num_heads
+        self.W_q = torch.zeros(d_model, d_model)
+        self.W_k = torch.zeros(d_model, d_model)
+        self.W_v = torch.zeros(d_model, d_model)
+        self.W_o = torch.zeros(d_model, d_model)
+
+
+def _apply_stub_ffn(ffn: _StubFFN, x: torch.Tensor) -> torch.Tensor:
+    up = torch.nn.functional.silu(x @ ffn.W_up.t() + ffn.b_up)
+    gate = x @ ffn.W_gate.t() + ffn.b_gate
+    return x + (up * gate) @ ffn.W_down.t()
 
 
 def _assert_same_ffn_units(
@@ -226,6 +251,23 @@ def test_layer6_imm_carry_refresh_ir_matches_legacy_units():
     )
 
 
+def test_layer6_attn_relays_ent_immediate_from_ax_to_sp_marker():
+    attn = _StubAttn()
+    head_dim = attn.W_q.shape[0] // attn.num_heads
+
+    _bake_layer6_attn_spec(attn, _SetDim, head_dim)
+
+    base = 5 * head_dim
+    relay_row = base + 51
+    assert attn.W_q[relay_row, _SetDim.MARK_SP] == 500.0
+    assert attn.W_q[relay_row, _SetDim.HAS_SE] == 500.0
+    assert attn.W_q[relay_row, _SetDim.CONST] == -500.0
+    assert attn.W_k[relay_row, _SetDim.MARK_AX] == 5.0
+    assert attn.W_k[relay_row, _SetDim.OP_ENT] == 5.0
+    assert attn.W_o[_SetDim.FETCH_LO + 0, base + 0] == 1.0
+    assert attn.W_o[_SetDim.FETCH_HI + 1, base + 17] == 1.0
+
+
 def test_layer6_halt_cleanup_and_identity_ir_match_legacy_units():
     actual = _StubFFN()
     expected = _StubFFN()
@@ -253,6 +295,8 @@ def test_layer6_halt_cleanup_and_identity_ir_match_legacy_units():
         _assert_same_ffn_units(actual, expected, start, end)
 
     # The legacy TEMP[0] slot is intentionally blank and not claimed by IR.
+
+
     assert torch.equal(
         actual.W_up[
             L6_TEMP_CLEANUP_START_UNIT:L6_TEMP_CLEANUP_RULE_START_UNIT
@@ -263,6 +307,31 @@ def test_layer6_halt_cleanup_and_identity_ir_match_legacy_units():
             ]
         ),
     )
+
+
+def test_layer6_stack_identity_fires_with_compact_marker_scale():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer6_stack_identity_rules(100.0))
+
+    out = ir.symbolic_ffn({
+        "MARK_BP": 1.0,
+        "HAS_SE": 0.997,
+        "EMBED_LO+0": 1.0,
+        "EMBED_HI+15": 1.0,
+    })
+
+    assert out["OUTPUT_LO+0"] > 0.0
+    assert out["OUTPUT_HI+15"] > 0.0
+
+    first_step = ir.symbolic_ffn({
+        "MARK_BP": 1.0,
+        "HAS_SE": 0.0,
+        "EMBED_LO+0": 1.0,
+        "EMBED_HI+15": 1.0,
+    })
+
+    assert first_step.get("OUTPUT_LO+0", 0.0) == 0.0
+    assert first_step.get("OUTPUT_HI+15", 0.0) == 0.0
 
 
 def test_layer6_ax_output_route_ir_matches_legacy_units():
@@ -376,6 +445,78 @@ def test_layer6_stack_arithmetic_ir_matches_legacy_units():
         _assert_same_ffn_units(actual, expected, start, end)
 
 
+def test_layer6_psh_sp_decrement_does_not_invert_no_borrow_hi_nibble():
+    ffn = _StubFFN()
+    _lower_layer6_stack_arithmetic_ir(ffn, 100.0, _SetDim)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_SP] = 1.0
+    x[..., _SetDim.PSH_AT_SP] = 1.0
+    x[..., _SetDim.EMBED_LO + 8] = 1.0
+    x[..., _SetDim.EMBED_HI + 14] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 0] > 0.9
+    assert y[_SetDim.OUTPUT_LO + 8] < -0.9
+    assert abs(float(y[_SetDim.OUTPUT_HI + 13])) < 1e-6
+    assert abs(float(y[_SetDim.OUTPUT_HI + 14])) < 1e-6
+
+
+def test_layer6_psh_sp_decrement_borrows_when_low_nibble_is_below_8():
+    ffn = _StubFFN()
+    _lower_layer6_stack_arithmetic_ir(ffn, 100.0, _SetDim)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_SP] = 1.0
+    x[..., _SetDim.PSH_AT_SP] = 1.0
+    x[..., _SetDim.EMBED_LO + 7] = 1.0
+    x[..., _SetDim.EMBED_HI + 14] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 15] > 0.9
+    assert y[_SetDim.OUTPUT_LO + 7] < -0.9
+    assert y[_SetDim.OUTPUT_HI + 13] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 14] < -0.9
+
+
+def test_layer6_jsr_sp_marker_decrement_is_first_step_only():
+    ffn = _StubFFN()
+    _lower_layer6_stack_arithmetic_ir(ffn, 100.0, _SetDim)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_SP] = 1.0
+    x[..., _SetDim.CMP + 4] = 1.0
+    x[..., _SetDim.OP_JSR] = 5.0
+    x[..., _SetDim.HAS_SE] = 1.0
+    x[..., _SetDim.EMBED_LO + 0] = 1.0
+    x[..., _SetDim.EMBED_HI + 13] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert abs(float(y[_SetDim.OUTPUT_LO + 8])) < 1e-3
+    assert abs(float(y[_SetDim.OUTPUT_HI + 15])) < 1e-3
+
+
+def test_layer6_jsr_sp_marker_decrement_still_handles_first_step():
+    ffn = _StubFFN()
+    _lower_layer6_stack_arithmetic_ir(ffn, 100.0, _SetDim)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_SP] = 1.0
+    x[..., _SetDim.CMP + 4] = 1.0
+    x[..., _SetDim.OP_JSR] = 5.0
+    x[..., _SetDim.HAS_SE] = 0.0
+    x[..., _SetDim.EMBED_LO + 0] = 1.0
+    x[..., _SetDim.EMBED_HI + 0] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 8] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 15] > 0.9
+
+
 def test_layer6_ent_first_step_ir_matches_legacy_units():
     actual = _StubFFN()
     expected = _StubFFN()
@@ -402,6 +543,120 @@ def test_layer6_ent_first_step_ir_matches_legacy_units():
         _assert_same_ffn_units(actual, expected, start, end)
 
 
+def test_layer6_ent_after_jsr_sp_byte0_fixup_lowers_to_reserved_unit():
+    actual = _StubFFN(hidden_dim=L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT)
+
+    end = _lower_layer6_ent_after_jsr_sp_byte0_fixup_ir(
+        actual,
+        100.0,
+        _SetDim,
+    )
+
+    assert end == L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT
+    assert len(_layer6_ent_after_jsr_sp_byte0_fixup_rules(100.0)) == 6
+    assert actual.W_up[
+        L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT,
+        _SetDim.OP_ENT,
+    ] != 0.0
+
+
+def test_layer6_ent_after_jsr_sp_byte0_fixup_emits_e8():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(
+        _layer6_ent_after_jsr_sp_byte0_fixup_rules(100.0)
+    )
+
+    out = ir.symbolic_ffn({
+        "OP_ENT": 5.0,
+        "MARK_SP": 1.0,
+        "HAS_SE": 1.0,
+        "EMBED_LO+8": 1.0,
+        "EMBED_HI+15": 1.0,
+    })
+
+    assert out["OUTPUT_LO+8"] > 0.0
+    assert out["OUTPUT_HI+14"] > 0.0
+    assert out["OUTPUT_LO+10"] < 0.0
+    assert out["OUTPUT_HI+1"] < 0.0
+
+
+def test_layer6_ent_after_jsr_bp_byte0_fixup_emits_f0():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(
+        _layer6_ent_after_jsr_sp_byte0_fixup_rules(100.0)
+    )
+
+    out = ir.symbolic_ffn({
+        "OP_ENT": 5.0,
+        "MARK_BP": 1.0,
+        "HAS_SE": 1.0,
+    })
+
+    assert out["OUTPUT_LO+0"] > 0.0
+    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_LO+8"] < 0.0
+    assert out["OUTPUT_HI+1"] < 0.0
+
+
+def test_layer6_ent_after_jsr_bp_byte1_fixup_emits_ff():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(
+        _layer6_ent_after_jsr_sp_byte0_fixup_rules(100.0)
+    )
+
+    out = ir.symbolic_ffn({
+        "OP_ENT": 5.0,
+        "IS_BYTE": 1.0,
+        "H1+3": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "HAS_SE": 1.0,
+    })
+
+    assert out["OUTPUT_LO+15"] > 0.0
+    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_LO+0"] < 0.0
+    assert out["OUTPUT_HI+0"] < 0.0
+
+
+def test_layer6_ent_after_jsr_bp_high_byte_fixup_emits_00():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(
+        _layer6_ent_after_jsr_sp_byte0_fixup_rules(100.0)
+    )
+
+    for byte_index in ("BYTE_INDEX_1", "BYTE_INDEX_2"):
+        out = ir.symbolic_ffn({
+            "OP_ENT": 5.0,
+            "IS_BYTE": 1.0,
+            "H1+3": 1.0,
+            byte_index: 1.0,
+            "HAS_SE": 1.0,
+        })
+
+        assert out["OUTPUT_LO+0"] > 0.0
+        assert out["OUTPUT_HI+0"] > 0.0
+        assert out["OUTPUT_LO+1"] < 0.0
+        assert out["OUTPUT_LO+15"] < 0.0
+
+
+def test_layer6_ent_after_jsr_stack0_byte0_fixup_emits_00():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(
+        _layer6_ent_after_jsr_sp_byte0_fixup_rules(100.0)
+    )
+
+    out = ir.symbolic_ffn({
+        "OP_ENT": 5.0,
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 1.0,
+    })
+
+    assert out["OUTPUT_LO+0"] > 0.0
+    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_LO+2"] < 0.0
+    assert out["OUTPUT_HI+1"] < 0.0
+
+
 def test_layer6_branch_pc_override_ir_matches_legacy_units():
     actual = _StubFFN()
     expected = _StubFFN()
@@ -417,6 +672,80 @@ def test_layer6_branch_pc_override_ir_matches_legacy_units():
         (L6_BNZ_PC_OVERRIDE_START_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT),
     ):
         _assert_same_ffn_units(actual, expected, start, end)
+
+
+def test_layer6_branch_pc_byte1_override_symbolically_emits_target_high_byte():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer6_branch_pc_byte1_override_rules(100.0))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "OP_BZ": 5.0,
+        "CMP+4": 1.0,
+        "CMP+5": 1.0,
+        "FETCH_HI+2": 40.0,
+        "OUTPUT_LO+0": 1.0,
+        "OUTPUT_HI+0": 1.0,
+        "CONST": 1.0,
+    })
+
+    assert out["OUTPUT_LO+1"] > 0.0
+    assert out["OUTPUT_LO+0"] < 1.0
+    assert out["OUTPUT_HI+0"] > 1.0
+
+
+def test_layer6_branch_pc_byte1_override_blocks_untaken_bz():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer6_branch_pc_byte1_override_rules(100.0))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "OP_BZ": 5.0,
+        "CMP+4": 1.0,
+        "CMP+5": 0.0,
+        "FETCH_HI+2": 40.0,
+    })
+
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+
+
+def test_layer6_branch_pc_byte1_override_ir_lowers_into_reserved_band():
+    actual = _StubFFN()
+
+    end = _lower_layer6_branch_pc_byte1_override_ir(actual, 100.0, _SetDim)
+
+    assert end == L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT
+    assert len(_layer6_branch_pc_byte1_override_rules(100.0)) == 147
+    assert torch.count_nonzero(
+        actual.W_up[
+            L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT:
+            L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT
+        ]
+    )
+
+
+def test_layer6_routing_bake_includes_branch_pc_byte1_override_band():
+    actual = _StubFFN()
+
+    _bake_layer6_routing_ffn(actual, 100.0, _SetDim)
+
+    assert torch.count_nonzero(
+        actual.W_up[
+            L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT:
+            L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT
+        ]
+    )
+    assert torch.count_nonzero(
+        actual.W_down[
+            :,
+            L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT:
+            L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT,
+        ]
+    )
 
 
 def test_layer6_tail_cleanup_ir_matches_legacy_units():

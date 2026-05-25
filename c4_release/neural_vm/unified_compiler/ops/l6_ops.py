@@ -71,8 +71,12 @@ L6_MEM_LEAKAGE_CLEANUP_START_UNIT = 1102
 L6_MEM_LEAKAGE_CLEANUP_END_UNIT = 1104
 L6_ALU_CLEAR_START_UNIT = 1104
 L6_ALU_CLEAR_END_UNIT = 1136
+L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT = 1136
+L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT = 1283
 L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2200
 L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2232
+L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 2294
+L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 2300
 
 
 def _clear_ffn_unit_band(ffn, start: int, end: int) -> None:
@@ -91,6 +95,10 @@ def _pc_target_lo_from_index(k: int) -> int:
 
 def _pc_target_hi_from_index(k: int) -> int:
     return ((k * 8 + 2) >> 4) & 0xF
+
+
+def _pc_target_byte1_lo_from_imm_hi(k: int) -> int:
+    return (k >> 1) & 0xF
 
 
 def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
@@ -416,7 +424,7 @@ def _layer6_stack_identity_rules(S: float) -> tuple[FFNRule, ...]:
                 rules.append(FFNRule.gated_write(
                     name=f"l6_{label}_identity_{band}_{k}",
                     conditions=conditions,
-                    threshold=2.5,
+                    threshold=1.5,
                     gate=f"{source_base}+{k}",
                     writes=((f"{output_base}+{k}", write_scale),),
                 ))
@@ -439,7 +447,7 @@ def _layer6_jsr_sp_decrement_rules(S: float) -> tuple[FFNRule, ...]:
 
     return _layer6_sp_decrement_rules(
         name_prefix="l6_jsr_sp_decrement",
-        conditions=(("CMP+4", 1.0), ("MARK_SP", 1.0)),
+        conditions=(("CMP+4", 1.0), ("MARK_SP", 1.0), ("HAS_SE", -1.0)),
         threshold=1.5,
         S=S,
     )
@@ -470,19 +478,12 @@ def _layer6_sp_decrement_rules(
         new_k_borrow = (k - 1) % 16
         rules.append(FFNRule.gated_write(
             name=f"{name_prefix}_hi_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate_terms=(
-                ((f"EMBED_HI+{k}"), 1.0),
-                ("EMBED_LO+8", -1.0),
-                ("EMBED_LO+9", -1.0),
-                ("EMBED_LO+10", -1.0),
-                ("EMBED_LO+11", -1.0),
-                ("EMBED_LO+12", -1.0),
-                ("EMBED_LO+13", -1.0),
-                ("EMBED_LO+14", -1.0),
-                ("EMBED_LO+15", -1.0),
+            conditions=conditions + tuple(
+                (f"EMBED_LO+{lo_bit}", -1.0)
+                for lo_bit in range(8, 16)
             ),
+            threshold=threshold,
+            gate=f"EMBED_HI+{k}",
             writes=(
                 (f"OUTPUT_HI+{new_k_borrow}", write_scale),
                 (f"OUTPUT_HI+{k}", -write_scale),
@@ -498,7 +499,7 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
     return (
         FFNRule.constant_write(
             name="l6_jsr_sp_fixup_lo",
-            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0)),
+            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0)),
             threshold=1.5,
             writes=(
                 ("OUTPUT_LO+8", write_scale),
@@ -507,7 +508,7 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="l6_jsr_sp_fixup_hi",
-            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0)),
+            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0)),
             threshold=1.5,
             writes=(
                 ("OUTPUT_HI+15", write_scale),
@@ -738,6 +739,119 @@ def _layer6_ent_first_step_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
+    """Correct ENT SP byte 0 after a JSR push leaves SP byte 0 at 0xf8."""
+
+    del S
+    return (
+        FFNRule.constant_write(
+            name="l6_ent_after_jsr_sp_byte0_e8",
+            conditions=(
+                ("OP_ENT", 1.0),
+                ("MARK_SP", 1.0),
+                ("HAS_SE", 1.0),
+                ("EMBED_LO+8", 1.0),
+                ("EMBED_HI+15", 1.0),
+            ),
+            threshold=7.5,
+            writes=(
+                ("OUTPUT_LO+8", 0.10),
+                ("OUTPUT_HI+14", 0.05),
+                ("OUTPUT_LO+0", -0.05),
+                ("OUTPUT_LO+10", -0.05),
+                ("OUTPUT_LO+14", -0.05),
+                ("OUTPUT_HI+1", -0.05),
+                ("OUTPUT_HI+15", -0.05),
+            ),
+        ),
+        FFNRule.constant_write(
+            name="l6_ent_after_jsr_bp_byte0_f0",
+            conditions=(
+                ("OP_ENT", 1.0),
+                ("MARK_BP", 1.0),
+                ("HAS_SE", 1.0),
+            ),
+            threshold=6.5,
+            writes=(
+                ("OUTPUT_LO+0", 0.30),
+                ("OUTPUT_HI+15", 0.30),
+                ("OUTPUT_LO+8", -0.10),
+                ("OUTPUT_HI+1", -0.10),
+            ),
+        ),
+        FFNRule.constant_write(
+            name="l6_ent_after_jsr_bp_byte1_ff",
+            conditions=(
+                ("OP_ENT", 1.0),
+                ("IS_BYTE", 1.0),
+                ("H1+3", 1.0),
+                ("BYTE_INDEX_0", 1.0),
+                ("HAS_SE", 1.0),
+            ),
+            threshold=8.5,
+            writes=(
+                ("OUTPUT_LO+15", 0.10),
+                ("OUTPUT_HI+15", 0.10),
+                ("OUTPUT_LO+0", -0.10),
+                ("OUTPUT_HI+0", -0.10),
+            ),
+        ),
+        FFNRule.constant_write(
+            name="l6_ent_after_jsr_bp_byte2_00",
+            conditions=(
+                ("OP_ENT", 1.0),
+                ("IS_BYTE", 1.0),
+                ("H1+3", 1.0),
+                ("BYTE_INDEX_1", 1.0),
+                ("HAS_SE", 1.0),
+            ),
+            threshold=8.5,
+            writes=(
+                ("OUTPUT_LO+0", 0.30),
+                ("OUTPUT_HI+0", 0.30),
+                ("OUTPUT_LO+1", -0.30),
+                ("OUTPUT_LO+15", -0.10),
+                ("OUTPUT_HI+15", -0.10),
+            ),
+        ),
+        FFNRule.constant_write(
+            name="l6_ent_after_jsr_bp_byte3_00",
+            conditions=(
+                ("OP_ENT", 1.0),
+                ("IS_BYTE", 1.0),
+                ("H1+3", 1.0),
+                ("BYTE_INDEX_2", 1.0),
+                ("HAS_SE", 1.0),
+            ),
+            threshold=8.5,
+            writes=(
+                ("OUTPUT_LO+0", 0.30),
+                ("OUTPUT_HI+0", 0.30),
+                ("OUTPUT_LO+1", -0.30),
+                ("OUTPUT_LO+15", -0.10),
+                ("OUTPUT_HI+15", -0.10),
+            ),
+        ),
+        FFNRule.constant_write(
+            name="l6_ent_after_jsr_stack0_byte0_00",
+            conditions=(
+                ("OP_ENT", 1.0),
+                ("MARK_STACK0", 1.0),
+                ("HAS_SE", 1.0),
+            ),
+            threshold=6.5,
+            writes=(
+                ("OUTPUT_LO+0", 0.30),
+                ("OUTPUT_HI+0", 0.30),
+                ("OUTPUT_LO+2", -0.10),
+                ("OUTPUT_LO+12", -0.10),
+                ("OUTPUT_HI+1", -0.10),
+                ("OUTPUT_HI+2", -0.10),
+            ),
+        ),
+    )
+
+
 def _layer6_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 BZ PC override units 878..941."""
 
@@ -829,6 +943,89 @@ def _layer6_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 gate=f"FETCH_LO+{k}",
                 writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
             ))
+    return tuple(rules)
+
+
+def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """Emit PC byte 1 for taken BZ/BNZ targets above 255.
+
+    The marker-row override emits target byte 0.  The next token row
+    (PC byte 0, identified by H1[PC] + BYTE_INDEX_0) must predict byte 1.
+    For instruction-index immediates, byte1((imm * 8) + 2) == imm >> 5, which
+    is the high immediate nibble shifted right by one.
+    """
+
+    rules = []
+    write_scale = 2.0 / S
+    const_zero_scale = 10.0 / S
+    byte0_conditions = (
+        ("IS_BYTE", 1.0),
+        ("H1+0", 1.0),
+        ("BYTE_INDEX_0", 1.0),
+    )
+
+    groups = (
+        (
+            "bz_zero",
+            byte0_conditions
+            + (
+                ("OP_BZ", 0.2),
+                ("CMP+4", 1.0),
+                ("CMP+5", 1.0),
+            ),
+            5.5,
+        ),
+        (
+            "bnz_lo_nonzero",
+            byte0_conditions
+            + (
+                ("OP_BNZ", 0.2),
+                ("CMP+4", -1.0),
+            ),
+            3.5,
+        ),
+        (
+            "bnz_hi_nonzero",
+            byte0_conditions
+            + (
+                ("OP_BNZ", 0.2),
+                ("CMP+4", 1.0),
+                ("CMP+5", -1.0),
+            ),
+            4.5,
+        ),
+    )
+
+    for group, conditions, threshold in groups:
+        for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+            for k in range(16):
+                rules.append(FFNRule.gated_write(
+                    name=f"l6_branch_pc_byte1_{group}_cancel_{band}_{k}",
+                    conditions=conditions,
+                    threshold=threshold,
+                    gate=f"{output_base}+{k}",
+                    gate_weight=-1.0,
+                    writes=((f"{output_base}+{k}", write_scale),),
+                ))
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_branch_pc_byte1_{group}_target_lo_{k}",
+                conditions=conditions,
+                threshold=threshold,
+                gate=f"FETCH_HI+{k}",
+                writes=((
+                    f"OUTPUT_LO+{_pc_target_byte1_lo_from_imm_hi(k)}",
+                    write_scale,
+                ),),
+            ))
+        rules.append(FFNRule.gated_write(
+            name=f"l6_branch_pc_byte1_{group}_target_hi_zero",
+            conditions=conditions,
+            threshold=threshold,
+            gate="CONST",
+            writes=(("OUTPUT_HI+0", const_zero_scale),),
+        ))
+
     return tuple(rules)
 
 
@@ -1262,6 +1459,18 @@ def _lower_layer6_ent_first_step_ir(ffn, S: float, BD) -> tuple[int, int]:
     return byte0_end, bytes_end
 
 
+def _lower_layer6_ent_after_jsr_sp_byte0_fixup_ir(ffn, S: float, BD) -> int:
+    """Lower focused ENT-after-JSR SP byte-0 correction."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_ent_after_jsr_sp_byte0_fixup_rules(S),
+        S,
+        BD,
+        unit=L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT,
+    )
+
+
 def _lower_layer6_branch_pc_override_ir(ffn, S: float, BD) -> tuple[int, int]:
     """Lower IR-authored BZ/BNZ PC override bands."""
 
@@ -1280,6 +1489,24 @@ def _lower_layer6_branch_pc_override_ir(ffn, S: float, BD) -> tuple[int, int]:
         unit=L6_BNZ_PC_OVERRIDE_START_UNIT,
     )
     return bz_end, bnz_end
+
+
+def _lower_layer6_branch_pc_byte1_override_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
+) -> int:
+    """Lower taken-branch PC byte-1 override rules into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_branch_pc_byte1_override_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
 
 
 def _lower_layer6_tail_cleanup_ir(ffn, S: float, BD) -> int:
@@ -1355,6 +1582,18 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             ffn.b_gate.data[unit] = 1.0
             ffn.W_down.data[output_base + k, unit] = 3.0 / S
             unit += 1
+    _clear_ffn_unit_band(
+        ffn,
+        L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
+        L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT,
+    )
+    branch_byte1_end = _lower_layer6_branch_pc_byte1_override_ir(ffn, S, BD)
+    if branch_byte1_end != L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 branch PC-byte1 override IR lowered to unexpected unit "
+            f"{branch_byte1_end}; expected "
+            f"{L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT}"
+        )
     return
     _clear_ffn_unit_band(
         ffn,
@@ -1571,6 +1810,18 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 tail cleanup IR lowered to unexpected unit "
             f"{tail_cleanup_end}; expected {L6_ALU_CLEAR_END_UNIT}"
         )
+    _clear_ffn_unit_band(
+        ffn,
+        L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
+        L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT,
+    )
+    branch_byte1_end = _lower_layer6_branch_pc_byte1_override_ir(ffn, S, BD)
+    if branch_byte1_end != L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 branch PC-byte1 override IR lowered to unexpected unit "
+            f"{branch_byte1_end}; expected "
+            f"{L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT}"
+        )
 
 
 def make_layer6_attn_op() -> Operation:
@@ -1650,6 +1901,38 @@ def make_layer6_routing_ffn_op() -> Operation:
             "TestSmokeFunctionCall::test_simple_function",
             "all",
         },
+        spec_section="BLOG_SPEC.md#function-calls",
+    )
+
+
+def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
+    """L6 FFN: correct ENT's SP byte 0 after the preceding JSR stack push."""
+
+    def bake(block, dim_positions, S):
+        end = _lower_layer6_ent_after_jsr_sp_byte0_fixup_ir(
+            block.ffn,
+            S,
+            _as_setdim_proxy(dim_positions),
+        )
+        if end != L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT:
+            raise AssertionError(
+                "L6 ENT-after-JSR SP byte0 fixup lowered to unexpected unit "
+                f"{end}; expected {L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT}"
+            )
+
+    return Operation(
+        name="layer6_ent_after_jsr_sp_byte0_fixup",
+        phase=6.55,
+        reads={"OP_ENT", "MARK_SP", "HAS_SE", "EMBED_LO", "EMBED_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        layer_idx=6,
+        ffn_units_used=L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT,
+        migrated=True,
+        smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
 
@@ -1751,13 +2034,42 @@ def _bake_layer6_attn_spec(attn, BD, HD):
         attn.W_v[base + 16 + k, BD.FETCH_HI + k] = 1.0
         attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
         attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
+    # Branch byte-1 relay: at the PC byte-0 row, re-read the PC marker so
+    # the L6 FFN can emit byte1(target) for BZ/BNZ targets above 255.
+    attn.W_v[base + 32, BD.OP_BZ] = 1.0
+    attn.W_v[base + 33, BD.OP_BNZ] = 1.0
+    attn.W_o[BD.OP_BZ, base + 32] = 1.0
+    attn.W_o[BD.OP_BNZ, base + 33] = 1.0
+    branch_pc_byte0_relay = 52
+    attn.W_q[base + branch_pc_byte0_relay, BD.IS_BYTE] = 300.0
+    attn.W_q[base + branch_pc_byte0_relay, BD.H1 + 0] = 300.0
+    attn.W_q[base + branch_pc_byte0_relay, BD.BYTE_INDEX_0] = 300.0
+    attn.W_q[base + branch_pc_byte0_relay, BD.MARK_PC] = -300.0
+    attn.W_k[base + branch_pc_byte0_relay, BD.MARK_PC] = 50.0
     fetch_gate = 50
     attn.W_q[base + fetch_gate, BD.MARK_AX] = 500.0
     attn.W_q[base + fetch_gate, BD.CONST] = -500.0
     attn.W_k[base + fetch_gate, BD.CONST] = 5.0
+    # AX byte rows also carry MARK_AX, but they need L4's PC+2/3/4 FETCH
+    # address, not the first immediate byte relayed from the PC marker.
+    ax_byte_fetch_blocker = 53
+    attn.W_q[base + ax_byte_fetch_blocker, BD.H1 + 1] = -6500.0
+    attn.W_q[base + ax_byte_fetch_blocker, BD.IS_BYTE] = -6500.0
+    attn.W_q[base + ax_byte_fetch_blocker, BD.MARK_AX] = 6500.0
+    attn.W_q[base + ax_byte_fetch_blocker, BD.H1 + 0] = 6500.0
+    attn.W_k[base + ax_byte_fetch_blocker, BD.CONST] = 5.0
     has_se_gate = 49
     attn.W_q[base + has_se_gate, BD.HAS_SE] = -500.0
     attn.W_k[base + has_se_gate, BD.CONST] = 5.0
+    # After a JSR into a function prologue, the ENT immediate has been
+    # fetched at the AX marker.  Relay it forward to the SP marker so later
+    # declarative SP-write rules can handle frame sizes beyond one local slot.
+    ent_sp_fetch_gate = 51
+    attn.W_q[base + ent_sp_fetch_gate, BD.MARK_SP] = 500.0
+    attn.W_q[base + ent_sp_fetch_gate, BD.HAS_SE] = 500.0
+    attn.W_q[base + ent_sp_fetch_gate, BD.CONST] = -500.0
+    attn.W_k[base + ent_sp_fetch_gate, BD.MARK_AX] = 5.0
+    attn.W_k[base + ent_sp_fetch_gate, BD.OP_ENT] = 5.0
 
 
 def _bake_layer6_relay_heads_spec(attn, BD, HD):
@@ -1931,11 +2243,17 @@ def _layer6_bz_bnz_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
             AP(0, BD.CONST, -L * 1.3),
             AP(0, BD.OP_BZ, L / 5.0),
             AP(0, BD.OP_BNZ, L / 5.0),
+            AP(5, BD.IS_BYTE, 60.0),
+            AP(5, BD.H1 + 0, 60.0),
+            AP(5, BD.BYTE_INDEX_0, 60.0),
+            AP(5, BD.MARK_PC, -60.0),
         ),
         k=(
             AP(0, BD.L1H1 + AX_I, L),
             AP(0, BD.L1H0 + AX_I, -L),
             AP(0, BD.CONST, L),
+            AP(5, BD.L1H1 + AX_I, L),
+            AP(5, BD.L1H0 + AX_I, -L),
         ),
         v=(
             AP(1, BD.OP_BZ, 1.0),
@@ -2011,13 +2329,12 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
         new_k_carry = (k + 1) % 16
         rules.append(FFNRule.gated_write(
             name=f"l6_binary_pop_sp_hi_{k}",
-            conditions=conditions,
-            threshold=1.5,
-            gate=f"EMBED_HI+{k}",
-            gate_terms=tuple(
+            conditions=conditions + tuple(
                 (f"EMBED_LO+{lo_bit}", -1.0)
                 for lo_bit in range(8)
             ),
+            threshold=1.5,
+            gate=f"EMBED_HI+{k}",
             writes=(
                 (f"OUTPUT_HI+{new_k_carry}", write_scale),
                 (f"OUTPUT_HI+{k}", -write_scale),

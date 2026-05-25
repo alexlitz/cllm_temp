@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.compiler import compile_c
 from tests.test_suite_1000 import generate_test_programs
+from tests.declarative_oracle import declarative_oracle_for_program
 
 
 def _parse_spec_k(raw: str) -> int:
@@ -214,6 +215,9 @@ class NeuralDeclarativeDiagnosticRow:
 
     @property
     def status(self) -> str:
+        if self.declarative_exit != (self.suite_expected & 0xFFFFFFFF):
+            if self.declarative_exit is not None:
+                return "suite/declarative-mismatch"
         if self.error is not None:
             return "error"
         if self.declarative_exit != (self.suite_expected & 0xFFFFFFFF):
@@ -718,12 +722,8 @@ def run_1096_neural_declarative_diagnostic(
     """Run a focused 1096 slice and return declarative/neural comparison rows."""
 
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
-    from neural_vm.unified_compiler.symbolic_program import (
-        SymbolicDeclarativeProgramRunner,
-    )
 
     selected = _selected_1096_tests(offset=offset, limit=limit)
-    symbolic_runner = SymbolicDeclarativeProgramRunner()
     neural_runner = BatchedPureNeuralRunner(max_seq_len=model_max_seq_len)
     rows: List[NeuralDeclarativeDiagnosticRow] = []
     traced_failures = 0
@@ -738,9 +738,11 @@ def run_1096_neural_declarative_diagnostic(
         for slot, (idx, source, expected, description) in enumerate(chunk):
             try:
                 bytecode, data = compile_c(source)
-                declarative = symbolic_runner.run(
+                declarative = declarative_oracle_for_program(
                     bytecode,
                     data,
+                    suite_expected=expected,
+                    label=f"id={idx:04d}",
                     max_steps=None,
                 )
             except Exception as exc:
@@ -757,18 +759,21 @@ def run_1096_neural_declarative_diagnostic(
                 )
                 continue
 
-            decl_exit = declarative.ax if declarative.halted else None
-            decl_steps = declarative.steps if declarative.halted else None
-            if decl_steps is None:
+            decl_exit = declarative.exit_code
+            decl_steps = declarative.steps
+            if declarative.error is not None or decl_steps is None:
                 rows.append(
                     NeuralDeclarativeDiagnosticRow(
                         test_idx=idx,
                         description=description,
                         suite_expected=expected,
                         declarative_exit=decl_exit,
-                        declarative_steps=None,
+                        declarative_steps=decl_steps,
                         neural_exit=None,
-                        error="declarative execution did not halt",
+                        error=(
+                            declarative.error
+                            or "declarative execution did not halt"
+                        ),
                     )
                 )
                 continue

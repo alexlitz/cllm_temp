@@ -30,12 +30,14 @@ def make_layer3_ffn_op() -> Operation:
         from ...vm_step import _set_layer3_ffn
         proxy = _as_setdim_proxy(dim_positions)
         _set_layer3_ffn(block.ffn, S, proxy)
+        _add_layer3_pc_byte1_output_rules(block.ffn, S, proxy)
 
     return Operation(
         name="layer3_ffn",
         phase=3,
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
-               "EMBED_LO", "EMBED_HI", "H1", "H4", "OP_LEV",
+               "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "TEMP", "IS_BYTE", "H1", "H4", "OP_LEV",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
@@ -55,6 +57,77 @@ def make_layer3_ffn_op() -> Operation:
     )
 
 
+def _next_free_ffn_unit(ffn) -> int:
+    active = (
+        (ffn.W_up.data.abs().sum(dim=1) > 0)
+        | (ffn.W_gate.data.abs().sum(dim=1) > 0)
+        | (ffn.b_up.data.abs() > 0)
+        | (ffn.b_gate.data.abs() > 0)
+        | (ffn.W_down.data.abs().sum(dim=0) > 0)
+    )
+    used = active.nonzero(as_tuple=True)[0]
+    return int(used[-1].item() + 1) if len(used) else 0
+
+
+def _write_pc_byte1_one(ffn, unit: int, BD, S: float, conditions) -> int:
+    for dim, weight in conditions:
+        ffn.W_up.data[unit, dim] = S * weight
+    ffn.b_up.data[unit] = -S * 5.5
+    ffn.b_gate.data[unit] = 1.0
+    ffn.W_down.data[BD.OUTPUT_LO + 0, unit] = -500.0 / S
+    ffn.W_down.data[BD.OUTPUT_LO + 1, unit] = 500.0 / S
+    ffn.W_down.data[BD.OUTPUT_HI + 0, unit] = 500.0 / S
+    return unit + 1
+
+
+def _add_layer3_pc_byte1_output_rules(ffn, S, BD) -> None:
+    """Emit PC byte1 for programs whose linear PC crosses 0x100.
+
+    Legacy L3 owns ordinary PC emission but only increments byte 0 and then
+    defaults bytes 1-3 to zero. Head 7 below stages the previous step's PC
+    byte1 into TEMP at the current PC byte0 row. These two late units make
+    byte1 equal one either on the wrap token (new byte0 == 0x02) or while the
+    previous byte1 was already one. The preserve rule is intentionally bounded
+    to byte0 high nibbles 0..4 because the current 1096 corpus never runs
+    past 0x14a; branch targets below 0x100 such as 0x62 must not preserve the
+    prior high byte.
+    """
+
+    PC_I = 0
+    unit = _next_free_ffn_unit(ffn)
+    if unit + 2 > ffn.W_up.shape[0]:
+        raise RuntimeError("L3 FFN has no room for PC byte1 carry repair")
+
+    common = (
+        (BD.H1 + PC_I, 1.0),
+        (BD.BYTE_INDEX_0, 1.0),
+        (BD.IS_BYTE, 1.0),
+        (BD.HAS_SE, 1.0),
+    )
+    unit = _write_pc_byte1_one(
+        ffn,
+        unit,
+        BD,
+        S,
+        common + (
+            (BD.CLEAN_EMBED_LO + 2, 1.0),
+            (BD.CLEAN_EMBED_HI + 0, 1.0),
+        ),
+    )
+
+    for dim, weight in common:
+        ffn.W_up.data[unit, dim] = S * weight
+    ffn.W_up.data[unit, BD.TEMP + 1] = S
+    ffn.W_up.data[unit, BD.TEMP + 16] = S
+    for hi in range(5):
+        ffn.W_up.data[unit, BD.CLEAN_EMBED_HI + hi] = S
+    ffn.b_up.data[unit] = -S * 6.5
+    ffn.b_gate.data[unit] = 1.0
+    ffn.W_down.data[BD.OUTPUT_LO + 0, unit] = -500.0 / S
+    ffn.W_down.data[BD.OUTPUT_LO + 1, unit] = 500.0 / S
+    ffn.W_down.data[BD.OUTPUT_HI + 0, unit] = 500.0 / S
+
+
 def make_layer3_ffn_dep_anchor_op() -> Operation:
     """No-op companion for ``layer3_ffn``: declares identical reads/writes so
     the LayerCompiler's dep graph reserves a layer slot for it. Mirrors
@@ -70,7 +143,8 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         name="_layer3_ffn_dep_anchor",
         phase=3,
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
-               "EMBED_LO", "EMBED_HI", "H1", "H4", "OP_LEV",
+               "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "TEMP", "IS_BYTE", "H1", "H4", "OP_LEV",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
@@ -85,13 +159,13 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
 
 
 def make_layer3_carry_forward_attn_op() -> Operation:
-    """L3 attention: 7 carry-forward heads (PC, AX, SP, BP, STACK0 + relays).
+    """L3 attention: 8 carry-forward heads (PC, AX, SP, BP, STACK0 + relays).
 
     Heads 0-3 use ``Primitives.carry_forward_attention`` (the canonical
     proxy-aware implementation; the legacy ``_set_carry_forward_attn``
     helper was deleted per BD_SETDIM_HARDCODE_AUDIT M1). Head 4 uses
-    ``_set_stack0_carry_attn`` (different K source). Heads 5-6 stay inline
-    (head 5 reads OUTPUT_*, head 6 has OP_LEV gating + CLEAN_EMBED_*).
+    ``_set_stack0_carry_attn`` (different K source). Heads 5-7 are
+    declarative relays for AX_FULL, LEV BP->PC, and PC byte1 preservation.
     """
     def bake(attn, dim_positions, S):
         from ..primitives import Primitives
@@ -113,6 +187,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                 _stack0_carry_head_spec(proxy),
                 _ax_full_relay_head_spec(proxy),
                 _lev_bp_to_pc_head_spec(proxy),
+                _pc_byte1_prev_head_spec(proxy),
             ),
             HD,
         )
@@ -132,6 +207,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
     #   Head 4 (STACK0): declarative STACK0_BYTE0 carry head spec below
     #   Head 5 (AX_FULL): inline V[OUTPUT_LO/HI] → AX_FULL_LO/HI
     #   Head 6 (BP→PC LEV): inline V[CLEAN_EMBED_LO/HI] → (out via inline)
+    #   Head 7 (PC byte1): previous PC byte1 CLEAN_EMBED_LO/HI → TEMP
     _claims = set()
     _heads_cf = [
         (0, "EMBED_LO", "EMBED_HI"),
@@ -151,16 +227,22 @@ def make_layer3_carry_forward_attn_op() -> Operation:
     for k in range(16):
         _claims.add((3, "attn_W_v", f"6_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
         _claims.add((3, "attn_W_v", f"6_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+    # Head 7: previous PC byte1 relay V slots from CLEAN_EMBED_LO/HI.
+    for k in range(16):
+        _claims.add((3, "attn_W_v", f"7_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((3, "attn_W_v", f"7_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
 
     return Operation(
         name="layer3_carry_forward_attn",
         phase=3,
         reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
                "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV", "HAS_SE",
+               "H1", "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
-                "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI"},
+                "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI",
+                "TEMP", "ADDR_KEY"},
         kind="attn",
         layer_idx=3,
         bake_fn=bake,
@@ -253,6 +335,59 @@ def _lev_bp_to_pc_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         q=tuple(q),
         k=tuple(k),
         v=tuple(v),
+    )
+
+
+def _pc_byte1_prev_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L3 head 7: previous PC byte1 -> current PC byte0 TEMP.
+
+    The L3 FFN predicts PC byte1 at the PC byte0 position. To preserve byte1
+    after PC has crossed 0x100, that FFN needs the previous state's byte1; this
+    head copies it from the prior PC byte1 token into TEMP at PC byte0 rows.
+    It also stages the low nibble of byte1 into ADDR_KEY[32..47] at PC rows so
+    later declarative fetch heads can match the full 12-bit code address.
+    """
+
+    L = 15.0
+    PC_I = 0
+    GATE = 33
+    v = []
+    o = []
+    for k_idx in range(16):
+        v.append(AP(1 + k_idx, BD.CLEAN_EMBED_LO + k_idx, 1.0))
+        v.append(AP(17 + k_idx, BD.CLEAN_EMBED_HI + k_idx, 1.0))
+        o.append(AO(BD.TEMP + k_idx, 1 + k_idx, 1.0))
+        o.append(AO(BD.TEMP + 16 + k_idx, 17 + k_idx, 1.0))
+        o.append(AO(BD.ADDR_KEY + 32 + k_idx, 1 + k_idx, 1.0))
+
+    code_prefix_blockers = tuple(
+        AP(0, BD.ADDR_KEY + k_idx, -L)
+        for k_idx in range(48)
+    )
+
+    return DeclarativeAttentionHeadSpec(
+        head_idx=7,
+        q=(
+            AP(0, BD.IS_BYTE, L),
+            AP(0, BD.H1 + PC_I, L),
+            AP(0, BD.BYTE_INDEX_0, L),
+            AP(0, BD.MARK_PC, 3.0 * L),
+            AP(0, BD.HAS_SE, L),
+            AP(0, BD.CONST, -3.0 * L),
+            *code_prefix_blockers,
+            AP(GATE, BD.IS_BYTE, 500.0),
+            AP(GATE, BD.MARK_PC, 500.0),
+            AP(GATE, BD.CONST, -500.0),
+        ),
+        k=(
+            AP(0, BD.IS_BYTE, L),
+            AP(0, BD.H1 + PC_I, L),
+            AP(0, BD.BYTE_INDEX_1, L),
+            AP(0, BD.CONST, -2.0 * L),
+            AP(GATE, BD.CONST, 5.0),
+        ),
+        v=tuple(v),
+        o=tuple(o),
     )
 
 

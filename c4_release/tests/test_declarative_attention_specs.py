@@ -18,6 +18,7 @@ from neural_vm.unified_compiler.ops.l3_ops import (  # noqa: E402
 )
 from neural_vm.unified_compiler.ops.l5_ops import (  # noqa: E402
     _layer5_fetch_head_specs,
+    make_layer5_fetch_op,
 )
 from neural_vm.unified_compiler.ops.l6_ops import (  # noqa: E402
     _bake_layer6_attn_spec,
@@ -209,6 +210,25 @@ def test_layer5_fetch_declarative_byte_identical_to_legacy_helper():
         assert torch.equal(getattr(legacy, name), getattr(generated, name)), name
 
 
+def test_layer5_fetch_pc_opcode_head_uses_exact_address_without_recency_bias():
+    """PC opcode fetch must choose exact ADDR_KEY over later aliases."""
+
+    d_model = 512
+    num_heads = 8
+    attn = AutoregressiveAttention(
+        d_model, num_heads=num_heads, layer_idx=5, use_flash_attention=False
+    )
+
+    make_layer5_fetch_op().declarative_bake_fn(
+        SimpleNamespace(attn=attn),
+        _setdim_positions(),
+        100.0,
+    )
+
+    assert attn.alibi_slopes is not None
+    assert torch.allclose(attn.alibi_slopes, torch.zeros(num_heads))
+
+
 def test_layer8_sp_gather_declarative_byte_identical_to_legacy_helper():
     """The declarative L8 SP-gather specs reproduce legacy matrix writes."""
 
@@ -343,6 +363,33 @@ def test_layer6_attn_spec_declarative_byte_identical_to_legacy_helper():
 
     for name in ("W_q", "W_k", "W_v", "W_o"):
         assert torch.equal(getattr(legacy, name), getattr(generated, name)), name
+
+
+def test_layer6_first_step_fetch_relay_blocks_ax_byte_rows():
+    """The byte0 FETCH relay must not overwrite L4 multibyte address staging."""
+
+    d_model = 512
+    num_heads = 8
+    hd = d_model // num_heads
+    attn = AutoregressiveAttention(
+        d_model, num_heads=num_heads, layer_idx=6, use_flash_attention=False
+    )
+
+    with torch.no_grad():
+        _bake_layer6_attn_spec(attn, _SetDim, hd)
+
+    row = 5 * hd + 53
+    assert attn.W_q[row, _SetDim.H1 + 1].item() == -6500.0
+    assert attn.W_q[row, _SetDim.IS_BYTE].item() == -6500.0
+    assert attn.W_q[row, _SetDim.MARK_AX].item() == 6500.0
+    assert attn.W_q[row, _SetDim.H1 + 0].item() == 6500.0
+    assert attn.W_k[row, _SetDim.CONST].item() == 5.0
+
+    branch_row = 5 * hd + 52
+    assert attn.W_q[branch_row, _SetDim.IS_BYTE].item() == 300.0
+    assert attn.W_q[branch_row, _SetDim.H1 + 0].item() == 300.0
+    assert attn.W_q[branch_row, _SetDim.BYTE_INDEX_0].item() == 300.0
+    assert attn.W_q[branch_row, _SetDim.CONST].item() == 0.0
 
 
 def test_layer6_relay_heads_spec_declarative_byte_identical_to_legacy_helper():

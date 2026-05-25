@@ -386,11 +386,11 @@ class NeuralVMEmbedding(nn.Module):
         x[:, :, addr_key:addr_key + 48].add_(gated)
 
     def _inject_mem_store(self, token_ids, x, start_pos=0):
-        """Inject MEM_STORE=1.0 on historical MEM markers for L15 K-side.
+        """Inject retained-memory metadata on historical MEM markers for L15.
 
         Historical MEM sections (from prior store ops retained in context)
-        lack the MEM_STORE flag that L6 head 6 sets for the current step.
-        Without this flag, L15 memory lookup won't match these positions.
+        lack the residual flags that L6/L7 set for the current step.  Without
+        these flags, L15 memory lookup won't match retained store positions.
 
         Only injects on MEM markers in the retained history region
         (0 .. _mem_history_end), not the current step's MEM section.
@@ -406,11 +406,13 @@ class NeuralVMEmbedding(nn.Module):
             return
 
         mem_store = self._dim("MEM_STORE")
+        mem_addr_src = self._dim("MEM_ADDR_SRC")
         B, S = token_ids.shape
         for b in range(B):
             for i in range(start_pos, min(end, S)):
                 if token_ids[b, i].item() == Token.MEM:
                     x[b, i, mem_store] = 1.0
+                    x[b, i, mem_addr_src] = 1.0
 
     def set_mem_history_end(self, end):
         """Set the memory history boundary for MEM_STORE injection.
