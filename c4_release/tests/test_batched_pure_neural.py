@@ -320,6 +320,20 @@ class _FakeBatchedModel:
         return logits
 
 
+class _MismatchingFakeBatchedModel(_FakeBatchedModel):
+    def forward(self, token_ids, kv_cache=None, cached_prefix_len=0):
+        self.calls.append({
+            "kv_cache": kv_cache,
+            "cached_prefix_len": cached_prefix_len,
+            "shape": tuple(token_ids.shape),
+        })
+        batch, seq_len = token_ids.shape
+        out_len = seq_len - cached_prefix_len if cached_prefix_len > 0 else seq_len
+        logits = torch.zeros((batch, out_len, 8), dtype=torch.float32)
+        logits[:, :, 4 if kv_cache is not None else 5] = 1.0
+        return logits
+
+
 def _fake_kv_runner(*, verify):
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
 
@@ -414,6 +428,26 @@ def test_batched_kv_verify_on_runs_one_fresh_verification():
     assert runner._kv_stats["kv_forwards"] == 1
     assert runner._kv_stats["verifications"] == 1
     assert runner._kv_stats["verification_forwards"] == 1
+
+
+def test_batched_kv_verify_mismatch_falls_back_to_fresh_predictions():
+    runner = _fake_kv_runner(verify=True)
+    runner.model = _MismatchingFakeBatchedModel()
+
+    preds, pred_start, real_lens = runner._forward_argmax_batch(
+        [[10, 11, 12, 13], [20, 21, 22, 23]],
+        [0, 1],
+        first_logit_pos=2,
+    )
+
+    assert pred_start == 0
+    assert real_lens == [4, 4]
+    assert preds == [[5, 5, 5, 5], [5, 5, 5, 5]]
+    assert len(runner.model.calls) == 2
+    assert runner.model.calls[0]["kv_cache"] is not None
+    assert runner.model.calls[1]["kv_cache"] is None
+    assert runner._kv_stats["mismatches"] == 1
+    assert runner._kv_stats["fallbacks"] == 1
 
 
 def test_batched_kv_flush_interval_rebuilds_cache():
