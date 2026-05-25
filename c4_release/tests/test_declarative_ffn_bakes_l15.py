@@ -60,6 +60,8 @@ def test_layer15_lookup_blocks_store_opcodes_on_load_restore_row():
     for head in range(4):
         row = head * 64 + 31
         assert attn.W_q[row, _SetDim.OP_LI_RELAY] == 20000.0
+        expected_mark_ax = 0.0 if head == 0 else -20000.0
+        assert attn.W_q[row, _SetDim.MARK_AX] == expected_mark_ax
         assert attn.W_q[row, _SetDim.OP_SI] == -20000.0
         assert attn.W_q[row, _SetDim.OP_SC] == -20000.0
         assert attn.W_k[row, _SetDim.MEM_STORE] == 5.0
@@ -73,13 +75,15 @@ def test_layer15_lookup_blocks_non_load_marker_setup():
     assert attn.W_q[0, _SetDim.CONST] == -200000.0
     assert attn.W_q[0, _SetDim.OP_LI_RELAY] == 200000.0
     assert attn.W_q[0, _SetDim.OP_LC_RELAY] == 200000.0
+    assert attn.W_q[0, _SetDim.OP_LI] == 200000.0
+    assert attn.W_q[0, _SetDim.OP_LC] == 200000.0
     assert attn.W_q[0, _SetDim.CMP + 3] == 50000.0
     assert attn.W_q[0, _SetDim.OP_JSR] == -1000000.0
     assert attn.W_q[0, _SetDim.OP_ENT] == -1000000.0
     assert attn.W_q[0, _SetDim.OP_LEA] == -1000000.0
     assert attn.W_q[0, _SetDim.OP_IMM] == -1000000.0
     assert attn.W_q[62, _SetDim.H1 + 2] == 100000.0
-    assert attn.W_q[62, _SetDim.IS_BYTE] == 100000.0
+    assert attn.W_q[62, _SetDim.IS_BYTE] == 0.0
     assert attn.W_k[62, _SetDim.CONST] == -20.0
     for head in range(1, 4):
         row = head * 64
@@ -89,7 +93,7 @@ def test_layer15_lookup_blocks_non_load_marker_setup():
         assert attn.W_q[row, _SetDim.OP_IMM] == 0.0
         blocker_row = head * 64 + 62
         assert attn.W_q[blocker_row, _SetDim.H1 + 2] == 100000.0
-        assert attn.W_q[blocker_row, _SetDim.IS_BYTE] == 100000.0
+        assert attn.W_q[blocker_row, _SetDim.IS_BYTE] == 0.0
         assert attn.W_k[blocker_row, _SetDim.CONST] == -20.0
 
 
@@ -106,6 +110,8 @@ def test_layer15_lookup_blocks_top_store_stack0_marker_only():
     assert attn.W_q[row, _SetDim.EMBED_HI + 14] == 10000.0
     assert attn.W_q[row, _SetDim.ADDR_B0_LO + 0] == 10000.0
     assert attn.W_q[row, _SetDim.ADDR_B0_HI + 14] == 10000.0
+    assert attn.W_q[row, _SetDim.OP_LI_RELAY] == 50000.0
+    assert attn.W_q[row, _SetDim.OP_LC_RELAY] == 50000.0
     assert attn.W_k[row, _SetDim.CONST] == 20.0
 
     for row in (59, 60, 61):
@@ -152,6 +158,10 @@ def test_layer15_lookup_source_gate_blocks_bp_register_bytes():
             assert attn.W_q[row, _SetDim.MARK_AX] == 0.0
             assert attn.W_q[row, _SetDim.MARK_STACK0] == 3000.0
         for dim in (
+            _SetDim.H1 + 2,
+            _SetDim.H2 + 2,
+            _SetDim.H3 + 2,
+            _SetDim.L2H0 + 2,
             _SetDim.H1 + 3,
             _SetDim.H2 + 3,
             _SetDim.H3 + 3,
@@ -168,10 +178,16 @@ def test_layer15_lookup_blocks_nonpop_stack0_marker_in_current_head():
     for head in range(4):
         row = head * 64 + 63
         assert attn.W_q[row, _SetDim.MARK_STACK0] == 60000.0
-        assert attn.W_q[row, _SetDim.MEM_STORE] == 0.0
+        assert attn.W_q[row, _SetDim.MEM_STORE] == 10000.0
         assert attn.W_q[row, _SetDim.HAS_SE] == 0.0
         assert attn.W_q[row, _SetDim.CMP + 3] == -15000.0
         assert attn.W_q[row, _SetDim.IS_BYTE] == 60000.0
+        assert attn.W_q[row, _SetDim.OP_LI_RELAY] == -60000.0
+        assert attn.W_q[row, _SetDim.OP_LC_RELAY] == -60000.0
+        assert attn.W_q[row, _SetDim.EMBED_LO + 8] == 10000.0
+        assert attn.W_q[row, _SetDim.EMBED_HI + 14] == 10000.0
+        assert attn.W_q[row, _SetDim.ADDR_B0_LO + 0] == 10000.0
+        assert attn.W_q[row, _SetDim.ADDR_B0_HI + 14] == 10000.0
         assert attn.W_k[row, _SetDim.CONST] == -20.0
         assert attn.W_k[row, _SetDim.MEM_VAL_B1] == 0.0
         assert torch.count_nonzero(attn.W_v[row, :]) == 0

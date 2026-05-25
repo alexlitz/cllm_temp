@@ -443,6 +443,7 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
     pc_i = 0
     ax_i = 1
     mem_i = 4
+    sp_i = 2
     bp_i = 3
     for head in range(4):
         base = head * HD
@@ -483,6 +484,8 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             attn.W_q.data[base + 0, BD.CONST] = -lookup_bias
             attn.W_q.data[base + 0, BD.OP_LI_RELAY] = lookup_bias
             attn.W_q.data[base + 0, BD.OP_LC_RELAY] = lookup_bias
+            attn.W_q.data[base + 0, BD.OP_LI] = lookup_bias
+            attn.W_q.data[base + 0, BD.OP_LC] = lookup_bias
             attn.W_q.data[base + 0, BD.CMP + 3] = lookup_bias / 4.0
             attn.W_q.data[base + 1, BD.CMP + 3] = 12.5
             # JSR/ENT synthesize STACK0 values through the function-call path,
@@ -521,6 +524,8 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
                 attn.W_q.data[base + row, BD.EMBED_HI + high] = 10000.0
                 attn.W_q.data[base + row, BD.ADDR_B0_LO + low] = 10000.0
                 attn.W_q.data[base + row, BD.ADDR_B0_HI + high] = 10000.0
+                attn.W_q.data[base + row, BD.OP_LI_RELAY] = 50000.0
+                attn.W_q.data[base + row, BD.OP_LC_RELAY] = 50000.0
                 # A partial miss on this signature is negative; keep that
                 # negative query from becoming positive stale-key evidence.
                 attn.W_k.data[base + row, BD.CONST] = 20.0
@@ -582,16 +587,16 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
                 attn.W_k.data[base + source_gate, BD.H2 + mem_i] = -source_key_s
 
         # L15 lookup must source historical MEM value rows (or the prior
-        # STACK0 row), not BP register bytes.  BP bytes can carry leaked
-        # MEM_STORE residue from frame setup and then beat the intended stack
-        # source through the top-store blocker rows.
-        for dim in (
-            BD.H1 + bp_i,
-            BD.H2 + bp_i,
-            BD.H3 + bp_i,
-            BD.L2H0 + bp_i,
-        ):
-            attn.W_k.data[base + source_gate, dim] = -80.0
+        # STACK0 row), not SP/BP register bytes.  Frame register bytes can
+        # carry address-like residue and beat the intended MEM value source.
+        for marker_i in (sp_i, bp_i):
+            for dim in (
+                BD.H1 + marker_i,
+                BD.H2 + marker_i,
+                BD.H3 + marker_i,
+                BD.L2H0 + marker_i,
+            ):
+                attn.W_k.data[base + source_gate, dim] = -80.0
 
         # Load-only reinforcement: the row above also stabilizes pop/STACK0
         # lookup during store ops, so keep it conservative. LI/LC need a
@@ -668,7 +673,7 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
         # when address residue is large, overwriting L3/L10's SP bytes.
         sp_byte_blocker = 62
         attn.W_q.data[base + sp_byte_blocker, BD.H1 + 2] = 100000.0
-        attn.W_q.data[base + sp_byte_blocker, BD.IS_BYTE] = 100000.0
+        attn.W_q.data[base + sp_byte_blocker, BD.IS_BYTE] = 0.0
         attn.W_k.data[base + sp_byte_blocker, BD.CONST] = -20.0
 
         # STACK0 marker queries are memory lookups only for pop-group ops.
@@ -690,9 +695,22 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             attn.W_q.data[
                 base + nonpop_stack0_marker_blocker, BD.IS_BYTE
             ] = 60000.0
+            attn.W_q.data[
+                base + nonpop_stack0_marker_blocker, BD.OP_LI_RELAY
+            ] = -60000.0
+            attn.W_q.data[
+                base + nonpop_stack0_marker_blocker, BD.OP_LC_RELAY
+            ] = -60000.0
             attn.W_k.data[
                 base + nonpop_stack0_marker_blocker, BD.CONST
             ] = -20.0
+            top_store_e8_from_e0_s = 10000.0
+            row = base + nonpop_stack0_marker_blocker
+            attn.W_q.data[row, BD.MEM_STORE] = top_store_e8_from_e0_s
+            attn.W_q.data[row, BD.EMBED_LO + 8] = top_store_e8_from_e0_s
+            attn.W_q.data[row, BD.EMBED_HI + 14] = top_store_e8_from_e0_s
+            attn.W_q.data[row, BD.ADDR_B0_LO + 0] = top_store_e8_from_e0_s
+            attn.W_q.data[row, BD.ADDR_B0_HI + 14] = top_store_e8_from_e0_s
 
         # A load-only source gate must not be the thing that keeps L15 quiet
         # during current store generation. Add an explicit current-MEM query
@@ -727,6 +745,8 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
         attn.W_q.data[base + 31, BD.OP_LI_RELAY] = 20000.0
         if head == 0:
             attn.W_q.data[base + 31, BD.OP_LC_RELAY] = 20000.0
+        else:
+            attn.W_q.data[base + 31, BD.MARK_AX] = -20000.0
         attn.W_q.data[base + 31, BD.OP_SI] = -20000.0
         attn.W_q.data[base + 31, BD.OP_SC] = -20000.0
         attn.W_k.data[base + 31, BD.MEM_STORE] = 5.0

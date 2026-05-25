@@ -1396,6 +1396,27 @@ def test_tail_stack0_store_top_e8_from_e0_blocks_byte_rows():
     assert out.get("OUTPUT_HI+0", 0.0) == 0.0
 
 
+def test_tail_stack0_store_top_e8_from_e0_requires_positive_address_signature():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_e8_from_e0_byte_30"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9956295490264893,
+        "MEM_STORE": 0.40726688504219055,
+        "EMBED_LO+8": 3.26611079799477e-05,
+        "EMBED_HI+14": 3.2605676096864045e-05,
+        "ADDR_B0_LO+0": -12.62271499633789,
+        "ADDR_B0_HI+0": -0.5151978731155396,
+        "H1+3": 0.003357573179528117,
+        "OUTPUT_LO+0": 14.835540771484375,
+        "OUTPUT_HI+3": 4.382873726171965e-07,
+    })
+
+    assert out["OUTPUT_LO+0"] == 14.835540771484375
+    assert out["OUTPUT_HI+3"] == 4.382873726171965e-07
+    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+
+
 def test_tail_pop_mem_marker_zero_blocks_byte_rows():
     ir = _single_rule_ir(_tail_rule("tail_pop_mem_marker_zero"))
 
@@ -3428,6 +3449,21 @@ def test_tail_clear_output_after_byte3_blocks_mem_addr_to_value_transition():
     assert out["OUTPUT_HI+0"] == 1_000_000.0
 
 
+def test_tail_clear_output_after_byte3_blocks_stack0_byte_rows():
+    ir = _single_rule_ir(_tail_rule("tail_clear_output_after_byte3"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "BYTE_INDEX_3": 1.0,
+        "STACK0_BYTE3": 1.0,
+        "OUTPUT_LO+10": 1_000_000.0,
+        "OUTPUT_HI+0": 1_000_000.0,
+    })
+
+    assert out["OUTPUT_LO+10"] == 1_000_000.0
+    assert out["OUTPUT_HI+0"] == 1_000_000.0
+
+
 def test_tail_clear_output_before_step_end_clears_mem_value_residue():
     ir = _single_rule_ir(_tail_rule("tail_clear_output_before_step_end"))
 
@@ -3444,6 +3480,21 @@ def test_tail_clear_output_before_step_end_clears_mem_value_residue():
     assert out["OUTPUT_HI+0"] < 0.0
     assert out["OUTPUT_LO+15"] < 0.0
     assert out["OUTPUT_HI+15"] < 0.0
+
+
+def test_tail_clear_output_before_step_end_blocks_stack0_byte_rows():
+    ir = _single_rule_ir(_tail_rule("tail_clear_output_before_step_end"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "NEXT_SE": 1.0,
+        "STACK0_BYTE0": 1.0,
+        "OUTPUT_LO+14": 1_000_000.0,
+        "OUTPUT_HI+13": 1_000_000.0,
+    })
+
+    assert out["OUTPUT_LO+14"] == 1_000_000.0
+    assert out["OUTPUT_HI+13"] == 1_000_000.0
 
 
 def test_tail_clear_output_before_step_end_requires_next_se():
