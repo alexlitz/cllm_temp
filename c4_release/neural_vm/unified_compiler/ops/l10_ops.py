@@ -1781,10 +1781,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("MARK_SP", -100.0),
             ("MARK_BP", -100.0),
             ("MARK_MEM", -100.0),
-            ("H1+0", -1.0e12),
-            ("H1+1", -1.0e12),
-            ("H1+2", -1.0e12),
-            ("H1+3", -1.0e12),
+            ("H1+0", -1000.0),
+            ("H1+1", -1000.0),
+            ("H1+2", -1000.0),
+            ("H1+3", -1000.0),
             ("OP_EQ", -1000000.0),
             ("OP_NE", -1000000.0),
             ("OP_LT", -1000000.0),
@@ -1901,10 +1901,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             f"{value:02x}"
                         ),
                         conditions=base_conditions + (
-                            (f"OUTPUT_LO+{lo}", 0.001),
-                            (f"OUTPUT_HI+{hi}", 0.001),
+                            (f"OUTPUT_LO+{lo}", 10.0),
+                            (f"OUTPUT_HI+{hi}", 10.0),
                         ),
-                        threshold=55.0,
+                        threshold=110.0,
                         gate="MARK_STACK0",
                         writes=byte_writes(value, strength=5000.0),
                     )
@@ -2056,6 +2056,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("OP_ENT", -1000000.0),
             ("MEM_STORE", -1000000.0),
         )
+        transition_blockers = (
+            ("NEXT_PC", -1000000.0),
+            ("NEXT_AX", -1000000.0),
+            ("NEXT_SP", -1000000.0),
+            ("NEXT_BP", -1000000.0),
+            ("NEXT_STACK0", -1000000.0),
+            ("NEXT_MEM", -1000000.0),
+        )
         return (
             FFNRule.constant_write(
                 name="tail_ax_add_no_carry_byte1_00",
@@ -2075,7 +2083,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ) + tuple(
                     (f"AX_CARRY_LO+{other}", -2000.0)
                     for other in range(1, 16)
-                ) + marker_blockers + non_add_blockers,
+                ) + marker_blockers + non_add_blockers + transition_blockers,
                 threshold=300.0,
                 writes=byte_writes(0x00, strength=5000.0),
             ),
@@ -2155,7 +2163,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ),
                     threshold=340.0,
                     gate="TEMP+8",
-                    writes=byte_writes(lo, strength=1.0e12),
+                    writes=byte_writes(lo, strength=10_000.0),
                 )
             )
         return tuple(rules)
@@ -2240,17 +2248,37 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         nibble.
         """
 
-        non_mul_block = -1_000_000_000_000_000_000_000_000_000_000.0
         non_mul_blockers = (
-            ("OP_ADD", non_mul_block),
-            ("OP_SUB", non_mul_block),
-            ("OP_DIV", non_mul_block),
-            ("OP_MOD", non_mul_block),
-            ("OP_SHL", non_mul_block),
-            ("OP_SHR", non_mul_block),
-            ("OP_AND", non_mul_block),
-            ("OP_OR", non_mul_block),
-            ("OP_XOR", non_mul_block),
+            ("OP_ADD", -1000.0),
+            ("OP_SUB", -1000.0),
+            ("OP_DIV", -1000.0),
+            ("OP_MOD", -1000.0),
+            ("OP_SHL", -1000.0),
+            ("OP_SHR", -1000.0),
+            ("OP_AND", -1000.0),
+            ("OP_OR", -1000.0),
+            ("OP_XOR", -1000.0),
+        )
+        bounded_ax_byte0 = (
+            ("IS_BYTE", 5.0),
+            ("H1+1", 20.0),
+            ("H1+2", -1000.0),
+            ("H1+3", -1000.0),
+            ("H1+4", -1000.0),
+            ("BYTE_INDEX_0", 5.0),
+            ("BYTE_INDEX_1", -1000.0),
+            ("BYTE_INDEX_2", -1000.0),
+            ("BYTE_INDEX_3", -1000.0),
+            ("MARK_AX", -1000.0),
+            ("MARK_PC", -1000.0),
+            ("MARK_SP", -1000.0),
+            ("MARK_BP", -1000.0),
+            ("MARK_STACK0", -1000.0),
+            ("MARK_MEM", -1000.0),
+            ("OP_LEA", -1000.0),
+            ("OP_JMP", -1000.0),
+            ("OP_ADJ", -1000.0),
+            ("OP_ENT", -1000.0),
         )
         rules = []
         for high_nibble in range(16):
@@ -2261,54 +2289,31 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     if high_nibble == 0
                     else f"tail_wide_mul_byte1_preserve_{high_nibble:01x}{low_nibble:01x}"
                 )
-                temp_block = non_mul_block if high_nibble == 0 else -1_000_000_000.0
-                add_temp_block = non_mul_block
-                sub_temp_block = non_mul_block
-                has_weight = (
-                    3_000_000_000_000_000.0
-                    if high_nibble == 0
-                    else 30_000_000_000_000.0
-                )
-                output_weight = (
-                    100_000_000.0
-                    if high_nibble == 0
-                    else 1_000_000_000.0
-                )
-                threshold = (
-                    3_000_005_000_000_000.0
-                    if high_nibble == 0
-                    else 30_030_000_000_000.0
-                )
-                span_blockers = (
-                    ("H1+2", -100_000_000_000_000_000.0),
-                    ("H1+3", -100_000_000_000_000_000.0),
-                    ("H1+4", -100_000_000_000_000_000.0),
-                )
                 rules.append(
                     FFNRule.gated_write(
                         name=name,
-                        conditions=ax_byte0 + (
-                            ("HAS_SE", has_weight),
-                            ("TEMP+10", 1_000_000_000.0),
+                        conditions=bounded_ax_byte0 + (
+                            ("HAS_SE", 20.0),
+                            ("TEMP+10", 30.0),
+                            ("OP_MUL", 80.0),
                             ("OP_EQ", -1000.0),
                             ("OP_NE", -1000.0),
                             ("OP_LT", -1000.0),
                             ("OP_GT", -1000.0),
                             ("OP_LE", -1000.0),
                             ("OP_GE", -1000.0),
-                            ("OP_JSR", -1_000_000_000_000.0),
-                            ("OP_ENT", -1_000_000_000_000.0),
-                            ("OP_LEV", -1_000_000_000_000.0),
-                            (f"OUTPUT_LO+{low_nibble}", output_weight),
-                            (f"OUTPUT_HI+{high_nibble}", output_weight),
-                            ("TEMP+4", temp_block),
-                            ("TEMP+5", temp_block),
-                            ("TEMP+6", temp_block),
-                            ("TEMP+8", add_temp_block),
-                            ("TEMP+9", sub_temp_block),
-                        ) + span_blockers + non_mul_blockers,
-                        threshold=threshold,
-                        gate="BYTE_INDEX_0",
+                            ("OP_JSR", -1000.0),
+                            ("OP_LEV", -1000.0),
+                            (f"OUTPUT_LO+{low_nibble}", 2.0),
+                            (f"OUTPUT_HI+{high_nibble}", 2.0),
+                            ("TEMP+4", -1000.0),
+                            ("TEMP+5", -1000.0),
+                            ("TEMP+6", -1000.0),
+                            ("TEMP+8", -1000.0),
+                            ("TEMP+9", -1000.0),
+                        ) + non_mul_blockers,
+                        threshold=220.0,
+                        gate="OP_MUL",
                         writes=byte_writes(byte_value, strength=10_000_000.0),
                     )
                 )
@@ -2317,9 +2322,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
     ax_byte0 = (
         ("IS_BYTE", 1.0),
         ("H1+1", 1.0),
-        ("H1+2", -1_000_000_000_000.0),
-        ("H1+3", -1_000_000_000_000.0),
-        ("H1+4", -1_000_000_000_000.0),
+        ("H1+2", -1000000.0),
+        ("H1+3", -1000000.0),
+        ("H1+4", -1000000.0),
         ("BYTE_INDEX_0", 1.0),
         ("BYTE_INDEX_1", -1_000_000_000.0),
         ("BYTE_INDEX_2", -1_000_000_000.0),
@@ -2339,9 +2344,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ("IS_BYTE", 1.0),
         ("H1+1", 20.0),
         ("BYTE_INDEX_0", 20.0),
-        ("BYTE_INDEX_1", -1_000_000_000_000_000.0),
-        ("BYTE_INDEX_2", -1_000_000_000_000_000.0),
-        ("BYTE_INDEX_3", -1_000_000_000_000_000.0),
+        ("BYTE_INDEX_1", -1000000000.0),
+        ("BYTE_INDEX_2", -1000000000.0),
+        ("BYTE_INDEX_3", -1000000000.0),
         ("MARK_AX", -200.0),
         ("OP_SI", 20.0),
         ("MEM_STORE", 20.0),
@@ -2499,7 +2504,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("IS_BYTE", 5.0),
                 ("HAS_SE", 5.0),
                 ("H1+2", 20.0),
-                ("H1+1", -1_000_000_000_000_000_000_000_000_000_000.0),
+                ("H1+1", -1000000.0),
                 ("BYTE_INDEX_0", -10000.0),
                 ("BYTE_INDEX_1", -10000.0),
                 ("BYTE_INDEX_3", -10000.0),
@@ -2769,7 +2774,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("BYTE_INDEX_0", 10.0),
                 ("BYTE_INDEX_1", -1000.0),
                 ("TEMP+8", 50.0),
-                ("TEMP+9", -1_000_000_000_000_000_000_000_000_000_000.0),
+                ("TEMP+9", -1000000.0),
                 ("CARRY+1", 100.0),
                 ("FETCH_HI+1", 1000.0),
                 ("OUTPUT_LO+1", 0.01),
@@ -2900,7 +2905,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             threshold=1.5,
             gate="BYTE_INDEX_3",
-            writes=clear_output_writes(strength=10_000_000_000.0),
+            writes=clear_output_writes(strength=100_000_000.0),
         ),
         FFNRule.gated_write(
             name="tail_clear_output_before_step_end",
@@ -2916,7 +2921,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             threshold=1.5,
             gate="NEXT_SE",
-            writes=clear_output_writes(strength=10_000_000_000.0),
+            writes=clear_output_writes(strength=100_000_000.0),
         ),
     ) + sp_pop_carry_rules()
     return step_end_transition_blocked(pc_byte_span_blocked(rules))

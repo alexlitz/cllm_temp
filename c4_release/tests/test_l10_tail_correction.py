@@ -560,6 +560,27 @@ def test_tail_ax_add_no_carry_zero_blocks_si_ax_byte_row_residue():
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
+def test_tail_ax_add_no_carry_zero_blocks_sp_marker_transition():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_no_carry_byte1_00"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701374769210815,
+        "NEXT_SP": 1.368794322013855,
+        "TEMP+8": 240.0,
+        "ALU_LO+0": 10.0,
+        "ALU_HI+0": 20.0,
+        "AX_CARRY_HI+0": 20.0,
+        "OUTPUT_LO+0": -218.64,
+        "OUTPUT_HI+0": -218.64,
+    })
+
+    assert out["OUTPUT_LO+0"] == -218.64
+    assert out["OUTPUT_HI+0"] == -218.64
+
+
 def test_tail_ax_add_no_carry_zero_ignores_tiny_negative_blocker_residue():
     ir = _single_rule_ir(_tail_rule("tail_ax_add_no_carry_byte1_00"))
 
@@ -2206,10 +2227,10 @@ def test_tail_ax_add_byte1_hi_zero_overrides_block27_scale():
         "TEMP+8": 1.0000001192092896,
         "ALU_HI+0": 6.236852645874023,
         "AX_CARRY_HI+0": 3.941866397857666,
-        "OUTPUT_LO+0": 2.339727474688e12,
-        "OUTPUT_LO+3": 2.1993707536384e13,
-        "OUTPUT_HI+0": 4.041023946752e12,
-        "OUTPUT_HI+1": 4.629028929536e12,
+        "OUTPUT_LO+0": 2000.0,
+        "OUTPUT_LO+3": 3000.0,
+        "OUTPUT_HI+0": 100.0,
+        "OUTPUT_HI+1": 4000.0,
     })
 
     assert out["OUTPUT_LO+3"] > out["OUTPUT_LO+0"]
@@ -2666,6 +2687,7 @@ def test_tail_wide_mul_byte1_preserve_handles_nonzero_high_nibble():
         "BYTE_INDEX_2": 0.0,
         "BYTE_INDEX_3": 0.0,
         "TEMP+10": 1.0,
+        "OP_MUL": 1.0,
         "OUTPUT_LO+9": 40.0,
         "OUTPUT_HI+15": 40.0,
     })
@@ -2700,6 +2722,7 @@ def test_tail_wide_mul_byte1_preserve_still_fires_with_byte0_gate():
         "H1+1": 1.0,
         "BYTE_INDEX_0": 1.0,
         "TEMP+10": 1.0,
+        "OP_MUL": 1.0,
         "OUTPUT_LO+9": 100.0,
         "OUTPUT_HI+0": 100.0,
     })
@@ -3037,7 +3060,28 @@ def test_tail_shr_byte1_zero_still_fires_with_full_temp7_relay():
 def test_tail_ax_add_byte1_hi_zero_lo_rules_use_finite_strength():
     rule = _tail_rule("tail_ax_add_byte1_hi_zero_lo_3")
 
-    assert max(abs(write.weight) for write in rule.writes) == 1.0e12
+    assert max(abs(write.weight) for write in rule.writes) == 10_000.0
+
+
+def test_tail_wide_mul_byte1_preserve_rules_use_bounded_conditions():
+    rule = _tail_rule("tail_wide_mul_byte1_preserve_43")
+
+    assert max(abs(term.weight) for term in rule.conditions) <= 1000000.0
+    assert rule.threshold == 220.0
+    assert rule.gate.name == "OP_MUL"
+    assert rule.gate.offset == 0
+
+
+def test_tail_rules_do_not_use_trillion_scale_numeric_bounds():
+    for rule in _tail_bit32_result_correction_rules():
+        condition_max = max((abs(term.weight) for term in rule.conditions), default=0.0)
+        write_max = max((abs(write.weight) for write in rule.writes), default=0.0)
+        gate_term_max = max((abs(term.weight) for term in rule.gate_terms), default=0.0)
+
+        assert condition_max <= 1_000_000_000.0, rule.name
+        assert write_max <= 1_000_000_000.0, rule.name
+        assert gate_term_max <= 1_000_000_000.0, rule.name
+        assert abs(rule.threshold) <= 1_000_000_000.0, rule.name
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_add_relay_residue():
@@ -3058,6 +3102,46 @@ def test_tail_wide_mul_byte1_preserve_blocks_add_relay_residue():
     assert out["OUTPUT_LO+3"] == state["OUTPUT_LO+3"]
     assert out["OUTPUT_HI+4"] == state["OUTPUT_HI+4"]
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
+def test_tail_wide_mul_byte1_preserve_blocks_tiny_negative_op_residue():
+    ir = _single_rule_ir(_tail_rule("tail_wide_mul_byte1_preserve_43"))
+    state = {
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "TEMP+10": 1.0,
+        "OP_MUL": -1e-21,
+        "OP_ADD": -1e-21,
+        "OUTPUT_LO+3": 2.2e13,
+        "OUTPUT_HI+4": 4.6e12,
+    }
+
+    out = ir.symbolic_ffn(state)
+
+    assert out["OUTPUT_LO+3"] == state["OUTPUT_LO+3"]
+    assert out["OUTPUT_HI+4"] == state["OUTPUT_HI+4"]
+
+
+def test_tail_wide_mul_byte1_preserve_blocks_add_even_with_mul_residue():
+    ir = _single_rule_ir(_tail_rule("tail_wide_mul_byte1_preserve_43"))
+    state = {
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "TEMP+10": 1.0,
+        "OP_MUL": 1.0,
+        "OP_ADD": 1.0,
+        "OUTPUT_LO+3": 100.0,
+        "OUTPUT_HI+4": 100.0,
+    }
+
+    out = ir.symbolic_ffn(state)
+
+    assert out["OUTPUT_LO+3"] == state["OUTPUT_LO+3"]
+    assert out["OUTPUT_HI+4"] == state["OUTPUT_HI+4"]
 
 
 def test_tail_ax_add_byte1_missing_stack_high_repairs_fetch_hi1_case():
