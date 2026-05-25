@@ -1634,6 +1634,49 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
         )
 
+    def ax_lea_local_addr_byte1_preserve_rules() -> tuple[FFNRule, ...]:
+        """Preserve byte 1 for BP-relative local addresses produced by LEA.
+
+        Local addresses such as BP-8/BP-16/BP-24 emit byte 0 as e8/e0/d8 and
+        byte 1 as ff. The late ADD cleanup can mistake the LEA row for a
+        low-16-bit arithmetic result and zero the high nibble. Key this repair
+        on the negative immediate high nibble instead of the weak opcode bit.
+        """
+
+        rules = []
+        for value in (0xE8, 0xE0, 0xD8):
+            lo = value & 0xF
+            hi = value >> 4
+            rules.append(
+                FFNRule.constant_write(
+                    name=f"tail_ax_lea_local_addr_byte1_ff_after_{value:02x}",
+                    conditions=(
+                        ("IS_BYTE", 5.0),
+                        ("HAS_SE", 5.0),
+                        ("H1+1", 20.0),
+                        ("H1+2", -1000.0),
+                        ("H1+3", -1000.0),
+                        ("H1+4", -1000.0),
+                        ("BYTE_INDEX_0", 5.0),
+                        ("BYTE_INDEX_1", -1000.0),
+                        ("BYTE_INDEX_2", -1000.0),
+                        ("BYTE_INDEX_3", -1000.0),
+                        (f"CLEAN_EMBED_LO+{lo}", 30.0),
+                        (f"CLEAN_EMBED_HI+{hi}", 30.0),
+                        ("FETCH_HI+15", 100.0),
+                        ("MARK_AX", -10000.0),
+                        ("MARK_PC", -10000.0),
+                        ("MARK_SP", -10000.0),
+                        ("MARK_BP", -10000.0),
+                        ("MARK_STACK0", -10000.0),
+                        ("MARK_MEM", -10000.0),
+                    ),
+                    threshold=150.0,
+                    writes=byte_writes(0xFF, strength=20000.0),
+                )
+            )
+        return tuple(rules)
+
     def stack0_store_nonzero_pair_rules() -> tuple[FFNRule, ...]:
         """Late STACK0 store correction for nonzero ALU byte pairs.
 
@@ -1886,6 +1929,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         )
         non_add_blockers = (
             ("OP_IMM", -1000000.0),
+            ("OP_LEA", -1000000.0),
             ("OP_EQ", -1000000.0),
             ("OP_NE", -1000000.0),
             ("OP_LT", -1000000.0),
@@ -1944,6 +1988,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         non_add_blockers = (
             ("CARRY+2", -1000.0),
             ("TEMP+9", -1000.0),
+            ("OP_LEA", -1000000.0),
             ("OP_EQ", -1000000.0),
             ("OP_NE", -1000000.0),
             ("OP_LT", -1000000.0),
@@ -1955,8 +2000,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("OP_LI", -1000.0),
             ("OP_LC", -1000.0),
         )
-        writes = [("OUTPUT_HI+0", 5000.0)]
-        writes.extend((f"OUTPUT_HI+{other}", -5000.0) for other in range(1, 16))
+        writes = [("OUTPUT_HI+0", 1.0e23)]
+        writes.extend((f"OUTPUT_HI+{other}", -1.0e23) for other in range(1, 16))
         return (
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_hi_zero",
@@ -1969,10 +2014,64 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("ALU_HI+0", 20.0),
                     ("AX_CARRY_HI+0", 20.0),
                 ) + marker_blockers + non_add_blockers,
-                threshold=250.0,
+                threshold=120.0,
                 writes=tuple(writes),
             ),
         )
+
+    def ax_sub_byte1_high_zero_rules() -> tuple[FFNRule, ...]:
+        """Assert high nibble zero for low 16-bit SUB byte-1 rows."""
+
+        writes = [("OUTPUT_HI+0", 1.0e12)]
+        writes.extend((f"OUTPUT_HI+{other}", -1.0e12) for other in range(1, 16))
+        return (
+            FFNRule.constant_write(
+                name="tail_ax_sub_byte1_hi_zero",
+                conditions=ax_byte0 + (
+                    ("TEMP+9", 100.0),
+                    ("TEMP+8", -1000.0),
+                    ("OP_IMM", -1000.0),
+                    ("OP_LEA", -1000.0),
+                    ("OP_EQ", -1000.0),
+                    ("OP_NE", -1000.0),
+                    ("OP_LT", -1000.0),
+                    ("OP_GT", -1000.0),
+                    ("OP_LE", -1000.0),
+                    ("OP_GE", -1000.0),
+                ),
+                threshold=90.0,
+                writes=tuple(writes),
+            ),
+        )
+
+    def ax_sub_borrow_decrement_rules() -> tuple[FFNRule, ...]:
+        """Re-apply byte-0 SUB borrow after L15 restores the base high byte."""
+
+        rules = []
+        for old_lo in range(1, 16):
+            rules.append(
+                FFNRule.gated_write(
+                    name=f"tail_ax_sub_borrow_byte1_{old_lo:01x}_to_{old_lo - 1:01x}",
+                    conditions=ax_byte0 + (
+                        ("TEMP+9", 100.0),
+                        ("TEMP+8", -1000.0),
+                        ("CARRY+2", 100.0),
+                        (f"OUTPUT_LO+{old_lo}", 0.001),
+                        ("OP_IMM", -1000.0),
+                        ("OP_LEA", -1000.0),
+                        ("OP_EQ", -1000.0),
+                        ("OP_NE", -1000.0),
+                        ("OP_LT", -1000.0),
+                        ("OP_GT", -1000.0),
+                        ("OP_LE", -1000.0),
+                        ("OP_GE", -1000.0),
+                    ),
+                    threshold=250.0,
+                    gate="CARRY+2",
+                    writes=byte_writes(old_lo - 1, strength=1.0e8),
+                )
+            )
+        return tuple(rules)
 
     def wide_mul_byte1_preserve_rules() -> tuple[FFNRule, ...]:
         """Keep the staged MUL byte-1 value authoritative through the tail.
@@ -2267,6 +2366,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *sp_pop_marker_increment_rules(),
         *sp_pop_byte1_preserve_rules(),
         *stack0_pushed_addr_byte1_preserve_rules(),
+        *ax_lea_local_addr_byte1_preserve_rules(),
         *stack0_pop_loaded_output_rules(),
         *stack0_store_loaded_output_rules(),
         *stack0_store_top_e0_output_rules(),
@@ -2339,6 +2439,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         *ax_add_no_carry_zero_rules(),
         *ax_add_byte1_high_zero_rules(),
+        *ax_sub_byte1_high_zero_rules(),
+        *ax_sub_borrow_decrement_rules(),
         *wide_mul_byte1_preserve_rules(),
         FFNRule.gated_write(
             name="tail_ax_add_byte1_carry_high2_03",

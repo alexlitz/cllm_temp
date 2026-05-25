@@ -1902,6 +1902,11 @@ def make_layer6_routing_ffn_op() -> Operation:
             "all",
         },
         spec_section="BLOG_SPEC.md#function-calls",
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI": "AX_byte0",
+        },
+        opcodes={"OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR"},
     )
 
 
@@ -2141,6 +2146,10 @@ def make_layer6_attn_bake_op() -> Operation:
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+        produces={
+            "ALU_LO": "STACK0",
+            "ALU_HI": "STACK0",
+        },
     )
 
 
@@ -2213,6 +2222,17 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
             HD,
         )
 
+    _claims = {
+        (6, "attn_W_v", "4_1", "OP_BZ+0"),
+        (6, "attn_W_v", "4_2", "OP_BNZ+0"),
+        (6, "attn_W_v", "4_3", "EMBED_LO+0"),
+        (6, "attn_W_v", "4_4", "EMBED_HI+0"),
+        (6, "attn_W_o", "4_1", "CMP+2"),
+        (6, "attn_W_o", "4_2", "CMP+3"),
+        (6, "attn_W_o", "4_3", "CMP+4"),
+        (6, "attn_W_o", "4_4", "CMP+5"),
+    }
+
     return Operation(
         name="layer6_bz_bnz_relay_bake",
         phase=998.7,
@@ -2227,6 +2247,11 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
             "TestSmokeControlFlow::test_bz_branch",
         },
         spec_section="BLOG_SPEC.md#control-flow",
+        claims=_claims,
+        produces={
+            "CMP": "PC_marker",
+        },
+        opcodes={"OP_BZ", "OP_BNZ"},
     )
 
 

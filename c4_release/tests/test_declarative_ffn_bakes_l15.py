@@ -191,16 +191,16 @@ def test_layer15_lookup_strengthens_local_slot_byte0_match():
 
     for head in range(4):
         bit3_row = head * 64 + 7
-        assert attn.W_q[bit3_row, _SetDim.ADDR_B0_LO + 8] == 30.0
-        assert attn.W_k[bit3_row, _SetDim.ADDR_B0_LO + 8] == 30.0
-        assert attn.W_q[bit3_row, _SetDim.ADDR_B0_LO + 0] == -30.0
-        assert attn.W_k[bit3_row, _SetDim.ADDR_B0_LO + 0] == -30.0
+        assert attn.W_q[bit3_row, _SetDim.ADDR_B0_LO + 8] == 100.0
+        assert attn.W_k[bit3_row, _SetDim.ADDR_B0_LO + 8] == 100.0
+        assert attn.W_q[bit3_row, _SetDim.ADDR_B0_LO + 0] == -100.0
+        assert attn.W_k[bit3_row, _SetDim.ADDR_B0_LO + 0] == -100.0
 
         hi_bit1_row = head * 64 + 9
-        assert attn.W_q[hi_bit1_row, _SetDim.ADDR_B0_HI + 14] == 30.0
-        assert attn.W_k[hi_bit1_row, _SetDim.ADDR_B0_HI + 14] == 30.0
-        assert attn.W_q[hi_bit1_row, _SetDim.ADDR_B0_HI + 13] == -30.0
-        assert attn.W_k[hi_bit1_row, _SetDim.ADDR_B0_HI + 13] == -30.0
+        assert attn.W_q[hi_bit1_row, _SetDim.ADDR_B0_HI + 14] == 100.0
+        assert attn.W_k[hi_bit1_row, _SetDim.ADDR_B0_HI + 14] == 100.0
+        assert attn.W_q[hi_bit1_row, _SetDim.ADDR_B0_HI + 13] == -100.0
+        assert attn.W_k[hi_bit1_row, _SetDim.ADDR_B0_HI + 13] == -100.0
 
         exact_row = head * 64 + 43 + 8
         assert attn.W_q[exact_row, _SetDim.CONST] == -100.0
@@ -211,6 +211,31 @@ def test_layer15_lookup_strengthens_local_slot_byte0_match():
         assert attn.W_k[exact_row, _SetDim.ADDR_B0_LO + 8] == 100.0
         assert attn.W_q[exact_row, _SetDim.ADDR_B0_LO + 0] == 0.0
         assert attn.W_k[exact_row, _SetDim.ADDR_B0_LO + 0] == 0.0
+
+
+def test_layer15_local_slot_hi_nibble_mismatch_beats_adjacent_frame_slot():
+    attn = _StubAttn()
+
+    _suppress_l15_lookup_during_current_store_generation(attn, _SetDim, 64)
+
+    row_base = 0
+
+    def bit_score(nibble_q: int, nibble_k: int, *, base_dim: int) -> float:
+        score = 0.0
+        for bit in range(4):
+            row = row_base + 4 + (4 if base_dim == _SetDim.ADDR_B0_HI else 0) + bit
+            score += (
+                float(attn.W_q[row, base_dim + nibble_q])
+                * float(attn.W_k[row, base_dim + nibble_k])
+            )
+        return score
+
+    # Adjacent call-frame slots such as return-pc 0xffe8 and arg 0xfff8
+    # share the low nibble. The high-nibble exact match must dominate recency.
+    exact_hi = bit_score(15, 15, base_dim=_SetDim.ADDR_B0_HI)
+    adjacent_hi = bit_score(15, 14, base_dim=_SetDim.ADDR_B0_HI)
+
+    assert exact_hi - adjacent_hi == 20000.0
 
 
 def test_layer15_si_mem_addr0_head_reads_clean_stack0_byte0():

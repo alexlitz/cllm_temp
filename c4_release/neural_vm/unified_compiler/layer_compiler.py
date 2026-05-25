@@ -221,6 +221,11 @@ class Operation:
     # and the canonical AX_CARRY example.
     produces: Dict[str, str] = field(default_factory=dict)
     consumes_fresh: Dict[str, str] = field(default_factory=dict)
+    # Tier A verifier annotations. Empty means "not annotated"; these fields
+    # are metadata only unless a verifier chooses to inspect them.
+    reset_after_step: Set[str] = field(default_factory=set)
+    requires: Dict[str, str] = field(default_factory=dict)
+    opcodes: Set[str] = field(default_factory=set)
     # Tier B declarative-verifier annotations. These are opt-in and default
     # to no-op values so existing operation declarations remain valid:
     #

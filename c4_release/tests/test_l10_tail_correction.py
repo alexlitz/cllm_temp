@@ -508,6 +508,88 @@ def test_tail_ax_add_no_carry_zero_blocks_imm_marker_row():
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
+def test_tail_ax_add_no_carry_zero_blocks_lea_address_row():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_no_carry_byte1_00"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "OP_LEA": 5.0,
+        "TEMP+8": 100.0,
+        "ALU_LO+0": 10.0,
+        "ALU_HI+0": 20.0,
+        "AX_CARRY_HI+0": 20.0,
+        "OUTPUT_LO+15": 9.0,
+        "OUTPUT_HI+15": 9.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == 9.0
+    assert out["OUTPUT_HI+15"] == 9.0
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
+def test_tail_ax_add_byte1_high_zero_blocks_lea_address_row():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_byte1_hi_zero"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "OP_LEA": 5.0,
+        "TEMP+8": 100.0,
+        "ALU_HI+0": 20.0,
+        "AX_CARRY_HI+0": 20.0,
+        "OUTPUT_LO+15": 9.0,
+        "OUTPUT_HI+15": 9.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == 9.0
+    assert out["OUTPUT_HI+15"] == 9.0
+    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+
+
+def test_tail_ax_lea_local_addr_byte1_preserves_ff_after_e8():
+    ir = _single_rule_ir(_tail_rule("tail_ax_lea_local_addr_byte1_ff_after_e8"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "CLEAN_EMBED_LO+8": 1.0,
+        "CLEAN_EMBED_HI+14": 1.0,
+        "FETCH_HI+15": 1.0,
+        "OUTPUT_LO+15": 9.0,
+        "OUTPUT_HI+0": 25.0,
+    })
+
+    assert out["OUTPUT_LO+15"] > 9.0
+    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI+0"] < 0.0
+
+
+def test_tail_ax_lea_local_addr_byte1_requires_negative_immediate():
+    ir = _single_rule_ir(_tail_rule("tail_ax_lea_local_addr_byte1_ff_after_e8"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "CLEAN_EMBED_LO+8": 1.0,
+        "CLEAN_EMBED_HI+14": 1.0,
+        "OUTPUT_LO+15": 9.0,
+        "OUTPUT_HI+0": 25.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == 9.0
+    assert out["OUTPUT_HI+0"] == 25.0
+    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+
+
 def test_tail_cmp_eq_false_blocks_equal_true_marker():
     ir = _single_rule_ir(_tail_rule("tail_cmp_eq_false_00"))
 
@@ -1907,6 +1989,80 @@ def test_tail_ax_add_byte1_hi_zero_blocks_sub_rows():
 
     assert out["OUTPUT_HI+1"] == 4.0
     assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+
+
+def test_tail_ax_add_byte1_hi_zero_repairs_huge_residual_scale():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_byte1_hi_zero"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9984797239303589,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+8": 1.304825782775879,
+        "CARRY+1": 2.0,
+        "OUTPUT_LO+3": 2.5499047823799323e22,
+        "OUTPUT_HI+0": -2.5499047823799323e22,
+        "OUTPUT_HI+1": -2.0988737832984045e22,
+    })
+
+    assert out["OUTPUT_HI+0"] > out["OUTPUT_HI+1"]
+    assert out["OUTPUT_LO+3"] == 2.5499047823799323e22
+
+
+def test_tail_ax_sub_byte1_hi_zero_repairs_non_borrow_sub_high_residue():
+    ir = _single_rule_ir(_tail_rule("tail_ax_sub_byte1_hi_zero"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9984797239303589,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+9": 1.0,
+        "OUTPUT_LO+5": 11.52,
+        "OUTPUT_HI+0": -43.67,
+        "OUTPUT_HI+8": 4.17,
+    })
+
+    assert out["OUTPUT_HI+0"] > out["OUTPUT_HI+8"]
+    assert out["OUTPUT_LO+5"] == 11.52
+
+
+def test_tail_ax_sub_borrow_decrements_l15_restored_high_byte():
+    ir = _single_rule_ir(_tail_rule("tail_ax_sub_borrow_byte1_5_to_4"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9984797239303589,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+9": 1.0,
+        "CARRY+2": 2.0,
+        "OUTPUT_LO+4": -245612544.0,
+        "OUTPUT_LO+5": 146251312.0,
+        "OUTPUT_HI+0": 449082016.0,
+    })
+
+    assert out["OUTPUT_LO+4"] > out["OUTPUT_LO+5"]
+    assert out["OUTPUT_HI+0"] > 449082016.0
+
+
+def test_tail_ax_sub_borrow_decrement_requires_borrow_relay():
+    ir = _single_rule_ir(_tail_rule("tail_ax_sub_borrow_byte1_5_to_4"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "TEMP+9": 1.0,
+        "OUTPUT_LO+5": 146251312.0,
+        "OUTPUT_HI+0": 449082016.0,
+    })
+
+    assert out["OUTPUT_LO+5"] == 146251312.0
+    assert out["OUTPUT_HI+0"] == 449082016.0
+    assert out.get("OUTPUT_LO+4", 0.0) == 0.0
 
 
 def test_tail_sp_pop_byte3_asserts_zero():

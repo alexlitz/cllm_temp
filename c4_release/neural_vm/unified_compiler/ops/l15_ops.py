@@ -452,7 +452,7 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
         # mismatch must dominate newer writes to adjacent locals. Strengthen
         # both byte-0 nibbles: three-local frames can share the same low
         # nibble (e.g. BP-8 and BP-24) and only differ in the high nibble.
-        local_slot_scale = 30.0
+        local_slot_scale = 100.0
         for nibble_offset, nibble_base in ((0, BD.ADDR_B0_LO), (4, BD.ADDR_B0_HI)):
             for bit in range(4):
                 row = base + 4 + nibble_offset + bit
