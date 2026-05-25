@@ -2090,7 +2090,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ]
         for lo in range(16):
             rules.append(
-                FFNRule.constant_write(
+                FFNRule.gated_write(
                     name=f"tail_ax_add_byte1_hi_zero_lo_{lo:01x}",
                     conditions=base_conditions
                     + ((f"OUTPUT_LO+{lo}", 10.0),)
@@ -2100,6 +2100,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         if other != lo
                     ),
                     threshold=340.0,
+                    gate="TEMP+8",
                     writes=byte_writes(lo, strength=1.0e24),
                 )
             )
@@ -2151,7 +2152,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         ("TEMP+9", 100.0),
                         ("TEMP+8", -1000.0),
                         ("CARRY+2", 100.0),
-                        (f"OUTPUT_LO+{old_lo}", 0.001),
+                        (f"ALU_LO+{old_lo}", 20.0),
                         ("OP_IMM", -1000.0),
                         ("OP_LEA", -1000.0),
                         ("OP_EQ", -1000.0),
@@ -2168,7 +2169,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         ("NEXT_MEM", -1000000.0),
                         ("NEXT_SE", -1000000.0),
                     ),
-                    threshold=250.0,
+                    threshold=350.0,
                     gate="CARRY+2",
                     writes=byte_writes(old_lo - 1, strength=1.0e8),
                 )

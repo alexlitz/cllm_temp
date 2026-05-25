@@ -11,7 +11,6 @@ from neural_vm.setup_helpers import (  # noqa: E402
     _set_layer14_add_byte1_high_zero_cleanup,
     _set_layer14_clear_addsub_temp_negative_residue,
     _set_layer14_clear_output_corruption,
-    _set_layer14_sub_borrow_byte1_preboost,
 )
 from neural_vm.unified_compiler.ops.l14_ops import (  # noqa: E402
     _clear_l14_mem_generation_overbroad_sp_suppression,
@@ -198,47 +197,6 @@ def test_l14_add_byte1_high_zero_cleanup_blocks_local_addr_high_nibble():
     assert y[_SetDim.OUTPUT_LO + 15] == x[0, 0, _SetDim.OUTPUT_LO + 15]
     assert y[_SetDim.OUTPUT_HI + 15] == x[0, 0, _SetDim.OUTPUT_HI + 15]
     assert y[_SetDim.OUTPUT_HI + 0] == x[0, 0, _SetDim.OUTPUT_HI + 0]
-
-
-def test_l14_sub_borrow_byte1_preboost_survives_l15_scale():
-    ffn = _StubFFN(hidden_dim=15)
-    end = _set_layer14_sub_borrow_byte1_preboost(ffn, 100.0, _SetDim)
-
-    assert end == 15
-
-    x = torch.zeros(1, 1, 512)
-    x[..., _SetDim.CONST] = 1.0
-    x[..., _SetDim.IS_BYTE] = 1.0
-    x[..., _SetDim.H1 + 1] = 1.0
-    x[..., _SetDim.BYTE_INDEX_0] = 0.9701380133628845
-    x[..., _SetDim.TEMP + 9] = 1.0
-    x[..., _SetDim.CARRY + 2] = 2.0
-    x[..., _SetDim.OUTPUT_LO + 3] = 8.97
-    x[..., _SetDim.OUTPUT_HI + 0] = 12.8
-
-    y = _apply_stub_ffn(ffn, x)[0, 0]
-
-    assert y[_SetDim.OUTPUT_LO + 2] > 1.0e9
-    assert y[_SetDim.OUTPUT_LO + 3] < 0.0
-    assert y[_SetDim.OUTPUT_HI + 0] > 1.0e9
-
-
-def test_l14_sub_borrow_byte1_preboost_requires_borrow():
-    ffn = _StubFFN(hidden_dim=15)
-    _set_layer14_sub_borrow_byte1_preboost(ffn, 100.0, _SetDim)
-
-    x = torch.zeros(1, 1, 512)
-    x[..., _SetDim.CONST] = 1.0
-    x[..., _SetDim.IS_BYTE] = 1.0
-    x[..., _SetDim.H1 + 1] = 1.0
-    x[..., _SetDim.BYTE_INDEX_0] = 0.9701380133628845
-    x[..., _SetDim.TEMP + 9] = 1.0
-    x[..., _SetDim.OUTPUT_LO + 3] = 8.97
-
-    y = _apply_stub_ffn(ffn, x)[0, 0]
-
-    assert y[_SetDim.OUTPUT_LO + 3] == x[0, 0, _SetDim.OUTPUT_LO + 3]
-    assert y[_SetDim.OUTPUT_LO + 2] == x[0, 0, _SetDim.OUTPUT_LO + 2]
 
 
 def test_l14_boundary_guard_does_not_invert_mem_value_blockers():

@@ -1485,50 +1485,6 @@ def _set_layer14_add_byte1_high_zero_cleanup(ffn, S, BD, start_unit=0):
     return unit
 
 
-def _set_layer14_sub_borrow_byte1_preboost(ffn, S, BD, start_unit=0):
-    """L14 FFN: preboost borrowed SUB byte-1 rows before L15 residue.
-
-    L15 can reintroduce the unborrowed byte-1 low nibble on SUB rows where the
-    byte-0 borrow is active. The correct borrowed nibble is already present
-    before L15, but only at ordinary logit scale. This repair boosts that
-    selected low nibble, plus high nibble zero, early enough for generation.
-    """
-    unit = start_unit
-    AX_I = 1
-
-    for old_lo in range(1, 16):
-        new_lo = old_lo - 1
-        ffn.W_up[unit, BD.IS_BYTE] = S
-        ffn.W_up[unit, BD.H1 + AX_I] = S
-        ffn.W_up[unit, BD.BYTE_INDEX_0] = S
-        ffn.W_up[unit, BD.BYTE_INDEX_1] = -S * 10
-        ffn.W_up[unit, BD.BYTE_INDEX_2] = -S * 10
-        ffn.W_up[unit, BD.BYTE_INDEX_3] = -S * 10
-        ffn.W_up[unit, BD.TEMP + 9] = S
-        ffn.W_up[unit, BD.TEMP + 8] = -S * 10
-        ffn.W_up[unit, BD.CARRY + 2] = S
-        ffn.W_up[unit, BD.OUTPUT_LO + old_lo] = 10.0
-        ffn.W_up[unit, BD.MARK_AX] = -S * 100
-        ffn.W_up[unit, BD.MARK_PC] = -S * 100
-        ffn.W_up[unit, BD.MARK_SP] = -S * 100
-        ffn.W_up[unit, BD.MARK_BP] = -S * 100
-        ffn.W_up[unit, BD.MARK_STACK0] = -S * 100
-        ffn.W_up[unit, BD.MARK_MEM] = -S * 100
-        ffn.b_up[unit] = -S * 6.2
-        ffn.W_gate[unit, BD.CONST] = 1.0
-        for lo in range(16):
-            ffn.W_down[BD.OUTPUT_LO + lo, unit] = (
-                2.0e9 / S if lo == new_lo else -2.0e9 / S
-            )
-        ffn.W_down[BD.OUTPUT_HI + 0, unit] = 2.0e9 / S
-        for hi in range(1, 16):
-            ffn.W_down[BD.OUTPUT_HI + hi, unit] = -2.0e9 / S
-        unit += 1
-
-    return unit
-
-
-
 def _set_layer14_clear_addr_key_pollution(ffn, S, BD, start_unit=0):
     """L14 FFN: Clear ADDR_KEY pollution at non-MEM, non-marker positions.
 

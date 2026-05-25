@@ -2114,6 +2114,25 @@ def test_tail_ax_add_byte1_hi_zero_blocks_sub_rows():
     assert out.get("OUTPUT_HI+0", 0.0) == 0.0
 
 
+def test_tail_ax_add_byte1_hi_zero_lo_blocks_huge_sub_output():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_byte1_hi_zero_lo_5"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9984797239303589,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+9": 1.0,
+        "ALU_HI+0": 6.236852645874023,
+        "AX_CARRY_HI+0": 3.941866397857666,
+        "OUTPUT_LO+5": 1.71e18,
+        "OUTPUT_HI+0": 4.82e18,
+    })
+
+    assert out["OUTPUT_LO+5"] == 1.71e18
+    assert out["OUTPUT_HI+0"] == 4.82e18
+
+
 def test_tail_ax_sub_byte1_hi_zero_repairs_non_borrow_sub_high_residue():
     ir = _single_rule_ir(_tail_rule("tail_ax_sub_byte1_hi_zero_lo_5"))
 
@@ -2142,6 +2161,7 @@ def test_tail_ax_sub_borrow_decrements_l15_restored_high_byte():
         "BYTE_INDEX_0": 0.9701380133628845,
         "TEMP+9": 1.0,
         "CARRY+2": 2.0,
+        "ALU_LO+5": 6.0,
         "OUTPUT_LO+4": -245612544.0,
         "OUTPUT_LO+5": 146251312.0,
         "OUTPUT_HI+0": 449082016.0,
@@ -2160,12 +2180,32 @@ def test_tail_ax_sub_borrow_decrement_requires_borrow_relay():
         "H1+1": 1.0,
         "BYTE_INDEX_0": 1.0,
         "TEMP+9": 1.0,
+        "ALU_LO+5": 6.0,
         "OUTPUT_LO+5": 146251312.0,
         "OUTPUT_HI+0": 449082016.0,
     })
 
     assert out["OUTPUT_LO+5"] == 146251312.0
     assert out["OUTPUT_HI+0"] == 449082016.0
+    assert out.get("OUTPUT_LO+4", 0.0) == 0.0
+
+
+def test_tail_ax_sub_borrow_decrement_uses_unborrowed_alu_source():
+    ir = _single_rule_ir(_tail_rule("tail_ax_sub_borrow_byte1_5_to_4"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9984797239303589,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+9": 1.0,
+        "CARRY+2": 2.0,
+        "ALU_LO+6": 6.0,
+        "OUTPUT_LO+5": 1.71e18,
+        "OUTPUT_HI+0": 4.82e18,
+    })
+
+    assert out["OUTPUT_LO+5"] == 1.71e18
     assert out.get("OUTPUT_LO+4", 0.0) == 0.0
 
 

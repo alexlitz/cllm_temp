@@ -607,9 +607,7 @@ def make_layer14_temp_clear_op() -> Operation:
         from ...setup_helpers import (
             _set_layer14_add_byte1_high_zero_cleanup,
             _set_layer14_clear_addsub_temp_negative_residue,
-            _set_layer14_sub_borrow_byte1_preboost,
         )
-        from ...base_layers import PureFFN
         ffn = block.ffn
         proxy = _as_setdim_proxy(dim_positions)
         start_unit = getattr(ffn, "_l14_unit_counter", 0)
@@ -624,9 +622,6 @@ def make_layer14_temp_clear_op() -> Operation:
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
-        preboost = PureFFN(ffn.W_up.shape[1], 15)
-        _set_layer14_sub_borrow_byte1_preboost(preboost, S, proxy)
-        block.post_ops.append(preboost)
 
     return Operation(
         name="layer14_temp_clear",
@@ -634,7 +629,7 @@ def make_layer14_temp_clear_op() -> Operation:
         reads={"OP_LEV", "MARK_PC", "TEMP", "IS_BYTE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "MARK_AX", "CONST"},
-        writes={"TEMP", "OUTPUT_LO", "OUTPUT_HI"},
+        writes={"TEMP", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
