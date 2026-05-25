@@ -79,6 +79,7 @@ def test_add_byte_base_propagation_respects_symbolic_residual_bounds():
         y,
         BD.OUTPUT_LO,
         expected=0x2,
+        expected_min=1.25,
         old_index=0x0,
     )
     _assert_symbolic_band_bounds(
@@ -101,8 +102,9 @@ def test_add_carry_propagation_is_stable_across_expected_carry_amplitude():
     x[..., BD.H1 + 1] = 1.0
     x[..., BD.BYTE_INDEX_0] = 1.0
     x[..., BD.CARRY + 1] = 2.2
-    x[..., BD.OUTPUT_LO + 0x2] = 1.0
-    x[..., BD.OUTPUT_HI + 0x0] = 1.0
+    # Matches the calibrated lower bound from AddSubBytePropagationPostOp.
+    x[..., BD.OUTPUT_LO + 0x2] = 1.3
+    x[..., BD.OUTPUT_HI + 0x0] = 1.3
 
     y = module(x)[0, 0]
 

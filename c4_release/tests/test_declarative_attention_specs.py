@@ -390,6 +390,12 @@ def test_layer6_first_step_fetch_relay_blocks_ax_byte_rows():
     assert attn.W_q[branch_row, _SetDim.H1 + 0].item() == 300.0
     assert attn.W_q[branch_row, _SetDim.BYTE_INDEX_0].item() == 300.0
     assert attn.W_q[branch_row, _SetDim.CONST].item() == 0.0
+    assert attn.W_v[5 * hd + 34, _SetDim.OP_JSR].item() == 1.0
+    assert attn.W_o[_SetDim.OP_JSR, 5 * hd + 34].item() == 1.0
+    assert attn.W_v[5 * hd + 35 + 3, _SetDim.OPCODE_BYTE_LO + 3].item() == 1.0
+    assert attn.W_v[5 * hd + 51, _SetDim.OPCODE_BYTE_HI].item() == 1.0
+    assert attn.W_o[_SetDim.OPCODE_BYTE_LO + 3, 5 * hd + 35 + 3].item() == 1.0
+    assert attn.W_o[_SetDim.OPCODE_BYTE_HI, 5 * hd + 51].item() == 1.0
 
 
 def test_layer6_relay_heads_spec_declarative_byte_identical_to_legacy_helper():

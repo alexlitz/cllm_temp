@@ -223,7 +223,7 @@ def test_layer6_all_step_jsr_pc_override_decodes_pc_opcode_directly():
     end = _lower_layer6_all_step_jsr_pc_override_ir(ffn, 100.0, _SetDim)
 
     assert end == L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT
-    assert len(_layer6_all_step_jsr_pc_override_rules(100.0)) == 64
+    assert len(_layer6_all_step_jsr_pc_override_rules(100.0)) == 80
     assert L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT >= (
         L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT
     )
@@ -242,6 +242,20 @@ def test_layer6_all_step_jsr_pc_override_decodes_pc_opcode_directly():
     assert y[_SetDim.OUTPUT_LO + 10] > 0.9
     assert y[_SetDim.OUTPUT_HI + 1] > 0.9
     assert y[_SetDim.OUTPUT_HI + 0] < x[_SetDim.OUTPUT_HI + 0]
+
+    x = torch.zeros(512)
+    x[_SetDim.MARK_PC] = 1.0
+    x[_SetDim.OPCODE_BYTE_LO + 3] = 1.0
+    x[_SetDim.OPCODE_BYTE_HI + 0] = 1.0
+    x[_SetDim.FETCH_LO + 4] = 1.0
+    x[_SetDim.FETCH_HI + 1] = 1.0
+    x[_SetDim.OUTPUT_HI + 2] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)
+
+    assert y[_SetDim.OUTPUT_LO + 2] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 10] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 2] < x[_SetDim.OUTPUT_HI + 2]
 
 
 def test_layer6_delayed_jmp_pc_override_ir_matches_legacy_units():
@@ -756,6 +770,27 @@ def test_layer6_branch_pc_byte1_override_symbolically_emits_target_high_byte():
     assert out["OUTPUT_HI+0"] > 1.0
 
 
+def test_layer6_branch_pc_byte1_override_handles_jsr_target_high_byte():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer6_branch_pc_byte1_override_rules(100.0))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "OPCODE_BYTE_LO+3": 1.0,
+        "OPCODE_BYTE_HI+0": 1.0,
+        "FETCH_HI+2": 40.0,
+        "OUTPUT_LO+0": 1.0,
+        "OUTPUT_HI+0": 1.0,
+        "CONST": 1.0,
+    })
+
+    assert out["OUTPUT_LO+1"] > 0.0
+    assert out["OUTPUT_LO+0"] < 1.0
+    assert out["OUTPUT_HI+0"] > 1.0
+
+
 def test_layer6_branch_pc_byte1_override_blocks_untaken_bz():
     ir = CompilerIR()
     ir.layer(0).ffn.rules.extend(_layer6_branch_pc_byte1_override_rules(100.0))
@@ -779,7 +814,7 @@ def test_layer6_branch_pc_byte1_override_ir_lowers_into_reserved_band():
     end = _lower_layer6_branch_pc_byte1_override_ir(actual, 100.0, _SetDim)
 
     assert end == L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT
-    assert len(_layer6_branch_pc_byte1_override_rules(100.0)) == 147
+    assert len(_layer6_branch_pc_byte1_override_rules(100.0)) == 196
     assert torch.count_nonzero(
         actual.W_up[
             L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT:

@@ -1042,7 +1042,7 @@ class AddSubBytePropagationPostOp(PureFFN):
                             self.W_up.data[unit, BD.IS_BYTE] = S
                             self.W_up.data[unit, BD.H1 + 1] = S
                             for wrong_h1 in (0, 2, 3, 4, 5, 6):
-                                self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10000
+                                self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10_000_000
                             self.W_up.data[unit, BD.BYTE_INDEX_0] = S
                             self.W_up.data[unit, BD.BYTE_INDEX_1] = -S * 10
                             self.W_up.data[unit, BD.BYTE_INDEX_2] = -S * 10
@@ -1061,9 +1061,9 @@ class AddSubBytePropagationPostOp(PureFFN):
                                 BD.MARK_MEM,
                                 BD.MARK_SE,
                             ):
-                                self.W_up.data[unit, marker_dim] = -S * 10000
+                                self.W_up.data[unit, marker_dim] = -S * 10_000_000
                             self.b_up.data[unit] = -S * 26.35
-                            self.W_gate.data[unit, BD.CONST] = 1.0
+                            self.W_gate.data[unit, op_dim] = 1.0
                             self.W_down.data[out_base + b, unit] = -2.0 / S
                             if b != 0 and result != 0:
                                 self.W_down.data[out_base + 0, unit] = -2.0 / S
@@ -1092,7 +1092,7 @@ class AddSubBytePropagationPostOp(PureFFN):
                     self.W_up.data[unit, BD.IS_BYTE] = S
                     self.W_up.data[unit, BD.H1 + 1] = S
                     for wrong_h1 in (0, 2, 3, 4, 5, 6):
-                        self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10000
+                        self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10_000_000
                     self.W_up.data[unit, byte_dim] = S
                     self.W_up.data[unit, BD.CLEAN_EMBED_LO + 15] = S * 2
                     self.W_up.data[unit, BD.CLEAN_EMBED_HI + 15] = S * 2
@@ -1109,7 +1109,7 @@ class AddSubBytePropagationPostOp(PureFFN):
                         BD.MARK_MEM,
                         BD.MARK_SE,
                     ):
-                        self.W_up.data[unit, marker_dim] = -S * 10000
+                        self.W_up.data[unit, marker_dim] = -S * 10_000_000
                     self.b_up.data[unit] = -S * 7.5
                     self.W_gate.data[unit, BD.CONST] = 1.0
                     self.W_down.data[out_base + 0, unit] = -2.0 / S
@@ -3993,12 +3993,19 @@ def _set_layer6_attn(attn, S, BD, HD):
     for k in range(16):
         attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
         attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
-    # Branch byte-1 relay: PC byte 0 re-reads the PC marker so L6 FFN can
-    # emit byte1(target) for taken BZ/BNZ targets above 255.
+    # Branch/call byte-1 relay: PC byte 0 re-reads the PC marker so L6 FFN can
+    # emit byte1(target) for taken BZ/BNZ and first-step JSR targets above 255.
     attn.W_v[base + 32, BD.OP_BZ] = 1.0
     attn.W_v[base + 33, BD.OP_BNZ] = 1.0
+    attn.W_v[base + 34, BD.OP_JSR] = 1.0
     attn.W_o[BD.OP_BZ, base + 32] = 1.0
     attn.W_o[BD.OP_BNZ, base + 33] = 1.0
+    attn.W_o[BD.OP_JSR, base + 34] = 1.0
+    for k in range(16):
+        attn.W_v[base + 35 + k, BD.OPCODE_BYTE_LO + k] = 1.0
+        attn.W_v[base + 51 + k, BD.OPCODE_BYTE_HI + k] = 1.0
+        attn.W_o[BD.OPCODE_BYTE_LO + k, base + 35 + k] = 1.0
+        attn.W_o[BD.OPCODE_BYTE_HI + k, base + 51 + k] = 1.0
     branch_pc_byte0_relay = 52
     attn.W_q[base + branch_pc_byte0_relay, BD.IS_BYTE] = 300.0
     attn.W_q[base + branch_pc_byte0_relay, BD.H1 + 0] = 300.0

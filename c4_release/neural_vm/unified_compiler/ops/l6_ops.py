@@ -72,9 +72,9 @@ L6_MEM_LEAKAGE_CLEANUP_END_UNIT = 1104
 L6_ALU_CLEAR_START_UNIT = 1104
 L6_ALU_CLEAR_END_UNIT = 1136
 L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT = 1136
-L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT = 1283
+L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT = 1332
 L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT = 1410
-L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT = 1474
+L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT = 1490
 L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2200
 L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2232
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 1668
@@ -97,6 +97,10 @@ def _pc_target_lo_from_index(k: int) -> int:
 
 def _pc_target_hi_from_index(k: int) -> int:
     return ((k * 8 + 2) >> 4) & 0xF
+
+
+def _pc_target_hi_plus_odd_imm_hi_from_index(k: int) -> int:
+    return (_pc_target_hi_from_index(k) + 8) & 0xF
 
 
 def _pc_target_byte1_lo_from_imm_hi(k: int) -> int:
@@ -250,6 +254,24 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=threshold,
             gate=f"FETCH_LO+{k}",
             writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
+        ))
+    odd_imm_hi_gate = tuple(
+        (f"FETCH_HI+{k}", 1.0)
+        for k in range(1, 16, 2)
+    )
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_jsr_all_step_target_hi_odd_imm_hi_correction_{k}",
+            conditions=conditions + ((f"FETCH_LO+{k}", 1.0),),
+            threshold=threshold + 0.5,
+            gate_terms=odd_imm_hi_gate,
+            writes=(
+                (f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", -write_scale),
+                (
+                    f"OUTPUT_HI+{_pc_target_hi_plus_odd_imm_hi_from_index(k)}",
+                    write_scale,
+                ),
+            ),
         ))
 
     return tuple(rules)
@@ -1046,6 +1068,15 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             4.5,
         ),
+        (
+            "jsr_target",
+            byte0_conditions
+            + (
+                ("OPCODE_BYTE_LO+3", 1.0),
+                ("OPCODE_BYTE_HI+0", 1.0),
+            ),
+            4.5,
+        ),
     )
 
     for group, conditions, threshold in groups:
@@ -1620,7 +1651,7 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
     from ...vm_step import _set_layer6_routing_ffn
 
     _set_layer6_routing_ffn(ffn, S, BD)
-    unit = 1476
+    unit = L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT + 2
 
     # Strict neural PSH needs STACK0 byte 0 to be exactly AX. The legacy
     # writeback cancels EMBED and adds ALU, but a tiny residual OUTPUT_HI[1]
@@ -2121,11 +2152,18 @@ def _bake_layer6_attn_spec(attn, BD, HD):
         attn.W_o[BD.FETCH_LO + k, base + k] = 1.0
         attn.W_o[BD.FETCH_HI + k, base + 16 + k] = 1.0
     # Branch byte-1 relay: at the PC byte-0 row, re-read the PC marker so
-    # the L6 FFN can emit byte1(target) for BZ/BNZ targets above 255.
+    # the L6 FFN can emit byte1(target) for BZ/BNZ/JSR targets above 255.
     attn.W_v[base + 32, BD.OP_BZ] = 1.0
     attn.W_v[base + 33, BD.OP_BNZ] = 1.0
+    attn.W_v[base + 34, BD.OP_JSR] = 1.0
     attn.W_o[BD.OP_BZ, base + 32] = 1.0
     attn.W_o[BD.OP_BNZ, base + 33] = 1.0
+    attn.W_o[BD.OP_JSR, base + 34] = 1.0
+    for k in range(16):
+        attn.W_v[base + 35 + k, BD.OPCODE_BYTE_LO + k] = 1.0
+        attn.W_v[base + 51 + k, BD.OPCODE_BYTE_HI + k] = 1.0
+        attn.W_o[BD.OPCODE_BYTE_LO + k, base + 35 + k] = 1.0
+        attn.W_o[BD.OPCODE_BYTE_HI + k, base + 51 + k] = 1.0
     branch_pc_byte0_relay = 52
     attn.W_q[base + branch_pc_byte0_relay, BD.IS_BYTE] = 300.0
     attn.W_q[base + branch_pc_byte0_relay, BD.H1 + 0] = 300.0

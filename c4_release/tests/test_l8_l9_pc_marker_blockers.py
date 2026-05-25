@@ -107,3 +107,17 @@ def test_addsub_byte_postop_blocks_lea_relay_byte_lane():
     assert float(out[0, 0, _SetDim.OUTPUT_HI + 15]) == 9.0
     assert float(out[0, 0, _SetDim.OUTPUT_LO + 14]) == 0.0
     assert float(out[0, 0, _SetDim.OUTPUT_HI + 14]) == 0.0
+
+
+def test_addsub_byte_postop_does_not_rewrite_large_pc_target_residual():
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, _SetDim.CONST] = 1.0
+    x[0, 0, _SetDim.MARK_PC] = 1.0
+    x[0, 0, _SetDim.H1 + 0] = 1.0
+    x[0, 0, _SetDim.ALU_HI + 10] = 2102.0
+    x[0, 0, _SetDim.OUTPUT_HI + 10] = 8351.0
+
+    out = AddSubBytePropagationPostOp()(x)
+
+    assert float(out[0, 0, _SetDim.OUTPUT_HI + 10]) == 8351.0
+    assert float(out[0, 0, _SetDim.OUTPUT_HI + 4]) == 0.0

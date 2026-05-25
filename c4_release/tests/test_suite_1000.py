@@ -11,13 +11,9 @@ This module generates a comprehensive test suite covering:
 - Edge cases
 """
 
-import random
+import random as _random
 import math
 from typing import List, Tuple
-
-# Set seed for reproducibility
-random.seed(42)
-
 
 def generate_test_programs() -> List[Tuple[str, int, str]]:
     """
@@ -26,6 +22,7 @@ def generate_test_programs() -> List[Tuple[str, int, str]]:
     Returns:
         List of (source_code, expected_result, description)
     """
+    random = _random.Random(42)
     tests = []
 
     # ==========================================================================
@@ -601,6 +598,14 @@ def get_quick_tests() -> List[Tuple[str, int, str]]:
 def get_all_tests() -> List[Tuple[str, int, str]]:
     """Get all 1000+ tests."""
     return generate_test_programs()
+
+
+def test_generate_test_programs_is_reentrant_deterministic():
+    first = generate_test_programs()
+    second = generate_test_programs()
+
+    assert len(first) == 1096
+    assert first == second
 
 
 # Test counts by category
