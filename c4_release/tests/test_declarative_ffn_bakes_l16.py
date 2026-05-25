@@ -39,8 +39,8 @@ def test_layer16_lev_routing_ir_matches_legacy_helper():
     legacy_end = _set_layer16_lev_routing(expected, 100.0, _SetDim)
 
     assert legacy_end == 121
-    assert end == 310
-    assert len(_layer16_lev_routing_rules(100.0)) == 310
+    assert end == 311
+    assert len(_layer16_lev_routing_rules(100.0)) == 311
     _assert_same_ffn_prefix(actual, expected, legacy_end)
     assert actual.W_down[:, legacy_end:end].abs().sum() > 0
 
@@ -176,6 +176,71 @@ def test_layer16_bp_after_ent_byte2_zero_blocks_initial_bp_tail():
     assert writes["OUTPUT_HI+0"] == 10000.0 / 100.0
     assert writes["OUTPUT_LO+1"] == -10000.0 / 100.0
     assert writes["OUTPUT_HI+1"] == -10000.0 / 100.0
+
+
+def test_layer16_ent_initial_stack0_byte2_writes_01_only_on_initial_main_ent():
+    from neural_vm.unified_compiler.ir import CompilerIR
+
+    rules_by_name = {rule.name: rule for rule in _layer16_lev_routing_rules(100.0)}
+    rule = rules_by_name["l16_ent_initial_stack0_byte2_01"]
+
+    condition_dims = {(term.dim.key(), term.weight) for term in rule.conditions}
+    assert ("IS_BYTE+0", 1.0) in condition_dims
+    assert ("HAS_SE+0", 1.0) in condition_dims
+    assert ("STACK0_BYTE1+0", 30.0) in condition_dims
+    assert ("OP_ENT+0", 2.0) in condition_dims
+    assert ("CLEAN_EMBED_LO+0", 8.0) in condition_dims
+    assert ("CLEAN_EMBED_HI+0", 8.0) in condition_dims
+    assert ("MEM_STORE+0", -2.0) in condition_dims
+    assert ("MARK_BP+0", -10.0) in condition_dims
+    assert ("MARK_STACK0+0", -10.0) in condition_dims
+    assert rule.threshold == 49.5
+
+    writes = {write.dim.key(): write.weight for write in rule.writes}
+    assert writes["OUTPUT_LO+1"] == 4.0 / 100.0
+    assert writes["OUTPUT_LO+0"] == -4.0 / 100.0
+    assert "OUTPUT_HI+0" not in writes  # OUTPUT_HI already correct from L3 default
+    assert "OUTPUT_HI+1" not in writes
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.append(rule)
+
+    initial_state = {
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "STACK0_BYTE1": 1.0,
+        "OP_ENT": 5.0,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+0": 1.0,
+    }
+    out = ir.symbolic_ffn(initial_state)
+    assert out["OUTPUT_LO+1"] > 0.0
+    assert out["OUTPUT_LO+0"] < 0.0
+
+    nested_state = {
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "STACK0_BYTE1": 1.0,
+        "OP_ENT": 5.0,
+        # nested ENT: saved BP byte 1 = 0xff → CLEAN_EMBED_LO/HI+15 active,
+        # the initial-state byte-0 sentinels stay zero.
+        "CLEAN_EMBED_LO+15": 1.0,
+        "CLEAN_EMBED_HI+15": 1.0,
+    }
+    out_nested = ir.symbolic_ffn(nested_state)
+    assert out_nested.get("OUTPUT_LO+1", 0.0) == 0.0
+    assert out_nested.get("OUTPUT_HI+0", 0.0) == 0.0
+
+    non_ent_state = {
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "STACK0_BYTE1": 1.0,
+        "OP_ENT": 0.0,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+0": 1.0,
+    }
+    out_non_ent = ir.symbolic_ffn(non_ent_state)
+    assert out_non_ent.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
 def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():

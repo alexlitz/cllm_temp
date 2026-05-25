@@ -414,6 +414,47 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ),
     ))
 
+    # The first ENT in main saves BP = STACK_INIT = 0x00010000 onto the stack,
+    # so STACK0_byte2 must be 0x01 instead of the L3 STACK0 byte default of
+    # 0x00. L7 head 6 relays OP_ENT and CMP+2 from the STACK0 marker to STACK0
+    # byte rows, so by L16 the OP_ENT flag is present at STACK0_BYTE1. The
+    # just-emitted saved-BP byte 1 distinguishes the initial main ENT
+    # (byte1 = 0x00 → CLEAN_EMBED_LO+0 + HI+0) from nested ENTs where the
+    # saved BP byte 1 is 0xff and STACK0_byte2 stays 0x00.
+    ent_initial_stack0_byte2_conditions = (
+        ("IS_BYTE", 1.0),
+        ("HAS_SE", 1.0),
+        # STACK0_BYTE1 is uniquely set by L2 FFN at the STACK0 byte-1 row
+        # (d=7 from BP); other byte positions see it as residue near zero.
+        # Use a heavy weight so it dominates the score and excludes nearby
+        # SP/BP/STACK0_byte0 positions whose OP_ENT relay is also large.
+        ("STACK0_BYTE1", 30.0),
+        ("OP_ENT", 2.0),
+        ("CLEAN_EMBED_LO+0", 8.0),
+        ("CLEAN_EMBED_HI+0", 8.0),
+        ("MEM_STORE", -2.0),
+        ("MARK_AX", -10.0),
+        ("MARK_PC", -10.0),
+        ("MARK_SP", -10.0),
+        ("MARK_BP", -10.0),
+        ("MARK_STACK0", -10.0),
+        ("MARK_MEM", -10.0),
+    )
+    # OUTPUT_HI at this row is already +1 from the L3 STACK0 byte default
+    # (saved BP byte 2 high nibble is 0x0). Only redirect OUTPUT_LO from
+    # nibble 0 to nibble 1; touching OUTPUT_HI here is unnecessary and the
+    # downstream L10 carry-propagation post_op amplifies any wide writes.
+    ent_initial_stack0_byte2_strength = 4.0 / S
+    rules.append(FFNRule.constant_write(
+        name="l16_ent_initial_stack0_byte2_01",
+        conditions=ent_initial_stack0_byte2_conditions,
+        threshold=49.5,
+        writes=(
+            ("OUTPUT_LO+1", ent_initial_stack0_byte2_strength),
+            ("OUTPUT_LO+0", -ent_initial_stack0_byte2_strength),
+        ),
+    ))
+
     # Function prologues after a JSR start with SP=0xfff8. ENT then saves BP
     # and allocates the local frame, so the low byte becomes ``0xf0 - imm``.
     # L6 relays the ENT immediate from the AX marker to the SP marker; these
@@ -649,10 +690,11 @@ def make_layer16_lev_routing_op() -> Operation:
         # preservation before same-step memory-store generation, 32 BP marker
         # passthrough units, 15 current top-store STACK0 restore units, one
         # retained-memory STACK0 byte-1 zero guard, 16 JMP AX preserve units,
-        # one BP byte-2 post-ENT zero guard, 4 non-store MEM value zero guards,
-        # 16 PSH SP no-borrow high-nibble restores, 34 ENT dynamic-frame SP
-        # byte-0 units, plus 2 LEA local-frame byte-1 materialization units.
-        ffn_units_used=310,
+        # one BP byte-2 post-ENT zero guard, one initial-main ENT STACK0 byte-2
+        # 0x01 guard, 4 non-store MEM value zero guards, 16 PSH SP no-borrow
+        # high-nibble restores, 34 ENT dynamic-frame SP byte-0 units, plus 2
+        # LEA local-frame byte-1 materialization units.
+        ffn_units_used=311,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
