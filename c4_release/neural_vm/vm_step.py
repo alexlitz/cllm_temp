@@ -44,6 +44,32 @@ from .efficient_alu_addsub_split import AddSub5StageBlock
 # =============================================================================
 
 
+def rotate_half(x):
+    """Rotate adjacent feature pairs for RoPE."""
+    if x.shape[-1] % 2 != 0:
+        raise ValueError("RoPE rotation requires an even feature dimension")
+    x_pair = x.reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
+    x0, x1 = x_pair.unbind(dim=-1)
+    return torch.stack((-x1, x0), dim=-1).reshape_as(x)
+
+
+def precompute_rope_cache(head_dim, max_seq_len, base=10000.0, device=None):
+    """Precompute RoPE cosine/sine tables with shape ``[max_seq_len, head_dim]``."""
+    if head_dim % 2 != 0:
+        raise ValueError("RoPE head_dim must be even")
+    half_idx = torch.arange(0, head_dim, 2, device=device, dtype=torch.float32)
+    inv_freq = 1.0 / (base ** (half_idx / head_dim))
+    positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)
+    angles = torch.repeat_interleave(freqs, repeats=2, dim=-1)
+    return angles.cos(), angles.sin()
+
+
+def apply_rotary_emb(q, k, cos, sin):
+    """Apply precomputed RoPE tables to query and key tensors."""
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
+
 class Token:
     """Token vocabulary for the autoregressive VM.
 
@@ -79,15 +105,16 @@ class Token:
 
 
 class AutoregressiveAttention(nn.Module):
-    """Multi-head attention with softmax1 (ZFOD) and ALiBi/RoPE positional encoding.
+    """Multi-head attention with configurable softmax and ALiBi/RoPE positions.
 
     NOT a PureAttention subclass — PureAttention.forward() is FINAL and uses
-    F.softmax. This class uses softmax1 for zero-fill-on-demand semantics
-    and supports both ALiBi and RoPE positional encodings via config.
+    F.softmax. This class defaults to softmax1 for zero-fill-on-demand
+    semantics and supports standard softmax via config or constructor override.
     """
 
     def __init__(self, dim, num_heads=4, max_seq_len=4096, layer_idx=None,
-                 use_flash_attention=True):
+                 use_flash_attention=True, positional_encoding=None,
+                 attention_normalization=None, rope_base=None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -110,24 +137,47 @@ class AutoregressiveAttention(nn.Module):
         self.max_seq_len = max_seq_len
         self.layer_idx = layer_idx
 
+        try:
+            from .config import get_config
+            config = get_config()
+        except ImportError:
+            config = None
+
+        if positional_encoding is None:
+            positional_encoding = (
+                config.positional_encoding if config is not None else "alibi"
+            )
+        if attention_normalization is None:
+            attention_normalization = (
+                config.attention_normalization
+                if config is not None
+                else "softmax1"
+            )
+        if attention_normalization not in {"softmax1", "softmax"}:
+            raise ValueError(
+                "attention_normalization must be one of {'softmax1', 'softmax'}"
+            )
+        self.attention_normalization = attention_normalization
+        self.use_softmax1 = attention_normalization == "softmax1"
+
+        if rope_base is None:
+            rope_base = config.rope_base if config is not None else 10000.0
+        self.rope_base = rope_base
+
         self.W_q = nn.Parameter(torch.zeros(dim, dim))
         self.W_k = nn.Parameter(torch.zeros(dim, dim))
         self.W_v = nn.Parameter(torch.zeros(dim, dim))
         self.W_o = nn.Parameter(torch.zeros(dim, dim))
 
         # Determine positional encoding for this layer
-        try:
-            from .config import get_config
-            config = get_config()
-
-            # Hybrid mode: L0-L2 use ALiBi, rest use RoPE
-            if config.positional_encoding == "hybrid" and layer_idx is not None and layer_idx < 3:
-                self._positional_encoding = "alibi"
-            else:
-                self._positional_encoding = config.positional_encoding
-        except ImportError:
-            # Fallback if config not available (backwards compatibility)
+        if positional_encoding not in {"alibi", "rope", "hybrid"}:
+            raise ValueError(
+                "positional_encoding must be one of {'alibi', 'rope', 'hybrid'}"
+            )
+        if positional_encoding == "hybrid" and layer_idx is not None and layer_idx < 3:
             self._positional_encoding = "alibi"
+        else:
+            self._positional_encoding = positional_encoding
 
         # Initialize ALiBi slopes if using ALiBi (or hybrid mode with layer < 3)
         use_alibi = (self._positional_encoding == "alibi" or
@@ -144,15 +194,6 @@ class AutoregressiveAttention(nn.Module):
         use_rope = (self._positional_encoding == "rope" or
                     (self._positional_encoding == "hybrid" and layer_idx is not None and layer_idx >= 3))
         if use_rope:
-            try:
-                from .config import get_config
-                from .base_layers import precompute_rope_cache
-                config = get_config()
-                rope_base = config.rope_base
-            except (ImportError, AttributeError):
-                rope_base = 10000.0
-
-            from .base_layers import precompute_rope_cache
             cos, sin = precompute_rope_cache(self.head_dim, max_seq_len, base=rope_base)
             self.register_buffer("_rope_cos", cos)
             self.register_buffer("_rope_sin", sin)
@@ -180,17 +221,9 @@ class AutoregressiveAttention(nn.Module):
         if new_max_seq_len <= current_max_len:
             return  # Already large enough
 
-        # Get RoPE base from config or use default
-        try:
-            from .config import get_config
-            rope_base = get_config().rope_base
-        except (ImportError, AttributeError):
-            rope_base = 10000.0
-
         # Compute extended cache
-        from .base_layers import precompute_rope_cache
         cos_new, sin_new = precompute_rope_cache(
-            self.head_dim, new_max_seq_len, base=rope_base, device=self._rope_cos.device
+            self.head_dim, new_max_seq_len, base=self.rope_base, device=self._rope_cos.device
         )
 
         # Replace buffers with extended versions
@@ -398,7 +431,6 @@ class AutoregressiveAttention(nn.Module):
             # absolute positions; K is rotated in full because the cache stores
             # the raw (un-rotated) K_new and we rotate per-call (matches the
             # legacy pre-cache code's behavior).
-            from .base_layers import rotate_half
             if use_pos_gather:
                 cos_q = self._rope_cos.index_select(0, q_pos_1d).unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
                 sin_q = self._rope_sin.index_select(0, q_pos_1d).unsqueeze(0).unsqueeze(0)  # [1, 1, S_q, HD]
@@ -471,11 +503,13 @@ class AutoregressiveAttention(nn.Module):
         # ----------------------------------------------------------------
         # Select attention backend.
         #
-        # SDPA path: appends a "sink" K/V column of zeros so that
+        # SDPA path for softmax1 appends a "sink" K/V column of zeros so that
         #   softmax([scores, 0]) = exp(scores) / (1 + sum(exp(scores)))
         # which exactly matches softmax1 with anchor=0. V=0 at the sink
         # column means that column contributes 0 to the output, so the
         # remaining V rows are weighted exactly like softmax1.
+        #
+        # Standard softmax uses SDPA without the sink column.
         #
         # Disable SDPA when: (a) the toggle is off, (b) sparse Q weights
         # were detected earlier (sparse_linear path implies CPU-friendly
@@ -489,35 +523,40 @@ class AutoregressiveAttention(nn.Module):
         )
 
         if use_sdpa:
-            # Append softmax1 sink: an extra K/V column with K=0 (score=0
-            # vs any Q) and V=0 (no contribution to output). The bias
-            # also needs a zero column appended so the sink score stays 0
-            # after the bias add inside SDPA.
-            sink_k = torch.zeros(
-                K.shape[0], K.shape[1], 1, K.shape[3],
-                dtype=K.dtype, device=K.device,
-            )
-            sink_v = torch.zeros(
-                V.shape[0], V.shape[1], 1, V.shape[3],
-                dtype=V.dtype, device=V.device,
-            )
-            K_s = torch.cat([K, sink_k], dim=2)
-            V_s = torch.cat([V, sink_v], dim=2)
+            if self.use_softmax1:
+                # Append softmax1 sink: an extra K/V column with K=0
+                # (score=0 vs any Q) and V=0 (no contribution to output).
+                # The bias also needs a zero column appended so the sink score
+                # stays 0 after the bias add inside SDPA.
+                sink_k = torch.zeros(
+                    K.shape[0], K.shape[1], 1, K.shape[3],
+                    dtype=K.dtype, device=K.device,
+                )
+                sink_v = torch.zeros(
+                    V.shape[0], V.shape[1], 1, V.shape[3],
+                    dtype=V.dtype, device=V.device,
+                )
+                K_attn = torch.cat([K, sink_k], dim=2)
+                V_attn = torch.cat([V, sink_v], dim=2)
 
-            # Bias gains a sink column of 0 (so score against sink = 0).
-            # Promote bias to bias.dtype that matches Q for SDPA contract.
-            bias_sink = torch.zeros(
-                bias.shape[0], bias.shape[1], bias.shape[2], 1,
-                dtype=bias.dtype, device=bias.device,
-            )
-            bias_with_sink = torch.cat([bias, bias_sink], dim=-1)
+                # Bias gains a sink column of 0 (so score against sink = 0).
+                bias_sink = torch.zeros(
+                    bias.shape[0], bias.shape[1], bias.shape[2], 1,
+                    dtype=bias.dtype, device=bias.device,
+                )
+                bias_for_attention = torch.cat([bias, bias_sink], dim=-1)
+            else:
+                K_attn = K
+                V_attn = V
+                bias_for_attention = bias
+
             # SDPA expects attn_mask in Q's dtype to land on the Flash
             # backend (math/mem-efficient also accept it). The bias may be
             # float32 from the ALiBi distance computation; cast to Q dtype.
-            attn_mask = bias_with_sink.to(Q.dtype)
+            attn_mask = bias_for_attention.to(Q.dtype)
 
             out = F.scaled_dot_product_attention(
-                Q, K_s, V_s,
+                Q, K_attn, V_attn,
                 attn_mask=attn_mask,
                 dropout_p=0.0,
                 is_causal=False,  # causal is baked into ``attn_mask``
@@ -527,13 +566,17 @@ class AutoregressiveAttention(nn.Module):
             scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
             scores = scores + bias
 
-            # softmax1 for ZFOD (inlined with cached anchor=0 buffer to avoid
-            # per-call torch.tensor() allocations; equivalent to softmax1(scores, dim=-1, anchor=0.0)).
-            anchor = self._softmax1_anchor
-            max_val = torch.max(scores.amax(dim=-1, keepdim=True), anchor)
-            exp_scores = torch.exp(scores - max_val)
-            exp_anchor = torch.exp(anchor - max_val)
-            attn = exp_scores / (exp_anchor + exp_scores.sum(dim=-1, keepdim=True))
+            if self.use_softmax1:
+                # softmax1 for ZFOD (inlined with cached anchor=0 buffer to
+                # avoid per-call torch.tensor() allocations; equivalent to
+                # softmax1(scores, dim=-1, anchor=0.0)).
+                anchor = self._softmax1_anchor
+                max_val = torch.max(scores.amax(dim=-1, keepdim=True), anchor)
+                exp_scores = torch.exp(scores - max_val)
+                exp_anchor = torch.exp(anchor - max_val)
+                attn = exp_scores / (exp_anchor + exp_scores.sum(dim=-1, keepdim=True))
+            else:
+                attn = F.softmax(scores, dim=-1)
             out = torch.matmul(attn, V)
 
         if getattr(self, "_is_compact", False):
@@ -1483,6 +1526,20 @@ class DivModModule(nn.Module):
         return x + delta
 
 
+class RMSNorm(nn.Module):
+    """Root-mean-square normalization used by common decoder-only LLM blocks."""
+
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
 class TransformerBlock(nn.Module):
     """Transformer decoder block: attention + FFN.
 
@@ -1490,15 +1547,33 @@ class TransformerBlock(nn.Module):
     so the block is sequential composition.
     """
 
-    def __init__(self, attn, ffn):
+    def __init__(self, attn, ffn, use_rms_norm=False, rms_norm_eps=1e-6):
         super().__init__()
         self.attn = attn
         self.ffn = ffn
+        self.use_rms_norm = bool(use_rms_norm)
+        if self.use_rms_norm:
+            dim = getattr(attn, "dim", None)
+            if dim is None:
+                dim = getattr(ffn, "dim")
+            self.attn_norm = RMSNorm(dim, eps=rms_norm_eps)
+            self.ffn_norm = RMSNorm(dim, eps=rms_norm_eps)
         self.post_ops = nn.ModuleList()
 
     def forward(self, x, kv_cache=None, x_is_new_only=False):
-        x = self.attn(x, kv_cache=kv_cache, x_is_new_only=x_is_new_only)
-        x = self.ffn(x)
+        if self.use_rms_norm:
+            attn_in = self.attn_norm(x)
+            attn_out = self.attn(
+                attn_in, kv_cache=kv_cache, x_is_new_only=x_is_new_only
+            )
+            x = x + (attn_out - attn_in)
+
+            ffn_in = self.ffn_norm(x)
+            ffn_out = self.ffn(ffn_in)
+            x = x + (ffn_out - ffn_in)
+        else:
+            x = self.attn(x, kv_cache=kv_cache, x_is_new_only=x_is_new_only)
+            x = self.ffn(x)
         for op in self.post_ops:
             x = op(x)
         return x
@@ -1535,14 +1610,47 @@ class AutoregressiveVM(nn.Module):
         max_seq_len=1024,  # PERF: reduced from 4096; Phase 1 contexts are <100 tokens (1024 leaves headroom)
         dim_positions=None,
         use_flash_attention=True,
+        positional_encoding=None,
+        attention_normalization=None,
+        use_rms_norm=None,
+        rms_norm_eps=None,
+        rope_base=None,
     ):
         super().__init__()
         if vocab_size is None:
             vocab_size = Token.VOCAB_SIZE
+        try:
+            from .config import get_config
+            config = get_config()
+        except ImportError:
+            config = None
+
+        if positional_encoding is None:
+            positional_encoding = (
+                config.positional_encoding if config is not None else "alibi"
+            )
+        if attention_normalization is None:
+            attention_normalization = (
+                config.attention_normalization
+                if config is not None
+                else "softmax1"
+            )
+        if use_rms_norm is None:
+            use_rms_norm = config.use_rms_norm if config is not None else False
+        if rms_norm_eps is None:
+            rms_norm_eps = config.rms_norm_eps if config is not None else 1e-6
+        if rope_base is None:
+            rope_base = config.rope_base if config is not None else 10000.0
+
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.max_seq_len = max_seq_len
         self.use_flash_attention = use_flash_attention
+        self.positional_encoding = positional_encoding
+        self.attention_normalization = attention_normalization
+        self.use_rms_norm = bool(use_rms_norm)
+        self.rms_norm_eps = rms_norm_eps
+        self.rope_base = rope_base
 
         # Compiler-allocated dim_positions (None => fall back to _SetDim for
         # backward-compat callers that construct AutoregressiveVM directly).
@@ -1577,8 +1685,13 @@ class AutoregressiveVM(nn.Module):
                     attn=AutoregressiveAttention(
                         d_model, num_heads=n_heads, max_seq_len=max_seq_len, layer_idx=i,
                         use_flash_attention=use_flash_attention,
+                        positional_encoding=positional_encoding,
+                        attention_normalization=attention_normalization,
+                        rope_base=rope_base,
                     ),
                     ffn=PureFFN(d_model, ffn_widths.get(i, default_hidden)),
+                    use_rms_norm=use_rms_norm,
+                    rms_norm_eps=rms_norm_eps,
                 )
                 for i in range(n_layers)
             ]
@@ -2420,6 +2533,11 @@ def _expand_wrapper_blocks(model):
             d_model, num_heads=template_attn.num_heads,
             max_seq_len=template_attn.max_seq_len, layer_idx=layer_idx,
             use_flash_attention=getattr(template_attn, "use_flash_attention", True),
+            positional_encoding=getattr(template_attn, "_positional_encoding", None),
+            attention_normalization=getattr(
+                template_attn, "attention_normalization", None
+            ),
+            rope_base=getattr(template_attn, "rope_base", None),
         )
         return TransformerBlock(attn=attn_passthrough, ffn=ffn_module)
 

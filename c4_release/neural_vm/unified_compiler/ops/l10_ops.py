@@ -1306,13 +1306,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
     """Late FFN correction rules after the dependency-assigned post-op tail."""
 
     def byte_writes(value: int, strength: float = 100.0):
-        lo = value & 0xF
-        hi = (value >> 4) & 0xF
-        writes = []
-        for k in range(16):
-            writes.append((f"OUTPUT_LO+{k}", strength if k == lo else -strength))
-            writes.append((f"OUTPUT_HI+{k}", strength if k == hi else -strength))
-        return tuple(writes)
+        return Primitives.byte_value_writes(value, strength=strength)
 
     def clear_output_writes(strength: float = 100.0):
         writes = []
@@ -1432,6 +1426,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_SC", -1000000.0),
                 ("OP_LI", -1000000.0),
                 ("OP_LC", -1000000.0),
+                ("PSH_AT_SP", -1000000.0),
                 ("MEM_STORE", -1000.0),
                 ("IS_BYTE", -100.0),
             )
@@ -1470,6 +1465,28 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 threshold=5.5,
                 gate="MARK_SP",
                 writes=byte_writes(0xD8, strength=500.0),
+            ),
+            FFNRule.gated_write(
+                name="tail_sp_pop_marker_f0_to_f8",
+                conditions=(
+                    ("MARK_SP", 1.0),
+                    ("HAS_SE", 1.0),
+                    ("CMP+3", 0.5),
+                    ("EMBED_LO+0", 1.0),
+                    ("EMBED_HI+15", 1.0),
+                    ("MARK_AX", -100.0),
+                    ("MARK_PC", -100.0),
+                    ("MARK_BP", -100.0),
+                    ("MARK_STACK0", -100.0),
+                    ("MARK_MEM", -100.0),
+                    ("OP_ENT", -1000000.0),
+                    ("OP_LEV", -1000000.0),
+                    ("PSH_AT_SP", -1000000.0),
+                    ("IS_BYTE", -100.0),
+                ),
+                threshold=5.5,
+                gate="MARK_SP",
+                writes=byte_writes(0xF8, strength=500.0),
             ),
             FFNRule.gated_write(
                 name="tail_sp_pop_marker_d8_to_e0",
@@ -1546,6 +1563,34 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("CMP+3", 1.0),
                     ("CLEAN_EMBED_LO+8", 1.0),
                     ("CLEAN_EMBED_HI+13", 1.0),
+                    ("MARK_SP", -10000.0),
+                    ("MARK_AX", -10000.0),
+                    ("MARK_PC", -10000.0),
+                    ("MARK_BP", -10000.0),
+                    ("MARK_STACK0", -10000.0),
+                    ("MARK_MEM", -10000.0),
+                    ("OP_EQ", -1000000.0),
+                    ("OP_NE", -1000000.0),
+                    ("OP_LT", -1000000.0),
+                    ("OP_GT", -1000000.0),
+                    ("OP_LE", -1000000.0),
+                    ("OP_GE", -1000000.0),
+                ),
+                threshold=40.5,
+                writes=byte_writes(0xFF, strength=5000.0),
+            ),
+            FFNRule.constant_write(
+                name="tail_sp_pop_byte1_ff_after_f8",
+                conditions=(
+                    ("IS_BYTE", 5.0),
+                    ("HAS_SE", 5.0),
+                    ("H1+2", 20.0),
+                    ("H1+1", -1000.0),
+                    ("H1+3", -1000.0),
+                    ("BYTE_INDEX_0", 5.0),
+                    ("CMP+3", 1.0),
+                    ("CLEAN_EMBED_LO+8", 1.0),
+                    ("CLEAN_EMBED_HI+15", 1.0),
                     ("MARK_SP", -10000.0),
                     ("MARK_AX", -10000.0),
                     ("MARK_PC", -10000.0),
@@ -1640,7 +1685,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         Local addresses such as BP-8/BP-16/BP-24 emit byte 0 as e8/e0/d8 and
         byte 1 as ff. The late ADD cleanup can mistake the LEA row for a
         low-16-bit arithmetic result and zero the high nibble. Key this repair
-        on the negative immediate high nibble instead of the weak opcode bit.
+        on the negative immediate high nibble instead of an OUTPUT high-nibble
+        value, which can be present on unrelated early AX/STACK0 rows.
         """
 
         rules = []
@@ -1657,10 +1703,15 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         ("H1+2", -1000.0),
                         ("H1+3", -1000.0),
                         ("H1+4", -1000.0),
+                        ("H3+4", -1000.0),
                         ("BYTE_INDEX_0", 5.0),
                         ("BYTE_INDEX_1", -1000.0),
                         ("BYTE_INDEX_2", -1000.0),
                         ("BYTE_INDEX_3", -1000.0),
+                        ("MEM_VAL_B0", -1000.0),
+                        ("MEM_VAL_B1", -1000.0),
+                        ("MEM_VAL_B2", -1000.0),
+                        ("MEM_VAL_B3", -1000.0),
                         (f"CLEAN_EMBED_LO+{lo}", 30.0),
                         (f"CLEAN_EMBED_HI+{hi}", 30.0),
                         ("FETCH_HI+15", 100.0),
@@ -1672,7 +1723,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         ("MARK_MEM", -10000.0),
                     ),
                     threshold=150.0,
-                    writes=byte_writes(0xFF, strength=20000.0),
+                    writes=byte_writes(0xFF, strength=1.0e24),
                 )
             )
         return tuple(rules)
@@ -1730,6 +1781,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("MARK_SP", -100.0),
             ("MARK_BP", -100.0),
             ("MARK_MEM", -100.0),
+            ("H1+0", -1.0e12),
+            ("H1+1", -1.0e12),
+            ("H1+2", -1.0e12),
+            ("H1+3", -1.0e12),
             ("OP_EQ", -1000000.0),
             ("OP_NE", -1000000.0),
             ("OP_LT", -1000000.0),
@@ -1773,6 +1828,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("MARK_SP", -1000000.0),
             ("MARK_BP", -1000000.0),
             ("MARK_MEM", -1000000.0),
+            ("H1+0", -1.0e12),
+            ("H1+1", -1.0e12),
+            ("H1+2", -1.0e12),
+            ("H1+3", -1.0e12),
         )
         rules = []
         for lo in range(16):
@@ -2010,56 +2069,75 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("NEXT_MEM", -1000000.0),
             ("NEXT_SE", -1000000.0),
         )
-        writes = [("OUTPUT_HI+0", 1.0e23)]
-        writes.extend((f"OUTPUT_HI+{other}", -1.0e23) for other in range(1, 16))
-        return (
+        high_writes = [("OUTPUT_HI+0", 5000.0)]
+        high_writes.extend((f"OUTPUT_HI+{other}", -5000.0) for other in range(1, 16))
+        base_conditions = (
+            ("IS_BYTE", 5.0),
+            ("HAS_SE", 5.0),
+            ("H1+1", 20.0),
+            ("BYTE_INDEX_0", 5.0),
+            ("TEMP+8", 100.0),
+            ("ALU_HI+0", 20.0),
+            ("AX_CARRY_HI+0", 20.0),
+        ) + marker_blockers + transition_blockers + non_add_blockers
+        rules = [
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_hi_zero",
-                conditions=(
-                    ("IS_BYTE", 5.0),
-                    ("HAS_SE", 5.0),
-                    ("H1+1", 20.0),
-                    ("BYTE_INDEX_0", 5.0),
-                    ("TEMP+8", 100.0),
-                    ("ALU_HI+0", 20.0),
-                    ("AX_CARRY_HI+0", 20.0),
-                ) + marker_blockers + transition_blockers + non_add_blockers,
-                threshold=120.0,
-                writes=tuple(writes),
+                conditions=base_conditions,
+                threshold=250.0,
+                writes=tuple(high_writes),
             ),
-        )
+        ]
+        for lo in range(16):
+            rules.append(
+                FFNRule.constant_write(
+                    name=f"tail_ax_add_byte1_hi_zero_lo_{lo:01x}",
+                    conditions=base_conditions
+                    + ((f"OUTPUT_LO+{lo}", 10.0),)
+                    + tuple(
+                        (f"OUTPUT_LO+{other}", -1.0)
+                        for other in range(16)
+                        if other != lo
+                    ),
+                    threshold=340.0,
+                    writes=byte_writes(lo, strength=1.0e24),
+                )
+            )
+        return tuple(rules)
 
     def ax_sub_byte1_high_zero_rules() -> tuple[FFNRule, ...]:
         """Assert high nibble zero for low 16-bit SUB byte-1 rows."""
 
-        writes = [("OUTPUT_HI+0", 1.0e12)]
-        writes.extend((f"OUTPUT_HI+{other}", -1.0e12) for other in range(1, 16))
-        return (
-            FFNRule.constant_write(
-                name="tail_ax_sub_byte1_hi_zero",
-                conditions=ax_byte0 + (
-                    ("TEMP+9", 100.0),
-                    ("TEMP+8", -1000.0),
-                    ("OP_IMM", -1000.0),
-                    ("OP_LEA", -1000.0),
-                    ("OP_EQ", -1000.0),
-                    ("OP_NE", -1000.0),
-                    ("OP_LT", -1000.0),
-                    ("OP_GT", -1000.0),
-                    ("OP_LE", -1000.0),
-                    ("OP_GE", -1000.0),
-                    ("NEXT_PC", -1000000.0),
-                    ("NEXT_AX", -1000000.0),
-                    ("NEXT_SP", -1000000.0),
-                    ("NEXT_BP", -1000000.0),
-                    ("NEXT_STACK0", -1000000.0),
-                    ("NEXT_MEM", -1000000.0),
-                    ("NEXT_SE", -1000000.0),
-                ),
-                threshold=90.0,
-                writes=tuple(writes),
-            ),
-        )
+        rules = []
+        for lo in range(16):
+            rules.append(
+                FFNRule.constant_write(
+                    name=f"tail_ax_sub_byte1_hi_zero_lo_{lo:01x}",
+                    conditions=ax_byte0 + (
+                        ("TEMP+9", 100.0),
+                        ("TEMP+8", -1000.0),
+                        (f"OUTPUT_LO+{lo}", 0.1),
+                        ("OP_IMM", -1000.0),
+                        ("OP_LEA", -1000.0),
+                        ("OP_EQ", -1000.0),
+                        ("OP_NE", -1000.0),
+                        ("OP_LT", -1000.0),
+                        ("OP_GT", -1000.0),
+                        ("OP_LE", -1000.0),
+                        ("OP_GE", -1000.0),
+                        ("NEXT_PC", -1000000.0),
+                        ("NEXT_AX", -1000000.0),
+                        ("NEXT_SP", -1000000.0),
+                        ("NEXT_BP", -1000000.0),
+                        ("NEXT_STACK0", -1000000.0),
+                        ("NEXT_MEM", -1000000.0),
+                        ("NEXT_SE", -1000000.0),
+                    ),
+                    threshold=103.5,
+                    writes=byte_writes(lo, strength=1.0e6),
+                )
+            )
+        return tuple(rules)
 
     def ax_sub_borrow_decrement_rules() -> tuple[FFNRule, ...]:
         """Re-apply byte-0 SUB borrow after L15 restores the base high byte."""
@@ -2813,11 +2891,12 @@ def make_tail_bit32_result_correction_op() -> Operation:
         name="tail_bit32_result_correction",
         phase=17.1,
         reads={
-            "CONST", "IS_BYTE", "HAS_SE", "H1",
+            "CONST", "IS_BYTE", "HAS_SE", "H1", "H3",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
             "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
             "MARK_MEM", "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
             "NEXT_STACK0", "NEXT_MEM", "NEXT_SE", "OP_SHL", "OP_SHR", "OP_IMM", "OP_JSR",
+            "PSH_AT_SP",
             "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
             "OP_ENT", "OP_LEV", "OP_SI", "OP_SC", "OP_LI", "OP_LC",
             "OP_ADD", "OP_SUB", "OP_DIV", "OP_MOD", "OP_AND", "OP_OR",
@@ -2825,6 +2904,7 @@ def make_tail_bit32_result_correction_op() -> Operation:
             "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
             "TEMP", "CMP", "CARRY", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "FETCH_HI",
             "OUTPUT_LO", "OUTPUT_HI", "MEM_STORE",
+            "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
             "ADDR_B0_LO", "ADDR_B0_HI",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI"},

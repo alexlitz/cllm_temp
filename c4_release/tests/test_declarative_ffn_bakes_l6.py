@@ -11,6 +11,8 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     L6_ADJ_SP_WRITEBACK_START_UNIT,
     L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT,
     L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
+    L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT,
+    L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT,
     L6_BNZ_AX_ROUTE_END_UNIT,
     L6_BNZ_AX_ROUTE_START_UNIT,
     L6_BNZ_PC_OVERRIDE_END_UNIT,
@@ -76,6 +78,7 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     L6_TEMP_CLEANUP_RULE_START_UNIT,
     _bake_layer6_routing_ffn,
     _bake_layer6_attn_spec,
+    _bake_layer6_relay_heads_spec,
     _layer6_adj_ax_route_rules,
     _layer6_adj_sp_writeback_rules,
     _layer6_bnz_ax_route_rules,
@@ -108,6 +111,7 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     _layer6_tail_cleanup_rules,
     _layer6_temp_cleanup_rules,
     _layer6_all_step_jmp_pc_override_rules,
+    _layer6_all_step_jsr_pc_override_rules,
     _lower_layer6_cmp3_cleanup_ir,
     _lower_layer6_delayed_jmp_pc_override_ir,
     _lower_layer6_first_step_jmp_pc_override_ir,
@@ -126,6 +130,7 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     _lower_layer6_ax_output_route_ir,
     _lower_layer6_imm_fetch_route_ir,
     _lower_layer6_all_step_jmp_pc_override_ir,
+    _lower_layer6_all_step_jsr_pc_override_ir,
 )
 
 
@@ -151,6 +156,35 @@ def _apply_stub_ffn(ffn: _StubFFN, x: torch.Tensor) -> torch.Tensor:
     up = torch.nn.functional.silu(x @ ffn.W_up.t() + ffn.b_up)
     gate = x @ ffn.W_gate.t() + ffn.b_gate
     return x + (up * gate) @ ffn.W_down.t()
+
+
+def test_layer6_relay_heads_preserve_psh_jsr_opcode_relay_slots():
+    attn = _StubAttn()
+
+    _bake_layer6_relay_heads_spec(attn, _SetDim, 64)
+
+    base = 6 * 64
+    assert attn.W_q[base, _SetDim.MARK_SP] == 50.0
+    assert attn.W_q[base, _SetDim.H1 + 2] == 50.0
+    assert attn.W_q[base, _SetDim.MARK_STACK0] == 50.0
+    assert attn.W_q[base, _SetDim.MARK_AX] == -50.0
+    assert attn.W_k[base, _SetDim.MARK_AX] == 50.0
+
+    assert attn.W_v[base + 1, _SetDim.OP_PSH] == 0.2
+    assert attn.W_o[_SetDim.PSH_AT_SP, base + 1] == 1.0
+    assert attn.W_o[_SetDim.CMP + 0, base + 1] == 1.0
+    assert attn.W_v[base + 0, _SetDim.OP_LEV] == 0.1
+    assert attn.W_o[_SetDim.OP_LEV, base + 0] == 10.0
+    assert attn.W_v[base + 2, _SetDim.OP_ADJ] == 0.2
+    assert attn.W_o[_SetDim.CMP + 1, base + 2] == 1.0
+    assert attn.W_v[base + 3, _SetDim.OP_ADD] == 0.04
+    assert attn.W_o[_SetDim.CMP + 3, base + 3] == 5.0
+    assert attn.W_v[base + 5, _SetDim.OP_JSR] == 0.2
+    assert attn.W_o[_SetDim.CMP + 4, base + 5] == 1.0
+    assert attn.W_o[_SetDim.OP_JSR, base + 5] == 5.0
+    assert attn.W_v[base + 6, _SetDim.OP_SI] == 0.2
+    assert attn.W_v[base + 7, _SetDim.OP_SC] == 0.2
+    assert attn.W_o[_SetDim.MEM_ADDR_SRC, base + 7] == 1.0
 
 
 def _assert_same_ffn_units(
@@ -181,6 +215,33 @@ def test_layer6_all_step_jmp_pc_override_ir_matches_legacy_units():
         L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
         L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT,
     )
+
+
+def test_layer6_all_step_jsr_pc_override_decodes_pc_opcode_directly():
+    ffn = _StubFFN()
+
+    end = _lower_layer6_all_step_jsr_pc_override_ir(ffn, 100.0, _SetDim)
+
+    assert end == L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT
+    assert len(_layer6_all_step_jsr_pc_override_rules(100.0)) == 64
+    assert L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT >= (
+        L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT
+    )
+
+    x = torch.zeros(512)
+    x[_SetDim.MARK_PC] = 1.0
+    x[_SetDim.OPCODE_BYTE_LO + 3] = 1.0
+    x[_SetDim.OPCODE_BYTE_HI + 0] = 1.0
+    x[_SetDim.FETCH_LO + 3] = 1.0
+    x[_SetDim.OUTPUT_LO + 0] = 1.0
+    x[_SetDim.OUTPUT_HI + 0] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)
+
+    assert y[_SetDim.OUTPUT_LO + 0] < x[_SetDim.OUTPUT_LO + 0]
+    assert y[_SetDim.OUTPUT_LO + 10] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 1] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 0] < x[_SetDim.OUTPUT_HI + 0]
 
 
 def test_layer6_delayed_jmp_pc_override_ir_matches_legacy_units():
@@ -434,7 +495,6 @@ def test_layer6_stack_arithmetic_ir_matches_legacy_units():
     assert len(_layer6_psh_stack0_writeback_rules(100.0)) == 32
     for start, end in (
         (L6_PSH_SP_DECREMENT_START_UNIT, L6_PSH_SP_DECREMENT_END_UNIT),
-        (L6_JSR_SP_DECREMENT_START_UNIT, L6_JSR_SP_DECREMENT_END_UNIT),
         (L6_JSR_SP_FIXUP_START_UNIT, L6_JSR_SP_FIXUP_END_UNIT),
         (L6_JSR_SP_BYTES_START_UNIT, L6_JSR_SP_BYTES_END_UNIT),
         (
@@ -481,7 +541,7 @@ def test_layer6_psh_sp_decrement_borrows_when_low_nibble_is_below_8():
     assert y[_SetDim.OUTPUT_HI + 14] < -0.9
 
 
-def test_layer6_jsr_sp_marker_decrement_is_first_step_only():
+def test_layer6_jsr_sp_marker_decrement_handles_later_calls():
     ffn = _StubFFN()
     _lower_layer6_stack_arithmetic_ir(ffn, 100.0, _SetDim)
 
@@ -495,8 +555,8 @@ def test_layer6_jsr_sp_marker_decrement_is_first_step_only():
 
     y = _apply_stub_ffn(ffn, x)[0, 0]
 
-    assert abs(float(y[_SetDim.OUTPUT_LO + 8])) < 1e-3
-    assert abs(float(y[_SetDim.OUTPUT_HI + 15])) < 1e-3
+    assert y[_SetDim.OUTPUT_LO + 8] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 12] > 0.9
 
 
 def test_layer6_jsr_sp_marker_decrement_still_handles_first_step():

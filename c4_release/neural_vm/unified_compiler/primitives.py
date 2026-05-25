@@ -512,6 +512,97 @@ class Primitives:
         return {name: getattr(bd, name) for name in names}
 
     @staticmethod
+    def nibble_value_writes(
+        target_base: str,
+        value: int,
+        *,
+        strength: float = 100.0,
+        competitor_strength: Optional[float] = None,
+    ) -> Tuple[Tuple[str, float], ...]:
+        """Return declarative writes for an exact one-hot nibble value.
+
+        The selected nibble channel receives ``+strength`` and every other
+        channel in the 16-wide target band receives ``-competitor_strength``.
+        This is intentionally just FFN write data: callers feed it into
+        ``FFNRule.constant_write`` or ``FFNRule.gated_write`` so symbolic
+        execution and neural lowering see the same declaration.
+        """
+
+        if not 0 <= value <= 0xF:
+            raise ValueError("nibble value must be in range 0x0..0xf")
+        if strength <= 0.0:
+            raise ValueError("strength must be positive")
+        if competitor_strength is None:
+            competitor_strength = strength
+        if competitor_strength <= 0.0:
+            raise ValueError("competitor_strength must be positive")
+
+        return tuple(
+            (
+                f"{target_base}+{k}",
+                strength if k == value else -competitor_strength,
+            )
+            for k in range(16)
+        )
+
+    @staticmethod
+    def nibble_constant_writes(
+        target_base: str,
+        value: int,
+        *,
+        strength: float = 100.0,
+        competitor_strength: Optional[float] = None,
+    ) -> Tuple[Tuple[str, float], ...]:
+        """Alias for ``nibble_value_writes`` kept close to FFN rule wording."""
+
+        return Primitives.nibble_value_writes(
+            target_base,
+            value,
+            strength=strength,
+            competitor_strength=competitor_strength,
+        )
+
+    @staticmethod
+    def byte_value_writes(
+        value: int,
+        *,
+        lo_base: str = "OUTPUT_LO",
+        hi_base: str = "OUTPUT_HI",
+        strength: float = 100.0,
+        competitor_strength: Optional[float] = None,
+    ) -> Tuple[Tuple[str, float], ...]:
+        """Return interleaved low/high nibble writes for an exact byte value.
+
+        The output order matches the historical local helpers used in op
+        bakes: ``LO+0, HI+0, LO+1, HI+1, ...``.  The returned terms assert
+        both nibbles one-hot by positively selecting the target channel and
+        negatively suppressing all competing channels.
+        """
+
+        if not 0 <= value <= 0xFF:
+            raise ValueError("byte value must be in range 0x00..0xff")
+
+        lo = value & 0xF
+        hi = (value >> 4) & 0xF
+        lo_writes = dict(Primitives.nibble_value_writes(
+            lo_base,
+            lo,
+            strength=strength,
+            competitor_strength=competitor_strength,
+        ))
+        hi_writes = dict(Primitives.nibble_value_writes(
+            hi_base,
+            hi,
+            strength=strength,
+            competitor_strength=competitor_strength,
+        ))
+        writes = []
+        for k in range(16):
+            writes.append((f"{lo_base}+{k}", lo_writes[f"{lo_base}+{k}"]))
+            writes.append((f"{hi_base}+{k}", hi_writes[f"{hi_base}+{k}"]))
+        return tuple(writes)
+
+    @staticmethod
     def cancel_pair(
         ffn,
         unit: int,

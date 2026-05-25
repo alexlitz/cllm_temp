@@ -400,6 +400,11 @@ def compile_full_vm(
     disk_cache: bool = True,
     use_dynamic_ffn: bool = True,
     enable_moe_routing: Optional[bool] = None,
+    positional_encoding: Optional[str] = None,
+    attention_normalization: Optional[str] = None,
+    rope_base: Optional[float] = None,
+    use_rms_norm: Optional[bool] = None,
+    rms_norm_eps: Optional[float] = None,
     require_declarative_bake: Optional[bool] = None,
     declarations_only: bool = False,
 ):
@@ -443,6 +448,16 @@ def compile_full_vm(
             ``None`` (default) follows ``C4_ENABLE_MOE_ROUTING``. This is a
             compiler-owned structural transform and is included in the
             persistent compile cache key.
+        positional_encoding: optional architecture override. ``None`` follows
+            ``VMConfig`` / ``NEURAL_VM_POS_ENCODING``. Default remains ALiBi.
+        attention_normalization: optional architecture override. ``None``
+            follows ``VMConfig`` / ``NEURAL_VM_ATTENTION_NORMALIZATION``.
+            Default remains ``"softmax1"``; pass ``"softmax"`` for standard
+            decoder attention normalization.
+        rope_base: optional RoPE base override. ``None`` follows ``VMConfig``.
+        use_rms_norm: optional architecture override. ``None`` follows
+            ``VMConfig`` / ``NEURAL_VM_USE_RMS_NORM``. Default remains off.
+        rms_norm_eps: optional RMSNorm epsilon. ``None`` follows ``VMConfig``.
         require_declarative_bake: opt-in enforcement gate for the migration
             endpoint. ``None`` (default) follows ``C4_REQUIRE_DECLARATIVE_BAKE``.
             When true, compile fails before model bake if the layout still
@@ -463,6 +478,10 @@ def compile_full_vm(
         C4_VALIDATE_VERBOSE: when set to ``"1"`` alongside
             ``C4_VALIDATE_ON_COMPILE``, print the full verifier report to
             stdout instead of just the summary warning.
+        NEURAL_VM_POS_ENCODING: ``alibi`` (default), ``rope``, or ``hybrid``.
+        NEURAL_VM_ATTENTION_NORMALIZATION: ``softmax1`` (default) or
+            ``softmax``.
+        NEURAL_VM_USE_RMS_NORM: truthy values enable RMSNorm pre-norm blocks.
 
     Returns:
         (model, layout) where:
@@ -478,6 +497,19 @@ def compile_full_vm(
     if declarations_only:
         require_declarative_bake = True
 
+    from ..config import get_config
+    vm_config = get_config()
+    if positional_encoding is None:
+        positional_encoding = vm_config.positional_encoding
+    if attention_normalization is None:
+        attention_normalization = vm_config.attention_normalization
+    if rope_base is None:
+        rope_base = vm_config.rope_base
+    if use_rms_norm is None:
+        use_rms_norm = vm_config.use_rms_norm
+    if rms_norm_eps is None:
+        rms_norm_eps = vm_config.rms_norm_eps
+
     kwargs_snapshot = {
         "S": S,
         "enable_conversational_io": enable_conversational_io,
@@ -489,6 +521,11 @@ def compile_full_vm(
         "max_seq_len": max_seq_len,
         "pin_io_only": pin_io_only,
         "enable_moe_routing": bool(enable_moe_routing),
+        "positional_encoding": positional_encoding,
+        "attention_normalization": attention_normalization,
+        "rope_base": float(rope_base),
+        "use_rms_norm": bool(use_rms_norm),
+        "rms_norm_eps": float(rms_norm_eps),
         "require_declarative_bake": bool(require_declarative_bake),
         "declarations_only": bool(declarations_only),
     }
@@ -653,6 +690,11 @@ def compile_full_vm(
         ffn_hidden=ffn_hidden_arg,
         max_seq_len=max_seq_len,
         dim_positions=layout.dim_positions,
+        positional_encoding=positional_encoding,
+        attention_normalization=attention_normalization,
+        rope_base=rope_base,
+        use_rms_norm=use_rms_norm,
+        rms_norm_eps=rms_norm_eps,
     )
 
     with _torch.no_grad():

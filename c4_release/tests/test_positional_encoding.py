@@ -16,8 +16,13 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.config import VMConfig, set_config, reset_config, get_config
-from neural_vm.base_layers import PureAttention, rotate_half, apply_rotary_emb, precompute_rope_cache
-from neural_vm.vm_step import AutoregressiveAttention
+from neural_vm.base_layers import PureAttention
+from neural_vm.vm_step import (
+    AutoregressiveAttention,
+    apply_rotary_emb,
+    precompute_rope_cache,
+    rotate_half,
+)
 
 
 class TestConfigSystem:
@@ -92,6 +97,14 @@ class TestRoPEHelpers:
         rotated = rotate_half(x)
         expected = torch.tensor([[-2.0, 1.0, -4.0, 3.0]])
         assert torch.allclose(rotated, expected)
+
+    def test_rotate_half_empty_sequence(self):
+        """Test rotate_half handles an empty sequence dimension."""
+        x = torch.empty(1, 4, 0, 64)
+        rotated = rotate_half(x)
+
+        assert rotated.shape == x.shape
+        assert rotated.numel() == 0
 
     def test_precompute_rope_cache(self):
         """Test RoPE cache precomputation."""

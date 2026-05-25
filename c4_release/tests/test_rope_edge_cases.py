@@ -263,14 +263,9 @@ class TestConfigValidation:
         VMConfig(positional_encoding="rope")
         VMConfig(positional_encoding="hybrid")
 
-        # Invalid value currently accepted (BUG - no runtime validation)
-        # After fix with __post_init__, should raise:
-        # with pytest.raises(ValueError, match="Invalid positional_encoding"):
-        #     VMConfig(positional_encoding="invalid")
-
-        # For now, test that invalid value can be created (demonstrates bug)
-        config = VMConfig(positional_encoding="invalid")
-        assert config.positional_encoding == "invalid"  # No validation!
+        # Invalid values should fail at config construction time.
+        with pytest.raises(ValueError, match="positional_encoding"):
+            VMConfig(positional_encoding="invalid")
 
 
 class TestModelSerialization:

@@ -73,10 +73,12 @@ L6_ALU_CLEAR_START_UNIT = 1104
 L6_ALU_CLEAR_END_UNIT = 1136
 L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT = 1136
 L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT = 1283
+L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT = 1410
+L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT = 1474
 L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2200
 L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2232
-L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 2294
-L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 2300
+L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 1668
+L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 1674
 
 
 def _clear_ffn_unit_band(ffn, start: int, end: int) -> None:
@@ -200,6 +202,56 @@ def _layer6_imm_carry_refresh_rules(S: float) -> tuple[FFNRule, ...]:
                 ),
                 writes=((f"{carry_base}+{k}", write_scale),),
             ))
+    return tuple(rules)
+
+
+def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for all-step JSR PC override units 1410..1473."""
+
+    rules = []
+    conditions = (
+        ("MARK_PC", 20.0),
+        ("OPCODE_BYTE_LO+3", 1.0),
+        ("OPCODE_BYTE_HI+0", 1.0),
+        ("MARK_AX", -100.0),
+        ("MARK_SP", -100.0),
+        ("MARK_BP", -100.0),
+        ("MARK_STACK0", -100.0),
+        ("MARK_MEM", -100.0),
+        ("NEXT_SE", -100.0),
+        ("IS_BYTE", -100.0),
+    )
+    threshold = 21.5
+    write_scale = 2.0 / S
+
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_jsr_all_step_cancel_{band}_{k}",
+                conditions=conditions,
+                threshold=threshold,
+                gate=f"{output_base}+{k}",
+                gate_weight=-1.0,
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_jsr_all_step_target_lo_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"FETCH_LO+{k}",
+            writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l6_jsr_all_step_target_hi_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"FETCH_LO+{k}",
+            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
+        ))
+
     return tuple(rules)
 
 
@@ -447,7 +499,7 @@ def _layer6_jsr_sp_decrement_rules(S: float) -> tuple[FFNRule, ...]:
 
     return _layer6_sp_decrement_rules(
         name_prefix="l6_jsr_sp_decrement",
-        conditions=(("CMP+4", 1.0), ("MARK_SP", 1.0), ("HAS_SE", -1.0)),
+        conditions=(("CMP+4", 1.0), ("MARK_SP", 1.0)),
         threshold=1.5,
         S=S,
     )
@@ -1539,6 +1591,24 @@ def _lower_layer6_all_step_jmp_pc_override_ir(
     )
 
 
+def _lower_layer6_all_step_jsr_pc_override_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT,
+) -> int:
+    """Lower the IR-authored all-step JSR override band into L6 FFN weights."""
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_all_step_jsr_pc_override_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
 def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
     """Bake L6 routing FFN via the smoke-stable legacy wrapper.
 
@@ -1593,6 +1663,17 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 branch PC-byte1 override IR lowered to unexpected unit "
             f"{branch_byte1_end}; expected "
             f"{L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT}"
+        )
+    _clear_ffn_unit_band(
+        ffn,
+        L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT,
+        L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT,
+    )
+    jsr_pc_end = _lower_layer6_all_step_jsr_pc_override_ir(ffn, S, BD)
+    if jsr_pc_end != L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 all-step JSR PC override IR lowered to unexpected unit "
+            f"{jsr_pc_end}; expected {L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT}"
         )
     return
     _clear_ffn_unit_band(
@@ -2080,12 +2161,67 @@ def _bake_layer6_attn_spec(attn, BD, HD):
 def _bake_layer6_relay_heads_spec(attn, BD, HD):
     """Spec writer for L6 PSH relay heads 6-7."""
     L = 50.0
+    SP_I = 2
+    BP_I = 3
 
     # Head 6: STACK0 reads AX_CARRY_LO from AX into ALU_LO.
     base = 6 * HD
+    # Mirror the opcode relay's marker coverage here so the PSH/JSR/ENT flags
+    # are available to the same L6 FFN step even if later model-level relay
+    # post-passes are trimmed or reordered.
+    attn.W_q[base, BD.MARK_SP] = L
+    attn.W_q[base, BD.H1 + SP_I] = L
     attn.W_q[base, BD.MARK_STACK0] = L
+    attn.W_q[base, BD.L1H4 + BP_I] = L
+    attn.W_q[base, BD.MARK_BP] = L
+    attn.W_q[base, BD.MARK_PC] = L
+    attn.W_q[base, BD.MARK_MEM] = L
     attn.W_q[base, BD.MARK_AX] = -L
     attn.W_k[base, BD.MARK_AX] = L
+    attn.W_v[base + 0, BD.OP_LEV] = 0.1
+    attn.W_v[base + 1, BD.OP_PSH] = 0.2
+    attn.W_v[base + 2, BD.OP_ADJ] = 0.2
+    for op_dim in (
+        BD.OP_ADD,
+        BD.OP_SUB,
+        BD.OP_MUL,
+        BD.OP_DIV,
+        BD.OP_MOD,
+        BD.OP_EQ,
+        BD.OP_NE,
+        BD.OP_LT,
+        BD.OP_GT,
+        BD.OP_LE,
+        BD.OP_GE,
+        BD.OP_OR,
+        BD.OP_XOR,
+        BD.OP_AND,
+        BD.OP_SHL,
+        BD.OP_SHR,
+        BD.OP_SI,
+        BD.OP_SC,
+    ):
+        attn.W_v[base + 3, op_dim] = 0.04
+    attn.W_v[base + 4, BD.OP_ENT] = 0.2
+    attn.W_v[base + 5, BD.OP_JSR] = 0.2
+    attn.W_v[base + 6, BD.OP_SI] = 0.2
+    attn.W_v[base + 6, BD.OP_SC] = 0.2
+    attn.W_v[base + 6, BD.OP_PSH] = 0.2
+    attn.W_v[base + 6, BD.OP_JSR] = 0.2
+    attn.W_v[base + 6, BD.OP_ENT] = 0.2
+    attn.W_v[base + 7, BD.OP_SI] = 0.2
+    attn.W_v[base + 7, BD.OP_SC] = 0.2
+    attn.W_o[BD.CMP + 0, base + 1] = 1.0
+    attn.W_o[BD.PSH_AT_SP, base + 1] = 1.0
+    attn.W_o[BD.CMP + 1, base + 2] = 1.0
+    attn.W_o[BD.CMP + 3, base + 3] = 5.0
+    attn.W_o[BD.CMP + 2, base + 4] = 1.0
+    attn.W_o[BD.CMP + 4, base + 5] = 1.0
+    attn.W_o[BD.OP_JSR, base + 5] = 5.0
+    attn.W_o[BD.OP_ENT, base + 4] = 5.0
+    attn.W_o[BD.MEM_STORE, base + 6] = 1.0
+    attn.W_o[BD.MEM_ADDR_SRC, base + 7] = 1.0
+    attn.W_o[BD.OP_LEV, base + 0] = 10.0
     for k in range(16):
         attn.W_v[base + 8 + k, BD.AX_CARRY_LO + k] = 1.0
         attn.W_o[BD.ALU_LO + k, base + 8 + k] = 1.0
