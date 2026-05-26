@@ -8388,16 +8388,16 @@ def _set_binary_pop_sp_increment(ffn, S, BD):
     - Hi nibble: (k + 1) % 16 when carry (lo nibble >= 8),
       detected by suppressing EMBED_LO[0..7]
 
-    Uses 32 FFN units starting at offset 2200.
+    Uses 32 FFN units starting after the function-call routing band.
 
     FIX 2026-04-16: Changed from 950 to 1600 to avoid overlap with BNZ PC override
     units (which extend to ~1543). The previous overlap caused units 950-961 to have
     both MARK_PC (from BNZ) and MARK_SP (from this function), incorrectly firing
     at PC marker when CMP[3] was set by POP group relay (not just OP_BNZ).
-    FIX 2026-04-26: Changed from 1600 to 2200 to avoid overlap with function_call_weights
-    (units 1700-2158).
+    FIX 2026-05-25: Changed from 2200 to 2294 to avoid overlap with the
+    extended function_call_weights band (units 1700-2293).
     """
-    unit = 2200
+    unit = 2294
     T_pop = 1.5  # threshold: MARK_SP(1) + CMP[3](~1) = 2 > 1.5 ✓
 
     # Lo nibble: cancel identity, write (k + 8) % 16
@@ -8406,6 +8406,12 @@ def _set_binary_pop_sp_increment(ffn, S, BD):
         # Gate on MARK_SP AND CMP[3] (relayed POP group flag)
         ffn.W_up[unit, BD.MARK_SP] = S
         ffn.W_up[unit, BD.CMP + 3] = S  # relayed POP group from L6 head 6
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10
+        ffn.W_up[unit, BD.MARK_PC] = -S * 10
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
+        ffn.W_up[unit, BD.MARK_BP] = -S * 10
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 10
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 10
         ffn.b_up[unit] = -S * T_pop
         ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
         ffn.W_down[BD.OUTPUT_LO + new_k, unit] = 2.0 / S
@@ -8418,6 +8424,12 @@ def _set_binary_pop_sp_increment(ffn, S, BD):
         new_k_carry = (k + 1) % 16
         ffn.W_up[unit, BD.MARK_SP] = S
         ffn.W_up[unit, BD.CMP + 3] = S  # relayed POP group from L6 head 6
+        ffn.W_up[unit, BD.IS_BYTE] = -S * 10
+        ffn.W_up[unit, BD.MARK_PC] = -S * 10
+        ffn.W_up[unit, BD.MARK_AX] = -S * 10
+        ffn.W_up[unit, BD.MARK_BP] = -S * 10
+        ffn.W_up[unit, BD.MARK_STACK0] = -S * 10
+        ffn.W_up[unit, BD.MARK_MEM] = -S * 10
         ffn.b_up[unit] = -S * T_pop
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         for lo_bit in range(8):

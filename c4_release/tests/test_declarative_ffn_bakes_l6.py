@@ -17,6 +17,8 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     L6_BNZ_AX_ROUTE_START_UNIT,
     L6_BNZ_PC_OVERRIDE_END_UNIT,
     L6_BNZ_PC_OVERRIDE_START_UNIT,
+    L6_BINARY_POP_SP_INCREMENT_END_UNIT,
+    L6_BINARY_POP_SP_INCREMENT_START_UNIT,
     L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT,
     L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
     L6_BZ_AX_ROUTE_END_UNIT,
@@ -83,6 +85,7 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     _layer6_adj_sp_writeback_rules,
     _layer6_bnz_ax_route_rules,
     _layer6_bnz_pc_override_rules,
+    _layer6_binary_pop_sp_increment_rules,
     _layer6_branch_pc_byte1_override_rules,
     _layer6_bz_ax_route_rules,
     _layer6_bz_pc_override_rules,
@@ -131,7 +134,9 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     _lower_layer6_imm_fetch_route_ir,
     _lower_layer6_all_step_jmp_pc_override_ir,
     _lower_layer6_all_step_jsr_pc_override_ir,
+    _lower_layer6_binary_pop_sp_increment_ir,
 )
+from neural_vm.unified_compiler.ops.model_ops import make_function_call_weights_op
 
 
 class _StubFFN:
@@ -553,6 +558,80 @@ def test_layer6_psh_sp_decrement_borrows_when_low_nibble_is_below_8():
     assert y[_SetDim.OUTPUT_LO + 7] < -0.9
     assert y[_SetDim.OUTPUT_HI + 13] > 0.9
     assert y[_SetDim.OUTPUT_HI + 14] < -0.9
+
+
+def test_layer6_binary_pop_sp_increment_band_follows_function_call_band():
+    function_call_op = make_function_call_weights_op()
+
+    assert function_call_op.ffn_units_used == 2294
+    assert L6_BINARY_POP_SP_INCREMENT_START_UNIT >= function_call_op.ffn_units_used
+    assert (
+        L6_BINARY_POP_SP_INCREMENT_END_UNIT
+        == L6_BINARY_POP_SP_INCREMENT_START_UNIT + 32
+    )
+    assert len(_layer6_binary_pop_sp_increment_rules(100.0)) == 32
+
+
+def test_layer6_binary_pop_sp_increment_emits_pre_l15_sp_byte0():
+    ffn = _StubFFN(hidden_dim=L6_BINARY_POP_SP_INCREMENT_END_UNIT)
+
+    end = _lower_layer6_binary_pop_sp_increment_ir(ffn, 100.0, _SetDim)
+
+    assert end == L6_BINARY_POP_SP_INCREMENT_END_UNIT
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_SP] = 1.0
+    x[..., _SetDim.CMP + 3] = 1.0
+    x[..., _SetDim.EMBED_LO + 0] = 1.0
+    x[..., _SetDim.EMBED_HI + 14] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 8] > 0.9
+    assert y[_SetDim.OUTPUT_LO + 0] < -0.9
+    assert abs(float(y[_SetDim.OUTPUT_HI + 15])) < 1e-6
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_SP] = 1.0
+    x[..., _SetDim.CMP + 3] = 1.0
+    x[..., _SetDim.EMBED_LO + 8] = 1.0
+    x[..., _SetDim.EMBED_HI + 14] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 0] > 0.9
+    assert y[_SetDim.OUTPUT_LO + 8] < -0.9
+    assert y[_SetDim.OUTPUT_HI + 15] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 14] < -0.9
+
+
+def test_layer6_binary_pop_sp_increment_blocks_non_sp_rows():
+    ffn = _StubFFN(hidden_dim=L6_BINARY_POP_SP_INCREMENT_END_UNIT)
+    _lower_layer6_binary_pop_sp_increment_ir(ffn, 100.0, _SetDim)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_SP] = 1.0
+    x[..., _SetDim.MARK_PC] = 1.0
+    x[..., _SetDim.CMP + 3] = 1.0
+    x[..., _SetDim.EMBED_LO + 0] = 1.0
+    x[..., _SetDim.EMBED_HI + 14] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert abs(float(y[_SetDim.OUTPUT_LO + 8])) < 1e-6
+    assert abs(float(y[_SetDim.OUTPUT_LO + 0])) < 1e-6
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_SP] = 1.0
+    x[..., _SetDim.IS_BYTE] = 1.0
+    x[..., _SetDim.CMP + 3] = 1.0
+    x[..., _SetDim.EMBED_LO + 0] = 1.0
+    x[..., _SetDim.EMBED_HI + 14] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert abs(float(y[_SetDim.OUTPUT_LO + 8])) < 1e-6
+    assert abs(float(y[_SetDim.OUTPUT_LO + 0])) < 1e-6
 
 
 def test_layer6_jsr_sp_marker_decrement_handles_later_calls():

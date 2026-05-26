@@ -75,8 +75,8 @@ L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT = 1136
 L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT = 1332
 L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT = 1410
 L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT = 1490
-L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2200
-L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2232
+L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2294
+L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2326
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 1668
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 1674
 
@@ -2479,7 +2479,7 @@ def make_binary_pop_sp_increment_op() -> Operation:
     can resolve `ffn6` from the model handle inside the bake_fn.
 
     Phase 998: runs just BEFORE legacy_bake (999) so that the L6 FFN units we
-    program (starting at unit 2200) are present when `_right_size_ffns`
+    program after the function-call band are present when `_right_size_ffns`
     (called at the end of legacy_bake) prunes dead units. Running at phase
     > 999 would write into already-rightsized FFN slots that no longer exist.
     """
@@ -2497,6 +2497,8 @@ def make_binary_pop_sp_increment_op() -> Operation:
         declarative_authority="spec_generated",
         phase=998,
         migrated=True,
+        layer_idx=6,
+        ffn_units_used=L6_BINARY_POP_SP_INCREMENT_END_UNIT,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -2510,6 +2512,12 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
     conditions = (
         ("MARK_SP", 1.0),
         ("CMP+3", 1.0),
+        ("IS_BYTE", -10.0),
+        ("MARK_PC", -10.0),
+        ("MARK_AX", -10.0),
+        ("MARK_BP", -10.0),
+        ("MARK_STACK0", -10.0),
+        ("MARK_MEM", -10.0),
     )
     for k in range(16):
         new_k = (k + 8) % 16
