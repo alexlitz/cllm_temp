@@ -262,6 +262,19 @@ def test_layer6_all_step_jsr_pc_override_decodes_pc_opcode_directly():
     assert y[_SetDim.OUTPUT_HI + 10] > 0.9
     assert y[_SetDim.OUTPUT_HI + 2] < x[_SetDim.OUTPUT_HI + 2]
 
+    x = torch.zeros(512)
+    x[_SetDim.MARK_PC] = 1.0
+    x[_SetDim.OPCODE_BYTE_LO + 1] = 1.62
+    x[_SetDim.OPCODE_BYTE_HI + 0] = 1.62
+    x[_SetDim.FETCH_LO + 6] = 64.62
+    x[_SetDim.FETCH_HI + 1] = 64.62
+    x[_SetDim.OUTPUT_LO + 10] = 1.0
+    x[_SetDim.OUTPUT_HI + 0] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)
+
+    assert torch.allclose(y, x, atol=1e-6)
+
 
 def test_layer6_delayed_jmp_pc_override_ir_matches_legacy_units():
     actual = _StubFFN()
@@ -868,6 +881,27 @@ def test_layer6_branch_pc_byte1_override_handles_jsr_target_high_byte():
     assert out["OUTPUT_LO+1"] > 0.0
     assert out["OUTPUT_LO+0"] < 1.0
     assert out["OUTPUT_HI+0"] > 1.0
+
+
+def test_layer6_branch_pc_byte1_override_blocks_contaminated_jsr_opcode():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer6_branch_pc_byte1_override_rules(100.0))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "OPCODE_BYTE_LO+1": 1.62,
+        "OPCODE_BYTE_HI+0": 1.62,
+        "FETCH_HI+2": 40.0,
+        "OUTPUT_LO+0": 1.0,
+        "OUTPUT_HI+0": 1.0,
+        "CONST": 1.0,
+    })
+
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+    assert out["OUTPUT_LO+0"] == 1.0
+    assert out["OUTPUT_HI+0"] == 1.0
 
 
 def test_layer6_branch_pc_byte1_override_blocks_untaken_bz():

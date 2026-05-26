@@ -103,6 +103,25 @@ def _pc_target_hi_plus_odd_imm_hi_from_index(k: int) -> int:
     return (_pc_target_hi_from_index(k) + 8) & 0xF
 
 
+def _jsr_opcode_nibble_conditions(
+    *, blocker: float = -10.0
+) -> tuple[tuple[str, float], ...]:
+    """Match opcode byte 0x03 while blocking other residual opcode nibbles."""
+
+    return (
+        ("OPCODE_BYTE_LO+3", 1.0),
+        ("OPCODE_BYTE_HI+0", 1.0),
+    ) + tuple(
+        (f"OPCODE_BYTE_LO+{k}", blocker)
+        for k in range(16)
+        if k != 3
+    ) + tuple(
+        (f"OPCODE_BYTE_HI+{k}", blocker)
+        for k in range(16)
+        if k != 0
+    )
+
+
 def _pc_target_byte1_lo_from_imm_hi(k: int) -> int:
     return (k >> 1) & 0xF
 
@@ -215,8 +234,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     rules = []
     conditions = (
         ("MARK_PC", 20.0),
-        ("OPCODE_BYTE_LO+3", 1.0),
-        ("OPCODE_BYTE_HI+0", 1.0),
+        *_jsr_opcode_nibble_conditions(),
         ("MARK_AX", -100.0),
         ("MARK_SP", -100.0),
         ("MARK_BP", -100.0),
@@ -262,7 +280,18 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     for k in range(16):
         rules.append(FFNRule.gated_write(
             name=f"l6_jsr_all_step_target_hi_odd_imm_hi_correction_{k}",
-            conditions=conditions + ((f"FETCH_LO+{k}", 1.0),),
+            conditions=(
+                ("MARK_PC", 20.0),
+                *_jsr_opcode_nibble_conditions(blocker=-100.0),
+                ("MARK_AX", -100.0),
+                ("MARK_SP", -100.0),
+                ("MARK_BP", -100.0),
+                ("MARK_STACK0", -100.0),
+                ("MARK_MEM", -100.0),
+                ("NEXT_SE", -100.0),
+                ("IS_BYTE", -100.0),
+                (f"FETCH_LO+{k}", 1.0),
+            ),
             threshold=threshold + 0.5,
             gate_terms=odd_imm_hi_gate,
             writes=(
@@ -1070,11 +1099,7 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         (
             "jsr_target",
-            byte0_conditions
-            + (
-                ("OPCODE_BYTE_LO+3", 1.0),
-                ("OPCODE_BYTE_HI+0", 1.0),
-            ),
+            byte0_conditions + _jsr_opcode_nibble_conditions(),
             4.5,
         ),
     )
@@ -2512,12 +2537,12 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
     conditions = (
         ("MARK_SP", 1.0),
         ("CMP+3", 1.0),
-        ("IS_BYTE", -10.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_STACK0", -10.0),
-        ("MARK_MEM", -10.0),
+        ("IS_BYTE", -1_000_000.0),
+        ("MARK_PC", -1_000_000.0),
+        ("MARK_AX", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
+        ("MARK_STACK0", -1_000_000.0),
+        ("MARK_MEM", -1_000_000.0),
     )
     for k in range(16):
         new_k = (k + 8) % 16
