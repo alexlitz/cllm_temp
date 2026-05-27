@@ -91,6 +91,44 @@ def test_add_byte_base_tolerates_stale_zero_output_residual():
     _assert_no_positive_non_targets(out, 0x04)
 
 
+def test_sub_byte_base_clears_stale_zero_low_nibble():
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, BD.CONST] = 1.0
+    x[0, 0, BD.IS_BYTE] = 1.0
+    x[0, 0, BD.H1 + 1] = 1.0
+    x[0, 0, BD.BYTE_INDEX_0] = 1.0
+    x[0, 0, BD.TEMP + 9] = 1.0
+    x[0, 0, BD.OUTPUT_LO + 0] = 2.94
+    x[0, 0, BD.OUTPUT_HI + 0] = 2.94
+    x[0, 0, BD.ALU_LO + 6] = 6.0
+    x[0, 0, BD.ALU_HI + 0] = 6.0
+
+    out = AddSubBytePropagationPostOp()(x)
+
+    assert _decode_output_byte(out) == 0x06
+    assert float(out[0, 0, BD.OUTPUT_LO + 0]) < 0.5
+    assert float(out[0, 0, BD.OUTPUT_LO + 6]) > 0.5
+
+
+def test_sub_byte_base_keeps_zero_high_nibble_under_amplification():
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, BD.CONST] = 1.0
+    x[0, 0, BD.IS_BYTE] = 1.0
+    x[0, 0, BD.H1 + 1] = 1.0
+    x[0, 0, BD.BYTE_INDEX_0] = 0.9701380133628845
+    x[0, 0, BD.BYTE_INDEX_1] = 0.0132971
+    x[0, 0, BD.TEMP + 9] = 1.3048
+    x[0, 0, BD.OUTPUT_LO + 0] = 2.9402759
+    x[0, 0, BD.OUTPUT_HI + 0] = 2.9402759
+    x[0, 0, BD.ALU_LO + 5] = 6.0
+    x[0, 0, BD.ALU_HI + 0] = 6.237
+
+    out = AddSubBytePropagationPostOp()(x)
+
+    assert _decode_output_byte(out) == 0x05
+    assert out[0, 0, BD.OUTPUT_HI + 0] > out[0, 0, BD.OUTPUT_HI + 8]
+
+
 def test_add_byte_base_tolerates_weak_bitwise_residue():
     x = _add_byte1_input(0x0300, 0x0100, alu_amp=6.0)
     x[0, 0, BD.TEMP + 3] = 0.305

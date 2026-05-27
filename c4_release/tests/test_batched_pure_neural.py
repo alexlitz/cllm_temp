@@ -257,6 +257,64 @@ def test_declarative_halt_horizon_marks_overrun_as_divergence():
     assert state.exit_code is None
 
 
+def test_spec_fail_on_correction_stops_at_first_safe_divergence():
+    import torch
+
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.run_vm import DraftVM
+    from neural_vm.vm_step import Token
+
+    class _Embed:
+        def set_mem_history_end(self, _value):
+            pass
+
+    class _Model:
+        max_seq_len = 4096
+        embed = _Embed()
+
+        def forward(self, token_ids, **_kwargs):
+            logits = torch.zeros(
+                token_ids.shape[0],
+                token_ids.shape[1],
+                Token.VOCAB_SIZE,
+                device=token_ids.device,
+            )
+            logits[:, :, Token.HALT] = 1.0
+            return logits
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    runner.model = _Model()
+    runner._device = torch.device("cpu")
+    runner.use_kv_cache = False
+    runner.incremental_kv_safe = False
+    runner.spec_fail_on_correction = True
+    runner.spec_fail_fast = True
+    runner._kv_stats = {"fresh_forwards": 0}
+    runner._reset_spec_stats()
+
+    bytecode = _encode([(Opcode.IMM, 42), Opcode.EXIT])
+    state = _ElementState(
+        bytecode=bytecode,
+        context=[Token.CODE_START],
+        prefix_len=1,
+        expected_steps=1,
+        draft_vm=DraftVM(bytecode),
+    )
+
+    runner._run_speculative(
+        [state],
+        max_steps=None,
+        max_context_window=512,
+        spec_k=1,
+    )
+
+    assert state.halted is True
+    assert state.exit_code is None
+    assert state.context == [Token.CODE_START]
+    assert runner._spec_stats["corrections"] == 1
+    assert runner._spec_stats["fail_fast"] == 1
+
+
 def test_windowed_context_does_not_duplicate_memory_history_without_eviction():
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
     from neural_vm.vm_step import Token
@@ -277,6 +335,91 @@ def test_windowed_context_does_not_duplicate_memory_history_without_eviction():
 
     assert windowed == prefix + dynamic
     assert state.mem_history_end == 0
+
+
+def test_windowed_context_does_not_mark_current_store_before_step_complete():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.vm_step import Token
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    prefix = [Token.CODE_START, Token.CODE_END]
+    dynamic = [0] * 25 + [Token.MEM]
+    state = _ElementState(
+        bytecode=_encode([Opcode.PSH, Opcode.EXIT]),
+        context=prefix + dynamic,
+        prefix_len=len(prefix),
+        token_pos=len(dynamic),
+    )
+
+    windowed = runner._windowed_context(state, max_context_window=128)
+
+    assert windowed == prefix + dynamic
+    assert state.mem_history_end == 0
+    assert state.mem_store_positions == []
+
+
+def test_windowed_context_does_not_mark_current_store_during_value_bytes():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.vm_step import Token
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    prefix = [Token.CODE_START, Token.CODE_END]
+    dynamic = [0] * 25 + [Token.MEM, 0xF8, 0xFF, 0x00, 0x00]
+    state = _ElementState(
+        bytecode=_encode([Opcode.PSH, Opcode.EXIT]),
+        context=prefix + dynamic,
+        prefix_len=len(prefix),
+        token_pos=len(dynamic),
+    )
+
+    windowed = runner._windowed_context(state, max_context_window=128)
+
+    assert windowed == prefix + dynamic
+    assert state.mem_history_end == 0
+    assert state.mem_store_positions == []
+
+
+def test_batched_kv_bypasses_incremental_path_by_default():
+    import torch
+
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+    from neural_vm.vm_step import Token
+
+    class _Model:
+        def forward(self, token_ids):
+            logits = torch.zeros(
+                token_ids.shape[0],
+                token_ids.shape[1],
+                Token.VOCAB_SIZE,
+                device=token_ids.device,
+            )
+            logits[:, :, Token.HALT] = 1.0
+            return logits
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    runner.model = _Model()
+    runner._device = torch.device("cpu")
+    runner.use_kv_cache = True
+    runner.incremental_kv_safe = False
+    runner._kv_stats = {
+        "fresh_forwards": 0,
+        "kv_forwards": 0,
+        "spec_fresh_bypass": 0,
+        "unsafe_model_fresh_bypass": 0,
+    }
+
+    preds, pred_start, real_lens = runner._forward_argmax_batch(
+        [[Token.CODE_START]],
+        [0],
+        first_logit_pos=0,
+    )
+
+    assert preds == [[Token.HALT]]
+    assert pred_start == 0
+    assert real_lens == [1]
+    assert runner._kv_stats["fresh_forwards"] == 1
+    assert runner._kv_stats["kv_forwards"] == 0
+    assert runner._kv_stats["unsafe_model_fresh_bypass"] == 1
 
 
 def test_windowed_context_splices_only_evicted_memory_history():
@@ -301,6 +444,10 @@ def test_windowed_context_splices_only_evicted_memory_history():
 
     assert windowed == prefix + evicted_mem + tail
     assert state.mem_history_end == len(prefix) + len(evicted_mem)
+    assert state.mem_store_positions == [
+        len(prefix),
+        len(prefix) + len(evicted_mem) + 5,
+    ]
 
 
 class _FakeBatchedModel:

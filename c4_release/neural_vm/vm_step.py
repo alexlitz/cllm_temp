@@ -1062,11 +1062,22 @@ class AddSubBytePropagationPostOp(PureFFN):
                                 BD.MARK_SE,
                             ):
                                 self.W_up.data[unit, marker_dim] = -S * 10_000_000
-                            self.b_up.data[unit] = -S * 26.35
+                            # Nonzero old-nibble rules must see actual
+                            # evidence for their lane. Otherwise the common
+                            # zero-lane passthrough is enough to activate all
+                            # nonzero alternatives under amplified SUB rows,
+                            # and their cleanup writes erase the true zero.
+                            threshold = (
+                                28.55
+                                if op_dim == BD.TEMP + 9 and b != 0
+                                else 26.35
+                            )
+                            self.b_up.data[unit] = -S * threshold
                             self.W_gate.data[unit, op_dim] = 1.0
-                            self.W_down.data[out_base + b, unit] = -2.0 / S
+                            if b != result:
+                                self.W_down.data[out_base + b, unit] = -50.0 / S
                             if b != 0 and result != 0:
-                                self.W_down.data[out_base + 0, unit] = -2.0 / S
+                                self.W_down.data[out_base + 0, unit] = -50.0 / S
                             self.W_down.data[out_base + result, unit] = 2.0 / S
                             unit += 1
 
@@ -1187,7 +1198,6 @@ class BitwiseBytePropagationPostOp(PureFFN):
                         # only for relayed bitwise op rows (TEMP[4..6]).
                         self.W_up.data[unit, BD.TEMP + 8] = -S * 10000
                         self.W_up.data[unit, BD.TEMP + 9] = -S * 10000
-                        self.W_up.data[unit, BD.TEMP + 10] = -S * 10000
                         self.W_up.data[unit, BD.CARRY + 1] = -S * 10000
                         self.W_up.data[unit, BD.CARRY + 2] = -S * 10000
                         self.W_up.data[unit, BD.CARRY + 3] = -S * 10000
@@ -1231,7 +1241,6 @@ class BitwiseBytePropagationPostOp(PureFFN):
                         # See low-nibble branch above.
                         self.W_up.data[unit, BD.TEMP + 8] = -S * 10000
                         self.W_up.data[unit, BD.TEMP + 9] = -S * 10000
-                        self.W_up.data[unit, BD.TEMP + 10] = -S * 10000
                         self.W_up.data[unit, BD.CARRY + 1] = -S * 10000
                         self.W_up.data[unit, BD.CARRY + 2] = -S * 10000
                         self.W_up.data[unit, BD.CARRY + 3] = -S * 10000

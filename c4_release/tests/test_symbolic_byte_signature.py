@@ -52,6 +52,13 @@ ID575_SRC = (
     "int main() { return add(57, 11); }\n"
 )
 ID800_SRC = "int main() { return 22 + 24 * 22; }\n"
+REC_FIB_SRC_TEMPLATE = (
+    "int fib(int n) {\n"
+    "    if (n < 2) return n;\n"
+    "    return fib(n-1) + fib(n-2);\n"
+    "}\n"
+    "int main() { return fib(%d); }\n"
+)
 
 
 @pytest.fixture(scope="module")
@@ -63,6 +70,12 @@ def id575_signatures() -> list[SymbolicStepByteSignature]:
 @pytest.fixture(scope="module")
 def id800_signatures() -> list[SymbolicStepByteSignature]:
     bytecode, data = compile_c(ID800_SRC)
+    return symbolic_byte_signatures(bytecode, data, max_steps=200)
+
+
+@pytest.fixture(scope="module")
+def id740_signatures() -> list[SymbolicStepByteSignature]:
+    bytecode, data = compile_c(REC_FIB_SRC_TEMPLATE % 1)
     return symbolic_byte_signatures(bytecode, data, max_steps=200)
 
 
@@ -180,6 +193,54 @@ def test_id800_second_psh_stack0_byte_signature(
     second_psh = psh_steps[1]
     assert second_psh.byte("STACK0_byte0") == 0x18
     assert second_psh.nibbles("STACK0_byte0") == (0x8, 0x1)
+
+
+# --------------------------------------------------------------------------- #
+# Cluster 3: id740 recursive JSR return-address frame invariants.             #
+# --------------------------------------------------------------------------- #
+
+
+def test_id740_recursive_jsr_stack0_is_return_address_0x0122(
+    id740_signatures: list[SymbolicStepByteSignature],
+) -> None:
+    jsr_steps = find_steps_by_opcode(id740_signatures, "JSR")
+    assert len(jsr_steps) >= 2, "fib(1) should call main, then recursively call fib"
+
+    recursive_call = jsr_steps[1]
+    assert recursive_call.byte("STACK0_byte0") == 0x22
+    assert recursive_call.byte("STACK0_byte1") == 0x01
+    assert recursive_call.byte("STACK0_byte2") == 0x00
+    assert recursive_call.byte("STACK0_byte3") == 0x00
+
+    # JSR stores the same return address at the decremented stack top.
+    assert recursive_call.byte("MEM_addr0") == 0xE0
+    assert recursive_call.byte("MEM_addr1") == 0xFF
+    assert recursive_call.byte("MEM_value0") == 0x22
+    assert recursive_call.byte("MEM_value1") == 0x01
+    assert recursive_call.byte("MEM_value2") == 0x00
+    assert recursive_call.byte("MEM_value3") == 0x00
+
+
+def test_id740_inner_ent_saves_caller_bp_not_return_address(
+    id740_signatures: list[SymbolicStepByteSignature],
+) -> None:
+    ent_steps = find_steps_by_opcode(id740_signatures, "ENT")
+    assert len(ent_steps) >= 2, "fib(1) should enter main and then fib"
+
+    inner_fib_ent = ent_steps[1]
+    assert inner_fib_ent.byte("BP_byte0") == 0xD8
+    assert inner_fib_ent.byte("BP_byte1") == 0xFF
+    assert inner_fib_ent.byte("STACK0_byte0") == 0xF0
+    assert inner_fib_ent.byte("STACK0_byte1") == 0xFF
+
+    # The saved frame pointer lives in MEM_value; the previous JSR return
+    # address remains at BP+8 and must not be confused with saved BP.
+    assert inner_fib_ent.byte("MEM_addr0") == 0xD8
+    assert inner_fib_ent.byte("MEM_addr1") == 0xFF
+    assert inner_fib_ent.byte("MEM_value0") == 0xF0
+    assert inner_fib_ent.byte("MEM_value1") == 0xFF
+    assert inner_fib_ent.byte("MEM_value2") == 0x00
+    assert inner_fib_ent.byte("MEM_value3") == 0x00
 
 
 # --------------------------------------------------------------------------- #

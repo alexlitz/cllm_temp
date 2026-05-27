@@ -72,9 +72,55 @@ def test_l10_sp_byte_passthrough_spec_matches_legacy_helper():
 
     with torch.no_grad():
         _set_layer10_sp_byte_passthrough(legacy, 100.0, _SetDim, hd)
+        base = 2 * hd
+        for slot in (34, 35):
+            legacy.W_q[base + slot, _SetDim.CMP + 4] = -600.0
+            legacy.W_q[base + slot, _SetDim.OP_JSR] = -600.0
         _bake_layer10_sp_byte_passthrough_head(generated, _SetDim, 100.0, hd)
 
     _assert_attention_equal(legacy, generated)
+
+
+def test_l10_sp_byte_passthrough_generic_chain_blocks_sp_marker_rows():
+    attn = _new_attention()
+    hd = attn.W_q.shape[0] // attn.num_heads
+    base = 2 * hd
+
+    with torch.no_grad():
+        _bake_layer10_sp_byte_passthrough_head(attn, _SetDim, 100.0, hd)
+
+    q0 = attn.W_q[base]
+    assert q0[_SetDim.IS_BYTE] == 100.0
+    assert q0[_SetDim.HAS_SE] == 200.0
+    assert q0[_SetDim.PSH_AT_SP] == -200.0
+    assert q0[_SetDim.MARK_SP] == -200.0
+
+    marker = torch.zeros(512)
+    marker[_SetDim.CONST] = 1.0
+    marker[_SetDim.HAS_SE] = 1.0
+    marker[_SetDim.MARK_SP] = 1.0
+    marker[_SetDim.H1 + 2] = 1.0
+    marker[_SetDim.CMP + 3] = 4.0
+    assert torch.dot(q0, marker) < 0
+
+    sp_byte = marker.clone()
+    sp_byte[_SetDim.MARK_SP] = 0.0
+    sp_byte[_SetDim.IS_BYTE] = 1.0
+    assert torch.dot(q0, sp_byte) > 0
+
+    assert attn.W_q[base + 34, _SetDim.MARK_SP] == 300.0
+    assert attn.W_q[base + 35, _SetDim.MARK_SP] == 300.0
+    assert attn.W_q[base + 34, _SetDim.CMP + 4] == -600.0
+    assert attn.W_q[base + 35, _SetDim.OP_JSR] == -600.0
+
+    jsr_marker = torch.zeros(512)
+    jsr_marker[_SetDim.CONST] = 1.0
+    jsr_marker[_SetDim.HAS_SE] = 1.0
+    jsr_marker[_SetDim.MARK_SP] = 1.0
+    jsr_marker[_SetDim.CMP + 4] = 1.0
+    jsr_marker[_SetDim.OP_JSR] = 5.0
+    assert torch.dot(attn.W_q[base + 34], jsr_marker) < 0
+    assert torch.dot(attn.W_q[base + 35], jsr_marker) < 0
 
 
 def test_l10_bp_byte_passthrough_spec_matches_legacy_helper():
@@ -118,3 +164,25 @@ def test_l10_stack0_byte_relay_spec_matches_legacy_helper():
             legacy.W_o[_SetDim.ALU_HI + k, base + 17 + k] = 6.0
 
     _assert_attention_equal(legacy, generated)
+
+
+def test_l10_stack0_persistence_store_route_requires_mem_store():
+    attn = _new_attention()
+    hd = attn.W_q.shape[0] // attn.num_heads
+    base = 6 * hd
+
+    with torch.no_grad():
+        _bake_layer10_stack0_byte_relay_head(attn, _SetDim, 100.0, hd)
+
+    q7 = attn.W_q[base + 7]
+    marker = torch.zeros(512)
+    marker[_SetDim.CONST] = 1.0
+    marker[_SetDim.MARK_STACK0] = 1.0
+    marker[_SetDim.HAS_SE] = 1.0
+    marker[_SetDim.CMP + 3] = 4.0
+
+    assert torch.dot(q7, marker) < 0
+    marker[_SetDim.MEM_STORE] = 1.0
+    assert torch.dot(q7, marker) > 0
+    marker[_SetDim.MEM_ADDR_SRC] = 1.0
+    assert torch.dot(q7, marker) < 0

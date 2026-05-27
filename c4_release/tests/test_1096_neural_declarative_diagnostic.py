@@ -20,7 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import os
 import sys
-from typing import Iterable, List, Optional, Sequence, TextIO
+import types
+from typing import Any, Iterable, List, Optional, Sequence, TextIO
 
 import pytest
 
@@ -47,6 +48,20 @@ def _parse_trace_limit(raw: str) -> int:
     if raw in {"", "none", "all"}:
         return 1_000_000
     return max(0, int(raw))
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw)
 
 
 def _shorten(text: str, width: int = 72) -> str:
@@ -157,6 +172,7 @@ class ResidualSupportSnapshot:
     neural_logit: Optional[float]
     expected_margin: float
     residual_note: str = ""
+    band_contract_report: Optional[Any] = None
 
     @property
     def supports_expected(self) -> bool:
@@ -175,6 +191,11 @@ class ResidualSupportSnapshot:
             else f" neural_logit={self.neural_logit:+.2f}"
         )
         note = f" {self.residual_note}" if self.residual_note else ""
+        band_contracts = (
+            f" {self.band_contract_report.format_inline()}"
+            if self.band_contract_report is not None
+            else ""
+        )
         return (
             f"block={block} layer={layer} label={self.label!r} "
             f"expected={_token_name(self.expected_token)} "
@@ -182,7 +203,7 @@ class ResidualSupportSnapshot:
             f"expected_logit={self.expected_logit:+.2f} "
             f"argmax_logit={self.argmax_logit:+.2f} "
             f"margin={self.expected_margin:+.2f}"
-            f"{neural}{note}"
+            f"{neural}{note}{band_contracts}"
         )
 
 
@@ -212,6 +233,7 @@ class NeuralDeclarativeDiagnosticRow:
     first_token_divergence: Optional[TokenDivergence] = None
     residual_diagnosis: Optional[ResidualDivergenceReport] = None
     trace_error: Optional[str] = None
+    comparison_mode: str = "final-output"
 
     @property
     def status(self) -> str:
@@ -222,6 +244,10 @@ class NeuralDeclarativeDiagnosticRow:
             return "error"
         if self.declarative_exit != (self.suite_expected & 0xFFFFFFFF):
             return "suite/declarative-mismatch"
+        if self.comparison_mode == "strict-first-safe-token":
+            if self.neural_exit != self.declarative_exit:
+                return "strict-first-safe-token-divergence"
+            return "strict-ok"
         if self.neural_exit != self.declarative_exit:
             return "neural-divergence"
         return "ok"
@@ -254,6 +280,7 @@ class NeuralDeclarativeDiagnosticRow:
         )
         return (
             f"[1096-diag] id={self.test_idx:04d} "
+            f"mode={self.comparison_mode} "
             f"status={self.status} "
             f"suite_decl={'match' if self.suite_declarative_match else 'mismatch'} "
             f"desc={_shorten(self.description)!r} "
@@ -494,6 +521,37 @@ def _residual_note_for_token(vec, model, token: int) -> str:
     return f"{flag_name}={flag_value:+.2f}"
 
 
+def _band_contract_report_for_token(
+    vec,
+    model,
+    token: int,
+    *,
+    include_projection: bool = False,
+    min_active_margin: float = 0.5,
+    max_inactive_value: float = 0.2,
+):
+    if not 0 <= token < 256:
+        return None
+
+    from neural_vm.unified_compiler.band_contracts import (
+        verify_declared_output_nibble_bands,
+    )
+
+    out_lo = _dim(model, "OUTPUT_LO")
+    out_hi = _dim(model, "OUTPUT_HI")
+    output_bands = {
+        "OUTPUT_LO": vec[out_lo : out_lo + 16],
+        "OUTPUT_HI": vec[out_hi : out_hi + 16],
+    }
+    return verify_declared_output_nibble_bands(
+        output_bands,
+        expected_byte=token,
+        min_active_margin=min_active_margin,
+        max_inactive_value=max_inactive_value,
+        include_projection=include_projection,
+    )
+
+
 def _head_logits(model, x_at_pos):
     from neural_vm.vm_step import sparse_linear
 
@@ -516,6 +574,9 @@ def _residual_support_snapshot(
     block_index: Optional[int],
     expected_token: int,
     neural_token: Optional[int],
+    include_band_projection: bool = False,
+    band_min_active_margin: float = 0.5,
+    band_max_inactive_value: float = 0.2,
 ) -> ResidualSupportSnapshot:
     import torch
 
@@ -544,6 +605,14 @@ def _residual_support_snapshot(
         neural_logit=neural_logit,
         expected_margin=expected_logit - best_other,
         residual_note=_residual_note_for_token(vec, model, expected_token),
+        band_contract_report=_band_contract_report_for_token(
+            vec,
+            model,
+            expected_token,
+            include_projection=include_band_projection,
+            min_active_margin=band_min_active_margin,
+            max_inactive_value=band_max_inactive_value,
+        ),
     )
 
 
@@ -577,6 +646,9 @@ def _trace_residual_support_for_divergence(
     divergence: TokenDivergence,
     *,
     max_context_window: int,
+    include_band_projection: bool = False,
+    band_min_active_margin: float = 0.5,
+    band_max_inactive_value: float = 0.2,
 ) -> Optional[ResidualDivergenceReport]:
     if divergence.expected_token is None or divergence.token_index <= 0:
         return None
@@ -610,6 +682,9 @@ def _trace_residual_support_for_divergence(
                 block_index=None,
                 expected_token=expected_token,
                 neural_token=neural_token,
+                include_band_projection=include_band_projection,
+                band_min_active_margin=band_min_active_margin,
+                band_max_inactive_value=band_max_inactive_value,
             )
         )
         for block_index, block in enumerate(model.blocks):
@@ -623,6 +698,9 @@ def _trace_residual_support_for_divergence(
                 block_index=block_index,
                 expected_token=expected_token,
                 neural_token=neural_token,
+                include_band_projection=include_band_projection,
+                band_min_active_margin=band_min_active_margin,
+                band_max_inactive_value=band_max_inactive_value,
             )
             snapshots.append(
                 replace(snapshot, original_layer_index=original_layer)
@@ -660,6 +738,9 @@ def _attach_failure_trace(
     expected_steps: Optional[int],
     spec_k: int,
     max_context_window: int,
+    include_band_projection: bool = False,
+    band_min_active_margin: float = 0.5,
+    band_max_inactive_value: float = 0.2,
 ) -> NeuralDeclarativeDiagnosticRow:
     try:
         expected = _build_symbolic_expected_execution(bytecode, data)
@@ -678,6 +759,9 @@ def _attach_failure_trace(
                 expected,
                 first,
                 max_context_window=max_context_window,
+                include_band_projection=include_band_projection,
+                band_min_active_margin=band_min_active_margin,
+                band_max_inactive_value=band_max_inactive_value,
             )
             if first is not None
             else None
@@ -718,6 +802,12 @@ def run_1096_neural_declarative_diagnostic(
     model_max_seq_len: int = 4096,
     trace_failures: bool = False,
     trace_failure_limit: int = 8,
+    include_band_projection: bool = False,
+    band_min_active_margin: float = 0.5,
+    band_max_inactive_value: float = 0.2,
+    sort_by_steps: bool = False,
+    progress_stream: Optional[TextIO] = None,
+    comparison_mode: str = "final-output",
 ) -> List[NeuralDeclarativeDiagnosticRow]:
     """Run a focused 1096 slice and return declarative/neural comparison rows."""
 
@@ -728,14 +818,17 @@ def run_1096_neural_declarative_diagnostic(
     rows: List[NeuralDeclarativeDiagnosticRow] = []
     traced_failures = 0
 
-    for start in range(0, len(selected), chunk_size):
-        chunk = selected[start : start + chunk_size]
-        bytecodes = []
-        data_list = []
-        compiled_slots = []
-        expected_steps = []
+    selected_groups = [selected]
+    if not sort_by_steps:
+        selected_groups = [
+            selected[start : start + chunk_size]
+            for start in range(0, len(selected), chunk_size)
+        ]
 
-        for slot, (idx, source, expected, description) in enumerate(chunk):
+    for selected_group in selected_groups:
+        prepared_entries = []
+
+        for idx, source, expected, description in selected_group:
             try:
                 bytecode, data = compile_c(source)
                 declarative = declarative_oracle_for_program(
@@ -755,6 +848,7 @@ def run_1096_neural_declarative_diagnostic(
                         declarative_steps=None,
                         neural_exit=None,
                         error=f"compile/declarative error: {exc!r}",
+                        comparison_mode=comparison_mode,
                     )
                 )
                 continue
@@ -774,13 +868,13 @@ def run_1096_neural_declarative_diagnostic(
                             declarative.error
                             or "declarative execution did not halt"
                         ),
+                        comparison_mode=comparison_mode,
                     )
                 )
                 continue
 
-            compiled_slots.append(
+            prepared_entries.append(
                 (
-                    slot,
                     idx,
                     expected,
                     description,
@@ -790,82 +884,127 @@ def run_1096_neural_declarative_diagnostic(
                     data,
                 )
             )
-            bytecodes.append(bytecode)
-            data_list.append(data)
-            expected_steps.append(decl_steps)
 
-        if not bytecodes:
-            continue
+        if sort_by_steps:
+            prepared_entries.sort(key=lambda item: item[4], reverse=True)
 
-        try:
-            neural_results = neural_runner.run_batch(
-                bytecodes,
-                data_list=data_list,
-                max_steps=None,
-                expected_steps_list=expected_steps,
-                max_context_window=max_context_window,
-                spec_k=spec_k,
-            )
-        except Exception as exc:
+        for start in range(0, len(prepared_entries), chunk_size):
+            chunk = prepared_entries[start : start + chunk_size]
+            bytecodes = []
+            data_list = []
+            compiled_slots = []
+            expected_steps = []
+
+            for entry in chunk:
+                compiled_slots.append(entry)
+                bytecodes.append(entry[5])
+                data_list.append(entry[6])
+                expected_steps.append(entry[4])
+
+            if not bytecodes:
+                continue
+
+            chunk_ids = [entry[0] for entry in compiled_slots]
+            if progress_stream is not None:
+                print(
+                    "[1096-progress] "
+                    f"mode={comparison_mode} "
+                    "phase=start "
+                    f"rows={len(rows)}/{len(selected)} "
+                    f"batch={len(compiled_slots)} "
+                    f"ids={min(chunk_ids):04d}-{max(chunk_ids):04d} "
+                    f"max_steps={max(expected_steps)}",
+                    file=progress_stream,
+                    flush=True,
+                )
+
+            try:
+                neural_results = neural_runner.run_batch(
+                    bytecodes,
+                    data_list=data_list,
+                    max_steps=None,
+                    expected_steps_list=expected_steps,
+                    max_context_window=max_context_window,
+                    spec_k=spec_k,
+                )
+            except Exception as exc:
+                for (
+                    idx,
+                    expected,
+                    description,
+                    decl_exit,
+                    decl_steps,
+                    _bytecode,
+                    _data,
+                ) in compiled_slots:
+                    rows.append(
+                        NeuralDeclarativeDiagnosticRow(
+                            test_idx=idx,
+                            description=description,
+                            suite_expected=expected,
+                            declarative_exit=decl_exit,
+                            declarative_steps=decl_steps,
+                            neural_exit=None,
+                            error=f"neural batch error: {exc!r}",
+                            comparison_mode=comparison_mode,
+                        )
+                    )
+                continue
+
             for (
-                _slot,
                 idx,
                 expected,
                 description,
                 decl_exit,
                 decl_steps,
-                _bytecode,
-                _data,
-            ) in compiled_slots:
-                rows.append(
-                    NeuralDeclarativeDiagnosticRow(
-                        test_idx=idx,
-                        description=description,
-                        suite_expected=expected,
-                        declarative_exit=decl_exit,
-                        declarative_steps=decl_steps,
-                        neural_exit=None,
-                        error=f"neural batch error: {exc!r}",
+                bytecode,
+                data,
+            ), (neural_output, neural_exit) in zip(compiled_slots, neural_results):
+                row = NeuralDeclarativeDiagnosticRow(
+                    test_idx=idx,
+                    description=description,
+                    suite_expected=expected,
+                    declarative_exit=decl_exit,
+                    declarative_steps=decl_steps,
+                    neural_exit=neural_exit,
+                    neural_output=neural_output,
+                    comparison_mode=comparison_mode,
+                )
+                if (
+                    trace_failures
+                    and traced_failures < trace_failure_limit
+                    and row.status in {
+                        "neural-divergence",
+                        "strict-first-safe-token-divergence",
+                    }
+                ):
+                    row = _attach_failure_trace(
+                        row,
+                        runner=neural_runner,
+                        bytecode=bytecode,
+                        data=data,
+                        expected_steps=decl_steps,
+                        spec_k=spec_k,
+                        max_context_window=max_context_window,
+                        include_band_projection=include_band_projection,
+                        band_min_active_margin=band_min_active_margin,
+                        band_max_inactive_value=band_max_inactive_value,
                     )
-                )
-            continue
+                    traced_failures += 1
+                rows.append(row)
 
-        for (
-            slot,
-            idx,
-            expected,
-            description,
-            decl_exit,
-            decl_steps,
-            bytecode,
-            data,
-        ), (neural_output, neural_exit) in zip(compiled_slots, neural_results):
-            del slot
-            row = NeuralDeclarativeDiagnosticRow(
-                test_idx=idx,
-                description=description,
-                suite_expected=expected,
-                declarative_exit=decl_exit,
-                declarative_steps=decl_steps,
-                neural_exit=neural_exit,
-                neural_output=neural_output,
-            )
-            if (
-                trace_failures
-                and traced_failures < trace_failure_limit
-                and row.status == "neural-divergence"
-            ):
-                row = _attach_failure_trace(
-                    row,
-                    runner=neural_runner,
-                    bytecode=bytecode,
-                    data=data,
-                    expected_steps=decl_steps,
-                    spec_k=spec_k,
-                    max_context_window=max_context_window,
+            if progress_stream is not None:
+                print(
+                    "[1096-progress] "
+                    f"mode={comparison_mode} "
+                    "phase=done "
+                    f"rows={len(rows)}/{len(selected)} "
+                    f"batch={len(compiled_slots)} "
+                    f"ids={min(chunk_ids):04d}-{max(chunk_ids):04d} "
+                    f"max_steps={max(expected_steps)}",
+                    file=progress_stream,
+                    flush=True,
                 )
-                traced_failures += 1
-            rows.append(row)
 
     return rows
 
@@ -886,6 +1025,42 @@ def print_divergence_rows(
     return count
 
 
+def print_diagnostic_summary(
+    rows: Sequence[NeuralDeclarativeDiagnosticRow],
+    *,
+    mode: str,
+    stream: TextIO = sys.stderr,
+) -> dict[str, int]:
+    """Print a machine-readable pass-rate summary for one diagnostic slice."""
+
+    ok_statuses = {"ok"} if mode == "final-output" else {"strict-ok"}
+    ok = sum(1 for row in rows if row.status in ok_statuses)
+    errors = sum(1 for row in rows if row.status == "error")
+    suite_mismatches = sum(
+        1 for row in rows if row.status == "suite/declarative-mismatch"
+    )
+    divergences = len(rows) - ok - errors - suite_mismatches
+    summary = {
+        "selected": len(rows),
+        "ok": ok,
+        "divergences": divergences,
+        "errors": errors,
+        "suite_mismatches": suite_mismatches,
+    }
+    print(
+        "[1096-summary] "
+        f"mode={mode} "
+        f"selected={summary['selected']} "
+        f"ok={summary['ok']} "
+        f"divergences={summary['divergences']} "
+        f"errors={summary['errors']} "
+        f"suite_mismatches={summary['suite_mismatches']}",
+        file=stream,
+        flush=True,
+    )
+    return summary
+
+
 def test_diagnostic_row_format_is_concise():
     row = NeuralDeclarativeDiagnosticRow(
         test_idx=7,
@@ -899,11 +1074,30 @@ def test_diagnostic_row_format_is_concise():
     text = row.format()
 
     assert "id=0007" in text
+    assert "mode=final-output" in text
     assert "status=neural-divergence" in text
     assert "suite_decl=match" in text
     assert "decl=768" in text
     assert "decl_steps=5" in text
     assert "neural=512" in text
+
+
+def test_strict_first_safe_token_mode_reports_separate_status():
+    row = NeuralDeclarativeDiagnosticRow(
+        test_idx=7,
+        description="large ADD carry case",
+        suite_expected=768,
+        declarative_exit=768,
+        declarative_steps=5,
+        neural_exit=None,
+        comparison_mode="strict-first-safe-token",
+    )
+
+    text = row.format()
+
+    assert row.status == "strict-first-safe-token-divergence"
+    assert "mode=strict-first-safe-token" in text
+    assert "status=strict-first-safe-token-divergence" in text
 
 
 def test_first_token_divergence_reports_symbolic_step_slot():
@@ -986,6 +1180,169 @@ def test_row_format_includes_token_and_residual_diagnostics():
     assert "block=24 layer=15" in text
 
 
+def test_diagnostic_summary_counts_final_and_strict_modes_separately(capsys):
+    final_rows = [
+        NeuralDeclarativeDiagnosticRow(0, "ok", 1, 1, 1, 1),
+        NeuralDeclarativeDiagnosticRow(1, "bad", 1, 1, 1, 2),
+    ]
+    strict_rows = [
+        NeuralDeclarativeDiagnosticRow(
+            0,
+            "strict ok",
+            1,
+            1,
+            1,
+            1,
+            comparison_mode="strict-first-safe-token",
+        ),
+        NeuralDeclarativeDiagnosticRow(
+            1,
+            "strict bad",
+            1,
+            1,
+            1,
+            None,
+            comparison_mode="strict-first-safe-token",
+        ),
+    ]
+
+    final = print_diagnostic_summary(
+        final_rows,
+        mode="final-output",
+        stream=sys.stderr,
+    )
+    strict = print_diagnostic_summary(
+        strict_rows,
+        mode="strict-first-safe-token",
+        stream=sys.stderr,
+    )
+
+    captured = capsys.readouterr()
+    assert final == {
+        "selected": 2,
+        "ok": 1,
+        "divergences": 1,
+        "errors": 0,
+        "suite_mismatches": 0,
+    }
+    assert strict == final
+    assert "[1096-summary] mode=final-output" in captured.err
+    assert "[1096-summary] mode=strict-first-safe-token" in captured.err
+
+
+def test_sorted_batching_uses_step_count_and_reports_progress(monkeypatch, capsys):
+    selected = [
+        (0, "return 10;", 10, "ten steps"),
+        (1, "return 30;", 30, "thirty steps"),
+        (2, "return 20;", 20, "twenty steps"),
+    ]
+    steps_by_expected = {10: 10, 20: 20, 30: 30}
+
+    class FakeRunner:
+        calls = []
+
+        def __init__(self, *, max_seq_len):
+            self.max_seq_len = max_seq_len
+
+        def run_batch(
+            self,
+            bytecodes,
+            *,
+            data_list,
+            max_steps,
+            expected_steps_list,
+            max_context_window,
+            spec_k,
+        ):
+            FakeRunner.calls.append(list(expected_steps_list))
+            return [
+                ("", bytecode[0])
+                for bytecode in bytecodes
+            ]
+
+    def fake_compile(source):
+        expected = int(source.removeprefix("return ").removesuffix(";"))
+        return [expected], []
+
+    def fake_oracle(bytecode, data, *, suite_expected, label, max_steps):
+        return types.SimpleNamespace(
+            exit_code=suite_expected,
+            steps=steps_by_expected[suite_expected],
+            error=None,
+        )
+
+    fake_module = types.SimpleNamespace(BatchedPureNeuralRunner=FakeRunner)
+    monkeypatch.setitem(sys.modules, "neural_vm.batched_pure_neural", fake_module)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_selected_1096_tests",
+        lambda *, offset, limit: selected,
+    )
+    monkeypatch.setattr(sys.modules[__name__], "compile_c", fake_compile)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "declarative_oracle_for_program",
+        fake_oracle,
+    )
+
+    rows = run_1096_neural_declarative_diagnostic(
+        offset=0,
+        limit=3,
+        chunk_size=2,
+        sort_by_steps=True,
+        progress_stream=sys.stderr,
+        comparison_mode="final-output",
+    )
+
+    captured = capsys.readouterr()
+    assert [row.test_idx for row in rows] == [1, 2, 0]
+    assert FakeRunner.calls == [[30, 20], [10]]
+    assert (
+        "mode=final-output phase=start rows=0/3 batch=2 "
+        "ids=0001-0002 max_steps=30"
+    ) in captured.err
+    assert (
+        "mode=final-output phase=done rows=2/3 batch=2 "
+        "ids=0001-0002 max_steps=30"
+    ) in captured.err
+
+
+def test_band_contract_report_for_symbolic_expected_token_is_actionable():
+    import torch
+
+    class FakeModel:
+        dim_positions = {"OUTPUT_LO": 0, "OUTPUT_HI": 16}
+
+    vec = torch.zeros(32)
+    vec[0x5] = 0.46
+    vec[0x3] = 0.42
+    vec[16 + 0x0] = 1.0
+    vec[16 + 0x8] = 0.7
+
+    report = _band_contract_report_for_token(
+        vec,
+        FakeModel(),
+        0x05,
+        include_projection=True,
+        min_active_margin=0.25,
+        max_inactive_value=0.2,
+    )
+
+    assert report is not None
+    assert not report.ok
+    metadata = report.as_dict()
+    assert metadata["expected_byte"] == 0x05
+    assert {
+        violation["kind"]
+        for violation in metadata["violations"]
+    } == {"active_margin_low", "inactive_too_high"}
+    assert any(
+        violation["band_base"] == "OUTPUT_LO" and violation["index"] == 5
+        for violation in metadata["violations"]
+    )
+    assert "projection_diag=" in report.format_inline()
+
+
 def test_1096_neural_declarative_diagnostic_slice():
     if os.environ.get("C4_1096_DIAG") != "1":
         pytest.skip("set C4_1096_DIAG=1 to run the neural diagnostic")
@@ -1003,6 +1360,16 @@ def test_1096_neural_declarative_diagnostic_slice():
     trace_failure_limit = _parse_trace_limit(
         os.environ.get("C4_1096_TRACE_LIMIT", "8")
     )
+    progress_stream = (
+        sys.stderr
+        if _env_flag("C4_1096_PROGRESS", False)
+        else None
+    )
+    comparison_mode = (
+        "strict-first-safe-token"
+        if _env_flag("C4_SPEC_FAIL_ON_CORRECTION", False)
+        else "final-output"
+    )
 
     rows = run_1096_neural_declarative_diagnostic(
         offset=offset,
@@ -1013,8 +1380,15 @@ def test_1096_neural_declarative_diagnostic_slice():
         model_max_seq_len=model_max_seq_len,
         trace_failures=trace_failures,
         trace_failure_limit=trace_failure_limit,
+        include_band_projection=_env_flag("C4_1096_BAND_PROJECTION_DIAG", True),
+        band_min_active_margin=_env_float("C4_1096_BAND_MIN_MARGIN", 0.5),
+        band_max_inactive_value=_env_float("C4_1096_BAND_MAX_INACTIVE", 0.2),
+        sort_by_steps=_env_flag("C4_1096_SORT_BY_STEPS", False),
+        progress_stream=progress_stream,
+        comparison_mode=comparison_mode,
     )
     divergences = print_divergence_rows(rows)
+    print_diagnostic_summary(rows, mode=comparison_mode)
 
     if os.environ.get("C4_1096_DIAG_ASSERT", "1") != "0":
         assert divergences == 0, (

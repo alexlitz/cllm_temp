@@ -499,8 +499,22 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             attn.W_q.data[base + 0, BD.OP_ENT] = non_load_suppression
             attn.W_q.data[base + 0, BD.OP_LEA] = non_load_suppression
             attn.W_q.data[base + 0, BD.OP_IMM] = non_load_suppression
+            # Preserve lookups at the exact 0xffe8 stack-top slot. This keeps
+            # ordinary IMM steps in function-call setup from going through the
+            # non-load zero sink while still excluding the adjacent 0xfff8
+            # return-address slot.
+            attn.W_q.data[base + 0, BD.MARK_STACK0] = 75000.0
+            attn.W_q.data[base + 0, BD.HAS_SE] = 75000.0
+            attn.W_q.data[base + 0, BD.ADDR_B0_LO + 8] = 75000.0
+            attn.W_q.data[base + 0, BD.ADDR_B0_HI + 14] = 75000.0
+            attn.W_q.data[base + 0, BD.ADDR_B0_HI + 15] = -100000.0
             attn.W_q.data[base + 0, BD.IS_BYTE] = -2000.0
             attn.W_q.data[base + 1, BD.IS_BYTE] = -50.0
+            attn.W_q.data[base + 1, BD.MARK_STACK0] = 50.0
+            attn.W_q.data[base + 1, BD.HAS_SE] = 50.0
+            attn.W_q.data[base + 1, BD.ADDR_B0_LO + 8] = 50.0
+            attn.W_q.data[base + 1, BD.ADDR_B0_HI + 14] = 50.0
+            attn.W_q.data[base + 1, BD.ADDR_B0_HI + 15] = -150.0
             attn.W_q.data[base + 28, BD.IS_BYTE] = -500.0
             attn.W_q.data[base + 28, BD.CONST] = -20000.0
             attn.W_q.data[base + 28, BD.MARK_AX] = 20000.0
@@ -538,11 +552,68 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
                 if row < HD:
                     attn.W_q.data[base + row, :] = 0.0
                     attn.W_k.data[base + row, :] = 0.0
+
+            # Same top-store equality as the e0 row above, but for the common
+            # one-local slot 0xffe8. At the SI/SC STACK0 marker the address is
+            # present in ADDR_B0, while EMBED still carries marker/value
+            # residue; block the historical lookup so L14's current store
+            # value remains authoritative.
+            top_store_e8_row = 60
+            if top_store_e8_row < HD:
+                row = base + top_store_e8_row
+                attn.W_q.data[row, BD.CONST] = -30000.0
+                attn.W_q.data[row, BD.MARK_STACK0] = 10000.0
+                attn.W_q.data[row, BD.MARK_SP] = -100000.0
+                attn.W_q.data[row, BD.HAS_SE] = 10000.0
+                attn.W_q.data[row, BD.MEM_STORE] = 150000.0
+                attn.W_q.data[row, BD.ADDR_B0_LO + 8] = 10000.0
+                attn.W_q.data[row, BD.ADDR_B0_HI + 14] = 10000.0
+                attn.W_q.data[row, BD.ADDR_B0_HI + 15] = -20000.0
+                attn.W_k.data[row, BD.CONST] = -20.0
+
+            # When preserving STACK0 at the one-argument call slot (0xffe8),
+            # the adjacent return-address slot (0xfff8) shares byte-0 low
+            # nibble 8 and can win by recency. Add an exact high-nibble source
+            # discriminator for this marker lookup so the e8 store is selected.
+            preserve_e8_row = 59
+            preserve_e8_s = 5000.0
+            attn.W_q.data[base + preserve_e8_row, BD.CONST] = -3.5 * preserve_e8_s
+            attn.W_q.data[base + preserve_e8_row, BD.MARK_STACK0] = preserve_e8_s
+            attn.W_q.data[base + preserve_e8_row, BD.HAS_SE] = preserve_e8_s
+            attn.W_q.data[base + preserve_e8_row, BD.ADDR_B0_LO + 8] = preserve_e8_s
+            attn.W_q.data[base + preserve_e8_row, BD.ADDR_B0_HI + 14] = preserve_e8_s
+            attn.W_q.data[base + preserve_e8_row, BD.IS_BYTE] = -4.0 * preserve_e8_s
+            attn.W_q.data[base + preserve_e8_row, BD.MEM_STORE] = -5.0 * preserve_e8_s
+            attn.W_k.data[base + preserve_e8_row, BD.ADDR_B0_LO + 8] = preserve_e8_s
+            attn.W_k.data[base + preserve_e8_row, BD.ADDR_B0_HI + 14] = preserve_e8_s
+            attn.W_k.data[base + preserve_e8_row, BD.STACK0_BYTE0] = 5.0 * preserve_e8_s
+
+            # Pop-group STACK0 marker lookups need the post-pop SP address.
+            # The marker can still carry the pre-pop byte-0 address (for
+            # example f0 while the value to reveal lives at f8), and the
+            # same L15 attention block cannot consume the head-12 correction
+            # it emits later in the block. Add a score-only row that shifts
+            # low-nibble 0 queries toward historical low-nibble 8 MEM value
+            # keys; the ordinary address rows still discriminate the high
+            # address bytes.
+            pop_low8_row = 34
+            attn.W_q.data[base + pop_low8_row, BD.CONST] = -5000.0
+            attn.W_q.data[base + pop_low8_row, BD.MARK_STACK0] = 2000.0
+            attn.W_q.data[base + pop_low8_row, BD.HAS_SE] = 1000.0
+            attn.W_q.data[base + pop_low8_row, BD.CMP + 3] = 1000.0
+            attn.W_q.data[base + pop_low8_row, BD.ADDR_B0_LO + 0] = 2000.0
+            attn.W_q.data[base + pop_low8_row, BD.ADDR_B0_LO + 8] = 1000.0
+            attn.W_q.data[base + pop_low8_row, BD.IS_BYTE] = -10000.0
+            attn.W_q.data[base + pop_low8_row, BD.MARK_SP] = -10000.0
+            attn.W_q.data[base + pop_low8_row, BD.MEM_STORE] = -20000.0
+            attn.W_k.data[base + pop_low8_row, BD.ADDR_B0_LO + 8] = 1000.0
         else:
             # The legacy byte-select rows for heads 1-3 target the source
             # byte behind the autoregressive query. At query byte N, logits
             # predict byte N+1, so the source must also be byte N+1.
             byte_q_flags = [None, BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]
+            attn.W_q.data[base + 0, BD.MARK_STACK0] = -100000.0
+            attn.W_q.data[base + 0, BD.MARK_SP] = -100000.0
             attn.W_q.data[base + 28, BD.CONST] = -20000.0
             attn.W_q.data[base + 28, byte_q_flags[head]] = 20000.0
             for dim in (BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3,
@@ -676,6 +747,36 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
         attn.W_q.data[base + sp_byte_blocker, BD.IS_BYTE] = 0.0
         attn.W_k.data[base + sp_byte_blocker, BD.CONST] = -20.0
 
+        # PC value bytes are produced by the control-flow path, not by memory
+        # lookup. Branch targets can carry address-like residue that otherwise
+        # makes L15 copy PC byte0 into the upper PC bytes.
+        pc_byte_blocker = 35
+        attn.W_q.data[base + pc_byte_blocker, BD.H1 + pc_i] = 100000.0
+        attn.W_q.data[base + pc_byte_blocker, BD.IS_BYTE] = 0.0
+        attn.W_k.data[base + pc_byte_blocker, BD.CONST] = -20.0
+        if head == 0:
+            # Binary-pop steps whose pre-pop SP is f8 reveal the empty stack
+            # slot at 0x10000.  The STACK0 marker still carries the pre-pop
+            # f8 address at L15, so do not let it read the just-popped value.
+            attn.W_q.data[base + pc_byte_blocker, BD.MARK_STACK0] = 10000.0
+            attn.W_q.data[base + pc_byte_blocker, BD.HAS_SE] = 10000.0
+            attn.W_q.data[base + pc_byte_blocker, BD.CMP + 3] = 10000.0
+            attn.W_q.data[base + pc_byte_blocker, BD.ADDR_B0_LO + 8] = 10000.0
+            attn.W_q.data[base + pc_byte_blocker, BD.ADDR_B0_HI + 15] = 10000.0
+
+        # MEM address bytes are being generated by L14/L16, not loaded from
+        # historical memory.  The autoregressive query for MEM_addr{N+1} sits
+        # on MEM_addrN, which carries H1[MEM] + IS_BYTE + BYTE_INDEX_N but
+        # not MARK_MEM/MEM_STORE.  Block the corresponding byte heads before
+        # stale MEM values can project into OUTPUT_LO/HI.
+        mem_addr_byte_blocker = 36
+        if head in (1, 2, 3):
+            mem_addr_block_s = 100000.0
+            attn.W_q.data[base + mem_addr_byte_blocker, BD.H1 + mem_i] = (
+                mem_addr_block_s
+            )
+            attn.W_k.data[base + mem_addr_byte_blocker, BD.CONST] = -20.0
+
         # STACK0 marker queries are memory lookups only for pop-group ops.
         # Non-pop steps should keep the upstream STACK0 passthrough value; L15
         # can otherwise read a stale historical zero through partial top-store
@@ -701,6 +802,16 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             attn.W_q.data[
                 base + nonpop_stack0_marker_blocker, BD.OP_LC_RELAY
             ] = -60000.0
+            # IMM and other non-pop preservers can still need to reveal the
+            # already-stored stack top. At the common one-argument call slot
+            # 0xffe8, let the ordinary address-matched lookup rows compete
+            # instead of forcing the softmax1 zero sink.
+            attn.W_q.data[
+                base + nonpop_stack0_marker_blocker, BD.ADDR_B0_LO + 8
+            ] = -40000.0
+            attn.W_q.data[
+                base + nonpop_stack0_marker_blocker, BD.ADDR_B0_HI + 14
+            ] = -30000.0
             attn.W_k.data[
                 base + nonpop_stack0_marker_blocker, BD.CONST
             ] = -20.0
@@ -710,7 +821,7 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             attn.W_q.data[row, BD.EMBED_LO + 8] = top_store_e8_from_e0_s
             attn.W_q.data[row, BD.EMBED_HI + 14] = top_store_e8_from_e0_s
             attn.W_q.data[row, BD.ADDR_B0_LO + 0] = top_store_e8_from_e0_s
-            attn.W_q.data[row, BD.ADDR_B0_HI + 14] = top_store_e8_from_e0_s
+            attn.W_q.data[row, BD.ADDR_B0_HI + 14] = -2.0 * top_store_e8_from_e0_s
 
         # A load-only source gate must not be the thing that keeps L15 quiet
         # during current store generation. Add an explicit current-MEM query

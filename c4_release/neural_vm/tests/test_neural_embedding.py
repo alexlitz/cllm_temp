@@ -9,7 +9,35 @@ import unittest
 import torch
 from neural_vm.neural_embedding import NeuralVMEmbedding
 from neural_vm.embedding import Opcode
+from neural_vm.constants import INSTR_WIDTH, PC_OFFSET
 from neural_vm.vm_step import _SetDim, Token
+
+
+def _expected_code_addr(pos):
+    seq_pos = pos - 1
+    byte_offset = seq_pos % 8
+    if seq_pos < 0 or byte_offset >= 5:
+        return None
+    return (seq_pos // 8) * INSTR_WIDTH + PC_OFFSET + byte_offset
+
+
+def _assert_addr_key(testcase, x, batch, pos):
+    addr = _expected_code_addr(pos)
+    testcase.assertIsNotNone(addr)
+    BD = _SetDim
+    testcase.assertAlmostEqual(
+        x[batch, pos, BD.ADDR_KEY + (addr & 0xF)].item(), 1.0, places=6
+    )
+    testcase.assertAlmostEqual(
+        x[batch, pos, BD.ADDR_KEY + 16 + ((addr >> 4) & 0xF)].item(),
+        1.0,
+        places=6,
+    )
+    testcase.assertAlmostEqual(
+        x[batch, pos, BD.ADDR_KEY + 32 + ((addr >> 8) & 0xF)].item(),
+        1.0,
+        places=6,
+    )
 
 
 class TestNeuralEmbedding(unittest.TestCase):
@@ -28,27 +56,12 @@ class TestNeuralEmbedding(unittest.TestCase):
 
         # Create embedding
         embed = NeuralVMEmbedding(272, 512)
+        embed.embed.weight.data.zero_()
         x = embed(token_ids)
 
-        BD = _SetDim
-
-        # Verify byte at position 1 has addr=0
-        # lo=0, hi=0, top=0
-        self.assertAlmostEqual(x[0, 1, BD.ADDR_KEY + 0].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 1, BD.ADDR_KEY + 16 + 0].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 1, BD.ADDR_KEY + 32 + 0].item(), 1.0, places=6)
-
-        # Verify byte at position 2 has addr=1
-        # lo=1, hi=0, top=0
-        self.assertAlmostEqual(x[0, 2, BD.ADDR_KEY + 1].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 2, BD.ADDR_KEY + 16 + 0].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 2, BD.ADDR_KEY + 32 + 0].item(), 1.0, places=6)
-
-        # Verify byte at position 3 has addr=2
-        # lo=2, hi=0, top=0
-        self.assertAlmostEqual(x[0, 3, BD.ADDR_KEY + 2].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 3, BD.ADDR_KEY + 16 + 0].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 3, BD.ADDR_KEY + 32 + 0].item(), 1.0, places=6)
+        _assert_addr_key(self, x, 0, 1)
+        _assert_addr_key(self, x, 0, 2)
+        _assert_addr_key(self, x, 0, 3)
 
     def test_addr_key_high_address(self):
         """Test ADDR_KEY computation for higher addresses (multiple nibbles)."""
@@ -58,13 +71,15 @@ class TestNeuralEmbedding(unittest.TestCase):
         token_ids = torch.tensor([code_bytes])
 
         embed = NeuralVMEmbedding(272, 512)
+        embed.embed.weight.data.zero_()
         x = embed(token_ids)
 
         BD = _SetDim
 
-        # Byte at position 291 (index 1+291) has addr=291=0x123
+        # Byte at position 291 is PC-aligned by instruction slot.
         pos = 1 + 290  # Position of byte at addr=290=0x122
-        addr = 290
+        addr = _expected_code_addr(pos)
+        self.assertIsNotNone(addr)
         lo = addr & 0xF  # 2
         hi = (addr >> 4) & 0xF  # 2
         top = (addr >> 8) & 0xF  # 1
@@ -84,26 +99,11 @@ class TestNeuralEmbedding(unittest.TestCase):
         ]])
 
         embed = NeuralVMEmbedding(272, 512)
+        embed.embed.weight.data.zero_()
         x = embed(token_ids)
 
-        BD = _SetDim
-
-        # Position 1 (byte 0x01) should have ADDR_KEY set to 1.0 at addr=0
-        # addr=0: lo=0, hi=0, top=0
-        self.assertAlmostEqual(x[0, 1, BD.ADDR_KEY + 0].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 1, BD.ADDR_KEY + 16 + 0].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 1, BD.ADDR_KEY + 32 + 0].item(), 1.0, places=6)
-
-        # Position 2 (STEP_END) should NOT get ADDR_KEY modified (stays at embedding values)
-        # We can't check for 0.0 because embedding has random values
-        # Instead we check position 3 gets the right address
-
-        # Position 3 (byte 0x02) should have ADDR_KEY set to 1.0 at addr=2
-        # Address is based on position: addr = i - cs_pos - 1 = 3 - 0 - 1 = 2
-        # addr=2: lo=2, hi=0, top=0
-        self.assertAlmostEqual(x[0, 3, BD.ADDR_KEY + 2].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 3, BD.ADDR_KEY + 16 + 0].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 3, BD.ADDR_KEY + 32 + 0].item(), 1.0, places=6)
+        _assert_addr_key(self, x, 0, 1)
+        _assert_addr_key(self, x, 0, 3)
 
     def test_mem_store_injection(self):
         """Test MEM_STORE injection on historical MEM markers."""
@@ -156,6 +156,52 @@ class TestNeuralEmbedding(unittest.TestCase):
                            x_with_history[0, 0, BD.MEM_STORE].item())
         self.assertAlmostEqual(x_with_history[0, 0, BD.MEM_STORE].item(), 1.0, places=6)
 
+    def test_mem_store_exact_positions_mark_tracked_rows_without_history_end(self):
+        """Exact retained-store positions should be authoritative per row."""
+        token_ids = torch.tensor([[
+            Token.MEM, 0x00, 0x00, 0x00, 0x00,
+            Token.STEP_END,
+            Token.MEM, 0x00, 0x00, 0x00, 0x00,
+        ]])
+
+        embed = NeuralVMEmbedding(272, 512)
+        embed.embed.weight.data.zero_()
+        embed.set_mem_store_positions([[6]])
+
+        x = embed(token_ids)
+
+        BD = _SetDim
+        self.assertEqual(x[0, 0, BD.MEM_STORE].item(), 0.0)
+        self.assertEqual(x[0, 0, BD.MEM_ADDR_SRC].item(), 0.0)
+        self.assertEqual(x[0, 6, BD.MEM_STORE].item(), 1.0)
+        self.assertEqual(x[0, 6, BD.MEM_ADDR_SRC].item(), 1.0)
+
+    def test_mem_store_exact_positions_are_batch_local(self):
+        token_ids = torch.tensor([
+            [
+                Token.MEM, 0x00, 0x00, 0x00, 0x00,
+                Token.STEP_END,
+                Token.MEM, 0x00, 0x00, 0x00, 0x00,
+            ],
+            [
+                Token.MEM, 0x00, 0x00, 0x00, 0x00,
+                Token.STEP_END,
+                Token.MEM, 0x00, 0x00, 0x00, 0x00,
+            ],
+        ])
+
+        embed = NeuralVMEmbedding(272, 512)
+        embed.embed.weight.data.zero_()
+        embed.set_mem_store_positions([[0], [6]])
+
+        x = embed(token_ids)
+
+        BD = _SetDim
+        self.assertEqual(x[0, 0, BD.MEM_STORE].item(), 1.0)
+        self.assertEqual(x[0, 6, BD.MEM_STORE].item(), 0.0)
+        self.assertEqual(x[1, 0, BD.MEM_STORE].item(), 0.0)
+        self.assertEqual(x[1, 6, BD.MEM_STORE].item(), 1.0)
+
     def test_full_embedding_realistic_program(self):
         """Test complete embedding with realistic program tokens."""
         # Build realistic context: CODE + DATA + initial state
@@ -175,19 +221,11 @@ class TestNeuralEmbedding(unittest.TestCase):
         ]])
 
         embed = NeuralVMEmbedding(272, 512)
+        embed.embed.weight.data.zero_()
         x = embed(token_ids)
 
-        BD = _SetDim
-
-        # Verify code bytes have ADDR_KEY
-        # Position 1 (IMM opcode) should have addr=0
-        self.assertAlmostEqual(x[0, 1, BD.ADDR_KEY + 0].item(), 1.0, places=6)
-
-        # Position 2 (0x2A) should have addr=1
-        self.assertAlmostEqual(x[0, 2, BD.ADDR_KEY + 1].item(), 1.0, places=6)
-
-        # Position 6 (EXIT) should have addr=5
-        self.assertAlmostEqual(x[0, 6, BD.ADDR_KEY + 5].item(), 1.0, places=6)
+        _assert_addr_key(self, x, 0, 1)
+        _assert_addr_key(self, x, 0, 2)
 
         # Verify embedding shape (40 tokens total)
         self.assertEqual(x.shape, (1, 40, 512))
@@ -215,23 +253,18 @@ class TestNeuralEmbedding(unittest.TestCase):
 
         # _add_code_addr_keys
         for b in range(B):
-            cs_pos = None
             for i in range(S):
-                tok = token_ids[b, i].item()
-                if tok == Token.CODE_START:
-                    cs_pos = i
-                elif tok == Token.CODE_END:
+                if token_ids[b, i].item() == Token.CODE_END:
                     break
-                elif cs_pos is not None and tok < 256:
-                    addr = i - cs_pos - 1
-                    if addr < 0:
-                        continue
-                    lo = addr & 0xF
-                    hi = (addr >> 4) & 0xF
-                    top = (addr >> 8) & 0xF
-                    x_old[b, i, BD.ADDR_KEY + lo] = 1.0
-                    x_old[b, i, BD.ADDR_KEY + 16 + hi] = 1.0
-                    x_old[b, i, BD.ADDR_KEY + 32 + top] = 1.0
+                addr = _expected_code_addr(i)
+                if addr is None:
+                    continue
+                lo = addr & 0xF
+                hi = (addr >> 4) & 0xF
+                top = (addr >> 8) & 0xF
+                x_old[b, i, BD.ADDR_KEY + lo] += 1.0
+                x_old[b, i, BD.ADDR_KEY + 16 + hi] += 1.0
+                x_old[b, i, BD.ADDR_KEY + 32 + top] += 1.0
 
         # New approach: NeuralVMEmbedding
         embed_new = NeuralVMEmbedding(272, 512)
@@ -251,17 +284,13 @@ class TestNeuralEmbedding(unittest.TestCase):
         ])
 
         embed = NeuralVMEmbedding(272, 512)
+        embed.embed.weight.data.zero_()
         x = embed(token_ids)
 
-        BD = _SetDim
-
-        # Verify first batch element
-        self.assertAlmostEqual(x[0, 1, BD.ADDR_KEY + 0].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[0, 2, BD.ADDR_KEY + 1].item(), 1.0, places=6)
-
-        # Verify second batch element
-        self.assertAlmostEqual(x[1, 1, BD.ADDR_KEY + 0].item(), 1.0, places=6)
-        self.assertAlmostEqual(x[1, 2, BD.ADDR_KEY + 1].item(), 1.0, places=6)
+        _assert_addr_key(self, x, 0, 1)
+        _assert_addr_key(self, x, 0, 2)
+        _assert_addr_key(self, x, 1, 1)
+        _assert_addr_key(self, x, 1, 2)
 
         # Verify shape
         self.assertEqual(x.shape, (2, 4, 512))

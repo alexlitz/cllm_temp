@@ -3,6 +3,7 @@
 import os
 import sys
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,6 +15,7 @@ from neural_vm.unified_compiler.ops.l10_ops import (  # noqa: E402
     _layer10_stack0_byte_relay_head_spec,
     _layer10_stack0_persistence_head_spec,
     make_l10_post_ops_combined,
+    _suppress_ffn_on_step_boundary,
     _tail_bit32_result_correction_rules,
 )
 from neural_vm.vm_step import (  # noqa: E402
@@ -40,6 +42,23 @@ def _tail_rules_ir(*names: str) -> CompilerIR:
     ir = CompilerIR()
     for name in names:
         ir.layer(0).ffn.append(_tail_rule(name))
+    return ir
+
+
+def _tail_rules_with_prefix(prefix: str):
+    rules = [
+        rule
+        for rule in _tail_bit32_result_correction_rules()
+        if rule.name.startswith(prefix)
+    ]
+    if not rules:
+        raise AssertionError(f"missing tail rules with prefix {prefix}")
+    return rules
+
+
+def _tail_prefix_ir(prefix: str) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_tail_rules_with_prefix(prefix))
     return ir
 
 
@@ -96,6 +115,17 @@ def test_l10_combined_post_ops_block_pc_byte_rows_with_negative_output_residue()
     assert abs(float(y[_SetDim.OUTPUT_HI + 0]) - 235.0) < 1e-3
 
 
+def test_step_boundary_guard_preserves_negative_structural_blockers():
+    ffn = _StubFFN(hidden_dim=1)
+    ffn.W_up[0, _SetDim.IS_BYTE] = -100_000_000.0
+    ffn.W_up[0, _SetDim.MARK_STACK0] = 100.0
+
+    _suppress_ffn_on_step_boundary(ffn, _SetDim, 100.0)
+
+    assert ffn.W_up[0, _SetDim.IS_BYTE] == -100_000_000.0
+    assert ffn.W_up[0, _SetDim.MARK_STACK0] > 100.0
+
+
 def test_l10_combined_post_ops_do_not_rerun_late_add_carry():
     ffn = _StubFFN()
     op = make_l10_post_ops_combined()
@@ -124,6 +154,32 @@ def test_l10_combined_post_ops_do_not_rerun_late_add_carry():
     assert abs(float(y[_SetDim.CARRY + 3]) - 103.5) < 1e-3
     assert abs(float(y[_SetDim.OUTPUT_LO + 0]) - 2.363e14) < 1e7
     assert abs(float(y[_SetDim.OUTPUT_LO + 3]) - 2.199e13) < 1e7
+
+
+def test_tail_mem_store_local_offset_rule_ignores_negative_output_residue():
+    rules = _tail_rules_with_prefix("tail_mem_store_addr0_e0_from_local_offset_exact")
+    ffn = _StubFFN(hidden_dim=len(rules))
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+    ir.lower_ffn(
+        ffn,
+        {name: getattr(_SetDim, name) for name in dir(_SetDim) if name.isupper()},
+        S=100.0,
+    )
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.CONST] = 1.0
+    x[..., _SetDim.IS_BYTE] = 1.0
+    x[..., _SetDim.HAS_SE] = 1.0
+    x[..., _SetDim.H1 + 1] = 1.0
+    x[..., _SetDim.OUTPUT_LO + 8] = -6.0e19
+    x[..., _SetDim.OUTPUT_HI + 14] = 1.0e20
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert torch.isfinite(y).all()
+    assert y[_SetDim.OUTPUT_LO + 8] == x[0, 0, _SetDim.OUTPUT_LO + 8]
+    assert y[_SetDim.OUTPUT_HI + 14] == x[0, 0, _SetDim.OUTPUT_HI + 14]
 
 
 def test_l10_bitwise_byte_post_op_blocks_pc_byte_span_pollution():
@@ -186,6 +242,25 @@ def test_l10_bitwise_byte_post_op_still_fires_on_bitwise_row():
     assert y[_SetDim.OUTPUT_LO + 3] < -100.0
 
 
+def test_l10_bitwise_byte_post_op_allows_temp10_on_bitwise_row():
+    ffn = BitwiseBytePropagationPostOp(512, 100.0)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.CONST] = 1.0
+    x[..., _SetDim.IS_BYTE] = 1.0
+    x[..., _SetDim.H1 + 1] = 1.0
+    x[..., _SetDim.BYTE_INDEX_0] = 1.0
+    x[..., _SetDim.TEMP + 5] = 1.0
+    x[..., _SetDim.TEMP + 10] = 1.0
+    x[..., _SetDim.OUTPUT_LO + 0] = 2.5
+    x[..., _SetDim.ALU_LO + 15] = 2.7
+
+    y = ffn(x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 15] > 0.0
+    assert y[_SetDim.OUTPUT_LO + 0] < 2.5
+
+
 def test_l10_carry_post_op_requires_real_carry_relay():
     ffn = CarryPropagationPostOp(512, 100.0, byte_idx=0, cascade=False)
 
@@ -225,7 +300,21 @@ def test_l10_carry_post_op_still_fires_with_real_carry_relay():
 
 def test_tail_bit32_rules_all_block_pc_byte_span():
     for rule in _tail_bit32_result_correction_rules():
-        if rule.name == "tail_clear_output_after_byte3":
+        if (
+            rule.name == "tail_clear_output_after_byte3"
+            or rule.name.startswith(
+                "tail_pc_byte1_01_from_long_initial_pc_exact"
+            )
+            or rule.name.startswith(
+                "tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact"
+            )
+            or rule.name.startswith(
+                "tail_pc_byte0_12_from_initial_jmp_exact"
+            )
+            or rule.name.startswith(
+                "tail_pc_byte0_1a_from_taken_branch_index3_exact"
+            )
+        ):
             continue
         assert any(
             term.dim.name == "H1"
@@ -306,6 +395,10 @@ def test_layer10_stack0_store_route_reads_current_ax_bytes():
         for weight in _projection_weights(spec, "q", 11, _SetDim.MEM_STORE)
     )
     assert any(
+        weight < 0.0
+        for weight in _projection_weights(spec, "q", 11, _SetDim.MEM_ADDR_SRC)
+    )
+    assert any(
         weight > 0.0
         for weight in _projection_weights(spec, "q", 11, _SetDim.CMP + 3)
     )
@@ -317,6 +410,56 @@ def test_layer10_stack0_store_route_reads_current_ax_bytes():
         weight < 0.0
         for weight in _projection_weights(spec, "q", 11, _SetDim.CONST)
     )
+
+
+def test_layer10_stack0_store_route_dominates_partial_mem_store_residue():
+    spec = _layer10_stack0_persistence_head_spec(_SetDim, 100.0)
+
+    state = {
+        _SetDim.CONST: 1.0,
+        _SetDim.HAS_SE: 0.997859,
+        _SetDim.CMP + 3: 4.0,
+        _SetDim.MEM_STORE: 1.52938,
+        _SetDim.STACK0_BYTE0: 0.973406,
+        _SetDim.STACK0_BYTE1: 0.0132971,
+    }
+
+    def q_score(slot: int) -> float:
+        return sum(
+            write.weight * state.get(write.dim, 0.0)
+            for write in spec.q
+            if write.slot == slot
+        )
+
+    # Predicting STACK0 byte 1 happens at the STACK0 byte-0 position.  On SI/SC
+    # store rows the AX-byte store route must beat ordinary STACK0 persistence,
+    # otherwise the previous address byte leaks into STACK0 byte 1.
+    assert q_score(8) > q_score(4)
+
+
+def test_layer10_stack0_store_route_blocks_stack_source_residue():
+    spec = _layer10_stack0_persistence_head_spec(_SetDim, 100.0)
+
+    state = {
+        _SetDim.CONST: 1.0,
+        _SetDim.HAS_SE: 0.99794,
+        _SetDim.CMP + 3: 4.0,
+        _SetDim.MEM_STORE: 0.40725404,
+        _SetDim.MEM_ADDR_SRC: 0.40725404,
+        _SetDim.MARK_STACK0: 1.0,
+    }
+
+    def q_score(slot: int) -> float:
+        return sum(
+            write.weight * state.get(write.dim, 0.0)
+            for write in spec.q
+            if write.slot == slot
+        )
+
+    assert q_score(11) < 0.0
+
+    state[_SetDim.MEM_ADDR_SRC] = 0.0
+    assert q_score(11) > 0.0
 
 
 def test_layer10_ax_byte_passthrough_blocks_binary_result_rows():
@@ -426,6 +569,24 @@ def test_tail_bp_byte2_preserve_still_fires_on_bp_byte1():
 
     assert out["OUTPUT_LO+1"] > 0.0
     assert out["OUTPUT_HI+0"] > 0.0
+
+
+def test_tail_bp_byte2_preserve_tolerates_adjacent_index_residue():
+    ir = _single_rule_ir(_tail_rule("tail_bp_byte2_preserve_01"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9982135891914368,
+        "H1+3": 1.0,
+        "BYTE_INDEX_1": 0.9701374769210815,
+        "BYTE_INDEX_2": 0.013297064229846,
+        "OUTPUT_LO+1": 2.0,
+        "OUTPUT_LO+0": 2.5493369102478027,
+        "OUTPUT_HI+0": 4.549336910247803,
+    })
+
+    assert out["OUTPUT_LO+1"] > 2.0
+    assert out["OUTPUT_HI+0"] > 4.549336910247803
 
 
 def test_tail_bp_byte2_preserve_blocks_lea_marker_row():
@@ -627,6 +788,28 @@ def test_tail_ax_add_byte1_high_zero_blocks_lea_address_row():
     assert out.get("OUTPUT_HI+0", 0.0) == 0.0
 
 
+def test_tail_ax_add_byte1_high_zero_blocks_mul_owned_byte_row():
+    ir = _tail_prefix_ir("tail_ax_add_byte1_hi_zero")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9980560541152954,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "BYTE_INDEX_1": 0.0132971,
+        "TEMP+8": 0.3048,
+        "TEMP+10": 0.996,
+        "ALU_HI+0": 6.237,
+        "AX_CARRY_HI+0": 6.237,
+        "OUTPUT_LO+1": 40.0,
+        "OUTPUT_HI+0": 2.9402759,
+        "OUTPUT_HI+1": 40.0,
+    })
+
+    assert out["OUTPUT_HI+0"] == pytest.approx(2.9402759)
+    assert out["OUTPUT_HI+1"] == pytest.approx(40.0)
+
+
 def test_tail_ax_lea_local_addr_byte1_preserves_ff_after_e8():
     ir = _single_rule_ir(_tail_rule("tail_ax_lea_local_addr_byte1_ff_after_e8"))
 
@@ -753,6 +936,22 @@ def test_tail_cmp_le_eq_prefix_false_preserves_equal_true():
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
+def test_tail_cmp_le_eq_prefix_false_preserves_lt_true_at_marker():
+    ir = _single_rule_ir(_tail_rule("tail_cmp_le_eq_prefix_false_00"))
+
+    out = ir.symbolic_ffn({
+        "MARK_AX": 1.0,
+        "OP_LE": 5.0,
+        "CMP+0": 1.0,
+        "OUTPUT_LO+1": 36.0,
+        "OUTPUT_HI+0": 19.0,
+    })
+
+    assert out["OUTPUT_LO+1"] == 36.0
+    assert out["OUTPUT_HI+0"] == 19.0
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
 def test_tail_does_not_emit_ax_add_carry_rules():
     names = {rule.name for rule in _tail_bit32_result_correction_rules()}
 
@@ -830,6 +1029,1759 @@ def test_tail_stack0_pop_marker_zero_still_fires_without_mem_store():
     assert out["OUTPUT_HI+13"] < 0.0
 
 
+def test_tail_mem_store_addr0_f8_exact_overrides_stale_zero_lanes():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_f8_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9961883425712585,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+2": 0.9940742254257202,
+        "OUTPUT_LO+0": 2.921051025390625,
+        "OUTPUT_LO+8": 0.9968036413192749,
+        "OUTPUT_HI+0": 2.9213929176330566,
+        "OUTPUT_HI+15": 0.9968036413192749,
+    })
+
+    assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"] + 1000.0
+    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"] + 1000.0
+
+
+def test_tail_mem_store_addr0_f8_exact_requires_staged_low_eight():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_f8_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9980560541152954,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+14": 0.9937615394592285,
+        "OUTPUT_LO+0": 3.8322701454162598,
+        "OUTPUT_HI+0": 3.503345012664795,
+        "OUTPUT_HI+15": 0.9901931285858154,
+    })
+
+    assert out["OUTPUT_LO+0"] == 3.8322701454162598
+    assert out["OUTPUT_HI+0"] == 3.503345012664795
+    assert out["OUTPUT_HI+15"] == 0.9901931285858154
+
+
+def test_tail_mem_store_addr0_f8_exact_blocks_second_push_residue():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_f8_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9980560541152954,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "OUTPUT_LO+0": 3.8322701454162598,
+        "OUTPUT_LO+8": 219616.703125,
+        "OUTPUT_LO+14": 0.6614807844161987,
+        "ALU_LO+14": 0.9937615394592285,
+        "OUTPUT_HI+15": 0.9901931285858154,
+    })
+
+    assert out["OUTPUT_LO+8"] == 219616.703125
+    assert out["OUTPUT_HI+15"] == 0.9901931285858154
+
+
+def test_tail_mem_store_addr0_f8_exact_blocks_negative_inactive_alu_lane():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_f8_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9982885122299194,
+        "H1+4": 1.0,
+        "MEM_STORE": 4.0,
+        "CMP+3": 2.996619462966919,
+        "ALU_LO+2": 0.00031229533487930894,
+        "ALU_LO+14": -247.27655029296875,
+        "ADDR_B0_LO+8": 0.9888219833374023,
+        "ADDR_B0_HI+14": 0.9716129302978516,
+        "OUTPUT_LO+8": 1282.8973388671875,
+        "OUTPUT_HI+14": 1361.1473388671875,
+        "OUTPUT_HI+15": -6.25,
+    })
+
+    assert out["OUTPUT_LO+8"] == 1282.8973388671875
+    assert out["OUTPUT_HI+14"] == 1361.1473388671875
+    assert out["OUTPUT_HI+15"] == -6.25
+
+
+def test_tail_mem_store_addr1_ff_from_stack_store_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_mem_store_addr1_ff_from_stack_store_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+4": 1.0,
+        "H1+11": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "MEM_STORE": 2.0,
+        "MEM_ADDR_SRC": 1.0,
+        "CLEAN_EMBED_LO+8": 1.0,
+        "CLEAN_EMBED_HI+15": 1.0,
+        "OUTPUT_LO+0": 3.78348,
+        "OUTPUT_HI+0": 3.78348,
+    })
+
+    assert out["OUTPUT_LO+15"] == pytest.approx(500.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(500.0)
+    for lane in range(16):
+        if lane != 15:
+            assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
+            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_mem_store_addr1_ff_from_stack_store_blocks_non_stack_addr0():
+    ir = _tail_prefix_ir("tail_mem_store_addr1_ff_from_stack_store_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+4": 1.0,
+        "H1+11": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "MEM_STORE": 2.0,
+        "MEM_ADDR_SRC": 1.0,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+14": 1.0,
+        "OUTPUT_LO+0": 3.78348,
+        "OUTPUT_HI+0": 3.78348,
+    })
+
+    assert out["OUTPUT_LO+0"] == 3.78348
+    assert out["OUTPUT_HI+0"] == 3.78348
+    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+
+
+def test_tail_mem_store_addr0_f8_initial_jsr_exacts_nibbles():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_f8_initial_jsr_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "H1+4": 1.0,
+        "H1+11": 1.0,
+        "MEM_STORE": 1.9999995231628418,
+        "OP_JSR": 12.491547584533691,
+        "CMP+4": 1.497720718383789,
+        "OUTPUT_LO+8": -839271360.0,
+        "OUTPUT_HI+15": -14807114752.0,
+        "OUTPUT_HI+0": 881834262528.0,
+    })
+
+    assert out["OUTPUT_LO+8"] > 1_000_000_000.0
+    assert out["OUTPUT_HI+15"] > 1_000_000_000.0
+    assert out["OUTPUT_HI+0"] < 0.0
+
+
+def test_tail_mem_store_addr0_f8_initial_jsr_requires_first_step():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_f8_initial_jsr_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 1.0,
+        "H1+4": 1.0,
+        "H1+11": 1.0,
+        "MEM_STORE": 1.9999995231628418,
+        "OP_JSR": 12.491547584533691,
+        "CMP+4": 1.497720718383789,
+        "OUTPUT_LO+8": 36939.66015625,
+        "OUTPUT_HI+0": 4668.30078125,
+    })
+
+    assert out["OUTPUT_LO+8"] == 36939.66015625
+    assert out["OUTPUT_HI+0"] == 4668.30078125
+
+
+def test_tail_mem_store_addr0_initial_jsr_blocks_local_addr_collisions():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "H1+4": 1.0,
+        "H1+11": 1.0,
+        "MEM_STORE": 2.0,
+        "OP_JSR": 12.491547584533691,
+        "CMP+4": 1.497720718383789,
+        "ALU_LO+0": -109.212,
+        "ALU_LO+7": -109.915,
+        "ALU_LO+8": -109.915,
+        "ALU_LO+10": -109.866,
+        "ALU_LO+14": -109.75,
+        "OUTPUT_LO+0": -1717824640.0,
+        "OUTPUT_LO+8": 1717824896.0,
+        "OUTPUT_HI+0": -25613821952.0,
+        "OUTPUT_HI+14": 1706504832.0,
+        "OUTPUT_HI+15": 1722568704.0,
+    })
+
+    assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"]
+    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+14"]
+
+
+def test_tail_mem_store_addr0_f0_exact_overrides_second_push_residue():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_f0_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9980560541152954,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "OUTPUT_LO+0": 3.8322701454162598,
+        "OUTPUT_LO+8": 219616.703125,
+        "OUTPUT_LO+14": 0.6614807844161987,
+        "ALU_LO+14": 0.9937615394592285,
+        "OUTPUT_HI+0": 3.503345012664795,
+        "OUTPUT_HI+15": 0.9901931285858154,
+    })
+
+    assert out["OUTPUT_LO+0"] > out["OUTPUT_LO+8"] + 1000.0
+    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"] + 1000.0
+
+
+def test_tail_mem_store_addr0_f0_exact_blocks_jsr_initial_store():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_f0_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "H1+4": 1.0,
+        "MEM_STORE": 4.0,
+        "OP_JSR": 12.491548538208008,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+14": 16377.4033203125,
+        "OUTPUT_LO+8": 19929.138671875,
+        "OUTPUT_HI+15": 19874.861328125,
+    })
+
+    assert out["OUTPUT_LO+8"] == 19929.138671875
+    assert out["OUTPUT_HI+15"] == 19874.861328125
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
+def test_tail_mem_store_addr0_00_from_global_exacts_nibbles():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_00_from_global_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.998,
+        "H1+4": 1.0,
+        "MEM_STORE": 4.0,
+        "MEM_ADDR_SRC": 4.0,
+        "OUTPUT_LO+0": 13.9,
+        "OUTPUT_HI+0": 16.9,
+    })
+
+    assert out["OUTPUT_LO+0"] > 1_000_000.0
+    assert out["OUTPUT_HI+0"] > 1_000_000.0
+    assert out["OUTPUT_LO+8"] < -1_000_000.0
+    assert out["OUTPUT_HI+15"] < -1_000_000.0
+
+
+def test_tail_mem_store_addr0_00_from_global_blocks_local_e0_shape():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_00_from_global_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.998,
+        "H1+4": 1.0,
+        "MEM_STORE": 4.0,
+        "MEM_ADDR_SRC": 4.0,
+        "OUTPUT_LO+0": 13.9,
+        "OUTPUT_HI+14": 16.9,
+    })
+
+    assert out["OUTPUT_LO+0"] == 13.9
+    assert out["OUTPUT_HI+14"] == 16.9
+    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+
+
+def test_tail_mem_store_addr0_00_from_global_blocks_psh_stack_store():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_00_from_global_exact"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.998,
+        "H1+4": 1.0,
+        "MEM_STORE": 4.0,
+        "MEM_ADDR_SRC": 4.0,
+        "PSH_AT_SP": 1.0,
+        "OUTPUT_LO+0": 13.9,
+        "OUTPUT_HI+0": 16.9,
+    })
+
+    assert out["OUTPUT_LO+0"] == 13.9
+    assert out["OUTPUT_HI+0"] == 16.9
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+
+
+def test_tail_mem_store_addr2_zero_from_global_exacts_after_addr1_residue():
+    ir = _tail_prefix_ir("tail_mem_store_addr2_zero_from_global_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "MEM_ADDR_SRC": 2.0,
+        "BYTE_INDEX_1": 0.97,
+        "OUTPUT_LO+0": 1.775,
+        "OUTPUT_LO+2": 4.669,
+        "OUTPUT_HI+0": 6.722,
+        "OUTPUT_HI+1": 1.669,
+    })
+
+    assert out["OUTPUT_LO+0"] > 100.0
+    assert out["OUTPUT_HI+0"] > 100.0
+    assert out["OUTPUT_LO+2"] == pytest.approx(0.0)
+    assert out["OUTPUT_HI+1"] == pytest.approx(0.0)
+
+
+def test_tail_mem_store_addr2_zero_from_global_blocks_addr1_row():
+    ir = _tail_prefix_ir("tail_mem_store_addr2_zero_from_global_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "MEM_ADDR_SRC": 2.0,
+        "BYTE_INDEX_0": 1.0,
+        "OUTPUT_LO+0": 1.0,
+        "OUTPUT_LO+2": 2.0,
+        "OUTPUT_HI+0": 1.0,
+    })
+
+    assert out["OUTPUT_LO+2"] == pytest.approx(2.0)
+    assert out["OUTPUT_LO+0"] == pytest.approx(1.0)
+
+
+def test_tail_mem_store_addr2_zero_from_global_blocks_local_high_byte():
+    ir = _tail_prefix_ir("tail_mem_store_addr2_zero_from_global_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "MEM_ADDR_SRC": 2.0,
+        "BYTE_INDEX_1": 1.0,
+        "OUTPUT_LO+15": 4.0,
+        "OUTPUT_HI+15": 4.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(4.0)
+
+
+def test_tail_mem_store_addr_high_zero_from_global_blocks_bp_byte3_residue():
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(
+        _tail_rules_with_prefix("tail_mem_store_addr2_zero_from_global_exact")
+    )
+    ir.layer(0).ffn.rules.extend(
+        _tail_rules_with_prefix("tail_mem_store_addr3_zero_from_global_exact")
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+3": 1.0,
+        "BYTE_INDEX_2": 1.0,
+        "OUTPUT_LO+0": 1.03e15,
+        "OUTPUT_HI+0": -6.81e15,
+        "OUTPUT_HI+1": 0.03,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(1.03e15)
+    assert out["OUTPUT_HI+0"] == pytest.approx(-6.81e15)
+    assert out["OUTPUT_HI+1"] == pytest.approx(0.03)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "byte_index"),
+    [
+        ("tail_mem_store_addr2_zero_from_global_exact", "BYTE_INDEX_1"),
+        ("tail_mem_store_addr3_zero_from_global_exact", "BYTE_INDEX_2"),
+    ],
+)
+def test_tail_mem_store_addr_high_zero_from_global_blocks_stack0_byte_rows(
+    prefix, byte_index
+):
+    ir = _tail_prefix_ir(prefix)
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "MEM_ADDR_SRC": 2.0,
+        byte_index: 1.0,
+        "STACK0_BYTE0": 1.0,
+        "OUTPUT_LO+0": 123.0,
+        "OUTPUT_HI+0": 456.0,
+        "OUTPUT_LO+15": -7.0,
+        "OUTPUT_HI+15": -8.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(123.0)
+    assert out["OUTPUT_HI+0"] == pytest.approx(456.0)
+    assert out["OUTPUT_LO+15"] == pytest.approx(-7.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(-8.0)
+
+
+def test_tail_mem_store_addr0_f8_from_mod_local_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_f8_from_mod_local_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9961883425712585,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+7": 0.9937863945960999,
+        "ALU_LO+10": 0.0,
+        "ALU_LO+14": 0.0,
+        "OUTPUT_LO+0": 2.921051025390625,
+        "OUTPUT_LO+7": 0.572,
+        "OUTPUT_LO+8": 0.9968036413192749,
+        "OUTPUT_HI+0": 2.9213929176330566,
+        "OUTPUT_HI+15": 1.1968036413192749,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(500.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(500.0)
+    for lane in range(16):
+        if lane != 8:
+            assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
+        if lane != 15:
+            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_mem_store_addr0_f8_from_mod_local_blocks_second_push():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_f8_from_mod_local_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9980560541152954,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+7": 0.0,
+        "ALU_LO+14": 0.9937615394592285,
+        "OUTPUT_LO+0": 3.8322701454162598,
+        "OUTPUT_LO+8": 219616.703125,
+        "OUTPUT_HI+15": 0.9901931285858154,
+    })
+
+    assert out["OUTPUT_LO+0"] == 3.8322701454162598
+    assert out["OUTPUT_LO+8"] == 219616.703125
+    assert out["OUTPUT_HI+15"] == 0.9901931285858154
+
+
+def test_tail_mem_store_addr0_f8_from_mod_local_blocks_psh_sp_store():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_f8_from_mod_local_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9978197813034058,
+        "H1+4": 1.0,
+        "H1+11": 1.0,
+        "MEM_STORE": 2.0,
+        "PSH_AT_SP": 1.498309850692749,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+7": 0.0005193031392991543,
+        "ALU_LO+10": 0.0,
+        "ALU_LO+14": 1.1776190149248578e-05,
+        "OUTPUT_LO+0": 2.566706895828247,
+        "OUTPUT_LO+8": 0.5347899794578552,
+        "OUTPUT_HI+14": 13285903.0,
+        "OUTPUT_HI+15": 11668551.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(2.566706895828247)
+    assert out["OUTPUT_LO+8"] == pytest.approx(0.5347899794578552)
+    assert out["OUTPUT_HI+14"] == pytest.approx(13285903.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(11668551.0)
+
+
+def test_tail_mem_store_addr0_f8_from_mod_local_blocks_stack_source_store():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_f8_from_mod_local_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9982885122299194,
+        "H1+4": 1.0,
+        "H1+11": 1.0,
+        "MEM_STORE": 2.0,
+        "MEM_ADDR_SRC": 2.0,
+        "CMP+0": 2.996619462966919,
+        "ALU_LO+7": 0.0,
+        "ALU_LO+10": 0.07819131016731262,
+        "ALU_LO+14": 0.0,
+        "OUTPUT_LO+8": 85991448.0,
+        "OUTPUT_HI+14": 90491448.0,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(85991448.0)
+    assert out["OUTPUT_HI+14"] == pytest.approx(90491448.0)
+    assert out.get("OUTPUT_LO+0", 0.0) == pytest.approx(0.0)
+    assert out.get("OUTPUT_HI+0", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_mem_store_addr0_e8_from_nested_local_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e8_from_nested_local_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9966400265693665,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+10": 0.9940742254257202,
+        "ALU_LO+7": 0.0,
+        "ALU_LO+14": 0.0,
+        "OUTPUT_LO+0": 2.958621025085449,
+        "OUTPUT_LO+8": 0.9968036413192749,
+        "OUTPUT_LO+10": 0.536,
+        "OUTPUT_HI+0": 3.503345012664795,
+        "OUTPUT_HI+14": 1.1968036413192749,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(500.0)
+    assert out["OUTPUT_HI+14"] == pytest.approx(500.0)
+    for lane in range(16):
+        if lane != 8:
+            assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
+        if lane != 14:
+            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_mem_store_addr0_e8_from_nested_local_blocks_stack_source_store():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e8_from_nested_local_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9982885122299194,
+        "H1+4": 1.0,
+        "H1+11": 1.0,
+        "MEM_STORE": 2.0,
+        "MEM_ADDR_SRC": 2.0,
+        "CMP+0": 2.996619462966919,
+        "ALU_LO+10": 0.07819131016731262,
+        "ALU_LO+7": 0.0,
+        "ALU_LO+14": 0.0,
+        "OUTPUT_LO+8": 85991448.0,
+        "OUTPUT_HI+14": 90491448.0,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(85991448.0)
+    assert out["OUTPUT_HI+14"] == pytest.approx(90491448.0)
+    assert out.get("OUTPUT_LO+0", 0.0) == pytest.approx(0.0)
+    assert out.get("OUTPUT_HI+0", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_mem_store_addr0_e0_from_local_offset_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e0_from_local_offset_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+8": 0.9937615394592285,
+        "ALU_LO+7": 0.0,
+        "ALU_LO+10": 0.0,
+        "ALU_LO+14": 0.0,
+        "OUTPUT_LO+0": 2.574,
+        "OUTPUT_LO+8": 0.535,
+        "OUTPUT_HI+0": -298.0,
+        "OUTPUT_HI+14": 161.262,
+        "OUTPUT_HI+15": 141.692,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(50000.0)
+    assert out["OUTPUT_HI+14"] == pytest.approx(50000.0)
+    for lane in range(16):
+        if lane != 0:
+            assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
+        if lane != 14:
+            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_mem_store_addr0_e0_from_local_offset_blocks_e8_row():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e0_from_local_offset_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+8": 0.0,
+        "ALU_LO+10": 0.9940742254257202,
+        "OUTPUT_LO+8": 12.2,
+        "OUTPUT_HI+14": 83.8,
+    })
+
+    assert out["OUTPUT_LO+8"] == 12.2
+    assert out["OUTPUT_HI+14"] == 83.8
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
+def test_tail_mem_store_addr0_e0_from_local_offset_blocks_strong_e8_output():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e0_from_local_offset_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9982885122299194,
+        "H1+4": 1.0,
+        "MEM_STORE": 4.0,
+        "CMP+3": 2.996619462966919,
+        "ALU_LO+8": 0.40735572576522827,
+        "ALU_LO+14": -247.27655029296875,
+        "ADDR_B0_LO+8": 0.9888219833374023,
+        "ADDR_B0_HI+14": 0.9716129302978516,
+        "OUTPUT_LO+8": 1282.8973388671875,
+        "OUTPUT_HI+14": 1361.1473388671875,
+    })
+
+    assert out["OUTPUT_LO+8"] == 1282.8973388671875
+    assert out["OUTPUT_HI+14"] == 1361.1473388671875
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
+def test_tail_mem_store_addr0_local_frame_rules_block_raw_psh_store_row():
+    ir = CompilerIR()
+    for prefix in (
+        "tail_mem_store_addr0_f8_from_mod_local_exact",
+        "tail_mem_store_addr0_e0_from_local_offset_exact",
+        "tail_mem_store_addr0_e8_from_nested_local_exact",
+        "tail_mem_store_addr0_e8_from_local_frame_addr_exact",
+        "tail_mem_store_addr0_e8_from_local_frame_output_exact",
+    ):
+        ir.layer(0).ffn.rules.extend(_tail_rules_with_prefix(prefix))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9969,
+        "H1+4": 1.0,
+        "MEM_STORE": 4.0,
+        "PSH_AT_SP": 1.498,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+7": 0.9937863945960999,
+        "ALU_LO+8": 0.9937615394592285,
+        "ALU_LO+10": 0.9940742254257202,
+        "ALU_LO+14": 0.0,
+        "ADDR_B0_LO+8": 0.9904117584228516,
+        "ADDR_B0_HI+14": 0.9812884330749512,
+        "OUTPUT_LO+0": 13.946,
+        "OUTPUT_LO+8": -10.0,
+        "OUTPUT_HI+14": -10.0,
+        "OUTPUT_HI+15": -10.0,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(500.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(500.0)
+    assert out.get("OUTPUT_LO+0", 0.0) == pytest.approx(0.0)
+    assert out.get("OUTPUT_HI+14", 0.0) == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "tail_mem_store_addr0_e0_from_local_offset_exact",
+        "tail_mem_store_addr0_e8_from_nested_local_exact",
+        "tail_mem_store_addr0_e8_from_local_frame_addr_exact",
+        "tail_mem_store_addr0_e8_from_local_frame_output_exact",
+    ],
+)
+def test_tail_mem_store_addr0_local_frame_rules_require_no_psh_at_sp(prefix):
+    ir = _tail_prefix_ir(prefix)
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 4.0,
+        "PSH_AT_SP": 1.498,
+        "CMP+0": 2.996619701385498,
+        "ALU_LO+8": 0.9937615394592285,
+        "ALU_LO+10": 0.9940742254257202,
+        "ADDR_B0_LO+8": 0.9904117584228516,
+        "ADDR_B0_HI+14": 0.9812884330749512,
+        "OUTPUT_LO+0": 13.946,
+        "OUTPUT_LO+8": -10.0,
+        "OUTPUT_HI+14": -10.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 13.946
+    assert out["OUTPUT_LO+8"] == -10.0
+    assert out["OUTPUT_HI+14"] == -10.0
+
+
+def test_tail_mem_store_addr0_e0_from_jsr_local_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e0_from_jsr_local_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "OP_JSR": 12.491547584533691,
+        "CMP+4": 1.497720718383789,
+        "ALU_LO+14": 5360.0,
+        "OUTPUT_LO+0": -10600.0,
+        "OUTPUT_LO+8": 10900.0,
+        "OUTPUT_HI+0": -354000.0,
+        "OUTPUT_HI+14": 30600.0,
+        "OUTPUT_HI+15": 11000.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(5000.0)
+    assert out["OUTPUT_HI+14"] == pytest.approx(5000.0)
+    for lane in range(16):
+        if lane != 0:
+            assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
+        if lane != 14:
+            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_mem_store_addr0_e0_from_jsr_local_blocks_initial_f8():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e0_from_jsr_local_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "H1+4": 1.0,
+        "MEM_STORE": 1.9999995231628418,
+        "OP_JSR": 12.491547584533691,
+        "CMP+4": 1.497720718383789,
+        "ALU_LO+14": -110.0,
+        "OUTPUT_LO+8": -839271360.0,
+        "OUTPUT_HI+0": 881834262528.0,
+        "OUTPUT_HI+15": -14807114752.0,
+    })
+
+    assert out["OUTPUT_LO+8"] == -839271360.0
+    assert out["OUTPUT_HI+0"] == 881834262528.0
+    assert out["OUTPUT_HI+15"] == -14807114752.0
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
+def test_tail_mem_store_addr0_e0_from_jsr_local_strong_overrides_residue():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_e0_from_jsr_local_strong"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "OP_JSR": 12.491547584533691,
+        "CMP+4": 1.497720718383789,
+        "ALU_LO+14": 5360.0,
+        "OUTPUT_LO+1": 8_867_526_213_632.0,
+        "OUTPUT_HI+0": 18_137_942_589_440.0,
+    })
+
+    assert out["OUTPUT_LO+0"] > out["OUTPUT_LO+1"]
+    assert out["OUTPUT_HI+14"] > out["OUTPUT_HI+0"]
+
+
+def test_tail_mem_store_addr0_local_frame_output_e8_dominates_f8():
+    ir = CompilerIR()
+    for prefix in (
+        "tail_mem_store_addr0_f8_from_mod_local_exact",
+        "tail_mem_store_addr0_e8_from_nested_local_exact",
+        "tail_mem_store_addr0_e8_from_local_frame_output_exact",
+    ):
+        ir.layer(0).ffn.rules.extend(_tail_rules_with_prefix(prefix))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9971901178359985,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "OUTPUT_LO+0": -56.29740524291992,
+        "OUTPUT_LO+8": 60.241825103759766,
+        "OUTPUT_HI+0": -98.06285858154297,
+        "OUTPUT_HI+14": 83.8114242553711,
+        "OUTPUT_HI+15": -0.0019485921366140246,
+    })
+
+    assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"]
+    assert out["OUTPUT_HI+14"] > out["OUTPUT_HI+15"]
+
+
+def test_tail_mem_store_addr0_local_frame_addr_e8_dominates_f8():
+    ir = CompilerIR()
+    for prefix in (
+        "tail_mem_store_addr0_f8_from_mod_local_exact",
+        "tail_mem_store_addr0_e8_from_nested_local_exact",
+        "tail_mem_store_addr0_e8_from_local_frame_addr_exact",
+    ):
+        ir.layer(0).ffn.rules.extend(_tail_rules_with_prefix(prefix))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 4.0,
+        "CMP+0": 2.996619701385498,
+        "OUTPUT_LO+0": 16.946823120117188,
+        "OUTPUT_LO+8": -10.0,
+        "OUTPUT_HI+0": 16.946823120117188,
+        "OUTPUT_HI+14": -10.0,
+        "OUTPUT_HI+15": -10.0,
+        "ADDR_B0_LO+8": 0.9904117584228516,
+        "ADDR_B0_HI+14": 0.9812884330749512,
+    })
+
+    assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"]
+    assert out["OUTPUT_HI+14"] > out["OUTPUT_HI+15"]
+
+
+def test_tail_mem_store_addr0_local_frame_e8_blocks_initial_f8_shape():
+    ir = CompilerIR()
+    for prefix in (
+        "tail_mem_store_addr0_e8_from_local_frame_addr_exact",
+        "tail_mem_store_addr0_e8_from_local_frame_output_exact",
+    ):
+        ir.layer(0).ffn.rules.extend(_tail_rules_with_prefix(prefix))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9980560541152954,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "OUTPUT_LO+8": 200.0,
+        "OUTPUT_HI+15": 200.0,
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+    })
+
+    assert out["OUTPUT_LO+8"] == 200.0
+    assert out["OUTPUT_HI+15"] == 200.0
+    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+
+
+def test_tail_mem_store_addr0_local_frame_output_e8_blocks_e0_offset_row():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e8_from_local_frame_output_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "OUTPUT_LO+0": -1.124,
+        "OUTPUT_LO+8": 4.226,
+        "OUTPUT_HI+14": 161.262,
+        "OUTPUT_HI+15": 141.692,
+        "ALU_LO+8": 0.9937615394592285,
+    })
+
+    assert out["OUTPUT_LO+8"] == 4.226
+    assert out["OUTPUT_HI+14"] == 161.262
+    assert out.get("OUTPUT_LO+0", 0.0) == -1.124
+
+
+def test_tail_mem_store_addr0_local_frame_output_e8_blocks_large_e0_offset_row():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e8_from_local_frame_output_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "OUTPUT_LO+0": 2.574,
+        "OUTPUT_LO+8": 0.535,
+        "OUTPUT_HI+0": -298.0,
+        "OUTPUT_HI+14": 161.262,
+        "OUTPUT_HI+15": 141.692,
+        "ALU_LO+8": 0.9937615394592285,
+    })
+
+    assert out["OUTPUT_LO+0"] == 2.574
+    assert out["OUTPUT_LO+8"] == 0.535
+    assert out["OUTPUT_HI+14"] == 161.262
+
+
+def test_tail_mem_store_addr0_local_frame_output_e8_blocks_jsr_e0_row():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e8_from_local_frame_output_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "OP_JSR": 12.491547584533691,
+        "CMP+4": 1.497720718383789,
+        "ALU_LO+14": 5360.0,
+        "OUTPUT_LO+0": -10600.0,
+        "OUTPUT_LO+8": 10900.0,
+        "OUTPUT_HI+0": -354000.0,
+        "OUTPUT_HI+14": 30600.0,
+        "OUTPUT_HI+15": 11000.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == -10600.0
+    assert out["OUTPUT_LO+8"] == 10900.0
+    assert out["OUTPUT_HI+14"] == 30600.0
+
+
+def test_tail_mem_store_addr0_local_frame_output_e8_blocks_ax_imm_residue():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e8_from_local_frame_output_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_AX": 1.0,
+        "H1+1": 1.0,
+        "OUTPUT_LO+0": -1.34e9,
+        "OUTPUT_LO+8": 1.34e9,
+        "OUTPUT_HI+0": -1.35e9,
+        "OUTPUT_HI+12": 1.35e9,
+        "OUTPUT_HI+14": 10.0,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(1.34e9)
+    assert out["OUTPUT_HI+12"] == pytest.approx(1.35e9)
+    assert out["OUTPUT_LO+0"] == pytest.approx(-1.34e9)
+
+
+def test_tail_mem_store_addr0_local_frame_output_e8_blocks_bp_byte3_residue():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e8_from_local_frame_output_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+3": 1.0,
+        "BYTE_INDEX_2": 1.0,
+        "OUTPUT_LO+0": 1.03e15,
+        "OUTPUT_HI+0": -6.81e15,
+        "OUTPUT_HI+1": 0.03,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(1.03e15)
+    assert out["OUTPUT_HI+0"] == pytest.approx(-6.81e15)
+    assert out["OUTPUT_HI+1"] == pytest.approx(0.03)
+
+
+def test_tail_mem_store_addr0_local_frame_output_e8_blocks_sub_byte_residue():
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e8_from_local_frame_output_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "TEMP+9": 1.0,
+        "CARRY+2": 2.0,
+        "OUTPUT_LO+0": -1.47e22,
+        "OUTPUT_LO+8": 1.46e22,
+        "OUTPUT_HI+0": -1.81e27,
+        "OUTPUT_HI+14": 1.14e26,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(-1.47e22)
+    assert out["OUTPUT_LO+8"] == pytest.approx(1.46e22)
+    assert out["OUTPUT_HI+0"] == pytest.approx(-1.81e27)
+    assert out["OUTPUT_HI+14"] == pytest.approx(1.14e26)
+
+
+def test_tail_stack0_f8_byte1_from_output_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_stack0_f8_byte1_from_output_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9965417981147766,
+        "H1+10": 1.0,
+        "BYTE_INDEX_0": 0.9734055995941162,
+        "STACK0_BYTE0": 0.9734055995941162,
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "OUTPUT_LO+0": 154.01010131835938,
+        "OUTPUT_LO+2": 3.0,
+        "OUTPUT_HI+0": 157.01010131835938,
+    })
+
+    assert out["OUTPUT_LO+2"] == pytest.approx(500.0)
+    assert out["OUTPUT_HI+0"] == pytest.approx(500.0)
+    for lane in range(16):
+        if lane != 2:
+            assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
+        if lane != 0:
+            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_stack0_f8_byte1_from_output_blocks_zero_byte1():
+    ir = _tail_prefix_ir("tail_stack0_f8_byte1_from_output_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9980018734931946,
+        "H1+10": 1.0,
+        "BYTE_INDEX_0": 0.9734055995941162,
+        "STACK0_BYTE0": 0.9734055995941162,
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "OUTPUT_LO+0": 3.9468109607696533,
+        "OUTPUT_HI+0": 42.94681167602539,
+    })
+
+    assert out["OUTPUT_LO+0"] == 3.9468109607696533
+    assert out["OUTPUT_HI+0"] == 42.94681167602539
+    assert out.get("OUTPUT_LO+2", 0.0) == 0.0
+
+
+def test_tail_stack0_f8_byte1_from_output_blocks_store_pop_rows():
+    ir = _tail_prefix_ir("tail_stack0_f8_byte1_from_output_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998,
+        "H1+10": 1.0,
+        "BYTE_INDEX_0": 0.973,
+        "STACK0_BYTE0": 0.973,
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "MEM_STORE": 1.53,
+        "OUTPUT_LO+0": 0.947,
+        "OUTPUT_LO+2": 3.0,
+        "OUTPUT_HI+0": 0.947,
+        "OUTPUT_HI+1": 3.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(0.947)
+    assert out["OUTPUT_LO+2"] == pytest.approx(3.0)
+    assert out["OUTPUT_HI+1"] == pytest.approx(3.0)
+
+
+def test_tail_stack0_f8_byte1_from_output_blocks_ax_byte_row():
+    ir = _tail_prefix_ir("tail_stack0_f8_byte1_from_output_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9981348514556885,
+        "H1+1": 1.0,
+        "H1+10": 1.0,
+        "BYTE_INDEX_0": 0.9701374769210815,
+        "STACK0_BYTE0": 0.9701374769210815,
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "OUTPUT_LO+1": -6140.89453125,
+        "OUTPUT_LO+2": 5581.818359375,
+        "OUTPUT_HI+0": 7892.8798828125,
+        "OUTPUT_HI+1": 607.6930541992188,
+    })
+
+    assert out["OUTPUT_LO+1"] == -6140.89453125
+    assert out["OUTPUT_LO+2"] == 5581.818359375
+    assert out["OUTPUT_HI+0"] == 7892.8798828125
+    assert out["OUTPUT_HI+1"] == 607.6930541992188
+
+
+def test_tail_stack0_f8_byte1_from_output_requires_has_se_margin():
+    ir = _tail_prefix_ir("tail_stack0_f8_byte1_from_output_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+10": 1.0,
+        "BYTE_INDEX_0": 0.9734055995941162,
+        "OUTPUT_LO+0": 142.07675170898438,
+        "OUTPUT_HI+0": 142.07675170898438,
+    })
+
+    assert out["OUTPUT_LO+0"] == 142.07675170898438
+    assert out["OUTPUT_HI+0"] == 142.07675170898438
+    assert out.get("OUTPUT_LO+2", 0.0) == 0.0
+
+
+def test_tail_pc_byte0_12_from_initial_jmp_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_pc_byte0_12_from_initial_jmp_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_PC": 1.0,
+        "OP_JMP": 10.0,
+        "FETCH_LO+2": 64.6191,
+        "FETCH_HI+0": 68.7496,
+        "OUTPUT_LO+2": 1520.0493,
+        "OUTPUT_HI+0": 1593.2112,
+    })
+
+    assert out["OUTPUT_LO+2"] == pytest.approx(1520.0493)
+    assert out["OUTPUT_HI+1"] == pytest.approx(5000.0)
+    assert out["OUTPUT_HI+0"] == pytest.approx(-3406.7888)
+
+
+def test_tail_pc_byte0_12_from_initial_jmp_blocks_non_pc_rows():
+    ir = _tail_prefix_ir("tail_pc_byte0_12_from_initial_jmp_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_AX": 1.0,
+        "OP_JMP": 10.0,
+        "FETCH_LO+2": 64.6191,
+        "FETCH_HI+0": 68.7496,
+        "OUTPUT_LO+2": 1520.0493,
+        "OUTPUT_HI+0": 1593.2112,
+    })
+
+    assert out["OUTPUT_LO+2"] == 1520.0493
+    assert out["OUTPUT_HI+0"] == 1593.2112
+    assert out.get("OUTPUT_HI+1", 0.0) == 0.0
+
+
+@pytest.mark.parametrize("op_dim", ["OP_BZ", "OP_BNZ"])
+def test_tail_pc_byte0_1a_from_taken_branch_index3_exacts_nibbles(op_dim):
+    ir = _tail_prefix_ir("tail_pc_byte0_1a_from_taken_branch_index3_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_PC": 1.0,
+        op_dim: 5.0,
+        "FETCH_LO+3": 40.0,
+        "FETCH_HI+0": 41.0,
+        "OUTPUT_LO+3": 40.0,
+        "OUTPUT_HI+0": 41.0,
+    })
+
+    assert out["OUTPUT_LO+10"] == pytest.approx(5000.0)
+    assert out["OUTPUT_LO+3"] == pytest.approx(-4960.0)
+    assert out["OUTPUT_HI+1"] == pytest.approx(5000.0)
+    assert out["OUTPUT_HI+0"] == pytest.approx(-4959.0)
+
+
+@pytest.mark.parametrize("op_dim", ["OP_BZ", "OP_BNZ"])
+def test_tail_pc_byte0_1a_from_taken_branch_index3_blocks_fallthrough(op_dim):
+    ir = _tail_prefix_ir("tail_pc_byte0_1a_from_taken_branch_index3_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_PC": 1.0,
+        op_dim: 5.0,
+        "FETCH_LO+3": 40.0,
+        "FETCH_HI+0": 41.0,
+        "OUTPUT_LO+2": 0.99,
+        "OUTPUT_HI+1": 0.98,
+    })
+
+    assert out["OUTPUT_LO+2"] == 0.99
+    assert out["OUTPUT_HI+1"] == 0.98
+    assert out.get("OUTPUT_LO+10", 0.0) == 0.0
+    assert out.get("OUTPUT_LO+3", 0.0) == 0.0
+
+
+@pytest.mark.parametrize("op_dim", ["OP_BZ", "OP_BNZ"])
+def test_tail_pc_byte0_1a_from_taken_branch_index3_blocks_plain_jmp(op_dim):
+    ir = _tail_prefix_ir("tail_pc_byte0_1a_from_taken_branch_index3_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_PC": 1.0,
+        "OP_JMP": 10.0,
+        op_dim: -1e-21,
+        "FETCH_LO+3": 2.31,
+        "FETCH_HI+0": 68.75,
+        "OUTPUT_LO+2": 1520.05,
+        "OUTPUT_LO+3": 54.4,
+        "OUTPUT_LO+10": -24.0,
+        "OUTPUT_HI+0": 1593.21,
+    })
+
+    assert out["OUTPUT_LO+2"] == pytest.approx(1520.05)
+    assert out["OUTPUT_LO+3"] == pytest.approx(54.4)
+    assert out["OUTPUT_LO+10"] == pytest.approx(-24.0)
+    assert out["OUTPUT_HI+0"] == pytest.approx(1593.21)
+
+
+def test_tail_pc_byte1_01_from_long_initial_pc_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_pc_byte1_01_from_long_initial_pc_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 0.9999545812606812,
+        "H1+7": 0.9999545812606812,
+        "H1+14": 0.9999545812606812,
+        "BYTE_INDEX_0": 0.9701393842697144,
+        "BYTE_INDEX_2": 0.0,
+        "BYTE_INDEX_3": 0.0,
+        "FETCH_HI+2": 39.99980163574219,
+        "AX_CARRY_HI+9": 3.0,
+        "NEXT_AX": 6.358210521284491e-05,
+        "OUTPUT_LO+0": 0.9402,
+        "OUTPUT_LO+1": -0.0001,
+        "OUTPUT_HI+0": 0.9402,
+    })
+
+    assert out["OUTPUT_LO+1"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI+0"] == pytest.approx(4.0)
+    for lane in range(16):
+        if lane != 1:
+            assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
+        if lane != 0:
+            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 0.9999545812606812,
+        "H1+7": 0.9999545812606812,
+        "H1+14": 0.9999545812606812,
+        "BYTE_INDEX_0": 0.9701393842697144,
+        "BYTE_INDEX_2": 0.0,
+        "BYTE_INDEX_3": 0.0,
+        "FETCH_HI+2": 39.99981689453125,
+        "AX_CARRY_HI+1": 2.679687738418579,
+        "NEXT_AX": 6.358210521284491e-05,
+        "OUTPUT_LO+0": 2.46177339553833,
+        "OUTPUT_LO+1": 37.60724639892578,
+        "OUTPUT_HI+0": 4.757164478302002,
+    })
+
+    assert out["OUTPUT_LO+1"] > 37.60724639892578
+    assert out["OUTPUT_HI+0"] > 4.757164478302002
+    assert out["OUTPUT_LO+0"] < 2.46177339553833
+    assert out.get("OUTPUT_HI+1", 0.0) < 0.0
+
+
+def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_requires_initial_step():
+    ir = _tail_prefix_ir("tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+0": 0.9999545812606812,
+        "H1+7": 0.9999545812606812,
+        "H1+14": 0.9999545812606812,
+        "BYTE_INDEX_0": 0.9701393842697144,
+        "FETCH_HI+2": 39.99981689453125,
+        "AX_CARRY_HI+1": 2.679687738418579,
+        "OUTPUT_LO+2": 12.0,
+        "OUTPUT_HI+1": 13.0,
+    })
+
+    assert out["OUTPUT_LO+2"] == 12.0
+    assert out["OUTPUT_HI+1"] == 13.0
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+
+
+def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_requires_byte_index0():
+    ir = _tail_prefix_ir("tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 0.9999545812606812,
+        "H1+7": 0.9999545812606812,
+        "H1+14": 0.9999545812606812,
+        "BYTE_INDEX_1": 0.9701393842697144,
+        "FETCH_HI+2": 39.99981689453125,
+        "AX_CARRY_HI+1": 2.679687738418579,
+        "OUTPUT_LO+0": 12.0,
+        "OUTPUT_HI+0": 13.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 12.0
+    assert out["OUTPUT_HI+0"] == 13.0
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+
+
+def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_requires_carry_sentinel():
+    ir = _tail_prefix_ir("tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 0.9999545812606812,
+        "H1+7": 0.9999545812606812,
+        "H1+14": 0.9999545812606812,
+        "BYTE_INDEX_0": 0.9701393842697144,
+        "OUTPUT_LO+0": 40.067691802978516,
+        "OUTPUT_LO+1": 0.0014171712100505829,
+        "OUTPUT_HI+0": 4.757174491882324,
+    })
+
+    assert out["OUTPUT_LO+0"] == 40.067691802978516
+    assert out["OUTPUT_HI+0"] == 4.757174491882324
+    assert out["OUTPUT_LO+1"] == 0.0014171712100505829
+
+
+def test_tail_pc_byte1_01_from_initial_jsr_blocks_plain_initial_pc_byte():
+    ir = _tail_prefix_ir("tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 0.9999545812606812,
+        "H1+7": 0.9999545812606812,
+        "H1+14": 0.9999545812606812,
+        "BYTE_INDEX_0": 0.9701393842697144,
+        "BYTE_INDEX_1": 0.0132961,
+        "FETCH_HI+2": 40.0016,
+        "AX_CARRY_HI+1": 0.0,
+        "OUTPUT_LO+0": 0.940187,
+        "OUTPUT_LO+1": 0.0,
+        "OUTPUT_HI+0": 0.940187,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(0.940187)
+    assert out["OUTPUT_HI+0"] == pytest.approx(0.940187)
+    assert out.get("OUTPUT_LO+1", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_pc_byte1_01_from_long_initial_pc_blocks_plain_initial_pc_byte():
+    ir = _tail_prefix_ir("tail_pc_byte1_01_from_long_initial_pc_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+0": 0.9999545812606812,
+        "H1+7": 0.9999545812606812,
+        "H1+14": 0.9999545812606812,
+        "BYTE_INDEX_0": 0.9701393842697144,
+        "BYTE_INDEX_1": 0.0132961,
+        "FETCH_HI+2": 40.0016,
+        "AX_CARRY_HI+9": 0.0,
+        "OUTPUT_LO+0": 0.940187,
+        "OUTPUT_LO+1": 0.0,
+        "OUTPUT_HI+0": 0.940187,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(0.940187)
+    assert out["OUTPUT_HI+0"] == pytest.approx(0.940187)
+    assert out.get("OUTPUT_LO+1", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_sp_marker_byte0_f8_from_initial_stack_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_SP": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "OUTPUT_LO+0": 0.9734733700752258,
+        "OUTPUT_LO+8": 0.026526624336838722,
+        "OUTPUT_HI+0": 0.97722327709198,
+        "OUTPUT_HI+15": 0.02277671918272972,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(4.0)
+    for lane in range(16):
+        if lane != 8:
+            assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
+        if lane != 15:
+            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_sp_marker_byte0_f8_blocks_zero_stack_marker():
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_SP": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "OUTPUT_LO+0": 1.0,
+        "OUTPUT_HI+0": 1.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 1.0
+    assert out["OUTPUT_HI+0"] == 1.0
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+
+
+def test_tail_sp_marker_byte0_f8_blocks_initial_jsr_stack0_marker():
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "OP_JSR": 11.0,
+        "MARK_STACK0": 1.0,
+        "H1+2": 1_000_000_000.0,
+        "H1+9": 1_000_000_000.0,
+        "OUTPUT_LO+0": 3.9,
+        "OUTPUT_LO+8": 0.0,
+        "OUTPUT_LO+10": 4.0,
+        "OUTPUT_HI+0": 4.0,
+        "OUTPUT_HI+15": 0.0,
+    })
+
+    assert out["OUTPUT_LO+10"] == 4.0
+    assert out["OUTPUT_HI+0"] == 4.0
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+
+
+def test_tail_sp_marker_byte0_f8_blocks_ax_marker_output_eight_residue():
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_AX": 1.0,
+        "H1+1": 1.0,
+        "HAS_SE": 0.997884,
+        "OP_IMM": 5.0,
+        "OUTPUT_LO+8": 13.0,
+        "OUTPUT_HI+0": 13.0,
+        "OUTPUT_HI+15": 4.0,
+    })
+
+    assert out["OUTPUT_LO+8"] == 13.0
+    assert out["OUTPUT_HI+0"] == 13.0
+    assert out["OUTPUT_HI+15"] == 4.0
+
+
+def test_tail_sp_marker_byte0_f8_blocks_ax_imm_ff_residue():
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_AX": 1.0,
+        "H1+1": 1.0,
+        "OP_IMM": 5.0,
+        "OUTPUT_LO+15": 520.0,
+        "OUTPUT_HI+15": 1_345_005_440.0,
+        "OUTPUT_HI+0": -1_345_004_928.0,
+        "OUTPUT_HI+14": 10.0,
+        "ALU_LO+14": -50.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == 520.0
+    assert out["OUTPUT_HI+15"] == 1_345_005_440.0
+    assert out["OUTPUT_HI+0"] == -1_345_004_928.0
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+
+
+def test_tail_sp_marker_byte0_f8_blocks_lea_local_frame_marker_residue():
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_AX": 1.0,
+        "H1+1": 1.0,
+        "HAS_SE": 0.9975294470787048,
+        "OP_LEA": 5.0,
+        "OUTPUT_LO+0": -54813.03125,
+        "OUTPUT_LO+8": 55586.0,
+        "OUTPUT_HI+0": -34047084.0,
+        "OUTPUT_HI+14": 2290023.25,
+        "OUTPUT_HI+15": 2290019.25,
+    })
+
+    assert out["OUTPUT_LO+8"] == 55586.0
+    assert out["OUTPUT_HI+14"] == 2290023.25
+    assert out["OUTPUT_HI+15"] == 2290019.25
+    assert out["OUTPUT_HI+0"] == -34047084.0
+
+
+def test_tail_sp_marker_byte0_f8_blocks_ent_frame_setup():
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_SP": 1.0,
+        "HAS_SE": 0.9896095991134644,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "OP_ENT": 6.528390884399414,
+        "OUTPUT_LO+0": 3969.28271484375,
+        "OUTPUT_HI+15": 3963.10498046875,
+    })
+
+    assert out["OUTPUT_LO+0"] == 3969.28271484375
+    assert out["OUTPUT_HI+15"] == 3963.10498046875
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+
+
+def test_tail_sp_byte1_ff_from_initial_stack_exacts_nibbles():
+    ir = _tail_prefix_ir("tail_sp_byte1_ff_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "BYTE_INDEX_0": 0.970139,
+        "BYTE_INDEX_1": 0.013297,
+        "CLEAN_EMBED_LO+8": 1.0,
+        "CLEAN_EMBED_HI+15": 1.0,
+        "OUTPUT_LO+0": 0.94,
+        "OUTPUT_LO+15": -0.025,
+        "OUTPUT_HI+0": 0.94,
+        "OUTPUT_HI+15": -0.025,
+    })
+
+    assert out["OUTPUT_LO+15"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
+    for lane in range(15):
+        assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
+        assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_sp_byte1_ff_from_initial_stack_requires_prior_f8_byte():
+    ir = _tail_prefix_ir("tail_sp_byte1_ff_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "BYTE_INDEX_0": 0.970139,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+0": 1.0,
+        "OUTPUT_LO+0": 0.94,
+        "OUTPUT_HI+0": 0.94,
+    })
+
+    assert out["OUTPUT_LO+0"] == 0.94
+    assert out["OUTPUT_HI+0"] == 0.94
+    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+
+
+def test_tail_sp_byte1_ff_from_initial_stack_reinforces_existing_ff_lane():
+    ir = _tail_prefix_ir("tail_sp_byte1_ff_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "BYTE_INDEX_0": 0.970139,
+        "CLEAN_EMBED_LO+8": 1.0,
+        "CLEAN_EMBED_HI+15": 1.0,
+        "OUTPUT_LO+15": 5.88,
+        "OUTPUT_HI+15": 5.88,
+    })
+
+    assert out["OUTPUT_LO+15"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
+
+
+def test_tail_sp_store_pop_byte1_zero_blocks_stored_value_high_byte():
+    ir = _single_rule_ir(_tail_rule("tail_sp_store_pop_byte1_zero"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9982727766036987,
+        "H1+2": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "CMP+3": 4.0,
+        "MEM_STORE": 1.2824475765228271,
+        "OUTPUT_LO+0": 2.703033924102783,
+        "OUTPUT_HI+0": 2.703033924102783,
+        "OUTPUT_LO+2": 2.9000067710876465,
+        "OUTPUT_HI+1": 2.9000067710876465,
+    })
+
+    assert out["OUTPUT_LO+0"] > 1000.0
+    assert out["OUTPUT_HI+0"] > 1000.0
+    assert out["OUTPUT_LO+2"] < -1000.0
+    assert out["OUTPUT_HI+1"] < -1000.0
+
+
+def test_tail_sp_store_pop_byte1_zero_requires_store_pop_signal():
+    ir = _single_rule_ir(_tail_rule("tail_sp_store_pop_byte1_zero"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+2": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "MEM_STORE": 1.3,
+        "OUTPUT_LO+2": 2.9,
+        "OUTPUT_HI+1": 2.9,
+    })
+
+    assert out["OUTPUT_LO+2"] == 2.9
+    assert out["OUTPUT_HI+1"] == 2.9
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
+def test_tail_sp_store_pop_byte1_zero_blocks_stack_source_store():
+    ir = _single_rule_ir(_tail_rule("tail_sp_store_pop_byte1_zero"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9979930520057678,
+        "H1+2": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "BYTE_INDEX_1": 0.013296706601977348,
+        "CMP+3": 4.0,
+        "MEM_STORE": 1.2824475765228271,
+        "MEM_ADDR_SRC": 1.2824475765228271,
+        "OUTPUT_LO+0": 5.599205493927002,
+        "OUTPUT_HI+0": 5.599205493927002,
+        "OUTPUT_LO+15": 4.121987196015198e-09,
+        "OUTPUT_HI+15": 4.121987196015198e-09,
+    })
+
+    assert out["OUTPUT_LO+0"] == 5.599205493927002
+    assert out["OUTPUT_HI+0"] == 5.599205493927002
+    assert out["OUTPUT_LO+15"] == 4.121987196015198e-09
+    assert out["OUTPUT_HI+15"] == 4.121987196015198e-09
+
+
+def test_tail_sp_store_pop_byte1_zero_blocks_ax_add_byte1_row():
+    ir = _single_rule_ir(_tail_rule("tail_sp_store_pop_byte1_zero"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998,
+        "H1+1": 1.0,
+        "H1+2": 1.0,
+        "BYTE_INDEX_0": 0.97,
+        "CMP+3": 4.0,
+        "MEM_STORE": 1.5,
+        "OUTPUT_LO+0": -9117.0,
+        "OUTPUT_LO+1": 9128.9,
+        "OUTPUT_HI+0": -8.65e10,
+        "OUTPUT_HI+1": 1.15e10,
+    })
+
+    assert out["OUTPUT_LO+1"] == pytest.approx(9128.9)
+    assert out["OUTPUT_HI+1"] == pytest.approx(1.15e10)
+    assert out["OUTPUT_LO+0"] == pytest.approx(-9117.0)
+
+
+def test_tail_sp_store_pop_byte1_zero_blocks_ax_sub_borrow_residue():
+    ir = _single_rule_ir(_tail_rule("tail_sp_store_pop_byte1_zero"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.97,
+        "TEMP+9": 1.0,
+        "CARRY+2": 2.0,
+        "CMP+3": 0.008,
+        "OUTPUT_LO+0": -1.47e22,
+        "OUTPUT_LO+2": -1.85e18,
+        "OUTPUT_HI+0": -1.81e27,
+        "OUTPUT_HI+1": 1.89e26,
+    })
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(-1.47e22)
+    assert out["OUTPUT_LO+2"] == pytest.approx(-1.85e18)
+    assert out["OUTPUT_HI+0"] == pytest.approx(-1.81e27)
+    assert out["OUTPUT_HI+1"] == pytest.approx(1.89e26)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "tail_pc_byte1_01_from_long_initial_pc_exact",
+        "tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact",
+        "tail_sp_marker_byte0_f8_from_initial_stack_exact",
+        "tail_sp_byte1_ff_from_initial_stack_exact",
+        "tail_mem_store_addr0_f8_from_mod_local_exact",
+        "tail_mem_store_addr0_e0_from_local_offset_exact",
+        "tail_mem_store_addr0_e0_from_jsr_local_exact",
+        "tail_mem_store_addr0_e8_from_nested_local_exact",
+    ],
+)
+def test_tail_exact_rules_block_bp_byte3_span(prefix):
+    ir = _tail_prefix_ir(prefix)
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+3": 0.9999994039535522,
+        "H1+10": 1.0,
+        "BYTE_INDEX_2": 0.9701374769210815,
+        "BYTE_INDEX_3": 0.013297064229846,
+        "OUTPUT_LO+0": 0.9402737021446228,
+        "OUTPUT_HI+0": 7_639_167.5,
+    })
+
+    assert out["OUTPUT_LO+0"] == 0.9402737021446228
+    assert out["OUTPUT_HI+0"] == 7_639_167.5
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+1", 0.0) == 0.0
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "tail_mem_store_addr0_f8_exact",
+        "tail_mem_store_addr0_f0_exact",
+    ],
+)
+def test_tail_mem_store_addr0_exact_blocks_register_byte_span_residue(name):
+    ir = _single_rule_ir(_tail_rule(name))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "BYTE_INDEX_0": 0.970139,
+        "BYTE_INDEX_1": 0.013297,
+        "OP_JSR": 5.0,
+        "MEM_STORE": 0.656,
+        "ALU_LO+2": -35.0,
+        "ALU_LO+14": -35.0,
+        "OUTPUT_LO+0": 0.94,
+        "OUTPUT_HI+0": 0.94,
+    })
+
+    assert out["OUTPUT_LO+0"] == 0.94
+    assert out["OUTPUT_HI+0"] == 0.94
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "tail_mem_store_addr0_f8_from_mod_local_exact",
+        "tail_mem_store_addr0_e0_from_local_offset_exact",
+        "tail_mem_store_addr0_e0_from_jsr_local_exact",
+        "tail_mem_store_addr0_e8_from_nested_local_exact",
+    ],
+)
+def test_tail_mem_store_addr0_band_exact_blocks_sp_byte_span_residue(prefix):
+    ir = _tail_prefix_ir(prefix)
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "BYTE_INDEX_0": 0.970139,
+        "BYTE_INDEX_1": 0.013297,
+        "OP_JSR": 5.0,
+        "MEM_STORE": 0.656,
+        "ALU_LO+7": -35.0,
+        "ALU_LO+10": -35.0,
+        "ALU_LO+14": -35.0,
+        "OUTPUT_LO+0": 0.94,
+        "OUTPUT_HI+0": 0.94,
+        "OUTPUT_HI+15": -0.025,
+    })
+
+    assert out["OUTPUT_LO+0"] == 0.94
+    assert out["OUTPUT_HI+0"] == 0.94
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+15", 0.0) == -0.025
+
+
+def test_tail_mem_store_addr0_rules_block_step_start_transition():
+    for name in (
+        "tail_mem_store_addr0_f8_exact",
+        "tail_mem_store_addr0_f0_exact",
+    ):
+        ir = _single_rule_ir(_tail_rule(name))
+
+        out = ir.symbolic_ffn({
+            "NEXT_PC": 1.4,
+            "MARK_MEM": 1.0,
+            "HAS_SE": 1.0,
+            "H1+4": 1.0,
+            "MEM_STORE": 2.0,
+            "CMP+0": 3.0,
+            "OUTPUT_LO+0": -1000.0,
+            "OUTPUT_LO+8": 1000.0,
+            "OUTPUT_LO+14": -1000.0,
+            "ALU_LO+14": 0.0,
+            "OUTPUT_HI+15": 1000.0,
+        })
+
+        assert out["OUTPUT_LO+8"] == 1000.0
+        assert out["OUTPUT_HI+15"] == 1000.0
+
+
 def test_tail_stack0_pop_reveals_saved_addr_e8_after_d8_pop():
     ir = CompilerIR()
     ir.layer(0).ffn.append(_tail_rule("tail_stack0_pop_marker_zero"))
@@ -872,6 +2824,23 @@ def test_tail_stack0_pop_reveals_saved_addr_e8_requires_pop_signal():
         "HAS_SE": 1.0,
         "ADDR_B0_LO+8": 10.0,
         "ADDR_B0_HI+13": 5.0,
+    })
+
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+
+
+def test_tail_stack0_pop_reveals_saved_addr_e8_blocks_ent_frame_marker():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_pop_reveals_saved_addr_e8"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9956,
+        "OP_ENT": 8.574,
+        "ADDR_B0_LO+8": 26.419,
+        "ADDR_B0_HI+13": -2.0,
+        "ADDR_B0_LO+0": -24.332,
+        "MEM_STORE": 0.407,
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
@@ -1095,6 +3064,30 @@ def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_mem_marker_rows():
 
     assert out["OUTPUT_LO+8"] == 3.0
     assert out["OUTPUT_HI+15"] == 3.0
+
+
+def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_stack_source_store():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_store_non_top_zero_e8_from_e0"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9984076023101807,
+        "CMP+3": 4.0,
+        "MEM_STORE": 0.40725404024124146,
+        "MEM_ADDR_SRC": 0.40725404024124146,
+        "EMBED_LO+8": 5.3777512221131474e-08,
+        "EMBED_HI+14": 3.57113009386012e-07,
+        "ADDR_B0_LO+0": 1.0,
+        "ADDR_B0_HI+14": 1.0,
+        "ADDR_B0_LO+8": -1.0,
+        "OUTPUT_LO+15": 3.0000078678131104,
+        "OUTPUT_HI+2": 3.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == 3.0000078678131104
+    assert out["OUTPUT_HI+2"] == 3.0
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
 
 
 def test_tail_stack0_store_non_top_zero_allows_top_store_value():
@@ -1417,6 +3410,67 @@ def test_tail_stack0_store_top_e8_from_e0_requires_positive_address_signature():
     assert out.get("OUTPUT_HI+0", 0.0) == 0.0
 
 
+def test_tail_stack0_store_top_e8_from_e0_requires_store_signal():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_e8_from_e0_byte_0f"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.997279,
+        "CMP+8": 0.697795,
+        "EMBED_LO+0": 0.995722,
+        "EMBED_HI+0": 0.99689,
+        "ADDR_B0_LO+0": 7.975916,
+        "ADDR_B0_HI+0": 7.975923,
+        "OUTPUT_LO+0": 1.980587,
+        "OUTPUT_HI+0": 1.982908,
+    })
+
+    assert out["OUTPUT_LO+0"] == 1.980587
+    assert out["OUTPUT_HI+0"] == 1.982908
+    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
+
+
+def test_tail_stack0_store_loaded_byte11_blocks_bp_byte3_zero_row():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_store_loaded_byte_11"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+3": 1.0,
+        "BYTE_INDEX_2": 1.0,
+        "CMP+3": 4.0,
+        "MEM_STORE": 4.0,
+        "MARK_STACK0": 1.0,
+        "OUTPUT_LO+0": 8_000_000.0,
+        "OUTPUT_HI+0": 8_000_000.0,
+        "OUTPUT_LO+1": 8_000_000.0,
+        "OUTPUT_HI+1": 8_000_000.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 8_000_000.0
+    assert out["OUTPUT_HI+0"] == 8_000_000.0
+    assert out["OUTPUT_LO+1"] == 8_000_000.0
+    assert out["OUTPUT_HI+1"] == 8_000_000.0
+
+
+def test_tail_stack0_store_loaded_byte11_still_fires_on_stack0_marker():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_store_loaded_byte_11"))
+
+    out = ir.symbolic_ffn({
+        "HAS_SE": 1.0,
+        "CMP+3": 4.0,
+        "MEM_STORE": 4.0,
+        "MARK_STACK0": 1.0,
+        "OUTPUT_LO+1": 8_000_000.0,
+        "OUTPUT_HI+1": 8_000_000.0,
+    })
+
+    assert out["OUTPUT_LO+1"] > 8_000_000.0
+    assert out["OUTPUT_HI+1"] > 8_000_000.0
+    assert out.get("OUTPUT_LO+0", 0.0) < 0.0
+    assert out.get("OUTPUT_HI+0", 0.0) < 0.0
+
+
 def test_tail_pop_mem_marker_zero_blocks_byte_rows():
     ir = _single_rule_ir(_tail_rule("tail_pop_mem_marker_zero"))
 
@@ -1543,7 +3597,7 @@ def test_tail_sp_pop_marker_increment_requires_pop_flag():
     assert out["OUTPUT_HI+14"] == 3.0
 
 
-def test_tail_sp_pop_marker_increment_tolerates_mem_store_residue():
+def test_tail_sp_pop_marker_increment_blocks_mem_store_residue():
     ir = _single_rule_ir(_tail_rule("tail_sp_pop_marker_e0_to_e8"))
 
     out = ir.symbolic_ffn({
@@ -1556,8 +3610,8 @@ def test_tail_sp_pop_marker_increment_tolerates_mem_store_residue():
         "OUTPUT_HI+14": 1.0,
     })
 
-    assert out["OUTPUT_LO+8"] > 0.0
-    assert out["OUTPUT_HI+14"] > 1.0
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert out["OUTPUT_HI+14"] == 1.0
 
 
 def test_tail_sp_pop_marker_d8_to_e0_restores_store_pop():
@@ -1608,6 +3662,41 @@ def test_tail_sp_pop_marker_output_d8_to_e0_requires_output_low_nibble():
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 42.0,
         "OUTPUT_HI+13": 1.0,
+        "OUTPUT_HI+0": 42.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 42.0
+    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+
+
+def test_tail_sp_pop_marker_output_d8_to_e0_requires_output_high_nibble():
+    ir = _single_rule_ir(_tail_rule("tail_sp_pop_marker_output_d8_to_e0"))
+
+    out = ir.symbolic_ffn({
+        "CONST": 1.0,
+        "MARK_SP": 1.0,
+        "HAS_SE": 1.0,
+        "CMP+3": 4.0,
+        "OUTPUT_LO+8": 1.0,
+        "OUTPUT_LO+0": 42.0,
+        "OUTPUT_HI+0": 42.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 42.0
+    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+
+
+def test_tail_sp_pop_marker_output_d8_to_e0_blocks_f8_marker():
+    ir = _single_rule_ir(_tail_rule("tail_sp_pop_marker_output_d8_to_e0"))
+
+    out = ir.symbolic_ffn({
+        "CONST": 1.0,
+        "MARK_SP": 1.0,
+        "HAS_SE": 1.0,
+        "CMP+3": 4.0,
+        "OUTPUT_LO+8": 1.0,
+        "OUTPUT_HI+15": 1.0,
+        "OUTPUT_LO+0": 42.0,
         "OUTPUT_HI+0": 42.0,
     })
 
@@ -1687,6 +3776,25 @@ def test_tail_sp_pop_marker_f0_to_f8_restores_larger_frame_pop():
     assert out["OUTPUT_LO+8"] > 0.0
     assert out["OUTPUT_HI+15"] > 2.0
     assert out["OUTPUT_LO+0"] < 2.0
+
+
+def test_tail_sp_pop_marker_f0_to_f8_blocks_mem_store_residue():
+    ir = _single_rule_ir(_tail_rule("tail_sp_pop_marker_f0_to_f8"))
+
+    out = ir.symbolic_ffn({
+        "MARK_SP": 1.0,
+        "HAS_SE": 1.0,
+        "CMP+3": 4.0,
+        "MEM_STORE": 0.001,
+        "EMBED_LO+0": 1.0,
+        "EMBED_HI+15": 1.0,
+        "OUTPUT_LO+0": 2.0,
+        "OUTPUT_HI+15": 2.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 2.0
+    assert out["OUTPUT_HI+15"] == 2.0
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
 
 
 def test_tail_sp_pop_byte1_ff_after_f8_preserves_stack_high_byte():
@@ -2214,6 +4322,53 @@ def test_tail_ax_add_no_carry_byte1_blocks_weak_high_byte_source():
     assert out.get("OUTPUT_LO+0", 0.0) == -4.184763431549072
 
 
+def test_tail_ax_add_no_carry_byte1_blocks_bitwise_relay():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_no_carry_byte1_00"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "TEMP+3": 1.0,
+        "TEMP+5": 1.0,
+        "TEMP+8": 1.0,
+        "ALU_LO+0": 10.0,
+        "ALU_HI+0": 10.0,
+        "AX_CARRY_HI+0": 10.0,
+        "OUTPUT_LO+15": 3.8,
+        "OUTPUT_HI+0": 9.5,
+    })
+
+    assert out["OUTPUT_LO+15"] == 3.8
+    assert out["OUTPUT_HI+0"] == 9.5
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
+def test_tail_ax_add_no_carry_byte1_blocks_sub_relay():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_no_carry_byte1_00"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "TEMP+8": 1.0,
+        "TEMP+9": 1.0,
+        "OP_SUB": 1.0,
+        "ALU_LO+0": 10.0,
+        "ALU_HI+0": 10.0,
+        "AX_CARRY_HI+0": 10.0,
+        "OUTPUT_LO+15": 7.0,
+        "OUTPUT_HI+15": 8.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == 7.0
+    assert out["OUTPUT_HI+15"] == 8.0
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+
+
 def test_tail_ax_add_byte1_hi_zero_repairs_stale_high_nibble():
     ir = _single_rule_ir(_tail_rule("tail_ax_add_byte1_hi_zero"))
 
@@ -2277,6 +4432,55 @@ def test_tail_ax_add_byte1_hi_zero_blocks_sub_rows():
     assert out.get("OUTPUT_HI+0", 0.0) == 0.0
 
 
+def test_tail_ax_add_byte1_hi_zero_blocks_bp_byte_rows():
+    ir = _tail_rules_ir(
+        "tail_ax_add_byte1_hi_zero",
+        "tail_ax_add_byte1_hi_zero_lo_b",
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "H1+3": 1.0,
+        "BYTE_INDEX_0": 1e-6,
+        "BYTE_INDEX_2": 1.0,
+        "TEMP+8": 1.0,
+        "ALU_HI+0": 6.0,
+        "AX_CARRY_HI+0": 4.0,
+        "OUTPUT_LO+11": 3.0,
+        "OUTPUT_HI+1": 4.0,
+    })
+
+    assert out["OUTPUT_LO+11"] == 3.0
+    assert out["OUTPUT_HI+1"] == 4.0
+    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+
+
+def test_tail_ax_add_byte1_hi_zero_lo_blocks_bp_frame_byte0_row():
+    ir = _tail_rules_ir(
+        "tail_ax_add_byte1_hi_zero",
+        "tail_ax_add_byte1_hi_zero_lo_f",
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9973672032356262,
+        "H1+3": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+8": 0.020405665040016174,
+        "ALU_HI+0": 0.7190718054771423,
+        "AX_CARRY_HI+0": 0.0003145717200823128,
+        "OUTPUT_LO+15": 50.375244140625,
+        "OUTPUT_HI+0": -47.434967041015625,
+        "OUTPUT_HI+15": 50.375244140625,
+    })
+
+    assert out["OUTPUT_LO+15"] == 50.375244140625
+    assert out["OUTPUT_HI+0"] == -47.434967041015625
+    assert out["OUTPUT_HI+15"] == 50.375244140625
+
+
 def test_tail_ax_add_byte1_hi_zero_lo_blocks_huge_sub_output():
     ir = _single_rule_ir(_tail_rule("tail_ax_add_byte1_hi_zero_lo_5"))
 
@@ -2312,6 +4516,107 @@ def test_tail_ax_sub_byte1_hi_zero_repairs_non_borrow_sub_high_residue():
 
     assert out["OUTPUT_HI+0"] > out["OUTPUT_HI+8"]
     assert out["OUTPUT_LO+5"] > out.get("OUTPUT_LO+0", 0.0)
+
+
+def test_tail_ax_sub_byte1_hi_zero_blocks_borrow_rows():
+    ir = _single_rule_ir(_tail_rule("tail_ax_sub_byte1_hi_zero_lo_f"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "TEMP+9": 1.0,
+        "CARRY+2": 1.0,
+        "OUTPUT_LO+15": 12.0,
+        "OUTPUT_HI+15": 7.0,
+        "OUTPUT_HI+0": 8.0,
+    })
+
+    assert out["OUTPUT_HI+15"] == 7.0
+    assert out["OUTPUT_HI+0"] == 8.0
+
+
+def test_tail_ax_sub_byte1_hi_zero_blocks_huge_underflow_borrow_residue():
+    ir = _single_rule_ir(_tail_rule("tail_ax_sub_byte1_hi_zero_lo_8"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9984797239303589,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+9": 1.0,
+        "CARRY+2": 2.0,
+        "CARRY+3": 9.00263e7,
+        "OUTPUT_LO+8": 1.136948985422256e27,
+        "OUTPUT_HI+13": 1.2506424672545367e27,
+        "OUTPUT_HI+0": -1.81e27,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(1.136948985422256e27)
+    assert out["OUTPUT_HI+13"] == pytest.approx(1.2506424672545367e27)
+    assert out["OUTPUT_HI+0"] == pytest.approx(-1.81e27)
+
+
+def test_tail_ax_sub_full_underflow_emits_bounded_huge_borrow_repair():
+    ir = _tail_rules_ir(
+        "tail_ax_sub_byte1_hi_zero_lo_8",
+        "tail_ax_sub_full_underflow_byte1_ff",
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "TEMP+9": 1.0,
+        "CARRY+2": 2.0,
+        "OUTPUT_LO+0": -1.47e22,
+        "OUTPUT_LO+8": 1.46e22,
+        "OUTPUT_HI+0": -1.81e27,
+        "OUTPUT_HI+15": 1.46e26,
+    })
+
+    assert out["OUTPUT_LO+15"] > 900_000_000.0
+    assert out["OUTPUT_HI+15"] > 900_000_000.0
+    assert out["OUTPUT_LO+8"] == pytest.approx(1.46e22)
+    assert out["OUTPUT_HI+0"] == pytest.approx(-1.81e27)
+
+
+def test_tail_ax_sub_byte1_hi_zero_blocks_imm_marker_residue():
+    ir = _single_rule_ir(_tail_rule("tail_ax_sub_byte1_hi_zero_lo_8"))
+
+    out = ir.symbolic_ffn({
+        "MARK_AX": 1.0,
+        "H1+1": 1.0,
+        "OUTPUT_LO+0": -1.34e9,
+        "OUTPUT_LO+8": 1.34e9,
+        "OUTPUT_HI+0": -1.35e9,
+        "OUTPUT_HI+12": 1.35e9,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(1.34e9)
+    assert out["OUTPUT_HI+12"] == pytest.approx(1.35e9)
+    assert out["OUTPUT_LO+0"] == pytest.approx(-1.34e9)
+
+
+def test_tail_ax_sub_full_underflow_byte1_materializes_ff():
+    ir = _single_rule_ir(_tail_rule("tail_ax_sub_full_underflow_byte1_ff"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "TEMP+9": 1.0,
+        "CARRY+2": 2.0,
+        "OUTPUT_LO+15": 12.0,
+        "OUTPUT_HI+0": 8.0,
+    })
+
+    assert out["OUTPUT_LO+15"] > 12.0
+    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI+0"] < 8.0
 
 
 def test_tail_ax_sub_borrow_decrements_l15_restored_high_byte():
@@ -2554,6 +4859,48 @@ def test_tail_si_ax_byte1_still_fires_for_store_signal():
     assert out["OUTPUT_HI+0"] > 3.0
 
 
+def test_tail_si_ax_byte1_blocks_lea_local_frame_row():
+    ir = _single_rule_ir(_tail_rule("tail_si_ax_byte1_12"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 1.0,
+        "OP_LEA": 5.0,
+        "MEM_STORE": 0.023,
+        "OUTPUT_LO+2": 5_690_513_408.0,
+        "OUTPUT_HI+1": 5_692_803_072.0,
+        "OUTPUT_LO+8": 55_586.3984375,
+        "OUTPUT_HI+14": 2_290_062.0,
+    })
+
+    assert out["OUTPUT_LO+8"] == 55_586.3984375
+    assert out["OUTPUT_HI+14"] == 2_290_062.0
+    assert out.get("OUTPUT_LO+2", 0.0) == 5_690_513_408.0
+    assert out.get("OUTPUT_HI+1", 0.0) == 5_692_803_072.0
+
+
+def test_tail_si_ax_byte1_blocks_mem_addr_row():
+    ir = _single_rule_ir(_tail_rule("tail_si_ax_byte1_12"))
+
+    out = ir.symbolic_ffn({
+        "MARK_MEM": 1.0,
+        "HAS_SE": 0.9976623058319092,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "CMP+0": 2.996619701385498,
+        "OUTPUT_LO+2": 54_250_434_560.0,
+        "OUTPUT_HI+1": 1_676_348_500.0,
+        "OUTPUT_LO+8": 1_646_635.125,
+        "OUTPUT_HI+14": 1_131_778.875,
+    })
+
+    assert out["OUTPUT_LO+8"] == 1_646_635.125
+    assert out["OUTPUT_HI+14"] == 1_131_778.875
+    assert out["OUTPUT_LO+2"] == 54_250_434_560.0
+    assert out["OUTPUT_HI+1"] == 1_676_348_500.0
+
+
 def test_tail_wide_mul_byte1_preserve_blocks_without_temp10_gate():
     ir = _single_rule_ir(_tail_rule("tail_wide_mul_byte1_preserve_9"))
 
@@ -2750,6 +5097,188 @@ def test_tail_wide_mul_byte1_preserve_still_fires_with_byte0_gate():
 
     assert out["OUTPUT_LO+9"] > 100.0
     assert out["OUTPUT_HI+0"] > 100.0
+
+
+def test_tail_ax_add_mul_byte1_materialize_repairs_low_one():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_mul_byte1_materialize_01"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998542845249176,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+8": 0.30489400029182434,
+        "TEMP+10": 0.9961900115013123,
+        "OP_MUL": 1.0,
+        "EMBED_HI+0": 1.0,
+        "FETCH_HI+0": 0.3991380035877228,
+        "OUTPUT_LO+0": 2.9402761459350586,
+        "OUTPUT_HI+0": 2.9402761459350586,
+    })
+
+    assert out["OUTPUT_LO+1"] > 0.0
+    assert out["OUTPUT_LO+0"] < 2.9402761459350586
+    assert out["OUTPUT_HI+0"] > 2.9402761459350586
+
+
+def test_tail_ax_add_mul_byte1_materialize_repairs_low_two_from_hi2():
+    ir = _single_rule_ir(
+        _tail_rule("tail_ax_add_mul_byte1_materialize_02_from_hi2")
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998542845249176,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+8": 0.3049095869064331,
+        "TEMP+10": 0.9961900115013123,
+        "OP_MUL": 1.0,
+        "EMBED_HI+2": 1.0,
+        "FETCH_HI+2": 1.2207061052322388,
+        "OUTPUT_LO+0": 2.9402761459350586,
+        "OUTPUT_HI+0": 2.9402761459350586,
+    })
+
+    assert out["OUTPUT_LO+2"] > 0.0
+    assert out["OUTPUT_LO+0"] < 2.9402761459350586
+    assert out["OUTPUT_HI+0"] > 2.9402761459350586
+
+
+def test_tail_ax_add_mul_byte1_materialize_repairs_low_two_from_hid():
+    ir = _single_rule_ir(
+        _tail_rule("tail_ax_add_mul_byte1_materialize_02_from_hid")
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998542845249176,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+8": 0.30489400029182434,
+        "TEMP+10": 0.9961900115013123,
+        "OP_MUL": 1.0,
+        "EMBED_HI+13": 1.0,
+        "FETCH_HI+2": 0.9340206980705261,
+        "OUTPUT_LO+0": 2.9402761459350586,
+        "OUTPUT_HI+0": 2.9402761459350586,
+    })
+
+    assert out["OUTPUT_LO+2"] > 0.0
+    assert out["OUTPUT_LO+0"] < 2.9402761459350586
+    assert out["OUTPUT_HI+0"] > 2.9402761459350586
+
+
+def test_tail_ax_add_mul_byte1_materialize_requires_add_relay():
+    ir = _single_rule_ir(
+        _tail_rule("tail_ax_add_mul_byte1_materialize_02_from_hi2")
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998542845249176,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+10": 1.3010942935943604,
+        "EMBED_HI+2": 1.0,
+        "FETCH_HI+2": 1.2207061052322388,
+        "OUTPUT_LO+0": 2.9402761459350586,
+        "OUTPUT_HI+0": 2.9402761459350586,
+    })
+
+    assert out["OUTPUT_LO+0"] == 2.9402761459350586
+    assert out["OUTPUT_HI+0"] == 2.9402761459350586
+    assert out.get("OUTPUT_LO+2", 0.0) == 0.0
+
+
+def test_tail_ax_add_mul_byte1_materialize_blocks_zero_high_product():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_mul_byte1_materialize_01"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998542845249176,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+8": 0.30489400029182434,
+        "TEMP+10": 0.9961900115013123,
+        "FETCH_HI+0": 0.11243800073862076,
+        "OUTPUT_LO+0": 2.9402761459350586,
+        "OUTPUT_HI+0": 2.9402761459350586,
+    })
+
+    assert out["OUTPUT_LO+0"] == 2.9402761459350586
+    assert out["OUTPUT_HI+0"] == 2.9402761459350586
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+
+
+def test_tail_ax_add_mul_byte1_materialize_requires_mul_ownership():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_mul_byte1_materialize_01"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9986177086830139,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "BYTE_INDEX_1": 0.013296706601977348,
+        "TEMP+8": 1.0000001192092896,
+        "TEMP+10": 0.014740509912371635,
+        "EMBED_HI+0": 1.000071406364441,
+        "FETCH_HI+0": 0.3991560637950897,
+        "OUTPUT_LO+0": 2.9402761459350586,
+        "OUTPUT_HI+0": 2.9402761459350586,
+    })
+
+    assert out["OUTPUT_LO+0"] == 2.9402761459350586
+    assert out["OUTPUT_HI+0"] == 2.9402761459350586
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+
+
+def test_tail_ax_add_mul_byte1_materialize_blocks_plain_add_byte1_zero():
+    ir = _single_rule_ir(
+        _tail_rule("tail_ax_add_mul_byte1_materialize_02_from_hi2")
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998542845249176,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+8": 0.3049095869064331,
+        "TEMP+10": 0.9961900115013123,
+        "EMBED_HI+2": 1.0,
+        "FETCH_HI+2": 1.2207061052322388,
+        "OUTPUT_LO+0": 2.9402761459350586,
+        "OUTPUT_HI+0": 2.9402761459350586,
+    })
+
+    assert out["OUTPUT_LO+0"] == 2.9402761459350586
+    assert out["OUTPUT_HI+0"] == 2.9402761459350586
+    assert out.get("OUTPUT_LO+2", 0.0) == 0.0
+
+
+def test_tail_ax_add_mul_byte1_materialize_blocks_psh_preserve_row():
+    ir = _single_rule_ir(
+        _tail_rule("tail_ax_add_mul_byte1_materialize_02_from_hi2")
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "TEMP+8": 0.304,
+        "TEMP+10": 0.997,
+        "OP_PSH": 5.0,
+        "EMBED_HI+2": 0.0,
+        "FETCH_HI+2": 0.934,
+        "CLEAN_EMBED_HI+14": 1.0,
+        "OUTPUT_LO+15": 2.0,
+        "OUTPUT_HI+15": 2.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == 2.0
+    assert out["OUTPUT_HI+15"] == 2.0
+    assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
 def test_tail_ax_add_byte1_carry_high2_repairs_huge_byte3_residue():
@@ -3027,11 +5556,31 @@ def test_tail_shr_marker_correction_still_fires_on_marker():
         "MARK_AX": 1.0,
         "H1+1": 1.0,
         "TEMP+7": 1.0,
-        "OP_SHR": 1.0,
-        "OUTPUT_LO+6": 6.0,
+        "OP_SHR": 5.0,
+        "OUTPUT_LO+10": -0.84,
+        "OUTPUT_HI+0": 2.56,
+        "OUTPUT_HI+2": -0.84,
     })
 
     assert out["OUTPUT_LO+1"] > 0.0
+
+
+def test_tail_shr_marker_correction_preserves_shr_by_one_result():
+    ir = _single_rule_ir(_tail_rule("tail_shr_marker_byte0_01"))
+
+    out = ir.symbolic_ffn({
+        "MARK_AX": 1.0,
+        "H1+1": 1.0,
+        "TEMP+7": 1.0,
+        "OP_SHR": 5.0,
+        "OUTPUT_LO+6": -0.84,
+        "OUTPUT_LO+10": 1.16,
+        "OUTPUT_HI+2": 1.16,
+    })
+
+    assert out["OUTPUT_LO+10"] == 1.16
+    assert out["OUTPUT_HI+2"] == 1.16
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
 def test_tail_shr_marker_correction_requires_shr_opcode():
@@ -3385,6 +5934,28 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_bp_frame_row():
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
+def test_tail_ax_add_byte1_missing_stack_high_blocks_stack0_byte_row():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_byte1_missing_stack_high_02"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9984540939331055,
+        "BYTE_INDEX_0": 0.9734055995941162,
+        "BYTE_INDEX_1": 0.013297183439135551,
+        "STACK0_BYTE1": 0.013297183439135551,
+        "OUTPUT_LO+1": -971.656494140625,
+        "OUTPUT_LO+3": -971.656494140625,
+        "OUTPUT_LO+4": -971.656494140625,
+        "OUTPUT_LO+5": -971.656494140625,
+        "OUTPUT_LO+6": -971.656494140625,
+        "OUTPUT_LO+7": -971.656494140625,
+        "OUTPUT_HI+0": 123.0,
+    })
+
+    assert out["OUTPUT_HI+0"] == 123.0
+    assert out.get("OUTPUT_LO+2", 0.0) == 0.0
+
+
 def test_tail_sp_pop_carry_blocks_ax_byte_row():
     ir = _single_rule_ir(_tail_rule("tail_sp_pop_carry_byte2_00"))
 
@@ -3548,6 +6119,94 @@ def test_tail_sp_pop_carry_requires_exact_byte_index():
     assert out["OUTPUT_LO+0"] == 2.9
     assert out["OUTPUT_HI+0"] == 2.9
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+
+
+def test_tail_sp_pop_carry_blocks_branch_sp_byte_rows():
+    ir = _single_rule_ir(_tail_rule("tail_sp_pop_carry_byte2_00"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+2": 1.0,
+        "BYTE_INDEX_1": 1.0,
+        "CMP+3": 4.0,
+        "OP_JMP": 1.0,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+0": 1.0,
+        "OUTPUT_LO+0": 2.0,
+        "OUTPUT_HI+0": 2.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 2.0
+    assert out["OUTPUT_HI+0"] == 2.0
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+
+
+def test_tail_sp_pop_carry_blocks_startup_stack0_row_without_has_se():
+    ir = _single_rule_ir(_tail_rule("tail_sp_pop_carry_byte2_00"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "BYTE_INDEX_0": 0.9734055995941162,
+        "BYTE_INDEX_1": 0.013297183439135551,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+0": 1.0,
+        "OUTPUT_LO+0": 142.0,
+        "OUTPUT_HI+0": 142.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 142.0
+    assert out["OUTPUT_HI+0"] == 142.0
+    assert out.get("OUTPUT_LO+1", 0.0) == 0.0
+
+
+def test_tail_sp_pop_carry_requires_real_pop_flag_margin():
+    ir = _single_rule_ir(_tail_rule("tail_sp_pop_carry_byte2_00"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9975,
+        "H1+2": 1.0,
+        "BYTE_INDEX_1": 0.9701,
+        "BYTE_INDEX_2": 0.0133,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+0": 1.0,
+        "OUTPUT_LO+1": 2.0,
+        "OUTPUT_HI+0": 2.0,
+    })
+
+    assert out["OUTPUT_LO+1"] == 2.0
+    assert out["OUTPUT_HI+0"] == 2.0
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+
+
+def test_tail_sp_pop_carry_byte2_blocks_nonpop_sp_zero_high_rules():
+    ir = _tail_rules_ir(
+        "tail_sp_pop_carry_byte2_00",
+        "tail_sp_pop_carry_byte2_01",
+        "tail_sp_pop_carry_byte2_0f",
+        "tail_sp_pop_carry_byte2_ff",
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.997515,
+        "H1+2": 1.0,
+        "BYTE_INDEX_1": 0.970137,
+        "BYTE_INDEX_2": 0.013297,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+0": 1.0,
+        "OUTPUT_LO+1": 2.0,
+        "OUTPUT_HI+0": 2.0,
+    })
+
+    assert out["OUTPUT_LO+1"] == 2.0
+    assert out["OUTPUT_HI+0"] == 2.0
+    for idx in range(16):
+        if idx != 1:
+            assert out.get(f"OUTPUT_LO+{idx}", 0.0) == 0.0
+        if idx != 0:
+            assert out.get(f"OUTPUT_HI+{idx}", 0.0) == 0.0
 
 
 def test_tail_sp_pop_carry_still_fires_after_clean_zero_previous_byte():

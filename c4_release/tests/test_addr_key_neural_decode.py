@@ -8,9 +8,8 @@ Verifies the new ``make_layer14_addr_key_neural_decode_op`` op
    ``enable=False`` (so existing tests stay byte-identical).
 
 2. **Bake parity**: with ``enable=True``, the FFN produces the same
-   ADDR_KEY[lo, 16+hi, 32+top] one-hot encoding that
-   ``NeuralVMEmbedding._inject_mem_metadata`` produces for the same
-   inputs, across a range of (addr_b0, addr_b1, byte_off) values
+   ADDR_KEY[lo, 16+hi, 32+top] one-hot encoding for the same value-source
+   positions L15 reads, across a range of (addr_b0, addr_b1, byte_off) values
    including the carry-overflow case.
 
 The full integration (enabling the gate and deleting
@@ -120,7 +119,7 @@ def _build_residual_for_addr(addr_b0, addr_b1, byte_off, dim_positions, d_model)
     state that L13's mem_addr_gather produces at a MEM val byte position.
 
     Sets:
-      - MEM_VAL_B{byte_off} = 1.0 (gate)
+      - the L15 value-source gate for byte_off
       - ADDR_B0_LO[addr_b0 & 0xF] = 1.0
       - ADDR_B0_HI[(addr_b0 >> 4) & 0xF] = 1.0  (aliased with ADDR_KEY+0)
       - ADDR_B1_LO[addr_b1 & 0xF] = 1.0
@@ -128,13 +127,17 @@ def _build_residual_for_addr(addr_b0, addr_b1, byte_off, dim_positions, d_model)
     All other dims are zero.
     """
     x = torch.zeros(1, 1, d_model)
-    MEM_VAL_BS = [
-        dim_positions["MEM_VAL_B0"],
-        dim_positions["MEM_VAL_B1"],
-        dim_positions["MEM_VAL_B2"],
-        dim_positions["MEM_VAL_B3"],
-    ]
-    x[0, 0, MEM_VAL_BS[byte_off]] = 1.0
+    if byte_off < 3:
+        mem_val_bs = [
+            dim_positions["MEM_VAL_B1"],
+            dim_positions["MEM_VAL_B2"],
+            dim_positions["MEM_VAL_B3"],
+        ]
+        x[0, 0, mem_val_bs[byte_off]] = 1.0
+    else:
+        mem_i = 4
+        x[0, 0, dim_positions["H3"] + mem_i] = 1.0
+        x[0, 0, dim_positions["H2"] + mem_i] = 0.0
     addr_b0_lo = addr_b0 & 0xF
     addr_b0_hi = (addr_b0 >> 4) & 0xF
     addr_b1_lo = addr_b1 & 0xF

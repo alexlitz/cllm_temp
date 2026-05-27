@@ -52,6 +52,7 @@ class NeuralVMEmbedding(nn.Module):
         # Track memory history end for MEM_STORE injection
         # (set by KV cache eviction logic)
         self._mem_history_end = 0
+        self._mem_store_positions = None
 
         # V20 (NeuralVMEmbedding prefix-embedding-delta cache) was retired
         # 2026-05-12. Its role is now subsumed by the unified per-layer KV
@@ -401,13 +402,23 @@ class NeuralVMEmbedding(nn.Module):
         """
         from .vm_step import Token
 
+        mem_store = self._dim("MEM_STORE")
+        mem_addr_src = self._dim("MEM_ADDR_SRC")
+        B, S = token_ids.shape
+
+        positions = self._mem_store_positions
+        if positions is not None:
+            for b in range(B):
+                row_positions = positions[b] if b < len(positions) else ()
+                for pos in row_positions:
+                    if start_pos <= pos < S and token_ids[b, pos].item() == Token.MEM:
+                        x[b, pos, mem_store] = 1.0
+                        x[b, pos, mem_addr_src] = 1.0
+
         end = self._mem_history_end
         if end == 0:
             return
 
-        mem_store = self._dim("MEM_STORE")
-        mem_addr_src = self._dim("MEM_ADDR_SRC")
-        B, S = token_ids.shape
         for b in range(B):
             for i in range(start_pos, min(end, S)):
                 if token_ids[b, i].item() == Token.MEM:
@@ -423,3 +434,7 @@ class NeuralVMEmbedding(nn.Module):
             end: Position marking end of historical memory region
         """
         self._mem_history_end = end
+
+    def set_mem_store_positions(self, positions):
+        """Set exact MEM marker positions that represent tracked store rows."""
+        self._mem_store_positions = positions

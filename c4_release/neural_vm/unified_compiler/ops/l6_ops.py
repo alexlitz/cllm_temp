@@ -126,6 +126,41 @@ def _pc_target_byte1_lo_from_imm_hi(k: int) -> int:
     return (k >> 1) & 0xF
 
 
+def _append_pc_byte0_direct_copy_rules(
+    rules: list[FFNRule],
+    *,
+    name_prefix: str,
+    conditions: tuple[tuple[str, float], ...],
+    threshold: float,
+    lo_source: str,
+    hi_source: str,
+    write_scale: float,
+) -> None:
+    """Copy an already-encoded branch target byte into PC byte 0.
+
+    Compiler branch immediates are PC byte addresses, not instruction indexes.
+    Recomputing ``imm * 8 + PC_OFFSET`` from the low nibble aliases targets
+    whose byte addresses share a low nibble (for example 0x12 and 0x22).
+    """
+
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"{name_prefix}_target_lo_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"{lo_source}+{k}",
+            writes=((f"OUTPUT_LO+{k}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"{name_prefix}_target_hi_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"{hi_source}+{k}",
+            writes=((f"OUTPUT_HI+{k}", write_scale),),
+        ))
+
+
 def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 all-step JMP PC override units 320..383."""
 
@@ -149,22 +184,15 @@ def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
 
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l6_jmp_all_step_fetch_lo_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate=f"FETCH_LO+{k}",
-            writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
-        ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l6_jmp_all_step_fetch_hi_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate=f"FETCH_LO+{k}",
-            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
-        ))
+    _append_pc_byte0_direct_copy_rules(
+        rules,
+        name_prefix="l6_jmp_all_step",
+        conditions=conditions,
+        threshold=threshold,
+        lo_source="FETCH_LO",
+        hi_source="FETCH_HI",
+        write_scale=write_scale,
+    )
 
     return tuple(rules)
 
@@ -229,7 +257,13 @@ def _layer6_imm_carry_refresh_rules(S: float) -> tuple[FFNRule, ...]:
 
 
 def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
-    """CompilerIR rules for all-step JSR PC override units 1410..1473."""
+    """CompilerIR rules for all-step JSR PC override units 1410..1473.
+
+    JSR immediates are instruction indexes, so byte 0 is still derived as
+    ``imm * 8 + 2``.  The high-byte correction must not fire when the current
+    target has an even high immediate nibble and an odd FETCH_HI lane is only
+    stale residual from an earlier target.
+    """
 
     rules = []
     conditions = (
@@ -277,6 +311,10 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         (f"FETCH_HI+{k}", 1.0)
         for k in range(1, 16, 2)
     )
+    even_imm_hi_blockers = tuple(
+        (f"FETCH_HI+{k}", -10.0)
+        for k in range(0, 16, 2)
+    )
     for k in range(16):
         rules.append(FFNRule.gated_write(
             name=f"l6_jsr_all_step_target_hi_odd_imm_hi_correction_{k}",
@@ -291,6 +329,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 ("NEXT_SE", -100.0),
                 ("IS_BYTE", -100.0),
                 (f"FETCH_LO+{k}", 1.0),
+                *even_imm_hi_blockers,
             ),
             threshold=threshold + 0.5,
             gate_terms=odd_imm_hi_gate,
@@ -397,22 +436,15 @@ def _layer6_delayed_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l6_delayed_jmp_target_lo_{k}",
-            conditions=conditions,
-            threshold=5.5,
-            gate=f"AX_CARRY_LO+{k}",
-            writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
-        ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l6_delayed_jmp_target_hi_{k}",
-            conditions=conditions,
-            threshold=5.5,
-            gate=f"AX_CARRY_LO+{k}",
-            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
-        ))
+    _append_pc_byte0_direct_copy_rules(
+        rules,
+        name_prefix="l6_delayed_jmp",
+        conditions=conditions,
+        threshold=5.5,
+        lo_source="AX_CARRY_LO",
+        hi_source="AX_CARRY_HI",
+        write_scale=write_scale,
+    )
     return tuple(rules)
 
 
@@ -438,22 +470,15 @@ def _layer6_first_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l6_first_step_jmp_target_lo_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate=f"AX_CARRY_LO+{k}",
-            writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
-        ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l6_first_step_jmp_target_hi_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate=f"AX_CARRY_LO+{k}",
-            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
-        ))
+    _append_pc_byte0_direct_copy_rules(
+        rules,
+        name_prefix="l6_first_step_jmp",
+        conditions=conditions,
+        threshold=threshold,
+        lo_source="AX_CARRY_LO",
+        hi_source="AX_CARRY_HI",
+        write_scale=write_scale,
+    )
     return tuple(rules)
 
 
@@ -978,22 +1003,15 @@ def _layer6_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l6_bz_target_lo_{k}",
-            conditions=target_conditions,
-            threshold=3.5,
-            gate=f"FETCH_LO+{k}",
-            writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
-        ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l6_bz_target_hi_{k}",
-            conditions=target_conditions,
-            threshold=3.5,
-            gate=f"FETCH_LO+{k}",
-            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
-        ))
+    _append_pc_byte0_direct_copy_rules(
+        rules,
+        name_prefix="l6_bz",
+        conditions=target_conditions,
+        threshold=3.5,
+        lo_source="FETCH_LO",
+        hi_source="FETCH_HI",
+        write_scale=write_scale,
+    )
     return tuple(rules)
 
 
@@ -1030,22 +1048,15 @@ def _layer6_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                     gate_weight=-1.0,
                     writes=((f"{output_base}+{k}", write_scale),),
                 ))
-        for k in range(16):
-            rules.append(FFNRule.gated_write(
-                name=f"l6_bnz_{group}_target_lo_{k}",
-                conditions=conditions,
-                threshold=threshold,
-                gate=f"FETCH_LO+{k}",
-                writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
-            ))
-        for k in range(16):
-            rules.append(FFNRule.gated_write(
-                name=f"l6_bnz_{group}_target_hi_{k}",
-                conditions=conditions,
-                threshold=threshold,
-                gate=f"FETCH_LO+{k}",
-                writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
-            ))
+        _append_pc_byte0_direct_copy_rules(
+            rules,
+            name_prefix=f"l6_bnz_{group}",
+            conditions=conditions,
+            threshold=threshold,
+            lo_source="FETCH_LO",
+            hi_source="FETCH_HI",
+            write_scale=write_scale,
+        )
     return tuple(rules)
 
 
@@ -1730,6 +1741,69 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
         raise AssertionError(
             "L6 all-step JSR PC override IR lowered to unexpected unit "
             f"{jsr_pc_end}; expected {L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT}"
+        )
+    _clear_ffn_unit_band(
+        ffn,
+        L6_JSR_SP_DECREMENT_START_UNIT,
+        L6_JSR_SP_DECREMENT_END_UNIT,
+    )
+    jsr_sp_end = _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_jsr_sp_decrement_rules(S),
+        S,
+        BD,
+        unit=L6_JSR_SP_DECREMENT_START_UNIT,
+    )
+    if jsr_sp_end != L6_JSR_SP_DECREMENT_END_UNIT:
+        raise AssertionError(
+            "L6 JSR SP decrement IR lowered to unexpected unit "
+            f"{jsr_sp_end}; expected {L6_JSR_SP_DECREMENT_END_UNIT}"
+        )
+    for start, end in (
+        (
+            L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
+            L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT,
+        ),
+        (
+            L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT,
+            L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT,
+        ),
+        (
+            L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
+            L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT,
+        ),
+        (L6_BZ_PC_OVERRIDE_START_UNIT, L6_BZ_PC_OVERRIDE_END_UNIT),
+        (L6_BNZ_PC_OVERRIDE_START_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT),
+    ):
+        _clear_ffn_unit_band(ffn, start, end)
+    delayed_end = _lower_layer6_delayed_jmp_pc_override_ir(ffn, S, BD)
+    if delayed_end != L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 delayed JMP PC override IR lowered to unexpected unit "
+            f"{delayed_end}; expected {L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT}"
+        )
+    first_step_end = _lower_layer6_first_step_jmp_pc_override_ir(ffn, S, BD)
+    if first_step_end != L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 first-step JMP PC override IR lowered to unexpected unit "
+            f"{first_step_end}; expected "
+            f"{L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT}"
+        )
+    all_step_jmp_end = _lower_layer6_all_step_jmp_pc_override_ir(ffn, S, BD)
+    if all_step_jmp_end != L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 all-step JMP PC override IR lowered to unexpected unit "
+            f"{all_step_jmp_end}; expected {L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT}"
+        )
+    branch_pc_ends = _lower_layer6_branch_pc_override_ir(ffn, S, BD)
+    expected_branch_pc_ends = (
+        L6_BZ_PC_OVERRIDE_END_UNIT,
+        L6_BNZ_PC_OVERRIDE_END_UNIT,
+    )
+    if branch_pc_ends != expected_branch_pc_ends:
+        raise AssertionError(
+            "L6 BZ/BNZ PC override IR lowered to unexpected units "
+            f"{branch_pc_ends}; expected {expected_branch_pc_ends}"
         )
     return
     _clear_ffn_unit_band(

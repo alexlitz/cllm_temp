@@ -82,6 +82,16 @@ def test_layer15_lookup_blocks_non_load_marker_setup():
     assert attn.W_q[0, _SetDim.OP_ENT] == -1000000.0
     assert attn.W_q[0, _SetDim.OP_LEA] == -1000000.0
     assert attn.W_q[0, _SetDim.OP_IMM] == -1000000.0
+    assert attn.W_q[0, _SetDim.MARK_STACK0] == 75000.0
+    assert attn.W_q[0, _SetDim.HAS_SE] == 75000.0
+    assert attn.W_q[0, _SetDim.ADDR_B0_LO + 8] == 75000.0
+    assert attn.W_q[0, _SetDim.ADDR_B0_HI + 14] == 75000.0
+    assert attn.W_q[0, _SetDim.ADDR_B0_HI + 15] == -100000.0
+    assert attn.W_q[1, _SetDim.MARK_STACK0] == 50.0
+    assert attn.W_q[1, _SetDim.HAS_SE] == 50.0
+    assert attn.W_q[1, _SetDim.ADDR_B0_LO + 8] == 50.0
+    assert attn.W_q[1, _SetDim.ADDR_B0_HI + 14] == 50.0
+    assert attn.W_q[1, _SetDim.ADDR_B0_HI + 15] == -150.0
     assert attn.W_q[62, _SetDim.H1 + 2] == 100000.0
     assert attn.W_q[62, _SetDim.IS_BYTE] == 0.0
     assert attn.W_k[62, _SetDim.CONST] == -20.0
@@ -91,6 +101,8 @@ def test_layer15_lookup_blocks_non_load_marker_setup():
         assert attn.W_q[row, _SetDim.OP_ENT] == 0.0
         assert attn.W_q[row, _SetDim.OP_LEA] == 0.0
         assert attn.W_q[row, _SetDim.OP_IMM] == 0.0
+        assert attn.W_q[row, _SetDim.MARK_STACK0] == -100000.0
+        assert attn.W_q[row, _SetDim.MARK_SP] == -100000.0
         blocker_row = head * 64 + 62
         assert attn.W_q[blocker_row, _SetDim.H1 + 2] == 100000.0
         assert attn.W_q[blocker_row, _SetDim.IS_BYTE] == 0.0
@@ -114,11 +126,35 @@ def test_layer15_lookup_blocks_top_store_stack0_marker_only():
     assert attn.W_q[row, _SetDim.OP_LC_RELAY] == 50000.0
     assert attn.W_k[row, _SetDim.CONST] == 20.0
 
-    for row in (59, 60, 61):
+    row = 60
+    assert attn.W_q[row, _SetDim.CONST] == -30000.0
+    assert attn.W_q[row, _SetDim.MARK_STACK0] == 10000.0
+    assert attn.W_q[row, _SetDim.MARK_SP] == -100000.0
+    assert attn.W_q[row, _SetDim.HAS_SE] == 10000.0
+    assert attn.W_q[row, _SetDim.MEM_STORE] == 150000.0
+    assert attn.W_q[row, _SetDim.ADDR_B0_LO + 8] == 10000.0
+    assert attn.W_q[row, _SetDim.ADDR_B0_HI + 14] == 10000.0
+    assert attn.W_q[row, _SetDim.ADDR_B0_HI + 15] == -20000.0
+    assert attn.W_k[row, _SetDim.CONST] == -20.0
+
+    for row in (61,):
         assert attn.W_q[row, _SetDim.CONST] == 0.0
         assert attn.W_q[row, _SetDim.MARK_STACK0] == 0.0
         assert attn.W_q[row, _SetDim.MEM_STORE] == 0.0
         assert attn.W_k[row, _SetDim.CONST] == 0.0
+    assert attn.W_q[59, _SetDim.CONST] == -17500.0
+    assert attn.W_q[59, _SetDim.MARK_STACK0] == 5000.0
+    assert attn.W_q[59, _SetDim.HAS_SE] == 5000.0
+    assert attn.W_q[59, _SetDim.ADDR_B0_LO + 8] == 5000.0
+    assert attn.W_q[59, _SetDim.ADDR_B0_HI + 14] == 5000.0
+    assert attn.W_q[59, _SetDim.IS_BYTE] == -20000.0
+    assert attn.W_q[59, _SetDim.MEM_STORE] == -25000.0
+    assert attn.W_k[59, _SetDim.ADDR_B0_LO + 8] == 5000.0
+    assert attn.W_k[59, _SetDim.ADDR_B0_HI + 14] == 5000.0
+    assert attn.W_k[59, _SetDim.MEM_VAL_B1] == 0.0
+    assert attn.W_k[59, _SetDim.L2H0 + 4] == 0.0
+    assert attn.W_k[59, _SetDim.STACK0_BYTE0] == 25000.0
+    assert attn.W_k[59, _SetDim.ADDR_B0_HI + 15] == 0.0
 
     for head in range(1, 4):
         row = head * 64 + 42
@@ -140,11 +176,32 @@ def test_layer15_legacy_lookup_neutralizes_top_store_miss_score_rows():
     assert attn.W_q[row, _SetDim.ADDR_B0_HI + 14] == 10000.0
     assert attn.W_k[row, _SetDim.CONST] == 20.0
 
-    for row in (59, 60, 61):
-        assert torch.count_nonzero(attn.W_q[row, :]) == 0
-        assert torch.count_nonzero(attn.W_k[row, :]) == 0
-        assert torch.count_nonzero(attn.W_v[row, :]) > 0
-        assert torch.count_nonzero(attn.W_o[:, row]) > 0
+    row = 59
+    assert attn.W_q[row, _SetDim.CONST] == -17500.0
+    assert attn.W_q[row, _SetDim.MARK_STACK0] == 5000.0
+    assert attn.W_q[row, _SetDim.MEM_STORE] == -25000.0
+    assert attn.W_k[row, _SetDim.MEM_VAL_B1] == 0.0
+    assert attn.W_k[row, _SetDim.L2H0 + 4] == 0.0
+    assert attn.W_k[row, _SetDim.STACK0_BYTE0] == 25000.0
+    assert attn.W_k[row, _SetDim.ADDR_B0_HI + 15] == 0.0
+    assert torch.count_nonzero(attn.W_v[row, :]) > 0
+    assert torch.count_nonzero(attn.W_o[:, row]) > 0
+
+    row = 60
+    assert attn.W_q[row, _SetDim.MARK_STACK0] == 10000.0
+    assert attn.W_q[row, _SetDim.MARK_SP] == -100000.0
+    assert attn.W_q[row, _SetDim.MEM_STORE] == 150000.0
+    assert attn.W_q[row, _SetDim.ADDR_B0_LO + 8] == 10000.0
+    assert attn.W_q[row, _SetDim.ADDR_B0_HI + 14] == 10000.0
+    assert attn.W_k[row, _SetDim.CONST] == -20.0
+    assert torch.count_nonzero(attn.W_v[row, :]) > 0
+    assert torch.count_nonzero(attn.W_o[:, row]) > 0
+
+    row = 61
+    assert torch.count_nonzero(attn.W_q[row, :]) == 0
+    assert torch.count_nonzero(attn.W_k[row, :]) == 0
+    assert torch.count_nonzero(attn.W_v[row, :]) > 0
+    assert torch.count_nonzero(attn.W_o[:, row]) > 0
 
 
 def test_layer15_lookup_source_gate_blocks_bp_register_bytes():
@@ -184,10 +241,11 @@ def test_layer15_lookup_blocks_nonpop_stack0_marker_in_current_head():
         assert attn.W_q[row, _SetDim.IS_BYTE] == 60000.0
         assert attn.W_q[row, _SetDim.OP_LI_RELAY] == -60000.0
         assert attn.W_q[row, _SetDim.OP_LC_RELAY] == -60000.0
+        assert attn.W_q[row, _SetDim.ADDR_B0_LO + 8] == -40000.0
         assert attn.W_q[row, _SetDim.EMBED_LO + 8] == 10000.0
         assert attn.W_q[row, _SetDim.EMBED_HI + 14] == 10000.0
         assert attn.W_q[row, _SetDim.ADDR_B0_LO + 0] == 10000.0
-        assert attn.W_q[row, _SetDim.ADDR_B0_HI + 14] == 10000.0
+        assert attn.W_q[row, _SetDim.ADDR_B0_HI + 14] == -20000.0
         assert attn.W_k[row, _SetDim.CONST] == -20.0
         assert attn.W_k[row, _SetDim.MEM_VAL_B1] == 0.0
         assert torch.count_nonzero(attn.W_v[row, :]) == 0
@@ -198,6 +256,99 @@ def test_layer15_lookup_blocks_nonpop_stack0_marker_in_current_head():
         assert attn.W_q[next_head_row0, _SetDim.MARK_STACK0] == 0.0
         assert attn.W_q[next_head_row0, _SetDim.IS_BYTE] == 0.0
         assert attn.W_k[next_head_row0, _SetDim.CONST] == 0.0
+
+
+def test_layer15_nonpop_stack0_marker_allows_e8_preserve_lookup():
+    attn = _StubAttn(head_dim=64)
+
+    _suppress_l15_lookup_during_current_store_generation(attn, _SetDim, 64)
+
+    row = 63
+    query = torch.zeros(512)
+    query[_SetDim.CONST] = 1.0
+    query[_SetDim.MARK_STACK0] = 1.0
+    query[_SetDim.ADDR_B0_LO + 8] = 1.0
+    query[_SetDim.ADDR_B0_HI + 14] = 1.0
+
+    f8_query = query.clone()
+    f8_query[_SetDim.ADDR_B0_HI + 14] = 0.0
+    f8_query[_SetDim.ADDR_B0_HI + 15] = 1.0
+
+    const_key = torch.zeros(512)
+    const_key[_SetDim.CONST] = 1.0
+
+    assert torch.dot(attn.W_q[row], query) == 0.0
+    assert torch.dot(attn.W_q[row], f8_query) > 0.0
+    assert torch.dot(attn.W_q[row], f8_query) * torch.dot(
+        attn.W_k[row], const_key
+    ) < 0.0
+
+    activation_row = 0
+    assert torch.dot(attn.W_q[activation_row], query) > 0.0
+    assert torch.dot(attn.W_q[activation_row], f8_query) < 0.0
+    store_anchor_row = 1
+    assert torch.dot(attn.W_q[store_anchor_row], query) > 0.0
+    assert torch.dot(attn.W_q[store_anchor_row], f8_query) < 0.0
+
+
+def test_layer15_lookup_blocks_mem_address_byte_queries_by_head():
+    attn = _StubAttn(head_dim=64)
+
+    _suppress_l15_lookup_during_current_store_generation(attn, _SetDim, 64)
+
+    byte_flags = {
+        1: _SetDim.BYTE_INDEX_0,
+        2: _SetDim.BYTE_INDEX_1,
+        3: _SetDim.BYTE_INDEX_2,
+    }
+    for head, byte_flag in byte_flags.items():
+        row = head * 64 + 36
+        assert attn.W_q[row, _SetDim.CONST] == 0.0
+        assert attn.W_q[row, _SetDim.H1 + 4] == 100000.0
+        assert attn.W_q[row, _SetDim.IS_BYTE] == 0.0
+        assert attn.W_q[row, byte_flag] == 0.0
+        assert attn.W_k[row, _SetDim.CONST] == -20.0
+
+
+def test_layer15_lookup_blocks_pc_byte_queries_by_head():
+    attn = _StubAttn(head_dim=64)
+
+    _suppress_l15_lookup_during_current_store_generation(attn, _SetDim, 64)
+
+    for head in range(4):
+        row = head * 64 + 35
+        assert attn.W_q[row, _SetDim.H1 + 0] == 100000.0
+        assert attn.W_q[row, _SetDim.IS_BYTE] == 0.0
+        assert attn.W_k[row, _SetDim.CONST] == -20.0
+
+
+def test_layer15_mem_addr0_query_sinks_head1_before_mem_addr1():
+    attn = _StubAttn(head_dim=64)
+
+    _suppress_l15_lookup_during_current_store_generation(attn, _SetDim, 64)
+
+    row = 1 * 64 + 36
+    query = torch.zeros(512)
+    query[_SetDim.CONST] = 1.0
+    query[_SetDim.H1 + 4] = 1.0
+    query[_SetDim.IS_BYTE] = 1.0
+    query[_SetDim.BYTE_INDEX_0] = 1.0
+
+    non_mem_query = query.clone()
+    non_mem_query[_SetDim.H1 + 4] = 0.0
+
+    stack0_marker_query = torch.zeros(512)
+    stack0_marker_query[_SetDim.CONST] = 1.0
+    stack0_marker_query[_SetDim.MARK_STACK0] = 1.0
+
+    const_key = torch.zeros(512)
+    const_key[_SetDim.CONST] = 1.0
+
+    q_value = torch.dot(attn.W_q[row], query)
+    assert q_value == 100000.0
+    assert torch.dot(attn.W_q[row], non_mem_query) == 0.0
+    assert torch.dot(attn.W_q[row], stack0_marker_query) == 0.0
+    assert q_value * torch.dot(attn.W_k[row], const_key) < -1_900_000.0
 
 
 def test_layer15_lookup_strengthens_local_slot_byte0_match():
@@ -227,6 +378,68 @@ def test_layer15_lookup_strengthens_local_slot_byte0_match():
         assert attn.W_k[exact_row, _SetDim.ADDR_B0_LO + 8] == 100.0
         assert attn.W_q[exact_row, _SetDim.ADDR_B0_LO + 0] == 0.0
         assert attn.W_k[exact_row, _SetDim.ADDR_B0_LO + 0] == 0.0
+
+
+def test_layer15_pop_stack0_marker_low0_query_prefers_low8_store_key():
+    attn = _StubAttn()
+
+    _suppress_l15_lookup_during_current_store_generation(attn, _SetDim, 64)
+
+    row = 34
+    query = torch.zeros(512)
+    query[_SetDim.CONST] = 1.0
+    query[_SetDim.MARK_STACK0] = 1.0
+    query[_SetDim.HAS_SE] = 1.0
+    query[_SetDim.CMP + 3] = 4.0
+    query[_SetDim.ADDR_B0_LO + 0] = 1.0
+
+    byte_query = query.clone()
+    byte_query[_SetDim.IS_BYTE] = 1.0
+    sp_query = query.clone()
+    sp_query[_SetDim.MARK_SP] = 1.0
+    store_query = query.clone()
+    store_query[_SetDim.MEM_STORE] = 1.0
+
+    key_low8 = torch.zeros(512)
+    key_low8[_SetDim.ADDR_B0_LO + 8] = 1.0
+
+    key_low0 = torch.zeros(512)
+    key_low0[_SetDim.ADDR_B0_LO + 0] = 1.0
+
+    q_value = torch.dot(attn.W_q[row], query)
+    assert q_value > 0.0
+    assert torch.dot(attn.W_q[row], byte_query) < 0.0
+    assert torch.dot(attn.W_q[row], sp_query) < 0.0
+    assert torch.dot(attn.W_q[row], store_query) < 0.0
+    assert torch.dot(attn.W_k[row], key_low8) > 0.0
+    assert torch.dot(attn.W_k[row], key_low0) == 0.0
+    assert q_value * torch.dot(attn.W_k[row], key_low8) > 1_000_000.0
+
+
+def test_layer15_pop_stack0_marker_low8_query_sinks_empty_stack_slot():
+    attn = _StubAttn()
+
+    _suppress_l15_lookup_during_current_store_generation(attn, _SetDim, 64)
+
+    row = 35
+    query = torch.zeros(512)
+    query[_SetDim.CONST] = 1.0
+    query[_SetDim.MARK_STACK0] = 1.0
+    query[_SetDim.HAS_SE] = 1.0
+    query[_SetDim.CMP + 3] = 4.0
+    query[_SetDim.ADDR_B0_LO + 8] = 1.0
+    query[_SetDim.ADDR_B0_HI + 15] = 1.0
+
+    non_stack0_query = query.clone()
+    non_stack0_query[_SetDim.MARK_STACK0] = 0.0
+
+    const_key = torch.zeros(512)
+    const_key[_SetDim.CONST] = 1.0
+
+    q_value = torch.dot(attn.W_q[row], query)
+    assert q_value > 0.0
+    assert torch.dot(attn.W_q[row], non_stack0_query) > 0.0
+    assert q_value * torch.dot(attn.W_k[row], const_key) < -1_000_000.0
 
 
 def test_layer15_local_slot_hi_nibble_mismatch_beats_adjacent_frame_slot():

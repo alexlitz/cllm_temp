@@ -30,6 +30,7 @@ def make_layer3_ffn_op() -> Operation:
         from ...vm_step import _set_layer3_ffn
         proxy = _as_setdim_proxy(dim_positions)
         _set_layer3_ffn(block.ffn, S, proxy)
+        _suppress_layer3_stack0_marker_carry_projection(block.ffn, S, proxy)
         _add_layer3_pc_byte1_output_rules(block.ffn, S, proxy)
 
     return Operation(
@@ -67,6 +68,118 @@ def _next_free_ffn_unit(ffn) -> int:
     )
     used = active.nonzero(as_tuple=True)[0]
     return int(used[-1].item() + 1) if len(used) else 0
+
+
+def _suppress_layer3_stack0_marker_carry_projection(ffn, S: float, BD) -> int:
+    """Disable stale previous-STACK0 projection at the STACK0 marker.
+
+    L3 head 4 carries the previous step's ``STACK0_byte0`` into
+    ``EMBED_LO/HI`` at the next ``STACK0`` marker.  That value is stale for
+    frame setup and other SP-changing steps because the current ``STACK0`` is
+    defined by the newly emitted SP, not by the prior top-of-stack.  The old
+    L3 FFN projected that carried byte directly to OUTPUT and left the stale
+    embed signal available for later stack tails to amplify.
+
+    Reuse those marker-position projection units as local suppressors: remove
+    their OUTPUT writes while preserving the carried EMBED band for later
+    stack-top reconstruction.
+    """
+
+    suppressed = 0
+    for unit in range(ffn.W_up.shape[0]):
+        up = ffn.W_up.data[unit]
+        gate = ffn.W_gate.data[unit]
+        if abs(float(up[BD.MARK_STACK0].item()) - S) > 1e-6:
+            continue
+        if abs(float(up[BD.HAS_SE].item()) - S) > 1e-6:
+            continue
+        if abs(float(ffn.b_up.data[unit].item()) + S * 1.5) > 1e-6:
+            continue
+
+        active_gate = gate.abs().nonzero(as_tuple=True)[0]
+        if len(active_gate) != 1:
+            continue
+        gate_dim = int(active_gate[0].item())
+        is_embed_lo = BD.EMBED_LO <= gate_dim < BD.EMBED_LO + 16
+        is_embed_hi = BD.EMBED_HI <= gate_dim < BD.EMBED_HI + 16
+        if not (is_embed_lo or is_embed_hi):
+            continue
+        if abs(float(gate[gate_dim].item()) - 1.0) > 1e-6:
+            continue
+
+        ffn.W_down.data[:, unit].zero_()
+        suppressed += 1
+    return suppressed
+
+
+def _rewrite_layer3_initial_sp_byte2_to_zero(ffn, S: float, BD) -> int:
+    """Materialize the emitted initial SP as ``0x0000fff8``.
+
+    The legacy L3 default was authored for the constructor value
+    ``STACK_INIT = 0x00010000`` and emits ``SP_byte2 = 0x01`` on the first
+    draft step.  The byte stream records state after the first instruction;
+    for compiled programs that first instruction is the startup JSR, so the
+    SP bytes are ``f8 ff 00 00``.  L10 exacts byte 0/1 from the emitted lower
+    bytes; this local L3 rewrite removes the remaining high-byte residue at
+    the owner unit without touching BP's true ``0x00010000`` default.
+    """
+
+    rewritten = 0
+    SP_I = 2
+    for unit in range(ffn.W_up.shape[0]):
+        up = ffn.W_up.data[unit]
+        gate = ffn.W_gate.data[unit]
+        if abs(float(up[BD.H1 + SP_I].item()) - S) > 1e-6:
+            continue
+        if abs(float(up[BD.BYTE_INDEX_1].item()) - S) > 1e-6:
+            continue
+        if abs(float(up[BD.HAS_SE].item()) + S) > 1e-6:
+            continue
+        if abs(float(ffn.b_up.data[unit].item()) + S * 1.5) > 1e-6:
+            continue
+        if abs(float(ffn.b_gate.data[unit].item()) - 1.0) > 1e-6:
+            continue
+        if gate.abs().sum().item() != 0:
+            continue
+        lo_one = float(ffn.W_down.data[BD.OUTPUT_LO + 1, unit].item())
+        if abs(lo_one - 2.0 / S) > 1e-6:
+            continue
+
+        ffn.W_down.data[BD.OUTPUT_LO + 1, unit] = 0.0
+        ffn.W_down.data[BD.OUTPUT_LO + 0, unit] = 2.0 / S
+        rewritten += 1
+    return rewritten
+
+
+def _rewrite_layer3_initial_sp_marker_to_f8(ffn, S: float, BD) -> int:
+    """Materialize initial emitted ``SP_byte0`` as ``0xf8`` at the SP marker."""
+
+    rewritten = 0
+    for unit in range(ffn.W_up.shape[0]):
+        up = ffn.W_up.data[unit]
+        gate = ffn.W_gate.data[unit]
+        if abs(float(up[BD.MARK_SP].item()) - S) > 1e-6:
+            continue
+        if abs(float(up[BD.HAS_SE].item()) + S) > 1e-6:
+            continue
+        if abs(float(ffn.b_up.data[unit].item()) + S * 0.5) > 1e-6:
+            continue
+        if abs(float(ffn.b_gate.data[unit].item()) - 1.0) > 1e-6:
+            continue
+        if gate.abs().sum().item() != 0:
+            continue
+
+        lo_zero = float(ffn.W_down.data[BD.OUTPUT_LO + 0, unit].item())
+        hi_zero = float(ffn.W_down.data[BD.OUTPUT_HI + 0, unit].item())
+        if abs(lo_zero - 2.0 / S) <= 1e-6:
+            ffn.W_down.data[BD.OUTPUT_LO + 0, unit] = 0.0
+            ffn.W_down.data[BD.OUTPUT_LO + 8, unit] = 2.0 / S
+            rewritten += 1
+        if abs(hi_zero - 2.0 / S) <= 1e-6:
+            ffn.W_down.data[BD.OUTPUT_HI + 0, unit] = 0.0
+            ffn.W_down.data[BD.OUTPUT_HI + 15, unit] = 2.0 / S
+            rewritten += 1
+    return rewritten
 
 
 def _write_pc_byte1_one(ffn, unit: int, BD, S: float, conditions) -> int:
@@ -256,26 +369,24 @@ def make_layer3_carry_forward_attn_op() -> Operation:
 
 
 def _stack0_carry_head_spec(BD) -> DeclarativeAttentionHeadSpec:
-    """Declarative L3 head 4: previous STACK0 byte0 -> current STACK0 marker."""
+    """Declarative L3 head 4: retire stale STACK0 marker carry.
+
+    Historical weights copied the previous ``STACK0_byte0`` into the current
+    STACK0 marker's EMBED band.  That marker row predicts the next byte, and
+    later marker identity paths can project the stale EMBED value back to
+    OUTPUT.  Leave the matcher structurally present but do not write a marker
+    value; real STACK0 bytes are supplied by the stack/memory paths.
+    """
 
     L = 15.0
     q = [AP(0, BD.MARK_STACK0, L)]
     k = [AP(0, BD.STACK0_BYTE0, L), AP(33, BD.CONST, L)]
-    v = []
-    o = []
-    for k_idx in range(16):
-        v.append(AP(1 + k_idx, BD.EMBED_LO + k_idx, 1.0))
-        v.append(AP(17 + k_idx, BD.EMBED_HI + k_idx, 1.0))
-        o.append(AO(BD.EMBED_LO + k_idx, 1 + k_idx, 1.0))
-        o.append(AO(BD.EMBED_HI + k_idx, 17 + k_idx, 1.0))
     q.append(AP(33, BD.MARK_STACK0, L))
     q.append(AP(33, BD.CONST, -L / 2))
     return DeclarativeAttentionHeadSpec(
         head_idx=4,
         q=tuple(q),
         k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
     )
 
 

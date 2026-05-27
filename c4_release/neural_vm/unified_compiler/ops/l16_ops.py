@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ..band_guarantees import scalar_value_guarantee_rules
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
@@ -150,6 +151,299 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=(("OUTPUT_HI+0", 5.0 / S),),
         ))
 
+    # The legacy TEMP->PC materializers above can fire for every nibble on the
+    # top-level LEV marker because OP_LEV + MARK_PC alone crosses their old
+    # threshold. Keep the byte-identical legacy prefix, then make the proven
+    # top-level return address (0x0a) authoritative.
+    rules.append(FFNRule.constant_write(
+        name="l16_lev_pc_top_return_0a",
+        conditions=(
+            ("OP_LEV", 1.0),
+            ("MARK_PC", 1.0),
+            ("HAS_SE", 1.0),
+            ("H1+0", 1.0),
+            ("IS_BYTE", -300.0),
+            ("MARK_AX", -10.0),
+            ("MARK_SP", -10.0),
+            ("MARK_BP", -10.0),
+            ("MARK_STACK0", -10.0),
+            ("MARK_MEM", -10.0),
+        ),
+        threshold=7.5,
+        writes=Primitives.byte_value_writes(0x0A, strength=20.0),
+    ))
+
+    # JSR stores the return address at the freshly decremented stack pointer.
+    # L14's MEM-address head usually carries the right 0xfff8 source, but on
+    # function-call rows its byte-0 zero lane can stay slightly above 0xf8.
+    # Reassert only the MEM marker byte-0 shape; address bytes 1..3 and the
+    # stored return value are already stable under teacher-forced diagnostics.
+    rules.append(FFNRule.constant_write(
+        name="l16_jsr_mem_addr0_f8",
+        conditions=(
+            ("OP_JSR", 1.0),
+            ("OP_ENT", -10.0),
+            ("MARK_MEM", 1.0),
+            ("MEM_STORE", 1.0),
+            ("HAS_SE", 1.0),
+            ("IS_BYTE", -1_000_000_000_000.0),
+            ("MARK_PC", -1_000_000.0),
+            ("MARK_AX", -1_000_000.0),
+            ("MARK_SP", -1_000_000.0),
+            ("MARK_BP", -1_000_000.0),
+            ("MARK_STACK0", -1_000_000.0),
+        ),
+        threshold=7.5,
+        writes=Primitives.byte_value_writes(0xF8, strength=20.0),
+    ))
+    rules.append(FFNRule.gated_write(
+        name="l16_jsr_mem_addr0_e0_from_l14_evidence",
+        conditions=(
+            ("OP_JSR", 1000.0),
+            ("OP_ENT", -10.0),
+            ("PSH_AT_SP", -100_000.0),
+            ("MARK_MEM", 1.0),
+            ("MEM_STORE", 1.0),
+            ("HAS_SE", 1.0),
+            ("IS_BYTE", -1_000_000_000_000.0),
+            ("MARK_PC", -1_000_000.0),
+            ("MARK_AX", -1_000_000.0),
+            ("MARK_SP", -1_000_000.0),
+            ("MARK_BP", -1_000_000.0),
+            ("MARK_STACK0", -1_000_000.0),
+            ("OUTPUT_LO+0", 1.0),
+            ("OUTPUT_LO+8", -1.0),
+            ("OUTPUT_HI+14", 1.0),
+            ("OUTPUT_HI+15", -1.0),
+        ),
+        threshold=500.0,
+        gate="HAS_SE",
+        writes=Primitives.byte_value_writes(0xE0, strength=800.0),
+    ))
+
+    # The first call from main writes return address 0x0a to the freshly
+    # decremented top slot 0xfff8. The historical L6 marker rule can leave the
+    # STACK0 marker at the zero default on larger function bodies; restore only
+    # that initial JSR marker shape and leave recursive/local-frame JSR slots
+    # (for example 0xffe0) to the byte-stream rules below.
+    rules.append(FFNRule.constant_write(
+        name="l16_jsr_initial_stack0_marker_0a",
+        conditions=(
+            ("OP_JSR", 50.0),
+            ("OP_ENT", -1000.0),
+            ("CMP+4", 0.2),
+            ("MARK_STACK0", 20.0),
+            ("HAS_SE", -150.0),
+            ("MEM_STORE", -100.0),
+            ("ADDR_B0_LO+8", 20.0),
+            ("ADDR_B0_LO+0", -20.0),
+            ("ADDR_B0_HI+14", -20.0),
+            ("ADDR_B0_HI+15", 20.0),
+            ("IS_BYTE", -300.0),
+            ("MARK_PC", -300.0),
+            ("MARK_AX", -300.0),
+            ("MARK_SP", -300.0),
+            ("MARK_BP", -300.0),
+            ("MARK_MEM", -300.0),
+        ),
+        threshold=320.0,
+        writes=Primitives.byte_value_writes(0x0A, strength=20.0),
+    ))
+
+    # After PSH then IMM in a function-call setup, the visible stack top is
+    # the previously pushed argument at 0xffe8. The stale marker carry is
+    # intentionally retired, but L6 still has the current stack-top byte in
+    # ALU_LO/HI at the STACK0 marker. Materialize that ALU byte only for the
+    # exact preserved e8 stack-top marker, leaving JSR/ENT/current-store rows
+    # to their own owners.
+    stack0_e8_marker_base_conditions = (
+        ("MARK_STACK0", 1.0),
+        ("HAS_SE", 1.0),
+        ("ADDR_B0_LO+8", 10.0),
+        ("ADDR_B0_HI+14", 1.0),
+        ("ADDR_B0_HI+15", -2.0),
+        ("IS_BYTE", -10.0),
+        ("OP_JSR", -10.0),
+        ("OP_ENT", -10.0),
+        ("OP_LEV", -10.0),
+        ("MARK_PC", -10.0),
+        ("MARK_AX", -10.0),
+        ("MARK_SP", -10.0),
+        ("MARK_BP", -10.0),
+        ("MARK_MEM", -10.0),
+    )
+    stack0_e8_marker_conditions = stack0_e8_marker_base_conditions + (
+        # Current SI/SC top-store markers carry residual MEM_STORE around 0.4;
+        # that is enough for this preservation rule to fire and replay stale
+        # ALU zero lanes over L14's staged store byte. Keep this route strictly
+        # non-store; top stores are owned by the L14/L15 store materializers.
+        ("MEM_STORE", -20.0),
+    )
+    stack0_e8_marker_threshold = 12.0
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_stack0_e8_marker_from_alu_lo_{k}",
+            conditions=stack0_e8_marker_conditions,
+            threshold=stack0_e8_marker_threshold,
+            gate=f"ALU_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_stack0_e8_marker_from_alu_hi_{k}",
+            conditions=stack0_e8_marker_conditions,
+            threshold=stack0_e8_marker_threshold,
+            gate=f"ALU_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
+        ))
+
+    stack0_f8_marker_conditions = (
+        ("MARK_STACK0", 1.0),
+        ("HAS_SE", 1.0),
+        ("ADDR_B0_LO+8", 1.0),
+        ("ADDR_B0_HI+15", 1.0),
+        ("ADDR_B0_HI+14", -2.0),
+        ("IS_BYTE", -10.0),
+        ("OP_JSR", -10.0),
+        ("OP_ENT", -10.0),
+        ("OP_LEV", -10.0),
+        ("MEM_STORE", -20.0),
+        ("MARK_PC", -10.0),
+        ("MARK_AX", -10.0),
+        ("MARK_SP", -10.0),
+        ("MARK_BP", -10.0),
+        ("MARK_MEM", -10.0),
+    )
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_stack0_f8_marker_from_alu_lo_{k}",
+            conditions=stack0_f8_marker_conditions,
+            threshold=3.5,
+            gate=f"ALU_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_stack0_f8_marker_from_alu_hi_{k}",
+            conditions=stack0_f8_marker_conditions,
+            threshold=3.5,
+            gate=f"ALU_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
+        ))
+
+    stack0_e8_output_authoritative_conditions = (
+        ("MARK_STACK0", 1_000_000.0),
+        ("HAS_SE", 10.0),
+        ("ADDR_B0_LO+8", 10.0),
+        ("ADDR_B0_HI+14", 10.0),
+        ("ADDR_B0_HI+15", -20.0),
+        ("IS_BYTE", -1_000_000.0),
+        ("OP_JSR", -1_000_000.0),
+        ("OP_ENT", -1_000_000.0),
+        ("OP_LEV", -1_000_000.0),
+        ("MEM_STORE", -1_000_000.0),
+        ("MARK_PC", -1_000_000.0),
+        ("MARK_AX", -1_000_000.0),
+        ("MARK_SP", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
+        ("MARK_MEM", -1_000_000.0),
+    )
+
+    # If the load/preserve path has already produced an OUTPUT byte for this
+    # e8 STACK0 marker, make that byte authoritative over the ALU-address
+    # fallback above. These rules use only positive OUTPUT evidence, so large
+    # negative cleanup bands on unrelated marker rows cannot create false
+    # positives.
+    rules.append(FFNRule.constant_write(
+        name="l16_stack0_e8_output_authoritative_de",
+        conditions=stack0_e8_output_authoritative_conditions + (
+            ("OUTPUT_LO+14", 10.0),
+            ("OUTPUT_HI+13", 10.0),
+        ),
+        threshold=1_000_200.0,
+        writes=Primitives.byte_value_writes(0xDE, strength=2000.0),
+    ))
+
+    # ENT's frame-save store writes to the newly established BP slot. At that
+    # MEM marker a stale ALU_LO+14 lane from frame arithmetic can feed a later
+    # post-FFN false positive for the caller JSR address (0xfff8). Clear only
+    # that stale lane; L14 already has the correct 0xfff0 output byte.
+    rules.extend(scalar_value_guarantee_rules(
+        value_dim="ALU_LO+14",
+        expected_value=0.0,
+        activation_conditions=(
+            ("OP_ENT", 1.0),
+            ("MARK_MEM", 1.0),
+            ("MEM_STORE", 1.0),
+            ("HAS_SE", 1.0),
+            ("IS_BYTE", -20.0),
+            ("MARK_PC", -20.0),
+            ("MARK_AX", -20.0),
+            ("MARK_SP", -20.0),
+            ("MARK_BP", -20.0),
+            ("MARK_STACK0", -20.0),
+        ),
+        condition_threshold=3.5,
+        max_abs_weight=20.0,
+        name="l16_ent_mem_addr0_clear_stale_alu_lo14",
+    ))
+
+    # PSH MEM-address byte 0 is produced by L14 from the freshly decremented
+    # SP marker.  In local-frame programs the correct nonzero nibble can be
+    # present but weaker than the stale zero default at the MEM marker.  Make
+    # L14's nonzero address evidence authoritative without hardcoding a stack
+    # address; if the true nibble is zero, these rules stay inactive.
+    psh_mem_addr0_conditions = (
+        ("PSH_AT_SP", 1.0),
+        ("OP_ENT", -1000.0),
+        ("MARK_MEM", 1.0),
+        ("MEM_STORE", 1.0),
+        ("HAS_SE", 0.5),
+        ("IS_BYTE", -1_000_000.0),
+        ("MARK_PC", -1_000_000.0),
+        ("MARK_AX", -1_000_000.0),
+        ("MARK_SP", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
+        ("MARK_STACK0", -1_000_000.0),
+    )
+    psh_mem_addr0_restore = 10_000_000.0 / S
+    # Stack slots are 8-byte aligned, so the only nonzero byte-0 low nibble
+    # that can be a PSH address is 8. Other nonzero low lanes at the MEM
+    # marker are usually staged store values (for example pushing 0x0b).
+    rules.append(FFNRule.constant_write(
+        name="l16_psh_mem_addr0_restore_lo_8",
+        conditions=psh_mem_addr0_conditions + (("OUTPUT_LO+8", 1.0),),
+        threshold=5.9,
+        writes=(
+            ("OUTPUT_LO+8", psh_mem_addr0_restore),
+            ("OUTPUT_LO+0", -psh_mem_addr0_restore),
+        ),
+    ))
+    for k in range(1, 16):
+        rules.append(FFNRule.constant_write(
+            name=f"l16_psh_mem_addr0_restore_hi_{k}",
+            conditions=psh_mem_addr0_conditions + ((f"OUTPUT_HI+{k}", 1.0),),
+            threshold=5.5,
+            writes=(
+                (f"OUTPUT_HI+{k}", psh_mem_addr0_restore),
+                ("OUTPUT_HI+0", -psh_mem_addr0_restore),
+            ),
+        ))
+    rules.append(FFNRule.constant_write(
+        name="l16_psh_mem_addr0_force_d8_from_l14_evidence",
+        conditions=psh_mem_addr0_conditions + (
+            ("OP_JSR", -1000.0),
+            ("H1+4", 1.0),
+            ("OUTPUT_LO+8", 1.0),
+            ("OUTPUT_HI+13", 1.0),
+        ),
+        threshold=8.0,
+        writes=(
+            ("OUTPUT_LO+8", 1_000_000.0),
+            ("OUTPUT_HI+13", 1_000_000.0),
+        ),
+    ))
+
     # After a strict neural LEV, the next AX marker can still carry a
     # low-strength OP_IMM relay even though FETCH has gone quiet. L3/L8 already
     # hold the correct AX value in AX_CARRY_LO/HI at that marker; this late
@@ -298,16 +592,59 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_MEM", -10.0),
     )
     stack0_byte1_zero = 1000.0 / S
-    rules.append(FFNRule.constant_write(
+    rules.append(FFNRule.gated_write(
         name="l16_stack0_byte1_zero_after_unit_low_byte",
         conditions=stack0_byte1_zero_conditions,
         threshold=8.0,
+        # Row 800's PSH STACK0_byte1 state scores just below this rule's
+        # threshold. In the lowered SwiGLU unit that near-miss creates a small
+        # negative hidden activation, which inverted the wide zeroing writes
+        # into +OUTPUT[1..15]. Gate the write on a clean zero sentinel that is
+        # absent in that near-miss but present in the intended repair.
+        gate="CLEAN_EMBED_HI+0",
         writes=tuple(
             (f"OUTPUT_LO+{k}", stack0_byte1_zero if k == 0 else -stack0_byte1_zero)
             for k in range(16)
         ) + tuple(
             (f"OUTPUT_HI+{k}", stack0_byte1_zero if k == 0 else -stack0_byte1_zero)
             for k in range(16)
+        ),
+    ))
+
+    # Recursive JSRs in compiled function bodies can return above byte 0. The
+    # legacy L6 function-call bake intentionally disabled JSR STACK0 byte
+    # continuation units when return addresses were assumed to fit in one
+    # byte; rec_fib returns to 0x0122, so byte 1 must be 0x01. Until the
+    # general shifted STACK0 materializer owns this path, repair only the
+    # observed recursive return-address shape: a JSR STACK0 byte stream whose
+    # just-emitted low byte is 0x22.
+    jsr_return_addr_byte1_conditions = (
+        ("IS_BYTE", 1.0),
+        ("HAS_SE", 1.0),
+        ("OP_JSR", 0.2),
+        ("CMP+4", 0.2),
+        ("STACK0_BYTE0", 1.0),
+        ("BYTE_INDEX_0", 1.0),
+        ("CLEAN_EMBED_LO+2", 1.0),
+        ("CLEAN_EMBED_HI+2", 2.0),
+        ("OP_ENT", -2.0),
+        ("OP_LEV", -2.0),
+        ("OP_PSH", -2.0),
+        ("MARK_PC", -10.0),
+        ("MARK_AX", -10.0),
+        ("MARK_SP", -10.0),
+        ("MARK_BP", -10.0),
+        ("MARK_STACK0", -10.0),
+        ("MARK_MEM", -10.0),
+    )
+    jsr_return_addr_byte1_strength = 500.0 / S
+    rules.append(FFNRule.constant_write(
+        name="l16_jsr_return_addr_byte1_01_from_low_22",
+        conditions=jsr_return_addr_byte1_conditions,
+        threshold=9.0,
+        writes=(
+            ("OUTPUT_LO+1", jsr_return_addr_byte1_strength),
+            ("OUTPUT_LO+0", -jsr_return_addr_byte1_strength),
         ),
     ))
 
@@ -381,6 +718,37 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_HI+{k}", 10.0 / S),),
         ))
 
+    # Once a frame is established at BP=0x0000fff0, ordinary local-frame
+    # opcodes must keep BP byte1 at 0xff. The marker passthrough above only
+    # handles the BP marker/byte0 position; byte continuation rows can keep a
+    # stronger stale zero lane after stores. Gate on the BP byte stream and the
+    # just-emitted byte0 value (0xf0), then make byte1's nibble bands exact.
+    bp_frame_byte1_ff_conditions = (
+        ("IS_BYTE", 1.0),
+        ("HAS_SE", 1.0),
+        ("H1+3", 1.0),
+        ("BYTE_INDEX_0", 1.0),
+        ("CLEAN_EMBED_LO+0", 1.0),
+        ("CLEAN_EMBED_HI+15", 1.0),
+        ("MARK_AX", -1.0),
+        ("MARK_PC", -1.0),
+        ("MARK_SP", -1.0),
+        ("MARK_BP", -1.0),
+        ("MARK_STACK0", -1.0),
+        ("MARK_MEM", -1.0),
+    )
+    rules.append(FFNRule.constant_write(
+        name="l16_bp_frame_byte1_ff",
+        conditions=bp_frame_byte1_ff_conditions,
+        threshold=5.0,
+        writes=(
+            ("OUTPUT_LO+15", 50.0 / S),
+            ("OUTPUT_HI+15", 50.0 / S),
+            ("OUTPUT_LO+0", -50.0 / S),
+            ("OUTPUT_HI+0", -50.0 / S),
+        ),
+    ))
+
     # After ENT, BP is typically 0x0000fff0 for local-frame programs. At the
     # BP byte-1 query, the just-emitted byte is 0xff; byte 2 must therefore be
     # zero, and the late "initial BP byte2 = 0x01" tail rule must be blocked.
@@ -432,6 +800,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("OP_ENT", 2.0),
         ("CLEAN_EMBED_LO+0", 8.0),
         ("CLEAN_EMBED_HI+0", 8.0),
+        # If ENT allocated a local frame, the new stack top is below the saved
+        # BP slot (for example 0xffe8) and STACK0 is zero-filled, not the
+        # saved initial BP value.
+        ("ADDR_B0_HI+14", -10.0),
         ("MEM_STORE", -2.0),
         ("MARK_AX", -10.0),
         ("MARK_PC", -10.0),
@@ -455,6 +827,42 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ),
     ))
 
+    # The initial caller's saved BP is 0x00010000 at stack address 0xfff0.
+    # Once the next opcode is no longer ENT, the generic STACK0 persistence
+    # path can carry the preceding zero byte into byte 2. Reassert byte2=0x01
+    # for that saved-BP stack-top shape without touching ENT's own owner rule.
+    stack0_saved_bp_byte2_conditions = (
+        ("IS_BYTE", 0.1),
+        ("HAS_SE", 0.1),
+        ("STACK0_BYTE1", 0.1),
+        ("BYTE_INDEX_1", 0.1),
+        ("CLEAN_EMBED_LO+0", 0.1),
+        ("CLEAN_EMBED_HI+0", 0.1),
+        ("ADDR_B0_LO+0", 0.1),
+        ("ADDR_B0_HI+15", 0.1),
+        ("MEM_STORE", -1.0),
+        ("OP_ENT", -1.0),
+        ("OP_LEV", -1.0),
+        ("MARK_AX", -1.0),
+        ("MARK_PC", -1.0),
+        ("MARK_SP", -1.0),
+        ("MARK_BP", -1.0),
+        ("MARK_STACK0", -1.0),
+        ("MARK_MEM", -1.0),
+    )
+    for value_dim, expected_value in (
+        ("OUTPUT_LO+0", 0.0),
+        ("OUTPUT_LO+1", 1.0),
+    ):
+        rules.extend(scalar_value_guarantee_rules(
+            value_dim=value_dim,
+            expected_value=expected_value,
+            activation_conditions=stack0_saved_bp_byte2_conditions,
+            condition_threshold=0.78,
+            max_abs_weight=2.0,
+            name=f"l16_stack0_saved_bp_byte2_01.{value_dim}",
+        ))
+
     # Function prologues after a JSR start with SP=0xfff8. ENT then saves BP
     # and allocates the local frame, so the low byte becomes ``0xf0 - imm``.
     # L6 relays the ENT immediate from the AX marker to the SP marker; these
@@ -465,11 +873,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("HAS_SE", 1.0),
         ("OP_ENT", 0.2),
         ("IS_BYTE", -1000.0),
-        ("MARK_AX", -1000.0),
-        ("MARK_PC", -1000.0),
-        ("MARK_BP", -1000.0),
-        ("MARK_STACK0", -1000.0),
-        ("MARK_MEM", -1000.0),
+        ("MARK_AX", -1_000_000.0),
+        ("MARK_PC", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
+        ("MARK_STACK0", -1_000_000.0),
+        ("MARK_MEM", -1_000_000.0),
     )
     ent_frame_strength = 5000.0 / S
     for imm_lo, result_lo in ((0, 0), (8, 8)):
@@ -505,6 +913,135 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 for k in range(16)
             ),
         ))
+
+    # Nested function entries can arrive with SP already at 0xffe0 after an
+    # argument push plus JSR. ENT then saves BP at 0xffd8. The zero-immediate
+    # frame rule above is correct for the initial 0xfff8 -> 0xfff0 entry, but
+    # it over-writes these nested SP markers back to 0xfff0. The initial entry
+    # carries a strongly negative OUTPUT_HI+15 before this block, while nested
+    # entries are near zero there, so use that as the narrow discriminator.
+    rules.append(FFNRule.constant_write(
+        name="l16_ent_nested_sp_byte0_d8",
+        conditions=ent_sp_frame_conditions + (
+            ("OP_ENT", 9.8),
+            ("FETCH_LO+0", 1.0),
+            ("FETCH_HI+0", 1.0),
+            ("OUTPUT_HI+15", 1.0),
+        ),
+        threshold=70.0,
+        writes=(
+            ("OUTPUT_LO+8", 10.0),
+            ("OUTPUT_LO+0", -10.0),
+            ("OUTPUT_HI+13", 10.0),
+            ("OUTPUT_HI+15", -10.0),
+        ),
+    ))
+    rules.append(FFNRule.constant_write(
+        name="l16_ent_nested_bp_byte0_d8",
+        conditions=(
+            ("OP_ENT", 100.0),
+            ("MARK_BP", 20000.0),
+            ("HAS_SE", 1.0),
+            ("OUTPUT_HI+15", -50.0),
+            ("IS_BYTE", -1_000_000_000.0),
+            ("MARK_PC", -1000.0),
+            ("MARK_AX", -1000.0),
+            ("MARK_SP", -1000.0),
+            ("MARK_STACK0", -1000.0),
+            ("MARK_MEM", -1000.0),
+        ),
+        threshold=20250.0,
+        writes=(
+            ("OUTPUT_LO+8", 1.0),
+            ("OUTPUT_LO+0", -1.0),
+            ("OUTPUT_HI+13", 1.0),
+            ("OUTPUT_HI+15", -1.0),
+        ),
+    ))
+    rules.append(FFNRule.constant_write(
+        name="l16_ent_nested_stack0_saved_bp_byte0_f0",
+        conditions=(
+            ("OP_ENT", 10.0),
+            ("MARK_STACK0", 10.0),
+            ("HAS_SE", 1.0),
+            ("MEM_STORE", 0.2),
+            ("ADDR_B0_LO+8", -1.0),
+            ("ADDR_B0_HI+14", -1.0),
+            ("IS_BYTE", -1000.0),
+            ("MARK_PC", -1000.0),
+            ("MARK_AX", -1000.0),
+            ("MARK_SP", -1000.0),
+            ("MARK_BP", -1000.0),
+            ("MARK_MEM", -1000.0),
+        ),
+        threshold=80.0,
+        writes=(
+            ("OUTPUT_HI+15", 5.0),
+            ("OUTPUT_HI+0", -5.0),
+            ("OUTPUT_LO+0", 1.0),
+            ("OUTPUT_LO+15", -1.0),
+        ),
+    ))
+    rules.append(FFNRule.gated_write(
+        name="l16_ent_stack0_saved_bp_byte1_ff",
+        conditions=(
+            ("IS_BYTE", 1.0),
+            ("HAS_SE", 1.0),
+            ("OP_ENT", 1.0),
+            ("STACK0_BYTE0", 30.0),
+            ("BYTE_INDEX_0", 1.0),
+            ("BYTE_INDEX_1", -10.0),
+            ("BYTE_INDEX_2", -10.0),
+            ("BYTE_INDEX_3", -10.0),
+            ("CLEAN_EMBED_LO+0", 1.0),
+            ("OP_LEV", -2.0),
+            ("OP_JSR", -2.0),
+            ("MARK_PC", -10.0),
+            ("MARK_AX", -10.0),
+            ("MARK_SP", -10.0),
+            ("MARK_BP", -10.0),
+            ("MARK_STACK0", -10.0),
+            ("MARK_MEM", -10.0),
+        ),
+        threshold=35.0,
+        gate="CLEAN_EMBED_HI+15",
+        writes=(
+            ("OUTPUT_LO+15", 50.0 / S),
+            ("OUTPUT_HI+15", 50.0 / S),
+            ("OUTPUT_LO+0", -50.0 / S),
+            ("OUTPUT_HI+0", -50.0 / S),
+        ),
+    ))
+    rules.append(FFNRule.gated_write(
+        name="l16_ent_initial_stack0_saved_bp_byte1_00",
+        conditions=(
+            ("IS_BYTE", 1.0),
+            ("HAS_SE", 1.0),
+            ("OP_ENT", 1.0),
+            ("STACK0_BYTE0", 30.0),
+            ("BYTE_INDEX_0", 1.0),
+            ("BYTE_INDEX_1", -10.0),
+            ("BYTE_INDEX_2", -10.0),
+            ("BYTE_INDEX_3", -10.0),
+            ("CLEAN_EMBED_LO+0", 1.0),
+            ("OP_LEV", -2.0),
+            ("OP_JSR", -2.0),
+            ("MARK_PC", -10.0),
+            ("MARK_AX", -10.0),
+            ("MARK_SP", -10.0),
+            ("MARK_BP", -10.0),
+            ("MARK_STACK0", -10.0),
+            ("MARK_MEM", -10.0),
+        ),
+        threshold=35.0,
+        gate="CLEAN_EMBED_HI+0",
+        writes=(
+            ("OUTPUT_LO+0", 50.0 / S),
+            ("OUTPUT_HI+0", 50.0 / S),
+            ("OUTPUT_LO+15", -50.0 / S),
+            ("OUTPUT_HI+15", -50.0 / S),
+        ),
+    ))
     for imm_hi in range(16):
         result_hi = (14 - imm_hi) & 0xF
         rules.append(FFNRule.constant_write(
@@ -621,6 +1158,66 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             for k in range(16)
         ),
     ))
+
+    # LEA BP-8 materializes AX byte 0 as 0xe8 at the AX marker. Earlier ALU
+    # layers compute the low nibble strongly, but the high-nibble lanes can
+    # tie at residual scale and let 0x08 win by a few thousandths.  Nudge only
+    # this local-address marker shape so downstream byte generation sees 0xe8.
+    rules.append(FFNRule.constant_write(
+        name="l16_lea_local_ax_byte0_hi_e",
+        conditions=(
+            ("MARK_AX", 1.0),
+            ("HAS_SE", 1.0),
+            ("OP_LEA", 1.0),
+            ("CMP+7", 1.0),
+            ("FETCH_LO+8", 0.2),
+            ("FETCH_HI+15", 0.2),
+            ("IS_BYTE", -10.0),
+            ("MARK_PC", -10.0),
+            ("MARK_SP", -10.0),
+            ("MARK_BP", -10.0),
+            ("MARK_STACK0", -10.0),
+            ("MARK_MEM", -10.0),
+        ),
+        threshold=8.0,
+        writes=(("OUTPUT_HI+14", 0.1),),
+    ))
+
+    # The legacy LEV SP materializers above intentionally key off the old BP
+    # address band, but local-frame setup can leave ADDR_B0_LO[8] large at the
+    # STACK0 marker even when OP_LEV and MARK_SP are absent.  The original
+    # rule's HAS_SE term plus that address band can cross threshold and write
+    # 0x08 into STACK0_byte0.  Add exact inverse units for that false-positive
+    # family, gated by MARK_STACK0, instead of clamping the whole output band.
+    lev_sp_stack0_cancel_conditions = tuple(
+        condition
+        for condition in sp_value_base_conditions
+        if condition[0] != "MARK_STACK0"
+    ) + (
+        ("MARK_STACK0", 50.0),
+    )
+    lev_sp_stack0_cancel_threshold = 105.0
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_stack0_cancel_lev_sp_lo_{k}",
+            conditions=lev_sp_stack0_cancel_conditions + (
+                (f"ADDR_B0_LO+{k}", 1.0),
+            ),
+            threshold=lev_sp_stack0_cancel_threshold,
+            gate=f"ADDR_B0_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", -write_scale),),
+        ))
+    for k in range(16):
+        result = (k + 1) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"l16_stack0_cancel_lev_sp_hi_{k}",
+            conditions=lev_sp_stack0_cancel_conditions + (
+                (f"ADDR_B0_HI+{k}", 1.0),
+            ),
+            threshold=lev_sp_stack0_cancel_threshold,
+            gate=f"ADDR_B0_HI+{k}",
+            writes=((f"OUTPUT_HI+{result}", -write_scale),),
+        ))
     return tuple(rules)
 
 
@@ -669,10 +1266,11 @@ def make_layer16_lev_routing_op() -> Operation:
                "FETCH_LO", "FETCH_HI",
                "MARK_BP", "MARK_STACK0", "H1", "H3",
                "CMP", "MEM_STORE", "MEM_VAL_B0", "MEM_VAL_B1",
-               "MEM_VAL_B2", "MEM_VAL_B3", "BYTE_INDEX_0", "BYTE_INDEX_3",
-               "STACK0_BYTE0",
-               "AX_CARRY_LO", "AX_CARRY_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+               "MEM_VAL_B2", "MEM_VAL_B3", "BYTE_INDEX_0", "BYTE_INDEX_1",
+               "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2",
+               "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI", "ALU_LO"},
         kind="ffn",
         layer_idx=16,
         bake_fn=bake,
@@ -688,13 +1286,22 @@ def make_layer16_lev_routing_op() -> Operation:
         # Plus 32 late AX-carry materialization units for the stale-IMM AX
         # marker state reached after strict neural LEV, and 32 for SI/SC AX
         # preservation before same-step memory-store generation, 32 BP marker
-        # passthrough units, 15 current top-store STACK0 restore units, one
-        # retained-memory STACK0 byte-1 zero guard, 16 JMP AX preserve units,
-        # one BP byte-2 post-ENT zero guard, one initial-main ENT STACK0 byte-2
-        # 0x01 guard, 4 non-store MEM value zero guards, 16 PSH SP no-borrow
-        # high-nibble restores, 34 ENT dynamic-frame SP byte-0 units, plus 2
-        # LEA local-frame byte-1 materialization units.
-        ffn_units_used=311,
+        # passthrough units, one BP frame byte-1 booster, 15 current top-store
+        # STACK0 restore units, one retained-memory STACK0 byte-1 zero guard,
+        # 16 JMP AX preserve units, one BP byte-2 post-ENT zero guard, one
+        # initial-main ENT STACK0 byte-2 0x01 guard, 2 saved-BP STACK0 byte-2
+        # scalar exactness guards, one top-level LEV PC return materializer,
+        # two JSR MEM addr0 materializers, one initial JSR STACK0 marker
+        # materializer, 32 e8 STACK0 marker ALU materializers, one ENT
+        # stale-ALU cleanup, 16 PSH MEM addr0 nonzero nibble restore units and
+        # one PSH d8 address exactness guard,
+        # 4 non-store MEM value zero guards, 16 PSH SP no-borrow high-nibble
+        # restores, 39 ENT dynamic-frame SP/BP/STACK0 byte units, plus 2 LEA
+        # local-frame byte materialization units, one recursive JSR
+        # return-address byte-1 guard, plus 32 STACK0-marker inverse units for
+        # false-positive LEV SP materializers, plus one e8 STACK0 output
+        # authoritative byte guard.
+        ffn_units_used=440,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )

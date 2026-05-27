@@ -56,7 +56,7 @@ from __future__ import annotations
 import inspect
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -66,6 +66,45 @@ from .layer_compiler import LayerCompiler, Operation, operation_display_label
 
 _LEGACY_HELPER_CALL_RE = re.compile(r"\b_set_[A-Za-z0-9_]+\(")
 _LAYER_PREFIX_RE = re.compile(r"^(?:layer|l)\d+_")
+
+
+_LOWERING_STEP_SLOT_NAMES: Tuple[str, ...] = (
+    "REG_PC",
+    "PC_byte0",
+    "PC_byte1",
+    "PC_byte2",
+    "PC_byte3",
+    "REG_AX",
+    "AX_byte0",
+    "AX_byte1",
+    "AX_byte2",
+    "AX_byte3",
+    "REG_SP",
+    "SP_byte0",
+    "SP_byte1",
+    "SP_byte2",
+    "SP_byte3",
+    "REG_BP",
+    "BP_byte0",
+    "BP_byte1",
+    "BP_byte2",
+    "BP_byte3",
+    "STACK0",
+    "STACK0_byte0",
+    "STACK0_byte1",
+    "STACK0_byte2",
+    "STACK0_byte3",
+    "MEM",
+    "MEM_addr0",
+    "MEM_addr1",
+    "MEM_addr2",
+    "MEM_addr3",
+    "MEM_value0",
+    "MEM_value1",
+    "MEM_value2",
+    "MEM_value3",
+    "STEP_END",
+)
 
 
 def semantic_op_label(op_name: str) -> str:
@@ -219,6 +258,669 @@ class StaticVerificationReport:
 def _claim_sort_key(claim):
     layer_idx, scope, identifier, column = claim
     return (layer_idx, scope, identifier, "" if column is None else column)
+
+
+# ---------------------------------------------------------------------------
+# Mode C: teacher-forced lowering support probes
+# ---------------------------------------------------------------------------
+
+
+def _token_label(token: int) -> str:
+    if 0 <= int(token) < 256:
+        return f"0x{int(token):02x}"
+    try:
+        from ..vm_step import Token
+    except Exception:
+        return str(token)
+    for name, value in vars(Token).items():
+        if name.isupper() and value == token:
+            return name
+    return str(token)
+
+
+def _slot_offset(slot_name: str) -> int:
+    try:
+        return _LOWERING_STEP_SLOT_NAMES.index(slot_name)
+    except ValueError as exc:
+        raise KeyError(f"unknown VM-step slot {slot_name!r}") from exc
+
+
+@dataclass(frozen=True)
+class TeacherForcedSymbolicTrace:
+    """Declarative token stream used to teacher-force one lowering probe.
+
+    ``context`` is the exact symbolic stream that the neural model should emit:
+    immutable CODE/DATA prefix followed by 35-token VM rows.  Tests usually
+    select a row with ``token_index(step, slot)`` and then call
+    :func:`verify_teacher_forced_token_support`.
+    """
+
+    context: Tuple[int, ...]
+    prefix_len: int
+    steps: int
+    exit_code: Optional[int]
+    halted: bool
+    mem_store_positions: Tuple[int, ...] = ()
+    early_exit: bool = False
+
+    def token_index(self, step: int, slot_name: str) -> int:
+        if step < 0:
+            raise ValueError("step must be non-negative")
+        return (
+            self.prefix_len
+            + step * len(_LOWERING_STEP_SLOT_NAMES)
+            + _slot_offset(slot_name)
+        )
+
+    def token_for(self, step: int, slot_name: str) -> int:
+        index = self.token_index(step, slot_name)
+        return int(self.context[index])
+
+
+@dataclass(frozen=True)
+class LoweringSupportSnapshot:
+    """Head support for one residual snapshot at the probed token row."""
+
+    label: str
+    block_index: Optional[int]
+    original_layer_index: Optional[int]
+    expected_token: int
+    argmax_token: int
+    expected_logit: float
+    argmax_logit: float
+    expected_margin: float
+    residual_note: str = ""
+    output_byte: Optional[int] = None
+    output_lo_argmax: Optional[int] = None
+    output_hi_argmax: Optional[int] = None
+
+    @property
+    def supports_expected_argmax(self) -> bool:
+        return self.argmax_token == self.expected_token
+
+    @property
+    def supports_expected_byte_channel(self) -> bool:
+        if not 0 <= int(self.expected_token) < 256:
+            return True
+        return self.output_byte == self.expected_token
+
+    def format(self) -> str:
+        block = "-" if self.block_index is None else str(self.block_index)
+        layer = (
+            "-"
+            if self.original_layer_index is None
+            else str(self.original_layer_index)
+        )
+        byte = ""
+        if 0 <= int(self.expected_token) < 256:
+            output_label = (
+                "<missing>"
+                if self.output_byte is None
+                else _token_label(self.output_byte)
+            )
+            byte = (
+                f" output_byte={output_label}"
+                f" lo_arg={self.output_lo_argmax}"
+                f" hi_arg={self.output_hi_argmax}"
+            )
+        note = f" {self.residual_note}" if self.residual_note else ""
+        return (
+            f"block={block} layer={layer} label={self.label!r} "
+            f"expected={_token_label(self.expected_token)} "
+            f"argmax={_token_label(self.argmax_token)} "
+            f"expected_logit={self.expected_logit:+.2f} "
+            f"argmax_logit={self.argmax_logit:+.2f} "
+            f"margin={self.expected_margin:+.2f}"
+            f"{byte}{note}"
+        )
+
+
+@dataclass(frozen=True)
+class TeacherForcedTokenSupportReport:
+    """Result of a teacher-forced symbolic-token lowering probe."""
+
+    probe_name: str
+    token_index: int
+    expected_token: int
+    prefix_len: int
+    logit_pos: int
+    min_margin: float
+    snapshots: Tuple[LoweringSupportSnapshot, ...]
+
+    @property
+    def final(self) -> LoweringSupportSnapshot:
+        return self.snapshots[-1]
+
+    @property
+    def supported(self) -> bool:
+        final = self.final
+        return (
+            final.argmax_token == self.expected_token
+            and final.expected_margin >= self.min_margin
+            and final.supports_expected_byte_channel
+        )
+
+    @property
+    def first_loss_after_support(self) -> Optional[LoweringSupportSnapshot]:
+        saw_support = False
+        for snapshot in self.snapshots:
+            if (
+                snapshot.argmax_token == self.expected_token
+                and snapshot.expected_margin >= self.min_margin
+            ):
+                saw_support = True
+                continue
+            if saw_support:
+                return snapshot
+        return None
+
+    def format(self) -> str:
+        loss = self.first_loss_after_support
+        loss_part = (
+            " first_loss_after_support=" + loss.format()
+            if loss is not None
+            else ""
+        )
+        return (
+            f"teacher_forced_lowering_probe={self.probe_name!r} "
+            f"token_index={self.token_index} expected="
+            f"{_token_label(self.expected_token)} supported={self.supported} "
+            f"final={self.final.format()}{loss_part}"
+        )
+
+
+@dataclass(frozen=True)
+class TeacherForcedTraceAuditFailure:
+    """One final-head mismatch in a teacher-forced symbolic trace audit."""
+
+    token_index: int
+    step: int
+    slot: str
+    expected_token: int
+    argmax_token: int
+    expected_margin: float
+    output_byte: Optional[int] = None
+
+    def format(self) -> str:
+        byte = (
+            ""
+            if self.output_byte is None
+            else f" output_byte={_token_label(self.output_byte)}"
+        )
+        return (
+            f"step{self.step}:{self.slot} abs={self.token_index} "
+            f"expected={_token_label(self.expected_token)} "
+            f"argmax={_token_label(self.argmax_token)} "
+            f"margin={self.expected_margin:+.2f}{byte}"
+        )
+
+
+@dataclass(frozen=True)
+class TeacherForcedTraceAuditReport:
+    """Final lowered-model support audit for all selected symbolic tokens."""
+
+    probe_name: str
+    checked: int
+    failures: Tuple[TeacherForcedTraceAuditFailure, ...]
+
+    @property
+    def passed(self) -> bool:
+        return not self.failures
+
+    def format(self) -> str:
+        if self.passed:
+            return (
+                f"teacher_forced_trace_audit={self.probe_name!r} "
+                f"checked={self.checked} failures=0"
+            )
+        failures = "; ".join(f.format() for f in self.failures)
+        return (
+            f"teacher_forced_trace_audit={self.probe_name!r} "
+            f"checked={self.checked} failures={len(self.failures)} "
+            f"{failures}"
+        )
+
+
+def _u32_bytes(value: int) -> Tuple[int, int, int, int]:
+    value &= 0xFFFFFFFF
+    return (
+        value & 0xFF,
+        (value >> 8) & 0xFF,
+        (value >> 16) & 0xFF,
+        (value >> 24) & 0xFF,
+    )
+
+
+def build_teacher_forced_symbolic_trace(
+    bytecode: Sequence[int],
+    data: Sequence[int] | bytes = b"",
+) -> TeacherForcedSymbolicTrace:
+    """Build the runtime-authoritative teacher-forced symbolic token stream.
+
+    The batched pure-neural runner stops after a completed step when the
+    model-emitted PC points at ``EXIT``.  Mirror that contract here so the
+    structural verifier checks the rows the neural runtime actually requires,
+    instead of demanding an extra symbolic EXIT/HALT row that is never emitted.
+    """
+
+    from ..constants import IMMEDIATE_SIZE, INSTR_WIDTH, PADDING_SIZE
+    from ..embedding import Opcode
+    from ..vm_step import Token
+    from .symbolic_program import SymbolicDeclarativeProgramRunner
+
+    context: List[int] = [Token.CODE_START]
+    for instr in bytecode:
+        op = int(instr) & 0xFF
+        imm = int(instr) >> 8
+        context.append(op)
+        for i in range(IMMEDIATE_SIZE):
+            context.append((imm >> (i * 8)) & 0xFF)
+        for _ in range(PADDING_SIZE):
+            context.append(0)
+    context.extend([Token.CODE_END, Token.DATA_START])
+    context.extend(int(b) & 0xFF for b in data)
+    context.append(Token.DATA_END)
+    prefix_len = len(context)
+
+    store_opcodes = {
+        int(Opcode.SI),
+        int(Opcode.SC),
+        int(Opcode.PSH),
+        int(Opcode.ENT),
+        int(Opcode.JSR),
+    }
+    mem_store_positions: List[int] = []
+
+    symbolic = SymbolicDeclarativeProgramRunner()
+    state = symbolic.init_state(bytecode, data)
+    early_exit = False
+    while symbolic.step(state):
+        trace = state.trace[-1]
+        step_base = len(context)
+        pc_bytes = _u32_bytes(state.pc)
+        ax_bytes = _u32_bytes(state.ax)
+        sp_bytes = _u32_bytes(state.sp)
+        bp_bytes = _u32_bytes(state.bp)
+        stack0_bytes = _u32_bytes(state.mem_read(state.sp))
+        mem_addr_bytes = _u32_bytes(trace.mem_addr)
+        mem_value_bytes = _u32_bytes(trace.mem_value)
+        context.extend((
+            Token.REG_PC, *pc_bytes,
+            Token.REG_AX, *ax_bytes,
+            Token.REG_SP, *sp_bytes,
+            Token.REG_BP, *bp_bytes,
+            Token.STACK0, *stack0_bytes,
+            Token.MEM, *mem_addr_bytes, *mem_value_bytes,
+            Token.HALT if state.halted else Token.STEP_END,
+        ))
+        if int(trace.opcode) in store_opcodes:
+            mem_store_positions.append(step_base + _slot_offset("MEM"))
+        if state.halted:
+            break
+        next_idx = int(state.pc) // INSTR_WIDTH
+        if 0 <= next_idx < len(bytecode):
+            next_op = int(bytecode[next_idx]) & 0xFF
+            if next_op == int(Opcode.EXIT):
+                early_exit = True
+                break
+
+    return TeacherForcedSymbolicTrace(
+        context=tuple(int(t) for t in context),
+        prefix_len=prefix_len,
+        steps=state.steps,
+        exit_code=state.ax if state.halted or early_exit else None,
+        halted=state.halted or early_exit,
+        mem_store_positions=tuple(mem_store_positions),
+        early_exit=early_exit,
+    )
+
+
+def _head_logits_for_residual(model, row: torch.Tensor) -> torch.Tensor:
+    from ..vm_step import sparse_linear
+
+    if getattr(model.head.weight, "is_sparse", False):
+        return sparse_linear(
+            row.unsqueeze(0), model.head.weight, model.head.bias
+        ).squeeze(0)
+    return model.head(row.unsqueeze(0)).squeeze(0)
+
+
+def _dim_position(model, name: str) -> int:
+    from ..vm_step import _SetDim
+
+    positions = getattr(model, "dim_positions", None)
+    if isinstance(positions, dict) and name in positions:
+        return int(positions[name])
+    return int(getattr(_SetDim, name))
+
+
+def _lowering_residual_note(model, row: torch.Tensor, token: int) -> str:
+    if not 0 <= int(token) < 256:
+        return ""
+    out_lo = _dim_position(model, "OUTPUT_LO")
+    out_hi = _dim_position(model, "OUTPUT_HI")
+    lo = int(token) & 0xF
+    hi = (int(token) >> 4) & 0xF
+    lo_band = row[out_lo : out_lo + 16]
+    hi_band = row[out_hi : out_hi + 16]
+    lo_arg = int(torch.argmax(lo_band).item())
+    hi_arg = int(torch.argmax(hi_band).item())
+    return (
+        f"OUT_LO[{lo}]={float(lo_band[lo].item()):+.2f} "
+        f"arg={lo_arg}/{float(lo_band[lo_arg].item()):+.2f} "
+        f"OUT_HI[{hi}]={float(hi_band[hi].item()):+.2f} "
+        f"arg={hi_arg}/{float(hi_band[hi_arg].item()):+.2f}"
+    )
+
+
+def _lowering_output_byte(
+    model,
+    row: torch.Tensor,
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    try:
+        out_lo = _dim_position(model, "OUTPUT_LO")
+        out_hi = _dim_position(model, "OUTPUT_HI")
+    except Exception:
+        return None, None, None
+    lo_arg = int(torch.argmax(row[out_lo:out_lo + 16]).item())
+    hi_arg = int(torch.argmax(row[out_hi:out_hi + 16]).item())
+    return lo_arg | (hi_arg << 4), lo_arg, hi_arg
+
+
+def _lowering_snapshot(
+    *,
+    model,
+    x: torch.Tensor,
+    pos: int,
+    label: str,
+    block_index: Optional[int],
+    original_layer_index: Optional[int],
+    expected_token: int,
+) -> LoweringSupportSnapshot:
+    row = x[0, pos]
+    logits = _head_logits_for_residual(model, row)
+    argmax_token = int(torch.argmax(logits).item())
+    expected_logit = float(logits[expected_token].item())
+    argmax_logit = float(logits[argmax_token].item())
+    masked = logits.clone()
+    masked[expected_token] = float("-inf")
+    best_other = float(masked.max().item())
+    output_byte, lo_arg, hi_arg = _lowering_output_byte(model, row)
+    return LoweringSupportSnapshot(
+        label=label,
+        block_index=block_index,
+        original_layer_index=original_layer_index,
+        expected_token=int(expected_token),
+        argmax_token=argmax_token,
+        expected_logit=expected_logit,
+        argmax_logit=argmax_logit,
+        expected_margin=expected_logit - best_other,
+        residual_note=_lowering_residual_note(model, row, expected_token),
+        output_byte=output_byte,
+        output_lo_argmax=lo_arg,
+        output_hi_argmax=hi_arg,
+    )
+
+
+def _window_teacher_forced_prefix(
+    *,
+    context: Sequence[int],
+    prefix_len: int,
+    token_index: int,
+    max_context_window: Optional[int],
+    mem_store_positions: Sequence[int],
+) -> Tuple[List[int], int, List[int]]:
+    def visible_store_positions() -> List[int]:
+        visible: List[int] = []
+        for raw_pos in mem_store_positions:
+            pos = int(raw_pos)
+            if not 0 <= pos < token_index:
+                continue
+            # Completed historical stores are visible everywhere. The current
+            # store row is visible only while predicting its address bytes;
+            # value bytes must not self-look-up an incomplete row.
+            if pos + 8 < token_index or token_index <= pos + 4:
+                visible.append(pos)
+        return visible
+
+    prediction_prefix = [int(t) for t in context[:token_index]]
+    if max_context_window is None:
+        return prediction_prefix, len(prediction_prefix) - 1, visible_store_positions()
+    if token_index <= prefix_len + max_context_window:
+        return prediction_prefix, len(prediction_prefix) - 1, visible_store_positions()
+
+    tail_start = token_index - max_context_window
+    windowed = (
+        [int(t) for t in context[:prefix_len]]
+        + [int(t) for t in context[tail_start:token_index]]
+    )
+
+    remapped_store_positions: List[int] = []
+    for pos in visible_store_positions():
+        if 0 <= pos < prefix_len:
+            remapped_store_positions.append(pos)
+        elif tail_start <= pos < token_index:
+            remapped_store_positions.append(prefix_len + (pos - tail_start))
+
+    return windowed, len(windowed) - 1, remapped_store_positions
+
+
+def _block_display_label(block, block_index: int) -> Tuple[str, Optional[int]]:
+    attn = getattr(block, "attn", None)
+    original_layer = getattr(attn, "layer_idx", None)
+    ffn = getattr(block, "ffn", None)
+    w_up = getattr(ffn, "W_up", None)
+    width = None if w_up is None else int(w_up.shape[0])
+    width_part = "" if width is None else f" width={width}"
+    layer_part = "-" if original_layer is None else str(original_layer)
+    return f"block{block_index} layer={layer_part}{width_part}", original_layer
+
+
+def verify_teacher_forced_token_support(
+    model,
+    context: Sequence[int],
+    *,
+    token_index: int,
+    expected_token: Optional[int] = None,
+    prefix_len: int = 0,
+    mem_store_positions: Sequence[int] = (),
+    max_context_window: Optional[int] = 512,
+    min_margin: float = 0.0,
+    probe_name: str = "",
+) -> TeacherForcedTokenSupportReport:
+    """Assertable lowering probe for one teacher-forced symbolic token.
+
+    The function feeds ``context[:token_index]`` through the compiled model and
+    records the output-head winner after embedding and after every compiled
+    block/tail.  Callers assert ``report.supported`` to catch cases where
+    intermediate symbolic evidence is later overwritten by a neural tail.
+    """
+
+    if token_index <= 0:
+        raise ValueError(
+            "token_index must predict a token after at least one prefix row"
+        )
+    if token_index >= len(context):
+        raise IndexError("token_index must point inside the teacher-forced context")
+    if expected_token is None:
+        expected_token = int(context[token_index])
+    if not 0 <= int(expected_token) < int(getattr(model, "vocab_size", 10**9)):
+        raise ValueError(f"expected token {expected_token!r} is outside model vocab")
+
+    windowed, logit_pos, remapped_store_positions = _window_teacher_forced_prefix(
+        context=context,
+        prefix_len=prefix_len,
+        token_index=token_index,
+        max_context_window=max_context_window,
+        mem_store_positions=mem_store_positions,
+    )
+    if logit_pos < 0:
+        raise ValueError("empty prediction prefix")
+
+    device = next(model.parameters()).device
+    token_ids = torch.tensor([windowed], dtype=torch.long, device=device)
+
+    embed = getattr(model, "embed", None)
+    old_mem_history_end = getattr(embed, "_mem_history_end", None)
+    old_mem_store_positions = getattr(embed, "_mem_store_positions", None)
+
+    snapshots: List[LoweringSupportSnapshot] = []
+    try:
+        if hasattr(embed, "set_mem_history_end"):
+            embed.set_mem_history_end(0)
+        if hasattr(embed, "set_mem_store_positions"):
+            embed.set_mem_store_positions([tuple(remapped_store_positions)])
+
+        with torch.no_grad():
+            x = model.embed(token_ids)
+            snapshots.append(
+                _lowering_snapshot(
+                    model=model,
+                    x=x,
+                    pos=logit_pos,
+                    label="embed",
+                    block_index=None,
+                    original_layer_index=None,
+                    expected_token=int(expected_token),
+                )
+            )
+            for block_index, block in enumerate(model.blocks):
+                x = block(x)
+                label, original_layer = _block_display_label(block, block_index)
+                snapshots.append(
+                    _lowering_snapshot(
+                        model=model,
+                        x=x,
+                        pos=logit_pos,
+                        label=label,
+                        block_index=block_index,
+                        original_layer_index=original_layer,
+                        expected_token=int(expected_token),
+                    )
+                )
+    finally:
+        if old_mem_history_end is not None and hasattr(embed, "set_mem_history_end"):
+            embed.set_mem_history_end(old_mem_history_end)
+        if hasattr(embed, "set_mem_store_positions"):
+            embed.set_mem_store_positions(old_mem_store_positions)
+
+    return TeacherForcedTokenSupportReport(
+        probe_name=probe_name,
+        token_index=int(token_index),
+        expected_token=int(expected_token),
+        prefix_len=int(prefix_len),
+        logit_pos=int(logit_pos),
+        min_margin=float(min_margin),
+        snapshots=tuple(snapshots),
+    )
+
+
+def audit_teacher_forced_trace_final_support(
+    model,
+    trace: TeacherForcedSymbolicTrace,
+    *,
+    token_indices: Optional[Sequence[int]] = None,
+    min_margin: float = 0.0,
+    max_failures: int = 16,
+    probe_name: str = "",
+) -> TeacherForcedTraceAuditReport:
+    """Check final lowered-model support for many symbolic tokens at once.
+
+    This is the fast counterpart to :func:`verify_teacher_forced_token_support`.
+    It teacher-forces the whole symbolic trace once, runs every compiled block,
+    and checks the final output head at each selected token's prediction row.
+    When a failure is found, callers can rerun the single-token verifier for a
+    block-by-block loss report.
+    """
+
+    if len(trace.context) < 2:
+        raise ValueError("teacher-forced trace is too short to audit")
+
+    if token_indices is None:
+        selected = range(trace.prefix_len, len(trace.context))
+    else:
+        selected = [int(i) for i in token_indices]
+
+    for token_index in selected:
+        if token_index <= 0 or token_index >= len(trace.context):
+            raise IndexError(f"token index {token_index} outside trace")
+
+    device = next(model.parameters()).device
+    token_ids = torch.tensor(
+        [[int(t) for t in trace.context[:-1]]],
+        dtype=torch.long,
+        device=device,
+    )
+
+    embed = getattr(model, "embed", None)
+    old_mem_history_end = getattr(embed, "_mem_history_end", None)
+    old_mem_store_positions = getattr(embed, "_mem_store_positions", None)
+
+    failures: List[TeacherForcedTraceAuditFailure] = []
+    checked = 0
+    try:
+        if hasattr(embed, "set_mem_history_end"):
+            embed.set_mem_history_end(0)
+        if hasattr(embed, "set_mem_store_positions"):
+            embed.set_mem_store_positions([tuple(trace.mem_store_positions)])
+
+        with torch.no_grad():
+            x = model.embed(token_ids)
+            for block in model.blocks:
+                x = block(x)
+
+            for token_index in selected:
+                expected_token = int(trace.context[token_index])
+                if not 0 <= expected_token < int(getattr(model, "vocab_size", 10**9)):
+                    continue
+                checked += 1
+                logit_pos = token_index - 1
+                row = x[0, logit_pos]
+                logits = _head_logits_for_residual(model, row)
+                argmax_token = int(torch.argmax(logits).item())
+                expected_logit = float(logits[expected_token].item())
+                masked = logits.clone()
+                masked[expected_token] = float("-inf")
+                expected_margin = expected_logit - float(masked.max().item())
+                output_byte, _, _ = _lowering_output_byte(model, row)
+                byte_ok = (
+                    not 0 <= expected_token < 256
+                    or output_byte == expected_token
+                )
+                if (
+                    argmax_token == expected_token
+                    and expected_margin >= min_margin
+                    and byte_ok
+                ):
+                    continue
+
+                generated_index = token_index - trace.prefix_len
+                step = generated_index // len(_LOWERING_STEP_SLOT_NAMES)
+                offset = generated_index % len(_LOWERING_STEP_SLOT_NAMES)
+                failures.append(
+                    TeacherForcedTraceAuditFailure(
+                        token_index=int(token_index),
+                        step=int(step),
+                        slot=_LOWERING_STEP_SLOT_NAMES[offset],
+                        expected_token=expected_token,
+                        argmax_token=argmax_token,
+                        expected_margin=float(expected_margin),
+                        output_byte=output_byte if 0 <= expected_token < 256 else None,
+                    )
+                )
+                if len(failures) >= max_failures:
+                    break
+    finally:
+        if old_mem_history_end is not None and hasattr(embed, "set_mem_history_end"):
+            embed.set_mem_history_end(old_mem_history_end)
+        if hasattr(embed, "set_mem_store_positions"):
+            embed.set_mem_store_positions(old_mem_store_positions)
+
+    return TeacherForcedTraceAuditReport(
+        probe_name=probe_name,
+        checked=checked,
+        failures=tuple(failures),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1070,7 +1772,6 @@ _STEP_TOKEN_OFFSETS = {
     "MEM_VAL_byte2": 32, "MEM_VAL_byte3": 33,
     "STEP_END": 34,
 }
-
 
 def _resolve_register_offset(register: str) -> Optional[int]:
     """Map an ``Operation.produces`` register name to a step-relative offset.

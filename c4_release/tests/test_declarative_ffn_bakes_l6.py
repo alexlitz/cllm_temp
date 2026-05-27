@@ -205,21 +205,27 @@ def _assert_same_ffn_units(
     assert torch.equal(actual.W_down[:, start:end], expected.W_down[:, start:end])
 
 
-def test_layer6_all_step_jmp_pc_override_ir_matches_legacy_units():
+def test_layer6_all_step_jmp_pc_override_copies_encoded_pc_byte():
     actual = _StubFFN()
-    expected = _StubFFN()
 
     end = _lower_layer6_all_step_jmp_pc_override_ir(actual, 100.0, _SetDim)
-    _set_layer6_routing_ffn(expected, 100.0, _SetDim)
 
     assert end == L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT
     assert len(_layer6_all_step_jmp_pc_override_rules(100.0)) == 64
-    _assert_same_ffn_units(
-        actual,
-        expected,
-        L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
-        L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT,
-    )
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_PC] = 1.0
+    x[..., _SetDim.OP_JMP] = 5.0
+    x[..., _SetDim.FETCH_LO + 2] = 40.0
+    x[..., _SetDim.FETCH_HI + 2] = 40.0
+    x[..., _SetDim.OUTPUT_LO + 2] = 1.0
+    x[..., _SetDim.OUTPUT_HI + 1] = 1.0
+
+    y = _apply_stub_ffn(actual, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 2] > 1.0
+    assert y[_SetDim.OUTPUT_HI + 2] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 1] < 0.0
 
 
 def test_layer6_all_step_jsr_pc_override_decodes_pc_opcode_directly():
@@ -276,38 +282,72 @@ def test_layer6_all_step_jsr_pc_override_decodes_pc_opcode_directly():
     assert torch.allclose(y, x, atol=1e-6)
 
 
-def test_layer6_delayed_jmp_pc_override_ir_matches_legacy_units():
+def test_layer6_all_step_jsr_pc_override_ignores_stale_odd_fetch_hi():
+    ffn = _StubFFN()
+
+    _lower_layer6_all_step_jsr_pc_override_ir(ffn, 100.0, _SetDim)
+
+    x = torch.zeros(512)
+    x[_SetDim.MARK_PC] = 1.0
+    x[_SetDim.OPCODE_BYTE_LO + 3] = 1.0
+    x[_SetDim.OPCODE_BYTE_HI + 0] = 1.0
+    x[_SetDim.FETCH_LO + 10] = 1.0
+    x[_SetDim.FETCH_HI + 0] = 1.0
+    x[_SetDim.FETCH_HI + 1] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)
+
+    assert y[_SetDim.OUTPUT_LO + 2] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 5] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 13] < 0.5
+
+
+def test_layer6_delayed_jmp_pc_override_copies_encoded_pc_byte():
     actual = _StubFFN()
-    expected = _StubFFN()
 
     end = _lower_layer6_delayed_jmp_pc_override_ir(actual, 100.0, _SetDim)
-    _set_layer6_routing_ffn(expected, 100.0, _SetDim)
 
     assert end == L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT
     assert len(_layer6_delayed_jmp_pc_override_rules(100.0)) == 64
-    _assert_same_ffn_units(
-        actual,
-        expected,
-        L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
-        L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT,
-    )
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_PC] = 1.0
+    x[..., _SetDim.CMP + 0] = 5.0
+    x[..., _SetDim.AX_CARRY_LO + 10] = 1.0
+    x[..., _SetDim.AX_CARRY_HI + 2] = 1.0
+    x[..., _SetDim.OUTPUT_LO + 2] = 1.0
+    x[..., _SetDim.OUTPUT_HI + 5] = 1.0
+
+    y = _apply_stub_ffn(actual, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 10] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 2] > 0.9
+    assert y[_SetDim.OUTPUT_LO + 2] < 0.5
+    assert y[_SetDim.OUTPUT_HI + 5] < 0.5
 
 
-def test_layer6_first_step_jmp_pc_override_ir_matches_legacy_units():
+def test_layer6_first_step_jmp_pc_override_copies_encoded_pc_byte():
     actual = _StubFFN()
-    expected = _StubFFN()
 
     end = _lower_layer6_first_step_jmp_pc_override_ir(actual, 100.0, _SetDim)
-    _set_layer6_routing_ffn(expected, 100.0, _SetDim)
 
     assert end == L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT
     assert len(_layer6_first_step_jmp_pc_override_rules(100.0)) == 64
-    _assert_same_ffn_units(
-        actual,
-        expected,
-        L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT,
-        L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT,
-    )
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_PC] = 1.0
+    x[..., _SetDim.OP_JMP] = 5.0
+    x[..., _SetDim.AX_CARRY_LO + 10] = 1.0
+    x[..., _SetDim.AX_CARRY_HI + 2] = 1.0
+    x[..., _SetDim.OUTPUT_LO + 2] = 1.0
+    x[..., _SetDim.OUTPUT_HI + 5] = 1.0
+
+    y = _apply_stub_ffn(actual, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 10] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 2] > 0.9
+    assert y[_SetDim.OUTPUT_LO + 2] < 0.5
+    assert y[_SetDim.OUTPUT_HI + 5] < 0.5
 
 
 def test_layer6_imm_fetch_route_ir_matches_legacy_units():
@@ -665,6 +705,23 @@ def test_layer6_jsr_sp_marker_decrement_handles_later_calls():
     assert y[_SetDim.OUTPUT_HI + 12] > 0.9
 
 
+def test_layer6_routing_bake_overlays_jsr_sp_decrement_for_later_calls():
+    ffn = _StubFFN(hidden_dim=1900)
+    _bake_layer6_routing_ffn(ffn, 100.0, _SetDim)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_SP] = 1.0
+    x[..., _SetDim.CMP + 4] = 1.0
+    x[..., _SetDim.HAS_SE] = 1.0
+    x[..., _SetDim.EMBED_LO + 0] = 1.0
+    x[..., _SetDim.EMBED_HI + 14] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 8] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 13] > 0.9
+
+
 def test_layer6_jsr_sp_marker_decrement_still_handles_first_step():
     ffn = _StubFFN()
     _lower_layer6_stack_arithmetic_ir(ffn, 100.0, _SetDim)
@@ -823,21 +880,31 @@ def test_layer6_ent_after_jsr_stack0_byte0_fixup_emits_00():
     assert out["OUTPUT_HI+1"] < 0.0
 
 
-def test_layer6_branch_pc_override_ir_matches_legacy_units():
+def test_layer6_branch_pc_override_copies_encoded_pc_byte():
     actual = _StubFFN()
-    expected = _StubFFN()
 
     route_ends = _lower_layer6_branch_pc_override_ir(actual, 100.0, _SetDim)
-    _set_layer6_routing_ffn(expected, 100.0, _SetDim)
 
     assert route_ends == (L6_BZ_PC_OVERRIDE_END_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT)
     assert len(_layer6_bz_pc_override_rules(100.0)) == 64
     assert len(_layer6_bnz_pc_override_rules(100.0)) == 128
-    for start, end in (
-        (L6_BZ_PC_OVERRIDE_START_UNIT, L6_BZ_PC_OVERRIDE_END_UNIT),
-        (L6_BNZ_PC_OVERRIDE_START_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT),
-    ):
-        _assert_same_ffn_units(actual, expected, start, end)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.MARK_PC] = 1.0
+    x[..., _SetDim.OP_BZ] = 5.0
+    x[..., _SetDim.CMP + 4] = 1.0
+    x[..., _SetDim.CMP + 5] = 1.0
+    x[..., _SetDim.FETCH_LO + 10] = 40.0
+    x[..., _SetDim.FETCH_HI + 2] = 40.0
+    x[..., _SetDim.OUTPUT_LO + 2] = 1.0
+    x[..., _SetDim.OUTPUT_HI + 5] = 1.0
+
+    y = _apply_stub_ffn(actual, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 10] > 0.9
+    assert y[_SetDim.OUTPUT_HI + 2] > 0.9
+    assert y[_SetDim.OUTPUT_LO + 2] < 0.5
+    assert y[_SetDim.OUTPUT_HI + 5] < 0.5
 
 
 def test_layer6_branch_pc_byte1_override_symbolically_emits_target_high_byte():
@@ -979,7 +1046,7 @@ def test_layer6_tail_cleanup_ir_matches_legacy_units():
         _assert_same_ffn_units(actual, expected, start, end)
 
 
-def test_layer6_routing_bake_keeps_ir_bands_at_legacy_parity():
+def test_layer6_routing_bake_keeps_non_overlay_ir_bands_at_legacy_parity():
     actual = _StubFFN()
     expected = _StubFFN()
 
@@ -993,20 +1060,11 @@ def test_layer6_routing_bake_keeps_ir_bands_at_legacy_parity():
         (L6_NOP_AX_ROUTE_START_UNIT, L6_NOP_AX_ROUTE_END_UNIT),
         (L6_JSR_AX_ROUTE_START_UNIT, L6_JSR_AX_ROUTE_END_UNIT),
         (L6_JMP_AX_ROUTE_START_UNIT, L6_JMP_AX_ROUTE_END_UNIT),
-        (
-            L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
-            L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT,
-        ),
-        (
-            L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT,
-            L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT,
-        ),
         (L6_HALT_DETECT_START_UNIT, L6_HALT_DETECT_END_UNIT),
         (L6_TEMP_CLEANUP_RULE_START_UNIT, L6_TEMP_CLEANUP_END_UNIT),
         (L6_CMP3_CLEANUP_START_UNIT, L6_CMP3_CLEANUP_END_UNIT),
         (L6_STACK_IDENTITY_START_UNIT, L6_STACK_IDENTITY_END_UNIT),
         (L6_PSH_SP_DECREMENT_START_UNIT, L6_PSH_SP_DECREMENT_END_UNIT),
-        (L6_JSR_SP_DECREMENT_START_UNIT, L6_JSR_SP_DECREMENT_END_UNIT),
         (L6_JSR_SP_FIXUP_START_UNIT, L6_JSR_SP_FIXUP_END_UNIT),
         (L6_JSR_SP_BYTES_START_UNIT, L6_JSR_SP_BYTES_END_UNIT),
         (
@@ -1028,8 +1086,6 @@ def test_layer6_routing_bake_keeps_ir_bands_at_legacy_parity():
             L6_ENT_FIRST_STEP_SP_BYTES_START_UNIT,
             L6_ENT_FIRST_STEP_SP_BYTES_END_UNIT,
         ),
-        (L6_BZ_PC_OVERRIDE_START_UNIT, L6_BZ_PC_OVERRIDE_END_UNIT),
-        (L6_BNZ_PC_OVERRIDE_START_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT),
         (
             L6_OPCODE_CONTAMINATION_CLEANUP_START_UNIT,
             L6_OPCODE_CONTAMINATION_CLEANUP_END_UNIT,
@@ -1041,9 +1097,6 @@ def test_layer6_routing_bake_keeps_ir_bands_at_legacy_parity():
         (L6_ALU_CLEAR_START_UNIT, L6_ALU_CLEAR_END_UNIT),
     ):
         _assert_same_ffn_units(actual, expected, start, end)
-    _assert_same_ffn_units(
-        actual,
-        expected,
-        L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
-        L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT,
-    )
+    # The routing bake overlays delayed/first/all-step branch override,
+    # branch PC-byte1, and later-call JSR SP bands with declarative fixes;
+    # those have dedicated coverage above.

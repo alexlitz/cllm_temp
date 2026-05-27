@@ -801,12 +801,13 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
     FFN, which reads AX_CARRY_LO/HI at the AX marker position.
 
     Q[0] gate (default ``byte_passthrough_chain`` coefficients):
-        IS_BYTE*3L + HAS_SE*L + (OP_IMM @ -3L) + (TEMP+3 @ -3L) + CONST*-3.5L
+        IS_BYTE*3L + HAS_SE*L + suppressed-op terms + CONST*-3.5L
       - AX marker: 0 + L - 3.5L = -2.5L < 0 (blocked)
       - AX byte non-IMM non-bitwise: 3L + L - 3.5L = 0.5L > 0 (fires)
       - First step (HAS_SE=0): 3L + 0 - 3.5L = -0.5L < 0 (blocked)
-      - IMM/BITWISE step at AX byte: 3L + L - 3L - 3.5L = -2.5L < 0 (blocked,
-        preserves multi-byte OUTPUT / lets BitwiseBytePropagation handle)
+      - IMM/LI/LC relay/bitwise/binary-pop byte: 3L + L - 3L - 3.5L
+        = -2.5L < 0 (blocked, preserving multi-byte OUTPUT and dedicated
+        post-op handling)
 
     Q[33] AND gate: H1[AX] AND HAS_SE (kills leakage at non-AX / first step).
 
@@ -826,8 +827,15 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
         target_marker_dim=BD.H1 + AX_IDX,
         value_lo_dim=BD.CLEAN_EMBED_LO,
         value_hi_dim=BD.CLEAN_EMBED_HI,
-        # Suppress during IMM (multi-byte) and bitwise ops (TEMP+3 = BITWISE_OP).
-        suppress_op_dims=[BD.OP_IMM, BD.TEMP + 3],
+        # Suppress during multi-byte/relay ops, binary-pop, and bitwise ops
+        # (TEMP+3 = BITWISE_OP).
+        suppress_op_dims=[
+            BD.OP_IMM,
+            BD.OP_LI_RELAY,
+            BD.OP_LC_RELAY,
+            BD.TEMP + 3,
+            BD.CMP + 3,
+        ],
         S=S,
         HD=HD,
         alibi_slope=1.0,
@@ -855,10 +863,13 @@ def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
       byte 3 pos → suppressed (predicts BP marker, not a byte)
 
     Q[0] gate (SP-specific coefficients):
-        IS_BYTE*L + HAS_SE*2L + (PSH_AT_SP @ -2L) + CONST*-1.5L
+        IS_BYTE*L + HAS_SE*2L + (PSH_AT_SP @ -2L) + (MARK_SP @ -2L)
+        + CONST*-1.5L
       - SP byte non-PSH non-first: L + 2L - 1.5L = 1.5L > 0 (fires)
       - First step (HAS_SE=0): L + 0 - 1.5L = -0.5L < 0 (blocked)
       - PSH step at SP byte: L + 2L - 2L - 1.5L = -0.5L < 0 (blocked)
+      - SP marker row: 0 + 2L - 2L - 1.5L = -1.5L < 0 (blocked;
+        marker carry-forward is handled by the explicit Q[34]/Q[35] route)
 
     Q[33] AND gate: IS_BYTE AND H1[SP] AND HAS_SE AND NOT PSH
     (gate_const=-30000 + 3*10000 base; PSH_AT_SP contributes -10000
@@ -877,8 +888,9 @@ def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
         target_marker_dim=BD.H1 + SP_IDX,
         value_lo_dim=BD.CLEAN_EMBED_LO,
         value_hi_dim=BD.CLEAN_EMBED_HI,
-        # Q[0] suppression for PSH (SP -= 8 handled elsewhere).
-        suppress_op_dims=[BD.PSH_AT_SP],
+        # Q[0] suppression for PSH (SP -= 8 handled elsewhere) and SP
+        # marker rows, which are owned by the explicit marker carry route.
+        suppress_op_dims=[BD.PSH_AT_SP, BD.MARK_SP],
         S=S,
         HD=HD,
         alibi_slope=1.0,
@@ -1062,9 +1074,12 @@ def _set_layer10_stack0_byte_relay(attn, S, BD, HD):
     ):
         attn.W_q[base + slot, byte_idx_dim] = 60.0
         attn.W_k[base + slot, mem_val_dim] = 60.0
+    attn.W_k[base + 31, BD.STACK0_BYTE1] = 60.0
+    attn.W_k[base + 32, BD.STACK0_BYTE2] = 60.0
     attn.W_q[base + 34, BD.BYTE_INDEX_2] = 60.0
     attn.W_k[base + 34, BD.H3 + 4] = 60.0
     attn.W_k[base + 34, BD.H2 + 4] = -60.0
+    attn.W_k[base + 34, BD.STACK0_BYTE3] = 60.0
 
     attn.W_q[base + 33, BD.CONST] = -30000.0
     attn.W_q[base + 33, BD.IS_BYTE] = 10000.0
@@ -1093,12 +1108,11 @@ def _set_layer10_stack0_byte_relay(attn, S, BD, HD):
     attn.W_q[base + 0, BD.IS_BYTE] = 1000.0
     attn.W_q[base + 0, BD.H1 + AX_IDX] = 1000.0
     attn.W_q[base + 0, BD.CMP + 3] = 150000.0
-    attn.W_q[base + 0, BD.TEMP + 3] = -3000.0
+    attn.W_q[base + 0, BD.TEMP + 3] = -500.0
     attn.W_q[base + 0, BD.BYTE_INDEX_3] = -3000.0
     attn.W_k[base + 0, BD.CONST] = 10.0
 
     attn.W_q[base + 1, BD.CMP + 3] = 1000.0
-    attn.W_q[base + 1, BD.TEMP + 3] = -1000.0
     attn.W_k[base + 1, BD.MEM_STORE] = 100.0
     attn.W_k[base + 1, BD.MARK_MEM] = -200.0
     attn.W_k[base + 1, BD.CONST] = -50.0
@@ -1109,15 +1123,18 @@ def _set_layer10_stack0_byte_relay(attn, S, BD, HD):
     ):
         attn.W_q[base + slot, byte_idx_dim] = 60.0
         attn.W_k[base + slot, mem_val_dim] = 60.0
+    attn.W_k[base + 31, BD.STACK0_BYTE1] = 60.0
+    attn.W_k[base + 32, BD.STACK0_BYTE2] = 60.0
     attn.W_q[base + 34, BD.BYTE_INDEX_2] = 60.0
     attn.W_k[base + 34, BD.H3 + 4] = 60.0
     attn.W_k[base + 34, BD.H2 + 4] = -60.0
+    attn.W_k[base + 34, BD.STACK0_BYTE3] = 60.0
 
     attn.W_q[base + 33, BD.CONST] = -30000.0
     attn.W_q[base + 33, BD.IS_BYTE] = 10000.0
     attn.W_q[base + 33, BD.H1 + AX_IDX] = 10000.0
     attn.W_q[base + 33, BD.CMP + 3] = 1500000.0
-    attn.W_q[base + 33, BD.TEMP + 3] = -30000.0
+    attn.W_q[base + 33, BD.TEMP + 3] = -5000.0
     attn.W_q[base + 33, BD.BYTE_INDEX_3] = -10000.0
     attn.W_k[base + 33, BD.CONST] = 5.0
 
@@ -1140,12 +1157,14 @@ def _set_layer10_stack0_byte_relay(attn, S, BD, HD):
     attn.W_q[base + 0, BD.CMP + 4] = -300.0
     attn.W_q[base + 0, BD.OP_LEV] = -300.0
 
-    byte_match = 5.0 * S
+    # Match the compiler-owned declarative spec: direct STACK0-byte
+    # persistence must dominate inactive store-route bias slots.
+    byte_match = 50.0 * S
     store_target = 50.0 * S
-    store_gate = 5.0 * S
+    store_gate = 50.0 * S
     store_cmp = 5.0 * S
     store_has_se = 5.0 * S
-    store_bias = -55.0 * S
+    store_bias = -85.0 * S
     attn.W_q[base + 4, BD.STACK0_BYTE0] = byte_match
     attn.W_k[base + 4, BD.STACK0_BYTE1] = byte_match
     attn.W_q[base + 5, BD.STACK0_BYTE1] = byte_match
@@ -1155,6 +1174,7 @@ def _set_layer10_stack0_byte_relay(attn, S, BD, HD):
     for slot in (7, 8, 9, 10, 11):
         attn.W_q[base + slot, BD.CONST] = store_bias
         attn.W_q[base + slot, BD.MEM_STORE] = store_gate
+        attn.W_q[base + slot, BD.MEM_ADDR_SRC] = -store_gate
         attn.W_q[base + slot, BD.CMP + 3] = store_cmp
         attn.W_q[base + slot, BD.HAS_SE] = store_has_se
     attn.W_q[base + 7, BD.MARK_STACK0] = store_target

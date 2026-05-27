@@ -108,6 +108,123 @@ def _guard_l14_output_units_on_step_boundary(
             ffn.W_up.data[unit, next_dim] -= 2 * strength
 
 
+def _block_l14_jsr_ax_zero_on_stack0_bytes(
+    ffn,
+    dim_positions,
+    S: float,
+    start_unit: int,
+    end_unit: int,
+) -> None:
+    """Keep JSR AX-byte zeroing off JSR return-address STACK0 rows."""
+
+    if end_unit <= start_unit:
+        return
+    stack0_byte_dims = [
+        _resolve_dim(dim_positions, name)
+        for name in (
+            "STACK0_BYTE0",
+            "STACK0_BYTE1",
+            "STACK0_BYTE2",
+            "STACK0_BYTE3",
+        )
+    ]
+    stack0_byte_dims = [
+        dim
+        for dim in stack0_byte_dims
+        if dim is not None and dim < ffn.W_up.data.shape[1]
+    ]
+    if not stack0_byte_dims:
+        return
+    strength = S * 1_000.0
+    for unit in range(start_unit, end_unit):
+        for dim in stack0_byte_dims:
+            ffn.W_up.data[unit, dim] -= strength
+
+
+def _disable_l14_stack0_jsr_hi0_default(
+    ffn,
+    dim_positions,
+    start_unit: int,
+    end_unit: int,
+) -> None:
+    """Remove the stale JSR STACK0 marker high-zero default.
+
+    JSR's STACK0 marker emits the return-address byte. The byte value is
+    routed earlier from the PC/AX-carry path and can have a nonzero high
+    nibble, so a hard-coded OUTPUT_HI[0] repair is not a valid declaration.
+    """
+
+    if end_unit <= start_unit:
+        return
+    mark_stack0 = _resolve_dim(dim_positions, "MARK_STACK0")
+    op_jsr = _resolve_dim(dim_positions, "OP_JSR")
+    is_byte = _resolve_dim(dim_positions, "IS_BYTE")
+    output_hi = _resolve_dim(dim_positions, "OUTPUT_HI")
+    if (
+        mark_stack0 is None
+        or op_jsr is None
+        or is_byte is None
+        or output_hi is None
+        or mark_stack0 >= ffn.W_up.data.shape[1]
+        or op_jsr >= ffn.W_up.data.shape[1]
+        or is_byte >= ffn.W_up.data.shape[1]
+        or output_hi >= ffn.W_down.data.shape[0]
+    ):
+        return
+    for unit in range(start_unit, end_unit):
+        if (
+            float(ffn.W_up.data[unit, mark_stack0]) <= 0.0
+            or float(ffn.W_up.data[unit, op_jsr]) <= 0.0
+            or float(ffn.W_up.data[unit, is_byte]) >= 0.0
+            or float(ffn.W_down.data[output_hi + 0, unit]) <= 0.0
+        ):
+            continue
+        ffn.W_up.data[unit, :] = 0.0
+        ffn.b_up.data[unit] = 0.0
+        ffn.W_gate.data[unit, :] = 0.0
+        ffn.b_gate.data[unit] = 0.0
+        ffn.W_down.data[:, unit] = 0.0
+
+
+def _boost_l14_psh_mem_marker_high_nibbles(
+    ffn,
+    dim_positions,
+    S: float,
+    start_unit: int,
+) -> int:
+    """Make PSH MEM addr0 high nibble beat the zero default.
+
+    L14 attention already places the post-PSH SP high nibble on the MEM marker,
+    but the matched zero-nibble cancel is intentionally soft for real zero
+    bytes. At local stack addresses such as 0xffe0, OUTPUT_HI[14] can land
+    just below OUTPUT_HI[0]. These units only reinforce nonzero high nibbles
+    that are already present on the PSH MEM marker.
+    """
+
+    mark_mem = _resolve_dim(dim_positions, "MARK_MEM")
+    mem_store = _resolve_dim(dim_positions, "MEM_STORE")
+    psh_at_sp = _resolve_dim(dim_positions, "PSH_AT_SP")
+    output_hi = _resolve_dim(dim_positions, "OUTPUT_HI")
+    if (
+        mark_mem is None
+        or mem_store is None
+        or psh_at_sp is None
+        or output_hi is None
+    ):
+        return start_unit
+
+    unit = start_unit
+    for nibble in range(1, 16):
+        ffn.W_up.data[unit, mark_mem] = S
+        ffn.W_up.data[unit, mem_store] = S
+        ffn.W_up.data[unit, psh_at_sp] = S
+        ffn.b_up.data[unit] = -S * 2.5
+        ffn.W_gate.data[unit, output_hi + nibble] = 1.0
+        ffn.W_down.data[output_hi + nibble, unit] = 0.1 / S
+        unit += 1
+    return unit
+
+
 def make_layer14_mem_generation_op() -> Operation:
     """L14 attention: generate MEM section tokens (addr + value) for SI/SC/PSH."""
     def bake(attn, dim_positions, S):
@@ -162,7 +279,11 @@ def make_layer14_mem_generation_op() -> Operation:
 def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
     """Relay staged wide-ALU byte 1 from the AX marker to AX byte 0."""
 
+    PC_I = 0
     AX_I = 1
+    SP_I = 2
+    BP_I = 3
+    MEM_I = 4
     q = [
         AP(0, BD.IS_BYTE, 100.0),
         AP(0, BD.H1 + AX_I, 100.0),
@@ -196,6 +317,20 @@ def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(36, BD.BYTE_INDEX_2, -3000.0),
         AP(36, BD.BYTE_INDEX_3, -3000.0),
         AP(36, BD.MARK_AX, -1000.0),
+        AP(36, BD.MARK_PC, -6000.0),
+        AP(36, BD.H1 + PC_I, -6000.0),
+        AP(36, BD.MARK_SP, -6000.0),
+        AP(36, BD.H1 + SP_I, -6000.0),
+        AP(36, BD.H4 + SP_I, -6000.0),
+        AP(36, BD.MARK_BP, -6000.0),
+        AP(36, BD.H1 + BP_I, -6000.0),
+        AP(36, BD.H4 + BP_I, -6000.0),
+        AP(36, BD.H1 + MEM_I, -6000.0),
+        AP(36, BD.H3 + MEM_I, -6000.0),
+        AP(36, BD.H4 + MEM_I, -6000.0),
+        AP(36, BD.MARK_STACK0, -6000.0),
+        AP(36, BD.MARK_MEM, -6000.0),
+        AP(36, BD.STACK0_BYTE0, -6000.0),
     ]
     k = [
         AP(0, BD.MARK_AX, 100.0),
@@ -205,6 +340,8 @@ def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(34, BD.CONST, 5.0),
         AP(35, BD.CONST, -20.0),
         AP(35, BD.MARK_AX, -10000.0),
+        AP(35, BD.OP_MUL, 2000.0),
+        AP(35, BD.OP_SHL, 2000.0),
         AP(36, BD.CONST, -100.0),
         AP(36, BD.OP_MUL, 200.0),
         AP(36, BD.OP_SHL, 200.0),
@@ -264,7 +401,9 @@ def make_layer14_alu_high_byte_relay_op() -> Operation:
     return Operation(
         name="layer15_alu_high_byte_relay",
         phase=15.05,
-        reads={"IS_BYTE", "H1", "BYTE_INDEX_0", "MARK_AX", "OP_MUL",
+        reads={"IS_BYTE", "H1", "H3", "H4", "BYTE_INDEX_0", "MARK_AX",
+               "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
+               "MARK_STACK0", "STACK0_BYTE0", "OP_MUL",
                "OP_SHL", "OP_LI_RELAY", "OP_LC_RELAY",
                "AX_FULL_LO", "AX_FULL_HI", "TEMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
@@ -691,6 +830,10 @@ def make_layer14_clear_output_corruption_op() -> Operation:
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
+        _disable_l14_stack0_jsr_hi0_default(ffn, dim_positions, start_unit, next_unit)
+        next_unit = _boost_l14_psh_mem_marker_high_nibbles(
+            ffn, dim_positions, S, next_unit
+        )
         ffn._l14_unit_counter = next_unit
 
     return Operation(
@@ -699,7 +842,7 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         reads={"H4", "H1", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "OP_JSR", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "IS_BYTE", "BYTE_INDEX_3", "PSH_AT_SP", "CMP",
-               "CONST"},
+               "MEM_STORE", "OUTPUT_HI", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
@@ -776,12 +919,14 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
+        _block_l14_jsr_ax_zero_on_stack0_bytes(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
     return Operation(
         name="layer14_jsr_ax_bytes_zero",
         phase=14.6,
-        reads={"OP_JSR", "IS_BYTE", "H1", "CONST"},
+        reads={"OP_JSR", "IS_BYTE", "H1", "CONST", "STACK0_BYTE0", "STACK0_BYTE1",
+               "STACK0_BYTE2", "STACK0_BYTE3"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
@@ -840,16 +985,17 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
-        # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1314
+        # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1873
         # after this op runs). The chain is: temp_clear + temp residue clamp
         # + ADD byte-1 high cleanup (4 units) →
         # clear_addr_key_pollution (48) → clear_output_corruption (3) →
-        # clear_mem_marker_output (64) → addr_key_neural_decode (1184) →
+        # PSH MEM high-nibble boost (15) → clear_mem_marker_output (64) →
+        # addr_key_neural_decode (1728) →
         # jsr_ax_bytes_zero (4) → lc_ax_bytes_zero (4) → this op (4).
         # Annotating only the chain tail with the cumulative max is
         # sufficient — the compiler aggregates per-layer max across all
         # ops, so this single annotation suffices for L14 dynamic sizing.
-        ffn_units_used=1315,
+        ffn_units_used=1874,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",
@@ -926,7 +1072,9 @@ def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
     ``ADDR_B0_LO``/``ADDR_B0_HI``/``ADDR_B1_LO`` at MEM val byte
     positions.
 
-    Per val byte position (gated by MEM_VAL_B{0,1,2,3}):
+    Per val byte position (gated by the same source-position flags L15
+    reads: MEM_VAL_B1/B2/B3 for value bytes 0/1/2, and H3[MEM] with
+    H2[MEM] blocked for value byte 3):
       Let addr_b0 = (hi << 4 | lo) be the byte 0 of the MEM section's
       address.  Let addr_b1_lo be the low nibble of byte 1.  Then
       ``byte_addr = addr_b0 + byte_off`` for byte_off ∈ {0,1,2,3}.
@@ -949,7 +1097,7 @@ def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
         ADDR_KEY[32..47]
 
     Both units use a 3-way AND in the silu path:
-      MEM_VAL_B{byte_off} + ADDR_B0_LO[lo] + ADDR_B0_HI[hi] >= 3
+      value-byte-gate + ADDR_B0_LO[lo] + ADDR_B0_HI[hi] >= 3
     with threshold ``-S*2.5`` so only all-3-match fires.
 
     The top-nibble unit additionally reads ADDR_B1_LO (a 4-way AND with
@@ -961,12 +1109,20 @@ def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
     """
     BD = _as_setdim_proxy(dim_positions)
     unit = start_unit
-    MEM_VAL_DIMS = [BD.MEM_VAL_B0, BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3]
+    MEM_I = 4
+    value_gates = [
+        # The L2 MEM_VAL flags are autoregressive: B1 marks the token that
+        # predicts MEM value byte 0, B2 marks byte 1, and B3 marks byte 2.
+        # Value byte 3 is selected elsewhere with H3[MEM] and not H2[MEM].
+        (BD.MEM_VAL_B1, None, 0),
+        (BD.MEM_VAL_B2, None, 1),
+        (BD.MEM_VAL_B3, None, 2),
+        (BD.H3 + MEM_I, BD.H2 + MEM_I, 3),
+    ]
 
     # Lo + Hi nibble units (write ADDR_KEY[0..31]): one unit per
-    # (byte_off, hi, lo) combination, 4*16*16 = 1024 units.
-    for byte_off in range(4):
-        gate_dim = MEM_VAL_DIMS[byte_off]
+    # (value gate, hi, lo) combination, 4*16*16 = 1024 units.
+    for gate_dim, blocker_dim, byte_off in value_gates:
         for hi in range(16):
             for lo in range(16):
                 byte_addr = ((hi << 4) | lo) + byte_off
@@ -977,6 +1133,8 @@ def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
                 ffn.W_up[unit, BD.ADDR_B0_HI + hi] = S
                 ffn.b_up[unit] = -S * 2.5
                 ffn.b_gate[unit] = 1.0
+                if blocker_dim is not None:
+                    ffn.W_gate[unit, blocker_dim] = -1.0
                 ffn.W_down[BD.ADDR_KEY + new_lo, unit] = 2.0 / S
                 ffn.W_down[BD.ADDR_KEY + 16 + new_hi, unit] = 2.0 / S
                 unit += 1
@@ -997,13 +1155,14 @@ def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
     #       (hi==15, lo, byte_off, b1_lo) combo — bounded by 16*4*16 = 1024.
 
     # (a) Common case: 4 byte_off × 16 b1_lo = 64 units.
-    for byte_off in range(4):
-        gate_dim = MEM_VAL_DIMS[byte_off]
+    for gate_dim, blocker_dim, byte_off in value_gates:
         for b1_lo in range(16):
             ffn.W_up[unit, gate_dim] = S
             ffn.W_up[unit, BD.ADDR_B1_LO + b1_lo] = S
             ffn.b_up[unit] = -S * 1.5
             ffn.b_gate[unit] = 1.0
+            if blocker_dim is not None:
+                ffn.W_gate[unit, blocker_dim] = -1.0
             ffn.W_down[BD.ADDR_KEY + 32 + b1_lo, unit] = 2.0 / S
             unit += 1
 
@@ -1021,8 +1180,7 @@ def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
         2: [14, 15],
         3: [13, 14, 15],
     }
-    for byte_off in range(4):
-        gate_dim = MEM_VAL_DIMS[byte_off]
+    for gate_dim, blocker_dim, byte_off in value_gates:
         for lo in carry_los[byte_off]:
             for b1_lo in range(16):
                 ffn.W_up[unit, gate_dim] = S
@@ -1031,10 +1189,38 @@ def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
                 ffn.W_up[unit, BD.ADDR_B1_LO + b1_lo] = S
                 ffn.b_up[unit] = -S * 3.5
                 ffn.b_gate[unit] = 1.0
+                if blocker_dim is not None:
+                    ffn.W_gate[unit, blocker_dim] = -1.0
                 # Cancel the common-case write at b1_lo, add at (b1_lo+1)&0xF.
                 ffn.W_down[BD.ADDR_KEY + 32 + b1_lo, unit] = -2.0 / S
                 ffn.W_down[BD.ADDR_KEY + 32 + ((b1_lo + 1) & 0xF), unit] = 2.0 / S
                 unit += 1
+
+    # Load queries at the AX marker also carry a proven address in ADDR_B*
+    # lanes, but no Python ADDR_KEY injection touches that marker. Materialize
+    # byte_off=0 for LI/LC so L15's query-side ADDR_KEY match is exact.
+    for op_gate in (BD.OP_LI_RELAY, BD.OP_LC_RELAY):
+        for hi in range(16):
+            for lo in range(16):
+                ffn.W_up[unit, op_gate] = S
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ADDR_B0_LO + lo] = S
+                ffn.W_up[unit, BD.ADDR_B0_HI + hi] = S
+                ffn.b_up[unit] = -S * 3.5
+                ffn.b_gate[unit] = 1.0
+                ffn.W_down[BD.ADDR_KEY + lo, unit] = 2.0 / S
+                ffn.W_down[BD.ADDR_KEY + 16 + hi, unit] = 2.0 / S
+                unit += 1
+        for b1_lo in range(16):
+            ffn.W_up[unit, op_gate] = S
+            ffn.W_up[unit, BD.MARK_AX] = S
+            ffn.W_up[unit, BD.ADDR_B1_LO + b1_lo] = S
+            ffn.b_up[unit] = -S * 2.5
+            ffn.b_gate[unit] = 1.0
+            ffn.W_down[BD.ADDR_KEY + 32 + b1_lo, unit] = 2.0 / S
+            if b1_lo != 0:
+                ffn.W_down[BD.ADDR_KEY + 32, unit] = -2.0 / S
+            unit += 1
 
     return unit
 
@@ -1060,7 +1246,7 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
     ``_set_layer13_mem_addr_gather`` already gathers the first 3 addr
     bytes to MEM val byte positions as 4-bit one-hot nibbles
     (``ADDR_B{0,1,2}_LO/HI``).  This op takes those nibbles plus the
-    ``MEM_VAL_B{0..3}`` flags (= byte_off) and emits the
+    value-byte flags used by L15 and emits the
     ``ADDR_KEY[lo, 16+hi, 32+top]`` one-hot encoding of
     ``byte_addr = addr + byte_off`` (with carry handling).
 
@@ -1076,8 +1262,9 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
     ``layer14_clear_addr_key_pollution`` (phase 14.2) so the decode
     output is authoritative (not pre-cleared away).
 
-    Total FFN units consumed when enabled: ~1184
-    (1024 lo+hi + 64 common-top + 96 carry-top).  When disabled, 0.
+    Total FFN units consumed when enabled: ~1728
+    (1024 lo+hi + 64 common-top + 96 carry-top + 544 load-query decode).
+    When disabled, 0.
     """
     def bake(block, dim_positions, S):
         if not enable:
@@ -1093,7 +1280,8 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
     return Operation(
         name="layer14_addr_key_neural_decode",
         phase=14.5,
-        reads={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+        reads={"MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "H2", "H3",
+               "OP_LI_RELAY", "OP_LC_RELAY", "MARK_AX",
                "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO",
                "CONST"},
         writes={"ADDR_KEY"},

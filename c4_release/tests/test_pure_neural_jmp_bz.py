@@ -4,8 +4,7 @@ Builds on Phase 1 (PC + AX) and Phase 2 (PSH + binary ALU). Exercises the
 neural network's ability to redirect PC for unconditional and conditional
 branches with NO Python overrides.
 
-Phase 4 closes when all tests in this file pass. Currently all are xfail —
-pure_neural mode does not yet redirect PC for any branch op.
+Phase 4 closes when all tests in this file pass.
 """
 
 import pytest
@@ -77,7 +76,6 @@ class TestPureNeuralJMP:
 class TestPureNeuralBZ:
     """Branch-if-zero conditional."""
 
-    @pytest.mark.xfail(reason="pure_neural BZ taken-path not yet supported (PC never redirects at step 1)")
     def test_bz_taken(self, pure_neural_runner):
         assert _run(pure_neural_runner, [
             (Opcode.IMM, 0),
@@ -91,11 +89,7 @@ class TestPureNeuralBZ:
     @pytest.mark.parametrize("imm", [
         1,
         5,
-        pytest.param(255, marks=pytest.mark.xfail(
-            reason="IMM 255 returns 4210752255 in pure_neural mode — "
-            "pre-existing IMM-large-byte regression unrelated to BZ "
-            "(test_pure_neural_pc::test_imm_byte_values[255] fails identically)"
-        )),
+        255,
     ])
     def test_bz_not_taken(self, pure_neural_runner, imm):
         assert _run(pure_neural_runner, [
@@ -109,7 +103,6 @@ class TestPureNeuralBZ:
 class TestPureNeuralBNZ:
     """Branch-if-not-zero conditional."""
 
-    @pytest.mark.xfail(reason="pure_neural BNZ taken-path not yet supported (PC never redirects at step 1)")
     @pytest.mark.parametrize("imm", [1, 5, 255])
     def test_bnz_taken(self, pure_neural_runner, imm):
         assert _run(pure_neural_runner, [
@@ -133,7 +126,6 @@ class TestPureNeuralBNZ:
 class TestPureNeuralLoop:
     """Tiny loop combining PSH/SUB/BNZ to a backward target."""
 
-    @pytest.mark.xfail(reason="pure_neural backward branch in loop not yet supported (BNZ never redirects PC)")
     def test_countdown_loop(self, pure_neural_runner):
         assert _run(pure_neural_runner, [
             (Opcode.IMM, 3),

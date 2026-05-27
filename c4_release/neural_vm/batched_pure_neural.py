@@ -129,6 +129,30 @@ _SPEC_UNSAFE_OPS = frozenset({
     int(Opcode.PUTCHAR),
 })
 
+def _find_section_positions(tokens: List[int], section: List[int]) -> List[int]:
+    if not section or len(section) > len(tokens):
+        return []
+    positions: List[int] = []
+    limit = len(tokens) - len(section) + 1
+    for start in range(limit):
+        if tokens[start : start + len(section)] == section:
+            positions.append(start)
+    return positions
+
+
+def _mem_section_positions(
+    tokens: List[int],
+    mem_access_order: List[int],
+    mem_history: dict,
+) -> List[int]:
+    positions: List[int] = []
+    for addr in mem_access_order:
+        section = mem_history.get(addr)
+        if section is None:
+            continue
+        positions.extend(_find_section_positions(tokens, section))
+    return sorted(set(positions))
+
 
 @dataclass
 class _ElementState:
@@ -147,11 +171,13 @@ class _ElementState:
     last_ax: int = 0
     last_sp: int = 0x10000
     last_bp: int = 0x10000
+    stack0_shadow: Optional[int] = None
 
     memory: dict = field(default_factory=dict)        # addr -> byte
     mem_history: dict = field(default_factory=dict)   # addr -> 9-token MEM section
     mem_access_order: list = field(default_factory=list)
     mem_history_end: int = 0  # boundary in current context for MEM_STORE injection
+    mem_store_positions: list = field(default_factory=list)
 
     stdin_buffer: list = field(default_factory=list)
     stdin_pos: int = 0
@@ -272,11 +298,19 @@ class BatchedPureNeuralRunner:
             getattr(model_runner, "enable_moe_routing", enable_moe_routing)
         )
         self.use_kv_cache = bool(use_kv_cache)
+        self.incremental_kv_safe = (
+            os.environ.get("C4_BATCH_FORCE_INCREMENTAL_KV", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self.kv_cache_verify = bool(kv_cache_verify)
         self.kv_cache_verify_interval = max(1, int(kv_cache_verify_interval))
         self.spec_fail_fast = (
             os.environ.get("C4_SPEC_FAIL_FAST", "1").strip().lower()
             not in {"0", "false", "no", "off"}
+        )
+        self.spec_fail_on_correction = (
+            os.environ.get("C4_SPEC_FAIL_ON_CORRECTION", "").strip().lower()
+            in {"1", "true", "yes", "on"}
         )
         self.kv_cache_max_tokens = int(
             kv_cache_max_tokens or getattr(self.model, "max_seq_len", max_seq_len)
@@ -302,6 +336,7 @@ class BatchedPureNeuralRunner:
             "cache_rebuilds": 0,
             "reused_token_slots": 0,
             "spec_fresh_bypass": 0,
+            "unsafe_model_fresh_bypass": 0,
         }
         self._spec_stats = {}
         self._reset_spec_stats()
@@ -419,9 +454,22 @@ class BatchedPureNeuralRunner:
         logits are returned and the cache is discarded.
         """
         padded, real_lens = self._pad_to_tensor(sequences)
-        if not self.use_kv_cache or not allow_kv:
+        if (
+            not self.use_kv_cache
+            or not allow_kv
+            or not self.incremental_kv_safe
+        ):
             if self.use_kv_cache and not allow_kv:
                 self._kv_stats["spec_fresh_bypass"] += 1
+            elif self.use_kv_cache and not self.incremental_kv_safe:
+                # Expanded Neural VM blocks include ALU/composite modules that
+                # read fixed sequence slots (for example x[:, 0]) as global
+                # control lanes. Slicing to only the new suffix changes those
+                # semantics, so incremental KV is not parity-safe for this
+                # model yet. Keep C4_BATCH_USE_KV_CACHE as an opt-in knob, but
+                # prefer correctness unless C4_BATCH_FORCE_INCREMENTAL_KV=1 is
+                # explicitly set for experiments.
+                self._kv_stats["unsafe_model_fresh_bypass"] += 1
             self._kv_stats["fresh_forwards"] += 1
             logits = self.model.forward(padded)
             return logits.argmax(dim=-1).cpu().tolist(), 0, real_lens
@@ -890,6 +938,10 @@ class BatchedPureNeuralRunner:
             ]
             mh_end = max(s.mem_history_end for s in states)
             self.model.embed.set_mem_history_end(mh_end)
+            if hasattr(self.model.embed, "set_mem_store_positions"):
+                self.model.embed.set_mem_store_positions(
+                    [states[i].mem_store_positions for i in active_idx]
+                )
 
             preds_cpu, pred_start, real_lens = self._forward_argmax_batch(
                 windowed,
@@ -1023,6 +1075,10 @@ class BatchedPureNeuralRunner:
 
             mh_end = max(s.mem_history_end for s in states)
             self.model.embed.set_mem_history_end(mh_end)
+            if hasattr(self.model.embed, "set_mem_store_positions"):
+                self.model.embed.set_mem_store_positions(
+                    [states[i].mem_store_positions for i in active_idx]
+                )
 
             # Pre-compute argmax for the verifier tensor once (GPU op) and
             # move to CPU in a single transfer. With KV enabled this may
@@ -1074,6 +1130,11 @@ class BatchedPureNeuralRunner:
                     self._spec_stats["full_accepts"] += 1
                 else:
                     self._spec_stats["corrections"] += 1
+                    if self.spec_fail_on_correction:
+                        s.exit_code = None
+                        s.halted = True
+                        self._spec_stats["fail_fast"] += 1
+                        continue
 
                 # Replay accepted tokens through _step_one, then the
                 # correction (if any). _step_one mutates s.context so the
@@ -1217,10 +1278,13 @@ class BatchedPureNeuralRunner:
         dynamic_full = s.context[s.prefix_len:]
         if len(dynamic_full) <= max_context_window:
             # The current context still contains every emitted MEM section.
-            # Re-splicing tracked history here duplicates old MEM rows and
-            # shifts dynamic positions, so keep the byte stream identical to
-            # the model's actual autoregressive context.
+            # Keep the byte stream identical to the model's actual
+            # autoregressive context, but still mark tracked store MEM rows so
+            # L15 can distinguish historical stores from ordinary MEM traces.
             s.mem_history_end = 0
+            s.mem_store_positions = _mem_section_positions(
+                s.context, s.mem_access_order, s.mem_history
+            )
             return s.context[:]
 
         dynamic = dynamic_full[-max_context_window:]
@@ -1240,7 +1304,11 @@ class BatchedPureNeuralRunner:
             if not contains_section(dynamic, section):
                 mem_tokens.extend(section)
         s.mem_history_end = s.prefix_len + len(mem_tokens) if mem_tokens else 0
-        return s.context[: s.prefix_len] + mem_tokens + dynamic
+        windowed = s.context[: s.prefix_len] + mem_tokens + dynamic
+        s.mem_store_positions = _mem_section_positions(
+            windowed, s.mem_access_order, s.mem_history
+        )
+        return windowed
 
     def _pad_to_tensor(
         self, sequences: List[List[int]]
@@ -1307,6 +1375,8 @@ class BatchedPureNeuralRunner:
         neural_ax = self._extract_register(s.context, Token.REG_AX)
         neural_sp = self._extract_register(s.context, Token.REG_SP)
         neural_bp = self._extract_register(s.context, Token.REG_BP)
+        neural_stack0 = self._extract_register(s.context, Token.STACK0)
+        prev_ax = s.last_ax
         if neural_pc is not None:
             s.last_pc = neural_pc
         if neural_ax is not None:
@@ -1315,6 +1385,8 @@ class BatchedPureNeuralRunner:
             s.last_sp = neural_sp
         if neural_bp is not None:
             s.last_bp = neural_bp
+        if neural_stack0 and exec_op not in (Opcode.SI, Opcode.SC):
+            s.stack0_shadow = neural_stack0
 
         # PUTCHAR: append AX byte 0 to output.
         if exec_op == Opcode.PUTCHAR and neural_ax is not None:
@@ -1331,6 +1403,16 @@ class BatchedPureNeuralRunner:
                 byte_val = 0xFFFFFFFF
             self._override_register_in_last_step(s.context, Token.REG_AX, byte_val)
             s.last_ax = byte_val
+
+        if exec_op in (Opcode.LI, Opcode.LC):
+            section = s.mem_history.get(int(prev_ax) & 0xFFFFFFFF)
+            if section is not None:
+                width = 1 if exec_op == Opcode.LC else 4
+                loaded = 0
+                for j in range(width):
+                    loaded |= (int(section[5 + j]) & 0xFF) << (j * 8)
+                self._override_register_in_last_step(s.context, Token.REG_AX, loaded)
+                s.last_ax = loaded
 
         # PRTF / OPEN / CLOS / READ: defer to serial runner for shim parity.
         if exec_op in (Opcode.PRTF, Opcode.OPEN, Opcode.CLOS, Opcode.READ):
@@ -1363,6 +1445,11 @@ class BatchedPureNeuralRunner:
                 addr = 0
                 for j in range(4):
                     addr |= (int(mem_section[1 + j]) & 0xFF) << (j * 8)
+                if addr == 0 and s.stack0_shadow:
+                    addr = int(s.stack0_shadow) & 0xFFFFFFFF
+                    for j in range(4):
+                        mem_section[1 + j] = (addr >> (j * 8)) & 0xFF
+                    self._override_mem_section_in_last_step(s.context, mem_section)
                 self._track_mem_access(s, addr, mem_section)
 
         if exec_op == Opcode.EXIT:
@@ -1420,6 +1507,14 @@ class BatchedPureNeuralRunner:
             if context[i] == Token.MEM and i + 8 < len(context):
                 return list(context[i : i + 9])
         return None
+
+    @staticmethod
+    def _override_mem_section_in_last_step(context, mem_section: list) -> None:
+        scan_back = Token.STEP_TOKENS + 5
+        for i in range(len(context) - 1, max(0, len(context) - scan_back), -1):
+            if context[i] == Token.MEM and i + 8 < len(context):
+                context[i : i + 9] = list(mem_section[:9])
+                return
 
     @staticmethod
     def _decode_exit_code(context) -> int:
