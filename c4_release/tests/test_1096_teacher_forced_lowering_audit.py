@@ -426,6 +426,54 @@ def _detail_failure(
     return classified[0].failure
 
 
+def _confirmed_lowering_failures(
+    *,
+    model,
+    trace: TeacherForcedSymbolicTrace,
+    failures: Sequence[TeacherForcedTraceAuditFailure],
+    min_margin: float,
+    output_band_min_margin: Optional[float],
+    output_band_max_inactive_value: float,
+    output_band_tolerance: float,
+    max_context_window: Optional[int],
+) -> tuple[TeacherForcedTraceAuditFailure, ...]:
+    """Filter fast audit candidates through the exact single-token verifier.
+
+    The windowed fast audit batches many token positions under one remapped
+    memory-store visibility set. That is fast, but it can over-report when a
+    chunk spans positions with different visible stores. Only reported
+    candidates pay for the exact verifier, so the failure list remains
+    authoritative without throwing away the fast path.
+    """
+
+    confirmed: list[TeacherForcedTraceAuditFailure] = []
+    for failure in failures:
+        band_margin = (
+            output_band_min_margin
+            if (
+                failure.output_band_contract_only
+                or failure.output_band_margin_only
+            )
+            else None
+        )
+        support = verify_teacher_forced_token_support(
+            model,
+            trace.context,
+            token_index=failure.token_index,
+            prefix_len=trace.prefix_len,
+            mem_store_positions=trace.mem_store_positions,
+            min_margin=min_margin,
+            output_band_min_margin=band_margin,
+            output_band_max_inactive_value=output_band_max_inactive_value,
+            output_band_tolerance=output_band_tolerance,
+            max_context_window=max_context_window,
+            probe_name=f"confirm:{failure.step}:{failure.slot}",
+        )
+        if not support.supported:
+            confirmed.append(failure)
+    return tuple(confirmed)
+
+
 def _run_1096_lowering_audit_slice(
     *,
     model,
@@ -571,6 +619,16 @@ def _run_1096_lowering_audit_slice(
                 *fatal_report.failures,
                 *info_report.failures,
                 *band_only_failures,
+            )
+            failures = _confirmed_lowering_failures(
+                model=model,
+                trace=trace,
+                failures=failures,
+                min_margin=min_margin,
+                output_band_min_margin=output_band_min_margin,
+                output_band_max_inactive_value=output_band_max_inactive_value,
+                output_band_tolerance=output_band_tolerance,
+                max_context_window=max_context_window,
             )
             detail_failure = _detail_failure(failures)
             if detail_failure is not None and detailed < detail_limit:

@@ -546,6 +546,22 @@ def test_layer10_bp_head_isolates_stack_source_top_store_ax_byte0():
     assert q40 > 0.0
     assert q41 > 0.0
 
+    stale_e8_marker_state = {
+        _SetDim.CONST: 1.0,
+        _SetDim.MARK_STACK0: 1.0,
+        _SetDim.HAS_SE: 0.997939944267273,
+        _SetDim.CMP + 3: 4.0,
+        _SetDim.MEM_STORE: 0.40725404024124146,
+        _SetDim.MEM_ADDR_SRC: 0.40725404024124146,
+        _SetDim.ADDR_B0_LO + 8: 1.0,
+        _SetDim.ADDR_B0_LO + 0: 7.191520126070827e-06,
+        _SetDim.ADDR_B0_HI + 14: 6.436998295297086e-16,
+        _SetDim.ADDR_B0_HI + 15: 1.9453605091257486e-06,
+        _SetDim.H1 + 3: 0.003357573179528117,
+    }
+    assert projection_score(spec.q, 40, stale_e8_marker_state) < 0.0
+    assert projection_score(spec.q, 41, stale_e8_marker_state) < 0.0
+
     ax_byte0 = {
         _SetDim.H1 + 1: 1.0,
         _SetDim.BYTE_INDEX_0: 0.9701380133628845,
@@ -694,10 +710,6 @@ def test_layer10_ax_byte_passthrough_has_li_reload_mem_value_route():
         weight > 0.0
         for weight in _projection_weights(spec, "k", 40, _SetDim.MEM_VAL_B1)
     )
-    assert any(
-        weight > 0.0
-        for weight in _projection_weights(spec, "k", 40, _SetDim.MEM_STORE)
-    )
 
     for slot, byte_dim, source_dim in (
         (40, _SetDim.MARK_AX, _SetDim.MEM_VAL_B1),
@@ -705,7 +717,14 @@ def test_layer10_ax_byte_passthrough_has_li_reload_mem_value_route():
         (42, _SetDim.BYTE_INDEX_1, _SetDim.MEM_VAL_B3),
         (43, _SetDim.BYTE_INDEX_2, _SetDim.MEM_VAL_B3),
     ):
-        assert not _projection_weights(spec, "q", slot, _SetDim.OP_LI_RELAY)
+        assert any(
+            weight > 0.0
+            for weight in _projection_weights(spec, "q", slot, _SetDim.OP_LI_RELAY)
+        )
+        assert any(
+            weight < 0.0
+            for weight in _projection_weights(spec, "q", slot, _SetDim.CONST)
+        )
         assert any(
             weight > 0.0
             for weight in _projection_weights(spec, "q", slot, byte_dim)
@@ -714,10 +733,47 @@ def test_layer10_ax_byte_passthrough_has_li_reload_mem_value_route():
             weight > 0.0
             for weight in _projection_weights(spec, "k", slot, source_dim)
         )
+
+    for slot, byte_dim in (
+        (44, _SetDim.MARK_AX),
+        (45, _SetDim.BYTE_INDEX_0),
+        (46, _SetDim.BYTE_INDEX_1),
+        (47, _SetDim.BYTE_INDEX_2),
+    ):
+        assert any(
+            weight > 0.0
+            for weight in _projection_weights(spec, "q", slot, _SetDim.OP_LI_RELAY)
+        )
+        assert any(
+            weight > 0.0
+            for weight in _projection_weights(spec, "q", slot, byte_dim)
+        )
+        assert any(
+            weight < 0.0
+            for weight in _projection_weights(spec, "q", slot, _SetDim.CONST)
+        )
         assert any(
             weight > 0.0
             for weight in _projection_weights(spec, "k", slot, _SetDim.MEM_STORE)
         )
+        if slot != 44:
+            assert any(
+                weight > 0.0
+                for weight in _projection_weights(
+                    spec,
+                    "k",
+                    slot,
+                    _SetDim.MEM_ADDR_SRC,
+                )
+            )
+    assert any(
+        weight > 0.0
+        for weight in _projection_weights(spec, "q", 48, _SetDim.MARK_AX)
+    )
+    assert any(
+        weight > 0.0
+        for weight in _projection_weights(spec, "k", 48, _SetDim.MEM_ADDR_SRC)
+    )
 
     def projection_score(writes, slot: int, state: dict[int, float]) -> float:
         return sum(
@@ -727,25 +783,38 @@ def test_layer10_ax_byte_passthrough_has_li_reload_mem_value_route():
         )
 
     li_marker = {
+        _SetDim.CONST: 1.0,
         _SetDim.OP_LI_RELAY: 1.0,
         _SetDim.MARK_AX: 1.0,
     }
     li_byte0 = {
+        _SetDim.CONST: 1.0,
         _SetDim.OP_LI_RELAY: 1.0,
         _SetDim.BYTE_INDEX_0: 0.9701380133628845,
         _SetDim.BYTE_INDEX_1: 0.013296706601977348,
     }
     non_li_byte0 = {
+        _SetDim.CONST: 1.0,
         _SetDim.BYTE_INDEX_0: 0.9701380133628845,
         _SetDim.BYTE_INDEX_1: 0.013296706601977348,
     }
     mem_value0_source = {
         _SetDim.MEM_STORE: 2.0,
+        _SetDim.MEM_ADDR_SRC: 2.0,
         _SetDim.MEM_VAL_B1: 0.9701380133628845,
     }
     mem_value2_source = {
         _SetDim.MEM_STORE: 2.0,
+        _SetDim.MEM_ADDR_SRC: 1.0,
         _SetDim.MEM_VAL_B3: 0.9701380133628845,
+    }
+    psh_value0_source = {
+        _SetDim.MEM_STORE: 2.0,
+        _SetDim.MEM_ADDR_SRC: 1.0,
+        _SetDim.MEM_VAL_B1: 0.9701380133628845,
+    }
+    nonstore_value0_source = {
+        _SetDim.MEM_VAL_B1: 0.9701380133628845,
     }
 
     def route_score(
@@ -755,19 +824,32 @@ def test_layer10_ax_byte_passthrough_has_li_reload_mem_value_route():
         return sum(
             projection_score(spec.q, slot, query_state)
             * projection_score(spec.k, slot, source_state)
-            for slot in (39, 40, 41, 42, 43)
+            for slot in range(39, 49)
         )
 
     assert projection_score(spec.q, 39, li_marker) > 0.0
     assert projection_score(spec.q, 39, non_li_byte0) == pytest.approx(0.0)
     assert projection_score(spec.q, 40, li_marker) > 0.0
-    assert projection_score(spec.q, 41, li_marker) == pytest.approx(0.0)
+    assert projection_score(spec.q, 40, {_SetDim.CONST: 1.0}) < 0.0
+    assert projection_score(spec.q, 41, li_marker) < 0.0
+    assert projection_score(spec.q, 41, non_li_byte0) < 0.0
     assert projection_score(spec.q, 41, li_byte0) > 0.0
+    assert projection_score(spec.q, 44, li_marker) > 0.0
+    assert projection_score(spec.q, 45, li_marker) == pytest.approx(0.0)
+    assert projection_score(spec.q, 45, li_byte0) > 0.0
+    assert projection_score(spec.q, 48, li_marker) > 0.0
+    assert projection_score(spec.q, 48, li_byte0) == pytest.approx(0.0)
     assert projection_score(spec.q, 42, li_byte0) < projection_score(
         spec.q, 41, li_byte0
     )
     assert route_score(li_marker, mem_value0_source) > route_score(
         li_marker, mem_value2_source
+    )
+    assert route_score(li_marker, mem_value0_source) > route_score(
+        li_marker, nonstore_value0_source
+    )
+    assert route_score(li_marker, mem_value0_source) > route_score(
+        li_marker, psh_value0_source
     )
     assert route_score(li_byte0, mem_value2_source) > route_score(
         non_li_byte0, mem_value2_source
@@ -1433,6 +1515,29 @@ def test_tail_ax_lea_local_addr_byte1_preserves_ff_after_e8():
     assert out["OUTPUT_HI+0"] < 0.0
 
 
+def test_tail_ax_lea_local_addr_byte1_accepts_temp10_local_signature():
+    ir = _single_rule_ir(_tail_rule("tail_ax_lea_local_addr_byte1_ff_after_e8"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.997,
+        "H1+1": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "BYTE_INDEX_1": 0.013296706601977348,
+        "CLEAN_EMBED_LO+8": 1.0,
+        "CLEAN_EMBED_HI+14": 1.0,
+        "FETCH_HI+15": 2.44211264543992e-06,
+        "TEMP+10": 0.9984737038612366,
+        "OUTPUT_LO+0": 2.9402759075164795,
+        "OUTPUT_HI+0": 2.9402759075164795,
+    })
+
+    assert out["OUTPUT_LO+15"] > 0.0
+    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_LO+0"] < 0.0
+    assert out["OUTPUT_HI+0"] < 0.0
+
+
 def test_tail_ax_lea_local_addr_byte1_requires_staged_high_nibble():
     ir = _single_rule_ir(_tail_rule("tail_ax_lea_local_addr_byte1_ff_after_e8"))
 
@@ -2033,6 +2138,42 @@ def test_tail_mem_store_addr_high_zero_from_global_blocks_stack0_byte_rows(
     assert out["OUTPUT_HI+0"] == pytest.approx(456.0)
     assert out["OUTPUT_LO+15"] == pytest.approx(-7.0)
     assert out["OUTPUT_HI+15"] == pytest.approx(-8.0)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "byte_index"),
+    [
+        ("tail_mem_store_addr2_zero_from_global_exact", "BYTE_INDEX_1"),
+        ("tail_mem_store_addr3_zero_from_global_exact", "BYTE_INDEX_2"),
+        ("tail_sp_marker_byte0_f8_from_initial_stack_exact", "BYTE_INDEX_0"),
+    ],
+)
+def test_tail_stack0_span_blockers_dominate_authoritative_output_bands(
+    prefix, byte_index
+):
+    ir = _tail_prefix_ir(prefix)
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "IS_BYTE": 1.0,
+        "HAS_SE": 1.0,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "MEM_ADDR_SRC": 2.0,
+        byte_index: 1.0,
+        "OUTPUT_LO+0": -441_904_000.0,
+        "OUTPUT_LO+8": -441_899_936.0,
+        "OUTPUT_LO+9": 441_904_032.0,
+        "OUTPUT_HI+0": -441_904_000.0,
+        "OUTPUT_HI+3": 441_904_032.0,
+        "OUTPUT_HI+14": -441_899_936.0,
+        "OUTPUT_HI+15": -441_904_000.0,
+    })
+
+    assert out["OUTPUT_LO+9"] == pytest.approx(441_904_032.0)
+    assert out["OUTPUT_HI+3"] == pytest.approx(441_904_032.0)
+    assert out["OUTPUT_LO+0"] == pytest.approx(-441_904_000.0)
+    assert out["OUTPUT_HI+0"] == pytest.approx(-441_904_000.0)
 
 
 def test_tail_mem_store_addr0_f8_from_mod_local_exacts_nibbles():
@@ -3427,6 +3568,28 @@ def test_tail_stack0_pop_reveals_saved_addr_e8_after_d8_pop():
     assert out["OUTPUT_HI+0"] < 0.0
 
 
+def test_tail_stack0_pop_reveals_saved_addr_e8_from_e0_addr():
+    ir = CompilerIR()
+    ir.layer(0).ffn.append(_tail_rule("tail_stack0_pop_marker_zero"))
+    ir.layer(0).ffn.append(
+        _tail_rule("tail_stack0_pop_reveals_saved_addr_e8_from_e0_addr")
+    )
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 1.0,
+        "CMP+3": 4.0,
+        "ADDR_B0_LO+0": 1.0,
+        "ADDR_B0_HI+14": 1.0,
+        "ADDR_B0_HI+13": -1.0,
+    })
+
+    assert out["OUTPUT_LO+8"] > 0.0
+    assert out["OUTPUT_HI+14"] > 0.0
+    assert out["OUTPUT_LO+0"] < 0.0
+    assert out["OUTPUT_HI+0"] < 0.0
+
+
 def test_tail_stack0_pop_reveals_saved_addr_e8_blocks_d0_pop():
     ir = _single_rule_ir(_tail_rule("tail_stack0_pop_reveals_saved_addr_e8"))
 
@@ -3900,6 +4063,24 @@ def test_tail_stack0_pop_loaded_blocks_large_ax_byte_residue():
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
+def test_tail_stack0_pop_loaded_blocks_store_row_residue():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_pop_loaded_byte_39"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9985874891281128,
+        "CMP+3": 4.0,
+        "MEM_STORE": 0.40725404024124146,
+        "OUTPUT_LO+9": 334.4128723144531,
+        "OUTPUT_HI+3": 518.2252197265625,
+    })
+
+    assert out["OUTPUT_LO+9"] == 334.4128723144531
+    assert out["OUTPUT_HI+3"] == 518.2252197265625
+    assert out.get("OUTPUT_LO+0", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+
+
 def test_tail_stack0_pop_loaded_blocks_bp_byte_span_residue():
     ir = _single_rule_ir(_tail_rule("tail_stack0_pop_loaded_byte_02"))
 
@@ -3967,6 +4148,82 @@ def test_tail_stack0_store_top_e8_from_e0_restores_current_store_value():
     assert out["OUTPUT_HI+13"] > 3.0
     assert out["OUTPUT_LO+0"] < 0.0
     assert out["OUTPUT_HI+0"] < 0.0
+
+
+def test_tail_stack0_store_top_e8_from_e0_restores_39_from_e8_addr():
+    ir = _tail_rules_ir(
+        "tail_stack0_pop_loaded_byte_30",
+        "tail_stack0_store_top_e8_from_e0_byte_39_from_e8_addr",
+    )
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9985874891281128,
+        "CMP+3": 4.0,
+        "MEM_STORE": 0.40725404024124146,
+        "MEM_ADDR_SRC": 0.40725404024124146,
+        "EMBED_LO+8": 3.582539704893861e-07,
+        "EMBED_HI+14": 4.122032919440244e-07,
+        "ADDR_B0_LO+0": -2.008293867111206,
+        "ADDR_B0_HI+0": -1.9909181594848633,
+        "ADDR_B0_LO+8": 1.990378737449646,
+        "ADDR_B0_HI+14": 0.9730035066604614,
+        "OUTPUT_LO+0": 1128.9244384765625,
+        "OUTPUT_HI+0": 1095.1925048828125,
+        "OUTPUT_LO+9": 334.4128723144531,
+        "OUTPUT_HI+3": 518.2252197265625,
+    })
+
+    assert out["OUTPUT_LO+9"] > 334.4128723144531
+    assert out["OUTPUT_HI+3"] > 518.2252197265625
+    assert out["OUTPUT_LO+0"] < 1128.9244384765625
+    assert out["OUTPUT_HI+0"] < 1095.1925048828125
+
+
+def test_tail_stack0_store_top_e8_from_e0_ignores_initial_stack0_value():
+    ir = _tail_prefix_ir("tail_stack0_store_top_e8_from_e0_byte_")
+
+    state = {
+        "MARK_STACK0": 1.0,
+        "MEM_STORE": 0.40725401043891907,
+        "ADDR_B0_LO+8": 1.0000001192092896,
+        "ADDR_B0_HI+15": 1.0000003576278687,
+        "OUTPUT_LO+10": 507625.5625,
+        "OUTPUT_HI+0": 507625.5625,
+    }
+    for i in range(16):
+        state.setdefault(f"OUTPUT_LO+{i}", -507622.5625)
+        state.setdefault(f"OUTPUT_HI+{i}", -507622.5625)
+
+    out = ir.symbolic_ffn(state)
+
+    assert out["OUTPUT_LO+10"] == 507625.5625
+    assert out["OUTPUT_HI+0"] == 507625.5625
+    assert out["OUTPUT_HI+1"] == -507622.5625
+
+
+def test_tail_stack0_store_top_e8_from_e0_39_requires_low9_evidence():
+    ir = _single_rule_ir(
+        _tail_rule("tail_stack0_store_top_e8_from_e0_byte_39_from_e8_addr")
+    )
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9981152415275574,
+        "ADDR_B0_LO+8": 7.971285343170166,
+        "ADDR_B0_HI+14": 7.971285343170166,
+        "ADDR_B0_LO+0": -1.9924825429916382,
+        "ADDR_B0_HI+0": -1.9924836158752441,
+        "MEM_STORE": 1.2841345778724644e-05,
+        "MEM_ADDR_SRC": 1.2841345778724644e-05,
+        "OUTPUT_LO+2": 4058.505859375,
+        "OUTPUT_LO+9": 3.938452982597199e-18,
+        "OUTPUT_HI+3": 4058.5029296875,
+    })
+
+    assert out["OUTPUT_LO+2"] == 4058.505859375
+    assert out["OUTPUT_HI+3"] == 4058.5029296875
+    assert out.get("OUTPUT_LO+9", 0.0) == 3.938452982597199e-18
 
 
 def test_tail_stack0_store_top_e8_from_e0_requires_l15_top_signature():
@@ -4097,6 +4354,78 @@ def test_tail_stack0_store_loaded_byte11_still_fires_on_stack0_marker():
     assert out.get("OUTPUT_HI+0", 0.0) < 0.0
 
 
+def test_tail_stack0_store_top_value_2f_materializes_from_alu_residue():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_value_2f_from_alu"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9984076023101807,
+        "CMP+3": 4.0,
+        "MEM_STORE": 0.40725404024124146,
+        "MEM_ADDR_SRC": 0.40725404024124146,
+        "ADDR_B0_LO+0": 0.9812770485877991,
+        "ADDR_B0_HI+14": 0.9630643129348755,
+        "ALU_LO+15": 2.110461950302124,
+        "ALU_HI+2": 0.9937549233436584,
+    })
+
+    assert out["OUTPUT_LO+15"] > out.get("OUTPUT_LO+0", 0.0)
+    assert out["OUTPUT_HI+2"] > out.get("OUTPUT_HI+0", 0.0)
+
+
+def test_tail_stack0_store_top_value_2f_blocks_non_stack_marker():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_value_2f_from_alu"))
+
+    out = ir.symbolic_ffn({
+        "MARK_AX": 1.0,
+        "HAS_SE": 0.9984076023101807,
+        "CMP+3": 4.0,
+        "MEM_STORE": 0.40725404024124146,
+        "MEM_ADDR_SRC": 0.40725404024124146,
+        "ADDR_B0_LO+0": 0.9812770485877991,
+        "ADDR_B0_HI+14": 0.9630643129348755,
+        "ALU_LO+15": 2.110461950302124,
+        "ALU_HI+2": 0.9937549233436584,
+    })
+
+    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+2", 0.0) == 0.0
+
+
+def test_tail_stack0_store_top_value_2f_requires_current_store_signal():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_value_2f_from_alu"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.996364951133728,
+        "ADDR_B0_LO+0": 7.967979431152344,
+        "ADDR_B0_HI+14": 7.961431503295898,
+        "ALU_HI+2": 0.0003117081942036748,
+        "H1+3": 0.003357573412358761,
+    })
+
+    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+2", 0.0) == 0.0
+
+
+def test_tail_stack0_store_top_value_2f_requires_high_nibble_two():
+    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_value_2f_from_alu"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9979397058486938,
+        "CMP+3": 4.0,
+        "MEM_STORE": 0.40725404024124146,
+        "MEM_ADDR_SRC": 0.40725404024124146,
+        "ADDR_B0_LO+0": 0.9812690019607544,
+        "ADDR_B0_HI+14": 0.9611873626708984,
+        "ALU_LO+15": 1.0341620445251465,
+    })
+
+    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+2", 0.0) == 0.0
+
+
 def test_tail_pop_mem_marker_zero_blocks_byte_rows():
     ir = _single_rule_ir(_tail_rule("tail_pop_mem_marker_zero"))
 
@@ -4220,6 +4549,25 @@ def test_tail_sp_pop_marker_increment_requires_pop_flag():
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert out["OUTPUT_HI+14"] == 3.0
+
+
+def test_tail_sp_pop_marker_increment_blocks_d8_embed_signature():
+    ir = _single_rule_ir(_tail_rule("tail_sp_pop_marker_e0_to_e8"))
+
+    out = ir.symbolic_ffn({
+        "CONST": 1.0,
+        "MARK_SP": 1.0,
+        "HAS_SE": 1.0,
+        "CMP+3": 4.0,
+        "OUTPUT_LO+0": 3.0,
+        "OUTPUT_HI+14": 3.0,
+        "EMBED_LO+8": 1.0,
+        "EMBED_HI+13": 1.0,
+    })
+
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert out["OUTPUT_LO+0"] == 3.0
     assert out["OUTPUT_HI+14"] == 3.0
 
 
@@ -4384,6 +4732,25 @@ def test_tail_sp_pop_marker_d0_to_d8_restores_larger_frame_pop():
     assert out["OUTPUT_LO+8"] > 0.0
     assert out["OUTPUT_HI+13"] > 2.0
     assert out["OUTPUT_LO+0"] < 2.0
+
+
+def test_tail_sp_pop_marker_d0_to_d8_blocks_d8_embed_signature():
+    ir = _single_rule_ir(_tail_rule("tail_sp_pop_marker_d0_to_d8"))
+
+    out = ir.symbolic_ffn({
+        "MARK_SP": 1.0,
+        "HAS_SE": 1.0,
+        "CMP+3": 4.0,
+        "EMBED_LO+0": 0.01,
+        "EMBED_LO+8": 1.0,
+        "EMBED_HI+13": 1.0,
+        "OUTPUT_LO+0": 2.0,
+        "OUTPUT_HI+13": 2.0,
+    })
+
+    assert out["OUTPUT_LO+0"] == 2.0
+    assert out["OUTPUT_HI+13"] == 2.0
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
 
 
 def test_tail_sp_pop_marker_f0_to_f8_restores_larger_frame_pop():
@@ -4754,6 +5121,78 @@ def test_tail_stack0_pushed_addr_byte1_blocks_store_rows():
     assert out["OUTPUT_HI+0"] == pytest.approx(5.053187847137451)
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
     assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+
+
+def test_tail_stack0_pushed_addr_byte1_store_preserves_ff_after_e8():
+    ir = _single_rule_ir(
+        _tail_rule("tail_stack0_pushed_addr_byte1_store_ff_after_e8")
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9972294569015503,
+        "H1+10": 0.9999994039535522,
+        "STACK0_BYTE0": 0.9734055995941162,
+        "BYTE_INDEX_0": 0.9734055995941162,
+        "MEM_STORE": 1.5293787717819214,
+        "CLEAN_EMBED_LO+8": 1.0,
+        "CLEAN_EMBED_HI+14": 1.0,
+        "OUTPUT_LO+0": 3.9468109607696533,
+        "OUTPUT_HI+0": 3.9468109607696533,
+        "OUTPUT_LO+15": 3.0,
+        "OUTPUT_HI+15": 3.3088135719299316,
+    })
+
+    assert out["OUTPUT_LO+15"] > out["OUTPUT_LO+0"]
+    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"]
+
+
+def test_tail_stack0_pushed_addr_byte1_store_requires_ff_residue():
+    ir = _single_rule_ir(
+        _tail_rule("tail_stack0_pushed_addr_byte1_store_ff_after_e8")
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9970132112503052,
+        "H1+10": 1.0,
+        "STACK0_BYTE0": 0.9734055995941162,
+        "BYTE_INDEX_0": 0.9734055995941162,
+        "MEM_STORE": 1.5293787717819214,
+        "CLEAN_EMBED_LO+8": 1.0,
+        "CLEAN_EMBED_HI+14": 1.0,
+        "OUTPUT_LO+2": 3.0,
+        "OUTPUT_HI+0": 5.053187847137451,
+    })
+
+    assert out["OUTPUT_LO+2"] == pytest.approx(3.0)
+    assert out["OUTPUT_HI+0"] == pytest.approx(5.053187847137451)
+    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+
+
+def test_tail_stack0_pushed_addr_byte1_store_preserves_ff_after_e0():
+    ir = _single_rule_ir(
+        _tail_rule("tail_stack0_pushed_addr_byte1_store_ff_after_e0")
+    )
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9982361793518066,
+        "H1+10": 0.9999994039535522,
+        "STACK0_BYTE0": 0.9734055995941162,
+        "BYTE_INDEX_0": 0.9734055995941162,
+        "MEM_STORE": 1.5293787717819214,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+14": 1.0,
+        "OUTPUT_LO+0": 3.9468109607696533,
+        "OUTPUT_HI+0": 3.9468109607696533,
+        "OUTPUT_LO+15": 3.0,
+        "OUTPUT_HI+15": 3.3088135719299316,
+    })
+
+    assert out["OUTPUT_LO+15"] > out["OUTPUT_LO+0"]
+    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"]
 
 
 def test_tail_stack0_pushed_addr_byte1_loses_to_exact_existing_byte2():
@@ -5509,6 +5948,23 @@ def test_tail_si_ax_byte1_blocks_byte3_residue():
 
     assert out["OUTPUT_LO+0"] == 42.0
     assert out["OUTPUT_HI+0"] == 1_000_000_000.0
+
+
+def test_tail_si_ax_byte1_blocks_stack0_marker_residue():
+    ir = _single_rule_ir(_tail_rule("tail_si_ax_byte1_00"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "MEM_STORE": 0.40725401043891907,
+        "OUTPUT_LO+2": -507622.5625,
+        "OUTPUT_HI+0": 507625.5625,
+        "OUTPUT_HI+1": -507622.5625,
+        "OUTPUT_LO+10": 507625.5625,
+    })
+
+    assert out["OUTPUT_LO+10"] == 507625.5625
+    assert out["OUTPUT_HI+0"] == 507625.5625
+    assert out["OUTPUT_HI+1"] == -507622.5625
 
 
 def test_tail_si_ax_byte1_still_fires_for_store_signal():
@@ -6695,6 +7151,27 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_stack0_byte_row():
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
+def test_tail_ax_add_byte1_missing_stack_high_blocks_stack0_marker_signed_bands():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_byte1_missing_stack_high_02"))
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9985138177871704,
+        "TEMP+8": 0.0008986028842628002,
+        "OUTPUT_LO+3": -425984032.0,
+        "OUTPUT_LO+4": -425984032.0,
+        "OUTPUT_LO+5": -425984032.0,
+        "OUTPUT_LO+6": -425984032.0,
+        "OUTPUT_LO+7": -425984032.0,
+        "OUTPUT_LO+15": 425984000.0,
+        "OUTPUT_HI+2": 425984000.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == 425984000.0
+    assert out["OUTPUT_HI+2"] == 425984000.0
+    assert out.get("OUTPUT_LO+2", 0.0) == 0.0
+
+
 def test_tail_sp_pop_carry_blocks_ax_byte_row():
     ir = _single_rule_ir(_tail_rule("tail_sp_pop_carry_byte2_00"))
 
@@ -6904,6 +7381,30 @@ def test_tail_sp_pop_carry_byte1_zero_blocks_store_frame_row():
     assert out["OUTPUT_HI+15"] == 5.880709648132324
     assert out["OUTPUT_LO+0"] == 0.08617234230041504
     assert out["OUTPUT_HI+0"] == 0.08617234230041504
+
+
+def test_tail_sp_pop_carry_byte1_zero_blocks_e0_high_byte_row():
+    ir = _single_rule_ir(_tail_rule("tail_sp_pop_carry_byte1_zero"))
+
+    out = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.998437,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "BYTE_INDEX_0": 0.9701380133628845,
+        "BYTE_INDEX_1": 0.013296706601977348,
+        "CLEAN_EMBED_LO+0": 1.0,
+        "CLEAN_EMBED_HI+14": 1.0,
+        "OUTPUT_LO+0": 0.9402758479118347,
+        "OUTPUT_LO+15": 2.0,
+        "OUTPUT_HI+0": 0.9402758479118347,
+        "OUTPUT_HI+15": 2.0,
+    })
+
+    assert out["OUTPUT_LO+15"] == 2.0
+    assert out["OUTPUT_HI+15"] == 2.0
+    assert out["OUTPUT_LO+0"] == 0.9402758479118347
+    assert out["OUTPUT_HI+0"] == 0.9402758479118347
 
 
 def test_tail_sp_pop_carry_byte2_zero_fires_on_measured_add_sp_row():

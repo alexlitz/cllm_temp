@@ -40,8 +40,8 @@ def test_layer16_lev_routing_ir_matches_legacy_helper():
     legacy_end = _set_layer16_lev_routing(expected, 100.0, _SetDim)
 
     assert legacy_end == 121
-    assert end == 442
-    assert len(_layer16_lev_routing_rules(100.0)) == 442
+    assert end == 695
+    assert len(_layer16_lev_routing_rules(100.0)) == 695
     _assert_same_ffn_prefix(actual, expected, legacy_end)
     assert actual.W_down[:, legacy_end:end].abs().sum() > 0
 
@@ -464,6 +464,8 @@ def test_layer16_stack0_e8_marker_materializes_from_alu():
     rules = {rule.name: rule for rule in _layer16_lev_routing_rules(100.0)}
     lo = rules["l16_stack0_e8_marker_from_alu_lo_9"]
     hi = rules["l16_stack0_e8_marker_from_alu_hi_3"]
+    auth01 = rules["l16_stack0_e8_output_authoritative_01"]
+    auth39 = rules["l16_stack0_e8_output_authoritative_39"]
     auth = rules["l16_stack0_e8_output_authoritative_de"]
 
     condition_dims = {(term.dim.key(), term.weight) for term in lo.conditions}
@@ -481,14 +483,15 @@ def test_layer16_stack0_e8_marker_materializes_from_alu():
     assert lo.writes[0].dim.key() == "OUTPUT_LO+9"
     assert hi.writes[0].dim.key() == "OUTPUT_HI+3"
     auth_conditions = {(term.dim.key(), term.weight) for term in auth.conditions}
-    assert ("MARK_STACK0+0", 1_000_000.0) in auth_conditions
-    assert ("OUTPUT_LO+14", 10.0) in auth_conditions
-    assert ("OUTPUT_HI+13", 10.0) in auth_conditions
-    assert ("MEM_STORE+0", -1_000_000.0) in auth_conditions
-    assert auth.threshold == 1_000_200.0
+    assert ("MARK_STACK0+0", 1_000_000_000.0) in auth_conditions
+    assert ("IS_BYTE+0", -1_000_000_000.0) in auth_conditions
+    assert ("OUTPUT_LO+14", 100.0) in auth_conditions
+    assert ("OUTPUT_HI+13", 100.0) in auth_conditions
+    assert ("MEM_STORE+0", -1_000_000_000.0) in auth_conditions
+    assert auth.threshold == 1_000_006_000.0
 
     ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend((lo, hi, auth))
+    ir.layer(0).ffn.rules.extend((lo, hi, auth01, auth39, auth))
 
     out = ir.symbolic_ffn({
         "MARK_STACK0": 1.0,
@@ -529,6 +532,58 @@ def test_layer16_stack0_e8_marker_materializes_from_alu():
     assert current_store["OUTPUT_HI+13"] == 3.0
     assert current_store.get("OUTPUT_LO+9", 0.0) == 0.0
     assert current_store.get("OUTPUT_HI+3", 0.0) == 0.0
+
+    ent_stack0_marker = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9937513470649719,
+        "OP_ENT": 8.574287414550781,
+        "ADDR_B0_LO+8": 26.36232566833496,
+        "ADDR_B0_HI+14": 21.223567962646484,
+        "ADDR_B0_HI+15": -42.0731086730957,
+        "MEM_STORE": 0.40726688504219055,
+        "ALU_LO+0": -65.84081268310547,
+        "ALU_LO+10": -70.74346160888672,
+        "ALU_HI+0": -65.84011840820312,
+        "ALU_HI+10": -70.74352264404297,
+        "OUTPUT_LO+0": 15.511894226074219,
+        "OUTPUT_HI+0": 15.514585494995117,
+    })
+    assert ent_stack0_marker["OUTPUT_LO+0"] == 15.511894226074219
+    assert ent_stack0_marker["OUTPUT_HI+0"] == 15.514585494995117
+    assert ent_stack0_marker.get("OUTPUT_LO+10", 0.0) == 0.0
+    assert ent_stack0_marker.get("OUTPUT_HI+10", 0.0) == 0.0
+
+    existing_39_stack0 = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9987085461616516,
+        "ADDR_B0_LO+8": 7.97370719909668,
+        "ADDR_B0_HI+14": 7.97370719909668,
+        "ADDR_B0_HI+15": -1.9999949932098389,
+        "ALU_LO+8": 0.9937556385993958,
+        "ALU_HI+14": 0.9937556385993958,
+        "OUTPUT_LO+9": 39.999961853027344,
+        "OUTPUT_HI+3": 40.0,
+        "OUTPUT_LO+14": 4.111372504667088e-07,
+        "OUTPUT_HI+13": 0.0,
+    })
+    assert existing_39_stack0["OUTPUT_LO+9"] > existing_39_stack0["OUTPUT_LO+8"]
+    assert existing_39_stack0["OUTPUT_HI+3"] > existing_39_stack0["OUTPUT_HI+14"]
+    assert existing_39_stack0["OUTPUT_LO+9"] > 39.999961853027344
+    assert existing_39_stack0["OUTPUT_HI+3"] > 40.0
+
+    bp_byte_row = ir.symbolic_ffn({
+        "IS_BYTE": 1.0,
+        "BYTE_INDEX_2": 0.9701374769210815,
+        "OP_JSR": 11.058891296386719,
+        "MEM_STORE": 1.6414871215820312,
+        "ADDR_B0_LO+8": 1.000000238418579,
+        "ADDR_B0_HI+15": 1.0000009536743164,
+        "OUTPUT_LO+0": 0.9402737021446228,
+        "OUTPUT_HI+0": 7_639_176.0,
+    })
+    assert bp_byte_row["OUTPUT_LO+0"] == 0.9402737021446228
+    assert bp_byte_row["OUTPUT_HI+0"] == 7_639_176.0
+    assert bp_byte_row.get("OUTPUT_LO+1", 0.0) == 0.0
 
     ent_mem_addr0 = CompilerIR()
     ent_mem_addr0.layer(0).ffn.rules.extend(
@@ -1837,7 +1892,7 @@ def test_layer16_lea_local_ax_byte0_high_nibble_nudges_e8_marker():
     assert ("IS_BYTE+0", -10.0) in condition_dims
     assert rule.threshold == 8.0
     assert rule.writes[0].dim.key() == "OUTPUT_HI+14"
-    assert rule.writes[0].weight == 0.1
+    assert rule.writes[0].weight == 2.0
 
     ir = CompilerIR()
     ir.layer(0).ffn.rules.append(rule)

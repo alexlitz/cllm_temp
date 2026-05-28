@@ -445,6 +445,23 @@ def test_l15_psh_stack_ir_symbolic_sp_byte_outputs():
     assert sp_byte2["OUTPUT_HI+0"] == 6.0
 
 
+def test_l15_psh_stack_ir_blocks_stack0_byte_residue():
+    ir = make_l15_psh_stack_ir()
+
+    stack0_byte0 = _psh_state(2, "BYTE_INDEX_0")
+    stack0_byte0["PSH_AT_SP+0"] = 2.0
+    stack0_byte0["H1+2"] = 0.0
+    stack0_byte0["H1+10"] = 1.0
+    stack0_byte0["H4+3"] = 1.0
+
+    out = ir.symbolic_ffn(stack0_byte0)
+
+    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out["OUTPUT_LO+0"] == 4.0
+    assert out["OUTPUT_HI+0"] == 4.0
+
+
 def test_l15_psh_stack_ir_symbolic_bp_byte2_preserved():
     ir = make_l15_psh_stack_ir()
 
@@ -462,6 +479,7 @@ def test_l15_psh_stack_ir_lowers_legacy_weight_scale():
         "BYTE_INDEX_0": 9,
         "BYTE_INDEX_1": 10,
         "BYTE_INDEX_2": 11,
+        "H4": 12,
         "OUTPUT_LO": 16,
         "OUTPUT_HI": 32,
     }

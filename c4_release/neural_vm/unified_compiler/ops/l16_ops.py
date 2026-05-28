@@ -284,7 +284,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("ADDR_B0_HI+15", -2.0),
         ("IS_BYTE", -10.0),
         ("OP_JSR", -10.0),
-        ("OP_ENT", -10.0),
+        ("OP_ENT", -100.0),
         ("OP_LEV", -10.0),
         ("MARK_PC", -10.0),
         ("MARK_AX", -10.0),
@@ -382,37 +382,43 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ))
 
     stack0_e8_output_authoritative_conditions = (
-        ("MARK_STACK0", 1_000_000.0),
+        ("MARK_STACK0", 1_000_000_000.0),
         ("HAS_SE", 10.0),
         ("ADDR_B0_LO+8", 10.0),
         ("ADDR_B0_HI+14", 10.0),
         ("ADDR_B0_HI+15", -20.0),
-        ("IS_BYTE", -1_000_000.0),
-        ("OP_JSR", -1_000_000.0),
-        ("OP_ENT", -1_000_000.0),
-        ("OP_LEV", -1_000_000.0),
-        ("MEM_STORE", -1_000_000.0),
-        ("MARK_PC", -1_000_000.0),
-        ("MARK_AX", -1_000_000.0),
-        ("MARK_SP", -1_000_000.0),
-        ("MARK_BP", -1_000_000.0),
-        ("MARK_MEM", -1_000_000.0),
+        ("IS_BYTE", -1_000_000_000.0),
+        ("OP_JSR", -1_000_000_000.0),
+        ("OP_ENT", -1_000_000_000.0),
+        ("OP_LEV", -1_000_000_000.0),
+        ("MEM_STORE", -1_000_000_000.0),
+        ("MARK_PC", -1_000_000_000.0),
+        ("MARK_AX", -1_000_000_000.0),
+        ("MARK_SP", -1_000_000_000.0),
+        ("MARK_BP", -1_000_000_000.0),
+        ("MARK_MEM", -1_000_000_000.0),
     )
 
-    # If the load/preserve path has already produced an OUTPUT byte for this
-    # e8 STACK0 marker, make that byte authoritative over the ALU-address
-    # fallback above. These rules use only positive OUTPUT evidence, so large
-    # negative cleanup bands on unrelated marker rows cannot create false
-    # positives.
-    rules.append(FFNRule.constant_write(
-        name="l16_stack0_e8_output_authoritative_de",
-        conditions=stack0_e8_output_authoritative_conditions + (
-            ("OUTPUT_LO+14", 10.0),
-            ("OUTPUT_HI+13", 10.0),
-        ),
-        threshold=1_000_200.0,
-        writes=Primitives.byte_value_writes(0xDE, strength=2000.0),
-    ))
+    # If the load/preserve path has already produced a non-zero OUTPUT byte
+    # for this e8 STACK0 marker, make that byte authoritative over the
+    # ALU-address fallback above. Requiring both OUTPUT nibbles keeps the
+    # rule out of default-zero rows; 0xe8 is excluded because it already
+    # agrees with the fallback.
+    stack0_e8_output_authoritative_threshold = 1_000_006_000.0
+    for byte in range(1, 256):
+        if byte == 0xE8:
+            continue
+        lo = byte & 0xF
+        hi = (byte >> 4) & 0xF
+        rules.append(FFNRule.constant_write(
+            name=f"l16_stack0_e8_output_authoritative_{byte:02x}",
+            conditions=stack0_e8_output_authoritative_conditions + (
+                (f"OUTPUT_LO+{lo}", 100.0),
+                (f"OUTPUT_HI+{hi}", 100.0),
+            ),
+            threshold=stack0_e8_output_authoritative_threshold,
+            writes=Primitives.byte_value_writes(byte, strength=2000.0),
+        ))
 
     # ENT's frame-save store writes to the newly established BP slot. At that
     # MEM marker a stale ALU_LO+14 lane from frame arithmetic can feed a later
@@ -1240,7 +1246,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_MEM", -10.0),
         ),
         threshold=8.0,
-        writes=(("OUTPUT_HI+14", 0.1),),
+        writes=(("OUTPUT_HI+14", 2.0),),
     ))
 
     # The legacy LEV SP materializers above intentionally key off the old BP
@@ -1359,9 +1365,10 @@ def make_layer16_lev_routing_op() -> Operation:
         # restores, 39 ENT dynamic-frame SP/BP/STACK0 byte units, plus 2 LEA
         # local-frame byte materialization units, one recursive JSR
         # return-address byte-1 guard, plus 32 STACK0-marker inverse units for
-        # false-positive LEV SP materializers, one e8 STACK0 output
-        # authoritative byte guard, plus one e0/e8 STACK0 exactness guard.
-        ffn_units_used=442,
+        # false-positive LEV SP materializers, 254 nonzero staged-byte e8
+        # STACK0 output authority guards, plus one e0/e8 STACK0 exactness
+        # guard.
+        ffn_units_used=695,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )

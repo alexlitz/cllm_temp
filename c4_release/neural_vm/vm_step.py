@@ -2903,6 +2903,7 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     psh_dim_positions = {
         "PSH_AT_SP": BD.PSH_AT_SP,
         "H1": BD.H1,
+        "H4": BD.H4,
         "IS_BYTE": BD.IS_BYTE,
         "BYTE_INDEX_0": BD.BYTE_INDEX_0,
         "BYTE_INDEX_1": BD.BYTE_INDEX_1,

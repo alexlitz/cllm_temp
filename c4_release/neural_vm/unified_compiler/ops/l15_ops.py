@@ -29,6 +29,12 @@ def make_l15_psh_stack_ir() -> CompilerIR:
             (f"H1+{marker_index}", 1.0),
             ("IS_BYTE", 1.0),
             (byte_index_name, 1.0),
+            # Strict traces can relay PSH_AT_SP at value ~2.0 onto STACK0 byte
+            # rows.  Without an explicit stack-area blocker, that residue plus
+            # IS_BYTE/BYTE_INDEX is enough to fire the SP-byte producer away
+            # from the actual SP register row.
+            (f"H1+10", -1.0),
+            (f"H4+{bp_i}", -1.0),
         )
 
     # SP byte 0 position predicts SP byte 1 = 0xff after SP -= 8.
@@ -588,6 +594,59 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             attn.W_k.data[base + preserve_e8_row, BD.ADDR_B0_HI + 14] = preserve_e8_s
             attn.W_k.data[base + preserve_e8_row, BD.STACK0_BYTE0] = 5.0 * preserve_e8_s
 
+            # AX LI/LC marker loads at 0xffe8 also need an exact e8 value-row
+            # discriminator, but row 59's K side intentionally likes STACK0.
+            # Use the otherwise-neutral row 61 to boost only MEM value byte 0
+            # rows whose decoded source address is 0xffe8.
+            ax_li_e8_row = 61
+            ax_li_e8_s = 10000.0
+            attn.W_q.data[base + ax_li_e8_row, BD.CONST] = -3.5 * ax_li_e8_s
+            attn.W_q.data[base + ax_li_e8_row, BD.MARK_AX] = ax_li_e8_s
+            attn.W_q.data[base + ax_li_e8_row, BD.OP_LI_RELAY] = ax_li_e8_s
+            attn.W_q.data[base + ax_li_e8_row, BD.OP_LC_RELAY] = ax_li_e8_s
+            attn.W_q.data[base + ax_li_e8_row, BD.MARK_STACK0] = 2.5 * ax_li_e8_s
+            attn.W_q.data[base + ax_li_e8_row, BD.ADDR_B0_LO + 8] = ax_li_e8_s
+            attn.W_q.data[base + ax_li_e8_row, BD.ADDR_B0_HI + 14] = ax_li_e8_s
+            attn.W_q.data[base + ax_li_e8_row, BD.IS_BYTE] = -4.0 * ax_li_e8_s
+            attn.W_q.data[base + ax_li_e8_row, BD.MEM_STORE] = -4.0 * ax_li_e8_s
+            attn.W_k.data[base + ax_li_e8_row, BD.MEM_VAL_B1] = ax_li_e8_s
+            attn.W_k.data[base + ax_li_e8_row, BD.ADDR_B0_LO + 8] = ax_li_e8_s
+            attn.W_k.data[base + ax_li_e8_row, BD.ADDR_B0_HI + 14] = ax_li_e8_s
+            attn.W_k.data[base + ax_li_e8_row, BD.STACK0_BYTE0] = -2.0 * ax_li_e8_s
+
+            # Immediately after ENT, the correct STACK0 preserve source is the
+            # zero row produced by the ENT setup step.  The general OP_ENT
+            # source blocker above is needed later to avoid stale frame setup
+            # rows, so add a query-side early-ENT discriminator that only
+            # fires while the STACK0 marker itself still carries OP_ENT
+            # residue.  Keep K non-negative so non-target negative queries
+            # cannot become positive evidence.
+            early_ent_stack0_row = 58
+            early_ent_stack0_q = 100000.0
+            attn.W_q.data[base + early_ent_stack0_row, :] = 0.0
+            attn.W_k.data[base + early_ent_stack0_row, :] = 0.0
+            attn.W_q.data[base + early_ent_stack0_row, BD.OP_ENT] = 200000000.0
+            attn.W_q.data[base + early_ent_stack0_row, BD.MARK_STACK0] = (
+                early_ent_stack0_q
+            )
+            attn.W_q.data[base + early_ent_stack0_row, BD.CONST] = (
+                -early_ent_stack0_q
+            )
+            attn.W_q.data[base + early_ent_stack0_row, BD.IS_BYTE] = (
+                -2000000000.0
+            )
+            for marker_dim in (
+                BD.MARK_AX,
+                BD.MARK_PC,
+                BD.MARK_SP,
+                BD.MARK_BP,
+                BD.MARK_MEM,
+            ):
+                attn.W_q.data[base + early_ent_stack0_row, marker_dim] = (
+                    -2000000000.0
+                )
+            attn.W_k.data[base + early_ent_stack0_row, BD.OP_ENT] = 10000.0
+
             # Pop-group STACK0 marker lookups need the post-pop SP address.
             # The marker can still carry the pre-pop byte-0 address (for
             # example f0 while the value to reveal lives at f8), and the
@@ -597,11 +656,11 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             # keys; the ordinary address rows still discriminate the high
             # address bytes.
             pop_low8_row = 34
-            attn.W_q.data[base + pop_low8_row, BD.CONST] = -5000.0
+            attn.W_q.data[base + pop_low8_row, BD.CONST] = -4000.0
             attn.W_q.data[base + pop_low8_row, BD.MARK_STACK0] = 2000.0
             attn.W_q.data[base + pop_low8_row, BD.HAS_SE] = 1000.0
             attn.W_q.data[base + pop_low8_row, BD.CMP + 3] = 1000.0
-            attn.W_q.data[base + pop_low8_row, BD.ADDR_B0_LO + 0] = 2000.0
+            attn.W_q.data[base + pop_low8_row, BD.ADDR_B0_LO + 0] = 1000.0
             attn.W_q.data[base + pop_low8_row, BD.ADDR_B0_LO + 8] = 1000.0
             attn.W_q.data[base + pop_low8_row, BD.IS_BYTE] = -10000.0
             attn.W_q.data[base + pop_low8_row, BD.MARK_SP] = -10000.0
@@ -739,21 +798,26 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
         attn.W_q.data[base + addsub_blocker, BD.TEMP + 9] = 10000.0
         attn.W_k.data[base + addsub_blocker, BD.CONST] = -20.0
 
-        # SP value bytes are not L15 lookup targets.  Head 0's pop-group gate
-        # can otherwise make SP byte rows attend to historical stack stores
-        # when address residue is large, overwriting L3/L10's SP bytes.
+        # SP value bytes and BP markers are not L15 lookup targets.  Head 0's
+        # pop-group/preserve gates can otherwise make frame rows attend to
+        # historical stack values when setup residue is large, overwriting
+        # L3/L10's register bytes.
         sp_byte_blocker = 62
         attn.W_q.data[base + sp_byte_blocker, BD.H1 + 2] = 100000.0
+        attn.W_q.data[base + sp_byte_blocker, BD.MARK_BP] = 100000.0
+        attn.W_q.data[base + sp_byte_blocker, BD.TEMP + 10] = 100000.0
+        attn.W_q.data[base + sp_byte_blocker, BD.TEMP + 24] = 100000.0
         attn.W_q.data[base + sp_byte_blocker, BD.IS_BYTE] = 0.0
-        attn.W_k.data[base + sp_byte_blocker, BD.CONST] = -20.0
+        attn.W_k.data[base + sp_byte_blocker, BD.CONST] = -300000.0
 
         # PC value bytes are produced by the control-flow path, not by memory
         # lookup. Branch targets can carry address-like residue that otherwise
         # makes L15 copy PC byte0 into the upper PC bytes.
         pc_byte_blocker = 35
         attn.W_q.data[base + pc_byte_blocker, BD.H1 + pc_i] = 100000.0
+        attn.W_q.data[base + pc_byte_blocker, BD.MARK_PC] = 100000000.0
         attn.W_q.data[base + pc_byte_blocker, BD.IS_BYTE] = 0.0
-        attn.W_k.data[base + pc_byte_blocker, BD.CONST] = -20.0
+        attn.W_k.data[base + pc_byte_blocker, BD.CONST] = -100000.0
         if head == 0:
             # Binary-pop steps whose pre-pop SP is f8 reveal the empty stack
             # slot at 0x10000.  The STACK0 marker still carries the pre-pop
@@ -763,6 +827,71 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             attn.W_q.data[base + pc_byte_blocker, BD.CMP + 3] = 10000.0
             attn.W_q.data[base + pc_byte_blocker, BD.ADDR_B0_LO + 8] = 10000.0
             attn.W_q.data[base + pc_byte_blocker, BD.ADDR_B0_HI + 15] = 10000.0
+
+            # Non-pop, non-store STACK0 markers preserve the visible stack top.
+            # Give them a positive source row for the latest prior STACK0 byte0
+            # token so preservation does not fall through to L16's ALU address
+            # fallback.
+            stack0_preserve_row = 36
+            stack0_preserve_s = 10000.0
+            attn.W_q.data[base + stack0_preserve_row, BD.CONST] = (
+                -1.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.MARK_STACK0] = (
+                3.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.HAS_SE] = (
+                1.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.CMP + 3] = (
+                -5.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.MEM_STORE] = (
+                -10.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.IS_BYTE] = (
+                -10.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.MARK_AX] = (
+                -10.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.OP_LI_RELAY] = (
+                10.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.OP_LC_RELAY] = (
+                10.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.MARK_PC] = (
+                -10.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.MARK_SP] = (
+                -10.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.MARK_BP] = (
+                -10.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.MARK_MEM] = (
+                -10.0 * stack0_preserve_s
+            )
+            attn.W_k.data[base + stack0_preserve_row, BD.CONST] = (
+                -2.0 * stack0_preserve_s
+            )
+            attn.W_k.data[base + stack0_preserve_row, BD.H1 + 10] = (
+                2.0 * stack0_preserve_s
+            )
+            attn.W_k.data[base + stack0_preserve_row, BD.BYTE_INDEX_0] = (
+                2.0 * stack0_preserve_s
+            )
+            # Early frame-setup STACK0 rows can retain OP_ENT residue and
+            # otherwise tie the latest visible stack top.  They are not valid
+            # preservation sources for later non-pop markers.
+            attn.W_k.data[base + stack0_preserve_row, BD.OP_ENT] = (
+                -0.25 * stack0_preserve_s
+            )
+            for marker_i in range(5):
+                attn.W_k.data[base + stack0_preserve_row, BD.H1 + marker_i] = (
+                    -4.0 * stack0_preserve_s
+                )
 
         # MEM address bytes are being generated by L14/L16, not loaded from
         # historical memory.  The autoregressive query for MEM_addr{N+1} sits
@@ -885,6 +1014,55 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
                 attn.W_q.data[base + row, BD.MARK_MEM] = -100000.0
                 attn.W_q.data[base + row, BD.H3 + mem_i] = -100000.0
 
+    # A pop after a one-word pushed result can leave the STACK0 marker keyed
+    # by the pre-pop 0xffd8 slot while the revealed value lives at the post-pop
+    # 0xffe0 slot.  Use an otherwise-unused late head for this exact lookup so
+    # the fix does not perturb the dense legacy score rows in head 0.
+    if getattr(attn, "num_heads", 0) > 9:
+        head = 9
+        base = head * HD
+        attn.W_q.data[base:base + HD, :] = 0.0
+        attn.W_k.data[base:base + HD, :] = 0.0
+        attn.W_v.data[base:base + HD, :] = 0.0
+        attn.W_o.data[:, base:base + HD] = 0.0
+
+        # Row 0 is a universal sink term: any ordinary key gets a negative
+        # score for every query. The target discriminator lives on a separate
+        # row so negative non-target queries cannot multiply a negative key
+        # into a false positive.
+        attn.W_q.data[base + 0, BD.CONST] = 1.0
+        attn.W_k.data[base + 0, BD.CONST] = -1000.0
+
+        pop_d8_to_e0_row = min(HD - 1, 63)
+        pop_d8_to_e0_s = 50000.0
+        row = base + pop_d8_to_e0_row
+        attn.W_q.data[row, BD.CONST] = -4.0 * pop_d8_to_e0_s
+        attn.W_q.data[row, BD.MARK_STACK0] = pop_d8_to_e0_s
+        attn.W_q.data[row, BD.HAS_SE] = pop_d8_to_e0_s
+        attn.W_q.data[row, BD.CMP + 3] = pop_d8_to_e0_s
+        attn.W_q.data[row, BD.ADDR_B0_LO + 8] = pop_d8_to_e0_s
+        attn.W_q.data[row, BD.ADDR_B0_HI + 13] = pop_d8_to_e0_s
+        attn.W_q.data[row, BD.IS_BYTE] = -5.0 * pop_d8_to_e0_s
+        attn.W_q.data[row, BD.MEM_STORE] = -4.0 * pop_d8_to_e0_s
+        for marker_dim in (
+            BD.MARK_AX,
+            BD.MARK_PC,
+            BD.MARK_SP,
+            BD.MARK_BP,
+            BD.MARK_MEM,
+        ):
+            attn.W_q.data[row, marker_dim] = -5.0 * pop_d8_to_e0_s
+        attn.W_k.data[row, BD.MEM_VAL_B1] = 1.0
+        attn.W_k.data[row, BD.ADDR_B0_LO + 0] = 1.0
+        attn.W_k.data[row, BD.ADDR_B0_HI + 14] = 1.0
+        for idx in range(16):
+            attn.W_v.data[base + 1 + idx, BD.CLEAN_EMBED_LO + idx] = 1.0
+            attn.W_v.data[base + 17 + idx, BD.CLEAN_EMBED_HI + idx] = 1.0
+            attn.W_o.data[BD.OUTPUT_LO + idx, base + 1 + idx] = 40.0
+            attn.W_o.data[BD.OUTPUT_HI + idx, base + 17 + idx] = 40.0
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes[head] = 1.0
+
 
 def make_layer15_nibble_copy_op() -> Operation:
     """L15 FFN: Conditional nibble copy OUTPUT = EMBED for non-register byte values.
@@ -951,13 +1129,18 @@ def make_l15_attention_resize_op() -> Operation:
             num_heads_new = 9
 
         attn = block.attn
+        d = attn.W_q.shape[1]
+        head_dim_old = d // attn.num_heads
         if getattr(attn, "num_heads", 8) >= num_heads_new:
             if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
                 attn.alibi_slopes[:4] = 0.05
+            _suppress_l15_lookup_during_current_store_generation(
+                attn,
+                _as_setdim_proxy(dim_positions),
+                getattr(attn, "head_dim", head_dim_old),
+            )
             return
 
-        d = attn.W_q.shape[1]
-        head_dim_old = d // attn.num_heads
         new_q_rows = num_heads_new * head_dim_old
 
         attn.num_heads = num_heads_new
@@ -986,6 +1169,11 @@ def make_l15_attention_resize_op() -> Operation:
         old_W_o = attn.W_o.data
         attn.W_o = nn.Parameter(torch.zeros(d, new_q_rows))
         attn.W_o.data[:, :d] = old_W_o
+        _suppress_l15_lookup_during_current_store_generation(
+            attn,
+            _as_setdim_proxy(dim_positions),
+            head_dim_old,
+        )
 
     return Operation(
         name="l15_attention_resize",
