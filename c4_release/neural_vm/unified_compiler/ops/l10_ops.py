@@ -117,7 +117,11 @@ def _bake_layer10_byte_passthrough_head(attn, BD, S, HD) -> None:
 def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
     """Carry AX bytes and reload LI bytes from the prior MEM value rows."""
 
+    PC_IDX = 0
     AX_IDX = 1
+    SP_IDX = 2
+    BP_IDX = 3
+    MEM_IDX = 4
     spec = _byte_passthrough_chain_spec(
         BD,
         head_idx=1,
@@ -146,6 +150,7 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
     ROW_SELECT_BIAS = -75.0 * S
     STORE_ROW_SELECT = 50.0 * S
     STORE_ROW_SELECT_BIAS = -50.0 * S
+    STORE_AX_BYTE1_SELECT = 20.0 * S
     li_value_query = (
         AP(39, BD.OP_LI_RELAY, M),
     )
@@ -194,6 +199,25 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
         AP(47, BD.BYTE_INDEX_2, STORE_ROW_SELECT),
         AP(47, BD.CONST, STORE_ROW_SELECT_BIAS),
     )
+    store_ax_byte1_query = (
+        AP(81, BD.OP_SI, STORE_AX_BYTE1_SELECT),
+        AP(81, BD.OP_SC, STORE_AX_BYTE1_SELECT),
+        AP(81, BD.MARK_AX, -5.0 * STORE_AX_BYTE1_SELECT),
+        AP(81, BD.H1 + PC_IDX, -5.0 * STORE_AX_BYTE1_SELECT),
+        AP(81, BD.H1 + SP_IDX, -5.0 * STORE_AX_BYTE1_SELECT),
+        AP(81, BD.H1 + BP_IDX, -5.0 * STORE_AX_BYTE1_SELECT),
+        AP(81, BD.H4 + BP_IDX, -5.0 * STORE_AX_BYTE1_SELECT),
+        AP(81, BD.H3 + MEM_IDX, -5.0 * STORE_AX_BYTE1_SELECT),
+        AP(81, BD.BYTE_INDEX_1, -10.0 * STORE_AX_BYTE1_SELECT),
+        AP(81, BD.BYTE_INDEX_2, -10.0 * STORE_AX_BYTE1_SELECT),
+        AP(81, BD.BYTE_INDEX_3, -10.0 * STORE_AX_BYTE1_SELECT),
+    )
+    store_ax_byte1_key = (
+        AP(81, BD.IS_BYTE, STORE_AX_BYTE1_SELECT),
+        AP(81, BD.H1 + AX_IDX, STORE_AX_BYTE1_SELECT),
+        AP(81, BD.BYTE_INDEX_1, STORE_AX_BYTE1_SELECT),
+        AP(81, BD.OP_IMM, STORE_AX_BYTE1_SELECT),
+    )
     return replace(
         spec,
         q=(
@@ -208,6 +232,7 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             + byte1_store_query
             + byte2_store_query
             + marker_addr_source_query
+            + store_ax_byte1_query
         ),
         k=spec.k + (
             AP(39, BD.MEM_VAL_B0, VALUE_SELECT),
@@ -226,7 +251,7 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             AP(47, BD.MEM_STORE, STORE_SELECT),
             AP(47, BD.MEM_ADDR_SRC, 1.0),
             AP(48, BD.MEM_ADDR_SRC, 1.0),
-        ),
+        ) + store_ax_byte1_key,
     )
 
 
@@ -3184,6 +3209,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("HAS_SE", 1000.0),
                 ("H1+10", 20.0),
                 ("H1+1", -1000000.0),
+                ("H1+3", -1_000_000_000.0),
                 ("CMP+3", -1000000.0),
                 ("BYTE_INDEX_0", 5.0),
                 ("BYTE_INDEX_2", -1000000.0),
@@ -3211,6 +3237,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             threshold=2100.0,
             active_value=20_000.0,
+            max_abs_weight=1_000_000_000.0,
         ),
         # At the final SP byte position, byte-output residue can beat the
         # stack-base high byte. Assert the zero byte for binary-pop SP byte 3.
@@ -3286,7 +3313,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *stack0_store_loaded_output_rules(),
         *stack0_store_top_e0_output_rules(),
         *stack0_store_top_e8_from_e0_output_rules(),
-        *stack0_store_top_value_from_alu_rules(),
         FFNRule.constant_write(
             name="tail_pc_byte0_12_from_initial_jmp_exact",
             conditions=(
@@ -3607,6 +3633,36 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             max_abs_weight=1_000_000_000.0,
         ),
         FFNRule.constant_write(
+            name="tail_mem_store_addr0_f8_initial_jsr_authority",
+            conditions=(
+                ("MARK_MEM", 1.0),
+                ("H1+4", 20.0),
+                ("H1+11", 5.0),
+                ("H1+1", -1_000_000_000.0),
+                ("H1+2", -1_000_000_000.0),
+                ("H1+3", -1000000.0),
+                ("MEM_STORE", 1.0),
+                ("OP_JSR", 1.0),
+                ("CMP+4", 1.0),
+                ("HAS_SE", -100.0),
+                ("IS_BYTE", -100.0),
+                ("MARK_AX", -1000000.0),
+                ("MARK_PC", -100.0),
+                ("MARK_SP", -100.0),
+                ("MARK_BP", -100.0),
+                ("MARK_STACK0", -100.0),
+                ("NEXT_PC", -1000000.0),
+                ("NEXT_AX", -1000000.0),
+                ("NEXT_SP", -1000000.0),
+                ("NEXT_BP", -1000000.0),
+                ("NEXT_STACK0", -1000000.0),
+                ("NEXT_MEM", -1000000.0),
+                ("NEXT_SE", -1000000.0),
+            ),
+            threshold=35.0,
+            writes=byte_writes(0xF8, strength=50_000.0),
+        ),
+        FFNRule.constant_write(
             name="tail_mem_store_addr0_f0_exact",
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -3649,6 +3705,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_STORE", 5.0),
                 ("MEM_ADDR_SRC", 5.0),
                 ("PSH_AT_SP", -1000000.0),
+                ("OP_JSR", -1000000.0),
                 ("OUTPUT_LO+0", 1.0),
                 ("OUTPUT_HI+0", 1.0),
                 ("OUTPUT_HI+14", -1.0),
@@ -3827,6 +3884,41 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             threshold=40.0,
             active_value=50000.0,
+        ),
+        FFNRule.constant_write(
+            name="tail_mem_store_addr0_e0_from_psh_sp_no_addr_src_authority",
+            conditions=(
+                ("MARK_MEM", 1.0),
+                ("HAS_SE", 1.0),
+                ("H1+4", 10.0),
+                ("H1+1", -1000000.0),
+                ("H1+2", -1000000.0),
+                ("H1+3", -1000000.0),
+                ("H1+10", -1000000.0),
+                ("MEM_STORE", 5.0),
+                ("MEM_ADDR_SRC", -1000000.0),
+                ("PSH_AT_SP", 1.0),
+                ("OP_JSR", -1000000.0),
+                ("CMP+0", 10.0),
+                ("ALU_LO+8", 5.0),
+                ("ALU_LO+7", -10.0),
+                ("ALU_LO+10", -20.0),
+                ("IS_BYTE", -100.0),
+                ("MARK_AX", -1000000.0),
+                ("MARK_PC", -100.0),
+                ("MARK_SP", -100.0),
+                ("MARK_BP", -100.0),
+                ("MARK_STACK0", -100.0),
+                ("NEXT_PC", -1000000.0),
+                ("NEXT_AX", -1000000.0),
+                ("NEXT_SP", -1000000.0),
+                ("NEXT_BP", -1000000.0),
+                ("NEXT_STACK0", -1000000.0),
+                ("NEXT_MEM", -1000000.0),
+                ("NEXT_SE", -1000000.0),
+            ),
+            threshold=40.0,
+            writes=byte_writes(0xE0, strength=5_000_000_000.0),
         ),
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_jsr_local_exact",
@@ -4228,6 +4320,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("TEMP+7", 1.0),
                 ("OP_SHR", 1000.0),
                 ("OP_IMM", -100.0),
+                ("OP_LEA", -1000000.0),
                 ("OUTPUT_HI+0", 1.0),
                 ("OUTPUT_HI+2", -1.0),
                 ("OUTPUT_LO+10", -1.0),
@@ -4235,6 +4328,25 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=5005.0,
             gate="MARK_AX",
             writes=byte_writes(0x01),
+        ),
+        FFNRule.constant_write(
+            name="tail_lea_local_ax_marker_byte0_e8",
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("HAS_SE", 1.0),
+                ("OP_LEA", 1.0),
+                ("CMP+7", 1.0),
+                ("FETCH_LO+8", 2.0),
+                ("FETCH_HI+15", 0.2),
+                ("IS_BYTE", -10.0),
+                ("MARK_PC", -10000.0),
+                ("MARK_SP", -10000.0),
+                ("MARK_BP", -10000.0),
+                ("MARK_STACK0", -10000.0),
+                ("MARK_MEM", -10000.0),
+            ),
+            threshold=9.0,
+            writes=byte_writes(0xE8, strength=1_000_000.0),
         ),
         FFNRule.constant_write(
             name="tail_ax_add_byte1_missing_stack_high_02",

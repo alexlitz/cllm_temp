@@ -361,11 +361,13 @@ def _layer15_si_mem_addr0_from_stack0_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(33, BD.MEM_STORE, 5000.0),
         AP(33, BD.MEM_ADDR_SRC, 10000.0),
         AP(33, BD.CONST, -55000.0),
+        AP(37, BD.IS_BYTE, 50000.0),
     )
     k = (
         AP(0, BD.STACK0_BYTE0, 100.0),
         AP(0, BD.MEM_STORE, -400.0),
         AP(33, BD.CONST, 5.0),
+        AP(37, BD.CONST, -20.0),
     )
     v = [AP(0, BD.CONST, 1.0)]
     o = []
@@ -597,9 +599,12 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             # AX LI/LC marker loads at 0xffe8 also need an exact e8 value-row
             # discriminator, but row 59's K side intentionally likes STACK0.
             # Use the otherwise-neutral row 61 to boost only MEM value byte 0
-            # rows whose decoded source address is 0xffe8.
+            # rows whose decoded source address is 0xffe8. Keep the key
+            # non-negative; the STACK0 query term neutralizes this row during
+            # STACK0 preserves, while broad H1 gates can turn unrelated byte
+            # queries into false-positive memory loads.
             ax_li_e8_row = 61
-            ax_li_e8_s = 10000.0
+            ax_li_e8_s = 100000.0
             attn.W_q.data[base + ax_li_e8_row, BD.CONST] = -3.5 * ax_li_e8_s
             attn.W_q.data[base + ax_li_e8_row, BD.MARK_AX] = ax_li_e8_s
             attn.W_q.data[base + ax_li_e8_row, BD.OP_LI_RELAY] = ax_li_e8_s
@@ -612,7 +617,6 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             attn.W_k.data[base + ax_li_e8_row, BD.MEM_VAL_B1] = ax_li_e8_s
             attn.W_k.data[base + ax_li_e8_row, BD.ADDR_B0_LO + 8] = ax_li_e8_s
             attn.W_k.data[base + ax_li_e8_row, BD.ADDR_B0_HI + 14] = ax_li_e8_s
-            attn.W_k.data[base + ax_li_e8_row, BD.STACK0_BYTE0] = -2.0 * ax_li_e8_s
 
             # Immediately after ENT, the correct STACK0 preserve source is the
             # zero row produced by the ENT setup step.  The general OP_ENT
@@ -809,6 +813,14 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
         attn.W_q.data[base + sp_byte_blocker, BD.TEMP + 24] = 100000.0
         attn.W_q.data[base + sp_byte_blocker, BD.IS_BYTE] = 0.0
         attn.W_k.data[base + sp_byte_blocker, BD.CONST] = -300000.0
+        if head == 0:
+            # Head 0 owns marker-byte lookups. At byte continuations, negative
+            # exact-address rows can multiply negative keys and copy the
+            # previous byte forward (for example JSR STACK0 byte0 -> byte1).
+            attn.W_q.data[base + sp_byte_blocker, BD.IS_BYTE] = 500000.0
+            # ENT is a frame-store opcode, not a load. Keep L15 head 0 from
+            # reading the previous JSR return-address row into ENT's AX marker.
+            attn.W_q.data[base + sp_byte_blocker, BD.OP_ENT] = 500000.0
 
         # PC value bytes are produced by the control-flow path, not by memory
         # lookup. Branch targets can carry address-like residue that otherwise
@@ -854,6 +866,9 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             )
             attn.W_q.data[base + stack0_preserve_row, BD.MARK_AX] = (
                 -10.0 * stack0_preserve_s
+            )
+            attn.W_q.data[base + stack0_preserve_row, BD.H1 + ax_i] = (
+                10.0 * stack0_preserve_s
             )
             attn.W_q.data[base + stack0_preserve_row, BD.OP_LI_RELAY] = (
                 10.0 * stack0_preserve_s
@@ -1007,7 +1022,7 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
     # whose K side is positive for all sources; adding MEM_STORE blockers to
     # address or negative-constant rows can create negative-query × negative-key
     # false positives.
-    for head in range(4, getattr(attn, "num_heads", 4)):
+    for head in range(4, min(getattr(attn, "num_heads", 4), 12)):
         base = head * HD
         for row in (0, 36, 37):
             if base + row < attn.W_q.data.shape[0]:
@@ -1043,7 +1058,7 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
         attn.W_q.data[row, BD.ADDR_B0_LO + 8] = pop_d8_to_e0_s
         attn.W_q.data[row, BD.ADDR_B0_HI + 13] = pop_d8_to_e0_s
         attn.W_q.data[row, BD.IS_BYTE] = -5.0 * pop_d8_to_e0_s
-        attn.W_q.data[row, BD.MEM_STORE] = -4.0 * pop_d8_to_e0_s
+        attn.W_q.data[row, BD.MEM_STORE] = -8.0 * pop_d8_to_e0_s
         for marker_dim in (
             BD.MARK_AX,
             BD.MARK_PC,

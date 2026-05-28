@@ -1989,6 +1989,28 @@ def test_tail_mem_store_addr0_00_from_global_exacts_nibbles():
     assert out["OUTPUT_HI+15"] < -1_000_000.0
 
 
+def test_tail_mem_store_addr0_00_from_global_blocks_initial_jsr_store():
+    ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_00_from_global_exact"))
+
+    row = {
+        "MARK_MEM": 1.0,
+        "H1+4": 1.0,
+        "MEM_STORE": 2.0,
+        "OP_JSR": 12.491547584533691,
+        "OUTPUT_LO+0": 14941.8525390625,
+        "OUTPUT_HI+0": 1853.215576171875,
+        "OUTPUT_HI+14": -1425.1607666015625,
+        "OUTPUT_HI+15": 1773.0650634765625,
+    }
+
+    out = ir.symbolic_ffn(row)
+
+    assert out["OUTPUT_LO+0"] == row["OUTPUT_LO+0"]
+    assert out["OUTPUT_HI+0"] == row["OUTPUT_HI+0"]
+    assert out.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert out.get("OUTPUT_HI+15", 0.0) == row["OUTPUT_HI+15"]
+
+
 def test_tail_mem_store_addr0_00_from_global_blocks_local_e0_shape():
     ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_00_from_global_exact"))
 
@@ -4354,76 +4376,9 @@ def test_tail_stack0_store_loaded_byte11_still_fires_on_stack0_marker():
     assert out.get("OUTPUT_HI+0", 0.0) < 0.0
 
 
-def test_tail_stack0_store_top_value_2f_materializes_from_alu_residue():
-    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_value_2f_from_alu"))
-
-    out = ir.symbolic_ffn({
-        "MARK_STACK0": 1.0,
-        "HAS_SE": 0.9984076023101807,
-        "CMP+3": 4.0,
-        "MEM_STORE": 0.40725404024124146,
-        "MEM_ADDR_SRC": 0.40725404024124146,
-        "ADDR_B0_LO+0": 0.9812770485877991,
-        "ADDR_B0_HI+14": 0.9630643129348755,
-        "ALU_LO+15": 2.110461950302124,
-        "ALU_HI+2": 0.9937549233436584,
-    })
-
-    assert out["OUTPUT_LO+15"] > out.get("OUTPUT_LO+0", 0.0)
-    assert out["OUTPUT_HI+2"] > out.get("OUTPUT_HI+0", 0.0)
-
-
-def test_tail_stack0_store_top_value_2f_blocks_non_stack_marker():
-    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_value_2f_from_alu"))
-
-    out = ir.symbolic_ffn({
-        "MARK_AX": 1.0,
-        "HAS_SE": 0.9984076023101807,
-        "CMP+3": 4.0,
-        "MEM_STORE": 0.40725404024124146,
-        "MEM_ADDR_SRC": 0.40725404024124146,
-        "ADDR_B0_LO+0": 0.9812770485877991,
-        "ADDR_B0_HI+14": 0.9630643129348755,
-        "ALU_LO+15": 2.110461950302124,
-        "ALU_HI+2": 0.9937549233436584,
-    })
-
-    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+2", 0.0) == 0.0
-
-
-def test_tail_stack0_store_top_value_2f_requires_current_store_signal():
-    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_value_2f_from_alu"))
-
-    out = ir.symbolic_ffn({
-        "MARK_STACK0": 1.0,
-        "HAS_SE": 0.996364951133728,
-        "ADDR_B0_LO+0": 7.967979431152344,
-        "ADDR_B0_HI+14": 7.961431503295898,
-        "ALU_HI+2": 0.0003117081942036748,
-        "H1+3": 0.003357573412358761,
-    })
-
-    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+2", 0.0) == 0.0
-
-
-def test_tail_stack0_store_top_value_2f_requires_high_nibble_two():
-    ir = _single_rule_ir(_tail_rule("tail_stack0_store_top_value_2f_from_alu"))
-
-    out = ir.symbolic_ffn({
-        "MARK_STACK0": 1.0,
-        "HAS_SE": 0.9979397058486938,
-        "CMP+3": 4.0,
-        "MEM_STORE": 0.40725404024124146,
-        "MEM_ADDR_SRC": 0.40725404024124146,
-        "ADDR_B0_LO+0": 0.9812690019607544,
-        "ADDR_B0_HI+14": 0.9611873626708984,
-        "ALU_LO+15": 1.0341620445251465,
-    })
-
-    assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+2", 0.0) == 0.0
+def test_tail_stack0_store_top_value_2f_from_alu_stays_inactive():
+    with pytest.raises(AssertionError, match="tail_stack0_store_top_value_2f_from_alu"):
+        _tail_rule("tail_stack0_store_top_value_2f_from_alu")
 
 
 def test_tail_pop_mem_marker_zero_blocks_byte_rows():

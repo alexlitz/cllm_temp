@@ -197,7 +197,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_STACK0", -1_000_000.0),
         ),
         threshold=7.5,
-        writes=Primitives.byte_value_writes(0xF8, strength=2.0) + (
+        writes=Primitives.byte_value_writes(0xF8, strength=5.0) + (
             ("ALU_LO+14", -30.0),
         ),
     ))
@@ -508,6 +508,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         threshold=8.5,
         writes=Primitives.byte_value_writes(0xE0, strength=20.0),
+    ))
+    rules.append(FFNRule.constant_write(
+        name="l16_psh_mem_addr0_e0_from_sp_no_addr_src",
+        conditions=psh_mem_addr0_conditions + (
+            ("MEM_ADDR_SRC", -1000.0),
+            ("H1+4", 1.0),
+            ("H1+11", 1.0),
+            ("CMP+0", 1.0),
+            ("ALU_LO+8", 2.0),
+            ("ALU_LO+7", -10.0),
+            ("ALU_LO+10", -10.0),
+            ("ALU_LO+14", -10.0),
+        ),
+        threshold=8.5,
+        writes=Primitives.byte_value_writes(0xE0, strength=200_000.0),
     ))
 
     # After a strict neural LEV, the next AX marker can still carry a
@@ -1360,7 +1375,8 @@ def make_layer16_lev_routing_op() -> Operation:
         # two JSR MEM addr0 materializers, one initial JSR STACK0 marker
         # materializer, 32 e8 STACK0 marker ALU materializers, one ENT
         # stale-ALU cleanup, 16 PSH MEM addr0 nonzero nibble restore units,
-        # one PSH d8 address exactness guard and one PSH e0 addr-band guard,
+        # one PSH d8 address exactness guard, one PSH e0 addr-band guard, and
+        # one no-side-state PSH e0 guard,
         # 4 non-store MEM value zero guards, 16 PSH SP no-borrow high-nibble
         # restores, 39 ENT dynamic-frame SP/BP/STACK0 byte units, plus 2 LEA
         # local-frame byte materialization units, one recursive JSR
@@ -1368,7 +1384,7 @@ def make_layer16_lev_routing_op() -> Operation:
         # false-positive LEV SP materializers, 254 nonzero staged-byte e8
         # STACK0 output authority guards, plus one e0/e8 STACK0 exactness
         # guard.
-        ffn_units_used=695,
+        ffn_units_used=696,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
