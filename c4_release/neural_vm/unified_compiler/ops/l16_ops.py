@@ -197,7 +197,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_STACK0", -1_000_000.0),
         ),
         threshold=7.5,
-        writes=Primitives.byte_value_writes(0xF8, strength=20.0) + (
+        writes=Primitives.byte_value_writes(0xF8, strength=2.0) + (
             ("ALU_LO+14", -30.0),
         ),
     ))
@@ -223,14 +223,29 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         threshold=500.0,
         gate="HAS_SE",
-        writes=Primitives.byte_value_writes(0xE0, strength=800.0),
+        writes=(
+            Primitives.nibble_value_writes(
+                "OUTPUT_LO",
+                0,
+                strength=0.0015,
+                competitor_strength=0.0015,
+            )
+            + Primitives.nibble_value_writes(
+                "OUTPUT_HI",
+                14,
+                strength=0.0016,
+                competitor_strength=0.0015,
+            )
+        ),
     ))
 
     # The first call from main writes return address 0x0a to the freshly
     # decremented top slot 0xfff8. The historical L6 marker rule can leave the
     # STACK0 marker at the zero default on larger function bodies; restore only
     # that initial JSR marker shape and leave recursive/local-frame JSR slots
-    # (for example 0xffe0) to the byte-stream rules below.
+    # (for example 0xffe0) to the byte-stream rules below. The initial row can
+    # still carry current-store MEM_STORE residue; saved-frame rows carry
+    # HAS_SE, so make that blocker decisive.
     rules.append(FFNRule.constant_write(
         name="l16_jsr_initial_stack0_marker_0a",
         conditions=(
@@ -238,7 +253,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OP_ENT", -1000.0),
             ("CMP+4", 0.2),
             ("MARK_STACK0", 20.0),
-            ("HAS_SE", -150.0),
+            ("HAS_SE", -1000.0),
             ("MEM_STORE", -100.0),
             ("ADDR_B0_LO+8", 20.0),
             ("ADDR_B0_LO+0", -20.0),
@@ -430,6 +445,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # address; if the true nibble is zero, these rules stay inactive.
     psh_mem_addr0_conditions = (
         ("PSH_AT_SP", 1.0),
+        ("OP_JSR", -1000.0),
         ("OP_ENT", -1000.0),
         ("MARK_MEM", 1.0),
         ("MEM_STORE", 1.0),
@@ -467,7 +483,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(FFNRule.constant_write(
         name="l16_psh_mem_addr0_force_d8_from_l14_evidence",
         conditions=psh_mem_addr0_conditions + (
-            ("OP_JSR", -1000.0),
             ("H1+4", 1.0),
             ("OUTPUT_LO+8", 1.0),
             ("OUTPUT_HI+13", 1.0),
@@ -477,6 +492,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_LO+8", 1_000_000.0),
             ("OUTPUT_HI+13", 1_000_000.0),
         ),
+    ))
+    rules.append(FFNRule.constant_write(
+        name="l16_psh_mem_addr0_e0_from_addr_b0",
+        conditions=psh_mem_addr0_conditions + (
+            ("MEM_ADDR_SRC", 1.0),
+            ("ADDR_B0_LO+0", 1.0),
+            ("ADDR_B0_HI+14", 1.0),
+        ),
+        threshold=8.5,
+        writes=Primitives.byte_value_writes(0xE0, strength=20.0),
     ))
 
     # After a strict neural LEV, the next AX marker can still carry a
@@ -1295,7 +1320,7 @@ def make_layer16_lev_routing_op() -> Operation:
         phase=16,
         reads={"MARK_SP", "MARK_PC", "MARK_AX", "OP_ENT", "OP_LEV", "OP_IMM",
                "OP_EXIT", "OP_JMP", "OP_SI", "OP_SC", "OP_LC_RELAY",
-               "ADDR_B0_LO", "ADDR_B0_HI",
+               "ADDR_B0_LO", "ADDR_B0_HI", "MEM_ADDR_SRC",
                "TEMP", "HAS_SE", "IS_BYTE", "PSH_AT_SP", "EMBED_LO",
                "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "FETCH_LO", "FETCH_HI",
@@ -1328,15 +1353,15 @@ def make_layer16_lev_routing_op() -> Operation:
         # scalar exactness guards, one top-level LEV PC return materializer,
         # two JSR MEM addr0 materializers, one initial JSR STACK0 marker
         # materializer, 32 e8 STACK0 marker ALU materializers, one ENT
-        # stale-ALU cleanup, 16 PSH MEM addr0 nonzero nibble restore units and
-        # one PSH d8 address exactness guard,
+        # stale-ALU cleanup, 16 PSH MEM addr0 nonzero nibble restore units,
+        # one PSH d8 address exactness guard and one PSH e0 addr-band guard,
         # 4 non-store MEM value zero guards, 16 PSH SP no-borrow high-nibble
         # restores, 39 ENT dynamic-frame SP/BP/STACK0 byte units, plus 2 LEA
         # local-frame byte materialization units, one recursive JSR
         # return-address byte-1 guard, plus 32 STACK0-marker inverse units for
         # false-positive LEV SP materializers, one e8 STACK0 output
         # authoritative byte guard, plus one e0/e8 STACK0 exactness guard.
-        ffn_units_used=441,
+        ffn_units_used=442,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )

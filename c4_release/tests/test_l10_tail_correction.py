@@ -774,7 +774,7 @@ def test_layer10_ax_byte_passthrough_has_li_reload_mem_value_route():
     )
 
 
-def test_id250_li_reload_teacher_forced_ax_bytes_survive_l10_route():
+def test_id250_teacher_forced_critical_bytes_survive_l10_tail():
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
     from neural_vm.unified_compiler.decl_verifier import (
         build_teacher_forced_symbolic_trace,
@@ -787,11 +787,13 @@ def test_id250_li_reload_teacher_forced_ax_bytes_survive_l10_route():
     runner = BatchedPureNeuralRunner(max_seq_len=512)
 
     for step, slot in (
+        (0, "STACK0_byte0"),
         (3, "AX_byte1"),
         (7, "AX_byte0"),
         (7, "AX_byte1"),
         (7, "AX_byte2"),
         (7, "AX_byte3"),
+        (7, "STACK0_byte0"),
     ):
         report = verify_teacher_forced_token_support(
             runner.model,
@@ -804,6 +806,112 @@ def test_id250_li_reload_teacher_forced_ax_bytes_survive_l10_route():
             probe_name=f"id=0250:{step}:{slot}",
         )
         assert report.supported, report.format()
+
+
+def test_tail_mem_store_addr_rules_block_stack0_marker_residue():
+    ir = _tail_prefix_ir("tail_mem_store_addr")
+    row = {
+        "CONST": 1.0,
+        "MARK_STACK0": 1.0,
+        "H1+10": 1.0,
+        "H3+10": 1.0,
+        "MEM_STORE": 0.40725401043891907,
+        "OP_JSR": 11.082738876342773,
+    }
+    for lane in range(16):
+        row[f"OUTPUT_LO+{lane}"] = -507622.5625
+        row[f"OUTPUT_HI+{lane}"] = -507622.5625
+    row["OUTPUT_LO+10"] = 507625.5625
+    row["OUTPUT_HI+0"] = 507625.5625
+
+    out = ir.symbolic_ffn(row)
+
+    for lane in range(16):
+        assert out[f"OUTPUT_LO+{lane}"] == pytest.approx(row[f"OUTPUT_LO+{lane}"])
+        assert out[f"OUTPUT_HI+{lane}"] == pytest.approx(row[f"OUTPUT_HI+{lane}"])
+
+
+def test_tail_ax_add_byte1_hi_zero_blocks_stack0_byte_row():
+    ir = _single_rule_ir(_tail_rule("tail_ax_add_byte1_hi_zero_lo_f"))
+    row = {
+        "IS_BYTE": 1.0,
+        "HAS_SE": 0.9982175827026367,
+        "H1+10": 0.9999994039535522,
+        "BYTE_INDEX_0": 0.9734055995941162,
+        "BYTE_INDEX_1": 0.013297183439135551,
+        "STACK0_BYTE0": 0.9734055995941162,
+        "STACK0_BYTE1": 0.013297183439135551,
+        "TEMP+8": 0.020851222798228264,
+        "ALU_HI+0": 1.0,
+        "AX_CARRY_HI+0": 1.0,
+        "OUTPUT_LO+0": -326.9977111816406,
+        "OUTPUT_LO+15": 332.94451904296875,
+        "OUTPUT_HI+0": -326.9977111816406,
+        "OUTPUT_HI+15": 332.94451904296875,
+    }
+
+    out = ir.symbolic_ffn(row)
+
+    assert out["OUTPUT_LO+0"] == pytest.approx(row["OUTPUT_LO+0"])
+    assert out["OUTPUT_LO+15"] == pytest.approx(row["OUTPUT_LO+15"])
+    assert out["OUTPUT_HI+0"] == pytest.approx(row["OUTPUT_HI+0"])
+    assert out["OUTPUT_HI+15"] == pytest.approx(row["OUTPUT_HI+15"])
+
+
+def test_tail_sp_initial_stack_exact_blocks_stack0_marker_residue():
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+    row = {
+        "CONST": 1.0,
+        "HAS_SE": 0.9985107183456421,
+        "MARK_STACK0": 1.0,
+        "H1+10": 1.0,
+        "H3+10": 1.0,
+        "H1+3": 0.003357573412358761,
+        "OUTPUT_LO+8": -1883940.625,
+        "OUTPUT_HI+14": -1883940.625,
+        "OUTPUT_HI+15": -1887999.875,
+        "ALU_LO+14": 0.0,
+    }
+    for lane in range(16):
+        row.setdefault(f"OUTPUT_LO+{lane}", -1888000.0)
+        row.setdefault(f"OUTPUT_HI+{lane}", -1888000.0)
+    row["OUTPUT_LO+14"] = 1888000.0
+    row["OUTPUT_HI+13"] = 1888000.0
+
+    out = ir.symbolic_ffn(row)
+
+    for lane in range(16):
+        assert out[f"OUTPUT_LO+{lane}"] == pytest.approx(row[f"OUTPUT_LO+{lane}"])
+        assert out[f"OUTPUT_HI+{lane}"] == pytest.approx(row[f"OUTPUT_HI+{lane}"])
+
+
+def test_id550_stack0_byte1_high_nibble_survives_l10_tail():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+    from neural_vm.unified_compiler.decl_verifier import (
+        build_teacher_forced_symbolic_trace,
+        verify_teacher_forced_token_support,
+    )
+    from src.compiler import compile_c
+    from tests.test_suite_1000 import generate_test_programs
+
+    source, _, _ = generate_test_programs()[550]
+    bytecode, data = compile_c(source)
+    trace = build_teacher_forced_symbolic_trace(bytecode, data)
+    runner = BatchedPureNeuralRunner(max_seq_len=512)
+    token_index = trace.token_index(5, "STACK0_byte1")
+
+    report = verify_teacher_forced_token_support(
+        runner.model,
+        trace.context,
+        token_index=token_index,
+        prefix_len=trace.prefix_len,
+        mem_store_positions=trace.mem_store_positions,
+        max_context_window=512,
+        min_margin=0.0,
+        probe_name="id=0550:5:STACK0_byte1",
+    )
+
+    assert report.supported, report.format()
 
 
 def test_tail_bp_byte2_preserve_requires_bp_span_signal():

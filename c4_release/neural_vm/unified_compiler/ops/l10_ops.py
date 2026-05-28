@@ -2332,10 +2332,15 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("H1+2", -1000000.0),
             ("H1+3", -1000000.0),
             ("H1+4", -1000000.0),
+            ("H1+10", -1000000.0),
             ("BYTE_INDEX_0", 5.0),
             ("BYTE_INDEX_1", -1000.0),
             ("BYTE_INDEX_2", -1000.0),
             ("BYTE_INDEX_3", -1000.0),
+            ("STACK0_BYTE0", -1000000.0),
+            ("STACK0_BYTE1", -1000000.0),
+            ("STACK0_BYTE2", -1000000.0),
+            ("STACK0_BYTE3", -1000000.0),
             ("TEMP+8", 100.0),
             ("ALU_HI+0", 20.0),
             ("AX_CARRY_HI+0", 20.0),
@@ -2810,6 +2815,35 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 blocked.append(rule)
             else:
                 blocked.append(replace(rule, conditions=rule.conditions + (blocker,)))
+        return tuple(blocked)
+
+    def stack0_span_blocked_tail_rules(
+        rules: tuple[FFNRule, ...],
+    ) -> tuple[FFNRule, ...]:
+        """Keep non-STACK0 tail exactness rules off STACK0 marker/byte rows."""
+
+        blockers = (
+            ConditionTerm(DimRef.parse("MARK_STACK0"), -1_000_000_000.0),
+            ConditionTerm(DimRef.parse("H1+10"), -1_000_000_000.0),
+            ConditionTerm(DimRef.parse("H3+10"), -1_000_000_000.0),
+            ConditionTerm(DimRef.parse("STACK0_BYTE0"), -1_000_000_000.0),
+            ConditionTerm(DimRef.parse("STACK0_BYTE1"), -1_000_000_000.0),
+            ConditionTerm(DimRef.parse("STACK0_BYTE2"), -1_000_000_000.0),
+            ConditionTerm(DimRef.parse("STACK0_BYTE3"), -1_000_000_000.0),
+        )
+        blocked_prefixes = (
+            "tail_mem_store_addr",
+            "tail_sp_marker_byte0_f8_from_initial_stack_exact",
+            "tail_sp_byte1_ff_from_initial_stack_exact",
+        )
+        blocked = []
+        for rule in rules:
+            if rule.name and rule.name.startswith(blocked_prefixes):
+                blocked.append(
+                    replace(rule, conditions=rule.conditions + blockers)
+                )
+            else:
+                blocked.append(rule)
         return tuple(blocked)
 
     rules = (
@@ -4168,7 +4202,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             writes=clear_output_writes(strength=100_000_000.0),
         ),
     ) + sp_pop_carry_rules()
-    return step_end_transition_blocked(pc_byte_span_blocked(rules))
+    return step_end_transition_blocked(
+        pc_byte_span_blocked(stack0_span_blocked_tail_rules(rules))
+    )
 
 
 def make_tail_bit32_result_correction_op() -> Operation:

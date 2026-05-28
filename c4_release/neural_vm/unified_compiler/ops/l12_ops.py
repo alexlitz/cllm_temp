@@ -23,7 +23,7 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
     return Operation(
         name="layer12_mul_combine",
         phase=12,
-        reads={"MARK_AX", "MUL_ACCUM", "OP_MUL"},
+        reads={"MARK_AX", "TEMP", "OP_MUL"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
@@ -34,13 +34,13 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         # Staleness invariants: L12 MUL combine consumes the same operands
         # as L11 MUL partial (ALU_HI for a_hi, AX_CARRY_LO for b_lo) at the
         # AX marker. These must be the in-step fresh values. Also consumes
-        # the fresh MUL_ACCUM (TEMP+partial) just written by
-        # ``layer11_mul_partial`` at the AX marker (phase 11 < 12).
+        # the fresh TEMP[partial] just written by ``layer11_mul_partial`` at
+        # the AX marker (phase 11 < 12).
         consumes_fresh={
             "ALU_HI": "AX_byte0",
             "AX_CARRY_LO": "AX_byte0",
-            "MUL_ACCUM": "AX_byte0",
-        },
+            "TEMP": "AX_byte0",
+        } if alu_mode == "lookup" else {},
         # Produces the fresh MUL hi-nibble result at the AX marker (gated
         # on MARK_AX + OP_MUL): ``result_hi = (partial + a_hi*b_lo) % 16``
         # is written via 4-way AND units into OUTPUT_HI. ``_set_layer12_mul_combine``

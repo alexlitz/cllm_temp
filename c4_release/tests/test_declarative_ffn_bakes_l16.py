@@ -40,8 +40,8 @@ def test_layer16_lev_routing_ir_matches_legacy_helper():
     legacy_end = _set_layer16_lev_routing(expected, 100.0, _SetDim)
 
     assert legacy_end == 121
-    assert end == 441
-    assert len(_layer16_lev_routing_rules(100.0)) == 441
+    assert end == 442
+    assert len(_layer16_lev_routing_rules(100.0)) == 442
     _assert_same_ffn_prefix(actual, expected, legacy_end)
     assert actual.W_down[:, legacy_end:end].abs().sum() > 0
 
@@ -336,7 +336,7 @@ def test_layer16_jsr_initial_stack0_marker_materializes_0a():
     assert ("OP_ENT+0", -1000.0) in condition_dims
     assert ("CMP+4", 0.2) in condition_dims
     assert ("MARK_STACK0+0", 20.0) in condition_dims
-    assert ("HAS_SE+0", -150.0) in condition_dims
+    assert ("HAS_SE+0", -1000.0) in condition_dims
     assert ("MEM_STORE+0", -100.0) in condition_dims
     assert ("ADDR_B0_LO+8", 20.0) in condition_dims
     assert ("ADDR_B0_LO+0", -20.0) in condition_dims
@@ -396,6 +396,52 @@ def test_layer16_jsr_initial_stack0_marker_materializes_0a():
         "OUTPUT_LO+0": 0.98,
     })
     assert recursive_slot["OUTPUT_LO+0"] == 0.98
+
+    false_positive_shapes = (
+        (
+            {
+                # id=0575 step6 STACK0_byte0: expected 0x8a, collapsed to 0x0a.
+                "OP_JSR": 11.082738876342773,
+                "CMP+4": 2.0,
+                "MARK_STACK0": 1.0,
+                "HAS_SE": 0.9981152415275574,
+                "MEM_STORE": 0.40726691484451294,
+                "ADDR_B0_LO+8": 1.9903745651245117,
+                "ADDR_B0_LO+0": -2.0108985900878906,
+                "ADDR_B0_HI+14": -2.008836269378662,
+                "ADDR_B0_HI+15": -1.9898868799209595,
+                "OUTPUT_LO+10": 2.992020606994629,
+                "OUTPUT_LO+0": -0.9999711513519287,
+                "OUTPUT_HI+0": -0.9715086817741394,
+                "OUTPUT_HI+8": 2.974466323852539,
+            },
+            "OUTPUT_HI+8",
+        ),
+        (
+            {
+                # id=0975 step6 STACK0_byte0: expected 0xfa, collapsed to 0x0a.
+                "OP_JSR": 11.082738876342773,
+                "CMP+4": 2.0,
+                "MARK_STACK0": 1.0,
+                "HAS_SE": 0.9975639581680298,
+                "MEM_STORE": 0.40726688504219055,
+                "ADDR_B0_LO+8": 1.9903759956359863,
+                "ADDR_B0_LO+0": -2.014194965362549,
+                "ADDR_B0_HI+14": -2.014007568359375,
+                "ADDR_B0_HI+15": -0.8387054204940796,
+                "OUTPUT_LO+10": 2.995905876159668,
+                "OUTPUT_LO+0": -0.9999712109565735,
+                "OUTPUT_HI+0": -0.9649104475975037,
+                "OUTPUT_HI+15": 2.971315622329712,
+            },
+            "OUTPUT_HI+15",
+        ),
+    )
+    for false_positive, expected_hi_key in false_positive_shapes:
+        out_false_positive = ir.symbolic_ffn(false_positive)
+        assert out_false_positive["OUTPUT_LO+10"] == false_positive["OUTPUT_LO+10"]
+        assert out_false_positive["OUTPUT_HI+0"] == false_positive["OUTPUT_HI+0"]
+        assert out_false_positive[expected_hi_key] == false_positive[expected_hi_key]
 
     ent_stack0_state = {
         "OP_ENT": 8.5,
@@ -1013,10 +1059,10 @@ def test_layer16_jsr_mem_addr0_materializes_f8_marker():
     assert rule.threshold == 7.5
 
     writes = {write.dim.key(): write.weight for write in rule.writes}
-    assert writes["OUTPUT_LO+8"] == 20.0
-    assert writes["OUTPUT_HI+15"] == 20.0
-    assert writes["OUTPUT_LO+0"] == -20.0
-    assert writes["OUTPUT_HI+14"] == -20.0
+    assert writes["OUTPUT_LO+8"] == 2.0
+    assert writes["OUTPUT_HI+15"] == 2.0
+    assert writes["OUTPUT_LO+0"] == -2.0
+    assert writes["OUTPUT_HI+14"] == -2.0
     assert writes["ALU_LO+14"] == -30.0
 
     ir = CompilerIR()
@@ -1094,10 +1140,10 @@ def test_layer16_jsr_mem_addr0_materializes_e0_when_l14_evidence_wins():
     assert rule.gate.key() == "HAS_SE+0"
 
     writes = {write.dim.key(): write.weight for write in rule.writes}
-    assert writes["OUTPUT_LO+0"] == 800.0
-    assert writes["OUTPUT_HI+14"] == 800.0
-    assert writes["OUTPUT_LO+8"] == -800.0
-    assert writes["OUTPUT_HI+15"] == -800.0
+    assert writes["OUTPUT_LO+0"] == 0.0015
+    assert writes["OUTPUT_HI+14"] == 0.0016
+    assert writes["OUTPUT_LO+8"] == -0.0015
+    assert writes["OUTPUT_HI+15"] == -0.0015
 
     ir = CompilerIR()
     ir.layer(0).ffn.rules.append(rule)
@@ -1107,10 +1153,10 @@ def test_layer16_jsr_mem_addr0_materializes_e0_when_l14_evidence_wins():
         "MARK_MEM": 1.0,
         "MEM_STORE": 2.0,
         "HAS_SE": 0.998,
-        "OUTPUT_LO+0": 177.1,
-        "OUTPUT_LO+8": 173.2,
-        "OUTPUT_HI+14": 174.2,
-        "OUTPUT_HI+15": 173.2,
+        "OUTPUT_LO+0": 175.999,
+        "OUTPUT_LO+8": 176.0,
+        "OUTPUT_HI+14": 175.999,
+        "OUTPUT_HI+15": 176.0,
     })
     assert out["OUTPUT_LO+0"] > out["OUTPUT_LO+8"]
     assert out["OUTPUT_HI+14"] > out["OUTPUT_HI+15"]
@@ -1170,6 +1216,37 @@ def test_layer16_jsr_mem_addr0_teacher_forced_f8_and_e0_paths():
             mem_store_positions=trace.mem_store_positions,
             output_band_min_margin=0.01,
             probe_name=name,
+        )
+        assert report.supported, report.format()
+
+
+@pytest.mark.lowering
+def test_layer16_id250_mem_addr0_paths_survive_final_tail():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+    from neural_vm.unified_compiler.decl_verifier import (
+        build_teacher_forced_symbolic_trace,
+        verify_teacher_forced_token_support,
+    )
+    from src.compiler import compile_c
+
+    source = "int main() { int x; x = 990; return x; }\n"
+    bytecode, data = compile_c(source)
+    trace = build_teacher_forced_symbolic_trace(bytecode, data)
+    runner = BatchedPureNeuralRunner(max_seq_len=512)
+
+    for step, expected in ((0, 0xF8), (3, 0xE0)):
+        token_index = trace.token_index(step, "MEM_addr0")
+        assert trace.context[token_index] == expected
+
+        report = verify_teacher_forced_token_support(
+            runner.model,
+            trace.context,
+            token_index=token_index,
+            prefix_len=trace.prefix_len,
+            mem_store_positions=trace.mem_store_positions,
+            max_context_window=512,
+            output_band_min_margin=0.01,
+            probe_name=f"id=0250:{step}:MEM_addr0",
         )
         assert report.supported, report.format()
 
@@ -1257,9 +1334,11 @@ def test_layer16_psh_mem_addr0_restores_nonzero_l14_address_nibbles():
     lo = rules["l16_psh_mem_addr0_restore_lo_8"]
     hi = rules["l16_psh_mem_addr0_restore_hi_14"]
     force_d8 = rules["l16_psh_mem_addr0_force_d8_from_l14_evidence"]
+    e0_from_addr = rules["l16_psh_mem_addr0_e0_from_addr_b0"]
 
     condition_dims = {(term.dim.key(), term.weight) for term in lo.conditions}
     assert ("PSH_AT_SP+0", 1.0) in condition_dims
+    assert ("OP_JSR+0", -1000.0) in condition_dims
     assert ("OP_ENT+0", -1000.0) in condition_dims
     assert ("MARK_MEM+0", 1.0) in condition_dims
     assert ("MEM_STORE+0", 1.0) in condition_dims
@@ -1276,13 +1355,26 @@ def test_layer16_psh_mem_addr0_restores_nonzero_l14_address_nibbles():
     assert ("OUTPUT_LO+8", 1.0) in d8_condition_dims
     assert ("OUTPUT_HI+13", 1.0) in d8_condition_dims
     assert force_d8.threshold == 8.0
+    e0_condition_dims = {
+        (term.dim.key(), term.weight) for term in e0_from_addr.conditions
+    }
+    assert ("MEM_ADDR_SRC+0", 1.0) in e0_condition_dims
+    assert ("ADDR_B0_LO+0", 1.0) in e0_condition_dims
+    assert ("ADDR_B0_HI+14", 1.0) in e0_condition_dims
+    assert ("OP_JSR+0", -1000.0) in e0_condition_dims
+    assert e0_from_addr.threshold == 8.5
 
     lo_writes = {write.dim.key(): write.weight for write in lo.writes}
     hi_writes = {write.dim.key(): write.weight for write in hi.writes}
+    e0_writes = {write.dim.key(): write.weight for write in e0_from_addr.writes}
     assert lo_writes["OUTPUT_LO+8"] == 10_000_000.0 / 100.0
     assert lo_writes["OUTPUT_LO+0"] == -10_000_000.0 / 100.0
     assert hi_writes["OUTPUT_HI+14"] == 10_000_000.0 / 100.0
     assert hi_writes["OUTPUT_HI+0"] == -10_000_000.0 / 100.0
+    assert e0_writes["OUTPUT_LO+0"] == 20.0
+    assert e0_writes["OUTPUT_HI+14"] == 20.0
+    assert e0_writes["OUTPUT_LO+8"] == -20.0
+    assert e0_writes["OUTPUT_HI+0"] == -20.0
 
     ir = CompilerIR()
     ir.layer(0).ffn.rules.extend((lo, hi))
@@ -1333,6 +1425,40 @@ def test_layer16_psh_mem_addr0_restores_nonzero_l14_address_nibbles():
     })
     assert out_ent_marker["OUTPUT_LO+0"] == 2.75
     assert out_ent_marker["OUTPUT_LO+8"] == 26.0
+
+    out_jsr_marker = ir.symbolic_ffn({
+        "PSH_AT_SP": 26.0,
+        "OP_JSR": 10.0,
+        "MARK_MEM": 1.0,
+        "MEM_STORE": 2.0,
+        "HAS_SE": 0.99,
+        "OUTPUT_LO+0": 192.0,
+        "OUTPUT_LO+8": 163.0,
+        "OUTPUT_HI+0": 192.0,
+        "OUTPUT_HI+14": 163.0,
+    })
+    assert out_jsr_marker["OUTPUT_LO+0"] == 192.0
+    assert out_jsr_marker["OUTPUT_LO+8"] == 163.0
+    assert out_jsr_marker["OUTPUT_HI+0"] == 192.0
+    assert out_jsr_marker["OUTPUT_HI+14"] == 163.0
+
+    e0_ir = CompilerIR()
+    e0_ir.layer(0).ffn.rules.append(e0_from_addr)
+    out_psh_e0 = e0_ir.symbolic_ffn({
+        "PSH_AT_SP": 1.49,
+        "MARK_MEM": 1.0,
+        "MEM_STORE": 2.0,
+        "HAS_SE": 0.99,
+        "MEM_ADDR_SRC": 2.0,
+        "ADDR_B0_LO+0": 0.98,
+        "ADDR_B0_HI+14": 0.97,
+        "OUTPUT_LO+0": 16.0,
+        "OUTPUT_LO+8": -9.0,
+        "OUTPUT_HI+0": 16.0,
+        "OUTPUT_HI+14": -9.0,
+    })
+    assert out_psh_e0["OUTPUT_LO+0"] > out_psh_e0["OUTPUT_LO+8"]
+    assert out_psh_e0["OUTPUT_HI+14"] > out_psh_e0["OUTPUT_HI+0"]
 
     out_ent_l14_evidence = ir.symbolic_ffn({
         "PSH_AT_SP": 0.0,

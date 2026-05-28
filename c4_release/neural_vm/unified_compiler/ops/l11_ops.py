@@ -27,7 +27,7 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         name="layer11_mul_partial",
         phase=11,
         reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
-        writes={"MUL_ACCUM"},
+        writes={"TEMP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -37,13 +37,18 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # Staleness invariants (Phase 3 / Agent G): the L11 MUL partial unit
         # consumes ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) at
         # the AX marker for OP_MUL. Both must be the *current* step's fresh
-        # values to produce the correct partial product.
+        # values to produce the correct partial product. The lookup bake
+        # stages the partial in TEMP[0..15] (not MUL_ACCUM/FETCH_LO), and L12
+        # consumes that fresh same-step TEMP value.
         consumes_fresh={
             "ALU_LO": "AX_byte0",
             "ALU_HI": "AX_byte0",
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
-        },
+        } if alu_mode == "lookup" else {},
+        produces={
+            "TEMP": "AX_byte0",
+        } if alu_mode == "lookup" else {},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
