@@ -692,7 +692,7 @@ class CompilerIR:
         unit = start_unit
         for rule in self.layer(layer_idx).ffn.rules:
             for term in rule.conditions:
-                ffn.W_up.data[unit, term.dim.resolve(dim_positions)] = (
+                ffn.W_up.data[unit, term.dim.resolve(dim_positions)] += (
                     S * term.weight
                 )
             ffn.b_up.data[unit] = -S * rule.threshold
@@ -700,17 +700,17 @@ class CompilerIR:
             if rule.gate is None:
                 ffn.b_gate.data[unit] = rule.gate_bias
             else:
-                ffn.W_gate.data[unit, rule.gate.resolve(dim_positions)] = (
+                ffn.W_gate.data[unit, rule.gate.resolve(dim_positions)] += (
                     rule.gate_weight
                 )
                 ffn.b_gate.data[unit] = rule.gate_bias
             for term in rule.gate_terms:
-                ffn.W_gate.data[unit, term.dim.resolve(dim_positions)] = (
+                ffn.W_gate.data[unit, term.dim.resolve(dim_positions)] += (
                     term.weight
                 )
 
             for write in rule.writes:
-                ffn.W_down.data[write.dim.resolve(dim_positions), unit] = (
+                ffn.W_down.data[write.dim.resolve(dim_positions), unit] += (
                     write.weight * write_scale
                 )
             unit += 1

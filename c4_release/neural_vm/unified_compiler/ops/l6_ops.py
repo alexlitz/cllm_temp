@@ -76,7 +76,7 @@ L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT = 1332
 L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT = 1410
 L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT = 1490
 L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2294
-L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2326
+L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2328
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 1668
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 1674
 
@@ -2646,6 +2646,51 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"OUTPUT_HI+{k}", -write_scale),
             ),
         ))
+
+    byte_row_conditions = (
+        ("IS_BYTE", 1.0),
+        ("H1+2", 1.0),
+        ("CMP+3", 1.0),
+        ("MARK_PC", -1_000_000.0),
+        ("MARK_AX", -1_000_000.0),
+        ("MARK_SP", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
+        ("MARK_STACK0", -1_000_000.0),
+        ("MARK_MEM", -1_000_000.0),
+    )
+    clean_zero_byte = (
+        ("CLEAN_EMBED_LO+0", 1.0),
+        ("CLEAN_EMBED_HI+0", 1.0),
+    )
+    # The common stack-pop boundary is 0x00fff8 + 8 => 0x010000.  L6
+    # already emits byte 0 on the SP marker; materialize the upper-byte
+    # carry before later tail layers can reinterpret the same CMP[3] relay.
+    rules.append(FFNRule.gated_write(
+        name="l6_binary_pop_sp_byte1_ff_to_00_lo",
+        conditions=byte_row_conditions + (
+            ("BYTE_INDEX_0", 1.0),
+        ) + clean_zero_byte,
+        threshold=5.5,
+        gate="CONST",
+        writes=(
+            ("OUTPUT_LO+0", 10.0 / S),
+            ("OUTPUT_HI+0", 10.0 / S),
+        ),
+    ))
+    rules.append(FFNRule.gated_write(
+        name="l6_binary_pop_sp_byte2_00_to_01_lo",
+        conditions=byte_row_conditions + (
+            ("BYTE_INDEX_1", 1.0),
+        ) + clean_zero_byte,
+        threshold=5.5,
+        gate="CONST",
+        writes=(
+            ("OUTPUT_LO+1", 10.0 / S),
+            ("OUTPUT_HI+0", 10.0 / S),
+            ("CLEAN_EMBED_LO+0", -1.5 / S),
+            ("CLEAN_EMBED_HI+0", -1.5 / S),
+        ),
+    ))
     return tuple(rules)
 
 

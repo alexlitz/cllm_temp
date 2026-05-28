@@ -1,6 +1,7 @@
 """Parity tests for L16 FFN bands migrated to declarative rules."""
 
 import torch
+import pytest
 
 from neural_vm.unified_compiler.ops.l16_ops import (
     _layer16_lev_routing_rules,
@@ -39,8 +40,8 @@ def test_layer16_lev_routing_ir_matches_legacy_helper():
     legacy_end = _set_layer16_lev_routing(expected, 100.0, _SetDim)
 
     assert legacy_end == 121
-    assert end == 439
-    assert len(_layer16_lev_routing_rules(100.0)) == 439
+    assert end == 441
+    assert len(_layer16_lev_routing_rules(100.0)) == 441
     _assert_same_ffn_prefix(actual, expected, legacy_end)
     assert actual.W_down[:, legacy_end:end].abs().sum() > 0
 
@@ -78,7 +79,7 @@ def test_layer16_bp_marker_passthrough_reads_embed_and_blocks_frame_ops():
     condition_dims = {(term.dim.key(), term.weight) for term in lo.conditions}
     assert ("MARK_BP+0", 1.0) in condition_dims
     assert ("HAS_SE+0", 1.0) in condition_dims
-    assert ("IS_BYTE+0", -300.0) in condition_dims
+    assert ("IS_BYTE+0", -10.0) in condition_dims
     assert ("OP_ENT+0", -2.0) in condition_dims
     assert ("OP_LEV+0", -2.0) in condition_dims
     assert lo.threshold == 1.5
@@ -155,11 +156,11 @@ def test_layer16_top_store_stack0_restore_boosts_staged_nonzero_nibbles():
     lo = rules["l16_top_store_stack0_restore_lo_1"]
 
     condition_dims = {(term.dim.key(), term.weight) for term in lo.conditions}
-    assert ("MARK_STACK0+0", 20.0) in condition_dims
+    assert ("MARK_STACK0+0", 1.0) in condition_dims
     assert ("CMP+3", 1.0) in condition_dims
     assert ("MEM_STORE+0", 1.0) in condition_dims
     assert ("EMBED_LO+0", 1.0) in condition_dims
-    assert ("IS_BYTE+0", -300.0) in condition_dims
+    assert ("IS_BYTE+0", -10.0) in condition_dims
     assert ("MARK_SP+0", -10.0) in condition_dims
     assert lo.threshold == 7.0
     assert lo.gate.key() == "OUTPUT_LO+1"
@@ -177,7 +178,7 @@ def test_layer16_jmp_ax_preserve_blocks_active_fetch_nibble():
     condition_dims = {(term.dim.key(), term.weight) for term in rule.conditions}
     assert ("OP_JMP+0", 0.2) in condition_dims
     assert ("MARK_AX+0", 1.0) in condition_dims
-    assert ("IS_BYTE+0", -300.0) in condition_dims
+    assert ("IS_BYTE+0", -10.0) in condition_dims
     assert ("FETCH_LO+2", -2.0) in condition_dims
     assert rule.threshold == 1.5
     assert rule.gate.key() == "OUTPUT_LO+2"
@@ -427,6 +428,7 @@ def test_layer16_stack0_e8_marker_materializes_from_alu():
     assert ("ADDR_B0_HI+15", -2.0) in condition_dims
     assert ("MEM_STORE+0", -20.0) in condition_dims
     assert ("OP_JSR+0", -10.0) in condition_dims
+    assert ("MARK_MEM+0", -300.0) in condition_dims
     assert lo.threshold == 12.0
     assert lo.gate.key() == "ALU_LO+9"
     assert hi.gate.key() == "ALU_HI+3"
@@ -482,6 +484,35 @@ def test_layer16_stack0_e8_marker_materializes_from_alu():
     assert current_store.get("OUTPUT_LO+9", 0.0) == 0.0
     assert current_store.get("OUTPUT_HI+3", 0.0) == 0.0
 
+    ent_mem_addr0 = CompilerIR()
+    ent_mem_addr0.layer(0).ffn.rules.extend(
+        rule
+        for rule in rules.values()
+        if rule.name.startswith("l16_stack0_e8_marker_from_alu_")
+    )
+    ent_mem_addr0_out = ent_mem_addr0.symbolic_ffn({
+        "OP_ENT": 10.0,
+        "MARK_MEM": 1.0,
+        "MEM_STORE": 4.0,
+        "HAS_SE": 0.9955,
+        "H1+4": 1.0,
+        "H3+4": 1.0,
+        "ADDR_B0_LO+0": -24.331579208374023,
+        "ADDR_B0_LO+8": 25.4189453125,
+        "ADDR_B0_HI+14": 20.25174903869629,
+        "ADDR_B0_HI+15": -42.10127639770508,
+        "ALU_LO+0": -83.75157928466797,
+        "ALU_LO+14": -84.9998779296875,
+        "ALU_HI+0": -84.26598358154297,
+        "ALU_HI+15": -85.0,
+        "OUTPUT_LO+0": 139.67910766601562,
+        "OUTPUT_HI+15": 143.8682403564453,
+    })
+    assert ent_mem_addr0_out["OUTPUT_LO+0"] == 139.67910766601562
+    assert ent_mem_addr0_out["OUTPUT_HI+15"] == 143.8682403564453
+    assert ent_mem_addr0_out.get("OUTPUT_LO+14", 0.0) == 0.0
+    assert ent_mem_addr0_out.get("OUTPUT_HI+0", 0.0) == 0.0
+
     e0_slot = ir.symbolic_ffn({
         "MARK_STACK0": 1.0,
         "HAS_SE": 0.9981152415275574,
@@ -513,6 +544,73 @@ def test_layer16_stack0_e8_marker_materializes_from_alu():
     assert loaded_stack0["OUTPUT_HI+13"] > 40.0
     assert loaded_stack0["OUTPUT_LO+14"] > loaded_stack0.get("OUTPUT_LO+9", 0.0)
     assert loaded_stack0["OUTPUT_HI+13"] > loaded_stack0.get("OUTPUT_HI+3", 0.0)
+
+
+def test_layer16_stack0_e0_marker_exact_e8_materializes_from_alu():
+    from neural_vm.unified_compiler.ir import CompilerIR
+
+    rules = {rule.name: rule for rule in _layer16_lev_routing_rules(100.0)}
+    rule = rules["l16_stack0_e0_marker_e8_from_alu_exact"]
+    condition_dims = {(term.dim.key(), term.weight) for term in rule.conditions}
+
+    assert ("MARK_STACK0+0", 1.0) in condition_dims
+    assert ("ADDR_B0_LO+0", 1.0) in condition_dims
+    assert ("ADDR_B0_HI+14", 1.0) in condition_dims
+    assert ("ALU_LO+8", 1.0) in condition_dims
+    assert ("ALU_HI+14", 1.0) in condition_dims
+    assert ("MEM_STORE+0", -20.0) in condition_dims
+    assert rule.threshold == 19.0
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.append(rule)
+
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9981496334075928,
+        "ADDR_B0_LO+0": 7.978207588195801,
+        "ADDR_B0_LO+8": -1.9999960660934448,
+        "ADDR_B0_HI+14": 7.970700263977051,
+        "ADDR_B0_HI+15": -1.9999877214431763,
+        "ALU_LO+8": 0.9937704801559448,
+        "ALU_HI+14": 0.9937731623649597,
+        "OUTPUT_LO+0": 3.950224709114991e-05,
+        "OUTPUT_HI+0": 3.413946251384914e-05,
+    })
+    assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"]
+    assert out["OUTPUT_HI+14"] > out["OUTPUT_HI+0"]
+
+    unrelated_e0_slot = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.9981152415275574,
+        "ADDR_B0_LO+0": 7.978802680969238,
+        "ADDR_B0_LO+8": -1.9999994039535522,
+        "ADDR_B0_HI+14": 7.971285343170166,
+        "ADDR_B0_HI+15": -1.9984419345855713,
+        "ALU_LO+7": 0.9937703609466553,
+        "ALU_HI+1": 0.9937703609466553,
+        "OUTPUT_LO+0": 3.9529022615170106e-05,
+        "OUTPUT_HI+0": 3.4088981919921935e-05,
+    })
+    assert unrelated_e0_slot["OUTPUT_LO+0"] == 3.9529022615170106e-05
+    assert unrelated_e0_slot["OUTPUT_HI+0"] == 3.4088981919921935e-05
+    assert unrelated_e0_slot.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert unrelated_e0_slot.get("OUTPUT_HI+14", 0.0) == 0.0
+
+    current_store = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 1.0,
+        "ADDR_B0_LO+0": 8.0,
+        "ADDR_B0_HI+14": 8.0,
+        "ALU_LO+8": 1.0,
+        "ALU_HI+14": 1.0,
+        "MEM_STORE": 0.4,
+        "OUTPUT_LO+0": 0.1,
+        "OUTPUT_HI+0": 0.1,
+    })
+    assert current_store["OUTPUT_LO+0"] == 0.1
+    assert current_store["OUTPUT_HI+0"] == 0.1
+    assert current_store.get("OUTPUT_LO+8", 0.0) == 0.0
+    assert current_store.get("OUTPUT_HI+14", 0.0) == 0.0
 
 
 def test_layer16_stack0_f8_marker_materializes_from_alu():
@@ -870,7 +968,7 @@ def test_layer16_lev_pc_top_return_materializes_0a_marker():
     assert ("MARK_PC+0", 1.0) in condition_dims
     assert ("HAS_SE+0", 1.0) in condition_dims
     assert ("H1+0", 1.0) in condition_dims
-    assert ("IS_BYTE+0", -10.0) in condition_dims
+    assert ("IS_BYTE+0", -300.0) in condition_dims
     assert rule.threshold == 7.5
 
     ir = CompilerIR()
@@ -910,9 +1008,16 @@ def test_layer16_jsr_mem_addr0_materializes_f8_marker():
     assert ("OP_ENT+0", -10.0) in condition_dims
     assert ("MARK_MEM+0", 1.0) in condition_dims
     assert ("MEM_STORE+0", 1.0) in condition_dims
-    assert ("HAS_SE+0", 1.0) in condition_dims
-    assert ("IS_BYTE+0", -100.0) in condition_dims
+    assert ("HAS_SE+0", -20.0) in condition_dims
+    assert ("IS_BYTE+0", -1_000_000_000_000.0) in condition_dims
     assert rule.threshold == 7.5
+
+    writes = {write.dim.key(): write.weight for write in rule.writes}
+    assert writes["OUTPUT_LO+8"] == 20.0
+    assert writes["OUTPUT_HI+15"] == 20.0
+    assert writes["OUTPUT_LO+0"] == -20.0
+    assert writes["OUTPUT_HI+14"] == -20.0
+    assert writes["ALU_LO+14"] == -30.0
 
     ir = CompilerIR()
     ir.layer(0).ffn.rules.append(rule)
@@ -921,20 +1026,29 @@ def test_layer16_jsr_mem_addr0_materializes_f8_marker():
         "OP_JSR": 5.0,
         "MARK_MEM": 1.0,
         "MEM_STORE": 2.0,
-        "HAS_SE": 1.0,
         "OUTPUT_LO+0": 176.0,
         "OUTPUT_LO+8": 174.0,
         "OUTPUT_HI+0": 177.0,
         "OUTPUT_HI+15": 174.0,
+        "ALU_LO+14": -2.0,
     })
     assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"]
     assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"]
+    assert out["ALU_LO+14"] < -20.0
+
+    out_local_frame = ir.symbolic_ffn({
+        "OP_JSR": 5.0,
+        "MARK_MEM": 1.0,
+        "MEM_STORE": 2.0,
+        "HAS_SE": 1.0,
+        "OUTPUT_LO+0": 176.0,
+    })
+    assert out_local_frame["OUTPUT_LO+0"] == 176.0
 
     out_byte = ir.symbolic_ffn({
         "OP_JSR": 5.0,
         "MARK_MEM": 1.0,
         "MEM_STORE": 2.0,
-        "HAS_SE": 1.0,
         "IS_BYTE": 1.0,
         "OUTPUT_LO+0": 176.0,
     })
@@ -1014,6 +1128,79 @@ def test_layer16_jsr_mem_addr0_materializes_e0_when_l14_evidence_wins():
     assert out_initial_f8["OUTPUT_HI+14"] == 173.2
 
 
+@pytest.mark.lowering
+def test_layer16_jsr_mem_addr0_teacher_forced_f8_and_e0_paths():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+    from neural_vm.unified_compiler.decl_verifier import (
+        build_teacher_forced_symbolic_trace,
+        verify_teacher_forced_token_support,
+    )
+    from src.compiler import compile_c
+
+    probes = (
+        (
+            "initial_jsr_mem_addr0_f8",
+            "int main() { int x; x = 990; return x; }\n",
+            0,
+            0xF8,
+        ),
+        (
+            "local_frame_jsr_mem_addr0_e0",
+            (
+                "int identity(int x) { return x; }\n"
+                "int main() { return identity(70); }\n"
+            ),
+            4,
+            0xE0,
+        ),
+    )
+    runner = BatchedPureNeuralRunner(max_seq_len=512)
+
+    for name, source, step, expected in probes:
+        bytecode, data = compile_c(source)
+        trace = build_teacher_forced_symbolic_trace(bytecode, data)
+        token_index = trace.token_index(step, "MEM_addr0")
+        assert trace.context[token_index] == expected
+
+        report = verify_teacher_forced_token_support(
+            runner.model,
+            trace.context,
+            token_index=token_index,
+            prefix_len=trace.prefix_len,
+            mem_store_positions=trace.mem_store_positions,
+            output_band_min_margin=0.01,
+            probe_name=name,
+        )
+        assert report.supported, report.format()
+
+
+@pytest.mark.lowering
+def test_layer16_ent_mem_addr0_teacher_forced_f0_path():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+    from neural_vm.unified_compiler.decl_verifier import (
+        build_teacher_forced_symbolic_trace,
+        verify_teacher_forced_token_support,
+    )
+    from src.compiler import compile_c
+
+    bytecode, data = compile_c("int main() { int x; x = 990; return x; }\n")
+    trace = build_teacher_forced_symbolic_trace(bytecode, data)
+    token_index = trace.token_index(1, "MEM_addr0")
+    assert trace.context[token_index] == 0xF0
+
+    runner = BatchedPureNeuralRunner(max_seq_len=512)
+    report = verify_teacher_forced_token_support(
+        runner.model,
+        trace.context,
+        token_index=token_index,
+        prefix_len=trace.prefix_len,
+        mem_store_positions=trace.mem_store_positions,
+        output_band_min_margin=0.01,
+        probe_name="ent_store_mem_addr0_f0",
+    )
+    assert report.supported, report.format()
+
+
 def test_layer16_ent_mem_addr0_clears_stale_alu_lo14():
     from neural_vm.unified_compiler.ir import CompilerIR
 
@@ -1025,7 +1212,7 @@ def test_layer16_ent_mem_addr0_clears_stale_alu_lo14():
     assert ("MARK_MEM+0", 1.0) in condition_dims
     assert ("MEM_STORE+0", 1.0) in condition_dims
     assert ("HAS_SE+0", 1.0) in condition_dims
-    assert ("IS_BYTE+0", -1_000_000.0) in condition_dims
+    assert ("IS_BYTE+0", -20.0) in condition_dims
     assert rule.threshold == 3.5
     assert rule.gate_terms[0].dim.key() == "ALU_LO+14"
     assert rule.gate_terms[0].weight == -1.0

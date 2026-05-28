@@ -173,11 +173,14 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         writes=Primitives.byte_value_writes(0x0A, strength=20.0),
     ))
 
-    # JSR stores the return address at the freshly decremented stack pointer.
-    # L14's MEM-address head usually carries the right 0xfff8 source, but on
-    # function-call rows its byte-0 zero lane can stay slightly above 0xf8.
-    # Reassert only the MEM marker byte-0 shape; address bytes 1..3 and the
-    # stored return value are already stable under teacher-forced diagnostics.
+    # The bootstrap JSR stores the return address at the freshly decremented
+    # top-level stack pointer (0xfff8).  Later local/recursive JSR store rows
+    # carry HAS_SE evidence and can legitimately target lower frame slots such
+    # as 0xffe0; the initial row has no saved-frame evidence. Make that no-SE
+    # shape authoritative without stealing local-frame JSR rows. The late tail
+    # local-JSR e0 guard also keys weakly on ALU_LO+14, so push that scalar
+    # down only for this no-SE row; the tail's own initial-JSR f8 exactness
+    # guard can then keep the byte supported.
     rules.append(FFNRule.constant_write(
         name="l16_jsr_mem_addr0_f8",
         conditions=(
@@ -185,7 +188,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OP_ENT", -10.0),
             ("MARK_MEM", 1.0),
             ("MEM_STORE", 1.0),
-            ("HAS_SE", 1.0),
+            ("HAS_SE", -20.0),
             ("IS_BYTE", -1_000_000_000_000.0),
             ("MARK_PC", -1_000_000.0),
             ("MARK_AX", -1_000_000.0),
@@ -194,7 +197,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_STACK0", -1_000_000.0),
         ),
         threshold=7.5,
-        writes=Primitives.byte_value_writes(0xF8, strength=20.0),
+        writes=Primitives.byte_value_writes(0xF8, strength=20.0) + (
+            ("ALU_LO+14", -30.0),
+        ),
     ))
     rules.append(FFNRule.gated_write(
         name="l16_jsr_mem_addr0_e0_from_l14_evidence",
@@ -270,7 +275,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_AX", -10.0),
         ("MARK_SP", -10.0),
         ("MARK_BP", -10.0),
-        ("MARK_MEM", -10.0),
+        ("MARK_MEM", -300.0),
     )
     stack0_e8_marker_conditions = stack0_e8_marker_base_conditions + (
         # Current SI/SC top-store markers carry residual MEM_STORE around 0.4;
@@ -296,6 +301,36 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             gate=f"ALU_HI+{k}",
             writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
         ))
+
+    # One-local frames can preserve a stack-top address at 0xffe8 while the
+    # current SP/address signature is 0xffe0.  In that shape L15 has already
+    # staged the preserved byte in ALU_LO/HI at the STACK0 marker, but the
+    # older e8 marker materializer above rejects the e0 address signature.
+    # Materialize only the exact e8 byte and require both ALU nibbles so nearby
+    # e0 marker rows with unrelated ALU residue stay inert.
+    rules.append(FFNRule.constant_write(
+        name="l16_stack0_e0_marker_e8_from_alu_exact",
+        conditions=(
+            ("MARK_STACK0", 1.0),
+            ("HAS_SE", 1.0),
+            ("ADDR_B0_LO+0", 1.0),
+            ("ADDR_B0_HI+14", 1.0),
+            ("ALU_LO+8", 1.0),
+            ("ALU_HI+14", 1.0),
+            ("MEM_STORE", -20.0),
+            ("IS_BYTE", -10.0),
+            ("OP_JSR", -10.0),
+            ("OP_ENT", -10.0),
+            ("OP_LEV", -10.0),
+            ("MARK_PC", -10.0),
+            ("MARK_AX", -10.0),
+            ("MARK_SP", -10.0),
+            ("MARK_BP", -10.0),
+            ("MARK_MEM", -10.0),
+        ),
+        threshold=19.0,
+        writes=Primitives.byte_value_writes(0xE8, strength=50.0 / S),
+    ))
 
     stack0_f8_marker_conditions = (
         ("MARK_STACK0", 1.0),
@@ -1299,9 +1334,9 @@ def make_layer16_lev_routing_op() -> Operation:
         # restores, 39 ENT dynamic-frame SP/BP/STACK0 byte units, plus 2 LEA
         # local-frame byte materialization units, one recursive JSR
         # return-address byte-1 guard, plus 32 STACK0-marker inverse units for
-        # false-positive LEV SP materializers, plus one e8 STACK0 output
-        # authoritative byte guard.
-        ffn_units_used=440,
+        # false-positive LEV SP materializers, one e8 STACK0 output
+        # authoritative byte guard, plus one e0/e8 STACK0 exactness guard.
+        ffn_units_used=441,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )

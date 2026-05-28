@@ -12,6 +12,13 @@ from c4_release.neural_vm.unified_compiler.ir import (
 
 
 _SILU_ONE_INPUT = 1.278464542761074
+_LOWERING_EQUIV_S = 100.0
+
+
+def _active_ffn_threshold(score):
+    return score - _SILU_ONE_INPUT / _LOWERING_EQUIV_S
+
+
 from c4_release.neural_vm.unified_compiler.ops.l15_ops import (
     lower_l15_psh_stack_ir,
     make_l15_psh_stack_ir,
@@ -83,6 +90,30 @@ def test_lower_ffn_matches_symbolic_positive_case():
     y = ffn(x)
 
     assert float(y[..., dim_positions["OUTPUT_LO"] + 1].item()) > 1.0
+
+
+@pytest.mark.lowering
+def test_lower_ffn_accumulates_duplicate_terms_like_symbolic_ffn():
+    dim_positions = {
+        "A": 0,
+        "G": 1,
+        "OUT": 2,
+    }
+    ir = CompilerIR()
+    ir.layer(0).ffn.append(FFNRule.gated_write(
+        conditions=(("A", 0.25), ("A", 0.5)),
+        threshold=0.5,
+        gate="G",
+        gate_terms=(("G", 2.0),),
+        writes=(("OUT", 1.0), ("OUT", 2.0)),
+    ))
+
+    ffn = PureFFN(dim=8, hidden_dim=ir.required_ffn_units())
+    ir.lower_ffn(ffn, dim_positions, S=10.0)
+
+    assert float(ffn.W_up[0, dim_positions["A"]].item()) == pytest.approx(7.5)
+    assert float(ffn.W_gate[0, dim_positions["G"]].item()) == pytest.approx(3.0)
+    assert float(ffn.W_down[dim_positions["OUT"], 0].item()) == pytest.approx(3.0)
 
 
 def test_compare_symbolic_to_lowered_ffn_psh_like_rule_matches():
@@ -209,6 +240,113 @@ def test_compare_symbolic_to_lowered_ffn_multi_gate_rules_match():
 
     assert report.ok, report.format()
     assert abs(report.lowered_state["OUT+0"] - 10.0) < 1e-5
+
+
+@pytest.mark.lowering
+@pytest.mark.parametrize(
+    ("rule", "dim_positions", "state", "expected"),
+    [
+        pytest.param(
+            FFNRule.constant_write(
+                name="duplicate_condition_dims",
+                conditions=(("COND", 0.25), ("COND", 0.75)),
+                threshold=_active_ffn_threshold(1.0),
+                writes=(("OUT", 2.5),),
+            ),
+            {"COND": 0, "OUT": 4},
+            {"COND": 1.0},
+            {"OUT+0": 2.5},
+            id="duplicate-condition-dims",
+        ),
+        pytest.param(
+            FFNRule.gated_write(
+                name="duplicate_gate_dims",
+                conditions=(("COND", 1.0),),
+                threshold=_active_ffn_threshold(1.0),
+                gate="GATE",
+                gate_weight=0.5,
+                gate_terms=(("GATE", 1.5),),
+                writes=(("OUT", 2.0),),
+            ),
+            {"COND": 0, "GATE": 1, "OUT": 4},
+            {"COND": 1.0, "GATE": 3.0},
+            {"OUT+0": 12.0},
+            id="duplicate-gate-dims",
+        ),
+        pytest.param(
+            FFNRule.constant_write(
+                name="duplicate_writes",
+                conditions=(("COND", 1.0),),
+                threshold=_active_ffn_threshold(1.0),
+                writes=(("OUT", 3.0), ("OUT", -0.75), ("OUT+0", 0.25)),
+            ),
+            {"COND": 0, "OUT": 4},
+            {"COND": 1.0},
+            {"OUT+0": 2.5},
+            id="duplicate-writes",
+        ),
+        pytest.param(
+            FFNRule.constant_write(
+                name="negative_blocker_allows",
+                conditions=(("COND", 1.0), ("BLOCK", -1.0)),
+                threshold=_active_ffn_threshold(1.0),
+                writes=(("OUT", 1.5),),
+            ),
+            {"COND": 0, "BLOCK": 1, "OUT": 4},
+            {"COND": 1.0, "BLOCK": 0.0},
+            {"OUT+0": 1.5},
+            id="negative-blocker-allows",
+        ),
+        pytest.param(
+            FFNRule.constant_write(
+                name="negative_blocker_blocks",
+                conditions=(("COND", 1.0), ("BLOCK", -1.0)),
+                threshold=_active_ffn_threshold(1.0),
+                writes=(("OUT", 1.5),),
+            ),
+            {"COND": 0, "BLOCK": 1, "OUT": 4},
+            {"COND": 1.0, "BLOCK": 1.0},
+            {"OUT+0": 0.0},
+            id="negative-blocker-blocks",
+        ),
+        pytest.param(
+            FFNRule.gated_write(
+                name="gated_write_terms",
+                conditions=(("COND", 1.0),),
+                threshold=_active_ffn_threshold(1.0),
+                gate="SRC",
+                gate_weight=1.25,
+                gate_terms=(("OFFSET", -0.5),),
+                gate_bias=0.75,
+                writes=(("OUT", -2.0),),
+            ),
+            {"COND": 0, "SRC": 1, "OFFSET": 2, "OUT": 4},
+            {"COND": 1.0, "SRC": 4.0, "OFFSET": 2.0},
+            {"OUT+0": -9.5},
+            id="gated-write",
+        ),
+    ],
+)
+def test_compare_symbolic_to_lowered_ffn_equivalence_cases(
+    rule, dim_positions, state, expected
+):
+    report = compare_symbolic_to_lowered_ffn(
+        rule,
+        dim_positions,
+        state,
+        S=_LOWERING_EQUIV_S,
+        atol=3e-5,
+        rtol=3e-5,
+    )
+
+    assert report.ok, report.format()
+    for key, value in expected.items():
+        assert report.symbolic_state.get(key, 0.0) == pytest.approx(value)
+        assert report.lowered_state[key] == pytest.approx(
+            value,
+            abs=3e-5,
+            rel=3e-5,
+        )
 
 
 def test_compare_symbolic_to_lowered_ffn_reports_declaration_semantics():

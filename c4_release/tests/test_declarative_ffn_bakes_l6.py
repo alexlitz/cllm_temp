@@ -620,9 +620,9 @@ def test_layer6_binary_pop_sp_increment_band_follows_function_call_band():
     assert L6_BINARY_POP_SP_INCREMENT_START_UNIT >= function_call_op.ffn_units_used
     assert (
         L6_BINARY_POP_SP_INCREMENT_END_UNIT
-        == L6_BINARY_POP_SP_INCREMENT_START_UNIT + 32
+        == L6_BINARY_POP_SP_INCREMENT_START_UNIT + 34
     )
-    assert len(_layer6_binary_pop_sp_increment_rules(100.0)) == 32
+    assert len(_layer6_binary_pop_sp_increment_rules(100.0)) == 34
 
 
 def test_layer6_binary_pop_sp_increment_emits_pre_l15_sp_byte0():
@@ -685,6 +685,66 @@ def test_layer6_binary_pop_sp_increment_blocks_non_sp_rows():
 
     assert abs(float(y[_SetDim.OUTPUT_LO + 8])) < 1e-6
     assert abs(float(y[_SetDim.OUTPUT_LO + 0])) < 1e-6
+
+
+def test_layer6_binary_pop_sp_increment_materializes_high_byte_carry():
+    ffn = _StubFFN(hidden_dim=L6_BINARY_POP_SP_INCREMENT_END_UNIT)
+    _lower_layer6_binary_pop_sp_increment_ir(ffn, 100.0, _SetDim)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.CONST] = 1.0
+    x[..., _SetDim.IS_BYTE] = 1.0
+    x[..., _SetDim.H1 + 2] = 1.0
+    x[..., _SetDim.CMP + 3] = 1.0
+    x[..., _SetDim.BYTE_INDEX_0] = 1.0
+    x[..., _SetDim.CLEAN_EMBED_LO + 0] = 1.0
+    x[..., _SetDim.CLEAN_EMBED_HI + 0] = 1.0
+    x[..., _SetDim.OUTPUT_LO + 15] = 1.0
+    x[..., _SetDim.OUTPUT_HI + 15] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 0] > y[_SetDim.OUTPUT_LO + 15]
+    assert y[_SetDim.OUTPUT_HI + 0] > y[_SetDim.OUTPUT_HI + 15]
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.CONST] = 1.0
+    x[..., _SetDim.IS_BYTE] = 1.0
+    x[..., _SetDim.H1 + 2] = 1.0
+    x[..., _SetDim.CMP + 3] = 1.0
+    x[..., _SetDim.BYTE_INDEX_1] = 1.0
+    x[..., _SetDim.CLEAN_EMBED_LO + 0] = 1.0
+    x[..., _SetDim.CLEAN_EMBED_HI + 0] = 1.0
+    x[..., _SetDim.OUTPUT_LO + 0] = 1.0
+    x[..., _SetDim.OUTPUT_HI + 0] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 1] > y[_SetDim.OUTPUT_LO + 0]
+    assert y[_SetDim.OUTPUT_HI + 0] > 1.0
+    assert y[_SetDim.CLEAN_EMBED_LO + 0] < 0.5
+    assert y[_SetDim.CLEAN_EMBED_HI + 0] < 0.5
+
+
+def test_layer6_binary_pop_sp_high_byte_carry_requires_pop_relay():
+    ffn = _StubFFN(hidden_dim=L6_BINARY_POP_SP_INCREMENT_END_UNIT)
+    _lower_layer6_binary_pop_sp_increment_ir(ffn, 100.0, _SetDim)
+
+    x = torch.zeros(1, 1, 512)
+    x[..., _SetDim.CONST] = 1.0
+    x[..., _SetDim.IS_BYTE] = 1.0
+    x[..., _SetDim.H1 + 2] = 1.0
+    x[..., _SetDim.BYTE_INDEX_1] = 1.0
+    x[..., _SetDim.CLEAN_EMBED_LO + 0] = 1.0
+    x[..., _SetDim.CLEAN_EMBED_HI + 0] = 1.0
+    x[..., _SetDim.OUTPUT_LO + 0] = 1.0
+    x[..., _SetDim.OUTPUT_HI + 0] = 1.0
+
+    y = _apply_stub_ffn(ffn, x)[0, 0]
+
+    assert y[_SetDim.OUTPUT_LO + 0] == 1.0
+    assert y[_SetDim.OUTPUT_HI + 0] == 1.0
+    assert abs(float(y[_SetDim.OUTPUT_LO + 1])) < 1e-6
 
 
 def test_layer6_jsr_sp_marker_decrement_handles_later_calls():

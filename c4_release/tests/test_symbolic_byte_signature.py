@@ -46,6 +46,9 @@ from tests.test_1096_neural_declarative_diagnostic import (  # noqa: E402
 )
 
 
+pytestmark = pytest.mark.lowering
+
+
 # Cached compile_c outputs for the test programs of interest.
 ID575_SRC = (
     "int add(int a, int b) { return a + b; }\n"

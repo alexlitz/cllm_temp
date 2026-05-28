@@ -333,6 +333,7 @@ class LoweringSupportSnapshot:
     output_byte: Optional[int] = None
     output_lo_argmax: Optional[int] = None
     output_hi_argmax: Optional[int] = None
+    output_band_contract: str = ""
 
     @property
     def supports_expected_argmax(self) -> bool:
@@ -364,6 +365,9 @@ class LoweringSupportSnapshot:
                 f" hi_arg={self.output_hi_argmax}"
             )
         note = f" {self.residual_note}" if self.residual_note else ""
+        band_contract = (
+            "" if not self.output_band_contract else f" {self.output_band_contract}"
+        )
         return (
             f"block={block} layer={layer} label={self.label!r} "
             f"expected={_token_label(self.expected_token)} "
@@ -372,6 +376,7 @@ class LoweringSupportSnapshot:
             f"argmax_logit={self.argmax_logit:+.2f} "
             f"margin={self.expected_margin:+.2f}"
             f"{byte}{note}"
+            f"{band_contract}"
         )
 
 
@@ -440,6 +445,35 @@ class TeacherForcedTraceAuditFailure:
     argmax_token: int
     expected_margin: float
     output_byte: Optional[int] = None
+    failure_kind: str = "unsupported"
+    output_band_contract: str = ""
+    output_band_violation_kinds: Tuple[str, ...] = ()
+
+    @property
+    def failure_kinds(self) -> Tuple[str, ...]:
+        return tuple(
+            part
+            for part in self.failure_kind.split(",")
+            if part
+        )
+
+    @property
+    def token_is_wrong(self) -> bool:
+        kinds = set(self.failure_kinds)
+        return bool(kinds & {"wrong_argmax", "wrong_output_byte"})
+
+    @property
+    def output_band_contract_only(self) -> bool:
+        kinds = set(self.failure_kinds)
+        return bool(kinds) and kinds <= {"output_band_contract"}
+
+    @property
+    def output_band_margin_only(self) -> bool:
+        return (
+            self.output_band_contract_only
+            and bool(self.output_band_violation_kinds)
+            and set(self.output_band_violation_kinds) <= {"active_margin_low"}
+        )
 
     def format(self) -> str:
         byte = (
@@ -447,11 +481,22 @@ class TeacherForcedTraceAuditFailure:
             if self.output_byte is None
             else f" output_byte={_token_label(self.output_byte)}"
         )
+        band_contract = (
+            "" if not self.output_band_contract else f" {self.output_band_contract}"
+        )
+        band_kinds = (
+            ""
+            if not self.output_band_violation_kinds
+            else " band_violations=" + ",".join(self.output_band_violation_kinds)
+        )
         return (
             f"step{self.step}:{self.slot} abs={self.token_index} "
             f"expected={_token_label(self.expected_token)} "
             f"argmax={_token_label(self.argmax_token)} "
-            f"margin={self.expected_margin:+.2f}{byte}"
+            f"margin={self.expected_margin:+.2f}{byte} "
+            f"kind={self.failure_kind}"
+            f"{band_contract}"
+            f"{band_kinds}"
         )
 
 
@@ -627,6 +672,132 @@ def _lowering_output_byte(
     return lo_arg | (hi_arg << 4), lo_arg, hi_arg
 
 
+def _lowering_output_band_contract_report(
+    model,
+    row: torch.Tensor,
+    expected_token: int,
+    *,
+    output_band_min_margin: Optional[float],
+    output_band_max_inactive_value: float,
+    output_band_tolerance: float,
+):
+    if output_band_min_margin is None or not 0 <= int(expected_token) < 256:
+        return None
+    from .band_contracts import verify_declared_output_nibble_bands
+
+    out_lo = _dim_position(model, "OUTPUT_LO")
+    out_hi = _dim_position(model, "OUTPUT_HI")
+    return verify_declared_output_nibble_bands(
+        {
+            "OUTPUT_LO": row[out_lo:out_lo + 16],
+            "OUTPUT_HI": row[out_hi:out_hi + 16],
+        },
+        expected_byte=int(expected_token),
+        min_active_margin=float(output_band_min_margin),
+        max_inactive_value=float(output_band_max_inactive_value),
+        tolerance=float(output_band_tolerance),
+        include_projection=True,
+    )
+
+
+def _lowering_failure_kind(
+    *,
+    argmax_token: int,
+    expected_token: int,
+    expected_margin: float,
+    min_margin: float,
+    byte_ok: bool,
+    band_contract_ok: bool,
+) -> str:
+    kinds: List[str] = []
+    if int(argmax_token) != int(expected_token):
+        kinds.append("wrong_argmax")
+    if not byte_ok:
+        kinds.append("wrong_output_byte")
+    if float(expected_margin) < float(min_margin):
+        kinds.append("low_head_margin")
+    if not band_contract_ok:
+        kinds.append("output_band_contract")
+    return ",".join(kinds) if kinds else "unsupported"
+
+
+def _lowering_output_band_violation_kinds(band_report) -> Tuple[str, ...]:
+    if band_report is None:
+        return ()
+    return tuple(sorted({violation.kind for violation in band_report.violations}))
+
+
+def _lowering_trace_audit_failure(
+    *,
+    model,
+    trace: TeacherForcedSymbolicTrace,
+    row: torch.Tensor,
+    token_index: int,
+    min_margin: float,
+    output_band_min_margin: Optional[float],
+    output_band_max_inactive_value: float,
+    output_band_tolerance: float,
+) -> Optional[TeacherForcedTraceAuditFailure]:
+    expected_token = int(trace.context[token_index])
+    if not 0 <= expected_token < int(getattr(model, "vocab_size", 10**9)):
+        return None
+
+    logits = _head_logits_for_residual(model, row)
+    argmax_token = int(torch.argmax(logits).item())
+    expected_logit = float(logits[expected_token].item())
+    masked = logits.clone()
+    masked[expected_token] = float("-inf")
+    expected_margin = expected_logit - float(masked.max().item())
+    output_byte, _, _ = _lowering_output_byte(model, row)
+    byte_ok = (
+        not 0 <= expected_token < 256
+        or output_byte == expected_token
+    )
+    band_report = _lowering_output_band_contract_report(
+        model,
+        row,
+        expected_token,
+        output_band_min_margin=output_band_min_margin,
+        output_band_max_inactive_value=output_band_max_inactive_value,
+        output_band_tolerance=output_band_tolerance,
+    )
+    band_contract_ok = band_report is None or band_report.ok
+    if (
+        argmax_token == expected_token
+        and expected_margin >= min_margin
+        and byte_ok
+        and band_contract_ok
+    ):
+        return None
+
+    generated_index = token_index - trace.prefix_len
+    step = generated_index // len(_LOWERING_STEP_SLOT_NAMES)
+    offset = generated_index % len(_LOWERING_STEP_SLOT_NAMES)
+    return TeacherForcedTraceAuditFailure(
+        token_index=int(token_index),
+        step=int(step),
+        slot=_LOWERING_STEP_SLOT_NAMES[offset],
+        expected_token=expected_token,
+        argmax_token=argmax_token,
+        expected_margin=float(expected_margin),
+        output_byte=output_byte if 0 <= expected_token < 256 else None,
+        failure_kind=_lowering_failure_kind(
+            argmax_token=argmax_token,
+            expected_token=expected_token,
+            expected_margin=expected_margin,
+            min_margin=min_margin,
+            byte_ok=byte_ok,
+            band_contract_ok=band_contract_ok,
+        ),
+        output_band_contract=(
+            "" if band_report is None else band_report.format_inline()
+        ),
+        output_band_violation_kinds=_lowering_output_band_violation_kinds(
+            band_report
+        ),
+    )
+
+
 def _lowering_snapshot(
     *,
     model,
@@ -636,6 +807,9 @@ def _lowering_snapshot(
     block_index: Optional[int],
     original_layer_index: Optional[int],
     expected_token: int,
+    output_band_min_margin: Optional[float] = None,
+    output_band_max_inactive_value: float = 1e30,
+    output_band_tolerance: float = 1e-6,
 ) -> LoweringSupportSnapshot:
     row = x[0, pos]
     logits = _head_logits_for_residual(model, row)
@@ -646,6 +820,14 @@ def _lowering_snapshot(
     masked[expected_token] = float("-inf")
     best_other = float(masked.max().item())
     output_byte, lo_arg, hi_arg = _lowering_output_byte(model, row)
+    band_report = _lowering_output_band_contract_report(
+        model,
+        row,
+        expected_token,
+        output_band_min_margin=output_band_min_margin,
+        output_band_max_inactive_value=output_band_max_inactive_value,
+        output_band_tolerance=output_band_tolerance,
+    )
     return LoweringSupportSnapshot(
         label=label,
         block_index=block_index,
@@ -659,6 +841,9 @@ def _lowering_snapshot(
         output_byte=output_byte,
         output_lo_argmax=lo_arg,
         output_hi_argmax=hi_arg,
+        output_band_contract=(
+            "" if band_report is None else band_report.format_inline()
+        ),
     )
 
 
@@ -726,6 +911,9 @@ def verify_teacher_forced_token_support(
     mem_store_positions: Sequence[int] = (),
     max_context_window: Optional[int] = 512,
     min_margin: float = 0.0,
+    output_band_min_margin: Optional[float] = None,
+    output_band_max_inactive_value: float = 1e30,
+    output_band_tolerance: float = 1e-6,
     probe_name: str = "",
 ) -> TeacherForcedTokenSupportReport:
     """Assertable lowering probe for one teacher-forced symbolic token.
@@ -782,6 +970,9 @@ def verify_teacher_forced_token_support(
                     block_index=None,
                     original_layer_index=None,
                     expected_token=int(expected_token),
+                    output_band_min_margin=output_band_min_margin,
+                    output_band_max_inactive_value=output_band_max_inactive_value,
+                    output_band_tolerance=output_band_tolerance,
                 )
             )
             for block_index, block in enumerate(model.blocks):
@@ -796,6 +987,9 @@ def verify_teacher_forced_token_support(
                         block_index=block_index,
                         original_layer_index=original_layer,
                         expected_token=int(expected_token),
+                        output_band_min_margin=output_band_min_margin,
+                        output_band_max_inactive_value=output_band_max_inactive_value,
+                        output_band_tolerance=output_band_tolerance,
                     )
                 )
     finally:
@@ -821,29 +1015,64 @@ def audit_teacher_forced_trace_final_support(
     *,
     token_indices: Optional[Sequence[int]] = None,
     min_margin: float = 0.0,
+    output_band_min_margin: Optional[float] = None,
+    output_band_max_inactive_value: float = 1e30,
+    output_band_tolerance: float = 1e-6,
+    max_context_window: Optional[int] = None,
+    window_chunk_tokens: int = 512,
     max_failures: int = 16,
     probe_name: str = "",
 ) -> TeacherForcedTraceAuditReport:
     """Check final lowered-model support for many symbolic tokens at once.
 
     This is the fast counterpart to :func:`verify_teacher_forced_token_support`.
-    It teacher-forces the whole symbolic trace once, runs every compiled block,
-    and checks the final output head at each selected token's prediction row.
-    When a failure is found, callers can rerun the single-token verifier for a
-    block-by-block loss report.
+    By default it teacher-forces the whole symbolic trace once, runs every
+    compiled block, and checks the final output head at each selected token's
+    prediction row.  Set ``max_context_window`` to audit long traces in
+    bounded chunks that keep the immutable prefix plus a rolling dynamic-token
+    window; this matches the single-token verifier's context-window shape and
+    avoids full-trace OOMs during shard triage.  When a failure is found,
+    callers can rerun the single-token verifier for a block-by-block loss
+    report.
     """
 
     if len(trace.context) < 2:
         raise ValueError("teacher-forced trace is too short to audit")
+    if max_context_window is not None and max_context_window < 1:
+        raise ValueError("max_context_window must be positive when set")
+    if window_chunk_tokens < 1:
+        raise ValueError("window_chunk_tokens must be positive")
 
     if token_indices is None:
-        selected = range(trace.prefix_len, len(trace.context))
+        selected = list(range(trace.prefix_len, len(trace.context)))
     else:
         selected = [int(i) for i in token_indices]
 
     for token_index in selected:
         if token_index <= 0 or token_index >= len(trace.context):
             raise IndexError(f"token index {token_index} outside trace")
+
+    if not selected:
+        return TeacherForcedTraceAuditReport(
+            probe_name=probe_name,
+            checked=0,
+            failures=(),
+        )
+
+    if max_context_window is not None:
+        return _audit_teacher_forced_trace_final_support_windowed(
+            model,
+            trace,
+            selected=selected,
+            min_margin=min_margin,
+            output_band_min_margin=output_band_min_margin,
+            output_band_max_inactive_value=output_band_max_inactive_value,
+            output_band_tolerance=output_band_tolerance,
+            max_context_window=max_context_window,
+            window_chunk_tokens=window_chunk_tokens,
+            max_failures=max_failures,
+            probe_name=probe_name,
+        )
 
     device = next(model.parameters()).device
     token_ids = torch.tensor(
@@ -876,40 +1105,150 @@ def audit_teacher_forced_trace_final_support(
                 checked += 1
                 logit_pos = token_index - 1
                 row = x[0, logit_pos]
-                logits = _head_logits_for_residual(model, row)
-                argmax_token = int(torch.argmax(logits).item())
-                expected_logit = float(logits[expected_token].item())
-                masked = logits.clone()
-                masked[expected_token] = float("-inf")
-                expected_margin = expected_logit - float(masked.max().item())
-                output_byte, _, _ = _lowering_output_byte(model, row)
-                byte_ok = (
-                    not 0 <= expected_token < 256
-                    or output_byte == expected_token
+                failure = _lowering_trace_audit_failure(
+                    model=model,
+                    trace=trace,
+                    row=row,
+                    token_index=token_index,
+                    min_margin=min_margin,
+                    output_band_min_margin=output_band_min_margin,
+                    output_band_max_inactive_value=output_band_max_inactive_value,
+                    output_band_tolerance=output_band_tolerance,
                 )
-                if (
-                    argmax_token == expected_token
-                    and expected_margin >= min_margin
-                    and byte_ok
-                ):
+                if failure is None:
                     continue
-
-                generated_index = token_index - trace.prefix_len
-                step = generated_index // len(_LOWERING_STEP_SLOT_NAMES)
-                offset = generated_index % len(_LOWERING_STEP_SLOT_NAMES)
-                failures.append(
-                    TeacherForcedTraceAuditFailure(
-                        token_index=int(token_index),
-                        step=int(step),
-                        slot=_LOWERING_STEP_SLOT_NAMES[offset],
-                        expected_token=expected_token,
-                        argmax_token=argmax_token,
-                        expected_margin=float(expected_margin),
-                        output_byte=output_byte if 0 <= expected_token < 256 else None,
-                    )
-                )
+                failures.append(failure)
                 if len(failures) >= max_failures:
                     break
+    finally:
+        if old_mem_history_end is not None and hasattr(embed, "set_mem_history_end"):
+            embed.set_mem_history_end(old_mem_history_end)
+        if hasattr(embed, "set_mem_store_positions"):
+            embed.set_mem_store_positions(old_mem_store_positions)
+
+    return TeacherForcedTraceAuditReport(
+        probe_name=probe_name,
+        checked=checked,
+        failures=tuple(failures),
+    )
+
+
+def _remapped_store_positions_for_window(
+    trace: TeacherForcedSymbolicTrace,
+    *,
+    dynamic_start: int,
+    dynamic_end: int,
+) -> Tuple[int, ...]:
+    remapped: List[int] = []
+    for raw_pos in trace.mem_store_positions:
+        pos = int(raw_pos)
+        if 0 <= pos < trace.prefix_len:
+            remapped.append(pos)
+        elif dynamic_start <= pos < dynamic_end:
+            remapped.append(trace.prefix_len + (pos - dynamic_start))
+    return tuple(remapped)
+
+
+def _audit_teacher_forced_trace_final_support_windowed(
+    model,
+    trace: TeacherForcedSymbolicTrace,
+    *,
+    selected: Sequence[int],
+    min_margin: float,
+    output_band_min_margin: Optional[float],
+    output_band_max_inactive_value: float,
+    output_band_tolerance: float,
+    max_context_window: int,
+    window_chunk_tokens: int,
+    max_failures: int,
+    probe_name: str,
+) -> TeacherForcedTraceAuditReport:
+    device = next(model.parameters()).device
+    selected_sorted = sorted(dict.fromkeys(int(i) for i in selected))
+
+    embed = getattr(model, "embed", None)
+    old_mem_history_end = getattr(embed, "_mem_history_end", None)
+    old_mem_store_positions = getattr(embed, "_mem_store_positions", None)
+
+    failures: List[TeacherForcedTraceAuditFailure] = []
+    checked = 0
+    try:
+        if hasattr(embed, "set_mem_history_end"):
+            embed.set_mem_history_end(0)
+
+        cursor = 0
+        while cursor < len(selected_sorted):
+            chunk_start = selected_sorted[cursor]
+            chunk_limit = min(
+                len(trace.context),
+                chunk_start + int(window_chunk_tokens),
+            )
+            chunk_selected: List[int] = []
+            while (
+                cursor < len(selected_sorted)
+                and selected_sorted[cursor] < chunk_limit
+            ):
+                chunk_selected.append(selected_sorted[cursor])
+                cursor += 1
+            if not chunk_selected:
+                continue
+
+            chunk_end = chunk_selected[-1] + 1
+            dynamic_start = max(
+                trace.prefix_len,
+                chunk_selected[0] - int(max_context_window),
+            )
+            windowed = (
+                [int(t) for t in trace.context[:trace.prefix_len]]
+                + [int(t) for t in trace.context[dynamic_start:chunk_end]]
+            )
+            if hasattr(embed, "set_mem_store_positions"):
+                embed.set_mem_store_positions([
+                    _remapped_store_positions_for_window(
+                        trace,
+                        dynamic_start=dynamic_start,
+                        dynamic_end=chunk_end,
+                    )
+                ])
+
+            token_ids = torch.tensor(
+                [windowed],
+                dtype=torch.long,
+                device=device,
+            )
+            with torch.no_grad():
+                x = model.embed(token_ids)
+                for block in model.blocks:
+                    x = block(x)
+
+                for token_index in chunk_selected:
+                    expected_token = int(trace.context[token_index])
+                    if not 0 <= expected_token < int(
+                        getattr(model, "vocab_size", 10**9)
+                    ):
+                        continue
+                    checked += 1
+                    logit_pos = trace.prefix_len + (token_index - dynamic_start) - 1
+                    row = x[0, logit_pos]
+                    failure = _lowering_trace_audit_failure(
+                        model=model,
+                        trace=trace,
+                        row=row,
+                        token_index=token_index,
+                        min_margin=min_margin,
+                        output_band_min_margin=output_band_min_margin,
+                        output_band_max_inactive_value=(
+                            output_band_max_inactive_value
+                        ),
+                        output_band_tolerance=output_band_tolerance,
+                    )
+                    if failure is None:
+                        continue
+                    failures.append(failure)
+                    if len(failures) >= max_failures:
+                        break
+            if len(failures) >= max_failures:
+                break
     finally:
         if old_mem_history_end is not None and hasattr(embed, "set_mem_history_end"):
             embed.set_mem_history_end(old_mem_history_end)
