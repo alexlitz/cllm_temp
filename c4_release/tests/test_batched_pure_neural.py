@@ -488,6 +488,7 @@ def _fake_kv_runner(*, verify):
     runner.model = _FakeBatchedModel()
     runner._device = torch.device("cpu")
     runner.use_kv_cache = True
+    runner.incremental_kv_safe = True
     runner.kv_cache_verify = verify
     runner.kv_cache_verify_interval = 1
     runner.kv_cache_max_tokens = 32
@@ -611,6 +612,90 @@ def test_batched_kv_flush_interval_rebuilds_cache():
     assert runner.model.calls[0]["cached_prefix_len"] == 0
     assert runner._kv_stats["cache_rebuilds"] == 1
     assert runner._kv_stats["hits"] == 0
+
+
+def test_batched_incremental_kv_prunes_overflow_without_fresh_reset():
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+    from neural_vm.kv_cache import LayerKVCache
+
+    class _AppendingModel(_FakeBatchedModel):
+        def forward(self, token_ids, kv_cache=None, cached_prefix_len=0):
+            if kv_cache is not None:
+                new_len = token_ids.shape[1] - cached_prefix_len
+                for layer_cache in kv_cache.caches:
+                    k = torch.zeros(1, 1, new_len, 1)
+                    v = torch.zeros(1, 1, new_len, 1)
+                    layer_cache.update(k, v)
+            return super().forward(
+                token_ids,
+                kv_cache=kv_cache,
+                cached_prefix_len=cached_prefix_len,
+            )
+
+    logical_max = 80
+    kv_cache = LayerKVCache(
+        num_layers=1,
+        max_tokens=logical_max + 1,
+        num_heads=1,
+        head_dim=1,
+        device="cpu",
+    )
+    kv_cache.caches[0].update(
+        torch.zeros(1, 1, logical_max, 1),
+        torch.zeros(1, 1, logical_max, 1),
+    )
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    runner.model = _AppendingModel()
+    runner._device = torch.device("cpu")
+    runner.use_kv_cache = True
+    runner.incremental_kv_safe = True
+    runner.kv_cache_verify = False
+    runner.kv_cache_verify_interval = 1
+    runner.kv_cache_max_tokens = logical_max
+    runner.kv_flush_interval = 0
+    runner._kv_cache_obj = kv_cache
+    runner._kv_active_idx = (0,)
+    runner._kv_cached_rows = [list(range(logical_max))]
+    runner._kv_incremental_count = 0
+    runner._kv_stats = {
+        "calls": 0,
+        "hits": 0,
+        "fallbacks": 0,
+        "mismatches": 0,
+        "eviction_pressure": 0,
+        "verifications": 0,
+        "fresh_forwards": 0,
+        "kv_forwards": 0,
+        "verification_forwards": 0,
+        "cache_rebuilds": 0,
+        "reused_token_slots": 0,
+        "spec_fresh_bypass": 0,
+        "unsafe_model_fresh_bypass": 0,
+        "bounded_evictions": 0,
+        "bounded_positions_evicted": 0,
+        "bounded_eviction_fallbacks": 0,
+    }
+
+    preds, pred_start, real_lens = runner._forward_argmax_batch(
+        [list(range(logical_max + 1))],
+        [0],
+        first_logit_pos=logical_max,
+        protected_prefix_lens=[2],
+        protected_mem_positions=[[]],
+    )
+
+    assert preds == [[3]]
+    assert pred_start == logical_max
+    assert real_lens == [logical_max + 1]
+    assert runner._kv_stats["fresh_forwards"] == 0
+    assert runner._kv_stats["bounded_evictions"] == 1
+    assert runner._kv_stats["bounded_positions_evicted"] == 1
+    assert kv_cache.caches[0].cache_size == logical_max
+    assert kv_cache.caches[0].next_pos_id == logical_max + 1
+    assert kv_cache.caches[0].cached_pos_ids[0].tolist() == (
+        [0, 1] + list(range(3, logical_max + 1))
+    )
 
 
 @pytest.mark.slow

@@ -315,6 +315,13 @@ class BatchedPureNeuralRunner:
         self.kv_cache_max_tokens = int(
             kv_cache_max_tokens or getattr(self.model, "max_seq_len", max_seq_len)
         )
+        self._kv_cache_eviction_overshoot = max(
+            1,
+            _env_int("C4_BATCH_KV_EVICTION_OVERSHOOT", Token.STEP_TOKENS),
+        )
+        self._kv_cache_storage_max_tokens = self.kv_cache_max_tokens
+        if self.use_kv_cache and self.incremental_kv_safe:
+            self._kv_cache_storage_max_tokens += self._kv_cache_eviction_overshoot
         self.kv_flush_interval = max(
             0,
             _env_int("C4_BATCH_KV_FLUSH_INTERVAL", 0),
@@ -337,6 +344,9 @@ class BatchedPureNeuralRunner:
             "reused_token_slots": 0,
             "spec_fresh_bypass": 0,
             "unsafe_model_fresh_bypass": 0,
+            "bounded_evictions": 0,
+            "bounded_positions_evicted": 0,
+            "bounded_eviction_fallbacks": 0,
         }
         self._spec_stats = {}
         self._reset_spec_stats()
@@ -375,7 +385,11 @@ class BatchedPureNeuralRunner:
         first_attn = self.model.blocks[0].attn
         self._kv_cache_obj = LayerKVCache(
             num_layers=len(self.model.blocks),
-            max_tokens=self.kv_cache_max_tokens,
+            max_tokens=getattr(
+                self,
+                "_kv_cache_storage_max_tokens",
+                self.kv_cache_max_tokens,
+            ),
             num_heads=first_attn.num_heads,
             head_dim=first_attn.head_dim,
             device=self._device,
@@ -398,27 +412,214 @@ class BatchedPureNeuralRunner:
             if layer_cache.cached_k is None:
                 continue
             cur = layer_cache.cache_size
-            if keep_len >= cur:
+            pos_ids = getattr(layer_cache, "cached_pos_ids", None)
+            if pos_ids is not None and pos_ids.shape[-1] == cur:
+                keep_idx = (pos_ids[0] < keep_len).nonzero(
+                    as_tuple=False
+                ).flatten()
+                if int(keep_idx.numel()) == cur:
+                    layer_cache.next_pos_id = keep_len
+                    continue
+                if int(keep_idx.numel()) <= 0:
+                    self._clear_layer_kv_storage(
+                        layer_cache,
+                        next_pos_id=keep_len,
+                    )
+                else:
+                    self._index_select_layer_kv(
+                        layer_cache,
+                        keep_idx,
+                        next_pos_id=keep_len,
+                    )
                 continue
-            if keep_len <= 0:
-                layer_cache.cached_k = None
-                layer_cache.cached_v = None
-                layer_cache.cached_pos_ids = None
-                layer_cache.per_head_keep_mask = None
-                layer_cache.cache_size = 0
-                layer_cache.next_pos_id = 0
+
+            keep_count = min(keep_len, cur)
+            if keep_count >= cur:
+                continue
+            if keep_count <= 0:
+                self._clear_layer_kv_storage(layer_cache, next_pos_id=0)
             else:
-                layer_cache.cached_k = layer_cache.cached_k[:, :, :keep_len, :]
-                layer_cache.cached_v = layer_cache.cached_v[:, :, :keep_len, :]
-                if layer_cache.cached_pos_ids is not None:
-                    layer_cache.cached_pos_ids = layer_cache.cached_pos_ids[:, :keep_len]
-                if layer_cache.per_head_keep_mask is not None:
-                    layer_cache.per_head_keep_mask = layer_cache.per_head_keep_mask[
-                        :, :, :keep_len
-                    ]
-                layer_cache.cache_size = keep_len
-                layer_cache.next_pos_id = keep_len
+                keep_idx = torch.arange(
+                    keep_count,
+                    dtype=torch.long,
+                    device=layer_cache.cached_k.device,
+                )
+                self._index_select_layer_kv(
+                    layer_cache,
+                    keep_idx,
+                    next_pos_id=keep_count,
+                )
         self._kv_cached_rows = [row[:keep_len] for row in self._kv_cached_rows]
+
+    @staticmethod
+    def _clear_layer_kv_storage(layer_cache, *, next_pos_id: int = 0) -> None:
+        layer_cache.cached_k = None
+        layer_cache.cached_v = None
+        layer_cache.cached_pos_ids = None
+        layer_cache.per_head_keep_mask = None
+        layer_cache.cache_size = 0
+        layer_cache.next_pos_id = int(max(0, next_pos_id))
+        layer_cache.stats.current_size = 0
+
+    @staticmethod
+    def _index_select_layer_kv(layer_cache, keep_idx, *, next_pos_id: int) -> None:
+        layer_cache.cached_k = layer_cache.cached_k.index_select(
+            2, keep_idx
+        ).contiguous()
+        layer_cache.cached_v = layer_cache.cached_v.index_select(
+            2, keep_idx
+        ).contiguous()
+        if layer_cache.cached_pos_ids is not None:
+            layer_cache.cached_pos_ids = layer_cache.cached_pos_ids.index_select(
+                1, keep_idx
+            ).contiguous()
+        if layer_cache.per_head_keep_mask is not None:
+            layer_cache.per_head_keep_mask = (
+                layer_cache.per_head_keep_mask.index_select(2, keep_idx)
+                .contiguous()
+            )
+        layer_cache.cache_size = int(keep_idx.numel())
+        layer_cache.next_pos_id = int(max(0, next_pos_id))
+        layer_cache.stats.current_size = layer_cache.cache_size
+
+    @staticmethod
+    def _kv_position_is_protected(
+        pos: int,
+        *,
+        max_prefix_len: int,
+        protected_mem_positions: Optional[List[List[int]]],
+    ) -> bool:
+        if pos < max_prefix_len:
+            return True
+        if not protected_mem_positions:
+            return False
+        for starts in protected_mem_positions:
+            for start in starts:
+                start = int(start)
+                if start <= pos < start + 9:
+                    return True
+        return False
+
+    def _kv_cache_append_is_aligned(
+        self,
+        cached_prefix_len: int,
+        new_tokens: int,
+    ) -> bool:
+        """Return True when bounded overflow can append without stale K/V.
+
+        This intentionally rejects cold/rebuild overflow. A full forward with
+        ``S > max_tokens`` would let ``TransformerKVCache.update`` discard K/V
+        before attention consumes it. The bounded path is only valid when the
+        existing cache is an ordered suffix ending at ``cached_prefix_len - 1``
+        and has enough physical overshoot room for the next incremental suffix.
+        """
+        if self._kv_cache_obj is None or cached_prefix_len <= 0 or new_tokens <= 0:
+            return False
+        for layer_cache in self._kv_cache_obj.caches:
+            if layer_cache.cached_k is None:
+                return False
+            pos_ids = getattr(layer_cache, "cached_pos_ids", None)
+            if pos_ids is None or pos_ids.shape[-1] != layer_cache.cache_size:
+                return False
+            if layer_cache.cache_size <= 0:
+                return False
+            if layer_cache.cache_size + new_tokens > layer_cache.max_tokens:
+                return False
+            pos_1d = pos_ids[0]
+            if int(pos_1d[-1].item()) != cached_prefix_len - 1:
+                return False
+            if int(layer_cache.next_pos_id) != cached_prefix_len:
+                return False
+            if bool((pos_1d >= cached_prefix_len).any().item()):
+                return False
+            if pos_1d.numel() > 1 and bool((pos_1d[1:] <= pos_1d[:-1]).any().item()):
+                return False
+        return True
+
+    def _prune_kv_cache_to_budget(
+        self,
+        *,
+        max_tokens: int,
+        protected_prefix_lens: Optional[List[int]],
+        protected_mem_positions: Optional[List[List[int]]],
+    ) -> Tuple[bool, int]:
+        """Prune old unprotected cached positions back to ``max_tokens``.
+
+        Protected positions are the immutable bytecode/data prefix and tracked
+        MEM-store sections. Those are known long-range dependencies for fetch
+        and neural memory loads, so if the requested budget cannot retain them
+        plus a small recent dynamic tail, the caller must discard the cache
+        instead of producing a silently stale bounded-cache result.
+        """
+        if self._kv_cache_obj is None:
+            return True, 0
+
+        ref = None
+        for layer_cache in self._kv_cache_obj.caches:
+            if layer_cache.cached_k is not None:
+                ref = layer_cache
+                break
+        if ref is None or ref.cache_size <= max_tokens:
+            return True, 0
+
+        ref_pos_ids = getattr(ref, "cached_pos_ids", None)
+        if ref_pos_ids is None or ref_pos_ids.shape[-1] != ref.cache_size:
+            return False, 0
+        positions = ref_pos_ids[0]
+        old_size = int(ref.cache_size)
+
+        for layer_cache in self._kv_cache_obj.caches:
+            if layer_cache.cached_k is None:
+                continue
+            pos_ids = getattr(layer_cache, "cached_pos_ids", None)
+            if (
+                layer_cache.cache_size != old_size
+                or pos_ids is None
+                or pos_ids.shape[-1] != old_size
+                or not torch.equal(pos_ids[0].to(positions.device), positions)
+            ):
+                return False, 0
+
+        max_prefix_len = max(protected_prefix_lens or [0])
+        protected_flags = [
+            self._kv_position_is_protected(
+                int(pos),
+                max_prefix_len=max_prefix_len,
+                protected_mem_positions=protected_mem_positions,
+            )
+            for pos in positions.tolist()
+        ]
+        protected_mask = torch.tensor(
+            protected_flags,
+            dtype=torch.bool,
+            device=positions.device,
+        )
+        protected_count = int(protected_mask.sum().item())
+        target = int(max(0, max_tokens))
+        if protected_count > target:
+            return False, 0
+
+        keep_unprotected_budget = target - protected_count
+        nonprotected_idx = (~protected_mask).nonzero(as_tuple=False).flatten()
+        nonprotected_count = int(nonprotected_idx.numel())
+        min_recent_dynamic = min(Token.STEP_TOKENS * 2, nonprotected_count)
+        if (
+            nonprotected_count > keep_unprotected_budget
+            and keep_unprotected_budget < min_recent_dynamic
+        ):
+            return False, 0
+
+        keep_mask = protected_mask.clone()
+        if keep_unprotected_budget > 0 and nonprotected_count > 0:
+            keep_mask[nonprotected_idx[-keep_unprotected_budget:]] = True
+        keep_idx = keep_mask.nonzero(as_tuple=False).flatten()
+        if int(keep_idx.numel()) == old_size:
+            return True, 0
+        if int(keep_idx.numel()) <= 0 or int(keep_idx[-1].item()) != old_size - 1:
+            return False, 0
+
+        self._kv_cache_obj.prune(keep_idx)
+        return True, old_size - int(keep_idx.numel())
 
     def _batched_kv_common_prefix(
         self, active_idx: List[int], sequences: List[List[int]]
@@ -444,6 +645,8 @@ class BatchedPureNeuralRunner:
         *,
         first_logit_pos: int,
         allow_kv: bool = True,
+        protected_prefix_lens: Optional[List[int]] = None,
+        protected_mem_positions: Optional[List[List[int]]] = None,
     ) -> Tuple[List[List[int]], int, List[int]]:
         """Forward a padded active batch and return argmax rows.
 
@@ -477,16 +680,6 @@ class BatchedPureNeuralRunner:
         max_len = padded.shape[1]
         first_logit_pos = int(max(0, min(first_logit_pos, max_len - 1)))
 
-        # If the requested tensor itself is larger than the hard cache window,
-        # running through KV would evict keys before attention uses them. Keep
-        # correctness simple: count the pressure and use the fresh path.
-        if max_len > self.kv_cache_max_tokens:
-            self._kv_stats["eviction_pressure"] += 1
-            self._reset_kv_cache()
-            self._kv_stats["fresh_forwards"] += 1
-            logits = self.model.forward(padded)
-            return logits.argmax(dim=-1).cpu().tolist(), 0, real_lens
-
         if (
             self.kv_flush_interval > 0
             and self._kv_incremental_count >= self.kv_flush_interval
@@ -496,6 +689,20 @@ class BatchedPureNeuralRunner:
         prefix_match = self._batched_kv_common_prefix(active_idx, sequences)
         cached_prefix_len = min(prefix_match, first_logit_pos)
         self._trim_kv_cache(cached_prefix_len)
+
+        bounded_overflow = max_len > self.kv_cache_max_tokens
+        if bounded_overflow:
+            self._kv_stats["eviction_pressure"] += 1
+            new_tokens = max_len - cached_prefix_len
+            if not self._kv_cache_append_is_aligned(
+                cached_prefix_len,
+                new_tokens,
+            ):
+                self._kv_stats["bounded_eviction_fallbacks"] += 1
+                self._reset_kv_cache()
+                self._kv_stats["fresh_forwards"] += 1
+                logits = self.model.forward(padded)
+                return logits.argmax(dim=-1).cpu().tolist(), 0, real_lens
 
         kv_cache = self._get_or_build_kv_cache()
         self._kv_stats["calls"] += 1
@@ -528,10 +735,25 @@ class BatchedPureNeuralRunner:
                 self._reset_kv_cache()
                 return fresh_preds, 0, real_lens
 
+        cache_still_valid = True
+        if bounded_overflow:
+            cache_still_valid, evicted = self._prune_kv_cache_to_budget(
+                max_tokens=self.kv_cache_max_tokens,
+                protected_prefix_lens=protected_prefix_lens,
+                protected_mem_positions=protected_mem_positions,
+            )
+            if not cache_still_valid:
+                self._kv_stats["bounded_eviction_fallbacks"] += 1
+                self._reset_kv_cache()
+            elif evicted > 0:
+                self._kv_stats["bounded_evictions"] += 1
+                self._kv_stats["bounded_positions_evicted"] += evicted
+
         self._kv_stats["hits"] += int(cached_prefix_len > 0)
-        self._kv_active_idx = tuple(active_idx)
-        self._kv_cached_rows = [list(seq) for seq in sequences]
-        self._kv_incremental_count += 1
+        if cache_still_valid:
+            self._kv_active_idx = tuple(active_idx)
+            self._kv_cached_rows = [list(seq) for seq in sequences]
+            self._kv_incremental_count += 1
         return cached_preds, cached_prefix_len, real_lens
 
     # ------------------------------------------------------------------
@@ -947,6 +1169,10 @@ class BatchedPureNeuralRunner:
                 windowed,
                 active_idx,
                 first_logit_pos=min(len(seq) for seq in windowed) - 1,
+                protected_prefix_lens=[states[i].prefix_len for i in active_idx],
+                protected_mem_positions=[
+                    states[i].mem_store_positions for i in active_idx
+                ],
             )
             for b, i in enumerate(active_idx):
                 last_pos = real_lens[b] - 1
@@ -1089,6 +1315,10 @@ class BatchedPureNeuralRunner:
                 active_idx,
                 first_logit_pos=min(real_prefix_lens) - 1,
                 allow_kv=not any(drafts),
+                protected_prefix_lens=[states[i].prefix_len for i in active_idx],
+                protected_mem_positions=[
+                    states[i].mem_store_positions for i in active_idx
+                ],
             )
 
             # 3) For each element: verify drafts and replay accepted prefix + correction.
