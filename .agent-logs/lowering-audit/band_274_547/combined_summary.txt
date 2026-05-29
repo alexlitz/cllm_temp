@@ -1,0 +1,1 @@
+[1096-lowering-summary] selected=274 clean=0 fatal_rows=273 info_only_rows=1 fatal_failures=6002 info_failures=4231 errors=0 skipped=0 wrong_token_failures=10030 band_only_failures=194 band_margin_failures=194 assert_mode=off print_mode=drift min_margin=0.5 output_band_min_margin=0.5 output_band_max_inactive=1e+30 context_window=512 chunk_tokens=512
