@@ -1502,18 +1502,88 @@ class BatchedPureNeuralRunner:
             op, _imm = fetched
         return int(op) not in _SPEC_UNSAFE_OPS
 
+    def _current_step_store_mem_marker(
+        self, s: _ElementState, context: List[int]
+    ) -> Optional[int]:
+        """Return the position of the current step's MEM marker if it has
+        already been emitted and the current step's instruction is a store op.
+
+        L15 / L16 lookup rules require ``MEM_STORE=1`` at the MEM marker BEFORE
+        the model predicts MEM_addr0. Historical store MEM markers get this
+        flag via ``mem_store_positions`` (set after STEP_END via
+        ``_track_mem_access``), but the *current* step's marker would be
+        missing until STEP_END dispatch — so the model emits MEM_addr0 without
+        the store-context flag and can pick a wrong address (e.g. ENT's
+        push-BP target ``0xfff0`` collapsing to ``0xffe0`` because the L14
+        attention sources the post-locals SP instead of the post-push SP).
+
+        Returns the absolute position of the MEM marker in ``context``, or
+        ``None`` if the current step's marker is not present, the current
+        instruction is not a store, or the step has already ended.
+        """
+        # Scan backward over at most one VM step.
+        scan_back = Token.STEP_TOKENS + 2
+        end = len(context)
+        start = max(0, end - scan_back)
+        for i in range(end - 1, start - 1, -1):
+            t = context[i]
+            if t == Token.STEP_END or t == Token.HALT or t == Token.TOOL_CALL:
+                # The step ended after this marker, so any prior MEM belongs
+                # to a previous step already tracked via mem_history.
+                return None
+            if t == Token.MEM:
+                exec_pc = s.exec_pc()
+                exec_idx = exec_pc // INSTR_WIDTH
+                if 0 <= exec_idx < len(s.bytecode):
+                    op = s.bytecode[exec_idx] & 0xFF
+                    if op in _MEM_STORE_OPS:
+                        return i
+                return None
+        return None
+
+    def _add_current_step_marker(
+        self,
+        positions: List[int],
+        current_marker_abs: Optional[int],
+        windowed: List[int],
+        *,
+        absolute_to_windowed: int = 0,
+    ) -> List[int]:
+        """Return ``positions`` augmented with the current-step MEM marker.
+
+        ``current_marker_abs`` is the marker position in the element's full
+        context. ``absolute_to_windowed`` is the offset added to map from
+        absolute context positions to positions in ``windowed`` (zero when
+        no windowing happened, otherwise compensates for trimmed dynamic
+        tokens and any re-injected mem history).
+        """
+        if current_marker_abs is None:
+            return positions
+        windowed_pos = current_marker_abs + absolute_to_windowed
+        if not (0 <= windowed_pos < len(windowed)):
+            return positions
+        if windowed[windowed_pos] != Token.MEM:
+            return positions
+        if windowed_pos in positions:
+            return positions
+        return sorted(set(positions) | {windowed_pos})
+
     def _windowed_context(
         self, s: _ElementState, max_context_window: int
     ) -> List[int]:
         dynamic_full = s.context[s.prefix_len:]
+        current_marker_abs = self._current_step_store_mem_marker(s, s.context)
         if len(dynamic_full) <= max_context_window:
             # The current context still contains every emitted MEM section.
             # Keep the byte stream identical to the model's actual
             # autoregressive context, but still mark tracked store MEM rows so
             # L15 can distinguish historical stores from ordinary MEM traces.
             s.mem_history_end = 0
-            s.mem_store_positions = _mem_section_positions(
+            positions = _mem_section_positions(
                 s.context, s.mem_access_order, s.mem_history
+            )
+            s.mem_store_positions = self._add_current_step_marker(
+                positions, current_marker_abs, s.context
             )
             return s.context[:]
 
@@ -1535,8 +1605,19 @@ class BatchedPureNeuralRunner:
                 mem_tokens.extend(section)
         s.mem_history_end = s.prefix_len + len(mem_tokens) if mem_tokens else 0
         windowed = s.context[: s.prefix_len] + mem_tokens + dynamic
-        s.mem_store_positions = _mem_section_positions(
+        positions = _mem_section_positions(
             windowed, s.mem_access_order, s.mem_history
+        )
+        # When the dynamic tail is trimmed, the absolute-to-windowed shift is
+        # ``len(mem_tokens) - (len(dynamic_full) - len(dynamic))``: prefix
+        # stays in place, mem-history tokens come right after, and the
+        # surviving dynamic tail follows them.
+        dynamic_dropped = len(dynamic_full) - len(dynamic)
+        s.mem_store_positions = self._add_current_step_marker(
+            positions,
+            current_marker_abs,
+            windowed,
+            absolute_to_windowed=len(mem_tokens) - dynamic_dropped,
         )
         return windowed
 
