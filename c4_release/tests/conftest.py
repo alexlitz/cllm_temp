@@ -61,6 +61,15 @@ HAS_GPU = DEVICE.type in ("cuda", "mps")
 # Pytest Markers
 # =============================================================================
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--runslow",
+        action="store_true",
+        default=False,
+        help="run tests marked slow",
+    )
+
+
 def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line("markers", "slow: marks tests as slow (skip with -m 'not slow')")
@@ -73,12 +82,38 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-skip GPU tests if no GPU available."""
+    """Auto-skip GPU and opt-in slow tests."""
     if not HAS_GPU:
         skip_gpu = pytest.mark.skip(reason="No GPU available")
         for item in items:
             if "gpu" in item.keywords:
                 item.add_marker(skip_gpu)
+
+    if not config.getoption("--runslow"):
+        slow_items = [item for item in items if "slow" in item.keywords]
+        if slow_items:
+            items[:] = [item for item in items if item not in slow_items]
+            config.hook.pytest_deselected(items=slow_items)
+
+
+# =============================================================================
+# Fixtures - Declarative Verifier (shared across per-layer audit harnesses)
+# =============================================================================
+
+@pytest.fixture(scope="session")
+def static_claims_report():
+    """Run ``verify_claims_static`` once per pytest session.
+
+    The verifier builds the production layout + a fresh ``AutoregressiveVM``
+    and runs every annotated op's bake under diff-based instrumentation
+    (~25-60s wall on the current model). Per-layer audit harnesses
+    (``test_l0_marker_transitions.py``, ``test_l2_mem_byte_flags.py``,
+    ``test_l4_pc_relay.py``, etc.) all read the same report; sharing it
+    at session scope keeps the audit's wall-clock cost flat regardless
+    of how many per-layer modules are added.
+    """
+    from neural_vm.unified_compiler.decl_verifier import verify_claims_static
+    return verify_claims_static()
 
 
 # =============================================================================
