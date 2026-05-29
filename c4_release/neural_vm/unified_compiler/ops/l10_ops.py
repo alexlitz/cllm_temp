@@ -1668,6 +1668,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_SC", -1000000.0),
                 ("OP_LI", -1000000.0),
                 ("OP_LC", -1000000.0),
+                # Wide ALU ops (MUL/DIV/MOD) can leak a multi-byte
+                # intermediate through L3's SP-carry EMBED relay; block on
+                # the e0→e8 base too so expr_mul_div_* SP byte 0 keeps the
+                # initial 0x00 instead of drifting to a binary-pop target.
+                ("OP_MUL", -1000000.0),
+                ("OP_DIV", -1000000.0),
+                ("OP_MOD", -1000000.0),
                 ("PSH_AT_SP", -1000000.0),
                 ("MEM_STORE", -100000.0),
                 ("IS_BYTE", -100.0),
@@ -1705,6 +1712,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("MARK_MEM", -100.0),
                     ("OP_ENT", -1000000.0),
                     ("OP_LEV", -1000000.0),
+                    # Wide ALU ops can leak through L3's SP-carry EMBED relay;
+                    # block analogous to f0→f8 to keep expr_mul_div_* SP byte 0
+                    # at the initial 0x00 rather than the binary-pop d8 target.
+                    ("OP_MUL", -1000000.0),
+                    ("OP_DIV", -1000000.0),
+                    ("OP_MOD", -1000000.0),
                     ("PSH_AT_SP", -1000000.0),
                     ("MEM_STORE", -100000.0),
                     ("IS_BYTE", -100.0),
@@ -1729,6 +1742,15 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("MARK_MEM", -100.0),
                     ("OP_ENT", -1000000.0),
                     ("OP_LEV", -1000000.0),
+                    # Wide ALU ops (MUL/DIV/MOD) can leak a multi-byte
+                    # intermediate into the L3 SP-carry EMBED relay; without
+                    # explicit blockers the (CMP+3, EMBED_LO+0, EMBED_HI+15)
+                    # signature drifts into the f0→f8 trigger and rewrites
+                    # SP byte 0 with 0xF8 at expr_mul_div_* tests where the
+                    # intermediate ``a*b > 255`` (regression on ids 854-873).
+                    ("OP_MUL", -1000000.0),
+                    ("OP_DIV", -1000000.0),
+                    ("OP_MOD", -1000000.0),
                     ("PSH_AT_SP", -1000000.0),
                     ("MEM_STORE", -100000.0),
                     ("IS_BYTE", -100.0),
@@ -1752,6 +1774,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("MARK_MEM", -100.0),
                     ("OP_ENT", -1000000.0),
                     ("OP_LEV", -1000000.0),
+                    # Wide ALU ops can leak through L3's SP-carry EMBED relay;
+                    # block analogous to f0→f8 to avoid spurious SP byte 0
+                    # rewrites in expr_mul_div_* multi-byte intermediates.
+                    ("OP_MUL", -1000000.0),
+                    ("OP_DIV", -1000000.0),
+                    ("OP_MOD", -1000000.0),
                     ("PSH_AT_SP", -1000000.0),
                     ("MEM_STORE", -100000.0),
                     ("IS_BYTE", -100.0),
