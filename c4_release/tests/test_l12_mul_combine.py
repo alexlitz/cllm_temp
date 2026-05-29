@@ -251,20 +251,6 @@ def test_l12_mul_combine_no_fire_when_gate_missing(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Drift surfaced by audit harness: "
-        "(1) make_layer12_mul_combine_op() no longer accepts alu_mode kwarg; "
-        "(2) the op STILL declares consumes_fresh={..., 'MUL_ACCUM': "
-        "'AX_byte0'} -- the prior STALENESS VIOLATION the test sentinel was "
-        "written to pin against. It must be corrected to 'TEMP' since the "
-        "bake _set_layer12_mul_combine reads BD.TEMP+partial (slot 480+), "
-        "and L11's bake writes BD.TEMP+partial as well -- but both ops "
-        "still declare the legacy 'MUL_ACCUM' name. Resolve by re-declaring "
-        "L11 produces / L12 consumes_fresh under 'TEMP'."
-    ),
-    strict=False,
-)
 def test_l12_mul_combine_op_consumes_temp_not_mul_accum():
     """REGRESSION SENTINEL.
 
@@ -297,17 +283,6 @@ def test_l12_mul_combine_op_consumes_temp_not_mul_accum():
     assert op.consumes_fresh.get("AX_CARRY_LO") == "AX_byte0"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "make_layer12_mul_combine_op() no longer accepts alu_mode kwarg. "
-        "Additionally, the op declares writes={'OUTPUT_LO', 'OUTPUT_HI'} "
-        "(both) at the Operation level even though produces={'OUTPUT_HI': "
-        "'AX_byte0'} is single-sided. Until the factory signature is "
-        "restored (or the audit harness is rewritten to drop alu_mode), "
-        "this test cannot construct the op."
-    ),
-    strict=False,
-)
 def test_l12_mul_combine_op_produces_output_hi_not_output_lo():
     """``_set_layer12_mul_combine`` writes only OUTPUT_HI -- the lo
     nibble was already populated by L10's MUL units. The op's
@@ -319,16 +294,6 @@ def test_l12_mul_combine_op_produces_output_hi_not_output_lo():
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Same TEMP-vs-MUL_ACCUM declaration drift as the consumes_fresh "
-        "test above. The compiled staleness registry has no ('TEMP', "
-        "'AX_byte0') consumer entry because L12 declares consumes_fresh "
-        "under 'MUL_ACCUM'. Test becomes green once L12 consumes_fresh "
-        "is corrected to 'TEMP' and L11 produces is corrected likewise."
-    ),
-    strict=False,
-)
 def test_l12_mul_combine_in_compiled_staleness_registry_has_in_step_producer():
     """The compiled staleness registry MUST resolve L12's TEMP@AX_byte0
     consumer to L11's producer at a lower phase. If a future change

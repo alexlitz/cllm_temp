@@ -195,19 +195,6 @@ def test_l11_mul_partial_no_fire_when_gate_missing(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Declaration drift surfaced by audit harness: "
-        "(1) make_layer11_mul_partial_op() no longer accepts alu_mode kwarg; "
-        "(2) the op declares produces={'MUL_ACCUM': 'AX_byte0'} but the bake "
-        "_set_layer11_mul_partial actually writes BD.TEMP+partial (slot 480+), "
-        "not BD.MUL_ACCUM (slot 420). The 'MUL_ACCUM' alias-to-TEMP claim in "
-        "the op docstring is not realized in vm_step bands. Resolve by either "
-        "(a) re-declaring produces={'TEMP': 'AX_byte0'} or (b) re-baking to "
-        "BD.MUL_ACCUM+partial."
-    ),
-    strict=False,
-)
 def test_l11_mul_partial_op_declares_temp_production_at_ax_byte0():
     """``layer11_mul_partial`` in lookup mode declares it produces
     ``TEMP@AX_byte0`` and consumes ``ALU_LO/HI`` + ``AX_CARRY_LO/HI`` at
@@ -224,18 +211,6 @@ def test_l11_mul_partial_op_declares_temp_production_at_ax_byte0():
     }
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Same drift as the produces-declaration test above: L11's op "
-        "declares produces={'MUL_ACCUM': 'AX_byte0'} so the staleness "
-        "registry keys this under MUL_ACCUM, not TEMP. The bake actually "
-        "writes BD.TEMP+partial. Until the declaration <-> bake disagreement "
-        "is reconciled, the registry will not contain a ('TEMP', 'AX_byte0') "
-        "producer entry. Test becomes green once produces is corrected to "
-        "'TEMP' (matching the bake's actual residual band)."
-    ),
-    strict=False,
-)
 def test_l11_mul_partial_in_compiled_staleness_registry():
     """The compiled staleness registry must list ``layer11_mul_partial`` as
     the sole producer of ``TEMP@AX_byte0`` so L12 (the only consumer) sees
