@@ -520,8 +520,14 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("ALU_LO+7", -10.0),
             ("ALU_LO+10", -10.0),
             ("ALU_LO+14", -10.0),
+            # Require L14 PSH-address evidence that the emitted low
+            # nibble is 0 (i.e. 0xE0). Without this guard the rule fires
+            # on PSH-after-ENT-0 where the SP-derived target is 0xE8
+            # (L14 emits OUTPUT_LO+8 there).
+            ("OUTPUT_LO+0", 1.0),
+            ("OUTPUT_LO+8", -10.0),
         ),
-        threshold=8.5,
+        threshold=10.5,
         writes=Primitives.byte_value_writes(0xE0, strength=200_000.0),
     ))
 
