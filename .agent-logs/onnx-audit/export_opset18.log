@@ -1,0 +1,145 @@
+=== HEAD (first 80 lines) ===
+[export_onnx] Building production model via compile_full_vm()...
+[export_onnx] Model built. d_model=736, n_layers=32, vocab=276, max_seq_len=8192
+[export_onnx] Sample input shape: (1, 32) (dtype=torch.int64)
+[export_onnx] Sanity: running eager forward...
+[export_onnx] Eager forward OK. Output shape: (1, 32, 276)
+[export_onnx] Calling torch.onnx.export (opset=18, dynamo=False)...
+Torch IR graph at exception: graph(%input : Long(1, *, strides=[32, 1], requires_grad=0, device=cpu),
+      %1 : Long(requires_grad=0, device=cpu),
+      %embed.embed.weight : Float(276, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.0.attn.W_q : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.0.attn.W_k : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.0.attn.W_v : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.0.attn.W_o : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.0.attn.alibi_slopes : Float(8, strides=[1], requires_grad=0, device=cpu),
+      %blocks.0.ffn.W_up : Float(7, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.0.ffn.b_up : Float(7, strides=[1], requires_grad=1, device=cpu),
+      %blocks.0.ffn.W_gate : Float(7, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.0.ffn.b_gate : Float(7, strides=[1], requires_grad=1, device=cpu),
+      %blocks.0.ffn.W_down : Float(736, 7, strides=[7, 1], requires_grad=1, device=cpu),
+      %blocks.0.ffn.b_down : Float(736, strides=[1], requires_grad=1, device=cpu),
+      %blocks.1.attn.W_q : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.1.attn.W_k : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.1.attn.W_v : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.1.attn.W_o : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.1.attn.alibi_slopes : Float(8, strides=[1], requires_grad=0, device=cpu),
+      %blocks.1.ffn.W_up : Float(5, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.1.ffn.b_up : Float(5, strides=[1], requires_grad=1, device=cpu),
+      %blocks.1.ffn.W_gate : Float(5, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.1.ffn.b_gate : Float(5, strides=[1], requires_grad=1, device=cpu),
+      %blocks.1.ffn.W_down : Float(736, 5, strides=[5, 1], requires_grad=1, device=cpu),
+      %blocks.1.ffn.b_down : Float(736, strides=[1], requires_grad=1, device=cpu),
+      %blocks.2.attn.W_q : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.2.attn.W_k : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.2.attn.W_v : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.2.attn.W_o : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.2.attn.alibi_slopes : Float(8, strides=[1], requires_grad=0, device=cpu),
+      %blocks.2.ffn.W_up : Float(10, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.2.ffn.b_up : Float(10, strides=[1], requires_grad=1, device=cpu),
+      %blocks.2.ffn.W_gate : Float(10, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.2.ffn.b_gate : Float(10, strides=[1], requires_grad=1, device=cpu),
+      %blocks.2.ffn.W_down : Float(736, 10, strides=[10, 1], requires_grad=1, device=cpu),
+      %blocks.2.ffn.b_down : Float(736, strides=[1], requires_grad=1, device=cpu),
+      %blocks.3.attn.W_q : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.3.attn.W_k : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.3.attn.W_v : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.3.attn.W_o : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.3.attn.alibi_slopes : Float(8, strides=[1], requires_grad=0, device=cpu),
+      %blocks.3.ffn.W_up : Float(134, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.3.ffn.b_up : Float(134, strides=[1], requires_grad=1, device=cpu),
+      %blocks.3.ffn.W_gate : Float(134, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.3.ffn.b_gate : Float(134, strides=[1], requires_grad=1, device=cpu),
+      %blocks.3.ffn.W_down : Float(736, 134, strides=[134, 1], requires_grad=1, device=cpu),
+      %blocks.3.ffn.b_down : Float(736, strides=[1], requires_grad=1, device=cpu),
+      %blocks.4.attn.W_q : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.4.attn.W_k : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.4.attn.W_v : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.4.attn.W_o : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.4.attn.alibi_slopes : Float(8, strides=[1], requires_grad=0, device=cpu),
+      %blocks.4.ffn.W_up : Float(543, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.4.ffn.b_up : Float(543, strides=[1], requires_grad=1, device=cpu),
+      %blocks.4.ffn.W_gate : Float(543, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.4.ffn.b_gate : Float(543, strides=[1], requires_grad=1, device=cpu),
+      %blocks.4.ffn.W_down : Float(736, 543, strides=[543, 1], requires_grad=1, device=cpu),
+      %blocks.4.ffn.b_down : Float(736, strides=[1], requires_grad=1, device=cpu),
+      %blocks.5.attn.W_q : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.5.attn.W_k : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.5.attn.W_v : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.5.attn.W_o : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.5.attn.alibi_slopes : Float(8, strides=[1], requires_grad=0, device=cpu),
+      %blocks.5.ffn.W_up : Float(88, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.5.ffn.b_up : Float(88, strides=[1], requires_grad=1, device=cpu),
+      %blocks.5.ffn.W_gate : Float(88, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.5.ffn.b_gate : Float(88, strides=[1], requires_grad=1, device=cpu),
+      %blocks.5.ffn.W_down : Float(736, 88, strides=[88, 1], requires_grad=1, device=cpu),
+      %blocks.5.ffn.b_down : Float(736, strides=[1], requires_grad=1, device=cpu),
+      %blocks.6.attn.W_q : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.6.attn.W_k : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.6.attn.W_v : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.6.attn.W_o : Float(736, 736, strides=[736, 1], requires_grad=1, device=cpu),
+      %blocks.6.attn.alibi_slopes : Float(8, strides=[1], requires_grad=0, device=cpu),
+
+=== ... (full log trimmed; ~103k lines of torch IR graph dump removed) ===
+
+=== TAIL (last 60 lines) ===
+  %1344048 : Float(1, 8, 32, 1, strides=[256, 32, 1, 1], requires_grad=1, device=cpu) = aten::sub(%1120098, %1344043, %1386004), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:576:0
+  %1344049 : Float(1, 8, 32, 1, strides=[256, 32, 1, 1], requires_grad=1, device=cpu) = aten::exp(%1344048), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:576:0
+  %1344054 : Float(1, 8, 32, 1, strides=[256, 32, 1, 1], requires_grad=1, device=cpu) = aten::sum(%1344046, %1344086, %1386026, %1119845), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:577:0
+  %1344056 : Float(1, 8, 32, 1, strides=[256, 32, 1, 1], requires_grad=1, device=cpu) = aten::add(%1344049, %1344054, %1386004), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:577:0
+  %1344057 : Float(1, 8, 32, 32, strides=[8192, 1024, 32, 1], requires_grad=1, device=cpu) = aten::div(%1344046, %1344056), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:577:0
+  %1344058 : Float(1, 8, 32, 92, strides=[23552, 2944, 92, 1], requires_grad=1, device=cpu) = aten::matmul(%1344057, %1343946), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:580:0
+  %1344061 : Float(1, 32, 8, 92, strides=[23552, 92, 2944, 1], requires_grad=1, device=cpu) = aten::transpose(%1344058, %1386004, %1386017), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:592:0
+  %1344063 : Float(1, 32, 8, 92, strides=[23552, 736, 92, 1], requires_grad=1, device=cpu) = aten::contiguous(%1344061, %1386010), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:592:0
+  %1344065 : int[] = prim::ListConstruct(%1343904, %1343911, %1386027), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn
+  %1344066 : Float(1, 32, 736, strides=[23552, 736, 1], requires_grad=1, device=cpu) = aten::view(%1344063, %1344065), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:592:0
+  %1344068 : Float(1, 32, 736, strides=[23552, 736, 1], requires_grad=1, device=cpu) = aten::linear(%1344066, %blocks.31.attn.W_o, %1119845), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:593:0
+  %1344070 : Float(1, 32, 736, strides=[23552, 736, 1], requires_grad=1, device=cpu) = aten::add(%1343902, %1344068, %1386004), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.vm_step.AutoregressiveAttention::attn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:593:0
+  %1344072 : Float(1, 32, 2091, strides=[66912, 2091, 1], requires_grad=1, device=cpu) = aten::linear(%1344070, %blocks.31.ffn.W_up, %1119845), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.base_layers.PureFFN::ffn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/base_layers.py:82:0
+  %up : Float(1, 32, 2091, strides=[66912, 2091, 1], requires_grad=1, device=cpu) = aten::add(%1344072, %blocks.31.ffn.b_up, %1386004), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.base_layers.PureFFN::ffn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/base_layers.py:82:0
+  %1344076 : Float(1, 32, 2091, strides=[66912, 2091, 1], requires_grad=1, device=cpu) = aten::linear(%1344070, %blocks.31.ffn.W_gate, %1119845), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.base_layers.PureFFN::ffn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/base_layers.py:83:0
+  %1344078 : Float(1, 32, 2091, strides=[66912, 2091, 1], requires_grad=1, device=cpu) = aten::add(%1344076, %blocks.31.ffn.b_gate, %1386004), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.base_layers.PureFFN::ffn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/base_layers.py:83:0
+  %1344079 : Float(1, 32, 2091, strides=[66912, 2091, 1], requires_grad=1, device=cpu) = aten::silu(%up), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.base_layers.PureFFN::ffn # /home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/nn/functional.py:2395:0
+  %1344080 : Float(1, 32, 2091, strides=[66912, 2091, 1], requires_grad=1, device=cpu) = aten::mul(%1344079, %1344078), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.base_layers.PureFFN::ffn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/base_layers.py:84:0
+  %1344081 : Float(1, 32, 736, strides=[23552, 736, 1], requires_grad=1, device=cpu) = aten::linear(%1344080, %blocks.31.ffn.W_down, %blocks.31.ffn.b_down), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.base_layers.PureFFN::ffn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/base_layers.py:85:0
+  %1344083 : Float(1, 32, 736, strides=[23552, 736, 1], requires_grad=1, device=cpu) = aten::add(%1344070, %1344081, %1386004), scope: neural_vm.vm_step.AutoregressiveVM::/neural_vm.vm_step.TransformerBlock::blocks.31/neural_vm.base_layers.PureFFN::ffn # /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/base_layers.py:85:0
+  %1344084 : Float(1, 32, 276, strides=[8832, 276, 1], requires_grad=1, device=cpu) = aten::linear(%1344083, %head.weight, %head.bias), scope: neural_vm.vm_step.AutoregressiveVM::/torch.nn.modules.linear.Linear::head # /home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/nn/modules/linear.py:134:0
+  return (%1344084)
+
+
+[export_onnx] === captured stdout ===
+(empty)
+
+[export_onnx] === captured stderr ===
+(empty)
+
+[export_onnx] === captured warnings (4) ===
+  [0] DeprecationWarning (/home/alexlitz/Documents/misc/c4_release/c4_release/scripts/export_onnx.py:109): You are using the legacy TorchScript-based ONNX export. Starting in PyTorch 2.9, the new torch.export-based ONNX exporter has become the default. Learn more about the new export logic: https://docs.pytorch.org/docs/stable/onnx_export.html. For exporting control flow: https://pytorch.org/tutorials/beginner/onnx/export_control_flow_model_to_onnx_tutorial.html
+  [1] DeprecationWarning (/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/_internal/torchscript_exporter/utils.py:218): The feature will be removed. Please remove usage of this function
+  [2] TracerWarning (/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/alu/ops/divmod_longdiv.py:284): Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  [3] TracerWarning (/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/alu/ops/divmod_longdiv.py:284): Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+
+[export_onnx] === EXPORT FAILED ===
+  Exception type: UnsupportedOperatorError
+  Exception message: Exporting the operator 'aten::cummax' to ONNX opset version 18 is not supported
+
+[export_onnx] Traceback:
+Traceback (most recent call last):
+  File "/home/alexlitz/Documents/misc/c4_release/c4_release/scripts/export_onnx.py", line 109, in attempt_export
+    torch.onnx.export(
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/__init__.py", line 341, in export
+    export(
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/_internal/torchscript_exporter/utils.py", line 552, in export
+    _export(
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/_internal/torchscript_exporter/utils.py", line 1513, in _export
+    graph, params_dict, torch_out = _model_to_graph(
+                                    ^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/_internal/torchscript_exporter/utils.py", line 1116, in _model_to_graph
+    graph = _optimize_graph(
+            ^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/_internal/torchscript_exporter/utils.py", line 689, in _optimize_graph
+    graph = _C._jit_pass_onnx(graph, operator_export_type)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/_internal/torchscript_exporter/utils.py", line 1794, in _run_symbolic_function
+    raise errors.UnsupportedOperatorError(
+torch.onnx.errors.UnsupportedOperatorError: Exporting the operator 'aten::cummax' to ONNX opset version 18 is not supported
