@@ -1,0 +1,176 @@
+======================================================================
+C4 TRANSFORMER VM - C RUNTIME TEST SUITE
+======================================================================
+
+Step 1: Compiling C runtime
+----------------------------------------------------------------------
+Compiling C runtime...
+  Source: bundler/simple_c_runtime.c
+  Output: /tmp/tmpyucj8p86
+  ERROR: Compilation failed
+  stderr: bundler/simple_c_runtime.c: In function ‘main’:
+bundler/simple_c_runtime.c:74:25: error: ‘program_data_len’ undeclared (first use in this function)
+   74 |     for (int i = 0; i < program_data_len; i++) {
+      |                         ^~~~~~~~~~~~~~~~
+bundler/simple_c_runtime.c:74:25: note: each undeclared identifier is reported only once for each function it appears in
+bundler/simple_c_runtime.c:75:45: error: ‘program_data’ undeclared (first use in this function)
+   75 |         mem_set(0x10000 + i, (unsigned char)program_data[i]);
+      |                                             ^~~~~~~~~~~~
+bundler/simple_c_runtime.c:89:31: error: ‘program_code_len’ undeclared (first use in this function)
+   89 |         if (idx < 0 || idx >= program_code_len) break;
+      |                               ^~~~~~~~~~~~~~~~
+bundler/simple_c_runtime.c:91:14: error: ‘program_code’ undeclared (first use in this function)
+   91 |         op = program_code[idx][0];
+      |              ^~~~~~~~~~~~
+
+
+WARNING: C runtime compilation failed.
+This is expected - C runtime integration is still in development.
+Continuing with Python-only validation.
+
+Step 2: Generating test programs
+----------------------------------------------------------------------
+Running QUICK test suite (100 tests)
+
+Category breakdown:
+  arithmetic: 200
+  modulo: 50
+  variables: 100
+  conditionals: 100
+  loops: 100
+  functions: 150
+  recursion: 100
+  expressions: 100
+  gcd: 50
+  nested_functions: 50
+  edge_cases: 50
+  abs_diff: 25
+  boolean_logic: 25
+
+Step 3: Running tests through Python VM (baseline)
+----------------------------------------------------------------------
+  BRANCH OVERRIDE PATCH: 433 units gated
+  L7 DEAD-UNIT ZERO: 131 units suppressed
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'OPCODE_FLAGS' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_LO' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_HI' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L15_attn reads 'ADDR_KEY' but no prior layer writes it
+  RIGHT-SIZING FFNs (compiler-determined width):
+    L0.ffn: 7 units (no dead units)
+    L1.ffn: 5 units (no dead units)
+    L2.ffn: 10 units (no dead units)
+    L3.ffn: 4096 -> 134 units (-3962 dead)
+    L4.ffn: 544 -> 543 units (-1 dead)
+    L5.ffn: 4096 -> 88 units (-4008 dead)
+    L6.ffn: 2328 -> 1855 units (-473 dead)
+    L7.ffn: 4096 -> 1 units (-4095 dead)
+    L8.ffn: 2055 units (no dead units)
+    L8.post_ops[0].pipeline.1.add_layer.ffn: 6 units (no dead units)
+    L8.post_ops[0].pipeline.1.sub_layer.ffn: 7 units (no dead units)
+    L8.post_ops[0].pipeline.2.add_layer.flat_ffn: 60 units (no dead units)
+    L8.post_ops[0].pipeline.2.sub_layer.flat_ffn: 60 units (no dead units)
+    L8.post_ops[0].pipeline.3.add_layer.ffn: 10 units (no dead units)
+    L8.post_ops[0].pipeline.3.sub_layer.ffn: 10 units (no dead units)
+    L8.post_ops[0].pipeline.4.ge_to_bd.ffn: 64 units (no dead units)
+    L9.ffn: 3405 units (no dead units)
+    L9.post_ops[0].pipeline.1.add_layer.ffn: 6 units (no dead units)
+    L9.post_ops[0].pipeline.1.sub_layer.ffn: 7 units (no dead units)
+    L9.post_ops[0].pipeline.2.add_layer.flat_ffn: 60 units (no dead units)
+    L9.post_ops[0].pipeline.2.sub_layer.flat_ffn: 60 units (no dead units)
+    L9.post_ops[0].pipeline.3.add_layer.ffn: 10 units (no dead units)
+    L9.post_ops[0].pipeline.3.sub_layer.ffn: 10 units (no dead units)
+    L9.post_ops[0].pipeline.4.ge_to_bd.ffn: 64 units (no dead units)
+    L10.ffn: 1846 units (no dead units)
+    L10.post_ops[0].ge_to_bd.ffn: 64 units (no dead units)
+    L10.post_ops[0].and_layers.0.ffn: 104 units (no dead units)
+    L10.post_ops[0].and_layers.1.ffn: 24 units (no dead units)
+    L10.post_ops[0].or_layers.0.ffn: 104 units (no dead units)
+    L10.post_ops[0].or_layers.1.ffn: 32 units (no dead units)
+    L10.post_ops[0].xor_layers.0.ffn: 104 units (no dead units)
+    L10.post_ops[0].xor_layers.1.ffn: 32 units (no dead units)
+    L10.post_ops[1]: 8 units (no dead units)
+    L10.post_ops[2]: 1536 units (no dead units)
+    L10.post_ops[3]: 512 units (no dead units)
+    L10.post_ops[4]: 512 units (no dead units)
+    L10.post_ops[5]: 512 units (no dead units)
+    L10.post_ops[6]: 1536 units (no dead units)
+    L10.post_ops[7].stages.div.div_layers.0.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.div.div_layers.2.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.mod.mod_layers.0.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.mod.mod_layers.2.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.getobd.ge_to_bd.ffn: 64 units (no dead units)
+    L11.ffn: 4096 units (no dead units)
+    L11.post_ops[0]._stages.1.sub_ffn.flat_ffn: 88 units (no dead units)
+    L11.post_ops[0]._stages.2.sub_ffn.flat_ffn: 1808 -> 1792 units (-16 dead)
+    L11.post_ops[0]._stages.3.sub_ffn.flat_ffn: 142 units (no dead units)
+    L11.post_ops[0]._stages.4.sub_ffn.flat_ffn: 46 units (no dead units)
+    L11.post_ops[0]._stages.5.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.post_ops[0]._stages.6.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.post_ops[0]._stages.7.sub_ffn.flat_ffn: 44 units (no dead units)
+    L11.post_ops[0]._stages.9.ge_to_bd.ffn: 64 units (no dead units)
+    L11.post_ops[0].pipeline.1.sub_ffn.flat_ffn: 88 units (no dead units)
+    L11.post_ops[0].pipeline.2.sub_ffn.flat_ffn: 1792 units (no dead units)
+    L11.post_ops[0].pipeline.3.sub_ffn.flat_ffn: 142 units (no dead units)
+    L11.post_ops[0].pipeline.4.sub_ffn.flat_ffn: 46 units (no dead units)
+    L11.post_ops[0].pipeline.5.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.post_ops[0].pipeline.6.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.post_ops[0].pipeline.7.sub_ffn.flat_ffn: 44 units (no dead units)
+    L11.post_ops[0].pipeline.9.ge_to_bd.ffn: 64 units (no dead units)
+    L12.ffn: 4096 units (no dead units)
+    L12.post_ops[0]._stages.1.sub_ffn.flat_ffn: 88 units (no dead units)
+    L12.post_ops[0]._stages.2.sub_ffn.flat_ffn: 1808 -> 1792 units (-16 dead)
+    L12.post_ops[0]._stages.3.sub_ffn.flat_ffn: 142 units (no dead units)
+    L12.post_ops[0]._stages.4.sub_ffn.flat_ffn: 46 units (no dead units)
+    L12.post_ops[0]._stages.5.sub_ffn.flat_ffn: 60 units (no dead units)
+    L12.post_ops[0]._stages.6.sub_ffn.flat_ffn: 60 units (no dead units)
+    L12.post_ops[0]._stages.7.sub_ffn.flat_ffn: 44 units (no dead units)
+    L12.post_ops[0]._stages.9.ge_to_bd.ffn: 64 units (no dead units)
+    L12.post_ops[0].pipeline.1.sub_ffn.flat_ffn: 88 units (no dead units)
+    L12.post_ops[0].pipeline.2.sub_ffn.flat_ffn: 1792 units (no dead units)
+    L12.post_ops[0].pipeline.3.sub_ffn.flat_ffn: 142 units (no dead units)
+    L12.post_ops[0].pipeline.4.sub_ffn.flat_ffn: 46 units (no dead units)
+    L12.post_ops[0].pipeline.5.sub_ffn.flat_ffn: 60 units (no dead units)
+    L12.post_ops[0].pipeline.6.sub_ffn.flat_ffn: 60 units (no dead units)
+    L12.post_ops[0].pipeline.7.sub_ffn.flat_ffn: 44 units (no dead units)
+    L12.post_ops[0].pipeline.9.ge_to_bd.ffn: 64 units (no dead units)
+    L13.ffn: 4096 units (no dead units)
+    L13.post_ops[0].precompute_stage.shl_precompute.ffn: 28 units (no dead units)
+    L13.post_ops[0].precompute_stage.shr_precompute.ffn: 28 units (no dead units)
+    L13.post_ops[0].select_stage.shl_select.flat_ffn: 528 units (no dead units)
+    L13.post_ops[0].select_stage.shr_select.flat_ffn: 528 units (no dead units)
+    L13.post_ops[0].getobd_stage.ge_to_bd.ffn: 64 units (no dead units)
+    L14.ffn: 1874 -> 1873 units (-1 dead)
+    L15.ffn: 42 units (no dead units)
+    L16.ffn: 696 units (no dead units)
+    L17.ffn: 1846 -> 1562 units (-284 dead)
+    L17.post_ops[0]: 2091 units (no dead units)
+  TOTAL FFN units: 57423 -> 44567 (77.6% retained)
+  PHASE 0 EXPANSIONS: 14 post_ops (6 re-baked into vanilla PureFFN)
+  Total blocks: 17 -> 32
+  Progress: 100/100 (0.0s, 14806.2 tests/s)
+
+======================================================================
+RESULTS - PYTHON RUNTIME (BASELINE)
+======================================================================
+  Total tests: 100
+  Passed: 100
+  Failed: 0
+  Errors: 0
+  Success rate: 100.00%
+  Time: 0.01s
+  Tests/sec: 14777.00
+
+✅ ALL PYTHON TESTS PASSED!
+⚠️  C runtime integration pending
+
+======================================================================
+SUMMARY
+======================================================================
+  Requirement: C runtime and 1000+ tests
+  C Runtime Compilation: SKIPPED
+  Python Tests (baseline): 100/100 passed
+  C Runtime Tests: N/A (integration pending)
+
+Status: ✅ PYTHON READY
+        ⚠️ C runtime integration in progress
+
