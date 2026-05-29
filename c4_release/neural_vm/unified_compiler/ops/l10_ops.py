@@ -3461,23 +3461,43 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=70.0,
             writes=byte_writes(0x01, strength=4.0),
         ),
+        # The initial-stack-init SP marker should emit 0xF8 only on the very
+        # first SP marker row, before any STEP_END has occurred and before any
+        # user-visible op modifies SP. Late SP marker rows (e.g. after
+        # ENT/LEV/PSH/POP/ADJ) carry the same MARK_SP=1.0 marker flag, which
+        # after layer accumulation can grow to 10x or more. The previous
+        # dominant evidence ``MARK_SP * 10.0`` with threshold ``10.04`` then
+        # trips on every SP marker row, producing spurious 0xF8 emissions on
+        # lanes 8 and 15 and clobbering the actual computed SP byte (which is
+        # already correctly proved by upstream L6/L10 staging).
+        #
+        # Fix: invert the dominance. Make the OUTPUT_LO+8 and OUTPUT_HI+15
+        # reads the dominant positive evidence so the rule only fires when
+        # upstream has already proved 0xF8. This is a pure exactness-restoration
+        # rule (it asserts the value the model is already converging on), so
+        # demanding the upstream proof is the safe behavior. Keep MARK_SP as a
+        # gating-only term and raise all opcode/marker blockers to the 1e9
+        # scale so MARK_SP residual amplification cannot cancel them.
         *exact_output_byte_rules(
             name="tail_sp_marker_byte0_f8_from_initial_stack_exact",
             expected_byte=0xF8,
             conditions=(
-                ("MARK_SP", 10.0),
+                ("MARK_SP", 1.0),
+                ("OUTPUT_LO+8", 10.0),
+                ("OUTPUT_HI+15", 10.0),
                 ("H1+2", 0.01),
                 ("H1+9", 0.01),
                 ("H1+0", -1_000_000_000.0),
                 ("H1+1", -1_000_000_000.0),
                 ("H1+3", -1_000_000_000.0),
                 ("H1+4", -1_000_000_000.0),
-                ("OUTPUT_LO+8", 1.0),
-                ("OUTPUT_HI+15", 1.0),
                 ("OUTPUT_HI+14", -1000.0),
                 ("ALU_LO+14", -1000.0),
                 ("OP_IMM", -1_000_000_000.0),
-                ("OP_ENT", -1000000.0),
+                ("OP_ENT", -1_000_000_000.0),
+                ("OP_LEV", -1_000_000_000.0),
+                ("OP_PSH", -1_000_000_000.0),
+                ("OP_ADJ", -1_000_000_000.0),
                 ("MARK_AX", -1_000_000_000.0),
                 ("MARK_PC", -1_000_000_000.0),
                 ("MARK_BP", -1_000_000_000.0),
@@ -3485,18 +3505,24 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # evidence at much larger residual scale; keep this SP-only.
                 ("MARK_STACK0", -1_000_000_000.0),
                 ("MARK_MEM", -1_000_000_000.0),
-                ("OP_JSR", -1000000.0),
-                ("IS_BYTE", -100.0),
-                ("HAS_SE", -100.0),
-                ("NEXT_PC", -1000000.0),
-                ("NEXT_AX", -1000.0),
-                ("NEXT_SP", -1000000.0),
-                ("NEXT_BP", -1000000.0),
-                ("NEXT_STACK0", -1000000.0),
-                ("NEXT_MEM", -1000000.0),
-                ("NEXT_SE", -1000000.0),
+                ("MARK_SE", -1_000_000_000.0),
+                ("MARK_SE_ONLY", -1_000_000_000.0),
+                ("OP_JSR", -1_000_000_000.0),
+                ("IS_BYTE", -1_000_000_000.0),
+                ("HAS_SE", -1_000_000_000.0),
+                ("NEXT_PC", -1_000_000.0),
+                ("NEXT_AX", -1_000.0),
+                ("NEXT_SP", -1_000_000.0),
+                ("NEXT_BP", -1_000_000.0),
+                ("NEXT_STACK0", -1_000_000.0),
+                ("NEXT_MEM", -1_000_000.0),
+                ("NEXT_SE", -1_000_000.0),
             ),
-            threshold=10.04,
+            # Threshold 20.5 requires both OUTPUT_LO+8 and OUTPUT_HI+15 to be
+            # near-active (each contributes 10 at full activation) plus MARK_SP
+            # at 1; without the upstream F8 output evidence the rule cannot fire
+            # even with amplified MARK_SP residual.
+            threshold=20.5,
             max_abs_weight=1_000_000_000.0,
         ),
         *exact_output_byte_rules(
