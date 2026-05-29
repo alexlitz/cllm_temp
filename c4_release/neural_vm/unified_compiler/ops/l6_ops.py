@@ -2287,6 +2287,15 @@ def _bake_layer6_attn_spec(attn, BD, HD):
     # After a JSR into a function prologue, the ENT immediate has been
     # fetched at the AX marker.  Relay it forward to the SP marker so later
     # declarative SP-write rules can handle frame sizes beyond one local slot.
+    #
+    # KNOWN GAP: slot 51's W_v only carries OPCODE_BYTE_HI+0 (from the
+    # OPCODE_BYTE_HI loop above), not FETCH_LO/HI directly. FETCH bands do
+    # reach SP via slots 0..15 / 16..31 sharing the head's combined attention
+    # pattern, but slots 35..50 / 51..66 also leak OPCODE_BYTE_LO/HI into SP
+    # by the same path. A FETCH-conditioned ENT-after-JSR SP-byte0 rewrite
+    # therefore regressed sentinel 0-32 from 3/32 to 0/32 in B2-D (block 6
+    # PC_byte1 corruption). A proper relay needs a dedicated FETCH-only slot
+    # pair that does not share W_v rows with OPCODE_BYTE writers.
     ent_sp_fetch_gate = 51
     attn.W_q[base + ent_sp_fetch_gate, BD.MARK_SP] = 500.0
     attn.W_q[base + ent_sp_fetch_gate, BD.HAS_SE] = 500.0
