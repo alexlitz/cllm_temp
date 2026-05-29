@@ -3864,6 +3864,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_ADDR_SRC", -1000000.0),
                 ("PSH_AT_SP", -1000000.0),
                 ("OP_JSR", -1000000.0),
+                # Block ENT's saved-BP push (target 0xF0, not 0xE0). The
+                # L6 opcode relay carries OP_ENT to the MEM marker during
+                # ENT steps; without this guard the rule's 50000 active
+                # value pins the wrong addr byte.
+                ("OP_ENT", -1000000.0),
                 ("CMP+0", 10.0),
                 ("ALU_LO+8", 5.0),
                 ("ALU_LO+7", -10.0),
@@ -3899,6 +3904,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_ADDR_SRC", -1000000.0),
                 ("PSH_AT_SP", 1.0),
                 ("OP_JSR", -1000000.0),
+                # Block ENT's saved-BP push (target 0xF0, not 0xE0). The
+                # L6 opcode relay carries OP_ENT to the MEM marker during
+                # ENT steps; without this guard the 5e9 authority pin
+                # overwrites the correct F0 rule (strength 1e6) at ENT.
+                ("OP_ENT", -1000000.0),
                 ("CMP+0", 10.0),
                 ("ALU_LO+8", 5.0),
                 ("ALU_LO+7", -10.0),
