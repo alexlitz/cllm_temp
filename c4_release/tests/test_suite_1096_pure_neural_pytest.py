@@ -61,8 +61,10 @@ Tuning knobs:
                        one-token-per-forward batched decode)
     C4_ADAPTIVE_START_K / C4_ADAPTIVE_MAX_K — adaptive speculation start and
                        cap when C4_SPEC_K=adaptive (defaults 32 / 64)
-    C4_SPEC_FAIL_FAST — stop an element after persistent first-token DraftVM
-                       disagreement (default 1)
+    C4_SPEC_FAIL_FAST — hard-halt an element after persistent first-token
+                       DraftVM disagreement (default 0; when off, persistent
+                       disagreement disables speculation for that element and
+                       falls back to single-token decoding)
     C4_1096_OFFSET / C4_1096_LIMIT — run a contiguous program slice after
                        pytest selection is applied. Useful for quick tuning.
     C4_1096_TIMING   — print per-chunk compile/run timing when set to 1.

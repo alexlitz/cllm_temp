@@ -111,6 +111,12 @@ _UNPREDICTED_BUCKET_KEY = "unpredicted"
 # would-be emission for any correct C4 program.
 _UNSAFE_OFFSETS = frozenset(range(26, 34))
 
+# Step-relative offset of the MEM marker token inside the 35-token step layout
+# (PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5) -> MEM at index 25). Used by the
+# speculator to locate draft-region MEM markers for ``mem_store_positions``
+# augmentation; ``_UNSAFE_OFFSETS`` covers the 8 addr/value bytes that follow.
+_MEM_MARKER_STEP_OFFSET = 25
+
 # Some opcodes are neural-authoritative in raw one-token decoding but are not
 # safe speculation boundaries yet. In particular, call-frame control changes
 # rewrite PC/SP/BP in ways where a long DraftVM continuation can poison the
@@ -304,9 +310,15 @@ class BatchedPureNeuralRunner:
         )
         self.kv_cache_verify = bool(kv_cache_verify)
         self.kv_cache_verify_interval = max(1, int(kv_cache_verify_interval))
+        # Default OFF: persistent first-token rejection is not terminal when
+        # the K=0 path can still complete via single-token decode. The legacy
+        # "1" default was tuned before the L10/L16 PSH-addr guards (commit
+        # 0ce6030) shifted some model boundary predictions by one position;
+        # since then hard-halting hides recoverable exits. Set
+        # ``C4_SPEC_FAIL_FAST=1`` to opt back in for benchmarking.
         self.spec_fail_fast = (
-            os.environ.get("C4_SPEC_FAIL_FAST", "1").strip().lower()
-            not in {"0", "false", "no", "off"}
+            os.environ.get("C4_SPEC_FAIL_FAST", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
         )
         self.spec_fail_on_correction = (
             os.environ.get("C4_SPEC_FAIL_ON_CORRECTION", "").strip().lower()
@@ -1224,9 +1236,16 @@ class BatchedPureNeuralRunner:
             #    adding more drafts but keep the prefix.
             drafts = []  # list[list[int]] aligned with active_idx
             per_elem_k = []  # K actually used this iter, aligned with active_idx
+            # Per-element list of drafted-step indices (0..K-1) whose opcode is
+            # a MEM-store op. The corresponding draft MEM markers are tagged
+            # ``MEM_STORE=1`` below so the embedding's L15/L16 lookup
+            # injection mirrors what ``_windowed_context`` does for the
+            # current step's marker.
+            draft_store_step_idx: List[List[int]] = []
             for i in active_idx:
                 s = states[i]
                 d: List[int] = []
+                store_steps: List[int] = []
                 # Only speculate when the element is at a clean VM-step
                 # boundary. If a previous iter's verification rejected
                 # mid-step, the context now contains a partial step; we'd
@@ -1268,16 +1287,23 @@ class BatchedPureNeuralRunner:
                     # the model remains the source of truth).
                     self._sync_draft_vm(s)
                     unsafe_stop = False
-                    for _ in range(effective_k):
+                    for step_j in range(effective_k):
                         if not self._draft_opcode_safe_for_speculation(s.draft_vm):
                             unsafe_stop = True
                             break
                         if s.draft_vm.halted:
                             break
+                        # Capture the opcode that will execute this step BEFORE
+                        # ``step()`` advances pc/idx. Store ops need the MEM
+                        # marker tagged for the model forward (see comment
+                        # above on ``draft_store_step_idx``).
+                        pre_op = self._draft_current_opcode(s.draft_vm)
                         ok = s.draft_vm.step()
                         if not ok:
                             break
                         d.extend(s.draft_vm.draft_tokens())
+                        if pre_op is not None and pre_op in _MEM_STORE_OPS:
+                            store_steps.append(step_j)
                         if s.draft_vm.halted:
                             break
                     if unsafe_stop:
@@ -1288,6 +1314,7 @@ class BatchedPureNeuralRunner:
                     self._spec_stats["drafted"] += len(d)
                 drafts.append(d)
                 per_elem_k.append(effective_k)
+                draft_store_step_idx.append(store_steps)
 
             # 2) Build padded tensor: each active element gets windowed context
             #    + its draft tokens appended. Padded to the max combined length.
@@ -1299,11 +1326,37 @@ class BatchedPureNeuralRunner:
                 real_prefix_lens.append(len(ctx_win))
                 windowed_with_drafts.append(ctx_win + drafts[k])
 
+            # Augment mem_store_positions with draft-region MEM markers for
+            # drafted STORE steps. The transient list is for the embedding
+            # only; ``s.mem_store_positions`` keeps the windowed-context-only
+            # list because the drafted steps may be rejected and must not
+            # pollute persistent state.
+            mem_store_positions_with_drafts: List[List[int]] = []
+            for k, i in enumerate(active_idx):
+                base = list(states[i].mem_store_positions)
+                prefix_len_k = real_prefix_lens[k]
+                seq_k = windowed_with_drafts[k]
+                seen = set(base)
+                for step_j in draft_store_step_idx[k]:
+                    marker_pos = (
+                        prefix_len_k + step_j * STEP + _MEM_MARKER_STEP_OFFSET
+                    )
+                    if (
+                        marker_pos in seen
+                        or marker_pos >= len(seq_k)
+                        or seq_k[marker_pos] != Token.MEM
+                    ):
+                        continue
+                    base.append(marker_pos)
+                    seen.add(marker_pos)
+                base.sort()
+                mem_store_positions_with_drafts.append(base)
+
             mh_end = max(s.mem_history_end for s in states)
             self.model.embed.set_mem_history_end(mh_end)
             if hasattr(self.model.embed, "set_mem_store_positions"):
                 self.model.embed.set_mem_store_positions(
-                    [states[i].mem_store_positions for i in active_idx]
+                    mem_store_positions_with_drafts
                 )
 
             # Pre-compute argmax for the verifier tensor once (GPU op) and
@@ -1316,9 +1369,7 @@ class BatchedPureNeuralRunner:
                 first_logit_pos=min(real_prefix_lens) - 1,
                 allow_kv=not any(drafts),
                 protected_prefix_lens=[states[i].prefix_len for i in active_idx],
-                protected_mem_positions=[
-                    states[i].mem_store_positions for i in active_idx
-                ],
+                protected_mem_positions=mem_store_positions_with_drafts,
             )
 
             # 3) For each element: verify drafts and replay accepted prefix + correction.
@@ -1484,7 +1535,25 @@ class BatchedPureNeuralRunner:
         vm._last_mem_val = 0
 
     @staticmethod
-    def _draft_opcode_safe_for_speculation(vm: DraftVM) -> bool:
+    def _draft_current_opcode(vm: DraftVM) -> Optional[int]:
+        """Return the opcode DraftVM will execute on its next ``step()``.
+
+        Handles both static-code fetch (``vm.code[vm.idx]``) and
+        unified-memory fetch (``_fetch_instr_from_memory``). Returns
+        ``None`` if the VM is halted or no instruction is fetchable.
+        """
+        if vm.halted:
+            return None
+        if 0 <= vm.idx < len(vm.code):
+            return int(vm.code[vm.idx] & 0xFF)
+        fetched = vm._fetch_instr_from_memory(vm.pc)
+        if fetched is None:
+            return None
+        op, _imm = fetched
+        return int(op) & 0xFF
+
+    @classmethod
+    def _draft_opcode_safe_for_speculation(cls, vm: DraftVM) -> bool:
         """Return whether DraftVM's current opcode may be appended as draft.
 
         Unsafe opcodes still execute neurally through the normal one-token path.
@@ -1493,14 +1562,10 @@ class BatchedPureNeuralRunner:
         """
         if vm.halted:
             return True
-        if 0 <= vm.idx < len(vm.code):
-            op = vm.code[vm.idx] & 0xFF
-        else:
-            fetched = vm._fetch_instr_from_memory(vm.pc)
-            if fetched is None:
-                return False
-            op, _imm = fetched
-        return int(op) not in _SPEC_UNSAFE_OPS
+        op = cls._draft_current_opcode(vm)
+        if op is None:
+            return False
+        return op not in _SPEC_UNSAFE_OPS
 
     @staticmethod
     def _current_step_store_mem_marker(

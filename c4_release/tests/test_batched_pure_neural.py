@@ -315,6 +315,191 @@ def test_spec_fail_on_correction_stops_at_first_safe_divergence():
     assert runner._spec_stats["fail_fast"] == 1
 
 
+def test_spec_fail_fast_defaults_to_disabled(monkeypatch):
+    """``C4_SPEC_FAIL_FAST`` defaults OFF so persistent draft rejection
+    falls back to single-token decode instead of hard-halting the element.
+    """
+    import os
+
+    def _parse():
+        return (
+            os.environ.get("C4_SPEC_FAIL_FAST", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+
+    monkeypatch.delenv("C4_SPEC_FAIL_FAST", raising=False)
+    assert _parse() is False
+
+    monkeypatch.setenv("C4_SPEC_FAIL_FAST", "1")
+    assert _parse() is True
+
+
+def test_run_speculative_disables_spec_after_persistent_first_token_rejects():
+    """When ``spec_fail_fast=False`` (the new default), four consecutive
+    first-token rejections set ``spec_disabled=True`` so the element keeps
+    advancing via single-token decode instead of hard-halting with
+    ``exit_code=None``."""
+    import torch
+
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.run_vm import DraftVM
+    from neural_vm.vm_step import Token
+
+    class _Embed:
+        def set_mem_history_end(self, _value):
+            pass
+
+        def set_mem_store_positions(self, _value):
+            pass
+
+    # Predict a benign byte (1) everywhere — disagrees with DraftVM's
+    # REG_PC step-start token (rejecting first draft token every time) and
+    # doesn't trigger HALT/STEP_END dispatch so the element keeps running.
+    class _Model:
+        max_seq_len = 4096
+        embed = _Embed()
+
+        def forward(self, token_ids, **_kwargs):
+            logits = torch.zeros(
+                token_ids.shape[0],
+                token_ids.shape[1],
+                Token.VOCAB_SIZE,
+                device=token_ids.device,
+            )
+            logits[:, :, 1] = 1.0
+            return logits
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    runner.model = _Model()
+    runner._device = torch.device("cpu")
+    runner.use_kv_cache = False
+    runner.incremental_kv_safe = False
+    runner.spec_fail_on_correction = False
+    runner.spec_fail_fast = False
+    runner._kv_stats = {"fresh_forwards": 0}
+    runner._reset_spec_stats()
+
+    bytecode = _encode([(Opcode.IMM, 1), (Opcode.IMM, 2),
+                        (Opcode.IMM, 3), (Opcode.IMM, 4),
+                        (Opcode.IMM, 5), Opcode.EXIT])
+    # Force at_step_boundary=True at every iteration by aligning token_pos
+    # to a STEP_TOKENS multiple. We arrange this by giving spec_k=1 and
+    # generous expected_steps so the runner gets several iterations.
+    state = _ElementState(
+        bytecode=bytecode,
+        context=[Token.CODE_START],
+        prefix_len=1,
+        expected_steps=400,
+        draft_vm=DraftVM(bytecode),
+    )
+
+    runner._run_speculative(
+        [state],
+        max_steps=None,
+        max_context_window=512,
+        spec_k=1,
+    )
+
+    # spec_disabled should be set after the streak of first-token rejects
+    # triggers the fallback path; the runner did not hard-halt the element.
+    assert state.spec_disabled is True, (
+        "Persistent first-token rejection should disable speculation, "
+        "not hard-halt the element"
+    )
+    assert runner._spec_stats["fail_fast"] == 0
+    assert runner._spec_stats["first_token_rejects"] >= 4
+
+
+def test_run_speculative_tags_draft_region_store_mem_markers():
+    """When a drafted step executes a MEM-store opcode (SI/SC/PSH/ENT/JSR),
+    its MEM marker inside the draft region must be added to the per-element
+    ``mem_store_positions`` passed to the embedding for that forward. Without
+    this tagging the embedding's ``MEM_STORE=1`` / ``MEM_ADDR_SRC=1`` flags
+    are missing at the drafted marker, the model predicts a different
+    ``MEM_addr0`` byte than DraftVM emitted, and L15/L16's lookup feeds
+    wrong addresses into the next step's PC/SP/BP — corrupting the verifier
+    even though the MEM addr/val bytes themselves are trusted from DraftVM
+    via ``_UNSAFE_OFFSETS``.
+    """
+    import torch
+
+    from neural_vm.batched_pure_neural import (
+        BatchedPureNeuralRunner,
+        _ElementState,
+        _MEM_MARKER_STEP_OFFSET,
+    )
+    from neural_vm.run_vm import DraftVM
+    from neural_vm.vm_step import Token
+
+    captured_positions = []
+
+    class _Embed:
+        def set_mem_history_end(self, _value):
+            pass
+
+        def set_mem_store_positions(self, positions):
+            captured_positions.append(
+                [list(row) for row in (positions or [])]
+            )
+
+    class _Model:
+        max_seq_len = 4096
+        embed = _Embed()
+
+        def forward(self, token_ids, **_kwargs):
+            logits = torch.zeros(
+                token_ids.shape[0],
+                token_ids.shape[1],
+                Token.VOCAB_SIZE,
+                device=token_ids.device,
+            )
+            logits[:, :, Token.HALT] = 1.0
+            return logits
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    runner.model = _Model()
+    runner._device = torch.device("cpu")
+    runner.use_kv_cache = False
+    runner.incremental_kv_safe = False
+    runner.spec_fail_on_correction = False
+    runner.spec_fail_fast = False
+    runner._kv_stats = {"fresh_forwards": 0}
+    runner._reset_spec_stats()
+
+    # IMM 7 then PSH (a store op): DraftVM will draft both steps; the second
+    # step's MEM marker must be tagged.
+    bytecode = _encode([(Opcode.IMM, 7), Opcode.PSH, Opcode.EXIT])
+    state = _ElementState(
+        bytecode=bytecode,
+        context=[Token.CODE_START],
+        prefix_len=1,
+        expected_steps=3,
+        draft_vm=DraftVM(bytecode),
+    )
+
+    runner._run_speculative(
+        [state],
+        max_steps=None,
+        max_context_window=512,
+        spec_k=2,
+    )
+
+    # First iteration must have captured ``mem_store_positions`` for the
+    # forward pass; the second drafted step (PSH at draft step index 1) is
+    # a store op, so its MEM marker at ``prefix_len + 1*35 + 25`` must be
+    # included in the positions row passed to the embedding.
+    assert captured_positions, (
+        "Speculator should have called set_mem_store_positions before its first forward"
+    )
+    first_call = captured_positions[0]
+    assert len(first_call) == 1, "single-element batch expected"
+    expected_psh_marker = 1 + 1 * Token.STEP_TOKENS + _MEM_MARKER_STEP_OFFSET
+    assert expected_psh_marker in first_call[0], (
+        f"Drafted PSH MEM marker at position {expected_psh_marker} should be "
+        f"tagged for the forward, got {first_call[0]}"
+    )
+
+
 def test_windowed_context_does_not_duplicate_memory_history_without_eviction():
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
     from neural_vm.vm_step import Token
