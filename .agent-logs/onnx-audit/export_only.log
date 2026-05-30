@@ -1,0 +1,13 @@
+[0;93m2026-05-29 10:11:53.566754458 [W:onnxruntime:Default, device_discovery.cc:164 DiscoverDevicesForPlatform] GPU device discovery failed: device_discovery.cc:89 ReadFileContents Failed to open file: "/sys/class/drm/card2/device/vendor"[m
+======================================================================
+C4 TRANSFORMER VM - ONNX RUNTIME TEST SUITE
+======================================================================
+
+Step 1: Exporting VM to ONNX
+----------------------------------------------------------------------
+ERROR: ONNX export failed: cannot import name 'build_full_vm' from 'neural_vm.vm_step' (/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py)
+
+This is expected - ONNX export for the full VM is still in development.
+For now, we'll run PyTorch-only validation of the 1096 test suite.
+
+Export complete. Exiting (--export-only specified).

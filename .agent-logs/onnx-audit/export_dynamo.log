@@ -1,0 +1,165 @@
+=== HEAD (first 80 lines) ===
+[dynamo] Building production model via compile_full_vm()...
+[dynamo] Model built. d_model=736, n_layers=32, vocab=276, max_seq_len=8192
+[dynamo] Sample input shape: (1, 32)
+[dynamo] Sanity: eager forward...
+[dynamo] Eager forward OK. Output shape: (1, 32, 276)
+[dynamo] Calling torch.onnx.export (dynamo=True)...
+[torch.onnx] Obtain model graph for `AutoregressiveVM([...]` with `torch.export.export(..., strict=False)`...
+W0529 10:17:20.069000 3003493 site-packages/torch/fx/experimental/symbolic_shapes.py:8013] Unable to find user code corresponding to {u0}
+/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/contextlib.py:158: UserWarning: The tensor attributes self.blocks.11.ffn.state._opcode_mask, self.blocks.11.ffn.state._x_bd_input, self.blocks.11.ffn.state._x_ge_sub, self.blocks.11.ffn.state._x_ge, self.blocks.11.ffn.state._x_ge_out, self.blocks.11.ffn.state._x_ge_add, self.blocks.9.ffn.state._opcode_mask, self.blocks.9.ffn.state._x_bd_input, self.blocks.9.ffn.state._x_ge_sub, self.blocks.9.ffn.state._x_ge, self.blocks.9.ffn.state._x_ge_out, self.blocks.9.ffn.state._x_ge_add were assigned during export. Such attributes must be registered as buffers using the `register_buffer` API (https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_buffer).
+  self.gen.throw(value)
+
+
+
+def forward(self, arg0_1: "f32[276, 736]", arg1_1: "f32[736, 736]", arg2_1: "f32[736, 736]", arg3_1: "f32[736, 736]", arg4_1: "f32[736, 736]", arg5_1: "f32[7, 736]", arg6_1: "f32[7]", arg7_1: "f32[7, 736]", arg8_1: "f32[7]", arg9_1: "f32[736, 7]", arg10_1: "f32[736]", arg11_1: "f32[736, 736]", arg12_1: "f32[736, 736]", arg13_1: "f32[736, 736]", arg14_1: "f32[736, 736]", arg15_1: "f32[5, 736]", arg16_1: "f32[5]", arg17_1: "f32[5, 736]", arg18_1: "f32[5]", arg19_1: "f32[736, 5]", arg20_1: "f32[736]", arg21_1: "f32[736, 736]", arg22_1: "f32[736, 736]", arg23_1: "f32[736, 736]", arg24_1: "f32[736, 736]", arg25_1: "f32[10, 736]", arg26_1: "f32[10]", arg27_1: "f32[10, 736]", arg28_1: "f32[10]", arg29_1: "f32[736, 10]", arg30_1: "f32[736]", arg31_1: "f32[736, 736]", arg32_1: "f32[736, 736]", arg33_1: "f32[736, 736]", arg34_1: "f32[736, 736]", arg35_1: "f32[134, 736]", arg36_1: "f32[134]", arg37_1: "f32[134, 736]", arg38_1: "f32[134]", arg39_1: "f32[736, 134]", arg40_1: "f32[736]", arg41_1: "f32[736, 736]", arg42_1: "f32[736, 736]", arg43_1: "f32[736, 736]", arg44_1: "f32[736, 736]", arg45_1: "f32[543, 736]", arg46_1: "f32[543]", arg47_1: "f32[543, 736]", arg48_1: "f32[543]", arg49_1: "f32[736, 543]", arg50_1: "f32[736]", arg51_1: "f32[736, 736]", arg52_1: "f32[736, 736]", arg53_1: "f32[736, 736]", arg54_1: "f32[736, 736]", arg55_1: "f32[88, 736]", arg56_1: "f32[88]", arg57_1: "f32[88, 736]", arg58_1: "f32[88]", arg59_1: "f32[736, 88]", arg60_1: "f32[736]", arg61_1: "f32[736, 736]", arg62_1: "f32[736, 736]", arg63_1: "f32[736, 736]", arg64_1: "f32[736, 736]", arg65_1: "f32[1855, 736]", arg66_1: "f32[1855]", arg67_1: "f32[1855, 736]", arg68_1: "f32[1855]", arg69_1: "f32[736, 1855]", arg70_1: "f32[736]", arg71_1: "f32[736, 736]", arg72_1: "f32[736, 736]", arg73_1: "f32[736, 736]", arg74_1: "f32[736, 736]", arg75_1: "f32[1, 736]", arg76_1: "f32[1]", arg77_1: "f32[1, 736]", arg78_1: "f32[1]", arg79_1: "f32[736, 1]", arg80_1: "f32[736]", arg81_1: "f32[736, 736]", arg82_1: "f32[736, 736]", arg83_1: "f32[736, 736]", arg84_1: "f32[736, 736]", arg85_1: "f32[2055, 736]", arg86_1: "f32[2055]", arg87_1: "f32[2055, 736]", arg88_1: "f32[2055]", arg89_1: "f32[736, 2055]", arg90_1: "f32[736]", arg91_1: "f32[736, 736]", arg92_1: "f32[736, 736]", arg93_1: "f32[736, 736]", arg94_1: "f32[736, 736]", arg95_1: "f32[6, 160]", arg96_1: "f32[6]", arg97_1: "f32[6, 160]", arg98_1: "f32[6]", arg99_1: "f32[160, 6]", arg100_1: "f32[160]", arg101_1: "f32[7, 160]", arg102_1: "f32[7]", arg103_1: "f32[7, 160]", arg104_1: "f32[7]", arg105_1: "f32[160, 7]", arg106_1: "f32[160]", arg107_1: "f32[60, 1280]", arg108_1: "f32[60]", arg109_1: "f32[60, 1280]", arg110_1: "f32[60]", arg111_1: "f32[1280, 60]", arg112_1: "f32[1280]", arg113_1: "f32[60, 1280]", arg114_1: "f32[60]", arg115_1: "f32[60, 1280]", arg116_1: "f32[60]", arg117_1: "f32[1280, 60]", arg118_1: "f32[1280]", arg119_1: "f32[10, 160]", arg120_1: "f32[10]", arg121_1: "f32[10, 160]", arg122_1: "f32[10]", arg123_1: "f32[160, 10]", arg124_1: "f32[160]", arg125_1: "f32[10, 160]", arg126_1: "f32[10]", arg127_1: "f32[10, 160]", arg128_1: "f32[10]", arg129_1: "f32[160, 10]", arg130_1: "f32[160]", arg131_1: "f32[64, 160]", arg132_1: "f32[64]", arg133_1: "f32[64, 160]", arg134_1: "f32[64]", arg135_1: "f32[160, 64]", arg136_1: "f32[160]", arg137_1: "f32[736, 736]", arg138_1: "f32[736, 736]", arg139_1: "f32[736, 736]", arg140_1: "f32[736, 736]", arg141_1: "f32[3405, 736]", arg142_1: "f32[3405]", arg143_1: "f32[3405, 736]", arg144_1: "f32[3405]", arg145_1: "f32[736, 3405]", arg146_1: "f32[736]", arg147_1: "f32[736, 736]", arg148_1: "f32[736, 736]", arg149_1: "f32[736, 736]", arg150_1: "f32[736, 736]", arg151_1: "f32[6, 160]", arg152_1: "f32[6]", arg153_1: "f32[6, 160]", arg154_1: "f32[6]", arg155_1: "f32[160, 6]", arg156_1: "f32[160]", arg157_1: "f32[7, 160]", arg158_1: "f32[7]", arg159_1: "f32[7, 160]", arg160_1: "f32[7]", arg161_1: "f32[160, 7]", arg162_1: "f32[160]", arg163_1: "f32[60, 1280]", arg164_1: "f32[60]", arg165_1: "f32[60, 1280]", arg166_1: "f32[60]", arg167_1: "f32[1280, 60]", arg168_1: "f32[1280]", arg169_1: "f32[60, 1280]", arg170_1: "f32[60]", arg171_1: "f32[60, 1280]", arg172_1: "f32[60]", arg173_1: "f32[1280, 60]", arg174_1: "f32[1280]", arg175_1: "f32[10, 160]", arg176_1: "f32[10]", arg177_1: "f32[10, 160]", arg178_1: "f32[10]", arg179_1: "f32[160, 10]", arg180_1: "f32[160]", arg181_1: "f32[10, 160]", arg182_1: "f32[10]", arg183_1: "f32[10, 160]", arg184_1: "f32[10]", arg185_1: "f32[160, 10]", arg186_1: "f32[160]", arg187_1: "f32[64, 160]", arg188_1: "f32[64]", arg189_1: "f32[64, 160]", arg190_1: "f32[64]", arg191_1: "f32[160, 64]", arg192_1: "f32[160]", arg193_1: "f32[736, 736]", arg194_1: "f32[736, 736]", arg195_1: "f32[736, 736]", arg196_1: "f32[736, 736]", arg197_1: "f32[1846, 736]", arg198_1: "f32[1846]", arg199_1: "f32[1846, 736]", arg200_1: "f32[1846]", arg201_1: "f32[736, 1846]", arg202_1: "f32[736]", arg203_1: "f32[736, 736]", arg204_1: "f32[736, 736]", arg205_1: "f32[736, 736]", arg206_1: "f32[736, 736]", arg207_1: "f32[64, 160]", arg208_1: "f32[64]", arg209_1: "f32[64, 160]", arg210_1: "f32[64]", arg211_1: "f32[160, 64]", arg212_1: "f32[160]", arg213_1: "f32[104, 160]", arg214_1: "f32[104]", arg215_1: "f32[104, 160]", arg216_1: "f32[104]", arg217_1: "f32[160, 104]", arg218_1: "f32[160]", arg219_1: "f32[24, 160]", arg220_1: "f32[24]", arg221_1: "f32[24, 160]", arg222_1: "f32[24]", arg223_1: "f32[160, 24]", arg224_1: "f32[160]", arg225_1: "f32[104, 160]", arg226_1: "f32[104]", arg227_1: "f32[104, 160]", arg228_1: "f32[104]", arg229_1: "f32[160, 104]", arg230_1: "f32[160]", arg231_1: "f32[32, 160]", arg232_1: "f32[32]", arg233_1: "f32[32, 160]", arg234_1: "f32[32]", arg235_1: "f32[160, 32]", arg236_1: "f32[160]", arg237_1: "f32[104, 160]", arg238_1: "f32[104]", arg239_1: "f32[104, 160]", arg240_1: "f32[104]", arg241_1: "f32[160, 104]", arg242_1: "f32[160]", arg243_1: "f32[32, 160]", arg244_1: "f32[32]", arg245_1: "f32[32, 160]", arg246_1: "f32[32]", arg247_1: "f32[160, 32]", arg248_1: "f32[160]", arg249_1: "f32[736, 736]", arg250_1: "f32[736, 736]", arg251_1: "f32[736, 736]", arg252_1: "f32[736, 736]", arg253_1: "f32[8, 736]", arg254_1: "f32[8]", arg255_1: "f32[8, 736]", arg256_1: "f32[8]", arg257_1: "f32[736, 8]", arg258_1: "f32[736]", arg259_1: "f32[736, 736]", arg260_1: "f32[736, 736]", arg261_1: "f32[736, 736]", arg262_1: "f32[736, 736]", arg263_1: "f32[1536, 736]", arg264_1: "f32[1536]", arg265_1: "f32[1536, 736]", arg266_1: "f32[1536]", arg267_1: "f32[736, 1536]", arg268_1: "f32[736]", arg269_1: "f32[736, 736]", arg270_1: "f32[736, 736]", arg271_1: "f32[736, 736]", arg272_1: "f32[736, 736]", arg273_1: "f32[512, 736]", arg274_1: "f32[512]", arg275_1: "f32[512, 736]", arg276_1: "f32[512]", arg277_1: "f32[736, 512]", arg278_1: "f32[736]", arg279_1: "f32[736, 736]", arg280_1: "f32[736, 736]", arg281_1: "f32[736, 736]", arg282_1: "f32[736, 736]", arg283_1: "f32[512, 736]", arg284_1: "f32[512]", arg285_1: "f32[512, 736]", arg286_1: "f32[512]", arg287_1: "f32[736, 512]", arg288_1: "f32[736]", arg289_1: "f32[736, 736]", arg290_1: "f32[736, 736]", arg291_1: "f32[736, 736]", arg292_1: "f32[736, 736]", arg293_1: "f32[512, 736]", arg294_1: "f32[512]", arg295_1: "f32[512, 736]", arg296_1: "f32[512]", arg297_1: "f32[736, 512]", arg298_1: "f32[736]", arg299_1: "f32[736, 736]", arg300_1: "f32[736, 736]", arg301_1: "f32[736, 736]", arg302_1: "f32[736, 736]", arg303_1: "f32[1536, 736]", arg304_1: "f32[1536]", arg305_1: "f32[1536, 736]", arg306_1: "f32[1536]", arg307_1: "f32[736, 1536]", arg308_1: "f32[736]", arg309_1: "f32[736, 736]", arg310_1: "f32[736, 736]", arg311_1: "f32[736, 736]", arg312_1: "f32[736, 736]", arg313_1: "f32[32, 1280]", arg314_1: "f32[32]", arg315_1: "f32[32, 1280]", arg316_1: "f32[32]", arg317_1: "f32[1280, 32]", arg318_1: "f32[1280]", arg319_1: "f32[32, 1280]", arg320_1: "f32[32]", arg321_1: "f32[32, 1280]", arg322_1: "f32[32]", arg323_1: "f32[1280, 32]", arg324_1: "f32[1280]", arg325_1: "f32[32, 1280]", arg326_1: "f32[32]", arg327_1: "f32[32, 1280]", arg328_1: "f32[32]", arg329_1: "f32[1280, 32]", arg330_1: "f32[1280]", arg331_1: "f32[32, 1280]", arg332_1: "f32[32]", arg333_1: "f32[32, 1280]", arg334_1: "f32[32]", arg335_1: "f32[1280, 32]", arg336_1: "f32[1280]", arg337_1: "f32[64, 160]", arg338_1: "f32[64]", arg339_1: "f32[64, 160]", arg340_1: "f32[64]", arg341_1: "f32[160, 64]", arg342_1: "f32[160]", arg343_1: "f32[736, 736]", arg344_1: "f32[736, 736]", arg345_1: "f32[736, 736]", arg346_1: "f32[736, 736]", arg347_1: "f32[4096, 736]", arg348_1: "f32[4096]", arg349_1: "f32[4096, 736]", arg350_1: "f32[4096]", arg351_1: "f32[736, 4096]", arg352_1: "f32[736]", arg353_1: "f32[736, 736]", arg354_1: "f32[736, 736]", arg355_1: "f32[736, 736]", arg356_1: "f32[736, 736]", arg357_1: "f32[88, 1280]", arg358_1: "f32[88]", arg359_1: "f32[88, 1280]", arg360_1: "f32[88]", arg361_1: "f32[1280, 88]", arg362_1: "f32[1280]", arg363_1: "f32[1792, 1280]", arg364_1: "f32[1792]", arg365_1: "f32[1792, 1280]", arg366_1: "f32[1792]", arg367_1: "f32[1280, 1792]", arg368_1: "f32[1280]", arg369_1: "f32[142, 1280]", arg370_1: "f32[142]", arg371_1: "f32[142, 1280]", arg372_1: "f32[142]", arg373_1: "f32[1280, 142]", arg374_1: "f32[1280]", arg375_1: "f32[46, 1280]", arg376_1: "f32[46]", arg377_1: "f32[46, 1280]", arg378_1: "f32[46]", arg379_1: "f32[1280, 46]", arg380_1: "f32[1280]", arg381_1: "f32[60, 1280]", arg382_1: "f32[60]", arg383_1: "f32[60, 1280]", arg384_1: "f32[60]", arg385_1: "f32[1280, 60]", arg386_1: "f32[1280]", arg387_1: "f32[60, 1280]", arg388_1: "f32[60]", arg389_1: "f32[60, 1280]", arg390_1: "f32[60]", arg391_1: "f32[1280, 60]", arg392_1: "f32[1280]", arg393_1: "f32[44, 1280]", arg394_1: "f32[44]", arg395_1: "f32[44, 1280]", arg396_1: "f32[44]", arg397_1: "f32[1280, 44]", arg398_1: "f32[1280]", arg399_1: "f32[64, 160]", arg400_1: "f32[64]", arg401_1: "f32[64, 160]", arg402_1: "f32[64]", arg403_1: "f32[160, 64]", arg404_1: "f32[160]", arg405_1: "f32[88, 1280]", arg406_1: "f32[88]", arg407_1: "f32[88, 1280]", arg408_1: "f32[88]", arg409_1: "f32[1280, 88]", arg410_1: "f32[1280]", arg411_1: "f32[1792, 1280]", arg412_1: "f32[1792]", arg413_1: "f32[1792, 1280]", arg414_1: "f32[1792]", arg415_1: "f32[1280, 1792]", arg416_1: "f32[1280]", arg417_1: "f32[142, 1280]", arg418_1: "f32[142]", arg419_1: "f32[142, 1280]", arg420_1: "f32[142]", arg421_1: "f32[1280, 142]", arg422_1: "f32[1280]", arg423_1: "f32[46, 1280]", arg424_1: "f32[46]", arg425_1: "f32[46, 1280]", arg426_1: "f32[46]", arg427_1: "f32[1280, 46]", arg428_1: "f32[1280]", arg429_1: "f32[60, 1280]", arg430_1: "f32[60]", arg431_1: "f32[60, 1280]", arg432_1: "f32[60]", arg433_1: "f32[1280, 60]", arg434_1: "f32[1280]", arg435_1: "f32[60, 1280]", arg436_1: "f32[60]", arg437_1: "f32[60, 1280]", arg438_1: "f32[60]", arg439_1: "f32[1280, 60]", arg440_1: "f32[1280]", arg441_1: "f32[44, 1280]", arg442_1: "f32[44]", arg443_1: "f32[44, 1280]", arg444_1: "f32[44]", arg445_1: "f32[1280, 44]", arg446_1: "f32[1280]", arg447_1: "f32[64, 160]", arg448_1: "f32[64]", arg449_1: "f32[64, 160]", arg450_1: "f32[64]", arg451_1: "f32[160, 64]", arg452_1: "f32[160]", arg453_1: "f32[736, 736]", arg454_1: "f32[736, 736]", arg455_1: "f32[736, 736]", arg456_1: "f32[736, 736]", arg457_1: "f32[4096, 736]", arg458_1: "f32[4096]", arg459_1: "f32[4096, 736]", arg460_1: "f32[4096]", arg461_1: "f32[736, 4096]", arg462_1: "f32[736]", arg463_1: "f32[736, 736]", arg464_1: "f32[736, 736]", arg465_1: "f32[736, 736]", arg466_1: "f32[736, 736]", arg467_1: "f32[88, 1280]", arg468_1: "f32[88]", arg469_1: "f32[88, 1280]", arg470_1: "f32[88]", arg471_1: "f32[1280, 88]", arg472_1: "f32[1280]", arg473_1: "f32[1792, 1280]", arg474_1: "f32[1792]", arg475_1: "f32[1792, 1280]", arg476_1: "f32[1792]", arg477_1: "f32[1280, 1792]", arg478_1: "f32[1280]", arg479_1: "f32[142, 1280]", arg480_1: "f32[142]", arg481_1: "f32[142, 1280]", arg482_1: "f32[142]", arg483_1: "f32[1280, 142]", arg484_1: "f32[1280]", arg485_1: "f32[46, 1280]", arg486_1: "f32[46]", arg487_1: "f32[46, 1280]", arg488_1: "f32[46]", arg489_1: "f32[1280, 46]", arg490_1: "f32[1280]", arg491_1: "f32[60, 1280]", arg492_1: "f32[60]", arg493_1: "f32[60, 1280]", arg494_1: "f32[60]", arg495_1: "f32[1280, 60]", arg496_1: "f32[1280]", arg497_1: "f32[60, 1280]", arg498_1: "f32[60]", arg499_1: "f32[60, 1280]", arg500_1: "f32[60]", arg501_1: "f32[1280, 60]", arg502_1: "f32[1280]", arg503_1: "f32[44, 1280]", arg504_1: "f32[44]", arg505_1: "f32[44, 1280]", arg506_1: "f32[44]", arg507_1: "f32[1280, 44]", arg508_1: "f32[1280]", arg509_1: "f32[64, 160]", arg510_1: "f32[64]", arg511_1: "f32[64, 160]", arg512_1: "f32[64]", arg513_1: "f32[160, 64]", arg514_1: "f32[160]", arg515_1: "f32[88, 1280]", arg516_1: "f32[88]", arg517_1: "f32[88, 1280]", arg518_1: "f32[88]", arg519_1: "f32[1280, 88]", arg520_1: "f32[1280]", arg521_1: "f32[1792, 1280]", arg522_1: "f32[1792]", arg523_1: "f32[1792, 1280]", arg524_1: "f32[1792]", arg525_1: "f32[1280, 1792]", arg526_1: "f32[1280]", arg527_1: "f32[142, 1280]", arg528_1: "f32[142]", arg529_1: "f32[142, 1280]", arg530_1: "f32[142]", arg531_1: "f32[1280, 142]", arg532_1: "f32[1280]", arg533_1: "f32[46, 1280]", arg534_1: "f32[46]", arg535_1: "f32[46, 1280]", arg536_1: "f32[46]", arg537_1: "f32[1280, 46]", arg538_1: "f32[1280]", arg539_1: "f32[60, 1280]", arg540_1: "f32[60]", arg541_1: "f32[60, 1280]", arg542_1: "f32[60]", arg543_1: "f32[1280, 60]", arg544_1: "f32[1280]", arg545_1: "f32[60, 1280]", arg546_1: "f32[60]", arg547_1: "f32[60, 1280]", arg548_1: "f32[60]", arg549_1: "f32[1280, 60]", arg550_1: "f32[1280]", arg551_1: "f32[44, 1280]", arg552_1: "f32[44]", arg553_1: "f32[44, 1280]", arg554_1: "f32[44]", arg555_1: "f32[1280, 44]", arg556_1: "f32[1280]", arg557_1: "f32[64, 160]", arg558_1: "f32[64]", arg559_1: "f32[64, 160]", arg560_1: "f32[64]", arg561_1: "f32[160, 64]", arg562_1: "f32[160]", arg563_1: "f32[736, 736]", arg564_1: "f32[736, 736]", arg565_1: "f32[736, 736]", arg566_1: "f32[736, 736]", arg567_1: "f32[4096, 736]", arg568_1: "f32[4096]", arg569_1: "f32[4096, 736]", arg570_1: "f32[4096]", arg571_1: "f32[736, 4096]", arg572_1: "f32[736]", arg573_1: "f32[736, 736]", arg574_1: "f32[736, 736]", arg575_1: "f32[736, 736]", arg576_1: "f32[736, 736]", arg577_1: "f32[28, 160]", arg578_1: "f32[28]", arg579_1: "f32[28, 160]", arg580_1: "f32[28]", arg581_1: "f32[160, 28]", arg582_1: "f32[160]", arg583_1: "f32[28, 160]", arg584_1: "f32[28]", arg585_1: "f32[28, 160]", arg586_1: "f32[28]", arg587_1: "f32[160, 28]", arg588_1: "f32[160]", arg589_1: "f32[528, 1280]", arg590_1: "f32[528]", arg591_1: "f32[528, 1280]", arg592_1: "f32[528]", arg593_1: "f32[1280, 528]", arg594_1: "f32[1280]", arg595_1: "f32[528, 1280]", arg596_1: "f32[528]", arg597_1: "f32[528, 1280]", arg598_1: "f32[528]", arg599_1: "f32[1280, 528]", arg600_1: "f32[1280]", arg601_1: "f32[64, 160]", arg602_1: "f32[64]", arg603_1: "f32[64, 160]", arg604_1: "f32[64]", arg605_1: "f32[160, 64]", arg606_1: "f32[160]", arg607_1: "f32[736, 736]", arg608_1: "f32[736, 736]", arg609_1: "f32[736, 736]", arg610_1: "f32[736, 736]", arg611_1: "f32[1873, 736]", arg612_1: "f32[1873]", arg613_1: "f32[1873, 736]", arg614_1: "f32[1873]", arg615_1: "f32[736, 1873]", arg616_1: "f32[736]", arg617_1: "f32[1288, 736]", arg618_1: "f32[1288, 736]", arg619_1: "f32[1288, 736]", arg620_1: "f32[736, 1288]", arg621_1: "f32[42, 736]", arg622_1: "f32[42]", arg623_1: "f32[42, 736]", arg624_1: "f32[42]", arg625_1: "f32[736, 42]", arg626_1: "f32[736]", arg627_1: "f32[736, 736]", arg628_1: "f32[736, 736]", arg629_1: "f32[736, 736]", arg630_1: "f32[736, 736]", arg631_1: "f32[696, 736]", arg632_1: "f32[696]", arg633_1: "f32[696, 736]", arg634_1: "f32[696]", arg635_1: "f32[736, 696]", arg636_1: "f32[736]", arg637_1: "f32[736, 736]", arg638_1: "f32[736, 736]", arg639_1: "f32[736, 736]", arg640_1: "f32[736, 736]", arg641_1: "f32[1562, 736]", arg642_1: "f32[1562]", arg643_1: "f32[1562, 736]", arg644_1: "f32[1562]", arg645_1: "f32[736, 1562]", arg646_1: "f32[736]", arg647_1: "f32[736, 736]", arg648_1: "f32[736, 736]", arg649_1: "f32[736, 736]", arg650_1: "f32[736, 736]", arg651_1: "f32[2091, 736]", arg652_1: "f32[2091]", arg653_1: "f32[2091, 736]", arg654_1: "f32[2091]", arg655_1: "f32[736, 2091]", arg656_1: "f32[736]", arg657_1: "f32[276, 736]", arg658_1: "f32[276]", arg659_1: "f32[8192, 48]", arg660_1: "f32[8]", arg661_1: "f32[]", arg662_1: "f32[8]", arg663_1: "f32[]", arg664_1: "f32[8]", arg665_1: "f32[]", arg666_1: "f32[8]", arg667_1: "f32[]", arg668_1: "f32[8]", arg669_1: "f32[]", arg670_1: "f32[8]", arg671_1: "f32[]", arg672_1: "f32[8]", arg673_1: "f32[]", arg674_1: "f32[8]", arg675_1: "f32[]", arg676_1: "f32[8]", arg677_1: "f32[]", arg678_1: "f32[8]", arg679_1: "f32[]", arg680_1: "f32[8, 160, 512]", arg681_1: "f32[8]", arg682_1: "f32[]", arg683_1: "f32[8]", arg684_1: "f32[]", arg685_1: "f32[8, 160, 512]", arg686_1: "f32[8]", arg687_1: "f32[]", arg688_1: "f32[8]", arg689_1: "f32[]", arg690_1: "f32[8, 160, 512]", arg691_1: "f32[8]", arg692_1: "f32[]", arg693_1: "f32[8]", arg694_1: "f32[]", arg695_1: "f32[8]", arg696_1: "f32[]", arg697_1: "f32[8]", arg698_1: "f32[]", arg699_1: "f32[8]", arg700_1: "f32[]", arg701_1: "f32[8]", arg702_1: "f32[]", arg703_1: "f32[8]", arg704_1: "f32[]", arg705_1: "f32[8, 160, 512]", arg706_1: "f32[8]", arg707_1: "f32[]", arg708_1: "f32[8]", arg709_1: "f32[]", arg710_1: "f32[8, 160, 512]", arg711_1: "f32[8, 160, 512]", arg712_1: "f32[8]", arg713_1: "f32[]", arg714_1: "f32[8]", arg715_1: "f32[]", arg716_1: "f32[8, 160, 512]", arg717_1: "f32[8, 160, 512]", arg718_1: "f32[8]", arg719_1: "f32[]", arg720_1: "f32[8]", arg721_1: "f32[]", arg722_1: "f32[8, 160, 512]", arg723_1: "f32[8]", arg724_1: "f32[]", arg725_1: "f32[14]", arg726_1: "f32[]", arg727_1: "f32[8]", arg728_1: "f32[]", arg729_1: "f32[8]", arg730_1: "f32[]", arg731_1: "f32[8]", arg732_1: "f32[]", arg733_1: "i64[1, s45]"):
+    # File: /home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/nn/modules/sparse.py:191 in forward, code: return F.embedding(
+    embedding: "f32[1, s45, 736]" = torch.ops.aten.embedding.default(arg0_1, arg733_1);  arg0_1 = None
+    
+    # File: /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/neural_embedding.py:125 in forward, code: self._compute_addr_keys(token_ids, x)
+    sym_size_int: "Sym(s45)" = torch.ops.aten.sym_size.int(arg733_1, 1)
+    arange: "i64[s45]" = torch.ops.aten.arange.default(sym_size_int, dtype = torch.int64, device = device(type='cpu'), pin_memory = False)
+    sub: "i64[s45]" = torch.ops.aten.sub.Tensor(arange, 1);  arange = None
+    remainder: "i64[s45]" = torch.ops.aten.remainder.Scalar(sub, 8)
+    floor_divide: "i64[s45]" = torch.ops.aten.floor_divide.default(sub, 8)
+    mul: "i64[s45]" = torch.ops.aten.mul.Tensor(floor_divide, 8);  floor_divide = None
+    add: "i64[s45]" = torch.ops.aten.add.Tensor(mul, 2);  mul = None
+    add_1: "i64[s45]" = torch.ops.aten.add.Tensor(add, remainder);  add = None
+    ge: "b8[s45]" = torch.ops.aten.ge.Scalar(sub, 0);  sub = None
+    lt: "b8[s45]" = torch.ops.aten.lt.Scalar(remainder, 5);  remainder = None
+    and_1: "b8[s45]" = torch.ops.aten.__and__.Tensor(ge, lt);  ge = lt = None
+    eq: "b8[1, s45]" = torch.ops.aten.eq.Scalar(arg733_1, 265);  arg733_1 = None
+    to: "i64[1, s45]" = torch.ops.aten.to.dtype(eq, torch.int64);  eq = None
+    cumsum: "i64[1, s45]" = torch.ops.aten.cumsum.default(to, 1);  to = None
+    eq_1: "b8[1, s45]" = torch.ops.aten.eq.Scalar(cumsum, 0);  cumsum = None
+    unsqueeze: "b8[1, s45]" = torch.ops.aten.unsqueeze.default(and_1, 0);  and_1 = None
+    and_2: "b8[1, s45]" = torch.ops.aten.__and__.Tensor(eq_1, unsqueeze);  eq_1 = unsqueeze = None
+    to_1: "f32[1, s45]" = torch.ops.aten.to.dtype(and_2, torch.float32);  and_2 = None
+    unsqueeze_1: "f32[1, s45, 1]" = torch.ops.aten.unsqueeze.default(to_1, -1);  to_1 = None
+    remainder_1: "i64[s45]" = torch.ops.aten.remainder.Scalar(add_1, 16)
+    clamp: "i64[s45]" = torch.ops.aten.clamp.default(remainder_1, 0, 15);  remainder_1 = None
+    floor_divide_1: "i64[s45]" = torch.ops.aten.floor_divide.default(add_1, 16)
+    remainder_2: "i64[s45]" = torch.ops.aten.remainder.Scalar(floor_divide_1, 16);  floor_divide_1 = None
+    clamp_1: "i64[s45]" = torch.ops.aten.clamp.default(remainder_2, 0, 15);  remainder_2 = None
+    floor_divide_2: "i64[s45]" = torch.ops.aten.floor_divide.default(add_1, 256);  add_1 = None
+    remainder_3: "i64[s45]" = torch.ops.aten.remainder.Scalar(floor_divide_2, 16);  floor_divide_2 = None
+    clamp_2: "i64[s45]" = torch.ops.aten.clamp.default(remainder_3, 0, 15);  remainder_3 = None
+    one_hot: "i64[s45, 16]" = torch.ops.aten.one_hot.default(clamp, 16);  clamp = None
+    to_2: "f32[s45, 16]" = torch.ops.aten.to.dtype(one_hot, torch.float32);  one_hot = None
+    one_hot_1: "i64[s45, 16]" = torch.ops.aten.one_hot.default(clamp_1, 16);  clamp_1 = None
+    to_3: "f32[s45, 16]" = torch.ops.aten.to.dtype(one_hot_1, torch.float32);  one_hot_1 = None
+    one_hot_2: "i64[s45, 16]" = torch.ops.aten.one_hot.default(clamp_2, 16);  clamp_2 = None
+    to_4: "f32[s45, 16]" = torch.ops.aten.to.dtype(one_hot_2, torch.float32);  one_hot_2 = None
+    cat: "f32[s45, 48]" = torch.ops.aten.cat.default([to_2, to_3, to_4], -1);  to_2 = to_3 = to_4 = None
+    unsqueeze_2: "f32[1, s45, 48]" = torch.ops.aten.unsqueeze.default(cat, 0);  cat = None
+    mul_1: "f32[1, s45, 48]" = torch.ops.aten.mul.Tensor(unsqueeze_2, unsqueeze_1);  unsqueeze_2 = unsqueeze_1 = None
+    le: "Sym(s45 <= 9223372036854775807)" = sym_size_int <= 9223372036854775807;  le = None
+    slice_1: "f32[1, s45, 736]" = torch.ops.aten.slice.Tensor(embedding, 1, 0, 9223372036854775807)
+    slice_2: "f32[1, s45, 48]" = torch.ops.aten.slice.Tensor(slice_1, 2, 133, 181);  slice_1 = None
+    add_: "f32[1, s45, 48]" = torch.ops.aten.add_.Tensor(slice_2, mul_1);  slice_2 = mul_1 = add_ = None
+    
+    # File: /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:362 in forward, code: Q = linear(x, self.W_q).view(B, S, H, HD).transpose(1, 2)
+    linear: "f32[1, s45, 736]" = torch.ops.aten.linear.default(embedding, arg1_1);  arg1_1 = None
+    view: "f32[1, s45, 8, 92]" = torch.ops.aten.view.default(linear, [1, sym_size_int, 8, 92]);  linear = None
+    transpose: "f32[1, 8, s45, 92]" = torch.ops.aten.transpose.int(view, 1, 2);  view = None
+    
+    # File: /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:372 in forward, code: K_new = linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
+    linear_1: "f32[1, s45, 736]" = torch.ops.aten.linear.default(embedding, arg2_1);  arg2_1 = None
+    view_1: "f32[1, s45, 8, 92]" = torch.ops.aten.view.default(linear_1, [1, sym_size_int, 8, 92]);  linear_1 = None
+    transpose_1: "f32[1, 8, s45, 92]" = torch.ops.aten.transpose.int(view_1, 1, 2);  view_1 = None
+    
+    # File: /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:373 in forward, code: V_new = linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
+    linear_2: "f32[1, s45, 736]" = torch.ops.aten.linear.default(embedding, arg3_1);  arg3_1 = None
+    view_2: "f32[1, s45, 8, 92]" = torch.ops.aten.view.default(linear_2, [1, sym_size_int, 8, 92]);  linear_2 = None
+    transpose_2: "f32[1, 8, s45, 92]" = torch.ops.aten.transpose.int(view_2, 1, 2);  view_2 = None
+    
+    # File: /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:405 in forward, code: q_pos_1d = torch.arange(S_kv - S_q, S_kv, device=x.device)
+    sub_1: "Sym(0)" = sym_size_int - sym_size_int;  sub_1 = None
+    arange_1: "i64[s45]" = torch.ops.aten.arange.start(0, sym_size_int, device = device(type='cpu'), pin_memory = False)
+    
+    # File: /home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/vm_step.py:406 in forward, code: k_pos_1d = torch.arange(S_kv, device=x.device)
+    arange_2: "i64[s45]" = torch.ops.aten.arange.default(sym_size_int, device = device(type='cpu'), pin_memory = False)
+
+=== ... (full log trimmed; ~210k lines of dynamo debug output removed) ===
+
+=== TAIL (last 80 lines) ===
+    r = self.evaluate()
+        ^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/fx/experimental/sym_node.py", line 515, in evaluate
+    return self.shape_env.evaluate_sym_node(self, size_oblivious)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/fx/experimental/symbolic_shapes.py", line 7318, in evaluate_sym_node
+    return self.evaluate_expr(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/fx/experimental/symbolic_shapes.py", line 7413, in evaluate_expr
+    return self._inner_evaluate_expr(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/fx/experimental/recording.py", line 273, in wrapper
+    return retlog(fn(*args, **kwargs))
+                  ^^^^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/fx/experimental/symbolic_shapes.py", line 7436, in _inner_evaluate_expr
+    return self._evaluate_expr(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/fx/experimental/symbolic_shapes.py", line 7655, in _evaluate_expr
+    raise self._make_data_dependent_error(
+torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode: Could not guard on data-dependent expression Eq(u0, 1) (unhinted: Eq(u0, 1)).  (Size-like symbols: none)
+
+consider using data-dependent friendly APIs such as guard_or_false, guard_or_true and statically_known_true.
+Caused by: (_export/non_strict_utils.py:1139 in __torch_function__)
+For more information, run with TORCH_LOGS="dynamic"
+For extended logs when we create symbols, also add TORCHDYNAMO_EXTENDED_DEBUG_CREATE_SYMBOL="u0"
+If you suspect the guard was triggered from C++, add TORCHDYNAMO_EXTENDED_DEBUG_CPP=1
+For more debugging help, see https://docs.google.com/document/d/1HSuTTVvYH1pTew89Rtpeu84Ht3nQEFTYhAX3Ypa_xJs/edit?usp=sharing
+
+For C++ stack trace, run with TORCHDYNAMO_EXTENDED_DEBUG_CPP=1
+
+The following call raised this error:
+  File "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/alu/ops/divmod_longdiv.py", line 284, in forward
+    if b_is_zero.any():
+
+
+The error above occurred when calling torch.export.export. If you would like to view some more information about this error, and get a list of all other errors that may occur in your export call, you can replace your `export()` call with `draft_export()`.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/tmp/dynamo_export.py", line 25, in <module>
+    onnx_program = torch.onnx.export(
+                   ^^^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/__init__.py", line 296, in export
+    return _compat.export_compat(
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/_internal/exporter/_compat.py", line 154, in export_compat
+    onnx_program = _core.export(
+                   ^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/_internal/exporter/_flags.py", line 27, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/site-packages/torch/onnx/_internal/exporter/_core.py", line 1409, in export
+    raise _errors.TorchExportError(
+torch.onnx._internal.exporter._errors.TorchExportError: Failed to export the model with torch.export. [96mThis is step 1/3[0m of exporting the model to ONNX. Next steps:
+- Modify the model code for `torch.export.export` to succeed. Refer to https://pytorch.org/docs/stable/generated/exportdb/index.html for more information.
+- Debug `torch.export.export` and submit a PR to PyTorch.
+- Create an issue in the PyTorch GitHub repository against the [96m*torch.export*[0m component and attach the full error stack as well as reproduction scripts.
+
+## Exception summary
+
+<class 'torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode'>: Could not guard on data-dependent expression Eq(u0, 1) (unhinted: Eq(u0, 1)).  (Size-like symbols: none)
+
+consider using data-dependent friendly APIs such as guard_or_false, guard_or_true and statically_known_true.
+Caused by: (_export/non_strict_utils.py:1139 in __torch_function__)
+For more information, run with TORCH_LOGS="dynamic"
+For extended logs when we create symbols, also add TORCHDYNAMO_EXTENDED_DEBUG_CREATE_SYMBOL="u0"
+If you suspect the guard was triggered from C++, add TORCHDYNAMO_EXTENDED_DEBUG_CPP=1
+For more debugging help, see https://docs.google.com/document/d/1HSuTTVvYH1pTew89Rtpeu84Ht3nQEFTYhAX3Ypa_xJs/edit?usp=sharing
+
+For C++ stack trace, run with TORCHDYNAMO_EXTENDED_DEBUG_CPP=1
+
+The following call raised this error:
+  File "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/alu/ops/divmod_longdiv.py", line 284, in forward
+    if b_is_zero.any():
+
+
+The error above occurred when calling torch.export.export. If you would like to view some more information about this error, and get a list of all other errors that may occur in your export call, you can replace your `export()` call with `draft_export()`.
+
+(Refer to the full stack trace above for more information.)

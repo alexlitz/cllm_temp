@@ -1,0 +1,38 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 24 items
+
+c4_release/tests/test_onnx_export.py .....sF.........x.xXF...            [100%]
+
+=================================== FAILURES ===================================
+________________ TestARVMExport.test_model_embedding_structure _________________
+c4_release/tests/test_onnx_export.py:111: in test_model_embedding_structure
+    assert weights.shape[1] == 512  # d_model
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   assert 736 == 512
+__________ TestONNXExportStatus.test_attention_without_alibi_exports ___________
+c4_release/tests/test_onnx_export.py:440: in test_attention_without_alibi_exports
+    attn = AutoregressiveAttention(
+E   TypeError: AutoregressiveAttention.__init__() got an unexpected keyword argument 'd_model'
+=============================== warnings summary ===============================
+tests/test_onnx_export.py::TestONNXRuntime::test_simple_onnx_model_creation
+tests/test_onnx_export.py::TestONNXExportCapabilities::test_swiglu_ffn_exportable
+tests/test_onnx_export.py::TestONNXExportStatus::test_embedding_exports
+tests/test_onnx_export.py::TestONNXExportStatus::test_softmax1_exports
+tests/test_onnx_export.py::TestONNXRuntimeExecution::test_ffn_onnx_matches_pytorch
+tests/test_onnx_export.py::TestONNXRuntimeExecution::test_embedding_onnx_matches_pytorch
+  /home/alexlitz/.pyenv/versions/3.12.6/lib/python3.12/copyreg.py:99: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+    return cls.__new__(cls, *args)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED c4_release/tests/test_onnx_export.py::TestARVMExport::test_model_embedding_structure
+FAILED c4_release/tests/test_onnx_export.py::TestONNXExportStatus::test_attention_without_alibi_exports
+= 2 failed, 18 passed, 1 skipped, 2 xfailed, 1 xpassed, 6 warnings in 118.90s (0:01:58) =
