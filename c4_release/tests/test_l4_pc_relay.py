@@ -7,9 +7,13 @@ Layer 4 owns the PC-marker → AX-marker relay that drives the L5 fetch:
   (head 0) and the byte positions' TEMP slot (head 1). Load-bearing
   for L5's first-step opcode fetch.
 * ``layer4_sp_to_addr_key`` — SP-to-ADDR_KEY staging for the
-  STACK0_VIA_MEM_ATTENTION_PLAN. Now ships with a populated per-cell
-  claim map (48 declared cells), so it is drift-checked alongside the
-  relay rather than tracked as absent.
+  STACK0_VIA_MEM_ATTENTION_PLAN. Registered in ``all_core_ops`` with
+  ``enable=False`` because its L8 reader runs before the current
+  neural ADDR_KEY decode (so MEM value tokens do not yet carry stable
+  byte-address keys). With ``enable=False`` the op authors zero
+  per-cell claims, so the verifier skips it — tracked below as a
+  known-absent op so flipping the enable flag will trip a loud test
+  failure that migrates it into the drift-checked list.
 * ``layer4_ffn`` — Phase-A PC+1/+2/+3/+4 nibble rotation chain. Ships
   with empty ``claims`` today (544 hidden units spec'd via
   ``ffn_units_used`` only) so the verifier skips it. Tracked below as
@@ -25,7 +29,6 @@ from ._per_op_audit import assert_no_drift, assert_op_absent, assert_op_fires
 
 L4_OPS_WITH_CLAIMS = (
     "layer4_pc_relay",
-    "layer4_sp_to_addr_key",
 )
 
 # Ops that intentionally ship with empty ``claims`` in the default
@@ -33,6 +36,13 @@ L4_OPS_WITH_CLAIMS = (
 # adding claims later requires updating this constant.
 L4_OPS_WITHOUT_CLAIMS_DEFAULT_BUILD = (
     "layer4_ffn",
+    # STACK0_VIA_MEM_ATTENTION_PLAN registers this op with
+    # ``enable=False`` until MEM value-byte ADDR_KEY producers exist
+    # before L8. The op's ``_claims`` set is gated on ``enable`` so it
+    # ships empty by default and the verifier skips it. When the plan
+    # lands and the call site flips to ``enable=True``, move this back
+    # into ``L4_OPS_WITH_CLAIMS`` (the 48-cell map is already authored).
+    "layer4_sp_to_addr_key",
 )
 
 
