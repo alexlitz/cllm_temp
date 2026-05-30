@@ -97,6 +97,25 @@ def pytest_collection_modifyitems(config, items):
 
 
 # =============================================================================
+# Fixtures - Declarative Verifier (shared across per-layer audit harnesses)
+# =============================================================================
+
+@pytest.fixture(scope="session")
+def static_claims_report():
+    """Run ``verify_claims_static`` once per pytest session.
+
+    The verifier builds the production layout + a fresh ``AutoregressiveVM``
+    and runs every annotated op's bake under diff-based instrumentation
+    (~25-60s wall on the current model). Per-layer audit harnesses
+    (``test_l8_per_op.py``, ``test_l13_mem_addr_gather.py``, ...) all read
+    the same report; sharing it at session scope keeps the audit's
+    wall-clock cost flat regardless of how many per-layer modules are added.
+    """
+    from neural_vm.unified_compiler.decl_verifier import verify_claims_static
+    return verify_claims_static()
+
+
+# =============================================================================
 # Fixtures - Fast Runners
 # =============================================================================
 
