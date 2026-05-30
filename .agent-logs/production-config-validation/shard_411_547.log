@@ -1,0 +1,22 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-a57fe05c0b3dd3619/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 1 item
+
+c4_release/tests/test_1096_neural_declarative_diagnostic.py [1096-progress] mode=final-output phase=start rows=0/137 batch=8 ids=0411-0418 max_steps=7
+[1096-progress] mode=final-output phase=done rows=8/137 batch=8 ids=0411-0418 max_steps=7
+[1096-progress] mode=final-output phase=start rows=8/137 batch=8 ids=0419-0426 max_steps=14
+[1096-progress] mode=final-output phase=done rows=16/137 batch=8 ids=0419-0426 max_steps=14
+[1096-progress] mode=final-output phase=start rows=16/137 batch=8 ids=0427-0434 max_steps=14
+[1096-progress] mode=final-output phase=done rows=24/137 batch=8 ids=0427-0434 max_steps=14
+[1096-progress] mode=final-output phase=start rows=24/137 batch=8 ids=0435-0442 max_steps=14
+[1096-progress] mode=final-output phase=done rows=32/137 batch=8 ids=0435-0442 max_steps=14
+[1096-progress] mode=final-output phase=start rows=32/137 batch=8 ids=0443-0450 max_steps=451
+[1096-progress] mode=final-output phase=done rows=40/137 batch=8 ids=0443-0450 max_steps=451
+[1096-progress] mode=final-output phase=start rows=40/137 batch=8 ids=0451-0458 max_steps=451
