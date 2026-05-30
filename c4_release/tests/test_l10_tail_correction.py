@@ -3278,6 +3278,62 @@ def test_tail_sp_marker_byte0_f8_blocks_ent_frame_setup():
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
 
 
+def test_tail_sp_marker_byte0_f8_lifecycle_gate_blocks_post_psh_residue():
+    """HAS_SE lifecycle gate: at any step >= 1 SP marker, accumulated
+    OUTPUT_LO+8 / OUTPUT_HI+15 residues from prior PSH/POP/ENT/ADJ
+    layer activity must NOT spuriously fire the initial-stack 0xF8 rule.
+
+    Regression for the ~461 SP_byte0 first-fatal failures observed
+    across the 1096-test diagnostic suite (B5-J).
+    """
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    # Post-PSH SP marker: HAS_SE saturated (prior STEP_END exists),
+    # OUTPUT residue accumulated to ~4192 on the F8 lanes (matching
+    # the histogram observation in the B5 campaign brief).
+    out = ir.symbolic_ffn({
+        "MARK_SP": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        "HAS_SE": 0.9982,
+        "OUTPUT_LO+8": 4192.0,
+        "OUTPUT_HI+15": 4192.0,
+    })
+
+    # Rule MUST NOT fire — HAS_SE blocker dominates. Lanes stay at their
+    # pre-rule residue values.
+    assert out["OUTPUT_LO+8"] == 4192.0
+    assert out["OUTPUT_HI+15"] == 4192.0
+    for lane in range(16):
+        if lane != 8:
+            assert out.get(f"OUTPUT_LO+{lane}", 0.0) == 0.0
+        if lane != 15:
+            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == 0.0
+
+
+def test_tail_sp_marker_byte0_f8_lifecycle_gate_allows_initial_step():
+    """At the initial-stack SP marker, HAS_SE=0 (no prior STEP_END),
+    so the lifecycle blocker contributes 0 and the rule still fires
+    on the legitimate 0xF8 OUTPUT residue from L3's default emission.
+    """
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    # Initial-stack SP marker (no HAS_SE set in input → defaults to 0).
+    out = ir.symbolic_ffn({
+        "MARK_SP": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        # HAS_SE intentionally omitted (= 0.0 at step 0).
+        "OUTPUT_LO+0": 0.9734733700752258,
+        "OUTPUT_LO+8": 0.026526624336838722,
+        "OUTPUT_HI+0": 0.97722327709198,
+        "OUTPUT_HI+15": 0.02277671918272972,
+    })
+
+    assert out["OUTPUT_LO+8"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(4.0)
+
+
 def test_tail_sp_byte1_ff_from_initial_stack_exacts_nibbles():
     ir = _tail_prefix_ir("tail_sp_byte1_ff_from_initial_stack_exact")
 

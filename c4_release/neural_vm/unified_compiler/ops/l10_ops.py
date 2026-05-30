@@ -3461,6 +3461,18 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=70.0,
             writes=byte_writes(0x01, strength=4.0),
         ),
+        # Lifecycle gate: HAS_SE is set by L1 to ~1.0 once any prior STEP_END
+        # exists in the trace, and stays at ~0.0 throughout step 0 (the only
+        # step where SP_byte0 should legitimately be forced to 0xF8 by this
+        # rule). The previous -100 blocker was insufficient — at post-PSH/POP
+        # SP markers the OUTPUT_LO+8 / OUTPUT_HI+15 residue accumulates to
+        # thousands, easily swamping a -100*1 blocker and firing spuriously.
+        # Promote the blocker to -1e9 so a single saturated HAS_SE crushes any
+        # OUTPUT-residue or marker-presence positive evidence. Per the
+        # B3-gamma rejection of the MARK_SP/OUTPUT inversion (commit
+        # 5ef58b0): a separate lifecycle signal is required because the
+        # OUTPUT residues cannot discriminate amplification from spurious
+        # blocking on their own.
         *exact_output_byte_rules(
             name="tail_sp_marker_byte0_f8_from_initial_stack_exact",
             expected_byte=0xF8,
@@ -3487,7 +3499,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_MEM", -1_000_000_000.0),
                 ("OP_JSR", -1000000.0),
                 ("IS_BYTE", -100.0),
-                ("HAS_SE", -100.0),
+                # Lifecycle gate: 0 at the initial-stack SP marker (no prior
+                # STEP_END in the trace), ~1 at every later SP marker. Strong
+                # enough to dominate accumulated OUTPUT_LO+8 / OUTPUT_HI+15
+                # residue at post-PSH/POP/ENT/ADJ SP markers without
+                # disturbing the legitimate initial-stack firing.
+                ("HAS_SE", -1_000_000_000.0),
                 ("NEXT_PC", -1000000.0),
                 ("NEXT_AX", -1000.0),
                 ("NEXT_SP", -1000000.0),
