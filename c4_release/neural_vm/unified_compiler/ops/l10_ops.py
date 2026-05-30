@@ -3710,6 +3710,16 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OUTPUT_HI+0", 1.0),
                 ("OUTPUT_HI+14", -1.0),
                 ("OUTPUT_HI+15", -1.0),
+                # B4-C: discriminate 0x00 (global addr nibbles 0/0) from 0xE8
+                # (local-frame addr nibbles 8/14). The original rule lacked the
+                # ADDR_B0_LO/HI nibble conditions and over-fired at
+                # step5:MEM_addr0 where the true address byte was 0xE8.
+                # Require nibble 0 on both halves; veto when nibble 8/14 is
+                # active (the local-frame 0xE8 signature).
+                ("ADDR_B0_LO+0", 5.0),
+                ("ADDR_B0_HI+0", 5.0),
+                ("ADDR_B0_LO+8", -1000000.0),
+                ("ADDR_B0_HI+14", -1000000.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -3724,7 +3734,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=60.0,
+            threshold=70.0,
             writes=byte_writes(0x00, strength=1_000_000_000.0),
         ),
         *exact_output_byte_rules(
