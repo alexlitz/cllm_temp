@@ -1042,7 +1042,7 @@ class AddSubBytePropagationPostOp(PureFFN):
                             self.W_up.data[unit, BD.IS_BYTE] = S
                             self.W_up.data[unit, BD.H1 + 1] = S
                             for wrong_h1 in (0, 2, 3, 4, 5, 6):
-                                self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10_000_000
+                                self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10000
                             self.W_up.data[unit, BD.BYTE_INDEX_0] = S
                             self.W_up.data[unit, BD.BYTE_INDEX_1] = -S * 10
                             self.W_up.data[unit, BD.BYTE_INDEX_2] = -S * 10
@@ -1061,7 +1061,7 @@ class AddSubBytePropagationPostOp(PureFFN):
                                 BD.MARK_MEM,
                                 BD.MARK_SE,
                             ):
-                                self.W_up.data[unit, marker_dim] = -S * 10_000_000
+                                self.W_up.data[unit, marker_dim] = -S * 10000
                             # Nonzero old-nibble rules must see actual
                             # evidence for their lane. Otherwise the common
                             # zero-lane passthrough is enough to activate all
@@ -1073,7 +1073,7 @@ class AddSubBytePropagationPostOp(PureFFN):
                                 else 26.35
                             )
                             self.b_up.data[unit] = -S * threshold
-                            self.W_gate.data[unit, op_dim] = 1.0
+                            self.W_gate.data[unit, BD.CONST] = 1.0
                             if b != result:
                                 self.W_down.data[out_base + b, unit] = -50.0 / S
                             if b != 0 and result != 0:
@@ -1103,7 +1103,7 @@ class AddSubBytePropagationPostOp(PureFFN):
                     self.W_up.data[unit, BD.IS_BYTE] = S
                     self.W_up.data[unit, BD.H1 + 1] = S
                     for wrong_h1 in (0, 2, 3, 4, 5, 6):
-                        self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10_000_000
+                        self.W_up.data[unit, BD.H1 + wrong_h1] = -S * 10000
                     self.W_up.data[unit, byte_dim] = S
                     self.W_up.data[unit, BD.CLEAN_EMBED_LO + 15] = S * 2
                     self.W_up.data[unit, BD.CLEAN_EMBED_HI + 15] = S * 2
@@ -1120,7 +1120,7 @@ class AddSubBytePropagationPostOp(PureFFN):
                         BD.MARK_MEM,
                         BD.MARK_SE,
                     ):
-                        self.W_up.data[unit, marker_dim] = -S * 10_000_000
+                        self.W_up.data[unit, marker_dim] = -S * 10000
                     self.b_up.data[unit] = -S * 7.5
                     self.W_gate.data[unit, BD.CONST] = 1.0
                     self.W_down.data[out_base + 0, unit] = -2.0 / S
