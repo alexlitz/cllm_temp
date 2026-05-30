@@ -3536,6 +3536,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # above the staged stack-address byte. When the declarative store
         # address evidence proves byte 0 is 0xf8, assert both nibbles with a
         # real margin before the output head consumes the marker row.
+        #
+        # B6-B / B4-H Path 2: rule C (0xF8 PSH-store) augmented with soft
+        # ADDR_B0 evidence (LO+8 / HI+15 → 0xF8).  The PSH-store path can
+        # fire before the L13 ADDR_B0 gather has completed, so we cannot
+        # require the L13 lanes (see plan 3.3 — same pattern as rule M).
+        # The disjoint CMP+0 / ALU_LO+2 witnesses remain as the legitimate
+        # fallback; ADDR_B0 strengthens the proof when present.  Strength
+        # stays at 10k.
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f8_exact",
             conditions=(
@@ -3548,6 +3556,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_STORE", 1.0),
                 ("CMP+0", 2.0),
                 ("ALU_LO+2", 5.0),
+                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
+                # 0xF8 → (LO+8, HI+15). These add conviction when L13's
+                # gather has completed; they are not required to fire.
+                ("ADDR_B0_LO+8", 2.0),
+                ("ADDR_B0_HI+15", 2.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -3565,6 +3578,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=33.0,
             writes=byte_writes(0xF8, strength=10_000.0),
         ),
+        # B6-B / B4-H Path 2: rule D (0xFF stack byte 1) augmented with soft
+        # ADDR_B1 evidence (LO+15 / HI+15 → 0xFF).  The L13 mem-addr gather
+        # writes B1 lanes too; this strengthens the proof when present.
         *exact_output_byte_rules(
             name="tail_mem_store_addr1_ff_from_stack_store_exact",
             expected_byte=0xFF,
@@ -3583,6 +3599,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_ADDR_SRC", 2.0),
                 ("CLEAN_EMBED_LO+8", 5.0),
                 ("CLEAN_EMBED_HI+15", 5.0),
+                # Soft positive evidence from L13 ADDR_B1 lanes (B6-B).
+                # 0xFF → (LO+15, HI+15).
+                ("ADDR_B1_LO+15", 2.0),
+                ("ADDR_B1_HI+15", 2.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -1000000.0),
                 ("MARK_SP", -1000000.0),
@@ -3600,6 +3620,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=50.0,
             active_value=500.0,
         ),
+        # B6-B / B4-H Path 2: rule E (0xF8 JSR initial push) augmented with
+        # soft ADDR_B0 evidence (LO+8 / HI+15 → 0xF8) and bounded max_abs_weight
+        # at 1e6 (was 1e9).  The JSR push of return-PC fires before L13 ADDR_B0
+        # gather has completed, so the L13 lanes are SOFT-only — the OP_JSR /
+        # CMP+4 evidence remains the primary proof.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_f8_initial_jsr_exact",
             expected_byte=0xF8,
@@ -3613,6 +3638,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_STORE", 1.0),
                 ("OP_JSR", 1.0),
                 ("CMP+4", 1.0),
+                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
+                # 0xF8 → (LO+8, HI+15). These add conviction when L13's
+                # gather has completed; they are not required to fire.
+                ("ADDR_B0_LO+8", 2.0),
+                ("ADDR_B0_HI+15", 2.0),
                 ("HAS_SE", -100.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
@@ -3632,6 +3662,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             active_value=5000.0,
             max_abs_weight=1_000_000_000.0,
         ),
+        # B6-B / B4-H Path 2: rule F (0xF8 JSR authority) augmented with soft
+        # ADDR_B0 evidence; strength stays at 50k (already bounded).
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f8_initial_jsr_authority",
             conditions=(
@@ -3644,6 +3676,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_STORE", 1.0),
                 ("OP_JSR", 1.0),
                 ("CMP+4", 1.0),
+                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
+                # 0xF8 → (LO+8, HI+15).
+                ("ADDR_B0_LO+8", 2.0),
+                ("ADDR_B0_HI+15", 2.0),
                 ("HAS_SE", -100.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
@@ -3662,6 +3698,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=35.0,
             writes=byte_writes(0xF8, strength=50_000.0),
         ),
+        # B6-B / B4-H Path 2: rule G (0xF0 full-frame addr) augmented with
+        # soft ADDR_B0 evidence (LO+0 / HI+15 → 0xF0).  Strength stays at 1e6.
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f0_exact",
             conditions=(
@@ -3675,6 +3713,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("CMP+0", 2.0),
                 ("ALU_LO+14", 5.0),
                 ("OP_JSR", -1000000.0),
+                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
+                # 0xF0 → (LO+0, HI+15).
+                ("ADDR_B0_LO+0", 2.0),
+                ("ADDR_B0_HI+15", 2.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -3727,6 +3769,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=60.0,
             writes=byte_writes(0x00, strength=1_000_000_000.0),
         ),
+        # B6-B / B4-H Path 2: rule I (addr byte 2 → 0x00 global) augmented
+        # with soft ADDR_B2 evidence (LO+0 / HI+0 → 0x00).  L13 writes
+        # ADDR_B0/B1/B2 (no B3); rule J cannot get an analogous boost.
         *exact_output_byte_rules(
             name="tail_mem_store_addr2_zero_from_global_exact",
             expected_byte=0x00,
@@ -3748,6 +3793,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("BYTE_INDEX_1", 5.0),
                 ("BYTE_INDEX_2", -1000.0),
                 ("BYTE_INDEX_3", -1000.0),
+                # Soft positive evidence from L13 ADDR_B2 lanes (B6-B).
+                # 0x00 → (LO+0, HI+0).
+                ("ADDR_B2_LO+0", 2.0),
+                ("ADDR_B2_HI+0", 2.0),
                 ("MARK_AX", -1_000_000_000.0),
                 ("MARK_PC", -1_000_000_000.0),
                 ("MARK_SP", -1_000_000_000.0),
@@ -3770,6 +3819,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             active_value=500.0,
             max_abs_weight=1_000_000_000.0,
         ),
+        # B6-B / B4-H Path 2: rule J (addr byte 3 → 0x00 global) — L13 only
+        # writes ADDR_B0/B1/B2, so no analogous soft boost is available for
+        # byte 3.  Rule retained unchanged.
         *exact_output_byte_rules(
             name="tail_mem_store_addr3_zero_from_global_exact",
             expected_byte=0x00,
@@ -3813,6 +3865,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             active_value=500.0,
             max_abs_weight=1_000_000_000.0,
         ),
+        # B6-B / B4-H Path 2: rule K (0xF8 mod-local) augmented with soft
+        # ADDR_B0 evidence (LO+8 / HI+15 → 0xF8).  Strength stays at 500.
+        # Note MEM_ADDR_SRC is blocked, so L13's mem-addr gather may not
+        # populate ADDR_B0 — soft only.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_f8_from_mod_local_exact",
             expected_byte=0xF8,
@@ -3832,6 +3888,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ALU_LO+7", 5.0),
                 ("ALU_LO+10", -10.0),
                 ("ALU_LO+14", -10.0),
+                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
+                # 0xF8 → (LO+8, HI+15).
+                ("ADDR_B0_LO+8", 2.0),
+                ("ADDR_B0_HI+15", 2.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -3849,6 +3909,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=28.0,
             active_value=500.0,
         ),
+        # B6-B / B4-H Path 2: rule L (0xE0 local-offset) augmented with soft
+        # ADDR_B0 evidence (LO+0 / HI+14 → 0xE0).  Strength stays at 50_000
+        # (legitimate downstream consumers expect this magnitude).
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_local_offset_exact",
             expected_byte=0xE0,
@@ -3875,6 +3938,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ALU_LO+8", 5.0),
                 ("ALU_LO+7", -10.0),
                 ("ALU_LO+10", -20.0),
+                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
+                # 0xE0 → (LO+0, HI+14).
+                ("ADDR_B0_LO+0", 2.0),
+                ("ADDR_B0_HI+14", 2.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -3942,6 +4009,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             # rec_factorial / rec_fib correctness past the base case.
             writes=byte_writes(0xE0, strength=1_000_000.0),
         ),
+        # B6-B / B4-H Path 2: rule N (0xE0 JSR-local) augmented with soft
+        # ADDR_B0 evidence (LO+0 / HI+14 → 0xE0).  Strength stays at 5000.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_jsr_local_exact",
             expected_byte=0xE0,
@@ -3959,6 +4028,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ALU_LO+14", 0.01),
                 ("CMP+0", -100.0),
                 ("OP_ENT", -1000.0),
+                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
+                # 0xE0 → (LO+0, HI+14).
+                ("ADDR_B0_LO+0", 2.0),
+                ("ADDR_B0_HI+14", 2.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -3976,40 +4049,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=80.0,
             active_value=5000.0,
         ),
-        *exact_output_byte_rules(
-            name="tail_mem_store_addr0_e0_from_jsr_local_strong",
-            expected_byte=0xE0,
-            conditions=(
-                ("MARK_MEM", 1.0),
-                ("HAS_SE", 1.0),
-                ("H1+4", 10.0),
-                ("H1+1", -1000000.0),
-                ("H1+2", -1000000.0),
-                ("H1+3", -1000000.0),
-                ("H1+10", -1000000.0),
-                ("MEM_STORE", 5.0),
-                ("OP_JSR", 2.0),
-                ("CMP+4", 2.0),
-                ("ALU_LO+14", 0.01),
-                ("CMP+0", -100.0),
-                ("OP_ENT", -1000.0),
-                ("IS_BYTE", -100.0),
-                ("MARK_AX", -1000000.0),
-                ("MARK_PC", -100.0),
-                ("MARK_SP", -100.0),
-                ("MARK_BP", -100.0),
-                ("MARK_STACK0", -100.0),
-                ("NEXT_PC", -1000000.0),
-                ("NEXT_AX", -1000000.0),
-                ("NEXT_SP", -1000000.0),
-                ("NEXT_BP", -1000000.0),
-                ("NEXT_STACK0", -1000000.0),
-                ("NEXT_MEM", -1000000.0),
-                ("NEXT_SE", -1000000.0),
-            ),
-            threshold=80.0,
-            active_value=5000.0,
-        ),
+        # B5-D / B4-H Path 2: rule O (tail_mem_store_addr0_e0_from_jsr_local_strong)
+        # was byte-identical to rule N (same conditions / threshold /
+        # active_value) — a pure strength-escalation sibling.  Deleted; the
+        # N variant alone carries the 0xE0 JSR-local proof and the bounded
+        # 5000 active_value is sufficient now that rule M is no longer
+        # producing 5e9 residual to compete against.
+        # B6-B / B4-H Path 2: rule P (0xE8 nested-local) augmented with soft
+        # ADDR_B0 evidence (LO+8 / HI+14 → 0xE8).  Strength stays at 500.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e8_from_nested_local_exact",
             expected_byte=0xE8,
@@ -4029,6 +4076,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ALU_LO+10", 5.0),
                 ("ALU_LO+7", -10.0),
                 ("ALU_LO+14", -10.0),
+                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
+                # 0xE8 → (LO+8, HI+14).
+                ("ADDR_B0_LO+8", 2.0),
+                ("ADDR_B0_HI+14", 2.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
