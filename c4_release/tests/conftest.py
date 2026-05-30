@@ -108,9 +108,10 @@ def static_claims_report():
     and runs every annotated op's bake under diff-based instrumentation
     (~25-60s wall on the current model). Per-layer audit harnesses
     (``test_l0_marker_transitions.py``, ``test_l2_mem_byte_flags.py``,
-    ``test_l4_pc_relay.py``, etc.) all read the same report; sharing it
-    at session scope keeps the audit's wall-clock cost flat regardless
-    of how many per-layer modules are added.
+    ``test_l4_pc_relay.py``, ``test_l8_per_op.py``,
+    ``test_l13_mem_addr_gather.py``, etc.) all read the same report;
+    sharing it at session scope keeps the audit's wall-clock cost flat
+    regardless of how many per-layer modules are added.
     """
     from neural_vm.unified_compiler.decl_verifier import verify_claims_static
     return verify_claims_static()

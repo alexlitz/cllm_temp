@@ -1,9 +1,9 @@
 """Shared assertions for per-layer per-op claim-verification audits.
 
 Used by ``test_l0_marker_transitions.py``, ``test_l2_mem_byte_flags.py``,
-``test_l4_pc_relay.py`` (and any future per-layer harness) to keep the
-boilerplate per-file minimal while preserving layer-labelled error
-messages.
+``test_l4_pc_relay.py``, ``test_l8_per_op.py`` (and any future per-layer
+harness) to keep the boilerplate per-file minimal while preserving
+layer-labelled error messages.
 
 All helpers take the ``static_claims_report`` session fixture (built once
 per pytest session by ``conftest.py``) and a layer label like ``"L0"`` so
