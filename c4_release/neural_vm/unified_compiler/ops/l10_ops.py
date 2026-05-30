@@ -3899,6 +3899,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_ADDR_SRC", -1000000.0),
                 ("PSH_AT_SP", 1.0),
                 ("OP_JSR", -1000000.0),
+                # ENT's frame-save store has MARK_MEM/HAS_SE/H1+4/MEM_STORE/
+                # CMP+0 active too, and PSH_AT_SP is only weakly required (+1).
+                # Without an explicit OP_ENT blocker the 5e9 0xE0 writeback
+                # dominates ENT MEM_addr0 at SP=0xfff0 (recursive call traces
+                # were observing step1 MEM_addr0=0xe0 instead of 0xf0).
+                ("OP_ENT", -1000000.0),
                 ("CMP+0", 10.0),
                 ("ALU_LO+8", 5.0),
                 ("ALU_LO+7", -10.0),
@@ -3918,7 +3924,16 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_SE", -1000000.0),
             ),
             threshold=40.0,
-            writes=byte_writes(0xE0, strength=5_000_000_000.0),
+            # Reduced from 5e9 to 1e6 so this rule no longer dwarfs sibling
+            # tail_mem_store_addr0_{f0,f8,e8,d8,...} rules by 5000x. With the
+            # OP_ENT blocker above and the strength brought in line with
+            # tail_mem_store_addr0_f0_exact (also 1e6), the most-evidence rule
+            # can win by discrimination instead of by raw dominance. The
+            # previous investigation (B3-α, commit 0cde3d3) documented the
+            # 5e9 strength dominance as the cause of step1:MEM_addr0=0xe0
+            # vs 0xf0 in `if_var` and as the primary blocker for
+            # rec_factorial / rec_fib correctness past the base case.
+            writes=byte_writes(0xE0, strength=1_000_000.0),
         ),
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_jsr_local_exact",
