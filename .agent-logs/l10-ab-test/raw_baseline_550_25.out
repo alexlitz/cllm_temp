@@ -1,0 +1,16 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-a3a5056f42a23ba07/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 1 item
+
+c4_release/tests/test_1096_neural_declarative_diagnostic.py [1096-progress] mode=final-output phase=start rows=0/25 batch=8 ids=0550-0557 max_steps=11
+[1096-progress] mode=final-output phase=done rows=8/25 batch=8 ids=0550-0557 max_steps=11
+[1096-progress] mode=final-output phase=start rows=8/25 batch=8 ids=0558-0565 max_steps=11
+[1096-progress] mode=final-output phase=done rows=16/25 batch=8 ids=0558-0565 max_steps=11
+[1096-progress] mode=final-output phase=start rows=16/25 batch=8 ids=0566-0573 max_steps=11

@@ -1,0 +1,11 @@
+=== b4a on 44dbfd1 ===
+--- offset=0 limit=32 ---
+[1096-summary] mode=final-output selected=32 ok=3 divergences=29 errors=0 suite_mismatches=0
+--- offset=200 limit=50 ---
+[1096-summary] mode=final-output selected=50 ok=25 divergences=25 errors=0 suite_mismatches=0
+--- offset=425 limit=25 ---
+[1096-summary] mode=final-output selected=25 ok=0 divergences=25 errors=0 suite_mismatches=0
+--- offset=550 limit=25 ---
+[1096-summary] mode=final-output selected=25 ok=0 divergences=25 errors=0 suite_mismatches=0
+--- offset=700 limit=25 ---
+[1096-summary] NO_OUTPUT rc=137 dur=1406s

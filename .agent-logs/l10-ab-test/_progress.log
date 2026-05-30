@@ -1,0 +1,69 @@
+[10:31:53] STARTING all variants
+HEAD is now at 4d069f7 Validate bounded batched KV eviction
+[10:31:53] BEGIN variant=baseline head=4d069f7
+[10:31:53]   run variant=baseline offset=0 limit=32
+[10:35:18]   done variant=baseline offset=0 limit=32 dur=205s rc=0
+[10:35:18]   run variant=baseline offset=200 limit=50
+[10:44:24]   done variant=baseline offset=200 limit=50 dur=546s rc=0
+[10:44:24]   run variant=baseline offset=425 limit=25
+[11:09:24]   done variant=baseline offset=425 limit=25 dur=1500s rc=0
+[11:09:24]   run variant=baseline offset=550 limit=25
+[11:21:48]   done variant=baseline offset=550 limit=25 dur=744s rc=143
+[11:21:48]   run variant=baseline offset=700 limit=25
+[11:22:03]   done variant=baseline offset=700 limit=25 dur=15s rc=137
+[11:22:03] END variant=baseline
+HEAD is now at 4d069f7 Validate bounded batched KV eviction
+From github.com:alexlitz/cllm_temp
+ * branch            fix/l10-ent-discrimination -> FETCH_HEAD
+[worktree-agent-a3a5056f42a23ba07 ee2f493] Guard L10 / L16 PSH MEM addr0 0xE0 rules against ENT context
+ Date: Fri May 29 19:58:24 2026 -0400
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+[11:22:03] BEGIN variant=b2a head=ee2f493
+[11:22:03]   run variant=b2a offset=0 limit=32
+[11:25:13]   done variant=b2a offset=0 limit=32 dur=190s rc=0
+[11:25:13]   run variant=b2a offset=200 limit=50
+[11:32:19]   done variant=b2a offset=200 limit=50 dur=426s rc=0
+[11:32:19]   run variant=b2a offset=425 limit=25
+[11:53:21]   done variant=b2a offset=425 limit=25 dur=1262s rc=0
+[11:53:21]   run variant=b2a offset=550 limit=25
+[12:04:14]   done variant=b2a offset=550 limit=25 dur=653s rc=0
+[12:04:14]   run variant=b2a offset=700 limit=25
+[12:26:19]   done variant=b2a offset=700 limit=25 dur=1325s rc=0
+[12:26:19] END variant=b2a
+HEAD is now at 4d069f7 Validate bounded batched KV eviction
+From github.com:alexlitz/cllm_temp
+ * branch            fix/rec-premature-exit -> FETCH_HEAD
+[worktree-agent-a3a5056f42a23ba07 d3c7c53] Block ENT and tame strength of tail_mem_store_addr0 0xE0 PSH rule
+ Date: Sat May 30 01:32:49 2026 -0400
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+[12:26:20] BEGIN variant=b3d head=d3c7c53
+[12:26:20]   run variant=b3d offset=0 limit=32
+[12:28:30]   done variant=b3d offset=0 limit=32 dur=130s rc=0
+[12:28:30]   run variant=b3d offset=200 limit=50
+[12:34:16]   done variant=b3d offset=200 limit=50 dur=346s rc=0
+[12:34:16]   run variant=b3d offset=425 limit=25
+[12:50:56]   done variant=b3d offset=425 limit=25 dur=1000s rc=0
+[12:50:56]   run variant=b3d offset=550 limit=25
+[13:01:35]   done variant=b3d offset=550 limit=25 dur=639s rc=0
+[13:01:35]   run variant=b3d offset=700 limit=25
+[13:23:21]   done variant=b3d offset=700 limit=25 dur=1306s rc=0
+[13:23:21] END variant=b3d
+HEAD is now at 4d069f7 Validate bounded batched KV eviction
+From github.com:alexlitz/cllm_temp
+ * branch            fix/l10-e0-coordinated -> FETCH_HEAD
+[worktree-agent-a3a5056f42a23ba07 44dbfd1] B4-A: add OP_ENT/LEV/IMM blockers to L10 + L16 0xE0 rules
+ Date: Sat May 30 02:05:11 2026 -0400
+ 2 files changed, 13 insertions(+)
+[13:23:22] BEGIN variant=b4a head=44dbfd1
+[13:23:22]   run variant=b4a offset=0 limit=32
+[13:25:42]   done variant=b4a offset=0 limit=32 dur=140s rc=0
+[13:25:42]   run variant=b4a offset=200 limit=50
+[13:31:24]   done variant=b4a offset=200 limit=50 dur=342s rc=0
+[13:31:24]   run variant=b4a offset=425 limit=25
+[13:49:51]   done variant=b4a offset=425 limit=25 dur=1107s rc=0
+[13:49:51]   run variant=b4a offset=550 limit=25
+[14:06:59]   done variant=b4a offset=550 limit=25 dur=1028s rc=0
+[14:06:59]   run variant=b4a offset=700 limit=25
+[14:30:25]   done variant=b4a offset=700 limit=25 dur=1406s rc=137
+[14:30:25] END variant=b4a
+[14:30:25] ALL VARIANTS COMPLETE
