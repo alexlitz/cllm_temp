@@ -79,6 +79,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "quine: marks quine-specific tests")
     config.addinivalue_line("markers", "bundler: marks bundler tests")
     config.addinivalue_line("markers", "dual: marks tests that run with both weight modes")
+    config.addinivalue_line("markers", "lowering: marks per-layer per-op claim-verification audits")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -94,6 +95,26 @@ def pytest_collection_modifyitems(config, items):
         if slow_items:
             items[:] = [item for item in items if item not in slow_items]
             config.hook.pytest_deselected(items=slow_items)
+
+
+# =============================================================================
+# Fixtures - Declarative Verifier (shared across per-layer audit harnesses)
+# =============================================================================
+
+@pytest.fixture(scope="session")
+def static_claims_report():
+    """Run ``verify_claims_static`` once per pytest session.
+
+    The verifier builds the production layout + a fresh ``AutoregressiveVM``
+    and runs every annotated op's bake under diff-based instrumentation
+    (~25-60s wall on the current model). Per-layer audit harnesses
+    (``test_l0_marker_transitions.py``, ``test_l4_pc_relay.py``,
+    ``test_l5_opcode_decode.py``, etc.) all read the same report; sharing
+    it at session scope keeps the audit's wall-clock cost flat regardless
+    of how many per-layer modules are added.
+    """
+    from neural_vm.unified_compiler.decl_verifier import verify_claims_static
+    return verify_claims_static()
 
 
 # =============================================================================
