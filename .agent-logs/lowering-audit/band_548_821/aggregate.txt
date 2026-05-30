@@ -1,0 +1,311 @@
+SUMMARY
+log=.agent-logs/lowering-audit/band_548_821/audit.log
+row_count=274 visible_failure_segments=522
+[1096-lowering-summary] selected=274 clean=0 fatal_rows=261 info_only_rows=0 fatal_failures=8702 info_failures=4774 errors=0 skipped=13 wrong_token_failures=13469 band_only_failures=2 band_margin_failures=2 assert_mode=off print_mode=drift min_margin=0.5 output_band_min_margin=0.5 output_band_max_inactive=1e+30 context_window=512 chunk_tokens=512
+======================== 1 passed in 1853.58s (0:30:53) ========================
+status_summary=fatal-lowering-divergence:261, skipped:13
+row_severity=fatal_rows:261 info_only_rows:0 clean_rows:0
+families=func_identity:25, func_add:25, func_mul:25, func_square:25, func_max:25, func_min:25, rec_factorial:25, rec_fib:25, rec_sum:25, rec_power:25, expr_add_mul:22, loop_pow2_23:1, loop_pow2_24:1
+
+FAILURE_KIND_COUNTS
+combined=low_head_margin,wrong_argmax,wrong_output_byte:522
+atomic=low_head_margin:522, wrong_argmax:522, wrong_output_byte:522
+combined_by_severity=fatal:low_head_margin,wrong_argmax,wrong_output_byte:261, info:low_head_margin,wrong_argmax,wrong_output_byte:261
+atomic_by_severity=fatal:low_head_margin:261, fatal:wrong_argmax:261, fatal:wrong_output_byte:261, info:low_head_margin:261, info:wrong_argmax:261, info:wrong_output_byte:261
+
+FIRST_FATAL_SLOT_COUNTS
+slots=SP_byte0:116, AX_byte0:93, PC_byte0:37, STACK0_byte0:15
+step_slots=step7:SP_byte0:93, step6:AX_byte0:92, step0:PC_byte0:37, step0:SP_byte0:21, step3:STACK0_byte0:15, step1:SP_byte0:2, step0:AX_byte0:1
+family_step_slots=func_add->step7:SP_byte0:25, rec_sum->step6:AX_byte0:25, rec_power->step0:PC_byte0:25, func_max->step7:SP_byte0:24, func_identity->step6:AX_byte0:23, func_mul->step7:SP_byte0:23, func_square->step6:AX_byte0:23, func_min->step7:SP_byte0:21, rec_factorial->step6:AX_byte0:21, expr_add_mul->step0:SP_byte0:21, rec_fib->step0:PC_byte0:12, func_min->step3:STACK0_byte0:4, rec_factorial->step3:STACK0_byte0:4, func_identity->step3:STACK0_byte0:2, func_mul->step3:STACK0_byte0:2, func_square->step3:STACK0_byte0:2, loop_pow2_23->step1:SP_byte0:1, loop_pow2_24->step1:SP_byte0:1, func_max->step3:STACK0_byte0:1, expr_add_mul->step0:AX_byte0:1
+first_fatal_examples[step1:SP_byte0]=0548:loop_pow2_23: 2^6; 0549:loop_pow2_24: 2^1
+first_fatal_examples[step6:AX_byte0]=0550:func_identity_0: identity(70); 0551:func_identity_1: identity(29); 0552:func_identity_2: identity(83); 0553:func_identity_3: identity(20)
+first_fatal_examples[step3:STACK0_byte0]=0562:func_identity_12: identity(73); 0567:func_identity_17: identity(89); 0612:func_mul_12: mul(41, 29); 0619:func_mul_19: mul(41, 39)
+first_fatal_examples[step7:SP_byte0]=0575:func_add_0: add(57, 11); 0576:func_add_1: add(77, 6); 0577:func_add_2: add(56, 95); 0578:func_add_3: add(42, 78)
+first_fatal_examples[step0:PC_byte0]=0725:rec_fib_0: fib(2); 0726:rec_fib_1: fib(3); 0729:rec_fib_4: fib(4); 0731:rec_fib_6: fib(4)
+first_fatal_examples[step0:SP_byte0]=0800:expr_add_mul_0: 22+24*22; 0801:expr_add_mul_1: 13+28*26; 0802:expr_add_mul_2: 18+12*3; 0803:expr_add_mul_3: 26+13*1
+first_fatal_examples[step0:AX_byte0]=0806:expr_add_mul_6: 24+22*9
+
+FIRST_INFO_SLOT_COUNTS
+slots=MEM_addr0:259, MEM_addr1:2
+step_slots=step3:MEM_addr0:240, step1:MEM_addr0:19, step1:MEM_addr1:2
+
+FINAL_BLOCK_COUNTS
+final_blocks=block27/layer27:64
+flas_blocks=block27/layer27:2
+
+PER_ID_STATUS
+# id status family desc(short)
+0548 fatal-lowering-divergence loop_pow2_23 loop_pow2_23: 2^6
+0549 fatal-lowering-divergence loop_pow2_24 loop_pow2_24: 2^1
+0550 fatal-lowering-divergence func_identity func_identity_0: identity(70)
+0551 fatal-lowering-divergence func_identity func_identity_1: identity(29)
+0552 fatal-lowering-divergence func_identity func_identity_2: identity(83)
+0553 fatal-lowering-divergence func_identity func_identity_3: identity(20)
+0554 fatal-lowering-divergence func_identity func_identity_4: identity(35)
+0555 fatal-lowering-divergence func_identity func_identity_5: identity(19)
+0556 fatal-lowering-divergence func_identity func_identity_6: identity(10)
+0557 fatal-lowering-divergence func_identity func_identity_7: identity(8)
+0558 fatal-lowering-divergence func_identity func_identity_8: identity(22)
+0559 fatal-lowering-divergence func_identity func_identity_9: identity(40)
+0560 fatal-lowering-divergence func_identity func_identity_10: identity(77)
+0561 fatal-lowering-divergence func_identity func_identity_11: identity(96)
+0562 fatal-lowering-divergence func_identity func_identity_12: identity(73)
+0563 fatal-lowering-divergence func_identity func_identity_13: identity(37)
+0564 fatal-lowering-divergence func_identity func_identity_14: identity(57)
+0565 fatal-lowering-divergence func_identity func_identity_15: identity(16)
+0566 fatal-lowering-divergence func_identity func_identity_16: identity(60)
+0567 fatal-lowering-divergence func_identity func_identity_17: identity(89)
+0568 fatal-lowering-divergence func_identity func_identity_18: identity(39)
+0569 fatal-lowering-divergence func_identity func_identity_19: identity(90)
+0570 fatal-lowering-divergence func_identity func_identity_20: identity(52)
+0571 fatal-lowering-divergence func_identity func_identity_21: identity(35)
+0572 fatal-lowering-divergence func_identity func_identity_22: identity(65)
+0573 fatal-lowering-divergence func_identity func_identity_23: identity(70)
+0574 fatal-lowering-divergence func_identity func_identity_24: identity(64)
+0575 fatal-lowering-divergence func_add func_add_0: add(57, 11)
+0576 fatal-lowering-divergence func_add func_add_1: add(77, 6)
+0577 fatal-lowering-divergence func_add func_add_2: add(56, 95)
+0578 fatal-lowering-divergence func_add func_add_3: add(42, 78)
+0579 fatal-lowering-divergence func_add func_add_4: add(33, 4)
+0580 fatal-lowering-divergence func_add func_add_5: add(12, 30)
+0581 fatal-lowering-divergence func_add func_add_6: add(87, 74)
+0582 fatal-lowering-divergence func_add func_add_7: add(76, 3)
+0583 fatal-lowering-divergence func_add func_add_8: add(98, 87)
+0584 fatal-lowering-divergence func_add func_add_9: add(35, 74)
+0585 fatal-lowering-divergence func_add func_add_10: add(6, 98)
+0586 fatal-lowering-divergence func_add func_add_11: add(97, 23)
+0587 fatal-lowering-divergence func_add func_add_12: add(61, 67)
+0588 fatal-lowering-divergence func_add func_add_13: add(84, 57)
+0589 fatal-lowering-divergence func_add func_add_14: add(36, 24)
+0590 fatal-lowering-divergence func_add func_add_15: add(75, 56)
+0591 fatal-lowering-divergence func_add func_add_16: add(82, 63)
+0592 fatal-lowering-divergence func_add func_add_17: add(12, 61)
+0593 fatal-lowering-divergence func_add func_add_18: add(45, 53)
+0594 fatal-lowering-divergence func_add func_add_19: add(43, 42)
+0595 fatal-lowering-divergence func_add func_add_20: add(86, 14)
+0596 fatal-lowering-divergence func_add func_add_21: add(21, 43)
+0597 fatal-lowering-divergence func_add func_add_22: add(53, 89)
+0598 fatal-lowering-divergence func_add func_add_23: add(64, 37)
+0599 fatal-lowering-divergence func_add func_add_24: add(85, 52)
+0600 fatal-lowering-divergence func_mul func_mul_0: mul(49, 36)
+0601 fatal-lowering-divergence func_mul func_mul_1: mul(3, 30)
+0602 fatal-lowering-divergence func_mul func_mul_2: mul(6, 21)
+0603 fatal-lowering-divergence func_mul func_mul_3: mul(17, 21)
+0604 fatal-lowering-divergence func_mul func_mul_4: mul(8, 50)
+0605 fatal-lowering-divergence func_mul func_mul_5: mul(26, 33)
+0606 fatal-lowering-divergence func_mul func_mul_6: mul(1, 43)
+0607 fatal-lowering-divergence func_mul func_mul_7: mul(35, 30)
+0608 fatal-lowering-divergence func_mul func_mul_8: mul(27, 4)
+0609 fatal-lowering-divergence func_mul func_mul_9: mul(13, 34)
+0610 fatal-lowering-divergence func_mul func_mul_10: mul(24, 40)
+0611 fatal-lowering-divergence func_mul func_mul_11: mul(49, 32)
+0612 fatal-lowering-divergence func_mul func_mul_12: mul(41, 29)
+0613 fatal-lowering-divergence func_mul func_mul_13: mul(49, 4)
+0614 fatal-lowering-divergence func_mul func_mul_14: mul(14, 18)
+0615 fatal-lowering-divergence func_mul func_mul_15: mul(36, 9)
+0616 fatal-lowering-divergence func_mul func_mul_16: mul(19, 29)
+0617 fatal-lowering-divergence func_mul func_mul_17: mul(45, 32)
+0618 fatal-lowering-divergence func_mul func_mul_18: mul(8, 2)
+0619 fatal-lowering-divergence func_mul func_mul_19: mul(41, 39)
+0620 fatal-lowering-divergence func_mul func_mul_20: mul(16, 46)
+0621 fatal-lowering-divergence func_mul func_mul_21: mul(11, 20)
+0622 fatal-lowering-divergence func_mul func_mul_22: mul(36, 1)
+0623 fatal-lowering-divergence func_mul func_mul_23: mul(36, 27)
+0624 fatal-lowering-divergence func_mul func_mul_24: mul(6, 15)
+0625 fatal-lowering-divergence func_square func_square_0: square(8)
+0626 fatal-lowering-divergence func_square func_square_1: square(30)
+0627 fatal-lowering-divergence func_square func_square_2: square(8)
+0628 fatal-lowering-divergence func_square func_square_3: square(42)
+0629 fatal-lowering-divergence func_square func_square_4: square(10)
+0630 fatal-lowering-divergence func_square func_square_5: square(32)
+0631 fatal-lowering-divergence func_square func_square_6: square(46)
+0632 fatal-lowering-divergence func_square func_square_7: square(19)
+0633 fatal-lowering-divergence func_square func_square_8: square(33)
+0634 fatal-lowering-divergence func_square func_square_9: square(46)
+0635 fatal-lowering-divergence func_square func_square_10: square(18)
+0636 fatal-lowering-divergence func_square func_square_11: square(27)
+0637 fatal-lowering-divergence func_square func_square_12: square(31)
+0638 fatal-lowering-divergence func_square func_square_13: square(31)
+0639 fatal-lowering-divergence func_square func_square_14: square(16)
+0640 fatal-lowering-divergence func_square func_square_15: square(30)
+0641 fatal-lowering-divergence func_square func_square_16: square(36)
+0642 fatal-lowering-divergence func_square func_square_17: square(10)
+0643 fatal-lowering-divergence func_square func_square_18: square(25)
+0644 fatal-lowering-divergence func_square func_square_19: square(13)
+0645 fatal-lowering-divergence func_square func_square_20: square(39)
+0646 fatal-lowering-divergence func_square func_square_21: square(33)
+0647 fatal-lowering-divergence func_square func_square_22: square(48)
+0648 fatal-lowering-divergence func_square func_square_23: square(9)
+0649 fatal-lowering-divergence func_square func_square_24: square(5)
+0650 fatal-lowering-divergence func_max func_max_0: max(36, 99)
+0651 fatal-lowering-divergence func_max func_max_1: max(54, 44)
+0652 fatal-lowering-divergence func_max func_max_2: max(65, 35)
+0653 fatal-lowering-divergence func_max func_max_3: max(1, 37)
+0654 fatal-lowering-divergence func_max func_max_4: max(93, 39)
+0655 fatal-lowering-divergence func_max func_max_5: max(76, 75)
+0656 fatal-lowering-divergence func_max func_max_6: max(85, 63)
+0657 fatal-lowering-divergence func_max func_max_7: max(20, 58)
+0658 fatal-lowering-divergence func_max func_max_8: max(69, 62)
+0659 fatal-lowering-divergence func_max func_max_9: max(45, 43)
+0660 fatal-lowering-divergence func_max func_max_10: max(71, 98)
+0661 fatal-lowering-divergence func_max func_max_11: max(70, 49)
+0662 fatal-lowering-divergence func_max func_max_12: max(59, 42)
+0663 fatal-lowering-divergence func_max func_max_13: max(25, 90)
+0664 fatal-lowering-divergence func_max func_max_14: max(31, 74)
+0665 fatal-lowering-divergence func_max func_max_15: max(50, 30)
+0666 fatal-lowering-divergence func_max func_max_16: max(100, 53)
+0667 fatal-lowering-divergence func_max func_max_17: max(6, 41)
+0668 fatal-lowering-divergence func_max func_max_18: max(96, 61)
+0669 fatal-lowering-divergence func_max func_max_19: max(91, 49)
+0670 fatal-lowering-divergence func_max func_max_20: max(50, 85)
+0671 fatal-lowering-divergence func_max func_max_21: max(84, 20)
+0672 fatal-lowering-divergence func_max func_max_22: max(64, 5)
+0673 fatal-lowering-divergence func_max func_max_23: max(17, 65)
+0674 fatal-lowering-divergence func_max func_max_24: max(76, 43)
+0675 fatal-lowering-divergence func_min func_min_0: min(13, 57)
+0676 fatal-lowering-divergence func_min func_min_1: min(13, 68)
+0677 fatal-lowering-divergence func_min func_min_2: min(59, 2)
+0678 fatal-lowering-divergence func_min func_min_3: min(93, 19)
+0679 fatal-lowering-divergence func_min func_min_4: min(53, 84)
+0680 fatal-lowering-divergence func_min func_min_5: min(20, 10)
+0681 fatal-lowering-divergence func_min func_min_6: min(61, 34)
+0682 fatal-lowering-divergence func_min func_min_7: min(44, 80)
+0683 fatal-lowering-divergence func_min func_min_8: min(89, 51)
+0684 fatal-lowering-divergence func_min func_min_9: min(84, 11)
+0685 fatal-lowering-divergence func_min func_min_10: min(43, 87)
+0686 fatal-lowering-divergence func_min func_min_11: min(69, 49)
+0687 fatal-lowering-divergence func_min func_min_12: min(41, 81)
+0688 fatal-lowering-divergence func_min func_min_13: min(92, 98)
+0689 fatal-lowering-divergence func_min func_min_14: min(63, 70)
+0690 fatal-lowering-divergence func_min func_min_15: min(5, 80)
+0691 fatal-lowering-divergence func_min func_min_16: min(9, 31)
+0692 fatal-lowering-divergence func_min func_min_17: min(81, 88)
+0693 fatal-lowering-divergence func_min func_min_18: min(37, 30)
+0694 fatal-lowering-divergence func_min func_min_19: min(96, 12)
+0695 fatal-lowering-divergence func_min func_min_20: min(56, 13)
+0696 fatal-lowering-divergence func_min func_min_21: min(98, 82)
+0697 fatal-lowering-divergence func_min func_min_22: min(91, 13)
+0698 fatal-lowering-divergence func_min func_min_23: min(57, 22)
+0699 fatal-lowering-divergence func_min func_min_24: min(89, 39)
+0700 fatal-lowering-divergence rec_factorial rec_factorial_0: 0!
+0701 fatal-lowering-divergence rec_factorial rec_factorial_1: 0!
+0702 fatal-lowering-divergence rec_factorial rec_factorial_2: 5!
+0703 fatal-lowering-divergence rec_factorial rec_factorial_3: 0!
+0704 fatal-lowering-divergence rec_factorial rec_factorial_4: 4!
+0705 fatal-lowering-divergence rec_factorial rec_factorial_5: 5!
+0706 fatal-lowering-divergence rec_factorial rec_factorial_6: 5!
+0707 fatal-lowering-divergence rec_factorial rec_factorial_7: 6!
+0708 fatal-lowering-divergence rec_factorial rec_factorial_8: 2!
+0709 fatal-lowering-divergence rec_factorial rec_factorial_9: 3!
+0710 fatal-lowering-divergence rec_factorial rec_factorial_10: 8!
+0711 fatal-lowering-divergence rec_factorial rec_factorial_11: 6!
+0712 fatal-lowering-divergence rec_factorial rec_factorial_12: 9!
+0713 fatal-lowering-divergence rec_factorial rec_factorial_13: 10!
+0714 fatal-lowering-divergence rec_factorial rec_factorial_14: 2!
+0715 fatal-lowering-divergence rec_factorial rec_factorial_15: 2!
+0716 fatal-lowering-divergence rec_factorial rec_factorial_16: 2!
+0717 fatal-lowering-divergence rec_factorial rec_factorial_17: 1!
+0718 fatal-lowering-divergence rec_factorial rec_factorial_18: 9!
+0719 fatal-lowering-divergence rec_factorial rec_factorial_19: 6!
+0720 fatal-lowering-divergence rec_factorial rec_factorial_20: 9!
+0721 fatal-lowering-divergence rec_factorial rec_factorial_21: 10!
+0722 fatal-lowering-divergence rec_factorial rec_factorial_22: 3!
+0723 fatal-lowering-divergence rec_factorial rec_factorial_23: 7!
+0724 fatal-lowering-divergence rec_factorial rec_factorial_24: 9!
+0725 fatal-lowering-divergence rec_fib rec_fib_0: fib(2)
+0726 fatal-lowering-divergence rec_fib rec_fib_1: fib(3)
+0727 skipped rec_fib rec_fib_2: fib(7)
+0728 skipped rec_fib rec_fib_3: fib(10)
+0729 fatal-lowering-divergence rec_fib rec_fib_4: fib(4)
+0730 skipped rec_fib rec_fib_5: fib(7)
+0731 fatal-lowering-divergence rec_fib rec_fib_6: fib(4)
+0732 skipped rec_fib rec_fib_7: fib(10)
+0733 fatal-lowering-divergence rec_fib rec_fib_8: fib(0)
+0734 skipped rec_fib rec_fib_9: fib(12)
+0735 skipped rec_fib rec_fib_10: fib(7)
+0736 fatal-lowering-divergence rec_fib rec_fib_11: fib(4)
+0737 skipped rec_fib rec_fib_12: fib(10)
+0738 skipped rec_fib rec_fib_13: fib(8)
+0739 fatal-lowering-divergence rec_fib rec_fib_14: fib(2)
+0740 fatal-lowering-divergence rec_fib rec_fib_15: fib(1)
+0741 skipped rec_fib rec_fib_16: fib(7)
+0742 fatal-lowering-divergence rec_fib rec_fib_17: fib(5)
+0743 skipped rec_fib rec_fib_18: fib(9)
+0744 fatal-lowering-divergence rec_fib rec_fib_19: fib(4)
+0745 skipped rec_fib rec_fib_20: fib(10)
+0746 fatal-lowering-divergence rec_fib rec_fib_21: fib(6)
+0747 skipped rec_fib rec_fib_22: fib(11)
+0748 fatal-lowering-divergence rec_fib rec_fib_23: fib(4)
+0749 skipped rec_fib rec_fib_24: fib(7)
+0750 fatal-lowering-divergence rec_sum rec_sum_0: sum(1..14)
+0751 fatal-lowering-divergence rec_sum rec_sum_1: sum(1..5)
+0752 fatal-lowering-divergence rec_sum rec_sum_2: sum(1..4)
+0753 fatal-lowering-divergence rec_sum rec_sum_3: sum(1..7)
+0754 fatal-lowering-divergence rec_sum rec_sum_4: sum(1..14)
+0755 fatal-lowering-divergence rec_sum rec_sum_5: sum(1..8)
+0756 fatal-lowering-divergence rec_sum rec_sum_6: sum(1..2)
+0757 fatal-lowering-divergence rec_sum rec_sum_7: sum(1..4)
+0758 fatal-lowering-divergence rec_sum rec_sum_8: sum(1..7)
+0759 fatal-lowering-divergence rec_sum rec_sum_9: sum(1..10)
+0760 fatal-lowering-divergence rec_sum rec_sum_10: sum(1..6)
+0761 fatal-lowering-divergence rec_sum rec_sum_11: sum(1..10)
+0762 fatal-lowering-divergence rec_sum rec_sum_12: sum(1..5)
+0763 fatal-lowering-divergence rec_sum rec_sum_13: sum(1..12)
+0764 fatal-lowering-divergence rec_sum rec_sum_14: sum(1..5)
+0765 fatal-lowering-divergence rec_sum rec_sum_15: sum(1..1)
+0766 fatal-lowering-divergence rec_sum rec_sum_16: sum(1..14)
+0767 fatal-lowering-divergence rec_sum rec_sum_17: sum(1..11)
+0768 fatal-lowering-divergence rec_sum rec_sum_18: sum(1..7)
+0769 fatal-lowering-divergence rec_sum rec_sum_19: sum(1..5)
+0770 fatal-lowering-divergence rec_sum rec_sum_20: sum(1..1)
+0771 fatal-lowering-divergence rec_sum rec_sum_21: sum(1..10)
+0772 fatal-lowering-divergence rec_sum rec_sum_22: sum(1..14)
+0773 fatal-lowering-divergence rec_sum rec_sum_23: sum(1..11)
+0774 fatal-lowering-divergence rec_sum rec_sum_24: sum(1..13)
+0775 fatal-lowering-divergence rec_power rec_power_0: 2^4
+0776 fatal-lowering-divergence rec_power rec_power_1: 5^6
+0777 fatal-lowering-divergence rec_power rec_power_2: 4^6
+0778 fatal-lowering-divergence rec_power rec_power_3: 3^4
+0779 fatal-lowering-divergence rec_power rec_power_4: 4^1
+0780 fatal-lowering-divergence rec_power rec_power_5: 3^4
+0781 fatal-lowering-divergence rec_power rec_power_6: 4^5
+0782 fatal-lowering-divergence rec_power rec_power_7: 3^5
+0783 fatal-lowering-divergence rec_power rec_power_8: 2^5
+0784 fatal-lowering-divergence rec_power rec_power_9: 2^2
+0785 fatal-lowering-divergence rec_power rec_power_10: 5^0
+0786 fatal-lowering-divergence rec_power rec_power_11: 4^5
+0787 fatal-lowering-divergence rec_power rec_power_12: 3^0
+0788 fatal-lowering-divergence rec_power rec_power_13: 4^2
+0789 fatal-lowering-divergence rec_power rec_power_14: 5^1
+0790 fatal-lowering-divergence rec_power rec_power_15: 3^1
+0791 fatal-lowering-divergence rec_power rec_power_16: 4^4
+0792 fatal-lowering-divergence rec_power rec_power_17: 4^6
+0793 fatal-lowering-divergence rec_power rec_power_18: 3^2
+0794 fatal-lowering-divergence rec_power rec_power_19: 5^6
+0795 fatal-lowering-divergence rec_power rec_power_20: 4^5
+0796 fatal-lowering-divergence rec_power rec_power_21: 4^6
+0797 fatal-lowering-divergence rec_power rec_power_22: 2^3
+0798 fatal-lowering-divergence rec_power rec_power_23: 2^1
+0799 fatal-lowering-divergence rec_power rec_power_24: 3^6
+0800 fatal-lowering-divergence expr_add_mul expr_add_mul_0: 22+24*22
+0801 fatal-lowering-divergence expr_add_mul expr_add_mul_1: 13+28*26
+0802 fatal-lowering-divergence expr_add_mul expr_add_mul_2: 18+12*3
+0803 fatal-lowering-divergence expr_add_mul expr_add_mul_3: 26+13*1
+0804 fatal-lowering-divergence expr_add_mul expr_add_mul_4: 9+18*4
+0805 fatal-lowering-divergence expr_add_mul expr_add_mul_5: 15+12*22
+0806 fatal-lowering-divergence expr_add_mul expr_add_mul_6: 24+22*9
+0807 fatal-lowering-divergence expr_add_mul expr_add_mul_7: 19+13*27
+0808 fatal-lowering-divergence expr_add_mul expr_add_mul_8: 21+12*4
+0809 fatal-lowering-divergence expr_add_mul expr_add_mul_9: 22+8*16
+0810 fatal-lowering-divergence expr_add_mul expr_add_mul_10: 1+20*29
+0811 fatal-lowering-divergence expr_add_mul expr_add_mul_11: 18+11*30
+0812 fatal-lowering-divergence expr_add_mul expr_add_mul_12: 20+8*21
+0813 fatal-lowering-divergence expr_add_mul expr_add_mul_13: 3+21*27
+0814 fatal-lowering-divergence expr_add_mul expr_add_mul_14: 15+30*23
+0815 fatal-lowering-divergence expr_add_mul expr_add_mul_15: 10+21*14
+0816 fatal-lowering-divergence expr_add_mul expr_add_mul_16: 4+5*2
+0817 fatal-lowering-divergence expr_add_mul expr_add_mul_17: 2+10*16
+0818 fatal-lowering-divergence expr_add_mul expr_add_mul_18: 4+4*8
+0819 fatal-lowering-divergence expr_add_mul expr_add_mul_19: 29+18*5
+0820 fatal-lowering-divergence expr_add_mul expr_add_mul_20: 13+15*12
+0821 fatal-lowering-divergence expr_add_mul expr_add_mul_21: 22+24*23
