@@ -3541,8 +3541,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("H1+1", -1_000_000_000.0),
                 ("H1+3", -1_000_000_000.0),
                 ("H1+4", -1_000_000_000.0),
-                ("OUTPUT_LO+8", 1.0),
-                ("OUTPUT_HI+15", 1.0),
+                # JSR-bootstrap structural signature relayed onto SP marker
+                # rows by L6 via CMP[4] (see _layer10_sp_byte_passthrough_head
+                # marker carry-forward).  Required instead of OUTPUT_LO+8 /
+                # OUTPUT_HI+15 so the rule cannot circularly self-amplify
+                # residual OUTPUT 0xF8 leakage from prior steps.
+                ("CMP+4", 0.5),
                 ("OUTPUT_HI+14", -1000.0),
                 ("ALU_LO+14", -1000.0),
                 ("OP_IMM", -1_000_000_000.0),
