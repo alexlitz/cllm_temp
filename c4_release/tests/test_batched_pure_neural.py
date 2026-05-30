@@ -337,7 +337,11 @@ def test_windowed_context_does_not_duplicate_memory_history_without_eviction():
     assert state.mem_history_end == 0
 
 
-def test_windowed_context_does_not_mark_current_store_before_step_complete():
+def test_windowed_context_marks_current_store_before_step_complete():
+    # B2-H fix: the current step's MEM marker MUST be flagged as a store
+    # BEFORE the model predicts MEM_addr0 when the current opcode is a store.
+    # Without this flag the L15/L16 lookup rules pick the wrong address
+    # (e.g. ENT's push-BP target 0xfff0 collapsing to 0xffe0).
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
     from neural_vm.vm_step import Token
 
@@ -353,12 +357,16 @@ def test_windowed_context_does_not_mark_current_store_before_step_complete():
 
     windowed = runner._windowed_context(state, max_context_window=128)
 
+    mem_pos = len(prefix) + 25
     assert windowed == prefix + dynamic
     assert state.mem_history_end == 0
-    assert state.mem_store_positions == []
+    assert state.mem_store_positions == [mem_pos]
 
 
-def test_windowed_context_does_not_mark_current_store_during_value_bytes():
+def test_windowed_context_marks_current_store_during_value_bytes():
+    # B2-H fix: marker is still flagged once MEM has been emitted, even if
+    # only some of the addr/val bytes are present so far (the model is about
+    # to predict the next byte and L15/L16 need the store flag now).
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
     from neural_vm.vm_step import Token
 
@@ -367,6 +375,57 @@ def test_windowed_context_does_not_mark_current_store_during_value_bytes():
     dynamic = [0] * 25 + [Token.MEM, 0xF8, 0xFF, 0x00, 0x00]
     state = _ElementState(
         bytecode=_encode([Opcode.PSH, Opcode.EXIT]),
+        context=prefix + dynamic,
+        prefix_len=len(prefix),
+        token_pos=len(dynamic),
+    )
+
+    windowed = runner._windowed_context(state, max_context_window=128)
+
+    mem_pos = len(prefix) + 25
+    assert windowed == prefix + dynamic
+    assert state.mem_history_end == 0
+    assert state.mem_store_positions == [mem_pos]
+
+
+def test_windowed_context_does_not_mark_current_step_after_step_end():
+    # B2-H guard: once STEP_END has been emitted, the MEM marker that
+    # appeared earlier in the same step belongs to history, not "current".
+    # _track_mem_access populates s.mem_history after STEP_END dispatches,
+    # so the historical path is responsible for marking it.
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.vm_step import Token
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    prefix = [Token.CODE_START, Token.CODE_END]
+    dynamic = [0] * 25 + [Token.MEM, 0xF8, 0xFF, 0x00, 0x00, 0, 0, 0, 0, Token.STEP_END]
+    state = _ElementState(
+        bytecode=_encode([Opcode.PSH, Opcode.EXIT]),
+        context=prefix + dynamic,
+        prefix_len=len(prefix),
+        token_pos=len(dynamic),
+    )
+
+    windowed = runner._windowed_context(state, max_context_window=128)
+
+    assert windowed == prefix + dynamic
+    assert state.mem_history_end == 0
+    # Step has ended — historical tracking handles this marker. The
+    # current-step helper must not double-add it.
+    assert state.mem_store_positions == []
+
+
+def test_windowed_context_does_not_mark_current_step_for_non_store_op():
+    # B2-H guard: non-store ops should NOT get the MEM_STORE flag injected
+    # even if a MEM marker is present (e.g. LI loading a value through MEM).
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
+    from neural_vm.vm_step import Token
+
+    runner = object.__new__(BatchedPureNeuralRunner)
+    prefix = [Token.CODE_START, Token.CODE_END]
+    dynamic = [0] * 25 + [Token.MEM]
+    state = _ElementState(
+        bytecode=_encode([Opcode.LI, Opcode.EXIT]),
         context=prefix + dynamic,
         prefix_len=len(prefix),
         token_pos=len(dynamic),
