@@ -2568,6 +2568,105 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             )
         return tuple(rules)
 
+    def ax_imm_byte1_high_zero_rules() -> tuple[FFNRule, ...]:
+        """Clear AX byte-1 high nibble residue on OP_IMM rows.
+
+        Sibling of ``ax_add_byte1_high_zero_rules`` for OP_IMM. After a
+        wide-MUL that produced a multi-byte product (e.g. 29*16=464), the
+        staged ``OUTPUT_HI`` for AX byte 1 can stay at the MUL high nibble.
+        A subsequent ``OP_IMM`` overwrites AX with the immediate operand, but
+        the dependency-tail has no explicit cleanup for IMM rows. This rule
+        keys on ``OP_IMM`` and forces ``OUTPUT_HI[0]`` to dominate at AX byte
+        1 when none of the wide-MUL evidence is present.
+
+        ``wide_mul_byte1_preserve_rules`` further down gate on ``TEMP+10``
+        (MUL relay) plus ``OP_MUL``; blocking both here keeps this cleanup
+        off the real MUL byte-1 rows. Other ALU relays (TEMP+8/9) and op
+        bits are also blocked so the rule only fires on a clean OP_IMM AX
+        byte-1 row where the model would otherwise carry MUL byte-1
+        residue.
+        """
+
+        marker_blockers = (
+            ("MARK_AX", -1000000.0),
+            ("MARK_PC", -1000000.0),
+            ("MARK_SP", -1000000.0),
+            ("MARK_BP", -1000000.0),
+            ("MARK_STACK0", -1000000.0),
+            ("MARK_MEM", -1000000.0),
+        )
+        non_imm_blockers = (
+            ("OP_ADD", -1000000.0),
+            ("OP_SUB", -1000000.0),
+            ("OP_MUL", -1000000.0),
+            ("OP_DIV", -1000000.0),
+            ("OP_MOD", -1000000.0),
+            ("OP_AND", -1000000.0),
+            ("OP_OR", -1000000.0),
+            ("OP_XOR", -1000000.0),
+            ("OP_SHL", -1000000.0),
+            ("OP_SHR", -1000000.0),
+            ("OP_LEA", -1000000.0),
+            ("OP_EQ", -1000000.0),
+            ("OP_NE", -1000000.0),
+            ("OP_LT", -1000000.0),
+            ("OP_GT", -1000000.0),
+            ("OP_LE", -1000000.0),
+            ("OP_GE", -1000000.0),
+            ("OP_SI", -1000.0),
+            ("OP_SC", -1000.0),
+            ("OP_LI", -1000.0),
+            ("OP_LC", -1000.0),
+            ("OP_ENT", -1000000.0),
+            ("MEM_STORE", -1000000.0),
+            ("TEMP+4", -1000000.0),
+            ("TEMP+5", -1000000.0),
+            ("TEMP+6", -1000000.0),
+            ("TEMP+7", -1000000.0),
+            ("TEMP+8", -1000000.0),
+            ("TEMP+9", -1000000.0),
+            ("TEMP+10", -1000000.0),
+        )
+        transition_blockers = (
+            ("NEXT_PC", -1000000.0),
+            ("NEXT_AX", -1000000.0),
+            ("NEXT_SP", -1000000.0),
+            ("NEXT_BP", -1000000.0),
+            ("NEXT_STACK0", -1000000.0),
+            ("NEXT_MEM", -1000000.0),
+            ("NEXT_SE", -1000000.0),
+        )
+        high_writes = [("OUTPUT_HI+0", 50_000.0)]
+        high_writes.extend(
+            (f"OUTPUT_HI+{other}", -50_000.0) for other in range(1, 16)
+        )
+        base_conditions = (
+            ("IS_BYTE", 5.0),
+            ("HAS_SE", 5.0),
+            ("H1+1", 20.0),
+            ("H1+2", -1000000.0),
+            ("H1+3", -1000000.0),
+            ("H1+4", -1000000.0),
+            ("H1+10", -1000000.0),
+            ("BYTE_INDEX_0", 5.0),
+            ("BYTE_INDEX_1", -1000.0),
+            ("BYTE_INDEX_2", -1000.0),
+            ("BYTE_INDEX_3", -1000.0),
+            ("STACK0_BYTE0", -1000000.0),
+            ("STACK0_BYTE1", -1000000.0),
+            ("STACK0_BYTE2", -1000000.0),
+            ("STACK0_BYTE3", -1000000.0),
+            ("OP_IMM", 100.0),
+        ) + marker_blockers + transition_blockers + non_imm_blockers
+        return (
+            FFNRule.constant_write(
+                name="tail_ax_imm_byte1_hi_zero",
+                conditions=base_conditions,
+                threshold=250.0,
+                writes=tuple(high_writes),
+            ),
+        )
+
     def ax_add_byte1_structural_materialize_rules() -> tuple[FFNRule, ...]:
         """Materialize ADD byte 1 from structural low-nibble evidence.
 
@@ -4161,6 +4260,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *ax_add_no_carry_zero_rules(),
         *ax_add_byte1_high_zero_rules(),
         *ax_add_byte1_structural_materialize_rules(),
+        *ax_imm_byte1_high_zero_rules(),
         *ax_sub_byte1_high_zero_rules(),
         *ax_sub_full_underflow_byte1_rules(),
         *ax_sub_borrow_decrement_rules(),
