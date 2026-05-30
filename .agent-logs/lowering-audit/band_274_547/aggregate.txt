@@ -1,0 +1,314 @@
+SUMMARY
+log=.agent-logs/lowering-audit/band_274_547/audit.log
+row_count=274 visible_failure_segments=538
+[1096-lowering-summary] selected=274 clean=0 fatal_rows=273 info_only_rows=1 fatal_failures=6002 info_failures=4231 errors=0 skipped=0 wrong_token_failures=10030 band_only_failures=194 band_margin_failures=194 assert_mode=off print_mode=drift min_margin=0.5 output_band_min_margin=0.5 output_band_max_inactive=1e+30 context_window=512 chunk_tokens=512
+status_summary=fatal-lowering-divergence:273, info-support-drift:1
+row_severity=fatal_rows:273 info_only_rows:1 clean_rows:0
+families=var_mul:25, var_three:25, var_update:25, if_gt:25, if_lt:25, if_eq:25, if_var:25, loop_sum:25, loop_countdown:25, loop_mul:25, var_simple:1, loop_pow2_0:1, loop_pow2_1:1, loop_pow2_2:1, loop_pow2_3:1, loop_pow2_4:1, loop_pow2_5:1, loop_pow2_6:1, loop_pow2_7:1, loop_pow2_8:1, loop_pow2_9:1, loop_pow2_10:1, loop_pow2_11:1, loop_pow2_12:1, loop_pow2_13:1, loop_pow2_14:1, loop_pow2_15:1, loop_pow2_16:1, loop_pow2_17:1, loop_pow2_18:1, loop_pow2_19:1, loop_pow2_20:1, loop_pow2_21:1, loop_pow2_22:1
+
+FAILURE_KIND_COUNTS
+combined=low_head_margin,wrong_argmax,wrong_output_byte:538
+atomic=low_head_margin:538, wrong_argmax:538, wrong_output_byte:538
+combined_by_severity=fatal:low_head_margin,wrong_argmax,wrong_output_byte:273, info:low_head_margin,wrong_argmax,wrong_output_byte:265
+atomic_by_severity=fatal:low_head_margin:273, fatal:wrong_argmax:273, fatal:wrong_output_byte:273, info:low_head_margin:265, info:wrong_argmax:265, info:wrong_output_byte:265
+
+FIRST_FATAL_SLOT_COUNTS
+slots=STACK0_byte0:123, SP_byte0:120, STACK0_byte2:25, AX_byte0:4, AX_byte1:1
+step_slots=step0:SP_byte0:72, step9:STACK0_byte0:65, step1:SP_byte0:48, step1:STACK0_byte2:25, step11:STACK0_byte0:25, step13:STACK0_byte0:20, step7:STACK0_byte0:7, step6:STACK0_byte0:6, step0:AX_byte0:3, step15:AX_byte0:1, step12:AX_byte1:1
+family_step_slots=var_mul->step9:STACK0_byte0:25, var_three->step1:STACK0_byte2:25, loop_sum->step11:STACK0_byte0:25, loop_mul->step1:SP_byte0:25, if_gt->step0:SP_byte0:24, if_lt->step0:SP_byte0:24, if_eq->step0:SP_byte0:24, if_var->step9:STACK0_byte0:21, var_update->step13:STACK0_byte0:20, loop_countdown->step9:STACK0_byte0:19, loop_countdown->step7:STACK0_byte0:4, var_update->step6:STACK0_byte0:3, if_var->step7:STACK0_byte0:3, loop_countdown->step6:STACK0_byte0:2, var_update->step15:AX_byte0:1, var_update->step12:AX_byte1:1, if_gt->step0:AX_byte0:1, if_lt->step0:AX_byte0:1, if_eq->step0:AX_byte0:1, if_var->step6:STACK0_byte0:1, loop_pow2_0->step1:SP_byte0:1, loop_pow2_1->step1:SP_byte0:1, loop_pow2_2->step1:SP_byte0:1, loop_pow2_3->step1:SP_byte0:1, loop_pow2_4->step1:SP_byte0:1, loop_pow2_5->step1:SP_byte0:1, loop_pow2_6->step1:SP_byte0:1, loop_pow2_7->step1:SP_byte0:1, loop_pow2_8->step1:SP_byte0:1, loop_pow2_9->step1:SP_byte0:1, loop_pow2_10->step1:SP_byte0:1, loop_pow2_11->step1:SP_byte0:1, loop_pow2_12->step1:SP_byte0:1, loop_pow2_13->step1:SP_byte0:1, loop_pow2_14->step1:SP_byte0:1, loop_pow2_15->step1:SP_byte0:1, loop_pow2_16->step1:SP_byte0:1, loop_pow2_17->step1:SP_byte0:1, loop_pow2_18->step1:SP_byte0:1, loop_pow2_19->step1:SP_byte0:1, loop_pow2_20->step1:SP_byte0:1, loop_pow2_21->step1:SP_byte0:1, loop_pow2_22->step1:SP_byte0:1
+first_fatal_examples[step9:STACK0_byte0]=0275:var_mul_0: a=23, b=47, a*b; 0276:var_mul_1: a=21, b=28, a*b; 0277:var_mul_2: a=39, b=33, a*b; 0278:var_mul_3: a=8, b=25, a*b
+first_fatal_examples[step1:STACK0_byte2]=0300:var_three_0: 29+6+20; 0301:var_three_1: 19+10+13; 0302:var_three_2: 18+27+1; 0303:var_three_3: 10+10+7
+first_fatal_examples[step15:AX_byte0]=0325:var_update_0: x=50, x=x+7
+first_fatal_examples[step13:STACK0_byte0]=0326:var_update_1: x=50, x=x+28; 0327:var_update_2: x=15, x=x+12; 0328:var_update_3: x=45, x=x+34; 0329:var_update_4: x=30, x=x+4
+first_fatal_examples[step6:STACK0_byte0]=0332:var_update_7: x=9, x=x+30; 0343:var_update_18: x=41, x=x+18; 0346:var_update_21: x=41, x=x+16; 0434:if_var_9: x=89, x>35
+first_fatal_examples[step12:AX_byte1]=0339:var_update_14: x=29, x=x+11
+first_fatal_examples[step0:SP_byte0]=0350:if_gt_0: 35 > 43; 0351:if_gt_1: 41 > 70; 0352:if_gt_2: 11 > 18; 0353:if_gt_3: 20 > 30
+first_fatal_examples[step0:AX_byte0]=0360:if_gt_10: 8 > 27; 0386:if_lt_11: 24 < 7; 0421:if_eq_21: 40 == 35
+first_fatal_examples[step7:STACK0_byte0]=0436:if_var_11: x=66, x>24; 0442:if_var_17: x=82, x>91; 0444:if_var_19: x=2, x>11; 0486:loop_countdown_11: countdown from 18
+first_fatal_examples[step11:STACK0_byte0]=0450:loop_sum_0: sum(1..18); 0451:loop_sum_1: sum(1..17); 0452:loop_sum_2: sum(1..12); 0453:loop_sum_3: sum(1..14)
+first_fatal_examples[step1:SP_byte0]=0500:loop_mul_0: 1*10 by addition; 0501:loop_mul_1: 5*8 by addition; 0502:loop_mul_2: 8*8 by addition; 0503:loop_mul_3: 6*3 by addition
+
+FIRST_INFO_SLOT_COUNTS
+slots=MEM_addr0:217, MEM_addr1:48
+step_slots=step5:MEM_addr0:76, step3:MEM_addr0:75, step1:MEM_addr0:66, step1:MEM_addr1:48
+
+FINAL_BLOCK_COUNTS
+final_blocks=block27/layer27:274
+flas_blocks=block27/layer27:86, block25/layer16:53, block13/layer13:1
+
+PER_ID_STATUS
+# id status family desc(short)
+0274 info-support-drift var_simple var_simple_24: x = 444
+0275 fatal-lowering-divergence var_mul var_mul_0: a=23, b=47, a*b
+0276 fatal-lowering-divergence var_mul var_mul_1: a=21, b=28, a*b
+0277 fatal-lowering-divergence var_mul var_mul_2: a=39, b=33, a*b
+0278 fatal-lowering-divergence var_mul var_mul_3: a=8, b=25, a*b
+0279 fatal-lowering-divergence var_mul var_mul_4: a=37, b=13, a*b
+0280 fatal-lowering-divergence var_mul var_mul_5: a=17, b=3, a*b
+0281 fatal-lowering-divergence var_mul var_mul_6: a=46, b=28, a*b
+0282 fatal-lowering-divergence var_mul var_mul_7: a=1, b=34, a*b
+0283 fatal-lowering-divergence var_mul var_mul_8: a=35, b=44, a*b
+0284 fatal-lowering-divergence var_mul var_mul_9: a=47, b=48, a*b
+0285 fatal-lowering-divergence var_mul var_mul_10: a=48, b=43, a*b
+0286 fatal-lowering-divergence var_mul var_mul_11: a=13, b=24, a*b
+0287 fatal-lowering-divergence var_mul var_mul_12: a=28, b=5, a*b
+0288 fatal-lowering-divergence var_mul var_mul_13: a=43, b=22, a*b
+0289 fatal-lowering-divergence var_mul var_mul_14: a=40, b=21, a*b
+0290 fatal-lowering-divergence var_mul var_mul_15: a=43, b=8, a*b
+0291 fatal-lowering-divergence var_mul var_mul_16: a=47, b=20, a*b
+0292 fatal-lowering-divergence var_mul var_mul_17: a=33, b=20, a*b
+0293 fatal-lowering-divergence var_mul var_mul_18: a=43, b=27, a*b
+0294 fatal-lowering-divergence var_mul var_mul_19: a=21, b=26, a*b
+0295 fatal-lowering-divergence var_mul var_mul_20: a=45, b=19, a*b
+0296 fatal-lowering-divergence var_mul var_mul_21: a=36, b=9, a*b
+0297 fatal-lowering-divergence var_mul var_mul_22: a=13, b=27, a*b
+0298 fatal-lowering-divergence var_mul var_mul_23: a=43, b=25, a*b
+0299 fatal-lowering-divergence var_mul var_mul_24: a=44, b=48, a*b
+0300 fatal-lowering-divergence var_three var_three_0: 29+6+20
+0301 fatal-lowering-divergence var_three var_three_1: 19+10+13
+0302 fatal-lowering-divergence var_three var_three_2: 18+27+1
+0303 fatal-lowering-divergence var_three var_three_3: 10+10+7
+0304 fatal-lowering-divergence var_three var_three_4: 14+26+19
+0305 fatal-lowering-divergence var_three var_three_5: 20+21+11
+0306 fatal-lowering-divergence var_three var_three_6: 15+15+15
+0307 fatal-lowering-divergence var_three var_three_7: 22+7+17
+0308 fatal-lowering-divergence var_three var_three_8: 16+26+29
+0309 fatal-lowering-divergence var_three var_three_9: 26+24+6
+0310 fatal-lowering-divergence var_three var_three_10: 22+3+10
+0311 fatal-lowering-divergence var_three var_three_11: 17+22+21
+0312 fatal-lowering-divergence var_three var_three_12: 20+11+3
+0313 fatal-lowering-divergence var_three var_three_13: 27+25+8
+0314 fatal-lowering-divergence var_three var_three_14: 22+10+8
+0315 fatal-lowering-divergence var_three var_three_15: 26+7+5
+0316 fatal-lowering-divergence var_three var_three_16: 1+2+8
+0317 fatal-lowering-divergence var_three var_three_17: 16+20+28
+0318 fatal-lowering-divergence var_three var_three_18: 25+3+15
+0319 fatal-lowering-divergence var_three var_three_19: 14+29+21
+0320 fatal-lowering-divergence var_three var_three_20: 19+7+23
+0321 fatal-lowering-divergence var_three var_three_21: 23+13+16
+0322 fatal-lowering-divergence var_three var_three_22: 13+8+5
+0323 fatal-lowering-divergence var_three var_three_23: 21+23+1
+0324 fatal-lowering-divergence var_three var_three_24: 29+25+28
+0325 fatal-lowering-divergence var_update var_update_0: x=50, x=x+7
+0326 fatal-lowering-divergence var_update var_update_1: x=50, x=x+28
+0327 fatal-lowering-divergence var_update var_update_2: x=15, x=x+12
+0328 fatal-lowering-divergence var_update var_update_3: x=45, x=x+34
+0329 fatal-lowering-divergence var_update var_update_4: x=30, x=x+4
+0330 fatal-lowering-divergence var_update var_update_5: x=36, x=x+16
+0331 fatal-lowering-divergence var_update var_update_6: x=8, x=x+30
+0332 fatal-lowering-divergence var_update var_update_7: x=9, x=x+30
+0333 fatal-lowering-divergence var_update var_update_8: x=43, x=x+34
+0334 fatal-lowering-divergence var_update var_update_9: x=36, x=x+39
+0335 fatal-lowering-divergence var_update var_update_10: x=21, x=x+49
+0336 fatal-lowering-divergence var_update var_update_11: x=29, x=x+40
+0337 fatal-lowering-divergence var_update var_update_12: x=47, x=x+33
+0338 fatal-lowering-divergence var_update var_update_13: x=28, x=x+36
+0339 fatal-lowering-divergence var_update var_update_14: x=29, x=x+11
+0340 fatal-lowering-divergence var_update var_update_15: x=48, x=x+31
+0341 fatal-lowering-divergence var_update var_update_16: x=29, x=x+17
+0342 fatal-lowering-divergence var_update var_update_17: x=49, x=x+16
+0343 fatal-lowering-divergence var_update var_update_18: x=41, x=x+18
+0344 fatal-lowering-divergence var_update var_update_19: x=50, x=x+50
+0345 fatal-lowering-divergence var_update var_update_20: x=34, x=x+32
+0346 fatal-lowering-divergence var_update var_update_21: x=41, x=x+16
+0347 fatal-lowering-divergence var_update var_update_22: x=18, x=x+29
+0348 fatal-lowering-divergence var_update var_update_23: x=5, x=x+46
+0349 fatal-lowering-divergence var_update var_update_24: x=19, x=x+16
+0350 fatal-lowering-divergence if_gt if_gt_0: 35 > 43
+0351 fatal-lowering-divergence if_gt if_gt_1: 41 > 70
+0352 fatal-lowering-divergence if_gt if_gt_2: 11 > 18
+0353 fatal-lowering-divergence if_gt if_gt_3: 20 > 30
+0354 fatal-lowering-divergence if_gt if_gt_4: 50 > 89
+0355 fatal-lowering-divergence if_gt if_gt_5: 20 > 91
+0356 fatal-lowering-divergence if_gt if_gt_6: 28 > 9
+0357 fatal-lowering-divergence if_gt if_gt_7: 54 > 53
+0358 fatal-lowering-divergence if_gt if_gt_8: 43 > 70
+0359 fatal-lowering-divergence if_gt if_gt_9: 60 > 54
+0360 fatal-lowering-divergence if_gt if_gt_10: 8 > 27
+0361 fatal-lowering-divergence if_gt if_gt_11: 54 > 50
+0362 fatal-lowering-divergence if_gt if_gt_12: 99 > 75
+0363 fatal-lowering-divergence if_gt if_gt_13: 90 > 3
+0364 fatal-lowering-divergence if_gt if_gt_14: 98 > 74
+0365 fatal-lowering-divergence if_gt if_gt_15: 49 > 62
+0366 fatal-lowering-divergence if_gt if_gt_16: 1 > 46
+0367 fatal-lowering-divergence if_gt if_gt_17: 39 > 97
+0368 fatal-lowering-divergence if_gt if_gt_18: 50 > 54
+0369 fatal-lowering-divergence if_gt if_gt_19: 69 > 96
+0370 fatal-lowering-divergence if_gt if_gt_20: 95 > 70
+0371 fatal-lowering-divergence if_gt if_gt_21: 78 > 29
+0372 fatal-lowering-divergence if_gt if_gt_22: 63 > 29
+0373 fatal-lowering-divergence if_gt if_gt_23: 35 > 56
+0374 fatal-lowering-divergence if_gt if_gt_24: 63 > 4
+0375 fatal-lowering-divergence if_lt if_lt_0: 50 < 44
+0376 fatal-lowering-divergence if_lt if_lt_1: 86 < 87
+0377 fatal-lowering-divergence if_lt if_lt_2: 52 < 93
+0378 fatal-lowering-divergence if_lt if_lt_3: 22 < 60
+0379 fatal-lowering-divergence if_lt if_lt_4: 17 < 80
+0380 fatal-lowering-divergence if_lt if_lt_5: 69 < 4
+0381 fatal-lowering-divergence if_lt if_lt_6: 51 < 76
+0382 fatal-lowering-divergence if_lt if_lt_7: 73 < 85
+0383 fatal-lowering-divergence if_lt if_lt_8: 4 < 11
+0384 fatal-lowering-divergence if_lt if_lt_9: 83 < 55
+0385 fatal-lowering-divergence if_lt if_lt_10: 18 < 60
+0386 fatal-lowering-divergence if_lt if_lt_11: 24 < 7
+0387 fatal-lowering-divergence if_lt if_lt_12: 34 < 49
+0388 fatal-lowering-divergence if_lt if_lt_13: 42 < 28
+0389 fatal-lowering-divergence if_lt if_lt_14: 59 < 42
+0390 fatal-lowering-divergence if_lt if_lt_15: 44 < 98
+0391 fatal-lowering-divergence if_lt if_lt_16: 49 < 36
+0392 fatal-lowering-divergence if_lt if_lt_17: 97 < 54
+0393 fatal-lowering-divergence if_lt if_lt_18: 33 < 11
+0394 fatal-lowering-divergence if_lt if_lt_19: 61 < 3
+0395 fatal-lowering-divergence if_lt if_lt_20: 96 < 70
+0396 fatal-lowering-divergence if_lt if_lt_21: 7 < 45
+0397 fatal-lowering-divergence if_lt if_lt_22: 29 < 84
+0398 fatal-lowering-divergence if_lt if_lt_23: 9 < 100
+0399 fatal-lowering-divergence if_lt if_lt_24: 84 < 6
+0400 fatal-lowering-divergence if_eq if_eq_0: 49 == 49
+0401 fatal-lowering-divergence if_eq if_eq_1: 13 == 13
+0402 fatal-lowering-divergence if_eq if_eq_2: 16 == 9
+0403 fatal-lowering-divergence if_eq if_eq_3: 43 == 43
+0404 fatal-lowering-divergence if_eq if_eq_4: 30 == 45
+0405 fatal-lowering-divergence if_eq if_eq_5: 50 == 50
+0406 fatal-lowering-divergence if_eq if_eq_6: 39 == 39
+0407 fatal-lowering-divergence if_eq if_eq_7: 50 == 11
+0408 fatal-lowering-divergence if_eq if_eq_8: 7 == 7
+0409 fatal-lowering-divergence if_eq if_eq_9: 20 == 37
+0410 fatal-lowering-divergence if_eq if_eq_10: 26 == 26
+0411 fatal-lowering-divergence if_eq if_eq_11: 5 == 5
+0412 fatal-lowering-divergence if_eq if_eq_12: 7 == 45
+0413 fatal-lowering-divergence if_eq if_eq_13: 44 == 44
+0414 fatal-lowering-divergence if_eq if_eq_14: 37 == 3
+0415 fatal-lowering-divergence if_eq if_eq_15: 35 == 28
+0416 fatal-lowering-divergence if_eq if_eq_16: 5 == 33
+0417 fatal-lowering-divergence if_eq if_eq_17: 1 == 27
+0418 fatal-lowering-divergence if_eq if_eq_18: 7 == 28
+0419 fatal-lowering-divergence if_eq if_eq_19: 41 == 41
+0420 fatal-lowering-divergence if_eq if_eq_20: 28 == 12
+0421 fatal-lowering-divergence if_eq if_eq_21: 40 == 35
+0422 fatal-lowering-divergence if_eq if_eq_22: 30 == 28
+0423 fatal-lowering-divergence if_eq if_eq_23: 21 == 21
+0424 fatal-lowering-divergence if_eq if_eq_24: 18 == 18
+0425 fatal-lowering-divergence if_var if_var_0: x=96, x>59
+0426 fatal-lowering-divergence if_var if_var_1: x=72, x>78
+0427 fatal-lowering-divergence if_var if_var_2: x=85, x>48
+0428 fatal-lowering-divergence if_var if_var_3: x=43, x>3
+0429 fatal-lowering-divergence if_var if_var_4: x=63, x>41
+0430 fatal-lowering-divergence if_var if_var_5: x=23, x>62
+0431 fatal-lowering-divergence if_var if_var_6: x=27, x>45
+0432 fatal-lowering-divergence if_var if_var_7: x=33, x>43
+0433 fatal-lowering-divergence if_var if_var_8: x=35, x>76
+0434 fatal-lowering-divergence if_var if_var_9: x=89, x>35
+0435 fatal-lowering-divergence if_var if_var_10: x=71, x>1
+0436 fatal-lowering-divergence if_var if_var_11: x=66, x>24
+0437 fatal-lowering-divergence if_var if_var_12: x=10, x>30
+0438 fatal-lowering-divergence if_var if_var_13: x=92, x>52
+0439 fatal-lowering-divergence if_var if_var_14: x=62, x>71
+0440 fatal-lowering-divergence if_var if_var_15: x=97, x>30
+0441 fatal-lowering-divergence if_var if_var_16: x=88, x>60
+0442 fatal-lowering-divergence if_var if_var_17: x=82, x>91
+0443 fatal-lowering-divergence if_var if_var_18: x=62, x>57
+0444 fatal-lowering-divergence if_var if_var_19: x=2, x>11
+0445 fatal-lowering-divergence if_var if_var_20: x=37, x>28
+0446 fatal-lowering-divergence if_var if_var_21: x=51, x>88
+0447 fatal-lowering-divergence if_var if_var_22: x=31, x>39
+0448 fatal-lowering-divergence if_var if_var_23: x=84, x>74
+0449 fatal-lowering-divergence if_var if_var_24: x=47, x>60
+0450 fatal-lowering-divergence loop_sum loop_sum_0: sum(1..18)
+0451 fatal-lowering-divergence loop_sum loop_sum_1: sum(1..17)
+0452 fatal-lowering-divergence loop_sum loop_sum_2: sum(1..12)
+0453 fatal-lowering-divergence loop_sum loop_sum_3: sum(1..14)
+0454 fatal-lowering-divergence loop_sum loop_sum_4: sum(1..18)
+0455 fatal-lowering-divergence loop_sum loop_sum_5: sum(1..11)
+0456 fatal-lowering-divergence loop_sum loop_sum_6: sum(1..12)
+0457 fatal-lowering-divergence loop_sum loop_sum_7: sum(1..15)
+0458 fatal-lowering-divergence loop_sum loop_sum_8: sum(1..9)
+0459 fatal-lowering-divergence loop_sum loop_sum_9: sum(1..10)
+0460 fatal-lowering-divergence loop_sum loop_sum_10: sum(1..9)
+0461 fatal-lowering-divergence loop_sum loop_sum_11: sum(1..8)
+0462 fatal-lowering-divergence loop_sum loop_sum_12: sum(1..4)
+0463 fatal-lowering-divergence loop_sum loop_sum_13: sum(1..7)
+0464 fatal-lowering-divergence loop_sum loop_sum_14: sum(1..11)
+0465 fatal-lowering-divergence loop_sum loop_sum_15: sum(1..4)
+0466 fatal-lowering-divergence loop_sum loop_sum_16: sum(1..18)
+0467 fatal-lowering-divergence loop_sum loop_sum_17: sum(1..6)
+0468 fatal-lowering-divergence loop_sum loop_sum_18: sum(1..7)
+0469 fatal-lowering-divergence loop_sum loop_sum_19: sum(1..7)
+0470 fatal-lowering-divergence loop_sum loop_sum_20: sum(1..16)
+0471 fatal-lowering-divergence loop_sum loop_sum_21: sum(1..9)
+0472 fatal-lowering-divergence loop_sum loop_sum_22: sum(1..19)
+0473 fatal-lowering-divergence loop_sum loop_sum_23: sum(1..17)
+0474 fatal-lowering-divergence loop_sum loop_sum_24: sum(1..20)
+0475 fatal-lowering-divergence loop_countdown loop_countdown_0: countdown from 10
+0476 fatal-lowering-divergence loop_countdown loop_countdown_1: countdown from 4
+0477 fatal-lowering-divergence loop_countdown loop_countdown_2: countdown from 27
+0478 fatal-lowering-divergence loop_countdown loop_countdown_3: countdown from 7
+0479 fatal-lowering-divergence loop_countdown loop_countdown_4: countdown from 10
+0480 fatal-lowering-divergence loop_countdown loop_countdown_5: countdown from 8
+0481 fatal-lowering-divergence loop_countdown loop_countdown_6: countdown from 12
+0482 fatal-lowering-divergence loop_countdown loop_countdown_7: countdown from 6
+0483 fatal-lowering-divergence loop_countdown loop_countdown_8: countdown from 10
+0484 fatal-lowering-divergence loop_countdown loop_countdown_9: countdown from 1
+0485 fatal-lowering-divergence loop_countdown loop_countdown_10: countdown from 23
+0486 fatal-lowering-divergence loop_countdown loop_countdown_11: countdown from 18
+0487 fatal-lowering-divergence loop_countdown loop_countdown_12: countdown from 5
+0488 fatal-lowering-divergence loop_countdown loop_countdown_13: countdown from 9
+0489 fatal-lowering-divergence loop_countdown loop_countdown_14: countdown from 2
+0490 fatal-lowering-divergence loop_countdown loop_countdown_15: countdown from 2
+0491 fatal-lowering-divergence loop_countdown loop_countdown_16: countdown from 18
+0492 fatal-lowering-divergence loop_countdown loop_countdown_17: countdown from 10
+0493 fatal-lowering-divergence loop_countdown loop_countdown_18: countdown from 23
+0494 fatal-lowering-divergence loop_countdown loop_countdown_19: countdown from 5
+0495 fatal-lowering-divergence loop_countdown loop_countdown_20: countdown from 21
+0496 fatal-lowering-divergence loop_countdown loop_countdown_21: countdown from 28
+0497 fatal-lowering-divergence loop_countdown loop_countdown_22: countdown from 25
+0498 fatal-lowering-divergence loop_countdown loop_countdown_23: countdown from 16
+0499 fatal-lowering-divergence loop_countdown loop_countdown_24: countdown from 4
+0500 fatal-lowering-divergence loop_mul loop_mul_0: 1*10 by addition
+0501 fatal-lowering-divergence loop_mul loop_mul_1: 5*8 by addition
+0502 fatal-lowering-divergence loop_mul loop_mul_2: 8*8 by addition
+0503 fatal-lowering-divergence loop_mul loop_mul_3: 6*3 by addition
+0504 fatal-lowering-divergence loop_mul loop_mul_4: 1*5 by addition
+0505 fatal-lowering-divergence loop_mul loop_mul_5: 8*2 by addition
+0506 fatal-lowering-divergence loop_mul loop_mul_6: 2*7 by addition
+0507 fatal-lowering-divergence loop_mul loop_mul_7: 8*2 by addition
+0508 fatal-lowering-divergence loop_mul loop_mul_8: 10*1 by addition
+0509 fatal-lowering-divergence loop_mul loop_mul_9: 3*3 by addition
+0510 fatal-lowering-divergence loop_mul loop_mul_10: 10*5 by addition
+0511 fatal-lowering-divergence loop_mul loop_mul_11: 2*4 by addition
+0512 fatal-lowering-divergence loop_mul loop_mul_12: 2*9 by addition
+0513 fatal-lowering-divergence loop_mul loop_mul_13: 7*10 by addition
+0514 fatal-lowering-divergence loop_mul loop_mul_14: 10*10 by addition
+0515 fatal-lowering-divergence loop_mul loop_mul_15: 4*9 by addition
+0516 fatal-lowering-divergence loop_mul loop_mul_16: 7*8 by addition
+0517 fatal-lowering-divergence loop_mul loop_mul_17: 8*5 by addition
+0518 fatal-lowering-divergence loop_mul loop_mul_18: 10*7 by addition
+0519 fatal-lowering-divergence loop_mul loop_mul_19: 5*10 by addition
+0520 fatal-lowering-divergence loop_mul loop_mul_20: 10*1 by addition
+0521 fatal-lowering-divergence loop_mul loop_mul_21: 10*2 by addition
+0522 fatal-lowering-divergence loop_mul loop_mul_22: 4*4 by addition
+0523 fatal-lowering-divergence loop_mul loop_mul_23: 5*2 by addition
+0524 fatal-lowering-divergence loop_mul loop_mul_24: 3*4 by addition
+0525 fatal-lowering-divergence loop_pow2_0 loop_pow2_0: 2^2
+0526 fatal-lowering-divergence loop_pow2_1 loop_pow2_1: 2^8
+0527 fatal-lowering-divergence loop_pow2_2 loop_pow2_2: 2^1
+0528 fatal-lowering-divergence loop_pow2_3 loop_pow2_3: 2^2
+0529 fatal-lowering-divergence loop_pow2_4 loop_pow2_4: 2^0
+0530 fatal-lowering-divergence loop_pow2_5 loop_pow2_5: 2^6
+0531 fatal-lowering-divergence loop_pow2_6 loop_pow2_6: 2^7
+0532 fatal-lowering-divergence loop_pow2_7 loop_pow2_7: 2^9
+0533 fatal-lowering-divergence loop_pow2_8 loop_pow2_8: 2^7
+0534 fatal-lowering-divergence loop_pow2_9 loop_pow2_9: 2^4
+0535 fatal-lowering-divergence loop_pow2_10 loop_pow2_10: 2^0
+0536 fatal-lowering-divergence loop_pow2_11 loop_pow2_11: 2^3
+0537 fatal-lowering-divergence loop_pow2_12 loop_pow2_12: 2^4
+0538 fatal-lowering-divergence loop_pow2_13 loop_pow2_13: 2^4
+0539 fatal-lowering-divergence loop_pow2_14 loop_pow2_14: 2^7
+0540 fatal-lowering-divergence loop_pow2_15 loop_pow2_15: 2^1
+0541 fatal-lowering-divergence loop_pow2_16 loop_pow2_16: 2^10
+0542 fatal-lowering-divergence loop_pow2_17 loop_pow2_17: 2^3
+0543 fatal-lowering-divergence loop_pow2_18 loop_pow2_18: 2^4
+0544 fatal-lowering-divergence loop_pow2_19 loop_pow2_19: 2^10
+0545 fatal-lowering-divergence loop_pow2_20 loop_pow2_20: 2^9
+0546 fatal-lowering-divergence loop_pow2_21 loop_pow2_21: 2^10
+0547 fatal-lowering-divergence loop_pow2_22 loop_pow2_22: 2^3
