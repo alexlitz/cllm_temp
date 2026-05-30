@@ -1,0 +1,44 @@
+=== CLLM Utilities Build ===
+Model:   /home/alexlitz/Documents/misc/c4_release/c4_release/models/transformer_vm.c4onnx (68K)
+Bin dir: /home/alexlitz/Documents/misc/c4_release/c4_release/build/bin
+Gen dir: /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled
+
+  argv_test-cllm FAIL (gcc error)
+  cat-cllm     FAIL (gcc error)
+  echo-cllm    FAIL (gcc error)
+  head-cllm    FAIL (gcc error)
+  memtest-cllm FAIL (gcc error)
+  nl-cllm      FAIL (gcc error)
+  quine-cllm   FAIL (gcc error)
+  rev-cllm     FAIL (gcc error)
+  tail-cllm    FAIL (gcc error)
+  tee-cllm     FAIL (gcc error)
+  uniq-cllm    FAIL (gcc error)
+  wc-cllm      FAIL (gcc error)
+  yes-cllm     FAIL (gcc error)
+
+=== Build Summary ===
+  OK:     0
+  Failed: 13
+
+Executables:
+
+Bundled C sources:
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/argv_test_cllm_bundled.c 393K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/cat_cllm_bundled.c 392K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/echo_cllm_bundled.c 392K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/head_cllm_bundled.c 393K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/memtest_cllm_bundled.c 396K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/nl_cllm_bundled.c 394K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/quine_cllm_bundled.c 396K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/quine_draft.c 22M
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/quine_neural.c 3.1M
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/quine_neural_c4.c 11M
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/quine_neural_fp32.c 3.1M
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/quine_nodraft.c 22M
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/rev_cllm_bundled.c 396K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/tail_cllm_bundled.c 397K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/tee_cllm_bundled.c 392K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/uniq_cllm_bundled.c 397K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/wc_cllm_bundled.c 396K
+  /home/alexlitz/Documents/misc/c4_release/c4_release/build/bundled/yes_cllm_bundled.c 392K
