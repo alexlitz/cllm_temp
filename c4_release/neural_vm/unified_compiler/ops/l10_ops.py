@@ -3471,13 +3471,28 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # lanes 8 and 15 and clobbering the actual computed SP byte (which is
         # already correctly proved by upstream L6/L10 staging).
         #
-        # Fix: invert the dominance. Make the OUTPUT_LO+8 and OUTPUT_HI+15
-        # reads the dominant positive evidence so the rule only fires when
-        # upstream has already proved 0xF8. This is a pure exactness-restoration
-        # rule (it asserts the value the model is already converging on), so
-        # demanding the upstream proof is the safe behavior. Keep MARK_SP as a
-        # gating-only term and raise all opcode/marker blockers to the 1e9
-        # scale so MARK_SP residual amplification cannot cancel them.
+        # Attempted fix (REJECTED, see below): invert the dominance. Make the
+        # OUTPUT_LO+8 and OUTPUT_HI+15 reads the dominant positive evidence so
+        # the rule only fires when upstream has already proved 0xF8. The intent
+        # was that a pure exactness-restoration rule should only assert the
+        # value the model is already converging on. MARK_SP becomes a
+        # gating-only term and opcode/marker blockers go to 1e9 so MARK_SP
+        # residual amplification cannot cancel them.
+        #
+        # B3-gamma rejection (2026-05-30): the inversion does not improve
+        # sentinel or smoke E2E numbers and breaks two unit tests for this
+        # same rule:
+        #   * test_tail_sp_marker_byte0_f8_from_initial_stack_exacts_nibbles
+        #     - residual inputs (OUTPUT_LO+8=0.026, OUTPUT_HI+15=0.022) are
+        #       below the new dominance scale, so the rule never fires and
+        #       fails to amplify the converging signal to 4.0.
+        #   * test_tail_sp_marker_byte0_f8_blocks_ax_imm_ff_residue - with
+        #     OUTPUT_HI+15=1.345e9 (non-F8 residue from an IMM/AX path), the
+        #     1e10-scale positive contribution overwhelms the -1e9 blockers
+        #     and spuriously emits 0xF8.
+        # E2E:  sentinel ids 0-32 = 3/32 baseline -> 3/32 patched (no delta);
+        #       smoke    ids 200-299 = 50/100 baseline -> 50/100 patched.
+        # See branch investigation/b2b-mark-sp-inversion-rejected.
         *exact_output_byte_rules(
             name="tail_sp_marker_byte0_f8_from_initial_stack_exact",
             expected_byte=0xF8,
