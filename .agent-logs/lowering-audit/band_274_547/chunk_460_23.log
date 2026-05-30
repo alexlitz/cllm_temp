@@ -1,0 +1,14 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-a319f733a49e89a43/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 1 item
+
+c4_release/tests/test_1096_teacher_forced_lowering_audit.py .
+
+======================== 1 passed in 793.22s (0:13:13) =========================
