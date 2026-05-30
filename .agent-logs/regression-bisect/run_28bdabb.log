@@ -1,0 +1,87 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-a982a8cea042804d0/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 1 item
+
+c4_release/tests/test_1096_neural_declarative_diagnostic.py   BRANCH OVERRIDE PATCH: 432 units gated
+  L7 DEAD-UNIT ZERO: 128 units suppressed
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'OPCODE_FLAGS' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_LO' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_HI' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L15_attn reads 'ADDR_KEY' but no prior layer writes it
+  RIGHT-SIZING FFNs (compiler-determined width):
+    L0.ffn: 7 units (no dead units)
+    L1.ffn: 5 units (no dead units)
+    L2.ffn: 10 units (no dead units)
+    L3.ffn: 4096 -> 132 units (-3964 dead)
+    L4.ffn: 544 -> 543 units (-1 dead)
+    L5.ffn: 4096 -> 88 units (-4008 dead)
+    L6.ffn: 2294 -> 1539 units (-755 dead)
+    L7.ffn: 4096 -> 1 units (-4095 dead)
+    L8.ffn: 2055 units (no dead units)
+    L8.post_ops[0].pipeline.1.add_layer.ffn: 6 units (no dead units)
+    L8.post_ops[0].pipeline.1.sub_layer.ffn: 7 units (no dead units)
+    L8.post_ops[0].pipeline.2.add_layer.flat_ffn: 60 units (no dead units)
+    L8.post_ops[0].pipeline.2.sub_layer.flat_ffn: 60 units (no dead units)
+    L8.post_ops[0].pipeline.3.add_layer.ffn: 10 units (no dead units)
+    L8.post_ops[0].pipeline.3.sub_layer.ffn: 10 units (no dead units)
+    L8.post_ops[0].pipeline.4.ge_to_bd.ffn: 64 units (no dead units)
+    L9.ffn: 3405 units (no dead units)
+    L10.ffn.ge_to_bd.ffn: 64 units (no dead units)
+    L10.ffn.and_layers.0.ffn: 104 units (no dead units)
+    L10.ffn.and_layers.1.ffn: 24 units (no dead units)
+    L10.ffn.or_layers.0.ffn: 104 units (no dead units)
+    L10.ffn.or_layers.1.ffn: 32 units (no dead units)
+    L10.ffn.xor_layers.0.ffn: 104 units (no dead units)
+    L10.ffn.xor_layers.1.ffn: 32 units (no dead units)
+    L10.post_ops[0]: 4 units (no dead units)
+    L10.post_ops[1]: 1536 -> 1028 units (-508 dead)
+    L10.post_ops[2]: 512 units (no dead units)
+    L10.post_ops[3]: 512 units (no dead units)
+    L10.post_ops[4]: 512 units (no dead units)
+    L10.post_ops[5]: 1536 units (no dead units)
+    L10.post_ops[6]: 18 units (no dead units)
+    L10.post_ops[7].stages.div.div_layers.0.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.div.div_layers.2.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.mod.mod_layers.0.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.mod.mod_layers.2.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.getobd.ge_to_bd.ffn: 64 units (no dead units)
+    L11.ffn._stages.1.sub_ffn.flat_ffn: 88 units (no dead units)
+    L11.ffn._stages.2.sub_ffn.flat_ffn: 1808 -> 1792 units (-16 dead)
+    L11.ffn._stages.3.sub_ffn.flat_ffn: 142 units (no dead units)
+    L11.ffn._stages.4.sub_ffn.flat_ffn: 46 units (no dead units)
+    L11.ffn._stages.5.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.ffn._stages.6.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.ffn._stages.7.sub_ffn.flat_ffn: 44 units (no dead units)
+    L11.ffn._stages.9.ge_to_bd.ffn: 64 units (no dead units)
+    L11.ffn.pipeline.1.sub_ffn.flat_ffn: 88 units (no dead units)
+    L11.ffn.pipeline.2.sub_ffn.flat_ffn: 1792 units (no dead units)
+    L11.ffn.pipeline.3.sub_ffn.flat_ffn: 142 units (no dead units)
+    L11.ffn.pipeline.4.sub_ffn.flat_ffn: 46 units (no dead units)
+    L11.ffn.pipeline.5.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.ffn.pipeline.6.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.ffn.pipeline.7.sub_ffn.flat_ffn: 44 units (no dead units)
+    L11.ffn.pipeline.9.ge_to_bd.ffn: 64 units (no dead units)
+    L12.ffn: 4096 -> 1 units (-4095 dead)
+    L13.ffn.precompute_stage.shl_precompute.ffn: 28 units (no dead units)
+    L13.ffn.precompute_stage.shr_precompute.ffn: 28 units (no dead units)
+    L13.ffn.select_stage.shl_select.flat_ffn: 528 units (no dead units)
+    L13.ffn.select_stage.shr_select.flat_ffn: 528 units (no dead units)
+    L13.ffn.getobd_stage.ge_to_bd.ffn: 64 units (no dead units)
+    L14.ffn: 1312 units (no dead units)
+    L15.ffn: 42 units (no dead units)
+    L16.ffn: 189 units (no dead units)
+    L17.ffn: 4096 -> 1558 units (-2538 dead)
+    L17.post_ops[0]: 546 units (no dead units)
+  TOTAL FFN units: 42176 -> 22196 (52.6% retained)
+  PHASE 0 EXPANSIONS: 10 post_ops (7 re-baked into vanilla PureFFN)
+  Total blocks: 17 -> 28
+.
+
+======================== 1 passed in 100.21s (0:01:40) =========================

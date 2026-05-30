@@ -1,0 +1,113 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-a982a8cea042804d0/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 1 item
+
+c4_release/tests/test_1096_neural_declarative_diagnostic.py   BRANCH OVERRIDE PATCH: 432 units gated
+  L7 DEAD-UNIT ZERO: 128 units suppressed
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'OPCODE_FLAGS' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_LO' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L6_ffn_io reads 'AX_CARRY_HI' but no prior layer writes it
+  CONTRACT: READ-BEFORE-WRITE: L15_attn reads 'ADDR_KEY' but no prior layer writes it
+  RIGHT-SIZING FFNs (compiler-determined width):
+    L0.ffn: 7 units (no dead units)
+    L1.ffn: 5 units (no dead units)
+    L2.ffn: 10 units (no dead units)
+    L3.ffn: 4096 -> 132 units (-3964 dead)
+    L4.ffn: 544 -> 543 units (-1 dead)
+    L5.ffn: 4096 -> 88 units (-4008 dead)
+    L6.ffn: 2294 -> 1539 units (-755 dead)
+    L7.ffn: 4096 -> 1 units (-4095 dead)
+    L8.ffn: 2055 units (no dead units)
+    L8.post_ops[0].pipeline.1.add_layer.ffn: 6 units (no dead units)
+    L8.post_ops[0].pipeline.1.sub_layer.ffn: 7 units (no dead units)
+    L8.post_ops[0].pipeline.2.add_layer.flat_ffn: 60 units (no dead units)
+    L8.post_ops[0].pipeline.2.sub_layer.flat_ffn: 60 units (no dead units)
+    L8.post_ops[0].pipeline.3.add_layer.ffn: 10 units (no dead units)
+    L8.post_ops[0].pipeline.3.sub_layer.ffn: 10 units (no dead units)
+    L8.post_ops[0].pipeline.4.ge_to_bd.ffn: 64 units (no dead units)
+    L9.ffn: 3405 units (no dead units)
+    L10.ffn.ge_to_bd.ffn: 64 units (no dead units)
+    L10.ffn.and_layers.0.ffn: 104 units (no dead units)
+    L10.ffn.and_layers.1.ffn: 24 units (no dead units)
+    L10.ffn.or_layers.0.ffn: 104 units (no dead units)
+    L10.ffn.or_layers.1.ffn: 32 units (no dead units)
+    L10.ffn.xor_layers.0.ffn: 104 units (no dead units)
+    L10.ffn.xor_layers.1.ffn: 32 units (no dead units)
+    L10.post_ops[0]: 4 units (no dead units)
+    L10.post_ops[1]: 1536 -> 1028 units (-508 dead)
+    L10.post_ops[2]: 512 units (no dead units)
+    L10.post_ops[3]: 512 units (no dead units)
+    L10.post_ops[4]: 512 units (no dead units)
+    L10.post_ops[5]: 1536 units (no dead units)
+    L10.post_ops[6]: 18 units (no dead units)
+    L10.post_ops[7].stages.div.div_layers.0.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.div.div_layers.2.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.mod.mod_layers.0.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.mod.mod_layers.2.flat_ffn: 32 units (no dead units)
+    L10.post_ops[7].stages.getobd.ge_to_bd.ffn: 64 units (no dead units)
+    L11.ffn._stages.1.sub_ffn.flat_ffn: 88 units (no dead units)
+    L11.ffn._stages.2.sub_ffn.flat_ffn: 1808 -> 1792 units (-16 dead)
+    L11.ffn._stages.3.sub_ffn.flat_ffn: 142 units (no dead units)
+    L11.ffn._stages.4.sub_ffn.flat_ffn: 46 units (no dead units)
+    L11.ffn._stages.5.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.ffn._stages.6.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.ffn._stages.7.sub_ffn.flat_ffn: 44 units (no dead units)
+    L11.ffn._stages.9.ge_to_bd.ffn: 64 units (no dead units)
+    L11.ffn.pipeline.1.sub_ffn.flat_ffn: 88 units (no dead units)
+    L11.ffn.pipeline.2.sub_ffn.flat_ffn: 1792 units (no dead units)
+    L11.ffn.pipeline.3.sub_ffn.flat_ffn: 142 units (no dead units)
+    L11.ffn.pipeline.4.sub_ffn.flat_ffn: 46 units (no dead units)
+    L11.ffn.pipeline.5.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.ffn.pipeline.6.sub_ffn.flat_ffn: 60 units (no dead units)
+    L11.ffn.pipeline.7.sub_ffn.flat_ffn: 44 units (no dead units)
+    L11.ffn.pipeline.9.ge_to_bd.ffn: 64 units (no dead units)
+    L12.ffn: 4096 -> 1 units (-4095 dead)
+    L13.ffn.precompute_stage.shl_precompute.ffn: 28 units (no dead units)
+    L13.ffn.precompute_stage.shr_precompute.ffn: 28 units (no dead units)
+    L13.ffn.select_stage.shl_select.flat_ffn: 528 units (no dead units)
+    L13.ffn.select_stage.shr_select.flat_ffn: 528 units (no dead units)
+    L13.ffn.getobd_stage.ge_to_bd.ffn: 64 units (no dead units)
+    L14.ffn: 1312 units (no dead units)
+    L15.ffn: 42 units (no dead units)
+    L16.ffn: 189 units (no dead units)
+    L17.ffn: 4096 -> 1558 units (-2538 dead)
+    L17.post_ops[0]: 802 units (no dead units)
+  TOTAL FFN units: 42432 -> 22452 (52.9% retained)
+  PHASE 0 EXPANSIONS: 10 post_ops (7 re-baked into vanilla PureFFN)
+  Total blocks: 17 -> 28
+[1096-diag] id=0000 status=neural-divergence desc='add_0: 654 + 114' expected=768 decl=768 decl_steps=5 neural=None
+[1096-diag] id=0001 status=neural-divergence desc='add_1: 25 + 759' expected=784 decl=784 decl_steps=5 neural=16
+[1096-diag] id=0002 status=neural-divergence desc='add_2: 281 + 250' expected=531 decl=531 decl_steps=5 neural=None
+[1096-diag] id=0003 status=neural-divergence desc='add_3: 228 + 142' expected=370 decl=370 decl_steps=5 neural=114
+[1096-diag] id=0004 status=neural-divergence desc='add_4: 754 + 104' expected=858 decl=858 decl_steps=5 neural=None
+[1096-diag] id=0005 status=neural-divergence desc='add_5: 692 + 758' expected=1450 decl=1450 decl_steps=5 neural=682
+[1096-diag] id=0006 status=neural-divergence desc='add_6: 913 + 558' expected=1471 decl=1471 decl_steps=5 neural=None
+[1096-diag] id=0008 status=neural-divergence desc='add_8: 432 + 32' expected=464 decl=464 decl_steps=5 neural=None
+[1096-diag] id=0010 status=neural-divergence desc='add_10: 223 + 238' expected=461 decl=461 decl_steps=5 neural=205
+[1096-diag] id=0011 status=neural-divergence desc='add_11: 517 + 616' expected=1133 decl=1133 decl_steps=5 neural=None
+[1096-diag] id=0013 status=neural-divergence desc='add_13: 203 + 733' expected=936 decl=936 decl_steps=5 neural=168
+[1096-diag] id=0014 status=neural-divergence desc='add_14: 665 + 718' expected=1383 decl=1383 decl_steps=5 neural=615
+[1096-diag] id=0015 status=neural-divergence desc='add_15: 558 + 429' expected=987 decl=987 decl_steps=5 neural=None
+[1096-diag] id=0016 status=neural-divergence desc='add_16: 225 + 459' expected=684 decl=684 decl_steps=5 neural=172
+[1096-diag] id=0017 status=neural-divergence desc='add_17: 603 + 284' expected=887 decl=887 decl_steps=5 neural=None
+[1096-diag] id=0018 status=neural-divergence desc='add_18: 828 + 890' expected=1718 decl=1718 decl_steps=5 neural=None
+[1096-diag] id=0020 status=neural-divergence desc='add_20: 825 + 163' expected=988 decl=988 decl_steps=5 neural=None
+[1096-diag] id=0021 status=neural-divergence desc='add_21: 714 + 432' expected=1146 decl=1146 decl_steps=5 neural=634
+[1096-diag] id=0022 status=neural-divergence desc='add_22: 348 + 284' expected=632 decl=632 decl_steps=5 neural=None
+[1096-diag] id=0023 status=neural-divergence desc='add_23: 159 + 220' expected=379 decl=379 decl_steps=5 neural=123
+[1096-diag] id=0024 status=neural-divergence desc='add_24: 980 + 781' expected=1761 decl=1761 decl_steps=5 neural=None
+[1096-diag] id=0025 status=neural-divergence desc='add_25: 344 + 104' expected=448 decl=448 decl_steps=5 neural=None
+[1096-diag] id=0028 status=neural-divergence desc='add_28: 867 + 352' expected=1219 decl=1219 decl_steps=5 neural=None
+[1096-diag] id=0029 status=neural-divergence desc='add_29: 618 + 270' expected=888 decl=888 decl_steps=5 neural=None
+[1096-diag] id=0030 status=neural-divergence desc='add_30: 826 + 44' expected=870 decl=870 decl_steps=5 neural=None
+[1096-diag] id=0031 status=neural-divergence desc='add_31: 747 + 470' expected=1217 decl=1217 decl_steps=5 neural=705
+.
+
+======================== 1 passed in 103.12s (0:01:43) =========================

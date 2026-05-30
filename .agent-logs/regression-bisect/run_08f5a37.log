@@ -1,0 +1,46 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-a982a8cea042804d0/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 1 item
+
+c4_release/tests/test_1096_neural_declarative_diagnostic.py [1096-diag] id=0000 status=neural-divergence suite_decl=match desc='add_0: 654 + 114' expected=768 decl=768 decl_steps=5 neural=None first_token_divergence=step0:PC_byte0 abs=45 gen=1 expected=0x0a neural=0x72 residual_diagnosis=first-loss-after-symbolic-support block=6 layer=6 label='block6 layer=6 width=1821' expected=0x0a argmax=0x72 expected_logit=+7.69 argmax_logit=+144.20 margin=-136.51 neural_logit=+144.20 OUT_LO[10]=+1.72 arg=2/+14.92 OUT_HI[0]=+0.82 arg=7/+14.92
+[1096-diag] id=0001 status=neural-divergence suite_decl=match desc='add_1: 25 + 759' expected=784 decl=784 decl_steps=5 neural=None first_token_divergence=step0:PC_byte0 abs=45 gen=1 expected=0x0a neural=0xca residual_diagnosis=first-loss-after-symbolic-support block=6 layer=6 label='block6 layer=6 width=1821' expected=0x0a argmax=0xca expected_logit=+82.31 argmax_logit=+41586.05 margin=-41503.74 neural_logit=+41586.05 OUT_LO[10]=+16.65 arg=10/+16.65 OUT_HI[0]=+0.82 arg=12/+8301.56
+[1096-diag] id=0002 status=neural-divergence suite_decl=match desc='add_2: 281 + 250' expected=531 decl=531 decl_steps=5 neural=None first_token_divergence=step0:PC_byte0 abs=45 gen=1 expected=0x0a neural=0xca residual_diagnosis=first-loss-after-symbolic-support block=6 layer=6 label='block6 layer=6 width=1821' expected=0x0a argmax=0xca expected_logit=+82.31 argmax_logit=+41586.05 margin=-41503.74 neural_logit=+41586.05 OUT_LO[10]=+16.65 arg=10/+16.65 OUT_HI[0]=+0.82 arg=12/+8301.56
+[1096-diag] id=0003 status=neural-divergence suite_decl=match desc='add_3: 228 + 142' expected=370 decl=370 decl_steps=5 neural=228 first_token_divergence=step0:PC_byte0 abs=45 gen=1 expected=0x0a neural=0x22 residual_diagnosis=first-loss-after-symbolic-support block=6 layer=6 label='block6 layer=6 width=1821' expected=0x0a argmax=0x22 expected_logit=+7.69 argmax_logit=+144.20 margin=-136.51 neural_logit=+144.20 OUT_LO[10]=+1.72 arg=2/+14.92 OUT_HI[0]=+0.82 arg=2/+14.92
+[1096-diag] id=0004 status=neural-divergence suite_decl=match desc='add_4: 754 + 104' expected=858 decl=858 decl_steps=5 neural=None first_token_divergence=step0:PC_byte0 abs=45 gen=1 expected=0x0a neural=0x92 residual_diagnosis=first-loss-after-symbolic-support block=6 layer=6 label='block6 layer=6 width=1821' expected=0x0a argmax=0x92 expected_logit=+7.69 argmax_logit=+42823.33 margin=-42815.64 neural_logit=+42823.33 OUT_LO[10]=+1.72 arg=2/+14.92 OUT_HI[0]=+0.82 arg=9/+8550.74
+[1096-diag] id=0005 status=neural-divergence suite_decl=match desc='add_5: 692 + 758' expected=1450 decl=1450 decl_steps=5 neural=None first_token_divergence=step0:PC_byte0 abs=45 gen=1 expected=0x0a neural=0xa2 residual_diagnosis=first-loss-after-symbolic-support block=6 layer=6 label='block6 layer=6 width=1821' expected=0x0a argmax=0xa2 expected_logit=+7.69 argmax_logit=+41577.43 margin=-41569.73 neural_logit=+41577.43 OUT_LO[10]=+1.72 arg=2/+14.92 OUT_HI[0]=+0.82 arg=10/+8301.56
+[1096-diag] id=0006 status=neural-divergence suite_decl=match desc='add_6: 913 + 558' expected=1471 decl=1471 decl_steps=5 neural=None first_token_divergence=step0:PC_byte0 abs=45 gen=1 expected=0x0a neural=0x8a residual_diagnosis=first-loss-after-symbolic-support block=6 layer=6 label='block6 layer=6 width=1821' expected=0x0a argmax=0x8a expected_logit=-41481.71 argmax_logit=+41716.88 margin=-83198.59 neural_logit=+41716.88 OUT_LO[10]=+16.65 arg=10/+16.65 OUT_HI[0]=-8311.99 arg=8/+8327.73
+[1096-diag] id=0007 status=neural-divergence suite_decl=match desc='add_7: 89 + 604' expected=693 decl=693 decl_steps=5 neural=None first_token_divergence=step0:PC_byte0 abs=45 gen=1 expected=0x0a neural=0xca residual_diagnosis=first-loss-after-symbolic-support block=6 layer=6 label='block6 layer=6 width=1821' expected=0x0a argmax=0xca expected_logit=+82.31 argmax_logit=+41586.05 margin=-41503.74 neural_logit=+41586.05 OUT_LO[10]=+16.65 arg=10/+16.65 OUT_HI[0]=+0.82 arg=12/+8301.56
+[1096-diag] id=0008 status=neural-divergence suite_decl=match desc='add_8: 432 + 32' expected=464 decl=464 decl_steps=5 neural=None
+[1096-diag] id=0009 status=neural-divergence suite_decl=match desc='add_9: 30 + 95' expected=125 decl=125 decl_steps=5 neural=None
+[1096-diag] id=0010 status=neural-divergence suite_decl=match desc='add_10: 223 + 238' expected=461 decl=461 decl_steps=5 neural=None
+[1096-diag] id=0011 status=neural-divergence suite_decl=match desc='add_11: 517 + 616' expected=1133 decl=1133 decl_steps=5 neural=None
+[1096-diag] id=0012 status=neural-divergence suite_decl=match desc='add_12: 27 + 574' expected=601 decl=601 decl_steps=5 neural=None
+[1096-diag] id=0013 status=neural-divergence suite_decl=match desc='add_13: 203 + 733' expected=936 decl=936 decl_steps=5 neural=None
+[1096-diag] id=0014 status=neural-divergence suite_decl=match desc='add_14: 665 + 718' expected=1383 decl=1383 decl_steps=5 neural=None
+[1096-diag] id=0015 status=neural-divergence suite_decl=match desc='add_15: 558 + 429' expected=987 decl=987 decl_steps=5 neural=None
+[1096-diag] id=0016 status=neural-divergence suite_decl=match desc='add_16: 225 + 459' expected=684 decl=684 decl_steps=5 neural=None
+[1096-diag] id=0017 status=neural-divergence suite_decl=match desc='add_17: 603 + 284' expected=887 decl=887 decl_steps=5 neural=None
+[1096-diag] id=0018 status=neural-divergence suite_decl=match desc='add_18: 828 + 890' expected=1718 decl=1718 decl_steps=5 neural=None
+[1096-diag] id=0019 status=neural-divergence suite_decl=match desc='add_19: 6 + 777' expected=783 decl=783 decl_steps=5 neural=None
+[1096-diag] id=0020 status=neural-divergence suite_decl=match desc='add_20: 825 + 163' expected=988 decl=988 decl_steps=5 neural=None
+[1096-diag] id=0021 status=neural-divergence suite_decl=match desc='add_21: 714 + 432' expected=1146 decl=1146 decl_steps=5 neural=None
+[1096-diag] id=0022 status=neural-divergence suite_decl=match desc='add_22: 348 + 284' expected=632 decl=632 decl_steps=5 neural=None
+[1096-diag] id=0023 status=neural-divergence suite_decl=match desc='add_23: 159 + 220' expected=379 decl=379 decl_steps=5 neural=None
+[1096-diag] id=0024 status=neural-divergence suite_decl=match desc='add_24: 980 + 781' expected=1761 decl=1761 decl_steps=5 neural=None
+[1096-diag] id=0025 status=neural-divergence suite_decl=match desc='add_25: 344 + 104' expected=448 decl=448 decl_steps=5 neural=None
+[1096-diag] id=0026 status=neural-divergence suite_decl=match desc='add_26: 94 + 389' expected=483 decl=483 decl_steps=5 neural=None
+[1096-diag] id=0027 status=neural-divergence suite_decl=match desc='add_27: 99 + 367' expected=466 decl=466 decl_steps=5 neural=None
+[1096-diag] id=0028 status=neural-divergence suite_decl=match desc='add_28: 867 + 352' expected=1219 decl=1219 decl_steps=5 neural=None
+[1096-diag] id=0029 status=neural-divergence suite_decl=match desc='add_29: 618 + 270' expected=888 decl=888 decl_steps=5 neural=None
+[1096-diag] id=0030 status=neural-divergence suite_decl=match desc='add_30: 826 + 44' expected=870 decl=870 decl_steps=5 neural=None
+[1096-diag] id=0031 status=neural-divergence suite_decl=match desc='add_31: 747 + 470' expected=1217 decl=1217 decl_steps=5 neural=None
+.
+
+======================== 1 passed in 238.34s (0:03:58) =========================
