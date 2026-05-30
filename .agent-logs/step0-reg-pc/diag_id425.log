@@ -1,0 +1,18 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-aae7e07c86f30a384/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 1 item
+
+c4_release/tests/test_1096_neural_declarative_diagnostic.py [1096-progress] mode=final-output phase=start rows=0/1 batch=1 ids=0425-0425 max_steps=14
+[1096-progress] mode=final-output phase=done rows=1/1 batch=1 ids=0425-0425 max_steps=14
+[1096-diag] id=0425 mode=final-output status=neural-divergence suite_decl=match desc='if_var_0: x=96, x>59' expected=1 decl=1 decl_steps=14 neural=None first_token_divergence=step1:MEM_addr0 abs=209 gen=61 expected=0xf0 neural=0xe0 residual_diagnosis=first-loss-after-symbolic-support block=27 layer=27 label='block27 layer=27 width=2091' expected=0xf0 argmax=0xe0 expected_logit=+439857264459776.00 argmax_logit=+10535720133328896.00 margin=-10095862868869120.00 neural_logit=+10535720133328896.00 OUT_LO[0]=+1097552451600384.00 arg=0/+1097552451600384.00 OUT_HI[15]=-1009581052395520.00 arg=14/+1009591521378304.00 band_contracts=DRIFT expected_byte=0xf0 OUTPUT_LO[expected_low]:expected=0 winner=0 margin=+2.2e+15 OUTPUT_HI[expected_high]:expected=15 winner=14 margin=+2.02e+15 violations=OUTPUT_HI[15]/active_margin_low:obs=-2.02e+15:limit=0.5;OUTPUT_HI[14]/inactive_too_high:obs=1.01e+15:limit=0.2 projection_diag=OUTPUT_LO[expected_low]:projected winner=0;OUTPUT_HI[expected_high]:unexpected_winner winner=14
+[1096-summary] mode=final-output selected=1 ok=0 divergences=1 errors=0 suite_mismatches=0
+.
+
+======================== 1 passed in 107.21s (0:01:47) =========================

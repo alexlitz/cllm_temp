@@ -1,0 +1,16 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-aae7e07c86f30a384/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 1 item
+
+c4_release/tests/test_1096_teacher_forced_lowering_audit.py [1096-lowering] id=0425 status=fatal-lowering-divergence desc='if_var_0: x=96, x>59' trace_len=603 checked=385 failures=2 fatal=1 info=1 wrong_token=2 band_only=0 band_margin_only=0 first_fatal=severity=fatal category=register-result step9:STACK0_byte0 abs=484 expected=0x60 argmax=0x00 margin=-1.00 output_byte=0x00 kind=wrong_argmax,wrong_output_byte,low_head_margin reason=completed register row feeds runner architectural state first_info=severity=info category=support-drift step5:MEM_addr0 abs=349 expected=0xe8 argmax=0x00 margin=-259959128064.00 output_byte=0x00 kind=wrong_argmax,wrong_output_byte,low_head_margin reason=teacher-forced support miss outside the fatal register gate detail=teacher_forced_lowering_probe='id=0425:9:STACK0_byte0' token_index=484 expected=0x60 supported=False final=block=27 layer=27 label='block27 layer=27 width=2091' expected=0x60 argmax=0x00 expected_logit=-5.00 argmax_logit=-4.00 margin=-1.00 output_byte=0x00 lo_arg=0 hi_arg=0 OUT_LO[0]=+0.00 arg=0/+0.00 OUT_HI[6]=+0.00 arg=0/+0.00 band_contracts=DRIFT expected_byte=0x60 OUTPUT_LO[expected_low]:expected=0 winner=0 margin=+3.04e-05 OUTPUT_HI[expected_high]:expected=6 winner=0 margin=+2e-05 violations=OUTPUT_LO[0]/active_margin_low:obs=3.04e-05:limit=0.5;OUTPUT_HI[6]/active_margin_low:obs=-3.28e-05:limit=0.5 projection_diag=OUTPUT_LO[expected_low]:ambiguous_winner winner=0;OUTPUT_HI[expected_high]:ambiguous_winner winner=0
+[1096-lowering-summary] selected=1 clean=0 fatal_rows=1 info_only_rows=0 fatal_failures=1 info_failures=1 errors=0 skipped=0 wrong_token_failures=2 band_only_failures=0 band_margin_failures=0 assert_mode=off print_mode=drift min_margin=0.5 output_band_min_margin=0.5 output_band_max_inactive=1e+30 context_window=512 chunk_tokens=512
+.
+
+============================== 1 passed in 15.86s ==============================
