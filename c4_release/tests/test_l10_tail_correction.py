@@ -1971,22 +1971,28 @@ def test_tail_mem_store_addr0_f0_exact_blocks_jsr_initial_store():
 
 
 def test_tail_mem_store_addr0_00_from_global_exacts_nibbles():
+    # B5-D / B4-H Path 2: this rule was refactored to read L13 ADDR_B0 lanes
+    # directly instead of OUTPUT_LO+0 / OUTPUT_HI+0 (a proxy that caused the
+    # B2-A step5 false-fire). Strength bounded at 10k because L13 evidence is
+    # decisive. Input is now ADDR_B0_LO+0 / ADDR_B0_HI+0 one-hot.
     ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_00_from_global_exact"))
 
     out = ir.symbolic_ffn({
         "MARK_MEM": 1.0,
         "HAS_SE": 0.998,
-        "H1+4": 1.0,
+        "H1+4": 4.0,
         "MEM_STORE": 4.0,
         "MEM_ADDR_SRC": 4.0,
-        "OUTPUT_LO+0": 13.9,
-        "OUTPUT_HI+0": 16.9,
+        "ADDR_B0_LO+0": 1.0,
+        "ADDR_B0_HI+0": 1.0,
     })
 
-    assert out["OUTPUT_LO+0"] > 1_000_000.0
-    assert out["OUTPUT_HI+0"] > 1_000_000.0
-    assert out["OUTPUT_LO+8"] < -1_000_000.0
-    assert out["OUTPUT_HI+15"] < -1_000_000.0
+    # Bounded strength: 10k means the per-lane delta caps at the rule's
+    # active write. Verify the rule emits the expected 0x00 nibbles.
+    assert out["OUTPUT_LO+0"] > 1_000.0
+    assert out["OUTPUT_HI+0"] > 1_000.0
+    assert out["OUTPUT_LO+8"] < -1_000.0
+    assert out["OUTPUT_HI+15"] < -1_000.0
 
 
 def test_tail_mem_store_addr0_00_from_global_blocks_initial_jsr_store():
@@ -2538,7 +2544,11 @@ def test_tail_mem_store_addr0_e0_from_jsr_local_blocks_initial_f8():
 
 
 def test_tail_mem_store_addr0_e0_from_jsr_local_strong_overrides_residue():
-    ir = _tail_prefix_ir("tail_mem_store_addr0_e0_from_jsr_local_strong")
+    # B5-D / B4-H Path 2: the ``_jsr_local_strong`` sibling was byte-identical
+    # to ``_jsr_local_exact`` (a pure strength-escalation duplicate) and was
+    # deleted.  This test now exercises the surviving ``_exact`` rule with the
+    # same activation conditions to keep the JSR-local 0xE0 coverage in place.
+    ir = _tail_prefix_ir("tail_mem_store_addr0_e0_from_jsr_local_exact")
 
     out = ir.symbolic_ffn({
         "MARK_MEM": 1.0,
