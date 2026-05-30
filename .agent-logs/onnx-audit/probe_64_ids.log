@@ -1,0 +1,21 @@
+[probe] Loaded 1096 tests; sampling 64 representative IDs
+[probe] First 5 ids: [0, 17, 35, 52, 70], last 5 ids: [1025, 1043, 1060, 1078, 1095]
+[probe] Building BakedC4Transformer for PyTorch reference...
+[probe] Built in 58.5s
+  [8/64] elapsed=0.0s fails=0 errs=0
+  [16/64] elapsed=0.0s fails=1 errs=0
+  [24/64] elapsed=0.2s fails=6 errs=0
+  [32/64] elapsed=0.3s fails=12 errs=0
+  [40/64] elapsed=0.4s fails=20 errs=0
+  [48/64] elapsed=0.4s fails=26 errs=0
+  [56/64] elapsed=0.4s fails=27 errs=0
+  [64/64] elapsed=0.5s fails=30 errs=0
+
+[probe] === SUMMARY ===
+  ids sampled : 64
+  pytorch pass: 34
+  pytorch fail: 30
+  pytorch errs: 0
+  onnx compares: 0 (export blocked)
+  elapsed: 0.5s
+  JSON: /home/alexlitz/Documents/misc/c4_release/.agent-logs/onnx-audit/probe_64_ids.json
