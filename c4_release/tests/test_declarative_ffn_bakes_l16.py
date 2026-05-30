@@ -40,8 +40,8 @@ def test_layer16_lev_routing_ir_matches_legacy_helper():
     legacy_end = _set_layer16_lev_routing(expected, 100.0, _SetDim)
 
     assert legacy_end == 121
-    assert end == 695
-    assert len(_layer16_lev_routing_rules(100.0)) == 695
+    assert end == 728
+    assert len(_layer16_lev_routing_rules(100.0)) == 728
     _assert_same_ffn_prefix(actual, expected, legacy_end)
     assert actual.W_down[:, legacy_end:end].abs().sum() > 0
 
