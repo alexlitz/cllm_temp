@@ -3899,6 +3899,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_ADDR_SRC", -1000000.0),
                 ("PSH_AT_SP", 1.0),
                 ("OP_JSR", -1000000.0),
+                # ENT-main relays OP_ENT to MEM marker with attenuated
+                # activation (~1e-3) via L7/L14 broadcast; weight must
+                # outweigh ~+50 positive dot to suppress 0xE0 emission
+                # over ENT's own 0xF0 push-BP target.
+                ("OP_ENT", -10_000_000_000.0),
+                ("OP_LEV", -1_000_000.0),
+                ("OP_IMM", -1_000_000.0),
                 ("CMP+0", 10.0),
                 ("ALU_LO+8", 5.0),
                 ("ALU_LO+7", -10.0),

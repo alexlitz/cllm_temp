@@ -520,6 +520,12 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("ALU_LO+7", -10.0),
             ("ALU_LO+10", -10.0),
             ("ALU_LO+14", -10.0),
+            # Shared psh_mem_addr0_conditions only blocks OP_ENT at -1000;
+            # ENT-main relay activations can still cross threshold here,
+            # so add an order-of-magnitude stronger discriminator.
+            ("OP_ENT", -1_000_000.0),
+            ("OP_LEV", -1_000_000.0),
+            ("OP_IMM", -1_000_000.0),
         ),
         threshold=8.5,
         writes=Primitives.byte_value_writes(0xE0, strength=200_000.0),
