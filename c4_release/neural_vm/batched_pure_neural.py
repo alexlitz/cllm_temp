@@ -49,6 +49,7 @@ from .embedding import Opcode
 from .constants import INSTR_WIDTH, PC_OFFSET
 from .run_vm import (
     AutoregressiveVMRunner,
+    _MEM_ADDR_SRC_OPS,
     _MEM_STORE_OPS,
 )
 from .speculative import DraftVM
@@ -178,6 +179,9 @@ class _ElementState:
     mem_access_order: list = field(default_factory=list)
     mem_history_end: int = 0  # boundary in current context for MEM_STORE injection
     mem_store_positions: list = field(default_factory=list)
+    # SI/SC-only subset of ``mem_store_positions``; absent positions correspond
+    # to PSH/JSR/ENT current-step markers whose MEM_ADDR_SRC must remain 0.
+    mem_addr_src_positions: list = field(default_factory=list)
 
     stdin_buffer: list = field(default_factory=list)
     stdin_pos: int = 0
@@ -1164,6 +1168,10 @@ class BatchedPureNeuralRunner:
                 self.model.embed.set_mem_store_positions(
                     [states[i].mem_store_positions for i in active_idx]
                 )
+            if hasattr(self.model.embed, "set_mem_addr_src_positions"):
+                self.model.embed.set_mem_addr_src_positions(
+                    [states[i].mem_addr_src_positions for i in active_idx]
+                )
 
             preds_cpu, pred_start, real_lens = self._forward_argmax_batch(
                 windowed,
@@ -1304,6 +1312,10 @@ class BatchedPureNeuralRunner:
             if hasattr(self.model.embed, "set_mem_store_positions"):
                 self.model.embed.set_mem_store_positions(
                     [states[i].mem_store_positions for i in active_idx]
+                )
+            if hasattr(self.model.embed, "set_mem_addr_src_positions"):
+                self.model.embed.set_mem_addr_src_positions(
+                    [states[i].mem_addr_src_positions for i in active_idx]
                 )
 
             # Pre-compute argmax for the verifier tensor once (GPU op) and
@@ -1504,9 +1516,8 @@ class BatchedPureNeuralRunner:
 
     def _current_step_store_mem_marker(
         self, s: _ElementState, context: List[int]
-    ) -> Optional[int]:
-        """Return the position of the current step's MEM marker if it has
-        already been emitted and the current step's instruction is a store op.
+    ) -> Tuple[Optional[int], bool]:
+        """Return the current step's MEM marker and whether it is an SI/SC op.
 
         L15 / L16 lookup rules require ``MEM_STORE=1`` at the MEM marker BEFORE
         the model predicts MEM_addr0. Historical store MEM markers get this
@@ -1517,9 +1528,11 @@ class BatchedPureNeuralRunner:
         push-BP target ``0xfff0`` collapsing to ``0xffe0`` because the L14
         attention sources the post-locals SP instead of the post-push SP).
 
-        Returns the absolute position of the MEM marker in ``context``, or
-        ``None`` if the current step's marker is not present, the current
-        instruction is not a store, or the step has already ended.
+        Returns ``(position, is_si_sc)``. The flag is ``True`` only for SI/SC
+        markers (whose address is sourced from STACK0 — MEM_ADDR_SRC=1); it is
+        ``False`` for PSH/JSR/ENT markers, whose MEM_ADDR_SRC must remain 0.
+        Returns ``(None, False)`` when the current step has no in-progress
+        store marker.
         """
         # Scan backward over at most one VM step.
         scan_back = Token.STEP_TOKENS + 2
@@ -1530,16 +1543,16 @@ class BatchedPureNeuralRunner:
             if t == Token.STEP_END or t == Token.HALT or t == Token.TOOL_CALL:
                 # The step ended after this marker, so any prior MEM belongs
                 # to a previous step already tracked via mem_history.
-                return None
+                return None, False
             if t == Token.MEM:
                 exec_pc = s.exec_pc()
                 exec_idx = exec_pc // INSTR_WIDTH
                 if 0 <= exec_idx < len(s.bytecode):
                     op = s.bytecode[exec_idx] & 0xFF
                     if op in _MEM_STORE_OPS:
-                        return i
-                return None
-        return None
+                        return i, op in _MEM_ADDR_SRC_OPS
+                return None, False
+        return None, False
 
     def _add_current_step_marker(
         self,
@@ -1568,11 +1581,37 @@ class BatchedPureNeuralRunner:
             return positions
         return sorted(set(positions) | {windowed_pos})
 
+    def _addr_src_positions(
+        self,
+        store_positions: List[int],
+        current_marker_abs: Optional[int],
+        current_marker_is_si_sc: bool,
+        windowed: List[int],
+        *,
+        absolute_to_windowed: int = 0,
+    ) -> List[int]:
+        """Return the SI/SC subset of ``store_positions``.
+
+        All historical store positions stay in the list (their MEM_ADDR_SRC=1
+        flag is load-bearing for L7 broadcasts feeding LI/LC lookups), but the
+        current-step marker is excluded when its op is PSH/JSR/ENT.
+        """
+        if current_marker_abs is None:
+            return list(store_positions)
+        windowed_pos = current_marker_abs + absolute_to_windowed
+        if not (0 <= windowed_pos < len(windowed)):
+            return list(store_positions)
+        if current_marker_is_si_sc:
+            return list(store_positions)
+        return [p for p in store_positions if p != windowed_pos]
+
     def _windowed_context(
         self, s: _ElementState, max_context_window: int
     ) -> List[int]:
         dynamic_full = s.context[s.prefix_len:]
-        current_marker_abs = self._current_step_store_mem_marker(s, s.context)
+        current_marker_abs, current_marker_is_si_sc = (
+            self._current_step_store_mem_marker(s, s.context)
+        )
         if len(dynamic_full) <= max_context_window:
             # The current context still contains every emitted MEM section.
             # Keep the byte stream identical to the model's actual
@@ -1584,6 +1623,12 @@ class BatchedPureNeuralRunner:
             )
             s.mem_store_positions = self._add_current_step_marker(
                 positions, current_marker_abs, s.context
+            )
+            s.mem_addr_src_positions = self._addr_src_positions(
+                s.mem_store_positions,
+                current_marker_abs,
+                current_marker_is_si_sc,
+                s.context,
             )
             return s.context[:]
 
@@ -1613,11 +1658,19 @@ class BatchedPureNeuralRunner:
         # stays in place, mem-history tokens come right after, and the
         # surviving dynamic tail follows them.
         dynamic_dropped = len(dynamic_full) - len(dynamic)
+        abs_to_windowed = len(mem_tokens) - dynamic_dropped
         s.mem_store_positions = self._add_current_step_marker(
             positions,
             current_marker_abs,
             windowed,
-            absolute_to_windowed=len(mem_tokens) - dynamic_dropped,
+            absolute_to_windowed=abs_to_windowed,
+        )
+        s.mem_addr_src_positions = self._addr_src_positions(
+            s.mem_store_positions,
+            current_marker_abs,
+            current_marker_is_si_sc,
+            windowed,
+            absolute_to_windowed=abs_to_windowed,
         )
         return windowed
 

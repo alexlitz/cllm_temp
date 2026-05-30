@@ -53,6 +53,11 @@ class NeuralVMEmbedding(nn.Module):
         # (set by KV cache eviction logic)
         self._mem_history_end = 0
         self._mem_store_positions = None
+        # Optional SI/SC-only subset of ``_mem_store_positions``. When set the
+        # embedding restricts MEM_ADDR_SRC=1 injection to these positions; when
+        # None the embedding falls back to the legacy behaviour of injecting
+        # MEM_ADDR_SRC=1 at every tracked store row.
+        self._mem_addr_src_positions = None
 
         # V20 (NeuralVMEmbedding prefix-embedding-delta cache) was retired
         # 2026-05-12. Its role is now subsumed by the unified per-layer KV
@@ -406,13 +411,31 @@ class NeuralVMEmbedding(nn.Module):
         mem_addr_src = self._dim("MEM_ADDR_SRC")
         B, S = token_ids.shape
 
+        # MEM_ADDR_SRC=1 is only correct for SI/SC (address sourced from
+        # STACK0); PSH/JSR/ENT must keep MEM_ADDR_SRC=0 (address sourced
+        # from SP). When callers supply ``_mem_addr_src_positions`` they
+        # constrain injection to that SI/SC subset; otherwise the legacy
+        # behaviour of flagging every tracked store row is preserved.
         positions = self._mem_store_positions
+        addr_src_positions = self._mem_addr_src_positions
         if positions is not None:
             for b in range(B):
                 row_positions = positions[b] if b < len(positions) else ()
+                if (
+                    addr_src_positions is not None
+                    and b < len(addr_src_positions)
+                ):
+                    addr_src_row = frozenset(addr_src_positions[b])
+                else:
+                    addr_src_row = None
                 for pos in row_positions:
-                    if start_pos <= pos < S and token_ids[b, pos].item() == Token.MEM:
-                        x[b, pos, mem_store] = 1.0
+                    if not (
+                        start_pos <= pos < S
+                        and token_ids[b, pos].item() == Token.MEM
+                    ):
+                        continue
+                    x[b, pos, mem_store] = 1.0
+                    if addr_src_row is None or pos in addr_src_row:
                         x[b, pos, mem_addr_src] = 1.0
 
         end = self._mem_history_end
@@ -438,3 +461,15 @@ class NeuralVMEmbedding(nn.Module):
     def set_mem_store_positions(self, positions):
         """Set exact MEM marker positions that represent tracked store rows."""
         self._mem_store_positions = positions
+
+    def set_mem_addr_src_positions(self, positions):
+        """Optionally constrain MEM_ADDR_SRC=1 injection to SI/SC subset.
+
+        When ``None`` the embedding injects MEM_ADDR_SRC=1 at every tracked
+        store row (legacy behaviour for retained SI/SC history). When set to
+        a per-batch list of position tuples, only those positions receive the
+        flag — callers use this to exclude the current step's PSH/JSR/ENT MEM
+        marker, which is intentionally tracked for ``MEM_STORE=1`` but where
+        MEM_ADDR_SRC must remain 0 (address sourced from SP, not STACK0).
+        """
+        self._mem_addr_src_positions = positions
