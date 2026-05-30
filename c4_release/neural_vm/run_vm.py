@@ -99,6 +99,10 @@ _RUNNER_TRACKED_MEMORY_OPS = {Opcode.ENT, Opcode.JSR}
 # Store ops whose MEM sections are retained in context for L15 memory lookup.
 _MEM_STORE_OPS = {Opcode.SI, Opcode.SC, Opcode.PSH, Opcode.ENT, Opcode.JSR}
 
+# Store ops whose MEM marker carries MEM_ADDR_SRC=1 (address sourced from
+# STACK0). PSH/JSR/ENT keep MEM_ADDR_SRC=0 (address sourced from SP).
+_MEM_ADDR_SRC_OPS = {Opcode.SI, Opcode.SC}
+
 # Step-relative offsets where the speculative-mode logit disagrees with the
 # unspeculative-mode logit. Mirrors
 # :data:`neural_vm.batched_pure_neural._UNSAFE_OFFSETS`. The 4 MEM-addr bytes
