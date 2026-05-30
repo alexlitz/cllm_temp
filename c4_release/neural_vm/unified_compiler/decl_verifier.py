@@ -301,6 +301,10 @@ class TeacherForcedSymbolicTrace:
     exit_code: Optional[int]
     halted: bool
     mem_store_positions: Tuple[int, ...] = ()
+    # SI/SC subset of ``mem_store_positions``. Embedding uses this list to
+    # restrict MEM_ADDR_SRC=1 injection to STACK0-sourced stores; PSH/JSR/ENT
+    # markers are tracked for MEM_STORE=1 but must keep MEM_ADDR_SRC=0.
+    mem_addr_src_positions: Tuple[int, ...] = ()
     early_exit: bool = False
 
     def token_index(self, step: int, slot_name: str) -> int:
@@ -574,7 +578,14 @@ def build_teacher_forced_symbolic_trace(
         int(Opcode.ENT),
         int(Opcode.JSR),
     }
+    # SI/SC carry MEM_ADDR_SRC=1 (address sourced from STACK0); PSH/JSR/ENT
+    # keep MEM_ADDR_SRC=0. We track them separately so the embedding can
+    # restrict its MEM_ADDR_SRC=1 injection to SI/SC markers only — otherwise
+    # the L15 SI MEM addr0-from-STACK0 head fires on PSH/JSR/ENT and routes
+    # the wrong source byte (see neural_embedding._inject_mem_store).
+    addr_src_opcodes = {int(Opcode.SI), int(Opcode.SC)}
     mem_store_positions: List[int] = []
+    mem_addr_src_positions: List[int] = []
 
     symbolic = SymbolicDeclarativeProgramRunner()
     state = symbolic.init_state(bytecode, data)
@@ -599,7 +610,10 @@ def build_teacher_forced_symbolic_trace(
             Token.HALT if state.halted else Token.STEP_END,
         ))
         if int(trace.opcode) in store_opcodes:
-            mem_store_positions.append(step_base + _slot_offset("MEM"))
+            mem_pos = step_base + _slot_offset("MEM")
+            mem_store_positions.append(mem_pos)
+            if int(trace.opcode) in addr_src_opcodes:
+                mem_addr_src_positions.append(mem_pos)
         if state.halted:
             break
         next_idx = int(state.pc) // INSTR_WIDTH
@@ -616,6 +630,7 @@ def build_teacher_forced_symbolic_trace(
         exit_code=state.ax if state.halted or early_exit else None,
         halted=state.halted or early_exit,
         mem_store_positions=tuple(mem_store_positions),
+        mem_addr_src_positions=tuple(mem_addr_src_positions),
         early_exit=early_exit,
     )
 
@@ -847,6 +862,30 @@ def _lowering_snapshot(
     )
 
 
+def _remap_positions_for_window(
+    raw_positions: Sequence[int],
+    *,
+    prefix_len: int,
+    dynamic_start: int,
+    dynamic_end: int,
+) -> Tuple[int, ...]:
+    """Map absolute positions to their image in a windowed prefix.
+
+    The window keeps ``context[:prefix_len]`` followed by
+    ``context[dynamic_start:dynamic_end]``; positions outside either span are
+    dropped. Used by both single-token verification and chunked trace audits.
+    """
+
+    remapped: List[int] = []
+    for raw_pos in raw_positions:
+        pos = int(raw_pos)
+        if 0 <= pos < prefix_len:
+            remapped.append(pos)
+        elif dynamic_start <= pos < dynamic_end:
+            remapped.append(prefix_len + (pos - dynamic_start))
+    return tuple(remapped)
+
+
 def _window_teacher_forced_prefix(
     *,
     context: Sequence[int],
@@ -854,7 +893,8 @@ def _window_teacher_forced_prefix(
     token_index: int,
     max_context_window: Optional[int],
     mem_store_positions: Sequence[int],
-) -> Tuple[List[int], int, List[int]]:
+    mem_addr_src_positions: Sequence[int] = (),
+) -> Tuple[List[int], int, List[int], List[int]]:
     def visible_store_positions() -> List[int]:
         visible: List[int] = []
         for raw_pos in mem_store_positions:
@@ -868,26 +908,48 @@ def _window_teacher_forced_prefix(
                 visible.append(pos)
         return visible
 
+    visible_store = visible_store_positions()
+    addr_src_set = {int(p) for p in mem_addr_src_positions}
+    visible_addr_src = [p for p in visible_store if p in addr_src_set]
+
     prediction_prefix = [int(t) for t in context[:token_index]]
     if max_context_window is None:
-        return prediction_prefix, len(prediction_prefix) - 1, visible_store_positions()
+        return (
+            prediction_prefix,
+            len(prediction_prefix) - 1,
+            visible_store,
+            visible_addr_src,
+        )
     if token_index <= prefix_len + max_context_window:
-        return prediction_prefix, len(prediction_prefix) - 1, visible_store_positions()
+        return (
+            prediction_prefix,
+            len(prediction_prefix) - 1,
+            visible_store,
+            visible_addr_src,
+        )
 
     tail_start = token_index - max_context_window
     windowed = (
         [int(t) for t in context[:prefix_len]]
         + [int(t) for t in context[tail_start:token_index]]
     )
-
-    remapped_store_positions: List[int] = []
-    for pos in visible_store_positions():
-        if 0 <= pos < prefix_len:
-            remapped_store_positions.append(pos)
-        elif tail_start <= pos < token_index:
-            remapped_store_positions.append(prefix_len + (pos - tail_start))
-
-    return windowed, len(windowed) - 1, remapped_store_positions
+    remapped_store = list(
+        _remap_positions_for_window(
+            visible_store,
+            prefix_len=prefix_len,
+            dynamic_start=tail_start,
+            dynamic_end=token_index,
+        )
+    )
+    remapped_addr_src = list(
+        _remap_positions_for_window(
+            visible_addr_src,
+            prefix_len=prefix_len,
+            dynamic_start=tail_start,
+            dynamic_end=token_index,
+        )
+    )
+    return windowed, len(windowed) - 1, remapped_store, remapped_addr_src
 
 
 def _block_display_label(block, block_index: int) -> Tuple[str, Optional[int]]:
@@ -909,6 +971,7 @@ def verify_teacher_forced_token_support(
     expected_token: Optional[int] = None,
     prefix_len: int = 0,
     mem_store_positions: Sequence[int] = (),
+    mem_addr_src_positions: Sequence[int] = (),
     max_context_window: Optional[int] = 512,
     min_margin: float = 0.0,
     output_band_min_margin: Optional[float] = None,
@@ -935,12 +998,18 @@ def verify_teacher_forced_token_support(
     if not 0 <= int(expected_token) < int(getattr(model, "vocab_size", 10**9)):
         raise ValueError(f"expected token {expected_token!r} is outside model vocab")
 
-    windowed, logit_pos, remapped_store_positions = _window_teacher_forced_prefix(
+    (
+        windowed,
+        logit_pos,
+        remapped_store_positions,
+        remapped_addr_src_positions,
+    ) = _window_teacher_forced_prefix(
         context=context,
         prefix_len=prefix_len,
         token_index=token_index,
         max_context_window=max_context_window,
         mem_store_positions=mem_store_positions,
+        mem_addr_src_positions=mem_addr_src_positions,
     )
     if logit_pos < 0:
         raise ValueError("empty prediction prefix")
@@ -951,6 +1020,7 @@ def verify_teacher_forced_token_support(
     embed = getattr(model, "embed", None)
     old_mem_history_end = getattr(embed, "_mem_history_end", None)
     old_mem_store_positions = getattr(embed, "_mem_store_positions", None)
+    old_mem_addr_src_positions = getattr(embed, "_mem_addr_src_positions", None)
 
     snapshots: List[LoweringSupportSnapshot] = []
     try:
@@ -958,6 +1028,10 @@ def verify_teacher_forced_token_support(
             embed.set_mem_history_end(0)
         if hasattr(embed, "set_mem_store_positions"):
             embed.set_mem_store_positions([tuple(remapped_store_positions)])
+        if hasattr(embed, "set_mem_addr_src_positions"):
+            embed.set_mem_addr_src_positions(
+                [tuple(remapped_addr_src_positions)]
+            )
 
         with torch.no_grad():
             x = model.embed(token_ids)
@@ -997,6 +1071,8 @@ def verify_teacher_forced_token_support(
             embed.set_mem_history_end(old_mem_history_end)
         if hasattr(embed, "set_mem_store_positions"):
             embed.set_mem_store_positions(old_mem_store_positions)
+        if hasattr(embed, "set_mem_addr_src_positions"):
+            embed.set_mem_addr_src_positions(old_mem_addr_src_positions)
 
     return TeacherForcedTokenSupportReport(
         probe_name=probe_name,
@@ -1084,6 +1160,7 @@ def audit_teacher_forced_trace_final_support(
     embed = getattr(model, "embed", None)
     old_mem_history_end = getattr(embed, "_mem_history_end", None)
     old_mem_store_positions = getattr(embed, "_mem_store_positions", None)
+    old_mem_addr_src_positions = getattr(embed, "_mem_addr_src_positions", None)
 
     failures: List[TeacherForcedTraceAuditFailure] = []
     checked = 0
@@ -1092,6 +1169,10 @@ def audit_teacher_forced_trace_final_support(
             embed.set_mem_history_end(0)
         if hasattr(embed, "set_mem_store_positions"):
             embed.set_mem_store_positions([tuple(trace.mem_store_positions)])
+        if hasattr(embed, "set_mem_addr_src_positions"):
+            embed.set_mem_addr_src_positions(
+                [tuple(trace.mem_addr_src_positions)]
+            )
 
         with torch.no_grad():
             x = model.embed(token_ids)
@@ -1125,6 +1206,8 @@ def audit_teacher_forced_trace_final_support(
             embed.set_mem_history_end(old_mem_history_end)
         if hasattr(embed, "set_mem_store_positions"):
             embed.set_mem_store_positions(old_mem_store_positions)
+        if hasattr(embed, "set_mem_addr_src_positions"):
+            embed.set_mem_addr_src_positions(old_mem_addr_src_positions)
 
     return TeacherForcedTraceAuditReport(
         probe_name=probe_name,
@@ -1139,14 +1222,26 @@ def _remapped_store_positions_for_window(
     dynamic_start: int,
     dynamic_end: int,
 ) -> Tuple[int, ...]:
-    remapped: List[int] = []
-    for raw_pos in trace.mem_store_positions:
-        pos = int(raw_pos)
-        if 0 <= pos < trace.prefix_len:
-            remapped.append(pos)
-        elif dynamic_start <= pos < dynamic_end:
-            remapped.append(trace.prefix_len + (pos - dynamic_start))
-    return tuple(remapped)
+    return _remap_positions_for_window(
+        trace.mem_store_positions,
+        prefix_len=trace.prefix_len,
+        dynamic_start=dynamic_start,
+        dynamic_end=dynamic_end,
+    )
+
+
+def _remapped_addr_src_positions_for_window(
+    trace: TeacherForcedSymbolicTrace,
+    *,
+    dynamic_start: int,
+    dynamic_end: int,
+) -> Tuple[int, ...]:
+    return _remap_positions_for_window(
+        trace.mem_addr_src_positions,
+        prefix_len=trace.prefix_len,
+        dynamic_start=dynamic_start,
+        dynamic_end=dynamic_end,
+    )
 
 
 def _audit_teacher_forced_trace_final_support_windowed(
@@ -1169,6 +1264,7 @@ def _audit_teacher_forced_trace_final_support_windowed(
     embed = getattr(model, "embed", None)
     old_mem_history_end = getattr(embed, "_mem_history_end", None)
     old_mem_store_positions = getattr(embed, "_mem_store_positions", None)
+    old_mem_addr_src_positions = getattr(embed, "_mem_addr_src_positions", None)
 
     failures: List[TeacherForcedTraceAuditFailure] = []
     checked = 0
@@ -1205,6 +1301,14 @@ def _audit_teacher_forced_trace_final_support_windowed(
             if hasattr(embed, "set_mem_store_positions"):
                 embed.set_mem_store_positions([
                     _remapped_store_positions_for_window(
+                        trace,
+                        dynamic_start=dynamic_start,
+                        dynamic_end=chunk_end,
+                    )
+                ])
+            if hasattr(embed, "set_mem_addr_src_positions"):
+                embed.set_mem_addr_src_positions([
+                    _remapped_addr_src_positions_for_window(
                         trace,
                         dynamic_start=dynamic_start,
                         dynamic_end=chunk_end,
@@ -1254,6 +1358,8 @@ def _audit_teacher_forced_trace_final_support_windowed(
             embed.set_mem_history_end(old_mem_history_end)
         if hasattr(embed, "set_mem_store_positions"):
             embed.set_mem_store_positions(old_mem_store_positions)
+        if hasattr(embed, "set_mem_addr_src_positions"):
+            embed.set_mem_addr_src_positions(old_mem_addr_src_positions)
 
     return TeacherForcedTraceAuditReport(
         probe_name=probe_name,

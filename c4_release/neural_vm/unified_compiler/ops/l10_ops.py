@@ -3864,6 +3864,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_ADDR_SRC", -1000000.0),
                 ("PSH_AT_SP", -1000000.0),
                 ("OP_JSR", -1000000.0),
+                # ENT pushes BP to (SP-8) BEFORE allocating its local frame, so
+                # MEM addr0 for ENT is 0xf0 even when the post-locals SP byte 0
+                # is 0xe0 (e.g. ENT 8 with starting SP=0xfff8). Without this
+                # blocker the lane-correction overshoot used by the
+                # OneHotBandGuarantee lowering would forcefully rewrite
+                # 0xf0 → 0xe0 at the MEM marker.
+                ("OP_ENT", -1000000.0),
                 ("CMP+0", 10.0),
                 ("ALU_LO+8", 5.0),
                 ("ALU_LO+7", -10.0),
@@ -3899,6 +3906,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_ADDR_SRC", -1000000.0),
                 ("PSH_AT_SP", 1.0),
                 ("OP_JSR", -1000000.0),
+                # See ENT note on tail_mem_store_addr0_e0_from_local_offset_exact:
+                # ENT must not be coerced to a 0xe0 store-target.
+                ("OP_ENT", -1000000.0),
                 ("CMP+0", 10.0),
                 ("ALU_LO+8", 5.0),
                 ("ALU_LO+7", -10.0),
@@ -4041,6 +4051,16 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("CMP+0", 2.0),
                 ("ADDR_B0_LO+8", 2.0),
                 ("ADDR_B0_HI+14", 2.0),
+                # When upstream L16/L17 store amplifiers have already pushed
+                # OUTPUT_LO+8 / OUTPUT_HI+14 to ~1e8 (model is confidently
+                # emitting 0xe8), the OneHotBandGuarantee lane corrections
+                # multiply ``(target - current)`` by ``silu(up) ≈ S * (score -
+                # threshold)`` and overshoot into ~1e10 at the inactive lanes,
+                # flipping the prediction. These tiny weights suppress the
+                # rule in that high-magnitude regime without weakening the
+                # uncertain-OUTPUT exactness recovery path.
+                ("OUTPUT_LO+8", -0.001),
+                ("OUTPUT_HI+14", -0.001),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
