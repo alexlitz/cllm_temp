@@ -1502,8 +1502,9 @@ class BatchedPureNeuralRunner:
             op, _imm = fetched
         return int(op) not in _SPEC_UNSAFE_OPS
 
+    @staticmethod
     def _current_step_store_mem_marker(
-        self, s: _ElementState, context: List[int]
+        s: _ElementState, context: List[int]
     ) -> Optional[int]:
         """Return the position of the current step's MEM marker if it has
         already been emitted and the current step's instruction is a store op.
@@ -1521,15 +1522,14 @@ class BatchedPureNeuralRunner:
         ``None`` if the current step's marker is not present, the current
         instruction is not a store, or the step has already ended.
         """
-        # Scan backward over at most one VM step.
         scan_back = Token.STEP_TOKENS + 2
         end = len(context)
         start = max(0, end - scan_back)
         for i in range(end - 1, start - 1, -1):
             t = context[i]
             if t == Token.STEP_END or t == Token.HALT or t == Token.TOOL_CALL:
-                # The step ended after this marker, so any prior MEM belongs
-                # to a previous step already tracked via mem_history.
+                # Prior MEM belongs to a previous step (already tracked via
+                # mem_history). Don't claim it as current-step.
                 return None
             if t == Token.MEM:
                 exec_pc = s.exec_pc()
@@ -1541,8 +1541,8 @@ class BatchedPureNeuralRunner:
                 return None
         return None
 
+    @staticmethod
     def _add_current_step_marker(
-        self,
         positions: List[int],
         current_marker_abs: Optional[int],
         windowed: List[int],
@@ -1552,10 +1552,12 @@ class BatchedPureNeuralRunner:
         """Return ``positions`` augmented with the current-step MEM marker.
 
         ``current_marker_abs`` is the marker position in the element's full
-        context. ``absolute_to_windowed`` is the offset added to map from
-        absolute context positions to positions in ``windowed`` (zero when
-        no windowing happened, otherwise compensates for trimmed dynamic
-        tokens and any re-injected mem history).
+        context. ``absolute_to_windowed`` shifts that absolute position into
+        the windowed coordinate space (zero when no windowing happened,
+        otherwise compensates for trimmed dynamic tokens and re-injected mem
+        history). Returns ``positions`` unchanged when the marker is missing,
+        out of range, or no longer points at a MEM token (defensive guard
+        against caller drift).
         """
         if current_marker_abs is None:
             return positions
