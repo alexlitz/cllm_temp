@@ -1,0 +1,14 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-a43bef4c42e744ff7/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 3 items
+
+c4_release/tests/test_batched_kv_eviction_validation.py ...
+
+============================== 3 passed in 0.15s ===============================
