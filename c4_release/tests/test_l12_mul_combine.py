@@ -412,20 +412,6 @@ def test_l12_mul_combine_dynamic_candidate_set():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "declaration drift: TEMP[partial] magnitude mismatch between L11 "
-        "(produces ~1.0) and L12 (threshold calibrated for ~5.0). "
-        "Diagnostic context: expr_mul_div_* in test_suite_1000.py returns "
-        "wildly wrong values (29*16/8 -> 314 instead of 58). The L12 bake "
-        "docstring claims TEMP fires at ~5.0 but L11's bake writes "
-        "W_down=2.0/S yielding TEMP ~= 1.0. Either L11 needs amplification "
-        "or L12's b_up must be re-baselined to threshold ~3.5 (matching "
-        "the 4-way AND at unit amplitude). Re-enable as a green test "
-        "once the amplitude contract is resolved."
-    ),
-    strict=True,
-)
 @pytest.mark.parametrize(
     ("a", "b"),
     [
@@ -439,9 +425,13 @@ def test_l11_then_l12_chained_forward_matches_expected_output_hi(
 ):
     """End-to-end symbolic chain: forward through L11 then L12.
 
-    Currently expected to xfail (see ``strict=True`` xfail marker) due
-    to the magnitude mismatch. The test is structured so that, once
-    fixed, removing the xfail marker yields a green CI signal.
+    Fix landed (2026-05-29): L11's W_down was amplified from 2.0/S to
+    10.0/S so hot TEMP[partial] lands at ~5.0 -- matching the L12 4-way
+    AND threshold (b_up = -S*7.5). The chained gate now fires and
+    OUTPUT_HI carries the correct ``(partial + a_hi*b_lo) % 16`` nibble.
+    Regression sentinel: if L11 W_down drifts back to ~2.0/S (TEMP ~1.0),
+    L12's threshold goes cold and the chain silently drops the high
+    nibble of wide-MUL products > 255 (the expr_mul_div_* failure mode).
     """
     a_lo = a & 0xF
     a_hi = (a >> 4) & 0xF
