@@ -24,6 +24,12 @@ class DimSlot:
     start: int
     size: int
     desc: str
+    semantics: Optional[str] = None  # predicate-DSL string describing
+                                     # when this dim fires; checked by
+                                     # decl_verifier.verify_rule_scopes
+                                     # (F-7). None means "not yet specified
+                                     # — tolerated this merge cycle but will
+                                     # become required."
 
     @property
     def end(self) -> int:
@@ -54,15 +60,44 @@ class DimRegistry:
         self.d_model = d_model
         self.slots: Dict[str, DimSlot] = {}
 
-    def alloc(self, name: str, start: int, size: int, desc: str) -> DimSlot:
-        """Register a dimension allocation. Returns the DimSlot."""
+    def alloc(
+        self,
+        name: str,
+        start: int,
+        size: int,
+        desc: str,
+        semantics: Optional[str] = None,
+    ) -> DimSlot:
+        """Register a dimension allocation. Returns the DimSlot.
+
+        `semantics` is a predicate-DSL string (parse with
+        neural_vm.unified_compiler.predicates.parse) describing when this
+        dim fires. Optional during F-3 tolerant rollout; will become
+        required in a follow-on commit once all ~80 dims are backfilled.
+        """
         if name in self.slots:
             raise ValueError(f"Duplicate slot name: {name}")
         if start < 0 or start + size > self.d_model:
             raise ValueError(f"Slot {name} [{start}, {start+size}) out of bounds [0, {self.d_model})")
-        slot = DimSlot(name, start, size, desc)
+        if semantics is None:
+            import warnings
+            warnings.warn(
+                f"DimSlot {name!r} declared without semantics (DEPRECATED; "
+                f"will be required after F-4 backfill lands). Add a "
+                f"`semantics='<predicate>'` keyword arg.",
+                category=DeprecationWarning,
+                stacklevel=2,
+            )
+        slot = DimSlot(name, start, size, desc, semantics)
         self.slots[name] = slot
         return slot
+
+    def semantics(self, name: str) -> Optional[str]:
+        """Return the semantics predicate string for `name`, or None if
+        not declared."""
+        if name not in self.slots:
+            raise KeyError(f"Unknown dim: {name!r}")
+        return self.slots[name].semantics
 
     def check_overlaps(self) -> List[str]:
         """Return error messages for any overlapping slots."""
