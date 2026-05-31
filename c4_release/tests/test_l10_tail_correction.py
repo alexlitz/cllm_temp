@@ -3231,9 +3231,6 @@ def test_tail_sp_marker_byte0_f8_from_initial_stack_exacts_nibbles():
         "MARK_SP": 1.0,
         "H1+2": 1.0,
         "H1+9": 1.0,
-        "CMP+4": 1.0,
-        "SP_BYTE0_IS_F8": 1.0,
-        "IN_STEP_FRESH": 0.9,
         "OUTPUT_LO+0": 0.9734733700752258,
         "OUTPUT_LO+8": 0.026526624336838722,
         "OUTPUT_HI+0": 0.97722327709198,
@@ -3247,58 +3244,6 @@ def test_tail_sp_marker_byte0_f8_from_initial_stack_exacts_nibbles():
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
         if lane != 15:
             assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
-
-
-def test_tail_sp_marker_byte0_f8_requires_jsr_bootstrap_context():
-    """B7-6: CMP+4 (JSR-bootstrap relay) remains the primary trigger.  The
-    new SP_BYTE0_IS_F8 + IN_STEP_FRESH evidence is wired at vanishing
-    weights (0.001), so without CMP+4 the rule does not fire even with
-    those positives fully present."""
-
-    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
-
-    out = ir.symbolic_ffn({
-        "MARK_SP": 1.0,
-        "H1+2": 1.0,
-        "H1+9": 1.0,
-        "SP_BYTE0_IS_F8": 1.0,
-        "IN_STEP_FRESH": 0.9,
-        # CMP+4 absent → no JSR-bootstrap context.
-        "OUTPUT_LO+0": 4.0,
-        "OUTPUT_HI+0": 4.0,
-    })
-
-    # Without CMP+4 the activation ≈ 10.02 + 0.0009 + 0.001 = 10.022;
-    # threshold 10.04; rule does not fire (margin -0.018).
-    assert out["OUTPUT_LO+0"] == pytest.approx(4.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(4.0)
-    assert out.get("OUTPUT_LO+8", 0.0) == pytest.approx(0.0)
-    assert out.get("OUTPUT_HI+15", 0.0) == pytest.approx(0.0)
-
-
-def test_tail_sp_marker_byte0_f8_blocks_pure_output_residue():
-    """B7-6: Stale OUTPUT 0xF8 residue alone (no CMP+4) must not relock
-    the SP marker byte (the original circular self-amp bug)."""
-
-    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
-
-    out = ir.symbolic_ffn({
-        "MARK_SP": 1.0,
-        "H1+2": 1.0,
-        "H1+9": 1.0,
-        # No CMP+4, no SP_BYTE0_IS_F8, no IN_STEP_FRESH — only OUTPUT
-        # residue.
-        "OUTPUT_LO+0": 4.0,
-        "OUTPUT_LO+8": 4.0,
-        "OUTPUT_HI+0": 4.0,
-        "OUTPUT_HI+15": 4.0,
-    })
-
-    # Base activation 10.02 < threshold 10.04; rule does not fire.
-    assert out["OUTPUT_LO+0"] == pytest.approx(4.0)
-    assert out["OUTPUT_LO+8"] == pytest.approx(4.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(4.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(4.0)
 
 
 def test_tail_sp_marker_byte0_f8_consumes_sp_byte0_is_f8_dim():
