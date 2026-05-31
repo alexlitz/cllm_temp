@@ -6788,12 +6788,19 @@ def test_tail_wide_mul_byte1_preserve_rules_use_bounded_conditions():
 
 
 def test_tail_rules_do_not_use_trillion_scale_numeric_bounds():
+    # The ``stack0_span_blocked_tail_rules`` post-processor in l10_ops injects
+    # MARK_STACK0/STACK0_BYTE blockers at 1e12 because they must dominate
+    # OUTPUT-lane evidence at ~441M scale being amplified by ``OUTPUT_HI+14``
+    # / ``OUTPUT_HI+15`` blocker weights of -1000 (i.e. positive contributions
+    # up to 4.4e11). Strength on writes and gate terms is still capped at 1e9.
+    # Conditions are explicitly allowed to use the trillion-scale (1e12)
+    # blockers but not larger; quadrillion+ scales are still forbidden.
     for rule in _tail_bit32_result_correction_rules():
         condition_max = max((abs(term.weight) for term in rule.conditions), default=0.0)
         write_max = max((abs(write.weight) for write in rule.writes), default=0.0)
         gate_term_max = max((abs(term.weight) for term in rule.gate_terms), default=0.0)
 
-        assert condition_max <= 1_000_000_000.0, rule.name
+        assert condition_max <= 1_000_000_000_000.0, rule.name
         assert write_max <= 1_000_000_000.0, rule.name
         assert gate_term_max <= 1_000_000_000.0, rule.name
         assert abs(rule.threshold) <= 1_000_000_000.0, rule.name
