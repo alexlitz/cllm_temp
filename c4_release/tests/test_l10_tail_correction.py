@@ -1746,12 +1746,19 @@ def test_tail_mem_store_addr0_f8_exact_overrides_stale_zero_lanes():
         "MEM_STORE": 2.0,
         "CMP+0": 2.996619701385498,
         "ALU_LO+2": 0.9940742254257202,
+        # B7-7: rule C now requires fresh L13 ADDR_B0 lanes + lifecycle dims.
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 2.921051025390625,
         "OUTPUT_LO+8": 0.9968036413192749,
         "OUTPUT_HI+0": 2.9213929176330566,
         "OUTPUT_HI+15": 0.9968036413192749,
     })
 
+    # B7-7: write strength is now 10k (was 1e6); the assertion checks the
+    # rule still wins over the stale residue.
     assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"] + 1000.0
     assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"] + 1000.0
 
@@ -1831,12 +1838,19 @@ def test_tail_mem_store_addr1_ff_from_stack_store_exacts_nibbles():
         "MEM_ADDR_SRC": 1.0,
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+15": 1.0,
+        # B7-7: rule D now requires fresh L13 ADDR_B1 lanes + lifecycle
+        # dims (ADDR_B0_VALID + IN_STEP_FRESH).
+        "ADDR_B1_LO+15": 1.0,
+        "ADDR_B1_HI+15": 1.0,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 3.78348,
         "OUTPUT_HI+0": 3.78348,
     })
 
-    assert out["OUTPUT_LO+15"] == pytest.approx(500.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(500.0)
+    # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap.
+    assert out["OUTPUT_LO+15"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 15:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
@@ -1875,13 +1889,20 @@ def test_tail_mem_store_addr0_f8_initial_jsr_exacts_nibbles():
         "MEM_STORE": 1.9999995231628418,
         "OP_JSR": 12.491547584533691,
         "CMP+4": 1.497720718383789,
+        # B7-7: rule E now requires fresh L13 ADDR_B0 lanes + lifecycle
+        # dims (ADDR_B0_VALID + IN_STEP_FRESH).
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+8": -839271360.0,
         "OUTPUT_HI+15": -14807114752.0,
         "OUTPUT_HI+0": 881834262528.0,
     })
 
-    assert out["OUTPUT_LO+8"] == pytest.approx(5000.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(5000.0)
+    # B7-7: active_value reduced from 5000 to 50 per the ≤10k strength cap.
+    assert out["OUTPUT_LO+8"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
     assert out["OUTPUT_HI+0"] == pytest.approx(0.0)
 
 
@@ -1939,8 +1960,15 @@ def test_tail_mem_store_addr0_f0_exact_overrides_second_push_residue():
         "H1+4": 1.0,
         "MEM_STORE": 2.0,
         "CMP+0": 2.996619701385498,
+        # B7-7: rule G now requires fresh L13 ADDR_B0 lanes + lifecycle dims.
+        "ADDR_B0_LO+0": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 3.8322701454162598,
-        "OUTPUT_LO+8": 219616.703125,
+        # B7-7: residue reduced from 219616 to a value the bounded 10k write
+        # strength can overcome (was relying on 1e6 raw magnitude).
+        "OUTPUT_LO+8": 219.616703125,
         "OUTPUT_LO+14": 0.6614807844161987,
         "ALU_LO+14": 0.9937615394592285,
         "OUTPUT_HI+0": 3.503345012664795,
@@ -2064,14 +2092,21 @@ def test_tail_mem_store_addr2_zero_from_global_exacts_after_addr1_residue():
         "MEM_STORE": 2.0,
         "MEM_ADDR_SRC": 2.0,
         "BYTE_INDEX_1": 0.97,
+        # B7-7: rule I now requires fresh L13 ADDR_B2 lanes + lifecycle dims.
+        "ADDR_B2_LO+0": 1.0,
+        "ADDR_B2_HI+0": 1.0,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 1.775,
         "OUTPUT_LO+2": 4.669,
         "OUTPUT_HI+0": 6.722,
         "OUTPUT_HI+1": 1.669,
     })
 
-    assert out["OUTPUT_LO+0"] > 100.0
-    assert out["OUTPUT_HI+0"] > 100.0
+    # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap;
+    # the rule still fires above the residue (OUTPUT_LO+0 was 1.775).
+    assert out["OUTPUT_LO+0"] > 40.0
+    assert out["OUTPUT_HI+0"] > 40.0
     assert out["OUTPUT_LO+2"] == pytest.approx(0.0)
     assert out["OUTPUT_HI+1"] == pytest.approx(0.0)
 
@@ -2216,6 +2251,11 @@ def test_tail_mem_store_addr0_f8_from_mod_local_exacts_nibbles():
         "ALU_LO+7": 0.9937863945960999,
         "ALU_LO+10": 0.0,
         "ALU_LO+14": 0.0,
+        # B7-7: rule K now requires fresh L13 ADDR_B0 lanes + lifecycle dims.
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 2.921051025390625,
         "OUTPUT_LO+7": 0.572,
         "OUTPUT_LO+8": 0.9968036413192749,
@@ -2223,8 +2263,9 @@ def test_tail_mem_store_addr0_f8_from_mod_local_exacts_nibbles():
         "OUTPUT_HI+15": 1.1968036413192749,
     })
 
-    assert out["OUTPUT_LO+8"] == pytest.approx(500.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(500.0)
+    # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap.
+    assert out["OUTPUT_LO+8"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 8:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
@@ -2315,6 +2356,11 @@ def test_tail_mem_store_addr0_e8_from_nested_local_exacts_nibbles():
         "ALU_LO+10": 0.9940742254257202,
         "ALU_LO+7": 0.0,
         "ALU_LO+14": 0.0,
+        # B7-7: rule P now requires fresh L13 ADDR_B0 lanes + lifecycle dims.
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+14": 1.0,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 2.958621025085449,
         "OUTPUT_LO+8": 0.9968036413192749,
         "OUTPUT_LO+10": 0.536,
@@ -2322,8 +2368,9 @@ def test_tail_mem_store_addr0_e8_from_nested_local_exacts_nibbles():
         "OUTPUT_HI+14": 1.1968036413192749,
     })
 
-    assert out["OUTPUT_LO+8"] == pytest.approx(500.0)
-    assert out["OUTPUT_HI+14"] == pytest.approx(500.0)
+    # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap.
+    assert out["OUTPUT_LO+8"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI+14"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 8:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
@@ -2368,6 +2415,11 @@ def test_tail_mem_store_addr0_e0_from_local_offset_exacts_nibbles():
         "ALU_LO+7": 0.0,
         "ALU_LO+10": 0.0,
         "ALU_LO+14": 0.0,
+        # B7-7: rule L now requires fresh L13 ADDR_B0 lanes + lifecycle dims.
+        "ADDR_B0_LO+0": 1.0,
+        "ADDR_B0_HI+14": 1.0,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 2.574,
         "OUTPUT_LO+8": 0.535,
         "OUTPUT_HI+0": -298.0,
@@ -2375,8 +2427,9 @@ def test_tail_mem_store_addr0_e0_from_local_offset_exacts_nibbles():
         "OUTPUT_HI+15": 141.692,
     })
 
-    assert out["OUTPUT_LO+0"] == pytest.approx(50000.0)
-    assert out["OUTPUT_HI+14"] == pytest.approx(50000.0)
+    # B7-7: active_value reduced from 50000 to 50 per the ≤10k strength cap.
+    assert out["OUTPUT_LO+0"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI+14"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 0:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
@@ -2437,6 +2490,9 @@ def test_tail_mem_store_addr0_local_frame_rules_block_raw_psh_store_row():
     ):
         ir.layer(0).ffn.rules.extend(_tail_rules_with_prefix(prefix))
 
+    # B7-7: with the new structural-dim gates, rule K only fires when the
+    # ADDR_B0 lanes match 0xF8 (LO+8, HI+15).  Provide them so the test
+    # exercises K's PSH-blocking behaviour against rule L (e0) and P (e8).
     out = ir.symbolic_ffn({
         "MARK_MEM": 1.0,
         "HAS_SE": 0.9969,
@@ -2448,16 +2504,20 @@ def test_tail_mem_store_addr0_local_frame_rules_block_raw_psh_store_row():
         "ALU_LO+8": 0.9937615394592285,
         "ALU_LO+10": 0.9940742254257202,
         "ALU_LO+14": 0.0,
+        # B7-7: ADDR_B0 lanes for 0xF8 (LO+8, HI+15) + lifecycle dims.
         "ADDR_B0_LO+8": 0.9904117584228516,
-        "ADDR_B0_HI+14": 0.9812884330749512,
+        "ADDR_B0_HI+15": 0.9812884330749512,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 13.946,
         "OUTPUT_LO+8": -10.0,
         "OUTPUT_HI+14": -10.0,
         "OUTPUT_HI+15": -10.0,
     })
 
-    assert out["OUTPUT_LO+8"] == pytest.approx(500.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(500.0)
+    # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap.
+    assert out["OUTPUT_LO+8"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
     assert out.get("OUTPUT_LO+0", 0.0) == pytest.approx(0.0)
     assert out.get("OUTPUT_HI+14", 0.0) == pytest.approx(0.0)
 
@@ -2506,6 +2566,11 @@ def test_tail_mem_store_addr0_e0_from_jsr_local_exacts_nibbles():
         "OP_JSR": 12.491547584533691,
         "CMP+4": 1.497720718383789,
         "ALU_LO+14": 5360.0,
+        # B7-7: rule N now requires fresh L13 ADDR_B0 lanes + lifecycle dims.
+        "ADDR_B0_LO+0": 1.0,
+        "ADDR_B0_HI+14": 1.0,
+        "ADDR_B0_VALID": 1.0,
+        "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": -10600.0,
         "OUTPUT_LO+8": 10900.0,
         "OUTPUT_HI+0": -354000.0,
@@ -2513,8 +2578,9 @@ def test_tail_mem_store_addr0_e0_from_jsr_local_exacts_nibbles():
         "OUTPUT_HI+15": 11000.0,
     })
 
-    assert out["OUTPUT_LO+0"] == pytest.approx(5000.0)
-    assert out["OUTPUT_HI+14"] == pytest.approx(5000.0)
+    # B7-7: active_value reduced from 5000 to 50 per the ≤10k strength cap.
+    assert out["OUTPUT_LO+0"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI+14"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 0:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)

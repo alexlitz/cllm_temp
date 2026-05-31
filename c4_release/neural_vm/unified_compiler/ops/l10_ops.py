@@ -3610,13 +3610,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # address evidence proves byte 0 is 0xf8, assert both nibbles with a
         # real margin before the output head consumes the marker row.
         #
-        # B6-B / B4-H Path 2: rule C (0xF8 PSH-store) augmented with soft
-        # ADDR_B0 evidence (LO+8 / HI+15 → 0xF8).  The PSH-store path can
-        # fire before the L13 ADDR_B0 gather has completed, so we cannot
-        # require the L13 lanes (see plan 3.3 — same pattern as rule M).
-        # The disjoint CMP+0 / ALU_LO+2 witnesses remain as the legitimate
-        # fallback; ADDR_B0 strengthens the proof when present.  Strength
-        # stays at 10k.
+        # B7-7 / B4-H Path 2: rule C (0xF8 PSH-store) upgraded from soft +2.0
+        # ADDR_B0 evidence to hard +50 ADDR_B0 gate combined with the new
+        # ADDR_B0_VALID lifecycle bit (B7-4) and IN_STEP_FRESH (B7-1) for
+        # current-step gating.  The PSH-store path can fire before the L13
+        # ADDR_B0 gather has completed, so the disjoint CMP+0 / ALU_LO+2
+        # witnesses remain as the legitimate fallback; the structural dims
+        # promote the proof decisively when the gather completes.  Strength
+        # stays at 10k (≤10k bound per B4-H §3.2).
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f8_exact",
             conditions=(
@@ -3629,11 +3630,16 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_STORE", 1.0),
                 ("CMP+0", 2.0),
                 ("ALU_LO+2", 5.0),
-                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
-                # 0xF8 → (LO+8, HI+15). These add conviction when L13's
-                # gather has completed; they are not required to fire.
-                ("ADDR_B0_LO+8", 2.0),
-                ("ADDR_B0_HI+15", 2.0),
+                # B7-7: hard +50 ADDR_B0 gate (was soft +2 per B6-B).
+                # 0xF8 → (LO+8, HI+15).  Combined with ADDR_B0_VALID +50
+                # to require the L13 gather actually completed (else the
+                # ADDR_B0 lanes are stale residue).
+                ("ADDR_B0_LO+8", 50.0),
+                ("ADDR_B0_HI+15", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                # B7-7: IN_STEP_FRESH +50 — only fire in the current step
+                # (the lifecycle bit decays after STEP_END).
+                ("IN_STEP_FRESH", 50.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -3648,12 +3654,24 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=33.0,
+            # B7-7: threshold raised from 33 to 140 so the structural-dim
+            # evidence (LO+8 / HI+15 / VALID / FRESH = +200) is jointly
+            # required.  Partial structural evidence (e.g. LO+8 alone with
+            # E8-row HI+14 residue) no longer suffices; matches the existing
+            # addr_from_l13_rules helper pattern.
+            threshold=140.0,
             writes=byte_writes(0xF8, strength=10_000.0),
         ),
-        # B6-B / B4-H Path 2: rule D (0xFF stack byte 1) augmented with soft
-        # ADDR_B1 evidence (LO+15 / HI+15 → 0xFF).  The L13 mem-addr gather
-        # writes B1 lanes too; this strengthens the proof when present.
+        # B7-7 / B4-H Path 2: rule D (0xFF stack byte 1) upgraded from soft
+        # +2.0 ADDR_B1 evidence to hard +50 ADDR_B1 gate combined with the
+        # ADDR_B0_VALID lifecycle bit (B7-4) and IN_STEP_FRESH (B7-1).  The
+        # L13 mem-addr gather populates B1 lanes at the same MEM val byte
+        # rows where ADDR_B0_VALID fires (no separate VALID bit exists for
+        # B1/B2 per B7-4), so ADDR_B0_VALID serves as the freshness witness.
+        # active_value reduced from 500 to a bounded value within the ≤10k
+        # range (the max_abs_weight default of 1e6 bounds the lowered Linear
+        # weights; the active_value sets the activation margin and 50.0 is
+        # sufficient now that the structural dims carry the decisive proof).
         *exact_output_byte_rules(
             name="tail_mem_store_addr1_ff_from_stack_store_exact",
             expected_byte=0xFF,
@@ -3672,10 +3690,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_ADDR_SRC", 2.0),
                 ("CLEAN_EMBED_LO+8", 5.0),
                 ("CLEAN_EMBED_HI+15", 5.0),
-                # Soft positive evidence from L13 ADDR_B1 lanes (B6-B).
-                # 0xFF → (LO+15, HI+15).
-                ("ADDR_B1_LO+15", 2.0),
-                ("ADDR_B1_HI+15", 2.0),
+                # B7-7: hard +50 ADDR_B1 gate (was soft +2 per B6-B).
+                # 0xFF → (LO+15, HI+15).  Combined with ADDR_B0_VALID +50
+                # (shared lifecycle bit for the L13 gather completion) and
+                # IN_STEP_FRESH +50 for current-step gating.
+                ("ADDR_B1_LO+15", 50.0),
+                ("ADDR_B1_HI+15", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                ("IN_STEP_FRESH", 50.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -1000000.0),
                 ("MARK_SP", -1000000.0),
@@ -3690,14 +3712,20 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=50.0,
-            active_value=500.0,
+            # B7-7: threshold raised from 50 to 140 so the structural-dim
+            # evidence (ADDR_B1 lanes + ADDR_B0_VALID + IN_STEP_FRESH) is
+            # jointly required for firing.
+            threshold=140.0,
+            active_value=50.0,
         ),
-        # B6-B / B4-H Path 2: rule E (0xF8 JSR initial push) augmented with
-        # soft ADDR_B0 evidence (LO+8 / HI+15 → 0xF8) and bounded max_abs_weight
-        # at 1e6 (was 1e9).  The JSR push of return-PC fires before L13 ADDR_B0
-        # gather has completed, so the L13 lanes are SOFT-only — the OP_JSR /
-        # CMP+4 evidence remains the primary proof.
+        # B7-7 / B4-H Path 2: rule E (0xF8 JSR initial push) upgraded from
+        # soft +2.0 ADDR_B0 evidence to hard +50 ADDR_B0 gate combined with
+        # ADDR_B0_VALID (B7-4) and IN_STEP_FRESH (B7-1).  The L13 gather Q
+        # fires at MEM val byte positions for all MEM store rows (including
+        # JSR return-PC push), so the structural dims are populated by the
+        # time this tail rule runs.  active_value reduced from 5000 to 50
+        # per the ≤10k cap (max_abs_weight kept at 1e9 because the existing
+        # marker / opcode blocker conditions use -1e9 weights).
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_f8_initial_jsr_exact",
             expected_byte=0xF8,
@@ -3711,11 +3739,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_STORE", 1.0),
                 ("OP_JSR", 1.0),
                 ("CMP+4", 1.0),
-                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
-                # 0xF8 → (LO+8, HI+15). These add conviction when L13's
-                # gather has completed; they are not required to fire.
-                ("ADDR_B0_LO+8", 2.0),
-                ("ADDR_B0_HI+15", 2.0),
+                # B7-7: hard +50 ADDR_B0 gate (was soft +2 per B6-B).
+                # 0xF8 → (LO+8, HI+15).  Combined with ADDR_B0_VALID +50
+                # to require fresh L13 gather output, IN_STEP_FRESH +50 for
+                # current-step gating.
+                ("ADDR_B0_LO+8", 50.0),
+                ("ADDR_B0_HI+15", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                ("IN_STEP_FRESH", 50.0),
                 ("HAS_SE", -100.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
@@ -3731,12 +3762,19 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=35.0,
-            active_value=5000.0,
+            # B7-7: threshold raised from 35 to 140 so the structural-dim
+            # evidence (LO+8 / HI+15 / VALID / FRESH = +200) is jointly
+            # required for firing.
+            threshold=140.0,
+            active_value=50.0,
             max_abs_weight=1_000_000_000.0,
         ),
-        # B6-B / B4-H Path 2: rule F (0xF8 JSR authority) augmented with soft
-        # ADDR_B0 evidence; strength stays at 50k (already bounded).
+        # B7-7 / B4-H Path 2: rule F (0xF8 JSR authority) upgraded from soft
+        # +2.0 ADDR_B0 evidence to hard +50 ADDR_B0 gate combined with the
+        # ADDR_B0_VALID (B7-4) and IN_STEP_FRESH (B7-1) lifecycle dims.
+        # Strength reduced from 50k to 10k per the ≤10k cap (the structural
+        # dims provide decisive evidence; outvoting siblings via raw magnitude
+        # is no longer required).
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f8_initial_jsr_authority",
             conditions=(
@@ -3749,10 +3787,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_STORE", 1.0),
                 ("OP_JSR", 1.0),
                 ("CMP+4", 1.0),
-                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
-                # 0xF8 → (LO+8, HI+15).
-                ("ADDR_B0_LO+8", 2.0),
-                ("ADDR_B0_HI+15", 2.0),
+                # B7-7: hard +50 ADDR_B0 gate (was soft +2 per B6-B).
+                # 0xF8 → (LO+8, HI+15).  Combined with ADDR_B0_VALID +50
+                # to require fresh L13 gather output, IN_STEP_FRESH +50 for
+                # current-step gating.
+                ("ADDR_B0_LO+8", 50.0),
+                ("ADDR_B0_HI+15", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                ("IN_STEP_FRESH", 50.0),
                 ("HAS_SE", -100.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
@@ -3768,11 +3810,16 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=35.0,
-            writes=byte_writes(0xF8, strength=50_000.0),
+            # B7-7: threshold raised from 35 to 140 so the structural-dim
+            # evidence (LO+8 / HI+15 / VALID / FRESH = +200) is jointly
+            # required for firing.
+            threshold=140.0,
+            writes=byte_writes(0xF8, strength=10_000.0),
         ),
-        # B6-B / B4-H Path 2: rule G (0xF0 full-frame addr) augmented with
-        # soft ADDR_B0 evidence (LO+0 / HI+15 → 0xF0).  Strength stays at 1e6.
+        # B7-7 / B4-H Path 2: rule G (0xF0 full-frame addr) upgraded from
+        # soft +2.0 ADDR_B0 evidence to hard +50 ADDR_B0 gate combined with
+        # ADDR_B0_VALID (B7-4) and IN_STEP_FRESH (B7-1).  Strength reduced
+        # from 1e6 to 10k per ≤10k cap (the structural dims are decisive).
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f0_exact",
             conditions=(
@@ -3786,10 +3833,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("CMP+0", 2.0),
                 ("ALU_LO+14", 5.0),
                 ("OP_JSR", -1000000.0),
-                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
-                # 0xF0 → (LO+0, HI+15).
-                ("ADDR_B0_LO+0", 2.0),
-                ("ADDR_B0_HI+15", 2.0),
+                # B7-7: hard +50 ADDR_B0 gate (was soft +2 per B6-B).
+                # 0xF0 → (LO+0, HI+15).  Combined with ADDR_B0_VALID +50
+                # and IN_STEP_FRESH +50 for lifecycle gating.
+                ("ADDR_B0_LO+0", 50.0),
+                ("ADDR_B0_HI+15", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                ("IN_STEP_FRESH", 50.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -3804,8 +3854,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=33.0,
-            writes=byte_writes(0xF0, strength=1_000_000.0),
+            # B7-7: threshold raised from 33 to 140 so the structural-dim
+            # evidence (LO+0 / HI+15 / VALID / FRESH = +200) is jointly
+            # required for firing.
+            threshold=140.0,
+            writes=byte_writes(0xF0, strength=10_000.0),
         ),
         # B5-D / B4-H Path 2: rule H (0x00 global addr) rerouted through L13
         # ADDR_B0 lanes.  Previously this rule used OUTPUT_LO+0 / OUTPUT_HI+0
@@ -3828,9 +3881,15 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=140.0,
             strength=10_000.0,
         ),
-        # B6-B / B4-H Path 2: rule I (addr byte 2 → 0x00 global) augmented
-        # with soft ADDR_B2 evidence (LO+0 / HI+0 → 0x00).  L13 writes
-        # ADDR_B0/B1/B2 (no B3); rule J cannot get an analogous boost.
+        # B7-7 / B4-H Path 2: rule I (addr byte 2 → 0x00 global) upgraded
+        # from soft +2.0 ADDR_B2 evidence to hard +50 ADDR_B2 gate combined
+        # with the shared ADDR_B0_VALID lifecycle bit (B7-4; L13 writes B2
+        # lanes at the same MEM val byte rows where ADDR_B0_VALID fires)
+        # and IN_STEP_FRESH (B7-1).  active_value reduced from 500 to 50
+        # per the ≤10k cap (max_abs_weight kept at 1e9 because the existing
+        # marker / register blocker conditions use -1e9 weights).  L13
+        # writes ADDR_B0/B1/B2 (no B3); rule J cannot get an analogous
+        # boost.
         *exact_output_byte_rules(
             name="tail_mem_store_addr2_zero_from_global_exact",
             expected_byte=0x00,
@@ -3852,10 +3911,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("BYTE_INDEX_1", 5.0),
                 ("BYTE_INDEX_2", -1000.0),
                 ("BYTE_INDEX_3", -1000.0),
-                # Soft positive evidence from L13 ADDR_B2 lanes (B6-B).
-                # 0x00 → (LO+0, HI+0).
-                ("ADDR_B2_LO+0", 2.0),
-                ("ADDR_B2_HI+0", 2.0),
+                # B7-7: hard +50 ADDR_B2 gate (was soft +2 per B6-B).
+                # 0x00 → (LO+0, HI+0).  Combined with ADDR_B0_VALID +50
+                # and IN_STEP_FRESH +50 for lifecycle gating.
+                ("ADDR_B2_LO+0", 50.0),
+                ("ADDR_B2_HI+0", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                ("IN_STEP_FRESH", 50.0),
                 ("MARK_AX", -1_000_000_000.0),
                 ("MARK_PC", -1_000_000_000.0),
                 ("MARK_SP", -1_000_000_000.0),
@@ -3874,8 +3936,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=35.0,
-            active_value=500.0,
+            # B7-7: threshold raised from 35 to 140 so the structural-dim
+            # evidence (ADDR_B2 lanes + ADDR_B0_VALID + IN_STEP_FRESH) is
+            # jointly required for firing.
+            threshold=140.0,
+            active_value=50.0,
             max_abs_weight=1_000_000_000.0,
         ),
         # B6-B / B4-H Path 2: rule J (addr byte 3 → 0x00 global) — L13 only
@@ -3924,10 +3989,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             active_value=500.0,
             max_abs_weight=1_000_000_000.0,
         ),
-        # B6-B / B4-H Path 2: rule K (0xF8 mod-local) augmented with soft
-        # ADDR_B0 evidence (LO+8 / HI+15 → 0xF8).  Strength stays at 500.
-        # Note MEM_ADDR_SRC is blocked, so L13's mem-addr gather may not
-        # populate ADDR_B0 — soft only.
+        # B7-7 / B4-H Path 2: rule K (0xF8 mod-local) upgraded from soft
+        # +2.0 ADDR_B0 evidence to hard +50 ADDR_B0 gate combined with
+        # ADDR_B0_VALID (B7-4) and IN_STEP_FRESH (B7-1).  Note: this rule
+        # has MEM_ADDR_SRC blocked, so L13's mem-addr gather may not fully
+        # populate ADDR_B0 — the structural evidence still strengthens the
+        # proof when present and IN_STEP_FRESH provides the freshness gate.
+        # active_value reduced from 500 to 50 per the ≤10k cap.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_f8_from_mod_local_exact",
             expected_byte=0xF8,
@@ -3947,10 +4015,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ALU_LO+7", 5.0),
                 ("ALU_LO+10", -10.0),
                 ("ALU_LO+14", -10.0),
-                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
-                # 0xF8 → (LO+8, HI+15).
-                ("ADDR_B0_LO+8", 2.0),
-                ("ADDR_B0_HI+15", 2.0),
+                # B7-7: hard +50 ADDR_B0 gate (was soft +2 per B6-B).
+                # 0xF8 → (LO+8, HI+15).  Combined with ADDR_B0_VALID +50
+                # and IN_STEP_FRESH +50 for lifecycle gating.
+                ("ADDR_B0_LO+8", 50.0),
+                ("ADDR_B0_HI+15", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                ("IN_STEP_FRESH", 50.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -3965,12 +4036,18 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=28.0,
-            active_value=500.0,
+            # B7-7: threshold raised from 28 to 140 so the structural-dim
+            # evidence (LO+8 / HI+15 / VALID / FRESH = +200) is jointly
+            # required for firing.
+            threshold=140.0,
+            active_value=50.0,
         ),
-        # B6-B / B4-H Path 2: rule L (0xE0 local-offset) augmented with soft
-        # ADDR_B0 evidence (LO+0 / HI+14 → 0xE0).  Strength stays at 50_000
-        # (legitimate downstream consumers expect this magnitude).
+        # B7-7 / B4-H Path 2: rule L (0xE0 local-offset) upgraded from soft
+        # +2.0 ADDR_B0 evidence to hard +50 ADDR_B0 gate combined with
+        # ADDR_B0_VALID (B7-4) and IN_STEP_FRESH (B7-1).  active_value
+        # reduced from 50000 to 50 per the ≤10k cap (the structural dims
+        # provide decisive evidence, so raw magnitude is no longer the
+        # disambiguator).
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_local_offset_exact",
             expected_byte=0xE0,
@@ -3997,10 +4074,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ALU_LO+8", 5.0),
                 ("ALU_LO+7", -10.0),
                 ("ALU_LO+10", -20.0),
-                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
-                # 0xE0 → (LO+0, HI+14).
-                ("ADDR_B0_LO+0", 2.0),
-                ("ADDR_B0_HI+14", 2.0),
+                # B7-7: hard +50 ADDR_B0 gate (was soft +2 per B6-B).
+                # 0xE0 → (LO+0, HI+14).  Combined with ADDR_B0_VALID +50
+                # and IN_STEP_FRESH +50 for lifecycle gating.
+                ("ADDR_B0_LO+0", 50.0),
+                ("ADDR_B0_HI+14", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                ("IN_STEP_FRESH", 50.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -4015,8 +4095,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=40.0,
-            active_value=50000.0,
+            # B7-7: threshold raised from 40 to 140 so the structural-dim
+            # evidence (LO+0 / HI+14 / VALID / FRESH = +200) is jointly
+            # required for firing.
+            threshold=140.0,
+            active_value=50.0,
         ),
         # B5-D / B4-H Path 2: rule M (0xE0 PSH-at-SP) — bounded strength +
         # ADDR_B0 evidence boost.  Original strength=5e9 was outvoting the
@@ -4080,8 +4163,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             # rec_factorial / rec_fib correctness past the base case.
             writes=byte_writes(0xE0, strength=1_000_000.0),
         ),
-        # B6-B / B4-H Path 2: rule N (0xE0 JSR-local) augmented with soft
-        # ADDR_B0 evidence (LO+0 / HI+14 → 0xE0).  Strength stays at 5000.
+        # B7-7 / B4-H Path 2: rule N (0xE0 JSR-local) upgraded from soft
+        # +2.0 ADDR_B0 evidence to hard +50 ADDR_B0 gate combined with
+        # ADDR_B0_VALID (B7-4) and IN_STEP_FRESH (B7-1).  active_value
+        # reduced from 5000 to 50 per the ≤10k cap.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_jsr_local_exact",
             expected_byte=0xE0,
@@ -4099,10 +4184,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ALU_LO+14", 0.01),
                 ("CMP+0", -100.0),
                 ("OP_ENT", -1000.0),
-                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
-                # 0xE0 → (LO+0, HI+14).
-                ("ADDR_B0_LO+0", 2.0),
-                ("ADDR_B0_HI+14", 2.0),
+                # B7-7: hard +50 ADDR_B0 gate (was soft +2 per B6-B).
+                # 0xE0 → (LO+0, HI+14).  Combined with ADDR_B0_VALID +50
+                # and IN_STEP_FRESH +50 for lifecycle gating.
+                ("ADDR_B0_LO+0", 50.0),
+                ("ADDR_B0_HI+14", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                ("IN_STEP_FRESH", 50.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -4117,8 +4205,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=80.0,
-            active_value=5000.0,
+            # B7-7: threshold raised from 80 to 140 so the structural-dim
+            # evidence (LO+0 / HI+14 / VALID / FRESH = +200) is jointly
+            # required for firing.
+            threshold=140.0,
+            active_value=50.0,
         ),
         # B5-D / B4-H Path 2: rule O (tail_mem_store_addr0_e0_from_jsr_local_strong)
         # was byte-identical to rule N (same conditions / threshold /
@@ -4126,8 +4217,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # N variant alone carries the 0xE0 JSR-local proof and the bounded
         # 5000 active_value is sufficient now that rule M is no longer
         # producing 5e9 residual to compete against.
-        # B6-B / B4-H Path 2: rule P (0xE8 nested-local) augmented with soft
-        # ADDR_B0 evidence (LO+8 / HI+14 → 0xE8).  Strength stays at 500.
+        # B7-7 / B4-H Path 2: rule P (0xE8 nested-local) upgraded from soft
+        # +2.0 ADDR_B0 evidence to hard +50 ADDR_B0 gate combined with
+        # ADDR_B0_VALID (B7-4) and IN_STEP_FRESH (B7-1).  active_value
+        # reduced from 500 to 50 per the ≤10k cap.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e8_from_nested_local_exact",
             expected_byte=0xE8,
@@ -4147,10 +4240,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ALU_LO+10", 5.0),
                 ("ALU_LO+7", -10.0),
                 ("ALU_LO+14", -10.0),
-                # Soft positive evidence from L13 ADDR_B0 lanes (B6-B).
-                # 0xE8 → (LO+8, HI+14).
-                ("ADDR_B0_LO+8", 2.0),
-                ("ADDR_B0_HI+14", 2.0),
+                # B7-7: hard +50 ADDR_B0 gate (was soft +2 per B6-B).
+                # 0xE8 → (LO+8, HI+14).  Combined with ADDR_B0_VALID +50
+                # and IN_STEP_FRESH +50 for lifecycle gating.
+                ("ADDR_B0_LO+8", 50.0),
+                ("ADDR_B0_HI+14", 50.0),
+                ("ADDR_B0_VALID", 50.0),
+                ("IN_STEP_FRESH", 50.0),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -4165,8 +4261,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=40.0,
-            active_value=500.0,
+            # B7-7: threshold raised from 40 to 140 so the structural-dim
+            # evidence (LO+8 / HI+14 / VALID / FRESH = +200) is jointly
+            # required for firing.
+            threshold=140.0,
+            active_value=50.0,
         ),
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e8_from_local_frame_addr_exact",
