@@ -148,6 +148,11 @@ def all_core_ops(
         make_format_pointer_extraction_op(
             enable_conversational_io=enable_conversational_io
         ),
+        # B7-2 (phase=7.6): SP_BYTE0_IS_F8 producer. Adds head-6 V/O slots
+        # 6 and 7 that detect the carry-forwarded SP byte 0 == 0xF8 from
+        # the MARK_SP row's EMBED_LO+8 / EMBED_HI+15 (set by L3 head 2).
+        # See ``make_layer7_sp_byte0_is_f8_op`` docstring.
+        make_layer7_sp_byte0_is_f8_op(),
         # L8 attn head 6 AX_CARRY refresh from prev step AX marker OUTPUT
         # (commit 3d1b700). Always registered for the staleness analyzer
         # (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md) so its
