@@ -347,48 +347,55 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         writes=Primitives.byte_value_writes(0xE8, strength=50.0 / S),
     ))
 
-    # Generic e0 stack-top STACK0 byte materializer.  After a PSH then IMM (or
-    # any non-store opcode that leaves SP=0xffe0), the visible stack top is the
-    # previously pushed value.  L6/upstream stage that byte in ALU_LO/HI at the
-    # STACK0 marker; mirror the e8/f8 materializers to project it onto
-    # OUTPUT_LO/HI.  Keep this strictly non-store, non-JSR/ENT/LEV, and exclude
-    # the e8 lookalike via the ADDR_B0_LO+8 negative weight so PSH/SI rows at
-    # 0xffe8 do not co-fire.
-    stack0_e0_marker_conditions = (
-        ("MARK_STACK0", 1.0),
-        ("HAS_SE", 1.0),
-        ("ADDR_B0_LO+0", 10.0),
-        ("ADDR_B0_LO+8", -2.0),
-        ("ADDR_B0_HI+14", 1.0),
-        ("ADDR_B0_HI+15", -2.0),
-        ("IS_BYTE", -10.0),
-        ("OP_JSR", -10.0),
-        ("OP_ENT", -100.0),
-        ("OP_LEV", -10.0),
-        ("MEM_STORE", -20.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_MEM", -300.0),
-    )
-    stack0_e0_marker_threshold = 12.0
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l16_stack0_e0_marker_from_alu_lo_{k}",
-            conditions=stack0_e0_marker_conditions,
-            threshold=stack0_e0_marker_threshold,
-            gate=f"ALU_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
-        ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l16_stack0_e0_marker_from_alu_hi_{k}",
-            conditions=stack0_e0_marker_conditions,
-            threshold=stack0_e0_marker_threshold,
-            gate=f"ALU_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
-        ))
+    # Generic ALU->OUTPUT STACK0 byte materializer for an x0 stack signature
+    # (ADDR_B0_LO+0 active, ADDR_B0_HI+`hi_active` positive, opposite HI nibble
+    # `hi_blocker` negative). After a PSH then IMM (or any non-store opcode
+    # that leaves SP at the slot), the visible stack top is the previously
+    # pushed value. L6/upstream stage that byte in ALU_LO/HI at the STACK0
+    # marker; project it onto OUTPUT_LO/HI. Suppress the LO+8 (e8/f8) lookalike
+    # so PSH/SI rows at sibling slots do not co-fire; negative MEM_STORE keeps
+    # current-store rows on the L14/L15 store materializer;
+    # OP_JSR/OP_ENT/OP_LEV blockers preserve function-call boundary ownership.
+    def _add_stack0_x0_alu_materializer(
+        sig: str, hi_active: int, hi_blocker: int
+    ) -> None:
+        conditions = (
+            ("MARK_STACK0", 1.0),
+            ("HAS_SE", 1.0),
+            ("ADDR_B0_LO+0", 10.0),
+            ("ADDR_B0_LO+8", -2.0),
+            (f"ADDR_B0_HI+{hi_active}", 1.0),
+            (f"ADDR_B0_HI+{hi_blocker}", -2.0),
+            ("IS_BYTE", -10.0),
+            ("OP_JSR", -10.0),
+            ("OP_ENT", -100.0),
+            ("OP_LEV", -10.0),
+            ("MEM_STORE", -20.0),
+            ("MARK_PC", -10.0),
+            ("MARK_AX", -10.0),
+            ("MARK_SP", -10.0),
+            ("MARK_BP", -10.0),
+            ("MARK_MEM", -300.0),
+        )
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l16_stack0_{sig}_marker_from_alu_lo_{k}",
+                conditions=conditions,
+                threshold=12.0,
+                gate=f"ALU_LO+{k}",
+                writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
+            ))
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l16_stack0_{sig}_marker_from_alu_hi_{k}",
+                conditions=conditions,
+                threshold=12.0,
+                gate=f"ALU_HI+{k}",
+                writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
+            ))
+
+    # SP=0xffe0 (saved-frame top after two pushes, B6-D's original target).
+    _add_stack0_x0_alu_materializer("e0", hi_active=14, hi_blocker=15)
 
     stack0_f8_marker_conditions = (
         ("MARK_STACK0", 1.0),
@@ -423,6 +430,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             gate=f"ALU_HI+{k}",
             writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
         ))
+
+    # SP=0xfff0 (single-local frame top after one PSH of the local's value).
+    _add_stack0_x0_alu_materializer("f0", hi_active=15, hi_blocker=14)
 
     stack0_e8_output_authoritative_conditions = (
         ("MARK_STACK0", 1_000_000_000.0),
@@ -1427,8 +1437,10 @@ def make_layer16_lev_routing_op() -> Operation:
         # false-positive LEV SP materializers, 254 nonzero staged-byte e8
         # STACK0 output authority guards, plus one e0/e8 STACK0 exactness
         # guard, plus 32 generic e0 STACK0 marker ALU materializers (16 LO + 16
-        # HI) for non-store preserve at SP=0xffe0.
-        ffn_units_used=728,
+        # HI) for non-store preserve at SP=0xffe0, plus 32 generic f0 STACK0
+        # marker ALU materializers (16 LO + 16 HI) for non-store preserve at
+        # SP=0xfff0 (single-local frames).
+        ffn_units_used=760,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
