@@ -2266,6 +2266,17 @@ class _SetDim:
     # Section 2.1 and B6-K Section 5 for the design.
     SP_BYTE0_IS_F8 = 95
 
+    # --- ADDR_B0 lifecycle ("VALID" bit, B7-4 / B6-K slot 97) ---
+    # Single dim written 1.0 by L13 mem-addr-gather alongside the ADDR_B0_LO/HI
+    # one-hots at MEM val byte positions. L10 tail addr0 family consumes this
+    # to disambiguate "ADDR_B0 lanes carry freshly-computed nibbles" from
+    # "ADDR_B0 lanes are stale residue from a previous step or unrelated row".
+    # Reclaimed from the B6-K dead-H5/H6/H7 reserve (slots 95-115). Slot 97
+    # aliases H5+2; L0 still writes H5 there but never reads it, and L13 only
+    # writes ADDR_B0_VALID at the MEM val byte positions where the ADDR_B0
+    # gather completed so the two writers do not collide at consumer rows.
+    ADDR_B0_VALID = 97
+
     # --- L1 fine thresholds + HAS_SE ---
     L1H0 = 116
     L1H1 = 123

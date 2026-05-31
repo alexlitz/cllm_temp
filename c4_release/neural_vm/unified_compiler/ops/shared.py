@@ -664,6 +664,12 @@ def declare_setdim_compat_dims(
         # layout is stable. IO_FORMAT_POS@468 aliases MEM_EXEC.
         "OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP", "MEM_EXEC",
         "OPCODE_BASE",
+        # B7-4 / B6-K slot 97: ADDR_B0 lifecycle "VALID" bit. Written 1.0 by
+        # L13 mem-addr-gather at MEM val byte positions whenever the ADDR_B0
+        # one-hot lanes carry freshly-computed nibbles. L10 tail addr0 family
+        # gates on this to distinguish fresh ADDR_B0 evidence from stale
+        # residue (see B4-H tail-correction-family PLAN §3.2).
+        "ADDR_B0_VALID",
         # Conversational I/O state (aliases noted in _SetDim):
         # IO_FORMAT_POS@468 aliases MEM_EXEC, IO_IN_OUTPUT_MODE@469 and
         # IO_OUTPUT_COMPLETE@470 are dedicated, LAST_WAS_BYTE@503 is
