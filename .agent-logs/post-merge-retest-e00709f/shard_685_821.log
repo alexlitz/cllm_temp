@@ -1,0 +1,179 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.6, pytest-9.0.2, pluggy-1.6.0
+Device: cuda
+GPU Available: True
+CUDA Version: 12.8
+Compiled Weights: Not implemented
+rootdir: /home/alexlitz/Documents/misc/c4_release/.claude/worktrees/agent-ab109c1b66a8df174/c4_release
+configfile: pyproject.toml
+plugins: timeout-2.4.0, anyio-4.12.0
+collected 1 item
+
+c4_release/tests/test_1096_neural_declarative_diagnostic.py [1096-progress] mode=final-output phase=start rows=0/137 batch=8 ids=0685-0692 max_steps=20
+[1096-progress] mode=final-output phase=done rows=8/137 batch=8 ids=0685-0692 max_steps=20
+[1096-progress] mode=final-output phase=start rows=8/137 batch=8 ids=0693-0700 max_steps=20
+[1096-progress] mode=final-output phase=done rows=16/137 batch=8 ids=0693-0700 max_steps=20
+[1096-progress] mode=final-output phase=start rows=16/137 batch=8 ids=0701-0708 max_steps=116
+[1096-progress] mode=final-output phase=done rows=24/137 batch=8 ids=0701-0708 max_steps=116
+[1096-progress] mode=final-output phase=start rows=24/137 batch=8 ids=0709-0716 max_steps=196
+[1096-progress] mode=final-output phase=done rows=32/137 batch=8 ids=0709-0716 max_steps=196
+[1096-progress] mode=final-output phase=start rows=32/137 batch=8 ids=0717-0724 max_steps=196
+[1096-progress] mode=final-output phase=done rows=40/137 batch=8 ids=0717-0724 max_steps=196
+[1096-progress] mode=final-output phase=start rows=40/137 batch=8 ids=0725-0732 max_steps=3185
+[1096-progress] mode=final-output phase=done rows=48/137 batch=8 ids=0725-0732 max_steps=3185
+[1096-progress] mode=final-output phase=start rows=48/137 batch=8 ids=0733-0740 max_steps=8369
+[1096-progress] mode=final-output phase=done rows=56/137 batch=8 ids=0733-0740 max_steps=8369
+[1096-progress] mode=final-output phase=start rows=56/137 batch=8 ids=0741-0748 max_steps=5165
+[1096-progress] mode=final-output phase=done rows=64/137 batch=8 ids=0741-0748 max_steps=5165
+[1096-progress] mode=final-output phase=start rows=64/137 batch=8 ids=0749-0756 max_steps=737
+[1096-progress] mode=final-output phase=done rows=72/137 batch=8 ids=0749-0756 max_steps=737
+[1096-progress] mode=final-output phase=start rows=72/137 batch=8 ids=0757-0764 max_steps=256
+[1096-progress] mode=final-output phase=done rows=80/137 batch=8 ids=0757-0764 max_steps=256
+[1096-progress] mode=final-output phase=start rows=80/137 batch=8 ids=0765-0772 max_steps=296
+[1096-progress] mode=final-output phase=done rows=88/137 batch=8 ids=0765-0772 max_steps=296
+[1096-progress] mode=final-output phase=start rows=88/137 batch=8 ids=0773-0780 max_steps=276
+[1096-progress] mode=final-output phase=done rows=96/137 batch=8 ids=0773-0780 max_steps=276
+[1096-progress] mode=final-output phase=start rows=96/137 batch=8 ids=0781-0788 max_steps=133
+[1096-progress] mode=final-output phase=done rows=104/137 batch=8 ids=0781-0788 max_steps=133
+[1096-progress] mode=final-output phase=start rows=104/137 batch=8 ids=0789-0796 max_steps=156
+[1096-progress] mode=final-output phase=done rows=112/137 batch=8 ids=0789-0796 max_steps=156
+[1096-progress] mode=final-output phase=start rows=112/137 batch=8 ids=0797-0804 max_steps=156
+[1096-progress] mode=final-output phase=done rows=120/137 batch=8 ids=0797-0804 max_steps=156
+[1096-progress] mode=final-output phase=start rows=120/137 batch=8 ids=0805-0812 max_steps=8
+[1096-progress] mode=final-output phase=done rows=128/137 batch=8 ids=0805-0812 max_steps=8
+[1096-progress] mode=final-output phase=start rows=128/137 batch=8 ids=0813-0820 max_steps=8
+[1096-progress] mode=final-output phase=done rows=136/137 batch=8 ids=0813-0820 max_steps=8
+[1096-progress] mode=final-output phase=start rows=136/137 batch=1 ids=0821-0821 max_steps=8
+[1096-progress] mode=final-output phase=done rows=137/137 batch=1 ids=0821-0821 max_steps=8
+[1096-diag] id=0685 mode=final-output status=neural-divergence suite_decl=match desc='func_min_10: min(43, 87)' expected=43 decl=43 decl_steps=20 neural=87 first_token_divergence=step0:MEM_value0 abs=234 gen=30 expected=0x0a neural=0x00 residual_diagnosis=no-residual-divergence-on-teacher-forced-prefix block=27 layer=27 label='block27 layer=27 width=2059' expected=0x0a argmax=0x0a expected_logit=+10.00 argmax_logit=+10.00 margin=+5.00 neural_logit=-4.00 OUT_LO[10]=+2.00 arg=10/+2.00 OUT_HI[0]=+1.00 arg=0/+1.00 band_contracts=OK expected_byte=0x0a OUTPUT_LO[expected_low]:expected=10 winner=10 margin=+2 OUTPUT_HI[expected_high]:expected=0 winner=0 margin=+1 projection_diag=OUTPUT_LO[expected_low]:projected winner=10;OUTPUT_HI[expected_high]:projected winner=0
+[1096-diag] id=0687 mode=final-output status=neural-divergence suite_decl=match desc='func_min_12: min(41, 81)' expected=41 decl=41 decl_steps=20 neural=81 first_token_divergence=step0:MEM_value0 abs=234 gen=30 expected=0x0a neural=0x00 residual_diagnosis=no-residual-divergence-on-teacher-forced-prefix block=27 layer=27 label='block27 layer=27 width=2059' expected=0x0a argmax=0x0a expected_logit=+10.00 argmax_logit=+10.00 margin=+5.00 neural_logit=-4.00 OUT_LO[10]=+2.00 arg=10/+2.00 OUT_HI[0]=+1.00 arg=0/+1.00 band_contracts=OK expected_byte=0x0a OUTPUT_LO[expected_low]:expected=10 winner=10 margin=+2 OUTPUT_HI[expected_high]:expected=0 winner=0 margin=+1 projection_diag=OUTPUT_LO[expected_low]:projected winner=10;OUTPUT_HI[expected_high]:projected winner=0
+[1096-diag] id=0688 mode=final-output status=neural-divergence suite_decl=match desc='func_min_13: min(92, 98)' expected=92 decl=92 decl_steps=20 neural=98 first_token_divergence=step0:MEM_value0 abs=234 gen=30 expected=0x0a neural=0x00 residual_diagnosis=no-residual-divergence-on-teacher-forced-prefix block=27 layer=27 label='block27 layer=27 width=2059' expected=0x0a argmax=0x0a expected_logit=+10.00 argmax_logit=+10.00 margin=+5.00 neural_logit=-4.00 OUT_LO[10]=+2.00 arg=10/+2.00 OUT_HI[0]=+1.00 arg=0/+1.00 band_contracts=OK expected_byte=0x0a OUTPUT_LO[expected_low]:expected=10 winner=10 margin=+2 OUTPUT_HI[expected_high]:expected=0 winner=0 margin=+1 projection_diag=OUTPUT_LO[expected_low]:projected winner=10;OUTPUT_HI[expected_high]:projected winner=0
+[1096-diag] id=0689 mode=final-output status=neural-divergence suite_decl=match desc='func_min_14: min(63, 70)' expected=63 decl=63 decl_steps=20 neural=70 first_token_divergence=step0:MEM_value0 abs=234 gen=30 expected=0x0a neural=0x00 residual_diagnosis=no-residual-divergence-on-teacher-forced-prefix block=27 layer=27 label='block27 layer=27 width=2059' expected=0x0a argmax=0x0a expected_logit=+10.00 argmax_logit=+10.00 margin=+5.00 neural_logit=-4.00 OUT_LO[10]=+2.00 arg=10/+2.00 OUT_HI[0]=+1.00 arg=0/+1.00 band_contracts=OK expected_byte=0x0a OUTPUT_LO[expected_low]:expected=10 winner=10 margin=+2 OUTPUT_HI[expected_high]:expected=0 winner=0 margin=+1 projection_diag=OUTPUT_LO[expected_low]:projected winner=10;OUTPUT_HI[expected_high]:projected winner=0
+[1096-diag] id=0690 mode=final-output status=neural-divergence suite_decl=match desc='func_min_15: min(5, 80)' expected=5 decl=5 decl_steps=20 neural=0 first_token_divergence=step0:MEM_value0 abs=234 gen=30 expected=0x0a neural=0x00 residual_diagnosis=no-residual-divergence-on-teacher-forced-prefix block=27 layer=27 label='block27 layer=27 width=2059' expected=0x0a argmax=0x0a expected_logit=+20.00 argmax_logit=+20.00 margin=+4.00 neural_logit=+16.00 OUT_LO[10]=+2.00 arg=10/+2.00 OUT_HI[0]=+3.00 arg=0/+3.00 band_contracts=DRIFT expected_byte=0x0a OUTPUT_LO[expected_low]:expected=10 winner=10 margin=+1 OUTPUT_HI[expected_high]:expected=0 winner=0 margin=+3 violations=OUTPUT_LO[0]/inactive_too_high:obs=1:limit=0.2 projection_diag=OUTPUT_LO[expected_low]:projected winner=10;OUTPUT_HI[expected_high]:projected winner=0
+[1096-diag] id=0691 mode=final-output status=neural-divergence suite_decl=match desc='func_min_16: min(9, 31)' expected=9 decl=9 decl_steps=20 neural=0 first_token_divergence=step0:MEM_value0 abs=234 gen=30 expected=0x0a neural=0x00 residual_diagnosis=no-residual-divergence-on-teacher-forced-prefix block=27 layer=27 label='block27 layer=27 width=2059' expected=0x0a argmax=0x0a expected_logit=+20.00 argmax_logit=+20.00 margin=+4.00 neural_logit=+16.00 OUT_LO[10]=+2.00 arg=10/+2.00 OUT_HI[0]=+3.00 arg=0/+3.00 band_contracts=DRIFT expected_byte=0x0a OUTPUT_LO[expected_low]:expected=10 winner=10 margin=+1 OUTPUT_HI[expected_high]:expected=0 winner=0 margin=+3 violations=OUTPUT_LO[0]/inactive_too_high:obs=1:limit=0.2 projection_diag=OUTPUT_LO[expected_low]:projected winner=10;OUTPUT_HI[expected_high]:projected winner=0
+[1096-diag] id=0692 mode=final-output status=neural-divergence suite_decl=match desc='func_min_17: min(81, 88)' expected=81 decl=81 decl_steps=20 neural=0 first_token_divergence=step0:MEM_value0 abs=234 gen=30 expected=0x0a neural=0x00 residual_diagnosis=no-residual-divergence-on-teacher-forced-prefix block=27 layer=27 label='block27 layer=27 width=2059' expected=0x0a argmax=0x0a expected_logit=+20.00 argmax_logit=+20.00 margin=+4.00 neural_logit=+16.00 OUT_LO[10]=+2.00 arg=10/+2.00 OUT_HI[0]=+3.00 arg=0/+3.00 band_contracts=DRIFT expected_byte=0x0a OUTPUT_LO[expected_low]:expected=10 winner=10 margin=+1 OUTPUT_HI[expected_high]:expected=0 winner=0 margin=+3 violations=OUTPUT_LO[0]/inactive_too_high:obs=1:limit=0.2 projection_diag=OUTPUT_LO[expected_low]:projected winner=10;OUTPUT_HI[expected_high]:projected winner=0
+[1096-diag] id=0693 mode=final-output status=neural-divergence suite_decl=match desc='func_min_18: min(37, 30)' expected=30 decl=30 decl_steps=20 neural=0 first_token_divergence=step0:MEM_value0 abs=234 gen=30 expected=0x0a neural=0x00 residual_diagnosis=no-residual-divergence-on-teacher-forced-prefix block=27 layer=27 label='block27 layer=27 width=2059' expected=0x0a argmax=0x0a expected_logit=+20.00 argmax_logit=+20.00 margin=+4.00 neural_logit=+16.00 OUT_LO[10]=+2.00 arg=10/+2.00 OUT_HI[0]=+3.00 arg=0/+3.00 band_contracts=DRIFT expected_byte=0x0a OUTPUT_LO[expected_low]:expected=10 winner=10 margin=+1 OUTPUT_HI[expected_high]:expected=0 winner=0 margin=+3 violations=OUTPUT_LO[0]/inactive_too_high:obs=1:limit=0.2 projection_diag=OUTPUT_LO[expected_low]:projected winner=10;OUTPUT_HI[expected_high]:projected winner=0
+[1096-diag] id=0694 mode=final-output status=neural-divergence suite_decl=match desc='func_min_19: min(96, 12)' expected=12 decl=12 decl_steps=20 neural=0
+[1096-diag] id=0695 mode=final-output status=neural-divergence suite_decl=match desc='func_min_20: min(56, 13)' expected=13 decl=13 decl_steps=20 neural=0
+[1096-diag] id=0697 mode=final-output status=neural-divergence suite_decl=match desc='func_min_22: min(91, 13)' expected=13 decl=13 decl_steps=20 neural=0
+[1096-diag] id=0700 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_0: 0!' expected=1 decl=1 decl_steps=16 neural=None
+[1096-diag] id=0701 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_1: 0!' expected=1 decl=1 decl_steps=16 neural=None
+[1096-diag] id=0702 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_2: 5!' expected=120 decl=120 decl_steps=96 neural=1
+[1096-diag] id=0703 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_3: 0!' expected=1 decl=1 decl_steps=16 neural=None
+[1096-diag] id=0704 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_4: 4!' expected=24 decl=24 decl_steps=76 neural=1
+[1096-diag] id=0705 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_5: 5!' expected=120 decl=120 decl_steps=96 neural=1
+[1096-diag] id=0706 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_6: 5!' expected=120 decl=120 decl_steps=96 neural=1
+[1096-diag] id=0707 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_7: 6!' expected=720 decl=720 decl_steps=116 neural=1
+[1096-diag] id=0708 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_8: 2!' expected=2 decl=2 decl_steps=36 neural=1
+[1096-diag] id=0709 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_9: 3!' expected=6 decl=6 decl_steps=56 neural=1
+[1096-diag] id=0710 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_10: 8!' expected=40320 decl=40320 decl_steps=156 neural=0
+[1096-diag] id=0711 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_11: 6!' expected=720 decl=720 decl_steps=116 neural=1
+[1096-diag] id=0712 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_12: 9!' expected=362880 decl=362880 decl_steps=176 neural=0
+[1096-diag] id=0713 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_13: 10!' expected=3628800 decl=3628800 decl_steps=196 neural=1
+[1096-diag] id=0714 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_14: 2!' expected=2 decl=2 decl_steps=36 neural=1
+[1096-diag] id=0715 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_15: 2!' expected=2 decl=2 decl_steps=36 neural=1
+[1096-diag] id=0716 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_16: 2!' expected=2 decl=2 decl_steps=36 neural=1
+[1096-diag] id=0718 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_18: 9!' expected=362880 decl=362880 decl_steps=176 neural=0
+[1096-diag] id=0719 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_19: 6!' expected=720 decl=720 decl_steps=116 neural=1
+[1096-diag] id=0720 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_20: 9!' expected=362880 decl=362880 decl_steps=176 neural=0
+[1096-diag] id=0721 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_21: 10!' expected=3628800 decl=3628800 decl_steps=196 neural=1
+[1096-diag] id=0722 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_22: 3!' expected=6 decl=6 decl_steps=56 neural=1
+[1096-diag] id=0723 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_23: 7!' expected=5040 decl=5040 decl_steps=136 neural=1
+[1096-diag] id=0724 mode=final-output status=neural-divergence suite_decl=match desc='rec_factorial_24: 9!' expected=362880 decl=362880 decl_steps=176 neural=0
+[1096-diag] id=0725 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_0: fib(2)' expected=1 decl=1 decl_steps=53 neural=0
+[1096-diag] id=0726 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_1: fib(3)' expected=2 decl=2 decl_steps=89 neural=0
+[1096-diag] id=0727 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_2: fib(7)' expected=13 decl=13 decl_steps=737 neural=0
+[1096-diag] id=0728 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_3: fib(10)' expected=55 decl=55 decl_steps=3185 neural=0
+[1096-diag] id=0729 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_4: fib(4)' expected=3 decl=3 decl_steps=161 neural=0
+[1096-diag] id=0730 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_5: fib(7)' expected=13 decl=13 decl_steps=737 neural=0
+[1096-diag] id=0731 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_6: fib(4)' expected=3 decl=3 decl_steps=161 neural=0
+[1096-diag] id=0732 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_7: fib(10)' expected=55 decl=55 decl_steps=3185 neural=0
+[1096-diag] id=0734 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_9: fib(12)' expected=144 decl=144 decl_steps=8369 neural=0
+[1096-diag] id=0735 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_10: fib(7)' expected=13 decl=13 decl_steps=737 neural=0
+[1096-diag] id=0736 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_11: fib(4)' expected=3 decl=3 decl_steps=161 neural=0
+[1096-diag] id=0737 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_12: fib(10)' expected=55 decl=55 decl_steps=3185 neural=0
+[1096-diag] id=0738 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_13: fib(8)' expected=21 decl=21 decl_steps=1205 neural=0
+[1096-diag] id=0739 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_14: fib(2)' expected=1 decl=1 decl_steps=53 neural=0
+[1096-diag] id=0740 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_15: fib(1)' expected=1 decl=1 decl_steps=17 neural=0
+[1096-diag] id=0741 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_16: fib(7)' expected=13 decl=13 decl_steps=737 neural=0
+[1096-diag] id=0742 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_17: fib(5)' expected=5 decl=5 decl_steps=269 neural=0
+[1096-diag] id=0743 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_18: fib(9)' expected=34 decl=34 decl_steps=1961 neural=0
+[1096-diag] id=0744 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_19: fib(4)' expected=3 decl=3 decl_steps=161 neural=0
+[1096-diag] id=0745 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_20: fib(10)' expected=55 decl=55 decl_steps=3185 neural=0
+[1096-diag] id=0746 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_21: fib(6)' expected=8 decl=8 decl_steps=449 neural=0
+[1096-diag] id=0747 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_22: fib(11)' expected=89 decl=89 decl_steps=5165 neural=0
+[1096-diag] id=0748 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_23: fib(4)' expected=3 decl=3 decl_steps=161 neural=0
+[1096-diag] id=0749 mode=final-output status=neural-divergence suite_decl=match desc='rec_fib_24: fib(7)' expected=13 decl=13 decl_steps=737 neural=0
+[1096-diag] id=0750 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_0: sum(1..14)' expected=105 decl=105 decl_steps=296 neural=0
+[1096-diag] id=0751 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_1: sum(1..5)' expected=15 decl=15 decl_steps=116 neural=0
+[1096-diag] id=0752 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_2: sum(1..4)' expected=10 decl=10 decl_steps=96 neural=0
+[1096-diag] id=0753 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_3: sum(1..7)' expected=28 decl=28 decl_steps=156 neural=0
+[1096-diag] id=0754 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_4: sum(1..14)' expected=105 decl=105 decl_steps=296 neural=0
+[1096-diag] id=0755 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_5: sum(1..8)' expected=36 decl=36 decl_steps=176 neural=0
+[1096-diag] id=0756 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_6: sum(1..2)' expected=3 decl=3 decl_steps=56 neural=0
+[1096-diag] id=0757 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_7: sum(1..4)' expected=10 decl=10 decl_steps=96 neural=0
+[1096-diag] id=0758 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_8: sum(1..7)' expected=28 decl=28 decl_steps=156 neural=0
+[1096-diag] id=0759 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_9: sum(1..10)' expected=55 decl=55 decl_steps=216 neural=0
+[1096-diag] id=0760 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_10: sum(1..6)' expected=21 decl=21 decl_steps=136 neural=0
+[1096-diag] id=0761 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_11: sum(1..10)' expected=55 decl=55 decl_steps=216 neural=0
+[1096-diag] id=0762 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_12: sum(1..5)' expected=15 decl=15 decl_steps=116 neural=0
+[1096-diag] id=0763 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_13: sum(1..12)' expected=78 decl=78 decl_steps=256 neural=0
+[1096-diag] id=0764 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_14: sum(1..5)' expected=15 decl=15 decl_steps=116 neural=0
+[1096-diag] id=0765 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_15: sum(1..1)' expected=1 decl=1 decl_steps=36 neural=0
+[1096-diag] id=0766 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_16: sum(1..14)' expected=105 decl=105 decl_steps=296 neural=0
+[1096-diag] id=0767 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_17: sum(1..11)' expected=66 decl=66 decl_steps=236 neural=0
+[1096-diag] id=0768 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_18: sum(1..7)' expected=28 decl=28 decl_steps=156 neural=0
+[1096-diag] id=0769 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_19: sum(1..5)' expected=15 decl=15 decl_steps=116 neural=0
+[1096-diag] id=0770 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_20: sum(1..1)' expected=1 decl=1 decl_steps=36 neural=0
+[1096-diag] id=0771 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_21: sum(1..10)' expected=55 decl=55 decl_steps=216 neural=0
+[1096-diag] id=0772 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_22: sum(1..14)' expected=105 decl=105 decl_steps=296 neural=0
+[1096-diag] id=0773 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_23: sum(1..11)' expected=66 decl=66 decl_steps=236 neural=0
+[1096-diag] id=0774 mode=final-output status=neural-divergence suite_decl=match desc='rec_sum_24: sum(1..13)' expected=91 decl=91 decl_steps=276 neural=0
+[1096-diag] id=0775 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_0: 2^4' expected=16 decl=16 decl_steps=110 neural=4294901761
+[1096-diag] id=0776 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_1: 5^6' expected=15625 decl=15625 decl_steps=156 neural=4294901761
+[1096-diag] id=0777 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_2: 4^6' expected=4096 decl=4096 decl_steps=156 neural=4294901761
+[1096-diag] id=0778 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_3: 3^4' expected=81 decl=81 decl_steps=110 neural=4294901761
+[1096-diag] id=0779 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_4: 4^1' expected=4 decl=4 decl_steps=41 neural=4294901761
+[1096-diag] id=0780 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_5: 3^4' expected=81 decl=81 decl_steps=110 neural=4294901761
+[1096-diag] id=0781 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_6: 4^5' expected=1024 decl=1024 decl_steps=133 neural=4294901761
+[1096-diag] id=0782 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_7: 3^5' expected=243 decl=243 decl_steps=133 neural=4294901761
+[1096-diag] id=0783 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_8: 2^5' expected=32 decl=32 decl_steps=133 neural=4294901761
+[1096-diag] id=0784 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_9: 2^2' expected=4 decl=4 decl_steps=64 neural=4294901761
+[1096-diag] id=0786 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_11: 4^5' expected=1024 decl=1024 decl_steps=133 neural=4294901761
+[1096-diag] id=0788 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_13: 4^2' expected=16 decl=16 decl_steps=64 neural=4294901761
+[1096-diag] id=0789 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_14: 5^1' expected=5 decl=5 decl_steps=41 neural=4294901761
+[1096-diag] id=0790 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_15: 3^1' expected=3 decl=3 decl_steps=41 neural=4294901761
+[1096-diag] id=0791 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_16: 4^4' expected=256 decl=256 decl_steps=110 neural=4294901761
+[1096-diag] id=0792 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_17: 4^6' expected=4096 decl=4096 decl_steps=156 neural=4294901761
+[1096-diag] id=0793 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_18: 3^2' expected=9 decl=9 decl_steps=64 neural=4294901761
+[1096-diag] id=0794 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_19: 5^6' expected=15625 decl=15625 decl_steps=156 neural=4294901761
+[1096-diag] id=0795 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_20: 4^5' expected=1024 decl=1024 decl_steps=133 neural=4294901761
+[1096-diag] id=0796 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_21: 4^6' expected=4096 decl=4096 decl_steps=156 neural=4294901761
+[1096-diag] id=0797 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_22: 2^3' expected=8 decl=8 decl_steps=87 neural=4294901761
+[1096-diag] id=0798 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_23: 2^1' expected=2 decl=2 decl_steps=41 neural=4294901761
+[1096-diag] id=0799 mode=final-output status=neural-divergence suite_decl=match desc='rec_power_24: 3^6' expected=729 decl=729 decl_steps=156 neural=4294901761
+[1096-diag] id=0800 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_0: 22+24*22' expected=550 decl=550 decl_steps=8 neural=None
+[1096-diag] id=0801 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_1: 13+28*26' expected=741 decl=741 decl_steps=8 neural=None
+[1096-diag] id=0802 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_2: 18+12*3' expected=54 decl=54 decl_steps=8 neural=None
+[1096-diag] id=0803 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_3: 26+13*1' expected=39 decl=39 decl_steps=8 neural=26
+[1096-diag] id=0804 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_4: 9+18*4' expected=81 decl=81 decl_steps=8 neural=None
+[1096-diag] id=0805 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_5: 15+12*22' expected=279 decl=279 decl_steps=8 neural=276
+[1096-diag] id=0806 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_6: 24+22*9' expected=222 decl=222 decl_steps=8 neural=None
+[1096-diag] id=0807 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_7: 19+13*27' expected=370 decl=370 decl_steps=8 neural=None
+[1096-diag] id=0808 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_8: 21+12*4' expected=69 decl=69 decl_steps=8 neural=None
+[1096-diag] id=0809 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_9: 22+8*16' expected=150 decl=150 decl_steps=8 neural=None
+[1096-diag] id=0810 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_10: 1+20*29' expected=581 decl=581 decl_steps=8 neural=None
+[1096-diag] id=0811 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_11: 18+11*30' expected=348 decl=348 decl_steps=8 neural=None
+[1096-diag] id=0812 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_12: 20+8*21' expected=188 decl=188 decl_steps=8 neural=None
+[1096-diag] id=0813 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_13: 3+21*27' expected=570 decl=570 decl_steps=8 neural=None
+[1096-diag] id=0814 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_14: 15+30*23' expected=705 decl=705 decl_steps=8 neural=None
+[1096-diag] id=0815 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_15: 10+21*14' expected=304 decl=304 decl_steps=8 neural=315
+[1096-diag] id=0816 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_16: 4+5*2' expected=14 decl=14 decl_steps=8 neural=15
+[1096-diag] id=0817 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_17: 2+10*16' expected=162 decl=162 decl_steps=8 neural=170
+[1096-diag] id=0819 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_19: 29+18*5' expected=119 decl=119 decl_steps=8 neural=91
+[1096-diag] id=0820 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_20: 13+15*12' expected=193 decl=193 decl_steps=8 neural=195
+[1096-diag] id=0821 mode=final-output status=neural-divergence suite_decl=match desc='expr_add_mul_21: 22+24*23' expected=574 decl=574 decl_steps=8 neural=576
+[1096-summary] mode=final-output selected=137 ok=9 divergences=128 errors=0 suite_mismatches=0
+.
+
+======================== 1 passed in 2252.40s (0:37:32) ========================
