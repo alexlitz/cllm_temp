@@ -2256,6 +2256,16 @@ class _SetDim:
     H6 = 102
     H7 = 109
 
+    # --- B7-2: SP_BYTE0_IS_F8 structural dim ---
+    # Aliases slot 95 (H5+0, formerly L0 head 5 MARK_PC threshold-14.5 output;
+    # H5/H6/H7 are dead per B6-K's BD dim usage map — no downstream consumer
+    # ever reads them, so the L0 contribution at slot 95 is residual noise we
+    # tolerate via a high consumer threshold). Set to 1.0 by L7 head 6's new
+    # V/O slot at MARK_SP rows when SP byte 0 == 0xF8 (i.e. carry-forwarded
+    # EMBED_LO+8 AND EMBED_HI+15 both fire). See B6-G L7-L9 structural audit
+    # Section 2.1 and B6-K Section 5 for the design.
+    SP_BYTE0_IS_F8 = 95
+
     # --- L1 fine thresholds + HAS_SE ---
     L1H0 = 116
     L1H1 = 123
