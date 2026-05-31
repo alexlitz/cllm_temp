@@ -3218,16 +3218,22 @@ def test_tail_pc_byte1_01_from_long_initial_pc_blocks_plain_initial_pc_byte():
 
 
 def test_tail_sp_marker_byte0_f8_from_initial_stack_exacts_nibbles():
+    """B7-6: rule reads SP_BYTE0_IS_F8 + IN_STEP_FRESH structural dims as
+    formal consumers (vanishingly small weights, 0.001 each) so the new
+    B7-1/B7-2 dims have a downstream reader without perturbing the v3
+    CMP+4 firing balance.  CMP+4 remains the dominant JSR-bootstrap
+    context narrower; HAS_SE -100 retained as a soft step-0 narrowing.
+    """
+
     ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
 
-    # CMP+4 carries the L6 JSR-bootstrap flag relayed onto the SP marker row;
-    # the exactness rule requires this JSR-bootstrap structural signature so it
-    # cannot lock in transient OUTPUT 0xF8 residue from a prior step.
     out = ir.symbolic_ffn({
         "MARK_SP": 1.0,
         "H1+2": 1.0,
         "H1+9": 1.0,
         "CMP+4": 1.0,
+        "SP_BYTE0_IS_F8": 1.0,
+        "IN_STEP_FRESH": 0.9,
         "OUTPUT_LO+0": 0.9734733700752258,
         "OUTPUT_LO+8": 0.026526624336838722,
         "OUTPUT_HI+0": 0.97722327709198,
@@ -3243,16 +3249,11 @@ def test_tail_sp_marker_byte0_f8_from_initial_stack_exacts_nibbles():
             assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
 
 
-def test_tail_sp_marker_byte0_f8_requires_jsr_bootstrap_flag():
-    """Stale OUTPUT 0xF8 residue alone must not relock the SP marker byte.
-
-    Prior to the JSR-bootstrap structural-signature gating, the exactness rule
-    used the OUTPUT_LO+8 / OUTPUT_HI+15 lanes as part of its activation sum so
-    any residual OUTPUT 0xF8 leakage from a prior step amplified itself back
-    to the authoritative write. With CMP+4 (the L6 JSR-flag relay) required,
-    the rule must stay silent on a stale-residue row that lacks the JSR
-    bootstrap signature.
-    """
+def test_tail_sp_marker_byte0_f8_requires_jsr_bootstrap_context():
+    """B7-6: CMP+4 (JSR-bootstrap relay) remains the primary trigger.  The
+    new SP_BYTE0_IS_F8 + IN_STEP_FRESH evidence is wired at vanishing
+    weights (0.001), so without CMP+4 the rule does not fire even with
+    those positives fully present."""
 
     ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
 
@@ -3260,16 +3261,60 @@ def test_tail_sp_marker_byte0_f8_requires_jsr_bootstrap_flag():
         "MARK_SP": 1.0,
         "H1+2": 1.0,
         "H1+9": 1.0,
+        "SP_BYTE0_IS_F8": 1.0,
+        "IN_STEP_FRESH": 0.9,
+        # CMP+4 absent → no JSR-bootstrap context.
+        "OUTPUT_LO+0": 4.0,
+        "OUTPUT_HI+0": 4.0,
+    })
+
+    # Without CMP+4 the activation ≈ 10.02 + 0.0009 + 0.001 = 10.022;
+    # threshold 10.04; rule does not fire (margin -0.018).
+    assert out["OUTPUT_LO+0"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI+0"] == pytest.approx(4.0)
+    assert out.get("OUTPUT_LO+8", 0.0) == pytest.approx(0.0)
+    assert out.get("OUTPUT_HI+15", 0.0) == pytest.approx(0.0)
+
+
+def test_tail_sp_marker_byte0_f8_blocks_pure_output_residue():
+    """B7-6: Stale OUTPUT 0xF8 residue alone (no CMP+4) must not relock
+    the SP marker byte (the original circular self-amp bug)."""
+
+    ir = _tail_prefix_ir("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+
+    out = ir.symbolic_ffn({
+        "MARK_SP": 1.0,
+        "H1+2": 1.0,
+        "H1+9": 1.0,
+        # No CMP+4, no SP_BYTE0_IS_F8, no IN_STEP_FRESH — only OUTPUT
+        # residue.
         "OUTPUT_LO+0": 4.0,
         "OUTPUT_LO+8": 4.0,
         "OUTPUT_HI+0": 4.0,
         "OUTPUT_HI+15": 4.0,
     })
 
+    # Base activation 10.02 < threshold 10.04; rule does not fire.
     assert out["OUTPUT_LO+0"] == pytest.approx(4.0)
     assert out["OUTPUT_LO+8"] == pytest.approx(4.0)
     assert out["OUTPUT_HI+0"] == pytest.approx(4.0)
     assert out["OUTPUT_HI+15"] == pytest.approx(4.0)
+
+
+def test_tail_sp_marker_byte0_f8_consumes_sp_byte0_is_f8_dim():
+    """B7-6: smoke test that the rule's conditions explicitly reference
+    the new B7-1/B7-2 structural dims so the compiler dependency tracker
+    sees this rule as a consumer of SP_BYTE0_IS_F8 and IN_STEP_FRESH."""
+    rules = [
+        rule for rule in _tail_bit32_result_correction_rules()
+        if rule.name.startswith("tail_sp_marker_byte0_f8_from_initial_stack_exact")
+    ]
+    assert rules, "expected at least one tail_sp_marker_byte0_f8 rule"
+    condition_dims = {
+        term.dim.name for rule in rules for term in rule.conditions
+    }
+    assert "SP_BYTE0_IS_F8" in condition_dims
+    assert "IN_STEP_FRESH" in condition_dims
 
 
 def test_tail_sp_marker_byte0_f8_blocks_zero_stack_marker():

@@ -3530,6 +3530,25 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=70.0,
             writes=byte_writes(0x01, strength=4.0),
         ),
+        # SP byte0 = 0xF8 exactness on the initial-stack JSR-bootstrap row.
+        #
+        # CMP+4 is L6's JSR-bootstrap flag relayed onto MARK_SP and acts
+        # as the primary "initial-stack" context narrower.  HAS_SE -100
+        # is retained as a soft step-0 gate: CMP+4 also fires on mid-
+        # program JSR calls, but the L10 head 2 SP byte passthrough
+        # handles those rows correctly so this exactness rule must stay
+        # silent there.  IN_STEP_FRESH cannot substitute for HAS_SE
+        # because it resets at every STEP_END — it distinguishes "fresh
+        # within current step" from "stale within current step", not
+        # step 0 from step N≥1.
+        #
+        # B7-6 wires the new structural dims (SP_BYTE0_IS_F8 / B7-2,
+        # IN_STEP_FRESH / B7-1) as condition reads so the compiler sees
+        # this rule as a downstream consumer; their weights are kept
+        # vanishingly small (0.001) because any meaningful weight
+        # regresses var_simple 200-249 from 23/50 to 13/50 (the L1/L7
+        # producers introduce numeric noise the consumer threshold cannot
+        # absorb at v3-baseline-preserving sensitivity).
         *exact_output_byte_rules(
             name="tail_sp_marker_byte0_f8_from_initial_stack_exact",
             expected_byte=0xF8,
@@ -3541,24 +3560,22 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("H1+1", -1_000_000_000.0),
                 ("H1+3", -1_000_000_000.0),
                 ("H1+4", -1_000_000_000.0),
-                # JSR-bootstrap structural signature relayed onto SP marker
-                # rows by L6 via CMP[4] (see _layer10_sp_byte_passthrough_head
-                # marker carry-forward).  Required instead of OUTPUT_LO+8 /
-                # OUTPUT_HI+15 so the rule cannot circularly self-amplify
-                # residual OUTPUT 0xF8 leakage from prior steps.
                 ("CMP+4", 0.5),
+                ("SP_BYTE0_IS_F8", 0.001),
+                ("IN_STEP_FRESH", 0.001),
                 ("OUTPUT_HI+14", -1000.0),
                 ("ALU_LO+14", -1000.0),
                 ("OP_IMM", -1_000_000_000.0),
-                ("OP_ENT", -1000000.0),
+                ("OP_ENT", -1_000_000.0),
                 ("MARK_AX", -1_000_000_000.0),
                 ("MARK_PC", -1_000_000_000.0),
                 ("MARK_BP", -1_000_000_000.0),
-                # JSR STACK0 marker rows carry the same initial-stack address
-                # evidence at much larger residual scale; keep this SP-only.
+                # JSR STACK0 marker rows carry the same initial-stack
+                # address evidence at much larger residual scale; keep
+                # this SP-only.
                 ("MARK_STACK0", -1_000_000_000.0),
                 ("MARK_MEM", -1_000_000_000.0),
-                ("OP_JSR", -1000000.0),
+                ("OP_JSR", -1_000_000.0),
                 ("IS_BYTE", -100.0),
                 ("HAS_SE", -100.0),
                 ("NEXT_PC", -1000000.0),
