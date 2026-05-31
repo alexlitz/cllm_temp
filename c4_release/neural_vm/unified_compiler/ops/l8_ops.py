@@ -464,8 +464,12 @@ def make_layer8_sp_gather_bake_op() -> Operation:
 
     # Dim-ownership claims: L8 attn heads 0-2 SP gather (SP bytes → ADDR_B*).
     # Each head writes V slots 1..32 reading CLEAN_EMBED_LO/HI.
+    # D3: heads 6/7 are dedicated MARK_SP mirrors of j=0/j=1 — they write
+    # the same V band (CLEAN_EMBED_LO/HI → slots 1..32) and output to
+    # ADDR_B0_*/ADDR_B1_* respectively. Claims declared here so the
+    # registry sees the head 6/7 V ownership.
     _claims = set()
-    for h in range(3):
+    for h in (0, 1, 2, 6, 7):
         for k in range(16):
             _claims.add((8, "attn_W_v", f"{h}_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
             _claims.add((8, "attn_W_v", f"{h}_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
@@ -473,7 +477,7 @@ def make_layer8_sp_gather_bake_op() -> Operation:
     return Operation(
         name="layer8_sp_gather_bake",
         phase=8.0,
-        reads={"MARK_STACK0", "MARK_BP", "H1", "H3", "H4",
+        reads={"MARK_STACK0", "MARK_SP", "MARK_BP", "H1", "H3", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CMP", "CONST"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI",
@@ -518,26 +522,57 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
                 head_idx=j,
                 q=(
                     AP(0, BD.MARK_STACK0, L),
-                    # B7-3 (B6-G Section 3.1 fix): also fire at MARK_SP so
-                    # ADDR_B0/B1/B2 carry a fresh in-step SP-derived address
-                    # at MARK_SP rows (not just residual leakage from
-                    # MARK_STACK0). 2*L coefficient is deliberately strong
-                    # enough that MARK_SP rows still beat the existing
-                    # H1+SP_I=-L suppressor (H1[SP] propagates into
-                    # MARK_SP marker rows too, so the suppressor would zero
-                    # out a +L MARK_SP contribution). SP byte rows still
-                    # have MARK_SP=0, so their score stays at -L (suppressed
-                    # as before).
-                    AP(0, BD.MARK_SP, 2 * L),
                     AP(0, BD.H4 + BP_I, L),
                     AP(0, BD.H1 + AX_I, -L),
                     AP(0, BD.H1 + SP_I, -L),
                     AP(0, BD.H3 + MEM_I, -L),
                     AP(0, BD.MARK_BP, -L),
                     AP(33, BD.MARK_STACK0, L),
-                    # B7-3: anti-leakage gate also needs to admit MARK_SP
-                    # queries so slot-33 contributes positively (instead of
-                    # the default -L*L/2 from the CONST=-L/2 baseline).
+                    AP(33, BD.CONST, -L / 2),
+                ),
+                k=(
+                    AP(0, byte_idx_dim, L),
+                    AP(0, BD.H1 + SP_I, L),
+                    AP(0, BD.CMP + 3, -L),
+                    AP(33, BD.CONST, L),
+                ),
+                v=(
+                    _band_projection_writes(1, BD.CLEAN_EMBED_LO)
+                    + _band_projection_writes(17, BD.CLEAN_EMBED_HI)
+                ),
+                o=(
+                    _band_output_writes(addr_lo_out, 1)
+                    + _band_output_writes(addr_hi_out, 17)
+                ),
+            )
+        )
+
+    # D3: dedicated MARK_SP mirror heads. The original B7-3 fix added
+    # ``MARK_SP`` firing to heads 0-2 so ADDR_B0/B1 would carry a fresh
+    # in-step SP-derived address at MARK_SP rows (feeding IN_STEP_FRESH /
+    # SP_BYTE0_IS_F8 / ADDR_B0_VALID consumers). That bled into L10/L16
+    # consumers authored against the MARK_STACK0-only Q semantics,
+    # doubling SP_byte0 fatals across the 1096 suite. D3 relocates the
+    # MARK_SP firing onto dedicated heads 6 and 7 (mirrors of j=0/j=1
+    # respectively) so the heads-0-2 Q semantics revert to MARK_STACK0
+    # only. Heads 6 and 7 are otherwise reserved for the
+    # ``make_layer8_head6_ax_carry_refresh_op`` and ``make_layer8_mem_to_alu_op``
+    # bakes, both ``enable=False`` by default so the physical head slots
+    # are free in the production build.
+    for mirror_j, head_idx in ((0, 6), (1, 7)):
+        byte_idx_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][mirror_j]
+        addr_lo_out = [BD.ADDR_B0_LO, BD.ADDR_B1_LO, BD.ADDR_B2_LO][mirror_j]
+        addr_hi_out = [BD.ADDR_B0_HI, BD.ADDR_B1_HI, BD.ADDR_B2_HI][mirror_j]
+        specs.append(
+            DeclarativeAttentionHeadSpec(
+                head_idx=head_idx,
+                q=(
+                    AP(0, BD.MARK_SP, 2 * L),
+                    AP(0, BD.H4 + BP_I, L),
+                    AP(0, BD.H1 + AX_I, -L),
+                    AP(0, BD.H1 + SP_I, -L),
+                    AP(0, BD.H3 + MEM_I, -L),
+                    AP(0, BD.MARK_BP, -L),
                     AP(33, BD.MARK_SP, L),
                     AP(33, BD.CONST, -L / 2),
                 ),
