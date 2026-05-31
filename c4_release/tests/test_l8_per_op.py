@@ -19,15 +19,12 @@ L8 op:
 2. Fires-during-bake — each claim-bearing L8 op must dispatch and emit
    at least one observable write under the shared verifier.
 
-3. **B6-G design-gap symbolic forward** (xfail): the L8 SP gather
-   (``layer8_sp_gather_bake`` heads 0-2) is documented to fire at
-   MARK_STACK0 only, NOT at MARK_SP — see Section 3.1 of B6-G's audit
-   ``.agent-logs/l7-l9-structural-audit/REPORT.md`` (commit 8d7d86a on
-   ``investigation/l7-l9-structural-audit``). When a synthetic residual
-   is fed in with MARK_SP set as the query position, the gather heads
-   should NOT produce an ADDR_B* write — that is the missing in-step
-   producer the L10 tail-correction family currently has to work around.
-   This test codifies the gap and stays xfail until B7-2 lands.
+3. **SP-gather symbolic forwards**: confirm ``layer8_sp_gather_bake``
+   heads 0-2 fire at BOTH MARK_STACK0 (baseline) AND MARK_SP, writing the
+   gathered SP byte to ADDR_B0_LO/HI. The MARK_SP path closes the B6-G
+   Section 3.1 design gap (``.agent-logs/l7-l9-structural-audit/REPORT.md``)
+   that previously forced L10 tail rules to read residual MARK_STACK0
+   leakage at MARK_SP rows.
 
 4. ADD lo-nibble carry-out symbolic forward — drive the L8 ALU lookup
    path with operands that overflow the lo nibble (a + b >= 16) and
@@ -238,50 +235,27 @@ def test_l8_sp_gather_fires_at_mark_stack0_baseline() -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "B6-G structural-signal audit finding (Section 3.1, .agent-logs/"
-        "l7-l9-structural-audit/REPORT.md on investigation/l7-l9-structural-"
-        "audit @ 8d7d86a): layer8_sp_gather_bake heads 0-2 Q-gate is "
-        "AP(0, MARK_STACK0, L) only, NOT MARK_SP. L10 tail rules (rule A "
-        "and family at l10_ops.py:3450-4100) consume ADDR_B0_LO/HI at "
-        "MARK_SP rows -- but those values are residual leakage from "
-        "MARK_STACK0, not a fresh in-step gather. B7-2 (proposed in B6-G "
-        "Section 2.5) extends the Q-side to AP(0, MARK_SP, L). Until B7-2 "
-        "lands this test stays xfail to codify the gap so future drift "
-        "into 'gather fires at MARK_SP' is loud rather than silent."
-    ),
-    strict=True,
-)
-def test_l8_sp_gather_does_not_fire_at_mark_sp_b6g_gap() -> None:
-    """B6-G design gap: heads 0-2 do NOT fire when query position is MARK_SP.
+def test_l8_sp_gather_fires_at_mark_sp() -> None:
+    """L8 SP gather heads 0-2 fire at MARK_SP as well as MARK_STACK0.
 
-    Drives the gather with the same SP byte values as the baseline above,
-    but the query position carries MARK_SP=1 (and H1[SP_I]=1, both of
-    which the bake's Q-side actively suppresses with -L coefficients).
-    The expected behavior given today's bake is that no recognisable
-    ADDR_B0 one-hot lands at the MARK_SP row -- the band stays near zero
-    or carries irrelevant softmax garbage.
-
-    Marked ``xfail(strict=True)``: if the assertion below ever PASSES
-    (i.e. the gather DOES fire at MARK_SP), B7-2 has landed and this
-    test should flip to ``xpass`` -- at which point the xfail marker
-    should be removed and the assertion polarity flipped (gap closed).
+    ADDR_B0/B1/B2 at MARK_SP rows must carry a fresh in-step SP-derived
+    address rather than residual leakage from MARK_STACK0 — the L10
+    tail-correction family at ``l10_ops.py:3450-4100`` consumes these
+    bands at MARK_SP rows. Without the MARK_SP Q-side gate the gather
+    only fires at MARK_STACK0 and L10 reads stale residue (B6-G Section
+    3.1, ``.agent-logs/l7-l9-structural-audit/REPORT.md``).
     """
     attn = _build_sp_gather_attn()
     x = _sp_byte_layout(query_position="MARK_SP")
     with torch.no_grad():
         y = attn(x)
     lo, hi = _addr_b0_argmax(y, _QUERY_POS)
-    # When B7-2 lands the gather will write ADDR_B0_LO+8 / ADDR_B0_HI+15
-    # at the MARK_SP query row, mirroring the MARK_STACK0 baseline. Today
-    # that does not happen and this assertion fails (xfail registered).
-    # Future flip-to-xpass signals B7-2 has landed.
     assert lo == 0x8 and hi == 0xF, (
         f"L8 SP gather did not fire at MARK_SP: ADDR_B0 argmax=({lo}, {hi}); "
-        f"this confirms B6-G Section 3.1's gap. ADDR_B0 band energy at "
-        f"MARK_SP row: {_addr_b0_band_energy(y, _QUERY_POS):.4f} "
-        f"(vs MARK_STACK0 baseline ~2.0)."
+        f"expected (8, 15) for SP byte 0=0xF8. ADDR_B0 band energy at "
+        f"MARK_SP row: {_addr_b0_band_energy(y, _QUERY_POS):.4f} (vs "
+        f"MARK_STACK0 baseline ~2.0). Check the AP(0, MARK_SP, 2*L) Q-gate "
+        f"in _layer8_sp_gather_head_specs and _set_layer8_sp_gather."
     )
 
 
