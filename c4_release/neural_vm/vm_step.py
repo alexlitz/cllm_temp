@@ -2256,6 +2256,16 @@ class _SetDim:
     H6 = 102
     H7 = 109
 
+    # --- B7 structural lifecycle dims (aliased onto H5/H6/H7 "dead" range) ---
+    # H5/H6/H7 (slots 95-115) are written by ``layer0_threshold_attn`` but
+    # have no downstream consumer (see ``investigation/bd-dim-usage-map``
+    # REPORT Section 3). B7-5 reclaims slot 98 for SP_GATHERED_THIS_STEP:
+    # a single-dim sentinel set to 1.0 at MARK_SP query positions by L8
+    # FFN, signalling that the L8 SP gather (heads 0-2) has fired in the
+    # current step. Consumed by L10 tail_sp_marker_* rules as positive
+    # in-step evidence (replaces HAS_SE -1e9 negative hammer).
+    SP_GATHERED_THIS_STEP = 98  # aliases H5+3 (dead L0 head 5 BP slot)
+
     # --- L1 fine thresholds + HAS_SE ---
     L1H0 = 116
     L1H1 = 123

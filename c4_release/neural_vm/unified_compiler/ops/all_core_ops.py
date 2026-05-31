@@ -178,6 +178,11 @@ def all_core_ops(
         # op in the registry for topology/claims coverage, but leave the bake
         # off until MEM value-byte address keys exist before L8.
         make_layer8_mem_to_alu_op(enable=False),
+        # B7-5 SP_GATHERED_THIS_STEP sentinel: marks MARK_SP rows with a
+        # single bit indicating L8's SP gather has fired this step. Phase
+        # 8.6 runs after all other L8 ops so the sentinel is visible to
+        # L9+ consumers without disturbing earlier-phase bakes.
+        make_layer8_sp_gathered_sentinel_op(),
         make_layer9_alu_op(alu_mode=alu_mode),
         make_layer9_lev_addr_relay_op(),
         make_layer9_lev_bp_to_pc_relay_op(),

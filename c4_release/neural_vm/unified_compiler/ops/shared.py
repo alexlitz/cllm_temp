@@ -682,6 +682,12 @@ def declare_setdim_compat_dims(
         "IO_IS_PRTF", "IO_IS_READ", "IO_STATE", "IO_OUTPUT_COUNT",
         "IO_IS_TOOL_CALL",
         "NEXT_IO_STATE_EMIT_BYTE", "NEXT_IO_STATE_EMIT_THINKING",
+        # B7-5 structural sentinel: 1.0 at MARK_SP positions after L8
+        # SP gather has fired in the current step. Produced by
+        # ``make_layer8_sp_gathered_sentinel_op`` (L8 FFN, phase 8.6);
+        # consumed by L10 tail_sp_marker_* rules. See
+        # ``investigation/bd-dim-usage-map`` REPORT Section 5.
+        "SP_GATHERED_THIS_STEP",
     ]
     # 7-dim threshold head outputs (one per marker type)
     seven_dim = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",
