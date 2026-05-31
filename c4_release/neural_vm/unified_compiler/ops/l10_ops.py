@@ -1560,13 +1560,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("MARK_MEM", 1.0),
             ("HAS_SE", 1.0),
             ("H1+4", 20.0),
-            # E3 fix: hard PC-row blocker. The existing MARK_PC=-100 weight
-            # was overwhelmed at PC byte0 rows by H1+0≈0.94 carrying enough
-            # signal for the 0xe8 writer (and siblings) to misfire on
-            # rec_power, emitting 0xe2 in the PC byte0 lane. Promoting H1+0
-            # to a -1M blocker (matching H1+1/2/3/10) cleanly suppresses any
-            # PC-row firing without affecting MEM rows (which sit on H1+4).
-            ("H1+0", -1_000_000.0),
             ("H1+1", -1_000_000.0),
             ("H1+2", -1_000_000.0),
             ("H1+3", -1_000_000.0),
@@ -3441,12 +3434,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_BP", -1000000.0),
                 ("NEXT_STACK0", -1000000.0),
                 ("NEXT_MEM", -1000000.0),
-                # E3 fix: block bootstrap-JSR misfire. Without this blocker
-                # the rule fires at step 0 of recursive programs (rec_fib)
-                # because the pc_byte_span_blocked whitelist exempts the
-                # tail_pc_byte0_1a_* family but the conditions here were not
-                # gated against OP_JSR.
-                ("OP_JSR", -1000000.0),
             ),
             threshold=250.0,
             writes=Primitives.byte_value_writes(0x1A, strength=5000.0),
@@ -3473,8 +3460,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_BP", -1000000.0),
                 ("NEXT_STACK0", -1000000.0),
                 ("NEXT_MEM", -1000000.0),
-                # E3 fix: see _bz variant above.
-                ("OP_JSR", -1000000.0),
             ),
             threshold=250.0,
             writes=Primitives.byte_value_writes(0x1A, strength=5000.0),
