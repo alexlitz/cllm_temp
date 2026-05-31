@@ -682,7 +682,15 @@ def declare_setdim_compat_dims(
         "IO_IS_PRTF", "IO_IS_READ", "IO_STATE", "IO_OUTPUT_COUNT",
         "IO_IS_TOOL_CALL",
         "NEXT_IO_STATE_EMIT_BYTE", "NEXT_IO_STATE_EMIT_THINKING",
-        # B7-5 structural sentinel: 1.0 at MARK_SP positions after L8
+        # B7-2 SP_BYTE0_IS_F8: L7 head-6 producer, 1.0 only when carry-forward
+        # proves SP byte 0 is 0xF8 (slot 95 — dead L0 H5+0).
+        "SP_BYTE0_IS_F8",
+        # B7-1 IN_STEP_FRESH: L1 head-5 producer with ALiBi slope 0.5,
+        # decays from 1.0 immediately after STEP_BOUNDARY toward 0.0;
+        # resets at next STEP_BOUNDARY. Replaces HAS_SE -1e9 hammer
+        # for L10 tail_* rules (slot 96 — dead L0 H5+1).
+        "IN_STEP_FRESH",
+        # B7-5 SP_GATHERED_THIS_STEP: 1.0 at MARK_SP positions after L8
         # SP gather has fired in the current step. Produced by
         # ``make_layer8_sp_gathered_sentinel_op`` (L8 FFN, phase 8.6);
         # consumed by L10 tail_sp_marker_* rules. See

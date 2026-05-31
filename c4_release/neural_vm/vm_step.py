@@ -2259,11 +2259,19 @@ class _SetDim:
     # --- B7 structural lifecycle dims (aliased onto H5/H6/H7 "dead" range) ---
     # H5/H6/H7 (slots 95-115) are written by ``layer0_threshold_attn`` but
     # have no downstream consumer (see ``investigation/bd-dim-usage-map``
-    # REPORT Section 3). B7-5 reclaims slot 98 for SP_GATHERED_THIS_STEP:
-    # a single-dim sentinel set to 1.0 at MARK_SP query positions by L8
-    # FFN, signalling that the L8 SP gather (heads 0-2) has fired in the
-    # current step. Consumed by L10 tail_sp_marker_* rules as positive
-    # in-step evidence (replaces HAS_SE -1e9 negative hammer).
+    # REPORT Section 3). B7 reclaims slots 95-98:
+    # - B7-2: SP_BYTE0_IS_F8 (slot 95) — L7 head-6 producer, 1.0 only when
+    #   carry-forward proves SP byte 0 is 0xF8.
+    # - B7-1: IN_STEP_FRESH (slot 96) — L1 head-5 producer with ALiBi slope
+    #   0.5, decays from 1.0 immediately after STEP_BOUNDARY toward 0.0 as
+    #   tokens accumulate; resets at next STEP_BOUNDARY. Consumed by L10
+    #   tail_* rules as positive in-step evidence (replaces HAS_SE -1e9
+    #   negative hammer).
+    # - B7-5: SP_GATHERED_THIS_STEP (slot 98) — single-dim sentinel set to
+    #   1.0 at MARK_SP query positions by L8 FFN, signalling that the L8
+    #   SP gather has fired in the current step.
+    SP_BYTE0_IS_F8 = 95         # aliases H5+0 (dead L0 head 5 PC slot)
+    IN_STEP_FRESH = 96          # aliases H5+1 (dead L0 head 5 AX slot)
     SP_GATHERED_THIS_STEP = 98  # aliases H5+3 (dead L0 head 5 BP slot)
 
     # --- L1 fine thresholds + HAS_SE ---
