@@ -22,20 +22,28 @@ def make_layer13_mem_addr_gather_op() -> Operation:
     # writes V slots 1..32 reading CLEAN_EMBED_LO/HI:
     #   W_v[h*HD + 1 + k, CLEAN_EMBED_LO + k]    for k=0..15
     #   W_v[h*HD + 17 + k, CLEAN_EMBED_HI + k]   for k=0..15
+    # Head 0 additionally writes slot 34's V row from L1H1+MEM_I and routes
+    # through W_o into ADDR_B0_VALID (B7-4 lifecycle bit; see setup_helpers
+    # ``_set_layer13_mem_addr_gather`` docstring).
     _claims = set()
     for h in range(3):
         for k in range(16):
             _claims.add((13, "attn_W_v", f"{h}_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
             _claims.add((13, "attn_W_v", f"{h}_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
+    # ADDR_B0_VALID lifecycle slot: head 0, slot 34, V row reads L1H1+MEM_I=4.
+    # Verifier decodes the col position via ``_pos_to_column`` which produces
+    # ``"<DIM>+<offset>"``; L1H1 has 7 lanes so MEM_I=4 lands at +4.
+    _claims.add((13, "attn_W_v", "0_34", "L1H1+4"))
 
     return Operation(
         name="layer13_mem_addr_gather",
         phase=13,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC", "OP_SI", "OP_SC",
-               "MEM_ADDR_SRC"},
+               "MEM_ADDR_SRC", "L1H1"},
         writes={"ADDR_B0_LO", "ADDR_B1_LO", "ADDR_B2_LO",
-                "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},
+                "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI",
+                "ADDR_B0_VALID"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,

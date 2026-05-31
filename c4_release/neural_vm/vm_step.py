@@ -2267,11 +2267,21 @@ class _SetDim:
     #   tokens accumulate; resets at next STEP_BOUNDARY. Consumed by L10
     #   tail_* rules as positive in-step evidence (replaces HAS_SE -1e9
     #   negative hammer).
+    # - B7-4: ADDR_B0_VALID (slot 97) — Single dim written 1.0 by L13
+    #   mem-addr-gather alongside the ADDR_B0_LO/HI one-hots at MEM val byte
+    #   positions. L10 tail addr0 family consumes this to disambiguate
+    #   "ADDR_B0 lanes carry freshly-computed nibbles" from "ADDR_B0 lanes
+    #   are stale residue from a previous step or unrelated row". Aliases
+    #   H5+2; L0 still writes H5 there but never reads it, and L13 only
+    #   writes ADDR_B0_VALID at the MEM val byte positions where the
+    #   ADDR_B0 gather completed so the two writers do not collide at
+    #   consumer rows.
     # - B7-5: SP_GATHERED_THIS_STEP (slot 98) — single-dim sentinel set to
     #   1.0 at MARK_SP query positions by L8 FFN, signalling that the L8
     #   SP gather has fired in the current step.
     SP_BYTE0_IS_F8 = 95         # aliases H5+0 (dead L0 head 5 PC slot)
     IN_STEP_FRESH = 96          # aliases H5+1 (dead L0 head 5 AX slot)
+    ADDR_B0_VALID = 97          # aliases H5+2 (dead L0 head 5 SP slot)
     SP_GATHERED_THIS_STEP = 98  # aliases H5+3 (dead L0 head 5 BP slot)
 
     # --- L1 fine thresholds + HAS_SE ---
