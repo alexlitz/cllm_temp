@@ -3943,9 +3943,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             active_value=50.0,
             max_abs_weight=1_000_000_000.0,
         ),
-        # B6-B / B4-H Path 2: rule J (addr byte 3 → 0x00 global) — L13 only
-        # writes ADDR_B0/B1/B2, so no analogous soft boost is available for
-        # byte 3.  Rule retained unchanged.
+        # C6 (Path 2): rule J fires at BYTE_INDEX_2 (MEM val byte 2 position)
+        # where L13 heads gather ADDR_B0/B1/B2 lanes into ALL MEM val byte
+        # positions. ADDR_B2 == 0x00 is the same honest signal rule I uses;
+        # wire it in as soft (+2.0) evidence to strengthen the global-store
+        # proof without becoming required.
         *exact_output_byte_rules(
             name="tail_mem_store_addr3_zero_from_global_exact",
             expected_byte=0x00,
@@ -3959,6 +3961,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_STORE", 5.0),
                 ("MEM_ADDR_SRC", 5.0),
                 ("PSH_AT_SP", -1000000.0),
+                ("ADDR_B2_LO+0", 2.0),
+                ("ADDR_B2_HI+0", 2.0),
                 ("OUTPUT_LO+0", 1.0),
                 ("OUTPUT_HI+0", 1.0),
                 ("OUTPUT_HI+14", -1000.0),
