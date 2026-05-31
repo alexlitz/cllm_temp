@@ -40,8 +40,8 @@ def test_layer16_lev_routing_ir_matches_legacy_helper():
     legacy_end = _set_layer16_lev_routing(expected, 100.0, _SetDim)
 
     assert legacy_end == 121
-    assert end == 728
-    assert len(_layer16_lev_routing_rules(100.0)) == 728
+    assert end == 760
+    assert len(_layer16_lev_routing_rules(100.0)) == 760
     _assert_same_ffn_prefix(actual, expected, legacy_end)
     assert actual.W_down[:, legacy_end:end].abs().sum() > 0
 
@@ -757,6 +757,104 @@ def test_layer16_stack0_f8_marker_materializes_from_alu():
     })
     assert current_store.get("OUTPUT_LO+11", 0.0) == 0.0
     assert current_store.get("OUTPUT_HI+2", 0.0) == 0.0
+
+
+def test_layer16_stack0_f0_marker_materializes_from_alu():
+    """SP=0xfff0 STACK0 materializer for single-local frames.
+
+    Mirrors the e0 generic pattern keyed on ADDR_B0_HI+15 (with the e0
+    lookalike via ADDR_B0_HI+14 negative, and the f8 lookalike via
+    ADDR_B0_LO+8 negative).
+    """
+    from neural_vm.unified_compiler.ir import CompilerIR
+
+    rules = {rule.name: rule for rule in _layer16_lev_routing_rules(100.0)}
+    lo = rules["l16_stack0_f0_marker_from_alu_lo_2"]
+    hi = rules["l16_stack0_f0_marker_from_alu_hi_4"]
+
+    condition_dims = {(term.dim.key(), term.weight) for term in lo.conditions}
+    assert ("MARK_STACK0+0", 1.0) in condition_dims
+    assert ("HAS_SE+0", 1.0) in condition_dims
+    assert ("ADDR_B0_LO+0", 10.0) in condition_dims
+    assert ("ADDR_B0_LO+8", -2.0) in condition_dims
+    assert ("ADDR_B0_HI+15", 1.0) in condition_dims
+    assert ("ADDR_B0_HI+14", -2.0) in condition_dims
+    assert ("MEM_STORE+0", -20.0) in condition_dims
+    assert ("OP_JSR+0", -10.0) in condition_dims
+    assert ("OP_ENT+0", -100.0) in condition_dims
+    assert ("OP_LEV+0", -10.0) in condition_dims
+    assert ("MARK_MEM+0", -300.0) in condition_dims
+    assert lo.threshold == 12.0
+    assert lo.gate.key() == "ALU_LO+2"
+    assert hi.gate.key() == "ALU_HI+4"
+    assert lo.writes[0].dim.key() == "OUTPUT_LO+2"
+    assert hi.writes[0].dim.key() == "OUTPUT_HI+4"
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend((lo, hi))
+
+    # Single-local frame stack top at SP=0xfff0 with ALU staging 0x42.
+    out = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 0.998,
+        "ADDR_B0_LO+0": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "ALU_LO+2": 0.994,
+        "ALU_HI+4": 0.994,
+    })
+    assert out["OUTPUT_LO+2"] > 0.0
+    assert out["OUTPUT_HI+4"] > 0.0
+
+    # Current store row must NOT fire (owned by L14/L15 store materializer).
+    current_store = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 1.0,
+        "ADDR_B0_LO+0": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "MEM_STORE": 0.4,
+        "ALU_LO+2": 1.0,
+        "ALU_HI+4": 1.0,
+    })
+    assert current_store.get("OUTPUT_LO+2", 0.0) == 0.0
+    assert current_store.get("OUTPUT_HI+4", 0.0) == 0.0
+
+    # f8 lookalike (ADDR_B0_LO+8 active) must NOT fire as the f0 family.
+    f8_lookalike = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 1.0,
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "ALU_LO+2": 1.0,
+        "ALU_HI+4": 1.0,
+    })
+    assert f8_lookalike.get("OUTPUT_LO+2", 0.0) == 0.0
+    assert f8_lookalike.get("OUTPUT_HI+4", 0.0) == 0.0
+
+    # e0 lookalike (ADDR_B0_HI+14 active) must NOT fire as the f0 family.
+    e0_lookalike = ir.symbolic_ffn({
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 1.0,
+        "ADDR_B0_LO+0": 1.0,
+        "ADDR_B0_HI+14": 1.0,
+        "ALU_LO+2": 1.0,
+        "ALU_HI+4": 1.0,
+    })
+    assert e0_lookalike.get("OUTPUT_LO+2", 0.0) == 0.0
+    assert e0_lookalike.get("OUTPUT_HI+4", 0.0) == 0.0
+
+    # JSR/ENT/LEV must suppress the f0 materializer.
+    for op_dim in ("OP_JSR", "OP_ENT", "OP_LEV"):
+        op_row = ir.symbolic_ffn({
+            "MARK_STACK0": 1.0,
+            "HAS_SE": 1.0,
+            "ADDR_B0_LO+0": 1.0,
+            "ADDR_B0_HI+15": 1.0,
+            "ALU_LO+2": 1.0,
+            "ALU_HI+4": 1.0,
+            op_dim: 5.0,
+        })
+        assert op_row.get("OUTPUT_LO+2", 0.0) == 0.0, op_dim
+        assert op_row.get("OUTPUT_HI+4", 0.0) == 0.0, op_dim
 
 
 def test_layer16_stack0_cancels_false_positive_lev_sp_value_materializer():
