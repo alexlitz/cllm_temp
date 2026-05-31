@@ -518,12 +518,27 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
                 head_idx=j,
                 q=(
                     AP(0, BD.MARK_STACK0, L),
+                    # B7-3 (B6-G Section 3.1 fix): also fire at MARK_SP so
+                    # ADDR_B0/B1/B2 carry a fresh in-step SP-derived address
+                    # at MARK_SP rows (not just residual leakage from
+                    # MARK_STACK0). 2*L coefficient is deliberately strong
+                    # enough that MARK_SP rows still beat the existing
+                    # H1+SP_I=-L suppressor (H1[SP] propagates into
+                    # MARK_SP marker rows too, so the suppressor would zero
+                    # out a +L MARK_SP contribution). SP byte rows still
+                    # have MARK_SP=0, so their score stays at -L (suppressed
+                    # as before).
+                    AP(0, BD.MARK_SP, 2 * L),
                     AP(0, BD.H4 + BP_I, L),
                     AP(0, BD.H1 + AX_I, -L),
                     AP(0, BD.H1 + SP_I, -L),
                     AP(0, BD.H3 + MEM_I, -L),
                     AP(0, BD.MARK_BP, -L),
                     AP(33, BD.MARK_STACK0, L),
+                    # B7-3: anti-leakage gate also needs to admit MARK_SP
+                    # queries so slot-33 contributes positively (instead of
+                    # the default -L*L/2 from the CONST=-L/2 baseline).
+                    AP(33, BD.MARK_SP, L),
                     AP(33, BD.CONST, -L / 2),
                 ),
                 k=(
