@@ -685,6 +685,13 @@ def declare_setdim_compat_dims(
         "IO_IS_PRTF", "IO_IS_READ", "IO_STATE", "IO_OUTPUT_COUNT",
         "IO_IS_TOOL_CALL",
         "NEXT_IO_STATE_EMIT_BYTE", "NEXT_IO_STATE_EMIT_THINKING",
+        # B7-2: SP_BYTE0_IS_F8 structural flag aliased onto dead L0 H5+0 slot
+        # (95). Producer is L7 head 6 (extended V/O slots in
+        # ``make_layer7_sp_byte0_is_f8_op``); consumer is the L10 tail
+        # ``tail_sp_marker_byte0_f8_from_initial_stack_exact`` family (B6-K
+        # Section 5). Declared so the compiler accepts producer reads/writes
+        # under pin_io_only layouts.
+        "SP_BYTE0_IS_F8",
     ]
     # 7-dim threshold head outputs (one per marker type)
     seven_dim = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",
