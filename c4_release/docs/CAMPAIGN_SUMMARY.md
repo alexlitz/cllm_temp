@@ -1,8 +1,13 @@
-# Neural-VM 1096-Test Campaign Summary (2026-05-29 / 2026-05-30)
+# Neural-VM 1096-Test Campaign Summary (2026-05-29 / 2026-05-30 / 2026-05-31)
 
-Base branch: `speedup-cache-and-buckets @ 4d069f7`
-Final head (C9): `e00709f` (B7-4 ADDR_B0_VALID landed)
-Owner: multi-agent campaign, 7 batches + follow-ups (C-units)
+Base branch: `speedup-cache-and-buckets`
+Heads of interest:
+- v2 baseline (clean, pre-architectural): `4d069f7`
+- e00709f (after B7-4 ADDR_B0_VALID landed; pre-B7-6/B7-7)
+- v4 (`integration/batch-merge-full-v4`, HEAD `10ab316`): foundation dims landed
+- **a03f600 (current HEAD)**: B7-6 + B7-7 consumer rewrites merged
+
+Owner: multi-agent campaign, 7 batches + C-units + D/E follow-ups
 
 ---
 
@@ -13,236 +18,305 @@ batched-KV functionality on the production pure-neural mode; and migrate the
 L10 tail-correction family from strength-escalating proxies to declarative
 upstream evidence.
 
-**Duration.** ~30 hours of agent work over 2026-05-29 -> 2026-05-30.
+**Duration.** ~50 hours of agent work over 2026-05-29 -> 2026-05-31.
 
-**Effort.** ~60 sub-agents spawned across 7 numbered batches (B1..B7) plus
-follow-up C-units (C1 retest, C2/C3 per-op harnesses, C9 this doc). The
-campaign produced ~70 commits on `speedup-cache-and-buckets` plus dozens of
-branches on `investigation/*`, `proposal/*`, `audit/*`, and `integration/*`.
+**Effort.** ~70 sub-agents spawned across 7 numbered batches (B1..B7), C-unit
+follow-ups (per-op harness coverage, doc), and a D/E debugging cycle. The
+campaign produced ~80 commits on `speedup-cache-and-buckets` plus dozens of
+branches on `investigation/*`, `proposal/*`, `audit/*`, `integration/*`,
+`refactor/*`, and `fix/*`.
 
-**Final pass rate.** 304/1096 = 27.7% on the declarations-only pure-neural
-path (per the C1 retest, which superseded mixed-handler numbers). The
-B7-6/B7-7 architectural cleanup is staged but not yet landed; v4 retest
-will measure that delta once B7 lands.
-
----
-
-## 2. Pass-rate progression
-
-| Phase | Pass | Total | Rate | Notes |
-|-------|-----:|------:|-----:|-------|
-| Pre-batch (mixed handlers + decl) | 387 | 1096 | 35.3% | misleading — counted handler-resident paths |
-| Pre-batch (pure-neural only) | ~298 | 1096 | 27.2% | true baseline for the campaign |
-| After batch 5 (v2 integration) | 304 | 1096 | 27.7% | +6 vs. pure-neural baseline |
-| After batch 7 (integration/final, B7-1..5 landed) | 304 | 1096 | 27.7% | structural dims allocated; consumers not yet rewired |
-| After v4 (B7-6/B7-7 land) | TBD | 1096 | TBD | pending L10 family rewrite |
-
-The headline metric did not move dramatically because the bulk of B6/B7 work
-was **structural plumbing** (new dims, new producers, new lifecycle bits).
-The pass-rate payoff arrives when B7-6 (L10 `tail_sp_marker_*` refactor) and
-B7-7 (L10 `tail_mem_store_addr0_*` refactor) consume those dims and drop the
-strength-escalating siblings.
-
-What did move: spec-decoding correctness (restored via `e7c4d63`),
-KV-eviction validation (`4d069f7` revalidated by B5-G), and the regression
-floor — B3-eta's ENT-main misfire and B2-A's step-5 misfire are no longer
-present in v2/v3.
+**Current pass rate.** 238/1096 = 21.7% on the declarations-only pure-neural
+path at `a03f600` (per the D1 8-shard retest, `audit/post-merge-retest-a03f600`).
+This is a **partial recovery** from the e00709f trough (229) but still **-66
+relative to the v2 baseline (304)**. The B7-9 lowering audit (revalidated on
+v4) confirms why: the B7 architectural cleanup eliminated most STACK0_byte0
+and AX_byte0 lowering misses, but introduced a brand-new SP_byte0 regression
+that more than offsets those wins.
 
 ---
 
-## 3. Bug catalog
+## 2. Pass-rate trajectory (revised)
 
-Bugs surfaced and tracked during the campaign. Status: F = fixed and
-landed; D = diagnosed with PLAN/REPORT; U = unresolved.
+| Head | Pass | Total | Rate | Delta vs v2 | Notes |
+|------|-----:|------:|-----:|------------:|-------|
+| **v2 baseline** (`4d069f7`) | 304 | 1096 | 27.7% | -- | clean pre-architectural baseline |
+| **e00709f** (post B7-4, pre B7-6/B7-7) | 229 | 1096 | 20.9% | **-75** | soft ADDR_B0 evidence (B5-D + B6-B) misfires; structural plumbing landed but consumers not rewired |
+| **v4** (`integration/batch-merge-full-v4`, `10ab316`) | 230 | 1096 | 21.0% | -74 | foundation dims B7-1..5 alone do not recover; passthrough |
+| **a03f600** (current HEAD; B7-6 + B7-7 merged) | 238 | 1096 | 21.7% | **-66** | B7-6/B7-7 consumer rewrites recover **+9** vs e00709f; SP_byte0 regression dominates the residual gap |
+| v5 (E1, if landed) | TBD | 1096 | TBD | TBD | pending — see Section 8 |
 
-| # | Bug | File:line | Status | Tests unblocked |
-|---|-----|-----------|--------|-----------------|
-| 1 | `tail_mem_store_addr0_e0_from_psh_sp_no_addr_src_authority` overpowers ENT-main (5e9 strength) | `l10_ops.py:3889` | F | ENT step set |
-| 2 | `tail_mem_store_addr0_00_from_global_exact` false-fires at step 5 (OUTPUT proxy ambiguity) | `l10_ops.py:3696` | F (via 1ef127c, B5-D partial reroute) | global-store ids |
-| 3 | `tail_sp_marker_byte0_f8_from_initial_stack_exact` fires on residual MARK_SP >1.0 | `l10_ops.py:3465` | D (B7-6 plan) | initial-SP ids |
-| 4 | `MEM_ADDR_SRC=1` injection wrongly fired on PSH/POP (not SI/SC) | `l7_ops.py` MEM head 7 | F (`0316600`) | PSH/POP store/load ids |
-| 5 | Current-step MEM marker missing in batched runner (causes false STACK0 attention) | batched runner | F (`e2f1e8e` Recovery B2-H) | batched-only ids |
-| 6 | L11 -> L12 wide-MUL amplitude mismatch | `alu_ops.py` MUL pipeline | F (`cc55474`) | MUL ids |
-| 7 | L10 SP-marker rule circular OUTPUT self-amp (B5-J's HAS_SE -1e9 was a hack) | `l10_ops.py:3465` | D (B7-6 plan) | initial-SP ids; pending |
-| 8 | L4 `sp_to_addr_key` mis-flagged as enabled when STACK0 mem-attention disabled | L4 op | F-as-absent (`f461e57` -- flagged disabled) | none directly; unblocks diagnosis |
-| 9 | spec_k cache corruption on draft VM divergence | spec engine | F (`e7c4d63` fallback + draft MEM marker) | spec-decoding regression suite |
-| 10 | KV eviction max_tokens corruption on bounded batches | runner | F (`4d069f7` validated by B5-G) | KV-eviction suite |
-| 11 | L17 hidden FFNs (`l10_post_ops_combined` + `tail_bit32_result_correction`) mis-attributed to L17 | layout `vm_step.py:2627` | D (B6-L inventory) | none; investigation primer |
-| 12 | ADDR_B0 staging stale at MARK_MEM rows (residual leak from MARK_STACK0) | `l8_ops.py` SP gather | F partial (`a9a45b6` fires SP gather at MARK_SP); full fix B7-3/B7-5 | tail-addr family |
-| 13 | L10 OUTPUT_LO+8 / OUTPUT_HI+15 proxy for SP byte 0 = 0xF8 (no structural signal) | `l10_ops.py:3465` | D (B7-2 dim allocated `e00709f`); consumer pending | SP marker family |
-| 14 | No `IN_STEP_FRESH` lifecycle bit -> tail rules can't distinguish fresh vs. residual | L1 attn | F (`2da184b` slot 96 allocated); consumer pending | tail family |
-| 15 | No `ADDR_B0_VALID` lifecycle bit -> L10 family can't gate on freshness | L13 gather | F (`e00709f` slot 97 allocated); consumer pending | tail-addr family |
-| 16 | No `SP_GATHERED_THIS_STEP` lifecycle bit | L8 gather | F (`3fe4ffa` allocated); consumer pending | SP-marker family |
-| 17 | L0 H5/H6/H7 attention heads dead (write, no reader, 21 dims wasted) | `l0_ops.py:141` | D (B6-K usage map) | reclaim 21 dims |
-| 18 | L16 `e0`/`f0` STACK0 marker fails to preserve post-PSH stack top across IMM | `l16_ops.py` | F (`6f8920b`) | post-PSH IMM ids |
-| 19 | L10 OP_IMM AX byte 1 not zeroed | `l10_ops.py` (`tail_ax_imm_byte1_hi_zero`) | F (`cb110ce`) | IMM AX-byte-1 ids |
-| 20 | L11/L12 MUL declaration alignment regression | `alu_ops.py` MUL | F (`b29d3ed`) | MUL regression suite |
-| 21 | Block27/layer27 = L17 -- B4-B misattribution | `l10_ops.py:1289`, `l10_ops.py:4529` | D (B6-L inventory) | investigation primer |
-| 22 | L7 head-5 ENT-SP fetch-gate limitation | `l7_ops.py` head 5 | D (`846d8fe` documented) | ENT-SP ids; unresolved |
-| 23 | B3-gamma MARK_SP/OUTPUT inversion (rejected; can't be solved at L10) | `l10_ops.py:3465-3502` | D (`5ef58b0` rejection) | initial-SP ids; structural fix B7-6 |
-| 24 | ONNX runtime path: cummax + dynamo guard broken | exporter | U (`7d4a5e3` audit) | export pipeline |
-| 25 | C runtime path: build broken, no baseline | C runtime | U (`48c13a6` audit) | C-runtime baseline |
-| 26 | `absdiff` (0/25) and `nested_quad` (0/16) categories entirely dead | `tests/` | D (`a8924be`) | 41 ids; unresolved |
+### Per-shard a03f600 vs e00709f vs v2 (D1 retest)
 
-Bugs 13-16 are the **structural plumbing** that enables the v4 retest delta.
+```
+shard offset:   a03f600   e00709f   v2     delta (v2 - a03f600)
+0 - 136     :      37        34     37     0
+137 - 273   :      57        53     76    -19
+274 - 410   :      31        31     53    -22
+411 - 547   :      32        32     28    +4
+548 - 684   :      17        19     16    +1
+685 - 821   :       9         9      8    +1
+822 - 958   :      30        29     52    -22
+959 - 1095  :      25        22     34    -9
+TOTAL       :     238       229    304   -66
+```
+
+Shards 137 (-19), 274 (-22), and 822 (-22) carry the bulk of the regression.
+The B7-9 audit shows these are the shards densest in `func_*`, `rec_*`,
+`nested_*`, and `absdiff_*` rows — exactly where the new SP_byte0 cluster
+lives (see Section 3).
 
 ---
 
-## 4. Per-batch contributions
+## 3. B7-9 lowering audit findings (revalidated on v4)
 
-- **B1 (active-opcode purity, MEM_EXEC, spec-decoding existing)**: established
-  the spec-decoding regression suite and pure-neural-mode gating; framed the
-  blocker stack (ALU-HI leakage, PC progression, heap LI/LC, JSR/LEV).
-- **B2 (recovery + spec / batched-KV)**: Recovery B2-H landed the current-step
-  MEM marker fix in the batched runner (`e2f1e8e`); B2-A surfaced the global
-  addr0 step-5 misfire; B2-B inverted MARK_SP/OUTPUT (later rejected by B3-gamma).
-- **B3 (alpha/eta/gamma/epsilon)**: documented the step0->step1 0xE0 PSH-vs-PC
-  rule (`0cde3d3`), tamed the 0xE0 PSH strength + ENT block (`87a75e4`),
-  rejected the MARK_SP inversion as L10-unsolvable (`5ef58b0`), and added
-  B2-H staticmethod cleanup + helper unit tests (`812a38f`).
-- **B4 (architectural plans + per-op harnesses)**: B4-A added OP_ENT/LEV/IMM
-  blockers to L10+L16 0xE0 rules (`527f540`); B4-G staged 20 validated
-  branches for PR open; B4-H wrote the L10 `tail_mem_store_addr0_*`
-  architectural refactor PLAN (`e672177`); landed per-op audit harnesses
-  for L0/L2/L4 (`7fbf4a7`), L5 (`ae2c51f`), L8 (`14e17fe`), L9 (`2bd4264`),
-  L11/L12 (`d3f22fe`), L13 (`1865bfe`), L14 (`acd3ce9`), L15 (`068dcbc`),
-  L16 (`4d3a7dc`), L6 (`c8af933`).
-- **B5 (revalidation + reroute)**: B5-D rerouted L10 tail rules through L13
-  ADDR_B0 (Path 2 partial, `66d9e12`); B5-F spec_k revalidation (`1ada801`);
-  B5-G KV eviction revalidation (`2aa07f6`); B5-H production-config
-  validation (`0abd829`); B5-J investigated HAS_SE lifecycle gate on the SP
-  marker F8 rule (`d0065e8`, found -5 regression, rejected hack).
-- **B6 (investigations + audits)**: B6-G L7-L9 structural-signal audit
-  (`8d7d86a`); B6-K BD dim usage map identifying 21 reclaimable dims at
-  H5/H6/H7 (`8d3ee75`); B6-L L17 post-op inventory (`974471e`) showing
-  block27/layer27 = L10 tail; B6-B augmented L10 tail addr-family with
-  soft ADDR_B0/B1/B2 evidence (`d4b2a90`); B6-D L16 e0 STACK0 fix (`6f8920b`).
-- **B7 (structural plumbing)**: B7-1 IN_STEP_FRESH at L1 head 5
-  (`2da184b`, slot 96); B7-2 SP_BYTE0_IS_F8 dim + L7 head-6 producer
-  (`35e0d6b`, slot 95); B7-4 ADDR_B0_VALID lifecycle bit (`e00709f`, slot
-  97); B7-5 SP_GATHERED_THIS_STEP (`3fe4ffa`, slot 98); supporting fix to
-  fire L8 SP gather at MARK_SP (`1c11364` / `a9a45b6`); B7-X L16 helper
-  refactor (`fdaf8e0`). B7-6 / B7-7 consumer rewrites are staged but not
-  yet merged.
+The B7-9 audit (`6e8ab77`, `.agent-logs/lowering-revalidation-v4/SUMMARY.md`)
+re-ran the teacher-forced lowering audit across all four 274-row slices of the
+1096 corpus on `integration/batch-merge-full-v4` (HEAD `10ab316`). It compares
+the post-batch-7 first-fatal-slot histograms against the pre-batch 2026-05-27
+baselines (slices 0-273, 274-547, 548-821 — 822 rows).
 
----
+### Headline first-fatal-slot shifts (v4 vs baseline)
 
-## 5. Key architectural findings
+| Fatal slot   | Baseline (822 rows) | v4 (0-821) | v4 (0-1095) | Verdict |
+|--------------|--------------------:|-----------:|------------:|---------|
+| **STACK0_byte0** |               198 |         21 |          22 | **9x reduction — huge win** |
+| **AX_byte0**     |               121 |         29 |          39 | **4x reduction — good win** |
+| **SP_byte0**     |               461 |        677 |     **893** | **doubled — new regression** |
+| STACK0_byte2 |                  -- |         25 |          25 | new bucket (var_three_*) |
+| PC_byte0     |                  -- |         42 |          42 | new bucket |
+| PC_byte1     |                  -- |          0 |          46 | new bucket (slice 822-1095) |
+| AX_byte1     |                  -- |          1 |           2 | new bucket |
 
-1. **The L10 tail-correction family is the dominant bug surface.** The 18
-   strength-escalating rules in `l10_ops.py:3450-4100` are responsible for
-   most of the OUTPUT-byte regressions surfaced in B2-A, B2-B, B3-eta,
-   B5-J. The rules each pick a "novel" combination of `ALU_LO` / `CMP` /
-   `PSH_AT_SP` / `OP_JSR` / `MEM_ADDR_SRC` proxies, then crank `strength`
-   until they out-vote their predecessors. Strength has reached 5e9 on one
-   rule.
+### Per-slice first-fatal SP_byte0 concentration
 
-2. **21 reclaimable dims at slots 95-115.** L0's H5/H6/H7 attention heads
-   (thresholds 14.5/19.5/24.5) write but no downstream op reads. B6-K's
-   usage map made the dim budget look saturated only because every dim has
-   *some* writer; counting *consumers* exposed the headroom. B7 used 4 of
-   these slots (95/96/97/98) for `SP_BYTE0_IS_F8`, `IN_STEP_FRESH`,
-   `ADDR_B0_VALID`, `SP_GATHERED_THIS_STEP`.
+```
+slice 0-273    : SP_byte0:225  AX_byte0:24  STACK0_byte0:6   AX_byte1:1
+slice 274-547  : SP_byte0:229  STACK0_byte2:25  STACK0_byte0:15  AX_byte0:4
+slice 548-821  : SP_byte0:223  PC_byte0:42  AX_byte0:1
+slice 822-1095 : SP_byte0:216  PC_byte1:46  AX_byte0:10  AX_byte1:1  STACK0_byte0:1
+```
 
-3. **Four foundation lifecycle dims unlock declarative rewrites.** The
-   wishlist from B6-G + B4-H crystallized into four upstream signals:
-   - `IN_STEP_FRESH` (L1 head 5, slot 96): 1.0 from PC marker through SE
-   - `SP_BYTE0_IS_F8` (L7 head 6 extension, slot 95): the in-step structural
-     fact that B5-J's `HAS_SE -1e9` hammer was trying to approximate
-   - `ADDR_B0_VALID` (L13 gather extension, slot 97): the L13 op KNOWS when
-     its gather fires; emitting it as a bit lets L10 gate on freshness
-   - `SP_GATHERED_THIS_STEP` (L8 gather extension at MARK_SP, slot 98):
-     resolves residual leakage from MARK_STACK0 -> MARK_MEM
-   With these four bits, the L10 tail-correction family shrinks from ~18
-   strength-escalating rules to ~5 bounded-strength declarative dispatchers.
+SP_byte0 is now the first fatal lane on **~80% of rows in every slice**.
+The growth concentrates in two new failure modes that did not exist (or were
+masked) in the pre-batch run:
 
-4. **L10 -> L13 refactor via ADDR_B0 (B5-D + B6-B partial; B7-5/B7-6
-   pending).** Rule Q (`tail_mem_store_addr0_e8_from_local_frame_addr_exact`,
-   `l10_ops.py:4028`) is the design exemplar: it reads `ADDR_B0_LO+8 /
-   ADDR_B0_HI+14` directly with bounded strength. B4-H proved the pattern
-   generalises to all five address values. The B5-D and B6-B commits added
-   the helper and partial reroute; the full sweep is the B7-7 task.
+- `step1:STACK0_byte2` (25 cases) — exclusive to `var_three_*` rows.
+- `step2:SP_byte0` (~275 cases) — `func_*`, `rec_*`, `nested_*`, and
+  `absdiff_*` rows now first diverge on the SP byte0 lane at step 2.
 
-5. **L17 owns L10's tail.** B6-L confirmed the layout's L17 carries
-   `block.ffn = l10_post_ops_combined` + `block.post_ops[0] =
-   tail_bit32_result_correction`. Future investigations into "layer 27 / 30
-   / 31" should consult `vm_step.py:2215-2470` and `_expand_wrapper_blocks`
-   to resolve the source factory in `l10_ops.py`.
+The interpretation: the structural-dim fixes (B7-1..5) and the rewritten
+L10 tail families (B7-6 + B7-7) successfully eliminated the *downstream*
+STACK0_byte0 / AX_byte0 misfires, but in doing so they exposed an
+**upstream SP-lane lowering bug that was previously masked**. The soft
+ADDR_B0/B1/B2 evidence added in B5-D (`66d9e12`) and B6-B (`d4b2a90`) is
+the most likely structural source: those merges added partial-strength
+evidence reads in the L10 family that win at SP byte 0 when they should
+not fire.
 
 ---
 
-## 6. What remains broken
+## 4. Trajectory analysis
 
-Per the v4 retest analysis target (~792 still-failing ids):
+### What we achieved
 
-- **Initial-SP F8 marker family** (~estimated 20-40 ids): blocked on B7-6.
-  Rule A still uses `OUTPUT_LO+8 / OUTPUT_HI+15` proxy + `HAS_SE -1e9` hack.
-- **MEM-store addr0 family** (~estimated 80-120 ids): blocked on B7-7.
-  Rules C/E/F/G/H/K/L/M/N/O/P still strength-escalate.
-- **Initial step0 -> step1 0xE0 transition** (`0cde3d3` doc): B3-alpha
-  noted PSH-vs-PC ambiguity at step 0; unresolved.
-- **L7/L3 attention defects** (per-op harnesses now exist via C2/C3): the
-  L7 head-5 ENT-SP fetch-gate limitation (`846d8fe`) is documented but
-  unresolved.
-- **L4 `sp_to_addr_key` disabled-plan flag** (`f461e57`, B3-θ): flag is
-  set to "absent" pending STACK0 mem-attention enablement.
-- **`absdiff` (0/25) + `nested_quad` (0/16)**: dead categories per B3
-  investigation (`a8924be`); unresolved root cause.
-- **MUL / DIV / SHL / SHR wide-byte families**: partial fixes via
-  `cc55474` (amplitude) and `b29d3ed` (alignment); regression surface
-  remains.
-- **PRTF / conv-I/O modes**: post-V9 design landed (`feddfc1`); pure-neural
-  pass rate not yet measured on these ids.
-- **ONNX export** (`7d4a5e3`): broken (cummax + dynamo guard).
-- **C runtime** (`48c13a6`): build broken, no baseline.
+1. **Architectural cleanup of L10 tail families.** B7-6 rewrote the
+   `tail_sp_marker_*` family to consume `IN_STEP_FRESH` (slot 96) and
+   `SP_BYTE0_IS_F8` (slot 95) directly; B7-7 migrated tail rules
+   C/D/E/F/G/I/K/L/N/P of `tail_mem_store_addr0_*` to read structural
+   ADDR_B0/B1/B2 evidence with bounded strength. The two strength-escalating
+   families are now declarative dispatchers (rule count dropped from ~18 to
+   ~5 per family; max strength dropped from 5e9 to bounded).
+2. **Foundation lifecycle dims landed.** Four upstream signals are now
+   available corpus-wide:
+   - `SP_BYTE0_IS_F8` (slot 95, L7 head 6)
+   - `IN_STEP_FRESH` (slot 96, L1 head 5)
+   - `ADDR_B0_VALID` (slot 97, L13 gather)
+   - `SP_GATHERED_THIS_STEP` (slot 98, L8 gather at MARK_SP)
+3. **STACK0_byte0 and AX_byte0 lowering misses largely eliminated**
+   (198 -> 22 and 121 -> 39 respectively, per B7-9 audit).
+4. **Per-op test harnesses** for L0/L2/L3/L4/L5/L6/L7/L8/L9/L11/L12/L13/L14/
+   L15/L16/L17-post-ops (C2/C3/C7) — every layer except L1/L10 itself now has
+   an isolated unit-test surface.
+5. **Spec-decoding and batched-KV revalidation** preserved across the
+   architectural churn (`e7c4d63`, `4d069f7`).
+6. **Documentation**: the B7-9 audit + this summary capture the full
+   first-fatal-slot histogram at v4/a03f600 so future campaigns start from a
+   measured baseline rather than a guess.
 
-Rough category breakdown of the ~792 failing ids:
-- L10 tail-family-blocked: ~150-200 (resolved when B7-6/B7-7 land)
-- Wide-byte ALU (MUL/DIV/SHL/SHR): ~120-150
-- Stack/JSR/LEV protocol edges: ~80-100
-- conv-I/O / PRTF: ~150-200 (not in scope this campaign)
-- Dead categories (absdiff/nested_quad/etc.): ~50-80
-- Long-tail (single-id regressions): ~100-150
+### What regressed
+
+1. **SP_byte0 doubled** from 461 to 893 corpus-wide (B7-9 audit). The
+   structural origin appears to be the soft ADDR_B0 evidence introduced in
+   B5-D + B6-B, which started firing partially on rows where it should
+   abstain entirely.
+2. **+115 fatals in four new lowering buckets** (STACK0_byte2, PC_byte0,
+   PC_byte1, AX_byte1) — concentrated in `gcd`, `rec_fib`, `rec_power`,
+   `var_three` rows.
+3. **Net pass-rate regression**: -66 vs v2 (304 -> 238). The
+   B7-6/B7-7 consumer rewrites only recovered +9 of the -75 e00709f trough;
+   the soft-ADDR_B0 component remains the dominant residual deficit.
+
+### What is known to fix it
+
+Two candidate fixes have been scoped (branches not yet landed; see Section 8):
+
+- **D2 — `fix/revert-l10-soft-addr-b0-evidence`** (proposed): selectively
+  revert the soft ADDR_B0/B1/B2 evidence reads added by B5-D (`66d9e12`)
+  and B6-B (`d4b2a90`) while keeping the B7-1..7 structural dims and
+  consumer rewrites. This is the lowest-risk path: it undoes the proven
+  source of regression without touching the architectural cleanup.
+- **D3 — `investigation/sp-byte0-regression-source`** (proposed): identify
+  the precise rule(s) inside the soft ADDR_B0 evidence path that are firing
+  on SP byte 0 step 2, then patch just those instead of a full revert. This
+  preserves any partial wins the soft evidence provides on the addr0 family
+  but requires bisection effort.
+
+If D2 lands cleanly, the expected pass rate is **>= 304 (v2 baseline) plus
+the genuine B7 wins on STACK0_byte0 / AX_byte0** — i.e., a net positive
+campaign outcome.
 
 ---
 
-## 7. Recommendations for next campaign
+## 5. Bug catalog updates
 
-1. **Land B7-6 + B7-7 first.** The structural dims (B7-1..5) are allocated
-   and produced; the consumer rewrites (B7-6 for `tail_sp_marker_*`, B7-7
-   for `tail_mem_store_addr0_*`) deliver the architectural cleanup that
-   pays off the dim-allocation cost. Expected delta: bounded-strength
-   replacements drop rule count from 18 -> ~5 per family and unblock
-   ~150-200 ids.
-2. **Use the new per-op harnesses for L3/L7 investigation.** C2/C3 added
-   harnesses for L0, L2, L4, L5, L6, L8, L9, L11, L12, L13, L14, L15, L16.
-   The L7 head-5 ENT-SP fetch-gate limitation and L3 carry-forward
-   attention (head 2) are now isolated-testable.
-3. **Address the L4 `sp_to_addr_key` flag.** B3-θ marked it absent
-   pending STACK0 mem-attention enablement. Enabling the attention path
-   (currently `enable=False` gates in `l8_ops.py`) opens an alternate
-   address gather pipeline that bypasses several L10 tail rules.
-4. **Reclaim the 17 remaining dims at slots 99-115.** B6-K identified
-   them; B7 used 4. The remaining 17 can host the full
-   `SP_BYTE0_VALUE` 32-dim one-hot (per B7-4 task spec) and
-   `ADDR_B0_HI_VALID` / `ADDR_B1_VALID` / `ADDR_B2_VALID` lifecycle
-   bits, completing the structural-signal foundation.
-5. **Investigate the dead categories.** `absdiff` (0/25) and
-   `nested_quad` (0/16) imply a missing compiler path, not a tail bug.
-   `a8924be` documented the surface; root cause is unidentified.
-6. **Fix ONNX + C-runtime export paths.** Both are currently broken
-   (`7d4a5e3`, `48c13a6`); needed for deployment validation outside the
-   PyTorch reference.
-7. **Re-run the 1096 diagnostic after B7-6/B7-7** to produce v4 numbers;
-   that's the campaign payoff measurement.
+The original 26-bug catalog (Section 3 of the prior summary) remains
+canonical; the updates below append new bugs identified during D3 + B7-9
+revalidation.
+
+| # | Bug | Source | Status | Tests affected |
+|---|-----|--------|--------|----------------|
+| 27 | L10 soft ADDR_B0/B1/B2 evidence (B5-D `66d9e12` + B6-B `d4b2a90`) misfires on SP byte 0 step 2, causing the +432 SP_byte0 cluster on `func_*`/`rec_*`/`nested_*`/`absdiff_*` | B7-9 audit; D1 retest shard concentration | D (revert candidate D2; targeted candidate D3) | ~150-250 ids in shards 137/274/822 |
+| 28 | New `step1:STACK0_byte2` cluster on `var_three_*` rows (25 cases) -- did not exist pre-batch | B7-9 audit slice 274-547 | U | var_three_* family |
+| 29 | New `step2:SP_byte0` cluster on `func_*`/`rec_*`/`nested_*`/`absdiff_*` (~275 cases) | B7-9 audit slices 548-821 + 822-1095 | U (likely subsumed by #27) | function-call families |
+| 30 | New `PC_byte0` cluster (42 cases) in slice 548-821 | B7-9 audit | U | unidentified family |
+| 31 | New `PC_byte1` cluster (46 cases) in slice 822-1095 | B7-9 audit | U | unidentified family |
+| 32 | Lowering audit shows 1069 of 1096 rows still produce >= 1 fatal failure; only 27 rows are info-only/clean (19 info + 8 errored). The 238 pass count therefore reflects "first-fatal does not propagate to final OUTPUT" rather than "model lowers cleanly". | B7-9 audit | D | corpus-wide observation |
+
+Bug #27 is the single highest-leverage residual: fixing it (via D2 revert or
+D3 targeted patch) is expected to recover the bulk of the -66 gap.
+
+---
+
+## 6. Per-batch contributions (updated)
+
+The B1-B7 contributions are unchanged from the prior summary; the new units
+since are:
+
+- **C9 (this doc, v1)** (`bcb0fd1`): initial campaign summary covering B1-B7
+  + B7-6/B7-7 pending.
+- **B7-6** (`cdd0d0a`, merged at `a03f600`): rewrite L10 SP marker family
+  using `IN_STEP_FRESH` + `SP_BYTE0_IS_F8`. Bounded strength; replaces the
+  circular OUTPUT self-amp hack from B5-J.
+- **B7-7** (`5924bb4`, merged at `b96c0da`): migrate L10 tail rules
+  C/D/E/F/G/I/K/L/N/P to structural ADDR_B0/B1/B2 dims with bounded strength.
+- **C6 / Rule J** (`41edf72`, `f2038ca`): apply ADDR_B2 evidence migration
+  to rule J on top of B7-7.
+- **D1 — post-merge retest at a03f600** (`audit/post-merge-retest-a03f600`,
+  `26c94a5`): 8-shard 1096 retest measuring B7-6/B7-7 delta = +9 vs e00709f
+  (229 -> 238); residual -66 vs v2.
+- **B7-9 — lowering revalidation on v4** (`6e8ab77`): teacher-forced
+  4-slice audit identifying SP_byte0 regression source.
+- **C9 (this doc, v2)**: incorporates D1 + B7-9 + B7-6/B7-7 actuals;
+  identifies bug #27 as the dominant residual; recommends D2/D3 as the
+  path back to v2-positive territory.
+
+---
+
+## 7. Key architectural findings (preserved + updated)
+
+1. **The L10 tail-correction family was the dominant bug surface**;
+   architectural cleanup (B7-6 / B7-7) succeeded in eliminating the
+   STACK0_byte0 and AX_byte0 lowering misses. The remaining regression
+   source is *not* the rewritten declarative paths but the soft ADDR_B0
+   evidence layered on top of them in B5-D + B6-B.
+2. **Foundation lifecycle dims (slots 95-98) work as designed.** The
+   B7-6/B7-7 rewrites confirm `SP_BYTE0_IS_F8`, `IN_STEP_FRESH`,
+   `ADDR_B0_VALID`, and `SP_GATHERED_THIS_STEP` carry the right signal;
+   no producer-side bugs were uncovered during the rewrite.
+3. **B7-9 audit gives the campaign a measurable first-fatal-slot baseline**
+   for the first time. Future structural work should report deltas against
+   this histogram (493 + 22 + 39 + 25 + 42 + 46 + 2 = 669 first-fatals
+   distributed across known slots; ~427 other first-fatals across less
+   common buckets).
+4. **The SP_byte0 cluster is structurally upstream of the L10 tail family.**
+   It manifests at *step 2* (not step 5 like the old e00709f addr0
+   misfires), implicating a per-row SP-lane lowering rule rather than a
+   per-rule strength escalation. This is consistent with the soft
+   ADDR_B0/B1/B2 evidence hypothesis (those rules read SP-lane state
+   during gather construction).
+5. **17 reclaimable dims at slots 99-115 remain available** for the next
+   structural cleanup wave (e.g., `SP_BYTE0_VALUE` 32-dim one-hot,
+   `ADDR_B0_HI_VALID` / `ADDR_B1_VALID` / `ADDR_B2_VALID` lifecycle bits).
+
+---
+
+## 8. Pending units (not yet landed)
+
+The following branches were scoped during the D-cycle but have not landed
+as of `a03f600`. They are the gating dependencies for the v5 retest:
+
+- **D2 — `fix/revert-l10-soft-addr-b0-evidence`**: selective revert of
+  B5-D (`66d9e12`) + B6-B (`d4b2a90`) soft ADDR_B0 evidence in
+  `l10_ops.py`. Preserves B7-1..7 structural dims and consumer rewrites.
+  *Expected delta: +50 to +75 ids (recovers bug #27 cluster).*
+- **D3 — `investigation/sp-byte0-regression-source`**: bisection of soft
+  ADDR_B0 evidence to isolate the precise rule(s) firing on SP byte 0
+  step 2; targeted patch instead of full revert. *Expected delta:
+  similar to D2 but preserves any genuine soft-evidence wins.*
+- **E1 — `integration/v5`**: integration branch combining `a03f600` +
+  D2 (or D3) + any further structural fixes. *Required for the v5 pass-rate
+  measurement.*
+
+When D2 or D3 lands, re-run the 8-shard retest and update Section 2 with
+the v5 row.
+
+---
+
+## 9. Recommendations for the next campaign
+
+1. **Preserve the B7 architectural work and revert the soft ADDR_B0 layer
+   (D2).** The B7-9 audit data is unambiguous: STACK0_byte0 and AX_byte0
+   collapsed (good), and the regression source is localized to the B5-D /
+   B6-B soft evidence path. Reverting those two commits while keeping
+   B7-1..7 should land the campaign **net-positive vs v2**.
+2. **Add a "first-fatal histogram" gate to the regression suite.** The B7-9
+   audit caught the SP_byte0 doubling that the headline pass-rate metric
+   could not. A lightweight per-slice histogram check (raise a CI failure if
+   any first-fatal slot grows by > 50%) would have flagged this regression
+   during the B5/B6 merges.
+3. **Investigate the four new lowering buckets** (STACK0_byte2 on
+   `var_three_*`; PC_byte0 in slice 548-821; PC_byte1 in slice 822-1095;
+   AX_byte1 corpus-wide). These appeared only on the v4 audit; they are
+   not subsumed by the soft-ADDR_B0 hypothesis and likely point at
+   independent regressions.
+4. **Land B7-9-style audits as a standard post-batch deliverable.** Per-op
+   harnesses (C2/C3/C7) are valuable for unit-level regression isolation;
+   the first-fatal-slot histogram is the corresponding system-level
+   regression-isolation tool.
+5. **Reclaim the 17 remaining dims at slots 99-115** for the next
+   structural wave (full `SP_BYTE0_VALUE` one-hot; per-byte `ADDR_*_VALID`
+   bits).
+6. **Address the dead categories** (`absdiff` 0/25 and `nested_quad` 0/16).
+   Both are now in the SP_byte0 step-2 cluster per the B7-9 audit, so D2
+   is likely a partial fix here too — but the surface area suggests a
+   compiler-path issue that goes beyond L10 tails.
+7. **Re-run the 1096 + 8-shard retest after D2/D3** and post the v5 number
+   to Section 2.
 
 ---
 
 ## Cross-references
 
+- D1 post-merge retest: `git show origin/audit/post-merge-retest-a03f600:.agent-logs/post-merge-retest-a03f600/_run.log`
+- D1 prior trough retest: `git show origin/audit/post-merge-retest-e00709f:.agent-logs/post-merge-retest-e00709f/_runner.log`
+- B7-9 lowering revalidation: `git show 6e8ab77:.agent-logs/lowering-revalidation-v4/SUMMARY.md`
 - B6-G L7-L9 audit: `git show origin/investigation/l7-l9-structural-audit:.agent-logs/l7-l9-structural-audit/REPORT.md`
 - B6-K BD dim usage map: `git show origin/investigation/bd-dim-usage-map:.agent-logs/bd-dim-usage-map/REPORT.md`
 - B6-L L17 post-op inventory: `git show origin/investigation/l17-post-op-inventory:.agent-logs/l17-post-op-inventory/REPORT.md`
 - B4-H L10 refactor PLAN: `git show origin/proposal/l10-tail-correction-family:.agent-logs/l10-tail-family-refactor/PLAN.md`
+- B7-6 SP-marker rewrite: commit `cdd0d0a`
+- B7-7 tail-addr rewrite: commit `5924bb4`
+- Soft ADDR_B0 evidence (regression source): commits `66d9e12` (B5-D) + `d4b2a90` (B6-B)
 - Per-op harness root: `.agent-logs/` per-batch subdirectories
 - Sub-agent brief defaults: `~/.claude/projects/-home-alexlitz-Documents-misc-c4-release/memory/feedback_agent_briefs.md`
