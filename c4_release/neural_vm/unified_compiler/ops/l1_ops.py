@@ -87,13 +87,36 @@ def _bake_layer1_ffn(ffn, S, BD):
 
 
 def make_layer1_threshold_attn_op() -> Operation:
-    """L1 attention: 3 fine threshold heads + STEP_END + L1H4."""
+    """L1 attention: 3 fine threshold heads + STEP_END + L1H4 + IN_STEP_FRESH.
+
+    Head 5 (B7-1) emits ``IN_STEP_FRESH``: a positive in-step lifecycle bit
+    that decays from ~1.0 immediately after the most-recent ``MARK_SE_ONLY``
+    (or ``MARK_CS`` at program start) toward 0.0 as more tokens accumulate
+    within the current step, and resets to ~1.0 at the next STEP_END. The
+    head uses the same Q/K/V/O shape as head 3 (HAS_SE) but with a positive
+    ALiBi slope (``IN_STEP_FRESH_ALIBI_S = 0.5``) so the softmax1 anchor
+    overtakes the score as the distance to the most-recent SE grows. See
+    ``_SetDim.IN_STEP_FRESH`` docstring and
+    ``investigation/l7-l9-structural-audit:REPORT.md`` Section 2.4 for the
+    full design rationale and B5-J regression context.
+    """
     def bake(attn, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
         ALIBI_S = 10.0
+        # B7-1: ALiBi slope chosen so IN_STEP_FRESH decays from ~1.0 right
+        # after a STEP_END toward ~0 within the 35-token step window. The
+        # head's base attention score for a single MARK_SE_ONLY key is
+        # ``CONST_w * SE_w / sqrt(HD) = 10 * 10 / sqrt(64) = 12.5`` (matches
+        # head 3 / HAS_SE). With slope 0.5 the score at distance d is
+        # ``12.5 - 0.5 * d``; combined with softmax1's anchor=0 the output
+        # crosses 0.5 near d=25 (about 70% through a 35-token step) and is
+        # < 0.01 by d=35. Matches the L9 ALiBi memory-lookup slope for ABI
+        # consistency (see test_alibi_mem_attn.py for the precedent).
+        IN_STEP_FRESH_ALIBI_S = 0.5
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(ALIBI_S)
             attn.alibi_slopes[3] = 0.0  # global SE detection
+            attn.alibi_slopes[5] = IN_STEP_FRESH_ALIBI_S  # B7-1: decay
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_threshold_attention_heads(
             attn,
@@ -120,12 +143,38 @@ def make_layer1_threshold_attn_op() -> Operation:
         Primitives.generate_threshold_attention_heads(
             attn, [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4], bd=proxy,
         )
+        # Head 5 (B7-1): IN_STEP_FRESH recency-to-SE decay. Same Q/K/V/O
+        # shape as head 3 but uses positive ALiBi slope so the attention
+        # weight on the most-recent MARK_SE_ONLY (or MARK_CS at program
+        # start) decays as the query position moves further from it. The
+        # softmax1 ZFOD anchor produces output ~0 when no SE/CS lies
+        # within ALiBi range.
+        Primitives.generate_attention_head(
+            attn,
+            DeclarativeAttentionHeadSpec(
+                head_idx=5,
+                q=(AP(0, proxy.CONST, 10.0),),
+                k=(
+                    AP(0, proxy.MARK_SE_ONLY, 10.0),
+                    AP(0, proxy.MARK_CS, 10.0),
+                ),
+                v=(
+                    AP(1, proxy.MARK_SE_ONLY, 1.0),
+                    AP(1, proxy.MARK_CS, 1.0),
+                ),
+                o=(AO(proxy.IN_STEP_FRESH, 1, 1.0),),
+            ),
+            HD,
+        )
 
-    # Dim-ownership claims: 5 heads on L1 attn.
+    # Dim-ownership claims: 6 heads on L1 attn.
     #   Heads 0,1,2,4: threshold heads writing to L1H0/L1H1/L1H2/L1H4
     #                  (each writes V slots 1..7 across MARKS).
     #   Head 3: STEP_END detector — Q[CONST], K[MARK_SE_ONLY],
     #           V[3*HD+1, MARK_SE_ONLY], O[HAS_SE, 3*HD+1].
+    #   Head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay — Q[CONST],
+    #           K[MARK_SE_ONLY+MARK_CS], V[1, MARK_SE_ONLY+MARK_CS],
+    #           O[IN_STEP_FRESH, 5*HD+1].
     _claims = set()
     _MARKS = ["MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
               "MARK_MEM", "MARK_SE", "MARK_CS"]
@@ -141,12 +190,19 @@ def make_layer1_threshold_attn_op() -> Operation:
     _claims.add((1, "attn_W_k", "3_0", "MARK_SE_ONLY+0"))
     _claims.add((1, "attn_W_v", "3_1", "MARK_SE_ONLY+0"))
     _claims.add((1, "attn_W_o", "3_1", "HAS_SE+0"))
+    # Head 5 (B7-1): IN_STEP_FRESH recency decay.
+    _claims.add((1, "attn_W_q", "5_0", "CONST+0"))
+    _claims.add((1, "attn_W_k", "5_0", "MARK_SE_ONLY+0"))
+    _claims.add((1, "attn_W_k", "5_0", "MARK_CS+0"))
+    _claims.add((1, "attn_W_v", "5_1", "MARK_SE_ONLY+0"))
+    _claims.add((1, "attn_W_v", "5_1", "MARK_CS+0"))
+    _claims.add((1, "attn_W_o", "5_1", "IN_STEP_FRESH+0"))
 
     return Operation(
         name="layer1_threshold_attn",
         phase=1,
-        reads={"IS_MARK", "MARK_SE_ONLY", "CONST"},
-        writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE"},
+        reads={"IS_MARK", "MARK_SE_ONLY", "MARK_CS", "CONST"},
+        writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE", "IN_STEP_FRESH"},
         kind="attn",
         layer_idx=1,
         bake_fn=bake,
@@ -180,6 +236,20 @@ def _layer1_threshold_ir(dim_positions, HD) -> CompilerIR:
     ))
     specs.extend(Primitives.threshold_attention_head_specs(
         [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4], bd=proxy,
+    ))
+    # Head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay.
+    specs.append(DeclarativeAttentionHeadSpec(
+        head_idx=5,
+        q=(AP(0, proxy.CONST, 10.0),),
+        k=(
+            AP(0, proxy.MARK_SE_ONLY, 10.0),
+            AP(0, proxy.MARK_CS, 10.0),
+        ),
+        v=(
+            AP(1, proxy.MARK_SE_ONLY, 1.0),
+            AP(1, proxy.MARK_CS, 1.0),
+        ),
+        o=(AO(proxy.IN_STEP_FRESH, 1, 1.0),),
     ))
     ir.layer(0).attention.extend(specs)
     return ir

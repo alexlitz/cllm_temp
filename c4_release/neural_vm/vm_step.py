@@ -2262,6 +2262,22 @@ class _SetDim:
     L1H2 = 130
     HAS_SE = 137
 
+    # --- B7-1: IN_STEP_FRESH lifecycle dim ---
+    # Slot 96 (reclaimed from dead L0 head 5 region per B6-K REPORT Section 5).
+    # Produced by L1 attention head 5 (sibling to head 3 HAS_SE): attends from
+    # each query position to the most-recent prior MARK_SE_ONLY (or MARK_CS)
+    # via softmax1 with a positive ALiBi slope. Right after a STEP_END token
+    # the attended distance is small and the head emits ~1.0; as more tokens
+    # accumulate within the current step the distance grows and the softmax1
+    # anchor wins, decaying the output toward 0.0; at the next STEP_END the
+    # distance resets to 0 and the head returns to ~1.0.
+    #
+    # Consumers: L10 tail_* rules that previously used HAS_SE as a negative
+    # life-counter hammer (B5-J) can switch to IN_STEP_FRESH as a *positive*
+    # in-step evidence gate. See investigation/l7-l9-structural-audit
+    # Section 2.4 for the full rationale.
+    IN_STEP_FRESH = 96
+
     # --- Byte index within register (0-3) ---
     BYTE_INDEX_0 = 138
     BYTE_INDEX_1 = 139
