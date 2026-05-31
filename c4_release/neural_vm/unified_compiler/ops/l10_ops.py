@@ -3829,8 +3829,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             strength=10_000.0,
         ),
         # B6-B / B4-H Path 2: rule I (addr byte 2 → 0x00 global) augmented
-        # with soft ADDR_B2 evidence (LO+0 / HI+0 → 0x00).  L13 writes
-        # ADDR_B0/B1/B2 (no B3); rule J cannot get an analogous boost.
+        # with soft ADDR_B2 evidence (LO+0 / HI+0 → 0x00).  Rule J below
+        # reuses ADDR_B2 at BYTE_INDEX_2 (see C6 note).
         *exact_output_byte_rules(
             name="tail_mem_store_addr2_zero_from_global_exact",
             expected_byte=0x00,
@@ -3878,9 +3878,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             active_value=500.0,
             max_abs_weight=1_000_000_000.0,
         ),
-        # B6-B / B4-H Path 2: rule J (addr byte 3 → 0x00 global) — L13 only
-        # writes ADDR_B0/B1/B2, so no analogous soft boost is available for
-        # byte 3.  Rule retained unchanged.
+        # C6 / B4-H Path 2: rule J (addr byte 3 → 0x00 global) augmented
+        # with soft ADDR_B2 evidence — same banks as rule I.  L13's 3
+        # heads all gather addr bytes 0/1/2 into ALL MEM val byte
+        # positions, so ADDR_B2 lanes are populated at BYTE_INDEX_2 too
+        # (not just BYTE_INDEX_1).  For global addresses ADDR_B2 == 0x00
+        # implies the upper bytes are zero, matching rule J's assertion.
         *exact_output_byte_rules(
             name="tail_mem_store_addr3_zero_from_global_exact",
             expected_byte=0x00,
@@ -3902,6 +3905,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("BYTE_INDEX_1", -1000.0),
                 ("BYTE_INDEX_2", 5.0),
                 ("BYTE_INDEX_3", -1000.0),
+                # Soft positive evidence from L13 ADDR_B2 lanes (C6 / B4-H
+                # Path 2).  0x00 → (LO+0, HI+0).  Mirrors rule I's boost.
+                ("ADDR_B2_LO+0", 2.0),
+                ("ADDR_B2_HI+0", 2.0),
                 ("MARK_AX", -1_000_000_000.0),
                 ("MARK_PC", -1_000_000_000.0),
                 ("MARK_SP", -1_000_000_000.0),
