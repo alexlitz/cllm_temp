@@ -5377,6 +5377,12 @@ def _set_layer8_sp_gather(attn, S, BD, HD):
         addr_hi_out = [BD.ADDR_B0_HI, BD.ADDR_B1_HI, BD.ADDR_B2_HI][j]
         # Q: fires at STACK0 area (d=5..9 from BP or STACK0 marker)
         attn.W_q[base, BD.MARK_STACK0] = L
+        # B7-3 (B6-G Section 3.1 fix): also fire at MARK_SP so ADDR_B*
+        # carries fresh in-step SP-derived address at MARK_SP rows (not
+        # just residual leakage from MARK_STACK0). 2*L beats the existing
+        # H1+SP_I=-L suppressor (H1[SP] propagates to MARK_SP marker rows
+        # too); SP byte rows still have MARK_SP=0 and stay suppressed.
+        attn.W_q[base, BD.MARK_SP] = 2 * L
         attn.W_q[base, BD.H4 + BP_I] = L  # d≤9.5 from BP
         # Suppress non-STACK0
         attn.W_q[base, BD.H1 + AX_I] = -L
@@ -5392,6 +5398,9 @@ def _set_layer8_sp_gather(attn, S, BD, HD):
         attn.W_k[base, BD.CMP + 3] = -L
         # Anti-leakage gate
         attn.W_q[base + 33, BD.MARK_STACK0] = L
+        # B7-3: anti-leakage gate admits MARK_SP queries so slot-33 stays
+        # positive (mirrors slot-0 MARK_SP extension above).
+        attn.W_q[base + 33, BD.MARK_SP] = L
         attn.W_q[base + 33, BD.CONST] = -L / 2
         attn.W_k[base + 33, BD.CONST] = L
         # V: copy CLEAN_EMBED nibbles
