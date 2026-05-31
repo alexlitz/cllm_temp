@@ -698,6 +698,12 @@ def declare_setdim_compat_dims(
         # Section 5). Declared so the compiler accepts producer reads/writes
         # under pin_io_only layouts.
         "SP_BYTE0_IS_F8",
+        # B7-5 structural sentinel: 1.0 at MARK_SP positions after L8
+        # SP gather has fired in the current step. Produced by
+        # ``make_layer8_sp_gathered_sentinel_op`` (L8 FFN, phase 8.6);
+        # consumed by L10 tail_sp_marker_* rules. See
+        # ``investigation/bd-dim-usage-map`` REPORT Section 5.
+        "SP_GATHERED_THIS_STEP",
     ]
     # 7-dim threshold head outputs (one per marker type)
     seven_dim = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",

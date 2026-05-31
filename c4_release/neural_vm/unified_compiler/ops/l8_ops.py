@@ -1079,3 +1079,112 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
+
+
+# Hidden-unit slot for the SP_GATHERED_THIS_STEP sentinel. Placed after the
+# L8 ALU + multibyte_routing unit cluster (which reaches 2054 — see the
+# ``ffn_units_used=2055`` annotation on ``make_layer8_multibyte_routing_op``).
+# Holding the constant here keeps the op factory and the per-op test in sync.
+_L8_SP_GATHERED_SENTINEL_UNIT = 2055
+
+
+def _layer8_sp_gathered_sentinel_rule(S: float) -> FFNRule:
+    """SwiGLU rule: write 1.0 to SP_GATHERED_THIS_STEP at MARK_SP positions.
+
+    Pattern (matches ``_bake_layer1_ffn``'s STACK0_BYTE0 unit):
+      up    = S * MARK_SP
+      b_up  = -S * 0.5
+      gate  = 1.0 (constant)
+      W_down = SP_GATHERED_THIS_STEP at (2.0 / S)
+
+    At MARK_SP=1: up = S/2, silu(S/2) ≈ S/2 for large S; gate=1.0;
+        hidden = S/2; delta = (2/S) * (S/2) = 1.0 → output = 1.0.
+    At MARK_SP=0: up = -S/2, silu(-S/2) ≈ 0; output = 0.
+
+    The sentinel is naturally reset at STEP_BOUNDARY because MARK_SP is a
+    per-step embedding flag (only set on the current step's SP marker
+    token, not carried into the next step's embedding).
+    """
+
+    return FFNRule.gated_write(
+        name="l8_sp_gathered_this_step_sentinel",
+        conditions=(("MARK_SP", 1.0),),
+        threshold=0.5,
+        gate=None,
+        gate_bias=1.0,
+        # ``lower_ffn`` multiplies S into W_up + b_up but does NOT scale
+        # W_down — the rule author owns the W_down magnitude. ``2.0 / S``
+        # cancels the SwiGLU hidden amplitude (silu(S/2) ≈ S/2) so the
+        # delta lands at 1.0 (matching ``_bake_layer1_ffn``'s
+        # STACK0_BYTE0 unit and ``_format_position_counter_rules``).
+        writes=(("SP_GATHERED_THIS_STEP", 2.0 / S),),
+    )
+
+
+def make_layer8_sp_gathered_sentinel_op() -> Operation:
+    """L8 FFN: write SP_GATHERED_THIS_STEP=1.0 at MARK_SP positions.
+
+    B7-5 lifecycle bit (see ``investigation/bd-dim-usage-map`` REPORT
+    Section 5). The L8 SP-byte gather (``layer8_sp_gather_bake``, phase
+    8.0, heads 0-2) populates ADDR_B0/B1/B2 with the current step's SP
+    bytes. This op marks the MARK_SP row with a single bit indicating
+    "L8 has just finished staging SP for THIS step" — letting L10
+    ``tail_sp_marker_*`` rules use positive in-step evidence rather
+    than HAS_SE -1e9 negative hammers (per B6-K's recommendation).
+
+    Phase=8.6 places this AFTER:
+      - layer8_sp_gather_bake (8.0)
+      - layer8_multibyte_fetch_bake (8.1)
+      - layer8_alu (8.2)
+      - layer8_multibyte_routing (8.3)
+      - layer8_op_imm_relay (8.4)
+      - format_position_counter (8.5)
+    so the sentinel write does not interfere with any in-layer L8 bake
+    and is visible to all consumers from L9 onward.
+
+    Implementation: single SwiGLU unit at index
+    ``_L8_SP_GATHERED_SENTINEL_UNIT`` (= 2055 — the next slot after
+    multibyte_routing's 0-2054 cluster). ``ffn_units_used=2056`` so the
+    L8 PureFFN allocator pre-sizes hidden_dim correctly.
+    """
+
+    def bake(block, dim_positions, S):
+        proxy = _as_setdim_proxy(dim_positions)
+        rule = _layer8_sp_gathered_sentinel_rule(S)
+        dim_names = Primitives.ffn_rule_dim_names((rule,))
+        dim_map = Primitives.dim_positions_from_bd(proxy, dim_names)
+        Primitives.lower_ffn_rules(
+            block.ffn,
+            (rule,),
+            dim_map,
+            start_unit=_L8_SP_GATHERED_SENTINEL_UNIT,
+            S=S,
+        )
+
+    _claims = {
+        (8, "ffn_W_down", str(_L8_SP_GATHERED_SENTINEL_UNIT),
+         "SP_GATHERED_THIS_STEP+0"),
+    }
+
+    return Operation(
+        name="layer8_sp_gathered_sentinel",
+        phase=8.6,
+        reads={"MARK_SP"},
+        writes={"SP_GATHERED_THIS_STEP"},
+        kind="block",
+        bake_fn=bake,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        layer_idx=8,
+        migrated=True,
+        claims=_claims,
+        # +1 over multibyte_routing's 2055 so L8's PureFFN allocator
+        # grows hidden_dim to cover the sentinel unit's index.
+        ffn_units_used=_L8_SP_GATHERED_SENTINEL_UNIT + 1,
+        # The op produces a fresh in-step sentinel at MARK_SP. Mark it
+        # so the staleness scanner sees the producer when downstream
+        # consumers (L10 tail rules) declare ``consumes_fresh``.
+        produces={"SP_GATHERED_THIS_STEP": "SP_marker"},
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
