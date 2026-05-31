@@ -457,3 +457,113 @@ def _format_pointer_extraction_spec(BD) -> DeclarativeAttentionHeadSpec:
         v=tuple(v),
         o=tuple(o),
     )
+
+
+# ---------------------------------------------------------------------------
+# B7-2: SP_BYTE0_IS_F8 producer
+# ---------------------------------------------------------------------------
+
+# V/O slots 6 and 7 are added to L7 head 6 (the PSH/CMP relay head). Slots
+# 1..5 are already occupied by the relay writes in
+# ``_layer7_memory_head_specs``; ``Primitives.generate_attention_head``
+# writes only the slots referenced by the spec, so adding slots 6+7 here
+# leaves the existing head 6 wiring intact. We use two slots (one per
+# nibble bit) so the consumer threshold rejects the half-match cases
+# where only one nibble lines up with 0xF8.
+_SP_BYTE0_F8_V_SLOT_LO = 6
+_SP_BYTE0_F8_V_SLOT_HI = 7
+
+
+def make_layer7_sp_byte0_is_f8_op() -> Operation:
+    """L7 head-6 extension: produce ``SP_BYTE0_IS_F8`` at MARK_SP rows.
+
+    Designed per B6-K's BD dim usage map Section 5 and B6-G's L7-L9
+    structural audit Section 2.1.
+
+    Semantics:
+      - Q fires at MARK_SP rows (same head 6 attention pattern that
+        already relays PSH/CMP/JSR flags).
+      - K fires at MARK_SP rows; head 6 ALiBi slope is 5.0 so self-
+        attention dominates.
+      - V slot 6 reads ``EMBED_LO+8`` from the attended MARK_SP row;
+        slot 7 reads ``EMBED_HI+15``. L3 head 2 carry-forward writes
+        SP byte 0's EMBED_LO/HI nibbles onto the MARK_SP row, so when
+        the carry-forwarded SP byte 0 == 0xF8 both reads are 1.0.
+      - O slots 6 and 7 both write to ``SP_BYTE0_IS_F8`` with weight
+        0.5, summing to 1.0 only when both nibbles match. The L10
+        consumer ``tail_sp_marker_byte0_f8_from_initial_stack_exact``
+        gates on ``SP_BYTE0_IS_F8 +1e6`` (B6-K Section 5 design).
+
+    Phase 7.6: runs after ``layer7_memory_heads`` (phase=7) and
+    ``format_pointer_extraction`` (phase=7.5), so adding head-6 slots
+    cannot be overwritten by either. Adding extra V/O slots on an
+    already-baked head is safe because
+    ``Primitives.generate_attention_head`` writes only the (head, slot)
+    cells referenced by the spec — slots 1..5 from the prior bake stay
+    intact.
+    """
+
+    def bake(block, dim_positions, S):
+        del S
+        attn = block.attn
+        BD = _as_setdim_proxy(dim_positions)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        Primitives.generate_attention_head(
+            attn, _layer7_sp_byte0_is_f8_spec(BD), HD,
+        )
+
+    _claims = set()
+    _claims.add((7, "attn_W_v", f"6_{_SP_BYTE0_F8_V_SLOT_LO}", "EMBED_LO+8"))
+    _claims.add((7, "attn_W_v", f"6_{_SP_BYTE0_F8_V_SLOT_HI}", "EMBED_HI+15"))
+    _claims.add((7, "attn_W_o", f"6_{_SP_BYTE0_F8_V_SLOT_LO}", "SP_BYTE0_IS_F8+0"))
+    _claims.add((7, "attn_W_o", f"6_{_SP_BYTE0_F8_V_SLOT_HI}", "SP_BYTE0_IS_F8+0"))
+
+    return Operation(
+        name="layer7_sp_byte0_is_f8",
+        phase=7.6,
+        reads={"MARK_SP", "EMBED_LO", "EMBED_HI"},
+        writes={"SP_BYTE0_IS_F8"},
+        kind="block",
+        layer_idx=7,
+        bake_fn=bake,
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer7_sp_byte0_is_f8_ir,
+        declarative_authority="spec_generated",
+        migrated=True,
+        claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _layer7_sp_byte0_is_f8_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_layer7_sp_byte0_is_f8_spec(BD))
+    return ir
+
+
+def _layer7_sp_byte0_is_f8_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative spec for the SP_BYTE0_IS_F8 extension on L7 head 6.
+
+    The existing head 6 Q/K pattern (MARK_SP & MARK_STACK0 self-attention
+    with ALiBi slope 5.0) is preserved; this spec adds only V slots
+    6 and 7 (and matching O writes). Q/K are intentionally empty here so
+    ``generate_attention_head`` does not overwrite the prior head-6 Q/K
+    wiring with zero weights.
+    """
+
+    return DeclarativeAttentionHeadSpec(
+        head_idx=6,
+        q=(),
+        k=(),
+        v=(
+            AP(_SP_BYTE0_F8_V_SLOT_LO, BD.EMBED_LO + 8, 1.0),
+            AP(_SP_BYTE0_F8_V_SLOT_HI, BD.EMBED_HI + 15, 1.0),
+        ),
+        o=(
+            AO(BD.SP_BYTE0_IS_F8, _SP_BYTE0_F8_V_SLOT_LO, 0.5),
+            AO(BD.SP_BYTE0_IS_F8, _SP_BYTE0_F8_V_SLOT_HI, 0.5),
+        ),
+    )
