@@ -276,19 +276,12 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # ALU_LO/HI at the STACK0 marker. Materialize that ALU byte only for the
     # exact preserved e8 stack-top marker, leaving JSR/ENT/current-store rows
     # to their own owners.
-    #
-    # E6: IN_STEP_FRESH (B7-1) soft +2 evidence wires the current-step
-    # lifecycle signal as discrimination against historical STACK0 markers
-    # whose ADDR_B0 lanes may still carry residual address evidence. The
-    # weight is intentionally conservative so the threshold stays in the
-    # same regime as the legacy HAS_SE-only shape.
     stack0_e8_marker_base_conditions = (
         ("MARK_STACK0", 1.0),
         ("HAS_SE", 1.0),
         ("ADDR_B0_LO+8", 10.0),
         ("ADDR_B0_HI+14", 1.0),
         ("ADDR_B0_HI+15", -2.0),
-        ("IN_STEP_FRESH", 2.0),
         ("IS_BYTE", -10.0),
         ("OP_JSR", -10.0),
         ("OP_ENT", -100.0),
@@ -361,11 +354,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # OUTPUT_LO/HI.  Keep this strictly non-store, non-JSR/ENT/LEV, and exclude
     # the e8 lookalike via the ADDR_B0_LO+8 negative weight so PSH/SI rows at
     # 0xffe8 do not co-fire.
-    #
-    # E6: IN_STEP_FRESH (B7-1) soft +2 evidence mirrors the e8 materializer;
-    # the lifecycle signal is shared across STACK0 marker materialization so
-    # historical-step STACK0 rows whose ADDR_B0 residue agrees with e0 do
-    # not co-fire on the older marker token.
     stack0_e0_marker_conditions = (
         ("MARK_STACK0", 1.0),
         ("HAS_SE", 1.0),
@@ -373,7 +361,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("ADDR_B0_LO+8", -2.0),
         ("ADDR_B0_HI+14", 1.0),
         ("ADDR_B0_HI+15", -2.0),
-        ("IN_STEP_FRESH", 2.0),
         ("IS_BYTE", -10.0),
         ("OP_JSR", -10.0),
         ("OP_ENT", -100.0),
@@ -403,17 +390,12 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
         ))
 
-    # E6: IN_STEP_FRESH (B7-1) soft +2 evidence — historical step STACK0
-    # markers can retain ADDR_B0_LO+8 / ADDR_B0_HI+15 residue when the same
-    # 0xfff8 slot was active in an earlier frame; the current-step lifecycle
-    # bit makes the present-step marker the natural owner of the materializer.
     stack0_f8_marker_conditions = (
         ("MARK_STACK0", 1.0),
         ("HAS_SE", 1.0),
         ("ADDR_B0_LO+8", 1.0),
         ("ADDR_B0_HI+15", 1.0),
         ("ADDR_B0_HI+14", -2.0),
-        ("IN_STEP_FRESH", 2.0),
         ("IS_BYTE", -10.0),
         ("OP_JSR", -10.0),
         ("OP_ENT", -10.0),
@@ -1411,12 +1393,7 @@ def make_layer16_lev_routing_op() -> Operation:
                "MEM_VAL_B2", "MEM_VAL_B3", "BYTE_INDEX_0", "BYTE_INDEX_1",
                "BYTE_INDEX_2", "BYTE_INDEX_3",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2",
-               "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
-               # E6: IN_STEP_FRESH (B7-1) soft evidence on STACK0 marker
-               # materializers (e8 / e0 / f8) to discriminate current-step
-               # STACK0 markers from historical ones whose ADDR_B0 residue
-               # may agree with the materializer's address signature.
-               "IN_STEP_FRESH"},
+               "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI", "ALU_LO"},
         kind="ffn",
         layer_idx=16,
