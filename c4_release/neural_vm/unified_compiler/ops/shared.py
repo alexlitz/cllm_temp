@@ -642,6 +642,9 @@ def declare_setdim_compat_dims(
         "ACTIVE_OPCODE_PRTF", "ACTIVE_OPCODE_READ",
         "HAS_SE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
         "STACK0_BYTE0", "CMP_GROUP",
+        # B7-1: in-step freshness lifecycle bit (L1 attn head 5; see
+        # _SetDim.IN_STEP_FRESH docstring for semantics).
+        "IN_STEP_FRESH",
         "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP", "NEXT_STACK0",
         "NEXT_MEM", "NEXT_SE", "NEXT_HALT",
         "NEXT_TOOL_CALL", "NEXT_THINKING_START", "NEXT_THINKING_END",
