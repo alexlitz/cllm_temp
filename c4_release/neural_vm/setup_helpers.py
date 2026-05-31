@@ -1304,6 +1304,12 @@ def _set_layer13_mem_addr_gather(attn, S, BD, HD):
 
     For L15 K-side address keys: copies addr byte nibbles from MEM addr
     positions (d=0..3 from MEM marker) to MEM val byte positions (d=4..8).
+
+    Head 0 additionally drives an ``ADDR_B0_VALID`` lifecycle bit (B7-4 / B6-K
+    slot 97) on slot 34. See the inline block below the gather loop for the
+    detailed Q/K/V/O routing; downstream consumers (L10 tail addr0 family
+    per B4-H §3.2) read ADDR_B0_VALID to distinguish freshly-computed
+    ADDR_B0 nibbles from stale residue.
     """
     L = 15.0
     MEM_I = 4
@@ -1348,6 +1354,41 @@ def _set_layer13_mem_addr_gather(attn, S, BD, HD):
         for k in range(16):
             attn.W_o[addr_lo_out + k, base + 1 + k] = 1.0
             attn.W_o[addr_hi_out + k, base + 17 + k] = 1.0
+
+        # ----------------------------------------------------------------
+        # ADDR_B0_VALID lifecycle bit (B7-4): only head 0 produces it,
+        # because only head 0 gathers ADDR_B0_LO/HI. The slot mirrors head
+        # 0's primary Q/K so attention is locked to the MEM addr byte 0
+        # row, then reads ``L1H1+MEM_I`` through V and routes through W_o
+        # into ADDR_B0_VALID.
+        #
+        # Reading ``L1H1+MEM_I`` (not CONST) is what gives the lifecycle
+        # bit its discrimination: ``L1H1+MEM_I`` is 1.0 only at MEM-band
+        # rows close to a MEM marker (d ≤ 1.5 from MEM), so at attended
+        # MEM addr byte 0 rows V=1 → output=1, while at unrelated rows
+        # (no MEM context anywhere) V=0 → output=0 even when softmax
+        # spreads mass.
+        #
+        # The result: at every MEM val byte position, ADDR_B0_VALID
+        # residual carries ~1.0 *iff* head 0 found a real MEM addr byte 0
+        # row to attend to. Downstream consumers (L10 tail addr0 family
+        # per B4-H §3.2) can gate their writes on ADDR_B0_VALID +50 as
+        # positive evidence that the ADDR_B0 lanes are fresh.
+        if j == 0:
+            VALID_SLOT = 34  # one past the anti-leakage gate at slot 33
+            # Q mirrors slot 0 (fires at MEM val byte positions).
+            attn.W_q[base + VALID_SLOT, BD.MEM_VAL_B0] = L
+            attn.W_q[base + VALID_SLOT, BD.MEM_VAL_B1] = L
+            attn.W_q[base + VALID_SLOT, BD.MEM_VAL_B2] = L
+            attn.W_q[base + VALID_SLOT, BD.MEM_VAL_B3] = L
+            # K mirrors head 0 slot 0 (selects MEM addr byte 0 row at d=1).
+            attn.W_k[base + VALID_SLOT, BD.L1H1 + MEM_I] = L
+            attn.W_k[base + VALID_SLOT, BD.L1H0 + MEM_I] = -L
+            # V: read L1H1+MEM_I so the attended MEM addr byte 0 row
+            # delivers 1.0 and unrelated rows deliver 0.
+            attn.W_v[base + VALID_SLOT, BD.L1H1 + MEM_I] = 1.0
+            # O: route gathered value into ADDR_B0_VALID.
+            attn.W_o[BD.ADDR_B0_VALID, base + VALID_SLOT] = 1.0
 
 
 
