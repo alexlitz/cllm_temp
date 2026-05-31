@@ -2256,37 +2256,21 @@ class _SetDim:
     H6 = 102
     H7 = 109
 
-    # --- B7-2: SP_BYTE0_IS_F8 structural dim ---
-    # Aliases slot 95 (H5+0, formerly L0 head 5 MARK_PC threshold-14.5 output;
-    # H5/H6/H7 are dead per B6-K's BD dim usage map — no downstream consumer
-    # ever reads them, so the L0 contribution at slot 95 is residual noise we
-    # tolerate via a high consumer threshold). Set to 1.0 by L7 head 6's new
-    # V/O slot at MARK_SP rows when SP byte 0 == 0xF8 (i.e. carry-forwarded
-    # EMBED_LO+8 AND EMBED_HI+15 both fire). See B6-G L7-L9 structural audit
-    # Section 2.1 and B6-K Section 5 for the design.
-    SP_BYTE0_IS_F8 = 95
+    # --- B7 structural lifecycle dims (aliased onto H5/H6/H7 "dead" range) ---
+    # H5/H6/H7 (slots 95-115) are written by ``layer0_threshold_attn`` but
+    # have no downstream consumer (see ``investigation/bd-dim-usage-map``
+    # REPORT Section 3). B7-5 reclaims slot 98 for SP_GATHERED_THIS_STEP:
+    # a single-dim sentinel set to 1.0 at MARK_SP query positions by L8
+    # FFN, signalling that the L8 SP gather (heads 0-2) has fired in the
+    # current step. Consumed by L10 tail_sp_marker_* rules as positive
+    # in-step evidence (replaces HAS_SE -1e9 negative hammer).
+    SP_GATHERED_THIS_STEP = 98  # aliases H5+3 (dead L0 head 5 BP slot)
 
     # --- L1 fine thresholds + HAS_SE ---
     L1H0 = 116
     L1H1 = 123
     L1H2 = 130
     HAS_SE = 137
-
-    # --- B7-1: IN_STEP_FRESH lifecycle dim ---
-    # Slot 96 (reclaimed from dead L0 head 5 region per B6-K REPORT Section 5).
-    # Produced by L1 attention head 5 (sibling to head 3 HAS_SE): attends from
-    # each query position to the most-recent prior MARK_SE_ONLY (or MARK_CS)
-    # via softmax1 with a positive ALiBi slope. Right after a STEP_END token
-    # the attended distance is small and the head emits ~1.0; as more tokens
-    # accumulate within the current step the distance grows and the softmax1
-    # anchor wins, decaying the output toward 0.0; at the next STEP_END the
-    # distance resets to 0 and the head returns to ~1.0.
-    #
-    # Consumers: L10 tail_* rules that previously used HAS_SE as a negative
-    # life-counter hammer (B5-J) can switch to IN_STEP_FRESH as a *positive*
-    # in-step evidence gate. See investigation/l7-l9-structural-audit
-    # Section 2.4 for the full rationale.
-    IN_STEP_FRESH = 96
 
     # --- Byte index within register (0-3) ---
     BYTE_INDEX_0 = 138
@@ -5403,12 +5387,6 @@ def _set_layer8_sp_gather(attn, S, BD, HD):
         addr_hi_out = [BD.ADDR_B0_HI, BD.ADDR_B1_HI, BD.ADDR_B2_HI][j]
         # Q: fires at STACK0 area (d=5..9 from BP or STACK0 marker)
         attn.W_q[base, BD.MARK_STACK0] = L
-        # B7-3 (B6-G Section 3.1 fix): also fire at MARK_SP so ADDR_B*
-        # carries fresh in-step SP-derived address at MARK_SP rows (not
-        # just residual leakage from MARK_STACK0). 2*L beats the existing
-        # H1+SP_I=-L suppressor (H1[SP] propagates to MARK_SP marker rows
-        # too); SP byte rows still have MARK_SP=0 and stay suppressed.
-        attn.W_q[base, BD.MARK_SP] = 2 * L
         attn.W_q[base, BD.H4 + BP_I] = L  # d≤9.5 from BP
         # Suppress non-STACK0
         attn.W_q[base, BD.H1 + AX_I] = -L
@@ -5424,9 +5402,6 @@ def _set_layer8_sp_gather(attn, S, BD, HD):
         attn.W_k[base, BD.CMP + 3] = -L
         # Anti-leakage gate
         attn.W_q[base + 33, BD.MARK_STACK0] = L
-        # B7-3: anti-leakage gate admits MARK_SP queries so slot-33 stays
-        # positive (mirrors slot-0 MARK_SP extension above).
-        attn.W_q[base + 33, BD.MARK_SP] = L
         attn.W_q[base + 33, BD.CONST] = -L / 2
         attn.W_k[base + 33, BD.CONST] = L
         # V: copy CLEAN_EMBED nibbles
