@@ -78,7 +78,7 @@ L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT = 1490
 L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2294
 L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2328
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 1668
-L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 1675
+L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 1674
 
 
 def _clear_ffn_unit_band(ffn, start: int, end: int) -> None:
@@ -890,26 +890,6 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+14", -0.05),
                 ("OUTPUT_HI+1", -0.05),
                 ("OUTPUT_HI+15", -0.05),
-            ),
-        ),
-        FFNRule.constant_write(
-            name="l6_ent_after_jsr_sp_byte0_f0_when_ent_zero",
-            conditions=(
-                ("OP_ENT", 1.0),
-                ("MARK_SP", 1.0),
-                ("HAS_SE", 1.0),
-                ("EMBED_LO+0", 1.0),
-                ("EMBED_HI+15", 1.0),
-                ("EMBED_LO+8", -1.0),
-            ),
-            threshold=7.5,
-            writes=(
-                ("OUTPUT_LO+0", 0.10),
-                ("OUTPUT_HI+15", 0.10),
-                ("OUTPUT_LO+8", -0.05),
-                ("OUTPUT_LO+10", -0.05),
-                ("OUTPUT_HI+0", -0.05),
-                ("OUTPUT_HI+14", -0.05),
             ),
         ),
         FFNRule.constant_write(
