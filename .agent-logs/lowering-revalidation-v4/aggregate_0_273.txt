@@ -1,0 +1,309 @@
+SUMMARY
+log=.agent-logs/lowering-revalidation-v4/slice_0_273.log
+row_count=274 visible_failure_segments=514
+[1096-lowering-summary] selected=274 clean=0 fatal_rows=256 info_only_rows=18 fatal_failures=1508 info_failures=318 errors=0 skipped=0 wrong_token_failures=1826 band_only_failures=0 band_margin_failures=0 assert_mode=off print_mode=drift min_margin=0.5 output_band_min_margin=0.5 output_band_max_inactive=1e+30 context_window=512 chunk_tokens=512
+======================== 1 passed in 3671.76s (1:01:11) ========================
+status_summary=fatal-lowering-divergence:256, info-support-drift:18
+row_severity=fatal_rows:256 info_only_rows:18 clean_rows:0
+families=add:50, sub:50, mul:50, div:50, mod:50, var_simple:24
+
+FAILURE_KIND_COUNTS
+combined=low_head_margin,wrong_argmax,wrong_output_byte:514
+atomic=low_head_margin:514, wrong_argmax:514, wrong_output_byte:514
+combined_by_severity=info:low_head_margin,wrong_argmax,wrong_output_byte:258, fatal:low_head_margin,wrong_argmax,wrong_output_byte:256
+atomic_by_severity=info:low_head_margin:258, info:wrong_argmax:258, info:wrong_output_byte:258, fatal:low_head_margin:256, fatal:wrong_argmax:256, fatal:wrong_output_byte:256
+
+FIRST_FATAL_SLOT_COUNTS
+slots=SP_byte0:225, AX_byte0:24, STACK0_byte0:6, AX_byte1:1
+step_slots=step0:SP_byte0:225, step0:AX_byte0:24, step6:STACK0_byte0:3, step7:STACK0_byte0:3, step0:AX_byte1:1
+family_step_slots=mul->step0:SP_byte0:49, mod->step0:SP_byte0:47, div->step0:SP_byte0:44, sub->step0:SP_byte0:43, add->step0:SP_byte0:42, add->step0:AX_byte0:8, sub->step0:AX_byte0:6, div->step0:AX_byte0:6, mod->step0:AX_byte0:3, var_simple->step6:STACK0_byte0:3, var_simple->step7:STACK0_byte0:3, sub->step0:AX_byte1:1, mul->step0:AX_byte0:1
+first_fatal_examples[step0:SP_byte0]=0000:add_0: 654 + 114; 0001:add_1: 25 + 759; 0002:add_2: 281 + 250; 0005:add_5: 692 + 758
+first_fatal_examples[step0:AX_byte0]=0003:add_3: 228 + 142; 0004:add_4: 754 + 104; 0016:add_16: 225 + 459; 0025:add_25: 344 + 104
+first_fatal_examples[step0:AX_byte1]=0070:sub_20: 744 - 27
+first_fatal_examples[step6:STACK0_byte0]=0255:var_simple_5: x = 521; 0256:var_simple_6: x = 409; 0269:var_simple_19: x = 985
+first_fatal_examples[step7:STACK0_byte0]=0264:var_simple_14: x = 898; 0268:var_simple_18: x = 594; 0273:var_simple_23: x = 610
+
+FIRST_INFO_SLOT_COUNTS
+slots=MEM_addr0:234, MEM_addr1:24
+step_slots=step1:MEM_addr0:234, step1:MEM_addr1:24
+
+FINAL_BLOCK_COUNTS
+final_blocks=block27/layer27:64
+flas_blocks=block27/layer27:56, block25/layer16:8
+
+PER_ID_STATUS
+# id status family desc(short)
+0000 fatal-lowering-divergence add add_0: 654 + 114
+0001 fatal-lowering-divergence add add_1: 25 + 759
+0002 fatal-lowering-divergence add add_2: 281 + 250
+0003 fatal-lowering-divergence add add_3: 228 + 142
+0004 fatal-lowering-divergence add add_4: 754 + 104
+0005 fatal-lowering-divergence add add_5: 692 + 758
+0006 fatal-lowering-divergence add add_6: 913 + 558
+0007 fatal-lowering-divergence add add_7: 89 + 604
+0008 fatal-lowering-divergence add add_8: 432 + 32
+0009 fatal-lowering-divergence add add_9: 30 + 95
+0010 fatal-lowering-divergence add add_10: 223 + 238
+0011 fatal-lowering-divergence add add_11: 517 + 616
+0012 fatal-lowering-divergence add add_12: 27 + 574
+0013 fatal-lowering-divergence add add_13: 203 + 733
+0014 fatal-lowering-divergence add add_14: 665 + 718
+0015 fatal-lowering-divergence add add_15: 558 + 429
+0016 fatal-lowering-divergence add add_16: 225 + 459
+0017 fatal-lowering-divergence add add_17: 603 + 284
+0018 fatal-lowering-divergence add add_18: 828 + 890
+0019 fatal-lowering-divergence add add_19: 6 + 777
+0020 fatal-lowering-divergence add add_20: 825 + 163
+0021 fatal-lowering-divergence add add_21: 714 + 432
+0022 fatal-lowering-divergence add add_22: 348 + 284
+0023 fatal-lowering-divergence add add_23: 159 + 220
+0024 fatal-lowering-divergence add add_24: 980 + 781
+0025 fatal-lowering-divergence add add_25: 344 + 104
+0026 fatal-lowering-divergence add add_26: 94 + 389
+0027 fatal-lowering-divergence add add_27: 99 + 367
+0028 fatal-lowering-divergence add add_28: 867 + 352
+0029 fatal-lowering-divergence add add_29: 618 + 270
+0030 fatal-lowering-divergence add add_30: 826 + 44
+0031 fatal-lowering-divergence add add_31: 747 + 470
+0032 fatal-lowering-divergence add add_32: 549 + 127
+0033 fatal-lowering-divergence add add_33: 996 + 944
+0034 fatal-lowering-divergence add add_34: 387 + 80
+0035 fatal-lowering-divergence add add_35: 565 + 300
+0036 fatal-lowering-divergence add add_36: 849 + 643
+0037 fatal-lowering-divergence add add_37: 633 + 906
+0038 fatal-lowering-divergence add add_38: 882 + 370
+0039 fatal-lowering-divergence add add_39: 591 + 196
+0040 fatal-lowering-divergence add add_40: 721 + 71
+0041 fatal-lowering-divergence add add_41: 46 + 677
+0042 fatal-lowering-divergence add add_42: 233 + 791
+0043 fatal-lowering-divergence add add_43: 296 + 81
+0044 fatal-lowering-divergence add add_44: 875 + 238
+0045 fatal-lowering-divergence add add_45: 887 + 103
+0046 fatal-lowering-divergence add add_46: 389 + 284
+0047 fatal-lowering-divergence add add_47: 464 + 650
+0048 fatal-lowering-divergence add add_48: 854 + 373
+0049 fatal-lowering-divergence add add_49: 166 + 379
+0050 fatal-lowering-divergence sub sub_0: 827 - 26
+0051 fatal-lowering-divergence sub sub_1: 1472 - 34
+0052 fatal-lowering-divergence sub sub_2: 1537 - 87
+0053 fatal-lowering-divergence sub sub_3: 1427 - 9
+0054 fatal-lowering-divergence sub sub_4: 1347 - 81
+0055 fatal-lowering-divergence sub sub_5: 450 - 68
+0056 fatal-lowering-divergence sub sub_6: 1593 - 31
+0057 fatal-lowering-divergence sub sub_7: 434 - 59
+0058 fatal-lowering-divergence sub sub_8: 877 - 34
+0059 fatal-lowering-divergence sub sub_9: 1995 - 81
+0060 fatal-lowering-divergence sub sub_10: 1509 - 71
+0061 fatal-lowering-divergence sub sub_11: 549 - 87
+0062 fatal-lowering-divergence sub sub_12: 764 - 98
+0063 fatal-lowering-divergence sub sub_13: 1689 - 7
+0064 fatal-lowering-divergence sub sub_14: 569 - 4
+0065 fatal-lowering-divergence sub sub_15: 1748 - 40
+0066 fatal-lowering-divergence sub sub_16: 921 - 34
+0067 fatal-lowering-divergence sub sub_17: 235 - 27
+0068 fatal-lowering-divergence sub sub_18: 1970 - 72
+0069 fatal-lowering-divergence sub sub_19: 1894 - 91
+0070 fatal-lowering-divergence sub sub_20: 744 - 27
+0071 fatal-lowering-divergence sub sub_21: 1442 - 63
+0072 fatal-lowering-divergence sub sub_22: 910 - 82
+0073 fatal-lowering-divergence sub sub_23: 1039 - 18
+0074 fatal-lowering-divergence sub sub_24: 642 - 17
+0075 fatal-lowering-divergence sub sub_25: 605 - 95
+0076 fatal-lowering-divergence sub sub_26: 1249 - 68
+0077 fatal-lowering-divergence sub sub_27: 638 - 95
+0078 fatal-lowering-divergence sub sub_28: 1297 - 54
+0079 fatal-lowering-divergence sub sub_29: 1938 - 74
+0080 fatal-lowering-divergence sub sub_30: 917 - 46
+0081 fatal-lowering-divergence sub sub_31: 549 - 17
+0082 fatal-lowering-divergence sub sub_32: 1143 - 63
+0083 fatal-lowering-divergence sub sub_33: 286 - 96
+0084 fatal-lowering-divergence sub sub_34: 196 - 14
+0085 fatal-lowering-divergence sub sub_35: 413 - 80
+0086 fatal-lowering-divergence sub sub_36: 427 - 87
+0087 fatal-lowering-divergence sub sub_37: 964 - 76
+0088 fatal-lowering-divergence sub sub_38: 230 - 49
+0089 fatal-lowering-divergence sub sub_39: 881 - 76
+0090 fatal-lowering-divergence sub sub_40: 1058 - 67
+0091 fatal-lowering-divergence sub sub_41: 614 - 70
+0092 fatal-lowering-divergence sub sub_42: 1862 - 1
+0093 fatal-lowering-divergence sub sub_43: 1493 - 92
+0094 fatal-lowering-divergence sub sub_44: 334 - 87
+0095 fatal-lowering-divergence sub sub_45: 1912 - 68
+0096 fatal-lowering-divergence sub sub_46: 1637 - 34
+0097 fatal-lowering-divergence sub sub_47: 1674 - 82
+0098 fatal-lowering-divergence sub sub_48: 796 - 14
+0099 fatal-lowering-divergence sub sub_49: 701 - 55
+0100 fatal-lowering-divergence mul mul_0: 21 * 59
+0101 fatal-lowering-divergence mul mul_1: 1 * 93
+0102 fatal-lowering-divergence mul mul_2: 93 * 34
+0103 fatal-lowering-divergence mul mul_3: 65 * 98
+0104 fatal-lowering-divergence mul mul_4: 23 * 65
+0105 fatal-lowering-divergence mul mul_5: 14 * 81
+0106 fatal-lowering-divergence mul mul_6: 39 * 82
+0107 fatal-lowering-divergence mul mul_7: 65 * 78
+0108 fatal-lowering-divergence mul mul_8: 26 * 20
+0109 fatal-lowering-divergence mul mul_9: 48 * 98
+0110 fatal-lowering-divergence mul mul_10: 21 * 70
+0111 fatal-lowering-divergence mul mul_11: 100 * 68
+0112 fatal-lowering-divergence mul mul_12: 1 * 77
+0113 fatal-lowering-divergence mul mul_13: 42 * 63
+0114 fatal-lowering-divergence mul mul_14: 3 * 15
+0115 fatal-lowering-divergence mul mul_15: 47 * 40
+0116 fatal-lowering-divergence mul mul_16: 31 * 8
+0117 fatal-lowering-divergence mul mul_17: 31 * 73
+0118 fatal-lowering-divergence mul mul_18: 11 * 11
+0119 fatal-lowering-divergence mul mul_19: 94 * 63
+0120 fatal-lowering-divergence mul mul_20: 9 * 98
+0121 fatal-lowering-divergence mul mul_21: 69 * 99
+0122 fatal-lowering-divergence mul mul_22: 17 * 17
+0123 fatal-lowering-divergence mul mul_23: 85 * 61
+0124 fatal-lowering-divergence mul mul_24: 71 * 22
+0125 fatal-lowering-divergence mul mul_25: 34 * 68
+0126 fatal-lowering-divergence mul mul_26: 78 * 55
+0127 fatal-lowering-divergence mul mul_27: 28 * 70
+0128 fatal-lowering-divergence mul mul_28: 97 * 94
+0129 fatal-lowering-divergence mul mul_29: 89 * 26
+0130 fatal-lowering-divergence mul mul_30: 92 * 40
+0131 fatal-lowering-divergence mul mul_31: 52 * 86
+0132 fatal-lowering-divergence mul mul_32: 84 * 48
+0133 fatal-lowering-divergence mul mul_33: 57 * 67
+0134 fatal-lowering-divergence mul mul_34: 58 * 16
+0135 fatal-lowering-divergence mul mul_35: 32 * 29
+0136 fatal-lowering-divergence mul mul_36: 9 * 44
+0137 fatal-lowering-divergence mul mul_37: 3 * 76
+0138 fatal-lowering-divergence mul mul_38: 71 * 30
+0139 fatal-lowering-divergence mul mul_39: 76 * 29
+0140 fatal-lowering-divergence mul mul_40: 1 * 10
+0141 fatal-lowering-divergence mul mul_41: 91 * 81
+0142 fatal-lowering-divergence mul mul_42: 8 * 30
+0143 fatal-lowering-divergence mul mul_43: 9 * 5
+0144 fatal-lowering-divergence mul mul_44: 43 * 10
+0145 fatal-lowering-divergence mul mul_45: 66 * 31
+0146 fatal-lowering-divergence mul mul_46: 36 * 86
+0147 fatal-lowering-divergence mul mul_47: 63 * 28
+0148 fatal-lowering-divergence mul mul_48: 70 * 17
+0149 fatal-lowering-divergence mul mul_49: 93 * 74
+0150 fatal-lowering-divergence div div_0: 1162 / 37
+0151 fatal-lowering-divergence div div_1: 843 / 31
+0152 fatal-lowering-divergence div div_2: 54 / 7
+0153 fatal-lowering-divergence div div_3: 657 / 28
+0154 fatal-lowering-divergence div div_4: 833 / 27
+0155 fatal-lowering-divergence div div_5: 176 / 4
+0156 fatal-lowering-divergence div div_6: 106 / 4
+0157 fatal-lowering-divergence div div_7: 113 / 7
+0158 fatal-lowering-divergence div div_8: 462 / 13
+0159 fatal-lowering-divergence div div_9: 254 / 9
+0160 fatal-lowering-divergence div div_10: 547 / 18
+0161 fatal-lowering-divergence div div_11: 149 / 5
+0162 fatal-lowering-divergence div div_12: 33 / 7
+0163 fatal-lowering-divergence div div_13: 40 / 35
+0164 fatal-lowering-divergence div div_14: 794 / 49
+0165 fatal-lowering-divergence div div_15: 879 / 27
+0166 fatal-lowering-divergence div div_16: 364 / 14
+0167 fatal-lowering-divergence div div_17: 275 / 11
+0168 fatal-lowering-divergence div div_18: 439 / 25
+0169 fatal-lowering-divergence div div_19: 549 / 19
+0170 fatal-lowering-divergence div div_20: 2009 / 43
+0171 fatal-lowering-divergence div div_21: 134 / 10
+0172 fatal-lowering-divergence div div_22: 65 / 14
+0173 fatal-lowering-divergence div div_23: 1683 / 48
+0174 fatal-lowering-divergence div div_24: 1011 / 48
+0175 fatal-lowering-divergence div div_25: 155 / 4
+0176 fatal-lowering-divergence div div_26: 1132 / 33
+0177 fatal-lowering-divergence div div_27: 132 / 4
+0178 fatal-lowering-divergence div div_28: 69 / 12
+0179 fatal-lowering-divergence div div_29: 221 / 5
+0180 fatal-lowering-divergence div div_30: 226 / 26
+0181 fatal-lowering-divergence div div_31: 609 / 16
+0182 fatal-lowering-divergence div div_32: 266 / 40
+0183 fatal-lowering-divergence div div_33: 1670 / 43
+0184 fatal-lowering-divergence div div_34: 730 / 34
+0185 fatal-lowering-divergence div div_35: 613 / 14
+0186 fatal-lowering-divergence div div_36: 344 / 21
+0187 fatal-lowering-divergence div div_37: 255 / 26
+0188 fatal-lowering-divergence div div_38: 869 / 42
+0189 fatal-lowering-divergence div div_39: 1031 / 21
+0190 fatal-lowering-divergence div div_40: 30 / 1
+0191 fatal-lowering-divergence div div_41: 176 / 5
+0192 fatal-lowering-divergence div div_42: 569 / 33
+0193 fatal-lowering-divergence div div_43: 122 / 23
+0194 fatal-lowering-divergence div div_44: 461 / 24
+0195 fatal-lowering-divergence div div_45: 1037 / 29
+0196 fatal-lowering-divergence div div_46: 816 / 20
+0197 fatal-lowering-divergence div div_47: 43 / 1
+0198 fatal-lowering-divergence div div_48: 309 / 43
+0199 fatal-lowering-divergence div div_49: 139 / 17
+0200 fatal-lowering-divergence mod mod_0: 390 % 19
+0201 fatal-lowering-divergence mod mod_1: 89 % 10
+0202 fatal-lowering-divergence mod mod_2: 154 % 8
+0203 fatal-lowering-divergence mod mod_3: 377 % 12
+0204 fatal-lowering-divergence mod mod_4: 114 % 10
+0205 fatal-lowering-divergence mod mod_5: 268 % 17
+0206 fatal-lowering-divergence mod mod_6: 138 % 3
+0207 fatal-lowering-divergence mod mod_7: 57 % 15
+0208 fatal-lowering-divergence mod mod_8: 434 % 10
+0209 fatal-lowering-divergence mod mod_9: 32 % 2
+0210 fatal-lowering-divergence mod mod_10: 180 % 6
+0211 fatal-lowering-divergence mod mod_11: 336 % 10
+0212 fatal-lowering-divergence mod mod_12: 92 % 16
+0213 fatal-lowering-divergence mod mod_13: 292 % 15
+0214 fatal-lowering-divergence mod mod_14: 297 % 2
+0215 fatal-lowering-divergence mod mod_15: 67 % 4
+0216 fatal-lowering-divergence mod mod_16: 493 % 6
+0217 fatal-lowering-divergence mod mod_17: 289 % 3
+0218 fatal-lowering-divergence mod mod_18: 437 % 13
+0219 fatal-lowering-divergence mod mod_19: 308 % 19
+0220 fatal-lowering-divergence mod mod_20: 85 % 15
+0221 fatal-lowering-divergence mod mod_21: 75 % 3
+0222 fatal-lowering-divergence mod mod_22: 167 % 13
+0223 fatal-lowering-divergence mod mod_23: 470 % 3
+0224 fatal-lowering-divergence mod mod_24: 470 % 13
+0225 fatal-lowering-divergence mod mod_25: 117 % 9
+0226 fatal-lowering-divergence mod mod_26: 351 % 5
+0227 fatal-lowering-divergence mod mod_27: 191 % 19
+0228 fatal-lowering-divergence mod mod_28: 462 % 15
+0229 fatal-lowering-divergence mod mod_29: 327 % 6
+0230 fatal-lowering-divergence mod mod_30: 483 % 9
+0231 fatal-lowering-divergence mod mod_31: 452 % 7
+0232 fatal-lowering-divergence mod mod_32: 419 % 7
+0233 fatal-lowering-divergence mod mod_33: 461 % 15
+0234 fatal-lowering-divergence mod mod_34: 22 % 7
+0235 fatal-lowering-divergence mod mod_35: 387 % 12
+0236 fatal-lowering-divergence mod mod_36: 410 % 15
+0237 fatal-lowering-divergence mod mod_37: 420 % 9
+0238 fatal-lowering-divergence mod mod_38: 146 % 7
+0239 fatal-lowering-divergence mod mod_39: 413 % 5
+0240 fatal-lowering-divergence mod mod_40: 205 % 3
+0241 fatal-lowering-divergence mod mod_41: 449 % 17
+0242 fatal-lowering-divergence mod mod_42: 123 % 8
+0243 fatal-lowering-divergence mod mod_43: 428 % 16
+0244 fatal-lowering-divergence mod mod_44: 189 % 11
+0245 fatal-lowering-divergence mod mod_45: 430 % 9
+0246 fatal-lowering-divergence mod mod_46: 124 % 2
+0247 fatal-lowering-divergence mod mod_47: 347 % 8
+0248 fatal-lowering-divergence mod mod_48: 214 % 12
+0249 fatal-lowering-divergence mod mod_49: 152 % 4
+0250 info-support-drift var_simple var_simple_0: x = 990
+0251 info-support-drift var_simple var_simple_1: x = 791
+0252 info-support-drift var_simple var_simple_2: x = 285
+0253 info-support-drift var_simple var_simple_3: x = 359
+0254 info-support-drift var_simple var_simple_4: x = 656
+0255 fatal-lowering-divergence var_simple var_simple_5: x = 521
+0256 fatal-lowering-divergence var_simple var_simple_6: x = 409
+0257 info-support-drift var_simple var_simple_7: x = 695
+0258 info-support-drift var_simple var_simple_8: x = 863
+0259 info-support-drift var_simple var_simple_9: x = 549
+0260 info-support-drift var_simple var_simple_10: x = 339
+0261 info-support-drift var_simple var_simple_11: x = 961
+0262 info-support-drift var_simple var_simple_12: x = 28
+0263 info-support-drift var_simple var_simple_13: x = 118
+0264 fatal-lowering-divergence var_simple var_simple_14: x = 898
+0265 info-support-drift var_simple var_simple_15: x = 993
+0266 info-support-drift var_simple var_simple_16: x = 267
+0267 info-support-drift var_simple var_simple_17: x = 182
+0268 fatal-lowering-divergence var_simple var_simple_18: x = 594
+0269 fatal-lowering-divergence var_simple var_simple_19: x = 985
+0270 info-support-drift var_simple var_simple_20: x = 271
+0271 info-support-drift var_simple var_simple_21: x = 39
+0272 info-support-drift var_simple var_simple_22: x = 111
+0273 fatal-lowering-divergence var_simple var_simple_23: x = 610
