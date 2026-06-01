@@ -2301,6 +2301,11 @@ class _SetDim:
     EMBED_HI = 158  # 158-173
     OUTPUT_LO = 174  # 174-189: output decoding nibbles
     OUTPUT_HI = 190  # 190-205
+    # B9 OUTPUT_HI split: declarative alias for the same 16-slot band. The
+    # rename clarifies "this step's OUTPUT_HI write" vs the would-be
+    # "OUTPUT_HI_PREV_STEP" cross-step carry (see docs/B9_OUTPUT_HI_SPLIT_SPEC.md).
+    # Numeric position is identical so baked weights are byte-identical.
+    OUTPUT_HI_THIS_STEP = 190  # alias of OUTPUT_HI
 
     # --- Address key (for memory attention) ---
     ADDR_KEY = 206  # 206-253 (48 dims: 3 nibbles × 16 one-hot)

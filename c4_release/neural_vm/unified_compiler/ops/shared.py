@@ -139,7 +139,25 @@ def _bake_post_op_into(ffn, post_op_instance, hidden_offset: int = 0) -> int:
 
 
 def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
-                               alu_mode: str = 'lookup') -> Operation:
+                               alu_mode: str = 'lookup',
+                               same_layer_as: str = None) -> Operation:
+    """Construct an ALU postop-attach Operation.
+
+    Args:
+        name: op name (e.g. ``l8_alu_postop_attach``).
+        layer_idx: home layer for the postop attach.
+        alu_cls_name: ALU class to instantiate (e.g. ``ALUAddSub``).
+        alu_mode: ``'lookup'`` (only supported mode for now).
+        same_layer_as: B12 backfill (plan §B12 / B10 schema). When provided,
+            the returned ``Operation`` declares
+            ``requires={"same_layer_as": same_layer_as}`` so the dynamic
+            scheduler pins the postop-attach to the same layer as the
+            wrapped ALU op (``layerN_alu`` / ``layer11_mul_partial`` etc.).
+            Moves the op from ``phase_required_but_undeclared`` to
+            ``phase_pinned_by_deps`` in ``analyze_scheduler``. None preserves
+            pre-B12 behaviour (no ``requires`` declaration; analyzer flags
+            it as ``phase_required_but_undeclared``).
+    """
     if alu_mode != 'lookup':
         # TODO(efficient-mode): efficient alu_mode REPLACES ffn rather than
         # wrapping it (see vm_step.py:2385-2434), so the bake_fn semantics
@@ -181,6 +199,15 @@ def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
     # AND AFTER the dead-unit zero passes (l6_dead_unit_zero=1160,
     # l7_dead_unit_zero=1170 which require the original PureFFN), but BEFORE
     # right_size_ffns (1200) which prunes dead units after wrapping.
+    #
+    # B12 backfill: ``requires["same_layer_as"]`` pins the postop attach to
+    # the same layer as the wrapped ALU op under the dynamic scheduler.
+    # Without it, the analyzer flags this op as
+    # ``phase_required_but_undeclared`` (the magic 1180+ phase carries the
+    # ordering constraint but the dep DAG has no way to see it).
+    requires: Dict[str, str] = {}
+    if same_layer_as is not None:
+        requires["same_layer_as"] = same_layer_as
     return Operation(
         name=name,
         reads=set(),
@@ -190,6 +217,7 @@ def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
         bake_fn=bake,
         phase=1180 + layer_idx * 0.01,
         migrated=True,
+        requires=requires,
     )
 
 
@@ -711,6 +739,18 @@ def declare_setdim_compat_dims(
                  "L1H0", "L1H1", "L1H2", "L1H4", "L2H0"]
     # 16-dim nibble groups
     sixteen_dim = ["EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI",
+                   # B9 OUTPUT_HI split: OUTPUT_HI_THIS_STEP is the new
+                   # canonical name for the same-step write band. Same
+                   # numeric base as OUTPUT_HI in _SetDim (190) so baked
+                   # weight indices are byte-identical; the alias keeps
+                   # ``BD.OUTPUT_HI`` lookups in legacy bake bodies
+                   # working unchanged. The 2 cross-step readers
+                   # (layer3_carry_forward_attn head 5,
+                   # layer8_head6_ax_carry_refresh) still read the same
+                   # numeric slot but acknowledge the prev-step semantic
+                   # via ``requires["after"]``. See
+                   # docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
+                   "OUTPUT_HI_THIS_STEP",
                    "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                    "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                    "FETCH_LO", "FETCH_HI", "MUL_ACCUM", "DIV_STAGING",
