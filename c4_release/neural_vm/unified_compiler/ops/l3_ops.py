@@ -151,8 +151,28 @@ def _rewrite_layer3_initial_sp_byte2_to_zero(ffn, S: float, BD) -> int:
     return rewritten
 
 
-def _rewrite_layer3_initial_sp_marker_to_f8(ffn, S: float, BD) -> int:
-    """Materialize initial emitted ``SP_byte0`` as ``0xf8`` at the SP marker."""
+def _rewrite_layer3_initial_sp_marker_to_f8(
+    ffn, S: float, BD, *, jsr_prologue: bool = False
+) -> int:
+    """Materialize initial emitted ``SP_byte0`` as ``0xf8`` at the SP marker.
+
+    Only valid when the program starts with a ``JSR; ENT N`` prologue that
+    pushes the return address (SP = STACK_INIT - 8 = 0x0000fff8 after step 0,
+    so SP_byte0 = 0xf8). For prologue-less programs produced by
+    ``compile_c('int main() {...}')`` — which emit flat IMM-first bytecode
+    with no JSR/CALL/ENT prologue — the real SP byte 0 is 0x00 (the L3 FFN
+    default), and forcibly writing 0xf8 silently corrupts MUL/DIV/anything
+    that needs stack storage.
+
+    Callers must explicitly opt in via ``jsr_prologue=True``. The boolean
+    cannot be auto-detected at L3 FFN bake time: the FFN weights are shared
+    across all positions of all inputs, and ``OP_JSR`` is not yet relayed to
+    the ``MARK_SP`` row until L6 (see vm_step.py line 4604+ for the
+    JSR-gated SP byte 0 fixup that already runs at the operational layer).
+    """
+
+    if not jsr_prologue:
+        return 0
 
     rewritten = 0
     for unit in range(ffn.W_up.shape[0]):
