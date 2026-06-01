@@ -219,37 +219,55 @@ def make_l13_alu_shift_install_op() -> Operation:
 
 def make_l8_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     return _mark_structural_declarations(
-        _make_alu_postop_attach_op("l8_alu_postop_attach", 8, "ALUAddSub", alu_mode)
+        _make_alu_postop_attach_op(
+            "l8_alu_postop_attach", 8, "ALUAddSub", alu_mode,
+            same_layer_as="layer8_alu",
+        )
     )
 
 
 def make_l9_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     return _mark_structural_declarations(
-        _make_alu_postop_attach_op("l9_alu_postop_attach", 9, "ALUAddSub", alu_mode)
+        _make_alu_postop_attach_op(
+            "l9_alu_postop_attach", 9, "ALUAddSub", alu_mode,
+            same_layer_as="layer9_alu",
+        )
     )
 
 
 def make_l10_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     return _mark_structural_declarations(
-        _make_alu_postop_attach_op("l10_alu_postop_attach", 10, "ALUAndOrXor", alu_mode)
+        _make_alu_postop_attach_op(
+            "l10_alu_postop_attach", 10, "ALUAndOrXor", alu_mode,
+            same_layer_as="layer10_alu",
+        )
     )
 
 
 def make_l11_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     return _mark_structural_declarations(
-        _make_alu_postop_attach_op("l11_alu_postop_attach", 11, "ALUMul", alu_mode)
+        _make_alu_postop_attach_op(
+            "l11_alu_postop_attach", 11, "ALUMul", alu_mode,
+            same_layer_as="layer11_mul_partial",
+        )
     )
 
 
 def make_l12_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     return _mark_structural_declarations(
-        _make_alu_postop_attach_op("l12_alu_postop_attach", 12, "ALUMul", alu_mode)
+        _make_alu_postop_attach_op(
+            "l12_alu_postop_attach", 12, "ALUMul", alu_mode,
+            same_layer_as="layer12_mul_combine",
+        )
     )
 
 
 def make_l13_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     return _mark_structural_declarations(
-        _make_alu_postop_attach_op("l13_alu_postop_attach", 13, "ALUShift", alu_mode)
+        _make_alu_postop_attach_op(
+            "l13_alu_postop_attach", 13, "ALUShift", alu_mode,
+            same_layer_as="layer13_shifts",
+        )
     )
 
 
