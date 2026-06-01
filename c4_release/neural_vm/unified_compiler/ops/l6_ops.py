@@ -1,10 +1,76 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..layer_compiler import Operation
 from ..ir import FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L6 attention-head layout (pinned head_idx per primary owner) =====
+#
+# L6 has three attention-bake ops that together own all 8 heads on
+# ``model.blocks[6].attn``. Pre-migration each call site picked its
+# ``head_idx`` either as a bare integer literal (``head_idx=4`` in
+# ``_layer6_bz_bnz_relay_head_spec``) or as an inline ``base = N * HD``
+# cursor inside the spec writers ``_bake_layer6_attn_spec`` (heads 0, 1,
+# 2, 3, 5) and ``_bake_layer6_relay_heads_spec`` (heads 6, 7). This
+# table is the single source of truth for the L6 head axis -- every
+# existing head index in the bakes below is pinned here, so the trained
+# attention weights stay valid and the bake is trivially byte-identical.
+#
+# Each row names a *primary owner* of its head_idx. Three families exist:
+#
+#   * ``layer6_attn_bake`` (phase=998.5): routing FFN's attention support
+#     -- heads 0 (later-step JMP relay), 1 (EXIT relay), 2 (first-step
+#     JMP relay), 3 (first-step JSR relay), 5 (first-step FETCH relay).
+#   * ``layer6_bz_bnz_relay_bake`` (phase=998.7): head 4 (BZ/BNZ relay,
+#     reserved by ``_bake_layer6_attn_spec``).
+#   * ``layer6_relay_heads_bake`` (phase=998.6): heads 6 and 7. Head 7 is
+#     additionally extended by the cancel-pair post-LEV AX_CARRY producer
+#     (slots 1, 2..17, 18, 49..63 within head 7's slot range) that pairs
+#     with L16's ``l16_lev_ax_carry_*`` FFN gates -- this extension lives
+#     within the existing head 7 owner so no new head row is needed.
+#
+# Order mirrors ``head_idx`` so the layout reads top-to-bottom.
+_L6_HEAD_LAYOUT = (
+    # (op_name,                                  head_idx)
+    ("layer6_attn_bake.later_step_jmp_relay",         0),
+    ("layer6_attn_bake.exit_relay",                   1),
+    ("layer6_attn_bake.first_step_jmp_relay",         2),
+    ("layer6_attn_bake.first_step_jsr_relay",         3),
+    ("layer6_bz_bnz_relay_bake.head_4",               4),
+    ("layer6_attn_bake.first_step_fetch_relay",       5),
+    ("layer6_relay_heads_bake.psh_ax_carry_lo",       6),
+    ("layer6_relay_heads_bake.psh_ax_carry_hi",       7),
+)
+_L6_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L6_HEAD_LAYOUT}
+
+
+def _allocate_layer6_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with all L6 heads.
+
+    Each primary owner from :data:`_L6_HEAD_LAYOUT` is pinned at its
+    existing ``head_idx``; the allocator therefore declares the full L6
+    head axis without disturbing any baked attention weights. Returns
+    the allocator so callers can inspect it or extend the layer with a
+    future op that wants a new head via ``allocator.alloc(name, 6)``
+    (no pin, which first-fits the lowest free index -- there are none
+    today since heads 0..7 are all claimed, but the contract is in
+    place for a wider config).
+
+    This is byte-identical bookkeeping: the allocator names the heads,
+    the bakes (``_bake_layer6_attn_spec``,
+    ``_bake_layer6_relay_heads_spec``, ``_layer6_bz_bnz_relay_head_spec``)
+    still write the same Q/K/V/O cells they always have. Each head index
+    in those writers is sourced from :data:`_L6_HEAD_LAYOUT_BY_NAME`, so
+    adding a new head requires only a layout-table edit.
+    """
+    allocator = AttentionHeadAllocator(layer_max_heads=8)
+    for name, head_idx in _L6_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=6, pin=head_idx)
+    return allocator
 
 
 L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT = 320
@@ -2585,7 +2651,7 @@ def _bake_layer6_attn_spec(attn, BD, HD):
     L = 50.0
 
     # Head 0: later-step JMP relay, PC marker reads previous AX marker.
-    base = 0 * HD
+    base = _L6_HEAD_LAYOUT_BY_NAME["layer6_attn_bake.later_step_jmp_relay"] * HD
     attn.W_q[base, BD.MARK_PC] = L
     attn.W_q[base, BD.MARK_AX] = -L
     attn.W_q[base, BD.HAS_SE] = L * 20
@@ -2601,7 +2667,7 @@ def _bake_layer6_attn_spec(attn, BD, HD):
     attn.W_o[BD.CMP + 0, base + 1] = 1.0
 
     # Head 1: EXIT relay, NEXT_SE reads current AX marker.
-    base = 1 * HD
+    base = _L6_HEAD_LAYOUT_BY_NAME["layer6_attn_bake.exit_relay"] * HD
     attn.W_q[base, BD.NEXT_SE] = L
     attn.W_q[base, BD.MARK_AX] = -L
     attn.W_k[base, BD.MARK_AX] = L
@@ -2609,7 +2675,7 @@ def _bake_layer6_attn_spec(attn, BD, HD):
     attn.W_o[BD.CMP + 1, base + 1] = 1.0
 
     # Head 2: first-step JMP relay, PC marker self-attends to fetched target.
-    base = 2 * HD
+    base = _L6_HEAD_LAYOUT_BY_NAME["layer6_attn_bake.first_step_jmp_relay"] * HD
     attn.W_q[base, BD.MARK_PC] = L
     attn.W_q[base, BD.HAS_SE] = -L
     attn.W_q[base, BD.MARK_AX] = -L
@@ -2625,7 +2691,7 @@ def _bake_layer6_attn_spec(attn, BD, HD):
     attn.W_o[BD.CMP + 0, base + 1] = 1.0
 
     # Head 3: first-step JSR relay, AX marker to PC marker.
-    base = 3 * HD
+    base = _L6_HEAD_LAYOUT_BY_NAME["layer6_attn_bake.first_step_jsr_relay"] * HD
     attn.W_q[base, BD.MARK_PC] = L
     attn.W_q[base, BD.MARK_AX] = -L
     attn.W_q[base, BD.HAS_SE] = -L
@@ -2636,7 +2702,7 @@ def _bake_layer6_attn_spec(attn, BD, HD):
     # Head 4 is reserved for layer6_bz_bnz_relay_bake.
 
     # Head 5: first-step FETCH relay, PC marker to AX marker.
-    base = 5 * HD
+    base = _L6_HEAD_LAYOUT_BY_NAME["layer6_attn_bake.first_step_fetch_relay"] * HD
     attn.W_q[base, BD.MARK_AX] = L
     attn.W_q[base, BD.HAS_SE] = -L
     attn.W_k[base, BD.MARK_PC] = L
@@ -2697,7 +2763,7 @@ def _bake_layer6_relay_heads_spec(attn, BD, HD):
     BP_I = 3
 
     # Head 6: STACK0 reads AX_CARRY_LO from AX into ALU_LO.
-    base = 6 * HD
+    base = _L6_HEAD_LAYOUT_BY_NAME["layer6_relay_heads_bake.psh_ax_carry_lo"] * HD
     # Mirror the opcode relay's marker coverage here so the PSH/JSR/ENT flags
     # are available to the same L6 FFN step even if later model-level relay
     # post-passes are trimmed or reordered.
@@ -2759,7 +2825,7 @@ def _bake_layer6_relay_heads_spec(attn, BD, HD):
         attn.W_o[BD.ALU_LO + k, base + 8 + k] = 1.0
 
     # Head 7: STACK0 reads AX_CARRY_HI from AX into ALU_HI.
-    base = 7 * HD
+    base = _L6_HEAD_LAYOUT_BY_NAME["layer6_relay_heads_bake.psh_ax_carry_hi"] * HD
     attn.W_q[base, BD.MARK_STACK0] = L + L * 20
     attn.W_q[base, BD.MARK_AX] = -L
     attn.W_q[base, BD.CONST] = -L * 20
@@ -2859,11 +2925,22 @@ def make_layer6_attn_bake_op() -> Operation:
         del S
         attn = model.blocks[6].attn
         HD = attn.W_q.shape[0] // attn.num_heads
+        # Per-bake attention-head allocator with the full L6 head layout
+        # pinned. Stashed on ``attn`` (``model.blocks[6].attn`` IS the L6
+        # block's ``block.attn``) for inspection / extension by downstream
+        # tools, mirroring the L4 / L7 convention. The actual head
+        # indices used by ``_bake_layer6_attn_spec`` are sourced from
+        # :data:`_L6_HEAD_LAYOUT_BY_NAME`, so the spec stays in lockstep
+        # with the layout table.
+        attn._l6_head_allocator = _allocate_layer6_heads()
         _bake_layer6_attn_spec(attn, _as_setdim_proxy(dim_positions), HD)
         # Keep the first-step FETCH relay sharp enough to select the PC marker
         # under strict neural smoke; the base spec stays byte-identical to the
         # legacy helper and this bake owns the production-only scale bump.
-        attn.W_k.data[5 * HD] *= 10.0
+        attn.W_k.data[
+            _L6_HEAD_LAYOUT_BY_NAME["layer6_attn_bake.first_step_fetch_relay"]
+            * HD
+        ] *= 10.0
 
     # Dim-ownership claims. ``_bake_layer6_attn_spec`` writes heads 0, 1, 2,
     # 3, and 5 (head 4 is owned by ``layer6_bz_bnz_relay_bake``, heads 6/7 by
@@ -2999,6 +3076,13 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         del S
         attn = model.blocks[6].attn
         HD = attn.W_q.shape[0] // attn.num_heads
+        # Per-bake attention-head allocator (re-installed here even though
+        # ``layer6_attn_bake`` at phase 998.5 installs an identical
+        # snapshot first: this guards against future schedules that run
+        # this op standalone). Heads 6 and 7 are sourced from
+        # :data:`_L6_HEAD_LAYOUT_BY_NAME` inside
+        # ``_bake_layer6_relay_heads_spec``.
+        attn._l6_head_allocator = _allocate_layer6_heads()
         _bake_layer6_relay_heads_spec(attn, _as_setdim_proxy(dim_positions), HD)
 
     # Dim-ownership claims. ``_bake_layer6_relay_heads_spec`` programs L6
@@ -3146,6 +3230,13 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
     def bake(model, dim_positions, S):
         attn = model.blocks[6].attn
         HD = attn.W_q.shape[0] // attn.num_heads
+        # Per-bake attention-head allocator (re-installed here even though
+        # ``layer6_attn_bake`` at phase 998.5 installs an identical
+        # snapshot first: this guards against future schedules that run
+        # this op standalone). Head 4 is sourced from
+        # :data:`_L6_HEAD_LAYOUT_BY_NAME` inside
+        # ``_layer6_bz_bnz_relay_head_spec``.
+        attn._l6_head_allocator = _allocate_layer6_heads()
         Primitives.generate_attention_head(
             attn,
             _layer6_bz_bnz_relay_head_spec(_as_setdim_proxy(dim_positions)),
@@ -3191,7 +3282,7 @@ def _layer6_bz_bnz_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     L = 50.0
     AX_I = 1
     return DeclarativeAttentionHeadSpec(
-        head_idx=4,
+        head_idx=_L6_HEAD_LAYOUT_BY_NAME["layer6_bz_bnz_relay_bake.head_4"],
         q=(
             AP(0, BD.MARK_PC, L),
             AP(0, BD.MARK_AX, -L),
