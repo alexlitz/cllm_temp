@@ -3916,8 +3916,9 @@ def verify_rule_strength(
 
 def _collect_ffn_rules_from_op(op) -> List:
     """Walk an Operation to find its FFNRules. Operations expose rules
-    via ``.compiler_ir`` which can be an FFNOp, a list, or other shapes.
-    Handles the common cases; returns ``[]`` for ops without FFN rules."""
+    via ``.compiler_ir`` which can be an FFNOp, a CompilerIR with
+    ``.layers[].ffn``, a list, or other shapes.  Handles the common
+    cases; returns ``[]`` for ops without FFN rules."""
     from neural_vm.unified_compiler.ir import FFNRule, FFNOp
 
     ir = getattr(op, "compiler_ir", None)
@@ -3928,6 +3929,14 @@ def _collect_ffn_rules_from_op(op) -> List:
     # FFNOp case
     if isinstance(ir, FFNOp):
         return list(ir.rules)
+    # CompilerIR with .layers[].ffn (mirrors writer_index._collect_ffn_rules_from_op)
+    if hasattr(ir, "layers"):
+        for layer in ir.layers:
+            ffn = getattr(layer, "ffn", None)
+            if ffn is not None and hasattr(ffn, "rules"):
+                rules.extend(ffn.rules)
+        if rules:
+            return rules
     # List-of-rules case
     if isinstance(ir, list):
         for item in ir:
