@@ -4343,11 +4343,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ALU_LO+8", 5.0),
                 ("ALU_LO+7", -10.0),
                 ("ALU_LO+10", -20.0),
-                # Soft positive evidence from L13 ADDR_B0 lanes (B5-D).
-                # 0xE0 → (LO+0, HI+14). These add conviction when L13's
-                # gather has completed; they are not required to fire.
-                ("ADDR_B0_LO+0", 2.0),
-                ("ADDR_B0_HI+14", 2.0),
+                # D2 revert (CAMPAIGN_SUMMARY bug #27): the soft B5-D
+                # ADDR_B0_LO+0 / ADDR_B0_HI+14 (+2.0 each) evidence reads
+                # were removed because L13's gather had not populated
+                # ADDR_B0 by the time this PSH-at-SP rule fires, so the
+                # reads were misfiring on SP byte 0 step 2 and driving
+                # the +432 SP_byte0 cluster on func_*/rec_*/nested_*/
+                # absdiff_*.  Rule M now relies on its CMP+0 / ALU_LO+8
+                # / PSH_AT_SP / OP_ENT-blocker discrimination only.
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
