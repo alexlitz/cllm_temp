@@ -969,7 +969,9 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer14_clear_mem_marker_output
         ffn = block.ffn
-        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        # Pinned to chain offset 70 (predecessors consume units 0..69).
+        # Byte-identical with the legacy ``_l14_unit_counter`` start.
+        start_unit = _l14_chain_alloc("layer14_clear_mem_marker_output")
         next_unit = _set_layer14_clear_mem_marker_output(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
