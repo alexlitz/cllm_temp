@@ -847,6 +847,29 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # handles the BP marker/byte0 position; byte continuation rows can keep a
     # stronger stale zero lane after stores. Gate on the BP byte stream and the
     # just-emitted byte0 value (0xf0), then make byte1's nibble bands exact.
+    #
+    # FIXME(if-var): The 50.0/S strength here is too weak for if_var_*
+    # programs (1096-suite IDs 425-449: `int main(){int x;x=N;if(x>M)...}`).
+    # Teacher-forced lowering audit (C4_1096_LOWERING_AUDIT=1, OFFSET=425
+    # LIMIT=2) shows step1:BP_byte1 abs=200 expected=0xff argmax=0xf0,
+    # OUT_LO[15]=+52.85 arg=0/+68.09 OUT_HI[15]=+52.85 arg=15/+52.85.
+    # OUTPUT_HI correctly wins at +15 but OUTPUT_LO is dominated at +0 by
+    # ~15.24 logits. The conditions look correct (H1+3 BP marker,
+    # BYTE_INDEX_0 just-emitted-was-byte-0, CLEAN_EMBED_LO+0/HI+15 means
+    # last byte was 0xf0), but a competing rule pumps OUTPUT_LO+0 stronger
+    # than the +50/S = 0.5 strength can overcome. The visible "first loss
+    # after support" is at block=24 layer=15 width=42 with massive
+    # expected_logit=+41.42 vs argmax_logit=+758.98 (margin=-717.55),
+    # consistent with a wide attention writer at L15 dumping into
+    # OUTPUT_LO+0 across BP rows in the local-frame post-store cadence.
+    # Candidate culprits: a top-store STACK0 restore rule (e.g.
+    # l16_top_store_stack0_restore_*) firing on the BP byte row due to
+    # missing MARK_BP blocker, or an L15 SI/SC bake leaking byte0 across
+    # the BP marker boundary. Bumping this rule's strength to 1000.0/S
+    # risks regressing nested-call ENT cases where the saved-BP byte1
+    # legitimately differs; the cleaner fix is identifying the wide
+    # OUTPUT_LO+0 writer at L15 and adding an H1+3 / MARK_BP blocker
+    # there. See project_l10_psh_addr_ent_bug for related L10 context.
     bp_frame_byte1_ff_conditions = (
         ("IS_BYTE", 1.0),
         ("HAS_SE", 1.0),
