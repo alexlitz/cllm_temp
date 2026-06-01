@@ -2612,6 +2612,91 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         _bake_layer6_relay_heads_spec(attn, _as_setdim_proxy(dim_positions), HD)
 
+    # Dim-ownership claims. ``_bake_layer6_relay_heads_spec`` programs L6
+    # heads 6 and 7 (Q/K/V/O). Head 6 owns the PSH/JSR/ENT/LEV/PSH-group
+    # opcode flag relay (slots 0-7 are control flags, slots 8-23 are the
+    # AX_CARRY_LO byte-0 lanes). Head 7 owns the AX_CARRY_HI -> ALU_HI relay
+    # at slots 33-48. ``opcode_relay_head`` (phase=1002) re-writes the
+    # head-6 cells with identical values and therefore declares no claims;
+    # ownership is anchored here (see ``model_ops.make_opcode_relay_head_op``
+    # docstring for the rationale).
+    _claims = frozenset({
+        # Head 6 Q at slot 0: gather across markers.
+        (6, "attn_W_q", "6_0", "MARK_SP+0"),
+        (6, "attn_W_q", "6_0", "H1+2"),
+        (6, "attn_W_q", "6_0", "MARK_STACK0+0"),
+        (6, "attn_W_q", "6_0", "L1H4+3"),
+        (6, "attn_W_q", "6_0", "MARK_BP+0"),
+        (6, "attn_W_q", "6_0", "MARK_PC+0"),
+        (6, "attn_W_q", "6_0", "MARK_MEM+0"),
+        (6, "attn_W_q", "6_0", "MARK_AX+0"),
+        # Head 6 K at slot 0.
+        (6, "attn_W_k", "6_0", "MARK_AX+0"),
+        # Head 6 V opcode lanes (slots 0-7).
+        (6, "attn_W_v", "6_0", "OP_LEV+0"),
+        (6, "attn_W_v", "6_1", "OP_PSH+0"),
+        (6, "attn_W_v", "6_2", "OP_ADJ+0"),
+        # Slot 3 receives the binary-pop group (OP_ADD..OP_SC) at +0.04.
+        (6, "attn_W_v", "6_3", "OP_ADD+0"),
+        (6, "attn_W_v", "6_3", "OP_SUB+0"),
+        (6, "attn_W_v", "6_3", "OP_MUL+0"),
+        (6, "attn_W_v", "6_3", "OP_DIV+0"),
+        (6, "attn_W_v", "6_3", "OP_MOD+0"),
+        (6, "attn_W_v", "6_3", "OP_EQ+0"),
+        (6, "attn_W_v", "6_3", "OP_NE+0"),
+        (6, "attn_W_v", "6_3", "OP_LT+0"),
+        (6, "attn_W_v", "6_3", "OP_GT+0"),
+        (6, "attn_W_v", "6_3", "OP_LE+0"),
+        (6, "attn_W_v", "6_3", "OP_GE+0"),
+        (6, "attn_W_v", "6_3", "OP_OR+0"),
+        (6, "attn_W_v", "6_3", "OP_XOR+0"),
+        (6, "attn_W_v", "6_3", "OP_AND+0"),
+        (6, "attn_W_v", "6_3", "OP_SHL+0"),
+        (6, "attn_W_v", "6_3", "OP_SHR+0"),
+        (6, "attn_W_v", "6_3", "OP_SI+0"),
+        (6, "attn_W_v", "6_3", "OP_SC+0"),
+        (6, "attn_W_v", "6_4", "OP_ENT+0"),
+        (6, "attn_W_v", "6_5", "OP_JSR+0"),
+        # Slot 6 is a multi-opcode pop-group flag.
+        (6, "attn_W_v", "6_6", "OP_SI+0"),
+        (6, "attn_W_v", "6_6", "OP_SC+0"),
+        (6, "attn_W_v", "6_6", "OP_PSH+0"),
+        (6, "attn_W_v", "6_6", "OP_JSR+0"),
+        (6, "attn_W_v", "6_6", "OP_ENT+0"),
+        (6, "attn_W_v", "6_7", "OP_SI+0"),
+        (6, "attn_W_v", "6_7", "OP_SC+0"),
+        # Head 6 O: opcode flag writebacks.
+        (6, "attn_W_o", "6_1", "CMP+0"),
+        (6, "attn_W_o", "6_1", "PSH_AT_SP+0"),
+        (6, "attn_W_o", "6_2", "CMP+1"),
+        (6, "attn_W_o", "6_3", "CMP+3"),
+        (6, "attn_W_o", "6_4", "CMP+2"),
+        (6, "attn_W_o", "6_5", "CMP+4"),
+        (6, "attn_W_o", "6_5", "OP_JSR+0"),
+        (6, "attn_W_o", "6_4", "OP_ENT+0"),
+        (6, "attn_W_o", "6_6", "MEM_STORE+0"),
+        (6, "attn_W_o", "6_7", "MEM_ADDR_SRC+0"),
+        (6, "attn_W_o", "6_0", "OP_LEV+0"),
+    })
+    # Head 6 V + O for AX_CARRY_LO byte-0 relay (slots 8..23).
+    _claims = _claims | frozenset({
+        (6, "attn_W_v", f"6_{8 + k}", f"AX_CARRY_LO+{k}")
+        for k in range(16)
+    }) | frozenset({
+        (6, "attn_W_o", f"6_{8 + k}", f"ALU_LO+{k}")
+        for k in range(16)
+    })
+    # Head 7 Q/K at slot 0 and V/O for AX_CARRY_HI byte-1 relay (slots 33..48).
+    _claims = _claims | frozenset({
+        (6, "attn_W_k", "7_0", "MARK_AX+0"),
+    }) | frozenset({
+        (6, "attn_W_v", f"7_{33 + k}", f"AX_CARRY_HI+{k}")
+        for k in range(16)
+    }) | frozenset({
+        (6, "attn_W_o", f"7_{33 + k}", f"ALU_HI+{k}")
+        for k in range(16)
+    })
+
     return Operation(
         name="layer6_relay_heads_bake",
         phase=998.6,
@@ -2622,6 +2707,7 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         migrated=True,
+        claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
