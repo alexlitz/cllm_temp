@@ -2919,6 +2919,72 @@ def make_binary_pop_sp_increment_op() -> Operation:
         proxy = _as_setdim_proxy(dim_positions)
         _lower_layer6_binary_pop_sp_increment_ir(model.blocks[6].ffn, S, proxy)
 
+    # Dim-ownership claims. ``_layer6_binary_pop_sp_increment_rules`` lowers
+    # 34 FFNRules into units 2294..2327 of the L6 FFN:
+    #   - units 2294..2309: SP_LO += 1 ladder gated on EMBED_LO+k (k=0..15);
+    #     each unit's W_up shares the (MARK_SP, CMP+3, -IS_BYTE/-other-marker)
+    #     gate, W_gate selects EMBED_LO+k, W_down writes OUTPUT_LO+(k+8) and
+    #     OUTPUT_LO+k (the canceling pair).
+    #   - units 2310..2325: SP_HI += 1 ladder gated on EMBED_HI+k (k=0..15)
+    #     with an additional 8-wide EMBED_LO blocker bank in W_up; W_gate
+    #     selects EMBED_HI+k, W_down writes OUTPUT_HI+(k+1)%16 and OUTPUT_HI+k.
+    #   - unit 2326: byte-row pop boundary fixup (BYTE_INDEX_0 + CLEAN_EMBED
+    #     gates -> OUTPUT_{LO,HI}+0).
+    #   - unit 2327: same idea for BYTE_INDEX_1 (-> OUTPUT_LO+1, OUTPUT_HI+0
+    #     plus clean-embed cancels).
+    _claims = set()
+    # Shared marker / opcode-flag conditions present on every LO/HI unit
+    # (rule.conditions[0:8] for the LO band; HI band adds EMBED_LO blockers).
+    _lo_hi_cond_cols = (
+        "MARK_SP+0", "CMP+3", "IS_BYTE+0", "MARK_PC+0", "MARK_AX+0",
+        "MARK_BP+0", "MARK_STACK0+0", "MARK_MEM+0",
+    )
+    for unit_off in range(16):
+        unit = 2294 + unit_off
+        for col in _lo_hi_cond_cols:
+            _claims.add((6, "ffn_W_up", str(unit), col))
+        _claims.add((6, "ffn_W_gate", str(unit), f"EMBED_LO+{unit_off}"))
+        new_off = (unit_off + 8) % 16
+        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_LO+{new_off}"))
+        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_LO+{unit_off}"))
+    for unit_off in range(16):
+        unit = 2310 + unit_off
+        for col in _lo_hi_cond_cols:
+            _claims.add((6, "ffn_W_up", str(unit), col))
+        for lo_bit in range(8):
+            _claims.add((6, "ffn_W_up", str(unit), f"EMBED_LO+{lo_bit}"))
+        _claims.add((6, "ffn_W_gate", str(unit), f"EMBED_HI+{unit_off}"))
+        new_carry = (unit_off + 1) % 16
+        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI+{new_carry}"))
+        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI+{unit_off}"))
+    # byte_row_conditions: IS_BYTE, H1+2, CMP+3, plus 6 marker blockers
+    # (-PC, -AX, -SP, -BP, -STACK0, -MEM).
+    _byte_row_cond_cols = (
+        "IS_BYTE+0", "H1+2", "CMP+3", "MARK_PC+0", "MARK_AX+0",
+        "MARK_SP+0", "MARK_BP+0", "MARK_STACK0+0", "MARK_MEM+0",
+    )
+    # Unit 2326: l6_binary_pop_sp_byte1_ff_to_00_lo
+    for col in _byte_row_cond_cols:
+        _claims.add((6, "ffn_W_up", "2326", col))
+    _claims.add((6, "ffn_W_up", "2326", "BYTE_INDEX_0+0"))
+    _claims.add((6, "ffn_W_up", "2326", "CLEAN_EMBED_LO+0"))
+    _claims.add((6, "ffn_W_up", "2326", "CLEAN_EMBED_HI+0"))
+    _claims.add((6, "ffn_W_gate", "2326", "CONST+0"))
+    _claims.add((6, "ffn_W_down", "2326", "OUTPUT_LO+0"))
+    _claims.add((6, "ffn_W_down", "2326", "OUTPUT_HI+0"))
+    # Unit 2327: l6_binary_pop_sp_byte2_00_to_01_lo
+    for col in _byte_row_cond_cols:
+        _claims.add((6, "ffn_W_up", "2327", col))
+    _claims.add((6, "ffn_W_up", "2327", "BYTE_INDEX_1+0"))
+    _claims.add((6, "ffn_W_up", "2327", "CLEAN_EMBED_LO+0"))
+    _claims.add((6, "ffn_W_up", "2327", "CLEAN_EMBED_HI+0"))
+    _claims.add((6, "ffn_W_gate", "2327", "CONST+0"))
+    _claims.add((6, "ffn_W_down", "2327", "OUTPUT_LO+1"))
+    _claims.add((6, "ffn_W_down", "2327", "OUTPUT_HI+0"))
+    _claims.add((6, "ffn_W_down", "2327", "CLEAN_EMBED_LO+0"))
+    _claims.add((6, "ffn_W_down", "2327", "CLEAN_EMBED_HI+0"))
+    _claims = frozenset(_claims)
+
     return Operation(
         name="binary_pop_sp_increment",
         reads=set(),
@@ -2931,6 +2997,7 @@ def make_binary_pop_sp_increment_op() -> Operation:
         migrated=True,
         layer_idx=6,
         ffn_units_used=L6_BINARY_POP_SP_INCREMENT_END_UNIT,
+        claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
