@@ -1,9 +1,59 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L0 FFN unit layout (pinned offsets) ============================
+#
+# The ``phase_a_ffn`` op owns the entire L0 FFN. The actual weight writes
+# happen inside ``vm_step._set_phase_a_ffn`` (and the equivalent
+# ``_bake_phase_a_ffn`` declarative path used by the migrated bake), which
+# iterates the 7-entry ``transitions`` list and writes one hidden unit per
+# transition at indices 0..6 (W_up[i, up_dim] / W_down[out_dim, i]).
+# Migration to :class:`FFNUnitAllocator` keeps the helper byte-identical --
+# we just declare each transition's unit at its existing pinned offset so
+# the layout is auditable rather than implicit. A future L0 op family would
+# call ``allocator.alloc(name, n)`` without a pin and get a free gap above 7.
+#
+# The offsets below mirror the transition order in ``_set_phase_a_ffn``
+# (SE->PC, PC->AX, AX->SP, SP->BP, BP->STACK0, STACK0->MEM, MEM->SE).
+# Changing the helper's transition list requires updating this table in
+# lock-step.
+_PHASE_A_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("phase_a_ffn.se_to_pc",      0, 1),  # SE -> NEXT_PC (constant write)
+    ("phase_a_ffn.pc_to_ax",      1, 1),  # PC -> NEXT_AX (gated by H0+PC)
+    ("phase_a_ffn.ax_to_sp",      2, 1),  # AX -> NEXT_SP (gated by H0+AX)
+    ("phase_a_ffn.sp_to_bp",      3, 1),  # SP -> NEXT_BP (gated by H0+SP)
+    ("phase_a_ffn.bp_to_stack0",  4, 1),  # BP -> NEXT_STACK0 (gated by H0+BP)
+    ("phase_a_ffn.stack0_to_mem", 5, 1),  # STACK0 -> NEXT_MEM (gated by H3+BP)
+    ("phase_a_ffn.mem_to_se",     6, 1),  # MEM -> NEXT_SE (gated by H2+MEM)
+)
+
+
+def _allocate_phase_a_ffn_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L0 phase-A units.
+
+    Every transition is pinned at its existing offset (units 0..6) so the
+    underlying ``_bake_phase_a_ffn`` helper -- which writes via its own
+    sequential start_unit=0 cursor through ``Primitives.lower_ffn_rules``
+    -- lands on exactly the same hidden-unit indices it always has. This
+    call is byte-identical bookkeeping: the allocator declares ranges by
+    name, the helper writes the weights. A future refactor can split the
+    helper into per-transition bake functions that consume
+    ``allocator.alloc(...)`` directly.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L0 op family claims a free range starting at unit 7).
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _PHASE_A_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def _phase_a_ffn_rules(S: float) -> tuple[FFNRule, ...]:
@@ -72,7 +122,27 @@ def make_phase_a_ffn_op() -> Operation:
     """
     def bake(block, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
-        _bake_phase_a_ffn(block.ffn, S, proxy)
+
+        # Per-bake FFN-unit allocator. Each L0 phase-A transition is pinned
+        # to its existing offset so the call below lands byte-identically.
+        # The total ``n_units`` across the allocator's ranges MUST equal the
+        # helper's monotonic unit count, or the byte-identity guard fires.
+        allocator = _allocate_phase_a_ffn_units()
+        # Make the allocator available for inspection / extension by
+        # downstream tools (e.g. a future L0 op family claiming a free
+        # gap). Mirrors the ``_l9_unit_allocator`` convention used by L9.
+        block.ffn._l0_unit_allocator = allocator
+
+        n0 = _bake_phase_a_ffn(block.ffn, S, proxy)
+        # Byte-identity guard: the helper's returned cursor MUST equal the
+        # sum of all declared unit ranges. If the table drifts from the
+        # helper's writes, this assertion fires before any weight surgery
+        # propagates downstream.
+        expected_total = sum(n for _, _, n in _PHASE_A_FFN_UNIT_LAYOUT)
+        assert n0 == expected_total, (
+            f"L0 phase_a_ffn unit cursor drift: helper wrote {n0} units, "
+            f"allocator declared {expected_total}"
+        )
 
     # Dim-ownership claims: ``_set_phase_a_ffn`` writes units 0..6 (one per
     # marker transition) into the L0 FFN. The W_up rows read H0..H4 marker
