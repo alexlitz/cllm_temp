@@ -325,6 +325,15 @@ def make_layer2_lookback_detection_head_op(
         ),
         declarative_authority="spec_generated",
         migrated=True,
+        # B12 backfill (wave 1b): pin strictly after layer1_threshold_attn.
+        # Flag-gated stub (enable_conversational_io); writes={} leaves the
+        # dep DAG with no derived placement. The structural intent is
+        # "L2-block resident, after the L1 threshold block has run." The
+        # spec's §25 alternative (after layer2_threshold_attn) would push
+        # dep_depth to 3 and trigger phase_inconsistent_with_deps at
+        # current_layer=2; using layer1_threshold_attn keeps dep_depth at
+        # the L2 floor (= current_layer) and reaches phase_pinned_by_deps.
+        requires={"after": "layer1_threshold_attn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
