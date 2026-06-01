@@ -400,6 +400,7 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         migrated=True,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir=make_convo_io_state_machine_ir(),
         ffn_units_used=1402 if enable_conversational_io else None,
         # B12 backfill: docstring above names ``layer6_routing_ffn`` (phase
         # 6.5, same L6 FFN) as the required predecessor — the base routing
@@ -447,6 +448,21 @@ def _lower_convo_io_state_machine_ir(ffn, S: float, BD) -> int:
         start_unit=1400,
         S=S,
     )
+
+
+def make_convo_io_state_machine_ir(S: float = 100.0) -> CompilerIR:
+    """Declarative CompilerIR for the L6 convo-IO state machine band.
+
+    Mirrors ``_lower_convo_io_state_machine_ir`` so the verifier, scope
+    checker, and dominance auditor can read the rule set directly. The
+    actual bake stays in ``make_convo_io_state_machine_op`` because the
+    band is pinned to L6 FFN units 1400..1401, which the generic
+    ``_dispatch_operation_ir`` (start_unit=0) cannot replicate.
+    """
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_convo_io_state_machine_rules(S))
+    return ir
 
 
 # ---------------------------------------------------------------------------
