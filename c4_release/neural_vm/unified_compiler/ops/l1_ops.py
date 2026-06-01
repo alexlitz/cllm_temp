@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
@@ -142,6 +143,42 @@ def _bake_layer1_ffn(ffn, S, BD):
         unit += 1
 
 
+_L1_HEAD_LAYOUT = (
+    # (op_name, pinned head_idx)
+    #
+    # Heads 0..2: fine threshold heads producing L1H0/L1H1/L1H2 (thresholds
+    # 0.5/1.5/2.5 against IS_MARK). Pinned at indices 0/1/2.
+    # Head 3: HAS_SE global STEP_END detector (slope=0 disables ALiBi decay).
+    # Head 4: threshold 6.5 producing L1H4 (STACK0 byte 0 identification).
+    # Head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay producer (positive
+    # ALiBi slope 0.5 so the softmax1 anchor wins as distance grows).
+    ("layer1_threshold_attn.l1h0",            0),
+    ("layer1_threshold_attn.l1h1",            1),
+    ("layer1_threshold_attn.l1h2",            2),
+    ("layer1_threshold_attn.has_se",          3),
+    ("layer1_threshold_attn.l1h4",            4),
+    ("layer1_threshold_attn.in_step_fresh",   5),
+)
+
+
+def _allocate_layer1_attn_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with every L1 head pinned.
+
+    Every existing ``head_idx`` in ``layer1_threshold_attn`` is declared at
+    its current slot so the bake stays byte-identical: ``W_q``/``W_k``/
+    ``W_v``/``W_o`` rows land in the same ``head_idx * HD + slot``
+    positions they always have. A future L1 attention head would call
+    ``allocator.alloc(name, layer_idx=1)`` without a pin and receive the
+    first free index past 5 (i.e. 6 or 7).
+
+    Returns the allocator so callers can inspect or extend it.
+    """
+    allocator = AttentionHeadAllocator()
+    for op_name, head_idx in _L1_HEAD_LAYOUT:
+        allocator.alloc(op_name, layer_idx=1, pin=head_idx)
+    return allocator
+
+
 def make_layer1_threshold_attn_op() -> Operation:
     """L1 attention: 3 fine threshold heads + STEP_END + L1H4 + IN_STEP_FRESH.
 
@@ -158,6 +195,22 @@ def make_layer1_threshold_attn_op() -> Operation:
     """
     def bake(attn, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
+
+        # Per-bake attention-head allocator. Every existing head_idx is
+        # pinned at its current slot so the calls below land
+        # byte-identically. Stashed on the attention module so downstream
+        # tools (e.g. a future L1 op claiming a free gap past head 5) can
+        # inspect or extend the layout. Mirrors the ``_l1_unit_allocator``
+        # FFN convention from ``make_layer1_ffn_op``.
+        head_allocator = _allocate_layer1_attn_heads()
+        attn._l1_head_allocator = head_allocator
+        h_l1h0 = head_allocator.heads()[0].head_idx
+        h_l1h1 = head_allocator.heads()[1].head_idx
+        h_l1h2 = head_allocator.heads()[2].head_idx
+        h_has_se = head_allocator.heads()[3].head_idx
+        h_l1h4 = head_allocator.heads()[4].head_idx
+        h_in_step_fresh = head_allocator.heads()[5].head_idx
+
         ALIBI_S = 10.0
         # B7-1: ALiBi slope chosen so IN_STEP_FRESH decays from ~1.0 right
         # after a STEP_END toward ~0 within the 35-token step window. The
@@ -171,8 +224,8 @@ def make_layer1_threshold_attn_op() -> Operation:
         IN_STEP_FRESH_ALIBI_S = 0.5
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(ALIBI_S)
-            attn.alibi_slopes[3] = 0.0  # global SE detection
-            attn.alibi_slopes[5] = IN_STEP_FRESH_ALIBI_S  # B7-1: decay
+            attn.alibi_slopes[h_has_se] = 0.0  # global SE detection
+            attn.alibi_slopes[h_in_step_fresh] = IN_STEP_FRESH_ALIBI_S  # B7-1: decay
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_threshold_attention_heads(
             attn,
@@ -180,14 +233,14 @@ def make_layer1_threshold_attn_op() -> Operation:
             [proxy.L1H0, proxy.L1H1, proxy.L1H2],
             ALIBI_S,
             HD,
-            heads=[0, 1, 2],
+            heads=[h_l1h0, h_l1h1, h_l1h2],
             bd=proxy,
         )
         # Head 3: STEP_END existence detection (global)
         Primitives.generate_attention_head(
             attn,
             DeclarativeAttentionHeadSpec(
-                head_idx=3,
+                head_idx=h_has_se,
                 q=(AP(0, proxy.CONST, 10.0),),
                 k=(AP(0, proxy.MARK_SE_ONLY, 10.0),),
                 v=(AP(1, proxy.MARK_SE_ONLY, 1.0),),
@@ -197,7 +250,7 @@ def make_layer1_threshold_attn_op() -> Operation:
         )
         # Head 4: threshold 6.5 for STACK0 byte 0 identification
         Primitives.generate_threshold_attention_heads(
-            attn, [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4], bd=proxy,
+            attn, [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[h_l1h4], bd=proxy,
         )
         # Head 5 (B7-1): IN_STEP_FRESH recency-to-SE decay. Same Q/K/V/O
         # shape as head 3 but uses positive ALiBi slope so the attention
@@ -208,7 +261,7 @@ def make_layer1_threshold_attn_op() -> Operation:
         Primitives.generate_attention_head(
             attn,
             DeclarativeAttentionHeadSpec(
-                head_idx=5,
+                head_idx=h_in_step_fresh,
                 q=(AP(0, proxy.CONST, 10.0),),
                 k=(
                     AP(0, proxy.MARK_SE_ONLY, 10.0),
