@@ -44,7 +44,7 @@ Example:
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 
 # Allowed `scope` values for `Operation.claims`. Each scope tags a class of
@@ -224,7 +224,30 @@ class Operation:
     # Tier A verifier annotations. Empty means "not annotated"; these fields
     # are metadata only unless a verifier chooses to inspect them.
     reset_after_step: Set[str] = field(default_factory=set)
-    requires: Dict[str, str] = field(default_factory=dict)
+    # Ordering / placement constraints. Historically a Dict[str, str] of
+    # residual-constraint strings (free-form), which the verifier treats as
+    # documentation. Two reserved keys carry scheduler semantics (B10 of the
+    # dynamic scheduler migration, see docs/DYNAMIC_SCHEDULER_MIGRATION_PLAN.md
+    # §B10):
+    #
+    #   requires["after"] = "<op_name>" | (op_name, ...) | [op_name, ...]
+    #       This op must be scheduled strictly after every referenced op
+    #       (treated as a dep-graph edge by the scheduler / analyzer).
+    #
+    #   requires["same_layer_as"] = "<op_name>" | (op_name, ...)
+    #       This op must be assigned to the same ``layer_idx`` as the
+    #       referenced op. Honoured by the dynamic compile path (B11). The
+    #       static path treats it as an ``after`` edge plus a per-layer
+    #       equality assertion at bake time.
+    #
+    # Any other key retains the legacy residual-constraint string semantics
+    # (used by ad-hoc decl_verifier docstring scans only). Values for the
+    # reserved keys may be a single string OR an iterable of strings to
+    # reference multiple ops; ``requires_after_ops()`` and
+    # ``requires_same_layer_as_ops()`` below are the canonical accessors.
+    requires: Dict[str, Union[str, Tuple[str, ...], List[str]]] = field(
+        default_factory=dict
+    )
     opcodes: Set[str] = field(default_factory=set)
     # Tier B declarative-verifier annotations. These are opt-in and default
     # to no-op values so existing operation declarations remain valid:
@@ -261,6 +284,100 @@ class Operation:
 
     def __hash__(self):
         return hash(self.name)
+
+
+# Reserved ``Operation.requires`` keys whose values are op-name references
+# (single string or iterable of strings) rather than residual-constraint
+# strings. See ``Operation.requires`` docstring for semantics.
+REQUIRES_AFTER_KEY = "after"
+REQUIRES_SAME_LAYER_AS_KEY = "same_layer_as"
+REQUIRES_OP_NAME_KEYS = frozenset({REQUIRES_AFTER_KEY, REQUIRES_SAME_LAYER_AS_KEY})
+
+
+def _requires_op_names(value) -> Tuple[str, ...]:
+    """Normalize a ``requires[key]`` value into a tuple of op-name strings.
+
+    Accepts a single string, or an iterable of strings. Empty iterables
+    become an empty tuple. Other types raise ``TypeError`` at lookup time
+    so authors get an immediate error rather than a silently-dropped edge.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,) if value else ()
+    if isinstance(value, (list, tuple, set, frozenset)):
+        out: List[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError(
+                    f"requires op-name reference must be str, got "
+                    f"{type(item).__name__}: {item!r}"
+                )
+            if item:
+                out.append(item)
+        return tuple(out)
+    raise TypeError(
+        "requires op-name reference must be str or iterable of str; got "
+        f"{type(value).__name__}: {value!r}"
+    )
+
+
+def requires_after_ops(op: "Operation") -> Tuple[str, ...]:
+    """Return the op-name strings ``op`` requires to run before it.
+
+    Returns an empty tuple when no ``requires["after"]`` is declared. The
+    returned names are NOT validated against the global op set — callers
+    (scheduler / analyzer) decide whether an unknown name is an error.
+    """
+    return _requires_op_names(op.requires.get(REQUIRES_AFTER_KEY))
+
+
+def requires_same_layer_as_ops(op: "Operation") -> Tuple[str, ...]:
+    """Return the op-name strings ``op`` must share a layer with.
+
+    Returns an empty tuple when no ``requires["same_layer_as"]`` is
+    declared. Same-layer-as implies an ``after`` edge for scheduling
+    purposes (the referenced op must already have been placed when the
+    layer for this op is decided) plus an equality assertion downstream.
+    """
+    return _requires_op_names(op.requires.get(REQUIRES_SAME_LAYER_AS_KEY))
+
+
+def validate_requires_op_refs(
+    ops: Iterable["Operation"],
+) -> List[str]:
+    """Return error messages for any ``requires`` op-name reference whose
+    target name is not present in ``ops``.
+
+    Pure validation — never raises. Empty list means every op-name
+    reference resolves to a known op.
+    """
+    names: Set[str] = {op.name for op in ops}
+    errors: List[str] = []
+    for op in ops:
+        for key in REQUIRES_OP_NAME_KEYS:
+            if key not in op.requires:
+                continue
+            try:
+                refs = _requires_op_names(op.requires[key])
+            except TypeError as exc:
+                errors.append(
+                    f"op {op.name!r} requires[{key!r}]: {exc}"
+                )
+                continue
+            for ref in refs:
+                if ref == op.name:
+                    errors.append(
+                        f"op {op.name!r} requires[{key!r}] references "
+                        f"itself"
+                    )
+                    continue
+                if ref not in names:
+                    errors.append(
+                        f"op {op.name!r} requires[{key!r}]={ref!r} "
+                        "references an unknown op"
+                    )
+    return errors
 
 
 _LAYER_PREFIX_RE = re.compile(r"^_?layer\d+_")
@@ -1072,6 +1189,18 @@ class LayerCompiler:
                     in_edges[v.name].add(u.name)
                     out_edges[u.name].add(v.name)
 
+            # B10: explicit ``requires["after"]`` / ``requires["same_layer_as"]``
+            # op-name edges. Both reserved keys add an A→v dep edge (v must
+            # run after the referenced op). Phase pruning does NOT apply —
+            # explicit op-name references are author intent and override the
+            # dim-only dep model. Unknown names are silently skipped here;
+            # ``validate_requires_op_refs`` is the place that errors on them.
+            for ref in requires_after_ops(v) + requires_same_layer_as_ops(v):
+                if ref == v.name or ref not in op_set:
+                    continue
+                in_edges[v.name].add(ref)
+                out_edges[ref].add(v.name)
+
         # Kahn's algorithm
         ready = [op for op in ops if not in_edges[op.name]]
         # Stable order: by insertion order, so determinism
@@ -1125,6 +1254,19 @@ class LayerCompiler:
                 if d in writes_layer:
                     earliest = max(earliest, writes_layer[d] + 1)
 
+            # B10: ``requires["after"] = "<op>"`` forces strict later layer
+            # than every referenced op. ``requires["same_layer_as"]`` forces
+            # equality (asserted below after the layer is chosen).
+            for ref in requires_after_ops(op):
+                ref_layer = assignment.get(ref)
+                if ref_layer is not None:
+                    earliest = max(earliest, ref_layer + 1)
+            same_layer_refs = requires_same_layer_as_ops(op)
+            for ref in same_layer_refs:
+                ref_layer = assignment.get(ref)
+                if ref_layer is not None:
+                    earliest = max(earliest, ref_layer)
+
             if op.layer_idx is not None and op.kind in ("attn", "ffn"):
                 # Pinned attn/ffn op — must land at layer_idx exactly.
                 # Validate that every read dim is produced at a strictly
@@ -1175,6 +1317,22 @@ class LayerCompiler:
                     if op.phase is not None and existing_phase == op.phase:
                         break
                     layer += 1
+            # B10: enforce ``requires["same_layer_as"]`` equality. If the
+            # referenced op has already been placed and lives at a different
+            # layer, the constraint is violated — raise rather than silently
+            # corrupt the layout. References to ops not yet placed are
+            # tolerated (topo order guarantees that for refs WITH outgoing
+            # data flow to ``op`` they would already be placed; isolated
+            # same_layer_as refs without dim deps may resolve in either
+            # direction).
+            for ref in same_layer_refs:
+                ref_layer = assignment.get(ref)
+                if ref_layer is not None and ref_layer != layer:
+                    raise ValueError(
+                        f"Op {op.name!r} requires[\"same_layer_as\"] "
+                        f"references {ref!r} at layer {ref_layer} but "
+                        f"this op was placed at layer {layer}"
+                    )
             assignment[op.name] = layer
             for d in op.writes:
                 writes_layer[d] = max(writes_layer.get(d, -1), layer)

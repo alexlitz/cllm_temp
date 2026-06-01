@@ -45,7 +45,12 @@ _REPO = os.path.dirname(_HERE)
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from neural_vm.unified_compiler.layer_compiler import Operation  # noqa: E402
+from neural_vm.unified_compiler.layer_compiler import (  # noqa: E402
+    Operation,
+    requires_after_ops,
+    requires_same_layer_as_ops,
+    validate_requires_op_refs,
+)
 from neural_vm.unified_compiler.ops.all_core_ops import (  # noqa: E402
     all_alu_postop_attach_ops,
     all_core_ops,
@@ -86,9 +91,12 @@ def build_dep_graph(
     Edges:
       * Data flow:        A.writes ∩ B.reads
       * Staleness:        A.produces.keys() ∩ B.consumes_fresh.keys()
-      * Explicit requires: B.requires references A.name (we treat requires
-        as a name-based prereq even though the field is currently used for
-        residual-dim constraint strings)
+      * Explicit requires: B.requires["after"] / B.requires["same_layer_as"]
+        reference A.name as an op-name string (or a tuple/list of strings).
+        See ``Operation.requires`` docstring for the B10 schema. Both keys
+        contribute scheduling edges (``after`` => strictly later layer;
+        ``same_layer_as`` => ordered after for topo purposes, equality
+        enforced downstream by ``LayerCompiler._assign_layers``).
     """
     name_to_op = {op.name: op for op in ops}
     in_edges: Dict[str, Set[str]] = {op.name: set() for op in ops}
@@ -130,17 +138,27 @@ def build_dep_graph(
                     f"produces/consumes_fresh:{dim}@{reg}"
                 )
 
-        # Requires field — treat as a hint when the value is an op name.
-        # The current field semantics is a residual-state constraint string,
-        # not an op-name list, so this branch is mostly a no-op until a
-        # future convention extends it.
-        for key, val in v.requires.items():
-            if val in name_to_op and val != v.name:
-                if val not in in_edges[v.name]:
-                    in_edges[val].add(v.name)  # NB: requires means v needs val first
-                    in_edges[v.name].add(val)
-                    out_edges[val].add(v.name)
-                    edge_reasons[(val, v.name)].append(f"requires:{key}={val}")
+        # Explicit op-name edges from ``requires["after"]`` and
+        # ``requires["same_layer_as"]``. The values may be a single string
+        # or an iterable of strings (B10 schema). Unknown names are
+        # silently skipped here; ``validate_requires_op_refs`` already ran
+        # in ``main`` and would have surfaced them as a hard error.
+        for ref in requires_after_ops(v):
+            if ref == v.name or ref not in name_to_op:
+                continue
+            if ref not in in_edges[v.name]:
+                in_edges[v.name].add(ref)
+                out_edges[ref].add(v.name)
+            edge_reasons[(ref, v.name)].append(f"requires[after]={ref}")
+        for ref in requires_same_layer_as_ops(v):
+            if ref == v.name or ref not in name_to_op:
+                continue
+            if ref not in in_edges[v.name]:
+                in_edges[v.name].add(ref)
+                out_edges[ref].add(v.name)
+            edge_reasons[(ref, v.name)].append(
+                f"requires[same_layer_as]={ref}"
+            )
 
     return in_edges, out_edges, edge_reasons
 
@@ -733,6 +751,16 @@ def main() -> int:
     args = parser.parse_args()
 
     ops = collect_ops()
+    # B10: surface bad ``requires`` op-name references as a hard error
+    # before they silently become no-op edges in the dep graph.
+    ref_errors = validate_requires_op_refs(ops)
+    if ref_errors:
+        sys.stderr.write(
+            "analyze_scheduler: invalid requires op-name references:\n"
+        )
+        for msg in ref_errors:
+            sys.stderr.write(f"  - {msg}\n")
+        return 2
     in_e, out_e, reasons = build_dep_graph(ops)
     depth, cycle_members = topo_depth(ops, in_e, out_e)
     sccs = find_scc_summary(cycle_members, in_e, out_e)
