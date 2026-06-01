@@ -68,6 +68,19 @@ from .layer_compiler import (
 )
 from . import full_vm_compiler as _static
 
+# B16: per-axis allocators that scaffold the post-static-registry layout.
+# Imported here so :func:`compile_full_vm_dynamic` can attach instances to
+# the returned layout, giving per-op migrations a single, declarative
+# place to request slot/unit/head ranges instead of hand-picked offsets.
+from ..dim_allocator import Allocator as _DimAllocator
+from ..ffn_unit_allocator import (
+    DEFAULT_LAYER_MAX_UNITS as _DEFAULT_FFN_LAYER_MAX_UNITS,
+    FFNUnitAllocator as _FFNUnitAllocator,
+)
+from ..attention_head_allocator import (
+    AttentionHeadAllocator as _AttentionHeadAllocator,
+)
+
 
 # ---------------------------------------------------------------------------
 # Dependency graph (same edge model as tools/analyze_scheduler.py)
@@ -365,6 +378,216 @@ def compute_dynamic_schedule(
 
 
 # ---------------------------------------------------------------------------
+# Allocator wiring (B16): expose dim / FFN-unit / attention-head allocators
+# on the compiled layout so per-op migrations can declare allocations
+# instead of hand-picking offsets.
+# ---------------------------------------------------------------------------
+
+
+# Attribute names used to attach allocators to ``ModelLayout`` instances.
+# Kept as module-level constants so the test suite and any follow-up
+# per-op migration code can reference the canonical names without
+# string-duplication drift.
+LAYOUT_DIM_ALLOCATOR_ATTR = "dim_allocator"
+LAYOUT_FFN_UNIT_ALLOCATORS_ATTR = "ffn_unit_allocators"
+LAYOUT_ATTENTION_HEAD_ALLOCATORS_ATTR = "attention_head_allocators"
+
+
+def _seed_dim_allocator_from_layout(layout) -> _DimAllocator:
+    """Build a :class:`Allocator` pre-pinned from ``layout.dim_positions``.
+
+    Mirrors :func:`dim_registry_dynamic.build_default_registry_dynamic`'s
+    pin-every-existing-dim pattern at the *layout* level (the compiler's
+    own dim positions, not the static :class:`DimRegistry`'s). Every
+    declared dim is allocated via ``alloc(name, size, pin=start)``; dims
+    that share a start with an earlier dim (intentional aliases in the
+    compact-IO layout — e.g. ``OUTPUT_HI`` / ``OUTPUT_HI_THIS_STEP``)
+    pass ``allow_overlap=True`` so the allocator's collision check
+    accepts them. The resulting allocator carries exactly the same
+    ``(name, start, size)`` triples the bake sees, so any new op that
+    asks for an unpinned range gets a gap the bake can guarantee is
+    free.
+
+    Pool width is ``layout.d_model`` (not the static 512 default) so the
+    pool exactly matches the compact-IO d_model that the runtime uses.
+    """
+    alloc = _DimAllocator(d_model=layout.d_model)
+    # Group dim names by start so we can mark every name past the first
+    # at a given start as an intentional alias. Iteration order is
+    # ``dict.items()`` insertion order, which mirrors the compiler's
+    # declaration order — the canonical owner of each shared start lands
+    # first, exactly matching the static registry's alias convention.
+    seen_starts: Set[int] = set()
+    for name, start in layout.dim_positions.items():
+        size = layout.dim_sizes[name]
+        alias = start in seen_starts
+        alloc.alloc(name, size, pin=start, allow_overlap=alias)
+        seen_starts.add(start)
+    return alloc
+
+
+def _seed_ffn_unit_allocators_from_layout(
+    layout,
+    *,
+    layer_max_units: int,
+) -> Dict[int, _FFNUnitAllocator]:
+    """Build a per-layer :class:`FFNUnitAllocator`, pinning each layer's
+    existing FFN tail as a single synthetic ``existing_layer<N>`` block.
+
+    Layers without an annotated ``ffn_units_used`` op contribute no
+    pinned range — the allocator for that layer starts empty and a new
+    op asking for ``N`` units gets unit ``0``. Layers with annotated
+    ops have ``[0, ffn_widths[layer_idx])`` pinned so a new op asking
+    for ``N`` units lands at the next-free unit ``ffn_widths[L]``,
+    preserving the current tail-allocation convention used by
+    ``_lXX_unit_counter`` patterns.
+
+    ``layer_max_units`` is taken from the caller (the compiled FFN
+    pool width, defaulting to the static 4096) so per-layer pools are
+    sized to the actual production pool, not the synthetic allocator
+    default.
+    """
+    allocs: Dict[int, _FFNUnitAllocator] = {}
+    for layer_idx in range(layout.n_layers):
+        a = _FFNUnitAllocator(layer_max_units=layer_max_units)
+        # ``ffn_widths`` only carries layers with at least one annotated
+        # op; missing layers fall back to "tail at 0" semantics.
+        tail = layout.ffn_widths.get(layer_idx, 0)
+        if tail > 0:
+            a.alloc(f"existing_layer{layer_idx}", tail, pin=0)
+        allocs[layer_idx] = a
+    return allocs
+
+
+def _seed_attention_head_allocators_from_layout(
+    layout,
+    *,
+    layer_max_heads: int,
+) -> Dict[int, _AttentionHeadAllocator]:
+    """Build a per-layer :class:`AttentionHeadAllocator` and pre-pin the
+    heads referenced by each layer's ops.
+
+    Each layer gets its own allocator instance so cross-layer head_idx
+    collisions are impossible by construction. Heads are pre-pinned
+    from two declarative sources:
+
+      * ``Operation.alibi_slopes`` keys — the canonical per-op
+        declaration of which head_idx an op binds to (used by every
+        explicit-ALiBi-slope op today).
+      * ``Operation.compiler_ir`` rule heads — for ops whose IR
+        enumerates ``AttentionHeadIR`` rules with a ``head_idx``,
+        each unique ``(layer, head_idx)`` is pinned.
+
+    Both sources are best-effort: ops without either annotation are
+    not pre-pinned, which is fine for byte-identity (new pins from
+    migrated ops simply land in the free gaps the layout already
+    leaves). The point of pre-pinning is to surface conflicts loudly
+    when a follow-up migration tries to claim a head another op
+    already declared.
+    """
+    allocs: Dict[int, _AttentionHeadAllocator] = {
+        layer_idx: _AttentionHeadAllocator(layer_max_heads=layer_max_heads)
+        for layer_idx in range(layout.n_layers)
+    }
+    # Collect every ``(layer_idx, head_idx, owner_name)`` tuple from
+    # declarative sources, deduplicating per layer/head so an op that
+    # declares the same head via both ``alibi_slopes`` and ``compiler_ir``
+    # only generates one pin.
+    seen: Set[Tuple[int, int]] = set()
+    for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer):
+        for op in ops_at_layer:
+            for head_idx in _heads_declared_by_op(op):
+                if not (0 <= head_idx < layer_max_heads):
+                    # Out-of-range alibi_slopes keys are diagnostics
+                    # (e.g. layer-index-as-key sentinels). Skip rather
+                    # than crash the wiring — the allocator's own
+                    # validation will catch any real misuse downstream.
+                    continue
+                key = (layer_idx, head_idx)
+                if key in seen:
+                    continue
+                seen.add(key)
+                allocs[layer_idx].alloc(
+                    f"{op.name}__h{head_idx}",
+                    layer_idx,
+                    pin=head_idx,
+                )
+    return allocs
+
+
+def _heads_declared_by_op(op: Operation) -> Set[int]:
+    """Return the set of ``head_idx`` values an op declares via either
+    ``alibi_slopes`` keys or its ``compiler_ir`` rule list.
+
+    Returns an empty set when no head-binding annotation is present.
+    Best-effort: callers must tolerate missing data (it just means the
+    op won't pre-pin a head during scaffolding).
+    """
+    heads: Set[int] = set()
+    for head_idx in op.alibi_slopes.keys():
+        if isinstance(head_idx, int):
+            heads.add(head_idx)
+    ir = op.compiler_ir
+    if ir is not None:
+        # ``CompilerIR.rules`` (when present) is a list of
+        # ``AttentionHeadIR`` instances with a ``head_idx`` int. Other
+        # IR shapes (FFN-only IR, structural anchors) don't carry a
+        # head; guard with ``getattr`` so we never raise on shape
+        # variation.
+        rules = getattr(ir, "rules", None) or ()
+        for rule in rules:
+            head_idx = getattr(rule, "head_idx", None)
+            if isinstance(head_idx, int):
+                heads.add(head_idx)
+    return heads
+
+
+def _attach_allocators_to_layout(
+    layout,
+    *,
+    ffn_hidden,
+    n_heads: int,
+) -> None:
+    """Build and attach the three allocators to ``layout`` in place.
+
+    Idempotent: re-attaching does not duplicate pins because the
+    allocators are constructed fresh from the layout each call. Safe
+    to invoke on cache-loaded layouts (which lack ``ops_per_layer`` /
+    ``ffn_widths``) — the per-layer allocators in that case will be
+    empty per-layer instances, exactly mirroring "no annotated ops on
+    this load path".
+    """
+    layout.__dict__[LAYOUT_DIM_ALLOCATOR_ATTR] = (
+        _seed_dim_allocator_from_layout(layout)
+    )
+    # ``ffn_hidden`` can be an int (legacy mono-width) or a dict
+    # (per-layer widths). For the allocator pool we want the maximum
+    # plausible width — i.e. ``max(per-layer widths, default)`` —
+    # because the runtime PureFFN allocates up to ``ffn_hidden`` per
+    # block. Dict-mode callers may have layers omitted (those fall
+    # back to the int default), so combine both.
+    if isinstance(ffn_hidden, dict):
+        layer_max_units = max(
+            [_DEFAULT_FFN_LAYER_MAX_UNITS] + list(ffn_hidden.values()),
+            default=_DEFAULT_FFN_LAYER_MAX_UNITS,
+        )
+    elif isinstance(ffn_hidden, int) and ffn_hidden > 0:
+        layer_max_units = max(ffn_hidden, _DEFAULT_FFN_LAYER_MAX_UNITS)
+    else:
+        layer_max_units = _DEFAULT_FFN_LAYER_MAX_UNITS
+    layout.__dict__[LAYOUT_FFN_UNIT_ALLOCATORS_ATTR] = (
+        _seed_ffn_unit_allocators_from_layout(
+            layout, layer_max_units=layer_max_units,
+        )
+    )
+    layout.__dict__[LAYOUT_ATTENTION_HEAD_ALLOCATORS_ATTR] = (
+        _seed_attention_head_allocators_from_layout(
+            layout, layer_max_heads=n_heads,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public compile entry point
 # ---------------------------------------------------------------------------
 
@@ -637,6 +860,17 @@ def _bake_from_scheduled_ops(
         cache_path = _static._cache_dir() / f"{cache_key}.pt"
         cached = _static._try_load_cached(cache_path, kwargs_snapshot)
         if cached is not None:
+            # B16: cache loaders return a layout stripped of
+            # ``ops_per_layer`` / ``ffn_widths`` (only the runtime-facing
+            # fields are persisted). Allocators must still be reachable
+            # on cache hits so callers can rely on
+            # ``layout.dim_allocator`` / ``ffn_unit_allocators`` /
+            # ``attention_head_allocators`` regardless of cache state;
+            # rebuild fresh from the (possibly thin) cached layout.
+            _, _cached_layout = cached
+            _attach_allocators_to_layout(
+                _cached_layout, ffn_hidden=ffn_hidden, n_heads=n_heads,
+            )
             return cached
 
     compiler = LayerCompiler()
@@ -649,6 +883,20 @@ def _bake_from_scheduled_ops(
         pad = n_heads - (layout.d_model % n_heads)
         compiler.declare_dim("_pad", pad)
         layout = compiler.compile()
+
+    # B16: attach the three allocators to ``layout`` so per-op
+    # migrations can request dim slots / FFN units / attention heads
+    # via a declarative API instead of hand-picked offsets. Wiring
+    # runs *after* the compiler has finalized ``dim_positions`` /
+    # ``ffn_widths`` so the allocators mirror the actual layout the
+    # bake will see. The seed pins (one per existing dim / per layer's
+    # FFN tail / per declared head) guarantee byte-identity: existing
+    # ops never have to know about the allocator and unmigrated bake
+    # bodies continue to read from ``layout.dim_positions`` exactly
+    # as before.
+    _attach_allocators_to_layout(
+        layout, ffn_hidden=ffn_hidden, n_heads=n_heads,
+    )
 
     if require_declarative_bake:
         _static.enforce_declarative_bake_authority(layout)
@@ -677,6 +925,16 @@ def _bake_from_scheduled_ops(
             cache_path = _static._cache_dir() / f"{cache_key}.pt"
             cached = _static._try_load_cached(cache_path, kwargs_snapshot)
             if cached is not None:
+                # B16: same allocator wiring as the early cache-hit
+                # branch — cache loaders return a stripped layout, so
+                # rebuild the three allocators from whatever fields
+                # survived persistence.
+                _, _cached_layout = cached
+                _attach_allocators_to_layout(
+                    _cached_layout,
+                    ffn_hidden=ffn_hidden,
+                    n_heads=n_heads,
+                )
                 return cached
 
     from ..vm_step import AutoregressiveVM
