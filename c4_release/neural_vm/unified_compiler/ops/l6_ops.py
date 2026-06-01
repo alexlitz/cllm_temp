@@ -2207,6 +2207,92 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
                 f"{end}; expected {L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT}"
             )
 
+    # Dim-ownership claims. ``_layer6_ent_after_jsr_sp_byte0_fixup_rules``
+    # lowers seven FFNRules into units 1668..1674 (one per rule). Each rule
+    # writes its conditions into ``W_up[unit, dim]`` (per-rule discrimination
+    # gating ENT after a JSR) and its constant writes into
+    # ``W_down[output_dim, unit]``. Claims enumerate the exact (unit, column)
+    # pairs the IR lowerer programs; bias columns are intentionally absent
+    # from the verifier's claim grid.
+    _claims = frozenset({
+        # Unit 1668: l6_ent_after_jsr_sp_byte0_e8 (SP byte0 0xe8)
+        (6, "ffn_W_up", "1668", "OP_ENT+0"),
+        (6, "ffn_W_up", "1668", "MARK_SP+0"),
+        (6, "ffn_W_up", "1668", "HAS_SE+0"),
+        (6, "ffn_W_up", "1668", "EMBED_LO+8"),
+        (6, "ffn_W_up", "1668", "EMBED_HI+15"),
+        (6, "ffn_W_down", "1668", "OUTPUT_LO+8"),
+        (6, "ffn_W_down", "1668", "OUTPUT_HI+14"),
+        (6, "ffn_W_down", "1668", "OUTPUT_LO+0"),
+        (6, "ffn_W_down", "1668", "OUTPUT_LO+10"),
+        (6, "ffn_W_down", "1668", "OUTPUT_LO+14"),
+        (6, "ffn_W_down", "1668", "OUTPUT_HI+1"),
+        (6, "ffn_W_down", "1668", "OUTPUT_HI+15"),
+        # Unit 1669: l6_ent_after_jsr_sp_byte0_f0_when_ent_zero
+        (6, "ffn_W_up", "1669", "OP_ENT+0"),
+        (6, "ffn_W_up", "1669", "MARK_SP+0"),
+        (6, "ffn_W_up", "1669", "HAS_SE+0"),
+        (6, "ffn_W_up", "1669", "EMBED_LO+0"),
+        (6, "ffn_W_up", "1669", "EMBED_HI+15"),
+        (6, "ffn_W_up", "1669", "EMBED_LO+8"),
+        (6, "ffn_W_down", "1669", "OUTPUT_LO+0"),
+        (6, "ffn_W_down", "1669", "OUTPUT_HI+15"),
+        (6, "ffn_W_down", "1669", "OUTPUT_LO+8"),
+        (6, "ffn_W_down", "1669", "OUTPUT_LO+10"),
+        (6, "ffn_W_down", "1669", "OUTPUT_HI+0"),
+        (6, "ffn_W_down", "1669", "OUTPUT_HI+14"),
+        # Unit 1670: l6_ent_after_jsr_bp_byte0_f0
+        (6, "ffn_W_up", "1670", "OP_ENT+0"),
+        (6, "ffn_W_up", "1670", "MARK_BP+0"),
+        (6, "ffn_W_up", "1670", "HAS_SE+0"),
+        (6, "ffn_W_down", "1670", "OUTPUT_LO+0"),
+        (6, "ffn_W_down", "1670", "OUTPUT_HI+15"),
+        (6, "ffn_W_down", "1670", "OUTPUT_LO+8"),
+        (6, "ffn_W_down", "1670", "OUTPUT_HI+1"),
+        # Unit 1671: l6_ent_after_jsr_bp_byte1_ff
+        (6, "ffn_W_up", "1671", "OP_ENT+0"),
+        (6, "ffn_W_up", "1671", "IS_BYTE+0"),
+        (6, "ffn_W_up", "1671", "H1+3"),
+        (6, "ffn_W_up", "1671", "BYTE_INDEX_0+0"),
+        (6, "ffn_W_up", "1671", "HAS_SE+0"),
+        (6, "ffn_W_down", "1671", "OUTPUT_LO+15"),
+        (6, "ffn_W_down", "1671", "OUTPUT_HI+15"),
+        (6, "ffn_W_down", "1671", "OUTPUT_LO+0"),
+        (6, "ffn_W_down", "1671", "OUTPUT_HI+0"),
+        # Unit 1672: l6_ent_after_jsr_bp_byte2_00
+        (6, "ffn_W_up", "1672", "OP_ENT+0"),
+        (6, "ffn_W_up", "1672", "IS_BYTE+0"),
+        (6, "ffn_W_up", "1672", "H1+3"),
+        (6, "ffn_W_up", "1672", "BYTE_INDEX_1+0"),
+        (6, "ffn_W_up", "1672", "HAS_SE+0"),
+        (6, "ffn_W_down", "1672", "OUTPUT_LO+0"),
+        (6, "ffn_W_down", "1672", "OUTPUT_HI+0"),
+        (6, "ffn_W_down", "1672", "OUTPUT_LO+1"),
+        (6, "ffn_W_down", "1672", "OUTPUT_LO+15"),
+        (6, "ffn_W_down", "1672", "OUTPUT_HI+15"),
+        # Unit 1673: l6_ent_after_jsr_bp_byte3_00
+        (6, "ffn_W_up", "1673", "OP_ENT+0"),
+        (6, "ffn_W_up", "1673", "IS_BYTE+0"),
+        (6, "ffn_W_up", "1673", "H1+3"),
+        (6, "ffn_W_up", "1673", "BYTE_INDEX_2+0"),
+        (6, "ffn_W_up", "1673", "HAS_SE+0"),
+        (6, "ffn_W_down", "1673", "OUTPUT_LO+0"),
+        (6, "ffn_W_down", "1673", "OUTPUT_HI+0"),
+        (6, "ffn_W_down", "1673", "OUTPUT_LO+1"),
+        (6, "ffn_W_down", "1673", "OUTPUT_LO+15"),
+        (6, "ffn_W_down", "1673", "OUTPUT_HI+15"),
+        # Unit 1674: l6_ent_after_jsr_stack0_byte0_00
+        (6, "ffn_W_up", "1674", "OP_ENT+0"),
+        (6, "ffn_W_up", "1674", "MARK_STACK0+0"),
+        (6, "ffn_W_up", "1674", "HAS_SE+0"),
+        (6, "ffn_W_down", "1674", "OUTPUT_LO+0"),
+        (6, "ffn_W_down", "1674", "OUTPUT_HI+0"),
+        (6, "ffn_W_down", "1674", "OUTPUT_LO+2"),
+        (6, "ffn_W_down", "1674", "OUTPUT_LO+12"),
+        (6, "ffn_W_down", "1674", "OUTPUT_HI+1"),
+        (6, "ffn_W_down", "1674", "OUTPUT_HI+2"),
+    })
+
     return Operation(
         name="layer6_ent_after_jsr_sp_byte0_fixup",
         phase=6.55,
@@ -2219,6 +2305,7 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         layer_idx=6,
         ffn_units_used=L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT,
         migrated=True,
+        claims=_claims,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
