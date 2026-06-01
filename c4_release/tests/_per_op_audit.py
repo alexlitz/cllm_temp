@@ -107,6 +107,98 @@ def assert_rule_scopes_satisfied(op, registry=None, *, require_scope=False):
         )
 
 
+def assert_rule_strength_dominance(
+    op,
+    registry=None,
+    bounds=None,
+    *,
+    margin: float = 1.0,
+    require_dominates: bool = False,
+):
+    """S-10: assert that every FFNRule in ``op`` with a declared
+    ``dominates_at[D]`` is verified to dominate competing writers at D
+    by ``margin`` (default 1.0). Optional ``bounds`` (BackboneBounds)
+    adds backbone contribution to the required threshold.
+
+    Opt-in by default: rules without ``dominates_at`` are silently skipped.
+    Set ``require_dominates=True`` to flag missing-``dominates_at`` on every
+    rule.
+    """
+    if registry is None:
+        from neural_vm.dim_registry import build_default_registry
+        registry = build_default_registry()
+    if bounds is None:
+        from neural_vm.unified_compiler.backbone_bounds import load_default_bounds
+        bounds = load_default_bounds()
+
+    from neural_vm.unified_compiler.decl_verifier import (
+        _collect_ffn_rules_from_op,
+        verify_rule_strength,
+    )
+
+    backbone_callable = bounds.as_strength_bound if bounds is not None else None
+    issues = verify_rule_strength(
+        op, registry,
+        backbone_bounds=backbone_callable,
+        margin=margin,
+        require_dominates=require_dominates,
+    )
+
+    # The verifier flags ``no_dominates_at`` only when the rule has no
+    # ``scope`` *and* no ``dominates_at`` (i.e. ``dominates_at_for``
+    # returns None). For the helper's stricter ``require_dominates``
+    # contract we want to flag any non-empty write whose output_dim is
+    # missing from ``rule.dominates_at`` -- a scope fallback isn't a
+    # per-write dominance declaration.
+    if require_dominates:
+        seen_pairs = {
+            (i.get("rule"), i.get("output_dim"))
+            for i in issues
+            if i.get("kind") == "no_dominates_at"
+        }
+        for rule in _collect_ffn_rules_from_op(op):
+            rule_name = getattr(rule, "name", "<anonymous>")
+            dominates_at = getattr(rule, "dominates_at", None)
+            for wt in rule.writes:
+                if wt.weight == 0.0:
+                    continue
+                output_dim = wt.dim.name
+                output_offset = wt.dim.offset
+                if dominates_at is not None and output_dim in dominates_at:
+                    continue
+                key = (rule_name, f"{output_dim}+{output_offset}")
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                issues.append({
+                    "kind": "no_dominates_at",
+                    "rule": rule_name,
+                    "output_dim": f"{output_dim}+{output_offset}",
+                })
+
+    if issues:
+        msgs = []
+        for i in issues:
+            kind = i.get('kind', '?')
+            rule = i.get('rule', '?')
+            if kind == 'strength_violation':
+                msgs.append(
+                    f"  - [strength_violation] rule={rule!r} at {i.get('output_dim')}: "
+                    f"my={i.get('my_contribution', 0):.1f} vs "
+                    f"competing={i.get('competing_max', 0):.1f} "
+                    f"+ backbone={i.get('backbone_max', 0):.1f} "
+                    f"(shortfall {i.get('shortfall', 0):.1f})"
+                )
+            else:
+                msgs.append(
+                    f"  - [{kind}] rule={rule!r}: {i.get('reason', '')}"
+                )
+        raise AssertionError(
+            f"Op {getattr(op, 'name', '?')!r}: {len(issues)} strength issue(s):\n"
+            + "\n".join(msgs)
+        )
+
+
 def assert_op_absent(static_report, layer_label: str, op_name: str) -> None:
     """Op must NOT appear in the report (used for known-empty-claims ops).
 
