@@ -91,8 +91,16 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
     return Operation(
         name="layer12_mul_combine",
         phase=12,
-        reads={"MARK_AX", "TEMP", "OP_MUL"},
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        # ``_set_layer12_mul_combine`` reads MARK_AX, TEMP[partial], ALU_HI[a_hi],
+        # AX_CARRY_LO[b_lo], gates on OP_MUL, and writes ONLY to OUTPUT_HI (the
+        # low byte's high nibble). It does NOT write OUTPUT_LO -- L10's MUL
+        # units already own the low nibble of the low byte. The previously
+        # over-declared ALU_HI/AX_CARRY_LO read and OUTPUT_LO write here
+        # silently masked downstream contention analysis. Corrected so the
+        # staleness analyzer / claim-collision detector see the true producer/
+        # consumer surface of this op.
+        reads={"MARK_AX", "TEMP", "ALU_HI", "AX_CARRY_LO", "OP_MUL"},
+        writes={"OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
