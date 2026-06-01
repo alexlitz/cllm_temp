@@ -2892,6 +2892,13 @@ def _set_nibble_copy_ffn(ffn, S, BD):
     SP_I = 2  # SP marker index
     BP_I = 3  # BP marker index
     AX_I = 1  # AX marker index in MARKS array
+    # Hard BP blockers: layer H1+BP_I and MARK_BP get an additional
+    # ``-S * 1e6`` weight so the wide nibble-copy writer cannot dump
+    # ~+758 into OUTPUT_LO+0 across BP byte rows during the local-frame
+    # post-store cadence. Without this the L16 ``l16_bp_frame_byte1_ff``
+    # override (50.0/S strength) is swamped and BP_byte1 lands at 0xf0
+    # instead of 0xff, regressing if_var_* (IDs 425-449).
+    BP_BLOCKER_W = -S * 1_000_000.0
     for k in range(16):
         # Up: fires at byte positions, suppressed at register areas with custom handling
         # Note: STACK0 uses separate MARK_STACK0 (not in MARKS array), so we use H4[BP]
@@ -2900,9 +2907,10 @@ def _set_nibble_copy_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress ALL PC bytes (L3 handles all)
         ffn.W_up[unit, BD.H1 + AX_I] = -S  # Suppress at AX (L3/L6 handle)
         ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP (L3/L15 PSH handle)
-        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP (L3 default handles)
+        ffn.W_up[unit, BD.H1 + BP_I] = -S + BP_BLOCKER_W  # BP byte rows: hard blocker
         ffn.W_up[unit, BD.H4 + BP_I] = -S  # Suppress at STACK0 area (d<=9.5 from BP)
         ffn.W_up[unit, BD.MEM_STORE] = -S  # Suppress at MEM during PSH/SI/SC
+        ffn.W_up[unit, BD.MARK_BP] = BP_BLOCKER_W  # BP marker row: hard blocker
         ffn.b_up[unit] = -S * 0.5
         # Gate: copy this specific nibble value
         ffn.W_gate[unit, BD.EMBED_LO + k] = 1.0
@@ -2915,9 +2923,10 @@ def _set_nibble_copy_ffn(ffn, S, BD):
         ffn.W_up[unit, BD.H1 + PC_I] = -S  # Suppress ALL PC bytes (L3 handles all)
         ffn.W_up[unit, BD.H1 + AX_I] = -S  # Suppress at AX (L3/L6 handle)
         ffn.W_up[unit, BD.H1 + SP_I] = -S  # Suppress at SP (L3/L15 PSH handle)
-        ffn.W_up[unit, BD.H1 + BP_I] = -S  # Suppress at BP (L3 default handles)
+        ffn.W_up[unit, BD.H1 + BP_I] = -S + BP_BLOCKER_W  # BP byte rows: hard blocker
         ffn.W_up[unit, BD.H4 + BP_I] = -S  # Suppress at STACK0 area (d<=9.5 from BP)
         ffn.W_up[unit, BD.MEM_STORE] = -S  # Suppress at MEM during PSH/SI/SC
+        ffn.W_up[unit, BD.MARK_BP] = BP_BLOCKER_W  # BP marker row: hard blocker
         ffn.b_up[unit] = -S * 0.5
         ffn.W_gate[unit, BD.EMBED_HI + k] = 1.0
         ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
