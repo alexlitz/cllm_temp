@@ -1,7 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -1017,6 +1017,64 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
     )
 
 
+def _layer14_jsr_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_jsr_ax_bytes_zero``.
+
+    Mirrors the 4 imperative hidden units: at AX byte positions
+    (IS_BYTE + H1[AX]) gated by OP_JSR, each unit spreads -3/S across one
+    nibble band (LO or HI) or boosts a single byte-value-0 slot (+5/S on
+    OUTPUT_LO[0] / OUTPUT_HI[0]). The byte-value-0 token wins argmax →
+    AX bytes 1-3 = 0x00 for the JSR-preserved AX. The W_down write weights
+    encode the original ``-3.0 / S`` / ``5.0 / S`` constants directly so
+    the lowerer's "no S scaling on writes" contract reproduces the
+    imperative helper byte-for-byte.
+    """
+    AX_I = 1
+    common_conditions = (
+        ("IS_BYTE", 1.0),
+        (f"H1+{AX_I}", 1.0),
+    )
+    common_kwargs = dict(
+        conditions=common_conditions,
+        threshold=1.5,
+        gate="OP_JSR",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        scope="OP_JSR and IS_BYTE and H1+1",
+    )
+    rules = (
+        FFNRule.gated_write(
+            name="l14_jsr_ax_bytes_zero_lo_neg",
+            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_jsr_ax_bytes_zero_hi_neg",
+            writes=tuple(
+                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
+            ),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_jsr_ax_bytes_zero_lo0_boost",
+            writes=(("OUTPUT_LO+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_jsr_ax_bytes_zero_hi0_boost",
+            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+    )
+    return rules
+
+
+def _layer14_jsr_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_jsr_ax_bytes_zero_rules(S))
+    return ir
+
+
 def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
     """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_JSR is active.
 
@@ -1036,16 +1094,27 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
     Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
     counter ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
     Phase 14.6: runs AFTER ``layer14_addr_key_neural_decode`` (14.5).
+
+    Migration (Phase 6 wave 3J): the per-unit writes are now declared via
+    :func:`_layer14_jsr_ax_bytes_zero_rules` and attached as ``compiler_ir``;
+    the bake lowers the rule list via :meth:`CompilerIR.lower_ffn` at the
+    pinned chain offset and then runs the boundary-guard / STACK0-block
+    post-passes. Byte-identical with the legacy imperative helper.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_jsr_ax_bytes_zero
         ffn = block.ffn
         # Pinned to chain offset 1862 (predecessors through addr_key_neural_decode
         # consume units 0..1861). Byte-identical with the legacy
         # ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_jsr_ax_bytes_zero")
-        next_unit = _set_layer14_jsr_ax_bytes_zero(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_jsr_ax_bytes_zero_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         _block_l14_jsr_ax_zero_on_stack0_bytes(ffn, dim_positions, S, start_unit, next_unit)
@@ -1074,6 +1143,7 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_jsr_ax_bytes_zero_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
