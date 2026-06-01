@@ -310,110 +310,232 @@ class ContractValidator:
 # ============================================================================
 
 def build_default_registry() -> DimRegistry:
-    """Build a DimRegistry matching the current _BakeDim allocations (d_model=512)."""
+    """Build a DimRegistry matching the current _BakeDim allocations (d_model=512).
+
+    Every alloc carries a ``semantics=`` predicate string (parseable by
+    ``neural_vm.unified_compiler.predicates.parse``) describing where the
+    slot's value fires across the token sequence. Predicates are
+    best-effort and conservative: a permissive-but-parseable predicate is
+    preferred to no predicate so that the F-3 tolerant shim can flip to
+    hard-error once F-4 lands. See ``# FIXME(F-4): ...`` comments where
+    the exact semantics is uncertain.
+    """
     reg = DimRegistry(d_model=512)
 
     # Marker identity flags (set by embedding)
-    reg.alloc("MARK_PC",      0, 1, "PC register marker flag")
-    reg.alloc("MARK_AX",      1, 1, "AX register marker flag")
-    reg.alloc("MARK_SP",      2, 1, "SP register marker flag")
-    reg.alloc("MARK_BP",      3, 1, "BP register marker flag")
-    reg.alloc("MARK_MEM",     4, 1, "MEM marker flag")
-    reg.alloc("MARK_SE",      5, 1, "STEP_END/DATA_END marker flag")
-    reg.alloc("IS_BYTE",      6, 1, "Token is a byte value (0-255)")
-    reg.alloc("IS_MARK",      7, 1, "Token is a marker")
-    reg.alloc("CONST",        8, 1, "Constant 1.0 on all tokens")
-    reg.alloc("MARK_CS",      9, 1, "CODE_START only marker")
-    reg.alloc("MARK_SE_ONLY", 10, 1, "STEP_END only (not DATA_END)")
-    reg.alloc("MARK_STACK0",  11, 1, "STACK0 marker flag")
+    reg.alloc("MARK_PC",      0, 1, "PC register marker flag",
+              semantics="mark == PC")
+    reg.alloc("MARK_AX",      1, 1, "AX register marker flag",
+              semantics="mark == AX")
+    reg.alloc("MARK_SP",      2, 1, "SP register marker flag",
+              semantics="mark == SP")
+    reg.alloc("MARK_BP",      3, 1, "BP register marker flag",
+              semantics="mark == BP")
+    reg.alloc("MARK_MEM",     4, 1, "MEM marker flag",
+              semantics="mark == MEM")
+    reg.alloc("MARK_SE",      5, 1, "STEP_END/DATA_END marker flag",
+              semantics="mark == SE")
+    reg.alloc("IS_BYTE",      6, 1, "Token is a byte value (0-255)",
+              semantics="is_byte")
+    reg.alloc("IS_MARK",      7, 1, "Token is a marker",
+              semantics="NOT is_byte")
+    # CONST is always-on (set to 1.0 at every token by the embedding); model
+    # as a tautology so the predicate parses but imposes no firing constraint.
+    reg.alloc("CONST",        8, 1, "Constant 1.0 on all tokens",
+              semantics="is_byte OR NOT is_byte")
+    # FIXME(F-4): refine — CODE_START is a distinct marker token but the DSL
+    # lacks a CS role; conservatively model as "any marker" (NOT is_byte).
+    reg.alloc("MARK_CS",      9, 1, "CODE_START only marker",
+              semantics="NOT is_byte")
+    reg.alloc("MARK_SE_ONLY", 10, 1, "STEP_END only (not DATA_END)",
+              semantics="mark == SE")
+    reg.alloc("MARK_STACK0",  11, 1, "STACK0 marker flag",
+              semantics="mark == STACK0")
 
-    # Address byte nibbles (gathered by memory address layers)
-    reg.alloc("ADDR_B0_LO",  12, 16, "One-hot addr byte 0 low nibble")
-    reg.alloc("ADDR_B1_LO",  28, 16, "One-hot addr byte 1 low nibble")
-    reg.alloc("ADDR_B2_LO",  44, 16, "One-hot addr byte 2 low nibble")
+    # Address byte nibbles (gathered by memory address layers). Each 16-wide
+    # slot is a one-hot encoding written at MEM-adjacent positions during
+    # address gather; describe the slot family by its firing region.
+    # FIXME(F-4): refine per-cell — the slot AS A WHOLE fires at MEM-region
+    # positions; individual cells fire on specific nibble values. The DSL
+    # has no per-cell hook, so the slot-level predicate is conservative.
+    reg.alloc("ADDR_B0_LO",  12, 16, "One-hot addr byte 0 low nibble",
+              semantics="mark == MEM")
+    reg.alloc("ADDR_B1_LO",  28, 16, "One-hot addr byte 1 low nibble",
+              semantics="mark == MEM")
+    reg.alloc("ADDR_B2_LO",  44, 16, "One-hot addr byte 2 low nibble",
+              semantics="mark == MEM")
 
-    # Layer 0 attention output: 8 threshold heads
-    reg.alloc("H0",  60, 7, "L0 head 0: marker within dist 3.5")
-    reg.alloc("H1",  67, 7, "L0 head 1: marker within dist 4.5")
-    reg.alloc("H2",  74, 7, "L0 head 2: marker within dist 5.5")
-    reg.alloc("H3",  81, 7, "L0 head 3: marker within dist 9.5")
-    reg.alloc("H4",  88, 7, "L0 head 4: marker within dist 10.5")
-    reg.alloc("H5",  95, 7, "L0 head 5: marker within dist 14.5")
-    reg.alloc("H6", 102, 7, "L0 head 6: marker within dist 15.5")
-    reg.alloc("H7", 109, 7, "L0 head 7: marker within dist 19.5")
+    # Layer 0 attention output: 8 threshold heads. Each 7-wide slot is one
+    # cell per marker type, written everywhere by the threshold attention
+    # so the firing condition is essentially "every token where a marker
+    # is within threshold distance" — conservatively model as a tautology.
+    # FIXME(F-4): refine — head outputs are best characterized by
+    # marker-distance proximity which the DSL does not yet expose.
+    reg.alloc("H0",  60, 7, "L0 head 0: marker within dist 3.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("H1",  67, 7, "L0 head 1: marker within dist 4.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("H2",  74, 7, "L0 head 2: marker within dist 5.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("H3",  81, 7, "L0 head 3: marker within dist 9.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("H4",  88, 7, "L0 head 4: marker within dist 10.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("H5",  95, 7, "L0 head 5: marker within dist 14.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("H6", 102, 7, "L0 head 6: marker within dist 15.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("H7", 109, 7, "L0 head 7: marker within dist 19.5",
+              semantics="is_byte OR NOT is_byte")
 
     # Layer 1 attention output: fine thresholds + SE detect
-    reg.alloc("L1H0", 116, 7, "L1 head 0: marker within dist 0.5")
-    reg.alloc("L1H1", 123, 7, "L1 head 1: marker within dist 1.5")
-    reg.alloc("L1H2", 130, 7, "L1 head 2: marker within dist 2.5")
-    reg.alloc("HAS_SE", 137, 1, "STEP_END existence flag")
+    # FIXME(F-4): refine — same fine-threshold characterization gap as L0.
+    reg.alloc("L1H0", 116, 7, "L1 head 0: marker within dist 0.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("L1H1", 123, 7, "L1 head 1: marker within dist 1.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("L1H2", 130, 7, "L1 head 2: marker within dist 2.5",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("HAS_SE", 137, 1, "STEP_END existence flag",
+              semantics="has_se")
 
-    # Byte index within register
-    reg.alloc("BYTE_INDEX_0", 138, 1, "Byte index 0 flag")
-    reg.alloc("BYTE_INDEX_1", 139, 1, "Byte index 1 flag")
-    reg.alloc("BYTE_INDEX_2", 140, 1, "Byte index 2 flag")
-    reg.alloc("BYTE_INDEX_3", 141, 1, "Byte index 3 flag")
+    # Byte index within register (4-byte register layout). The byte_index
+    # atom fires on byte tokens at the given offset within their register.
+    reg.alloc("BYTE_INDEX_0", 138, 1, "Byte index 0 flag",
+              semantics="is_byte AND byte_index == 0")
+    reg.alloc("BYTE_INDEX_1", 139, 1, "Byte index 1 flag",
+              semantics="is_byte AND byte_index == 1")
+    reg.alloc("BYTE_INDEX_2", 140, 1, "Byte index 2 flag",
+              semantics="is_byte AND byte_index == 2")
+    reg.alloc("BYTE_INDEX_3", 141, 1, "Byte index 3 flag",
+              semantics="is_byte AND byte_index == 3")
 
-    # Nibble encoding
-    reg.alloc("EMBED_LO",  142, 16, "Embedding input low nibble (one-hot)")
-    reg.alloc("EMBED_HI",  158, 16, "Embedding input high nibble (one-hot)")
-    reg.alloc("OUTPUT_LO", 174, 16, "Output decoding low nibble (one-hot)")
-    reg.alloc("OUTPUT_HI", 190, 16, "Output decoding high nibble (one-hot)")
+    # Nibble encoding. EMBED_* is set by the embedding at byte tokens
+    # (one-hot per nibble); OUTPUT_* is written by the decoder ops.
+    # FIXME(F-4): refine — the 16-wide slot fires at byte positions; each
+    # cell encodes a specific nibble value (byte_value.lo_nibble == c).
+    reg.alloc("EMBED_LO",  142, 16, "Embedding input low nibble (one-hot)",
+              semantics="is_byte")
+    reg.alloc("EMBED_HI",  158, 16, "Embedding input high nibble (one-hot)",
+              semantics="is_byte")
+    # FIXME(F-4): refine — OUTPUT_* is autoregressively populated at marker
+    # positions where the next emitted token is a byte; conservatively
+    # model as "any token" since the DSL has no "next-token-is-byte" atom.
+    reg.alloc("OUTPUT_LO", 174, 16, "Output decoding low nibble (one-hot)",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("OUTPUT_HI", 190, 16, "Output decoding high nibble (one-hot)",
+              semantics="is_byte OR NOT is_byte")
 
-    # Memory address key
-    reg.alloc("ADDR_KEY", 206, 48, "One-hot address key for memory matching (3 nibbles x 16)")
+    # Memory address key (3 nibbles × 16 one-hot = 48 dims). Written at
+    # positions feeding the L15 memory lookup attention.
+    # FIXME(F-4): refine — fires at MEM-region query positions.
+    reg.alloc("ADDR_KEY", 206, 48, "One-hot address key for memory matching (3 nibbles x 16)",
+              semantics="mark == MEM")
 
-    # NEXT_* transition flags
-    reg.alloc("NEXT_PC",     254, 1, "Next token is PC register")
-    reg.alloc("NEXT_AX",     255, 1, "Next token is AX register")
-    reg.alloc("NEXT_SP",     256, 1, "Next token is SP register")
-    reg.alloc("NEXT_BP",     257, 1, "Next token is BP register")
-    reg.alloc("NEXT_STACK0", 258, 1, "Next token is STACK0 marker")
-    reg.alloc("NEXT_MEM",    259, 1, "Next token is MEM marker")
-    reg.alloc("NEXT_SE",     260, 1, "Next token is STEP_END")
-    reg.alloc("NEXT_HALT",   261, 1, "Emit HALT instead of STEP_END")
+    # NEXT_* transition flags. Written at the marker position preceding
+    # the transition; conservatively scoped to "any marker" since the
+    # exact preceding-marker family varies per NEXT_*.
+    # FIXME(F-4): refine — NEXT_PC fires at MARK_SE positions (transition
+    # from STEP_END to next step's PC); same pattern for the other NEXT_*.
+    reg.alloc("NEXT_PC",     254, 1, "Next token is PC register",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_AX",     255, 1, "Next token is AX register",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_SP",     256, 1, "Next token is SP register",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_BP",     257, 1, "Next token is BP register",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_STACK0", 258, 1, "Next token is STACK0 marker",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_MEM",    259, 1, "Next token is MEM marker",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_SE",     260, 1, "Next token is STEP_END",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_HALT",   261, 1, "Emit HALT instead of STEP_END",
+              semantics="NOT is_byte")
 
-    # Opcode one-hot flags (34 opcodes)
-    reg.alloc("OPCODE_FLAGS", 262, 34, "One-hot opcode flags (LEA..GETCHAR)")
+    # Opcode one-hot flags (34 opcodes). The slot is written at AX byte
+    # positions during step decode, indicating which opcode is active.
+    # FIXME(F-4): refine per-cell — each cell fires when the active
+    # opcode matches that index (opcode_at_AX == OP_NAME). Slot-level
+    # predicate is "any AX byte position" conservatively widened.
+    reg.alloc("OPCODE_FLAGS", 262, 34, "One-hot opcode flags (LEA..GETCHAR)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
 
-    # IO PUTCHAR flag
-    reg.alloc("IO_IS_PUTCHAR", 296, 1, "OP_PUTCHAR detected this step (L6 FFN)")
+    # IO PUTCHAR flag — fires at the AX marker when current opcode is PUTCHAR.
+    reg.alloc("IO_IS_PUTCHAR", 296, 1, "OP_PUTCHAR detected this step (L6 FFN)",
+              semantics="mark == AX AND opcode_at_AX == PUTCHAR")
 
-    # ADJ implementation dimensions (SP + signed immediate)
-    reg.alloc("SP_OLD_LO", 297, 8, "ADJ: old SP value low nibbles (4 bytes)")
-    reg.alloc("SP_OLD_HI", 305, 8, "ADJ: old SP value high nibbles (4 bytes)")
-    reg.alloc("ADJ_CARRY", 313, 2, "ADJ: multi-byte carry propagation")
+    # ADJ implementation dimensions (SP + signed immediate). Written during
+    # ADJ opcode execution at SP byte positions.
+    # FIXME(F-4): refine — these stagings fire at SP byte positions when
+    # opcode_in_step contains ADJ.
+    reg.alloc("SP_OLD_LO", 297, 8, "ADJ: old SP value low nibbles (4 bytes)",
+              semantics="(mark == SP OR mark == AX) AND opcode_in_step in {ADJ}")
+    reg.alloc("SP_OLD_HI", 305, 8, "ADJ: old SP value high nibbles (4 bytes)",
+              semantics="(mark == SP OR mark == AX) AND opcode_in_step in {ADJ}")
+    reg.alloc("ADJ_CARRY", 313, 2, "ADJ: multi-byte carry propagation",
+              semantics="(mark == SP OR mark == AX) AND opcode_in_step in {ADJ}")
 
     # Reserved (remaining space for ENT/LEV)
-    reg.alloc("RESERVED_315_327", 315, 13, "Reserved (ENT/LEV staging)")
+    # FIXME(F-4): refine — placeholder reserved slot; model as never-fires
+    # via an unsatisfiable conjunction (mark must be both PC and AX).
+    reg.alloc("RESERVED_315_327", 315, 13, "Reserved (ENT/LEV staging)",
+              semantics="mark == PC AND mark == AX")
 
-    # AX carry-forward staging
-    reg.alloc("AX_CARRY_LO", 328, 16, "Carried-forward AX lo nibble")
-    reg.alloc("AX_CARRY_HI", 344, 16, "Carried-forward AX hi nibble")
+    # AX carry-forward staging. Populated at AX byte positions by the
+    # carry-forward attention so downstream layers can read AX as a value.
+    reg.alloc("AX_CARRY_LO", 328, 16, "Carried-forward AX lo nibble",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    reg.alloc("AX_CARRY_HI", 344, 16, "Carried-forward AX hi nibble",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
 
-    # ALU result staging
-    reg.alloc("ALU_LO", 360, 16, "ALU result lo nibble")
-    reg.alloc("ALU_HI", 376, 16, "ALU result hi nibble")
+    # ALU result staging. Written at AX byte positions when an ALU opcode
+    # is active in the current step.
+    # FIXME(F-4): refine — exact ALU opcode set is ADD/SUB/MUL/DIV/MOD/
+    # OR/XOR/AND/SHL/SHR; conservatively gate on AX position only.
+    reg.alloc("ALU_LO", 360, 16, "ALU result lo nibble",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    reg.alloc("ALU_HI", 376, 16, "ALU result hi nibble",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
 
-    # Carry / comparison
-    reg.alloc("CARRY", 392, 4, "Inter-byte carry for ADD/SUB/MUL")
-    reg.alloc("CMP",   396, 4, "Comparison cascade: LT, EQ, GT, ZERO")
+    # Carry / comparison cascade. Per-byte carry propagation slot for
+    # add/sub/mul cascade and comparison-flag bus.
+    # FIXME(F-4): refine — fires at AX byte positions during ALU ops.
+    reg.alloc("CARRY", 392, 4, "Inter-byte carry for ADD/SUB/MUL",
+              semantics="is_byte AND byte_index in {0, 1, 2, 3}")
+    reg.alloc("CMP",   396, 4, "Comparison cascade: LT, EQ, GT, ZERO",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
 
     # Reserved (formerly PC_BIT, available for future use)
-    reg.alloc("RESERVED_400_415", 400, 16, "Reserved (future PC binary encoding/IO)")
+    # FIXME(F-4): refine — unused; model as unsatisfiable.
+    reg.alloc("RESERVED_400_415", 400, 16, "Reserved (future PC binary encoding/IO)",
+              semantics="mark == PC AND mark == AX")
 
-    # MUL/DIV staging
-    reg.alloc("MUL_ACCUM",   416, 16, "Multiplication accumulator")
-    reg.alloc("DIV_STAGING", 432, 16, "Division quotient/remainder")
+    # MUL/DIV staging — written at AX byte positions when MUL/DIV active.
+    # FIXME(F-4): refine — exact gating opcode set unknown at slot level.
+    reg.alloc("MUL_ACCUM",   416, 16, "Multiplication accumulator",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    reg.alloc("DIV_STAGING", 432, 16, "Division quotient/remainder",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
 
-    # Immediate staging
-    reg.alloc("IMM_STAGING", 448, 16, "Fetched immediate bytes")
+    # Immediate staging — fetched immediate bytes following the opcode.
+    # FIXME(F-4): refine — fires at PC byte positions during fetch.
+    reg.alloc("IMM_STAGING", 448, 16, "Fetched immediate bytes",
+              semantics="mark == PC OR (is_byte AND byte_index in {0, 1, 2, 3})")
 
-    # CS distance thermometer
-    reg.alloc("CS_DIST_THERMO", 464, 16, "Thermometer-coded distance from CODE_START")
+    # CS distance thermometer — thermometer-coded distance from CODE_START.
+    # FIXME(F-4): refine — fires at every position; model as tautology
+    # since the DSL has no "distance from CS" atom.
+    reg.alloc("CS_DIST_THERMO", 464, 16, "Thermometer-coded distance from CODE_START",
+              semantics="is_byte OR NOT is_byte")
 
-    # General temporaries
-    reg.alloc("TEMP", 480, 32, "General temporaries / reserved")
+    # General temporaries / reserved scratch. Many sub-uses (PRTF/READ
+    # capture state, OUTPUT_BYTE) so we use a permissive tautology.
+    # FIXME(F-4): refine — split TEMP into sub-slots with per-feature
+    # predicates once consumers stabilize.
+    reg.alloc("TEMP", 480, 32, "General temporaries / reserved",
+              semantics="is_byte OR NOT is_byte")
 
     return reg
 
