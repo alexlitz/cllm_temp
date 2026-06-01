@@ -1,0 +1,207 @@
+"""Byte-identity tests for the hybrid dynamic-layer compile path (B11).
+
+These tests assert that ``compile_full_vm_dynamic`` returns a layout
+that is bit-identical to ``compile_full_vm`` on today's op set.
+
+The tests are marked ``slow`` because each one runs two full compiles
+(~40-70s each on the default static path; the dynamic path adds another
+full compile on top). Run them with ``pytest --runslow``. The fast
+non-build-heavy assertions (schedule consistency, cycle counts) are kept
+out of the slow gate so CI surfaces scheduler regressions cheaply.
+"""
+
+import pytest
+import torch
+
+from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
+    compile_full_vm,
+)
+from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+    compare_compile_paths,
+    compile_full_vm_dynamic,
+    compute_dynamic_schedule,
+    _build_dep_graph,
+    _build_phase_pruned_graph,
+    _collect_ops_for_compile,
+    _find_cycle_members,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fast (non-build) scheduler invariants
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_schedule_orders_every_op_once():
+    """The hybrid schedule must be a permutation of the input op list."""
+    ops = _collect_ops_for_compile(
+        alu_mode="lookup",
+        enable_conversational_io=False,
+        enable_tool_calling=False,
+        enable_neural_io_think_protocol=False,
+    )
+    scheduled, source = compute_dynamic_schedule(ops)
+    assert len(scheduled) == len(ops)
+    assert {o.name for o in scheduled} == {o.name for o in ops}
+    # Every op must have been classified as either dep-derived or
+    # phase-fallback. No op may be silently dropped.
+    assert set(source.keys()) == {o.name for o in ops}
+    for src in source.values():
+        assert src in ("dep", "phase")
+
+
+def test_dynamic_schedule_is_a_valid_topological_sort():
+    """The hybrid schedule must be a valid topological sort of the
+    phase-pruned dep DAG. For every edge u -> v in the pruned graph,
+    u must appear before v in the schedule.
+
+    This is the precondition for B11 byte-identity: if the dep order is
+    a valid topo sort under the same pruning rule the static path uses,
+    then the static ``LayerCompiler`` will produce the same layout
+    regardless of whether the dep order or the input order is the
+    starting Kahn's input (because both are valid topo sorts of the
+    same DAG, and ``LayerCompiler._assign_layers`` is layer-pinning-
+    dominant on today's op set).
+    """
+    ops = _collect_ops_for_compile(
+        alu_mode="lookup",
+        enable_conversational_io=False,
+        enable_tool_calling=False,
+        enable_neural_io_think_protocol=False,
+    )
+    by_dep, _ = compute_dynamic_schedule(ops)
+    dep_position = {op.name: i for i, op in enumerate(by_dep)}
+    # Mirror the static LayerCompiler: only attn/ffn ops participate in
+    # the topological constraint check. Block / model ops are pinned by
+    # layer_idx or phase, not by deps.
+    _in_e, out_e, _cycle = _build_phase_pruned_graph(
+        ops, restrict_to_kinds={"attn", "ffn"},
+    )
+    violations: list = []
+    for u in ops:
+        if u.kind not in ("attn", "ffn"):
+            continue
+        for v_name in out_e.get(u.name, set()):
+            if dep_position[u.name] >= dep_position[v_name]:
+                violations.append(
+                    (u.name, dep_position[u.name],
+                     v_name, dep_position[v_name])
+                )
+    assert not violations, (
+        f"Dynamic schedule violates phase-pruned topo order in "
+        f"{len(violations)} places; first 5: {violations[:5]}"
+    )
+
+
+def test_dynamic_schedule_cycle_members_exist_and_phase_pruning_breaks_them():
+    """Verify the Phase A finding: the dep-only DAG (no phase pruning)
+    has cycle members, and applying the static phase-pruning rule
+    breaks every cycle.
+
+    On the Phase A reference date (2026-06-01) the unpruned graph had
+    57 SCC members across the lookup-mode "all-flags-on" op set; the
+    repo has since grown the op count by ~8 with additional claims,
+    so the cycle count tracks accordingly. We lock the LOWER BOUND
+    (>50 cycle members) here — anything significantly under that
+    suggests a major SCC break worth celebrating, and anything zero
+    means the unpruned graph is now acyclic (drop B11's hybrid
+    fallback entirely in that case).
+    """
+    ops = _collect_ops_for_compile(
+        alu_mode="lookup",
+        enable_conversational_io=True,
+        enable_tool_calling=True,
+        enable_neural_io_think_protocol=True,
+    )
+    # Unpruned dep graph: declared deps only, no phase pruning.
+    in_edges, out_edges = _build_dep_graph(ops)
+    cycle = _find_cycle_members(ops, in_edges, out_edges)
+    assert len(cycle) >= 50, (
+        f"unpruned dep cycle members dropped well below the Phase A "
+        f"baseline (~57). Got {len(cycle)} — if you've broken the "
+        f"largest SCC, celebrate AND relax this lower bound."
+    )
+    assert len(cycle) <= 90, (
+        f"unpruned dep cycle members shot above the Phase A baseline "
+        f"(~57). Got {len(cycle)} — a new op likely introduced "
+        f"unannotated back-edges."
+    )
+
+    # Phase-pruned graph: must be acyclic (this is the invariant the
+    # static path depends on, and the precondition for B11
+    # byte-identity).
+    pruned_in, pruned_out, _ = _build_phase_pruned_graph(
+        ops, restrict_to_kinds={"attn", "ffn"},
+    )
+    attn_ffn = [op for op in ops if op.kind in ("attn", "ffn")]
+    pruned_cycle = _find_cycle_members(attn_ffn, pruned_in, pruned_out)
+    assert pruned_cycle == set(), (
+        f"Phase pruning fails to break all cycles: "
+        f"{len(pruned_cycle)} ops stuck in {sorted(pruned_cycle)[:5]}..."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Slow: full byte-identity comparison vs compile_full_vm
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_compile_full_vm_dynamic_byte_identical_lookup():
+    """Default-arg dynamic compile must match the static compile bit-for-bit."""
+    report = compare_compile_paths(
+        alu_mode="lookup",
+        disk_cache=False,
+    )
+    assert report["n_diffs"] == 0, (
+        f"dynamic vs static state_dict differs in {report['n_diffs']} "
+        f"tensors; first 5: {report['diff_keys'][:5]}"
+    )
+    assert report["layout_diff"] == [], (
+        f"dynamic vs static ModelLayout differs: {report['layout_diff']}"
+    )
+    assert report["phase_disagrees_with_dep_order"] == [], (
+        "dep order diverged from phase order — Phase A guarantees this "
+        f"set should match. Divergences: "
+        f"{report['phase_disagrees_with_dep_order'][:5]}"
+    )
+
+
+@pytest.mark.slow
+def test_compile_full_vm_dynamic_byte_identical_efficient():
+    """``alu_mode='efficient'`` dynamic compile must match the static
+    compile bit-for-bit. Efficient mode adds 12 extra ALU wrapper /
+    composite ops, so this is a separate regression surface from the
+    lookup-mode case.
+    """
+    report = compare_compile_paths(
+        alu_mode="efficient",
+        disk_cache=False,
+    )
+    assert report["n_diffs"] == 0, (
+        f"dynamic vs static state_dict differs in {report['n_diffs']} "
+        f"tensors; first 5: {report['diff_keys'][:5]}"
+    )
+    assert report["layout_diff"] == [], (
+        f"dynamic vs static ModelLayout differs: {report['layout_diff']}"
+    )
+
+
+@pytest.mark.slow
+def test_compile_full_vm_dynamic_runs_with_all_flags():
+    """The hybrid scheduler must not crash on any op, including the
+    flag-gated convo-IO / tool-call / think-protocol bakes that gate on
+    runtime metadata. Cycle members are routed through the phase-fallback
+    branch; this test exercises that path under flags=on.
+    """
+    model, layout = compile_full_vm_dynamic(
+        enable_conversational_io=True,
+        enable_tool_calling=True,
+        enable_neural_io_think_protocol=True,
+        disk_cache=False,
+    )
+    # Sanity: the model + layout are non-empty.
+    assert layout.n_layers > 0
+    assert layout.d_model > 0
+    sd = model.state_dict()
+    assert len(sd) > 0
