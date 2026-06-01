@@ -1399,10 +1399,19 @@ def entails(p: Predicate, q: Predicate) -> bool:
     if not p_dnf:
         # p is unsatisfiable -> vacuously entails anything.
         return True
+    # Filter out internally-contradictory p disjuncts: they represent
+    # the empty set and entail anything vacuously. Our DNF builder
+    # never emits an empty list, so contradictions surface as
+    # frozensets containing structurally-incompatible atoms (e.g.,
+    # {mark == MEM, mark == AX}); _disjunct_satisfiable rejects those.
+    sat_p_dnf = [d for d in p_dnf if _disjunct_satisfiable(d)]
+    if not sat_p_dnf:
+        # Every disjunct of p was contradictory -> p is unsatisfiable.
+        return True
     if not q_dnf:
         # q is unsatisfiable; only satisfied if p is too (already handled).
         return False
-    for p_disj in p_dnf:
+    for p_disj in sat_p_dnf:
         if not any(conj_subsumes(p_disj, q_disj) for q_disj in q_dnf):
             return False
     return True
