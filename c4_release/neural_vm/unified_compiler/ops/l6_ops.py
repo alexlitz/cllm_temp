@@ -891,6 +891,12 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_HI+1", -0.05),
                 ("OUTPUT_HI+15", -0.05),
             ),
+            # F-9: fires at SP marker rows for ENT-after-JSR (any non-zero
+            # ENT immediate whose ones-place is 8 — e.g. SP=0xffe8 for
+            # ENT 1..8 family member). EMBED_LO+8/HI+15 immediate-value
+            # constraint not expressible at slot granularity (EMBED nibble
+            # semantics widen to tautology), so we keep scope loose.
+            scope="mark == SP AND opcode_in_step in {ENT}",
         ),
         FFNRule.constant_write(
             name="l6_ent_after_jsr_sp_byte0_f0_when_ent_zero",
@@ -911,6 +917,11 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_HI+0", -0.05),
                 ("OUTPUT_HI+14", -0.05),
             ),
+            # F-9: SP marker row for ENT 0 (SP byte0 = 0xf0). ENT-immediate
+            # discrimination via EMBED nibble lanes is not visible to the
+            # scope DSL; loose scope matches the other SP-byte0 family
+            # members.
+            scope="mark == SP AND opcode_in_step in {ENT}",
         ),
         FFNRule.constant_write(
             name="l6_ent_after_jsr_bp_byte0_f0",
@@ -926,6 +937,8 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+8", -0.10),
                 ("OUTPUT_HI+1", -0.10),
             ),
+            # F-9: BP marker row right after JSR; BP byte 0 -> 0xf0.
+            scope="mark == BP AND opcode_in_step in {ENT}",
         ),
         FFNRule.constant_write(
             name="l6_ent_after_jsr_bp_byte1_ff",
@@ -943,6 +956,10 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+0", -0.10),
                 ("OUTPUT_HI+0", -0.10),
             ),
+            # F-9: byte-position 0 row carrying the BP byte 1 staging
+            # under H1+3 staging. BP-discrimination via H1+3 not modeled
+            # in slot semantics (H1+3 widens to a permissive predicate).
+            scope="is_byte AND byte_index == 0 AND opcode_in_step in {ENT}",
         ),
         FFNRule.constant_write(
             name="l6_ent_after_jsr_bp_byte2_00",
@@ -961,6 +978,8 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+15", -0.10),
                 ("OUTPUT_HI+15", -0.10),
             ),
+            # F-9: byte-position 1 row for BP byte 2 = 0x00.
+            scope="is_byte AND byte_index == 1 AND opcode_in_step in {ENT}",
         ),
         FFNRule.constant_write(
             name="l6_ent_after_jsr_bp_byte3_00",
@@ -979,6 +998,8 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+15", -0.10),
                 ("OUTPUT_HI+15", -0.10),
             ),
+            # F-9: byte-position 2 row for BP byte 3 = 0x00.
+            scope="is_byte AND byte_index == 2 AND opcode_in_step in {ENT}",
         ),
         FFNRule.constant_write(
             name="l6_ent_after_jsr_stack0_byte0_00",
@@ -996,6 +1017,8 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_HI+1", -0.10),
                 ("OUTPUT_HI+2", -0.10),
             ),
+            # F-9: STACK0 marker row right after JSR; byte 0 -> 0x00.
+            scope="mark == STACK0 AND opcode_in_step in {ENT}",
         ),
     )
 
