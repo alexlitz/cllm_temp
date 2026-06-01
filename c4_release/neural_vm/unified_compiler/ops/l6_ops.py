@@ -2565,6 +2565,94 @@ def make_layer6_attn_bake_op() -> Operation:
         # legacy helper and this bake owns the production-only scale bump.
         attn.W_k.data[5 * HD] *= 10.0
 
+    # Dim-ownership claims. ``_bake_layer6_attn_spec`` writes heads 0, 1, 2,
+    # 3, and 5 (head 4 is owned by ``layer6_bz_bnz_relay_bake``, heads 6/7 by
+    # ``layer6_relay_heads_bake``). Each head writes a fixed pattern of Q/K
+    # gates at slot 0, plus V/O 16-wide low/high nibble lanes that relay the
+    # fetched immediate (heads 0, 2, 5) or single-bit opcode flags (heads 1,
+    # 3). Head 5 additionally programs the branch byte-1 / opcode-byte relay
+    # at slots 32-66 plus a handful of fetch-blocker discriminators at slots
+    # 49-53. See ``_bake_layer6_attn_spec`` for the structure.
+    _claims = set()
+    # --- Head 0: later-step JMP relay (PC reads previous AX) ---
+    for col in ("MARK_PC+0", "MARK_AX+0", "HAS_SE+0", "CONST+0"):
+        _claims.add((6, "attn_W_q", "0_0", col))
+    for col in ("MARK_AX+0", "CONST+0"):
+        _claims.add((6, "attn_W_k", "0_0", col))
+    _claims.add((6, "attn_W_v", "0_1", "OP_JMP+0"))
+    _claims.add((6, "attn_W_o", "0_1", "CMP+0"))
+    for k in range(16):
+        _claims.add((6, "attn_W_v", f"0_{2 + k}", f"FETCH_LO+{k}"))
+        _claims.add((6, "attn_W_v", f"0_{18 + k}", f"FETCH_HI+{k}"))
+        _claims.add((6, "attn_W_o", f"0_{2 + k}", f"AX_CARRY_LO+{k}"))
+        _claims.add((6, "attn_W_o", f"0_{18 + k}", f"AX_CARRY_HI+{k}"))
+    # --- Head 1: EXIT relay (NEXT_SE reads current AX) ---
+    for col in ("NEXT_SE+0", "MARK_AX+0"):
+        _claims.add((6, "attn_W_q", "1_0", col))
+    _claims.add((6, "attn_W_k", "1_0", "MARK_AX+0"))
+    _claims.add((6, "attn_W_v", "1_1", "OP_EXIT+0"))
+    _claims.add((6, "attn_W_o", "1_1", "CMP+1"))
+    # --- Head 2: first-step JMP relay (PC self-attends to fetched target) ---
+    for col in ("MARK_PC+0", "HAS_SE+0", "MARK_AX+0", "OP_JMP+0", "CONST+0"):
+        _claims.add((6, "attn_W_q", "2_0", col))
+    _claims.add((6, "attn_W_k", "2_0", "MARK_PC+0"))
+    _claims.add((6, "attn_W_v", "2_1", "OP_JMP+0"))
+    _claims.add((6, "attn_W_o", "2_1", "CMP+0"))
+    for k in range(16):
+        _claims.add((6, "attn_W_v", f"2_{2 + k}", f"FETCH_LO+{k}"))
+        _claims.add((6, "attn_W_v", f"2_{18 + k}", f"FETCH_HI+{k}"))
+        _claims.add((6, "attn_W_o", f"2_{2 + k}", f"AX_CARRY_LO+{k}"))
+        _claims.add((6, "attn_W_o", f"2_{18 + k}", f"AX_CARRY_HI+{k}"))
+    # --- Head 3: first-step JSR relay (AX -> PC marker temp tag) ---
+    for col in ("MARK_PC+0", "MARK_AX+0", "HAS_SE+0"):
+        _claims.add((6, "attn_W_q", "3_0", col))
+    _claims.add((6, "attn_W_k", "3_0", "MARK_AX+0"))
+    _claims.add((6, "attn_W_v", "3_1", "OP_JSR+0"))
+    _claims.add((6, "attn_W_o", "3_1", "TEMP+0"))
+    # --- Head 5: first-step FETCH relay (PC marker self-attends to AX) ---
+    for col in ("MARK_AX+0", "HAS_SE+0"):
+        _claims.add((6, "attn_W_q", "5_0", col))
+    _claims.add((6, "attn_W_k", "5_0", "MARK_PC+0"))
+    for k in range(16):
+        _claims.add((6, "attn_W_v", f"5_{k}", f"FETCH_LO+{k}"))
+        _claims.add((6, "attn_W_v", f"5_{16 + k}", f"FETCH_HI+{k}"))
+        _claims.add((6, "attn_W_o", f"5_{k}", f"FETCH_LO+{k}"))
+        _claims.add((6, "attn_W_o", f"5_{16 + k}", f"FETCH_HI+{k}"))
+    # Branch byte-1 relay V/O (slots 32, 33, 34) and opcode-byte relay
+    # (slots 35..66).
+    for slot, dim in ((32, "OP_BZ+0"), (33, "OP_BNZ+0"), (34, "OP_JSR+0")):
+        _claims.add((6, "attn_W_v", f"5_{slot}", dim))
+        _claims.add((6, "attn_W_o", f"5_{slot}", dim))
+    for k in range(16):
+        _claims.add((6, "attn_W_v", f"5_{35 + k}", f"OPCODE_BYTE_LO+{k}"))
+        _claims.add((6, "attn_W_v", f"5_{51 + k}", f"OPCODE_BYTE_HI+{k}"))
+        _claims.add((6, "attn_W_o", f"5_{35 + k}", f"OPCODE_BYTE_LO+{k}"))
+        _claims.add((6, "attn_W_o", f"5_{51 + k}", f"OPCODE_BYTE_HI+{k}"))
+    # Head-5 Q/K discriminator slots: the branch byte-0 relay (slot 52), the
+    # AX-byte fetch blocker (slot 53), the fetch gate (slot 50), the HAS_SE
+    # gate (slot 49), and the ENT-after-JSR SP fetch gate (slot 51).
+    _claims.add((6, "attn_W_q", "5_49", "HAS_SE+0"))
+    _claims.add((6, "attn_W_k", "5_49", "CONST+0"))
+    _claims.add((6, "attn_W_q", "5_50", "MARK_AX+0"))
+    _claims.add((6, "attn_W_q", "5_50", "CONST+0"))
+    _claims.add((6, "attn_W_k", "5_50", "CONST+0"))
+    _claims.add((6, "attn_W_q", "5_51", "MARK_SP+0"))
+    _claims.add((6, "attn_W_q", "5_51", "HAS_SE+0"))
+    _claims.add((6, "attn_W_q", "5_51", "CONST+0"))
+    _claims.add((6, "attn_W_k", "5_51", "MARK_AX+0"))
+    _claims.add((6, "attn_W_k", "5_51", "OP_ENT+0"))
+    _claims.add((6, "attn_W_q", "5_52", "IS_BYTE+0"))
+    _claims.add((6, "attn_W_q", "5_52", "H1+0"))
+    _claims.add((6, "attn_W_q", "5_52", "BYTE_INDEX_0+0"))
+    _claims.add((6, "attn_W_q", "5_52", "MARK_PC+0"))
+    _claims.add((6, "attn_W_k", "5_52", "MARK_PC+0"))
+    _claims.add((6, "attn_W_q", "5_53", "H1+1"))
+    _claims.add((6, "attn_W_q", "5_53", "IS_BYTE+0"))
+    _claims.add((6, "attn_W_q", "5_53", "MARK_AX+0"))
+    _claims.add((6, "attn_W_q", "5_53", "H1+0"))
+    _claims.add((6, "attn_W_k", "5_53", "CONST+0"))
+    _claims = frozenset(_claims)
+
     return Operation(
         name="layer6_attn_bake",
         phase=998.5,
@@ -2575,6 +2663,7 @@ def make_layer6_attn_bake_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         migrated=True,
+        claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
         produces={
