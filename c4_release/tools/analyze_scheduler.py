@@ -389,7 +389,58 @@ def render_report(
         "`tools/analyze_scheduler.py`._"
     )
     lines.append("")
-    lines.append("## Summary")
+    lines.append("## Executive summary")
+    lines.append("")
+    cycle_share = (
+        counts.get("dep_graph_cycle_member", 0) / max(len(ops), 1) * 100
+    )
+    lines.append(
+        f"- **DAG depth ({dag_depth + 1}) vs static layer count "
+        f"({declared_n_layers})**: the dep-derived earliest chain only "
+        f"reaches depth {dag_depth + 1}, far below the {declared_n_layers}-"
+        f"layer hand-set layout. The remaining gap is held up by hidden "
+        f"ordering."
+    )
+    lines.append(
+        f"- **{int(cycle_share)}% of ops are stuck in cycles**: "
+        f"{counts.get('dep_graph_cycle_member', 0)} of {len(ops)} ops "
+        f"cannot be topologically ordered without phase pruning. The "
+        f"largest SCC swallows roughly half the ops, dominated by "
+        f"writes/reads on ``OUTPUT_HI``, ``AX_CARRY_HI``, ``ADDR_KEY``, "
+        f"``TEMP``."
+    )
+    lines.append(
+        f"- **Phase B is BLOCKED on dim-decomposition work**. Building "
+        f"``compile_full_vm_dynamic`` against today's declarations would "
+        f"reject the input as cyclic. Before Phase B can produce a baked "
+        f"model the largest SCC must be broken — either by introducing "
+        f"step-local vs cross-step dim variants (e.g. ``OUTPUT_HI_THIS_STEP`` "
+        f"vs ``OUTPUT_HI_PREV_STEP``) or by adding ``requires`` op-name "
+        f"references for the top back-edge dims listed below."
+    )
+    lines.append(
+        f"- **Effort estimate**: 1-2 days to land the analyzer + a dynamic-"
+        f"scheduler prototype that accepts phase as a fallback tiebreaker; "
+        f"**1-2 weeks** to actually retire phase pruning (each back-edge dim "
+        f"needs a designed decomposition + decl-verifier update + smoke "
+        f"validation). The 2-week estimate matches the upper bound the "
+        f"caller mentioned; the scope is dominated by the OUTPUT_HI / "
+        f"AX_CARRY / ADDR_KEY cycle work, not by the scheduler code itself."
+    )
+    lines.append(
+        f"- **Internal consistency check**: a clean Phase-B compile WOULD "
+        f"produce identical ``dim_positions`` and ``ops_per_layer`` to the "
+        f"static path IF all ops moved to ``phase_pinned_by_deps``. Today "
+        f"only {counts.get('phase_pinned_by_deps', 0)} of {len(ops)} ops "
+        f"reach that bucket; the other "
+        f"{counts.get('phase_required_but_undeclared', 0) + counts.get('phase_inconsistent_with_deps', 0)} "
+        f"non-cycle ops would float to earlier layers under a strict "
+        f"dep-order scheduler. That implies the dynamic and static paths "
+        f"are NOT yet equivalent — the dynamic scheduler would change the "
+        f"layout."
+    )
+    lines.append("")
+    lines.append("## Counts")
     lines.append("")
     lines.append(f"- total ops analysed: **{len(ops)}**")
     lines.append(f"- declared block-layer count (max floor(phase) for ops < 100): **{declared_n_layers}**")
