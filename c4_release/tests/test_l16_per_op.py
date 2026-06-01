@@ -330,13 +330,13 @@ def test_b6d_e0_marker_hi_lanes_route_to_output_hi(l16_rules_by_name):
     ir = _ir_from_family(l16_rules_by_name, "l16_stack0_e0_marker_from_alu_hi_")
     for lane in (0, 3, 9, 14):
         out = ir.symbolic_ffn(_e0_marker_firing_state(alu_hi_lane=lane))
-        assert out[f"OUTPUT_HI+{lane}"] > 0.0, (
-            f"e0 marker ALU_HI+{lane} did not light OUTPUT_HI+{lane}"
+        assert out[f"OUTPUT_HI_THIS_STEP+{lane}"] > 0.0, (
+            f"e0 marker ALU_HI+{lane} did not light OUTPUT_HI_THIS_STEP+{lane}"
         )
         for other in range(16):
             if other == lane:
                 continue
-            assert out.get(f"OUTPUT_HI+{other}", 0.0) == 0.0
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{other}", 0.0) == 0.0
 
 
 def test_b6d_e0_marker_suppresses_e8_lookalike(l16_rules_by_name):
@@ -457,7 +457,7 @@ def test_f8_marker_hi_lanes_route_to_output_hi(l16_rules_by_name):
     }
     for lane in (0, 2, 14):
         out = ir.symbolic_ffn(dict(base, **{f"ALU_HI+{lane}": 1.0}))
-        assert out[f"OUTPUT_HI+{lane}"] > 0.0
+        assert out[f"OUTPUT_HI_THIS_STEP+{lane}"] > 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -507,9 +507,9 @@ def test_lev_result_reroute_sp_value_hi_lane_shift(l16_rules_by_name):
     for lane in (0, 5, 14, 15):
         out = ir.symbolic_ffn(dict(_LEV_SP_BASE, **{f"ADDR_B0_HI+{lane}": 20.0}))
         expected_dst = (lane + 1) % 16
-        assert out.get(f"OUTPUT_HI+{expected_dst}", 0.0) > 0.0, (
+        assert out.get(f"OUTPUT_HI_THIS_STEP+{expected_dst}", 0.0) > 0.0, (
             f"LEV SP+BP+16 ADDR_B0_HI+{lane} did not light "
-            f"OUTPUT_HI+{expected_dst}: out={out}"
+            f"OUTPUT_HI_THIS_STEP+{expected_dst}: out={out}"
         )
 
 
@@ -534,8 +534,8 @@ def test_lev_result_reroute_pc_temp_copy_hi(l16_rules_by_name):
     ir = _ir_from_family(l16_rules_by_name, "l16_lev_pc_temp_hi_")
     for lane in (0, 5, 13):
         out = ir.symbolic_ffn(dict(_LEV_PC_BASE, **{f"TEMP+{16 + lane}": 2.0}))
-        assert out.get(f"OUTPUT_HI+{lane}", 0.0) > 0.0, (
-            f"LEV PC TEMP+{16 + lane} -> OUTPUT_HI+{lane} failed: {out}"
+        assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) > 0.0, (
+            f"LEV PC TEMP+{16 + lane} -> OUTPUT_HI_THIS_STEP+{lane} failed: {out}"
         )
 
 
