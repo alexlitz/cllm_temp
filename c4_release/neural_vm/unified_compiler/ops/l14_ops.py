@@ -783,6 +783,93 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
         attn.W_o.data[BD.OUTPUT_HI + 0, base + 0] = -0.5
 
 
+def _layer14_temp_clear_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for the ``layer14_temp_clear`` 4-unit substage chain.
+
+    Spans the three legacy helpers consolidated under this op:
+    :func:`_set_layer14_temp_clear` (1 unit), then
+    :func:`_set_layer14_clear_addsub_temp_negative_residue` (2 units),
+    then :func:`_set_layer14_add_byte1_high_zero_cleanup` (1 unit).
+    Every unit uses ``gate="CONST"`` with ``gate_weight=1.0`` and
+    ``gate_bias=0.0`` to reproduce the imperative
+    ``ffn.W_gate[unit, BD.CONST] = 1.0`` / unset-``b_gate`` pair
+    byte-identically (``constant_write`` would instead set
+    ``b_gate=1.0`` with ``W_gate[CONST]=0.0`` — a different matrix).
+    """
+    AX_I = 1
+    rules = (
+        # Unit 0: clear TEMP[0] at PC marker when OP_LEV active.
+        FFNRule.gated_write(
+            name="l14_temp_clear_pc_lev",
+            conditions=(
+                ("OP_LEV", 0.1),    # S * 0.1 == legacy W_up[..., OP_LEV] = S/10
+                ("MARK_PC", 1.0),
+            ),
+            threshold=1.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("TEMP+0", -5.0 / S),),
+            scope="OP_LEV and MARK_PC",
+            dominates_at={"TEMP+0": "OP_LEV and MARK_PC"},
+        ),
+        # Unit 1: TEMP[8] negative residue clamp.
+        FFNRule.gated_write(
+            name="l14_clear_addsub_temp_negative_residue_8",
+            conditions=(("TEMP+8", -1.0),),
+            threshold=0.0,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("TEMP+8", 2.0 / S),),
+        ),
+        # Unit 2: TEMP[9] negative residue clamp.
+        FFNRule.gated_write(
+            name="l14_clear_addsub_temp_negative_residue_9",
+            conditions=(("TEMP+9", -1.0),),
+            threshold=0.0,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("TEMP+9", 2.0 / S),),
+        ),
+        # Unit 3: ADD byte-1 high-nibble zero cleanup.
+        FFNRule.gated_write(
+            name="l14_add_byte1_high_zero_cleanup",
+            conditions=(
+                ("IS_BYTE", 1.0),
+                (f"H1+{AX_I}", 1.0),
+                ("BYTE_INDEX_0", 1.0),
+                ("TEMP+8", 1.0),
+                ("TEMP+9", -10.0),
+                ("AX_CARRY_HI+15", -10_000_000.0),
+                ("BYTE_INDEX_1", -10.0),
+                ("BYTE_INDEX_2", -10.0),
+                ("BYTE_INDEX_3", -10.0),
+                ("MARK_AX", -100.0),
+            ),
+            threshold=3.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                ("OUTPUT_HI_THIS_STEP+0", 50.0 / S),
+                *(
+                    (f"OUTPUT_HI_THIS_STEP+{nonzero}", -5000.0 / S)
+                    for nonzero in range(1, 16)
+                ),
+            ),
+        ),
+    )
+    return rules
+
+
+def _layer14_temp_clear_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_temp_clear_rules(S))
+    return ir
+
+
 def make_layer14_temp_clear_op() -> Operation:
     """L14 FFN: Clear TEMP[0] at PC marker when OP_LEV is active.
 
@@ -790,27 +877,28 @@ def make_layer14_temp_clear_op() -> Operation:
     additive cleanup ops (``layer14_clear_addr_key_pollution``,
     ``layer14_clear_output_corruption``) via a shared FFN unit counter stored
     on ``block.ffn._l14_unit_counter``. First in the chain (phase=14.1).
+
+    Migration (Phase 6 wave 3J): the 4 hidden units (across the legacy
+    helpers ``_set_layer14_temp_clear``,
+    ``_set_layer14_clear_addsub_temp_negative_residue``, and
+    ``_set_layer14_add_byte1_high_zero_cleanup``) are now declared via
+    :func:`_layer14_temp_clear_rules` and attached as ``compiler_ir``;
+    bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_temp_clear
-        from ...setup_helpers import (
-            _set_layer14_add_byte1_high_zero_cleanup,
-            _set_layer14_clear_addsub_temp_negative_residue,
-        )
         ffn = block.ffn
-        proxy = _as_setdim_proxy(dim_positions)
         # Pinned to the chain head (offset 0). Byte-identical with the
         # legacy ``_l14_unit_counter`` start (the counter is zero on a
         # fresh FFN before any L14 cleanup op has baked).
         start_unit = _l14_chain_alloc("layer14_temp_clear")
-        next_unit = _set_layer14_temp_clear(
-            ffn, S, proxy, start_unit=start_unit
+        ir = _layer14_temp_clear_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
         )
-        next_unit = _set_layer14_clear_addsub_temp_negative_residue(
-            ffn, S, proxy, start_unit=next_unit
-        )
-        next_unit = _set_layer14_add_byte1_high_zero_cleanup(
-            ffn, S, proxy, start_unit=next_unit
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -835,11 +923,12 @@ def make_layer14_temp_clear_op() -> Operation:
         phase=14.1,
         reads={"OP_LEV", "MARK_PC", "TEMP", "IS_BYTE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "BYTE_INDEX_3", "MARK_AX", "CONST"},
+               "BYTE_INDEX_3", "MARK_AX", "AX_CARRY_HI", "CONST"},
         writes={"TEMP", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_temp_clear_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
