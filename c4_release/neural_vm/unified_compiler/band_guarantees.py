@@ -42,6 +42,7 @@ class OneHotBandGuarantee:
     active_value: Optional[float] = None
     max_abs_weight: float = 16.0
     name: Optional[str] = None
+    scope: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.band_base, str) or not self.band_base:
@@ -163,6 +164,7 @@ class OneHotBandGuarantee:
                 gate_terms=((lane_name, -1.0),),
                 gate_bias=self.target_value(lane),
                 writes=((lane_name, 1.0),),
+                scope=self.scope,
             ))
         return tuple(rules)
 
@@ -187,6 +189,7 @@ class ScalarValueGuarantee:
     condition_threshold: Optional[float] = None
     max_abs_weight: float = 16.0
     name: Optional[str] = None
+    scope: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.value_dim, str) or not self.value_dim:
@@ -259,6 +262,7 @@ class ScalarValueGuarantee:
                 gate_terms=((self.value_dim, -1.0),),
                 gate_bias=float(self.expected_value),
                 writes=((self.value_dim, 1.0),),
+                scope=self.scope,
             ),
         )
 
@@ -272,6 +276,7 @@ def scalar_value_guarantee_rules(
     condition_threshold: Optional[float] = None,
     max_abs_weight: float = 16.0,
     name: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> Tuple[FFNRule, ...]:
     """Build declarative FFN rules for an exact scalar value."""
 
@@ -283,6 +288,7 @@ def scalar_value_guarantee_rules(
         condition_threshold=condition_threshold,
         max_abs_weight=max_abs_weight,
         name=name,
+        scope=scope,
     ).to_ffn_rules()
 
 
@@ -295,6 +301,7 @@ def scalar_nibble_guarantee_rules(
     condition_threshold: Optional[float] = None,
     max_abs_weight: float = 16.0,
     name: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> Tuple[FFNRule, ...]:
     """Build a scalar exactness rule for a nibble value in ``0..15``."""
 
@@ -313,6 +320,7 @@ def scalar_nibble_guarantee_rules(
         condition_threshold=condition_threshold,
         max_abs_weight=max_abs_weight,
         name=name,
+        scope=scope,
     )
 
 
@@ -326,6 +334,7 @@ def scalar_byte_guarantee_rules(
     condition_threshold: Optional[float] = None,
     max_abs_weight: float = 16.0,
     name: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> Tuple[FFNRule, ...]:
     """Build scalar exactness rules for low/high nibble value slots."""
 
@@ -343,6 +352,7 @@ def scalar_byte_guarantee_rules(
         condition_threshold=condition_threshold,
         max_abs_weight=max_abs_weight,
         name=low_name,
+        scope=scope,
     ) + scalar_nibble_guarantee_rules(
         value_dim=high_value_dim,
         expected_nibble=(expected_byte >> 4) & 0x0F,
@@ -351,6 +361,7 @@ def scalar_byte_guarantee_rules(
         condition_threshold=condition_threshold,
         max_abs_weight=max_abs_weight,
         name=high_name,
+        scope=scope,
     )
 
 
@@ -367,6 +378,7 @@ def one_hot_band_guarantee_rules(
     active_value: Optional[float] = None,
     max_abs_weight: float = 16.0,
     name: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> Tuple[FFNRule, ...]:
     """Build declarative FFN rules for a one-hot structural guarantee."""
 
@@ -382,6 +394,7 @@ def one_hot_band_guarantee_rules(
         active_value=active_value,
         max_abs_weight=max_abs_weight,
         name=name,
+        scope=scope,
     ).to_ffn_rules()
 
 
@@ -397,6 +410,7 @@ def expected_nibble_guarantee_rules(
     active_value: Optional[float] = None,
     max_abs_weight: float = 16.0,
     name: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> Tuple[FFNRule, ...]:
     """Convenience wrapper for the common 16-lane nibble-band case."""
 
@@ -412,6 +426,7 @@ def expected_nibble_guarantee_rules(
         active_value=active_value,
         max_abs_weight=max_abs_weight,
         name=name,
+        scope=scope,
     )
 
 
@@ -428,6 +443,7 @@ def expected_byte_guarantee_rules(
     active_value: Optional[float] = None,
     max_abs_weight: float = 16.0,
     name: Optional[str] = None,
+    scope: Optional[str] = None,
 ) -> Tuple[FFNRule, ...]:
     """Emit one-hot guarantees for legacy byte low/high nibble bands."""
 
@@ -449,6 +465,7 @@ def expected_byte_guarantee_rules(
         active_value=active_value,
         max_abs_weight=max_abs_weight,
         name=low_name,
+        scope=scope,
     )
     high = expected_nibble_guarantee_rules(
         band_base=high_band_base,
@@ -461,6 +478,7 @@ def expected_byte_guarantee_rules(
         active_value=active_value,
         max_abs_weight=max_abs_weight,
         name=high_name,
+        scope=scope,
     )
     return low + high
 

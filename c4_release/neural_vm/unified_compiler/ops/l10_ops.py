@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from dataclasses import replace
+from typing import Optional
 
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule
 from ..layer_compiler import Operation
@@ -1500,6 +1501,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         threshold: float,
         active_value: float = 4.0,
         max_abs_weight: float = 1_000_000.0,
+        scope: Optional[str] = None,
     ) -> tuple[FFNRule, ...]:
         """Lane-local exact output-byte guarantee from structural evidence."""
 
@@ -1512,6 +1514,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             min_margin=1.0,
             max_abs_weight=max_abs_weight,
             name=name,
+            scope=scope,
         )
 
     def clear_output_writes(strength: float = 100.0):
