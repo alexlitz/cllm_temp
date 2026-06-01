@@ -116,8 +116,31 @@ def build_dep_graph(
             producers[(dim, reg)].append(op)
 
     for v in ops:
+        # B9 R-OH-2: when a reader declares ``requires["after"] = <op X>``
+        # AND X writes some dim D that v also reads, suppress the
+        # data-flow edge u→v on D for every PRODUCER u (u != X).
+        # Semantic: the reader is opting into the "prev-step residual"
+        # interpretation -- the read is satisfied by X's prev-step write
+        # via the KV cache, NOT a same-step data dep on any later-layer
+        # producer. The explicit requires["after"] edge X→v is still
+        # added below (so X must run before v in the schedule).
+        # See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §7.2 and §6.3.
+        requires_after_writers: Set[Tuple[str, str]] = set()
+        for ref in requires_after_ops(v):
+            if ref == v.name or ref not in name_to_op:
+                continue
+            ref_op = name_to_op[ref]
+            for d in ref_op.writes & v.reads:
+                requires_after_writers.add((ref, d))
+        suppressed_dims = {d for (_, d) in requires_after_writers}
         # Data-flow edges
         for d in v.reads:
+            if d in suppressed_dims:
+                # Cross-step read acknowledged via requires["after"];
+                # the actual X→v edge is added below in the requires
+                # block. Skip the data-flow inference for every other
+                # writer of D.
+                continue
             for u in writers.get(d, ()):
                 if u.name == v.name:
                     continue
