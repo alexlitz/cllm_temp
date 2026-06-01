@@ -860,6 +860,27 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         )
         ffn._l14_unit_counter = next_unit
 
+    # Dim-ownership claims (W_down output cells). Runs at phase 14.3 after
+    # ``layer14_temp_clear`` (units 0..3) and
+    # ``layer14_clear_addr_key_pollution`` (units 4..51).
+    #   unit 52: _set_layer14_clear_output_corruption k=0 -> OUTPUT_LO[0]
+    #   unit 53: _set_layer14_clear_output_corruption k=16 -> OUTPUT_HI[0]
+    #   unit 54: JSR STACK0 marker high-zero default unit (allocated by
+    #            ``_set_layer14_clear_output_corruption`` then wiped by
+    #            ``_disable_l14_stack0_jsr_hi0_default``; net W_down delta is
+    #            zero so the verifier observes no change — intentionally
+    #            unclaimed).
+    #   units 55..69: _boost_l14_psh_mem_marker_high_nibbles writes one
+    #            W_down[OUTPUT_HI+nibble] per unit for nibble in 1..15.
+    _claims = {
+        (14, "ffn_W_down", "52", "OUTPUT_LO+0"),
+        (14, "ffn_W_down", "53", "OUTPUT_HI+0"),
+    }
+    for nibble in range(1, 16):
+        _claims.add(
+            (14, "ffn_W_down", str(54 + nibble), f"OUTPUT_HI+{nibble}")
+        )
+
     return Operation(
         name="layer14_clear_output_corruption",
         phase=14.3,
@@ -874,6 +895,7 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
+        claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
