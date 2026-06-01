@@ -1,9 +1,71 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L9 FFN unit layout (pinned offsets) ============================
+#
+# The ``layer9_alu`` op owns the entire L9 FFN. The actual weight writes
+# happen inside ``vm_step._set_layer9_alu`` + ``_set_layer9_marker_suppress``,
+# which use a local ``unit = 0`` counter that increments through 3405
+# sub-stages. Migration to :class:`FFNUnitAllocator` keeps those helpers
+# byte-identical -- we just declare each sub-stage's range at its existing
+# pinned offset so the layout is auditable rather than implicit. Adding a new
+# L9 op family later will go through ``allocator.alloc(name, n)`` without a
+# pin, and the allocator will pick the first free gap below 3405 (or above).
+#
+# The offsets below mirror the unit-counter walk in
+# ``vm_step._set_layer9_alu`` (carry/borrow doubled inner loops) followed by
+# ``_set_layer9_marker_suppress`` (7 NEXT_* dims). Changing any helper's
+# unit count requires updating this table in lock-step.
+_L9_ALU_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer9_alu.add_hi_nibble",         0, 512),  # ADD hi nibble (carry x 256)
+    ("layer9_alu.lea_hi_nibble",       512, 512),  # LEA hi nibble (carry x 256)
+    ("layer9_alu.adj_hi_nibble",      1024, 512),  # ADJ hi nibble (carry x 256)
+    ("layer9_alu.sub_hi_nibble",      1536, 512),  # SUB hi nibble (borrow x 256)
+    ("layer9_alu.ent_hi_nibble",      2048, 512),  # ENT hi nibble (borrow x 256)
+    ("layer9_alu.hi_eq",              2560,  16),  # CMP+1 hi-eq
+    ("layer9_alu.lo_eq",              2576,  16),  # CMP+2 lo-eq
+    ("layer9_alu.hi_lt",              2592, 120),  # CMP+0 hi-lt
+    ("layer9_alu.lo_lt",              2712, 120),  # CMP+3 lo-lt
+    ("layer9_alu.add_carry_out",      2832, 256),  # CARRY+1 add carry-out
+    ("layer9_alu.sub_borrow_out",     3088, 256),  # CARRY+2 sub borrow-out
+    ("layer9_alu.alu_lo_clear",       3344,  16),  # ALU_LO clear at non-ALU op
+    ("layer9_alu.alu_hi_clear",       3360,  16),  # ALU_HI clear at non-ALU op
+    ("layer9_alu.bp_plus8_shift",     3376,  16),  # ADDR_B0_LO BP+8 lo-nibble shift
+    ("layer9_alu.addr_b1_lo_set",     3392,   1),  # ADDR_B1_LO+15
+    ("layer9_alu.addr_b1_hi_set",     3393,   1),  # ADDR_B1_HI+15
+    ("layer9_alu.cascade_b0_hi",      3394,   1),  # cascade ADDR_B0_HI[15]->[0]
+    ("layer9_alu.cascade_b1_lo",      3395,   1),  # cascade ADDR_B1_LO[15]->[0]
+    ("layer9_alu.cascade_b1_hi",      3396,   1),  # cascade ADDR_B1_HI[15]->[0]
+    ("layer9_alu.cascade_b2_lo",      3397,   1),  # cascade ADDR_B2_LO+1
+    ("layer9_alu.marker_suppress",    3398,   7),  # _set_layer9_marker_suppress NEXT_*
+)
+
+
+def _allocate_layer9_alu_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L9 ALU sub-stages.
+
+    Every sub-stage is pinned at its existing offset so the underlying
+    ``vm_step._set_layer9_alu`` helper -- which writes via its own
+    monotonic ``unit = 0`` counter -- lands on exactly the same hidden-unit
+    indices it always has. This call is byte-identical bookkeeping: the
+    allocator declares ranges by name, the helper writes the weights. A
+    future refactor can split the monolithic helper into per-range bake
+    functions that consume ``allocator.alloc(...)`` directly.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L9 op claims a free range past unit 3405).
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L9_ALU_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
@@ -29,10 +91,37 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer9_alu, _set_layer9_marker_suppress
         proxy = _as_setdim_proxy(dim_positions)
+
+        # Per-bake FFN-unit allocator. Each L9 ALU sub-stage is pinned to
+        # its existing offset so the calls below land byte-identically. The
+        # ``marker_suppress`` range gives the start-unit for the
+        # ``_set_layer9_marker_suppress`` chained call, replacing the
+        # implicit ``n9`` cursor return.
+        allocator = _allocate_layer9_alu_units()
+        marker_range = next(
+            r for r in allocator.ranges()
+            if r.op_name == "layer9_alu.marker_suppress"
+        )
+        marker_start = marker_range.start
+        # Make the allocator available for inspection / extension by
+        # downstream tools (e.g. a future L9 op family claiming a free
+        # gap). The block-level attribute mirrors the ``_l14_unit_counter``
+        # convention used by sibling layers, but carries the allocator
+        # object so the layout is structured, not just a monotonic int.
+        block.ffn._l9_unit_allocator = allocator
+
         n9 = _set_layer9_alu(block.ffn, S, proxy)
+        # Byte-identity guard: the helper's local cursor MUST end exactly
+        # where the allocator's marker_suppress range starts. If the table
+        # drifts from the helper's writes, this assertion fires before any
+        # weight surgery happens.
+        assert n9 == marker_start, (
+            f"L9 ALU unit cursor drift: helper returned {n9}, allocator "
+            f"expected {marker_start}"
+        )
         if alu_mode == "efficient":
             _suppress_l9_legacy_addsub_writes(block.ffn, proxy)
-        _set_layer9_marker_suppress(block.ffn, S, proxy, n9)
+        _set_layer9_marker_suppress(block.ffn, S, proxy, marker_start)
 
     # Dim-ownership claims (W_down output cells). Mirrors ``_set_layer9_alu``
     # in ``vm_step.py`` (3398 units) followed by ``_set_layer9_marker_suppress``
