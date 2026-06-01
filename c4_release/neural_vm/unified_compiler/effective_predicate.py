@@ -20,6 +20,7 @@ from neural_vm.unified_compiler.predicates import (
     Or,
     Predicate,
     parse,
+    satisfiable,
 )
 
 
@@ -39,6 +40,16 @@ _TOTAL_DNF_BUDGET = 256
 # Sentinel tautology expressed via the DSL: returned when we have no
 # useful information to constrain the over-approximation.
 _TAUTOLOGY = parse("step_is_fresh OR NOT step_is_fresh")
+
+# Sentinel contradiction expressed via the DSL: returned when the AND of
+# positive condition semantics (and NOT-blockers) is unsatisfiable -- i.e.,
+# the rule's effective firing set is empty under our over-approximation,
+# meaning two condition semantics structurally contradict (e.g., MARK_MEM
+# AND CMP+X-with-mark==AX). entails(contradiction, anything) returns True
+# vacuously, so callers treating effective_predicate output as the firing
+# set under-approximation correctly conclude "rule fires nowhere -> any
+# scope claim trivially holds."
+_CONTRADICTION = parse("is_byte AND NOT is_byte")
 
 
 def _nnf_disjunct_count(p: Predicate, negated: bool = False) -> int:
@@ -164,6 +175,20 @@ def effective_predicate(rule: FFNRule, registry: DimRegistry) -> Predicate:
         return _TAUTOLOGY
 
     if len(parts) == 1:
-        return parts[0]
+        result = parts[0]
+    else:
+        result = And(tuple(parts))
 
-    return And(tuple(parts))
+    # If the AND of positives + NOT-blockers is unsatisfiable, the
+    # rule's effective firing set is structurally empty: two or more
+    # positive-weight condition semantics contradict (e.g., MARK_MEM
+    # AND a CMP+X-style condition whose semantics force mark == AX).
+    # Returning the original AND would expose `entails(effective, scope)`
+    # to a non-trivial firing set, manufacturing false-positive
+    # scope_violation flags. Collapse to a contradiction sentinel; the
+    # patched entails() (in predicates.py) treats internally-contradictory
+    # disjuncts as vacuously entailing anything.
+    if not satisfiable(result):
+        return _CONTRADICTION
+
+    return result
