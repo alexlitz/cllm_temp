@@ -1,10 +1,62 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..band_guarantees import scalar_value_guarantee_rules
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L16 FFN unit layout (pinned offsets) ===========================
+#
+# The ``layer16_lev_routing`` op currently owns the entire L16 FFN. Its
+# bake calls ``lower_layer16_lev_routing_ir(..., start_unit=0)``, which
+# walks ``_layer16_lev_routing_rules`` and writes one hidden unit per
+# rule via :func:`Primitives.lower_ffn_rules`. The full sub-stage list
+# spans many families (LEV routing, STACK0 markers, BP/SP byte
+# producers, post-LEV AX_CARRY + STACK0 byte0 preservation, etc.) but
+# the rule-list order is monolithic and unit-index ``i`` always lands
+# at ``i``-th rule, so the only externally-visible offset is
+# ``start_unit=0`` for a 792-unit span.
+#
+# Migration to :class:`FFNUnitAllocator` keeps that span byte-identical
+# -- we declare the single pinned range and assert at bake-time that
+# the lowering helper actually wrote exactly that many units. Adding a
+# new L16 op family later will go through ``allocator.alloc(name, n)``
+# without a pin, and the allocator will pick the first free gap past
+# 792 (or above). Splitting the monolithic range into per-sub-stage
+# pins is a possible follow-up once the sub-stage offsets are stable.
+#
+# The total here mirrors ``ffn_units_used=792`` on the op. Changing
+# the rule-list length in ``_layer16_lev_routing_rules`` requires
+# updating this table in lock-step.
+_L16_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer16_lev_routing", 0, 792),  # full LEV routing rule bank
+)
+
+
+def _allocate_layer16_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L16 sub-stages.
+
+    Every sub-stage is pinned at its existing offset so the underlying
+    ``lower_layer16_lev_routing_ir`` call -- which writes via its own
+    monotonic ``start_unit=0`` cursor through
+    :func:`Primitives.lower_ffn_rules` -- lands on exactly the same
+    hidden-unit indices it always has. This call is byte-identical
+    bookkeeping: the allocator declares ranges by name, the helper
+    writes the weights. A future refactor can split the monolithic
+    routing range into per-family bake calls that consume
+    ``allocator.alloc(...)`` directly.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L16 op claims a free range past unit 792).
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L16_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def _add_stack0_x0_alu_materializer(
@@ -1557,10 +1609,35 @@ def lower_layer16_lev_routing_ir(ffn, S: float, BD, *, start_unit: int = 0) -> i
 def make_layer16_lev_routing_op() -> Operation:
     """L16 FFN: LEV routing — SP = BP + 16."""
     def bake(ffn, dim_positions, S):
-        lower_layer16_lev_routing_ir(
+        # Per-bake FFN-unit allocator. The single routing range is
+        # pinned at offset 0 so the call below lands byte-identically.
+        # The lowering helper writes one unit per rule starting from
+        # ``start_unit=0``; its return value MUST equal the end of the
+        # pinned range or the layout has drifted from the rule list.
+        allocator = _allocate_layer16_units()
+        routing_range = next(
+            r for r in allocator.ranges()
+            if r.op_name == "layer16_lev_routing"
+        )
+        # Make the allocator available for inspection / extension by
+        # downstream tools (e.g. a future L16 op family claiming a free
+        # gap). Mirrors the ``_l9_unit_allocator`` convention on sibling
+        # layers so the layout is structured, not just a monotonic int.
+        ffn._l16_unit_allocator = allocator
+
+        next_unit = lower_layer16_lev_routing_ir(
             ffn,
             S,
             _as_setdim_proxy(dim_positions),
+            start_unit=routing_range.start,
+        )
+        # Byte-identity guard: the helper's monotonic cursor MUST end
+        # exactly where the allocator's routing range ends. If the
+        # rule-list length drifts from the pinned layout, this
+        # assertion fires before any downstream op consumes the FFN.
+        assert next_unit == routing_range.end, (
+            f"L16 LEV routing unit cursor drift: helper returned "
+            f"{next_unit}, allocator expected {routing_range.end}"
         )
 
     return Operation(
