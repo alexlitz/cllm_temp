@@ -859,7 +859,9 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer14_clear_addr_key_pollution
         ffn = block.ffn
-        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        # Pinned to chain offset 4 (after layer14_temp_clear consumes 0..3).
+        # Byte-identical with the legacy ``_l14_unit_counter`` start.
+        start_unit = _l14_chain_alloc("layer14_clear_addr_key_pollution")
         next_unit = _set_layer14_clear_addr_key_pollution(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
