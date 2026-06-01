@@ -76,7 +76,16 @@ class WriteTerm:
 
 @dataclass(frozen=True)
 class FFNRule:
-    """One SwiGLU-compatible conditional write."""
+    """One SwiGLU-compatible conditional write.
+
+    `scope` is an optional predicate-DSL string declaring the intended
+    firing scope of this rule (parsed by
+    ``neural_vm.unified_compiler.predicates.parse``). It is checked by
+    ``decl_verifier.verify_rule_scopes`` (F-7) against the effective
+    over-approximation derived from the rule's weights+conditions: the
+    effective firing predicate must be entailed by the declared scope.
+    Optional during the F-8/F-9/F-10 backfill window.
+    """
 
     conditions: Tuple[ConditionTerm, ...]
     threshold: float
@@ -86,6 +95,7 @@ class FFNRule:
     gate_terms: Tuple[ConditionTerm, ...] = ()
     gate_bias: float = 1.0
     name: Optional[str] = None
+    scope: Optional[str] = None
 
     @classmethod
     def constant_write(
@@ -95,6 +105,7 @@ class FFNRule:
         threshold: float,
         writes: Sequence[Tuple[str, float]],
         name: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> "FFNRule":
         return cls(
             conditions=tuple(
@@ -107,6 +118,7 @@ class FFNRule:
                 for dim, weight in writes
             ),
             name=name,
+            scope=scope,
         )
 
     @classmethod
@@ -121,6 +133,7 @@ class FFNRule:
         gate_weight: float = 1.0,
         gate_bias: float = 0.0,
         name: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> "FFNRule":
         return cls(
             conditions=tuple(
@@ -140,6 +153,7 @@ class FFNRule:
                 for dim, weight in writes
             ),
             name=name,
+            scope=scope,
         )
 
 

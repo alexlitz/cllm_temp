@@ -79,6 +79,34 @@ def assert_op_fires(static_report, layer_label: str, op_name: str) -> None:
     )
 
 
+def assert_rule_scopes_satisfied(op, registry=None, *, require_scope=False):
+    """F-12: assert that every FFNRule in ``op`` with a declared ``scope``
+    predicate has effective firing scope entailed by that predicate.
+
+    Off by default (opt-in): a per-op test calls this only if the
+    file has been backfilled by F-8/F-9/F-10.
+
+    If ``require_scope=True``, also fails on rules WITHOUT a scope --
+    useful when a layer-file is fully backfilled.
+    """
+    if registry is None:
+        from neural_vm.dim_registry import build_default_registry
+        registry = build_default_registry()
+
+    from neural_vm.unified_compiler.decl_verifier import verify_rule_scopes
+    issues = verify_rule_scopes(op, registry, require_scope=require_scope)
+    if issues:
+        msgs = [
+            f"  - [{i['kind']}] rule={i.get('rule','?')!r}: "
+            f"{i.get('reason', '')}"
+            for i in issues
+        ]
+        raise AssertionError(
+            f"Op {getattr(op, 'name', '?')!r} has {len(issues)} rule-scope issue(s):\n"
+            + "\n".join(msgs)
+        )
+
+
 def assert_op_absent(static_report, layer_label: str, op_name: str) -> None:
     """Op must NOT appear in the report (used for known-empty-claims ops).
 

@@ -3716,3 +3716,128 @@ def verify_compaction_safety(
         mismatches=mismatches,
         partition_unavailable=partition_unavailable,
     )
+
+
+# ---------------------------------------------------------------------------
+# F-7: Rule-scope verification
+# ---------------------------------------------------------------------------
+
+
+def verify_rule_scopes(
+    op,
+    registry,
+    *,
+    require_scope: bool = False,
+) -> List[Dict[str, object]]:
+    """Verify each FFNRule's declared ``scope`` entails its effective
+    firing predicate (computed from weights + condition dim semantics).
+
+    Returns a list of issue dicts. An empty list means "all checks passed."
+    Each issue has at least ``kind`` and ``rule`` keys; ``reason`` carries
+    a one-line human explanation.
+
+    Recognized issue kinds:
+
+      * ``"missing_scope"`` -- rule has no ``scope=`` declaration and
+        ``require_scope=True``.
+      * ``"scope_unparseable"`` -- ``rule.scope`` string failed to parse
+        with the predicate DSL.
+      * ``"scope_violation"`` -- the rule's effective firing predicate is
+        NOT entailed by the declared scope: positions exist that satisfy
+        the effective predicate but not the declared scope (i.e., the rule
+        fires somewhere the declaration says it shouldn't).
+      * ``"scope_unsatisfiable_effective"`` -- the effective predicate is
+        a contradiction; the rule cannot fire under our over-approximation.
+        Reported as a warning regardless of ``require_scope``.
+
+    Off-by-default callers (e.g., per-op test helper) pass an op whose
+    rules may not yet have scopes — those are silently skipped unless
+    ``require_scope=True``.
+    """
+    from .effective_predicate import effective_predicate
+    from .predicates import entails, explain_failure, parse
+
+    ir = getattr(op, "compiler_ir", None)
+    if ir is None:
+        return []
+    rules = getattr(ir, "rules", None)
+    if rules is None:
+        return []
+
+    issues: List[Dict[str, object]] = []
+    for rule in rules:
+        rule_name = getattr(rule, "name", None) or "<anonymous>"
+        declared_scope = getattr(rule, "scope", None)
+
+        if declared_scope is None:
+            if require_scope:
+                issues.append({
+                    "kind": "missing_scope",
+                    "rule": rule_name,
+                    "reason": "rule has no declared scope= predicate",
+                })
+            continue
+
+        try:
+            scope_pred = parse(declared_scope)
+        except Exception as exc:  # noqa: BLE001 — surface any parse error
+            issues.append({
+                "kind": "scope_unparseable",
+                "rule": rule_name,
+                "reason": f"scope={declared_scope!r} did not parse: {exc}",
+            })
+            continue
+
+        try:
+            eff_pred = effective_predicate(rule, registry)
+        except Exception as exc:  # noqa: BLE001
+            issues.append({
+                "kind": "scope_unparseable",
+                "rule": rule_name,
+                "reason": (
+                    f"failed to compute effective predicate: {exc}"
+                ),
+            })
+            continue
+
+        # If the effective predicate is unsatisfiable, the rule is dead
+        # under our over-approximation; surface as a warning issue but
+        # don't conflate with scope violation.
+        try:
+            tautology = parse("step_is_fresh OR NOT step_is_fresh")
+            contradiction = parse("step_is_fresh AND NOT step_is_fresh")
+            if entails(eff_pred, contradiction):
+                issues.append({
+                    "kind": "scope_unsatisfiable_effective",
+                    "rule": rule_name,
+                    "reason": (
+                        "effective predicate is unsatisfiable; rule "
+                        "cannot fire under the over-approximation"
+                    ),
+                })
+                continue
+            # If the declared scope is a tautology, it's trivially fine.
+            if entails(tautology, scope_pred):
+                continue
+        except Exception:  # noqa: BLE001 — keep going on parse oddities
+            pass
+
+        if not entails(eff_pred, scope_pred):
+            explanation = ""
+            try:
+                explanation = explain_failure(eff_pred, scope_pred) or ""
+            except Exception:  # noqa: BLE001
+                explanation = ""
+            reason = (
+                f"effective predicate does not entail declared "
+                f"scope={declared_scope!r}"
+            )
+            if explanation:
+                reason = f"{reason}: {explanation}"
+            issues.append({
+                "kind": "scope_violation",
+                "rule": rule_name,
+                "reason": reason,
+            })
+
+    return issues
