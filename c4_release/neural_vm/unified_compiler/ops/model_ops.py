@@ -735,6 +735,17 @@ def make_embedding_bake_op() -> Operation:
     def _bake(model, dim_positions, S):
         setup_token_embeddings(model.embed.embed.weight, dim_positions)
 
+    # Dim-ownership claims. ``setup_token_embeddings`` calls ``embed_weight
+    # .zero_()`` first, which differs from the fresh ``nn.Embedding`` random
+    # init for every row; the static verifier's embedding diff therefore
+    # registers an ``embed_row`` claim for every token id 0 .. V-1. The
+    # vocabulary size matches ``Token.VOCAB_SIZE`` (276). Declaring all rows
+    # makes the verifier check that no row is missed by future refactors.
+    from ...vm_step import Token as _Token  # local import to avoid module-load cycle
+    _claims = frozenset(
+        (-1, "embed_row", str(tok), None) for tok in range(_Token.VOCAB_SIZE)
+    )
+
     return Operation(
         name="embedding_bake",
         reads=set(),
@@ -744,6 +755,7 @@ def make_embedding_bake_op() -> Operation:
         declarative_bake_fn=_bake,
         phase=1001,
         declarative_authority="declarative",
+        claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
