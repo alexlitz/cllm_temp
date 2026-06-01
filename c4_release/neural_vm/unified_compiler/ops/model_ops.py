@@ -214,6 +214,23 @@ def make_opcode_relay_head_op() -> Operation:
     ``_set_function_call_weights`` (phase=998) plus
     ``_set_layer6_relay_heads`` (phase=998.6) — none of which touch
     head 6 slots, so phase ordering against those is irrelevant.
+
+    Claim-coverage note: ``claims`` is intentionally left empty. The
+    migrated ``_bake_layer6_relay_heads_spec`` head-6 section in
+    ``ops/l6_ops.py`` (phase=998.6) writes the *same* W_q/W_k/W_v/W_o
+    cells with the *same* values that this op writes -- it was promoted
+    to a per-block spec ahead of ``opcode_relay_head``'s phase=1002
+    dispatch. By the time this op runs, every cell it would set already
+    holds the target value, so the snapshot diff comes back empty and
+    the static verifier marks the bake "inert". The only remaining
+    side effect of this op is ``alibi_slopes[6]=5.0`` /
+    ``alibi_slopes[7]=5.0`` -- a non-weight-matrix mutation outside the
+    verifier's diff scope. Declaring claims here would either flag every
+    one as ``declared_but_not_written`` (the writes look like no-ops to
+    the differ) or pass only via the inert short-circuit -- neither adds
+    verification value. The genuine bake of these cells lives on
+    ``make_layer6_relay_heads_bake_op``; claims should be attached there
+    when that op is backfilled.
     """
     def bake(model, dim_positions, S):
         del S
@@ -733,6 +750,18 @@ def make_head_bake_op() -> Operation:
 
     Phase=1000 so it runs AFTER legacy_bake (phase=999); the corresponding
     head section in `set_vm_weights` has been removed to avoid double-bake.
+
+    Claim-coverage note: ``claims`` is intentionally left empty. The static
+    verifier in ``decl_verifier.py`` (``_diff_all_blocks_by_ptr``) diffs only
+    ``model.blocks[*].attn`` / ``.ffn`` matrices and the token-embedding row
+    table. ``setup_head_weights`` writes to ``model.head.weight`` and
+    ``model.head.bias`` -- two parameters outside the verifier's diff scope.
+    Even if we declared claims, the snapshot diff would observe zero cells
+    for this op and the verifier would either mark it inert (passing via
+    the inert short-circuit) or flag every claim as ``declared_but_not_
+    written``. Neither outcome adds verification value until the diff path
+    is extended to cover the head module. Structural-anchor-style op: the
+    only writer to ``head.{weight,bias}``, so collisions aren't a concern.
     """
     def _bake(model, dim_positions, S):
         setup_head_weights(model.head, dim_positions)
