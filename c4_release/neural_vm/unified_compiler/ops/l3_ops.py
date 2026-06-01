@@ -33,6 +33,78 @@ def make_layer3_ffn_op() -> Operation:
         _suppress_layer3_stack0_marker_carry_projection(block.ffn, S, proxy)
         _add_layer3_pc_byte1_output_rules(block.ffn, S, proxy)
 
+    # Dim-ownership claims (W_down output cells; partial-claims subset). The
+    # bake writes 136 hidden units; their W_down output projections fall into
+    # well-defined blocks:
+    #   units 0/1:     PC default emit -> OUTPUT_LO+10 (low nibble of PC byte0
+    #                  default for STACK_INIT-style residue) and EMBED_LO+10
+    #                  carry (legacy default kept for residue safety).
+    #   units 2/3:     analogous OUTPUT_HI+0 / EMBED_HI+0 PC default.
+    #   units 6..49:   STACK0 marker carry suppressor / SP/BP/STACK0 default
+    #                  blocks, each writing a single OUTPUT_LO+0 or
+    #                  OUTPUT_HI+0 cell (alternating; see
+    #                  _set_layer3_ffn in vm_step.py and the suppressor
+    #                  ``_suppress_layer3_stack0_marker_carry_projection``).
+    #   unit 12:       BP default emits OUTPUT_LO+1 (one-byte default).
+    #   unit 20:       SP default emits OUTPUT_LO+1.
+    #   units 82..85:  STACK0 NEXT_STACK0 carry chain.
+    #   unit 83:       also writes OUTPUT_LO+0 / OUTPUT_HI+0.
+    #   units 86..101: PC LEV-return OUTPUT_LO+(unit-86) for k=0..15
+    #                  (LEV BP relay nibble-by-nibble).
+    #   units 102..117: PC LEV-return OUTPUT_HI+(unit-102) for k=0..15.
+    #   units 118..133: PC byte1 carry pairs; unit (118+k) writes
+    #                   OUTPUT_HI+k and OUTPUT_HI+(k+1) — adjacent-nibble
+    #                   carry. Unit 133 wraps and writes OUTPUT_HI+0/+15.
+    #   units 134/135: byte1 ones from _add_layer3_pc_byte1_output_rules
+    #                  (write OUTPUT_LO+0/+1 and OUTPUT_HI+0).
+    _claims = set()
+    # PC default residue carries (units 0-3).
+    _claims.add((3, "ffn_W_down", "0", "EMBED_LO+10"))
+    _claims.add((3, "ffn_W_down", "0", "OUTPUT_LO+10"))
+    _claims.add((3, "ffn_W_down", "1", "EMBED_LO+10"))
+    _claims.add((3, "ffn_W_down", "1", "OUTPUT_LO+10"))
+    _claims.add((3, "ffn_W_down", "2", "EMBED_HI+0"))
+    _claims.add((3, "ffn_W_down", "2", "OUTPUT_HI+0"))
+    _claims.add((3, "ffn_W_down", "3", "EMBED_HI+0"))
+    _claims.add((3, "ffn_W_down", "3", "OUTPUT_HI+0"))
+    # Units 6..49: alternating OUTPUT_LO+0 / OUTPUT_HI+0 default writers, with
+    # OUTPUT_LO+1 exceptions at units 12 and 20.
+    for unit in range(6, 50):
+        if unit in (12, 20):
+            _claims.add((3, "ffn_W_down", str(unit), "OUTPUT_LO+1"))
+        elif unit % 2 == 0:
+            _claims.add((3, "ffn_W_down", str(unit), "OUTPUT_LO+0"))
+        else:
+            _claims.add((3, "ffn_W_down", str(unit), "OUTPUT_HI+0"))
+    # Units 82..85: NEXT_STACK0 carry chain.
+    for unit in (82, 83, 84, 85):
+        _claims.add((3, "ffn_W_down", str(unit), "NEXT_STACK0+0"))
+    _claims.add((3, "ffn_W_down", "83", "OUTPUT_HI+0"))
+    _claims.add((3, "ffn_W_down", "83", "OUTPUT_LO+0"))
+    # Units 86..101: LEV nibble relay over OUTPUT_LO. Hidden units 86..93
+    # drive OUTPUT_LO+8..+15 (high nibble of byte 0), then 94..101 drive
+    # OUTPUT_LO+0..+7 (low nibble of byte 1, splitting the byte across
+    # adjacent OUTPUT_LO cells).
+    for k in range(8):
+        _claims.add((3, "ffn_W_down", str(86 + k), f"OUTPUT_LO+{8 + k}"))
+        _claims.add((3, "ffn_W_down", str(94 + k), f"OUTPUT_LO+{k}"))
+    # Units 102..117: OUTPUT_HI+(unit-102) for k=0..15 (full HI nibble band).
+    for k in range(16):
+        _claims.add((3, "ffn_W_down", str(102 + k), f"OUTPUT_HI+{k}"))
+    # Units 118..132: byte1 carry pairs, each writing OUTPUT_HI+k & OUTPUT_HI+k+1.
+    for k in range(15):
+        _claims.add((3, "ffn_W_down", str(118 + k), f"OUTPUT_HI+{k}"))
+        _claims.add((3, "ffn_W_down", str(118 + k), f"OUTPUT_HI+{k + 1}"))
+    # Unit 133: wraps from OUTPUT_HI+15 back to OUTPUT_HI+0.
+    _claims.add((3, "ffn_W_down", "133", "OUTPUT_HI+0"))
+    _claims.add((3, "ffn_W_down", "133", "OUTPUT_HI+15"))
+    # Units 134/135: PC byte1 = 1 emission (added by
+    # _add_layer3_pc_byte1_output_rules at the end of the bake).
+    for unit in ("134", "135"):
+        _claims.add((3, "ffn_W_down", unit, "OUTPUT_LO+0"))
+        _claims.add((3, "ffn_W_down", unit, "OUTPUT_LO+1"))
+        _claims.add((3, "ffn_W_down", unit, "OUTPUT_HI+0"))
+
     return Operation(
         name="layer3_ffn",
         phase=3,
@@ -49,6 +121,7 @@ def make_layer3_ffn_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         migrated=True,
+        claims=_claims,
         postcondition={
             "OUTPUT_LO": "monotonic_non_decreasing",
         },
