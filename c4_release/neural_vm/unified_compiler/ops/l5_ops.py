@@ -1,9 +1,86 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy, _opcode_name_map
+
+
+# === L5 FFN unit layout (pinned offsets) ============================
+#
+# The ``opcode_decode_ffn`` op owns the entire L5 FFN. The actual weight
+# writes happen inside ``_bake_opcode_decode_ffn`` below, which uses a
+# local ``unit = 0`` counter that walks through four CompilerIR rule
+# batches plus one reserved blank slot. Migration to
+# :class:`FFNUnitAllocator` keeps that helper byte-identical -- we
+# declare each sub-stage's range at its existing pinned offset so the
+# layout is auditable rather than implicit. Adding a new L5 op family
+# later will go through ``allocator.alloc(name, n)`` without a pin, and
+# the allocator will pick the first free gap above unit 89.
+#
+# Sibling L5 ops do NOT allocate FFN units:
+#   * ``layer5_fetch`` writes attn5 W_q/W_k/W_v/W_o only (8 attention
+#     heads); no FFN units.
+#   * ``layer5_user_input_gather`` is a phase-1 ``enable=False`` no-op
+#     (see ``user_input_ops.py``); phase 2 will allocate L5 attention
+#     heads 8/9, still no FFN units.
+# So this allocator covers the full L5 FFN footprint.
+#
+# The offsets below mirror the unit-counter walk in
+# ``_bake_opcode_decode_ffn`` (main per-opcode AX decode -> first-step
+# PC decode -> reserved JSR TEMP[0] blank -> TEMP[1..31] clear at PC ->
+# all-step PC decode). Changing any helper's unit count requires
+# updating this table in lock-step.
+_L5_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    # 34 main per-opcode AX rules (one unit per opcode in the table at
+    # ``_opcode_decode_main_rules``). Unit 3 writes TEMP+0 (JSR's IS_JSR
+    # flag); the other 33 units each write the matching OP_* dim.
+    ("opcode_decode_ffn.main_at_ax",          0, 34),
+    # 18 first-step PC-marker decode rules (``HAS_SE == 0`` gates the
+    # initial step). Unit 35 writes TEMP+0 (first-step JSR's IS_JSR
+    # flag); the other 17 units write OP_* dims.
+    ("opcode_decode_ffn.first_step_at_pc",   34, 18),
+    # Reserved blank unit for the first-step JSR TEMP[0] slot -- the
+    # bake skips ``unit += 1`` here to preserve legacy unit numbering
+    # for the TEMP-clear band that follows. No weight writes land on
+    # unit 52.
+    ("opcode_decode_ffn.jsr_temp0_blank",    52,  1),
+    # 31 TEMP[1..31] clearing rules at MARK_PC (TEMP[0] is owned by
+    # the first-step JSR flag and is intentionally skipped).
+    ("opcode_decode_ffn.temp_clear_at_pc",   53, 31),
+    # 5 all-step PC-marker decode rules (BZ, BNZ, LEV, EXIT, JMP -- the
+    # only opcodes whose first-step write also fires on the AX-marker
+    # step's PC-marker copy).
+    ("opcode_decode_ffn.all_step_at_pc",     84,  5),
+)
+
+# Total = 34 + 18 + 1 + 31 + 5 = 89 units (final cursor lands at 89;
+# highest used unit index is 88, matching the 5/ffn_W_down/88 claim on
+# OP_JMP+0 in ``make_opcode_decode_ffn_op``).
+_L5_FFN_TOTAL_UNITS = 89
+
+
+def _allocate_layer5_ffn_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L5 FFN sub-stages.
+
+    Every sub-stage is pinned at its existing offset so the underlying
+    ``_bake_opcode_decode_ffn`` helper -- which writes via its own
+    monotonic ``unit = 0`` counter -- lands on exactly the same
+    hidden-unit indices it always has. This call is byte-identical
+    bookkeeping: the allocator declares ranges by name, the helper
+    writes the weights. A future refactor can split the monolithic
+    helper into per-range bake functions that consume
+    ``allocator.alloc(...)`` directly.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L5 op claims a free range past unit 89).
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L5_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def make_layer5_fetch_op() -> Operation:
@@ -315,10 +392,28 @@ def make_opcode_decode_ffn_op() -> Operation:
     graph still reserves a layer slot for it (preserving model n_layers).
     """
     def bake(block, dim_positions, S):
-        _bake_opcode_decode_ffn(
+        # Per-bake FFN-unit allocator. Each L5 FFN sub-stage is pinned
+        # to its existing offset so the call below lands byte-identically.
+        # The allocator is published on ``block.ffn`` for inspection /
+        # extension by downstream tools (e.g. a future L5 op family
+        # claiming a free gap past unit 89). Mirrors the L9 pattern in
+        # ``make_layer9_alu_op`` and the L4 pattern in
+        # ``make_layer4_ffn_op``.
+        allocator = _allocate_layer5_ffn_units()
+        block.ffn._l5_unit_allocator = allocator
+
+        final_unit = _bake_opcode_decode_ffn(
             block.ffn,
             S,
             _as_setdim_proxy(dim_positions),
+        )
+        # Byte-identity guard: the helper's local cursor MUST end exactly
+        # at the allocator's declared footprint. If the layout table
+        # drifts from the helper's writes, this assertion fires before
+        # any weight surgery happens.
+        assert final_unit == _L5_FFN_TOTAL_UNITS, (
+            f"L5 FFN unit cursor drift: helper returned {final_unit}, "
+            f"allocator expected {_L5_FFN_TOTAL_UNITS}"
         )
 
     # Dim-ownership claims (W_down output cells). The bake programs four
@@ -569,8 +664,14 @@ def _lower_l5_opcode_rules(ffn, rules, BD, *, unit: int, S: float) -> int:
     )
 
 
-def _bake_opcode_decode_ffn(ffn, S, BD):
-    """Declarative L5 FFN spec: opcode-byte one-hot decode."""
+def _bake_opcode_decode_ffn(ffn, S, BD) -> int:
+    """Declarative L5 FFN spec: opcode-byte one-hot decode.
+
+    Returns the post-bake unit cursor (must equal
+    :data:`_L5_FFN_TOTAL_UNITS` for byte-identity with the historical
+    89-unit footprint). The caller asserts this in
+    ``make_opcode_decode_ffn_op``.
+    """
 
     unit = 0
     unit = _lower_l5_opcode_rules(
@@ -603,6 +704,8 @@ def _bake_opcode_decode_ffn(ffn, S, BD):
         unit=unit,
         S=S,
     )
+
+    return unit
 
 
 def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
