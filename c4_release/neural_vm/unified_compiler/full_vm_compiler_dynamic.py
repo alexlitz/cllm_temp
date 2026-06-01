@@ -61,7 +61,11 @@ import math
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from .layer_compiler import Operation
+from .layer_compiler import (
+    Operation,
+    requires_after_ops,
+    requires_same_layer_as_ops,
+)
 from . import full_vm_compiler as _static
 
 
@@ -112,13 +116,17 @@ def _build_dep_graph(
                 if u.name not in in_edges[v.name]:
                     in_edges[v.name].add(u.name)
                     out_edges[u.name].add(v.name)
-        for _key, val in v.requires.items():
-            if not isinstance(val, str):
+        # B10: explicit ``requires["after"]`` / ``requires["same_layer_as"]``
+        # op-name edges. Both reserved keys add a ref→v dep edge (v must
+        # run after the referenced op). Use the canonical accessors so
+        # iterable values (multi-ref tuples) are handled correctly rather
+        # than silently dropped by an ``isinstance(val, str)`` filter.
+        for ref in requires_after_ops(v) + requires_same_layer_as_ops(v):
+            if ref == v.name or ref not in name_to_op:
                 continue
-            if val in name_to_op and val != v.name:
-                if val not in in_edges[v.name]:
-                    in_edges[v.name].add(val)
-                    out_edges[val].add(v.name)
+            if ref not in in_edges[v.name]:
+                in_edges[v.name].add(ref)
+                out_edges[ref].add(v.name)
 
     return in_edges, out_edges
 
