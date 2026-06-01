@@ -1,0 +1,265 @@
+{
+  "op": "make_tail_bit32_result_correction_op",
+  "total_violations": 255,
+  "by_category": {
+    "A_scope_annotation_error": 0,
+    "B_genuine_e5_bug": 0,
+    "C_imprecise_semantics": 0,
+    "D_unsatisfiable": 255
+  },
+  "rule_families_per_category": {
+    "A": {},
+    "B": {},
+    "C": {},
+    "D": {
+      "tail_stack0_store_loaded_byte_XX": 255
+    }
+  },
+  "examples_per_category": {
+    "A": [],
+    "B": [],
+    "C": [],
+    "D": [
+      {
+        "rule": "tail_stack0_store_loaded_byte_10",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      },
+      {
+        "rule": "tail_stack0_store_loaded_byte_20",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      },
+      {
+        "rule": "tail_stack0_store_loaded_byte_30",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      },
+      {
+        "rule": "tail_stack0_store_loaded_byte_40",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      },
+      {
+        "rule": "tail_stack0_store_loaded_byte_50",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      },
+      {
+        "rule": "tail_stack0_store_loaded_byte_60",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      },
+      {
+        "rule": "tail_stack0_store_loaded_byte_70",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      },
+      {
+        "rule": "tail_stack0_store_loaded_byte_80",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      },
+      {
+        "rule": "tail_stack0_store_loaded_byte_90",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      },
+      {
+        "rule": "tail_stack0_store_loaded_byte_a0",
+        "scope": "mark == STACK0",
+        "effective_pos_markers": [
+          "AX",
+          "MEM"
+        ],
+        "effective_neg_markers": [
+          "AX",
+          "BP",
+          "MEM",
+          "PC",
+          "SP"
+        ],
+        "scope_pos_markers": [
+          "STACK0"
+        ],
+        "name_markers": [
+          "STACK0"
+        ],
+        "effective_satisfiable": false,
+        "why": "effective predicate is unsatisfiable per S-3",
+        "reason": "disjunct {NOT is_byte AND NOT mark == AX AND NOT mark == BP AND NOT mark == MEM AND NOT mark == PC AND NOT mark == SP AND has_se AND is_byte AND mark == AX AND mark == MEM AND opcode_in_step in {PSH, SC, SI}} of p does not entail any disjun"
+      }
+    ]
+  }
+}
