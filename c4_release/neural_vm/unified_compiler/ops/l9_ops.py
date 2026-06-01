@@ -1,10 +1,82 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L9 attention-head layout (pinned indices) ======================
+#
+# Three migrated ops claim heads on the L9 attention block today:
+#
+#   * ``layer9_lev_addr_relay`` (phase=9.0)      -> head 0
+#   * ``layer9_lev_bp_to_pc_relay`` (phase=9.1)  -> head 1
+#   * ``layer9_alibi_mem_attn`` (phase=9.2)      -> head 2
+#
+# ``layer9_alibi_mem_attn`` is conditionally enabled at runtime via
+# ``enable=False``; we still claim its head index in the allocator so
+# the layout is structurally stable across builds (the bake itself
+# early-returns when the gate is off, so no weights move either way).
+# Pre-migration each call site picked its ``head_idx`` as a bare integer
+# literal -- ``head_idx=0`` / ``head_idx=1`` in the relay
+# :class:`DeclarativeAttentionHeadSpec` calls and ``head = 2`` in the
+# ALiBi bake -- which made adding a future L9 head fragile (the author
+# had to remember which slots were already taken). With the allocator
+# the handoff is structural: each bake instantiates its OWN allocator
+# pre-loaded with the full L9 head layout (pinned to existing slots),
+# stashes it on ``attn._l9_head_allocator`` for downstream inspection,
+# and resolves its own head index by name. A future L9 attention op
+# can claim a free head via ``allocator.alloc(name, layer_idx=9)`` --
+# with no ``pin=`` -- without touching this table.
+#
+# NOTE: ``format_string_fetch_head`` (gated by ``enable_conversational_io``)
+# also writes head 0 in the conversational-I/O path, intentionally
+# clobbering ``layer9_lev_addr_relay`` slopes/weights. That aliasing
+# pre-dates the allocator and is not modeled here; the allocator
+# forbids head aliasing, so the convo-I/O head stays outside this
+# layout until a follow-up reconciles the two ops onto distinct slots.
+_L9_HEAD_LAYOUT = (
+    # (op-name key,                          pinned head_idx)
+    ("layer9_lev_addr_relay",                0),
+    ("layer9_lev_bp_to_pc_relay",            1),
+    ("layer9_alibi_mem_attn",                2),
+)
+
+
+def _allocate_layer9_attention_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with all L9 heads.
+
+    Every entry in :data:`_L9_HEAD_LAYOUT` is pinned at its existing
+    ``head_idx`` so the underlying primitive calls -- which still write
+    the same weights to the same heads -- land byte-identically. Each
+    of the three migrated L9 attention ops calls this so they can look
+    up their own head by name without baking in an integer literal at
+    the call site.
+    """
+    allocator = AttentionHeadAllocator()
+    for name, head_idx in _L9_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=9, pin=head_idx)
+    return allocator
+
+
+def _l9_head_idx(op_name: str) -> int:
+    """Return the pinned L9 ``head_idx`` for ``op_name``.
+
+    Static lookup against :data:`_L9_HEAD_LAYOUT` for callers that
+    cannot instantiate a per-bake allocator (e.g. the head-spec
+    helpers consumed by both bake and ``compiler_ir_factory`` paths,
+    where running the collision-checked allocator on every call
+    would be wasteful). The runtime bakes still go through
+    :func:`_allocate_layer9_attention_heads` so the collision-checked
+    allocator path is exercised on every weight write.
+    """
+    for name, head_idx in _L9_HEAD_LAYOUT:
+        if name == op_name:
+            return head_idx
+    raise KeyError(f"_l9_head_idx: unknown L9 attention op {op_name!r}")
 
 
 # === L9 FFN unit layout (pinned offsets) ============================
@@ -352,8 +424,20 @@ def make_layer9_lev_addr_relay_op() -> Operation:
     """
     def bake(block, dim_positions, S):
         attn = block.attn
+        # Per-bake attention-head allocator with the full L9 head layout
+        # pinned. Looking up the relay head by name keeps its index
+        # identical to the legacy ``head_idx=0`` literal without baking
+        # the integer into the call site.
+        allocator = _allocate_layer9_attention_heads()
+        attn._l9_head_allocator = allocator
+        relay_head_idx = next(
+            h.head_idx for h in allocator.heads()
+            if h.op_name == "layer9_lev_addr_relay"
+        )
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-            attn.alibi_slopes[0] = 0.2  # head 0: shallow slope for d=29 relay
+            # head 0: shallow slope for d=29 relay. Index from the
+            # allocator so the slot stays in sync with the spec below.
+            attn.alibi_slopes[relay_head_idx] = 0.2
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_head(
             attn,
@@ -410,8 +494,20 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
     """
     def bake(block, dim_positions, S):
         attn = block.attn
+        # Per-bake attention-head allocator with the full L9 head layout
+        # pinned. Resolving the BP→PC relay head by name reproduces the
+        # legacy ``head_idx=1`` literal without depending on the
+        # addr-relay op having already populated ``attn._l9_head_allocator``.
+        allocator = _allocate_layer9_attention_heads()
+        attn._l9_head_allocator = allocator
+        relay_head_idx = next(
+            h.head_idx for h in allocator.heads()
+            if h.op_name == "layer9_lev_bp_to_pc_relay"
+        )
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-            attn.alibi_slopes[1] = 0.5  # head 1: BP→PC relay for LEV (d=15 tokens)
+            # head 1: BP→PC relay for LEV (d=15 tokens). Index from the
+            # allocator so the slot stays in sync with the spec below.
+            attn.alibi_slopes[relay_head_idx] = 0.5
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_head(
             attn,
@@ -476,7 +572,11 @@ def _layer9_lev_addr_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         o.append(AO(BD.ADDR_B0_LO + k, 1 + k, 1.0))
         o.append(AO(BD.ADDR_B0_HI + k, 17 + k, 1.0))
     return DeclarativeAttentionHeadSpec(
-        head_idx=0,
+        # Pull the head index from the shared L9 layout rather than
+        # baking in a ``head_idx=0`` literal here. Both the bake and IR
+        # paths consult the same source of truth, so renumbering the
+        # layout in one place stays consistent across every consumer.
+        head_idx=_l9_head_idx("layer9_lev_addr_relay"),
         q=(
             AP(0, BD.MARK_SP, L),
             AP(0, BD.OP_LEV, L / 5),
@@ -508,7 +608,11 @@ def _layer9_lev_bp_to_pc_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         o.append(AO(BD.ADDR_B0_LO + k, 1 + k, 1.0))
         o.append(AO(BD.ADDR_B0_HI + k, 17 + k, 1.0))
     return DeclarativeAttentionHeadSpec(
-        head_idx=1,
+        # Pull the head index from the shared L9 layout rather than
+        # baking in a ``head_idx=1`` literal here. Both the bake and IR
+        # paths consult the same source of truth, so renumbering the
+        # layout in one place stays consistent across every consumer.
+        head_idx=_l9_head_idx("layer9_lev_bp_to_pc_relay"),
         q=(
             AP(0, BD.MARK_PC, L),
             AP(0, BD.OP_LEV, L / 5),
@@ -694,7 +798,17 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         from ...vm_step import _SetDim as BD_DEFAULT
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        head = 2
+        # Per-bake attention-head allocator with the full L9 head layout
+        # pinned. Looking up the ALiBi mem-attn head by name keeps its
+        # index identical to the legacy ``head = 2`` literal without
+        # baking the integer into the call site. Stash on the attn
+        # block so downstream tooling can inspect the layout.
+        allocator = _allocate_layer9_attention_heads()
+        attn._l9_head_allocator = allocator
+        head = next(
+            h.head_idx for h in allocator.heads()
+            if h.op_name == "layer9_alibi_mem_attn"
+        )
         base = head * HD
 
         # Slope tuned to favor most-recent matching PSH within a typical
