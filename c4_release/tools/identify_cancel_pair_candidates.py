@@ -53,7 +53,14 @@ if str(REPO) not in sys.path:
 
 from neural_vm.dim_registry import build_default_registry  # noqa: E402
 from neural_vm.unified_compiler.attention_verifier import (  # noqa: E402
+    build_attention_writer_index,
+    effective_attention_scope,
+    head_write_magnitude,
     verify_attention_head,
+)
+from neural_vm.unified_compiler.attention_verifier import (  # noqa: E402
+    _dim_int_to_name,
+    _resolve_writes_to_dim_names,
 )
 from neural_vm.unified_compiler.ops.all_core_ops import all_core_ops  # noqa: E402
 from neural_vm.unified_compiler.ops.shared import (  # noqa: E402
@@ -72,6 +79,28 @@ OUT_PATH = REPO / ".agent-logs" / "cancel_pair_generalization_candidates_2026_06
 
 
 def _build_dim_positions() -> Dict[str, int]:
+    # Prefer reading a cached compiled layout when the live LayerCompiler
+    # is in a topology-cycle state (B9/B12 work-in-progress -- the
+    # cycle is real but transient). We only need ``dim_positions`` for
+    # ``compiler_ir_factory(dim_positions, HD)`` calls, which read
+    # integer offsets; the rest of the layout state is irrelevant here.
+    import os, glob, torch
+    cache_dir = os.path.expanduser("~/.cache/c4_release/compiled_vm")
+    if os.path.isdir(cache_dir):
+        candidates = sorted(
+            glob.glob(os.path.join(cache_dir, "*.pt")),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                d = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception:
+                continue
+            if isinstance(d, dict) and "dim_positions" in d:
+                print(f"[candidates] loaded dim_positions from cache: {path}")
+                return dict(d["dim_positions"])
+    print("[candidates] cache miss; rebuilding dim_positions via LayerCompiler...")
     compiler = LayerCompiler()
     declare_setdim_compat_dims(compiler, pin_io_only=True)
     for op in all_core_ops():
@@ -93,35 +122,36 @@ def _materialize_ir(op, dim_positions, HD: int = 64):
         return None
 
 
-def _collect_heads(ops, dim_positions):
-    out: List[Tuple[str, int, int, Any]] = []
-    for op in ops:
-        ir = _materialize_ir(op, dim_positions)
-        if ir is None or not hasattr(ir, "layers"):
-            continue
-        for layer_idx, layer in enumerate(ir.layers):
-            attention = getattr(layer, "attention", None)
-            if attention is None:
-                continue
-            for head_idx, head in enumerate(getattr(attention, "rules", None) or []):
-                out.append((op.name, layer_idx, head_idx, head))
-    return out
-
-
 class _IROnlyOp:
     def __init__(self, name, ir):
         self.name = name
         self.compiler_ir = ir
 
 
-def _build_cross_ops(ops, dim_positions):
-    out = []
+def _collect_heads_and_cross_ops(ops, dim_positions):
+    """Materialize each op's IR ONCE and return (heads, cross_ops).
+
+    Critical: ``build_attention_writer_index`` stores ``entry.head`` as
+    the actual head object, so we MUST share the same materialized IR
+    between the head-list traversal and the cross-op writer index. If
+    we materialize twice, id()-keyed maps stop matching.
+    """
+    heads: List[Tuple[str, int, int, Any]] = []
+    cross_ops: List[_IROnlyOp] = []
     for op in ops:
         ir = _materialize_ir(op, dim_positions)
         if ir is None:
             continue
-        out.append(_IROnlyOp(op.name, ir))
-    return out
+        cross_ops.append(_IROnlyOp(op.name, ir))
+        if not hasattr(ir, "layers"):
+            continue
+        for layer_idx, layer in enumerate(ir.layers):
+            attention = getattr(layer, "attention", None)
+            if attention is None:
+                continue
+            for head_idx, head in enumerate(getattr(attention, "rules", None) or []):
+                heads.append((op.name, layer_idx, head_idx, head))
+    return heads, cross_ops
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +235,25 @@ def _classify(
             f"Q markers disjoint: head={sorted(head_markers)} vs comp={sorted(comp_markers)}",
         )
 
+    # Marker-vs-IS_BYTE mutex: a head that requires MARK_* (and not
+    # IS_BYTE) fires at marker rows; a head that requires IS_BYTE
+    # (and not MARK_*) fires at byte rows. Marker rows and byte rows
+    # are disjoint by construction.
+    head_marker_only = bool(head_markers) and "IS_BYTE" not in head_pos
+    comp_marker_only = bool(comp_markers) and "IS_BYTE" not in comp_pos
+    head_byte_only = "IS_BYTE" in head_pos and not head_markers
+    comp_byte_only = "IS_BYTE" in comp_pos and not comp_markers
+    if head_marker_only and comp_byte_only:
+        return (
+            "applicable",
+            f"head fires at marker {sorted(head_markers)}; comp fires at IS_BYTE rows -- mutually exclusive",
+        )
+    if comp_marker_only and head_byte_only:
+        return (
+            "applicable",
+            f"comp fires at marker {sorted(comp_markers)}; head fires at IS_BYTE rows -- mutually exclusive",
+        )
+
     # Mutual exclusion via negative gating: head positively requires X,
     # competitor negatively excludes X.
     if head_pos & comp_neg:
@@ -277,74 +326,100 @@ def main() -> int:
     dim_positions = _build_dim_positions()
     ops = all_core_ops()
     print(f"[candidates] enumerating heads across {len(ops)} ops...")
-    heads = _collect_heads(ops, dim_positions)
+    heads, cross_ops = _collect_heads_and_cross_ops(ops, dim_positions)
     print(f"[candidates] total heads: {len(heads)}")
     head_index: Dict[Tuple[str, int, int], Any] = {
         (op_name, li, hi): head for (op_name, li, hi, head) in heads
     }
-
-    cross_ops = _build_cross_ops(ops, dim_positions)
     print(f"[candidates] cross-op list: {len(cross_ops)}")
 
-    # Build lookup: op_name -> {(layer, head): head}.
-    op_to_heads: Dict[str, List[Tuple[int, int, Any]]] = defaultdict(list)
-    for op_name, li, hi, head in heads:
-        op_to_heads[op_name].append((li, hi, head))
+    # Build attention writer index ONCE -- the catalog tool calls
+    # verify_attention_head per head, which rebuilds the index each
+    # time (the catalog took 591s on the cross-op pass). We walk the
+    # index directly and inline the strength check below.
+    print("[candidates] building attention writer index (once)...")
+    attn_index = build_attention_writer_index(cross_ops, registry)
+    print(f"[candidates] attn writer index: {len(attn_index)} dim entries")
 
-    # Per head: run verification with cross-op competition once, group
-    # issues by (competitor_op, output_dim_band) so we count per-band
-    # candidates not per-output-dim.
-    print("[candidates] running per-head cross-op verification...")
+    margin = 1.0
+
+    # Precompute Q gate signatures for every head with an id() lookup
+    # so the competitor scope lookup is O(1). Critical: the writer
+    # index stores ``entry.head`` as the SAME object referenced in
+    # ``heads`` (because we share materialized IRs via
+    # ``_collect_heads_and_cross_ops``).
+    head_q_sig_by_obj: Dict[int, Tuple[frozenset, frozenset]] = {}
+    for op_name, li, hi, head in heads:
+        head_q_sig_by_obj[id(head)] = _q_gate_signature(head, registry)
+
     results: List[Dict[str, Any]] = []
+    print("[candidates] walking heads + computing strength competition...")
     for op_name, li, hi, head in heads:
-        try:
-            issues = verify_attention_head(
-                head, registry, ops_for_competition=cross_ops,
-            )
-        except Exception as e:
-            issues = [{"kind": "exception", "reason": repr(e)}]
-
-        # Only attention_strength_violation entries are cancel-pair-eligible.
-        strength_issues = [
-            i for i in issues
-            if i.get("kind") == "attention_strength_violation"
-        ]
-        if not strength_issues:
+        spec = getattr(head, "spec", None)
+        if spec is None:
             continue
+        head_pos, head_neg = head_q_sig_by_obj[id(head)]
 
-        # Group strength_issues by top competitor.
-        by_comp: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for issue in strength_issues:
-            comp = issue.get("top_competitor") or "<none>"
-            by_comp[comp].append(issue)
+        seen_dims = set()
+        # Per (head, competitor) accumulator -- groups
+        # attention_strength_violation issues by the competitor that
+        # caused them.
+        per_comp: Dict[Tuple[str, str], Dict[str, Any]] = defaultdict(
+            lambda: {
+                "n": 0, "sample": None, "my_mag": None, "comp_mag": None,
+                "competitor_head": None,
+            }
+        )
+        for o_write in getattr(spec, "o", ()):
+            dim_int = getattr(o_write, "out_dim", None)
+            if dim_int is None:
+                continue
+            resolved = _dim_int_to_name(int(dim_int), registry)
+            if resolved is None:
+                continue
+            name, offset = resolved
+            key = (name, offset)
+            if key in seen_dims:
+                continue
+            seen_dims.add(key)
 
-        head_pos, head_neg = _q_gate_signature(head, registry)
+            my_magnitude = head_write_magnitude(head, name, offset, registry)
+            competitors = [
+                e for e in attn_index.get(key, [])
+                if e.head is not head
+            ]
+            if not competitors:
+                continue
+            top = max(competitors, key=lambda e: e.magnitude)
+            competing_max = top.magnitude
+            if my_magnitude >= competing_max + margin:
+                continue
 
-        # Find competitor head's Q signature (look it up).
-        for comp_label, comp_issues in by_comp.items():
-            comp_head_obj = None
-            comp_op_name = None
-            # comp_label is head_name or op_name. Try match against
-            # known heads.
-            for (cn_op, cn_li, cn_hi), ch in head_index.items():
-                ch_name = getattr(ch, "name", None)
-                if ch_name == comp_label or cn_op == comp_label:
-                    comp_head_obj = ch
-                    comp_op_name = cn_op
-                    break
+            comp_op = top.op_name or "<none>"
+            comp_label = top.head_name or comp_op
+            ck = (comp_op, comp_label)
+            slot = per_comp[ck]
+            slot["n"] += 1
+            if slot["sample"] is None:
+                slot["sample"] = f"{name}+{offset}"
+                slot["my_mag"] = my_magnitude
+                slot["comp_mag"] = competing_max
+                slot["competitor_head"] = top.head
 
+        for (comp_op, comp_label), info in per_comp.items():
+            comp_head_obj = info.get("competitor_head")
             if comp_head_obj is not None:
-                comp_pos, comp_neg = _q_gate_signature(comp_head_obj, registry)
+                comp_pos, comp_neg = head_q_sig_by_obj.get(
+                    id(comp_head_obj), (frozenset(), frozenset()),
+                )
             else:
                 comp_pos, comp_neg = frozenset(), frozenset()
 
             verdict, reason = _classify(
                 head_pos, head_neg, comp_pos, comp_neg,
-                own_op=op_name, competitor_op=comp_op_name,
+                own_op=op_name, competitor_op=comp_op,
             )
 
-            # Sample magnitudes / scopes from first issue.
-            first = comp_issues[0]
             results.append({
                 "op": op_name,
                 "layer": li,
@@ -354,17 +429,17 @@ def main() -> int:
                     getattr(getattr(head, "spec", None), "head_idx", -1)
                 ),
                 "competitor": comp_label,
-                "competitor_op": comp_op_name,
-                "n_issues": len(comp_issues),
-                "my_magnitude": first.get("my_magnitude"),
-                "competing_max": first.get("competing_max"),
+                "competitor_op": comp_op,
+                "n_issues": info["n"],
+                "my_magnitude": info["my_mag"],
+                "competing_max": info["comp_mag"],
                 "head_q_pos": sorted(head_pos),
                 "head_q_neg": sorted(head_neg),
                 "comp_q_pos": sorted(comp_pos),
                 "comp_q_neg": sorted(comp_neg),
                 "verdict": verdict,
                 "reason": reason,
-                "sample_output": first.get("output_dim"),
+                "sample_output": info["sample"],
             })
 
     print(f"[candidates] candidate (head, competitor) pairs: {len(results)}")
