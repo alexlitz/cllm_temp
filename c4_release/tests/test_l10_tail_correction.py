@@ -902,15 +902,15 @@ def test_tail_mem_store_addr_rules_block_stack0_marker_residue():
     }
     for lane in range(16):
         row[f"OUTPUT_LO+{lane}"] = -507622.5625
-        row[f"OUTPUT_HI+{lane}"] = -507622.5625
+        row[f"OUTPUT_HI_THIS_STEP+{lane}"] = -507622.5625
     row["OUTPUT_LO+10"] = 507625.5625
-    row["OUTPUT_HI+0"] = 507625.5625
+    row["OUTPUT_HI_THIS_STEP+0"] = 507625.5625
 
     out = ir.symbolic_ffn(row)
 
     for lane in range(16):
         assert out[f"OUTPUT_LO+{lane}"] == pytest.approx(row[f"OUTPUT_LO+{lane}"])
-        assert out[f"OUTPUT_HI+{lane}"] == pytest.approx(row[f"OUTPUT_HI+{lane}"])
+        assert out[f"OUTPUT_HI_THIS_STEP+{lane}"] == pytest.approx(row[f"OUTPUT_HI_THIS_STEP+{lane}"])
 
 
 def test_tail_ax_add_byte1_hi_zero_blocks_stack0_byte_row():
@@ -928,16 +928,16 @@ def test_tail_ax_add_byte1_hi_zero_blocks_stack0_byte_row():
         "AX_CARRY_HI+0": 1.0,
         "OUTPUT_LO+0": -326.9977111816406,
         "OUTPUT_LO+15": 332.94451904296875,
-        "OUTPUT_HI+0": -326.9977111816406,
-        "OUTPUT_HI+15": 332.94451904296875,
+        "OUTPUT_HI_THIS_STEP+0": -326.9977111816406,
+        "OUTPUT_HI_THIS_STEP+15": 332.94451904296875,
     }
 
     out = ir.symbolic_ffn(row)
 
     assert out["OUTPUT_LO+0"] == pytest.approx(row["OUTPUT_LO+0"])
     assert out["OUTPUT_LO+15"] == pytest.approx(row["OUTPUT_LO+15"])
-    assert out["OUTPUT_HI+0"] == pytest.approx(row["OUTPUT_HI+0"])
-    assert out["OUTPUT_HI+15"] == pytest.approx(row["OUTPUT_HI+15"])
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(row["OUTPUT_HI_THIS_STEP+0"])
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(row["OUTPUT_HI_THIS_STEP+15"])
 
 
 def test_tail_sp_initial_stack_exact_blocks_stack0_marker_residue():
@@ -950,21 +950,21 @@ def test_tail_sp_initial_stack_exact_blocks_stack0_marker_residue():
         "H3+10": 1.0,
         "H1+3": 0.003357573412358761,
         "OUTPUT_LO+8": -1883940.625,
-        "OUTPUT_HI+14": -1883940.625,
-        "OUTPUT_HI+15": -1887999.875,
+        "OUTPUT_HI_THIS_STEP+14": -1883940.625,
+        "OUTPUT_HI_THIS_STEP+15": -1887999.875,
         "ALU_LO+14": 0.0,
     }
     for lane in range(16):
         row.setdefault(f"OUTPUT_LO+{lane}", -1888000.0)
-        row.setdefault(f"OUTPUT_HI+{lane}", -1888000.0)
+        row.setdefault(f"OUTPUT_HI_THIS_STEP+{lane}", -1888000.0)
     row["OUTPUT_LO+14"] = 1888000.0
-    row["OUTPUT_HI+13"] = 1888000.0
+    row["OUTPUT_HI_THIS_STEP+13"] = 1888000.0
 
     out = ir.symbolic_ffn(row)
 
     for lane in range(16):
         assert out[f"OUTPUT_LO+{lane}"] == pytest.approx(row[f"OUTPUT_LO+{lane}"])
-        assert out[f"OUTPUT_HI+{lane}"] == pytest.approx(row[f"OUTPUT_HI+{lane}"])
+        assert out[f"OUTPUT_HI_THIS_STEP+{lane}"] == pytest.approx(row[f"OUTPUT_HI_THIS_STEP+{lane}"])
 
 
 def test_id550_stack0_byte1_high_nibble_survives_l10_tail():
@@ -1004,7 +1004,7 @@ def test_tail_bp_byte2_preserve_requires_bp_span_signal():
         "HAS_SE": 1.0,
         "BYTE_INDEX_1": 0.013,
         "OUTPUT_LO+0": 0.95,
-        "OUTPUT_HI+0": 29.0,
+        "OUTPUT_HI_THIS_STEP+0": 29.0,
     })
 
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
@@ -1019,11 +1019,11 @@ def test_tail_bp_byte2_preserve_blocks_large_ax_byte_residue():
         "H1+1": 1.0,
         "BYTE_INDEX_1": 0.013,
         "OUTPUT_LO+1": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+1"] == 1_000_000.0
-    assert out["OUTPUT_HI+0"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000.0
 
 
 def test_tail_bp_byte2_preserve_blocks_byte0_residue():
@@ -1036,11 +1036,11 @@ def test_tail_bp_byte2_preserve_blocks_byte0_residue():
         "BYTE_INDEX_0": 1.0,
         "BYTE_INDEX_1": 0.013,
         "OUTPUT_LO+1": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+1"] == 1_000_000.0
-    assert out["OUTPUT_HI+0"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000.0
 
 
 def test_tail_bp_byte2_preserve_still_fires_on_bp_byte1():
@@ -1052,11 +1052,11 @@ def test_tail_bp_byte2_preserve_still_fires_on_bp_byte1():
         "H1+3": 1.0,
         "BYTE_INDEX_1": 1.0,
         "OUTPUT_LO+1": 1.0,
-        "OUTPUT_HI+0": 1.0,
+        "OUTPUT_HI_THIS_STEP+0": 1.0,
     })
 
     assert out["OUTPUT_LO+1"] > 0.0
-    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
 
 
 def test_tail_bp_byte2_preserve_tolerates_adjacent_index_residue():
@@ -1070,11 +1070,11 @@ def test_tail_bp_byte2_preserve_tolerates_adjacent_index_residue():
         "BYTE_INDEX_2": 0.013297064229846,
         "OUTPUT_LO+1": 2.0,
         "OUTPUT_LO+0": 2.5493369102478027,
-        "OUTPUT_HI+0": 4.549336910247803,
+        "OUTPUT_HI_THIS_STEP+0": 4.549336910247803,
     })
 
     assert out["OUTPUT_LO+1"] > 2.0
-    assert out["OUTPUT_HI+0"] > 4.549336910247803
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 4.549336910247803
 
 
 def test_tail_bp_byte2_preserve_blocks_lea_marker_row():
@@ -1087,11 +1087,11 @@ def test_tail_bp_byte2_preserve_blocks_lea_marker_row():
         "H1+3": 20.0,
         "BYTE_INDEX_1": 1.0,
         "OUTPUT_LO+1": 10000.0,
-        "OUTPUT_HI+0": 10000.0,
+        "OUTPUT_HI_THIS_STEP+0": 10000.0,
     })
 
     assert out.get("OUTPUT_LO+1", 0.0) == 10000.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 10000.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 10000.0
 
 
 def test_tail_ax_byte0_rules_block_lea_marker_row():
@@ -1123,12 +1123,12 @@ def test_tail_wide_shl_byte1_blocks_add_residue_without_op_shl():
         "CARRY+3": 103.5004,
         "OUTPUT_LO+1": 8.192543157368e12,
         "OUTPUT_LO+3": 2.1993707531384e13,
-        "OUTPUT_HI+0": 4.041023946752e12,
+        "OUTPUT_HI_THIS_STEP+0": 4.041023946752e12,
     })
 
     assert out["OUTPUT_LO+1"] == 8.192543157368e12
     assert out["OUTPUT_LO+3"] == 2.1993707531384e13
-    assert out["OUTPUT_HI+0"] == 4.041023946752e12
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4.041023946752e12
 
 
 def test_tail_ax_byte0_rules_block_jmp_marker_row():
@@ -1138,11 +1138,11 @@ def test_tail_ax_byte0_rules_block_jmp_marker_row():
         "MARK_AX": 1.0,
         "OP_JMP": 5.0,
         "OUTPUT_LO+1": -10000.0,
-        "OUTPUT_HI+0": 10000.0,
+        "OUTPUT_HI_THIS_STEP+0": 10000.0,
     })
 
     assert out["OUTPUT_LO+1"] == -10000.0
-    assert out["OUTPUT_HI+0"] == 10000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 10000.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -1156,11 +1156,11 @@ def test_tail_ax_add_no_carry_zero_blocks_imm_marker_row():
         "ALU_HI+0": 800.0,
         "AX_CARRY_HI+0": 40000.0,
         "OUTPUT_LO+13": 520.0,
-        "OUTPUT_HI+0": 580.0,
+        "OUTPUT_HI_THIS_STEP+0": 580.0,
     })
 
     assert out["OUTPUT_LO+13"] == 520.0
-    assert out["OUTPUT_HI+0"] == 580.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 580.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -1178,11 +1178,11 @@ def test_tail_ax_add_no_carry_zero_blocks_lea_address_row():
         "ALU_HI+0": 20.0,
         "AX_CARRY_HI+0": 20.0,
         "OUTPUT_LO+15": 9.0,
-        "OUTPUT_HI+15": 9.0,
+        "OUTPUT_HI_THIS_STEP+15": 9.0,
     })
 
     assert out["OUTPUT_LO+15"] == 9.0
-    assert out["OUTPUT_HI+15"] == 9.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 9.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -1201,11 +1201,11 @@ def test_tail_ax_add_no_carry_zero_blocks_si_ax_byte_row_residue():
         "ALU_HI+0": 20.0,
         "AX_CARRY_HI+0": 20.0,
         "OUTPUT_LO+3": 2.0,
-        "OUTPUT_HI+0": 2.94,
+        "OUTPUT_HI_THIS_STEP+0": 2.94,
     })
 
     assert out["OUTPUT_LO+3"] == 2.0
-    assert out["OUTPUT_HI+0"] == 2.94
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.94
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -1223,11 +1223,11 @@ def test_tail_ax_add_no_carry_zero_blocks_sp_marker_transition():
         "ALU_HI+0": 20.0,
         "AX_CARRY_HI+0": 20.0,
         "OUTPUT_LO+0": -218.64,
-        "OUTPUT_HI+0": -218.64,
+        "OUTPUT_HI_THIS_STEP+0": -218.64,
     })
 
     assert out["OUTPUT_LO+0"] == -218.64
-    assert out["OUTPUT_HI+0"] == -218.64
+    assert out["OUTPUT_HI_THIS_STEP+0"] == -218.64
 
 
 def test_tail_ax_add_no_carry_zero_ignores_tiny_negative_blocker_residue():
@@ -1247,11 +1247,11 @@ def test_tail_ax_add_no_carry_zero_ignores_tiny_negative_blocker_residue():
         "OP_SI": -1.0e-21,
         "MEM_STORE": -1.0e-21,
         "OUTPUT_LO+11": 533.0,
-        "OUTPUT_HI+12": 520.0,
+        "OUTPUT_HI_THIS_STEP+12": 520.0,
     })
 
     assert out["OUTPUT_LO+11"] == 533.0
-    assert out["OUTPUT_HI+12"] == 520.0
+    assert out["OUTPUT_HI_THIS_STEP+12"] == 520.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -1268,12 +1268,12 @@ def test_tail_ax_add_byte1_high_zero_blocks_lea_address_row():
         "ALU_HI+0": 20.0,
         "AX_CARRY_HI+0": 20.0,
         "OUTPUT_LO+15": 9.0,
-        "OUTPUT_HI+15": 9.0,
+        "OUTPUT_HI_THIS_STEP+15": 9.0,
     })
 
     assert out["OUTPUT_LO+15"] == 9.0
-    assert out["OUTPUT_HI+15"] == 9.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 9.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_ax_add_byte1_high_zero_blocks_mul_owned_byte_row():
@@ -1290,12 +1290,12 @@ def test_tail_ax_add_byte1_high_zero_blocks_mul_owned_byte_row():
         "ALU_HI+0": 6.237,
         "AX_CARRY_HI+0": 6.237,
         "OUTPUT_LO+1": 40.0,
-        "OUTPUT_HI+0": 2.9402759,
-        "OUTPUT_HI+1": 40.0,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402759,
+        "OUTPUT_HI_THIS_STEP+1": 40.0,
     })
 
-    assert out["OUTPUT_HI+0"] == pytest.approx(2.9402759)
-    assert out["OUTPUT_HI+1"] == pytest.approx(40.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(2.9402759)
+    assert out["OUTPUT_HI_THIS_STEP+1"] == pytest.approx(40.0)
 
 
 def test_tail_ax_add_byte1_carry_high2_beats_drafted_stale_low8_row():
@@ -1360,12 +1360,12 @@ def test_tail_ax_add_byte1_no_carry_low1_materializes_02():
         "AX_CARRY_HI+0": 3.728,
         "OUTPUT_LO+1": -357.7730712890625,
         "OUTPUT_LO+2": -17.386804580688477,
-        "OUTPUT_HI+0": -1997.99951171875,
-        "OUTPUT_HI+1": -1818.688720703125,
+        "OUTPUT_HI_THIS_STEP+0": -1997.99951171875,
+        "OUTPUT_HI_THIS_STEP+1": -1818.688720703125,
     })
 
     assert out["OUTPUT_LO+2"] > 0.0
-    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
     assert out["OUTPUT_LO+1"] < -357.7730712890625
 
 
@@ -1384,11 +1384,11 @@ def test_tail_ax_add_byte1_no_carry_low1_requires_boosted_add_row():
         "ALU_HI+0": 6.237,
         "AX_CARRY_HI+0": 3.728,
         "OUTPUT_LO+1": 8.965822219848633,
-        "OUTPUT_HI+0": -1997.99951171875,
+        "OUTPUT_HI_THIS_STEP+0": -1997.99951171875,
     })
 
     assert out["OUTPUT_LO+1"] == 8.965822219848633
-    assert out["OUTPUT_HI+0"] == -1997.99951171875
+    assert out["OUTPUT_HI_THIS_STEP+0"] == -1997.99951171875
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -1408,12 +1408,12 @@ def test_tail_ax_add_byte1_no_carry_low2_materializes_03():
         "AX_CARRY_HI+0": 3.728,
         "OUTPUT_LO+2": -25.737689971923828,
         "OUTPUT_LO+3": -17.386804580688477,
-        "OUTPUT_HI+0": -1997.99951171875,
-        "OUTPUT_HI+1": -1818.688720703125,
+        "OUTPUT_HI_THIS_STEP+0": -1997.99951171875,
+        "OUTPUT_HI_THIS_STEP+1": -1818.688720703125,
     })
 
     assert out["OUTPUT_LO+3"] > 0.0
-    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
     assert out["OUTPUT_LO+2"] < -25.737689971923828
 
 
@@ -1432,11 +1432,11 @@ def test_tail_ax_add_byte1_no_carry_low2_requires_boosted_add_row():
         "ALU_HI+0": 6.237,
         "AX_CARRY_HI+0": 3.728,
         "OUTPUT_LO+2": 8.965362548828125,
-        "OUTPUT_HI+0": -1997.99951171875,
+        "OUTPUT_HI_THIS_STEP+0": -1997.99951171875,
     })
 
     assert out["OUTPUT_LO+2"] == 8.965362548828125
-    assert out["OUTPUT_HI+0"] == -1997.99951171875
+    assert out["OUTPUT_HI_THIS_STEP+0"] == -1997.99951171875
     assert out.get("OUTPUT_LO+3", 0.0) == 0.0
 
 
@@ -1462,12 +1462,12 @@ def test_tail_ax_add_byte1_carry_low2_beats_missing_stack_high_02():
         "OUTPUT_LO+1": -110.91671752929688,
         "OUTPUT_LO+2": -95.88512420654297,
         "OUTPUT_LO+3": -110.91671752929688,
-        "OUTPUT_HI+0": -1997.99951171875,
-        "OUTPUT_HI+1": -1818.688720703125,
+        "OUTPUT_HI_THIS_STEP+0": -1997.99951171875,
+        "OUTPUT_HI_THIS_STEP+1": -1818.688720703125,
     })
 
     assert out["OUTPUT_LO+3"] > out["OUTPUT_LO+2"]
-    assert out["OUTPUT_HI+0"] > out["OUTPUT_HI+1"]
+    assert out["OUTPUT_HI_THIS_STEP+0"] > out["OUTPUT_HI_THIS_STEP+1"]
 
 
 def test_tail_ax_add_byte1_carry_low2_requires_boosted_add_row():
@@ -1486,11 +1486,11 @@ def test_tail_ax_add_byte1_carry_low2_requires_boosted_add_row():
         "ALU_HI+0": 6.237,
         "AX_CARRY_HI+0": 3.728,
         "OUTPUT_LO+5": 2616.27001953125,
-        "OUTPUT_HI+0": -1997.99951171875,
+        "OUTPUT_HI_THIS_STEP+0": -1997.99951171875,
     })
 
     assert out["OUTPUT_LO+5"] == 2616.27001953125
-    assert out["OUTPUT_HI+0"] == -1997.99951171875
+    assert out["OUTPUT_HI_THIS_STEP+0"] == -1997.99951171875
     assert out.get("OUTPUT_LO+3", 0.0) == 0.0
 
 
@@ -1506,13 +1506,13 @@ def test_tail_ax_lea_local_addr_byte1_preserves_ff_after_e8():
         "CLEAN_EMBED_HI+14": 1.0,
         "FETCH_HI+15": 1.0,
         "OUTPUT_LO+15": 9.0,
-        "OUTPUT_HI+15": 2.0,
-        "OUTPUT_HI+0": 25.0,
+        "OUTPUT_HI_THIS_STEP+15": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 25.0,
     })
 
     assert out["OUTPUT_LO+15"] > 9.0
-    assert out["OUTPUT_HI+15"] > 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_tail_ax_lea_local_addr_byte1_accepts_temp10_local_signature():
@@ -1529,13 +1529,13 @@ def test_tail_ax_lea_local_addr_byte1_accepts_temp10_local_signature():
         "FETCH_HI+15": 2.44211264543992e-06,
         "TEMP+10": 0.9984737038612366,
         "OUTPUT_LO+0": 2.9402759075164795,
-        "OUTPUT_HI+0": 2.9402759075164795,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402759075164795,
     })
 
     assert out["OUTPUT_LO+15"] > 0.0
-    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_tail_ax_lea_local_addr_byte1_requires_staged_high_nibble():
@@ -1549,12 +1549,12 @@ def test_tail_ax_lea_local_addr_byte1_requires_staged_high_nibble():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+15": 9.0,
-        "OUTPUT_HI+0": 25.0,
+        "OUTPUT_HI_THIS_STEP+0": 25.0,
     })
 
     assert out["OUTPUT_LO+15"] == 9.0
-    assert out["OUTPUT_HI+0"] == 25.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 25.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
 
 
 def test_tail_ax_lea_local_addr_byte1_blocks_mem_address_rows():
@@ -1569,13 +1569,13 @@ def test_tail_ax_lea_local_addr_byte1_blocks_mem_address_rows():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+15": 9.0,
-        "OUTPUT_HI+15": 2.0,
-        "OUTPUT_HI+0": 25.0,
+        "OUTPUT_HI_THIS_STEP+15": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 25.0,
     })
 
     assert out["OUTPUT_LO+15"] == 9.0
-    assert out["OUTPUT_HI+15"] == 2.0
-    assert out["OUTPUT_HI+0"] == 25.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 25.0
 
 
 def test_tail_cmp_eq_false_blocks_equal_true_marker():
@@ -1587,11 +1587,11 @@ def test_tail_cmp_eq_false_blocks_equal_true_marker():
         "CMP+1": 1.0,
         "CMP+2": 1.0,
         "OUTPUT_LO+1": 19.0,
-        "OUTPUT_HI+0": 18.0,
+        "OUTPUT_HI_THIS_STEP+0": 18.0,
     })
 
     assert out["OUTPUT_LO+1"] == 19.0
-    assert out["OUTPUT_HI+0"] == 18.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 18.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -1603,7 +1603,7 @@ def test_tail_cmp_eq_false_still_fires_when_low_compare_mismatches():
         "OP_EQ": 5.0,
         "CMP+1": 1.0,
         "OUTPUT_LO+1": 19.0,
-        "OUTPUT_HI+0": 18.0,
+        "OUTPUT_HI_THIS_STEP+0": 18.0,
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
@@ -1618,12 +1618,12 @@ def test_tail_cmp_le_eq_prefix_false_clears_spurious_true():
         "OP_LE": 5.0,
         "CMP+1": 2.5,
         "OUTPUT_LO+1": 83.0,
-        "OUTPUT_HI+0": 18.0,
+        "OUTPUT_HI_THIS_STEP+0": 18.0,
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
     assert out["OUTPUT_LO+1"] < 83.0
-    assert out["OUTPUT_HI+0"] > 18.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 18.0
 
 
 def test_tail_cmp_le_eq_prefix_false_preserves_equal_true():
@@ -1635,11 +1635,11 @@ def test_tail_cmp_le_eq_prefix_false_preserves_equal_true():
         "CMP+1": 2.5,
         "CMP+2": 1.0,
         "OUTPUT_LO+1": 83.0,
-        "OUTPUT_HI+0": 18.0,
+        "OUTPUT_HI_THIS_STEP+0": 18.0,
     })
 
     assert out["OUTPUT_LO+1"] == 83.0
-    assert out["OUTPUT_HI+0"] == 18.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 18.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -1651,11 +1651,11 @@ def test_tail_cmp_le_eq_prefix_false_preserves_lt_true_at_marker():
         "OP_LE": 5.0,
         "CMP+0": 1.0,
         "OUTPUT_LO+1": 36.0,
-        "OUTPUT_HI+0": 19.0,
+        "OUTPUT_HI_THIS_STEP+0": 19.0,
     })
 
     assert out["OUTPUT_LO+1"] == 36.0
-    assert out["OUTPUT_HI+0"] == 19.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 19.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -1680,11 +1680,11 @@ def test_tail_stack0_pop_marker_zero_blocks_byte_rows():
         "CMP+3": 1.0,
         "IS_BYTE": 1.0,
         "OUTPUT_LO+8": 2.0,
-        "OUTPUT_HI+14": 2.0,
+        "OUTPUT_HI_THIS_STEP+14": 2.0,
     })
 
     assert out["OUTPUT_LO+8"] == 2.0
-    assert out["OUTPUT_HI+14"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 2.0
 
 
 def test_tail_stack0_pop_marker_zero_blocks_sp_marker_rows():
@@ -1696,11 +1696,11 @@ def test_tail_stack0_pop_marker_zero_blocks_sp_marker_rows():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+8": 2.0,
-        "OUTPUT_HI+14": 2.0,
+        "OUTPUT_HI_THIS_STEP+14": 2.0,
     })
 
     assert out["OUTPUT_LO+8"] == 2.0
-    assert out["OUTPUT_HI+14"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 2.0
 
 
 def test_tail_stack0_pop_marker_zero_blocks_mem_store_rows():
@@ -1712,11 +1712,11 @@ def test_tail_stack0_pop_marker_zero_blocks_mem_store_rows():
         "CMP+3": 4.0,
         "MEM_STORE": 0.5,
         "OUTPUT_LO+14": 2.0,
-        "OUTPUT_HI+13": 2.0,
+        "OUTPUT_HI_THIS_STEP+13": 2.0,
     })
 
     assert out["OUTPUT_LO+14"] == 2.0
-    assert out["OUTPUT_HI+13"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] == 2.0
 
 
 def test_tail_stack0_pop_marker_zero_still_fires_without_mem_store():
@@ -1727,13 +1727,13 @@ def test_tail_stack0_pop_marker_zero_still_fires_without_mem_store():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+14": 2.0,
-        "OUTPUT_HI+13": 2.0,
+        "OUTPUT_HI_THIS_STEP+13": 2.0,
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
     assert out["OUTPUT_LO+14"] < 0.0
-    assert out["OUTPUT_HI+13"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] < 0.0
 
 
 def test_tail_mem_store_addr0_f8_exact_overrides_stale_zero_lanes():
@@ -1753,14 +1753,14 @@ def test_tail_mem_store_addr0_f8_exact_overrides_stale_zero_lanes():
         "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 2.921051025390625,
         "OUTPUT_LO+8": 0.9968036413192749,
-        "OUTPUT_HI+0": 2.9213929176330566,
-        "OUTPUT_HI+15": 0.9968036413192749,
+        "OUTPUT_HI_THIS_STEP+0": 2.9213929176330566,
+        "OUTPUT_HI_THIS_STEP+15": 0.9968036413192749,
     })
 
     # B7-7: write strength is now 10k (was 1e6); the assertion checks the
     # rule still wins over the stale residue.
     assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"] + 1000.0
-    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"] + 1000.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > out["OUTPUT_HI_THIS_STEP+0"] + 1000.0
 
 
 def test_tail_mem_store_addr0_f8_exact_requires_staged_low_eight():
@@ -1774,13 +1774,13 @@ def test_tail_mem_store_addr0_f8_exact_requires_staged_low_eight():
         "CMP+0": 2.996619701385498,
         "ALU_LO+14": 0.9937615394592285,
         "OUTPUT_LO+0": 3.8322701454162598,
-        "OUTPUT_HI+0": 3.503345012664795,
-        "OUTPUT_HI+15": 0.9901931285858154,
+        "OUTPUT_HI_THIS_STEP+0": 3.503345012664795,
+        "OUTPUT_HI_THIS_STEP+15": 0.9901931285858154,
     })
 
     assert out["OUTPUT_LO+0"] == 3.8322701454162598
-    assert out["OUTPUT_HI+0"] == 3.503345012664795
-    assert out["OUTPUT_HI+15"] == 0.9901931285858154
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.503345012664795
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 0.9901931285858154
 
 
 def test_tail_mem_store_addr0_f8_exact_blocks_second_push_residue():
@@ -1796,11 +1796,11 @@ def test_tail_mem_store_addr0_f8_exact_blocks_second_push_residue():
         "OUTPUT_LO+8": 219616.703125,
         "OUTPUT_LO+14": 0.6614807844161987,
         "ALU_LO+14": 0.9937615394592285,
-        "OUTPUT_HI+15": 0.9901931285858154,
+        "OUTPUT_HI_THIS_STEP+15": 0.9901931285858154,
     })
 
     assert out["OUTPUT_LO+8"] == 219616.703125
-    assert out["OUTPUT_HI+15"] == 0.9901931285858154
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 0.9901931285858154
 
 
 def test_tail_mem_store_addr0_f8_exact_blocks_negative_inactive_alu_lane():
@@ -1817,13 +1817,13 @@ def test_tail_mem_store_addr0_f8_exact_blocks_negative_inactive_alu_lane():
         "ADDR_B0_LO+8": 0.9888219833374023,
         "ADDR_B0_HI+14": 0.9716129302978516,
         "OUTPUT_LO+8": 1282.8973388671875,
-        "OUTPUT_HI+14": 1361.1473388671875,
-        "OUTPUT_HI+15": -6.25,
+        "OUTPUT_HI_THIS_STEP+14": 1361.1473388671875,
+        "OUTPUT_HI_THIS_STEP+15": -6.25,
     })
 
     assert out["OUTPUT_LO+8"] == 1282.8973388671875
-    assert out["OUTPUT_HI+14"] == 1361.1473388671875
-    assert out["OUTPUT_HI+15"] == -6.25
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 1361.1473388671875
+    assert out["OUTPUT_HI_THIS_STEP+15"] == -6.25
 
 
 def test_tail_mem_store_addr1_ff_from_stack_store_exacts_nibbles():
@@ -1845,16 +1845,16 @@ def test_tail_mem_store_addr1_ff_from_stack_store_exacts_nibbles():
         "ADDR_B0_VALID": 1.0,
         "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 3.78348,
-        "OUTPUT_HI+0": 3.78348,
+        "OUTPUT_HI_THIS_STEP+0": 3.78348,
     })
 
     # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap.
     assert out["OUTPUT_LO+15"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 15:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
-            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr1_ff_from_stack_store_blocks_non_stack_addr0():
@@ -1870,13 +1870,13 @@ def test_tail_mem_store_addr1_ff_from_stack_store_blocks_non_stack_addr0():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 3.78348,
-        "OUTPUT_HI+0": 3.78348,
+        "OUTPUT_HI_THIS_STEP+0": 3.78348,
     })
 
     assert out["OUTPUT_LO+0"] == 3.78348
-    assert out["OUTPUT_HI+0"] == 3.78348
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.78348
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
 
 
 def test_tail_mem_store_addr0_f8_initial_jsr_exacts_nibbles():
@@ -1896,14 +1896,14 @@ def test_tail_mem_store_addr0_f8_initial_jsr_exacts_nibbles():
         "ADDR_B0_VALID": 1.0,
         "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+8": -839271360.0,
-        "OUTPUT_HI+15": -14807114752.0,
-        "OUTPUT_HI+0": 881834262528.0,
+        "OUTPUT_HI_THIS_STEP+15": -14807114752.0,
+        "OUTPUT_HI_THIS_STEP+0": 881834262528.0,
     })
 
     # B7-7: active_value reduced from 5000 to 50 per the ≤10k strength cap.
     assert out["OUTPUT_LO+8"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(0.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr0_f8_initial_jsr_requires_first_step():
@@ -1918,11 +1918,11 @@ def test_tail_mem_store_addr0_f8_initial_jsr_requires_first_step():
         "OP_JSR": 12.491547584533691,
         "CMP+4": 1.497720718383789,
         "OUTPUT_LO+8": 36939.66015625,
-        "OUTPUT_HI+0": 4668.30078125,
+        "OUTPUT_HI_THIS_STEP+0": 4668.30078125,
     })
 
     assert out["OUTPUT_LO+8"] == 36939.66015625
-    assert out["OUTPUT_HI+0"] == 4668.30078125
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4668.30078125
 
 
 def test_tail_mem_store_addr0_initial_jsr_blocks_local_addr_collisions():
@@ -1942,13 +1942,13 @@ def test_tail_mem_store_addr0_initial_jsr_blocks_local_addr_collisions():
         "ALU_LO+14": -109.75,
         "OUTPUT_LO+0": -1717824640.0,
         "OUTPUT_LO+8": 1717824896.0,
-        "OUTPUT_HI+0": -25613821952.0,
-        "OUTPUT_HI+14": 1706504832.0,
-        "OUTPUT_HI+15": 1722568704.0,
+        "OUTPUT_HI_THIS_STEP+0": -25613821952.0,
+        "OUTPUT_HI_THIS_STEP+14": 1706504832.0,
+        "OUTPUT_HI_THIS_STEP+15": 1722568704.0,
     })
 
     assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"]
-    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+14"]
+    assert out["OUTPUT_HI_THIS_STEP+15"] > out["OUTPUT_HI_THIS_STEP+14"]
 
 
 def test_tail_mem_store_addr0_f0_exact_overrides_second_push_residue():
@@ -1971,12 +1971,12 @@ def test_tail_mem_store_addr0_f0_exact_overrides_second_push_residue():
         "OUTPUT_LO+8": 219.616703125,
         "OUTPUT_LO+14": 0.6614807844161987,
         "ALU_LO+14": 0.9937615394592285,
-        "OUTPUT_HI+0": 3.503345012664795,
-        "OUTPUT_HI+15": 0.9901931285858154,
+        "OUTPUT_HI_THIS_STEP+0": 3.503345012664795,
+        "OUTPUT_HI_THIS_STEP+15": 0.9901931285858154,
     })
 
     assert out["OUTPUT_LO+0"] > out["OUTPUT_LO+8"] + 1000.0
-    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"] + 1000.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > out["OUTPUT_HI_THIS_STEP+0"] + 1000.0
 
 
 def test_tail_mem_store_addr0_f0_exact_blocks_jsr_initial_store():
@@ -1990,17 +1990,17 @@ def test_tail_mem_store_addr0_f0_exact_blocks_jsr_initial_store():
         "CMP+0": 2.996619701385498,
         "ALU_LO+14": 16377.4033203125,
         "OUTPUT_LO+8": 19929.138671875,
-        "OUTPUT_HI+15": 19874.861328125,
+        "OUTPUT_HI_THIS_STEP+15": 19874.861328125,
     })
 
     assert out["OUTPUT_LO+8"] == 19929.138671875
-    assert out["OUTPUT_HI+15"] == 19874.861328125
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 19874.861328125
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
 def test_tail_mem_store_addr0_00_from_global_exacts_nibbles():
     # B5-D / B4-H Path 2: this rule was refactored to read L13 ADDR_B0 lanes
-    # directly instead of OUTPUT_LO+0 / OUTPUT_HI+0 (a proxy that caused the
+    # directly instead of OUTPUT_LO+0 / OUTPUT_HI_THIS_STEP+0 (a proxy that caused the
     # B2-A step5 false-fire). Strength bounded at 10k because L13 evidence is
     # decisive. Input is now ADDR_B0_LO+0 / ADDR_B0_HI+0 one-hot.
     ir = _single_rule_ir(_tail_rule("tail_mem_store_addr0_00_from_global_exact"))
@@ -2018,9 +2018,9 @@ def test_tail_mem_store_addr0_00_from_global_exacts_nibbles():
     # Bounded strength: 10k means the per-lane delta caps at the rule's
     # active write. Verify the rule emits the expected 0x00 nibbles.
     assert out["OUTPUT_LO+0"] > 1_000.0
-    assert out["OUTPUT_HI+0"] > 1_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 1_000.0
     assert out["OUTPUT_LO+8"] < -1_000.0
-    assert out["OUTPUT_HI+15"] < -1_000.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] < -1_000.0
 
 
 def test_tail_mem_store_addr0_00_from_global_blocks_initial_jsr_store():
@@ -2032,17 +2032,17 @@ def test_tail_mem_store_addr0_00_from_global_blocks_initial_jsr_store():
         "MEM_STORE": 2.0,
         "OP_JSR": 12.491547584533691,
         "OUTPUT_LO+0": 14941.8525390625,
-        "OUTPUT_HI+0": 1853.215576171875,
-        "OUTPUT_HI+14": -1425.1607666015625,
-        "OUTPUT_HI+15": 1773.0650634765625,
+        "OUTPUT_HI_THIS_STEP+0": 1853.215576171875,
+        "OUTPUT_HI_THIS_STEP+14": -1425.1607666015625,
+        "OUTPUT_HI_THIS_STEP+15": 1773.0650634765625,
     }
 
     out = ir.symbolic_ffn(row)
 
     assert out["OUTPUT_LO+0"] == row["OUTPUT_LO+0"]
-    assert out["OUTPUT_HI+0"] == row["OUTPUT_HI+0"]
+    assert out["OUTPUT_HI_THIS_STEP+0"] == row["OUTPUT_HI_THIS_STEP+0"]
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == row["OUTPUT_HI+15"]
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == row["OUTPUT_HI_THIS_STEP+15"]
 
 
 def test_tail_mem_store_addr0_00_from_global_blocks_local_e0_shape():
@@ -2055,12 +2055,12 @@ def test_tail_mem_store_addr0_00_from_global_blocks_local_e0_shape():
         "MEM_STORE": 4.0,
         "MEM_ADDR_SRC": 4.0,
         "OUTPUT_LO+0": 13.9,
-        "OUTPUT_HI+14": 16.9,
+        "OUTPUT_HI_THIS_STEP+14": 16.9,
     })
 
     assert out["OUTPUT_LO+0"] == 13.9
-    assert out["OUTPUT_HI+14"] == 16.9
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 16.9
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_mem_store_addr0_00_from_global_blocks_psh_stack_store():
@@ -2074,11 +2074,11 @@ def test_tail_mem_store_addr0_00_from_global_blocks_psh_stack_store():
         "MEM_ADDR_SRC": 4.0,
         "PSH_AT_SP": 1.0,
         "OUTPUT_LO+0": 13.9,
-        "OUTPUT_HI+0": 16.9,
+        "OUTPUT_HI_THIS_STEP+0": 16.9,
     })
 
     assert out["OUTPUT_LO+0"] == 13.9
-    assert out["OUTPUT_HI+0"] == 16.9
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 16.9
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
 
 
@@ -2099,16 +2099,16 @@ def test_tail_mem_store_addr2_zero_from_global_exacts_after_addr1_residue():
         "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 1.775,
         "OUTPUT_LO+2": 4.669,
-        "OUTPUT_HI+0": 6.722,
-        "OUTPUT_HI+1": 1.669,
+        "OUTPUT_HI_THIS_STEP+0": 6.722,
+        "OUTPUT_HI_THIS_STEP+1": 1.669,
     })
 
     # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap;
     # the rule still fires above the residue (OUTPUT_LO+0 was 1.775).
     assert out["OUTPUT_LO+0"] > 40.0
-    assert out["OUTPUT_HI+0"] > 40.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 40.0
     assert out["OUTPUT_LO+2"] == pytest.approx(0.0)
-    assert out["OUTPUT_HI+1"] == pytest.approx(0.0)
+    assert out["OUTPUT_HI_THIS_STEP+1"] == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr2_zero_from_global_blocks_addr1_row():
@@ -2123,7 +2123,7 @@ def test_tail_mem_store_addr2_zero_from_global_blocks_addr1_row():
         "BYTE_INDEX_0": 1.0,
         "OUTPUT_LO+0": 1.0,
         "OUTPUT_LO+2": 2.0,
-        "OUTPUT_HI+0": 1.0,
+        "OUTPUT_HI_THIS_STEP+0": 1.0,
     })
 
     assert out["OUTPUT_LO+2"] == pytest.approx(2.0)
@@ -2141,11 +2141,11 @@ def test_tail_mem_store_addr2_zero_from_global_blocks_local_high_byte():
         "MEM_ADDR_SRC": 2.0,
         "BYTE_INDEX_1": 1.0,
         "OUTPUT_LO+15": 4.0,
-        "OUTPUT_HI+15": 4.0,
+        "OUTPUT_HI_THIS_STEP+15": 4.0,
     })
 
     assert out["OUTPUT_LO+15"] == pytest.approx(4.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(4.0)
 
 
 def test_tail_mem_store_addr_high_zero_from_global_blocks_bp_byte3_residue():
@@ -2162,13 +2162,13 @@ def test_tail_mem_store_addr_high_zero_from_global_blocks_bp_byte3_residue():
         "H1+3": 1.0,
         "BYTE_INDEX_2": 1.0,
         "OUTPUT_LO+0": 1.03e15,
-        "OUTPUT_HI+0": -6.81e15,
-        "OUTPUT_HI+1": 0.03,
+        "OUTPUT_HI_THIS_STEP+0": -6.81e15,
+        "OUTPUT_HI_THIS_STEP+1": 0.03,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(1.03e15)
-    assert out["OUTPUT_HI+0"] == pytest.approx(-6.81e15)
-    assert out["OUTPUT_HI+1"] == pytest.approx(0.03)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(-6.81e15)
+    assert out["OUTPUT_HI_THIS_STEP+1"] == pytest.approx(0.03)
 
 
 @pytest.mark.parametrize(
@@ -2192,15 +2192,15 @@ def test_tail_mem_store_addr_high_zero_from_global_blocks_stack0_byte_rows(
         byte_index: 1.0,
         "STACK0_BYTE0": 1.0,
         "OUTPUT_LO+0": 123.0,
-        "OUTPUT_HI+0": 456.0,
+        "OUTPUT_HI_THIS_STEP+0": 456.0,
         "OUTPUT_LO+15": -7.0,
-        "OUTPUT_HI+15": -8.0,
+        "OUTPUT_HI_THIS_STEP+15": -8.0,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(123.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(456.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(456.0)
     assert out["OUTPUT_LO+15"] == pytest.approx(-7.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(-8.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(-8.0)
 
 
 @pytest.mark.parametrize(
@@ -2227,16 +2227,16 @@ def test_tail_stack0_span_blockers_dominate_authoritative_output_bands(
         "OUTPUT_LO+0": -441_904_000.0,
         "OUTPUT_LO+8": -441_899_936.0,
         "OUTPUT_LO+9": 441_904_032.0,
-        "OUTPUT_HI+0": -441_904_000.0,
-        "OUTPUT_HI+3": 441_904_032.0,
-        "OUTPUT_HI+14": -441_899_936.0,
-        "OUTPUT_HI+15": -441_904_000.0,
+        "OUTPUT_HI_THIS_STEP+0": -441_904_000.0,
+        "OUTPUT_HI_THIS_STEP+3": 441_904_032.0,
+        "OUTPUT_HI_THIS_STEP+14": -441_899_936.0,
+        "OUTPUT_HI_THIS_STEP+15": -441_904_000.0,
     })
 
     assert out["OUTPUT_LO+9"] == pytest.approx(441_904_032.0)
-    assert out["OUTPUT_HI+3"] == pytest.approx(441_904_032.0)
+    assert out["OUTPUT_HI_THIS_STEP+3"] == pytest.approx(441_904_032.0)
     assert out["OUTPUT_LO+0"] == pytest.approx(-441_904_000.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(-441_904_000.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(-441_904_000.0)
 
 
 def test_tail_mem_store_addr0_f8_from_mod_local_exacts_nibbles():
@@ -2259,18 +2259,18 @@ def test_tail_mem_store_addr0_f8_from_mod_local_exacts_nibbles():
         "OUTPUT_LO+0": 2.921051025390625,
         "OUTPUT_LO+7": 0.572,
         "OUTPUT_LO+8": 0.9968036413192749,
-        "OUTPUT_HI+0": 2.9213929176330566,
-        "OUTPUT_HI+15": 1.1968036413192749,
+        "OUTPUT_HI_THIS_STEP+0": 2.9213929176330566,
+        "OUTPUT_HI_THIS_STEP+15": 1.1968036413192749,
     })
 
     # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap.
     assert out["OUTPUT_LO+8"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 8:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
         if lane != 15:
-            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr0_f8_from_mod_local_blocks_second_push():
@@ -2286,12 +2286,12 @@ def test_tail_mem_store_addr0_f8_from_mod_local_blocks_second_push():
         "ALU_LO+14": 0.9937615394592285,
         "OUTPUT_LO+0": 3.8322701454162598,
         "OUTPUT_LO+8": 219616.703125,
-        "OUTPUT_HI+15": 0.9901931285858154,
+        "OUTPUT_HI_THIS_STEP+15": 0.9901931285858154,
     })
 
     assert out["OUTPUT_LO+0"] == 3.8322701454162598
     assert out["OUTPUT_LO+8"] == 219616.703125
-    assert out["OUTPUT_HI+15"] == 0.9901931285858154
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 0.9901931285858154
 
 
 def test_tail_mem_store_addr0_f8_from_mod_local_blocks_psh_sp_store():
@@ -2310,14 +2310,14 @@ def test_tail_mem_store_addr0_f8_from_mod_local_blocks_psh_sp_store():
         "ALU_LO+14": 1.1776190149248578e-05,
         "OUTPUT_LO+0": 2.566706895828247,
         "OUTPUT_LO+8": 0.5347899794578552,
-        "OUTPUT_HI+14": 13285903.0,
-        "OUTPUT_HI+15": 11668551.0,
+        "OUTPUT_HI_THIS_STEP+14": 13285903.0,
+        "OUTPUT_HI_THIS_STEP+15": 11668551.0,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(2.566706895828247)
     assert out["OUTPUT_LO+8"] == pytest.approx(0.5347899794578552)
-    assert out["OUTPUT_HI+14"] == pytest.approx(13285903.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(11668551.0)
+    assert out["OUTPUT_HI_THIS_STEP+14"] == pytest.approx(13285903.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(11668551.0)
 
 
 def test_tail_mem_store_addr0_f8_from_mod_local_blocks_stack_source_store():
@@ -2335,13 +2335,13 @@ def test_tail_mem_store_addr0_f8_from_mod_local_blocks_stack_source_store():
         "ALU_LO+10": 0.07819131016731262,
         "ALU_LO+14": 0.0,
         "OUTPUT_LO+8": 85991448.0,
-        "OUTPUT_HI+14": 90491448.0,
+        "OUTPUT_HI_THIS_STEP+14": 90491448.0,
     })
 
     assert out["OUTPUT_LO+8"] == pytest.approx(85991448.0)
-    assert out["OUTPUT_HI+14"] == pytest.approx(90491448.0)
+    assert out["OUTPUT_HI_THIS_STEP+14"] == pytest.approx(90491448.0)
     assert out.get("OUTPUT_LO+0", 0.0) == pytest.approx(0.0)
-    assert out.get("OUTPUT_HI+0", 0.0) == pytest.approx(0.0)
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr0_e8_from_nested_local_exacts_nibbles():
@@ -2364,18 +2364,18 @@ def test_tail_mem_store_addr0_e8_from_nested_local_exacts_nibbles():
         "OUTPUT_LO+0": 2.958621025085449,
         "OUTPUT_LO+8": 0.9968036413192749,
         "OUTPUT_LO+10": 0.536,
-        "OUTPUT_HI+0": 3.503345012664795,
-        "OUTPUT_HI+14": 1.1968036413192749,
+        "OUTPUT_HI_THIS_STEP+0": 3.503345012664795,
+        "OUTPUT_HI_THIS_STEP+14": 1.1968036413192749,
     })
 
     # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap.
     assert out["OUTPUT_LO+8"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+14"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI_THIS_STEP+14"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 8:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
         if lane != 14:
-            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr0_e8_from_nested_local_blocks_stack_source_store():
@@ -2393,13 +2393,13 @@ def test_tail_mem_store_addr0_e8_from_nested_local_blocks_stack_source_store():
         "ALU_LO+7": 0.0,
         "ALU_LO+14": 0.0,
         "OUTPUT_LO+8": 85991448.0,
-        "OUTPUT_HI+14": 90491448.0,
+        "OUTPUT_HI_THIS_STEP+14": 90491448.0,
     })
 
     assert out["OUTPUT_LO+8"] == pytest.approx(85991448.0)
-    assert out["OUTPUT_HI+14"] == pytest.approx(90491448.0)
+    assert out["OUTPUT_HI_THIS_STEP+14"] == pytest.approx(90491448.0)
     assert out.get("OUTPUT_LO+0", 0.0) == pytest.approx(0.0)
-    assert out.get("OUTPUT_HI+0", 0.0) == pytest.approx(0.0)
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr0_e0_from_local_offset_exacts_nibbles():
@@ -2422,19 +2422,19 @@ def test_tail_mem_store_addr0_e0_from_local_offset_exacts_nibbles():
         "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 2.574,
         "OUTPUT_LO+8": 0.535,
-        "OUTPUT_HI+0": -298.0,
-        "OUTPUT_HI+14": 161.262,
-        "OUTPUT_HI+15": 141.692,
+        "OUTPUT_HI_THIS_STEP+0": -298.0,
+        "OUTPUT_HI_THIS_STEP+14": 161.262,
+        "OUTPUT_HI_THIS_STEP+15": 141.692,
     })
 
     # B7-7: active_value reduced from 50000 to 50 per the ≤10k strength cap.
     assert out["OUTPUT_LO+0"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+14"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI_THIS_STEP+14"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 0:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
         if lane != 14:
-            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr0_e0_from_local_offset_blocks_e8_row():
@@ -2449,11 +2449,11 @@ def test_tail_mem_store_addr0_e0_from_local_offset_blocks_e8_row():
         "ALU_LO+8": 0.0,
         "ALU_LO+10": 0.9940742254257202,
         "OUTPUT_LO+8": 12.2,
-        "OUTPUT_HI+14": 83.8,
+        "OUTPUT_HI_THIS_STEP+14": 83.8,
     })
 
     assert out["OUTPUT_LO+8"] == 12.2
-    assert out["OUTPUT_HI+14"] == 83.8
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 83.8
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -2471,11 +2471,11 @@ def test_tail_mem_store_addr0_e0_from_local_offset_blocks_strong_e8_output():
         "ADDR_B0_LO+8": 0.9888219833374023,
         "ADDR_B0_HI+14": 0.9716129302978516,
         "OUTPUT_LO+8": 1282.8973388671875,
-        "OUTPUT_HI+14": 1361.1473388671875,
+        "OUTPUT_HI_THIS_STEP+14": 1361.1473388671875,
     })
 
     assert out["OUTPUT_LO+8"] == 1282.8973388671875
-    assert out["OUTPUT_HI+14"] == 1361.1473388671875
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 1361.1473388671875
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -2511,15 +2511,15 @@ def test_tail_mem_store_addr0_local_frame_rules_block_raw_psh_store_row():
         "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": 13.946,
         "OUTPUT_LO+8": -10.0,
-        "OUTPUT_HI+14": -10.0,
-        "OUTPUT_HI+15": -10.0,
+        "OUTPUT_HI_THIS_STEP+14": -10.0,
+        "OUTPUT_HI_THIS_STEP+15": -10.0,
     })
 
     # B7-7: active_value reduced from 500 to 50 per the ≤10k strength cap.
     assert out["OUTPUT_LO+8"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(50.0)
     assert out.get("OUTPUT_LO+0", 0.0) == pytest.approx(0.0)
-    assert out.get("OUTPUT_HI+14", 0.0) == pytest.approx(0.0)
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(
@@ -2547,12 +2547,12 @@ def test_tail_mem_store_addr0_local_frame_rules_require_no_psh_at_sp(prefix):
         "ADDR_B0_HI+14": 0.9812884330749512,
         "OUTPUT_LO+0": 13.946,
         "OUTPUT_LO+8": -10.0,
-        "OUTPUT_HI+14": -10.0,
+        "OUTPUT_HI_THIS_STEP+14": -10.0,
     })
 
     assert out["OUTPUT_LO+0"] == 13.946
     assert out["OUTPUT_LO+8"] == -10.0
-    assert out["OUTPUT_HI+14"] == -10.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == -10.0
 
 
 def test_tail_mem_store_addr0_e0_from_jsr_local_exacts_nibbles():
@@ -2573,19 +2573,19 @@ def test_tail_mem_store_addr0_e0_from_jsr_local_exacts_nibbles():
         "IN_STEP_FRESH": 1.0,
         "OUTPUT_LO+0": -10600.0,
         "OUTPUT_LO+8": 10900.0,
-        "OUTPUT_HI+0": -354000.0,
-        "OUTPUT_HI+14": 30600.0,
-        "OUTPUT_HI+15": 11000.0,
+        "OUTPUT_HI_THIS_STEP+0": -354000.0,
+        "OUTPUT_HI_THIS_STEP+14": 30600.0,
+        "OUTPUT_HI_THIS_STEP+15": 11000.0,
     })
 
     # B7-7: active_value reduced from 5000 to 50 per the ≤10k strength cap.
     assert out["OUTPUT_LO+0"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+14"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI_THIS_STEP+14"] == pytest.approx(50.0)
     for lane in range(16):
         if lane != 0:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
         if lane != 14:
-            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr0_e0_from_jsr_local_blocks_initial_f8():
@@ -2599,13 +2599,13 @@ def test_tail_mem_store_addr0_e0_from_jsr_local_blocks_initial_f8():
         "CMP+4": 1.497720718383789,
         "ALU_LO+14": -110.0,
         "OUTPUT_LO+8": -839271360.0,
-        "OUTPUT_HI+0": 881834262528.0,
-        "OUTPUT_HI+15": -14807114752.0,
+        "OUTPUT_HI_THIS_STEP+0": 881834262528.0,
+        "OUTPUT_HI_THIS_STEP+15": -14807114752.0,
     })
 
     assert out["OUTPUT_LO+8"] == -839271360.0
-    assert out["OUTPUT_HI+0"] == 881834262528.0
-    assert out["OUTPUT_HI+15"] == -14807114752.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 881834262528.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == -14807114752.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -2625,13 +2625,13 @@ def test_tail_mem_store_addr0_e0_from_jsr_local_strong_overrides_residue():
         "CMP+4": 1.497720718383789,
         "ALU_LO+14": 5360.0,
         "OUTPUT_LO+1": 8_867_526_213_632.0,
-        "OUTPUT_HI+0": 18_137_942_589_440.0,
+        "OUTPUT_HI_THIS_STEP+0": 18_137_942_589_440.0,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(5000.0)
-    assert out["OUTPUT_HI+14"] == pytest.approx(5000.0)
+    assert out["OUTPUT_HI_THIS_STEP+14"] == pytest.approx(5000.0)
     assert out["OUTPUT_LO+1"] == pytest.approx(0.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(0.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(0.0)
 
 
 def test_tail_mem_store_addr0_local_frame_output_e8_dominates_f8():
@@ -2651,13 +2651,13 @@ def test_tail_mem_store_addr0_local_frame_output_e8_dominates_f8():
         "CMP+0": 2.996619701385498,
         "OUTPUT_LO+0": -56.29740524291992,
         "OUTPUT_LO+8": 60.241825103759766,
-        "OUTPUT_HI+0": -98.06285858154297,
-        "OUTPUT_HI+14": 83.8114242553711,
-        "OUTPUT_HI+15": -0.0019485921366140246,
+        "OUTPUT_HI_THIS_STEP+0": -98.06285858154297,
+        "OUTPUT_HI_THIS_STEP+14": 83.8114242553711,
+        "OUTPUT_HI_THIS_STEP+15": -0.0019485921366140246,
     })
 
     assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"]
-    assert out["OUTPUT_HI+14"] > out["OUTPUT_HI+15"]
+    assert out["OUTPUT_HI_THIS_STEP+14"] > out["OUTPUT_HI_THIS_STEP+15"]
 
 
 def test_tail_mem_store_addr0_local_frame_addr_e8_dominates_f8():
@@ -2677,15 +2677,15 @@ def test_tail_mem_store_addr0_local_frame_addr_e8_dominates_f8():
         "CMP+0": 2.996619701385498,
         "OUTPUT_LO+0": 16.946823120117188,
         "OUTPUT_LO+8": -10.0,
-        "OUTPUT_HI+0": 16.946823120117188,
-        "OUTPUT_HI+14": -10.0,
-        "OUTPUT_HI+15": -10.0,
+        "OUTPUT_HI_THIS_STEP+0": 16.946823120117188,
+        "OUTPUT_HI_THIS_STEP+14": -10.0,
+        "OUTPUT_HI_THIS_STEP+15": -10.0,
         "ADDR_B0_LO+8": 0.9904117584228516,
         "ADDR_B0_HI+14": 0.9812884330749512,
     })
 
     assert out["OUTPUT_LO+8"] > out["OUTPUT_LO+0"]
-    assert out["OUTPUT_HI+14"] > out["OUTPUT_HI+15"]
+    assert out["OUTPUT_HI_THIS_STEP+14"] > out["OUTPUT_HI_THIS_STEP+15"]
 
 
 def test_tail_mem_store_addr0_local_frame_e8_blocks_initial_f8_shape():
@@ -2703,14 +2703,14 @@ def test_tail_mem_store_addr0_local_frame_e8_blocks_initial_f8_shape():
         "MEM_STORE": 2.0,
         "CMP+0": 2.996619701385498,
         "OUTPUT_LO+8": 200.0,
-        "OUTPUT_HI+15": 200.0,
+        "OUTPUT_HI_THIS_STEP+15": 200.0,
         "ADDR_B0_LO+8": 1.0,
         "ADDR_B0_HI+15": 1.0,
     })
 
     assert out["OUTPUT_LO+8"] == 200.0
-    assert out["OUTPUT_HI+15"] == 200.0
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 200.0
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_tail_mem_store_addr0_local_frame_output_e8_blocks_e0_offset_row():
@@ -2724,13 +2724,13 @@ def test_tail_mem_store_addr0_local_frame_output_e8_blocks_e0_offset_row():
         "CMP+0": 2.996619701385498,
         "OUTPUT_LO+0": -1.124,
         "OUTPUT_LO+8": 4.226,
-        "OUTPUT_HI+14": 161.262,
-        "OUTPUT_HI+15": 141.692,
+        "OUTPUT_HI_THIS_STEP+14": 161.262,
+        "OUTPUT_HI_THIS_STEP+15": 141.692,
         "ALU_LO+8": 0.9937615394592285,
     })
 
     assert out["OUTPUT_LO+8"] == 4.226
-    assert out["OUTPUT_HI+14"] == 161.262
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 161.262
     assert out.get("OUTPUT_LO+0", 0.0) == -1.124
 
 
@@ -2745,15 +2745,15 @@ def test_tail_mem_store_addr0_local_frame_output_e8_blocks_large_e0_offset_row()
         "CMP+0": 2.996619701385498,
         "OUTPUT_LO+0": 2.574,
         "OUTPUT_LO+8": 0.535,
-        "OUTPUT_HI+0": -298.0,
-        "OUTPUT_HI+14": 161.262,
-        "OUTPUT_HI+15": 141.692,
+        "OUTPUT_HI_THIS_STEP+0": -298.0,
+        "OUTPUT_HI_THIS_STEP+14": 161.262,
+        "OUTPUT_HI_THIS_STEP+15": 141.692,
         "ALU_LO+8": 0.9937615394592285,
     })
 
     assert out["OUTPUT_LO+0"] == 2.574
     assert out["OUTPUT_LO+8"] == 0.535
-    assert out["OUTPUT_HI+14"] == 161.262
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 161.262
 
 
 def test_tail_mem_store_addr0_local_frame_output_e8_blocks_jsr_e0_row():
@@ -2769,14 +2769,14 @@ def test_tail_mem_store_addr0_local_frame_output_e8_blocks_jsr_e0_row():
         "ALU_LO+14": 5360.0,
         "OUTPUT_LO+0": -10600.0,
         "OUTPUT_LO+8": 10900.0,
-        "OUTPUT_HI+0": -354000.0,
-        "OUTPUT_HI+14": 30600.0,
-        "OUTPUT_HI+15": 11000.0,
+        "OUTPUT_HI_THIS_STEP+0": -354000.0,
+        "OUTPUT_HI_THIS_STEP+14": 30600.0,
+        "OUTPUT_HI_THIS_STEP+15": 11000.0,
     })
 
     assert out["OUTPUT_LO+0"] == -10600.0
     assert out["OUTPUT_LO+8"] == 10900.0
-    assert out["OUTPUT_HI+14"] == 30600.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 30600.0
 
 
 def test_tail_mem_store_addr0_local_frame_output_e8_blocks_ax_imm_residue():
@@ -2787,13 +2787,13 @@ def test_tail_mem_store_addr0_local_frame_output_e8_blocks_ax_imm_residue():
         "H1+1": 1.0,
         "OUTPUT_LO+0": -1.34e9,
         "OUTPUT_LO+8": 1.34e9,
-        "OUTPUT_HI+0": -1.35e9,
-        "OUTPUT_HI+12": 1.35e9,
-        "OUTPUT_HI+14": 10.0,
+        "OUTPUT_HI_THIS_STEP+0": -1.35e9,
+        "OUTPUT_HI_THIS_STEP+12": 1.35e9,
+        "OUTPUT_HI_THIS_STEP+14": 10.0,
     })
 
     assert out["OUTPUT_LO+8"] == pytest.approx(1.34e9)
-    assert out["OUTPUT_HI+12"] == pytest.approx(1.35e9)
+    assert out["OUTPUT_HI_THIS_STEP+12"] == pytest.approx(1.35e9)
     assert out["OUTPUT_LO+0"] == pytest.approx(-1.34e9)
 
 
@@ -2805,13 +2805,13 @@ def test_tail_mem_store_addr0_local_frame_output_e8_blocks_bp_byte3_residue():
         "H1+3": 1.0,
         "BYTE_INDEX_2": 1.0,
         "OUTPUT_LO+0": 1.03e15,
-        "OUTPUT_HI+0": -6.81e15,
-        "OUTPUT_HI+1": 0.03,
+        "OUTPUT_HI_THIS_STEP+0": -6.81e15,
+        "OUTPUT_HI_THIS_STEP+1": 0.03,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(1.03e15)
-    assert out["OUTPUT_HI+0"] == pytest.approx(-6.81e15)
-    assert out["OUTPUT_HI+1"] == pytest.approx(0.03)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(-6.81e15)
+    assert out["OUTPUT_HI_THIS_STEP+1"] == pytest.approx(0.03)
 
 
 def test_tail_mem_store_addr0_local_frame_output_e8_blocks_sub_byte_residue():
@@ -2826,14 +2826,14 @@ def test_tail_mem_store_addr0_local_frame_output_e8_blocks_sub_byte_residue():
         "CARRY+2": 2.0,
         "OUTPUT_LO+0": -1.47e22,
         "OUTPUT_LO+8": 1.46e22,
-        "OUTPUT_HI+0": -1.81e27,
-        "OUTPUT_HI+14": 1.14e26,
+        "OUTPUT_HI_THIS_STEP+0": -1.81e27,
+        "OUTPUT_HI_THIS_STEP+14": 1.14e26,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(-1.47e22)
     assert out["OUTPUT_LO+8"] == pytest.approx(1.46e22)
-    assert out["OUTPUT_HI+0"] == pytest.approx(-1.81e27)
-    assert out["OUTPUT_HI+14"] == pytest.approx(1.14e26)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(-1.81e27)
+    assert out["OUTPUT_HI_THIS_STEP+14"] == pytest.approx(1.14e26)
 
 
 def test_tail_stack0_f8_byte1_from_output_exacts_nibbles():
@@ -2849,16 +2849,16 @@ def test_tail_stack0_f8_byte1_from_output_exacts_nibbles():
         "ADDR_B0_HI+15": 1.0,
         "OUTPUT_LO+0": 154.01010131835938,
         "OUTPUT_LO+2": 3.0,
-        "OUTPUT_HI+0": 157.01010131835938,
+        "OUTPUT_HI_THIS_STEP+0": 157.01010131835938,
     })
 
     assert out["OUTPUT_LO+2"] == pytest.approx(20_000.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(20_000.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(20_000.0)
     for lane in range(16):
         if lane != 2:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
         if lane != 0:
-            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_stack0_f8_byte1_from_output_blocks_zero_byte1():
@@ -2873,11 +2873,11 @@ def test_tail_stack0_f8_byte1_from_output_blocks_zero_byte1():
         "ADDR_B0_LO+8": 1.0,
         "ADDR_B0_HI+15": 1.0,
         "OUTPUT_LO+0": 3.9468109607696533,
-        "OUTPUT_HI+0": 42.94681167602539,
+        "OUTPUT_HI_THIS_STEP+0": 42.94681167602539,
     })
 
     assert out["OUTPUT_LO+0"] == 3.9468109607696533
-    assert out["OUTPUT_HI+0"] == 42.94681167602539
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 42.94681167602539
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -2895,13 +2895,13 @@ def test_tail_stack0_f8_byte1_from_output_blocks_store_pop_rows():
         "MEM_STORE": 1.53,
         "OUTPUT_LO+0": 0.947,
         "OUTPUT_LO+2": 3.0,
-        "OUTPUT_HI+0": 0.947,
-        "OUTPUT_HI+1": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 0.947,
+        "OUTPUT_HI_THIS_STEP+1": 3.0,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(0.947)
     assert out["OUTPUT_LO+2"] == pytest.approx(3.0)
-    assert out["OUTPUT_HI+1"] == pytest.approx(3.0)
+    assert out["OUTPUT_HI_THIS_STEP+1"] == pytest.approx(3.0)
 
 
 def test_tail_stack0_f8_byte1_from_output_blocks_binary_pop_rows():
@@ -2918,12 +2918,12 @@ def test_tail_stack0_f8_byte1_from_output_blocks_binary_pop_rows():
         "ADDR_B0_HI+15": 0.99979,
         "OUTPUT_LO+0": 104.87068939208984,
         "OUTPUT_LO+2": 4.767031669616699,
-        "OUTPUT_HI+0": 116.17977142333984,
+        "OUTPUT_HI_THIS_STEP+0": 116.17977142333984,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(104.87068939208984)
     assert out["OUTPUT_LO+2"] == pytest.approx(4.767031669616699)
-    assert out["OUTPUT_HI+0"] == pytest.approx(116.17977142333984)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(116.17977142333984)
 
 
 def test_tail_stack0_f8_byte1_from_output_blocks_ax_byte_row():
@@ -2940,14 +2940,14 @@ def test_tail_stack0_f8_byte1_from_output_blocks_ax_byte_row():
         "ADDR_B0_HI+15": 1.0,
         "OUTPUT_LO+1": -6140.89453125,
         "OUTPUT_LO+2": 5581.818359375,
-        "OUTPUT_HI+0": 7892.8798828125,
-        "OUTPUT_HI+1": 607.6930541992188,
+        "OUTPUT_HI_THIS_STEP+0": 7892.8798828125,
+        "OUTPUT_HI_THIS_STEP+1": 607.6930541992188,
     })
 
     assert out["OUTPUT_LO+1"] == -6140.89453125
     assert out["OUTPUT_LO+2"] == 5581.818359375
-    assert out["OUTPUT_HI+0"] == 7892.8798828125
-    assert out["OUTPUT_HI+1"] == 607.6930541992188
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 7892.8798828125
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 607.6930541992188
 
 
 def test_tail_stack0_f8_byte1_from_output_requires_has_se_margin():
@@ -2958,11 +2958,11 @@ def test_tail_stack0_f8_byte1_from_output_requires_has_se_margin():
         "H1+10": 1.0,
         "BYTE_INDEX_0": 0.9734055995941162,
         "OUTPUT_LO+0": 142.07675170898438,
-        "OUTPUT_HI+0": 142.07675170898438,
+        "OUTPUT_HI_THIS_STEP+0": 142.07675170898438,
     })
 
     assert out["OUTPUT_LO+0"] == 142.07675170898438
-    assert out["OUTPUT_HI+0"] == 142.07675170898438
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 142.07675170898438
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -2975,12 +2975,12 @@ def test_tail_pc_byte0_12_from_initial_jmp_exacts_nibbles():
         "FETCH_LO+2": 64.6191,
         "FETCH_HI+0": 68.7496,
         "OUTPUT_LO+2": 1520.0493,
-        "OUTPUT_HI+0": 1593.2112,
+        "OUTPUT_HI_THIS_STEP+0": 1593.2112,
     })
 
     assert out["OUTPUT_LO+2"] == pytest.approx(1520.0493)
-    assert out["OUTPUT_HI+1"] == pytest.approx(5000.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(-3406.7888)
+    assert out["OUTPUT_HI_THIS_STEP+1"] == pytest.approx(5000.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(-3406.7888)
 
 
 def test_tail_pc_byte0_12_from_initial_jmp_blocks_non_pc_rows():
@@ -2992,12 +2992,12 @@ def test_tail_pc_byte0_12_from_initial_jmp_blocks_non_pc_rows():
         "FETCH_LO+2": 64.6191,
         "FETCH_HI+0": 68.7496,
         "OUTPUT_LO+2": 1520.0493,
-        "OUTPUT_HI+0": 1593.2112,
+        "OUTPUT_HI_THIS_STEP+0": 1593.2112,
     })
 
     assert out["OUTPUT_LO+2"] == 1520.0493
-    assert out["OUTPUT_HI+0"] == 1593.2112
-    assert out.get("OUTPUT_HI+1", 0.0) == 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1593.2112
+    assert out.get("OUTPUT_HI_THIS_STEP+1", 0.0) == 0.0
 
 
 @pytest.mark.parametrize("op_dim", ["OP_BZ", "OP_BNZ"])
@@ -3010,13 +3010,13 @@ def test_tail_pc_byte0_1a_from_taken_branch_index3_exacts_nibbles(op_dim):
         "FETCH_LO+3": 40.0,
         "FETCH_HI+0": 41.0,
         "OUTPUT_LO+3": 40.0,
-        "OUTPUT_HI+0": 41.0,
+        "OUTPUT_HI_THIS_STEP+0": 41.0,
     })
 
     assert out["OUTPUT_LO+10"] == pytest.approx(5000.0)
     assert out["OUTPUT_LO+3"] == pytest.approx(-4960.0)
-    assert out["OUTPUT_HI+1"] == pytest.approx(5000.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(-4959.0)
+    assert out["OUTPUT_HI_THIS_STEP+1"] == pytest.approx(5000.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(-4959.0)
 
 
 @pytest.mark.parametrize("op_dim", ["OP_BZ", "OP_BNZ"])
@@ -3029,11 +3029,11 @@ def test_tail_pc_byte0_1a_from_taken_branch_index3_blocks_fallthrough(op_dim):
         "FETCH_LO+3": 40.0,
         "FETCH_HI+0": 41.0,
         "OUTPUT_LO+2": 0.99,
-        "OUTPUT_HI+1": 0.98,
+        "OUTPUT_HI_THIS_STEP+1": 0.98,
     })
 
     assert out["OUTPUT_LO+2"] == 0.99
-    assert out["OUTPUT_HI+1"] == 0.98
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 0.98
     assert out.get("OUTPUT_LO+10", 0.0) == 0.0
     assert out.get("OUTPUT_LO+3", 0.0) == 0.0
 
@@ -3051,13 +3051,13 @@ def test_tail_pc_byte0_1a_from_taken_branch_index3_blocks_plain_jmp(op_dim):
         "OUTPUT_LO+2": 1520.05,
         "OUTPUT_LO+3": 54.4,
         "OUTPUT_LO+10": -24.0,
-        "OUTPUT_HI+0": 1593.21,
+        "OUTPUT_HI_THIS_STEP+0": 1593.21,
     })
 
     assert out["OUTPUT_LO+2"] == pytest.approx(1520.05)
     assert out["OUTPUT_LO+3"] == pytest.approx(54.4)
     assert out["OUTPUT_LO+10"] == pytest.approx(-24.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(1593.21)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(1593.21)
 
 
 def test_tail_pc_byte1_01_from_long_initial_pc_exacts_nibbles():
@@ -3076,16 +3076,16 @@ def test_tail_pc_byte1_01_from_long_initial_pc_exacts_nibbles():
         "NEXT_AX": 6.358210521284491e-05,
         "OUTPUT_LO+0": 0.9402,
         "OUTPUT_LO+1": -0.0001,
-        "OUTPUT_HI+0": 0.9402,
+        "OUTPUT_HI_THIS_STEP+0": 0.9402,
     })
 
     assert out["OUTPUT_LO+1"] == pytest.approx(4.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(4.0)
     for lane in range(16):
         if lane != 1:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
         if lane != 0:
-            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_exacts_nibbles():
@@ -3104,13 +3104,13 @@ def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_exacts_nibbles():
         "NEXT_AX": 6.358210521284491e-05,
         "OUTPUT_LO+0": 2.46177339553833,
         "OUTPUT_LO+1": 37.60724639892578,
-        "OUTPUT_HI+0": 4.757164478302002,
+        "OUTPUT_HI_THIS_STEP+0": 4.757164478302002,
     })
 
     assert out["OUTPUT_LO+1"] > 37.60724639892578
-    assert out["OUTPUT_HI+0"] > 4.757164478302002
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 4.757164478302002
     assert out["OUTPUT_LO+0"] < 2.46177339553833
-    assert out.get("OUTPUT_HI+1", 0.0) < 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+1", 0.0) < 0.0
 
 
 def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_requires_initial_step():
@@ -3126,11 +3126,11 @@ def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_requires_initial_step():
         "FETCH_HI+2": 39.99981689453125,
         "AX_CARRY_HI+1": 2.679687738418579,
         "OUTPUT_LO+2": 12.0,
-        "OUTPUT_HI+1": 13.0,
+        "OUTPUT_HI_THIS_STEP+1": 13.0,
     })
 
     assert out["OUTPUT_LO+2"] == 12.0
-    assert out["OUTPUT_HI+1"] == 13.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 13.0
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -3146,11 +3146,11 @@ def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_requires_byte_index0():
         "FETCH_HI+2": 39.99981689453125,
         "AX_CARRY_HI+1": 2.679687738418579,
         "OUTPUT_LO+0": 12.0,
-        "OUTPUT_HI+0": 13.0,
+        "OUTPUT_HI_THIS_STEP+0": 13.0,
     })
 
     assert out["OUTPUT_LO+0"] == 12.0
-    assert out["OUTPUT_HI+0"] == 13.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 13.0
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -3165,11 +3165,11 @@ def test_tail_pc_byte1_01_from_initial_jsr_fetch_hi_requires_carry_sentinel():
         "BYTE_INDEX_0": 0.9701393842697144,
         "OUTPUT_LO+0": 40.067691802978516,
         "OUTPUT_LO+1": 0.0014171712100505829,
-        "OUTPUT_HI+0": 4.757174491882324,
+        "OUTPUT_HI_THIS_STEP+0": 4.757174491882324,
     })
 
     assert out["OUTPUT_LO+0"] == 40.067691802978516
-    assert out["OUTPUT_HI+0"] == 4.757174491882324
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4.757174491882324
     assert out["OUTPUT_LO+1"] == 0.0014171712100505829
 
 
@@ -3187,11 +3187,11 @@ def test_tail_pc_byte1_01_from_initial_jsr_blocks_plain_initial_pc_byte():
         "AX_CARRY_HI+1": 0.0,
         "OUTPUT_LO+0": 0.940187,
         "OUTPUT_LO+1": 0.0,
-        "OUTPUT_HI+0": 0.940187,
+        "OUTPUT_HI_THIS_STEP+0": 0.940187,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(0.940187)
-    assert out["OUTPUT_HI+0"] == pytest.approx(0.940187)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(0.940187)
     assert out.get("OUTPUT_LO+1", 0.0) == pytest.approx(0.0)
 
 
@@ -3209,11 +3209,11 @@ def test_tail_pc_byte1_01_from_long_initial_pc_blocks_plain_initial_pc_byte():
         "AX_CARRY_HI+9": 0.0,
         "OUTPUT_LO+0": 0.940187,
         "OUTPUT_LO+1": 0.0,
-        "OUTPUT_HI+0": 0.940187,
+        "OUTPUT_HI_THIS_STEP+0": 0.940187,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(0.940187)
-    assert out["OUTPUT_HI+0"] == pytest.approx(0.940187)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(0.940187)
     assert out.get("OUTPUT_LO+1", 0.0) == pytest.approx(0.0)
 
 
@@ -3236,17 +3236,17 @@ def test_tail_sp_marker_byte0_f8_from_initial_stack_exacts_nibbles():
         "IN_STEP_FRESH": 0.9,
         "OUTPUT_LO+0": 0.9734733700752258,
         "OUTPUT_LO+8": 0.026526624336838722,
-        "OUTPUT_HI+0": 0.97722327709198,
-        "OUTPUT_HI+15": 0.02277671918272972,
+        "OUTPUT_HI_THIS_STEP+0": 0.97722327709198,
+        "OUTPUT_HI_THIS_STEP+15": 0.02277671918272972,
     })
 
     assert out["OUTPUT_LO+8"] == pytest.approx(4.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(4.0)
     for lane in range(16):
         if lane != 8:
             assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
         if lane != 15:
-            assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_sp_marker_byte0_f8_requires_jsr_bootstrap_context():
@@ -3265,15 +3265,15 @@ def test_tail_sp_marker_byte0_f8_requires_jsr_bootstrap_context():
         "IN_STEP_FRESH": 0.9,
         # CMP+4 absent → no JSR-bootstrap context.
         "OUTPUT_LO+0": 4.0,
-        "OUTPUT_HI+0": 4.0,
+        "OUTPUT_HI_THIS_STEP+0": 4.0,
     })
 
     # Without CMP+4 the activation ≈ 10.02 + 0.0009 + 0.001 = 10.022;
     # threshold 10.04; rule does not fire (margin -0.018).
     assert out["OUTPUT_LO+0"] == pytest.approx(4.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(4.0)
     assert out.get("OUTPUT_LO+8", 0.0) == pytest.approx(0.0)
-    assert out.get("OUTPUT_HI+15", 0.0) == pytest.approx(0.0)
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_sp_marker_byte0_f8_blocks_pure_output_residue():
@@ -3290,15 +3290,15 @@ def test_tail_sp_marker_byte0_f8_blocks_pure_output_residue():
         # residue.
         "OUTPUT_LO+0": 4.0,
         "OUTPUT_LO+8": 4.0,
-        "OUTPUT_HI+0": 4.0,
-        "OUTPUT_HI+15": 4.0,
+        "OUTPUT_HI_THIS_STEP+0": 4.0,
+        "OUTPUT_HI_THIS_STEP+15": 4.0,
     })
 
     # Base activation 10.02 < threshold 10.04; rule does not fire.
     assert out["OUTPUT_LO+0"] == pytest.approx(4.0)
     assert out["OUTPUT_LO+8"] == pytest.approx(4.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(4.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(4.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(4.0)
 
 
 def test_tail_sp_marker_byte0_f8_consumes_sp_byte0_is_f8_dim():
@@ -3325,13 +3325,13 @@ def test_tail_sp_marker_byte0_f8_blocks_zero_stack_marker():
         "H1+2": 1.0,
         "H1+9": 1.0,
         "OUTPUT_LO+0": 1.0,
-        "OUTPUT_HI+0": 1.0,
+        "OUTPUT_HI_THIS_STEP+0": 1.0,
     })
 
     assert out["OUTPUT_LO+0"] == 1.0
-    assert out["OUTPUT_HI+0"] == 1.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1.0
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
 
 
 def test_tail_sp_marker_byte0_f8_blocks_initial_jsr_stack0_marker():
@@ -3345,14 +3345,14 @@ def test_tail_sp_marker_byte0_f8_blocks_initial_jsr_stack0_marker():
         "OUTPUT_LO+0": 3.9,
         "OUTPUT_LO+8": 0.0,
         "OUTPUT_LO+10": 4.0,
-        "OUTPUT_HI+0": 4.0,
-        "OUTPUT_HI+15": 0.0,
+        "OUTPUT_HI_THIS_STEP+0": 4.0,
+        "OUTPUT_HI_THIS_STEP+15": 0.0,
     })
 
     assert out["OUTPUT_LO+10"] == 4.0
-    assert out["OUTPUT_HI+0"] == 4.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4.0
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
 
 
 def test_tail_sp_marker_byte0_f8_blocks_ax_marker_output_eight_residue():
@@ -3364,13 +3364,13 @@ def test_tail_sp_marker_byte0_f8_blocks_ax_marker_output_eight_residue():
         "HAS_SE": 0.997884,
         "OP_IMM": 5.0,
         "OUTPUT_LO+8": 13.0,
-        "OUTPUT_HI+0": 13.0,
-        "OUTPUT_HI+15": 4.0,
+        "OUTPUT_HI_THIS_STEP+0": 13.0,
+        "OUTPUT_HI_THIS_STEP+15": 4.0,
     })
 
     assert out["OUTPUT_LO+8"] == 13.0
-    assert out["OUTPUT_HI+0"] == 13.0
-    assert out["OUTPUT_HI+15"] == 4.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 13.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 4.0
 
 
 def test_tail_sp_marker_byte0_f8_blocks_ax_imm_ff_residue():
@@ -3381,15 +3381,15 @@ def test_tail_sp_marker_byte0_f8_blocks_ax_imm_ff_residue():
         "H1+1": 1.0,
         "OP_IMM": 5.0,
         "OUTPUT_LO+15": 520.0,
-        "OUTPUT_HI+15": 1_345_005_440.0,
-        "OUTPUT_HI+0": -1_345_004_928.0,
-        "OUTPUT_HI+14": 10.0,
+        "OUTPUT_HI_THIS_STEP+15": 1_345_005_440.0,
+        "OUTPUT_HI_THIS_STEP+0": -1_345_004_928.0,
+        "OUTPUT_HI_THIS_STEP+14": 10.0,
         "ALU_LO+14": -50.0,
     })
 
     assert out["OUTPUT_LO+15"] == 520.0
-    assert out["OUTPUT_HI+15"] == 1_345_005_440.0
-    assert out["OUTPUT_HI+0"] == -1_345_004_928.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 1_345_005_440.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == -1_345_004_928.0
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
 
 
@@ -3403,15 +3403,15 @@ def test_tail_sp_marker_byte0_f8_blocks_lea_local_frame_marker_residue():
         "OP_LEA": 5.0,
         "OUTPUT_LO+0": -54813.03125,
         "OUTPUT_LO+8": 55586.0,
-        "OUTPUT_HI+0": -34047084.0,
-        "OUTPUT_HI+14": 2290023.25,
-        "OUTPUT_HI+15": 2290019.25,
+        "OUTPUT_HI_THIS_STEP+0": -34047084.0,
+        "OUTPUT_HI_THIS_STEP+14": 2290023.25,
+        "OUTPUT_HI_THIS_STEP+15": 2290019.25,
     })
 
     assert out["OUTPUT_LO+8"] == 55586.0
-    assert out["OUTPUT_HI+14"] == 2290023.25
-    assert out["OUTPUT_HI+15"] == 2290019.25
-    assert out["OUTPUT_HI+0"] == -34047084.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 2290023.25
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 2290019.25
+    assert out["OUTPUT_HI_THIS_STEP+0"] == -34047084.0
 
 
 def test_tail_sp_marker_byte0_f8_blocks_ent_frame_setup():
@@ -3424,11 +3424,11 @@ def test_tail_sp_marker_byte0_f8_blocks_ent_frame_setup():
         "H1+9": 1.0,
         "OP_ENT": 6.528390884399414,
         "OUTPUT_LO+0": 3969.28271484375,
-        "OUTPUT_HI+15": 3963.10498046875,
+        "OUTPUT_HI_THIS_STEP+15": 3963.10498046875,
     })
 
     assert out["OUTPUT_LO+0"] == 3969.28271484375
-    assert out["OUTPUT_HI+15"] == 3963.10498046875
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 3963.10498046875
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
 
 
@@ -3445,15 +3445,15 @@ def test_tail_sp_byte1_ff_from_initial_stack_exacts_nibbles():
         "CLEAN_EMBED_HI+15": 1.0,
         "OUTPUT_LO+0": 0.94,
         "OUTPUT_LO+15": -0.025,
-        "OUTPUT_HI+0": 0.94,
-        "OUTPUT_HI+15": -0.025,
+        "OUTPUT_HI_THIS_STEP+0": 0.94,
+        "OUTPUT_HI_THIS_STEP+15": -0.025,
     })
 
     assert out["OUTPUT_LO+15"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(50.0)
     for lane in range(15):
         assert out.get(f"OUTPUT_LO+{lane}", 0.0) == pytest.approx(0.0)
-        assert out.get(f"OUTPUT_HI+{lane}", 0.0) == pytest.approx(0.0)
+        assert out.get(f"OUTPUT_HI_THIS_STEP+{lane}", 0.0) == pytest.approx(0.0)
 
 
 def test_tail_sp_byte1_ff_from_initial_stack_requires_prior_f8_byte():
@@ -3467,13 +3467,13 @@ def test_tail_sp_byte1_ff_from_initial_stack_requires_prior_f8_byte():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+0": 0.94,
-        "OUTPUT_HI+0": 0.94,
+        "OUTPUT_HI_THIS_STEP+0": 0.94,
     })
 
     assert out["OUTPUT_LO+0"] == 0.94
-    assert out["OUTPUT_HI+0"] == 0.94
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 0.94
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
 
 
 def test_tail_sp_byte1_ff_from_initial_stack_reinforces_existing_ff_lane():
@@ -3487,11 +3487,11 @@ def test_tail_sp_byte1_ff_from_initial_stack_reinforces_existing_ff_lane():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+15": 1.0,
         "OUTPUT_LO+15": 5.88,
-        "OUTPUT_HI+15": 5.88,
+        "OUTPUT_HI_THIS_STEP+15": 5.88,
     })
 
     assert out["OUTPUT_LO+15"] == pytest.approx(50.0)
-    assert out["OUTPUT_HI+15"] == pytest.approx(50.0)
+    assert out["OUTPUT_HI_THIS_STEP+15"] == pytest.approx(50.0)
 
 
 def test_tail_sp_store_pop_byte1_zero_blocks_stored_value_high_byte():
@@ -3505,15 +3505,15 @@ def test_tail_sp_store_pop_byte1_zero_blocks_stored_value_high_byte():
         "CMP+3": 4.0,
         "MEM_STORE": 1.2824475765228271,
         "OUTPUT_LO+0": 2.703033924102783,
-        "OUTPUT_HI+0": 2.703033924102783,
+        "OUTPUT_HI_THIS_STEP+0": 2.703033924102783,
         "OUTPUT_LO+2": 2.9000067710876465,
-        "OUTPUT_HI+1": 2.9000067710876465,
+        "OUTPUT_HI_THIS_STEP+1": 2.9000067710876465,
     })
 
     assert out["OUTPUT_LO+0"] > 1000.0
-    assert out["OUTPUT_HI+0"] > 1000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 1000.0
     assert out["OUTPUT_LO+2"] < -1000.0
-    assert out["OUTPUT_HI+1"] < -1000.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] < -1000.0
 
 
 def test_tail_sp_store_pop_byte1_zero_requires_store_pop_signal():
@@ -3526,11 +3526,11 @@ def test_tail_sp_store_pop_byte1_zero_requires_store_pop_signal():
         "BYTE_INDEX_0": 1.0,
         "MEM_STORE": 1.3,
         "OUTPUT_LO+2": 2.9,
-        "OUTPUT_HI+1": 2.9,
+        "OUTPUT_HI_THIS_STEP+1": 2.9,
     })
 
     assert out["OUTPUT_LO+2"] == 2.9
-    assert out["OUTPUT_HI+1"] == 2.9
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 2.9
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -3547,15 +3547,15 @@ def test_tail_sp_store_pop_byte1_zero_blocks_stack_source_store():
         "MEM_STORE": 1.2824475765228271,
         "MEM_ADDR_SRC": 1.2824475765228271,
         "OUTPUT_LO+0": 5.599205493927002,
-        "OUTPUT_HI+0": 5.599205493927002,
+        "OUTPUT_HI_THIS_STEP+0": 5.599205493927002,
         "OUTPUT_LO+15": 4.121987196015198e-09,
-        "OUTPUT_HI+15": 4.121987196015198e-09,
+        "OUTPUT_HI_THIS_STEP+15": 4.121987196015198e-09,
     })
 
     assert out["OUTPUT_LO+0"] == 5.599205493927002
-    assert out["OUTPUT_HI+0"] == 5.599205493927002
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 5.599205493927002
     assert out["OUTPUT_LO+15"] == 4.121987196015198e-09
-    assert out["OUTPUT_HI+15"] == 4.121987196015198e-09
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 4.121987196015198e-09
 
 
 def test_tail_sp_store_pop_byte1_zero_blocks_ax_add_byte1_row():
@@ -3571,12 +3571,12 @@ def test_tail_sp_store_pop_byte1_zero_blocks_ax_add_byte1_row():
         "MEM_STORE": 1.5,
         "OUTPUT_LO+0": -9117.0,
         "OUTPUT_LO+1": 9128.9,
-        "OUTPUT_HI+0": -8.65e10,
-        "OUTPUT_HI+1": 1.15e10,
+        "OUTPUT_HI_THIS_STEP+0": -8.65e10,
+        "OUTPUT_HI_THIS_STEP+1": 1.15e10,
     })
 
     assert out["OUTPUT_LO+1"] == pytest.approx(9128.9)
-    assert out["OUTPUT_HI+1"] == pytest.approx(1.15e10)
+    assert out["OUTPUT_HI_THIS_STEP+1"] == pytest.approx(1.15e10)
     assert out["OUTPUT_LO+0"] == pytest.approx(-9117.0)
 
 
@@ -3593,14 +3593,14 @@ def test_tail_sp_store_pop_byte1_zero_blocks_ax_sub_borrow_residue():
         "CMP+3": 0.008,
         "OUTPUT_LO+0": -1.47e22,
         "OUTPUT_LO+2": -1.85e18,
-        "OUTPUT_HI+0": -1.81e27,
-        "OUTPUT_HI+1": 1.89e26,
+        "OUTPUT_HI_THIS_STEP+0": -1.81e27,
+        "OUTPUT_HI_THIS_STEP+1": 1.89e26,
     })
 
     assert out["OUTPUT_LO+0"] == pytest.approx(-1.47e22)
     assert out["OUTPUT_LO+2"] == pytest.approx(-1.85e18)
-    assert out["OUTPUT_HI+0"] == pytest.approx(-1.81e27)
-    assert out["OUTPUT_HI+1"] == pytest.approx(1.89e26)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(-1.81e27)
+    assert out["OUTPUT_HI_THIS_STEP+1"] == pytest.approx(1.89e26)
 
 
 @pytest.mark.parametrize(
@@ -3626,13 +3626,13 @@ def test_tail_exact_rules_block_bp_byte3_span(prefix):
         "BYTE_INDEX_2": 0.9701374769210815,
         "BYTE_INDEX_3": 0.013297064229846,
         "OUTPUT_LO+0": 0.9402737021446228,
-        "OUTPUT_HI+0": 7_639_167.5,
+        "OUTPUT_HI_THIS_STEP+0": 7_639_167.5,
     })
 
     assert out["OUTPUT_LO+0"] == 0.9402737021446228
-    assert out["OUTPUT_HI+0"] == 7_639_167.5
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 7_639_167.5
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+1", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+1", 0.0) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -3656,13 +3656,13 @@ def test_tail_mem_store_addr0_exact_blocks_register_byte_span_residue(name):
         "ALU_LO+2": -35.0,
         "ALU_LO+14": -35.0,
         "OUTPUT_LO+0": 0.94,
-        "OUTPUT_HI+0": 0.94,
+        "OUTPUT_HI_THIS_STEP+0": 0.94,
     })
 
     assert out["OUTPUT_LO+0"] == 0.94
-    assert out["OUTPUT_HI+0"] == 0.94
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 0.94
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -3689,15 +3689,15 @@ def test_tail_mem_store_addr0_band_exact_blocks_sp_byte_span_residue(prefix):
         "ALU_LO+10": -35.0,
         "ALU_LO+14": -35.0,
         "OUTPUT_LO+0": 0.94,
-        "OUTPUT_HI+0": 0.94,
-        "OUTPUT_HI+15": -0.025,
+        "OUTPUT_HI_THIS_STEP+0": 0.94,
+        "OUTPUT_HI_THIS_STEP+15": -0.025,
     })
 
     assert out["OUTPUT_LO+0"] == 0.94
-    assert out["OUTPUT_HI+0"] == 0.94
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 0.94
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == -0.025
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == -0.025
 
 
 def test_tail_mem_store_addr0_rules_block_step_start_transition():
@@ -3718,11 +3718,11 @@ def test_tail_mem_store_addr0_rules_block_step_start_transition():
             "OUTPUT_LO+8": 1000.0,
             "OUTPUT_LO+14": -1000.0,
             "ALU_LO+14": 0.0,
-            "OUTPUT_HI+15": 1000.0,
+            "OUTPUT_HI_THIS_STEP+15": 1000.0,
         })
 
         assert out["OUTPUT_LO+8"] == 1000.0
-        assert out["OUTPUT_HI+15"] == 1000.0
+        assert out["OUTPUT_HI_THIS_STEP+15"] == 1000.0
 
 
 def test_tail_stack0_pop_reveals_saved_addr_e8_after_d8_pop():
@@ -3739,9 +3739,9 @@ def test_tail_stack0_pop_reveals_saved_addr_e8_after_d8_pop():
     })
 
     assert out["OUTPUT_LO+8"] > 0.0
-    assert out["OUTPUT_HI+14"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] > 0.0
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_tail_stack0_pop_reveals_saved_addr_e8_from_e0_addr():
@@ -3761,9 +3761,9 @@ def test_tail_stack0_pop_reveals_saved_addr_e8_from_e0_addr():
     })
 
     assert out["OUTPUT_LO+8"] > 0.0
-    assert out["OUTPUT_HI+14"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] > 0.0
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_tail_stack0_pop_reveals_saved_addr_e8_blocks_d0_pop():
@@ -3778,7 +3778,7 @@ def test_tail_stack0_pop_reveals_saved_addr_e8_blocks_d0_pop():
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_tail_stack0_pop_reveals_saved_addr_e8_requires_pop_signal():
@@ -3792,7 +3792,7 @@ def test_tail_stack0_pop_reveals_saved_addr_e8_requires_pop_signal():
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_tail_stack0_pop_reveals_saved_addr_e8_blocks_ent_frame_marker():
@@ -3809,7 +3809,7 @@ def test_tail_stack0_pop_reveals_saved_addr_e8_blocks_ent_frame_marker():
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_tail_stack0_store_correction_is_owned_by_attention_route():
@@ -3834,13 +3834,13 @@ def test_tail_stack0_store_non_top_zero_blocks_local_store_value():
         "ADDR_B0_LO+8": 1.0,
         "ADDR_B0_HI+13": 1.0,
         "OUTPUT_LO+5": 3.0,
-        "OUTPUT_HI+1": 3.0,
+        "OUTPUT_HI_THIS_STEP+1": 3.0,
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
     assert out["OUTPUT_LO+5"] < 3.0
-    assert out["OUTPUT_HI+1"] < 3.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] < 3.0
 
 
 def test_tail_stack0_store_non_top_zero_preserves_strong_loaded_stack_value():
@@ -3858,11 +3858,11 @@ def test_tail_stack0_store_non_top_zero_preserves_strong_loaded_stack_value():
         "ADDR_B0_LO+8": 1.0,
         "ADDR_B0_HI+13": 1.0,
         "OUTPUT_LO+1": 40.0,
-        "OUTPUT_HI+0": 40.0,
+        "OUTPUT_HI_THIS_STEP+0": 40.0,
     })
 
     assert out["OUTPUT_LO+1"] > 40.0
-    assert out["OUTPUT_HI+0"] > 40.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 40.0
     assert out["OUTPUT_LO+0"] < 0.0
 
 
@@ -3874,11 +3874,11 @@ def test_tail_stack0_store_loaded_blocks_byte_rows_with_large_residue():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+1": 2_000_000_000.0,
-        "OUTPUT_HI+0": 2_000_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 2_000_000_000.0,
     })
 
     assert out["OUTPUT_LO+1"] == 2_000_000_000.0
-    assert out["OUTPUT_HI+0"] == 2_000_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2_000_000_000.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -3890,11 +3890,11 @@ def test_tail_stack0_store_loaded_blocks_bp_byte_span_residue():
         "H1+3": 1.0,
         "BYTE_INDEX_2": 0.97,
         "OUTPUT_LO+2": 8_000_000.0,
-        "OUTPUT_HI+0": 8_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 8_000_000.0,
     })
 
     assert out["OUTPUT_LO+2"] == 8_000_000.0
-    assert out["OUTPUT_HI+0"] == 8_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 8_000_000.0
 
 
 def test_tail_sp_pop_byte3_zero_blocks_ax_byte_span_with_large_residue():
@@ -3907,11 +3907,11 @@ def test_tail_sp_pop_byte3_zero_blocks_ax_byte_span_with_large_residue():
         "BYTE_INDEX_0": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 2_000_000_000.0,
-        "OUTPUT_HI+0": 2_000_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 2_000_000_000.0,
     })
 
     assert out["OUTPUT_LO+0"] == 2_000_000_000.0
-    assert out["OUTPUT_HI+0"] == 2_000_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2_000_000_000.0
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -3928,12 +3928,12 @@ def test_tail_stack0_store_non_top_zero_allows_postpop_e8_top_store():
         "ADDR_B0_LO+8": 1.0,
         "ADDR_B0_HI+14": 1.0,
         "OUTPUT_LO+2": 3.0,
-        "OUTPUT_HI+3": 3.0,
+        "OUTPUT_HI_THIS_STEP+3": 3.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
     assert out["OUTPUT_LO+2"] == 3.0
-    assert out["OUTPUT_HI+3"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+3"] == 3.0
 
 
 def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_local_store():
@@ -3949,13 +3949,13 @@ def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_local_store():
         "ADDR_B0_LO+0": 1.0,
         "ADDR_B0_HI+14": 1.0,
         "OUTPUT_LO+5": 3.0,
-        "OUTPUT_HI+1": 3.0,
+        "OUTPUT_HI_THIS_STEP+1": 3.0,
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
     assert out["OUTPUT_LO+5"] < 3.0
-    assert out["OUTPUT_HI+1"] < 3.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] < 3.0
 
 
 def test_tail_stack0_store_non_top_zero_e8_from_e0_preserves_loaded_stack_value():
@@ -3973,11 +3973,11 @@ def test_tail_stack0_store_non_top_zero_e8_from_e0_preserves_loaded_stack_value(
         "ADDR_B0_LO+0": 1.0,
         "ADDR_B0_HI+14": 1.0,
         "OUTPUT_LO+1": 40.0,
-        "OUTPUT_HI+0": 40.0,
+        "OUTPUT_HI_THIS_STEP+0": 40.0,
     })
 
     assert out["OUTPUT_LO+1"] > 40.0
-    assert out["OUTPUT_HI+0"] > 40.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 40.0
     assert out["OUTPUT_LO+0"] < 0.0
 
 
@@ -3994,11 +3994,11 @@ def test_tail_stack0_store_non_top_zero_e8_from_e0_requires_store_signal():
         "ADDR_B0_HI+14": -2.0,
         "ADDR_B0_LO+8": -1.0,
         "OUTPUT_LO+0": 3.0,
-        "OUTPUT_HI+14": 3.0,
+        "OUTPUT_HI_THIS_STEP+14": 3.0,
     })
 
     assert out["OUTPUT_LO+0"] == 3.0
-    assert out["OUTPUT_HI+14"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 3.0
 
 
 def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_byte_rows():
@@ -4010,11 +4010,11 @@ def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_byte_rows():
         "EMBED_LO+8": 1.0,
         "EMBED_HI+15": 1.0,
         "OUTPUT_LO+15": 3.0,
-        "OUTPUT_HI+15": 3.0,
+        "OUTPUT_HI_THIS_STEP+15": 3.0,
     })
 
     assert out["OUTPUT_LO+15"] == 3.0
-    assert out["OUTPUT_HI+15"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 3.0
 
 
 def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_mem_marker_rows():
@@ -4024,11 +4024,11 @@ def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_mem_marker_rows():
         "MARK_MEM": 1.0,
         "MEM_STORE": 2.0,
         "OUTPUT_LO+8": 3.0,
-        "OUTPUT_HI+15": 3.0,
+        "OUTPUT_HI_THIS_STEP+15": 3.0,
     })
 
     assert out["OUTPUT_LO+8"] == 3.0
-    assert out["OUTPUT_HI+15"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 3.0
 
 
 def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_stack_source_store():
@@ -4046,13 +4046,13 @@ def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_stack_source_store():
         "ADDR_B0_HI+14": 1.0,
         "ADDR_B0_LO+8": -1.0,
         "OUTPUT_LO+15": 3.0000078678131104,
-        "OUTPUT_HI+2": 3.0,
+        "OUTPUT_HI_THIS_STEP+2": 3.0,
     })
 
     assert out["OUTPUT_LO+15"] == 3.0000078678131104
-    assert out["OUTPUT_HI+2"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+2"] == 3.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_stack0_store_non_top_zero_allows_top_store_value():
@@ -4066,12 +4066,12 @@ def test_tail_stack0_store_non_top_zero_allows_top_store_value():
         "EMBED_LO+0": 1.0,
         "EMBED_HI+14": 1.0,
         "OUTPUT_LO+12": 3.0,
-        "OUTPUT_HI+1": 3.0,
+        "OUTPUT_HI_THIS_STEP+1": 3.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
     assert out["OUTPUT_LO+12"] == 3.0
-    assert out["OUTPUT_HI+1"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 3.0
 
 
 def test_tail_stack0_store_non_top_zero_blocks_e0_top_signature():
@@ -4088,12 +4088,12 @@ def test_tail_stack0_store_non_top_zero_blocks_e0_top_signature():
         "ADDR_B0_LO+8": 1.0,
         "ADDR_B0_HI+13": 1.0,
         "OUTPUT_LO+5": 3.0,
-        "OUTPUT_HI+1": 3.0,
+        "OUTPUT_HI_THIS_STEP+1": 3.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
     assert out["OUTPUT_LO+5"] == 3.0
-    assert out["OUTPUT_HI+1"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 3.0
 
 
 def test_tail_stack0_store_non_top_zero_e0_blocks_middle_local_store():
@@ -4107,11 +4107,11 @@ def test_tail_stack0_store_non_top_zero_e0_blocks_middle_local_store():
         "EMBED_LO+0": 1.0,
         "EMBED_HI+14": 1.0,
         "OUTPUT_LO+6": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+0"] > 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 3.0
     assert out["OUTPUT_LO+6"] < 3.0
 
 
@@ -4128,11 +4128,11 @@ def test_tail_stack0_store_non_top_zero_e0_preserves_loaded_stack_value():
         "EMBED_LO+0": 1.0,
         "EMBED_HI+14": 1.0,
         "OUTPUT_LO+1": 40.0,
-        "OUTPUT_HI+0": 40.0,
+        "OUTPUT_HI_THIS_STEP+0": 40.0,
     })
 
     assert out["OUTPUT_LO+1"] > 40.0
-    assert out["OUTPUT_HI+0"] > 40.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 40.0
     assert out["OUTPUT_LO+0"] < 0.0
 
 
@@ -4148,11 +4148,11 @@ def test_tail_stack0_store_non_top_zero_e0_blocks_byte_rows():
         "EMBED_LO+0": 1.0,
         "EMBED_HI+14": 1.0,
         "OUTPUT_LO+6": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+6"] == 3.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
 
 
 def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_e0_top_signature():
@@ -4169,12 +4169,12 @@ def test_tail_stack0_store_non_top_zero_e8_from_e0_blocks_e0_top_signature():
         "ADDR_B0_LO+0": 1.0,
         "ADDR_B0_HI+14": 1.0,
         "OUTPUT_LO+5": 3.0,
-        "OUTPUT_HI+1": 3.0,
+        "OUTPUT_HI_THIS_STEP+1": 3.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
     assert out["OUTPUT_LO+5"] == 3.0
-    assert out["OUTPUT_HI+1"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 3.0
 
 
 def test_tail_stack0_store_top_e0_restores_staged_nonzero_value():
@@ -4192,11 +4192,11 @@ def test_tail_stack0_store_top_e0_restores_staged_nonzero_value():
         "ALU_LO+1": 1.0,
         "ALU_HI+0": 7.0,
         "OUTPUT_LO+1": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+1"] > 3.0
-    assert out["OUTPUT_HI+0"] > 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 3.0
     assert out["OUTPUT_LO+0"] < 0.0
 
 
@@ -4213,11 +4213,11 @@ def test_tail_stack0_store_top_e0_requires_strong_e0_store_address():
         "ALU_LO+2": 1.0,
         "ALU_HI+0": 7.0,
         "OUTPUT_LO+2": 3.0,
-        "OUTPUT_HI+0": 43.0,
+        "OUTPUT_HI_THIS_STEP+0": 43.0,
     })
 
     assert out["OUTPUT_LO+2"] == 3.0
-    assert out["OUTPUT_HI+0"] == 43.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 43.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -4231,11 +4231,11 @@ def test_tail_stack0_pop_loaded_blocks_large_ax_byte_residue():
         "BYTE_INDEX_0": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+9": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+9"] == 1_000_000.0
-    assert out["OUTPUT_HI+0"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -4248,13 +4248,13 @@ def test_tail_stack0_pop_loaded_blocks_store_row_residue():
         "CMP+3": 4.0,
         "MEM_STORE": 0.40725404024124146,
         "OUTPUT_LO+9": 334.4128723144531,
-        "OUTPUT_HI+3": 518.2252197265625,
+        "OUTPUT_HI_THIS_STEP+3": 518.2252197265625,
     })
 
     assert out["OUTPUT_LO+9"] == 334.4128723144531
-    assert out["OUTPUT_HI+3"] == 518.2252197265625
+    assert out["OUTPUT_HI_THIS_STEP+3"] == 518.2252197265625
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_stack0_pop_loaded_blocks_bp_byte_span_residue():
@@ -4265,11 +4265,11 @@ def test_tail_stack0_pop_loaded_blocks_bp_byte_span_residue():
         "H1+3": 1.0,
         "BYTE_INDEX_2": 0.97,
         "OUTPUT_LO+2": 8_000_000.0,
-        "OUTPUT_HI+0": 8_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 8_000_000.0,
     })
 
     assert out["OUTPUT_LO+2"] == 8_000_000.0
-    assert out["OUTPUT_HI+0"] == 8_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 8_000_000.0
 
 
 def test_tail_stack0_store_top_e0_blocks_large_ax_byte_residue():
@@ -4286,11 +4286,11 @@ def test_tail_stack0_store_top_e0_blocks_large_ax_byte_residue():
         "ALU_LO+1": 1.0,
         "ALU_HI+0": 7.0,
         "OUTPUT_LO+1": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+1"] == 1_000_000.0
-    assert out["OUTPUT_HI+0"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000.0
 
 
 def test_tail_stack0_store_top_e0_does_not_restore_stale_e0_address():
@@ -4317,13 +4317,13 @@ def test_tail_stack0_store_top_e8_from_e0_restores_current_store_value():
         "ADDR_B0_HI+14": 1.97,
         "H1+3": 0.003357573179528117,
         "OUTPUT_LO+14": 3.0,
-        "OUTPUT_HI+13": 3.0,
+        "OUTPUT_HI_THIS_STEP+13": 3.0,
     })
 
     assert out["OUTPUT_LO+14"] > 3.0
-    assert out["OUTPUT_HI+13"] > 3.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] > 3.0
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_tail_stack0_store_top_e8_from_e0_restores_39_from_e8_addr():
@@ -4345,15 +4345,15 @@ def test_tail_stack0_store_top_e8_from_e0_restores_39_from_e8_addr():
         "ADDR_B0_LO+8": 1.990378737449646,
         "ADDR_B0_HI+14": 0.9730035066604614,
         "OUTPUT_LO+0": 1128.9244384765625,
-        "OUTPUT_HI+0": 1095.1925048828125,
+        "OUTPUT_HI_THIS_STEP+0": 1095.1925048828125,
         "OUTPUT_LO+9": 334.4128723144531,
-        "OUTPUT_HI+3": 518.2252197265625,
+        "OUTPUT_HI_THIS_STEP+3": 518.2252197265625,
     })
 
     assert out["OUTPUT_LO+9"] > 334.4128723144531
-    assert out["OUTPUT_HI+3"] > 518.2252197265625
+    assert out["OUTPUT_HI_THIS_STEP+3"] > 518.2252197265625
     assert out["OUTPUT_LO+0"] < 1128.9244384765625
-    assert out["OUTPUT_HI+0"] < 1095.1925048828125
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 1095.1925048828125
 
 
 def test_tail_stack0_store_top_e8_from_e0_ignores_initial_stack0_value():
@@ -4365,17 +4365,17 @@ def test_tail_stack0_store_top_e8_from_e0_ignores_initial_stack0_value():
         "ADDR_B0_LO+8": 1.0000001192092896,
         "ADDR_B0_HI+15": 1.0000003576278687,
         "OUTPUT_LO+10": 507625.5625,
-        "OUTPUT_HI+0": 507625.5625,
+        "OUTPUT_HI_THIS_STEP+0": 507625.5625,
     }
     for i in range(16):
         state.setdefault(f"OUTPUT_LO+{i}", -507622.5625)
-        state.setdefault(f"OUTPUT_HI+{i}", -507622.5625)
+        state.setdefault(f"OUTPUT_HI_THIS_STEP+{i}", -507622.5625)
 
     out = ir.symbolic_ffn(state)
 
     assert out["OUTPUT_LO+10"] == 507625.5625
-    assert out["OUTPUT_HI+0"] == 507625.5625
-    assert out["OUTPUT_HI+1"] == -507622.5625
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 507625.5625
+    assert out["OUTPUT_HI_THIS_STEP+1"] == -507622.5625
 
 
 def test_tail_stack0_store_top_e8_from_e0_39_requires_low9_evidence():
@@ -4394,11 +4394,11 @@ def test_tail_stack0_store_top_e8_from_e0_39_requires_low9_evidence():
         "MEM_ADDR_SRC": 1.2841345778724644e-05,
         "OUTPUT_LO+2": 4058.505859375,
         "OUTPUT_LO+9": 3.938452982597199e-18,
-        "OUTPUT_HI+3": 4058.5029296875,
+        "OUTPUT_HI_THIS_STEP+3": 4058.5029296875,
     })
 
     assert out["OUTPUT_LO+2"] == 4058.505859375
-    assert out["OUTPUT_HI+3"] == 4058.5029296875
+    assert out["OUTPUT_HI_THIS_STEP+3"] == 4058.5029296875
     assert out.get("OUTPUT_LO+9", 0.0) == 3.938452982597199e-18
 
 
@@ -4415,13 +4415,13 @@ def test_tail_stack0_store_top_e8_from_e0_requires_l15_top_signature():
         "ADDR_B0_LO+0": 7.442606449127197,
         "ADDR_B0_HI+14": 4.009108066558838,
         "OUTPUT_LO+14": 3.0,
-        "OUTPUT_HI+13": 3.0,
+        "OUTPUT_HI_THIS_STEP+13": 3.0,
     })
 
     assert out["OUTPUT_LO+14"] == 3.0
-    assert out["OUTPUT_HI+13"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] == 3.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_stack0_store_top_e8_from_e0_blocks_byte_rows():
@@ -4439,13 +4439,13 @@ def test_tail_stack0_store_top_e8_from_e0_blocks_byte_rows():
         "IS_BYTE": 1.0,
         "H1+3": 1.0,
         "OUTPUT_LO+14": 3.0,
-        "OUTPUT_HI+13": 3.0,
+        "OUTPUT_HI_THIS_STEP+13": 3.0,
     })
 
     assert out["OUTPUT_LO+14"] == 3.0
-    assert out["OUTPUT_HI+13"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] == 3.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_stack0_store_top_e8_from_e0_requires_positive_address_signature():
@@ -4461,12 +4461,12 @@ def test_tail_stack0_store_top_e8_from_e0_requires_positive_address_signature():
         "ADDR_B0_HI+0": -0.5151978731155396,
         "H1+3": 0.003357573179528117,
         "OUTPUT_LO+0": 14.835540771484375,
-        "OUTPUT_HI+3": 4.382873726171965e-07,
+        "OUTPUT_HI_THIS_STEP+3": 4.382873726171965e-07,
     })
 
     assert out["OUTPUT_LO+0"] == 14.835540771484375
-    assert out["OUTPUT_HI+3"] == 4.382873726171965e-07
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out["OUTPUT_HI_THIS_STEP+3"] == 4.382873726171965e-07
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_stack0_store_top_e8_from_e0_requires_store_signal():
@@ -4481,11 +4481,11 @@ def test_tail_stack0_store_top_e8_from_e0_requires_store_signal():
         "ADDR_B0_LO+0": 7.975916,
         "ADDR_B0_HI+0": 7.975923,
         "OUTPUT_LO+0": 1.980587,
-        "OUTPUT_HI+0": 1.982908,
+        "OUTPUT_HI_THIS_STEP+0": 1.982908,
     })
 
     assert out["OUTPUT_LO+0"] == 1.980587
-    assert out["OUTPUT_HI+0"] == 1.982908
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1.982908
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
 
 
@@ -4501,15 +4501,15 @@ def test_tail_stack0_store_loaded_byte11_blocks_bp_byte3_zero_row():
         "MEM_STORE": 4.0,
         "MARK_STACK0": 1.0,
         "OUTPUT_LO+0": 8_000_000.0,
-        "OUTPUT_HI+0": 8_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 8_000_000.0,
         "OUTPUT_LO+1": 8_000_000.0,
-        "OUTPUT_HI+1": 8_000_000.0,
+        "OUTPUT_HI_THIS_STEP+1": 8_000_000.0,
     })
 
     assert out["OUTPUT_LO+0"] == 8_000_000.0
-    assert out["OUTPUT_HI+0"] == 8_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 8_000_000.0
     assert out["OUTPUT_LO+1"] == 8_000_000.0
-    assert out["OUTPUT_HI+1"] == 8_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 8_000_000.0
 
 
 def test_tail_stack0_store_loaded_byte11_still_fires_on_stack0_marker():
@@ -4521,13 +4521,13 @@ def test_tail_stack0_store_loaded_byte11_still_fires_on_stack0_marker():
         "MEM_STORE": 4.0,
         "MARK_STACK0": 1.0,
         "OUTPUT_LO+1": 8_000_000.0,
-        "OUTPUT_HI+1": 8_000_000.0,
+        "OUTPUT_HI_THIS_STEP+1": 8_000_000.0,
     })
 
     assert out["OUTPUT_LO+1"] > 8_000_000.0
-    assert out["OUTPUT_HI+1"] > 8_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] > 8_000_000.0
     assert out.get("OUTPUT_LO+0", 0.0) < 0.0
-    assert out.get("OUTPUT_HI+0", 0.0) < 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) < 0.0
 
 
 def test_tail_stack0_store_top_value_2f_from_alu_stays_inactive():
@@ -4544,11 +4544,11 @@ def test_tail_pop_mem_marker_zero_blocks_byte_rows():
         "CMP+3": 1.0,
         "IS_BYTE": 1.0,
         "OUTPUT_LO+6": 2.0,
-        "OUTPUT_HI+7": 2.0,
+        "OUTPUT_HI_THIS_STEP+7": 2.0,
     })
 
     assert out["OUTPUT_LO+6"] == 2.0
-    assert out["OUTPUT_HI+7"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+7"] == 2.0
 
 
 def test_tail_pop_mem_marker_zero_blocks_sp_marker_rows():
@@ -4560,11 +4560,11 @@ def test_tail_pop_mem_marker_zero_blocks_sp_marker_rows():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+8": 2.0,
-        "OUTPUT_HI+14": 2.0,
+        "OUTPUT_HI_THIS_STEP+14": 2.0,
     })
 
     assert out["OUTPUT_LO+8"] == 2.0
-    assert out["OUTPUT_HI+14"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 2.0
 
 
 def test_tail_sp_pop_marker_increments_staged_sp_byte():
@@ -4576,11 +4576,11 @@ def test_tail_sp_pop_marker_increments_staged_sp_byte():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 2.8,
-        "OUTPUT_HI+14": 1.0,
+        "OUTPUT_HI_THIS_STEP+14": 1.0,
     })
 
     assert out["OUTPUT_LO+8"] > 0.0
-    assert out["OUTPUT_HI+14"] > 1.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] > 1.0
 
 
 def test_tail_sp_pop_marker_increment_blocks_non_sp_markers():
@@ -4591,11 +4591,11 @@ def test_tail_sp_pop_marker_increment_blocks_non_sp_markers():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 2.8,
-        "OUTPUT_HI+14": 1.0,
+        "OUTPUT_HI_THIS_STEP+14": 1.0,
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out["OUTPUT_HI+14"] == 1.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 1.0
 
 
 def test_tail_sp_pop_marker_increment_blocks_ent_frames():
@@ -4608,7 +4608,7 @@ def test_tail_sp_pop_marker_increment_blocks_ent_frames():
         "CMP+3": 4.0,
         "OP_ENT": 1.0,
         "OUTPUT_LO+0": 4000.0,
-        "OUTPUT_HI+14": 4000.0,
+        "OUTPUT_HI_THIS_STEP+14": 4000.0,
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
@@ -4625,7 +4625,7 @@ def test_tail_sp_pop_marker_increment_blocks_store_steps():
         "OP_SI": 1.0,
         "MEM_STORE": 1.0,
         "OUTPUT_LO+0": 4000.0,
-        "OUTPUT_HI+14": 4000.0,
+        "OUTPUT_HI_THIS_STEP+14": 4000.0,
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
@@ -4640,7 +4640,7 @@ def test_tail_sp_pop_marker_increment_requires_e0_high_nibble():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 42.0,
-        "OUTPUT_HI+13": 1.0,
+        "OUTPUT_HI_THIS_STEP+13": 1.0,
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
@@ -4654,11 +4654,11 @@ def test_tail_sp_pop_marker_increment_requires_pop_flag():
         "MARK_SP": 1.0,
         "HAS_SE": 1.0,
         "OUTPUT_LO+0": 3.0,
-        "OUTPUT_HI+14": 3.0,
+        "OUTPUT_HI_THIS_STEP+14": 3.0,
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out["OUTPUT_HI+14"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 3.0
 
 
 def test_tail_sp_pop_marker_increment_blocks_d8_embed_signature():
@@ -4670,14 +4670,14 @@ def test_tail_sp_pop_marker_increment_blocks_d8_embed_signature():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 3.0,
-        "OUTPUT_HI+14": 3.0,
+        "OUTPUT_HI_THIS_STEP+14": 3.0,
         "EMBED_LO+8": 1.0,
         "EMBED_HI+13": 1.0,
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
     assert out["OUTPUT_LO+0"] == 3.0
-    assert out["OUTPUT_HI+14"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 3.0
 
 
 def test_tail_sp_pop_marker_increment_blocks_mem_store_residue():
@@ -4690,11 +4690,11 @@ def test_tail_sp_pop_marker_increment_blocks_mem_store_residue():
         "CMP+3": 4.0,
         "MEM_STORE": 0.001,
         "OUTPUT_LO+0": 3.0,
-        "OUTPUT_HI+14": 1.0,
+        "OUTPUT_HI_THIS_STEP+14": 1.0,
     })
 
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
-    assert out["OUTPUT_HI+14"] == 1.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 1.0
 
 
 def test_tail_sp_pop_marker_d8_to_e0_restores_store_pop():
@@ -4707,12 +4707,12 @@ def test_tail_sp_pop_marker_d8_to_e0_restores_store_pop():
         "EMBED_LO+8": 1.0,
         "EMBED_HI+13": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 2.0,
     })
 
     assert out["OUTPUT_LO+0"] > 2.0
-    assert out["OUTPUT_HI+14"] > 0.0
-    assert out["OUTPUT_HI+0"] < 2.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 2.0
 
 
 def test_tail_sp_pop_marker_output_d8_to_e0_restores_store_pop():
@@ -4724,15 +4724,15 @@ def test_tail_sp_pop_marker_output_d8_to_e0_restores_store_pop():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+8": 1.0,
-        "OUTPUT_HI+13": 1.0,
+        "OUTPUT_HI_THIS_STEP+13": 1.0,
         "OUTPUT_LO+0": 42.0,
-        "OUTPUT_HI+0": 42.0,
+        "OUTPUT_HI_THIS_STEP+0": 42.0,
     })
 
     assert out["OUTPUT_LO+0"] > 42.0
-    assert out["OUTPUT_HI+14"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] > 0.0
     assert out["OUTPUT_LO+8"] < 1.0
-    assert out["OUTPUT_HI+13"] < 1.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] < 1.0
 
 
 def test_tail_sp_pop_marker_output_d8_to_e0_requires_output_low_nibble():
@@ -4744,12 +4744,12 @@ def test_tail_sp_pop_marker_output_d8_to_e0_requires_output_low_nibble():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 42.0,
-        "OUTPUT_HI+13": 1.0,
-        "OUTPUT_HI+0": 42.0,
+        "OUTPUT_HI_THIS_STEP+13": 1.0,
+        "OUTPUT_HI_THIS_STEP+0": 42.0,
     })
 
     assert out["OUTPUT_LO+0"] == 42.0
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_tail_sp_pop_marker_output_d8_to_e0_requires_output_high_nibble():
@@ -4762,11 +4762,11 @@ def test_tail_sp_pop_marker_output_d8_to_e0_requires_output_high_nibble():
         "CMP+3": 4.0,
         "OUTPUT_LO+8": 1.0,
         "OUTPUT_LO+0": 42.0,
-        "OUTPUT_HI+0": 42.0,
+        "OUTPUT_HI_THIS_STEP+0": 42.0,
     })
 
     assert out["OUTPUT_LO+0"] == 42.0
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_tail_sp_pop_marker_output_d8_to_e0_blocks_f8_marker():
@@ -4778,13 +4778,13 @@ def test_tail_sp_pop_marker_output_d8_to_e0_blocks_f8_marker():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+8": 1.0,
-        "OUTPUT_HI+15": 1.0,
+        "OUTPUT_HI_THIS_STEP+15": 1.0,
         "OUTPUT_LO+0": 42.0,
-        "OUTPUT_HI+0": 42.0,
+        "OUTPUT_HI_THIS_STEP+0": 42.0,
     })
 
     assert out["OUTPUT_LO+0"] == 42.0
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_tail_sp_pop_marker_output_d8_to_e0_blocks_ax_byte_rows():
@@ -4797,15 +4797,15 @@ def test_tail_sp_pop_marker_output_d8_to_e0_blocks_ax_byte_rows():
         "HAS_SE": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+8": 1_000_000.0,
-        "OUTPUT_HI+13": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+13": 1_000_000.0,
         "OUTPUT_LO+0": 42.0,
-        "OUTPUT_HI+0": 42.0,
+        "OUTPUT_HI_THIS_STEP+0": 42.0,
     })
 
     assert out["OUTPUT_LO+0"] == 42.0
-    assert out["OUTPUT_HI+0"] == 42.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 42.0
     assert out["OUTPUT_LO+8"] == 1_000_000.0
-    assert out["OUTPUT_HI+13"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] == 1_000_000.0
 
 
 def test_tail_sp_pop_marker_d8_to_e0_requires_d8_low_nibble():
@@ -4818,11 +4818,11 @@ def test_tail_sp_pop_marker_d8_to_e0_requires_d8_low_nibble():
         "EMBED_LO+0": 1.0,
         "EMBED_HI+13": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 2.0,
     })
 
     assert out["OUTPUT_LO+0"] == 2.0
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_tail_sp_pop_marker_d0_to_d8_restores_larger_frame_pop():
@@ -4835,11 +4835,11 @@ def test_tail_sp_pop_marker_d0_to_d8_restores_larger_frame_pop():
         "EMBED_LO+0": 1.0,
         "EMBED_HI+13": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+13": 2.0,
+        "OUTPUT_HI_THIS_STEP+13": 2.0,
     })
 
     assert out["OUTPUT_LO+8"] > 0.0
-    assert out["OUTPUT_HI+13"] > 2.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] > 2.0
     assert out["OUTPUT_LO+0"] < 2.0
 
 
@@ -4854,11 +4854,11 @@ def test_tail_sp_pop_marker_d0_to_d8_blocks_d8_embed_signature():
         "EMBED_LO+8": 1.0,
         "EMBED_HI+13": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+13": 2.0,
+        "OUTPUT_HI_THIS_STEP+13": 2.0,
     })
 
     assert out["OUTPUT_LO+0"] == 2.0
-    assert out["OUTPUT_HI+13"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] == 2.0
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
 
 
@@ -4872,11 +4872,11 @@ def test_tail_sp_pop_marker_f0_to_f8_restores_larger_frame_pop():
         "EMBED_LO+0": 1.0,
         "EMBED_HI+15": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+15": 2.0,
+        "OUTPUT_HI_THIS_STEP+15": 2.0,
     })
 
     assert out["OUTPUT_LO+8"] > 0.0
-    assert out["OUTPUT_HI+15"] > 2.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 2.0
     assert out["OUTPUT_LO+0"] < 2.0
 
 
@@ -4891,11 +4891,11 @@ def test_tail_sp_pop_marker_f0_to_f8_blocks_mem_store_residue():
         "EMBED_LO+0": 1.0,
         "EMBED_HI+15": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+15": 2.0,
+        "OUTPUT_HI_THIS_STEP+15": 2.0,
     })
 
     assert out["OUTPUT_LO+0"] == 2.0
-    assert out["OUTPUT_HI+15"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 2.0
     assert out.get("OUTPUT_LO+8", 0.0) == 0.0
 
 
@@ -4911,13 +4911,13 @@ def test_tail_sp_pop_byte1_ff_after_f8_preserves_stack_high_byte():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+15": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 2.0,
     })
 
     assert out["OUTPUT_LO+15"] > 0.0
-    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
     assert out["OUTPUT_LO+0"] < 2.0
-    assert out["OUTPUT_HI+0"] < 2.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 2.0
 
 
 def test_tail_sp_pop_marker_d8_to_e0_blocks_push_rows():
@@ -4930,10 +4930,10 @@ def test_tail_sp_pop_marker_d8_to_e0_blocks_push_rows():
         "PSH_AT_SP": 1.0,
         "EMBED_LO+8": 1000.0,
         "EMBED_HI+13": 1000.0,
-        "OUTPUT_HI+13": 2.0,
+        "OUTPUT_HI_THIS_STEP+13": 2.0,
     })
 
-    assert out.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_tail_sp_pop_byte1_preserves_ff_after_e8():
@@ -4948,13 +4948,13 @@ def test_tail_sp_pop_byte1_preserves_ff_after_e8():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+2": 2.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+15"] > 0.0
-    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
     assert out["OUTPUT_LO+2"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_tail_sp_pop_byte1_preserves_ff_after_e0():
@@ -4969,13 +4969,13 @@ def test_tail_sp_pop_byte1_preserves_ff_after_e0():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+15"] > 0.0
-    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_tail_sp_pop_byte1_preserves_ff_after_d8():
@@ -4990,13 +4990,13 @@ def test_tail_sp_pop_byte1_preserves_ff_after_d8():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+13": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+15"] > 0.0
-    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_tail_sp_pop_byte3_zero_blocks_byte1_residue():
@@ -5010,15 +5010,15 @@ def test_tail_sp_pop_byte3_zero_blocks_byte1_residue():
         "BYTE_INDEX_2": 0.000001,
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 42.9,
-        "OUTPUT_HI+0": 2.9,
+        "OUTPUT_HI_THIS_STEP+0": 2.9,
         "OUTPUT_LO+15": 7.0,
-        "OUTPUT_HI+15": 7.0,
+        "OUTPUT_HI_THIS_STEP+15": 7.0,
     })
 
     assert out["OUTPUT_LO+0"] == 42.9
-    assert out["OUTPUT_HI+0"] == 2.9
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.9
     assert out["OUTPUT_LO+15"] == 7.0
-    assert out["OUTPUT_HI+15"] == 7.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 7.0
 
 
 def test_tail_sp_pop_byte3_zero_fires_on_byte3_signature():
@@ -5032,15 +5032,15 @@ def test_tail_sp_pop_byte3_zero_fires_on_byte3_signature():
         "BYTE_INDEX_3": 0.013,
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 2.9,
-        "OUTPUT_HI+0": 2.9,
+        "OUTPUT_HI_THIS_STEP+0": 2.9,
         "OUTPUT_LO+1": 7.0,
-        "OUTPUT_HI+1": 7.0,
+        "OUTPUT_HI_THIS_STEP+1": 7.0,
     })
 
     assert out["OUTPUT_LO+0"] > 2.9
-    assert out["OUTPUT_HI+0"] > 2.9
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 2.9
     assert out["OUTPUT_LO+1"] < 7.0
-    assert out["OUTPUT_HI+1"] < 7.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] < 7.0
 
 
 def test_tail_sp_pop_byte1_ff_after_e8_blocks_ax_byte_rows():
@@ -5055,13 +5055,13 @@ def test_tail_sp_pop_byte1_ff_after_e8_blocks_ax_byte_rows():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+2": 2.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
     assert out["OUTPUT_LO+2"] == 2.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
 
 
 def test_tail_sp_pop_byte1_ff_after_e8_blocks_marker_rows():
@@ -5077,13 +5077,13 @@ def test_tail_sp_pop_byte1_ff_after_e8_blocks_marker_rows():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+2": 2.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
     assert out["OUTPUT_LO+2"] == 2.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
 
 
 def test_tail_sp_pop_byte1_ff_after_e8_requires_exact_low_nibble():
@@ -5098,13 +5098,13 @@ def test_tail_sp_pop_byte1_ff_after_e8_requires_exact_low_nibble():
         "CLEAN_EMBED_LO+4": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
     assert out["OUTPUT_LO+0"] == 2.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
 
 
 def test_tail_sp_pop_byte1_ff_after_e8_blocks_stack0_byte_rows():
@@ -5120,13 +5120,13 @@ def test_tail_sp_pop_byte1_ff_after_e8_blocks_stack0_byte_rows():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
     assert out["OUTPUT_LO+0"] == 2.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
 
 
 def test_tail_stack0_pushed_addr_byte1_preserves_ff_after_e8():
@@ -5140,13 +5140,13 @@ def test_tail_stack0_pushed_addr_byte1_preserves_ff_after_e8():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+15"] > 0.0
-    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_tail_stack0_pushed_addr_byte1_blocks_e4_high_nibble_match():
@@ -5160,13 +5160,13 @@ def test_tail_stack0_pushed_addr_byte1_blocks_e4_high_nibble_match():
         "CLEAN_EMBED_LO+4": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
     assert out["OUTPUT_LO+0"] == 3.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
 
 
 def test_tail_stack0_pushed_addr_byte1_blocks_e4_with_e8_residue():
@@ -5181,13 +5181,13 @@ def test_tail_stack0_pushed_addr_byte1_blocks_e4_with_e8_residue():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
     assert out["OUTPUT_LO+0"] == 3.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
 
 
 def test_tail_stack0_pushed_addr_byte1_blocks_marker_rows():
@@ -5202,13 +5202,13 @@ def test_tail_stack0_pushed_addr_byte1_blocks_marker_rows():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
     assert out["OUTPUT_LO+0"] == 3.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
 
 
 def test_tail_stack0_pushed_addr_byte1_blocks_store_rows():
@@ -5223,13 +5223,13 @@ def test_tail_stack0_pushed_addr_byte1_blocks_store_rows():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+2": 3.0,
-        "OUTPUT_HI+0": 5.053187847137451,
+        "OUTPUT_HI_THIS_STEP+0": 5.053187847137451,
     })
 
     assert out["OUTPUT_LO+2"] == pytest.approx(3.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(5.053187847137451)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(5.053187847137451)
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
 
 
 def test_tail_stack0_pushed_addr_byte1_store_preserves_ff_after_e8():
@@ -5247,13 +5247,13 @@ def test_tail_stack0_pushed_addr_byte1_store_preserves_ff_after_e8():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 3.9468109607696533,
-        "OUTPUT_HI+0": 3.9468109607696533,
+        "OUTPUT_HI_THIS_STEP+0": 3.9468109607696533,
         "OUTPUT_LO+15": 3.0,
-        "OUTPUT_HI+15": 3.3088135719299316,
+        "OUTPUT_HI_THIS_STEP+15": 3.3088135719299316,
     })
 
     assert out["OUTPUT_LO+15"] > out["OUTPUT_LO+0"]
-    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"]
+    assert out["OUTPUT_HI_THIS_STEP+15"] > out["OUTPUT_HI_THIS_STEP+0"]
 
 
 def test_tail_stack0_pushed_addr_byte1_store_requires_ff_residue():
@@ -5271,13 +5271,13 @@ def test_tail_stack0_pushed_addr_byte1_store_requires_ff_residue():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+2": 3.0,
-        "OUTPUT_HI+0": 5.053187847137451,
+        "OUTPUT_HI_THIS_STEP+0": 5.053187847137451,
     })
 
     assert out["OUTPUT_LO+2"] == pytest.approx(3.0)
-    assert out["OUTPUT_HI+0"] == pytest.approx(5.053187847137451)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(5.053187847137451)
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
 
 
 def test_tail_stack0_pushed_addr_byte1_store_preserves_ff_after_e0():
@@ -5295,13 +5295,13 @@ def test_tail_stack0_pushed_addr_byte1_store_preserves_ff_after_e0():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 3.9468109607696533,
-        "OUTPUT_HI+0": 3.9468109607696533,
+        "OUTPUT_HI_THIS_STEP+0": 3.9468109607696533,
         "OUTPUT_LO+15": 3.0,
-        "OUTPUT_HI+15": 3.3088135719299316,
+        "OUTPUT_HI_THIS_STEP+15": 3.3088135719299316,
     })
 
     assert out["OUTPUT_LO+15"] > out["OUTPUT_LO+0"]
-    assert out["OUTPUT_HI+15"] > out["OUTPUT_HI+0"]
+    assert out["OUTPUT_HI_THIS_STEP+15"] > out["OUTPUT_HI_THIS_STEP+0"]
 
 
 def test_tail_stack0_pushed_addr_byte1_loses_to_exact_existing_byte2():
@@ -5319,11 +5319,11 @@ def test_tail_stack0_pushed_addr_byte1_loses_to_exact_existing_byte2():
         "CLEAN_EMBED_LO+8": 1.0,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+2": 3.0,
-        "OUTPUT_HI+0": 42.94681167602539,
+        "OUTPUT_HI_THIS_STEP+0": 42.94681167602539,
     })
 
     assert out["OUTPUT_LO+2"] > out.get("OUTPUT_LO+15", 0.0)
-    assert out["OUTPUT_HI+0"] > out.get("OUTPUT_HI+15", 0.0)
+    assert out["OUTPUT_HI_THIS_STEP+0"] > out.get("OUTPUT_HI_THIS_STEP+15", 0.0)
 
 
 def test_tail_ax_add_no_carry_byte1_zeros_stale_address_output():
@@ -5340,13 +5340,13 @@ def test_tail_ax_add_no_carry_byte1_zeros_stale_address_output():
         "AX_CARRY_HI+0": 4.0,
         "OUTPUT_LO+0": 12.0,
         "OUTPUT_LO+1": 12.0,
-        "OUTPUT_HI+15": 12.0,
+        "OUTPUT_HI_THIS_STEP+15": 12.0,
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
     assert out["OUTPUT_LO+1"] < 12.0
-    assert out["OUTPUT_HI+15"] < 12.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] < 12.0
 
 
 def test_tail_ax_add_no_carry_byte1_blocks_nonzero_high_byte_low_nibble():
@@ -5362,11 +5362,11 @@ def test_tail_ax_add_no_carry_byte1_blocks_nonzero_high_byte_low_nibble():
         "AX_CARRY_HI+0": 4.0,
         "ALU_LO+5": 1.0,
         "OUTPUT_LO+5": 5.0,
-        "OUTPUT_HI+0": 5.0,
+        "OUTPUT_HI_THIS_STEP+0": 5.0,
     })
 
     assert out["OUTPUT_LO+5"] == 5.0
-    assert out["OUTPUT_HI+0"] == 5.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 5.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -5383,11 +5383,11 @@ def test_tail_ax_add_no_carry_byte1_blocks_nonzero_second_operand_high_byte():
         "AX_CARRY_HI+0": 4.0,
         "AX_CARRY_LO+2": 1.0,
         "OUTPUT_LO+2": 5.0,
-        "OUTPUT_HI+0": 5.0,
+        "OUTPUT_HI_THIS_STEP+0": 5.0,
     })
 
     assert out["OUTPUT_LO+2"] == 5.0
-    assert out["OUTPUT_HI+0"] == 5.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 5.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -5404,11 +5404,11 @@ def test_tail_ax_add_no_carry_byte1_blocks_real_carry():
         "ALU_HI+0": 6.0,
         "AX_CARRY_HI+0": 4.0,
         "OUTPUT_LO+1": 12.0,
-        "OUTPUT_HI+15": 12.0,
+        "OUTPUT_HI_THIS_STEP+15": 12.0,
     })
 
     assert out["OUTPUT_LO+1"] == 12.0
-    assert out["OUTPUT_HI+15"] == 12.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 12.0
 
 
 def test_tail_ax_add_no_carry_byte1_blocks_real_carry_huge_residue():
@@ -5427,12 +5427,12 @@ def test_tail_ax_add_no_carry_byte1_blocks_real_carry_huge_residue():
         "AX_CARRY_HI+0": 3.7277987003326416,
         "OUTPUT_LO+0": 2.36312338633608e14,
         "OUTPUT_LO+3": 2.1993707531384e13,
-        "OUTPUT_HI+0": 4.041023946752e12,
+        "OUTPUT_HI_THIS_STEP+0": 4.041023946752e12,
     })
 
     assert out["OUTPUT_LO+0"] == 2.36312338633608e14
     assert out["OUTPUT_LO+3"] == 2.1993707531384e13
-    assert out["OUTPUT_HI+0"] == 4.041023946752e12
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4.041023946752e12
 
 
 def test_tail_ax_add_no_carry_byte1_blocks_sp_frame_row_residue():
@@ -5450,7 +5450,7 @@ def test_tail_ax_add_no_carry_byte1_blocks_sp_frame_row_residue():
         "ALU_HI+0": 10.0,
         "AX_CARRY_HI+0": 10.0,
         "OUTPUT_LO+8": 12.0,
-        "OUTPUT_HI+15": 13.0,
+        "OUTPUT_HI_THIS_STEP+15": 13.0,
     }
     for other in range(1, 16):
         row[f"ALU_LO+{other}"] = -100.0
@@ -5458,9 +5458,9 @@ def test_tail_ax_add_no_carry_byte1_blocks_sp_frame_row_residue():
     out = ir.symbolic_ffn(row)
 
     assert out["OUTPUT_LO+8"] == 12.0
-    assert out["OUTPUT_HI+15"] == 13.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 13.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_ax_add_no_carry_byte1_blocks_stack0_frame_row_residue():
@@ -5477,7 +5477,7 @@ def test_tail_ax_add_no_carry_byte1_blocks_stack0_frame_row_residue():
         "ALU_HI+0": 10.0,
         "AX_CARRY_HI+0": 10.0,
         "OUTPUT_LO+10": 12.0,
-        "OUTPUT_HI+0": 13.0,
+        "OUTPUT_HI_THIS_STEP+0": 13.0,
     }
     for other in range(1, 16):
         row[f"ALU_LO+{other}"] = -100.0
@@ -5485,7 +5485,7 @@ def test_tail_ax_add_no_carry_byte1_blocks_stack0_frame_row_residue():
     out = ir.symbolic_ffn(row)
 
     assert out["OUTPUT_LO+10"] == 12.0
-    assert out["OUTPUT_HI+0"] == 13.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 13.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -5504,7 +5504,7 @@ def test_tail_ax_add_no_carry_byte1_blocks_ent_mem_value_row_residue():
         "ALU_HI+0": 10.0,
         "AX_CARRY_HI+0": 10.0,
         "OUTPUT_LO+1": 12.0,
-        "OUTPUT_HI+0": 13.0,
+        "OUTPUT_HI_THIS_STEP+0": 13.0,
     }
     for other in range(1, 16):
         row[f"ALU_LO+{other}"] = -35.0
@@ -5512,7 +5512,7 @@ def test_tail_ax_add_no_carry_byte1_blocks_ent_mem_value_row_residue():
     out = ir.symbolic_ffn(row)
 
     assert out["OUTPUT_LO+1"] == 12.0
-    assert out["OUTPUT_HI+0"] == 13.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 13.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -5531,11 +5531,11 @@ def test_tail_ax_add_no_carry_byte1_blocks_weak_high_byte_source():
         "AX_CARRY_HI+0": 3.7277987003326416,
         "OUTPUT_LO+0": -4.184763431549072,
         "OUTPUT_LO+2": 7.125039100646973,
-        "OUTPUT_HI+0": 12.77362060546875,
+        "OUTPUT_HI_THIS_STEP+0": 12.77362060546875,
     })
 
     assert out["OUTPUT_LO+2"] == 7.125039100646973
-    assert out["OUTPUT_HI+0"] == 12.77362060546875
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 12.77362060546875
     assert out.get("OUTPUT_LO+0", 0.0) == -4.184763431549072
 
 
@@ -5554,11 +5554,11 @@ def test_tail_ax_add_no_carry_byte1_blocks_bitwise_relay():
         "ALU_HI+0": 10.0,
         "AX_CARRY_HI+0": 10.0,
         "OUTPUT_LO+15": 3.8,
-        "OUTPUT_HI+0": 9.5,
+        "OUTPUT_HI_THIS_STEP+0": 9.5,
     })
 
     assert out["OUTPUT_LO+15"] == 3.8
-    assert out["OUTPUT_HI+0"] == 9.5
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 9.5
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -5577,13 +5577,13 @@ def test_tail_ax_add_no_carry_byte1_blocks_sub_relay():
         "ALU_HI+0": 10.0,
         "AX_CARRY_HI+0": 10.0,
         "OUTPUT_LO+15": 7.0,
-        "OUTPUT_HI+15": 8.0,
+        "OUTPUT_HI_THIS_STEP+15": 8.0,
     })
 
     assert out["OUTPUT_LO+15"] == 7.0
-    assert out["OUTPUT_HI+15"] == 8.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 8.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_ax_add_byte1_hi_zero_repairs_stale_high_nibble():
@@ -5598,12 +5598,12 @@ def test_tail_ax_add_byte1_hi_zero_repairs_stale_high_nibble():
         "ALU_HI+0": 6.0,
         "AX_CARRY_HI+0": 4.0,
         "OUTPUT_LO+2": 10.0,
-        "OUTPUT_HI+1": 4.0,
+        "OUTPUT_HI_THIS_STEP+1": 4.0,
     })
 
     assert out["OUTPUT_LO+2"] == 10.0
-    assert out["OUTPUT_HI+0"] > 0.0
-    assert out["OUTPUT_HI+1"] < 4.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] < 4.0
 
 
 def test_tail_ax_add_byte1_hi_zero_overrides_block27_scale():
@@ -5622,12 +5622,12 @@ def test_tail_ax_add_byte1_hi_zero_overrides_block27_scale():
         "AX_CARRY_HI+0": 3.941866397857666,
         "OUTPUT_LO+0": 2000.0,
         "OUTPUT_LO+3": 3000.0,
-        "OUTPUT_HI+0": 100.0,
-        "OUTPUT_HI+1": 4000.0,
+        "OUTPUT_HI_THIS_STEP+0": 100.0,
+        "OUTPUT_HI_THIS_STEP+1": 4000.0,
     })
 
     assert out["OUTPUT_LO+3"] > out["OUTPUT_LO+0"]
-    assert out["OUTPUT_HI+0"] > out["OUTPUT_HI+1"]
+    assert out["OUTPUT_HI_THIS_STEP+0"] > out["OUTPUT_HI_THIS_STEP+1"]
 
 
 def test_tail_ax_add_byte1_hi_zero_blocks_sub_rows():
@@ -5642,11 +5642,11 @@ def test_tail_ax_add_byte1_hi_zero_blocks_sub_rows():
         "TEMP+9": 1.0,
         "ALU_HI+0": 6.0,
         "AX_CARRY_HI+0": 4.0,
-        "OUTPUT_HI+1": 4.0,
+        "OUTPUT_HI_THIS_STEP+1": 4.0,
     })
 
-    assert out["OUTPUT_HI+1"] == 4.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 4.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_ax_add_byte1_hi_zero_blocks_bp_byte_rows():
@@ -5666,12 +5666,12 @@ def test_tail_ax_add_byte1_hi_zero_blocks_bp_byte_rows():
         "ALU_HI+0": 6.0,
         "AX_CARRY_HI+0": 4.0,
         "OUTPUT_LO+11": 3.0,
-        "OUTPUT_HI+1": 4.0,
+        "OUTPUT_HI_THIS_STEP+1": 4.0,
     })
 
     assert out["OUTPUT_LO+11"] == 3.0
-    assert out["OUTPUT_HI+1"] == 4.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 0.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 4.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 0.0
 
 
 def test_tail_ax_add_byte1_hi_zero_lo_blocks_bp_frame_byte0_row():
@@ -5689,13 +5689,13 @@ def test_tail_ax_add_byte1_hi_zero_lo_blocks_bp_frame_byte0_row():
         "ALU_HI+0": 0.7190718054771423,
         "AX_CARRY_HI+0": 0.0003145717200823128,
         "OUTPUT_LO+15": 50.375244140625,
-        "OUTPUT_HI+0": -47.434967041015625,
-        "OUTPUT_HI+15": 50.375244140625,
+        "OUTPUT_HI_THIS_STEP+0": -47.434967041015625,
+        "OUTPUT_HI_THIS_STEP+15": 50.375244140625,
     })
 
     assert out["OUTPUT_LO+15"] == 50.375244140625
-    assert out["OUTPUT_HI+0"] == -47.434967041015625
-    assert out["OUTPUT_HI+15"] == 50.375244140625
+    assert out["OUTPUT_HI_THIS_STEP+0"] == -47.434967041015625
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 50.375244140625
 
 
 def test_tail_ax_add_byte1_hi_zero_lo_blocks_huge_sub_output():
@@ -5710,11 +5710,11 @@ def test_tail_ax_add_byte1_hi_zero_lo_blocks_huge_sub_output():
         "ALU_HI+0": 6.236852645874023,
         "AX_CARRY_HI+0": 3.941866397857666,
         "OUTPUT_LO+5": 1.71e18,
-        "OUTPUT_HI+0": 4.82e18,
+        "OUTPUT_HI_THIS_STEP+0": 4.82e18,
     })
 
     assert out["OUTPUT_LO+5"] == 1.71e18
-    assert out["OUTPUT_HI+0"] == 4.82e18
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4.82e18
 
 
 def test_tail_ax_sub_byte1_hi_zero_repairs_non_borrow_sub_high_residue():
@@ -5727,11 +5727,11 @@ def test_tail_ax_sub_byte1_hi_zero_repairs_non_borrow_sub_high_residue():
         "BYTE_INDEX_0": 0.9701380133628845,
         "TEMP+9": 1.0,
         "OUTPUT_LO+5": 11.52,
-        "OUTPUT_HI+0": -43.67,
-        "OUTPUT_HI+8": 4.17,
+        "OUTPUT_HI_THIS_STEP+0": -43.67,
+        "OUTPUT_HI_THIS_STEP+8": 4.17,
     })
 
-    assert out["OUTPUT_HI+0"] > out["OUTPUT_HI+8"]
+    assert out["OUTPUT_HI_THIS_STEP+0"] > out["OUTPUT_HI_THIS_STEP+8"]
     assert out["OUTPUT_LO+5"] > out.get("OUTPUT_LO+0", 0.0)
 
 
@@ -5746,12 +5746,12 @@ def test_tail_ax_sub_byte1_hi_zero_blocks_borrow_rows():
         "TEMP+9": 1.0,
         "CARRY+2": 1.0,
         "OUTPUT_LO+15": 12.0,
-        "OUTPUT_HI+15": 7.0,
-        "OUTPUT_HI+0": 8.0,
+        "OUTPUT_HI_THIS_STEP+15": 7.0,
+        "OUTPUT_HI_THIS_STEP+0": 8.0,
     })
 
-    assert out["OUTPUT_HI+15"] == 7.0
-    assert out["OUTPUT_HI+0"] == 8.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 7.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 8.0
 
 
 def test_tail_ax_sub_byte1_hi_zero_blocks_huge_underflow_borrow_residue():
@@ -5766,13 +5766,13 @@ def test_tail_ax_sub_byte1_hi_zero_blocks_huge_underflow_borrow_residue():
         "CARRY+2": 2.0,
         "CARRY+3": 9.00263e7,
         "OUTPUT_LO+8": 1.136948985422256e27,
-        "OUTPUT_HI+13": 1.2506424672545367e27,
-        "OUTPUT_HI+0": -1.81e27,
+        "OUTPUT_HI_THIS_STEP+13": 1.2506424672545367e27,
+        "OUTPUT_HI_THIS_STEP+0": -1.81e27,
     })
 
     assert out["OUTPUT_LO+8"] == pytest.approx(1.136948985422256e27)
-    assert out["OUTPUT_HI+13"] == pytest.approx(1.2506424672545367e27)
-    assert out["OUTPUT_HI+0"] == pytest.approx(-1.81e27)
+    assert out["OUTPUT_HI_THIS_STEP+13"] == pytest.approx(1.2506424672545367e27)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(-1.81e27)
 
 
 def test_tail_ax_sub_full_underflow_emits_bounded_huge_borrow_repair():
@@ -5790,14 +5790,14 @@ def test_tail_ax_sub_full_underflow_emits_bounded_huge_borrow_repair():
         "CARRY+2": 2.0,
         "OUTPUT_LO+0": -1.47e22,
         "OUTPUT_LO+8": 1.46e22,
-        "OUTPUT_HI+0": -1.81e27,
-        "OUTPUT_HI+15": 1.46e26,
+        "OUTPUT_HI_THIS_STEP+0": -1.81e27,
+        "OUTPUT_HI_THIS_STEP+15": 1.46e26,
     })
 
     assert out["OUTPUT_LO+15"] > 900_000_000.0
-    assert out["OUTPUT_HI+15"] > 900_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 900_000_000.0
     assert out["OUTPUT_LO+8"] == pytest.approx(1.46e22)
-    assert out["OUTPUT_HI+0"] == pytest.approx(-1.81e27)
+    assert out["OUTPUT_HI_THIS_STEP+0"] == pytest.approx(-1.81e27)
 
 
 def test_tail_ax_sub_byte1_hi_zero_blocks_imm_marker_residue():
@@ -5808,12 +5808,12 @@ def test_tail_ax_sub_byte1_hi_zero_blocks_imm_marker_residue():
         "H1+1": 1.0,
         "OUTPUT_LO+0": -1.34e9,
         "OUTPUT_LO+8": 1.34e9,
-        "OUTPUT_HI+0": -1.35e9,
-        "OUTPUT_HI+12": 1.35e9,
+        "OUTPUT_HI_THIS_STEP+0": -1.35e9,
+        "OUTPUT_HI_THIS_STEP+12": 1.35e9,
     })
 
     assert out["OUTPUT_LO+8"] == pytest.approx(1.34e9)
-    assert out["OUTPUT_HI+12"] == pytest.approx(1.35e9)
+    assert out["OUTPUT_HI_THIS_STEP+12"] == pytest.approx(1.35e9)
     assert out["OUTPUT_LO+0"] == pytest.approx(-1.34e9)
 
 
@@ -5828,12 +5828,12 @@ def test_tail_ax_sub_full_underflow_byte1_materializes_ff():
         "TEMP+9": 1.0,
         "CARRY+2": 2.0,
         "OUTPUT_LO+15": 12.0,
-        "OUTPUT_HI+0": 8.0,
+        "OUTPUT_HI_THIS_STEP+0": 8.0,
     })
 
     assert out["OUTPUT_LO+15"] > 12.0
-    assert out["OUTPUT_HI+15"] > 0.0
-    assert out["OUTPUT_HI+0"] < 8.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 8.0
 
 
 def test_tail_ax_sub_borrow_decrements_l15_restored_high_byte():
@@ -5849,11 +5849,11 @@ def test_tail_ax_sub_borrow_decrements_l15_restored_high_byte():
         "ALU_LO+5": 6.0,
         "OUTPUT_LO+4": -245612544.0,
         "OUTPUT_LO+5": 146251312.0,
-        "OUTPUT_HI+0": 449082016.0,
+        "OUTPUT_HI_THIS_STEP+0": 449082016.0,
     })
 
     assert out["OUTPUT_LO+4"] > out["OUTPUT_LO+5"]
-    assert out["OUTPUT_HI+0"] > 449082016.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 449082016.0
 
 
 def test_tail_ax_sub_borrow_decrement_requires_borrow_relay():
@@ -5867,11 +5867,11 @@ def test_tail_ax_sub_borrow_decrement_requires_borrow_relay():
         "TEMP+9": 1.0,
         "ALU_LO+5": 6.0,
         "OUTPUT_LO+5": 146251312.0,
-        "OUTPUT_HI+0": 449082016.0,
+        "OUTPUT_HI_THIS_STEP+0": 449082016.0,
     })
 
     assert out["OUTPUT_LO+5"] == 146251312.0
-    assert out["OUTPUT_HI+0"] == 449082016.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 449082016.0
     assert out.get("OUTPUT_LO+4", 0.0) == 0.0
 
 
@@ -5887,7 +5887,7 @@ def test_tail_ax_sub_borrow_decrement_uses_unborrowed_alu_source():
         "CARRY+2": 2.0,
         "ALU_LO+6": 6.0,
         "OUTPUT_LO+5": 1.71e18,
-        "OUTPUT_HI+0": 4.82e18,
+        "OUTPUT_HI_THIS_STEP+0": 4.82e18,
     })
 
     assert out["OUTPUT_LO+5"] == 1.71e18
@@ -5905,11 +5905,11 @@ def test_tail_sp_pop_byte3_asserts_zero():
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 2.0,
         "OUTPUT_LO+1": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+0"] > 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 3.0
     assert out["OUTPUT_LO+1"] < 0.0
 
 
@@ -5923,11 +5923,11 @@ def test_tail_sp_pop_byte3_zero_requires_staged_zero():
         "BYTE_INDEX_2": 1.0,
         "CMP+3": 4.0,
         "OUTPUT_LO+1": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
     assert out["OUTPUT_LO+1"] == 3.0
 
 
@@ -5943,11 +5943,11 @@ def test_tail_sp_pop_byte3_zero_blocks_marker_rows():
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 2.0,
         "OUTPUT_LO+1": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+0"] == 2.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
     assert out["OUTPUT_LO+1"] == 3.0
 
 
@@ -5963,11 +5963,11 @@ def test_tail_sp_pop_byte3_zero_blocks_stack0_byte_rows():
         "STACK0_BYTE0": 1.0,
         "OUTPUT_LO+0": 2.0,
         "OUTPUT_LO+1": 3.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+0"] == 2.0
-    assert out["OUTPUT_HI+0"] == 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 3.0
     assert out["OUTPUT_LO+1"] == 3.0
 
 
@@ -5983,12 +5983,12 @@ def test_tail_sp_pop_byte3_zero_blocks_ax_byte_rows():
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 10_000.0,
         "OUTPUT_LO+7": 10_000.0,
-        "OUTPUT_HI+0": 10_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 10_000.0,
     })
 
     assert out["OUTPUT_LO+0"] == 10_000.0
     assert out["OUTPUT_LO+7"] == 10_000.0
-    assert out["OUTPUT_HI+0"] == 10_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 10_000.0
 
     huge = ir.symbolic_ffn({
         "IS_BYTE": 1.0,
@@ -5999,12 +5999,12 @@ def test_tail_sp_pop_byte3_zero_blocks_ax_byte_rows():
         "CMP+3": 4.0,
         "OUTPUT_LO+0": 7.085196304539714e18,
         "OUTPUT_LO+5": 1.7100452833515274e18,
-        "OUTPUT_HI+0": 4.818260064030687e18,
+        "OUTPUT_HI_THIS_STEP+0": 4.818260064030687e18,
     })
 
     assert huge["OUTPUT_LO+0"] == 7.085196304539714e18
     assert huge["OUTPUT_LO+5"] == 1.7100452833515274e18
-    assert huge["OUTPUT_HI+0"] == 4.818260064030687e18
+    assert huge["OUTPUT_HI_THIS_STEP+0"] == 4.818260064030687e18
 
 
 def test_tail_si_ax_byte1_requires_real_mem_store_signal():
@@ -6017,11 +6017,11 @@ def test_tail_si_ax_byte1_requires_real_mem_store_signal():
         "OP_SI": 5.0,
         "MEM_STORE": 0.004,
         "OUTPUT_LO+2": 2.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 3.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 3.0
 
 
 def test_tail_si_ax_byte1_blocks_large_non_store_residue():
@@ -6033,12 +6033,12 @@ def test_tail_si_ax_byte1_blocks_large_non_store_residue():
         "BYTE_INDEX_0": 1.0,
         "OP_SI": 5.0,
         "OUTPUT_LO+2": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
         "OUTPUT_LO+0": 42.0,
     })
 
     assert out["OUTPUT_LO+0"] == 42.0
-    assert out["OUTPUT_HI+0"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000.0
 
 
 def test_tail_si_ax_byte1_blocks_byte3_residue():
@@ -6051,12 +6051,12 @@ def test_tail_si_ax_byte1_blocks_byte3_residue():
         "OP_SI": 5.0,
         "MEM_STORE": 0.001,
         "OUTPUT_LO+2": 1_000_000_000.0,
-        "OUTPUT_HI+0": 1_000_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000_000.0,
         "OUTPUT_LO+0": 42.0,
     })
 
     assert out["OUTPUT_LO+0"] == 42.0
-    assert out["OUTPUT_HI+0"] == 1_000_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000_000.0
 
 
 def test_tail_si_ax_byte1_blocks_stack0_marker_residue():
@@ -6066,14 +6066,14 @@ def test_tail_si_ax_byte1_blocks_stack0_marker_residue():
         "MARK_STACK0": 1.0,
         "MEM_STORE": 0.40725401043891907,
         "OUTPUT_LO+2": -507622.5625,
-        "OUTPUT_HI+0": 507625.5625,
-        "OUTPUT_HI+1": -507622.5625,
+        "OUTPUT_HI_THIS_STEP+0": 507625.5625,
+        "OUTPUT_HI_THIS_STEP+1": -507622.5625,
         "OUTPUT_LO+10": 507625.5625,
     })
 
     assert out["OUTPUT_LO+10"] == 507625.5625
-    assert out["OUTPUT_HI+0"] == 507625.5625
-    assert out["OUTPUT_HI+1"] == -507622.5625
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 507625.5625
+    assert out["OUTPUT_HI_THIS_STEP+1"] == -507622.5625
 
 
 def test_tail_si_ax_byte1_still_fires_for_store_signal():
@@ -6086,11 +6086,11 @@ def test_tail_si_ax_byte1_still_fires_for_store_signal():
         "OP_SI": 5.0,
         "MEM_STORE": 1.0,
         "OUTPUT_LO+2": 2.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+0"] > 3.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 3.0
 
 
 def test_tail_si_ax_byte1_blocks_lea_local_frame_row():
@@ -6103,15 +6103,15 @@ def test_tail_si_ax_byte1_blocks_lea_local_frame_row():
         "OP_LEA": 5.0,
         "MEM_STORE": 0.023,
         "OUTPUT_LO+2": 5_690_513_408.0,
-        "OUTPUT_HI+1": 5_692_803_072.0,
+        "OUTPUT_HI_THIS_STEP+1": 5_692_803_072.0,
         "OUTPUT_LO+8": 55_586.3984375,
-        "OUTPUT_HI+14": 2_290_062.0,
+        "OUTPUT_HI_THIS_STEP+14": 2_290_062.0,
     })
 
     assert out["OUTPUT_LO+8"] == 55_586.3984375
-    assert out["OUTPUT_HI+14"] == 2_290_062.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 2_290_062.0
     assert out.get("OUTPUT_LO+2", 0.0) == 5_690_513_408.0
-    assert out.get("OUTPUT_HI+1", 0.0) == 5_692_803_072.0
+    assert out.get("OUTPUT_HI_THIS_STEP+1", 0.0) == 5_692_803_072.0
 
 
 def test_tail_si_ax_byte1_blocks_mem_addr_row():
@@ -6124,15 +6124,15 @@ def test_tail_si_ax_byte1_blocks_mem_addr_row():
         "MEM_STORE": 2.0,
         "CMP+0": 2.996619701385498,
         "OUTPUT_LO+2": 54_250_434_560.0,
-        "OUTPUT_HI+1": 1_676_348_500.0,
+        "OUTPUT_HI_THIS_STEP+1": 1_676_348_500.0,
         "OUTPUT_LO+8": 1_646_635.125,
-        "OUTPUT_HI+14": 1_131_778.875,
+        "OUTPUT_HI_THIS_STEP+14": 1_131_778.875,
     })
 
     assert out["OUTPUT_LO+8"] == 1_646_635.125
-    assert out["OUTPUT_HI+14"] == 1_131_778.875
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 1_131_778.875
     assert out["OUTPUT_LO+2"] == 54_250_434_560.0
-    assert out["OUTPUT_HI+1"] == 1_676_348_500.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] == 1_676_348_500.0
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_without_temp10_gate():
@@ -6143,11 +6143,11 @@ def test_tail_wide_mul_byte1_preserve_blocks_without_temp10_gate():
         "H1+1": 1.0,
         "BYTE_INDEX_0": 1.0,
         "OUTPUT_LO+9": 40.0,
-        "OUTPUT_HI+0": 40.0,
+        "OUTPUT_HI_THIS_STEP+0": 40.0,
     })
 
     assert out["OUTPUT_LO+9"] == 40.0
-    assert out["OUTPUT_HI+0"] == 40.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 40.0
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_byte3_rows():
@@ -6159,11 +6159,11 @@ def test_tail_wide_mul_byte1_preserve_blocks_byte3_rows():
         "BYTE_INDEX_3": 1.0,
         "TEMP+10": 1.0,
         "OUTPUT_LO+9": 40.0,
-        "OUTPUT_HI+0": 40.0,
+        "OUTPUT_HI_THIS_STEP+0": 40.0,
     })
 
     assert out["OUTPUT_LO+9"] == 40.0
-    assert out["OUTPUT_HI+0"] == 40.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 40.0
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_non_ax_spans():
@@ -6177,11 +6177,11 @@ def test_tail_wide_mul_byte1_preserve_blocks_non_ax_spans():
         "BYTE_INDEX_0": 1.0,
         "TEMP+10": 1.0,
         "OUTPUT_LO+9": 40.0,
-        "OUTPUT_HI+15": 40.0,
+        "OUTPUT_HI_THIS_STEP+15": 40.0,
     })
 
     assert out["OUTPUT_LO+9"] == 40.0
-    assert out["OUTPUT_HI+15"] == 40.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 40.0
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_without_step_history():
@@ -6196,11 +6196,11 @@ def test_tail_wide_mul_byte1_preserve_blocks_without_step_history():
         "BYTE_INDEX_3": 0.0,
         "TEMP+10": 1.0,
         "OUTPUT_LO+9": 40.0,
-        "OUTPUT_HI+0": 40.0,
+        "OUTPUT_HI_THIS_STEP+0": 40.0,
     })
 
     assert out["OUTPUT_LO+9"] == 40.0
-    assert out["OUTPUT_HI+0"] == 40.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 40.0
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_ent_rows_with_temp_residue():
@@ -6213,11 +6213,11 @@ def test_tail_wide_mul_byte1_preserve_blocks_ent_rows_with_temp_residue():
         "TEMP+10": 100.0,
         "OP_ENT": 1.0,
         "OUTPUT_LO+9": 40.0,
-        "OUTPUT_HI+0": 40.0,
+        "OUTPUT_HI_THIS_STEP+0": 40.0,
     })
 
     assert out["OUTPUT_LO+9"] == 40.0
-    assert out["OUTPUT_HI+0"] == 40.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 40.0
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_add_rows_with_temp_residue():
@@ -6231,11 +6231,11 @@ def test_tail_wide_mul_byte1_preserve_blocks_add_rows_with_temp_residue():
         "TEMP+8": 1.0,
         "OP_ADD": 1.0,
         "OUTPUT_LO+9": 40.0,
-        "OUTPUT_HI+0": 40.0,
+        "OUTPUT_HI_THIS_STEP+0": 40.0,
     })
 
     assert out["OUTPUT_LO+9"] == 40.0
-    assert out["OUTPUT_HI+0"] == 40.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 40.0
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_huge_add_residue():
@@ -6249,11 +6249,11 @@ def test_tail_wide_mul_byte1_preserve_blocks_huge_add_residue():
         "TEMP+8": 1.0,
         "TEMP+10": 1.0,
         "OUTPUT_LO+4": 1_000_000_000_000_000_000.0,
-        "OUTPUT_HI+0": 1_000_000_000_000_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000_000_000_000_000.0,
     })
 
     assert out["OUTPUT_LO+4"] == 1_000_000_000_000_000_000.0
-    assert out["OUTPUT_HI+0"] == 1_000_000_000_000_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000_000_000_000_000.0
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_sub_borrow_residue():
@@ -6268,13 +6268,13 @@ def test_tail_wide_mul_byte1_preserve_blocks_sub_borrow_residue():
         "TEMP+10": 1.3010942935943604,
         "OUTPUT_LO+0": 7.085196304539714e18,
         "OUTPUT_LO+5": 1.7100452833515274e18,
-        "OUTPUT_HI+0": 4.818260064030687e18,
-        "OUTPUT_HI+15": 6.338251601425203e17,
+        "OUTPUT_HI_THIS_STEP+0": 4.818260064030687e18,
+        "OUTPUT_HI_THIS_STEP+15": 6.338251601425203e17,
     })
 
     assert out["OUTPUT_LO+0"] == 7.085196304539714e18
     assert out["OUTPUT_LO+5"] == 1.7100452833515274e18
-    assert out["OUTPUT_HI+15"] == 6.338251601425203e17
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 6.338251601425203e17
 
 
 def test_tail_wide_mul_byte1_preserve_handles_nonzero_high_nibble():
@@ -6291,11 +6291,11 @@ def test_tail_wide_mul_byte1_preserve_handles_nonzero_high_nibble():
         "TEMP+10": 1.0,
         "OP_MUL": 1.0,
         "OUTPUT_LO+9": 40.0,
-        "OUTPUT_HI+15": 40.0,
+        "OUTPUT_HI_THIS_STEP+15": 40.0,
     })
 
     assert out["OUTPUT_LO+9"] > 40.0
-    assert out["OUTPUT_HI+15"] > 40.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 40.0
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_weak_staged_byte():
@@ -6308,11 +6308,11 @@ def test_tail_wide_mul_byte1_preserve_blocks_weak_staged_byte():
         "BYTE_INDEX_0": 1.0,
         "TEMP+10": 1.0,
         "OUTPUT_LO+0": 13.0,
-        "OUTPUT_HI+0": 13.0,
+        "OUTPUT_HI_THIS_STEP+0": 13.0,
     })
 
     assert out["OUTPUT_LO+0"] == 13.0
-    assert out["OUTPUT_HI+0"] == 13.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 13.0
 
 
 def test_tail_wide_mul_byte1_preserve_still_fires_with_byte0_gate():
@@ -6326,11 +6326,11 @@ def test_tail_wide_mul_byte1_preserve_still_fires_with_byte0_gate():
         "TEMP+10": 1.0,
         "OP_MUL": 1.0,
         "OUTPUT_LO+9": 100.0,
-        "OUTPUT_HI+0": 100.0,
+        "OUTPUT_HI_THIS_STEP+0": 100.0,
     })
 
     assert out["OUTPUT_LO+9"] > 100.0
-    assert out["OUTPUT_HI+0"] > 100.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 100.0
 
 
 def test_tail_ax_add_mul_byte1_materialize_repairs_low_one():
@@ -6347,12 +6347,12 @@ def test_tail_ax_add_mul_byte1_materialize_repairs_low_one():
         "EMBED_HI+0": 1.0,
         "FETCH_HI+0": 0.3991380035877228,
         "OUTPUT_LO+0": 2.9402761459350586,
-        "OUTPUT_HI+0": 2.9402761459350586,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402761459350586,
     })
 
     assert out["OUTPUT_LO+1"] > 0.0
     assert out["OUTPUT_LO+0"] < 2.9402761459350586
-    assert out["OUTPUT_HI+0"] > 2.9402761459350586
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 2.9402761459350586
 
 
 def test_tail_ax_add_mul_byte1_materialize_repairs_low_two_from_hi2():
@@ -6371,12 +6371,12 @@ def test_tail_ax_add_mul_byte1_materialize_repairs_low_two_from_hi2():
         "EMBED_HI+2": 1.0,
         "FETCH_HI+2": 1.2207061052322388,
         "OUTPUT_LO+0": 2.9402761459350586,
-        "OUTPUT_HI+0": 2.9402761459350586,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402761459350586,
     })
 
     assert out["OUTPUT_LO+2"] > 0.0
     assert out["OUTPUT_LO+0"] < 2.9402761459350586
-    assert out["OUTPUT_HI+0"] > 2.9402761459350586
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 2.9402761459350586
 
 
 def test_tail_ax_add_mul_byte1_materialize_repairs_low_two_from_hid():
@@ -6395,12 +6395,12 @@ def test_tail_ax_add_mul_byte1_materialize_repairs_low_two_from_hid():
         "EMBED_HI+13": 1.0,
         "FETCH_HI+2": 0.9340206980705261,
         "OUTPUT_LO+0": 2.9402761459350586,
-        "OUTPUT_HI+0": 2.9402761459350586,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402761459350586,
     })
 
     assert out["OUTPUT_LO+2"] > 0.0
     assert out["OUTPUT_LO+0"] < 2.9402761459350586
-    assert out["OUTPUT_HI+0"] > 2.9402761459350586
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 2.9402761459350586
 
 
 def test_tail_ax_add_mul_byte1_materialize_requires_add_relay():
@@ -6417,11 +6417,11 @@ def test_tail_ax_add_mul_byte1_materialize_requires_add_relay():
         "EMBED_HI+2": 1.0,
         "FETCH_HI+2": 1.2207061052322388,
         "OUTPUT_LO+0": 2.9402761459350586,
-        "OUTPUT_HI+0": 2.9402761459350586,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402761459350586,
     })
 
     assert out["OUTPUT_LO+0"] == 2.9402761459350586
-    assert out["OUTPUT_HI+0"] == 2.9402761459350586
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.9402761459350586
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -6437,11 +6437,11 @@ def test_tail_ax_add_mul_byte1_materialize_blocks_zero_high_product():
         "TEMP+10": 0.9961900115013123,
         "FETCH_HI+0": 0.11243800073862076,
         "OUTPUT_LO+0": 2.9402761459350586,
-        "OUTPUT_HI+0": 2.9402761459350586,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402761459350586,
     })
 
     assert out["OUTPUT_LO+0"] == 2.9402761459350586
-    assert out["OUTPUT_HI+0"] == 2.9402761459350586
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.9402761459350586
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -6459,11 +6459,11 @@ def test_tail_ax_add_mul_byte1_materialize_blocks_plain_mul_zero_byte1():
         "EMBED_HI+0": 1.0000574588775635,
         "FETCH_HI+0": 1.332642912864685,
         "OUTPUT_LO+0": 2.9402759075164795,
-        "OUTPUT_HI+0": 2.9402759075164795,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402759075164795,
     })
 
     assert out["OUTPUT_LO+0"] == 2.9402759075164795
-    assert out["OUTPUT_HI+0"] == 2.9402759075164795
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.9402759075164795
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -6481,11 +6481,11 @@ def test_tail_ax_add_mul_byte1_materialize_requires_mul_ownership():
         "EMBED_HI+0": 1.000071406364441,
         "FETCH_HI+0": 0.3991560637950897,
         "OUTPUT_LO+0": 2.9402761459350586,
-        "OUTPUT_HI+0": 2.9402761459350586,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402761459350586,
     })
 
     assert out["OUTPUT_LO+0"] == 2.9402761459350586
-    assert out["OUTPUT_HI+0"] == 2.9402761459350586
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.9402761459350586
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -6504,11 +6504,11 @@ def test_tail_ax_add_mul_byte1_materialize_blocks_plain_add_byte1_zero():
         "EMBED_HI+2": 1.0,
         "FETCH_HI+2": 1.2207061052322388,
         "OUTPUT_LO+0": 2.9402761459350586,
-        "OUTPUT_HI+0": 2.9402761459350586,
+        "OUTPUT_HI_THIS_STEP+0": 2.9402761459350586,
     })
 
     assert out["OUTPUT_LO+0"] == 2.9402761459350586
-    assert out["OUTPUT_HI+0"] == 2.9402761459350586
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.9402761459350586
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -6529,11 +6529,11 @@ def test_tail_ax_add_mul_byte1_materialize_blocks_psh_preserve_row():
         "FETCH_HI+2": 0.934,
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+15": 2.0,
-        "OUTPUT_HI+15": 2.0,
+        "OUTPUT_HI_THIS_STEP+15": 2.0,
     })
 
     assert out["OUTPUT_LO+15"] == 2.0
-    assert out["OUTPUT_HI+15"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 2.0
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -6550,13 +6550,13 @@ def test_tail_ax_add_byte1_carry_high2_repairs_huge_byte3_residue():
         "FETCH_HI+1": 0.9340206980705261,
         "OUTPUT_LO+0": 2.36312338633608e14,
         "OUTPUT_LO+3": 2.1993707531384e13,
-        "OUTPUT_HI+3": 4.688537e12,
+        "OUTPUT_HI_THIS_STEP+3": 4.688537e12,
     })
 
     assert out["OUTPUT_LO+3"] > 2.1993707531384e13
     assert out["OUTPUT_LO+0"] < 2.36312338633608e14
-    assert out["OUTPUT_HI+0"] > 0.0
-    assert out["OUTPUT_HI+3"] < 4.688537e12
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+3"] < 4.688537e12
 
 
 def test_tail_ax_add_byte1_carry_high2_blocks_existing_byte7():
@@ -6572,7 +6572,7 @@ def test_tail_ax_add_byte1_carry_high2_blocks_existing_byte7():
         "FETCH_HI+1": 0.9340206980705261,
         "OUTPUT_LO+3": 185.0347,
         "OUTPUT_LO+7": 2616.264,
-        "OUTPUT_HI+0": 8464.702,
+        "OUTPUT_HI_THIS_STEP+0": 8464.702,
     })
 
     assert out["OUTPUT_LO+7"] == 2616.264
@@ -6589,7 +6589,7 @@ def test_tail_sub_borrow_requires_sub_marker():
         "TEMP+8": 1.0,
         "ALU_LO+1": 6.0,
         "OUTPUT_LO+2": 20.0,
-        "OUTPUT_HI+0": 20.0,
+        "OUTPUT_HI_THIS_STEP+0": 20.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
@@ -6607,12 +6607,12 @@ def test_tail_sub_borrow_blocks_add_residue_with_huge_output():
         "ALU_LO+1": 6.595503032613692e-10,
         "OUTPUT_LO+0": 2.36312338633608e14,
         "OUTPUT_LO+3": 2.1993707531384e13,
-        "OUTPUT_HI+0": 4.041023946752e12,
+        "OUTPUT_HI_THIS_STEP+0": 4.041023946752e12,
     })
 
     assert out["OUTPUT_LO+0"] == 2.36312338633608e14
     assert out["OUTPUT_LO+3"] == 2.1993707531384e13
-    assert out["OUTPUT_HI+0"] == 4.041023946752e12
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4.041023946752e12
 
 
 def test_tail_sub_borrow_still_fires_for_sub_marker():
@@ -6626,7 +6626,7 @@ def test_tail_sub_borrow_still_fires_for_sub_marker():
         "CARRY+2": 2.0,
         "ALU_LO+1": 6.0,
         "OUTPUT_LO+0": 1700.0,
-        "OUTPUT_HI+0": 24.0,
+        "OUTPUT_HI_THIS_STEP+0": 24.0,
     })
 
     assert out["OUTPUT_LO+0"] > 1700.0
@@ -6641,10 +6641,10 @@ def test_tail_sub_borrow_blocks_mul_high_byte_shape():
         "BYTE_INDEX_0": 1.0,
         "TEMP+10": 1.0,
         "OUTPUT_LO+0": 43.0,
-        "OUTPUT_HI+1": 40.0,
+        "OUTPUT_HI_THIS_STEP+1": 40.0,
     })
 
-    assert out.get("OUTPUT_HI+1", 0.0) == 40.0
+    assert out.get("OUTPUT_HI_THIS_STEP+1", 0.0) == 40.0
 
 
 def test_tail_sub_borrow_blocks_add_carry_shape():
@@ -6656,7 +6656,7 @@ def test_tail_sub_borrow_blocks_add_carry_shape():
         "BYTE_INDEX_0": 1.0,
         "TEMP+8": 1.0,
         "OUTPUT_LO+0": 1700.0,
-        "OUTPUT_HI+0": 26.0,
+        "OUTPUT_HI_THIS_STEP+0": 26.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 1700.0
@@ -6672,7 +6672,7 @@ def test_tail_sub_borrow_blocks_non_borrowing_sub():
         "TEMP+9": 1.0,
         "ALU_LO+1": 6.0,
         "OUTPUT_LO+1": 6.0,
-        "OUTPUT_HI+0": 3.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
@@ -6689,7 +6689,7 @@ def test_tail_sub_borrow_blocks_preserved_non_unit_high_byte():
         "CARRY+2": 2.0,
         "ALU_LO+1": 6.0,
         "OUTPUT_LO+5": 24.0,
-        "OUTPUT_HI+0": 24.0,
+        "OUTPUT_HI_THIS_STEP+0": 24.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
@@ -6705,7 +6705,7 @@ def test_tail_sub_borrow_blocks_ax_marker_row():
         "CARRY+2": 4.0,
         "ALU_LO+1": 7.0,
         "OUTPUT_LO+0": 24.0,
-        "OUTPUT_HI+0": 24.0,
+        "OUTPUT_HI_THIS_STEP+0": 24.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 24.0
@@ -6723,7 +6723,7 @@ def test_tail_sub_borrow_blocks_sp_marker_row():
         "ALU_LO+1": 6.0,
         "OUTPUT_LO+0": 4000.0,
         "OUTPUT_LO+1": -4000.0,
-        "OUTPUT_HI+0": -4000.0,
+        "OUTPUT_HI_THIS_STEP+0": -4000.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 4000.0
@@ -6737,7 +6737,7 @@ def test_tail_sub_borrow_blocks_imm_marker_row():
         "H1+1": 1.0,
         "OP_IMM": 5.0,
         "OUTPUT_LO+0": 520.0,
-        "OUTPUT_HI+0": 33.0,
+        "OUTPUT_HI_THIS_STEP+0": 33.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 520.0
@@ -6754,7 +6754,7 @@ def test_tail_sub_borrow_preserves_nonzero_high_byte():
         "CARRY+2": 2.0,
         "ALU_LO+1": 6.0,
         "OUTPUT_LO+5": 23.0,
-        "OUTPUT_HI+0": 26.0,
+        "OUTPUT_HI_THIS_STEP+0": 26.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
@@ -6772,7 +6772,7 @@ def test_tail_sub_borrow_blocks_unit_high_byte_without_low_byte_underflow_signat
         "ALU_LO+1": 6.0,
         "OUTPUT_LO+1": 24.0,
         "OUTPUT_LO+0": 24.0,
-        "OUTPUT_HI+0": 24.0,
+        "OUTPUT_HI_THIS_STEP+0": 24.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 24.0
@@ -6799,7 +6799,7 @@ def test_tail_shr_marker_correction_blocks_mem_marker_rows():
         "MARK_MEM": 1.0,
         "OUTPUT_LO+6": 153.0,
         "OUTPUT_LO+8": 153.0,
-        "OUTPUT_HI+15": 153.0,
+        "OUTPUT_HI_THIS_STEP+15": 153.0,
     })
 
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
@@ -6814,8 +6814,8 @@ def test_tail_shr_marker_correction_still_fires_on_marker():
         "TEMP+7": 1.0,
         "OP_SHR": 5.0,
         "OUTPUT_LO+10": -0.84,
-        "OUTPUT_HI+0": 2.56,
-        "OUTPUT_HI+2": -0.84,
+        "OUTPUT_HI_THIS_STEP+0": 2.56,
+        "OUTPUT_HI_THIS_STEP+2": -0.84,
     })
 
     assert out["OUTPUT_LO+1"] > 0.0
@@ -6831,11 +6831,11 @@ def test_tail_shr_marker_correction_preserves_shr_by_one_result():
         "OP_SHR": 5.0,
         "OUTPUT_LO+6": -0.84,
         "OUTPUT_LO+10": 1.16,
-        "OUTPUT_HI+2": 1.16,
+        "OUTPUT_HI_THIS_STEP+2": 1.16,
     })
 
     assert out["OUTPUT_LO+10"] == 1.16
-    assert out["OUTPUT_HI+2"] == 1.16
+    assert out["OUTPUT_HI_THIS_STEP+2"] == 1.16
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -6847,7 +6847,7 @@ def test_tail_shr_marker_correction_requires_shr_opcode():
         "H1+1": 1.0,
         "TEMP+7": 1.0,
         "OUTPUT_LO+6": 40.0,
-        "OUTPUT_HI+7": 40.0,
+        "OUTPUT_HI_THIS_STEP+7": 40.0,
     })
 
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
@@ -6862,7 +6862,7 @@ def test_tail_shr_byte1_zero_requires_full_temp7_relay():
         "BYTE_INDEX_0": 1.0,
         "TEMP+7": 0.305,
         "OUTPUT_LO+2": 12.0,
-        "OUTPUT_HI+0": 15.0,
+        "OUTPUT_HI_THIS_STEP+0": 15.0,
     })
 
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
@@ -6901,8 +6901,8 @@ def test_tail_wide_mul_byte1_preserve_rules_use_bounded_conditions():
 def test_tail_rules_do_not_use_trillion_scale_numeric_bounds():
     # The ``stack0_span_blocked_tail_rules`` post-processor in l10_ops injects
     # MARK_STACK0/STACK0_BYTE blockers at 1e12 because they must dominate
-    # OUTPUT-lane evidence at ~441M scale being amplified by ``OUTPUT_HI+14``
-    # / ``OUTPUT_HI+15`` blocker weights of -1000 (i.e. positive contributions
+    # OUTPUT-lane evidence at ~441M scale being amplified by ``OUTPUT_HI_THIS_STEP+14``
+    # / ``OUTPUT_HI_THIS_STEP+15`` blocker weights of -1000 (i.e. positive contributions
     # up to 4.4e11). Strength on writes and gate terms is still capped at 1e9.
     # Conditions are explicitly allowed to use the trillion-scale (1e12)
     # blockers but not larger; quadrillion+ scales are still forbidden.
@@ -6927,13 +6927,13 @@ def test_tail_wide_mul_byte1_preserve_blocks_add_relay_residue():
         "TEMP+8": 1.0,
         "TEMP+10": 1.0,
         "OUTPUT_LO+3": 2.2e13,
-        "OUTPUT_HI+4": 4.6e12,
+        "OUTPUT_HI_THIS_STEP+4": 4.6e12,
     }
 
     out = ir.symbolic_ffn(state)
 
     assert out["OUTPUT_LO+3"] == state["OUTPUT_LO+3"]
-    assert out["OUTPUT_HI+4"] == state["OUTPUT_HI+4"]
+    assert out["OUTPUT_HI_THIS_STEP+4"] == state["OUTPUT_HI_THIS_STEP+4"]
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -6948,13 +6948,13 @@ def test_tail_wide_mul_byte1_preserve_blocks_tiny_negative_op_residue():
         "OP_MUL": -1e-21,
         "OP_ADD": -1e-21,
         "OUTPUT_LO+3": 2.2e13,
-        "OUTPUT_HI+4": 4.6e12,
+        "OUTPUT_HI_THIS_STEP+4": 4.6e12,
     }
 
     out = ir.symbolic_ffn(state)
 
     assert out["OUTPUT_LO+3"] == state["OUTPUT_LO+3"]
-    assert out["OUTPUT_HI+4"] == state["OUTPUT_HI+4"]
+    assert out["OUTPUT_HI_THIS_STEP+4"] == state["OUTPUT_HI_THIS_STEP+4"]
 
 
 def test_tail_wide_mul_byte1_preserve_blocks_add_even_with_mul_residue():
@@ -6968,13 +6968,13 @@ def test_tail_wide_mul_byte1_preserve_blocks_add_even_with_mul_residue():
         "OP_MUL": 1.0,
         "OP_ADD": 1.0,
         "OUTPUT_LO+3": 100.0,
-        "OUTPUT_HI+4": 100.0,
+        "OUTPUT_HI_THIS_STEP+4": 100.0,
     }
 
     out = ir.symbolic_ffn(state)
 
     assert out["OUTPUT_LO+3"] == state["OUTPUT_LO+3"]
-    assert out["OUTPUT_HI+4"] == state["OUTPUT_HI+4"]
+    assert out["OUTPUT_HI_THIS_STEP+4"] == state["OUTPUT_HI_THIS_STEP+4"]
 
 
 def test_tail_ax_add_byte1_missing_stack_high_repairs_fetch_hi1_case():
@@ -6989,7 +6989,7 @@ def test_tail_ax_add_byte1_missing_stack_high_repairs_fetch_hi1_case():
         "CARRY+1": 2.0,
         "FETCH_HI+1": 1.22,
         "OUTPUT_LO+1": 253.0,
-        "OUTPUT_HI+0": 254.0,
+        "OUTPUT_HI_THIS_STEP+0": 254.0,
     })
 
     assert out["OUTPUT_LO+2"] > 0.0
@@ -7008,11 +7008,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_plain_carry_case():
         "CARRY+1": 2.0,
         "FETCH_HI+1": 0.934,
         "OUTPUT_LO+1": 9128.0,
-        "OUTPUT_HI+0": 9311.0,
+        "OUTPUT_HI_THIS_STEP+0": 9311.0,
     })
 
     assert out["OUTPUT_LO+1"] == 9128.0
-    assert out["OUTPUT_HI+0"] == 9311.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 9311.0
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7027,11 +7027,11 @@ def test_tail_ax_add_byte1_missing_stack_high_requires_carry():
         "TEMP+8": 1.0,
         "FETCH_HI+1": 1.22,
         "OUTPUT_LO+1": 12.0,
-        "OUTPUT_HI+0": 15.0,
+        "OUTPUT_HI_THIS_STEP+0": 15.0,
     })
 
     assert out["OUTPUT_LO+1"] == 12.0
-    assert out["OUTPUT_HI+0"] == 15.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 15.0
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7047,11 +7047,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_existing_byte3():
         "CARRY+1": 2.0,
         "FETCH_HI+1": 1.22,
         "OUTPUT_LO+3": 4551.0,
-        "OUTPUT_HI+0": 8773.0,
+        "OUTPUT_HI_THIS_STEP+0": 8773.0,
     })
 
     assert out["OUTPUT_LO+3"] == 4551.0
-    assert out["OUTPUT_HI+0"] == 8773.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 8773.0
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7070,11 +7070,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_existing_byte5():
         "OUTPUT_LO+1": -251.51998901367188,
         "OUTPUT_LO+3": -188.16000366210938,
         "OUTPUT_LO+5": 2616.27001953125,
-        "OUTPUT_HI+0": 8464.7353515625,
+        "OUTPUT_HI_THIS_STEP+0": 8464.7353515625,
     })
 
     assert out["OUTPUT_LO+5"] == 2616.27001953125
-    assert out["OUTPUT_HI+0"] == 8464.7353515625
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 8464.7353515625
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7096,11 +7096,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_negative_lane_evidence():
         "OUTPUT_LO+3": -613.1743774414062,
         "OUTPUT_LO+4": -2611.14501953125,
         "OUTPUT_LO+5": 2616.270263671875,
-        "OUTPUT_HI+0": 7681.05908203125,
+        "OUTPUT_HI_THIS_STEP+0": 7681.05908203125,
     })
 
     assert out["OUTPUT_LO+5"] == 2616.270263671875
-    assert out["OUTPUT_HI+0"] == 7681.05908203125
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 7681.05908203125
     assert out["OUTPUT_LO+2"] == 487.04034423828125
 
 
@@ -7116,11 +7116,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_sub_residue():
         "CARRY+1": 2.0,
         "FETCH_HI+1": 0.9340206980705261,
         "OUTPUT_LO+4": 1.7281791163115766e18,
-        "OUTPUT_HI+0": 4.260235372945998e18,
+        "OUTPUT_HI_THIS_STEP+0": 4.260235372945998e18,
     })
 
     assert out["OUTPUT_LO+4"] == 1.7281791163115766e18
-    assert out["OUTPUT_HI+0"] == 4.260235372945998e18
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4.260235372945998e18
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7140,11 +7140,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_existing_byte4():
         "OUTPUT_LO+2": -188.16000366210938,
         "OUTPUT_LO+3": -2611.144775390625,
         "OUTPUT_LO+4": 2616.27001953125,
-        "OUTPUT_HI+0": 8464.7353515625,
+        "OUTPUT_HI_THIS_STEP+0": 8464.7353515625,
     })
 
     assert out["OUTPUT_LO+4"] == 2616.27001953125
-    assert out["OUTPUT_HI+0"] == 8464.7353515625
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 8464.7353515625
     assert out.get("OUTPUT_LO+2", 0.0) == -188.16000366210938
 
 
@@ -7164,11 +7164,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_existing_byte6():
         "OUTPUT_LO+3": 149.1645965576172,
         "OUTPUT_LO+5": -1890.9033203125,
         "OUTPUT_LO+6": 1895.4190673828125,
-        "OUTPUT_HI+0": 7860.3779296875,
+        "OUTPUT_HI_THIS_STEP+0": 7860.3779296875,
     })
 
     assert out["OUTPUT_LO+6"] == 1895.4190673828125
-    assert out["OUTPUT_HI+0"] == 7860.3779296875
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 7860.3779296875
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7187,11 +7187,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_existing_byte7():
         "OUTPUT_LO+3": 185.0347,
         "OUTPUT_LO+6": -2611.139,
         "OUTPUT_LO+7": 2616.264,
-        "OUTPUT_HI+0": 8464.702,
+        "OUTPUT_HI_THIS_STEP+0": 8464.702,
     })
 
     assert out["OUTPUT_LO+7"] == 2616.264
-    assert out["OUTPUT_HI+0"] == 8464.702
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 8464.702
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7215,11 +7215,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_bp_frame_row():
         "OUTPUT_LO+5": -4000.0,
         "OUTPUT_LO+6": -4000.0,
         "OUTPUT_LO+7": -4000.0,
-        "OUTPUT_HI+0": 4000.0,
+        "OUTPUT_HI_THIS_STEP+0": 4000.0,
     })
 
     assert out["OUTPUT_LO+0"] == 4000.0
-    assert out["OUTPUT_HI+0"] == 4000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4000.0
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7237,11 +7237,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_pc_byte_row():
         "CARRY+1": 2.0,
         "FETCH_HI+1": 40.00002670288086,
         "OUTPUT_LO+1": 253.0,
-        "OUTPUT_HI+0": 254.0,
+        "OUTPUT_HI_THIS_STEP+0": 254.0,
     })
 
     assert out["OUTPUT_LO+1"] == 253.0
-    assert out["OUTPUT_HI+0"] == 254.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 254.0
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7260,10 +7260,10 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_stack0_byte_row():
         "OUTPUT_LO+5": -971.656494140625,
         "OUTPUT_LO+6": -971.656494140625,
         "OUTPUT_LO+7": -971.656494140625,
-        "OUTPUT_HI+0": 123.0,
+        "OUTPUT_HI_THIS_STEP+0": 123.0,
     })
 
-    assert out["OUTPUT_HI+0"] == 123.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 123.0
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7280,11 +7280,11 @@ def test_tail_ax_add_byte1_missing_stack_high_blocks_stack0_marker_signed_bands(
         "OUTPUT_LO+6": -425984032.0,
         "OUTPUT_LO+7": -425984032.0,
         "OUTPUT_LO+15": 425984000.0,
-        "OUTPUT_HI+2": 425984000.0,
+        "OUTPUT_HI_THIS_STEP+2": 425984000.0,
     })
 
     assert out["OUTPUT_LO+15"] == 425984000.0
-    assert out["OUTPUT_HI+2"] == 425984000.0
+    assert out["OUTPUT_HI_THIS_STEP+2"] == 425984000.0
     assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
@@ -7299,7 +7299,7 @@ def test_tail_sp_pop_carry_blocks_ax_byte_row():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+0": 2000.0,
-        "OUTPUT_HI+0": 25.0,
+        "OUTPUT_HI_THIS_STEP+0": 25.0,
     })
 
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
@@ -7312,15 +7312,15 @@ def test_tail_clear_output_after_byte3_clears_final_byte_residue():
         "IS_BYTE": 1.0,
         "BYTE_INDEX_3": 1.0,
         "OUTPUT_LO+0": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
         "OUTPUT_LO+15": 1_000_000.0,
-        "OUTPUT_HI+15": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+15": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
     assert out["OUTPUT_LO+15"] < 0.0
-    assert out["OUTPUT_HI+15"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] < 0.0
 
 
 def test_tail_clear_output_after_byte3_blocks_earlier_bytes():
@@ -7330,11 +7330,11 @@ def test_tail_clear_output_after_byte3_blocks_earlier_bytes():
         "IS_BYTE": 1.0,
         "BYTE_INDEX_2": 1.0,
         "OUTPUT_LO+0": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+0"] == 1_000_000.0
-    assert out["OUTPUT_HI+0"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000.0
 
 
 def test_tail_clear_output_after_byte3_blocks_mem_addr_to_value_transition():
@@ -7345,11 +7345,11 @@ def test_tail_clear_output_after_byte3_blocks_mem_addr_to_value_transition():
         "BYTE_INDEX_3": 1.0,
         "MEM_VAL_B0": 1.0,
         "OUTPUT_LO+10": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+10"] == 1_000_000.0
-    assert out["OUTPUT_HI+0"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000.0
 
 
 def test_tail_clear_output_after_byte3_blocks_stack0_byte_rows():
@@ -7360,11 +7360,11 @@ def test_tail_clear_output_after_byte3_blocks_stack0_byte_rows():
         "BYTE_INDEX_3": 1.0,
         "STACK0_BYTE3": 1.0,
         "OUTPUT_LO+10": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+10"] == 1_000_000.0
-    assert out["OUTPUT_HI+0"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000.0
 
 
 def test_tail_clear_output_before_step_end_clears_mem_value_residue():
@@ -7374,15 +7374,15 @@ def test_tail_clear_output_before_step_end_clears_mem_value_residue():
         "IS_BYTE": 1.0,
         "NEXT_SE": 1.0,
         "OUTPUT_LO+0": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
         "OUTPUT_LO+15": 1_000_000.0,
-        "OUTPUT_HI+15": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+15": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
     assert out["OUTPUT_LO+15"] < 0.0
-    assert out["OUTPUT_HI+15"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] < 0.0
 
 
 def test_tail_clear_output_before_step_end_blocks_stack0_byte_rows():
@@ -7393,11 +7393,11 @@ def test_tail_clear_output_before_step_end_blocks_stack0_byte_rows():
         "NEXT_SE": 1.0,
         "STACK0_BYTE0": 1.0,
         "OUTPUT_LO+14": 1_000_000.0,
-        "OUTPUT_HI+13": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+13": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+14"] == 1_000_000.0
-    assert out["OUTPUT_HI+13"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+13"] == 1_000_000.0
 
 
 def test_tail_clear_output_before_step_end_requires_next_se():
@@ -7406,11 +7406,11 @@ def test_tail_clear_output_before_step_end_requires_next_se():
     out = ir.symbolic_ffn({
         "IS_BYTE": 1.0,
         "OUTPUT_LO+0": 1_000_000.0,
-        "OUTPUT_HI+0": 1_000_000.0,
+        "OUTPUT_HI_THIS_STEP+0": 1_000_000.0,
     })
 
     assert out["OUTPUT_LO+0"] == 1_000_000.0
-    assert out["OUTPUT_HI+0"] == 1_000_000.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1_000_000.0
 
 
 def test_tail_sp_pop_carry_requires_clean_zero_previous_byte():
@@ -7425,12 +7425,12 @@ def test_tail_sp_pop_carry_requires_clean_zero_previous_byte():
         "CLEAN_EMBED_LO+15": 1.0,
         "CLEAN_EMBED_HI+15": 1.0,
         "OUTPUT_LO+8": 20.2,
-        "OUTPUT_HI+0": 21.8,
+        "OUTPUT_HI_THIS_STEP+0": 21.8,
         "OUTPUT_LO+9": 3.0,
     })
 
     assert out.get("OUTPUT_LO+9", 0.0) == 3.0
-    assert out["OUTPUT_HI+0"] == 21.8
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 21.8
 
 
 def test_tail_sp_pop_carry_requires_exact_byte_index():
@@ -7445,11 +7445,11 @@ def test_tail_sp_pop_carry_requires_exact_byte_index():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+0": 2.9,
-        "OUTPUT_HI+0": 2.9,
+        "OUTPUT_HI_THIS_STEP+0": 2.9,
     })
 
     assert out["OUTPUT_LO+0"] == 2.9
-    assert out["OUTPUT_HI+0"] == 2.9
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.9
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -7468,11 +7468,11 @@ def test_tail_sp_pop_carry_byte1_zero_fires_on_measured_add_sp_row():
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+0": 0.953674,
         "OUTPUT_LO+3": 1.9866,
-        "OUTPUT_HI+0": 2.94028,
+        "OUTPUT_HI_THIS_STEP+0": 2.94028,
     })
 
     assert out["OUTPUT_LO+0"] > out["OUTPUT_LO+3"]
-    assert out["OUTPUT_HI+0"] > 2.94028
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 2.94028
 
 
 def test_tail_sp_pop_carry_byte1_zero_blocks_store_frame_row():
@@ -7489,14 +7489,14 @@ def test_tail_sp_pop_carry_byte1_zero_blocks_store_frame_row():
         "EMBED_HI+14": 1.0000396966934204,
         "OUTPUT_LO+0": 0.08617234230041504,
         "OUTPUT_LO+15": 5.880698204040527,
-        "OUTPUT_HI+0": 0.08617234230041504,
-        "OUTPUT_HI+15": 5.880709648132324,
+        "OUTPUT_HI_THIS_STEP+0": 0.08617234230041504,
+        "OUTPUT_HI_THIS_STEP+15": 5.880709648132324,
     })
 
     assert out["OUTPUT_LO+15"] == 5.880698204040527
-    assert out["OUTPUT_HI+15"] == 5.880709648132324
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 5.880709648132324
     assert out["OUTPUT_LO+0"] == 0.08617234230041504
-    assert out["OUTPUT_HI+0"] == 0.08617234230041504
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 0.08617234230041504
 
 
 def test_tail_sp_pop_carry_byte1_zero_blocks_e0_high_byte_row():
@@ -7513,14 +7513,14 @@ def test_tail_sp_pop_carry_byte1_zero_blocks_e0_high_byte_row():
         "CLEAN_EMBED_HI+14": 1.0,
         "OUTPUT_LO+0": 0.9402758479118347,
         "OUTPUT_LO+15": 2.0,
-        "OUTPUT_HI+0": 0.9402758479118347,
-        "OUTPUT_HI+15": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 0.9402758479118347,
+        "OUTPUT_HI_THIS_STEP+15": 2.0,
     })
 
     assert out["OUTPUT_LO+15"] == 2.0
-    assert out["OUTPUT_HI+15"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] == 2.0
     assert out["OUTPUT_LO+0"] == 0.9402758479118347
-    assert out["OUTPUT_HI+0"] == 0.9402758479118347
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 0.9402758479118347
 
 
 def test_tail_sp_pop_carry_byte2_zero_fires_on_measured_add_sp_row():
@@ -7536,11 +7536,11 @@ def test_tail_sp_pop_carry_byte2_zero_fires_on_measured_add_sp_row():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 2.0,
     })
 
     assert out["OUTPUT_LO+1"] > out["OUTPUT_LO+0"]
-    assert out["OUTPUT_HI+0"] > 2.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 2.0
 
 
 def test_tail_sp_pop_carry_blocks_branch_sp_byte_rows():
@@ -7556,11 +7556,11 @@ def test_tail_sp_pop_carry_blocks_branch_sp_byte_rows():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 2.0,
     })
 
     assert out["OUTPUT_LO+0"] == 2.0
-    assert out["OUTPUT_HI+0"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.0
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -7574,11 +7574,11 @@ def test_tail_sp_pop_carry_blocks_startup_stack0_row_without_has_se():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+0": 142.0,
-        "OUTPUT_HI+0": 142.0,
+        "OUTPUT_HI_THIS_STEP+0": 142.0,
     })
 
     assert out["OUTPUT_LO+0"] == 142.0
-    assert out["OUTPUT_HI+0"] == 142.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 142.0
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
 
 
@@ -7594,11 +7594,11 @@ def test_tail_sp_pop_carry_requires_real_pop_flag_margin():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+1": 2.0,
-        "OUTPUT_HI+0": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 2.0,
     })
 
     assert out["OUTPUT_LO+1"] == 2.0
-    assert out["OUTPUT_HI+0"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.0
     assert out.get("OUTPUT_LO+0", 0.0) == 0.0
 
 
@@ -7619,16 +7619,16 @@ def test_tail_sp_pop_carry_byte2_blocks_nonpop_sp_zero_high_rules():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+1": 2.0,
-        "OUTPUT_HI+0": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 2.0,
     })
 
     assert out["OUTPUT_LO+1"] == 2.0
-    assert out["OUTPUT_HI+0"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 2.0
     for idx in range(16):
         if idx != 1:
             assert out.get(f"OUTPUT_LO+{idx}", 0.0) == 0.0
         if idx != 0:
-            assert out.get(f"OUTPUT_HI+{idx}", 0.0) == 0.0
+            assert out.get(f"OUTPUT_HI_THIS_STEP+{idx}", 0.0) == 0.0
 
 
 def test_tail_sp_pop_carry_still_fires_after_clean_zero_previous_byte():
@@ -7643,11 +7643,11 @@ def test_tail_sp_pop_carry_still_fires_after_clean_zero_previous_byte():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+0": 2.0,
-        "OUTPUT_HI+0": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 2.0,
     })
 
     assert out["OUTPUT_LO+1"] > 0.0
-    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
 
 
 def test_tail_pop_mem_marker_zero_blocks_store_rows():
@@ -7659,8 +7659,8 @@ def test_tail_pop_mem_marker_zero_blocks_store_rows():
         "CMP+3": 3.0,
         "MEM_STORE": 2.0,
         "OUTPUT_LO+8": 2.0,
-        "OUTPUT_HI+14": 2.0,
+        "OUTPUT_HI_THIS_STEP+14": 2.0,
     })
 
     assert out["OUTPUT_LO+8"] == 2.0
-    assert out["OUTPUT_HI+14"] == 2.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] == 2.0
