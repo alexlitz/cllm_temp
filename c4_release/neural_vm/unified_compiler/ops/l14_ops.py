@@ -1128,6 +1128,20 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
+    # Dim-ownership claims (W_down output cells). Runs at phase 14.7 after
+    # ``layer14_jsr_ax_bytes_zero`` (14.6) consumes units 1862..1865. The
+    # helper writes 4 units mirroring jsr_ax_bytes_zero:
+    #   unit 1866: -3/S on OUTPUT_LO[0..15]
+    #   unit 1867: -3/S on OUTPUT_HI[0..15]
+    #   unit 1868: +5/S on OUTPUT_LO[0]
+    #   unit 1869: +5/S on OUTPUT_HI[0]
+    _claims = set()
+    for k in range(16):
+        _claims.add((14, "ffn_W_down", "1866", f"OUTPUT_LO+{k}"))
+        _claims.add((14, "ffn_W_down", "1867", f"OUTPUT_HI+{k}"))
+    _claims.add((14, "ffn_W_down", "1868", "OUTPUT_LO+0"))
+    _claims.add((14, "ffn_W_down", "1869", "OUTPUT_HI+0"))
+
     return Operation(
         name="layer14_lc_ax_bytes_zero",
         phase=14.7,
@@ -1139,6 +1153,7 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
+        claims=_claims,
         smoke_tests={"TestSmokeMemory::test_sc_lc_roundtrip"},
         spec_section="BLOG_SPEC.md#memory",
     )
