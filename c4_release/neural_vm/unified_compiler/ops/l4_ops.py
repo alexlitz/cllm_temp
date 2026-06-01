@@ -1,9 +1,74 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L4 FFN unit layout (pinned offsets) ============================
+#
+# The ``layer4_ffn`` op owns the entire L4 FFN. The actual weight writes
+# happen inside ``_bake_layer4_ffn`` below, which uses a local ``unit = 0``
+# counter that walks through six sub-stages (PC+1@AX, TEMP clear, PC+2/3/4
+# @AX byte positions, PC+1@PC). Migration to :class:`FFNUnitAllocator`
+# keeps that helper byte-identical -- we declare each sub-stage's range
+# at its existing pinned offset so the layout is auditable rather than
+# implicit. Adding a new L4 op family later will go through
+# ``allocator.alloc(name, n)`` without a pin, and the allocator will pick
+# the first free gap above unit 544.
+#
+# IMPORTANT: the PC+N chains do NOT have equal stride. The widths follow
+# :meth:`Primitives.nibble_rotation_chain`'s ``with_carry=True`` formula
+# of ``32 + 32 * offset`` units per chain, so PC+2/+3/+4 land at 96/128/
+# 160 units respectively (NOT a uniform 96-unit stride). The pin offsets
+# below honour those exact widths so the layout matches the helper's
+# monotonic walk byte-for-byte.
+_L4_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    # PC+1 chain at MARK_AX (offset=1, with_carry=True): 32 + 32 = 64 units.
+    #   16 lo rotation + 16 hi default-copy + 16 hi carry-cancel + 16 hi
+    #   carry-rotated. Writes TEMP[0..15] (lo) and TEMP[16..31] (hi).
+    ("layer4_ffn.pc_plus1_ax",       0,  64),
+    # TEMP[0..31] clearing pass at MARK_PC. TEMP[0] is reserved for IS_JSR
+    # so its slot is an empty placeholder (still consumes 1 unit). 32 units.
+    ("layer4_ffn.temp_clear_pc",    64,  32),
+    # PC+N chains at IS_BYTE × H1[AX_I] × BYTE_INDEX_n. Widths follow
+    # ``32 + 32 * offset``: PC+2 → 96, PC+3 → 128, PC+4 → 160. NOT
+    # equal-stride; the carry block grows with offset because lo + offset
+    # >= 16 admits ``offset`` distinct carry sources (lo ∈ [16-offset, 15]).
+    ("layer4_ffn.pc_plus2_byte0",   96,  96),  # offset=2, 32 + 32*2
+    ("layer4_ffn.pc_plus3_byte1",  192, 128),  # offset=3, 32 + 32*3
+    ("layer4_ffn.pc_plus4_byte2",  320, 160),  # offset=4, 32 + 32*4
+    # PC+1 chain at MARK_PC (offset=1, with_carry=True): 64 units for the
+    # dynamic immediate fetch path (L5 head 3 reads FETCH at PC marker).
+    ("layer4_ffn.pc_plus1_pc",     480,  64),
+)
+
+# Total = 64 + 32 + 96 + 128 + 160 + 64 = 544 units (matches
+# ``ffn_units_used=544`` and the historical helper footprint).
+_L4_FFN_TOTAL_UNITS = 544
+
+
+def _allocate_layer4_ffn_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L4 FFN sub-stages.
+
+    Every sub-stage is pinned at its existing offset so the underlying
+    ``_bake_layer4_ffn`` helper -- which writes via its own monotonic
+    ``unit = 0`` counter -- lands on exactly the same hidden-unit indices
+    it always has. This call is byte-identical bookkeeping: the allocator
+    declares ranges by name, the helper writes the weights. A future
+    refactor can split the monolithic helper into per-range bake functions
+    that consume ``allocator.alloc(...)`` directly.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L4 op claims a free range past unit 544).
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L4_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def make_layer4_pc_relay_op() -> Operation:
@@ -199,7 +264,26 @@ def make_layer4_ffn_op() -> Operation:
     ``make_layer4_pc_relay_op``.
     """
     def bake(block, dim_positions, S):
-        _bake_layer4_ffn(block.ffn, S, _as_setdim_proxy(dim_positions))
+        # Per-bake FFN-unit allocator. Each L4 FFN sub-stage is pinned to
+        # its existing offset so the calls below land byte-identically.
+        # The allocator is published on ``block.ffn`` for inspection /
+        # extension by downstream tools (e.g. a future L4 op family
+        # claiming a free gap past unit 544). Mirrors the L9 pattern in
+        # ``make_layer9_alu_op``.
+        allocator = _allocate_layer4_ffn_units()
+        block.ffn._l4_unit_allocator = allocator
+
+        final_unit = _bake_layer4_ffn(
+            block.ffn, S, _as_setdim_proxy(dim_positions)
+        )
+        # Byte-identity guard: the helper's local cursor MUST end exactly
+        # at the allocator's declared footprint. If the layout table drifts
+        # from the helper's writes, this assertion fires before any weight
+        # surgery happens.
+        assert final_unit == _L4_FFN_TOTAL_UNITS, (
+            f"L4 FFN unit cursor drift: helper returned {final_unit}, "
+            f"allocator expected {_L4_FFN_TOTAL_UNITS}"
+        )
 
     # Dim-ownership claims (W_down output cells). The bake programs four
     # ``nibble_rotation_chain``s and one TEMP-clear pass on L4.ffn:
@@ -264,8 +348,13 @@ def make_layer4_ffn_op() -> Operation:
     )
 
 
-def _bake_layer4_ffn(ffn, S, BD):
-    """Declarative L4 FFN spec: PC+1/2/3/4 fetch-address rotations."""
+def _bake_layer4_ffn(ffn, S, BD) -> int:
+    """Declarative L4 FFN spec: PC+1/2/3/4 fetch-address rotations.
+
+    Returns the post-bake unit cursor (must equal
+    :data:`_L4_FFN_TOTAL_UNITS` for byte-identity with the historical
+    544-unit footprint). The caller asserts this in ``make_layer4_ffn_op``.
+    """
 
     unit = 0
 
@@ -312,7 +401,7 @@ def _bake_layer4_ffn(ffn, S, BD):
             condition_dims=[BD.H1 + AX_I, BD.BYTE_INDEX_0 + byte_idx],
         )
 
-    Primitives.nibble_rotation_chain(
+    unit = Primitives.nibble_rotation_chain(
         ffn,
         unit=unit,
         gate_marker=BD.MARK_PC,
@@ -325,6 +414,8 @@ def _bake_layer4_ffn(ffn, S, BD):
         S=S,
         magnitude=2.0,
     )
+
+    return unit
 
 
 def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
