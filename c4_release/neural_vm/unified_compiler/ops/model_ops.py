@@ -792,6 +792,15 @@ def make_initial_pc_bake_op() -> Operation:
             embed_weight[Token.REG_PC, embed_lo + init_pc_lo] = 1.0
             embed_weight[Token.REG_PC, embed_hi + init_pc_hi] = 1.0
 
+    # Dim-ownership claims. The bake adds two non-zero values into the REG_PC
+    # row of the token-embedding table (column EMBED_LO + (PC_OFFSET & 0xF)
+    # and column EMBED_HI + ((PC_OFFSET >> 4) & 0xF)). The static verifier's
+    # embedding diff is row-granular (one row -> one ``embed_row`` claim with
+    # ``column=None``); declaring the single REG_PC row covers both column
+    # writes. ``Token.REG_PC`` == 257 (see ``vm_step.Token``).
+    from ...vm_step import Token as _Token  # local import to avoid module-load cycle
+    _claims = frozenset({(-1, "embed_row", str(_Token.REG_PC), None)})
+
     return Operation(
         name="initial_pc_bake",
         reads=set(),
@@ -801,6 +810,7 @@ def make_initial_pc_bake_op() -> Operation:
         declarative_bake_fn=_bake,
         phase=1001.5,
         declarative_authority="declarative",
+        claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
