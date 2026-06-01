@@ -240,6 +240,15 @@ def make_layer2_threshold_attn_op() -> Operation:
         compiler_ir_factory=_layer2_threshold_ir,
         migrated=True,
         claims=_claims,
+        # B12 backfill (wave 1b): pin strictly after layer1_threshold_attn.
+        # Same shape as L1: reads IS_MARK/CONST from an upstream marker
+        # bake (no in-DAG predecessor), so the structural L0->L1->L2
+        # threshold-attn-stack ordering needs explicit after-edges to
+        # surface in the dep graph. Chaining via layer1_threshold_attn
+        # (rather than layer0_threshold_attn) gives this op dep_depth=2,
+        # matching current_layer=2 and reaching the phase_pinned_by_deps
+        # bucket. See docs/B12_BACKFILL_SPEC.md §24 recommended choice (a).
+        requires={"after": "layer1_threshold_attn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
