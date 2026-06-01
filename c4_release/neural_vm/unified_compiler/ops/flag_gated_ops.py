@@ -110,6 +110,13 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         ffn_units_used=412 if enable_conversational_io else None,
+        # B12 backfill: docstring above names ``opcode_decode_ffn`` (phase
+        # 5, same L5 FFN) as the required predecessor — its base opcode
+        # decoder must be in place before this extension writes units
+        # 410-411. Encoded as a B10 op-name reference so the dynamic
+        # scheduler honours the dep edge even though reads/writes are
+        # empty (bake body flag-gated on ``enable_conversational_io``).
+        requires={"after": "opcode_decode_ffn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
@@ -394,6 +401,12 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         ffn_units_used=1402 if enable_conversational_io else None,
+        # B12 backfill: docstring above names ``layer6_routing_ffn`` (phase
+        # 6.5, same L6 FFN) as the required predecessor — the base routing
+        # FFN must be in place before this extension appends units
+        # 1400-1401. Encoded as a B10 op-name reference so the dynamic
+        # scheduler honours the dep edge despite empty reads/writes.
+        requires={"after": "layer6_routing_ffn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
@@ -572,6 +585,13 @@ def make_convo_io_step_resume_op(
         declarative_authority="spec_generated",
         migrated=True,
         ffn_units_used=1036 if (enable_conversational_io and enable) else None,
+        # B12 backfill: docstring above names ``layer3_convo_io_state_init``
+        # (phase 3.1, same L3 FFN) as the required predecessor — that op
+        # writes unit 1034, this one writes unit 1035, so the upstream
+        # state-init unit must be in place first. Encoded as a B10
+        # op-name reference so the dynamic scheduler honours the dep
+        # edge despite empty reads/writes.
+        requires={"after": "layer3_convo_io_state_init"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
@@ -660,6 +680,13 @@ def make_convo_io_pc_sp_latch_op(
         declarative_authority="spec_generated",
         migrated=True,
         ffn_units_used=1466 if (enable_conversational_io and enable) else None,
+        # B12 backfill: docstring above names ``convo_io_state_machine``
+        # (phase 6.6, same L6 FFN) as the required predecessor — its
+        # state-machine units 1400-1401 must be in place before this op
+        # writes units 1402+. Encoded as a B10 op-name reference so the
+        # dynamic scheduler honours the dep edge despite empty
+        # reads/writes.
+        requires={"after": "convo_io_state_machine"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
@@ -761,6 +788,13 @@ def make_convo_io_prtf_capture_op(
         declarative_authority="spec_generated",
         migrated=True,
         ffn_units_used=864 if (enable_conversational_io and enable) else None,
+        # B12 backfill: docstring above names the L7 FFN main bakes as
+        # the required predecessors so the capture-side units 800-863
+        # layer cleanly on top. ``layer7_operand_gather`` is the L7
+        # block op that owns the main-band weights; pin after it via a
+        # B10 op-name reference so the dynamic scheduler honours the
+        # dep edge despite empty reads/writes.
+        requires={"after": "layer7_operand_gather"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
@@ -893,6 +927,14 @@ def make_convo_io_prtf_transport_op(
         ),
         declarative_authority="spec_generated",
         migrated=True,
+        # B12 backfill: docstring above names ``layer4_pc_relay`` (phase
+        # 4) and ``layer4_sp_to_addr_key`` (phase 4.5) as the required
+        # predecessors so the per-block ``fill_(0.5)`` of alibi slopes
+        # has settled before this op overrides ``slope[4] = 0.1``. Pin
+        # after the later of the two via a B10 op-name reference so the
+        # dynamic scheduler honours the dep edge despite empty
+        # reads/writes.
+        requires={"after": "layer4_sp_to_addr_key"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
