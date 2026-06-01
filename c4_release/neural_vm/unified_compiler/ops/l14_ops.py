@@ -938,21 +938,79 @@ def make_layer14_temp_clear_op() -> Operation:
     )
 
 
+def _layer14_clear_addr_key_pollution_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_clear_addr_key_pollution``.
+
+    48 ``gated_write`` rules, one per ADDR_KEY[k] cell. Each rule fires
+    at positions that are NOT MEM value bytes AND NOT register markers
+    (the latter list mirrors the imperative blockers) by combining a
+    positive bias of 0.5 with -100 condition weights on every MEM_VAL_B*
+    and MARK_* blocker. The W_down write is -4.0/S to gently cancel the
+    ADDR_B*_HI residue that L9 attention leaves on ADDR_KEY-aliased
+    cells. Per-rule scope and dominates_at are not declared because the
+    rule is an additive defensive clear with no contested writes from
+    other ops in the L14 chain.
+    """
+    suppress_weight = -100.0  # imperative: W_up[..., DIM] = -S * 100
+    common_conditions = (
+        ("MEM_VAL_B0", suppress_weight),
+        ("MEM_VAL_B1", suppress_weight),
+        ("MEM_VAL_B2", suppress_weight),
+        ("MEM_VAL_B3", suppress_weight),
+        ("MARK_PC", suppress_weight),
+        ("MARK_BP", suppress_weight),
+        ("MARK_AX", suppress_weight),
+        ("MARK_STACK0", suppress_weight),
+        ("MARK_SP", suppress_weight),
+    )
+    rules = tuple(
+        FFNRule.gated_write(
+            name=f"l14_clear_addr_key_pollution_{k}",
+            conditions=common_conditions,
+            threshold=-0.5,  # imperative: b_up = +S * 0.5 == -S * (-0.5)
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"ADDR_KEY+{k}", -4.0 / S),),
+            scope=("not MEM_VAL_B0 and not MEM_VAL_B1 and not MEM_VAL_B2 "
+                   "and not MEM_VAL_B3 and not MARK_PC and not MARK_BP "
+                   "and not MARK_AX and not MARK_STACK0 and not MARK_SP"),
+        )
+        for k in range(48)
+    )
+    return rules
+
+
+def _layer14_clear_addr_key_pollution_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_clear_addr_key_pollution_rules(S))
+    return ir
+
+
 def make_layer14_clear_addr_key_pollution_op() -> Operation:
     """L14 FFN: Clear ADDR_KEY pollution at non-MEM, non-marker positions.
 
     Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
     counter on ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
     Second in the chain (phase=14.2).
+
+    Migration (Phase 6 wave 3J): per-unit writes declared via
+    :func:`_layer14_clear_addr_key_pollution_rules` and attached as
+    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_clear_addr_key_pollution
         ffn = block.ffn
         # Pinned to chain offset 4 (after layer14_temp_clear consumes 0..3).
         # Byte-identical with the legacy ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_clear_addr_key_pollution")
-        next_unit = _set_layer14_clear_addr_key_pollution(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_clear_addr_key_pollution_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -974,6 +1032,7 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_clear_addr_key_pollution_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
