@@ -200,6 +200,14 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         # 8 and 9 -> max index 10. The aggregator takes the per-block max
         # across all annotated ops, so reporting 10 here covers both.
         ffn_units_used=10,
+        # B12 backfill (wave 1c): basic ``after`` reference per
+        # docs/B12_BACKFILL_SPEC.md §26 (manual-judgment bucket; the
+        # register-aware ``produces`` model is deferred). This op cancels
+        # ``phase_a_ffn``'s initial-PC token-embedding bake, so the strict
+        # ``after`` edge is the load-bearing constraint. ``layer_pin=2``
+        # via ``layer_idx`` already keeps it on L2 during the static path;
+        # the dynamic scheduler honours the requires["after"] edge.
+        requires={"after": "phase_a_ffn"},
         step_idx={0},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
