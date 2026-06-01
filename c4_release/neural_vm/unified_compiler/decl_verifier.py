@@ -3825,6 +3825,16 @@ def verify_rule_strength(
 
     rules = _collect_ffn_rules_from_op(op)
 
+    # Cache parsed dom_scope predicates (only a handful of distinct
+    # dominance scope strings are typical -- e.g. "is_byte", "mark == MEM").
+    parsed_dom_cache: Dict[str, object] = {}
+    # Cache overlaps(eff_scope, dom_scope) results.  effective_scope is a
+    # Predicate; we key by ``(id(eff), dom_scope_str)`` because
+    # effective_predicate yields fresh Predicate instances per rule but
+    # many writers share identical structure -- we use id() for hashability
+    # and reset per verifier call.
+    overlap_cache: Dict[tuple, bool] = {}
+
     for rule in rules:
         rule_name = getattr(rule, "name", "<anonymous>")
 
@@ -3848,15 +3858,22 @@ def verify_rule_strength(
                     })
                 continue
 
-            try:
-                dom_scope = parse(dom_scope_str)
-            except Exception as e:
-                issues.append({
-                    "kind": "dominates_at_parse_error",
-                    "rule": rule_name,
-                    "output_dim": f"{output_dim}+{output_offset}",
-                    "reason": str(e),
-                })
+            if dom_scope_str in parsed_dom_cache:
+                dom_scope = parsed_dom_cache[dom_scope_str]
+            else:
+                try:
+                    dom_scope = parse(dom_scope_str)
+                except Exception as e:
+                    issues.append({
+                        "kind": "dominates_at_parse_error",
+                        "rule": rule_name,
+                        "output_dim": f"{output_dim}+{output_offset}",
+                        "reason": str(e),
+                    })
+                    parsed_dom_cache[dom_scope_str] = None
+                    continue
+                parsed_dom_cache[dom_scope_str] = dom_scope
+            if dom_scope is None:
                 continue
 
             # Find competing writers at the same output_dim+offset whose
@@ -3868,7 +3885,12 @@ def verify_rule_strength(
             for w in all_writers:
                 if w.rule is rule:
                     continue
-                if overlaps(w.effective_scope, dom_scope):
+                cache_key = (id(w.effective_scope), dom_scope_str)
+                cached = overlap_cache.get(cache_key)
+                if cached is None:
+                    cached = overlaps(w.effective_scope, dom_scope)
+                    overlap_cache[cache_key] = cached
+                if cached:
                     competing.append(w)
 
             # This rule's contribution
@@ -3917,7 +3939,7 @@ def verify_rule_strength(
 def _collect_ffn_rules_from_op(op) -> List:
     """Walk an Operation to find its FFNRules. Operations expose rules
     via ``.compiler_ir`` which can be an FFNOp, a CompilerIR with
-    ``.layers[].ffn``, a list, or other shapes.  Handles the common
+    ``.layers[].ffn``, a list, or other shapes. Handles the common
     cases; returns ``[]`` for ops without FFN rules."""
     from neural_vm.unified_compiler.ir import FFNRule, FFNOp
 
@@ -3926,17 +3948,17 @@ def _collect_ffn_rules_from_op(op) -> List:
         return []
 
     rules: List = []
-    # FFNOp case
-    if isinstance(ir, FFNOp):
-        return list(ir.rules)
-    # CompilerIR with .layers[].ffn (mirrors writer_index._collect_ffn_rules_from_op)
+    # CompilerIR with .layers[].ffn (preferred — same shape used by S-4
+    # writer_index._collect_ffn_rules_from_op).
     if hasattr(ir, "layers"):
         for layer in ir.layers:
             ffn = getattr(layer, "ffn", None)
             if ffn is not None and hasattr(ffn, "rules"):
                 rules.extend(ffn.rules)
-        if rules:
-            return rules
+        return rules
+    # FFNOp case
+    if isinstance(ir, FFNOp):
+        return list(ir.rules)
     # List-of-rules case
     if isinstance(ir, list):
         for item in ir:
