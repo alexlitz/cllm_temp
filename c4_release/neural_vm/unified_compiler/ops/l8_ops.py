@@ -408,7 +408,7 @@ def make_layer8_multibyte_routing_op() -> Operation:
         phase=8.3,
         reads={"IS_BYTE", "H1", "OP_IMM", "MARK_AX",
                "AX_CARRY_LO", "AX_CARRY_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -423,7 +423,7 @@ def make_layer8_multibyte_routing_op() -> Operation:
         # L8 FFN extension covers the IMM multi-byte path.
         produces={
             "OUTPUT_LO": "AX_byte0",
-            "OUTPUT_HI": "AX_byte0",
+            "OUTPUT_HI_THIS_STEP": "AX_byte0",
         },
         # ``_set_layer8_multibyte_routing`` re-invokes ``_set_layer8_alu``
         # internally to recover the ALU-final unit cursor (~2023) and then
@@ -467,7 +467,7 @@ def _layer8_multibyte_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=conditions,
             threshold=6.5,
             gate=f"AX_CARRY_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 8.0 / S),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 8.0 / S),),
         ))
     return tuple(rules)
 
@@ -764,7 +764,7 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         # for the staleness analyzer (it only checks producer.phase <=
         # consumer.phase); 8.05 keeps the L8 attn bakes contiguous.
         phase=8.05,
-        reads={"MARK_AX", "HAS_SE", "OUTPUT_LO", "OUTPUT_HI", "CONST",
+        reads={"MARK_AX", "HAS_SE", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CONST",
                "OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR", "OP_LEV",
                "OP_BZ", "OP_BNZ", "OP_PSH", "OP_ADJ", "OP_ENT",
                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",

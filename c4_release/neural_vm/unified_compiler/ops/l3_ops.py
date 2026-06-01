@@ -39,24 +39,24 @@ def make_layer3_ffn_op() -> Operation:
     #   units 0/1:     PC default emit -> OUTPUT_LO+10 (low nibble of PC byte0
     #                  default for STACK_INIT-style residue) and EMBED_LO+10
     #                  carry (legacy default kept for residue safety).
-    #   units 2/3:     analogous OUTPUT_HI+0 / EMBED_HI+0 PC default.
+    #   units 2/3:     analogous OUTPUT_HI_THIS_STEP+0 / EMBED_HI+0 PC default.
     #   units 6..49:   STACK0 marker carry suppressor / SP/BP/STACK0 default
     #                  blocks, each writing a single OUTPUT_LO+0 or
-    #                  OUTPUT_HI+0 cell (alternating; see
+    #                  OUTPUT_HI_THIS_STEP+0 cell (alternating; see
     #                  _set_layer3_ffn in vm_step.py and the suppressor
     #                  ``_suppress_layer3_stack0_marker_carry_projection``).
     #   unit 12:       BP default emits OUTPUT_LO+1 (one-byte default).
     #   unit 20:       SP default emits OUTPUT_LO+1.
     #   units 82..85:  STACK0 NEXT_STACK0 carry chain.
-    #   unit 83:       also writes OUTPUT_LO+0 / OUTPUT_HI+0.
+    #   unit 83:       also writes OUTPUT_LO+0 / OUTPUT_HI_THIS_STEP+0.
     #   units 86..101: PC LEV-return OUTPUT_LO+(unit-86) for k=0..15
     #                  (LEV BP relay nibble-by-nibble).
-    #   units 102..117: PC LEV-return OUTPUT_HI+(unit-102) for k=0..15.
+    #   units 102..117: PC LEV-return OUTPUT_HI_THIS_STEP+(unit-102) for k=0..15.
     #   units 118..133: PC byte1 carry pairs; unit (118+k) writes
-    #                   OUTPUT_HI+k and OUTPUT_HI+(k+1) — adjacent-nibble
-    #                   carry. Unit 133 wraps and writes OUTPUT_HI+0/+15.
+    #                   OUTPUT_HI_THIS_STEP+k and OUTPUT_HI_THIS_STEP+(k+1) — adjacent-nibble
+    #                   carry. Unit 133 wraps and writes OUTPUT_HI_THIS_STEP+0/+15.
     #   units 134/135: byte1 ones from _add_layer3_pc_byte1_output_rules
-    #                  (write OUTPUT_LO+0/+1 and OUTPUT_HI+0).
+    #                  (write OUTPUT_LO+0/+1 and OUTPUT_HI_THIS_STEP+0).
     _claims = set()
     # PC default residue carries (units 0-3).
     _claims.add((3, "ffn_W_down", "0", "EMBED_LO+10"))
@@ -64,10 +64,10 @@ def make_layer3_ffn_op() -> Operation:
     _claims.add((3, "ffn_W_down", "1", "EMBED_LO+10"))
     _claims.add((3, "ffn_W_down", "1", "OUTPUT_LO+10"))
     _claims.add((3, "ffn_W_down", "2", "EMBED_HI+0"))
-    _claims.add((3, "ffn_W_down", "2", "OUTPUT_HI+0"))
+    _claims.add((3, "ffn_W_down", "2", "OUTPUT_HI_THIS_STEP+0"))
     _claims.add((3, "ffn_W_down", "3", "EMBED_HI+0"))
-    _claims.add((3, "ffn_W_down", "3", "OUTPUT_HI+0"))
-    # Units 6..49: alternating OUTPUT_LO+0 / OUTPUT_HI+0 default writers, with
+    _claims.add((3, "ffn_W_down", "3", "OUTPUT_HI_THIS_STEP+0"))
+    # Units 6..49: alternating OUTPUT_LO+0 / OUTPUT_HI_THIS_STEP+0 default writers, with
     # OUTPUT_LO+1 exceptions at units 12 and 20.
     for unit in range(6, 50):
         if unit in (12, 20):
@@ -75,11 +75,11 @@ def make_layer3_ffn_op() -> Operation:
         elif unit % 2 == 0:
             _claims.add((3, "ffn_W_down", str(unit), "OUTPUT_LO+0"))
         else:
-            _claims.add((3, "ffn_W_down", str(unit), "OUTPUT_HI+0"))
+            _claims.add((3, "ffn_W_down", str(unit), "OUTPUT_HI_THIS_STEP+0"))
     # Units 82..85: NEXT_STACK0 carry chain.
     for unit in (82, 83, 84, 85):
         _claims.add((3, "ffn_W_down", str(unit), "NEXT_STACK0+0"))
-    _claims.add((3, "ffn_W_down", "83", "OUTPUT_HI+0"))
+    _claims.add((3, "ffn_W_down", "83", "OUTPUT_HI_THIS_STEP+0"))
     _claims.add((3, "ffn_W_down", "83", "OUTPUT_LO+0"))
     # Units 86..101: LEV nibble relay over OUTPUT_LO. Hidden units 86..93
     # drive OUTPUT_LO+8..+15 (high nibble of byte 0), then 94..101 drive
@@ -88,22 +88,22 @@ def make_layer3_ffn_op() -> Operation:
     for k in range(8):
         _claims.add((3, "ffn_W_down", str(86 + k), f"OUTPUT_LO+{8 + k}"))
         _claims.add((3, "ffn_W_down", str(94 + k), f"OUTPUT_LO+{k}"))
-    # Units 102..117: OUTPUT_HI+(unit-102) for k=0..15 (full HI nibble band).
+    # Units 102..117: OUTPUT_HI_THIS_STEP+(unit-102) for k=0..15 (full HI nibble band).
     for k in range(16):
-        _claims.add((3, "ffn_W_down", str(102 + k), f"OUTPUT_HI+{k}"))
-    # Units 118..132: byte1 carry pairs, each writing OUTPUT_HI+k & OUTPUT_HI+k+1.
+        _claims.add((3, "ffn_W_down", str(102 + k), f"OUTPUT_HI_THIS_STEP+{k}"))
+    # Units 118..132: byte1 carry pairs, each writing OUTPUT_HI_THIS_STEP+k & OUTPUT_HI_THIS_STEP+k+1.
     for k in range(15):
-        _claims.add((3, "ffn_W_down", str(118 + k), f"OUTPUT_HI+{k}"))
-        _claims.add((3, "ffn_W_down", str(118 + k), f"OUTPUT_HI+{k + 1}"))
-    # Unit 133: wraps from OUTPUT_HI+15 back to OUTPUT_HI+0.
-    _claims.add((3, "ffn_W_down", "133", "OUTPUT_HI+0"))
-    _claims.add((3, "ffn_W_down", "133", "OUTPUT_HI+15"))
+        _claims.add((3, "ffn_W_down", str(118 + k), f"OUTPUT_HI_THIS_STEP+{k}"))
+        _claims.add((3, "ffn_W_down", str(118 + k), f"OUTPUT_HI_THIS_STEP+{k + 1}"))
+    # Unit 133: wraps from OUTPUT_HI_THIS_STEP+15 back to OUTPUT_HI_THIS_STEP+0.
+    _claims.add((3, "ffn_W_down", "133", "OUTPUT_HI_THIS_STEP+0"))
+    _claims.add((3, "ffn_W_down", "133", "OUTPUT_HI_THIS_STEP+15"))
     # Units 134/135: PC byte1 = 1 emission (added by
     # _add_layer3_pc_byte1_output_rules at the end of the bake).
     for unit in ("134", "135"):
         _claims.add((3, "ffn_W_down", unit, "OUTPUT_LO+0"))
         _claims.add((3, "ffn_W_down", unit, "OUTPUT_LO+1"))
-        _claims.add((3, "ffn_W_down", unit, "OUTPUT_HI+0"))
+        _claims.add((3, "ffn_W_down", unit, "OUTPUT_HI_THIS_STEP+0"))
 
     return Operation(
         name="layer3_ffn",
@@ -113,7 +113,7 @@ def make_layer3_ffn_op() -> Operation:
                "TEMP", "IS_BYTE", "H1", "H4", "OP_LEV",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
-        writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "EMBED_LO", "EMBED_HI",
                 "NEXT_STACK0"},
         kind="block",
         layer_idx=3,
@@ -353,7 +353,7 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
                "TEMP", "IS_BYTE", "H1", "H4", "OP_LEV",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
-        writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "EMBED_LO", "EMBED_HI",
                 "NEXT_STACK0"},
         kind="ffn",
         bake_fn=bake,
@@ -428,7 +428,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
     # Head 5: AX_FULL relay V slots from OUTPUT_LO/HI.
     for k in range(16):
         _claims.add((3, "attn_W_v", f"5_{1 + k}", f"OUTPUT_LO+{k}"))
-        _claims.add((3, "attn_W_v", f"5_{17 + k}", f"OUTPUT_HI+{k}"))
+        _claims.add((3, "attn_W_v", f"5_{17 + k}", f"OUTPUT_HI_THIS_STEP+{k}"))
     # Head 6: BP→PC LEV relay V slots from CLEAN_EMBED_LO/HI.
     for k in range(16):
         _claims.add((3, "attn_W_v", f"6_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
@@ -445,9 +445,9 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV", "HAS_SE",
                "H1", "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI", "CONST"},
+               "EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
-                "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI",
+                "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
                 "TEMP", "ADDR_KEY"},
         kind="attn",
         layer_idx=3,

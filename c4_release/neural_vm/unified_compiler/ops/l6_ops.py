@@ -157,7 +157,7 @@ def _append_pc_byte0_direct_copy_rules(
             conditions=conditions,
             threshold=threshold,
             gate=f"{hi_source}+{k}",
-            writes=((f"OUTPUT_HI+{k}", write_scale),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
         ))
 
 
@@ -173,7 +173,7 @@ def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     )
     write_scale = 2.0 / S
 
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_jmp_all_step_cancel_{band}_{k}",
@@ -212,7 +212,7 @@ def _layer6_imm_fetch_route_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / S
     for band, source_base, output_base in (
         ("lo", "FETCH_LO", "OUTPUT_LO"),
-        ("hi", "FETCH_HI", "OUTPUT_HI"),
+        ("hi", "FETCH_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
             rules.append(FFNRule.gated_write(
@@ -280,7 +280,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     threshold = 21.5
     write_scale = 2.0 / S
 
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_jsr_all_step_cancel_{band}_{k}",
@@ -305,7 +305,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=conditions,
             threshold=threshold,
             gate=f"FETCH_LO+{k}",
-            writes=((f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", write_scale),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{_pc_target_hi_from_index(k)}", write_scale),),
         ))
     odd_imm_hi_gate = tuple(
         (f"FETCH_HI+{k}", 1.0)
@@ -334,9 +334,9 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=threshold + 0.5,
             gate_terms=odd_imm_hi_gate,
             writes=(
-                (f"OUTPUT_HI+{_pc_target_hi_from_index(k)}", -write_scale),
+                (f"OUTPUT_HI_THIS_STEP+{_pc_target_hi_from_index(k)}", -write_scale),
                 (
-                    f"OUTPUT_HI+{_pc_target_hi_plus_odd_imm_hi_from_index(k)}",
+                    f"OUTPUT_HI_THIS_STEP+{_pc_target_hi_plus_odd_imm_hi_from_index(k)}",
                     write_scale,
                 ),
             ),
@@ -426,7 +426,7 @@ def _layer6_delayed_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ("CONST", -1000.0),
     )
     write_scale = 2.0 / S
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_delayed_jmp_cancel_{band}_{k}",
@@ -460,7 +460,7 @@ def _layer6_first_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     )
     write_scale = 2.0 / S
     threshold = 5.0
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_first_step_jmp_cancel_{band}_{k}",
@@ -546,7 +546,7 @@ def _layer6_stack_identity_rules(S: float) -> tuple[FFNRule, ...]:
         )
         for band, source_base, output_base in (
             ("lo", "EMBED_LO", "OUTPUT_LO"),
-            ("hi", "EMBED_HI", "OUTPUT_HI"),
+            ("hi", "EMBED_HI", "OUTPUT_HI_THIS_STEP"),
         ):
             for k in range(16):
                 rules.append(FFNRule.gated_write(
@@ -613,8 +613,8 @@ def _layer6_sp_decrement_rules(
             threshold=threshold,
             gate=f"EMBED_HI+{k}",
             writes=(
-                (f"OUTPUT_HI+{new_k_borrow}", write_scale),
-                (f"OUTPUT_HI+{k}", -write_scale),
+                (f"OUTPUT_HI_THIS_STEP+{new_k_borrow}", write_scale),
+                (f"OUTPUT_HI_THIS_STEP+{k}", -write_scale),
             ),
         ))
     return tuple(rules)
@@ -639,8 +639,8 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0)),
             threshold=1.5,
             writes=(
-                ("OUTPUT_HI+15", write_scale),
-                ("OUTPUT_HI+0", -write_scale),
+                ("OUTPUT_HI_THIS_STEP+15", write_scale),
+                ("OUTPUT_HI_THIS_STEP+0", -write_scale),
             ),
         ),
     )
@@ -673,7 +673,7 @@ def _layer6_jsr_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=conditions,
             threshold=3.5,
             gate="CONST",
-            writes=((f"OUTPUT_HI+{hi}", 10.0 / S),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{hi}", 10.0 / S),),
         ))
     return tuple(rules)
 
@@ -686,7 +686,7 @@ def _layer6_psh_stack0_writeback_rules(S: float) -> tuple[FFNRule, ...]:
     conditions = (("PSH_AT_SP", 1.0), ("MARK_STACK0", 1.0))
     for band, embed_base, alu_base, output_base in (
         ("lo", "EMBED_LO", "ALU_LO", "OUTPUT_LO"),
-        ("hi", "EMBED_HI", "ALU_HI", "OUTPUT_HI"),
+        ("hi", "EMBED_HI", "ALU_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
             rules.append(FFNRule.gated_write(
@@ -828,7 +828,7 @@ def _layer6_ent_first_step_sp_byte0_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=conditions,
             threshold=1.5,
             gate=f"FETCH_HI+{imm_hi}",
-            writes=((f"OUTPUT_HI+{result_hi}", 5.0 / S),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{result_hi}", 5.0 / S),),
         ))
     return tuple(rules)
 
@@ -862,7 +862,7 @@ def _layer6_ent_first_step_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=conditions,
             threshold=4.0,
             gate="CONST",
-            writes=((f"OUTPUT_HI+{hi}", scale),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{hi}", scale),),
         ))
     return tuple(rules)
 
@@ -884,12 +884,12 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=7.5,
             writes=(
                 ("OUTPUT_LO+8", 0.10),
-                ("OUTPUT_HI+14", 0.05),
+                ("OUTPUT_HI_THIS_STEP+14", 0.05),
                 ("OUTPUT_LO+0", -0.05),
                 ("OUTPUT_LO+10", -0.05),
                 ("OUTPUT_LO+14", -0.05),
-                ("OUTPUT_HI+1", -0.05),
-                ("OUTPUT_HI+15", -0.05),
+                ("OUTPUT_HI_THIS_STEP+1", -0.05),
+                ("OUTPUT_HI_THIS_STEP+15", -0.05),
             ),
             # F-9: fires at SP marker rows for ENT-after-JSR (any non-zero
             # ENT immediate whose ones-place is 8 — e.g. SP=0xffe8 for
@@ -899,7 +899,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             scope="mark == SP AND opcode_in_step in {ENT}",
             dominates_at={
                 "OUTPUT_LO": "mark == SP AND opcode_in_step in {ENT}",
-                "OUTPUT_HI": "mark == SP AND opcode_in_step in {ENT}",
+                "OUTPUT_HI_THIS_STEP": "mark == SP AND opcode_in_step in {ENT}",
             },
         ),
         FFNRule.constant_write(
@@ -915,11 +915,11 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=7.5,
             writes=(
                 ("OUTPUT_LO+0", 0.10),
-                ("OUTPUT_HI+15", 0.10),
+                ("OUTPUT_HI_THIS_STEP+15", 0.10),
                 ("OUTPUT_LO+8", -0.05),
                 ("OUTPUT_LO+10", -0.05),
-                ("OUTPUT_HI+0", -0.05),
-                ("OUTPUT_HI+14", -0.05),
+                ("OUTPUT_HI_THIS_STEP+0", -0.05),
+                ("OUTPUT_HI_THIS_STEP+14", -0.05),
             ),
             # F-9: SP marker row for ENT 0 (SP byte0 = 0xf0). ENT-immediate
             # discrimination via EMBED nibble lanes is not visible to the
@@ -928,7 +928,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             scope="mark == SP AND opcode_in_step in {ENT}",
             dominates_at={
                 "OUTPUT_LO": "mark == SP AND opcode_in_step in {ENT}",
-                "OUTPUT_HI": "mark == SP AND opcode_in_step in {ENT}",
+                "OUTPUT_HI_THIS_STEP": "mark == SP AND opcode_in_step in {ENT}",
             },
         ),
         FFNRule.constant_write(
@@ -941,15 +941,15 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=6.5,
             writes=(
                 ("OUTPUT_LO+0", 0.30),
-                ("OUTPUT_HI+15", 0.30),
+                ("OUTPUT_HI_THIS_STEP+15", 0.30),
                 ("OUTPUT_LO+8", -0.10),
-                ("OUTPUT_HI+1", -0.10),
+                ("OUTPUT_HI_THIS_STEP+1", -0.10),
             ),
             # F-9: BP marker row right after JSR; BP byte 0 -> 0xf0.
             scope="mark == BP AND opcode_in_step in {ENT}",
             dominates_at={
                 "OUTPUT_LO": "mark == BP AND opcode_in_step in {ENT}",
-                "OUTPUT_HI": "mark == BP AND opcode_in_step in {ENT}",
+                "OUTPUT_HI_THIS_STEP": "mark == BP AND opcode_in_step in {ENT}",
             },
         ),
         FFNRule.constant_write(
@@ -964,9 +964,9 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=8.5,
             writes=(
                 ("OUTPUT_LO+15", 0.10),
-                ("OUTPUT_HI+15", 0.10),
+                ("OUTPUT_HI_THIS_STEP+15", 0.10),
                 ("OUTPUT_LO+0", -0.10),
-                ("OUTPUT_HI+0", -0.10),
+                ("OUTPUT_HI_THIS_STEP+0", -0.10),
             ),
             # F-9: byte-position 0 row carrying the BP byte 1 staging
             # under H1+3 staging. BP-discrimination via H1+3 not modeled
@@ -974,7 +974,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             scope="is_byte AND byte_index == 0 AND opcode_in_step in {ENT}",
             dominates_at={
                 "OUTPUT_LO": "is_byte AND byte_index == 0 AND opcode_in_step in {ENT}",
-                "OUTPUT_HI": "is_byte AND byte_index == 0 AND opcode_in_step in {ENT}",
+                "OUTPUT_HI_THIS_STEP": "is_byte AND byte_index == 0 AND opcode_in_step in {ENT}",
             },
         ),
         FFNRule.constant_write(
@@ -989,16 +989,16 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=8.5,
             writes=(
                 ("OUTPUT_LO+0", 0.30),
-                ("OUTPUT_HI+0", 0.30),
+                ("OUTPUT_HI_THIS_STEP+0", 0.30),
                 ("OUTPUT_LO+1", -0.30),
                 ("OUTPUT_LO+15", -0.10),
-                ("OUTPUT_HI+15", -0.10),
+                ("OUTPUT_HI_THIS_STEP+15", -0.10),
             ),
             # F-9: byte-position 1 row for BP byte 2 = 0x00.
             scope="is_byte AND byte_index == 1 AND opcode_in_step in {ENT}",
             dominates_at={
                 "OUTPUT_LO": "is_byte AND byte_index == 1 AND opcode_in_step in {ENT}",
-                "OUTPUT_HI": "is_byte AND byte_index == 1 AND opcode_in_step in {ENT}",
+                "OUTPUT_HI_THIS_STEP": "is_byte AND byte_index == 1 AND opcode_in_step in {ENT}",
             },
         ),
         FFNRule.constant_write(
@@ -1013,16 +1013,16 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=8.5,
             writes=(
                 ("OUTPUT_LO+0", 0.30),
-                ("OUTPUT_HI+0", 0.30),
+                ("OUTPUT_HI_THIS_STEP+0", 0.30),
                 ("OUTPUT_LO+1", -0.30),
                 ("OUTPUT_LO+15", -0.10),
-                ("OUTPUT_HI+15", -0.10),
+                ("OUTPUT_HI_THIS_STEP+15", -0.10),
             ),
             # F-9: byte-position 2 row for BP byte 3 = 0x00.
             scope="is_byte AND byte_index == 2 AND opcode_in_step in {ENT}",
             dominates_at={
                 "OUTPUT_LO": "is_byte AND byte_index == 2 AND opcode_in_step in {ENT}",
-                "OUTPUT_HI": "is_byte AND byte_index == 2 AND opcode_in_step in {ENT}",
+                "OUTPUT_HI_THIS_STEP": "is_byte AND byte_index == 2 AND opcode_in_step in {ENT}",
             },
         ),
         FFNRule.constant_write(
@@ -1035,17 +1035,17 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=6.5,
             writes=(
                 ("OUTPUT_LO+0", 0.30),
-                ("OUTPUT_HI+0", 0.30),
+                ("OUTPUT_HI_THIS_STEP+0", 0.30),
                 ("OUTPUT_LO+2", -0.10),
                 ("OUTPUT_LO+12", -0.10),
-                ("OUTPUT_HI+1", -0.10),
-                ("OUTPUT_HI+2", -0.10),
+                ("OUTPUT_HI_THIS_STEP+1", -0.10),
+                ("OUTPUT_HI_THIS_STEP+2", -0.10),
             ),
             # F-9: STACK0 marker row right after JSR; byte 0 -> 0x00.
             scope="mark == STACK0 AND opcode_in_step in {ENT}",
             dominates_at={
                 "OUTPUT_LO": "mark == STACK0 AND opcode_in_step in {ENT}",
-                "OUTPUT_HI": "mark == STACK0 AND opcode_in_step in {ENT}",
+                "OUTPUT_HI_THIS_STEP": "mark == STACK0 AND opcode_in_step in {ENT}",
             },
         ),
     )
@@ -1064,7 +1064,7 @@ def _layer6_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     )
     target_conditions = cancel_conditions + (("MARK_STACK0", -10.0),)
     write_scale = 2.0 / S
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_bz_cancel_{band}_{k}",
@@ -1109,7 +1109,7 @@ def _layer6_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ),
     )
     for group, conditions, threshold in groups:
-        for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+        for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
             for k in range(16):
                 rules.append(FFNRule.gated_write(
                     name=f"l6_bnz_{group}_cancel_{band}_{k}",
@@ -1187,7 +1187,7 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
     for group, conditions, threshold in groups:
-        for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+        for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
             for k in range(16):
                 rules.append(FFNRule.gated_write(
                     name=f"l6_branch_pc_byte1_{group}_cancel_{band}_{k}",
@@ -1213,7 +1213,7 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=conditions,
             threshold=threshold,
             gate="CONST",
-            writes=(("OUTPUT_HI+0", const_zero_scale),),
+            writes=(("OUTPUT_HI_THIS_STEP+0", const_zero_scale),),
         ))
 
     return tuple(rules)
@@ -1282,7 +1282,7 @@ def _layer6_stack_writeback_rules(
     write_scale = 2.0 / S
     for band, embed_base, carry_base, output_base in (
         ("lo", "EMBED_LO", "AX_CARRY_LO", "OUTPUT_LO"),
-        ("hi", "EMBED_HI", "AX_CARRY_HI", "OUTPUT_HI"),
+        ("hi", "EMBED_HI", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
             rules.append(FFNRule.gated_write(
@@ -1309,7 +1309,7 @@ def _layer6_ax_output_route_rules(
     write_scale = 2.0 / S
     for band, source_base, output_base in (
         ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
-        ("hi", "AX_CARRY_HI", "OUTPUT_HI"),
+        ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
             rules.append(FFNRule.gated_write(
@@ -2183,10 +2183,10 @@ def make_layer6_routing_ffn_op() -> Operation:
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
                "AX_CARRY_LO", "AX_CARRY_HI", "CMP",
-               "OUTPUT_LO", "OUTPUT_HI", "HAS_SE",
+               "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
                "TEMP", "DIV_STAGING"},
-        writes={"OUTPUT_LO", "OUTPUT_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -2202,7 +2202,7 @@ def make_layer6_routing_ffn_op() -> Operation:
         spec_section="BLOG_SPEC.md#function-calls",
         produces={
             "OUTPUT_LO": "AX_byte0",
-            "OUTPUT_HI": "AX_byte0",
+            "OUTPUT_HI_THIS_STEP": "AX_byte0",
         },
         opcodes={"OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR"},
     )
@@ -2238,12 +2238,12 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1668", "EMBED_LO+8"),
         (6, "ffn_W_up", "1668", "EMBED_HI+15"),
         (6, "ffn_W_down", "1668", "OUTPUT_LO+8"),
-        (6, "ffn_W_down", "1668", "OUTPUT_HI+14"),
+        (6, "ffn_W_down", "1668", "OUTPUT_HI_THIS_STEP+14"),
         (6, "ffn_W_down", "1668", "OUTPUT_LO+0"),
         (6, "ffn_W_down", "1668", "OUTPUT_LO+10"),
         (6, "ffn_W_down", "1668", "OUTPUT_LO+14"),
-        (6, "ffn_W_down", "1668", "OUTPUT_HI+1"),
-        (6, "ffn_W_down", "1668", "OUTPUT_HI+15"),
+        (6, "ffn_W_down", "1668", "OUTPUT_HI_THIS_STEP+1"),
+        (6, "ffn_W_down", "1668", "OUTPUT_HI_THIS_STEP+15"),
         # Unit 1669: l6_ent_after_jsr_sp_byte0_f0_when_ent_zero
         (6, "ffn_W_up", "1669", "OP_ENT+0"),
         (6, "ffn_W_up", "1669", "MARK_SP+0"),
@@ -2252,19 +2252,19 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1669", "EMBED_HI+15"),
         (6, "ffn_W_up", "1669", "EMBED_LO+8"),
         (6, "ffn_W_down", "1669", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1669", "OUTPUT_HI+15"),
+        (6, "ffn_W_down", "1669", "OUTPUT_HI_THIS_STEP+15"),
         (6, "ffn_W_down", "1669", "OUTPUT_LO+8"),
         (6, "ffn_W_down", "1669", "OUTPUT_LO+10"),
-        (6, "ffn_W_down", "1669", "OUTPUT_HI+0"),
-        (6, "ffn_W_down", "1669", "OUTPUT_HI+14"),
+        (6, "ffn_W_down", "1669", "OUTPUT_HI_THIS_STEP+0"),
+        (6, "ffn_W_down", "1669", "OUTPUT_HI_THIS_STEP+14"),
         # Unit 1670: l6_ent_after_jsr_bp_byte0_f0
         (6, "ffn_W_up", "1670", "OP_ENT+0"),
         (6, "ffn_W_up", "1670", "MARK_BP+0"),
         (6, "ffn_W_up", "1670", "HAS_SE+0"),
         (6, "ffn_W_down", "1670", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1670", "OUTPUT_HI+15"),
+        (6, "ffn_W_down", "1670", "OUTPUT_HI_THIS_STEP+15"),
         (6, "ffn_W_down", "1670", "OUTPUT_LO+8"),
-        (6, "ffn_W_down", "1670", "OUTPUT_HI+1"),
+        (6, "ffn_W_down", "1670", "OUTPUT_HI_THIS_STEP+1"),
         # Unit 1671: l6_ent_after_jsr_bp_byte1_ff
         (6, "ffn_W_up", "1671", "OP_ENT+0"),
         (6, "ffn_W_up", "1671", "IS_BYTE+0"),
@@ -2272,9 +2272,9 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1671", "BYTE_INDEX_0+0"),
         (6, "ffn_W_up", "1671", "HAS_SE+0"),
         (6, "ffn_W_down", "1671", "OUTPUT_LO+15"),
-        (6, "ffn_W_down", "1671", "OUTPUT_HI+15"),
+        (6, "ffn_W_down", "1671", "OUTPUT_HI_THIS_STEP+15"),
         (6, "ffn_W_down", "1671", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1671", "OUTPUT_HI+0"),
+        (6, "ffn_W_down", "1671", "OUTPUT_HI_THIS_STEP+0"),
         # Unit 1672: l6_ent_after_jsr_bp_byte2_00
         (6, "ffn_W_up", "1672", "OP_ENT+0"),
         (6, "ffn_W_up", "1672", "IS_BYTE+0"),
@@ -2282,10 +2282,10 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1672", "BYTE_INDEX_1+0"),
         (6, "ffn_W_up", "1672", "HAS_SE+0"),
         (6, "ffn_W_down", "1672", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1672", "OUTPUT_HI+0"),
+        (6, "ffn_W_down", "1672", "OUTPUT_HI_THIS_STEP+0"),
         (6, "ffn_W_down", "1672", "OUTPUT_LO+1"),
         (6, "ffn_W_down", "1672", "OUTPUT_LO+15"),
-        (6, "ffn_W_down", "1672", "OUTPUT_HI+15"),
+        (6, "ffn_W_down", "1672", "OUTPUT_HI_THIS_STEP+15"),
         # Unit 1673: l6_ent_after_jsr_bp_byte3_00
         (6, "ffn_W_up", "1673", "OP_ENT+0"),
         (6, "ffn_W_up", "1673", "IS_BYTE+0"),
@@ -2293,27 +2293,27 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1673", "BYTE_INDEX_2+0"),
         (6, "ffn_W_up", "1673", "HAS_SE+0"),
         (6, "ffn_W_down", "1673", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1673", "OUTPUT_HI+0"),
+        (6, "ffn_W_down", "1673", "OUTPUT_HI_THIS_STEP+0"),
         (6, "ffn_W_down", "1673", "OUTPUT_LO+1"),
         (6, "ffn_W_down", "1673", "OUTPUT_LO+15"),
-        (6, "ffn_W_down", "1673", "OUTPUT_HI+15"),
+        (6, "ffn_W_down", "1673", "OUTPUT_HI_THIS_STEP+15"),
         # Unit 1674: l6_ent_after_jsr_stack0_byte0_00
         (6, "ffn_W_up", "1674", "OP_ENT+0"),
         (6, "ffn_W_up", "1674", "MARK_STACK0+0"),
         (6, "ffn_W_up", "1674", "HAS_SE+0"),
         (6, "ffn_W_down", "1674", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1674", "OUTPUT_HI+0"),
+        (6, "ffn_W_down", "1674", "OUTPUT_HI_THIS_STEP+0"),
         (6, "ffn_W_down", "1674", "OUTPUT_LO+2"),
         (6, "ffn_W_down", "1674", "OUTPUT_LO+12"),
-        (6, "ffn_W_down", "1674", "OUTPUT_HI+1"),
-        (6, "ffn_W_down", "1674", "OUTPUT_HI+2"),
+        (6, "ffn_W_down", "1674", "OUTPUT_HI_THIS_STEP+1"),
+        (6, "ffn_W_down", "1674", "OUTPUT_HI_THIS_STEP+2"),
     })
 
     return Operation(
         name="layer6_ent_after_jsr_sp_byte0_fixup",
         phase=6.55,
         reads={"OP_ENT", "MARK_SP", "HAS_SE", "EMBED_LO", "EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -3037,10 +3037,10 @@ def make_binary_pop_sp_increment_op() -> Operation:
     #     OUTPUT_LO+k (the canceling pair).
     #   - units 2310..2325: SP_HI += 1 ladder gated on EMBED_HI+k (k=0..15)
     #     with an additional 8-wide EMBED_LO blocker bank in W_up; W_gate
-    #     selects EMBED_HI+k, W_down writes OUTPUT_HI+(k+1)%16 and OUTPUT_HI+k.
+    #     selects EMBED_HI+k, W_down writes OUTPUT_HI_THIS_STEP+(k+1)%16 and OUTPUT_HI_THIS_STEP+k.
     #   - unit 2326: byte-row pop boundary fixup (BYTE_INDEX_0 + CLEAN_EMBED
     #     gates -> OUTPUT_{LO,HI}+0).
-    #   - unit 2327: same idea for BYTE_INDEX_1 (-> OUTPUT_LO+1, OUTPUT_HI+0
+    #   - unit 2327: same idea for BYTE_INDEX_1 (-> OUTPUT_LO+1, OUTPUT_HI_THIS_STEP+0
     #     plus clean-embed cancels).
     _claims = set()
     # Shared marker / opcode-flag conditions present on every LO/HI unit
@@ -3065,8 +3065,8 @@ def make_binary_pop_sp_increment_op() -> Operation:
             _claims.add((6, "ffn_W_up", str(unit), f"EMBED_LO+{lo_bit}"))
         _claims.add((6, "ffn_W_gate", str(unit), f"EMBED_HI+{unit_off}"))
         new_carry = (unit_off + 1) % 16
-        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI+{new_carry}"))
-        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI+{unit_off}"))
+        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{new_carry}"))
+        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{unit_off}"))
     # byte_row_conditions: IS_BYTE, H1+2, CMP+3, plus 6 marker blockers
     # (-PC, -AX, -SP, -BP, -STACK0, -MEM).
     _byte_row_cond_cols = (
@@ -3081,7 +3081,7 @@ def make_binary_pop_sp_increment_op() -> Operation:
     _claims.add((6, "ffn_W_up", "2326", "CLEAN_EMBED_HI+0"))
     _claims.add((6, "ffn_W_gate", "2326", "CONST+0"))
     _claims.add((6, "ffn_W_down", "2326", "OUTPUT_LO+0"))
-    _claims.add((6, "ffn_W_down", "2326", "OUTPUT_HI+0"))
+    _claims.add((6, "ffn_W_down", "2326", "OUTPUT_HI_THIS_STEP+0"))
     # Unit 2327: l6_binary_pop_sp_byte2_00_to_01_lo
     for col in _byte_row_cond_cols:
         _claims.add((6, "ffn_W_up", "2327", col))
@@ -3090,7 +3090,7 @@ def make_binary_pop_sp_increment_op() -> Operation:
     _claims.add((6, "ffn_W_up", "2327", "CLEAN_EMBED_HI+0"))
     _claims.add((6, "ffn_W_gate", "2327", "CONST+0"))
     _claims.add((6, "ffn_W_down", "2327", "OUTPUT_LO+1"))
-    _claims.add((6, "ffn_W_down", "2327", "OUTPUT_HI+0"))
+    _claims.add((6, "ffn_W_down", "2327", "OUTPUT_HI_THIS_STEP+0"))
     _claims.add((6, "ffn_W_down", "2327", "CLEAN_EMBED_LO+0"))
     _claims.add((6, "ffn_W_down", "2327", "CLEAN_EMBED_HI+0"))
     _claims = frozenset(_claims)
@@ -3152,8 +3152,8 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=1.5,
             gate=f"EMBED_HI+{k}",
             writes=(
-                (f"OUTPUT_HI+{new_k_carry}", write_scale),
-                (f"OUTPUT_HI+{k}", -write_scale),
+                (f"OUTPUT_HI_THIS_STEP+{new_k_carry}", write_scale),
+                (f"OUTPUT_HI_THIS_STEP+{k}", -write_scale),
             ),
         ))
 
@@ -3184,7 +3184,7 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
         gate="CONST",
         writes=(
             ("OUTPUT_LO+0", 10.0 / S),
-            ("OUTPUT_HI+0", 10.0 / S),
+            ("OUTPUT_HI_THIS_STEP+0", 10.0 / S),
         ),
     ))
     rules.append(FFNRule.gated_write(
@@ -3196,7 +3196,7 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
         gate="CONST",
         writes=(
             ("OUTPUT_LO+1", 10.0 / S),
-            ("OUTPUT_HI+0", 10.0 / S),
+            ("OUTPUT_HI_THIS_STEP+0", 10.0 / S),
             ("CLEAN_EMBED_LO+0", -1.5 / S),
             ("CLEAN_EMBED_HI+0", -1.5 / S),
         ),

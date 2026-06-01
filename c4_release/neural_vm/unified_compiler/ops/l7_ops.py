@@ -28,20 +28,20 @@ def make_layer7_operand_gather_op() -> Operation:
     #   Head 0 V slot 1+k reads CLEAN_EMBED_LO+k (STACK0 byte 0 → ALU_LO at AX)
     #   Head 0 V slot 17+k reads CLEAN_EMBED_HI+k (STACK0 byte 0 → ALU_HI at AX)
     #   Head 1 V slot 1+k reads OUTPUT_LO+k (BP/SP OUTPUT → ALU_LO at AX for LEA/ADJ/ENT)
-    #   Head 1 V slot 17+k reads OUTPUT_HI+k
+    #   Head 1 V slot 17+k reads OUTPUT_HI_THIS_STEP+k
     _claims = set()
     for k in range(16):
         _claims.add((7, "attn_W_v", f"0_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
         _claims.add((7, "attn_W_v", f"0_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
         _claims.add((7, "attn_W_v", f"1_{1 + k}", f"OUTPUT_LO+{k}"))
-        _claims.add((7, "attn_W_v", f"1_{17 + k}", f"OUTPUT_HI+{k}"))
+        _claims.add((7, "attn_W_v", f"1_{17 + k}", f"OUTPUT_HI_THIS_STEP+{k}"))
 
     return Operation(
         name="layer7_operand_gather",
         phase=7,
         reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA", "OP_ADJ", "OP_ENT",
                "CONST",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "OUTPUT_LO", "OUTPUT_HI"},
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         writes={"ALU_LO", "ALU_HI"},
         kind="block",
         bake_fn=bake,

@@ -26,7 +26,7 @@ def _guard_l14_output_units_on_step_boundary(
         return
     const_dim = _resolve_dim(dim_positions, "CONST")
     output_lo = _resolve_dim(dim_positions, "OUTPUT_LO")
-    output_hi = _resolve_dim(dim_positions, "OUTPUT_HI")
+    output_hi = _resolve_dim(dim_positions, "OUTPUT_HI_THIS_STEP")
     if (
         const_dim is None
         or output_lo is None
@@ -159,7 +159,7 @@ def _disable_l14_stack0_jsr_hi0_default(
     mark_stack0 = _resolve_dim(dim_positions, "MARK_STACK0")
     op_jsr = _resolve_dim(dim_positions, "OP_JSR")
     is_byte = _resolve_dim(dim_positions, "IS_BYTE")
-    output_hi = _resolve_dim(dim_positions, "OUTPUT_HI")
+    output_hi = _resolve_dim(dim_positions, "OUTPUT_HI_THIS_STEP")
     if (
         mark_stack0 is None
         or op_jsr is None
@@ -204,7 +204,7 @@ def _boost_l14_psh_mem_marker_high_nibbles(
     mark_mem = _resolve_dim(dim_positions, "MARK_MEM")
     mem_store = _resolve_dim(dim_positions, "MEM_STORE")
     psh_at_sp = _resolve_dim(dim_positions, "PSH_AT_SP")
-    output_hi = _resolve_dim(dim_positions, "OUTPUT_HI")
+    output_hi = _resolve_dim(dim_positions, "OUTPUT_HI_THIS_STEP")
     if (
         mark_mem is None
         or mem_store is None
@@ -257,7 +257,7 @@ def make_layer14_mem_generation_op() -> Operation:
                "MEM_STORE", "MEM_ADDR_SRC", "STACK0_BYTE0", "L1H0", "L1H1", "L1H2",
                "H0", "H1", "L1H4", "H2", "H3", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3", "IS_BYTE"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
         layer_idx=14,
         bake_fn=bake,
@@ -406,7 +406,7 @@ def make_layer14_alu_high_byte_relay_op() -> Operation:
                "MARK_STACK0", "STACK0_BYTE0", "OP_MUL",
                "OP_SHL", "OP_LI_RELAY", "OP_LC_RELAY",
                "AX_FULL_LO", "AX_FULL_HI", "TEMP", "CONST"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         layer_idx=15,
         bake_fn=bake,
@@ -775,7 +775,7 @@ def make_layer14_temp_clear_op() -> Operation:
         (14, "ffn_W_down", "2", "TEMP+9"),
     }
     for k in range(16):
-        _claims.add((14, "ffn_W_down", "3", f"OUTPUT_HI+{k}"))
+        _claims.add((14, "ffn_W_down", "3", f"OUTPUT_HI_THIS_STEP+{k}"))
 
     return Operation(
         name="layer14_temp_clear",
@@ -783,7 +783,7 @@ def make_layer14_temp_clear_op() -> Operation:
         reads={"OP_LEV", "MARK_PC", "TEMP", "IS_BYTE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "MARK_AX", "CONST"},
-        writes={"TEMP", "OUTPUT_HI"},
+        writes={"TEMP", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -871,14 +871,14 @@ def make_layer14_clear_output_corruption_op() -> Operation:
     #            zero so the verifier observes no change — intentionally
     #            unclaimed).
     #   units 55..69: _boost_l14_psh_mem_marker_high_nibbles writes one
-    #            W_down[OUTPUT_HI+nibble] per unit for nibble in 1..15.
+    #            W_down[OUTPUT_HI_THIS_STEP+nibble] per unit for nibble in 1..15.
     _claims = {
         (14, "ffn_W_down", "52", "OUTPUT_LO+0"),
-        (14, "ffn_W_down", "53", "OUTPUT_HI+0"),
+        (14, "ffn_W_down", "53", "OUTPUT_HI_THIS_STEP+0"),
     }
     for nibble in range(1, 16):
         _claims.add(
-            (14, "ffn_W_down", str(54 + nibble), f"OUTPUT_HI+{nibble}")
+            (14, "ffn_W_down", str(54 + nibble), f"OUTPUT_HI_THIS_STEP+{nibble}")
         )
 
     return Operation(
@@ -887,8 +887,8 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         reads={"H4", "H1", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "OP_JSR", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "IS_BYTE", "BYTE_INDEX_3", "PSH_AT_SP", "CMP",
-               "MEM_STORE", "OUTPUT_HI", "CONST"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+               "MEM_STORE", "OUTPUT_HI_THIS_STEP", "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -936,7 +936,7 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
             )
             _claims.add(
                 (14, "ffn_W_down", str(base + op_block * 32 + 16 + k),
-                 f"OUTPUT_HI+{k}")
+                 f"OUTPUT_HI_THIS_STEP+{k}")
             )
 
     return Operation(
@@ -945,7 +945,7 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         reads={"OP_JSR", "OP_ENT", "MARK_MEM", "IS_BYTE",
                "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
                "CONST"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -999,16 +999,16 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
     _claims = set()
     for k in range(16):
         _claims.add((14, "ffn_W_down", "1862", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1863", f"OUTPUT_HI+{k}"))
+        _claims.add((14, "ffn_W_down", "1863", f"OUTPUT_HI_THIS_STEP+{k}"))
     _claims.add((14, "ffn_W_down", "1864", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1865", "OUTPUT_HI+0"))
+    _claims.add((14, "ffn_W_down", "1865", "OUTPUT_HI_THIS_STEP+0"))
 
     return Operation(
         name="layer14_jsr_ax_bytes_zero",
         phase=14.6,
         reads={"OP_JSR", "IS_BYTE", "H1", "CONST", "STACK0_BYTE0", "STACK0_BYTE1",
                "STACK0_BYTE2", "STACK0_BYTE3"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -1066,15 +1066,15 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
     _claims = set()
     for k in range(16):
         _claims.add((14, "ffn_W_down", "1870", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1871", f"OUTPUT_HI+{k}"))
+        _claims.add((14, "ffn_W_down", "1871", f"OUTPUT_HI_THIS_STEP+{k}"))
     _claims.add((14, "ffn_W_down", "1872", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1873", "OUTPUT_HI+0"))
+    _claims.add((14, "ffn_W_down", "1873", "OUTPUT_HI_THIS_STEP+0"))
 
     return Operation(
         name="layer14_alu_nocarry_ax_bytes_zero",
         phase=14.8,
         reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -1153,15 +1153,15 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
     _claims = set()
     for k in range(16):
         _claims.add((14, "ffn_W_down", "1866", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1867", f"OUTPUT_HI+{k}"))
+        _claims.add((14, "ffn_W_down", "1867", f"OUTPUT_HI_THIS_STEP+{k}"))
     _claims.add((14, "ffn_W_down", "1868", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1869", "OUTPUT_HI+0"))
+    _claims.add((14, "ffn_W_down", "1869", "OUTPUT_HI_THIS_STEP+0"))
 
     return Operation(
         name="layer14_lc_ax_bytes_zero",
         phase=14.7,
         reads={"OP_LC_RELAY", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,

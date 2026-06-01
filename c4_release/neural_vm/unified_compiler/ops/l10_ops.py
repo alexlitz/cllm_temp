@@ -818,7 +818,7 @@ def make_layer10_byte_passthrough_op() -> Operation:
                "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "MEM_STORE", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
         bake_fn=bake,
         migrated=True,
@@ -844,7 +844,7 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
         reads={"IS_BYTE", "HAS_SE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
         bake_fn=bake,
         migrated=True,
@@ -869,7 +869,7 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
         phase=10,
         reads={"MARK_STACK0", "OP_PSH", "AX_CARRY_LO", "AX_CARRY_HI",
                "OP_LI", "OP_LC", "OP_SI", "OP_SC"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
         bake_fn=bake,
         migrated=True,
@@ -975,7 +975,7 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
                "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "MEM_STORE", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -1017,7 +1017,7 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
                "OP_ENT", "OP_JSR",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -1055,7 +1055,7 @@ def make_layer10_bp_byte_passthrough_bake_op() -> Operation:
         reads={"IS_BYTE", "HAS_SE", "H1", "OP_ENT", "OP_LEV",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -1099,7 +1099,7 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         reads={"MARK_STACK0", "IS_BYTE", "PSH_AT_SP", "H1", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -1148,7 +1148,7 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "MEM_VAL_B2", "MEM_VAL_B3", "H2", "H3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
-        writes={"ALU_LO", "ALU_HI", "OUTPUT_LO", "OUTPUT_HI"},
+        writes={"ALU_LO", "ALU_HI", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -1190,7 +1190,7 @@ def make_layer10_alu_op() -> Operation:
         phase=10.2,
         reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "ALU_HI", "AX_CARRY_HI",
                "OP_OR", "OP_XOR", "OP_AND", "OP_DIV", "OP_MOD"},
-        writes={"OUTPUT_LO", "OUTPUT_HI", "DIV_STAGING"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "DIV_STAGING"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -1251,7 +1251,7 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "MEM_VAL_B2", "MEM_VAL_B3", "H2", "H3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"ALU_LO", "ALU_HI", "OUTPUT_LO", "OUTPUT_HI"},
+        writes={"ALU_LO", "ALU_HI", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
         bake_fn=bake,
         migrated=True,
@@ -1421,11 +1421,11 @@ def make_l10_post_ops_combined() -> Operation:
             "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC",
             "OP_SI", "OP_SC", "OP_PSH", "OP_EXIT", "OP_NOP",
             "OP_PUTCHAR", "OP_GETCHAR",
-            "OUTPUT_LO", "OUTPUT_HI", "ALU_LO", "ALU_HI",
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "ALU_LO", "ALU_HI",
             "CARRY", "CMP", "TEMP",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
         },
-        writes={"OUTPUT_LO", "OUTPUT_HI", "CARRY"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CARRY"},
         kind="ffn",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -1532,7 +1532,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         writes = []
         for k in range(16):
             writes.append((f"OUTPUT_LO+{k}", -strength))
-            writes.append((f"OUTPUT_HI+{k}", -strength))
+            writes.append((f"OUTPUT_HI_THIS_STEP+{k}", -strength))
         return tuple(writes)
 
     def addr_from_l13_rules(
@@ -1745,7 +1745,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         # claim) until the structural conflict is resolved.
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{old_value & 0xF}", output_match_weight),
-                            (f"OUTPUT_HI+{old_value >> 4}", output_match_weight),
+                            (f"OUTPUT_HI_THIS_STEP+{old_value >> 4}", output_match_weight),
                         ),
                         threshold=2105.0,
                         gate="H1+2",
@@ -1788,16 +1788,16 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.gated_write(
                 name="tail_sp_pop_marker_e0_to_e8",
                 scope="mark == SP",
-                dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI": "mark == SP"},
+                dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
                 conditions=base_conditions + (
                     ("OUTPUT_LO+0", 0.1),
-                    ("OUTPUT_HI+14", 2.0),
+                    ("OUTPUT_HI_THIS_STEP+14", 2.0),
                     ("OUTPUT_LO+8", -0.1),
                     ("EMBED_LO+8", -10.0),
                     ("EMBED_HI+13", -10.0),
                     ("EMBED_HI+15", -10.0),
-                    ("OUTPUT_HI+13", -10.0),
-                    ("OUTPUT_HI+0", -0.05),
+                    ("OUTPUT_HI_THIS_STEP+13", -10.0),
+                    ("OUTPUT_HI_THIS_STEP+0", -0.05),
                 ),
                 threshold=9.0,
                 gate="MARK_SP",
@@ -1806,7 +1806,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.gated_write(
                 name="tail_sp_pop_marker_d0_to_d8",
                 scope="mark == SP",
-                dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI": "mark == SP"},
+                dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
                 conditions=(
                     ("MARK_SP", 1.0),
                     ("HAS_SE", 1.0),
@@ -1832,7 +1832,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.gated_write(
                 name="tail_sp_pop_marker_f0_to_f8",
                 scope="mark == SP",
-                dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI": "mark == SP"},
+                dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
                 conditions=(
                     ("MARK_SP", 1.0),
                     ("HAS_SE", 1.0),
@@ -1858,7 +1858,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.gated_write(
                 name="tail_sp_pop_marker_d8_to_e0",
                 scope="mark == SP",
-                dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI": "mark == SP"},
+                dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
                 conditions=(
                     ("MARK_SP", 1.0),
                     ("HAS_SE", 1.0),
@@ -1896,7 +1896,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_sp_pop_byte1_ff_after_e0",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -1926,7 +1926,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_sp_pop_byte1_ff_after_d8",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -1956,7 +1956,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_sp_pop_byte1_ff_after_f8",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -1986,7 +1986,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_sp_pop_byte1_ff_after_e8",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -2029,7 +2029,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_stack0_pushed_addr_byte1_ff_after_e8",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -2061,7 +2061,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_stack0_pushed_addr_byte1_store_ff_after_e8",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -2072,7 +2072,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("CLEAN_EMBED_LO+8", 30.0),
                     ("CLEAN_EMBED_HI+14", 30.0),
                     ("OUTPUT_LO+15", 1.0),
-                    ("OUTPUT_HI+15", 1.0),
+                    ("OUTPUT_HI_THIS_STEP+15", 1.0),
                     *(
                         (f"CLEAN_EMBED_LO+{k}", -100.0)
                         for k in range(16)
@@ -2096,7 +2096,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_stack0_pushed_addr_byte1_store_ff_after_e0",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -2107,7 +2107,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("CLEAN_EMBED_LO+0", 30.0),
                     ("CLEAN_EMBED_HI+14", 30.0),
                     ("OUTPUT_LO+15", 1.0),
-                    ("OUTPUT_HI+15", 1.0),
+                    ("OUTPUT_HI_THIS_STEP+15", 1.0),
                     *(
                         (f"CLEAN_EMBED_LO+{k}", -100.0)
                         for k in range(16)
@@ -2148,7 +2148,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 FFNRule.constant_write(
                     name=f"tail_ax_lea_local_addr_byte1_ff_after_{value:02x}",
                     scope="is_byte",
-                    dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                    dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                     conditions=(
                         ("IS_BYTE", 5.0),
                         ("HAS_SE", 5.0),
@@ -2212,7 +2212,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     FFNRule.constant_write(
                         name=f"tail_stack0_store_byte_{value:02x}",
                         scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
                         conditions=base_conditions + (
                             (f"ALU_LO+{lo}", 1.0),
                             (f"ALU_HI+{hi}", 1.0),
@@ -2258,10 +2258,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     FFNRule.gated_write(
                         name=f"tail_stack0_pop_loaded_byte_{value:02x}",
                         scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{lo}", 0.1),
-                            (f"OUTPUT_HI+{hi}", 0.1),
+                            (f"OUTPUT_HI_THIS_STEP+{hi}", 0.1),
                         ),
                         threshold=10.5,
                         gate="MARK_STACK0",
@@ -2303,12 +2303,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     FFNRule.gated_write(
                         name=f"tail_stack0_store_top_e0_byte_{value:02x}",
                         scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
                         conditions=base_conditions + (
                             (f"ALU_LO+{lo}", 1.0),
                             (f"ALU_HI+{hi}", 1.0),
                             (f"OUTPUT_LO+{lo}", 0.001),
-                            (f"OUTPUT_HI+{hi}", 0.001),
+                            (f"OUTPUT_HI_THIS_STEP+{hi}", 0.001),
                         ),
                         threshold=25.0,
                         gate="MARK_STACK0",
@@ -2361,10 +2361,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             f"{value:02x}"
                         ),
                         scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{lo}", 0.001),
-                            (f"OUTPUT_HI+{hi}", 0.001),
+                            (f"OUTPUT_HI_THIS_STEP+{hi}", 0.001),
                         ),
                         threshold=4300.0,
                         gate="MARK_STACK0",
@@ -2377,13 +2377,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     "tail_stack0_store_top_e8_from_e0_byte_39_from_e8_addr"
                 ),
                 scope="mark == STACK0",
-                dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+                dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
                 conditions=base_conditions + (
                     ("MEM_ADDR_SRC", 100.0),
                     ("ADDR_B0_LO+8", 100.0),
                     ("ADDR_B0_HI+14", 100.0),
                     ("OUTPUT_LO+9", 100.0),
-                    ("OUTPUT_HI+3", 1.0),
+                    ("OUTPUT_HI_THIS_STEP+3", 1.0),
                 ),
                 threshold=20000.0,
                 writes=byte_writes(0x39, strength=5000.0),
@@ -2427,10 +2427,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     FFNRule.gated_write(
                         name=f"tail_stack0_store_loaded_byte_{value:02x}",
                         scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{lo}", 1.0),
-                            (f"OUTPUT_HI+{hi}", 1.0),
+                            (f"OUTPUT_HI_THIS_STEP+{hi}", 1.0),
                         ),
                         threshold=25.0,
                         gate="MARK_STACK0",
@@ -2446,7 +2446,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_stack0_store_top_value_2f_from_alu",
                 scope="mark == STACK0",
-                dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+                dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
                 conditions=(
                     ("MARK_STACK0", 5.0),
                     ("HAS_SE", 1.0),
@@ -2530,10 +2530,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             f"{old_value:02x}"
                         ),
                         scope="is_byte",
-                        dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                        dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{old_lo}", 1.0),
-                            (f"OUTPUT_HI+{old_value >> 4}", 1.0),
+                            (f"OUTPUT_HI_THIS_STEP+{old_value >> 4}", 1.0),
                             (f"ALU_LO+{old_lo}", 20.0),
                         ) + tuple(
                             (f"OUTPUT_LO+{other}", -25.0)
@@ -2608,7 +2608,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_ax_add_no_carry_byte1_00",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -2674,8 +2674,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("NEXT_MEM", -1000000.0),
             ("NEXT_SE", -1000000.0),
         )
-        high_writes = [("OUTPUT_HI+0", 50_000.0)]
-        high_writes.extend((f"OUTPUT_HI+{other}", -50_000.0) for other in range(1, 16))
+        high_writes = [("OUTPUT_HI_THIS_STEP+0", 50_000.0)]
+        high_writes.extend((f"OUTPUT_HI_THIS_STEP+{other}", -50_000.0) for other in range(1, 16))
         base_conditions = (
             ("IS_BYTE", 5.0),
             ("HAS_SE", 5.0),
@@ -2795,7 +2795,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_no_carry_low1_02",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=base_conditions + (
                     ("CARRY+1", -1000.0),
                     ("ALU_LO+1", 100.0),
@@ -2806,7 +2806,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_no_carry_low2_03",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=base_conditions + (
                     ("CARRY+1", -1000.0),
                     ("ALU_LO+2", 100.0),
@@ -2817,7 +2817,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_carry_low2_03",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=base_conditions + (
                     ("CARRY+1", 200.0),
                     ("ALU_LO+2", 100.0),
@@ -2836,7 +2836,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 FFNRule.constant_write(
                     name=f"tail_ax_sub_byte1_hi_zero_lo_{lo:01x}",
                     scope="is_byte",
-                    dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                    dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                     conditions=ax_byte0 + (
                         ("TEMP+9", 100.0),
                         ("TEMP+8", -1000.0),
@@ -2872,7 +2872,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             FFNRule.constant_write(
                 name="tail_ax_sub_full_underflow_byte1_ff",
                 scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=ax_byte0 + (
                     ("TEMP+9", 100.0),
                     ("TEMP+8", -1000.0),
@@ -2908,7 +2908,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 FFNRule.gated_write(
                     name=f"tail_ax_sub_borrow_byte1_{old_lo:01x}_to_{old_lo - 1:01x}",
                     scope="is_byte",
-                    dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                    dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                     conditions=ax_byte0 + (
                         ("TEMP+9", 100.0),
                         ("TEMP+8", -1000.0),
@@ -3009,7 +3009,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         # dominance scope is flagged regardless, so this
                         # choice is purely to keep the diagnostic stable.
                         scope="mark == AX AND opcode_at_AX == MUL",
-                        dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                        dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                         conditions=bounded_ax_byte0 + (
                             ("HAS_SE", 20.0),
                             ("TEMP+10", 30.0),
@@ -3023,7 +3023,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             ("OP_JSR", -1000.0),
                             ("OP_LEV", -1000.0),
                             (f"OUTPUT_LO+{low_nibble}", 2.0),
-                            (f"OUTPUT_HI+{high_nibble}", 2.0),
+                            (f"OUTPUT_HI_THIS_STEP+{high_nibble}", 2.0),
                             ("TEMP+4", -1000.0),
                             ("TEMP+5", -1000.0),
                             ("TEMP+6", -1000.0),
@@ -3255,7 +3255,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_stack0_pop_marker_zero",
             scope="mark == STACK0",
-            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3284,7 +3284,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_stack0_pop_reveals_saved_addr_e8",
             scope="mark == STACK0",
-            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3312,7 +3312,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_stack0_pop_reveals_saved_addr_e8_from_e0_addr",
             scope="mark == STACK0",
-            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3339,7 +3339,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_stack0_store_non_top_zero",
             scope="mark == STACK0",
-            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3365,7 +3365,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_stack0_store_non_top_zero_e8_from_e0",
             scope="mark == STACK0",
-            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
             conditions=(
                 ("MARK_STACK0", 100.0),
                 ("HAS_SE", 1.0),
@@ -3391,7 +3391,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_stack0_store_non_top_zero_e0",
             scope="mark == STACK0",
-            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI": "mark == STACK0"},
+            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3413,7 +3413,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_stack0_f8_byte1_from_output_exact",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             expected_byte=0x02,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -3431,7 +3431,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ADDR_B0_HI+14", -10.0),
                 ("MEM_STORE", -1000000.0),
                 ("OUTPUT_LO+2", 50.0),
-                ("OUTPUT_HI+0", 0.1),
+                ("OUTPUT_HI_THIS_STEP+0", 0.1),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -1000000.0),
                 ("MARK_SP", -1000000.0),
@@ -3455,7 +3455,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.gated_write(
             name="tail_sp_pop_byte3_zero",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             conditions=(
                 ("IS_BYTE", 5.0),
                 ("HAS_SE", 5.0),
@@ -3484,7 +3484,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_sp_store_pop_byte1_zero",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             conditions=(
                 ("IS_BYTE", 5.0),
                 ("HAS_SE", 5.0),
@@ -3531,14 +3531,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_pc_byte0_12_from_initial_jmp_exact",
             scope="mark == PC",
-            dominates_at={"OUTPUT_LO": "mark == PC", "OUTPUT_HI": "mark == PC"},
+            dominates_at={"OUTPUT_LO": "mark == PC", "OUTPUT_HI_THIS_STEP": "mark == PC"},
             conditions=(
                 ("MARK_PC", 5.0),
                 ("OP_JMP", 20.0),
                 ("FETCH_LO+2", 1.0),
                 ("FETCH_HI+0", 1.0),
                 ("OUTPUT_LO+2", 0.1),
-                ("OUTPUT_HI+0", 0.1),
+                ("OUTPUT_HI_THIS_STEP+0", 0.1),
                 ("IS_BYTE", -1000.0),
                 ("HAS_SE", -1000.0),
                 ("MARK_AX", -1000000.0),
@@ -3555,7 +3555,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             threshold=250.0,
             writes=Primitives.nibble_value_writes(
-                "OUTPUT_HI",
+                "OUTPUT_HI_THIS_STEP",
                 1,
                 strength=5000.0,
             ),
@@ -3563,7 +3563,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_pc_byte0_1a_from_taken_branch_index3_exact_bz",
             scope="mark == PC",
-            dominates_at={"OUTPUT_LO": "mark == PC", "OUTPUT_HI": "mark == PC"},
+            dominates_at={"OUTPUT_LO": "mark == PC", "OUTPUT_HI_THIS_STEP": "mark == PC"},
             conditions=(
                 ("MARK_PC", 5.0),
                 ("OP_BZ", 20.0),
@@ -3571,7 +3571,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("FETCH_LO+3", 1.0),
                 ("FETCH_HI+0", 1.0),
                 ("OUTPUT_LO+3", 1.0),
-                ("OUTPUT_HI+0", 1.0),
+                ("OUTPUT_HI_THIS_STEP+0", 1.0),
                 ("IS_BYTE", -1000.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_SP", -1000000.0),
@@ -3597,7 +3597,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_pc_byte0_1a_from_taken_branch_index3_exact_bnz",
             scope="mark == PC",
-            dominates_at={"OUTPUT_LO": "mark == PC", "OUTPUT_HI": "mark == PC"},
+            dominates_at={"OUTPUT_LO": "mark == PC", "OUTPUT_HI_THIS_STEP": "mark == PC"},
             conditions=(
                 ("MARK_PC", 5.0),
                 ("OP_BNZ", 20.0),
@@ -3605,7 +3605,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("FETCH_LO+3", 1.0),
                 ("FETCH_HI+0", 1.0),
                 ("OUTPUT_LO+3", 1.0),
-                ("OUTPUT_HI+0", 1.0),
+                ("OUTPUT_HI_THIS_STEP+0", 1.0),
                 ("IS_BYTE", -1000.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_SP", -1000000.0),
@@ -3627,7 +3627,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_pc_byte1_01_from_long_initial_pc_exact",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             expected_byte=0x01,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -3662,7 +3662,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             conditions=(
                 ("IS_BYTE", 5.0),
                 ("H1+0", 20.0),
@@ -3716,7 +3716,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_sp_marker_byte0_f8_from_initial_stack_exact",
             scope="mark == SP",
-            dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI": "mark == SP"},
+            dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
             expected_byte=0xF8,
             conditions=(
                 ("MARK_SP", 10.0),
@@ -3729,7 +3729,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("CMP+4", 0.5),
                 ("SP_BYTE0_IS_F8", 0.001),
                 ("IN_STEP_FRESH", 0.001),
-                ("OUTPUT_HI+14", -1000.0),
+                ("OUTPUT_HI_THIS_STEP+14", -1000.0),
                 ("ALU_LO+14", -1000.0),
                 ("OP_IMM", -1_000_000_000.0),
                 ("OP_ENT", -1_000_000.0),
@@ -3758,7 +3758,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_sp_byte1_ff_from_initial_stack_exact",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             expected_byte=0xFF,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -3806,7 +3806,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f8_exact",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -3862,7 +3862,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_mem_store_addr1_ff_from_stack_store_exact",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             expected_byte=0xFF,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -3918,7 +3918,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_f8_initial_jsr_exact",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             expected_byte=0xF8,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -3969,7 +3969,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f8_initial_jsr_authority",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("H1+4", 20.0),
@@ -4016,7 +4016,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f0_exact",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -4056,7 +4056,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             writes=byte_writes(0xF0, strength=10_000.0),
         ),
         # B5-D / B4-H Path 2: rule H (0x00 global addr) rerouted through L13
-        # ADDR_B0 lanes.  Previously this rule used OUTPUT_LO+0 / OUTPUT_HI+0
+        # ADDR_B0 lanes.  Previously this rule used OUTPUT_LO+0 / OUTPUT_HI_THIS_STEP+0
         # as a *proxy* for the address byte, which gave a false positive at
         # step5 (B2-A) where unrelated OUTPUT lanes happened to fire.  Reading
         # the L13 one-hot ADDR_B0_LO+0 / ADDR_B0_HI+0 directly removes the
@@ -4066,7 +4066,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *addr_from_l13_rules(
             name="tail_mem_store_addr0_00_from_global_exact",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             target_byte=0x00,
             lo_lane=0,
             hi_lane=0,
@@ -4090,7 +4090,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_mem_store_addr2_zero_from_global_exact",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             expected_byte=0x00,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -4103,9 +4103,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_ADDR_SRC", 5.0),
                 ("PSH_AT_SP", -1000000.0),
                 ("OUTPUT_LO+0", 1.0),
-                ("OUTPUT_HI+0", 1.0),
-                ("OUTPUT_HI+14", -1000.0),
-                ("OUTPUT_HI+15", -1000.0),
+                ("OUTPUT_HI_THIS_STEP+0", 1.0),
+                ("OUTPUT_HI_THIS_STEP+14", -1000.0),
+                ("OUTPUT_HI_THIS_STEP+15", -1000.0),
                 ("BYTE_INDEX_0", -1000.0),
                 ("BYTE_INDEX_1", 5.0),
                 ("BYTE_INDEX_2", -1000.0),
@@ -4150,7 +4150,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_mem_store_addr3_zero_from_global_exact",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             expected_byte=0x00,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -4165,9 +4165,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ADDR_B2_LO+0", 2.0),
                 ("ADDR_B2_HI+0", 2.0),
                 ("OUTPUT_LO+0", 1.0),
-                ("OUTPUT_HI+0", 1.0),
-                ("OUTPUT_HI+14", -1000.0),
-                ("OUTPUT_HI+15", -1000.0),
+                ("OUTPUT_HI_THIS_STEP+0", 1.0),
+                ("OUTPUT_HI_THIS_STEP+14", -1000.0),
+                ("OUTPUT_HI_THIS_STEP+15", -1000.0),
                 ("BYTE_INDEX_0", -1000.0),
                 ("BYTE_INDEX_1", -1000.0),
                 ("BYTE_INDEX_2", 5.0),
@@ -4204,7 +4204,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_f8_from_mod_local_exact",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             expected_byte=0xF8,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4258,7 +4258,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_local_offset_exact",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             expected_byte=0xE0,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4320,7 +4320,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_mem_store_addr0_e0_from_psh_sp_no_addr_src_authority",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -4384,7 +4384,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_jsr_local_exact",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             expected_byte=0xE0,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4440,7 +4440,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e8_from_nested_local_exact",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             expected_byte=0xE8,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4488,7 +4488,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e8_from_local_frame_addr_exact",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             expected_byte=0xE8,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4505,7 +4505,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("ADDR_B0_LO+8", 2.0),
                 ("ADDR_B0_HI+14", 2.0),
                 # When upstream L16/L17 store amplifiers have already pushed
-                # OUTPUT_LO+8 / OUTPUT_HI+14 to ~1e8 (model is confidently
+                # OUTPUT_LO+8 / OUTPUT_HI_THIS_STEP+14 to ~1e8 (model is confidently
                 # emitting 0xe8), the OneHotBandGuarantee lane corrections
                 # multiply ``(target - current)`` by ``silu(up) ≈ S * (score -
                 # threshold)`` and overshoot into ~1e10 at the inactive lanes,
@@ -4513,7 +4513,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # rule in that high-magnitude regime without weakening the
                 # uncertain-OUTPUT exactness recovery path.
                 ("OUTPUT_LO+8", -0.001),
-                ("OUTPUT_HI+14", -0.001),
+                ("OUTPUT_HI_THIS_STEP+14", -0.001),
                 ("IS_BYTE", -100.0),
                 ("MARK_AX", -1000000.0),
                 ("MARK_PC", -100.0),
@@ -4535,7 +4535,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # positive combined with CMP+0 (sem ``mark == AX OR (is_byte AND
         # byte_index == 0)``) positive plus the IS_BYTE/MARK_AX/MARK_STACK0
         # hard blockers makes the conditions-only effective predicate
-        # unsatisfiable; F-5 falls back to the gate ``OUTPUT_HI+14`` whose
+        # unsatisfiable; F-5 falls back to the gate ``OUTPUT_HI_THIS_STEP+14`` whose
         # semantics is tautological. No scope tighter than tautology is
         # entailable. Leave scope/dominates_at unset for now.
         FFNRule.gated_write(
@@ -4568,7 +4568,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_SE", -1000000.0),
             ),
             threshold=25.0,
-            gate="OUTPUT_HI+14",
+            gate="OUTPUT_HI_THIS_STEP+14",
             writes=byte_writes(0xE8, strength=500.0),
         ),
         # Non-memory binary pops should emit a zero MEM row. Store/load ops
@@ -4576,7 +4576,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_pop_mem_marker_zero",
             scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
+            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -4631,7 +4631,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("BYTE_INDEX_3", -100.0),
                 ("OUTPUT_LO+1", 0.1),
                 ("OUTPUT_LO+0", -0.2),
-                ("OUTPUT_HI+0", 0.1),
+                ("OUTPUT_HI_THIS_STEP+0", 0.1),
                 ("MARK_AX", -1_000_000.0),
                 ("MARK_PC", -1_000_000.0),
                 ("MARK_SP", -1_000_000.0),
@@ -4663,7 +4663,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.gated_write(
             name="tail_ax_add_byte1_carry_high2_03",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             conditions=ax_byte0 + (
                 ("BYTE_INDEX_1", -1000.0),
                 ("BYTE_INDEX_2", -1000.0),
@@ -4687,7 +4687,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.gated_write(
             name="tail_wide_shl_byte1_01",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             conditions=ax_byte0 + (
                 ("OP_SHL", 100.0),
                 ("EMBED_LO+0", 1.0),
@@ -4714,7 +4714,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             scope="mark == MEM AND opcode_in_step in {PSH, SC, SI}",
             dominates_at={
                 "OUTPUT_LO": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
-                "OUTPUT_HI": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
+                "OUTPUT_HI_THIS_STEP": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
             },
             conditions=si_ax_byte0 + (
                 ("OP_EQ", -1000.0),
@@ -4724,8 +4724,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_LE", -1000.0),
                 ("OP_GE", -1000.0),
                 ("OUTPUT_LO+2", 0.01),
-                ("OUTPUT_HI+1", 0.5),
-                ("OUTPUT_HI+0", -0.5),
+                ("OUTPUT_HI_THIS_STEP+1", 0.5),
+                ("OUTPUT_HI_THIS_STEP+0", -0.5),
             ),
             threshold=161.0,
             gate="MEM_STORE",
@@ -4736,7 +4736,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             scope="mark == MEM AND opcode_in_step in {PSH, SC, SI}",
             dominates_at={
                 "OUTPUT_LO": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
-                "OUTPUT_HI": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
+                "OUTPUT_HI_THIS_STEP": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
             },
             conditions=si_ax_byte0 + (
                 ("OP_EQ", -1000.0),
@@ -4746,8 +4746,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_LE", -1000.0),
                 ("OP_GE", -1000.0),
                 ("OUTPUT_LO+2", 0.01),
-                ("OUTPUT_HI+0", 0.5),
-                ("OUTPUT_HI+1", -0.5),
+                ("OUTPUT_HI_THIS_STEP+0", 0.5),
+                ("OUTPUT_HI_THIS_STEP+1", -0.5),
             ),
             threshold=161.5,
             gate="MEM_STORE",
@@ -4760,7 +4760,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.gated_write(
             name="tail_sub_borrow_byte1_00",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             conditions=ax_byte0 + (
                 ("MARK_AX", -1000.0),
                 ("OP_IMM", -1000.0),
@@ -4782,7 +4782,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_and_byte1_00",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             conditions=ax_byte0 + (
                 ("TEMP+3", 1.0),
                 ("TEMP+4", 1.0),
@@ -4800,7 +4800,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.gated_write(
             name="tail_or_xor_byte1_0f",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             conditions=ax_byte0 + (
                 ("TEMP+3", 1.0),
                 ("TEMP+4", -2.0),
@@ -4836,7 +4836,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.gated_write(
             name="tail_shr_marker_byte0_01",
             scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI": "mark == AX"},
+            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
             conditions=(
                 ("MARK_AX", 1.0),
                 ("MARK_PC", -10000.0),
@@ -4850,8 +4850,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_SHR", 1000.0),
                 ("OP_IMM", -100.0),
                 ("OP_LEA", -1000000.0),
-                ("OUTPUT_HI+0", 1.0),
-                ("OUTPUT_HI+2", -1.0),
+                ("OUTPUT_HI_THIS_STEP+0", 1.0),
+                ("OUTPUT_HI_THIS_STEP+2", -1.0),
                 ("OUTPUT_LO+10", -1.0),
             ),
             threshold=5005.0,
@@ -4861,7 +4861,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_lea_local_ax_marker_byte0_e8",
             scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI": "mark == AX"},
+            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
             conditions=(
                 ("MARK_AX", 1.0),
                 ("HAS_SE", 1.0),
@@ -4882,7 +4882,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_ax_add_byte1_missing_stack_high_02",
             scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
             conditions=(
                 ("IS_BYTE", 10.0),
                 ("HAS_SE", 10.0),
@@ -4922,7 +4922,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_cmp_ne_true_01",
             scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI": "mark == AX"},
+            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_NE", 1.0),
@@ -4934,7 +4934,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_cmp_eq_false_00",
             scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI": "mark == AX"},
+            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_EQ", 1.0),
@@ -4947,7 +4947,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_cmp_le_lt_true_01",
             scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI": "mark == AX"},
+            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_LE", 1.0),
@@ -4960,7 +4960,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_cmp_le_eq_prefix_false_00",
             scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI": "mark == AX"},
+            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_LE", 1.0),
@@ -4975,7 +4975,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_cmp_lt_false_00",
             scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI": "mark == AX"},
+            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_LT", 1.0),
@@ -4987,7 +4987,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.constant_write(
             name="tail_cmp_gt_false_00",
             scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI": "mark == AX"},
+            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_GT", 1.0),
@@ -5012,15 +5012,15 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         FFNRule.gated_write(
             name="tail_sp_pop_marker_output_d8_to_e0",
             scope="mark == SP",
-            dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI": "mark == SP"},
+            dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
             conditions=(
                 ("CONST", -100000000.0),
                 ("MARK_SP", 100000000.0),
                 ("HAS_SE", 1000.0),
                 ("CMP+3", 100.0),
                 ("OUTPUT_LO+8", 10.0),
-                ("OUTPUT_HI+13", 100.0),
-                ("OUTPUT_HI+15", -100.0),
+                ("OUTPUT_HI_THIS_STEP+13", 100.0),
+                ("OUTPUT_HI_THIS_STEP+15", -100.0),
                 ("MARK_AX", -1000.0),
                 ("MARK_PC", -1000.0),
                 ("MARK_BP", -1000.0),
@@ -5142,11 +5142,11 @@ def make_tail_bit32_result_correction_op() -> Operation:
             "OP_XOR",
             "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
             "TEMP", "CMP", "CARRY", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "FETCH_HI",
-            "OUTPUT_LO", "OUTPUT_HI", "MEM_STORE",
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "MEM_STORE",
             "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
             "ADDR_B0_LO", "ADDR_B0_HI",
         },
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         layer_idx=17,
         target_op_name="l10_post_ops_combined",

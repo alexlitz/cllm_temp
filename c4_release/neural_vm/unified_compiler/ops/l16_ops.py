@@ -20,13 +20,13 @@ def _add_stack0_x0_alu_materializer(
     """Append 32 ALU->OUTPUT materializer rules for a STACK0 marker family.
 
     Each call appends 16 LO-band rules (gated on ALU_LO+k -> OUTPUT_LO+k) and
-    16 HI-band rules (gated on ALU_HI+k -> OUTPUT_HI+k).  ``family`` becomes
+    16 HI-band rules (gated on ALU_HI+k -> OUTPUT_HI_THIS_STEP+k).  ``family`` becomes
     part of the rule name (``l16_stack0_{family}_marker_from_alu_{band}_{k}``).
     ``scope`` is threaded through to every generated FFNRule so the
     declarative scope verifier can audit the intended firing positions.
     ``dominates_at`` is threaded through identically so the strength
     verifier can audit per-output-dim dominance claims; it accepts the
-    standard mapping ``{"OUTPUT_LO": <predicate>, "OUTPUT_HI": <predicate>}``.
+    standard mapping ``{"OUTPUT_LO": <predicate>, "OUTPUT_HI_THIS_STEP": <predicate>}``.
     """
 
     for k in range(16):
@@ -45,7 +45,7 @@ def _add_stack0_x0_alu_materializer(
             conditions=conditions,
             threshold=threshold,
             gate=f"ALU_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 50.0 / S),),
             scope=scope,
             dominates_at=dominates_at,
         ))
@@ -66,7 +66,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("HAS_SE", first_step_gate),
         ("PSH_AT_SP", -first_step_gate),
     )
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI")):
+    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l16_lev_sp_cancel_{band}_{k}",
@@ -109,7 +109,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=sp_value_base_conditions + ((f"ADDR_B0_HI+{k}", 1.0),),
             threshold=40.0,
             gate=f"ADDR_B0_HI+{k}",
-            writes=((f"OUTPUT_HI+{result}", write_scale),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{result}", write_scale),),
         ))
 
     pc_cancel_hi_conditions = (
@@ -124,9 +124,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l16_lev_pc_cancel_hi_{k}",
             conditions=pc_cancel_hi_conditions,
             threshold=1.5,
-            gate=f"OUTPUT_HI+{k}",
+            gate=f"OUTPUT_HI_THIS_STEP+{k}",
             gate_weight=-1.0,
-            writes=((f"OUTPUT_HI+{k}", write_scale),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
         ))
     for k in range(16):
         rules.append(FFNRule.gated_write(
@@ -150,7 +150,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             threshold=3.5,
             gate="CONST",
-            writes=((f"OUTPUT_HI+{k}", write_scale),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
         ))
 
     # LEV restores the caller's AX from the saved value on STACK0. By step 6
@@ -189,7 +189,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=lev_ax_carry_conditions,
             threshold=1.5,
             gate=f"AX_CARRY_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 2.0 / S),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
 
     # Companion preservation: the same triage row sees step6:STACK0_byte0
@@ -232,8 +232,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l16_lev_stack0_byte0_preserve_hi_{k}",
             conditions=lev_stack0_preserve_conditions,
             threshold=4.5,
-            gate=f"OUTPUT_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", lev_stack0_preserve_strength),),
+            gate=f"OUTPUT_HI_THIS_STEP+{k}",
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", lev_stack0_preserve_strength),),
         ))
 
     byte_zero_base = (
@@ -275,7 +275,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=byte_zero_base + ((byte_idx, 1.0),),
             threshold=4.0,
             gate="CONST",
-            writes=(("OUTPUT_HI+0", 5.0 / S),),
+            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
         ))
 
     # The legacy TEMP->PC materializers above can fire for every nibble on the
@@ -345,8 +345,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_STACK0", -1_000_000.0),
             ("OUTPUT_LO+0", 1.0),
             ("OUTPUT_LO+8", -1.0),
-            ("OUTPUT_HI+14", 1.0),
-            ("OUTPUT_HI+15", -1.0),
+            ("OUTPUT_HI_THIS_STEP+14", 1.0),
+            ("OUTPUT_HI_THIS_STEP+15", -1.0),
         ),
         threshold=500.0,
         gate="HAS_SE",
@@ -358,7 +358,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 competitor_strength=0.0015,
             )
             + Primitives.nibble_value_writes(
-                "OUTPUT_HI",
+                "OUTPUT_HI_THIS_STEP",
                 14,
                 strength=0.0016,
                 competitor_strength=0.0015,
@@ -591,7 +591,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l16_stack0_e8_output_authoritative_{byte:02x}",
             conditions=stack0_e8_output_authoritative_conditions + (
                 (f"OUTPUT_LO+{lo}", 100.0),
-                (f"OUTPUT_HI+{hi}", 100.0),
+                (f"OUTPUT_HI_THIS_STEP+{hi}", 100.0),
             ),
             threshold=stack0_e8_output_authoritative_threshold,
             writes=Primitives.byte_value_writes(byte, strength=2000.0),
@@ -656,11 +656,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     for k in range(1, 16):
         rules.append(FFNRule.constant_write(
             name=f"l16_psh_mem_addr0_restore_hi_{k}",
-            conditions=psh_mem_addr0_conditions + ((f"OUTPUT_HI+{k}", 1.0),),
+            conditions=psh_mem_addr0_conditions + ((f"OUTPUT_HI_THIS_STEP+{k}", 1.0),),
             threshold=5.5,
             writes=(
-                (f"OUTPUT_HI+{k}", psh_mem_addr0_restore),
-                ("OUTPUT_HI+0", -psh_mem_addr0_restore),
+                (f"OUTPUT_HI_THIS_STEP+{k}", psh_mem_addr0_restore),
+                ("OUTPUT_HI_THIS_STEP+0", -psh_mem_addr0_restore),
             ),
         ))
     rules.append(FFNRule.constant_write(
@@ -668,12 +668,12 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         conditions=psh_mem_addr0_conditions + (
             ("H1+4", 1.0),
             ("OUTPUT_LO+8", 1.0),
-            ("OUTPUT_HI+13", 1.0),
+            ("OUTPUT_HI_THIS_STEP+13", 1.0),
         ),
         threshold=8.0,
         writes=(
             ("OUTPUT_LO+8", 1_000_000.0),
-            ("OUTPUT_HI+13", 1_000_000.0),
+            ("OUTPUT_HI_THIS_STEP+13", 1_000_000.0),
         ),
     ))
     rules.append(FFNRule.constant_write(
@@ -697,6 +697,18 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("ALU_LO+7", -10.0),
             ("ALU_LO+10", -10.0),
             ("ALU_LO+14", -10.0),
+            # Shared psh_mem_addr0_conditions only blocks OP_ENT at -1000;
+            # ENT-main relays OP_ENT to the MEM marker position with
+            # attenuated activation (~1e-3) via L7/L14 broadcast, so the
+            # -1000 blocker can be crossed by upstream amplification given
+            # the 200_000 0xE0 writeback strength. Mirrors L10 B7-7 fix
+            # (tail_mem_store_addr0_e0_from_psh_sp_no_addr_src_authority)
+            # which has OP_ENT:-1e6 to discriminate ENT-main 0xF0 push from
+            # PSH 0xE0 push. Targets +97 rows of func_*/nested_*/expr_mod_*
+            # neural=None failures from wide-ALU triage 2026-06-01.
+            ("OP_ENT", -1_000_000.0),
+            ("OP_LEV", -1_000_000.0),
+            ("OP_IMM", -1_000_000.0),
         ),
         threshold=8.5,
         writes=Primitives.byte_value_writes(0xE0, strength=200_000.0),
@@ -729,7 +741,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=stale_imm_ax_conditions,
             threshold=1.5,
             gate=f"AX_CARRY_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 2.0 / S),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
 
     # SI/SC preserve AX while using STACK0 as the memory address source. The
@@ -759,7 +771,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=store_ax_conditions,
             threshold=4.0,
             gate=f"AX_CARRY_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 2.0 / S),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
 
     # LC is an 8-bit load. L15 head 0 writes the loaded byte and can leave
@@ -781,7 +793,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         name="l16_lc_ax_bytes_1_3_clear_hi",
         conditions=lc_ax_byte_conditions,
         threshold=2.5,
-        writes=tuple((f"OUTPUT_HI+{k}", -300.0 / S) for k in range(16)),
+        writes=tuple((f"OUTPUT_HI_THIS_STEP+{k}", -300.0 / S) for k in range(16)),
     ))
     rules.append(FFNRule.constant_write(
         name="l16_lc_ax_bytes_1_3_zero_lo",
@@ -793,7 +805,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         name="l16_lc_ax_bytes_1_3_zero_hi",
         conditions=lc_ax_byte_conditions,
         threshold=2.5,
-        writes=(("OUTPUT_HI+0", 500.0 / S),),
+        writes=(("OUTPUT_HI_THIS_STEP+0", 500.0 / S),),
     ))
 
     # SI/SC top-store steps stage the current value at the STACK0 marker
@@ -864,7 +876,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             (f"OUTPUT_LO+{k}", stack0_byte1_zero if k == 0 else -stack0_byte1_zero)
             for k in range(16)
         ) + tuple(
-            (f"OUTPUT_HI+{k}", stack0_byte1_zero if k == 0 else -stack0_byte1_zero)
+            (f"OUTPUT_HI_THIS_STEP+{k}", stack0_byte1_zero if k == 0 else -stack0_byte1_zero)
             for k in range(16)
         ),
     ))
@@ -973,7 +985,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=bp_marker_passthrough_conditions,
             threshold=1.5,
             gate=f"EMBED_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 10.0 / S),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 10.0 / S),),
         ))
 
     # Once a frame is established at BP=0x0000fff0, ordinary local-frame
@@ -1039,9 +1051,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         threshold=5.0,
         writes=(
             ("OUTPUT_LO+15", 50.0 / S),
-            ("OUTPUT_HI+15", 50.0 / S),
+            ("OUTPUT_HI_THIS_STEP+15", 50.0 / S),
             ("OUTPUT_LO+0", -50.0 / S),
-            ("OUTPUT_HI+0", -50.0 / S),
+            ("OUTPUT_HI_THIS_STEP+0", -50.0 / S),
         ),
     ))
 
@@ -1073,7 +1085,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             (f"OUTPUT_LO+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
             for k in range(16)
         ) + tuple(
-            (f"OUTPUT_HI+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
+            (f"OUTPUT_HI_THIS_STEP+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
             for k in range(16)
         ),
     ))
@@ -1203,7 +1215,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=13.5,
             writes=tuple(
                 (
-                    f"OUTPUT_HI+{k}",
+                    f"OUTPUT_HI_THIS_STEP+{k}",
                     ent_frame_strength if k == result_hi else -ent_frame_strength,
                 )
                 for k in range(16)
@@ -1214,7 +1226,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # argument push plus JSR. ENT then saves BP at 0xffd8. The zero-immediate
     # frame rule above is correct for the initial 0xfff8 -> 0xfff0 entry, but
     # it over-writes these nested SP markers back to 0xfff0. The initial entry
-    # carries a strongly negative OUTPUT_HI+15 before this block, while nested
+    # carries a strongly negative OUTPUT_HI_THIS_STEP+15 before this block, while nested
     # entries are near zero there, so use that as the narrow discriminator.
     rules.append(FFNRule.constant_write(
         name="l16_ent_nested_sp_byte0_d8",
@@ -1222,14 +1234,14 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OP_ENT", 9.8),
             ("FETCH_LO+0", 1.0),
             ("FETCH_HI+0", 1.0),
-            ("OUTPUT_HI+15", 1.0),
+            ("OUTPUT_HI_THIS_STEP+15", 1.0),
         ),
         threshold=70.0,
         writes=(
             ("OUTPUT_LO+8", 10.0),
             ("OUTPUT_LO+0", -10.0),
-            ("OUTPUT_HI+13", 10.0),
-            ("OUTPUT_HI+15", -10.0),
+            ("OUTPUT_HI_THIS_STEP+13", 10.0),
+            ("OUTPUT_HI_THIS_STEP+15", -10.0),
         ),
     ))
     rules.append(FFNRule.constant_write(
@@ -1238,7 +1250,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OP_ENT", 100.0),
             ("MARK_BP", 20000.0),
             ("HAS_SE", 1.0),
-            ("OUTPUT_HI+15", -50.0),
+            ("OUTPUT_HI_THIS_STEP+15", -50.0),
             ("IS_BYTE", -1_000_000_000.0),
             ("MARK_PC", -1000.0),
             ("MARK_AX", -1000.0),
@@ -1250,8 +1262,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         writes=(
             ("OUTPUT_LO+8", 1.0),
             ("OUTPUT_LO+0", -1.0),
-            ("OUTPUT_HI+13", 1.0),
-            ("OUTPUT_HI+15", -1.0),
+            ("OUTPUT_HI_THIS_STEP+13", 1.0),
+            ("OUTPUT_HI_THIS_STEP+15", -1.0),
         ),
     ))
     rules.append(FFNRule.constant_write(
@@ -1272,8 +1284,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         threshold=80.0,
         writes=(
-            ("OUTPUT_HI+15", 5.0),
-            ("OUTPUT_HI+0", -5.0),
+            ("OUTPUT_HI_THIS_STEP+15", 5.0),
+            ("OUTPUT_HI_THIS_STEP+0", -5.0),
             ("OUTPUT_LO+0", 1.0),
             ("OUTPUT_LO+15", -1.0),
         ),
@@ -1303,9 +1315,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         gate="CLEAN_EMBED_HI+15",
         writes=(
             ("OUTPUT_LO+15", 50.0 / S),
-            ("OUTPUT_HI+15", 50.0 / S),
+            ("OUTPUT_HI_THIS_STEP+15", 50.0 / S),
             ("OUTPUT_LO+0", -50.0 / S),
-            ("OUTPUT_HI+0", -50.0 / S),
+            ("OUTPUT_HI_THIS_STEP+0", -50.0 / S),
         ),
     ))
     rules.append(FFNRule.gated_write(
@@ -1333,9 +1345,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         gate="CLEAN_EMBED_HI+0",
         writes=(
             ("OUTPUT_LO+0", 50.0 / S),
-            ("OUTPUT_HI+0", 50.0 / S),
+            ("OUTPUT_HI_THIS_STEP+0", 50.0 / S),
             ("OUTPUT_LO+15", -50.0 / S),
-            ("OUTPUT_HI+15", -50.0 / S),
+            ("OUTPUT_HI_THIS_STEP+15", -50.0 / S),
         ),
     ))
     for imm_hi in range(16):
@@ -1349,7 +1361,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=13.5,
             writes=tuple(
                 (
-                    f"OUTPUT_HI+{k}",
+                    f"OUTPUT_HI_THIS_STEP+{k}",
                     ent_frame_strength if k == result_hi else -ent_frame_strength,
                 )
                 for k in range(16)
@@ -1377,7 +1389,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"OUTPUT_LO+{k}", (100.0 / S) if k == 0 else (-100.0 / S))
                 for k in range(16)
             ) + tuple(
-                (f"OUTPUT_HI+{k}", (100.0 / S) if k == 0 else (-100.0 / S))
+                (f"OUTPUT_HI_THIS_STEP+{k}", (100.0 / S) if k == 0 else (-100.0 / S))
                 for k in range(16)
             ),
         ))
@@ -1405,7 +1417,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             gate_terms=psh_no_borrow_low_gate,
             writes=tuple(
                 (
-                    f"OUTPUT_HI+{k}",
+                    f"OUTPUT_HI_THIS_STEP+{k}",
                     (4.0 / S) if k == hi else (-4.0 / S),
                 )
                 for k in range(16)
@@ -1448,7 +1460,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         threshold=4.5,
         writes=tuple(
             (
-                f"OUTPUT_HI+{k}",
+                f"OUTPUT_HI_THIS_STEP+{k}",
                 (20.0 / S) if k == 15 else (-20.0 / S),
             )
             for k in range(16)
@@ -1476,7 +1488,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_MEM", -10.0),
         ),
         threshold=8.0,
-        writes=(("OUTPUT_HI+14", 2.0),),
+        writes=(("OUTPUT_HI_THIS_STEP+14", 2.0),),
     ))
 
     # The legacy LEV SP materializers above intentionally key off the old BP
@@ -1512,7 +1524,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             threshold=lev_sp_stack0_cancel_threshold,
             gate=f"ADDR_B0_HI+{k}",
-            writes=((f"OUTPUT_HI+{result}", -write_scale),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{result}", -write_scale),),
         ))
     return tuple(rules)
 
@@ -1566,7 +1578,7 @@ def make_layer16_lev_routing_op() -> Operation:
                "BYTE_INDEX_2", "BYTE_INDEX_3",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2",
                "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI", "ALU_LO"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "ALU_LO"},
         kind="ffn",
         layer_idx=16,
         bake_fn=bake,

@@ -674,7 +674,7 @@ def _convo_io_pc_sp_latch_rules(S: float) -> tuple[FFNRule, ...]:
     ):
         for source_base, output_base in (
             (src_lo, "OUTPUT_LO"),
-            (src_hi, "OUTPUT_HI"),
+            (src_hi, "OUTPUT_HI_THIS_STEP"),
         ):
             for k in range(16):
                 rules.append(FFNRule.gated_write(
@@ -973,7 +973,7 @@ def make_conversational_io_output_routing_op(
         name="conversational_io_output_routing",
         phase=15.1,
         reads={"IO_IN_OUTPUT_MODE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake if not enable_conversational_io else None,

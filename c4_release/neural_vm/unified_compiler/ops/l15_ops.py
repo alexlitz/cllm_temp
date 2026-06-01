@@ -48,7 +48,7 @@ def make_l15_psh_stack_ir() -> CompilerIR:
         name="psh_sp_byte1_hi_ff",
         conditions=psh_byte_conditions(sp_i, "BYTE_INDEX_0"),
         threshold=threshold,
-        writes=(("OUTPUT_HI+15", 4.0), ("OUTPUT_HI+0", -4.0)),
+        writes=(("OUTPUT_HI_THIS_STEP+15", 4.0), ("OUTPUT_HI_THIS_STEP+0", -4.0)),
     ))
 
     # SP byte 1 and byte 2 positions predict zero for the following bytes.
@@ -66,7 +66,7 @@ def make_l15_psh_stack_ir() -> CompilerIR:
             name=f"psh_sp_{predicted_byte}_hi_00",
             conditions=psh_byte_conditions(sp_i, byte_index_name),
             threshold=threshold,
-            writes=(("OUTPUT_HI+0", 2.0),),
+            writes=(("OUTPUT_HI_THIS_STEP+0", 2.0),),
         ))
 
     # PSH leaves BP unchanged; preserve STACK_INIT byte 2 = 0x01.
@@ -80,7 +80,7 @@ def make_l15_psh_stack_ir() -> CompilerIR:
         name="psh_bp_byte2_hi_00",
         conditions=psh_byte_conditions(bp_i, "BYTE_INDEX_1"),
         threshold=threshold,
-        writes=(("OUTPUT_HI+0", 4.0),),
+        writes=(("OUTPUT_HI_THIS_STEP+0", 4.0),),
     ))
     return ir
 
@@ -131,7 +131,7 @@ def make_l15_nibble_copy_ir() -> CompilerIR:
             conditions=copy_conditions,
             threshold=0.5,
             gate=f"EMBED_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 2.0),),
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0),),
         ))
 
     rules.rules.extend(make_l15_psh_stack_ir().layer(0).ffn.rules)
@@ -153,7 +153,7 @@ def make_l15_nibble_copy_ir() -> CompilerIR:
         name="lea_first_step_ax_byte2_hi_00",
         conditions=lea_conditions,
         threshold=4.5,
-        writes=(("OUTPUT_HI+0", 2.0),),
+        writes=(("OUTPUT_HI_THIS_STEP+0", 2.0),),
     ))
     return ir
 
@@ -203,7 +203,7 @@ def make_nibble_copy_ffn_op() -> Operation:
                "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "MARK_BP", "MARK_STACK0", "HAS_SE", "CMP"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="ffn",
         bake_fn=bake,
         migrated=True,
@@ -254,7 +254,7 @@ def make_layer15_memory_lookup_op() -> Operation:
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "H1", "H2", "H3", "L2H0", "TEMP",
                "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "CMP", "CONST"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
         layer_idx=15,
         bake_fn=bake,
@@ -332,7 +332,7 @@ def make_layer15_store_stack0_sp_byte0_addr_op() -> Operation:
         phase=15.2,
         reads={
             "MARK_STACK0", "MARK_SP", "HAS_SE", "MEM_STORE",
-            "OUTPUT_LO", "OUTPUT_HI", "CONST",
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CONST",
         },
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
@@ -437,7 +437,7 @@ def _layer15_si_mem_addr0_from_stack0_ir(dim_positions, HD) -> CompilerIR:
             "scope": "mark == MEM AND mem_store",
             "dominates_at": {
                 "OUTPUT_LO": "mark == MEM AND mem_store",
-                "OUTPUT_HI": "mark == MEM AND mem_store",
+                "OUTPUT_HI_THIS_STEP": "mark == MEM AND mem_store",
             },
         },
     )
@@ -467,7 +467,7 @@ def make_layer15_si_mem_addr0_from_stack0_op() -> Operation:
             "MARK_MEM", "MEM_STORE", "MEM_ADDR_SRC", "STACK0_BYTE0",
             "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST",
         },
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         layer_idx=15,
         bake_fn=bake,
@@ -1148,7 +1148,7 @@ def make_layer15_nibble_copy_op() -> Operation:
                "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "MARK_BP", "MARK_STACK0", "HAS_SE", "CMP"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,

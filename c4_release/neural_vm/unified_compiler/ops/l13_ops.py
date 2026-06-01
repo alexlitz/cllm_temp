@@ -191,7 +191,7 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         phase=13,
         reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                "OP_SHL", "OP_SHR"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,

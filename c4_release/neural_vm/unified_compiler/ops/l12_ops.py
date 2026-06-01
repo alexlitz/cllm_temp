@@ -24,7 +24,7 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         name="layer12_mul_combine",
         phase=12,
         reads={"MARK_AX", "TEMP", "OP_MUL"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -48,7 +48,7 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         # already populated upstream in L10's MUL units, so the staleness
         # contract only covers the hi half emitted here.
         produces={
-            "OUTPUT_HI": "AX_byte0",
+            "OUTPUT_HI_THIS_STEP": "AX_byte0",
         },
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",

@@ -43,40 +43,40 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     # W_up/W_gate selectors are left unclaimed to mirror the L14/L6 style).
     _claims: set = set()
     unit = 0
-    # ADD hi nibble (carry_in in [0, 1]): 512 units -> W_down[OUTPUT_HI+result]
+    # ADD hi nibble (carry_in in [0, 1]): 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
                 result = (a + b + carry_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
                 unit += 1
-    # LEA hi nibble: 512 units -> W_down[OUTPUT_HI+result]
+    # LEA hi nibble: 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
                 result = (a + b + carry_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
                 unit += 1
-    # ADJ hi nibble: 512 units -> W_down[OUTPUT_HI+result]
+    # ADJ hi nibble: 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
                 result = (a + b + carry_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
                 unit += 1
-    # SUB hi nibble: 512 units -> W_down[OUTPUT_HI+result]
+    # SUB hi nibble: 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
     for borrow_in in (0, 1):
         for a in range(16):
             for b in range(16):
                 result = (a - b - borrow_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
                 unit += 1
-    # ENT hi nibble: 512 units -> W_down[OUTPUT_HI+result]
+    # ENT hi nibble: 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
     for borrow_in in (0, 1):
         for sp_hi in range(16):
             for imm_hi in range(16):
                 result = (sp_hi - imm_hi - borrow_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
                 unit += 1
     # hi_eq: 16 units -> W_down[CMP+1]
     for _k in range(16):
@@ -155,14 +155,14 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     _claims.add((9, "ffn_W_down", str(unit), "ADDR_B2_LO+1"))
     unit += 1
     # _set_layer9_marker_suppress: 7 units (one per NEXT_* dim), each writes
-    # W_down[OUTPUT_LO+k] and W_down[OUTPUT_HI+k] for k in 0..15.
+    # W_down[OUTPUT_LO+k] and W_down[OUTPUT_HI_THIS_STEP+k] for k in 0..15.
     for _next_dim in (
         "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
         "NEXT_STACK0", "NEXT_MEM", "NEXT_SE",
     ):
         for k in range(16):
             _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_LO+{k}"))
-            _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{k}"))
+            _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{k}"))
         unit += 1
     # Total expected unit index after bake: 3405 (matches ffn_units_used).
     _claims = frozenset(_claims)
@@ -174,7 +174,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
                "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                "ALU_LO", "AX_CARRY_LO"},
-        writes={"OUTPUT_HI", "CMP", "OUTPUT_LO", "CARRY"},
+        writes={"OUTPUT_HI_THIS_STEP", "CMP", "OUTPUT_LO", "CARRY"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
@@ -680,7 +680,7 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         reads={"MEM_VAL_B0", "OP_LI_RELAY", "OP_LC_RELAY", "CMP", "CONST",
                "PSH_AT_SP", "MEM_STORE", "ADDR_KEY",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake if not enable else None,
@@ -712,7 +712,7 @@ def make_layer9_marker_suppress_op() -> Operation:
         reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
                "OP_OR", "OP_XOR", "OP_AND"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="ffn",
         bake_fn=bake,
         migrated=True,
