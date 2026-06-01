@@ -1,9 +1,54 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L7 FFN unit layout (pinned offsets) ============================
+#
+# L7 is attention-only: every op in this file is ``kind="block"`` and
+# writes attention weights (Q/K/V/O), not FFN hidden units. There is no
+# ``_set_layer7_ffn`` helper in ``vm_step`` and no ``ffn_units_used``
+# annotation on any L7 op. Migration to :class:`FFNUnitAllocator` is
+# therefore bookkeeping-only: each op claims a 1-unit placeholder at a
+# pinned offset so the L7 FFN-unit layout is auditable in the same way as
+# L1/L2/L9, and a future L7 op family that DOES need FFN units can claim
+# a free range past unit 4 via ``allocator.alloc(name, n)`` without a
+# pin. Byte-identity is trivially preserved -- no FFN weights are
+# touched by any L7 bake.
+#
+# Order mirrors the op-factory order in this file (operand_gather first,
+# then memory_heads, format_pointer_extraction, sp_byte0_is_f8) so the
+# layout reads top-to-bottom alongside the factories that own each slot.
+_L7_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer7_operand_gather.placeholder",       0, 1),  # L7 head 0+1
+    ("layer7_memory_heads.placeholder",         1, 1),  # L7 heads 2-7
+    ("format_pointer_extraction.placeholder",   2, 1),  # L7 head 7 (gated)
+    ("layer7_sp_byte0_is_f8.placeholder",       3, 1),  # L7 head 6 ext
+)
+
+
+def _allocate_layer7_ffn_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L7 sub-stages.
+
+    Every sub-stage is pinned at its placeholder offset so the L7 ops --
+    which write attention weights, not FFN units -- declare a structured
+    layout for the L7 FFN-unit axis without disturbing any existing
+    weight indices. This call is byte-identical bookkeeping: the
+    allocator declares names, the bakes write attention. A future L7 op
+    family that needs real FFN units can ``allocator.alloc(name, n)``
+    past unit 4 (no pin) and pick up the first free gap.
+
+    Returns the allocator so callers can inspect or extend it.
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L7_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def make_layer7_operand_gather_op() -> Operation:
@@ -17,6 +62,16 @@ def make_layer7_operand_gather_op() -> Operation:
     def bake(block, dim_positions, S):
         attn = block.attn
         BD = _as_setdim_proxy(dim_positions)
+
+        # Per-bake FFN-unit allocator. L7 is attention-only so every
+        # range here is a 1-unit placeholder pinned to its existing
+        # offset -- no FFN weights are written, byte-identity is
+        # trivially preserved. Stashed on ``block.ffn`` for inspection /
+        # extension by downstream tools, mirroring the L9 convention
+        # from ca775eb.
+        allocator = _allocate_layer7_ffn_units()
+        block.ffn._l7_unit_allocator = allocator
+
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
@@ -148,6 +203,13 @@ def make_layer7_memory_heads_op() -> Operation:
     def bake(block, dim_positions, S):
         attn = block.attn
         BD = _as_setdim_proxy(dim_positions)
+
+        # Per-bake FFN-unit allocator. See ``make_layer7_operand_gather_op``
+        # for the rationale: L7 is attention-only so this is byte-identical
+        # bookkeeping.
+        allocator = _allocate_layer7_ffn_units()
+        block.ffn._l7_unit_allocator = allocator
+
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[1] = 5.0  # head 1: MEM flag broadcast
             attn.alibi_slopes[5] = 5.0  # head 5: LI/LC flag relay
@@ -401,6 +463,14 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
     """
     def bake(block, dim_positions, S):
         del S
+
+        # Per-bake FFN-unit allocator. See ``make_layer7_operand_gather_op``
+        # for the rationale. Built unconditionally (even when the
+        # conversational-IO gate is off) so the L7 layout stays consistent
+        # across modes; this is byte-identical bookkeeping either way.
+        allocator = _allocate_layer7_ffn_units()
+        block.ffn._l7_unit_allocator = allocator
+
         if not enable_conversational_io:
             return
         attn = block.attn
@@ -507,6 +577,13 @@ def make_layer7_sp_byte0_is_f8_op() -> Operation:
         del S
         attn = block.attn
         BD = _as_setdim_proxy(dim_positions)
+
+        # Per-bake FFN-unit allocator. See ``make_layer7_operand_gather_op``
+        # for the rationale: L7 is attention-only so this is byte-identical
+        # bookkeeping.
+        allocator = _allocate_layer7_ffn_units()
+        block.ffn._l7_unit_allocator = allocator
+
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_head(
             attn, _layer7_sp_byte0_is_f8_spec(BD), HD,
