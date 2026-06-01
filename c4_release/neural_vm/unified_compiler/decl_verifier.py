@@ -117,6 +117,26 @@ def semantic_op_label(op_name: str) -> str:
     return _LAYER_PREFIX_RE.sub("", op_name)
 
 
+def _format_dim_with_semantics(dim_name: str, registry=None) -> str:
+    """Format ``dim_name`` for printing, appending its semantics string
+    if available.
+
+    F-11: pure observability helper. Reviewers reading verifier output can
+    see at-a-glance whether a dim's declared semantics matches the rule's
+    intent. If ``registry`` is None, or the dim is unknown, or the dim has
+    no semantics declared, returns the bare name unchanged.
+    """
+    if registry is None:
+        return dim_name
+    try:
+        sem = registry.semantics(dim_name)
+    except KeyError:
+        return dim_name  # unknown dim -- don't crash, just skip semantics
+    if sem is None:
+        return dim_name
+    return f"{dim_name} [{sem}]"
+
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -196,6 +216,9 @@ class StaticVerificationReport:
     results: List[OpVerificationResult] = field(default_factory=list)
     skipped: List[Tuple[str, str]] = field(default_factory=list)  # (op_name, reason)
     strict_mode: bool = False
+    # F-11: optional registry used to enrich dim references in ``format()``
+    # output with their declared semantics. None preserves prior behavior.
+    registry: Optional[object] = None
 
     def has_errors(self) -> bool:
         if self.strict_mode:
@@ -242,12 +265,18 @@ class StaticVerificationReport:
             )
             # UNUSED CLAIMs are the real bugs (declared but never written).
             for cell in sorted(r.declared_but_not_written, key=_claim_sort_key):
-                lines.append(f"     UNUSED CLAIM (DECLARATION DRIFT): {cell}")
+                lines.append(
+                    f"     UNUSED CLAIM (DECLARATION DRIFT): "
+                    f"{_format_cell_with_semantics(cell, self.registry)}"
+                )
             # Show undeclared writes only when in strict mode (otherwise
             # would flood with the expected partial-claim residue).
             if self.strict_mode:
                 for cell in sorted(r.written_but_not_declared, key=_claim_sort_key):
-                    lines.append(f"     UNDECLARED WRITE: {cell}")
+                    lines.append(
+                        f"     UNDECLARED WRITE: "
+                        f"{_format_cell_with_semantics(cell, self.registry)}"
+                    )
             for note in r.notes:
                 lines.append(f"     NOTE: {note}")
         for op_name, reason in self.skipped:
@@ -258,6 +287,26 @@ class StaticVerificationReport:
 def _claim_sort_key(claim):
     layer_idx, scope, identifier, column = claim
     return (layer_idx, scope, identifier, "" if column is None else column)
+
+
+def _format_cell_with_semantics(cell, registry=None) -> str:
+    """F-11: format a (layer, scope, identifier, column) cell tuple for
+    display, decoding the ``column`` field's ``"DIM+offset"`` shape and
+    appending the dim's declared semantics when ``registry`` is provided.
+
+    Falls back to ``repr(cell)`` when ``column`` is None or not in the
+    ``"<dim>+<offset>"`` form -- pure observability, never raises.
+    """
+    if registry is None:
+        return repr(cell)
+    layer_idx, scope, identifier, column = cell
+    if column is None or "+" not in column:
+        return repr(cell)
+    dim_name, _, offset = column.partition("+")
+    enriched = _format_dim_with_semantics(dim_name, registry)
+    if enriched == dim_name:
+        return repr(cell)
+    return f"(layer={layer_idx}, scope={scope!r}, id={identifier!r}, column={enriched}+{offset})"
 
 
 # ---------------------------------------------------------------------------
@@ -1623,6 +1672,7 @@ def verify_claims_static(
     n_heads: int = 8,
     op_filter: Optional[Callable[[Operation], bool]] = None,
     strict_mode: bool = False,
+    registry: Optional[object] = None,
 ) -> StaticVerificationReport:
     """Run static claim verification on every annotated op in compile_full_vm.
 
@@ -1661,7 +1711,7 @@ def verify_claims_static(
         if op.claims and (op_filter is None or op_filter(op)):
             op_targets[op.name] = op
 
-    report = StaticVerificationReport(strict_mode=strict_mode)
+    report = StaticVerificationReport(strict_mode=strict_mode, registry=registry)
     if not op_targets:
         return report
 
@@ -3431,6 +3481,13 @@ class DeclarativeAuthorityReport:
     semantic_labels: Dict[str, str] = field(default_factory=dict)
     explicit_sources: Dict[str, str] = field(default_factory=dict)
     inferred_sources: Dict[str, str] = field(default_factory=dict)
+    # F-11: per-op {reads: [...], writes: [...]} captured at audit time so
+    # ``format()`` can enrich dim names with semantics when a registry is
+    # supplied. Empty by default; populated by ``audit_declarative_authority``.
+    op_reads: Dict[str, List[str]] = field(default_factory=dict)
+    op_writes: Dict[str, List[str]] = field(default_factory=dict)
+    # Optional registry for semantics enrichment in ``format()``.
+    registry: Optional[object] = None
 
     @property
     def authoritative_count(self) -> int:
@@ -3451,6 +3508,26 @@ class DeclarativeAuthorityReport:
         lines.append(f"Unclassified ops: {self.unclassified_count}")
         lines.append(f"Explicit source markers: {len(self.explicit_sources)}")
         lines.append(f"Inferred source markers: {len(self.inferred_sources)}")
+        # F-11: when a registry is supplied, list each op's reads/writes
+        # alongside their declared semantics so reviewers can audit at-a-glance
+        # whether dim meanings match each rule's intent. Pure observability.
+        if self.registry is not None and (self.op_reads or self.op_writes):
+            lines.append("--- Per-op dim references (with semantics) ---")
+            all_ops = sorted(set(self.op_reads) | set(self.op_writes))
+            for op_name in all_ops:
+                reads = self.op_reads.get(op_name, [])
+                writes = self.op_writes.get(op_name, [])
+                if not reads and not writes:
+                    continue
+                lines.append(f"  {op_name}:")
+                for dim_name in reads:
+                    lines.append(
+                        f"    R {_format_dim_with_semantics(dim_name, self.registry)}"
+                    )
+                for dim_name in writes:
+                    lines.append(
+                        f"    W {_format_dim_with_semantics(dim_name, self.registry)}"
+                    )
         return "\n".join(lines)
 
     def semantic_label(self, op_name: str) -> str:
@@ -3478,6 +3555,7 @@ def audit_declarative_authority(
     enable_conversational_io: bool = False,
     enable_tool_calling: bool = False,
     n_heads: int = 8,
+    registry: Optional[object] = None,
 ) -> DeclarativeAuthorityReport:
     """Classify ops by whether their bake path is declarative authority.
 
@@ -3503,9 +3581,15 @@ def audit_declarative_authority(
     explicit: Dict[str, str] = {}
     inferred: Dict[str, str] = {}
     semantic_labels: Dict[str, str] = {}
+    op_reads: Dict[str, List[str]] = {}
+    op_writes: Dict[str, List[str]] = {}
 
     for op in _collect_unique_ops_with(layout, lambda _op: True):
         semantic_labels[op.name] = operation_display_label(op)
+        # F-11: capture per-op dim references so the report can later
+        # enrich them with semantics if a registry is supplied.
+        op_reads[op.name] = sorted(op.reads) if op.reads else []
+        op_writes[op.name] = sorted(op.writes) if op.writes else []
         source = op.declarative_authority
         if source is not None:
             explicit[op.name] = source
@@ -3535,6 +3619,9 @@ def audit_declarative_authority(
         semantic_labels=dict(sorted(semantic_labels.items())),
         explicit_sources=explicit,
         inferred_sources=inferred,
+        op_reads=op_reads,
+        op_writes=op_writes,
+        registry=registry,
     )
 
 
