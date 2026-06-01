@@ -1,4 +1,4 @@
-"""V1 scaffolding for an attention-side analogue of ``verify_rule_strength``.
+"""V2 scaffolding for an attention-side analogue of ``verify_rule_strength``.
 
 Background
 ----------
@@ -13,41 +13,47 @@ copy attention bleed, etc.).
 This module is intentionally a research prototype, not a production API.
 For each ``AttentionHeadIR`` it surfaces a list of issue dicts shaped like
 ``verify_rule_strength``'s output. Heuristics are deliberately approximate
-(see "V1 approximations" below); the goal is "does this head dominate at
+(see "V2 approximations" below); the goal is "does this head dominate at
 the dim it claims?" not "exactly reproduce softmax".
 
-V1 approximations
+V2 approximations
 -----------------
-* **Effective firing scope** is built from the K projection. Each
+* **Effective K-side firing scope** is built from the K projection. Each
   ``AP(slot, dim, weight)`` with positive weight is a positively-scored
   key-side dim — we treat the set of K-side dim *names* as the head's
-  preferred firing condition. Q projection is intentionally ignored at
-  this layer because the Q value pattern is largely uniform across q-
-  positions in most threshold / relay heads. ALiBi slope / softmax sink
-  are ignored — see "V2 wishlist" below.
+  preferred firing condition at the *key* position.
+* **Effective Q-side firing scope** (new in V2) is built from the Q
+  projection by the same rule: positive-weighted Q dims are the active
+  *query*-side markers. Heads with disjoint Q scopes cannot fire at the
+  same query position simultaneously, so V2 skips competition entirely
+  between disjoint-Q heads. This is the **Q-side scope-overlap filter**
+  the V1 docstring promised but never wired up. ALiBi slope / softmax
+  sink are still ignored — see "V3 wishlist" below.
 * **Write magnitude** at a residual dim is ``|o.weight| * sum(|v.weight|)``
   across all V writes sharing the O write's slot. This is the upper
   bound the head can deliver to that dim when its attention probability
   saturates to 1.0 and every contributing source dim is 1.0.
 * **Competition** at an output dim covers (a) other AttentionHeadIRs in
-  ``ops_for_competition`` that write the same residual dim, and (b)
+  ``ops_for_competition`` that write the same residual dim **and whose
+  effective Q scope overlaps the head's effective Q scope**, and (b)
   FFNRules surfaced from the same op list whose ``effective_predicate``
   intersects this head's effective scope and whose ``max_contribution``
-  to the same dim is non-zero.
+  to the same dim is non-zero. When either head has no declared Q
+  projection, the filter degrades to V1 behavior (treat as overlapping).
 * **Scope ground truth** is read from ``head.metadata['scope']`` (a
   predicate-DSL string) or ``head.metadata['dominates_at']`` (mapping
   output-dim name → predicate string). Both are optional; missing
   declarations are tolerated unless ``require_scope`` /
   ``require_dominates`` is set.
 
-V2 wishlist (limitations)
+V3 wishlist (limitations)
 -------------------------
 * Model the softmax probability. Today's bound treats the head as
   delivering its full V value at any firing key, which over-states
   weak heads and under-states sharp heads.
 * Use ALiBi slopes to constrain effective scope (distance-bounded
   firing). Several heads (e.g. L1H5 IN_STEP_FRESH) intentionally bound
-  themselves through slope, which the V1 effective-scope predicate
+  themselves through slope, which the V1/V2 effective-scope predicate
   cannot represent.
 * Cross-check ``Operation.produces`` declarations against the head's
   declared output dims; mismatch should be an issue kind.
@@ -65,6 +71,7 @@ __all__ = [
     "AttentionWriterEntry",
     "build_attention_writer_index",
     "effective_attention_scope",
+    "effective_attention_q_scope",
     "head_write_magnitude",
     "verify_attention_head",
 ]
@@ -89,8 +96,13 @@ class AttentionWriterEntry:
     output_dim_name: str
     output_dim_offset: int
     magnitude: float
-    effective_scope: Tuple[str, ...]   # V1: list of K-side dim names
+    effective_scope: Tuple[str, ...]   # K-side dim names (positive weights)
     head: Any                          # AttentionHeadIR -- avoid hard import
+    # V2: Q-side dim names (positive weights). Empty tuple means "no
+    # positively-weighted Q dim was declared" — V2 treats that as a
+    # wildcard for the overlap check (preserves V1 behaviour for legacy
+    # heads). Defaulted so external V1 positional constructors still work.
+    q_effective_scope: Tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -161,18 +173,18 @@ def _resolve_o_writes(
 
 
 # ---------------------------------------------------------------------------
-# Effective firing scope (V1)
+# Effective firing scope (V2: K-side + Q-side)
 # ---------------------------------------------------------------------------
 
 
 def effective_attention_scope(head, registry) -> Tuple[str, ...]:
-    """Return the V1-approximate effective firing scope for ``head``.
+    """Return the approximate effective K-side firing scope for ``head``.
 
-    V1 = the set of K-side dim names with a positive weight. The intuition:
+    The set of K-side dim names with a positive weight. The intuition:
     a positive K write contributes positively to the q·k score when the
     residual stream at the key position has that dim set, so the head
     "prefers keys where any of these K-side dims fire". This is an
-    over-approximation — it ignores Q-side conditioning and ALiBi.
+    over-approximation — it ignores ALiBi.
 
     Returned as a sorted tuple so two heads can be compared by identity.
     """
@@ -189,8 +201,59 @@ def effective_attention_scope(head, registry) -> Tuple[str, ...]:
     return tuple(sorted(set(names)))
 
 
+def effective_attention_q_scope(head, registry) -> Tuple[str, ...]:
+    """Return the V2 effective Q-side firing scope for ``head``.
+
+    Analogous to ``effective_attention_scope`` but extracted from the Q
+    projection: each positively-weighted ``AP(slot, dim, weight)`` in
+    ``spec.q`` contributes its dim name. The intuition: a positive Q
+    write means the head only produces a non-trivial q·k inner product
+    when the residual stream at the *query* position has that dim set,
+    so the head "prefers querying from positions where any of these Q-
+    side dims fire".
+
+    Used by V2's competition filter: two heads with disjoint non-empty
+    Q scopes cannot fire at the same query position, so their O writes
+    never collide in practice and they shouldn't be counted as mutual
+    competitors. Returned as a sorted tuple so two heads can be compared
+    by identity.
+
+    An empty result means "no positively-weighted Q dim was declared"
+    (either the head has a uniform/constant Q pattern, or the Q writes
+    target dims not present in the registry). V2 treats an empty Q scope
+    as a wildcard (fires at every query position) for the overlap check,
+    falling back to V1 behavior.
+    """
+    spec = getattr(head, "spec", None)
+    if spec is None:
+        return ()
+    q_writes = _resolve_writes_to_dim_names(
+        getattr(spec, "q", ()), registry
+    )
+    names: List[str] = []
+    for name, _offset, weight, _slot in q_writes:
+        if weight > 0.0:
+            names.append(name)
+    return tuple(sorted(set(names)))
+
+
+def _q_scopes_overlap(
+    a: Sequence[str],
+    b: Sequence[str],
+) -> bool:
+    """Return True when two Q scopes can fire at the same query position.
+
+    Per V2 semantics: an empty scope is a wildcard (treat as overlapping
+    with anything). Two non-empty scopes overlap iff they share at least
+    one dim name.
+    """
+    if not a or not b:
+        return True
+    return bool(set(a) & set(b))
+
+
 # ---------------------------------------------------------------------------
-# Write magnitude (V1)
+# Write magnitude (V1; unchanged in V2)
 # ---------------------------------------------------------------------------
 
 
@@ -247,12 +310,18 @@ def build_attention_writer_index(
     that cannot be resolved to dim names (e.g. dim integers outside any
     registry slot range) are silently skipped — callers can address
     those gaps with a registry-completeness audit.
+
+    V2: each ``AttentionWriterEntry`` is also tagged with its effective
+    Q-side scope (``q_effective_scope``) so downstream verifiers can
+    filter competitors by Q-position overlap without re-walking the head
+    spec.
     """
     index: Dict[Tuple[str, int], List[AttentionWriterEntry]] = {}
     for op in ops:
         op_name = getattr(op, "name", None)
         for head in _collect_heads_from_op(op):
             scope = effective_attention_scope(head, registry)
+            q_scope = effective_attention_q_scope(head, registry)
             spec = getattr(head, "spec", None)
             if spec is None:
                 continue
@@ -271,6 +340,7 @@ def build_attention_writer_index(
                     magnitude=magnitude,
                     effective_scope=scope,
                     head=head,
+                    q_effective_scope=q_scope,
                 )
                 index.setdefault((name, offset), []).append(entry)
     return index
@@ -397,16 +467,25 @@ def verify_attention_head(
     margin: float = 1.0,
     require_scope: bool = False,
     require_dominates: bool = False,
+    q_scope_filter: bool = True,
 ) -> List[Dict[str, Any]]:
-    """V1 attention-side analogue of ``verify_rule_strength``.
+    """V2 attention-side analogue of ``verify_rule_strength``.
 
     Walks ``head.spec.o`` and for each declared output dim:
       * resolves the integer column back to (name, offset);
-      * computes the head's V1 magnitude;
+      * computes the head's magnitude;
       * looks up competing attention heads + FFN rules at the same dim
         from ``ops_for_competition``;
+      * V2: filters attention competitors by Q-side scope overlap. Two
+        heads whose Q projections target disjoint dim names cannot fire
+        at the same query position, so they don't actually compete — V2
+        skips the strength check for those pairs. Heads with no declared
+        Q scope are treated as wildcards (always overlap), which
+        preserves V1 behavior for legacy heads. Set
+        ``q_scope_filter=False`` to opt back into V1's "magnitude only,
+        ignore Q-scope" comparison.
       * emits an issue when the head's magnitude does not dominate the
-        strongest competitor + ``margin``.
+        strongest *Q-overlapping* competitor + ``margin``.
 
     Issue kinds returned:
       * ``unresolved_output_dim``   — O write targets a residual column
@@ -420,13 +499,15 @@ def verify_attention_head(
                                        entry for this dim.
       * ``attention_strength_violation`` — head's magnitude is not
                                        greater than ``competing_max +
-                                       margin``.
+                                       margin``. (V2: only Q-overlapping
+                                       attention competitors counted.)
       * ``cross_modality_strength_violation`` — head loses to an FFN
                                        rule writing the same dim.
 
     Each issue dict carries enough context (head name, output dim, my
     magnitude, top competitor, declared scope) for a downstream agent or
-    audit script to triage without re-inspecting the head.
+    audit script to triage without re-inspecting the head. V2 issues
+    additionally carry ``my_q_scope`` / ``competitor_q_scope``.
     """
     issues: List[Dict[str, Any]] = []
 
@@ -451,6 +532,7 @@ def verify_attention_head(
     attn_index = build_attention_writer_index(other_ops, registry)
     ffn_index = _build_ffn_writer_index(other_ops, registry)
     my_scope = effective_attention_scope(head, registry)
+    my_q_scope = effective_attention_q_scope(head, registry)
 
     # Walk every O write.
     seen_dims = set()
@@ -520,21 +602,24 @@ def verify_attention_head(
             entry for entry in attn_index.get(key, [])
             if entry.head is not head
         ]
+        # V2: drop competitors whose Q-side scope is disjoint from
+        # ours. Two heads with disjoint non-empty Q scopes cannot fire
+        # at the same query position, so their O writes can't actually
+        # collide at runtime. Heads with an empty Q scope (no positive
+        # Q write resolved to the registry) degrade to V1 behaviour
+        # (treat as overlapping / wildcard) so we never regress on
+        # heads that haven't declared a Q projection.
+        if q_scope_filter:
+            attn_competitors = [
+                entry for entry in attn_competitors
+                if _q_scopes_overlap(my_q_scope, entry.q_effective_scope)
+            ]
         competing_max_attn = 0.0
         top_attn: Optional[AttentionWriterEntry] = None
         for entry in attn_competitors:
             if entry.magnitude > competing_max_attn:
                 competing_max_attn = entry.magnitude
                 top_attn = entry
-            # V1: only count scope-overlapping competitors as "real"
-            # contestants when both have an effective scope. If either
-            # is empty, treat as overlapping (conservative).
-            if my_scope and entry.effective_scope:
-                if not (set(my_scope) & set(entry.effective_scope)):
-                    # Scopes do not overlap -- bookkeeping competitor
-                    # only, but keep them in the magnitude max for the
-                    # conservative bound.
-                    pass
 
         # FFN-side competitors.
         ffn_competitors = _ffn_competitors_for_dim(
@@ -570,6 +655,12 @@ def verify_attention_head(
                 "my_effective_scope": list(my_scope),
                 "competitor_effective_scope": (
                     [] if top_attn is None else list(top_attn.effective_scope)
+                ),
+                "my_q_scope": list(my_q_scope),
+                "competitor_q_scope": (
+                    []
+                    if top_attn is None
+                    else list(top_attn.q_effective_scope)
                 ),
             })
 
