@@ -1040,7 +1040,10 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer14_jsr_ax_bytes_zero
         ffn = block.ffn
-        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        # Pinned to chain offset 1862 (predecessors through addr_key_neural_decode
+        # consume units 0..1861). Byte-identical with the legacy
+        # ``_l14_unit_counter`` start.
+        start_unit = _l14_chain_alloc("layer14_jsr_ax_bytes_zero")
         next_unit = _set_layer14_jsr_ax_bytes_zero(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
