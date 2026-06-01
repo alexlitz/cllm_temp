@@ -450,5 +450,5 @@ def test_l10_alu_op_metadata_pinned():
     assert op.ffn_units_used == 1846
     assert op.migrated is True
     assert "OUTPUT_LO" in op.writes
-    assert "OUTPUT_HI" in op.writes
+    assert "OUTPUT_HI_THIS_STEP" in op.writes
     assert "DIV_STAGING" in op.writes
