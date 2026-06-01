@@ -618,6 +618,13 @@ def build_default_registry() -> DimRegistry:
     reg.alloc("SP_GATHERED_THIS_STEP", 98, 1,
               "SP gather fired this step (aliases H5+3)",
               semantics="sp_gathered_this_step")
+    # B8-A: ADDR_B1_VALID / ADDR_B2_VALID lifecycle bits — mirror ADDR_B0_VALID
+    # on L13 heads 1 and 2 (slot 34 of each head). Aliases H5+4 / H5+5, the
+    # next two dormant L0 head-5 lanes after the B7 quartet at 95-98.
+    reg.alloc("ADDR_B1_VALID", 99, 1, "Address byte 1 gathered (aliases H5+4)",
+              semantics="addr_b1_valid")
+    reg.alloc("ADDR_B2_VALID", 100, 1, "Address byte 2 gathered (aliases H5+5)",
+              semantics="addr_b2_valid")
 
     # --- CMP_GROUP (305): set at AX when any cmp opcode active ---
     # FIXME(F-4-ext): refine — fires only at AX positions during cmp ops.
