@@ -1,9 +1,59 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L14 FFN cleanup-chain unit layout (pinned offsets) =================
+#
+# The 8 L14 cleanup ops historically chained their hidden-unit
+# allocations through a shared monotonic counter on
+# ``block.ffn._l14_unit_counter`` (first op starts at 0; each op reads the
+# counter, calls its helper, and writes the returned ``next_unit`` back).
+# Migration to :class:`FFNUnitAllocator` keeps the chain byte-identical by
+# pinning every op to its existing chain offset -- the offsets below are
+# the exact values the counter held when each op ran in production order.
+#
+# Each op's bake instantiates a fresh allocator with a single pinned
+# claim; the allocator is bookkeeping rather than persistent state. A
+# future L14 op family can claim a free gap via ``allocator.alloc(name,
+# n)`` (no pin) instead of hand-picking another offset, after stitching
+# the table here.
+#
+# Adding or resizing any helper requires updating this table in lock-step
+# (mirrors the L9 ``_L9_ALU_UNIT_LAYOUT`` convention).
+_L14_CLEANUP_CHAIN_LAYOUT = {
+    "layer14_temp_clear":                    (   0,    4),
+    "layer14_clear_addr_key_pollution":      (   4,   48),
+    "layer14_clear_output_corruption":       (  52,   18),
+    "layer14_clear_mem_marker_output":       (  70,   64),
+    "layer14_addr_key_neural_decode":        ( 134, 1728),
+    "layer14_jsr_ax_bytes_zero":             (1862,    4),
+    "layer14_lc_ax_bytes_zero":              (1866,    4),
+    "layer14_alu_nocarry_ax_bytes_zero":     (1870,    4),
+}
+
+
+def _l14_chain_alloc(op_name: str) -> int:
+    """Return the pinned start unit for ``op_name`` in the L14 cleanup chain.
+
+    Looks up ``op_name`` in :data:`_L14_CLEANUP_CHAIN_LAYOUT` and routes
+    the pinned range through a fresh :class:`FFNUnitAllocator`. The
+    allocator is per-bake (not shared across ops) so each call is
+    independent; the byte-identity guarantee comes from the static pin
+    matching the legacy ``_l14_unit_counter`` value the predecessor op
+    left behind in production order. Adding the allocator call now keeps
+    the structure auditable and ready for future ``pin=None`` extensions
+    without changing any baked weight.
+    """
+
+    pin, n_units = _L14_CLEANUP_CHAIN_LAYOUT[op_name]
+    allocator = FFNUnitAllocator()
+    start, _end = allocator.alloc(op_name, n_units, pin=pin)
+    return start
 
 
 def _resolve_dim(dim_positions, name: str):
@@ -749,7 +799,10 @@ def make_layer14_temp_clear_op() -> Operation:
         )
         ffn = block.ffn
         proxy = _as_setdim_proxy(dim_positions)
-        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        # Pinned to the chain head (offset 0). Byte-identical with the
+        # legacy ``_l14_unit_counter`` start (the counter is zero on a
+        # fresh FFN before any L14 cleanup op has baked).
+        start_unit = _l14_chain_alloc("layer14_temp_clear")
         next_unit = _set_layer14_temp_clear(
             ffn, S, proxy, start_unit=start_unit
         )
