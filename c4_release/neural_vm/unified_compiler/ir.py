@@ -90,6 +90,20 @@ class FFNRule:
     # positions where this rule is intended to fire. Checked by F-7's
     # verify_rule_scopes. None means "no declared scope — verifier won't
     # check".
+    dominates_at: Optional[Mapping[str, str]] = None  # NEW: per-output-dim
+    # dominance scope. Maps output_dim_name → predicate string. If None,
+    # falls back to scope for all of rule.writes.
+
+    def dominates_at_for(self, output_dim_name: str) -> Optional[str]:
+        """Return the dominance scope predicate for ``output_dim_name``,
+        or the rule's general ``scope`` if ``dominates_at`` doesn't specify
+        one, or ``None`` if no scope at all."""
+        if (
+            self.dominates_at is not None
+            and output_dim_name in self.dominates_at
+        ):
+            return self.dominates_at[output_dim_name]
+        return self.scope
 
     @classmethod
     def constant_write(
@@ -100,6 +114,7 @@ class FFNRule:
         writes: Sequence[Tuple[str, float]],
         name: Optional[str] = None,
         scope: Optional[str] = None,
+        dominates_at: Optional[Mapping[str, str]] = None,
     ) -> "FFNRule":
         return cls(
             conditions=tuple(
@@ -113,6 +128,7 @@ class FFNRule:
             ),
             name=name,
             scope=scope,
+            dominates_at=dominates_at,
         )
 
     @classmethod
@@ -128,6 +144,7 @@ class FFNRule:
         gate_bias: float = 0.0,
         name: Optional[str] = None,
         scope: Optional[str] = None,
+        dominates_at: Optional[Mapping[str, str]] = None,
     ) -> "FFNRule":
         return cls(
             conditions=tuple(
@@ -148,6 +165,7 @@ class FFNRule:
             ),
             name=name,
             scope=scope,
+            dominates_at=dominates_at,
         )
 
 
