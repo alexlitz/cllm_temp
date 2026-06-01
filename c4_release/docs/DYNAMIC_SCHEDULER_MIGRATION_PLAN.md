@@ -324,6 +324,20 @@ already zero).
 **Go/no-go signal.** A test PR that introduces an op with no deps and
 no `freely_placeable` opt-in fails CI.
 
+**How to flip the gate after B12 lands.** The CI test
+`c4_release/tests/test_b13_dep_declaration_gate.py` is scaffolded but
+defaults to `pytest.skip(...)` so it does not block today's CI while
+the 21 `phase_required_but_undeclared` + 3
+`phase_inconsistent_with_deps` + 66 `dep_graph_cycle_member` ops are
+still on `main`. Once B12 backfill drives all three counters to zero,
+flip the gate by either (a) exporting `B13_GATE_ENABLED=1` in the CI
+workflow (one-line YAML change), or (b) committing an empty marker
+file at `c4_release/docs/B13_GATE.flag`. Either signal lifts the skip;
+the test then asserts every op landed in `freely_placeable` or
+`phase_pinned_by_deps` and fails the build with the offending op names
+grouped by bucket. There is intentionally no other knob — the flip is
+auditable as a single commit.
+
 ### B14 — Strict-mode rollout (no phase fallback) + first dynamic 1096 sweep
 
 **Scope.** Flip `compile_full_vm_dynamic` to `strict=True` for the
