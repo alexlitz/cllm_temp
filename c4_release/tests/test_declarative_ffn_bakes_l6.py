@@ -454,7 +454,7 @@ def test_layer6_stack_identity_fires_with_compact_marker_scale():
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
 
     first_step = ir.symbolic_ffn({
         "MARK_BP": 1.0,
@@ -464,7 +464,7 @@ def test_layer6_stack_identity_fires_with_compact_marker_scale():
     })
 
     assert first_step.get("OUTPUT_LO+0", 0.0) == 0.0
-    assert first_step.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert first_step.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
 
 
 def test_layer6_ax_output_route_ir_matches_legacy_units():
@@ -858,9 +858,9 @@ def test_layer6_ent_after_jsr_sp_byte0_fixup_emits_e8():
     })
 
     assert out["OUTPUT_LO+8"] > 0.0
-    assert out["OUTPUT_HI+14"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] > 0.0
     assert out["OUTPUT_LO+10"] < 0.0
-    assert out["OUTPUT_HI+1"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] < 0.0
 
 
 def test_layer6_ent_after_jsr_bp_byte0_fixup_emits_f0():
@@ -876,9 +876,9 @@ def test_layer6_ent_after_jsr_bp_byte0_fixup_emits_f0():
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
     assert out["OUTPUT_LO+8"] < 0.0
-    assert out["OUTPUT_HI+1"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] < 0.0
 
 
 def test_layer6_ent_after_jsr_bp_byte1_fixup_emits_ff():
@@ -896,9 +896,9 @@ def test_layer6_ent_after_jsr_bp_byte1_fixup_emits_ff():
     })
 
     assert out["OUTPUT_LO+15"] > 0.0
-    assert out["OUTPUT_HI+15"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+15"] > 0.0
     assert out["OUTPUT_LO+0"] < 0.0
-    assert out["OUTPUT_HI+0"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] < 0.0
 
 
 def test_layer6_ent_after_jsr_bp_high_byte_fixup_emits_00():
@@ -917,7 +917,7 @@ def test_layer6_ent_after_jsr_bp_high_byte_fixup_emits_00():
         })
 
         assert out["OUTPUT_LO+0"] > 0.0
-        assert out["OUTPUT_HI+0"] > 0.0
+        assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
         assert out["OUTPUT_LO+1"] < 0.0
         assert out["OUTPUT_LO+15"] < 0.0
 
@@ -935,9 +935,9 @@ def test_layer6_ent_after_jsr_stack0_byte0_fixup_emits_00():
     })
 
     assert out["OUTPUT_LO+0"] > 0.0
-    assert out["OUTPUT_HI+0"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 0.0
     assert out["OUTPUT_LO+2"] < 0.0
-    assert out["OUTPUT_HI+1"] < 0.0
+    assert out["OUTPUT_HI_THIS_STEP+1"] < 0.0
 
 
 def test_layer6_branch_pc_override_copies_encoded_pc_byte():
@@ -980,13 +980,13 @@ def test_layer6_branch_pc_byte1_override_symbolically_emits_target_high_byte():
         "CMP+5": 1.0,
         "FETCH_HI+2": 40.0,
         "OUTPUT_LO+0": 1.0,
-        "OUTPUT_HI+0": 1.0,
+        "OUTPUT_HI_THIS_STEP+0": 1.0,
         "CONST": 1.0,
     })
 
     assert out["OUTPUT_LO+1"] > 0.0
     assert out["OUTPUT_LO+0"] < 1.0
-    assert out["OUTPUT_HI+0"] > 1.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 1.0
 
 
 def test_layer6_branch_pc_byte1_override_handles_jsr_target_high_byte():
@@ -1001,13 +1001,13 @@ def test_layer6_branch_pc_byte1_override_handles_jsr_target_high_byte():
         "OPCODE_BYTE_HI+0": 1.0,
         "FETCH_HI+2": 40.0,
         "OUTPUT_LO+0": 1.0,
-        "OUTPUT_HI+0": 1.0,
+        "OUTPUT_HI_THIS_STEP+0": 1.0,
         "CONST": 1.0,
     })
 
     assert out["OUTPUT_LO+1"] > 0.0
     assert out["OUTPUT_LO+0"] < 1.0
-    assert out["OUTPUT_HI+0"] > 1.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] > 1.0
 
 
 def test_layer6_branch_pc_byte1_override_blocks_contaminated_jsr_opcode():
@@ -1022,13 +1022,13 @@ def test_layer6_branch_pc_byte1_override_blocks_contaminated_jsr_opcode():
         "OPCODE_BYTE_HI+0": 1.62,
         "FETCH_HI+2": 40.0,
         "OUTPUT_LO+0": 1.0,
-        "OUTPUT_HI+0": 1.0,
+        "OUTPUT_HI_THIS_STEP+0": 1.0,
         "CONST": 1.0,
     })
 
     assert out.get("OUTPUT_LO+1", 0.0) == 0.0
     assert out["OUTPUT_LO+0"] == 1.0
-    assert out["OUTPUT_HI+0"] == 1.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 1.0
 
 
 def test_layer6_branch_pc_byte1_override_blocks_untaken_bz():
