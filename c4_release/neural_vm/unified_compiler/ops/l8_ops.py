@@ -1,10 +1,80 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L8 attention head layout (pinned head_idx values) ==============
+#
+# L8 hosts five attention-bake op families competing for an 8-head budget.
+# Pre-migration each ``DeclarativeAttentionHeadSpec`` / hand-rolled
+# weight-write block carried a literal ``head_idx=N``, making it fragile
+# to add a new head (the author had to remember which slots were already
+# taken). With :class:`AttentionHeadAllocator` the layout is structural:
+# every existing head_idx is declared here at its current slot so the
+# bakes stay byte-identical, and a future L8 attn op can claim a free
+# slot via ``allocator.alloc(name, layer_idx=8)`` (no pin) without
+# touching the existing weight writes.
+#
+# Heads 6 and 7 are intentionally listed twice — once as
+# ``layer8_sp_gather_bake`` mirror heads (the production owners; both
+# guarded ops below default to ``enable=False``) and once as the
+# alternative owners (``layer8_head6_ax_carry_refresh`` /
+# ``layer8_mem_to_alu``). The aliasing only matters when an alternative
+# owner is flipped to ``enable=True``; in that configuration the
+# sp_gather mirror writes are an acknowledged collision (see the head
+# spec docstring in :func:`_layer8_sp_gather_head_specs`). Each bake
+# instantiates its OWN allocator pinning only the heads it actually
+# writes, so the collision is not raised by the allocator at registration
+# time — but the table below documents the full picture so a future
+# reconciliation has a single source of truth.
+_L8_HEAD_LAYOUT = (
+    # (op-name key,                                       pinned head_idx)
+    ("layer8_sp_gather_bake.head_0",                      0),  # SP gather j=0
+    ("layer8_sp_gather_bake.head_1",                      1),  # SP gather j=1
+    ("layer8_sp_gather_bake.head_2",                      2),  # SP gather j=2
+    ("layer8_multibyte_fetch_bake.head_3",                3),  # multi-byte IMM fetch
+    ("layer8_op_imm_relay.head_4",                        4),  # OP_IMM relay at AX bytes
+    ("layer8_mem_to_alu.head_5",                          5),  # mem[SP] -> ALU at AX
+    ("layer8_sp_gather_bake.head_6_mark_sp_mirror",       6),  # MARK_SP mirror of j=0
+    ("layer8_sp_gather_bake.head_7_mark_sp_mirror",       7),  # MARK_SP mirror of j=1
+    ("layer8_head6_ax_carry_refresh.head_6",              6),  # alt owner (enable=False)
+    ("layer8_mem_to_alu.head_7",                          7),  # alt owner (enable=False)
+)
+_L8_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L8_HEAD_LAYOUT}
+
+
+def _allocate_layer8_attn_heads(op_names: tuple[str, ...]) -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` pinning ``op_names``.
+
+    Each L8 attn bake calls this with the subset of
+    :data:`_L8_HEAD_LAYOUT` entries it owns and stashes the result on
+    ``block.attn._l8_head_allocator`` for downstream inspection. The
+    helper resolves each name through :data:`_L8_HEAD_LAYOUT_BY_NAME`
+    and pins it at exactly the existing slot so the underlying weight
+    writes -- still hand-coded in the spec functions / inline blocks --
+    land byte-identically.
+
+    Subsetting (rather than pinning the full table on every call) sidesteps
+    the head 6/7 dual ownership documented in :data:`_L8_HEAD_LAYOUT`: the
+    sp_gather mirrors and the alt owners never share a single allocator
+    instance, so the collision check fires only on intra-op duplicates
+    (which is what we want).
+    """
+    allocator = AttentionHeadAllocator()
+    for name in op_names:
+        try:
+            head_idx = _L8_HEAD_LAYOUT_BY_NAME[name]
+        except KeyError as exc:
+            raise KeyError(
+                f"_allocate_layer8_attn_heads: unknown L8 attn op {name!r}"
+            ) from exc
+        allocator.alloc(name, layer_idx=8, pin=head_idx)
+    return allocator
 
 
 # === L8 FFN unit layout (pinned offsets) ============================
@@ -430,6 +500,14 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
+        # Per-bake attention-head allocator. Head 3 is pinned at its
+        # existing slot so ``generate_attention_head`` writes the same
+        # ``head_idx * HD + slot`` rows it always has. Stashed on the
+        # attention module so a future L8 attn op claiming a free slot
+        # can inspect the layout. See :data:`_L8_HEAD_LAYOUT`.
+        attn._l8_head_allocator = _allocate_layer8_attn_heads(
+            ("layer8_multibyte_fetch_bake.head_3",)
+        )
         Primitives.generate_attention_head(
             attn, _layer8_multibyte_fetch_head_spec(proxy), HD
         )
@@ -475,7 +553,7 @@ def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     AX_I = 1
     TOP = 36
     return DeclarativeAttentionHeadSpec(
-        head_idx=3,
+        head_idx=_L8_HEAD_LAYOUT_BY_NAME["layer8_multibyte_fetch_bake.head_3"],
         q=(
             tuple(AP(k, BD.FETCH_LO + k, L) for k in range(16))
             + tuple(AP(16 + k, BD.FETCH_HI + k, L) for k in range(16))
@@ -695,6 +773,19 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
+        # Per-bake attention-head allocator. Heads 0-2 (j=0..2 main
+        # gather rows) and the head 6/7 MARK_SP mirrors are pinned at
+        # their existing slots so ``generate_attention_heads`` writes
+        # the same ``head_idx * HD + slot`` rows it always has. Stashed
+        # on the attention module so downstream tooling can inspect the
+        # layout. See :data:`_L8_HEAD_LAYOUT`.
+        attn._l8_head_allocator = _allocate_layer8_attn_heads((
+            "layer8_sp_gather_bake.head_0",
+            "layer8_sp_gather_bake.head_1",
+            "layer8_sp_gather_bake.head_2",
+            "layer8_sp_gather_bake.head_6_mark_sp_mirror",
+            "layer8_sp_gather_bake.head_7_mark_sp_mirror",
+        ))
         Primitives.generate_attention_heads(
             attn, _layer8_sp_gather_head_specs(proxy), HD
         )
@@ -750,13 +841,18 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
     MEM_I = 4
 
     specs: list[DeclarativeAttentionHeadSpec] = []
+    _sp_gather_main_names = (
+        "layer8_sp_gather_bake.head_0",
+        "layer8_sp_gather_bake.head_1",
+        "layer8_sp_gather_bake.head_2",
+    )
     for j in range(3):
         byte_idx_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][j]
         addr_lo_out = [BD.ADDR_B0_LO, BD.ADDR_B1_LO, BD.ADDR_B2_LO][j]
         addr_hi_out = [BD.ADDR_B0_HI, BD.ADDR_B1_HI, BD.ADDR_B2_HI][j]
         specs.append(
             DeclarativeAttentionHeadSpec(
-                head_idx=j,
+                head_idx=_L8_HEAD_LAYOUT_BY_NAME[_sp_gather_main_names[j]],
                 q=(
                     AP(0, BD.MARK_STACK0, L),
                     AP(0, BD.H4 + BP_I, L),
@@ -799,7 +895,13 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
     # ``make_layer8_head6_ax_carry_refresh_op`` and ``make_layer8_mem_to_alu_op``
     # bakes, both ``enable=False`` by default so the physical head slots
     # are free in the production build.
-    for mirror_j, head_idx in ((0, 6), (1, 7)):
+    _sp_gather_mirror_names = {
+        0: "layer8_sp_gather_bake.head_6_mark_sp_mirror",
+        1: "layer8_sp_gather_bake.head_7_mark_sp_mirror",
+    }
+    for mirror_j in (0, 1):
+        mirror_name = _sp_gather_mirror_names[mirror_j]
+        head_idx = _L8_HEAD_LAYOUT_BY_NAME[mirror_name]
         byte_idx_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][mirror_j]
         addr_lo_out = [BD.ADDR_B0_LO, BD.ADDR_B1_LO, BD.ADDR_B2_LO][mirror_j]
         addr_hi_out = [BD.ADDR_B0_HI, BD.ADDR_B1_HI, BD.ADDR_B2_HI][mirror_j]
@@ -869,7 +971,16 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         BD = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        base = 6 * HD
+        # Per-bake attention-head allocator. Head 6 is pinned at its
+        # existing slot so the hand-rolled weight writes below land
+        # byte-identically. Stashed on the attention module so
+        # downstream tooling can inspect the layout. See
+        # :data:`_L8_HEAD_LAYOUT`.
+        attn._l8_head_allocator = _allocate_layer8_attn_heads(
+            ("layer8_head6_ax_carry_refresh.head_6",)
+        )
+        head = _L8_HEAD_LAYOUT_BY_NAME["layer8_head6_ax_carry_refresh.head_6"]
+        base = head * HD
         AX_CARRY_L = 50.0  # head-local Q/K scale
         # Q[base+0]: fire only at current step's AX marker on subsequent
         # steps (HAS_SE = 1). The CONST baseline blocks first-step fires.
@@ -970,6 +1081,14 @@ def make_layer8_op_imm_relay_op() -> Operation:
         BD = _as_setdim_proxy(dim_positions)
         attn8 = block.attn
         HD = attn8.W_q.shape[0] // attn8.num_heads
+        # Per-bake attention-head allocator. Head 4 is pinned at its
+        # existing slot so ``generate_attention_head`` writes the same
+        # ``head_idx * HD + slot`` rows it always has. Stashed on the
+        # attention module so downstream tooling can inspect the layout.
+        # See :data:`_L8_HEAD_LAYOUT`.
+        attn8._l8_head_allocator = _allocate_layer8_attn_heads(
+            ("layer8_op_imm_relay.head_4",)
+        )
         Primitives.generate_attention_head(
             attn8, _layer8_op_imm_relay_head_spec(BD), HD
         )
@@ -1017,7 +1136,7 @@ def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     AX_I = 1
     L8_relay = 20.0
     return DeclarativeAttentionHeadSpec(
-        head_idx=4,
+        head_idx=_L8_HEAD_LAYOUT_BY_NAME["layer8_op_imm_relay.head_4"],
         q=(
             AP(0, BD.IS_BYTE, L8_relay),
             AP(0, BD.H1 + AX_I, L8_relay),
@@ -1092,7 +1211,16 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         BD = _as_setdim_proxy(dim_positions)
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
-        head = 5
+        # Per-bake attention-head allocator. Heads 5 and 7 are pinned
+        # at their existing slots so the hand-rolled weight writes
+        # below land byte-identically. Stashed on the attention module
+        # so downstream tooling can inspect the layout. See
+        # :data:`_L8_HEAD_LAYOUT`.
+        attn._l8_head_allocator = _allocate_layer8_attn_heads((
+            "layer8_mem_to_alu.head_5",
+            "layer8_mem_to_alu.head_7",
+        ))
+        head = _L8_HEAD_LAYOUT_BY_NAME["layer8_mem_to_alu.head_5"]
         base = head * HD
 
         # Slope tuned to favor most-recent matching MEM_STORE.
@@ -1248,7 +1376,7 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         # stack byte 1 available at the marker before the shift pipeline runs.
         # Stage the historical MEM value byte 1 into AX_FULL_* at the AX
         # marker. GE conversion consumes AX_FULL_* as operand-A positions 2/3.
-        head = 7
+        head = _L8_HEAD_LAYOUT_BY_NAME["layer8_mem_to_alu.head_7"]
         base = head * HD
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[head] = 0.5
