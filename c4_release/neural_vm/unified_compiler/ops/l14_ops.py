@@ -1153,6 +1153,68 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
     )
 
 
+def _layer14_alu_nocarry_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_alu_nocarry_ax_bytes_zero``.
+
+    Mirrors the 4 imperative hidden units: at AX byte positions 1-3
+    (IS_BYTE + H1[AX] + TEMP[7]*4 + NOT BYTE_INDEX_3*4) gated by TEMP[7]
+    (the NOCARRY_ALU_OP relay populated by L7 head 5 for AND/OR/XOR/SHR),
+    each unit spreads -3/S across one nibble band (LO or HI) or boosts a
+    single byte-value-0 slot (+5/S on OUTPUT_LO[0] / OUTPUT_HI[0]). The
+    elevated threshold of 5.0 plus the ``TEMP+7`` condition weight of
+    4.0 reproduce the imperative ``b_up = -S * 5.0`` and
+    ``W_up[TEMP+7] = S * 4`` lines exactly; without TEMP[7] the
+    pre-silu drops to -300 (no firing) so byte 0 and non-target opcodes
+    are both safe.
+    """
+    AX_I = 1
+    common_conditions = (
+        ("IS_BYTE", 1.0),
+        (f"H1+{AX_I}", 1.0),
+        ("TEMP+7", 4.0),
+        ("BYTE_INDEX_3", -4.0),
+    )
+    common_kwargs = dict(
+        conditions=common_conditions,
+        threshold=5.0,
+        gate="TEMP+7",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        scope="TEMP+7 and IS_BYTE and H1+1 and not BYTE_INDEX_3",
+    )
+    rules = (
+        FFNRule.gated_write(
+            name="l14_alu_nocarry_ax_bytes_zero_lo_neg",
+            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_alu_nocarry_ax_bytes_zero_hi_neg",
+            writes=tuple(
+                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
+            ),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_alu_nocarry_ax_bytes_zero_lo0_boost",
+            writes=(("OUTPUT_LO+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_alu_nocarry_ax_bytes_zero_hi0_boost",
+            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+    )
+    return rules
+
+
+def _layer14_alu_nocarry_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_alu_nocarry_ax_bytes_zero_rules(S))
+    return ir
+
+
 def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
     """L14 FFN: Zero AX bytes 1-3 at AX byte positions when a non-carry ALU
     op is active (V7 Block 13, fix-v7-block13-ax-merge, 2026-05-12).
@@ -1177,16 +1239,25 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
     Phase 14.8: runs AFTER ``layer14_lc_ax_bytes_zero`` (14.7) — JSR / LC /
     nocarry-ALU gate on disjoint relays (OP_JSR vs OP_LC_RELAY vs TEMP[7])
     so the relative order within 14.6-14.8 only matters for unit allocation.
+
+    Migration (Phase 6 wave 3J): per-unit writes declared via
+    :func:`_layer14_alu_nocarry_ax_bytes_zero_rules` and attached as
+    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_alu_nocarry_ax_bytes_zero
         ffn = block.ffn
         # Pinned to chain offset 1870 (jsr_ax + lc_ax consume units 1862..1869).
         # Last op in the L14 cleanup chain. Byte-identical with the legacy
         # ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_alu_nocarry_ax_bytes_zero")
-        next_unit = _set_layer14_alu_nocarry_ax_bytes_zero(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_alu_nocarry_ax_bytes_zero_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -1213,6 +1284,7 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_alu_nocarry_ax_bytes_zero_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
@@ -1242,6 +1314,65 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
     )
 
 
+def _layer14_lc_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_lc_ax_bytes_zero``.
+
+    Mirrors the 4 imperative hidden units: at AX byte positions 1-3
+    (IS_BYTE + H1[AX] + NOT BYTE_INDEX_0 via ``BYTE_INDEX_3 = -S*4``
+    blocker) gated by OP_LC_RELAY, each unit spreads -3/S across one
+    nibble band (LO or HI) or boosts a single byte-value-0 slot (+5/S on
+    OUTPUT_LO[0] / OUTPUT_HI[0]). The ``BYTE_INDEX_3`` blocker is a
+    "kill switch": at any byte index where it is 1 the condition sum
+    drops by 4S and the SiLU side stops firing, which is why the
+    imperative helper labels it as a "Block after AX byte 3" guard.
+    """
+    AX_I = 1
+    common_conditions = (
+        ("IS_BYTE", 1.0),
+        (f"H1+{AX_I}", 1.0),
+        ("BYTE_INDEX_3", -4.0),
+    )
+    common_kwargs = dict(
+        conditions=common_conditions,
+        threshold=1.5,
+        gate="OP_LC_RELAY",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        scope="OP_LC_RELAY and IS_BYTE and H1+1 and not BYTE_INDEX_3",
+    )
+    rules = (
+        FFNRule.gated_write(
+            name="l14_lc_ax_bytes_zero_lo_neg",
+            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_lc_ax_bytes_zero_hi_neg",
+            writes=tuple(
+                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
+            ),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_lc_ax_bytes_zero_lo0_boost",
+            writes=(("OUTPUT_LO+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_lc_ax_bytes_zero_hi0_boost",
+            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+    )
+    return rules
+
+
+def _layer14_lc_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_lc_ax_bytes_zero_rules(S))
+    return ir
+
+
 def make_layer14_lc_ax_bytes_zero_op() -> Operation:
     """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_LC is active.
 
@@ -1267,15 +1398,24 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
     Phase 14.7: runs AFTER ``layer14_jsr_ax_bytes_zero`` (14.6) — the JSR
     and LC ops gate on disjoint relays (OP_JSR vs OP_LC_RELAY) so the
     relative order within phase 14.6-14.7 only matters for unit allocation.
+
+    Migration (Phase 6 wave 3J): per-unit writes declared via
+    :func:`_layer14_lc_ax_bytes_zero_rules` and attached as
+    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_lc_ax_bytes_zero
         ffn = block.ffn
         # Pinned to chain offset 1866 (jsr_ax_bytes_zero consumes 1862..1865).
         # Byte-identical with the legacy ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_lc_ax_bytes_zero")
-        next_unit = _set_layer14_lc_ax_bytes_zero(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_lc_ax_bytes_zero_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -1302,6 +1442,7 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_lc_ax_bytes_zero_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
