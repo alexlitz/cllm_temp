@@ -45,7 +45,7 @@ def make_io_putchar_routing_op() -> Operation:
     _claims.add((6, "ffn_W_down", "1500", "IO_IS_PUTCHAR+0"))
     for k in range(16):
         _claims.add((6, "ffn_W_down", str(1501 + k), f"OUTPUT_LO+{k}"))
-        _claims.add((6, "ffn_W_down", str(1517 + k), f"OUTPUT_HI+{k}"))
+        _claims.add((6, "ffn_W_down", str(1517 + k), f"OUTPUT_HI_THIS_STEP+{k}"))
     # W_gate: routing units read AX_CARRY_*[k]
     for k in range(16):
         _claims.add((6, "ffn_W_gate", str(1501 + k), f"AX_CARRY_LO+{k}"))
@@ -142,7 +142,7 @@ def make_function_call_weights_op() -> Operation:
             (6, "attn_W_v", f"7_{1 + k}", f"OUTPUT_LO+{k}")
         )
         _claims.add(
-            (6, "attn_W_v", f"7_{17 + k}", f"OUTPUT_HI+{k}")
+            (6, "attn_W_v", f"7_{17 + k}", f"OUTPUT_HI_THIS_STEP+{k}")
         )
 
     return Operation(
