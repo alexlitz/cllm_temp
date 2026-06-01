@@ -1,0 +1,3064 @@
+{
+  "aggregate": {
+    "total_ops": 115,
+    "per_class": {
+      "imperative_heavy": 37,
+      "imperative_medium": 12,
+      "declarative": 23,
+      "imperative_trivial": 9,
+      "no_op": 33,
+      "declarative_no_op": 1
+    },
+    "per_kind": {
+      "block": 67,
+      "ffn": 8,
+      "attn": 15,
+      "model": 25
+    },
+    "per_layer_per_class": {
+      "?": {
+        "no_op": 2,
+        "imperative_heavy": 1,
+        "imperative_trivial": 2,
+        "imperative_medium": 1,
+        "declarative": 1
+      },
+      "L0": {
+        "imperative_heavy": 1,
+        "imperative_medium": 1
+      },
+      "L1": {
+        "imperative_medium": 1,
+        "declarative": 1
+      },
+      "L10": {
+        "no_op": 5,
+        "imperative_trivial": 2,
+        "imperative_heavy": 7
+      },
+      "L11": {
+        "imperative_heavy": 1
+      },
+      "L12": {
+        "imperative_heavy": 1
+      },
+      "L13": {
+        "imperative_heavy": 2
+      },
+      "L14": {
+        "imperative_heavy": 6,
+        "imperative_medium": 3
+      },
+      "L15": {
+        "imperative_heavy": 3,
+        "declarative": 4
+      },
+      "L16": {
+        "declarative": 1
+      },
+      "L17": {
+        "declarative_no_op": 1
+      },
+      "L2": {
+        "imperative_medium": 1,
+        "declarative": 2,
+        "imperative_trivial": 1
+      },
+      "L3": {
+        "no_op": 1,
+        "imperative_heavy": 2,
+        "imperative_trivial": 2
+      },
+      "L4": {
+        "imperative_heavy": 1,
+        "declarative": 2,
+        "no_op": 1
+      },
+      "L5": {
+        "no_op": 2,
+        "declarative": 1,
+        "imperative_heavy": 1,
+        "imperative_medium": 1
+      },
+      "L6": {
+        "no_op": 7,
+        "imperative_heavy": 6,
+        "imperative_medium": 3,
+        "declarative": 1
+      },
+      "L7": {
+        "declarative": 4,
+        "imperative_heavy": 1,
+        "no_op": 1
+      },
+      "L8": {
+        "no_op": 9,
+        "declarative": 3,
+        "imperative_heavy": 1,
+        "imperative_medium": 1,
+        "imperative_trivial": 1
+      },
+      "L9": {
+        "imperative_heavy": 1,
+        "declarative": 3,
+        "no_op": 2
+      },
+      "model": {
+        "imperative_heavy": 2,
+        "imperative_trivial": 1,
+        "no_op": 3
+      }
+    },
+    "cells_per_class": {
+      "imperative_heavy": 258733,
+      "imperative_medium": 650,
+      "declarative": 47728,
+      "imperative_trivial": 55,
+      "no_op": 0,
+      "declarative_no_op": 0
+    },
+    "ir_status": {
+      "no_ir": 84,
+      "has_ir": 31
+    },
+    "top10_biggest": [
+      {
+        "name": "l10_post_ops_combined",
+        "cells": 39284,
+        "classification": "imperative_heavy",
+        "helpers": [
+          "_suppress_ffn_on_step_boundary"
+        ],
+        "layer": "L10"
+      },
+      {
+        "name": "layer13_shifts",
+        "cells": 36864,
+        "classification": "imperative_heavy",
+        "helpers": [
+          "_set_layer13_shifts"
+        ],
+        "layer": "L13"
+      },
+      {
+        "name": "layer9_alu",
+        "cells": 36753,
+        "classification": "imperative_heavy",
+        "helpers": [
+          "_set_layer9_alu",
+          "_set_layer9_marker_suppress",
+          "_suppress_l9_legacy_addsub_writes"
+        ],
+        "layer": "L9"
+      },
+      {
+        "name": "layer11_mul_partial",
+        "cells": 28672,
+        "classification": "imperative_heavy",
+        "helpers": [
+          "_set_layer11_mul_partial"
+        ],
+        "layer": "L11"
+      },
+      {
+        "name": "layer12_mul_combine",
+        "cells": 28672,
+        "classification": "imperative_heavy",
+        "helpers": [
+          "_set_layer12_mul_combine"
+        ],
+        "layer": "L12"
+      },
+      {
+        "name": "layer16_lev_routing",
+        "cells": 22077,
+        "classification": "declarative",
+        "helpers": [],
+        "layer": "L16"
+      },
+      {
+        "name": "layer8_multibyte_routing",
+        "cells": 21713,
+        "classification": "declarative",
+        "helpers": [
+          "_set_layer8_alu"
+        ],
+        "layer": "L8"
+      },
+      {
+        "name": "layer8_alu",
+        "cells": 21489,
+        "classification": "imperative_heavy",
+        "helpers": [
+          "_set_layer8_alu"
+        ],
+        "layer": "L8"
+      },
+      {
+        "name": "layer6_routing_ffn",
+        "cells": 15212,
+        "classification": "imperative_heavy",
+        "helpers": [],
+        "layer": "L6"
+      },
+      {
+        "name": "layer14_addr_key_neural_decode",
+        "cells": 12894,
+        "classification": "imperative_heavy",
+        "helpers": [],
+        "layer": "L14"
+      }
+    ]
+  },
+  "rows": [
+    {
+      "name": "layer0_threshold_attn",
+      "kind": "block",
+      "phase": 0,
+      "layer_idx": 0,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l0_ops.py",
+      "bake_line": 251,
+      "classification": "imperative_heavy",
+      "cells_written": 144,
+      "cell_breakdown": {
+        "attn.W_q": 8,
+        "attn.W_k": 8,
+        "attn.W_v": 56,
+        "attn.W_o": 56,
+        "attn.alibi_slopes": 16
+      },
+      "helpers": [
+        "Primitives.generate_threshold_attention_heads"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L0"
+    },
+    {
+      "name": "phase_a_ffn",
+      "kind": "block",
+      "phase": 0,
+      "layer_idx": 0,
+      "has_compiler_ir": true,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l0_ops.py",
+      "bake_line": 124,
+      "classification": "imperative_medium",
+      "cells_written": 34,
+      "cell_breakdown": {
+        "ffn.W_up": 7,
+        "ffn.b_up": 7,
+        "ffn.W_gate": 6,
+        "ffn.b_gate": 7,
+        "ffn.W_down": 7
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L0"
+    },
+    {
+      "name": "layer1_ffn",
+      "kind": "ffn",
+      "phase": 1,
+      "layer_idx": 1,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l1_ops.py",
+      "bake_line": 65,
+      "classification": "imperative_medium",
+      "cells_written": 78,
+      "cell_breakdown": {
+        "ffn.W_up": 34,
+        "ffn.b_up": 5,
+        "ffn.W_gate": 29,
+        "ffn.b_gate": 5,
+        "ffn.W_down": 5
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L1"
+    },
+    {
+      "name": "layer1_threshold_attn",
+      "kind": "attn",
+      "phase": 1,
+      "layer_idx": 1,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l1_ops.py",
+      "bake_line": 196,
+      "classification": "declarative",
+      "cells_written": 89,
+      "cell_breakdown": {
+        "attn.W_q": 6,
+        "attn.W_k": 7,
+        "attn.W_v": 31,
+        "attn.W_o": 30,
+        "attn.alibi_slopes": 15
+      },
+      "helpers": [
+        "Primitives.generate_threshold_attention_heads",
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L1"
+    },
+    {
+      "name": "layer2_mem_byte_flags",
+      "kind": "ffn",
+      "phase": 2,
+      "layer_idx": 2,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l2_ops.py",
+      "bake_line": 125,
+      "classification": "imperative_medium",
+      "cells_written": 51,
+      "cell_breakdown": {
+        "ffn.W_up": 16,
+        "ffn.b_up": 8,
+        "ffn.W_gate": 8,
+        "ffn.b_gate": 8,
+        "ffn.W_down": 11
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L2"
+    },
+    {
+      "name": "layer2_threshold_attn",
+      "kind": "attn",
+      "phase": 2,
+      "layer_idx": 2,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l2_ops.py",
+      "bake_line": 363,
+      "classification": "declarative",
+      "cells_written": 32,
+      "cell_breakdown": {
+        "attn.W_q": 1,
+        "attn.W_k": 1,
+        "attn.W_v": 7,
+        "attn.W_o": 7,
+        "attn.alibi_slopes": 16
+      },
+      "helpers": [
+        "Primitives.generate_threshold_attention_heads"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L2"
+    },
+    {
+      "name": "layer2_lookback_detection_head",
+      "kind": "block",
+      "phase": 2.1,
+      "layer_idx": 2,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l2_ops.py",
+      "bake_line": 458,
+      "classification": "declarative",
+      "cells_written": 9,
+      "cell_breakdown": {
+        "attn.W_q": 1,
+        "attn.W_k": 1,
+        "attn.W_v": 3,
+        "attn.W_o": 3,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L2"
+    },
+    {
+      "name": "layer2_initial_pc_bake_cancel",
+      "kind": "block",
+      "phase": 2.5,
+      "layer_idx": 2,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l2_ops.py",
+      "bake_line": 263,
+      "classification": "imperative_trivial",
+      "cells_written": 8,
+      "cell_breakdown": {
+        "ffn.W_up": 2,
+        "ffn.b_up": 2,
+        "ffn.W_gate": 2,
+        "ffn.W_down": 2
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L2"
+    },
+    {
+      "name": "_layer3_ffn_dep_anchor",
+      "kind": "ffn",
+      "phase": 3,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l3_ops.py",
+      "bake_line": 457,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L3"
+    },
+    {
+      "name": "layer3_carry_forward_attn",
+      "kind": "attn",
+      "phase": 3,
+      "layer_idx": 3,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l3_ops.py",
+      "bake_line": 489,
+      "classification": "imperative_heavy",
+      "cells_written": 554,
+      "cell_breakdown": {
+        "attn.W_q": 82,
+        "attn.W_k": 24,
+        "attn.W_v": 224,
+        "attn.W_o": 208,
+        "attn.alibi_slopes": 16
+      },
+      "helpers": [
+        "Primitives.carry_forward_attention",
+        "Primitives.generate_attention_heads"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L3"
+    },
+    {
+      "name": "layer3_ffn",
+      "kind": "block",
+      "phase": 3,
+      "layer_idx": 3,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l3_ops.py",
+      "bake_line": 110,
+      "classification": "imperative_heavy",
+      "cells_written": 857,
+      "cell_breakdown": {
+        "ffn.W_up": 461,
+        "ffn.b_up": 134,
+        "ffn.W_gate": 86,
+        "ffn.b_gate": 48,
+        "ffn.W_down": 128
+      },
+      "helpers": [
+        "_set_layer3_ffn",
+        "_suppress_layer3_stack0_marker_carry_projection"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L3"
+    },
+    {
+      "name": "layer3_convo_io_state_init",
+      "kind": "block",
+      "phase": 3.1,
+      "layer_idx": 3,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l3_ops.py",
+      "bake_line": 742,
+      "classification": "imperative_trivial",
+      "cells_written": 4,
+      "cell_breakdown": {
+        "ffn.W_up": 1,
+        "ffn.b_up": 1,
+        "ffn.b_gate": 1,
+        "ffn.W_down": 1
+      },
+      "helpers": [
+        "_lower_layer3_convo_io_state_init_ir"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L3"
+    },
+    {
+      "name": "convo_io_step_resume",
+      "kind": "block",
+      "phase": 3.2,
+      "layer_idx": 3,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 567,
+      "classification": "imperative_trivial",
+      "cells_written": 6,
+      "cell_breakdown": {
+        "ffn.W_up": 1,
+        "ffn.b_up": 1,
+        "ffn.b_gate": 1,
+        "ffn.W_down": 3
+      },
+      "helpers": [
+        "_lower_convo_io_step_resume_ir"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L3"
+    },
+    {
+      "name": "layer4_ffn",
+      "kind": "block",
+      "phase": 4,
+      "layer_idx": 4,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l4_ops.py",
+      "bake_line": 341,
+      "classification": "imperative_heavy",
+      "cells_written": 3292,
+      "cell_breakdown": {
+        "ffn.W_up": 1663,
+        "ffn.b_up": 543,
+        "ffn.W_gate": 543,
+        "ffn.W_down": 543
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L4"
+    },
+    {
+      "name": "layer4_pc_relay",
+      "kind": "block",
+      "phase": 4,
+      "layer_idx": 4,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l4_ops.py",
+      "bake_line": 151,
+      "classification": "declarative",
+      "cells_written": 221,
+      "cell_breakdown": {
+        "attn.W_q": 8,
+        "attn.W_k": 5,
+        "attn.W_v": 96,
+        "attn.W_o": 96,
+        "attn.alibi_slopes": 16
+      },
+      "helpers": [
+        "Primitives.generate_attention_heads"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L4"
+    },
+    {
+      "name": "layer4_sp_to_addr_key",
+      "kind": "block",
+      "phase": 4.5,
+      "layer_idx": 4,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l4_ops.py",
+      "bake_line": 527,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L4"
+    },
+    {
+      "name": "convo_io_prtf_transport",
+      "kind": "block",
+      "phase": 4.6,
+      "layer_idx": 4,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 896,
+      "classification": "declarative",
+      "cells_written": 132,
+      "cell_breakdown": {
+        "attn.W_q": 2,
+        "attn.W_k": 3,
+        "attn.W_v": 63,
+        "attn.W_o": 63,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [
+        "_set_convo_io_prtf_transport",
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L4"
+    },
+    {
+      "name": "_layer5_fetch_dep_anchor",
+      "kind": "attn",
+      "phase": 5,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l5_ops.py",
+      "bake_line": 358,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L5"
+    },
+    {
+      "name": "_opcode_decode_ffn_dep_anchor",
+      "kind": "ffn",
+      "phase": 5,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l5_ops.py",
+      "bake_line": 717,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "?"
+    },
+    {
+      "name": "layer5_fetch",
+      "kind": "block",
+      "phase": 5,
+      "layer_idx": 5,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l5_ops.py",
+      "bake_line": 97,
+      "classification": "declarative",
+      "cells_written": 909,
+      "cell_breakdown": {
+        "attn.W_q": 226,
+        "attn.W_k": 299,
+        "attn.W_v": 192,
+        "attn.W_o": 192
+      },
+      "helpers": [
+        "Primitives.generate_attention_heads"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L5"
+    },
+    {
+      "name": "opcode_decode_ffn",
+      "kind": "block",
+      "phase": 5,
+      "layer_idx": 5,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l5_ops.py",
+      "bake_line": 394,
+      "classification": "imperative_heavy",
+      "cells_written": 450,
+      "cell_breakdown": {
+        "ffn.W_up": 186,
+        "ffn.b_up": 88,
+        "ffn.W_gate": 65,
+        "ffn.b_gate": 23,
+        "ffn.W_down": 88
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L5"
+    },
+    {
+      "name": "convo_io_opcode_decode",
+      "kind": "block",
+      "phase": 5.6,
+      "layer_idx": 5,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 92,
+      "classification": "imperative_medium",
+      "cells_written": 12,
+      "cell_breakdown": {
+        "ffn.W_up": 4,
+        "ffn.b_up": 2,
+        "ffn.W_gate": 2,
+        "ffn.W_down": 4
+      },
+      "helpers": [
+        "_lower_convo_io_opcode_decode_ir"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L5"
+    },
+    {
+      "name": "layer5_user_input_gather",
+      "kind": "block",
+      "phase": 5.7,
+      "layer_idx": 5,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/user_input_ops.py",
+      "bake_line": 46,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L5"
+    },
+    {
+      "name": "layer6_attn",
+      "kind": "attn",
+      "phase": 6,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 2369,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "layer6_relay_heads",
+      "kind": "attn",
+      "phase": 6.1,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 2618,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "layer6_routing_ffn",
+      "kind": "block",
+      "phase": 6.5,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 2423,
+      "classification": "imperative_heavy",
+      "cells_written": 15212,
+      "cell_breakdown": {
+        "ffn.W_up": 10368,
+        "ffn.b_up": 1507,
+        "ffn.W_gate": 1680,
+        "ffn.b_gate": 67,
+        "ffn.W_down": 1590
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "layer6_ent_after_jsr_sp_byte0_fixup",
+      "kind": "block",
+      "phase": 6.55,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 2476,
+      "classification": "imperative_medium",
+      "cells_written": 83,
+      "cell_breakdown": {
+        "ffn.W_up": 32,
+        "ffn.b_up": 7,
+        "ffn.b_gate": 7,
+        "ffn.W_down": 37
+      },
+      "helpers": [
+        "_lower_layer6_ent_after_jsr_sp_byte0_fixup_ir"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "convo_io_state_machine",
+      "kind": "block",
+      "phase": 6.6,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 383,
+      "classification": "imperative_medium",
+      "cells_written": 12,
+      "cell_breakdown": {
+        "ffn.W_up": 2,
+        "ffn.b_up": 2,
+        "ffn.W_gate": 2,
+        "ffn.W_down": 6
+      },
+      "helpers": [
+        "_lower_convo_io_state_machine_ir"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "prtf_think_protocol",
+      "kind": "block",
+      "phase": 6.6,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 3682,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "putchar_think_protocol",
+      "kind": "block",
+      "phase": 6.6,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 3590,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [
+        "_set_conversational_io_state_machine",
+        "setup_helpers"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "convo_io_pc_sp_latch",
+      "kind": "block",
+      "phase": 6.7,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 662,
+      "classification": "imperative_heavy",
+      "cells_written": 256,
+      "cell_breakdown": {
+        "ffn.W_up": 64,
+        "ffn.b_up": 64,
+        "ffn.W_gate": 64,
+        "ffn.W_down": 64
+      },
+      "helpers": [
+        "_lower_convo_io_pc_sp_latch_ir"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "open_clos_tool_call",
+      "kind": "block",
+      "phase": 6.7,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 3755,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "layer7_memory_heads",
+      "kind": "block",
+      "phase": 7,
+      "layer_idx": 7,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l7_ops.py",
+      "bake_line": 267,
+      "classification": "declarative",
+      "cells_written": 288,
+      "cell_breakdown": {
+        "attn.W_q": 34,
+        "attn.W_k": 13,
+        "attn.W_v": 120,
+        "attn.W_o": 118,
+        "attn.alibi_slopes": 3
+      },
+      "helpers": [
+        "Primitives.generate_attention_heads"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L7"
+    },
+    {
+      "name": "layer7_operand_gather",
+      "kind": "block",
+      "phase": 7,
+      "layer_idx": 7,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l7_ops.py",
+      "bake_line": 120,
+      "classification": "declarative",
+      "cells_written": 165,
+      "cell_breakdown": {
+        "attn.W_q": 16,
+        "attn.W_k": 5,
+        "attn.W_v": 64,
+        "attn.W_o": 64,
+        "attn.alibi_slopes": 16
+      },
+      "helpers": [
+        "Primitives.generate_attention_heads"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L7"
+    },
+    {
+      "name": "format_pointer_extraction",
+      "kind": "block",
+      "phase": 7.5,
+      "layer_idx": 7,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l7_ops.py",
+      "bake_line": 539,
+      "classification": "declarative",
+      "cells_written": 67,
+      "cell_breakdown": {
+        "attn.W_q": 1,
+        "attn.W_k": 1,
+        "attn.W_v": 32,
+        "attn.W_o": 32,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L7"
+    },
+    {
+      "name": "convo_io_prtf_capture",
+      "kind": "block",
+      "phase": 7.6,
+      "layer_idx": 7,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 770,
+      "classification": "imperative_heavy",
+      "cells_written": 320,
+      "cell_breakdown": {
+        "ffn.W_up": 128,
+        "ffn.b_up": 64,
+        "ffn.W_gate": 64,
+        "ffn.W_down": 64
+      },
+      "helpers": [
+        "_lower_convo_io_prtf_capture_ir"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L7"
+    },
+    {
+      "name": "layer7_sp_byte0_is_f8",
+      "kind": "block",
+      "phase": 7.6,
+      "layer_idx": 7,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l7_ops.py",
+      "bake_line": 663,
+      "classification": "declarative",
+      "cells_written": 4,
+      "cell_breakdown": {
+        "attn.W_v": 2,
+        "attn.W_o": 2
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L7"
+    },
+    {
+      "name": "l8_alu_addsub_bdtoge",
+      "kind": "model",
+      "phase": 8.0,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": false,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/alu_ops.py",
+      "bake_line": 1005,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [
+        "_expand_wrapper_blocks"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer8_multibyte_fetch",
+      "kind": "attn",
+      "phase": 8,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 458,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer8_sp_gather",
+      "kind": "attn",
+      "phase": 8,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 739,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer8_sp_gather_bake",
+      "kind": "block",
+      "phase": 8.0,
+      "layer_idx": 8,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 772,
+      "classification": "declarative",
+      "cells_written": 710,
+      "cell_breakdown": {
+        "attn.W_q": 40,
+        "attn.W_k": 20,
+        "attn.W_v": 170,
+        "attn.W_o": 480
+      },
+      "helpers": [
+        "Primitives.generate_attention_heads"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer8_head6_ax_carry_refresh",
+      "kind": "block",
+      "phase": 8.05,
+      "layer_idx": 8,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 968,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "l8_alu_addsub_stage1",
+      "kind": "model",
+      "phase": 8.1,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": false,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/alu_ops.py",
+      "bake_line": 1030,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer8_multibyte_fetch_bake",
+      "kind": "block",
+      "phase": 8.1,
+      "layer_idx": 8,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 499,
+      "classification": "declarative",
+      "cells_written": 174,
+      "cell_breakdown": {
+        "attn.W_q": 58,
+        "attn.W_k": 52,
+        "attn.W_v": 32,
+        "attn.W_o": 32
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "l8_alu_addsub_stage2",
+      "kind": "model",
+      "phase": 8.2,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": false,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/alu_ops.py",
+      "bake_line": 1055,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer8_alu",
+      "kind": "block",
+      "phase": 8.2,
+      "layer_idx": 8,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 287,
+      "classification": "imperative_heavy",
+      "cells_written": 21489,
+      "cell_breakdown": {
+        "ffn.W_up": 15419,
+        "ffn.b_up": 2019,
+        "ffn.W_gate": 2018,
+        "ffn.b_gate": 9,
+        "ffn.W_down": 2024
+      },
+      "helpers": [
+        "_set_layer8_alu"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "l8_alu_addsub_stage3",
+      "kind": "model",
+      "phase": 8.3,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": false,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/alu_ops.py",
+      "bake_line": 1078,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer8_multibyte_routing",
+      "kind": "block",
+      "phase": 8.3,
+      "layer_idx": 8,
+      "has_compiler_ir": true,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 612,
+      "classification": "declarative",
+      "cells_written": 21713,
+      "cell_breakdown": {
+        "ffn.W_up": 15547,
+        "ffn.b_up": 2051,
+        "ffn.W_gate": 2050,
+        "ffn.b_gate": 9,
+        "ffn.W_down": 2056
+      },
+      "helpers": [
+        "_set_layer8_alu"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "l8_alu_addsub_getobd",
+      "kind": "model",
+      "phase": 8.4,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": false,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/alu_ops.py",
+      "bake_line": 1101,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer8_mem_to_alu",
+      "kind": "block",
+      "phase": 8.45,
+      "layer_idx": 8,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 1207,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [
+        "_set_layer7_operand_gather"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "format_position_counter",
+      "kind": "block",
+      "phase": 8.5,
+      "layer_idx": 8,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 373,
+      "classification": "imperative_medium",
+      "cells_written": 96,
+      "cell_breakdown": {
+        "ffn.W_up": 32,
+        "ffn.b_up": 16,
+        "ffn.W_gate": 16,
+        "ffn.W_down": 32
+      },
+      "helpers": [
+        "_lower_format_position_counter_ir"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer8_sp_gathered_sentinel",
+      "kind": "block",
+      "phase": 8.6,
+      "layer_idx": 8,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l8_ops.py",
+      "bake_line": 1566,
+      "classification": "imperative_trivial",
+      "cells_written": 4,
+      "cell_breakdown": {
+        "ffn.W_up": 1,
+        "ffn.b_up": 1,
+        "ffn.b_gate": 1,
+        "ffn.W_down": 1
+      },
+      "helpers": [
+        "Primitives.lower_ffn_rules"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L8"
+    },
+    {
+      "name": "layer9_alu",
+      "kind": "block",
+      "phase": 9,
+      "layer_idx": 9,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l9_ops.py",
+      "bake_line": 163,
+      "classification": "imperative_heavy",
+      "cells_written": 36753,
+      "cell_breakdown": {
+        "ffn.W_up": 26271,
+        "ffn.b_up": 3405,
+        "ffn.W_gate": 3377,
+        "ffn.b_gate": 59,
+        "ffn.W_down": 3641
+      },
+      "helpers": [
+        "_set_layer9_alu",
+        "_set_layer9_marker_suppress",
+        "_suppress_l9_legacy_addsub_writes"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L9"
+    },
+    {
+      "name": "layer9_lev_addr_relay",
+      "kind": "block",
+      "phase": 9.0,
+      "layer_idx": 9,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l9_ops.py",
+      "bake_line": 425,
+      "classification": "declarative",
+      "cells_written": 73,
+      "cell_breakdown": {
+        "attn.W_q": 5,
+        "attn.W_k": 3,
+        "attn.W_v": 32,
+        "attn.W_o": 32,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L9"
+    },
+    {
+      "name": "layer9_marker_suppress",
+      "kind": "ffn",
+      "phase": 9,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l9_ops.py",
+      "bake_line": 908,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L9"
+    },
+    {
+      "name": "layer9_lev_bp_to_pc_relay",
+      "kind": "block",
+      "phase": 9.1,
+      "layer_idx": 9,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l9_ops.py",
+      "bake_line": 495,
+      "classification": "declarative",
+      "cells_written": 73,
+      "cell_breakdown": {
+        "attn.W_q": 5,
+        "attn.W_k": 3,
+        "attn.W_v": 32,
+        "attn.W_o": 32,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L9"
+    },
+    {
+      "name": "layer9_alibi_mem_attn",
+      "kind": "block",
+      "phase": 9.2,
+      "layer_idx": 9,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l9_ops.py",
+      "bake_line": 789,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L9"
+    },
+    {
+      "name": "format_string_fetch_head",
+      "kind": "block",
+      "phase": 9.5,
+      "layer_idx": 9,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l9_ops.py",
+      "bake_line": 653,
+      "classification": "declarative",
+      "cells_written": 145,
+      "cell_breakdown": {
+        "attn.W_q": 33,
+        "attn.W_k": 32,
+        "attn.W_v": 32,
+        "attn.W_o": 32,
+        "attn.alibi_slopes": 16
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L9"
+    },
+    {
+      "name": "layer10_byte_passthrough",
+      "kind": "attn",
+      "phase": 10,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 988,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_carry_relay",
+      "kind": "attn",
+      "phase": 10,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 964,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_carry_relay_bake",
+      "kind": "block",
+      "phase": 10.0,
+      "layer_idx": 10,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1084,
+      "classification": "imperative_trivial",
+      "cells_written": 10,
+      "cell_breakdown": {
+        "attn.W_q": 4,
+        "attn.W_k": 2,
+        "attn.W_v": 2,
+        "attn.W_o": 2
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_psh_stack0_passthrough",
+      "kind": "attn",
+      "phase": 10,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1041,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_sp_byte_passthrough",
+      "kind": "attn",
+      "phase": 10,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1015,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_stack0_byte_relay",
+      "kind": "attn",
+      "phase": 10,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1452,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_byte_passthrough_bake",
+      "kind": "block",
+      "phase": 10.1,
+      "layer_idx": 10,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1131,
+      "classification": "imperative_heavy",
+      "cells_written": 150,
+      "cell_breakdown": {
+        "attn.W_q": 57,
+        "attn.W_k": 28,
+        "attn.W_v": 32,
+        "attn.W_o": 32,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_alu",
+      "kind": "block",
+      "phase": 10.2,
+      "layer_idx": 10,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1376,
+      "classification": "imperative_heavy",
+      "cells_written": 11804,
+      "cell_breakdown": {
+        "ffn.W_up": 6244,
+        "ffn.b_up": 1846,
+        "ffn.W_gate": 1840,
+        "ffn.b_gate": 6,
+        "ffn.W_down": 1868
+      },
+      "helpers": [
+        "_set_layer10_alu"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_sp_byte_passthrough_bake",
+      "kind": "block",
+      "phase": 10.2,
+      "layer_idx": 10,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1176,
+      "classification": "imperative_heavy",
+      "cells_written": 111,
+      "cell_breakdown": {
+        "attn.W_q": 36,
+        "attn.W_k": 10,
+        "attn.W_v": 32,
+        "attn.W_o": 32,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_bp_byte_passthrough_bake",
+      "kind": "block",
+      "phase": 10.25,
+      "layer_idx": 10,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1218,
+      "classification": "imperative_heavy",
+      "cells_written": 211,
+      "cell_breakdown": {
+        "attn.W_q": 130,
+        "attn.W_k": 16,
+        "attn.W_v": 32,
+        "attn.W_o": 32,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_psh_stack0_passthrough_bake",
+      "kind": "block",
+      "phase": 10.3,
+      "layer_idx": 10,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1259,
+      "classification": "imperative_heavy",
+      "cells_written": 185,
+      "cell_breakdown": {
+        "attn.W_q": 17,
+        "attn.W_k": 8,
+        "attn.W_v": 96,
+        "attn.W_o": 64
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer10_stack0_byte_relay_bake",
+      "kind": "block",
+      "phase": 10.4,
+      "layer_idx": 10,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1315,
+      "classification": "imperative_heavy",
+      "cells_written": 348,
+      "cell_breakdown": {
+        "attn.W_q": 89,
+        "attn.W_k": 33,
+        "attn.W_v": 97,
+        "attn.W_o": 128,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "l10_post_ops_combined",
+      "kind": "ffn",
+      "phase": 10.5,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "declarative",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 1522,
+      "classification": "imperative_heavy",
+      "cells_written": 39284,
+      "cell_breakdown": {
+        "ffn.W_up": 39088,
+        "ffn.b_up": 26,
+        "ffn.W_gate": 60,
+        "ffn.b_gate": 6,
+        "ffn.W_down": 104
+      },
+      "helpers": [
+        "_suppress_ffn_on_step_boundary"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "null_terminator_detection",
+      "kind": "block",
+      "phase": 10.6,
+      "layer_idx": 10,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 503,
+      "classification": "imperative_trivial",
+      "cells_written": 9,
+      "cell_breakdown": {
+        "ffn.W_up": 3,
+        "ffn.b_up": 1,
+        "ffn.W_gate": 1,
+        "ffn.b_gate": 1,
+        "ffn.W_down": 3
+      },
+      "helpers": [
+        "_set_null_terminator_detection"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L10"
+    },
+    {
+      "name": "layer11_mul_partial",
+      "kind": "block",
+      "phase": 11,
+      "layer_idx": 11,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l11_ops.py",
+      "bake_line": 75,
+      "classification": "imperative_heavy",
+      "cells_written": 28672,
+      "cell_breakdown": {
+        "ffn.W_up": 16384,
+        "ffn.b_up": 4096,
+        "ffn.W_gate": 4096,
+        "ffn.W_down": 4096
+      },
+      "helpers": [
+        "_set_layer11_mul_partial"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L11"
+    },
+    {
+      "name": "layer12_mul_combine",
+      "kind": "block",
+      "phase": 12,
+      "layer_idx": 12,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l12_ops.py",
+      "bake_line": 62,
+      "classification": "imperative_heavy",
+      "cells_written": 28672,
+      "cell_breakdown": {
+        "ffn.W_up": 16384,
+        "ffn.b_up": 4096,
+        "ffn.W_gate": 4096,
+        "ffn.W_down": 4096
+      },
+      "helpers": [
+        "_set_layer12_mul_combine"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L12"
+    },
+    {
+      "name": "layer13_mem_addr_gather",
+      "kind": "block",
+      "phase": 13,
+      "layer_idx": 13,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l13_ops.py",
+      "bake_line": 139,
+      "classification": "imperative_heavy",
+      "cells_written": 259,
+      "cell_breakdown": {
+        "attn.W_q": 30,
+        "attn.W_k": 15,
+        "attn.W_v": 99,
+        "attn.W_o": 99,
+        "attn.alibi_slopes": 16
+      },
+      "helpers": [
+        "_set_layer13_mem_addr_gather",
+        "setup_helpers"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L13"
+    },
+    {
+      "name": "layer13_shifts",
+      "kind": "block",
+      "phase": 13,
+      "layer_idx": 13,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l13_ops.py",
+      "bake_line": 234,
+      "classification": "imperative_heavy",
+      "cells_written": 36864,
+      "cell_breakdown": {
+        "ffn.W_up": 20480,
+        "ffn.b_up": 4096,
+        "ffn.W_gate": 4096,
+        "ffn.W_down": 8192
+      },
+      "helpers": [
+        "_set_layer13_shifts"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L13"
+    },
+    {
+      "name": "layer14_mem_generation",
+      "kind": "attn",
+      "phase": 14,
+      "layer_idx": 14,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 280,
+      "classification": "imperative_heavy",
+      "cells_written": 1035,
+      "cell_breakdown": {
+        "attn.W_q": 304,
+        "attn.W_k": 155,
+        "attn.W_v": 296,
+        "attn.W_o": 272,
+        "attn.alibi_slopes": 8
+      },
+      "helpers": [
+        "_set_layer14_mem_generation"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L14"
+    },
+    {
+      "name": "layer14_temp_clear",
+      "kind": "block",
+      "phase": 14.1,
+      "layer_idx": 14,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 794,
+      "classification": "imperative_medium",
+      "cells_written": 48,
+      "cell_breakdown": {
+        "ffn.W_up": 23,
+        "ffn.b_up": 2,
+        "ffn.W_gate": 4,
+        "ffn.W_down": 19
+      },
+      "helpers": [
+        "_set_layer14_temp_clear",
+        "setup_helpers",
+        "_set_layer14_add_byte1_high_zero_cleanup",
+        "_set_layer14_clear_addsub_temp_negative_residue"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L14"
+    },
+    {
+      "name": "layer14_clear_addr_key_pollution",
+      "kind": "block",
+      "phase": 14.2,
+      "layer_idx": 14,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 859,
+      "classification": "imperative_heavy",
+      "cells_written": 576,
+      "cell_breakdown": {
+        "ffn.W_up": 432,
+        "ffn.b_up": 48,
+        "ffn.W_gate": 48,
+        "ffn.W_down": 48
+      },
+      "helpers": [
+        "_set_layer14_clear_addr_key_pollution"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L14"
+    },
+    {
+      "name": "layer14_clear_output_corruption",
+      "kind": "block",
+      "phase": 14.3,
+      "layer_idx": 14,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 904,
+      "classification": "imperative_heavy",
+      "cells_written": 186,
+      "cell_breakdown": {
+        "ffn.W_up": 135,
+        "ffn.b_up": 17,
+        "ffn.W_gate": 17,
+        "ffn.W_down": 17
+      },
+      "helpers": [
+        "_set_layer14_clear_output_corruption"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L14"
+    },
+    {
+      "name": "layer14_clear_mem_marker_output",
+      "kind": "block",
+      "phase": 14.4,
+      "layer_idx": 14,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 969,
+      "classification": "imperative_heavy",
+      "cells_written": 1280,
+      "cell_breakdown": {
+        "ffn.W_up": 1088,
+        "ffn.b_up": 64,
+        "ffn.W_gate": 64,
+        "ffn.W_down": 64
+      },
+      "helpers": [
+        "_set_layer14_clear_mem_marker_output"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L14"
+    },
+    {
+      "name": "layer14_addr_key_neural_decode",
+      "kind": "block",
+      "phase": 14.5,
+      "layer_idx": 14,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 1448,
+      "classification": "imperative_heavy",
+      "cells_written": 12894,
+      "cell_breakdown": {
+        "ffn.W_up": 5728,
+        "ffn.b_up": 1728,
+        "ffn.W_gate": 320,
+        "ffn.b_gate": 1728,
+        "ffn.W_down": 3390
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L14"
+    },
+    {
+      "name": "layer14_jsr_ax_bytes_zero",
+      "kind": "block",
+      "phase": 14.6,
+      "layer_idx": 14,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 1040,
+      "classification": "imperative_heavy",
+      "cells_written": 102,
+      "cell_breakdown": {
+        "ffn.W_up": 60,
+        "ffn.b_up": 4,
+        "ffn.W_gate": 4,
+        "ffn.W_down": 34
+      },
+      "helpers": [
+        "_set_layer14_jsr_ax_bytes_zero"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L14"
+    },
+    {
+      "name": "layer14_lc_ax_bytes_zero",
+      "kind": "block",
+      "phase": 14.7,
+      "layer_idx": 14,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 1201,
+      "classification": "imperative_medium",
+      "cells_written": 90,
+      "cell_breakdown": {
+        "ffn.W_up": 48,
+        "ffn.b_up": 4,
+        "ffn.W_gate": 4,
+        "ffn.W_down": 34
+      },
+      "helpers": [
+        "_set_layer14_lc_ax_bytes_zero"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L14"
+    },
+    {
+      "name": "layer14_alu_nocarry_ax_bytes_zero",
+      "kind": "block",
+      "phase": 14.8,
+      "layer_idx": 14,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 1111,
+      "classification": "imperative_medium",
+      "cells_written": 94,
+      "cell_breakdown": {
+        "ffn.W_up": 52,
+        "ffn.b_up": 4,
+        "ffn.W_gate": 4,
+        "ffn.W_down": 34
+      },
+      "helpers": [
+        "_set_layer14_alu_nocarry_ax_bytes_zero"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L14"
+    },
+    {
+      "name": "l15_attention_resize",
+      "kind": "block",
+      "phase": 14.9,
+      "layer_idx": 15,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "structural_model",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l15_ops.py",
+      "bake_line": 1268,
+      "classification": "imperative_heavy",
+      "cells_written": 1973,
+      "cell_breakdown": {
+        "attn.W_q": 1077,
+        "attn.W_k": 703,
+        "attn.W_v": 32,
+        "attn.W_o": 156,
+        "attn.alibi_slopes": 5
+      },
+      "helpers": [
+        "_suppress_l15_lookup_during_current_store_generation"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L15"
+    },
+    {
+      "name": "layer15_memory_lookup",
+      "kind": "attn",
+      "phase": 15,
+      "layer_idx": 15,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l15_ops.py",
+      "bake_line": 282,
+      "classification": "imperative_heavy",
+      "cells_written": 5115,
+      "cell_breakdown": {
+        "attn.W_q": 2488,
+        "attn.W_k": 2022,
+        "attn.W_v": 380,
+        "attn.W_o": 220,
+        "attn.alibi_slopes": 5
+      },
+      "helpers": [
+        "_set_layer15_memory_lookup",
+        "_suppress_l15_lookup_during_current_store_generation"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L15"
+    },
+    {
+      "name": "layer15_nibble_copy",
+      "kind": "block",
+      "phase": 15,
+      "layer_idx": 15,
+      "has_compiler_ir": true,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l15_ops.py",
+      "bake_line": 1201,
+      "classification": "declarative",
+      "cells_written": 444,
+      "cell_breakdown": {
+        "ffn.W_up": 314,
+        "ffn.b_up": 42,
+        "ffn.W_gate": 32,
+        "ffn.b_gate": 10,
+        "ffn.W_down": 46
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L15"
+    },
+    {
+      "name": "nibble_copy_ffn",
+      "kind": "ffn",
+      "phase": 15,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "topology_anchor",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l15_ops.py",
+      "bake_line": 260,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "?"
+    },
+    {
+      "name": "layer15_alu_high_byte_relay",
+      "kind": "block",
+      "phase": 15.05,
+      "layer_idx": 15,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l14_ops.py",
+      "bake_line": 433,
+      "classification": "declarative",
+      "cells_written": 123,
+      "cell_breakdown": {
+        "attn.W_q": 46,
+        "attn.W_k": 12,
+        "attn.W_v": 32,
+        "attn.W_o": 32,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L15"
+    },
+    {
+      "name": "conversational_io_output_routing",
+      "kind": "block",
+      "phase": 15.1,
+      "layer_idx": 15,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 1005,
+      "classification": "imperative_heavy",
+      "cells_written": 128,
+      "cell_breakdown": {
+        "ffn.W_up": 32,
+        "ffn.b_up": 32,
+        "ffn.W_gate": 32,
+        "ffn.W_down": 32
+      },
+      "helpers": [
+        "_set_conversational_io_output_routing"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "L15"
+    },
+    {
+      "name": "layer15_store_stack0_sp_byte0_addr",
+      "kind": "block",
+      "phase": 15.2,
+      "layer_idx": 15,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "declarative",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l15_ops.py",
+      "bake_line": 381,
+      "classification": "declarative",
+      "cells_written": 104,
+      "cell_breakdown": {
+        "attn.W_q": 4,
+        "attn.W_k": 2,
+        "attn.W_v": 33,
+        "attn.W_o": 64,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L15"
+    },
+    {
+      "name": "layer15_si_mem_addr0_from_stack0",
+      "kind": "block",
+      "phase": 15.25,
+      "layer_idx": 15,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "declarative",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l15_ops.py",
+      "bake_line": 514,
+      "classification": "declarative",
+      "cells_written": 111,
+      "cell_breakdown": {
+        "attn.W_q": 9,
+        "attn.W_k": 4,
+        "attn.W_v": 33,
+        "attn.W_o": 64,
+        "attn.alibi_slopes": 1
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L15"
+    },
+    {
+      "name": "layer16_lev_routing",
+      "kind": "ffn",
+      "phase": 16,
+      "layer_idx": 16,
+      "has_compiler_ir": true,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l16_ops.py",
+      "bake_line": 1611,
+      "classification": "declarative",
+      "cells_written": 22077,
+      "cell_breakdown": {
+        "ffn.W_up": 9952,
+        "ffn.b_up": 792,
+        "ffn.W_gate": 577,
+        "ffn.b_gate": 328,
+        "ffn.W_down": 10428
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L16"
+    },
+    {
+      "name": "tail_bit32_result_correction",
+      "kind": "block",
+      "phase": 17.1,
+      "layer_idx": 17,
+      "has_compiler_ir": true,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l10_ops.py",
+      "bake_line": 5358,
+      "classification": "declarative_no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [
+        "Primitives.lower_ffn_rules",
+        "_suppress_ffn_on_step_boundary"
+      ],
+      "enabled_flags": [],
+      "error": "AttributeError: 'StubBlock' object has no attribute 'post_ops'",
+      "layer_group": "L17"
+    },
+    {
+      "name": "binary_pop_sp_increment",
+      "kind": "model",
+      "phase": 998,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 3333,
+      "classification": "imperative_heavy",
+      "cells_written": 546,
+      "cell_breakdown": {
+        "block6.ffn.W_up": 408,
+        "block6.ffn.b_up": 34,
+        "block6.ffn.W_gate": 34,
+        "block6.ffn.W_down": 70
+      },
+      "helpers": [
+        "_lower_layer6_binary_pop_sp_increment_ir"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "function_call_weights",
+      "kind": "model",
+      "phase": 998,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 85,
+      "classification": "imperative_heavy",
+      "cells_written": 2910,
+      "cell_breakdown": {
+        "block5.attn.W_q": 8,
+        "block5.attn.W_k": 5,
+        "block5.attn.W_v": 64,
+        "block5.attn.W_o": 64,
+        "block6.attn.W_q": 3,
+        "block6.attn.W_k": 2,
+        "block6.attn.W_v": 32,
+        "block6.attn.W_o": 32,
+        "block6.ffn.W_up": 1696,
+        "block6.ffn.b_up": 308,
+        "block6.ffn.W_gate": 370,
+        "block6.ffn.b_gate": 2,
+        "block6.ffn.W_down": 324
+      },
+      "helpers": [
+        "_set_function_call_weights"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "io_putchar_routing",
+      "kind": "model",
+      "phase": 998,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 24,
+      "classification": "imperative_heavy",
+      "cells_written": 165,
+      "cell_breakdown": {
+        "block6.ffn.W_up": 66,
+        "block6.ffn.b_up": 33,
+        "block6.ffn.W_gate": 32,
+        "block6.ffn.b_gate": 1,
+        "block6.ffn.W_down": 33
+      },
+      "helpers": [
+        "_set_io_putchar_routing"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "?"
+    },
+    {
+      "name": "layer6_attn_bake",
+      "kind": "model",
+      "phase": 998.5,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 2924,
+      "classification": "imperative_heavy",
+      "cells_written": 312,
+      "cell_breakdown": {
+        "block6.attn.W_q": 30,
+        "block6.attn.W_k": 12,
+        "block6.attn.W_v": 135,
+        "block6.attn.W_o": 135
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "layer6_relay_heads_bake",
+      "kind": "model",
+      "phase": 998.6,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 3075,
+      "classification": "imperative_heavy",
+      "cells_written": 186,
+      "cell_breakdown": {
+        "block6.attn.W_q": 14,
+        "block6.attn.W_k": 3,
+        "block6.attn.W_v": 94,
+        "block6.attn.W_o": 75
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "layer6_bz_bnz_relay_bake",
+      "kind": "model",
+      "phase": 998.7,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/l6_ops.py",
+      "bake_line": 3230,
+      "classification": "imperative_medium",
+      "cells_written": 22,
+      "cell_breakdown": {
+        "block6.attn.W_q": 9,
+        "block6.attn.W_k": 5,
+        "block6.attn.W_v": 4,
+        "block6.attn.W_o": 4
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "tool_call_detection",
+      "kind": "model",
+      "phase": 998.8,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 338,
+      "classification": "imperative_trivial",
+      "cells_written": 6,
+      "cell_breakdown": {
+        "block6.ffn.W_up": 2,
+        "block6.ffn.b_up": 1,
+        "block6.ffn.b_gate": 1,
+        "block6.ffn.W_down": 2
+      },
+      "helpers": [
+        "_set_tool_call_detection"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "?"
+    },
+    {
+      "name": "tool_call_opcode_decode",
+      "kind": "model",
+      "phase": 998.8,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 49,
+      "classification": "imperative_medium",
+      "cells_written": 30,
+      "cell_breakdown": {
+        "block5.ffn.W_up": 12,
+        "block5.ffn.b_up": 6,
+        "block5.ffn.W_gate": 6,
+        "block5.ffn.W_down": 6
+      },
+      "helpers": [
+        "_set_tool_call_opcode_decode"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "?"
+    },
+    {
+      "name": "tool_call_relay_head",
+      "kind": "model",
+      "phase": 998.8,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 197,
+      "classification": "imperative_trivial",
+      "cells_written": 6,
+      "cell_breakdown": {
+        "block6.attn.W_q": 2,
+        "block6.attn.W_k": 1,
+        "block6.attn.W_v": 1,
+        "block6.attn.W_o": 1,
+        "block6.attn.alibi_slopes": 1
+      },
+      "helpers": [
+        "_set_tool_call_relay_head"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "?"
+    },
+    {
+      "name": "layer6_getchar_routing",
+      "kind": "model",
+      "phase": 998.9,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": null,
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/user_input_ops.py",
+      "bake_line": 114,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "convo_io_relay_heads",
+      "kind": "model",
+      "phase": 999.5,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py",
+      "bake_line": 253,
+      "classification": "declarative",
+      "cells_written": 13,
+      "cell_breakdown": {
+        "block6.attn.W_q": 5,
+        "block6.attn.W_k": 2,
+        "block6.attn.W_v": 2,
+        "block6.attn.W_o": 2,
+        "block6.attn.alibi_slopes": 2
+      },
+      "helpers": [
+        "Primitives.generate_attention_heads"
+      ],
+      "enabled_flags": [
+        "enable_conversational_io",
+        "enable_tool_calling",
+        "enable_neural_io_think_protocol"
+      ],
+      "error": null,
+      "layer_group": "?"
+    },
+    {
+      "name": "head_bake",
+      "kind": "model",
+      "phase": 1000,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "declarative",
+      "migrated": false,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 766,
+      "classification": "imperative_heavy",
+      "cells_written": 3615,
+      "cell_breakdown": {
+        "head.weight": 3339,
+        "head.bias": 276
+      },
+      "helpers": [
+        "setup_head_weights"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "model"
+    },
+    {
+      "name": "embedding_bake",
+      "kind": "model",
+      "phase": 1001,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "declarative",
+      "migrated": false,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 790,
+      "classification": "imperative_heavy",
+      "cells_written": 1823,
+      "cell_breakdown": {
+        "embed.weight": 1823
+      },
+      "helpers": [
+        "setup_token_embeddings"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "model"
+    },
+    {
+      "name": "initial_pc_bake",
+      "kind": "model",
+      "phase": 1001.5,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "declarative",
+      "migrated": false,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 838,
+      "classification": "imperative_trivial",
+      "cells_written": 2,
+      "cell_breakdown": {
+        "embed.weight": 2
+      },
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "model"
+    },
+    {
+      "name": "opcode_relay_head",
+      "kind": "model",
+      "phase": 1002,
+      "layer_idx": 6,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": true,
+      "declarative_authority": "spec_generated",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 235,
+      "classification": "declarative",
+      "cells_written": 52,
+      "cell_breakdown": {
+        "block6.attn.W_q": 8,
+        "block6.attn.W_k": 1,
+        "block6.attn.W_v": 30,
+        "block6.attn.W_o": 11,
+        "block6.attn.alibi_slopes": 2
+      },
+      "helpers": [
+        "Primitives.generate_attention_head"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "branch_override_patch",
+      "kind": "model",
+      "phase": 1100,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "structural_model",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 453,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "model"
+    },
+    {
+      "name": "l6_dead_unit_zero",
+      "kind": "model",
+      "phase": 1160,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "structural_model",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 557,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L6"
+    },
+    {
+      "name": "l7_dead_unit_zero",
+      "kind": "model",
+      "phase": 1170,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "structural_model",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 646,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "L7"
+    },
+    {
+      "name": "right_size_ffns",
+      "kind": "model",
+      "phase": 1200,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "structural_model",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 708,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [
+        "_right_size_ffns"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "model"
+    },
+    {
+      "name": "expand_wrapper_blocks",
+      "kind": "model",
+      "phase": 1300,
+      "layer_idx": null,
+      "has_compiler_ir": false,
+      "has_compiler_ir_factory": false,
+      "declarative_authority": "structural_model",
+      "migrated": true,
+      "bake_module": "/home/alexlitz/Documents/misc/c4_release/c4_release/neural_vm/unified_compiler/ops/model_ops.py",
+      "bake_line": 729,
+      "classification": "no_op",
+      "cells_written": 0,
+      "cell_breakdown": {},
+      "helpers": [
+        "_expand_wrapper_blocks"
+      ],
+      "enabled_flags": [],
+      "error": null,
+      "layer_group": "model"
+    }
+  ]
+}
