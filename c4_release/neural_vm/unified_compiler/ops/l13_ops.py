@@ -1,7 +1,56 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..layer_compiler import Operation
 from .shared import _as_setdim_proxy
+
+
+# === L13 FFN unit layout (pinned offsets) ============================
+#
+# The ``layer13_shifts`` op owns the entire L13 FFN. The actual weight
+# writes happen inside ``vm_step._set_layer13_shifts``, which uses a
+# local ``unit = 0`` counter that increments through two 2048-unit
+# sub-stages (SHL then SHR, each spanning 8 shift amounts x 16 a_hi
+# x 16 a_lo). Migration to :class:`FFNUnitAllocator` keeps that helper
+# byte-identical -- we just declare each sub-stage's range at its
+# existing pinned offset so the layout is auditable rather than
+# implicit. Adding a new L13 op family later will go through
+# ``allocator.alloc(name, n)`` without a pin, but note the SHL+SHR
+# chain currently fills the 4096-unit pool exactly (see the trailing
+# "fills L13 exactly" note in the helper docstring), so a future
+# extension must first shrink one of the lookup tables or widen the
+# pool.
+#
+# The offsets below mirror the unit-counter walk in
+# ``vm_step._set_layer13_shifts``. Changing the helper's unit count
+# requires updating this table in lock-step.
+_L13_SHIFTS_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer13_shifts.shl",    0, 2048),  # OP_SHL: 8 shifts x 16 a_hi x 16 a_lo
+    ("layer13_shifts.shr", 2048, 2048),  # OP_SHR: 8 shifts x 16 a_hi x 16 a_lo
+)
+
+
+def _allocate_layer13_shifts_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L13 shift sub-stages.
+
+    Every sub-stage is pinned at its existing offset so the underlying
+    ``vm_step._set_layer13_shifts`` helper -- which writes via its own
+    monotonic ``unit = 0`` counter -- lands on exactly the same
+    hidden-unit indices it always has. This call is byte-identical
+    bookkeeping: the allocator declares ranges by name, the helper
+    writes the weights. A future refactor can split the monolithic
+    helper into per-range bake functions that consume
+    ``allocator.alloc(...)`` directly.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L13 op claims a free range -- but see the layout-table note
+    above: the SHL+SHR chain currently saturates the 4096-unit pool).
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L13_SHIFTS_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def _l13_addr_bn_valid_extension(attn, BD, HD, S):
@@ -184,7 +233,18 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
     else:
         def bake(block, dim_positions, S):
             from ...vm_step import _set_layer13_shifts
-            _set_layer13_shifts(block.ffn, S, _as_setdim_proxy(dim_positions))
+            proxy = _as_setdim_proxy(dim_positions)
+
+            # Per-bake FFN-unit allocator. Each L13 shift sub-stage is
+            # pinned to its existing offset so the call below lands
+            # byte-identically. Stashed on the FFN module so downstream
+            # tools (e.g. a future L13 op family) can inspect or extend
+            # the layout. Mirrors the L1 / L9 convention from
+            # 4639146 / ca775eb.
+            allocator = _allocate_layer13_shifts_units()
+            block.ffn._l13_unit_allocator = allocator
+
+            _set_layer13_shifts(block.ffn, S, proxy)
 
     return Operation(
         name="layer13_shifts",
