@@ -220,6 +220,58 @@ class FFNComparisonReport:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class AttentionComparisonIssue:
+    """One classified symbolic-vs-lowered attention comparison failure."""
+
+    kind: str
+    message: str
+
+
+@dataclass
+class AttentionComparisonReport:
+    """Diagnostic result for ``compare_symbolic_to_lowered_attn``.
+
+    Mirror of :class:`FFNComparisonReport` for attention heads. ``issues`` is
+    a coarse classification:
+
+    * ``declaration_semantics`` — the head spec references slots/dims that
+      cannot be lowered into a ``PureAttention`` of the resolved shape.
+    * ``lowering`` — the lowered Q/K/V/O matrices do not match the values the
+      ``AttentionHeadIR`` would produce via ``Primitives.generate_attention_head``.
+    * ``weight_output_mismatch`` — the matrices match the lowering contract
+      but ``PureAttention.forward`` disagrees with the symbolic execution on
+      at least one ``(query_pos, output_dim)``.
+    """
+
+    ok: bool
+    issues: List[AttentionComparisonIssue] = field(default_factory=list)
+    symbolic_state: Optional["SymbolicResidualState"] = None
+    lowered_state: Optional["SymbolicResidualState"] = None
+    layer_idx: int = 0
+    head_dim: int = 0
+    num_heads: int = 0
+
+    @property
+    def failure_kinds(self) -> Tuple[str, ...]:
+        return tuple(dict.fromkeys(issue.kind for issue in self.issues))
+
+    @property
+    def primary_failure_kind(self) -> Optional[str]:
+        return self.issues[0].kind if self.issues else None
+
+    def format(self) -> str:
+        status = "OK" if self.ok else "DRIFT"
+        lines = [
+            f"=== CompilerIR attention comparison "
+            f"({status}, layer={self.layer_idx}, "
+            f"heads={self.num_heads}, HD={self.head_dim}) ==="
+        ]
+        for issue in self.issues:
+            lines.append(f"  [{issue.kind}] {issue.message}")
+        return "\n".join(lines)
+
+
 @dataclass
 class AttentionOp:
     """Declarative attention operation made of head-level specs.
@@ -1065,6 +1117,441 @@ def _coerce_compiler_ir(ir_or_rule, *, layer_idx: int) -> CompilerIR:
     )
 
 
+def compare_symbolic_to_lowered_attn(
+    ir_or_head,
+    head_dim: int,
+    *,
+    layer_idx: int = 0,
+    attn=None,
+    lower: bool = True,
+    num_heads: Optional[int] = None,
+    dim: Optional[int] = None,
+    state: Optional["SymbolicResidualState"] = None,
+    n_positions: int = 2,
+    causal: bool = True,
+    score_amplitude: float = 50.0,
+    atol: float = 1e-3,
+    rtol: float = 1e-3,
+) -> AttentionComparisonReport:
+    """Compare symbolic attention semantics with a lowered ``PureAttention`` forward.
+
+    ``ir_or_head`` may be a ``CompilerIR``, an :class:`AttentionHeadIR`, or a
+    raw ``DeclarativeAttentionHeadSpec`` (the latter two are wrapped into a
+    single-head ``CompilerIR`` at ``layer_idx``). When ``attn`` is omitted the
+    helper allocates a fresh ``PureAttention(dim, num_heads)`` and lowers the
+    selected heads into it. Pass an already-baked ``PureAttention`` together
+    with ``lower=False`` to validate an external module.
+
+    The comparison is the attention analogue of
+    :func:`compare_symbolic_to_lowered_ffn`:
+
+    1. Validate that the heads only reference slots in ``range(head_dim)`` and
+       Q/K/V/W_o positions that fit in ``num_heads * head_dim``. Mismatches
+       are reported as ``declaration_semantics``.
+    2. After lowering, check that each ``W_q[base+slot, dim]``,
+       ``W_k[..., dim]``, ``W_v[..., dim]`` and ``W_o[out_dim, base+slot]``
+       equals the IR-declared value. Mismatches are ``lowering`` failures.
+    3. Build a synthetic ``SymbolicResidualState`` (or accept one) that fires
+       every head with high amplitude (so softmax converges to hardmax), then
+       diff per ``(query_pos, output_dim)`` between
+       ``symbolic_attention_positions`` (hardmax) and ``PureAttention(x)``.
+       Mismatches are ``weight_output_mismatch`` failures.
+
+    The amplitude knob ``score_amplitude`` controls how strongly the synthetic
+    Q row dominates the softmax distribution. The defaults give roughly
+    ``softmax_winner / softmax_runner_up ~ exp(score_amplitude / sqrt(HD))``.
+    """
+
+    ir = _coerce_compiler_ir_attn(ir_or_head, layer_idx=layer_idx)
+    heads = ir.layer(layer_idx).attention.rules
+    report = AttentionComparisonReport(
+        ok=False, layer_idx=layer_idx, head_dim=head_dim
+    )
+
+    if not heads:
+        report.ok = True
+        return report
+
+    resolved_num_heads, resolved_dim = _resolve_attn_shape(
+        heads, head_dim, num_heads=num_heads, dim=dim, attn=attn,
+    )
+    report.num_heads = resolved_num_heads
+
+    declaration_issues = _validate_attn_declarations(
+        heads, head_dim=head_dim, num_heads=resolved_num_heads,
+        model_dim=resolved_dim,
+    )
+    if declaration_issues:
+        report.issues.extend(declaration_issues)
+        return report
+
+    if attn is None:
+        from c4_release.neural_vm.base_layers import PureAttention
+
+        attn = PureAttention(
+            dim=resolved_dim,
+            num_heads=resolved_num_heads,
+            causal=causal,
+        )
+
+    if lower:
+        ir.lower_attention(attn, head_dim, layer_idx=layer_idx)
+
+    lowering_issues = _validate_lowered_attn(
+        heads,
+        attn,
+        head_dim=head_dim,
+        atol=atol,
+        rtol=rtol,
+    )
+    if lowering_issues:
+        report.issues.extend(lowering_issues)
+        return report
+
+    if state is None:
+        state = _synthetic_attention_state(
+            heads,
+            head_dim=head_dim,
+            n_positions=n_positions,
+            score_amplitude=score_amplitude,
+        )
+
+    try:
+        # PureAttention.forward has no softmax1 sink; symbolic hardmax must
+        # therefore disable its sink (``sink_score=-inf``) so every query
+        # position picks a real key, matching what plain softmax does on a
+        # masked single-key row.
+        symbolic_state, _choices = ir.symbolic_attention_positions(
+            state,
+            head_dim,
+            layer_idx=layer_idx,
+            causal=causal,
+            mode="hardmax",
+            sink_score=-math.inf,
+        )
+    except Exception as exc:
+        report.issues.append(AttentionComparisonIssue(
+            "declaration_semantics",
+            f"symbolic execution failed: {exc!r}",
+        ))
+        return report
+
+    lowered_state, output_issues = _run_lowered_attn_comparison(
+        attn,
+        state,
+        symbolic_state,
+        heads,
+        head_dim=head_dim,
+        model_dim=resolved_dim,
+        causal=causal,
+        atol=atol,
+        rtol=rtol,
+    )
+    report.symbolic_state = symbolic_state
+    report.lowered_state = lowered_state
+    report.issues.extend(output_issues)
+    report.ok = not report.issues
+    return report
+
+
+def _coerce_compiler_ir_attn(ir_or_head, *, layer_idx: int) -> CompilerIR:
+    if isinstance(ir_or_head, CompilerIR):
+        return ir_or_head
+    if isinstance(ir_or_head, AttentionHeadIR):
+        ir = CompilerIR()
+        ir.layer(layer_idx).attention.append(ir_or_head)
+        return ir
+
+    from .primitives import DeclarativeAttentionHeadSpec
+
+    if isinstance(ir_or_head, DeclarativeAttentionHeadSpec):
+        ir = CompilerIR()
+        ir.layer(layer_idx).attention.append(ir_or_head)
+        return ir
+    raise TypeError(
+        "compare_symbolic_to_lowered_attn expects CompilerIR, "
+        "AttentionHeadIR, or DeclarativeAttentionHeadSpec"
+    )
+
+
+def _resolve_attn_shape(
+    heads: Sequence["AttentionHeadIR"],
+    head_dim: int,
+    *,
+    num_heads: Optional[int],
+    dim: Optional[int],
+    attn,
+) -> Tuple[int, int]:
+    if attn is not None:
+        attn_dim = int(attn.W_q.shape[0])
+        attn_heads = int(getattr(attn, "num_heads", attn_dim // head_dim))
+        return attn_heads, attn_dim
+
+    max_head_idx = -1
+    max_residual_dim = -1
+    for head in heads:
+        spec = head.spec
+        max_head_idx = max(max_head_idx, int(spec.head_idx))
+        for write in spec.q + spec.k + spec.v:
+            max_residual_dim = max(max_residual_dim, int(write.dim))
+        for write in spec.o:
+            max_residual_dim = max(max_residual_dim, int(write.out_dim))
+
+    inferred_heads = max(max_head_idx + 1, 1)
+    resolved_heads = num_heads if num_heads is not None else inferred_heads
+    inferred_dim = max(
+        resolved_heads * head_dim,
+        max_residual_dim + 1 if max_residual_dim >= 0 else 0,
+    )
+    resolved_dim = dim if dim is not None else inferred_dim
+    # PureAttention requires dim % num_heads == 0 with dim/num_heads == head_dim.
+    if resolved_dim < resolved_heads * head_dim:
+        resolved_dim = resolved_heads * head_dim
+    return resolved_heads, resolved_dim
+
+
+def _validate_attn_declarations(
+    heads: Sequence["AttentionHeadIR"],
+    *,
+    head_dim: int,
+    num_heads: int,
+    model_dim: int,
+) -> List[AttentionComparisonIssue]:
+    issues: List[AttentionComparisonIssue] = []
+    for h_idx, head in enumerate(heads):
+        spec = head.spec
+        label = head.name or f"head_{h_idx}"
+        if not (0 <= int(spec.head_idx) < num_heads):
+            issues.append(AttentionComparisonIssue(
+                "declaration_semantics",
+                f"{label}: head_idx {spec.head_idx} out of range "
+                f"[0, {num_heads})",
+            ))
+            continue
+        for role, writes in (
+            ("q", spec.q), ("k", spec.k), ("v", spec.v),
+        ):
+            for write in writes:
+                if not (0 <= int(write.slot) < head_dim):
+                    issues.append(AttentionComparisonIssue(
+                        "declaration_semantics",
+                        f"{label} {role} write slot {write.slot} "
+                        f"out of range [0, {head_dim})",
+                    ))
+                if not (0 <= int(write.dim) < model_dim):
+                    issues.append(AttentionComparisonIssue(
+                        "declaration_semantics",
+                        f"{label} {role} write dim {write.dim} "
+                        f"out of range [0, {model_dim})",
+                    ))
+        for write in spec.o:
+            if not (0 <= int(write.slot) < head_dim):
+                issues.append(AttentionComparisonIssue(
+                    "declaration_semantics",
+                    f"{label} o write slot {write.slot} "
+                    f"out of range [0, {head_dim})",
+                ))
+            if not (0 <= int(write.out_dim) < model_dim):
+                issues.append(AttentionComparisonIssue(
+                    "declaration_semantics",
+                    f"{label} o write out_dim {write.out_dim} "
+                    f"out of range [0, {model_dim})",
+                ))
+    return issues
+
+
+def _synthetic_attention_state(
+    heads: Sequence["AttentionHeadIR"],
+    *,
+    head_dim: int,
+    n_positions: int,
+    score_amplitude: float,
+) -> "SymbolicResidualState":
+    """Build a synthetic ``SymbolicResidualState`` that fires every head.
+
+    The state splits into two roles so symbolic hardmax and lowered softmax
+    pick the same key for every query:
+
+    * **Source** positions (everything except the last) hold ``1.0`` at every
+      K-dim and ``1 + 0.1 * pos_idx`` at every V-dim. The per-position V
+      scaling means each source position contributes a distinct value, so the
+      comparison cannot mask a key-routing bug.
+    * **Query** (final) position holds ``score_amplitude`` at every Q-dim and
+      ``0.0`` everywhere else. With K-dims silent at the query row, no later
+      row competes for the softmax mass and the lowered output collapses to
+      the chosen source.
+
+    When a dim plays multiple roles (e.g. ``q`` and ``k`` share a residual
+    cell), the source value wins on source rows and the amplitude wins on the
+    query row, matching the projection sums symbolic execution computes.
+    """
+
+    n_positions = max(2, int(n_positions))
+    q_dims = set()
+    k_dims = set()
+    v_dims = set()
+    for head in heads:
+        spec = head.spec
+        for write in spec.q:
+            q_dims.add(int(write.dim))
+        for write in spec.k:
+            k_dims.add(int(write.dim))
+        for write in spec.v:
+            v_dims.add(int(write.dim))
+
+    last = n_positions - 1
+    positions: List[Dict[int, float]] = [{} for _ in range(n_positions)]
+    for pos_idx in range(n_positions):
+        if pos_idx == last:
+            # Query row: only q-dims active.
+            for dim in q_dims:
+                positions[pos_idx][dim] = float(score_amplitude)
+        else:
+            v_scale = 1.0 + 0.1 * float(pos_idx)
+            for dim in k_dims:
+                positions[pos_idx][dim] = 1.0
+            for dim in v_dims:
+                # V wins ties with K when a dim plays both roles, so each
+                # source row still produces a unique V signal.
+                positions[pos_idx][dim] = float(v_scale)
+    return SymbolicResidualState(positions)
+
+
+def _validate_lowered_attn(
+    heads: Sequence["AttentionHeadIR"],
+    attn,
+    *,
+    head_dim: int,
+    atol: float,
+    rtol: float,
+) -> List[AttentionComparisonIssue]:
+    """Mirror ``_validate_lowered_ffn``: check Q/K/V/O weights match heads."""
+
+    issues: List[AttentionComparisonIssue] = []
+    for h_idx, head in enumerate(heads):
+        spec = head.spec
+        label = head.name or f"head_{h_idx}"
+        base = int(spec.head_idx) * head_dim
+        for role, writes, matrix_name in (
+            ("q", spec.q, "W_q"),
+            ("k", spec.k, "W_k"),
+            ("v", spec.v, "W_v"),
+        ):
+            matrix = getattr(attn, matrix_name).detach()
+            for write in writes:
+                observed = float(matrix[base + int(write.slot), int(write.dim)])
+                expected = float(write.weight)
+                if abs(observed - expected) > (atol + rtol * abs(expected)):
+                    issues.append(AttentionComparisonIssue(
+                        "lowering",
+                        f"{label} {matrix_name}[{base + int(write.slot)}, "
+                        f"{int(write.dim)}]: expected {expected:.8g}, "
+                        f"observed {observed:.8g}",
+                    ))
+        w_o = attn.W_o.detach()
+        for write in spec.o:
+            observed = float(w_o[int(write.out_dim), base + int(write.slot)])
+            expected = float(write.weight)
+            if abs(observed - expected) > (atol + rtol * abs(expected)):
+                issues.append(AttentionComparisonIssue(
+                    "lowering",
+                    f"{label} W_o[{int(write.out_dim)}, "
+                    f"{base + int(write.slot)}]: expected {expected:.8g}, "
+                    f"observed {observed:.8g}",
+                ))
+    return issues
+
+
+def _run_lowered_attn_comparison(
+    attn,
+    state: "SymbolicResidualState",
+    symbolic_state: "SymbolicResidualState",
+    heads: Sequence["AttentionHeadIR"],
+    *,
+    head_dim: int,
+    model_dim: int,
+    causal: bool,
+    atol: float,
+    rtol: float,
+) -> Tuple["SymbolicResidualState", List[AttentionComparisonIssue]]:
+    """Run ``PureAttention(x)`` and diff against symbolic per (pos, out_dim).
+
+    Mirror of :func:`_run_lowered_ffn_comparison`. The lowered state is
+    captured per-position via ``SymbolicResidualState`` so downstream tooling
+    can pretty-print it.
+    """
+
+    import torch
+
+    n_positions = len(state)
+    x = torch.zeros(
+        1, n_positions, model_dim,
+        dtype=attn.W_q.dtype, device=attn.W_q.device,
+    )
+    for pos_idx in range(n_positions):
+        for dim, value in state.positions[pos_idx].items():
+            if 0 <= dim < model_dim:
+                x[0, pos_idx, dim] = float(value)
+
+    # Many PureAttention subclasses install a causal mask via the ``mask``
+    # buffer (e.g. ``-inf`` above the diagonal). Our symbolic backend
+    # implements causality with a key range cap, so we install a parallel
+    # mask if the existing buffer is all zeros (the base PureAttention
+    # default).
+    mask = attn.mask
+    seq_mask = mask[:n_positions, :n_positions]
+    if causal and bool(torch.all(seq_mask == 0)):
+        causal_mask = torch.full(
+            (n_positions, n_positions), float("-inf"),
+            dtype=mask.dtype, device=mask.device,
+        )
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        # Patch the slice in-place so PureAttention.forward sees the mask.
+        with torch.no_grad():
+            attn.mask[:n_positions, :n_positions] = causal_mask
+        _restore_mask = True
+    else:
+        _restore_mask = False
+
+    try:
+        with torch.no_grad():
+            y = attn(x)
+    finally:
+        if _restore_mask:
+            with torch.no_grad():
+                attn.mask[:n_positions, :n_positions] = 0.0
+
+    # Collect every output_dim that any head writes to.
+    output_dims = set()
+    for head in heads:
+        for write in head.spec.o:
+            output_dims.add(int(write.out_dim))
+
+    lowered_positions: List[Dict[int, float]] = []
+    for pos_idx in range(n_positions):
+        lowered_positions.append({
+            int(d): float(y[0, pos_idx, d].item())
+            for d in sorted(output_dims | set(state.positions[pos_idx].keys()))
+        })
+    lowered_state = SymbolicResidualState(lowered_positions)
+
+    issues: List[AttentionComparisonIssue] = []
+    for pos_idx in range(n_positions):
+        for out_dim in sorted(output_dims):
+            observed = float(y[0, pos_idx, out_dim].item())
+            expected = float(symbolic_state.get(pos_idx, out_dim))
+            tol = atol + rtol * abs(expected)
+            if abs(observed - expected) <= tol:
+                continue
+            issues.append(AttentionComparisonIssue(
+                "weight_output_mismatch",
+                f"pos={pos_idx} out_dim={out_dim}: "
+                f"symbolic expected {expected:.8g}, "
+                f"lowered observed {observed:.8g}",
+            ))
+    return lowered_state, issues
+
+
 def _coerce_attention_head_ir(
     spec_or_head,
     *,
@@ -1437,6 +1924,8 @@ def _run_lowered_ffn_comparison(
 
 
 __all__ = [
+    "AttentionComparisonIssue",
+    "AttentionComparisonReport",
     "AttentionDebugReport",
     "AttentionHeadIR",
     "AttentionHeadReport",
@@ -1455,5 +1944,6 @@ __all__ = [
     "SymbolicDeclarativeRunner",
     "SymbolicResidualState",
     "WriteTerm",
+    "compare_symbolic_to_lowered_attn",
     "compare_symbolic_to_lowered_ffn",
 ]
