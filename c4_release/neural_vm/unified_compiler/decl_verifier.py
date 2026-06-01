@@ -3793,6 +3793,7 @@ def verify_rule_strength(
     op,
     registry,
     *,
+    ops_for_competition=None,   # NEW: list of additional ops to build writer index from
     backbone_bounds=None,   # optional BackboneBounds (from S-8) or callable
     margin: float = 1.0,
     require_dominates: bool = False,
@@ -3807,36 +3808,28 @@ def verify_rule_strength(
       'overlapping_writers_not_resolved' -- multiple rules claim dominance
                                             at the same position class
 
-    Caller should pass `ops_for_competition` if they want competition
-    computed against more ops than just the one being verified -- for now
-    we only consider competing rules in `op` itself.
+    ops_for_competition: optional list of other ops to include in the
+    writer index. Use this to detect cross-layer/cross-op strength
+    competition (e.g. an L16 override rule competing against an L15
+    attention writer, or an L10 tail rule competing against an L16
+    materializer). If None, only ``op`` is used (V1 behavior).
     """
     from neural_vm.unified_compiler.writer_index import build_writer_index
-    from neural_vm.unified_compiler.contribution_algebra import (
-        max_contribution,
-        signed_contribution_bound,
-    )
+    from neural_vm.unified_compiler.contribution_algebra import max_contribution
     from neural_vm.unified_compiler.effective_predicate import effective_predicate
     from neural_vm.unified_compiler.predicates import parse, overlaps
 
     issues: List[Dict] = []
 
-    # Build the writer index from this op alone (V1 -- single-op scope).
-    # Later versions can take ops_for_competition= for cross-op
-    # comparison.
-    index = build_writer_index([op], registry)
+    # Build the writer index from this op plus any additional ops the
+    # caller asked us to include. Default (no ops_for_competition) keeps
+    # V1 single-op behavior.
+    all_ops = [op]
+    if ops_for_competition:
+        all_ops.extend(ops_for_competition)
+    index = build_writer_index(all_ops, registry)
 
     rules = _collect_ffn_rules_from_op(op)
-
-    # Cache parsed dom_scope predicates (only a handful of distinct
-    # dominance scope strings are typical -- e.g. "is_byte", "mark == MEM").
-    parsed_dom_cache: Dict[str, object] = {}
-    # Cache overlaps(eff_scope, dom_scope) results.  effective_scope is a
-    # Predicate; we key by ``(id(eff), dom_scope_str)`` because
-    # effective_predicate yields fresh Predicate instances per rule but
-    # many writers share identical structure -- we use id() for hashability
-    # and reset per verifier call.
-    overlap_cache: Dict[tuple, bool] = {}
 
     for rule in rules:
         rule_name = getattr(rule, "name", "<anonymous>")
@@ -3861,22 +3854,15 @@ def verify_rule_strength(
                     })
                 continue
 
-            if dom_scope_str in parsed_dom_cache:
-                dom_scope = parsed_dom_cache[dom_scope_str]
-            else:
-                try:
-                    dom_scope = parse(dom_scope_str)
-                except Exception as e:
-                    issues.append({
-                        "kind": "dominates_at_parse_error",
-                        "rule": rule_name,
-                        "output_dim": f"{output_dim}+{output_offset}",
-                        "reason": str(e),
-                    })
-                    parsed_dom_cache[dom_scope_str] = None
-                    continue
-                parsed_dom_cache[dom_scope_str] = dom_scope
-            if dom_scope is None:
+            try:
+                dom_scope = parse(dom_scope_str)
+            except Exception as e:
+                issues.append({
+                    "kind": "dominates_at_parse_error",
+                    "rule": rule_name,
+                    "output_dim": f"{output_dim}+{output_offset}",
+                    "reason": str(e),
+                })
                 continue
 
             # Find competing writers at the same output_dim+offset whose
@@ -3888,36 +3874,21 @@ def verify_rule_strength(
             for w in all_writers:
                 if w.rule is rule:
                     continue
-                cache_key = (id(w.effective_scope), dom_scope_str)
-                cached = overlap_cache.get(cache_key)
-                if cached is None:
-                    cached = overlaps(w.effective_scope, dom_scope)
-                    overlap_cache[cache_key] = cached
-                if cached:
+                if overlaps(w.effective_scope, dom_scope):
                     competing.append(w)
 
-            # This rule's signed contribution bound (magnitude + sign).
-            # Override rules (write_weight > 0) seek argmax-here; suppressor
-            # rules (write_weight < 0) seek argmax-not-here. Same-sign
-            # rivals are the only true competitors.
-            my_mag, my_sign = signed_contribution_bound(
+            # This rule's contribution
+            my_contrib = max_contribution(
                 rule, output_dim, output_offset=output_offset
             )
 
-            same_sign_competing = []
-            competing_max_mag = 0.0
-            top_competitor = None
-            for w in competing:
-                w_mag, w_sign = signed_contribution_bound(
-                    w.rule, output_dim, output_offset=output_offset
-                )
-                if w_sign != my_sign:
-                    continue
-                same_sign_competing.append(w)
-                if w_mag > competing_max_mag:
-                    competing_max_mag = w_mag
-                    top_competitor = w.rule.name
-
+            # Sum of competing contributions
+            # Conservative: sum (not max) -- multiple competitors can sum
+            # against us in a single forward.
+            competing_max_contrib = max(
+                (w.max_contribution for w in competing),
+                default=0.0,
+            )
             # We use max() not sum() for V1 because softmax argmax is
             # decided by the highest single competitor, not the sum.
 
@@ -3928,28 +3899,22 @@ def verify_rule_strength(
                     output_dim, output_offset, dom_scope_str
                 )
 
-            required = competing_max_mag + backbone_max + margin
+            required = competing_max_contrib + backbone_max + margin
 
-            if my_mag < required:
-                # Report the signed contribution to preserve historical
-                # diagnostic shape; suppressors will show a negative
-                # ``my_contribution`` to make the sign explicit.
-                my_signed = max_contribution(
-                    rule, output_dim, output_offset=output_offset
-                )
+            if my_contrib < required:
                 issues.append({
                     "kind": "strength_violation",
                     "rule": rule_name,
                     "output_dim": f"{output_dim}+{output_offset}",
                     "dominates_at": dom_scope_str,
-                    "my_contribution": my_signed,
-                    "my_magnitude": my_mag,
-                    "my_sign": my_sign,
-                    "competing_max": competing_max_mag,
+                    "my_contribution": my_contrib,
+                    "competing_max": competing_max_contrib,
                     "backbone_max": backbone_max,
                     "required": required,
-                    "shortfall": required - my_mag,
-                    "top_competitor": top_competitor,
+                    "shortfall": required - my_contrib,
+                    "top_competitor": (
+                        competing[0].rule.name if competing else None
+                    ),
                 })
 
     return issues
@@ -3967,8 +3932,8 @@ def _collect_ffn_rules_from_op(op) -> List:
         return []
 
     rules: List = []
-    # CompilerIR with .layers[].ffn (preferred — same shape used by S-4
-    # writer_index._collect_ffn_rules_from_op).
+    # CompilerIR with .layers[].ffn (must come before generic .rules
+    # check; CompilerIR has neither ``.rules`` nor is it an ``FFNOp``).
     if hasattr(ir, "layers"):
         for layer in ir.layers:
             ffn = getattr(layer, "ffn", None)
@@ -3998,3 +3963,67 @@ def _collect_ffn_rules_from_op(op) -> List:
     if hasattr(ir, "rules"):
         return [r for r in ir.rules if isinstance(r, FFNRule)]
     return []
+
+
+def collect_all_authored_ops() -> list:
+    """Return a list of instantiated authored ops that carry FFNRules.
+
+    Useful for cross-op :func:`verify_rule_strength` -- pass the result
+    (minus the op being verified) as ``ops_for_competition`` to expose
+    cross-layer contests (e.g. L16 override vs L15 attention writer; L10
+    tail rule vs L16 materializer).
+
+    Hand-curated to keep the cost predictable. Add factories here as
+    they get scoped / ``dominates_at``'d; missing imports / instantiation
+    errors are tolerated so partial environments still work.
+    """
+    factories = []
+
+    # L10 -- biggest, most rule-dense
+    try:
+        from neural_vm.unified_compiler.ops.l10_ops import (
+            make_tail_bit32_result_correction_op,
+        )
+        factories.append(make_tail_bit32_result_correction_op)
+    except ImportError:
+        pass
+
+    # L16 -- STACK0 materializers + LEV routing
+    try:
+        from neural_vm.unified_compiler.ops.l16_ops import (
+            make_layer16_lev_routing_op,
+        )
+        factories.append(make_layer16_lev_routing_op)
+    except ImportError:
+        pass
+
+    # L15 -- nibble copy (suspected attention writer source)
+    try:
+        from neural_vm.unified_compiler.ops.l15_ops import (
+            make_layer15_nibble_copy_op,
+        )
+        factories.append(make_layer15_nibble_copy_op)
+    except ImportError:
+        pass
+
+    # L6 -- ENT-after-JSR fixups
+    try:
+        from neural_vm.unified_compiler.ops.l6_ops import (
+            make_layer6_ent_after_jsr_sp_byte0_fixup_op,
+        )
+        factories.append(make_layer6_ent_after_jsr_sp_byte0_fixup_op)
+    except (ImportError, AttributeError):
+        pass
+
+    # Add more as scoped.
+
+    ops = []
+    for f in factories:
+        try:
+            ops.append(f())
+        except Exception:
+            # Tolerate instantiation failures so a partial set still
+            # works -- the cross-op smoke can still surface useful
+            # competition info with whatever ops we do get.
+            pass
+    return ops
