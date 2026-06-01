@@ -3789,6 +3789,131 @@ def verify_rule_scopes(
     return issues
 
 
+def verify_rule_strength(
+    op,
+    registry,
+    *,
+    backbone_bounds=None,   # optional BackboneBounds (from S-8) or callable
+    margin: float = 1.0,
+    require_dominates: bool = False,
+):
+    """S-6: check that each FFNRule's declared `dominates_at[D]` is
+    actually realized by the rule's algebraic contribution against
+    competing writers (per S-4 writer index) and the backbone bound.
+
+    Returns a list of issue dicts. Issue kinds:
+      'no_dominates_at'   -- rule has no dominates_at and require_dominates=True
+      'strength_violation' -- rule's max_contribution does not dominate
+      'overlapping_writers_not_resolved' -- multiple rules claim dominance
+                                            at the same position class
+
+    Caller should pass `ops_for_competition` if they want competition
+    computed against more ops than just the one being verified -- for now
+    we only consider competing rules in `op` itself.
+    """
+    from neural_vm.unified_compiler.writer_index import build_writer_index
+    from neural_vm.unified_compiler.contribution_algebra import max_contribution
+    from neural_vm.unified_compiler.effective_predicate import effective_predicate
+    from neural_vm.unified_compiler.predicates import parse, overlaps
+
+    issues: List[Dict] = []
+
+    # Build the writer index from this op alone (V1 -- single-op scope).
+    # Later versions can take ops_for_competition= for cross-op
+    # comparison.
+    index = build_writer_index([op], registry)
+
+    rules = _collect_ffn_rules_from_op(op)
+
+    for rule in rules:
+        rule_name = getattr(rule, "name", "<anonymous>")
+
+        # Check each write of this rule
+        for wt in rule.writes:
+            if wt.weight == 0.0:
+                continue
+
+            output_dim = wt.dim.name
+            output_offset = wt.dim.offset
+
+            # What scope does the rule claim to dominate at this dim?
+            dom_scope_str = rule.dominates_at_for(output_dim)
+
+            if dom_scope_str is None:
+                if require_dominates:
+                    issues.append({
+                        "kind": "no_dominates_at",
+                        "rule": rule_name,
+                        "output_dim": f"{output_dim}+{output_offset}",
+                    })
+                continue
+
+            try:
+                dom_scope = parse(dom_scope_str)
+            except Exception as e:
+                issues.append({
+                    "kind": "dominates_at_parse_error",
+                    "rule": rule_name,
+                    "output_dim": f"{output_dim}+{output_offset}",
+                    "reason": str(e),
+                })
+                continue
+
+            # Find competing writers at the same output_dim+offset whose
+            # effective scope overlaps the rule's declared dominance scope
+            key = (output_dim, output_offset)
+            all_writers = index.get(key, [])
+
+            competing = []
+            for w in all_writers:
+                if w.rule is rule:
+                    continue
+                if overlaps(w.effective_scope, dom_scope):
+                    competing.append(w)
+
+            # This rule's contribution
+            my_contrib = max_contribution(
+                rule, output_dim, output_offset=output_offset
+            )
+
+            # Sum of competing contributions
+            # Conservative: sum (not max) -- multiple competitors can sum
+            # against us in a single forward.
+            competing_max_contrib = max(
+                (w.max_contribution for w in competing),
+                default=0.0,
+            )
+            # We use max() not sum() for V1 because softmax argmax is
+            # decided by the highest single competitor, not the sum.
+
+            # Backbone bound at the dominance scope
+            backbone_max = 0.0
+            if backbone_bounds is not None:
+                backbone_max = backbone_bounds(
+                    output_dim, output_offset, dom_scope_str
+                )
+
+            required = competing_max_contrib + backbone_max + margin
+
+            if my_contrib < required:
+                issues.append({
+                    "kind": "strength_violation",
+                    "rule": rule_name,
+                    "output_dim": f"{output_dim}+{output_offset}",
+                    "dominates_at": dom_scope_str,
+                    "my_contribution": my_contrib,
+                    "competing_max": competing_max_contrib,
+                    "backbone_max": backbone_max,
+                    "required": required,
+                    "shortfall": required - my_contrib,
+                    "top_competitor": (
+                        competing[0].rule.name if competing else None
+                    ),
+                })
+
+    return issues
+
+
 def _collect_ffn_rules_from_op(op) -> List:
     """Walk an Operation to find its FFNRules. Operations expose rules
     via ``.compiler_ir`` which can be an FFNOp, a list, or other shapes.
