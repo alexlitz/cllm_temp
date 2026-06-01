@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -186,6 +187,59 @@ def make_phase_a_ffn_op() -> Operation:
     )
 
 
+# === L0 attention-head layout (pinned indices) ======================
+#
+# ``layer0_threshold_attn`` owns the entire L0 attention block: 8
+# threshold heads (H0..H7) detecting whether the nearest marker is
+# within a per-head distance cutoff (3.5/4.5/7.5/8.5/9.5/14.5/19.5/24.5
+# tokens). Pre-migration the bake delegated to
+# ``Primitives.generate_threshold_attention_heads`` with ``heads=None``,
+# which defaulted to ``list(range(8))`` -- an implicit head-index
+# claim that made adding a new L0 head fragile (the author had to
+# remember which slots were already taken). With the allocator the
+# handoff is structural: the bake instantiates its OWN allocator
+# pre-loaded with the full L0 head layout (pinned to existing slots),
+# stashes it on ``attn._l0_head_allocator`` for downstream inspection,
+# and resolves each head's index by name. A future L0 attention op
+# can claim a free head via ``allocator.alloc(name, layer_idx=0)`` --
+# with no ``pin=`` -- without touching this table.
+#
+# Each entry's ``head_idx`` mirrors the implicit ``heads=range(8)``
+# walk in ``Primitives.threshold_attention_head_specs``; changing the
+# head/threshold pairing requires updating this table in lock-step.
+_L0_HEAD_LAYOUT = (
+    # (op-name key,                      pinned head_idx)
+    ("layer0_threshold_attn.h0",         0),  # threshold 3.5  -> H0
+    ("layer0_threshold_attn.h1",         1),  # threshold 4.5  -> H1
+    ("layer0_threshold_attn.h2",         2),  # threshold 7.5  -> H2
+    ("layer0_threshold_attn.h3",         3),  # threshold 8.5  -> H3
+    ("layer0_threshold_attn.h4",         4),  # threshold 9.5  -> H4
+    ("layer0_threshold_attn.h5",         5),  # threshold 14.5 -> H5
+    ("layer0_threshold_attn.h6",         6),  # threshold 19.5 -> H6
+    ("layer0_threshold_attn.h7",         7),  # threshold 24.5 -> H7
+)
+
+
+def _allocate_layer0_threshold_attn_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with all L0 heads.
+
+    Every entry in :data:`_L0_HEAD_LAYOUT` is pinned at its existing
+    ``head_idx`` so the underlying
+    ``Primitives.generate_threshold_attention_heads`` call -- which
+    writes ``W_q``/``W_k``/``W_v``/``W_o`` at ``head_idx * HD + slot``
+    -- lands byte-identically. Replacing the implicit ``heads=None``
+    default with an explicit allocator-resolved list keeps every head
+    index auditable rather than buried in a ``range(8)`` fallback.
+    A future L0 attention op can claim a free head past index 7 (when
+    ``layer_max_heads`` widens beyond 8) via
+    ``allocator.alloc(name, layer_idx=0)`` without a pin.
+    """
+    allocator = AttentionHeadAllocator()
+    for name, head_idx in _L0_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=0, pin=head_idx)
+    return allocator
+
+
 def make_layer0_threshold_attn_op() -> Operation:
     """L0 attention: 8 threshold heads detecting marker distance.
 
@@ -202,6 +256,21 @@ def make_layer0_threshold_attn_op() -> Operation:
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(ALIBI_S)
         HD = attn.W_q.shape[0] // attn.num_heads
+        # Per-bake attention-head allocator with the full L0 head layout
+        # pinned. Resolving each threshold head by name reproduces the
+        # legacy implicit ``heads=range(8)`` walk without baking integer
+        # literals into the call site. Stashed on the attention module so
+        # downstream tools (e.g. a future L0 op claiming a free gap, or
+        # the verifier auditing head ownership) can inspect or extend
+        # the layout. Mirrors the ``_l1_head_allocator`` /
+        # ``_l2_head_allocator`` conventions used by sibling layers.
+        head_allocator = _allocate_layer0_threshold_attn_heads()
+        attn._l0_head_allocator = head_allocator
+        # Resolve the full 8-head ordered list from the allocator so the
+        # call site is structural rather than positional.
+        threshold_heads = [
+            head_allocator.heads()[i].head_idx for i in range(8)
+        ]
         # Pass proxy as BD= so pin_io_only=True resolves CONST/IS_MARK/MARKS
         # via dim_positions. In practice these are all IO-pinned so the legacy
         # fallback agrees, but routing through the proxy keeps the bake honest
@@ -213,6 +282,7 @@ def make_layer0_threshold_attn_op() -> Operation:
              proxy.H5, proxy.H6, proxy.H7],
             ALIBI_S,
             HD,
+            heads=threshold_heads,
             bd=proxy,
         )
         # H1's 4.5-token cutoff is semantically load-bearing: L1 marks
