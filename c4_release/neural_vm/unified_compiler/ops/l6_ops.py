@@ -3379,6 +3379,15 @@ def make_prtf_think_protocol_op(
         declarative_bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        # B12 backfill: this op is a Phase 2a no-op stub that piggybacks
+        # on the existing convo-IO bake chain. The L6-anchored side of
+        # the chain (state-machine / pc-sp latch) sits at the same L6
+        # FFN as ``layer6_routing_ffn`` (phase 6.5), and the docstring
+        # explicitly groups this op with ``make_convo_io_state_machine_op``
+        # at phase 6.6. Pin after the base L6 routing FFN via a B10
+        # op-name reference so the dynamic scheduler honours the dep
+        # edge despite empty reads/writes.
+        requires={"after": "layer6_routing_ffn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
@@ -3443,6 +3452,14 @@ def make_open_clos_tool_call_op(
         declarative_bake_fn=bake,
         layer_idx=6,
         migrated=True,
+        # B12 backfill: dep-graph anchor only (bake_fn is always a
+        # no-op). Phase 6.7 sits in the same L6 I/O block as
+        # ``convo_io_state_machine`` (6.6) and ``convo_io_pc_sp_latch``
+        # (6.7); the docstring positions it after the L6 routing-FFN
+        # bake. Pin after ``layer6_routing_ffn`` via a B10 op-name
+        # reference so the dynamic scheduler honours the dep edge
+        # despite empty reads/writes.
+        requires={"after": "layer6_routing_ffn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
     )
