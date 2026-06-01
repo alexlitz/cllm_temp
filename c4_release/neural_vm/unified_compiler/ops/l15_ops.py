@@ -108,6 +108,14 @@ def make_l15_nibble_copy_ir() -> CompilerIR:
         (f"H1+{bp_i}", -1.0),
         (f"H4+{bp_i}", -1.0),
         ("MEM_STORE", -1.0),
+        # Hard blockers on BP marker / BP byte stream so the wide L15
+        # nibble-copy writer cannot dump ~+758 into OUTPUT_LO+0 across BP
+        # byte rows during the local-frame post-store cadence; without
+        # these the L16 ``l16_bp_frame_byte1_ff`` BP_byte1=0xff override
+        # (50.0/S strength) is swamped and if_var_* (IDs 425-449) regress
+        # to BP_byte1=0xf0.
+        ("H1+3", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
     )
     for k in range(16):
         rules.append(FFNRule.gated_write(
@@ -194,7 +202,7 @@ def make_nibble_copy_ffn_op() -> Operation:
         reads={"IS_BYTE", "H1", "H4", "MEM_STORE",
                "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "MARK_STACK0", "HAS_SE", "CMP"},
+               "MARK_BP", "MARK_STACK0", "HAS_SE", "CMP"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="ffn",
         bake_fn=bake,
@@ -1100,7 +1108,7 @@ def make_layer15_nibble_copy_op() -> Operation:
         reads={"IS_BYTE", "H1", "H4", "MEM_STORE",
                "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "MARK_STACK0", "HAS_SE", "CMP"},
+               "MARK_BP", "MARK_STACK0", "HAS_SE", "CMP"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         bake_fn=bake,
