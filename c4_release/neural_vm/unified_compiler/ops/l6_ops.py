@@ -2342,8 +2342,15 @@ def make_layer6_relay_heads_op() -> Operation:
     return Operation(
         name="layer6_relay_heads",
         phase=6.1,
-        reads={"MARK_STACK0", "MARK_AX", "AX_CARRY_LO", "AX_CARRY_HI"},
-        writes={"ALU_LO", "ALU_HI"},
+        # Head 7 LEV AX_CARRY refresh (pairs with L16's 3650e01) additionally
+        # reads STACK0_BYTE0 / CLEAN_EMBED_LO / CLEAN_EMBED_HI / OP_LEV at the
+        # K side and writes AX_CARRY_LO / AX_CARRY_HI at the MARK_AX query
+        # position; declare those so the LayerCompiler dep graph routes the
+        # producer before downstream consumers.
+        reads={"MARK_STACK0", "MARK_AX", "AX_CARRY_LO", "AX_CARRY_HI",
+               "STACK0_BYTE0", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "OP_LEV", "CONST"},
+        writes={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         layer_idx=6,
         bake_fn=bake,
@@ -2546,6 +2553,69 @@ def _bake_layer6_relay_heads_spec(attn, BD, HD):
     for k in range(16):
         attn.W_v[base + 33 + k, BD.AX_CARRY_HI + k] = 1.0
         attn.W_o[BD.ALU_HI + k, base + 33 + k] = 1.0
+
+    # ---- LEV AX_CARRY refresh: post-LEV MARK_AX <- STACK0_byte0 CLEAN_EMBED ----
+    #
+    # Post-LEV (step 6 of a typical function-call sequence) the L8 ALU contract
+    # requires AX_CARRY_LO/HI at MARK_AX to hold the popped return value, which
+    # lives on the freed STACK0 saved-AX slot. No earlier layer populates it:
+    # L3 head 1 (legacy carry-forward) copies the *previous* AX byte 0 EMBED
+    # which during LEV is the callee's local AX, not the value just popped
+    # from STACK0. The 2026-06-01 stack/JSR/LEV triage attributes 91 rows of
+    # ``step6:AX_byte0`` corruption to this missing producer (see
+    # ``.agent-logs/stack_jsr_lev_triage_2026_06_01.md``).
+    #
+    # The companion L16 op ``layer16_lev_routing`` (commit 3650e01) added
+    # ``l16_lev_ax_carry_lo/hi_{k}`` FFN rules that gate on ``AX_CARRY_LO/HI+k``
+    # and write OUTPUT_LO/HI at MARK_AX during OP_LEV -- but those gates are
+    # silent unless something populates AX_CARRY_LO/HI first. This sub-pattern
+    # within head 7 provides that producer.
+    #
+    # Wiring (mirrors L7 head 0 ``_layer7_operand_gather_head_specs`` which
+    # already gathers STACK0_byte0 CLEAN_EMBED -> ALU at MARK_AX for binary
+    # ops): an attention sub-pattern within head 7 at unused slots that fires
+    # on (MARK_AX AND OP_LEV) at the Q side and matches the STACK0_BYTE0 flag
+    # (set by the L1 FFN, true at the byte-0 row of the saved-AX stack slot)
+    # at the K side, then routes the attended row's CLEAN_EMBED_LO/HI nibbles
+    # into AX_CARRY_LO/HI at the Q (MARK_AX) position.
+    #
+    # Slot layout (head 7, head_dim 64; existing claims use slot 0 and
+    # 33..48):
+    #   slot 1               : LEV main gate (Q[MARK_AX]+Q[OP_LEV]-Q[CONST];
+    #                          K[STACK0_BYTE0])
+    #   slot 2 + k (k=0..15) : V[CLEAN_EMBED_LO+k] -> O[AX_CARRY_LO+k]
+    #   slot 18              : V[CLEAN_EMBED_HI+0] -> O[AX_CARRY_HI+0]
+    #   slot 49 + k (k=0..14): V[CLEAN_EMBED_HI+(1+k)] -> O[AX_CARRY_HI+(1+k)]
+    #
+    # The Q at slot 1 uses a sign pattern designed so the slot contribution to
+    # the Q*K product is positive only at the MARK_AX query position with
+    # OP_LEV simultaneously set (Q[1] = +L only when both bits are on). Head 7's
+    # existing slot-0 attention (MARK_STACK0 -> MARK_AX) is undisturbed because
+    # slot 1's K only matches STACK0_BYTE0 (not MARK_AX), so slot 1's
+    # contribution to the existing routing is zero. At MARK_AX during LEV the
+    # combined score for j=STACK0_BYTE0 wins by a wide margin over self-match
+    # (slot 0 is deeply negative at the MARK_AX query) and over arbitrary
+    # other positions (slot 1 only fires at K=STACK0_BYTE0).
+    L_lev = L
+    # Slot 1 Q/K gate: positive contribution only at (MARK_AX + OP_LEV).
+    LEV_GATE = 1
+    attn.W_q[base + LEV_GATE, BD.MARK_AX] = L_lev
+    attn.W_q[base + LEV_GATE, BD.OP_LEV] = L_lev
+    attn.W_q[base + LEV_GATE, BD.CONST] = -L_lev
+    attn.W_k[base + LEV_GATE, BD.STACK0_BYTE0] = L_lev
+    # V/O lanes for AX_CARRY_LO band: slots 2..17.
+    for k in range(16):
+        attn.W_v[base + 2 + k, BD.CLEAN_EMBED_LO + k] = 1.0
+        attn.W_o[BD.AX_CARRY_LO + k, base + 2 + k] = 1.0
+    # V/O lanes for AX_CARRY_HI band: slot 18 for k=0, slots 49..63 for k=1..15
+    # (slots 33..48 are claimed by the existing AX_CARRY_HI -> ALU_HI relay
+    # above, so we route the HI band's k=0 to the lowest unused slot 18 and
+    # the rest to the high tail of the head).
+    attn.W_v[base + 18, BD.CLEAN_EMBED_HI + 0] = 1.0
+    attn.W_o[BD.AX_CARRY_HI + 0, base + 18] = 1.0
+    for k in range(1, 16):
+        attn.W_v[base + 48 + k, BD.CLEAN_EMBED_HI + k] = 1.0
+        attn.W_o[BD.AX_CARRY_HI + k, base + 48 + k] = 1.0
 
 
 def make_layer6_attn_bake_op() -> Operation:
@@ -2800,6 +2870,30 @@ def make_layer6_relay_heads_bake_op() -> Operation:
     }) | frozenset({
         (6, "attn_W_o", f"7_{33 + k}", f"ALU_HI+{k}")
         for k in range(16)
+    })
+    # Head 7 LEV AX_CARRY refresh: (MARK_AX + OP_LEV) -> STACK0_BYTE0 attention
+    # at slot 1; CLEAN_EMBED -> AX_CARRY band at slots 2..18 + 49..63. Pairs
+    # with the L16 ``l16_lev_ax_carry_lo/hi_{k}`` rules at commit 3650e01.
+    _claims = _claims | frozenset({
+        (6, "attn_W_q", "7_1", "MARK_AX+0"),
+        (6, "attn_W_q", "7_1", "OP_LEV+0"),
+        (6, "attn_W_q", "7_1", "CONST+0"),
+        (6, "attn_W_k", "7_1", "STACK0_BYTE0+0"),
+    }) | frozenset({
+        (6, "attn_W_v", f"7_{2 + k}", f"CLEAN_EMBED_LO+{k}")
+        for k in range(16)
+    }) | frozenset({
+        (6, "attn_W_o", f"7_{2 + k}", f"AX_CARRY_LO+{k}")
+        for k in range(16)
+    }) | frozenset({
+        (6, "attn_W_v", "7_18", "CLEAN_EMBED_HI+0"),
+        (6, "attn_W_o", "7_18", "AX_CARRY_HI+0"),
+    }) | frozenset({
+        (6, "attn_W_v", f"7_{48 + k}", f"CLEAN_EMBED_HI+{k}")
+        for k in range(1, 16)
+    }) | frozenset({
+        (6, "attn_W_o", f"7_{48 + k}", f"AX_CARRY_HI+{k}")
+        for k in range(1, 16)
     })
 
     return Operation(
