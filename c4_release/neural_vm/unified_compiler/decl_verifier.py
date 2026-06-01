@@ -3812,7 +3812,10 @@ def verify_rule_strength(
     we only consider competing rules in `op` itself.
     """
     from neural_vm.unified_compiler.writer_index import build_writer_index
-    from neural_vm.unified_compiler.contribution_algebra import max_contribution
+    from neural_vm.unified_compiler.contribution_algebra import (
+        max_contribution,
+        signed_contribution_bound,
+    )
     from neural_vm.unified_compiler.effective_predicate import effective_predicate
     from neural_vm.unified_compiler.predicates import parse, overlaps
 
@@ -3893,18 +3896,28 @@ def verify_rule_strength(
                 if cached:
                     competing.append(w)
 
-            # This rule's contribution
-            my_contrib = max_contribution(
+            # This rule's signed contribution bound (magnitude + sign).
+            # Override rules (write_weight > 0) seek argmax-here; suppressor
+            # rules (write_weight < 0) seek argmax-not-here. Same-sign
+            # rivals are the only true competitors.
+            my_mag, my_sign = signed_contribution_bound(
                 rule, output_dim, output_offset=output_offset
             )
 
-            # Sum of competing contributions
-            # Conservative: sum (not max) -- multiple competitors can sum
-            # against us in a single forward.
-            competing_max_contrib = max(
-                (w.max_contribution for w in competing),
-                default=0.0,
-            )
+            same_sign_competing = []
+            competing_max_mag = 0.0
+            top_competitor = None
+            for w in competing:
+                w_mag, w_sign = signed_contribution_bound(
+                    w.rule, output_dim, output_offset=output_offset
+                )
+                if w_sign != my_sign:
+                    continue
+                same_sign_competing.append(w)
+                if w_mag > competing_max_mag:
+                    competing_max_mag = w_mag
+                    top_competitor = w.rule.name
+
             # We use max() not sum() for V1 because softmax argmax is
             # decided by the highest single competitor, not the sum.
 
@@ -3915,22 +3928,28 @@ def verify_rule_strength(
                     output_dim, output_offset, dom_scope_str
                 )
 
-            required = competing_max_contrib + backbone_max + margin
+            required = competing_max_mag + backbone_max + margin
 
-            if my_contrib < required:
+            if my_mag < required:
+                # Report the signed contribution to preserve historical
+                # diagnostic shape; suppressors will show a negative
+                # ``my_contribution`` to make the sign explicit.
+                my_signed = max_contribution(
+                    rule, output_dim, output_offset=output_offset
+                )
                 issues.append({
                     "kind": "strength_violation",
                     "rule": rule_name,
                     "output_dim": f"{output_dim}+{output_offset}",
                     "dominates_at": dom_scope_str,
-                    "my_contribution": my_contrib,
-                    "competing_max": competing_max_contrib,
+                    "my_contribution": my_signed,
+                    "my_magnitude": my_mag,
+                    "my_sign": my_sign,
+                    "competing_max": competing_max_mag,
                     "backbone_max": backbone_max,
                     "required": required,
-                    "shortfall": required - my_contrib,
-                    "top_competitor": (
-                        competing[0].rule.name if competing else None
-                    ),
+                    "shortfall": required - my_mag,
+                    "top_competitor": top_competitor,
                 })
 
     return issues
