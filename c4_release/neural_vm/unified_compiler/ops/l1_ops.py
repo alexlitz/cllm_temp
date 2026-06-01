@@ -1,9 +1,56 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L1 FFN unit layout (pinned offsets) ============================
+#
+# The ``layer1_ffn`` op owns the entire L1 FFN. The weight writes happen
+# inside ``_bake_layer1_ffn`` below, which uses a local ``unit = 0``
+# counter that increments through 5 sub-stages (one unit per output
+# dim). Migration to :class:`FFNUnitAllocator` keeps the helper
+# byte-identical -- we just declare each sub-stage's range at its
+# existing pinned offset so the layout is auditable rather than
+# implicit. Adding a new L1 op family later will go through
+# ``allocator.alloc(name, n)`` without a pin, and the allocator will
+# pick the first free gap past unit 5.
+#
+# The offsets below mirror the unit-counter walk in ``_bake_layer1_ffn``
+# (STACK0_BYTE0 followed by the four BYTE_INDEX_i thresholds).
+# Changing the helper's unit count requires updating this table in
+# lock-step.
+_L1_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer1_ffn.stack0_byte0",   0, 1),  # STACK0_BYTE0 from L1H4 + IS_BYTE
+    ("layer1_ffn.byte_index_0",   1, 1),  # BYTE_INDEX_0 from L1H1 vs L1H0
+    ("layer1_ffn.byte_index_1",   2, 1),  # BYTE_INDEX_1 from L1H2 vs L1H1
+    ("layer1_ffn.byte_index_2",   3, 1),  # BYTE_INDEX_2 from H0   vs L1H2
+    ("layer1_ffn.byte_index_3",   4, 1),  # BYTE_INDEX_3 from H1   vs H0
+)
+
+
+def _allocate_layer1_ffn_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L1 FFN sub-stages.
+
+    Every sub-stage is pinned at its existing offset so the underlying
+    ``_bake_layer1_ffn`` helper -- which writes via its own monotonic
+    ``unit = 0`` counter -- lands on exactly the same hidden-unit
+    indices it always has. This call is byte-identical bookkeeping: the
+    allocator declares ranges by name, the helper writes the weights. A
+    future refactor can split the monolithic helper into per-range bake
+    functions that consume ``allocator.alloc(...)`` directly.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L1 op claims a free range past unit 5).
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L1_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def make_layer1_ffn_op() -> Operation:
@@ -16,6 +63,15 @@ def make_layer1_ffn_op() -> Operation:
     """
     def bake(ffn, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
+
+        # Per-bake FFN-unit allocator. Each L1 FFN sub-stage is pinned to
+        # its existing offset so the call below lands byte-identically.
+        # Stashed on the FFN module so downstream tools (e.g. a future
+        # L1 op family claiming a free gap) can inspect or extend the
+        # layout. Mirrors the L9 convention from ca775eb.
+        allocator = _allocate_layer1_ffn_units()
+        ffn._l1_unit_allocator = allocator
+
         _bake_layer1_ffn(ffn, S, proxy)
 
     # Dim-ownership claims: L1 FFN writes 5 units at fixed positions:
