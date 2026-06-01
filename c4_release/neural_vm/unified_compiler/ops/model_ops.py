@@ -26,6 +26,31 @@ def make_io_putchar_routing_op() -> Operation:
         proxy = _as_setdim_proxy(dim_positions)
         _set_io_putchar_routing(model.blocks[6].ffn, S, proxy)
 
+    # Dim-ownership claims. ``_set_io_putchar_routing`` (vm_step.py:8068+)
+    # programs 33 L6 FFN units starting at unit 1500:
+    #   - unit 1500: OP_PUTCHAR & MARK_AX detector -> IO_IS_PUTCHAR
+    #   - units 1501..1516: AX_CARRY_LO[k] -> OUTPUT_LO[k] (k=0..15)
+    #   - units 1517..1532: AX_CARRY_HI[k] -> OUTPUT_HI[k] (k=0..15)
+    # Every unit shares the (OP_PUTCHAR, MARK_AX) gate on W_up; units 1501+
+    # also write a W_gate column (AX_CARRY_*[k]) and a W_down row
+    # (OUTPUT_*[k] for the routing units; IO_IS_PUTCHAR for the detector).
+    # The verifier doesn't track b_up / b_gate bias cells, so those writes
+    # are intentionally absent from this claim set.
+    _claims = set()
+    # W_up: 33 units * 2 columns (OP_PUTCHAR, MARK_AX) = 66 cells
+    for unit in range(1500, 1533):
+        _claims.add((6, "ffn_W_up", str(unit), "OP_PUTCHAR+0"))
+        _claims.add((6, "ffn_W_up", str(unit), "MARK_AX+0"))
+    # W_down: detector unit 1500 -> IO_IS_PUTCHAR; routing units -> OUTPUT_*[k]
+    _claims.add((6, "ffn_W_down", "1500", "IO_IS_PUTCHAR+0"))
+    for k in range(16):
+        _claims.add((6, "ffn_W_down", str(1501 + k), f"OUTPUT_LO+{k}"))
+        _claims.add((6, "ffn_W_down", str(1517 + k), f"OUTPUT_HI+{k}"))
+    # W_gate: routing units read AX_CARRY_*[k]
+    for k in range(16):
+        _claims.add((6, "ffn_W_gate", str(1501 + k), f"AX_CARRY_LO+{k}"))
+        _claims.add((6, "ffn_W_gate", str(1517 + k), f"AX_CARRY_HI+{k}"))
+
     return Operation(
         name="io_putchar_routing",
         reads=set(),
@@ -36,6 +61,7 @@ def make_io_putchar_routing_op() -> Operation:
         declarative_authority="spec_generated",
         phase=998,
         migrated=True,
+        claims=_claims,
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
         semantic_label="putchar output routing",
