@@ -762,6 +762,21 @@ def make_layer14_temp_clear_op() -> Operation:
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
+    # Dim-ownership claims (W_down output cells; bias / W_up cells are not
+    # part of the claim grid). First op in the L14 cleanup chain so units
+    # start at 0.
+    #   unit 0: _set_layer14_temp_clear writes TEMP[0]
+    #   unit 1: _set_layer14_clear_addsub_temp_negative_residue writes TEMP[8]
+    #   unit 2: _set_layer14_clear_addsub_temp_negative_residue writes TEMP[9]
+    #   unit 3: _set_layer14_add_byte1_high_zero_cleanup writes OUTPUT_HI[0..15]
+    _claims = {
+        (14, "ffn_W_down", "0", "TEMP+0"),
+        (14, "ffn_W_down", "1", "TEMP+8"),
+        (14, "ffn_W_down", "2", "TEMP+9"),
+    }
+    for k in range(16):
+        _claims.add((14, "ffn_W_down", "3", f"OUTPUT_HI+{k}"))
+
     return Operation(
         name="layer14_temp_clear",
         phase=14.1,
@@ -775,6 +790,7 @@ def make_layer14_temp_clear_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
+        claims=_claims,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
