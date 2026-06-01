@@ -1,9 +1,90 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L3 FFN unit layout (pinned offsets) ============================
+#
+# The ``layer3_ffn`` op owns the L3 FFN's marker-default + PC-increment
+# bands. The actual weight writes happen inside
+# ``vm_step._set_layer3_ffn`` (units 0..133, monotonic ``unit = 0``
+# counter) followed by
+# ``_suppress_layer3_stack0_marker_carry_projection`` (in-place edits
+# of existing units, no new allocation) and
+# ``_add_layer3_pc_byte1_output_rules`` (2 units, claimed via the
+# ``_next_free_ffn_unit`` probe). Migration to
+# :class:`FFNUnitAllocator` keeps every helper byte-identical -- we just
+# declare each sub-stage's range at its existing pinned offset so the
+# layout is auditable rather than implicit. Adding a new L3 op family
+# later will go through ``allocator.alloc(name, n)`` without a pin, and
+# the allocator will pick the first free gap above unit 136.
+#
+# The offsets below mirror the unit-counter walk in
+# ``vm_step._set_layer3_ffn`` (PC default / SP default / BP default /
+# marker bytes-1..3 defaults / STACK0 carry / NEXT_STACK0 locality /
+# PC increment + carry) followed by
+# ``_add_layer3_pc_byte1_output_rules`` (2 PC byte1 = 1 writers).
+# Changing any helper's unit count requires updating this table in
+# lock-step.
+_L3_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer3_ffn.pc_first_step_default_lo",     0,   2),  # PC FIRST-STEP default LO (set + undo)
+    ("layer3_ffn.pc_first_step_default_hi",     2,   2),  # PC FIRST-STEP default HI (set + undo)
+    ("layer3_ffn.initial_pc_bake_cancel",       4,   2),  # no-op placeholders (cancel moved to L2)
+    ("layer3_ffn.sp_marker_default",            6,   2),  # SP byte0 at MARK_SP (LO, HI)
+    ("layer3_ffn.sp_byte_idx_0_2_default",      8,   4),  # SP byte 0/2 LO+HI = 0
+    ("layer3_ffn.sp_byte_1_first_step",        12,   2),  # SP byte 2 first-step (LO=1, HI=0)
+    ("layer3_ffn.bp_marker_default",           14,   2),  # BP byte0 at MARK_BP (LO, HI)
+    ("layer3_ffn.bp_byte_idx_0_2_default",     16,   4),  # BP byte 0/2 LO+HI = 0
+    ("layer3_ffn.bp_byte_1_first_step",        20,   2),  # BP byte 2 first-step (LO=1, HI=0)
+    ("layer3_ffn.pc_bytes_1_3_default",        22,   6),  # PC bytes 1-3 = 0 (3 byte_idx x LO/HI)
+    ("layer3_ffn.ax_bytes_1_3_default",        28,   6),  # AX bytes 1-3 = 0 (3 byte_idx x LO/HI)
+    ("layer3_ffn.mem_marker_default",          34,   2),  # MEM marker addr byte0 (LO, HI)
+    ("layer3_ffn.mem_bytes_1_3_default",       36,   6),  # MEM addr bytes 1-3 = 0
+    ("layer3_ffn.stack0_bytes_1_3_default",    42,   6),  # STACK0 bytes 1-3 = 0
+    ("layer3_ffn.stack0_first_step_default",   48,   2),  # STACK0 byte0 first-step (LO, HI)
+    ("layer3_ffn.stack0_carry_projection_lo",  50,  16),  # STACK0 marker carry EMBED_LO -> OUTPUT_LO
+    ("layer3_ffn.stack0_carry_projection_hi",  66,  16),  # STACK0 marker carry EMBED_HI -> OUTPUT_HI
+    ("layer3_ffn.next_stack0_locality",        82,   4),  # NEXT_STACK0 locality clears (marker + byte_idx_3 + 1/2)
+    ("layer3_ffn.pc_increment_lo",             86,  16),  # PC INCREMENT lo nibble (k+8)%16
+    ("layer3_ffn.pc_increment_hi",            102,  16),  # PC INCREMENT hi nibble copy
+    ("layer3_ffn.pc_carry_correction",        118,  16),  # PC carry: lo>=8 -> hi+=1
+    ("layer3_ffn.pc_byte1_output_rules",      134,   2),  # _add_layer3_pc_byte1_output_rules
+)
+
+
+def _allocate_layer3_ffn_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L3 FFN sub-stages.
+
+    Every sub-stage is pinned at its existing offset so the underlying
+    ``vm_step._set_layer3_ffn`` helper -- which writes via its own
+    monotonic ``unit = 0`` counter -- lands on exactly the same
+    hidden-unit indices it always has. The trailing
+    ``_add_layer3_pc_byte1_output_rules`` writer is also pinned at its
+    legacy offset (134), which is where
+    ``_next_free_ffn_unit(ffn)`` evaluates to immediately after the
+    main helper returns. This call is byte-identical bookkeeping: the
+    allocator declares ranges by name, the helpers write the weights. A
+    future refactor can split the monolithic helper into per-range bake
+    functions that consume ``allocator.alloc(...)`` directly.
+
+    Note that
+    ``_suppress_layer3_stack0_marker_carry_projection`` is intentionally
+    absent: it modifies existing units in place (a subset of the
+    ``stack0_carry_projection_*`` bands) rather than allocating new
+    ones, so it has no entry in the layout table.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L3 op claims a free range past unit 136).
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L3_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def make_layer3_ffn_op() -> Operation:
@@ -29,8 +110,40 @@ def make_layer3_ffn_op() -> Operation:
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer3_ffn
         proxy = _as_setdim_proxy(dim_positions)
+
+        # Per-bake FFN-unit allocator. Each L3 FFN sub-stage is pinned to
+        # its existing offset so the helper calls below land
+        # byte-identically. The ``pc_byte1_output_rules`` range gives the
+        # start-unit for the trailing ``_add_layer3_pc_byte1_output_rules``
+        # writer, replacing the implicit ``_next_free_ffn_unit`` probe.
+        allocator = _allocate_layer3_ffn_units()
+        pc_byte1_range = next(
+            r for r in allocator.ranges()
+            if r.op_name == "layer3_ffn.pc_byte1_output_rules"
+        )
+        pc_byte1_start = pc_byte1_range.start
+        # Make the allocator available for inspection / extension by
+        # downstream tools (e.g. a future L3 op family claiming a free
+        # gap). The block-level attribute mirrors the
+        # ``_l9_unit_allocator`` convention used by sibling layers, but
+        # carries the allocator object so the layout is structured, not
+        # just a monotonic int.
+        block.ffn._l3_unit_allocator = allocator
+
         _set_layer3_ffn(block.ffn, S, proxy)
         _suppress_layer3_stack0_marker_carry_projection(block.ffn, S, proxy)
+        # Byte-identity guard: ``_set_layer3_ffn`` does not return a
+        # cursor, but its monotonic walk ends at unit 134; the in-place
+        # suppressor does not allocate new units. So the next free unit
+        # (as the legacy ``_next_free_ffn_unit`` probe reports) MUST
+        # equal the allocator's ``pc_byte1_output_rules`` start. If the
+        # helpers drift from the table, this assertion fires before any
+        # further weight surgery happens.
+        next_free = _next_free_ffn_unit(block.ffn)
+        assert next_free == pc_byte1_start, (
+            f"L3 FFN unit cursor drift: next free unit is {next_free}, "
+            f"allocator expected {pc_byte1_start}"
+        )
         _add_layer3_pc_byte1_output_rules(block.ffn, S, proxy)
 
     # Dim-ownership claims (W_down output cells; partial-claims subset). The
