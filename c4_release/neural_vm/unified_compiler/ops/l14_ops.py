@@ -989,6 +989,20 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         _block_l14_jsr_ax_zero_on_stack0_bytes(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
+    # Dim-ownership claims (W_down output cells). Runs at phase 14.6 after
+    # ``layer14_addr_key_neural_decode`` (14.5) which closes the chain at
+    # unit 1862. The helper writes 4 units:
+    #   unit 1862: -3/S on OUTPUT_LO[0..15]
+    #   unit 1863: -3/S on OUTPUT_HI[0..15]
+    #   unit 1864: +5/S on OUTPUT_LO[0]
+    #   unit 1865: +5/S on OUTPUT_HI[0]
+    _claims = set()
+    for k in range(16):
+        _claims.add((14, "ffn_W_down", "1862", f"OUTPUT_LO+{k}"))
+        _claims.add((14, "ffn_W_down", "1863", f"OUTPUT_HI+{k}"))
+    _claims.add((14, "ffn_W_down", "1864", "OUTPUT_LO+0"))
+    _claims.add((14, "ffn_W_down", "1865", "OUTPUT_HI+0"))
+
     return Operation(
         name="layer14_jsr_ax_bytes_zero",
         phase=14.6,
@@ -1001,6 +1015,7 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
+        claims=_claims,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
