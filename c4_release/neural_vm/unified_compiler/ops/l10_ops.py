@@ -3,12 +3,136 @@
 from dataclasses import replace
 from typing import Mapping, Optional
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule
 from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 from .shared import _bake_post_op_into
+
+
+# === L10 FFN unit layouts (pinned offsets) ==========================
+#
+# L10 hosts three distinct FFNs in the compiled model:
+#
+#   1. ``model.blocks[10].ffn`` -- baked by ``make_layer10_alu_op`` via
+#      ``vm_step._set_layer10_alu``. 1846 units = comparison combine (18)
+#      + bitwise OR/XOR/AND lo+hi (3 * 512 = 1536) + MUL lo (256) +
+#      SHL/SHR zero shortcut (4) + AX passthrough (32).
+#
+#   2. A dependency-assigned FFN block carrying the *combined* L10 post-op
+#      logic (``l10_post_ops_combined``, ``kind="ffn"``). 1562 units =
+#      ``BinaryOpByteZeroingPostOp`` (8) + 3x ``CarryPropagationPostOp``
+#      (512 each, slice later zeroed) + ``ComparisonCombine`` (18). The
+#      carry slice keeps its unit range so OUTPUT-row offset accounting
+#      stays byte-identical even though the weights are wiped.
+#
+#   3. A late ``tail_bit32_result_correction`` block on layer 17 -- its
+#      own freshly-allocated ``PureFFN`` sized to ``len(rules)`` (2059).
+#      Single-owner layout, declared here so a future second tenant in
+#      that bank goes through ``allocator.alloc(...)``.
+#
+# The per-block ``make_l10_post_op_attach_op`` bake appends six (lookup)
+# or seven (efficient) *independent* ``PureFFN`` modules onto
+# ``block.post_ops`` -- each is a standalone bank, not a shared hidden
+# axis, so it deliberately does NOT appear in these tables. Migrating
+# those into an allocator would require flattening them into one FFN,
+# which is the next refactor stage, not this commit.
+#
+# Migration is byte-identical bookkeeping: each underlying helper still
+# writes via its own monotonic ``unit = 0`` / ``offset = 0`` cursor.
+# The allocator declares ranges by name, the helpers write the weights,
+# and an ``assert`` after each helper verifies the cursor lands exactly
+# where the layout table says it should. Changing any helper's unit
+# count requires updating the matching table in lock-step.
+
+# Main L10 FFN (model.blocks[10].ffn). Walk mirrors the order of writes
+# in ``vm_step._set_layer10_alu``.
+_L10_FFN_UNIT_LAYOUT_MAIN = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer10_alu.cmp_combine",       0,   18),  # 6 default + 12 override
+    ("layer10_alu.bitwise_or",       18,  512),  # 256 lo + 256 hi
+    ("layer10_alu.bitwise_xor",     530,  512),  # 256 lo + 256 hi
+    ("layer10_alu.bitwise_and",    1042,  512),  # 256 lo + 256 hi
+    ("layer10_alu.mul_lo",         1554,  256),  # (a*b)%16 lookup
+    ("layer10_alu.shl_shr_zero",   1810,    4),  # 2 per opcode (SHL, SHR)
+    ("layer10_alu.ax_passthrough", 1814,   32),  # 16 lo + 16 hi
+)
+_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL = 1846
+
+# Combined post-op FFN baked by ``make_l10_post_ops_combined`` (kind="ffn",
+# dependency-assigned). Each range maps 1:1 to a post-op class's
+# ``hidden_dim`` and lands at the offset the inline ``offset`` counter
+# walks to in the original bake.
+_L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED = (
+    ("l10_post_ops_combined.binary_op_byte_zeroing",     0,    8),  # PureFFN H=8
+    ("l10_post_ops_combined.carry_propagation_byte0",    8,  512),  # PureFFN H=512
+    ("l10_post_ops_combined.carry_propagation_byte1",  520,  512),  # PureFFN H=512
+    ("l10_post_ops_combined.carry_propagation_byte2", 1032,  512),  # PureFFN H=512
+    ("l10_post_ops_combined.comparison_combine",      1544,   18),  # PureFFN H=18
+)
+_L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL = 1562
+
+# Tail bit32 result correction (lives on L17 block.post_ops as its own
+# fresh PureFFN). Single tenant today; the layout makes the bank
+# explicit so a future tenant claims through the allocator.
+_L10_FFN_UNIT_LAYOUT_TAIL_BIT32 = (
+    ("tail_bit32_result_correction.rules", 0, 2059),
+)
+_L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL = 2059
+
+
+def _allocate_l10_main_ffn_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` for ``model.blocks[10].ffn``.
+
+    All sub-stages of ``_set_layer10_alu`` are pinned at their existing
+    offsets so the helper -- which writes via its own monotonic
+    ``unit = 0`` counter -- lands byte-identically. The allocator is
+    stashed on ``block.ffn._l10_unit_allocator`` so downstream tools and
+    a future L10 op family can claim a free gap past unit 1846.
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L10_FFN_UNIT_LAYOUT_MAIN:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
+
+
+def _allocate_l10_post_ops_combined_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` for the combined post-op FFN.
+
+    Mirrors the inline ``offset`` walk in ``make_l10_post_ops_combined``:
+    one ``BinaryOpByteZeroingPostOp``, three ``CarryPropagationPostOp``,
+    one ``ComparisonCombine`` -- each pinned at the offset its
+    predecessor's ``hidden_dim`` advances to. The carry slice is zeroed
+    by the existing post-bake step but still occupies its declared
+    range so the comparison-combine offset remains stable.
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
+
+
+def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` for ``tail_bit32_result_correction``.
+
+    The tail PureFFN's ``hidden_dim`` equals ``len(rules)`` so this
+    layout is parameterised: ``n_rules`` must match the
+    ``_L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL`` constant. A mismatch
+    means someone changed the tail rule set without updating the
+    layout table; fail loudly rather than silently miss a pinned range.
+    """
+    if n_rules != _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL:
+        raise ValueError(
+            f"tail_bit32_result_correction rule count drift: helper "
+            f"produced {n_rules} rules, allocator expects "
+            f"{_L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL}"
+        )
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L10_FFN_UNIT_LAYOUT_TAIL_BIT32:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def _bake_layer10_carry_relay_head(attn, BD, S, HD) -> None:
@@ -1251,7 +1375,25 @@ def make_layer10_alu_op() -> Operation:
     """
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer10_alu
-        _set_layer10_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
+
+        # Per-bake FFN-unit allocator. Every sub-stage of
+        # ``_set_layer10_alu`` is pinned at its existing offset so the
+        # underlying writes land byte-identically. The allocator object
+        # is stashed on ``block.ffn`` so downstream tools (a future L10
+        # op family, the per-op audit, etc.) can inspect or extend the
+        # layout without re-reading the helper source.
+        allocator = _allocate_l10_main_ffn_units()
+        block.ffn._l10_unit_allocator = allocator
+
+        n10 = _set_layer10_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
+        # Byte-identity guard: the helper's local cursor MUST end
+        # exactly at the total declared in the layout table. If the
+        # table drifts from the helper's writes, this assertion fires
+        # before any later op stages a write past the declared end.
+        assert n10 == _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL, (
+            f"L10 ALU unit cursor drift: helper returned {n10}, "
+            f"allocator expected {_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL}"
+        )
 
     return Operation(
         name="layer10_alu",
@@ -1384,24 +1526,59 @@ def make_l10_post_ops_combined() -> Operation:
             ComparisonCombine,
         )
         d_model = ffn.W_up.shape[1]
-        offset = 0
+
+        # Per-bake FFN-unit allocator. Every sub-range matches the
+        # ``hidden_dim`` of the post-op instance baked into it and is
+        # pinned at the offset the inline ``_bake_post_op_into`` walk
+        # would naturally land on. Stashed on the FFN itself (this op
+        # is ``kind="ffn"`` so ``ffn`` IS the block-equivalent target)
+        # so a future second tenant in this dependency-assigned bank
+        # can claim a free gap above unit 1562 through the allocator.
+        allocator = _allocate_l10_post_ops_combined_units()
+        ffn._l10_unit_allocator = allocator
+
+        # Pull the pinned starts back out of the allocator so the
+        # inline walk uses the table as its source of truth. Drift
+        # between the walk and the table fails fast in
+        # ``_bake_post_op_into`` (which raises if the resulting end
+        # exceeds the FFN's ``hidden_dim``).
+        by_name = {r.op_name: r for r in allocator.ranges()}
+
+        offset = by_name["l10_post_ops_combined.binary_op_byte_zeroing"].start
         # Thread dim_positions so each fresh post-op instance bakes against
         # the compact layout, matching the per-block post_op attach path.
         offset = _bake_post_op_into(
             ffn, BinaryOpByteZeroingPostOp(d_model, S, dim_positions=dim_positions), offset)
+        assert offset == by_name["l10_post_ops_combined.carry_propagation_byte0"].start, (
+            f"L10 post_ops_combined zeroing cursor drift: {offset}"
+        )
         carry_start = offset
         offset = _bake_post_op_into(
             ffn, CarryPropagationPostOp(d_model, S, byte_idx=0, cascade=False,
                                         dim_positions=dim_positions), offset)
+        assert offset == by_name["l10_post_ops_combined.carry_propagation_byte1"].start, (
+            f"L10 post_ops_combined carry0 cursor drift: {offset}"
+        )
         offset = _bake_post_op_into(
             ffn, CarryPropagationPostOp(d_model, S, byte_idx=1, cascade=True,
                                         dim_positions=dim_positions), offset)
+        assert offset == by_name["l10_post_ops_combined.carry_propagation_byte2"].start, (
+            f"L10 post_ops_combined carry1 cursor drift: {offset}"
+        )
         offset = _bake_post_op_into(
             ffn, CarryPropagationPostOp(d_model, S, byte_idx=2, cascade=True,
                                         dim_positions=dim_positions), offset)
+        assert offset == by_name["l10_post_ops_combined.comparison_combine"].start, (
+            f"L10 post_ops_combined carry2 cursor drift: {offset}"
+        )
         carry_end = offset
         offset = _bake_post_op_into(
             ffn, ComparisonCombine(d_model, S, dim_positions=dim_positions), offset)
+        assert offset == _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL, (
+            f"L10 post_ops_combined comparison cursor drift: helper "
+            f"ended at {offset}, allocator expected "
+            f"{_L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL}"
+        )
         # The attached L10 post-op pipeline is now the authoritative carry
         # implementation. This late dependency-assigned copy sees very large
         # downstream OUTPUT residuals, and the legacy carry units can turn
@@ -5182,7 +5359,16 @@ def make_tail_bit32_result_correction_op() -> Operation:
         from ...base_layers import PureFFN
 
         d_model = block.ffn.W_up.shape[1] if hasattr(block.ffn, "W_up") else 512
+        # Per-bake FFN-unit allocator. The tail FFN is a standalone bank
+        # whose ``hidden_dim`` equals ``len(rules)``; pinning the full
+        # range under a single op name makes the bank's tenancy
+        # explicit so a future second tenant goes through
+        # ``allocator.alloc(...)`` instead of silently aliasing rule
+        # rows. The factory also fails fast on rule-count drift between
+        # the layout table and the materialised rule set.
+        allocator = _allocate_l10_tail_bit32_units(len(rules))
         ffn = PureFFN(d_model, len(rules))
+        ffn._l10_unit_allocator = allocator
         dim_map = Primitives.dim_positions_from_bd(
             _as_setdim_proxy(dim_positions),
             Primitives.ffn_rule_dim_names(rules),
