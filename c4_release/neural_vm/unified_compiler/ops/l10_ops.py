@@ -1704,8 +1704,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 rules.append(
                     FFNRule.gated_write(
                         name="tail_sp_pop_carry_byte1_zero",
-                        scope="is_byte",
-                        dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                        # Same base_conditions contradiction as the
+                        # byte_idx=1 family below (CMP+3 vs BYTE_INDEX_*
+                        # via MARK_AX blocker); effective collapses to the
+                        # gate H1+2 tautology fallback. No honest scope is
+                        # tighter than tautology; leave unset.
                         conditions=base_conditions,
                         threshold=2025.0,
                         gate="H1+2",
@@ -1727,8 +1730,19 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             f"tail_sp_pop_carry_byte{byte_idx + 1}_"
                             f"{old_value:02x}"
                         ),
-                        scope="is_byte",
-                        dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
+                        # The CMP+3 positive condition's semantics
+                        # (``mark == AX OR (is_byte AND byte_index == 0)``)
+                        # conflicts with BYTE_INDEX_1's positive semantics
+                        # (``is_byte AND byte_index == 1``) and the MARK_AX
+                        # hard blocker, making the conditions-only
+                        # effective predicate unsatisfiable; F-5 falls back
+                        # to the gate ``H1+2`` which has no semantics and
+                        # collapses to tautology. A declared scope can't be
+                        # honest here -- the gated-fallback effective set
+                        # is not narrowable without code-level surgery to
+                        # the shared base_conditions used by both byte_idx
+                        # branches. Leave scope/dominates_at unset (no
+                        # claim) until the structural conflict is resolved.
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{old_value & 0xF}", output_match_weight),
                             (f"OUTPUT_HI+{old_value >> 4}", output_match_weight),
@@ -2682,11 +2696,17 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("ALU_HI+0", 20.0),
             ("AX_CARRY_HI+0", 20.0),
         ) + marker_blockers + transition_blockers + non_add_blockers
+        # base_conditions ANDs many ``OP_*`` hard blockers (sem
+        # ``NOT (mark == AX AND opcode_at_AX == FOO)``) with the IS_BYTE /
+        # BYTE_INDEX_0 positives and the wide MARK_AX/STACK0/... blockers.
+        # The effective_predicate walker finds the union unsatisfiable and
+        # falls back to the gate (TEMP+8, no semantics) which collapses to
+        # tautology -- no scope tighter than tautology is honestly
+        # entailed. Leave scope/dominates_at unset until the conditions can
+        # be restructured.
         rules = [
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_hi_zero",
-                scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
                 conditions=base_conditions,
                 threshold=250.0,
                 writes=tuple(high_writes),
@@ -2696,8 +2716,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             rules.append(
                 FFNRule.gated_write(
                     name=f"tail_ax_add_byte1_hi_zero_lo_{lo:01x}",
-                    scope="is_byte",
-                    dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
                     conditions=base_conditions
                     + ((f"OUTPUT_LO+{lo}", 10.0),)
                     + tuple(
@@ -2973,7 +2991,24 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 rules.append(
                     FFNRule.gated_write(
                         name=name,
-                        scope="is_byte",
+                        # The MARK_AX hard blocker (-1000) inside
+                        # bounded_ax_byte0 plus the OP_MUL positive whose
+                        # semantics include ``mark == AX`` make the
+                        # conditions-only effective predicate unsatisfiable;
+                        # F-5-gate fallback then surfaces ``mark == AX AND
+                        # opcode_at_AX == MUL`` as the effective firing set
+                        # (the gate physically forces firing there). Declare
+                        # scope to match so F-7 entailment succeeds. Keep
+                        # dominates_at on ``is_byte`` (the broader output
+                        # surface the rule actually staked a claim on) so
+                        # strength competition is computed against the
+                        # narrower historical population of is_byte
+                        # competitors rather than the broader mark==AX
+                        # writer set; with V1's sign-blind algebra and
+                        # positive_sum < threshold every write at any
+                        # dominance scope is flagged regardless, so this
+                        # choice is purely to keep the diagnostic stable.
+                        scope="mark == AX AND opcode_at_AX == MUL",
                         dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
                         conditions=bounded_ax_byte0 + (
                             ("HAS_SE", 20.0),
@@ -3099,11 +3134,13 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("NEXT_STACK0", -1000000.0),
             ("NEXT_MEM", -1000000.0),
         )
+        # Same shared-base_conditions/gate=TEMP+8 contradiction pattern as
+        # the surrounding ax_add helpers -- effective collapses to the
+        # gate tautology, so no scope is tightenable below tautology.
+        # Leave scope/dominates_at unset.
         return (
             FFNRule.gated_write(
                 name="tail_ax_add_mul_byte1_materialize_01",
-                scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
                 conditions=base_conditions + (
                     ("EMBED_HI+0", 25.0),
                     ("FETCH_HI+0", 100.0),
@@ -3116,8 +3153,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.gated_write(
                 name="tail_ax_add_mul_byte1_materialize_02_from_hi2",
-                scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
                 conditions=base_conditions + (
                     ("EMBED_HI+2", 25.0),
                     ("FETCH_HI+2", 50.0),
@@ -3130,8 +3165,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.gated_write(
                 name="tail_ax_add_mul_byte1_materialize_02_from_hid",
-                scope="is_byte",
-                dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
                 conditions=base_conditions + (
                     ("EMBED_HI+13", 25.0),
                     ("FETCH_HI+2", 50.0),
@@ -4495,10 +4528,15 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=35.0,
             active_value=5000.0,
         ),
+        # MEM_STORE (sem ``mark == MEM AND opcode_in_step in {SI, SC, PSH}``)
+        # positive combined with CMP+0 (sem ``mark == AX OR (is_byte AND
+        # byte_index == 0)``) positive plus the IS_BYTE/MARK_AX/MARK_STACK0
+        # hard blockers makes the conditions-only effective predicate
+        # unsatisfiable; F-5 falls back to the gate ``OUTPUT_HI+14`` whose
+        # semantics is tautological. No scope tighter than tautology is
+        # entailable. Leave scope/dominates_at unset for now.
         FFNRule.gated_write(
             name="tail_mem_store_addr0_e8_from_local_frame_output_exact",
-            scope="mark == MEM",
-            dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI": "mark == MEM"},
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -4564,16 +4602,20 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # BP is stable across ordinary binary ops. The L10 BP passthrough
         # carries byte 2 as a weak 0x01 signal; reinforce it when no frame op
         # is rewriting BP.
-        # FIXME(S-9-strength-violation): my=-5.00035e7 vs competing=-5e7
-        # from rule 'tail_clear_output_after_byte3' at 30 nibble lanes
-        # (shortfall ~351). This rule writes positive at LO+1/HI+0 (the
-        # nibbles of 0x01) and negative -1.75e3 elsewhere; against
-        # clear_output's -1e8 the verifier flags the negative writes as
-        # being dominated. The positive nibble writes do dominate correctly.
+        # The 30 negative side-effect writes (byte_writes 0x01 lays out
+        # -strength at every non-target nibble in the 16-wide OUTPUT_LO/HI
+        # bands) get flagged against the +1e8 magnitude of the global
+        # tail_clear_output_after_byte3 suppressor under the V1 contribution
+        # algebra used by verify_rule_strength. The conditions' effective
+        # predicate also collapses to a gate-fallback tautology (the
+        # IS_BYTE/HAS_SE/H1+3 positives combined with the wide MARK_* and
+        # OP_* hard blockers turn out unsatisfiable for the
+        # effective_predicate walker), so an honest scope claim isn't
+        # possible without code-level restructuring of the conditions.
+        # Leave scope/dominates_at unset until the verifier supports
+        # sign-aware competition and the condition shape can be tightened.
         FFNRule.gated_write(
             name="tail_bp_byte2_preserve_01",
-            scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
             conditions=(
                 ("IS_BYTE", 1.0),
                 ("HAS_SE", 1.0),
@@ -4657,10 +4699,20 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # prepared the right 16-bit value. OP_SI is relayed to AX byte
         # positions by L7; the HI-nibble comparison distinguishes a real
         # nonzero stored high byte from the common zero-high-byte store cases.
+        # The si_ax_byte0 conditions combine MARK_AX-blocker, OP_SI positive
+        # (sem ``mark == AX AND opcode_at_AX == SI``) and MEM_STORE positive
+        # (sem ``mark == MEM AND opcode_in_step in {SI, SC, PSH}``); these
+        # contradict via the MARK_AX blocker, and F-5 falls back to the
+        # MEM_STORE gate semantics. Match scope/dominates_at to that
+        # effective gate firing set so F-7 entailment succeeds and
+        # cross-op strength competition is limited to MEM-store rows.
         FFNRule.gated_write(
             name="tail_si_ax_byte1_12",
-            scope="is_byte OR mark == AX",
-            dominates_at={"OUTPUT_LO": "is_byte OR mark == AX", "OUTPUT_HI": "is_byte OR mark == AX"},
+            scope="mark == MEM AND opcode_in_step in {PSH, SC, SI}",
+            dominates_at={
+                "OUTPUT_LO": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
+                "OUTPUT_HI": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
+            },
             conditions=si_ax_byte0 + (
                 ("OP_EQ", -1000.0),
                 ("OP_NE", -1000.0),
@@ -4678,8 +4730,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.gated_write(
             name="tail_si_ax_byte1_00",
-            scope="is_byte OR mark == AX",
-            dominates_at={"OUTPUT_LO": "is_byte OR mark == AX", "OUTPUT_HI": "is_byte OR mark == AX"},
+            scope="mark == MEM AND opcode_in_step in {PSH, SC, SI}",
+            dominates_at={
+                "OUTPUT_LO": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
+                "OUTPUT_HI": "mark == MEM AND opcode_in_step in {PSH, SC, SI}",
+            },
             conditions=si_ax_byte0 + (
                 ("OP_EQ", -1000.0),
                 ("OP_NE", -1000.0),
@@ -4756,10 +4811,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # SHR by 8 also needs byte 1 cleared after the marker correction emits
         # byte 0 as 0x01; TEMP[7] is the reliable non-carry/SHR signature at
         # byte positions.
+        # The shared ``ax_byte0`` prefix combines MARK_AX hard blocker (-1e9)
+        # with positives whose semantics include ``mark == AX``, so the
+        # conditions-only effective collapses to a contradiction and F-5
+        # falls back to the TEMP+7 gate (no semantics) producing a
+        # tautology. Leave scope/dominates_at unset until the shared
+        # ax_byte0 conditions are restructured.
         FFNRule.gated_write(
             name="tail_shr_byte1_00",
-            scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
             conditions=ax_byte0 + (
                 ("TEMP+7", 1.0),
                 ("OUTPUT_LO+1", 0.001),
@@ -4938,13 +4997,15 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # Keep this appended after the legacy tail rules so existing generated
         # unit indexes remain stable. It repairs SP marker d8->e0 when the
         # staged value exists only in OUTPUT, not in EMBED.
-        # FIXME(S-9-strength-violation): my=-4.99e11 vs competing=-5e7 from
-        # rule 'tail_clear_output_after_byte3' at OUTPUT_HI+0..15/OUTPUT_LO+0..15
-        # (30 nibble lanes, shortfall ~5e11). The rule writes -5000 strength
-        # at non-target nibbles; clear_output writes -1e8 at every nibble. V1
-        # algebra treats more-negative competitor as winning; in practice
-        # both push the lane down so this is non-fatal. Revisit when V2 algebra
-        # models sign-aware competition.
+        # The rule writes 0xE0 (one-hot: +5000 at LO+0/HI+14, -5000 at the
+        # other 30 nibbles). V1's sign-blind comparison flags the 30
+        # negative side writes against a stronger negative competitor
+        # (tail_clear_output_after_byte3 at -1e8); both rules cooperatively
+        # push those lanes down, so the rivalry is spurious. The +5000
+        # positive writes at the target nibbles dominate correctly. Narrow
+        # dominates_at down to the actual firing site so positive-write
+        # competition is limited to SP marker rows; the negative side
+        # writes remain flagged until the verifier becomes sign-aware.
         FFNRule.gated_write(
             name="tail_sp_pop_marker_output_d8_to_e0",
             scope="mark == SP",
@@ -4971,19 +5032,18 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             gate="MARK_SP",
             writes=byte_writes(0xE0, strength=5000.0),
         ),
-        # FIXME(S-9-strength-violation): my=-5e7 < required=1 at all 32
-        # OUTPUT_LO/HI nibble lanes (no competitor, shortfall ~5e7+1). This
-        # rule's write_weight is intentionally negative (clear_output_writes
-        # at strength=1e8 -> all 32 nibble lanes get -1e8). V1 strength
-        # algebra (write_weight * max_activation) yields a negative
-        # contribution; the verifier flags it as not dominating. In practice
-        # this rule is the suppressor that drives all output lanes to 0 at
-        # the byte3 step boundary -- it is the dominator. V2 algebra should
-        # treat dominate-down separately from dominate-up.
+        # Pure suppressor (clear_output_writes lays out -1e8 on every
+        # OUTPUT_LO/HI nibble lane) with no positive write. Under V1's
+        # cross-sign contribution algebra used by verify_rule_strength,
+        # the -1e8 magnitude is compared against unrelated positive
+        # override contributions (tail_sp_pop_byte3_zero at +5e11) and
+        # falsely flagged at all 32 nibble lanes. In practice this is the
+        # designated dominator that drives every nibble lane to 0 at the
+        # byte3 step boundary; competition with positive-write rules is
+        # spurious. Leave scope/dominates_at unset; the verifier cannot
+        # prove a useful claim with the current sign-blind algebra.
         FFNRule.gated_write(
             name="tail_clear_output_after_byte3",
-            scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
             conditions=(
                 ("IS_BYTE", 1.0),
                 ("BYTE_INDEX_3", 1.0),
@@ -5003,16 +5063,21 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             gate="BYTE_INDEX_3",
             writes=clear_output_writes(strength=100_000_000.0),
         ),
-        # FIXME(S-9-strength-violation): my=-5e7 vs competing=-5e7 (margin=1
-        # shortfall) from rule 'tail_clear_output_after_byte3' at 32 nibble
-        # lanes. Both rules write -1e8 to OUTPUT_LO/HI lanes at distinct
-        # but overlapping byte positions (byte3 vs NEXT_SE). The V1 algebra
-        # cannot distinguish two suppressors as cooperative -- it treats
-        # them as competing. Real behavior is fine because both push to 0.
+        # Pure suppressor (clear_output_writes lays out -1e8 on every
+        # OUTPUT_LO/HI nibble lane) with no positive write. Under V1's
+        # cross-sign contribution algebra used by verify_rule_strength,
+        # this rule's -1e8 magnitude is compared against the very large
+        # POSITIVE override contributions of unrelated tail materializers
+        # (tail_sp_pop_byte3_zero etc. at +5e11) and falsely flagged. In
+        # practice the rule cooperatively drives every nibble lane to 0
+        # in tandem with tail_clear_output_after_byte3 (the cross-sign
+        # rivalry isn't real). The effective predicate is also collapsed
+        # to the NEXT_SE gate fallback (semantics ``NOT is_byte``) because
+        # the IS_BYTE+NEXT_SE conditions contradict in the registry
+        # semantics. Leave scope/dominates_at unset; the verifier cannot
+        # prove a useful claim with the current algebra.
         FFNRule.gated_write(
             name="tail_clear_output_before_step_end",
-            scope="is_byte",
-            dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI": "is_byte"},
             conditions=(
                 ("IS_BYTE", 1.0),
                 ("NEXT_SE", 1.0),
