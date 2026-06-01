@@ -321,6 +321,72 @@ def make_opcode_decode_ffn_op() -> Operation:
             _as_setdim_proxy(dim_positions),
         )
 
+    # Dim-ownership claims (W_down output cells). The bake programs four
+    # blocks of L5 FFN units (see ``_bake_opcode_decode_ffn``):
+    #   units 0..33:   main rules — one unit per opcode at MARK_AX,
+    #                  writing the matching OP_* dim. Unit 35 is the JSR
+    #                  detector writing TEMP+0.
+    #   units 34..51:  first-step PC-marker decode (18 rules).
+    #                  Unit 34: JMP, 35: JSR (TEMP+0), 36: IMM, 37: LEA,
+    #                  38: EXIT, 39: NOP, 40..44: ADD..MOD,
+    #                  45/46: OR/XOR, 47: AND, 48: EQ, 49: LT,
+    #                  50: SHL, 51: SHR.
+    #   unit 52:       reserved blank (preserves legacy unit numbering for
+    #                  the first-step JSR-flag slot above).
+    #   units 53..83:  TEMP[1..31] clear at MARK_PC — unit (52+k) writes
+    #                  TEMP+k.
+    #   units 84..88:  all-step PC-marker decode (BZ, BNZ, LEV, EXIT, JMP).
+    _claims = set()
+    # Main per-opcode units at MARK_AX, in the order from _opcode_decode_main_rules.
+    _main_outputs = [
+        "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
+        "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
+        "OP_SC", "OP_PSH", "OP_OR", "OP_XOR", "OP_AND",
+        "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+        "OP_SHL", "OP_SHR", "OP_ADD", "OP_SUB", "OP_MUL",
+        "OP_DIV", "OP_MOD", "OP_EXIT", "OP_NOP",
+        "OP_PUTCHAR", "OP_GETCHAR",
+    ]
+    for unit, op_dim in enumerate(_main_outputs):
+        _claims.add((5, "ffn_W_down", str(unit), f"{op_dim}+0"))
+    # First-step PC-marker decode (18 rules at units 34..51).
+    _first_step_outputs = [
+        ("34", "OP_JMP+0"),
+        ("35", "TEMP+0"),  # JSR's IS_JSR flag
+        ("36", "OP_IMM+0"),
+        ("37", "OP_LEA+0"),
+        ("38", "OP_EXIT+0"),
+        ("39", "OP_NOP+0"),
+        ("40", "OP_ADD+0"),
+        ("41", "OP_SUB+0"),
+        ("42", "OP_MUL+0"),
+        ("43", "OP_DIV+0"),
+        ("44", "OP_MOD+0"),
+        ("45", "OP_OR+0"),
+        ("46", "OP_XOR+0"),
+        ("47", "OP_AND+0"),
+        ("48", "OP_EQ+0"),
+        ("49", "OP_LT+0"),
+        ("50", "OP_SHL+0"),
+        ("51", "OP_SHR+0"),
+    ]
+    for unit, col in _first_step_outputs:
+        _claims.add((5, "ffn_W_down", unit, col))
+    # Unit 52 is the reserved blank for first-step JSR's TEMP[0] (see
+    # ``_bake_opcode_decode_ffn`` -- ``unit += 1`` before TEMP-clear).
+    # TEMP[1..31] clear units 53..83.
+    for k in range(1, 32):
+        _claims.add((5, "ffn_W_down", str(52 + k), f"TEMP+{k}"))
+    # All-step PC-marker decode (BZ, BNZ, LEV, EXIT, JMP at units 84..88).
+    for unit, col in (
+        ("84", "OP_BZ+0"),
+        ("85", "OP_BNZ+0"),
+        ("86", "OP_LEV+0"),
+        ("87", "OP_EXIT+0"),
+        ("88", "OP_JMP+0"),
+    ):
+        _claims.add((5, "ffn_W_down", unit, col))
+
     return Operation(
         name="opcode_decode_ffn",
         phase=5,
@@ -338,6 +404,7 @@ def make_opcode_decode_ffn_op() -> Operation:
         bake_fn=bake,
         declarative_bake_fn=bake,
         migrated=True,
+        claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
