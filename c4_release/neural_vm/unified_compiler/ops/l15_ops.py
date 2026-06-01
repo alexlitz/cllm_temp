@@ -3,10 +3,74 @@
 import torch.nn as nn
 from collections.abc import Mapping
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L15 FFN unit layout (pinned offsets) ===========================
+#
+# ``layer15_nibble_copy`` owns the entire L15 FFN. The actual weight
+# writes happen inside ``lower_l15_nibble_copy_ir`` (and the legacy
+# ``vm_step._set_nibble_copy_ffn`` path), which use a monotonic
+# ``unit = 0`` counter that walks 42 sub-stages: 16 LO nibble-copy units,
+# 16 HI nibble-copy units, 8 PSH stack-byte units, and 2 first-step LEA
+# units (see ``make_l15_nibble_copy_ir`` and ``make_l15_psh_stack_ir``).
+# Migration to :class:`FFNUnitAllocator` keeps the helper byte-identical
+# -- we just declare each sub-stage's range at its existing pinned offset
+# so the layout is auditable rather than implicit. Adding a new L15 op
+# family later will go through ``allocator.alloc(name, n)`` without a
+# pin, and the allocator will pick the first free gap past unit 42.
+#
+# The other L15-named ops in this module (``layer15_memory_lookup``,
+# ``layer15_alu_high_byte_relay`` -- which actually lives in
+# ``l14_ops.py``, ``layer15_store_stack0_sp_byte0_addr``,
+# ``layer15_si_mem_addr0_from_stack0``, ``l15_attention_resize``) are
+# attention-side bakes; they do not consume FFN hidden units and are not
+# represented in this table.
+#
+# The offsets below mirror the rule order in ``make_l15_nibble_copy_ir``
+# (nibble_copy_lo_{0..15} then nibble_copy_hi_{0..15}) followed by the
+# 8 rules from ``make_l15_psh_stack_ir`` and the final 2 LEA rules.
+# Changing the rule list requires updating this table in lock-step.
+_L15_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer15_nibble_copy.nibble_copy_lo",         0, 16),  # OUTPUT_LO copy
+    ("layer15_nibble_copy.nibble_copy_hi",        16, 16),  # OUTPUT_HI_THIS_STEP copy
+    ("layer15_nibble_copy.psh_sp_byte1_lo_ff",    32,  1),  # PSH SP byte1 lo=0xf
+    ("layer15_nibble_copy.psh_sp_byte1_hi_ff",    33,  1),  # PSH SP byte1 hi=0xf
+    ("layer15_nibble_copy.psh_sp_byte2_lo_00",    34,  1),  # PSH SP byte2 lo=0
+    ("layer15_nibble_copy.psh_sp_byte2_hi_00",    35,  1),  # PSH SP byte2 hi=0
+    ("layer15_nibble_copy.psh_sp_byte3_lo_00",    36,  1),  # PSH SP byte3 lo=0
+    ("layer15_nibble_copy.psh_sp_byte3_hi_00",    37,  1),  # PSH SP byte3 hi=0
+    ("layer15_nibble_copy.psh_bp_byte2_lo_01",    38,  1),  # PSH BP byte2 lo=1
+    ("layer15_nibble_copy.psh_bp_byte2_hi_00",    39,  1),  # PSH BP byte2 hi=0
+    ("layer15_nibble_copy.lea_first_step_lo_01",  40,  1),  # LEA AX byte2 lo=1
+    ("layer15_nibble_copy.lea_first_step_hi_00",  41,  1),  # LEA AX byte2 hi=0
+)
+
+
+def _allocate_layer15_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L15 FFN sub-stages.
+
+    Every sub-stage is pinned at its existing offset so the underlying
+    ``lower_l15_nibble_copy_ir`` call -- which writes via the IR
+    lowerer's monotonic ``unit = start_unit`` counter -- lands on
+    exactly the same hidden-unit indices it always has. This call is
+    byte-identical bookkeeping: the allocator declares ranges by name,
+    the lowerer writes the weights. A future refactor can split the
+    monolithic IR into per-range bake fragments that consume
+    ``allocator.alloc(...)`` directly.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L15 op claims a free range past unit 42).
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L15_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def make_l15_psh_stack_ir() -> CompilerIR:
@@ -1135,10 +1199,29 @@ def make_layer15_nibble_copy_op() -> Operation:
     removed at the original site).
     """
     def bake(block, dim_positions, S):
-        lower_l15_nibble_copy_ir(
+        # Per-bake FFN-unit allocator. Each L15 nibble-copy sub-stage is
+        # pinned to its existing offset so the IR lowerer below lands
+        # byte-identically. The allocator is stashed on the FFN so
+        # downstream tools (e.g. a future L15 op family claiming a free
+        # gap past unit 42) can inspect or extend the layout. Mirrors
+        # the ``_l9_unit_allocator`` convention introduced in commit
+        # ca775eb.
+        allocator = _allocate_layer15_units()
+        block.ffn._l15_unit_allocator = allocator
+
+        next_unit = lower_l15_nibble_copy_ir(
             block.ffn,
             _as_setdim_proxy(dim_positions),
             S=S,
+        )
+        # Byte-identity guard: the IR lowerer's local cursor MUST end
+        # exactly at the layout table's total width (42). If the rule
+        # list drifts from the table, this assertion fires before any
+        # downstream consumer notices the offset mismatch.
+        expected_end = _L15_FFN_UNIT_LAYOUT[-1][1] + _L15_FFN_UNIT_LAYOUT[-1][2]
+        assert next_unit == expected_end, (
+            f"L15 nibble-copy unit cursor drift: lowerer returned "
+            f"{next_unit}, allocator expected {expected_end}"
         )
 
     return Operation(
