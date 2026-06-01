@@ -1449,7 +1449,10 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         if not enable:
             return
         ffn = block.ffn
-        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        # Pinned to chain offset 134 (cleanup chain through 14.1..14.4
+        # consumes units 0..133). Byte-identical with the legacy
+        # ``_l14_unit_counter`` start.
+        start_unit = _l14_chain_alloc("layer14_addr_key_neural_decode")
         next_unit = _bake_addr_key_neural_decode(
             ffn, dim_positions, S, start_unit=start_unit
         )
