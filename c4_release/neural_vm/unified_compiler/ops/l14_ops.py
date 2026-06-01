@@ -1056,6 +1056,20 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
+    # Dim-ownership claims (W_down output cells). Runs at phase 14.8 — last
+    # op in the L14 cleanup chain. Predecessors leave the counter at 1870.
+    # The helper writes 4 units mirroring jsr/lc_ax_bytes_zero:
+    #   unit 1870: -3/S on OUTPUT_LO[0..15]
+    #   unit 1871: -3/S on OUTPUT_HI[0..15]
+    #   unit 1872: +5/S on OUTPUT_LO[0]
+    #   unit 1873: +5/S on OUTPUT_HI[0]
+    _claims = set()
+    for k in range(16):
+        _claims.add((14, "ffn_W_down", "1870", f"OUTPUT_LO+{k}"))
+        _claims.add((14, "ffn_W_down", "1871", f"OUTPUT_HI+{k}"))
+    _claims.add((14, "ffn_W_down", "1872", "OUTPUT_LO+0"))
+    _claims.add((14, "ffn_W_down", "1873", "OUTPUT_HI+0"))
+
     return Operation(
         name="layer14_alu_nocarry_ax_bytes_zero",
         phase=14.8,
@@ -1067,6 +1081,7 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
+        claims=_claims,
         # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1873
         # after this op runs). The chain is: temp_clear + temp residue clamp
         # + ADD byte-1 high cleanup (4 units) →
