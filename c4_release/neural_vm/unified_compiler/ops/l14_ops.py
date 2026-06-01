@@ -919,6 +919,26 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
 
+    # Dim-ownership claims (W_down output cells). Runs at phase 14.4 after
+    # phases 14.1..14.3 which consume units 0..69. The helper writes 64 units
+    # arranged as:
+    #   units 70..85:    OP_JSR + OUTPUT_LO[k] for k in 0..15
+    #   units 86..101:   OP_JSR + OUTPUT_HI[k] for k in 0..15
+    #   units 102..117:  OP_ENT + OUTPUT_LO[k] for k in 0..15
+    #   units 118..133:  OP_ENT + OUTPUT_HI[k] for k in 0..15
+    _claims = set()
+    base = 70
+    for op_block in range(2):  # 0 = OP_JSR, 1 = OP_ENT
+        for k in range(16):
+            _claims.add(
+                (14, "ffn_W_down", str(base + op_block * 32 + k),
+                 f"OUTPUT_LO+{k}")
+            )
+            _claims.add(
+                (14, "ffn_W_down", str(base + op_block * 32 + 16 + k),
+                 f"OUTPUT_HI+{k}")
+            )
+
     return Operation(
         name="layer14_clear_mem_marker_output",
         phase=14.4,
@@ -932,6 +952,7 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
+        claims=_claims,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#memory",
     )
