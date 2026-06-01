@@ -694,6 +694,7 @@ def make_convo_io_pc_sp_latch_op(
         bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir=make_convo_io_pc_sp_latch_ir(),
         migrated=True,
         ffn_units_used=1466 if (enable_conversational_io and enable) else None,
         # B12 backfill: docstring above names ``convo_io_state_machine``
@@ -743,6 +744,21 @@ def _lower_convo_io_pc_sp_latch_ir(ffn, S: float, BD) -> int:
         start_unit=1402,
         S=S,
     )
+
+
+def make_convo_io_pc_sp_latch_ir(S: float = 100.0) -> CompilerIR:
+    """Declarative CompilerIR for the L6 convo-IO PC/SP latch band.
+
+    Mirrors ``_lower_convo_io_pc_sp_latch_ir`` so the verifier, scope
+    checker, and dominance auditor can read the rule set directly. The
+    actual bake stays in ``make_convo_io_pc_sp_latch_op`` because the band
+    is pinned to L6 FFN units 1402..1465, which the generic
+    ``_dispatch_operation_ir`` (start_unit=0) cannot replicate.
+    """
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_convo_io_pc_sp_latch_rules(S))
+    return ir
 
 
 def make_convo_io_prtf_capture_op(
