@@ -469,6 +469,59 @@ def _layer10_psh_stack0_passthrough_head_spec(BD, S) -> DeclarativeAttentionHead
         v.append(AP(16 + k_idx, BD.CLEAN_EMBED_HI + k_idx, 1.0))
         o.append(AO(BD.OUTPUT_LO + k_idx, k_idx, 3.0))
         o.append(AO(BD.OUTPUT_HI + k_idx, 16 + k_idx, 3.0))
+    # ---- LEA-local AX byte 0 differential routing (bug #33) ----
+    #
+    # The existing slot 0..31 V/O routes CLEAN_EMBED_LO/HI from the attended
+    # AX byte 0 source row into STACK0 byte 0's OUTPUT_LO/HI at the PSH step.
+    # For most opcodes (IMM, ADD, SHR, ...) this is correct because the
+    # source's CLEAN_EMBED nibbles match its byte-0 value -- L8 wrote
+    # OUTPUT[k] = CLEAN_EMBED[k] for the byte value at the AX byte 0 row.
+    #
+    # For LEA-local (BP + signed offset, e.g. var_simple / var_update / if_var)
+    # the AX-byte-0 source row's nibbles diverge: CLEAN_EMBED holds the raw
+    # immediate operand (e.g. 0x18) while OUTPUT holds the L8-computed
+    # effective-address low byte (e.g. 0xE8). The PSH-passthrough head needs
+    # the OUTPUT-band value, not the immediate. The L10 post-op rule
+    # ``tail_lea_local_ax_marker_byte0_e8`` writes 0xE8 into OUTPUT_LO[8]/
+    # OUTPUT_HI[14] at the AX marker row but only after L10 post_ops execute,
+    # whereas head 3 fires earlier at phase 10.3 -- so head 3 reads the
+    # L8-produced OUTPUT directly. That L8 value is exactly the desired
+    # LEA-local byte. 2026-06-01 triage attributes 78 ``step4:STACK0_byte0``
+    # corruption rows (var_simple +25, var_update +25, if_var +25, ~3 loop)
+    # to this missing producer.
+    #
+    # Differential sub-pattern (slots 32..63, free per HD=64; main routing
+    # uses 0..31 in V/O and slot 33 in Q/K only):
+    #   slot 32 + k (k=0..15): V reads (OUTPUT_LO+k - CLEAN_EMBED_LO+k),
+    #                          O writes the diff into OUTPUT_LO+k at Q row.
+    #   slot 48 + k (k=0..15): V reads (OUTPUT_HI+k - CLEAN_EMBED_HI+k),
+    #                          O writes the diff into OUTPUT_HI+k at Q row.
+    #
+    # Semantic-neutrality on non-LEA paths: at AX byte 0 source rows for
+    # IMM / ADD / SHR / etc. the L8 FFN writes OUTPUT_LO/HI[k] = the same
+    # one-hot nibble pattern that CLEAN_EMBED_LO/HI[k] carries (the byte
+    # value matches the immediate input). The diff is ~0, so the added
+    # routing contributes nothing -- existing behavior is preserved
+    # (including var_three_* whose STACK0_byte0 came out correct under
+    # the CLEAN_EMBED-only routing).
+    #
+    # On LEA-local AX byte 0 rows the diff is (LEA_computed - immediate);
+    # adding it on top of the existing CLEAN_EMBED routing yields the
+    # LEA-computed byte at STACK0_byte0 -- the fix.
+    #
+    # Q/K attention scoring is unchanged: head 3 already attends from PSH
+    # STACK0 byte 0 to the most recent AX byte 0 row. For programs with a
+    # PSH following a LEA-local (var_*, if_var, loop_*), that AX byte 0 is
+    # the LEA's, and the differential V routes the (0xE8-0x18) nibble
+    # deltas into the STACK0_byte0 OUTPUT band.
+    for k_idx in range(16):
+        v.append(AP(32 + k_idx, BD.OUTPUT_LO + k_idx, 1.0))
+        v.append(AP(32 + k_idx, BD.CLEAN_EMBED_LO + k_idx, -1.0))
+        o.append(AO(BD.OUTPUT_LO + k_idx, 32 + k_idx, 3.0))
+    for k_idx in range(16):
+        v.append(AP(48 + k_idx, BD.OUTPUT_HI + k_idx, 1.0))
+        v.append(AP(48 + k_idx, BD.CLEAN_EMBED_HI + k_idx, -1.0))
+        o.append(AO(BD.OUTPUT_HI + k_idx, 48 + k_idx, 3.0))
     return DeclarativeAttentionHeadSpec(
         head_idx=3,
         q=tuple(q),
@@ -1086,19 +1139,34 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         _bake_layer10_psh_stack0_passthrough_head(attn, proxy, S, HD)
 
     # Dim-ownership claims: L10 attn head 3 PSH STACK0 passthrough.
-    #   W_v[3*HD + k, CLEAN_EMBED_LO + k]      for k=0..15
-    #   W_v[3*HD + 16 + k, CLEAN_EMBED_HI + k] for k=0..15
+    #   W_v[3*HD + k, CLEAN_EMBED_LO + k]       for k=0..15
+    #   W_v[3*HD + 16 + k, CLEAN_EMBED_HI + k]  for k=0..15
+    # LEA-local differential routing (bug #33):
+    #   W_v[3*HD + 32 + k, OUTPUT_LO + k]       for k=0..15
+    #   W_v[3*HD + 32 + k, CLEAN_EMBED_LO + k]  for k=0..15 (negative weight)
+    #   W_v[3*HD + 48 + k, OUTPUT_HI + k]       for k=0..15
+    #   W_v[3*HD + 48 + k, CLEAN_EMBED_HI + k]  for k=0..15 (negative weight)
     _claims = set()
     for k in range(16):
         _claims.add((10, "attn_W_v", f"3_{k}", f"CLEAN_EMBED_LO+{k}"))
         _claims.add((10, "attn_W_v", f"3_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
+        _claims.add((10, "attn_W_v", f"3_{32 + k}", f"OUTPUT_LO+{k}"))
+        _claims.add((10, "attn_W_v", f"3_{32 + k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((10, "attn_W_v", f"3_{48 + k}", f"OUTPUT_HI_THIS_STEP+{k}"))
+        _claims.add((10, "attn_W_v", f"3_{48 + k}", f"CLEAN_EMBED_HI+{k}"))
 
     return Operation(
         name="layer10_psh_stack0_passthrough_bake",
         phase=10.3,
         reads={"MARK_STACK0", "IS_BYTE", "PSH_AT_SP", "H1", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               # LEA-local differential routing (bug #33) reads the
+               # current-step OUTPUT bands at the attended AX byte 0 row.
+               # Use the B9 ``THIS_STEP`` reader-side name for OUTPUT_HI;
+               # OUTPUT_LO has no split alias yet (see L7
+               # ``layer7_operand_gather`` for the same convention).
+               "OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
