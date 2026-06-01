@@ -65,9 +65,9 @@ def test_layer16_lea_local_frame_byte1_rules_materialize_ff():
     lo_writes = {write.dim.key(): write.weight for write in lo.writes}
     hi_writes = {write.dim.key(): write.weight for write in hi.writes}
     assert lo_writes["OUTPUT_LO+15"] == 20.0 / 100.0
-    assert hi_writes["OUTPUT_HI+15"] == 20.0 / 100.0
+    assert hi_writes["OUTPUT_HI_THIS_STEP+15"] == 20.0 / 100.0
     assert lo_writes["OUTPUT_LO+0"] == -20.0 / 100.0
-    assert hi_writes["OUTPUT_HI+0"] == -20.0 / 100.0
+    assert hi_writes["OUTPUT_HI_THIS_STEP+0"] == -20.0 / 100.0
 
 
 def test_layer16_bp_marker_passthrough_reads_embed_and_blocks_frame_ops():
@@ -86,7 +86,7 @@ def test_layer16_bp_marker_passthrough_reads_embed_and_blocks_frame_ops():
     assert lo.gate.key() == "EMBED_LO+15"
     assert hi.gate.key() == "EMBED_HI+15"
     assert lo.writes[0].dim.key() == "OUTPUT_LO+15"
-    assert hi.writes[0].dim.key() == "OUTPUT_HI+15"
+    assert hi.writes[0].dim.key() == "OUTPUT_HI_THIS_STEP+15"
     assert lo.writes[0].weight == 10.0 / 100.0
     assert hi.writes[0].weight == 10.0 / 100.0
 
@@ -109,9 +109,9 @@ def test_layer16_bp_frame_byte1_ff_restores_post_ent_bp_stream():
 
     writes = {write.dim.key(): write.weight for write in rule.writes}
     assert writes["OUTPUT_LO+15"] == 50.0 / 100.0
-    assert writes["OUTPUT_HI+15"] == 50.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+15"] == 50.0 / 100.0
     assert writes["OUTPUT_LO+0"] == -50.0 / 100.0
-    assert writes["OUTPUT_HI+0"] == -50.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+0"] == -50.0 / 100.0
 
     ir = CompilerIR()
     ir.layer(0).ffn.rules.append(rule)
@@ -125,14 +125,14 @@ def test_layer16_bp_frame_byte1_ff_restores_post_ent_bp_stream():
         "CLEAN_EMBED_HI+15": 1.0,
         "OUTPUT_LO+0": 2.26,
         "OUTPUT_LO+15": 2.0,
-        "OUTPUT_HI+0": 3.47,
-        "OUTPUT_HI+15": 2.0,
+        "OUTPUT_HI_THIS_STEP+0": 3.47,
+        "OUTPUT_HI_THIS_STEP+15": 2.0,
     }
     out = ir.symbolic_ffn(bp_byte1_state)
     assert out["OUTPUT_LO+15"] > bp_byte1_state["OUTPUT_LO+15"]
-    assert out["OUTPUT_HI+15"] > bp_byte1_state["OUTPUT_HI+15"]
+    assert out["OUTPUT_HI_THIS_STEP+15"] > bp_byte1_state["OUTPUT_HI_THIS_STEP+15"]
     assert out["OUTPUT_LO+0"] < bp_byte1_state["OUTPUT_LO+0"]
-    assert out["OUTPUT_HI+0"] < bp_byte1_state["OUTPUT_HI+0"]
+    assert out["OUTPUT_HI_THIS_STEP+0"] < bp_byte1_state["OUTPUT_HI_THIS_STEP+0"]
 
     initial_bp_state = dict(
         bp_byte1_state,
@@ -214,8 +214,8 @@ def test_layer16_stack0_byte1_zero_blocks_retained_byte0_replay():
     writes = {write.dim.key(): write.weight for write in rule.writes}
     assert writes["OUTPUT_LO+0"] == 1000.0 / 100.0
     assert writes["OUTPUT_LO+1"] == -1000.0 / 100.0
-    assert writes["OUTPUT_HI+0"] == 1000.0 / 100.0
-    assert writes["OUTPUT_HI+1"] == -1000.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+0"] == 1000.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+1"] == -1000.0 / 100.0
 
 
 def test_layer16_stack0_byte1_zero_has_lowered_near_miss_margin():
@@ -744,7 +744,7 @@ def test_layer16_stack0_f8_marker_materializes_from_alu():
         "ALU_HI+2": 0.994,
     })
     assert out["OUTPUT_LO+11"] > 0.0
-    assert out["OUTPUT_HI+2"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+2"] > 0.0
 
     current_store = ir.symbolic_ffn({
         "MARK_STACK0": 1.0,
@@ -756,7 +756,7 @@ def test_layer16_stack0_f8_marker_materializes_from_alu():
         "ALU_HI+2": 1.0,
     })
     assert current_store.get("OUTPUT_LO+11", 0.0) == 0.0
-    assert current_store.get("OUTPUT_HI+2", 0.0) == 0.0
+    assert current_store.get("OUTPUT_HI_THIS_STEP+2", 0.0) == 0.0
 
 
 def test_layer16_stack0_f0_marker_materializes_from_alu():
@@ -955,9 +955,9 @@ def test_layer16_bp_after_ent_byte2_zero_blocks_initial_bp_tail():
 
     writes = {write.dim.key(): write.weight for write in rule.writes}
     assert writes["OUTPUT_LO+0"] == 10000.0 / 100.0
-    assert writes["OUTPUT_HI+0"] == 10000.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+0"] == 10000.0 / 100.0
     assert writes["OUTPUT_LO+1"] == -10000.0 / 100.0
-    assert writes["OUTPUT_HI+1"] == -10000.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+1"] == -10000.0 / 100.0
 
 
 def test_layer16_ent_initial_stack0_byte2_writes_01_only_on_initial_main_ent():
@@ -1287,16 +1287,16 @@ def test_layer16_jsr_mem_addr0_materializes_e0_when_l14_evidence_wins():
     assert ("HAS_SE+0", 1.0) in condition_dims
     assert ("OUTPUT_LO+0", 1.0) in condition_dims
     assert ("OUTPUT_LO+8", -1.0) in condition_dims
-    assert ("OUTPUT_HI+14", 1.0) in condition_dims
-    assert ("OUTPUT_HI+15", -1.0) in condition_dims
+    assert ("OUTPUT_HI_THIS_STEP+14", 1.0) in condition_dims
+    assert ("OUTPUT_HI_THIS_STEP+15", -1.0) in condition_dims
     assert rule.threshold == 500.0
     assert rule.gate.key() == "HAS_SE+0"
 
     writes = {write.dim.key(): write.weight for write in rule.writes}
     assert writes["OUTPUT_LO+0"] == 0.0015
-    assert writes["OUTPUT_HI+14"] == 0.0016
+    assert writes["OUTPUT_HI_THIS_STEP+14"] == 0.0016
     assert writes["OUTPUT_LO+8"] == -0.0015
-    assert writes["OUTPUT_HI+15"] == -0.0015
+    assert writes["OUTPUT_HI_THIS_STEP+15"] == -0.0015
 
     ir = CompilerIR()
     ir.layer(0).ffn.rules.append(rule)
@@ -1308,11 +1308,11 @@ def test_layer16_jsr_mem_addr0_materializes_e0_when_l14_evidence_wins():
         "HAS_SE": 0.998,
         "OUTPUT_LO+0": 175.999,
         "OUTPUT_LO+8": 176.0,
-        "OUTPUT_HI+14": 175.999,
-        "OUTPUT_HI+15": 176.0,
+        "OUTPUT_HI_THIS_STEP+14": 175.999,
+        "OUTPUT_HI_THIS_STEP+15": 176.0,
     })
     assert out["OUTPUT_LO+0"] > out["OUTPUT_LO+8"]
-    assert out["OUTPUT_HI+14"] > out["OUTPUT_HI+15"]
+    assert out["OUTPUT_HI_THIS_STEP+14"] > out["OUTPUT_HI_THIS_STEP+15"]
 
     out_initial_f8 = ir.symbolic_ffn({
         "OP_JSR": 12.49,
@@ -1320,11 +1320,11 @@ def test_layer16_jsr_mem_addr0_materializes_e0_when_l14_evidence_wins():
         "MEM_STORE": 2.0,
         "OUTPUT_LO+0": 175.1,
         "OUTPUT_LO+8": 175.7,
-        "OUTPUT_HI+14": 173.2,
-        "OUTPUT_HI+15": 175.8,
+        "OUTPUT_HI_THIS_STEP+14": 173.2,
+        "OUTPUT_HI_THIS_STEP+15": 175.8,
     })
     assert out_initial_f8["OUTPUT_LO+0"] == 175.1
-    assert out_initial_f8["OUTPUT_HI+14"] == 173.2
+    assert out_initial_f8["OUTPUT_HI_THIS_STEP+14"] == 173.2
 
 
 @pytest.mark.lowering
@@ -1757,9 +1757,9 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
     hi24_writes = {write.dim.key(): write.weight for write in hi_frame24.writes}
     assert hi_frame16.threshold == 13.5
     assert hi_frame24.threshold == 13.5
-    assert hi16_writes["OUTPUT_HI+14"] == 5000.0 / 100.0
-    assert hi24_writes["OUTPUT_HI+13"] == 5000.0 / 100.0
-    assert hi16_writes["OUTPUT_HI+1"] == -5000.0 / 100.0
+    assert hi16_writes["OUTPUT_HI_THIS_STEP+14"] == 5000.0 / 100.0
+    assert hi24_writes["OUTPUT_HI_THIS_STEP+13"] == 5000.0 / 100.0
+    assert hi16_writes["OUTPUT_HI_THIS_STEP+1"] == -5000.0 / 100.0
 
     nested_conditions = {(term.dim.key(), term.weight) for term in nested.conditions}
     assert ("OP_ENT+0", 0.2) in nested_conditions
@@ -1767,14 +1767,14 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
     assert ("MARK_SP+0", 10.0) in nested_conditions
     assert ("FETCH_LO+0", 1.0) in nested_conditions
     assert ("FETCH_HI+0", 1.0) in nested_conditions
-    assert ("OUTPUT_HI+15", 1.0) in nested_conditions
+    assert ("OUTPUT_HI_THIS_STEP+15", 1.0) in nested_conditions
     assert nested.threshold == 70.0
 
     nested_writes = {write.dim.key(): write.weight for write in nested.writes}
     assert nested_writes["OUTPUT_LO+8"] == 10.0
-    assert nested_writes["OUTPUT_HI+13"] == 10.0
+    assert nested_writes["OUTPUT_HI_THIS_STEP+13"] == 10.0
     assert nested_writes["OUTPUT_LO+0"] == -10.0
-    assert nested_writes["OUTPUT_HI+15"] == -10.0
+    assert nested_writes["OUTPUT_HI_THIS_STEP+15"] == -10.0
 
     ir = CompilerIR()
     ir.layer(0).ffn.rules.append(nested)
@@ -1786,15 +1786,15 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
         "FETCH_LO+0": 1.0,
         "FETCH_HI+0": 1.0,
         "OUTPUT_LO+8": 0.12,
-        "OUTPUT_HI+15": 0.0,
+        "OUTPUT_HI_THIS_STEP+15": 0.0,
         "OUTPUT_LO+0": -5.7,
     }
     out_nested = ir.symbolic_ffn(nested_state)
     assert out_nested["OUTPUT_LO+8"] > nested_state["OUTPUT_LO+8"]
-    assert out_nested["OUTPUT_HI+13"] > 0.0
-    assert out_nested["OUTPUT_HI+15"] < nested_state["OUTPUT_HI+15"]
+    assert out_nested["OUTPUT_HI_THIS_STEP+13"] > 0.0
+    assert out_nested["OUTPUT_HI_THIS_STEP+15"] < nested_state["OUTPUT_HI_THIS_STEP+15"]
 
-    initial_state = dict(nested_state, **{"OUTPUT_LO+8": 8.8, "OUTPUT_HI+15": -13.0})
+    initial_state = dict(nested_state, **{"OUTPUT_LO+8": 8.8, "OUTPUT_HI_THIS_STEP+15": -13.0})
     out_initial = ir.symbolic_ffn(initial_state)
     assert out_initial["OUTPUT_LO+8"] == initial_state["OUTPUT_LO+8"]
 
@@ -1805,18 +1805,18 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
         "FETCH_LO+0": 1.0,
         "FETCH_HI+0": 1.0,
         "OUTPUT_LO+8": 484.0,
-        "OUTPUT_HI+15": 18_950.0,
-        "OUTPUT_HI+13": 18_950.0,
+        "OUTPUT_HI_THIS_STEP+15": 18_950.0,
+        "OUTPUT_HI_THIS_STEP+13": 18_950.0,
     }
     out_ax_marker = ir.symbolic_ffn(ax_marker_state)
     assert out_ax_marker["OUTPUT_LO+8"] == ax_marker_state["OUTPUT_LO+8"]
-    assert out_ax_marker["OUTPUT_HI+13"] == ax_marker_state["OUTPUT_HI+13"]
-    assert out_ax_marker["OUTPUT_HI+15"] == ax_marker_state["OUTPUT_HI+15"]
+    assert out_ax_marker["OUTPUT_HI_THIS_STEP+13"] == ax_marker_state["OUTPUT_HI_THIS_STEP+13"]
+    assert out_ax_marker["OUTPUT_HI_THIS_STEP+15"] == ax_marker_state["OUTPUT_HI_THIS_STEP+15"]
 
     bp_conditions = {(term.dim.key(), term.weight) for term in nested_bp.conditions}
     assert ("OP_ENT+0", 100.0) in bp_conditions
     assert ("MARK_BP+0", 20000.0) in bp_conditions
-    assert ("OUTPUT_HI+15", -50.0) in bp_conditions
+    assert ("OUTPUT_HI_THIS_STEP+15", -50.0) in bp_conditions
     assert nested_bp.threshold == 20250.0
 
     ir_bp = CompilerIR()
@@ -1828,14 +1828,14 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
         "HAS_SE": 0.998,
         "OUTPUT_LO+0": 8.9,
         "OUTPUT_LO+8": -5.0,
-        "OUTPUT_HI+15": 9.0,
+        "OUTPUT_HI_THIS_STEP+15": 9.0,
     }
     out_nested_bp = ir_bp.symbolic_ffn(nested_bp_state)
     assert out_nested_bp["OUTPUT_LO+8"] > nested_bp_state["OUTPUT_LO+8"]
-    assert out_nested_bp["OUTPUT_HI+13"] > 0.0
-    assert out_nested_bp["OUTPUT_HI+15"] < nested_bp_state["OUTPUT_HI+15"]
+    assert out_nested_bp["OUTPUT_HI_THIS_STEP+13"] > 0.0
+    assert out_nested_bp["OUTPUT_HI_THIS_STEP+15"] < nested_bp_state["OUTPUT_HI_THIS_STEP+15"]
 
-    initial_bp_state = dict(nested_bp_state, **{"OUTPUT_HI+15": 15.0})
+    initial_bp_state = dict(nested_bp_state, **{"OUTPUT_HI_THIS_STEP+15": 15.0})
     out_initial_bp = ir_bp.symbolic_ffn(initial_bp_state)
     assert out_initial_bp["OUTPUT_LO+8"] == nested_bp_state["OUTPUT_LO+8"]
 
@@ -1858,19 +1858,19 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
         "ADDR_B0_LO+8": -0.6,
         "ADDR_B0_HI+14": -19.8,
         "OUTPUT_LO+0": 15.8,
-        "OUTPUT_HI+0": 15.2,
-        "OUTPUT_HI+15": 0.7,
+        "OUTPUT_HI_THIS_STEP+0": 15.2,
+        "OUTPUT_HI_THIS_STEP+15": 0.7,
     }
     out_nested_stack0 = ir_stack0.symbolic_ffn(nested_stack0_state)
-    assert out_nested_stack0["OUTPUT_HI+15"] > nested_stack0_state["OUTPUT_HI+15"]
-    assert out_nested_stack0["OUTPUT_HI+0"] < nested_stack0_state["OUTPUT_HI+0"]
+    assert out_nested_stack0["OUTPUT_HI_THIS_STEP+15"] > nested_stack0_state["OUTPUT_HI_THIS_STEP+15"]
+    assert out_nested_stack0["OUTPUT_HI_THIS_STEP+0"] < nested_stack0_state["OUTPUT_HI_THIS_STEP+0"]
 
     initial_stack0_state = dict(
         nested_stack0_state,
         **{"ADDR_B0_LO+8": 24.6, "ADDR_B0_HI+14": 20.2},
     )
     out_initial_stack0 = ir_stack0.symbolic_ffn(initial_stack0_state)
-    assert out_initial_stack0["OUTPUT_HI+15"] == nested_stack0_state["OUTPUT_HI+15"]
+    assert out_initial_stack0["OUTPUT_HI_THIS_STEP+15"] == nested_stack0_state["OUTPUT_HI_THIS_STEP+15"]
 
     byte1_conditions = {(term.dim.key(), term.weight) for term in stack0_byte1.conditions}
     assert ("IS_BYTE+0", 1.0) in byte1_conditions
@@ -1906,13 +1906,13 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
         "CLEAN_EMBED_LO+0": 1.0,
         "CLEAN_EMBED_HI+15": 1.0,
         "OUTPUT_LO+0": 3.9,
-        "OUTPUT_HI+0": 42.9,
+        "OUTPUT_HI_THIS_STEP+0": 42.9,
     }
     out_byte1 = ir_byte1.symbolic_ffn(byte1_state)
     assert out_byte1["OUTPUT_LO+15"] > 0.0
-    assert out_byte1["OUTPUT_HI+15"] > 0.0
+    assert out_byte1["OUTPUT_HI_THIS_STEP+15"] > 0.0
     assert out_byte1["OUTPUT_LO+0"] < byte1_state["OUTPUT_LO+0"]
-    assert out_byte1["OUTPUT_HI+0"] < byte1_state["OUTPUT_HI+0"]
+    assert out_byte1["OUTPUT_HI_THIS_STEP+0"] < byte1_state["OUTPUT_HI_THIS_STEP+0"]
 
     out_byte1_initial = ir_byte1.symbolic_ffn(dict(
         byte1_state,
@@ -1940,14 +1940,14 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
             "CLEAN_EMBED_HI+15": 0.0,
             "CLEAN_EMBED_HI+0": 1.0,
             "OUTPUT_LO+15": 3.3,
-            "OUTPUT_HI+15": 4.4,
+            "OUTPUT_HI_THIS_STEP+15": 4.4,
         },
     )
     out_initial_byte1 = ir_initial_byte1.symbolic_ffn(initial_byte1_state)
     assert out_initial_byte1["OUTPUT_LO+0"] > byte1_state["OUTPUT_LO+0"]
-    assert out_initial_byte1["OUTPUT_HI+0"] > byte1_state["OUTPUT_HI+0"]
+    assert out_initial_byte1["OUTPUT_HI_THIS_STEP+0"] > byte1_state["OUTPUT_HI_THIS_STEP+0"]
     assert out_initial_byte1["OUTPUT_LO+15"] < initial_byte1_state["OUTPUT_LO+15"]
-    assert out_initial_byte1["OUTPUT_HI+15"] < initial_byte1_state["OUTPUT_HI+15"]
+    assert out_initial_byte1["OUTPUT_HI_THIS_STEP+15"] < initial_byte1_state["OUTPUT_HI_THIS_STEP+15"]
 
     out_recursive_initial_byte1 = ir_initial_byte1.symbolic_ffn(dict(
         initial_byte1_state,
@@ -1965,12 +1965,12 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
         "CLEAN_EMBED_HI+0": 1.0,
         "OUTPUT_LO+15": 4.893622875213623,
         "OUTPUT_LO+0": 2.053187847137451,
-        "OUTPUT_HI+0": 5.053187847137451,
-        "OUTPUT_HI+15": 1.8936229944229126,
+        "OUTPUT_HI_THIS_STEP+0": 5.053187847137451,
+        "OUTPUT_HI_THIS_STEP+15": 1.8936229944229126,
     }
     out_psh_stack0_byte1 = ir_initial_byte1.symbolic_ffn(psh_stack0_byte1_state)
     assert out_psh_stack0_byte1["OUTPUT_LO+15"] == psh_stack0_byte1_state["OUTPUT_LO+15"]
-    assert out_psh_stack0_byte1["OUTPUT_HI+15"] == psh_stack0_byte1_state["OUTPUT_HI+15"]
+    assert out_psh_stack0_byte1["OUTPUT_HI_THIS_STEP+15"] == psh_stack0_byte1_state["OUTPUT_HI_THIS_STEP+15"]
     assert out_psh_stack0_byte1["OUTPUT_LO+0"] == psh_stack0_byte1_state["OUTPUT_LO+0"]
 
 
@@ -1989,7 +1989,7 @@ def test_layer16_lea_local_ax_byte0_high_nibble_nudges_e8_marker():
     assert ("FETCH_HI+15", 0.2) in condition_dims
     assert ("IS_BYTE+0", -10.0) in condition_dims
     assert rule.threshold == 8.0
-    assert rule.writes[0].dim.key() == "OUTPUT_HI+14"
+    assert rule.writes[0].dim.key() == "OUTPUT_HI_THIS_STEP+14"
     assert rule.writes[0].weight == 2.0
 
     ir = CompilerIR()
@@ -2003,7 +2003,7 @@ def test_layer16_lea_local_ax_byte0_high_nibble_nudges_e8_marker():
         "FETCH_LO+8": 1.0,
         "FETCH_HI+15": 1.0,
     })
-    assert out["OUTPUT_HI+14"] > 0.0
+    assert out["OUTPUT_HI_THIS_STEP+14"] > 0.0
 
     out_byte_row = ir.symbolic_ffn({
         "MARK_AX": 1.0,
@@ -2014,7 +2014,7 @@ def test_layer16_lea_local_ax_byte0_high_nibble_nudges_e8_marker():
         "FETCH_HI+15": 1.0,
         "IS_BYTE": 1.0,
     })
-    assert out_byte_row.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out_byte_row.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
     out_pc_marker = ir.symbolic_ffn({
         "MARK_PC": 1.0,
@@ -2022,7 +2022,7 @@ def test_layer16_lea_local_ax_byte0_high_nibble_nudges_e8_marker():
         "FETCH_LO+8": 40.0,
         "FETCH_HI+15": 0.0001,
     })
-    assert out_pc_marker.get("OUTPUT_HI+14", 0.0) == 0.0
+    assert out_pc_marker.get("OUTPUT_HI_THIS_STEP+14", 0.0) == 0.0
 
 
 def test_layer16_nonstore_mem_value_zero_blocks_mem_store_residue():
@@ -2040,9 +2040,9 @@ def test_layer16_nonstore_mem_value_zero_blocks_mem_store_residue():
 
     writes = {write.dim.key(): write.weight for write in rule.writes}
     assert writes["OUTPUT_LO+0"] == 100.0 / 100.0
-    assert writes["OUTPUT_HI+0"] == 100.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+0"] == 100.0 / 100.0
     assert writes["OUTPUT_LO+8"] == -100.0 / 100.0
-    assert writes["OUTPUT_HI+14"] == -100.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+14"] == -100.0 / 100.0
 
 
 def test_layer16_psh_sp_no_borrow_high_restore_uses_positive_low_gate():
@@ -2064,5 +2064,5 @@ def test_layer16_psh_sp_no_borrow_high_restore_uses_positive_low_gate():
     }
 
     writes = {write.dim.key(): write.weight for write in rule.writes}
-    assert writes["OUTPUT_HI+14"] == 4.0 / 100.0
-    assert writes["OUTPUT_HI+13"] == -4.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+14"] == 4.0 / 100.0
+    assert writes["OUTPUT_HI_THIS_STEP+13"] == -4.0 / 100.0
