@@ -140,6 +140,63 @@ def effective_predicate(rule: FFNRule, registry: DimRegistry) -> Predicate:
             # else: soft blocker, dropped in over-approximation
         # weight == 0: skip
 
+    # F-5-gate-extension: gated_write rules use `gate=` (and optionally
+    # `gate_terms=`) to FORCE the rule to fire at positions where the
+    # gate is active, regardless of whether `conditions` look
+    # contradictory. The gate is a STRONG constraint and must be ANDed
+    # into the effective predicate as a positive contribution. Without
+    # this, rules like L10's tail_stack0_store_loaded_byte_*
+    # (gate=MARK_STACK0, conditions include both MEM_STORE and
+    # MARK_MEM-as-blocker) collapse to a contradiction sentinel because
+    # their condition semantics structurally clash -- even though the
+    # gate restricts firing to STACK0 rows where the rule is correct
+    # (the MEM_STORE wire is relayed from MEM into STACK0 positions,
+    # so its "mark == MEM" semantics describes the wire's source, not
+    # the firing position).
+    #
+    # We collect gate contributions into SEPARATE lists so they can be
+    # used as an authoritative fallback when the union of
+    # conditions+gate is unsatisfiable (see below).
+    gate_pos_candidates: List[tuple] = []
+    gate_blocker_candidates: List[tuple] = []
+    if rule.gate is not None:
+        try:
+            gate_sem_str = registry.semantics(rule.gate.name)
+        except KeyError:
+            gate_sem_str = None
+        if gate_sem_str is not None:
+            gate_sem_pred = parse(gate_sem_str)
+            dc = _nnf_disjunct_count(gate_sem_pred, negated=False)
+            if dc <= _MAX_DISJUNCTS_PER_CONTRIB:
+                gate_pos_candidates.append((gate_sem_pred, dc))
+
+    for gt in rule.gate_terms:
+        try:
+            sem_str = registry.semantics(gt.dim.name)
+        except KeyError:
+            continue
+        if sem_str is None:
+            continue
+        sem_pred = parse(sem_str)
+        if gt.weight > 0:
+            dc = _nnf_disjunct_count(sem_pred, negated=False)
+            if dc > _MAX_DISJUNCTS_PER_CONTRIB:
+                continue
+            gate_pos_candidates.append((sem_pred, dc))
+        elif gt.weight < 0:
+            if abs(gt.weight) >= HARD_BLOCKER_THRESHOLD:
+                dc = _nnf_disjunct_count(sem_pred, negated=True)
+                if dc > _MAX_DISJUNCTS_PER_CONTRIB:
+                    continue
+                gate_blocker_candidates.append((sem_pred, dc))
+            # else: soft blocker, dropped in over-approximation
+        # weight == 0: skip
+
+    # Merge gate contributions into the unified candidate lists for the
+    # primary "conditions AND gate" attempt.
+    pos_candidates.extend(gate_pos_candidates)
+    blocker_candidates.extend(gate_blocker_candidates)
+
     # Second pass: respect total DNF budget. Prefer atomic (dc==1)
     # contributions first; spend budget on multi-disjunct contributions
     # until exhausted.
@@ -188,7 +245,30 @@ def effective_predicate(rule: FFNRule, registry: DimRegistry) -> Predicate:
     # scope_violation flags. Collapse to a contradiction sentinel; the
     # patched entails() (in predicates.py) treats internally-contradictory
     # disjuncts as vacuously entailing anything.
+    #
+    # EXCEPTION (F-5-gate-extension): if the rule has a `gate`/`gate_terms`
+    # and the gate-only predicate is satisfiable, fall back to JUST the
+    # gate semantics. The gate physically forces firing at gate-positions
+    # regardless of conditions, so even when condition semantics describe
+    # a wire's source position (e.g., MEM_STORE has "mark == MEM" but is
+    # relayed into STACK0 positions), the gate's semantics correctly
+    # identifies the firing set. Without this fallback, all 255 of L10's
+    # tail_stack0_store_loaded_byte_* rules collapse to contradiction
+    # sentinels and silently bypass scope verification.
     if not satisfiable(result):
+        if gate_pos_candidates or gate_blocker_candidates:
+            gate_parts: List[Predicate] = []
+            for pred, dc in gate_pos_candidates:
+                gate_parts.append(pred)
+            for pred, dc in gate_blocker_candidates:
+                gate_parts.append(Not(pred))
+            if gate_parts:
+                gate_result = (
+                    gate_parts[0] if len(gate_parts) == 1
+                    else And(tuple(gate_parts))
+                )
+                if satisfiable(gate_result):
+                    return gate_result
         return _CONTRADICTION
 
     return result
