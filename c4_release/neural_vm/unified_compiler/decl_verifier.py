@@ -3716,3 +3716,110 @@ def verify_compaction_safety(
         mismatches=mismatches,
         partition_unavailable=partition_unavailable,
     )
+
+
+def verify_rule_scopes(
+    op,                                   # Operation (with .compiler_ir holding FFNOp or FFNRule list)
+    registry,                             # DimRegistry
+    require_scope: bool = False,
+) -> List[Dict]:
+    """F-7: check that each FFNRule's declared ``scope`` predicate is
+    entailed by the effective firing predicate (over-approximation
+    from conditions+threshold).
+
+    Returns a list of issue dicts:
+        {'kind': 'no_scope', 'rule': name}   # if require_scope=True and scope missing
+        {'kind': 'scope_violation', 'rule': name,
+         'effective': pred_str, 'scope': scope_str,
+         'reason': explain_failure_str}
+
+    If ``require_scope`` is False (default), rules without a scope are
+    silently skipped (opt-in adoption).
+    """
+    from neural_vm.unified_compiler.predicates import parse, entails, explain_failure
+    from neural_vm.unified_compiler.effective_predicate import effective_predicate
+
+    issues: List[Dict] = []
+
+    rules = _collect_ffn_rules_from_op(op)
+
+    for rule in rules:
+        scope_str = getattr(rule, "scope", None)
+        if scope_str is None:
+            if require_scope:
+                issues.append({
+                    "kind": "no_scope",
+                    "rule": getattr(rule, "name", "<anonymous>"),
+                })
+            continue
+
+        try:
+            scope_pred = parse(scope_str)
+        except Exception as e:
+            issues.append({
+                "kind": "scope_parse_error",
+                "rule": getattr(rule, "name", "<anonymous>"),
+                "scope": scope_str,
+                "reason": str(e),
+            })
+            continue
+
+        try:
+            effective = effective_predicate(rule, registry)
+        except Exception as e:
+            issues.append({
+                "kind": "effective_inference_error",
+                "rule": getattr(rule, "name", "<anonymous>"),
+                "reason": str(e),
+            })
+            continue
+
+        if not entails(effective, scope_pred):
+            reason = explain_failure(effective, scope_pred) or (
+                "scope not entailed by effective predicate"
+            )
+            issues.append({
+                "kind": "scope_violation",
+                "rule": getattr(rule, "name", "<anonymous>"),
+                "effective": str(effective),
+                "scope": scope_str,
+                "reason": reason,
+            })
+
+    return issues
+
+
+def _collect_ffn_rules_from_op(op) -> List:
+    """Walk an Operation to find its FFNRules. Operations expose rules
+    via ``.compiler_ir`` which can be an FFNOp, a list, or other shapes.
+    Handles the common cases; returns ``[]`` for ops without FFN rules."""
+    from neural_vm.unified_compiler.ir import FFNRule, FFNOp
+
+    ir = getattr(op, "compiler_ir", None)
+    if ir is None:
+        return []
+
+    rules: List = []
+    # FFNOp case
+    if isinstance(ir, FFNOp):
+        return list(ir.rules)
+    # List-of-rules case
+    if isinstance(ir, list):
+        for item in ir:
+            if isinstance(item, FFNRule):
+                rules.append(item)
+            elif isinstance(item, FFNOp):
+                rules.extend(item.rules)
+        return rules
+    # Tuple case
+    if isinstance(ir, tuple):
+        for item in ir:
+            if isinstance(item, FFNRule):
+                rules.append(item)
+            elif isinstance(item, FFNOp):
+                rules.extend(item.rules)
+        return rules
+    # Object with .rules attribute
+    if hasattr(ir, "rules"):
+        return [r for r in ir.rules if isinstance(r, FFNRule)]
+    return []

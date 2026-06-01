@@ -86,6 +86,7 @@ class FFNRule:
     gate_terms: Tuple[ConditionTerm, ...] = ()
     gate_bias: float = 1.0
     name: Optional[str] = None
+    scope: Optional[str] = None
 
     @classmethod
     def constant_write(
@@ -95,6 +96,7 @@ class FFNRule:
         threshold: float,
         writes: Sequence[Tuple[str, float]],
         name: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> "FFNRule":
         return cls(
             conditions=tuple(
@@ -107,6 +109,7 @@ class FFNRule:
                 for dim, weight in writes
             ),
             name=name,
+            scope=scope,
         )
 
     @classmethod
@@ -121,6 +124,7 @@ class FFNRule:
         gate_weight: float = 1.0,
         gate_bias: float = 0.0,
         name: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> "FFNRule":
         return cls(
             conditions=tuple(
@@ -140,6 +144,7 @@ class FFNRule:
                 for dim, weight in writes
             ),
             name=name,
+            scope=scope,
         )
 
 
