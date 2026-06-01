@@ -42,6 +42,8 @@ Example:
     # layout.ops_at(1) = [pc_increment]
 """
 
+import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -285,6 +287,33 @@ class Operation:
     reset_after_step: Set[str] = field(default_factory=set)
     requires: Dict[str, str] = field(default_factory=dict)
     opcodes: Set[str] = field(default_factory=set)
+
+    def __post_init__(self):
+        # B15 prep (1.0d, see docs/DYNAMIC_SCHEDULER_MIGRATION_PLAN.md):
+        # scaffold a DeprecationWarning emission path for the `phase=N.M`
+        # field. The dynamic scheduler retires `phase` after B14 strict mode
+        # stabilizes; this hook is silent by default and only fires when ALL
+        # THREE gates trip:
+        #
+        #   1. ``self.phase is not None``     — the op actually uses phase
+        #   2. ``C4_PHASE_STRICT_MODE=1``    — strict mode (B14) is enabled
+        #   3. ``C4_PHASE_DEPRECATION_WARN=1`` — deprecation warning opt-in
+        #
+        # Under normal use (no env flags set) this method is a no-op. Flip
+        # the env flags once B14 lands to surface remaining phase= users,
+        # then drop the `phase` field and this hook entirely in B15.
+        if self.phase is None:
+            return
+        if os.environ.get("C4_PHASE_STRICT_MODE") != "1":
+            return
+        if os.environ.get("C4_PHASE_DEPRECATION_WARN") != "1":
+            return
+        warnings.warn(
+            f"Operation '{self.name}' uses phase={self.phase}; "
+            f"switch to dep-based ordering",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     def __hash__(self):
         return hash(self.name)
