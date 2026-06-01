@@ -399,11 +399,28 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir=make_format_position_counter_ir(),
         layer_idx=8,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def make_format_position_counter_ir(S: float = 100.0) -> CompilerIR:
+    """Declarative IR mirror of ``_lower_format_position_counter_ir``.
+
+    Exposes the same 16-rule SwiGLU counter as ``Operation.compiler_ir`` so
+    the verifier, scope checker, and dominance auditor can read the spec.
+    The bake path still drives the imperative pin (unit 600) via
+    ``_lower_format_position_counter_ir``; this IR is the semantic source of
+    truth for symbolic tooling and is byte-identity-validated by
+    ``compare_symbolic_to_lowered_ffn`` (start_unit=0 in the validator, no
+    consumer-facing weights are baked through this path).
+    """
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_format_position_counter_rules(S))
+    return ir
 
 
 def _format_position_counter_rules(S: float) -> tuple[FFNRule, ...]:
