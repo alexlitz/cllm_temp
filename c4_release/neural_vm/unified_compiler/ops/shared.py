@@ -772,8 +772,31 @@ def declare_setdim_compat_dims(
     # by `_allocate_dims`.
     io_cursor = [0]
 
+    # B9 OUTPUT_HI split: alias map. Dim names on the LHS share the same
+    # numeric position as the dim on the RHS. The alias must be declared
+    # AFTER the base in the relevant size-bucket list so the base's
+    # pinned position is already in ``compiler._pinned`` before the alias
+    # is declared. See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §6.4.
+    _ALIAS_OF = {
+        "OUTPUT_HI_THIS_STEP": "OUTPUT_HI",
+    }
+
     def _declare(name, size):
         if not hasattr(_SetDim, name):
+            return
+        # Aliases inherit the base dim's pinned position (in BOTH pinning
+        # modes) so byte-identical residual cells are guaranteed regardless
+        # of compaction layout.
+        base = _ALIAS_OF.get(name)
+        if base is not None:
+            existing = getattr(compiler, "_pinned", {}) or {}
+            if base in existing:
+                pinned = existing[base]
+            else:
+                # Fall back to _SetDim if the base wasn't pinned (shouldn't
+                # happen because the base is declared first in the list).
+                pinned = getattr(_SetDim, base, None) if pin_to_setdim else None
+            compiler.declare_dim(name, size, pinned=pinned)
             return
         if pin_io_only:
             if name in _IO_REQUIRED_DIMS:
