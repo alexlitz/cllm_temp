@@ -638,6 +638,13 @@ def make_layer3_convo_io_state_init_op(
         declarative_authority="spec_generated",
         migrated=True,
         ffn_units_used=1035 if enable_conversational_io else None,
+        # B12 backfill: docstring above pins phase 3.1 AFTER
+        # ``layer3_ffn`` (phase 3, same L3 FFN) so this extension's
+        # writes at unit 1034 layer cleanly on top of the L3 / L6-routing
+        # unit counters. Encoded as a B10 op-name reference so the
+        # dynamic scheduler honours the dep edge even though reads/writes
+        # are empty (bake body flag-gated on ``enable_conversational_io``).
+        requires={"after": "layer3_ffn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
