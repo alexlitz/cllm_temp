@@ -1306,7 +1306,18 @@ class LayerCompiler:
             # B10: ``requires["after"] = "<op>"`` forces strict later layer
             # than every referenced op. ``requires["same_layer_as"]`` forces
             # equality (asserted below after the layer is chosen).
+            #
+            # B9 EXCEPTION (mirrors _topological_sort): cross-step
+            # requires["after"] skips the layer constraint when the
+            # ref is at a later phase AND writes some dim ``op`` reads
+            # (prev-step carry; see B9 spec §7.2 R-OH-2).
             for ref in requires_after_ops(op):
+                ref_op = self._op_by_name.get(ref)
+                if (ref_op is not None
+                        and op.phase is not None and ref_op.phase is not None
+                        and ref_op.phase > op.phase
+                        and (ref_op.writes & op.reads)):
+                    continue
                 ref_layer = assignment.get(ref)
                 if ref_layer is not None:
                     earliest = max(earliest, ref_layer + 1)
