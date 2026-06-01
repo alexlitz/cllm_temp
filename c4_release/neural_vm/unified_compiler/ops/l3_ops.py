@@ -455,6 +455,17 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         migrated=True,
+        # B9 OUTPUT_HI split: head 5 (``_ax_full_relay_head_spec``) reads
+        # OUTPUT_LO/HI at the AX marker, but L3 is the first layer in
+        # step N to touch OUTPUT -- the read actually consumes the
+        # PREVIOUS step's residual via attention back to the prev-step
+        # AX marker token. Declare requires["after"]=layer16_lev_routing
+        # to inform the dynamic scheduler that the OUTPUT_HI_THIS_STEP
+        # read on this op is satisfied by the previous step's final
+        # OUTPUT writer (and is therefore NOT a same-step data dep on
+        # any later-layer producer). See
+        # docs/B9_OUTPUT_HI_SPLIT_SPEC.md §2.1 and §6.3.
+        requires={"after": "layer16_lev_routing"},
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",

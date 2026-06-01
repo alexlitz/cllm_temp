@@ -786,6 +786,15 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
+        # B9 OUTPUT_HI split: this op's docstring is "refresh
+        # AX_CARRY from prev step's AX marker OUTPUT". The V reads on
+        # OUTPUT_LO/HI_THIS_STEP at the AX marker pull the PREVIOUS step's
+        # cached residual via attention -- NOT a same-step data dep on
+        # any L8+ producer. requires["after"]=layer16_lev_routing tells
+        # the dynamic scheduler that the read is satisfied by the prev
+        # step's final OUTPUT writer. See
+        # docs/B9_OUTPUT_HI_SPLIT_SPEC.md §2.2 and §6.3.
+        requires={"after": "layer16_lev_routing"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
