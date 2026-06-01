@@ -1,10 +1,78 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L4 attention-head layout (pinned indices) ======================
+#
+# Two ops claim heads on the L4 attention block today:
+#
+#   * ``layer4_pc_relay`` (phase=4)              -> heads 0, 1
+#   * ``layer4_sp_to_addr_key`` (phase=4.5)      -> heads 2, 3
+#
+# Pre-migration each call site picked its ``head_idx`` as a bare integer
+# literal -- ``head_idx=0`` / ``head_idx=1`` in the PC-relay
+# :class:`DeclarativeAttentionHeadSpec` block, and ``_stage_sp_byte(2,
+# ...)`` / ``_stage_sp_byte(3, ...)`` in the SP-to-ADDR_KEY bake -- which
+# made adding a future L4 head fragile (the author had to remember which
+# slots were already taken). With the allocator the handoff is
+# structural: each bake instantiates its OWN allocator pre-loaded with
+# the full L4 head layout (pinned to existing slots), stashes it on
+# ``attn._l4_head_allocator`` for downstream inspection, and resolves
+# its own head indices by name. A future L4 attention op can claim a
+# free head via ``allocator.alloc(name, layer_idx=4)`` -- with no
+# ``pin=`` -- without touching this table.
+#
+# ``layer4_sp_to_addr_key`` is gated by ``enable=False`` today (a guard
+# returns before any weight writes); we still pin its head indices here
+# so the layout is structurally stable across builds. The pinned
+# allocator only attaches to ``attn._l4_head_allocator`` when the op
+# actually fires, matching the existing ``_claims`` gating below.
+_L4_HEAD_LAYOUT = (
+    # (op-name key,                            pinned head_idx)
+    ("layer4_pc_relay.head_0",                 0),
+    ("layer4_pc_relay.head_1",                 1),
+    ("layer4_sp_to_addr_key.head_2",           2),
+    ("layer4_sp_to_addr_key.head_3",           3),
+)
+
+
+def _allocate_layer4_attention_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with all L4 heads.
+
+    Every entry in :data:`_L4_HEAD_LAYOUT` is pinned at its existing
+    ``head_idx`` so the underlying weight writes -- still hand-coded in
+    ``_layer4_pc_relay_head_specs`` (heads 0/1) and ``_stage_sp_byte``
+    (heads 2/3) -- land byte-identically. Both ``layer4_pc_relay`` and
+    (when enabled) ``layer4_sp_to_addr_key`` call this so each can look
+    up its own head by name without baking an integer literal at the
+    call site.
+    """
+    allocator = AttentionHeadAllocator()
+    for name, head_idx in _L4_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=4, pin=head_idx)
+    return allocator
+
+
+def _l4_head_idx(op_name: str) -> int:
+    """Return the pinned L4 ``head_idx`` for ``op_name``.
+
+    Static lookup against :data:`_L4_HEAD_LAYOUT` for callers that
+    cannot instantiate a per-bake allocator (e.g. ``compiler_ir_factory``
+    helpers, which run outside the bake and receive only dim positions
+    and ``HD``). The runtime bakes still go through
+    :func:`_allocate_layer4_attention_heads` so the collision-checked
+    allocator path is exercised on every weight write.
+    """
+    for name, head_idx in _L4_HEAD_LAYOUT:
+        if name == op_name:
+            return head_idx
+    raise KeyError(f"_l4_head_idx: unknown L4 attention op {op_name!r}")
 
 
 # === L4 FFN unit layout (pinned offsets) ============================
@@ -83,6 +151,13 @@ def make_layer4_pc_relay_op() -> Operation:
     def bake(block, dim_positions, S):
         attn = block.attn
         proxy = _as_setdim_proxy(dim_positions)
+        # Per-bake attention-head allocator with the full L4 head layout
+        # pinned. Stashed on ``attn`` for inspection / extension; the
+        # actual ``head_idx`` values used by ``_layer4_pc_relay_head_specs``
+        # come from :func:`_l4_head_idx` so the spec stays in lockstep
+        # with the layout table without re-querying the allocator here.
+        allocator = _allocate_layer4_attention_heads()
+        attn._l4_head_allocator = allocator
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
@@ -211,7 +286,7 @@ def _layer4_pc_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     AX_I = 1
     return (
         DeclarativeAttentionHeadSpec(
-            head_idx=0,
+            head_idx=_l4_head_idx("layer4_pc_relay.head_0"),
             q=(
                 AP(0, BD.MARK_AX, L),
                 AP(33, BD.MARK_AX, L),
@@ -230,7 +305,7 @@ def _layer4_pc_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
             ),
         ),
         DeclarativeAttentionHeadSpec(
-            head_idx=1,
+            head_idx=_l4_head_idx("layer4_pc_relay.head_1"),
             q=(
                 AP(0, BD.IS_BYTE, L),
                 AP(0, BD.H1 + AX_I, L),
@@ -455,6 +530,14 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
 
         BD = _as_setdim_proxy(dim_positions)
         attn = block.attn
+        # Per-bake attention-head allocator with the full L4 head layout
+        # pinned. Mirrors ``make_layer4_pc_relay_op`` so the SP-to-ADDR_KEY
+        # bake produces the same ``attn._l4_head_allocator`` view regardless
+        # of which op runs first. The head indices passed to
+        # ``_stage_sp_byte`` come from :func:`_l4_head_idx` so the literal
+        # ``2`` / ``3`` no longer appear at the call site.
+        allocator = _allocate_layer4_attention_heads()
+        attn._l4_head_allocator = allocator
         HD = attn.W_q.shape[0] // attn.num_heads
         L = 50.0  # strong gate; overpowers any incidental L7 contamination
         SP_I = 2  # SP marker index in MARKS array
@@ -504,11 +587,17 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
                     attn.W_o[write_hi_to + k, base + 17 + k] = SCALE_O
 
         # Head 2: SP byte 0 → ADDR_KEY[0..15] (lo nibble) + [16..31] (hi nibble).
-        _stage_sp_byte(2, BD.BYTE_INDEX_0, BD.ADDR_B0_HI, BD.ADDR_B1_HI)
+        _stage_sp_byte(
+            _l4_head_idx("layer4_sp_to_addr_key.head_2"),
+            BD.BYTE_INDEX_0, BD.ADDR_B0_HI, BD.ADDR_B1_HI,
+        )
         # Head 3: SP byte 1 → ADDR_KEY[32..47] (lo nibble only). The hi
         # nibble of SP byte 1 would extend ADDR_KEY past 48 dims; matches
         # the 12-bit "top" convention used by `_inject_mem_metadata`.
-        _stage_sp_byte(3, BD.BYTE_INDEX_1, BD.ADDR_B2_HI, None)
+        _stage_sp_byte(
+            _l4_head_idx("layer4_sp_to_addr_key.head_3"),
+            BD.BYTE_INDEX_1, BD.ADDR_B2_HI, None,
+        )
 
     # Dim-ownership claims: L4 attn heads 2 + 3 SP-to-ADDR_KEY staging.
     # Each head writes V slots 1..32 + O writes into ADDR_B*_HI sub-bands.
