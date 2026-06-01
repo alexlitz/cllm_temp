@@ -365,6 +365,203 @@ def compute_dynamic_schedule(
 
 
 # ---------------------------------------------------------------------------
+# Strict mode: pure dep-derived ordering (no phase fallback)
+# ---------------------------------------------------------------------------
+
+
+class StrictModeUnschedulableError(RuntimeError):
+    """Raised by ``compile_full_vm_dynamic(strict=True)`` when the declared
+    dep graph cannot place every op without falling back to ``phase``.
+
+    The exception carries three attribute lists naming the offending op
+    classes so callers (and the B14 rollout test) can verify the exact
+    reason strict mode refused to compile:
+
+      * ``cycle_members`` — ops trapped in a directed cycle in the
+        unpruned dep graph (today: the OUTPUT_HI / IF_VAR SCC, etc.).
+        These need ``B9`` dim decomposition to break the back-edges.
+      * ``phase_required_but_undeclared`` — ops whose static
+        ``phase=N.M`` places them later than their dep-derived earliest
+        position. The static path uses ``phase`` to pin them; strict
+        mode does not, so an explicit ``requires={"after": ...}`` (or
+        new ``reads`` / ``consumes_fresh``) is needed. ``B12`` is the
+        unit that backfills these declarations.
+      * ``phase_inconsistent_with_deps`` — ops whose static ``phase`` is
+        EARLIER than the dep DAG can satisfy. Indicates a bug or a
+        latent cycle whose member's depth is the sentinel ``-1``.
+    """
+
+    def __init__(
+        self,
+        *,
+        cycle_members: Sequence[str],
+        phase_required_but_undeclared: Sequence[str],
+        phase_inconsistent_with_deps: Sequence[str],
+    ) -> None:
+        self.cycle_members = list(cycle_members)
+        self.phase_required_but_undeclared = list(phase_required_but_undeclared)
+        self.phase_inconsistent_with_deps = list(phase_inconsistent_with_deps)
+        total = (
+            len(self.cycle_members)
+            + len(self.phase_required_but_undeclared)
+            + len(self.phase_inconsistent_with_deps)
+        )
+
+        def _preview(names: Sequence[str], limit: int = 10) -> str:
+            head = ", ".join(sorted(names)[:limit])
+            extra = max(0, len(names) - limit)
+            return f"{head}{f', ... (+{extra} more)' if extra else ''}"
+
+        msg_parts: List[str] = [
+            f"compile_full_vm_dynamic(strict=True) refused to compile: "
+            f"{total} ops cannot be placed by declared dependencies alone.",
+        ]
+        if self.cycle_members:
+            msg_parts.append(
+                f"  dep_graph_cycle_member ({len(self.cycle_members)}): "
+                f"{_preview(self.cycle_members)}"
+            )
+        if self.phase_required_but_undeclared:
+            msg_parts.append(
+                f"  phase_required_but_undeclared "
+                f"({len(self.phase_required_but_undeclared)}): "
+                f"{_preview(self.phase_required_but_undeclared)}"
+            )
+        if self.phase_inconsistent_with_deps:
+            msg_parts.append(
+                f"  phase_inconsistent_with_deps "
+                f"({len(self.phase_inconsistent_with_deps)}): "
+                f"{_preview(self.phase_inconsistent_with_deps)}"
+            )
+        msg_parts.append(
+            "  Resolution: add explicit deps (requires={\"after\": ...}, "
+            "consumes_fresh, or new reads/writes) per "
+            "DYNAMIC_SCHEDULER_MIGRATION_PLAN.md units B9/B12. Until then, "
+            "compile with strict=False (the default) to fall back to phase "
+            "tiebreaking."
+        )
+        super().__init__("\n".join(msg_parts))
+
+
+def _current_layer_for_strict(op: Operation) -> Optional[int]:
+    """Best-effort integer layer derived from ``op.phase`` / ``op.layer_idx``.
+
+    Mirrors ``tools/analyze_scheduler.py:_current_layer`` so strict-mode
+    categorisation matches the analyzer's report exactly.
+    """
+    if op.layer_idx is not None:
+        return op.layer_idx
+    if op.phase is None:
+        return None
+    try:
+        return int(math.floor(op.phase))
+    except (TypeError, ValueError):
+        return None
+
+
+def _strict_mode_categorise(
+    ops: Sequence[Operation],
+) -> Dict[str, List[str]]:
+    """Categorise ops for strict-mode admission.
+
+    Returns ``{"ok": [...], "cycle_members": [...],
+    "phase_required_but_undeclared": [...],
+    "phase_inconsistent_with_deps": [...]}`` where each value is a sorted
+    list of op names. Mirrors ``tools/analyze_scheduler.py:categorise``
+    so strict-mode failures and the offline analyzer report agree.
+
+    Implementation notes
+    --------------------
+    * Uses the unpruned dep graph (no phase pruning) — strict mode is
+      defined as "what happens when phase is ignored".
+    * Post-pass ops (current layer >= 100) and ``kind="model"`` ops are
+      treated as structurally pinned and pass strict mode unconditionally
+      (the dispatcher places them by phase / layer_idx, never by dep
+      depth). Block-kind ops go through the same dep check as attn / ffn
+      ops — they may still expose ordering bugs.
+    """
+    in_edges, out_edges = _build_dep_graph(ops)
+    cycle_members = _find_cycle_members(ops, in_edges, out_edges)
+
+    # Compute dep-derived earliest layer (matches analyzer.topo_depth).
+    indeg = {op.name: len(in_edges[op.name]) for op in ops}
+    max_pred_depth: Dict[str, int] = {op.name: -1 for op in ops}
+    depth: Dict[str, int] = {}
+    queue: List[str] = []
+    for op in ops:
+        if indeg[op.name] == 0:
+            depth[op.name] = 0
+            queue.append(op.name)
+    while queue:
+        u = queue.pop(0)
+        for v in sorted(out_edges[u]):
+            if depth[u] > max_pred_depth[v]:
+                max_pred_depth[v] = depth[u]
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                depth[v] = max_pred_depth[v] + 1
+                queue.append(v)
+    for op in ops:
+        depth.setdefault(op.name, -1)
+
+    buckets: Dict[str, List[str]] = {
+        "ok": [],
+        "cycle_members": [],
+        "phase_required_but_undeclared": [],
+        "phase_inconsistent_with_deps": [],
+    }
+    for op in ops:
+        current = _current_layer_for_strict(op)
+        # Post-pass / model ops short-circuit: their placement is by
+        # phase / layer_idx, never by dep depth.
+        if current is not None and current >= 100:
+            buckets["ok"].append(op.name)
+            continue
+        if op.kind == "model":
+            buckets["ok"].append(op.name)
+            continue
+        if op.name in cycle_members:
+            buckets["cycle_members"].append(op.name)
+            continue
+        derived = depth[op.name]
+        if current is None:
+            # No phase declared and no cycle — free placement.
+            buckets["ok"].append(op.name)
+            continue
+        if current < derived:
+            buckets["phase_inconsistent_with_deps"].append(op.name)
+            continue
+        if current == derived:
+            buckets["ok"].append(op.name)
+            continue
+        # current > derived: phase pins op later than the DAG requires.
+        buckets["phase_required_but_undeclared"].append(op.name)
+
+    for key in buckets:
+        buckets[key].sort()
+    return buckets
+
+
+def _assert_strict_mode_clean(ops: Sequence[Operation]) -> None:
+    """Raise ``StrictModeUnschedulableError`` if any op fails strict admission."""
+    buckets = _strict_mode_categorise(ops)
+    if (
+        buckets["cycle_members"]
+        or buckets["phase_required_but_undeclared"]
+        or buckets["phase_inconsistent_with_deps"]
+    ):
+        raise StrictModeUnschedulableError(
+            cycle_members=buckets["cycle_members"],
+            phase_required_but_undeclared=buckets[
+                "phase_required_but_undeclared"
+            ],
+            phase_inconsistent_with_deps=buckets[
+                "phase_inconsistent_with_deps"
+            ],
+        )
+
+
+# ---------------------------------------------------------------------------
 # Public compile entry point
 # ---------------------------------------------------------------------------
 
@@ -390,6 +587,7 @@ def compile_full_vm_dynamic(
     rms_norm_eps: Optional[float] = None,
     require_declarative_bake: Optional[bool] = None,
     declarations_only: bool = False,
+    strict: bool = False,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
@@ -422,6 +620,29 @@ def compile_full_vm_dynamic(
     detailed semantics. The disk-cache key is namespaced by appending
     ``"__dynamic"`` to the kwargs snapshot so dynamic and static
     compiles cannot trample each other's cache entries.
+
+    Strict mode (B14 prep, OFF by default)
+    --------------------------------------
+    When ``strict=True``, the dynamic compile refuses to fall back to
+    ``phase`` for any ordering decision. Before compiling, every op is
+    categorised against the unpruned declared-dep graph (mirroring
+    ``tools/analyze_scheduler.py``); if any op falls into
+    ``dep_graph_cycle_member``, ``phase_required_but_undeclared``, or
+    ``phase_inconsistent_with_deps``, the call raises
+    ``StrictModeUnschedulableError`` with the offending op names.
+
+    On a clean op set strict mode produces the same byte-identical
+    layout as the static path, because on a fully-declared op set the
+    dep-derived order and the phase-derived order agree (Phase A
+    finding, see ``DYNAMIC_SCHEDULER_MIGRATION_PLAN.md``).
+
+    Today (2026-06-01) strict mode is expected to FAIL on the production
+    op set: ~70 ops are cycle members of the OUTPUT_HI SCC, ~23 ops are
+    ``phase_required_but_undeclared``, and ~3 are
+    ``phase_inconsistent_with_deps``. ``strict=False`` (the default)
+    preserves the B11/B12 hybrid behaviour. Flipping the default to
+    ``True`` is the B14 unit; it depends on B9 (dim decomposition) and
+    B12 (declaration backfill) fully landing first.
     """
     # Mirror static-path env-flag handling to keep the API truly identical.
     if not declarations_only:
@@ -459,6 +680,15 @@ def compile_full_vm_dynamic(
         enable_tool_calling=enable_tool_calling,
         enable_neural_io_think_protocol=enable_neural_io_think_protocol,
     )
+
+    # B14 strict-mode gate: refuse to compile if any op needs phase to
+    # be placed. Raised BEFORE any LayerCompiler / disk-cache work runs
+    # so the error citation is purely scheduler-level (no half-built
+    # model state to tear down, no stale cache hit masking the failure).
+    # When ``strict=False`` (the default), the hybrid scheduler falls
+    # back to phase, preserving the B11/B12 byte-identity behaviour.
+    if strict:
+        _assert_strict_mode_clean(ops)
 
     # Compute the hybrid schedule. The schedule output (dep-derived
     # order with phase-pruning fallback) is the load-bearing "dynamic"
