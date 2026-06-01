@@ -127,6 +127,46 @@ def make_layer4_ffn_op() -> Operation:
     def bake(block, dim_positions, S):
         _bake_layer4_ffn(block.ffn, S, _as_setdim_proxy(dim_positions))
 
+    # Dim-ownership claims (W_down output cells). The bake programs four
+    # ``nibble_rotation_chain``s and one TEMP-clear pass on L4.ffn:
+    #   units 0..31:    PC+1 direct nibbles -> TEMP+(unit)
+    #                   (16 lo + 16 hi nibbles of TEMP, sourced from EMBED).
+    #   units 32..63:   PC+1 carry pairs writing TEMP+(16 + (unit-32)//2).
+    #   unit 64:        IS_JSR placeholder (no write, preserves unit number).
+    #   units 65..95:   TEMP[1..31] clear at MARK_PC -> TEMP+(unit-64).
+    #   units 96..191:  PC+2 chain at MARK_AX (byte_idx=0, 96 units; 32
+    #                   direct outputs into FETCH_LO/HI followed by 64
+    #                   carry units feeding FETCH_HI carries).
+    #   units 192..319: PC+3 chain (byte_idx=1, 128 units).
+    #   units 320..479: PC+4 chain (byte_idx=2, 160 units).
+    #   units 480..543: PC+1@MARK_PC fallback chain (64 units).
+    # Declares the direct-output cells of each chain plus the TEMP carry
+    # pairs and TEMP clear units. Carry-only units (128..223 etc., which
+    # also write FETCH_HI+k via the carry projection) are intentionally
+    # omitted to keep the partial set readable; the verifier only requires
+    # declared ⊆ observed.
+    _claims = set()
+    # PC+1 -> TEMP direct nibbles (units 0..31).
+    for unit in range(32):
+        _claims.add((4, "ffn_W_down", str(unit), f"TEMP+{unit}"))
+    # PC+1 -> TEMP carry pairs (units 32..63, two units per high-nibble
+    # output TEMP+16..+31).
+    for k in range(16):
+        unit_pair = (32 + 2 * k, 33 + 2 * k)
+        for unit in unit_pair:
+            _claims.add((4, "ffn_W_down", str(unit), f"TEMP+{16 + k}"))
+    # Unit 64 is reserved (IS_JSR placeholder; no write).
+    # TEMP[1..31] clear at MARK_PC (units 65..95).
+    for k in range(1, 32):
+        _claims.add((4, "ffn_W_down", str(64 + k), f"TEMP+{k}"))
+    # Multi-byte PC+2 / PC+3 / PC+4 chains and PC+1@MARK_PC fallback. Each
+    # chain's first 32 units write the direct FETCH outputs (16 LO + 16 HI).
+    # Chain bases: 96 (PC+2), 192 (PC+3), 320 (PC+4), 480 (PC+1@MARK_PC).
+    for chain_base in (96, 192, 320, 480):
+        for k in range(16):
+            _claims.add((4, "ffn_W_down", str(chain_base + k), f"FETCH_LO+{k}"))
+            _claims.add((4, "ffn_W_down", str(chain_base + 16 + k), f"FETCH_HI+{k}"))
+
     return Operation(
         name="layer4_ffn",
         phase=4,
@@ -139,6 +179,7 @@ def make_layer4_ffn_op() -> Operation:
         declarative_bake_fn=bake,
         layer_idx=4,
         migrated=True,
+        claims=_claims,
         # ``_set_layer4_ffn`` writes the PC+1 (lo/hi/carry = 64 units) +
         # TEMP-clear (32) + multi-byte PC+2/+3/+4 (96+128+160 = 384) +
         # PC+1@PC marker (64) chains for a total of 544 units (0..543).
