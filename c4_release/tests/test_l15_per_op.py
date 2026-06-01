@@ -203,8 +203,8 @@ def test_l15_psh_sp_byte0_position_predicts_byte1_ff_symbolic():
         f"Expected OUTPUT_LO+0 = -4.0 (cancel competing 0x0 bias), "
         f"got {out.get('OUTPUT_LO+0')}"
     )
-    assert out.get("OUTPUT_HI+15", 0.0) == 4.0
-    assert out.get("OUTPUT_HI+0", 0.0) == -4.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 4.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == -4.0
 
 
 @pytest.mark.parametrize(
@@ -218,12 +218,12 @@ def test_l15_psh_sp_byte_position_predicts_zero_symbolic(byte_index_name: str):
     state = _psh_sp_state(byte_index_name)
     out = ir.symbolic_ffn(state)
     # Byte == 0x00 means low nibble 0 AND high nibble 0.
-    # Rule writes ("OUTPUT_LO+0", 2.0), ("OUTPUT_HI+0", 2.0).
+    # Rule writes ("OUTPUT_LO+0", 2.0), ("OUTPUT_HI_THIS_STEP+0", 2.0).
     assert out.get("OUTPUT_LO+0", 0.0) == 2.0, (
         f"Expected OUTPUT_LO+0 = +2.0 for PSH SP {byte_index_name}, "
         f"got {out.get('OUTPUT_LO+0')}"
     )
-    assert out.get("OUTPUT_HI+0", 0.0) == 2.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 2.0
 
 
 def test_l15_psh_bp_byte1_position_preserves_stack_init_byte2_symbolic():
@@ -235,13 +235,13 @@ def test_l15_psh_bp_byte1_position_preserves_stack_init_byte2_symbolic():
     state = _psh_bp_state("BYTE_INDEX_1")
     out = ir.symbolic_ffn(state)
     # 0x01 -> low nibble 1, high nibble 0. The rules write +4 to OUTPUT_LO+1
-    # / -4 to OUTPUT_LO+0 for LO; +4 to OUTPUT_HI+0 for HI.
+    # / -4 to OUTPUT_LO+0 for LO; +4 to OUTPUT_HI_THIS_STEP+0 for HI.
     assert out.get("OUTPUT_LO+1", 0.0) == 4.0, (
         f"Expected OUTPUT_LO+1 = +4.0 (lo nibble 1 for 0x01), got "
         f"{out.get('OUTPUT_LO+1')}"
     )
     assert out.get("OUTPUT_LO+0", 0.0) == -4.0
-    assert out.get("OUTPUT_HI+0", 0.0) == 4.0
+    assert out.get("OUTPUT_HI_THIS_STEP+0", 0.0) == 4.0
 
 
 def test_l15_psh_sp_byte_rules_do_not_fire_on_non_psh_signatures_symbolic():
@@ -263,7 +263,7 @@ def test_l15_psh_sp_byte_rules_do_not_fire_on_non_psh_signatures_symbolic():
             f"PSH-specific rules should be silent without PSH_AT_SP; "
             f"OUTPUT_LO+{k} = {out.get(f'OUTPUT_LO+{k}')}"
         )
-        assert out.get(f"OUTPUT_HI+{k}", 0.0) == 0.0
+        assert out.get(f"OUTPUT_HI_THIS_STEP+{k}", 0.0) == 0.0
 
 
 def test_l15_psh_sp_byte0_lowered_ffn_predicts_byte1_ff():
