@@ -1,9 +1,114 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L8 FFN unit layout (pinned offsets) ============================
+#
+# The L8 FFN hosts four op families that historically picked their
+# hidden-unit ranges by hand. ``layer8_alu`` runs the monolithic
+# ``vm_step._set_layer8_alu`` helper which walks a local ``unit = 0``
+# counter through 18 sub-stages (ADD/LEA/SUB/ADJ/ENT lo nibbles + carry
+# detection + CMP_GROUP + ENT/ADJ defaults + LEV byte-0 relay + LEA
+# first-step byte-2 output) totalling 2023 units. ``layer8_multibyte_routing``
+# appends a further 32 units at offset 2023 (16 lo + 16 hi for the
+# multi-byte IMM route). ``layer8_sp_gathered_sentinel`` lands a single
+# SwiGLU unit at offset 2055 (the per-layer FFN width therefore is 2056).
+# ``format_position_counter`` is an opt-in alias: when
+# ``enable_conversational_io`` is set it overlays 16 units at offset 600,
+# overwriting a slice of the ALU's SUB lo nibble cluster -- a deliberate
+# legacy choice carried forward via ``allow_overlap=True``.
+#
+# Migration to :class:`FFNUnitAllocator` keeps every bake byte-identical
+# by pinning each sub-stage at the offset its helper already writes to.
+# The ALU sub-stage rows mirror the cursor walk inside
+# ``vm_step._set_layer8_alu`` exactly; the carry/borrow widths are the
+# number of ``(a, b)`` pairs that satisfy the helper's branch condition
+# (e.g. ``a + b >= 16`` gives 120). Changing any helper's unit count
+# requires updating this table in lock-step.
+#
+# Adding a new L8 FFN op family later goes through
+# ``allocator.alloc(name, n)`` without a pin and the allocator picks the
+# first free gap (today the only gap is past unit 2056).
+_L8_FFN_UNIT_LAYOUT = (
+    # ---- layer8_alu sub-stages (cursor walk in _set_layer8_alu) ----
+    # (sub-stage name, pinned start, n_units)
+    ("layer8_alu.add_lo",                0, 256),  # ADD lo nibble
+    ("layer8_alu.lea_lo",              256, 256),  # LEA lo nibble (FETCH_LO)
+    ("layer8_alu.sub_lo",              512, 256),  # SUB lo nibble
+    ("layer8_alu.add_carry",           768, 120),  # ADD carry (a+b >= 16)
+    ("layer8_alu.lea_carry",           888, 120),  # LEA carry (a+b >= 16)
+    ("layer8_alu.adj_lo",             1008, 256),  # ADJ lo nibble (FETCH_LO)
+    ("layer8_alu.adj_carry",          1264, 120),  # ADJ carry (a+b >= 16)
+    ("layer8_alu.sub_borrow",         1384, 120),  # SUB borrow (a < b)
+    ("layer8_alu.ent_lo",             1504, 256),  # ENT lo nibble (FETCH_LO)
+    ("layer8_alu.ent_borrow",         1760, 220),  # ENT borrow (full_sum cases)
+    ("layer8_alu.cmp_group",          1980,   1),  # CMP_GROUP flag
+    ("layer8_alu.cmp_clear",          1981,   4),  # CMP[0..3] clear at AX
+    ("layer8_alu.ent_adj_defaults",   1985,   2),  # ENT/ADJ first-step ALU defaults
+    ("layer8_alu.lev_byte0_lo",       1987,  16),  # LEV BP byte0 lo -> ADDR_B0_LO
+    ("layer8_alu.lev_byte0_hi",       2003,  16),  # LEV BP byte0 hi -> ADDR_B0_HI
+    ("layer8_alu.lev_b1",             2019,   1),  # LEV ADDR_B1_LO zero
+    ("layer8_alu.lev_b2",             2020,   1),  # LEV ADDR_B2_LO zero
+    ("layer8_alu.lea_axb2",           2021,   2),  # LEA first-step AX byte 2
+    # ---- standalone L8 FFN ops ----
+    ("layer8_multibyte_routing",      2023,  32),  # 16 lo + 16 hi IMM route
+    ("layer8_sp_gathered_sentinel",   2055,   1),  # MARK_SP SwiGLU sentinel
+)
+
+# format_position_counter is an opt-in alias that intentionally overwrites
+# a slice of layer8_alu.sub_lo (units 600..615). Tracked as a separate
+# entry because allocator pins must be declared with allow_overlap=True
+# and aliases should not consume free units. Only registered when the
+# conversational-io flag is set on bake.
+_L8_FFN_FORMAT_POS_COUNTER_PIN = 600
+_L8_FFN_FORMAT_POS_COUNTER_UNITS = 16
+
+
+def _allocate_layer8_ffn_units(
+    *, include_format_position_counter: bool = False
+) -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` for the L8 FFN.
+
+    Every FFN op family is pinned at its existing offset so the helpers
+    in ``vm_step._set_layer8_alu`` /
+    ``vm_step._set_layer8_multibyte_routing`` -- which write via their
+    own monotonic ``unit`` counters -- land on exactly the same hidden
+    units they always have. The allocator is bookkeeping rather than
+    persistent state: each bake instantiates a fresh one and stashes it
+    on ``block.ffn._l8_unit_allocator`` so downstream tooling can
+    inspect the layout.
+
+    ``include_format_position_counter`` adds the convo-io alias range
+    at unit 600 with ``allow_overlap=True``. Pass it only on bakes
+    where the conversational-io flag is set; otherwise the legacy
+    sub_lo cluster is left untouched.
+    """
+
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L8_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    if include_format_position_counter:
+        allocator.alloc(
+            "format_position_counter",
+            _L8_FFN_FORMAT_POS_COUNTER_UNITS,
+            pin=_L8_FFN_FORMAT_POS_COUNTER_PIN,
+            allow_overlap=True,
+        )
+    return allocator
+
+
+def _l8_ffn_range_start(allocator: FFNUnitAllocator, op_name: str) -> int:
+    """Return the pinned start unit for ``op_name`` in ``allocator``."""
+
+    for r in allocator.ranges():
+        if r.op_name == op_name:
+            return r.start
+    raise KeyError(f"L8 FFN allocator missing range {op_name!r}")
 
 
 def _band_projection_writes(slot_base: int, dim_base: int, weight: float = 1.0):
@@ -111,7 +216,29 @@ def make_layer8_alu_op() -> Operation:
     """
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer8_alu
-        _set_layer8_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
+
+        # Per-bake FFN-unit allocator. ``layer8_alu`` claims the whole
+        # 0..2023 cluster via its sub-stage rows; the helper's local
+        # ``unit = 0`` counter walks that range byte-identically. The
+        # allocator is the structured manifest of those offsets so a
+        # future op claiming a free L8 gap goes through
+        # ``allocator.alloc(...)`` instead of hand-picking another
+        # offset. Stash on ``block.ffn`` (mirrors the
+        # ``_l9_unit_allocator`` convention) so downstream tooling can
+        # inspect the layout.
+        allocator = _allocate_layer8_ffn_units()
+        block.ffn._l8_unit_allocator = allocator
+
+        n8 = _set_layer8_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
+        # Byte-identity guard: the helper's local cursor must end
+        # exactly where the next L8 FFN op (``layer8_multibyte_routing``)
+        # is pinned. If the helper's cursor drifts from the table the
+        # assertion fires before any weight surgery happens.
+        expected_end = _l8_ffn_range_start(allocator, "layer8_multibyte_routing")
+        assert n8 == expected_end, (
+            f"L8 ALU unit cursor drift: helper returned {n8}, allocator "
+            f"expected {expected_end}"
+        )
 
     return Operation(
         name="layer8_alu",
@@ -176,10 +303,21 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
     def bake(block, dim_positions, S):
         if not enable_conversational_io:
             return
+        # Per-bake allocator with the convo-io alias registered. The
+        # alias overlaps ``layer8_alu.sub_lo`` at unit 600 by design
+        # (the position-counter units intentionally overwrite that
+        # slice). ``allow_overlap=True`` makes the layout auditable
+        # without changing any baked weight.
+        allocator = _allocate_layer8_ffn_units(
+            include_format_position_counter=True
+        )
+        block.ffn._l8_unit_allocator = allocator
+        start_unit = _l8_ffn_range_start(allocator, "format_position_counter")
         _lower_format_position_counter_ir(
             block.ffn,
             S,
             _as_setdim_proxy(dim_positions),
+            start_unit=start_unit,
         )
 
     return Operation(
@@ -220,7 +358,9 @@ def _format_position_counter_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _lower_format_position_counter_ir(ffn, S: float, BD) -> int:
+def _lower_format_position_counter_ir(
+    ffn, S: float, BD, *, start_unit: int = _L8_FFN_FORMAT_POS_COUNTER_PIN
+) -> int:
     rules = _format_position_counter_rules(S)
     dim_positions = Primitives.dim_positions_from_bd(
         BD,
@@ -230,7 +370,7 @@ def _lower_format_position_counter_ir(ffn, S: float, BD) -> int:
         ffn,
         rules,
         dim_positions,
-        start_unit=600,
+        start_unit=start_unit,
         S=S,
     )
 
@@ -395,12 +535,26 @@ def make_layer8_multibyte_routing_op() -> Operation:
         from ...vm_step import _set_layer8_alu
 
         proxy = _as_setdim_proxy(dim_positions)
+        # Per-bake allocator. ``layer8_alu`` (phase 8.2) already ran
+        # and produced units 0..2022; the helper re-call below is the
+        # legacy idempotent overwrite that recovers the cursor. With
+        # the allocator in place the pinned offset 2023 is the source
+        # of truth -- the helper return is now a byte-identity guard.
+        allocator = _allocate_layer8_ffn_units()
+        block.ffn._l8_unit_allocator = allocator
         unit_start = _set_layer8_alu(block.ffn, S, proxy)
+        expected_start = _l8_ffn_range_start(
+            allocator, "layer8_multibyte_routing"
+        )
+        assert unit_start == expected_start, (
+            f"L8 multibyte_routing unit start drift: helper returned "
+            f"{unit_start}, allocator expected {expected_start}"
+        )
         lower_layer8_multibyte_routing_ir(
             block.ffn,
             S,
             proxy,
-            start_unit=unit_start,
+            start_unit=expected_start,
         )
 
     return Operation(
@@ -1283,6 +1437,23 @@ def make_layer8_sp_gathered_sentinel_op() -> Operation:
 
     def bake(block, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
+        # Per-bake allocator. The sentinel claims a single SwiGLU unit
+        # at the pinned offset 2055, immediately after the
+        # ``layer8_multibyte_routing`` cluster.
+        allocator = _allocate_layer8_ffn_units()
+        block.ffn._l8_unit_allocator = allocator
+        start_unit = _l8_ffn_range_start(
+            allocator, "layer8_sp_gathered_sentinel"
+        )
+        # Byte-identity guard: the pinned start must match the legacy
+        # constant. If the table ever drifts from
+        # ``_L8_SP_GATHERED_SENTINEL_UNIT`` the assertion fires before
+        # any weight surgery.
+        assert start_unit == _L8_SP_GATHERED_SENTINEL_UNIT, (
+            f"L8 SP-gathered sentinel pin drift: allocator returned "
+            f"{start_unit}, legacy constant is "
+            f"{_L8_SP_GATHERED_SENTINEL_UNIT}"
+        )
         rule = _layer8_sp_gathered_sentinel_rule(S)
         dim_names = Primitives.ffn_rule_dim_names((rule,))
         dim_map = Primitives.dim_positions_from_bd(proxy, dim_names)
@@ -1290,7 +1461,7 @@ def make_layer8_sp_gathered_sentinel_op() -> Operation:
             block.ffn,
             (rule,),
             dim_map,
-            start_unit=_L8_SP_GATHERED_SENTINEL_UNIT,
+            start_unit=start_unit,
             S=S,
         )
 
