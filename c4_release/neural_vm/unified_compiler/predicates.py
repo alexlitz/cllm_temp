@@ -1414,6 +1414,71 @@ def _format_conj(conj: frozenset[Atom]) -> str:
     return " AND ".join(sorted(str(a) for a in conj))
 
 
+# ---------------------------------------------------------------------------
+# Satisfiability and overlap
+# ---------------------------------------------------------------------------
+
+
+def atom_contradicts(a: Atom, b: Atom) -> bool:
+    """Return True iff atoms `a` and `b` cannot both hold at any position.
+
+    Implemented via subsumption against the negation of one operand:
+    a ⊥ b iff a ⊨ NOT b (or symmetrically b ⊨ NOT a). For cross-family
+    pairs (e.g., mark vs step_index), neither subsumption holds and the
+    function correctly returns False (independent dimensions).
+    """
+    if a == b:
+        return False
+    # Try a entails NOT b, then symmetric.
+    try:
+        neg_b = _negate_atom(b)
+    except TypeError:
+        neg_b = None
+    if neg_b is not None and atom_subsumes(a, neg_b):
+        return True
+    try:
+        neg_a = _negate_atom(a)
+    except TypeError:
+        neg_a = None
+    if neg_a is not None and atom_subsumes(b, neg_a):
+        return True
+    return False
+
+
+def _disjunct_satisfiable(conj: frozenset[Atom]) -> bool:
+    """A conjunction of atoms is satisfiable iff no pair contradicts."""
+    atoms = list(conj)
+    for i in range(len(atoms)):
+        for j in range(i + 1, len(atoms)):
+            if atom_contradicts(atoms[i], atoms[j]):
+                return False
+    return True
+
+
+def satisfiable(p: Predicate) -> bool:
+    """Decide if predicate p has any satisfying position.
+
+    Decidable structurally over our atom families: a conjunction is
+    unsatisfiable iff some pair of atoms contradicts (e.g., mark==SP
+    AND mark==AX); a disjunction is satisfiable iff any disjunct is.
+    """
+    p_dnf = dnf(p)
+    for disj in p_dnf:
+        if _disjunct_satisfiable(disj):
+            return True
+    return False
+
+
+def overlaps(p: Predicate, q: Predicate) -> bool:
+    """Decide if there exists any position satisfying BOTH p and q.
+
+    Equivalent to satisfiable(p AND q). Two scopes "overlap" iff there's
+    a position where both rules could fire — they compete for the output
+    at that position.
+    """
+    return satisfiable(And((p, q)))
+
+
 def explain_failure(p: Predicate, q: Predicate) -> Optional[str]:
     """Return None if p ⊨ q else a one-line explanation."""
     p_dnf = dnf(p)
