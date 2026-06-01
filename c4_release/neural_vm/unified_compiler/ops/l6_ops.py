@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..layer_compiler import Operation
 from ..ir import FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -79,6 +80,190 @@ L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2294
 L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2328
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 1668
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 1675
+
+
+# === L6 FFN unit layout (pinned offsets) ============================
+#
+# L6 is the widest FFN in the model: ``layer6_routing_ffn`` programs the
+# bulk of the band (per-opcode AX/FETCH -> OUTPUT relays, PSH stack
+# writeback, branch PC override families, the inline PSH STACK0 marker
+# rewrite block) while a handful of follow-up ops add focused fixups
+# (``layer6_ent_after_jsr_sp_byte0_fixup``) and SP arithmetic
+# (``binary_pop_sp_increment``). Right-sizing keeps 2328 units live
+# (per L6's ``ffn_units_used`` claim).
+#
+# Migration to :class:`FFNUnitAllocator` mirrors L9 (commit ca775eb):
+# each existing band is pinned at its historical offset so the IR
+# lowerers + ``vm_step._set_layer6_routing_ffn`` -- which still use
+# explicit unit cursors / ``L6_*_START_UNIT`` constants -- land on
+# byte-identical hidden-unit indices. The allocator declares ranges by
+# name; it is not the source of truth for the writes yet. Adding a new
+# L6 op family later can call ``allocator.alloc(name, n)`` without a
+# pin and the allocator will pick the first free gap.
+#
+# Bands tracked here include both the constant-named ranges and the
+# anonymous PSH STACK0 marker-only OUTPUT rewrite block written inline
+# by ``_bake_layer6_routing_ffn`` (units 1492..1588, 6 sub-loops of 16
+# units across {OUTPUT_LO, OUTPUT_HI}). The 2-unit gap at 1490..1492
+# matches the historical ``+ 2`` cursor bump and the 78-unit gap at
+# 1332..1410 / 1588..1668 / 1675..2294 reflects the right-sizing
+# breathing room the legacy layout left between sub-band families.
+_L6_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer6_routing_ffn.imm_fetch_route",
+        L6_IMM_FETCH_ROUTE_START_UNIT,
+        L6_IMM_FETCH_ROUTE_END_UNIT - L6_IMM_FETCH_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.imm_carry_refresh",
+        L6_IMM_CARRY_REFRESH_START_UNIT,
+        L6_IMM_CARRY_REFRESH_END_UNIT - L6_IMM_CARRY_REFRESH_START_UNIT),
+    ("layer6_routing_ffn.exit_ax_route",
+        L6_EXIT_AX_ROUTE_START_UNIT,
+        L6_EXIT_AX_ROUTE_END_UNIT - L6_EXIT_AX_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.nop_ax_route",
+        L6_NOP_AX_ROUTE_START_UNIT,
+        L6_NOP_AX_ROUTE_END_UNIT - L6_NOP_AX_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.jsr_ax_route",
+        L6_JSR_AX_ROUTE_START_UNIT,
+        L6_JSR_AX_ROUTE_END_UNIT - L6_JSR_AX_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.jmp_ax_route",
+        L6_JMP_AX_ROUTE_START_UNIT,
+        L6_JMP_AX_ROUTE_END_UNIT - L6_JMP_AX_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.delayed_jmp_pc_override",
+        L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
+        L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT
+        - L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT),
+    ("layer6_routing_ffn.first_step_jmp_pc_override",
+        L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT,
+        L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT
+        - L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT),
+    ("layer6_routing_ffn.all_step_jmp_pc_override",
+        L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
+        L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT
+        - L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT),
+    ("layer6_routing_ffn.halt_detect",
+        L6_HALT_DETECT_START_UNIT,
+        L6_HALT_DETECT_END_UNIT - L6_HALT_DETECT_START_UNIT),
+    ("layer6_routing_ffn.temp_cleanup",
+        L6_TEMP_CLEANUP_START_UNIT,
+        L6_TEMP_CLEANUP_END_UNIT - L6_TEMP_CLEANUP_START_UNIT),
+    ("layer6_routing_ffn.cmp3_cleanup",
+        L6_CMP3_CLEANUP_START_UNIT,
+        L6_CMP3_CLEANUP_END_UNIT - L6_CMP3_CLEANUP_START_UNIT),
+    ("layer6_routing_ffn.stack_identity",
+        L6_STACK_IDENTITY_START_UNIT,
+        L6_STACK_IDENTITY_END_UNIT - L6_STACK_IDENTITY_START_UNIT),
+    ("layer6_routing_ffn.psh_sp_decrement",
+        L6_PSH_SP_DECREMENT_START_UNIT,
+        L6_PSH_SP_DECREMENT_END_UNIT - L6_PSH_SP_DECREMENT_START_UNIT),
+    ("layer6_routing_ffn.jsr_sp_decrement",
+        L6_JSR_SP_DECREMENT_START_UNIT,
+        L6_JSR_SP_DECREMENT_END_UNIT - L6_JSR_SP_DECREMENT_START_UNIT),
+    ("layer6_routing_ffn.jsr_sp_fixup",
+        L6_JSR_SP_FIXUP_START_UNIT,
+        L6_JSR_SP_FIXUP_END_UNIT - L6_JSR_SP_FIXUP_START_UNIT),
+    ("layer6_routing_ffn.jsr_sp_bytes",
+        L6_JSR_SP_BYTES_START_UNIT,
+        L6_JSR_SP_BYTES_END_UNIT - L6_JSR_SP_BYTES_START_UNIT),
+    ("layer6_routing_ffn.psh_stack0_writeback",
+        L6_PSH_STACK0_WRITEBACK_START_UNIT,
+        L6_PSH_STACK0_WRITEBACK_END_UNIT
+        - L6_PSH_STACK0_WRITEBACK_START_UNIT),
+    ("layer6_routing_ffn.getchar_ax_route",
+        L6_GETCHAR_AX_ROUTE_START_UNIT,
+        L6_GETCHAR_AX_ROUTE_END_UNIT - L6_GETCHAR_AX_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.bz_ax_route",
+        L6_BZ_AX_ROUTE_START_UNIT,
+        L6_BZ_AX_ROUTE_END_UNIT - L6_BZ_AX_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.bnz_ax_route",
+        L6_BNZ_AX_ROUTE_START_UNIT,
+        L6_BNZ_AX_ROUTE_END_UNIT - L6_BNZ_AX_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.psh_ax_route",
+        L6_PSH_AX_ROUTE_START_UNIT,
+        L6_PSH_AX_ROUTE_END_UNIT - L6_PSH_AX_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.adj_ax_route",
+        L6_ADJ_AX_ROUTE_START_UNIT,
+        L6_ADJ_AX_ROUTE_END_UNIT - L6_ADJ_AX_ROUTE_START_UNIT),
+    ("layer6_routing_ffn.adj_sp_writeback",
+        L6_ADJ_SP_WRITEBACK_START_UNIT,
+        L6_ADJ_SP_WRITEBACK_END_UNIT - L6_ADJ_SP_WRITEBACK_START_UNIT),
+    ("layer6_routing_ffn.ent_sp_writeback",
+        L6_ENT_SP_WRITEBACK_START_UNIT,
+        L6_ENT_SP_WRITEBACK_END_UNIT - L6_ENT_SP_WRITEBACK_START_UNIT),
+    ("layer6_routing_ffn.ent_first_step_sp_byte0",
+        L6_ENT_FIRST_STEP_SP_BYTE0_START_UNIT,
+        L6_ENT_FIRST_STEP_SP_BYTE0_END_UNIT
+        - L6_ENT_FIRST_STEP_SP_BYTE0_START_UNIT),
+    ("layer6_routing_ffn.ent_first_step_sp_bytes",
+        L6_ENT_FIRST_STEP_SP_BYTES_START_UNIT,
+        L6_ENT_FIRST_STEP_SP_BYTES_END_UNIT
+        - L6_ENT_FIRST_STEP_SP_BYTES_START_UNIT),
+    ("layer6_routing_ffn.bz_pc_override",
+        L6_BZ_PC_OVERRIDE_START_UNIT,
+        L6_BZ_PC_OVERRIDE_END_UNIT - L6_BZ_PC_OVERRIDE_START_UNIT),
+    ("layer6_routing_ffn.bnz_pc_override",
+        L6_BNZ_PC_OVERRIDE_START_UNIT,
+        L6_BNZ_PC_OVERRIDE_END_UNIT - L6_BNZ_PC_OVERRIDE_START_UNIT),
+    ("layer6_routing_ffn.opcode_contamination_cleanup",
+        L6_OPCODE_CONTAMINATION_CLEANUP_START_UNIT,
+        L6_OPCODE_CONTAMINATION_CLEANUP_END_UNIT
+        - L6_OPCODE_CONTAMINATION_CLEANUP_START_UNIT),
+    ("layer6_routing_ffn.mem_leakage_cleanup",
+        L6_MEM_LEAKAGE_CLEANUP_START_UNIT,
+        L6_MEM_LEAKAGE_CLEANUP_END_UNIT
+        - L6_MEM_LEAKAGE_CLEANUP_START_UNIT),
+    ("layer6_routing_ffn.alu_clear",
+        L6_ALU_CLEAR_START_UNIT,
+        L6_ALU_CLEAR_END_UNIT - L6_ALU_CLEAR_START_UNIT),
+    ("layer6_routing_ffn.branch_pc_byte1_override",
+        L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
+        L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT
+        - L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT),
+    ("layer6_routing_ffn.all_step_jsr_pc_override",
+        L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT,
+        L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT
+        - L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT),
+    # Anonymous inline band: PSH STACK0 marker-only OUTPUT rewrite written
+    # by ``_bake_layer6_routing_ffn`` immediately after
+    # ALL_STEP_JSR_PC_OVERRIDE (+ a 2-unit historical cursor gap). The
+    # block reprograms STACK0's OUTPUT_LO / OUTPUT_HI from the relayed
+    # ALU value for strict-neural PSH; structure is 2 outer x 3 inner x
+    # 16 units = 96 units total.
+    ("layer6_routing_ffn.psh_stack0_marker_override",
+        L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT + 2,
+        96),
+    ("layer6_ent_after_jsr_sp_byte0_fixup",
+        L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT,
+        L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT
+        - L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT),
+    ("binary_pop_sp_increment",
+        L6_BINARY_POP_SP_INCREMENT_START_UNIT,
+        L6_BINARY_POP_SP_INCREMENT_END_UNIT
+        - L6_BINARY_POP_SP_INCREMENT_START_UNIT),
+)
+
+
+def _allocate_layer6_ffn_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with every L6 FFN band.
+
+    Each band is pinned at its historical ``L6_*_START_UNIT`` offset so
+    the underlying writes -- ``vm_step._set_layer6_routing_ffn``, the
+    IR lowerers, the inline PSH STACK0 marker-override block, and the
+    follow-up ops ``layer6_ent_after_jsr_sp_byte0_fixup`` /
+    ``binary_pop_sp_increment`` -- land on byte-identical hidden-unit
+    indices. This is byte-identical bookkeeping: the allocator declares
+    ranges by name, the helpers still own the writes. A future refactor
+    can split the monolithic routing-FFN bake into per-band bake
+    functions that consume ``allocator.alloc(...)`` directly.
+
+    Each bake gets its own allocator instance via this helper so the
+    layout snapshot stashed on ``block.ffn._l6_unit_allocator`` reflects
+    every L6 owner -- not just the one currently writing -- making the
+    map auditable from any phase.
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L6_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
 
 
 def _clear_ffn_unit_band(ffn, start: int, end: int) -> None:
@@ -2170,6 +2355,17 @@ def make_layer6_routing_ffn_op() -> Operation:
     the same precedent as model_ops' ``head_bake`` and ``opcode_relay_head``.
     """
     def bake(block, dim_positions, S):
+        # Per-bake FFN-unit allocator. Every L6 FFN band is pinned to its
+        # historical offset so ``_bake_layer6_routing_ffn`` -- which still
+        # drives writes via the ``L6_*_START_UNIT`` constants and the
+        # inline PSH STACK0 marker cursor -- lands byte-identically. The
+        # allocator is byte-identical bookkeeping (no writes go through
+        # it yet); stashing it on ``block.ffn`` exposes the L6 layout to
+        # follow-up ops and tooling. Sibling L6 bakes
+        # (``layer6_ent_after_jsr_sp_byte0_fixup``,
+        # ``binary_pop_sp_increment``) install the same layout snapshot
+        # so any phase can introspect the full map.
+        block.ffn._l6_unit_allocator = _allocate_layer6_ffn_units()
         _bake_layer6_routing_ffn(
             block.ffn,
             S,
@@ -2212,6 +2408,17 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
     """L6 FFN: correct ENT's SP byte 0 after the preceding JSR stack push."""
 
     def bake(block, dim_positions, S):
+        # Per-bake FFN-unit allocator. Reinstalled here even though
+        # ``layer6_routing_ffn`` (phase 6.5) installs an identical
+        # snapshot first: this guards against future schedules that run
+        # this op standalone. Byte-identity guard below pins the lowerer
+        # against the allocator's declared end-of-range.
+        allocator = _allocate_layer6_ffn_units()
+        block.ffn._l6_unit_allocator = allocator
+        fixup_range = next(
+            r for r in allocator.ranges()
+            if r.op_name == "layer6_ent_after_jsr_sp_byte0_fixup"
+        )
         end = _lower_layer6_ent_after_jsr_sp_byte0_fixup_ir(
             block.ffn,
             S,
@@ -2222,6 +2429,13 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
                 "L6 ENT-after-JSR SP byte0 fixup lowered to unexpected unit "
                 f"{end}; expected {L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT}"
             )
+        # Byte-identity guard: allocator-declared end must match the IR
+        # lowerer's actual cursor. Drift here means the layout table got
+        # out of sync with the rules.
+        assert end == fixup_range.end, (
+            f"L6 ENT-after-JSR allocator drift: lowerer ended at {end}, "
+            f"allocator expected {fixup_range.end}"
+        )
 
     # Dim-ownership claims. ``_layer6_ent_after_jsr_sp_byte0_fixup_rules``
     # lowers seven FFNRules into units 1668..1674 (one per rule). Each rule
@@ -3027,7 +3241,15 @@ def make_binary_pop_sp_increment_op() -> Operation:
     """
     def bake(model, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
-        _lower_layer6_binary_pop_sp_increment_ir(model.blocks[6].ffn, S, proxy)
+        ffn = model.blocks[6].ffn
+        # Per-bake FFN-unit allocator (model-level op -- resolves the L6
+        # FFN via the model handle since this op runs in the model phase
+        # band, see docstring). Installed so this op's downstream
+        # consumers can introspect the L6 layout from a model-level
+        # phase too, mirroring the block-level installs done by
+        # ``layer6_routing_ffn`` and ``layer6_ent_after_jsr_sp_byte0_fixup``.
+        ffn._l6_unit_allocator = _allocate_layer6_ffn_units()
+        _lower_layer6_binary_pop_sp_increment_ir(ffn, S, proxy)
 
     # Dim-ownership claims. ``_layer6_binary_pop_sp_increment_rules`` lowers
     # 34 FFNRules into units 2294..2327 of the L6 FFN:
