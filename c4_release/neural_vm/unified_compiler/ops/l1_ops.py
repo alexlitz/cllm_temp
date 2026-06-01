@@ -210,6 +210,15 @@ def make_layer1_threshold_attn_op() -> Operation:
         compiler_ir_factory=_layer1_threshold_ir,
         migrated=True,
         claims=_claims,
+        # B12 backfill (wave 1b): pin strictly after L0's threshold-attn
+        # block. Both L0 and L1 read IS_MARK from an earlier marker bake
+        # (neither writes it), so the dep DAG cannot derive the structural
+        # L0->L1 transformer-block ordering on its own. B12 manual-judgment
+        # audit confirmed L0 writes {H0..H7} and reads {IS_MARK, CONST} —
+        # there is no missing IS_MARK write to add on L0; the predecessor
+        # gap is a true structural pin, not a declaration bug.
+        # See docs/B12_BACKFILL_SPEC.md §27.
+        requires={"after": "layer0_threshold_attn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
