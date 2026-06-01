@@ -218,7 +218,7 @@ def test_layer3_initial_sp_marker_rewrite_emits_f8_without_touching_bp():
     assert before[_SetDim.OUTPUT_HI + 0] > 0.9
 
     rewritten = _rewrite_layer3_initial_sp_marker_to_f8(
-        ffn, 100.0, _SetDim
+        ffn, 100.0, _SetDim, jsr_prologue=True
     )
     after = _apply_stub_ffn(ffn, sp)[0, 0]
 
@@ -234,6 +234,37 @@ def test_layer3_initial_sp_marker_rewrite_emits_f8_without_touching_bp():
 
     assert bp_after[_SetDim.OUTPUT_LO + 0] > 0.9
     assert bp_after[_SetDim.OUTPUT_HI + 0] > 0.9
+
+
+def test_layer3_initial_sp_marker_rewrite_is_noop_without_jsr_prologue_opt_in():
+    """Without ``jsr_prologue=True``, the rewrite must not touch SP_byte0.
+
+    compile_c('int main() {...}') produces flat IMM-first bytecode with no
+    JSR prologue → real SP byte 0 = 0x00 (== L3 default). Forcing 0xf8 there
+    silently corrupts MUL/DIV/anything needing stack storage. The rewrite
+    must therefore require explicit opt-in from callers that know the
+    program starts with a ``JSR; ENT N`` prologue.
+    """
+    ffn = _StubFFN(hidden_dim=200)
+    _set_layer3_ffn(ffn, 100.0, _SetDim)
+
+    sp = torch.zeros(1, 1, 512)
+    sp[..., _SetDim.MARK_SP] = 1.0
+
+    before = _apply_stub_ffn(ffn, sp)[0, 0]
+    assert before[_SetDim.OUTPUT_LO + 0] > 0.9
+    assert before[_SetDim.OUTPUT_HI + 0] > 0.9
+
+    rewritten = _rewrite_layer3_initial_sp_marker_to_f8(
+        ffn, 100.0, _SetDim
+    )
+    after = _apply_stub_ffn(ffn, sp)[0, 0]
+
+    assert rewritten == 0
+    assert after[_SetDim.OUTPUT_LO + 0] > 0.9
+    assert after[_SetDim.OUTPUT_HI + 0] > 0.9
+    assert abs(float(after[_SetDim.OUTPUT_LO + 8])) < 1e-12
+    assert abs(float(after[_SetDim.OUTPUT_HI + 15])) < 1e-12
 
 
 def test_layer3_bake_leaves_initial_sp_rewrites_out_of_l3():
