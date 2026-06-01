@@ -102,7 +102,13 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
     return Operation(
         name="layer11_mul_partial",
         phase=11,
-        reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
+        # ``_set_layer11_mul_partial`` reads ALU_LO[a_lo], AX_CARRY_LO[b_lo],
+        # AX_CARRY_HI[b_hi], MARK_AX, gates on OP_MUL, writes TEMP[partial].
+        # It does NOT read ALU_HI -- that's L12's job (``a_hi`` lookup).
+        # Declaring a phantom ALU_HI read here understates L11's true producer
+        # role and inflates ALU_HI's apparent in-step consumer count, which
+        # makes the staleness analyzer harder to interpret. Removed.
+        reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
         writes={"TEMP"},
         kind="block",
         bake_fn=bake,
@@ -111,14 +117,16 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         layer_idx=11,
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G): the L11 MUL partial unit
-        # consumes ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) at
-        # the AX marker for OP_MUL. Both must be the *current* step's fresh
-        # values to produce the correct partial product. The lookup bake
-        # stages the partial in TEMP[0..15] (not MUL_ACCUM/FETCH_LO), and L12
-        # consumes that fresh same-step TEMP value.
+        # consumes ALU_LO (operand A low nibble) and AX_CARRY_LO/HI (operand B
+        # nibbles) at the AX marker for OP_MUL. All must be the *current*
+        # step's fresh values to produce the correct partial product. The
+        # lookup bake stages the partial in TEMP[0..15] (not
+        # MUL_ACCUM/FETCH_LO), and L12 consumes that fresh same-step TEMP
+        # value plus its own fresh ALU_HI / AX_CARRY_LO lookup. ALU_HI is NOT
+        # consumed here -- the L11 helper writes ``a_hi``-independent
+        # ``partial = (carry + a_lo * b_hi) % 16`` entries.
         consumes_fresh={
             "ALU_LO": "AX_byte0",
-            "ALU_HI": "AX_byte0",
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         } if alu_mode == "lookup" else {},
