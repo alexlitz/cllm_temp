@@ -305,9 +305,13 @@ def _layer10_sp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
     marker_s = 300.0
     # Marker carry-forward for SP byte 0 on step 1+. The byte-chain above
     # handles SP byte positions; the marker itself needs to copy the previous
-    # step's SP byte 0 unless the current op is actively rewriting SP (PSH or
-    # JSR). JSR is relayed to SP as CMP[4]/OP_JSR by L6; without this blocker
-    # the marker carry-forward re-copies the old SP byte after L6 decrements it.
+    # step's SP byte 0 unless the current op is actively rewriting SP (PSH,
+    # JSR, ENT, or POP/LEV/ADJ). L6 relays these as CMP[0]/CMP[2]/CMP[3]/CMP[4]
+    # to the SP marker; without these blockers the marker carry-forward
+    # re-copies the stale pre-op SP byte after L6 has applied the SP delta.
+    # CMP[2]=ENT was previously missing, causing func_identity_* and other
+    # post-ENT programs to emit step1:SP_byte0 = stale 0xf8 (pre-JSR target)
+    # or 0xff (pre-bootstrap) instead of the ENT-adjusted 0xf0/0xe0.
     return DeclarativeAttentionHeadSpec(
         head_idx=spec.head_idx,
         q=spec.q + (
@@ -317,6 +321,8 @@ def _layer10_sp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             AP(34, BD.CMP + 4, -2.0 * marker_s),
             AP(34, BD.OP_JSR, -2.0 * marker_s),
             AP(34, BD.CMP + 3, -2.0 * marker_s),
+            AP(34, BD.CMP + 2, -2.0 * marker_s),
+            AP(34, BD.OP_ENT, -2.0 * marker_s),
             AP(34, BD.CONST, -marker_s),
             AP(35, BD.MARK_SP, marker_s),
             AP(35, BD.HAS_SE, marker_s),
@@ -324,6 +330,8 @@ def _layer10_sp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             AP(35, BD.CMP + 4, -2.0 * marker_s),
             AP(35, BD.OP_JSR, -2.0 * marker_s),
             AP(35, BD.CMP + 3, -2.0 * marker_s),
+            AP(35, BD.CMP + 2, -2.0 * marker_s),
+            AP(35, BD.OP_ENT, -2.0 * marker_s),
             AP(35, BD.CONST, -marker_s),
         ),
         k=spec.k + (
@@ -1006,6 +1014,7 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         name="layer10_sp_byte_passthrough_bake",
         phase=10.2,
         reads={"IS_BYTE", "HAS_SE", "H1", "PSH_AT_SP", "CMP",
+               "OP_ENT", "OP_JSR",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
