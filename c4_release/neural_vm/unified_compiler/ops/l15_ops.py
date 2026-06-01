@@ -399,8 +399,47 @@ def _layer15_si_mem_addr0_from_stack0_ir(dim_positions, HD) -> CompilerIR:
     del HD
     proxy = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
+    # NOTE(L15-si-mem-addr0-scope-honest): the head's INTENDED firing scope is
+    # the SI/SC MEM-address token (mark == MEM AND mem_store AND NOT psh)
+    # at the q position, with the key drawn from the pre-store STACK0 byte 0.
+    # The K projection's positive dims are CONST and STACK0_BYTE0, so the V1
+    # attention verifier's K-derived effective_attention_scope is
+    # ("CONST", "STACK0_BYTE0") -- this is over-approximate (it ignores the Q
+    # MEM_STORE/MEM_ADDR_SRC opcode gating) but is the best the V1 scope
+    # heuristic can express without modelling Q-side conditioning.
+    #
+    # Declaring scope/dominates_at here is purely informational under V1:
+    # ``verify_attention_head`` does NOT currently filter FFN-side
+    # cross-modality competitors by scope overlap (see attention_verifier.py
+    # V2 wishlist), so the declared scope cannot suppress the 32 CSV
+    # violations head 13 surfaces against tail_mem_store_addr1_ff_*,
+    # tail_bp_byte2_preserve_01, tail_sp_pop_marker_output_d8_to_e0, etc.
+    # Those tail rules are gated to entirely different opcode/marker
+    # combinations (mark == SP for the pop-marker family, MEM-store address
+    # finalization at byte_index == 1 for the addr1_ff family), so a
+    # scope-aware V2 verifier would rule them out as bookkeeping
+    # competitors only.
+    #
+    # We do NOT bump the head's magnitude (slot 0 cleanup -10, slot 1+idx
+    # copy +20 -> magnitude 30): bumping to dominate the 112-tier addr1_ff
+    # competitors would require ~4x larger O/V weights, which scales the
+    # actual residual delta proportionally and would over-write the SI/SC
+    # MEM addr0 byte by the same factor (breaking the L13 mem-addr gather
+    # downstream calibration).  The attention_strength_violation against
+    # layer15_alu_high_byte_relay (head 8) is structurally zero-sum: head 8
+    # also writes OUTPUT_LO/HI with magnitude 20 over a non-overlapping
+    # opcode gate (MARK_AX/OP_MUL/OP_SHL vs MARK_MEM/MEM_STORE here), and
+    # any magnitude swap between the two heads just relocates the
+    # violation between them under the V1 sign-blind, scope-blind algebra.
     ir.layer(0).attention.append(
-        _layer15_si_mem_addr0_from_stack0_spec(proxy)
+        _layer15_si_mem_addr0_from_stack0_spec(proxy),
+        metadata={
+            "scope": "mark == MEM AND mem_store",
+            "dominates_at": {
+                "OUTPUT_LO": "mark == MEM AND mem_store",
+                "OUTPUT_HI": "mark == MEM AND mem_store",
+            },
+        },
     )
     return ir
 
