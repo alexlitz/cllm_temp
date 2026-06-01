@@ -153,6 +153,89 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_HI+{k}", write_scale),),
         ))
 
+    # LEV restores the caller's AX from the saved value on STACK0. By step 6
+    # post-LEV the L8 AX-carry shadow at MARK_AX holds the popped return value
+    # (parallel L6 backfill ensures the carry is populated from the freed STACK0
+    # slot). Without a declarative materializer the OUTPUT byte at the AX
+    # position defaults to zero, corrupting the post-LEV return register --
+    # this is the step6:AX_byte0 91-row cluster identified by the 2026-06-01
+    # stack/JSR/LEV triage. Mirror the OP_IMM/OP_SI/OP_SC AX-carry
+    # materializers above (l16_stale_imm_ax_carry_* / l16_store_ax_carry_*),
+    # but key on OP_LEV so the SP/PC LEV-routing rules above (which cancel at
+    # MARK_SP / MARK_PC and do not touch MARK_AX) remain orthogonal.
+    lev_ax_carry_conditions = (
+        ("OP_LEV", 1.0),
+        ("MARK_AX", 1.0),
+        ("MARK_PC", -8.0),
+        ("MARK_SP", -8.0),
+        ("MARK_BP", -8.0),
+        ("MARK_STACK0", -8.0),
+        ("MARK_MEM", -8.0),
+        ("IS_BYTE", -10.0),
+        ("OP_EXIT", -20.0),
+        ("OP_JMP", -20.0),
+    )
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_lev_ax_carry_lo_{k}",
+            conditions=lev_ax_carry_conditions,
+            threshold=1.5,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_lev_ax_carry_hi_{k}",
+            conditions=lev_ax_carry_conditions,
+            threshold=1.5,
+            gate=f"AX_CARRY_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", 2.0 / S),),
+        ))
+
+    # Companion preservation: the same triage row sees step6:STACK0_byte0
+    # corruption (50-row cluster) because no LEV-aware rule keeps the freed
+    # stack-top byte from being overwritten by the generic STACK0 materializer
+    # family (stack0_e0/e8/f8_marker_from_alu_*) which the LEV-routing op gates
+    # off via OP_LEV blockers. After LEV pops the saved AX, the visible STACK0
+    # byte at the byte-0 row should remain the just-popped value rather than
+    # collapsing back to zero. Gate the preservation on the existing OUTPUT
+    # nibble so we only reinforce what L14/L15 already staged; the rule is
+    # silent on the default-zero row.
+    lev_stack0_preserve_conditions = (
+        ("OP_LEV", 1.0),
+        ("MARK_STACK0", 1.0),
+        ("HAS_SE", 1.0),
+        ("BYTE_INDEX_0", 1.0),
+        ("MARK_PC", -8.0),
+        ("MARK_AX", -8.0),
+        ("MARK_SP", -8.0),
+        ("MARK_BP", -8.0),
+        ("MARK_MEM", -8.0),
+        ("IS_BYTE", -10.0),
+        ("MEM_STORE", -10.0),
+    )
+    # Use nudge-strength (50/S) to match the sibling stack0_e0/e8/f8 marker
+    # materializer families; this is enough to overcome the residual
+    # zero-default but not so strong that we clobber legitimate L14/L15
+    # store writes (which carry MEM_STORE and are excluded above).
+    lev_stack0_preserve_strength = 50.0 / S
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_lev_stack0_byte0_preserve_lo_{k}",
+            conditions=lev_stack0_preserve_conditions,
+            threshold=4.5,
+            gate=f"OUTPUT_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", lev_stack0_preserve_strength),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_lev_stack0_byte0_preserve_hi_{k}",
+            conditions=lev_stack0_preserve_conditions,
+            threshold=4.5,
+            gate=f"OUTPUT_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", lev_stack0_preserve_strength),),
+        ))
+
     byte_zero_base = (
         ("OP_LEV", 0.5),
         ("MARK_PC", -1.5),
@@ -1517,7 +1600,14 @@ def make_layer16_lev_routing_op() -> Operation:
         # STACK0 output authority guards, plus one e0/e8 STACK0 exactness
         # guard, plus 32 generic e0 STACK0 marker ALU materializers (16 LO + 16
         # HI) for non-store preserve at SP=0xffe0.
-        ffn_units_used=728,
+        # Plus 32 LEV AX-carry materializers (l16_lev_ax_carry_lo/hi_{k}) that
+        # restore the popped return value into OUTPUT at MARK_AX during OP_LEV
+        # (fixes step6:AX_byte0 91-row cluster, 2026-06-01 stack/JSR/LEV
+        # triage) and 32 LEV STACK0 byte-0 preservation units
+        # (l16_lev_stack0_byte0_preserve_lo/hi_{k}) that keep the just-popped
+        # stack-top byte stable through LEV (fixes step6:STACK0_byte0 50-row
+        # cluster from the same triage).
+        ffn_units_used=792,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
