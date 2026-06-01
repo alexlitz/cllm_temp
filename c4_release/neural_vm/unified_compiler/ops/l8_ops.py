@@ -1318,6 +1318,16 @@ def make_layer8_sp_gathered_sentinel_op() -> Operation:
         # so the staleness scanner sees the producer when downstream
         # consumers (L10 tail rules) declare ``consumes_fresh``.
         produces={"SP_GATHERED_THIS_STEP": "SP_marker"},
+        # B12 backfill (wave 1c): the docstring lists six L8 ops this
+        # sentinel must run after (phases 8.0..8.5). The last L8 writer
+        # to MARK_SP-adjacent dims is layer8_multibyte_routing, so pin
+        # strictly after it; same_layer_as layer8_alu keeps the op on
+        # L8 even if the dynamic scheduler tries to float it later.
+        # See docs/B12_BACKFILL_SPEC.md §11.
+        requires={
+            "after": "layer8_multibyte_routing",
+            "same_layer_as": "layer8_alu",
+        },
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
