@@ -149,3 +149,37 @@ def test_e5_class_strength_violation(reg):
     # Override at LO+15 vs no-one at LO+15 → passes
     sv = [i for i in issues if i['kind'] == 'strength_violation']
     assert sv == [], f"unexpected violations: {sv}"
+
+
+def test_cross_op_competition(reg):
+    """Rule in op1 competes against rule in op2 -- should flag if op2's
+    rule is stronger and overlaps op1's dominance scope."""
+    weak = FFNRule.constant_write(
+        conditions=(("MARK_SP", 20.0),),
+        threshold=10.0,
+        writes=(("OUT_LO+0", 1.0),),
+        name="weak_in_op1",
+        scope="mark == SP",
+        dominates_at={"OUT_LO": "mark == SP"},
+    )
+    strong = FFNRule.constant_write(
+        conditions=(("MARK_SP", 1000.0),),
+        threshold=10.0,
+        writes=(("OUT_LO+0", 1.0),),
+        name="strong_in_op2",
+        scope="mark == SP",
+    )
+    op1 = _FakeOp("op1", [weak])
+    op2 = _FakeOp("op2", [strong])
+
+    # Solo verification -- weak passes (no in-op competitors)
+    issues = verify_rule_strength(op1, reg)
+    sv = [i for i in issues if i['kind'] == 'strength_violation']
+    assert sv == [], "expected no violations in solo verification"
+
+    # Cross-op verification -- weak should be flagged
+    issues = verify_rule_strength(op1, reg, ops_for_competition=[op2])
+    sv = [i for i in issues if i['kind'] == 'strength_violation']
+    assert len(sv) == 1
+    assert sv[0]['rule'] == 'weak_in_op1'
+    assert sv[0]['top_competitor'] == 'strong_in_op2'

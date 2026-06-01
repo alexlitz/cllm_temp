@@ -3793,6 +3793,7 @@ def verify_rule_strength(
     op,
     registry,
     *,
+    ops_for_competition=None,   # NEW: list of additional ops to build writer index from
     backbone_bounds=None,   # optional BackboneBounds (from S-8) or callable
     margin: float = 1.0,
     require_dominates: bool = False,
@@ -3807,9 +3808,11 @@ def verify_rule_strength(
       'overlapping_writers_not_resolved' -- multiple rules claim dominance
                                             at the same position class
 
-    Caller should pass `ops_for_competition` if they want competition
-    computed against more ops than just the one being verified -- for now
-    we only consider competing rules in `op` itself.
+    ops_for_competition: optional list of other ops to include in the
+    writer index. Use this to detect cross-layer/cross-op strength
+    competition (e.g. an L16 override rule competing against an L15
+    attention writer, or an L10 tail rule competing against an L16
+    materializer). If None, only ``op`` is used (V1 behavior).
     """
     from neural_vm.unified_compiler.writer_index import build_writer_index
     from neural_vm.unified_compiler.contribution_algebra import max_contribution
@@ -3818,10 +3821,13 @@ def verify_rule_strength(
 
     issues: List[Dict] = []
 
-    # Build the writer index from this op alone (V1 -- single-op scope).
-    # Later versions can take ops_for_competition= for cross-op
-    # comparison.
-    index = build_writer_index([op], registry)
+    # Build the writer index from this op plus any additional ops the
+    # caller asked us to include. Default (no ops_for_competition) keeps
+    # V1 single-op behavior.
+    all_ops = [op]
+    if ops_for_competition:
+        all_ops.extend(ops_for_competition)
+    index = build_writer_index(all_ops, registry)
 
     rules = _collect_ffn_rules_from_op(op)
 
@@ -3916,8 +3922,9 @@ def verify_rule_strength(
 
 def _collect_ffn_rules_from_op(op) -> List:
     """Walk an Operation to find its FFNRules. Operations expose rules
-    via ``.compiler_ir`` which can be an FFNOp, a list, or other shapes.
-    Handles the common cases; returns ``[]`` for ops without FFN rules."""
+    via ``.compiler_ir`` which can be an FFNOp, a CompilerIR with
+    ``.layers[].ffn``, a list, or other shapes. Handles the common
+    cases; returns ``[]`` for ops without FFN rules."""
     from neural_vm.unified_compiler.ir import FFNRule, FFNOp
 
     ir = getattr(op, "compiler_ir", None)
@@ -3925,6 +3932,14 @@ def _collect_ffn_rules_from_op(op) -> List:
         return []
 
     rules: List = []
+    # CompilerIR with .layers[].ffn (must come before generic .rules
+    # check; CompilerIR has neither ``.rules`` nor is it an ``FFNOp``).
+    if hasattr(ir, "layers"):
+        for layer in ir.layers:
+            ffn = getattr(layer, "ffn", None)
+            if ffn is not None and hasattr(ffn, "rules"):
+                rules.extend(ffn.rules)
+        return rules
     # FFNOp case
     if isinstance(ir, FFNOp):
         return list(ir.rules)
@@ -3948,3 +3963,67 @@ def _collect_ffn_rules_from_op(op) -> List:
     if hasattr(ir, "rules"):
         return [r for r in ir.rules if isinstance(r, FFNRule)]
     return []
+
+
+def collect_all_authored_ops() -> list:
+    """Return a list of instantiated authored ops that carry FFNRules.
+
+    Useful for cross-op :func:`verify_rule_strength` -- pass the result
+    (minus the op being verified) as ``ops_for_competition`` to expose
+    cross-layer contests (e.g. L16 override vs L15 attention writer; L10
+    tail rule vs L16 materializer).
+
+    Hand-curated to keep the cost predictable. Add factories here as
+    they get scoped / ``dominates_at``'d; missing imports / instantiation
+    errors are tolerated so partial environments still work.
+    """
+    factories = []
+
+    # L10 -- biggest, most rule-dense
+    try:
+        from neural_vm.unified_compiler.ops.l10_ops import (
+            make_tail_bit32_result_correction_op,
+        )
+        factories.append(make_tail_bit32_result_correction_op)
+    except ImportError:
+        pass
+
+    # L16 -- STACK0 materializers + LEV routing
+    try:
+        from neural_vm.unified_compiler.ops.l16_ops import (
+            make_layer16_lev_routing_op,
+        )
+        factories.append(make_layer16_lev_routing_op)
+    except ImportError:
+        pass
+
+    # L15 -- nibble copy (suspected attention writer source)
+    try:
+        from neural_vm.unified_compiler.ops.l15_ops import (
+            make_layer15_nibble_copy_op,
+        )
+        factories.append(make_layer15_nibble_copy_op)
+    except ImportError:
+        pass
+
+    # L6 -- ENT-after-JSR fixups
+    try:
+        from neural_vm.unified_compiler.ops.l6_ops import (
+            make_layer6_ent_after_jsr_sp_byte0_fixup_op,
+        )
+        factories.append(make_layer6_ent_after_jsr_sp_byte0_fixup_op)
+    except (ImportError, AttributeError):
+        pass
+
+    # Add more as scoped.
+
+    ops = []
+    for f in factories:
+        try:
+            ops.append(f())
+        except Exception:
+            # Tolerate instantiation failures so a partial set still
+            # works -- the cross-op smoke can still surface useful
+            # competition info with whatever ops we do get.
+            pass
+    return ops
