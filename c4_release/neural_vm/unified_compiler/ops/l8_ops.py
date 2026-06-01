@@ -1553,6 +1553,21 @@ def _layer8_sp_gathered_sentinel_rule(S: float) -> FFNRule:
     )
 
 
+def make_layer8_sp_gathered_sentinel_ir(S: float = 100.0) -> CompilerIR:
+    """Declarative IR mirror of the SP_GATHERED_THIS_STEP sentinel SwiGLU unit.
+
+    Wraps the single-rule ``_layer8_sp_gathered_sentinel_rule`` into a
+    ``CompilerIR`` so the op exposes its semantic source of truth via
+    ``Operation.compiler_ir``. The bake path still pins the unit at
+    ``_L8_SP_GATHERED_SENTINEL_UNIT`` (2055); this IR is what the verifier,
+    scope checker, and dominance auditor consume, and what
+    ``compare_symbolic_to_lowered_ffn`` validates byte-for-byte.
+    """
+    ir = CompilerIR()
+    ir.layer(0).ffn.append(_layer8_sp_gathered_sentinel_rule(S))
+    return ir
+
+
 def make_layer8_sp_gathered_sentinel_op() -> Operation:
     """L8 FFN: write SP_GATHERED_THIS_STEP=1.0 at MARK_SP positions.
 
@@ -1624,6 +1639,7 @@ def make_layer8_sp_gathered_sentinel_op() -> Operation:
         bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir=make_layer8_sp_gathered_sentinel_ir(),
         layer_idx=8,
         migrated=True,
         claims=_claims,
