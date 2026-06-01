@@ -333,16 +333,21 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
     legacy_bake (999) so unit 1300 survives `_right_size_ffns`.
 
     When `enable_tool_calling=False`, the bake_fn is a no-op.
+
+    Migrated 2026-06-01 (Phase 6 Wave 3L): the imperative helper
+    ``_set_tool_call_detection`` is replaced by an ``FFNRule``-driven
+    lowerer (``_lower_tool_call_detection_ir``) — single
+    ``FFNRule.constant_write`` lowered through
+    ``Primitives.lower_ffn_rules`` at pinned unit 1300. Byte-identical to
+    the legacy helper (validated via
+    ``compare_symbolic_to_lowered_ffn``).
     """
-    if enable_tool_calling:
-        def bake(model, dim_positions, S):
-            from ...vm_step import _set_tool_call_detection
-            _set_tool_call_detection(
-                model.blocks[6].ffn, S, _as_setdim_proxy(dim_positions),
-            )
-    else:
-        def bake(model, dim_positions, S):
-            return  # disabled when enable_tool_calling=False
+    def bake(model, dim_positions, S):
+        if not enable_tool_calling:
+            return
+        _lower_tool_call_detection_ir(
+            model.blocks[6].ffn, S, _as_setdim_proxy(dim_positions),
+        )
 
     return Operation(
         name="tool_call_detection",
@@ -350,11 +355,55 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_tool_calling else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         phase=998.8,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
+    )
+
+
+_TOOL_CALL_DETECTION_START_UNIT = 1300
+
+
+def _tool_call_detection_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for ``_set_tool_call_detection`` (L6 FFN unit 1300).
+
+    Single ``constant_write`` unit: ``CMP[2] + NEXT_SE >= 3.0`` fires and
+    emits ``NEXT_TOOL_CALL`` (+2/S) while suppressing ``NEXT_SE`` (-2/S).
+    ``b_gate=1.0`` is supplied via :class:`FFNRule`'s default
+    ``gate_bias`` for ``constant_write``.
+    """
+    write_scale = 2.0 / S
+    return (
+        FFNRule.constant_write(
+            name="tool_call_detection",
+            conditions=(
+                ("CMP+2", 1.0),
+                ("NEXT_SE", 1.0),
+            ),
+            threshold=3.0,
+            writes=(
+                ("NEXT_TOOL_CALL", write_scale),
+                ("NEXT_SE", -write_scale),
+            ),
+        ),
+    )
+
+
+def _lower_tool_call_detection_ir(ffn, S: float, BD) -> int:
+    rules = _tool_call_detection_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=_TOOL_CALL_DETECTION_START_UNIT,
+        S=S,
     )
 
 
