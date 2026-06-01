@@ -423,7 +423,7 @@ def _psh_state(marker_index, byte_index_name):
         "IS_BYTE+0": 1.0,
         f"{byte_index_name}+0": 1.0,
         "OUTPUT_LO+0": 4.0,
-        "OUTPUT_HI+0": 4.0,
+        "OUTPUT_HI_THIS_STEP+0": 4.0,
     }
 
 
@@ -432,17 +432,17 @@ def test_l15_psh_stack_ir_symbolic_sp_byte_outputs():
 
     sp_byte0 = ir.symbolic_ffn(_psh_state(2, "BYTE_INDEX_0"))
     assert sp_byte0["OUTPUT_LO+15"] == 4.0
-    assert sp_byte0["OUTPUT_HI+15"] == 4.0
+    assert sp_byte0["OUTPUT_HI_THIS_STEP+15"] == 4.0
     assert sp_byte0["OUTPUT_LO+0"] == 0.0
-    assert sp_byte0["OUTPUT_HI+0"] == 0.0
+    assert sp_byte0["OUTPUT_HI_THIS_STEP+0"] == 0.0
 
     sp_byte1 = ir.symbolic_ffn(_psh_state(2, "BYTE_INDEX_1"))
     assert sp_byte1["OUTPUT_LO+0"] == 6.0
-    assert sp_byte1["OUTPUT_HI+0"] == 6.0
+    assert sp_byte1["OUTPUT_HI_THIS_STEP+0"] == 6.0
 
     sp_byte2 = ir.symbolic_ffn(_psh_state(2, "BYTE_INDEX_2"))
     assert sp_byte2["OUTPUT_LO+0"] == 6.0
-    assert sp_byte2["OUTPUT_HI+0"] == 6.0
+    assert sp_byte2["OUTPUT_HI_THIS_STEP+0"] == 6.0
 
 
 def test_l15_psh_stack_ir_blocks_stack0_byte_residue():
@@ -457,9 +457,9 @@ def test_l15_psh_stack_ir_blocks_stack0_byte_residue():
     out = ir.symbolic_ffn(stack0_byte0)
 
     assert out.get("OUTPUT_LO+15", 0.0) == 0.0
-    assert out.get("OUTPUT_HI+15", 0.0) == 0.0
+    assert out.get("OUTPUT_HI_THIS_STEP+15", 0.0) == 0.0
     assert out["OUTPUT_LO+0"] == 4.0
-    assert out["OUTPUT_HI+0"] == 4.0
+    assert out["OUTPUT_HI_THIS_STEP+0"] == 4.0
 
 
 def test_l15_psh_stack_ir_symbolic_bp_byte2_preserved():
@@ -467,7 +467,7 @@ def test_l15_psh_stack_ir_symbolic_bp_byte2_preserved():
 
     bp_byte1 = ir.symbolic_ffn(_psh_state(3, "BYTE_INDEX_1"))
     assert bp_byte1["OUTPUT_LO+1"] == 4.0
-    assert bp_byte1["OUTPUT_HI+0"] == 8.0
+    assert bp_byte1["OUTPUT_HI_THIS_STEP+0"] == 8.0
     assert bp_byte1["OUTPUT_LO+0"] == 0.0
 
 
@@ -482,6 +482,7 @@ def test_l15_psh_stack_ir_lowers_legacy_weight_scale():
         "H4": 12,
         "OUTPUT_LO": 16,
         "OUTPUT_HI": 32,
+        "OUTPUT_HI_THIS_STEP": 32,
     }
     ffn = PureFFN(dim=48, hidden_dim=8)
 
