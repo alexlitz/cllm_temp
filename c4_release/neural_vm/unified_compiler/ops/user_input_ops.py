@@ -75,6 +75,13 @@ def make_layer5_user_input_gather_op(enable: bool = False) -> Operation:
         bake_fn=bake,
         declarative_bake_fn=bake if not enable else None,
         migrated=True,
+        # B12 backfill: docstring above pins phase 5.7 AFTER
+        # ``layer5_fetch`` (phase 5) so the head-allocation order is
+        # stable (fetch claims heads 0-7; this op would extend to heads
+        # 8-9 in phase 2). Encoded as a B10 op-name reference so the
+        # dynamic scheduler honours the dep edge even while the bake
+        # body is a no-op (Phase 1, ``enable=False``).
+        requires={"after": "layer5_fetch"},
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )
