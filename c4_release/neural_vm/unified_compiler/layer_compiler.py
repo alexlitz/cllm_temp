@@ -42,7 +42,9 @@ Example:
     # layout.ops_at(1) = [pc_increment]
 """
 
+import os
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
@@ -281,6 +283,33 @@ class Operation:
     # dynamic placement does not leak old physical layer numbers into user
     # facing blocker lists.
     semantic_label: Optional[str] = None
+
+    def __post_init__(self):
+        # B15 prep (1.0d, see docs/DYNAMIC_SCHEDULER_MIGRATION_PLAN.md):
+        # scaffold a DeprecationWarning emission path for the `phase=N.M`
+        # field. The dynamic scheduler retires `phase` after B14 strict mode
+        # stabilizes; this hook is silent by default and only fires when ALL
+        # THREE gates trip:
+        #
+        #   1. ``self.phase is not None``     — the op actually uses phase
+        #   2. ``C4_PHASE_STRICT_MODE=1``    — strict mode (B14) is enabled
+        #   3. ``C4_PHASE_DEPRECATION_WARN=1`` — deprecation warning opt-in
+        #
+        # Under normal use (no env flags set) this method is a no-op. Flip
+        # the env flags once B14 lands to surface remaining phase= users,
+        # then drop the `phase` field and this hook entirely in B15.
+        if self.phase is None:
+            return
+        if os.environ.get("C4_PHASE_STRICT_MODE") != "1":
+            return
+        if os.environ.get("C4_PHASE_DEPRECATION_WARN") != "1":
+            return
+        warnings.warn(
+            f"Operation '{self.name}' uses phase={self.phase}; "
+            f"switch to dep-based ordering",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     def __hash__(self):
         return hash(self.name)
@@ -1190,12 +1219,32 @@ class LayerCompiler:
                     out_edges[u.name].add(v.name)
 
             # B10: explicit ``requires["after"]`` / ``requires["same_layer_as"]``
-            # op-name edges. Both reserved keys add an A→v dep edge (v must
-            # run after the referenced op). Phase pruning does NOT apply —
-            # explicit op-name references are author intent and override the
-            # dim-only dep model. Unknown names are silently skipped here;
-            # ``validate_requires_op_refs`` is the place that errors on them.
-            for ref in requires_after_ops(v) + requires_same_layer_as_ops(v):
+            # op-name edges. Both reserved keys normally add an A->v dep edge
+            # (v must run after the referenced op). Phase pruning does NOT
+            # apply -- explicit op-name references are author intent and
+            # override the dim-only dep model. Unknown names are silently
+            # skipped here; ``validate_requires_op_refs`` is the place that
+            # errors on them.
+            #
+            # B9 EXCEPTION: cross-step semantic. When requires["after"]
+            # references an op at a STRICTLY LATER phase than v AND that op
+            # writes some dim that v also reads, the constraint expresses a
+            # PREV-STEP carry (v reads ref's output from the previous
+            # autoregressive step). In the single-step static compile path
+            # the edge would create a forward-cycle, so it is dropped here.
+            # See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §7.2 (R-OH-2).
+            for ref in requires_after_ops(v):
+                if ref == v.name or ref not in op_set:
+                    continue
+                ref_op = self._op_by_name[ref]
+                if (v.phase is not None and ref_op.phase is not None
+                        and ref_op.phase > v.phase
+                        and (ref_op.writes & v.reads)):
+                    # Cross-step semantic: skip the static edge.
+                    continue
+                in_edges[v.name].add(ref)
+                out_edges[ref].add(v.name)
+            for ref in requires_same_layer_as_ops(v):
                 if ref == v.name or ref not in op_set:
                     continue
                 in_edges[v.name].add(ref)
