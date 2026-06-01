@@ -7,6 +7,44 @@ from ..primitives import Primitives
 from .shared import _as_setdim_proxy
 
 
+def _add_stack0_x0_alu_materializer(
+    rules,
+    *,
+    family: str,
+    conditions,
+    threshold: float,
+    S: float,
+    scope=None,
+):
+    """Append 32 ALU->OUTPUT materializer rules for a STACK0 marker family.
+
+    Each call appends 16 LO-band rules (gated on ALU_LO+k -> OUTPUT_LO+k) and
+    16 HI-band rules (gated on ALU_HI+k -> OUTPUT_HI+k).  ``family`` becomes
+    part of the rule name (``l16_stack0_{family}_marker_from_alu_{band}_{k}``).
+    ``scope`` is threaded through to every generated FFNRule so the
+    declarative scope verifier can audit the intended firing positions.
+    """
+
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_stack0_{family}_marker_from_alu_lo_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"ALU_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
+            scope=scope,
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l16_stack0_{family}_marker_from_alu_hi_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"ALU_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
+            scope=scope,
+        ))
+
+
 def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L16 LEV routing units 0..120."""
 
@@ -300,22 +338,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MEM_STORE", -20.0),
     )
     stack0_e8_marker_threshold = 12.0
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l16_stack0_e8_marker_from_alu_lo_{k}",
-            conditions=stack0_e8_marker_conditions,
-            threshold=stack0_e8_marker_threshold,
-            gate=f"ALU_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
-        ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l16_stack0_e8_marker_from_alu_hi_{k}",
-            conditions=stack0_e8_marker_conditions,
-            threshold=stack0_e8_marker_threshold,
-            gate=f"ALU_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
-        ))
+    # FIXME(F-10): scope predicate documents the intended firing positions
+    # (current-step STACK0 markers carrying the preserved e8 stack-top byte).
+    # The declarative scope verifier surfaces scope_violations here because
+    # the per-k ALU-gated rules do not actually constrain byte_value.hi_nibble
+    # to 0x8 -- they project whatever ALU contains -- and the conditions tuple
+    # has no in_step_fresh / step_is_fresh evidence.  Treat each violation as
+    # a documented bleed onto non-current-step or non-e8-byte positions.
+    _add_stack0_x0_alu_materializer(
+        rules,
+        family="e8",
+        conditions=stack0_e8_marker_conditions,
+        threshold=stack0_e8_marker_threshold,
+        S=S,
+        scope="mark == STACK0 AND in_step_fresh AND byte_value.hi_nibble == 0x8",
+    )
 
     # One-local frames can preserve a stack-top address at 0xffe8 while the
     # current SP/address signature is 0xffe0.  In that shape L15 has already
@@ -373,22 +410,19 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_MEM", -300.0),
     )
     stack0_e0_marker_threshold = 12.0
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l16_stack0_e0_marker_from_alu_lo_{k}",
-            conditions=stack0_e0_marker_conditions,
-            threshold=stack0_e0_marker_threshold,
-            gate=f"ALU_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
-        ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l16_stack0_e0_marker_from_alu_hi_{k}",
-            conditions=stack0_e0_marker_conditions,
-            threshold=stack0_e0_marker_threshold,
-            gate=f"ALU_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
-        ))
+    # FIXME(F-10): scope predicate documents the intended firing positions
+    # (current-step STACK0 markers carrying the preserved e0 stack-top byte).
+    # See e8 family note above -- the declarative scope verifier surfaces
+    # scope_violations because the conditions tuple does not actually pin
+    # in_step_fresh nor byte_value.hi_nibble.
+    _add_stack0_x0_alu_materializer(
+        rules,
+        family="e0",
+        conditions=stack0_e0_marker_conditions,
+        threshold=stack0_e0_marker_threshold,
+        S=S,
+        scope="mark == STACK0 AND in_step_fresh AND byte_value.hi_nibble == 0x0",
+    )
 
     stack0_f8_marker_conditions = (
         ("MARK_STACK0", 1.0),
@@ -407,22 +441,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_BP", -10.0),
         ("MARK_MEM", -10.0),
     )
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l16_stack0_f8_marker_from_alu_lo_{k}",
-            conditions=stack0_f8_marker_conditions,
-            threshold=3.5,
-            gate=f"ALU_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
-        ))
-    for k in range(16):
-        rules.append(FFNRule.gated_write(
-            name=f"l16_stack0_f8_marker_from_alu_hi_{k}",
-            conditions=stack0_f8_marker_conditions,
-            threshold=3.5,
-            gate=f"ALU_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
-        ))
+    # FIXME(F-10): scope predicate documents the intended firing positions
+    # (current-step STACK0 markers carrying the preserved 0xF8 stack-top
+    # byte).  See e8 family note above for why the verifier will surface
+    # scope_violations on this family.
+    _add_stack0_x0_alu_materializer(
+        rules,
+        family="f8",
+        conditions=stack0_f8_marker_conditions,
+        threshold=3.5,
+        S=S,
+        scope=(
+            "mark == STACK0 AND in_step_fresh AND "
+            "byte_value.hi_nibble == 0xF AND byte_value.lo_nibble == 0x8"
+        ),
+    )
 
     stack0_e8_output_authoritative_conditions = (
         ("MARK_STACK0", 1_000_000_000.0),
