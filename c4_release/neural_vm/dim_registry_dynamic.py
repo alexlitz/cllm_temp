@@ -41,7 +41,11 @@ def build_default_registry_dynamic() -> DimRegistry:
     ``allow_overlap=True`` so the allocator's collision check doesn't
     fire on them.
     """
-    a = Allocator(d_model=512)
+    # d_model expanded from 512 -> 736 to mirror the static registry's
+    # compact pin_io_only layout block at positions 510..732. See the
+    # ``# --- Compact pin_io_only layout mirrors ---`` block at the end
+    # of this function for the ``_PIN``-suffix family.
+    a = Allocator(d_model=736)
 
     def pin(name, start, size, desc, semantics=None, alias=False):
         # Tiny wrapper that mirrors the (name, start, size, desc, semantics)
@@ -444,6 +448,103 @@ def build_default_registry_dynamic() -> DimRegistry:
     # --- OPCODE_BASE alias (262) — alias of OPCODE_FLAGS / OP_LEA ---
     pin("OPCODE_BASE", 262, 1, "Base of opcode one-hot (aliases OP_LEA)",
         "mark == AX OR (is_byte AND byte_index == 0)", alias=True)
+
+    # =========================================================================
+    # Compact pin_io_only layout mirrors (positions 510..732)
+    # -----------------------------------------------------------------------
+    # Mirror of the registry-completeness ``_PIN`` block in
+    # ``build_default_registry`` (commit 57c6a04). The compact
+    # ``pin_io_only=True`` layout lays the address / nibble / scratch
+    # families out at positions 510..732; the attention IR emitted by
+    # ops references those positions directly, so the registry needs
+    # named slots at them for ``verify_attention_head`` to resolve dim
+    # ints back to names. Each ``_PIN`` alloc mirrors the semantics of
+    # its legacy counterpart.
+    # =========================================================================
+
+    # OPCODE_BYTE_HI mirror (compact pos 510..525). Legacy OPCODE_BYTE_HI
+    # lives at 28 (aliased onto ADDR_B1_LO). Compact layout places it at
+    # 510. Note: 510..526 straddles TEMP's tail (480..512) by 2 bytes, so
+    # this mirror is registered as an alias of TEMP at the boundary.
+    pin("OPCODE_BYTE_HI_PIN", 510, 16,
+        "Compact-layout OPCODE_BYTE_HI (mirrors legacy OPCODE_BYTE_HI at 28)",
+        "mark == MEM OR (is_byte AND byte_index == 0)", alias=True)
+
+    # ADDR_B*_LO mirrors (compact pos 526..573). Legacy ADDR_B0_LO=12,
+    # ADDR_B1_LO=28, ADDR_B2_LO=44 (one-hot low nibbles of gathered addr
+    # bytes). Compact layout places the family at 526..573.
+    pin("ADDR_B0_LO_PIN", 526, 16,
+        "Compact-layout ADDR_B0_LO (mirrors legacy at 12)",
+        "mark == MEM")
+    pin("ADDR_B1_LO_PIN", 542, 16,
+        "Compact-layout ADDR_B1_LO (mirrors legacy at 28)",
+        "mark == MEM")
+    pin("ADDR_B2_LO_PIN", 558, 16,
+        "Compact-layout ADDR_B2_LO (mirrors legacy at 44)",
+        "mark == MEM")
+
+    # ADDR_B*_HI mirrors (compact pos 574..621). Legacy ADDR_B0_HI=206,
+    # ADDR_B1_HI=222, ADDR_B2_HI=238 (hi nibbles, aliased onto ADDR_KEY).
+    # Compact layout places the family at 574..621.
+    pin("ADDR_B0_HI_PIN", 574, 16,
+        "Compact-layout ADDR_B0_HI (mirrors legacy at 206)",
+        "mark == MEM")
+    pin("ADDR_B1_HI_PIN", 590, 16,
+        "Compact-layout ADDR_B1_HI (mirrors legacy at 222)",
+        "mark == MEM")
+    pin("ADDR_B2_HI_PIN", 606, 16,
+        "Compact-layout ADDR_B2_HI (mirrors legacy at 238)",
+        "mark == MEM")
+
+    # FORMAT_PTR_*/AX_FULL_* mirrors (compact pos 622..653). Legacy
+    # FORMAT_PTR_LO=471, FORMAT_PTR_HI=487 (aliased with AX_FULL_LO/HI).
+    # Compact layout places the family at 622..653.
+    pin("FORMAT_PTR_LO_PIN", 622, 16,
+        "Compact-layout FORMAT_PTR_LO/AX_FULL_LO (mirrors legacy at 471)",
+        "mark == AX OR (is_byte AND byte_index == 0)")
+    pin("FORMAT_PTR_HI_PIN", 638, 16,
+        "Compact-layout FORMAT_PTR_HI/AX_FULL_HI (mirrors legacy at 487)",
+        "mark == AX OR (is_byte AND byte_index == 0)")
+
+    # OUTPUT_BYTE_* mirrors (compact pos 654..685). Legacy OUTPUT_BYTE_LO=480,
+    # OUTPUT_BYTE_HI=496 (aliased onto TEMP). Compact layout places them at
+    # 654..685.
+    pin("OUTPUT_BYTE_LO_PIN", 654, 16,
+        "Compact-layout OUTPUT_BYTE_LO (mirrors legacy at 480)",
+        "is_byte OR NOT is_byte")
+    pin("OUTPUT_BYTE_HI_PIN", 670, 16,
+        "Compact-layout OUTPUT_BYTE_HI (mirrors legacy at 496)",
+        "is_byte OR NOT is_byte")
+
+    # CARRY mirror (compact pos 686..689). Legacy CARRY=392 (4-wide
+    # inter-byte ADD/SUB/MUL carry cascade).
+    pin("CARRY_PIN", 686, 4,
+        "Compact-layout CARRY (mirrors legacy at 392)",
+        "is_byte AND byte_index in {0, 1, 2, 3}")
+
+    # CMP mirror (compact pos 690..697). Legacy CMP=396 (size 4 in legacy
+    # registry; compact layout widens to 8 to match the declared size in
+    # ``declare_setdim_compat_dims`` -- the ``eight_dim`` family).
+    pin("CMP_PIN", 690, 8,
+        "Compact-layout CMP (mirrors legacy at 396; widened to 8)",
+        "mark == AX OR (is_byte AND byte_index == 0)")
+
+    # TEMP mirror (compact pos 698..729). Legacy TEMP=480 size 32.
+    pin("TEMP_PIN", 698, 32,
+        "Compact-layout TEMP (mirrors legacy at 480)",
+        "is_byte OR NOT is_byte")
+
+    # STACK0_BYTE1/2/3 mirrors (compact pos 730..732). Legacy
+    # STACK0_BYTE1/2/3 = 508/509/510 (aliased onto TEMP+28..30).
+    pin("STACK0_BYTE1_PIN", 730, 1,
+        "Compact-layout STACK0_BYTE1 (mirrors legacy at 508)",
+        "mark == STACK0 OR (is_byte AND byte_index == 1)")
+    pin("STACK0_BYTE2_PIN", 731, 1,
+        "Compact-layout STACK0_BYTE2 (mirrors legacy at 509)",
+        "mark == STACK0 OR (is_byte AND byte_index == 2)")
+    pin("STACK0_BYTE3_PIN", 732, 1,
+        "Compact-layout STACK0_BYTE3 (mirrors legacy at 510)",
+        "mark == STACK0 OR (is_byte AND byte_index == 3)")
 
     return a.to_registry()
 
