@@ -1533,6 +1533,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         extra_conditions: tuple = (),
         threshold: float = 140.0,
         strength: float = 10_000.0,
+        scope: Optional[str] = None,
     ) -> tuple[FFNRule, ...]:
         """Emit byte 0 for MEM-store rows directly from L13 ADDR_B0 lanes.
 
@@ -1594,6 +1595,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         return (
             FFNRule.constant_write(
                 name=name,
+                scope=scope,
                 conditions=base,
                 threshold=threshold,
                 writes=byte_writes(target_byte, strength=strength),
@@ -1689,6 +1691,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 rules.append(
                     FFNRule.gated_write(
                         name="tail_sp_pop_carry_byte1_zero",
+                        scope="is_byte",
                         conditions=base_conditions,
                         threshold=2025.0,
                         gate="H1+2",
@@ -1710,6 +1713,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             f"tail_sp_pop_carry_byte{byte_idx + 1}_"
                             f"{old_value:02x}"
                         ),
+                        scope="is_byte",
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{old_value & 0xF}", output_match_weight),
                             (f"OUTPUT_HI+{old_value >> 4}", output_match_weight),
@@ -1754,6 +1758,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         return (
             FFNRule.gated_write(
                 name="tail_sp_pop_marker_e0_to_e8",
+                scope="mark == SP",
                 conditions=base_conditions + (
                     ("OUTPUT_LO+0", 0.1),
                     ("OUTPUT_HI+14", 2.0),
@@ -1770,6 +1775,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.gated_write(
                 name="tail_sp_pop_marker_d0_to_d8",
+                scope="mark == SP",
                 conditions=(
                     ("MARK_SP", 1.0),
                     ("HAS_SE", 1.0),
@@ -1794,6 +1800,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.gated_write(
                 name="tail_sp_pop_marker_f0_to_f8",
+                scope="mark == SP",
                 conditions=(
                     ("MARK_SP", 1.0),
                     ("HAS_SE", 1.0),
@@ -1818,6 +1825,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.gated_write(
                 name="tail_sp_pop_marker_d8_to_e0",
+                scope="mark == SP",
                 conditions=(
                     ("MARK_SP", 1.0),
                     ("HAS_SE", 1.0),
@@ -1854,6 +1862,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         return (
             FFNRule.constant_write(
                 name="tail_sp_pop_byte1_ff_after_e0",
+                scope="is_byte",
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -1882,6 +1891,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.constant_write(
                 name="tail_sp_pop_byte1_ff_after_d8",
+                scope="is_byte",
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -1910,6 +1920,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.constant_write(
                 name="tail_sp_pop_byte1_ff_after_f8",
+                scope="is_byte",
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -1938,6 +1949,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.constant_write(
                 name="tail_sp_pop_byte1_ff_after_e8",
+                scope="is_byte",
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -1979,6 +1991,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         return (
             FFNRule.constant_write(
                 name="tail_stack0_pushed_addr_byte1_ff_after_e8",
+                scope="is_byte",
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -2009,6 +2022,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.constant_write(
                 name="tail_stack0_pushed_addr_byte1_store_ff_after_e8",
+                scope="is_byte",
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -2042,6 +2056,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.constant_write(
                 name="tail_stack0_pushed_addr_byte1_store_ff_after_e0",
+                scope="is_byte",
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -2092,6 +2107,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             rules.append(
                 FFNRule.constant_write(
                     name=f"tail_ax_lea_local_addr_byte1_ff_after_{value:02x}",
+                    scope="is_byte",
                     conditions=(
                         ("IS_BYTE", 5.0),
                         ("HAS_SE", 5.0),
@@ -2154,6 +2170,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 rules.append(
                     FFNRule.constant_write(
                         name=f"tail_stack0_store_byte_{value:02x}",
+                        scope="mark == STACK0",
                         conditions=base_conditions + (
                             (f"ALU_LO+{lo}", 1.0),
                             (f"ALU_HI+{hi}", 1.0),
@@ -2198,6 +2215,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 rules.append(
                     FFNRule.gated_write(
                         name=f"tail_stack0_pop_loaded_byte_{value:02x}",
+                        scope="mark == STACK0",
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{lo}", 0.1),
                             (f"OUTPUT_HI+{hi}", 0.1),
@@ -2241,6 +2259,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 rules.append(
                     FFNRule.gated_write(
                         name=f"tail_stack0_store_top_e0_byte_{value:02x}",
+                        scope="mark == STACK0",
                         conditions=base_conditions + (
                             (f"ALU_LO+{lo}", 1.0),
                             (f"ALU_HI+{hi}", 1.0),
@@ -2297,6 +2316,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             "tail_stack0_store_top_e8_from_e0_byte_"
                             f"{value:02x}"
                         ),
+                        scope="mark == STACK0",
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{lo}", 0.001),
                             (f"OUTPUT_HI+{hi}", 0.001),
@@ -2311,6 +2331,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 name=(
                     "tail_stack0_store_top_e8_from_e0_byte_39_from_e8_addr"
                 ),
+                scope="mark == STACK0",
                 conditions=base_conditions + (
                     ("MEM_ADDR_SRC", 100.0),
                     ("ADDR_B0_LO+8", 100.0),
@@ -2359,6 +2380,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 rules.append(
                     FFNRule.gated_write(
                         name=f"tail_stack0_store_loaded_byte_{value:02x}",
+                        scope="mark == STACK0",
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{lo}", 1.0),
                             (f"OUTPUT_HI+{hi}", 1.0),
@@ -2376,6 +2398,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         return (
             FFNRule.constant_write(
                 name="tail_stack0_store_top_value_2f_from_alu",
+                scope="mark == STACK0",
                 conditions=(
                     ("MARK_STACK0", 5.0),
                     ("HAS_SE", 1.0),
@@ -2458,6 +2481,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             f"tail_ax_add_carry_byte{byte_idx + 1}_"
                             f"{old_value:02x}"
                         ),
+                        scope="is_byte",
                         conditions=base_conditions + (
                             (f"OUTPUT_LO+{old_lo}", 1.0),
                             (f"OUTPUT_HI+{old_value >> 4}", 1.0),
@@ -2534,6 +2558,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         return (
             FFNRule.constant_write(
                 name="tail_ax_add_no_carry_byte1_00",
+                scope="is_byte",
                 conditions=(
                     ("IS_BYTE", 5.0),
                     ("HAS_SE", 5.0),
@@ -2624,6 +2649,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         rules = [
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_hi_zero",
+                scope="is_byte",
                 conditions=base_conditions,
                 threshold=250.0,
                 writes=tuple(high_writes),
@@ -2633,6 +2659,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             rules.append(
                 FFNRule.gated_write(
                     name=f"tail_ax_add_byte1_hi_zero_lo_{lo:01x}",
+                    scope="is_byte",
                     conditions=base_conditions
                     + ((f"OUTPUT_LO+{lo}", 10.0),)
                     + tuple(
@@ -2711,6 +2738,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         return (
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_no_carry_low1_02",
+                scope="is_byte",
                 conditions=base_conditions + (
                     ("CARRY+1", -1000.0),
                     ("ALU_LO+1", 100.0),
@@ -2720,6 +2748,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_no_carry_low2_03",
+                scope="is_byte",
                 conditions=base_conditions + (
                     ("CARRY+1", -1000.0),
                     ("ALU_LO+2", 100.0),
@@ -2729,6 +2758,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.constant_write(
                 name="tail_ax_add_byte1_carry_low2_03",
+                scope="is_byte",
                 conditions=base_conditions + (
                     ("CARRY+1", 200.0),
                     ("ALU_LO+2", 100.0),
@@ -2746,6 +2776,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             rules.append(
                 FFNRule.constant_write(
                     name=f"tail_ax_sub_byte1_hi_zero_lo_{lo:01x}",
+                    scope="is_byte",
                     conditions=ax_byte0 + (
                         ("TEMP+9", 100.0),
                         ("TEMP+8", -1000.0),
@@ -2780,6 +2811,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         return (
             FFNRule.constant_write(
                 name="tail_ax_sub_full_underflow_byte1_ff",
+                scope="is_byte",
                 conditions=ax_byte0 + (
                     ("TEMP+9", 100.0),
                     ("TEMP+8", -1000.0),
@@ -2814,6 +2846,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             rules.append(
                 FFNRule.gated_write(
                     name=f"tail_ax_sub_borrow_byte1_{old_lo:01x}_to_{old_lo - 1:01x}",
+                    scope="is_byte",
                     conditions=ax_byte0 + (
                         ("TEMP+9", 100.0),
                         ("TEMP+8", -1000.0),
@@ -2896,6 +2929,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 rules.append(
                     FFNRule.gated_write(
                         name=name,
+                        scope="is_byte",
                         conditions=bounded_ax_byte0 + (
                             ("HAS_SE", 20.0),
                             ("TEMP+10", 30.0),
@@ -3023,6 +3057,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         return (
             FFNRule.gated_write(
                 name="tail_ax_add_mul_byte1_materialize_01",
+                scope="is_byte",
                 conditions=base_conditions + (
                     ("EMBED_HI+0", 25.0),
                     ("FETCH_HI+0", 100.0),
@@ -3035,6 +3070,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.gated_write(
                 name="tail_ax_add_mul_byte1_materialize_02_from_hi2",
+                scope="is_byte",
                 conditions=base_conditions + (
                     ("EMBED_HI+2", 25.0),
                     ("FETCH_HI+2", 50.0),
@@ -3047,6 +3083,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             FFNRule.gated_write(
                 name="tail_ax_add_mul_byte1_materialize_02_from_hid",
+                scope="is_byte",
                 conditions=base_conditions + (
                     ("EMBED_HI+13", 25.0),
                     ("FETCH_HI+2", 50.0),
@@ -3136,6 +3173,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # carried marker byte once CMP[3] has been relayed.
         FFNRule.constant_write(
             name="tail_stack0_pop_marker_zero",
+            scope="mark == STACK0",
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3163,6 +3201,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # revealed address needed by update/store expressions.
         FFNRule.constant_write(
             name="tail_stack0_pop_reveals_saved_addr_e8",
+            scope="mark == STACK0",
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3189,6 +3228,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # local address 0xffe8.
         FFNRule.constant_write(
             name="tail_stack0_pop_reveals_saved_addr_e8_from_e0_addr",
+            scope="mark == STACK0",
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3214,6 +3254,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # SP; the STACK0 marker should therefore be zero, not the stored AX.
         FFNRule.constant_write(
             name="tail_stack0_store_non_top_zero",
+            scope="mark == STACK0",
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3238,6 +3279,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_stack0_store_non_top_zero_e8_from_e0",
+            scope="mark == STACK0",
             conditions=(
                 ("MARK_STACK0", 100.0),
                 ("HAS_SE", 1.0),
@@ -3262,6 +3304,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_stack0_store_non_top_zero_e0",
+            scope="mark == STACK0",
             conditions=(
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
@@ -3282,6 +3325,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         *exact_output_byte_rules(
             name="tail_stack0_f8_byte1_from_output_exact",
+            scope="is_byte",
             expected_byte=0x02,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -3322,6 +3366,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # stack-base high byte. Assert the zero byte for binary-pop SP byte 3.
         FFNRule.gated_write(
             name="tail_sp_pop_byte3_zero",
+            scope="is_byte",
             conditions=(
                 ("IS_BYTE", 5.0),
                 ("HAS_SE", 5.0),
@@ -3349,6 +3394,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_sp_store_pop_byte1_zero",
+            scope="is_byte",
             conditions=(
                 ("IS_BYTE", 5.0),
                 ("HAS_SE", 5.0),
@@ -3394,6 +3440,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *stack0_store_top_e8_from_e0_output_rules(),
         FFNRule.constant_write(
             name="tail_pc_byte0_12_from_initial_jmp_exact",
+            scope="mark == PC",
             conditions=(
                 ("MARK_PC", 5.0),
                 ("OP_JMP", 20.0),
@@ -3424,6 +3471,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_pc_byte0_1a_from_taken_branch_index3_exact_bz",
+            scope="mark == PC",
             conditions=(
                 ("MARK_PC", 5.0),
                 ("OP_BZ", 20.0),
@@ -3456,6 +3504,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_pc_byte0_1a_from_taken_branch_index3_exact_bnz",
+            scope="mark == PC",
             conditions=(
                 ("MARK_PC", 5.0),
                 ("OP_BNZ", 20.0),
@@ -3484,6 +3533,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         *exact_output_byte_rules(
             name="tail_pc_byte1_01_from_long_initial_pc_exact",
+            scope="is_byte",
             expected_byte=0x01,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -3517,6 +3567,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact",
+            scope="is_byte",
             conditions=(
                 ("IS_BYTE", 5.0),
                 ("H1+0", 20.0),
@@ -3569,6 +3620,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # absorb at v3-baseline-preserving sensitivity).
         *exact_output_byte_rules(
             name="tail_sp_marker_byte0_f8_from_initial_stack_exact",
+            scope="mark == SP",
             expected_byte=0xF8,
             conditions=(
                 ("MARK_SP", 10.0),
@@ -3609,6 +3661,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         *exact_output_byte_rules(
             name="tail_sp_byte1_ff_from_initial_stack_exact",
+            scope="is_byte",
             expected_byte=0xFF,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -3655,6 +3708,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # stays at 10k (≤10k bound per B4-H §3.2).
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f8_exact",
+            scope="mark == MEM",
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -3709,6 +3763,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # sufficient now that the structural dims carry the decisive proof).
         *exact_output_byte_rules(
             name="tail_mem_store_addr1_ff_from_stack_store_exact",
+            scope="is_byte",
             expected_byte=0xFF,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -3763,6 +3818,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # marker / opcode blocker conditions use -1e9 weights).
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_f8_initial_jsr_exact",
+            scope="mark == MEM",
             expected_byte=0xF8,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -3812,6 +3868,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # is no longer required).
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f8_initial_jsr_authority",
+            scope="mark == MEM",
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("H1+4", 20.0),
@@ -3857,6 +3914,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # from 1e6 to 10k per ≤10k cap (the structural dims are decisive).
         FFNRule.constant_write(
             name="tail_mem_store_addr0_f0_exact",
+            scope="mark == MEM",
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -3905,6 +3963,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # tail_mem_store_addr0_e8_from_local_frame_addr_exact).
         *addr_from_l13_rules(
             name="tail_mem_store_addr0_00_from_global_exact",
+            scope="mark == MEM",
             target_byte=0x00,
             lo_lane=0,
             hi_lane=0,
@@ -3927,6 +3986,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # boost.
         *exact_output_byte_rules(
             name="tail_mem_store_addr2_zero_from_global_exact",
+            scope="is_byte",
             expected_byte=0x00,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -3985,6 +4045,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # proof without becoming required.
         *exact_output_byte_rules(
             name="tail_mem_store_addr3_zero_from_global_exact",
+            scope="is_byte",
             expected_byte=0x00,
             conditions=(
                 ("IS_BYTE", 5.0),
@@ -4037,6 +4098,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # active_value reduced from 500 to 50 per the ≤10k cap.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_f8_from_mod_local_exact",
+            scope="mark == MEM",
             expected_byte=0xF8,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4089,6 +4151,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # disambiguator).
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_local_offset_exact",
+            scope="mark == MEM",
             expected_byte=0xE0,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4149,6 +4212,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # so the rule cannot fire on ENT-main regardless of strength.
         FFNRule.constant_write(
             name="tail_mem_store_addr0_e0_from_psh_sp_no_addr_src_authority",
+            scope="mark == MEM",
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -4208,6 +4272,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # reduced from 5000 to 50 per the ≤10k cap.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e0_from_jsr_local_exact",
+            scope="mark == MEM",
             expected_byte=0xE0,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4262,6 +4327,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # reduced from 500 to 50 per the ≤10k cap.
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e8_from_nested_local_exact",
+            scope="mark == MEM",
             expected_byte=0xE8,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4308,6 +4374,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         *exact_output_byte_rules(
             name="tail_mem_store_addr0_e8_from_local_frame_addr_exact",
+            scope="mark == MEM",
             expected_byte=0xE8,
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -4352,6 +4419,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.gated_write(
             name="tail_mem_store_addr0_e8_from_local_frame_output_exact",
+            scope="mark == MEM",
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -4387,6 +4455,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # have dedicated memory paths and block this cleanup.
         FFNRule.constant_write(
             name="tail_pop_mem_marker_zero",
+            scope="mark == MEM",
             conditions=(
                 ("MARK_MEM", 1.0),
                 ("HAS_SE", 1.0),
@@ -4417,6 +4486,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # is rewriting BP.
         FFNRule.gated_write(
             name="tail_bp_byte2_preserve_01",
+            scope="is_byte",
             conditions=(
                 ("IS_BYTE", 1.0),
                 ("HAS_SE", 1.0),
@@ -4460,6 +4530,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *ax_add_mul_byte1_materialize_rules(),
         FFNRule.gated_write(
             name="tail_ax_add_byte1_carry_high2_03",
+            scope="is_byte",
             conditions=ax_byte0 + (
                 ("BYTE_INDEX_1", -1000.0),
                 ("BYTE_INDEX_2", -1000.0),
@@ -4482,6 +4553,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # OUTPUT_LO[1] plus carry residue rather than MUL's OUTPUT_LO[2].
         FFNRule.gated_write(
             name="tail_wide_shl_byte1_01",
+            scope="is_byte",
             conditions=ax_byte0 + (
                 ("OP_SHL", 100.0),
                 ("EMBED_LO+0", 1.0),
@@ -4498,6 +4570,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # nonzero stored high byte from the common zero-high-byte store cases.
         FFNRule.gated_write(
             name="tail_si_ax_byte1_12",
+            scope="is_byte OR mark == AX",
             conditions=si_ax_byte0 + (
                 ("OP_EQ", -1000.0),
                 ("OP_NE", -1000.0),
@@ -4515,6 +4588,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.gated_write(
             name="tail_si_ax_byte1_00",
+            scope="is_byte OR mark == AX",
             conditions=si_ax_byte0 + (
                 ("OP_EQ", -1000.0),
                 ("OP_NE", -1000.0),
@@ -4536,6 +4610,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # accidentally trigger the zeroing rule.
         FFNRule.gated_write(
             name="tail_sub_borrow_byte1_00",
+            scope="is_byte",
             conditions=ax_byte0 + (
                 ("MARK_AX", -1000.0),
                 ("OP_IMM", -1000.0),
@@ -4556,6 +4631,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # OR/XOR, whose high bytes intentionally remain 0x0f.
         FFNRule.constant_write(
             name="tail_and_byte1_00",
+            scope="is_byte",
             conditions=ax_byte0 + (
                 ("TEMP+3", 1.0),
                 ("TEMP+4", 1.0),
@@ -4572,6 +4648,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # the AND-zeroing rule above remains authoritative for AND.
         FFNRule.gated_write(
             name="tail_or_xor_byte1_0f",
+            scope="is_byte",
             conditions=ax_byte0 + (
                 ("TEMP+3", 1.0),
                 ("TEMP+4", -2.0),
@@ -4587,6 +4664,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # byte positions.
         FFNRule.gated_write(
             name="tail_shr_byte1_00",
+            scope="is_byte",
             conditions=ax_byte0 + (
                 ("TEMP+7", 1.0),
                 ("OUTPUT_LO+1", 0.001),
@@ -4600,6 +4678,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # before byte generation proceeds.
         FFNRule.gated_write(
             name="tail_shr_marker_byte0_01",
+            scope="mark == AX",
             conditions=(
                 ("MARK_AX", 1.0),
                 ("MARK_PC", -10000.0),
@@ -4623,6 +4702,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_lea_local_ax_marker_byte0_e8",
+            scope="mark == AX",
             conditions=(
                 ("MARK_AX", 1.0),
                 ("HAS_SE", 1.0),
@@ -4642,6 +4722,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_ax_add_byte1_missing_stack_high_02",
+            scope="is_byte",
             conditions=(
                 ("IS_BYTE", 10.0),
                 ("HAS_SE", 10.0),
@@ -4680,6 +4761,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # truthy NE and LE cases without touching byte-lane arithmetic.
         FFNRule.constant_write(
             name="tail_cmp_ne_true_01",
+            scope="mark == AX",
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_NE", 1.0),
@@ -4690,6 +4772,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_cmp_eq_false_00",
+            scope="mark == AX",
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_EQ", 1.0),
@@ -4701,6 +4784,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_cmp_le_lt_true_01",
+            scope="mark == AX",
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_LE", 1.0),
@@ -4712,6 +4796,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_cmp_le_eq_prefix_false_00",
+            scope="mark == AX",
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_LE", 1.0),
@@ -4725,6 +4810,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_cmp_lt_false_00",
+            scope="mark == AX",
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_LT", 1.0),
@@ -4735,6 +4821,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.constant_write(
             name="tail_cmp_gt_false_00",
+            scope="mark == AX",
             conditions=(
                 ("MARK_AX", 1.0),
                 ("OP_GT", 1.0),
@@ -4749,6 +4836,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # staged value exists only in OUTPUT, not in EMBED.
         FFNRule.gated_write(
             name="tail_sp_pop_marker_output_d8_to_e0",
+            scope="mark == SP",
             conditions=(
                 ("CONST", -100000000.0),
                 ("MARK_SP", 100000000.0),
@@ -4773,6 +4861,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.gated_write(
             name="tail_clear_output_after_byte3",
+            scope="is_byte",
             conditions=(
                 ("IS_BYTE", 1.0),
                 ("BYTE_INDEX_3", 1.0),
@@ -4794,6 +4883,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         FFNRule.gated_write(
             name="tail_clear_output_before_step_end",
+            scope="is_byte",
             conditions=(
                 ("IS_BYTE", 1.0),
                 ("NEXT_SE", 1.0),
