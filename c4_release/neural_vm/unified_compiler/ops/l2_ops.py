@@ -1,22 +1,78 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
+# === L2 FFN unit layout (pinned offsets) ============================
+#
+# Two ops share the L2 FFN today:
+#
+#   * ``layer2_mem_byte_flags`` (phase=2) owns units 0..7 -- 4 MEM_VAL_B*
+#     flags + 4 BYTE_INDEX_*/STACK0_BYTE* flags.
+#   * ``layer2_initial_pc_bake_cancel`` (phase=2.5) owns units 8..9 -- a
+#     pair of EMBED_LO/EMBED_HI cancel taps for the initial-PC bake.
+#
+# Pre-migration the second op picked up its start unit from a stateful
+# ``ffn._l2_unit_counter`` written by the first op. With the allocator
+# the handoff is structural: each bake instantiates its OWN allocator
+# pre-loaded with the full L2 layout (pinned to existing offsets), so
+# the unit indices are reproducible without depending on cross-op
+# attribute writes. Both bakes still stash the allocator on
+# ``ffn._l2_unit_allocator`` so downstream tooling can inspect the
+# layout, mirroring the L9 convention.
+_L2_FFN_UNIT_LAYOUT = (
+    # (sub-stage name, pinned start, n_units)
+    ("layer2_mem_byte_flags.flags",         0, 8),  # MEM_VAL + BYTE_INDEX
+    ("layer2_initial_pc_bake_cancel.lo",    8, 1),  # EMBED_LO cancel
+    ("layer2_initial_pc_bake_cancel.hi",    9, 1),  # EMBED_HI cancel
+)
+
+
+def _allocate_layer2_ffn_units() -> FFNUnitAllocator:
+    """Build a per-bake :class:`FFNUnitAllocator` with all L2 FFN sub-stages.
+
+    Every sub-stage is pinned at its existing offset so the underlying
+    bake helpers -- which still write the same weights to the same
+    indices -- land byte-identically. Both ``layer2_mem_byte_flags`` and
+    ``layer2_initial_pc_bake_cancel`` call this so each can look up its
+    own start unit by name without depending on a cross-op
+    ``_l2_unit_counter`` attribute. A future L2 FFN op family can claim
+    a free range past unit 10 via ``allocator.alloc(name, n)`` without a
+    pin.
+    """
+    allocator = FFNUnitAllocator()
+    for name, start, n_units in _L2_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units, pin=start)
+    return allocator
+
+
 def make_layer2_mem_byte_flags_op() -> Operation:
     """L2 FFN: MEM val byte position flags + extended BYTE_INDEX for STACK0.
 
-    Uses units [0, 8). Records the next free unit on
-    ``ffn._l2_unit_counter`` so chained ops (e.g.
-    ``make_layer2_initial_pc_bake_cancel_op``) can start above this range.
+    Uses units [0, 8) pinned via :class:`FFNUnitAllocator`. The allocator
+    is stashed on ``ffn._l2_unit_allocator`` so downstream ops (e.g.
+    ``make_layer2_initial_pc_bake_cancel_op``) can inspect or extend the
+    layout. The legacy ``ffn._l2_unit_counter`` cross-op handoff is gone
+    -- the cancel op now resolves its own start from
+    ``_L2_FFN_UNIT_LAYOUT``, not from a mutated FFN attribute.
     """
     def bake(ffn, dim_positions, S):
-        _bake_layer2_mem_byte_flags(ffn, S, _as_setdim_proxy(dim_positions))
-        # The legacy bake fills units 0..7 (4 MEM_VAL_BN + 4 BYTE_INDEX_*).
-        ffn._l2_unit_counter = max(getattr(ffn, "_l2_unit_counter", 0), 8)
+        # Per-bake FFN-unit allocator. Pin every existing L2 range so the
+        # underlying weight writes land byte-identically; expose the
+        # allocator for inspection on the FFN module.
+        allocator = _allocate_layer2_ffn_units()
+        flags_range = next(
+            r for r in allocator.ranges()
+            if r.op_name == "layer2_mem_byte_flags.flags"
+        )
+        ffn._l2_unit_allocator = allocator
+        _bake_layer2_mem_byte_flags(
+            ffn, S, _as_setdim_proxy(dim_positions), flags_range.start,
+        )
 
     # Dim-ownership claims: ``_set_layer2_mem_byte_flags`` writes units 0..7
     # (see setup_helpers.py:_set_layer2_mem_byte_flags). Each unit writes a
@@ -58,20 +114,28 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         migrated=True,
         claims=_claims,
         # ``_set_layer2_mem_byte_flags`` writes 8 units (4 MEM_VAL_B* +
-        # 4 BYTE_INDEX_*); ``_l2_unit_counter`` is bumped to 8 after this op
-        # so the cancel op below starts at unit 8.
+        # 4 BYTE_INDEX_*) pinned at offset 0 via ``_L2_FFN_UNIT_LAYOUT``.
+        # The cancel op below resolves its own start (unit 8) from the
+        # same shared layout.
         ffn_units_used=8,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
 
 
-def _bake_layer2_mem_byte_flags(ffn, S, BD):
-    """Declarative L2 FFN spec: MEM value-byte and STACK0 byte-index flags."""
+def _bake_layer2_mem_byte_flags(ffn, S, BD, start_unit=0):
+    """Declarative L2 FFN spec: MEM value-byte and STACK0 byte-index flags.
+
+    ``start_unit`` is the pinned hidden-unit base supplied by the
+    :class:`FFNUnitAllocator`. Callers pass ``start_unit=0`` today (the
+    pinned offset for ``layer2_mem_byte_flags.flags``); the parameter
+    exists so the helper does not bake in an implicit ``0`` -- the
+    layout is owned by ``_L2_FFN_UNIT_LAYOUT``.
+    """
 
     MEM_I = 4
     BP_I = 3
-    unit = 0
+    unit = start_unit
 
     for src_dim, blocker_dim, out_dim in (
         (BD.H1 + MEM_I, BD.H0 + MEM_I, BD.MEM_VAL_B0),
@@ -128,9 +192,11 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
     -1.0 (exact match for the +1.0 bake).
 
     Pinned to ``layer_idx=2``, ``kind="block"`` (so the bake can access
-    the same FFN as ``make_layer2_mem_byte_flags_op`` and chain unit
-    allocation via ``ffn._l2_unit_counter``). Phase=2.5 so it runs after
-    ``make_layer2_mem_byte_flags_op`` (phase=2).
+    the same FFN as ``make_layer2_mem_byte_flags_op``). Phase=2.5 so it
+    runs after ``make_layer2_mem_byte_flags_op`` (phase=2). The unit
+    indices (8 and 9) are now resolved through the shared
+    :class:`FFNUnitAllocator` layout in ``_L2_FFN_UNIT_LAYOUT`` rather
+    than via the historical ``ffn._l2_unit_counter`` handoff.
     """
     def bake(block, dim_positions, S):
         from ...constants import PC_OFFSET
@@ -142,7 +208,23 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
             return getattr(_SetDim, name)
 
         ffn = block.ffn
-        unit = getattr(ffn, "_l2_unit_counter", 0)
+        # Per-bake allocator with the full L2 FFN layout pinned. Looking
+        # up the cancel-op ranges by name keeps the start unit identical
+        # to the legacy ``_l2_unit_counter`` value (8 / 9) without
+        # depending on any prior op having mutated the FFN module.
+        allocator = _allocate_layer2_ffn_units()
+        ffn._l2_unit_allocator = allocator
+        lo_range = next(
+            r for r in allocator.ranges()
+            if r.op_name == "layer2_initial_pc_bake_cancel.lo"
+        )
+        hi_range = next(
+            r for r in allocator.ranges()
+            if r.op_name == "layer2_initial_pc_bake_cancel.hi"
+        )
+        lo_unit = lo_range.start
+        hi_unit = hi_range.start
+
         init_pc_lo = PC_OFFSET & 0xF
         init_pc_hi = (PC_OFFSET >> 4) & 0xF
 
@@ -155,25 +237,23 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         # up = S * HAS_SE - S/2 → +S/2 at HAS_SE=1, silu(+S/2) ≈ S/2.
         # gate = MARK_PC → 1.0 at PC marker.
         # hidden = S/2, W_down = -2.0/S → contribution = -1.0.
-        ffn.W_up.data[unit, HAS_SE] = S
-        ffn.b_up.data[unit] = -S * 0.5
-        ffn.W_gate.data[unit, MARK_PC] = 1.0
-        ffn.W_down.data[EMBED_LO + init_pc_lo, unit] = -2.0 / S
-        unit += 1
+        ffn.W_up.data[lo_unit, HAS_SE] = S
+        ffn.b_up.data[lo_unit] = -S * 0.5
+        ffn.W_gate.data[lo_unit, MARK_PC] = 1.0
+        ffn.W_down.data[EMBED_LO + init_pc_lo, lo_unit] = -2.0 / S
 
         # Cancel EMBED_HI[init_pc_hi] (mirror of the LO cancel).
-        ffn.W_up.data[unit, HAS_SE] = S
-        ffn.b_up.data[unit] = -S * 0.5
-        ffn.W_gate.data[unit, MARK_PC] = 1.0
-        ffn.W_down.data[EMBED_HI + init_pc_hi, unit] = -2.0 / S
-        unit += 1
+        ffn.W_up.data[hi_unit, HAS_SE] = S
+        ffn.b_up.data[hi_unit] = -S * 0.5
+        ffn.W_gate.data[hi_unit, MARK_PC] = 1.0
+        ffn.W_down.data[EMBED_HI + init_pc_hi, hi_unit] = -2.0 / S
 
-        ffn._l2_unit_counter = unit
-
-    # Dim-ownership claims: two FFN units (allocated at the L2 unit counter,
-    # which is 8 after _set_layer2_mem_byte_flags). Each writes one EMBED
-    # nibble.  PC_OFFSET is a runtime constant from constants.py, so resolve
-    # init_pc_lo/hi at op-construction time for the claim columns.
+    # Dim-ownership claims: two FFN units pinned at indices 8 and 9 via
+    # ``_L2_FFN_UNIT_LAYOUT`` (the same offsets the legacy
+    # ``_l2_unit_counter`` handoff produced after _set_layer2_mem_byte_flags).
+    # Each writes one EMBED nibble. PC_OFFSET is a runtime constant from
+    # constants.py, so resolve init_pc_lo/hi at op-construction time for
+    # the claim columns.
     from ...constants import PC_OFFSET as _PC_OFFSET
     _init_pc_lo = _PC_OFFSET & 0xF
     _init_pc_hi = (_PC_OFFSET >> 4) & 0xF
@@ -195,10 +275,12 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         migrated=True,
         claims=_claims,
         declarative_authority="spec_generated",
-        # Allocates 2 FFN units starting at ``ffn._l2_unit_counter`` (which
-        # ``make_layer2_mem_byte_flags_op`` sets to 8). Result: writes units
-        # 8 and 9 -> max index 10. The aggregator takes the per-block max
-        # across all annotated ops, so reporting 10 here covers both.
+        # Allocates 2 FFN units pinned at indices 8 and 9 via
+        # ``_L2_FFN_UNIT_LAYOUT`` (same offsets the legacy
+        # ``ffn._l2_unit_counter`` handoff produced). Result: writes
+        # units 8 and 9 -> max index 10. The aggregator takes the
+        # per-block max across all annotated ops, so reporting 10 here
+        # covers both.
         ffn_units_used=10,
         # B12 backfill (wave 1c): basic ``after`` reference per
         # docs/B12_BACKFILL_SPEC.md §26 (manual-judgment bucket; the
