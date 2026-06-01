@@ -1,10 +1,72 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L2 attention-head layout (pinned indices) ======================
+#
+# Two ops claim heads on the L2 attention block today:
+#
+#   * ``layer2_threshold_attn`` (phase=2)            -> head 0
+#   * ``layer2_lookback_detection_head`` (phase=2.1) -> head 1
+#
+# The lookback head is conditionally enabled at runtime via
+# ``enable_conversational_io``; we still claim its head index in the
+# allocator so the layout is structurally stable across builds (the
+# bake itself early-returns when the gate is off, so no weights move
+# either way). Pre-migration each call site picked its ``head_idx``
+# as a bare integer literal — ``heads=[0]`` in the threshold call and
+# ``head_idx=1`` in the lookback :class:`DeclarativeAttentionHeadSpec`
+# — which made adding a future L2 head fragile (the author had to
+# remember which slots were already taken). With the allocator the
+# handoff is structural: each bake instantiates its OWN allocator
+# pre-loaded with the full L2 head layout (pinned to existing slots),
+# stashes it on ``attn._l2_head_allocator`` for downstream inspection,
+# and resolves its own head index by name. A future L2 attention op
+# can claim a free head via ``allocator.alloc(name, layer_idx=2)`` --
+# with no ``pin=`` -- without touching this table.
+_L2_HEAD_LAYOUT = (
+    # (op-name key,                          pinned head_idx)
+    ("layer2_threshold_attn",                0),
+    ("layer2_lookback_detection_head",       1),
+)
+
+
+def _allocate_layer2_attention_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with all L2 heads.
+
+    Every entry in :data:`_L2_HEAD_LAYOUT` is pinned at its existing
+    ``head_idx`` so the underlying primitive calls -- which still write
+    the same weights to the same heads -- land byte-identically. Both
+    ``layer2_threshold_attn`` and ``layer2_lookback_detection_head``
+    call this so each can look up its own head by name without baking
+    in an integer literal at the call site.
+    """
+    allocator = AttentionHeadAllocator()
+    for name, head_idx in _L2_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=2, pin=head_idx)
+    return allocator
+
+
+def _l2_head_idx(op_name: str) -> int:
+    """Return the pinned L2 ``head_idx`` for ``op_name``.
+
+    Static lookup against :data:`_L2_HEAD_LAYOUT` for callers that
+    cannot instantiate a per-bake allocator (e.g. ``compiler_ir_factory``
+    helpers, which run outside the bake and receive only dim positions
+    and ``HD``). The runtime bakes still go through
+    :func:`_allocate_layer2_attention_heads` so the collision-checked
+    allocator path is exercised on every weight write.
+    """
+    for name, head_idx in _L2_HEAD_LAYOUT:
+        if name == op_name:
+            return head_idx
+    raise KeyError(f"_l2_head_idx: unknown L2 attention op {op_name!r}")
 
 
 # === L2 FFN unit layout (pinned offsets) ============================
@@ -304,8 +366,19 @@ def make_layer2_threshold_attn_op() -> Operation:
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(ALIBI_S)
         HD = attn.W_q.shape[0] // attn.num_heads
+        # Per-bake attention-head allocator with the full L2 head layout
+        # pinned. Looking up the threshold head by name keeps its index
+        # identical to the legacy ``heads=[0]`` literal without baking
+        # the integer into the call site.
+        allocator = _allocate_layer2_attention_heads()
+        attn._l2_head_allocator = allocator
+        threshold_head_idx = next(
+            h.head_idx for h in allocator.heads()
+            if h.op_name == "layer2_threshold_attn"
+        )
         Primitives.generate_threshold_attention_heads(
-            attn, [5.5], [proxy.L2H0], ALIBI_S, HD, heads=[0], bd=proxy,
+            attn, [5.5], [proxy.L2H0], ALIBI_S, HD,
+            heads=[threshold_head_idx], bd=proxy,
         )
 
     # Dim-ownership claims: 1 threshold head on L2 attn, head 0 writing L2H0.
@@ -347,12 +420,14 @@ def make_layer2_threshold_attn_op() -> Operation:
 def _layer2_threshold_ir(dim_positions, HD) -> CompilerIR:
     proxy = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
+    # Pull the head index from the shared L2 layout so the IR path and
+    # the bake path stay in lockstep -- no integer literal here.
     ir.layer(0).attention.extend(Primitives.threshold_attention_head_specs(
         [5.5],
         [proxy.L2H0],
         10.0,
         HD,
-        heads=[0],
+        heads=[_l2_head_idx("layer2_threshold_attn")],
         bd=proxy,
     ))
     return ir
@@ -385,8 +460,20 @@ def make_layer2_lookback_detection_head_op(
         if not enable_conversational_io:
             return
         attn = block.attn
+        # Per-bake attention-head allocator with the full L2 head layout
+        # pinned. Resolving the lookback head by name reproduces the
+        # legacy ``head_idx=1`` literal without depending on the
+        # threshold op having already populated ``attn._l2_head_allocator``.
+        allocator = _allocate_layer2_attention_heads()
+        attn._l2_head_allocator = allocator
+        lookback_head_idx = next(
+            h.head_idx for h in allocator.heads()
+            if h.op_name == "layer2_lookback_detection_head"
+        )
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-            attn.alibi_slopes[1] = 10.0  # Steep slope to favor most recent token
+            # Steep slope to favor most recent token. Index from the
+            # allocator so the slot stays in sync with the spec below.
+            attn.alibi_slopes[lookback_head_idx] = 10.0
         proxy = _as_setdim_proxy(dim_positions)
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_head(
@@ -439,8 +526,12 @@ def _layer2_lookback_detection_head_ir(dim_positions, HD) -> CompilerIR:
 
 def _layer2_lookback_detection_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     L = 20.0
+    # Pull the head index from the shared L2 layout rather than baking
+    # in a ``head_idx=1`` literal here. Both the bake and IR paths
+    # consult the same source of truth, so renumbering the layout in
+    # one place stays consistent across every consumer.
     return DeclarativeAttentionHeadSpec(
-        head_idx=1,
+        head_idx=_l2_head_idx("layer2_lookback_detection_head"),
         q=(AP(0, BD.CONST, L),),
         k=(AP(0, BD.CONST, L),),
         v=(
