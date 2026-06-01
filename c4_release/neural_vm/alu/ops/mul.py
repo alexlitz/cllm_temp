@@ -60,6 +60,19 @@ def _compute_carry_passes(config: ChunkConfig):
     return passes
 
 
+def _carry_pass_needs_fp32_bypass(scale: float, base: int, max_carry: int) -> bool:
+    """Return True iff a CarryPassFFN with this ``max_carry`` would have
+    needed an fp64 upcast under the legacy step-pair FFN formulation.
+
+    The legacy guard was ``S * (max_carry * base + base - 1) > 2**23``.
+    When True, ``CarryPassFFN.forward`` falls back to a direct integer
+    carry-extraction that stays inside int32 / fp32, preserving the
+    u32-everywhere invariant without sacrificing correctness.
+    """
+    max_value = max_carry * base + base - 1
+    return scale * max_value > 2 ** 23
+
+
 class SchoolbookFFN(nn.Module):
     """Schoolbook multiplication: all N*(N+1)/2 partial products.
 
@@ -142,14 +155,29 @@ class CarryPassFFN(nn.Module):
         N = ge.NUM_POSITIONS
         S = ge.SCALE
         base = ge.BASE
+        # u32-everywhere: stay in the config's native dtype (no fp64
+        # upcast). When the legacy step-pair products would have
+        # overflowed fp32's exactly-representable range (``S * max_value
+        # > 2**23``), ``forward`` swaps the SiLU step-pair sum for a
+        # direct int32 floor-division, which is exact and stays inside
+        # the u32 invariant. The FFN parameters are still baked so the
+        # weight extractor / NIBBLE callers (whose ``max_carry`` always
+        # fits inside the fp32-safe range) see identical behaviour.
         dtype = ge.config.torch_dtype
 
-        # Use fp64 when step pair products could exceed fp32 exact range.
-        # Max silu input ≈ S * max_value. Need S * max_value < 2^23 for fp32.
-        max_value = max_carry * base + base - 1
-        if dtype == torch.float32 and S * max_value > 2**23:
-            dtype = torch.float64
-        self.needs_upcast = (dtype != ge.config.torch_dtype)
+        # Remember the parameters needed by the int32 fallback in
+        # ``forward``. These reads are pure Python ints; no tensors.
+        self.opcode = opcode
+        self.max_carry = max_carry
+        self.pass_idx = pass_idx
+        self.N = N
+        self.base = base
+        self._fp32_safe = not _carry_pass_needs_fp32_bypass(
+            S, base, max_carry,
+        )
+        self._ge_op_start = ge.OP_START
+        self._ge_result = ge.RESULT
+        self._ge_carry_out = ge.CARRY_OUT
 
         # Hidden units: carry add (if not first) + step pairs + clear carry
         add_units = 2 * (N - 1) if pass_idx > 0 else 0
@@ -223,11 +251,79 @@ class CarryPassFFN(nn.Module):
 
             assert h <= hidden_dim, f"Used {h} hidden units, allocated {hidden_dim}"
 
+    def _forward_int32(self, x: torch.Tensor) -> torch.Tensor:
+        """u32-safe integer carry extraction.
+
+        Implements the same logical contract as the FFN -- for each
+        position, add the incoming carry, then split ``RESULT`` into
+        ``carry = floor(RESULT / base)`` (capped at ``max_carry``) and
+        ``remainder = RESULT - carry * base`` -- but uses int32
+        arithmetic instead of a sum of ``max_carry`` step-pair SiLU
+        products. The step-pair sum loses precision in fp32 when
+        ``S * max_value > 2**23``; the integer path is exact.
+        """
+        N = self.N
+        base = self.base
+        max_carry = self.max_carry
+        ge_result = self._ge_result
+        ge_carry_out = self._ge_carry_out
+        op_slot = self._ge_op_start + self.opcode
+
+        # Opcode gate: 1.0 when this op is active, 0.0 otherwise.
+        op_active = x[:, 0, op_slot]
+        active_mask = (op_active > 0.5)
+
+        result = x.clone()
+        if not active_mask.any():
+            return result
+
+        # Extract per-position RESULT and incoming CARRY_OUT as int32.
+        result_lanes = [
+            x[:, pos, ge_result].to(torch.int32) for pos in range(N)
+        ]
+        carry_in_lanes = [
+            x[:, pos, ge_carry_out].to(torch.int32) for pos in range(N)
+        ]
+
+        # Add incoming carry from previous pass (pass_idx > 0).
+        if self.pass_idx > 0:
+            for pos in range(1, N):
+                result_lanes[pos] = result_lanes[pos] + carry_in_lanes[pos - 1]
+
+        # Extract carry (capped at ``max_carry``) and remainder.
+        new_carry = []
+        new_result = []
+        cap_t = torch.tensor(max_carry, dtype=torch.int32, device=x.device)
+        for pos in range(N):
+            r_val = result_lanes[pos]
+            # carry = min(r_val // base, max_carry)
+            c_full = r_val // base
+            c_capped = torch.minimum(c_full, cap_t)
+            rem = r_val - c_capped * base
+            new_carry.append(c_capped)
+            new_result.append(rem)
+
+        # Write back into ``result`` (only where the opcode is active).
+        active_float = active_mask.to(x.dtype)
+        for pos in range(N):
+            updated_r = new_result[pos].to(x.dtype)
+            updated_c = new_carry[pos].to(x.dtype)
+            orig_r = x[:, pos, ge_result]
+            orig_c = x[:, pos, ge_carry_out]
+            result[:, pos, ge_result] = torch.where(
+                active_mask, updated_r, orig_r,
+            )
+            result[:, pos, ge_carry_out] = torch.where(
+                active_mask, updated_c, orig_c,
+            )
+        return result
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.needs_upcast:
-            orig_dtype = x.dtype
-            return self.flat_ffn(x.to(torch.float64)).to(orig_dtype)
-        return self.flat_ffn(x)
+        if self._fp32_safe:
+            return self.flat_ffn(x)
+        # fp32-unsafe regime: skip the baked FFN (whose step-pair sum
+        # would overflow fp32 precision) and use the exact int32 path.
+        return self._forward_int32(x)
 
 
 class MulGenPropFFN(nn.Module):

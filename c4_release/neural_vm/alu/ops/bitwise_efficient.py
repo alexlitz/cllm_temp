@@ -37,8 +37,10 @@ class EfficientAndFFN(nn.Module):
 
         result = x.clone()
         for pos in range(N):
-            a = x[:, pos, self.ge.NIB_A].long()
-            b = x[:, pos, self.ge.NIB_B].long()
+            # u32-everywhere: byte lanes (0..255) fit in int32; no int64
+            # widening needed for the bitwise op.
+            a = x[:, pos, self.ge.NIB_A].to(torch.int32)
+            b = x[:, pos, self.ge.NIB_B].to(torch.int32)
             result[:, pos, self.ge.RESULT] = (a & b).float() * op_active
 
         return result
@@ -59,8 +61,10 @@ class EfficientOrFFN(nn.Module):
 
         result = x.clone()
         for pos in range(N):
-            a = x[:, pos, self.ge.NIB_A].long()
-            b = x[:, pos, self.ge.NIB_B].long()
+            # u32-everywhere: byte lanes (0..255) fit in int32; no int64
+            # widening needed for the bitwise op.
+            a = x[:, pos, self.ge.NIB_A].to(torch.int32)
+            b = x[:, pos, self.ge.NIB_B].to(torch.int32)
             result[:, pos, self.ge.RESULT] = (a | b).float() * op_active
 
         return result
@@ -81,8 +85,10 @@ class EfficientXorFFN(nn.Module):
 
         result = x.clone()
         for pos in range(N):
-            a = x[:, pos, self.ge.NIB_A].long()
-            b = x[:, pos, self.ge.NIB_B].long()
+            # u32-everywhere: byte lanes (0..255) fit in int32; no int64
+            # widening needed for the bitwise op.
+            a = x[:, pos, self.ge.NIB_A].to(torch.int32)
+            b = x[:, pos, self.ge.NIB_B].to(torch.int32)
             result[:, pos, self.ge.RESULT] = (a ^ b).float() * op_active
 
         return result
