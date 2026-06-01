@@ -1,10 +1,68 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L7 attention head layout (pinned head_idx per primary owner) ====
+#
+# L7 is attention-heavy: every op in this file writes Q/K/V/O for one or
+# more attention heads. This table is the single source of truth for the
+# L7 head axis -- every existing ``head_idx=N`` literal in the spec
+# functions below is pinned here, so the bakes pull the same indices
+# they always have and byte-identity is trivially preserved.
+#
+# Each row names a *primary owner* of its head_idx. Two L7 ops legitimately
+# extend an already-owned head: ``layer7_sp_byte0_is_f8`` adds V/O slots
+# 6+7 to head 6 (primary owner ``layer7_memory_heads``) and
+# ``format_pointer_extraction`` (gated) reuses head 7's slot range.
+# Extensions are documented in the comments below and resolve their
+# head_idx via :data:`_L7_HEAD_LAYOUT_BY_NAME` rather than re-pinning the
+# same slot, which the allocator forbids (heads cannot be aliased).
+#
+# Order mirrors the op-factory order in this file (operand_gather, then
+# memory_heads heads 2-7) so the layout reads top-to-bottom alongside the
+# specs that own each row.
+_L7_HEAD_LAYOUT = (
+    # (op_name, head_idx)
+    ("layer7_operand_gather.head_0",     0),  # operand A gather (STACK0 byte 0 -> ALU)
+    ("layer7_operand_gather.head_1",     1),  # operand A gather (BP/SP OUTPUT -> ALU for LEA/ADJ/ENT)
+    ("layer7_memory_heads.head_2",       2),  # gather prev AX byte 0 -> ADDR_B0_LO/HI
+    ("layer7_memory_heads.head_3",       3),  # gather prev AX byte 1 -> ADDR_B1_LO/HI
+    ("layer7_memory_heads.head_4",       4),  # gather prev AX byte 2 -> ADDR_B2_LO/HI
+    ("layer7_memory_heads.head_5",       5),  # LI/LC/LEA/bitwise/JSR/no-carry/ADD/SUB flag relay
+    ("layer7_memory_heads.head_6",       6),  # PSH/CMP relay (extended by layer7_sp_byte0_is_f8)
+    ("layer7_memory_heads.head_7",       7),  # MEM flag broadcast (reused by format_pointer_extraction when gated)
+)
+_L7_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L7_HEAD_LAYOUT}
+
+
+def _allocate_layer7_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with all L7 heads.
+
+    Each primary owner from :data:`_L7_HEAD_LAYOUT` is pinned at its
+    existing ``head_idx``; the allocator therefore declares the full L7
+    head axis without disturbing any baked attention weights. Returns
+    the allocator so callers can inspect it or extend the layer with a
+    future op that wants a new head via ``allocator.alloc(name, 7)``
+    (no pin, which first-fits the lowest free index -- there are none
+    today since heads 0..7 are all claimed, but the contract is in
+    place for a wider config).
+
+    This is byte-identical bookkeeping: the allocator names the heads,
+    the bakes still write the same Q/K/V/O cells they always have.
+    Each ``head_idx=N`` literal in the spec functions below is sourced
+    from :data:`_L7_HEAD_LAYOUT_BY_NAME`, so adding a new head requires
+    only a layout-table edit.
+    """
+    allocator = AttentionHeadAllocator(layer_max_heads=8)
+    for name, head_idx in _L7_HEAD_LAYOUT:
+        allocator.alloc(name, 7, pin=head_idx)
+    return allocator
 
 
 # === L7 FFN unit layout (pinned offsets) ============================
@@ -71,6 +129,12 @@ def make_layer7_operand_gather_op() -> Operation:
         # from ca775eb.
         allocator = _allocate_layer7_ffn_units()
         block.ffn._l7_unit_allocator = allocator
+
+        # Per-bake attention-head allocator. Pins every L7 head_idx at
+        # its existing slot so the bake is byte-identical; stashed on
+        # ``block.attn`` for inspection / extension by downstream tools.
+        head_allocator = _allocate_layer7_heads()
+        block.attn._l7_head_allocator = head_allocator
 
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
@@ -145,7 +209,7 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
 
     return (
         DeclarativeAttentionHeadSpec(
-            head_idx=0,
+            head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_operand_gather.head_0"],
             q=(
                 AP(0, BD.MARK_AX, L),
                 AP(0, BD.OP_LEA, -L),
@@ -168,7 +232,7 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
             ),
         ),
         DeclarativeAttentionHeadSpec(
-            head_idx=1,
+            head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_operand_gather.head_1"],
             q=(
                 AP(0, BD.MARK_AX, L * 10),
                 AP(0, BD.OP_LEA, L),
@@ -209,6 +273,12 @@ def make_layer7_memory_heads_op() -> Operation:
         # bookkeeping.
         allocator = _allocate_layer7_ffn_units()
         block.ffn._l7_unit_allocator = allocator
+
+        # Per-bake attention-head allocator. See
+        # ``make_layer7_operand_gather_op`` for the rationale: pins every
+        # L7 head_idx at its existing slot so byte-identity is preserved.
+        head_allocator = _allocate_layer7_heads()
+        block.attn._l7_head_allocator = head_allocator
 
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[1] = 5.0  # head 1: MEM flag broadcast
@@ -309,7 +379,7 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     specs: list[DeclarativeAttentionHeadSpec] = [
         # Head 7: MEM flag broadcast (MEM marker -> MEM byte positions).
         DeclarativeAttentionHeadSpec(
-            head_idx=7,
+            head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_memory_heads.head_7"],
             q=(
                 AP(0, BD.MARK_MEM, L),
                 AP(0, BD.H3 + MEM_I, L),
@@ -335,8 +405,13 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     ]
 
     # Heads 2-4: Gather previous AX bytes into address-byte staging dims.
+    _head_2_4_layout_names = (
+        "layer7_memory_heads.head_2",
+        "layer7_memory_heads.head_3",
+        "layer7_memory_heads.head_4",
+    )
     for j in range(3):
-        head = 2 + j
+        head = _L7_HEAD_LAYOUT_BY_NAME[_head_2_4_layout_names[j]]
         byte_idx_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][j]
         addr_lo_out = [BD.ADDR_B0_LO, BD.ADDR_B1_LO, BD.ADDR_B2_LO][j]
         addr_hi_out = [BD.ADDR_B0_HI, BD.ADDR_B1_HI, BD.ADDR_B2_HI][j]
@@ -372,7 +447,7 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     # previously ran as a post-helper row multiply in ``bake``.
     specs.append(
         DeclarativeAttentionHeadSpec(
-            head_idx=5,
+            head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_memory_heads.head_5"],
             q=(AP(0, BD.MARK_AX, L), AP(0, BD.H1 + AX_I, L)),
             k=(AP(0, BD.MARK_AX, L * 2.0),),
             v=(
@@ -413,7 +488,7 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     # Head 6: Relay PSH/ENT/JSR from STACK0 marker and PSH_AT_SP from SP.
     specs.append(
         DeclarativeAttentionHeadSpec(
-            head_idx=6,
+            head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_memory_heads.head_6"],
             q=(
                 AP(0, BD.MARK_STACK0, L),
                 AP(0, BD.H4 + BP_I, L),
@@ -471,6 +546,13 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
         allocator = _allocate_layer7_ffn_units()
         block.ffn._l7_unit_allocator = allocator
 
+        # Per-bake attention-head allocator. Built unconditionally for
+        # the same reason as the FFN-unit allocator above -- the L7 head
+        # axis is declared once, regardless of the conversational-IO
+        # gate. Byte-identical bookkeeping.
+        head_allocator = _allocate_layer7_heads()
+        block.attn._l7_head_allocator = head_allocator
+
         if not enable_conversational_io:
             return
         attn = block.attn
@@ -520,8 +602,13 @@ def _format_pointer_extraction_spec(BD) -> DeclarativeAttentionHeadSpec:
         v.append(AP(17 + k, BD.EMBED_HI + k, 1.0))
         o.append(AO(BD.FORMAT_PTR_LO + k, 1 + k, 1.0))
         o.append(AO(BD.FORMAT_PTR_HI + k, 17 + k, 1.0))
+    # head_idx sourced from _L7_HEAD_LAYOUT: format_pointer_extraction
+    # reuses head 7's slot range when ``enable_conversational_io`` is
+    # on. The primary owner of head 7 is ``layer7_memory_heads`` (MEM
+    # flag broadcast); when the gate is on this op writes V/O slots
+    # 1..32 that the primary owner does not touch.
     return DeclarativeAttentionHeadSpec(
-        head_idx=7,
+        head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_memory_heads.head_7"],
         q=(AP(0, BD.IO_IN_OUTPUT_MODE, L),),
         k=(AP(0, BD.MARK_STACK0, L),),
         v=tuple(v),
@@ -584,6 +671,15 @@ def make_layer7_sp_byte0_is_f8_op() -> Operation:
         allocator = _allocate_layer7_ffn_units()
         block.ffn._l7_unit_allocator = allocator
 
+        # Per-bake attention-head allocator. See
+        # ``make_layer7_operand_gather_op`` for the rationale: pins every
+        # L7 head_idx at its existing slot. Head 6 is owned by
+        # ``layer7_memory_heads``; this op extends the same head with
+        # V/O slots 6+7, sourced via ``_L7_HEAD_LAYOUT_BY_NAME`` so the
+        # extension cannot drift from the primary owner.
+        head_allocator = _allocate_layer7_heads()
+        block.attn._l7_head_allocator = head_allocator
+
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_head(
             attn, _layer7_sp_byte0_is_f8_spec(BD), HD,
@@ -631,8 +727,11 @@ def _layer7_sp_byte0_is_f8_spec(BD) -> DeclarativeAttentionHeadSpec:
     wiring with zero weights.
     """
 
+    # head_idx sourced from _L7_HEAD_LAYOUT: this op extends head 6,
+    # owned by ``layer7_memory_heads`` (PSH/CMP relay). Slots 1..5 are
+    # written by the primary owner; we add slots 6+7 here.
     return DeclarativeAttentionHeadSpec(
-        head_idx=6,
+        head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_memory_heads.head_6"],
         q=(),
         k=(),
         v=(
