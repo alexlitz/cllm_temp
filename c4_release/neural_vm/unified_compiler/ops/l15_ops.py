@@ -1248,6 +1248,11 @@ def make_l15_attention_resize_op() -> Operation:
         layer_idx=15,
         migrated=True,
         declarative_authority="structural_model",
+        # B12 backfill (wave 1c): structural cleanup that resizes L15
+        # attention after the nibble-copy weights are baked. The op writes
+        # no dims, so the dep DAG can't derive the post-bake placement on
+        # its own. See docs/B12_BACKFILL_SPEC.md §1.
+        requires={"after": "layer15_nibble_copy"},
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )
