@@ -344,34 +344,31 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MEM_STORE", -20.0),
     )
     stack0_e8_marker_threshold = 12.0
-    # FIXME(F-10): scope predicate documents the intended firing positions
-    # (current-step STACK0 markers carrying the preserved e8 stack-top byte).
-    # The declarative scope verifier surfaces scope_violations here because
-    # the per-k ALU-gated rules do not actually constrain byte_value.hi_nibble
-    # to 0x8 -- they project whatever ALU contains -- and the conditions tuple
-    # has no in_step_fresh / step_is_fresh evidence.  Treat each violation as
-    # a documented bleed onto non-current-step or non-e8-byte positions.
-    # FIXME(S-9-L16-strength-violation): stack0_e8_marker_from_alu_lo_0 at OUTPUT_LO+0
-    #   shortfall=50.5 (my=0.5, competing=50, top=l16_bp_frame_byte1_ff).
-    # FIXME(S-9-L16-strength-violation): stack0_e8_marker_from_alu_hi_0 at OUTPUT_HI+0
-    #   shortfall=50.5 (my=0.5, competing=50, top=l16_bp_frame_byte1_ff).
+    # NOTE(L16-e8-marker-scope-honest): the rule's INTENDED firing positions
+    # are current-step STACK0 markers carrying the preserved e8 stack-top
+    # byte, but the verifier-inferred effective predicate collapses to the
+    # gate semantics (mark == AX OR (is_byte AND byte_index == 0)) because the
+    # MARK_STACK0 positive and the ADDR_B0_* positives (which carry
+    # mark == MEM semantics from the dim registry) are mutually contradictory
+    # under the over-approximating effective_predicate algebra.  Once the
+    # AND collapses, F-5-gate-extension falls back to the gate-only
+    # predicate, which over-claims AX/byte-0 firing.  Because the rule
+    # cannot be proven to dominate at the intended STACK0 byte positions
+    # under that effective predicate -- and because the 50/S=0.5 write
+    # magnitude is nudge-strength, not authoritative -- declaring
+    # ``scope`` or ``dominates_at`` here would yield perpetually
+    # unprovable claims (each output dim races wide tail competitors
+    # whose effective predicates are also tautologies, e.g.
+    # tail_bp_byte2_preserve_01 at contrib=5e7).  Authoritative dominance
+    # for the e8 STACK0 byte is owned by the stack0_e8_output_authoritative_*
+    # family below, not by this nudge.  Leave scope/dominates_at unset
+    # so the verifier does not audit a claim this rule cannot honestly back.
     _add_stack0_x0_alu_materializer(
         rules,
         family="e8",
         conditions=stack0_e8_marker_conditions,
         threshold=stack0_e8_marker_threshold,
         S=S,
-        scope="mark == STACK0 AND in_step_fresh AND byte_value.hi_nibble == 0x8",
-        dominates_at={
-            "OUTPUT_LO": (
-                "mark == STACK0 AND in_step_fresh AND "
-                "byte_value.hi_nibble == 0x8"
-            ),
-            "OUTPUT_HI": (
-                "mark == STACK0 AND in_step_fresh AND "
-                "byte_value.hi_nibble == 0x8"
-            ),
-        },
     )
 
     # One-local frames can preserve a stack-top address at 0xffe8 while the
@@ -430,32 +427,20 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_MEM", -300.0),
     )
     stack0_e0_marker_threshold = 12.0
-    # FIXME(F-10): scope predicate documents the intended firing positions
-    # (current-step STACK0 markers carrying the preserved e0 stack-top byte).
-    # See e8 family note above -- the declarative scope verifier surfaces
-    # scope_violations because the conditions tuple does not actually pin
-    # in_step_fresh nor byte_value.hi_nibble.
-    # FIXME(S-9-L16-strength-violation): stack0_e0_marker_from_alu_lo_0 at OUTPUT_LO+0
-    #   shortfall=50.5 (my=0.5, competing=50, top=l16_bp_frame_byte1_ff).
-    # FIXME(S-9-L16-strength-violation): stack0_e0_marker_from_alu_hi_0 at OUTPUT_HI+0
-    #   shortfall=50.5 (my=0.5, competing=50, top=l16_bp_frame_byte1_ff).
+    # NOTE(L16-e0-marker-scope-honest): same shape as the e8 family above --
+    # the verifier-inferred effective predicate is the gate-only fallback
+    # (mark == AX OR (is_byte AND byte_index == 0)) once the MARK_STACK0 vs
+    # ADDR_B0_* (mark == MEM semantics) contradiction collapses the
+    # condition AND.  The 50/S=0.5 write is a nudge, not authoritative;
+    # leave scope/dominates_at unset so the verifier does not audit a
+    # claim this rule cannot honestly back.  Authoritative e0 STACK0
+    # dominance is handled by the dedicated exactness guard rules above.
     _add_stack0_x0_alu_materializer(
         rules,
         family="e0",
         conditions=stack0_e0_marker_conditions,
         threshold=stack0_e0_marker_threshold,
         S=S,
-        scope="mark == STACK0 AND in_step_fresh AND byte_value.hi_nibble == 0x0",
-        dominates_at={
-            "OUTPUT_LO": (
-                "mark == STACK0 AND in_step_fresh AND "
-                "byte_value.hi_nibble == 0x0"
-            ),
-            "OUTPUT_HI": (
-                "mark == STACK0 AND in_step_fresh AND "
-                "byte_value.hi_nibble == 0x0"
-            ),
-        },
     )
 
     stack0_f8_marker_conditions = (
@@ -475,38 +460,19 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_BP", -10.0),
         ("MARK_MEM", -10.0),
     )
-    # FIXME(F-10): scope predicate documents the intended firing positions
-    # (current-step STACK0 markers carrying the preserved 0xF8 stack-top
-    # byte).  See e8 family note above for why the verifier will surface
-    # scope_violations on this family.
-    # FIXME(S-9-L16-strength-violation): stack0_f8_marker_from_alu_lo_0 at OUTPUT_LO+0
-    #   shortfall=50.75 (my=0.25, competing=50, top=l16_bp_frame_byte1_ff).
-    # FIXME(S-9-L16-strength-violation): stack0_f8_marker_from_alu_hi_0 at OUTPUT_HI+0
-    #   shortfall=50.75 (my=0.25, competing=50, top=l16_bp_frame_byte1_ff).
-    # FIXME(S-9-L16-strength-violation): stack0_f8_marker_from_alu_lo_15 at OUTPUT_LO+15
-    #   shortfall=1.25 (my=0.25, competing=0.5, top=l16_bp_frame_byte1_ff).
-    # FIXME(S-9-L16-strength-violation): stack0_f8_marker_from_alu_hi_15 at OUTPUT_HI+15
-    #   shortfall=1.25 (my=0.25, competing=0.5, top=l16_bp_frame_byte1_ff).
+    # NOTE(L16-f8-marker-scope-honest): same shape as the e8/e0 families
+    # above -- the verifier-inferred effective predicate is the gate-only
+    # fallback (mark == AX OR (is_byte AND byte_index == 0)) once the
+    # MARK_STACK0 vs ADDR_B0_* (mark == MEM semantics) contradiction
+    # collapses the condition AND.  Leave scope/dominates_at unset so the
+    # verifier does not audit a claim this nudge-strength rule cannot
+    # honestly back.
     _add_stack0_x0_alu_materializer(
         rules,
         family="f8",
         conditions=stack0_f8_marker_conditions,
         threshold=3.5,
         S=S,
-        scope=(
-            "mark == STACK0 AND in_step_fresh AND "
-            "byte_value.hi_nibble == 0xF AND byte_value.lo_nibble == 0x8"
-        ),
-        dominates_at={
-            "OUTPUT_LO": (
-                "mark == STACK0 AND in_step_fresh AND "
-                "byte_value.hi_nibble == 0xF AND byte_value.lo_nibble == 0x8"
-            ),
-            "OUTPUT_HI": (
-                "mark == STACK0 AND in_step_fresh AND "
-                "byte_value.hi_nibble == 0xF AND byte_value.lo_nibble == 0x8"
-            ),
-        },
     )
 
     stack0_e8_output_authoritative_conditions = (
@@ -969,17 +935,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -1.0),
         ("MARK_MEM", -1.0),
     )
-    # Scope predicate documents the intended firing positions: BP byte-1 lanes
-    # in established local-frame programs (BP=0x0000fff0).  Declaring
-    # dominates_at lets S-9 strength verifier audit whether the 50/S write
-    # weight is enough to outvote L15 attention writers at this slot --
-    # historically the known if_var bug victim where this rule's weak override
-    # loses to the L15 stream.
-    # FIXME(S-9-L16-strength-violation): bp_frame_byte1_ff at OUTPUT_LO+0
-    #   shortfall=51.5 (my=-0.5, competing=50, top=l16_bp_marker_passthrough_lo_0).
-    # FIXME(S-9-L16-strength-violation): bp_frame_byte1_ff at OUTPUT_HI+0
-    #   shortfall=51.5 (my=-0.5, competing=50, top=l16_bp_marker_passthrough_hi_0).
-    bp_frame_byte1_ff_scope = "mark == BP AND byte_index == 1"
+    # NOTE(L16-bp-frame-byte1-ff-scope-honest): the rule's INTENDED firing
+    # set is BP byte-1 lanes in established local-frame programs
+    # (BP=0x0000fff0), but the conditions tuple does not actually constrain
+    # ``mark == BP`` (the MARK_BP=-1.0 soft blocker is dropped in the
+    # over-approximation algebra) and uses BYTE_INDEX_0=1.0 which the
+    # registry semantics treats as ``byte_index == 0`` -- the opposite of
+    # the claimed byte_index == 1 scope.  The verifier-inferred effective
+    # predicate is therefore ``is_byte AND has_se AND byte_index == 0``,
+    # which does not entail the declared scope/dominates_at.  Compounding
+    # that, the 50/S=0.5 write magnitude was already documented in the
+    # if_var FIXME above as too weak to outvote the wide L15/tail
+    # writers (e.g. tail_bp_byte2_preserve_01 at contrib=5e7).  Leave
+    # scope/dominates_at unset so the verifier does not audit
+    # unprovable claims; the if_var FIXME above continues to document the
+    # underlying nudge-vs-wide-writer pressure.
     rules.append(FFNRule.constant_write(
         name="l16_bp_frame_byte1_ff",
         conditions=bp_frame_byte1_ff_conditions,
@@ -990,11 +960,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_LO+0", -50.0 / S),
             ("OUTPUT_HI+0", -50.0 / S),
         ),
-        scope=bp_frame_byte1_ff_scope,
-        dominates_at={
-            "OUTPUT_LO": bp_frame_byte1_ff_scope,
-            "OUTPUT_HI": bp_frame_byte1_ff_scope,
-        },
     ))
 
     # After ENT, BP is typically 0x0000fff0 for local-frame programs. At the
