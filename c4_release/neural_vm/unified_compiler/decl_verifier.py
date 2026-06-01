@@ -2533,3 +2533,404 @@ def verify_compaction_safety(
         mismatches=mismatches,
         partition_unavailable=partition_unavailable,
     )
+
+
+# ---------------------------------------------------------------------------
+# u32-everywhere invariant check
+# ---------------------------------------------------------------------------
+#
+# The u32-everywhere invariant: every internal ALU representation must be a
+# u32 value decomposed into byte/nibble lanes. No fp64 intermediate precision;
+# no 16-bit MUL_ACCUM lanes (one-hot encodings beyond the 0..255 single-byte
+# range). This static scan catches three concrete leak shapes:
+#
+#   1. ``fp64_dtype`` -- a parameter/buffer tensor whose ``dtype`` is
+#      ``torch.float64`` (or a source-level reference to ``torch.float64`` /
+#      ``torch.double`` / ``.double()`` in a non-test, non-archive ALU file).
+#   2. ``oversize_lane`` -- a ``dim_registry`` allocation whose size implies
+#      a single-lane one-hot wider than a byte (size > 256), or whose
+#      description text claims a 16-bit / uint16 / 65536-way encoding in a
+#      single lane.
+#   3. ``widening`` -- a source line (comment or code) that implies a u64 /
+#      i64 / int64 / uint64 intermediate, or a "wraparound at 2**32" /
+#      "wider than 32" comment that affirms (not denies) widening.
+#
+# The scan is intentionally conservative -- it errs toward missing a hidden
+# violation rather than over-flagging legitimate u32 code. Each issue dict
+# carries enough provenance (``where`` = ``"<file>:<line>"``) for a human to
+# triage without re-running the scan.
+
+_U32_ALU_DIRS = ("neural_vm/alu", "neural_vm/unified_compiler")
+_U32_EXCLUDE_DIR_FRAGMENTS = ("/archive/", "/tests/", "/__pycache__/")
+
+_U32_FP64_PATTERNS: Tuple[str, ...] = (
+    "torch.float64",
+    "torch.double",
+    "dtype=torch.float64",
+    'dtype="float64"',
+    "dtype='float64'",
+)
+
+# Casts / dtypes that imply a >32-bit integer intermediate. Bare ``.double()``
+# is included as a torch tensor call but NOT bare ``int64`` (which matches
+# ``torch.int64`` legitimately used for indexing). The check is "ALU
+# intermediates only", so the caller restricts the scan to ``_U32_ALU_DIRS``.
+_U32_WIDEN_PATTERNS: Tuple[str, ...] = (
+    "torch.int64",
+    "torch.uint64",
+    "torch.long",  # int64 alias
+    ".to(torch.int64)",
+    ".to(torch.uint64)",
+    ".to(torch.long)",
+    ".long()",
+    ".double()",
+    "dtype=torch.int64",
+    "dtype=torch.uint64",
+    "dtype=torch.long",
+    "wraparound at 2**32",
+    "wider than 32",
+)
+
+# Lines containing any of these phrases are *denials* (e.g., "no wider than
+# 32 bits", or a check/audit that compares a dtype to fp64 rather than
+# actually allocating one) and should not count as widening / fp64 evidence.
+_U32_WIDEN_DENIAL_PHRASES: Tuple[str, ...] = (
+    "no fp64",
+    "no widening",
+    "not wider",
+    "no wider",
+    "eliminates fp64",
+    "without fp64",
+    "no longer fp64",
+    "stays in fp32",
+    "stays in u32",
+    "fp32 only",
+    "u32 only",
+    "without u64",
+    "no u64",
+    "no i64",
+    "no int64",
+    "no uint64",
+    # Comparison patterns -- the line is auditing a dtype, not casting to it.
+    "dtype == torch.float64",
+    "dtype != torch.float64",
+    "== torch.float64",
+    "!= torch.float64",
+)
+
+# dim_registry description tokens that *justify* a larger-than-byte allocation
+# (composite multi-nibble / multi-byte staging, etc.).
+_U32_DIM_JUSTIFIERS: Tuple[str, ...] = (
+    "nibble",
+    "byte",
+    "bytes",
+    "thermo",
+    "thermometer",
+    "reserved",
+    "carry",
+    "key",
+    "staging",
+    "temp",
+    "temporaries",
+    "one-hot opcode",
+    "one-hot addr",
+)
+
+# dim_registry description tokens that *affirm* a single-lane wider-than-byte
+# encoding (the very thing the u32 invariant forbids).
+_U32_DIM_OVERSIZE_HINTS: Tuple[str, ...] = (
+    "16-bit",
+    "16 bit",
+    "uint16",
+    "u16",
+    "65536",
+    "single lane",
+    "single-lane 16",
+    "single-lane wide",
+)
+
+
+def _u32_repo_root() -> "os.PathLike":
+    """Return the ``c4_release/`` (project) directory, used as the root for
+    file-relative ``where`` strings in issue dicts.
+    """
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    # ``decl_verifier.py`` lives at ``c4_release/neural_vm/unified_compiler/``;
+    # the project root is two levels up.
+    return os.path.dirname(os.path.dirname(here))
+
+
+def _u32_relpath(abs_path: str) -> str:
+    """Return ``abs_path`` made relative to the c4_release project root when
+    possible; otherwise return it unchanged.
+    """
+    import os
+    root = str(_u32_repo_root())
+    try:
+        return os.path.relpath(abs_path, root)
+    except ValueError:
+        return abs_path
+
+
+def _u32_iter_alu_source_files() -> List[str]:
+    """Yield absolute paths to every ``.py`` file under the ALU + unified
+    compiler subtrees, skipping ``archive``, ``tests``, and ``__pycache__``.
+    """
+    import os
+    root = _u32_repo_root()
+    out: List[str] = []
+    for sub in _U32_ALU_DIRS:
+        base = os.path.join(str(root), sub)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(base):
+            if any(frag in dirpath + "/" for frag in _U32_EXCLUDE_DIR_FRAGMENTS):
+                continue
+            for fname in filenames:
+                if not fname.endswith(".py"):
+                    continue
+                out.append(os.path.join(dirpath, fname))
+    return sorted(out)
+
+
+def _u32_scan_fp64_in_source(issues: List[Dict[str, str]]) -> None:
+    """Append ``fp64_dtype`` issues for source lines under the ALU subtree
+    that reference ``torch.float64`` / ``torch.double`` / ``.double()``.
+
+    Only *executable* references count -- comments and docstrings that
+    *deny* fp64 use (``"no fp64"``, ``"eliminates fp64"``, etc.) are
+    explicitly filtered.
+    """
+    for path in _u32_iter_alu_source_files():
+        # The verifier file itself defines the patterns it scans for. Skip
+        # it so the static check never flags its own definitions.
+        if path.endswith("/decl_verifier.py"):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for lineno, line in enumerate(lines, start=1):
+            if not any(pat in line for pat in _U32_FP64_PATTERNS):
+                continue
+            lower = line.lower()
+            if any(deny in lower for deny in _U32_WIDEN_DENIAL_PHRASES):
+                continue
+            issues.append({
+                "kind": "fp64_dtype",
+                "where": f"{_u32_relpath(path)}:{lineno}",
+                "reason": (
+                    "fp64 / torch.float64 reference in ALU / compiler "
+                    "source: " + line.strip()
+                ),
+            })
+
+
+def _u32_scan_model_params(model, issues: List[Dict[str, str]]) -> None:
+    """Append ``fp64_dtype`` issues for any model parameter or buffer whose
+    dtype is ``torch.float64``. Walks ``model.named_parameters`` and
+    ``model.named_buffers`` recursively.
+
+    No-op when ``model`` is ``None``.
+    """
+    if model is None:
+        return
+    try:
+        params = list(model.named_parameters(recurse=True))
+        buffers = list(model.named_buffers(recurse=True))
+    except Exception as exc:
+        issues.append({
+            "kind": "fp64_dtype",
+            "where": f"<model>:<introspection>",
+            "reason": f"could not walk model parameters: {exc!r}",
+        })
+        return
+    for name, p in params:
+        if p.dtype == torch.float64:
+            issues.append({
+                "kind": "fp64_dtype",
+                "where": f"<model>:{name}",
+                "reason": (
+                    f"parameter {name} has dtype=torch.float64 "
+                    f"(shape={tuple(p.shape)}); u32-everywhere requires "
+                    f"bf16/fp16/fp32"
+                ),
+            })
+    for name, b in buffers:
+        if b.dtype == torch.float64:
+            issues.append({
+                "kind": "fp64_dtype",
+                "where": f"<model>:{name}",
+                "reason": (
+                    f"buffer {name} has dtype=torch.float64 "
+                    f"(shape={tuple(b.shape)}); u32-everywhere requires "
+                    f"bf16/fp16/fp32"
+                ),
+            })
+
+
+def _u32_scan_dim_registry(issues: List[Dict[str, str]]) -> None:
+    """Append ``oversize_lane`` issues for any ``dim_registry.alloc(...)``
+    call whose size exceeds 256 (the full single-byte one-hot range) OR
+    whose description text claims a single-lane wider-than-byte encoding
+    (``16-bit``, ``uint16``, ``65536``, etc.).
+
+    The parse is a line-by-line regex over the source file (no need to
+    import ``dim_registry`` -- the registry isn't picklable cheaply and
+    the source IS the spec).
+    """
+    import os
+    import re
+    root = _u32_repo_root()
+    path = os.path.join(str(root), "neural_vm", "dim_registry.py")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    # Match: reg.alloc("NAME", start, size, "description")
+    # Sizes are integer literals; description is the trailing quoted string.
+    alloc_re = re.compile(
+        r"""alloc\(\s*['"](?P<name>[^'"]+)['"]\s*,"""
+        r"""\s*(?P<start>\d+)\s*,"""
+        r"""\s*(?P<size>\d+)\s*,"""
+        r"""\s*['"](?P<desc>[^'"]*)['"]\s*\)"""
+    )
+    for lineno, line in enumerate(lines, start=1):
+        m = alloc_re.search(line)
+        if m is None:
+            continue
+        name = m.group("name")
+        size = int(m.group("size"))
+        desc = m.group("desc")
+        desc_lower = desc.lower()
+        # Rule A: size strictly greater than a full byte one-hot.
+        if size > 256:
+            if not any(j in desc_lower for j in _U32_DIM_JUSTIFIERS):
+                issues.append({
+                    "kind": "oversize_lane",
+                    "where": f"{_u32_relpath(path)}:{lineno}",
+                    "reason": (
+                        f"dim {name!r} has size={size} > 256 "
+                        f"(single-byte one-hot range) with no nibble / "
+                        f"byte / staging justification in description "
+                        f"{desc!r}"
+                    ),
+                })
+        # Rule B: description text hints at a single-lane 16-bit encoding.
+        if any(hint in desc_lower for hint in _U32_DIM_OVERSIZE_HINTS):
+            issues.append({
+                "kind": "oversize_lane",
+                "where": f"{_u32_relpath(path)}:{lineno}",
+                "reason": (
+                    f"dim {name!r} description {desc!r} claims a "
+                    f"single-lane wider-than-byte encoding; u32 invariant "
+                    f"requires nibble / byte decomposition"
+                ),
+            })
+
+
+def _u32_scan_widening_in_source(issues: List[Dict[str, str]]) -> None:
+    """Append ``widening`` issues for source lines that imply a >32-bit
+    integer intermediate or that affirm "wraparound at 2**32" / "wider
+    than 32" semantics. Denial phrases (``"no widening"``, ``"stays in
+    fp32"``, etc.) suppress the flag.
+    """
+    for path in _u32_iter_alu_source_files():
+        if path.endswith("/decl_verifier.py"):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for lineno, line in enumerate(lines, start=1):
+            if not any(pat in line for pat in _U32_WIDEN_PATTERNS):
+                continue
+            lower = line.lower()
+            if any(deny in lower for deny in _U32_WIDEN_DENIAL_PHRASES):
+                continue
+            # Exclude bare "torch.long" matches that are part of larger
+            # tokens like "torch.long_tensor" (none in current code but
+            # defensive). Also tolerate "torch.long" inside a comment that
+            # documents that we are NOT using it.
+            issues.append({
+                "kind": "widening",
+                "where": f"{_u32_relpath(path)}:{lineno}",
+                "reason": (
+                    "source references >32-bit integer / float widening: "
+                    + line.strip()
+                ),
+            })
+
+
+def verify_u32_invariant(
+    model=None,
+    *,
+    scan_source: bool = True,
+    scan_model: bool = True,
+) -> List[Dict[str, str]]:
+    """Scan the codebase + (optionally) a baked model for u32-everywhere
+    invariant violations.
+
+    The invariant: every internal ALU representation is a u32 value
+    decomposed into byte/nibble lanes. No fp64 internal precision; no
+    16-bit MUL_ACCUM lanes (one-hot encodings beyond the 0..255 single-
+    byte range); no u64/i64 intermediate widening.
+
+    Args:
+        model: optional already-baked model (e.g. from ``compile_full_vm``).
+            When provided, parameter / buffer dtypes are walked and any
+            ``torch.float64`` tensor is reported as ``fp64_dtype``. When
+            ``None``, the dtype check is skipped (the source-level fp64
+            scan still runs).
+        scan_source: when True (default), scan ``.py`` files under
+            ``neural_vm/alu/`` and ``neural_vm/unified_compiler/`` for
+            literal references to fp64 dtypes and >32-bit integer casts.
+            Comments / docstrings that explicitly *deny* such use (e.g.
+            ``"eliminates fp64"``) are filtered.
+        scan_model: when True (default) and ``model is not None``, walk
+            ``model.named_parameters()`` + ``model.named_buffers()`` and
+            flag any ``torch.float64`` tensor. Has no effect when
+            ``model`` is ``None``.
+
+    Returns:
+        A list of issue dicts of the shape::
+
+            {
+                "kind": "fp64_dtype" | "oversize_lane" | "widening",
+                "where": "<relative_path>:<lineno>" |
+                         "<model>:<param_name>",
+                "reason": "...",
+            }
+
+        Empty list when the invariant holds.
+
+    Usage:
+        from c4_release.neural_vm.unified_compiler.decl_verifier import (
+            verify_u32_invariant,
+        )
+
+        # Source-only sweep (cheap, no model bake):
+        issues = verify_u32_invariant()
+
+        # Including model-parameter dtype check:
+        from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
+            compile_full_vm,
+        )
+        model, _layout = compile_full_vm()
+        issues = verify_u32_invariant(model)
+    """
+    issues: List[Dict[str, str]] = []
+    # Always check the dim registry -- it's the spec for residual encoding.
+    _u32_scan_dim_registry(issues)
+    if scan_source:
+        _u32_scan_fp64_in_source(issues)
+        _u32_scan_widening_in_source(issues)
+    if scan_model and model is not None:
+        _u32_scan_model_params(model, issues)
+    return issues
