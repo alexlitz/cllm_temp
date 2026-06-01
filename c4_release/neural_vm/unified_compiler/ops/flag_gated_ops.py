@@ -108,6 +108,19 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
         layer_idx=5,
         migrated=True,
         declarative_bake_fn=bake,
+        # When ``enable_conversational_io=False`` the bake_fn is a true
+        # no-op — declarations-only / symbolic tooling treats the op as
+        # vacuous, so we expose ``compiler_ir`` only when the flag is on.
+        # The rules cover the 2 FFN units the helper writes at the L5
+        # FFN's 410-411 pin offsets; the IR itself is offset-agnostic
+        # (``start_unit=`` is supplied by ``_lower_convo_io_opcode_decode_ir``
+        # at bake time, and by the verifier / symbolic runner at index 0
+        # for declaration-semantics + per-rule lowering-contract checks).
+        compiler_ir=(
+            _convo_io_opcode_decode_ir()
+            if enable_conversational_io
+            else None
+        ),
         declarative_authority="spec_generated",
         ffn_units_used=412 if enable_conversational_io else None,
         # B12 backfill: docstring above names ``opcode_decode_ffn`` (phase
@@ -120,6 +133,23 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
+
+
+def _convo_io_opcode_decode_ir(S: float = 100.0) -> CompilerIR:
+    """Build the declarative ``CompilerIR`` for ``convo_io_opcode_decode``.
+
+    Exposed via ``compiler_ir=`` (only when ``enable_conversational_io``
+    is True) so symbolic / decl-verifier tooling sees the same FFNRule
+    declarations the bake lowers. The production bake itself stays in
+    :func:`_lower_convo_io_opcode_decode_ir` because it pins
+    ``start_unit=410`` while ``CompilerIR.lower_ffn`` lowers starting at
+    ``start_unit=0`` — both produce the same per-rule weights at their
+    respective unit offsets.
+    """
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_convo_io_opcode_decode_rules(S))
+    return ir
 
 
 def _convo_io_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:

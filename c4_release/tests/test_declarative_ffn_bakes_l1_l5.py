@@ -288,3 +288,70 @@ def test_opcode_decode_ffn_op_exposes_compiler_ir():
     op = make_opcode_decode_ffn_op()
     assert op.compiler_ir is not None
     assert len(op.compiler_ir.layer(0).ffn.rules) == 89
+
+
+# --- L5 ``convo_io_opcode_decode`` (flag-gated FFN extension) -----------------
+
+
+def test_convo_io_opcode_decode_declarative_matches_legacy_helper():
+    """``_lower_convo_io_opcode_decode_ir`` is byte-identical to the legacy
+    ``_set_conversational_io_opcode_decode`` helper at L5 FFN units 410-411."""
+
+    from c4_release.neural_vm.setup_helpers import (
+        _set_conversational_io_opcode_decode,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.flag_gated_ops import (
+        _lower_convo_io_opcode_decode_ir,
+    )
+
+    actual = _StubFFN(hidden_dim=420)
+    expected = _StubFFN(hidden_dim=420)
+
+    _lower_convo_io_opcode_decode_ir(actual, 100.0, _SetDim)
+    _set_conversational_io_opcode_decode(expected, 100.0, _SetDim)
+
+    _assert_same_ffn_units(actual, expected, 410, 412)
+
+
+def test_convo_io_opcode_decode_ir_passes_declaration_and_lowering_checks():
+    """``compare_symbolic_to_lowered_ffn`` over the 2-rule IR is clean for
+    declaration-semantics + lowering-contract failures."""
+
+    from c4_release.neural_vm.unified_compiler.ops.flag_gated_ops import (
+        _convo_io_opcode_decode_ir,
+    )
+
+    ir = _convo_io_opcode_decode_ir(100.0)
+    names = Primitives.ffn_rule_dim_names(ir.layer(0).ffn.rules)
+    dim_positions = Primitives.dim_positions_from_bd(_SetDim, names)
+    report = compare_symbolic_to_lowered_ffn(
+        ir,
+        dim_positions,
+        S=100.0,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+    structural_failures = [
+        issue for issue in report.issues
+        if issue.kind in ("declaration_semantics", "lowering")
+    ]
+    assert not structural_failures, (
+        "structural compare_symbolic_to_lowered_ffn failures: "
+        + "\n".join(f"  [{i.kind}] {i.message}" for i in structural_failures)
+    )
+
+
+def test_convo_io_opcode_decode_op_exposes_compiler_ir_only_when_enabled():
+    """``compiler_ir`` is attached only when ``enable_conversational_io=True``."""
+
+    from c4_release.neural_vm.unified_compiler.ops.flag_gated_ops import (
+        make_convo_io_opcode_decode_op,
+    )
+
+    op_off = make_convo_io_opcode_decode_op(enable_conversational_io=False)
+    op_on = make_convo_io_opcode_decode_op(enable_conversational_io=True)
+
+    assert op_off.compiler_ir is None
+    assert op_on.compiler_ir is not None
+    assert len(op_on.compiler_ir.layer(0).ffn.rules) == 2
