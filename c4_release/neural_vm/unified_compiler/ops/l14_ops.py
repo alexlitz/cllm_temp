@@ -1201,7 +1201,9 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
     def bake(block, dim_positions, S):
         from ...vm_step import _set_layer14_lc_ax_bytes_zero
         ffn = block.ffn
-        start_unit = getattr(ffn, "_l14_unit_counter", 0)
+        # Pinned to chain offset 1866 (jsr_ax_bytes_zero consumes 1862..1865).
+        # Byte-identical with the legacy ``_l14_unit_counter`` start.
+        start_unit = _l14_chain_alloc("layer14_lc_ax_bytes_zero")
         next_unit = _set_layer14_lc_ax_bytes_zero(
             ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
         )
