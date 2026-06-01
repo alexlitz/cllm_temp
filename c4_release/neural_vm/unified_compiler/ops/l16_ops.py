@@ -15,6 +15,7 @@ def _add_stack0_x0_alu_materializer(
     threshold: float,
     S: float,
     scope=None,
+    dominates_at=None,
 ):
     """Append 32 ALU->OUTPUT materializer rules for a STACK0 marker family.
 
@@ -23,6 +24,9 @@ def _add_stack0_x0_alu_materializer(
     part of the rule name (``l16_stack0_{family}_marker_from_alu_{band}_{k}``).
     ``scope`` is threaded through to every generated FFNRule so the
     declarative scope verifier can audit the intended firing positions.
+    ``dominates_at`` is threaded through identically so the strength
+    verifier can audit per-output-dim dominance claims; it accepts the
+    standard mapping ``{"OUTPUT_LO": <predicate>, "OUTPUT_HI": <predicate>}``.
     """
 
     for k in range(16):
@@ -33,6 +37,7 @@ def _add_stack0_x0_alu_materializer(
             gate=f"ALU_LO+{k}",
             writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
             scope=scope,
+            dominates_at=dominates_at,
         ))
     for k in range(16):
         rules.append(FFNRule.gated_write(
@@ -42,6 +47,7 @@ def _add_stack0_x0_alu_materializer(
             gate=f"ALU_HI+{k}",
             writes=((f"OUTPUT_HI+{k}", 50.0 / S),),
             scope=scope,
+            dominates_at=dominates_at,
         ))
 
 
@@ -345,6 +351,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # to 0x8 -- they project whatever ALU contains -- and the conditions tuple
     # has no in_step_fresh / step_is_fresh evidence.  Treat each violation as
     # a documented bleed onto non-current-step or non-e8-byte positions.
+    # FIXME(S-9-L16-strength-violation): stack0_e8_marker_from_alu_lo_0 at OUTPUT_LO+0
+    #   shortfall=50.5 (my=0.5, competing=50, top=l16_bp_frame_byte1_ff).
+    # FIXME(S-9-L16-strength-violation): stack0_e8_marker_from_alu_hi_0 at OUTPUT_HI+0
+    #   shortfall=50.5 (my=0.5, competing=50, top=l16_bp_frame_byte1_ff).
     _add_stack0_x0_alu_materializer(
         rules,
         family="e8",
@@ -352,6 +362,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         threshold=stack0_e8_marker_threshold,
         S=S,
         scope="mark == STACK0 AND in_step_fresh AND byte_value.hi_nibble == 0x8",
+        dominates_at={
+            "OUTPUT_LO": (
+                "mark == STACK0 AND in_step_fresh AND "
+                "byte_value.hi_nibble == 0x8"
+            ),
+            "OUTPUT_HI": (
+                "mark == STACK0 AND in_step_fresh AND "
+                "byte_value.hi_nibble == 0x8"
+            ),
+        },
     )
 
     # One-local frames can preserve a stack-top address at 0xffe8 while the
@@ -415,6 +435,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # See e8 family note above -- the declarative scope verifier surfaces
     # scope_violations because the conditions tuple does not actually pin
     # in_step_fresh nor byte_value.hi_nibble.
+    # FIXME(S-9-L16-strength-violation): stack0_e0_marker_from_alu_lo_0 at OUTPUT_LO+0
+    #   shortfall=50.5 (my=0.5, competing=50, top=l16_bp_frame_byte1_ff).
+    # FIXME(S-9-L16-strength-violation): stack0_e0_marker_from_alu_hi_0 at OUTPUT_HI+0
+    #   shortfall=50.5 (my=0.5, competing=50, top=l16_bp_frame_byte1_ff).
     _add_stack0_x0_alu_materializer(
         rules,
         family="e0",
@@ -422,6 +446,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         threshold=stack0_e0_marker_threshold,
         S=S,
         scope="mark == STACK0 AND in_step_fresh AND byte_value.hi_nibble == 0x0",
+        dominates_at={
+            "OUTPUT_LO": (
+                "mark == STACK0 AND in_step_fresh AND "
+                "byte_value.hi_nibble == 0x0"
+            ),
+            "OUTPUT_HI": (
+                "mark == STACK0 AND in_step_fresh AND "
+                "byte_value.hi_nibble == 0x0"
+            ),
+        },
     )
 
     stack0_f8_marker_conditions = (
@@ -445,6 +479,14 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # (current-step STACK0 markers carrying the preserved 0xF8 stack-top
     # byte).  See e8 family note above for why the verifier will surface
     # scope_violations on this family.
+    # FIXME(S-9-L16-strength-violation): stack0_f8_marker_from_alu_lo_0 at OUTPUT_LO+0
+    #   shortfall=50.75 (my=0.25, competing=50, top=l16_bp_frame_byte1_ff).
+    # FIXME(S-9-L16-strength-violation): stack0_f8_marker_from_alu_hi_0 at OUTPUT_HI+0
+    #   shortfall=50.75 (my=0.25, competing=50, top=l16_bp_frame_byte1_ff).
+    # FIXME(S-9-L16-strength-violation): stack0_f8_marker_from_alu_lo_15 at OUTPUT_LO+15
+    #   shortfall=1.25 (my=0.25, competing=0.5, top=l16_bp_frame_byte1_ff).
+    # FIXME(S-9-L16-strength-violation): stack0_f8_marker_from_alu_hi_15 at OUTPUT_HI+15
+    #   shortfall=1.25 (my=0.25, competing=0.5, top=l16_bp_frame_byte1_ff).
     _add_stack0_x0_alu_materializer(
         rules,
         family="f8",
@@ -455,6 +497,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             "mark == STACK0 AND in_step_fresh AND "
             "byte_value.hi_nibble == 0xF AND byte_value.lo_nibble == 0x8"
         ),
+        dominates_at={
+            "OUTPUT_LO": (
+                "mark == STACK0 AND in_step_fresh AND "
+                "byte_value.hi_nibble == 0xF AND byte_value.lo_nibble == 0x8"
+            ),
+            "OUTPUT_HI": (
+                "mark == STACK0 AND in_step_fresh AND "
+                "byte_value.hi_nibble == 0xF AND byte_value.lo_nibble == 0x8"
+            ),
+        },
     )
 
     stack0_e8_output_authoritative_conditions = (
@@ -894,6 +946,17 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -1.0),
         ("MARK_MEM", -1.0),
     )
+    # Scope predicate documents the intended firing positions: BP byte-1 lanes
+    # in established local-frame programs (BP=0x0000fff0).  Declaring
+    # dominates_at lets S-9 strength verifier audit whether the 50/S write
+    # weight is enough to outvote L15 attention writers at this slot --
+    # historically the known if_var bug victim where this rule's weak override
+    # loses to the L15 stream.
+    # FIXME(S-9-L16-strength-violation): bp_frame_byte1_ff at OUTPUT_LO+0
+    #   shortfall=51.5 (my=-0.5, competing=50, top=l16_bp_marker_passthrough_lo_0).
+    # FIXME(S-9-L16-strength-violation): bp_frame_byte1_ff at OUTPUT_HI+0
+    #   shortfall=51.5 (my=-0.5, competing=50, top=l16_bp_marker_passthrough_hi_0).
+    bp_frame_byte1_ff_scope = "mark == BP AND byte_index == 1"
     rules.append(FFNRule.constant_write(
         name="l16_bp_frame_byte1_ff",
         conditions=bp_frame_byte1_ff_conditions,
@@ -904,6 +967,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_LO+0", -50.0 / S),
             ("OUTPUT_HI+0", -50.0 / S),
         ),
+        scope=bp_frame_byte1_ff_scope,
+        dominates_at={
+            "OUTPUT_LO": bp_frame_byte1_ff_scope,
+            "OUTPUT_HI": bp_frame_byte1_ff_scope,
+        },
     ))
 
     # After ENT, BP is typically 0x0000fff0 for local-frame programs. At the
