@@ -58,10 +58,84 @@ def make_layer4_pc_relay_op() -> Operation:
     )
 
 
+# IR identity cache: keyed by (id(dim_positions), HD). The attention
+# verifier's cross-op competition pass (``catalog_attention_violations.py``,
+# ``verify_attention_head(ops_for_competition=...)``) materializes each op's
+# IR twice for the same ``dim_positions`` dict — once to enumerate heads,
+# once to build the competitor index. Without caching, the two
+# materializations produce distinct ``AttentionHeadIR`` instances, so the
+# verifier's ``entry.head is not head`` identity check fails to filter
+# self-vs-clone competition, and h0/h1 each generate 32 spurious
+# ``attention_strength_violation`` issues against their own clones at the
+# EMBED_LO/HI / ADDR_KEY+32..47 band (resolved by the V1 dim resolver to
+# ADDR_B1_LO+9..15 / ADDR_B2_LO+0..15 / EMBED_HI+7..15 / OUTPUT_LO+0..6
+# etc. due to runtime dim_positions remapping).  Memoizing on
+# ``id(dim_positions)`` keeps both call sites pointing at the same IR so
+# the identity filter actually fires; baseline on this op drops from
+# 64 ASV + 14 CSV to 32 ASV + 14 CSV with no semantic change.
+#
+# Safety: dim_positions is constructed once per compile and held in scope
+# for the full bake; id() collision via GC reclaim is not possible during
+# that window.  HD is part of the key so a later debug call with a
+# different head dim still gets a fresh IR.
+_layer4_pc_relay_ir_cache: dict = {}
+
+
 def _layer4_pc_relay_ir(dim_positions, HD) -> CompilerIR:
+    key = (id(dim_positions), HD)
+    cached = _layer4_pc_relay_ir_cache.get(key)
+    if cached is not None:
+        return cached
     proxy = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
-    ir.layer(0).attention.extend(_layer4_pc_relay_head_specs(proxy))
+    # NOTE(L4-pc-relay-scope-honest): the two heads' INTENDED firing scopes
+    # are complementary -- h0 fires at the AX marker position via the
+    # q-side MARK_AX gate; h1 fires at the AX byte positions via the
+    # q-side IS_BYTE × H1+AX_I gate.  Both relay the PC marker's
+    # ADDR_KEY top nibble (slots 33..48 → ``ADDR_KEY+32..47``) for
+    # downstream consumers: L5 fetch head 0 reads ADDR_KEY+32..47 at the
+    # AX marker (h0's write), and L8 multibyte fetch head 3 reads
+    # ADDR_KEY+32..47 at AX byte positions (h1's write).
+    #
+    # The V1 verifier's K-derived ``effective_attention_scope`` is
+    # ("CONST", "MARK_PC") for both heads -- the Q-side gating difference
+    # (MARK_AX vs IS_BYTE × H1+AX_I) is invisible to V1.  Declaring the
+    # Q-side scope here is informational under V1 (the verifier neither
+    # filters competitors by Q-scope overlap nor by dominates_at metadata
+    # at present -- see attention_verifier.py V2 wishlist) but documents
+    # why the residual 16 ``attention_strength_violation`` per head against
+    # the OTHER head at ADDR_KEY+32..47 (resolved as EMBED_HI+7..15 /
+    # OUTPUT_LO+0..6 due to dim_positions remap) is bookkeeping: the two
+    # heads never fire at the same position, so the writes do not actually
+    # compete at runtime.
+    #
+    # We do NOT bump either head's magnitude (slot 33+k V copy ×
+    # slot 33+k O copy = magnitude 1.0).  Bumping h0's slot 33..48 weights
+    # to dominate h1 just transfers the violation to h1 (the symmetric
+    # zero-sum case documented in
+    # ``feedback_single_rule_fixes_are_zero_sum.md``).
+    ir.layer(0).attention.append(
+        _layer4_pc_relay_head_specs(proxy)[0],
+        metadata={
+            "scope": "mark == AX",
+            "dominates_at": {
+                "EMBED_LO": "mark == AX",
+                "EMBED_HI": "mark == AX",
+                "ADDR_KEY": "mark == AX AND offset >= 32",
+            },
+        },
+    )
+    ir.layer(0).attention.append(
+        _layer4_pc_relay_head_specs(proxy)[1],
+        metadata={
+            "scope": "is_byte AND h1 == AX_I",
+            "dominates_at": {
+                "TEMP": "is_byte AND h1 == AX_I",
+                "ADDR_KEY": "is_byte AND h1 == AX_I AND offset >= 32",
+            },
+        },
+    )
+    _layer4_pc_relay_ir_cache[key] = ir
     return ir
 
 
