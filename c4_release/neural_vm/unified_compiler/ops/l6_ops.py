@@ -2152,6 +2152,22 @@ def make_layer6_routing_ffn_op() -> Operation:
 
     Phase 6.5: runs AFTER the L6 attention ops (phases 6.0-6.2) and before
     other L6 FFN extension ops migrated to model-level phase=998.
+
+    Claim-coverage note: ``claims`` is intentionally left empty. This op
+    delegates almost the entirety of L6 routing to ``_set_layer6_routing_ffn``
+    in ``vm_step.py``, plus a chain of IR lowerers that program
+    ~1486 FFN hidden units (every opcode's AX_CARRY/FETCH -> OUTPUT relay,
+    PSH stack writeback, every branch's PC byte0/byte1 override band, the
+    full delayed/first-step/all-step JMP/JSR PC override families, BZ/BNZ
+    overrides, JSR SP decrement, and a strict-neural PSH STACK0 rewrite
+    block). The static verifier observes ~13.6k weight cells written by a
+    single dispatch -- enumerating them at the (unit, column) grain would
+    duplicate every line in ``_set_layer6_routing_ffn`` plus the rule
+    bodies in ``_layer6_*_rules`` helpers, with no semantic gain over the
+    code those helpers are. Until the underlying spec is decomposed into
+    smaller per-band ops (which would be claimed individually), declaring
+    claims here would be a maintenance-cost pure-noise duplicate; skip with
+    the same precedent as model_ops' ``head_bake`` and ``opcode_relay_head``.
     """
     def bake(block, dim_positions, S):
         _bake_layer6_routing_ffn(
