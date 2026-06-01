@@ -537,6 +537,254 @@ def build_default_registry() -> DimRegistry:
     reg.alloc("TEMP", 480, 32, "General temporaries / reserved",
               semantics="is_byte OR NOT is_byte")
 
+    # =========================================================================
+    # F-4-extension: per-opcode sub-offsets, MEM/STACK0 control flags,
+    # FETCH/AX_FULL aliases, CLEAN_EMBED, and IO/PRTF/READ scratch.
+    # These OVERLAP with the parent slot they live within (OPCODE_FLAGS,
+    # MUL_ACCUM, DIV_STAGING, TEMP, etc.) — overlaps are NOT checked at
+    # alloc() time (only the validator's check_overlaps() reports them),
+    # and the verifier needs each name individually present so it can
+    # look up a semantics predicate per dim.
+    # =========================================================================
+
+    # --- Per-opcode flags (sub-offsets within OPCODE_FLAGS 262..295) ---
+    # FIXME(F-4-ext): refine — each fires at AX byte positions when the
+    # active opcode matches the named opcode; conservative gate models
+    # this as "mark == AX AND opcode_at_AX == NAME" so the verifier can
+    # see both the position and opcode constraints.
+    _OPCODES = [
+        ("OP_LEA", 262), ("OP_IMM", 263), ("OP_JMP", 264), ("OP_JSR", 265),
+        ("OP_BZ",  266), ("OP_BNZ", 267), ("OP_ENT", 268), ("OP_ADJ", 269),
+        ("OP_LEV", 270), ("OP_LI",  271), ("OP_LC",  272), ("OP_SI",  273),
+        ("OP_SC",  274), ("OP_PSH", 275), ("OP_OR",  276), ("OP_XOR", 277),
+        ("OP_AND", 278), ("OP_EQ",  279), ("OP_NE",  280), ("OP_LT",  281),
+        ("OP_GT",  282), ("OP_LE",  283), ("OP_GE",  284), ("OP_SHL", 285),
+        ("OP_SHR", 286), ("OP_ADD", 287), ("OP_SUB", 288), ("OP_MUL", 289),
+        ("OP_DIV", 290), ("OP_MOD", 291), ("OP_EXIT", 292), ("OP_NOP", 293),
+        ("OP_PUTCHAR", 294), ("OP_GETCHAR", 295),
+    ]
+    # Reserved DSL keywords (AND/OR/NOT) cannot appear as opcode names in
+    # the predicate grammar, so OP_OR/OP_AND fall back to a position-only
+    # gate. FIXME(F-4-ext): extend the DSL grammar to allow quoted/escaped
+    # opcode literals so OP_OR/OP_AND can be tightened.
+    _DSL_KEYWORDS = {"OR", "AND", "NOT"}
+    for _name, _pos in _OPCODES:
+        # Strip the OP_ prefix to get the opcode atom name used in the DSL.
+        _opname = _name[3:]
+        if _opname in _DSL_KEYWORDS:
+            _sem = "mark == AX OR (is_byte AND byte_index == 0)"
+        else:
+            _sem = f"mark == AX AND opcode_at_AX == {_opname}"
+        reg.alloc(
+            _name, _pos, 1,
+            f"OPCODE_FLAGS[{_pos - 262}] = {_name} active flag",
+            semantics=_sem,
+        )
+
+    # --- STACK0 byte position flags (304, 508, 509, 510) ---
+    # Set at STACK0 byte positions; conservatively gate on MARK_STACK0
+    # since byte_index alone doesn't tell us which marker family.
+    # FIXME(F-4-ext): STACK0_BYTE0 fires at byte_index==0 within a STACK0
+    # cluster; this widening covers any STACK0-marked position.
+    reg.alloc("STACK0_BYTE0", 304, 1, "STACK0 byte 0 position flag",
+              semantics="mark == STACK0 OR (is_byte AND byte_index == 0)")
+    # FIXME(F-4-ext): STACK0_BYTE1/2/3 alias TEMP+28/29/30 (positions
+    # 508-510 = TEMP base 480 + 28..30). Overlap with TEMP is intentional.
+    reg.alloc("STACK0_BYTE1", 508, 1, "STACK0 byte 1 position flag",
+              semantics="mark == STACK0 OR (is_byte AND byte_index == 1)")
+    reg.alloc("STACK0_BYTE2", 509, 1, "STACK0 byte 2 position flag",
+              semantics="mark == STACK0 OR (is_byte AND byte_index == 2)")
+    reg.alloc("STACK0_BYTE3", 510, 1, "STACK0 byte 3 position flag",
+              semantics="mark == STACK0 OR (is_byte AND byte_index == 3)")
+
+    # --- L1H4 / L2H0 fine threshold heads ---
+    # FIXME(F-4-ext): refine — head outputs are best characterized by
+    # marker-distance proximity; permissive tautology mirrors the H*
+    # head treatments above.
+    reg.alloc("L1H4", 297, 7, "L1 head 4: threshold 6.5 from nearest IS_MARK",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("L2H0", 452, 7, "L2 head 0: threshold 5.5 from nearest IS_MARK",
+              semantics="is_byte OR NOT is_byte")
+
+    # --- L0 head 5 aliases (SP_BYTE0_IS_F8, IN_STEP_FRESH, ADDR_B0_VALID,
+    # SP_GATHERED_THIS_STEP). These alias H5+0..H5+3 and carry pseudo-boolean
+    # state set by later layers; use boolean atoms when supported by the DSL.
+    reg.alloc("SP_BYTE0_IS_F8", 95, 1, "SP byte 0 equals 0xF8 (aliases H5+0)",
+              semantics="(mark == SP OR mark == AX) AND sp_byte0 == 0xF8")
+    reg.alloc("IN_STEP_FRESH", 96, 1, "In-step freshness flag (aliases H5+1)",
+              semantics="in_step_fresh")
+    reg.alloc("ADDR_B0_VALID", 97, 1, "Address byte 0 gathered (aliases H5+2)",
+              semantics="addr_b0_valid")
+    reg.alloc("SP_GATHERED_THIS_STEP", 98, 1,
+              "SP gather fired this step (aliases H5+3)",
+              semantics="sp_gathered_this_step")
+
+    # --- CMP_GROUP (305): set at AX when any cmp opcode active ---
+    # FIXME(F-4-ext): refine — fires only at AX positions during cmp ops.
+    reg.alloc("CMP_GROUP", 305, 1, "Any EQ/NE/LT/GT/LE/GE active at AX",
+              semantics="mark == AX AND opcode_at_AX in {EQ, NE, LT, GT, LE, GE}")
+
+    # --- CLEAN_EMBED nibbles (clones of EMBED, written after a clean pass) ---
+    # Fire at byte positions (mirror EMBED_LO/HI semantics).
+    reg.alloc("CLEAN_EMBED_LO", 306, 16, "Clean embedding lo nibble (one-hot)",
+              semantics="is_byte")
+    reg.alloc("CLEAN_EMBED_HI", 404, 16, "Clean embedding hi nibble (one-hot)",
+              semantics="is_byte")
+
+    # --- IO/conversational tool-call transition + state flags ---
+    # FIXME(F-4-ext): refine — these are autoregressive transition flags
+    # set at marker positions to drive next-token emission; conservatively
+    # gate on "any marker" since the DSL has no PRTF/READ atom.
+    reg.alloc("IO_IS_TOOL_CALL", 322, 1, "Any of OPEN/READ/CLOS/PRTF active",
+              semantics="mark == AX")
+    reg.alloc("NEXT_TOOL_CALL",        323, 1, "Next token is TOOL_CALL",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_THINKING_START",   324, 1, "Next token is THINKING_START",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_THINKING_END",     325, 1, "Next token is THINKING_END",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_IO_STATE_EMIT_BYTE",      326, 1,
+              "Next token is IO_STATE_EMIT_BYTE",
+              semantics="NOT is_byte")
+    reg.alloc("NEXT_IO_STATE_EMIT_THINKING",  327, 1,
+              "Next token is IO_STATE_EMIT_THINKING",
+              semantics="NOT is_byte")
+
+    # --- FETCH aliases — fetched immediate nibble staging.
+    # FETCH_LO/HI alias MUL_ACCUM (420..435) and DIV_STAGING (436..451).
+    # FIXME(F-4-ext): refine — fired at PC byte positions during opcode
+    # fetch; current MUL_ACCUM/DIV_STAGING base predicates use AX gating.
+    reg.alloc("FETCH_LO", 420, 16, "Fetched immediate lo nibble (aliases MUL_ACCUM)",
+              semantics="mark == PC OR (is_byte AND byte_index in {0, 1, 2, 3})")
+    reg.alloc("FETCH_HI", 436, 16, "Fetched immediate hi nibble (aliases DIV_STAGING)",
+              semantics="mark == PC OR (is_byte AND byte_index in {0, 1, 2, 3})")
+
+    # --- ADDR_B0_HI / ADDR_B1_HI / ADDR_B2_HI — hi nibble of gathered addr
+    # bytes. These OVERLAP with ADDR_KEY (206..253), which itself is the
+    # 3 nibbles × 16 one-hot. The hi-nibble overlay is read at MEM-region
+    # positions just like ADDR_B*_LO.
+    reg.alloc("ADDR_B0_HI", 206, 16, "Gathered addr byte 0 hi nibble (aliases ADDR_KEY[0:16])",
+              semantics="mark == MEM")
+    reg.alloc("ADDR_B1_HI", 222, 16, "Gathered addr byte 1 hi nibble (aliases ADDR_KEY[16:32])",
+              semantics="mark == MEM")
+    reg.alloc("ADDR_B2_HI", 238, 16, "Gathered addr byte 2 hi nibble (aliases ADDR_KEY[32:48])",
+              semantics="mark == MEM")
+
+    # --- MEM control + value bus (459..464 plus relays 465..467) ---
+    # FIXME(F-4-ext): refine — MEM_STORE is set at MEM positions when a
+    # store op (SI/SC/PSH) is active; the {SI, SC, PSH} gate captures
+    # the intent at the slot level.
+    reg.alloc("MEM_STORE", 459, 1,
+              "Store op (SI/SC/PSH) active, relayed to MEM positions",
+              semantics="mark == MEM AND opcode_in_step in {SI, SC, PSH}")
+    reg.alloc("MEM_ADDR_SRC", 460, 1,
+              "Address source: 1=STACK0 (SI/SC), 0=SP (PSH)",
+              semantics="mark == MEM AND opcode_in_step in {SI, SC, PSH}")
+    reg.alloc("MEM_VAL_B0", 461, 1, "Predicts MEM val byte 0 (d=4 from MEM)",
+              semantics="mark == MEM OR (is_byte AND byte_index == 0)")
+    reg.alloc("MEM_VAL_B1", 462, 1, "Predicts MEM val byte 1 (d=5 from MEM)",
+              semantics="mark == MEM OR (is_byte AND byte_index == 1)")
+    reg.alloc("MEM_VAL_B2", 463, 1, "Predicts MEM val byte 2 (d=6 from MEM)",
+              semantics="mark == MEM OR (is_byte AND byte_index == 2)")
+    reg.alloc("MEM_VAL_B3", 464, 1, "Predicts MEM val byte 3 (d=7 from MEM)",
+              semantics="mark == MEM OR (is_byte AND byte_index == 3)")
+
+    # --- LI/LC opcode relays + PSH-at-SP flag ---
+    # These alias IO_IS_PRTF/IO_IS_READ/IO_STATE/IO_OUTPUT_COUNT positions.
+    reg.alloc("OP_LI_RELAY", 465, 1, "LI active, relayed to AX byte positions",
+              semantics="mark == AX AND opcode_in_step in {LI}")
+    reg.alloc("OP_LC_RELAY", 466, 1, "LC active, relayed to AX byte positions",
+              semantics="mark == AX AND opcode_in_step in {LC}")
+    reg.alloc("PSH_AT_SP", 467, 1, "PSH opcode flag relayed to SP/STACK0",
+              semantics="(mark == SP OR mark == STACK0) AND opcode_in_step in {PSH}")
+
+    # --- PRTF/READ IO state machine scratch (alias MEM_VAL/RELAY slots) ---
+    # FIXME(F-4-ext): refine — these are autoregressive IO state flags;
+    # firing positions depend on the PRTF/READ tool-call state machine.
+    # Conservative gating: AX positions when PRTF/READ-class opcode active.
+    reg.alloc("IO_IS_PRTF", 464, 1, "PRTF opcode detected (aliases MEM_VAL_B3)",
+              semantics="mark == AX")
+    reg.alloc("IO_IS_READ", 465, 1, "READ opcode detected (aliases OP_LI_RELAY)",
+              semantics="mark == AX")
+    reg.alloc("IO_STATE",   466, 1, "IO state machine (aliases OP_LC_RELAY)",
+              semantics="mark == AX OR NOT is_byte")
+    reg.alloc("IO_OUTPUT_COUNT", 467, 1,
+              "Output bytes remaining (aliases PSH_AT_SP)",
+              semantics="mark == AX OR NOT is_byte")
+    reg.alloc("IO_FORMAT_POS",   468, 1, "Position in format string (aliases MEM_EXEC)",
+              semantics="mark == AX OR NOT is_byte")
+    reg.alloc("MEM_EXEC", 468, 1, "Deprecated; retained as IO_FORMAT_POS alias",
+              semantics="mark == AX OR NOT is_byte")
+    reg.alloc("IO_IN_OUTPUT_MODE",  469, 1, "Currently emitting output bytes",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("IO_OUTPUT_COMPLETE", 470, 1, "Format string complete",
+              semantics="is_byte OR NOT is_byte")
+
+    # --- FORMAT_PTR / AX_FULL nibble pointers (471..502 — two views) ---
+    # FORMAT_PTR_* and AX_FULL_* share the same byte range; both are
+    # populated at AX positions.
+    reg.alloc("FORMAT_PTR_LO", 471, 16, "Format string ptr lo nibble (aliases AX_FULL_LO)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    reg.alloc("FORMAT_PTR_HI", 487, 16, "Format string ptr hi nibble (aliases AX_FULL_HI)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    reg.alloc("AX_FULL_LO",    471, 16, "Full AX lo nibble (aliases FORMAT_PTR_LO)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    reg.alloc("AX_FULL_HI",    487, 16, "Full AX hi nibble (aliases FORMAT_PTR_HI)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+
+    # --- OUTPUT_BYTE nibbles — alias TEMP+0..15 / TEMP+16..31 ---
+    # Set at marker positions where next-emitted token will be a byte.
+    reg.alloc("OUTPUT_BYTE_LO", 480, 16, "Output byte lo nibble (aliases TEMP[0:16])",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("OUTPUT_BYTE_HI", 496, 16, "Output byte hi nibble (aliases TEMP[16:32])",
+              semantics="is_byte OR NOT is_byte")
+
+    # --- "LAST_WAS_*" / "ACTIVE_OPCODE_*" / "MARK_THINKING_*" flags ---
+    # All single-dim history/marker flags within the TEMP region.
+    reg.alloc("LAST_WAS_THINKING_END",   501, 1, "Prev token was THINKING_END",
+              semantics="NOT is_byte")
+    reg.alloc("LAST_WAS_THINKING_START", 502, 1, "Prev token was THINKING_START",
+              semantics="NOT is_byte")
+    reg.alloc("LAST_WAS_BYTE", 503, 1, "Prev token was byte (0-255)",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("LAST_WAS_IO_STATE_EMIT_BYTE", 462, 1,
+              "Prev token was IO_STATE_EMIT_BYTE (aliases MEM_VAL_B1)",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("LAST_WAS_IO_STATE_EMIT_THINKING", 463, 1,
+              "Prev token was IO_STATE_EMIT_THINKING (aliases MEM_VAL_B2)",
+              semantics="is_byte OR NOT is_byte")
+    reg.alloc("ACTIVE_OPCODE_PRTF", 504, 1, "Current opcode is PRTF",
+              semantics="mark == AX AND opcode_at_AX == PRTF")
+    reg.alloc("ACTIVE_OPCODE_READ", 505, 1, "Current opcode is READ",
+              semantics="mark == AX AND opcode_at_AX == READ")
+    reg.alloc("MARK_THINKING_START", 506, 1, "THINKING_START token marker",
+              semantics="NOT is_byte")
+    reg.alloc("MARK_THINKING_END",   507, 1, "THINKING_END token marker",
+              semantics="NOT is_byte")
+
+    # --- POST_PRTF aliases (471..502 / 328..359) ---
+    # FIXME(F-4-ext): refine — these alias AX_FULL/AX_CARRY ranges and are
+    # populated when a PRTF tool-call returns; conservatively gate on AX.
+    reg.alloc("POST_PRTF_PC_LO", 471, 16, "Post-PRTF PC lo (aliases AX_FULL_LO)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    reg.alloc("POST_PRTF_PC_HI", 487, 16, "Post-PRTF PC hi (aliases AX_FULL_HI)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    reg.alloc("POST_PRTF_SP_LO", 328, 16, "Post-PRTF SP lo (aliases AX_CARRY_LO)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    reg.alloc("POST_PRTF_SP_HI", 344, 16, "Post-PRTF SP hi (aliases AX_CARRY_HI)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+
+    # --- Opcode-byte aliases (12, 28) — unused in autoregressive but
+    # referenced by some legacy ops. Alias ADDR_B0_LO / ADDR_B1_LO.
+    reg.alloc("OPCODE_BYTE_LO", 12, 16, "Opcode byte lo nibble (aliases ADDR_B0_LO)",
+              semantics="mark == MEM OR (is_byte AND byte_index == 0)")
+    reg.alloc("OPCODE_BYTE_HI", 28, 16, "Opcode byte hi nibble (aliases ADDR_B1_LO)",
+              semantics="mark == MEM OR (is_byte AND byte_index == 0)")
+
+    # --- OPCODE_BASE alias (262) — alias of OPCODE_FLAGS / OP_LEA. ---
+    reg.alloc("OPCODE_BASE", 262, 1, "Base of opcode one-hot (aliases OP_LEA)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+
     return reg
 
 
