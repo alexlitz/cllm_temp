@@ -230,38 +230,41 @@ def make_layer1_ffn_op() -> Operation:
 
 
 _L1_HEAD_LAYOUT = (
-    # (op_name, pinned head_idx)
+    # (op_name,)  -- no pinned head_idx; allocator first-fits in
+    # declaration order, landing at 0..5 byte-identically (Phase 7.B.2 attn).
     #
     # Heads 0..2: fine threshold heads producing L1H0/L1H1/L1H2 (thresholds
-    # 0.5/1.5/2.5 against IS_MARK). Pinned at indices 0/1/2.
+    # 0.5/1.5/2.5 against IS_MARK).
     # Head 3: HAS_SE global STEP_END detector (slope=0 disables ALiBi decay).
     # Head 4: threshold 6.5 producing L1H4 (STACK0 byte 0 identification).
     # Head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay producer (positive
     # ALiBi slope 0.5 so the softmax1 anchor wins as distance grows).
-    ("layer1_threshold_attn.l1h0",            0),
-    ("layer1_threshold_attn.l1h1",            1),
-    ("layer1_threshold_attn.l1h2",            2),
-    ("layer1_threshold_attn.has_se",          3),
-    ("layer1_threshold_attn.l1h4",            4),
-    ("layer1_threshold_attn.in_step_fresh",   5),
+    ("layer1_threshold_attn.l1h0",),
+    ("layer1_threshold_attn.l1h1",),
+    ("layer1_threshold_attn.l1h2",),
+    ("layer1_threshold_attn.has_se",),
+    ("layer1_threshold_attn.l1h4",),
+    ("layer1_threshold_attn.in_step_fresh",),
 )
 
 
 def _allocate_layer1_attn_heads() -> AttentionHeadAllocator:
-    """Build a per-bake :class:`AttentionHeadAllocator` with every L1 head pinned.
+    """Build a per-bake :class:`AttentionHeadAllocator` for the L1 heads.
 
-    Every existing ``head_idx`` in ``layer1_threshold_attn`` is declared at
-    its current slot so the bake stays byte-identical: ``W_q``/``W_k``/
-    ``W_v``/``W_o`` rows land in the same ``head_idx * HD + slot``
-    positions they always have. A future L1 attention head would call
-    ``allocator.alloc(name, layer_idx=1)`` without a pin and receive the
-    first free index past 5 (i.e. 6 or 7).
+    Phase 7.B.2 attn auto-fit: the allocator is built in
+    ``dynamic_first_fit`` mode without ``pin=`` hints. Each entry is
+    allocated in declaration order; first-fit picks the lowest free
+    head each call, so the 6 declarations land at indices 0..5 --
+    byte-identical to the legacy pinned offsets. The alibi-slope
+    overrides in the bake key off the allocator-resolved indices, so
+    HAS_SE / IN_STEP_FRESH follow their semantic heads across any
+    future allocator reshuffle.
 
     Returns the allocator so callers can inspect or extend it.
     """
-    allocator = AttentionHeadAllocator()
-    for op_name, head_idx in _L1_HEAD_LAYOUT:
-        allocator.alloc(op_name, layer_idx=1, pin=head_idx)
+    allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    for (op_name,) in _L1_HEAD_LAYOUT:
+        allocator.alloc(op_name, layer_idx=1)
     return allocator
 
 
@@ -419,30 +422,51 @@ def make_layer1_threshold_attn_op() -> Operation:
 
 
 def _layer1_threshold_ir(dim_positions, HD) -> CompilerIR:
+    """``compiler_ir_factory`` for ``layer1_threshold_attn``.
+
+    Resolves head indices via :func:`_allocate_layer1_attn_heads` so the
+    IR and the bake share a single source of truth. After the Phase
+    7.B.2-attn pin drop the allocator runs in ``dynamic_first_fit``
+    mode; with no other claimants on the L1 attention pool the 6
+    declaration-order entries always land at indices 0..5 -- so the
+    IR's spec walk reproduces the legacy ``heads=[0,1,2]``+3+``[4]``+5
+    schedule byte-identically.
+    """
+
     proxy = _as_setdim_proxy(dim_positions)
     ALIBI_S = 10.0
+    allocator = _allocate_layer1_attn_heads()
+    # Resolve each L1 head index by op-name so the spec walk follows
+    # the allocator across any future reshuffle.
+    by_name = {rec.op_name: rec.head_idx for rec in allocator.heads()}
+    h_l1h0 = by_name["layer1_threshold_attn.l1h0"]
+    h_l1h1 = by_name["layer1_threshold_attn.l1h1"]
+    h_l1h2 = by_name["layer1_threshold_attn.l1h2"]
+    h_has_se = by_name["layer1_threshold_attn.has_se"]
+    h_l1h4 = by_name["layer1_threshold_attn.l1h4"]
+    h_in_step_fresh = by_name["layer1_threshold_attn.in_step_fresh"]
     ir = CompilerIR()
     specs = list(Primitives.threshold_attention_head_specs(
         [0.5, 1.5, 2.5],
         [proxy.L1H0, proxy.L1H1, proxy.L1H2],
         ALIBI_S,
         HD,
-        heads=[0, 1, 2],
+        heads=[h_l1h0, h_l1h1, h_l1h2],
         bd=proxy,
     ))
     specs.append(DeclarativeAttentionHeadSpec(
-        head_idx=3,
+        head_idx=h_has_se,
         q=(AP(0, proxy.CONST, 10.0),),
         k=(AP(0, proxy.MARK_SE_ONLY, 10.0),),
         v=(AP(1, proxy.MARK_SE_ONLY, 1.0),),
         o=(AO(proxy.HAS_SE, 1, 1.0),),
     ))
     specs.extend(Primitives.threshold_attention_head_specs(
-        [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[4], bd=proxy,
+        [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[h_l1h4], bd=proxy,
     ))
     # Head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay.
     specs.append(DeclarativeAttentionHeadSpec(
-        head_idx=5,
+        head_idx=h_in_step_fresh,
         q=(AP(0, proxy.CONST, 10.0),),
         k=(
             AP(0, proxy.MARK_SE_ONLY, 10.0),

@@ -31,41 +31,52 @@ from .shared import _as_setdim_proxy
 # can claim a free head via ``allocator.alloc(name, layer_idx=2)`` --
 # with no ``pin=`` -- without touching this table.
 _L2_HEAD_LAYOUT = (
-    # (op-name key,                          pinned head_idx)
-    ("layer2_threshold_attn",                0),
-    ("layer2_lookback_detection_head",       1),
+    # (op-name key,)  -- no pinned head_idx; allocator first-fits in
+    # declaration order, landing at 0 / 1 byte-identically
+    # (Phase 7.B.2 attn).
+    ("layer2_threshold_attn",),
+    ("layer2_lookback_detection_head",),
 )
 
 
 def _allocate_layer2_attention_heads() -> AttentionHeadAllocator:
-    """Build a per-bake :class:`AttentionHeadAllocator` with all L2 heads.
+    """Build a per-bake :class:`AttentionHeadAllocator` for L2 heads.
 
-    Every entry in :data:`_L2_HEAD_LAYOUT` is pinned at its existing
-    ``head_idx`` so the underlying primitive calls -- which still write
-    the same weights to the same heads -- land byte-identically. Both
-    ``layer2_threshold_attn`` and ``layer2_lookback_detection_head``
-    call this so each can look up its own head by name without baking
-    in an integer literal at the call site.
+    Phase 7.B.2 attn auto-fit: the allocator is built in
+    ``dynamic_first_fit`` mode without ``pin=`` hints. Each entry is
+    allocated in declaration order; first-fit picks the lowest free
+    head each call, so ``layer2_threshold_attn`` lands at head 0 and
+    ``layer2_lookback_detection_head`` at head 1 -- byte-identical to
+    the legacy pinned offsets. Both ops still resolve their own
+    ``head_idx`` by name out of the returned allocator so a future
+    re-fit (e.g. wider layer pool, additional L2 head) cannot
+    silently misroute the lookback bake.
     """
-    allocator = AttentionHeadAllocator()
-    for name, head_idx in _L2_HEAD_LAYOUT:
-        allocator.alloc(name, layer_idx=2, pin=head_idx)
+    allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    for (name,) in _L2_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=2)
     return allocator
 
 
 def _l2_head_idx(op_name: str) -> int:
-    """Return the pinned L2 ``head_idx`` for ``op_name``.
+    """Return the L2 ``head_idx`` for ``op_name`` under the current
+    layout / allocator strategy.
 
-    Static lookup against :data:`_L2_HEAD_LAYOUT` for callers that
-    cannot instantiate a per-bake allocator (e.g. ``compiler_ir_factory``
-    helpers, which run outside the bake and receive only dim positions
-    and ``HD``). The runtime bakes still go through
-    :func:`_allocate_layer2_attention_heads` so the collision-checked
-    allocator path is exercised on every weight write.
+    Replays :func:`_allocate_layer2_attention_heads` (cheap; the L2
+    pool is 2 heads wide) and returns the named head's resolved
+    ``head_idx``. The static-lookup contract held before Phase 7.B.2
+    attn dropped pins, but with ``dynamic_first_fit`` the layout
+    decision is "compute the assignment by replaying the allocator",
+    so the helper now does exactly that. Bakes that need to thread
+    the same allocator through multiple call sites should pass the
+    allocator instance directly rather than re-replaying for every
+    lookup.
     """
-    for name, head_idx in _L2_HEAD_LAYOUT:
-        if name == op_name:
-            return head_idx
+
+    allocator = _allocate_layer2_attention_heads()
+    for rec in allocator.heads():
+        if rec.op_name == op_name:
+            return rec.head_idx
     raise KeyError(f"_l2_head_idx: unknown L2 attention op {op_name!r}")
 
 

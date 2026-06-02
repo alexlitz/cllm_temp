@@ -214,7 +214,7 @@ def make_phase_a_ffn_op() -> Operation:
     )
 
 
-# === L0 attention-head layout (pinned indices) ======================
+# === L0 attention-head layout (auto-fit offsets, Phase 7.B.2 attn) ===
 #
 # ``layer0_threshold_attn`` owns the entire L0 attention block: 8
 # threshold heads (H0..H7) detecting whether the nearest marker is
@@ -225,45 +225,58 @@ def make_phase_a_ffn_op() -> Operation:
 # claim that made adding a new L0 head fragile (the author had to
 # remember which slots were already taken). With the allocator the
 # handoff is structural: the bake instantiates its OWN allocator
-# pre-loaded with the full L0 head layout (pinned to existing slots),
-# stashes it on ``attn._l0_head_allocator`` for downstream inspection,
-# and resolves each head's index by name. A future L0 attention op
-# can claim a free head via ``allocator.alloc(name, layer_idx=0)`` --
-# with no ``pin=`` -- without touching this table.
+# pre-loaded with the full L0 head layout, stashes it on
+# ``attn._l0_head_allocator`` for downstream inspection, and resolves
+# each head's index by name.
 #
-# Each entry's ``head_idx`` mirrors the implicit ``heads=range(8)``
-# walk in ``Primitives.threshold_attention_head_specs``; changing the
-# head/threshold pairing requires updating this table in lock-step.
+# Phase 7.B.2 attn: ``pin`` is dropped from every entry. The allocator
+# is constructed in ``"dynamic_first_fit"`` mode and walks the layout
+# in declaration order; first-fit on an 8-head pool lands the eight
+# threshold heads at indices 0..7 -- byte-identical to the legacy
+# pins -- but the author no longer supplies the offsets. A future L0
+# attention op can claim a free head via
+# ``allocator.alloc(name, layer_idx=0)`` without a pin.
+#
+# Output-base / alibi-slope mapping is now spec-carried: the
+# ``alibi_slopes=`` list threaded through
+# ``Primitives.generate_threshold_attention_heads`` is keyed by
+# threshold POSITION (parallel to ``_L0_THRESHOLDS``), not head_idx,
+# so first-fit drift in head_idx cannot scramble it. Likewise each
+# spec captures its own ``out_base`` (a pre-resolved ``AO(out_base+m, ...)``
+# write) so permuting head_idx never reroutes a threshold to a
+# different ``H<n>`` output dim.
 _L0_HEAD_LAYOUT = (
-    # (op-name key,                      pinned head_idx)
-    ("layer0_threshold_attn.h0",         0),  # threshold 3.5  -> H0
-    ("layer0_threshold_attn.h1",         1),  # threshold 4.5  -> H1
-    ("layer0_threshold_attn.h2",         2),  # threshold 7.5  -> H2
-    ("layer0_threshold_attn.h3",         3),  # threshold 8.5  -> H3
-    ("layer0_threshold_attn.h4",         4),  # threshold 9.5  -> H4
-    ("layer0_threshold_attn.h5",         5),  # threshold 14.5 -> H5
-    ("layer0_threshold_attn.h6",         6),  # threshold 19.5 -> H6
-    ("layer0_threshold_attn.h7",         7),  # threshold 24.5 -> H7
+    # (op-name key,)  -- no pinned head_idx; allocator first-fits.
+    # Declaration order is preserved here so the threshold-index
+    # parallelism with ``_L0_THRESHOLDS`` / ``_L0_OUT_BASE_NAMES``
+    # stays load-bearing for the spec output mapping.
+    ("layer0_threshold_attn.h0",),    # threshold 3.5  -> H0
+    ("layer0_threshold_attn.h1",),    # threshold 4.5  -> H1
+    ("layer0_threshold_attn.h2",),    # threshold 7.5  -> H2
+    ("layer0_threshold_attn.h3",),    # threshold 8.5  -> H3
+    ("layer0_threshold_attn.h4",),    # threshold 9.5  -> H4
+    ("layer0_threshold_attn.h5",),    # threshold 14.5 -> H5
+    ("layer0_threshold_attn.h6",),    # threshold 19.5 -> H6
+    ("layer0_threshold_attn.h7",),    # threshold 24.5 -> H7
 )
 
 
 def _allocate_layer0_threshold_attn_heads() -> AttentionHeadAllocator:
     """Build a per-bake :class:`AttentionHeadAllocator` with all L0 heads.
 
-    Every entry in :data:`_L0_HEAD_LAYOUT` is pinned at its existing
-    ``head_idx`` so the underlying
-    ``Primitives.generate_threshold_attention_heads`` call -- which
-    writes ``W_q``/``W_k``/``W_v``/``W_o`` at ``head_idx * HD + slot``
-    -- lands byte-identically. Replacing the implicit ``heads=None``
-    default with an explicit allocator-resolved list keeps every head
-    index auditable rather than buried in a ``range(8)`` fallback.
-    A future L0 attention op can claim a free head past index 7 (when
-    ``layer_max_heads`` widens beyond 8) via
-    ``allocator.alloc(name, layer_idx=0)`` without a pin.
+    Phase 7.B.2 attn auto-fit: the allocator is built in
+    ``dynamic_first_fit`` mode without ``pin=`` hints. Each entry is
+    allocated in declaration order; first-fit picks the lowest free
+    head each call, so the 8 threshold-head entries land at indices
+    0..7 -- byte-identical to the legacy pinned offsets.
+
+    Returns the allocator so callers can inspect or extend it (e.g. a
+    future L0 attention op claiming a free gap past head 7 when
+    ``layer_max_heads`` widens).
     """
-    allocator = AttentionHeadAllocator()
-    for name, head_idx in _L0_HEAD_LAYOUT:
-        allocator.alloc(name, layer_idx=0, pin=head_idx)
+    allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    for (name,) in _L0_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=0)
     return allocator
 
 
@@ -293,14 +306,16 @@ def _layer0_threshold_attn_ir(dim_positions, HD: int) -> CompilerIR:
     """``compiler_ir_factory`` for ``layer0_threshold_attn``.
 
     Builds a :class:`CompilerIR` whose ``layer(0).attention`` holds the 8
-    declarative threshold-head specs (H0..H7). The pinned head indices
-    come from :data:`_L0_HEAD_LAYOUT` so the IR stays in lockstep with the
-    bake's allocator pinning, and ``compare_symbolic_to_lowered_attn``
-    can audit byte-identity end-to-end against ``PureAttention``.
+    declarative threshold-head specs (H0..H7). The head indices are
+    resolved by walking :func:`_allocate_layer0_threshold_attn_heads`
+    in declaration order so the IR and the bake share a single source
+    of truth -- which lets ``compare_symbolic_to_lowered_attn`` audit
+    byte-identity end-to-end against ``PureAttention``.
     """
 
     proxy = _as_setdim_proxy(dim_positions)
-    heads = [head_idx for _name, head_idx in _L0_HEAD_LAYOUT]
+    allocator = _allocate_layer0_threshold_attn_heads()
+    heads = [rec.head_idx for rec in allocator.heads()]
     specs = _layer0_threshold_head_specs(proxy, HD, heads)
     ir = CompilerIR()
     ir.layer(0).attention.extend(specs)
