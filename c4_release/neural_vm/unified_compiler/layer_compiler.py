@@ -47,6 +47,8 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
+from .ssa_dim import SSA_ANY_WRITER, is_ssa_form, parse_ssa_name
+
 
 # Allowed `scope` values for `Operation.claims`. Each scope tags a class of
 # weight slots whose ownership can collide across bakes:
@@ -754,12 +756,34 @@ class LayerCompiler:
             )
         if op.name in self._op_by_name:
             raise ValueError(f"Operation name {op.name!r} already added")
-        # Validate that every read/write is declared.
+        # Phase 9 SSA prototype: SSA-form reads/writes
+        # (``BASE.WRITER.STEP_OFFSET``) are auto-declared as aliases of
+        # the base dim if the base dim is already declared. This keeps the
+        # bake-time ``dim_positions`` lookup byte-identical to the
+        # unversioned form while letting the scheduler see the
+        # cross-step semantics. See ssa_dim.py for the schema and
+        # docs/PHASE_9_SSA_PROTOTYPE.md for the migration plan.
         for d in op.reads | op.writes:
-            if d not in self.dims:
-                raise ValueError(
-                    f"Op {op.name!r} references undeclared dim {d!r}"
+            if d in self.dims:
+                continue
+            if is_ssa_form(d):
+                parsed = parse_ssa_name(d)
+                if parsed.base_dim not in self.dims:
+                    raise ValueError(
+                        f"Op {op.name!r} SSA dim {d!r} references "
+                        f"undeclared base dim {parsed.base_dim!r}"
+                    )
+                # Auto-declare the SSA form as an alias of the base. Same
+                # numeric slot, same size; matches the PREV_STEP pattern.
+                self.declare_dim(
+                    d,
+                    self.dims[parsed.base_dim],
+                    alias_of=parsed.base_dim,
                 )
+                continue
+            raise ValueError(
+                f"Op {op.name!r} references undeclared dim {d!r}"
+            )
         # Validate staleness invariants (Phase 3 / Agent G of
         # ARCH_LEAKAGE_FIX_PLAN.md). Both ``produces`` and ``consumes_fresh``
         # map declared dim names to register identifiers.
@@ -1319,6 +1343,19 @@ class LayerCompiler:
         op_set = {op.name for op in ops}
         for v in ops:
             for d in v.reads:
+                # Phase 9 SSA prototype: SSA cross-step reads
+                # (``BASE.WRITER.STEP_OFFSET`` with step_offset != 0) are
+                # cross-step by construction. Skip the back-edge entirely
+                # at the read level so the dep graph stays acyclic. When
+                # the writer is named explicitly (writer_op != "*"), we
+                # could in principle add the edge to *that* writer only;
+                # for the prototype we treat every SSA cross-step read as
+                # a pure cross-step alias (matches the PREV_STEP
+                # semantics today). See ssa_dim.py.
+                if is_ssa_form(d):
+                    parsed = parse_ssa_name(d)
+                    if parsed.is_cross_step:
+                        continue
                 for u in writers.get(d, ()):
                     if u.name == v.name:
                         continue
