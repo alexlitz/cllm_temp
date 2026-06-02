@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -154,17 +155,25 @@ def _allocate_layer2_ffn_units() -> FFNUnitAllocator:
 #
 # Phase 6 wave 3C migration.
 
+# Phase 8.D: the legacy transition table is split into a "structural"
+# tuple (H-source / blocker pairs) and a per-row write list of
+# ``dim_ref`` calls. Pre-binding the dim_ref calls in module scope keeps
+# the source-level inventory of role-meaningful refs aligned with the
+# pilot pattern: each MEM_VAL_B<n> write resolves through (memory_lo,
+# val_b<n>) and each BYTE_INDEX_<n> write through (byte_index, "<n>")
+# -- so the rule generator names its outputs by family/role, not by
+# slot label.
 _L2_MEM_FLAGS_TRANSITIONS = (
     # (src_dim_name_with_offset, blocker_dim_name_with_offset,
     #  out_dim_names_with_offset_tuple)
-    ("H1+4",   "H0+4",   ("MEM_VAL_B0",)),
-    ("L2H0+4", "H1+4",   ("MEM_VAL_B1",)),
-    ("L1H4+4", "L2H0+4", ("MEM_VAL_B2",)),
-    ("H2+4",   "L1H4+4", ("MEM_VAL_B3",)),
-    ("L1H4+3", "H1+3",   ("BYTE_INDEX_0",)),
-    ("H2+3",   "L1H4+3", ("BYTE_INDEX_1", "STACK0_BYTE1")),
-    ("H3+3",   "H2+3",   ("BYTE_INDEX_2", "STACK0_BYTE2")),
-    ("H4+3",   "H3+3",   ("BYTE_INDEX_3", "STACK0_BYTE3")),
+    ("H1+4",   "H0+4",   (dim_ref("memory_lo", "val_b0"),)),
+    ("L2H0+4", "H1+4",   (dim_ref("memory_lo", "val_b1"),)),
+    ("L1H4+4", "L2H0+4", (dim_ref("memory_lo", "val_b2"),)),
+    ("H2+4",   "L1H4+4", (dim_ref("memory_lo", "val_b3"),)),
+    ("L1H4+3", "H1+3",   (dim_ref("byte_index", "0"),)),
+    ("H2+3",   "L1H4+3", (dim_ref("byte_index", "1"), "STACK0_BYTE1")),
+    ("H3+3",   "H2+3",   (dim_ref("byte_index", "2"), "STACK0_BYTE2")),
+    ("H4+3",   "H3+3",   (dim_ref("byte_index", "3"), "STACK0_BYTE3")),
 )
 
 
@@ -177,14 +186,25 @@ def _layer2_mem_byte_flags_rules(S: float) -> tuple[FFNRule, ...]:
     is selected, not every byte slot in the run). The gate computes
     ``1.0 - blocker``, so ``hidden = silu(S/2) * (1.0 - blocker) ~= S/2``
     at the boundary and ``0`` deeper into the run.
+
+    Phase 8.D: the per-row output dims come from ``dim_ref`` calls
+    bound in :data:`_L2_MEM_FLAGS_TRANSITIONS`: each ``MEM_VAL_B<n>``
+    write resolves the (memory_lo, val_b<n>) pair, and each
+    ``BYTE_INDEX_<n>`` write resolves the (byte_index, "<n>") pair.
+    Structural H-source / blocker reads (``H<k>+<j>`` / ``L1H4+<j>``)
+    stay as ``+N`` -- ``<j>`` is a marker-bank slot index, a structural
+    position, not a role-meaningful byte index.
     """
     write_scale = 2.0 / S
     rules = []
     for idx, (src_dim, blocker_dim, out_dims) in enumerate(
         _L2_MEM_FLAGS_TRANSITIONS
     ):
+        # Preserve the legacy rule-name suffix by stripping ``+0`` from
+        # the ``dim_ref`` output strings.
+        first_out = out_dims[0].split("+", 1)[0]
         rules.append(FFNRule.gated_write(
-            name=f"layer2_mem_byte_flags_{idx}_{out_dims[0].lower()}",
+            name=f"layer2_mem_byte_flags_{idx}_{first_out.lower()}",
             conditions=(
                 (src_dim, 1.0),
                 ("IS_BYTE", 1.0),
@@ -329,18 +349,27 @@ def _layer2_initial_pc_bake_cancel_rules(S: float) -> tuple[FFNRule, ...]:
 
     The output offsets are derived from runtime ``PC_OFFSET`` so the
     cancel slots match the token-embedding bake exactly.
+
+    Phase 8.D: the ``MARK_PC`` gate uses :func:`dim_ref` for the
+    ``(marker, PC)`` semantic pair so the rule names the family
+    lookup (PC marker family member) rather than the bare slot
+    label. ``EMBED_LO+init_pc_lo`` / ``EMBED_HI+init_pc_hi`` writes
+    stay structural -- the runtime ``PC_OFFSET``-derived offsets
+    encode a value-bus nibble position, not a role-meaningful byte
+    index.
     """
     from ...constants import PC_OFFSET
     init_pc_lo = PC_OFFSET & 0xF
     init_pc_hi = (PC_OFFSET >> 4) & 0xF
     write_scale = -2.0 / S
+    gate_mark_pc = dim_ref("marker", "PC")
 
     return (
         FFNRule.gated_write(
             name="layer2_initial_pc_bake_cancel_lo",
             conditions=(("HAS_SE", 1.0),),
             threshold=0.5,
-            gate="MARK_PC",
+            gate=gate_mark_pc,
             gate_weight=1.0,
             gate_bias=0.0,
             writes=((f"EMBED_LO+{init_pc_lo}", write_scale),),
@@ -349,7 +378,7 @@ def _layer2_initial_pc_bake_cancel_rules(S: float) -> tuple[FFNRule, ...]:
             name="layer2_initial_pc_bake_cancel_hi",
             conditions=(("HAS_SE", 1.0),),
             threshold=0.5,
-            gate="MARK_PC",
+            gate=gate_mark_pc,
             gate_weight=1.0,
             gate_bias=0.0,
             writes=((f"EMBED_HI+{init_pc_hi}", write_scale),),

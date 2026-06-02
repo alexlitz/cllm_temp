@@ -2,6 +2,7 @@
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...constants import INSTR_WIDTH, PC_OFFSET
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -143,10 +144,18 @@ def _layer3_ffn_rules(S: float) -> tuple:
     Byte-identity-validated against the legacy
     ``vm_step._set_layer3_ffn`` + suppressor pair via the parity test
     in ``tests/test_declarative_ffn_bakes_l3.py``.
+
+    Phase 8.D: the two ``MARK_PC`` undo-unit gates use :func:`dim_ref`
+    for the ``(marker, PC)`` semantic pair so the rule names the
+    family lookup directly. Marker references that appear as
+    ``(marker_name, weight)`` conditions stay structural -- those
+    are guard terms in the up-branch dot product, not role-meaningful
+    gate dims (the L8 pilot preserved that convention).
     """
     first_pc = PC_OFFSET + INSTR_WIDTH
     pc_lo = first_pc & 0xF
     pc_hi = (first_pc >> 4) & 0xF
+    gate_mark_pc = dim_ref("marker", "PC")
     rules = []
 
     # --- PC FIRST-STEP DEFAULT (units 0-3) ---
@@ -166,7 +175,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
         name="layer3_ffn.pc_first_step_default_lo_undo",
         conditions=(("HAS_SE", 1.0),),
         threshold=0.5,
-        gate="MARK_PC",
+        gate=gate_mark_pc,
         gate_weight=1.0,
         gate_bias=0.0,
         writes=((f"OUTPUT_LO+{pc_lo}", -2.0 / S),
@@ -185,7 +194,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
         name="layer3_ffn.pc_first_step_default_hi_undo",
         conditions=(("HAS_SE", 1.0),),
         threshold=0.5,
-        gate="MARK_PC",
+        gate=gate_mark_pc,
         gate_weight=1.0,
         gate_bias=0.0,
         writes=((f"OUTPUT_HI+{pc_hi}", -2.0 / S),
