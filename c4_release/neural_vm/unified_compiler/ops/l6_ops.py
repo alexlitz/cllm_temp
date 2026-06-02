@@ -2106,6 +2106,66 @@ def _lower_layer6_psh_stack0_marker_override_ir(
     )
 
 
+def make_layer6_routing_ffn_ir(S: float = 100.0) -> CompilerIR:
+    """Declarative CompilerIR aggregating every ``layer6_routing_ffn`` band.
+
+    The actual bake stays in ``_bake_layer6_routing_ffn`` because each band
+    is pinned to its historical L6_*_START_UNIT offset (see
+    :data:`_L6_FFN_BAND_LAYOUT`), which the generic
+    ``_dispatch_operation_ir`` (start_unit=0) cannot replicate. The IR is
+    attached to the op via ``compiler_ir=`` so the declarative verifier,
+    scope checker, and dominance auditor can read the full L6 routing rule
+    set directly.
+
+    The rule families included (in source order) cover every unit band
+    listed in :data:`_L6_FFN_BAND_LAYOUT` that has an authored ``_layer6_*_rules``
+    helper -- i.e. every band except those whose writes are still produced
+    inside the legacy ``_set_layer6_routing_ffn`` wrapper (such as the
+    convo-IO state machine band and the late ``opcode_relay_head`` extension
+    band, which are owned by separate ops with their own ``compiler_ir``).
+
+    See ``compare_symbolic_to_lowered_ffn`` aggregate test below for the
+    structural (declaration / lowering-contract) guarantee.
+    """
+
+    ir = CompilerIR()
+    ffn_op = ir.layer(0).ffn
+    ffn_op.rules.extend(_layer6_imm_fetch_route_rules(S))
+    ffn_op.rules.extend(_layer6_imm_carry_refresh_rules(S))
+    ffn_op.rules.extend(_layer6_exit_ax_route_rules(S))
+    ffn_op.rules.extend(_layer6_nop_ax_route_rules(S))
+    ffn_op.rules.extend(_layer6_jsr_ax_route_rules(S))
+    ffn_op.rules.extend(_layer6_jmp_ax_route_rules(S))
+    ffn_op.rules.extend(_layer6_delayed_jmp_pc_override_rules(S))
+    ffn_op.rules.extend(_layer6_first_step_jmp_pc_override_rules(S))
+    ffn_op.rules.extend(_layer6_all_step_jmp_pc_override_rules(S))
+    ffn_op.rules.extend(_layer6_halt_detect_rules(S))
+    ffn_op.rules.extend(_layer6_temp_cleanup_rules(S))
+    ffn_op.rules.extend(_layer6_cmp3_cleanup_rules(S))
+    ffn_op.rules.extend(_layer6_stack_identity_rules(S))
+    ffn_op.rules.extend(_layer6_psh_sp_decrement_rules(S))
+    ffn_op.rules.extend(_layer6_jsr_sp_decrement_rules(S))
+    ffn_op.rules.extend(_layer6_jsr_sp_fixup_rules(S))
+    ffn_op.rules.extend(_layer6_jsr_sp_bytes_rules(S))
+    ffn_op.rules.extend(_layer6_psh_stack0_writeback_rules(S))
+    ffn_op.rules.extend(_layer6_getchar_ax_route_rules(S))
+    ffn_op.rules.extend(_layer6_bz_ax_route_rules(S))
+    ffn_op.rules.extend(_layer6_bnz_ax_route_rules(S))
+    ffn_op.rules.extend(_layer6_psh_ax_route_rules(S))
+    ffn_op.rules.extend(_layer6_adj_ax_route_rules(S))
+    ffn_op.rules.extend(_layer6_adj_sp_writeback_rules(S))
+    ffn_op.rules.extend(_layer6_ent_sp_writeback_rules(S))
+    ffn_op.rules.extend(_layer6_ent_first_step_sp_byte0_rules(S))
+    ffn_op.rules.extend(_layer6_ent_first_step_sp_bytes_rules(S))
+    ffn_op.rules.extend(_layer6_bz_pc_override_rules(S))
+    ffn_op.rules.extend(_layer6_bnz_pc_override_rules(S))
+    ffn_op.rules.extend(_layer6_tail_cleanup_rules(S))
+    ffn_op.rules.extend(_layer6_branch_pc_byte1_override_rules(S))
+    ffn_op.rules.extend(_layer6_all_step_jsr_pc_override_rules(S))
+    ffn_op.rules.extend(_layer6_psh_stack0_marker_override_rules(S))
+    return ir
+
+
 def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
     """Bake L6 routing FFN via the smoke-stable legacy wrapper.
 
@@ -2543,6 +2603,7 @@ def make_layer6_routing_ffn_op() -> Operation:
         bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir=make_layer6_routing_ffn_ir(),
         layer_idx=6,
         migrated=True,
         smoke_tests={
