@@ -44,16 +44,20 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
 
     When `enable_tool_calling=False`, the bake_fn is a no-op so the op can be
     unconditionally registered in `all_core_ops()` without changing behavior.
+
+    Migrated 2026-06-01 (Phase 6 Wave 3L): the imperative helper
+    ``_set_tool_call_opcode_decode`` is replaced by an
+    ``FFNRule``-driven lowerer (``_lower_tool_call_opcode_decode_ir``)
+    — six ``FFNRule.gated_write`` units lowered through
+    ``Primitives.lower_ffn_rules`` at pinned units 400..405.
+    Byte-identical to the legacy helper.
     """
-    if enable_tool_calling:
-        def bake(model, dim_positions, S):
-            from ...vm_step import _set_tool_call_opcode_decode
-            _set_tool_call_opcode_decode(
-                model.blocks[5].ffn, S, _as_setdim_proxy(dim_positions),
-            )
-    else:
-        def bake(model, dim_positions, S):
-            return  # disabled when enable_tool_calling=False
+    def bake(model, dim_positions, S):
+        if not enable_tool_calling:
+            return
+        _lower_tool_call_opcode_decode_ir(
+            model.blocks[5].ffn, S, _as_setdim_proxy(dim_positions),
+        )
 
     return Operation(
         name="tool_call_opcode_decode",
@@ -61,11 +65,67 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_tool_calling else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         phase=998.8,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
+    )
+
+
+_TOOL_CALL_OPCODE_DECODE_START_UNIT = 400
+
+# (OPCODE_BYTE_LO nibble, OPCODE_BYTE_HI nibble, opcode name).  Mirrors the
+# ``io_opcodes`` table in ``_set_tool_call_opcode_decode``: OPEN=30 (0x1E),
+# READ=31 (0x1F), CLOS=32 (0x20), PRTF=33 (0x21), GETCHAR=64 (0x40),
+# PUTCHAR=65 (0x41).
+_TOOL_CALL_OPCODE_TABLE = (
+    (14, 1, "open"),
+    (15, 1, "read"),
+    (0, 2, "clos"),
+    (1, 2, "prtf"),
+    (0, 4, "getchar"),
+    (1, 4, "putchar"),
+)
+
+
+def _tool_call_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for ``_set_tool_call_opcode_decode``.
+
+    Six gated-write units, one per I/O opcode: 2-way AND on
+    ``OPCODE_BYTE_LO/HI`` nibbles, MARK_AX gate, writes ``IO_IS_TOOL_CALL``.
+    Each unit's effective contribution is ``10.0/S`` so the combined flag
+    is roughly 5.0 when an I/O opcode is active.
+    """
+    write_scale = 10.0 / S
+    return tuple(
+        FFNRule.gated_write(
+            name=f"tool_call_decode_{name}",
+            conditions=(
+                (f"OPCODE_BYTE_LO+{lo}", 1.0),
+                (f"OPCODE_BYTE_HI+{hi}", 1.0),
+            ),
+            threshold=1.5,
+            gate="MARK_AX",
+            writes=(("IO_IS_TOOL_CALL", write_scale),),
+        )
+        for lo, hi, name in _TOOL_CALL_OPCODE_TABLE
+    )
+
+
+def _lower_tool_call_opcode_decode_ir(ffn, S: float, BD) -> int:
+    rules = _tool_call_opcode_decode_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=_TOOL_CALL_OPCODE_DECODE_START_UNIT,
+        S=S,
     )
 
 
@@ -222,20 +282,29 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
     Runs before legacy_bake (999).
 
     When `enable_tool_calling=False`, the bake_fn is a no-op.
+
+    Migrated 2026-06-01 (Phase 6 Wave 3L): the imperative helper
+    ``_set_tool_call_relay_head`` is replaced by a
+    ``DeclarativeAttentionHeadSpec`` lowered through
+    ``Primitives.generate_attention_head`` (matching the
+    ``make_convo_io_relay_heads_op`` pattern). Byte-identical to the
+    legacy helper. The ``alibi_slopes[5] = 5.0`` mutation stays inline
+    in the bake_fn (alibi slopes are not part of the declarative
+    attention IR).
     """
-    if enable_tool_calling:
-        def bake(model, dim_positions, S):
-            from ...vm_step import _set_tool_call_relay_head
-            attn = model.blocks[6].attn
-            if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-                attn.alibi_slopes[5] = 5.0  # steep ALiBi for head 5
-            HD = attn.W_q.shape[0] // attn.num_heads
-            _set_tool_call_relay_head(
-                attn, S, _as_setdim_proxy(dim_positions), HD,
-            )
-    else:
-        def bake(model, dim_positions, S):
-            return  # disabled when enable_tool_calling=False
+    def bake(model, dim_positions, S):
+        del S
+        if not enable_tool_calling:
+            return
+        attn = model.blocks[6].attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[5] = 5.0  # steep ALiBi for head 5
+        HD = attn.W_q.shape[0] // attn.num_heads
+        Primitives.generate_attention_head(
+            attn,
+            _tool_call_relay_head_spec(_as_setdim_proxy(dim_positions)),
+            HD,
+        )
 
     return Operation(
         name="tool_call_relay_head",
@@ -243,11 +312,45 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_tool_calling else None,
+        declarative_bake_fn=bake,
+        compiler_ir_factory=(
+            _tool_call_relay_head_ir if enable_tool_calling else None
+        ),
+        declarative_authority="spec_generated",
         phase=998.8,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
+    )
+
+
+def _tool_call_relay_head_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_tool_call_relay_head_spec(proxy))
+    return ir
+
+
+def _tool_call_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L6 attention head 5: relay IO_IS_TOOL_CALL AX -> SE.
+
+    Mirrors ``_set_tool_call_relay_head`` exactly:
+      - Q: ``NEXT_SE`` × L (query at SE position), ``MARK_AX`` × -L (block at AX)
+      - K: ``MARK_AX`` × L (attend to AX marker)
+      - V slot 1: copy ``IO_IS_TOOL_CALL`` (×1.0)
+      - O: write slot-1 value into ``CMP+2`` (×1.0, the IS_TOOL_CALL relay)
+    """
+    L = 50.0
+    return DeclarativeAttentionHeadSpec(
+        head_idx=5,
+        q=(
+            AP(0, BD.NEXT_SE, L),
+            AP(0, BD.MARK_AX, -L),
+        ),
+        k=(AP(0, BD.MARK_AX, L),),
+        v=(AP(1, BD.IO_IS_TOOL_CALL, 1.0),),
+        o=(AO(BD.CMP + 2, 1, 1.0),),
     )
 
 
@@ -363,16 +466,21 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
     legacy_bake (999) so unit 1300 survives `_right_size_ffns`.
 
     When `enable_tool_calling=False`, the bake_fn is a no-op.
+
+    Migrated 2026-06-01 (Phase 6 Wave 3L): the imperative helper
+    ``_set_tool_call_detection`` is replaced by an ``FFNRule``-driven
+    lowerer (``_lower_tool_call_detection_ir``) — single
+    ``FFNRule.constant_write`` lowered through
+    ``Primitives.lower_ffn_rules`` at pinned unit 1300. Byte-identical to
+    the legacy helper (validated via
+    ``compare_symbolic_to_lowered_ffn``).
     """
-    if enable_tool_calling:
-        def bake(model, dim_positions, S):
-            from ...vm_step import _set_tool_call_detection
-            _set_tool_call_detection(
-                model.blocks[6].ffn, S, _as_setdim_proxy(dim_positions),
-            )
-    else:
-        def bake(model, dim_positions, S):
-            return  # disabled when enable_tool_calling=False
+    def bake(model, dim_positions, S):
+        if not enable_tool_calling:
+            return
+        _lower_tool_call_detection_ir(
+            model.blocks[6].ffn, S, _as_setdim_proxy(dim_positions),
+        )
 
     return Operation(
         name="tool_call_detection",
@@ -380,11 +488,55 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_tool_calling else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         phase=998.8,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
+    )
+
+
+_TOOL_CALL_DETECTION_START_UNIT = 1300
+
+
+def _tool_call_detection_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for ``_set_tool_call_detection`` (L6 FFN unit 1300).
+
+    Single ``constant_write`` unit: ``CMP[2] + NEXT_SE >= 3.0`` fires and
+    emits ``NEXT_TOOL_CALL`` (+2/S) while suppressing ``NEXT_SE`` (-2/S).
+    ``b_gate=1.0`` is supplied via :class:`FFNRule`'s default
+    ``gate_bias`` for ``constant_write``.
+    """
+    write_scale = 2.0 / S
+    return (
+        FFNRule.constant_write(
+            name="tool_call_detection",
+            conditions=(
+                ("CMP+2", 1.0),
+                ("NEXT_SE", 1.0),
+            ),
+            threshold=3.0,
+            writes=(
+                ("NEXT_TOOL_CALL", write_scale),
+                ("NEXT_SE", -write_scale),
+            ),
+        ),
+    )
+
+
+def _lower_tool_call_detection_ir(ffn, S: float, BD) -> int:
+    rules = _tool_call_detection_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=_TOOL_CALL_DETECTION_START_UNIT,
+        S=S,
     )
 
 
