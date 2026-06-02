@@ -675,6 +675,14 @@ def make_layer15_si_mem_addr0_from_stack0_op() -> Operation:
         compiler_ir_factory=_layer15_si_mem_addr0_from_stack0_ir,
         migrated=True,
         alibi_slopes={13: 1.0},
+        # Phase 7.A.2 backfill: this op OVERRIDES the L14 generic MEM-address
+        # head's OUTPUT_LO/OUTPUT_HI_THIS_STEP for SI/SC (see module docstring
+        # at the top of the spec helper). The override only makes sense after
+        # ``layer14_mem_generation`` has already written the generic result,
+        # so it must run strictly later. The STACK0_BYTE0 source path
+        # ultimately traces back to ``layer1_ffn`` (already declared) which
+        # populates the STACK0 byte slot consumed by the K projection here.
+        requires={"after": ["layer1_ffn", "layer14_mem_generation"]},
         smoke_tests={
             "TestSmokeMemory::test_si_li_roundtrip",
         },
