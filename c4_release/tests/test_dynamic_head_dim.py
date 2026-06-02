@@ -315,3 +315,145 @@ def test_l8_half_width_head_integration():
 # stays byte-identical against the pre-change baseline. Per the brief we
 # don't gate that here; the unit-level checks above are the contract.
 # ----------------------------------------------------------------------
+
+
+# ----------------------------------------------------------------------
+# 7. Asymmetric head_dim consumer test: head_dim=[16, 16, 8, 16] at L8.
+#    Head 2 is half-width. Verifies the cumulative-sum layout the bake
+#    must use to keep Q/K/V/O slot row widths per-head.
+# ----------------------------------------------------------------------
+def test_l8_asymmetric_head_dim_16_16_8_16():
+    """Register heads at L8 with head_dim=[16, 16, 8, 16] (head 2 is
+    half-width). Verify total = 56 (not 4*16=64), per-head cumulative
+    bases line up, and Q/K/V/O writes land in each head's own row
+    block at its declared width.
+
+    Expected layout (default HD=16):
+        head 0 (HD=16) -> rows  [0, 16)
+        head 1 (HD=16) -> rows [16, 32)
+        head 2 (HD= 8) -> rows [32, 40)
+        head 3 (HD=16) -> rows [40, 56)
+    Total = 56, NOT 4 * 16 = 64.
+    """
+    alloc = AttentionHeadAllocator(layer_max_heads=8)
+    head_dims = [16, 16, 8, 16]
+    for h, hd in enumerate(head_dims):
+        # head_dim=None for default-width heads keeps byte-identity with
+        # the legacy bake; only head 2 declares an override.
+        kw = {"head_dim": hd} if hd != 16 else {}
+        alloc.alloc(f"l8_asym_head_{h}", layer_idx=8, pin=h, **kw)
+
+    default_HD = 16
+
+    # ---- allocator-level totals + bases ----
+    total = alloc.total_head_dim_at(8, default_head_dim=default_HD)
+    assert total == 16 + 16 + 8 + 16
+    assert total == 56
+    assert total != 4 * default_HD  # naive fixed-HD formula would give 64
+
+    expected_bases = [0, 16, 32, 40]
+    for h, expected in zip(range(4), expected_bases):
+        assert alloc.head_base_at(8, h, default_head_dim=default_HD) == expected
+
+    # ---- consumer-side lowering: each head writes only inside its own
+    #      row block, using its own head_dim as the slot width.
+    attn = _AttnStub(dim_rows=total + 1, dim_cols=80)
+    specs = []
+    for h, hd in enumerate(head_dims):
+        eff = hd
+        spec_kw = {"head_dim": hd} if hd != 16 else {}
+        specs.append(
+            DeclarativeAttentionHeadSpec(
+                head_idx=h,
+                q=tuple(
+                    AP(slot=s, dim=h * 4 + (s % 4), weight=float(10 * h + s + 1))
+                    for s in range(eff)
+                ),
+                k=tuple(
+                    AP(slot=s, dim=20 + h * 4 + (s % 4), weight=float(100 + 10 * h + s + 1))
+                    for s in range(eff)
+                ),
+                v=tuple(
+                    AP(slot=s, dim=40 + h * 4 + (s % 4), weight=float(200 + 10 * h + s + 1))
+                    for s in range(eff)
+                ),
+                o=tuple(
+                    AO(out_dim=60 + h * 4 + (s % 4), slot=s, weight=float(300 + 10 * h + s + 1))
+                    for s in range(eff)
+                ),
+                **spec_kw,
+            )
+        )
+    Primitives.generate_attention_heads(attn, specs, default_HD)
+
+    # ---- head-by-head check: writes land at the cumulative base ----
+    for h, hd in enumerate(head_dims):
+        base = expected_bases[h]
+        eff = hd
+        for s in range(eff):
+            assert float(attn.W_q.data[base + s, h * 4 + (s % 4)]) == float(
+                10 * h + s + 1
+            )
+            assert float(
+                attn.W_k.data[base + s, 20 + h * 4 + (s % 4)]
+            ) == float(100 + 10 * h + s + 1)
+            assert float(
+                attn.W_v.data[base + s, 40 + h * 4 + (s % 4)]
+            ) == float(200 + 10 * h + s + 1)
+            assert float(
+                attn.W_o.data[60 + h * 4 + (s % 4), base + s]
+            ) == float(300 + 10 * h + s + 1)
+
+    # ---- bounds-respect: head 2 must not bleed past its 8-row block.
+    # Head 2's Q dims: 8, 9, 10, 11 (h=2: h*4=8; slot%4 in {0..3}).
+    # Rows [40, 48) belong to head 3 — those columns must be zero there.
+    for col in (8, 9, 10, 11):
+        for r in range(40, 48):
+            assert float(attn.W_q.data[r, col]) == 0.0
+
+
+def test_lower_attention_consumer_respects_dynamic_head_dim():
+    """Consumer-path test: ``CompilerIR.lower_attention`` must route
+    through the cumulative-sum lowering path when any head declares a
+    non-default ``head_dim``. Before the fix it called
+    ``Primitives.generate_attention_head`` per head with no ``head_base``,
+    so the half-width middle head landed at the legacy ``head_idx * HD``
+    row, overlapping the next head's block.
+    """
+    from c4_release.neural_vm.unified_compiler.ir import (
+        CompilerIR,
+        LayerSpec,
+    )
+
+    head_dims = [16, 16, 8, 16]
+    default_HD = 16
+    specs = [
+        DeclarativeAttentionHeadSpec(
+            head_idx=h,
+            head_dim=hd if hd != 16 else None,
+            q=(AP(slot=0, dim=h, weight=float(h + 1)),),
+            k=(AP(slot=0, dim=10 + h, weight=float(100 + h + 1)),),
+            v=(AP(slot=0, dim=20 + h, weight=float(200 + h + 1)),),
+            o=(AO(out_dim=30 + h, slot=0, weight=float(300 + h + 1)),),
+        )
+        for h, hd in enumerate(head_dims)
+    ]
+    layer = LayerSpec()
+    for s in specs:
+        layer.attention.add_head(s)
+    ir = CompilerIR(layers=[layer])
+    attn = _AttnStub(dim_rows=64, dim_cols=64)
+    ir.lower_attention(attn, default_HD, layer_idx=0)
+
+    # Expected cumulative bases for [16, 16, 8, 16].
+    expected_bases = [0, 16, 32, 40]
+    for h in range(4):
+        base = expected_bases[h]
+        assert float(attn.W_q.data[base, h]) == float(h + 1)
+        assert float(attn.W_k.data[base, 10 + h]) == float(100 + h + 1)
+        assert float(attn.W_v.data[base, 20 + h]) == float(200 + h + 1)
+        assert float(attn.W_o.data[30 + h, base]) == float(300 + h + 1)
+
+    # Pre-fix behaviour would have written head 3 at row 3*16=48 (legacy).
+    # Confirm the new cumulative-sum base 40 was used instead.
+    assert float(attn.W_q.data[48, 3]) == 0.0
