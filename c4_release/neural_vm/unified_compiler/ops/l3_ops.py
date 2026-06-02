@@ -694,9 +694,15 @@ def make_layer3_ffn_op() -> Operation:
     return Operation(
         name="layer3_ffn",
         phase=3,
+        # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
+        # relative to L5/L7/L11/L14 TEMP writers (which fire AFTER L3 in the
+        # same step). The same-step value layer3_carry_forward_attn writes
+        # at PC byte0 row (TEMP+1, TEMP+16) is still picked up at the same
+        # numeric position because TEMP_PREV_STEP aliases TEMP. Breaks
+        # back-edges L5/L7/L11/L14 → layer3_ffn on TEMP.
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
                "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "TEMP", "IS_BYTE", "H1", "H4", "OP_LEV",
+               "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
@@ -972,9 +978,10 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
     return Operation(
         name="_layer3_ffn_dep_anchor",
         phase=3,
+        # Phase 8.A.6 v2: matches layer3_ffn's TEMP_PREV_STEP rename.
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
                "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "TEMP", "IS_BYTE", "H1", "H4", "OP_LEV",
+               "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "EMBED_LO", "EMBED_HI",

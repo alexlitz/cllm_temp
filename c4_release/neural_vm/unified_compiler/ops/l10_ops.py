@@ -1898,7 +1898,12 @@ def make_layer10_byte_passthrough_op() -> Operation:
     return Operation(
         name="layer10_byte_passthrough",
         phase=10,
-        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "TEMP",
+        # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
+        # relative to L11/L14 TEMP writers (which fire after L10 in the
+        # same step). The same-step values from L3/L5/L7 still resolve at
+        # the same numeric position (TEMP_PREV_STEP aliases TEMP). Breaks
+        # L11/L14 → layer10_byte_passthrough back-edges on TEMP.
+        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "TEMP_PREV_STEP",
                "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "MEM_STORE", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -2094,7 +2099,10 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
     return Operation(
         name="layer10_byte_passthrough_bake",
         phase=10.1,
-        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "OP_LC_RELAY", "TEMP",
+        # Phase 8.A.6 v2: matches layer10_byte_passthrough's TEMP_PREV_STEP
+        # rename. See that op for rationale.
+        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "OP_LC_RELAY",
+               "TEMP_PREV_STEP",
                "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "MEM_STORE", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -2320,7 +2328,12 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
     return Operation(
         name="layer10_stack0_byte_relay_bake",
         phase=10.4,
-        reads={"IS_BYTE", "HAS_SE", "H1", "H4", "TEMP", "CMP", "PSH_AT_SP",
+        # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
+        # relative to L11/L14 TEMP writers (which fire after L10 in the
+        # same step). Same numeric position as TEMP. See
+        # layer10_byte_passthrough for the per-band rationale.
+        reads={"IS_BYTE", "HAS_SE", "H1", "H4", "TEMP_PREV_STEP", "CMP",
+               "PSH_AT_SP",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
                "OP_PSH", "OP_SI", "OP_SC", "OP_LEV", "MEM_STORE", "MARK_MEM",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
@@ -2448,7 +2461,10 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
     return Operation(
         name="layer10_stack0_byte_relay",
         phase=10,
-        reads={"MARK_AX", "IS_BYTE", "HAS_SE", "H1", "H4", "TEMP", "CMP",
+        # Phase 8.A.6 v2: matches layer10_stack0_byte_relay_bake's
+        # TEMP_PREV_STEP rename. See that op for rationale.
+        reads={"MARK_AX", "IS_BYTE", "HAS_SE", "H1", "H4", "TEMP_PREV_STEP",
+               "CMP",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
                "PSH_AT_SP", "OP_PSH", "OP_SI", "OP_SC", "OP_LEV", "MEM_STORE", "MARK_MEM",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
@@ -2669,6 +2685,9 @@ def make_l10_post_ops_combined() -> Operation:
     return Operation(
         name="l10_post_ops_combined",
         phase=10.5,
+        # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
+        # relative to L11/L14 TEMP writers. Same numeric position as TEMP.
+        # See layer10_byte_passthrough for the per-band rationale.
         reads={
             "CONST", "MARK_AX", "MARK_PC", "IS_BYTE", "H1",
             "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
@@ -2680,7 +2699,7 @@ def make_l10_post_ops_combined() -> Operation:
             "OP_SI", "OP_SC", "OP_PSH", "OP_EXIT", "OP_NOP",
             "OP_PUTCHAR", "OP_GETCHAR",
             "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "ALU_LO", "ALU_HI",
-            "CARRY", "CMP", "TEMP",
+            "CARRY", "CMP", "TEMP_PREV_STEP",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CARRY"},

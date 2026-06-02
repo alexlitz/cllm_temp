@@ -2536,13 +2536,18 @@ def make_layer6_routing_ffn_op() -> Operation:
     return Operation(
         name="layer6_routing_ffn",
         phase=6.5,
+        # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
+        # relative to L7/L11/L14 TEMP writers (which fire after L6 in the
+        # same step). The same-step values from L3 carry_forward / L5
+        # opcode_decode are still picked up at the same numeric position.
+        # Breaks L7/L11/L14 → layer6_routing_ffn back-edges on TEMP.
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
                "AX_CARRY_LO", "AX_CARRY_HI", "CMP",
                "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
-               "TEMP", "DIV_STAGING"},
+               "TEMP_PREV_STEP", "DIV_STAGING"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
         declarative_bake_fn=bake,
