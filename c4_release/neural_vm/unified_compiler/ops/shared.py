@@ -757,6 +757,17 @@ def declare_setdim_compat_dims(
                    # (174) so bakes stay byte-identical.
                    "OUTPUT_LO_PREV_STEP",
                    "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+                   # Phase 8.A.6 v2: PREV_STEP aliases for the ALU/AX_CARRY
+                   # bands. Same numeric base as ALU_LO / AX_CARRY_{LO,HI}.
+                   # Used by cross-step readers (ops that fire BEFORE the
+                   # next writer of the band in the same step) to break the
+                   # ALU_LO / AX_CARRY_HI back-edges in the dynamic
+                   # scheduler dep graph. Mirrors B9 OUTPUT_HI_THIS_STEP /
+                   # 7.A.3 OUTPUT_LO_PREV_STEP / 7.A.3.b TEMP_PREV_STEP.
+                   # Declared after each base so the alias inherits the
+                   # pinned position via ``_ALIAS_OF`` below.
+                   "ALU_LO_PREV_STEP",
+                   "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP",
                    "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                    "FETCH_LO", "FETCH_HI", "MUL_ACCUM", "DIV_STAGING",
                    "AX_FULL_LO", "AX_FULL_HI",
@@ -767,7 +778,12 @@ def declare_setdim_compat_dims(
                    "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"]
     four_dim = ["CARRY"]
     eight_dim = ["CMP"]
-    forty_eight_dim = ["ADDR_KEY"]
+    forty_eight_dim = ["ADDR_KEY",
+                      # Phase 8.A.6 v2: PREV_STEP alias for ADDR_KEY. Same
+                      # numeric base. Used by cross-step readers (L4/L5/L8/L9
+                      # ops that fire before L7/L14 writers in the same step).
+                      # See ALU_LO / AX_CARRY *_PREV_STEP comment above.
+                      "ADDR_KEY_PREV_STEP"]
     thirty_two_dim = ["TEMP",
                       # Phase 7.A.3 TEMP split: TEMP_PREV_STEP cross-step
                       # alias mirrors the B9 OUTPUT_HI / 7.A.3.b OUTPUT_LO
@@ -793,36 +809,38 @@ def declare_setdim_compat_dims(
         "OUTPUT_LO_PREV_STEP": "OUTPUT_LO",
         # Phase 7.A.3 TEMP split: PREV_STEP alias for future cross-step reads.
         "TEMP_PREV_STEP": "TEMP",
+        # Phase 8.A.6 v2: PREV_STEP aliases break back-edges on ADDR_KEY,
+        # ALU_LO, and AX_CARRY_{LO,HI} in the dynamic scheduler dep graph.
+        # Each alias shares the same numeric position as its base so baked
+        # weight cells are byte-identical.
+        "ADDR_KEY_PREV_STEP": "ADDR_KEY",
+        "ALU_LO_PREV_STEP": "ALU_LO",
+        "AX_CARRY_LO_PREV_STEP": "AX_CARRY_LO",
+        "AX_CARRY_HI_PREV_STEP": "AX_CARRY_HI",
     }
 
     def _declare(name, size):
         if not hasattr(_SetDim, name):
             return
-        # Aliases inherit the base dim's pinned position (in BOTH pinning
-        # modes) so byte-identical residual cells are guaranteed regardless
-        # of compaction layout.
+        # Aliases inherit the base dim's position (in BOTH pinning modes)
+        # so byte-identical residual cells are guaranteed regardless of
+        # compaction layout. We declare via ``alias_of=`` so the compiler
+        # resolves the position at _allocate_dims time, even when the base
+        # is bump-pointer-allocated (which happens in pin_io_only=True
+        # mode for non-IO-required dims like AX_CARRY_LO/HI, ALU_LO,
+        # ADDR_KEY, TEMP, OUTPUT_LO).
         base = _ALIAS_OF.get(name)
         if base is not None:
             existing = getattr(compiler, "_pinned", {}) or {}
             if base in existing:
                 pinned = existing[base]
-            elif pin_io_only and base not in _IO_REQUIRED_DIMS:
-                # Compact layout: base is bump-pointer allocated (not
-                # pinned). Skip the alias declaration so it doesn't get
-                # pinned to a stale _SetDim position that disagrees with
-                # the bump-pointer location of the base. The alias still
-                # resolves via the ``_SetDim`` proxy fallback in baked
-                # code that references ``BD.<alias>``, and ops that
-                # declare reads on the alias name would surface a clear
-                # "undeclared dim" error in compact mode -- which is the
-                # correct behaviour because there is no byte-identical
-                # cell to read.
-                return
             else:
-                # Fall back to _SetDim if the base wasn't pinned (shouldn't
-                # happen because the base is declared first in the list).
+                # Base is unpinned (will be bump-allocated). Fall back to
+                # _SetDim if pin_to_setdim is set; otherwise leave
+                # pinned=None — the compiler's alias machinery resolves the
+                # position post-allocation via the ``alias_of=`` link.
                 pinned = getattr(_SetDim, base, None) if pin_to_setdim else None
-            compiler.declare_dim(name, size, pinned=pinned)
+            compiler.declare_dim(name, size, pinned=pinned, alias_of=base)
             return
         if pin_io_only:
             if name in _IO_REQUIRED_DIMS:

@@ -2314,6 +2314,11 @@ class _SetDim:
 
     # --- Address key (for memory attention) ---
     ADDR_KEY = 206  # 206-253 (48 dims: 3 nibbles × 16 one-hot)
+    # Phase 8.A.6 v2: ADDR_KEY_PREV_STEP alias (same numeric base) lets
+    # cross-step readers (L4/L5/L8/L9 ops that fire before L7/L14 writers
+    # in the same step) declare their reads as prev-step semantically.
+    # See dim_registry.py and shared.py for the alias map.
+    ADDR_KEY_PREV_STEP = 206  # alias of ADDR_KEY
 
     # --- NEXT_* transition flags ---
     NEXT_PC = 254
@@ -2427,6 +2432,12 @@ class _SetDim:
     # --- AX carry-forward staging ---
     AX_CARRY_LO = 328  # 328-343
     AX_CARRY_HI = 344  # 344-359
+    # Phase 8.A.6 v2: PREV_STEP aliases of AX_CARRY_{LO,HI} (same numeric
+    # base) let cross-step readers (L6/L7 ops that fire before L8 writers
+    # in the same step) declare their reads as prev-step semantically.
+    # See dim_registry.py and shared.py for the alias map.
+    AX_CARRY_LO_PREV_STEP = 328  # alias of AX_CARRY_LO
+    AX_CARRY_HI_PREV_STEP = 344  # alias of AX_CARRY_HI
 
     # --- I/O state detection (shifted +4 to maintain aliases with MEM_VAL_B1/B2) ---
     LAST_WAS_IO_STATE_EMIT_BYTE = 462  # Flag: last token was IO_STATE_EMIT_BYTE (aliases MEM_VAL_B1)
@@ -2435,6 +2446,11 @@ class _SetDim:
     # --- ALU result staging ---
     ALU_LO = 360  # 360-375
     ALU_HI = 376  # 376-391
+    # Phase 8.A.6 v2: ALU_LO_PREV_STEP alias (same numeric base) lets
+    # cross-step readers (ops that fire before the next ALU_LO writer in
+    # the same step) declare their reads as prev-step semantically. See
+    # dim_registry.py and shared.py for the alias map.
+    ALU_LO_PREV_STEP = 360  # alias of ALU_LO
 
     # --- Carry / comparison ---
     CARRY = 392  # 392-395 (4 dims: inter-byte carry for ADD/SUB/MUL)
