@@ -48,6 +48,11 @@ from .layer_compiler import (
     dispatch_operation_bake,
     validate_declarations_only_ops,
 )
+from ..kv_eviction import (
+    KVEvictionPolicy,
+    KVEvictionState,
+    build_state_from_report,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -458,6 +463,75 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
                 pass
 
 
+def _attach_kv_eviction_state(
+    model,
+    layout: ModelLayout,
+    *,
+    kv_eviction_policy: KVEvictionPolicy,
+    n_steps: int,
+) -> None:
+    """Phase 7.F.2: attach per-layer ``KVEvictionState`` to each block's attn.
+
+    The policy is the single switch. ``KVEvictionPolicy.OFF`` clears any
+    previously-attached state on every block (so a cached model built with
+    STATIC_LIVENESS but reloaded with OFF reverts to byte-identity with the
+    baseline) and returns without running the analyzer.
+
+    ``KVEvictionPolicy.STATIC_LIVENESS`` runs
+    :func:`neural_vm.kv_liveness_analyzer.analyze_kv_liveness` once over
+    the layout's full op corpus, then projects the report onto each
+    attention layer via :func:`build_state_from_report` and attaches the
+    resulting :class:`KVEvictionState` to ``block.attn``. The decisions are
+    deterministic functions of the static IR, so spec-decode and main-decode
+    paths see identical eviction sets when given the same step index.
+    """
+
+    # Bottom-out: OFF clears any prior attached state and skips analysis.
+    if kv_eviction_policy is KVEvictionPolicy.OFF:
+        for block in getattr(model, "blocks", ()):
+            attn = getattr(block, "attn", None)
+            if attn is not None:
+                # Use object.__setattr__ to defeat any custom __setattr__ traps;
+                # nn.Module sets attributes via plain attribute assignment but
+                # we go through setattr for safety with sparse / compact wrappers.
+                setattr(attn, "eviction_state", None)
+        return
+
+    # Collect every op the compiler placed into the layout. The analyzer is
+    # read-only and tolerates ops without compiler_ir (no IR -> contributes
+    # only declared op.reads / op.writes / op.step_idx).
+    ops: List[Operation] = []
+    for ops_at_layer in layout.ops_per_layer:
+        ops.extend(ops_at_layer)
+    ops.extend(layout.block_ops)
+    ops.extend(layout.model_ops)
+
+    # Lazy-import the analyzer to keep ``compile_full_vm`` import-time light
+    # and to avoid pulling its IR-walking helpers into the OFF path.
+    from ..kv_liveness_analyzer import analyze_kv_liveness
+
+    report = analyze_kv_liveness(ops, n_steps=n_steps)
+
+    for layer_idx, block in enumerate(getattr(model, "blocks", ())):
+        attn = getattr(block, "attn", None)
+        if attn is None:
+            continue
+        # Per-layer projection; head=None means "every head in the layer
+        # shares the same evictable set". The state is a small dataclass
+        # so attaching one per attention is O(layers) memory.
+        state = build_state_from_report(
+            report,
+            layer_idx=layer_idx,
+            head_idx=None,
+            policy=kv_eviction_policy,
+        )
+        setattr(attn, "eviction_state", state)
+        # Make sure the runtime step counter exists so PureAttention's
+        # ``run_eviction_hook`` finds the attribute it expects.
+        if not hasattr(attn, "_eviction_step_idx"):
+            setattr(attn, "_eviction_step_idx", 0)
+
+
 def compile_full_vm(
     S: float = 100.0,
     *,
@@ -479,6 +553,8 @@ def compile_full_vm(
     rms_norm_eps: Optional[float] = None,
     require_declarative_bake: Optional[bool] = None,
     declarations_only: bool = False,
+    kv_eviction_policy: KVEvictionPolicy = KVEvictionPolicy.OFF,
+    kv_eviction_n_steps: int = 64,
 ):
     """Compile and bake a full Neural VM model via the compiler.
 
@@ -543,6 +619,24 @@ def compile_full_vm(
             bodies and only dispatches ``declarative_bake_fn`` generators (plus
             no-op topology anchors). This also enforces declarative authority
             and bypasses the disk cache so unsupported ops are visible.
+        kv_eviction_policy: Phase 7.F.2 runtime KV-eviction policy. Default
+            :data:`KVEvictionPolicy.OFF` preserves byte-identity with all
+            historical baselines (no eviction state attached). When set to
+            :data:`KVEvictionPolicy.STATIC_LIVENESS`, the compiler runs
+            :func:`neural_vm.kv_liveness_analyzer.analyze_kv_liveness` against
+            the registered op corpus, projects the report onto each attention
+            layer via :func:`neural_vm.kv_eviction.build_state_from_report`,
+            and attaches the resulting :class:`KVEvictionState` to every
+            ``model.blocks[i].attn`` instance. The forward-pass step boundary
+            hook in :class:`PureAttention.forward` consults the state
+            deterministically (same decisions across spec-decode and
+            main-decode paths). The flag is included in the disk-cache key
+            so OFF and STATIC_LIVENESS builds don't collide.
+        kv_eviction_n_steps: Upper bound on VM steps the liveness analyzer
+            reasons about when ``kv_eviction_policy`` is on. The default of
+            64 covers the smoke / 1096 test corpus; larger values widen the
+            evictable window at the cost of analysis time. Ignored when the
+            policy is OFF.
 
     Environment variables:
         C4_VALIDATE_ON_COMPILE: when set to ``"1"``, run Mode A of the
@@ -603,6 +697,10 @@ def compile_full_vm(
         "rms_norm_eps": float(rms_norm_eps),
         "require_declarative_bake": bool(require_declarative_bake),
         "declarations_only": bool(declarations_only),
+        # Phase 7.F.2: include eviction policy in the cache key so OFF and
+        # STATIC_LIVENESS builds don't share a serialised model.
+        "kv_eviction_policy": KVEvictionPolicy(kv_eviction_policy).value,
+        "kv_eviction_n_steps": int(kv_eviction_n_steps),
     }
     cache_path = None
     cache_key = _cache_key(kwargs_snapshot) if disk_cache else None
@@ -610,7 +708,19 @@ def compile_full_vm(
         cache_path = _cache_dir() / f"{cache_key}.pt"
         cached = _try_load_cached(cache_path, kwargs_snapshot)
         if cached is not None:
-            return cached
+            # Phase 7.F.2: re-attach KV eviction state on cache hit. The
+            # cache key includes the policy so cached models already match
+            # the requested policy; the re-attach is a defensive idempotent
+            # step that protects against stale caches built before the flag
+            # existed (analyzer + attach are cheap relative to a full bake).
+            cached_model, cached_layout = cached
+            _attach_kv_eviction_state(
+                cached_model,
+                cached_layout,
+                kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
+                n_steps=int(kv_eviction_n_steps),
+            )
+            return cached_model, cached_layout
 
     compiler = LayerCompiler()
     declare_setdim_compat_dims(compiler, pin_io_only=pin_io_only)
@@ -740,7 +850,16 @@ def compile_full_vm(
             cache_path = _cache_dir() / f"{cache_key}.pt"
             cached = _try_load_cached(cache_path, kwargs_snapshot)
             if cached is not None:
-                return cached
+                # Phase 7.F.2: same defensive re-attach as in the main cache
+                # hit path above.
+                cached_model, cached_layout = cached
+                _attach_kv_eviction_state(
+                    cached_model,
+                    cached_layout,
+                    kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
+                    n_steps=int(kv_eviction_n_steps),
+                )
+                return cached_model, cached_layout
 
     # Build the model with d_model/n_layers from the compiler. We override
     # the default size from build_model_from_layout to set ffn_hidden,
@@ -816,6 +935,20 @@ def compile_full_vm(
         # before cache save so MoE artifacts are reused across test runs.
         model.compact(block_size=32)
         model.compact_moe()
+
+    # Phase 7.F.2: attach per-attention :class:`KVEvictionState` artifacts.
+    # The hook short-circuits to a no-op when policy is OFF (preserves
+    # byte-identity with all historical baselines). When STATIC_LIVENESS,
+    # the analyzer runs against the full op corpus to compute the per-step
+    # evictable set; the state is then projected onto every block's attn
+    # (both PureAttention and AutoregressiveAttention; the latter relies
+    # on the caller invoking ``run_eviction_hook`` at the step boundary).
+    _attach_kv_eviction_state(
+        model,
+        layout,
+        kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
+        n_steps=int(kv_eviction_n_steps),
+    )
 
     if cache_path is not None:
         _try_save_cached(cache_path, model, layout, kwargs_snapshot)
