@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -1750,10 +1751,14 @@ def _layer14_jsr_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
         ("IS_BYTE", 1.0),
         (f"H1+{AX_I}", 1.0),
     )
+    # Phase 8.D: the OP_JSR gate resolves through the
+    # (opcode_flag, "JSR") semantic pair; byte-identical to the
+    # legacy "OP_JSR" slot string via DimRef.parse.
+    gate_jsr = dim_ref("opcode_flag", "JSR")
     common_kwargs = dict(
         conditions=common_conditions,
         threshold=1.5,
-        gate="OP_JSR",
+        gate=gate_jsr,
         gate_weight=1.0,
         gate_bias=0.0,
         scope="OP_JSR and IS_BYTE and H1+1",
