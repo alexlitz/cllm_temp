@@ -580,6 +580,71 @@ def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT lo nibble subtraction (256 units, offsets 1504..1759).
+
+    ENT computes SP = SP - (8 + signed_immediate). For lo nibble:
+    result = (sp_lo - (8 + imm_lo)) mod 16. sp_lo from ALU_LO,
+    imm_lo from FETCH_LO. Gate=OP_ENT, threshold=85.
+    """
+    write_scale = 2.0 / S
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for sp_lo in range(16):
+        for imm_lo in range(16):
+            effective_b = (8 + imm_lo) % 16
+            result = (sp_lo - effective_b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_ent_lo_sp{sp_lo}_imm{imm_lo}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{sp_lo}", 1.0),
+                    (f"FETCH_LO+{imm_lo}", 20.0),
+                ),
+                threshold=85.0,
+                gate="OP_ENT",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_ENT",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_ENT",
+                },
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT borrow detection (220 units, offsets 1760..1979).
+
+    Borrow when sp_lo < (8 + imm_lo) mod 16, or when (8 + imm_lo) >= 16
+    (carry out of byte 0 into byte 1). The condition is asymmetric
+    because the +8 constant offset can itself produce a byte-1 carry.
+    """
+    carry_scale = 2.0 / (S * 5.0)
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for sp_lo in range(16):
+        for imm_lo in range(16):
+            full_sum = 8 + imm_lo
+            if not (sp_lo < (full_sum % 16) or full_sum >= 16):
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_ent_borrow_sp{sp_lo}_imm{imm_lo}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{sp_lo}", 1.0),
+                    (f"FETCH_LO+{imm_lo}", 20.0),
+                ),
+                threshold=85.0,
+                gate="OP_ENT",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_ENT",
+                dominates_at={"CARRY+0": "MARK_AX and OP_ENT"},
+            ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
