@@ -580,6 +580,68 @@ def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+# Opcodes that don't need ALU operand gather; the ALU clear units fire
+# at MARK_AX positions when ANY of these opcodes is active so residual
+# ALU_LO/HI values do not contaminate Layer 10 bitwise / MUL units.
+# Mirrors the inline ``non_alu_opcodes`` list inside
+# :func:`vm_step._set_layer9_alu`.
+_L9_NON_ALU_OPCODES: tuple[str, ...] = (
+    "OP_IMM",
+    "OP_NOP",
+    "OP_JMP",
+    "OP_JSR",
+    "OP_EXIT",
+    "OP_BZ",
+    "OP_BNZ",
+    "OP_ENT",
+    "OP_ADJ",
+    "OP_LEV",
+    "OP_PSH",
+    "OP_LI",
+    "OP_LC",
+    "OP_SI",
+    "OP_SC",
+)
+
+
+def _layer9_alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
+    """ALU LO/HI clear at non-ALU opcodes (32 units).
+
+    Pair of identical 16-unit bands writing ``-10.0 / S`` to
+    ``ALU_LO+k`` and ``ALU_HI+k`` respectively. Both bands fire when
+    ``MARK_AX`` and any non-ALU opcode is active (threshold 1.5,
+    constant gate at ``gate_bias=1.0``). The residual ALU_* values from
+    earlier layers would otherwise leak into Layer 10's bitwise / MUL
+    units at non-ALU positions; the clear band cancels them.
+    """
+
+    rules: list[FFNRule] = []
+
+    # ALU_LO clear: 16 units.
+    for k in range(16):
+        conditions = [("MARK_AX", 1.0)]
+        conditions.extend((dim, 1.0) for dim in _L9_NON_ALU_OPCODES)
+        rules.append(FFNRule.constant_write(
+            name=f"l9_alu_lo_clear_{k}",
+            conditions=tuple(conditions),
+            threshold=1.5,
+            writes=((f"ALU_LO+{k}", -10.0 / S),),
+        ))
+
+    # ALU_HI clear: 16 units.
+    for k in range(16):
+        conditions = [("MARK_AX", 1.0)]
+        conditions.extend((dim, 1.0) for dim in _L9_NON_ALU_OPCODES)
+        rules.append(FFNRule.constant_write(
+            name=f"l9_alu_hi_clear_{k}",
+            conditions=tuple(conditions),
+            threshold=1.5,
+            writes=((f"ALU_HI+{k}", -10.0 / S),),
+        ))
+
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 

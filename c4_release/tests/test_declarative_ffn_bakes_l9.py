@@ -228,6 +228,18 @@ def test_layer9_sub_borrow_out_rules_match_legacy():
     _compare_symbolic_to_lowered(rules)
 
 
+def test_layer9_alu_clear_rules_match_legacy():
+    """``_layer9_alu_clear_rules`` lowers byte-identically at unit 3344 (32 units)."""
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
+        _layer9_alu_clear_rules,
+    )
+
+    rules = _layer9_alu_clear_rules(100.0)
+    assert len(rules) == 32
+    _assert_unit_range_matches_legacy(rules, start_unit=3344, n_units=32)
+    _compare_symbolic_to_lowered(rules)
+
+
 def test_layer9_lea_adj_ent_fetch_gates_use_one_hot_scale():
     ffn = _StubFFN()
     _set_layer9_alu(ffn, 100.0, _SetDim)
