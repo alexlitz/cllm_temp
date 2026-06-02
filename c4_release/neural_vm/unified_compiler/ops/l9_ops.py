@@ -219,6 +219,48 @@ def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEA hi-nibble cross-product (512 units).
+
+    Mirrors the second loop in :func:`vm_step._set_layer9_alu` -- amplified
+    ``MARK_AX`` AND with operand ``ALU_HI[a]`` and the FETCH-side
+    ``FETCH_HI[b]`` immediate. Carry discrimination via ``CARRY[0]`` at the
+    ``S * 8.0`` strength to maintain selectivity against the
+    ``S * 40``-scale main score. The seven non-AX marker dims are repelled
+    at ``-S * 1000`` so PC/SP/BP/STACK0/MEM/SE/byte rows never fire even
+    when LEA's FETCH gate is high. Gated by ``OP_LEA``; writes
+    ``OUTPUT_HI_THIS_STEP+result``.
+    """
+
+    rules: list[FFNRule] = []
+    for carry_in in (0, 1):
+        for a in range(16):
+            for b in range(16):
+                result = (a + b + carry_in) % 16
+                conditions: list[tuple[str, float]] = [("MARK_AX", 20.0)]
+                conditions.extend(
+                    (dim, -1000.0) for dim in _L9_NON_AX_BLOCKERS
+                )
+                conditions.append((f"ALU_HI+{a}", 1.0))
+                conditions.append((f"FETCH_HI+{b}", 20.0))
+                if carry_in == 0:
+                    conditions.append(("CARRY+0", -8.0))
+                    threshold = 40.5
+                else:
+                    conditions.append(("CARRY+0", 8.0))
+                    threshold = 48.5
+                rules.append(FFNRule.gated_write(
+                    name=f"l9_lea_hi_c{carry_in}_a{a}_b{b}",
+                    conditions=tuple(conditions),
+                    threshold=threshold,
+                    gate="OP_LEA",
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
+                ))
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 

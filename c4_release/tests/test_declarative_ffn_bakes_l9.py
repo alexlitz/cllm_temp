@@ -136,6 +136,18 @@ def test_layer9_add_hi_nibble_matches_legacy():
     _compare_symbolic_to_lowered(rules)
 
 
+def test_layer9_lea_hi_nibble_matches_legacy():
+    """``_layer9_lea_hi_nibble_rules`` lowers byte-identically at unit 512."""
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
+        _layer9_lea_hi_nibble_rules,
+    )
+
+    rules = _layer9_lea_hi_nibble_rules(100.0)
+    assert len(rules) == 512
+    _assert_unit_range_matches_legacy(rules, start_unit=512, n_units=512)
+    _compare_symbolic_to_lowered(rules)
+
+
 def test_layer9_lea_adj_ent_fetch_gates_use_one_hot_scale():
     ffn = _StubFFN()
     _set_layer9_alu(ffn, 100.0, _SetDim)
