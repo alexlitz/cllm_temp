@@ -8,7 +8,7 @@ from ..primitives import Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L16 FFN unit layout (pinned offsets) ===========================
+# === L16 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
 #
 # The ``layer16_lev_routing`` op currently owns the entire L16 FFN. Its
 # bake calls ``lower_layer16_lev_routing_ir(..., start_unit=0)``, which
@@ -20,19 +20,17 @@ from .shared import _as_setdim_proxy
 # at ``i``-th rule, so the only externally-visible offset is
 # ``start_unit=0`` for a 792-unit span.
 #
-# Migration to :class:`FFNUnitAllocator` keeps that span byte-identical
-# -- we declare the single pinned range and assert at bake-time that
-# the lowering helper actually wrote exactly that many units. Adding a
-# new L16 op family later will go through ``allocator.alloc(name, n)``
-# without a pin, and the allocator will pick the first free gap past
-# 792 (or above). Splitting the monolithic range into per-sub-stage
-# pins is a possible follow-up once the sub-stage offsets are stable.
+# Phase 7.B.6: the single layout entry is auto-placed by
+# :class:`FFNUnitAllocator` first-fit. With an empty L16 FFN pool the
+# first-fit lands the 792-unit range at start=0, matching the legacy
+# ``start_unit=0`` cursor bit-for-bit. The ``legacy_start`` column is
+# kept purely as documentation.
 #
 # The total here mirrors ``ffn_units_used=792`` on the op. Changing
 # the rule-list length in ``_layer16_lev_routing_rules`` requires
 # updating this table in lock-step.
 _L16_FFN_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     ("layer16_lev_routing", 0, 792),  # full LEV routing rule bank
 )
 
@@ -40,22 +38,19 @@ _L16_FFN_UNIT_LAYOUT = (
 def _allocate_layer16_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L16 sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the underlying
-    ``lower_layer16_lev_routing_ir`` call -- which writes via its own
-    monotonic ``start_unit=0`` cursor through
-    :func:`Primitives.lower_ffn_rules` -- lands on exactly the same
-    hidden-unit indices it always has. This call is byte-identical
-    bookkeeping: the allocator declares ranges by name, the helper
-    writes the weights. A future refactor can split the monolithic
-    routing range into per-family bake calls that consume
-    ``allocator.alloc(...)`` directly.
+    Phase 7.B.6: ``pin=`` is dropped. The allocator's default first-fit
+    lands the layout's single 792-unit range at start=0 (the lowest
+    free gap in an empty pool), which matches
+    ``lower_layer16_lev_routing_ir``'s ``start_unit=0`` cursor
+    bit-for-bit. Byte-identity with the legacy bake is therefore
+    preserved without the author having to spell out the offset.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L16 op claims a free range past unit 792).
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L16_FFN_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L16_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
