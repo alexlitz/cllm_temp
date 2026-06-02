@@ -2119,10 +2119,9 @@ def make_layer6_routing_ffn_ir(S: float = 100.0) -> CompilerIR:
 
     The rule families included (in source order) cover every unit band
     listed in :data:`_L6_FFN_BAND_LAYOUT` that has an authored ``_layer6_*_rules``
-    helper -- i.e. every band except those whose writes are still produced
-    inside the legacy ``_set_layer6_routing_ffn`` wrapper (such as the
-    convo-IO state machine band and the late ``opcode_relay_head`` extension
-    band, which are owned by separate ops with their own ``compiler_ir``).
+    helper. Since Phase 7.C.1 the bake is fully IR-driven; the convo-IO state
+    machine band and the late ``opcode_relay_head`` extension band remain
+    owned by separate ops with their own ``compiler_ir``.
 
     See ``compare_symbolic_to_lowered_ffn`` aggregate test below for the
     structural (declaration / lowering-contract) guarantee.
@@ -2167,23 +2166,20 @@ def make_layer6_routing_ffn_ir(S: float = 100.0) -> CompilerIR:
 
 
 def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
-    """Bake L6 routing FFN via the smoke-stable legacy wrapper.
+    """Bake L6 routing FFN entirely from authored CompilerIR rules.
 
-    The CompilerIR lowerers below have parity coverage for individual unit
-    bands, but strict neural smoke still depends on the full legacy L6 bake
-    until the generated specs preserve PSH/ADD autoregressive step structure.
+    Every L6 routing-FFN band -- per-opcode AX/FETCH -> OUTPUT relays,
+    branch/JSR/JMP PC overrides, halt detect, stack arithmetic,
+    PSH STACK0 marker rewrite, tail cleanup -- is now lowered from the
+    ``_layer6_<band>_rules`` helpers via the matching ``_lower_layer6_*_ir``
+    functions. The legacy ``vm_step._set_layer6_routing_ffn`` driver was cut
+    once every band reached byte-identical IR coverage (Phase 7.C.1).
     """
 
-    from ...vm_step import _set_layer6_routing_ffn
-
-    _set_layer6_routing_ffn(ffn, S, BD)
-
-    # Strict neural PSH needs STACK0 byte 0 to be exactly AX. The legacy
-    # writeback cancels EMBED and adds ALU, but a tiny residual OUTPUT_HI[1]
-    # can beat OUTPUT_HI[0] at the STACK0 marker and emit 0x1a instead of
-    # 0x0a. The marker-only OUTPUT rewrite from the relayed ALU value is now
-    # declared by ``_layer6_psh_stack0_marker_override_rules`` and lowered
-    # byte-identically via ``_lower_layer6_psh_stack0_marker_override_ir``.
+    # Strict neural PSH needs STACK0 byte 0 to be exactly AX. The marker-only
+    # OUTPUT rewrite from the relayed ALU value is declared by
+    # ``_layer6_psh_stack0_marker_override_rules`` and lowered byte-identically
+    # via ``_lower_layer6_psh_stack0_marker_override_ir``.
     psh_marker_end = _lower_layer6_psh_stack0_marker_override_ir(ffn, S, BD)
     if psh_marker_end != L6_PSH_STACK0_MARKER_OVERRIDE_END_UNIT:
         raise AssertionError(
@@ -2277,7 +2273,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 BZ/BNZ PC override IR lowered to unexpected units "
             f"{branch_pc_ends}; expected {expected_branch_pc_ends}"
         )
-    return
     _clear_ffn_unit_band(
         ffn,
         L6_IMM_FETCH_ROUTE_START_UNIT,
@@ -2318,41 +2313,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
         raise AssertionError(
             "L6 AX-output route IR lowered to unexpected units "
             f"{route_ends}; expected {expected_ends}"
-        )
-    for start, end in (
-        (
-            L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
-            L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT,
-        ),
-        (
-            L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT,
-            L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT,
-        ),
-    ):
-        _clear_ffn_unit_band(ffn, start, end)
-    delayed_end = _lower_layer6_delayed_jmp_pc_override_ir(ffn, S, BD)
-    if delayed_end != L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT:
-        raise AssertionError(
-            "L6 delayed JMP PC override IR lowered to unexpected unit "
-            f"{delayed_end}; expected {L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT}"
-        )
-    first_step_end = _lower_layer6_first_step_jmp_pc_override_ir(ffn, S, BD)
-    if first_step_end != L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT:
-        raise AssertionError(
-            "L6 first-step JMP PC override IR lowered to unexpected unit "
-            f"{first_step_end}; expected "
-            f"{L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT}"
-        )
-    _clear_ffn_unit_band(
-        ffn,
-        L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
-        L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT,
-    )
-    end = _lower_layer6_all_step_jmp_pc_override_ir(ffn, S, BD)
-    if end != L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT:
-        raise AssertionError(
-            "L6 all-step JMP PC override IR lowered to unexpected unit "
-            f"{end}; expected {L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT}"
         )
     for start, end in (
         (L6_HALT_DETECT_START_UNIT, L6_HALT_DETECT_END_UNIT),
@@ -2467,21 +2427,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 ENT first-step IR lowered to unexpected units "
             f"{ent_first_step_ends}; expected {expected_ent_first_step_ends}"
         )
-    for start, end in (
-        (L6_BZ_PC_OVERRIDE_START_UNIT, L6_BZ_PC_OVERRIDE_END_UNIT),
-        (L6_BNZ_PC_OVERRIDE_START_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT),
-    ):
-        _clear_ffn_unit_band(ffn, start, end)
-    branch_ends = _lower_layer6_branch_pc_override_ir(ffn, S, BD)
-    expected_branch_ends = (
-        L6_BZ_PC_OVERRIDE_END_UNIT,
-        L6_BNZ_PC_OVERRIDE_END_UNIT,
-    )
-    if branch_ends != expected_branch_ends:
-        raise AssertionError(
-            "L6 branch override IR lowered to unexpected units "
-            f"{branch_ends}; expected {expected_branch_ends}"
-        )
     _clear_ffn_unit_band(
         ffn,
         L6_OPCODE_CONTAMINATION_CLEANUP_START_UNIT,
@@ -2492,18 +2437,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
         raise AssertionError(
             "L6 tail cleanup IR lowered to unexpected unit "
             f"{tail_cleanup_end}; expected {L6_ALU_CLEAR_END_UNIT}"
-        )
-    _clear_ffn_unit_band(
-        ffn,
-        L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
-        L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT,
-    )
-    branch_byte1_end = _lower_layer6_branch_pc_byte1_override_ir(ffn, S, BD)
-    if branch_byte1_end != L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT:
-        raise AssertionError(
-            "L6 branch PC-byte1 override IR lowered to unexpected unit "
-            f"{branch_byte1_end}; expected "
-            f"{L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT}"
         )
 
 
@@ -2554,27 +2487,27 @@ def make_layer6_routing_ffn_op() -> Operation:
     Phase 6.5: runs AFTER the L6 attention ops (phases 6.0-6.2) and before
     other L6 FFN extension ops migrated to model-level phase=998.
 
-    Claim-coverage note: ``claims`` is intentionally left empty. This op
-    delegates almost the entirety of L6 routing to ``_set_layer6_routing_ffn``
-    in ``vm_step.py``, plus a chain of IR lowerers that program
-    ~1486 FFN hidden units (every opcode's AX_CARRY/FETCH -> OUTPUT relay,
-    PSH stack writeback, every branch's PC byte0/byte1 override band, the
-    full delayed/first-step/all-step JMP/JSR PC override families, BZ/BNZ
-    overrides, JSR SP decrement, and a strict-neural PSH STACK0 rewrite
-    block). The static verifier observes ~13.6k weight cells written by a
-    single dispatch -- enumerating them at the (unit, column) grain would
-    duplicate every line in ``_set_layer6_routing_ffn`` plus the rule
-    bodies in ``_layer6_*_rules`` helpers, with no semantic gain over the
-    code those helpers are. Until the underlying spec is decomposed into
-    smaller per-band ops (which would be claimed individually), declaring
-    claims here would be a maintenance-cost pure-noise duplicate; skip with
-    the same precedent as model_ops' ``head_bake`` and ``opcode_relay_head``.
+    Claim-coverage note: ``claims`` is intentionally left empty. Since
+    Phase 7.C.1 the op drives every L6 routing FFN band from authored
+    ``_layer6_*_rules`` helpers via ``_lower_layer6_*_ir`` lowerers
+    (~1486 FFN hidden units total: every opcode's AX_CARRY/FETCH -> OUTPUT
+    relay, PSH stack writeback, every branch's PC byte0/byte1 override band,
+    the full delayed/first-step/all-step JMP/JSR PC override families,
+    BZ/BNZ overrides, JSR SP decrement, and a strict-neural PSH STACK0
+    rewrite block). The static verifier observes ~13.6k weight cells written
+    by a single dispatch -- enumerating them at the (unit, column) grain
+    would duplicate the rule bodies in ``_layer6_*_rules`` helpers, with no
+    semantic gain over the code those helpers are. Until the underlying spec
+    is decomposed into smaller per-band ops (which would be claimed
+    individually), declaring claims here would be a maintenance-cost
+    pure-noise duplicate; skip with the same precedent as model_ops'
+    ``head_bake`` and ``opcode_relay_head``.
     """
     def bake(block, dim_positions, S):
         # Per-bake FFN-unit allocator. Every L6 FFN band is pinned to its
-        # historical offset so ``_bake_layer6_routing_ffn`` -- which still
-        # drives writes via the ``L6_*_START_UNIT`` constants and the
-        # inline PSH STACK0 marker cursor -- lands byte-identically. The
+        # historical offset so ``_bake_layer6_routing_ffn`` -- which drives
+        # writes via the ``L6_*_START_UNIT`` constants through authored
+        # ``_lower_layer6_*_ir`` lowerers -- lands byte-identically. The
         # allocator is byte-identical bookkeeping (no writes go through
         # it yet); stashing it on ``block.ffn`` exposes the L6 layout to
         # follow-up ops and tooling. Sibling L6 bakes
