@@ -368,7 +368,10 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=10.85,
-        layer_idx=10,
+        # Phase 8.G.6: drop ``layer_idx=10`` literal; bind to the L10
+        # attn anchor ``layer10_carry_relay`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_carry_relay",
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
@@ -418,7 +421,10 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=11.05,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#binary-ALU",
@@ -484,7 +490,10 @@ def make_l11_alu_mul_bdtoge_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=11.0,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -513,7 +522,10 @@ def make_l11_alu_mul_schoolbook_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=11.1,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -542,7 +554,10 @@ def make_l11_alu_mul_carrypass1_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=11.2,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -572,7 +587,10 @@ def make_l11_alu_mul_carrypass2_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=11.3,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -603,7 +621,10 @@ def make_l11_alu_mul_carrypass3_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=11.4,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -633,7 +654,10 @@ def make_l12_alu_mul_genprop_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=12.0,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -663,7 +687,10 @@ def make_l12_alu_mul_binarylookahead_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=12.1,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -692,7 +719,10 @@ def make_l12_alu_mul_finalcorrection_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=12.2,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -723,7 +753,10 @@ def make_l12_alu_mul_getobd_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         phase=12.3,
-        layer_idx=11,
+        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         # Phase 7.A.5 default-flip: this MUL ALU stage runs after the
         # ``l12_alu_mul_finalcorrection`` stage (phase=12.2) on the same
@@ -816,7 +849,10 @@ def make_alu_divmod_composite_ops():
             writes=set(),
             kind="block",
             declarative_bake_fn=bake,
-            layer_idx=10,
+            # Phase 8.G.6: drop ``layer_idx=10`` literal; bind to the L10
+            # attn anchor ``layer10_carry_relay`` so the block op resolves
+            # to whichever layer the compiler places the anchor at.
+            target_op_name="layer10_carry_relay",
             migrated=True,
             declarative_authority="structural_model",
         smoke_tests={
@@ -839,7 +875,10 @@ def make_alu_divmod_composite_ops():
             writes=set(),
             kind="block",
             declarative_bake_fn=bake,
-            layer_idx=10,
+            # Phase 8.G.6: drop ``layer_idx=10`` literal; bind to the L10
+            # attn anchor ``layer10_carry_relay`` so the block op resolves
+            # to whichever layer the compiler places the anchor at.
+            target_op_name="layer10_carry_relay",
             migrated=True,
             declarative_authority="structural_model",
         smoke_tests={
@@ -862,7 +901,10 @@ def make_alu_divmod_composite_ops():
             writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
             kind="block",
             declarative_bake_fn=bake,
-            layer_idx=10,
+            # Phase 8.G.6: drop ``layer_idx=10`` literal; bind to the L10
+            # attn anchor ``layer10_carry_relay`` so the block op resolves
+            # to whichever layer the compiler places the anchor at.
+            target_op_name="layer10_carry_relay",
             migrated=True,
             declarative_authority="structural_model",
         smoke_tests={
@@ -886,7 +928,10 @@ def make_alu_divmod_composite_ops():
             writes=set(),
             kind="block",
             declarative_bake_fn=bake,
-            layer_idx=10,
+            # Phase 8.G.6: drop ``layer_idx=10`` literal; bind to the L10
+            # attn anchor ``layer10_carry_relay`` so the block op resolves
+            # to whichever layer the compiler places the anchor at.
+            target_op_name="layer10_carry_relay",
             migrated=True,
             declarative_authority="structural_model",
         smoke_tests={
