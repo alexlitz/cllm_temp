@@ -719,6 +719,16 @@ def make_l12_alu_mul_getobd_op() -> Operation:
         phase=12.3,
         layer_idx=11,
         migrated=True,
+        # Phase 7.A.5 default-flip: this MUL ALU stage runs after the
+        # ``l12_alu_mul_finalcorrection`` stage (phase=12.2) on the same
+        # ``_ensure_l11_mul_module`` builder. Without an explicit
+        # ``requires["after"]`` the strict admission gate flags this op
+        # as ``phase_required_but_undeclared`` because ``reads=set()``
+        # leaves no in-edges. Anchoring it to its immediate phase
+        # predecessor makes the chain dep-derived.
+        requires={"after": [
+            "l12_alu_mul_finalcorrection",
+        ]},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",

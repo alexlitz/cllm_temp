@@ -796,7 +796,7 @@ def compile_full_vm_dynamic(
     rms_norm_eps: Optional[float] = None,
     require_declarative_bake: Optional[bool] = None,
     declarations_only: bool = False,
-    strict: bool = False,
+    strict: bool = True,
     allow_sealed_cycles: bool = True,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
@@ -831,13 +831,14 @@ def compile_full_vm_dynamic(
     ``"__dynamic"`` to the kwargs snapshot so dynamic and static
     compiles cannot trample each other's cache entries.
 
-    Strict mode (B14 prep, OFF by default)
-    --------------------------------------
-    When ``strict=True``, the dynamic compile refuses to fall back to
-    ``phase`` for any ordering decision. Before compiling, every op is
-    categorised against the unpruned declared-dep graph (mirroring
-    ``tools/analyze_scheduler.py``); if any op falls into
-    ``dep_graph_cycle_member``, ``phase_required_but_undeclared``, or
+    Strict mode (B14, ON by default as of Phase 7.A.5 default-flip)
+    ----------------------------------------------------------------
+    When ``strict=True`` (the default since Phase 7.A.5), the dynamic
+    compile refuses to fall back to ``phase`` for any ordering decision.
+    Before compiling, every op is categorised against the unpruned
+    declared-dep graph (mirroring ``tools/analyze_scheduler.py``); if any
+    op falls into ``dep_graph_cycle_member`` (and ``allow_sealed_cycles``
+    is False), ``phase_required_but_undeclared``, or
     ``phase_inconsistent_with_deps``, the call raises
     ``StrictModeUnschedulableError`` with the offending op names.
 
@@ -846,13 +847,20 @@ def compile_full_vm_dynamic(
     dep-derived order and the phase-derived order agree (Phase A
     finding, see ``DYNAMIC_SCHEDULER_MIGRATION_PLAN.md``).
 
-    Today (2026-06-01) strict mode is expected to FAIL on the production
-    op set: ~70 ops are cycle members of the OUTPUT_HI SCC, ~23 ops are
-    ``phase_required_but_undeclared``, and ~3 are
-    ``phase_inconsistent_with_deps``. ``strict=False`` (the default)
-    preserves the B11/B12 hybrid behaviour. Flipping the default to
-    ``True`` is the B14 unit; it depends on B9 (dim decomposition) and
-    B12 (declaration backfill) fully landing first.
+    Cycle-aware admission (``allow_sealed_cycles=True``, also the
+    default) accepts the OUTPUT_HI / IF_VAR SCC as a sealed group: the
+    hybrid scheduler still falls back to phase ordering INSIDE the SCC,
+    but every op OUTSIDE the SCC must be cleanly placeable from declared
+    deps alone. Today's production op set has ~92 cycle members and 0
+    non-cycle ``phase_required_but_undeclared`` /
+    ``phase_inconsistent_with_deps`` ops, so the default
+    ``strict=True, allow_sealed_cycles=True`` admits the compile and
+    produces a byte-identical layout to the prior strict-off path.
+
+    Passing ``strict=False`` restores the pre-Phase-7.A.5 behaviour
+    (no admission gate). Passing ``allow_sealed_cycles=False`` restores
+    the legacy "any cycle is a failure" behaviour, which today fails on
+    the production op set until B9 (dim decomposition) completes.
     """
     # Mirror static-path env-flag handling to keep the API truly identical.
     if not declarations_only:

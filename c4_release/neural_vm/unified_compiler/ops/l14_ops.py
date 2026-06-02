@@ -2156,6 +2156,20 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
+        # Phase 7.A.5 default-flip: declare the chain predecessor as an
+        # explicit ``requires["after"]`` so cycle-aware strict mode can
+        # place this op via the dep DAG instead of the static ``phase``
+        # pin. ``layer14_alu_nocarry_ax_bytes_zero`` is the immediate
+        # prior entry in ``_L14_CLEANUP_CHAIN_LAYOUT`` (line 97). Without
+        # this declaration the demo op has no in-edges in the strict dep
+        # graph, so its dep-depth is 0 while its ``phase=14.95`` places
+        # it at L14 -- the analyzer flags this gap as
+        # ``phase_required_but_undeclared``, breaking the
+        # ``test_strict_mode_categoriser_is_clean_outside_the_scc``
+        # invariant and the strict-default admission gate.
+        requires={"after": [
+            "layer14_alu_nocarry_ax_bytes_zero",
+        ]},
         # New chain tail: prior ops fill [0, 1874), the demo's auto-fit
         # picks unit 1874 (single-unit rule), so the cumulative max is 1875.
         # This replaces the legacy ``ffn_units_used=1874`` annotation

@@ -44,7 +44,7 @@ After Phase 7:
 
 **7.A.4** — Re-run `analyze_scheduler.py` to verify SCC shrinks. 1 agent, ~10 min.
 
-**7.A.5** — B14 strict-flip: set `compile_full_vm(strict=True)` as default, run corpus. 1 agent, ~30 min.
+**7.A.5** — B14 strict-flip: set `compile_full_vm(strict=True)` as default, run corpus. 1 agent, ~30 min. **COMPLETE** (Phase 7.A.5 default-flip): `compile_full_vm_dynamic` now defaults to `strict=True, allow_sealed_cycles=True`; backfilled `requires["after"]` declarations on `layer14_demo_phase6_wave7` and `l12_alu_mul_getobd` so the strict admission gate has no non-cycle `phase_required_but_undeclared` ops on the lookup or efficient op sets. Byte-identity preserved across both ALU modes.
 
 **Wave 7.A blocked on**: nothing (can start immediately).
 
