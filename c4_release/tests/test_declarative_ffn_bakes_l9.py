@@ -184,6 +184,24 @@ def test_layer9_ent_hi_nibble_matches_legacy():
     _compare_symbolic_to_lowered(rules)
 
 
+def test_layer9_cmp_rules_match_legacy():
+    """``_layer9_cmp_rules`` lowers byte-identically at unit 2560 (272 units).
+
+    The CMP family covers four contiguous sub-bands inside
+    :func:`vm_step._set_layer9_alu` (hi_eq, lo_eq, hi_lt, lo_lt) emitted
+    in that order to match the imperative cursor walk.
+    """
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
+        _layer9_cmp_rules,
+    )
+
+    rules = _layer9_cmp_rules(100.0)
+    # 16 + 16 + 120 + 120 = 272.
+    assert len(rules) == 272
+    _assert_unit_range_matches_legacy(rules, start_unit=2560, n_units=272)
+    _compare_symbolic_to_lowered(rules)
+
+
 def test_layer9_lea_adj_ent_fetch_gates_use_one_hot_scale():
     ffn = _StubFFN()
     _set_layer9_alu(ffn, 100.0, _SetDim)

@@ -388,6 +388,99 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
+    """Comparison-flag cross-products (272 units total).
+
+    Mirrors the four CMP loops in :func:`vm_step._set_layer9_alu`:
+
+      * ``hi_eq`` -- 16 units writing ``CMP+1`` (high-nibble equality)
+      * ``lo_eq`` -- 16 units writing ``CMP+2`` (low-nibble equality)
+      * ``hi_lt`` -- 120 units writing ``CMP+0`` (high-nibble less-than)
+      * ``lo_lt`` -- 120 units writing ``CMP+3`` (low-nibble less-than)
+
+    Every CMP unit is a 3-way AND at the AX marker (``MARK_AX`` and
+    operand a/b dims, with ``MARK_PC`` repelled at ``-S * 2``) gated on
+    ``CMP_GROUP`` (the L8 comparison-opcode-group flag). Threshold 2.5
+    for the 3-way AND; writes ``2.0 / S`` to the matching CMP output
+    nibble. Equality uses ``a == k`` for both operand dims; less-than
+    uses ``a < b`` over the (a, b) pairs.
+    """
+
+    rules: list[FFNRule] = []
+
+    # hi_eq: 16 units -> CMP+1
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l9_cmp_hi_eq_{k}",
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("MARK_PC", -2.0),
+                (f"ALU_HI+{k}", 1.0),
+                (f"AX_CARRY_HI+{k}", 1.0),
+            ),
+            threshold=2.5,
+            gate="CMP_GROUP",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("CMP+1", 2.0 / S),),
+        ))
+
+    # lo_eq: 16 units -> CMP+2
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l9_cmp_lo_eq_{k}",
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("MARK_PC", -2.0),
+                (f"ALU_LO+{k}", 1.0),
+                (f"AX_CARRY_LO+{k}", 1.0),
+            ),
+            threshold=2.5,
+            gate="CMP_GROUP",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("CMP+2", 2.0 / S),),
+        ))
+
+    # hi_lt: 120 units -> CMP+0 (a < b for hi nibble)
+    for a in range(16):
+        for b in range(a + 1, 16):
+            rules.append(FFNRule.gated_write(
+                name=f"l9_cmp_hi_lt_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -2.0),
+                    (f"ALU_HI+{a}", 1.0),
+                    (f"AX_CARRY_HI+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="CMP_GROUP",
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=(("CMP+0", 2.0 / S),),
+            ))
+
+    # lo_lt: 120 units -> CMP+3 (a < b for lo nibble)
+    for a in range(16):
+        for b in range(a + 1, 16):
+            rules.append(FFNRule.gated_write(
+                name=f"l9_cmp_lo_lt_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -2.0),
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"AX_CARRY_LO+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="CMP_GROUP",
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=(("CMP+3", 2.0 / S),),
+            ))
+
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 
