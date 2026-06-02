@@ -610,18 +610,14 @@ def compile_full_vm(
     declarations_only: bool = False,
     kv_eviction_policy: KVEvictionPolicy = KVEvictionPolicy.OFF,
     kv_eviction_n_steps: int = 64,
-    use_static_path: bool = False,
 ):
     """Compile and bake a full Neural VM model via the compiler.
 
-    Phase 7 closing audit priority 5: ``compile_full_vm`` now routes through
-    :func:`compile_full_vm_dynamic` by default. The hybrid dynamic-layer
-    scheduler is byte-identical to the static phase-pruning path on today's
-    op set (see
-    :func:`neural_vm.unified_compiler.full_vm_compiler_dynamic.compare_compile_paths`
-    and ``tests/test_compile_dynamic_byte_identical.py``). Pass
-    ``use_static_path=True`` to force the legacy phase-pruning implementation
-    while the migration completes.
+    Phase 8.G.3: ``compile_full_vm`` is now a thin redirect to
+    :func:`compile_full_vm_dynamic`. The legacy static phase-pruning body
+    was deleted once one release passed without any production callsite
+    flipping the (now-removed) ``use_static_path=True`` kwarg. The hybrid
+    dynamic-layer scheduler is the single bake entry point.
 
     The compiler is the single bake authority. Internally, the legacy
     `set_vm_weights` pipeline is wrapped as one model-level Operation
@@ -722,365 +718,33 @@ def compile_full_vm(
         - model is an AutoregressiveVM with all weights baked
         - layout is the ModelLayout (d_model, n_layers, dim_positions)
     """
-    if not use_static_path:
-        # Phase 7 closing audit priority 5: route to the hybrid dynamic-layer
-        # scheduler. Byte-identical to the static path on today's op set; the
-        # legacy phase-pruning implementation lives behind ``use_static_path``
-        # as a fallback while the migration completes (deletion candidate
-        # once one release passes without static-path fallbacks in production
-        # callsites). Lazy-imported to avoid a circular import — the dynamic
-        # module imports this one as ``_static`` to share helpers.
-        from .full_vm_compiler_dynamic import compile_full_vm_dynamic
-        return compile_full_vm_dynamic(
-            S=S,
-            enable_conversational_io=enable_conversational_io,
-            enable_tool_calling=enable_tool_calling,
-            enable_neural_io_think_protocol=enable_neural_io_think_protocol,
-            alu_mode=alu_mode,
-            n_heads=n_heads,
-            ffn_hidden=ffn_hidden,
-            max_seq_len=max_seq_len,
-            pin_io_only=pin_io_only,
-            disk_cache=disk_cache,
-            use_dynamic_ffn=use_dynamic_ffn,
-            enable_moe_routing=enable_moe_routing,
-            positional_encoding=positional_encoding,
-            attention_normalization=attention_normalization,
-            rope_base=rope_base,
-            use_rms_norm=use_rms_norm,
-            rms_norm_eps=rms_norm_eps,
-            require_declarative_bake=require_declarative_bake,
-            declarations_only=declarations_only,
-            kv_eviction_policy=kv_eviction_policy,
-            kv_eviction_n_steps=kv_eviction_n_steps,
-        )
-
-    # ------------------------------------------------------------------
-    # TODO(phase-7-audit-priority-5): the static phase-pruning path below
-    # is preserved as a fallback under ``use_static_path=True`` while the
-    # migration completes. Deletion candidate once one release passes
-    # without production callsites flipping the flag. ``compare_compile_paths``
-    # and ``tests/test_compile_dynamic_byte_identical.py`` still exercise
-    # this code path so the byte-identity gate keeps signal until then.
-    # ------------------------------------------------------------------
-    if not declarations_only:
-        declarations_only = _env_flag_enabled(_DECLARATIONS_ONLY_BAKE_ENV)
-    if enable_moe_routing is None:
-        enable_moe_routing = _env_flag_enabled(_ENABLE_MOE_ROUTING_ENV)
-    if require_declarative_bake is None:
-        require_declarative_bake = _env_flag_enabled(_REQUIRE_DECLARATIVE_BAKE_ENV)
-    if declarations_only:
-        require_declarative_bake = True
-
-    from ..config import get_config
-    vm_config = get_config()
-    if positional_encoding is None:
-        positional_encoding = vm_config.positional_encoding
-    if attention_normalization is None:
-        attention_normalization = vm_config.attention_normalization
-    if rope_base is None:
-        rope_base = vm_config.rope_base
-    if use_rms_norm is None:
-        use_rms_norm = vm_config.use_rms_norm
-    if rms_norm_eps is None:
-        rms_norm_eps = vm_config.rms_norm_eps
-
-    kwargs_snapshot = {
-        "S": S,
-        "enable_conversational_io": enable_conversational_io,
-        "enable_tool_calling": enable_tool_calling,
-        "enable_neural_io_think_protocol": enable_neural_io_think_protocol,
-        "alu_mode": alu_mode,
-        "n_heads": n_heads,
-        "ffn_hidden": ffn_hidden,
-        "max_seq_len": max_seq_len,
-        "pin_io_only": pin_io_only,
-        "enable_moe_routing": bool(enable_moe_routing),
-        "positional_encoding": positional_encoding,
-        "attention_normalization": attention_normalization,
-        "rope_base": float(rope_base),
-        "use_rms_norm": bool(use_rms_norm),
-        "rms_norm_eps": float(rms_norm_eps),
-        "require_declarative_bake": bool(require_declarative_bake),
-        "declarations_only": bool(declarations_only),
-        # Phase 7.F.2: include eviction policy in the cache key so OFF and
-        # STATIC_LIVENESS builds don't share a serialised model.
-        "kv_eviction_policy": KVEvictionPolicy(kv_eviction_policy).value,
-        "kv_eviction_n_steps": int(kv_eviction_n_steps),
-    }
-    cache_path = None
-    cache_key = _cache_key(kwargs_snapshot) if disk_cache else None
-    if disk_cache and not require_declarative_bake and not declarations_only:
-        cache_path = _cache_dir() / f"{cache_key}.pt"
-        cached = _try_load_cached(cache_path, kwargs_snapshot)
-        if cached is not None:
-            # Phase 7.F.2: re-attach KV eviction state on cache hit. The
-            # cache key includes the policy so cached models already match
-            # the requested policy; the re-attach is a defensive idempotent
-            # step that protects against stale caches built before the flag
-            # existed (analyzer + attach are cheap relative to a full bake).
-            cached_model, cached_layout = cached
-            _attach_kv_eviction_state(
-                cached_model,
-                cached_layout,
-                kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
-                n_steps=int(kv_eviction_n_steps),
-            )
-            return cached_model, cached_layout
-
-    compiler = LayerCompiler()
-    declare_setdim_compat_dims(compiler, pin_io_only=pin_io_only)
-
-    # Per-layer ops drive the layout (d_model, n_layers, dim_positions).
-    # Forward alu_mode so SHL/SHR (and any future alu_mode-aware migrated op)
-    # can branch between the legacy lookup-table bake and the efficient
-    # neural-ALU bake. Forward enable_conversational_io / enable_tool_calling
-    # to flag-gated ops (registered unconditionally to keep the dep graph
-    # stable) so they fire their bakes when the corresponding flag is on.
-    for op in all_core_ops(
-        alu_mode=alu_mode,
+    # Phase 8.G.3: redirect unconditionally to the hybrid dynamic-layer
+    # scheduler. The legacy static phase-pruning body lived here behind the
+    # ``use_static_path=True`` kwarg until 8.G.3 deleted it; the dynamic
+    # path is now the single bake entry point. Lazy-imported to avoid a
+    # circular import (the dynamic module imports this one as ``_static``
+    # to share helpers).
+    from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+    return compile_full_vm_dynamic(
+        S=S,
         enable_conversational_io=enable_conversational_io,
         enable_tool_calling=enable_tool_calling,
         enable_neural_io_think_protocol=enable_neural_io_think_protocol,
-    ):
-        compiler.add_op(op)
-
-    # L10 post_op attach: runs as a migrated block op (phase=10.7) before the
-    # legacy bake pipeline. Replaces the inline post_op appends previously
-    # done in set_vm_weights. alu_mode-dependent, so it lives outside
-    # all_core_ops().
-    compiler.add_op(make_l10_post_op_attach_op(alu_mode=alu_mode))
-
-    # L11/L12 MUL ALU flattening: 9 phase-ordered block ops at L11 install
-    # the FlattenedALUMul wrapper. Phases 11.0..12.3 split the previous
-    # monolithic `model.blocks[11].ffn = ALUMul(...)` assignment in
-    # set_vm_weights into discrete BD↔GE conversion + 7 sub-FFN MUL pipeline
-    # stages. All bind to layer_idx=11 (the runtime forward collapses them
-    # into one block call). Only registered in efficient mode — lookup mode
-    # keeps the `_set_layer11_mul_partial` / `_set_layer12_mul_combine`
-    # lookup tables; the L11 ALUMul module is attached to ``block.post_ops``
-    # by ``make_l11_alu_postop_attach_op`` and split out by
-    # ``_expand_wrapper_blocks``.
-    if alu_mode == "efficient":
-        compiler.add_op(make_l11_alu_mul_bdtoge_op())
-        compiler.add_op(make_l11_alu_mul_schoolbook_op())
-        compiler.add_op(make_l11_alu_mul_carrypass1_op())
-        compiler.add_op(make_l11_alu_mul_carrypass2_op())
-        compiler.add_op(make_l11_alu_mul_carrypass3_op())
-        compiler.add_op(make_l12_alu_mul_genprop_op())
-        compiler.add_op(make_l12_alu_mul_binarylookahead_op())
-        compiler.add_op(make_l12_alu_mul_finalcorrection_op())
-        compiler.add_op(make_l12_alu_mul_getobd_op())
-
-        # Efficient-mode ALU wrapper installs — replace the inline
-        # ``model.blocks[N].ffn = ...`` assignments previously in legacy_bake's
-        # efficient branch. See migrated_ops for ordering notes.
-        compiler.add_op(make_efficient_l8_addsub_wrap_op(alu_mode=alu_mode))
-        compiler.add_op(make_efficient_l10_andorxor_wrap_op(alu_mode=alu_mode))
-        compiler.add_op(make_efficient_l11_alumul_wrap_op(alu_mode=alu_mode))
-
-    # L10 DIV/MOD ALU flattening: 4 cooperating block ops install the
-    # FlattenedDivMod composite (BD→GE, long-division pipeline, GE→BD,
-    # plus an install op that appends to model.blocks[10].post_ops).
-    # Replaces the previous EfficientDivMod_Neural runtime instantiations
-    # (lookup-mode override at vm_step.py and efficient-mode append in
-    # make_l10_post_op_attach_op). All 4 ops share a builder so the install
-    # op (phase=10.8) gets the fully-assembled composite. Both alu_modes
-    # use the flattened composite — its forward is byte-identical to the
-    # previous EfficientDivMod_Neural.
-    for op in make_alu_divmod_composite_ops():
-        compiler.add_op(op)
-
-    # Residual ALiBi-slope bakes (previously inline in set_vm_weights):
-    #   phase=999 :  L6/L8/L14/L15 alibi_slopes (mode-agnostic)
-    #   phase=999.1: L10 alibi_slopes (mode-conditional: lookup vs efficient)
-    # phase=8.4 (block op): L8 head 4 OP_IMM relay (previously inline)
-    # phase=1199 (model op): contract validation diagnostic
-    # The alu_postop_attach_ops are added below in the lookup branch.
-    compiler.add_op(make_residual_alibi_slopes_op())
-    compiler.add_op(make_layer10_residual_alibi_slopes_op(alu_mode=alu_mode))
-    compiler.add_op(make_layer8_op_imm_relay_op())
-    compiler.add_op(make_contract_validation_op())
-
-    # ALU post-op attach ops (lookup mode only): attach a structural neural
-    # ALU to each L8-L13 block's ``post_ops`` so it runs on top of the baked
-    # lookup-table FFN. Must run AFTER the L8-L13 FFN bakes complete, which
-    # is naturally the case here because phase=L+0.5 sits AFTER the block-op
-    # phases (8.0-8.5, 9, 10.0-10.85, 11, 12, 13) and the phase-999
-    # residuals.
-    if alu_mode == 'lookup':
-        for op in all_alu_postop_attach_ops():
-            compiler.add_op(op)
-
-    layout = compiler.compile()
-    if layout.d_model % n_heads != 0:
-        pad = n_heads - (layout.d_model % n_heads)
-        compiler.declare_dim("_pad", pad)
-        layout = compiler.compile()
-
-    if require_declarative_bake:
-        enforce_declarative_bake_authority(layout)
-
-    # Run all model-level ops via the compiler dispatch. Per-layer ops are
-    # skipped (by default) because legacy_bake is present and owns them.
-    # Per-layer ops with migrated=True are dispatched before legacy_bake so
-    # their bakes run on the freshly-built model before set_vm_weights edits.
-    # Block ops with migrated=True are dispatched similarly.
-    import torch as _torch
-    per_layer_dispatch = [
-        (layer_idx, op)
-        for layer_idx, ops_at_layer in enumerate(layout.ops_per_layer)
-        for op in ops_at_layer
-        if op.migrated
-    ]
-    block_dispatch = [
-        op for op in sorted(
-            layout.block_ops,
-            key=lambda o: (layout.resolve_block_op_layer(o), o.phase or 0),
-        )
-        if op.migrated
-    ]
-    model_dispatch = sorted(layout.model_ops, key=lambda o: (o.phase or 0))
-    if declarations_only:
-        validate_declarations_only_ops(
-            [op for _, op in per_layer_dispatch]
-            + block_dispatch
-            + model_dispatch
-        )
-        if disk_cache:
-            # Declarations-only is the authoritative endpoint, but it must
-            # still validate ownership before a cache hit can bypass the bake.
-            # The layout compile + validation above is cheap; loading here
-            # keeps unsupported imperative ops visible while avoiding repeated
-            # 40s+ model bakes in smoke/1096 test runs.
-            cache_path = _cache_dir() / f"{cache_key}.pt"
-            cached = _try_load_cached(cache_path, kwargs_snapshot)
-            if cached is not None:
-                # Phase 7.F.2: same defensive re-attach as in the main cache
-                # hit path above.
-                cached_model, cached_layout = cached
-                _attach_kv_eviction_state(
-                    cached_model,
-                    cached_layout,
-                    kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
-                    n_steps=int(kv_eviction_n_steps),
-                )
-                return cached_model, cached_layout
-
-    # Build the model with d_model/n_layers from the compiler. We override
-    # the default size from build_model_from_layout to set ffn_hidden,
-    # n_heads, and max_seq_len that AutoregressiveVM expects.
-    from ..vm_step import AutoregressiveVM
-
-    # Per-block FFN hidden_dim from layout when use_dynamic_ffn is on.
-    # Blocks without an annotated op are absent from ``layout.ffn_widths``
-    # and fall back to ``ffn_hidden`` inside AutoregressiveVM.__init__'s
-    # dict-dispatch path; those still get trimmed by ``_right_size_ffns``
-    # post-bake. As ops accumulate ``ffn_units_used`` annotations, more
-    # blocks land in the dict and skip the allocate-then-trim overhead.
-    if use_dynamic_ffn and layout.ffn_widths:
-        ffn_hidden_arg = layout.ffn_widths
-    else:
-        ffn_hidden_arg = ffn_hidden
-
-    model = AutoregressiveVM(
-        d_model=layout.d_model,
-        n_layers=layout.n_layers,
+        alu_mode=alu_mode,
         n_heads=n_heads,
-        ffn_hidden=ffn_hidden_arg,
+        ffn_hidden=ffn_hidden,
         max_seq_len=max_seq_len,
-        dim_positions=layout.dim_positions,
+        pin_io_only=pin_io_only,
+        disk_cache=disk_cache,
+        use_dynamic_ffn=use_dynamic_ffn,
+        enable_moe_routing=enable_moe_routing,
         positional_encoding=positional_encoding,
         attention_normalization=attention_normalization,
         rope_base=rope_base,
         use_rms_norm=use_rms_norm,
         rms_norm_eps=rms_norm_eps,
+        require_declarative_bake=require_declarative_bake,
+        declarations_only=declarations_only,
+        kv_eviction_policy=kv_eviction_policy,
+        kv_eviction_n_steps=kv_eviction_n_steps,
     )
-
-    with _torch.no_grad():
-        # Migrated per-layer ops fire before block/model ops.
-        for layer_idx, op in per_layer_dispatch:
-            block = model.blocks[layer_idx]
-            if op.kind == "attn":
-                target = block.attn
-            elif op.kind == "ffn":
-                target = block.ffn
-            else:
-                raise ValueError(
-                    f"Op {op.name!r} in ops_per_layer has kind={op.kind!r}; "
-                    "expected 'attn' or 'ffn'"
-                )
-            dispatch_operation_bake(
-                op, target, layout.dim_positions, S,
-                declarations_only=declarations_only,
-            )
-
-        # Migrated block ops fire before model ops (which include legacy_bake).
-        # `_n_layers_hint` lets block bake_fns gate on total layer count (e.g.
-        # the L15 attention resize only fires for >=17-layer models).
-        # Block op binding via target_op_name (resolved from layout) takes
-        # precedence over the legacy layer_idx field.
-        for op in block_dispatch:
-            block = model.blocks[layout.resolve_block_op_layer(op)]
-            block._n_layers_hint = len(model.blocks)
-            dispatch_operation_bake(
-                op, block, layout.dim_positions, S,
-                declarations_only=declarations_only,
-            )
-
-        for op in model_dispatch:
-            dispatch_operation_bake(
-                op, model, layout.dim_positions, S,
-                declarations_only=declarations_only,
-            )
-
-    if enable_moe_routing:
-        # Compiler-owned MoE emission: callers receive a model whose routed
-        # FFNs are already represented as tensor-native top-1 experts. Keep
-        # this after all bakes so the partition observes final weights, and
-        # before cache save so MoE artifacts are reused across test runs.
-        model.compact(block_size=32)
-        model.compact_moe()
-
-    # Phase 7.F.2: attach per-attention :class:`KVEvictionState` artifacts.
-    # The hook short-circuits to a no-op when policy is OFF (preserves
-    # byte-identity with all historical baselines). When STATIC_LIVENESS,
-    # the analyzer runs against the full op corpus to compute the per-step
-    # evictable set; the state is then projected onto every block's attn
-    # (both PureAttention and AutoregressiveAttention; the latter relies
-    # on the caller invoking ``run_eviction_hook`` at the step boundary).
-    _attach_kv_eviction_state(
-        model,
-        layout,
-        kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
-        n_steps=int(kv_eviction_n_steps),
-    )
-
-    if cache_path is not None:
-        _try_save_cached(cache_path, model, layout, kwargs_snapshot)
-
-    # Opt-in declarative verifier hook. Gated on C4_VALIDATE_ON_COMPILE
-    # so it never runs in production builds; tests / CI flip it on to
-    # surface declaration drift at compile time. Always warn-only --
-    # the verifier is diagnostic, never a hard fail.
-    if os.environ.get("C4_VALIDATE_ON_COMPILE") == "1":
-        import warnings
-        try:
-            from .decl_verifier import verify_claims_static
-            report = verify_claims_static()
-            if report.has_errors():
-                warnings.warn(
-                    f"C4_VALIDATE_ON_COMPILE=1: declarative verifier "
-                    f"surfaced {len(report.results)} drift entries. "
-                    f"Set C4_VALIDATE_VERBOSE=1 for details.",
-                    stacklevel=2,
-                )
-                if os.environ.get("C4_VALIDATE_VERBOSE") == "1":
-                    print(report.format())
-        except Exception as e:
-            # Validator is opt-in diagnostic -- never fail compile.
-            warnings.warn(
-                f"C4_VALIDATE_ON_COMPILE: verifier raised {e}; continuing"
-            )
-
-    return model, layout
