@@ -524,7 +524,7 @@ def make_opcode_decode_ffn_op() -> Operation:
         # consumption as a prev-step residual read rather than a
         # same-layer dep on ``layer5_fetch``. Drops the L5
         # fetch->decode writes/reads edge from the SCC.
-        reads={"OPCODE_BYTE_LO_PREV_STEP",
+        reads={"OPCODE_BYTE_LO.*.-1",
                "OPCODE_BYTE_HI", "MARK_AX", "MARK_PC", "HAS_SE"},
         writes={"OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
                 "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
@@ -863,7 +863,7 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
         # Phase 8.A SCC step 6: matches opcode_decode_ffn's
         # OPCODE_BYTE_LO_PREV_STEP rename (same numeric base, prev-step
         # semantics).
-        reads={"OPCODE_BYTE_LO_PREV_STEP",
+        reads={"OPCODE_BYTE_LO.*.-1",
                "OPCODE_BYTE_HI", "MARK_AX", "MARK_PC", "HAS_SE"},
         writes={"OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
                 "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
