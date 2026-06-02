@@ -1,10 +1,71 @@
 """Model-level and post-pass op factories. See ../migrated_ops.py for history."""
 
-from ..ir import CompilerIR
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
 from .shared import _as_setdim_proxy, setup_token_embeddings, setup_head_weights
+
+
+_IO_PUTCHAR_ROUTING_START_UNIT = 1500
+
+
+def _io_putchar_routing_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for ``_set_io_putchar_routing`` (L6 FFN units 1500..1532).
+
+    Mirrors the imperative helper bit-for-bit:
+      - unit 1500 (constant_write): ``OP_PUTCHAR + MARK_AX >= 4.0`` ->
+        ``IO_IS_PUTCHAR += 2.0/S``.
+      - units 1501..1516 (gated_write): same threshold gate,
+        ``W_gate[AX_CARRY_LO+k]=1.0`` -> ``OUTPUT_LO+k += 2.0/S``.
+      - units 1517..1532 (gated_write): same threshold gate,
+        ``W_gate[AX_CARRY_HI+k]=1.0`` -> ``OUTPUT_HI_THIS_STEP+k += 2.0/S``
+        (``OUTPUT_HI_THIS_STEP`` is the canonical name for the same-step
+        write band; numerically aliases ``OUTPUT_HI``).
+    """
+    T = 4.0
+    write_scale = 2.0 / S
+    conditions = (("OP_PUTCHAR", 1.0), ("MARK_AX", 1.0))
+    rules: list[FFNRule] = [
+        FFNRule.constant_write(
+            name="io_putchar_detect",
+            conditions=conditions,
+            threshold=T,
+            writes=(("IO_IS_PUTCHAR", write_scale),),
+        ),
+    ]
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"io_putchar_route_lo_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"io_putchar_route_hi_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_HI+{k}",
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _lower_io_putchar_routing_ir(ffn, S: float, BD) -> int:
+    rules = _io_putchar_routing_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=_IO_PUTCHAR_ROUTING_START_UNIT,
+        S=S,
+    )
 
 
 def make_io_putchar_routing_op() -> Operation:
@@ -20,11 +81,19 @@ def make_io_putchar_routing_op() -> Operation:
     program (starting at unit 1500) are present when `_right_size_ffns`
     (called at the end of legacy_bake) prunes dead units. Running at phase
     > 999 would write into already-rightsized FFN slots that no longer exist.
+
+    Migrated 2026-06-01 (Phase 6 Wave 3L): the imperative helper
+    ``_set_io_putchar_routing`` is replaced by an ``FFNRule``-driven
+    lowerer (``_lower_io_putchar_routing_ir``) — 33 rules
+    (1 ``constant_write`` detector + 16 LO ``gated_write`` + 16 HI
+    ``gated_write``) lowered through ``Primitives.lower_ffn_rules`` at
+    pinned units 1500..1532. Byte-identical to the legacy helper;
+    validated via ``compare_symbolic_to_lowered_ffn`` and direct tensor
+    comparison against ``_set_io_putchar_routing``.
     """
     def bake(model, dim_positions, S):
-        from ...vm_step import _set_io_putchar_routing
         proxy = _as_setdim_proxy(dim_positions)
-        _set_io_putchar_routing(model.blocks[6].ffn, S, proxy)
+        _lower_io_putchar_routing_ir(model.blocks[6].ffn, S, proxy)
 
     # Dim-ownership claims. ``_set_io_putchar_routing`` (vm_step.py:8068+)
     # programs 33 L6 FFN units starting at unit 1500:
