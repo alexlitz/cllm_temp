@@ -1161,10 +1161,18 @@ def make_convo_io_prtf_transport_op(
         # 4) and ``layer4_sp_to_addr_key`` (phase 4.5) as the required
         # predecessors so the per-block ``fill_(0.5)`` of alibi slopes
         # has settled before this op overrides ``slope[4] = 0.1``. Pin
-        # after the later of the two via a B10 op-name reference so the
-        # dynamic scheduler honours the dep edge despite empty
-        # reads/writes.
-        requires={"after": "layer4_sp_to_addr_key"},
+        # via a B10 op-name reference so the dynamic scheduler honours
+        # the dep edge despite empty reads/writes.
+        #
+        # Phase 7.A.1: ``layer4_sp_to_addr_key`` is itself a kind="block"
+        # op pinned to layer_idx=4 (phase 4.5), so this op (layer_idx=4,
+        # phase 4.6) really wants to co-place at L4 with a per-block
+        # phase tiebreaker -- NOT push to L5. Use
+        # ``requires["same_layer_as"]`` to express the co-placement
+        # constraint to analyze_scheduler.py and LayerCompiler equally;
+        # the per-block phase ordering (4.5 < 4.6) handles within-block
+        # sequencing of alibi-slope writes.
+        requires={"same_layer_as": "layer4_sp_to_addr_key"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
