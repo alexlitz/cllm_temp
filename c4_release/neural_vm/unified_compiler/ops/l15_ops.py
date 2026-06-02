@@ -1399,6 +1399,21 @@ def make_l15_attention_resize_op() -> Operation:
 
     phase=14.9 places this after L14 (phase=14) and before
     `_set_layer15_memory_lookup` inside legacy_bake at phase=999.
+
+    Phase 6 wave 2F (head-axis migration): the bake instantiates a
+    per-bake :class:`AttentionHeadAllocator` pre-loaded with the full
+    L15 head layout (see :data:`_L15_HEAD_LAYOUT`) and stashes it on
+    ``attn._l15_head_allocator`` so downstream tooling can audit the
+    head axis after the resize. The op stays
+    ``declarative_authority="structural_model"`` with ``compiler_ir=None``
+    (no ``compiler_ir_factory`` either): the work it performs is a
+    structural ``nn.Parameter`` resize plus a follow-up suppress-helper
+    call, neither of which fits the per-head
+    :class:`AttentionHeadIR` semantics. This is intentional -- the
+    resize *makes* the head set available, it is not a head spec
+    itself; the layer compiler already early-returns for
+    ``structural_model`` ops at IR lowering, so leaving the IR factory
+    unset is correct.
     """
     def bake(block, dim_positions, S):
         import torch
@@ -1409,6 +1424,20 @@ def make_l15_attention_resize_op() -> Operation:
             num_heads_new = 9
 
         attn = block.attn
+        # Per-bake attention-head allocator with the full L15 head
+        # layout pinned. ``l15_attention_resize`` does not write Q/K/V/O
+        # itself -- it only enlarges ``attn.num_heads``/``W_q``/``W_k``/
+        # ``W_v``/``W_o`` and re-initialises ``alibi_slopes`` -- so this
+        # is bookkeeping-only: the allocator declares the L15 head axis
+        # for the resized attention block. The follow-up
+        # ``_suppress_l15_lookup_during_current_store_generation`` call
+        # then writes into the heads the allocator just pinned. Stashing
+        # the allocator on ``attn._l15_head_allocator`` keeps the
+        # layout discoverable when this op runs before the per-layer
+        # memory-lookup bake (legacy_bake at phase=999) AND when it runs
+        # after, so the late_bake reentrant case keeps a consistent view.
+        head_allocator = _allocate_layer15_attention_heads()
+        attn._l15_head_allocator = head_allocator
         d = attn.W_q.shape[1]
         head_dim_old = d // attn.num_heads
         if getattr(attn, "num_heads", 8) >= num_heads_new:
