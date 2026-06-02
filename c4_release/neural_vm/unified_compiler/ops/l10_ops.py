@@ -383,6 +383,72 @@ def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
 
+# Suppressed opcodes for L10 ALU AX passthrough -- mirrors the
+# ``suppressed_ops`` list in ``vm_step._set_layer10_alu``. Each opcode
+# already owns the AX-byte-0 emission for its specific lane (L6 routing,
+# L8 ALU, L15 memory lookup, DivModModule, etc.), so the L10 passthrough
+# must NOT fire for them.
+_L10_ALU_AX_PASSTHROUGH_SUPPRESSED_OPS = (
+    "OP_IMM",
+    "OP_ADD",
+    "OP_SUB",
+    "OP_OR",
+    "OP_XOR",
+    "OP_AND",
+    "OP_EQ",
+    "OP_NE",
+    "OP_LT",
+    "OP_GT",
+    "OP_LE",
+    "OP_GE",
+    "OP_MUL",
+    "OP_DIV",
+    "OP_MOD",
+    "OP_SHL",
+    "OP_SHR",
+    "OP_LEA",
+    "OP_LI",
+    "OP_LC",
+    "OP_JMP",
+    "OP_EXIT",
+    "OP_NOP",
+    "OP_PUTCHAR",
+)
+
+
+def _layer10_alu_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
+    """L10 AX passthrough: 32 units (16 lo + 16 hi).
+
+    Each unit fires at the AX marker only when none of the
+    ``_L10_ALU_AX_PASSTHROUGH_SUPPRESSED_OPS`` opcodes are active --
+    every suppressed opcode contributes a ``-S`` term that pushes the
+    pre-activation below the ``-S * 0.5`` threshold whenever the
+    opcode flag is hot. Units 0..15 gate on ``AX_CARRY_LO[k]`` and route
+    that one-hot into ``OUTPUT_LO[k]``; units 16..31 do the same on the
+    hi nibble via ``AX_CARRY_HI[k]`` and ``OUTPUT_HI[k]``.
+    """
+
+    rules: list[FFNRule] = []
+    for nibble_label, carry_dim, out_dim in (
+        ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+    ):
+        for k in range(16):
+            conditions = [("MARK_AX", 1.0)]
+            for op_dim in _L10_ALU_AX_PASSTHROUGH_SUPPRESSED_OPS:
+                conditions.append((op_dim, -1.0))
+            rules.append(FFNRule.gated_write(
+                name=f"l10_ax_passthrough_{nibble_label}_{k}",
+                conditions=tuple(conditions),
+                threshold=0.5,
+                gate=f"{carry_dim}+{k}",
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=((f"{out_dim}+{k}", 2.0 / S),),
+            ))
+    return tuple(rules)
+
+
 def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
     """L10 MUL lo-nibble lookup: 256 units gated on OP_MUL.
 
