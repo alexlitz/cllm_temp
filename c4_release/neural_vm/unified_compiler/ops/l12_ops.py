@@ -205,7 +205,16 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         )
         block.ffn._l12_unit_allocator = allocator
 
-        n12 = _bake_layer12_mul_combine(block.ffn, S, proxy)
+        # Phase 8.C inline: lower the rule list directly (was
+        # ``_bake_layer12_mul_combine``) so census v2 classifies this op
+        # as ``declarative`` rather than ``declarative_via_helper``.
+        rules = _layer12_mul_combine_rules(S)
+        rule_dim_positions = Primitives.dim_positions_from_bd(
+            proxy, Primitives.ffn_rule_dim_names(rules),
+        )
+        n12 = Primitives.lower_ffn_rules(
+            block.ffn, rules, rule_dim_positions, S=S,
+        )
         # Byte-identity guard: the FFNRule lowering MUST end exactly
         # where the allocator's partials range ends. If the rule list
         # drifts from the layout table, this assertion fires before any
