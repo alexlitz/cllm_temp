@@ -1896,6 +1896,13 @@ def make_layer10_carry_relay_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 8.A.4 retry: this op is the L10 layer anchor. Pointing at
+        # ``layer9_marker_suppress`` (kind="ffn", pinned to L9 via its own
+        # ``requires["after"]: layer8_alu``) creates a topo dep edge that
+        # both orders the placement (anchor placed after suppress) and
+        # forces ``earliest = L9 + 1 = L10``. L10 block ops then bind to
+        # this anchor's resolved layer via ``target_op_name``.
+        requires={"after": "layer9_marker_suppress"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -2062,7 +2069,10 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_carry_relay_ir,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor pinned via ``requires["after"]: layer9_alu``).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
