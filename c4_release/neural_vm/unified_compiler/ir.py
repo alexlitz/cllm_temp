@@ -492,6 +492,77 @@ class RuntimeAttentionFragment:
 
 
 @dataclass(frozen=True)
+class StructuralOp:
+    """Declarative description of a whole-block structural transform.
+
+    Phase 8.I closing-audit primitive: some legacy bakes do work that
+    isn't a per-head Q/K/V/O write or a per-unit FFN rule -- they reshape
+    the block (e.g. ``nn.Parameter`` resizes that grow ``attn.num_heads``)
+    and then run a follow-up imperative pass that depends on the new
+    shape. ``StructuralOp`` carries the structural intent as data so
+    those bakes lower through :meth:`CompilerIR.lower_structural_ops`
+    instead of writing weights directly from a bake_fn.
+
+    Attributes
+    ----------
+    kind:
+        The structural transform identifier. Today only
+        ``"attention_resize"`` is recognised; the lowerer raises on
+        unknown kinds so a typo can't silently no-op.
+    target_num_heads:
+        Desired ``attn.num_heads`` after the resize. The lowerer
+        re-allocates ``W_q`` / ``W_k`` / ``W_v`` / ``W_o`` and the
+        ``alibi_slopes`` buffer to match.
+    small_num_heads:
+        Alternative head count used when ``block._n_layers_hint`` is at
+        or below :attr:`layers_threshold`. ``None`` means "always use
+        ``target_num_heads``".
+    layers_threshold:
+        ``n_layers_hint`` boundary that selects between
+        :attr:`target_num_heads` (larger build) and
+        :attr:`small_num_heads` (16-layer smoke build).
+    alibi_pin_value:
+        Value the first :attr:`alibi_pin_count` ALiBi slopes are pinned
+        to after the resize. ``None`` disables the pin.
+    alibi_pin_count:
+        How many of the leading ALiBi slope slots receive
+        :attr:`alibi_pin_value`. Defaults to 4 (the L15 load-head count).
+    follow_up:
+        Optional callable ``follow_up(block, dim_positions, S)`` run
+        after the structural resize completes. Used by L15 to stash the
+        attention-head allocator and call
+        ``_suppress_l15_lookup_during_current_store_generation``. The
+        follow-up callable is opaque to the lowerer: it can be a thin
+        imperative helper as long as the structural shape comes from
+        the IR.
+    metadata:
+        Opaque mapping for downstream tooling (audit reports, symbolic
+        execution stubs). The lowerer never consults it.
+    """
+
+    kind: str
+    target_num_heads: int = 0
+    small_num_heads: Optional[int] = None
+    layers_threshold: Optional[int] = None
+    alibi_pin_value: Optional[float] = None
+    alibi_pin_count: int = 4
+    follow_up: Optional[Callable[..., None]] = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def resolve_num_heads(self, n_layers_hint: Optional[int]) -> int:
+        """Return the head count this op should resize to for ``n_layers_hint``."""
+
+        if (
+            self.small_num_heads is not None
+            and self.layers_threshold is not None
+            and n_layers_hint is not None
+            and n_layers_hint <= self.layers_threshold
+        ):
+            return int(self.small_num_heads)
+        return int(self.target_num_heads)
+
+
+@dataclass(frozen=True)
 class AttentionMatrixWrite:
     """One resolved attention matrix write for debug/reporting."""
 
@@ -972,6 +1043,7 @@ class LayerSpec:
 
     ffn: FFNOp = field(default_factory=FFNOp)
     attention: AttentionOp = field(default_factory=AttentionOp)
+    structural_ops: List[StructuralOp] = field(default_factory=list)
 
 
 @dataclass
@@ -1098,6 +1170,114 @@ class CompilerIR:
                 continue
             fragment.bake_fn(attn, dim_positions, HD, S)
         return len(heads)
+
+    def lower_structural_ops(
+        self,
+        block,
+        dim_positions: Optional[Mapping[str, int]] = None,
+        *,
+        layer_idx: int = 0,
+        S: float = 100.0,
+    ) -> int:
+        """Lower :class:`StructuralOp` entries against a transformer block.
+
+        Phase 8.I primitive: runs each structural op in declaration
+        order against ``block`` (must expose ``block.attn``). Today only
+        ``kind="attention_resize"`` is implemented; unknown kinds raise
+        ``ValueError`` so a typo at the IR site is loud, not silent.
+
+        For ``attention_resize`` the lowering:
+
+        * Reads ``block._n_layers_hint`` to pick between
+          :attr:`StructuralOp.target_num_heads` and
+          :attr:`StructuralOp.small_num_heads`.
+        * If ``attn.num_heads`` already matches or exceeds the chosen
+          count, the resize is skipped (the ALiBi pin and follow-up
+          still run -- this matches the legacy
+          ``make_l15_attention_resize_op`` short-circuit so the same
+          op invoked twice stays idempotent).
+        * Otherwise re-allocates ``attn.W_q`` / ``W_k`` / ``W_v`` /
+          ``W_o`` as fresh ``nn.Parameter`` tensors sized for
+          ``target_num_heads * head_dim`` rows, copies the existing
+          weights into the leading slice, and re-registers an
+          ``alibi_slopes`` buffer with the standard
+          ``2 ** (-8/N * (i+1))`` decay.
+        * Pins the leading :attr:`StructuralOp.alibi_pin_count` ALiBi
+          slots to :attr:`StructuralOp.alibi_pin_value` when both are
+          set.
+        * Invokes :attr:`StructuralOp.follow_up` (when set) as
+          ``follow_up(block, dim_positions, S)``.
+
+        Returns the number of structural ops lowered.
+        """
+
+        import torch
+        from torch import nn
+
+        layer = self.layer(layer_idx)
+        applied = 0
+        for sop in layer.structural_ops:
+            if sop.kind != "attention_resize":
+                raise ValueError(
+                    f"StructuralOp.kind {sop.kind!r} not recognised by "
+                    "lower_structural_ops"
+                )
+            attn = getattr(block, "attn", block)
+            n_layers_hint = getattr(block, "_n_layers_hint", None)
+            num_heads_new = sop.resolve_num_heads(n_layers_hint)
+            d = attn.W_q.shape[1]
+            head_dim_old = d // attn.num_heads
+
+            if getattr(attn, "num_heads", 0) >= num_heads_new:
+                if (
+                    sop.alibi_pin_value is not None
+                    and hasattr(attn, "alibi_slopes")
+                    and attn.alibi_slopes is not None
+                ):
+                    attn.alibi_slopes[: sop.alibi_pin_count] = (
+                        sop.alibi_pin_value
+                    )
+                if sop.follow_up is not None:
+                    sop.follow_up(block, dim_positions, S)
+                applied += 1
+                continue
+
+            new_q_rows = num_heads_new * head_dim_old
+            attn.num_heads = num_heads_new
+            attn.head_dim = head_dim_old
+
+            if (
+                hasattr(attn, "alibi_slopes")
+                and attn.alibi_slopes is not None
+            ):
+                new_slopes = torch.tensor(
+                    [
+                        2.0 ** (-8.0 / num_heads_new * (i + 1))
+                        for i in range(num_heads_new)
+                    ]
+                )
+                if sop.alibi_pin_value is not None:
+                    new_slopes[: sop.alibi_pin_count] = sop.alibi_pin_value
+                attn.register_buffer("alibi_slopes", new_slopes)
+
+            old_W_q = attn.W_q.data
+            old_W_k = attn.W_k.data
+            old_W_v = attn.W_v.data
+            attn.W_q = nn.Parameter(torch.zeros(new_q_rows, d))
+            attn.W_k = nn.Parameter(torch.zeros(new_q_rows, d))
+            attn.W_v = nn.Parameter(torch.zeros(new_q_rows, d))
+            attn.W_q.data[:d, :] = old_W_q
+            attn.W_k.data[:d, :] = old_W_k
+            attn.W_v.data[:d, :] = old_W_v
+
+            old_W_o = attn.W_o.data
+            attn.W_o = nn.Parameter(torch.zeros(d, new_q_rows))
+            attn.W_o.data[:, :d] = old_W_o
+
+            if sop.follow_up is not None:
+                sop.follow_up(block, dim_positions, S)
+            applied += 1
+        return applied
 
     def lower_token_embeddings(
         self,

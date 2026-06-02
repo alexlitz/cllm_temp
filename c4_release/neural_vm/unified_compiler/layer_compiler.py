@@ -660,6 +660,19 @@ def _dispatch_operation_ir(op: Operation, target, dim_positions, S, ir):
         )
         return
     if op.kind == "block":
+        layer_spec = ir.layer(0)
+        # Phase 8.I closing audit: structural ops resize ``target.attn``
+        # (number of heads, alibi slopes, W_{q,k,v,o} re-allocation) and
+        # may run a follow-up imperative pass that depends on the new
+        # shape. Dispatch them BEFORE attn/ffn lowering so any attention
+        # specs declared on the same IR see the post-resize block.
+        if layer_spec.structural_ops:
+            ir.lower_structural_ops(
+                target,
+                dim_positions,
+                layer_idx=0,
+                S=S,
+            )
         if getattr(target, "attn", None) is not None:
             head_dim = target.attn.W_q.shape[0] // target.attn.num_heads
             ir.lower_attention(
