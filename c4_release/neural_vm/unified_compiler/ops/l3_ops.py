@@ -1079,9 +1079,12 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         for k in range(16):
             _claims.add((3, "attn_W_v", f"{h}_{1 + k}", f"{src_lo}+{k}"))
             _claims.add((3, "attn_W_v", f"{h}_{17 + k}", f"{src_hi}+{k}"))
-    # Head 5: AX_FULL relay V slots from OUTPUT_LO/HI.
+    # Head 5: AX_FULL relay V slots from prev-step OUTPUT_LO/HI (read
+    # via attention back to the prev-step AX marker row -- L3 fires
+    # before any same-step OUTPUT producer, so the read consumes step
+    # N-1's residual). See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §2.1.
     for k in range(16):
-        _claims.add((3, "attn_W_v", f"5_{1 + k}", f"OUTPUT_LO+{k}"))
+        _claims.add((3, "attn_W_v", f"5_{1 + k}", f"OUTPUT_LO_PREV_STEP+{k}"))
         _claims.add((3, "attn_W_v", f"5_{17 + k}", f"OUTPUT_HI_THIS_STEP+{k}"))
     # Head 6: BP→PC LEV relay V slots from CLEAN_EMBED_LO/HI.
     for k in range(16):
@@ -1099,7 +1102,12 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV", "HAS_SE",
                "H1", "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CONST"},
+               # Phase 7.A.3.b: head 5 reads prev-step OUTPUT_LO via the
+               # AX-marker attention back-edge (mirrors OUTPUT_HI_THIS_STEP
+               # cross-step semantics; cycle-break tracked under the
+               # requires["after"] declaration below).
+               "EMBED_LO", "EMBED_HI", "OUTPUT_LO_PREV_STEP",
+               "OUTPUT_HI_THIS_STEP", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                 "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
                 "TEMP", "ADDR_KEY"},

@@ -1776,7 +1776,12 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         # for the staleness analyzer (it only checks producer.phase <=
         # consumer.phase); 8.05 keeps the L8 attn bakes contiguous.
         phase=8.05,
-        reads={"MARK_AX", "HAS_SE", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CONST",
+        # Phase 7.A.3.b: OUTPUT_LO read is cross-step (the V slots pull
+        # the prev step's AX marker residual via attention back-edge).
+        # OUTPUT_HI_THIS_STEP keeps its B9 name because rename-only Option
+        # B is the documented choice for OUTPUT_HI in that split.
+        reads={"MARK_AX", "HAS_SE", "OUTPUT_LO_PREV_STEP",
+               "OUTPUT_HI_THIS_STEP", "CONST",
                "OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR", "OP_LEV",
                "OP_BZ", "OP_BNZ", "OP_PSH", "OP_ADJ", "OP_ENT",
                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
