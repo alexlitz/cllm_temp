@@ -4026,6 +4026,13 @@ def make_putchar_think_protocol_op(
         # ffn dep anchor so the block op resolves to whichever
         # layer the compiler places the anchor at.
         target_op_name="_layer6_ffn_dep_anchor",
+        # Phase 8: declare explicit "after" anchor so strict-mode
+        # scheduler can place this op by dep depth (rather than
+        # bucketing it as ``phase_required_but_undeclared``). The
+        # op fires at L6 phase 6.6 after PC relay; layer4_pc_relay
+        # is the standard upstream anchor used by sibling L5/L6
+        # ops (see l5_ops.py:185, 401; l4_ops.py:929).
+        requires={"after": "layer4_pc_relay"},
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
