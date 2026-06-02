@@ -1096,4 +1096,59 @@ implementation effort.
 
 ---
 
+## Section 12 — Phase 11: V1 completion + Phase 10.E/F unblock
+
+The 10.E+F feasibility audit (.agent-logs/phase_10ef_feasibility_20260602.md)
+revealed gaps in the V1 "complete" claim that also block Phase 10.E/F.
+
+### 11.A — IR exposure for 58 imperative-bake ops
+
+58 of 124 ops have `compiler_ir = None AND compiler_ir_factory = None`.
+Census v2 marked them "declarative" because they don't route through
+a `declarative_via_helper` trampoline — but they also don't expose
+an IR for static analysis.
+
+Their dim usage is invisible, blocking:
+- 10.E/F multiplexing (conservatively treats them as ALWAYS_ACTIVE)
+- Future compression/analysis passes
+- Strict V1 spec ("every op authored declaratively")
+
+Work: extend each op's bake_fn to declare a `compiler_ir` (if the bake
+is declarative under the hood) or migrate to declarative IR (if still
+imperative). Target: 124/124 ops expose `.reads / .writes /
+.conditions` to static analyzers.
+
+### 11.B — Tighten 16% token-gated rules to opcode-gated
+
+4,378 / 27,331 IR rules (16%) gate on `MARK_AX AND BYTE_INDEX_0` or
+similar token-type conditions, NOT opcode markers. Adds 283
+ALWAYS_ACTIVE bytes.
+
+Work: per rule family, decide token-agnostic (keep) vs accidentally
+token-gated (tighten). Each tightening exposes more bytes to 10.E/F.
+
+### 11.C — Migrate 76 attention heads to opcode K-gating
+
+76 of 82 heads K-gate on `MARK_*` (token markers), not `OP_*`. Blocks
+Axis F entirely.
+
+Work: per head, decide whether to add an opcode K-side gate. Some are
+genuinely opcode-agnostic (cross-step carry-forward heads) and stay;
+others should declare their data-flow opcode dependency. Phase 7-scale
+(~weeks).
+
+### Phase 11 acceptance
+
+- 124/124 ops expose IR (`compiler_ir` or `compiler_ir_factory`)
+- Token-gated rules audited per family; tightening landed where
+  applicable
+- Opcode-filtering heads ≥ 80% of total (was 6/82)
+- Re-run 10.E/F feasibility audit; confirm projected savings now match
+  ~50M (Axis E ceiling) or ~46M total (Axis F)
+
+Until 11.A-C land, Phase 10.E and 10.F are blocked. Phase 10.A + 10.B
+remain unblocked (target ~135M).
+
+---
+
 _End of plan._
