@@ -187,7 +187,6 @@ def make_layer4_pc_relay_op() -> Operation:
         reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI", "ADDR_KEY", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "ADDR_KEY"},  # at AX marker/bytes
         kind="block",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer4_pc_relay_ir,
         layer_idx=4,
@@ -408,7 +407,6 @@ def make_layer4_ffn_op() -> Operation:
                "H1"},
         writes={"FETCH_LO", "FETCH_HI"},
         kind="block",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir=make_layer4_ffn_ir(),
         layer_idx=4,
@@ -799,7 +797,6 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
         writes={"ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},  # = ADDR_KEY band
         kind="block",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         layer_idx=4,

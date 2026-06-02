@@ -248,7 +248,6 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
         writes={"TEMP"},
         kind="block",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         # Declarative ``CompilerIR`` exposed for symbolic execution,
         # ``compare_symbolic_to_lowered_ffn`` / declarative verifier

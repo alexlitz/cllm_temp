@@ -207,7 +207,6 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         reads={"MARK_AX", "TEMP", "ALU_HI", "AX_CARRY_LO", "OP_MUL"},
         writes={"OUTPUT_HI_THIS_STEP"},
         kind="block",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir=_layer12_mul_combine_ir(),
         declarative_authority="spec_generated",
