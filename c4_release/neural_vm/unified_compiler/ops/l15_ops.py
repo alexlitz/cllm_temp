@@ -376,6 +376,9 @@ def make_nibble_copy_ffn_op() -> Operation:
         kind="ffn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )

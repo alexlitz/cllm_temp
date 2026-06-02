@@ -17,6 +17,13 @@ from ..layer_compiler import Operation
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Phase 11.A IR exposure: shared empty-IR factory for flag-gated ops whose
+# bake bodies are no-ops when their gating flag is off.
+def _empty_compiler_ir_factory(dim_positions, HD):
+    """Return an empty ``CompilerIR``; used when a flag-gated bake is a no-op."""
+    from ..ir import CompilerIR
+    return CompilerIR()
+
 # Reverse map (lazily populated): Opcode int value -> "OP_<NAME>" string
 # for dim_positions lookup. Module-level so _SetDimProxy can be pickled.
 _OP_NAME_CACHE: Dict[int, str] = {}

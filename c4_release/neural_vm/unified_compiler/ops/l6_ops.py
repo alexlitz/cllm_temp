@@ -2552,6 +2552,9 @@ def make_layer6_attn_op() -> Operation:
         layer_idx=6,
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -2744,6 +2747,9 @@ def make_layer6_ffn_dep_anchor_op() -> Operation:
         requires={"same_layer_as": "_opcode_decode_ffn_dep_anchor"},
         smoke_tests=set(),
         spec_section=None,
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
     )
 
 
@@ -2925,6 +2931,9 @@ def make_layer6_relay_heads_op() -> Operation:
         layer_idx=6,
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -4068,6 +4077,10 @@ def make_putchar_think_protocol_op(
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )
 
 
@@ -4162,6 +4175,10 @@ def make_prtf_think_protocol_op(
         requires={"after": "layer6_routing_ffn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )
 
 
@@ -4236,4 +4253,8 @@ def make_open_clos_tool_call_op(
         requires={"after": "layer6_routing_ffn"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )

@@ -4,7 +4,10 @@ from ...dim_registry import dim_ref
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import (  # noqa: F401
+    _as_setdim_proxy,
+    _empty_compiler_ir_factory,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +191,7 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
         compiler_ir=(
             _convo_io_opcode_decode_ir()
             if enable_conversational_io
-            else None
+            else CompilerIR()
         ),
         declarative_authority="spec_generated",
         ffn_units_used=412 if enable_conversational_io else None,
@@ -332,7 +335,9 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
         kind="model",
         declarative_bake_fn=bake,
         compiler_ir_factory=(
-            _tool_call_relay_head_ir if enable_tool_calling else None
+            _tool_call_relay_head_ir
+            if enable_tool_calling
+            else _empty_compiler_ir_factory
         ),
         declarative_authority="spec_generated",
         phase=998.8,
@@ -425,7 +430,8 @@ def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Oper
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _convo_io_relay_heads_ir
-            if enable_conversational_io else None
+            if enable_conversational_io
+            else _empty_compiler_ir_factory
         ),
         declarative_authority="spec_generated",
         migrated=True,
@@ -775,6 +781,10 @@ def make_null_terminator_detection_op(
         ),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )
 
 
@@ -1076,6 +1086,10 @@ def make_convo_io_prtf_capture_op(
         requires={"after": "layer7_operand_gather"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )
 
 
@@ -1205,7 +1219,8 @@ def make_convo_io_prtf_transport_op(
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _convo_io_prtf_transport_ir
-            if (enable_conversational_io and enable) else None
+            if (enable_conversational_io and enable)
+            else _empty_compiler_ir_factory
         ),
         declarative_authority="spec_generated",
         migrated=True,
@@ -1422,4 +1437,8 @@ def make_conversational_io_output_routing_op(
         ffn_units_used=1232 if enable_conversational_io else None,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )

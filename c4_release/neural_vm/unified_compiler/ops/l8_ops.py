@@ -1351,6 +1351,9 @@ def make_layer8_multibyte_fetch_op() -> Operation:
         requires={"after": "layer4_pc_relay"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
     )
 
 
@@ -1637,6 +1640,9 @@ def make_layer8_sp_gather_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -2006,6 +2012,10 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         },
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )
 
 
@@ -2463,6 +2473,10 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )
 
 

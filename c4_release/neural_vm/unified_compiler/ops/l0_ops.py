@@ -369,6 +369,9 @@ def make_layer0_threshold_attn_dep_anchor_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
         smoke_tests=set(),
         spec_section=None,
     )

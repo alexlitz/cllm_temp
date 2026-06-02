@@ -521,6 +521,9 @@ def make_layer4_ffn_dep_anchor_op() -> Operation:
         requires={"same_layer_as": "_layer3_ffn_dep_anchor"},
         smoke_tests=set(),
         spec_section=None,
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
     )
 
 
@@ -936,4 +939,8 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )

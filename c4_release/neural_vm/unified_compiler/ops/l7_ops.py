@@ -5,7 +5,10 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import (  # noqa: F401
+    _as_setdim_proxy,
+    _empty_compiler_ir_factory,
+)
 
 
 # === L7 attention head layout (auto-fit; legacy head_idx as docs) ====
@@ -618,7 +621,8 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _format_pointer_extraction_ir
-            if enable_conversational_io else None
+            if enable_conversational_io
+            else _empty_compiler_ir_factory
         ),
         declarative_authority="spec_generated",
         # Phase 8.G.6: drop ``layer_idx=7`` literal; bind to the L7 ffn

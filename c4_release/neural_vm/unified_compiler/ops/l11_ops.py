@@ -255,6 +255,9 @@ def make_layer11_ffn_dep_anchor_op() -> Operation:
         requires={"after": "layer10_carry_relay"},
         smoke_tests=set(),
         spec_section=None,
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
     )
 
 

@@ -6,7 +6,10 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import (  # noqa: F401
+    _as_setdim_proxy,
+    _empty_compiler_ir_factory,
+)
 
 
 # === L9 attention-head layout (pinned indices) ======================
@@ -1529,7 +1532,8 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _format_string_fetch_head_ir
-            if enable_conversational_io else None
+            if enable_conversational_io
+            else _empty_compiler_ir_factory
         ),
         declarative_authority="spec_generated",
         # Phase 8.A.4 retry: layer_idx=9 literal dropped. ``target_op_name``
@@ -1799,4 +1803,7 @@ def make_layer9_marker_suppress_op() -> Operation:
         requires={"after": "layer8_alu"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
     )

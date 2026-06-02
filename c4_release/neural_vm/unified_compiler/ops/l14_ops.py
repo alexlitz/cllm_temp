@@ -677,6 +677,9 @@ def make_layer14_attn_dep_anchor_op() -> Operation:
         requires={"after": "_layer13_attn_dep_anchor"},
         smoke_tests=set(),
         spec_section=None,
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
     )
 
 

@@ -17,6 +17,7 @@ plan: cursor advancement, EOF, READ-into-memory.
 """
 
 from ..layer_compiler import Operation
+from ..ir import CompilerIR
 from .shared import _as_setdim_proxy
 
 
@@ -87,6 +88,10 @@ def make_layer5_user_input_gather_op(enable: bool = False) -> Operation:
         requires={"after": "layer5_fetch"},
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
+        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
+        # config, so an empty IR is byte-identical for default flag values.
+        # Populating IR with the matching rules is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
     )
 
 
