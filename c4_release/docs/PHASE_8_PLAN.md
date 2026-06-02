@@ -947,4 +947,81 @@ complete and the original vision realized.
 
 ---
 
+## Section 11 — Phase 10: Parameter compression (post-Phase 8)
+
+Phase 8 closes the *structural* compiler vision. Phase 10 reduces the
+parameter count for the same symbolic task using the declarative knobs
+Phase 8 just landed (`dim_allocator`, `attention_head_allocator` with
+dynamic head_dim + GQA, `ModelShapeConstraint`).
+
+Baseline (post-Phase-8, 2026-06-02): **167.7M params** at `d_model=736,
+n_layers=18, n_heads=8, head_dim=92, expanded_blocks=32,
+ffn_units=44,547`.
+
+### 10.A — Axis 1: d_model packing (target ≤95M, saves ~70-75M)
+
+The residual stream's active width (sum of declared dim widths) is
+~500. `d_model=736` is the max-allocated slot, not the active count.
+The dim allocator currently aligns to 16 and leaves gaps between
+allocator generations.
+
+Work:
+- Add `dim_allocator` defragmentation pass: after all dims register,
+  compact slots to minimize `d_model` while preserving relative
+  ordering (so existing rules' offsets stay byte-identical relative
+  to their base dim).
+- Add `ModelShapeConstraint(d_model=<target>)` validation hook that
+  raises if active dim sum exceeds target.
+- Verify byte-identity at the default (no defrag) path; opt-in defrag
+  is the new fast path.
+
+Expected savings: attention scales as O(d_model²); FFN/embed/head
+scale as O(d_model). Total ~70-75M.
+
+### 10.B — Axis 2: Wrapper-block expansion reduction (target ≤80M, saves ~15M on top of A)
+
+`_expand_wrapper_blocks` (vm_step.py) inflates 18 native layers to 32
+blocks by wrapping post-ops in dedicated attention towers. Many
+post-ops could be merged into their parent block's FFN.
+
+Work:
+- Audit `_expand_wrapper_blocks`: classify each wrap as "merge-safe"
+  (post-op has no attention reads of fresh markers) vs "must-split"
+  (genuine cross-step attention needed).
+- For merge-safe wraps: fold the post-op's FFN rules into the parent
+  block's `FFNOp` and drop the wrapper block.
+- Track via `ModelShapeConstraint(num_hidden_layers=<target>)`.
+
+### 10.C — Axis 3: Per-byte FFN granularity (target ≤50M, saves ~50M on top of A+B)
+
+Most FFN units are nibble-level (16 per byte slot) for symbolic
+clarity. Folding to byte-level codecs shrinks FFN ~4× but changes
+representation. Per-family verification required.
+
+Work:
+- Audit FFN ops: classify "byte-level-safe" vs "nibble-required".
+- Rewrite byte-safe families with 16→1 unit collapse via gate
+  composition.
+- Gate behind `enable_byte_ffn=False` flag; flip per-family as
+  verified.
+
+### 10.D — Floor estimate
+
+An ideal hand-authored compiler for this 27-opcode VM fits in ~10-20M
+params. The gap from 50M (post-A+B+C) to ~15M is per-op symbolic
+compression (shared residual slots across non-overlapping opcode
+classes).
+
+### Phase 10 acceptance
+
+- Compiled VM passes all Phase 8 acceptance gates at default
+- Each axis ships behind a flag; default = current baseline
+  (byte-identity preserved)
+- `ModelShapeConstraint(target="compact_<axis>", ...)` shape-validates
+  the new targets
+- `test_compression_axes.py` shows end-to-end param count per
+  combination
+
+---
+
 _End of plan._
