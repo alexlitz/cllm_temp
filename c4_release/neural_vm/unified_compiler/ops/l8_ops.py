@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -434,10 +435,21 @@ def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
 
     Same conditions as add_lo (MARK_AX + ALU_LO[a] + AX_CARRY_LO[b],
     MARK_PC blocker, OP_ADD gate) but only emits a unit when
-    ``a + b >= 16`` (carry-out from the lo nibble). Writes CARRY+0
-    normalized by 2.0/(S*5.0) so the gated output ~1 after scaling.
+    ``a + b >= 16`` (carry-out from the lo nibble). Writes the
+    ``(carry, alu)`` byte-0 cell normalized by 2.0/(S*5.0) so the
+    gated output ~1 after scaling.
+
+    Phase 7.E.2: gate + carry-output refs use the
+    ``(category, role)`` form via :func:`dim_ref`. The byte-position
+    semantics of the carry write (``offset=0`` = byte 0 of the
+    inter-byte cascade) and the opcode-family semantics of the gate
+    are now explicit in the rule definition. The ``ALU_LO+a`` /
+    ``AX_CARRY_LO+b`` reads stay as ``+N`` because those offsets are
+    structural per-nibble one-hot lookups, not byte-index roles.
     """
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_add = dim_ref("opcode_flag", "ADD")
     rules = []
     for a in range(16):
         for b in range(16):
@@ -452,10 +464,10 @@ def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_LO+{b}", 1.0),
                 ),
                 threshold=2.5,
-                gate="OP_ADD",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_add,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_ADD",
-                dominates_at={"CARRY+0": "MARK_AX and OP_ADD"},
+                dominates_at={carry_byte0: "MARK_AX and OP_ADD"},
             ))
     return tuple(rules)
 
