@@ -671,7 +671,6 @@ def make_layer14_mem_generation_op() -> Operation:
 
     return Operation(
         name="layer14_mem_generation",
-        phase=14,
         # Phase 8.A: ADDR_B0_HI_PREV_STEP marks the read as cross-step
         # relative to L15 store_stack0_sp_byte0_addr (phase 15.2), which
         # writes ADDR_B0_HI after L14 in the same step. All other
@@ -833,7 +832,6 @@ def make_layer14_alu_high_byte_relay_op() -> Operation:
 
     return Operation(
         name="layer15_alu_high_byte_relay",
-        phase=15.05,
         reads={"IS_BYTE", "H1", "H3", "H4", "BYTE_INDEX_0", "MARK_AX",
                "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "STACK0_BYTE0", "OP_MUL",
@@ -1306,7 +1304,6 @@ def make_layer14_temp_clear_op() -> Operation:
 
     return Operation(
         name="layer14_temp_clear",
-        phase=14.1,
         reads={"OP_LEV", "MARK_PC", "TEMP", "IS_BYTE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "MARK_AX", "AX_CARRY_HI", "CONST"},
@@ -1352,6 +1349,9 @@ def _layer14_clear_addr_key_pollution_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", suppress_weight),
         ("MARK_SP", suppress_weight),
     )
+    # structural offset: ADDR_KEY +k for k in 0..47 spans the 48-wide
+    # address-key band; k is a structural index into the band, not a
+    # role-meaningful byte position.
     rules = tuple(
         FFNRule.gated_write(
             name=f"l14_clear_addr_key_pollution_{k}",
@@ -1413,7 +1413,6 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
 
     return Operation(
         name="layer14_clear_addr_key_pollution",
-        phase=14.2,
         reads={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "MARK_PC", "MARK_BP", "MARK_AX", "MARK_STACK0", "MARK_SP",
                "CONST"},
@@ -1614,7 +1613,6 @@ def make_layer14_clear_output_corruption_op() -> Operation:
 
     return Operation(
         name="layer14_clear_output_corruption",
-        phase=14.3,
         reads={"H4", "H1", "H3", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "OP_JSR", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "IS_BYTE", "BYTE_INDEX_3", "PSH_AT_SP", "CMP",
@@ -1664,6 +1662,8 @@ def _layer14_clear_mem_marker_output_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
     def rule_for(op_name: str, band: str, k: int) -> FFNRule:
+        # structural offset: band+k for k in 0..15 spans the OUTPUT
+        # nibble band; per-nibble lookup, not role-meaningful byte.
         return FFNRule.gated_write(
             name=f"l14_clear_mem_marker_output_{op_name.lower()}_{band.lower()}_{k}",
             conditions=(
@@ -1745,7 +1745,6 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
 
     return Operation(
         name="layer14_clear_mem_marker_output",
-        phase=14.4,
         reads={"OP_JSR", "OP_ENT", "MARK_MEM", "IS_BYTE",
                "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
                "CONST"},
@@ -1795,6 +1794,9 @@ def _layer14_jsr_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
         gate_bias=0.0,
         scope="OP_JSR and IS_BYTE and H1+1",
     )
+    # structural offset: OUTPUT_LO/HI +k for k in 0..15 spans the
+    # nibble-value band (zero-suppression spread + +0 boost so byte-
+    # value-0 wins argmax). Per-nibble lookups, not role-meaningful.
     rules = (
         FFNRule.gated_write(
             name="l14_jsr_ax_bytes_zero_lo_neg",
@@ -1897,7 +1899,6 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
 
     return Operation(
         name="layer14_jsr_ax_bytes_zero",
-        phase=14.6,
         reads={"OP_JSR", "IS_BYTE", "H1", "CONST", "STACK0_BYTE0", "STACK0_BYTE1",
                "STACK0_BYTE2", "STACK0_BYTE3"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
@@ -1946,6 +1947,9 @@ def _layer14_alu_nocarry_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
         gate_bias=0.0,
         scope="TEMP+7 and IS_BYTE and H1+1 and not BYTE_INDEX_3",
     )
+    # structural offset: OUTPUT_LO/HI +k for k in 0..15 spans the
+    # nibble-value band (zero-suppression spread + +0 boost). Per-
+    # nibble lookups into the OUTPUT bus, not role-meaningful bytes.
     rules = (
         FFNRule.gated_write(
             name="l14_alu_nocarry_ax_bytes_zero_lo_neg",
@@ -2042,7 +2046,6 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
 
     return Operation(
         name="layer14_alu_nocarry_ax_bytes_zero",
-        phase=14.8,
         reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
@@ -2192,7 +2195,6 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
     # tuples go here.
     return Operation(
         name="layer14_demo_phase6_wave7",
-        phase=14.95,
         reads={"CONST"},
         writes={"TEMP"},
         kind="block",
@@ -2255,6 +2257,9 @@ def _layer14_lc_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
         gate_bias=0.0,
         scope="OP_LC_RELAY and IS_BYTE and H1+1 and not BYTE_INDEX_3",
     )
+    # structural offset: OUTPUT_LO/HI +k for k in 0..15 spans the
+    # nibble-value band (zero-suppression spread + +0 boost). Per-
+    # nibble lookups, not role-meaningful byte positions.
     rules = (
         FFNRule.gated_write(
             name="l14_lc_ax_bytes_zero_lo_neg",
@@ -2351,7 +2356,6 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
 
     return Operation(
         name="layer14_lc_ax_bytes_zero",
-        phase=14.7,
         reads={"OP_LC_RELAY", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
@@ -2508,6 +2512,10 @@ def _layer14_addr_key_neural_decode_lo_hi_rules(
                 byte_addr = ((hi << 4) | lo) + byte_off
                 new_lo = byte_addr & 0xF
                 new_hi = (byte_addr >> 4) & 0xF
+                # structural offset: ADDR_B0_LO/HI +lo/+hi are
+                # nibble-value one-hot reads; ADDR_KEY +new_lo /
+                # +(16+new_hi) are positions inside the addr-key band
+                # (value-bus lookups), not role-meaningful bytes.
                 rules.append(_addr_key_make_rule(
                     name=(
                         f"l14_addr_key_lohi_off{byte_off}_hi{hi:x}_lo{lo:x}"
@@ -2965,7 +2973,6 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
 
     return Operation(
         name="layer14_addr_key_neural_decode",
-        phase=14.5,
         # Phase 8.A: matches layer14_mem_generation's ADDR_B0_HI_PREV_STEP
         # rename — same back-edge against L15 store_stack0_sp_byte0_addr,
         # same numeric position (slot 206), no functional change.
