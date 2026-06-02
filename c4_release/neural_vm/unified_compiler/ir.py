@@ -1082,8 +1082,15 @@ class CompilerIR:
 
         layer = self.layer(layer_idx)
         heads = layer.attention.rules
-        for head in heads:
-            Primitives.generate_attention_head(attn, head.spec, HD)
+        # V1/V2 vision (per-head dynamic head_dim): delegate to
+        # ``generate_attention_heads`` so any spec declaring a non-default
+        # ``head_dim`` triggers the cumulative-sum row-base path. When
+        # every spec leaves ``head_dim=None`` this falls through to the
+        # legacy ``head_idx * HD`` per-head loop — byte-identical with
+        # the prior per-head ``Primitives.generate_attention_head`` call.
+        Primitives.generate_attention_heads(
+            attn, [head.spec for head in heads], HD
+        )
 
         fragments = layer.attention.fragments
         for fragment in fragments:
