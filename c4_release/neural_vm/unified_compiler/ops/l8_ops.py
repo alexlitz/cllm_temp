@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -434,10 +435,21 @@ def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
 
     Same conditions as add_lo (MARK_AX + ALU_LO[a] + AX_CARRY_LO[b],
     MARK_PC blocker, OP_ADD gate) but only emits a unit when
-    ``a + b >= 16`` (carry-out from the lo nibble). Writes CARRY+0
-    normalized by 2.0/(S*5.0) so the gated output ~1 after scaling.
+    ``a + b >= 16`` (carry-out from the lo nibble). Writes the
+    ``(carry, alu)`` byte-0 cell normalized by 2.0/(S*5.0) so the
+    gated output ~1 after scaling.
+
+    Phase 7.E.2: gate + carry-output refs use the
+    ``(category, role)`` form via :func:`dim_ref`. The byte-position
+    semantics of the carry write (``offset=0`` = byte 0 of the
+    inter-byte cascade) and the opcode-family semantics of the gate
+    are now explicit in the rule definition. The ``ALU_LO+a`` /
+    ``AX_CARRY_LO+b`` reads stay as ``+N`` because those offsets are
+    structural per-nibble one-hot lookups, not byte-index roles.
     """
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_add = dim_ref("opcode_flag", "ADD")
     rules = []
     for a in range(16):
         for b in range(16):
@@ -452,10 +464,10 @@ def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_LO+{b}", 1.0),
                 ),
                 threshold=2.5,
-                gate="OP_ADD",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_add,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_ADD",
-                dominates_at={"CARRY+0": "MARK_AX and OP_ADD"},
+                dominates_at={carry_byte0: "MARK_AX and OP_ADD"},
             ))
     return tuple(rules)
 
@@ -464,10 +476,18 @@ def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
     """LEA carry detection (120 units, offsets 888..1007).
 
     Same structural shape as lea_lo (gate=OP_LEA, FETCH_LO operand,
-    non-AX blockers) but only emits when ``a + b >= 16``. Writes
-    CARRY+0 at the same 2.0/(S*5.0) normalization as ADD carry.
+    non-AX blockers) but only emits when ``a + b >= 16``. Writes the
+    ``(carry, alu)`` byte-0 cell at the same 2.0/(S*5.0) normalization
+    as ADD carry.
+
+    Phase 7.E.2: gate + carry-output refs use ``dim_ref`` for the
+    semantic ``(opcode_flag, LEA)`` and ``(carry, alu, byte_index=0)``
+    pairs. ALU_LO+a / FETCH_LO+b stay structural (per-nibble one-hot
+    lookups).
     """
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_lea = dim_ref("opcode_flag", "LEA")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
     rules = []
     for a in range(16):
@@ -483,10 +503,10 @@ def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"FETCH_LO+{b}", 20.0),
                 ),
                 threshold=80.5,
-                gate="OP_LEA",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_lea,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_LEA",
-                dominates_at={"CARRY+0": "MARK_AX and OP_LEA"},
+                dominates_at={carry_byte0: "MARK_AX and OP_LEA"},
             ))
     return tuple(rules)
 
@@ -525,9 +545,19 @@ def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
 
 
 def _layer8_alu_adj_carry_rules(S: float) -> tuple[FFNRule, ...]:
-    """ADJ carry detection (120 units, offsets 1264..1383)."""
+    """ADJ carry detection (120 units, offsets 1264..1383).
+
+    Same shape as lea_carry but gated on OP_ADJ with the ADJ-tuned
+    threshold (85.0 vs LEA's 80.5).
+
+    Phase 7.E.2: gate + carry-output refs use ``dim_ref`` for the
+    ``(opcode_flag, ADJ)`` and ``(carry, alu, byte_index=0)`` pairs.
+    ALU_LO+a / FETCH_LO+b stay structural.
+    """
 
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_adj = dim_ref("opcode_flag", "ADJ")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
     rules = []
     for a in range(16):
@@ -543,10 +573,10 @@ def _layer8_alu_adj_carry_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"FETCH_LO+{b}", 20.0),
                 ),
                 threshold=85.0,
-                gate="OP_ADJ",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_adj,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_ADJ",
-                dominates_at={"CARRY+0": "MARK_AX and OP_ADJ"},
+                dominates_at={carry_byte0: "MARK_AX and OP_ADJ"},
             ))
     return tuple(rules)
 
@@ -555,9 +585,17 @@ def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
     """SUB borrow detection (120 units, offsets 1384..1503).
 
     Borrow occurs when ALU_LO[a] < AX_CARRY_LO[b] (stack_top < AX in
-    this nibble). Mirrors SUB lo structure with gate=OP_SUB.
+    this nibble). Mirrors SUB lo structure with the
+    ``(opcode_flag, SUB)`` gate, writing the ``(carry, alu)`` byte-0
+    cell.
+
+    Phase 7.E.2: gate + carry-output refs use ``dim_ref`` (mirrors the
+    add_carry / lea_carry pilots). ALU_LO+a / AX_CARRY_LO+b operand
+    reads stay structural.
     """
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_sub = dim_ref("opcode_flag", "SUB")
     rules = []
     for a in range(16):
         for b in range(16):
@@ -572,10 +610,10 @@ def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_LO+{b}", 1.0),
                 ),
                 threshold=2.5,
-                gate="OP_SUB",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_sub,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_SUB",
-                dominates_at={"CARRY+0": "MARK_AX and OP_SUB"},
+                dominates_at={carry_byte0: "MARK_AX and OP_SUB"},
             ))
     return tuple(rules)
 
@@ -619,8 +657,14 @@ def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
     Borrow when sp_lo < (8 + imm_lo) mod 16, or when (8 + imm_lo) >= 16
     (carry out of byte 0 into byte 1). The condition is asymmetric
     because the +8 constant offset can itself produce a byte-1 carry.
+
+    Phase 7.E.2: gate + carry-output refs use ``dim_ref`` for the
+    ``(opcode_flag, ENT)`` and ``(carry, alu, byte_index=0)`` pairs.
+    ALU_LO+sp_lo / FETCH_LO+imm_lo stay structural.
     """
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_ent = dim_ref("opcode_flag", "ENT")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
     rules = []
     for sp_lo in range(16):
@@ -637,10 +681,10 @@ def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"FETCH_LO+{imm_lo}", 20.0),
                 ),
                 threshold=85.0,
-                gate="OP_ENT",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_ent,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_ENT",
-                dominates_at={"CARRY+0": "MARK_AX and OP_ENT"},
+                dominates_at={carry_byte0: "MARK_AX and OP_ENT"},
             ))
     return tuple(rules)
 
