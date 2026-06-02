@@ -1899,6 +1899,22 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
         bake_fn=bake,
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 7.A.2 backfill: this is the topology anchor for L10 head 2's
+        # SP byte-0 marker carry-forward. The actual spec
+        # (``_layer10_sp_byte_passthrough_head_spec``) reads dims at Q
+        # positions 34/35 that are NOT in this anchor's ``reads`` set:
+        #   - PSH_AT_SP, OP_JSR  -- written by layer7_memory_heads
+        #   - CMP+2/+3/+4         -- written by layer6_routing_ffn
+        # These are the *gates* that decide whether to suppress the SP byte
+        # carry-forward when the current op is rewriting SP (PSH/JSR/ENT/POP/
+        # LEV/ADJ). The byte payload itself (CLEAN_EMBED) is residue from
+        # the embedding, so the only same-step preds we have are the gating
+        # writers; declare them explicitly so the scheduler analyzer knows
+        # this op cannot float earlier than L7.
+        requires={"after": [
+            "layer6_routing_ffn",
+            "layer7_memory_heads",
+        ]},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

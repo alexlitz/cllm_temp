@@ -1357,6 +1357,22 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
+        # Phase 7.A.2 backfill: this op cancels ADDR_KEY residue left on
+        # non-MEM, non-marker rows by prior ADDR_KEY writers. The data dep
+        # is on the *write side* (we read CONST/markers and write ADDR_KEY)
+        # so the dim-only analyzer cannot infer the real upstream. The
+        # actual ADDR_KEY writers we run after are:
+        #   - layer4_pc_relay      (phase 4,   same step)
+        #   - layer7_memory_heads  (phase 7,   same step)
+        #   - layer14_addr_key_neural_decode (phase 14.5, prev-step carry --
+        #     fires LATER in the current step but the residual we clear is
+        #     last step's output; block ops are pinned to layer_idx so this
+        #     listing is purely informational for the scheduler analyzer).
+        requires={"after": [
+            "layer4_pc_relay",
+            "layer7_memory_heads",
+            "layer14_addr_key_neural_decode",
+        ]},
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
