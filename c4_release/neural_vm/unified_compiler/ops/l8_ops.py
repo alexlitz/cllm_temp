@@ -1146,7 +1146,6 @@ def make_layer8_alu_op() -> Operation:
 
     return Operation(
         name="layer8_alu",
-        phase=8.2,
         reads={"MARK_AX", "MARK_PC", "ALU_LO", "AX_CARRY_LO", "FETCH_LO",
                "OP_ADD", "OP_SUB", "OP_LEA",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE"},
@@ -1336,7 +1335,6 @@ def make_layer8_multibyte_fetch_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_fetch",
-        phase=8,
         reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
@@ -1402,7 +1400,6 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_fetch_bake",
-        phase=8.1,
         reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1", "HAS_SE",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST", "MARK_AX"},
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
@@ -1524,7 +1521,6 @@ def make_layer8_multibyte_routing_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_routing",
-        phase=8.3,
         reads={"IS_BYTE", "H1", "OP_IMM", "MARK_AX",
                "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
@@ -1692,7 +1688,6 @@ def make_layer8_sp_gather_bake_op() -> Operation:
 
     return Operation(
         name="layer8_sp_gather_bake",
-        phase=8.0,
         # Phase 8.A targeted: cross-step CMP+3 read (STACK0-suppression
         # gate on the SP-gather Q rows) declared as CMP_PREV_STEP. L9
         # ALU writes CMP in the same step but AFTER L8; the gate
@@ -2569,7 +2564,6 @@ def make_layer8_sp_gathered_sentinel_op() -> Operation:
 
     return Operation(
         name="layer8_sp_gathered_sentinel",
-        phase=8.6,
         reads={"MARK_SP"},
         writes={"SP_GATHERED_THIS_STEP"},
         kind="block",
