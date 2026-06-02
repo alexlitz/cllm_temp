@@ -20,11 +20,11 @@ Cell buckets: trivial ≤10, medium 11–100, heavy >100.
 
 - Total ops in `all_core_ops()`: **115**
 - Per classification:
-  - `imperative_heavy`: **37**
+  - `imperative_heavy`: **36**
   - `no_op`: **33**
-  - `declarative`: **23**
+  - `declarative`: **26**
   - `imperative_medium`: **12**
-  - `imperative_trivial`: **9**
+  - `imperative_trivial`: **7**
   - `declarative_no_op`: **1**
 - Per kind:
   - `block`: **67**
@@ -32,13 +32,13 @@ Cell buckets: trivial ≤10, medium 11–100, heavy >100.
   - `attn`: **15**
   - `ffn`: **8**
 - IR status:
-  - `no_ir`: **84**
-  - `has_ir`: **31**
+  - `no_ir`: **81**
+  - `has_ir`: **34**
 - Cells written per class (sum of nonzero param cells):
-  - `imperative_heavy`: **258733**
-  - `declarative`: **47728**
+  - `imperative_heavy`: **257876**
+  - `declarative`: **48595**
   - `imperative_medium`: **650**
-  - `imperative_trivial`: **55**
+  - `imperative_trivial`: **45**
   - `no_op`: **0**
   - `declarative_no_op`: **0**
 
@@ -58,7 +58,7 @@ Cell buckets: trivial ≤10, medium 11–100, heavy >100.
 | L16 | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
 | L17 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
 | L2 | 2 | 0 | 1 | 1 | 0 | 0 | 0 |
-| L3 | 0 | 0 | 2 | 0 | 2 | 1 | 0 |
+| L3 | 3 | 0 | 0 | 0 | 1 | 1 | 0 |
 | L4 | 2 | 0 | 0 | 0 | 1 | 1 | 0 |
 | L5 | 1 | 0 | 0 | 1 | 1 | 2 | 0 |
 | L6 | 1 | 0 | 0 | 3 | 6 | 7 | 0 |
@@ -96,9 +96,9 @@ Cell buckets: trivial ≤10, medium 11–100, heavy >100.
 | `layer2_initial_pc_bake_cancel` | L2 | block | 2.5 | n | imperative_trivial | 8 | - |
 | `_layer3_ffn_dep_anchor` | L3 | ffn | 3 | n | no_op | 0 | - |
 | `layer3_carry_forward_attn` | L3 | attn | 3 | n | imperative_heavy | 554 | `Primitives.carry_forward_attention`, `Primitives.generate_attention_heads` |
-| `layer3_ffn` | L3 | block | 3 | n | imperative_heavy | 857 | `_set_layer3_ffn`, `_suppress_layer3_stack0_marker_carry_projection` |
-| `layer3_convo_io_state_init` | L3 | block | 3.1 | n | imperative_trivial | 4 | `_lower_layer3_convo_io_state_init_ir` |
-| `convo_io_step_resume` | L3 | block | 3.2 | n | imperative_trivial | 6 | `_lower_convo_io_step_resume_ir` |
+| `layer3_ffn` | L3 | block | 3 | Y | declarative | 857 | `_lower_layer3_ffn_ir` |
+| `layer3_convo_io_state_init` | L3 | block | 3.1 | Y | declarative | 4 | `_lower_layer3_convo_io_state_init_ir` |
+| `convo_io_step_resume` | L3 | block | 3.2 | Y | declarative | 6 | `_lower_convo_io_step_resume_ir` |
 | `layer4_ffn` | L4 | block | 4 | n | imperative_heavy | 3,292 | - |
 | `layer4_pc_relay` | L4 | block | 4 | Y | declarative | 221 | `Primitives.generate_attention_heads` |
 | `layer4_sp_to_addr_key` | L4 | block | 4.5 | n | no_op | 0 | - |
@@ -205,7 +205,7 @@ Cell buckets: trivial ≤10, medium 11–100, heavy >100.
 ## Verdict on plan estimate
 
 - Plan doc estimates **99 imperative ops** + **89 legacy attention bakes**.
-- Observed imperative-classed ops (trivial+medium+heavy): **58**
-- Observed declarative ops (lower-via-IR): **23** (+ 1 declarative-shape but flag-off no_op)
+- Observed imperative-classed ops (trivial+medium+heavy): **55**
+- Observed declarative ops (lower-via-IR): **26** (+ 1 declarative-shape but flag-off no_op)
 - Pure no_op ops: **33**; unknown (stub-incompatible): **0**
 - Ops whose bake actually writes to attention parameters: **47** (kind=attn: 15; kind=block touching attn: 25; kind=model touching attn: 7)

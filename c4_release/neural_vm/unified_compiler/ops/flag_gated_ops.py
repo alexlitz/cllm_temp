@@ -780,6 +780,7 @@ def make_convo_io_step_resume_op(
         layer_idx=3,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_convo_io_step_resume_ir(),
         declarative_authority="spec_generated",
         migrated=True,
         ffn_units_used=1036 if (enable_conversational_io and enable) else None,
@@ -807,8 +808,23 @@ def _convo_io_step_resume_rules(S: float) -> tuple[FFNRule, ...]:
                 ("IO_STATE", -write_scale),
                 ("IO_IN_OUTPUT_MODE", -write_scale),
             ),
+            scope="LAST_WAS_THINKING_START",
         ),
     )
+
+
+def _convo_io_step_resume_ir(S: float = 100.0) -> CompilerIR:
+    """Build a :class:`CompilerIR` exposing the convo-IO step-resume rule.
+
+    Pinned to :attr:`Operation.compiler_ir` so the declarative verifier
+    sees the single ``convo_io_step_resume`` rule even though the bake
+    body lowers it at start_unit=1035 (above the L3 main rule range).
+    The IR-level lowering uses start_unit=0; the actual bake body uses
+    the production offset via :func:`_lower_convo_io_step_resume_ir`.
+    """
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_convo_io_step_resume_rules(S))
+    return ir
 
 
 def _lower_convo_io_step_resume_ir(ffn, S: float, BD) -> int:

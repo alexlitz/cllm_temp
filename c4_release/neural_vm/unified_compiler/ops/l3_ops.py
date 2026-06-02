@@ -1,34 +1,35 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...constants import INSTR_WIDTH, PC_OFFSET
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import FFNRule
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
+# Marker indices inside the H0..H4 / H1+i threshold-head banks.
+_PC_I, _AX_I, _SP_I, _BP_I, _MEM_I = 0, 1, 2, 3, 4
+
+
 # === L3 FFN unit layout (pinned offsets) ============================
 #
 # The ``layer3_ffn`` op owns the L3 FFN's marker-default + PC-increment
-# bands. The actual weight writes happen inside
-# ``vm_step._set_layer3_ffn`` (units 0..133, monotonic ``unit = 0``
-# counter) followed by
-# ``_suppress_layer3_stack0_marker_carry_projection`` (in-place edits
-# of existing units, no new allocation) and
-# ``_add_layer3_pc_byte1_output_rules`` (2 units, claimed via the
-# ``_next_free_ffn_unit`` probe). Migration to
-# :class:`FFNUnitAllocator` keeps every helper byte-identical -- we just
-# declare each sub-stage's range at its existing pinned offset so the
-# layout is auditable rather than implicit. Adding a new L3 op family
-# later will go through ``allocator.alloc(name, n)`` without a pin, and
-# the allocator will pick the first free gap above unit 136.
+# bands. The 134-unit prefix is now produced by the declarative
+# :func:`_layer3_ffn_rules` rule list, lowered via
+# :func:`Primitives.lower_ffn_rules`; the trailing 2 PC-byte1 writers
+# come from :func:`_add_layer3_pc_byte1_output_rules`. Migration to
+# :class:`FFNUnitAllocator` keeps every sub-stage's offset auditable --
+# each sub-stage's range is declared at its existing pinned offset.
+# Adding a new L3 op family later will go through
+# ``allocator.alloc(name, n)`` without a pin, and the allocator will
+# pick the first free gap above unit 136.
 #
-# The offsets below mirror the unit-counter walk in
-# ``vm_step._set_layer3_ffn`` (PC default / SP default / BP default /
-# marker bytes-1..3 defaults / STACK0 carry / NEXT_STACK0 locality /
-# PC increment + carry) followed by
-# ``_add_layer3_pc_byte1_output_rules`` (2 PC byte1 = 1 writers).
-# Changing any helper's unit count requires updating this table in
+# The offsets below mirror the rule order in :func:`_layer3_ffn_rules`
+# (PC default / SP default / BP default / marker bytes-1..3 defaults /
+# STACK0 carry / NEXT_STACK0 locality / PC increment + carry) followed
+# by :func:`_add_layer3_pc_byte1_output_rules` (2 PC byte1 = 1 writers).
+# Changing any rule's unit count requires updating this table in
 # lock-step.
 _L3_FFN_UNIT_LAYOUT = (
     # (sub-stage name, pinned start, n_units)
@@ -60,23 +61,26 @@ _L3_FFN_UNIT_LAYOUT = (
 def _allocate_layer3_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L3 FFN sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the underlying
-    ``vm_step._set_layer3_ffn`` helper -- which writes via its own
-    monotonic ``unit = 0`` counter -- lands on exactly the same
-    hidden-unit indices it always has. The trailing
+    Every sub-stage is pinned at its existing offset so the
+    :func:`_layer3_ffn_rules` rule list -- lowered via
+    :func:`Primitives.lower_ffn_rules` -- lands on exactly the same
+    hidden-unit indices the legacy ``vm_step._set_layer3_ffn`` helper
+    occupied. The trailing
     ``_add_layer3_pc_byte1_output_rules`` writer is also pinned at its
     legacy offset (134), which is where
     ``_next_free_ffn_unit(ffn)`` evaluates to immediately after the
-    main helper returns. This call is byte-identical bookkeeping: the
-    allocator declares ranges by name, the helpers write the weights. A
-    future refactor can split the monolithic helper into per-range bake
-    functions that consume ``allocator.alloc(...)`` directly.
+    main rule lowering returns. This call is byte-identical
+    bookkeeping: the allocator declares ranges by name, the rule
+    lowerer / trailing helper write the weights. A future refactor can
+    split the rule list into per-range factories that consume
+    ``allocator.alloc(...)`` directly.
 
-    Note that
-    ``_suppress_layer3_stack0_marker_carry_projection`` is intentionally
-    absent: it modifies existing units in place (a subset of the
-    ``stack0_carry_projection_*`` bands) rather than allocating new
-    ones, so it has no entry in the layout table.
+    The 32 ``stack0_carry_projection_{lo,hi}_*`` rules emit *zero*
+    ``W_down`` writes, which replaces the legacy
+    ``_suppress_layer3_stack0_marker_carry_projection`` in-place
+    rewrite. Those rules still occupy 32 units (the W_up / W_gate /
+    b_up writes survive) so the unit-cursor offsets downstream are
+    unchanged.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L3 op claims a free range past unit 136).
@@ -87,10 +91,480 @@ def _allocate_layer3_ffn_units() -> FFNUnitAllocator:
     return allocator
 
 
+def _no_op_placeholder_rule(name: str) -> FFNRule:
+    """Empty FFNRule that occupies one hidden-unit slot but writes no weights.
+
+    Mimics the legacy ``unit += 1`` placeholders for the
+    initial_pc_bake cancel (whose logic moved to
+    ``make_layer2_initial_pc_bake_cancel_op``) so the unit count stays
+    at 134 and downstream pinned offsets are unchanged.
+
+    Notably, ``gate_bias=0.0`` overrides the
+    ``FFNRule.constant_write`` default (1.0) so the placeholder leaves
+    ``b_gate[unit]`` at its initial zero -- matching the legacy bake's
+    behaviour for these two intentionally-unused units.
+    """
+    return FFNRule(
+        name=name,
+        conditions=(),
+        threshold=0.0,
+        writes=(),
+        gate=None,
+        gate_bias=0.0,
+    )
+
+
+def _layer3_ffn_rules(S: float) -> tuple:
+    """Declarative L3 FFN rule list -- replaces ``vm_step._set_layer3_ffn``.
+
+    Produces 134 :class:`FFNRule` instances covering:
+
+    * units 0-3 -- PC FIRST-STEP DEFAULT (set + HAS_SE-keyed undo, LO/HI).
+    * units 4-5 -- INITIAL_PC_BAKE CANCEL placeholders (no-op).
+    * units 6-13 -- SP defaults (marker, bytes 0/2, byte 2 first-step).
+    * units 14-21 -- BP defaults (mirror of SP).
+    * units 22-27 -- PC bytes 1-3 default (all zero).
+    * units 28-33 -- AX bytes 1-3 default (all zero).
+    * units 34-35 -- MEM marker default.
+    * units 36-41 -- MEM addr bytes 1-3 default.
+    * units 42-47 -- STACK0 bytes 1-3 default (gated by H4[BP] AND NOT H1[BP]).
+    * units 48-49 -- STACK0 first-step default.
+    * units 50-81 -- STACK0 carry projection (32 write-less suppressor
+      units; this is the declarative replacement for the legacy
+      ``_suppress_layer3_stack0_marker_carry_projection`` post-pass).
+    * units 82-85 -- NEXT_STACK0 locality clears (marker, byte_idx 1/2/3).
+    * units 86-101 -- PC INCREMENT lo nibble (k+INSTR_WIDTH)%16.
+    * units 102-117 -- PC INCREMENT hi nibble copy.
+    * units 118-133 -- PC carry correction (lo nibble >= 8 -> hi += 1).
+
+    Byte-identity-validated against the legacy
+    ``vm_step._set_layer3_ffn`` + suppressor pair via the parity test
+    in ``tests/test_declarative_ffn_bakes_l3.py``.
+    """
+    first_pc = PC_OFFSET + INSTR_WIDTH
+    pc_lo = first_pc & 0xF
+    pc_hi = (first_pc >> 4) & 0xF
+    rules = []
+
+    # --- PC FIRST-STEP DEFAULT (units 0-3) ---
+    # At MARK_PC AND NOT HAS_SE, predict PC = PC_OFFSET + INSTR_WIDTH.
+    # Encoded as a "set" unit (ungated; fires on MARK_PC) plus a
+    # HAS_SE-keyed "undo" unit gated by MARK_PC that subtracts the
+    # same amount whenever HAS_SE is on.
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.pc_first_step_default_lo_set",
+        conditions=(("MARK_PC", 1.0),),
+        threshold=0.5,
+        writes=((f"OUTPUT_LO+{pc_lo}", 2.0 / S),
+                (f"EMBED_LO+{pc_lo}", 2.0 / S)),
+        scope="MARK_PC and not HAS_SE",
+    ))
+    rules.append(FFNRule.gated_write(
+        name="layer3_ffn.pc_first_step_default_lo_undo",
+        conditions=(("HAS_SE", 1.0),),
+        threshold=0.5,
+        gate="MARK_PC",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        writes=((f"OUTPUT_LO+{pc_lo}", -2.0 / S),
+                (f"EMBED_LO+{pc_lo}", -2.0 / S)),
+        scope="MARK_PC and HAS_SE",
+    ))
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.pc_first_step_default_hi_set",
+        conditions=(("MARK_PC", 1.0),),
+        threshold=0.5,
+        writes=((f"OUTPUT_HI+{pc_hi}", 2.0 / S),
+                (f"EMBED_HI+{pc_hi}", 2.0 / S)),
+        scope="MARK_PC and not HAS_SE",
+    ))
+    rules.append(FFNRule.gated_write(
+        name="layer3_ffn.pc_first_step_default_hi_undo",
+        conditions=(("HAS_SE", 1.0),),
+        threshold=0.5,
+        gate="MARK_PC",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        writes=((f"OUTPUT_HI+{pc_hi}", -2.0 / S),
+                (f"EMBED_HI+{pc_hi}", -2.0 / S)),
+        scope="MARK_PC and HAS_SE",
+    ))
+
+    # --- INITIAL_PC_BAKE CANCEL placeholders (units 4-5) ---
+    # Cancel logic moved to L2 (``make_layer2_initial_pc_bake_cancel_op``).
+    # These two zero-write units preserve downstream pinned offsets.
+    rules.append(_no_op_placeholder_rule(
+        "layer3_ffn.initial_pc_bake_cancel_lo"))
+    rules.append(_no_op_placeholder_rule(
+        "layer3_ffn.initial_pc_bake_cancel_hi"))
+
+    # --- SP DEFAULT (units 6-13) ---
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.sp_marker_default_lo",
+        conditions=(("MARK_SP", 1.0), ("HAS_SE", -1.0)),
+        threshold=0.5,
+        writes=(("OUTPUT_LO+0", 2.0 / S),),
+        scope="MARK_SP and not HAS_SE",
+    ))
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.sp_marker_default_hi",
+        conditions=(("MARK_SP", 1.0), ("HAS_SE", -1.0)),
+        threshold=0.5,
+        writes=(("OUTPUT_HI+0", 2.0 / S),),
+        scope="MARK_SP and not HAS_SE",
+    ))
+    for byte_idx in (0, 2):
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.sp_byte_idx_{byte_idx}_default_lo",
+            conditions=((f"H1+{_SP_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_LO+0", 2.0 / S),),
+        ))
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.sp_byte_idx_{byte_idx}_default_hi",
+            conditions=((f"H1+{_SP_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_HI+0", 2.0 / S),),
+        ))
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.sp_byte_1_first_step_lo",
+        conditions=((f"H1+{_SP_I}", 1.0), ("BYTE_INDEX_1", 1.0),
+                    ("HAS_SE", -1.0)),
+        threshold=1.5,
+        writes=(("OUTPUT_LO+1", 2.0 / S),),
+    ))
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.sp_byte_1_first_step_hi",
+        conditions=((f"H1+{_SP_I}", 1.0), ("BYTE_INDEX_1", 1.0),
+                    ("HAS_SE", -1.0)),
+        threshold=1.5,
+        writes=(("OUTPUT_HI+0", 2.0 / S),),
+    ))
+
+    # --- BP DEFAULT (units 14-21) ---
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.bp_marker_default_lo",
+        conditions=(("MARK_BP", 1.0), ("HAS_SE", -1.0)),
+        threshold=0.5,
+        writes=(("OUTPUT_LO+0", 2.0 / S),),
+        scope="MARK_BP and not HAS_SE",
+    ))
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.bp_marker_default_hi",
+        conditions=(("MARK_BP", 1.0), ("HAS_SE", -1.0)),
+        threshold=0.5,
+        writes=(("OUTPUT_HI+0", 2.0 / S),),
+        scope="MARK_BP and not HAS_SE",
+    ))
+    for byte_idx in (0, 2):
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.bp_byte_idx_{byte_idx}_default_lo",
+            conditions=((f"H1+{_BP_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_LO+0", 2.0 / S),),
+        ))
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.bp_byte_idx_{byte_idx}_default_hi",
+            conditions=((f"H1+{_BP_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_HI+0", 2.0 / S),),
+        ))
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.bp_byte_1_first_step_lo",
+        conditions=((f"H1+{_BP_I}", 1.0), ("BYTE_INDEX_1", 1.0),
+                    ("HAS_SE", -1.0)),
+        threshold=1.5,
+        writes=(("OUTPUT_LO+1", 2.0 / S),),
+    ))
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.bp_byte_1_first_step_hi",
+        conditions=((f"H1+{_BP_I}", 1.0), ("BYTE_INDEX_1", 1.0),
+                    ("HAS_SE", -1.0)),
+        threshold=1.5,
+        writes=(("OUTPUT_HI+0", 2.0 / S),),
+    ))
+
+    # --- PC bytes 1-3 default (units 22-27) ---
+    for byte_idx in (0, 1, 2):
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.pc_byte_{byte_idx}_default_lo",
+            conditions=((f"H1+{_PC_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_LO+0", 2.0 / S),),
+        ))
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.pc_byte_{byte_idx}_default_hi",
+            conditions=((f"H1+{_PC_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_HI+0", 2.0 / S),),
+        ))
+
+    # --- AX bytes 1-3 default (units 28-33) ---
+    for byte_idx in (0, 1, 2):
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.ax_byte_{byte_idx}_default_lo",
+            conditions=((f"H1+{_AX_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_LO+0", 2.0 / S),),
+        ))
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.ax_byte_{byte_idx}_default_hi",
+            conditions=((f"H1+{_AX_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_HI+0", 2.0 / S),),
+        ))
+
+    # --- MEM marker default (units 34-35) ---
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.mem_marker_default_lo",
+        conditions=(("MARK_MEM", 1.0),),
+        threshold=0.5,
+        writes=(("OUTPUT_LO+0", 2.0 / S),),
+        scope="MARK_MEM",
+    ))
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.mem_marker_default_hi",
+        conditions=(("MARK_MEM", 1.0),),
+        threshold=0.5,
+        writes=(("OUTPUT_HI+0", 2.0 / S),),
+        scope="MARK_MEM",
+    ))
+
+    # --- MEM addr bytes 1-3 default (units 36-41) ---
+    for byte_idx in (0, 1, 2):
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.mem_byte_{byte_idx}_default_lo",
+            conditions=((f"H1+{_MEM_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_LO+0", 2.0 / S),),
+        ))
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.mem_byte_{byte_idx}_default_hi",
+            conditions=((f"H1+{_MEM_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_HI+0", 2.0 / S),),
+        ))
+
+    # --- STACK0 bytes 1-3 default (units 42-47) ---
+    # H4[BP] covers BP through STACK0 (d<=9.5); subtract H1[BP] to
+    # exclude the BP-area positions and leave only STACK0.
+    for byte_idx in (0, 1, 2):
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.stack0_byte_{byte_idx}_default_lo",
+            conditions=((f"H4+{_BP_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0),
+                        (f"H1+{_BP_I}", -1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_LO+0", 2.0 / S),),
+        ))
+        rules.append(FFNRule.constant_write(
+            name=f"layer3_ffn.stack0_byte_{byte_idx}_default_hi",
+            conditions=((f"H4+{_BP_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0),
+                        (f"H1+{_BP_I}", -1.0)),
+            threshold=1.5,
+            writes=(("OUTPUT_HI+0", 2.0 / S),),
+        ))
+
+    # --- STACK0 first-step default (units 48-49) ---
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.stack0_first_step_default_lo",
+        conditions=(("MARK_STACK0", 1.0), ("HAS_SE", -1.0)),
+        threshold=0.5,
+        writes=(("OUTPUT_LO+0", 2.0 / S),),
+        scope="MARK_STACK0 and not HAS_SE",
+    ))
+    rules.append(FFNRule.constant_write(
+        name="layer3_ffn.stack0_first_step_default_hi",
+        conditions=(("MARK_STACK0", 1.0), ("HAS_SE", -1.0)),
+        threshold=0.5,
+        writes=(("OUTPUT_HI+0", 2.0 / S),),
+        scope="MARK_STACK0 and not HAS_SE",
+    ))
+
+    # --- STACK0 carry projection -- SUPPRESSED writes (units 50-81) ---
+    # Imperative bake wrote ``W_down[OUTPUT_LO/HI+k] = 2/S`` for these
+    # 32 units, then
+    # ``_suppress_layer3_stack0_marker_carry_projection`` zeroed those
+    # columns. Express directly as write-less ``gated_write`` rules so
+    # the suppressor is no longer needed; the W_up / W_gate / b_up
+    # writes are still emitted (preserving unit ownership) but
+    # ``writes=()`` means no W_down cells are touched, matching the
+    # post-suppression final state cell-for-cell.
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"layer3_ffn.stack0_carry_projection_lo_{k}",
+            conditions=(("MARK_STACK0", 1.0), ("HAS_SE", 1.0)),
+            threshold=1.5,
+            gate=f"EMBED_LO+{k}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(),  # suppressed (was 2/S in legacy, zeroed by suppressor)
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"layer3_ffn.stack0_carry_projection_hi_{k}",
+            conditions=(("MARK_STACK0", 1.0), ("HAS_SE", 1.0)),
+            threshold=1.5,
+            gate=f"EMBED_HI+{k}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(),  # suppressed (was 2/S in legacy, zeroed by suppressor)
+        ))
+
+    # --- NEXT_STACK0 locality (units 82-85) ---
+    rules.append(FFNRule.gated_write(
+        name="layer3_ffn.next_stack0_locality_marker",
+        conditions=(("MARK_STACK0", 1.0),),
+        threshold=0.5,
+        gate="NEXT_STACK0",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        writes=(("NEXT_STACK0", -3.0 / S),),
+        scope="MARK_STACK0",
+    ))
+    # STACK0 byte 0 aliases BYTE_INDEX_3; exclude BP byte 3 by
+    # requiring H0[BP] to be effectively zero (-1000 weight makes any
+    # H0[BP] presence dominate the threshold).
+    rules.append(FFNRule.gated_write(
+        name="layer3_ffn.next_stack0_locality_byte_idx_3",
+        conditions=((f"H4+{_BP_I}", 1.0),
+                    ("BYTE_INDEX_3", 1.0),
+                    (f"H0+{_BP_I}", -1000.0)),
+        threshold=1.5,
+        gate="NEXT_STACK0",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        writes=(("NEXT_STACK0", -3.0 / S),
+                ("OUTPUT_LO+0", 5.0 / S),
+                ("OUTPUT_HI+0", 5.0 / S)),
+    ))
+    for byte_idx in (1, 2):
+        rules.append(FFNRule.gated_write(
+            name=f"layer3_ffn.next_stack0_locality_byte_idx_{byte_idx}",
+            conditions=((f"H4+{_BP_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+            threshold=1.5,
+            gate="NEXT_STACK0",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("NEXT_STACK0", -3.0 / S),),
+        ))
+
+    # --- PC INCREMENT lo nibble (units 86-101) ---
+    # MARK_PC AND HAS_SE AND NOT OP_LEV: new_k = (k + INSTR_WIDTH) % 16.
+    # OP_LEV ~ 5, so weight -1/5 makes its contribution to the score
+    # cancel the HAS_SE/MARK_PC pair (suppress on LEV opcodes).
+    for k in range(16):
+        new_k = (k + INSTR_WIDTH) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"layer3_ffn.pc_increment_lo_{k}",
+            conditions=(("HAS_SE", 1.0), ("MARK_PC", 1.0),
+                        ("OP_LEV", -1.0 / 5.0)),
+            threshold=1.5,
+            gate=f"EMBED_LO+{k}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"OUTPUT_LO+{new_k}", 2.0 / S),),
+            scope="MARK_PC and HAS_SE and not OP_LEV",
+        ))
+
+    # --- PC INCREMENT hi nibble (units 102-117) ---
+    # Same condition; copies EMBED_HI[k] -> OUTPUT_HI[k].
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"layer3_ffn.pc_increment_hi_{k}",
+            conditions=(("HAS_SE", 1.0), ("MARK_PC", 1.0),
+                        ("OP_LEV", -1.0 / 5.0)),
+            threshold=1.5,
+            gate=f"EMBED_HI+{k}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"OUTPUT_HI+{k}", 2.0 / S),),
+            scope="MARK_PC and HAS_SE and not OP_LEV",
+        ))
+
+    # --- PC carry correction (units 118-133) ---
+    # Fires when MARK_PC AND HAS_SE AND NOT OP_LEV AND any
+    # EMBED_LO[8..15] is set (old lo nibble >= 16 - INSTR_WIDTH).
+    # MARK_PC weight 4 strictly requires it (prevents false positive
+    # at byte positions where EMBED_LO is inflated). Output gate
+    # carries the EMBED_HI[k] nibble into OUTPUT_HI[(k+1)%16] (cancel
+    # old k, add to k+1).
+    carry_threshold = 16 - INSTR_WIDTH
+    for k in range(16):
+        conds = [("MARK_PC", 4.0), ("HAS_SE", 1.0), ("OP_LEV", -1.0)]
+        for lo_bit in range(carry_threshold, 16):
+            conds.append((f"EMBED_LO+{lo_bit}", 1.0))
+        rules.append(FFNRule.gated_write(
+            name=f"layer3_ffn.pc_carry_correction_{k}",
+            conditions=tuple(conds),
+            threshold=5.5,
+            gate=f"EMBED_HI+{k}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"OUTPUT_HI+{k}", -2.0 / S),
+                    (f"OUTPUT_HI+{(k + 1) % 16}", 2.0 / S)),
+            scope="MARK_PC and HAS_SE and not OP_LEV",
+        ))
+
+    return tuple(rules)
+
+
+def _layer3_ffn_ir(S: float = 100.0) -> CompilerIR:
+    """Build a single-layer :class:`CompilerIR` carrying the L3 FFN rules.
+
+    Exposed as :attr:`Operation.compiler_ir` so the declarative
+    verifier / dominance auditor can read the rule list without bake
+    execution. Matches the pattern established by ``_phase_a_ffn_ir``
+    (L0) and similar helpers. The IR carries all 136 units the
+    ``layer3_ffn`` op writes: 134 from :func:`_layer3_ffn_rules`
+    (PC/SP/BP defaults + STACK0 carry suppression + NEXT_STACK0
+    locality + PC increment / carry) followed by 2 from
+    :func:`_layer3_pc_byte1_output_rules` (PC byte1 emission).
+    """
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer3_ffn_rules(S))
+    ir.layer(0).ffn.rules.extend(_layer3_pc_byte1_output_rules(S))
+    return ir
+
+
+def _lower_layer3_ffn_ir(ffn, S: float, BD) -> int:
+    """Lower :func:`_layer3_ffn_rules` into ``ffn`` and return next free unit.
+
+    Thin wrapper around :func:`Primitives.lower_ffn_rules` that builds the
+    rule list, resolves dim names through ``BD``, and lowers at
+    ``start_unit=0``. Used by :func:`make_layer3_ffn_op`'s bake closure.
+    """
+    rules = _layer3_ffn_rules(S)
+    dim_names = Primitives.ffn_rule_dim_names(rules)
+    dim_positions = Primitives.dim_positions_from_bd(BD, dim_names)
+    return Primitives.lower_ffn_rules(
+        ffn, rules, dim_positions, start_unit=0, S=S,
+    )
+
+
 def make_layer3_ffn_op() -> Operation:
     """L3 FFN: PC/SP/BP first-step defaults + PC byte-0 increment.
 
-    Originally: `_set_layer3_ffn` at vm_step.py:2929.
+    Originally: `_set_layer3_ffn` at vm_step.py:2929. Migrated to
+    declarative :class:`FFNRule` lowering via :func:`_layer3_ffn_rules`
+    + :func:`Primitives.lower_ffn_rules` (134 units); the trailing 2
+    PC-byte1 emission units come from
+    :func:`_add_layer3_pc_byte1_output_rules`. The legacy in-place
+    suppressor ``_suppress_layer3_stack0_marker_carry_projection`` is
+    no longer needed -- the 32 STACK0 carry-projection rules now emit
+    zero W_down writes directly.
 
     Reads MARK_PC, MARK_SP, MARK_BP, MARK_STACK0, HAS_SE, EMBED_LO/HI,
     H1, H4, BYTE_INDEX_*, OP_LEV, NEXT_STACK0.
@@ -108,11 +582,10 @@ def make_layer3_ffn_op() -> Operation:
     (e.g. ``layer14_mem_generation``) to the wrong block.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer3_ffn
         proxy = _as_setdim_proxy(dim_positions)
 
         # Per-bake FFN-unit allocator. Each L3 FFN sub-stage is pinned to
-        # its existing offset so the helper calls below land
+        # its existing offset so the rule lowering below lands
         # byte-identically. The ``pc_byte1_output_rules`` range gives the
         # start-unit for the trailing ``_add_layer3_pc_byte1_output_rules``
         # writer, replacing the implicit ``_next_free_ffn_unit`` probe.
@@ -130,19 +603,16 @@ def make_layer3_ffn_op() -> Operation:
         # just a monotonic int.
         block.ffn._l3_unit_allocator = allocator
 
-        _set_layer3_ffn(block.ffn, S, proxy)
-        _suppress_layer3_stack0_marker_carry_projection(block.ffn, S, proxy)
-        # Byte-identity guard: ``_set_layer3_ffn`` does not return a
-        # cursor, but its monotonic walk ends at unit 134; the in-place
-        # suppressor does not allocate new units. So the next free unit
-        # (as the legacy ``_next_free_ffn_unit`` probe reports) MUST
-        # equal the allocator's ``pc_byte1_output_rules`` start. If the
-        # helpers drift from the table, this assertion fires before any
-        # further weight surgery happens.
-        next_free = _next_free_ffn_unit(block.ffn)
+        # Lower the 134-rule declarative spec at unit 0.
+        next_free = _lower_layer3_ffn_ir(block.ffn, S, proxy)
+        # Byte-identity guard: rule count MUST equal the
+        # ``pc_byte1_output_rules`` start (134). If a rule is added or
+        # removed without updating ``_L3_FFN_UNIT_LAYOUT`` in lock-step,
+        # this assertion fires before any further weight surgery
+        # happens.
         assert next_free == pc_byte1_start, (
-            f"L3 FFN unit cursor drift: next free unit is {next_free}, "
-            f"allocator expected {pc_byte1_start}"
+            f"L3 FFN unit cursor drift: rule lowering wrote {next_free} "
+            f"units, allocator expected {pc_byte1_start}"
         )
         _add_layer3_pc_byte1_output_rules(block.ffn, S, proxy)
 
@@ -232,6 +702,7 @@ def make_layer3_ffn_op() -> Operation:
         layer_idx=3,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer3_ffn_ir(),
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
@@ -388,15 +859,74 @@ def _rewrite_layer3_initial_sp_marker_to_f8(
     return rewritten
 
 
-def _write_pc_byte1_one(ffn, unit: int, BD, S: float, conditions) -> int:
-    for dim, weight in conditions:
-        ffn.W_up.data[unit, dim] = S * weight
-    ffn.b_up.data[unit] = -S * 5.5
-    ffn.b_gate.data[unit] = 1.0
-    ffn.W_down.data[BD.OUTPUT_LO + 0, unit] = -500.0 / S
-    ffn.W_down.data[BD.OUTPUT_LO + 1, unit] = 500.0 / S
-    ffn.W_down.data[BD.OUTPUT_HI + 0, unit] = 500.0 / S
-    return unit + 1
+def _layer3_pc_byte1_output_rules(S: float) -> tuple:
+    """Declarative L3 FFN units 134-135 -- PC byte1 emission rules.
+
+    Two ``constant_write`` rules that make PC byte1 equal one either
+    on the wrap token (new byte0 == 0x02 -> CLEAN_EMBED_LO+2 +
+    CLEAN_EMBED_HI+0) or while the previous byte1 was already one
+    (TEMP+1 + TEMP+16 staged by L3 head 7, with CLEAN_EMBED_HI+0..4
+    bounding the preserve rule to byte0 high nibbles 0..4).
+
+    Both rules write ``OUTPUT_LO[0]=-500/S``, ``OUTPUT_LO[1]=500/S``,
+    ``OUTPUT_HI[0]=500/S`` (the OUTPUT_LO writes form a +1 / -0
+    one-hot pair, the OUTPUT_HI write provides the byte1 high nibble).
+    """
+    common_conds = (
+        (f"H1+{_PC_I}", 1.0),
+        ("BYTE_INDEX_0", 1.0),
+        ("IS_BYTE", 1.0),
+        ("HAS_SE", 1.0),
+    )
+    common_writes = (
+        ("OUTPUT_LO+0", -500.0 / S),
+        ("OUTPUT_LO+1", 500.0 / S),
+        ("OUTPUT_HI+0", 500.0 / S),
+    )
+    # Rule 0 (unit 134): wrap token -- new byte0 high nibble == 0 AND
+    # new byte0 low nibble == 2 (i.e. PC just crossed 0x100).
+    wrap = FFNRule.constant_write(
+        name="layer3_ffn.pc_byte1_wrap_token",
+        conditions=common_conds + (
+            ("CLEAN_EMBED_LO+2", 1.0),
+            ("CLEAN_EMBED_HI+0", 1.0),
+        ),
+        threshold=5.5,
+        writes=common_writes,
+    )
+    # Rule 1 (unit 135): preserve when previous byte1 was already 1
+    # (TEMP+1 from L3 head 7 carry low nibble) AND TEMP+16 (the carry
+    # tag) AND CLEAN_EMBED_HI 0..4 (bound to byte0 high nibbles 0..4
+    # because the current 1096 corpus never runs past 0x14a).
+    preserve_conds = list(common_conds)
+    preserve_conds.append(("TEMP+1", 1.0))
+    preserve_conds.append(("TEMP+16", 1.0))
+    for hi in range(5):
+        preserve_conds.append((f"CLEAN_EMBED_HI+{hi}", 1.0))
+    preserve = FFNRule.constant_write(
+        name="layer3_ffn.pc_byte1_preserve",
+        conditions=tuple(preserve_conds),
+        threshold=6.5,
+        writes=common_writes,
+    )
+    return (wrap, preserve)
+
+
+def _lower_layer3_pc_byte1_output_rules_ir(
+    ffn, S: float, BD, *, start_unit: int,
+) -> int:
+    """Lower :func:`_layer3_pc_byte1_output_rules` into ``ffn``.
+
+    Returns the next free unit index. The two PC-byte1 rules occupy
+    units ``start_unit`` and ``start_unit + 1`` -- callers pass the
+    cursor returned by the main L3 FFN rule lowering (134).
+    """
+    rules = _layer3_pc_byte1_output_rules(S)
+    dim_names = Primitives.ffn_rule_dim_names(rules)
+    dim_positions = Primitives.dim_positions_from_bd(BD, dim_names)
+    return Primitives.lower_ffn_rules(
+        ffn, rules, dim_positions, start_unit=start_unit, S=S,
+    )
 
 
 def _add_layer3_pc_byte1_output_rules(ffn, S, BD) -> None:
@@ -410,41 +940,20 @@ def _add_layer3_pc_byte1_output_rules(ffn, S, BD) -> None:
     to byte0 high nibbles 0..4 because the current 1096 corpus never runs
     past 0x14a; branch targets below 0x100 such as 0x62 must not preserve the
     prior high byte.
+
+    Migrated to :class:`FFNRule` lowering via
+    :func:`_layer3_pc_byte1_output_rules` and
+    :func:`_lower_layer3_pc_byte1_output_rules_ir`; the
+    ``_next_free_ffn_unit`` probe remains for legacy back-compat (the
+    main bake's cursor assertion guarantees it returns 134).
     """
 
-    PC_I = 0
-    unit = _next_free_ffn_unit(ffn)
-    if unit + 2 > ffn.W_up.shape[0]:
+    start_unit = _next_free_ffn_unit(ffn)
+    if start_unit + 2 > ffn.W_up.shape[0]:
         raise RuntimeError("L3 FFN has no room for PC byte1 carry repair")
-
-    common = (
-        (BD.H1 + PC_I, 1.0),
-        (BD.BYTE_INDEX_0, 1.0),
-        (BD.IS_BYTE, 1.0),
-        (BD.HAS_SE, 1.0),
+    _lower_layer3_pc_byte1_output_rules_ir(
+        ffn, S, BD, start_unit=start_unit,
     )
-    unit = _write_pc_byte1_one(
-        ffn,
-        unit,
-        BD,
-        S,
-        common + (
-            (BD.CLEAN_EMBED_LO + 2, 1.0),
-            (BD.CLEAN_EMBED_HI + 0, 1.0),
-        ),
-    )
-
-    for dim, weight in common:
-        ffn.W_up.data[unit, dim] = S * weight
-    ffn.W_up.data[unit, BD.TEMP + 1] = S
-    ffn.W_up.data[unit, BD.TEMP + 16] = S
-    for hi in range(5):
-        ffn.W_up.data[unit, BD.CLEAN_EMBED_HI + hi] = S
-    ffn.b_up.data[unit] = -S * 6.5
-    ffn.b_gate.data[unit] = 1.0
-    ffn.W_down.data[BD.OUTPUT_LO + 0, unit] = -500.0 / S
-    ffn.W_down.data[BD.OUTPUT_LO + 1, unit] = 500.0 / S
-    ffn.W_down.data[BD.OUTPUT_HI + 0, unit] = 500.0 / S
 
 
 def make_layer3_ffn_dep_anchor_op() -> Operation:
@@ -759,6 +1268,7 @@ def make_layer3_convo_io_state_init_op(
         layer_idx=3,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer3_convo_io_state_init_ir(),
         declarative_authority="spec_generated",
         migrated=True,
         ffn_units_used=1035 if enable_conversational_io else None,
@@ -781,8 +1291,24 @@ def _layer3_convo_io_state_init_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=(("LAST_WAS_THINKING_END", 1.0),),
             threshold=0.5,
             writes=(("IO_IN_OUTPUT_MODE", 2.0 / S),),
+            scope="LAST_WAS_THINKING_END",
         ),
     )
+
+
+def _layer3_convo_io_state_init_ir(S: float = 100.0) -> CompilerIR:
+    """Build a :class:`CompilerIR` exposing the convo-IO state-init rule.
+
+    Pinned to :attr:`Operation.compiler_ir` so the declarative verifier
+    sees the single ``convo_io_enter_output_mode`` rule even though
+    the bake body lowers it at start_unit=1034 (above the L3 main
+    rule range). The IR-level lowering uses start_unit=0; the actual
+    bake body uses the production offset via
+    :func:`_lower_layer3_convo_io_state_init_ir`.
+    """
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer3_convo_io_state_init_rules(S))
+    return ir
 
 
 def _lower_layer3_convo_io_state_init_ir(ffn, S: float, BD) -> int:
