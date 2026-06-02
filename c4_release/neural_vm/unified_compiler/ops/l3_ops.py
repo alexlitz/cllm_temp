@@ -13,18 +13,21 @@ from .shared import _as_setdim_proxy
 _PC_I, _AX_I, _SP_I, _BP_I, _MEM_I = 0, 1, 2, 3, 4
 
 
-# === L3 FFN unit layout (pinned offsets) ============================
+# === L3 FFN unit layout (auto-fit; legacy offsets retained as docs) ===
 #
 # The ``layer3_ffn`` op owns the L3 FFN's marker-default + PC-increment
-# bands. The 134-unit prefix is now produced by the declarative
+# bands. The 134-unit prefix is produced by the declarative
 # :func:`_layer3_ffn_rules` rule list, lowered via
 # :func:`Primitives.lower_ffn_rules`; the trailing 2 PC-byte1 writers
-# come from :func:`_add_layer3_pc_byte1_output_rules`. Migration to
-# :class:`FFNUnitAllocator` keeps every sub-stage's offset auditable --
-# each sub-stage's range is declared at its existing pinned offset.
-# Adding a new L3 op family later will go through
-# ``allocator.alloc(name, n)`` without a pin, and the allocator will
-# pick the first free gap above unit 136.
+# come from :func:`_add_layer3_pc_byte1_output_rules`.
+#
+# Phase 7.B.2: every entry below is auto-placed by
+# :class:`FFNUnitAllocator` first-fit. Because the layout is fully
+# contiguous in declaration order, first-fit reproduces the legacy
+# pinned offsets bit-for-bit -- so byte-identity with the legacy
+# ``vm_step._set_layer3_ffn`` helper survives the pin drop. The
+# ``legacy_start`` column is kept purely as documentation (matches the
+# unit-counter walk in :func:`_layer3_ffn_rules`).
 #
 # The offsets below mirror the rule order in :func:`_layer3_ffn_rules`
 # (PC default / SP default / BP default / marker bytes-1..3 defaults /
@@ -33,7 +36,7 @@ _PC_I, _AX_I, _SP_I, _BP_I, _MEM_I = 0, 1, 2, 3, 4
 # Changing any rule's unit count requires updating this table in
 # lock-step.
 _L3_FFN_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     ("layer3_ffn.pc_first_step_default_lo",     0,   2),  # PC FIRST-STEP default LO (set + undo)
     ("layer3_ffn.pc_first_step_default_hi",     2,   2),  # PC FIRST-STEP default HI (set + undo)
     ("layer3_ffn.initial_pc_bake_cancel",       4,   2),  # no-op placeholders (cancel moved to L2)
@@ -62,33 +65,32 @@ _L3_FFN_UNIT_LAYOUT = (
 def _allocate_layer3_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L3 FFN sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the
-    :func:`_layer3_ffn_rules` rule list -- lowered via
-    :func:`Primitives.lower_ffn_rules` -- lands on exactly the same
-    hidden-unit indices the legacy ``vm_step._set_layer3_ffn`` helper
-    occupied. The trailing
-    ``_add_layer3_pc_byte1_output_rules`` writer is also pinned at its
-    legacy offset (134), which is where
-    ``_next_free_ffn_unit(ffn)`` evaluates to immediately after the
-    main rule lowering returns. This call is byte-identical
-    bookkeeping: the allocator declares ranges by name, the rule
-    lowerer / trailing helper write the weights. A future refactor can
-    split the rule list into per-range factories that consume
-    ``allocator.alloc(...)`` directly.
+    Phase 7.B.2: ``pin=`` is dropped from every entry in
+    :data:`_L3_FFN_UNIT_LAYOUT`. The allocator's default first-fit
+    strategy walks the layout in declaration order and lands each
+    sub-stage at the lowest free gap large enough to hold it. Because
+    the layout is fully contiguous (every entry starts exactly where
+    the previous one ended), first-fit reproduces the legacy pinned
+    offsets bit-for-bit -- so byte-identity with the legacy
+    ``vm_step._set_layer3_ffn`` helper is preserved without the author
+    having to spell out the offsets. The legacy ``pin`` column in the
+    layout table is kept as a documentation column only (no longer
+    consumed by the allocator).
 
-    The 32 ``stack0_carry_projection_{lo,hi}_*`` rules emit *zero*
-    ``W_down`` writes, which replaces the legacy
-    ``_suppress_layer3_stack0_marker_carry_projection`` in-place
-    rewrite. Those rules still occupy 32 units (the W_up / W_gate /
-    b_up writes survive) so the unit-cursor offsets downstream are
-    unchanged.
+    The trailing ``_add_layer3_pc_byte1_output_rules`` writer is also
+    auto-placed; first-fit lands it at unit 134, matching the value
+    ``_next_free_ffn_unit(ffn)`` would have returned immediately after
+    the main rule lowering. The 32
+    ``stack0_carry_projection_{lo,hi}_*`` rules emit *zero* ``W_down``
+    writes (the W_up / W_gate / b_up writes survive), so the
+    unit-cursor offsets downstream are unchanged.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L3 op claims a free range past unit 136).
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L3_FFN_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_pin, n_units in _L3_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
@@ -985,19 +987,21 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
     )
 
 
-# === L3 attention head layout (pinned head_idx per primary owner) ====
+# === L3 attention head layout (auto-fit; legacy head_idx as docs) ====
 #
 # The ``layer3_carry_forward_attn`` op owns all 8 L3 attention heads.
 # Heads 0-3 are register carry-forward heads (PC / AX / SP / BP),
 # head 4 retires the stale STACK0 marker carry, and heads 5-7 are
 # declarative relays (AX_FULL gather, LEV BP->PC, PC byte1 carry).
 #
-# Pinning every head at its existing ``head_idx`` preserves byte-identity
-# with the legacy bake (which used literal ``head_idx=N`` everywhere).
-# Once a future wave drops ``pin=`` the allocator will auto-fit any new
-# head added to L3 above index 7.
+# Phase 7.B.2: the allocator runs with ``pin=None`` on every entry --
+# first-fit picks 0..7 in declaration order, which matches the legacy
+# layout bit-for-bit. The ``legacy_head_idx`` column below is now
+# documentation only; the load-bearing copy is
+# :data:`_L3_HEAD_LAYOUT_BY_NAME`, consumed by the head-spec
+# factories that write Q/K/V/O weights at the resolved ``head_idx``.
 _L3_HEAD_LAYOUT = (
-    # (op_name, head_idx)
+    # (op_name, legacy_head_idx (docs only))
     ("layer3_carry_forward_attn.head_0", 0),  # PC carry-forward
     ("layer3_carry_forward_attn.head_1", 1),  # AX carry-forward -> AX_CARRY band
     ("layer3_carry_forward_attn.head_2", 2),  # SP carry-forward
@@ -1013,14 +1017,19 @@ _L3_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L3_HEAD_LAYOUT}
 def _allocate_layer3_heads() -> AttentionHeadAllocator:
     """Build a per-bake :class:`AttentionHeadAllocator` with all L3 heads.
 
-    Every L3 head is pinned at its existing ``head_idx`` (declared in
-    :data:`_L3_HEAD_LAYOUT`) so byte-identity with the legacy bake is
-    preserved. Returns the allocator so callers can attach it to the
-    ``attn`` module for inspection.
+    Phase 7.B.2: ``pin=`` is dropped from every entry. The allocator's
+    first-fit picks the lowest free head index in declaration order;
+    because :data:`_L3_HEAD_LAYOUT` is contiguous (0..7) and ordered,
+    first-fit reproduces the legacy ``head_idx`` values bit-for-bit.
+    The actual weight-write head indices are still looked up via
+    :data:`_L3_HEAD_LAYOUT_BY_NAME` inside the head-spec factories
+    below, so byte-identity with the legacy bake is preserved
+    regardless of allocator order. Returns the allocator so callers
+    can attach it to the ``attn`` module for inspection.
     """
     allocator = AttentionHeadAllocator(layer_max_heads=8)
-    for name, head_idx in _L3_HEAD_LAYOUT:
-        allocator.alloc(name, 3, pin=head_idx)
+    for name, _legacy_head_idx in _L3_HEAD_LAYOUT:
+        allocator.alloc(name, 3)
     return allocator
 
 
