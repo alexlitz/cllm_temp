@@ -8,7 +8,7 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L4 attention-head layout (pinned indices) ======================
+# === L4 attention-head layout (auto-fit; legacy head_idx as docs) ====
 #
 # Two ops claim heads on the L4 attention block today:
 #
@@ -22,19 +22,25 @@ from .shared import _as_setdim_proxy
 # made adding a future L4 head fragile (the author had to remember which
 # slots were already taken). With the allocator the handoff is
 # structural: each bake instantiates its OWN allocator pre-loaded with
-# the full L4 head layout (pinned to existing slots), stashes it on
+# the full L4 head layout, stashes it on
 # ``attn._l4_head_allocator`` for downstream inspection, and resolves
-# its own head indices by name. A future L4 attention op can claim a
-# free head via ``allocator.alloc(name, layer_idx=4)`` -- with no
-# ``pin=`` -- without touching this table.
+# its own head indices by name.
+#
+# Phase 7.B.2: every entry below is auto-placed by
+# :class:`AttentionHeadAllocator` first-fit. Because the layout is
+# contiguous (0..3) in declaration order, first-fit reproduces the
+# legacy ``head_idx`` values bit-for-bit. The actual weight writes are
+# still positioned via :func:`_l4_head_idx`, which reads the
+# documentation column below; so byte-identity survives regardless of
+# allocator order.
 #
 # ``layer4_sp_to_addr_key`` is gated by ``enable=False`` today (a guard
-# returns before any weight writes); we still pin its head indices here
-# so the layout is structurally stable across builds. The pinned
+# returns before any weight writes); we still declare its head indices
+# here so the layout is structurally stable across builds. The
 # allocator only attaches to ``attn._l4_head_allocator`` when the op
 # actually fires, matching the existing ``_claims`` gating below.
 _L4_HEAD_LAYOUT = (
-    # (op-name key,                            pinned head_idx)
+    # (op-name key,                            legacy_head_idx (docs only))
     ("layer4_pc_relay.head_0",                 0),
     ("layer4_pc_relay.head_1",                 1),
     ("layer4_sp_to_addr_key.head_2",           2),
@@ -45,17 +51,22 @@ _L4_HEAD_LAYOUT = (
 def _allocate_layer4_attention_heads() -> AttentionHeadAllocator:
     """Build a per-bake :class:`AttentionHeadAllocator` with all L4 heads.
 
-    Every entry in :data:`_L4_HEAD_LAYOUT` is pinned at its existing
-    ``head_idx`` so the underlying weight writes -- still hand-coded in
-    ``_layer4_pc_relay_head_specs`` (heads 0/1) and ``_stage_sp_byte``
-    (heads 2/3) -- land byte-identically. Both ``layer4_pc_relay`` and
-    (when enabled) ``layer4_sp_to_addr_key`` call this so each can look
-    up its own head by name without baking an integer literal at the
+    Phase 7.B.2: ``pin=`` is dropped from every entry. First-fit walks
+    :data:`_L4_HEAD_LAYOUT` in declaration order and assigns each op
+    the lowest free head index in layer 4; because the layout is
+    contiguous (0..3) and ordered, first-fit reproduces the legacy
+    ``head_idx`` values bit-for-bit. The underlying weight writes --
+    still hand-coded in ``_layer4_pc_relay_head_specs`` (heads 0/1) and
+    ``_stage_sp_byte`` (heads 2/3) -- look up their ``head_idx`` via
+    :func:`_l4_head_idx`, independent of the allocator's choice, so
+    byte-identity is preserved. Both ``layer4_pc_relay`` and (when
+    enabled) ``layer4_sp_to_addr_key`` call this so each can look up
+    its own head by name without baking an integer literal at the
     call site.
     """
     allocator = AttentionHeadAllocator()
-    for name, head_idx in _L4_HEAD_LAYOUT:
-        allocator.alloc(name, layer_idx=4, pin=head_idx)
+    for name, _legacy_head_idx in _L4_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=4)
     return allocator
 
 
@@ -75,26 +86,29 @@ def _l4_head_idx(op_name: str) -> int:
     raise KeyError(f"_l4_head_idx: unknown L4 attention op {op_name!r}")
 
 
-# === L4 FFN unit layout (pinned offsets) ============================
+# === L4 FFN unit layout (auto-fit; legacy offsets retained as docs) ===
 #
 # The ``layer4_ffn`` op owns the entire L4 FFN. The actual weight writes
 # happen inside ``_bake_layer4_ffn`` below, which uses a local ``unit = 0``
 # counter that walks through six sub-stages (PC+1@AX, TEMP clear, PC+2/3/4
-# @AX byte positions, PC+1@PC). Migration to :class:`FFNUnitAllocator`
-# keeps that helper byte-identical -- we declare each sub-stage's range
-# at its existing pinned offset so the layout is auditable rather than
-# implicit. Adding a new L4 op family later will go through
-# ``allocator.alloc(name, n)`` without a pin, and the allocator will pick
-# the first free gap above unit 544.
+# @AX byte positions, PC+1@PC).
+#
+# Phase 7.B.2: every entry below is auto-placed by
+# :class:`FFNUnitAllocator` first-fit. Because the layout is fully
+# contiguous in declaration order, first-fit reproduces the legacy
+# pinned offsets bit-for-bit; the ``_bake_layer4_ffn`` helper's own
+# unit-0 cursor is what positions the actual weight writes, so
+# byte-identity is independent of allocator order. The
+# ``legacy_start`` column is documentation only.
 #
 # IMPORTANT: the PC+N chains do NOT have equal stride. The widths follow
 # :meth:`Primitives.nibble_rotation_chain`'s ``with_carry=True`` formula
 # of ``32 + 32 * offset`` units per chain, so PC+2/+3/+4 land at 96/128/
-# 160 units respectively (NOT a uniform 96-unit stride). The pin offsets
-# below honour those exact widths so the layout matches the helper's
-# monotonic walk byte-for-byte.
+# 160 units respectively (NOT a uniform 96-unit stride). The legacy
+# offsets below honour those exact widths so the layout matches the
+# helper's monotonic walk byte-for-byte.
 _L4_FFN_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     # PC+1 chain at MARK_AX (offset=1, with_carry=True): 32 + 32 = 64 units.
     #   16 lo rotation + 16 hi default-copy + 16 hi carry-cancel + 16 hi
     #   carry-rotated. Writes TEMP[0..15] (lo) and TEMP[16..31] (hi).
@@ -122,20 +136,27 @@ _L4_FFN_TOTAL_UNITS = 544
 def _allocate_layer4_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L4 FFN sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the underlying
-    ``_bake_layer4_ffn`` helper -- which writes via its own monotonic
-    ``unit = 0`` counter -- lands on exactly the same hidden-unit indices
-    it always has. This call is byte-identical bookkeeping: the allocator
-    declares ranges by name, the helper writes the weights. A future
-    refactor can split the monolithic helper into per-range bake functions
-    that consume ``allocator.alloc(...)`` directly.
+    Phase 7.B.2: ``pin=`` is dropped from every entry in
+    :data:`_L4_FFN_UNIT_LAYOUT`. The allocator's default first-fit
+    strategy walks the layout in declaration order and lands each
+    sub-stage at the lowest free gap large enough to hold it. Because
+    the layout is fully contiguous (every entry starts exactly where
+    the previous one ended), first-fit reproduces the legacy pinned
+    offsets bit-for-bit. The underlying ``_bake_layer4_ffn`` helper --
+    which writes via its own monotonic ``unit = 0`` counter -- lands
+    on exactly the same hidden-unit indices regardless of allocator
+    order, so byte-identity with the legacy bake is preserved. The
+    allocator's role is bookkeeping: the layout declares ranges by
+    name, the helper writes the weights. A future refactor can split
+    the monolithic helper into per-range bake functions that consume
+    ``allocator.alloc(...)`` directly.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L4 op claims a free range past unit 544).
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L4_FFN_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L4_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 

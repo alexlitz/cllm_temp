@@ -7,17 +7,20 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy, _opcode_name_map
 
 
-# === L5 FFN unit layout (pinned offsets) ============================
+# === L5 FFN unit layout (auto-fit; legacy offsets retained as docs) ===
 #
 # The ``opcode_decode_ffn`` op owns the entire L5 FFN. The actual weight
 # writes happen inside ``_bake_opcode_decode_ffn`` below, which uses a
 # local ``unit = 0`` counter that walks through four CompilerIR rule
-# batches plus one reserved blank slot. Migration to
-# :class:`FFNUnitAllocator` keeps that helper byte-identical -- we
-# declare each sub-stage's range at its existing pinned offset so the
-# layout is auditable rather than implicit. Adding a new L5 op family
-# later will go through ``allocator.alloc(name, n)`` without a pin, and
-# the allocator will pick the first free gap above unit 89.
+# batches plus one reserved blank slot.
+#
+# Phase 7.B.2: every entry below is auto-placed by
+# :class:`FFNUnitAllocator` first-fit. Because the layout is fully
+# contiguous in declaration order, first-fit reproduces the legacy
+# pinned offsets bit-for-bit; the ``_bake_opcode_decode_ffn`` helper's
+# own unit-0 cursor is what positions the actual weight writes, so
+# byte-identity is independent of allocator order. The
+# ``legacy_start`` column is documentation only.
 #
 # Sibling L5 ops do NOT allocate FFN units:
 #   * ``layer5_fetch`` writes attn5 W_q/W_k/W_v/W_o only (8 attention
@@ -33,7 +36,7 @@ from .shared import _as_setdim_proxy, _opcode_name_map
 # all-step PC decode). Changing any helper's unit count requires
 # updating this table in lock-step.
 _L5_FFN_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     # 34 main per-opcode AX rules (one unit per opcode in the table at
     # ``_opcode_decode_main_rules``). Unit 3 writes TEMP+0 (JSR's IS_JSR
     # flag); the other 33 units each write the matching OP_* dim.
@@ -65,21 +68,27 @@ _L5_FFN_TOTAL_UNITS = 89
 def _allocate_layer5_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L5 FFN sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the underlying
-    ``_bake_opcode_decode_ffn`` helper -- which writes via its own
-    monotonic ``unit = 0`` counter -- lands on exactly the same
-    hidden-unit indices it always has. This call is byte-identical
-    bookkeeping: the allocator declares ranges by name, the helper
-    writes the weights. A future refactor can split the monolithic
-    helper into per-range bake functions that consume
-    ``allocator.alloc(...)`` directly.
+    Phase 7.B.2: ``pin=`` is dropped from every entry in
+    :data:`_L5_FFN_UNIT_LAYOUT`. The allocator's default first-fit
+    strategy walks the layout in declaration order and lands each
+    sub-stage at the lowest free gap large enough to hold it. Because
+    the layout is fully contiguous (every entry starts exactly where
+    the previous one ended), first-fit reproduces the legacy pinned
+    offsets bit-for-bit. The underlying ``_bake_opcode_decode_ffn``
+    helper -- which writes via its own monotonic ``unit = 0`` counter
+    -- lands on exactly the same hidden-unit indices regardless of
+    allocator order, so byte-identity with the legacy bake is
+    preserved. The allocator's role is bookkeeping: the layout
+    declares ranges by name, the helper writes the weights. A future
+    refactor can split the monolithic helper into per-range bake
+    functions that consume ``allocator.alloc(...)`` directly.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L5 op claims a free range past unit 89).
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L5_FFN_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L5_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
