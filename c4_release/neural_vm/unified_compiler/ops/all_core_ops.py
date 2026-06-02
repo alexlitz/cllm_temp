@@ -233,6 +233,10 @@ def all_core_ops(
         # scheduler a layer-resident ffn op so the block op resolves to L11.
         make_layer11_ffn_dep_anchor_op(),
         make_layer11_mul_partial_op(alu_mode=alu_mode),
+        # Phase 8.G.6: L12 ffn dep anchor — gives L12 block ops a
+        # stable ``target_op_name`` to bind to so they can drop
+        # ``layer_idx=12`` literals.
+        make_layer12_ffn_dep_anchor_op(),
         make_layer12_mul_combine_op(alu_mode=alu_mode),
         make_layer13_mem_addr_gather_op(),
         make_layer13_shifts_op(alu_mode=alu_mode),

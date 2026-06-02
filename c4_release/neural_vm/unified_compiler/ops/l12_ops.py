@@ -136,6 +136,42 @@ def _bake_layer12_mul_combine(ffn, S, BD) -> int:
     return Primitives.lower_ffn_rules(ffn, rules, dim_positions, S=S)
 
 
+def make_layer12_ffn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer12_mul_combine``: declares mirrored
+    reads/writes so the LayerCompiler's dep graph reserves an L12 slot
+    for it. Mirrors ``_layer11_ffn_dep_anchor`` / ``_layer3_ffn_dep_anchor``:
+    the actual weight bake happens in ``layer12_mul_combine`` (kind=
+    "block"); this op's bake is a no-op.
+
+    Phase 8.G.6: lets L12 block ops declare
+    ``target_op_name="_layer12_ffn_dep_anchor"`` and bind to whichever
+    layer the compiler places the anchor at, instead of carrying a
+    literal ``layer_idx=12``.
+    """
+    def bake(ffn, dim_positions, S):
+        # No-op: actual bake is in ``layer12_mul_combine`` block op below.
+        return
+
+    return Operation(
+        name="_layer12_ffn_dep_anchor",
+        # Phase=11.5 places this anchor between the L11 MUL partial
+        # writes (phase=11) and the L12 MUL combine (phase=12). Reads
+        # include TEMP (written by L11 MUL partial) so the dep graph
+        # earliest-fit lands at L12.
+        phase=11.5,
+        reads={"MARK_AX", "TEMP", "ALU_HI", "AX_CARRY_LO", "OP_MUL"},
+        writes={"OUTPUT_HI_THIS_STEP"},
+        kind="ffn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        # Co-place with the L11 dep anchor + 1 layer (TEMP read deps
+        # against L11 MUL partial force earliest=12).
+        requires={"after": "_layer11_ffn_dep_anchor"},
+        smoke_tests=set(),
+        spec_section=None,
+    )
+
+
 def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
     """L12 FFN: combine MUL partial products into final result.
 
@@ -218,7 +254,10 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer12_mul_combine_ir(),
         declarative_authority="spec_generated",
-        layer_idx=12,
+        # Phase 8.G.6: drop ``layer_idx=12`` literal; bind to the L12
+        # ffn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer12_ffn_dep_anchor",
         migrated=True,
         claims=_claims,
         ffn_units_used=4096,
