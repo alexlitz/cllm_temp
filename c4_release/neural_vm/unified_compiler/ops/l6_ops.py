@@ -2608,11 +2608,23 @@ def make_layer6_routing_ffn_op() -> Operation:
         # byte-identical. This single rename breaks 31 OUTPUT_LO back-
         # edges into layer6_routing_ffn (per scc_audit_phase8.md §3),
         # the single largest back-edge contributor in the dep graph.
+        #
+        # Phase 8.A G7: mirror the OUTPUT_LO_PREV_STEP rename for
+        # OUTPUT_HI: the cancel/relay bands in this op gate on the
+        # residual OUTPUT_HI value, which is the PREVIOUS step's high
+        # nibble (L8+/L14+ OUTPUT_HI_THIS_STEP writers fire AFTER L6
+        # in the same step). Retarget the read to OUTPUT_HI_PREV_STEP
+        # (alias of OUTPUT_HI at numeric position 190) so the scheduler
+        # dep graph drops the 11 cross-step back-edges into this op
+        # from later-layer OUTPUT_HI_THIS_STEP writers (nibble_copy_ffn,
+        # layer8_multibyte_routing, layer9_alibi_mem_attn, every L10+
+        # writer, layer12_mul_combine, layer13_shifts, layer14_mem_generation,
+        # layer15_*, layer16_lev_routing, etc.). Byte-identical bake.
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
                "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP", "CMP",
-               "OUTPUT_LO_PREV_STEP", "OUTPUT_HI_THIS_STEP", "HAS_SE",
+               "OUTPUT_LO_PREV_STEP", "OUTPUT_HI_PREV_STEP", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
                "TEMP_PREV_STEP", "DIV_STAGING"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "AX_CARRY_LO", "AX_CARRY_HI"},
