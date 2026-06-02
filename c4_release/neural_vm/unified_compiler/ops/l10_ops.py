@@ -114,6 +114,105 @@ def _allocate_l10_post_ops_combined_units() -> FFNUnitAllocator:
     return allocator
 
 
+_L10_BINARY_OP_BYTE_ZEROING_OP_DIMS = (
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+    "OP_SHL", "OP_SHR", "OP_MUL", "OP_DIV", "OP_MOD",
+)
+
+
+def _l10_binary_op_byte_zeroing_rules(S: float) -> tuple[FFNRule, ...]:
+    """Declarative rules for ``BinaryOpByteZeroingPostOp`` (8 units).
+
+    Mirrors ``vm_step.BinaryOpByteZeroingPostOp._bake_weights``: four
+    opcode-gated detectors (units 0..3, gate by the binary-op set) and
+    four bitwise-gated detectors (units 4..7, gate by ``TEMP+3``).
+
+    Per the legacy ``wire_zeroing_writes(unit_offset)`` helper, within
+    each group of four:
+
+      * unit_offset+0 wipes the OUTPUT_LO band (16 cells, each -3.0/S),
+      * unit_offset+1 wipes the OUTPUT_HI band (16 cells, each -3.0/S),
+      * unit_offset+2 adds OUTPUT_LO+0 += 5.0/S,
+      * unit_offset+3 adds OUTPUT_HI+0 += 5.0/S.
+
+    The opcode-gated detectors use ``gate=None`` with multi-term
+    ``gate_terms`` summing all 11 opcode flags (each weight 1.0). The
+    bitwise detectors use ``gate="TEMP+3"`` directly.
+    """
+
+    def conds_opcode_gated():
+        return (
+            ("IS_BYTE", 1.0),
+            ("H1+1", 1.0),
+            ("TEMP+8", -1000.0),
+            ("TEMP+9", -1000.0),
+        )
+
+    def conds_bitwise_gated():
+        return (
+            ("IS_BYTE", 1.0),
+            ("H1+1", 1.0),
+            ("TEMP+3", 1.0),
+            ("TEMP+8", -1000.0),
+            ("TEMP+9", -1000.0),
+        )
+
+    opcode_gate_terms = tuple(
+        (op_dim, 1.0) for op_dim in _L10_BINARY_OP_BYTE_ZEROING_OP_DIMS
+    )
+
+    output_lo_wipe = tuple(
+        (f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)
+    )
+    output_hi_wipe = tuple(
+        (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
+    )
+
+    rules: list[FFNRule] = []
+
+    # Units 0..3: opcode-gated detectors.
+    for unit_idx, writes in enumerate((
+        output_lo_wipe,
+        output_hi_wipe,
+        (("OUTPUT_LO+0", 5.0 / S),),
+        (("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+    )):
+        rules.append(FFNRule.gated_write(
+            conditions=conds_opcode_gated(),
+            threshold=1.5,
+            gate=None,
+            gate_terms=opcode_gate_terms,
+            gate_bias=0.0,
+            writes=writes,
+            name=f"l10_binary_op_byte_zeroing_opcode_unit{unit_idx}",
+            scope=(
+                "IS_BYTE and ("
+                + " or ".join(_L10_BINARY_OP_BYTE_ZEROING_OP_DIMS)
+                + ")"
+            ),
+        ))
+
+    # Units 4..7: bitwise-gated detectors (gate = TEMP+3).
+    for unit_idx, writes in enumerate((
+        output_lo_wipe,
+        output_hi_wipe,
+        (("OUTPUT_LO+0", 5.0 / S),),
+        (("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+    )):
+        rules.append(FFNRule.gated_write(
+            conditions=conds_bitwise_gated(),
+            threshold=2.5,
+            gate="TEMP+3",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=writes,
+            name=f"l10_binary_op_byte_zeroing_bitwise_unit{unit_idx}",
+            scope="IS_BYTE and TEMP+3",
+        ))
+
+    return tuple(rules)
+
+
 def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` for ``tail_bit32_result_correction``.
 
@@ -1545,10 +1644,18 @@ def make_l10_post_ops_combined() -> Operation:
         by_name = {r.op_name: r for r in allocator.ranges()}
 
         offset = by_name["l10_post_ops_combined.binary_op_byte_zeroing"].start
-        # Thread dim_positions so each fresh post-op instance bakes against
-        # the compact layout, matching the per-block post_op attach path.
-        offset = _bake_post_op_into(
-            ffn, BinaryOpByteZeroingPostOp(d_model, S, dim_positions=dim_positions), offset)
+        # Migrated to FFNRule. Rule list lives in
+        # ``_l10_binary_op_byte_zeroing_rules`` and is lowered through
+        # ``Primitives.lower_ffn_rules`` so symbolic / declarative
+        # verifiers see the same declarations the imperative
+        # ``BinaryOpByteZeroingPostOp._bake_weights`` used to write.
+        offset = Primitives.lower_ffn_rules(
+            ffn,
+            _l10_binary_op_byte_zeroing_rules(S),
+            dim_positions,
+            start_unit=offset,
+            S=S,
+        )
         assert offset == by_name["l10_post_ops_combined.carry_propagation_byte0"].start, (
             f"L10 post_ops_combined zeroing cursor drift: {offset}"
         )
