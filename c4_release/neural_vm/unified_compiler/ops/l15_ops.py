@@ -11,7 +11,7 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L15 attention head layout (pinned head_idx per primary owner) ===
+# === L15 attention head layout (auto-fit; legacy head_idx as docs) ===
 #
 # L15 attention is the load-side memory pipeline. The block is structurally
 # resized by ``l15_attention_resize`` (phase 14.9) so the live head count
@@ -28,24 +28,27 @@ from .shared import _as_setdim_proxy
 #
 # This table is the single source of truth for the L15 head axis.
 # ``layer_max_heads=14`` covers the widest configuration; runtime
-# narrower-width builds simply leave the higher pins unused. Every
-# ``head_idx`` literal in the spec functions below (e.g. ``head_idx=12``
-# in :func:`_layer15_store_stack0_sp_byte0_addr_spec`) is pinned here so
-# the bakes pull the same indices they always have and byte-identity is
-# trivially preserved.
+# narrower-width builds simply leave the higher allocator slots unused.
+# Every ``head_idx`` literal in the spec functions below (e.g.
+# ``head_idx=12`` in :func:`_layer15_store_stack0_sp_byte0_addr_spec`) is
+# resolved through :data:`_L15_HEAD_LAYOUT_BY_NAME`, so byte-identity
+# with the legacy bake is preserved regardless of allocator order.
 #
 # Heads 0-11 are written by ``_set_layer15_memory_lookup`` in vm_step
 # (still imperative) and the suppress helper in this module
 # (also still imperative due to conditional num_heads logic). The
-# allocator pins them here so future structural reshuffles (LEV head
-# renumbering, additional load-side heads) can land via an
-# ``allocator.alloc(name, layer_idx=15)`` call without re-pinning. The
 # already-declarative ops ``layer15_store_stack0_sp_byte0_addr``,
 # ``layer15_si_mem_addr0_from_stack0``, and ``layer15_alu_high_byte_relay``
 # (the last one lives in ``l14_ops.py`` but writes to the L15 attention
 # block) resolve their head index by name from this table.
+#
+# Phase 7.B.6: the allocator now runs without ``pin=`` -- first-fit picks
+# 0..13 in declaration order, which matches the legacy layout bit-for-bit
+# because :data:`_L15_HEAD_LAYOUT` is contiguous and ordered. The
+# ``legacy_head_idx`` column is kept purely as documentation; the
+# load-bearing copy is :data:`_L15_HEAD_LAYOUT_BY_NAME`.
 _L15_HEAD_LAYOUT = (
-    # (op-name key,                                    pinned head_idx)
+    # (op-name key,                                    legacy_head_idx (docs only))
     ("layer15_memory_lookup.li_lc_stack0_h0",          0),  # head 0: LI/LC byte 0 + STACK0 pop dual-role
     ("layer15_memory_lookup.li_lc_stack0_h1",          1),  # head 1: LI/LC byte 1 (BYTE_INDEX_0 gate)
     ("layer15_memory_lookup.li_lc_stack0_h2",          2),  # head 2: LI/LC byte 2 (BYTE_INDEX_1 gate)
@@ -67,24 +70,26 @@ _L15_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L15_HEAD_LAYOU
 def _allocate_layer15_attention_heads() -> AttentionHeadAllocator:
     """Build a per-bake :class:`AttentionHeadAllocator` with all L15 heads.
 
-    Every entry in :data:`_L15_HEAD_LAYOUT` is pinned at its existing
-    ``head_idx`` so the underlying primitive calls -- which still write
-    the same weights to the same heads via the legacy imperative helpers
-    in vm_step (for the conditional LEV / pop-group heads that vary by
-    ``attn.num_heads``) plus the declarative specs already on store_stack0
-    / si_mem_addr0 / alu_high_byte_relay -- land byte-identically.
+    Phase 7.B.6: ``pin=`` is dropped from every entry. The allocator's
+    first-fit picks the lowest free head index in declaration order;
+    because :data:`_L15_HEAD_LAYOUT` is contiguous (0..13) and ordered,
+    first-fit reproduces the legacy ``head_idx`` values bit-for-bit.
+    The actual weight-write head indices are still looked up via
+    :data:`_L15_HEAD_LAYOUT_BY_NAME` inside the head-spec factories
+    below, so byte-identity with the legacy bake is preserved
+    regardless of allocator order.
 
     ``layer_max_heads=14`` is the widest L15 configuration the resize op
     produces (17-layer LEV build). Narrower builds simply leave the high
-    pins claimed-but-unused; the allocator never writes weights itself,
+    slots claimed-but-unused; the allocator never writes weights itself,
     it only records the layout for collision checks and downstream
     inspection. Stashed on ``attn._l15_head_allocator`` by both
     ``layer15_memory_lookup`` and ``l15_attention_resize`` bakes so
     downstream tooling can audit the layout.
     """
     allocator = AttentionHeadAllocator(layer_max_heads=14)
-    for name, head_idx in _L15_HEAD_LAYOUT:
-        allocator.alloc(name, layer_idx=15, pin=head_idx)
+    for name, _legacy_head_idx in _L15_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=15)
     return allocator
 
 
@@ -107,7 +112,7 @@ def _l15_head_idx(op_name: str) -> int:
         ) from None
 
 
-# === L15 FFN unit layout (pinned offsets) ===========================
+# === L15 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
 #
 # ``layer15_nibble_copy`` owns the entire L15 FFN. The actual weight
 # writes happen inside ``lower_l15_nibble_copy_ir`` (and the legacy
@@ -115,11 +120,14 @@ def _l15_head_idx(op_name: str) -> int:
 # ``unit = 0`` counter that walks 42 sub-stages: 16 LO nibble-copy units,
 # 16 HI nibble-copy units, 8 PSH stack-byte units, and 2 first-step LEA
 # units (see ``make_l15_nibble_copy_ir`` and ``make_l15_psh_stack_ir``).
-# Migration to :class:`FFNUnitAllocator` keeps the helper byte-identical
-# -- we just declare each sub-stage's range at its existing pinned offset
-# so the layout is auditable rather than implicit. Adding a new L15 op
-# family later will go through ``allocator.alloc(name, n)`` without a
-# pin, and the allocator will pick the first free gap past unit 42.
+#
+# Phase 7.B.6: every entry below is auto-placed by
+# :class:`FFNUnitAllocator` first-fit. Because the layout is fully
+# contiguous in declaration order, first-fit reproduces the legacy
+# pinned offsets bit-for-bit -- so byte-identity with the legacy
+# ``vm_step._set_nibble_copy_ffn`` helper and ``lower_l15_nibble_copy_ir``
+# unit-cursor survives the pin drop. The ``legacy_start`` column is
+# kept purely as documentation.
 #
 # The other L15-named ops in this module (``layer15_memory_lookup``,
 # ``layer15_alu_high_byte_relay`` -- which actually lives in
@@ -133,7 +141,7 @@ def _l15_head_idx(op_name: str) -> int:
 # 8 rules from ``make_l15_psh_stack_ir`` and the final 2 LEA rules.
 # Changing the rule list requires updating this table in lock-step.
 _L15_FFN_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     ("layer15_nibble_copy.nibble_copy_lo",         0, 16),  # OUTPUT_LO copy
     ("layer15_nibble_copy.nibble_copy_hi",        16, 16),  # OUTPUT_HI_THIS_STEP copy
     ("layer15_nibble_copy.psh_sp_byte1_lo_ff",    32,  1),  # PSH SP byte1 lo=0xf
@@ -152,21 +160,22 @@ _L15_FFN_UNIT_LAYOUT = (
 def _allocate_layer15_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L15 FFN sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the underlying
-    ``lower_l15_nibble_copy_ir`` call -- which writes via the IR
-    lowerer's monotonic ``unit = start_unit`` counter -- lands on
-    exactly the same hidden-unit indices it always has. This call is
-    byte-identical bookkeeping: the allocator declares ranges by name,
-    the lowerer writes the weights. A future refactor can split the
-    monolithic IR into per-range bake fragments that consume
-    ``allocator.alloc(...)`` directly.
+    Phase 7.B.6: ``pin=`` is dropped from every entry. The allocator's
+    default first-fit walks :data:`_L15_FFN_UNIT_LAYOUT` in declaration
+    order and lands each sub-stage at the lowest free gap large enough
+    to hold it. Because the layout is fully contiguous (every entry
+    starts exactly where the previous one ended), first-fit reproduces
+    the legacy pinned offsets bit-for-bit -- so byte-identity with
+    ``vm_step._set_nibble_copy_ffn`` and ``lower_l15_nibble_copy_ir``'s
+    own ``unit = start_unit`` cursor is preserved without the author
+    having to spell out the offsets.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L15 op claims a free range past unit 42).
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L15_FFN_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L15_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
