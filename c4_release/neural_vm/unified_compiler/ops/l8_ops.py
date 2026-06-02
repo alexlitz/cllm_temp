@@ -746,6 +746,60 @@ def _layer8_alu_ent_adj_defaults_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_lev_byte0_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV BP byte 0 lo nibble relay (16 units, offsets 1987..2002).
+
+    For L15 to read memory at BP and BP+8, BP's address value must be
+    encoded in ADDR_B0/B1/B2 dims at the BP marker position. This
+    substage relays OUTPUT_LO[k] -> ADDR_B0_LO[k] at MARK_BP when
+    OP_LEV is active (gated on OUTPUT_LO[k]). MARK_PC blocker
+    (-S * 10) excludes the PC marker where OP_LEV is amplified ~10.
+    """
+    write_scale = 2.0 / (S * 9.0)
+    rules = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l8_alu_lev_byte0_lo_k{k}",
+            conditions=(
+                ("OP_LEV", 1.0),
+                ("MARK_BP", 1.0),
+                ("MARK_PC", -10.0),
+            ),
+            threshold=1.5,
+            gate=f"OUTPUT_LO+{k}",
+            writes=((f"ADDR_B0_LO+{k}", write_scale),),
+            scope="OP_LEV and MARK_BP and not MARK_PC",
+            dominates_at={
+                f"ADDR_B0_LO+{k}": "OP_LEV and MARK_BP and not MARK_PC",
+            },
+        ))
+    return tuple(rules)
+
+
+def _layer8_alu_lev_byte0_hi_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV BP byte 0 hi nibble relay (16 units, offsets 2003..2018)."""
+
+    write_scale = 2.0 / (S * 9.0)
+    rules = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l8_alu_lev_byte0_hi_k{k}",
+            conditions=(
+                ("OP_LEV", 1.0),
+                ("MARK_BP", 1.0),
+                ("MARK_PC", -10.0),
+            ),
+            threshold=1.5,
+            gate=f"OUTPUT_HI+{k}",
+            writes=((f"ADDR_B0_HI+{k}", write_scale),),
+            scope="OP_LEV and MARK_BP and not MARK_PC",
+            dominates_at={
+                f"ADDR_B0_HI+{k}": "OP_LEV and MARK_BP and not MARK_PC",
+            },
+        ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
