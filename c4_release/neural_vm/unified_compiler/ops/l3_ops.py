@@ -1176,7 +1176,6 @@ def make_layer3_carry_forward_attn_op() -> Operation:
 
     return Operation(
         name="layer3_carry_forward_attn",
-        phase=3,
         # Phase 8.A: OP_LEV_PREV_STEP marks head 6 (_lev_bp_to_pc_head_spec)
         # gating on OP_LEV as cross-step relative to L5 opcode_decode_ffn
         # (the OP_LEV writer). The head's Q[0]+=OP_LEV*L/5 still resolves
