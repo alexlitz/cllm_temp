@@ -136,6 +136,647 @@ def make_io_putchar_routing_op() -> Operation:
     )
 
 
+_FUNCTION_CALL_L6_FFN_START_UNIT = 1700
+
+
+def _function_call_blank_rule(name: str) -> FFNRule:
+    """Reserved no-op FFN unit matching the legacy unit-cursor advance.
+
+    The legacy ``_set_function_call_weights`` increments its hidden-unit
+    cursor past several reserved bands without writing weights (see the
+    ``# Units 852-881 unused (reserved)`` and ``# Reserve 128 units``
+    comments in vm_step.py). To replay the same layout through a single
+    declarative lower we emit one no-op :class:`FFNRule` per reserved
+    unit. Lowering matches a zero-initialised PureFFN row byte-for-byte:
+
+      * ``conditions=()`` -> ``W_up[u, :] = 0``
+      * ``threshold=0.0`` -> ``b_up[u] = -S * 0 = 0``
+      * ``gate=None`` and ``gate_bias=0.0`` -> ``b_gate[u] = 0``
+      * ``writes=()`` -> ``W_down[:, u] = 0``
+
+    Mirrors ``l5_ops._opcode_decode_jsr_temp0_blank_rule`` (the same
+    pattern is used by ``opcode_decode_ffn`` for its unit-52 blank).
+    """
+    return FFNRule(
+        conditions=(),
+        threshold=0.0,
+        writes=(),
+        gate=None,
+        gate_bias=0.0,
+        name=name,
+    )
+
+
+def _function_call_lea_first_step_alu_init_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEA first-step ALU init: initialise ALU_LO[0]/ALU_HI[0] (2 units).
+
+    For the LEA first step (``OP_LEA + MARK_AX + NOT HAS_SE``) the ALU is
+    seeded with ``BP_default = 0x00010000`` (byte 0 = 0x00). The HAS_SE
+    blocker (-10*S) must dominate OP_LEA's strong +5 amplification on
+    later steps so the seed only fires on the first step.
+    """
+    write_scale = 2.0 / S
+    conditions = (
+        ("OP_LEA", 1.0),
+        ("MARK_AX", 1.0),
+        ("HAS_SE", -10.0),
+    )
+    return (
+        FFNRule.constant_write(
+            name="lea_first_step_alu_lo_init",
+            conditions=conditions,
+            threshold=1.5,
+            writes=(("ALU_LO+0", write_scale),),
+        ),
+        FFNRule.constant_write(
+            name="lea_first_step_alu_hi_init",
+            conditions=conditions,
+            threshold=1.5,
+            writes=(("ALU_HI+0", write_scale),),
+        ),
+    )
+
+
+def _function_call_jsr_stack0_marker_rules(S: float) -> tuple[FFNRule, ...]:
+    """JSR STACK0 marker writeback: return_addr -> OUTPUT (34 units).
+
+    Layout (matches the legacy bake at vm_step.py ~8639+):
+
+      * 2 cancel-L3-default units (LO, HI): gate=CONST so the gate is
+        always 1.0; writes OUTPUT_LO[0] / OUTPUT_HI[0] by -2.0/S to
+        counteract L3's default OUTPUT_LO[0]=1 baseline. CMP[4]=2
+        (the JSR relay marker) + MARK_STACK0 fires only at STACK0.
+      * 16+16 AX_CARRY -> OUTPUT writeback units (LO band, HI band):
+        gated_write with gate_terms (-EMBED_*[k] + AX_CARRY_*[k]) so the
+        unit fires only when AX_CARRY != EMBED at byte k.
+
+    The strong negative MARK_PC / MARK_AX / IS_BYTE blockers (-10*S each)
+    confine firing to the actual MARK_STACK0 position; without them the
+    CMP[4]=2 leak via L6 head 4 (BZ/BNZ relay) would corrupt PC on
+    branch steps. See vm_step.py:8645-8650 for the full failure-mode note.
+    """
+    T_jsr_s0 = 1.5
+    JSR_S0_BLOCK = -10.0
+    write_scale_cancel = -2.0 / S
+    write_scale_writeback = 2.0 / S
+    conditions = (
+        ("CMP+4", 1.0),
+        ("MARK_STACK0", 1.0),
+        ("MARK_PC", JSR_S0_BLOCK),
+        ("MARK_AX", JSR_S0_BLOCK),
+        ("IS_BYTE", JSR_S0_BLOCK),
+    )
+
+    rules: list[FFNRule] = [
+        # Cancel L3 default OUTPUT_LO[0]. The legacy bake implements the
+        # always-on gate as ``W_gate[unit, CONST] = 1.0`` (not as a
+        # ``b_gate = 1.0`` bias) so the gate value at any position with
+        # ``CONST=1`` (every position) is 1.0. ``gated_write`` with
+        # ``gate="CONST"`` reproduces that cell layout exactly.
+        FFNRule.gated_write(
+            name="jsr_stack0_cancel_l3_default_lo",
+            conditions=conditions,
+            threshold=T_jsr_s0,
+            gate="CONST",
+            writes=(("OUTPUT_LO+0", write_scale_cancel),),
+        ),
+        FFNRule.gated_write(
+            name="jsr_stack0_cancel_l3_default_hi",
+            conditions=conditions,
+            threshold=T_jsr_s0,
+            gate="CONST",
+            writes=(("OUTPUT_HI+0", write_scale_cancel),),
+        ),
+    ]
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"jsr_stack0_writeback_lo_{k}",
+            conditions=conditions,
+            threshold=T_jsr_s0,
+            gate_terms=(
+                (f"EMBED_LO+{k}", -1.0),
+                (f"AX_CARRY_LO+{k}", 1.0),
+            ),
+            writes=((f"OUTPUT_LO+{k}", write_scale_writeback),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"jsr_stack0_writeback_hi_{k}",
+            conditions=conditions,
+            threshold=T_jsr_s0,
+            gate_terms=(
+                (f"EMBED_HI+{k}", -1.0),
+                (f"AX_CARRY_HI+{k}", 1.0),
+            ),
+            writes=((f"OUTPUT_HI+{k}", write_scale_writeback),),
+        ))
+    return tuple(rules)
+
+
+def _function_call_jsr_pc_override_conditions() -> tuple[tuple[str, float], ...]:
+    """Common up-branch conditions for the JSR PC override band.
+
+    Gates on MARK_PC + TEMP[0] (IS_JSR flag relayed by L6 head 3), with
+    strong negative blockers for every other opcode (NOP, EXIT, JMP, BZ,
+    BNZ, IMM, LEV, ENT) to prevent spurious firing on non-JSR steps
+    where TEMP[0] is polluted by L6 head 4 (BZ/BNZ relay). IS_BYTE
+    blocker confines to the PC marker position.
+    """
+    return (
+        ("MARK_PC", 1.0),
+        ("TEMP+0", 1.0),
+        ("OP_NOP", -4.0),
+        ("OP_EXIT", -4.0),
+        ("OP_JMP", -4.0),
+        ("OP_BZ", -4.0),
+        ("OP_BNZ", -4.0),
+        ("OP_IMM", -4.0),
+        ("OP_LEV", -4.0),
+        ("OP_ENT", -4.0),
+        ("IS_BYTE", -10.0),
+    )
+
+
+def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """JSR PC override: cancel OUTPUT (PC+5) + materialize target (80 units).
+
+    Layout (matches vm_step.py ~8718+):
+
+      * 16 OUTPUT_LO cancel units: gate=-OUTPUT_LO[k], writes OUTPUT_LO[k]
+      * 16 OUTPUT_HI cancel units: gate=-OUTPUT_HI[k], writes OUTPUT_HI[k]
+      * 16 FETCH_LO -> OUTPUT_LO[target_lo] target units
+      * 16 FETCH_HI reserved gate units (no writes; legacy reservation
+        for targets >= 256 that would need a FETCH_HI byte path)
+      * 16 FETCH_LO -> OUTPUT_HI[target_hi_from_lo] carry units
+
+    All units share the same conditions (MARK_PC + TEMP[0] + opcode
+    blockers + IS_BYTE blocker). The reserved FETCH_HI block keeps the
+    unit cursor aligned with the legacy layout.
+    """
+    from ...constants import INSTR_WIDTH, PC_OFFSET
+
+    T_jsr_pc = 4.0
+    write_scale = 2.0 / S
+    conditions = _function_call_jsr_pc_override_conditions()
+
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"jsr_pc_cancel_output_lo_{k}",
+            conditions=conditions,
+            threshold=T_jsr_pc,
+            gate=f"OUTPUT_LO+{k}",
+            gate_weight=-1.0,
+            writes=((f"OUTPUT_LO+{k}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"jsr_pc_cancel_output_hi_{k}",
+            conditions=conditions,
+            threshold=T_jsr_pc,
+            gate=f"OUTPUT_HI+{k}",
+            gate_weight=-1.0,
+            writes=((f"OUTPUT_HI+{k}", write_scale),),
+        ))
+    for k in range(16):
+        target_lo = ((k * INSTR_WIDTH) + PC_OFFSET) & 0xF
+        rules.append(FFNRule.gated_write(
+            name=f"jsr_pc_target_lo_{k}",
+            conditions=conditions,
+            threshold=T_jsr_pc,
+            gate=f"FETCH_LO+{k}",
+            writes=((f"OUTPUT_LO+{target_lo}", write_scale),),
+        ))
+    # FETCH_HI reserved band: gate is wired but no down write. Legacy
+    # bake writes ``ffn6.W_gate[unit, FETCH_HI+k] = 1.0`` and no down
+    # assignment because JSR fixtures target instruction indexes < 16.
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"jsr_pc_fetch_hi_reserved_{k}",
+            conditions=conditions,
+            threshold=T_jsr_pc,
+            gate=f"FETCH_HI+{k}",
+            writes=(),
+        ))
+    for k in range(16):
+        target_hi_from_lo = ((k * INSTR_WIDTH) + PC_OFFSET) >> 4
+        rules.append(FFNRule.gated_write(
+            name=f"jsr_pc_target_hi_from_lo_{k}",
+            conditions=conditions,
+            threshold=T_jsr_pc,
+            gate=f"FETCH_LO+{k}",
+            writes=((f"OUTPUT_HI+{target_hi_from_lo}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _function_call_jsr_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
+    """JSR AX passthrough: AX_CARRY -> OUTPUT at AX marker (32 units)."""
+    T = 4.0
+    write_scale = 2.0 / S
+    conditions = (("OP_JSR", 1.0), ("MARK_AX", 1.0))
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"jsr_ax_passthrough_lo_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"jsr_ax_passthrough_hi_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _function_call_ent_stack0_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT STACK0 = old_BP at STACK0 marker (32 units).
+
+    At STACK0 marker when ENT (CMP[2]=1, MARK_STACK0=1): cancel EMBED
+    identity (gate_terms[EMBED_*+k]=-1) and write TEMP (= old BP relayed
+    by L5 head 5 above). L6 attn head 6 broadcasts OP_ENT through CMP[2]
+    (see ``layer6_relay_heads_bake``), which is what these rules gate on.
+    """
+    T_ent_s0 = 1.5
+    write_scale = 2.0 / S
+    conditions = (("CMP+2", 1.0), ("MARK_STACK0", 1.0))
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"ent_stack0_lo_{k}",
+            conditions=conditions,
+            threshold=T_ent_s0,
+            gate_terms=(
+                (f"EMBED_LO+{k}", -1.0),
+                (f"TEMP+{k}", 1.0),
+            ),
+            writes=((f"OUTPUT_LO+{k}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"ent_stack0_hi_{k}",
+            conditions=conditions,
+            threshold=T_ent_s0,
+            gate_terms=(
+                (f"EMBED_HI+{k}", -1.0),
+                (f"TEMP+{16 + k}", 1.0),
+            ),
+            writes=((f"OUTPUT_HI+{k}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _function_call_ent_bp_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT BP = SP - 8 at BP marker (32 units).
+
+    Each LO unit writes ``OUTPUT_LO[new_k] += 2/S`` AND
+    ``OUTPUT_LO[k] -= 2/S`` (cancels identity at source). new_k =
+    (k - 8) % 16. Each HI unit writes the borrowed-down high nibble
+    (new_k_borrow = (k - 1) % 16) and cancels identity at k.
+
+    Borrow detection: when ``old SP lo < 8`` (TEMP[8..15] not hot) the
+    HI unit must NOT fire on the borrow path. The legacy bake adds
+    ``ffn6.W_up[unit, BD.TEMP + lo_bit] = -S`` for lo_bit in 8..15 on
+    HI units only; mirrored here via the ``borrow_blockers`` term set.
+    """
+    T_ent_bp = 1.5
+    write_scale = 2.0 / S
+    base_conditions = (
+        ("CMP+2", 1.0),
+        ("MARK_BP", 1.0),
+    )
+    borrow_blockers = tuple(
+        (f"TEMP+{lo_bit}", -1.0) for lo_bit in range(8, 16)
+    )
+
+    rules: list[FFNRule] = []
+    for k in range(16):
+        new_k = (k - 8) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"ent_bp_lo_{k}",
+            conditions=base_conditions,
+            threshold=T_ent_bp,
+            gate=f"TEMP+{k}",
+            writes=(
+                (f"OUTPUT_LO+{new_k}", write_scale),
+                (f"OUTPUT_LO+{k}", -write_scale),
+            ),
+        ))
+    for k in range(16):
+        new_k_borrow = (k - 1) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"ent_bp_hi_{k}",
+            conditions=base_conditions + borrow_blockers,
+            threshold=T_ent_bp,
+            gate=f"TEMP+{16 + k}",
+            writes=(
+                (f"OUTPUT_HI+{new_k_borrow}", write_scale),
+                (f"OUTPUT_HI+{k}", -write_scale),
+            ),
+        ))
+    return tuple(rules)
+
+
+def _function_call_ent_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT AX passthrough: AX_CARRY -> OUTPUT at AX marker (32 units)."""
+    T = 4.0
+    write_scale = 2.0 / S
+    conditions = (("OP_ENT", 1.0), ("MARK_AX", 1.0))
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"ent_ax_passthrough_lo_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"ent_ax_passthrough_hi_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _function_call_lev_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV AX passthrough at AX marker (32 units).
+
+    MARK_PC -15*S blocker prevents firing at PC marker (OP_LEV gets
+    amplified to ~10 by L6 attention; without it units would fire at PC).
+    IS_BYTE -10*S blocker prevents firing at AX byte positions where
+    OP_LEV ~7.5 alone would clear T=4.
+    """
+    T = 4.0
+    write_scale = 2.0 / S
+    conditions = (
+        ("OP_LEV", 1.0),
+        ("MARK_AX", 1.0),
+        ("MARK_PC", -15.0),
+        ("IS_BYTE", -10.0),
+    )
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"lev_ax_passthrough_lo_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"lev_ax_passthrough_hi_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _function_call_lev_ax_byte_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV AX byte: AX_CARRY -> OUTPUT at AX byte positions (32 units).
+
+    3-way AND ``OP_LEV + IS_BYTE + H1[AX_IDX]`` with T=9 fires only at
+    byte positions inside the AX region. The marker-position units above
+    are blocked at byte positions; these byte-position units fill in
+    the gap so AX_CARRY propagates onto OUTPUT at AX byte positions
+    during LEV. See vm_step.py:8925-8953 for the gating analysis.
+    """
+    T_byte = 9.0
+    AX_IDX = 1
+    write_scale = 2.0 / S
+    conditions = (
+        ("OP_LEV", 1.0),
+        ("IS_BYTE", 1.0),
+        (f"H1+{AX_IDX}", 1.0),
+        ("MARK_AX", -15.0),
+    )
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"lev_ax_byte_lo_{k}",
+            conditions=conditions,
+            threshold=T_byte,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", write_scale),),
+        ))
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"lev_ax_byte_hi_{k}",
+            conditions=conditions,
+            threshold=T_byte,
+            gate=f"AX_CARRY_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _function_call_l6_ffn_rules(S: float) -> tuple[FFNRule, ...]:
+    """Full ordered :class:`FFNRule` sequence for function_call_weights' L6 FFN.
+
+    Matches the 594-unit layout in the legacy ``_set_function_call_weights``
+    (vm_step.py:8602-8953):
+
+      * units 1700..1701  - LEA first-step ALU init (2 units)
+      * units 1702..1731  - reserved (30 blank units)
+      * units 1732..1859  - JSR SP -= 8 reserved (128 blank units; moved to L7)
+      * units 1860..1893  - JSR STACK0 marker writeback (34 units)
+      * units 1894..2021  - JSR STACK0 bytes 0-3 reserved (128 blank units)
+      * units 2022..2101  - JSR PC override (80 units; 16+16 cancel +
+                            16 LO target + 16 FETCH_HI reserved + 16 HI carry)
+      * units 2102..2133  - JSR AX passthrough (32 units)
+      * units 2134..2165  - ENT STACK0 = old_BP (32 units)
+      * units 2166..2197  - ENT BP = SP - 8 (32 units)
+      * units 2198..2229  - ENT AX passthrough (32 units)
+      * units 2230..2261  - LEV AX passthrough at AX marker (32 units)
+      * units 2262..2293  - LEV AX byte positions (32 units)
+
+    Total: 594 rules. End cursor (start_unit=1700 + 594) = 2294, matching
+    ``Operation.ffn_units_used``.
+
+    The reserved bands are emitted as no-op :func:`_function_call_blank_rule`
+    placeholders so the lower_ffn cursor walks the same unit numbers the
+    legacy helper used. ``right_size_ffns`` correctly prunes them because
+    every weight column / row remains all-zero.
+    """
+    rules: list[FFNRule] = []
+
+    rules.extend(_function_call_lea_first_step_alu_init_rules(S))
+    rules.extend(
+        _function_call_blank_rule(f"lea_reserved_{i}")
+        for i in range(30)
+    )
+    rules.extend(
+        _function_call_blank_rule(f"jsr_sp_dec_reserved_{i}")
+        for i in range(128)
+    )
+    rules.extend(_function_call_jsr_stack0_marker_rules(S))
+    rules.extend(
+        _function_call_blank_rule(f"jsr_stack0_bytes_reserved_{i}")
+        for i in range(128)
+    )
+    rules.extend(_function_call_jsr_pc_override_rules(S))
+    rules.extend(_function_call_jsr_ax_passthrough_rules(S))
+    rules.extend(_function_call_ent_stack0_rules(S))
+    rules.extend(_function_call_ent_bp_rules(S))
+    rules.extend(_function_call_ent_ax_passthrough_rules(S))
+    rules.extend(_function_call_lev_ax_passthrough_rules(S))
+    rules.extend(_function_call_lev_ax_byte_rules(S))
+
+    return tuple(rules)
+
+
+def _function_call_l5_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Declarative L5 attention specs for the ENT relay heads (5, 6).
+
+    Mirrors the imperative L5 section of ``_set_function_call_weights``
+    bit-for-bit (vm_step.py ~8520-8563):
+
+      * Head 5 (BP EMBED -> TEMP at STACK0): relays the caller's BP
+        value into TEMP[0..31] at MARK_STACK0 positions so the L6 FFN
+        ``ent_stack0_*`` band writes it onto OUTPUT during ENT.
+      * Head 6 (SP EMBED -> TEMP at BP): relays the caller's SP value
+        into TEMP[0..31] at MARK_BP positions so the L6 FFN ``ent_bp_*``
+        band can compute ``new_BP = old_SP - 8``. Head 6 additionally
+        carries an OP_ENT-only firing gate at slot 34 so the TEMP band
+        is only populated on ENT steps.
+
+    Slot layout (HD=64):
+      slot 0       : main Q/K gather (marker x marker)
+      slot 1..16   : V[EMBED_LO+k] -> O[TEMP+k]      (low nibble band)
+      slot 17..32  : V[EMBED_HI+k] -> O[TEMP+16+k]   (high nibble band)
+      slot 33      : anti-leakage gate (Q[marker]=500, Q[CONST]=-500,
+                     K[CONST]=5) so the head only fires at the target
+                     marker positions
+      slot 34      : (head 6 only) OP_ENT firing gate
+    """
+    L5 = 20.0
+
+    def _band_v(slot_base: int, dim_base: int):
+        return tuple(AP(slot_base + k, dim_base + k, 1.0) for k in range(16))
+
+    def _band_o(dim_base: int, slot_base: int):
+        return tuple(AO(dim_base + k, slot_base + k, 1.0) for k in range(16))
+
+    head5 = DeclarativeAttentionHeadSpec(
+        head_idx=5,
+        q=(
+            AP(0, BD.MARK_STACK0, L5),
+            AP(33, BD.MARK_STACK0, 500.0),
+            AP(33, BD.CONST, -500.0),
+        ),
+        k=(
+            AP(0, BD.MARK_BP, L5),
+            AP(33, BD.CONST, 5.0),
+        ),
+        v=_band_v(1, BD.EMBED_LO) + _band_v(17, BD.EMBED_HI),
+        o=_band_o(BD.TEMP, 1) + _band_o(BD.TEMP + 16, 17),
+    )
+
+    head6 = DeclarativeAttentionHeadSpec(
+        head_idx=6,
+        q=(
+            AP(0, BD.MARK_BP, L5),
+            AP(33, BD.MARK_BP, 500.0),
+            AP(33, BD.CONST, -500.0),
+            AP(34, BD.OP_ENT, 500.0),
+            AP(34, BD.CONST, -500.0),
+        ),
+        k=(
+            AP(0, BD.MARK_SP, L5),
+            AP(33, BD.CONST, 5.0),
+            AP(34, BD.CONST, 5.0),
+        ),
+        v=_band_v(1, BD.EMBED_LO) + _band_v(17, BD.EMBED_HI),
+        o=_band_o(BD.TEMP, 1) + _band_o(BD.TEMP + 16, 17),
+    )
+
+    return (head5, head6)
+
+
+def _function_call_l6_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L6 attention spec for the JSR PC OUTPUT -> AX_CARRY relay.
+
+    Mirrors the imperative L6 section of ``_set_function_call_weights``
+    bit-for-bit (vm_step.py ~8585-8600). Copies the previous PC's OUTPUT
+    (PC+INSTR_WIDTH from L3, the return address) into AX_CARRY at the
+    MARK_STACK0 position so the L6 FFN ``jsr_stack0_*`` band can write
+    it onto OUTPUT during JSR.
+
+    Slot layout (HD=64):
+      slot 0       : Q[MARK_STACK0]=+1050 (strong); Q[MARK_AX]=-50
+                     (block at AX); Q[CONST]=-1000 (baseline
+                     suppression). K[MARK_PC]=30 (positive at PC).
+                     K[OP_JSR]=-20 fires only on JSR (the OP_JSR relay
+                     at MARK_AX ~5.0), canceling AX's K for JSR while
+                     preserving AX's K for PSH (head 7 is shared).
+      slot 1..16   : V[OUTPUT_LO+k] -> O[AX_CARRY_LO+k] (low nibble)
+      slot 17..32  : V[OUTPUT_HI+k] -> O[AX_CARRY_HI+k] (high nibble)
+
+    Phase ordering: ``layer6_relay_heads_bake`` (998.6) OVERWRITES
+    Q[MARK_STACK0] with 50 so PSH semantics win. Both bakes write the
+    same slot-0 cells; relay_heads's later write replaces this one's.
+    See ``make_layer6_relay_heads_bake_op`` docstring for ordering notes.
+    """
+    L6 = 50.0
+    return DeclarativeAttentionHeadSpec(
+        head_idx=7,
+        q=(
+            AP(0, BD.MARK_STACK0, L6 + L6 * 20),
+            AP(0, BD.MARK_AX, -L6),
+            AP(0, BD.CONST, -L6 * 20),
+        ),
+        k=(
+            AP(0, BD.MARK_PC, 30.0),
+            AP(0, BD.OP_JSR, -20.0),
+        ),
+        v=(
+            tuple(AP(1 + k, BD.OUTPUT_LO + k, 1.0) for k in range(16))
+            + tuple(AP(17 + k, BD.OUTPUT_HI + k, 1.0) for k in range(16))
+        ),
+        o=(
+            tuple(AO(BD.AX_CARRY_LO + k, 1 + k, 1.0) for k in range(16))
+            + tuple(AO(BD.AX_CARRY_HI + k, 17 + k, 1.0) for k in range(16))
+        ),
+    )
+
+
+def _function_call_weights_ir(dim_positions, HD) -> CompilerIR:
+    """Informational :class:`CompilerIR` for ``function_call_weights``.
+
+    Carries the L5 H5/H6 + L6 H7 attention specs plus the L6 FFN rule
+    list so the declarative verifier, scope checker, symbolic-tools, and
+    static census see the same writes the bake produces. The actual bake
+    writes to three blocks (L5 attn, L6 attn, L6 FFN); the generic
+    ``_dispatch_operation_ir`` only handles single-target kinds, so this
+    IR is informational only (the imperative bake_fn lowers it via per-
+    block ``Primitives`` calls).
+
+    Mirrors the ``compiler_ir_factory`` convention used by
+    ``layer6_attn_bake`` / ``layer6_relay_heads_bake`` for model-level
+    multi-block bakes.
+    """
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    for spec in _function_call_l5_head_specs(proxy):
+        ir.layer(0).attention.append(spec)
+    ir.layer(0).attention.append(_function_call_l6_head_spec(proxy))
+    ir.layer(0).ffn.rules.extend(_function_call_l6_ffn_rules(100.0))
+    return ir
+
+
 def make_function_call_weights_op() -> Operation:
     """Bake function-call opcode weights (JSR, ENT, LEV, LEA).
 
@@ -149,13 +790,46 @@ def make_function_call_weights_op() -> Operation:
     we program (1700-2158) are present when `_right_size_ffns` (called at the
     end of legacy_bake) prunes dead units. Running at phase > 999 would write
     into already-rightsized FFN slots that no longer exist (IndexError).
+
+    Phase 8.C.2 migration (2026-06-02): the imperative
+    ``_set_function_call_weights`` helper is replaced by
+    :class:`DeclarativeAttentionHeadSpec` lowering for L5 H5/H6 + L6 H7
+    plus 594 :class:`FFNRule`s (~13 rule families + 286 blank-unit
+    reservations) for the L6 FFN routing band (units 1700..2293). The
+    bake_fn drives every write through
+    :meth:`Primitives.generate_attention_head` and
+    :meth:`Primitives.lower_ffn_rules`; ``compiler_ir_factory`` exposes
+    the same specs to the declarative verifier and symbolic tools.
+    Byte-identical to the legacy helper.
     """
     def bake(model, dim_positions, S):
-        from ...vm_step import _set_function_call_weights
         proxy = _as_setdim_proxy(dim_positions)
         attn5 = model.blocks[5].attn
+        attn6 = model.blocks[6].attn
+        ffn6 = model.blocks[6].ffn
         HD = attn5.W_q.shape[0] // attn5.num_heads
-        _set_function_call_weights(model, S, proxy, HD)
+
+        # L5 attention: ENT relay heads (5 BP->TEMP, 6 SP->TEMP).
+        Primitives.generate_attention_heads(
+            attn5, _function_call_l5_head_specs(proxy), HD,
+        )
+        # L6 attention: JSR PC OUTPUT->AX_CARRY relay (head 7).
+        Primitives.generate_attention_head(
+            attn6, _function_call_l6_head_spec(proxy), HD,
+        )
+        # L6 FFN: LEA / JSR / ENT / LEV output routing (units 1700..2293).
+        rules = _function_call_l6_ffn_rules(S)
+        dim_positions_for_rules = Primitives.dim_positions_from_bd(
+            proxy,
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(
+            ffn6,
+            rules,
+            dim_positions_for_rules,
+            start_unit=_FUNCTION_CALL_L6_FFN_START_UNIT,
+            S=S,
+        )
 
     # Dim-ownership claims (see c4_release/docs/DIM_OWNERSHIP_REGISTRY.md).
     # `_set_function_call_weights` programs three ENT/JSR relay attention
@@ -219,6 +893,7 @@ def make_function_call_weights_op() -> Operation:
         writes=set(),
         kind="model",
         declarative_bake_fn=bake,
+        compiler_ir_factory=_function_call_weights_ir,
         declarative_authority="spec_generated",
         phase=998,
         migrated=True,
