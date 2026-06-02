@@ -38,7 +38,17 @@ Design choices:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
+
+
+# Strategy modes for :class:`Allocator`. ``"pinned"`` (default) preserves
+# the byte-identity contract: ``pin=`` is mandatory for migrated dims
+# and a collision is a hard error. ``"dynamic_first_fit"`` relaxes the
+# pin to a HINT — if the pinned range is free the allocator honors it
+# (so trained weights stay in place where possible); otherwise it falls
+# back to a first-fit gap and records the collision for migration
+# auditing. Phase 7.B uses the dynamic mode to drop pins corpus-wide.
+AllocStrategy = Literal["pinned", "dynamic_first_fit"]
 
 
 # Default pool width — matches DimRegistry(d_model=512) used by the
@@ -100,10 +110,21 @@ class Allocator:
     past ~100 dims.
     """
 
-    def __init__(self, d_model: int = DEFAULT_POOL_WIDTH):
+    def __init__(
+        self,
+        d_model: int = DEFAULT_POOL_WIDTH,
+        *,
+        strategy: AllocStrategy = "pinned",
+    ):
         if d_model <= 0:
             raise AllocatorError(f"d_model must be positive (got {d_model})")
+        if strategy not in ("pinned", "dynamic_first_fit"):
+            raise AllocatorError(
+                f"strategy must be 'pinned' or 'dynamic_first_fit' "
+                f"(got {strategy!r})"
+            )
         self.d_model: int = int(d_model)
+        self._strategy: AllocStrategy = strategy
         # Insertion-ordered list; used as the source of truth when
         # rebuilding a DimRegistry from this allocator.
         self._slots: List[AllocatedSlot] = []
@@ -115,6 +136,12 @@ class Allocator:
         # blocked — matches the static registry's behaviour where aliases
         # share underlying bytes with their parent slot.
         self._claimed: set[int] = set()
+        # Migration audit: every (name, requested_pin, actual_start) where
+        # the caller provided a pin that the allocator could NOT honor
+        # under ``"dynamic_first_fit"`` (collision) and had to first-fit
+        # elsewhere. Empty in ``"pinned"`` mode because a colliding pin
+        # is a hard error there.
+        self._pin_collisions: List[Tuple[str, int, int]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -163,16 +190,37 @@ class Allocator:
                 )
             overlap_hit = self._collision(pin, size)
             if overlap_hit is not None and not allow_overlap:
-                other = overlap_hit
-                raise AllocatorError(
-                    f"alloc({name!r}): pinned range "
-                    f"[{pin}, {pin + size}) collides with "
-                    f"{other.name!r} at [{other.start}, {other.end}); "
-                    f"pass allow_overlap=True if the alias is intentional"
-                )
-            start = pin
-            pinned = True
-            overlap = allow_overlap and (overlap_hit is not None)
+                # In ``"dynamic_first_fit"`` mode the pin is a HINT —
+                # a collision triggers a first-fit fallback instead of
+                # erroring. ``allow_overlap=True`` (explicit aliases)
+                # still takes precedence so byte-identity migration
+                # keeps working alongside the relaxed pinning.
+                if self._strategy == "dynamic_first_fit":
+                    found = self._find_free(size)
+                    if found is None:
+                        raise AllocatorError(
+                            f"alloc({name!r}): pin hint {pin} collides with "
+                            f"{overlap_hit.name!r} and no free gap of size "
+                            f"{size} remains in pool of width {self.d_model} "
+                            f"(used={self._used_bytes()}, "
+                            f"free_pool={self.free_pool()})"
+                        )
+                    self._pin_collisions.append((name, pin, found))
+                    start = found
+                    pinned = False
+                    overlap = False
+                else:
+                    other = overlap_hit
+                    raise AllocatorError(
+                        f"alloc({name!r}): pinned range "
+                        f"[{pin}, {pin + size}) collides with "
+                        f"{other.name!r} at [{other.start}, {other.end}); "
+                        f"pass allow_overlap=True if the alias is intentional"
+                    )
+            else:
+                start = pin
+                pinned = True
+                overlap = allow_overlap and (overlap_hit is not None)
         else:
             # ---- auto-placed path ----
             if allow_overlap:
@@ -234,6 +282,51 @@ class Allocator:
     def slots(self) -> List[AllocatedSlot]:
         """Return a shallow copy of all allocations in insertion order."""
         return list(self._slots)
+
+    @property
+    def strategy(self) -> AllocStrategy:
+        """Current allocation strategy. Read-only; use
+        :meth:`set_strategy` to switch modes mid-stream."""
+        return self._strategy
+
+    def set_strategy(self, strategy: AllocStrategy) -> None:
+        """Switch allocation mode in place.
+
+        Used by the Phase 7.B compile pass to flip a freshly-constructed
+        allocator from the default ``"pinned"`` (byte-identity) mode
+        into ``"dynamic_first_fit"`` (pins-are-hints) before any
+        allocations happen. Mid-stream switching is permitted — already-
+        recorded slots keep their starts; only subsequent
+        :meth:`alloc` calls observe the new mode.
+        """
+        if strategy not in ("pinned", "dynamic_first_fit"):
+            raise AllocatorError(
+                f"set_strategy(): strategy must be 'pinned' or "
+                f"'dynamic_first_fit' (got {strategy!r})"
+            )
+        self._strategy = strategy
+
+    def evict_pin_hints(self) -> List[Tuple[str, int]]:
+        """Return ``(name, start)`` for every slot that actually landed
+        at its caller-provided ``pin=``.
+
+        Migration-auditing helper: the Phase 7.B compile pass uses this
+        output to track which dims are still relying on hand-picked
+        offsets after the strategy switch. Anything that turns up here
+        in ``"dynamic_first_fit"`` mode is a candidate for pin removal.
+        """
+        return [(s.name, s.start) for s in self._slots if s.pinned]
+
+    def pin_collisions(self) -> List[Tuple[str, int, int]]:
+        """Return ``(name, requested_pin, actual_start)`` for every pin
+        hint that could NOT be honored under ``"dynamic_first_fit"``.
+
+        Empty list in ``"pinned"`` mode (a colliding pin is a hard error
+        there). The Phase 7.B reporter surfaces this list so the operator
+        can see which dims need their pins relaxed before the allocator
+        can fold them into a smaller layout.
+        """
+        return list(self._pin_collisions)
 
     def to_registry(self):
         """Materialise a :class:`DimRegistry` from current allocations.
@@ -297,6 +390,7 @@ class Allocator:
 
 
 __all__ = [
+    "AllocStrategy",
     "AllocatedSlot",
     "Allocator",
     "AllocatorError",
