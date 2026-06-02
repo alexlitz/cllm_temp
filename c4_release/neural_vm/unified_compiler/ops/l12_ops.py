@@ -164,7 +164,6 @@ def make_layer12_ffn_dep_anchor_op() -> Operation:
         # writes (phase=11) and the L12 MUL combine (phase=12). Reads
         # include TEMP (written by L11 MUL partial) so the dep graph
         # earliest-fit lands at L12.
-        phase=11.5,
         reads={"MARK_AX", "TEMP", "ALU_HI", "AX_CARRY_LO", "OP_MUL"},
         writes={"OUTPUT_HI_THIS_STEP"},
         kind="ffn",
