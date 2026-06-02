@@ -739,8 +739,9 @@ def make_layer3_ffn_op() -> Operation:
         # carried by L3/L0-L2 still resolves at the same numeric position
         # because EMBED_HI_PREV_STEP aliases EMBED_HI. Breaks the
         # layer4_pc_relay → layer3_ffn back-edge on EMBED_HI.
+        # Phase 9.B EMBED_LO -> EMBED_LO.*.-1 SSA cross-step rename.
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
-               "EMBED_LO", "EMBED_HI.*.-1", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "EMBED_LO.*.-1", "EMBED_HI.*.-1", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "TEMP.*.-1", "IS_BYTE", "H1", "H4", "OP_LEV.*.-1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
