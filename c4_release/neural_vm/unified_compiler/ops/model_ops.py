@@ -814,11 +814,192 @@ def make_expand_wrapper_blocks_op() -> Operation:
     )
 
 
+def _head_bake_rules(vocab_size: int, dim_positions) -> tuple:
+    """Build the :class:`TokenEmbeddingRule` list mirroring ``setup_head_weights``.
+
+    The imperative helper in ``ops/shared.py`` (see ``setup_head_weights``)
+    walks the head's weight + bias as follows:
+
+      1. Zero both ``head.weight`` and ``head.bias``.
+      2. Build a ``next_flags`` list of NEXT_* dim names (some optional).
+      3. For each byte ``b in 0..255``:
+         - ``head.weight[b, OUTPUT_LO+lo] = 5.0``
+         - ``head.weight[b, OUTPUT_HI+hi] = 5.0``
+         - ``head.bias[b] = -5.0``
+         - For each ``flag in next_flags``: ``head.weight[b, flag] += -80.0``
+      4. ``head.bias[0] = -4.0`` (overrides the -5.0 from step 3).
+      5. For each (tok, flag_name) pair: ``head.weight[tok, D(flag_name)] = 20.0``
+         and ``head.bias[tok] = -10.0``.
+      6. For [CODE_START, CODE_END, DATA_START, DATA_END, SEP,
+         USER_INPUT_START, USER_INPUT_END]: ``head.bias[tok] = -50.0``.
+      7. ``head.bias[IO_STATE_EMIT_BYTE] = -20.0`` and
+         ``head.bias[IO_STATE_EMIT_THINKING] = -20.0``.
+
+    The rule lowering is accumulative (``+=``), so we follow exactly the same
+    sequence: the bake_fn zeroes ``head.weight`` / ``head.bias`` first, then
+    every rule is additive. The single ``=`` vs ``+=`` conflict is step 4,
+    which writes byte 0's bias to ``-4.0`` AFTER step 3 wrote ``-5.0``. We
+    emit a delta rule (``bias += +1.0`` for byte 0) so the final cell value
+    is ``-5.0 + 1.0 = -4.0`` — byte-identical.
+
+    The ``next_flags`` list is built from ``dim_positions`` so the rules
+    only reference dims that exist in the active layout (mirrors the
+    legacy helper's per-flag ``try: D(opt) except AttributeError``).
+    Marker / step-end rules likewise skip the flag-name lookup when the
+    dim is absent.
+    """
+    from ...vm_step import Token
+
+    rules: list[TokenEmbeddingRule] = []
+
+    # 2. Build the NEXT_* flags list (the optional flags only appear when
+    #    conversational I/O is enabled — same try/except semantics as
+    #    ``setup_head_weights``).
+    next_flags: list[str] = [
+        "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
+        "NEXT_STACK0", "NEXT_MEM", "NEXT_SE", "NEXT_HALT",
+    ]
+    for opt in ("NEXT_TOOL_CALL", "NEXT_THINKING_START", "NEXT_THINKING_END"):
+        if opt in dim_positions:
+            next_flags.append(opt)
+
+    byte_tokens = [b for b in range(min(256, vocab_size))]
+
+    # 3a. For each byte: head.weight[b, OUTPUT_LO+lo] = 5.0 and
+    #     head.weight[b, OUTPUT_HI+hi] = 5.0. Emit one rule per byte.
+    for b in byte_tokens:
+        lo = b & 0xF
+        hi = (b >> 4) & 0xF
+        rules.append(TokenEmbeddingRule.head_weight_write(
+            token_ids=[b],
+            writes=(
+                (f"OUTPUT_LO+{lo}", 5.0),
+                (f"OUTPUT_HI+{hi}", 5.0),
+            ),
+            name=f"head_bake_byte_{b}_output",
+        ))
+
+    # 3b. All bytes get -80.0 on every NEXT_* flag (the inner ``+=``).
+    #     Emit one rule per flag with token_ids=byte_tokens.
+    for flag in next_flags:
+        rules.append(TokenEmbeddingRule.head_weight_write(
+            token_ids=byte_tokens,
+            writes=((flag, -80.0),),
+            name=f"head_bake_byte_next_flag_{flag.lower()}",
+        ))
+
+    # 3c. All bytes get bias = -5.0.
+    rules.append(TokenEmbeddingRule.head_bias_write(
+        token_ids=byte_tokens,
+        value=-5.0,
+        name="head_bake_byte_bias_minus_five",
+    ))
+
+    # 4. byte 0's bias is overridden to -4.0. With ``+=`` semantics we
+    #    add +1.0 so the cell ends at -5.0 + 1.0 = -4.0.
+    if 0 < vocab_size:
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=[0],
+            value=1.0,
+            name="head_bake_byte_zero_bias_override_delta",
+        ))
+
+    # 5. Marker/step-end tokens: head.weight[tok, D(flag_name)] = 20.0
+    #    and head.bias[tok] = -10.0. The legacy helper's try/except
+    #    skips the entry when the flag dim is missing; we do the same.
+    for tok, flag_name in (
+        (Token.REG_PC, "NEXT_PC"),
+        (Token.REG_AX, "NEXT_AX"),
+        (Token.REG_SP, "NEXT_SP"),
+        (Token.REG_BP, "NEXT_BP"),
+        (Token.STACK0, "NEXT_STACK0"),
+        (Token.MEM, "NEXT_MEM"),
+        (Token.STEP_END, "NEXT_SE"),
+        (Token.HALT, "NEXT_HALT"),
+        (Token.TOOL_CALL, "NEXT_TOOL_CALL"),
+        (Token.THINKING_START, "NEXT_THINKING_START"),
+        (Token.THINKING_END, "NEXT_THINKING_END"),
+    ):
+        if tok >= vocab_size:
+            continue
+        if flag_name not in dim_positions:
+            continue
+        rules.append(TokenEmbeddingRule.head_weight_write(
+            token_ids=[tok],
+            writes=((flag_name, 20.0),),
+            name=f"head_bake_marker_weight_token_{tok}",
+        ))
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=[tok],
+            value=-10.0,
+            name=f"head_bake_marker_bias_token_{tok}",
+        ))
+
+    # 6. Section/special tokens: head.bias[tok] = -50.0.
+    section_tokens = [
+        tok for tok in (
+            Token.CODE_START, Token.CODE_END,
+            Token.DATA_START, Token.DATA_END,
+            Token.SEP, Token.USER_INPUT_START, Token.USER_INPUT_END,
+        ) if tok < vocab_size
+    ]
+    if section_tokens:
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=section_tokens,
+            value=-50.0,
+            name="head_bake_section_token_bias",
+        ))
+
+    # 7. IO_STATE_* bias = -20.0.
+    if Token.IO_STATE_EMIT_BYTE < vocab_size:
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=[Token.IO_STATE_EMIT_BYTE],
+            value=-20.0,
+            name="head_bake_io_state_emit_byte_bias",
+        ))
+    if Token.IO_STATE_EMIT_THINKING < vocab_size:
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=[Token.IO_STATE_EMIT_THINKING],
+            value=-20.0,
+            name="head_bake_io_state_emit_thinking_bias",
+        ))
+
+    return tuple(rules)
+
+
+def _head_bake_ir(dim_positions) -> CompilerIR:
+    """Build the head-bake :class:`CompilerIR`.
+
+    Built lazily from ``dim_positions`` because the optional ``NEXT_*``
+    convo-IO flags appear only when conversational I/O is enabled, mirroring
+    the legacy helper's ``try: D(opt) except AttributeError`` behaviour.
+    """
+    from ...vm_step import Token
+
+    ir = CompilerIR()
+    ir.embeddings.extend(_head_bake_rules(Token.VOCAB_SIZE, dim_positions))
+    return ir
+
+
 def make_head_bake_op() -> Operation:
     """Bake the output projection head: byte/marker token logits.
 
     Phase=1000 so it runs AFTER legacy_bake (phase=999); the corresponding
     head section in `set_vm_weights` has been removed to avoid double-bake.
+
+    Phase 7.D.2 migration: the imperative ``setup_head_weights`` helper is
+    replaced by an op-owned :class:`CompilerIR` carrying ~270 + 13
+    :class:`TokenEmbeddingRule`s (256 per-byte OUTPUT_LO/OUTPUT_HI writes,
+    one rule per NEXT_* flag for the -80.0 byte gating, one bulk
+    ``head.bias = -5.0`` write across all bytes, one ``+1.0`` delta on
+    byte 0 to override to ``-4.0``, plus marker / step-end / section /
+    IO_STATE bias and weight rules). The bake_fn zeroes ``head.weight``
+    and ``head.bias`` first (the IR has no zeroing primitive) and then
+    calls ``CompilerIR.lower_token_embeddings``. The single ``=`` /
+    ``+=`` conflict in the legacy helper -- ``head.bias[0] = -4.0``
+    overriding the prior ``-5.0`` -- is modelled as a ``+1.0`` delta
+    rule. Byte-identical to ``setup_head_weights`` for the canonical
+    ``_SetDim`` and the compact ``pin_io_only=True`` layouts.
 
     Claim-coverage note: ``claims`` is intentionally left empty. The static
     verifier in ``decl_verifier.py`` (``_diff_all_blocks_by_ptr``) diffs only
@@ -833,7 +1014,13 @@ def make_head_bake_op() -> Operation:
     only writer to ``head.{weight,bias}``, so collisions aren't a concern.
     """
     def _bake(model, dim_positions, S):
-        setup_head_weights(model.head, dim_positions)
+        del S
+        import torch
+        with torch.no_grad():
+            model.head.weight.zero_()
+            model.head.bias.zero_()
+        ir = _head_bake_ir(dim_positions)
+        ir.lower_token_embeddings(model, dim_positions)
 
     return Operation(
         name="head_bake",
@@ -844,6 +1031,7 @@ def make_head_bake_op() -> Operation:
         declarative_bake_fn=_bake,
         phase=1000,
         declarative_authority="declarative",
+        migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
