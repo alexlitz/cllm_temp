@@ -463,7 +463,7 @@ def _layer10_sp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
     SP_IDX = 2
     spec = _byte_passthrough_chain_spec(
         BD,
-        head_idx=2,
+        head_idx=_l10_head_idx("layer10_sp_byte_passthrough_bake.head_2"),
         source_marker_dim=BD.H1 + SP_IDX,
         target_marker_dim=BD.H1 + SP_IDX,
         value_lo_dim=BD.CLEAN_EMBED_LO,
@@ -990,7 +990,8 @@ def _layer10_sp_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
     proxy = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
     ir.layer(0).attention.append(
-        _layer10_sp_byte_passthrough_head_spec(proxy, 100.0)
+        _layer10_sp_byte_passthrough_head_spec(proxy, 100.0),
+        name="layer10_sp_byte_passthrough_bake.head_2",
     )
     return ir
 
@@ -1264,10 +1265,20 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
     Was an inline call in ``set_vm_weights`` (both branches):
     ``_set_layer10_sp_byte_passthrough(attn10, S, BD, HD)``. Inline call
     removed; this op now owns the bake. Phase=10.2.
+
+    Phase 6 Wave 2D: migrated to ``AttentionHeadIR`` form. The head_idx=2
+    literal is replaced with a pinned-allocator lookup
+    (``_l10_head_idx("layer10_sp_byte_passthrough_bake.head_2")``); the
+    bake_fn stashes a per-bake :class:`AttentionHeadAllocator` on ``attn``.
+    See ``make_layer10_carry_relay_bake_op`` for the shared infrastructure.
     """
     def bake(block, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
+        # Per-bake attention-head allocator with the L10 head layout pinned.
+        # See ``make_layer10_carry_relay_bake_op`` for the rationale.
+        head_allocator = _allocate_layer10_attention_heads()
+        attn._l10_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
         _bake_layer10_sp_byte_passthrough_head(attn, proxy, S, HD)
 
