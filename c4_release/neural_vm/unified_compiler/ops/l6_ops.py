@@ -2639,10 +2639,16 @@ def make_layer6_routing_ffn_op() -> Operation:
         # layer8_multibyte_routing, layer9_alibi_mem_attn, every L10+
         # writer, layer12_mul_combine, layer13_shifts, layer14_mem_generation,
         # layer15_*, layer16_lev_routing, etc.). Byte-identical bake.
+        # Phase 8.A: CMP_PREV_STEP marks the CMP read as cross-step
+        # relative to L9 alu (which writes CMP after L6 in the same
+        # step). The L6 routing FFN's branch-override bands gate on the
+        # previous-step's CMP residual via the KV cache; same numeric
+        # base as CMP, so weight bakes stay byte-identical. Breaks the
+        # layer9_alu -> layer6_routing_ffn back-edge in the dep graph.
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
-               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP", "CMP",
+               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP", "CMP_PREV_STEP",
                "OUTPUT_LO_PREV_STEP", "OUTPUT_HI_PREV_STEP", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
                "TEMP_PREV_STEP", "DIV_STAGING"},
