@@ -225,27 +225,43 @@ KV eviction kwarg port done (in same merge)._
 
 ### Stream 4 — KV eviction / corpus fixes / demo
 
-#### 8.E — KV eviction unblock
+#### 8.E — KV eviction completeness
 
-_Status: in progress; 7.F.1/2/4 landed. Per audit §3 + Tier 1, three
-analyzer enhancements remain. **Blocked on 8.A** (cycle decomp feeds
-the analyzer)._
+_Status: in progress; 7.F.1/2/4 landed. **Blocked on 8.A** (cycle
+decomp feeds the analyzer)._
+
+**Goal (revised):** every KV entry that is provably dead at step S
+(per the declarative IR's liveness analysis) is evicted no later
+than step S. Not a memory-% target. Memory drop is the downstream
+consequence.
 
 * **8.E.1** Refine analyzer's cycle classifier: `_PREV_STEP` reads
   should not promote the base dim to cycle-conservative. (Today,
-  any base-dim reader inside the SCC marks the dim as cycle-conservative.)
+  any base-dim reader inside the SCC marks the dim as cycle-conservative,
+  causing ~80 dim names to never be evictable.)
 * **8.E.2** Per-(layer, head, dim-group) cache compartmentalisation.
   Today's `cached_k[B, H, S, HD]` packs every dim into one row, so
-  the AND across dims keeps every row live. Split the cache into
-  register / ALU / TEMP / OUTPUT groups; compaction applies per-group.
+  the AND across dims keeps every row live even when most are dead.
+  Split the cache into dim-groups so eviction applies per-group.
 * **8.E.3** Loosen "semantic-overwrite" category from "every later
   step" to "very next step" — catches register carries like `REG_AX`
-  automatically.
-* **8.E.4** Wire `test_kv_eviction.py` byte-identity gate into CI
-  (7.F.3 leftover).
-* **Acceptance**: `measure_kv_eviction.py` reports peak K+V drop
-  ≥ 30%; analyzer coverage ≥ 30% of evictable positions;
-  byte-identical gate green.
+  automatically (when step N+1 overwrites it, step N's entry is dead).
+* **8.E.4** Build the **oracle analyzer**: walk the declarative IR
+  with no cycle conservatism; for each `(step, position, dim)` compute
+  the actual last-reader step. The runtime analyzer's job is to match
+  the oracle.
+* **8.E.5** Build the **completeness gate**: after each step, run both
+  runtime analyzer and oracle. Assert (a) every entry the oracle says
+  is dead at step S has been evicted by step S (no late-evictions);
+  (b) every entry the runtime evicted is also dead per the oracle (no
+  false-positives that would break correctness).
+* **8.E.6** Determinism gate: spec-decode and main-decode at the same
+  step S evict identical entry sets.
+* **8.E.7** Wire `test_kv_eviction.py` byte-identity gate + completeness
+  gate into CI.
+* **Acceptance**: completeness gate green on 1096 corpus sample
+  (200 inputs): **0 late-evictions, 0 false-positives, determinism
+  preserved**. Memory drop reported as a side effect, not gated.
 
 #### 8.F — 1096 corpus targeted fixes (parallelizable)
 
@@ -409,7 +425,7 @@ This decomposes to **5 explicit goals**, each mapped to Phase 8 work:
 
 | Goal | Sub-wave | 100% condition |
 |---|---|---|
-| KV eviction memory win | 8.E | `measure_kv_eviction.py` reports ≥ 30% peak drop |
+| KV eviction completeness | 8.E | **Every KV entry that is provably dead (per the declarative IR's liveness analysis) is evicted no later than the step its last reader runs.** Not a memory-% target — a correctness target: 0 late-evictions, 0 false-positives (false-lives never evicted), determinism between spec-decode and main-decode. The memory drop is the downstream consequence, not the metric. |
 | Cycle graph collapse | 8.A | `dep_graph_cycle_member ≤ 10` |
 | 1096 corpus pass rate | 8.F | strict improvement vs Phase 7 baseline; no real_bug regressions |
 | Closing audit | 8.I | `phase_8_closing_audit.md` written; all metrics confirmed |
