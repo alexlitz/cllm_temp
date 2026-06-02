@@ -2453,7 +2453,10 @@ def make_layer10_alu_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer10_alu_ir(),
         declarative_authority="spec_generated",
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G): L10 ALU consumes
         # ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) at the AX
