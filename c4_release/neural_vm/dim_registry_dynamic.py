@@ -444,11 +444,8 @@ def build_default_registry_dynamic() -> DimRegistry:
         "mark == MEM OR (is_byte AND byte_index == 0)", alias=True)
     pin("OPCODE_BYTE_HI", 28, 16, "Opcode byte hi nibble (aliases ADDR_B1_LO)",
         "mark == MEM OR (is_byte AND byte_index == 0)", alias=True)
-    # Phase 8.A SCC step 6: OPCODE_BYTE_LO_PREV_STEP alias (same numeric
-    # base) lets L5 opcode-decode readers declare prev-step semantics.
-    pin("OPCODE_BYTE_LO_PREV_STEP", 12, 16,
-        "Prev-step OPCODE_BYTE_LO residual (aliases OPCODE_BYTE_LO)",
-        "mark == MEM OR (is_byte AND byte_index == 0)", alias=True)
+    # Phase 9.C: OPCODE_BYTE_LO_PREV_STEP alias retired (Phase 9.B
+    # migrated readers to SSA ``OPCODE_BYTE_LO.<writer>.-1``).
 
     # --- OPCODE_BASE alias (262) — alias of OPCODE_FLAGS / OP_LEA ---
     pin("OPCODE_BASE", 262, 1, "Base of opcode one-hot (aliases OP_LEA)",
