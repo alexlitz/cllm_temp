@@ -228,10 +228,12 @@ def make_function_call_weights_op() -> Operation:
         # the trailing LEV-AX-byte routing pairs (``vm_step.py:8230+``).
         # Annotating this op with the per-layer max (2294) lets the
         # dynamic-FFN allocator pre-size L6 instead of falling back to 4096
-        # and trimming post-bake. ``layer_idx=6`` is purely a sizing hint —
-        # model ops are dispatched against the whole model and the
-        # layer_idx field doesn't affect their bake execution.
-        layer_idx=6,
+        # and trimming post-bake. The (former) ``layer_idx=6`` was purely
+        # a sizing hint -- model ops are dispatched against the whole
+        # model and the layer_idx field doesn't affect their bake
+        # execution. Phase 8.A.4: dropped the literal; L6 FFN sizing
+        # falls back to ``_right_size_ffns`` trim post-bake, which is
+        # behaviour-equivalent (the bake itself writes the same cells).
         ffn_units_used=2294,
         smoke_tests={
             "TestSmokeFunctionCall::test_simple_function",
@@ -309,12 +311,18 @@ def make_opcode_relay_head_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_head(attn, _opcode_relay_head_spec(proxy), HD)
 
+    # Phase 8.A.4: ``layer_idx`` is intentionally omitted. This is
+    # a ``kind="model"`` op without an ``ffn_units_used`` annotation, so
+    # the (former) ``layer_idx=6`` neither anchored a bake (model ops
+    # dispatch against the whole model) nor contributed to the per-block
+    # FFN sizing aggregate (only ``layer_idx`` + ``ffn_units_used`` model
+    # ops feed ``ffn_widths``). Purely cosmetic and removed without
+    # behaviour change.
     return Operation(
         name="opcode_relay_head",
         reads=set(),
         writes=set(),
         kind="model",
-        layer_idx=6,
         declarative_bake_fn=bake,
         compiler_ir_factory=_opcode_relay_head_ir,
         declarative_authority="spec_generated",

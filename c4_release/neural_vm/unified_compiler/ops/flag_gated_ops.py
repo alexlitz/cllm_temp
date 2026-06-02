@@ -171,7 +171,10 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
         reads=set(),
         writes=set(),
         kind="block",
-        layer_idx=5,
+        # Phase 8.A.4: dropped ``layer_idx=5`` in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``_layer5_fetch_dep_anchor`` (the L5 dep anchor).
+        target_op_name="_layer5_fetch_dep_anchor",
         migrated=True,
         declarative_bake_fn=bake,
         # When ``enable_conversational_io=False`` the bake_fn is a true
@@ -590,7 +593,10 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         reads=set(),
         writes=set(),
         kind="block",
-        layer_idx=6,
+        # Phase 8.A.4: dropped ``layer_idx=6`` in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer6_attn`` (an L6 attn op anchor).
+        target_op_name="layer6_attn",
         migrated=True,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
@@ -789,7 +795,10 @@ def make_convo_io_step_resume_op(
         reads=set(),
         writes=set(),
         kind="block",
-        layer_idx=3,
+        # Phase 8.A.4: dropped ``layer_idx=3`` in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer3_carry_forward_attn`` (the L3 attn op).
+        target_op_name="layer3_carry_forward_attn",
         declarative_bake_fn=bake,
         compiler_ir=_convo_io_step_resume_ir(),
         declarative_authority="spec_generated",
@@ -899,7 +908,10 @@ def make_convo_io_pc_sp_latch_op(
         reads=set(),
         writes=set(),
         kind="block",
-        layer_idx=6,
+        # Phase 8.A.4: dropped ``layer_idx=6`` in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer6_attn`` (an L6 attn op anchor).
+        target_op_name="layer6_attn",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_convo_io_pc_sp_latch_ir(),
@@ -1022,7 +1034,10 @@ def make_convo_io_prtf_capture_op(
         reads=set(),
         writes=set(),
         kind="block",
-        layer_idx=7,
+        # Phase 8.A.4: dropped ``layer_idx=7`` in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``nibble_copy_ffn`` (an L7 FFN op anchor).
+        target_op_name="nibble_copy_ffn",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         migrated=True,
@@ -1157,7 +1172,11 @@ def make_convo_io_prtf_transport_op(
         reads=set(),
         writes=set(),
         kind="block",
-        layer_idx=4,
+        # Phase 8.A.4: dropped ``layer_idx=4`` in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``_layer3_ffn_dep_anchor`` (the L4 ffn dep anchor;
+        # the dep graph places it at the layer the L3 ffn extends to).
+        target_op_name="_layer3_ffn_dep_anchor",
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _convo_io_prtf_transport_ir
@@ -1285,7 +1304,10 @@ def make_conversational_io_output_routing_op(
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake if not enable_conversational_io else None,
-        layer_idx=15,
+        # Phase 8.A.4: dropped ``layer_idx=15`` in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer15_memory_lookup`` (the L15 attn op).
+        target_op_name="layer15_memory_lookup",
         migrated=True,
         # ``_set_conversational_io_output_routing`` writes units 1200..1231
         # (16 LO + 16 HI = 32 units; see setup_helpers.py:1777). The op is

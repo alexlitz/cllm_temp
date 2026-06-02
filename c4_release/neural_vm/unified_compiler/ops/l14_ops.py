@@ -829,13 +829,17 @@ def make_layer14_alu_high_byte_relay_op() -> Operation:
                "AX_FULL_LO", "AX_FULL_HI", "TEMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
-        layer_idx=15,
+        # Phase 8.A.4: dropped ``layer_idx=15`` in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer15_memory_lookup`` (the L15 attn op).
+        target_op_name="layer15_memory_lookup",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir_factory=_layer14_alu_high_byte_relay_ir,
         migrated=True,
         claims=_claims,
         alibi_slopes={8: 1.0},
+        requires={"after": "layer15_memory_lookup"},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmoke32Bit::test_shl_8bit",
@@ -1299,9 +1303,13 @@ def make_layer14_temp_clear_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer14_temp_clear_ir(),
         declarative_authority="spec_generated",
-        layer_idx=14,
+        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer14_mem_generation`` (the L14 attn op).
+        target_op_name="layer14_mem_generation",
         migrated=True,
         claims=_claims,
+        requires={"after": "layer14_mem_generation"},
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
@@ -1402,7 +1410,10 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer14_clear_addr_key_pollution_ir(),
         declarative_authority="spec_generated",
-        layer_idx=14,
+        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer14_mem_generation`` (the L14 attn op).
+        target_op_name="layer14_mem_generation",
         migrated=True,
         # Phase 7.A.2 backfill: this op cancels ADDR_KEY residue left on
         # non-MEM, non-marker rows by prior ADDR_KEY writers. The data dep
@@ -1419,6 +1430,7 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
             "layer4_pc_relay",
             "layer7_memory_heads",
             "layer14_addr_key_neural_decode",
+            "layer14_mem_generation",
         ]},
         claims=_claims,
         smoke_tests={"all"},
@@ -1600,9 +1612,13 @@ def make_layer14_clear_output_corruption_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer14_clear_output_corruption_ir(),
         declarative_authority="spec_generated",
-        layer_idx=14,
+        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer14_mem_generation`` (the L14 attn op).
+        target_op_name="layer14_mem_generation",
         migrated=True,
         claims=_claims,
+        requires={"after": "layer14_mem_generation"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1726,9 +1742,13 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer14_clear_mem_marker_output_ir(),
         declarative_authority="spec_generated",
-        layer_idx=14,
+        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer14_mem_generation`` (the L14 attn op).
+        target_op_name="layer14_mem_generation",
         migrated=True,
         claims=_claims,
+        requires={"after": "layer14_mem_generation"},
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#memory",
     )
@@ -1873,9 +1893,13 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer14_jsr_ax_bytes_zero_ir(),
         declarative_authority="spec_generated",
-        layer_idx=14,
+        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer14_mem_generation`` (the L14 attn op).
+        target_op_name="layer14_mem_generation",
         migrated=True,
         claims=_claims,
+        requires={"after": "layer14_mem_generation"},
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
@@ -2013,9 +2037,13 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer14_alu_nocarry_ax_bytes_zero_ir(),
         declarative_authority="spec_generated",
-        layer_idx=14,
+        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer14_mem_generation`` (the L14 attn op).
+        target_op_name="layer14_mem_generation",
         migrated=True,
         claims=_claims,
+        requires={"after": "layer14_mem_generation"},
         # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1873
         # after this op runs). The chain is: temp_clear + temp residue clamp
         # + ADD byte-1 high cleanup (4 units) →
@@ -2159,7 +2187,10 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer14_demo_phase6_wave7_ir(),
         declarative_authority="spec_generated",
-        layer_idx=14,
+        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer14_mem_generation`` (the L14 attn op).
+        target_op_name="layer14_mem_generation",
         migrated=True,
         # Phase 7.A.5 default-flip: declare the chain predecessor as an
         # explicit ``requires["after"]`` so cycle-aware strict mode can
@@ -2174,6 +2205,7 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
         # invariant and the strict-default admission gate.
         requires={"after": [
             "layer14_alu_nocarry_ax_bytes_zero",
+            "layer14_mem_generation",
         ]},
         # New chain tail: prior ops fill [0, 1874), the demo's auto-fit
         # picks unit 1874 (single-unit rule), so the cumulative max is 1875.
@@ -2314,9 +2346,13 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer14_lc_ax_bytes_zero_ir(),
         declarative_authority="spec_generated",
-        layer_idx=14,
+        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer14_mem_generation`` (the L14 attn op).
+        target_op_name="layer14_mem_generation",
         migrated=True,
         claims=_claims,
+        requires={"after": "layer14_mem_generation"},
         smoke_tests={"TestSmokeMemory::test_sc_lc_roundtrip"},
         spec_section="BLOG_SPEC.md#memory",
     )
@@ -2927,8 +2963,12 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=op_compiler_ir,
         declarative_authority="spec_generated",
-        layer_idx=14,
+        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer14_mem_generation`` (the L14 attn op).
+        target_op_name="layer14_mem_generation",
         migrated=True,
+        requires={"after": "layer14_mem_generation"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
