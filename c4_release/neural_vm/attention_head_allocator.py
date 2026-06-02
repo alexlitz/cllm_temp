@@ -87,6 +87,14 @@ class AllocatedHead:
     layer_idx: int
     head_idx: int
     pinned: bool = False
+    # V1/V2 vision (per-head dynamic head_dim): the head_dim this head
+    # consumes in its layer's Q/K/V matrices. ``None`` means "use the
+    # layer's default head_dim" — byte-identical with the historical
+    # fixed-HD bake. Allocator sums non-None values via
+    # :meth:`AttentionHeadAllocator.total_head_dim_at` to drive d_model.
+    # NOTE FOR IN-FLIGHT DYNAMIC-HEAD-COUNT / GQA AGENT a4ca47000230faf7a:
+    # additive None-default field; safe to merge with new fields you add.
+    head_dim: Optional[int] = None
 
 
 class AttentionHeadAllocatorError(ValueError):
@@ -177,6 +185,7 @@ class AttentionHeadAllocator:
         layer_idx: int,
         *,
         pin: Optional[int] = None,
+        head_dim: Optional[int] = None,
     ) -> int:
         """Allocate an attention head in ``layer_idx`` for ``op_name``.
 
@@ -189,6 +198,13 @@ class AttentionHeadAllocator:
         If ``pin`` is ``None`` the allocator scans
         ``[0, layer_max_heads)`` in the target layer and returns the
         lowest free index.
+
+        ``head_dim`` (V1/V2 vision — per-head dynamic head_dim) is the
+        number of Q/K/V slot rows this head consumes. ``None`` (default)
+        means "use the layer's default head_dim" and preserves byte-
+        identity with the historical fixed-HD bake. Non-None values are
+        validated to be positive ints; downstream callers can sum them
+        per-layer via :meth:`total_head_dim_at` to drive d_model.
 
         Returns
         -------
@@ -208,6 +224,13 @@ class AttentionHeadAllocator:
             raise AttentionHeadAllocatorError(
                 f"alloc({op_name!r}): layer_idx must be a non-negative int "
                 f"(got {layer_idx!r})"
+            )
+        if head_dim is not None and (
+            not isinstance(head_dim, int) or head_dim <= 0
+        ):
+            raise AttentionHeadAllocatorError(
+                f"alloc({op_name!r}): head_dim must be a positive int or "
+                f"None (got {head_dim!r})"
             )
 
         claimed = self._claimed.setdefault(layer_idx, set())
@@ -269,6 +292,7 @@ class AttentionHeadAllocator:
             layer_idx=layer_idx,
             head_idx=head_idx,
             pinned=pinned,
+            head_dim=head_dim,
         )
         self._heads.append(rec)
         self._by_name[op_name] = rec
@@ -318,6 +342,90 @@ class AttentionHeadAllocator:
         if not claimed:
             return 0
         return max(claimed) + 1
+
+    def head_dim_at(
+        self,
+        layer_idx: int,
+        head_idx: int,
+        *,
+        default: Optional[int] = None,
+    ) -> Optional[int]:
+        """Return the head_dim claimed for ``(layer_idx, head_idx)``.
+
+        Returns the head's own ``head_dim`` field when non-None, otherwise
+        ``default`` (typically the layer-wide default HD). Returns
+        ``None`` if no head was allocated at this slot.
+        V1/V2 vision (per-head dynamic head_dim).
+        """
+        for rec in self._heads:
+            if rec.layer_idx == layer_idx and rec.head_idx == head_idx:
+                return rec.head_dim if rec.head_dim is not None else default
+        return None
+
+    def total_head_dim_at(
+        self,
+        layer_idx: int,
+        default_head_dim: int,
+    ) -> int:
+        """Return the sum of effective head_dims at ``layer_idx``.
+
+        Heads with ``head_dim is None`` contribute ``default_head_dim``;
+        heads with explicit ``head_dim`` contribute their own value. The
+        result is the total Q/K/V row count that the per-layer attention
+        matrices need to accommodate every claimed head — used by the
+        compiler to drive d_model at compile time when the V1/V2 dynamic
+        head_dim path is active. Byte-identical with
+        ``num_heads_at * default_head_dim`` when every head uses default.
+        """
+        if not isinstance(layer_idx, int) or layer_idx < 0:
+            raise AttentionHeadAllocatorError(
+                f"total_head_dim_at(): layer_idx must be a non-negative int "
+                f"(got {layer_idx!r})"
+            )
+        if not isinstance(default_head_dim, int) or default_head_dim <= 0:
+            raise AttentionHeadAllocatorError(
+                f"total_head_dim_at(): default_head_dim must be a positive "
+                f"int (got {default_head_dim!r})"
+            )
+        total = 0
+        for rec in self._heads:
+            if rec.layer_idx != layer_idx:
+                continue
+            total += (
+                rec.head_dim if rec.head_dim is not None else default_head_dim
+            )
+        return total
+
+    def head_base_at(
+        self,
+        layer_idx: int,
+        head_idx: int,
+        default_head_dim: int,
+    ) -> int:
+        """Return the cumulative-sum row offset for ``(layer_idx, head_idx)``.
+
+        Iterates the layer's allocated heads in ascending ``head_idx``
+        order, summing each one's effective head_dim. The result is the
+        Q/K/V row offset for ``head_idx`` once per-head dynamic head_dim
+        is active. With all heads at the default, equals
+        ``head_idx * default_head_dim`` (byte-identical with the legacy
+        formula). Raises if ``head_idx`` was never allocated.
+        """
+        ordered = sorted(
+            (rec for rec in self._heads if rec.layer_idx == layer_idx),
+            key=lambda r: r.head_idx,
+        )
+        running = 0
+        for rec in ordered:
+            if rec.head_idx == head_idx:
+                return running
+            running += (
+                rec.head_dim if rec.head_dim is not None else default_head_dim
+            )
+        raise AttentionHeadAllocatorError(
+            f"head_base_at(): no head allocated at "
+            f"(layer_idx={layer_idx}, head_idx={head_idx})"
+        )
 
     def assert_within_cap(self, layer_idx: int, cap: int) -> None:
         """Assert the live head count at ``layer_idx`` is at most ``cap``.

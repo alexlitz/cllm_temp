@@ -87,6 +87,33 @@ class DeclarativeAttentionHeadSpec:
     # ``group_size=1`` is byte-identical with MHA (``head_idx // 1 ==
     # head_idx``). Mixtral target: 32 Q, 8 KV => 4.
     group_size: int = 1
+    # V1/V2 vision (per-head dynamic head_dim): None = use the layer's
+    # default head_dim (today's fixed ``dim // num_heads``); an int
+    # overrides for this head specifically. Byte-identical at the default.
+    # Composes cleanly with ``group_size``: ``head_dim`` controls the
+    # ROW WIDTH of each Q/K/V slot block; ``group_size`` controls the
+    # head-index mapping. Lowering site:
+    # ``Primitives.generate_attention_head(head_base=..., kv_head_base=...)``.
+    head_dim: Optional[int] = None
+
+    def effective_head_dim(self, default_HD: int) -> int:
+        """Return per-head slot count: ``spec.head_dim`` or ``default_HD``.
+
+        V1/V2 vision (per-head dynamic head_dim): when a head declares
+        a non-default ``head_dim``, that width drives both slot-write
+        validation and the cumulative-sum row base computation. Heads
+        that leave ``head_dim=None`` adopt the layer-wide default and
+        keep the legacy fixed-HD bake byte-identical.
+        """
+        hd = self.head_dim if self.head_dim is not None else default_HD
+        if not isinstance(hd, int) or hd <= 0:
+            raise ValueError(
+                "DeclarativeAttentionHeadSpec.effective_head_dim: "
+                f"non-positive head_dim={hd!r} "
+                f"(spec.head_dim={self.head_dim!r}, "
+                f"default_HD={default_HD!r})"
+            )
+        return hd
 
     @property
     def kv_head_idx(self) -> int:
@@ -136,34 +163,77 @@ class Primitives:
     # =========================================================================
 
     @staticmethod
-    def generate_attention_head(attn, spec: DeclarativeAttentionHeadSpec, HD: int):
+    def generate_attention_head(
+        attn,
+        spec: DeclarativeAttentionHeadSpec,
+        HD: int,
+        *,
+        head_base: Optional[int] = None,
+        kv_head_base: Optional[int] = None,
+    ):
         """Emit Q/K/V/O matrix writes for one declarative attention head.
 
         If ``spec.alibi_slope`` is not ``None`` and ``attn`` exposes an
         ``alibi_slopes`` buffer, the slope is written at
         ``attn.alibi_slopes[spec.head_idx]``. This makes the slope follow
         the spec across an :class:`AttentionHeadAllocator` first-fit
-        permutation: the spec carries its own slope, so dropping a
-        ``pin=`` on its head_idx no longer scrambles the slope-to-head
-        mapping. Specs without a slope (``alibi_slope=None``) leave the
-        buffer untouched — the bake function fills it itself, matching
-        the legacy behaviour.
+        permutation.
+
+        ``head_base`` / ``kv_head_base`` (V1/V2 vision — per-head
+        dynamic head_dim) are the starting Q/O and K/V rows for this
+        head's slot block. When ``None`` (default) the legacy
+        ``spec.head_idx * HD`` / ``spec.kv_head_idx * HD`` formulas are
+        used — byte-identical with every existing fixed-HD bake. When
+        provided (e.g. by an allocator-driven lowering pass) the caller
+        supplies the cumulative-sum offset that accounts for upstream
+        heads with non-default ``spec.head_dim``. Slot writes are
+        validated against ``spec.effective_head_dim(HD)`` so a stale
+        slot index can't bleed into the next head's row block.
         """
 
         # Phase 8.O.2 GQA: Q and O rows land at ``head_idx * HD``;
         # K and V rows land at ``kv_head_idx * HD =
         # (head_idx // group_size) * HD``. At ``group_size=1`` (the
         # default) the two bases coincide, so the writes are byte-
-        # identical with the pre-8.O.2 MHA path.
-        base = spec.head_idx * HD
-        kv_base = spec.kv_head_idx * HD
+        # identical with the pre-8.O.2 MHA path. V1/V2 vision (per-head
+        # dynamic head_dim) layers on top: when ``head_base`` /
+        # ``kv_head_base`` are supplied, they override the legacy
+        # ``head_idx * HD`` formula with allocator-driven cumulative
+        # offsets — leaves byte-identity intact whenever ``head_base``
+        # is ``None``.
+        base = spec.head_idx * HD if head_base is None else int(head_base)
+        kv_base = (
+            spec.kv_head_idx * HD if kv_head_base is None
+            else int(kv_head_base)
+        )
+        eff_hd = spec.effective_head_dim(HD)
         for write in spec.q:
+            if write.slot >= eff_hd:
+                raise ValueError(
+                    f"generate_attention_head: q slot={write.slot} >= "
+                    f"effective_head_dim={eff_hd} (head_idx={spec.head_idx})"
+                )
             attn.W_q.data[base + write.slot, write.dim] = write.weight
         for write in spec.k:
+            if write.slot >= eff_hd:
+                raise ValueError(
+                    f"generate_attention_head: k slot={write.slot} >= "
+                    f"effective_head_dim={eff_hd} (head_idx={spec.head_idx})"
+                )
             attn.W_k.data[kv_base + write.slot, write.dim] = write.weight
         for write in spec.v:
+            if write.slot >= eff_hd:
+                raise ValueError(
+                    f"generate_attention_head: v slot={write.slot} >= "
+                    f"effective_head_dim={eff_hd} (head_idx={spec.head_idx})"
+                )
             attn.W_v.data[kv_base + write.slot, write.dim] = write.weight
         for write in spec.o:
+            if write.slot >= eff_hd:
+                raise ValueError(
+                    f"generate_attention_head: o slot={write.slot} >= "
+                    f"effective_head_dim={eff_hd} (head_idx={spec.head_idx})"
+                )
             attn.W_o.data[write.out_dim, base + write.slot] = write.weight
         if spec.alibi_slope is not None:
             if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
@@ -171,10 +241,31 @@ class Primitives:
 
     @staticmethod
     def generate_attention_heads(attn, specs, HD: int):
-        """Emit Q/K/V/O matrix writes for multiple declarative heads."""
+        """Emit Q/K/V/O matrix writes for multiple declarative heads.
 
-        for spec in specs:
-            Primitives.generate_attention_head(attn, spec, HD)
+        When every spec uses the layer default (``spec.head_dim is None``)
+        the loop falls through to per-head ``head_idx * HD`` row bases —
+        byte-identical with the prior implementation. When any spec
+        declares a non-default ``head_dim``, per-head bases are computed
+        by cumulative-sum over specs sorted by ``head_idx`` so the layout
+        is deterministic regardless of insertion order.
+        """
+
+        spec_list = list(specs)
+        any_custom = any(
+            getattr(s, "head_dim", None) is not None for s in spec_list
+        )
+        if not any_custom:
+            for spec in spec_list:
+                Primitives.generate_attention_head(attn, spec, HD)
+            return
+        ordered = sorted(spec_list, key=lambda s: int(s.head_idx))
+        running_base = 0
+        for spec in ordered:
+            Primitives.generate_attention_head(
+                attn, spec, HD, head_base=running_base
+            )
+            running_base += spec.effective_head_dim(HD)
 
     @staticmethod
     def threshold_attention_head_spec(
