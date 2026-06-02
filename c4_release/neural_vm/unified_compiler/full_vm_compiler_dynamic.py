@@ -805,6 +805,7 @@ def compile_full_vm_dynamic(
     strict: bool = True,
     allow_sealed_cycles: bool = True,
     model_shape_constraint=None,
+    target_shape_overrides=None,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
@@ -873,6 +874,27 @@ def compile_full_vm_dynamic(
     (no admission gate). Passing ``allow_sealed_cycles=False`` restores
     the legacy "any cycle is a failure" behaviour, which today fails on
     the production op set until B9 (dim decomposition) completes.
+
+    Target-shape overrides (shape-only rebuild)
+    --------------------------------------------
+    ``target_shape_overrides`` (when not ``None``) is a
+    ``ModelShapeConstraint`` whose pinned fields drive a POST-COMPILE
+    rebuild of the returned VM into a fresh ``AutoregressiveVM`` with
+    the target ``d_model`` / ``n_layers`` / ``n_heads`` / ``head_dim``
+    / ``intermediate_size`` / ``vocab_size``. The rebuilt model has
+    zero-initialized weights — it is NOT semantically equivalent to the
+    compiled VM. This is the minimum viable path that lets the HF
+    state-dict export adapters (Mixtral, Llama) be wired end-to-end
+    without rewriting the allocator stack to natively emit
+    Mixtral-shaped weights. See ``_rebuild_to_target_shape`` for the
+    documented gap (the allocator-native path is tracked separately).
+
+    ``model_shape_constraint`` (validation-only) and
+    ``target_shape_overrides`` (rebuild) compose: when both are set,
+    the rebuild runs first, then the constraint validates the rebuilt
+    model. Use ``target_shape_overrides`` alone for "shape-match HF
+    export"; use ``model_shape_constraint`` alone to assert the
+    naturally-allocated shape matches an external envelope.
     """
     # Mirror static-path env-flag handling to keep the API truly identical.
     if not declarations_only:
@@ -980,6 +1002,33 @@ def compile_full_vm_dynamic(
         kv_eviction_n_steps=kv_eviction_n_steps,
     )
 
+    # Post-compile shape rebuild. When the caller hands in
+    # ``target_shape_overrides`` (a ``ModelShapeConstraint``), REPLACE the
+    # compiled VM with a freshly-initialized ``AutoregressiveVM`` whose
+    # geometry matches the overrides. This is a SHAPE-ONLY rebuild — the
+    # baked VM weights are NOT copied into the new model, so semantic
+    # equivalence is sacrificed for shape compatibility. Use case:
+    # producing a target-architecture-shaped VM for HF state-dict export
+    # (Mixtral, Llama) without changing the VM's allocator-derived
+    # natural shape.
+    if target_shape_overrides is not None:
+        from .model_shape_constraint import ModelShapeConstraint as _MSC
+        if not isinstance(target_shape_overrides, _MSC):
+            raise TypeError(
+                "target_shape_overrides must be a ModelShapeConstraint instance, "
+                f"got {type(target_shape_overrides).__name__}"
+            )
+        model = _rebuild_to_target_shape(
+            model,
+            target_shape_overrides,
+            max_seq_len=max_seq_len,
+            positional_encoding=positional_encoding,
+            attention_normalization=attention_normalization,
+            rope_base=rope_base,
+            use_rms_norm=use_rms_norm,
+            rms_norm_eps=rms_norm_eps,
+        )
+
     # Post-compile shape-constraint check. When the caller hands in a
     # ``ModelShapeConstraint``, diff it against the compiled model and
     # raise ``ModelShapeMismatchError`` on any mismatch. The check runs
@@ -1004,6 +1053,132 @@ def compile_full_vm_dynamic(
             )
 
     return model, layout
+
+
+# ---------------------------------------------------------------------------
+# Internals: target-shape rebuild
+# ---------------------------------------------------------------------------
+
+
+def _rebuild_to_target_shape(
+    compiled_model,
+    overrides,
+    *,
+    max_seq_len: int,
+    positional_encoding: str,
+    attention_normalization: str,
+    rope_base: float,
+    use_rms_norm: bool,
+    rms_norm_eps: float,
+):
+    """Build a fresh ``AutoregressiveVM`` with the override geometry.
+
+    SHAPE-ONLY rebuild — returns a new model with target
+    ``d_model`` / ``n_layers`` / ``n_heads`` / ``head_dim`` /
+    ``ffn_hidden`` / ``vocab_size`` taken from ``overrides``, falling
+    back to the compiled model's values when a field is ``None``. The
+    new model's weights are nn.Parameter zeros (PureFFN's default init),
+    so it is NOT semantically equivalent to the compiled VM. The intent
+    is to produce a model whose ``state_dict`` shape matches a target
+    HF architecture (Mixtral, Llama) for export adapters.
+
+    Gap documented loudly: a real "compile-time shape override" would
+    have the allocator emit a baked, semantics-preserving model with
+    the target geometry (padding dims up, rebuilding attention with
+    GQA, padding FFN widths uniformly, padding vocab). That requires
+    reworking the dim allocator, head allocator, and FFN allocator to
+    accept a target envelope and route excess capacity to padding
+    rather than to functional ops. This rebuild is the minimum viable
+    path that lets the HF export adapters be wired end-to-end without
+    that allocator rework.
+
+    Override fields:
+      * ``d_model`` — total residual width (must equal num_heads * head_dim)
+      * ``num_hidden_layers`` — n_layers
+      * ``num_attention_heads`` — n_heads
+      * ``head_dim`` — per-head width (overrides d_model // n_heads)
+      * ``intermediate_size`` — FFN hidden_dim (applied uniformly)
+      * ``vocab_size`` — embedding + lm_head vocab
+      * ``num_key_value_heads`` — not honored yet (MHA only; raises if
+        set != num_attention_heads). GQA wiring through the runtime
+        attention module is a separate item.
+    """
+    from ..vm_step import AutoregressiveVM
+
+    d_model = overrides.d_model if overrides.d_model is not None else int(compiled_model.d_model)
+    n_layers = (
+        overrides.num_hidden_layers
+        if overrides.num_hidden_layers is not None
+        else len(compiled_model.blocks)
+    )
+    if overrides.num_attention_heads is not None:
+        n_heads = int(overrides.num_attention_heads)
+    else:
+        n_heads = int(getattr(compiled_model.blocks[0].attn, "num_heads", 8))
+    head_dim = overrides.head_dim
+    if head_dim is not None:
+        if int(head_dim) * n_heads != d_model:
+            raise ValueError(
+                f"target_shape_overrides: head_dim={head_dim} * "
+                f"num_attention_heads={n_heads} = {int(head_dim) * n_heads}, "
+                f"but d_model={d_model}. Mixtral requires num_attention_heads * "
+                "head_dim == hidden_size."
+            )
+    if overrides.num_key_value_heads is not None:
+        if int(overrides.num_key_value_heads) != n_heads:
+            raise NotImplementedError(
+                f"target_shape_overrides: num_key_value_heads="
+                f"{overrides.num_key_value_heads} != num_attention_heads="
+                f"{n_heads}. GQA rebuild is not yet implemented; pass MHA "
+                "(num_key_value_heads == num_attention_heads) for now."
+            )
+    if overrides.intermediate_size is not None:
+        ffn_hidden = int(overrides.intermediate_size)
+    else:
+        widths = [
+            int(getattr(b.ffn, "hidden_dim", 0)) for b in compiled_model.blocks
+        ]
+        ffn_hidden = max(widths) if widths else 4096
+    vocab_size = (
+        int(overrides.vocab_size)
+        if overrides.vocab_size is not None
+        else int(getattr(compiled_model, "vocab_size", 256))
+    )
+
+    ffn_widths: Dict[int, int] = {}
+    for layer_idx, ov in overrides.per_layer_overrides.items():
+        if not isinstance(layer_idx, int) or layer_idx < 0 or layer_idx >= n_layers:
+            raise ValueError(
+                f"target_shape_overrides.per_layer_overrides has layer_idx="
+                f"{layer_idx}, but rebuild has {n_layers} layers."
+            )
+        if (
+            ov.get("num_attention_heads") is not None
+            or ov.get("num_key_value_heads") is not None
+            or ov.get("head_dim") is not None
+        ):
+            raise NotImplementedError(
+                "target_shape_overrides: per-layer head/head_dim overrides "
+                "are not supported by the rebuild path (AutoregressiveVM "
+                "uses one n_heads / head_dim across all blocks)."
+            )
+        if ov.get("intermediate_size") is not None:
+            ffn_widths[layer_idx] = int(ov["intermediate_size"])
+
+    rebuilt = AutoregressiveVM(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        ffn_hidden=ffn_widths if ffn_widths else ffn_hidden,
+        max_seq_len=max_seq_len,
+        positional_encoding=positional_encoding,
+        attention_normalization=attention_normalization,
+        rope_base=rope_base,
+        use_rms_norm=use_rms_norm,
+        rms_norm_eps=rms_norm_eps,
+    )
+    return rebuilt
 
 
 # ---------------------------------------------------------------------------
