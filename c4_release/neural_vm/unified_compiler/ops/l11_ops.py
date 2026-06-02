@@ -239,7 +239,13 @@ def make_layer11_ffn_dep_anchor_op() -> Operation:
     return Operation(
         name="_layer11_ffn_dep_anchor",
         phase=11,
-        reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
+        # Phase 9.B (ALU_LO SCC rename): ALU_LO -> ALU_LO.*.-1 marks the
+        # read as SSA cross-step. layer16_lev_routing (phase 16) writes
+        # ALU_LO as next-step PC staging; the L11 anchor's read is
+        # satisfied by the prev-step residual. Same numeric slot via SSA
+        # alias; byte-identical bake. Breaks the L16 ->
+        # _layer11_ffn_dep_anchor ALU_LO back-edge.
+        reads={"MARK_AX", "ALU_LO.*.-1", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
         writes={"TEMP"},
         kind="ffn",
         migrated=True,
