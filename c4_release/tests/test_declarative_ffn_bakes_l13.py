@@ -79,7 +79,9 @@ def test_layer13_shifts_rule_count_is_4096():
     assert combined[2048:] == shr
 
     # Layout table totals must equal the rule count (byte-identity guard).
-    layout_total = sum(n for _, _, n in _L13_SHIFTS_UNIT_LAYOUT)
+    # Phase 7.B.5: layout entries are ``(name, n_units)`` 2-tuples after the
+    # explicit pin was dropped in favor of allocator auto-fit.
+    layout_total = sum(n for _, n in _L13_SHIFTS_UNIT_LAYOUT)
     assert layout_total == 4096
 
 

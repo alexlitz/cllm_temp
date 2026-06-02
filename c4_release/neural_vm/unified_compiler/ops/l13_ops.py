@@ -63,51 +63,51 @@ def _l13_head_idx(op_name: str) -> int:
     raise KeyError(f"_l13_head_idx: unknown L13 attention op {op_name!r}")
 
 
-# === L13 FFN unit layout (pinned offsets) ============================
+# === L13 FFN unit layout (auto-fit) ===================================
 #
 # The ``layer13_shifts`` op owns the entire L13 FFN. The actual weight
-# writes happen inside ``vm_step._set_layer13_shifts``, which uses a
-# local ``unit = 0`` counter that increments through two 2048-unit
-# sub-stages (SHL then SHR, each spanning 8 shift amounts x 16 a_hi
-# x 16 a_lo). Migration to :class:`FFNUnitAllocator` keeps that helper
-# byte-identical -- we just declare each sub-stage's range at its
-# existing pinned offset so the layout is auditable rather than
-# implicit. Adding a new L13 op family later will go through
-# ``allocator.alloc(name, n)`` without a pin, but note the SHL+SHR
-# chain currently fills the 4096-unit pool exactly (see the trailing
-# "fills L13 exactly" note in the helper docstring), so a future
-# extension must first shrink one of the lookup tables or widen the
-# pool.
+# writes happen via the declarative SHL+SHR rule list (lowered through
+# ``Primitives.lower_ffn_rules`` with ``start_unit=0``), which fills the
+# pool in two 2048-unit sub-stages (SHL then SHR, each spanning 8 shift
+# amounts x 16 a_hi x 16 a_lo).
 #
-# The offsets below mirror the unit-counter walk in
-# ``vm_step._set_layer13_shifts``. Changing the helper's unit count
-# requires updating this table in lock-step.
+# Phase 7.B.5: both sub-stages now use ``pin=None``. Declaration order
+# is SHL then SHR; first-fit on an empty 4096-wide pool places SHL at
+# unit 0, then SHR at unit 2048 — byte-identical to the legacy explicit
+# pins. The SHL+SHR chain saturates the pool, so any future extension
+# must first shrink a lookup table or widen the pool (auto-fit will
+# error rather than silently overflow).
+#
+# The order in this table determines the auto-fit placement, which in
+# turn must match the rule-list walk in ``_layer13_shifts_rules``
+# (SHL-first then SHR). Changing rule counts requires updating this
+# table's ``n_units`` entries in lock-step.
 _L13_SHIFTS_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
-    ("layer13_shifts.shl",    0, 2048),  # OP_SHL: 8 shifts x 16 a_hi x 16 a_lo
-    ("layer13_shifts.shr", 2048, 2048),  # OP_SHR: 8 shifts x 16 a_hi x 16 a_lo
+    # (sub-stage name, n_units)  -- pins dropped (Phase 7.B.5, auto-fit)
+    ("layer13_shifts.shl", 2048),  # OP_SHL: 8 shifts x 16 a_hi x 16 a_lo
+    ("layer13_shifts.shr", 2048),  # OP_SHR: 8 shifts x 16 a_hi x 16 a_lo
 )
 
 
 def _allocate_layer13_shifts_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L13 shift sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the underlying
-    ``vm_step._set_layer13_shifts`` helper -- which writes via its own
-    monotonic ``unit = 0`` counter -- lands on exactly the same
-    hidden-unit indices it always has. This call is byte-identical
-    bookkeeping: the allocator declares ranges by name, the helper
-    writes the weights. A future refactor can split the monolithic
-    helper into per-range bake functions that consume
-    ``allocator.alloc(...)`` directly.
+    Phase 7.B.5: both sub-stages are now auto-fit (``pin=None``).
+    Declaration order is SHL then SHR; first-fit on an empty
+    4096-wide pool places SHL at unit 0 and SHR at unit 2048 —
+    byte-identical to the legacy explicit pins. The declarative rule
+    lowering still consumes ``start_unit=0`` from
+    ``Primitives.lower_ffn_rules``, so the SHL block writes units
+    0..2047 and the SHR block writes 2048..4095, matching the legacy
+    ``_set_layer13_shifts`` indices.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L13 op claims a free range -- but see the layout-table note
     above: the SHL+SHR chain currently saturates the 4096-unit pool).
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L13_SHIFTS_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, n_units in _L13_SHIFTS_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
@@ -491,12 +491,14 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         def bake(block, dim_positions, S):
             proxy = _as_setdim_proxy(dim_positions)
 
-            # Per-bake FFN-unit allocator. Each L13 shift sub-stage is
-            # pinned to its existing offset so the call below lands
-            # byte-identically. Stashed on the FFN module so downstream
-            # tools (e.g. a future L13 op family) can inspect or extend
-            # the layout. Mirrors the L1 / L9 convention from
-            # 4639146 / ca775eb.
+            # Per-bake FFN-unit allocator. Phase 7.B.5: both shift
+            # sub-stages are auto-fit (``pin=None``); declaration order
+            # SHL-then-SHR plus first-fit on an empty pool lands SHL at
+            # unit 0 and SHR at unit 2048 — byte-identical to the
+            # legacy explicit pins. Stashed on the FFN module so
+            # downstream tools (e.g. a future L13 op family) can
+            # inspect or extend the layout. Mirrors the L1 / L9
+            # convention from 4639146 / ca775eb.
             allocator = _allocate_layer13_shifts_units()
             block.ffn._l13_unit_allocator = allocator
 
@@ -504,7 +506,7 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
             # Byte-identity guard: the declarative lowering MUST land
             # exactly on the allocator's declared range total or a
             # downstream layer will read stale weights.
-            expected_total = sum(n for _, _, n in _L13_SHIFTS_UNIT_LAYOUT)
+            expected_total = sum(n for _, n in _L13_SHIFTS_UNIT_LAYOUT)
             assert n_units == expected_total, (
                 f"L13 layer13_shifts unit cursor drift: declarative "
                 f"bake wrote {n_units} units, allocator declared "
