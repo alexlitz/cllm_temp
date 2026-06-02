@@ -186,7 +186,18 @@ def make_layer1_ffn_op() -> Operation:
     return Operation(
         name="layer1_ffn",
         phase=1,
-        reads={"L1H0", "L1H1", "L1H2", "L1H4", "H0", "H1", "IS_BYTE"},
+        # Phase 7.A.1: L1H0/L1H1/L1H2/L1H4 are written by
+        # ``layer1_threshold_attn`` at the SAME layer (L1 attn substage feeds
+        # the L1 FFN substage inside the same transformer block). Express
+        # this as a co-placement constraint via
+        # ``requires["same_layer_as"]`` rather than a depth-bumping dataflow
+        # edge, so analyze_scheduler.py and LayerCompiler._assign_layers
+        # agree on the layer assignment. H0/H1 (written by
+        # ``layer0_threshold_attn`` at L0) and IS_BYTE (markers from an
+        # earlier setup) remain genuine cross-layer reads. The bake_fn
+        # itself still consumes the L1H* dims from the residual; reads= is
+        # declarative metadata only.
+        reads={"H0", "H1", "IS_BYTE"},
         writes={"STACK0_BYTE0", "BYTE_INDEX_0", "BYTE_INDEX_1",
                 "BYTE_INDEX_2", "BYTE_INDEX_3"},
         kind="ffn",
@@ -197,6 +208,7 @@ def make_layer1_ffn_op() -> Operation:
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
+        requires={"same_layer_as": "layer1_threshold_attn"},
         # ``_set_layer1_ffn`` writes 5 units (one per output: STACK0_BYTE0,
         # BYTE_INDEX_0..3). See setup_helpers.py:_set_layer1_ffn.
         ffn_units_used=5,
