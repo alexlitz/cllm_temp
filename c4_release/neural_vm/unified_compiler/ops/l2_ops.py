@@ -319,7 +319,6 @@ def make_layer2_mem_byte_flags_op() -> Operation:
 
     return Operation(
         name="layer2_mem_byte_flags",
-        phase=2,
         reads={"H0", "H1", "H4", "IS_BYTE", "BYTE_INDEX_0",
                "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
         writes={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
