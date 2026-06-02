@@ -1776,12 +1776,12 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         # for the staleness analyzer (it only checks producer.phase <=
         # consumer.phase); 8.05 keeps the L8 attn bakes contiguous.
         phase=8.05,
-        # Phase 7.A.3.b: OUTPUT_LO read is cross-step (the V slots pull
-        # the prev step's AX marker residual via attention back-edge).
-        # OUTPUT_HI_THIS_STEP keeps its B9 name because rename-only Option
-        # B is the documented choice for OUTPUT_HI in that split.
+        # Phase 7.A.3.a/b: BOTH OUTPUT_LO and OUTPUT_HI reads are
+        # cross-step here (the V slots pull the prev step's AX marker
+        # residual via attention back-edge). Renames use PREV_STEP
+        # aliases (same numeric base, byte-identical bakes).
         reads={"MARK_AX", "HAS_SE", "OUTPUT_LO_PREV_STEP",
-               "OUTPUT_HI_THIS_STEP", "CONST",
+               "OUTPUT_HI_PREV_STEP", "CONST",
                "OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR", "OP_LEV",
                "OP_BZ", "OP_BNZ", "OP_PSH", "OP_ADJ", "OP_ENT",
                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
@@ -1803,14 +1803,16 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
-        # B9 OUTPUT_HI split: this op's docstring is "refresh
-        # AX_CARRY from prev step's AX marker OUTPUT". The V reads on
-        # OUTPUT_LO/HI_THIS_STEP at the AX marker pull the PREVIOUS step's
-        # cached residual via attention -- NOT a same-step data dep on
-        # any L8+ producer. requires["after"]=layer16_lev_routing tells
-        # the dynamic scheduler that the read is satisfied by the prev
-        # step's final OUTPUT writer. See
-        # docs/B9_OUTPUT_HI_SPLIT_SPEC.md §2.2 and §6.3.
+        # Phase 7.A.3: the OUTPUT_HI read has been renamed to the
+        # cross-step alias ``OUTPUT_HI_PREV_STEP`` so the dynamic
+        # scheduler resolves it via dim algebra (no same-step producers
+        # write the PREV_STEP alias).  ``requires["after"]`` remains
+        # because the sibling OUTPUT_LO read is also cross-step (head 6
+        # gathers prev step's AX marker OUTPUT byte) but OUTPUT_LO has
+        # no PREV_STEP alias yet -- the requires keeps suppressing the
+        # OUTPUT_LO data-flow edges from same-step producers.  When
+        # OUTPUT_LO gets the same split treatment, the requires can be
+        # removed entirely.  See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §2.2.
         requires={"after": "layer16_lev_routing"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
