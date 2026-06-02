@@ -68,6 +68,24 @@ def _lower_io_putchar_routing_ir(ffn, S: float, BD) -> int:
     )
 
 
+def _io_putchar_routing_ir(dim_positions, HD, S: float = 100.0) -> CompilerIR:
+    """Informational :class:`CompilerIR` for ``io_putchar_routing``.
+
+    Mirrors ``_function_call_weights_ir`` -- exposed via
+    ``compiler_ir_factory=`` so the declarative verifier and symbolic
+    tooling see the 33 :class:`FFNRule` declarations the bake lowers.
+    The production bake stays in :func:`_lower_io_putchar_routing_ir`
+    because it pins ``start_unit=_IO_PUTCHAR_ROUTING_START_UNIT`` (1500)
+    while ``CompilerIR.lower_ffn`` lowers at ``start_unit=0``; both
+    produce the same per-rule weights at their respective offsets.
+    Phase 11.A.
+    """
+    del dim_positions, HD
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_io_putchar_routing_rules(S))
+    return ir
+
+
 def make_io_putchar_routing_op() -> Operation:
     """Bake L6 FFN PUTCHAR routing units (IO_IS_PUTCHAR + AX_CARRY -> OUTPUT).
 
@@ -127,6 +145,8 @@ def make_io_putchar_routing_op() -> Operation:
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        # Phase 11.A IR exposure: informational factory (33 FFNRules).
+        compiler_ir_factory=_io_putchar_routing_ir,
         phase=998,
         migrated=True,
         claims=_claims,
@@ -1273,6 +1293,9 @@ def make_branch_override_patch_op() -> Operation:  # noqa: E302
         phase=1100,
         migrated=True,
         declarative_authority="structural_model",
+        # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
+        # no static FFNRule form -- introspects already-baked weights).
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#control-flow",
     )
@@ -1358,6 +1381,9 @@ def make_l6_dead_unit_zero_op() -> Operation:
         phase=1160,
         migrated=True,
         declarative_authority="structural_model",
+        # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
+        # no static FFNRule form -- introspects already-baked weights).
+        compiler_ir=CompilerIR(),
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1443,6 +1469,9 @@ def make_l7_dead_unit_zero_op() -> Operation:
         phase=1170,
         migrated=True,
         declarative_authority="structural_model",
+        # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
+        # no static FFNRule form -- introspects already-baked weights).
+        compiler_ir=CompilerIR(),
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1463,6 +1492,9 @@ def make_right_size_ffns_op() -> Operation:
         phase=1200,
         migrated=True,
         declarative_authority="structural_model",
+        # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
+        # no static FFNRule form -- introspects already-baked weights).
+        compiler_ir=CompilerIR(),
         smoke_tests=set(),
         spec_section=None,
     )
@@ -1499,6 +1531,9 @@ def make_expand_wrapper_blocks_op() -> Operation:
         phase=1300,
         migrated=True,
         declarative_authority="structural_model",
+        # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
+        # no static FFNRule form -- introspects already-baked weights).
+        compiler_ir=CompilerIR(),
         smoke_tests=set(),
         spec_section=None,
     )
@@ -1671,6 +1706,18 @@ def _head_bake_ir(dim_positions) -> CompilerIR:
     return ir
 
 
+def _head_bake_ir_factory(dim_positions, HD) -> CompilerIR:
+    """``compiler_ir_factory``-shaped wrapper around :func:`_head_bake_ir`.
+
+    Mirrors the ``(dim_positions, head_dim)`` signature expected by
+    :func:`layer_compiler._make_operation_ir`. ``HD`` is unused because
+    head-bake writes ``model.head.{weight,bias}`` (no attention head
+    state). Phase 11.A.
+    """
+    del HD
+    return _head_bake_ir(dim_positions)
+
+
 def make_head_bake_op() -> Operation:
     """Bake the output projection head: byte/marker token logits.
 
@@ -1718,6 +1765,8 @@ def make_head_bake_op() -> Operation:
         writes=set(),
         kind="model",
         declarative_bake_fn=_bake,
+        # Phase 11.A IR exposure: informational factory (~270 TokenEmbeddingRules).
+        compiler_ir_factory=_head_bake_ir_factory,
         phase=1000,
         declarative_authority="declarative",
         migrated=True,
