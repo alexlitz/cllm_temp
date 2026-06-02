@@ -709,9 +709,15 @@ def make_layer3_ffn_op() -> Operation:
         # at PC byte0 row (TEMP+1, TEMP+16) is still picked up at the same
         # numeric position because TEMP_PREV_STEP aliases TEMP. Breaks
         # back-edges L5/L7/L11/L14 → layer3_ffn on TEMP.
+        # Phase 8.A: OP_LEV_PREV_STEP marks the OP_LEV read as cross-step
+        # relative to L5 opcode_decode_ffn (writes OP_LEV at the PC marker
+        # of the current step). The L3 FFN's PC-increment / carry-correction
+        # rules use the previous step's OP_LEV decode as the "skip increment
+        # on LEV" suppressor — byte-identical because OP_LEV_PREV_STEP
+        # aliases OP_LEV. Breaks back-edge L5 → layer3_ffn on OP_LEV.
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
                "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV",
+               "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV_PREV_STEP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
@@ -988,9 +994,10 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         name="_layer3_ffn_dep_anchor",
         phase=3,
         # Phase 8.A.6 v2: matches layer3_ffn's TEMP_PREV_STEP rename.
+        # Phase 8.A: matches layer3_ffn's OP_LEV_PREV_STEP rename.
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
                "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV",
+               "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV_PREV_STEP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "EMBED_LO", "EMBED_HI",
@@ -1124,8 +1131,13 @@ def make_layer3_carry_forward_attn_op() -> Operation:
     return Operation(
         name="layer3_carry_forward_attn",
         phase=3,
+        # Phase 8.A: OP_LEV_PREV_STEP marks head 6 (_lev_bp_to_pc_head_spec)
+        # gating on OP_LEV as cross-step relative to L5 opcode_decode_ffn
+        # (the OP_LEV writer). The head's Q[0]+=OP_LEV*L/5 still resolves
+        # to the same numeric position because OP_LEV_PREV_STEP aliases
+        # OP_LEV. Breaks back-edge L5 → layer3_carry_forward_attn on OP_LEV.
         reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
-               "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV", "HAS_SE",
+               "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV_PREV_STEP", "HAS_SE",
                "H1", "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                # Phase 7.A.3.b: head 5 reads prev-step OUTPUT_LO via the
