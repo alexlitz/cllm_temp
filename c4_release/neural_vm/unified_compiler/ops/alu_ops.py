@@ -343,12 +343,12 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
 
     return Operation(
         name="efficient_l8_addsub_wrap",
+        requires={"after": ("initial_pc_bake",)},
         reads=set(),
         writes=set(),
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=1002,
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_add_16bit",
@@ -1011,11 +1011,11 @@ def make_layer10_residual_alibi_slopes_op(alu_mode: str = 'lookup') -> Operation
 
     return Operation(
         name="layer10_residual_alibi_slopes",
+        requires={"after": ("residual_alibi_slopes",)},
         reads=set(),
         writes=set(),
         kind="model",
         declarative_bake_fn=_bake,
-        phase=999.1,
         migrated=True,
         declarative_authority="structural_model",
         smoke_tests=set(),
@@ -1066,7 +1066,6 @@ def make_l8_alu_addsub_bdtoge_op() -> Operation:
 
     return Operation(
         name="l8_alu_addsub_bdtoge",
-        phase=8.0,
         reads=set(),
         writes=set(),
         kind="model",  # no-op model op; documentation only
@@ -1091,7 +1090,7 @@ def make_l8_alu_addsub_stage1_op() -> Operation:
 
     return Operation(
         name="l8_alu_addsub_stage1",
-        phase=8.1,
+        requires={"after": ("l8_alu_addsub_bdtoge",)},
         reads=set(),
         writes=set(),
         kind="model",
@@ -1118,7 +1117,7 @@ def make_l8_alu_addsub_stage2_op() -> Operation:
 
     return Operation(
         name="l8_alu_addsub_stage2",
-        phase=8.2,
+        requires={"after": ("l8_alu_addsub_stage1",)},
         reads=set(),
         writes=set(),
         kind="model",
@@ -1143,7 +1142,7 @@ def make_l8_alu_addsub_stage3_op() -> Operation:
 
     return Operation(
         name="l8_alu_addsub_stage3",
-        phase=8.3,
+        requires={"after": ("l8_alu_addsub_stage2",)},
         reads=set(),
         writes=set(),
         kind="model",
@@ -1168,7 +1167,7 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
 
     return Operation(
         name="l8_alu_addsub_getobd",
-        phase=8.4,
+        requires={"after": ("l8_alu_addsub_stage3",)},
         reads=set(),
         writes=set(),
         kind="model",
