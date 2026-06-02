@@ -456,6 +456,16 @@ class FlattenedDivMod(nn.Module):
         # byte-identical. Per docs/ONNX_EXPORT_STATUS_2026_05_11.md
         # blocker 1.
         if torch.onnx.is_in_onnx_export() or torch.compiler.is_compiling():
+            # Phase 8.O.3: same div_mode gate as the eager path. We can't
+            # use Python branches under tracing, so log_softmax1 simply
+            # cannot be exported until it is implemented.
+            from .config import get_config
+            if get_config().div_mode == "log_softmax1":
+                raise NotImplementedError(
+                    "div_mode='log_softmax1' is a Phase 8.O.3 stub and "
+                    "cannot be ONNX-exported / torch.compile-traced. Use "
+                    "div_mode='long_div' (default)."
+                )
             return pipeline(x_bd)
 
         BD = self.BD
@@ -463,6 +473,37 @@ class FlattenedDivMod(nn.Module):
         op_mod_max = x_bd[..., BD.OP_MOD].max()
         if float(op_div_max.item()) < 0.1 and float(op_mod_max.item()) < 0.1:
             return x_bd
+
+        # Phase 8.O.3 div_mode gate. The default ``"long_div"`` path is
+        # ``pipeline(x_bd)`` below — byte-identical to every pre-8.O.3
+        # baseline. The alternative ``"log_softmax1"`` path (BLOG_SPEC.md
+        # §"Via Attention With Log Sink") would replace the long-division
+        # FFN pipeline with an attention construction: 8 lookup tokens at
+        # positions 0..7 carrying exp-scale keys ``L_j[d] = log(16^j d)``
+        # for ``d=1..15`` (and ``-inf`` for ``d=0``), plus a softmax1 sink
+        # at BOS that contributes the +1 in the denominator, yielding
+        # weight ``1/(1+(n-1)) = 1/n`` on the sink. The construction
+        # cannot divide correctly in the first 8 tokens, which is why
+        # BLOG_SPEC sets the default to long division. Wiring this into
+        # the L10 DIV staging path would require new L10 attention heads
+        # with masked exp-scale key tables and (n-1)-nibble query setup;
+        # see the Phase 8.O.3 note on ``VMConfig.div_mode`` for the full
+        # rationale. Stubbed here to land the toggle without an invasive
+        # attention rewire. The check is gated on DIV/MOD actually being
+        # active (we passed the early-out above), so unrelated programs
+        # never trigger the stub.
+        from .config import get_config
+        cfg = get_config()
+        if cfg.div_mode == "log_softmax1":
+            raise NotImplementedError(
+                "div_mode='log_softmax1' is a Phase 8.O.3 stub: the "
+                "softmax1-sink-based 1/n attention construction "
+                "(BLOG_SPEC.md \"Via Attention With Log Sink\") is not "
+                "yet wired into the L10 DIV staging path. Switch back "
+                "to div_mode='long_div' (the default, byte-identical to "
+                "baseline) to execute DIV/MOD. See "
+                "neural_vm.config.VMConfig.div_mode for design notes."
+            )
 
         return pipeline(x_bd)
 

@@ -63,6 +63,30 @@ class VMConfig:
     use_rms_norm: bool = False
     rms_norm_eps: float = 1e-6
 
+    # Division implementation (Phase 8.O.3)
+    # - "long_div" (default): base-16 long division via threshold counting
+    #   per quotient digit (q = Σ_{k=1..15} step(rem - k * div)). This is
+    #   the ALiBi-equivalent default: byte-identical to every pre-8.O.3
+    #   baseline because the existing FlattenedDivMod pipeline IS the long
+    #   division implementation. See BLOG_SPEC.md §"Long Division
+    #   Implementation".
+    # - "log_softmax1": attention-based 1/n via softmax1 sink + exp-scale
+    #   keys at the first 8 tokens (BLOG_SPEC.md §"Via Attention With Log
+    #   Sink"). REQUIRES ``attention_normalization == "softmax1"``: the
+    #   construction relies on the +1 in the softmax1 denominator giving
+    #   weight 1/(1+(n-1)) = 1/n on the sink.
+    #   STATUS (Phase 8.O.3): documented as a stub. The current
+    #   FlattenedDivMod pipeline is the long-division path; wiring the
+    #   alternative attention construction into the L10 DIV staging path
+    #   would require new attention heads at L10 with masked exp-scale
+    #   key tables at the first 8 tokens (BLOG_SPEC notes this can't
+    #   correctly divide in the first 8 tokens) plus query setup from
+    #   the (n-1) nibble decomposition. That is invasive enough that
+    #   the spec itself sets the default behavior to long division. The
+    #   toggle is plumbed so log_softmax1 raises ``NotImplementedError``
+    #   at DIV/MOD execution time with a pointer back to BLOG_SPEC.md.
+    div_mode: Literal["long_div", "log_softmax1"] = "long_div"
+
     def __post_init__(self):
         if self.positional_encoding not in {"alibi", "rope", "hybrid"}:
             raise ValueError(
@@ -80,6 +104,24 @@ class VMConfig:
 
         # Keep the legacy attribute useful after construction.
         self.use_softmax1 = self.attention_normalization == "softmax1"
+
+        # Phase 8.O.3 div_mode validation: log_softmax1 requires softmax1
+        # attention because the 1/n construction relies on the +1 in the
+        # softmax1 denominator giving weight 1/(1+(n-1)) = 1/n on the sink.
+        if self.div_mode not in {"long_div", "log_softmax1"}:
+            raise ValueError(
+                "div_mode must be one of {'long_div', 'log_softmax1'}"
+            )
+        if (
+            self.div_mode == "log_softmax1"
+            and self.attention_normalization != "softmax1"
+        ):
+            raise ValueError(
+                "div_mode='log_softmax1' requires attention_normalization="
+                "'softmax1' (the 1/n attention construction relies on the "
+                "softmax1 sink). Got attention_normalization="
+                f"{self.attention_normalization!r}."
+            )
 
     @classmethod
     def alibi_mode(cls, **kwargs) -> "VMConfig":
@@ -125,6 +167,7 @@ def get_config() -> VMConfig:
         )
         use_rms_norm = _env_bool("NEURAL_VM_USE_RMS_NORM", False)
         rms_norm_eps = _env_float("NEURAL_VM_RMS_NORM_EPS", 1e-6)
+        div_mode = os.environ.get("NEURAL_VM_DIV_MODE", "long_div")
 
         if pos_encoding == "rope":
             factory = VMConfig.rope_mode
@@ -137,6 +180,7 @@ def get_config() -> VMConfig:
             attention_normalization=attention_normalization,
             use_rms_norm=use_rms_norm,
             rms_norm_eps=rms_norm_eps,
+            div_mode=div_mode,
         )
     return _global_config
 
