@@ -1992,7 +1992,6 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
 
     return Operation(
         name="layer10_psh_stack0_passthrough",
-        phase=10,
         reads={"MARK_STACK0", "OP_PSH", "AX_CARRY_LO", "AX_CARRY_HI",
                "OP_LI", "OP_LC", "OP_SI", "OP_SC"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
