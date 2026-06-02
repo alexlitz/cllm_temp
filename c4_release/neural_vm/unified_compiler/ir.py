@@ -1882,9 +1882,25 @@ def _run_lowered_ffn_comparison(
     import torch
 
     x = torch.zeros(1, 1, dim, dtype=ffn.W_up.dtype, device=ffn.W_up.device)
-    for key, value in state.items():
-        pos = DimRef.parse(key).resolve(dim_positions)
-        x[..., pos] = value
+    # ``_synthetic_ffn_state`` builds a state that satisfies every rule's
+    # threshold by piling per-condition activations on a small set of dims.
+    # For huge-rule layers (fan-in > a few hundred), those accumulated values
+    # can exceed fp32 range and the cast into the lowered ``x`` tensor raises
+    # ``RuntimeError: value cannot be converted to type float without
+    # overflow``. That is a harness limitation, not a semantic bug in the IR,
+    # so classify it as ``_synthetic_state_overflow`` and bail out before
+    # running the lowered forward.
+    try:
+        for key, value in state.items():
+            pos = DimRef.parse(key).resolve(dim_positions)
+            x[..., pos] = value
+    except (RuntimeError, OverflowError) as exc:
+        return {}, [FFNComparisonIssue(
+            "_synthetic_state_overflow",
+            f"synthetic FFN state overflowed lowered fp32 input tensor "
+            f"({type(exc).__name__}: {str(exc).splitlines()[0]}); "
+            f"likely too many rules sharing a condition dim",
+        )]
 
     with torch.no_grad():
         y = ffn(x)

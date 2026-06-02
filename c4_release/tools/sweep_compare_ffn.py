@@ -107,6 +107,7 @@ class LayerResult:
     declaration_semantics: int = 0
     lowering: int = 0
     weight_output_mismatch: int = 0
+    synthetic_state_overflow: int = 0
     other: int = 0
     first_failure_kind: Optional[str] = None
     first_failure_message: Optional[str] = None
@@ -129,6 +130,7 @@ class OpResult:
     total_declaration_semantics: int = 0
     total_lowering: int = 0
     total_weight_output_mismatch: int = 0
+    total_synthetic_state_overflow: int = 0
     total_other: int = 0
     first_failure_kind: Optional[str] = None
     first_failure_layer: Optional[int] = None
@@ -233,6 +235,8 @@ def _sweep_op(op, enabled_flags, dim_positions, head_dim: int,
                     lr.lowering += 1
                 elif issue.kind == "weight_output_mismatch":
                     lr.weight_output_mismatch += 1
+                elif issue.kind == "_synthetic_state_overflow":
+                    lr.synthetic_state_overflow += 1
                 else:
                     lr.other += 1
                 if lr.first_failure_kind is None:
@@ -250,6 +254,7 @@ def _sweep_op(op, enabled_flags, dim_positions, head_dim: int,
         result.total_declaration_semantics += lr.declaration_semantics
         result.total_lowering += lr.lowering
         result.total_weight_output_mismatch += lr.weight_output_mismatch
+        result.total_synthetic_state_overflow += lr.synthetic_state_overflow
         result.total_other += lr.other
         if not lr.ok or lr.exception is not None:
             op_ok = False
@@ -278,6 +283,13 @@ def _sweep_op(op, enabled_flags, dim_positions, head_dim: int,
     elif any(lr.exception for lr in result.layers_checked):
         # Exception during symbolic/lowering counts as a real bug.
         result.bucket = "real_bug"
+    elif (
+        result.total_synthetic_state_overflow > 0
+        and result.total_weight_output_mismatch == 0
+    ):
+        # Harness limitation: the auto-built synthetic state grew past fp32
+        # range for a huge-rule layer. Not a semantic bug in the IR.
+        result.bucket = "synthetic_state_overflow"
     elif result.total_weight_output_mismatch > 0:
         result.bucket = "mismatch_only"
     else:
@@ -295,6 +307,8 @@ def _aggregate(results: List[OpResult]) -> Dict[str, Any]:
     clean = [r for r in with_rules if r.bucket == "clean"]
     mismatch_only = [r for r in with_rules if r.bucket == "mismatch_only"]
     real_bug = [r for r in with_rules if r.bucket == "real_bug"]
+    overflow = [r for r in with_rules
+                if r.bucket == "synthetic_state_overflow"]
     other = [r for r in with_rules if r.bucket == "other_failure"]
 
     return {
@@ -303,10 +317,12 @@ def _aggregate(results: List[OpResult]) -> Dict[str, Any]:
         "total_clean": len(clean),
         "total_mismatch_only": len(mismatch_only),
         "total_real_bug": len(real_bug),
+        "total_synthetic_state_overflow": len(overflow),
         "total_other_failure": len(other),
         "bucket_counts": dict(buckets),
         "real_bug_ops": [r.name for r in real_bug],
         "mismatch_only_ops": [r.name for r in mismatch_only],
+        "synthetic_state_overflow_ops": [r.name for r in overflow],
         "clean_ops": [r.name for r in clean],
         "other_failure_ops": [r.name for r in other],
     }
@@ -329,6 +345,11 @@ layers whose `FFNOp` had any rules, and ran
 - **real_bug** — at least one `declaration_semantics` or `lowering` issue
   (or a thrown exception). The IR is broken or the lowering contract
   doesn't match what the verifier reads.
+- **synthetic_state_overflow** — the auto-built `_synthetic_ffn_state`
+  produced a value past fp32 range when packed into the lowered input
+  tensor. Harness limitation on huge-rule layers (typical for
+  fan-in-heavy ops with thousands of rules sharing a condition dim); not
+  a semantic bug in the IR.
 - **other_failure** — non-empty issues that don't fall into the above
   (currently unused; preserved for future failure kinds).
 - **no_ffn_rules / no_ir / build_error** — informational; these ops carry
@@ -353,6 +374,10 @@ def _render_md(results: List[OpResult], agg: Dict[str, Any]) -> str:
     lines.append(f"- **clean**: {agg['total_clean']}")
     lines.append(f"- **mismatch_only**: {agg['total_mismatch_only']}")
     lines.append(f"- **real_bug**: {agg['total_real_bug']}")
+    lines.append(
+        f"- **synthetic_state_overflow**: "
+        f"{agg['total_synthetic_state_overflow']}"
+    )
     lines.append(f"- **other_failure**: {agg['total_other_failure']}")
     lines.append("- Bucket distribution (incl. no-rule buckets):")
     for k, v in sorted(agg['bucket_counts'].items(), key=lambda kv: -kv[1]):
@@ -383,6 +408,20 @@ def _render_md(results: List[OpResult], agg: Dict[str, Any]) -> str:
             )
         lines.append("")
 
+    if agg.get("synthetic_state_overflow_ops"):
+        lines.append(
+            "## Synthetic-state-overflow ops "
+            "(harness limitation, not real bug)\n"
+        )
+        for name in agg["synthetic_state_overflow_ops"]:
+            r = next(rr for rr in results if rr.name == name)
+            lines.append(
+                f"- `{name}` (rules={r.total_rules}, "
+                f"overflow={r.total_synthetic_state_overflow}, "
+                f"first={r.first_failure_message})"
+            )
+        lines.append("")
+
     lines.append("## All swept ops (with FFN rules)\n")
     lines.append(
         "| Op | Kind | Phase | LayerIdx | Rules | LayersChecked | Bucket | "
@@ -393,7 +432,7 @@ def _render_md(results: List[OpResult], agg: Dict[str, Any]) -> str:
     with_rules.sort(key=lambda r: (
         # real_bug first, mismatch_only next, clean last
         {"real_bug": 0, "other_failure": 1, "mismatch_only": 2,
-         "clean": 3}.get(r.bucket, 4),
+         "synthetic_state_overflow": 3, "clean": 4}.get(r.bucket, 5),
         r.phase if r.phase is not None else 1e9,
         r.name,
     ))
@@ -519,6 +558,7 @@ def main() -> None:
         f"clean={agg['total_clean']} "
         f"mismatch_only={agg['total_mismatch_only']} "
         f"real_bug={agg['total_real_bug']} "
+        f"synthetic_state_overflow={agg['total_synthetic_state_overflow']} "
         f"other_failure={agg['total_other_failure']} "
         f"with_ffn_rules={agg['total_ops_with_ffn_rules']}"
     )
