@@ -1175,6 +1175,25 @@ def make_layer8_alu_op() -> Operation:
             # binary-op semantics for any operand A computation.
             "ALU_LO": "AX_byte0",
         },
+        # Phase 8.A SCC step 4 (ALU_LO chain): the ALU pipeline reads
+        # ALU_LO from ``layer7_operand_gather`` (same-step, fresh at AX
+        # byte 0 -- see ``consumes_fresh`` above). The L10/L16 ops that
+        # also write ALU_LO (``layer10_stack0_byte_relay{,_bake}``,
+        # ``layer16_lev_routing``) stage the band for the NEXT step's
+        # residual; without an explicit prev-step marker the scheduler
+        # interprets every L10+ ALU_LO writer as a forward-cycle
+        # back-edge into this L8 reader. Declaring
+        # ``requires["after"] = "layer16_lev_routing"`` opts this op
+        # into the B9 R-OH-2 prev-step semantics for ALU_LO: the read
+        # is satisfied by L16's prev-step write via the KV cache, and
+        # every other L10+ writer's data-flow edge into ``layer8_alu``
+        # on ALU_LO is suppressed by ``_topological_sort``. The L7
+        # same-step producer remains the actual data source (recorded
+        # by ``consumes_fresh``) -- this declaration is the cycle-graph
+        # acknowledgement, not a data-flow change. Mirrors the
+        # ``layer8_head6_ax_carry_refresh`` pattern (L8 phase reading
+        # an L16-written band via prev-step residual).
+        requires={"after": "layer16_lev_routing"},
         smoke_tests={
             "TestSmokeBasic::test_add_basic",
             "TestSmokeBasic::test_sub_basic",

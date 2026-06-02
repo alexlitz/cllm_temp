@@ -1173,6 +1173,16 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         consumes_fresh={
             "ALU_HI": "AX_byte0",
         },
+        # Phase 8.A SCC step 4 (ALU_LO chain): see ``make_layer8_alu_op``'s
+        # ``requires`` comment for the full rationale. The L9 ALU reads
+        # ALU_LO/AX_CARRY_LO at the AX marker (operand A low nibble +
+        # operand B low nibble for ADD/SUB borrow / carry propagation) --
+        # both same-step fresh from L7 operand_gather / L8 head6 carry
+        # refresh. L10/L16 ALU_LO writers stage NEXT-step residuals;
+        # ``requires["after"] = "layer16_lev_routing"`` opts L9 into the
+        # B9 R-OH-2 prev-step semantics so the L10/L16 forward-cycle
+        # back-edges on ALU_LO collapse.
+        requires={"after": "layer16_lev_routing"},
         # ``_set_layer9_alu`` writes the ADD/LEA/SUB/AND/OR/XOR/CMP/etc.
         # cross-product cluster (~3398 units), and the bake chains into
         # ``_set_layer9_marker_suppress`` for 7 more NEXT_* suppression

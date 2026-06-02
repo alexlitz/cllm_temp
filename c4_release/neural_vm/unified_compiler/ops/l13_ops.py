@@ -558,6 +558,18 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
             "ALU_HI": "AX_byte0",
             "AX_CARRY_LO": "AX_byte0",
         } if alu_mode == "lookup" else {},
+        # Phase 8.A SCC step 4 (ALU_LO chain): see ``make_layer8_alu_op``'s
+        # ``requires`` comment for the full rationale. L13 shifts read
+        # ALU_LO at AX byte 0 (value-to-shift low nibble; same-step fresh
+        # from L7 operand_gather per ``consumes_fresh`` above when
+        # alu_mode=='lookup'). The L16 ALU_LO writer stages a NEXT-step
+        # residual; ``requires["after"] = "layer16_lev_routing"`` opts
+        # L13 into the B9 R-OH-2 prev-step semantics so the L16
+        # forward-cycle back-edge on ALU_LO collapses. Declared
+        # unconditionally so the scheduler graph is identical across
+        # alu_modes (the constraint is cycle-graph bookkeeping, not a
+        # data-flow change).
+        requires={"after": "layer16_lev_routing"},
         smoke_tests={
             "TestSmoke32Bit::test_shl_8bit",
             "TestSmoke32Bit::test_shr_8bit",

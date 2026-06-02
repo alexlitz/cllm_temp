@@ -2468,6 +2468,15 @@ def make_layer10_alu_op() -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
+        # Phase 8.A SCC step 4 (ALU_LO chain): see ``make_layer8_alu_op``'s
+        # ``requires`` comment for the full rationale. L10 ALU's ALU_LO
+        # read is the same-step operand-A nibble (from L7 operand_gather,
+        # asserted by ``consumes_fresh`` above). The phase=10.4 / phase=16
+        # ALU_LO writers stage NEXT-step residuals;
+        # ``requires["after"] = "layer16_lev_routing"`` opts L10 into the
+        # B9 R-OH-2 prev-step semantics so the L10 stack0 byte relay and
+        # L16 LEV routing forward-cycle back-edges on ALU_LO collapse.
+        requires={"after": "layer16_lev_routing"},
         # ``_set_layer10_alu`` writes the comparison-combine (18 units) +
         # bitwise-cross-product (~1536) + AX passthrough (~32) + DIV/MOD
         # setup units, reaching unit 1845. No other op writes to L10 FFN
@@ -2752,6 +2761,17 @@ def make_l10_post_ops_combined() -> Operation:
         declarative_bake_fn=bake,
         migrated=True,
         declarative_authority="declarative",
+        # Phase 8.A SCC step 4 (ALU_LO chain): see ``make_layer8_alu_op``'s
+        # ``requires`` comment for the full rationale. The L10 byte
+        # post-ops read ALU_LO/HI at byte-cleanup positions to drive the
+        # carry-propagation and zeroing rules; the ALU_LO read is
+        # satisfied by L7 operand_gather + L8/L9/L10 ALU's same-step
+        # output (this op runs at phase=10.5 after layer10_alu at 10.2).
+        # The L16 ALU_LO writer stages a NEXT-step residual;
+        # ``requires["after"] = "layer16_lev_routing"`` opts this op into
+        # the B9 R-OH-2 prev-step semantics so the L16 forward-cycle
+        # back-edge on ALU_LO collapses.
+        requires={"after": "layer16_lev_routing"},
         ffn_units_used=1562,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
