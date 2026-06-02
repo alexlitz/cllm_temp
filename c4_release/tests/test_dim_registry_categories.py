@@ -27,6 +27,7 @@ from neural_vm.dim_registry import (
     DimRegistry,
     DimSlot,
     build_default_registry,
+    dim_ref,
 )
 
 
@@ -195,6 +196,101 @@ def test_alloc_without_category_still_works():
 
     # The categories() helper omits the slot since it has no binding.
     assert reg.categories() == {}
+
+
+# ---------------------------------------------------------------------------
+# 4. Phase 7.E.2 — dim_ref helper produces byte-identical legacy strings
+# ---------------------------------------------------------------------------
+def test_dim_ref_carry_alu_byte_index_roles():
+    """``dim_ref("carry", "alu", k)`` returns ``"CARRY+k"`` for the
+    four byte-index roles of the inter-byte ALU carry cascade.
+
+    This is the canonical Phase 7.E.2 migration shape: a rule that
+    today writes ``("CARRY+0", scale)`` re-expresses the same write as
+    ``(dim_ref("carry", "alu", 0), scale)``. The returned string must
+    be byte-identical to the legacy form so the rule lowers to the
+    exact same SwiGLU matrix entries.
+    """
+    reg = _silent_default_registry()
+    for k in range(4):
+        assert dim_ref("carry", "alu", k, registry=reg) == f"CARRY+{k}"
+
+
+def test_dim_ref_output_lo_hi_nibble_roles():
+    """``output_lo`` / ``output_hi`` nibble bands resolve to
+    ``OUTPUT_LO+k`` / ``OUTPUT_HI+k`` (k = nibble value, structural
+    one-hot index)."""
+    reg = _silent_default_registry()
+    for k in range(16):
+        assert dim_ref("output_lo", "nibble", k, registry=reg) == f"OUTPUT_LO+{k}"
+        assert dim_ref("output_hi", "nibble", k, registry=reg) == f"OUTPUT_HI+{k}"
+
+
+def test_dim_ref_ax_carry_register_roles():
+    """``ax_carry_lo``/``ax_carry_hi`` map to the AX carry-forward
+    staging slot families. The ``offset`` is the nibble value (one-hot
+    cell within the 16-wide band)."""
+    reg = _silent_default_registry()
+    assert dim_ref("ax_carry_lo", "AX", 0, registry=reg) == "AX_CARRY_LO+0"
+    assert dim_ref("ax_carry_lo", "AX", 15, registry=reg) == "AX_CARRY_LO+15"
+    assert dim_ref("ax_carry_hi", "AX", 7, registry=reg) == "AX_CARRY_HI+7"
+
+
+def test_dim_ref_opcode_role():
+    """``opcode_flag`` carries one role per opcode (LEA, IMM, ...). The
+    ``offset`` argument is always 0 for these 1-wide gate slots."""
+    reg = _silent_default_registry()
+    assert dim_ref("opcode_flag", "ADD", registry=reg) == "OP_ADD+0"
+    assert dim_ref("opcode_flag", "LEA", registry=reg) == "OP_LEA+0"
+    assert dim_ref("opcode_flag", "PUTCHAR", registry=reg) == "OP_PUTCHAR+0"
+
+
+def test_dim_ref_missing_pair_raises():
+    """Unregistered ``(category, role)`` pairs surface the same
+    ``KeyError`` that :meth:`resolve_dim` raises so typos are caught at
+    rule-construction time."""
+    reg = _silent_default_registry()
+    with pytest.raises(KeyError) as excinfo:
+        dim_ref("nonexistent_category", "missing_role", registry=reg)
+    msg = str(excinfo.value)
+    assert "nonexistent_category" in msg
+    assert "missing_role" in msg
+
+
+def test_dim_ref_uses_default_registry_when_not_provided():
+    """Callers that omit ``registry=`` get the lazy default-built
+    registry. The result must match the explicit-registry path so
+    production rule definitions don't need to thread a registry
+    through."""
+    reg = _silent_default_registry()
+    # Suppress the default-registry build's deprecation warnings if any
+    # leak through the lazy cache.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=DeprecationWarning)
+        implicit = dim_ref("carry", "alu", 2)
+    explicit = dim_ref("carry", "alu", 2, registry=reg)
+    assert implicit == explicit == "CARRY+2"
+
+
+def test_slot_for_category_returns_name():
+    """``slot_for_category`` returns the bare slot NAME (no ``+N``
+    suffix), which callers can use to construct refs with a custom
+    offset format."""
+    reg = _silent_default_registry()
+    assert reg.slot_for_category("carry", "alu") == "CARRY"
+    assert reg.slot_for_category("ax_carry_lo", "AX") == "AX_CARRY_LO"
+    assert reg.slot_for_category("opcode_flag", "ADD") == "OP_ADD"
+
+
+def test_slot_for_category_missing_raises():
+    """``slot_for_category`` raises ``KeyError`` for unregistered
+    pairs (same diagnostic as :meth:`resolve_dim`)."""
+    reg = _silent_default_registry()
+    with pytest.raises(KeyError) as excinfo:
+        reg.slot_for_category("nope", "missing")
+    msg = str(excinfo.value)
+    assert "nope" in msg
+    assert "missing" in msg
 
 
 def test_alloc_with_category_indexes_in_resolve():

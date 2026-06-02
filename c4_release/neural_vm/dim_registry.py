@@ -207,6 +207,33 @@ class DimRegistry:
         slot_name = self._category_index[key]
         return self.slots[slot_name].start
 
+    def slot_for_category(self, category: str, role: str) -> str:
+        """Return the slot NAME registered under ``(category, role)``.
+
+        Phase 7.E.2 helper: rule authors use this to emit the legacy
+        ``"NAME+N"`` dim-ref string by semantic family rather than by
+        hard-coding the slot name. For example::
+
+            slot = reg.slot_for_category("carry", "alu")  # -> "CARRY"
+            ref = f"{slot}+{byte_index}"                   # -> "CARRY+0"
+
+        Coupled with :func:`dim_ref` this lets a rule that today reads
+        ``"CARRY+0"`` re-express the intent as
+        ``dim_ref("carry", "alu", byte_index=0)`` while emitting the
+        byte-identical legacy string into the IR.
+
+        Raises ``KeyError`` if no slot has been registered with the
+        requested ``(category, role)`` pair (same diagnostic as
+        :meth:`resolve_dim`).
+        """
+        key = (category, role)
+        if key not in self._category_index:
+            raise KeyError(
+                f"No dim registered for (category={category!r}, "
+                f"role={role!r})"
+            )
+        return self._category_index[key]
+
     def categories(self) -> Dict[str, List[str]]:
         """Return ``{category: [role, ...]}`` for every registered pair.
 
@@ -1227,6 +1254,88 @@ def _register_default_categories(reg: 'DimRegistry') -> None:
     ]
     for op in _OPCODE_ROLES:
         reg.register_category(f"OP_{op}", "opcode_flag", op)
+
+
+# ============================================================================
+# Phase 7.E.2 — (category, role) dim-ref string helper
+# ----------------------------------------------------------------------------
+# ``dim_ref`` lets FFNRule authors emit the legacy ``"NAME+offset"`` string
+# from a semantic ``(category, role)`` pair, so the rule definition reads
+# like a semantic family lookup instead of a hard-coded slot name. The
+# returned string is byte-identical to the legacy form: rules migrated to
+# ``dim_ref("carry", "alu", 0)`` produce the same ``"CARRY+0"`` ref that the
+# pre-migration code wrote by hand.
+#
+# A module-level lazy registry (``_default_registry_for_dim_ref``) is
+# constructed on first use so callers don't have to plumb a registry
+# through. The lazy registry uses :func:`build_default_registry` so its
+# category bindings match the production layout.
+# ============================================================================
+_DEFAULT_REGISTRY_FOR_DIM_REF: Optional[DimRegistry] = None
+
+
+def _default_registry_for_dim_ref() -> DimRegistry:
+    """Lazy default registry for :func:`dim_ref`.
+
+    Built once per process via :func:`build_default_registry` (which is
+    cheap) and cached. The deprecation warnings the build emits are
+    suppressed so the first call to ``dim_ref`` doesn't surface them to
+    every importer.
+    """
+    global _DEFAULT_REGISTRY_FOR_DIM_REF
+    if _DEFAULT_REGISTRY_FOR_DIM_REF is None:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=DeprecationWarning)
+            _DEFAULT_REGISTRY_FOR_DIM_REF = build_default_registry()
+    return _DEFAULT_REGISTRY_FOR_DIM_REF
+
+
+def dim_ref(
+    category: str,
+    role: str,
+    offset: int = 0,
+    *,
+    registry: Optional[DimRegistry] = None,
+) -> str:
+    """Return the ``"NAME+offset"`` dim ref string for ``(category, role)``.
+
+    Phase 7.E.2 migration helper: rules can read
+
+        ``("CARRY+0", 1.0)``
+
+    or, semantically equivalently,
+
+        ``(dim_ref("carry", "alu", 0), 1.0)``
+
+    Both produce the same byte-identical string (``"CARRY+0"`` resolves
+    to the same residual dim). The semantic form makes the role of the
+    offset explicit — here ``offset=0`` means "byte_index 0 of the
+    inter-byte ALU carry cascade".
+
+    The ``+0`` suffix is preserved even when ``offset == 0`` so the
+    resulting ref string round-trips through :meth:`DimRef.parse`
+    unambiguously. Callers that need the bare name can use
+    :meth:`DimRegistry.slot_for_category` instead.
+
+    Args:
+        category: semantic family (``"carry"``, ``"output_lo"``, ...).
+        role: family member (``"alu"``, ``"nibble"``, ...).
+        offset: per-cell offset into the slot. Defaults to ``0``.
+        registry: explicit registry. ``None`` (the default) uses the
+            cached :func:`build_default_registry` instance so callers
+            don't have to thread a registry through.
+
+    Returns:
+        The legacy ``"NAME+offset"`` string consumed by
+        :meth:`DimRef.parse`.
+
+    Raises:
+        KeyError: if ``(category, role)`` is not registered.
+    """
+    reg = registry if registry is not None else _default_registry_for_dim_ref()
+    slot_name = reg.slot_for_category(category, role)
+    return f"{slot_name}+{offset}"
 
 
 def build_default_contracts(registry: DimRegistry) -> List[LayerIO]:
