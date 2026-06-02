@@ -1025,7 +1025,6 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer3_ffn_dep_anchor",
-        phase=3,
         # Phase 8.A.6 v2: matches layer3_ffn's TEMP_PREV_STEP rename.
         # Phase 8.A: matches layer3_ffn's OP_LEV_PREV_STEP rename.
         # Phase 8.A (EMBED_HI split): matches layer3_ffn's
