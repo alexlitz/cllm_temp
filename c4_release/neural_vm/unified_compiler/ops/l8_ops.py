@@ -272,6 +272,99 @@ def _addr_mag_boost_o(dim_base):
     return tuple(writes)
 
 
+# === layer8_alu FFNRule migration ===================================
+#
+# The L8 ALU helper (``vm_step._set_layer8_alu``) writes ~2023 hidden units
+# arranged in 18 sub-stages (see :data:`_L8_FFN_UNIT_LAYOUT`). Each
+# sub-stage below returns a tuple of :class:`FFNRule` that lowers to the
+# same per-unit ``W_up`` / ``b_up`` / ``W_gate`` / ``b_gate`` / ``W_down``
+# writes the imperative helper produces, byte-for-byte.
+#
+# Substage cursor layout (matches _L8_FFN_UNIT_LAYOUT, also re-stated here
+# for cross-reference):
+#
+#   0..255      add_lo          (ADD lo nibble, gate=OP_ADD)
+#   256..511    lea_lo          (LEA lo nibble, gate=OP_LEA, FETCH_LO)
+#   512..767    sub_lo          (SUB lo nibble, gate=OP_SUB)
+#   768..887    add_carry       (ADD carry, gate=OP_ADD, 120 pairs)
+#   888..1007   lea_carry       (LEA carry, gate=OP_LEA, FETCH_LO, 120)
+#   1008..1263  adj_lo          (ADJ lo nibble, gate=OP_ADJ, FETCH_LO)
+#   1264..1383  adj_carry       (ADJ carry, gate=OP_ADJ, FETCH_LO, 120)
+#   1384..1503  sub_borrow      (SUB borrow, gate=OP_SUB, 120 pairs a<b)
+#   1504..1759  ent_lo          (ENT lo nibble, gate=OP_ENT, FETCH_LO)
+#   1760..1979  ent_borrow      (ENT borrow, 220 pairs, gate=OP_ENT)
+#   1980        cmp_group       (any comparison opcode flag; 1 unit)
+#   1981..1984  cmp_clear       (clear CMP[0..3] at AX marker; 4 units)
+#   1985..1986  ent_adj_defaults (ENT/ADJ first-step ALU defaults; 2)
+#   1987..2002  lev_byte0_lo    (LEV BP byte0 lo → ADDR_B0_LO; 16)
+#   2003..2018  lev_byte0_hi    (LEV BP byte0 hi → ADDR_B0_HI; 16)
+#   2019        lev_b1          (LEV ADDR_B1_LO zero; 1)
+#   2020        lev_b2          (LEV ADDR_B2_LO zero; 1)
+#   2021..2022  lea_axb2        (LEA first-step AX byte 2; 2)
+#
+# Each rule's ``scope=`` mirrors the helper's intent (the dim-presence
+# conjunction that the unit fires on). The ``dominates_at=`` field is
+# left at the rule-level scope; per-output dominance disambiguation is
+# only needed when a rule writes multiple output dims with different
+# competition shapes -- in this helper every rule writes either a
+# single OUTPUT_LO[k] / CARRY+0 / CMP_GROUP / ADDR_B*_LO[k] / ALU_*[0]
+# cell, so the scope is unambiguous.
+
+
+def _layer8_alu_block_non_ax_marker_conditions() -> tuple[tuple[str, float], ...]:
+    """LEA/ADJ/ENT non-AX-marker blockers (-S * 1000 on each blocker dim).
+
+    These mirror ``_block_non_ax_marker_sites`` inside ``_set_layer8_alu``:
+    blockers prevent the unit from firing at non-AX marker sites where
+    scale-40 LEA/ADJ/ENT operand fetch residuals could otherwise sneak
+    the unit on. Returned as condition terms (weight=-1000) so the
+    ``Primitives.lower_ffn_rules`` scales them by S, matching the
+    ``-S * 1000`` imperative writes.
+    """
+    return (
+        ("MARK_PC", -1000.0),
+        ("MARK_SP", -1000.0),
+        ("MARK_BP", -1000.0),
+        ("MARK_STACK0", -1000.0),
+        ("MARK_MEM", -1000.0),
+        ("MARK_SE", -1000.0),
+        ("IS_BYTE", -1000.0),
+    )
+
+
+def _layer8_alu_add_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADD lo nibble (256 units, offsets 0..255).
+
+    For each (a, b) pair in 16x16, fire when MARK_AX active, ALU_LO[a]
+    and AX_CARRY_LO[b] both one-hot, OP_ADD gating. MARK_PC blocker
+    (-S * 4) suppresses the unit at PC marker where L6 head 0 / L7
+    attention leakage could otherwise sneak it on. Writes
+    OUTPUT_LO[(a+b) mod 16] at 2.0/S.
+    """
+    write_scale = 2.0 / S
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            result = (a + b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_add_lo_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -4.0),
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"AX_CARRY_LO+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="OP_ADD",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_ADD",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_ADD",
+                },
+            ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
