@@ -433,7 +433,6 @@ def make_layer1_threshold_attn_op() -> Operation:
 
     return Operation(
         name="layer1_threshold_attn",
-        phase=1,
         reads={"IS_MARK", "MARK_SE_ONLY", "MARK_CS", "CONST"},
         writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE", "IN_STEP_FRESH"},
         kind="attn",
