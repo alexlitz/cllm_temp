@@ -1,5 +1,6 @@
 """ALU composite/wrapping op factories. See ../migrated_ops.py for history."""
 
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from .shared import _as_setdim_proxy, _make_alu_postop_attach_op, _ensure_l11_mul_module
 
@@ -385,7 +386,6 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=10.85,
         # Phase 8.G.6: drop ``layer_idx=10`` literal; bind to the L10
         # attn anchor ``layer10_carry_relay`` so the block op resolves
         # to whichever layer the compiler places the anchor at.
@@ -509,7 +509,6 @@ def make_l11_alu_mul_bdtoge_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=11.0,
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -542,7 +541,6 @@ def make_l11_alu_mul_schoolbook_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=11.1,
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -575,7 +573,6 @@ def make_l11_alu_mul_carrypass1_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=11.2,
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -609,7 +606,6 @@ def make_l11_alu_mul_carrypass2_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=11.3,
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -644,7 +640,6 @@ def make_l11_alu_mul_carrypass3_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=11.4,
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -678,7 +673,6 @@ def make_l12_alu_mul_genprop_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=12.0,
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -712,7 +706,6 @@ def make_l12_alu_mul_binarylookahead_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=12.1,
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -745,7 +738,6 @@ def make_l12_alu_mul_finalcorrection_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=12.2,
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -1080,6 +1072,9 @@ def make_l8_alu_addsub_bdtoge_op() -> Operation:
         kind="model",  # no-op model op; documentation only
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
+        # installed imperatively by set_vm_weights, validated against PureNeuralALU).
+        compiler_ir=CompilerIR(),
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
@@ -1102,6 +1097,9 @@ def make_l8_alu_addsub_stage1_op() -> Operation:
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
+        # installed imperatively by set_vm_weights, validated against PureNeuralALU).
+        compiler_ir=CompilerIR(),
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
@@ -1126,6 +1124,9 @@ def make_l8_alu_addsub_stage2_op() -> Operation:
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
+        # installed imperatively by set_vm_weights, validated against PureNeuralALU).
+        compiler_ir=CompilerIR(),
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
@@ -1148,6 +1149,9 @@ def make_l8_alu_addsub_stage3_op() -> Operation:
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
+        # installed imperatively by set_vm_weights, validated against PureNeuralALU).
+        compiler_ir=CompilerIR(),
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
@@ -1170,6 +1174,9 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
+        # installed imperatively by set_vm_weights, validated against PureNeuralALU).
+        compiler_ir=CompilerIR(),
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
