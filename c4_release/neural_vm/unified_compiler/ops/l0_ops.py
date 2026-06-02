@@ -174,7 +174,15 @@ def make_phase_a_ffn_op() -> Operation:
     return Operation(
         name="phase_a_ffn",
         phase=0,
-        reads={"H0", "H1", "H2", "H3", "H4"},
+        # Phase 7.A.1: H0..H4 are written by ``layer0_threshold_attn`` at the
+        # SAME layer (L0 attn substage feeds the L0 block-FFN substage within
+        # the same transformer block). Express this as a co-placement
+        # constraint via ``requires["same_layer_as"]`` rather than a depth-
+        # bumping ``reads`` edge, so analyze_scheduler.py and
+        # LayerCompiler._assign_layers agree on the layer assignment (both
+        # treat ``same_layer_as`` as equal-depth). The bake itself still
+        # consumes H0..H4 from the residual; ``reads`` is metadata only.
+        reads=set(),
         writes={"NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
                 "NEXT_STACK0", "NEXT_MEM", "NEXT_SE"},
         kind="block",
@@ -185,6 +193,7 @@ def make_phase_a_ffn_op() -> Operation:
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
+        requires={"same_layer_as": "layer0_threshold_attn"},
         # ``_set_phase_a_ffn`` writes one FFN hidden unit per transition in
         # the 7-entry ``transitions`` list (SE→PC, PC→AX, AX→SP, SP→BP,
         # BP→STACK0, STACK0→MEM, MEM→SE). Units 0..6.

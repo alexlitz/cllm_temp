@@ -82,11 +82,22 @@ def collect_ops() -> List[Operation]:
 
 def build_dep_graph(
     ops: List[Operation],
-) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]], Dict[str, List[str]]]:
+) -> Tuple[
+    Dict[str, Set[str]],
+    Dict[str, Set[str]],
+    Dict[str, List[str]],
+    Set[Tuple[str, str]],
+]:
     """Construct dependency edges A -> B for every declared-dep pair.
 
-    Returns ``(in_edges, out_edges, edge_reasons)`` where ``edge_reasons``
-    explains why each edge was created (for diagnostics).
+    Returns ``(in_edges, out_edges, edge_reasons, same_layer_edges)`` where
+    ``edge_reasons`` explains why each edge was created (for diagnostics)
+    and ``same_layer_edges`` is the set of ``(u, v)`` pairs whose ONLY
+    contribution comes from a ``requires["same_layer_as"]`` declaration
+    (i.e. the edge is a co-placement assertion, not a strict-after
+    constraint). ``topo_depth`` propagates ``depth[u]`` instead of
+    ``depth[u] + 1`` along those edges so the diagnostic matches the
+    LayerCompiler's ``_assign_layers`` semantics (Phase 7.A.1).
 
     Edges:
       * Data flow:        A.writes ∩ B.reads
@@ -95,13 +106,24 @@ def build_dep_graph(
         reference A.name as an op-name string (or a tuple/list of strings).
         See ``Operation.requires`` docstring for the B10 schema. Both keys
         contribute scheduling edges (``after`` => strictly later layer;
-        ``same_layer_as`` => ordered after for topo purposes, equality
-        enforced downstream by ``LayerCompiler._assign_layers``).
+        ``same_layer_as`` => peer-layer ordering, equality enforced
+        downstream by ``LayerCompiler._assign_layers``). An edge that
+        ONLY comes from ``same_layer_as`` (with no overlapping ``reads``,
+        ``produces``/``consumes_fresh`` or ``after`` contribution) is
+        recorded in ``same_layer_edges`` so ``topo_depth`` treats it as
+        depth-equal rather than depth+1.
     """
     name_to_op = {op.name: op for op in ops}
     in_edges: Dict[str, Set[str]] = {op.name: set() for op in ops}
     out_edges: Dict[str, Set[str]] = {op.name: set() for op in ops}
     edge_reasons: Dict[str, List[str]] = defaultdict(list)
+    # Track (u, v) pairs whose edge was contributed by a
+    # requires["same_layer_as"] declaration. After all edges are walked,
+    # any pair that ALSO has a non-same_layer_as reason (writes/reads,
+    # produces/consumes_fresh, requires[after]) is removed from this set
+    # — only pure same_layer_as edges propagate depth-equal in topo_depth.
+    same_layer_only: Set[Tuple[str, str]] = set()
+    other_edges: Set[Tuple[str, str]] = set()
 
     # writers index: dim -> ops that write it
     writers: Dict[str, List[Operation]] = defaultdict(list)
@@ -148,6 +170,7 @@ def build_dep_graph(
                     in_edges[v.name].add(u.name)
                     out_edges[u.name].add(v.name)
                     edge_reasons[(u.name, v.name)].append(f"writes/reads:{d}")
+                other_edges.add((u.name, v.name))
 
         # Staleness edges
         for dim, reg in v.consumes_fresh.items():
@@ -160,6 +183,7 @@ def build_dep_graph(
                 edge_reasons[(u.name, v.name)].append(
                     f"produces/consumes_fresh:{dim}@{reg}"
                 )
+                other_edges.add((u.name, v.name))
 
         # Explicit op-name edges from ``requires["after"]`` and
         # ``requires["same_layer_as"]``. The values may be a single string
@@ -173,6 +197,7 @@ def build_dep_graph(
                 in_edges[v.name].add(ref)
                 out_edges[ref].add(v.name)
             edge_reasons[(ref, v.name)].append(f"requires[after]={ref}")
+            other_edges.add((ref, v.name))
         for ref in requires_same_layer_as_ops(v):
             if ref == v.name or ref not in name_to_op:
                 continue
@@ -182,8 +207,14 @@ def build_dep_graph(
             edge_reasons[(ref, v.name)].append(
                 f"requires[same_layer_as]={ref}"
             )
+            same_layer_only.add((ref, v.name))
 
-    return in_edges, out_edges, edge_reasons
+    # Restrict same_layer_edges to pairs that have NO other contribution
+    # (so a dim-flow or requires[after] edge always wins over a peer
+    # constraint when both exist for the same (u, v) pair).
+    same_layer_edges = {pair for pair in same_layer_only if pair not in other_edges}
+
+    return in_edges, out_edges, edge_reasons, same_layer_edges
 
 
 # ---------------------------------------------------------------------------
@@ -193,12 +224,16 @@ def build_dep_graph(
 def topo_depth(
     ops: List[Operation], in_edges: Dict[str, Set[str]],
     out_edges: Dict[str, Set[str]],
+    same_layer_edges: Optional[Set[Tuple[str, str]]] = None,
 ) -> Tuple[Dict[str, int], Set[str]]:
     """Return ``(depth, cycle_members)``.
 
     ``depth[op]`` = earliest-layer index each op can occupy purely from the
     dep DAG. 0 means the op has no incoming deps; otherwise it's
-    ``max(depth[predecessor]) + 1``.
+    ``max(contribution[predecessor])`` where ``contribution[u]`` is
+    ``depth[u]`` for ``(u, op)`` edges in ``same_layer_edges`` (peer
+    constraint -- mirrors ``LayerCompiler._assign_layers`` co-placement
+    semantics for ``requires["same_layer_as"]``), else ``depth[u] + 1``.
 
     ``cycle_members`` = set of op names that never reach in-degree 0 (so
     their ``depth`` is sentinel -1). These nodes are either members of a
@@ -210,7 +245,12 @@ def topo_depth(
     # were producing impossible orderings (a node's depth was being set
     # from a single early predecessor while other predecessors were
     # still trapped in a cycle downstream).
+    if same_layer_edges is None:
+        same_layer_edges = set()
     indeg = {op.name: len(in_edges[op.name]) for op in ops}
+    # ``max_pred_depth[v]`` tracks the maximum depth contribution from any
+    # predecessor seen so far. Depth-bumping edges contribute ``depth[u]+1``;
+    # ``same_layer_as``-only edges contribute ``depth[u]`` (peer placement).
     max_pred_depth: Dict[str, int] = {op.name: -1 for op in ops}
     depth: Dict[str, int] = {}
     queue: List[str] = []
@@ -222,11 +262,19 @@ def topo_depth(
     while queue:
         u = queue.pop(0)
         for v in sorted(out_edges[u]):
-            if depth[u] > max_pred_depth[v]:
-                max_pred_depth[v] = depth[u]
+            if (u, v) in same_layer_edges:
+                contribution = depth[u]
+            else:
+                contribution = depth[u] + 1
+            if contribution > max_pred_depth[v]:
+                max_pred_depth[v] = contribution
             indeg[v] -= 1
             if indeg[v] == 0:
-                depth[v] = max_pred_depth[v] + 1
+                # ``max_pred_depth[v]`` is already the resolved depth
+                # (the per-edge contribution baked in the +1 where it
+                # applies). Floor at 0 so an isolated same_layer_as
+                # peer at depth 0 still resolves to depth 0.
+                depth[v] = max(max_pred_depth[v], 0)
                 queue.append(v)
 
     cycle_members: Set[str] = set()
@@ -784,8 +832,8 @@ def main() -> int:
         for msg in ref_errors:
             sys.stderr.write(f"  - {msg}\n")
         return 2
-    in_e, out_e, reasons = build_dep_graph(ops)
-    depth, cycle_members = topo_depth(ops, in_e, out_e)
+    in_e, out_e, reasons, same_layer_edges = build_dep_graph(ops)
+    depth, cycle_members = topo_depth(ops, in_e, out_e, same_layer_edges)
     sccs = find_scc_summary(cycle_members, in_e, out_e)
     cats = categorise(ops, depth, cycle_members, in_e, out_e)
 
