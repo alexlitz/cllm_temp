@@ -440,10 +440,27 @@ maps to a Phase 8 sub-wave:
 
 #### 8.J — ONNX export + ONNX runtime 1096 test suite (closes C3, part of C10)
 
-* **8.J.1** Verify `bundler/bundle_onnx_standard.py` (and `bundle_onnx_v2.py` / `bundle_onnx_memory.py`) produce a valid ONNX graph that loads in `onnxruntime`.
-* **8.J.2** Create `tests/test_onnx_runtime_1096.py`: export model, run all 1096 corpus programs through ONNX runtime, assert 100% pass match PyTorch implementation.
+**Constraint (per user):** the ONNX produced must be a **subset of vanilla
+ONNX**, loadable by a normal ONNX toolchain (`onnxruntime` Python /
+`onnxruntime` C API). NOT a custom `.c4onnx` format. Audit found:
+- `vm/onnx_runtime_c4.c` currently uses custom `.c4onnx` v3 format
+  (magic `0x584E4E4F`) — this does NOT satisfy the requirement
+- `tools/onnx_to_c4.py` converts standard PyTorch ONNX → custom format
+- Exporter currently covers only `NeuralALU` — no transformer layers
+- Subgraph executor only supports 5 ops (MATMUL, SOFTMAX, CONCAT,
+  SLICE, SCALE)
+
+* **8.J.1** Export the FULL `BakedC4Transformer` to **standard ONNX**
+  using `torch.onnx.export()` with only vanilla operators (MatMul,
+  Softmax, Add, Mul, Reshape, Slice, Concat, Gather, Where, Cast,
+  LayerNormalization, etc.). Verify load via `onnxruntime.InferenceSession()`.
+* **8.J.2** Create `tests/test_onnx_runtime_1096.py`: export model, run
+  all 1096 corpus programs through `onnxruntime.InferenceSession`,
+  assert byte-identical logits vs PyTorch.
 * **8.J.3** Add CI gate.
-* **Acceptance**: ONNX runtime passes 1096/1096 (matches Phase 7 close baseline of 1096/1096 on `BakedC4Transformer`).
+* **Acceptance**: standard `onnxruntime` (CPU EP) passes 1096/1096
+  byte-identical to PyTorch baseline. No custom `.c4onnx` format
+  involved in the runtime path.
 
 #### 8.K — Tool-use IO test suite (closes C5)
 
@@ -512,17 +529,44 @@ cross-stack tests — sequence 8.K.4 last among the deployment items.
 
 #### 8.L — ONNX runtime in C4-C (closes C7, part of C10)
 
-* **8.L.1** Audit `vm/onnx_standard_runtime.c`, `bundler/onnx_standard_runtime.c`. Determine if both compile + execute today.
-* **8.L.2** Create `tests/test_c_runtime_1096.py`: compile the C4-C ONNX runtime; load the exported ONNX; run all 1096 test programs through it; assert 100% pass.
-* **8.L.3** Document compile + run procedure.
-* **Acceptance**: C runtime passes 1096/1096.
+**Constraint:** the C runtime must load **standard ONNX** (same
+subset as 8.J), not the custom `.c4onnx` v3 format. Two paths:
+
+- **Path A — link against onnxruntime C API**: use Microsoft's
+  `onnxruntime` C library to load and run the exported ONNX. Simplest
+  path; the C runtime becomes a thin wrapper around the standard library.
+- **Path B — implement subset of ONNX runtime in C from scratch**:
+  expand `vm/onnx_runtime_c4.c` to support the actual operators used
+  in 8.J's export (MatMul, Softmax, Add, Mul, Reshape, Slice, Concat,
+  Gather, Where, Cast, LayerNormalization). This makes the runtime
+  self-contained.
+
+* **8.L.1** Decide between Path A and Path B.
+* **8.L.2** Implement loading + execution of the 8.J-exported standard ONNX.
+* **8.L.3** Create `tests/test_c_runtime_1096.py`: compile the runtime;
+  load the exported ONNX; run all 1096 corpus programs; assert byte-identical
+  to PyTorch.
+* **8.L.4** Document compile + run procedure.
+* **Acceptance**: C runtime passes 1096/1096 byte-identical to PyTorch.
+  No custom `.c4onnx` format involved.
 
 #### 8.M — Bundler tests (closes C8)
 
-* **8.M.1** `tests/test_bundler_1096.py`: bundle all 1096 test programs (model weights + bytecode + bundled runtime) into single executable; run each; assert 100% pass.
-* **8.M.2** C4-C version of the bundler: verify it exists, builds, and produces equivalent output.
-* **8.M.3** Self-hosting validation: the C4-C bundler must be able to bundle ITSELF (output runs and produces a working bundler).
-* **Acceptance**: Python bundler passes 1096/1096; C4-C bundler passes 1096/1096; self-bundle round-trips.
+**Constraint:** the bundled artifact must execute via the standard
+ONNX runtime path defined in 8.J/8.L (vanilla ONNX subset). No custom
+`.c4onnx` format permitted.
+
+* **8.M.1** `tests/test_bundler_1096.py`: bundle all 1096 test programs
+  (model weights as standard ONNX + bytecode + bundled C runtime
+  linking to onnxruntime per 8.L) into single executable; run each;
+  assert byte-identical exit codes vs PyTorch.
+* **8.M.2** C4-C version of the bundler: verify it exists, builds, and
+  produces equivalent output.
+* **8.M.3** Self-hosting validation: the C4-C bundler must bundle
+  ITSELF (output runs and produces a working bundler).
+* **Acceptance**: Python bundler passes 1096/1096; C4-C bundler passes
+  1096/1096; self-bundle round-trips. All execution paths go through
+  vanilla `onnxruntime`, not the custom `.c4onnx` v3 format.
 
 #### 8.O — Architectural toggles + HuggingFace loadable model
 
