@@ -30,6 +30,7 @@ compiled model byte-identically without re-running any bake_fn. Pass
 ``disk_cache=False`` to bypass.
 """
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -37,11 +38,12 @@ import os
 import pathlib
 import tempfile
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 from .layer_compiler import (
     LayerCompiler,
     ModelLayout,
+    Operation,
     build_model_from_layout,
     dispatch_operation_bake,
     validate_declarations_only_ops,
@@ -244,7 +246,45 @@ def derive_layout(num_heads: int = 8):
     return layout
 
 
-_CACHE_FORMAT_VERSION = 3
+_CACHE_FORMAT_VERSION = 4
+
+# Operation fields that hold callables / closures captured at op-construction
+# time (typically inner functions inside the per-op factory). These are not
+# picklable in the general case and are not needed at cache-hit time (a cache
+# hit short-circuits the bake pipeline), so we strip them before serialising
+# the operation list and rely on the metadata-only view for introspection
+# (``layout.block_ops``, ``layout.ops_per_layer``, ``layout.model_ops``).
+_UNPICKLABLE_OP_FIELDS: Sequence[str] = (
+    "bake_fn",
+    "declarative_bake_fn",
+    "compiler_ir_factory",
+)
+
+
+def _strip_op_for_cache(op: Operation) -> Operation:
+    """Return a copy of ``op`` with unpicklable callable fields cleared.
+
+    ``Operation.bake_fn`` and its declarative siblings are typically inner
+    closures created inside per-op factory functions and so cannot be
+    pickled. Cache-hit consumers only read metadata (name / kind /
+    layer_idx / phase / claims / writes / migrated / ...), so dropping the
+    bakes is safe: any code path that actually needs to bake should bypass
+    the cache (``disk_cache=False``) or recompile.
+    """
+    return dataclasses.replace(
+        op,
+        **{name: None for name in _UNPICKLABLE_OP_FIELDS},
+    )
+
+
+def _strip_ops_per_layer_for_cache(
+    ops_per_layer: Sequence[Sequence[Operation]],
+) -> List[List[Operation]]:
+    return [[_strip_op_for_cache(op) for op in layer] for layer in ops_per_layer]
+
+
+def _strip_op_list_for_cache(ops: Sequence[Operation]) -> List[Operation]:
+    return [_strip_op_for_cache(op) for op in ops]
 
 
 def _cache_dir() -> pathlib.Path:
@@ -328,13 +368,34 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
     if payload.get("format_version") != _CACHE_FORMAT_VERSION:
         return None
 
+    # Backwards-compat guard: format v3 and earlier didn't serialise
+    # ``block_ops`` / ``ops_per_layer`` / ``model_ops`` / ``ffn_widths``, so
+    # loading would silently return a layout with empty op lists and
+    # introspecting tests (e.g. ``tests/test_addr_key_neural_decode.py``) would
+    # break. The format-version check above already invalidates those entries;
+    # this defensive check covers any future field-renaming slip-ups.
+    required_keys = (
+        "model", "d_model", "n_layers", "dim_positions", "dim_sizes",
+        "ops_per_layer", "block_ops", "model_ops", "ffn_widths",
+    )
+    for key in required_keys:
+        if key not in payload:
+            _logger.warning(
+                "compile_full_vm: cache %s missing field %r; recompiling",
+                path, key,
+            )
+            return None
+
     model = payload["model"]
     layout = ModelLayout(
         d_model=payload["d_model"],
         n_layers=payload["n_layers"],
-        ops_per_layer=[[] for _ in range(payload["n_layers"])],
+        ops_per_layer=payload["ops_per_layer"],
         dim_positions=payload["dim_positions"],
         dim_sizes=payload["dim_sizes"],
+        block_ops=payload["block_ops"],
+        model_ops=payload["model_ops"],
+        ffn_widths=payload["ffn_widths"],
     )
     return model, layout
 
@@ -355,6 +416,17 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
         "n_layers": layout.n_layers,
         "dim_positions": dict(layout.dim_positions),
         "dim_sizes": dict(layout.dim_sizes),
+        # Persist the per-layer / block / model op metadata so layouts
+        # restored from cache match the freshly-compiled ones for tests
+        # and tools that introspect ``layout.block_ops`` / ``ops_per_layer``
+        # / ``model_ops``. Inner-closure ``bake_fn`` / ``declarative_bake_fn``
+        # / ``compiler_ir_factory`` fields are stripped before pickling
+        # because they are not picklable in the general case and aren't
+        # needed when the cache short-circuits the bake.
+        "ops_per_layer": _strip_ops_per_layer_for_cache(layout.ops_per_layer),
+        "block_ops": _strip_op_list_for_cache(layout.block_ops),
+        "model_ops": _strip_op_list_for_cache(layout.model_ops),
+        "ffn_widths": dict(layout.ffn_widths),
         "kwargs_snapshot": kwargs_snapshot,
     }
     tmp_path = None
@@ -430,12 +502,15 @@ def compile_full_vm(
             workers) skip the bake pipeline. See module docstring for the
             cache-key construction and the ``C4_VM_CACHE_DIR`` override.
             On cache hit the returned layout's ``ops_per_layer`` /
-            ``block_ops`` / ``model_ops`` are empty (the bake ran in the
-            producer process); only ``d_model``, ``n_layers``,
-            ``dim_positions``, and ``dim_sizes`` are populated. Runtime
-            callers (``run_vm``, batch runners) only read those four
-            fields, so the cache is transparent to them; tests that
-            inspect the per-op placement should pass ``disk_cache=False``.
+            ``block_ops`` / ``model_ops`` are populated with metadata-only
+            copies of the operations (the inner-closure ``bake_fn`` /
+            ``declarative_bake_fn`` / ``compiler_ir_factory`` fields are
+            stripped because they aren't picklable in the general case;
+            all other metadata — name, kind, layer_idx, phase, claims,
+            reads/writes, migrated, etc. — is preserved). Tests that
+            introspect the layout work transparently across cold and warm
+            cache runs; only callers that need to *bake* via the cached
+            ops should pass ``disk_cache=False`` to bypass.
         use_dynamic_ffn: when True (default), use ``layout.ffn_widths`` to
             pre-size each block's PureFFN to the exact unit count its ops
             need, avoiding the allocate-4096-then-trim overhead. Blocks
