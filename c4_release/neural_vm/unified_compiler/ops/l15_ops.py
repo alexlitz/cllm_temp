@@ -662,7 +662,7 @@ def make_layer15_store_stack0_sp_byte0_addr_op() -> Operation:
         # byte-identical. Breaks 2 cross-step back-edges.
         reads={
             "MARK_STACK0", "MARK_SP", "HAS_SE", "MEM_STORE",
-            "OUTPUT_LO", "OUTPUT_HI_PREV_STEP", "CONST",
+            "OUTPUT_LO", "OUTPUT_HI.*.-1", "CONST",
         },
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
