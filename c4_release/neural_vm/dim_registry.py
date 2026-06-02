@@ -615,14 +615,8 @@ def build_default_registry() -> DimRegistry:
     # FIXME(F-4): refine — fires at MEM-region query positions.
     _pin("ADDR_KEY", 206, 48, "One-hot address key for memory matching (3 nibbles x 16)",
               semantics="mark == MEM")
-    # Phase 8.A.6 v2: ADDR_KEY_PREV_STEP aliases the same 48-slot key band
-    # so byte-identity is preserved. Cross-step readers (L4/L5/L8/L9 ops
-    # that fire before L7/L14 writers in the same step) declare their
-    # reads as prev-step semantically. Mirrors the B9 OUTPUT_HI_THIS_STEP
-    # pattern. See docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
-    _pin("ADDR_KEY_PREV_STEP", 206, 48,
-              "Prev-step ADDR_KEY residual (aliases ADDR_KEY)",
-              semantics="mark == MEM", alias=True)
+    # Phase 9.C: ADDR_KEY_PREV_STEP alias retired (Phase 9.B migrated
+    # readers to SSA ``ADDR_KEY.<writer>.-1``).
 
     # NEXT_* transition flags. Written at the marker position preceding
     # the transition; conservatively scoped to "any marker" since the
