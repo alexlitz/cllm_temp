@@ -2590,7 +2590,6 @@ def make_layer6_routing_ffn_op() -> Operation:
 
     return Operation(
         name="layer6_routing_ffn",
-        phase=6.5,
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L7/L11/L14 TEMP writers (which fire after L6 in the
         # same step). The same-step values from L3 carry_forward / L5
@@ -2679,7 +2678,6 @@ def make_layer6_ffn_dep_anchor_op() -> Operation:
         # phase). The actual ``layer6_routing_ffn`` block op runs at
         # phase=6.5 and pins layer_idx=6 separately, so the anchor's
         # phase is purely a placement key for the dep-graph slot table.
-        phase=5,
         # Mirrored subset of ``layer6_routing_ffn``'s reads/writes,
         # excluding dims the ``_opcode_decode_ffn_dep_anchor`` writes at
         # L6 (OP_IMM/OP_EXIT/OP_JMP/OP_NOP/OP_LEA/TEMP) so the new
@@ -4077,7 +4075,6 @@ def make_prtf_think_protocol_op(
 
     return Operation(
         name="prtf_think_protocol",
-        phase=6.6,
         reads=set(),
         writes=set(),
         kind="block",
@@ -4152,7 +4149,6 @@ def make_open_clos_tool_call_op(
 
     return Operation(
         name="open_clos_tool_call",
-        phase=6.7,
         reads=set(),
         writes=set(),
         kind="block",
