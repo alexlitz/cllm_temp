@@ -70,67 +70,6 @@ def _set_layer14_add_byte1_high_zero_cleanup(ffn, S, BD, start_unit=0):
 
 
 
-def _set_layer14_clear_addr_key_pollution(ffn, S, BD, start_unit=0):
-    """L14 FFN: Clear ADDR_KEY pollution at non-MEM, non-marker positions.
-
-    BUG FIX 2026-04-16: ADDR_KEY dims (206-253) are aliased with ADDR_B*_HI.
-    L9 attention writes to ADDR_B*_HI for address gathering, which pollutes
-    ADDR_KEY at non-MEM positions. This causes L15 to attend to wrong positions.
-
-    Solution: Clear ADDR_KEY at positions that are:
-    - NOT MEM value bytes (MEM_VAL_B* = 0)
-    - NOT register markers where ADDR_B*_HI is needed for L15 queries
-      (PC marker for LEV return_addr, BP marker for LEV saved_bp,
-       AX marker for LI/LC, STACK0 marker for stack read)
-
-    Pattern: Fire when NOT at MEM value position AND NOT at query markers.
-    - W_up: Large negative weights for MEM_VAL_B* and MARK_* flags
-    - b_up: Positive bias (fires when no flags present)
-    - W_down: Write negative value to cancel ADDR_KEY pollution
-    """
-    unit = start_unit
-
-    # Large value to suppress firing at MEM and marker positions
-    suppress = S * 100  # When flag = 1.0, adds -100*S to activation
-
-    # Clear all 48 ADDR_KEY dims at non-MEM, non-marker positions
-    for k in range(48):  # ADDR_KEY is 48 dims (206-253)
-        # Suppress at MEM value positions (any of B0/B1/B2/B3)
-        ffn.W_up[unit, BD.MEM_VAL_B0] = -suppress
-        ffn.W_up[unit, BD.MEM_VAL_B1] = -suppress
-        ffn.W_up[unit, BD.MEM_VAL_B2] = -suppress
-        ffn.W_up[unit, BD.MEM_VAL_B3] = -suppress
-
-        # Suppress at register markers where ADDR_B*_HI is used for L15 queries
-        ffn.W_up[unit, BD.MARK_PC] = -suppress  # LEV return_addr lookup
-        ffn.W_up[unit, BD.MARK_BP] = -suppress  # LEV saved_bp lookup
-        ffn.W_up[unit, BD.MARK_AX] = -suppress  # LI/LC address lookup
-        ffn.W_up[unit, BD.MARK_STACK0] = -suppress  # Stack read
-        # FIX 2026-04-16: Also suppress at SP marker during LEV
-        # SP marker needs ADDR_B0 for SP = BP + 16 computation
-        ffn.W_up[unit, BD.MARK_SP] = -suppress
-
-        # Positive bias to fire at non-MEM, non-marker positions
-        ffn.b_up[unit] = S * 0.5
-
-        # Gate unconditionally
-        ffn.W_gate[unit, BD.CONST] = 1.0
-
-        # Write to cancel pollution and bring ADDR_KEY to 0
-        # FIX 2026-04-16: Changed from -200/S (=-100 output) to -4/S (~=-1.4 output).
-        # The original -100 clearing caused negative Q × negative K = positive score
-        # at non-target positions in L15 LEV heads. Clearing to ~0 avoids this issue
-        # while still preventing false address matches (0 × anything = 0).
-        # The pollution to clear is small (typically ~1-2 from L9 ADDR_B*_HI writes),
-        # so a small negative value is sufficient.
-        ffn.W_down[BD.ADDR_KEY + k, unit] = -4.0 / S
-        unit += 1
-
-    return unit
-
-
-
-
 def _set_layer14_clear_output_corruption(ffn, S, BD, start_unit=0):
     """L14 FFN: Fix OUTPUT at STACK0 byte positions (bytes 1-3 = 0).
 

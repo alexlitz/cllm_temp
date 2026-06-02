@@ -70,7 +70,6 @@ from .setup_helpers_l13 import (
 )
 from .setup_helpers_l14 import (
     _set_layer14_add_byte1_high_zero_cleanup,
-    _set_layer14_clear_addr_key_pollution,
     _set_layer14_clear_addsub_temp_negative_residue,
     _set_layer14_clear_output_corruption,
 )
@@ -148,7 +147,6 @@ __all__ = [
     "_set_layer13_mem_addr_gather",
     "_set_layer13_shifts",
     "_set_layer14_add_byte1_high_zero_cleanup",
-    "_set_layer14_clear_addr_key_pollution",
     "_set_layer14_clear_addsub_temp_negative_residue",
     "_set_layer14_clear_output_corruption",
     "_set_layer1_ffn",
