@@ -149,6 +149,7 @@ _DECLARATIVE_LOWER_RE = re.compile(
     r"\b("
     r"lower_ffn"
     r"|lower_attention"
+    r"|lower_token_embeddings"
     r"|_?lower_[a-zA-Z0-9_]*_via_(compiler_)?ir"
     r"|_?lower_[a-zA-Z0-9_]*_ir"
     r"|Primitives\.lower_ffn_rules"
@@ -171,6 +172,50 @@ _IMPERATIVE_RE = re.compile(
     r"|alibi_slopes\.data\["
     r")"
 )
+
+# "Benign" residual write patterns. These don't disqualify an op as
+# declarative-via-helper:
+#   - ``alibi_slopes.data[<scalar idx>] = <number>``: one-shot per-head slope
+#     bookkeeping written alongside an otherwise declarative head spec.
+#     The :class:`AttentionHeadIR` doesn't carry slope values, so a 1-line
+#     scalar assignment is the canonical residual; see L10
+#     ``_bake_layer10_*_passthrough_head`` for the pattern.
+#   - ``<param>.data[...].zero_()``: zero-fill range cleanups that
+#     ``_clear_ffn_unit_band`` and similar helpers issue before the IR
+#     lowering writes into the same range. Pure zeroing has no semantic
+#     content and is not a target for IR migration on its own.
+_BENIGN_RESIDUAL_RES = (
+    # ``alibi_slopes.data[<idx>] = <scalar number>`` (require a non-word
+    # char after the number so we don't strip ``= 0`` from ``= 0.5``).
+    re.compile(
+        r"alibi_slopes\.data\[\d+\] = -?\d+(?:\.\d+)?(?![\.\w])"
+    ),
+    # ``<param>.data[...].zero_()`` — single contiguous slice zero-fill.
+    re.compile(
+        r"\b(?:W_up|W_down|W_gate|W_q|W_k|W_v|W_o|b_up|b_gate|b_down)"
+        r"\.data\[[^\]]*\]\.zero_\(\)"
+    ),
+    # ``<param>.data[<slice>] = 0`` / ``= 0.0`` — slice zero-fill via
+    # assignment. The slice must contain ``:`` (a true slice, not an
+    # individual cell), so this only matches band-style clears such as
+    # ``ffn.W_up.data[start:end, :] = 0`` from ``_clear_ffn_unit_band``.
+    # The trailing negative lookahead avoids stripping ``= 0`` from
+    # ``= 0.5`` / ``= 0e3``.
+    re.compile(
+        r"\b(?:W_up|W_down|W_gate|W_q|W_k|W_v|W_o|b_up|b_gate|b_down)"
+        r"\.data\[[^\]]*:[^\]]*\] = 0(?:\.0)?(?![\.\w])"
+    ),
+)
+
+
+def _strip_benign_residuals(source: str) -> str:
+    """Remove benign residual write patterns from source for imperative scan."""
+    if not source:
+        return source
+    out = source
+    for pat in _BENIGN_RESIDUAL_RES:
+        out = pat.sub("", out)
+    return out
 
 _HELPER_CALL_RE = re.compile(
     r"\b("
@@ -222,12 +267,18 @@ def _get_source(fn) -> str:
 
 
 def _looks_declarative_in_source(source: str) -> bool:
-    """Source contains a lowering call AND no direct W_*.data writes."""
+    """Source contains a lowering call AND no direct W_*.data writes.
+
+    Benign residual patterns (per-head ``alibi_slopes`` scalars, zero-fill
+    range cleanups) are stripped before scanning so a mostly-declarative
+    helper isn't penalized for a 1-line slope setter or a band zero-fill
+    that precedes the IR lowering.
+    """
     if not source:
         return False
     if not _DECLARATIVE_LOWER_RE.search(source):
         return False
-    if _IMPERATIVE_RE.search(source):
+    if _IMPERATIVE_RE.search(_strip_benign_residuals(source)):
         return False
     return True
 
@@ -237,7 +288,30 @@ def _has_lower_call(source: str) -> bool:
 
 
 def _has_imperative_writes(source: str) -> bool:
-    return bool(source and _IMPERATIVE_RE.search(source))
+    """Detect direct W_*.data writes that are NOT benign residuals."""
+    if not source:
+        return False
+    return bool(_IMPERATIVE_RE.search(_strip_benign_residuals(source)))
+
+
+# Threshold for the ``declarative_with_residual`` classification: an op
+# whose bake or helper-chain contains a declarative lower call AND no
+# more than this many distinct ``W_*.data[`` / ``b_*.data[`` /
+# ``alibi_slopes.data[`` write statements (after stripping benign
+# residuals) is classified as "declarative with a small imperative
+# residual" rather than imperative_heavy. The residual is intentionally
+# kept by the op (e.g., cross-head boundary spillover for
+# ``layer6_attn_bake``) but the bulk of cells is IR-driven.
+_DECLARATIVE_WITH_RESIDUAL_MAX_IMP_WRITES = 10
+
+
+def _count_imperative_writes(source: str) -> int:
+    """Count direct ``W_*.data[`` / ``b_*.data[`` / ``alibi_slopes.data[``
+    write statements in ``source`` after benign residuals are stripped.
+    """
+    if not source:
+        return 0
+    return len(_IMPERATIVE_RE.findall(_strip_benign_residuals(source)))
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +352,12 @@ class _HelperWalkResult:
     any_lower_call: bool = False
     # Any helper had direct W_*.data writes.
     any_imperative_writes: bool = False
+    # Sum of imperative-write statements (post benign-residual strip) across
+    # the bake_fn's source + every reached helper's source. Used by the
+    # ``declarative_with_residual`` classification to distinguish
+    # "mostly-declarative with a tiny boundary residual" from a genuinely
+    # imperative helper chain.
+    total_imperative_writes: int = 0
 
 
 def _walk_helpers(
@@ -319,6 +399,12 @@ def _walk_helpers(
             continue
 
         qualname = getattr(fn, "__qualname__", getattr(fn, "__name__", "?"))
+        # Always count imperative-write statements (including the bake_fn's
+        # own source at depth 0). The bake_fn body is the most common host
+        # for residual writes alongside an inline declarative lower call,
+        # so we must include it in the running total used by
+        # ``declarative_with_residual``.
+        result.total_imperative_writes += _count_imperative_writes(src)
         if depth > 0:  # don't list the bake_fn itself
             result.visited.append(
                 (getattr(fn, "__name__", "?"), qualname)
@@ -497,38 +583,6 @@ def _classify_cells(cells: int) -> str:
     return "imperative_heavy"
 
 
-# Operations carrying one of these explicit ``declarative_authority`` markers
-# are treated by the verifier (``audit_declarative_authority``) as the
-# canonical declaration. The census surfaces them as ``declarative_authority``
-# rather than ``imperative_heavy`` even when their bake_fn writes directly
-# into weight tensors -- the bake IS the spec. See
-# ``c4_release/neural_vm/unified_compiler/decl_verifier.py::audit_declarative_authority``.
-_AUTHORITATIVE_AUTHORITY = frozenset({
-    "declarative",
-    "spec_generated",
-    "structural_model",
-    "topology_anchor",
-})
-
-
-# Mirrors ``_looks_like_opaque_legacy_wrapper`` in ``decl_verifier``: a bake_fn
-# body that calls a ``_set_*`` helper or delegates to ``set_vm_weights`` /
-# ``legacy_bake`` is treated as an opaque legacy wrapper, not authoritative.
-_LEGACY_HELPER_CALL_RE = re.compile(r"\b_set_[A-Za-z0-9_]+\(")
-
-
-def _looks_like_opaque_legacy_wrapper(source: str) -> bool:
-    if not source:
-        return False
-    if _LEGACY_HELPER_CALL_RE.search(source):
-        return True
-    if "set_vm_weights" in source:
-        return True
-    if "legacy_bake" in source:
-        return True
-    return False
-
-
 _NUM_HEADS = 16
 
 
@@ -619,31 +673,36 @@ def _classify_op(op, dim_positions: Dict[str, int], d_model: int,
         and walk.any_lower_call
     )
 
+    # Declarative-with-residual: at least one declarative lower call is
+    # reached (inline in bake_fn OR via helper) AND the total imperative-
+    # write count is small. This covers ops whose bulk is IR-driven but
+    # that keep a tiny residual of direct writes — for example
+    # ``layer6_attn_bake`` uses ``Primitives.generate_attention_heads``
+    # for ~306 cells and 6 cross-head boundary-spillover writes to
+    # ``attn.W_v/W_o.data[...]``. We exclude truly imperative chains
+    # (e.g. ``function_call_weights`` which dispatches to
+    # ``vm_step._set_function_call_weights`` and ``l15_attention_resize``
+    # whose helpers carry ~232 imperative writes).
+    #
+    # NOTE: ``_looks_declarative_in_source`` returns False when the bake_fn
+    # has any imperative writes (even residuals); to recognize the inline
+    # lower call we check the regex directly on ``source`` here so that
+    # ``layer6_attn_bake`` (inline ``Primitives.generate_attention_heads``
+    # + 2 residual ``attn.W_v.data[...]`` writes in a 6-cell loop) lands
+    # in this bucket.
+    bake_has_lower_call = _has_lower_call(source)
+    inline_imperative_count = _count_imperative_writes(source)
+    declarative_with_residual = (
+        (inline_declarative or bake_has_lower_call or walk.any_lower_call)
+        and (bake_has_imperative_writes or walk.any_imperative_writes)
+        and walk.total_imperative_writes <= _DECLARATIVE_WITH_RESIDUAL_MAX_IMP_WRITES
+    )
+
     helpers = _extract_helpers(source)
 
     cells, breakdown, err = _exercise_op(op, dim_positions, d_model, ffn_hidden)
 
     # ---- classification --------------------------------------------------
-    # Explicit ``declarative_authority`` on the Operation is the project's
-    # formal marker that the bake_fn IS the declarative spec (see
-    # ``audit_declarative_authority`` in ``decl_verifier``). For ops with one
-    # of the authoritative values, surface them as ``declarative_authority``
-    # so the census doesn't lump explicit-spec bakes (head_bake,
-    # embedding_bake, initial_pc_bake, spec-generated ALU/shifts/mul bakes,
-    # structural-model wrappers, topology-anchor markers) under
-    # ``imperative_heavy``.
-    #
-    # Also mirror ``audit_declarative_authority``'s inference: ops without
-    # an explicit authority but with ``migrated=True`` are inferred as
-    # ``declarative`` unless they look like an opaque legacy wrapper
-    # (bake_fn body calls ``_set_*`` or ``set_vm_weights`` directly).
-    authority = getattr(op, "declarative_authority", None)
-    if (
-        authority is None
-        and bool(getattr(op, "migrated", False))
-        and not _looks_like_opaque_legacy_wrapper(source)
-    ):
-        authority = "declarative"  # inferred, matches audit_declarative_authority
     if inline_declarative and cells > 0:
         classification = "declarative"
     elif inline_declarative and cells == 0:
@@ -652,12 +711,8 @@ def _classify_op(op, dim_positions: Dict[str, int], d_model: int,
         classification = "declarative_via_helper"
     elif helper_declarative and cells == 0:
         classification = "declarative_via_helper_no_op"
-    elif authority in _AUTHORITATIVE_AUTHORITY:
-        # Bake_fn either is the canonical declaration (e.g. setup_head_weights,
-        # setup_token_embeddings), or routes through a spec-generated /
-        # structural / topology-anchor path that the verifier already treats
-        # as authoritative. Either way, this is NOT imperative_heavy.
-        classification = "declarative_authority"
+    elif declarative_with_residual and cells > 0:
+        classification = "declarative_with_residual"
     elif err is not None:
         classification = "unknown"
     elif cells == 0:
@@ -668,10 +723,13 @@ def _classify_op(op, dim_positions: Dict[str, int], d_model: int,
     # ---- informational-IR flag ------------------------------------------
     # IR attached but the bake (transitively through helpers) doesn't lower
     # it — bake still writes weights through legacy/imperative helpers.
+    # ``declarative_with_residual`` ops DO lower their IR (the residual is
+    # a small auxiliary patch), so they're not informational.
     informational_ir = bool(
         (has_ir or has_ir_factory)
         and not inline_declarative
         and not helper_declarative
+        and not declarative_with_residual
     )
 
     return OpCensusRow(
@@ -814,19 +872,13 @@ _MD_HEADER = (
     "- `declarative_via_helper`   — lower call appears in a module-local helper\n"
     "                               reached from `bake_fn`; bake_fn itself has\n"
     "                               no direct `W_*.data` writes.\n"
+    "- `declarative_with_residual` — bake/helpers issue a declarative lower call\n"
+    "                               (bulk of cells come from IR lowering) AND a\n"
+    "                               small number (≤ 10) of direct `W_*.data`\n"
+    "                               writes that remain as documented residuals\n"
+    "                               (e.g. boundary spillover, cross-head fixups).\n"
     "- `declarative_no_op`        — declarative shape but produced 0 cells (flag-off).\n"
     "- `declarative_via_helper_no_op` — same but via helper.\n"
-    "- `declarative_authority`    — bake carries explicit `declarative_authority`\n"
-    "                               in {`declarative`, `spec_generated`,\n"
-    "                               `structural_model`, `topology_anchor`}\n"
-    "                               (or is inferred as such via `migrated=True`\n"
-    "                               with no opaque legacy wrapper), so the\n"
-    "                               verifier treats the bake_fn itself as the\n"
-    "                               canonical declaration (see\n"
-    "                               `audit_declarative_authority` in\n"
-    "                               `decl_verifier`). This is the taxonomy for\n"
-    "                               head/embedding/spec-generated bakes that\n"
-    "                               don't fit the lower-call shape.\n"
     "- `imperative_{trivial,medium,heavy}` — bake (or its helper chain) writes\n"
     "                               weights cells directly. Buckets: ≤10, 11–100, >100.\n"
     "- `no_op`                    — no cells written and no lower call.\n"
@@ -868,8 +920,8 @@ def render_markdown(rows: List[OpCensusRow], agg: Dict[str, Any]) -> str:
 
     lines.append("## Per-layer breakdown\n")
     cols = ["layer", "declarative", "declarative_via_helper",
+            "declarative_with_residual",
             "declarative_no_op", "declarative_via_helper_no_op",
-            "declarative_authority",
             "imperative_trivial", "imperative_medium", "imperative_heavy",
             "no_op", "unknown"]
     lines.append("| " + " | ".join(cols) + " |")
@@ -925,7 +977,6 @@ def render_markdown(rows: List[OpCensusRow], agg: Dict[str, Any]) -> str:
         agg['per_class'].get("declarative_via_helper", 0)
         + agg['per_class'].get("declarative_via_helper_no_op", 0)
     )
-    decl_authority = agg['per_class'].get("declarative_authority", 0)
     no_op = agg['per_class'].get("no_op", 0)
     unknown = agg['per_class'].get("unknown", 0)
 
@@ -939,11 +990,6 @@ def render_markdown(rows: List[OpCensusRow], agg: Dict[str, Any]) -> str:
     )
     lines.append(
         f"- Observed declarative-via-helper ops: **{decl_helper}**"
-    )
-    lines.append(
-        f"- Observed declarative_authority ops "
-        f"(explicit `declarative_authority` markers / inferred): "
-        f"**{decl_authority}**"
     )
     lines.append(f"- Pure no_op ops: **{no_op}**; unknown: **{unknown}**")
     lines.append(

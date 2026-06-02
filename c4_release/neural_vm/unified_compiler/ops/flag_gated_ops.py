@@ -1262,6 +1262,79 @@ def _convo_io_prtf_transport_spec(BD) -> DeclarativeAttentionHeadSpec:
     )
 
 
+_CONVERSATIONAL_IO_OUTPUT_ROUTING_START_UNIT = 1200
+
+
+def _conversational_io_output_routing_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for ``_set_conversational_io_output_routing``.
+
+    32 gated-write units (16 ``OUTPUT_LO`` + 16 ``OUTPUT_HI`` nibbles).
+    Each unit gates on ``IO_IN_OUTPUT_MODE`` (threshold 0.5) and copies one
+    ``OUTPUT_BYTE_LO/HI+k`` nibble through to the matching ``OUTPUT_LO/HI+k``
+    cell. The imperative form (``setup_helpers_l15``) writes:
+
+        W_up[unit, IO_IN_OUTPUT_MODE]      = S
+        b_up[unit]                         = -S * 0.5
+        W_gate[unit, OUTPUT_BYTE_LO + k]   = 1.0
+        W_down[OUTPUT_LO + k, unit]        = 2.0 / S
+
+    which is byte-identical to ``FFNRule.gated_write`` with
+    ``conditions=(("IO_IN_OUTPUT_MODE", 1.0),)``, ``threshold=0.5``,
+    ``gate=f"OUTPUT_BYTE_LO+{k}"``, ``gate_weight=1.0``, ``gate_bias=0.0``,
+    and ``writes=((f"OUTPUT_LO+{k}", 2.0 / S),)``: ``lower_ffn`` accumulates
+    ``W_up += S * 1.0``, ``b_up = -S * 0.5``, ``W_gate += 1.0``,
+    ``b_gate = 0.0``, and ``W_down += (2.0 / S) * 1.0``.
+
+    The LO and HI bands are interleaved per the legacy unit ordering
+    (lo[0], hi[0], lo[1], hi[1], ...) so the lowered band stays at
+    units 1200..1231 byte-for-byte against the imperative helper.
+    """
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"convo_io_output_routing_lo_{k}",
+            conditions=(("IO_IN_OUTPUT_MODE", 1.0),),
+            threshold=0.5,
+            gate=f"OUTPUT_BYTE_LO+{k}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
+        ))
+        rules.append(FFNRule.gated_write(
+            name=f"convo_io_output_routing_hi_{k}",
+            conditions=(("IO_IN_OUTPUT_MODE", 1.0),),
+            threshold=0.5,
+            gate=f"OUTPUT_BYTE_HI+{k}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
+        ))
+    return tuple(rules)
+
+
+def _conversational_io_output_routing_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_conversational_io_output_routing_rules(S))
+    return ir
+
+
+def _lower_conversational_io_output_routing_ir(ffn, S: float, BD) -> int:
+    """Lower the convo-IO output-routing FFN rules at pinned unit 1200."""
+
+    rules = _conversational_io_output_routing_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=_CONVERSATIONAL_IO_OUTPUT_ROUTING_START_UNIT,
+        S=S,
+    )
+
+
 def make_conversational_io_output_routing_op(
     enable_conversational_io: bool = False,
 ) -> Operation:
@@ -1285,11 +1358,17 @@ def make_conversational_io_output_routing_op(
     is a ``PureFFN`` in both alu_modes, so this bake is alu_mode-agnostic.
 
     No-op when ``enable_conversational_io=False``.
+
+    Phase 8.C migration: the 32-unit imperative ``_set_conversational_io_
+    output_routing`` body is replaced by a CompilerIR built from
+    :func:`_conversational_io_output_routing_rules` and lowered through
+    ``Primitives.lower_ffn_rules`` at pinned unit 1200. Byte-identical to
+    the legacy helper (one ``gated_write`` per OUTPUT_LO/HI nibble lane,
+    same S-scaled weights).
     """
     if enable_conversational_io:
         def bake(block, dim_positions, S):
-            from ...vm_step import _set_conversational_io_output_routing
-            _set_conversational_io_output_routing(
+            _lower_conversational_io_output_routing_ir(
                 block.ffn, S, _as_setdim_proxy(dim_positions)
             )
     else:
