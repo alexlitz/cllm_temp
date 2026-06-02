@@ -494,6 +494,197 @@ class TestVMSelfCompilationQuineGap:
         assert os.path.getsize(path) > 1024
 
 
+# ----------------------------------------------------------------------------
+# Self-compilation byte-sequence + weight-bundle emission gap class.
+#
+# The TESTING_CHECKLIST quine requires that the model+runtime+bytecode bundle
+# can run the VM-compiles-its-own-source path and emit a valid weight bundle.
+# Today the path is split:
+#   - ``bundler/c4_compile.c`` is the C4 source the VM should be able to
+#     consume as a byte sequence.
+#   - ``tools/export_autoregressive.export_autoregressive`` is the canonical
+#     weight-bundle emitter (.arvm format).
+# The wiring between "VM runs on c4_compile.c" and "exporter emits bundle"
+# is missing. These tests document the gap and pin the contract pieces that
+# DO exist so a future driver can flip them strict.
+# ----------------------------------------------------------------------------
+
+
+class TestSelfCompilationByteSequenceAndBundleEmission:
+    """The VM consumes C4 source as a byte sequence + emits a weight bundle.
+
+    Two sub-gates:
+      1. The C source of the c4-compile target (``bundler/c4_compile.c``) is
+         loadable as a clean byte sequence the VM can step over.
+      2. The exporter that emits a valid .arvm weight bundle is callable on
+         a baked model, and emits a file conforming to the
+         documented header+tensor layout.
+    """
+
+    def test_c4_source_loads_as_byte_sequence(self):
+        """``c4_compile.c`` is loadable as a self-consistent byte sequence."""
+        path = "bundler/c4_compile.c"
+        with open(path, 'rb') as f:
+            raw = f.read()
+        # Non-empty + ASCII-decodable (the VM consumes the source as bytes,
+        # the host compiler consumes the same text).
+        assert len(raw) > 5000
+        # Every byte must be in the printable+whitespace range so a
+        # byte-by-byte VM-driven tokenizer wouldn't trip on a control char.
+        bad = [(i, b) for i, b in enumerate(raw)
+               if b not in (9, 10, 13) and not (32 <= b < 127)]
+        assert not bad, (
+            f"c4_compile.c contains non-ASCII bytes at offsets "
+            f"{bad[:5]}; VM byte-stream driver would have to handle them."
+        )
+
+    def test_weight_bundle_emitter_is_callable(self):
+        """``export_autoregressive`` is importable + has the expected signature."""
+        import inspect
+        from tools.export_autoregressive import export_autoregressive
+        sig = inspect.signature(export_autoregressive)
+        # (model, path, sparse=True) is the documented contract.
+        assert 'model' in sig.parameters
+        assert 'path' in sig.parameters
+        assert 'sparse' in sig.parameters
+
+    def test_weight_bundle_emitter_writes_arvm_header(self, tmp_path):
+        """Exporter emits a file whose first 28 bytes match the ARVM header.
+
+        We can't bake the full VM here (the dynamic compiler is unreliable in
+        the test sandbox per project memory notes about the L10/L16/L3
+        blockers). Instead we construct a tiny stand-in module that satisfies
+        the exporter's structural contract and verify the bytes it emits.
+        """
+        import torch
+        import torch.nn as nn
+        import struct
+        from tools.export_autoregressive import (
+            export_autoregressive, ARVM_MAGIC, ARVM_VERSION,
+        )
+
+        vocab_size, d_model, n_heads, ffn_hidden = 4, 4, 2, 4
+
+        class FakeAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.alibi_slopes = nn.Parameter(torch.zeros(n_heads))
+                self.W_q = nn.Parameter(torch.zeros(d_model, d_model))
+                self.W_k = nn.Parameter(torch.zeros(d_model, d_model))
+                self.W_v = nn.Parameter(torch.zeros(d_model, d_model))
+                self.W_o = nn.Parameter(torch.zeros(d_model, d_model))
+
+        class FakeFFN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.W_up = nn.Parameter(torch.zeros(ffn_hidden, d_model))
+                self.b_up = nn.Parameter(torch.zeros(ffn_hidden))
+                self.W_gate = nn.Parameter(torch.zeros(ffn_hidden, d_model))
+                self.b_gate = nn.Parameter(torch.zeros(ffn_hidden))
+                self.W_down = nn.Parameter(torch.zeros(d_model, ffn_hidden))
+                self.b_down = nn.Parameter(torch.zeros(d_model))
+
+        class FakeBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = FakeAttn()
+                self.ffn = FakeFFN()
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vocab_size = vocab_size
+                self.d_model = d_model
+                self.embed = nn.Embedding(vocab_size, d_model)
+                self.blocks = nn.ModuleList([FakeBlock()])
+                self.head = nn.Linear(d_model, vocab_size)
+
+        path = tmp_path / "self_compile.arvm"
+        export_autoregressive(FakeModel(), str(path), sparse=False)
+
+        with open(path, 'rb') as f:
+            header = f.read(28)
+        magic, ver, vs, dm, nl, nh, fh = struct.unpack('<IIIIIII', header)
+        assert magic == ARVM_MAGIC, "Exporter wrote wrong magic"
+        assert ver == ARVM_VERSION
+        assert vs == vocab_size
+        assert dm == d_model
+        assert nl == 1
+        assert nh == n_heads
+        assert fh == ffn_hidden
+
+    def test_emitted_bundle_is_loadable(self, tmp_path):
+        """A bundle emitted by ``export_autoregressive`` re-loads via load_arvm."""
+        import torch
+        import torch.nn as nn
+        from tools.export_autoregressive import (
+            export_autoregressive, load_arvm,
+        )
+
+        vocab_size, d_model, n_heads, ffn_hidden = 4, 4, 2, 4
+
+        class _Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Module()
+                self.attn.num_heads = n_heads
+                self.attn.alibi_slopes = nn.Parameter(torch.zeros(n_heads))
+                self.attn.W_q = nn.Parameter(torch.zeros(d_model, d_model))
+                self.attn.W_k = nn.Parameter(torch.zeros(d_model, d_model))
+                self.attn.W_v = nn.Parameter(torch.zeros(d_model, d_model))
+                self.attn.W_o = nn.Parameter(torch.zeros(d_model, d_model))
+                self.ffn = nn.Module()
+                self.ffn.W_up = nn.Parameter(torch.zeros(ffn_hidden, d_model))
+                self.ffn.b_up = nn.Parameter(torch.zeros(ffn_hidden))
+                self.ffn.W_gate = nn.Parameter(torch.zeros(ffn_hidden, d_model))
+                self.ffn.b_gate = nn.Parameter(torch.zeros(ffn_hidden))
+                self.ffn.W_down = nn.Parameter(torch.zeros(d_model, ffn_hidden))
+                self.ffn.b_down = nn.Parameter(torch.zeros(d_model))
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vocab_size = vocab_size
+                self.d_model = d_model
+                self.embed = nn.Embedding(vocab_size, d_model)
+                self.blocks = nn.ModuleList([_Block()])
+                self.head = nn.Linear(d_model, vocab_size)
+
+        path = tmp_path / "loadable.arvm"
+        export_autoregressive(_Model(), str(path), sparse=False)
+        loaded = load_arvm(str(path))
+
+        assert loaded['vocab_size'] == vocab_size
+        assert loaded['n_layers'] == 1
+        assert loaded['embed_weight'].shape == (vocab_size, d_model)
+        assert len(loaded['layers']) == 1
+
+    @pytest.mark.slow
+    @pytest.mark.quine
+    @pytest.mark.xfail(
+        reason=(
+            "End-to-end VM-consumes-c4_compile.c + emits .arvm bundle path "
+            "is not yet wired. The two halves (source loadable as bytes; "
+            "exporter emits valid bundle) are individually pinned above; "
+            "the missing piece is a driver that runs the VM-compiled c4 "
+            "compiler over the c4 source byte sequence and feeds its "
+            "emitted model state into export_autoregressive."
+        ),
+        strict=False,
+    )
+    def test_vm_self_compile_then_emit_bundle(self, tmp_path):
+        """End-to-end: VM compiles c4 source -> exporter emits valid bundle."""
+        from src.compiler import compile_c
+        with open("bundler/c4_compile.c") as f:
+            source = f.read()
+        bc, dt = compile_c(source)
+        assert bc and dt is not None
+        # Missing wiring: take the VM run state produced by executing ``bc``
+        # over ``source``-as-bytes and call export_autoregressive on it.
+        assert False, "VM-driven self-compile -> bundle path not wired"
+
+
 # Run tests
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
