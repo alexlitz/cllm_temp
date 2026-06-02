@@ -256,6 +256,11 @@ def all_core_ops(
             if alu_mode == "efficient"
             else []
         ),
+        # Phase 8.G.6 follow-up: L14 attn dep anchor — gives
+        # ``layer14_mem_generation`` a stable ``requires["same_layer_as"]``
+        # target so it can drop its ``layer_idx=14`` literal. Anchor is
+        # pinned past ``_layer13_attn_dep_anchor`` so it lands at L14.
+        make_layer14_attn_dep_anchor_op(),
         make_layer14_mem_generation_op(),
         make_layer14_temp_clear_op(),
         make_layer14_clear_addr_key_pollution_op(),
