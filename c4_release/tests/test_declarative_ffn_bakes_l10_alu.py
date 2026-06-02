@@ -20,6 +20,7 @@ from c4_release.neural_vm.unified_compiler.ops.l10_ops import (
     _layer10_alu_bitwise_or_rules,
     _layer10_alu_bitwise_xor_rules,
     _layer10_alu_cmp_combine_rules,
+    _layer10_alu_mul_lo_rules,
 )
 from c4_release.neural_vm.unified_compiler.primitives import Primitives
 from c4_release.neural_vm.vm_step import _SetDim, _set_layer10_alu
@@ -212,3 +213,30 @@ def test_layer10_alu_bitwise_and_rules_compare_symbolic_to_lowered_ffn():
     """Structural ``compare_symbolic_to_lowered_ffn`` parity for bitwise_and."""
 
     _assert_substage_compare_clean(_layer10_alu_bitwise_and_rules(100.0))
+
+
+def test_layer10_alu_mul_lo_rules_match_legacy_units():
+    """Sub-stage 5 (units 1554..1809): MUL lo-nibble (a*b)%16 lookup."""
+
+    actual = _StubFFN()
+    expected = _StubFFN()
+
+    rules = _layer10_alu_mul_lo_rules(100.0)
+    start, end = _layout_range("layer10_alu.mul_lo")
+    next_unit = _lower_rules(actual, rules, start_unit=start, S=100.0)
+    _set_layer10_alu(expected, 100.0, _SetDim)
+
+    assert next_unit == end, (
+        f"mul_lo cursor drift: lowered to {next_unit}, expected {end}"
+    )
+    assert len(rules) == end - start, (
+        f"mul_lo rule count drift: {len(rules)} rules vs "
+        f"{end - start} pinned units"
+    )
+    _assert_same_ffn_units(actual, expected, start, end)
+
+
+def test_layer10_alu_mul_lo_rules_compare_symbolic_to_lowered_ffn():
+    """Structural ``compare_symbolic_to_lowered_ffn`` parity for mul_lo."""
+
+    _assert_substage_compare_clean(_layer10_alu_mul_lo_rules(100.0))

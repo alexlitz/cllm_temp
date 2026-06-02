@@ -318,6 +318,37 @@ def _layer10_alu_bitwise_and_rules(S: float) -> tuple[FFNRule, ...]:
     return _layer10_alu_bitwise_rules(S, op_name="AND", op_fn=operator.and_)
 
 
+def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """L10 MUL lo-nibble lookup: 256 units gated on OP_MUL.
+
+    For each (a, b) in 0..15 x 0..15, one 3-way AND unit fires only on
+    the matching ALU_LO[a] / AX_CARRY_LO[b] one-hot pair at the AX
+    marker, writing the lo nibble of (a * b) (i.e. ``(a * b) % 16``) to
+    ``OUTPUT_LO``. Weights and threshold reuse the (40, 30, 30) / 80
+    balanced 3-way AND from the bitwise sub-stages above so a single
+    spurious one-hot in either operand band cannot fire the unit.
+    """
+
+    rules: list[FFNRule] = []
+    for a in range(16):
+        for b in range(16):
+            result = (a * b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l10_mul_lo_a{a:x}_b{b:x}",
+                conditions=(
+                    ("MARK_AX", 40.0),
+                    (f"ALU_LO+{a}", 30.0),
+                    (f"AX_CARRY_LO+{b}", 30.0),
+                ),
+                threshold=80.0,
+                gate="OP_MUL",
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=((f"OUTPUT_LO+{result}", 2.0 / S),),
+            ))
+    return tuple(rules)
+
+
 def _bake_layer10_carry_relay_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 0 carry relay spec."""
     Primitives.generate_attention_head(
