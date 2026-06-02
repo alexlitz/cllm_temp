@@ -978,7 +978,6 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "EMBED_LO", "EMBED_HI",
                 "NEXT_STACK0"},
         kind="ffn",
-        bake_fn=bake,
         migrated=True,
         declarative_authority="topology_anchor",
         smoke_tests=set(),
