@@ -1,7 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -783,6 +783,93 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
         attn.W_o.data[BD.OUTPUT_HI + 0, base + 0] = -0.5
 
 
+def _layer14_temp_clear_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for the ``layer14_temp_clear`` 4-unit substage chain.
+
+    Spans the three legacy helpers consolidated under this op:
+    :func:`_set_layer14_temp_clear` (1 unit), then
+    :func:`_set_layer14_clear_addsub_temp_negative_residue` (2 units),
+    then :func:`_set_layer14_add_byte1_high_zero_cleanup` (1 unit).
+    Every unit uses ``gate="CONST"`` with ``gate_weight=1.0`` and
+    ``gate_bias=0.0`` to reproduce the imperative
+    ``ffn.W_gate[unit, BD.CONST] = 1.0`` / unset-``b_gate`` pair
+    byte-identically (``constant_write`` would instead set
+    ``b_gate=1.0`` with ``W_gate[CONST]=0.0`` — a different matrix).
+    """
+    AX_I = 1
+    rules = (
+        # Unit 0: clear TEMP[0] at PC marker when OP_LEV active.
+        FFNRule.gated_write(
+            name="l14_temp_clear_pc_lev",
+            conditions=(
+                ("OP_LEV", 0.1),    # S * 0.1 == legacy W_up[..., OP_LEV] = S/10
+                ("MARK_PC", 1.0),
+            ),
+            threshold=1.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("TEMP+0", -5.0 / S),),
+            scope="OP_LEV and MARK_PC",
+            dominates_at={"TEMP+0": "OP_LEV and MARK_PC"},
+        ),
+        # Unit 1: TEMP[8] negative residue clamp.
+        FFNRule.gated_write(
+            name="l14_clear_addsub_temp_negative_residue_8",
+            conditions=(("TEMP+8", -1.0),),
+            threshold=0.0,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("TEMP+8", 2.0 / S),),
+        ),
+        # Unit 2: TEMP[9] negative residue clamp.
+        FFNRule.gated_write(
+            name="l14_clear_addsub_temp_negative_residue_9",
+            conditions=(("TEMP+9", -1.0),),
+            threshold=0.0,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("TEMP+9", 2.0 / S),),
+        ),
+        # Unit 3: ADD byte-1 high-nibble zero cleanup.
+        FFNRule.gated_write(
+            name="l14_add_byte1_high_zero_cleanup",
+            conditions=(
+                ("IS_BYTE", 1.0),
+                (f"H1+{AX_I}", 1.0),
+                ("BYTE_INDEX_0", 1.0),
+                ("TEMP+8", 1.0),
+                ("TEMP+9", -10.0),
+                ("AX_CARRY_HI+15", -10_000_000.0),
+                ("BYTE_INDEX_1", -10.0),
+                ("BYTE_INDEX_2", -10.0),
+                ("BYTE_INDEX_3", -10.0),
+                ("MARK_AX", -100.0),
+            ),
+            threshold=3.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                ("OUTPUT_HI_THIS_STEP+0", 50.0 / S),
+                *(
+                    (f"OUTPUT_HI_THIS_STEP+{nonzero}", -5000.0 / S)
+                    for nonzero in range(1, 16)
+                ),
+            ),
+        ),
+    )
+    return rules
+
+
+def _layer14_temp_clear_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_temp_clear_rules(S))
+    return ir
+
+
 def make_layer14_temp_clear_op() -> Operation:
     """L14 FFN: Clear TEMP[0] at PC marker when OP_LEV is active.
 
@@ -790,27 +877,28 @@ def make_layer14_temp_clear_op() -> Operation:
     additive cleanup ops (``layer14_clear_addr_key_pollution``,
     ``layer14_clear_output_corruption``) via a shared FFN unit counter stored
     on ``block.ffn._l14_unit_counter``. First in the chain (phase=14.1).
+
+    Migration (Phase 6 wave 3J): the 4 hidden units (across the legacy
+    helpers ``_set_layer14_temp_clear``,
+    ``_set_layer14_clear_addsub_temp_negative_residue``, and
+    ``_set_layer14_add_byte1_high_zero_cleanup``) are now declared via
+    :func:`_layer14_temp_clear_rules` and attached as ``compiler_ir``;
+    bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_temp_clear
-        from ...setup_helpers import (
-            _set_layer14_add_byte1_high_zero_cleanup,
-            _set_layer14_clear_addsub_temp_negative_residue,
-        )
         ffn = block.ffn
-        proxy = _as_setdim_proxy(dim_positions)
         # Pinned to the chain head (offset 0). Byte-identical with the
         # legacy ``_l14_unit_counter`` start (the counter is zero on a
         # fresh FFN before any L14 cleanup op has baked).
         start_unit = _l14_chain_alloc("layer14_temp_clear")
-        next_unit = _set_layer14_temp_clear(
-            ffn, S, proxy, start_unit=start_unit
+        ir = _layer14_temp_clear_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
         )
-        next_unit = _set_layer14_clear_addsub_temp_negative_residue(
-            ffn, S, proxy, start_unit=next_unit
-        )
-        next_unit = _set_layer14_add_byte1_high_zero_cleanup(
-            ffn, S, proxy, start_unit=next_unit
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -835,11 +923,12 @@ def make_layer14_temp_clear_op() -> Operation:
         phase=14.1,
         reads={"OP_LEV", "MARK_PC", "TEMP", "IS_BYTE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "BYTE_INDEX_3", "MARK_AX", "CONST"},
+               "BYTE_INDEX_3", "MARK_AX", "AX_CARRY_HI", "CONST"},
         writes={"TEMP", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_temp_clear_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
@@ -849,21 +938,79 @@ def make_layer14_temp_clear_op() -> Operation:
     )
 
 
+def _layer14_clear_addr_key_pollution_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_clear_addr_key_pollution``.
+
+    48 ``gated_write`` rules, one per ADDR_KEY[k] cell. Each rule fires
+    at positions that are NOT MEM value bytes AND NOT register markers
+    (the latter list mirrors the imperative blockers) by combining a
+    positive bias of 0.5 with -100 condition weights on every MEM_VAL_B*
+    and MARK_* blocker. The W_down write is -4.0/S to gently cancel the
+    ADDR_B*_HI residue that L9 attention leaves on ADDR_KEY-aliased
+    cells. Per-rule scope and dominates_at are not declared because the
+    rule is an additive defensive clear with no contested writes from
+    other ops in the L14 chain.
+    """
+    suppress_weight = -100.0  # imperative: W_up[..., DIM] = -S * 100
+    common_conditions = (
+        ("MEM_VAL_B0", suppress_weight),
+        ("MEM_VAL_B1", suppress_weight),
+        ("MEM_VAL_B2", suppress_weight),
+        ("MEM_VAL_B3", suppress_weight),
+        ("MARK_PC", suppress_weight),
+        ("MARK_BP", suppress_weight),
+        ("MARK_AX", suppress_weight),
+        ("MARK_STACK0", suppress_weight),
+        ("MARK_SP", suppress_weight),
+    )
+    rules = tuple(
+        FFNRule.gated_write(
+            name=f"l14_clear_addr_key_pollution_{k}",
+            conditions=common_conditions,
+            threshold=-0.5,  # imperative: b_up = +S * 0.5 == -S * (-0.5)
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"ADDR_KEY+{k}", -4.0 / S),),
+            scope=("not MEM_VAL_B0 and not MEM_VAL_B1 and not MEM_VAL_B2 "
+                   "and not MEM_VAL_B3 and not MARK_PC and not MARK_BP "
+                   "and not MARK_AX and not MARK_STACK0 and not MARK_SP"),
+        )
+        for k in range(48)
+    )
+    return rules
+
+
+def _layer14_clear_addr_key_pollution_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_clear_addr_key_pollution_rules(S))
+    return ir
+
+
 def make_layer14_clear_addr_key_pollution_op() -> Operation:
     """L14 FFN: Clear ADDR_KEY pollution at non-MEM, non-marker positions.
 
     Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
     counter on ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
     Second in the chain (phase=14.2).
+
+    Migration (Phase 6 wave 3J): per-unit writes declared via
+    :func:`_layer14_clear_addr_key_pollution_rules` and attached as
+    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_clear_addr_key_pollution
         ffn = block.ffn
         # Pinned to chain offset 4 (after layer14_temp_clear consumes 0..3).
         # Byte-identical with the legacy ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_clear_addr_key_pollution")
-        next_unit = _set_layer14_clear_addr_key_pollution(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_clear_addr_key_pollution_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -885,6 +1032,7 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_clear_addr_key_pollution_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
@@ -894,21 +1042,139 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
     )
 
 
+def _layer14_clear_output_corruption_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_clear_output_corruption``.
+
+    Three hidden units: the loop over ``k in [0, 16]`` produces unit 0
+    (OUTPUT_LO[0] boost at STACK0 byte rows) and unit 1 (OUTPUT_HI[0]
+    boost at STACK0 byte rows), each with the same blocker fan-out but
+    with the "preserve already-nonzero nibble" guard pointing at its
+    own band. Unit 2 is the JSR STACK0 marker HI[0] reassertion that
+    :func:`_disable_l14_stack0_jsr_hi0_default` wipes immediately after
+    bake (net W_down delta zero so the verifier observes no claim).
+
+    Each rule uses ``gate="CONST"`` with ``gate_weight=1.0`` and
+    ``gate_bias=0.0`` to reproduce the imperative
+    ``W_gate[CONST] = 1.0`` / unset-``b_gate`` pair byte-identically.
+    """
+    PC_I = 0
+    AX_I = 1
+    SP_I = 2
+    BP_I = 3
+    MEM_I = 4
+    suppress_weight = -100.0  # imperative: W_up[..., DIM] = -S * 100
+
+    def boost_unit_conditions(k: int, band_dim_name: str) -> tuple:
+        cond = [
+            (f"H4+{BP_I}", 1.0),
+            (f"H1+{BP_I}", -20.0),
+            ("MEM_VAL_B0", suppress_weight),
+            ("MEM_VAL_B1", suppress_weight),
+            ("MEM_VAL_B2", suppress_weight),
+            ("MEM_VAL_B3", suppress_weight),
+            (f"H1+{MEM_I}", suppress_weight),
+            (f"H3+{MEM_I}", suppress_weight),
+            ("MARK_PC", suppress_weight),
+            ("MARK_AX", suppress_weight),
+            ("MARK_SP", suppress_weight),
+            ("MARK_BP", suppress_weight),
+            ("MARK_MEM", suppress_weight),
+            ("MARK_STACK0", suppress_weight),
+            (f"H1+{PC_I}", suppress_weight),
+            (f"H1+{AX_I}", suppress_weight),
+            (f"H1+{SP_I}", suppress_weight),
+            ("PSH_AT_SP", suppress_weight),
+            ("CMP+3", suppress_weight),
+        ]
+        # k==0 (OUTPUT_LO band) also blocks ADD/SUB byte rows hard.
+        if k == 0:
+            cond.append(("TEMP+8", -1e20))
+            cond.append(("TEMP+9", -1e20))
+        cond.append(("BYTE_INDEX_3", suppress_weight))
+        # Preserve already-computed nonzero nibbles.
+        for nonzero in range(1, 16):
+            cond.append((f"{band_dim_name}+{nonzero}", -2.0))
+        return tuple(cond)
+
+    rules = (
+        FFNRule.gated_write(
+            name="l14_clear_output_corruption_lo0_boost",
+            conditions=boost_unit_conditions(0, "OUTPUT_LO"),
+            threshold=0.5,  # imperative: b_up = -S * 0.5
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("OUTPUT_LO+0", 50.0 / S),),
+        ),
+        FFNRule.gated_write(
+            name="l14_clear_output_corruption_hi0_boost",
+            conditions=boost_unit_conditions(16, "OUTPUT_HI_THIS_STEP"),
+            threshold=0.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("OUTPUT_HI_THIS_STEP+0", 50.0 / S),),
+        ),
+        # JSR STACK0 marker HI[0] reassertion. The bake post-pass
+        # ``_disable_l14_stack0_jsr_hi0_default`` zeroes this entire unit
+        # immediately after the rules lower, so the net residual cell
+        # writes are zero. The unit is still allocated to keep the chain
+        # offset / claim grid consistent with the legacy bake.
+        FFNRule.gated_write(
+            name="l14_clear_output_corruption_jsr_stack0_hi0_marker",
+            conditions=(
+                ("OP_JSR", 0.2),  # imperative: W_up[OP_JSR] = S/5
+                ("MARK_STACK0", 1.0),
+                ("IS_BYTE", -10.0),
+                ("MARK_PC", suppress_weight),
+                ("MARK_AX", suppress_weight),
+                ("MARK_SP", suppress_weight),
+                ("MARK_BP", suppress_weight),
+                ("MARK_MEM", suppress_weight),
+            ),
+            threshold=1.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("OUTPUT_HI_THIS_STEP+0", 50.0 / S),),
+        ),
+    )
+    return rules
+
+
+def _layer14_clear_output_corruption_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_clear_output_corruption_rules(S))
+    return ir
+
+
 def make_layer14_clear_output_corruption_op() -> Operation:
     """L14 FFN: Boost OUTPUT[0] at STACK0 byte positions to fix attention bleed.
 
     Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
     counter on ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
     Third in the chain (phase=14.3).
+
+    Migration (Phase 6 wave 3J): per-unit writes declared via
+    :func:`_layer14_clear_output_corruption_rules` and attached as
+    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`
+    then runs the boundary guard, the JSR STACK0 HI[0] disable pass
+    (which wipes the third allocated unit by design), and the PSH MEM
+    high-nibble boost extension.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_clear_output_corruption
         ffn = block.ffn
         # Pinned to chain offset 52 (predecessors consume units 0..51).
         # Byte-identical with the legacy ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_clear_output_corruption")
-        next_unit = _set_layer14_clear_output_corruption(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_clear_output_corruption_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         _disable_l14_stack0_jsr_hi0_default(ffn, dim_positions, start_unit, next_unit)
@@ -941,14 +1207,15 @@ def make_layer14_clear_output_corruption_op() -> Operation:
     return Operation(
         name="layer14_clear_output_corruption",
         phase=14.3,
-        reads={"H4", "H1", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+        reads={"H4", "H1", "H3", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "OP_JSR", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "IS_BYTE", "BYTE_INDEX_3", "PSH_AT_SP", "CMP",
-               "MEM_STORE", "OUTPUT_HI_THIS_STEP", "CONST"},
+               "MEM_STORE", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "TEMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_clear_output_corruption_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
@@ -958,6 +1225,64 @@ def make_layer14_clear_output_corruption_op() -> Operation:
     )
 
 
+def _layer14_clear_mem_marker_output_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_clear_mem_marker_output``.
+
+    64 hidden units arranged as four 16-element blocks:
+      block 0 (units +0..+15):  OP_JSR + OUTPUT_LO[k]   (k in 0..15)
+      block 1 (units +16..+31): OP_JSR + OUTPUT_HI[k]   (k in 0..15)
+      block 2 (units +32..+47): OP_ENT + OUTPUT_LO[k]   (k in 0..15)
+      block 3 (units +48..+63): OP_ENT + OUTPUT_HI[k]   (k in 0..15)
+
+    Each rule fires only at the MEM marker token when the matching op
+    relay is active: positive contributions from OP_* (weight 0.2,
+    matching the imperative ``W_up[OP_*] = S/5``) and MARK_MEM (weight
+    1.0), strong -10 blockers on IS_BYTE / MARK_PC / MARK_AX / MARK_SP /
+    MARK_BP / MARK_STACK0, threshold 1.5 so only the (relay+MEM marker)
+    pair fires. The W_down weight is the per-S 76/S offset
+    that cancels the L14 attention's -115 corruption per dim.
+    """
+    OFFSET = 76.0 / S  # imperative: same OFFSET = 76.0 / S
+    common_blockers = (
+        ("IS_BYTE", -10.0),
+        ("MARK_PC", -10.0),
+        ("MARK_AX", -10.0),
+        ("MARK_SP", -10.0),
+        ("MARK_BP", -10.0),
+        ("MARK_STACK0", -10.0),
+    )
+
+    def rule_for(op_name: str, band: str, k: int) -> FFNRule:
+        return FFNRule.gated_write(
+            name=f"l14_clear_mem_marker_output_{op_name.lower()}_{band.lower()}_{k}",
+            conditions=(
+                (op_name, 0.2),  # imperative: W_up[OP_*] = S / 5
+                ("MARK_MEM", 1.0),
+                *common_blockers,
+            ),
+            threshold=1.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"{band}+{k}", OFFSET),),
+            scope=f"{op_name} and MARK_MEM",
+        )
+
+    rules: list[FFNRule] = []
+    for op_name in ("OP_JSR", "OP_ENT"):
+        for k in range(16):
+            rules.append(rule_for(op_name, "OUTPUT_LO", k))
+        for k in range(16):
+            rules.append(rule_for(op_name, "OUTPUT_HI_THIS_STEP", k))
+    return tuple(rules)
+
+
+def _layer14_clear_mem_marker_output_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_clear_mem_marker_output_rules(S))
+    return ir
+
+
 def make_layer14_clear_mem_marker_output_op() -> Operation:
     """L14 FFN: Clear OUTPUT at MEM marker for OP_JSR/OP_ENT.
 
@@ -965,15 +1290,24 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
     counter on ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops
     (``layer14_temp_clear``, ``layer14_clear_addr_key_pollution``,
     ``layer14_clear_output_corruption``). Last in the chain (phase=14.4).
+
+    Migration (Phase 6 wave 3J): per-unit writes declared via
+    :func:`_layer14_clear_mem_marker_output_rules` and attached as
+    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_clear_mem_marker_output
         ffn = block.ffn
         # Pinned to chain offset 70 (predecessors consume units 0..69).
         # Byte-identical with the legacy ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_clear_mem_marker_output")
-        next_unit = _set_layer14_clear_mem_marker_output(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_clear_mem_marker_output_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -1008,6 +1342,7 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_clear_mem_marker_output_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
@@ -1015,6 +1350,64 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#memory",
     )
+
+
+def _layer14_jsr_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_jsr_ax_bytes_zero``.
+
+    Mirrors the 4 imperative hidden units: at AX byte positions
+    (IS_BYTE + H1[AX]) gated by OP_JSR, each unit spreads -3/S across one
+    nibble band (LO or HI) or boosts a single byte-value-0 slot (+5/S on
+    OUTPUT_LO[0] / OUTPUT_HI[0]). The byte-value-0 token wins argmax →
+    AX bytes 1-3 = 0x00 for the JSR-preserved AX. The W_down write weights
+    encode the original ``-3.0 / S`` / ``5.0 / S`` constants directly so
+    the lowerer's "no S scaling on writes" contract reproduces the
+    imperative helper byte-for-byte.
+    """
+    AX_I = 1
+    common_conditions = (
+        ("IS_BYTE", 1.0),
+        (f"H1+{AX_I}", 1.0),
+    )
+    common_kwargs = dict(
+        conditions=common_conditions,
+        threshold=1.5,
+        gate="OP_JSR",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        scope="OP_JSR and IS_BYTE and H1+1",
+    )
+    rules = (
+        FFNRule.gated_write(
+            name="l14_jsr_ax_bytes_zero_lo_neg",
+            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_jsr_ax_bytes_zero_hi_neg",
+            writes=tuple(
+                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
+            ),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_jsr_ax_bytes_zero_lo0_boost",
+            writes=(("OUTPUT_LO+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_jsr_ax_bytes_zero_hi0_boost",
+            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+    )
+    return rules
+
+
+def _layer14_jsr_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_jsr_ax_bytes_zero_rules(S))
+    return ir
 
 
 def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
@@ -1036,16 +1429,27 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
     Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
     counter ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
     Phase 14.6: runs AFTER ``layer14_addr_key_neural_decode`` (14.5).
+
+    Migration (Phase 6 wave 3J): the per-unit writes are now declared via
+    :func:`_layer14_jsr_ax_bytes_zero_rules` and attached as ``compiler_ir``;
+    the bake lowers the rule list via :meth:`CompilerIR.lower_ffn` at the
+    pinned chain offset and then runs the boundary-guard / STACK0-block
+    post-passes. Byte-identical with the legacy imperative helper.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_jsr_ax_bytes_zero
         ffn = block.ffn
         # Pinned to chain offset 1862 (predecessors through addr_key_neural_decode
         # consume units 0..1861). Byte-identical with the legacy
         # ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_jsr_ax_bytes_zero")
-        next_unit = _set_layer14_jsr_ax_bytes_zero(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_jsr_ax_bytes_zero_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         _block_l14_jsr_ax_zero_on_stack0_bytes(ffn, dim_positions, S, start_unit, next_unit)
@@ -1074,6 +1478,7 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_jsr_ax_bytes_zero_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
@@ -1081,6 +1486,68 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
+
+
+def _layer14_alu_nocarry_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_alu_nocarry_ax_bytes_zero``.
+
+    Mirrors the 4 imperative hidden units: at AX byte positions 1-3
+    (IS_BYTE + H1[AX] + TEMP[7]*4 + NOT BYTE_INDEX_3*4) gated by TEMP[7]
+    (the NOCARRY_ALU_OP relay populated by L7 head 5 for AND/OR/XOR/SHR),
+    each unit spreads -3/S across one nibble band (LO or HI) or boosts a
+    single byte-value-0 slot (+5/S on OUTPUT_LO[0] / OUTPUT_HI[0]). The
+    elevated threshold of 5.0 plus the ``TEMP+7`` condition weight of
+    4.0 reproduce the imperative ``b_up = -S * 5.0`` and
+    ``W_up[TEMP+7] = S * 4`` lines exactly; without TEMP[7] the
+    pre-silu drops to -300 (no firing) so byte 0 and non-target opcodes
+    are both safe.
+    """
+    AX_I = 1
+    common_conditions = (
+        ("IS_BYTE", 1.0),
+        (f"H1+{AX_I}", 1.0),
+        ("TEMP+7", 4.0),
+        ("BYTE_INDEX_3", -4.0),
+    )
+    common_kwargs = dict(
+        conditions=common_conditions,
+        threshold=5.0,
+        gate="TEMP+7",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        scope="TEMP+7 and IS_BYTE and H1+1 and not BYTE_INDEX_3",
+    )
+    rules = (
+        FFNRule.gated_write(
+            name="l14_alu_nocarry_ax_bytes_zero_lo_neg",
+            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_alu_nocarry_ax_bytes_zero_hi_neg",
+            writes=tuple(
+                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
+            ),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_alu_nocarry_ax_bytes_zero_lo0_boost",
+            writes=(("OUTPUT_LO+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_alu_nocarry_ax_bytes_zero_hi0_boost",
+            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+    )
+    return rules
+
+
+def _layer14_alu_nocarry_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_alu_nocarry_ax_bytes_zero_rules(S))
+    return ir
 
 
 def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
@@ -1107,16 +1574,25 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
     Phase 14.8: runs AFTER ``layer14_lc_ax_bytes_zero`` (14.7) — JSR / LC /
     nocarry-ALU gate on disjoint relays (OP_JSR vs OP_LC_RELAY vs TEMP[7])
     so the relative order within 14.6-14.8 only matters for unit allocation.
+
+    Migration (Phase 6 wave 3J): per-unit writes declared via
+    :func:`_layer14_alu_nocarry_ax_bytes_zero_rules` and attached as
+    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_alu_nocarry_ax_bytes_zero
         ffn = block.ffn
         # Pinned to chain offset 1870 (jsr_ax + lc_ax consume units 1862..1869).
         # Last op in the L14 cleanup chain. Byte-identical with the legacy
         # ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_alu_nocarry_ax_bytes_zero")
-        next_unit = _set_layer14_alu_nocarry_ax_bytes_zero(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_alu_nocarry_ax_bytes_zero_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -1143,6 +1619,7 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_alu_nocarry_ax_bytes_zero_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
@@ -1172,6 +1649,65 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
     )
 
 
+def _layer14_lc_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_lc_ax_bytes_zero``.
+
+    Mirrors the 4 imperative hidden units: at AX byte positions 1-3
+    (IS_BYTE + H1[AX] + NOT BYTE_INDEX_0 via ``BYTE_INDEX_3 = -S*4``
+    blocker) gated by OP_LC_RELAY, each unit spreads -3/S across one
+    nibble band (LO or HI) or boosts a single byte-value-0 slot (+5/S on
+    OUTPUT_LO[0] / OUTPUT_HI[0]). The ``BYTE_INDEX_3`` blocker is a
+    "kill switch": at any byte index where it is 1 the condition sum
+    drops by 4S and the SiLU side stops firing, which is why the
+    imperative helper labels it as a "Block after AX byte 3" guard.
+    """
+    AX_I = 1
+    common_conditions = (
+        ("IS_BYTE", 1.0),
+        (f"H1+{AX_I}", 1.0),
+        ("BYTE_INDEX_3", -4.0),
+    )
+    common_kwargs = dict(
+        conditions=common_conditions,
+        threshold=1.5,
+        gate="OP_LC_RELAY",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        scope="OP_LC_RELAY and IS_BYTE and H1+1 and not BYTE_INDEX_3",
+    )
+    rules = (
+        FFNRule.gated_write(
+            name="l14_lc_ax_bytes_zero_lo_neg",
+            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_lc_ax_bytes_zero_hi_neg",
+            writes=tuple(
+                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
+            ),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_lc_ax_bytes_zero_lo0_boost",
+            writes=(("OUTPUT_LO+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+        FFNRule.gated_write(
+            name="l14_lc_ax_bytes_zero_hi0_boost",
+            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+    )
+    return rules
+
+
+def _layer14_lc_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_lc_ax_bytes_zero_rules(S))
+    return ir
+
+
 def make_layer14_lc_ax_bytes_zero_op() -> Operation:
     """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_LC is active.
 
@@ -1197,15 +1733,24 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
     Phase 14.7: runs AFTER ``layer14_jsr_ax_bytes_zero`` (14.6) — the JSR
     and LC ops gate on disjoint relays (OP_JSR vs OP_LC_RELAY) so the
     relative order within phase 14.6-14.7 only matters for unit allocation.
+
+    Migration (Phase 6 wave 3J): per-unit writes declared via
+    :func:`_layer14_lc_ax_bytes_zero_rules` and attached as
+    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_lc_ax_bytes_zero
         ffn = block.ffn
         # Pinned to chain offset 1866 (jsr_ax_bytes_zero consumes 1862..1865).
         # Byte-identical with the legacy ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_lc_ax_bytes_zero")
-        next_unit = _set_layer14_lc_ax_bytes_zero(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_lc_ax_bytes_zero_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -1232,6 +1777,7 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_lc_ax_bytes_zero_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
