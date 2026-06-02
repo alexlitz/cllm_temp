@@ -2349,7 +2349,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 stack identity IR lowered to unexpected unit "
             f"{stack_identity_end}; expected {L6_STACK_IDENTITY_END_UNIT}"
         )
-    return
     for start, end in (
         (L6_PSH_SP_DECREMENT_START_UNIT, L6_PSH_SP_DECREMENT_END_UNIT),
         (L6_JSR_SP_DECREMENT_START_UNIT, L6_JSR_SP_DECREMENT_END_UNIT),
@@ -2375,6 +2374,7 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             f"{stack_arithmetic_ends}; expected "
             f"{expected_stack_arithmetic_ends}"
         )
+    return
     for start, end in (
         (L6_GETCHAR_AX_ROUTE_START_UNIT, L6_GETCHAR_AX_ROUTE_END_UNIT),
         (L6_BZ_AX_ROUTE_START_UNIT, L6_BZ_AX_ROUTE_END_UNIT),
