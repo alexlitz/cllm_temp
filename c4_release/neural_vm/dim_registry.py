@@ -726,13 +726,11 @@ def build_default_registry() -> DimRegistry:
     # predicates once consumers stabilize.
     _pin("TEMP", 480, 32, "General temporaries / reserved",
               semantics="is_byte OR NOT is_byte")
-    # Phase 7.A.3 TEMP split: TEMP_PREV_STEP aliases the same numeric slot
-    # as TEMP so byte-identity is preserved. Mirrors the B9 OUTPUT_HI /
-    # Phase 7.A.3.b OUTPUT_LO PREV_STEP pattern. TEMP is heavily
-    # cell-multiplexed; the alias documents the prev-step semantic and
-    # leaves room for future cross-step migrations.
+    # Phase 9.C: TEMP_PREV_STEP retained — consumed by
+    # ``make_lev_detector_head_op`` (control_flow_heads.py) as a string
+    # literal in op.reads (and exercised by tests/test_lev_detector_head.py).
     _pin("TEMP_PREV_STEP", 480, 32,
-              "TEMP from previous step (aliases TEMP)",
+              "TEMP from previous step (aliases TEMP; consumer: lev_detector_head)",
               semantics="is_byte OR NOT is_byte", alias=True)
 
     # =========================================================================
