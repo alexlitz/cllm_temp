@@ -68,7 +68,7 @@ _L11_MUL_PARTIAL_TOTAL_UNITS = sum(
 # 4 -> 8 -> 12 -> 16 across the Wave 4D substage commits; the final
 # commit removes the imperative tail entirely and attaches the full
 # ``compiler_ir`` to the op.
-_L11_MUL_PARTIAL_MIGRATED_END_A_LO = 12
+_L11_MUL_PARTIAL_MIGRATED_END_A_LO = 16
 
 
 # === Declarative FFNRule generators for L11 MUL partial ===============
