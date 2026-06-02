@@ -903,10 +903,15 @@ def _layer3_pc_byte1_output_rules(S: float) -> tuple:
     Both rules write ``OUTPUT_LO[0]=-500/S``, ``OUTPUT_LO[1]=500/S``,
     ``OUTPUT_HI[0]=500/S`` (the OUTPUT_LO writes form a +1 / -0
     one-hot pair, the OUTPUT_HI write provides the byte1 high nibble).
+
+    Phase 8.D follow-up: the ``BYTE_INDEX_0`` condition uses
+    :func:`dim_ref` for the ``(byte_index, "0")`` family lookup so
+    the rule names the byte-position role rather than the bare slot
+    label. Byte-identical via DimRef.parse.
     """
     common_conds = (
         (f"H1+{_PC_I}", 1.0),
-        ("BYTE_INDEX_0", 1.0),
+        (dim_ref("byte_index", "0"), 1.0),
         ("IS_BYTE", 1.0),
         ("HAS_SE", 1.0),
     )
