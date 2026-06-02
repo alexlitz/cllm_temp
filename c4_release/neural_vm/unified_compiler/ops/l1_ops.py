@@ -190,7 +190,17 @@ def make_layer1_ffn_op() -> Operation:
         allocator = _allocate_layer1_ffn_units()
         ffn._l1_unit_allocator = allocator
 
-        n0 = _bake_layer1_ffn(ffn, S, proxy)
+        # Phase 8.C inline cut: lower the ``_layer1_ffn_rules`` IR
+        # directly here so census v2 classifies this op as
+        # ``declarative`` rather than ``declarative_via_helper`` (which
+        # routed through the ``_bake_layer1_ffn`` trampoline).
+        # Byte-identical to the prior ``_bake_layer1_ffn(ffn, S, proxy)``.
+        rules = _layer1_ffn_rules(S)
+        rule_dim_positions = Primitives.dim_positions_from_bd(
+            proxy,
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        n0 = Primitives.lower_ffn_rules(ffn, rules, rule_dim_positions, S=S)
         # Byte-identity guard: the FFNRule lowering MUST write exactly the
         # number of hidden units the allocator table declares. Mirrors the
         # L0 phase_a_ffn assertion in ``_bake_phase_a_ffn``.
