@@ -7195,35 +7195,14 @@ def _set_layer14_alu_nocarry_ax_bytes_zero(ffn, S, BD, start_unit=0):
 # =============================================================================
 
 
-def _set_layer15_memory_lookup(attn, S, BD, HD):
-    """L15 attention: Memory lookup for LI/LC (at AX) and *SP (at STACK0).
+def _set_layer15_memory_lookup_heads_0_3(attn, S, BD, HD):
+    """Always-on portion of :func:`_set_layer15_memory_lookup`: heads 0-3.
 
-    4 heads, one per output byte. Each head serves BOTH:
-    - LI/LC at AX positions (load from memory address in prev AX)
-    - *SP at STACK0 positions (load from address in SP)
-
-    Uses binary Q/K address encoding for 24-bit matching with ZFOD.
-
-    Score budget per dim (all /sqrt(HD)=8):
-      Dim 0 (bias):     Q=-2000(non-target) or 0(target), K=CONST*10
-                         → -2500 at non-target, 0 at target
-      Dim 1 (store):    Q=50(target) or 0, K=(2*MEM_STORE-1)*50
-                         → +312.5 target+store, -312.5 target+non-store
-      Dim 2 (ZFOD ofs): Q=CONST*(-96), K=MEM_STORE*50
-                         → -600 at store entries (shifts addr baseline)
-      Dim 3 (byte sel): Q=L*flag, K=L*MEM_VAL_BH → +28 correct byte
-      Dims 4-27 (addr): 24 binary bits, scale=10
-                         match=+300, 1-bit-off=+275, random≈0
-                         NOTE: ADDR_B0_LO overlaps OPCODE_BYTE — up to +1200
-                         spurious score from residual opcode nibbles at Q side
-
-    Totals:
-      target+store+match:   0+312.5-600+300 = +12.5  → attend
-      target+store+1bitoff: 0+312.5-600+275 = -12.5  → ZFOD ✓
-      target+store+random:  0+312.5-600+0   = -287.5 → ZFOD ✓
-      target+non-store:     0-312.5+0+0     = -312.5 → suppressed
-      non-target+worst:     -2500+1200      = -1300  → suppressed ✓
-      non-target+self:      -2500+300       = -2200  → suppressed ✓
+    Factored out for Phase 7.C.2 so the IR carries the unconditional
+    heads-0-3 writes as one :class:`RuntimeAttentionFragment` and the
+    LEV-only heads-4-11 writes as another fragment gated by
+    ``attn.num_heads >= 12``. Callable directly for tests and for the
+    legacy :func:`_set_layer15_memory_lookup` umbrella entry point.
     """
     L = 15.0
     PC_I = 0
@@ -7401,10 +7380,21 @@ def _set_layer15_memory_lookup(attn, S, BD, HD):
             attn.W_o[BD.OUTPUT_LO + k, base + 32 + k] = 1.0
             attn.W_o[BD.OUTPUT_HI + k, base + 48 + k] = 1.0
 
+
+def _set_layer15_memory_lookup_lev_heads_4_11(attn, S, BD, HD):
+    """LEV-only portion of :func:`_set_layer15_memory_lookup`: heads 4-11.
+
+    Factored out for Phase 7.C.2 so the IR can carry this body as a
+    :class:`RuntimeAttentionFragment` gated by
+    ``attn.num_heads >= 12``. Heads 4-7 read ``saved_bp`` from
+    ``memory[BP]`` and heads 8-11 read ``return_addr`` from
+    ``memory[BP+8]``. Only fires on 17-layer LEV builds.
+    """
+    L = 15.0
     # === LEV-specific heads (4-7, 8-11): Only when L15 has 12 heads ===
     # This requires 17-layer model. With 16-layer model, heads 4-7 remain as
     # val heads for LI/LC/STACK0, and heads 8-11 don't exist.
-    if attn.num_heads >= 12:
+    if True:
         # === LEV-specific heads (4-7): Read saved_bp from memory[BP] ===
         # Phase 2 implementation - 2026-04-09
         # When OP_LEV active at BP marker, read the 4-byte word stored at BP address.
@@ -7667,6 +7657,55 @@ def _set_layer15_memory_lookup(attn, S, BD, HD):
                     attn.W_o[BD.TEMP + k, base + 32 + k] = 1.0
                     attn.W_o[BD.TEMP + 16 + k, base + 48 + k] = 1.0
             # Heads 9-11: No O projection (they write at byte positions later)
+
+
+def _set_layer15_memory_lookup(attn, S, BD, HD):
+    """L15 attention: Memory lookup for LI/LC (at AX) and *SP (at STACK0).
+
+    4 heads, one per output byte. Each head serves BOTH:
+    - LI/LC at AX positions (load from memory address in prev AX)
+    - *SP at STACK0 positions (load from address in SP)
+
+    Uses binary Q/K address encoding for 24-bit matching with ZFOD.
+
+    Score budget per dim (all /sqrt(HD)=8):
+      Dim 0 (bias):     Q=-2000(non-target) or 0(target), K=CONST*10
+                         → -2500 at non-target, 0 at target
+      Dim 1 (store):    Q=50(target) or 0, K=(2*MEM_STORE-1)*50
+                         → +312.5 target+store, -312.5 target+non-store
+      Dim 2 (ZFOD ofs): Q=CONST*(-96), K=MEM_STORE*50
+                         → -600 at store entries (shifts addr baseline)
+      Dim 3 (byte sel): Q=L*flag, K=L*MEM_VAL_BH → +28 correct byte
+      Dims 4-27 (addr): 24 binary bits, scale=10
+                         match=+300, 1-bit-off=+275, random≈0
+                         NOTE: ADDR_B0_LO overlaps OPCODE_BYTE — up to +1200
+                         spurious score from residual opcode nibbles at Q side
+
+    Totals:
+      target+store+match:   0+312.5-600+300 = +12.5  → attend
+      target+store+1bitoff: 0+312.5-600+275 = -12.5  → ZFOD ✓
+      target+store+random:  0+312.5-600+0   = -287.5 → ZFOD ✓
+      target+non-store:     0-312.5+0+0     = -312.5 → suppressed
+      non-target+worst:     -2500+1200      = -1300  → suppressed ✓
+      non-target+self:      -2500+300       = -2200  → suppressed ✓
+
+    Phase 7.C.2 split this umbrella into three runtime-shape pieces so
+    the L15 ``memory_lookup`` op can carry them as
+    :class:`RuntimeAttentionFragment` entries in its CompilerIR:
+
+    * :func:`_set_layer15_memory_lookup_heads_0_3` — always emits.
+    * :func:`_set_layer15_memory_lookup_lev_heads_4_11` — emits only
+      when ``attn.num_heads >= 12``.
+    * The current-store-generation suppress helper in
+      ``unified_compiler.ops.l15_ops``.
+
+    Kept as a single legacy entry point for ``tests/test_l15_per_op.py``
+    and for any caller that still wants the full imperative bake; the
+    production L15 op routes through the IR.
+    """
+    _set_layer15_memory_lookup_heads_0_3(attn, S, BD, HD)
+    if attn.num_heads >= 12:
+        _set_layer15_memory_lookup_lev_heads_4_11(attn, S, BD, HD)
 
     # Keep legacy_bake's L15 lookup guards in parity with the declarative L15
     # op while L15 attention is still a legacy-wrapper surface.

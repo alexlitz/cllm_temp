@@ -5,7 +5,7 @@ from collections.abc import Mapping
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR, FFNRule
+from ..ir import CompilerIR, FFNRule, RuntimeAttentionFragment
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -374,44 +374,153 @@ def make_nibble_copy_ffn_op() -> Operation:
     )
 
 
+def _layer15_memory_lookup_ir(dim_positions, HD) -> CompilerIR:
+    """Build the L15 ``memory_lookup`` CompilerIR with conditional fragments.
+
+    Phase 7.C.2 migrates the bake's two imperative helpers
+    (``vm_step._set_layer15_memory_lookup`` and the local
+    :func:`_suppress_l15_lookup_during_current_store_generation`) into
+    five :class:`RuntimeAttentionFragment` entries on a single
+    :class:`AttentionOp`. The IR carries each fragment's runtime
+    predicate so the lowerer can choose the right ones at bake time:
+
+    * ``memory_lookup.heads_0_3`` (always) — universal LI/LC + STACK0
+      load heads.
+    * ``memory_lookup.lev_heads_4_11`` (``attn.num_heads >= 12``) —
+      LEV-only saved_bp / return_addr reads.
+    * ``suppress.heads_0_3`` (always) — load-side suppression for
+      heads 0-3.
+    * ``suppress.lev_blockers_4_11`` (``attn.num_heads >= 12``) —
+      blocker rows on heads 4-11 keeping them silent during current
+      store generation.
+    * ``suppress.pop_d8_head_9`` (``attn.num_heads > 9``) — head 9 wipe
+      + pop_d8_to_e0 rewrite.
+
+    ``dim_positions`` is wrapped into a SetDim proxy and captured into
+    each fragment via closure so the writers see the same dim layout
+    they did in the imperative helpers. The wrapper functions in
+    ``vm_step`` and this module are byte-identity verified callers --
+    factoring them here just exposes the runtime-shape conditionals
+    one level up.
+    """
+    from ...vm_step import (
+        _set_layer15_memory_lookup_heads_0_3,
+        _set_layer15_memory_lookup_lev_heads_4_11,
+    )
+
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    attn_op = ir.layer(0).attention
+
+    # `_set_layer15_memory_lookup_*` and `_suppress_l15_*` take
+    # ``(attn, S, BD, HD)`` and ``(attn, BD, HD)`` respectively;
+    # `bake_fn` adapters absorb the IR's ``(attn, dim_positions, HD,
+    # S)`` call shape and pass `proxy` for BD. ``dim_positions`` is
+    # already captured via closure; the param is accepted but unused so
+    # the IR contract stays uniform.
+    attn_op.add_fragment(
+        RuntimeAttentionFragment(
+            name="layer15_memory_lookup.heads_0_3",
+            bake_fn=(
+                lambda attn, _dp, hd, s:
+                _set_layer15_memory_lookup_heads_0_3(attn, s, proxy, hd)
+            ),
+            metadata={"role": "load_heads", "always_on": True},
+        )
+    )
+    attn_op.add_fragment(
+        RuntimeAttentionFragment(
+            name="layer15_memory_lookup.lev_heads_4_11",
+            bake_fn=(
+                lambda attn, _dp, hd, s:
+                _set_layer15_memory_lookup_lev_heads_4_11(attn, s, proxy, hd)
+            ),
+            runtime_predicate=lambda attn: int(getattr(attn, "num_heads", 0)) >= 12,
+            metadata={"role": "lev_heads", "predicate": "num_heads >= 12"},
+        )
+    )
+    attn_op.add_fragment(
+        RuntimeAttentionFragment(
+            name="layer15_memory_lookup.suppress_heads_0_3",
+            bake_fn=(
+                lambda attn, _dp, hd, _s:
+                _suppress_l15_lookup_heads_0_3(attn, proxy, hd)
+            ),
+            metadata={"role": "current_store_suppress", "always_on": True},
+        )
+    )
+    attn_op.add_fragment(
+        RuntimeAttentionFragment(
+            name="layer15_memory_lookup.suppress_lev_blockers_4_11",
+            bake_fn=(
+                lambda attn, _dp, hd, _s:
+                _suppress_l15_lookup_lev_blockers_4_11(attn, proxy, hd)
+            ),
+            # The blocker loop iterates ``range(4, min(num_heads, 12))``
+            # in the legacy helper -- it has no LEV-build gate of its
+            # own. The body is empty for ``num_heads <= 4`` so any
+            # always-on emit would still be byte-identical, but
+            # restricting to ``num_heads > 4`` keeps the IR's intent
+            # explicit (these blocker rows belong to heads 4+).
+            runtime_predicate=lambda attn: int(getattr(attn, "num_heads", 0)) > 4,
+            metadata={
+                "role": "current_store_suppress_lev",
+                "predicate": "num_heads > 4",
+            },
+        )
+    )
+    attn_op.add_fragment(
+        RuntimeAttentionFragment(
+            name="layer15_memory_lookup.suppress_pop_d8_head_9",
+            bake_fn=(
+                lambda attn, _dp, hd, _s:
+                _suppress_l15_lookup_pop_d8_head_9(attn, proxy, hd)
+            ),
+            runtime_predicate=lambda attn: int(getattr(attn, "num_heads", 0)) > 9,
+            metadata={"role": "pop_d8_to_e0", "predicate": "num_heads > 9"},
+        )
+    )
+    return ir
+
+
 def make_layer15_memory_lookup_op() -> Operation:
     """L15 attention: memory-lookup heads for LI/LC.
 
-    Phase 6 wave 2F (head-axis migration): the bake instantiates a
-    per-bake :class:`AttentionHeadAllocator` pre-loaded with the full
-    L15 head layout (see :data:`_L15_HEAD_LAYOUT`) so the
-    structurally-stable head axis is auditable without grepping for
-    ``head_idx=`` literals. The actual Q/K/V/O writes still go through
-    the legacy ``_set_layer15_memory_lookup`` helper plus
+    Phase 7.C.2 (Option B, this commit): the bake no longer calls the
+    legacy ``_set_layer15_memory_lookup`` /
     :func:`_suppress_l15_lookup_during_current_store_generation`
-    because both helpers branch on ``attn.num_heads`` at runtime
-    (heads 4-11 only fire on the LEV build; head 9 is wiped and
-    rewritten when ``num_heads > 9``) and that conditional shape does
-    not cleanly fit a static per-head
-    :class:`DeclarativeAttentionHeadSpec` today. A follow-up wave can
-    carve each head out into its own spec once the LEV/non-LEV head
-    set is unified.
+    helpers directly. The CompilerIR built by
+    :func:`_layer15_memory_lookup_ir` carries the same writes as five
+    :class:`RuntimeAttentionFragment` entries gated by their respective
+    ``attn.num_heads`` predicates, and the layer-compiler dispatches
+    the bake through that IR. The legacy helpers stay around as the
+    fragment bodies (and as the single legacy entry point for
+    :mod:`tests.test_l15_per_op` and :func:`make_l15_attention_resize_op`).
+
+    Phase 6 wave 2F (head-axis migration, still in force): the bake
+    instantiates a per-bake :class:`AttentionHeadAllocator` pre-loaded
+    with the full L15 head layout (see :data:`_L15_HEAD_LAYOUT`) so the
+    structurally-stable head axis is auditable without grepping for
+    ``head_idx=`` literals.
     """
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_layer15_memory_lookup
         # Per-bake attention-head allocator with the full L15 head
         # layout pinned. Stashing on ``attn._l15_head_allocator`` lets
         # downstream tooling inspect the L15 head axis without grepping
-        # for ``head_idx=`` literals; the actual weight writes still go
-        # through the legacy ``_set_layer15_memory_lookup`` helper (heads
-        # 0-3 always, plus 4-11 when ``attn.num_heads >= 12``) and the
-        # ``_suppress_l15_lookup_during_current_store_generation`` helper
-        # (heads 0-3 always, head 9 when ``attn.num_heads > 9``, and
-        # rows on heads 4-11 when present). The conditional num_heads
-        # logic in those helpers does not cleanly fit per-head
-        # ``DeclarativeAttentionHeadSpec`` shape today; the allocator
-        # records the layout so a future refactor can carve them out.
+        # for ``head_idx=`` literals. The actual Q/K/V/O writes go
+        # through the IR fragments below (cut from the legacy
+        # imperative helpers in Phase 7.C.2).
         head_allocator = _allocate_layer15_attention_heads()
         attn._l15_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
-        proxy = _as_setdim_proxy(dim_positions)
-        _set_layer15_memory_lookup(attn, S, proxy, HD)
-        _suppress_l15_lookup_during_current_store_generation(attn, proxy, HD)
+
+        # Dispatch the conditional fragments via the IR. Each fragment
+        # carries its own ``num_heads`` predicate so the LEV / head-9
+        # branches fire only when the resized attention block exposes
+        # the right shape.
+        ir = _layer15_memory_lookup_ir(dim_positions, HD)
+        ir.lower_attention(attn, HD, dim_positions=dim_positions, S=S)
+
         if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
             # Memory reads are last-write-wins. Strict neural traces can leave
             # residual address features on older MEM value bytes; once source
@@ -450,6 +559,11 @@ def make_layer15_memory_lookup_op() -> Operation:
         layer_idx=15,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        # ``compiler_ir_factory`` surfaces the L15 head structure as
+        # data so the declarations-only path can audit it without
+        # invoking ``bake_fn``. Forwarded through the same fragment IR
+        # the bake uses, so the symbolic / IR view stays in sync.
+        compiler_ir_factory=_layer15_memory_lookup_ir,
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
@@ -690,18 +804,14 @@ def make_layer15_si_mem_addr0_from_stack0_op() -> Operation:
     )
 
 
-def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
-    """Keep L15 memory lookup from overwriting L14's current store tokens.
+def _suppress_l15_lookup_heads_0_3(attn, BD, HD) -> None:
+    """Always-on portion of :func:`_suppress_l15_lookup_during_current_store_generation`.
 
-    L15 is a load-side attention op: it reads historical MEM stores for LI/LC
-    and pop-group STACK0 loads. During PSH/SI/SC/JSR/ENT, L14 is still
-    generating the current MEM section. Those in-flight MEM byte positions have
-    MEM_STORE set and can also carry byte-index/ADDR_KEY features, making L15
-    look target-like and add a zero-valued load result over L14's freshly
-    emitted store byte. Suppress only query positions with MEM_STORE set; the
-    historical store tokens remain available as K-side memory entries.
+    Phase 7.C.2 factored split: heads 0-3 are universal LI/LC + STACK0
+    load heads, so their suppress writes run on every L15 attention
+    bake. Carried as a :class:`RuntimeAttentionFragment` in
+    ``layer15_memory_lookup``'s CompilerIR.
     """
-
     pc_i = 0
     ax_i = 1
     mem_i = 4
@@ -1270,12 +1380,27 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
             attn.W_q.data[base + 33, BD.OP_LC_RELAY] = 20000.0
             attn.W_k.data[base + 33, BD.MEM_STORE] = 5.0
 
-    # The LEV-aware 12-head build adds heads 4-11 for saved-BP and return-PC
-    # memory reads. They are load-side heads too, so they must also stay silent
-    # while the current step is generating a store MEM section. Use only rows
-    # whose K side is positive for all sources; adding MEM_STORE blockers to
-    # address or negative-constant rows can create negative-query × negative-key
-    # false positives.
+
+def _suppress_l15_lookup_lev_blockers_4_11(attn, BD, HD) -> None:
+    """LEV blocker rows for heads 4-11 (fires when ``num_heads >= 12``).
+
+    Phase 7.C.2 factored portion of the suppress helper: the LEV-aware
+    12-head build adds heads 4-11 for saved-BP and return-PC memory
+    reads. They are load-side heads too, so they must also stay silent
+    while the current step is generating a store MEM section. Use only
+    rows whose K side is positive for all sources; adding MEM_STORE
+    blockers to address or negative-constant rows can create
+    negative-query × negative-key false positives.
+
+    Carried as a :class:`RuntimeAttentionFragment` gated on
+    ``attn.num_heads >= 12`` in ``layer15_memory_lookup``'s CompilerIR.
+    The legacy umbrella loops ``range(4, min(num_heads, 12))`` so this
+    is a no-op when ``num_heads < 5``; gating the fragment on
+    ``num_heads >= 12`` keeps the IR's runtime-shape claim ("fires on
+    LEV build") explicit while remaining byte-identical because the
+    range is empty for ``num_heads < 5`` anyway.
+    """
+    mem_i = 4
     for head in range(4, min(getattr(attn, "num_heads", 4), 12)):
         base = head * HD
         for row in (0, 36, 37):
@@ -1283,54 +1408,96 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
                 attn.W_q.data[base + row, BD.MARK_MEM] = -100000.0
                 attn.W_q.data[base + row, BD.H3 + mem_i] = -100000.0
 
-    # A pop after a one-word pushed result can leave the STACK0 marker keyed
-    # by the pre-pop 0xffd8 slot while the revealed value lives at the post-pop
-    # 0xffe0 slot.  Use an otherwise-unused late head for this exact lookup so
-    # the fix does not perturb the dense legacy score rows in head 0.
+
+def _suppress_l15_lookup_pop_d8_head_9(attn, BD, HD) -> None:
+    """Head-9 wipe + pop_d8_to_e0 rewrite (fires when ``num_heads > 9``).
+
+    Phase 7.C.2 factored portion of the suppress helper: a pop after a
+    one-word pushed result can leave the STACK0 marker keyed by the
+    pre-pop 0xffd8 slot while the revealed value lives at the post-pop
+    0xffe0 slot.  Use an otherwise-unused late head for this exact
+    lookup so the fix does not perturb the dense legacy score rows in
+    head 0.
+
+    Wipes head 9's full Q/K/V/O bands first, then writes the pop_d8
+    lookup row. Carried as a :class:`RuntimeAttentionFragment` gated on
+    ``attn.num_heads > 9`` in ``layer15_memory_lookup``'s CompilerIR.
+    """
+    head = 9
+    base = head * HD
+    attn.W_q.data[base:base + HD, :] = 0.0
+    attn.W_k.data[base:base + HD, :] = 0.0
+    attn.W_v.data[base:base + HD, :] = 0.0
+    attn.W_o.data[:, base:base + HD] = 0.0
+
+    # Row 0 is a universal sink term: any ordinary key gets a negative
+    # score for every query. The target discriminator lives on a separate
+    # row so negative non-target queries cannot multiply a negative key
+    # into a false positive.
+    attn.W_q.data[base + 0, BD.CONST] = 1.0
+    attn.W_k.data[base + 0, BD.CONST] = -1000.0
+
+    pop_d8_to_e0_row = min(HD - 1, 63)
+    pop_d8_to_e0_s = 50000.0
+    row = base + pop_d8_to_e0_row
+    attn.W_q.data[row, BD.CONST] = -4.0 * pop_d8_to_e0_s
+    attn.W_q.data[row, BD.MARK_STACK0] = pop_d8_to_e0_s
+    attn.W_q.data[row, BD.HAS_SE] = pop_d8_to_e0_s
+    attn.W_q.data[row, BD.CMP + 3] = pop_d8_to_e0_s
+    attn.W_q.data[row, BD.ADDR_B0_LO + 8] = pop_d8_to_e0_s
+    attn.W_q.data[row, BD.ADDR_B0_HI + 13] = pop_d8_to_e0_s
+    attn.W_q.data[row, BD.IS_BYTE] = -5.0 * pop_d8_to_e0_s
+    attn.W_q.data[row, BD.MEM_STORE] = -8.0 * pop_d8_to_e0_s
+    for marker_dim in (
+        BD.MARK_AX,
+        BD.MARK_PC,
+        BD.MARK_SP,
+        BD.MARK_BP,
+        BD.MARK_MEM,
+    ):
+        attn.W_q.data[row, marker_dim] = -5.0 * pop_d8_to_e0_s
+    attn.W_k.data[row, BD.MEM_VAL_B1] = 1.0
+    attn.W_k.data[row, BD.ADDR_B0_LO + 0] = 1.0
+    attn.W_k.data[row, BD.ADDR_B0_HI + 14] = 1.0
+    for idx in range(16):
+        attn.W_v.data[base + 1 + idx, BD.CLEAN_EMBED_LO + idx] = 1.0
+        attn.W_v.data[base + 17 + idx, BD.CLEAN_EMBED_HI + idx] = 1.0
+        attn.W_o.data[BD.OUTPUT_LO + idx, base + 1 + idx] = 40.0
+        attn.W_o.data[BD.OUTPUT_HI + idx, base + 17 + idx] = 40.0
+    if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+        attn.alibi_slopes[head] = 1.0
+
+
+def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
+    """Keep L15 memory lookup from overwriting L14's current store tokens.
+
+    L15 is a load-side attention op: it reads historical MEM stores for LI/LC
+    and pop-group STACK0 loads. During PSH/SI/SC/JSR/ENT, L14 is still
+    generating the current MEM section. Those in-flight MEM byte positions have
+    MEM_STORE set and can also carry byte-index/ADDR_KEY features, making L15
+    look target-like and add a zero-valued load result over L14's freshly
+    emitted store byte. Suppress only query positions with MEM_STORE set; the
+    historical store tokens remain available as K-side memory entries.
+
+    Phase 7.C.2 split this umbrella into three runtime-shape pieces so
+    the ``layer15_memory_lookup`` op carries them as
+    :class:`RuntimeAttentionFragment` entries in its CompilerIR:
+
+    * :func:`_suppress_l15_lookup_heads_0_3` — always emits.
+    * :func:`_suppress_l15_lookup_lev_blockers_4_11` — emits when
+      ``attn.num_heads >= 12`` (LEV build only).
+    * :func:`_suppress_l15_lookup_pop_d8_head_9` — emits when
+      ``attn.num_heads > 9`` (covers the 14-head LEV build).
+
+    Kept as a single legacy entry point for the other callers
+    (``vm_step._set_layer15_memory_lookup`` and
+    ``make_l15_attention_resize_op``) and for ``tests/test_l15_per_op.py``;
+    the production ``layer15_memory_lookup`` bake routes through the IR.
+    """
+    _suppress_l15_lookup_heads_0_3(attn, BD, HD)
+    _suppress_l15_lookup_lev_blockers_4_11(attn, BD, HD)
     if getattr(attn, "num_heads", 0) > 9:
-        head = 9
-        base = head * HD
-        attn.W_q.data[base:base + HD, :] = 0.0
-        attn.W_k.data[base:base + HD, :] = 0.0
-        attn.W_v.data[base:base + HD, :] = 0.0
-        attn.W_o.data[:, base:base + HD] = 0.0
-
-        # Row 0 is a universal sink term: any ordinary key gets a negative
-        # score for every query. The target discriminator lives on a separate
-        # row so negative non-target queries cannot multiply a negative key
-        # into a false positive.
-        attn.W_q.data[base + 0, BD.CONST] = 1.0
-        attn.W_k.data[base + 0, BD.CONST] = -1000.0
-
-        pop_d8_to_e0_row = min(HD - 1, 63)
-        pop_d8_to_e0_s = 50000.0
-        row = base + pop_d8_to_e0_row
-        attn.W_q.data[row, BD.CONST] = -4.0 * pop_d8_to_e0_s
-        attn.W_q.data[row, BD.MARK_STACK0] = pop_d8_to_e0_s
-        attn.W_q.data[row, BD.HAS_SE] = pop_d8_to_e0_s
-        attn.W_q.data[row, BD.CMP + 3] = pop_d8_to_e0_s
-        attn.W_q.data[row, BD.ADDR_B0_LO + 8] = pop_d8_to_e0_s
-        attn.W_q.data[row, BD.ADDR_B0_HI + 13] = pop_d8_to_e0_s
-        attn.W_q.data[row, BD.IS_BYTE] = -5.0 * pop_d8_to_e0_s
-        attn.W_q.data[row, BD.MEM_STORE] = -8.0 * pop_d8_to_e0_s
-        for marker_dim in (
-            BD.MARK_AX,
-            BD.MARK_PC,
-            BD.MARK_SP,
-            BD.MARK_BP,
-            BD.MARK_MEM,
-        ):
-            attn.W_q.data[row, marker_dim] = -5.0 * pop_d8_to_e0_s
-        attn.W_k.data[row, BD.MEM_VAL_B1] = 1.0
-        attn.W_k.data[row, BD.ADDR_B0_LO + 0] = 1.0
-        attn.W_k.data[row, BD.ADDR_B0_HI + 14] = 1.0
-        for idx in range(16):
-            attn.W_v.data[base + 1 + idx, BD.CLEAN_EMBED_LO + idx] = 1.0
-            attn.W_v.data[base + 17 + idx, BD.CLEAN_EMBED_HI + idx] = 1.0
-            attn.W_o.data[BD.OUTPUT_LO + idx, base + 1 + idx] = 40.0
-            attn.W_o.data[BD.OUTPUT_HI + idx, base + 17 + idx] = 40.0
-        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-            attn.alibi_slopes[head] = 1.0
+        _suppress_l15_lookup_pop_d8_head_9(attn, BD, HD)
 
 
 def make_layer15_nibble_copy_op() -> Operation:
