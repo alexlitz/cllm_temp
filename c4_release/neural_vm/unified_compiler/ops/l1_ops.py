@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -82,6 +83,14 @@ def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     nearest at any position, so the sum is ~1 when active. The
     threshold/scale constants here (S, 1.5 threshold, 2.0/S write
     weight) are unchanged from the imperative helper.
+
+    Phase 8.D: The four ``BYTE_INDEX_i`` writes use :func:`dim_ref`
+    for the role-meaningful ``(byte_index, "i")`` family lookups --
+    each rule's output dim is a slot whose semantic role is the
+    byte index it asserts. The per-marker ``H*/L1H*+{i}`` reads stay
+    structural (``i`` is a marker-bank slot index, a structural
+    position into a fixed-width threshold-head bank, not a
+    role-meaningful byte index).
     """
     BP_I = 3
     NM = 7  # NUM_MARKERS — fixed-width threshold-head bank
@@ -103,19 +112,31 @@ def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     ))
 
     # Units 1..4: BYTE_INDEX_0..3 = IS_BYTE AND any(src_base) AND NOT any(blocker_base).
+    # Phase 8.D: pre-compute the four (byte_index, role) refs so the
+    # rule writes name the semantic family lookup, not the bare slot
+    # name. Each ``byte_index_<n>`` binding resolves to
+    # ``"BYTE_INDEX_<n>+0"`` -- byte-identical to the legacy ``out_dim``
+    # tuple-table strings via :meth:`DimRef.parse`.
+    byte_index_0 = dim_ref("byte_index", "0")
+    byte_index_1 = dim_ref("byte_index", "1")
+    byte_index_2 = dim_ref("byte_index", "2")
+    byte_index_3 = dim_ref("byte_index", "3")
     for src_base, blocker_base, out_dim in (
-        ("L1H1", "L1H0", "BYTE_INDEX_0"),
-        ("L1H2", "L1H1", "BYTE_INDEX_1"),
-        ("H0",   "L1H2", "BYTE_INDEX_2"),
-        ("H1",   "H0",   "BYTE_INDEX_3"),
+        ("L1H1", "L1H0", byte_index_0),
+        ("L1H2", "L1H1", byte_index_1),
+        ("H0",   "L1H2", byte_index_2),
+        ("H1",   "H0",   byte_index_3),
     ):
         conditions = [("IS_BYTE", 1.0)]
         gate_terms = []
         for i in range(NM):
             conditions.append((f"{src_base}+{i}", 1.0))
             gate_terms.append((f"{blocker_base}+{i}", -1.0))
+        # Recover the human-readable name (drops the "+0" so the rule
+        # name keeps the legacy ``l1_byte_index_<n>`` form).
+        out_name = out_dim.split("+", 1)[0].lower()
         rules.append(FFNRule.gated_write(
-            name=f"l1_{out_dim.lower()}",
+            name=f"l1_{out_name}",
             conditions=tuple(conditions),
             threshold=1.5,
             gate_terms=tuple(gate_terms),
