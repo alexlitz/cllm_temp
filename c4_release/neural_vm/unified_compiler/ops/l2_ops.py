@@ -551,14 +551,20 @@ def make_layer2_threshold_attn_op() -> Operation:
         )
 
     # Dim-ownership claims: 1 threshold head on L2 attn, head 0 writing L2H0.
+    # Phase 8.D follow-up: MARK_*+0 V-slot strings resolve through
+    # :func:`dim_ref` for the (marker, <NAME>) semantic family lookup --
+    # byte-identical to the legacy bare slot strings via DimRef.parse.
+    # ``L2H0+{m}`` stays bare: m is a structural offset into the
+    # 7-marker threshold-head output bank. ``CONST+0`` / ``IS_MARK+0``
+    # are scalar globals without (category, role) registry bindings.
     _claims = set()
-    _MARKS = ["MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
-              "MARK_MEM", "MARK_SE", "MARK_CS"]
-    for m, mark in enumerate(_MARKS):
-        _claims.add((2, "attn_W_v", f"0_{1 + m}", f"{mark}+0"))
+    _MARK_ROLES = ["PC", "AX", "SP", "BP", "MEM", "SE", "CS"]
+    for m, role in enumerate(_MARK_ROLES):
+        _claims.add((2, "attn_W_v", f"0_{1 + m}", dim_ref("marker", role)))
+        # structural offset: m indexes the per-marker output slot.
         _claims.add((2, "attn_W_o", f"0_{1 + m}", f"L2H0+{m}"))
-    _claims.add((2, "attn_W_q", "0_0", "CONST+0"))
-    _claims.add((2, "attn_W_k", "0_0", "IS_MARK+0"))
+    _claims.add((2, "attn_W_q", "0_0", "CONST+0"))  # structural offset (scalar global)
+    _claims.add((2, "attn_W_k", "0_0", "IS_MARK+0"))  # structural offset (scalar flag)
 
     return Operation(
         name="layer2_threshold_attn",
