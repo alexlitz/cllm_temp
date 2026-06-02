@@ -250,6 +250,58 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
 
+def _layer10_alu_bitwise_rules(
+    S: float, *, op_name: str, op_fn,
+) -> tuple[FFNRule, ...]:
+    """L10 bitwise OR/XOR/AND rules: 256 lo + 256 hi units per opcode.
+
+    Each unit is a 3-way AND across (MARK_AX, ALU_*[a], AX_CARRY_*[b])
+    that fires only when the OP_* gate is hot. Weights (40, 30, 30) and
+    threshold 80 implement the balanced 3-way AND from
+    ``vm_step._set_layer10_alu`` (see the BUG FIX 2026-04-16 comment):
+
+      * all three present: 40 + 30 + 30 = 100 > 80 -> fires
+      * any two present:   max(40 + 30) = 70 < 80  -> blocked
+
+    ``op_fn`` is the bitwise function (``operator.or_`` / ``xor`` /
+    ``and_``) used to compute the result nibble.
+    """
+
+    rules: list[FFNRule] = []
+    for nibble_label, alu_dim, carry_dim, out_dim in (
+        ("lo", "ALU_LO", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "ALU_HI", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+    ):
+        for a in range(16):
+            for b in range(16):
+                result = op_fn(a, b)
+                rules.append(FFNRule.gated_write(
+                    name=(
+                        f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
+                        f"a{a:x}_b{b:x}"
+                    ),
+                    conditions=(
+                        ("MARK_AX", 40.0),
+                        (f"{alu_dim}+{a}", 30.0),
+                        (f"{carry_dim}+{b}", 30.0),
+                    ),
+                    threshold=80.0,
+                    gate=f"OP_{op_name}",
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=((f"{out_dim}+{result}", 2.0 / S),),
+                ))
+    return tuple(rules)
+
+
+def _layer10_alu_bitwise_or_rules(S: float) -> tuple[FFNRule, ...]:
+    """L10 bitwise OR: 512 units (256 lo + 256 hi) gated on OP_OR."""
+
+    import operator
+
+    return _layer10_alu_bitwise_rules(S, op_name="OR", op_fn=operator.or_)
+
+
 def _bake_layer10_carry_relay_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 0 carry relay spec."""
     Primitives.generate_attention_head(
