@@ -2969,9 +2969,11 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         # Phase 8.A: matches layer14_mem_generation's ADDR_B0_HI_PREV_STEP
         # rename — same back-edge against L15 store_stack0_sp_byte0_addr,
         # same numeric position (slot 206), no functional change.
+        # Phase 8.A follow-up: ADDR_B0_LO_PREV_STEP matches the HI pattern
+        # — same L15 back-edge, same numeric slot, no functional change.
         reads={"MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "H2", "H3",
                "OP_LI_RELAY", "OP_LC_RELAY", "MARK_AX",
-               "ADDR_B0_LO", "ADDR_B0_HI_PREV_STEP", "ADDR_B1_LO",
+               "ADDR_B0_LO_PREV_STEP", "ADDR_B0_HI_PREV_STEP", "ADDR_B1_LO",
                "CONST"},
         writes={"ADDR_KEY"},
         kind="block",
