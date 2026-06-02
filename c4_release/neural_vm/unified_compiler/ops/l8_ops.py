@@ -1969,8 +1969,20 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         # no longer needed (the dim algebra now breaks the back-edge
         # natively) and has been removed -- keeping it would make the B9
         # EXCEPTION mis-fire (writes∩reads now empty), forcing L8 past L16.
-        reads={"MARK_AX", "HAS_SE", "OUTPUT_LO_PREV_STEP",
-               "OUTPUT_HI_PREV_STEP", "CONST",
+        #
+        # Phase 9 SSA prototype demo: the *_PREV_STEP aliases are
+        # re-spelled in SSA form (``BASE.*.STEP_OFFSET``). The ``*``
+        # writer wildcard reflects the multi-producer reality (any of
+        # L8/L14/L16's OUTPUT_LO/HI writers may have written this AX
+        # marker's residual in the previous step); ``-1`` is the
+        # prev-VM-step offset. The LayerCompiler auto-declares each SSA
+        # form as an alias of its base dim, so
+        # ``dim_positions["OUTPUT_LO.*.-1"] == dim_positions["OUTPUT_LO"]``
+        # -- byte-identical to the OUTPUT_LO_PREV_STEP form. The bake
+        # (``enable=False`` by default) is unchanged. See ssa_dim.py and
+        # docs/PHASE_9_SSA_PROTOTYPE.md.
+        reads={"MARK_AX", "HAS_SE", "OUTPUT_LO.*.-1",
+               "OUTPUT_HI.*.-1", "CONST",
                "OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR", "OP_LEV",
                "OP_BZ", "OP_BNZ", "OP_PSH", "OP_ADJ", "OP_ENT",
                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
