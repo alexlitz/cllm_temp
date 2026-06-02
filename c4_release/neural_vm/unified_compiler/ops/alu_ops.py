@@ -145,8 +145,14 @@ def make_alu_shift_composite_ops():
             kind="block",
             declarative_bake_fn=bake,
             declarative_authority="structural_model",
-            layer_idx=13,
+            # Phase 8.A.4: dropped ``layer_idx=13`` in favour of
+            # ``target_op_name``. Binds to whichever layer the dep graph
+            # places ``l13_alu_shift_getobd`` (the final kind="ffn"
+            # composite stage) -- those stages all write into the L13
+            # FFN, so the install op naturally follows them.
+            target_op_name="l13_alu_shift_getobd",
             migrated=True,
+            requires={"after": "l13_alu_shift_getobd"},
         smoke_tests={
             "TestSmoke32Bit::test_shl_8bit",
             "TestSmoke32Bit::test_shr_8bit",
