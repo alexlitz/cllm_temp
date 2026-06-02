@@ -1,6 +1,6 @@
 """Model-level and post-pass op factories. See ../migrated_ops.py for history."""
 
-from ..ir import CompilerIR, FFNRule
+from ..ir import CompilerIR, FFNRule, TokenEmbeddingRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
@@ -885,6 +885,38 @@ def make_embedding_bake_op() -> Operation:
     )
 
 
+def _initial_pc_bake_ir() -> CompilerIR:
+    """Build the :class:`TokenEmbeddingRule` IR for ``initial_pc_bake``.
+
+    Mirrors the imperative bake bit-for-bit:
+      - ``embed[REG_PC, EMBED_LO + (PC_OFFSET & 0xF)] += 1.0``
+      - ``embed[REG_PC, EMBED_HI + ((PC_OFFSET >> 4) & 0xF)] += 1.0``
+
+    The rule lowering is accumulative (``+=``), and the imperative bake used
+    direct assignment (``=``) to +1.0 on cells previously zeroed by
+    ``setup_token_embeddings``. Since the embedding-table cells in question
+    are NOT also written by ``setup_token_embeddings`` for the ``REG_PC``
+    token (the token only gets ``MARK_PC``, ``IS_MARK``, and ``CONST``
+    set — none of which alias these EMBED_LO/HI nibble slots), the
+    ``+=`` semantics produce the same byte-identical 1.0 cell value.
+    """
+    from ...vm_step import Token
+    from ...constants import PC_OFFSET
+
+    ir = CompilerIR()
+    init_pc_lo = PC_OFFSET & 0xF
+    init_pc_hi = (PC_OFFSET >> 4) & 0xF
+    ir.embeddings.append(TokenEmbeddingRule.embed_write(
+        token_ids=[Token.REG_PC],
+        writes=(
+            (f"EMBED_LO+{init_pc_lo}", 1.0),
+            (f"EMBED_HI+{init_pc_hi}", 1.0),
+        ),
+        name="initial_pc_reg_pc_nibbles",
+    ))
+    return ir
+
+
 def make_initial_pc_bake_op() -> Operation:
     """Bake the initial PC value (PC_OFFSET) into the REG_PC token embedding.
 
@@ -903,30 +935,20 @@ def make_initial_pc_bake_op() -> Operation:
     inline at `_set_layer3_ffn`) subtracts -1.0 from those same EMBED_LO/HI
     dims at MARK_PC AND HAS_SE positions — leaving step-1+ residuals
     bit-identical to the pre-migration behavior.
+
+    Phase 7.D.2 migration: the imperative body is replaced by an op-owned
+    :class:`CompilerIR` carrying a single :class:`TokenEmbeddingRule` (one
+    rule, two writes — the EMBED_LO and EMBED_HI nibble columns derived
+    from ``PC_OFFSET``). The bake_fn delegates to
+    ``CompilerIR.lower_token_embeddings``. Byte-identical to the prior
+    imperative path because the IR rule writes ``+1.0`` to cells that
+    ``setup_token_embeddings`` (phase=1001) leaves at 0 for ``REG_PC``.
     """
+    _ir = _initial_pc_bake_ir()
+
     def _bake(model, dim_positions, S):
-        import torch
-        from ...vm_step import Token
-        from ...constants import PC_OFFSET
-
-        def D(name):
-            if dim_positions is not None and name in dim_positions:
-                return dim_positions[name]
-            from ...vm_step import _SetDim
-            return getattr(_SetDim, name)
-
-        embed_weight = model.embed.embed.weight
-        if Token.REG_PC >= embed_weight.shape[0]:
-            return  # No REG_PC token in vocab (shouldn't happen).
-
-        embed_lo = D("EMBED_LO")
-        embed_hi = D("EMBED_HI")
-        init_pc_lo = PC_OFFSET & 0xF
-        init_pc_hi = (PC_OFFSET >> 4) & 0xF
-
-        with torch.no_grad():
-            embed_weight[Token.REG_PC, embed_lo + init_pc_lo] = 1.0
-            embed_weight[Token.REG_PC, embed_hi + init_pc_hi] = 1.0
+        del S
+        _ir.lower_token_embeddings(model, dim_positions)
 
     # Dim-ownership claims. The bake adds two non-zero values into the REG_PC
     # row of the token-embedding table (column EMBED_LO + (PC_OFFSET & 0xF)
@@ -944,8 +966,10 @@ def make_initial_pc_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         declarative_bake_fn=_bake,
+        compiler_ir=_ir,
         phase=1001.5,
         declarative_authority="declarative",
+        migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
