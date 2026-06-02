@@ -2688,6 +2688,55 @@ def _expand_wrapper_blocks(model):
         print(f"  Total blocks: 17 -> {len(final_blocks)}")
 
 
+def _merge_wrapper_blocks(model):
+    """Phase 10.B: fold per-block ``post_ops`` into the parent block's FFN.
+
+    Alternate to :func:`_expand_wrapper_blocks`. Selected when
+    ``C4_DISABLE_WRAPPER_EXPANSION=1`` is set (see
+    :func:`make_expand_wrapper_blocks_op`).
+
+    The default path lifts each ``post_op`` into a fresh
+    ``TransformerBlock`` whose attention is zero-initialised. The
+    passthrough attention is functionally a no-op (``x + Attn(x) = x +
+    0 = x``) but costs ``4 * d_model**2`` params per wrapper block --
+    19.5%% of total at the production ``d_model=800``.
+
+    This routing chains each block's post_ops behind its existing FFN
+    via ``nn.Sequential(orig_ffn, *post_ops)`` and clears
+    ``block.post_ops``. Forward math is byte-identical to the expanded
+    path on the default ``use_rms_norm=False`` setting:
+
+      * expanded:  ``attn(x); ffn(x);`` then per wrapper block
+        ``passthrough_attn(x) [= x]; post_op(x)`` reduces to
+        ``post_op_n(...post_op_1(ffn(attn(x))))``.
+      * merged:   ``attn(x); Sequential(ffn, *post_ops)(x)`` reduces to
+        ``post_op_n(...post_op_1(ffn(attn(x))))``.
+
+    Saves ``n_post_ops * 4 * d_model**2`` attention params (~35.8 M at
+    the 14-wrapper / 800-d_model baseline). The default
+    ``_expand_wrapper_blocks`` path is unchanged.
+    """
+    merged_count = 0
+    for block in model.blocks:
+        if not hasattr(block, 'post_ops'):
+            continue
+        if len(block.post_ops) == 0:
+            continue
+        post_ops_list = list(block.post_ops)
+        # Clear post_ops so TransformerBlock.forward's trailing loop is a no-op.
+        block.post_ops = nn.ModuleList()
+        # Chain (orig_ffn -> post_op_1 -> ... -> post_op_n).
+        block.ffn = nn.Sequential(block.ffn, *post_ops_list)
+        merged_count += len(post_ops_list)
+
+    if merged_count > 0:
+        device = next(model.parameters()).device
+        model.blocks = model.blocks.to(device)
+        print(f"  PHASE 10.B MERGE: folded {merged_count} post_ops into "
+              f"parent FFNs (no wrapper blocks emitted)")
+        print(f"  Total blocks: {len(model.blocks)} (native, no expansion)")
+
+
 def _right_size_ffns(model):
     """Trim each block's FFN to the actually-programmed unit count.
 

@@ -1469,10 +1469,26 @@ def make_right_size_ffns_op() -> Operation:
 
 
 def make_expand_wrapper_blocks_op() -> Operation:
-    """Split HybridALUBlock + post_ops into separate transformer blocks."""
+    """Split HybridALUBlock + post_ops into separate transformer blocks.
+
+    Default path runs :func:`_expand_wrapper_blocks` (each post_op
+    becomes its own block with a zero-init passthrough attention).
+
+    Phase 10.B alternate path: when ``C4_DISABLE_WRAPPER_EXPANSION=1``
+    is set in the environment, :func:`_merge_wrapper_blocks` folds each
+    block's post_ops into the parent block's FFN via ``nn.Sequential``
+    instead, eliminating ~35.8M dead wrapper-attention params (19.5%%
+    of total at the production d_model=800). Forward math is byte-
+    identical on the default ``use_rms_norm=False`` setting.
+    """
     def bake(model, dim_positions, S):
-        from ...vm_step import _expand_wrapper_blocks
-        _expand_wrapper_blocks(model)
+        import os as _os
+        if _os.environ.get("C4_DISABLE_WRAPPER_EXPANSION") == "1":
+            from ...vm_step import _merge_wrapper_blocks
+            _merge_wrapper_blocks(model)
+        else:
+            from ...vm_step import _expand_wrapper_blocks
+            _expand_wrapper_blocks(model)
 
     return Operation(
         name="expand_wrapper_blocks",
