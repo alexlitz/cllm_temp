@@ -2742,6 +2742,16 @@ def make_l10_post_ops_combined() -> Operation:
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L11/L14 TEMP writers. Same numeric position as TEMP.
         # See layer10_byte_passthrough for the per-band rationale.
+        # Phase 8.A G7: OUTPUT_HI_THIS_STEP read renamed to
+        # OUTPUT_HI_PREV_STEP. The combined post-op block uses OUTPUT_HI
+        # as a residual gate for carry-propagation / byte zeroing -- the
+        # value it actually reads at phase 10.5 is the residual carried
+        # from the PREVIOUS step's final OUTPUT writer, NOT a same-step
+        # data flow from later-layer OUTPUT_HI_THIS_STEP writers (L12+/
+        # L14+/L15+/L16). Mirrors the OUTPUT_LO_PREV_STEP rename for the
+        # same op (commit e7ee64bd). The alias shares numeric position
+        # 190 with OUTPUT_HI so bakes stay byte-identical. Breaks 9
+        # cross-step back-edges into this op.
         reads={
             "CONST", "MARK_AX", "MARK_PC", "IS_BYTE", "H1",
             "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
@@ -2752,7 +2762,7 @@ def make_l10_post_ops_combined() -> Operation:
             "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC",
             "OP_SI", "OP_SC", "OP_PSH", "OP_EXIT", "OP_NOP",
             "OP_PUTCHAR", "OP_GETCHAR",
-            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "ALU_LO", "ALU_HI",
+            "OUTPUT_LO", "OUTPUT_HI_PREV_STEP", "ALU_LO", "ALU_HI",
             "CARRY", "CMP", "TEMP_PREV_STEP",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
         },

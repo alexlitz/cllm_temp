@@ -2329,6 +2329,13 @@ class _SetDim:
     # "OUTPUT_HI_PREV_STEP" cross-step carry (see docs/B9_OUTPUT_HI_SPLIT_SPEC.md).
     # Numeric position is identical so baked weights are byte-identical.
     OUTPUT_HI_THIS_STEP = 190  # alias of OUTPUT_HI
+    # Phase 8.A G7: OUTPUT_HI_PREV_STEP alias for the same 16-slot band.
+    # Cross-step readers (L3 head 5 AX_FULL relay, L8 head 6 AX_CARRY
+    # refresh, L6 routing_ffn cancel-pattern gates, L10 post-ops combined,
+    # L15 store_stack0_sp_byte0_addr) attend back to the prior step's
+    # residual via attention or read the prev-step OUTPUT_HI directly.
+    # Same numeric base (190) so baked weights are byte-identical.
+    OUTPUT_HI_PREV_STEP = 190  # alias of OUTPUT_HI
     # Phase 7.A.3 OUTPUT_LO split: PREV_STEP alias for the same 16-slot
     # band. Cross-step readers (L3 head 5 AX_FULL relay,
     # L8 head 6 AX_CARRY refresh) attend back to the prior step's AX

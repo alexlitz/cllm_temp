@@ -1959,10 +1959,18 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         phase=8.05,
         # Phase 7.A.3.b: OUTPUT_LO read is cross-step (the V slots pull
         # the prev step's AX marker residual via attention back-edge).
-        # OUTPUT_HI_THIS_STEP keeps its B9 name because rename-only Option
-        # B is the documented choice for OUTPUT_HI in that split.
+        # Phase 8.A G7: OUTPUT_HI_THIS_STEP read renamed to
+        # OUTPUT_HI_PREV_STEP. The V slots pull the prev step's AX marker
+        # residual via attention back-edge -- not a same-step data dep on
+        # any L8+/L14+/L16 OUTPUT_HI_THIS_STEP writer. The alias shares
+        # numeric position 190 with OUTPUT_HI so bakes stay byte-identical.
+        # This rename breaks 13 cross-step back-edges into this op. The
+        # previous requires["after"]=layer16_lev_routing cycle-break is
+        # no longer needed (the dim algebra now breaks the back-edge
+        # natively) and has been removed -- keeping it would make the B9
+        # EXCEPTION mis-fire (writes∩reads now empty), forcing L8 past L16.
         reads={"MARK_AX", "HAS_SE", "OUTPUT_LO_PREV_STEP",
-               "OUTPUT_HI_THIS_STEP", "CONST",
+               "OUTPUT_HI_PREV_STEP", "CONST",
                "OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR", "OP_LEV",
                "OP_BZ", "OP_BNZ", "OP_PSH", "OP_ADJ", "OP_ENT",
                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
@@ -1987,15 +1995,6 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
-        # B9 OUTPUT_HI split: this op's docstring is "refresh
-        # AX_CARRY from prev step's AX marker OUTPUT". The V reads on
-        # OUTPUT_LO/HI_THIS_STEP at the AX marker pull the PREVIOUS step's
-        # cached residual via attention -- NOT a same-step data dep on
-        # any L8+ producer. requires["after"]=layer16_lev_routing tells
-        # the dynamic scheduler that the read is satisfied by the prev
-        # step's final OUTPUT writer. See
-        # docs/B9_OUTPUT_HI_SPLIT_SPEC.md §2.2 and §6.3.
-        requires={"after": "layer16_lev_routing"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

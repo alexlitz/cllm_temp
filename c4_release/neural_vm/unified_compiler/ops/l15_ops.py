@@ -652,9 +652,17 @@ def make_layer15_store_stack0_sp_byte0_addr_op() -> Operation:
     return Operation(
         name="layer15_store_stack0_sp_byte0_addr",
         phase=15.2,
+        # Phase 8.A G7: OUTPUT_HI_THIS_STEP read renamed to
+        # OUTPUT_HI_PREV_STEP. Head 12 attends back to the post-pop
+        # STACK0 / SP-marker token whose cached OUTPUT_HI residual
+        # is the previous step's value -- not a same-step data flow
+        # from layer16_lev_routing or tail_bit32_result_correction
+        # (which both fire AFTER L15 in the same step). The alias
+        # shares numeric position 190 with OUTPUT_HI so bakes stay
+        # byte-identical. Breaks 2 cross-step back-edges.
         reads={
             "MARK_STACK0", "MARK_SP", "HAS_SE", "MEM_STORE",
-            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CONST",
+            "OUTPUT_LO", "OUTPUT_HI_PREV_STEP", "CONST",
         },
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
