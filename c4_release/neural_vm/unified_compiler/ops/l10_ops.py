@@ -135,6 +135,121 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     return allocator
 
 
+# === L10 ALU FFNRule generators (Phase 6 Wave 4I migration) ==========
+#
+# Per-sub-stage declarative rules that reproduce ``_set_layer10_alu``
+# (vm_step.py) byte-for-byte. Each generator mirrors one contiguous
+# range of the ``_L10_FFN_UNIT_LAYOUT_MAIN`` table so a downstream
+# lower via ``Primitives.lower_ffn_rules`` lands on the same pinned
+# offsets the imperative helper writes today.
+
+def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
+    """L10 cmp_combine rules: 18 units for EQ/NE/LT/GT/LE/GE.
+
+    Mirrors the ``_cmp_default`` / ``_cmp_override_2way`` /
+    ``_cmp_override_3way`` helpers in ``vm_step._set_layer10_alu``.
+
+    Each comparison opcode has one default unit (writes a baseline 0 or
+    1 result + an OUTPUT_HI[0]=1 marker, ungated via ``b_gate=1.0``)
+    followed by 1-3 override units (each gated on the OP_* dim,
+    flipping the result via a +4.0/S / -4.0/S pair on OUTPUT_LO) that
+    fire on CMP-flag combinations from L9.
+    """
+
+    def _cmp_default(op_name: str, default_result: int) -> FFNRule:
+        # Helper: W_up[MARK_AX]=S, W_up[op]=S, b_up=-S*1.5, b_gate=1.0
+        # (gate=None), W_down[OUTPUT_LO+default_result]=2/S,
+        # W_down[OUTPUT_HI+0]=2/S.
+        return FFNRule.constant_write(
+            name=f"l10_cmp_{op_name.lower()}_default",
+            conditions=(
+                ("MARK_AX", 1.0),
+                (f"OP_{op_name}", 1.0),
+            ),
+            threshold=1.5,
+            writes=(
+                (f"OUTPUT_LO+{default_result}", 2.0 / S),
+                ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
+            ),
+        )
+
+    def _cmp_override_2way(
+        op_name: str, cmp_idx: int, to_result: int, from_result: int,
+        suffix: str,
+    ) -> FFNRule:
+        # Helper: W_up[MARK_AX]=S, W_up[CMP+i]=S, b_up=-S*1.5,
+        # W_gate[op]=1.0 (b_gate=0), W_down[OUTPUT_LO+to]=4/S,
+        # W_down[OUTPUT_LO+from]=-4/S.
+        return FFNRule.gated_write(
+            name=f"l10_cmp_{op_name.lower()}_override2_{suffix}",
+            conditions=(
+                ("MARK_AX", 1.0),
+                (f"CMP+{cmp_idx}", 1.0),
+            ),
+            threshold=1.5,
+            gate=f"OP_{op_name}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                (f"OUTPUT_LO+{to_result}", 4.0 / S),
+                (f"OUTPUT_LO+{from_result}", -4.0 / S),
+            ),
+        )
+
+    def _cmp_override_3way(
+        op_name: str, cmp_idx1: int, cmp_idx2: int,
+        to_result: int, from_result: int, suffix: str,
+    ) -> FFNRule:
+        # Helper: W_up[MARK_AX]=S, W_up[CMP+i]=S, W_up[CMP+j]=S,
+        # b_up=-S*4.0, W_gate[op]=1.0 (b_gate=0),
+        # W_down[OUTPUT_LO+to]=4/S, W_down[OUTPUT_LO+from]=-4/S.
+        return FFNRule.gated_write(
+            name=f"l10_cmp_{op_name.lower()}_override3_{suffix}",
+            conditions=(
+                ("MARK_AX", 1.0),
+                (f"CMP+{cmp_idx1}", 1.0),
+                (f"CMP+{cmp_idx2}", 1.0),
+            ),
+            threshold=4.0,
+            gate=f"OP_{op_name}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                (f"OUTPUT_LO+{to_result}", 4.0 / S),
+                (f"OUTPUT_LO+{from_result}", -4.0 / S),
+            ),
+        )
+
+    return (
+        # EQ: default=0, override to 1 when hi_eq AND lo_eq.
+        _cmp_default("EQ", 0),
+        _cmp_override_3way("EQ", 1, 2, 1, 0, "hi_eq_lo_eq"),
+        # NE: default=1, override to 0 when hi_eq AND lo_eq.
+        _cmp_default("NE", 1),
+        _cmp_override_3way("NE", 1, 2, 0, 1, "hi_eq_lo_eq"),
+        # LT: default=0, override to 1 on hi_lt OR (hi_eq AND lo_lt).
+        _cmp_default("LT", 0),
+        _cmp_override_2way("LT", 0, 1, 0, "hi_lt"),
+        _cmp_override_3way("LT", 1, 3, 1, 0, "hi_eq_lo_lt"),
+        # GT: default=1, override to 0 on hi_lt / (hi_eq AND lo_lt) /
+        # (hi_eq AND lo_eq).
+        _cmp_default("GT", 1),
+        _cmp_override_2way("GT", 0, 0, 1, "hi_lt"),
+        _cmp_override_3way("GT", 1, 3, 0, 1, "hi_eq_lo_lt"),
+        _cmp_override_3way("GT", 1, 2, 0, 1, "hi_eq_lo_eq"),
+        # LE: default=0, override to 1 on hi_lt / (hi_eq AND lo_lt) /
+        # (hi_eq AND lo_eq).
+        _cmp_default("LE", 0),
+        _cmp_override_2way("LE", 0, 1, 0, "hi_lt"),
+        _cmp_override_3way("LE", 1, 3, 1, 0, "hi_eq_lo_lt"),
+        _cmp_override_3way("LE", 1, 2, 1, 0, "hi_eq_lo_eq"),
+        # GE: default=1, override to 0 on hi_lt / (hi_eq AND lo_lt).
+        _cmp_default("GE", 1),
+        _cmp_override_2way("GE", 0, 0, 1, "hi_lt"),
+        _cmp_override_3way("GE", 1, 3, 0, 1, "hi_eq_lo_lt"),
+    )
+
+
 def _bake_layer10_carry_relay_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 0 carry relay spec."""
     Primitives.generate_attention_head(
