@@ -736,7 +736,10 @@ def make_null_terminator_detection_op(
         declarative_bake_fn=bake
         if not (enable_conversational_io and alu_mode == "lookup")
         else None,
-        layer_idx=10,
+        # Phase 8.G.6: drop ``layer_idx=10`` literal; bind to the L10
+        # attn anchor ``layer10_carry_relay`` so the block op resolves to
+        # whichever layer the compiler picks for the L10 carry-relay attn.
+        target_op_name="layer10_carry_relay",
         migrated=True,
         # When ``enable_conversational_io=True`` AND ``alu_mode='lookup'``,
         # the helper writes L10 FFN unit 1864 (single unit). That sits
