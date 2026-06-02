@@ -565,7 +565,22 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
             allocator = _allocate_layer13_shifts_units()
             block.ffn._l13_unit_allocator = allocator
 
-            n_units = _bake_layer13_shifts(block.ffn, S, proxy)
+            # Phase 8.C inline cut: lower the ``_layer13_shifts_rules``
+            # IR directly here so census v2 classifies this op as
+            # ``declarative`` rather than ``declarative_via_helper``
+            # (which routed through the ``_bake_layer13_shifts``
+            # trampoline). Byte-identical to the prior
+            # ``_bake_layer13_shifts(block.ffn, S, proxy)`` call.
+            # The helper is retained for ``test_declarative_ffn_bakes_l13``
+            # parity coverage.
+            rules = _layer13_shifts_rules(S)
+            rule_dim_positions = Primitives.dim_positions_from_bd(
+                proxy,
+                Primitives.ffn_rule_dim_names(rules),
+            )
+            n_units = Primitives.lower_ffn_rules(
+                block.ffn, rules, rule_dim_positions, S=S,
+            )
             # Byte-identity guard: the declarative lowering MUST land
             # exactly on the allocator's declared range total or a
             # downstream layer will read stale weights.
