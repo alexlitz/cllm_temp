@@ -645,6 +645,69 @@ def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_cmp_group_rules(S: float) -> tuple[FFNRule, ...]:
+    """CMP_GROUP flag (1 unit, offset 1980).
+
+    Fires ~1.0 when any comparison opcode (EQ/NE/LT/GT/LE/GE) is active
+    at the AX marker. OP_* flags ~5 each, MARK_AX = 1; threshold=1.5
+    keeps the unit silent at non-cmp opcodes. W_down normalized by
+    2.0/(S*9) so silu(S*~4.5)*1 * 2/(S*9) ≈ 1.0.
+    """
+    write_scale = 2.0 / (S * 9.0)
+    return (
+        FFNRule.constant_write(
+            name="l8_alu_cmp_group",
+            conditions=(
+                ("OP_EQ", 1.0),
+                ("OP_NE", 1.0),
+                ("OP_LT", 1.0),
+                ("OP_GT", 1.0),
+                ("OP_LE", 1.0),
+                ("OP_GE", 1.0),
+                ("MARK_AX", 1.0),
+            ),
+            threshold=1.5,
+            writes=(("CMP_GROUP+0", write_scale),),
+            scope="MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+            dominates_at={
+                "CMP_GROUP+0":
+                    "MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+            },
+        ),
+    )
+
+
+def _layer8_alu_cmp_clear_rules(S: float) -> tuple[FFNRule, ...]:
+    """CMP[0..3] clearing at AX marker (4 units, offsets 1981..1984).
+
+    L6 attention relay heads write JMP/EXIT/PSH/POP flags to CMP[0..3]
+    at every position, including the AX marker -- which would pollute
+    the comparison flag dims at the AX marker if not cleared. Each
+    unit negates CMP[k] at MARK_AX via the gated read:
+    silu(S * CMP[k]) * silu(S/2) * (-2 / S^2) ≈ -CMP[k].
+
+    Note: the legacy unit sets ``W_gate[unit, MARK_AX] = S`` (not 1.0)
+    and ``b_gate = -S/2``. We encode this with ``gate_weight=S`` /
+    ``gate_bias=-S/2`` because the lowerer applies them directly
+    without the S scaling that conditions get.
+    """
+    write_scale = -2.0 / (S * S)
+    rules = []
+    for k in range(4):
+        rules.append(FFNRule.gated_write(
+            name=f"l8_alu_cmp_clear_k{k}",
+            conditions=((f"CMP+{k}", 1.0),),
+            threshold=0.0,
+            gate="MARK_AX",
+            gate_weight=S,
+            gate_bias=-S * 0.5,
+            writes=((f"CMP+{k}", write_scale),),
+            scope="MARK_AX",
+            dominates_at={f"CMP+{k}": "MARK_AX"},
+        ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
