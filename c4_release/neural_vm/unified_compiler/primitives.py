@@ -60,6 +60,14 @@ class DeclarativeAttentionHeadSpec:
     bakes can describe Q/K/V/O structure as data and let a shared generator
     emit the matrix writes. The spec is intentionally low-level enough to be
     byte-identical with existing imperative helpers.
+
+    ``alibi_slope`` (Phase 7.B.2 attn) decouples the per-head ALiBi slope
+    from its literal ``head_idx`` position: when the spec is lowered the
+    bake helper writes ``attn.alibi_slopes[spec.head_idx] = spec.alibi_slope``
+    rather than indexing a parallel list keyed on the head's old position.
+    ``None`` means "the op handles its own ``alibi_slopes`` write" (the
+    historical default — kept so existing call sites stay byte-identical
+    while the migration ports them to spec-carried slopes).
     """
 
     head_idx: int
@@ -67,6 +75,7 @@ class DeclarativeAttentionHeadSpec:
     k: Tuple[AttentionProjectionWrite, ...] = field(default_factory=tuple)
     v: Tuple[AttentionProjectionWrite, ...] = field(default_factory=tuple)
     o: Tuple[AttentionOutputWrite, ...] = field(default_factory=tuple)
+    alibi_slope: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +110,18 @@ class Primitives:
 
     @staticmethod
     def generate_attention_head(attn, spec: DeclarativeAttentionHeadSpec, HD: int):
-        """Emit Q/K/V/O matrix writes for one declarative attention head."""
+        """Emit Q/K/V/O matrix writes for one declarative attention head.
+
+        If ``spec.alibi_slope`` is not ``None`` and ``attn`` exposes an
+        ``alibi_slopes`` buffer, the slope is written at
+        ``attn.alibi_slopes[spec.head_idx]``. This makes the slope follow
+        the spec across an :class:`AttentionHeadAllocator` first-fit
+        permutation: the spec carries its own slope, so dropping a
+        ``pin=`` on its head_idx no longer scrambles the slope-to-head
+        mapping. Specs without a slope (``alibi_slope=None``) leave the
+        buffer untouched — the bake function fills it itself, matching
+        the legacy behaviour.
+        """
 
         base = spec.head_idx * HD
         for write in spec.q:
@@ -112,6 +132,9 @@ class Primitives:
             attn.W_v.data[base + write.slot, write.dim] = write.weight
         for write in spec.o:
             attn.W_o.data[write.out_dim, base + write.slot] = write.weight
+        if spec.alibi_slope is not None:
+            if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+                attn.alibi_slopes.data[spec.head_idx] = float(spec.alibi_slope)
 
     @staticmethod
     def generate_attention_heads(attn, specs, HD: int):
@@ -124,8 +147,25 @@ class Primitives:
     def threshold_attention_head_spec(
         spec: ThresholdAttentionHeadSpec,
         HD: int,
+        *,
+        alibi_slope: Optional[float] = None,
     ) -> DeclarativeAttentionHeadSpec:
-        """Lower a threshold-attention spec to raw Q/K/V/O writes."""
+        """Lower a threshold-attention spec to raw Q/K/V/O writes.
+
+        ``out_base`` is captured by the spec itself: the resulting
+        :class:`DeclarativeAttentionHeadSpec` carries pre-resolved
+        ``AO(out_base + m, ...)`` writes, so the output-base mapping does
+        NOT depend on ``head_idx`` — a first-fit allocator can permute
+        ``head_idx`` without scrambling which threshold targets which
+        residual output (Phase 7.B.2 attn). The W_o ROW index always
+        lands at the per-spec ``out_base``; the W_o COLUMN index
+        naturally tracks the head's row footprint via ``base + slot``.
+
+        If ``alibi_slope`` is provided it is forwarded into the returned
+        :class:`DeclarativeAttentionHeadSpec` so the slope follows the
+        spec across allocator permutations rather than being indexed by
+        the head's old position.
+        """
 
         import math
 
@@ -135,6 +175,10 @@ class Primitives:
             AP(1 + m, src, 1.0)
             for m, src in enumerate(bd.MARKS)
         )
+        # ``out_base`` is captured here, NOT later: each output write
+        # carries its target dim verbatim, so permuting ``head_idx`` at
+        # the allocator never reroutes a threshold to a different
+        # ``H<n>``/``L<n>H<n>`` slot.
         o_writes = tuple(
             AO(spec.out_base + m, 1 + m, 1.0)
             for m in range(bd.NUM_MARKERS)
@@ -145,6 +189,7 @@ class Primitives:
             k=(AP(0, bd.IS_MARK, spec.threshold),),
             v=v_writes,
             o=o_writes,
+            alibi_slope=alibi_slope,
         )
 
     @staticmethod
@@ -155,11 +200,23 @@ class Primitives:
         HD: int,
         heads=None,
         bd=None,
+        alibi_slopes=None,
     ):
         """Build declarative specs equivalent to ``_set_threshold_attn``.
 
         ``bd`` is required for migrated compiler layouts so CONST/IS_MARK/MARKS
         resolve through the active dim-position proxy instead of the legacy enum.
+
+        ``alibi_slopes`` is an optional positional list (one float per
+        threshold/head pair) — when provided each spec carries its own
+        slope so :meth:`generate_attention_head` writes the matching
+        ``attn.alibi_slopes[head_idx]`` at bake time. The list is keyed
+        by **threshold position** (parallel to ``thresholds`` /
+        ``out_bases``), NOT by ``head_idx``, so a first-fit head
+        permutation cannot scramble the slope-to-threshold mapping.
+        ``None`` leaves slope handling to the caller's bake (matches the
+        historical contract — every existing site that pre-fills the
+        slopes via ``attn.alibi_slopes.fill_(...)`` keeps working).
         """
 
         if bd is None:
@@ -169,6 +226,12 @@ class Primitives:
             )
         if heads is None:
             heads = list(range(len(thresholds)))
+        if alibi_slopes is not None and len(alibi_slopes) != len(thresholds):
+            raise ValueError(
+                f"threshold_attention_head_specs: alibi_slopes length "
+                f"({len(alibi_slopes)}) must match thresholds length "
+                f"({len(thresholds)})"
+            )
         return tuple(
             Primitives.threshold_attention_head_spec(
                 ThresholdAttentionHeadSpec(
@@ -179,6 +242,10 @@ class Primitives:
                     bd=bd,
                 ),
                 HD,
+                alibi_slope=(
+                    None if alibi_slopes is None
+                    else float(alibi_slopes[i])
+                ),
             )
             for i, (h, t) in enumerate(zip(heads, thresholds))
         )
@@ -192,13 +259,22 @@ class Primitives:
         HD: int,
         heads=None,
         bd=None,
+        alibi_slopes=None,
     ):
-        """Emit threshold-attention heads from declarative specs."""
+        """Emit threshold-attention heads from declarative specs.
+
+        ``alibi_slopes`` (optional, parallel to ``thresholds``) makes
+        each spec carry its own slope so the alibi-buffer write follows
+        the spec across an allocator-driven head_idx permutation. When
+        omitted the caller's bake remains responsible for filling
+        ``attn.alibi_slopes`` directly.
+        """
 
         Primitives.generate_attention_heads(
             attn,
             Primitives.threshold_attention_head_specs(
-                thresholds, out_bases, slope, HD, heads=heads, bd=bd
+                thresholds, out_bases, slope, HD,
+                heads=heads, bd=bd, alibi_slopes=alibi_slopes,
             ),
             HD,
         )
