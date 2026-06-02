@@ -560,12 +560,24 @@ def _dispatch_operation_ir(op: Operation, target, dim_positions, S, ir):
         return
     if op.kind == "attn":
         head_dim = target.W_q.shape[0] // target.num_heads
-        ir.lower_attention(target, head_dim, layer_idx=0)
+        ir.lower_attention(
+            target,
+            head_dim,
+            layer_idx=0,
+            dim_positions=dim_positions,
+            S=S,
+        )
         return
     if op.kind == "block":
         if getattr(target, "attn", None) is not None:
             head_dim = target.attn.W_q.shape[0] // target.attn.num_heads
-            ir.lower_attention(target.attn, head_dim, layer_idx=0)
+            ir.lower_attention(
+                target.attn,
+                head_dim,
+                layer_idx=0,
+                dim_positions=dim_positions,
+                S=S,
+            )
         if getattr(target, "ffn", None) is not None:
             ir.lower_ffn(
                 target.ffn,

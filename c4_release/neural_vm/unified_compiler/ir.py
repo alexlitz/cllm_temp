@@ -21,6 +21,7 @@ import math
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -280,9 +281,19 @@ class AttentionOp:
     ``primitives.DeclarativeAttentionHeadSpec`` so this prototype can carry
     existing attention-head bakes through ``CompilerIR`` without migrating
     production bake code.
+
+    In addition to the per-head specs in ``rules``, an op may attach
+    :class:`RuntimeAttentionFragment` entries to express attention bakes
+    whose shape depends on runtime properties of the target attention
+    block (e.g. ``attn.num_heads``). Fragments carry their own predicate
+    and writer; the lowerer emits each fragment whose predicate matches.
+    Used by Phase 7.C.2's L15 ``memory_lookup`` migration to keep the
+    LEV / pop-d8-to-e0 conditional shapes inside the IR rather than
+    hidden behind an imperative bake call.
     """
 
     rules: List["AttentionHeadIR"] = field(default_factory=list)
+    fragments: List["RuntimeAttentionFragment"] = field(default_factory=list)
 
     def add_head(
         self,
@@ -314,9 +325,22 @@ class AttentionOp:
             self.add_head(spec_or_head)
         return self
 
+    def add_fragment(
+        self,
+        fragment: "RuntimeAttentionFragment",
+    ) -> "RuntimeAttentionFragment":
+        """Attach a runtime-shape conditional bake fragment to this op."""
+
+        self.fragments.append(fragment)
+        return fragment
+
     @property
     def heads(self) -> Tuple["AttentionHeadIR", ...]:
         return tuple(self.rules)
+
+    @property
+    def runtime_fragments(self) -> Tuple["RuntimeAttentionFragment", ...]:
+        return tuple(self.fragments)
 
 
 @dataclass(frozen=True)
@@ -394,6 +418,55 @@ class AttentionHeadIR:
             v=v,
             o=o,
         )
+
+
+@dataclass(frozen=True)
+class RuntimeAttentionFragment:
+    """A conditionally-emitted imperative attention-head fragment.
+
+    Phase 7.C.2 (Option B) — some legacy attention bakes (notably L15
+    ``memory_lookup``) write Q/K/V/O across heads whose presence depends
+    on runtime shape (``attn.num_heads``). The per-head
+    :class:`DeclarativeAttentionHeadSpec` shape can't express that
+    branching, so we keep the imperative writer as a callable and let
+    the IR carry it as a *fragment* with a runtime predicate. The
+    lowerer picks the right fragments at compile time based on the
+    target attention block, so all variants are visible in one place
+    rather than hidden inside a bake function that branches at the
+    weight-write site.
+
+    Attributes
+    ----------
+    name:
+        Human-readable identifier (e.g. ``"l15_memory_lookup.heads_0_3"``).
+        Surfaced in debug reports and used as a deduplication key by
+        downstream tooling.
+    bake_fn:
+        Callable that writes weights when the predicate matches. Called
+        as ``bake_fn(attn, dim_positions, HD, S)`` so it has the same
+        information the legacy imperative helper consumed. Must be
+        idempotent within a single bake pass — fragments may be invoked
+        multiple times if the surrounding IR is composed.
+    runtime_predicate:
+        Callable ``(attn) -> bool``. The fragment is emitted iff this
+        returns ``True``. Defaults to ``None`` meaning "always emit".
+        The predicate runs against the live ``attn`` (so it can read
+        ``attn.num_heads``, ``attn.head_dim``, etc.) — keep it cheap and
+        side-effect free.
+    metadata:
+        Optional opaque mapping for downstream tooling (audit reports,
+        symbolic execution stubs, etc.). The lowerer never consults it.
+    """
+
+    name: str
+    bake_fn: Callable[..., None]
+    runtime_predicate: Optional[Callable[[object], bool]] = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def should_emit(self, attn) -> bool:
+        if self.runtime_predicate is None:
+            return True
+        return bool(self.runtime_predicate(attn))
 
 
 @dataclass(frozen=True)
@@ -831,14 +904,34 @@ class CompilerIR:
         HD: int,
         *,
         layer_idx: int = 0,
+        dim_positions: Optional[Mapping[str, int]] = None,
+        S: float = 100.0,
     ) -> int:
-        """Lower one layer's attention specs into attention projection weights."""
+        """Lower one layer's attention specs into attention projection weights.
+
+        Emits the per-head :class:`DeclarativeAttentionHeadSpec` rules
+        first, then runs each :class:`RuntimeAttentionFragment` whose
+        predicate matches ``attn``. Fragments receive
+        ``(attn, dim_positions, HD, S)`` so they have the same context
+        the legacy imperative helpers consumed.
+
+        ``dim_positions`` is required by fragments that resolve dim
+        names at bake time; pass-through callers without fragments can
+        leave it as ``None``.
+        """
 
         from .primitives import Primitives
 
-        heads = self.layer(layer_idx).attention.rules
+        layer = self.layer(layer_idx)
+        heads = layer.attention.rules
         for head in heads:
             Primitives.generate_attention_head(attn, head.spec, HD)
+
+        fragments = layer.attention.fragments
+        for fragment in fragments:
+            if not fragment.should_emit(attn):
+                continue
+            fragment.bake_fn(attn, dim_positions, HD, S)
         return len(heads)
 
     def attention_debug_report(
@@ -1939,6 +2032,7 @@ __all__ = [
     "FFNOp",
     "FFNRule",
     "LayerSpec",
+    "RuntimeAttentionFragment",
     "SymbolicAttentionChoice",
     "SymbolicDeclarativeRunReport",
     "SymbolicDeclarativeRunner",
