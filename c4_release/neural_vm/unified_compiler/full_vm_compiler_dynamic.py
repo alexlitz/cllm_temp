@@ -61,6 +61,7 @@ point and the static ``phase`` field can be retired.
 from __future__ import annotations
 
 import math
+import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -1307,6 +1308,14 @@ def _bake_from_scheduled_ops(
         # static-path snapshot in ``compile_full_vm``).
         "kv_eviction_policy": KVEvictionPolicy(kv_eviction_policy).value,
         "kv_eviction_n_steps": int(kv_eviction_n_steps),
+        # Phase 10.B: include wrapper-expansion env flag so the merged-path
+        # (~17-block, post_ops folded into Sequential FFNs) and the
+        # expanded-path (~31-block, dedicated wrapper TransformerBlocks)
+        # never share a serialised cache entry. See
+        # ``make_expand_wrapper_blocks_op`` for the dispatch.
+        "C4_DISABLE_WRAPPER_EXPANSION": (
+            os.environ.get("C4_DISABLE_WRAPPER_EXPANSION") == "1"
+        ),
         # Namespace the dynamic cache so it never collides with the static
         # entry (same kwargs, different scheduler).
         "__dynamic": True,
