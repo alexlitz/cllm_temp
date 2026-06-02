@@ -10,6 +10,7 @@ import math
 from .constants import PC_OFFSET
 
 
+# DEPRECATED — parity oracle only, no production use (Phase 6 wave 6A).
 def _set_layer10_carry_relay(attn, S, BD, HD):
     """L10 attention head 0: relay CARRY[1/2] from AX marker to AX byte positions.
 
@@ -45,6 +46,7 @@ def _set_layer10_carry_relay(attn, S, BD, HD):
 
 
 
+# DEPRECATED — parity oracle only, no production use (Phase 6 wave 6A).
 def _set_layer10_byte_passthrough(attn, S, BD, HD):
     """L10 attention head 1: AX byte 0-2 passthrough across steps.
 
@@ -107,6 +109,7 @@ def _set_layer10_byte_passthrough(attn, S, BD, HD):
 
 
 
+# DEPRECATED — parity oracle only, no production use (Phase 6 wave 6A).
 def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
     """L10 attention head 2: SP byte 0-2 passthrough across steps (when NOT PSH).
 
@@ -188,6 +191,7 @@ def _set_layer10_sp_byte_passthrough(attn, S, BD, HD):
 
 
 
+# DEPRECATED — parity oracle only, no production use (Phase 6 wave 6A).
 def _set_layer10_bp_byte_passthrough(attn, S, BD, HD):
     """L10 attention head 7: BP byte 0-2 passthrough across ordinary steps."""
     from .unified_compiler.primitives import Primitives as _P
@@ -219,6 +223,7 @@ def _set_layer10_bp_byte_passthrough(attn, S, BD, HD):
 
 
 
+# DEPRECATED — parity oracle only, no production use (Phase 6 wave 6A).
 def _set_layer10_psh_stack0_passthrough(attn, S, BD, HD):
     """L10 attention head 3: PSH STACK0 bytes 1-3 passthrough from AX.
 
@@ -311,6 +316,7 @@ def _set_layer10_psh_stack0_passthrough(attn, S, BD, HD):
 
 
 
+# DEPRECATED — parity oracle only, no production use (Phase 6 wave 6A).
 def _set_layer10_stack0_byte_relay(attn, S, BD, HD):
     """L10 attention heads 4-6: STACK0 byte relays.
 
