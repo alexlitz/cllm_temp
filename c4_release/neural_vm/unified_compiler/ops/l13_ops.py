@@ -418,7 +418,6 @@ def make_layer13_attn_dep_anchor_op() -> Operation:
         # (phase=12) and L13 mem-addr-gather (phase=13). Same-step
         # reads against the L12 dep anchor force the dep graph to land
         # this at L13.
-        phase=12.5,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC",
                "OP_SI", "OP_SC", "MEM_ADDR_SRC", "L1H1"},
@@ -586,7 +585,6 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
 
     return Operation(
         name="layer13_shifts",
-        phase=13,
         reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                "OP_SHL", "OP_SHR"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
