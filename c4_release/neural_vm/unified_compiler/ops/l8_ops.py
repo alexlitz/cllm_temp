@@ -1155,7 +1155,10 @@ def make_layer8_alu_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=_layer8_alu_ir(),
-        layer_idx=8,
+        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
+        # anchor ``layer10_byte_passthrough`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_byte_passthrough",
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
         # The L8 lookup ALU consumes the *current step's* AX value via
@@ -1252,7 +1255,10 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_format_position_counter_ir(),
-        layer_idx=8,
+        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
+        # anchor ``layer10_byte_passthrough`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_byte_passthrough",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -1404,7 +1410,10 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir_factory=_layer8_multibyte_fetch_ir,
-        layer_idx=8,
+        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
+        # anchor ``layer10_byte_passthrough`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_byte_passthrough",
         migrated=True,
         claims=_claims,
         # Phase 8.A targeted (SCC audit step 7): mirror the
@@ -1523,7 +1532,10 @@ def make_layer8_multibyte_routing_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_layer8_multibyte_routing_ir(),
-        layer_idx=8,
+        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
+        # anchor ``layer10_byte_passthrough`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_byte_passthrough",
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
         # This op produces the fresh AX-byte-0 OUTPUT for IMM (routes
@@ -1702,7 +1714,10 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir_factory=_layer8_sp_gather_ir,
-        layer_idx=8,
+        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
+        # anchor ``layer10_byte_passthrough`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_byte_passthrough",
         migrated=True,
         claims=_claims,
         # Phase 8.A targeted: explicit cross-step boundary. The
@@ -1959,7 +1974,10 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         kind="block",
         bake_fn=_bake,
         declarative_bake_fn=_bake if not enable else None,
-        layer_idx=8,
+        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
+        # anchor ``layer10_byte_passthrough`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_byte_passthrough",
         # Always migrated=True so the bake runs when enable=True; when
         # enable=False the bake body is a no-op so production behavior is
         # unchanged. The Operation itself stays in the registry either way
@@ -2031,7 +2049,10 @@ def make_layer8_op_imm_relay_op() -> Operation:
         declarative_bake_fn=_bake,
         declarative_authority="spec_generated",
         compiler_ir_factory=_layer8_op_imm_relay_ir,
-        layer_idx=8,
+        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
+        # anchor ``layer10_byte_passthrough`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_byte_passthrough",
         phase=8.4,
         migrated=True,
         claims=_claims,
@@ -2412,7 +2433,10 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
-        layer_idx=8,
+        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
+        # anchor ``layer10_byte_passthrough`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_byte_passthrough",
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
@@ -2546,7 +2570,10 @@ def make_layer8_sp_gathered_sentinel_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_layer8_sp_gathered_sentinel_ir(),
-        layer_idx=8,
+        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
+        # anchor ``layer10_byte_passthrough`` so the block op resolves
+        # to whichever layer the compiler places the anchor at.
+        target_op_name="layer10_byte_passthrough",
         migrated=True,
         claims=_claims,
         # +1 over multibyte_routing's 2055 so L8's PureFFN allocator
