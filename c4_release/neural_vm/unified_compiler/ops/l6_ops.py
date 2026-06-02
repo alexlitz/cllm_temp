@@ -2318,42 +2318,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 AX-output route IR lowered to unexpected units "
             f"{route_ends}; expected {expected_ends}"
         )
-    return
-    for start, end in (
-        (
-            L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
-            L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT,
-        ),
-        (
-            L6_FIRST_STEP_JMP_PC_OVERRIDE_START_UNIT,
-            L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT,
-        ),
-    ):
-        _clear_ffn_unit_band(ffn, start, end)
-    delayed_end = _lower_layer6_delayed_jmp_pc_override_ir(ffn, S, BD)
-    if delayed_end != L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT:
-        raise AssertionError(
-            "L6 delayed JMP PC override IR lowered to unexpected unit "
-            f"{delayed_end}; expected {L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT}"
-        )
-    first_step_end = _lower_layer6_first_step_jmp_pc_override_ir(ffn, S, BD)
-    if first_step_end != L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT:
-        raise AssertionError(
-            "L6 first-step JMP PC override IR lowered to unexpected unit "
-            f"{first_step_end}; expected "
-            f"{L6_FIRST_STEP_JMP_PC_OVERRIDE_END_UNIT}"
-        )
-    _clear_ffn_unit_band(
-        ffn,
-        L6_ALL_STEP_JMP_PC_OVERRIDE_START_UNIT,
-        L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT,
-    )
-    end = _lower_layer6_all_step_jmp_pc_override_ir(ffn, S, BD)
-    if end != L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT:
-        raise AssertionError(
-            "L6 all-step JMP PC override IR lowered to unexpected unit "
-            f"{end}; expected {L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT}"
-        )
     for start, end in (
         (L6_HALT_DETECT_START_UNIT, L6_HALT_DETECT_END_UNIT),
         (L6_TEMP_CLEANUP_START_UNIT, L6_TEMP_CLEANUP_END_UNIT),
@@ -2385,6 +2349,7 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 stack identity IR lowered to unexpected unit "
             f"{stack_identity_end}; expected {L6_STACK_IDENTITY_END_UNIT}"
         )
+    return
     for start, end in (
         (L6_PSH_SP_DECREMENT_START_UNIT, L6_PSH_SP_DECREMENT_END_UNIT),
         (L6_JSR_SP_DECREMENT_START_UNIT, L6_JSR_SP_DECREMENT_END_UNIT),
