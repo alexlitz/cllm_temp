@@ -2239,32 +2239,18 @@ class _SetDim:
     ADDR_B0_LO = 12  # dims 12-27  (16 one-hot)
     ADDR_B1_LO = 28  # dims 28-43
     ADDR_B2_LO = 44  # dims 44-59
-    # Phase 8.A (PREV_STEP infrastructure): ADDR_B0_LO_PREV_STEP alias
-    # (same numeric base) lets cross-step readers declare their reads
-    # against prev-step ADDR_B0_LO semantically, breaking back-edges in
-    # the dynamic scheduler dep graph. See shared.py ``_ALIAS_OF``.
-    # No ops migrated in this pass — alias is infrastructure only.
-    ADDR_B0_LO_PREV_STEP = 12  # alias of ADDR_B0_LO
-    # Phase 8.A (PREV_STEP infrastructure): ADDR_B1/B2_LO_PREV_STEP aliases
-    # (same numeric base as the respective ADDR_B1/B2_LO writers) let
-    # cross-step readers (e.g. ``layer8_mem_to_alu``) declare their reads
-    # as prev-step semantically, breaking back-edges from L13 / L12-anchor
-    # writers in the dynamic scheduler dep graph. No bake-position change.
-    ADDR_B1_LO_PREV_STEP = 28  # alias of ADDR_B1_LO
-    ADDR_B2_LO_PREV_STEP = 44  # alias of ADDR_B2_LO
+    # Phase 9.C: ADDR_B0_LO_PREV_STEP retained — consumed by
+    # ``make_lev_detector_head_op`` (control_flow_heads.py) as a string
+    # literal in op.reads (and exercised by tests/test_lev_detector_head.py).
+    # ADDR_B{1,2}_LO_PREV_STEP and OPCODE_BYTE_LO_PREV_STEP aliases
+    # deleted — corpus readers migrated to SSA ``BASE.<writer>.-1``
+    # spellings in Phase 9.B.
+    ADDR_B0_LO_PREV_STEP = 12  # alias of ADDR_B0_LO (consumer: lev_detector_head)
 
     # --- Opcode byte staging (L5 head 1 → L5 FFN decode) ---
     # Separate from ALU_LO/HI to avoid residual collision with L7 operand gather
     OPCODE_BYTE_LO = 12  # reuse ADDR_B0_LO (unused in autoregressive)
     OPCODE_BYTE_HI = 28  # reuse ADDR_B1_LO (unused in autoregressive)
-    # Phase 8.A SCC step 6: OPCODE_BYTE_LO_PREV_STEP alias (same numeric
-    # base as OPCODE_BYTE_LO) lets L5 opcode-decode readers (anchored at
-    # ``opcode_decode_ffn`` / ``_opcode_decode_ffn_dep_anchor``) declare
-    # their reads as prev-step semantically, breaking the same-layer
-    # writer→reader edge from ``layer5_fetch`` in the dynamic scheduler
-    # dep graph. Mirrors OUTPUT_LO_PREV_STEP / ALU_LO_PREV_STEP /
-    # ADDR_KEY_PREV_STEP. See shared.py ``_ALIAS_OF``.
-    OPCODE_BYTE_LO_PREV_STEP = 12  # alias of OPCODE_BYTE_LO
 
     # --- L0 threshold heads (8 heads for 39-token step) ---
     # Thresholds: [3.5, 4.5, 5.5, 9.5, 10.5, 14.5, 15.5, 19.5]
@@ -2320,15 +2306,6 @@ class _SetDim:
     # --- Nibble encoding ---
     EMBED_LO = 142  # 142-157: embedding input nibbles (one-hot 16)
     EMBED_HI = 158  # 158-173
-    # Phase 8.A (PREV_STEP infrastructure): EMBED_{LO,HI}_PREV_STEP aliases
-    # (same numeric base) let cross-step readers declare prev-step reads
-    # against the input nibble bands. EMBED_LO/HI is written at token-
-    # embedding time and read by L3+ heads; cross-step readers (L4 pc_relay
-    # back to L3 carry-forward attn) currently form a back-edge in the dep
-    # graph. Alias documents the prev-step semantic for future migrations.
-    # No ops migrated in this pass — alias is infrastructure only.
-    EMBED_LO_PREV_STEP = 142  # alias of EMBED_LO
-    EMBED_HI_PREV_STEP = 158  # alias of EMBED_HI
     OUTPUT_LO = 174  # 174-189: output decoding nibbles
     OUTPUT_HI = 190  # 190-205
     # B9 OUTPUT_HI split: declarative alias for the same 16-slot band. The
@@ -2336,26 +2313,12 @@ class _SetDim:
     # "OUTPUT_HI_PREV_STEP" cross-step carry (see docs/B9_OUTPUT_HI_SPLIT_SPEC.md).
     # Numeric position is identical so baked weights are byte-identical.
     OUTPUT_HI_THIS_STEP = 190  # alias of OUTPUT_HI
-    # Phase 8.A G7: OUTPUT_HI_PREV_STEP alias for the same 16-slot band.
-    # Cross-step readers (L3 head 5 AX_FULL relay, L8 head 6 AX_CARRY
-    # refresh, L6 routing_ffn cancel-pattern gates, L10 post-ops combined,
-    # L15 store_stack0_sp_byte0_addr) attend back to the prior step's
-    # residual via attention or read the prev-step OUTPUT_HI directly.
-    # Same numeric base (190) so baked weights are byte-identical.
-    OUTPUT_HI_PREV_STEP = 190  # alias of OUTPUT_HI
-    # Phase 7.A.3 OUTPUT_LO split: PREV_STEP alias for the same 16-slot
-    # band. Cross-step readers (L3 head 5 AX_FULL relay,
-    # L8 head 6 AX_CARRY refresh) attend back to the prior step's AX
-    # marker row, where this slot still holds the prev-step value.
-    OUTPUT_LO_PREV_STEP = 174  # alias of OUTPUT_LO
+    # Phase 9.C: OUTPUT_{LO,HI}_PREV_STEP, EMBED_{LO,HI}_PREV_STEP, and
+    # ADDR_KEY_PREV_STEP aliases were deleted — corpus readers migrated
+    # to SSA ``BASE.<writer>.-1`` spellings in Phase 9.B.
 
     # --- Address key (for memory attention) ---
     ADDR_KEY = 206  # 206-253 (48 dims: 3 nibbles × 16 one-hot)
-    # Phase 8.A.6 v2: ADDR_KEY_PREV_STEP alias (same numeric base) lets
-    # cross-step readers (L4/L5/L8/L9 ops that fire before L7/L14 writers
-    # in the same step) declare their reads as prev-step semantically.
-    # See dim_registry.py and shared.py for the alias map.
-    ADDR_KEY_PREV_STEP = 206  # alias of ADDR_KEY
 
     # --- NEXT_* transition flags ---
     NEXT_PC = 254
@@ -2377,12 +2340,8 @@ class _SetDim:
     OP_ENT = 268
     OP_ADJ = 269
     OP_LEV = 270
-    # Phase 8.A (PREV_STEP infrastructure): OP_LEV_PREV_STEP alias (same
-    # numeric base) lets cross-step readers (e.g. opcode_decode_ffn back
-    # to L3 carry_forward_attn / L3 ffn) declare prev-step OP_LEV reads
-    # semantically, breaking the 6 OP_LEV back-edges in the dep graph.
-    # No ops migrated in this pass — alias is infrastructure only.
-    OP_LEV_PREV_STEP = 270  # alias of OP_LEV
+    # Phase 9.C: OP_LEV_PREV_STEP alias deleted — corpus readers migrated
+    # to SSA ``OP_LEV.<writer>.-1`` spellings in Phase 9.B.
     OP_LI = 271
     OP_LC = 272
     OP_SI = 273
@@ -2475,12 +2434,9 @@ class _SetDim:
     # --- AX carry-forward staging ---
     AX_CARRY_LO = 328  # 328-343
     AX_CARRY_HI = 344  # 344-359
-    # Phase 8.A.6 v2: PREV_STEP aliases of AX_CARRY_{LO,HI} (same numeric
-    # base) let cross-step readers (L6/L7 ops that fire before L8 writers
-    # in the same step) declare their reads as prev-step semantically.
-    # See dim_registry.py and shared.py for the alias map.
-    AX_CARRY_LO_PREV_STEP = 328  # alias of AX_CARRY_LO
-    AX_CARRY_HI_PREV_STEP = 344  # alias of AX_CARRY_HI
+    # Phase 9.C: AX_CARRY_{LO,HI}_PREV_STEP aliases deleted — corpus
+    # readers migrated to SSA ``AX_CARRY_{LO,HI}.<writer>.-1`` spellings
+    # in Phase 9.B.
 
     # --- I/O state detection (shifted +4 to maintain aliases with MEM_VAL_B1/B2) ---
     LAST_WAS_IO_STATE_EMIT_BYTE = 462  # Flag: last token was IO_STATE_EMIT_BYTE (aliases MEM_VAL_B1)
@@ -2489,22 +2445,13 @@ class _SetDim:
     # --- ALU result staging ---
     ALU_LO = 360  # 360-375
     ALU_HI = 376  # 376-391
-    # Phase 8.A.6 v2: ALU_LO_PREV_STEP alias (same numeric base) lets
-    # cross-step readers (ops that fire before the next ALU_LO writer in
-    # the same step) declare their reads as prev-step semantically. See
-    # dim_registry.py and shared.py for the alias map.
-    ALU_LO_PREV_STEP = 360  # alias of ALU_LO
+    # Phase 9.C: ALU_LO_PREV_STEP / CARRY_PREV_STEP / CMP_PREV_STEP
+    # aliases deleted — corpus readers migrated to SSA
+    # ``BASE.<writer>.-1`` spellings in Phase 9.B.
 
     # --- Carry / comparison ---
     CARRY = 392  # 392-395 (4 dims: inter-byte carry for ADD/SUB/MUL)
     CMP = 396  # 396-403 (8 dims: PSH/ADJ/ENT/POP/JSR/AX_ZERO flags)
-    # Phase 8.A (PREV_STEP infrastructure): CARRY/CMP_PREV_STEP aliases
-    # (same numeric base) let cross-step readers (e.g. L10 carry-relay
-    # back to L9 ALU) declare prev-step reads semantically, breaking
-    # back-edges in the dep graph. No ops migrated in this pass — alias
-    # is infrastructure only.
-    CARRY_PREV_STEP = 392  # alias of CARRY
-    CMP_PREV_STEP = 396    # alias of CMP
 
     # --- Pristine nibble encoding (hi nibble) ---
     # BUG FIX 2026-04-13: Moved from 400 to 404 to avoid collision with CMP[4..7]
@@ -2521,20 +2468,12 @@ class _SetDim:
     ADDR_B0_HI = 206  # 206-221 (16 dims): hi nibble of gathered addr byte 0
     ADDR_B1_HI = 222  # 222-237
     ADDR_B2_HI = 238  # 238-253
-    # Phase 8.A (PREV_STEP infrastructure): ADDR_B0_HI_PREV_STEP alias
-    # (same numeric base) lets cross-step readers declare their reads
-    # against prev-step ADDR_B0_HI semantically. Shares position 206 with
-    # ADDR_KEY / ADDR_KEY_PREV_STEP (legacy ADDR_KEY space overlap, see
-    # ADDR_KEY comment above). No ops migrated in this pass — alias is
-    # infrastructure only.
-    ADDR_B0_HI_PREV_STEP = 206  # alias of ADDR_B0_HI
-    # Phase 8.A (PREV_STEP infrastructure): ADDR_B1/B2_HI_PREV_STEP aliases
-    # (same numeric base as the respective ADDR_B1/B2_HI writers). Used by
-    # cross-step readers (e.g. ``layer8_mem_to_alu``) so the dep-graph
-    # back-edges from L13 / L12-anchor writers are retired. No bake-position
-    # change — slot is shared with ADDR_B1/B2_HI.
-    ADDR_B1_HI_PREV_STEP = 222  # alias of ADDR_B1_HI
-    ADDR_B2_HI_PREV_STEP = 238  # alias of ADDR_B2_HI
+    # Phase 9.C: ADDR_B0_HI_PREV_STEP retained — consumed by
+    # ``make_lev_detector_head_op`` (control_flow_heads.py) as a string
+    # literal in op.reads (and exercised by tests/test_lev_detector_head.py).
+    # ADDR_B{1,2}_HI_PREV_STEP aliases deleted — corpus readers migrated
+    # to SSA ``BASE.<writer>.-1`` spellings in Phase 9.B.
+    ADDR_B0_HI_PREV_STEP = 206  # alias of ADDR_B0_HI (consumer: lev_detector_head)
 
     # --- L2 threshold head output (7 dims: one per marker type) ---
     # Shifted +4 (was 448-454, now 452-458)
@@ -2585,11 +2524,10 @@ class _SetDim:
 
     # --- General temporaries / reserved ---
     TEMP = 480  # 480-511 (32 dims)
-    # Phase 7.A.3 TEMP split: PREV_STEP alias for the same 32-slot scratch
-    # band. Mirrors the OUTPUT_HI / OUTPUT_LO PREV_STEP naming convention.
-    # Same numeric base as TEMP so bakes stay byte-identical; future
-    # cross-step TEMP readers can declare reads against this alias.
-    TEMP_PREV_STEP = 480  # alias of TEMP
+    # Phase 9.C: TEMP_PREV_STEP retained — consumed by
+    # ``make_lev_detector_head_op`` (control_flow_heads.py) as a string
+    # literal in op.reads (and exercised by tests/test_lev_detector_head.py).
+    TEMP_PREV_STEP = 480  # alias of TEMP (consumer: lev_detector_head)
 
     # Convenience: map Opcode int → _SetDim opcode flag dim
     _OPCODE_DIM = None  # lazily built
