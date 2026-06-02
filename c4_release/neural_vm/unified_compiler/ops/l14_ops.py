@@ -77,33 +77,76 @@ def _allocate_layer14_mem_generation_heads() -> AttentionHeadAllocator:
 # Adding or resizing any helper requires updating this table in lock-step
 # (mirrors the L9 ``_L9_ALU_UNIT_LAYOUT`` convention).
 _L14_CLEANUP_CHAIN_LAYOUT = {
+    # ``pin=None`` means auto-fit: the allocator picks the first free gap
+    # past the previously-pinned chain ops. Phase 6 Wave 6D demos the
+    # auto-fit path on ``layer14_jsr_ax_bytes_zero`` — a 4-unit op whose
+    # rules don't cross-reference unit indices, so the FFN function is
+    # invariant to where in the chain the units land. With the static
+    # pins above consuming [0, 1862), first-fit on a 4096-wide pool
+    # lands the 4-unit auto-fit range back at unit 1862, so weight bits
+    # are coincidentally byte-identical to the legacy pin — but the
+    # author no longer has to supply the offset.
     "layer14_temp_clear":                    (   0,    4),
     "layer14_clear_addr_key_pollution":      (   4,   48),
     "layer14_clear_output_corruption":       (  52,   18),
     "layer14_clear_mem_marker_output":       (  70,   64),
     "layer14_addr_key_neural_decode":        ( 134, 1728),
-    "layer14_jsr_ax_bytes_zero":             (1862,    4),
+    "layer14_jsr_ax_bytes_zero":             (None,    4),  # auto-fit (Phase 6 Wave 6D)
     "layer14_lc_ax_bytes_zero":              (1866,    4),
     "layer14_alu_nocarry_ax_bytes_zero":     (1870,    4),
 }
 
 
 def _l14_chain_alloc(op_name: str) -> int:
-    """Return the pinned start unit for ``op_name`` in the L14 cleanup chain.
+    """Return the start unit for ``op_name`` in the L14 cleanup chain.
 
     Looks up ``op_name`` in :data:`_L14_CLEANUP_CHAIN_LAYOUT` and routes
-    the pinned range through a fresh :class:`FFNUnitAllocator`. The
-    allocator is per-bake (not shared across ops) so each call is
-    independent; the byte-identity guarantee comes from the static pin
-    matching the legacy ``_l14_unit_counter`` value the predecessor op
-    left behind in production order. Adding the allocator call now keeps
-    the structure auditable and ready for future ``pin=None`` extensions
-    without changing any baked weight.
+    every prior chain entry (in declaration order) through a fresh
+    :class:`FFNUnitAllocator` so the target op's own claim sees the same
+    occupied pool a runtime allocator would. Two placement modes are
+    supported:
+
+    * **Pinned** — the layout entry has an explicit integer ``pin``.
+      ``alloc`` claims exactly that range; collisions raise
+      :class:`FFNUnitAllocatorError`. This is the byte-identity
+      guarantee path used by every legacy chain op.
+    * **Auto-fit** (``pin=None``) — the layout entry leaves placement
+      to the allocator. ``alloc`` walks the first-fit pool and returns
+      the lowest free gap large enough for ``n_units``. Wave 6D uses
+      this on :data:`layer14_jsr_ax_bytes_zero` to demonstrate the
+      "drop the offset, let the allocator pick" workflow targeted by
+      Phase 6 Wave 6D and the docs/PHASE_6_DECLARATIVE_WEIGHT_AUTHORING_PLAN.md
+      auto-fit story.
+
+    Because the chain bakes one op at a time (each op's bake_fn is its
+    own call), the allocator is rebuilt per call. Pre-claiming every
+    preceding layout entry is what makes the auto-fit deterministic:
+    the target op always sees the same occupied pool a stateful runtime
+    allocator would after replaying the chain in declaration order.
     """
 
-    pin, n_units = _L14_CLEANUP_CHAIN_LAYOUT[op_name]
     allocator = FFNUnitAllocator()
-    start, _end = allocator.alloc(op_name, n_units, pin=pin)
+    target_entry: tuple[int | None, int] | None = None
+    for name, (pin, n_units) in _L14_CLEANUP_CHAIN_LAYOUT.items():
+        if name == op_name:
+            target_entry = (pin, n_units)
+            break
+        # Pre-claim prior chain entries so the target's pin/auto-fit
+        # check sees the same occupied pool a stateful allocator would.
+        # Prior entries are always pinned in the current layout; if a
+        # future entry becomes auto-fit, replay it the same way (the
+        # allocator's first-fit pick is deterministic).
+        if pin is None:
+            allocator.alloc(name, n_units)
+        else:
+            allocator.alloc(name, n_units, pin=pin)
+    if target_entry is None:
+        raise KeyError(op_name)
+    pin, n_units = target_entry
+    if pin is None:
+        start, _end = allocator.alloc(op_name, n_units)
+    else:
+        start, _end = allocator.alloc(op_name, n_units, pin=pin)
     return start
 
 
@@ -1775,9 +1818,14 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
     """
     def bake(block, dim_positions, S):
         ffn = block.ffn
-        # Pinned to chain offset 1862 (predecessors through addr_key_neural_decode
-        # consume units 0..1861). Byte-identical with the legacy
-        # ``_l14_unit_counter`` start.
+        # Phase 6 Wave 6D: this op's layout entry uses ``pin=None`` so the
+        # allocator picks the first free gap past the prior chain claims.
+        # First-fit on a 4096-wide pool with predecessors filling
+        # [0, 1862) lands the 4-unit auto-fit range back at unit 1862, so
+        # the FFN weights are byte-identical to the legacy pin even though
+        # the author never wrote the offset. The rules don't cross-reference
+        # the unit index, so moving the range elsewhere (e.g. if a future
+        # predecessor expands) would still leave the FFN function invariant.
         start_unit = _l14_chain_alloc("layer14_jsr_ax_bytes_zero")
         ir = _layer14_jsr_ax_bytes_zero_ir(S)
         rules = ir.layer(0).ffn.rules
@@ -1794,7 +1842,10 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
 
     # Dim-ownership claims (W_down output cells). Runs at phase 14.6 after
     # ``layer14_addr_key_neural_decode`` (14.5) which closes the chain at
-    # unit 1862. The helper writes 4 units:
+    # unit 1862. The bake's auto-fit allocator (Phase 6 Wave 6D) lands the
+    # 4 units back at 1862 because the prior chain claims fill [0, 1862)
+    # contiguously and first-fit on a 4096-wide pool picks the first free
+    # gap. The helper writes 4 units:
     #   unit 1862: -3/S on OUTPUT_LO[0..15]
     #   unit 1863: -3/S on OUTPUT_HI[0..15]
     #   unit 1864: +5/S on OUTPUT_LO[0]
