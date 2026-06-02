@@ -213,6 +213,191 @@ def _l10_binary_op_byte_zeroing_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+_L10_CARRY_NON_ARITH_OPS = (
+    "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
+    "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
+    "OP_SC", "OP_PSH", "OP_OR", "OP_XOR", "OP_AND", "OP_EQ",
+    "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE", "OP_SHL",
+    "OP_SHR", "OP_MUL", "OP_DIV", "OP_MOD", "OP_EXIT", "OP_NOP",
+    "OP_PUTCHAR", "OP_GETCHAR",
+)
+
+_L10_CARRY_BYTE_DIM_BY_IDX = (
+    "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+)
+
+
+def _l10_carry_propagation_rules(
+    S: float, *, byte_idx: int, cascade: bool,
+) -> tuple[FFNRule, ...]:
+    """Declarative rules for one ``CarryPropagationPostOp`` instance (512 units).
+
+    Mirrors ``vm_step.CarryPropagationPostOp._bake_weights``: 256 ADD
+    carry units followed by 256 SUB borrow units, indexed by
+    ``(lo, hi)`` over ``range(16) x range(16)`` for the active byte.
+
+    Differences captured per (byte_idx, cascade):
+
+      * ``byte_dim`` flag: BYTE_INDEX_0/1/2 (no byte_idx=3 here).
+      * ``add_carry_in`` / ``sub_carry_in`` choose between CARRY+1/+2
+        (non-cascade byte_idx=0) and CARRY+3/+3 (cascade=True for
+        byte_idx=1/2).
+      * ``cascade=True`` routes mutual exclusion through TEMP+8/9
+        instead of the carry dim pair.
+      * The threshold drops to ``cascade_carry_threshold=40`` when
+        cascade=True; non-cascade uses ``carry_threshold=56``.
+
+    Output cells: the imperative bake writes
+    ``W_down[OUTPUT_LO+lo] = -2/S`` then later
+    ``W_down[OUTPUT_LO+new_lo] = +2/S`` with ``=`` semantics. When
+    ``new_lo == lo`` (or ``new_hi == hi``) the second assignment
+    overwrites the first, giving a net +2/S on that cell. The
+    ``CompilerIR.lower_ffn`` lowerer uses ``+=`` so the rule below
+    emits only the surviving write per cell (``+2/S`` when they
+    collide, both writes when they don't). The CARRY+3 high-overflow
+    write only fires at ``(15,15)`` for ADD and ``(0,0)`` for SUB,
+    and only when ``byte_idx < 2``.
+    """
+
+    if byte_idx not in (0, 1, 2):
+        raise ValueError(f"byte_idx must be 0, 1, or 2; got {byte_idx}")
+
+    byte_dim_name = _L10_CARRY_BYTE_DIM_BY_IDX[byte_idx]
+    wrong_byte_dim_names = tuple(
+        name for i, name in enumerate(_L10_CARRY_BYTE_DIM_BY_IDX)
+        if i != byte_idx
+    )
+    add_carry_in_name = f"CARRY+{3 if cascade else 1}"
+    sub_carry_in_name = f"CARRY+{3 if cascade else 2}"
+    threshold = 40.0 if cascade else 56.0
+
+    # carry_weight=1.0, output_weight=20.0, mismatch_weight=0.0 in the
+    # legacy bake; mismatch writes drop out of the rule because they
+    # multiply to zero (``-S * 0 = 0`` produces no W_up cell).
+    carry_weight = 1.0
+    output_weight = 20.0
+
+    def base_conds(carry_in_name: str) -> list[tuple[str, float]]:
+        conds: list[tuple[str, float]] = [
+            (carry_in_name, carry_weight),
+            ("IS_BYTE", 1.0),
+            ("H1+1", 1.0),
+            ("MARK_AX", -5000.0),
+            ("MARK_PC", -5000.0),
+            (byte_dim_name, 1.0),
+        ]
+        # Suppress non-arithmetic opcodes.
+        for op_name in _L10_CARRY_NON_ARITH_OPS:
+            conds.append((op_name, -20.0))
+        # TEMP+3 suppression (BITWISE_OP indicator).
+        conds.append(("TEMP+3", -10.0))
+        # Wrong byte position suppression.
+        for wrong_name in wrong_byte_dim_names:
+            conds.append((wrong_name, -10.0))
+        return conds
+
+    def add_rule_for(lo: int, hi: int) -> FFNRule:
+        new_val = lo + hi * 16 + 1
+        new_lo = new_val & 0xF
+        new_hi = (new_val >> 4) & 0xF
+        conds = base_conds(add_carry_in_name)
+        # ADD-specific mutual exclusion vs SUB.
+        conds.append(("OP_SUB", -20.0))
+        if cascade:
+            conds.append(("TEMP+8", 1.0))
+            conds.append(("TEMP+9", -10.0))
+        else:
+            # sub_carry_in (CARRY+2) suppresses ADD firing under SUB.
+            conds.append((sub_carry_in_name, -10.0))
+        # OUTPUT_LO/HI match boosts (only matching nibble; mismatches
+        # are 0 because mismatch_weight=0 in the legacy bake).
+        conds.append((f"OUTPUT_LO+{lo}", output_weight))
+        conds.append((f"OUTPUT_HI_THIS_STEP+{hi}", output_weight))
+
+        writes: list[tuple[str, float]] = []
+        # Collapse the legacy ``= -2/S`` + ``= +2/S`` pair using the
+        # rule that lower_ffn uses ``+=``: when new == old, emit only
+        # the surviving +2/S; otherwise emit both writes as distinct
+        # cells.
+        if new_lo == lo:
+            writes.append((f"OUTPUT_LO+{lo}", 2.0 / S))
+        else:
+            writes.append((f"OUTPUT_LO+{lo}", -2.0 / S))
+            writes.append((f"OUTPUT_LO+{new_lo}", 2.0 / S))
+        if new_hi == hi:
+            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", 2.0 / S))
+        else:
+            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", -2.0 / S))
+            writes.append((f"OUTPUT_HI_THIS_STEP+{new_hi}", 2.0 / S))
+        if lo == 15 and hi == 15 and byte_idx < 2:
+            writes.append(("CARRY+3", 2.0 / S))
+
+        return FFNRule.gated_write(
+            conditions=tuple(conds),
+            threshold=threshold,
+            gate=add_carry_in_name,
+            gate_weight=0.5,
+            gate_bias=0.0,
+            writes=tuple(writes),
+            name=f"l10_carry_byte{byte_idx}_add_lo{lo}_hi{hi}",
+            scope=(
+                f"IS_BYTE and {byte_dim_name} and not MARK_AX "
+                f"and not MARK_PC"
+            ),
+        )
+
+    def sub_rule_for(lo: int, hi: int) -> FFNRule:
+        new_val = (lo + hi * 16 - 1) & 0xFF
+        new_lo = new_val & 0xF
+        new_hi = (new_val >> 4) & 0xF
+        conds = base_conds(sub_carry_in_name)
+        conds.append(("OP_ADD", -20.0))
+        if cascade:
+            conds.append(("TEMP+9", 1.0))
+            conds.append(("TEMP+8", -10.0))
+        else:
+            conds.append((add_carry_in_name, -10.0))
+        conds.append((f"OUTPUT_LO+{lo}", output_weight))
+        conds.append((f"OUTPUT_HI_THIS_STEP+{hi}", output_weight))
+
+        writes: list[tuple[str, float]] = []
+        if new_lo == lo:
+            writes.append((f"OUTPUT_LO+{lo}", 2.0 / S))
+        else:
+            writes.append((f"OUTPUT_LO+{lo}", -2.0 / S))
+            writes.append((f"OUTPUT_LO+{new_lo}", 2.0 / S))
+        if new_hi == hi:
+            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", 2.0 / S))
+        else:
+            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", -2.0 / S))
+            writes.append((f"OUTPUT_HI_THIS_STEP+{new_hi}", 2.0 / S))
+        if lo == 0 and hi == 0 and byte_idx < 2:
+            writes.append(("CARRY+3", 2.0 / S))
+
+        return FFNRule.gated_write(
+            conditions=tuple(conds),
+            threshold=threshold,
+            gate=sub_carry_in_name,
+            gate_weight=0.5,
+            gate_bias=0.0,
+            writes=tuple(writes),
+            name=f"l10_carry_byte{byte_idx}_sub_lo{lo}_hi{hi}",
+            scope=(
+                f"IS_BYTE and {byte_dim_name} and not MARK_AX "
+                f"and not MARK_PC"
+            ),
+        )
+
+    rules: list[FFNRule] = []
+    for lo in range(16):
+        for hi in range(16):
+            rules.append(add_rule_for(lo, hi))
+    for lo in range(16):
+        for hi in range(16):
+            rules.append(sub_rule_for(lo, hi))
+    return tuple(rules)
+
+
 def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` for ``tail_bit32_result_correction``.
 
@@ -1660,9 +1845,14 @@ def make_l10_post_ops_combined() -> Operation:
             f"L10 post_ops_combined zeroing cursor drift: {offset}"
         )
         carry_start = offset
-        offset = _bake_post_op_into(
-            ffn, CarryPropagationPostOp(d_model, S, byte_idx=0, cascade=False,
-                                        dim_positions=dim_positions), offset)
+        # Migrated to FFNRule. See ``_l10_carry_propagation_rules``.
+        offset = Primitives.lower_ffn_rules(
+            ffn,
+            _l10_carry_propagation_rules(S, byte_idx=0, cascade=False),
+            dim_positions,
+            start_unit=offset,
+            S=S,
+        )
         assert offset == by_name["l10_post_ops_combined.carry_propagation_byte1"].start, (
             f"L10 post_ops_combined carry0 cursor drift: {offset}"
         )
