@@ -130,25 +130,21 @@ OUTPUT_HI split landed + reverted, see commits `e8eba9c` / `80c7288` /
 
 ### Stream 2 — Allocator / pin removal
 
-#### 8.B — AttentionHeadAllocator decoupling + L0–L2 attn pin drop
+#### 8.B — AttentionHeadAllocator decoupling + corpus-wide attn pin drop
 
-_Status: not started; called out structurally in the audit
-("alibi-slope / W_o mapping" couples slope to head_idx)._
+_Status: **DONE (8.B.1, 8.B.2, 8.B.3)** as of overnight cycles. L9 attn
+pin drop landed (`8cf75955`); L10/L13/L14/L15 remaining._
 
-* **8.B.1** Add `slope_table` parameter to
-  `DeclarativeAttentionHeadSpec` and route alibi-slope lookup through
-  it (instead of `head_idx`-indexed array in `primitives.py`). The
-  attn primitive decoupling already started in `e791fef` ("decouple
-  alibi_slope + threshold out_base from head_idx") — finish the work.
-* **8.B.2** Add a `(layer, role) → W_o_column` mapping in
-  `AttentionHeadAllocator` so the output projection isn't pinned to
-  `head_idx`. Mirror `dim_allocator.dynamic_first_fit`.
-* **8.B.3** Drop `pin=` from L0/L1/L2 attention heads (the L0–L2 FFN
-  pin removal in 7.B.1 explicitly retained attn pins "due to
-  alibi/W_o structural mapping"; 8.B.1 + 8.B.2 unblock this).
-* **8.B.4** Sweep remaining `pin=` references corpus-wide; drop or
-  document each. Target: `grep -c "pin=" ops/` ≤ 5 (residual literal
-  pins should be documented exceptions only).
+* **8.B.1** ✅ Add `dynamic_first_fit` mode to `AttentionHeadAllocator`
+  (`c4efc27`).
+* **8.B.2** ✅ Decouple `alibi_slope` + threshold `out_base` from
+  `head_idx` (`e791fef`).
+* **8.B.3** ✅ Drop `pin=` from L0/L1/L2 attention heads (`01088f1`).
+* **8.B.4** Continue corpus-wide attn pin drops: L9 (done `8cf75955`);
+  remaining L10/L13/L14/L15. Each layer: switch to `dynamic_first_fit`,
+  verify byte-identity via W_q/W_k/W_v/W_o + alibi_slopes diff.
+* **8.B.5** Sweep `grep -c "pin=" ops/` after all per-layer drops;
+  document any residual exceptions.
 * **Acceptance**: 0 non-None `pin=` in `ops/` head-allocator calls;
   byte-identical sweep on all 86 heads (still 0 real_bug).
 
@@ -200,21 +196,32 @@ Audit Tier 4 enumerates the next set._
 
 #### 8.G — Delete `compile_full_vm` static path + phase pruning
 
-_Status: in progress; strict-default flip landed (`b038fed`)._
+_Status: in progress; strict-default flip landed (`b038fed`);
+reroute landed (`e6da5f4` — `use_static_path=False` default);
+KV eviction kwarg port done (in same merge)._
 
-* **8.G.1** Mark `compile_full_vm` (static-phase entry point) as
-  deprecated; route all callers through `compile_full_vm_dynamic`.
-* **8.G.2** After 8.A lands (SCC ≤ 10), delete the static-phase code
-  path entirely; collapse to a single dynamic compiler.
-* **8.G.3** Delete `phase=` ordinal from op factories where the
-  scheduler can derive it from `requires=`. Audit count is 282
-  `phase=` references; target is ≤ 30 (only for ops that have no
-  declared deps and need an explicit anchor).
-* **8.G.4** Delete `layer_idx=` from `ops/` calls where it's
-  redundant with the allocator's per-layer mapping. Audit count is
-  189; target is ≤ 50 (only allocator slot anchors).
-* **Acceptance**: `compile_full_vm` removed from public API; static
-  test suite + 1096 corpus byte-identical under dynamic-only path.
+* **8.G.1** ✅ Port `kv_eviction_policy` + `kv_eviction_n_steps` kwargs
+  into `compile_full_vm_dynamic` (was static-only blocker).
+* **8.G.2** ✅ Reroute `compile_full_vm` to dynamic by default
+  (`e6da5f4`). Static path preserved behind `use_static_path=True`
+  flag with deletion TODO.
+* **8.G.3** **Actually delete** the static-phase code path (~550 LOC
+  in `full_vm_compiler.py` per `static_path_deletion_prep.md`). After
+  8.A lands SCC ≤ 10 + 8.D corpus-wide dim_ref done. Audit confirms
+  no production caller blocks deletion.
+* **8.G.4** **Actually delete** phase-pruning code (~250-350 LOC in
+  `_topological_sort`, `_assign_layers`, `_phase_key` of
+  `layer_compiler.py`). Mirror in `compile_full_vm_dynamic`.
+* **8.G.5** Delete `phase=` ordinal from op factories where the
+  scheduler can derive it from `requires=`. Audit count: 282
+  `phase=` references; target **0** (only for documented anchor ops
+  where requires-only doesn't suffice). Per-layer batches in flight.
+* **8.G.6** Delete `layer_idx=` from `ops/` calls where it's
+  redundant. Audit count: 189; target **0** (allocator chooses).
+  Per-layer batches in flight.
+* **Acceptance**: `compile_full_vm` removed from public API; phase
+  pruning code deleted; 0 `phase=` / 0 `layer_idx=` literals in ops;
+  static test suite + 1096 corpus byte-identical under dynamic-only path.
 
 ### Stream 4 — KV eviction / corpus fixes / demo
 
@@ -261,6 +268,22 @@ root-cause diagnostic._
 * **Acceptance**: 1096 corpus pass-rate strictly improves; no new
   sentinel regressions under both declarations-only + full-flag
   modes.
+
+#### 8.I — Final 100% verification pass
+
+_Status: not started; closing audit re-run._
+
+* **8.I.1** Run all sweeps (FFN, attn, claims, census v2, scheduler,
+  KV eviction quantification) and confirm 100% of `Section 2` table.
+* **8.I.2** Run full 1096 corpus + spec-decode + smoke; net delta
+  vs Phase 7 baseline must be ≥ 0 with no real_bug regressions.
+* **8.I.3** Write `c4_release/.agent-logs/phase_8_closing_audit.md`
+  mirroring the Phase 7 closing audit format.
+* **8.I.4** Map each metric to the user's original five vision components
+  (see Section 7 below) and confirm 100% adoption — this is the
+  acceptance forcing-function.
+* **Acceptance**: all 12 metrics in Section 2 hit 100% or "deleted";
+  closing audit is committed.
 
 #### 8.H — Phase 9 demo (zero-pin declarative op)
 
@@ -359,6 +382,40 @@ This matches the audit's expectation that Phase 8 is the "closing
 20%": Phase 7 took ~3 weeks for 65 commits across 5 sub-waves;
 Phase 8 should land ~80 commits across 8 sub-waves in a similar
 window.
+
+---
+
+## Section 7 — Explicit mapping to the user's original vision
+
+The user's 5-component vision (from the original conversation):
+
+> "Once we have things fully dynamic there will be no more
+> imperative setting and then all fixes will be fixes on the level
+> of the compiler and no non-io dims will be hardcoded and no layer
+> indices will be hardcoded and the weights will be just outputed
+> via compilation of the declarative spec."
+
+This decomposes to **5 explicit goals**, each mapped to Phase 8 work:
+
+| # | Vision goal | Concrete target | Owned by sub-wave(s) | 100% condition |
+|---|---|---|---|---|
+| V1 | "no more imperative setting" | 100% declarative cells; 0 imperative_heavy ops | 8.C | census v2 reports `imperative_heavy=0` AND `declarative+via_helper=100% of cells` |
+| V2 | "all fixes will be fixes on the level of the compiler" | Every new corrective op authored in IR; no bake_fn surgery | 8.H (forcing function); 8.D (dim refs) | 8.H demo op exists with zero pins / zero literal offsets / zero phase ordinal |
+| V3 | "no non-io dims will be hardcoded" | 100% `dim_ref(category, role)` adoption where applicable; structural lookups documented | 8.D | `grep -c "dim_ref(" ops/` ≥ all role-meaningful sites; structural exceptions explicitly tagged |
+| V4 | "no layer indices will be hardcoded" | 0 `layer_idx=` literals; 0 `phase=` literals (compiler derives both) | 8.G.5, 8.G.6 + 8.A.5 backfill | `grep -c "layer_idx=" ops/` = 0 AND `grep -c "phase=" ops/` = 0 |
+| V5 | "weights just output via compilation of the declarative spec" | Single compile path; static path + phase pruning deleted | 8.G.3, 8.G.4 | `compile_full_vm` symbol removed; `_topological_sort` phase-pruning branch removed |
+
+### Additional non-vision goals (Phase 8 also closes these)
+
+| Goal | Sub-wave | 100% condition |
+|---|---|---|
+| KV eviction memory win | 8.E | `measure_kv_eviction.py` reports ≥ 30% peak drop |
+| Cycle graph collapse | 8.A | `dep_graph_cycle_member ≤ 10` |
+| 1096 corpus pass rate | 8.F | strict improvement vs Phase 7 baseline; no real_bug regressions |
+| Closing audit | 8.I | `phase_8_closing_audit.md` written; all metrics confirmed |
+
+**Phase 8 is "done" when all 5 vision goals + 4 non-vision goals
+land in one head-of-branch commit, attested by 8.I.**
 
 ---
 
