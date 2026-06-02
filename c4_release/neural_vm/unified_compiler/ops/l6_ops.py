@@ -2623,7 +2623,7 @@ def make_layer6_routing_ffn_op() -> Operation:
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
-               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP", "CMP",
+               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP", "CMP",
                "OUTPUT_LO_PREV_STEP", "OUTPUT_HI_PREV_STEP", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
                "TEMP_PREV_STEP", "DIV_STAGING"},
@@ -2690,7 +2690,7 @@ def make_layer6_ffn_dep_anchor_op() -> Operation:
         # the L6 FFN slot.
         reads={"MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
-               "AX_CARRY_LO", "AX_CARRY_HI", "CMP",
+               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI", "CMP",
                "HAS_SE", "OPCODE_BASE"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
                 "AX_CARRY_LO", "AX_CARRY_HI"},
@@ -2870,7 +2870,7 @@ def make_layer6_relay_heads_op() -> Operation:
         # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the L6 read as
         # cross-step relative to L8 writers. See layer6_attn for rationale.
         reads={"MARK_STACK0", "MARK_AX",
-               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP",
+               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP",
                "STACK0_BYTE0", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "OP_LEV", "CONST"},
         writes={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
@@ -3992,7 +3992,7 @@ def make_putchar_think_protocol_op(
         # L6 phase 6.6, before any L8 AX_CARRY producer). Stub bake; the
         # reads are placeholders for the Phase 2 implementation.
         reads={"IO_IS_PUTCHAR", "NEXT_SE",
-               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP"},
+               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP"},
         writes={"NEXT_THINKING_END", "NEXT_SE", "IO_STATE",
                 "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         kind="block",
