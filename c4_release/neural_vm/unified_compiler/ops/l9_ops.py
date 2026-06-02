@@ -1707,7 +1707,10 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake if not enable else None,
-        layer_idx=9,
+        # Phase 8.A.4 retry: layer_idx=9 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer9_marker_suppress``
+        # (kind="ffn", L9 anchor pinned via ``requires["after"]: layer8_alu``).
+        target_op_name="layer9_marker_suppress",
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
