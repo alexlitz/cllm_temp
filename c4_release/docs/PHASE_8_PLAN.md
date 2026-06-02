@@ -164,8 +164,11 @@ _Status: not started; targets enumerated in audit Section 2._
   Decide per-op.
 * **8.C.3** `l15_attention_resize` (1,973 cells) and
   `function_call_weights` (2,910 cells) — runtime-shape decisions.
-  Extend `RuntimeAttentionFragment` to cover them or document as
-  IR-exception with `kind="runtime_shape"`.
+  **Per user**: no `structural_model` escape hatch — must be fully
+  declarative. Introduce a `StructuralOp` IR node (and corresponding
+  `lower_structural`) for `l15_attention_resize`'s
+  `nn.Parameter` reshape (shape change is declared, not imperative).
+  `function_call_weights` migrated to `FFNRule` + `AttentionHeadIR`.
 * **8.C.4** L10 passthrough_bakes (211 + 150 + 348 + 111 cells) and
   `conversational_io_output_routing` (128 cells) — small mop-up
   migrations using the L14 cleanup-chain pattern.
@@ -741,7 +744,7 @@ This decomposes to **5 explicit goals**, each mapped to Phase 8 work:
 
 | # | Vision goal | Concrete target | Owned by sub-wave(s) | 100% condition |
 |---|---|---|---|---|
-| V1 | "no more imperative setting" | 100% declarative cells; 0 imperative_heavy ops | 8.C | census v2 reports `imperative_heavy=0` AND `declarative+via_helper=100% of cells` |
+| V1 | "no more imperative setting" | 100% declarative cells; 0 imperative_heavy ops; **0 structural-model exceptions** | 8.C | census v2 reports `imperative_heavy=0` AND `declarative+via_helper=100% of cells`. `l15_attention_resize` must be migrated to a declarative `StructuralResize` IR node (not skipped via `declarative_authority="structural_model"`). No `structural_model` authority labels remain. |
 | V2 | "all fixes will be fixes on the level of the compiler" | Every new corrective op authored in IR; no bake_fn surgery | 8.H (forcing function); 8.D (dim refs) | 8.H demo op exists with zero pins / zero literal offsets / zero phase ordinal |
 | V3 | "no non-io dims will be hardcoded" | 100% `dim_ref(category, role)` adoption where applicable; structural lookups documented | 8.D | `grep -c "dim_ref(" ops/` ≥ all role-meaningful sites; structural exceptions explicitly tagged |
 | V4 | "no layer indices will be hardcoded" | 0 `layer_idx=` literals; 0 `phase=` literals (compiler derives both) | 8.G.5, 8.G.6 + 8.A.5 backfill | `grep -c "layer_idx=" ops/` = 0 AND `grep -c "phase=" ops/` = 0 |
@@ -752,7 +755,7 @@ This decomposes to **5 explicit goals**, each mapped to Phase 8 work:
 | Goal | Sub-wave | 100% condition |
 |---|---|---|
 | KV eviction of overwritten values | 8.E | **Every KV entry whose value has been overwritten by a later step (register clobber, memory cell rewrite, output slot rewrite, transient scratch end-of-step) is evicted at that step.** Static overwrite detection — not runtime liveness. Correctness gate: KV-eviction-ON byte-identical to OFF. Completeness gate: 0 late-evictions on overwrite categories. Determinism gate: spec-decode and main-decode evict identically. Memory drop is a downstream side effect. |
-| Cycle graph collapse | 8.A | `dep_graph_cycle_member ≤ 10` |
+| Cycle graph collapse | 8.A | `dep_graph_cycle_member = 0` (zero cycles, not ≤10 — every cross-step dependency must be expressed via `_PREV_STEP` aliases or explicit `requires["after"]`) |
 | 1096 corpus pass rate | 8.F | strict improvement vs Phase 7 baseline; no real_bug regressions |
 | Closing audit | 8.I | `phase_8_closing_audit.md` written; all metrics confirmed |
 
