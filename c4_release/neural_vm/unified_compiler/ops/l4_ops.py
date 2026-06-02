@@ -515,10 +515,16 @@ def make_layer4_ffn_dep_anchor_op() -> Operation:
         kind="ffn",
         migrated=True,
         declarative_authority="topology_anchor",
-        # Co-place with ``_layer3_ffn_dep_anchor`` so the new anchor lands
-        # at exactly L4 (where the L3 anchor lands today). The phase-share
-        # rule (same kind, same phase) then puts both in the L4 FFN slot.
-        requires={"same_layer_as": "_layer3_ffn_dep_anchor"},
+        # Phase 9.B SSA migration: drop ``requires["same_layer_as"]``.
+        # The L3 anchor's earliest-feasible layer settled at L3 after the
+        # SSA rename, so coupling to it dragged this anchor to L3 -- but
+        # the L4 anchor's writes (FETCH_LO/HI) force a layer >= 4 minimum,
+        # producing the "placed at layer 4 but reference at layer 3"
+        # mismatch error at layer_compiler.py:1609. Relying on
+        # phase=3 + writes={FETCH_LO, FETCH_HI} lets the scheduler place
+        # this anchor at L4 naturally (no earlier layer writes FETCH_LO/HI),
+        # matching the ``layer4_ffn`` block op's slot.
+        requires={},
         smoke_tests=set(),
         spec_section=None,
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's

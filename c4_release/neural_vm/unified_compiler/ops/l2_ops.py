@@ -570,7 +570,6 @@ def make_layer2_threshold_attn_op() -> Operation:
 
     return Operation(
         name="layer2_threshold_attn",
-        phase=2,
         reads={"IS_MARK", "CONST"},
         writes={"L2H0"},
         kind="attn",
