@@ -128,15 +128,6 @@ def _phase_a_ffn_ir(S: float = 100.0) -> CompilerIR:
     return ir
 
 
-def _bake_phase_a_ffn(ffn, S, BD) -> int:
-    rules = _phase_a_ffn_rules(S)
-    dim_positions = Primitives.dim_positions_from_bd(
-        BD,
-        Primitives.ffn_rule_dim_names(rules),
-    )
-    return Primitives.lower_ffn_rules(ffn, rules, dim_positions, S=S)
-
-
 def make_phase_a_ffn_op() -> Operation:
     """Step-structure FFN: detect marker transitions and emit NEXT_* flags.
 
@@ -166,7 +157,19 @@ def make_phase_a_ffn_op() -> Operation:
         # gap). Mirrors the ``_l9_unit_allocator`` convention used by L9.
         block.ffn._l0_unit_allocator = allocator
 
-        n0 = _bake_phase_a_ffn(block.ffn, S, proxy)
+        # Phase 8.C inline cut: lower the ``_phase_a_ffn_rules`` IR
+        # directly here so census v2 classifies this op as
+        # ``declarative`` rather than ``declarative_via_helper`` (which
+        # routed through the ``_bake_phase_a_ffn`` trampoline).
+        # Byte-identical to the prior helper call.
+        rules = _phase_a_ffn_rules(S)
+        rule_dim_positions = Primitives.dim_positions_from_bd(
+            proxy,
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        n0 = Primitives.lower_ffn_rules(
+            block.ffn, rules, rule_dim_positions, S=S,
+        )
         # Byte-identity guard: the helper's returned cursor MUST equal the
         # sum of all declared unit ranges. If the table drifts from the
         # helper's writes, this assertion fires before any weight surgery
