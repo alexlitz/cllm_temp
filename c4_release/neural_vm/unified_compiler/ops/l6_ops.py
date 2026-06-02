@@ -452,7 +452,7 @@ def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     # OUTPUT_HI_THIS_STEP is already step-local (B9 split) so its gate
     # name is unchanged.
     for band, output_base, output_gate_base in (
-        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
@@ -564,7 +564,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
     # See _layer6_all_step_jmp_pc_override_rules for the rationale.
     for band, output_base, output_gate_base in (
-        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
@@ -714,7 +714,7 @@ def _layer6_delayed_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / S
     # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
     for band, output_base, output_gate_base in (
-        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
@@ -752,7 +752,7 @@ def _layer6_first_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     threshold = 5.0
     # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
     for band, output_base, output_gate_base in (
-        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
@@ -1035,7 +1035,7 @@ def _layer6_psh_stack0_marker_override_rules(S: float) -> tuple[FFNRule, ...]:
     # sub-loop (gate=ALU) and the final constant_write sub-loop are
     # unaffected; only the cancel-output gate needs the alias rename.
     for band, output_base, alu_base, output_gate_base in (
-        ("lo", "OUTPUT_LO", "ALU_LO", "OUTPUT_LO_PREV_STEP"),
+        ("lo", "OUTPUT_LO", "ALU_LO", "OUTPUT_LO.*.-1"),
         ("hi", "OUTPUT_HI_THIS_STEP", "ALU_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         # Sub-loop 1: cancel residual OUTPUT
@@ -1437,7 +1437,7 @@ def _layer6_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / S
     # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
     for band, output_base, output_gate_base in (
-        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
@@ -1486,7 +1486,7 @@ def _layer6_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
     for group, conditions, threshold in groups:
         for band, output_base, output_gate_base in (
-            ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+            ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
             ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
         ):
             for k in range(16):
@@ -1568,7 +1568,7 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
     # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
     for group, conditions, threshold in groups:
         for band, output_base, output_gate_base in (
-            ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+            ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
             ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
         ):
             for k in range(16):
@@ -2537,7 +2537,7 @@ def make_layer6_attn_op() -> Operation:
         reads={"OP_JMP", "OP_EXIT", "OP_JSR", "MARK_AX", "MARK_PC", "MARK_SP",
                "MARK_STACK0", "NEXT_SE", "FETCH_LO", "FETCH_HI",
                "PSH_AT_SP", "OP_PSH", "OP_ADJ", "OP_ENT", "OP_LEV",
-               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP"},
+               "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1"},
         writes={"CMP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         layer_idx=6,
@@ -2648,10 +2648,10 @@ def make_layer6_routing_ffn_op() -> Operation:
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
-               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP", "CMP_PREV_STEP",
-               "OUTPUT_LO_PREV_STEP", "OUTPUT_HI_PREV_STEP", "HAS_SE",
+               "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1", "CMP.*.-1",
+               "OUTPUT_LO.*.-1", "OUTPUT_HI.*.-1", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
-               "TEMP_PREV_STEP", "DIV_STAGING"},
+               "TEMP.*.-1", "DIV_STAGING"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
         declarative_bake_fn=bake,
@@ -2715,7 +2715,7 @@ def make_layer6_ffn_dep_anchor_op() -> Operation:
         # the L6 FFN slot.
         reads={"MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
-               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP", "CMP_PREV_STEP",
+               "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1", "CMP.*.-1",
                "HAS_SE", "OPCODE_BASE"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
                 "AX_CARRY_LO", "AX_CARRY_HI"},
@@ -2895,7 +2895,7 @@ def make_layer6_relay_heads_op() -> Operation:
         # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the L6 read as
         # cross-step relative to L8 writers. See layer6_attn for rationale.
         reads={"MARK_STACK0", "MARK_AX",
-               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP",
+               "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1",
                "STACK0_BYTE0", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "OP_LEV", "CONST"},
         writes={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
@@ -4017,7 +4017,7 @@ def make_putchar_think_protocol_op(
         # L6 phase 6.6, before any L8 AX_CARRY producer). Stub bake; the
         # reads are placeholders for the Phase 2 implementation.
         reads={"IO_IS_PUTCHAR", "NEXT_SE",
-               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP"},
+               "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1"},
         writes={"NEXT_THINKING_END", "NEXT_SE", "IO_STATE",
                 "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         kind="block",
