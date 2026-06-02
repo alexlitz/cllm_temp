@@ -3,7 +3,7 @@
 Strategy:
   - Build the compiled neural VM model (cached) in both `pure_neural=True`
     and handler-mode (`pure_neural=False`) configurations. Both build the
-    SAME underlying model (compile_full_vm); the difference is in the
+    SAME underlying model (compile_full_vm_dynamic); the difference is in the
     runner's Python overrides at STEP_END boundaries, not in the residual
     stream during a single forward.
   - Construct a *synthesized* context that contains the bytecode prefix

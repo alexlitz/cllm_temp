@@ -17,7 +17,7 @@ from neural_vm.debugger import VMExecutionTracer, ExecutionTrace
 from neural_vm.contracts import validate_and_print
 from neural_vm.step_debugger import StepDebugger
 from neural_vm.vm_step import Opcode
-from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
 
 def demo_execution_tracer():
@@ -81,7 +81,7 @@ def demo_contract_validation():
     print("DEMO 3: DIMENSION CONTRACT VALIDATION")
     print("="*80 + "\n")
 
-    model, _ = compile_full_vm()
+    model, _ = compile_full_vm_dynamic()
 
     print("Validating dimension contracts...\n")
     violations = validate_and_print(model)

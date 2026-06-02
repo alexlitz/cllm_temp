@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from neural_vm.run_vm import AutoregressiveVMRunner  # noqa: E402
 from neural_vm.pure_moe import StandardMoEFFN  # noqa: E402
 from neural_vm.base_layers import PureFFN  # noqa: E402
-from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm  # noqa: E402
+from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic  # noqa: E402
 
 
 def _count_standard_moe_blocks(model):
@@ -85,13 +85,13 @@ def test_compiler_can_emit_standard_moe():
     This keeps MoE out of runner-local post-processing, so cache keys and
     downstream graph compilers see the final module structure.
     """
-    model, _layout = compile_full_vm(
+    model, _layout = compile_full_vm_dynamic(
         enable_moe_routing=True,
         disk_cache=False,
     )
     n_moe = _count_standard_moe_blocks(model)
     assert n_moe > 0, (
-        "compile_full_vm(enable_moe_routing=True) should emit at least "
+        "compile_full_vm_dynamic(enable_moe_routing=True) should emit at least "
         "one StandardMoEFFN block"
     )
 

@@ -207,17 +207,17 @@ def test_consumer_threshold_distinguishes_f8_from_half_match():
 
 
 def test_compile_full_vm_includes_sp_byte0_is_f8_dim():
-    """compile_full_vm allocates SP_BYTE0_IS_F8 and emits 0 STALENESS warnings."""
+    """compile_full_vm_dynamic allocates SP_BYTE0_IS_F8 and emits 0 STALENESS warnings."""
     import warnings
 
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        _model, layout = compile_full_vm(disk_cache=False)
+        _model, layout = compile_full_vm_dynamic(disk_cache=False)
 
     assert "SP_BYTE0_IS_F8" in layout.dim_positions, (
-        "compile_full_vm did not allocate SP_BYTE0_IS_F8"
+        "compile_full_vm_dynamic did not allocate SP_BYTE0_IS_F8"
     )
     staleness = [str(w.message) for w in caught if "STALENESS" in str(w.message)]
-    assert not staleness, f"compile_full_vm emitted STALENESS warnings: {staleness}"
+    assert not staleness, f"compile_full_vm_dynamic emitted STALENESS warnings: {staleness}"

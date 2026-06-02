@@ -61,10 +61,10 @@ class TestARVMExport:
 
     def test_model_weight_setting(self):
         """VM weights can be baked via the unified compiler."""
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
         # Should not raise.
-        model, _ = compile_full_vm(n_heads=8, ffn_hidden=4096)
+        model, _ = compile_full_vm_dynamic(n_heads=8, ffn_hidden=4096)
         assert model is not None
 
     def test_write_tensor_function(self):
@@ -95,10 +95,10 @@ class TestARVMExport:
 
     def test_model_embedding_structure(self):
         """Verify model embedding structure for export compatibility."""
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
         from neural_vm.neural_embedding import NeuralVMEmbedding
 
-        model, _ = compile_full_vm(n_heads=8, ffn_hidden=4096)
+        model, _ = compile_full_vm_dynamic(n_heads=8, ffn_hidden=4096)
 
         # Verify embedding structure
         assert isinstance(model.embed, NeuralVMEmbedding)

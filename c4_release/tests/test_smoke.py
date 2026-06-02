@@ -976,7 +976,7 @@ class TestSmokeHarnessConfig:
 
 # All per-class fixtures share the SAME compiled model via the session-
 # scoped ``_batched_pure_neural_runner_model`` fixture in ``conftest.py`` —
-# so the expensive ``compile_full_vm`` bake happens exactly once across the
+# so the expensive ``compile_full_vm_dynamic`` bake happens exactly once across the
 # whole pytest session, not once per class.
 
 

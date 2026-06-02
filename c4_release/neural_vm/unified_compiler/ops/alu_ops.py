@@ -396,7 +396,7 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
     (phase=11) which writes to ``block.ffn.W_up`` of the original PureFFN, and
     AFTER ``l11_alu_mul_bdtoge`` (phase=11.0) which installs
     ``FlattenedALUMul``. Our isinstance check below makes the wrap a no-op
-    when ``FlattenedALUMul`` is already installed (the normal compile_full_vm
+    when ``FlattenedALUMul`` is already installed (the normal compile_full_vm_dynamic
     flow). The install path remains a fallback for direct ``set_vm_weights``
     callers that don't run the 9 flattening ops.
     """
@@ -405,7 +405,7 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
             return
         from ...efficient_alu_neural import ALUMul, FlattenedALUMul
         # Don't clobber FlattenedALUMul if a sibling op already installed it
-        # (the normal compile_full_vm flow). The 9 ``FlattenedALUMul`` installer
+        # (the normal compile_full_vm_dynamic flow). The 9 ``FlattenedALUMul`` installer
         # ops at phases 11.0..12.3 run alongside us; the bdtoge op (phase=11.0)
         # runs first and we skip the ALUMul install when it already did so.
         if isinstance(block.ffn, FlattenedALUMul):

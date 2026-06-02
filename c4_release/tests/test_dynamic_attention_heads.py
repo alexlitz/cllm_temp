@@ -14,7 +14,7 @@ Tests three layers of the fully-dynamic-head vision:
    module — proves the IR can express the HF Mixtral architecture
    without a full VM rebake.
 
-The tests do NOT require a full ``compile_full_vm`` run — they exercise
+The tests do NOT require a full ``compile_full_vm_dynamic`` run — they exercise
 the allocator and lowering primitives directly, which keeps them fast
 and immune to concurrent op-corpus changes.
 """

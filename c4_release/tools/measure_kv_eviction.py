@@ -2,7 +2,7 @@
 
 This harness:
 
-1. Compiles ``compile_full_vm`` twice — once with
+1. Compiles ``compile_full_vm_dynamic`` twice — once with
    ``kv_eviction_policy=OFF`` and once with
    ``kv_eviction_policy=STATIC_LIVENESS``.
 2. Runs each model on a 100-input sample of the smoke + 1096 corpus,
@@ -377,7 +377,7 @@ def measure(
     seed: int,
 ) -> Dict[str, object]:
     """Compile both models, run each on the sampled corpus, return a report dict."""
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     # Boot a runner singleton (used by ``_build_program_tokens``).
     _set_runner_singleton()
@@ -400,7 +400,7 @@ def measure(
 
     # Compile models.
     t0 = time.perf_counter()
-    model_off, layout = compile_full_vm(
+    model_off, layout = compile_full_vm_dynamic(
         disk_cache=True,
         kv_eviction_policy=KVEvictionPolicy.OFF,
     )
@@ -410,7 +410,7 @@ def measure(
         flush=True,
     )
     t1 = time.perf_counter()
-    model_sl, _ = compile_full_vm(
+    model_sl, _ = compile_full_vm_dynamic(
         disk_cache=True,
         kv_eviction_policy=KVEvictionPolicy.STATIC_LIVENESS,
         kv_eviction_n_steps=n_steps,
@@ -536,7 +536,7 @@ def write_report(report: Dict[str, object], path: Path) -> None:
     lines.append("## Methodology")
     lines.append("")
     lines.append(
-        "* Compile two models via `compile_full_vm`: `kv_eviction_policy=OFF` "
+        "* Compile two models via `compile_full_vm_dynamic`: `kv_eviction_policy=OFF` "
         f"and `kv_eviction_policy=STATIC_LIVENESS` (n_steps={n_steps}). The "
         "byte-identity gate (tests/test_kv_eviction.py) confirmed the two "
         "produce identical logits."

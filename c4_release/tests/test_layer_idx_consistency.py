@@ -19,12 +19,12 @@ What this test locks in:
        (``attn``/``ffn``/``block``) MUST set ``layer_idx == N``.
        (``kind="model"`` ops are intentionally exempt: they operate on the
        whole model and never use ``layer_idx``.)
-    2. After ``compile_full_vm()`` produces a layout, every migrated
+    2. After ``compile_full_vm_dynamic()`` produces a layout, every migrated
        ``layerN_*`` attn/ffn op must actually appear at
        ``layout.ops_per_layer[N]`` — i.e. the pin was honored.
-    3. After ``compile_full_vm()``, every migrated ``layerN_*`` block op
+    3. After ``compile_full_vm_dynamic()``, every migrated ``layerN_*`` block op
        must report ``layer_idx == N`` (block ops are dispatched by
-       ``compile_full_vm`` via ``layout.resolve_block_op_layer`` /
+       ``compile_full_vm_dynamic`` via ``layout.resolve_block_op_layer`` /
        ``layer_idx`` directly).
 
 If a future agent flips a new ``layerN_*`` op to ``migrated=True`` and
@@ -37,7 +37,7 @@ import re
 import pytest
 
 from c4_release.neural_vm.unified_compiler.ops.all_core_ops import all_core_ops
-from c4_release.neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
 
 # Matches an op name of the form ``layer{N}_<anything>`` and captures N.
@@ -112,7 +112,7 @@ def test_layout_ops_per_layer_pins_migrated_attn_ffn_to_named_layer():
     ``_assign_layers`` could still send it to the wrong block. Walking
     ``ops_per_layer`` after compile catches that.
     """
-    _, layout = compile_full_vm()
+    _, layout = compile_full_vm_dynamic()
 
     failures = []
     # Build {name: layer_index} for every op the compiler placed in
@@ -160,7 +160,7 @@ def test_layout_ops_per_layer_pins_migrated_attn_ffn_to_named_layer():
 
 def test_layout_block_ops_carry_matching_layer_idx():
     """Block ops carry their own ``layer_idx`` (not via ops_per_layer)."""
-    _, layout = compile_full_vm()
+    _, layout = compile_full_vm_dynamic()
 
     block_ops_by_name = {op.name: op for op in layout.block_ops}
 

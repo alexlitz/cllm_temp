@@ -94,7 +94,7 @@ class BakedPromptVM:
             n_heads: Number of attention heads
             ffn_hidden: FFN hidden dimension
             bake_weights: Retained for backwards compatibility. The runner
-                         always bakes weights via `compile_full_vm` at
+                         always bakes weights via `compile_full_vm_dynamic` at
                          construction time; this flag is now a no-op.
         """
         self.system_source = system_source
@@ -107,7 +107,7 @@ class BakedPromptVM:
         self.available_functions = self._extract_function_names(system_source)
 
         # Lazy-create runner (imports torch + neural_vm). The runner bakes
-        # weights via `compile_full_vm` internally, so `bake_weights` is now
+        # weights via `compile_full_vm_dynamic` internally, so `bake_weights` is now
         # a no-op kept for backwards compatibility.
         from neural_vm.run_vm import AutoregressiveVMRunner
         self.runner = AutoregressiveVMRunner(

@@ -428,14 +428,14 @@ def test_production_compile_emits_no_collision_warnings():
     been retired. Any collision warning here is a real latent bug to
     investigate (per ARCH_LEAKAGE_FIX_PLAN.md).
     """
-    from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
-        compile_full_vm,
+    from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+        compile_full_vm_dynamic,
     )
 
     with warnings.catch_warnings(record=True) as wlist:
         warnings.simplefilter("always")
         # Default args mirror the bake path used by the headline tests.
-        compile_full_vm()
+        compile_full_vm_dynamic()
 
     msgs = _collect_claim_warnings(wlist)
     assert msgs == [], (

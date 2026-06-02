@@ -3282,7 +3282,7 @@ def make_layer6_attn_bake_op() -> Operation:
     ordering where _set_layer6_attn ran after function_call_weights.
 
     A model-level op (rather than ``kind="block"`` pinned to ``layer_idx=6``)
-    is required because compile_full_vm dispatches block ops BEFORE all
+    is required because compile_full_vm_dynamic dispatches block ops BEFORE all
     model ops, which would flip the override contract between this op's
     sibling ``layer6_relay_heads_bake`` (head 7 Q[MARK_STACK0]=50) and
     ``function_call_weights`` (head 7 Q[MARK_STACK0]=1050). Operating on
@@ -4145,7 +4145,7 @@ def make_open_clos_tool_call_op(
     Each of those three bakes is wrapped in a no-op-when-False factory
     in ``flag_gated_ops.py`` (``make_tool_call_*_op``) and registered
     unconditionally in ``all_core_ops``. When
-    ``enable_tool_calling=True`` is passed to ``compile_full_vm``, all
+    ``enable_tool_calling=True`` is passed to ``compile_full_vm_dynamic``, all
     three fire and OPEN/CLOS steps produce TOOL_CALL.
 
     **This op is dep-graph documentation, not a new weight write.**

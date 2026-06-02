@@ -5,7 +5,7 @@ import torch
 import os
 from neural_vm.vm_step import Token
 from neural_vm.embedding import Opcode
-from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
 def build_and_save_model():
     """Build model with weights and save to cache."""
@@ -14,7 +14,7 @@ def build_and_save_model():
     print("=" * 80)
 
     print("\nCompiling VM via unified compiler...")
-    model, _ = compile_full_vm()
+    model, _ = compile_full_vm_dynamic()
 
     print("Compacting model...")
     model.compact(block_size=32)

@@ -858,7 +858,7 @@ Pre-conditions (must be true before Phase B is unblocked):
 
 Phase C (delete static phase):
   * Once ``compile_full_vm_dynamic`` produces byte-identical layouts to
-    ``compile_full_vm`` for the full test matrix, remove the ``phase``
+    ``compile_full_vm_dynamic`` for the full test matrix, remove the ``phase``
     field from ``Operation`` and delete the static-phase code path.
 """
 

@@ -51,8 +51,8 @@ _shared_model = None
 def _get_model():
     global _shared_model
     if _shared_model is None:
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-        _shared_model, _ = compile_full_vm()
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+        _shared_model, _ = compile_full_vm_dynamic()
         _shared_model.compact(block_size=32)
         _shared_model.compact_moe()
         if torch.cuda.is_available():

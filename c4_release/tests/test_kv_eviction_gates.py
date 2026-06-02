@@ -2,7 +2,7 @@
 the ``KVEvictionPolicy.OVERWRITE_BASED`` runtime path.
 
 The gates exercise the runtime wiring landed in Phase 8.E.3 (merge commit
-``0acf03908b602bd9bc7085aa65341216df0b29db``) — :func:`compile_full_vm`
+``0acf03908b602bd9bc7085aa65341216df0b29db``) — :func:`compile_full_vm_dynamic`
 attaches a per-attention :class:`~neural_vm.kv_eviction.KVEvictionState`
 constructed by
 :func:`~neural_vm.kv_eviction.build_state_from_overwrite_map`, and
@@ -85,7 +85,7 @@ from neural_vm.kv_overwrite_map import (
     OverwriteCategory,
     build_overwrite_map,
 )
-from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +116,7 @@ def _logits_for_model(model, token_ids: torch.Tensor) -> torch.Tensor:
 def off_model_layout():
     """Baseline ``policy=OFF`` model + layout."""
 
-    return compile_full_vm(
+    return compile_full_vm_dynamic(
         disk_cache=False,
         kv_eviction_policy=KVEvictionPolicy.OFF,
     )
@@ -126,7 +126,7 @@ def off_model_layout():
 def overwrite_model_layout_n_steps_8():
     """``policy=OVERWRITE_BASED`` with the smoke ``n_steps`` (8)."""
 
-    return compile_full_vm(
+    return compile_full_vm_dynamic(
         disk_cache=False,
         kv_eviction_policy=KVEvictionPolicy.OVERWRITE_BASED,
         kv_eviction_n_steps=8,
@@ -137,7 +137,7 @@ def overwrite_model_layout_n_steps_8():
 def overwrite_model_layout_n_steps_64():
     """``policy=OVERWRITE_BASED`` with the wider 1096 ``n_steps`` (64)."""
 
-    return compile_full_vm(
+    return compile_full_vm_dynamic(
         disk_cache=False,
         kv_eviction_policy=KVEvictionPolicy.OVERWRITE_BASED,
         kv_eviction_n_steps=64,
@@ -489,7 +489,7 @@ def test_determinism_spec_and_main_decode_evict_identical_entries_per_step(
     # Second independent OVERWRITE_BASED build — stand-in for the
     # spec-decode path. The eviction state is precomputed from the IR,
     # so the two builds must produce identical plans.
-    spec_model, spec_layout = compile_full_vm(
+    spec_model, spec_layout = compile_full_vm_dynamic(
         disk_cache=False,
         kv_eviction_policy=KVEvictionPolicy.OVERWRITE_BASED,
         kv_eviction_n_steps=8,

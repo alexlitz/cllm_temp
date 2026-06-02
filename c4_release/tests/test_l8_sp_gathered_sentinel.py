@@ -12,7 +12,7 @@ should:
      W_down writing to SP_GATHERED_THIS_STEP at amplitude ``2.0 / S``.
   4. Output 1.0 at MARK_SP positions and 0.0 elsewhere after one L8 FFN
      forward pass on a synthetic residual stream.
-  5. Survive ``compile_full_vm()`` with zero staleness warnings (the
+  5. Survive ``compile_full_vm_dynamic()`` with zero staleness warnings (the
      ``produces={"SP_GATHERED_THIS_STEP": "SP_marker"}`` annotation is the
      in-step producer for any future L10/L13 consumer's
      ``consumes_fresh`` claim).
@@ -167,8 +167,8 @@ def test_sentinel_rule_writes_w_down_at_2_over_s():
 @pytest.fixture(scope="module")
 def baked_full_model():
     """One compiled full-VM model + layout shared by symbolic-forward tests."""
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-    model, layout = compile_full_vm(disk_cache=False, S=100.0)
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+    model, layout = compile_full_vm_dynamic(disk_cache=False, S=100.0)
     return model, layout
 
 
@@ -229,7 +229,7 @@ def test_l8_ffn_sentinel_unit_writes_only_to_sp_gathered_dim(baked_full_model):
 
 
 # ---------------------------------------------------------------------------
-# 5. compile_full_vm() succeeds with no STALENESS warnings
+# 5. compile_full_vm_dynamic() succeeds with no STALENESS warnings
 # ---------------------------------------------------------------------------
 
 
@@ -237,10 +237,10 @@ def test_compile_full_vm_emits_no_staleness_warnings_with_sentinel(caplog):
     """The full-VM compile path runs clean once the sentinel is wired."""
     import logging
 
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     caplog.set_level(logging.WARNING, logger="neural_vm")
-    model, _layout = compile_full_vm(disk_cache=False, S=100.0)
+    model, _layout = compile_full_vm_dynamic(disk_cache=False, S=100.0)
     # No "STALENESS" warning text in any captured record.
     for record in caplog.records:
         msg = record.getMessage()

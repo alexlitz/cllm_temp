@@ -648,7 +648,7 @@ class ModelLayout:
         ffn_widths: per-block FFN hidden_dim, computed as the max
             ``ffn_units_used`` across all ops targeting each block. Layers
             without any annotated FFN op are omitted (caller treats as the
-            default ffn_hidden — 4096 by default). Used by ``compile_full_vm``
+            default ffn_hidden — 4096 by default). Used by ``compile_full_vm_dynamic``
             to pre-size ``PureFFN.hidden_dim`` per-block, avoiding the
             allocate-4096-then-trim-via-``_right_size_ffns`` overhead.
     """

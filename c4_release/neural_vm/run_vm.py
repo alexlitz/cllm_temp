@@ -289,7 +289,7 @@ class AutoregressiveVMRunner:
                 manual capture is ~3× **slower** than eager for this model
                 (compute-bound). See ``c4_release/docs/CUDA_GRAPHS_MULTI_STEP.md``.
             enable_moe_routing: If True, request
-                ``compile_full_vm(enable_moe_routing=True)`` so the compiler
+                ``compile_full_vm_dynamic(enable_moe_routing=True)`` so the compiler
                 emits a model whose eligible FFN layers are already
                 partitioned into per-opcode ``StandardMoEFFN`` experts plus a
                 shared FFN. This is the standard top-K MoE path
@@ -311,7 +311,7 @@ class AutoregressiveVMRunner:
             )
         self.enable_cuda_graphs = bool(enable_cuda_graphs)
         # Phase 0 M5 (2026-05-09): the entire model build+bake goes through
-        # compile_full_vm. The compiler derives d_model and n_layers from the
+        # compile_full_vm_dynamic. The compiler derives d_model and n_layers from the
         # operation set (no hardcoding) and orchestrates the bake pass.
         # Override d_model/n_layers via explicit args only for tests.
         alu_mode = 'efficient' if trust_neural_alu else 'lookup'
@@ -325,8 +325,8 @@ class AutoregressiveVMRunner:
         if cache_model and cache_key in AutoregressiveVMRunner._MODEL_CACHE:
             self.model = AutoregressiveVMRunner._MODEL_CACHE[cache_key]
         else:
-            from .unified_compiler.full_vm_compiler import compile_full_vm
-            self.model, _layout = compile_full_vm(
+            from .unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+            self.model, _layout = compile_full_vm_dynamic(
                 enable_conversational_io=conversational_io,
                 enable_neural_io_think_protocol=enable_neural_io_think_protocol,
                 alu_mode=alu_mode,
@@ -339,7 +339,7 @@ class AutoregressiveVMRunner:
                 self.model = self.model.cuda()
             self.model.eval()
             # Standard top-K MoE routing is emitted by
-            # compile_full_vm(enable_moe_routing=True) so the compiler/cache
+            # compile_full_vm_dynamic(enable_moe_routing=True) so the compiler/cache
             # owns the structural transform and compiled graphs see the
             # final module topology.
             if compile_mode and compile_mode != "none":

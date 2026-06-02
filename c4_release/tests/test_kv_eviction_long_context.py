@@ -241,9 +241,9 @@ def model_off():
     compared against.
     """
 
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
-    model, _layout = compile_full_vm(
+    model, _layout = compile_full_vm_dynamic(
         disk_cache=False,
         kv_eviction_policy=KVEvictionPolicy.OFF,
     )
@@ -260,9 +260,9 @@ def model_static_liveness():
     program's draft step count (the longest currently is < 250 steps).
     """
 
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
-    model, _layout = compile_full_vm(
+    model, _layout = compile_full_vm_dynamic(
         disk_cache=False,
         kv_eviction_policy=KVEvictionPolicy.STATIC_LIVENESS,
         kv_eviction_n_steps=_KV_EVICTION_N_STEPS,

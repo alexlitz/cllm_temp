@@ -36,8 +36,8 @@ class StrictNeuralPredictionTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-        cls.model, _ = compile_full_vm()
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+        cls.model, _ = compile_full_vm_dynamic()
         cls.model.compact(block_size=32)
         cls.model.compact_moe()
         cls.model.eval()

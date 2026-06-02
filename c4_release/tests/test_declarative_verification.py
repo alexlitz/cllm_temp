@@ -378,7 +378,7 @@ class TestDynamicVerification:
 class TestUnitMultistepProbe:
     """Unit tests for the multistep probe builder / register resolver.
 
-    These do not invoke ``compile_full_vm`` so they run in well under a
+    These do not invoke ``compile_full_vm_dynamic`` so they run in well under a
     second. The pyramid keeps the expensive validator tests below from
     blocking trivial regressions in the builder logic.
     """
@@ -488,10 +488,10 @@ class TestMultistepProbe:
     def compiled(self):
         # Build the model once for the whole class -- saves ~70s per
         # test case relative to letting each call rebuild.
-        from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
-            compile_full_vm,
+        from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+            compile_full_vm_dynamic,
         )
-        model, layout = compile_full_vm(
+        model, layout = compile_full_vm_dynamic(
             S=100.0, alu_mode="lookup",
             enable_conversational_io=False, n_heads=8,
         )

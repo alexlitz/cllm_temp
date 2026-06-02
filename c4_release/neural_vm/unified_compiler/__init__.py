@@ -21,7 +21,7 @@ from .verification import Verifier
 from .layer_compiler import LayerCompiler, Operation, ModelLayout, build_model_from_layout
 
 # B11: hybrid dynamic-layer compile path (byte-identical to the static
-# ``compile_full_vm`` on today's op set). Lazy-imported guard keeps the
+# ``compile_full_vm_dynamic`` on today's op set). Lazy-imported guard keeps the
 # package importable on branches that don't ship this module yet.
 try:
     from .full_vm_compiler_dynamic import (  # noqa: F401

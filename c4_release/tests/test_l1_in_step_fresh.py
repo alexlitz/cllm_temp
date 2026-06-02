@@ -23,7 +23,7 @@ from c4_release.neural_vm.vm_step import AutoregressiveAttention, _SetDim
 from c4_release.neural_vm.unified_compiler.ops.l1_ops import (
     make_layer1_threshold_attn_op,
 )
-from c4_release.neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
 
 # Step layout: PC(5) + AX(5) + SP(5) + BP(5) + STACK0(5) + MEM(9) + SE(1) = 35.
@@ -191,16 +191,16 @@ def test_in_step_fresh_dim_allocated_by_compiler():
     import warnings
     with warnings.catch_warnings(record=True) as wlist:
         warnings.simplefilter("always")
-        _model, layout = compile_full_vm()
+        _model, layout = compile_full_vm_dynamic()
         staleness = [w for w in wlist if "STALENESS" in str(w.message)]
 
     assert "IN_STEP_FRESH" in layout.dim_positions, (
-        "IN_STEP_FRESH dim not allocated by compile_full_vm."
+        "IN_STEP_FRESH dim not allocated by compile_full_vm_dynamic."
     )
     pos = layout.dim_positions["IN_STEP_FRESH"]
     assert pos >= 0, f"IN_STEP_FRESH allocated at invalid position {pos}."
     assert len(staleness) == 0, (
-        f"compile_full_vm emitted {len(staleness)} STALENESS warnings: "
+        f"compile_full_vm_dynamic emitted {len(staleness)} STALENESS warnings: "
         f"{[str(w.message) for w in staleness[:3]]}"
     )
 

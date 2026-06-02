@@ -483,7 +483,7 @@ def enforce_runtime_vanilla(
     model,
     *,
     strict: Optional[bool] = None,
-    label: str = "compile_full_vm",
+    label: str = "compile_full_vm_dynamic",
 ) -> RuntimeAuditReport:
     """Run the audit and either warn or raise based on policy.
 

@@ -51,7 +51,7 @@ class _SetDimProxy:
     Module-level (not a closure) so instances of this class can be pickled —
     several runtime modules (``efficient_byte_alu``, ``efficient_wrappers``)
     hold a proxy as ``self.BD``, which means the model object must be
-    picklable for the ``compile_full_vm`` on-disk cache to work.
+    picklable for the ``compile_full_vm_dynamic`` on-disk cache to work.
 
     Falls back to ``_SetDim`` for any attribute not in ``dim_positions``
     (e.g. constants like ``NUM_OPCODES``). ``opcode_dim`` resolves via

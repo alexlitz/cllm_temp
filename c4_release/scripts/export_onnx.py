@@ -1,7 +1,7 @@
 """ONNX export probe for the production Neural VM model.
 
 Attempts to call ``torch.onnx.export`` on the model produced by the production
-constructor (``compile_full_vm``). The goal is **not** to produce a usable
+constructor (``compile_full_vm_dynamic``). The goal is **not** to produce a usable
 ONNX file but to enumerate the concrete blockers (Python control flow,
 ``.item()`` syncs, setattr-on-module state, dynamic-shape arithmetic that
 TorchScript can't trace) so they can be triaged.
@@ -50,10 +50,10 @@ import torch  # noqa: E402
 
 
 def build_production_model():
-    """Build the production model via ``compile_full_vm`` (no runner)."""
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    """Build the production model via ``compile_full_vm_dynamic`` (no runner)."""
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
-    model, _layout = compile_full_vm()
+    model, _layout = compile_full_vm_dynamic()
     model.eval()
     return model
 
@@ -76,7 +76,7 @@ def attempt_export(
     seq_len: int,
     verbose: bool,
 ) -> int:
-    print("[export_onnx] Building production model via compile_full_vm()...")
+    print("[export_onnx] Building production model via compile_full_vm_dynamic()...")
     model = build_production_model()
     print(f"[export_onnx] Model built. d_model={getattr(model, 'd_model', '?')}, "
           f"n_layers={len(model.blocks)}, vocab={model.vocab_size}, "

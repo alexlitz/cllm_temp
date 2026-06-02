@@ -27,8 +27,8 @@ class TestTransformerArchitecture:
     @pytest.fixture
     def model(self):
         """Create a fresh model for testing via the unified compiler."""
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-        model, _ = compile_full_vm(n_heads=8, ffn_hidden=4096)
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+        model, _ = compile_full_vm_dynamic(n_heads=8, ffn_hidden=4096)
         return model
 
     def test_model_has_embedding(self, model):
@@ -254,8 +254,8 @@ class TestNoCustomOperations:
     @pytest.fixture
     def model(self):
         """Create model for testing via the unified compiler."""
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-        model, _ = compile_full_vm(n_heads=8, ffn_hidden=4096)
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+        model, _ = compile_full_vm_dynamic(n_heads=8, ffn_hidden=4096)
         return model
 
     def test_forward_produces_logits(self, model):

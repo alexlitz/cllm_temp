@@ -109,15 +109,15 @@ def _set_hand_weights(
     """DEPRECATED: hand-set weights are no longer supported.
 
     The legacy `vm_step.set_vm_weights()` function has been removed. The
-    unified compiler (`compile_full_vm`) is now the single bake authority,
+    unified compiler (`compile_full_vm_dynamic`) is now the single bake authority,
     and it constructs its own AutoregressiveVM rather than baking into a
-    pre-existing one. Callers should switch to `compile_full_vm(...)` and
+    pre-existing one. Callers should switch to `compile_full_vm_dynamic(...)` and
     use the returned model directly.
     """
     raise NotImplementedError(
         "WeightMode.HAND_SET is no longer supported: vm_step.set_vm_weights "
         "has been removed. Use neural_vm.unified_compiler.full_vm_compiler."
-        "compile_full_vm(...) which builds and bakes the model in one step."
+        "compile_full_vm_dynamic(...) which builds and bakes the model in one step."
     )
 
 

@@ -121,7 +121,7 @@ class TestPurityEnforcement(unittest.TestCase):
 
     @unittest.skip(
         "set_vm_weights has been removed; purity check now lives in the "
-        "compile_full_vm pipeline. This test guarded the legacy hand-set path "
+        "compile_full_vm_dynamic pipeline. This test guarded the legacy hand-set path "
         "and no longer applies."
     )
     def test_set_vm_weights_blocks_impure_model(self):

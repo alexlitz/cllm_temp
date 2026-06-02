@@ -523,13 +523,21 @@ def _tool_call_detection_rules(S: float) -> tuple[FFNRule, ...]:
     emits ``NEXT_TOOL_CALL`` (+2/S) while suppressing ``NEXT_SE`` (-2/S).
     ``b_gate=1.0`` is supplied via :class:`FFNRule`'s default
     ``gate_bias`` for ``constant_write``.
+
+    Phase 8.D: the ``CMP+2`` condition uses :func:`dim_ref` for the
+    role-meaningful ``(cmp_flag, "cascade", 2)`` family lookup -- the
+    inter-byte CMP cascade lo_eq byte that the tool-call detector reads
+    as the IS_TOOL_CALL relay signal. ``NEXT_SE`` / ``NEXT_TOOL_CALL``
+    are slot-level flags with no ``(category, role)`` binding so they
+    stay bare.
     """
     write_scale = 2.0 / S
+    cmp_lo_eq = dim_ref("cmp_flag", "cascade", 2)
     return (
         FFNRule.constant_write(
             name="tool_call_detection",
             conditions=(
-                ("CMP+2", 1.0),
+                (cmp_lo_eq, 1.0),
                 ("NEXT_SE", 1.0),
             ),
             threshold=3.0,
@@ -673,7 +681,7 @@ def make_convo_io_state_machine_ir(S: float = 100.0) -> CompilerIR:
 # ``_set_conversational_io_output_routing`` calls out of ``set_vm_weights``.
 # Both are gated by ``enable_conversational_io`` — when the flag is off the
 # bake_fn is a no-op so the op is safe to register unconditionally. The flag
-# is plumbed through ``all_core_ops`` (and from ``compile_full_vm``).
+# is plumbed through ``all_core_ops`` (and from ``compile_full_vm_dynamic``).
 #
 # L10 null terminator: writes ffn10 units starting at 1864 (above the
 # ~1854 units used by ``_set_layer10_alu``). Pinned to layer_idx=10 via

@@ -307,13 +307,13 @@ def test_production_compile_emits_no_unexpected_staleness_warnings():
     bug that warrants investigation (per
     ``docs/ARCH_LEAKAGE_FIX_PLAN.md`` Phase 3 / Agent G).
     """
-    from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
-        compile_full_vm,
+    from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+        compile_full_vm_dynamic,
     )
 
     with warnings.catch_warnings(record=True) as wlist:
         warnings.simplefilter("always")
-        compile_full_vm()
+        compile_full_vm_dynamic()
     msgs = _collect_staleness_warnings(wlist)
     assert msgs == [], (
         "Production compile emitted unexpected staleness warnings -- "

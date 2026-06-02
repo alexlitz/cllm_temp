@@ -1,6 +1,6 @@
 """Phase 7.F.2 — runtime KV eviction byte-identity gate.
 
-Acceptance criteria for the ``compile_full_vm(..., kv_eviction_policy=...)``
+Acceptance criteria for the ``compile_full_vm_dynamic(..., kv_eviction_policy=...)``
 flag wiring:
 
 1. Default policy=OFF produces byte-identical logits to no flag passed at
@@ -52,7 +52,7 @@ from neural_vm.embedding import E
 
 # Five small token-id inputs that exercise the byte-identity gate. Each is
 # a [1, seq_len] sequence of legal vocab IDs (vocab=276). They're picked to
-# stay short (<=10 tokens) so a single ``compile_full_vm`` is enough to
+# stay short (<=10 tokens) so a single ``compile_full_vm_dynamic`` is enough to
 # evaluate all of them quickly.
 _SMOKE_INPUTS = [
     torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long),
@@ -76,17 +76,17 @@ def _logits_for_model(model, token_ids: torch.Tensor) -> torch.Tensor:
 
 @pytest.fixture(scope="module")
 def model_no_flag():
-    """Baseline: ``compile_full_vm()`` with no eviction flag passed."""
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-    model, layout = compile_full_vm(disk_cache=False)
+    """Baseline: ``compile_full_vm_dynamic()`` with no eviction flag passed."""
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+    model, layout = compile_full_vm_dynamic(disk_cache=False)
     return model, layout
 
 
 @pytest.fixture(scope="module")
 def model_off():
     """``policy=OFF`` model — must match the baseline byte-for-byte."""
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-    model, layout = compile_full_vm(
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+    model, layout = compile_full_vm_dynamic(
         disk_cache=False, kv_eviction_policy=KVEvictionPolicy.OFF,
     )
     return model, layout
@@ -95,8 +95,8 @@ def model_off():
 @pytest.fixture(scope="module")
 def model_static_liveness():
     """``policy=STATIC_LIVENESS`` model with the analyzer attached."""
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-    model, layout = compile_full_vm(
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+    model, layout = compile_full_vm_dynamic(
         disk_cache=False,
         kv_eviction_policy=KVEvictionPolicy.STATIC_LIVENESS,
         kv_eviction_n_steps=8,
@@ -113,8 +113,8 @@ def model_overwrite_based():
     corpus and attaches a per-attention :class:`KVEvictionState` constructed by
     :func:`neural_vm.kv_eviction.build_state_from_overwrite_map`.
     """
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-    model, layout = compile_full_vm(
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+    model, layout = compile_full_vm_dynamic(
         disk_cache=False,
         kv_eviction_policy=KVEvictionPolicy.OVERWRITE_BASED,
         kv_eviction_n_steps=8,
@@ -128,7 +128,7 @@ def model_overwrite_based():
 
 
 def test_default_off_matches_no_flag(model_no_flag, model_off):
-    """``compile_full_vm()`` (no flag) and ``compile_full_vm(policy=OFF)``
+    """``compile_full_vm_dynamic()`` (no flag) and ``compile_full_vm_dynamic(policy=OFF)``
     must produce byte-identical logits for every smoke input."""
     base_model, base_layout = model_no_flag
     off_model, off_layout = model_off

@@ -16,10 +16,10 @@ if _ROOT not in sys.path:
 
 import torch
 from c4_release.neural_vm.efficient_alu_divmod_split import FlattenedDivMod
-from c4_release.neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
 print(">>> Compiling full VM to obtain dim_positions...")
-model, layout = compile_full_vm()
+model, layout = compile_full_vm_dynamic()
 dim = layout.dim_positions
 print(f"  d_model={layout.d_model}, n_layers={layout.n_layers}")
 

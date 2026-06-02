@@ -39,8 +39,8 @@ class SpeculativeRunner:
         # Create transformer model via the unified compiler. The compiler is
         # the single bake authority; d_model/n_layers come from the operation
         # set. n_heads/ffn_hidden/max_seq_len are passed through.
-        from .unified_compiler.full_vm_compiler import compile_full_vm
-        self.model, _layout = compile_full_vm(
+        from .unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+        self.model, _layout = compile_full_vm_dynamic(
             n_heads=n_heads,
             ffn_hidden=ffn_hidden,
             max_seq_len=max_seq_len,

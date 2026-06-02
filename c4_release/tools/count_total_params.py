@@ -2,20 +2,20 @@
 """Count total non-zero parameters in Neural VM with efficient vs lookup ALU."""
 
 import torch
-from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
 print('Building models and counting parameters...')
 print('=' * 70)
 
 # Efficient model
 print('\nBuilding model with EFFICIENT ALU...')
-model_eff, _ = compile_full_vm(
+model_eff, _ = compile_full_vm_dynamic(
     alu_mode='efficient', n_heads=8, ffn_hidden=4096, max_seq_len=512
 )
 
 # Lookup model
 print('Building model with LOOKUP tables...')
-model_lookup, _ = compile_full_vm(
+model_lookup, _ = compile_full_vm_dynamic(
     alu_mode='lookup', n_heads=8, ffn_hidden=4096, max_seq_len=512
 )
 

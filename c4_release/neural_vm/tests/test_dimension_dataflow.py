@@ -110,8 +110,8 @@ class TestDimensionContracts:
 
     def test_no_unauthorized_writes(self):
         """No layer should write to reserved dimensions without authorization."""
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-        model, _ = compile_full_vm()
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+        model, _ = compile_full_vm_dynamic()
 
         violations = DimensionContract.validate_model(model)
 
@@ -126,8 +126,8 @@ class TestDimensionContracts:
 
     def test_contract_validation_runs(self):
         """Test that contract validation runs without errors."""
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-        model, _ = compile_full_vm()
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+        model, _ = compile_full_vm_dynamic()
 
         # Should not raise exceptions
         violations = DimensionContract.validate_model(model)
@@ -138,8 +138,8 @@ class TestDimensionContracts:
 
     def test_expected_writers_configured(self):
         """Test that expected writers are configured in model."""
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-        model, _ = compile_full_vm()
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+        model, _ = compile_full_vm_dynamic()
 
         # Check if Layer 3 Head 1 writes to AX_CARRY
         layer3 = model.blocks[3]

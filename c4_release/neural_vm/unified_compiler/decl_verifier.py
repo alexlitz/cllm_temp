@@ -45,7 +45,7 @@ Usage:
     from c4_release.neural_vm.unified_compiler.decl_verifier import (
         verify_claims_static,
     )
-    report = verify_claims_static()  # uses compile_full_vm defaults
+    report = verify_claims_static()  # uses compile_full_vm_dynamic defaults
     if report.has_errors():
         print(report.format())
         raise AssertionError("declaration drift")
@@ -1674,7 +1674,7 @@ def verify_claims_static(
     strict_mode: bool = False,
     registry: Optional[object] = None,
 ) -> StaticVerificationReport:
-    """Run static claim verification on every annotated op in compile_full_vm.
+    """Run static claim verification on every annotated op in compile_full_vm_dynamic.
 
     Algorithm (single-pass instrumented bake):
         1. Build the layout exactly as production does.
@@ -1801,7 +1801,7 @@ def _build_layout_only(
     enable_tool_calling: bool,
     n_heads: int,
 ):
-    """Same op-registration logic as ``compile_full_vm`` but returns ONLY the
+    """Same op-registration logic as ``compile_full_vm_dynamic`` but returns ONLY the
     compiled layout. Skips the model build + bake pass.
     """
     from .migrated_ops import (
@@ -1948,12 +1948,12 @@ def verify_produces_consumes_dynamic(
     test, not a synthetic 1-instruction probe. The verifier surfaces
     discrepancies via per-op notes; callers decide how to escalate.
     """
-    from .full_vm_compiler import compile_full_vm
+    from .full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     report = DynamicVerificationReport()
 
     try:
-        model, layout = compile_full_vm(
+        model, layout = compile_full_vm_dynamic(
             S=S,
             alu_mode=alu_mode,
             enable_conversational_io=enable_conversational_io,
@@ -1961,7 +1961,7 @@ def verify_produces_consumes_dynamic(
         )
     except Exception as exc:
         report.results.append(DynamicVerificationResult(
-            op_name="<compile_full_vm>",
+            op_name="<compile_full_vm_dynamic>",
             notes=[f"compile failed: {exc!r}"],
         ))
         return report
@@ -2463,7 +2463,7 @@ def verify_produces_consumes_multistep(
 
     Args:
         model, layout: optional pre-built model + layout to reuse. When
-            either is None, both are built via ``compile_full_vm`` using
+            either is None, both are built via ``compile_full_vm_dynamic`` using
             the keyword config args below. Reusing a model is the common
             case for tests that want to run multiple probes (and saves
             ~70s of bake time per call).
@@ -2493,9 +2493,9 @@ def verify_produces_consumes_multistep(
     )
 
     if model is None or layout is None:
-        from .full_vm_compiler import compile_full_vm
+        from .full_vm_compiler_dynamic import compile_full_vm_dynamic
         try:
-            model, layout = compile_full_vm(
+            model, layout = compile_full_vm_dynamic(
                 S=S,
                 alu_mode=alu_mode,
                 enable_conversational_io=enable_conversational_io,
@@ -2503,7 +2503,7 @@ def verify_produces_consumes_multistep(
             )
         except Exception as exc:
             report.results.append(MultistepVerificationResult(
-                op_name="<compile_full_vm>",
+                op_name="<compile_full_vm_dynamic>",
                 notes=[f"compile failed: {exc!r}"],
             ))
             return report
@@ -2860,8 +2860,8 @@ def verify_alibi_consistency(
                 else:
                     layout = built
             else:
-                from .full_vm_compiler import compile_full_vm
-                model, layout = compile_full_vm(
+                from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+                model, layout = compile_full_vm_dynamic(
                     S=S,
                     alu_mode=alu_mode,
                     enable_conversational_io=enable_conversational_io,
@@ -3065,8 +3065,8 @@ def verify_postconditions(
         program = list(_ADD_CASCADE_PROGRAM)
     if model is None or layout is None:
         try:
-            from .full_vm_compiler import compile_full_vm
-            model, layout = compile_full_vm(
+            from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+            model, layout = compile_full_vm_dynamic(
                 S=S,
                 alu_mode=alu_mode,
                 enable_conversational_io=enable_conversational_io,
@@ -3202,8 +3202,8 @@ def verify_step_idx_gating(
         program = list(_ADD_CASCADE_PROGRAM)
     if model is None or layout is None:
         try:
-            from .full_vm_compiler import compile_full_vm
-            model, layout = compile_full_vm(
+            from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+            model, layout = compile_full_vm_dynamic(
                 S=S,
                 alu_mode=alu_mode,
                 enable_conversational_io=enable_conversational_io,

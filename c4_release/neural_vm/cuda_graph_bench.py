@@ -27,9 +27,9 @@ import torch
 
 
 def _build_model():
-    from c4_release.neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
-    model, _ = compile_full_vm()
+    model, _ = compile_full_vm_dynamic()
     if torch.cuda.is_available():
         model = model.cuda()
     model.eval()

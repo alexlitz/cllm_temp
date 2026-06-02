@@ -1,7 +1,7 @@
 """Per-op audit harness for the 4 wide-ALU composites at L10/L11/L12/L13.
 
 Inventory of "wide-ALU composites" runtime-installed via post_op attach
-ops in lookup mode (the default ``compile_full_vm`` build):
+ops in lookup mode (the default ``compile_full_vm_dynamic`` build):
 
   - L10.post_ops[0] = ``ALUAndOrXor``       (bitwise AND/OR/XOR)
   - L10.post_ops[-1] = ``FlattenedDivMod``  (DIV/MOD long-division pipeline)

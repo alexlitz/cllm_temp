@@ -2,7 +2,7 @@
 ``ModelLayout`` after :func:`compile_full_vm_dynamic`.
 
 Two coverage layers (the byte-identity layer was removed in Phase
-8.G.3 alongside the static ``compile_full_vm`` body):
+8.G.3 alongside the static ``compile_full_vm_dynamic`` body):
 
 1. **Reachability** — every allocator is present on the returned layout
    under canonical attribute names, regardless of whether the bake was

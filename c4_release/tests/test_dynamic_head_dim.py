@@ -24,7 +24,7 @@ Covers:
    shorter head.
 
 Per the task brief these are unit-level checks. We don't gate per-commit
-byte-identity of ``compile_full_vm`` at non-default settings.
+byte-identity of ``compile_full_vm_dynamic`` at non-default settings.
 """
 
 from __future__ import annotations
@@ -250,7 +250,7 @@ def test_allocator_head_dim_at_returns_explicit_value():
 # ----------------------------------------------------------------------
 # 5. L8 integration smoke: half-width head bakes to the expected rows.
 #    Per the task brief, this is the in-process integration check —
-#    not gated against compile_full_vm byte-identity at non-default
+#    not gated against compile_full_vm_dynamic byte-identity at non-default
 #    settings.
 # ----------------------------------------------------------------------
 def test_l8_half_width_head_integration():
@@ -311,7 +311,7 @@ def test_l8_half_width_head_integration():
 
 # ----------------------------------------------------------------------
 # 6. NOTE FOR INTEGRATION: at-default (no spec sets head_dim) the public
-# bake site falls through to ``head_idx * HD`` so ``compile_full_vm()``
+# bake site falls through to ``head_idx * HD`` so ``compile_full_vm_dynamic()``
 # stays byte-identical against the pre-change baseline. Per the brief we
 # don't gate that here; the unit-level checks above are the contract.
 # ----------------------------------------------------------------------

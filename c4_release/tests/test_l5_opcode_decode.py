@@ -154,7 +154,7 @@ def test_l5_opcode_decode_symbolic_forward(l5_opcode_decode_ffn, op_name, lo, hi
     x[0, 0, dim_positions["OPCODE_BYTE_LO"] + lo] = 1.0
     x[0, 0, dim_positions["OPCODE_BYTE_HI"] + hi] = 1.0
     x[0, 0, dim_positions["MARK_AX"]] = 1.0
-    # CONST = 1.0 is the model-wide convention (see ``compile_full_vm``);
+    # CONST = 1.0 is the model-wide convention (see ``compile_full_vm_dynamic``);
     # the gated FFN rules read it implicitly via threshold subtraction.
     if "CONST" in dim_positions:
         x[0, 0, dim_positions["CONST"]] = 1.0

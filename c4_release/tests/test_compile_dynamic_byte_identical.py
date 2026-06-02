@@ -1,6 +1,6 @@
 """Scheduler-invariant tests for the dynamic compile path (B11).
 
-The historical slow byte-identity tests (which ran ``compile_full_vm``
+The historical slow byte-identity tests (which ran ``compile_full_vm_dynamic``
 under the legacy static phase-pruning body and diffed it against
 ``compile_full_vm_dynamic``) were removed in Phase 8.G.3 alongside the
 static body itself. The fast scheduler invariants below — schedule
@@ -140,7 +140,7 @@ def test_dynamic_schedule_cycle_members_exist_and_phase_pruning_breaks_them():
 # ---------------------------------------------------------------------------
 #
 # Phase 8.G.3 deleted the byte-identity slow tests that previously ran
-# ``compile_full_vm_dynamic`` against the legacy ``compile_full_vm``
+# ``compile_full_vm_dynamic`` against the legacy ``compile_full_vm_dynamic``
 # static body via ``compare_compile_paths``. The static body is gone, so
 # the diff has no left operand to compare against. The dep-graph
 # regression surface lives in the fast scheduler-invariant tests above.

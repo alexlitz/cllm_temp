@@ -145,7 +145,7 @@ def test_declarations_only_dispatch_skips_topology_anchor():
 
 
 def test_compile_full_vm_declarations_only_builds_authoritative_path():
-    model, layout = fvc.compile_full_vm(declarations_only=True, disk_cache=False)
+    model, layout = fvc.compile_full_vm_dynamic(declarations_only=True, disk_cache=False)
 
     assert model.blocks
     assert layout.d_model > 0
@@ -155,7 +155,7 @@ def test_compile_full_vm_declarations_only_builds_authoritative_path():
 def test_compile_full_vm_declarations_only_env_selects_authoritative_path(monkeypatch):
     monkeypatch.setenv("C4_DECLARATIONS_ONLY_BAKE", "1")
 
-    model, layout = fvc.compile_full_vm(disk_cache=False)
+    model, layout = fvc.compile_full_vm_dynamic(disk_cache=False)
 
     assert model.blocks
     assert layout.d_model > 0
@@ -274,7 +274,7 @@ def test_compile_full_vm_env_gate_fails_before_model_bake(monkeypatch):
     monkeypatch.setattr(fvc, "all_alu_postop_attach_ops", lambda *args, **kwargs: [])
 
     with pytest.raises(fvc.DeclarativeBakeRequirementError) as exc:
-        fvc.compile_full_vm(disk_cache=True)
+        fvc.compile_full_vm_dynamic(disk_cache=True)
 
     assert "legacy_bake" in str(exc.value)
 

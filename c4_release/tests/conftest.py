@@ -476,7 +476,7 @@ def _batched_pure_neural_runner_model(_pure_neural_runner_model):
     """Session-scoped BatchedPureNeuralRunner sharing the pure_neural model.
 
     Wraps the same compiled AutoregressiveVM as `pure_neural_runner` so the
-    expensive bake (`compile_full_vm` + `set_vm_weights`) happens once.
+    expensive bake (`compile_full_vm_dynamic` + `set_vm_weights`) happens once.
     """
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
     return BatchedPureNeuralRunner(model_runner=_pure_neural_runner_model)

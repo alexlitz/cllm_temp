@@ -1,9 +1,9 @@
-"""Determinism tests for ``compile_full_vm``.
+"""Determinism tests for ``compile_full_vm_dynamic``.
 
 After the compiler migration every weight in the model is supposed to be baked
 by an ``Operation`` instance registered in ``all_core_ops()`` (plus the
 L11/L12 mul + L10 divmod composite ops registered explicitly in
-``compile_full_vm``). The goal: ``compile_full_vm`` should be a pure function
+``compile_full_vm_dynamic``). The goal: ``compile_full_vm_dynamic`` should be a pure function
 of its arguments — calling it twice should yield identical ``state_dict()``s.
 
 If this fails it means some bake_fn has hidden non-determinism (random init
@@ -14,7 +14,7 @@ op list, etc.).
 import pytest
 import torch
 
-from c4_release.neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
 
 def _compare_state_dicts(sd1, sd2):
@@ -37,8 +37,8 @@ def _compare_state_dicts(sd1, sd2):
 
 def test_compile_full_vm_is_deterministic():
     """Default-arg compile should be bit-identical across two calls."""
-    m1, _ = compile_full_vm()
-    m2, _ = compile_full_vm()
+    m1, _ = compile_full_vm_dynamic()
+    m2, _ = compile_full_vm_dynamic()
     sd1 = m1.state_dict()
     sd2 = m2.state_dict()
     assert sd1.keys() == sd2.keys(), f"keys differ: {set(sd1) ^ set(sd2)}"
@@ -51,8 +51,8 @@ def test_compile_full_vm_is_deterministic():
 
 def test_compile_full_vm_is_deterministic_efficient():
     """``alu_mode='efficient'`` compile should also be bit-identical."""
-    m1, _ = compile_full_vm(alu_mode="efficient")
-    m2, _ = compile_full_vm(alu_mode="efficient")
+    m1, _ = compile_full_vm_dynamic(alu_mode="efficient")
+    m2, _ = compile_full_vm_dynamic(alu_mode="efficient")
     sd1 = m1.state_dict()
     sd2 = m2.state_dict()
     assert sd1.keys() == sd2.keys(), f"keys differ: {set(sd1) ^ set(sd2)}"
@@ -62,8 +62,8 @@ def test_compile_full_vm_is_deterministic_efficient():
 
 def test_compile_full_vm_is_deterministic_conversational_io():
     """Conversational-IO compile should be bit-identical."""
-    m1, _ = compile_full_vm(enable_conversational_io=True)
-    m2, _ = compile_full_vm(enable_conversational_io=True)
+    m1, _ = compile_full_vm_dynamic(enable_conversational_io=True)
+    m2, _ = compile_full_vm_dynamic(enable_conversational_io=True)
     sd1 = m1.state_dict()
     sd2 = m2.state_dict()
     assert sd1.keys() == sd2.keys(), f"keys differ: {set(sd1) ^ set(sd2)}"
@@ -73,8 +73,8 @@ def test_compile_full_vm_is_deterministic_conversational_io():
 
 def test_compile_full_vm_is_deterministic_tool_calling():
     """Tool-calling compile should be bit-identical."""
-    m1, _ = compile_full_vm(enable_tool_calling=True)
-    m2, _ = compile_full_vm(enable_tool_calling=True)
+    m1, _ = compile_full_vm_dynamic(enable_tool_calling=True)
+    m2, _ = compile_full_vm_dynamic(enable_tool_calling=True)
     sd1 = m1.state_dict()
     sd2 = m2.state_dict()
     assert sd1.keys() == sd2.keys(), f"keys differ: {set(sd1) ^ set(sd2)}"

@@ -50,7 +50,7 @@ def make_layer5_user_input_gather_op(enable: bool = False) -> Operation:
         # weights for the USER_INPUT_START locator and byte gather. Requires:
         #   1. Dim registry alloc for MARK_USER_INPUT_START, MARK_USER_INPUT_END,
         #      STDIN_BYTE_LO (16 dims), STDIN_BYTE_HI (16 dims).
-        #   2. L5 attention widened from 8 to 10 heads in compile_full_vm.
+        #   2. L5 attention widened from 8 to 10 heads in compile_full_vm_dynamic.
         #   3. Embedding bake adds MARK_USER_INPUT_START=1.0 on token 269,
         #      MARK_USER_INPUT_END=1.0 on token 270.
         #   4. ALiBi position-bias setup for Head B's offset arithmetic

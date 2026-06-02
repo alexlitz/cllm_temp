@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.constants import IMMEDIATE_SIZE, PADDING_SIZE
 from neural_vm.embedding import Opcode
-from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 from neural_vm.unified_compiler.symbolic_program import (
     SymbolicDeclarativeProgramRunner,
 )
@@ -357,7 +357,7 @@ def trace_full_model_add_residual(
     stream: TextIO = sys.stderr,
 ) -> list[AddResidualSnapshot]:
     context, target_pos, metadata = build_teacher_forced_add_context()
-    model, _layout = compile_full_vm(
+    model, _layout = compile_full_vm_dynamic(
         alu_mode="efficient",
         declarations_only=True,
         max_seq_len=max(4096, len(context) + 8),

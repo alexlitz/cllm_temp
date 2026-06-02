@@ -16,7 +16,7 @@ Design constraints
   same decisions when given the same step index.
 * **Byte-identity by default.** :data:`KVEvictionPolicy.OFF` is the
   default; no caller observes any change unless the policy is opted in
-  via the ``compile_full_vm`` flag.
+  via the ``compile_full_vm_dynamic`` flag.
 * **Safe-by-construction.** ``apply_eviction`` only zeros rows that the
   analyzer flagged as guaranteed dead. If the analyzer is conservative
   the worst outcome is "no rows zeroed". The byte-identity gate in

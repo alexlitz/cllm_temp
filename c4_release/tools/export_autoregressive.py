@@ -299,8 +299,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     import torch
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
-    model, _ = compile_full_vm()
+    model, _ = compile_full_vm_dynamic()
     model.eval()
     export_autoregressive(model, args.output, sparse=not args.dense)

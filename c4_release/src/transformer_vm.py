@@ -296,7 +296,7 @@ class C4TransformerVM(nn.Module):
                 ffn_hidden=self.config.ffn_hidden,
                 max_seq_len=self.config.max_seq_len,
             )
-            # AutoregressiveVMRunner builds and bakes weights via compile_full_vm.
+            # AutoregressiveVMRunner builds and bakes weights via compile_full_vm_dynamic.
             self._runner.model.compact(block_size=32)
             self._runner.model.compact_moe()
 

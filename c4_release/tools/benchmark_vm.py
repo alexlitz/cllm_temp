@@ -15,7 +15,7 @@ from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.speculative import DraftVM
 
 # AutoregressiveVMRunner builds the model via the unified compiler
-# (compile_full_vm). No explicit set_vm_weights call is needed.
+# (compile_full_vm_dynamic). No explicit set_vm_weights call is needed.
 
 # Test bytecode: 6 * 7 = 42
 BYTECODE_MUL = [

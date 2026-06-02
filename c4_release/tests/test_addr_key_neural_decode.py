@@ -4,7 +4,7 @@ Verifies the new ``make_layer14_addr_key_neural_decode_op`` op
 (see ``neural_vm/unified_compiler/ops/l14_ops.py``) at two levels:
 
 1. **Registration / gate**: the op is in ``all_core_ops()``, lands at
-   layer_idx=14 after ``compile_full_vm()``, and is a no-op when
+   layer_idx=14 after ``compile_full_vm_dynamic()``, and is a no-op when
    ``enable=False`` (so existing tests stay byte-identical).
 
 2. **Bake parity**: with ``enable=True``, the FFN produces the same
@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def test_addr_key_decode_op_is_registered():
     """The new op is in all_core_ops() and lands at layer 14 after compile."""
     from neural_vm.unified_compiler.ops.all_core_ops import all_core_ops
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     ops = all_core_ops()
     found = [op for op in ops if op.name == "layer14_addr_key_neural_decode"]
@@ -46,7 +46,7 @@ def test_addr_key_decode_op_is_registered():
     assert op.writes == {"ADDR_KEY"}
 
     # Verify it lands at L14 in the layout after compile.
-    _, layout = compile_full_vm()
+    _, layout = compile_full_vm_dynamic()
     block_ops_by_name = {bo.name: bo for bo in layout.block_ops}
     assert "layer14_addr_key_neural_decode" in block_ops_by_name
 
@@ -65,9 +65,9 @@ def test_addr_key_decode_op_is_active_when_enabled():
     by its ``_l14_unit_counter`` attribute set by the L14 cleanup ops
     chain rather than indexing ``model.blocks[14]`` directly.
     """
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
-    model, layout = compile_full_vm()
+    model, layout = compile_full_vm_dynamic()
     # Find the physical block whose FFN owns the L14 cleanup chain.
     ffn14 = None
     for blk in model.blocks:
@@ -183,7 +183,7 @@ def test_addr_key_decode_bake_matches_inject_mem_metadata(
     matching what L13 produces at a MEM val byte position, and verifies the
     output ADDR_KEY band one-hots match the Python injector exactly.
     """
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
     from neural_vm.unified_compiler.ops.l14_ops import (
         _bake_addr_key_neural_decode,
     )
@@ -191,7 +191,7 @@ def test_addr_key_decode_bake_matches_inject_mem_metadata(
 
     # Use the compiled model to get the canonical dim_positions; the bake
     # function reads them via _as_setdim_proxy.
-    _, layout = compile_full_vm()
+    _, layout = compile_full_vm_dynamic()
     dim_positions = layout.dim_positions
     d_model = layout.d_model
 

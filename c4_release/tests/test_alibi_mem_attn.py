@@ -4,7 +4,7 @@ These tests exercise the new ``make_layer9_alibi_mem_attn_op`` op
 (see ``neural_vm/unified_compiler/ops/l9_ops.py``) at two levels:
 
 1. **Registration**: the op is in ``all_core_ops()``, lands at layer_idx=9
-   after ``compile_full_vm()``, and is a no-op when ``enable=False`` (so
+   after ``compile_full_vm_dynamic()``, and is a no-op when ``enable=False`` (so
    existing tests are byte-identical).
 
 2. **ALiBi slope micro-validation**: a focused construction that proves the
@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def test_alibi_mem_attn_op_is_registered():
     """The new op is in all_core_ops() and lands at layer 9 after compile."""
     from neural_vm.unified_compiler.ops.all_core_ops import all_core_ops
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     ops = all_core_ops()
     found = [op for op in ops if op.name == "layer9_alibi_mem_attn"]
@@ -44,7 +44,7 @@ def test_alibi_mem_attn_op_is_registered():
     assert op.kind == "block"
 
     # Verify it lands at L9 in the layout after compile.
-    _, layout = compile_full_vm()
+    _, layout = compile_full_vm_dynamic()
     block_ops_by_name = {bo.name: bo for bo in layout.block_ops}
     assert "layer9_alibi_mem_attn" in block_ops_by_name
     placed = block_ops_by_name["layer9_alibi_mem_attn"]
@@ -60,9 +60,9 @@ def test_alibi_mem_attn_op_is_noop_when_disabled():
     breaking existing tests; the op is registered for dep-graph stability
     but its bake is a guard-clause early return when enable=False.
     """
-    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
-    model, _ = compile_full_vm()
+    model, _ = compile_full_vm_dynamic()
     attn9 = model.blocks[9].attn
     HD = attn9.W_q.shape[0] // attn9.num_heads
     head = 2

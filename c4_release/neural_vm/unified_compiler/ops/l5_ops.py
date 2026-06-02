@@ -98,7 +98,7 @@ def make_layer5_fetch_op() -> Operation:
 
     Dispatched as a block op pinned to layer_idx=5 so the bake hits the same
     transformer block (block[5].attn) the legacy path used. Using kind="block"
-    routes through compile_full_vm's block_ops dispatch even when legacy_bake
+    routes through compile_full_vm_dynamic's block_ops dispatch even when legacy_bake
     is present, ensuring block[5] receives the L5 fetch logic for pure_neural
     execution. The companion `_layer5_fetch_dep_anchor` op declares the same
     reads/writes via kind="attn" so the LayerCompiler's dep graph still
@@ -409,7 +409,7 @@ def make_opcode_decode_ffn_op() -> Operation:
 
     Dispatched as a block op pinned to layer_idx=5 so the bake hits the same
     transformer block (block[5].ffn) the legacy path used. Using kind="block"
-    routes through compile_full_vm's block_ops dispatch even when legacy_bake
+    routes through compile_full_vm_dynamic's block_ops dispatch even when legacy_bake
     is present, ensuring block[5] receives the opcode decode logic for
     pure_neural execution. The companion `_opcode_decode_ffn_dep_anchor` op
     declares the same reads/writes via kind="ffn" so the LayerCompiler's dep

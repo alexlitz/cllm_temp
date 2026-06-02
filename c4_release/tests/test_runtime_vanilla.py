@@ -3,7 +3,7 @@
 This test enforces the directive: runtime = just attention + FFN.
 
 It runs `verify_runtime_is_vanilla(model)` on models built via
-`compile_full_vm` in each supported mode (default `lookup`, `efficient`, and
+`compile_full_vm_dynamic` in each supported mode (default `lookup`, `efficient`, and
 `enable_conversational_io=True`) and FAILS if any block contains a module
 class that is NOT in either:
   - the canonical vanilla set (`PureFFN` / `FlattenedPureFFN` / `nn.Linear`
@@ -28,7 +28,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm  # noqa: E402
+from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic  # noqa: E402
 from neural_vm.unified_compiler.runtime_audit import (  # noqa: E402
     verify_runtime_is_vanilla,
 )
@@ -130,7 +130,7 @@ def _assert_audit_clean_or_allowlisted(model, *, mode_label: str):
 class TestRuntimeVanilla:
     """Runtime vanilla audit gate.
 
-    Each test builds a model via `compile_full_vm` with a different mode and
+    Each test builds a model via `compile_full_vm_dynamic` with a different mode and
     asserts that the audit reports no violations OTHER than those captured by
     the allowlist baseline. This means:
       - existing non-vanilla modules (HybridALUBlock split residue, ALU
@@ -139,18 +139,18 @@ class TestRuntimeVanilla:
     """
 
     def test_compile_full_vm_default_mode_audit(self):
-        """Default `compile_full_vm()` produces no non-allowlisted violations."""
-        model, _layout = compile_full_vm()
+        """Default `compile_full_vm_dynamic()` produces no non-allowlisted violations."""
+        model, _layout = compile_full_vm_dynamic()
         _assert_audit_clean_or_allowlisted(model, mode_label="default (lookup)")
 
     def test_compile_full_vm_efficient_mode_audit(self):
-        """`compile_full_vm(alu_mode='efficient')` produces no non-allowlisted violations."""
-        model, _layout = compile_full_vm(alu_mode="efficient")
+        """`compile_full_vm_dynamic(alu_mode='efficient')` produces no non-allowlisted violations."""
+        model, _layout = compile_full_vm_dynamic(alu_mode="efficient")
         _assert_audit_clean_or_allowlisted(model, mode_label="efficient")
 
     def test_compile_full_vm_conversational_io_audit(self):
-        """`compile_full_vm(enable_conversational_io=True)` produces no non-allowlisted violations."""
-        model, _layout = compile_full_vm(enable_conversational_io=True)
+        """`compile_full_vm_dynamic(enable_conversational_io=True)` produces no non-allowlisted violations."""
+        model, _layout = compile_full_vm_dynamic(enable_conversational_io=True)
         _assert_audit_clean_or_allowlisted(model, mode_label="conversational_io")
 
 

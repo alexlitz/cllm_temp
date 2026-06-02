@@ -292,10 +292,10 @@ class TestDefaultContracts(unittest.TestCase):
 
 class TestIntegration(unittest.TestCase):
     def test_compile_full_vm_runs_validation(self):
-        """compile_full_vm should complete without raising (replaces the legacy
+        """compile_full_vm_dynamic should complete without raising (replaces the legacy
         ``set_vm_weights`` validation gate)."""
-        from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
-        compile_full_vm()  # should not raise
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+        compile_full_vm_dynamic()  # should not raise
 
 
 if __name__ == "__main__":

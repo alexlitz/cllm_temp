@@ -31,7 +31,7 @@ from types import SimpleNamespace
 
 import torch
 from neural_vm.vm_step import AutoregressiveAttention, _SetDim
-from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 from neural_vm.unified_compiler.ops.l6_ops import (
     make_layer6_attn_bake_op,
     make_layer6_relay_heads_bake_op,
@@ -48,7 +48,7 @@ def test_ax_carry_preservation():
     print("="*80)
     print("\nTest 1: AX_CARRY preservation at AX marker\n")
 
-    model, _ = compile_full_vm()
+    model, _ = compile_full_vm_dynamic()
 
     layer6 = model.blocks[6]
     attn6 = layer6.attn
@@ -144,7 +144,7 @@ def test_head6_no_conflict():
     print("="*80)
     print("\nTest 3: Head 6 configuration consistency\n")
 
-    model, _ = compile_full_vm()
+    model, _ = compile_full_vm_dynamic()
 
     layer6 = model.blocks[6]
     attn6 = layer6.attn

@@ -23,7 +23,7 @@ from neural_vm.fast_runner import SpeculativeRunner
 from neural_vm.speculative import DraftVM
 
 # AutoregressiveVMRunner builds the model via the unified compiler
-# (compile_full_vm). No explicit set_vm_weights call is needed.
+# (compile_full_vm_dynamic). No explicit set_vm_weights call is needed.
 
 # Test bytecode: fibonacci(10) = 55
 FIB_BYTECODE = """

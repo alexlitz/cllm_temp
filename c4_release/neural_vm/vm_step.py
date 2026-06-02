@@ -2245,6 +2245,13 @@ class _SetDim:
     # the dynamic scheduler dep graph. See shared.py ``_ALIAS_OF``.
     # No ops migrated in this pass — alias is infrastructure only.
     ADDR_B0_LO_PREV_STEP = 12  # alias of ADDR_B0_LO
+    # Phase 8.A (PREV_STEP infrastructure): ADDR_B1/B2_LO_PREV_STEP aliases
+    # (same numeric base as the respective ADDR_B1/B2_LO writers) let
+    # cross-step readers (e.g. ``layer8_mem_to_alu``) declare their reads
+    # as prev-step semantically, breaking back-edges from L13 / L12-anchor
+    # writers in the dynamic scheduler dep graph. No bake-position change.
+    ADDR_B1_LO_PREV_STEP = 28  # alias of ADDR_B1_LO
+    ADDR_B2_LO_PREV_STEP = 44  # alias of ADDR_B2_LO
 
     # --- Opcode byte staging (L5 head 1 → L5 FFN decode) ---
     # Separate from ALU_LO/HI to avoid residual collision with L7 operand gather
