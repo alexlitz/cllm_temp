@@ -151,11 +151,29 @@ def _layer3_ffn_rules(S: float) -> tuple:
     ``(marker_name, weight)`` conditions stay structural -- those
     are guard terms in the up-branch dot product, not role-meaningful
     gate dims (the L8 pilot preserved that convention).
+
+    Phase 8.D follow-up: ``BYTE_INDEX_<n>`` conditions across the
+    SP/BP/PC/AX/MEM/STACK0/NEXT_STACK0 byte-default and locality
+    rules use :func:`dim_ref` for the ``(byte_index, "<n>")`` family
+    lookup -- each tuple condition names the byte-position role
+    rather than the bare slot label. Byte-identical via DimRef.parse
+    (the ``+0`` suffix produced by dim_ref resolves to the same
+    cell). Structural ``OUTPUT_LO/HI+<k>`` / ``EMBED_LO/HI+<k>`` /
+    ``H<n>+<idx>`` offsets stay bare.
     """
     first_pc = PC_OFFSET + INSTR_WIDTH
     pc_lo = first_pc & 0xF
     pc_hi = (first_pc >> 4) & 0xF
     gate_mark_pc = dim_ref("marker", "PC")
+    # Phase 8.D follow-up: pre-bind the four (byte_index, role) refs so
+    # downstream rule conditions name the byte-position role lookup
+    # instead of the bare ``BYTE_INDEX_<n>`` slot string.
+    _BYTE_INDEX = {
+        0: dim_ref("byte_index", "0"),
+        1: dim_ref("byte_index", "1"),
+        2: dim_ref("byte_index", "2"),
+        3: dim_ref("byte_index", "3"),
+    }
     rules = []
 
     # --- PC FIRST-STEP DEFAULT (units 0-3) ---
@@ -229,27 +247,27 @@ def _layer3_ffn_rules(S: float) -> tuple:
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.sp_byte_idx_{byte_idx}_default_lo",
             conditions=((f"H1+{_SP_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.sp_byte_idx_{byte_idx}_default_hi",
             conditions=((f"H1+{_SP_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
     rules.append(FFNRule.constant_write(
         name="layer3_ffn.sp_byte_1_first_step_lo",
-        conditions=((f"H1+{_SP_I}", 1.0), ("BYTE_INDEX_1", 1.0),
+        conditions=((f"H1+{_SP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_LO+1", 2.0 / S),),
     ))
     rules.append(FFNRule.constant_write(
         name="layer3_ffn.sp_byte_1_first_step_hi",
-        conditions=((f"H1+{_SP_I}", 1.0), ("BYTE_INDEX_1", 1.0),
+        conditions=((f"H1+{_SP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_HI+0", 2.0 / S),),
@@ -274,27 +292,27 @@ def _layer3_ffn_rules(S: float) -> tuple:
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.bp_byte_idx_{byte_idx}_default_lo",
             conditions=((f"H1+{_BP_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.bp_byte_idx_{byte_idx}_default_hi",
             conditions=((f"H1+{_BP_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
     rules.append(FFNRule.constant_write(
         name="layer3_ffn.bp_byte_1_first_step_lo",
-        conditions=((f"H1+{_BP_I}", 1.0), ("BYTE_INDEX_1", 1.0),
+        conditions=((f"H1+{_BP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_LO+1", 2.0 / S),),
     ))
     rules.append(FFNRule.constant_write(
         name="layer3_ffn.bp_byte_1_first_step_hi",
-        conditions=((f"H1+{_BP_I}", 1.0), ("BYTE_INDEX_1", 1.0),
+        conditions=((f"H1+{_BP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_HI+0", 2.0 / S),),
@@ -305,14 +323,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.pc_byte_{byte_idx}_default_lo",
             conditions=((f"H1+{_PC_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.pc_byte_{byte_idx}_default_hi",
             conditions=((f"H1+{_PC_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
@@ -322,14 +340,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.ax_byte_{byte_idx}_default_lo",
             conditions=((f"H1+{_AX_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.ax_byte_{byte_idx}_default_hi",
             conditions=((f"H1+{_AX_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
@@ -355,14 +373,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.mem_byte_{byte_idx}_default_lo",
             conditions=((f"H1+{_MEM_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.mem_byte_{byte_idx}_default_hi",
             conditions=((f"H1+{_MEM_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
@@ -374,7 +392,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.stack0_byte_{byte_idx}_default_lo",
             conditions=((f"H4+{_BP_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0),
+                        (_BYTE_INDEX[byte_idx], 1.0),
                         (f"H1+{_BP_I}", -1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
@@ -382,7 +400,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
         rules.append(FFNRule.constant_write(
             name=f"layer3_ffn.stack0_byte_{byte_idx}_default_hi",
             conditions=((f"H4+{_BP_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0),
+                        (_BYTE_INDEX[byte_idx], 1.0),
                         (f"H1+{_BP_I}", -1.0)),
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
@@ -451,7 +469,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
     rules.append(FFNRule.gated_write(
         name="layer3_ffn.next_stack0_locality_byte_idx_3",
         conditions=((f"H4+{_BP_I}", 1.0),
-                    ("BYTE_INDEX_3", 1.0),
+                    (_BYTE_INDEX[3], 1.0),
                     (f"H0+{_BP_I}", -1000.0)),
         threshold=1.5,
         gate="NEXT_STACK0",
@@ -465,7 +483,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
         rules.append(FFNRule.gated_write(
             name=f"layer3_ffn.next_stack0_locality_byte_idx_{byte_idx}",
             conditions=((f"H4+{_BP_I}", 1.0),
-                        (f"BYTE_INDEX_{byte_idx}", 1.0)),
+                        (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             gate="NEXT_STACK0",
             gate_weight=1.0,
