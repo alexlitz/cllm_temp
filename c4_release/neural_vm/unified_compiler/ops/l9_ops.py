@@ -1152,7 +1152,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         # baked weight cells are byte-identical. Breaks the 3 L10 -> L9
         # back-edges (CARRY rank 9 in the latest scheduler SCC audit).
         reads={"MARK_AX", "MARK_PC", "ALU_HI", "AX_CARRY_HI", "FETCH_HI",
-               "CARRY_PREV_STEP",
+               "CARRY.*.-1",
                "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                "ALU_LO", "AX_CARRY_LO"},
