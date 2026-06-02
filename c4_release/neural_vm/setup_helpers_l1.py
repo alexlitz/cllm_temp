@@ -10,6 +10,7 @@ import math
 from .constants import PC_OFFSET
 
 
+# DEPRECATED — parity oracle only, no production use (Phase 6 wave 6A).
 def _set_layer1_ffn(ffn, S, BD):
     """Layer 1 FFN: STACK0_BYTE0 flag + BYTE_INDEX flags.
 
