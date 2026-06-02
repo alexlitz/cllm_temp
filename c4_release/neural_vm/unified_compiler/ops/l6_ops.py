@@ -2431,22 +2431,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 ENT first-step IR lowered to unexpected units "
             f"{ent_first_step_ends}; expected {expected_ent_first_step_ends}"
         )
-    return
-    for start, end in (
-        (L6_BZ_PC_OVERRIDE_START_UNIT, L6_BZ_PC_OVERRIDE_END_UNIT),
-        (L6_BNZ_PC_OVERRIDE_START_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT),
-    ):
-        _clear_ffn_unit_band(ffn, start, end)
-    branch_ends = _lower_layer6_branch_pc_override_ir(ffn, S, BD)
-    expected_branch_ends = (
-        L6_BZ_PC_OVERRIDE_END_UNIT,
-        L6_BNZ_PC_OVERRIDE_END_UNIT,
-    )
-    if branch_ends != expected_branch_ends:
-        raise AssertionError(
-            "L6 branch override IR lowered to unexpected units "
-            f"{branch_ends}; expected {expected_branch_ends}"
-        )
     _clear_ffn_unit_band(
         ffn,
         L6_OPCODE_CONTAMINATION_CLEANUP_START_UNIT,
@@ -2457,18 +2441,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
         raise AssertionError(
             "L6 tail cleanup IR lowered to unexpected unit "
             f"{tail_cleanup_end}; expected {L6_ALU_CLEAR_END_UNIT}"
-        )
-    _clear_ffn_unit_band(
-        ffn,
-        L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
-        L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT,
-    )
-    branch_byte1_end = _lower_layer6_branch_pc_byte1_override_ir(ffn, S, BD)
-    if branch_byte1_end != L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT:
-        raise AssertionError(
-            "L6 branch PC-byte1 override IR lowered to unexpected unit "
-            f"{branch_byte1_end}; expected "
-            f"{L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT}"
         )
 
 
