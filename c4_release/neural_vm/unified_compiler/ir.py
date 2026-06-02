@@ -25,6 +25,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Literal,
     Mapping,
     Optional,
     Sequence,
@@ -1037,13 +1038,264 @@ class TokenEmbeddingComparisonReport:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class PositionalEncodingSpec:
+    """Declarative positional-encoding choice for an attention block.
+
+    V2 / Phase 8 architectural toggle. The legacy
+    ``compile_full_vm_dynamic(..., positional_encoding="alibi", rope_base=...)``
+    kwarg path is shape-equivalent to a ``PositionalEncodingSpec`` that
+    lives in the IR. Lifting it into the IR makes the choice auditable
+    (no kwarg flowing through ten internal helpers) and round-trippable
+    (a tool can serialize the IR and recover the architectural intent).
+
+    The default value (``kind="alibi"``) is byte-identical to the
+    historical default — the existing ``VMConfig.alibi_mode`` produces
+    the same effective attention slopes.
+    """
+
+    kind: Literal["rope", "alibi", "sinusoidal", "learned", "none"] = "alibi"
+    rope_base: float = 10000.0
+    alibi_slopes: Optional[Tuple[float, ...]] = None
+
+    _VALID_KINDS = ("rope", "alibi", "sinusoidal", "learned", "none")
+
+    def __post_init__(self) -> None:
+        if self.kind not in self._VALID_KINDS:
+            raise ValueError(
+                "PositionalEncodingSpec.kind must be one of "
+                f"{self._VALID_KINDS}; got {self.kind!r}"
+            )
+        if self.alibi_slopes is not None and not isinstance(
+            self.alibi_slopes, tuple
+        ):
+            raise TypeError(
+                "PositionalEncodingSpec.alibi_slopes must be a tuple of "
+                "floats (use tuple(...) when constructing from a list); got "
+                f"{type(self.alibi_slopes).__name__}"
+            )
+
+
+@dataclass(frozen=True)
+class AttentionActivationSpec:
+    """Declarative attention denominator choice.
+
+    ``softmax`` is the canonical attention normalization. ``softmax1`` is
+    the +1-in-denominator variant used by every C4-VM attention head as
+    of Phase 8 (see ``BLOG_SPEC.md`` §"Long Division via Attention" for
+    the construction that depends on the sink). ``none`` is the no-op
+    "raw scores" variant, exposed so tests can verify the toggle plumbs
+    through the IR.
+    """
+
+    softmax_kind: Literal["softmax", "softmax1", "none"] = "softmax1"
+
+    _VALID_KINDS = ("softmax", "softmax1", "none")
+
+    def __post_init__(self) -> None:
+        if self.softmax_kind not in self._VALID_KINDS:
+            raise ValueError(
+                "AttentionActivationSpec.softmax_kind must be one of "
+                f"{self._VALID_KINDS}; got {self.softmax_kind!r}"
+            )
+
+
+@dataclass(frozen=True)
+class NormSpec:
+    """Declarative pre-attention / pre-FFN normalization.
+
+    The C4 VM historically baked LayerNorm into every block; Phase 8.O
+    added an ``use_rms_norm`` toggle for the open-model-like target.
+    ``kind="none"`` is exposed so a caller can construct a transformer
+    block without any pre-norm (used by some teacher-forced eval paths
+    that pre-apply norm at the outer level).
+    """
+
+    kind: Literal["rmsnorm", "layernorm", "none"] = "layernorm"
+    eps: float = 1e-6
+
+    _VALID_KINDS = ("rmsnorm", "layernorm", "none")
+
+    def __post_init__(self) -> None:
+        if self.kind not in self._VALID_KINDS:
+            raise ValueError(
+                "NormSpec.kind must be one of "
+                f"{self._VALID_KINDS}; got {self.kind!r}"
+            )
+        if not (self.eps > 0.0):
+            raise ValueError(
+                f"NormSpec.eps must be > 0; got {self.eps!r}"
+            )
+
+
+@dataclass(frozen=True)
+class FFNActivationSpec:
+    """Declarative FFN activation + expansion ratio.
+
+    ``relu`` is the default (matches PureFFN's historical ReLU gate),
+    ``gelu`` for open-model parity, ``swiglu`` for Llama/Mixtral-style
+    gated SiLU FFNs. ``ffn_expansion_ratio`` is the multiplier from
+    ``d_model`` to ``ffn_hidden`` (4.0 is the standard transformer
+    ratio; SwiGLU variants typically use 8/3 ≈ 2.667).
+    """
+
+    kind: Literal["relu", "gelu", "swiglu"] = "relu"
+    ffn_expansion_ratio: float = 4.0
+
+    _VALID_KINDS = ("relu", "gelu", "swiglu")
+
+    def __post_init__(self) -> None:
+        if self.kind not in self._VALID_KINDS:
+            raise ValueError(
+                "FFNActivationSpec.kind must be one of "
+                f"{self._VALID_KINDS}; got {self.kind!r}"
+            )
+        if not (self.ffn_expansion_ratio > 0.0):
+            raise ValueError(
+                "FFNActivationSpec.ffn_expansion_ratio must be > 0; "
+                f"got {self.ffn_expansion_ratio!r}"
+            )
+
+
+@dataclass(frozen=True)
+class ModelArchitectureSpec:
+    """Model-wide architectural toggles, lifted out of compile kwargs.
+
+    V2 compliance: the historical
+    ``compile_full_vm_dynamic(positional_encoding=..., use_rms_norm=...,
+    rope_base=..., ffn_hidden=..., div_mode=..., attention_normalization=...)``
+    kwargs encode architectural choices that aren't weight-shaped, so
+    they shouldn't live as compile kwargs. This dataclass groups them
+    into the IR so a caller can describe a target architecture
+    declaratively.
+
+    Per-layer overrides live on :class:`LayerSpec`'s
+    ``attention_pos_encoding`` / ``attention_activation`` /
+    ``norm_pre_attention`` / ``norm_pre_ffn`` / ``ffn_activation`` fields
+    — if a layer pins one of those, it wins; otherwise the
+    model-wide spec applies.
+
+    The default value is byte-identical to the historical
+    ``VMConfig.alibi_mode`` factory: ALiBi attention, softmax1 denom,
+    LayerNorm pre-norm, ReLU FFN with 4x expansion.
+    """
+
+    positional_encoding: PositionalEncodingSpec = field(
+        default_factory=PositionalEncodingSpec
+    )
+    attention_activation: AttentionActivationSpec = field(
+        default_factory=AttentionActivationSpec
+    )
+    norm_pre_attention: NormSpec = field(default_factory=NormSpec)
+    norm_pre_ffn: NormSpec = field(default_factory=NormSpec)
+    ffn_activation: FFNActivationSpec = field(
+        default_factory=FFNActivationSpec
+    )
+
+    @classmethod
+    def from_compile_kwargs(
+        cls,
+        *,
+        positional_encoding: Optional[str] = None,
+        attention_normalization: Optional[str] = None,
+        rope_base: Optional[float] = None,
+        use_rms_norm: Optional[bool] = None,
+        rms_norm_eps: Optional[float] = None,
+        ffn_activation_kind: Optional[str] = None,
+        ffn_expansion_ratio: Optional[float] = None,
+    ) -> "ModelArchitectureSpec":
+        """Construct from ``compile_full_vm_dynamic``'s kwarg surface.
+
+        Mirrors the kwarg names so a caller migrating from the legacy
+        kwarg path can do so by replacing the kwargs with a single
+        ``ModelArchitectureSpec.from_compile_kwargs(...)`` call. Any
+        kwarg left as ``None`` falls back to the dataclass default —
+        which is byte-identical to ``VMConfig.alibi_mode``.
+
+        ``positional_encoding="hybrid"`` is the legacy 3-valued string;
+        callers wiring a non-hybrid IR can either resolve it ahead of
+        time (per-layer overrides on :class:`LayerSpec`) or pass
+        ``kind="alibi"`` and rely on the layer-level override path.
+        Hybrid as a kind isn't supported in :class:`PositionalEncodingSpec`
+        because the IR forces the per-layer decision to be visible.
+        """
+        pos_kind: Literal[
+            "rope", "alibi", "sinusoidal", "learned", "none"
+        ] = "alibi"
+        if positional_encoding == "rope":
+            pos_kind = "rope"
+        elif positional_encoding == "alibi" or positional_encoding is None:
+            pos_kind = "alibi"
+        elif positional_encoding == "hybrid":
+            # Hybrid resolves at the layer level; the model-wide default
+            # describes the majority path (alibi for L0-L2, rope for
+            # the rest — call it rope here since the rest dominates).
+            pos_kind = "rope"
+        else:
+            # Allow direct passthrough of the new kinds.
+            pos_kind = positional_encoding  # type: ignore[assignment]
+        pos = PositionalEncodingSpec(
+            kind=pos_kind,
+            rope_base=rope_base if rope_base is not None else 10000.0,
+        )
+
+        if attention_normalization == "softmax":
+            act_kind: Literal["softmax", "softmax1", "none"] = "softmax"
+        elif attention_normalization == "softmax1" or attention_normalization is None:
+            act_kind = "softmax1"
+        else:
+            act_kind = attention_normalization  # type: ignore[assignment]
+        attn_act = AttentionActivationSpec(softmax_kind=act_kind)
+
+        if use_rms_norm is True:
+            norm_kind: Literal["rmsnorm", "layernorm", "none"] = "rmsnorm"
+        elif use_rms_norm is False or use_rms_norm is None:
+            norm_kind = "layernorm"
+        else:  # pragma: no cover - defensive
+            norm_kind = "layernorm"
+        eps = rms_norm_eps if rms_norm_eps is not None else 1e-6
+        norm_pre_attn = NormSpec(kind=norm_kind, eps=eps)
+        norm_pre_ffn = NormSpec(kind=norm_kind, eps=eps)
+
+        ffn_kind: Literal["relu", "gelu", "swiglu"] = "relu"
+        if ffn_activation_kind in ("relu", "gelu", "swiglu"):
+            ffn_kind = ffn_activation_kind  # type: ignore[assignment]
+        ffn_act = FFNActivationSpec(
+            kind=ffn_kind,
+            ffn_expansion_ratio=(
+                ffn_expansion_ratio if ffn_expansion_ratio is not None else 4.0
+            ),
+        )
+
+        return cls(
+            positional_encoding=pos,
+            attention_activation=attn_act,
+            norm_pre_attention=norm_pre_attn,
+            norm_pre_ffn=norm_pre_ffn,
+            ffn_activation=ffn_act,
+        )
+
+
 @dataclass
 class LayerSpec:
-    """Declarative work assigned to one logical compiler layer."""
+    """Declarative work assigned to one logical compiler layer.
+
+    The architectural-toggle fields (``attention_pos_encoding``,
+    ``attention_activation``, ``norm_pre_attention``, ``norm_pre_ffn``,
+    ``ffn_activation``) are per-layer overrides. When set, they take
+    precedence over the :class:`ModelArchitectureSpec` on the enclosing
+    :class:`CompilerIR`. The default ``None`` means "inherit from the
+    model-wide spec", which is byte-identical to the pre-spec behaviour.
+    """
 
     ffn: FFNOp = field(default_factory=FFNOp)
     attention: AttentionOp = field(default_factory=AttentionOp)
     structural_ops: List[StructuralOp] = field(default_factory=list)
+    attention_pos_encoding: Optional[PositionalEncodingSpec] = None
+    attention_activation: Optional[AttentionActivationSpec] = None
+    norm_pre_attention: Optional[NormSpec] = None
+    norm_pre_ffn: Optional[NormSpec] = None
+    ffn_activation: Optional[FFNActivationSpec] = None
 
 
 @dataclass
@@ -1052,11 +1304,53 @@ class CompilerIR:
 
     layers: List[LayerSpec] = field(default_factory=list)
     embeddings: List[TokenEmbeddingRule] = field(default_factory=list)
+    architecture: ModelArchitectureSpec = field(
+        default_factory=ModelArchitectureSpec
+    )
 
     def layer(self, index: int) -> LayerSpec:
         while len(self.layers) <= index:
             self.layers.append(LayerSpec())
         return self.layers[index]
+
+    # ------------------------------------------------------------------
+    # Architecture-spec resolution helpers (V2 toggle IR — Phase 8.X).
+    # ------------------------------------------------------------------
+
+    def resolve_attention_pos_encoding(
+        self, layer_idx: int
+    ) -> PositionalEncodingSpec:
+        """Per-layer override wins; else falls back to ``architecture``."""
+        override = self.layer(layer_idx).attention_pos_encoding
+        if override is not None:
+            return override
+        return self.architecture.positional_encoding
+
+    def resolve_attention_activation(
+        self, layer_idx: int
+    ) -> AttentionActivationSpec:
+        override = self.layer(layer_idx).attention_activation
+        if override is not None:
+            return override
+        return self.architecture.attention_activation
+
+    def resolve_norm_pre_attention(self, layer_idx: int) -> NormSpec:
+        override = self.layer(layer_idx).norm_pre_attention
+        if override is not None:
+            return override
+        return self.architecture.norm_pre_attention
+
+    def resolve_norm_pre_ffn(self, layer_idx: int) -> NormSpec:
+        override = self.layer(layer_idx).norm_pre_ffn
+        if override is not None:
+            return override
+        return self.architecture.norm_pre_ffn
+
+    def resolve_ffn_activation(self, layer_idx: int) -> FFNActivationSpec:
+        override = self.layer(layer_idx).ffn_activation
+        if override is not None:
+            return override
+        return self.architecture.ffn_activation
 
     def lower_ffn(
         self,
@@ -2650,6 +2944,7 @@ def _run_lowered_ffn_comparison(
 
 
 __all__ = [
+    "AttentionActivationSpec",
     "AttentionComparisonIssue",
     "AttentionComparisonReport",
     "AttentionDebugReport",
@@ -2660,11 +2955,15 @@ __all__ = [
     "CompilerIR",
     "ConditionTerm",
     "DimRef",
+    "FFNActivationSpec",
     "FFNComparisonIssue",
     "FFNComparisonReport",
     "FFNOp",
     "FFNRule",
     "LayerSpec",
+    "ModelArchitectureSpec",
+    "NormSpec",
+    "PositionalEncodingSpec",
     "RuntimeAttentionFragment",
     "SymbolicAttentionChoice",
     "SymbolicDeclarativeRunReport",
