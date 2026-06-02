@@ -9,7 +9,6 @@ from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
-from .shared import _bake_post_op_into
 
 
 # === L10 FFN unit layouts (pinned offsets) ==========================
@@ -112,6 +111,417 @@ def _allocate_l10_post_ops_combined_units() -> FFNUnitAllocator:
     for name, start, n_units in _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED:
         allocator.alloc(name, n_units, pin=start)
     return allocator
+
+
+_L10_BINARY_OP_BYTE_ZEROING_OP_DIMS = (
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+    "OP_SHL", "OP_SHR", "OP_MUL", "OP_DIV", "OP_MOD",
+)
+
+
+def _l10_binary_op_byte_zeroing_rules(S: float) -> tuple[FFNRule, ...]:
+    """Declarative rules for ``BinaryOpByteZeroingPostOp`` (8 units).
+
+    Mirrors ``vm_step.BinaryOpByteZeroingPostOp._bake_weights``: four
+    opcode-gated detectors (units 0..3, gate by the binary-op set) and
+    four bitwise-gated detectors (units 4..7, gate by ``TEMP+3``).
+
+    Per the legacy ``wire_zeroing_writes(unit_offset)`` helper, within
+    each group of four:
+
+      * unit_offset+0 wipes the OUTPUT_LO band (16 cells, each -3.0/S),
+      * unit_offset+1 wipes the OUTPUT_HI band (16 cells, each -3.0/S),
+      * unit_offset+2 adds OUTPUT_LO+0 += 5.0/S,
+      * unit_offset+3 adds OUTPUT_HI+0 += 5.0/S.
+
+    The opcode-gated detectors use ``gate=None`` with multi-term
+    ``gate_terms`` summing all 11 opcode flags (each weight 1.0). The
+    bitwise detectors use ``gate="TEMP+3"`` directly.
+    """
+
+    def conds_opcode_gated():
+        return (
+            ("IS_BYTE", 1.0),
+            ("H1+1", 1.0),
+            ("TEMP+8", -1000.0),
+            ("TEMP+9", -1000.0),
+        )
+
+    def conds_bitwise_gated():
+        return (
+            ("IS_BYTE", 1.0),
+            ("H1+1", 1.0),
+            ("TEMP+3", 1.0),
+            ("TEMP+8", -1000.0),
+            ("TEMP+9", -1000.0),
+        )
+
+    opcode_gate_terms = tuple(
+        (op_dim, 1.0) for op_dim in _L10_BINARY_OP_BYTE_ZEROING_OP_DIMS
+    )
+
+    output_lo_wipe = tuple(
+        (f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)
+    )
+    output_hi_wipe = tuple(
+        (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
+    )
+
+    rules: list[FFNRule] = []
+
+    # Units 0..3: opcode-gated detectors.
+    for unit_idx, writes in enumerate((
+        output_lo_wipe,
+        output_hi_wipe,
+        (("OUTPUT_LO+0", 5.0 / S),),
+        (("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+    )):
+        rules.append(FFNRule.gated_write(
+            conditions=conds_opcode_gated(),
+            threshold=1.5,
+            gate=None,
+            gate_terms=opcode_gate_terms,
+            gate_bias=0.0,
+            writes=writes,
+            name=f"l10_binary_op_byte_zeroing_opcode_unit{unit_idx}",
+            scope=(
+                "IS_BYTE and ("
+                + " or ".join(_L10_BINARY_OP_BYTE_ZEROING_OP_DIMS)
+                + ")"
+            ),
+        ))
+
+    # Units 4..7: bitwise-gated detectors (gate = TEMP+3).
+    for unit_idx, writes in enumerate((
+        output_lo_wipe,
+        output_hi_wipe,
+        (("OUTPUT_LO+0", 5.0 / S),),
+        (("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+    )):
+        rules.append(FFNRule.gated_write(
+            conditions=conds_bitwise_gated(),
+            threshold=2.5,
+            gate="TEMP+3",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=writes,
+            name=f"l10_binary_op_byte_zeroing_bitwise_unit{unit_idx}",
+            scope="IS_BYTE and TEMP+3",
+        ))
+
+    return tuple(rules)
+
+
+_L10_CARRY_NON_ARITH_OPS = (
+    "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
+    "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
+    "OP_SC", "OP_PSH", "OP_OR", "OP_XOR", "OP_AND", "OP_EQ",
+    "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE", "OP_SHL",
+    "OP_SHR", "OP_MUL", "OP_DIV", "OP_MOD", "OP_EXIT", "OP_NOP",
+    "OP_PUTCHAR", "OP_GETCHAR",
+)
+
+_L10_CARRY_BYTE_DIM_BY_IDX = (
+    "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+)
+
+
+def _l10_carry_propagation_rules(
+    S: float, *, byte_idx: int, cascade: bool,
+) -> tuple[FFNRule, ...]:
+    """Declarative rules for one ``CarryPropagationPostOp`` instance (512 units).
+
+    Mirrors ``vm_step.CarryPropagationPostOp._bake_weights``: 256 ADD
+    carry units followed by 256 SUB borrow units, indexed by
+    ``(lo, hi)`` over ``range(16) x range(16)`` for the active byte.
+
+    Differences captured per (byte_idx, cascade):
+
+      * ``byte_dim`` flag: BYTE_INDEX_0/1/2 (no byte_idx=3 here).
+      * ``add_carry_in`` / ``sub_carry_in`` choose between CARRY+1/+2
+        (non-cascade byte_idx=0) and CARRY+3/+3 (cascade=True for
+        byte_idx=1/2).
+      * ``cascade=True`` routes mutual exclusion through TEMP+8/9
+        instead of the carry dim pair.
+      * The threshold drops to ``cascade_carry_threshold=40`` when
+        cascade=True; non-cascade uses ``carry_threshold=56``.
+
+    Output cells: the imperative bake writes
+    ``W_down[OUTPUT_LO+lo] = -2/S`` then later
+    ``W_down[OUTPUT_LO+new_lo] = +2/S`` with ``=`` semantics. When
+    ``new_lo == lo`` (or ``new_hi == hi``) the second assignment
+    overwrites the first, giving a net +2/S on that cell. The
+    ``CompilerIR.lower_ffn`` lowerer uses ``+=`` so the rule below
+    emits only the surviving write per cell (``+2/S`` when they
+    collide, both writes when they don't). The CARRY+3 high-overflow
+    write only fires at ``(15,15)`` for ADD and ``(0,0)`` for SUB,
+    and only when ``byte_idx < 2``.
+    """
+
+    if byte_idx not in (0, 1, 2):
+        raise ValueError(f"byte_idx must be 0, 1, or 2; got {byte_idx}")
+
+    byte_dim_name = _L10_CARRY_BYTE_DIM_BY_IDX[byte_idx]
+    wrong_byte_dim_names = tuple(
+        name for i, name in enumerate(_L10_CARRY_BYTE_DIM_BY_IDX)
+        if i != byte_idx
+    )
+    add_carry_in_name = f"CARRY+{3 if cascade else 1}"
+    sub_carry_in_name = f"CARRY+{3 if cascade else 2}"
+    threshold = 40.0 if cascade else 56.0
+
+    # carry_weight=1.0, output_weight=20.0, mismatch_weight=0.0 in the
+    # legacy bake; mismatch writes drop out of the rule because they
+    # multiply to zero (``-S * 0 = 0`` produces no W_up cell).
+    carry_weight = 1.0
+    output_weight = 20.0
+
+    def base_conds(carry_in_name: str) -> list[tuple[str, float]]:
+        conds: list[tuple[str, float]] = [
+            (carry_in_name, carry_weight),
+            ("IS_BYTE", 1.0),
+            ("H1+1", 1.0),
+            ("MARK_AX", -5000.0),
+            ("MARK_PC", -5000.0),
+            (byte_dim_name, 1.0),
+        ]
+        # Suppress non-arithmetic opcodes.
+        for op_name in _L10_CARRY_NON_ARITH_OPS:
+            conds.append((op_name, -20.0))
+        # TEMP+3 suppression (BITWISE_OP indicator).
+        conds.append(("TEMP+3", -10.0))
+        # Wrong byte position suppression.
+        for wrong_name in wrong_byte_dim_names:
+            conds.append((wrong_name, -10.0))
+        return conds
+
+    def add_rule_for(lo: int, hi: int) -> FFNRule:
+        new_val = lo + hi * 16 + 1
+        new_lo = new_val & 0xF
+        new_hi = (new_val >> 4) & 0xF
+        conds = base_conds(add_carry_in_name)
+        # ADD-specific mutual exclusion vs SUB.
+        conds.append(("OP_SUB", -20.0))
+        if cascade:
+            conds.append(("TEMP+8", 1.0))
+            conds.append(("TEMP+9", -10.0))
+        else:
+            # sub_carry_in (CARRY+2) suppresses ADD firing under SUB.
+            conds.append((sub_carry_in_name, -10.0))
+        # OUTPUT_LO/HI match boosts (only matching nibble; mismatches
+        # are 0 because mismatch_weight=0 in the legacy bake).
+        conds.append((f"OUTPUT_LO+{lo}", output_weight))
+        conds.append((f"OUTPUT_HI_THIS_STEP+{hi}", output_weight))
+
+        writes: list[tuple[str, float]] = []
+        # Collapse the legacy ``= -2/S`` + ``= +2/S`` pair using the
+        # rule that lower_ffn uses ``+=``: when new == old, emit only
+        # the surviving +2/S; otherwise emit both writes as distinct
+        # cells.
+        if new_lo == lo:
+            writes.append((f"OUTPUT_LO+{lo}", 2.0 / S))
+        else:
+            writes.append((f"OUTPUT_LO+{lo}", -2.0 / S))
+            writes.append((f"OUTPUT_LO+{new_lo}", 2.0 / S))
+        if new_hi == hi:
+            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", 2.0 / S))
+        else:
+            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", -2.0 / S))
+            writes.append((f"OUTPUT_HI_THIS_STEP+{new_hi}", 2.0 / S))
+        if lo == 15 and hi == 15 and byte_idx < 2:
+            writes.append(("CARRY+3", 2.0 / S))
+
+        return FFNRule.gated_write(
+            conditions=tuple(conds),
+            threshold=threshold,
+            gate=add_carry_in_name,
+            gate_weight=0.5,
+            gate_bias=0.0,
+            writes=tuple(writes),
+            name=f"l10_carry_byte{byte_idx}_add_lo{lo}_hi{hi}",
+            scope=(
+                f"IS_BYTE and {byte_dim_name} and not MARK_AX "
+                f"and not MARK_PC"
+            ),
+        )
+
+    def sub_rule_for(lo: int, hi: int) -> FFNRule:
+        new_val = (lo + hi * 16 - 1) & 0xFF
+        new_lo = new_val & 0xF
+        new_hi = (new_val >> 4) & 0xF
+        conds = base_conds(sub_carry_in_name)
+        conds.append(("OP_ADD", -20.0))
+        if cascade:
+            conds.append(("TEMP+9", 1.0))
+            conds.append(("TEMP+8", -10.0))
+        else:
+            conds.append((add_carry_in_name, -10.0))
+        conds.append((f"OUTPUT_LO+{lo}", output_weight))
+        conds.append((f"OUTPUT_HI_THIS_STEP+{hi}", output_weight))
+
+        writes: list[tuple[str, float]] = []
+        if new_lo == lo:
+            writes.append((f"OUTPUT_LO+{lo}", 2.0 / S))
+        else:
+            writes.append((f"OUTPUT_LO+{lo}", -2.0 / S))
+            writes.append((f"OUTPUT_LO+{new_lo}", 2.0 / S))
+        if new_hi == hi:
+            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", 2.0 / S))
+        else:
+            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", -2.0 / S))
+            writes.append((f"OUTPUT_HI_THIS_STEP+{new_hi}", 2.0 / S))
+        if lo == 0 and hi == 0 and byte_idx < 2:
+            writes.append(("CARRY+3", 2.0 / S))
+
+        return FFNRule.gated_write(
+            conditions=tuple(conds),
+            threshold=threshold,
+            gate=sub_carry_in_name,
+            gate_weight=0.5,
+            gate_bias=0.0,
+            writes=tuple(writes),
+            name=f"l10_carry_byte{byte_idx}_sub_lo{lo}_hi{hi}",
+            scope=(
+                f"IS_BYTE and {byte_dim_name} and not MARK_AX "
+                f"and not MARK_PC"
+            ),
+        )
+
+    rules: list[FFNRule] = []
+    for lo in range(16):
+        for hi in range(16):
+            rules.append(add_rule_for(lo, hi))
+    for lo in range(16):
+        for hi in range(16):
+            rules.append(sub_rule_for(lo, hi))
+    return tuple(rules)
+
+
+def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
+    """Declarative rules for ``ComparisonCombine`` (18 units).
+
+    Mirrors ``vm_step.ComparisonCombine._bake_weights``. For each of
+    EQ/NE/LT/GT/LE/GE the post-op emits one *default* unit that writes
+    the initial result and one or two *override* units that flip the
+    result when CMP[0..3] flags indicate the opposite outcome.
+
+      * Default unit: constant_write style (``W_gate[unit, CONST]``
+        was the legacy gate, but ``ComparisonCombine`` actually sets
+        ``b_gate = 1.0`` with no W_gate cell, matching
+        ``constant_write``'s ``gate=None``/``gate_bias=1.0`` form).
+        Writes ``OUTPUT_LO+default_result`` and ``OUTPUT_HI+0`` at
+        +2/S.
+      * Override 2-way: gated by the opcode dim, conditions sum
+        MARK_AX + one CMP flag with threshold 1.5, writes a +4/S/-4/S
+        pair on OUTPUT_LO.
+      * Override 3-way: gated by the opcode dim, conditions sum
+        MARK_AX + two CMP flags with threshold 2.5, writes a +4/S/
+        -4/S pair on OUTPUT_LO.
+
+    All units include a strong MARK_PC blocker (``-50``) to prevent
+    leaked OP_NE/OP_GT/OP_GE or CMP residue from corrupting PC
+    predictions; see the 2026-05-09 fix comment in vm_step.py.
+    """
+
+    MARK_PC_BLOCK = -50.0
+
+    def cmp_default(op_name: str, default_result: int, *, idx: int) -> FFNRule:
+        return FFNRule.constant_write(
+            conditions=(
+                ("MARK_AX", 1.0),
+                (op_name, 1.0),
+                ("MARK_PC", MARK_PC_BLOCK),
+            ),
+            threshold=1.5,
+            writes=(
+                (f"OUTPUT_LO+{default_result}", 2.0 / S),
+                ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
+            ),
+            name=f"l10_cmp_default_{op_name.lower()}_{idx}",
+            scope=f"MARK_AX and {op_name} and not MARK_PC",
+        )
+
+    def cmp_override_2way(
+        op_name: str, cmp_name: str, to_result: int, from_result: int,
+        *, idx: int,
+    ) -> FFNRule:
+        return FFNRule.gated_write(
+            conditions=(
+                ("MARK_AX", 1.0),
+                (cmp_name, 1.0),
+                ("MARK_PC", MARK_PC_BLOCK),
+            ),
+            threshold=1.5,
+            gate=op_name,
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                (f"OUTPUT_LO+{to_result}", 4.0 / S),
+                (f"OUTPUT_LO+{from_result}", -4.0 / S),
+            ),
+            name=f"l10_cmp_override2_{op_name.lower()}_{idx}",
+            scope=f"MARK_AX and {op_name} and {cmp_name} and not MARK_PC",
+        )
+
+    def cmp_override_3way(
+        op_name: str, cmp_name1: str, cmp_name2: str,
+        to_result: int, from_result: int, *, idx: int,
+    ) -> FFNRule:
+        return FFNRule.gated_write(
+            conditions=(
+                ("MARK_AX", 1.0),
+                (cmp_name1, 1.0),
+                (cmp_name2, 1.0),
+                ("MARK_PC", MARK_PC_BLOCK),
+            ),
+            threshold=2.5,
+            gate=op_name,
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                (f"OUTPUT_LO+{to_result}", 4.0 / S),
+                (f"OUTPUT_LO+{from_result}", -4.0 / S),
+            ),
+            name=f"l10_cmp_override3_{op_name.lower()}_{idx}",
+            scope=(
+                f"MARK_AX and {op_name} and {cmp_name1} and "
+                f"{cmp_name2} and not MARK_PC"
+            ),
+        )
+
+    rules: list[FFNRule] = []
+
+    # EQ: default 0, override (CMP+1,CMP+2 -> 1)
+    rules.append(cmp_default("OP_EQ", 0, idx=0))
+    rules.append(cmp_override_3way("OP_EQ", "CMP+1", "CMP+2", 1, 0, idx=1))
+
+    # NE: default 1, override (CMP+1,CMP+2 -> 0)
+    rules.append(cmp_default("OP_NE", 1, idx=2))
+    rules.append(cmp_override_3way("OP_NE", "CMP+1", "CMP+2", 0, 1, idx=3))
+
+    # LT: default 0, override CMP+0 -> 1, override (CMP+1,CMP+3 -> 1)
+    rules.append(cmp_default("OP_LT", 0, idx=4))
+    rules.append(cmp_override_2way("OP_LT", "CMP+0", 1, 0, idx=5))
+    rules.append(cmp_override_3way("OP_LT", "CMP+1", "CMP+3", 1, 0, idx=6))
+
+    # GT: default 1, override CMP+0 -> 0, two 3-way overrides -> 0
+    rules.append(cmp_default("OP_GT", 1, idx=7))
+    rules.append(cmp_override_2way("OP_GT", "CMP+0", 0, 1, idx=8))
+    rules.append(cmp_override_3way("OP_GT", "CMP+1", "CMP+3", 0, 1, idx=9))
+    rules.append(cmp_override_3way("OP_GT", "CMP+1", "CMP+2", 0, 1, idx=10))
+
+    # LE: default 0, override CMP+0 -> 1, two 3-way overrides -> 1
+    rules.append(cmp_default("OP_LE", 0, idx=11))
+    rules.append(cmp_override_2way("OP_LE", "CMP+0", 1, 0, idx=12))
+    rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+3", 1, 0, idx=13))
+    rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+2", 1, 0, idx=14))
+
+    # GE: default 1, override CMP+0 -> 0, override (CMP+1,CMP+3 -> 0)
+    rules.append(cmp_default("OP_GE", 1, idx=15))
+    rules.append(cmp_override_2way("OP_GE", "CMP+0", 0, 1, idx=16))
+    rules.append(cmp_override_3way("OP_GE", "CMP+1", "CMP+3", 0, 1, idx=17))
+
+    return tuple(rules)
 
 
 def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
@@ -1520,16 +1930,9 @@ def make_l10_post_ops_combined() -> Operation:
     turns already-computed 16-bit XOR bytes back into zero.
     """
     def bake(ffn, dim_positions, S):
-        from ...vm_step import (
-            BinaryOpByteZeroingPostOp,
-            CarryPropagationPostOp,
-            ComparisonCombine,
-        )
-        d_model = ffn.W_up.shape[1]
-
         # Per-bake FFN-unit allocator. Every sub-range matches the
-        # ``hidden_dim`` of the post-op instance baked into it and is
-        # pinned at the offset the inline ``_bake_post_op_into`` walk
+        # hidden_dim of the corresponding FFNRule family lowered into
+        # it and is pinned at the offset the historical inline walk
         # would naturally land on. Stashed on the FFN itself (this op
         # is ``kind="ffn"`` so ``ffn`` IS the block-equivalent target)
         # so a future second tenant in this dependency-assigned bank
@@ -1539,41 +1942,69 @@ def make_l10_post_ops_combined() -> Operation:
 
         # Pull the pinned starts back out of the allocator so the
         # inline walk uses the table as its source of truth. Drift
-        # between the walk and the table fails fast in
-        # ``_bake_post_op_into`` (which raises if the resulting end
-        # exceeds the FFN's ``hidden_dim``).
+        # between the walk and the rule-emitted cursors fails fast in
+        # the ``assert offset == ...`` checks below.
         by_name = {r.op_name: r for r in allocator.ranges()}
 
         offset = by_name["l10_post_ops_combined.binary_op_byte_zeroing"].start
-        # Thread dim_positions so each fresh post-op instance bakes against
-        # the compact layout, matching the per-block post_op attach path.
-        offset = _bake_post_op_into(
-            ffn, BinaryOpByteZeroingPostOp(d_model, S, dim_positions=dim_positions), offset)
+        # Migrated to FFNRule. Rule list lives in
+        # ``_l10_binary_op_byte_zeroing_rules`` and is lowered through
+        # ``Primitives.lower_ffn_rules`` so symbolic / declarative
+        # verifiers see the same declarations the imperative
+        # ``BinaryOpByteZeroingPostOp._bake_weights`` used to write.
+        offset = Primitives.lower_ffn_rules(
+            ffn,
+            _l10_binary_op_byte_zeroing_rules(S),
+            dim_positions,
+            start_unit=offset,
+            S=S,
+        )
         assert offset == by_name["l10_post_ops_combined.carry_propagation_byte0"].start, (
             f"L10 post_ops_combined zeroing cursor drift: {offset}"
         )
         carry_start = offset
-        offset = _bake_post_op_into(
-            ffn, CarryPropagationPostOp(d_model, S, byte_idx=0, cascade=False,
-                                        dim_positions=dim_positions), offset)
+        # Migrated to FFNRule. See ``_l10_carry_propagation_rules``.
+        offset = Primitives.lower_ffn_rules(
+            ffn,
+            _l10_carry_propagation_rules(S, byte_idx=0, cascade=False),
+            dim_positions,
+            start_unit=offset,
+            S=S,
+        )
         assert offset == by_name["l10_post_ops_combined.carry_propagation_byte1"].start, (
             f"L10 post_ops_combined carry0 cursor drift: {offset}"
         )
-        offset = _bake_post_op_into(
-            ffn, CarryPropagationPostOp(d_model, S, byte_idx=1, cascade=True,
-                                        dim_positions=dim_positions), offset)
+        # Migrated to FFNRule. See ``_l10_carry_propagation_rules``.
+        offset = Primitives.lower_ffn_rules(
+            ffn,
+            _l10_carry_propagation_rules(S, byte_idx=1, cascade=True),
+            dim_positions,
+            start_unit=offset,
+            S=S,
+        )
         assert offset == by_name["l10_post_ops_combined.carry_propagation_byte2"].start, (
             f"L10 post_ops_combined carry1 cursor drift: {offset}"
         )
-        offset = _bake_post_op_into(
-            ffn, CarryPropagationPostOp(d_model, S, byte_idx=2, cascade=True,
-                                        dim_positions=dim_positions), offset)
+        # Migrated to FFNRule. See ``_l10_carry_propagation_rules``.
+        offset = Primitives.lower_ffn_rules(
+            ffn,
+            _l10_carry_propagation_rules(S, byte_idx=2, cascade=True),
+            dim_positions,
+            start_unit=offset,
+            S=S,
+        )
         assert offset == by_name["l10_post_ops_combined.comparison_combine"].start, (
             f"L10 post_ops_combined carry2 cursor drift: {offset}"
         )
         carry_end = offset
-        offset = _bake_post_op_into(
-            ffn, ComparisonCombine(d_model, S, dim_positions=dim_positions), offset)
+        # Migrated to FFNRule. See ``_l10_comparison_combine_rules``.
+        offset = Primitives.lower_ffn_rules(
+            ffn,
+            _l10_comparison_combine_rules(S),
+            dim_positions,
+            start_unit=offset,
+            S=S,
+        )
         assert offset == _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL, (
             f"L10 post_ops_combined comparison cursor drift: helper "
             f"ended at {offset}, allocator expected "
