@@ -22,6 +22,24 @@ from ..layer_compiler import Operation
 _OP_NAME_CACHE: Dict[int, str] = {}
 
 
+def _setdim_to_positions(BD) -> Dict[str, int]:
+    """Build a ``dim_positions`` dict from a ``_SetDim``-like class.
+
+    Phase 7.D.3 helper. Used by the legacy ``setup_token_embeddings`` /
+    ``setup_head_weights`` fallback path when no ``dim_positions`` arg was
+    supplied. Walks every public class attribute that resolves to an
+    ``int`` so the returned mapping is closed.
+    """
+    positions: Dict[str, int] = {}
+    for name in dir(BD):
+        if name.startswith("_"):
+            continue
+        val = getattr(BD, name, None)
+        if isinstance(val, int) and not isinstance(val, bool):
+            positions[name] = val
+    return positions
+
+
 def _opcode_name_map() -> Dict[int, str]:
     """Return (and lazily build) the Opcode -> "OP_<NAME>" lookup map."""
     if _OP_NAME_CACHE:
@@ -369,105 +387,48 @@ def setup_token_embeddings(embed_weight, dim_positions: Dict[str, int] = None) -
     compiler path uses auto-allocated positions. Falls back to _SetDim when
     dim_positions is None.
 
+    Phase 7.D.3 migration: replaced the per-token imperative writes with a
+    call to ``CompilerIR.lower_token_embeddings`` using the same
+    ``_embedding_bake_rules`` list that the active production op
+    ``make_embedding_bake_op`` uses -- single source of truth.
+
     Args:
         embed_weight: nn.Embedding.weight tensor [vocab, d_model].
         dim_positions: Optional dict mapping dim name -> start position.
     """
     import torch
-    from ...vm_step import Token, _SetDim
+    from ...vm_step import _SetDim
+    from ..ir import CompilerIR
+    # Local import to avoid module-load cycle (model_ops imports from shared).
+    from .model_ops import _embedding_bake_rules
 
-    def D(name):
-        if dim_positions is not None and name in dim_positions:
-            return dim_positions[name]
-        return getattr(_SetDim, name)
+    if dim_positions is None:
+        dim_positions = _setdim_to_positions(_SetDim)
 
     V = embed_weight.shape[0]
 
     with torch.no_grad():
         embed_weight.zero_()
 
-        # CONST=1 for every token
-        const = D("CONST")
-        for tok in range(V):
-            embed_weight[tok, const] = 1.0
+    # Model-like shim so ``lower_token_embeddings`` can resolve
+    # ``model.embed.embed.weight``. ``.head`` is stubbed so attribute
+    # resolution succeeds even though the embedding bake never writes there.
+    class _InnerEmbed:
+        def __init__(self, w):
+            self.weight = w
 
-        # Marker tokens
-        is_mark = D("IS_MARK")
-        for tok, dim_name in [
-            (Token.REG_PC, "MARK_PC"),
-            (Token.REG_AX, "MARK_AX"),
-            (Token.REG_SP, "MARK_SP"),
-            (Token.REG_BP, "MARK_BP"),
-            (Token.MEM, "MARK_MEM"),
-            (Token.CODE_START, "MARK_CS"),
-        ]:
-            if tok < V:
-                embed_weight[tok, D(dim_name)] = 1.0
-                embed_weight[tok, is_mark] = 1.0
+    class _OuterEmbed:
+        def __init__(self, w):
+            self.embed = _InnerEmbed(w)
 
-        # STACK0 marker WITHOUT IS_MARK (so threshold heads see BP as nearest)
-        if Token.STACK0 < V:
-            embed_weight[Token.STACK0, D("MARK_STACK0")] = 1.0
+    class _ModelShim:
+        def __init__(self, w):
+            self.embed = _OuterEmbed(w)
+            self.head = None
 
-        # Step-end / data-end / halt
-        mark_se = D("MARK_SE")
-        for tok in [Token.STEP_END, Token.DATA_END, Token.HALT]:
-            if tok < V:
-                embed_weight[tok, mark_se] = 1.0
-                embed_weight[tok, is_mark] = 1.0
-
-        if Token.STEP_END < V:
-            embed_weight[Token.STEP_END, D("MARK_SE_ONLY")] = 1.0
-
-        if Token.TOOL_CALL < V:
-            embed_weight[Token.TOOL_CALL, mark_se] = 1.0
-            embed_weight[Token.TOOL_CALL, is_mark] = 1.0
-            embed_weight[Token.TOOL_CALL, D("MARK_SE_ONLY")] = 1.0
-            embed_weight[Token.TOOL_CALL, const] = 1.0
-
-        # Thinking markers (try/except in case dims not declared in compiler spec)
-        # MARK_THINKING_START/_END are baked directly into the embedding table
-        # so the runtime `NeuralVMEmbedding._inject_thinking_markers` Python
-        # loop is unnecessary — L2's lookback head reads these dims, and an
-        # embedding-table entry is equivalent to a per-position injection for
-        # tokens that only appear as themselves (THINKING_START=272,
-        # THINKING_END=273 are never reused for anything else).
-        try:
-            temp = D("TEMP")
-            mark_thinking_start = D("MARK_THINKING_START")
-            mark_thinking_end = D("MARK_THINKING_END")
-            if Token.THINKING_START < V:
-                embed_weight[Token.THINKING_START, is_mark] = 1.0
-                embed_weight[Token.THINKING_START, const] = 1.0
-                embed_weight[Token.THINKING_START, temp + 1] = 1.0
-                embed_weight[Token.THINKING_START, mark_thinking_start] = 1.0
-            if Token.THINKING_END < V:
-                embed_weight[Token.THINKING_END, is_mark] = 1.0
-                embed_weight[Token.THINKING_END, const] = 1.0
-                embed_weight[Token.THINKING_END, temp + 2] = 1.0
-                embed_weight[Token.THINKING_END, mark_thinking_end] = 1.0
-        except AttributeError:
-            pass
-
-        if Token.IO_STATE_EMIT_BYTE < V:
-            embed_weight[Token.IO_STATE_EMIT_BYTE, is_mark] = 1.0
-            embed_weight[Token.IO_STATE_EMIT_BYTE, const] = 1.0
-        if Token.IO_STATE_EMIT_THINKING < V:
-            embed_weight[Token.IO_STATE_EMIT_THINKING, is_mark] = 1.0
-            embed_weight[Token.IO_STATE_EMIT_THINKING, const] = 1.0
-
-        # Byte tokens 0-255: IS_BYTE + nibble decoding
-        is_byte = D("IS_BYTE")
-        embed_lo = D("EMBED_LO")
-        embed_hi = D("EMBED_HI")
-        clean_lo = D("CLEAN_EMBED_LO")
-        clean_hi = D("CLEAN_EMBED_HI")
-        for b in range(256):
-            embed_weight[b, is_byte] = 1.0
-            embed_weight[b, embed_lo + (b & 0xF)] = 1.0
-            embed_weight[b, embed_hi + ((b >> 4) & 0xF)] = 1.0
-            embed_weight[b, clean_lo + (b & 0xF)] = 1.0
-            embed_weight[b, clean_hi + ((b >> 4) & 0xF)] = 1.0
+    ir = CompilerIR()
+    ir.embeddings.extend(_embedding_bake_rules(V))
+    ir.lower_token_embeddings(_ModelShim(embed_weight), dim_positions)
 
 
 def setup_head_weights(head, dim_positions: Dict[str, int] = None) -> None:
@@ -478,78 +439,48 @@ def setup_head_weights(head, dim_positions: Dict[str, int] = None) -> None:
     _SetDim constants. When `dim_positions` is None, falls back to _SetDim
     (backward-compat with hand-set path).
 
+    Phase 7.D.3 migration: replaced the per-byte / per-marker imperative
+    writes with a call to ``CompilerIR.lower_token_embeddings`` using the
+    same ``_head_bake_rules`` list that the active production op
+    ``make_head_bake_op`` uses -- single source of truth.
+
     Args:
         head: The model.head nn.Linear(d_model, vocab_size) module.
         dim_positions: Optional dict mapping dim name -> start position.
     """
     import torch
-    from ...vm_step import Token, _SetDim
+    from ...vm_step import _SetDim
+    from ..ir import CompilerIR
+    # Local import to avoid module-load cycle (model_ops imports from shared).
+    from .model_ops import _head_bake_rules
 
-    def D(name):
-        if dim_positions is not None and name in dim_positions:
-            return dim_positions[name]
-        return getattr(_SetDim, name)
+    if dim_positions is None:
+        dim_positions = _setdim_to_positions(_SetDim)
 
     with torch.no_grad():
         head.weight.zero_()
         head.bias.zero_()
 
-        next_flags = [
-            D("NEXT_PC"), D("NEXT_AX"), D("NEXT_SP"), D("NEXT_BP"),
-            D("NEXT_STACK0"), D("NEXT_MEM"), D("NEXT_SE"), D("NEXT_HALT"),
-        ]
-        # Optional flags (only present when conversational I/O is enabled)
-        for opt in ("NEXT_TOOL_CALL", "NEXT_THINKING_START", "NEXT_THINKING_END"):
-            try:
-                next_flags.append(D(opt))
-            except AttributeError:
-                pass
+    # Model-like shim so ``lower_token_embeddings`` can resolve
+    # ``model.head.weight`` / ``model.head.bias``. ``lower_token_embeddings``
+    # also touches ``model.embed.embed.weight`` to set ``embed_weight`` when
+    # ``chosen`` is truthy, even when no embed-target rules exist; stub
+    # ``.embed`` to a no-op object so attribute resolution succeeds.
+    class _NullEmbed:
+        weight = None
 
-        OUTPUT_LO = D("OUTPUT_LO")
-        OUTPUT_HI = D("OUTPUT_HI")
-        for b in range(256):
-            lo, hi = b & 0xF, (b >> 4) & 0xF
-            head.weight[b, OUTPUT_LO + lo] = 5.0
-            head.weight[b, OUTPUT_HI + hi] = 5.0
-            head.bias[b] = -5.0
-            for flag in next_flags:
-                head.weight[b, flag] += -80.0
-        head.bias[0] = -4.0
+    class _NullOuter:
+        embed = _NullEmbed()
 
-        vocab_size = head.weight.shape[0]
-        for tok, flag_name in [
-            (Token.REG_PC, "NEXT_PC"),
-            (Token.REG_AX, "NEXT_AX"),
-            (Token.REG_SP, "NEXT_SP"),
-            (Token.REG_BP, "NEXT_BP"),
-            (Token.STACK0, "NEXT_STACK0"),
-            (Token.MEM, "NEXT_MEM"),
-            (Token.STEP_END, "NEXT_SE"),
-            (Token.HALT, "NEXT_HALT"),
-            (Token.TOOL_CALL, "NEXT_TOOL_CALL"),
-            (Token.THINKING_START, "NEXT_THINKING_START"),
-            (Token.THINKING_END, "NEXT_THINKING_END"),
-        ]:
-            if tok >= vocab_size:
-                continue
-            try:
-                head.weight[tok, D(flag_name)] = 20.0
-                head.bias[tok] = -10.0
-            except AttributeError:
-                pass
+    class _ModelShim:
+        def __init__(self, h):
+            self.head = h
+            self.embed = _NullOuter()
 
-        for tok in [
-            Token.CODE_START, Token.CODE_END,
-            Token.DATA_START, Token.DATA_END,
-            Token.SEP, Token.USER_INPUT_START, Token.USER_INPUT_END,
-        ]:
-            if tok < vocab_size:
-                head.bias[tok] = -50.0
-
-        if Token.IO_STATE_EMIT_BYTE < vocab_size:
-            head.bias[Token.IO_STATE_EMIT_BYTE] = -20.0
-        if Token.IO_STATE_EMIT_THINKING < vocab_size:
-            head.bias[Token.IO_STATE_EMIT_THINKING] = -20.0
+    vocab_size = head.weight.shape[0]
+    ir = CompilerIR()
+    ir.embeddings.extend(_head_bake_rules(vocab_size, dim_positions))
+    ir.lower_token_embeddings(_ModelShim(head), dim_positions)
 
 
 # ---------------------------------------------------------------------------

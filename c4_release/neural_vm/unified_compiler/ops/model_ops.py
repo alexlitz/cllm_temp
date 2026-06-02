@@ -4,7 +4,7 @@ from ..ir import CompilerIR, FFNRule, TokenEmbeddingRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
-from .shared import _as_setdim_proxy, setup_token_embeddings, setup_head_weights
+from .shared import _as_setdim_proxy
 
 
 _IO_PUTCHAR_ROUTING_START_UNIT = 1500
