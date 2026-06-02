@@ -1706,7 +1706,7 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         # cells are byte-identical. See .agent-logs/scc_audit_phase8.md.
         reads={"MARK_STACK0", "MARK_SP", "MARK_BP", "H1", "H3", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CMP_PREV_STEP", "CONST"},
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CMP.*.-1", "CONST"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI",
                 "ADDR_B1_LO", "ADDR_B1_HI",
                 "ADDR_B2_LO", "ADDR_B2_HI"},
@@ -1783,7 +1783,7 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
                     # Phase 8.A targeted: CMP_PREV_STEP cross-step alias.
                     # Same numeric position as CMP (396+3=399); byte-
                     # identical at the bake level. See the op-level
-                    # ``reads={... "CMP_PREV_STEP" ...}`` + ``requires=
+                    # ``reads={... "CMP.*.-1" ...}`` + ``requires=
                     # {"after": "layer9_alu"}`` block in
                     # ``make_layer8_sp_gather_bake_op`` for the dep-
                     # graph semantics.
@@ -1845,7 +1845,7 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
                     # Phase 8.A targeted: CMP_PREV_STEP cross-step alias.
                     # Same numeric position as CMP (396+3=399); byte-
                     # identical at the bake level. See the op-level
-                    # ``reads={... "CMP_PREV_STEP" ...}`` + ``requires=
+                    # ``reads={... "CMP.*.-1" ...}`` + ``requires=
                     # {"after": "layer9_alu"}`` block in
                     # ``make_layer8_sp_gather_bake_op`` for the dep-
                     # graph semantics.
@@ -2450,9 +2450,9 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
                "OP_PSH", "OP_JSR", "OP_ENT", "OP_LEV", "OP_JMP", "OP_ADJ",
                "OP_BZ", "OP_BNZ", "OP_EXIT", "MEM_STORE", "MEM_VAL_B2", "L2H0",
                "H1", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
-               "MARK_STACK0", "ADDR_B0_LO_PREV_STEP", "ADDR_B0_HI_PREV_STEP",
-               "ADDR_B1_LO_PREV_STEP", "ADDR_B1_HI_PREV_STEP",
-               "ADDR_B2_LO_PREV_STEP", "ADDR_B2_HI_PREV_STEP",
+               "MARK_STACK0", "ADDR_B0_LO.*.-1", "ADDR_B0_HI.*.-1",
+               "ADDR_B1_LO.*.-1", "ADDR_B1_HI.*.-1",
+               "ADDR_B2_LO.*.-1", "ADDR_B2_HI.*.-1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
         writes={"ALU_LO", "ALU_HI", "AX_FULL_LO", "AX_FULL_HI"},
         kind="block",
