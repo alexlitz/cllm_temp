@@ -353,16 +353,19 @@ def test_l10_post_ops_combined_suppresses_non_comparison_opcodes(
 def test_l10_post_ops_combined_op_metadata_pinned():
     """Pin the load-bearing Operation metadata for ``l10_post_ops_combined``.
 
-    The phase=10.5 + kind="ffn" + ffn_units_used=1846 combination is what
+    The phase=10.5 + kind="ffn" + ffn_units_used=1562 combination is what
     routes this op to L17 in the layout (the dep-graph anchor that ends
     up materialised as block 30 after Phase 0 expansion). Any drift in
-    these fields silently relocates the op.
+    these fields silently relocates the op. The 1562 value matches
+    ``_L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL`` (the actual unit
+    count baked by the rule emitters); the prior 1846 was a stale
+    pre-existing data bug.
     """
     op = make_l10_post_ops_combined()
     assert op.name == "l10_post_ops_combined"
     assert op.phase == 10.5
     assert op.kind == "ffn"
-    assert op.ffn_units_used == 1846
+    assert op.ffn_units_used == 1562
     assert op.migrated is True
     assert op.declarative_authority == "declarative"
     assert "OUTPUT_LO" in op.writes

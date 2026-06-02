@@ -2650,7 +2650,7 @@ def make_l10_post_ops_combined() -> Operation:
         declarative_bake_fn=bake,
         migrated=True,
         declarative_authority="declarative",
-        ffn_units_used=1846,
+        ffn_units_used=1562,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
