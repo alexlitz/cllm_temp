@@ -388,7 +388,19 @@ class Operation:
 # strings. See ``Operation.requires`` docstring for semantics.
 REQUIRES_AFTER_KEY = "after"
 REQUIRES_SAME_LAYER_AS_KEY = "same_layer_as"
-REQUIRES_OP_NAME_KEYS = frozenset({REQUIRES_AFTER_KEY, REQUIRES_SAME_LAYER_AS_KEY})
+# Phase 7.A / SCC-zero residual structural retirement: cross-step "after"
+# edge. The reader consumes the referenced op's output from the PREVIOUS
+# autoregressive step (via the KV cache / residual carry). Treated as a
+# NON-CYCLE edge by every scheduler. See
+# c4_release/docs/NEXT_STEP_AFTER_PRIMITIVE.md.
+REQUIRES_NEXT_STEP_AFTER_KEY = "next_step_after"
+REQUIRES_OP_NAME_KEYS = frozenset(
+    {
+        REQUIRES_AFTER_KEY,
+        REQUIRES_SAME_LAYER_AS_KEY,
+        REQUIRES_NEXT_STEP_AFTER_KEY,
+    }
+)
 
 
 def _requires_op_names(value) -> Tuple[str, ...]:
