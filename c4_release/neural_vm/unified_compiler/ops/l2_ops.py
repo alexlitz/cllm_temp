@@ -300,13 +300,19 @@ def make_layer2_mem_byte_flags_op() -> Operation:
     #   unit 5: BYTE_INDEX_1 + STACK0_BYTE1  (STACK0 byte 1)
     #   unit 6: BYTE_INDEX_2 + STACK0_BYTE2  (STACK0 byte 2)
     #   unit 7: BYTE_INDEX_3 + STACK0_BYTE3  (STACK0 byte 3)
+    #
+    # Phase 8.D follow-up: MEM_VAL_B<n>+0 and BYTE_INDEX_<n>+0 strings
+    # resolve through :func:`dim_ref` for the (memory_lo, val_b<n>) and
+    # (byte_index, "<n>") family lookups. Byte-identical via DimRef.parse.
+    # ``STACK0_BYTE<n>+0`` slots stay bare -- no (category, role)
+    # registry binding.
     _claims = set()
-    _outputs = [
-        "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
-        "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
-    ]
-    for u, out_dim in enumerate(_outputs):
-        _claims.add((2, "ffn_W_down", str(u), f"{out_dim}+0"))
+    _MEM_VAL_ROLES = ["val_b0", "val_b1", "val_b2", "val_b3"]
+    _BYTE_INDEX_ROLES = ["0", "1", "2", "3"]
+    for u, role in enumerate(_MEM_VAL_ROLES):
+        _claims.add((2, "ffn_W_down", str(u), dim_ref("memory_lo", role)))
+    for u, role in enumerate(_BYTE_INDEX_ROLES):
+        _claims.add((2, "ffn_W_down", str(4 + u), dim_ref("byte_index", role)))
     for u, out_dim in (
         (5, "STACK0_BYTE1"),
         (6, "STACK0_BYTE2"),

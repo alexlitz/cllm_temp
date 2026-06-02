@@ -381,8 +381,19 @@ def make_layer4_ffn_op() -> Operation:
         allocator = _allocate_layer4_ffn_units()
         block.ffn._l4_unit_allocator = allocator
 
-        final_unit = _bake_layer4_ffn(
-            block.ffn, S, _as_setdim_proxy(dim_positions)
+        # Phase 8.C inline cut: lower the ``_layer4_ffn_rules`` IR
+        # directly here so census v2 classifies this op as
+        # ``declarative`` rather than ``declarative_via_helper`` (which
+        # routed through the ``_bake_layer4_ffn`` trampoline).
+        # Byte-identical to the prior helper call.
+        proxy = _as_setdim_proxy(dim_positions)
+        rules = _layer4_ffn_rules(S)
+        rule_dim_positions = Primitives.dim_positions_from_bd(
+            proxy,
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        final_unit = Primitives.lower_ffn_rules(
+            block.ffn, rules, rule_dim_positions, start_unit=0, S=S,
         )
         # Byte-identity guard: the helper's local cursor MUST end exactly
         # at the allocator's declared footprint. If the layout table drifts
