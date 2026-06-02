@@ -16,13 +16,17 @@ from c4_release.neural_vm.unified_compiler.ir import (
 )
 from c4_release.neural_vm.unified_compiler.ops.l10_ops import (
     _L10_FFN_UNIT_LAYOUT_MAIN,
+    _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL,
+    _layer10_alu_ax_passthrough_rules,
     _layer10_alu_bitwise_and_rules,
     _layer10_alu_bitwise_or_rules,
     _layer10_alu_bitwise_xor_rules,
-    _layer10_alu_ax_passthrough_rules,
     _layer10_alu_cmp_combine_rules,
+    _layer10_alu_ir,
     _layer10_alu_mul_lo_rules,
+    _layer10_alu_rules,
     _layer10_alu_shl_shr_zero_rules,
+    make_layer10_alu_op,
 )
 from c4_release.neural_vm.unified_compiler.primitives import Primitives
 from c4_release.neural_vm.vm_step import _SetDim, _set_layer10_alu
@@ -296,3 +300,52 @@ def test_layer10_alu_ax_passthrough_rules_compare_symbolic_to_lowered_ffn():
     """Structural ``compare_symbolic_to_lowered_ffn`` parity for ax_passthrough."""
 
     _assert_substage_compare_clean(_layer10_alu_ax_passthrough_rules(100.0))
+
+
+def test_layer10_alu_full_ir_rule_count():
+    """The composite rule list spans all 1846 declared L10 ALU units."""
+
+    rules = _layer10_alu_rules(100.0)
+    assert len(rules) == _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL
+
+
+def test_layer10_alu_full_ir_matches_legacy_helper():
+    """One-shot ``Primitives.lower_ffn_rules`` of the composite IR equals
+    the legacy ``_set_layer10_alu`` byte-for-byte across all 1846 units."""
+
+    actual = _StubFFN()
+    expected = _StubFFN()
+
+    rules = _layer10_alu_rules(100.0)
+    end = _lower_rules(actual, rules, start_unit=0, S=100.0)
+    _set_layer10_alu(expected, 100.0, _SetDim)
+
+    assert end == _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL, (
+        f"composite cursor drift: {end} != {_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL}"
+    )
+    _assert_same_ffn_units(actual, expected, 0, end)
+
+
+def test_layer10_alu_op_exposes_compiler_ir():
+    """``make_layer10_alu_op()`` must attach the composite IR for the
+    declarations-only dispatch path."""
+
+    op = make_layer10_alu_op()
+    assert op.compiler_ir is not None
+    assert (
+        len(op.compiler_ir.layer(0).ffn.rules)
+        == _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL
+    )
+
+
+def test_layer10_alu_ir_factory_is_idempotent():
+    """``_layer10_alu_ir`` rebuilds a fresh ``CompilerIR`` per call."""
+
+    ir_a = _layer10_alu_ir(100.0)
+    ir_b = _layer10_alu_ir(100.0)
+    assert ir_a is not ir_b
+    assert (
+        len(ir_a.layer(0).ffn.rules)
+        == len(ir_b.layer(0).ffn.rules)
+        == _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL
+    )

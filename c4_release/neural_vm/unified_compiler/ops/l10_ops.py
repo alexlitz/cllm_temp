@@ -480,6 +480,52 @@ def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer10_alu_rules(S: float) -> tuple[FFNRule, ...]:
+    """Composite ordered ``FFNRule`` sequence for ``layer10_alu``.
+
+    Concatenates all seven sub-stage rule lists in the exact order
+    declared by ``_L10_FFN_UNIT_LAYOUT_MAIN`` so a single
+    ``Primitives.lower_ffn_rules`` call lowers the entire 1846-unit FFN
+    in cursor order (matching the legacy ``_set_layer10_alu`` walk
+    byte-for-byte).
+    """
+
+    return (
+        _layer10_alu_cmp_combine_rules(S)
+        + _layer10_alu_bitwise_or_rules(S)
+        + _layer10_alu_bitwise_xor_rules(S)
+        + _layer10_alu_bitwise_and_rules(S)
+        + _layer10_alu_mul_lo_rules(S)
+        + _layer10_alu_shl_shr_zero_rules(S)
+        + _layer10_alu_ax_passthrough_rules(S)
+    )
+
+
+def _layer10_alu_ir(S: float = 100.0) -> CompilerIR:
+    """Build the declarative ``CompilerIR`` exposed by ``layer10_alu``."""
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer10_alu_rules(S))
+    return ir
+
+
+def _bake_layer10_alu_rules(ffn, S: float, BD) -> int:
+    """Lower the composite ``layer10_alu`` rule list into ``ffn``.
+
+    Returns the post-bake unit cursor (must equal
+    :data:`_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL` for byte-identity with the
+    historical 1846-unit footprint of ``vm_step._set_layer10_alu``).
+    """
+
+    rules = _layer10_alu_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD, Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn, rules, dim_positions, start_unit=0, S=S,
+    )
+
+
 def _bake_layer10_carry_relay_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 0 carry relay spec."""
     Primitives.generate_attention_head(
@@ -1714,29 +1760,37 @@ def make_layer10_alu_op() -> Operation:
     now owns the bake. (Per Unit 9 diagnosis, this migration is SAFE so
     long as ``make_l10_post_op_attach_op`` is NOT modified.)
 
+    Phase 6 Wave 4I (2026-06-01): the bake is now driven entirely by
+    declarative ``FFNRule`` data via ``_layer10_alu_rules`` /
+    ``_bake_layer10_alu_rules``. ``vm_step._set_layer10_alu`` is no
+    longer called; the per-sub-stage byte-identity tests in
+    ``test_declarative_ffn_bakes_l10_alu.py`` pin the rules against the
+    legacy helper for all seven sub-stages (cmp_combine, bitwise OR /
+    XOR / AND, mul_lo, shl_shr_zero, ax_passthrough).
+
     Declarations-only note: this migrated owner is now exposed through the
     declarations-only dispatcher so strict builds do not fall back to legacy
     model bake.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer10_alu
-
-        # Per-bake FFN-unit allocator. Every sub-stage of
-        # ``_set_layer10_alu`` is pinned at its existing offset so the
-        # underlying writes land byte-identically. The allocator object
-        # is stashed on ``block.ffn`` so downstream tools (a future L10
-        # op family, the per-op audit, etc.) can inspect or extend the
-        # layout without re-reading the helper source.
+        # Per-bake FFN-unit allocator. Every sub-stage of the legacy
+        # ``_set_layer10_alu`` helper is pinned at its existing offset
+        # so the rule lowering below lands byte-identically. The
+        # allocator object is stashed on ``block.ffn`` so downstream
+        # tools (a future L10 op family, the per-op audit, etc.) can
+        # inspect or extend the layout without re-reading the helper
+        # source.
         allocator = _allocate_l10_main_ffn_units()
         block.ffn._l10_unit_allocator = allocator
 
-        n10 = _set_layer10_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
-        # Byte-identity guard: the helper's local cursor MUST end
-        # exactly at the total declared in the layout table. If the
-        # table drifts from the helper's writes, this assertion fires
-        # before any later op stages a write past the declared end.
+        proxy = _as_setdim_proxy(dim_positions)
+        n10 = _bake_layer10_alu_rules(block.ffn, S, proxy)
+        # Byte-identity guard: the rule lowering's final cursor MUST
+        # equal the total declared in ``_L10_FFN_UNIT_LAYOUT_MAIN``. If
+        # any sub-stage rule generator drifts, this fires before the
+        # mismatch propagates to downstream layers.
         assert n10 == _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL, (
-            f"L10 ALU unit cursor drift: helper returned {n10}, "
+            f"L10 ALU unit cursor drift: rules lowered {n10} units, "
             f"allocator expected {_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL}"
         )
 
@@ -1749,6 +1803,7 @@ def make_layer10_alu_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer10_alu_ir(),
         declarative_authority="spec_generated",
         layer_idx=10,
         migrated=True,
