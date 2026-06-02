@@ -564,7 +564,6 @@ def make_layer15_memory_lookup_op() -> Operation:
                "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "CMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
-        layer_idx=15,
         declarative_bake_fn=bake,
         # ``compiler_ir_factory`` surfaces the L15 head structure as
         # data so the declarations-only path can audit it without
@@ -574,6 +573,13 @@ def make_layer15_memory_lookup_op() -> Operation:
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
+        # Phase 8.A.4: dropped ``layer_idx=15``. The dep graph already
+        # forces a layer >= L14 via reads on ``AX_CARRY_LO`` /
+        # ``AX_CARRY_HI`` / ``ADDR_KEY`` (produced by L14 attn/ffn ops);
+        # ``requires["after"] = "layer14_mem_generation"`` backs the
+        # constraint with a block-op-aware edge so the dynamic scheduler
+        # still lands the op at layer 15.
+        requires={"after": "layer14_mem_generation"},
         smoke_tests={
             "TestSmokeMemory::test_sc_lc_roundtrip",
             "TestSmokeMemory::test_si_li_roundtrip",
@@ -652,12 +658,17 @@ def make_layer15_store_stack0_sp_byte0_addr_op() -> Operation:
         },
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
-        layer_idx=15,
+        # Phase 8.A.4: dropped ``layer_idx=15`` pin. The block op binds
+        # to whichever layer the compiler placed ``layer15_memory_lookup``
+        # (the L15 attn op that owns the layer slot). ``requires["after"]``
+        # encodes the same constraint at the scheduler level.
+        target_op_name="layer15_memory_lookup",
         declarative_bake_fn=bake,
         declarative_authority="declarative",
         compiler_ir_factory=_layer15_store_stack0_sp_byte0_addr_ir,
         migrated=True,
         alibi_slopes={12: 1.0},
+        requires={"after": "layer15_memory_lookup"},
         smoke_tests={
             "TestSmokeMemory::test_si_li_roundtrip",
         },
@@ -788,7 +799,10 @@ def make_layer15_si_mem_addr0_from_stack0_op() -> Operation:
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
-        layer_idx=15,
+        # Phase 8.A.4: dropped ``layer_idx=15`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer15_memory_lookup`` (the L15 attn op).
+        target_op_name="layer15_memory_lookup",
         declarative_bake_fn=bake,
         declarative_authority="declarative",
         compiler_ir_factory=_layer15_si_mem_addr0_from_stack0_ir,
@@ -1508,10 +1522,12 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
 def make_layer15_nibble_copy_op() -> Operation:
     """L15 FFN: Conditional nibble copy OUTPUT = EMBED for non-register byte values.
 
-    Pinned to ``layer_idx=15`` via ``kind="block"`` so the bake hits block 15's
-    FFN regardless of dep-graph placement. ``migrated=True`` claims this bake
-    from the legacy ``set_vm_weights`` pipeline (the inline call has been
-    removed at the original site).
+    Bound to the same block as ``layer15_memory_lookup`` via
+    ``target_op_name`` (Phase 8.A.4 drop of the literal ``layer_idx=15``
+    pin) so the bake hits whichever block the compiler picks for the L15
+    attn op. ``migrated=True`` claims this bake from the legacy
+    ``set_vm_weights`` pipeline (the inline call has been removed at the
+    original site).
     """
     def bake(block, dim_positions, S):
         # Per-bake FFN-unit allocator. Each L15 nibble-copy sub-stage is
@@ -1551,8 +1567,14 @@ def make_layer15_nibble_copy_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_l15_nibble_copy_ir(),
-        layer_idx=15,
+        # Phase 8.A.4: dropped ``layer_idx=15`` pin in favour of
+        # ``target_op_name``. The block binds to whichever layer the
+        # compiler placed ``layer15_memory_lookup`` at, and the per-block
+        # FFN sizing aggregate honours ``target_op_name`` as well so
+        # ``ffn_units_used=42`` still routes to the same target layer.
+        target_op_name="layer15_memory_lookup",
         migrated=True,
+        requires={"after": "layer15_memory_lookup"},
         # ``_set_nibble_copy_ffn`` writes 40 units (see vm_step.py:2411):
         #   16 LO copy + 16 HI copy + 2 PSH SP byte0 + 2 PSH SP byte1 +
         #   2 PSH SP byte2 + 2 PSH BP byte2 + 2 LEA first-step AX byte2 = 42.
@@ -1670,7 +1692,10 @@ def make_l15_attention_resize_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         phase=14.9,
-        layer_idx=15,
+        # Phase 8.A.4: dropped ``layer_idx=15`` pin in favour of
+        # ``target_op_name``. Binds to whichever layer the compiler
+        # placed ``layer15_memory_lookup`` (the L15 attn op).
+        target_op_name="layer15_memory_lookup",
         migrated=True,
         declarative_authority="structural_model",
         # B12 backfill (wave 1c): structural cleanup that resizes L15
