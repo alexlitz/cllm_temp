@@ -260,12 +260,31 @@ class Primitives:
                 Primitives.generate_attention_head(attn, spec, HD)
             return
         ordered = sorted(spec_list, key=lambda s: int(s.head_idx))
-        running_base = 0
+        # V1/V2 vision (per-head dynamic head_dim): track cumulative Q/O
+        # bases over Q-heads AND cumulative K/V bases over KV-head groups
+        # so the GQA layout (multiple Q heads sharing one KV row block)
+        # composes cleanly with dynamic head_dim. At ``group_size=1``
+        # (vanilla MHA) every Q head IS its own KV head, so the two
+        # cumulative sums coincide — byte-identical with the prior MHA
+        # cumulative loop. At ``group_size>1`` only the first Q head in
+        # each group advances ``running_kv_base`` (its K/V block is then
+        # re-used by the rest of the group via ``kv_bases``).
+        running_q_base = 0
+        kv_bases: dict = {}
+        running_kv_base = 0
         for spec in ordered:
+            kv_idx = int(spec.kv_head_idx)
+            if kv_idx not in kv_bases:
+                kv_bases[kv_idx] = running_kv_base
+                running_kv_base += spec.effective_head_dim(HD)
             Primitives.generate_attention_head(
-                attn, spec, HD, head_base=running_base
+                attn,
+                spec,
+                HD,
+                head_base=running_q_base,
+                kv_head_base=kv_bases[kv_idx],
             )
-            running_base += spec.effective_head_dim(HD)
+            running_q_base += spec.effective_head_dim(HD)
 
     @staticmethod
     def threshold_attention_head_spec(
