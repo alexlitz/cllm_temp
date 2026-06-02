@@ -272,6 +272,726 @@ def _addr_mag_boost_o(dim_base):
     return tuple(writes)
 
 
+# === layer8_alu FFNRule migration ===================================
+#
+# The L8 ALU helper (``vm_step._set_layer8_alu``) writes ~2023 hidden units
+# arranged in 18 sub-stages (see :data:`_L8_FFN_UNIT_LAYOUT`). Each
+# sub-stage below returns a tuple of :class:`FFNRule` that lowers to the
+# same per-unit ``W_up`` / ``b_up`` / ``W_gate`` / ``b_gate`` / ``W_down``
+# writes the imperative helper produces, byte-for-byte.
+#
+# Substage cursor layout (matches _L8_FFN_UNIT_LAYOUT, also re-stated here
+# for cross-reference):
+#
+#   0..255      add_lo          (ADD lo nibble, gate=OP_ADD)
+#   256..511    lea_lo          (LEA lo nibble, gate=OP_LEA, FETCH_LO)
+#   512..767    sub_lo          (SUB lo nibble, gate=OP_SUB)
+#   768..887    add_carry       (ADD carry, gate=OP_ADD, 120 pairs)
+#   888..1007   lea_carry       (LEA carry, gate=OP_LEA, FETCH_LO, 120)
+#   1008..1263  adj_lo          (ADJ lo nibble, gate=OP_ADJ, FETCH_LO)
+#   1264..1383  adj_carry       (ADJ carry, gate=OP_ADJ, FETCH_LO, 120)
+#   1384..1503  sub_borrow      (SUB borrow, gate=OP_SUB, 120 pairs a<b)
+#   1504..1759  ent_lo          (ENT lo nibble, gate=OP_ENT, FETCH_LO)
+#   1760..1979  ent_borrow      (ENT borrow, 220 pairs, gate=OP_ENT)
+#   1980        cmp_group       (any comparison opcode flag; 1 unit)
+#   1981..1984  cmp_clear       (clear CMP[0..3] at AX marker; 4 units)
+#   1985..1986  ent_adj_defaults (ENT/ADJ first-step ALU defaults; 2)
+#   1987..2002  lev_byte0_lo    (LEV BP byte0 lo → ADDR_B0_LO; 16)
+#   2003..2018  lev_byte0_hi    (LEV BP byte0 hi → ADDR_B0_HI; 16)
+#   2019        lev_b1          (LEV ADDR_B1_LO zero; 1)
+#   2020        lev_b2          (LEV ADDR_B2_LO zero; 1)
+#   2021..2022  lea_axb2        (LEA first-step AX byte 2; 2)
+#
+# Each rule's ``scope=`` mirrors the helper's intent (the dim-presence
+# conjunction that the unit fires on). The ``dominates_at=`` field is
+# left at the rule-level scope; per-output dominance disambiguation is
+# only needed when a rule writes multiple output dims with different
+# competition shapes -- in this helper every rule writes either a
+# single OUTPUT_LO[k] / CARRY+0 / CMP_GROUP / ADDR_B*_LO[k] / ALU_*[0]
+# cell, so the scope is unambiguous.
+
+
+def _layer8_alu_block_non_ax_marker_conditions() -> tuple[tuple[str, float], ...]:
+    """LEA/ADJ/ENT non-AX-marker blockers (-S * 1000 on each blocker dim).
+
+    These mirror ``_block_non_ax_marker_sites`` inside ``_set_layer8_alu``:
+    blockers prevent the unit from firing at non-AX marker sites where
+    scale-40 LEA/ADJ/ENT operand fetch residuals could otherwise sneak
+    the unit on. Returned as condition terms (weight=-1000) so the
+    ``Primitives.lower_ffn_rules`` scales them by S, matching the
+    ``-S * 1000`` imperative writes.
+    """
+    return (
+        ("MARK_PC", -1000.0),
+        ("MARK_SP", -1000.0),
+        ("MARK_BP", -1000.0),
+        ("MARK_STACK0", -1000.0),
+        ("MARK_MEM", -1000.0),
+        ("MARK_SE", -1000.0),
+        ("IS_BYTE", -1000.0),
+    )
+
+
+def _layer8_alu_add_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADD lo nibble (256 units, offsets 0..255).
+
+    For each (a, b) pair in 16x16, fire when MARK_AX active, ALU_LO[a]
+    and AX_CARRY_LO[b] both one-hot, OP_ADD gating. MARK_PC blocker
+    (-S * 4) suppresses the unit at PC marker where L6 head 0 / L7
+    attention leakage could otherwise sneak it on. Writes
+    OUTPUT_LO[(a+b) mod 16] at 2.0/S.
+    """
+    write_scale = 2.0 / S
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            result = (a + b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_add_lo_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -4.0),
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"AX_CARRY_LO+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="OP_ADD",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_ADD",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_ADD",
+                },
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_lea_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEA lo nibble (256 units, offsets 256..511).
+
+    Like ADD lo but reads operand-B from FETCH_LO (one-hot) instead of
+    AX_CARRY_LO, gates on OP_LEA, and uses the strong MARK_AX
+    requirement (60) + the non-AX-marker blocker set (-1000 on each of
+    MARK_PC/SP/BP/STACK0/MEM/SE/IS_BYTE). FETCH_LO contributes at
+    weight 20.
+    """
+    write_scale = 2.0 / S
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            result = (a + b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_lea_lo_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"FETCH_LO+{b}", 20.0),
+                ),
+                threshold=80.5,
+                gate="OP_LEA",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_LEA",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_LEA",
+                },
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_sub_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """SUB lo nibble (256 units, offsets 512..767).
+
+    C4 semantics: AX = stack_top - AX, so result = ALU_LO[a] - AX_CARRY_LO[b].
+    Same structural shape as ADD lo (gate=OP_SUB).
+    """
+    write_scale = 2.0 / S
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            result = (a - b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_sub_lo_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -4.0),
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"AX_CARRY_LO+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="OP_SUB",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_SUB",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_SUB",
+                },
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADD carry detection (120 units, offsets 768..887).
+
+    Same conditions as add_lo (MARK_AX + ALU_LO[a] + AX_CARRY_LO[b],
+    MARK_PC blocker, OP_ADD gate) but only emits a unit when
+    ``a + b >= 16`` (carry-out from the lo nibble). Writes CARRY+0
+    normalized by 2.0/(S*5.0) so the gated output ~1 after scaling.
+    """
+    carry_scale = 2.0 / (S * 5.0)
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            if a + b < 16:
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_add_carry_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -4.0),
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"AX_CARRY_LO+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="OP_ADD",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_ADD",
+                dominates_at={"CARRY+0": "MARK_AX and OP_ADD"},
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEA carry detection (120 units, offsets 888..1007).
+
+    Same structural shape as lea_lo (gate=OP_LEA, FETCH_LO operand,
+    non-AX blockers) but only emits when ``a + b >= 16``. Writes
+    CARRY+0 at the same 2.0/(S*5.0) normalization as ADD carry.
+    """
+    carry_scale = 2.0 / (S * 5.0)
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            if a + b < 16:
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_lea_carry_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"FETCH_LO+{b}", 20.0),
+                ),
+                threshold=80.5,
+                gate="OP_LEA",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_LEA",
+                dominates_at={"CARRY+0": "MARK_AX and OP_LEA"},
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADJ lo nibble (256 units, offsets 1008..1263).
+
+    ADJ computes SP = SP + signed_immediate. Reads ALU_LO (SP lo nibble
+    from L7) and FETCH_LO (immediate). Gate=OP_ADJ; threshold tuned
+    higher (85) than LEA (80.5) to reflect the helper's empirical
+    margin.
+    """
+    write_scale = 2.0 / S
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            result = (a + b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_adj_lo_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"FETCH_LO+{b}", 20.0),
+                ),
+                threshold=85.0,
+                gate="OP_ADJ",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_ADJ",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_ADJ",
+                },
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_adj_carry_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADJ carry detection (120 units, offsets 1264..1383)."""
+
+    carry_scale = 2.0 / (S * 5.0)
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            if a + b < 16:
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_adj_carry_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"FETCH_LO+{b}", 20.0),
+                ),
+                threshold=85.0,
+                gate="OP_ADJ",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_ADJ",
+                dominates_at={"CARRY+0": "MARK_AX and OP_ADJ"},
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
+    """SUB borrow detection (120 units, offsets 1384..1503).
+
+    Borrow occurs when ALU_LO[a] < AX_CARRY_LO[b] (stack_top < AX in
+    this nibble). Mirrors SUB lo structure with gate=OP_SUB.
+    """
+    carry_scale = 2.0 / (S * 5.0)
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            if a >= b:
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_sub_borrow_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -4.0),
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"AX_CARRY_LO+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="OP_SUB",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_SUB",
+                dominates_at={"CARRY+0": "MARK_AX and OP_SUB"},
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT lo nibble subtraction (256 units, offsets 1504..1759).
+
+    ENT computes SP = SP - (8 + signed_immediate). For lo nibble:
+    result = (sp_lo - (8 + imm_lo)) mod 16. sp_lo from ALU_LO,
+    imm_lo from FETCH_LO. Gate=OP_ENT, threshold=85.
+    """
+    write_scale = 2.0 / S
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for sp_lo in range(16):
+        for imm_lo in range(16):
+            effective_b = (8 + imm_lo) % 16
+            result = (sp_lo - effective_b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_ent_lo_sp{sp_lo}_imm{imm_lo}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{sp_lo}", 1.0),
+                    (f"FETCH_LO+{imm_lo}", 20.0),
+                ),
+                threshold=85.0,
+                gate="OP_ENT",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_ENT",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_ENT",
+                },
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT borrow detection (220 units, offsets 1760..1979).
+
+    Borrow when sp_lo < (8 + imm_lo) mod 16, or when (8 + imm_lo) >= 16
+    (carry out of byte 0 into byte 1). The condition is asymmetric
+    because the +8 constant offset can itself produce a byte-1 carry.
+    """
+    carry_scale = 2.0 / (S * 5.0)
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for sp_lo in range(16):
+        for imm_lo in range(16):
+            full_sum = 8 + imm_lo
+            if not (sp_lo < (full_sum % 16) or full_sum >= 16):
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_ent_borrow_sp{sp_lo}_imm{imm_lo}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{sp_lo}", 1.0),
+                    (f"FETCH_LO+{imm_lo}", 20.0),
+                ),
+                threshold=85.0,
+                gate="OP_ENT",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_ENT",
+                dominates_at={"CARRY+0": "MARK_AX and OP_ENT"},
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_cmp_group_rules(S: float) -> tuple[FFNRule, ...]:
+    """CMP_GROUP flag (1 unit, offset 1980).
+
+    Fires ~1.0 when any comparison opcode (EQ/NE/LT/GT/LE/GE) is active
+    at the AX marker. OP_* flags ~5 each, MARK_AX = 1; threshold=1.5
+    keeps the unit silent at non-cmp opcodes. W_down normalized by
+    2.0/(S*9) so silu(S*~4.5)*1 * 2/(S*9) ≈ 1.0.
+    """
+    write_scale = 2.0 / (S * 9.0)
+    return (
+        FFNRule.constant_write(
+            name="l8_alu_cmp_group",
+            conditions=(
+                ("OP_EQ", 1.0),
+                ("OP_NE", 1.0),
+                ("OP_LT", 1.0),
+                ("OP_GT", 1.0),
+                ("OP_LE", 1.0),
+                ("OP_GE", 1.0),
+                ("MARK_AX", 1.0),
+            ),
+            threshold=1.5,
+            writes=(("CMP_GROUP+0", write_scale),),
+            scope="MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+            dominates_at={
+                "CMP_GROUP+0":
+                    "MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+            },
+        ),
+    )
+
+
+def _layer8_alu_cmp_clear_rules(S: float) -> tuple[FFNRule, ...]:
+    """CMP[0..3] clearing at AX marker (4 units, offsets 1981..1984).
+
+    L6 attention relay heads write JMP/EXIT/PSH/POP flags to CMP[0..3]
+    at every position, including the AX marker -- which would pollute
+    the comparison flag dims at the AX marker if not cleared. Each
+    unit negates CMP[k] at MARK_AX via the gated read:
+    silu(S * CMP[k]) * silu(S/2) * (-2 / S^2) ≈ -CMP[k].
+
+    Note: the legacy unit sets ``W_gate[unit, MARK_AX] = S`` (not 1.0)
+    and ``b_gate = -S/2``. We encode this with ``gate_weight=S`` /
+    ``gate_bias=-S/2`` because the lowerer applies them directly
+    without the S scaling that conditions get.
+    """
+    write_scale = -2.0 / (S * S)
+    rules = []
+    for k in range(4):
+        rules.append(FFNRule.gated_write(
+            name=f"l8_alu_cmp_clear_k{k}",
+            conditions=((f"CMP+{k}", 1.0),),
+            threshold=0.0,
+            gate="MARK_AX",
+            gate_weight=S,
+            gate_bias=-S * 0.5,
+            writes=((f"CMP+{k}", write_scale),),
+            scope="MARK_AX",
+            dominates_at={f"CMP+{k}": "MARK_AX"},
+        ))
+    return tuple(rules)
+
+
+def _layer8_alu_ent_adj_defaults_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT/ADJ first-step ALU defaults (2 units, offsets 1985..1986).
+
+    For the first step (NOT HAS_SE), L7 attention can't gather SP
+    because the SP marker is AFTER the AX marker (causal attention).
+    For ENT/ADJ with initial SP = 0, we need ALU_LO[0] > 0 and
+    ALU_HI[0] > 0. These units fire when OP_ENT or OP_ADJ + MARK_AX +
+    NOT HAS_SE. MARK_SP blocker prevents firing at the SP marker
+    (where OP_ENT can be relayed). Output weight 50/S overrides L7's
+    garbage write (~-32).
+
+    Constant write (W_gate untouched, b_gate=1.0) because the original
+    helper uses the SiLU path for gating (b_gate=1.0 only, no W_gate
+    write).
+    """
+    output_weight = 50.0 / S
+    rules = []
+    for alu_base in ("ALU_LO", "ALU_HI"):
+        rules.append(FFNRule.constant_write(
+            name=f"l8_alu_ent_adj_default_{alu_base.lower()}",
+            conditions=(
+                ("OP_ENT", 1.0 / 3.0),
+                ("OP_ADJ", 1.0 / 3.0),
+                ("MARK_AX", 2.0),
+                ("MARK_SP", -10.0),
+                ("HAS_SE", -10.0),
+            ),
+            threshold=6.0,
+            writes=((f"{alu_base}+0", output_weight),),
+            scope="MARK_AX and (OP_ENT or OP_ADJ) and not HAS_SE",
+            dominates_at={
+                f"{alu_base}+0":
+                    "MARK_AX and (OP_ENT or OP_ADJ) and not HAS_SE",
+            },
+        ))
+    return tuple(rules)
+
+
+def _layer8_alu_lev_byte0_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV BP byte 0 lo nibble relay (16 units, offsets 1987..2002).
+
+    For L15 to read memory at BP and BP+8, BP's address value must be
+    encoded in ADDR_B0/B1/B2 dims at the BP marker position. This
+    substage relays OUTPUT_LO[k] -> ADDR_B0_LO[k] at MARK_BP when
+    OP_LEV is active (gated on OUTPUT_LO[k]). MARK_PC blocker
+    (-S * 10) excludes the PC marker where OP_LEV is amplified ~10.
+    """
+    write_scale = 2.0 / (S * 9.0)
+    rules = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l8_alu_lev_byte0_lo_k{k}",
+            conditions=(
+                ("OP_LEV", 1.0),
+                ("MARK_BP", 1.0),
+                ("MARK_PC", -10.0),
+            ),
+            threshold=1.5,
+            gate=f"OUTPUT_LO+{k}",
+            writes=((f"ADDR_B0_LO+{k}", write_scale),),
+            scope="OP_LEV and MARK_BP and not MARK_PC",
+            dominates_at={
+                f"ADDR_B0_LO+{k}": "OP_LEV and MARK_BP and not MARK_PC",
+            },
+        ))
+    return tuple(rules)
+
+
+def _layer8_alu_lev_byte0_hi_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV BP byte 0 hi nibble relay (16 units, offsets 2003..2018)."""
+
+    write_scale = 2.0 / (S * 9.0)
+    rules = []
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"l8_alu_lev_byte0_hi_k{k}",
+            conditions=(
+                ("OP_LEV", 1.0),
+                ("MARK_BP", 1.0),
+                ("MARK_PC", -10.0),
+            ),
+            threshold=1.5,
+            gate=f"OUTPUT_HI+{k}",
+            writes=((f"ADDR_B0_HI+{k}", write_scale),),
+            scope="OP_LEV and MARK_BP and not MARK_PC",
+            dominates_at={
+                f"ADDR_B0_HI+{k}": "OP_LEV and MARK_BP and not MARK_PC",
+            },
+        ))
+    return tuple(rules)
+
+
+def _layer8_alu_lev_b1_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV ADDR_B1_LO[0] zero (1 unit, offset 2019).
+
+    For small addresses (< 256), bytes 1-2 of the LEV-relayed BP
+    address are zero. This unit writes ADDR_B1_LO[0] at the
+    LEV + BP marker site (no MARK_PC exclusion in legacy -- the unit
+    fires at PC marker too, which is harmless since the write target
+    is ADDR_B1_LO, not the OUTPUT bank that drives PC).
+
+    The legacy helper writes ``W_gate[unit, CONST] = 1.0`` (no
+    explicit b_gate), so we use ``FFNRule.gated_write(gate="CONST",
+    gate_weight=1.0, gate_bias=0.0)`` to reproduce the exact W_gate
+    cell write. CONST is always 1.0 at runtime so the gate value is
+    identical to the b_gate=1.0 form, but this keeps the matrix
+    byte-identical for the verifier.
+    """
+    write_scale = 2.0 / (S * 9.0)
+    return (
+        FFNRule.gated_write(
+            name="l8_alu_lev_b1",
+            conditions=(
+                ("OP_LEV", 1.0),
+                ("MARK_BP", 1.0),
+            ),
+            threshold=1.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("ADDR_B1_LO+0", write_scale),),
+            scope="OP_LEV and MARK_BP",
+            dominates_at={"ADDR_B1_LO+0": "OP_LEV and MARK_BP"},
+        ),
+    )
+
+
+def _layer8_alu_lev_b2_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV ADDR_B2_LO[0] zero (1 unit, offset 2020).
+
+    Same byte-identity rationale as ``_layer8_alu_lev_b1_rules``: the
+    legacy helper writes ``W_gate[unit, CONST] = 1.0``, so the rule
+    uses ``FFNRule.gated_write(gate="CONST", gate_weight=1.0,
+    gate_bias=0.0)``.
+    """
+    write_scale = 2.0 / (S * 9.0)
+    return (
+        FFNRule.gated_write(
+            name="l8_alu_lev_b2",
+            conditions=(
+                ("OP_LEV", 1.0),
+                ("MARK_BP", 1.0),
+            ),
+            threshold=1.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("ADDR_B2_LO+0", write_scale),),
+            scope="OP_LEV and MARK_BP",
+            dominates_at={"ADDR_B2_LO+0": "OP_LEV and MARK_BP"},
+        ),
+    )
+
+
+def _layer8_alu_lea_axb2_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEA first-step AX byte 2 output (2 units, offsets 2021..2022).
+
+    BP = 0x10000 so byte 2 = 0x01. Fires only on first step
+    (NOT HAS_SE) at AX byte 1 position (BYTE_INDEX_1) when L7 head 5
+    has relayed OP_LEA into CMP[7]. The two units write:
+      * OUTPUT_LO+1 = +4/S  AND  OUTPUT_LO+0 = -4/S  (single unit, two writes)
+      * OUTPUT_HI+0 = +2/S  (single unit, one write)
+
+    Both use ``b_gate = 1.0`` (no explicit W_gate) so they're
+    constant_write rules.
+    """
+    return (
+        FFNRule.constant_write(
+            name="l8_alu_lea_axb2_lo",
+            conditions=(
+                ("CMP+7", 1.0),
+                ("H1+1", 1.0),
+                ("IS_BYTE", 1.0),
+                ("BYTE_INDEX_1", 1.0),
+                ("HAS_SE", -1.0),
+            ),
+            threshold=3.5,
+            writes=(
+                ("OUTPUT_LO+1", 4.0 / S),
+                ("OUTPUT_LO+0", -4.0 / S),
+            ),
+            scope="CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            dominates_at={
+                "OUTPUT_LO+1":
+                    "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+                "OUTPUT_LO+0":
+                    "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            },
+        ),
+        FFNRule.constant_write(
+            name="l8_alu_lea_axb2_hi",
+            conditions=(
+                ("CMP+7", 1.0),
+                ("H1+1", 1.0),
+                ("IS_BYTE", 1.0),
+                ("BYTE_INDEX_1", 1.0),
+                ("HAS_SE", -1.0),
+            ),
+            threshold=3.5,
+            writes=(("OUTPUT_HI+0", 2.0 / S),),
+            scope="CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            dominates_at={
+                "OUTPUT_HI+0":
+                    "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            },
+        ),
+    )
+
+
+def _layer8_alu_rules(S: float) -> tuple[FFNRule, ...]:
+    """Full ordered ``FFNRule`` sequence for ``layer8_alu``.
+
+    Concatenates the 18 sub-stage rule tuples in cursor order so the
+    composite list lowers byte-identically against
+    ``_set_layer8_alu``. Total: 2023 rules covering offsets 0..2022.
+    """
+    return (
+        _layer8_alu_add_lo_rules(S)
+        + _layer8_alu_lea_lo_rules(S)
+        + _layer8_alu_sub_lo_rules(S)
+        + _layer8_alu_add_carry_rules(S)
+        + _layer8_alu_lea_carry_rules(S)
+        + _layer8_alu_adj_lo_rules(S)
+        + _layer8_alu_adj_carry_rules(S)
+        + _layer8_alu_sub_borrow_rules(S)
+        + _layer8_alu_ent_lo_rules(S)
+        + _layer8_alu_ent_borrow_rules(S)
+        + _layer8_alu_cmp_group_rules(S)
+        + _layer8_alu_cmp_clear_rules(S)
+        + _layer8_alu_ent_adj_defaults_rules(S)
+        + _layer8_alu_lev_byte0_lo_rules(S)
+        + _layer8_alu_lev_byte0_hi_rules(S)
+        + _layer8_alu_lev_b1_rules(S)
+        + _layer8_alu_lev_b2_rules(S)
+        + _layer8_alu_lea_axb2_rules(S)
+    )
+
+
+def _layer8_alu_ir(S: float = 100.0) -> CompilerIR:
+    """Build the L8 ALU CompilerIR (single FFN op, 2023 rules).
+
+    Exposes ``layer8_alu``'s full declarative spec as
+    ``Operation.compiler_ir`` so the verifier, scope checker, and
+    dominance auditor can read the per-rule semantics. The bake path
+    drives the imperative pin via ``lower_layer8_alu_ir`` so the
+    weights land at units 0..2022, exactly where the legacy
+    ``_set_layer8_alu`` helper used to write.
+    """
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer8_alu_rules(S))
+    return ir
+
+
+def lower_layer8_alu_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    start_unit: int = 0,
+) -> int:
+    """Lower L8 ALU rules into ``ffn`` and return the next unit cursor.
+
+    The companion to ``lower_layer8_multibyte_routing_ir``: the bake
+    path calls this from ``make_layer8_alu_op``'s ``bake_fn`` so the
+    weights land at the same offsets the imperative helper used to
+    write. Symbolic / verifier tooling reads the same rule list via
+    ``_layer8_alu_ir`` (attached as ``compiler_ir`` on the Operation).
+    """
+
+    rules = _layer8_alu_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=start_unit,
+        S=S,
+    )
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
@@ -283,14 +1003,21 @@ def make_layer8_alu_op() -> Operation:
     after format_pointer_extraction (7.5) and the L8 multibyte_fetch
     bake (8.1), and before format_position_counter (8.5) — matching the
     legacy in-set_vm_weights ordering.
+
+    MIGRATED 2026 Phase 6 Wave 4F: the imperative ``_set_layer8_alu``
+    bake is replaced with a declarative ``FFNRule`` list lowered via
+    ``Primitives.lower_ffn_rules`` (see ``lower_layer8_alu_ir`` and the
+    18 ``_layer8_alu_<substage>_rules`` factories). The ``vm_step``
+    helper is still imported by ``layer8_multibyte_routing`` for cursor
+    recovery (an idempotent overwrite of the same weights), so it
+    stays in place; this op no longer calls it. ``compiler_ir`` exposes
+    the rule spec to verifier / scope / dominance tooling.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer8_alu
-
         # Per-bake FFN-unit allocator. ``layer8_alu`` claims the whole
-        # 0..2023 cluster via its sub-stage rows; the helper's local
-        # ``unit = 0`` counter walks that range byte-identically. The
-        # allocator is the structured manifest of those offsets so a
+        # 0..2023 cluster via its sub-stage rows; the declarative
+        # lowerer's start_unit=0 cursor walks that range byte-identically.
+        # The allocator is the structured manifest of those offsets so a
         # future op claiming a free L8 gap goes through
         # ``allocator.alloc(...)`` instead of hand-picking another
         # offset. Stash on ``block.ffn`` (mirrors the
@@ -299,15 +1026,17 @@ def make_layer8_alu_op() -> Operation:
         allocator = _allocate_layer8_ffn_units()
         block.ffn._l8_unit_allocator = allocator
 
-        n8 = _set_layer8_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
-        # Byte-identity guard: the helper's local cursor must end
-        # exactly where the next L8 FFN op (``layer8_multibyte_routing``)
-        # is pinned. If the helper's cursor drifts from the table the
-        # assertion fires before any weight surgery happens.
+        proxy = _as_setdim_proxy(dim_positions)
+        n8 = lower_layer8_alu_ir(block.ffn, S, proxy, start_unit=0)
+        # Byte-identity guard: the declarative lowerer's cursor must
+        # end exactly where the next L8 FFN op
+        # (``layer8_multibyte_routing``) is pinned. If the rule list
+        # drifts from the table the assertion fires before any weight
+        # surgery happens.
         expected_end = _l8_ffn_range_start(allocator, "layer8_multibyte_routing")
         assert n8 == expected_end, (
-            f"L8 ALU unit cursor drift: helper returned {n8}, allocator "
-            f"expected {expected_end}"
+            f"L8 ALU unit cursor drift: rule lowering returned {n8}, "
+            f"allocator expected {expected_end}"
         )
 
     return Operation(
@@ -321,6 +1050,7 @@ def make_layer8_alu_op() -> Operation:
         bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir=_layer8_alu_ir(),
         layer_idx=8,
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
