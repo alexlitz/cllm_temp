@@ -2,7 +2,7 @@
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -138,6 +138,85 @@ def _allocate_layer9_alu_units() -> FFNUnitAllocator:
     for name, start, n_units in _L9_ALU_UNIT_LAYOUT:
         allocator.alloc(name, n_units, pin=start)
     return allocator
+
+
+# ====================================================================
+# L9 ALU sub-stage rule helpers (Phase 6 Wave 4C migration).
+#
+# Each helper returns a tuple of :class:`FFNRule` instances that exactly
+# reproduces the corresponding sub-stage's hidden-unit writes in
+# :func:`vm_step._set_layer9_alu` (or
+# :func:`vm_step._set_layer9_marker_suppress` for the trailing suppress
+# range). The rules use ``"NAME+offset"`` string dim references so they
+# can be lowered through :func:`Primitives.lower_ffn_rules` against the
+# compiler-allocated ``dim_positions`` map.
+#
+# The unit ordering inside each helper matches the imperative loop
+# nesting (outermost ``carry_in``/``borrow_in`` -> ``a`` -> ``b``) so a
+# pinned ``start_unit`` lowering lands byte-for-byte where the legacy
+# helper used to write.
+# ====================================================================
+
+
+# Markers the LEA/ADJ/ENT high-nibble units block when the AX-marker
+# amplification is high. Mirrors ``_block_non_ax_marker_sites`` inside
+# :func:`vm_step._set_layer9_alu`.
+_L9_NON_AX_BLOCKERS: tuple[str, ...] = (
+    "MARK_PC",
+    "MARK_SP",
+    "MARK_BP",
+    "MARK_STACK0",
+    "MARK_MEM",
+    "MARK_SE",
+    "IS_BYTE",
+)
+
+
+def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADD hi-nibble cross-product (512 units).
+
+    Mirrors the first loop in :func:`vm_step._set_layer9_alu` -- 4-way
+    AND at the AX marker over ``ALU_HI[a]`` (operand A high nibble) and
+    ``AX_CARRY_HI[b]`` (operand B high nibble) with the inter-byte
+    ``CARRY[0]`` either repelled (carry_in=0, threshold 2.5) or required
+    (carry_in=1, threshold 4.5). Gated by ``OP_ADD``; writes
+    ``OUTPUT_HI_THIS_STEP+result`` where ``result = (a + b + carry_in) %
+    16``.
+    """
+
+    rules: list[FFNRule] = []
+    for carry_in in (0, 1):
+        for a in range(16):
+            for b in range(16):
+                result = (a + b + carry_in) % 16
+                if carry_in == 0:
+                    conditions = (
+                        ("MARK_AX", 1.0),
+                        ("MARK_PC", -2.0),
+                        (f"ALU_HI+{a}", 1.0),
+                        (f"AX_CARRY_HI+{b}", 1.0),
+                        ("CARRY+0", -2.0),
+                    )
+                    threshold = 2.5
+                else:
+                    conditions = (
+                        ("MARK_AX", 1.0),
+                        ("MARK_PC", -2.0),
+                        (f"ALU_HI+{a}", 1.0),
+                        (f"AX_CARRY_HI+{b}", 1.0),
+                        ("CARRY+0", 2.0),
+                    )
+                    threshold = 4.5
+                rules.append(FFNRule.gated_write(
+                    name=f"l9_add_hi_c{carry_in}_a{a}_b{b}",
+                    conditions=conditions,
+                    threshold=threshold,
+                    gate="OP_ADD",
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
+                ))
+    return tuple(rules)
 
 
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
