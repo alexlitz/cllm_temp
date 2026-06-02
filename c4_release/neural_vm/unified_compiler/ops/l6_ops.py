@@ -2620,7 +2620,10 @@ def make_layer6_routing_ffn_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_layer6_routing_ffn_ir(),
-        layer_idx=6,
+        # Phase 8.G.6: drop ``layer_idx=6`` literal; bind to the L6
+        # ffn dep anchor so the block op resolves to whichever
+        # layer the compiler places the anchor at.
+        target_op_name="_layer6_ffn_dep_anchor",
         migrated=True,
         smoke_tests={
             "TestSmokeBasic::test_imm_exit",
@@ -2820,7 +2823,10 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_layer6_ent_after_jsr_sp_byte0_fixup_ir(),
-        layer_idx=6,
+        # Phase 8.G.6: drop ``layer_idx=6`` literal; bind to the L6
+        # ffn dep anchor so the block op resolves to whichever
+        # layer the compiler places the anchor at.
+        target_op_name="_layer6_ffn_dep_anchor",
         ffn_units_used=L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT,
         migrated=True,
         claims=_claims,
@@ -3979,7 +3985,10 @@ def make_putchar_think_protocol_op(
                 "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         kind="block",
         declarative_bake_fn=bake,
-        layer_idx=6,
+        # Phase 8.G.6: drop ``layer_idx=6`` literal; bind to the L6
+        # ffn dep anchor so the block op resolves to whichever
+        # layer the compiler places the anchor at.
+        target_op_name="_layer6_ffn_dep_anchor",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
@@ -4061,7 +4070,10 @@ def make_prtf_think_protocol_op(
         writes=set(),
         kind="block",
         declarative_bake_fn=bake,
-        layer_idx=6,
+        # Phase 8.G.6: drop ``layer_idx=6`` literal; bind to the L6
+        # ffn dep anchor so the block op resolves to whichever
+        # layer the compiler places the anchor at.
+        target_op_name="_layer6_ffn_dep_anchor",
         migrated=True,
         # B12 backfill: this op is a Phase 2a no-op stub that piggybacks
         # on the existing convo-IO bake chain. The L6-anchored side of
@@ -4133,7 +4145,10 @@ def make_open_clos_tool_call_op(
         writes=set(),
         kind="block",
         declarative_bake_fn=bake,
-        layer_idx=6,
+        # Phase 8.G.6: drop ``layer_idx=6`` literal; bind to the L6
+        # ffn dep anchor so the block op resolves to whichever
+        # layer the compiler places the anchor at.
+        target_op_name="_layer6_ffn_dep_anchor",
         migrated=True,
         # B12 backfill: dep-graph anchor only (bake_fn is always a
         # no-op). Phase 6.7 sits in the same L6 I/O block as
