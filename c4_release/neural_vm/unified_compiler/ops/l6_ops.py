@@ -8,7 +8,7 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L6 attention-head layout (pinned head_idx per primary owner) =====
+# === L6 attention-head layout (auto-fit; legacy head_idx as docs) =====
 #
 # L6 has three attention-bake ops that together own all 8 heads on
 # ``model.blocks[6].attn``. Pre-migration each call site picked its
@@ -17,8 +17,9 @@ from .shared import _as_setdim_proxy
 # cursor inside the spec writers ``_bake_layer6_attn_spec`` (heads 0, 1,
 # 2, 3, 5) and ``_bake_layer6_relay_heads_spec`` (heads 6, 7). This
 # table is the single source of truth for the L6 head axis -- every
-# existing head index in the bakes below is pinned here, so the trained
-# attention weights stay valid and the bake is trivially byte-identical.
+# load-bearing head index in the bakes below is resolved via
+# :data:`_L6_HEAD_LAYOUT_BY_NAME`, so the trained attention weights stay
+# valid and the bake is trivially byte-identical.
 #
 # Each row names a *primary owner* of its head_idx. Three families exist:
 #
@@ -33,9 +34,13 @@ from .shared import _as_setdim_proxy
 #     with L16's ``l16_lev_ax_carry_*`` FFN gates -- this extension lives
 #     within the existing head 7 owner so no new head row is needed.
 #
-# Order mirrors ``head_idx`` so the layout reads top-to-bottom.
+# Phase 7.B.3: ``pin=`` is dropped from the allocator. The layout is
+# contiguous (0..7) in declaration order so first-fit reproduces the
+# legacy ``head_idx`` values bit-for-bit; the ``legacy_head_idx`` column
+# is documentation only. Order mirrors ``head_idx`` so the layout reads
+# top-to-bottom.
 _L6_HEAD_LAYOUT = (
-    # (op_name,                                  head_idx)
+    # (op_name,                                  legacy_head_idx (docs only))
     ("layer6_attn_bake.later_step_jmp_relay",         0),
     ("layer6_attn_bake.exit_relay",                   1),
     ("layer6_attn_bake.first_step_jmp_relay",         2),
@@ -51,25 +56,20 @@ _L6_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L6_HEAD_LAYOUT}
 def _allocate_layer6_heads() -> AttentionHeadAllocator:
     """Build a per-bake :class:`AttentionHeadAllocator` with all L6 heads.
 
-    Each primary owner from :data:`_L6_HEAD_LAYOUT` is pinned at its
-    existing ``head_idx``; the allocator therefore declares the full L6
-    head axis without disturbing any baked attention weights. Returns
-    the allocator so callers can inspect it or extend the layer with a
-    future op that wants a new head via ``allocator.alloc(name, 6)``
-    (no pin, which first-fits the lowest free index -- there are none
-    today since heads 0..7 are all claimed, but the contract is in
-    place for a wider config).
-
-    This is byte-identical bookkeeping: the allocator names the heads,
-    the bakes (``_bake_layer6_attn_spec``,
-    ``_bake_layer6_relay_heads_spec``, ``_layer6_bz_bnz_relay_head_spec``)
-    still write the same Q/K/V/O cells they always have. Each head index
-    in those writers is sourced from :data:`_L6_HEAD_LAYOUT_BY_NAME`, so
-    adding a new head requires only a layout-table edit.
+    Phase 7.B.3: ``pin=`` is dropped from every entry. The allocator's
+    first-fit picks the lowest free head index in declaration order;
+    because :data:`_L6_HEAD_LAYOUT` is contiguous (0..7) and ordered,
+    first-fit reproduces the legacy ``head_idx`` values bit-for-bit.
+    The actual weight-write head indices are still looked up via
+    :data:`_L6_HEAD_LAYOUT_BY_NAME` inside ``_bake_layer6_attn_spec`` /
+    ``_bake_layer6_relay_heads_spec`` /
+    ``_layer6_bz_bnz_relay_head_spec``, so byte-identity with the legacy
+    bake is preserved regardless of allocator order. Returns the
+    allocator so callers can attach it to ``block.attn`` for inspection.
     """
     allocator = AttentionHeadAllocator(layer_max_heads=8)
-    for name, head_idx in _L6_HEAD_LAYOUT:
-        allocator.alloc(name, layer_idx=6, pin=head_idx)
+    for name, _legacy_head_idx in _L6_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=6)
     return allocator
 
 
@@ -154,7 +154,7 @@ L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 1668
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 1675
 
 
-# === L6 FFN unit layout (pinned offsets) ============================
+# === L6 FFN unit layout (pinned offsets; non-contiguous, see notes) ==
 #
 # L6 is the widest FFN in the model: ``layer6_routing_ffn`` programs the
 # bulk of the band (per-opcode AX/FETCH -> OUTPUT relays, PSH stack
@@ -164,14 +164,21 @@ L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT = 1675
 # (``binary_pop_sp_increment``). Right-sizing keeps 2328 units live
 # (per L6's ``ffn_units_used`` claim).
 #
-# Migration to :class:`FFNUnitAllocator` mirrors L9 (commit ca775eb):
-# each existing band is pinned at its historical offset so the IR
-# lowerers + ``vm_step._set_layer6_routing_ffn`` -- which still use
-# explicit unit cursors / ``L6_*_START_UNIT`` constants -- land on
-# byte-identical hidden-unit indices. The allocator declares ranges by
-# name; it is not the source of truth for the writes yet. Adding a new
-# L6 op family later can call ``allocator.alloc(name, n)`` without a
-# pin and the allocator will pick the first free gap.
+# Phase 7.B.3 retains ``pin=`` on the L6 FFN unit allocator (unlike L7
+# attn + L7 FFN placeholder + L8 attn + L8 FFN ALU, where pins are
+# dropped and first-fit reproduces the legacy offsets bit-for-bit).
+# Rationale: the L6 FFN layout has intentional non-contiguous gaps
+# (1332..1410 / 1490..1492 / 1588..1668 / 1675..2294) so first-fit
+# packing of the allocator inventory diverges from the writer offsets
+# consumed by ``vm_step._set_layer6_routing_ffn`` + the IR lowerers
+# (which still use ``L6_*_START_UNIT`` constants). Worse, the byte-
+# identity guard in ``make_layer6_ent_after_jsr_sp_byte0_fixup_op``
+# compares the lowerer's end cursor against ``fixup_range.end`` read
+# off the allocator -- a manifest-consistency check that would fire
+# spuriously under packed first-fit while the actual weights stay
+# correct. Pinning preserves the manifest so the guard keeps its
+# diagnostic value. See the L7+L8 sections of this file for the
+# pin-drop pattern applied to contiguous layouts.
 #
 # Bands tracked here include both the constant-named ranges and the
 # anonymous PSH STACK0 marker-only OUTPUT rewrite block written inline
@@ -326,6 +333,12 @@ def _allocate_layer6_ffn_units() -> FFNUnitAllocator:
     ranges by name, the helpers still own the writes. A future refactor
     can split the monolithic routing-FFN bake into per-band bake
     functions that consume ``allocator.alloc(...)`` directly.
+
+    Phase 7.B.3 retains pins on the L6 FFN allocator (see the layout
+    table comment above for the rationale -- non-contiguous gaps +
+    manifest-consistency assertion in
+    ``make_layer6_ent_after_jsr_sp_byte0_fixup_op``). L6 *attention*
+    head pins are dropped; only the FFN-unit pins stay.
 
     Each bake gets its own allocator instance via this helper so the
     layout snapshot stashed on ``block.ffn._l6_unit_allocator`` reflects
