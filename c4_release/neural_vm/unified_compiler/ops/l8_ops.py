@@ -862,6 +862,61 @@ def _layer8_alu_lev_b2_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
 
+def _layer8_alu_lea_axb2_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEA first-step AX byte 2 output (2 units, offsets 2021..2022).
+
+    BP = 0x10000 so byte 2 = 0x01. Fires only on first step
+    (NOT HAS_SE) at AX byte 1 position (BYTE_INDEX_1) when L7 head 5
+    has relayed OP_LEA into CMP[7]. The two units write:
+      * OUTPUT_LO+1 = +4/S  AND  OUTPUT_LO+0 = -4/S  (single unit, two writes)
+      * OUTPUT_HI+0 = +2/S  (single unit, one write)
+
+    Both use ``b_gate = 1.0`` (no explicit W_gate) so they're
+    constant_write rules.
+    """
+    return (
+        FFNRule.constant_write(
+            name="l8_alu_lea_axb2_lo",
+            conditions=(
+                ("CMP+7", 1.0),
+                ("H1+1", 1.0),
+                ("IS_BYTE", 1.0),
+                ("BYTE_INDEX_1", 1.0),
+                ("HAS_SE", -1.0),
+            ),
+            threshold=3.5,
+            writes=(
+                ("OUTPUT_LO+1", 4.0 / S),
+                ("OUTPUT_LO+0", -4.0 / S),
+            ),
+            scope="CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            dominates_at={
+                "OUTPUT_LO+1":
+                    "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+                "OUTPUT_LO+0":
+                    "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            },
+        ),
+        FFNRule.constant_write(
+            name="l8_alu_lea_axb2_hi",
+            conditions=(
+                ("CMP+7", 1.0),
+                ("H1+1", 1.0),
+                ("IS_BYTE", 1.0),
+                ("BYTE_INDEX_1", 1.0),
+                ("HAS_SE", -1.0),
+            ),
+            threshold=3.5,
+            writes=(("OUTPUT_HI+0", 2.0 / S),),
+            scope="CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            dominates_at={
+                "OUTPUT_HI+0":
+                    "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            },
+        ),
+    )
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
