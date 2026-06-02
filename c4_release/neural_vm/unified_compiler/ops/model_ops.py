@@ -1236,9 +1236,23 @@ def make_embedding_bake_op() -> Operation:
     # registers an ``embed_row`` claim for every token id 0 .. V-1. The
     # vocabulary size matches ``Token.VOCAB_SIZE`` (276). Declaring all rows
     # makes the verifier check that no row is missed by future refactors.
+    #
+    # Exception: the REG_PC row (id 257) is claimed by ``initial_pc_bake``
+    # (phase 1001.5), which is the canonical writer of the +1.0 EMBED_LO /
+    # EMBED_HI nibble cells representing the initial PC value. Both ops
+    # legitimately touch row 257 (embedding_bake writes marker bits +
+    # zero-fill; initial_pc_bake adds the PC-nibble bits on top), but the
+    # dim-ownership registry only allows one canonical owner per
+    # ``(layer, scope, identifier, column)`` 4-tuple. The PC-nibble writes
+    # are the load-bearing signal worth gating in the registry, so
+    # ``initial_pc_bake`` keeps the claim and ``embedding_bake`` drops
+    # it. The verifier still observes embedding_bake's row-257 write, but
+    # ``written_but_not_declared`` is non-fatal in non-strict mode.
     from ...vm_step import Token as _Token  # local import to avoid module-load cycle
     _claims = frozenset(
-        (-1, "embed_row", str(tok), None) for tok in range(_Token.VOCAB_SIZE)
+        (-1, "embed_row", str(tok), None)
+        for tok in range(_Token.VOCAB_SIZE)
+        if tok != _Token.REG_PC
     )
 
     return Operation(
