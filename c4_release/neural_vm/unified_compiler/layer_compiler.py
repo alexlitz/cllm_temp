@@ -98,6 +98,32 @@ def _topology_anchor_noop_bake(target, dim_positions, S):
     return None
 
 
+class _IRBakeCallable:
+    """Module-level callable that mirrors the IR-dispatch closure formerly
+    defined inside ``_resolve_default_bake_fn``.
+
+    Refactored out of a local closure so the ``compile_full_vm`` disk
+    cache can pickle baked operations. Local closures of the form
+    ``_resolve_default_bake_fn.<locals>._ir_bake`` are unpicklable, which
+    caused ``compile_full_vm: failed to save cache ... (Can't get local
+    object '_resolve_default_bake_fn.<locals>._ir_bake')`` warnings on
+    every cold compile. The class form has a stable qualified name and
+    pickles via its ``op`` attribute.
+    """
+
+    __slots__ = ("op",)
+
+    def __init__(self, op: "Operation") -> None:
+        self.op = op
+
+    def __call__(self, target, dim_positions, S):
+        op = self.op
+        ir = op.compiler_ir
+        if ir is None:
+            ir = _make_operation_ir(op, target, dim_positions)
+        _dispatch_operation_ir(op, target, dim_positions, S, ir)
+
+
 def _resolve_default_bake_fn(op: "Operation") -> Optional[Callable]:
     """Pick a default ``bake_fn`` for an op that didn't supply one.
 
@@ -105,10 +131,12 @@ def _resolve_default_bake_fn(op: "Operation") -> Optional[Callable]:
 
       1. ``declarative_bake_fn`` — the dominant case (100/115 historical
          core ops passed the same callable to both fields).
-      2. An IR-lowering closure when ``compiler_ir`` /
+      2. An IR-lowering callable when ``compiler_ir`` /
          ``compiler_ir_factory`` is set. Mirrors the declarations-only
          dispatch path in ``dispatch_operation_bake`` so behaviour is
-         byte-identical regardless of which path triggers.
+         byte-identical regardless of which path triggers. Implemented
+         as ``_IRBakeCallable`` (module-level class) so the compile-cache
+         pickle path works.
       3. A no-op when ``declarative_authority == 'topology_anchor'``.
 
     Returns ``None`` when none of the above applies — the op will retain
@@ -118,12 +146,7 @@ def _resolve_default_bake_fn(op: "Operation") -> Optional[Callable]:
     if op.declarative_bake_fn is not None:
         return op.declarative_bake_fn
     if op.compiler_ir is not None or op.compiler_ir_factory is not None:
-        def _ir_bake(target, dim_positions, S, *, _op=op):
-            ir = _op.compiler_ir
-            if ir is None:
-                ir = _make_operation_ir(_op, target, dim_positions)
-            _dispatch_operation_ir(_op, target, dim_positions, S, ir)
-        return _ir_bake
+        return _IRBakeCallable(op)
     if op.declarative_authority == "topology_anchor":
         return _topology_anchor_noop_bake
     return None
