@@ -686,13 +686,8 @@ def build_default_registry() -> DimRegistry:
               semantics="mark == AX OR (is_byte AND byte_index == 0)")
     _pin("ALU_HI", 376, 16, "ALU result hi nibble",
               semantics="mark == AX OR (is_byte AND byte_index == 0)")
-    # Phase 8.A.6 v2: ALU_LO_PREV_STEP alias lets cross-step readers (L8+
-    # ops that fire before the next ALU_LO writer in the same step) declare
-    # their reads as prev-step semantically. Same numeric base.
-    _pin("ALU_LO_PREV_STEP", 360, 16,
-              "Prev-step ALU_LO residual (aliases ALU_LO)",
-              semantics="mark == AX OR (is_byte AND byte_index == 0)",
-              alias=True)
+    # Phase 9.C: ALU_LO_PREV_STEP alias retired (Phase 9.B migrated
+    # readers to SSA ``ALU_LO.<writer>.-1``).
 
     # Carry / comparison cascade. Per-byte carry propagation slot for
     # add/sub/mul cascade and comparison-flag bus.
