@@ -2613,7 +2613,6 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
 
     return Operation(
         name="layer10_stack0_byte_relay",
-        phase=10,
         # Phase 8.A.6 v2: matches layer10_stack0_byte_relay_bake's
         # TEMP_PREV_STEP rename. See that op for rationale.
         reads={"MARK_AX", "IS_BYTE", "HAS_SE", "H1", "H4", "TEMP.*.-1",
@@ -2864,7 +2863,20 @@ def make_l10_post_ops_combined() -> Operation:
             "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC",
             "OP_SI", "OP_SC", "OP_PSH", "OP_EXIT", "OP_NOP",
             "OP_PUTCHAR", "OP_GETCHAR",
-            "OUTPUT_LO", "OUTPUT_HI.*.-1", "ALU_LO", "ALU_HI",
+            # Phase 9.B (SCC #2 dissolution): OUTPUT_LO -> OUTPUT_LO.*.-1
+            # marks the read as SSA cross-step relative to the
+            # downstream OUTPUT_LO writer ``tail_bit32_result_correction``
+            # (phase=17.1). This op runs at phase=10.5 and uses
+            # OUTPUT_LO as a residual gate for carry-propagation / byte
+            # zeroing — the value read at phase 10.5 is the residual
+            # carried from the PREVIOUS step's final OUTPUT_LO writer,
+            # NOT a same-step data flow from the much-later L17 tail
+            # correction. Mirrors the OUTPUT_HI.*.-1 alias on the line
+            # below and the TEMP.*.-1 / CARRY.*.-1 aliases on the same
+            # op; aliases share the numeric slot via the SSA rewriter so
+            # bakes stay byte-identical. Breaks the OUTPUT_LO back-edge
+            # ``tail_bit32_result_correction -> l10_post_ops_combined``.
+            "OUTPUT_LO.*.-1", "OUTPUT_HI.*.-1", "ALU_LO", "ALU_HI",
             "CARRY", "CMP", "TEMP.*.-1",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
             # V2/G7 LEV detector: in-step topology edge replacing the
