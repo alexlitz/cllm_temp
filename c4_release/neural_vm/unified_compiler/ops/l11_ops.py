@@ -145,6 +145,8 @@ def _layer11_mul_partial_rules_for_a_lo(
                 name=f"l11_mul_partial_a{a_lo:02d}_b{b_lo:02d}_h{b_hi:02d}",
                 conditions=(
                     ("MARK_AX", 1.0),
+                    # structural offset: a_lo/b_lo/b_hi are nibble-value
+                    # one-hot lookup indices into the operand bands.
                     (f"ALU_LO+{a_lo}", 1.0),
                     (f"AX_CARRY_LO+{b_lo}", 1.0),
                     (f"AX_CARRY_HI+{b_hi}", 1.0),
@@ -153,6 +155,8 @@ def _layer11_mul_partial_rules_for_a_lo(
                 gate=gate_mul,
                 gate_weight=1.0,
                 gate_bias=0.0,
+                # structural offset: partial is the computed MUL partial
+                # nibble (value-bus lookup), not a role-meaningful byte.
                 writes=((f"TEMP+{partial}", 10.0 / S),),
             ))
     return tuple(rules)
