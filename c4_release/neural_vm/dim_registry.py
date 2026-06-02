@@ -607,22 +607,8 @@ def build_default_registry() -> DimRegistry:
               semantics="is_byte OR NOT is_byte")
     _pin("OUTPUT_HI", 190, 16, "Output decoding high nibble (one-hot)",
               semantics="is_byte OR NOT is_byte")
-    # Phase 7.A.3 OUTPUT_LO split: OUTPUT_LO_PREV_STEP aliases the same
-    # numeric slot as OUTPUT_LO so byte-identity is preserved. Cross-step
-    # readers (L3 head 5 AX_FULL relay, L8 head 6 AX_CARRY refresh) attend
-    # back to the prior step's AX marker row, where this slot holds the
-    # prev-step value. Mirrors the B9 OUTPUT_HI_THIS_STEP pattern. See
-    # docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
-    _pin("OUTPUT_LO_PREV_STEP", 174, 16,
-              "OUTPUT_LO from previous step (aliases OUTPUT_LO)",
-              semantics="is_byte OR NOT is_byte", alias=True)
-    # Phase 8.A G7: OUTPUT_HI_PREV_STEP aliases OUTPUT_HI (same numeric
-    # base 190). Cross-step readers retarget their ``reads`` to this name
-    # so the scheduler dep graph drops the corresponding back-edges into
-    # the OUTPUT_HI_THIS_STEP writer band. Byte-identical bake.
-    _pin("OUTPUT_HI_PREV_STEP", 190, 16,
-              "OUTPUT_HI from previous step (aliases OUTPUT_HI)",
-              semantics="is_byte OR NOT is_byte", alias=True)
+    # Phase 9.C: OUTPUT_{LO,HI}_PREV_STEP aliases retired (Phase 9.B
+    # migrated readers to SSA ``OUTPUT_{LO,HI}.<writer>.-1``).
 
     # Memory address key (3 nibbles × 16 one-hot = 48 dims). Written at
     # positions feeding the L15 memory lookup attention.
