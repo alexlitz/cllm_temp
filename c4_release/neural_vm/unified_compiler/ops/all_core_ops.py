@@ -110,6 +110,7 @@ def all_core_ops(
         ),
         make_layer4_pc_relay_op(),
         make_layer4_ffn_op(),
+        make_layer4_ffn_dep_anchor_op(),
         # STACK0 via mem attention remains registered but disabled on the
         # authoritative smoke path. Its L8 reader runs before the current
         # neural ADDR_KEY decode, so MEM value tokens do not yet carry stable
