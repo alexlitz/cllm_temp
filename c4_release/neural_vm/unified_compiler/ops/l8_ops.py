@@ -1336,7 +1336,6 @@ def make_layer8_multibyte_fetch_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_fetch",
-        phase=8,
         reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
