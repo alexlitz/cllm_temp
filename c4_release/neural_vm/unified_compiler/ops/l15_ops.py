@@ -553,7 +553,6 @@ def make_layer15_memory_lookup_op() -> Operation:
 
     return Operation(
         name="layer15_memory_lookup",
-        phase=15,
         reads={"MARK_AX", "OP_LI", "OP_LC", "OP_LI_RELAY", "OP_LC_RELAY",
                "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_KEY", "MARK_MEM", "MEM_STORE",
                "MEM_ADDR_SRC",
