@@ -642,6 +642,44 @@ def _layer9_alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_bp_plus8_shift_rules(S: float) -> tuple[FFNRule, ...]:
+    """``ADDR_B0_LO`` BP+8 shift at PC marker for LEV return (16 units).
+
+    Mirrors the 16-unit shift block in :func:`vm_step._set_layer9_alu`:
+    at the LEV PC marker the previous BP byte 0 needs ``+8`` so the
+    return-address gather lands on ``[BP+8]``. Each unit reads
+    ``ADDR_B0_LO[k]`` as its gate (with ``b_gate=-2.5`` to require the
+    legitimate ~3.0 value from L9 head 0 and reject the ~2.0 opcode
+    fetch contamination from L5), cancels the original ``+k`` slot, and
+    re-energises the rotated ``(k + 8) % 16`` slot. PC-marker activation
+    is gated by ``MARK_PC + OP_LEV/5`` with strong negative blockers for
+    MARK_BP / MARK_SP to keep the unit from firing at those rows during
+    LEV.
+    """
+
+    rules: list[FFNRule] = []
+    for k in range(16):
+        new_k = (k + 8) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"l9_bp_plus8_shift_{k}",
+            conditions=(
+                ("MARK_PC", 1.0),
+                ("OP_LEV", 1.0 / 5.0),
+                ("MARK_BP", -10.0),
+                ("MARK_SP", -10.0),
+            ),
+            threshold=1.5,
+            gate=f"ADDR_B0_LO+{k}",
+            gate_weight=1.0,
+            gate_bias=-2.5,
+            writes=(
+                (f"ADDR_B0_LO+{k}", -0.67 / S),
+                (f"ADDR_B0_LO+{new_k}", 0.67 / S),
+            ),
+        ))
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 
