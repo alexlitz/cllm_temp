@@ -150,6 +150,7 @@ _DECLARATIVE_LOWER_RE = re.compile(
     r"lower_ffn"
     r"|lower_attention"
     r"|lower_token_embeddings"
+    r"|lower_structural_ops"
     r"|_?lower_[a-zA-Z0-9_]*_via_(compiler_)?ir"
     r"|_?lower_[a-zA-Z0-9_]*_ir"
     r"|Primitives\.lower_ffn_rules"
