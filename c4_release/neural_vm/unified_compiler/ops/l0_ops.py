@@ -7,6 +7,14 @@ from ..layer_compiler import Operation
 from ..primitives import Primitives
 from .shared import _as_setdim_proxy
 
+# L0 threshold-attention configuration shared between the bake_fn and the
+# declarative ``compiler_ir_factory``. The two lists are positional siblings:
+# index ``i`` in ``_L0_THRESHOLDS`` pairs with ``_L0_OUT_BASE_NAMES[i]`` and
+# the head at ``_L0_HEAD_LAYOUT[i]``.
+_L0_THRESHOLDS = (3.5, 4.5, 7.5, 8.5, 9.5, 14.5, 19.5, 24.5)
+_L0_OUT_BASE_NAMES = ("H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7")
+_L0_ALIBI_S = 10.0
+
 
 # === L0 FFN unit layout (pinned offsets) ============================
 #
@@ -240,6 +248,46 @@ def _allocate_layer0_threshold_attn_heads() -> AttentionHeadAllocator:
     return allocator
 
 
+def _layer0_threshold_head_specs(proxy, HD: int, heads):
+    """Return the 8 declarative L0 threshold-attention head specs.
+
+    ``heads`` is an explicit list of ``head_idx`` values (one per entry in
+    :data:`_L0_THRESHOLDS`) so the spec is structurally pinned to the
+    allocator layout rather than the implicit ``range(8)`` fallback. The
+    resulting Q/K/V/O writes lower byte-identically to the legacy
+    ``Primitives.generate_threshold_attention_heads`` walk because both
+    paths funnel through ``Primitives.threshold_attention_head_specs``.
+    """
+
+    out_bases = [getattr(proxy, name) for name in _L0_OUT_BASE_NAMES]
+    return Primitives.threshold_attention_head_specs(
+        list(_L0_THRESHOLDS),
+        out_bases,
+        _L0_ALIBI_S,
+        HD,
+        heads=heads,
+        bd=proxy,
+    )
+
+
+def _layer0_threshold_attn_ir(dim_positions, HD: int) -> CompilerIR:
+    """``compiler_ir_factory`` for ``layer0_threshold_attn``.
+
+    Builds a :class:`CompilerIR` whose ``layer(0).attention`` holds the 8
+    declarative threshold-head specs (H0..H7). The pinned head indices
+    come from :data:`_L0_HEAD_LAYOUT` so the IR stays in lockstep with the
+    bake's allocator pinning, and ``compare_symbolic_to_lowered_attn``
+    can audit byte-identity end-to-end against ``PureAttention``.
+    """
+
+    proxy = _as_setdim_proxy(dim_positions)
+    heads = [head_idx for _name, head_idx in _L0_HEAD_LAYOUT]
+    specs = _layer0_threshold_head_specs(proxy, HD, heads)
+    ir = CompilerIR()
+    ir.layer(0).attention.extend(specs)
+    return ir
+
+
 def make_layer0_threshold_attn_op() -> Operation:
     """L0 attention: 8 threshold heads detecting marker distance.
 
@@ -247,14 +295,22 @@ def make_layer0_threshold_attn_op() -> Operation:
     transformer block (block[0].attn) the legacy path used. Using kind="block"
     keeps the L0 op aligned with the hand-set block index regardless of
     LayerCompiler dep-based assignment.
+
+    Phase 6 Wave 2A: migrated to ``DeclarativeAttentionHeadSpec`` form. The
+    8 threshold heads are now expressed as data via
+    :func:`_layer0_threshold_head_specs` and exposed through
+    ``compiler_ir_factory=_layer0_threshold_attn_ir``. The bake_fn lowers
+    the same specs (so byte-identity is mandated by spec equality, not by
+    a separate call path). Head indices remain pinned via the allocator;
+    the ALiBi slope override and allocator stash stay in the bake as
+    residual-side bookkeeping until a future wave folds them into
+    ``AttentionHeadIR.metadata``.
     """
     def bake(block, dim_positions, S):
-        from ..primitives import Primitives
         attn = block.attn
         proxy = _as_setdim_proxy(dim_positions)
-        ALIBI_S = 10.0
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-            attn.alibi_slopes.fill_(ALIBI_S)
+            attn.alibi_slopes.fill_(_L0_ALIBI_S)
         HD = attn.W_q.shape[0] // attn.num_heads
         # Per-bake attention-head allocator with the full L0 head layout
         # pinned. Resolving each threshold head by name reproduces the
@@ -271,20 +327,12 @@ def make_layer0_threshold_attn_op() -> Operation:
         threshold_heads = [
             head_allocator.heads()[i].head_idx for i in range(8)
         ]
-        # Pass proxy as BD= so pin_io_only=True resolves CONST/IS_MARK/MARKS
-        # via dim_positions. In practice these are all IO-pinned so the legacy
-        # fallback agrees, but routing through the proxy keeps the bake honest
-        # if the IO-pin contract ever changes.
-        Primitives.generate_threshold_attention_heads(
-            attn,
-            [3.5, 4.5, 7.5, 8.5, 9.5, 14.5, 19.5, 24.5],
-            [proxy.H0, proxy.H1, proxy.H2, proxy.H3, proxy.H4,
-             proxy.H5, proxy.H6, proxy.H7],
-            ALIBI_S,
-            HD,
-            heads=threshold_heads,
-            bd=proxy,
-        )
+        # Lower via the same declarative spec used by ``compiler_ir_factory``.
+        # This routes the bake through ``DeclarativeAttentionHeadSpec`` ->
+        # ``Primitives.generate_attention_heads`` so spec equality implies
+        # byte-equal Q/K/V/W_o (see compare_symbolic_to_lowered_attn).
+        specs = _layer0_threshold_head_specs(proxy, HD, threshold_heads)
+        Primitives.generate_attention_heads(attn, specs, HD)
         # H1's 4.5-token cutoff is semantically load-bearing: L1 marks
         # STACK0 byte 0 with L1H4[BP] AND NOT H1[BP]. Scaling this head makes
         # H1 fire at STACK0 byte 0 and blocks ADD/POP operand gather.
@@ -321,6 +369,8 @@ def make_layer0_threshold_attn_op() -> Operation:
         layer_idx=0,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer0_threshold_attn_ir,
+        declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
