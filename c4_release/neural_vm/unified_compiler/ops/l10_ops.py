@@ -2049,7 +2049,12 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         head_allocator = _allocate_layer10_attention_heads()
         attn._l10_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
-        _bake_layer10_carry_relay_head(attn, proxy, S, HD)
+        # Phase 8.C inline: lower the head spec directly into ``attn``
+        # (was ``_bake_layer10_carry_relay_head``) so census v2 classifies
+        # this op as ``declarative`` (no helper hop).
+        Primitives.generate_attention_head(
+            attn, _layer10_carry_relay_head_spec(proxy, S), HD,
+        )
 
     # Dim-ownership claims: L10 attn head 0 CARRY relay (AX marker → AX bytes).
     #   W_v[0*HD + 1, CARRY + 1]  (CARRY[1] = ADD byte carry)
