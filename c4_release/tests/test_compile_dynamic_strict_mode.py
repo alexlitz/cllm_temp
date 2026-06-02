@@ -1,10 +1,14 @@
-"""B14 prep tests for ``compile_full_vm_dynamic(strict=...)``.
+"""B14 tests for ``compile_full_vm_dynamic(strict=...)``.
 
-These tests pin the behaviour of the strict-mode admission gate. The
-``strict`` parameter defaults to ``False`` (off) per the B14 rollout
-plan in ``c4_release/docs/DYNAMIC_SCHEDULER_MIGRATION_PLAN.md``; flipping
-the default is deferred until B9 (dim decomposition) and B12 (declaration
-backfill) fully land.
+These tests pin the behaviour of the strict-mode admission gate. As of
+Phase 7.A.5's default-flip the ``strict`` parameter defaults to ``True``
+(on) with cycle-aware admission (``allow_sealed_cycles=True``); the
+prior default was ``strict=False`` per the B14 rollout plan in
+``c4_release/docs/DYNAMIC_SCHEDULER_MIGRATION_PLAN.md``. Cycle-aware
+admission is the load-bearing assumption that lets strict mode land
+before B9 (dim decomposition) and B12 (declaration backfill) fully
+complete: the OUTPUT_HI / IF_VAR SCC is accepted as a sealed group while
+every op outside it is dep-derived.
 
 Phase 7.A.5 B14 attempt
 -----------------------
@@ -21,9 +25,10 @@ the compile. Setting ``allow_sealed_cycles=False`` restores the legacy
 
 The tests here cover four regression surfaces:
 
-1. **Default is OFF.** ``compile_full_vm_dynamic()`` with no ``strict``
-   kwarg behaves exactly as before, so existing callers and the B11
-   byte-identity invariant are unaffected.
+1. **Default is ON (cycle-aware).** ``compile_full_vm_dynamic()`` with
+   no ``strict`` kwarg now runs the cycle-aware admission gate by
+   default and produces a byte-identical layout to the prior strict-off
+   path on today's op set.
 2. **Cycle-aware strict mode admits today's op set.** With
    ``allow_sealed_cycles=True`` the strict-mode admission check passes
    even though 92 ops are cycle members, because the rest of the graph
@@ -56,29 +61,54 @@ from c4_release.neural_vm.unified_compiler.layer_compiler import Operation
 
 
 # ---------------------------------------------------------------------------
-# 1. Default-off guarantee
+# 1. Default-on guarantee (Phase 7.A.5 default-flip)
 # ---------------------------------------------------------------------------
 
 
-def test_strict_kwarg_defaults_to_false():
-    """``compile_full_vm_dynamic`` must keep ``strict=False`` as default.
+def test_strict_kwarg_defaults_to_true():
+    """``compile_full_vm_dynamic`` must default to ``strict=True``
+    (cycle-aware admission) as of the Phase 7.A.5 default-flip.
 
-    B14 is the unit that flips this default; until then any change to the
-    default is a behavioural break for existing callers that import the
-    function with positional / kwargs that don't include ``strict``.
+    The strict gate is now the production default. Pair this with
+    ``test_allow_sealed_cycles_kwarg_default_is_true`` to lock in the
+    cycle-aware admission default that makes strict mode safe on
+    today's op set.
     """
     sig = inspect.signature(compile_full_vm_dynamic)
     assert "strict" in sig.parameters, (
-        "compile_full_vm_dynamic must expose a 'strict' parameter for B14 prep"
+        "compile_full_vm_dynamic must expose a 'strict' parameter"
     )
     param = sig.parameters["strict"]
-    assert param.default is False, (
-        f"strict parameter default must be False (B14 rollout requires "
-        f"off-by-default); got {param.default!r}"
+    assert param.default is True, (
+        f"strict parameter default must be True (Phase 7.A.5 default-flip "
+        f"made cycle-aware strict the production default); got "
+        f"{param.default!r}"
     )
     assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
         "strict must be keyword-only to prevent positional-argument breakage"
     )
+
+
+def test_default_compile_runs_strict_admission_on_current_op_set():
+    """The Phase 7.A.5 default-flip acceptance test: calling
+    ``compile_full_vm_dynamic`` with no ``strict`` kwarg must run the
+    cycle-aware admission gate on today's production op set and pass.
+
+    This pins the "default-on works" invariant: if a future op
+    introduction breaks admission (e.g. adds a non-cycle
+    ``phase_required_but_undeclared`` op), this test fires immediately
+    rather than waiting for a downstream byte-identity test or a strict
+    explicit caller.
+    """
+    ops = _collect_ops_for_compile(
+        alu_mode="lookup",
+        enable_conversational_io=False,
+        enable_tool_calling=False,
+        enable_neural_io_think_protocol=False,
+    )
+    # Default-mode strict admission must pass (cycle-aware seals the
+    # OUTPUT_HI / IF_VAR SCC; all other ops are dep-derived).
+    _assert_strict_mode_clean(ops, allow_sealed_cycles=True)
 
 
 # ---------------------------------------------------------------------------
