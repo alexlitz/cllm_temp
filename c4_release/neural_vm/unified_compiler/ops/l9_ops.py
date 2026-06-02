@@ -1142,7 +1142,17 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     return Operation(
         name="layer9_alu",
         phase=9,
-        reads={"MARK_AX", "MARK_PC", "ALU_HI", "AX_CARRY_HI", "FETCH_HI", "CARRY",
+        # Phase 8.A: CARRY_PREV_STEP marks the CARRY read as cross-step
+        # relative to the L10 CARRY writers (layer10_carry_relay,
+        # layer10_carry_relay_bake, l10_post_ops_combined) that fire AFTER
+        # L9 in the same step. The L9 ALU consumes the byte-level carry-in
+        # bit (``CARRY[0]``) from the previous step's L10 carry relay write
+        # to discriminate ADD/SUB hi-nibble outputs (carry_in=0 vs 1) at
+        # subsequent AX byte positions. Same numeric position as CARRY so
+        # baked weight cells are byte-identical. Breaks the 3 L10 -> L9
+        # back-edges (CARRY rank 9 in the latest scheduler SCC audit).
+        reads={"MARK_AX", "MARK_PC", "ALU_HI", "AX_CARRY_HI", "FETCH_HI",
+               "CARRY_PREV_STEP",
                "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                "ALU_LO", "AX_CARRY_LO"},
