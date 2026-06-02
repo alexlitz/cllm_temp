@@ -41,7 +41,17 @@ in a follow-up commit, at which point this module gets the same
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
+
+
+# Strategy modes for :class:`FFNUnitAllocator`. ``"pinned"`` (default)
+# preserves the historical byte-identity contract: ``pin=`` is mandatory
+# for migrated ops and a collision is a hard error. ``"dynamic_first_fit"``
+# treats ``pin=`` as a HINT — if the pinned range is free the allocator
+# honors it (so already-trained weights stay in place when possible);
+# otherwise it falls back to a first-fit gap. Used by Phase 7.B to drop
+# pins corpus-wide once the allocator self-fits the layout.
+AllocStrategy = Literal["pinned", "dynamic_first_fit"]
 
 
 # Default per-layer FFN unit budget. Wider FFNs can pass
@@ -102,12 +112,23 @@ class FFNUnitAllocator:
     families.
     """
 
-    def __init__(self, layer_max_units: int = DEFAULT_LAYER_MAX_UNITS):
+    def __init__(
+        self,
+        layer_max_units: int = DEFAULT_LAYER_MAX_UNITS,
+        *,
+        strategy: AllocStrategy = "pinned",
+    ):
         if layer_max_units <= 0:
             raise FFNUnitAllocatorError(
                 f"layer_max_units must be positive (got {layer_max_units})"
             )
+        if strategy not in ("pinned", "dynamic_first_fit"):
+            raise FFNUnitAllocatorError(
+                f"strategy must be 'pinned' or 'dynamic_first_fit' "
+                f"(got {strategy!r})"
+            )
         self.layer_max_units: int = int(layer_max_units)
+        self._strategy: AllocStrategy = strategy
         # Insertion-ordered list; the source of truth for any future
         # registry-rebuild path.
         self._ranges: List[AllocatedUnitRange] = []
@@ -117,6 +138,12 @@ class FFNUnitAllocator:
         # (allow_overlap=True) do NOT add to this set, matching the
         # dim_allocator semantics.
         self._claimed: set[int] = set()
+        # Migration audit: every (op_name, pin) where the caller provided
+        # a pin hint that the allocator could NOT honor under
+        # ``"dynamic_first_fit"`` (collision) and had to first-fit
+        # elsewhere. Empty in ``"pinned"`` mode because a colliding pin
+        # is a hard error there.
+        self._pin_collisions: List[Tuple[str, int, int]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -171,16 +198,38 @@ class FFNUnitAllocator:
                 )
             overlap_hit = self._collision(pin, n_units)
             if overlap_hit is not None and not allow_overlap:
-                other = overlap_hit
-                raise FFNUnitAllocatorError(
-                    f"alloc({op_name!r}): pinned range "
-                    f"[{pin}, {pin + n_units}) collides with "
-                    f"{other.op_name!r} at [{other.start}, {other.end}); "
-                    f"pass allow_overlap=True if the alias is intentional"
-                )
-            start = pin
-            pinned = True
-            overlap = allow_overlap and (overlap_hit is not None)
+                # In ``"dynamic_first_fit"`` mode the pin is a HINT —
+                # a collision triggers a first-fit fallback instead of
+                # erroring. ``allow_overlap=True`` still wins for
+                # explicit aliases so byte-identity migration keeps
+                # working alongside the relaxed pinning.
+                if self._strategy == "dynamic_first_fit":
+                    found = self._find_free(n_units)
+                    if found is None:
+                        raise FFNUnitAllocatorError(
+                            f"alloc({op_name!r}): pin hint {pin} collides "
+                            f"with {overlap_hit.op_name!r} and no free "
+                            f"gap of size {n_units} remains in pool of "
+                            f"width {self.layer_max_units} "
+                            f"(used={self._used_units()}, "
+                            f"free_pool={self.free_pool()})"
+                        )
+                    self._pin_collisions.append((op_name, pin, found))
+                    start = found
+                    pinned = False
+                    overlap = False
+                else:
+                    other = overlap_hit
+                    raise FFNUnitAllocatorError(
+                        f"alloc({op_name!r}): pinned range "
+                        f"[{pin}, {pin + n_units}) collides with "
+                        f"{other.op_name!r} at [{other.start}, {other.end}); "
+                        f"pass allow_overlap=True if the alias is intentional"
+                    )
+            else:
+                start = pin
+                pinned = True
+                overlap = allow_overlap and (overlap_hit is not None)
         else:
             # ---- auto-placed path ----
             if allow_overlap:
@@ -241,6 +290,52 @@ class FFNUnitAllocator:
         """Return a shallow copy of all allocations in insertion order."""
         return list(self._ranges)
 
+    @property
+    def strategy(self) -> AllocStrategy:
+        """Current allocation strategy. Read-only; use
+        :meth:`set_strategy` to switch modes mid-stream."""
+        return self._strategy
+
+    def set_strategy(self, strategy: AllocStrategy) -> None:
+        """Switch allocation mode in place.
+
+        Used by the Phase 7.B compile pass to flip a freshly-constructed
+        allocator from the default ``"pinned"`` (byte-identity) mode into
+        ``"dynamic_first_fit"`` (pins-are-hints) before any allocations
+        happen. Mid-stream switching is permitted — already-recorded
+        ranges keep their starts; only subsequent :meth:`alloc` calls
+        observe the new mode.
+        """
+        if strategy not in ("pinned", "dynamic_first_fit"):
+            raise FFNUnitAllocatorError(
+                f"set_strategy(): strategy must be 'pinned' or "
+                f"'dynamic_first_fit' (got {strategy!r})"
+            )
+        self._strategy = strategy
+
+    def evict_pin_hints(self) -> List[Tuple[str, int]]:
+        """Return ``(op_name, pin)`` for every pinned range still in use.
+
+        Migration-auditing helper: walk every allocation that landed at
+        its caller-provided ``pin=`` (i.e. ``pinned=True``) and report
+        the pair. The Phase 7.B compile pass uses this output to track
+        which op families are still relying on hard-coded offsets after
+        the strategy switch — anything that turns up here in
+        ``"dynamic_first_fit"`` mode is a candidate for pin removal.
+        """
+        return [(r.op_name, r.start) for r in self._ranges if r.pinned]
+
+    def pin_collisions(self) -> List[Tuple[str, int, int]]:
+        """Return ``(op_name, requested_pin, actual_start)`` for every
+        pin hint that could NOT be honored under ``"dynamic_first_fit"``.
+
+        Empty list in ``"pinned"`` mode (a colliding pin is a hard error
+        there). Used by the Phase 7.B reporter to surface which op
+        families need their pins relaxed before the allocator can fold
+        them into a smaller layout.
+        """
+        return list(self._pin_collisions)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -286,6 +381,7 @@ class FFNUnitAllocator:
 
 
 __all__ = [
+    "AllocStrategy",
     "AllocatedUnitRange",
     "DEFAULT_LAYER_MAX_UNITS",
     "FFNUnitAllocator",
