@@ -736,6 +736,141 @@ class SymbolicDeclarativeRunner:
         )
 
 
+@dataclass(frozen=True)
+class TokenEmbeddingRule:
+    """One declarative write into a model-level token table.
+
+    ``TokenEmbeddingRule`` is the embedding/head-bake analogue of
+    :class:`FFNRule`: instead of conditionally adding values to one residual
+    position based on other residual cells, it unconditionally writes a fixed
+    set of ``(dim, value)`` pairs into a per-token row of a model-level table
+    (``model.embed.embed.weight`` or ``model.head.weight``), or into a per-token
+    scalar (``model.head.bias``).
+
+    Three ``target`` values are supported:
+
+    * ``embed`` — writes into ``model.embed.embed.weight[token_ids, dim]``.
+      ``writes`` is a tuple of ``(dim_name+offset, value)`` pairs resolved via
+      ``dim_positions`` (just like :class:`FFNRule.writes`).
+    * ``head_weight`` — writes into ``model.head.weight[token_ids, dim]``.
+      ``writes`` uses the same ``(dim_name+offset, value)`` form.
+    * ``head_bias`` — writes into ``model.head.bias[token_ids]``. ``writes`` is
+      either empty or a single ``("", value)`` entry; the convenience
+      constructor :meth:`bias_write` builds the canonical form.
+
+    A rule fans out across every token in ``token_ids``. The lowering is
+    accumulative (``+=``) so multiple rules may target the same cell, mirroring
+    how :class:`FFNRule` lowering accumulates ``W_up``/``W_down`` contributions.
+    """
+
+    target: str  # Literal["embed", "head_weight", "head_bias"]
+    token_ids: Tuple[int, ...]
+    writes: Tuple[WriteTerm, ...]
+    name: Optional[str] = None
+
+    @classmethod
+    def embed_write(
+        cls,
+        *,
+        token_ids,
+        writes: Sequence[Tuple[str, float]],
+        name: Optional[str] = None,
+    ) -> "TokenEmbeddingRule":
+        return cls(
+            target="embed",
+            token_ids=_coerce_token_ids(token_ids),
+            writes=tuple(
+                WriteTerm(DimRef.parse(dim), float(weight))
+                for dim, weight in writes
+            ),
+            name=name,
+        )
+
+    @classmethod
+    def head_weight_write(
+        cls,
+        *,
+        token_ids,
+        writes: Sequence[Tuple[str, float]],
+        name: Optional[str] = None,
+    ) -> "TokenEmbeddingRule":
+        return cls(
+            target="head_weight",
+            token_ids=_coerce_token_ids(token_ids),
+            writes=tuple(
+                WriteTerm(DimRef.parse(dim), float(weight))
+                for dim, weight in writes
+            ),
+            name=name,
+        )
+
+    @classmethod
+    def head_bias_write(
+        cls,
+        *,
+        token_ids,
+        value: float,
+        name: Optional[str] = None,
+    ) -> "TokenEmbeddingRule":
+        return cls(
+            target="head_bias",
+            token_ids=_coerce_token_ids(token_ids),
+            writes=(WriteTerm(DimRef("", 0), float(value)),),
+            name=name,
+        )
+
+    def __post_init__(self):
+        if self.target not in ("embed", "head_weight", "head_bias"):
+            raise ValueError(
+                f"TokenEmbeddingRule.target must be one of "
+                f"'embed' | 'head_weight' | 'head_bias', got {self.target!r}"
+            )
+        if self.target == "head_bias":
+            if len(self.writes) != 1 or self.writes[0].dim.name != "":
+                raise ValueError(
+                    "TokenEmbeddingRule(target='head_bias') expects exactly "
+                    "one write with an empty DimRef; use "
+                    "TokenEmbeddingRule.head_bias_write"
+                )
+
+
+def _coerce_token_ids(token_ids) -> Tuple[int, ...]:
+    if isinstance(token_ids, int):
+        return (int(token_ids),)
+    return tuple(int(t) for t in token_ids)
+
+
+@dataclass(frozen=True)
+class TokenEmbeddingComparisonIssue:
+    """One classified symbolic-vs-lowered token-embedding failure."""
+
+    kind: str
+    message: str
+
+
+@dataclass
+class TokenEmbeddingComparisonReport:
+    """Diagnostic result for ``compare_symbolic_to_lowered_embedding``."""
+
+    ok: bool
+    issues: List[TokenEmbeddingComparisonIssue] = field(default_factory=list)
+
+    @property
+    def failure_kinds(self) -> Tuple[str, ...]:
+        return tuple(dict.fromkeys(issue.kind for issue in self.issues))
+
+    @property
+    def primary_failure_kind(self) -> Optional[str]:
+        return self.issues[0].kind if self.issues else None
+
+    def format(self) -> str:
+        status = "OK" if self.ok else "DRIFT"
+        lines = [f"=== CompilerIR token-embedding comparison ({status}) ==="]
+        for issue in self.issues:
+            lines.append(f"  [{issue.kind}] {issue.message}")
+        return "\n".join(lines)
+
+
 @dataclass
 class LayerSpec:
     """Declarative work assigned to one logical compiler layer."""
@@ -749,6 +884,7 @@ class CompilerIR:
     """A symbolic-and-lowerable program fragment."""
 
     layers: List[LayerSpec] = field(default_factory=list)
+    embeddings: List[TokenEmbeddingRule] = field(default_factory=list)
 
     def layer(self, index: int) -> LayerSpec:
         while len(self.layers) <= index:
@@ -840,6 +976,48 @@ class CompilerIR:
         for head in heads:
             Primitives.generate_attention_head(attn, head.spec, HD)
         return len(heads)
+
+    def lower_token_embeddings(
+        self,
+        model,
+        dim_positions: Mapping[str, int],
+        *,
+        rules: Optional[Sequence[TokenEmbeddingRule]] = None,
+    ) -> int:
+        """Lower model-level :class:`TokenEmbeddingRule` entries into ``model``.
+
+        Mirrors :meth:`lower_ffn` / :meth:`lower_attention` for the embedding
+        / head bakes. ``model`` must expose ``model.embed.embed.weight``,
+        ``model.head.weight``, and ``model.head.bias`` (the standard
+        ``NeuralVMEmbedding`` + ``nn.Linear`` head shape used throughout this
+        codebase).
+
+        When ``rules`` is None the IR's own ``embeddings`` list is used. Returns
+        the number of (rule, token_id) write batches applied — useful as a
+        sanity check.
+        """
+
+        chosen = list(self.embeddings if rules is None else rules)
+        applied = 0
+        embed_weight = model.embed.embed.weight if chosen else None
+        head_weight = getattr(model, "head", None)
+        for rule in chosen:
+            for token_id in rule.token_ids:
+                if rule.target == "embed":
+                    for write in rule.writes:
+                        col = write.dim.resolve(dim_positions)
+                        embed_weight.data[token_id, col] += float(write.weight)
+                elif rule.target == "head_weight":
+                    for write in rule.writes:
+                        col = write.dim.resolve(dim_positions)
+                        head_weight.weight.data[token_id, col] += float(write.weight)
+                elif rule.target == "head_bias":
+                    # Validated by __post_init__ to be one bias write.
+                    head_weight.bias.data[token_id] += float(rule.writes[0].weight)
+                else:  # pragma: no cover — guarded in __post_init__
+                    raise ValueError(f"unknown target {rule.target!r}")
+                applied += 1
+        return applied
 
     def attention_debug_report(
         self,
@@ -1252,6 +1430,231 @@ def compare_symbolic_to_lowered_attn(
     report.issues.extend(output_issues)
     report.ok = not report.issues
     return report
+
+
+def compare_symbolic_to_lowered_embedding(
+    ir_or_rule,
+    dim_positions: Mapping[str, int],
+    *,
+    model=None,
+    vocab_size: Optional[int] = None,
+    d_model: Optional[int] = None,
+    lower: bool = True,
+    atol: float = 1e-6,
+    rtol: float = 1e-6,
+) -> TokenEmbeddingComparisonReport:
+    """Compare declared :class:`TokenEmbeddingRule` writes with lowered weights.
+
+    The token-embedding analogue of :func:`compare_symbolic_to_lowered_ffn`.
+    For each rule we expect the lowered model to contain ``sum(rule.weight)``
+    at every ``(token, resolved_dim)`` it targets — accumulated across rules
+    that hit the same cell, exactly as ``lower_token_embeddings`` accumulates.
+
+    Failure kinds:
+
+    * ``declaration_semantics`` — a rule references a dim not in
+      ``dim_positions``, or a ``token_id`` outside the model's vocab range.
+    * ``lowering`` — the lowered weights (``model.embed.embed.weight`` /
+      ``model.head.weight`` / ``model.head.bias``) disagree with the IR sum.
+    """
+
+    ir = _coerce_compiler_ir_embedding(ir_or_rule)
+    report = TokenEmbeddingComparisonReport(ok=False)
+    rules = list(ir.embeddings)
+    if not rules:
+        report.ok = True
+        return report
+
+    decl_issues = _validate_embedding_declarations(
+        rules,
+        dim_positions,
+        vocab_size=vocab_size,
+    )
+    if decl_issues:
+        report.issues.extend(decl_issues)
+        return report
+
+    resolved_vocab, resolved_d_model = _resolve_embedding_shape(
+        rules,
+        dim_positions,
+        vocab_size=vocab_size,
+        d_model=d_model,
+        model=model,
+    )
+
+    if model is None:
+        model = _build_synthetic_embed_model(resolved_vocab, resolved_d_model)
+
+    if lower:
+        ir.lower_token_embeddings(model, dim_positions)
+
+    lowering_issues = _validate_lowered_embedding(
+        rules,
+        model,
+        dim_positions,
+        atol=atol,
+        rtol=rtol,
+    )
+    if lowering_issues:
+        report.issues.extend(lowering_issues)
+        return report
+
+    report.ok = True
+    return report
+
+
+def _coerce_compiler_ir_embedding(ir_or_rule) -> CompilerIR:
+    if isinstance(ir_or_rule, CompilerIR):
+        return ir_or_rule
+    if isinstance(ir_or_rule, TokenEmbeddingRule):
+        ir = CompilerIR()
+        ir.embeddings.append(ir_or_rule)
+        return ir
+    raise TypeError(
+        "compare_symbolic_to_lowered_embedding expects CompilerIR or "
+        "TokenEmbeddingRule"
+    )
+
+
+def _validate_embedding_declarations(
+    rules: Sequence[TokenEmbeddingRule],
+    dim_positions: Mapping[str, int],
+    *,
+    vocab_size: Optional[int],
+) -> List[TokenEmbeddingComparisonIssue]:
+    issues: List[TokenEmbeddingComparisonIssue] = []
+    for rule_idx, rule in enumerate(rules):
+        label = rule.name or f"embed_rule_{rule_idx}"
+        if rule.target in ("embed", "head_weight"):
+            for write in rule.writes:
+                if write.dim.name not in dim_positions:
+                    issues.append(TokenEmbeddingComparisonIssue(
+                        "declaration_semantics",
+                        f"{label} write references undeclared dim "
+                        f"{write.dim.name!r}",
+                    ))
+        if vocab_size is not None:
+            for token_id in rule.token_ids:
+                if not (0 <= int(token_id) < int(vocab_size)):
+                    issues.append(TokenEmbeddingComparisonIssue(
+                        "declaration_semantics",
+                        f"{label} token_id {token_id} out of vocab "
+                        f"range [0, {vocab_size})",
+                    ))
+    return issues
+
+
+def _resolve_embedding_shape(
+    rules: Sequence[TokenEmbeddingRule],
+    dim_positions: Mapping[str, int],
+    *,
+    vocab_size: Optional[int],
+    d_model: Optional[int],
+    model,
+) -> Tuple[int, int]:
+    if model is not None:
+        embed_w = model.embed.embed.weight
+        return int(embed_w.shape[0]), int(embed_w.shape[1])
+
+    max_token = -1
+    for rule in rules:
+        for token_id in rule.token_ids:
+            max_token = max(max_token, int(token_id))
+    inferred_vocab = max_token + 1 if max_token >= 0 else 1
+    resolved_vocab = vocab_size if vocab_size is not None else inferred_vocab
+
+    max_dim = -1
+    for pos in dim_positions.values():
+        max_dim = max(max_dim, int(pos))
+    for rule in rules:
+        if rule.target == "head_bias":
+            continue
+        for write in rule.writes:
+            if write.dim.name in dim_positions:
+                max_dim = max(max_dim, write.dim.resolve(dim_positions))
+    inferred_d_model = max_dim + 1 if max_dim >= 0 else 1
+    resolved_d_model = d_model if d_model is not None else inferred_d_model
+    return resolved_vocab, resolved_d_model
+
+
+def _build_synthetic_embed_model(vocab_size: int, d_model: int):
+    """Return a minimal duck-typed ``model`` with the fields lowering touches.
+
+    Avoids importing the full ``NeuralVMEmbedding`` + ``AutoregressiveVM`` stack
+    in unit tests / quick comparisons. The synthetic model exposes
+    ``model.embed.embed.weight`` and ``model.head.{weight,bias}`` as plain
+    ``torch.nn`` modules, which is what ``lower_token_embeddings`` writes into.
+    """
+
+    import torch
+    import torch.nn as nn
+
+    class _SyntheticEmbed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(vocab_size, d_model)
+            with torch.no_grad():
+                self.embed.weight.zero_()
+
+    class _SyntheticModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = _SyntheticEmbed()
+            self.head = nn.Linear(d_model, vocab_size)
+            with torch.no_grad():
+                self.head.weight.zero_()
+                self.head.bias.zero_()
+
+    return _SyntheticModel()
+
+
+def _validate_lowered_embedding(
+    rules: Sequence[TokenEmbeddingRule],
+    model,
+    dim_positions: Mapping[str, int],
+    *,
+    atol: float,
+    rtol: float,
+) -> List[TokenEmbeddingComparisonIssue]:
+    """Diff expected per-cell sums against the lowered weights."""
+
+    embed_w = model.embed.embed.weight.detach()
+    head_w = model.head.weight.detach()
+    head_b = model.head.bias.detach()
+
+    # Build expected accumulators keyed by (target, token, col_or_None).
+    expected: Dict[Tuple[str, int, Optional[int]], float] = {}
+    for rule in rules:
+        for token_id in rule.token_ids:
+            if rule.target == "head_bias":
+                key = ("head_bias", int(token_id), None)
+                expected[key] = expected.get(key, 0.0) + float(
+                    rule.writes[0].weight
+                )
+                continue
+            for write in rule.writes:
+                col = write.dim.resolve(dim_positions)
+                key = (rule.target, int(token_id), col)
+                expected[key] = expected.get(key, 0.0) + float(write.weight)
+
+    issues: List[TokenEmbeddingComparisonIssue] = []
+    for (target, token_id, col), expected_value in expected.items():
+        if target == "embed":
+            observed = float(embed_w[token_id, col])
+            label = f"embed[{token_id}, {col}]"
+        elif target == "head_weight":
+            observed = float(head_w[token_id, col])
+            label = f"head.weight[{token_id}, {col}]"
+        else:
+            observed = float(head_b[token_id])
+            label = f"head.bias[{token_id}]"
+        if abs(observed - expected_value) <= atol + rtol * abs(expected_value):
+            continue
+        issues.append(TokenEmbeddingComparisonIssue(
+            "lowering",
+            f"{label}: expected {expected_value:.8g}, observed {observed:.8g}",
+        ))
+    return issues
 
 
 def _coerce_compiler_ir_attn(ir_or_head, *, layer_idx: int) -> CompilerIR:
@@ -1943,7 +2346,11 @@ __all__ = [
     "SymbolicDeclarativeRunReport",
     "SymbolicDeclarativeRunner",
     "SymbolicResidualState",
+    "TokenEmbeddingComparisonIssue",
+    "TokenEmbeddingComparisonReport",
+    "TokenEmbeddingRule",
     "WriteTerm",
     "compare_symbolic_to_lowered_attn",
+    "compare_symbolic_to_lowered_embedding",
     "compare_symbolic_to_lowered_ffn",
 ]
