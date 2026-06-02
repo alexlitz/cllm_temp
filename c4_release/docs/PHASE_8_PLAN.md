@@ -550,14 +550,27 @@ model that can run through the standard `transformers` runner.
      sinks in the symbolic comparison harness — extend to runtime).
    - Both modes must pass 1096 corpus.
 
-3. **Division strategy**: `div_mode: Literal["log_exp", "log_div"]`
-   - **Clarification needed**: please confirm which path is
-     "log/exp" vs "log division" in the current codebase. Two
-     candidates:
-     (a) DIV opcode lookup table (current) vs log-space subtraction
-     (b) Softmax computation: standard log-sum-exp vs alternative
-     log-division formulation
-   - 8.O.3 add the other mode; both pass 1096.
+3. **Division strategy**: `div_mode: Literal["long_div", "log_softmax1"]`
+   - Per `docs/BLOG_SPEC.md` §"Division Implementation" (lines 641-682):
+     - **`long_div`** (current default) — base-16 long division. Each
+       quotient digit `q ∈ {0..15}` is computed by threshold counting:
+       `q = Σ_{k=1..15} step(remainder − k · divisor)`. Iterative,
+       O(layers per digit). The blog defaults to long_div because of the
+       "first-8-tokens cannot divide" issue in the alternative.
+     - **`log_softmax1`** — attention-based division. Use softmax1 with
+       a position at `score=0, value=0` (the sink) and others at
+       `score=−log(n), value=1`; accumulated value = 1/n. Requires
+       `log(n)` keys baked at exponential scales (`2^0…2^31`) — the same
+       comparison-cascade machinery the blog uses for position offsets
+       (lines 720-728). Limitation: cannot divide in the first 8 tokens
+       (insufficient distinct exponential keys yet).
+   - 8.O.3 add `log_softmax1` mode as an alternative; both pass 1096.
+     Note: `log_softmax1` requires `attn_softmax="softmax1"` (toggle 2)
+     to function — so these toggles co-vary.
+   - Same applies to attention baking: §"Attention baking via long division"
+     (line 836) describes how a full attention bake currently
+     computes `1 + Σ e^{x_i}` and divides by it; switching to
+     `log_softmax1` mode replaces this with the attention-based path.
 
 4. **Output norm**: `output_norm: Optional[Literal["rmsnorm", "layernorm"]]
    = None`
@@ -567,33 +580,64 @@ model that can run through the standard `transformers` runner.
      today's behavior; with norm ON it must still pass 1096 corpus
      (norm trained or analytically derived to be identity at our scale).
 
-**HuggingFace packaging:**
+**HuggingFace packaging — fit into an EXISTING HF model spec:**
 
-* **8.O.5** Write `c4_release/hf_export/`:
-  - `configuration_c4vm.py` — `transformers.PretrainedConfig` subclass
-    with all the toggles above + existing hyperparameters
-    (n_layers, n_heads, d_model, vocab_size, etc.)
-  - `modeling_c4vm.py` — `transformers.PreTrainedModel` subclass
-    wrapping `BakedC4Transformer`. Override `forward` to match the
-    HF convention (input_ids → logits).
-  - `tokenization_c4vm.py` — `transformers.PreTrainedTokenizer`
-    subclass for the C4 token vocabulary (opcodes, markers, bytes).
-* **8.O.6** Map weights from internal names to HF-conventional names
-  (or vice versa). The `compile_full_vm` output is a `nn.Module`;
-  serialize via `model.save_pretrained(path)`.
-* **8.O.7** Publish to HuggingFace Hub:
-  - Pick a model ID (suggested: `c4vm/c4-baked-transformer-15L-v1`).
-  - Upload weights + config + tokenizer + README + license.
-  - **Clarification needed**: which HF org / model name?
-* **8.O.8** Round-trip test:
+The model must be loadable via the standard `transformers` runner
+**without any custom modeling code** — i.e., reshape/rename the
+weights to fit an existing HF architecture (no
+`modeling_c4vm.py`). The reason 8.O.1–8.O.4 toggles exist is
+precisely so the architecture aligns with an HF standard.
+
+* **8.O.5** Pick the target HF architecture. The C4 VM uses
+  MoE + SwiGLU + (currently) ALiBi + standard multi-head attention.
+  Closest existing HF architectures:
+
+  | HF arch | MoE | SwiGLU | Position encoding | Norm |
+  |---|---|---|---|---|
+  | `MixtralForCausalLM` | sparse | yes | RoPE | RMSNorm |
+  | `Qwen2MoeForCausalLM` | sparse | yes | RoPE | RMSNorm |
+  | `JambaForCausalLM` | yes (hybrid) | yes | RoPE | RMSNorm |
+  | `LlamaForCausalLM` | no | yes | RoPE | RMSNorm |
+  | `MptForCausalLM` (legacy) | no | no | ALiBi | LayerNorm |
+
+  Most-likely target: **`MixtralForCausalLM`** (MoE + SwiGLU + RoPE
+  + RMSNorm) — requires 8.O.1 (RoPE toggle) and 8.O.4 (RMSNorm
+  toggle) to flip ON for the HF-compatible build. The toggles
+  exist for this reason.
+
+  Alternative if MPT compatibility wanted: keep ALiBi off
+  (`MptForCausalLM`) but lose MoE.
+
+  **Decision input needed**: confirm target HF architecture (or
+  pick the closest based on the toggle combination you want as the
+  published default).
+
+* **8.O.6** Write `c4_release/hf_export/`:
+  - `export_to_hf.py` — script that takes a `compile_full_vm` output
+    + the agreed toggle config, reshapes/renames internal weights
+    into the chosen HF arch's `state_dict()` schema. The output is
+    a path containing `config.json` + `model.safetensors` + tokenizer
+    files that load via `AutoModelForCausalLM.from_pretrained()`.
+  - Tokenizer: map the C4 token vocabulary to an HF-standard
+    tokenizer base (`PreTrainedTokenizerFast` with vocab JSON — no
+    custom subclass).
+  - NO `modeling_*.py` or `configuration_*.py` subclasses — use HF's
+    stock code paths.
+
+* **8.O.7** Round-trip test:
   ```python
   from transformers import AutoModelForCausalLM, AutoTokenizer
-  model = AutoModelForCausalLM.from_pretrained("c4vm/c4-baked-transformer-15L-v1")
-  tokenizer = AutoTokenizer.from_pretrained("c4vm/c4-baked-transformer-15L-v1")
-  # Run 1096 corpus through the HF model
+  # AutoModelForCausalLM resolves to the chosen HF arch
+  model = AutoModelForCausalLM.from_pretrained("./exported_c4vm/")
+  tokenizer = AutoTokenizer.from_pretrained("./exported_c4vm/")
+  # Run 1096 corpus through the HF runner
   ```
-  Acceptance: HF-loaded model passes 1096/1096 corpus identical to
-  internal `BakedC4Transformer`.
+  Acceptance: HF-loaded model passes 1096/1096 identical to internal
+  `BakedC4Transformer`. NO custom code paths in user code — only
+  HF's stock model class and tokenizer.
+
+* **8.O.8** Optional: publish to HF Hub (model ID TBD). Lower
+  priority than the local round-trip.
 
 * **8.O.9** Each toggle combination must pass:
   - 1096 corpus 100%
