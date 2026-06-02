@@ -8,13 +8,14 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L7 attention head layout (pinned head_idx per primary owner) ====
+# === L7 attention head layout (auto-fit; legacy head_idx as docs) ====
 #
 # L7 is attention-heavy: every op in this file writes Q/K/V/O for one or
 # more attention heads. This table is the single source of truth for the
-# L7 head axis -- every existing ``head_idx=N`` literal in the spec
-# functions below is pinned here, so the bakes pull the same indices
-# they always have and byte-identity is trivially preserved.
+# L7 head axis -- every ``head_idx=N`` literal in the spec functions
+# below is resolved via :data:`_L7_HEAD_LAYOUT_BY_NAME`, so the bakes
+# pull the same indices they always have and byte-identity is trivially
+# preserved.
 #
 # Each row names a *primary owner* of its head_idx. Two L7 ops legitimately
 # extend an already-owned head: ``layer7_sp_byte0_is_f8`` adds V/O slots
@@ -24,11 +25,18 @@ from .shared import _as_setdim_proxy
 # head_idx via :data:`_L7_HEAD_LAYOUT_BY_NAME` rather than re-pinning the
 # same slot, which the allocator forbids (heads cannot be aliased).
 #
+# Phase 7.B.3: ``pin=`` is dropped from the allocator. Because
+# :data:`_L7_HEAD_LAYOUT` is contiguous (0..7) and declared in order,
+# first-fit reproduces the legacy ``head_idx`` values bit-for-bit. The
+# load-bearing copy is :data:`_L7_HEAD_LAYOUT_BY_NAME`, consumed by the
+# head-spec factories that write Q/K/V/O weights at the resolved
+# ``head_idx``; the ``legacy_head_idx`` column below is documentation only.
+#
 # Order mirrors the op-factory order in this file (operand_gather, then
 # memory_heads heads 2-7) so the layout reads top-to-bottom alongside the
 # specs that own each row.
 _L7_HEAD_LAYOUT = (
-    # (op_name, head_idx)
+    # (op_name, legacy_head_idx (docs only))
     ("layer7_operand_gather.head_0",     0),  # operand A gather (STACK0 byte 0 -> ALU)
     ("layer7_operand_gather.head_1",     1),  # operand A gather (BP/SP OUTPUT -> ALU for LEA/ADJ/ENT)
     ("layer7_memory_heads.head_2",       2),  # gather prev AX byte 0 -> ADDR_B0_LO/HI
@@ -44,45 +52,45 @@ _L7_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L7_HEAD_LAYOUT}
 def _allocate_layer7_heads() -> AttentionHeadAllocator:
     """Build a per-bake :class:`AttentionHeadAllocator` with all L7 heads.
 
-    Each primary owner from :data:`_L7_HEAD_LAYOUT` is pinned at its
-    existing ``head_idx``; the allocator therefore declares the full L7
-    head axis without disturbing any baked attention weights. Returns
-    the allocator so callers can inspect it or extend the layer with a
-    future op that wants a new head via ``allocator.alloc(name, 7)``
-    (no pin, which first-fits the lowest free index -- there are none
-    today since heads 0..7 are all claimed, but the contract is in
-    place for a wider config).
-
-    This is byte-identical bookkeeping: the allocator names the heads,
-    the bakes still write the same Q/K/V/O cells they always have.
-    Each ``head_idx=N`` literal in the spec functions below is sourced
-    from :data:`_L7_HEAD_LAYOUT_BY_NAME`, so adding a new head requires
-    only a layout-table edit.
+    Phase 7.B.3: ``pin=`` is dropped from every entry. The allocator's
+    first-fit picks the lowest free head index in declaration order;
+    because :data:`_L7_HEAD_LAYOUT` is contiguous (0..7) and ordered,
+    first-fit reproduces the legacy ``head_idx`` values bit-for-bit.
+    The actual weight-write head indices are still looked up via
+    :data:`_L7_HEAD_LAYOUT_BY_NAME` inside the head-spec factories
+    below, so byte-identity with the legacy bake is preserved
+    regardless of allocator order. Returns the allocator so callers
+    can attach it to the ``attn`` module for inspection.
     """
     allocator = AttentionHeadAllocator(layer_max_heads=8)
-    for name, head_idx in _L7_HEAD_LAYOUT:
-        allocator.alloc(name, 7, pin=head_idx)
+    for name, _legacy_head_idx in _L7_HEAD_LAYOUT:
+        allocator.alloc(name, 7)
     return allocator
 
 
-# === L7 FFN unit layout (pinned offsets) ============================
+# === L7 FFN unit layout (auto-fit; legacy offsets retained as docs) ===
 #
 # L7 is attention-only: every op in this file is ``kind="block"`` and
 # writes attention weights (Q/K/V/O), not FFN hidden units. There is no
 # ``_set_layer7_ffn`` helper in ``vm_step`` and no ``ffn_units_used``
-# annotation on any L7 op. Migration to :class:`FFNUnitAllocator` is
-# therefore bookkeeping-only: each op claims a 1-unit placeholder at a
-# pinned offset so the L7 FFN-unit layout is auditable in the same way as
-# L1/L2/L9, and a future L7 op family that DOES need FFN units can claim
-# a free range past unit 4 via ``allocator.alloc(name, n)`` without a
-# pin. Byte-identity is trivially preserved -- no FFN weights are
-# touched by any L7 bake.
+# annotation on any L7 op. The allocator is bookkeeping-only: each op
+# claims a 1-unit placeholder so the L7 FFN-unit layout is auditable in
+# the same way as L1/L2/L9, and a future L7 op family that DOES need
+# FFN units can claim a free range via ``allocator.alloc(name, n)``.
+# Byte-identity is trivially preserved -- no FFN weights are touched by
+# any L7 bake.
+#
+# Phase 7.B.3: every entry below is auto-placed by
+# :class:`FFNUnitAllocator` first-fit. Because the layout is fully
+# contiguous in declaration order, first-fit reproduces the legacy
+# placeholder offsets (0..3) bit-for-bit; the ``legacy_start`` column
+# is kept purely as documentation.
 #
 # Order mirrors the op-factory order in this file (operand_gather first,
 # then memory_heads, format_pointer_extraction, sp_byte0_is_f8) so the
 # layout reads top-to-bottom alongside the factories that own each slot.
 _L7_FFN_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     ("layer7_operand_gather.placeholder",       0, 1),  # L7 head 0+1
     ("layer7_memory_heads.placeholder",         1, 1),  # L7 heads 2-7
     ("format_pointer_extraction.placeholder",   2, 1),  # L7 head 7 (gated)
@@ -93,19 +101,15 @@ _L7_FFN_UNIT_LAYOUT = (
 def _allocate_layer7_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L7 sub-stages.
 
-    Every sub-stage is pinned at its placeholder offset so the L7 ops --
-    which write attention weights, not FFN units -- declare a structured
-    layout for the L7 FFN-unit axis without disturbing any existing
-    weight indices. This call is byte-identical bookkeeping: the
-    allocator declares names, the bakes write attention. A future L7 op
-    family that needs real FFN units can ``allocator.alloc(name, n)``
-    past unit 4 (no pin) and pick up the first free gap.
-
-    Returns the allocator so callers can inspect or extend it.
+    Phase 7.B.3: ``pin=`` is dropped from every entry. First-fit
+    over the contiguous placeholder layout reproduces offsets 0..3
+    bit-for-bit. No FFN weights are written by any L7 bake, so the
+    allocator state is pure bookkeeping. Returns the allocator so
+    callers can inspect or extend it.
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L7_FFN_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L7_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
