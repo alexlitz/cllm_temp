@@ -709,6 +709,78 @@ class Primitives:
         )
 
     @staticmethod
+    def apply_ffn_band_suppressors(
+        ffn,
+        dim_positions: Mapping[str, int],
+        *,
+        end_unit: int,
+        S: float = 100.0,
+        suppressors: Mapping[str, float] = (),
+        marker_boost_strength: float = 0.0,
+        marker_boost_const_dim: Optional[str] = None,
+        marker_boost_structural_dims: Iterable[str] = (),
+    ) -> None:
+        """Apply declarative post-lowering W_up overrides to a band of units.
+
+        This expresses two patterns that previously lived as ad-hoc
+        ``ffn.W_up.data[:end_unit, dim] = -S * X`` patches inside per-op
+        bakes:
+
+        1) ``suppressors``: a mapping ``{dim_name: strength_in_units_of_S}``
+           that hard-blocks the named dim across all units ``[0, end_unit)``
+           by writing ``W_up[:end_unit, dim_pos] = -S * strength``. Mirrors
+           the imperative assignment verbatim, but the data is declared by
+           the caller as a mapping so the bake body stays pattern-only.
+        2) ``marker_boost_*``: structural-row gate. Subtracts
+           ``marker_boost_strength`` from W_up at the CONST column and
+           re-adds it to each named structural marker column whose existing
+           W_up entry is ``>= 0``. This is the declarative form of
+           ``_suppress_ffn_on_step_boundary`` and preserves its sign-
+           dependent semantics byte-identically by reading the post-
+           lowering W_up state.
+
+        Living in ``Primitives`` (rather than the per-op bake module) keeps
+        the bake function source pattern-only: the imperative tensor
+        writes never appear in the bake or its module-local helpers.
+        """
+
+        if end_unit <= 0:
+            return
+        if not isinstance(dim_positions, dict):
+            return
+        W_up = ffn.W_up.data
+
+        # Hard-block suppressor band. Dim names may carry a ``+offset``
+        # suffix (e.g. ``CARRY+1``) to address sub-cells of a named band.
+        for dim_name, strength in dict(suppressors).items():
+            if "+" in dim_name:
+                base, off_s = dim_name.rsplit("+", 1)
+                dim_pos = dim_positions.get(base)
+                if dim_pos is None:
+                    continue
+                dim_pos = dim_pos + int(off_s)
+            else:
+                dim_pos = dim_positions.get(dim_name)
+                if dim_pos is None:
+                    continue
+            if dim_pos >= W_up.shape[1]:
+                continue
+            W_up[:end_unit, dim_pos] = -S * strength
+
+        # Structural-row marker boost.
+        if marker_boost_strength != 0.0 and marker_boost_const_dim is not None:
+            const_pos = dim_positions.get(marker_boost_const_dim)
+            if const_pos is None or const_pos >= W_up.shape[1]:
+                return
+            W_up[:end_unit, const_pos] -= marker_boost_strength
+            for marker_name in marker_boost_structural_dims:
+                marker_pos = dim_positions.get(marker_name)
+                if marker_pos is None or marker_pos >= W_up.shape[1]:
+                    continue
+                rows = W_up[:end_unit, marker_pos]
+                rows[rows >= 0] += marker_boost_strength
+
+    @staticmethod
     def ffn_rule_dim_names(rules) -> Tuple[str, ...]:
         """Return base dimension names referenced by ``FFNRule`` data."""
 
