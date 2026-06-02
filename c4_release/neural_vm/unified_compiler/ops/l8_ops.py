@@ -476,10 +476,18 @@ def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
     """LEA carry detection (120 units, offsets 888..1007).
 
     Same structural shape as lea_lo (gate=OP_LEA, FETCH_LO operand,
-    non-AX blockers) but only emits when ``a + b >= 16``. Writes
-    CARRY+0 at the same 2.0/(S*5.0) normalization as ADD carry.
+    non-AX blockers) but only emits when ``a + b >= 16``. Writes the
+    ``(carry, alu)`` byte-0 cell at the same 2.0/(S*5.0) normalization
+    as ADD carry.
+
+    Phase 7.E.2: gate + carry-output refs use ``dim_ref`` for the
+    semantic ``(opcode_flag, LEA)`` and ``(carry, alu, byte_index=0)``
+    pairs. ALU_LO+a / FETCH_LO+b stay structural (per-nibble one-hot
+    lookups).
     """
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_lea = dim_ref("opcode_flag", "LEA")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
     rules = []
     for a in range(16):
@@ -495,10 +503,10 @@ def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"FETCH_LO+{b}", 20.0),
                 ),
                 threshold=80.5,
-                gate="OP_LEA",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_lea,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_LEA",
-                dominates_at={"CARRY+0": "MARK_AX and OP_LEA"},
+                dominates_at={carry_byte0: "MARK_AX and OP_LEA"},
             ))
     return tuple(rules)
 
