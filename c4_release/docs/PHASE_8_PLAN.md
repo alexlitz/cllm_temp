@@ -225,43 +225,56 @@ KV eviction kwarg port done (in same merge)._
 
 ### Stream 4 — KV eviction / corpus fixes / demo
 
-#### 8.E — KV eviction completeness
+#### 8.E — KV eviction of overwritten values
 
-_Status: in progress; 7.F.1/2/4 landed. **Blocked on 8.A** (cycle
-decomp feeds the analyzer)._
+_Status: in progress; 7.F.1/2/4 landed._
 
-**Goal (revised):** every KV entry that is provably dead at step S
-(per the declarative IR's liveness analysis) is evicted no later
-than step S. Not a memory-% target. Memory drop is the downstream
-consequence.
+**Goal (clarified):** when a later step overwrites a value (register
+clobber, memory cell write, output slot rewrite, etc.), the OLD value's
+KV entry — the one carrying the now-superseded contribution — is
+evicted at that step. The simple semantic rule: **dead means
+overwritten**.
 
-* **8.E.1** Refine analyzer's cycle classifier: `_PREV_STEP` reads
-  should not promote the base dim to cycle-conservative. (Today,
-  any base-dim reader inside the SCC marks the dim as cycle-conservative,
-  causing ~80 dim names to never be evictable.)
-* **8.E.2** Per-(layer, head, dim-group) cache compartmentalisation.
-  Today's `cached_k[B, H, S, HD]` packs every dim into one row, so
-  the AND across dims keeps every row live even when most are dead.
-  Split the cache into dim-groups so eviction applies per-group.
-* **8.E.3** Loosen "semantic-overwrite" category from "every later
-  step" to "very next step" — catches register carries like `REG_AX`
-  automatically (when step N+1 overwrites it, step N's entry is dead).
-* **8.E.4** Build the **oracle analyzer**: walk the declarative IR
-  with no cycle conservatism; for each `(step, position, dim)` compute
-  the actual last-reader step. The runtime analyzer's job is to match
-  the oracle.
-* **8.E.5** Build the **completeness gate**: after each step, run both
-  runtime analyzer and oracle. Assert (a) every entry the oracle says
-  is dead at step S has been evicted by step S (no late-evictions);
-  (b) every entry the runtime evicted is also dead per the oracle (no
-  false-positives that would break correctness).
-* **8.E.6** Determinism gate: spec-decode and main-decode at the same
-  step S evict identical entry sets.
-* **8.E.7** Wire `test_kv_eviction.py` byte-identity gate + completeness
-  gate into CI.
-* **Acceptance**: completeness gate green on 1096 corpus sample
-  (200 inputs): **0 late-evictions, 0 false-positives, determinism
-  preserved**. Memory drop reported as a side effect, not gated.
+This is NOT a full runtime liveness analyzer. It's a static
+"overwrite" detector applied each step. The declarative IR already
+declares what each step writes; that's the signal.
+
+* **8.E.1** Catalog the **overwrite categories**:
+  - Register overwrites (PC, AX, SP, BP, STACK0) — when a later step writes the
+    same register at a later position, prior position's KV entry for that
+    register dim is dead.
+  - Memory cell overwrites (writes to the same MEM address).
+  - Output slot overwrites (`OUTPUT_LO+k`, `OUTPUT_HI+k` rewritten by a later
+    step's same nibble).
+  - Transient scratch (`TEMP+k`, `AX_FULL_*`, etc.) — these dims are by
+    construction step-local; their KV entries are dead at end-of-step.
+  - "Position didn't persist" — positions whose only writes are transient
+    intermediates with no cross-step reader: KV is dead at end-of-step.
+* **8.E.2** Walk the declarative IR per-step and emit, for each
+  `(position, dim)`, the step at which it is overwritten by a later
+  position's write. This is the **overwrite map**.
+* **8.E.3** At each step boundary, the runtime evicts entries whose
+  overwrite step has been reached. Determinism by construction —
+  the map is precomputed from the IR.
+* **8.E.4** Per-(layer, head, dim-group) cache compartmentalization.
+  Today's `cached_k[B, H, S, HD]` packs every dim into one row, so an
+  overwrite of one dim alone can't evict — the whole row stays. Split
+  the cache by dim-group so per-dim overwrites can drop their rows.
+* **8.E.5** **Determinism gate**: spec-decode and main-decode evict
+  identical entries at each step (the overwrite map is the same).
+* **8.E.6** **Correctness gate**: KV-eviction-ON vs KV-eviction-OFF
+  produce byte-identical logits on the 1096 sample. (If any entry
+  gets evicted that's actually still read, this fires.)
+* **8.E.7** **Completeness gate**: for every dim whose category is in
+  the catalog (8.E.1), check that the runtime evicts every overwritten
+  position's entry by the overwrite step. Spot-check 100 sampled
+  inputs; assert 0 late-evictions.
+* **8.E.8** Wire `test_kv_eviction.py` byte-identity + completeness
+  gates into CI.
+* **Acceptance**: KV-eviction-ON byte-identical to KV-eviction-OFF on
+  1096 sample (correctness gate, the load-bearing check); 0 late-evictions
+  on 100-sample completeness gate; determinism between spec-decode and
+  main-decode. Memory drop reported as a side effect, not gated.
 
 #### 8.F — 1096 corpus targeted fixes (parallelizable)
 
@@ -425,13 +438,80 @@ This decomposes to **5 explicit goals**, each mapped to Phase 8 work:
 
 | Goal | Sub-wave | 100% condition |
 |---|---|---|
-| KV eviction completeness | 8.E | **Every KV entry that is provably dead (per the declarative IR's liveness analysis) is evicted no later than the step its last reader runs.** Not a memory-% target — a correctness target: 0 late-evictions, 0 false-positives (false-lives never evicted), determinism between spec-decode and main-decode. The memory drop is the downstream consequence, not the metric. |
+| KV eviction of overwritten values | 8.E | **Every KV entry whose value has been overwritten by a later step (register clobber, memory cell rewrite, output slot rewrite, transient scratch end-of-step) is evicted at that step.** Static overwrite detection — not runtime liveness. Correctness gate: KV-eviction-ON byte-identical to OFF. Completeness gate: 0 late-evictions on overwrite categories. Determinism gate: spec-decode and main-decode evict identically. Memory drop is a downstream side effect. |
 | Cycle graph collapse | 8.A | `dep_graph_cycle_member ≤ 10` |
 | 1096 corpus pass rate | 8.F | strict improvement vs Phase 7 baseline; no real_bug regressions |
 | Closing audit | 8.I | `phase_8_closing_audit.md` written; all metrics confirmed |
 
 **Phase 8 is "done" when all 5 vision goals + 4 non-vision goals
 land in one head-of-branch commit, attested by 8.I.**
+
+---
+
+## Section 8 — Testing requirements (must all pass at Phase 8 close)
+
+These are gates that any Phase 8 sub-wave must respect AND that 8.I
+must confirm in the closing audit. Most of these are implicit
+in the sub-wave acceptance criteria, but called out explicitly here
+so nothing slips.
+
+### Correctness gates
+
+| Gate | What it checks | Enforced by |
+|---|---|---|
+| **Byte-identity (FFN)** | Per-op weights via `lower_ffn` match legacy bake cell-for-cell | `compare_symbolic_to_lowered_ffn`, `sweep_compare_ffn.py` |
+| **Byte-identity (attn)** | Per-head weights via `lower_attention` match legacy bake | `compare_symbolic_to_lowered_attn`, `sweep_compare_attn.py` |
+| **Byte-identity (embedding)** | `lower_token_embeddings` matches `head_bake`/`embedding_bake`/`initial_pc_bake` | `compare_symbolic_to_lowered_embedding` |
+| **Verifier drift** | Every `(layer, scope, identifier, column)` claim matches actual writes | `scan_static_claims.py` / `verify_claims_static` |
+| **u32 invariant** | No fp64 fallback; no values exceeding uint32 range; no 16-bit MUL_ACCUM | `verify_u32_invariant()` |
+| **Static vs dynamic compile** | `compile_full_vm(use_static_path=True)` byte-identical to `compile_full_vm_dynamic()` until 8.G.3 deletes the static path | `test_compile_dynamic_byte_identical.py` |
+| **Strict-mode admission** | `compile_full_vm_dynamic(strict=True, allow_sealed_cycles=True)` admits the current op set | `test_compile_dynamic_strict_mode.py` |
+| **Cross-run determinism** | `compile_full_vm()` produces identical `state_dict()` SHA on N consecutive runs with same seed | `test_compile_determinism.py` |
+| **Disk-cache consistency** | Cold-bake vs warm-cache produce identical `ModelLayout` (`block_ops`, `ops_per_layer`, `dim_positions`) | `test_addr_key_neural_decode.py`-style; `_try_load_cached` bug fix `4dec893f` |
+| **KV-eviction correctness** | `policy=STATIC_LIVENESS` byte-identical logits vs `policy=OFF` | `test_kv_eviction.py` |
+| **KV-eviction determinism** | Spec-decode and main-decode evict identical entries at each step | `test_kv_eviction.py` |
+| **KV-eviction completeness** | Every overwritten value's KV entry evicted by overwrite step | 8.E.7 completeness gate |
+
+### Behavioral gates
+
+| Gate | What it checks | Enforced by |
+|---|---|---|
+| **1096 corpus net-improvement** | Phase 8 close has strictly more passing programs than Phase 7 close on the 411-sample baseline | `tests/runners/run_1096_fast_shards.sh` |
+| **Smoke tests** | All `test_smoke*` tests pass that were passing at Phase 7 close (pre-existing failures may persist) | `tests/test_smoke_*.py` |
+| **Per-op tests** | Every op file's `test_l<N>_per_op.py` and `test_declarative_ffn_bakes_l<N>.py` stay green or pre-existing-failing | per-layer test suites |
+| **Spec-decode vs teacher-forced** | Spec-decoded output matches teacher-forced output on smoke + 1096 corpus | `test_suite_1096_pure_neural_pytest.py` |
+| **Allocator contracts** | `dim_allocator`, `ffn_unit_allocator`, `attention_head_allocator` all unit-tests green; `dynamic_first_fit` mode preserves byte-identity | `test_dim_allocator.py`, `test_ffn_unit_allocator.py`, `test_attention_head_allocator.py`, `test_l0_l1_l2_attn_pin_drop.py` |
+| **Scheduler analyzer no-regression** | `analyze_scheduler.py` reports no new `phase_inconsistent_with_deps` or `phase_required_but_undeclared` ops | `tools/analyze_scheduler.py` |
+
+### Sentinel-mode gates (per user-memory caveats)
+
+| Gate | What it checks | Enforced by |
+|---|---|---|
+| **Sentinel baseline (declarations-only)** | 1096 sentinel count under `C4_DECLARATIONS_ONLY_BAKE=1, C4_SPEC_K=0, C4_BATCH_USE_KV_CACHE=0` strictly improves or stays at Phase 7 close baseline | per memory note `project_1096_sentinel_baseline.md` |
+| **Sentinel baseline (full flags)** | 1096 sentinel count under default flags strictly improves or stays | same |
+| **var_simple 200-249 regression check** | `tail_sp_marker_byte0_f8` rule retunings don't regress var_simple ids 200-249 (the documented zero-sum trap) | per memory note `feedback_single_rule_fixes_are_zero_sum.md` |
+
+### What MUST NOT regress
+
+| Property | Phase 7 close baseline |
+|---|---|
+| FFN sweep `real_bug` count | 0 |
+| Attn sweep `real_bug` count | 0 |
+| `verify_claims_static` `problems` count | 0 |
+| Dim-ownership `_detect_claim_collisions` warnings | 0 (was 2 at one point; `c455e38` fixed it) |
+| Pre-existing test pass set | Tests passing at Phase 7 close must still pass |
+
+### Final Phase 8 acceptance forcing-function
+
+8.I closing audit must confirm:
+1. **All 5 vision goals at 100%** (Section 7)
+2. **All 4 non-vision goals at 100%** (Section 7)
+3. **All 22 testing gates above green** (Section 8)
+4. **One head-of-branch commit** with everything landed
+5. **Closing audit doc committed**
+
+Only when all 5 of these are simultaneously true is Phase 8 declared
+complete and the original vision realized.
 
 ---
 
