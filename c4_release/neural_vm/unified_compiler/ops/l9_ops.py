@@ -1784,7 +1784,6 @@ def make_layer9_marker_suppress_op() -> Operation:
 
     return Operation(
         name="layer9_marker_suppress",
-        phase=9,
         reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
                "OP_OR", "OP_XOR", "OP_AND"},
