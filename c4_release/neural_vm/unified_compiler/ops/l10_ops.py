@@ -2775,56 +2775,72 @@ def make_l10_post_ops_combined() -> Operation:
         # this point; leaving the legacy carry detectors active increments the
         # high byte after the L15 relay. LI/LC also already have authoritative
         # bytes from L15.
-        if isinstance(dim_positions, dict):
-            for suppress_name in (
-                "OP_IMM",
-                "OP_JMP",
-                "OP_LI_RELAY",
-                "OP_LC_RELAY",
-                "OP_ADD",
-                "OP_SUB",
-                "OP_MUL",
-                "OP_SHL",
-                "OP_SHR",
-            ):
-                suppress_dim = dim_positions.get(suppress_name)
-                if suppress_dim is not None:
-                    ffn.W_up.data[:offset, suppress_dim] = -S * 1000
-            carry_base = dim_positions.get("CARRY")
-            if carry_base is not None:
-                for carry_offset in (1, 2, 3):
-                    ffn.W_up.data[:offset, carry_base + carry_offset] = -S * 1000000
-            temp_base = dim_positions.get("TEMP")
-            if temp_base is not None:
-                # L7 relays ADD/SUB to TEMP[8]/TEMP[9] at AX byte rows, and
-                # the wide ALU path relays MUL byte-1 ownership to TEMP[10].
-                # This late dependency-tail copy of legacy post-ops must not
-                # rerun byte logic after the immediate structural blocks have
-                # already materialized the authoritative result.
-                for temp_offset in (8, 9, 10):
-                    ffn.W_up.data[:offset, temp_base + temp_offset] = -S * 1000000
-            cmp_base = dim_positions.get("CMP")
-            if cmp_base is not None:
-                # L7 relays LEA to CMP[7] at AX byte rows. LEA bytes are
-                # already materialized by L16; the dependency-tail copy of L10
-                # post-ops must not rerun carry propagation over them.
-                ffn.W_up.data[:offset, cmp_base + 7] = -S * 1000
-            h1_base = dim_positions.get("H1")
-            if h1_base is not None:
-                # This dependency-assigned copy of the L10 byte post-ops runs
-                # after many later corrections, where nonmatching OUTPUT
-                # nibbles can be strongly negative. The legacy carry detectors
-                # use negative OUTPUT blockers; on PC byte rows those blockers
-                # become large positive evidence and can erase L3's PC-byte
-                # output. The L10 byte post-ops are AX-oriented, so suppress the
-                # whole combined block across the PC byte span.
-                ffn.W_up.data[:offset, h1_base + 0] = -S * 10000
-            # The dependency-assigned copy is byte/marker cleanup. At
-            # step-boundary prediction rows there is no marker and no byte
-            # lane yet, so stale OUTPUT residue can make the legacy units
-            # overwhelm the next marker token. Require a structural row signal
-            # while leaving real marker and byte rows unchanged.
-            _suppress_ffn_on_step_boundary(ffn, dim_positions, S, units=offset)
+        # Express the per-opcode / CARRY / TEMP / CMP / H1 W_up suppressor
+        # band as a declarative mapping passed to
+        # ``Primitives.apply_ffn_band_suppressors``. The previous code
+        # form was a sequence of inline tensor-slice assignments plus a
+        # call to ``_suppress_ffn_on_step_boundary``; both are subsumed by
+        # the primitive's declarative parameters. Strength values are
+        # kept byte-identical to the original assignments.
+        _SUPPRESSORS = {
+            "OP_IMM": 1000.0,
+            "OP_JMP": 1000.0,
+            "OP_LI_RELAY": 1000.0,
+            "OP_LC_RELAY": 1000.0,
+            "OP_ADD": 1000.0,
+            "OP_SUB": 1000.0,
+            "OP_MUL": 1000.0,
+            "OP_SHL": 1000.0,
+            "OP_SHR": 1000.0,
+            "CARRY+1": 1000000.0,
+            "CARRY+2": 1000000.0,
+            "CARRY+3": 1000000.0,
+            # L7 relays ADD/SUB to TEMP[8]/TEMP[9] at AX byte rows, and
+            # the wide ALU path relays MUL byte-1 ownership to TEMP[10].
+            # This late dependency-tail copy of legacy post-ops must not
+            # rerun byte logic after the immediate structural blocks have
+            # already materialized the authoritative result.
+            "TEMP+8": 1000000.0,
+            "TEMP+9": 1000000.0,
+            "TEMP+10": 1000000.0,
+            # L7 relays LEA to CMP[7] at AX byte rows. LEA bytes are
+            # already materialized by L16; the dependency-tail copy of L10
+            # post-ops must not rerun carry propagation over them.
+            "CMP+7": 1000.0,
+            # This dependency-assigned copy of the L10 byte post-ops runs
+            # after many later corrections, where nonmatching OUTPUT
+            # nibbles can be strongly negative. The legacy carry detectors
+            # use negative OUTPUT blockers; on PC byte rows those blockers
+            # become large positive evidence and can erase L3's PC-byte
+            # output. The L10 byte post-ops are AX-oriented, so suppress
+            # the whole combined block across the PC byte span.
+            "H1+0": 10000.0,
+        }
+        # The dependency-assigned copy is byte/marker cleanup. At
+        # step-boundary prediction rows there is no marker and no byte
+        # lane yet, so stale OUTPUT residue can make the legacy units
+        # overwhelm the next marker token. Require a structural row signal
+        # while leaving real marker and byte rows unchanged. Sign-dependent
+        # (rows[rows >= 0] += strength) byte-identical to the legacy
+        # ``_suppress_ffn_on_step_boundary`` helper.
+        Primitives.apply_ffn_band_suppressors(
+            ffn,
+            dim_positions,
+            end_unit=offset,
+            S=S,
+            suppressors=_SUPPRESSORS,
+            marker_boost_strength=S * 10_000_000,
+            marker_boost_const_dim="CONST",
+            marker_boost_structural_dims=(
+                "IS_BYTE",
+                "MARK_AX",
+                "MARK_PC",
+                "MARK_SP",
+                "MARK_BP",
+                "MARK_STACK0",
+                "MARK_MEM",
+            ),
+        )
 
     # phase=10.5 so it lands AFTER layer10_alu (phase=10) but BEFORE later layers
     # which depend on its OUTPUT_LO/HI updates. Note: float phases work because
