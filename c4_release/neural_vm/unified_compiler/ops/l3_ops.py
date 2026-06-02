@@ -702,7 +702,6 @@ def make_layer3_ffn_op() -> Operation:
 
     return Operation(
         name="layer3_ffn",
-        phase=3,
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L5/L7/L11/L14 TEMP writers (which fire AFTER L3 in the
         # same step). The same-step value layer3_carry_forward_attn writes
@@ -1001,7 +1000,6 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer3_ffn_dep_anchor",
-        phase=3,
         # Phase 8.A.6 v2: matches layer3_ffn's TEMP_PREV_STEP rename.
         # Phase 8.A: matches layer3_ffn's OP_LEV_PREV_STEP rename.
         # Phase 8.A (EMBED_HI split): matches layer3_ffn's
@@ -1487,7 +1485,6 @@ def make_layer3_convo_io_state_init_op(
 
     return Operation(
         name="layer3_convo_io_state_init",
-        phase=3.1,
         # Reads/writes use LAST_WAS_THINKING_END and IO_IN_OUTPUT_MODE,
         # which are not declared in declare_setdim_compat_dims
         # (conversational-I/O-only dims); the bake resolves them via the
