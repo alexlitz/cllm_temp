@@ -28,6 +28,7 @@ from __future__ import annotations
 import pytest
 
 from neural_vm.attention_head_allocator import (
+    AllocStrategy,
     AttentionHeadAllocator,
     AttentionHeadAllocatorError,
     DEFAULT_LAYER_MAX_HEADS,
@@ -212,3 +213,110 @@ def test_heads_returns_insertion_order():
     a.alloc("second", layer_idx=1, pin=3)
     names = [r.op_name for r in a.heads()]
     assert names == ["third", "first", "second"]
+
+
+# ---------------------------------------------------------------------------
+# 6. dynamic_first_fit strategy (Phase 7.B prep)
+# ---------------------------------------------------------------------------
+def test_default_strategy_is_pinned():
+    """The bare constructor must default to ``"pinned"`` so existing
+    call sites stay byte-identical."""
+    a = AttentionHeadAllocator()
+    assert a.strategy == "pinned"
+
+
+def test_invalid_strategy_rejected():
+    """Constructor + set_strategy reject anything outside the literal set."""
+    with pytest.raises(AttentionHeadAllocatorError):
+        AttentionHeadAllocator(strategy="firstfit")  # type: ignore[arg-type]
+    a = AttentionHeadAllocator()
+    with pytest.raises(AttentionHeadAllocatorError):
+        a.set_strategy("first_come_first_served")  # type: ignore[arg-type]
+
+
+def test_set_strategy_flips_in_place():
+    """``set_strategy`` updates the live strategy mid-stream; already
+    recorded heads keep their indices, only subsequent alloc() calls
+    observe the new mode."""
+    a = AttentionHeadAllocator()
+    a.alloc("legacy", layer_idx=0, pin=0)
+    a.set_strategy("dynamic_first_fit")
+    assert a.strategy == "dynamic_first_fit"
+    # Already-recorded head is unmoved.
+    assert a.heads()[0].head_idx == 0
+    # A colliding pin is now a HINT, falls back to first-fit.
+    landed = a.alloc("fresh", layer_idx=0, pin=0)
+    assert landed == 1, f"expected first-fit to land at 1, got {landed}"
+
+
+def test_dynamic_first_fit_honors_pin_when_free():
+    """In dynamic mode an UNCONTESTED pin is still honored verbatim
+    so trained weights stay in place where possible."""
+    a = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    landed = a.alloc("op", layer_idx=4, pin=3)
+    assert landed == 3
+    rec = a.heads()[0]
+    assert rec.head_idx == 3
+    assert rec.pinned is True
+    assert a.pin_collisions() == []
+
+
+def test_dynamic_first_fit_falls_back_on_collision():
+    """In dynamic mode a colliding pin falls back to first-fit and the
+    collision is recorded in :meth:`pin_collisions` for auditing."""
+    a = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    a.alloc("first", layer_idx=0, pin=0)
+    landed = a.alloc("second", layer_idx=0, pin=0)
+    assert landed == 1, f"first-fit fallback should pick 1, got {landed}"
+    rec = a.heads()[1]
+    assert rec.head_idx == 1
+    assert rec.pinned is False
+    cols = a.pin_collisions()
+    assert cols == [("second", 0, 1)], cols
+
+
+def test_dynamic_first_fit_full_layer_errors_cleanly():
+    """If every head is claimed, a colliding pin in dynamic mode raises
+    a clean error naming the (op, layer) — same shape as the unpinned
+    full-layer error."""
+    a = AttentionHeadAllocator(layer_max_heads=2, strategy="dynamic_first_fit")
+    a.alloc("a", layer_idx=0, pin=0)
+    a.alloc("b", layer_idx=0, pin=1)
+    with pytest.raises(AttentionHeadAllocatorError) as excinfo:
+        a.alloc("c", layer_idx=0, pin=0)
+    msg = str(excinfo.value)
+    assert "pin hint 0 collides" in msg, msg
+    assert "no free head" in msg, msg
+    assert "layer 0" in msg, msg
+
+
+def test_pinned_strategy_pin_collisions_stays_empty():
+    """In ``"pinned"`` mode a colliding pin is a hard error and never
+    populates :meth:`pin_collisions`."""
+    a = AttentionHeadAllocator()
+    a.alloc("first", layer_idx=0, pin=0)
+    with pytest.raises(AttentionHeadAllocatorError):
+        a.alloc("second", layer_idx=0, pin=0)
+    assert a.pin_collisions() == []
+
+
+def test_evict_pin_hints_lists_only_pinned():
+    """``evict_pin_hints`` reports every head that landed at its
+    caller-provided pin — auto-placed and dynamic-fallback heads are
+    excluded so the auditor can see exactly which pins still need
+    relaxing."""
+    a = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    a.alloc("legacy", layer_idx=0, pin=2)        # pinned -> honored
+    a.alloc("auto", layer_idx=0)                  # auto -> 0
+    a.alloc("collide", layer_idx=0, pin=2)       # collides -> fallback to 1
+    hints = a.evict_pin_hints()
+    # Only ``legacy`` actually landed at its pin.
+    assert hints == [("legacy", 0, 2)], hints
+
+
+def test_dynamic_first_fit_alloc_strategy_literal_exported():
+    """``AllocStrategy`` literal is part of the public API so type-aware
+    callers (LayerCompiler / sweep tooling) can spell it out."""
+    assert AllocStrategy is not None
+    a = AttentionHeadAllocator(strategy="pinned")
+    assert a.strategy in ("pinned", "dynamic_first_fit")
