@@ -334,6 +334,7 @@ class AutoregressiveVMRunner:
                 ffn_hidden=ffn_hidden,
                 max_seq_len=max_seq_len,
                 enable_moe_routing=enable_moe_routing,
+                strict=False,
             )
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
