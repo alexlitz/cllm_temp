@@ -1512,7 +1512,13 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
     return Operation(
         name="format_string_fetch_head",
         phase=9.5,
-        reads={"IO_IN_OUTPUT_MODE", "FORMAT_PTR_LO", "FORMAT_PTR_HI",
+        # Phase 9.B (IO_IN_OUTPUT_MODE SCC rename): IO_IN_OUTPUT_MODE ->
+        # IO_IN_OUTPUT_MODE.*.-1 marks the read as SSA cross-step.
+        # null_terminator_detection (phase 10.6) stages the value for the
+        # NEXT step's L9 format-fetch gating. Same numeric slot via SSA
+        # alias; byte-identical bake. Breaks the null_terminator_detection
+        # -> format_string_fetch_head IO_IN_OUTPUT_MODE back-edge (SCC #3).
+        reads={"IO_IN_OUTPUT_MODE.*.-1", "FORMAT_PTR_LO", "FORMAT_PTR_HI",
                "ADDR_KEY", "EMBED_LO", "EMBED_HI"},
         writes={"OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         kind="block",
