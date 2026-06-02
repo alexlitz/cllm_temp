@@ -69,7 +69,7 @@ from .layer_compiler import (
     requires_after_ops,
     requires_same_layer_as_ops,
 )
-from . import full_vm_compiler as _static
+from . import _legacy_redirect as _static
 from ..kv_eviction import KVEvictionPolicy
 
 

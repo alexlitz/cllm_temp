@@ -20,7 +20,7 @@ direct call to `set_vm_weights` from outside the compiler module.
 
 On-disk cache
 -------------
-``compile_full_vm`` is deterministic (see ``tests/test_compile_determinism``),
+``compile_full_vm_dynamic`` is deterministic (see ``tests/test_compile_determinism``),
 so an on-disk cache keyed on source bytes + kwargs lets pytest processes (and
 any other short-lived caller) skip the ~40-70 s bake on cache hit. The cache
 file holds the post-bake model (including the right-sized FFNs, attached
@@ -350,7 +350,7 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
         payload = _torch.load(path, weights_only=False, map_location="cpu")
     except Exception as exc:
         _logger.warning(
-            "compile_full_vm: failed to load cache %s (%s); recompiling",
+            "compile_full_vm_dynamic: failed to load cache %s (%s); recompiling",
             path, exc,
         )
         try:
@@ -365,7 +365,7 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
         # without deleting; a future call with the original kwargs may still
         # want this entry.
         _logger.warning(
-            "compile_full_vm: cache %s kwargs_snapshot mismatch "
+            "compile_full_vm_dynamic: cache %s kwargs_snapshot mismatch "
             "(saved=%r, requested=%r); recompiling",
             path, saved_kwargs, kwargs_snapshot,
         )
@@ -386,7 +386,7 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
     for key in required_keys:
         if key not in payload:
             _logger.warning(
-                "compile_full_vm: cache %s missing field %r; recompiling",
+                "compile_full_vm_dynamic: cache %s missing field %r; recompiling",
                 path, key,
             )
             return None
@@ -451,7 +451,7 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
         tmp_path = None  # replaced; nothing to clean up
     except Exception as exc:
         _logger.warning(
-            "compile_full_vm: failed to save cache %s (%s); returning "
+            "compile_full_vm_dynamic: failed to save cache %s (%s); returning "
             "in-memory model anyway",
             path, exc,
         )
@@ -545,7 +545,7 @@ def _attach_kv_eviction_state(
                 setattr(attn, "_eviction_step_idx", 0)
         return
 
-    # Lazy-import the analyzer to keep ``compile_full_vm`` import-time light
+    # Lazy-import the analyzer to keep ``compile_full_vm_dynamic`` import-time light
     # and to avoid pulling its IR-walking helpers into the OFF path.
     from ..kv_liveness_analyzer import analyze_kv_liveness
 
@@ -625,165 +625,3 @@ def _iter_attention_heads_in_op(op):
         for head in getattr(attn, "rules", ()):
             yield head
 
-
-def compile_full_vm(
-    S: float = 100.0,
-    *,
-    enable_conversational_io: bool = False,
-    enable_tool_calling: bool = False,
-    enable_neural_io_think_protocol: bool = False,
-    alu_mode: str = "lookup",
-    n_heads: int = 8,
-    ffn_hidden: int = 4096,
-    max_seq_len: int = 8192,
-    pin_io_only: bool = True,
-    disk_cache: bool = True,
-    use_dynamic_ffn: bool = True,
-    enable_moe_routing: Optional[bool] = None,
-    positional_encoding: Optional[str] = None,
-    attention_normalization: Optional[str] = None,
-    rope_base: Optional[float] = None,
-    use_rms_norm: Optional[bool] = None,
-    rms_norm_eps: Optional[float] = None,
-    require_declarative_bake: Optional[bool] = None,
-    declarations_only: bool = False,
-    kv_eviction_policy: KVEvictionPolicy = KVEvictionPolicy.OFF,
-    kv_eviction_n_steps: int = 64,
-):
-    """Compile and bake a full Neural VM model via the compiler.
-
-    Phase 8.G.3: ``compile_full_vm`` is now a thin redirect to
-    :func:`compile_full_vm_dynamic`. The legacy static phase-pruning body
-    was deleted once one release passed without any production callsite
-    flipping the (now-removed) ``use_static_path=True`` kwarg. The hybrid
-    dynamic-layer scheduler is the single bake entry point.
-
-    The compiler is the single bake authority. Internally, the legacy
-    `set_vm_weights` pipeline is wrapped as one model-level Operation
-    (`legacy_bake`) that the compiler dispatches. As individual ops migrate
-    out of `set_vm_weights` into their own per-layer Operation instances, the
-    legacy_bake op shrinks and eventually disappears.
-
-    Args:
-        pin_io_only: when True, only IO-required dims (the externally-
-            observable ones read/written by token embedding, the head, and
-            `_inject_*` runtime injectors) are pinned, and they are pinned to
-            a *compact contiguous block* starting at position 0. Every other
-            dim is bump-pointer-allocated above the IO block, shrinking
-            d_model relative to the legacy `_SetDim`-pinned layout. See
-            `declare_setdim_compat_dims` for details. Defaults to False for
-            backward compatibility.
-        disk_cache: when True (default), look up / write a persistent
-            on-disk cache so successive Python processes (e.g. pytest
-            workers) skip the bake pipeline. See module docstring for the
-            cache-key construction and the ``C4_VM_CACHE_DIR`` override.
-            On cache hit the returned layout's ``ops_per_layer`` /
-            ``block_ops`` / ``model_ops`` are populated with metadata-only
-            copies of the operations (the inner-closure ``bake_fn`` /
-            ``declarative_bake_fn`` / ``compiler_ir_factory`` fields are
-            stripped because they aren't picklable in the general case;
-            all other metadata — name, kind, layer_idx, phase, claims,
-            reads/writes, migrated, etc. — is preserved). Tests that
-            introspect the layout work transparently across cold and warm
-            cache runs; only callers that need to *bake* via the cached
-            ops should pass ``disk_cache=False`` to bypass.
-        use_dynamic_ffn: when True (default), use ``layout.ffn_widths`` to
-            pre-size each block's PureFFN to the exact unit count its ops
-            need, avoiding the allocate-4096-then-trim overhead. Blocks
-            without any FFN-annotated op fall back to ``ffn_hidden`` (4096)
-            and are trimmed by ``_right_size_ffns`` post-bake. Set to False
-            to force the legacy allocate-4096-everywhere path (used for
-            byte-identity comparison).
-        enable_moe_routing: when true, emit the compiler-built model with
-            FFN blocks converted to standard top-1 ``StandardMoEFFN`` experts.
-            ``None`` (default) follows ``C4_ENABLE_MOE_ROUTING``. This is a
-            compiler-owned structural transform and is included in the
-            persistent compile cache key.
-        positional_encoding: optional architecture override. ``None`` follows
-            ``VMConfig`` / ``NEURAL_VM_POS_ENCODING``. Default remains ALiBi.
-        attention_normalization: optional architecture override. ``None``
-            follows ``VMConfig`` / ``NEURAL_VM_ATTENTION_NORMALIZATION``.
-            Default remains ``"softmax1"``; pass ``"softmax"`` for standard
-            decoder attention normalization.
-        rope_base: optional RoPE base override. ``None`` follows ``VMConfig``.
-        use_rms_norm: optional architecture override. ``None`` follows
-            ``VMConfig`` / ``NEURAL_VM_USE_RMS_NORM``. Default remains off.
-        rms_norm_eps: optional RMSNorm epsilon. ``None`` follows ``VMConfig``.
-        require_declarative_bake: opt-in enforcement gate for the migration
-            endpoint. ``None`` (default) follows ``C4_REQUIRE_DECLARATIVE_BAKE``.
-            When true, compile fails before model bake if the layout still
-            contains ``legacy_bake``, non-migrated layer/block ops, or wrapper
-            model bakes that are not owned by declarative per-layer ops.
-        declarations_only: opt-in prototype runner for the end-state bake.
-            When true, compile refuses to call imperative ``Operation.bake_fn``
-            bodies and only dispatches ``declarative_bake_fn`` generators (plus
-            no-op topology anchors). This also enforces declarative authority
-            and bypasses the disk cache so unsupported ops are visible.
-        kv_eviction_policy: Phase 7.F.2 runtime KV-eviction policy. Default
-            :data:`KVEvictionPolicy.OFF` preserves byte-identity with all
-            historical baselines (no eviction state attached). When set to
-            :data:`KVEvictionPolicy.STATIC_LIVENESS`, the compiler runs
-            :func:`neural_vm.kv_liveness_analyzer.analyze_kv_liveness` against
-            the registered op corpus, projects the report onto each attention
-            layer via :func:`neural_vm.kv_eviction.build_state_from_report`,
-            and attaches the resulting :class:`KVEvictionState` to every
-            ``model.blocks[i].attn`` instance. The forward-pass step boundary
-            hook in :class:`PureAttention.forward` consults the state
-            deterministically (same decisions across spec-decode and
-            main-decode paths). The flag is included in the disk-cache key
-            so OFF and STATIC_LIVENESS builds don't collide.
-        kv_eviction_n_steps: Upper bound on VM steps the liveness analyzer
-            reasons about when ``kv_eviction_policy`` is on. The default of
-            64 covers the smoke / 1096 test corpus; larger values widen the
-            evictable window at the cost of analysis time. Ignored when the
-            policy is OFF.
-
-    Environment variables:
-        C4_VALIDATE_ON_COMPILE: when set to ``"1"``, run Mode A of the
-            declarative verifier (``verify_claims_static``) at the end of
-            compile as a warn-only sanity check. Drift is surfaced via
-            ``warnings.warn`` and never fails the compile -- the verifier
-            is opt-in diagnostic, not a production gate. Default off.
-        C4_VALIDATE_VERBOSE: when set to ``"1"`` alongside
-            ``C4_VALIDATE_ON_COMPILE``, print the full verifier report to
-            stdout instead of just the summary warning.
-        NEURAL_VM_POS_ENCODING: ``alibi`` (default), ``rope``, or ``hybrid``.
-        NEURAL_VM_ATTENTION_NORMALIZATION: ``softmax1`` (default) or
-            ``softmax``.
-        NEURAL_VM_USE_RMS_NORM: truthy values enable RMSNorm pre-norm blocks.
-
-    Returns:
-        (model, layout) where:
-        - model is an AutoregressiveVM with all weights baked
-        - layout is the ModelLayout (d_model, n_layers, dim_positions)
-    """
-    # Phase 8.G.3: redirect unconditionally to the hybrid dynamic-layer
-    # scheduler. The legacy static phase-pruning body lived here behind the
-    # ``use_static_path=True`` kwarg until 8.G.3 deleted it; the dynamic
-    # path is now the single bake entry point. Lazy-imported to avoid a
-    # circular import (the dynamic module imports this one as ``_static``
-    # to share helpers).
-    from .full_vm_compiler_dynamic import compile_full_vm_dynamic
-    return compile_full_vm_dynamic(
-        S=S,
-        enable_conversational_io=enable_conversational_io,
-        enable_tool_calling=enable_tool_calling,
-        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
-        alu_mode=alu_mode,
-        n_heads=n_heads,
-        ffn_hidden=ffn_hidden,
-        max_seq_len=max_seq_len,
-        pin_io_only=pin_io_only,
-        disk_cache=disk_cache,
-        use_dynamic_ffn=use_dynamic_ffn,
-        enable_moe_routing=enable_moe_routing,
-        positional_encoding=positional_encoding,
-        attention_normalization=attention_normalization,
-        rope_base=rope_base,
-        use_rms_norm=use_rms_norm,
-        rms_norm_eps=rms_norm_eps,
-        require_declarative_bake=require_declarative_bake,
-        declarations_only=declarations_only,
-        kv_eviction_policy=kv_eviction_policy,
-        kv_eviction_n_steps=kv_eviction_n_steps,
-    )

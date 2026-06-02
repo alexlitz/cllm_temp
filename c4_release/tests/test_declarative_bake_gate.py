@@ -1,6 +1,6 @@
 import pytest
 
-from c4_release.neural_vm.unified_compiler import full_vm_compiler as fvc
+from c4_release.neural_vm.unified_compiler import _legacy_redirect as fvc
 from c4_release.neural_vm.unified_compiler.decl_verifier import _build_layout_only
 from c4_release.neural_vm.unified_compiler.layer_compiler import (
     DeclarationsOnlyBakeError,

@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.base_layers import PureFFN
 from neural_vm.config import VMConfig, get_config, reset_config, set_config
-from neural_vm.unified_compiler import full_vm_compiler
+from neural_vm.unified_compiler import _legacy_redirect as full_vm_compiler
 from neural_vm.vm_step import (
     AutoregressiveAttention,
     AutoregressiveVM,
