@@ -10,6 +10,7 @@ import math
 from .constants import PC_OFFSET
 
 
+# DEPRECATED — parity oracle only, no production use (Phase 6 wave 6A).
 def _set_layer5_fetch(attn, S, BD, HD):
     """Layer 5 attention: fetch opcode/immediate through memory keys.
 
