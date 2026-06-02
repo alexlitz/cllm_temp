@@ -432,3 +432,97 @@ def test_alibi_default_byte_identical_to_no_kwarg():
     assert torch.equal(y_default, y_explicit), (
         "positional_encoding default drifted from no-kwarg baseline."
     )
+
+
+def test_div_mode_log_softmax1_short_circuits_before_long_div_pipeline():
+    """``div_mode='log_softmax1'`` is documented as a Phase 8.O.3 stub
+    (BLOG_SPEC.md "Via Attention With Log Sink") and must raise at
+    DIV/MOD execution time, while ``div_mode='long_div'`` runs through
+    to the long-division pipeline lookup tables.
+
+    This pins the div_mode toggle to a real behavioural difference at
+    runtime (different code paths for the ALU lookup-table stage) rather
+    than just config-flag plumbing. We fake an installed pipeline so the
+    forward() reaches the cfg.div_mode gate (the install ops require the
+    full compiler pipeline to bake the baked-table stages).
+    """
+    from neural_vm.efficient_alu_divmod_split import FlattenedDivMod
+
+    class _BDProxy:
+        OP_DIV = 0
+        OP_MOD = 1
+        MARK_AX = 2
+        CONST = 3
+
+    composite = FlattenedDivMod(S=100.0, BD=_BDProxy)
+
+    captured = {}
+
+    def fake_pipeline(x):
+        captured["ran"] = True
+        return x
+
+    composite.__dict__["pipeline"] = fake_pipeline
+
+    # x_bd[..., OP_DIV] > 0.1 trips the early-out gate and reaches the
+    # div_mode branch.
+    x_bd = torch.zeros(1, 4, 64)
+    x_bd[..., _BDProxy.OP_DIV] = 1.0
+
+    # log_softmax1: stub raises NotImplementedError before pipeline runs.
+    set_config(VMConfig(
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        div_mode="log_softmax1",
+    ))
+    captured.clear()
+    with pytest.raises(NotImplementedError, match="log_softmax1"):
+        composite(x_bd)
+    assert "ran" not in captured, (
+        "log_softmax1 must short-circuit before the long-division pipeline."
+    )
+
+    # long_div: gate passes through to the (fake) pipeline — this is the
+    # baked-lookup-table path that actually computes DIV/MOD.
+    set_config(VMConfig(
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        div_mode="long_div",
+    ))
+    captured.clear()
+    out = composite(x_bd)
+    assert captured.get("ran") is True, (
+        "long_div must execute the long-division pipeline (the lookup-"
+        "table path) when DIV is active."
+    )
+    assert out.shape == x_bd.shape
+
+
+def test_div_mode_log_softmax1_requires_softmax1_attention():
+    """``div_mode='log_softmax1'`` depends on the softmax1 +1 sink
+    denominator (1/(1+(n-1)) = 1/n). Pairing it with plain softmax must
+    fail at config construction time — the documented contract in
+    ``VMConfig.__post_init__``.
+    """
+    with pytest.raises(ValueError, match="softmax1"):
+        VMConfig(
+            positional_encoding="alibi",
+            attention_normalization="softmax",
+            div_mode="log_softmax1",
+        )
+
+
+def test_div_mode_default_long_div_byte_identical_to_no_kwarg():
+    """The current div_mode default (``"long_div"``) must be byte-
+    identical to a VMConfig constructed with no ``div_mode`` kwarg.
+    """
+    default = VMConfig(
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+    )
+    explicit = VMConfig(
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        div_mode="long_div",
+    )
+    assert default.div_mode == explicit.div_mode == "long_div"
