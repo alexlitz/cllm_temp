@@ -2873,7 +2873,6 @@ from .setup_helpers import (
     _set_layer13_shifts,
     _set_layer14_clear_addr_key_pollution,
     _set_layer14_clear_output_corruption,
-    _set_layer14_temp_clear,
     _set_layer1_ffn,
     _set_layer2_mem_byte_flags,
     _set_layer5_fetch,
