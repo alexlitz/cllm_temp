@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -76,8 +77,15 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
     -- and therefore the pinned hidden-unit indices via
     ``Primitives.lower_ffn_rules`` -- is byte-identical with the original
     bake.
+
+    Phase 7.E.3: gate uses :func:`dim_ref` for the
+    ``(opcode_flag, MUL)`` semantic pair. Structural reads
+    (``TEMP+partial``, ``ALU_HI+a_hi``, ``AX_CARRY_LO+b_lo``) and the
+    ``OUTPUT_HI+result_hi`` write stay as ``+N`` -- ``result_hi`` is a
+    value-bus lookup index, not a role-meaningful byte position.
     """
     write_scale = 2.0 / S
+    gate_mul = dim_ref("opcode_flag", "MUL")
     rules: list[FFNRule] = []
 
     for partial in range(16):
@@ -93,7 +101,7 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
                         (f"AX_CARRY_LO+{b_lo}", 1.0),
                     ),
                     threshold=7.5,
-                    gate="OP_MUL",
+                    gate=gate_mul,
                     gate_weight=1.0,
                     gate_bias=0.0,
                     writes=((f"OUTPUT_HI+{result_hi}", write_scale),),
