@@ -498,6 +498,7 @@ def make_opcode_decode_ffn_op() -> Operation:
         layer_idx=5,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_opcode_decode_ffn_ir(),
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
@@ -650,6 +651,74 @@ def _opcode_decode_all_step_pc_rules(S):
     )
 
 
+def _opcode_decode_jsr_temp0_blank_rule() -> FFNRule:
+    """Blank-unit placeholder for the reserved unit-52 JSR TEMP[0] slot.
+
+    The legacy ``_set_opcode_decode_ffn`` increments its hidden-unit cursor
+    past unit 52 without writing any weights there ("preserve legacy unit
+    numbering for the TEMP-clear band that follows"). To carry the same
+    layout through a single declarative ``CompilerIR`` lower, we emit one
+    no-op ``FFNRule`` whose lowering matches a zero-initialised PureFFN row
+    byte-for-byte:
+
+      * ``conditions=()`` → ``W_up[52, :] = 0``
+      * ``threshold=0.0`` → ``b_up[52] = -S * 0 = 0``
+      * ``gate=None`` and ``gate_bias=0.0`` → ``b_gate[52] = 0`` (note:
+        ``FFNRule.constant_write`` defaults ``gate_bias=1.0``, so we
+        construct the rule directly to override the default to 0.0)
+      * ``writes=()`` → ``W_down[:, 52] = 0``
+
+    ``right_size_ffns`` correctly prunes this unit because every weight
+    column / row remains all-zero. Symbolic execution and lowered forward
+    both produce no state change for this rule (score=0 >= threshold=0
+    fires but ``gate_value = 0`` plus empty ``writes`` is a no-op).
+    """
+
+    return FFNRule(
+        conditions=(),
+        threshold=0.0,
+        writes=(),
+        gate=None,
+        gate_bias=0.0,
+        name="l5_opcode_decode_jsr_temp0_blank",
+    )
+
+
+def _opcode_decode_ffn_rules(S: float) -> tuple[FFNRule, ...]:
+    """Full ordered ``FFNRule`` sequence for ``opcode_decode_ffn``.
+
+    Matches the 89-unit layout declared in ``_L5_FFN_UNIT_LAYOUT``:
+
+      * units 0..33  — main per-opcode AX decode (34 rules)
+      * units 34..51 — first-step PC-marker decode (18 rules)
+      * unit 52      — reserved blank for JSR TEMP[0] (1 no-op rule)
+      * units 53..83 — TEMP[1..31] clear at PC marker (31 rules)
+      * units 84..88 — all-step PC-marker decode (5 rules)
+
+    Concatenating them into a single ``FFNRule`` tuple lets the bake lower
+    via one ``Primitives.lower_ffn_rules`` call (cursor walks 0..89) and
+    lets the op expose its full ``compiler_ir`` for symbolic execution /
+    ``compare_symbolic_to_lowered_ffn`` validation / declarative
+    verifier tooling.
+    """
+
+    return (
+        _opcode_decode_main_rules(S)
+        + _opcode_decode_first_step_rules(S)
+        + (_opcode_decode_jsr_temp0_blank_rule(),)
+        + _opcode_decode_temp_clear_rules(S)
+        + _opcode_decode_all_step_pc_rules(S)
+    )
+
+
+def _opcode_decode_ffn_ir(S: float = 100.0) -> CompilerIR:
+    """Build the declarative ``CompilerIR`` exposed by ``opcode_decode_ffn``."""
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_opcode_decode_ffn_rules(S))
+    return ir
+
+
 def _lower_l5_opcode_rules(ffn, rules, BD, *, unit: int, S: float) -> int:
     dim_positions = Primitives.dim_positions_from_bd(
         BD,
@@ -671,41 +740,22 @@ def _bake_opcode_decode_ffn(ffn, S, BD) -> int:
     :data:`_L5_FFN_TOTAL_UNITS` for byte-identity with the historical
     89-unit footprint). The caller asserts this in
     ``make_opcode_decode_ffn_op``.
+
+    Lowers the single ``_opcode_decode_ffn_rules`` tuple through
+    ``Primitives.lower_ffn_rules`` -- the rule list embeds the unit-52
+    blank placeholder (see :func:`_opcode_decode_jsr_temp0_blank_rule`)
+    so the cursor walks 0..89 with no per-sub-stage cursor surgery. This
+    matches the IR returned by :func:`_opcode_decode_ffn_ir`, which the
+    op exposes via ``compiler_ir=`` for symbolic / verifier tooling.
     """
 
-    unit = 0
-    unit = _lower_l5_opcode_rules(
+    return _lower_l5_opcode_rules(
         ffn,
-        _opcode_decode_main_rules(S),
+        _opcode_decode_ffn_rules(S),
         BD,
-        unit=unit,
+        unit=0,
         S=S,
     )
-    unit = _lower_l5_opcode_rules(
-        ffn,
-        _opcode_decode_first_step_rules(S),
-        BD,
-        unit=unit,
-        S=S,
-    )
-
-    unit += 1  # TEMP[0] is reserved for first-step JSR; keep legacy blank unit.
-    unit = _lower_l5_opcode_rules(
-        ffn,
-        _opcode_decode_temp_clear_rules(S),
-        BD,
-        unit=unit,
-        S=S,
-    )
-    unit = _lower_l5_opcode_rules(
-        ffn,
-        _opcode_decode_all_step_pc_rules(S),
-        BD,
-        unit=unit,
-        S=S,
-    )
-
-    return unit
 
 
 def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
