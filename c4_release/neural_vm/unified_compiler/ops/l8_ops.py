@@ -399,6 +399,36 @@ def _layer8_alu_lea_lo_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_sub_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """SUB lo nibble (256 units, offsets 512..767).
+
+    C4 semantics: AX = stack_top - AX, so result = ALU_LO[a] - AX_CARRY_LO[b].
+    Same structural shape as ADD lo (gate=OP_SUB).
+    """
+    write_scale = 2.0 / S
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            result = (a - b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_sub_lo_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -4.0),
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"AX_CARRY_LO+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="OP_SUB",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_SUB",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_SUB",
+                },
+            ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
