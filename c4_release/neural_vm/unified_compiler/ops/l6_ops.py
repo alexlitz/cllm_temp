@@ -2374,7 +2374,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             f"{stack_arithmetic_ends}; expected "
             f"{expected_stack_arithmetic_ends}"
         )
-    return
     for start, end in (
         (L6_GETCHAR_AX_ROUTE_START_UNIT, L6_GETCHAR_AX_ROUTE_END_UNIT),
         (L6_BZ_AX_ROUTE_START_UNIT, L6_BZ_AX_ROUTE_END_UNIT),
@@ -2396,6 +2395,7 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 late AX-output route IR lowered to unexpected units "
             f"{late_route_ends}; expected {expected_late_route_ends}"
         )
+    return
     for start, end in (
         (L6_ADJ_SP_WRITEBACK_START_UNIT, L6_ADJ_SP_WRITEBACK_END_UNIT),
         (L6_ENT_SP_WRITEBACK_START_UNIT, L6_ENT_SP_WRITEBACK_END_UNIT),
