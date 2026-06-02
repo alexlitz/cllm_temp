@@ -556,12 +556,23 @@ def make_layer15_memory_lookup_op() -> Operation:
 
     return Operation(
         name="layer15_memory_lookup",
+        # Phase 11 SCC residual (cycle #1, 5-op LEV next-step C-instruction
+        # loop): TEMP -> TEMP.*.-1 SSA cross-step rename. l15
+        # memory_lookup has phase=None, so the analyser sees l11_mul_partial's
+        # and l14_temp_clear's TEMP writes (phases 11 / 14.1) as back-edges
+        # into l15. The TEMP residual the lookup heads consume is the
+        # previous step's value carried through the KV cache (the current
+        # step's L11 / L14 writes are produced AFTER l15 under dynamic
+        # scheduling; the static phase=None just surfaces as layer 0 in
+        # the analyser). The SSA `.*.-1` form aliases back to the base
+        # dim's numeric slot, so baked weight cells stay byte-identical
+        # while the analyser drops the back-edges.
         reads={"MARK_AX", "OP_LI", "OP_LC", "OP_LI_RELAY", "OP_LC_RELAY",
                "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_KEY", "MARK_MEM", "MEM_STORE",
                "MEM_ADDR_SRC",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "MARK_STACK0", "IS_BYTE",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "H1", "H2", "H3", "L2H0", "TEMP",
+               "H1", "H2", "H3", "L2H0", "TEMP.*.-1",
                "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "CMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
