@@ -1,10 +1,61 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L14 attention-head layout (pinned indices) =====================
+#
+# ``layer14_mem_generation`` owns heads 0-7 of the L14 attention block:
+#
+#   heads 0-3: MEM address-byte generation (PSH, SI/SC, JSR/ENT).
+#     head 0 -> MEM addr byte 0 (predicted at MEM marker, d=0).
+#     head 1 -> MEM addr byte 1 (predicted at addr_b0 token, d=1).
+#     head 2 -> MEM addr byte 2 (predicted at addr_b1 token, d=2).
+#     head 3 -> MEM addr byte 3 (predicted at addr_b2 token, d=3).
+#   heads 4-7: MEM value-byte generation (PSH/SI/SC source AX,
+#              JSR/ENT source STACK0).
+#     head 4 -> MEM val byte 0 (predicted at addr_b3 token, d=4).
+#     head 5 -> MEM val byte 1 (predicted at val_b0 token, d=5).
+#     head 6 -> MEM val byte 2 (predicted at val_b1 token, d=6).
+#     head 7 -> MEM val byte 3 (predicted at val_b2 token, d=7).
+#
+# Pre-migration the legacy ``_set_layer14_mem_generation`` helper used
+# bare ``base = h * HD`` literals for h in 0..7. Pinning the allocator
+# preserves those exact slots so the lowering is byte-identical, while
+# the layout table becomes the audited source of truth for future L14
+# attention extensions.
+_L14_HEAD_LAYOUT = (
+    # (op-name key,                            pinned head_idx)
+    ("layer14_mem_generation.head_0",          0),  # MEM addr byte 0
+    ("layer14_mem_generation.head_1",          1),  # MEM addr byte 1
+    ("layer14_mem_generation.head_2",          2),  # MEM addr byte 2
+    ("layer14_mem_generation.head_3",          3),  # MEM addr byte 3
+    ("layer14_mem_generation.head_4",          4),  # MEM val byte 0
+    ("layer14_mem_generation.head_5",          5),  # MEM val byte 1
+    ("layer14_mem_generation.head_6",          6),  # MEM val byte 2
+    ("layer14_mem_generation.head_7",          7),  # MEM val byte 3
+)
+_L14_HEAD_LAYOUT_BY_NAME = {n: h for n, h in _L14_HEAD_LAYOUT}
+
+
+def _allocate_layer14_mem_generation_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with the L14 heads pinned.
+
+    Every entry in :data:`_L14_HEAD_LAYOUT` is pinned at its existing
+    ``head_idx`` so the underlying weight writes -- now expressed as
+    ``DeclarativeAttentionHeadSpec`` instances -- land byte-identically.
+    The legacy ``_set_layer14_mem_generation`` helper iterated h=0..7
+    with ``base = h * HD``; those same indices are pinned here.
+    """
+    allocator = AttentionHeadAllocator()
+    for name, head_idx in _L14_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=14, pin=head_idx)
+    return allocator
 
 
 # === L14 FFN cleanup-chain unit layout (pinned offsets) =================
@@ -275,13 +326,282 @@ def _boost_l14_psh_mem_marker_high_nibbles(
     return unit
 
 
+def _layer14_mem_generation_head_specs(
+    BD,
+) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Declarative L14 heads 0-7 mirroring ``_set_layer14_mem_generation``.
+
+    Heads 0-3 generate MEM address bytes (source: SP for PSH, STACK0 for
+    SI/SC, BP/STACK0 for JSR/ENT via post-step ``_clear_*`` overrides).
+    Heads 4-7 generate MEM value bytes (source: AX for PSH/SI/SC,
+    STACK0 for JSR/ENT). Each head fires at exactly ONE MEM byte position
+    via threshold-difference encoding (slot 0) gated by slot 33 (position)
+    and slot 34 (MEM_STORE). Slot 38 is a shared non-MEM target blocker.
+
+    Mirrors ``vm_step._set_layer14_mem_generation`` cell-for-cell; the
+    only post-step modifications are the targeted overrides applied by
+    :func:`_clear_l14_mem_generation_overbroad_sp_suppression`, which
+    remain in the bake_fn as residual byte-identity bookkeeping.
+    """
+
+    L = 15.0
+    PC_I = 0
+    AX_I = 1
+    SP_I = 2
+    BP_I = 3
+    MEM_I = 4
+
+    # Position flags: threshold-difference pairs selecting distance from
+    # MEM. To predict addr_bJ (at d=J+1), L14 fires at d=J.
+    addr_pos = [
+        (BD.MARK_MEM, None),                           # d=0: predicts addr_b0
+        (BD.L1H1 + MEM_I, BD.L1H0 + MEM_I),            # d=1: predicts addr_b1
+        (BD.L1H2 + MEM_I, BD.L1H1 + MEM_I),            # d=2: predicts addr_b2
+        (BD.H0 + MEM_I,   BD.L1H2 + MEM_I),            # d=3: predicts addr_b3
+    ]
+    val_pos = [
+        (BD.H1 + MEM_I,   BD.H0 + MEM_I),              # d=4: predicts val_b0
+        (BD.L2H0 + MEM_I, BD.H1 + MEM_I),              # d=5: predicts val_b1
+        (BD.L1H4 + MEM_I, BD.L2H0 + MEM_I),            # d=6: predicts val_b2
+        (BD.H2 + MEM_I,   BD.L1H4 + MEM_I),            # d=7: predicts val_b3
+    ]
+
+    target_block_s = 2000.0
+
+    specs: list[DeclarativeAttentionHeadSpec] = []
+
+    # === Heads 0-3: MEM addr byte generation ===
+    for h in range(4):
+        pos_up, pos_down = addr_pos[h]
+        q: list[AP] = []
+        k: list[AP] = []
+
+        # Slot 0: Q position selection + suppression rows.
+        q.append(AP(0, pos_up, L))
+        if pos_down is not None:
+            q.append(AP(0, pos_down, -L))
+        q.append(AP(0, BD.MARK_STACK0, -L))
+        q.append(AP(0, BD.H4 + BP_I,   -L))
+        q.append(AP(0, BD.H1 + SP_I,   -L))
+
+        # Slot 0: K source selection (head-0 dual K, others byte-index K).
+        if h == 0:
+            k.append(AP(0, BD.MARK_SP,      L))
+            k.append(AP(0, BD.STACK0_BYTE0, L))
+        else:
+            byte_idx_dim = [None, BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][h]
+            k.append(AP(0, byte_idx_dim, L))
+
+        # Slot 1: SP source bonus (PSH).
+        q.append(AP(1, BD.CONST,         L))
+        q.append(AP(1, BD.MEM_ADDR_SRC, -2 * L))
+        k.append(AP(1, BD.H1 + SP_I,  L))
+        k.append(AP(1, BD.H1 + AX_I, -L))
+
+        # Slot 2: STACK0 source bonus (SI/SC).
+        q.append(AP(2, BD.MEM_ADDR_SRC, L))
+        if h == 0:
+            k.append(AP(2, BD.STACK0_BYTE0, L))
+        elif h == 1:
+            k.append(AP(2, BD.L1H4 + BP_I,  L))
+            k.append(AP(2, BD.H1   + BP_I, -L))
+        elif h == 2:
+            k.append(AP(2, BD.H2   + BP_I,  L))
+            k.append(AP(2, BD.L1H4 + BP_I, -L))
+        elif h == 3:
+            k.append(AP(2, BD.H3   + BP_I,  L))
+            k.append(AP(2, BD.H2   + BP_I, -L))
+        k.append(AP(2, BD.H1 + AX_I,    -L))
+        k.append(AP(2, BD.H1 + SP_I,    -L))
+        k.append(AP(2, BD.MARK_STACK0,  -L))
+
+        # Slot 33: Position gate.
+        q.append(AP(33, BD.CONST,        -500.0))
+        q.append(AP(33, pos_up,           500.0))
+        if pos_down is not None:
+            q.append(AP(33, pos_down,    -500.0))
+        q.append(AP(33, BD.MARK_STACK0,  -500.0))
+        q.append(AP(33, BD.L1H4 + BP_I,  -500.0))
+        q.append(AP(33, BD.H1 + SP_I,    -500.0))
+        k.append(AP(33, BD.CONST,         5.0))
+
+        # Slot 34: MEM_STORE gate.
+        q.append(AP(34, BD.CONST,        -500.0))
+        q.append(AP(34, BD.MEM_STORE,     500.0))
+        k.append(AP(34, BD.CONST,         5.0))
+
+        # Slot 38: shared non-MEM target blocker.
+        q.append(AP(38, BD.MARK_PC,      -target_block_s))
+        q.append(AP(38, BD.MARK_AX,      -target_block_s))
+        q.append(AP(38, BD.MARK_BP,      -target_block_s))
+        q.append(AP(38, BD.MARK_STACK0,  -target_block_s))
+        q.append(AP(38, BD.H1 + PC_I,    -target_block_s))
+        q.append(AP(38, BD.H1 + AX_I,    -target_block_s))
+        q.append(AP(38, BD.H1 + BP_I,    -target_block_s))
+        q.append(AP(38, BD.H4 + BP_I,    -target_block_s))
+        k.append(AP(38, BD.CONST,         5.0))
+
+        # V: read CLEAN_EMBED + OUTPUT (sum).
+        v: list[AP] = []
+        v.append(AP(0, BD.CONST, 1.0))
+        for kk in range(16):
+            v.append(AP(1  + kk, BD.CLEAN_EMBED_LO + kk, 1.0))
+            v.append(AP(1  + kk, BD.OUTPUT_LO      + kk, 1.0))
+            v.append(AP(17 + kk, BD.CLEAN_EMBED_HI + kk, 1.0))
+            v.append(AP(17 + kk, BD.OUTPUT_HI      + kk, 1.0))
+
+        # O: write to OUTPUT_LO/HI + cancel L3 default at byte 0.
+        o: list[AO] = []
+        o.append(AO(BD.OUTPUT_LO + 0, 0, -1.0))
+        o.append(AO(BD.OUTPUT_HI + 0, 0, -1.0))
+        for kk in range(16):
+            o.append(AO(BD.OUTPUT_LO + kk, 1  + kk, 1.0))
+            o.append(AO(BD.OUTPUT_HI + kk, 17 + kk, 1.0))
+
+        specs.append(DeclarativeAttentionHeadSpec(
+            head_idx=_L14_HEAD_LAYOUT_BY_NAME[f"layer14_mem_generation.head_{h}"],
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ))
+
+    # === Heads 4-7: MEM val byte generation ===
+    for h in range(4):
+        head_idx = 4 + h
+        pos_up, pos_down = val_pos[h]
+        byte_idx_dim = [
+            BD.BYTE_INDEX_0,
+            BD.BYTE_INDEX_1,
+            BD.BYTE_INDEX_2,
+            BD.BYTE_INDEX_3,
+        ][h]
+
+        q = []
+        k = []
+
+        # Slot 0: Q position selection + suppression; K targets byte position.
+        q.append(AP(0, pos_up,         L))
+        q.append(AP(0, pos_down,      -L))
+        q.append(AP(0, BD.MARK_STACK0, -L))
+        q.append(AP(0, BD.H4 + BP_I,   -L))
+        q.append(AP(0, BD.H1 + SP_I,   -L))
+        k.append(AP(0, byte_idx_dim,    L))
+
+        # Slot 1: AX source bonus (PSH/SI/SC).
+        q.append(AP(1, BD.CONST,   L))
+        q.append(AP(1, BD.OP_JSR, -2 * L))
+        q.append(AP(1, BD.OP_ENT, -2 * L))
+        k.append(AP(1, BD.H1 + AX_I, L))
+
+        # Slot 2: STACK0 source bonus (JSR/ENT).
+        q.append(AP(2, BD.OP_JSR, L))
+        q.append(AP(2, BD.OP_ENT, L))
+        if h == 0:
+            k.append(AP(2, BD.STACK0_BYTE0, L))
+        elif h == 1:
+            k.append(AP(2, BD.H2   + BP_I,  L))
+            k.append(AP(2, BD.L1H4 + BP_I, -L))
+        elif h == 2:
+            k.append(AP(2, BD.H3 + BP_I,  L))
+            k.append(AP(2, BD.H2 + BP_I, -L))
+        elif h == 3:
+            k.append(AP(2, BD.H4 + BP_I,  L))
+            k.append(AP(2, BD.H3 + BP_I, -L))
+        k.append(AP(2, BD.H1 + AX_I,    -L))
+        k.append(AP(2, BD.H1 + SP_I,    -L))
+        k.append(AP(2, BD.MARK_STACK0,  -L))
+
+        # Slot 33: Position gate.
+        q.append(AP(33, BD.CONST,        -500.0))
+        q.append(AP(33, pos_up,           500.0))
+        q.append(AP(33, pos_down,        -500.0))
+        q.append(AP(33, BD.MARK_STACK0,  -500.0))
+        q.append(AP(33, BD.L1H4 + BP_I,  -500.0))
+        q.append(AP(33, BD.H1 + SP_I,    -500.0))
+        k.append(AP(33, BD.CONST,         5.0))
+
+        # Slot 34: MEM_STORE gate.
+        q.append(AP(34, BD.CONST,        -500.0))
+        q.append(AP(34, BD.MEM_STORE,     500.0))
+        k.append(AP(34, BD.CONST,         5.0))
+
+        # Slot 38: shared non-MEM target blocker.
+        q.append(AP(38, BD.MARK_PC,      -target_block_s))
+        q.append(AP(38, BD.MARK_AX,      -target_block_s))
+        q.append(AP(38, BD.MARK_BP,      -target_block_s))
+        q.append(AP(38, BD.MARK_STACK0,  -target_block_s))
+        q.append(AP(38, BD.H1 + PC_I,    -target_block_s))
+        q.append(AP(38, BD.H1 + AX_I,    -target_block_s))
+        q.append(AP(38, BD.H1 + BP_I,    -target_block_s))
+        q.append(AP(38, BD.H4 + BP_I,    -target_block_s))
+        k.append(AP(38, BD.CONST,         5.0))
+
+        # V: copy CLEAN_EMBED only (no OUTPUT — see legacy 2026-04-16 fix).
+        v = []
+        v.append(AP(0, BD.CONST, 1.0))
+        for kk in range(16):
+            v.append(AP(1  + kk, BD.CLEAN_EMBED_LO + kk, 1.0))
+            v.append(AP(17 + kk, BD.CLEAN_EMBED_HI + kk, 1.0))
+
+        # O: write to OUTPUT_LO/HI + cancel L3 default at byte 0.
+        o = []
+        o.append(AO(BD.OUTPUT_LO + 0, 0, -1.0))
+        o.append(AO(BD.OUTPUT_HI + 0, 0, -1.0))
+        for kk in range(16):
+            o.append(AO(BD.OUTPUT_LO + kk, 1  + kk, 1.0))
+            o.append(AO(BD.OUTPUT_HI + kk, 17 + kk, 1.0))
+
+        specs.append(DeclarativeAttentionHeadSpec(
+            head_idx=_L14_HEAD_LAYOUT_BY_NAME[f"layer14_mem_generation.head_{head_idx}"],
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ))
+
+    return tuple(specs)
+
+
+def _layer14_mem_generation_ir(dim_positions, HD) -> CompilerIR:
+    """Build the declarative L14 mem-generation IR for the compiler.
+
+    Eight heads (0-3 address, 4-7 value). See
+    :func:`_layer14_mem_generation_head_specs` for the byte-level layout.
+    """
+
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    for spec in _layer14_mem_generation_head_specs(proxy):
+        ir.layer(0).attention.append(spec)
+    return ir
+
+
 def make_layer14_mem_generation_op() -> Operation:
-    """L14 attention: generate MEM section tokens (addr + value) for SI/SC/PSH."""
+    """L14 attention: generate MEM section tokens (addr + value) for SI/SC/PSH.
+
+    Wave 2E (Phase 6): migrated to ``DeclarativeAttentionHeadSpec`` form.
+    Heads 0-3 (address) and 4-7 (value) are expressed declaratively via
+    :func:`_layer14_mem_generation_head_specs`; the imperative
+    :func:`vm_step._set_layer14_mem_generation` helper is no longer
+    called. Byte-identity is preserved end-to-end (legacy ``W_q``/``W_k``
+    /``W_v``/``W_o`` writes are reproduced cell-for-cell via the spec,
+    then ``_clear_l14_mem_generation_overbroad_sp_suppression`` applies
+    the same residual overrides as before).
+    """
+
     def bake(attn, dim_positions, S):
-        from ...vm_step import _set_layer14_mem_generation
-        HD = attn.W_q.shape[0] // attn.num_heads
+        del S
         proxy = _as_setdim_proxy(dim_positions)
-        _set_layer14_mem_generation(attn, S, proxy, HD)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        # Per-bake attention-head allocator with the L14 head layout
+        # pinned. Stashed on ``attn`` for downstream inspection/extension.
+        head_allocator = _allocate_layer14_mem_generation_heads()
+        attn._l14_head_allocator = head_allocator
+        Primitives.generate_attention_heads(
+            attn, _layer14_mem_generation_head_specs(proxy), HD,
+        )
         _clear_l14_mem_generation_overbroad_sp_suppression(attn, proxy, HD)
         if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
             attn.alibi_slopes[:8] = 5.0
@@ -312,6 +632,7 @@ def make_layer14_mem_generation_op() -> Operation:
         layer_idx=14,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer14_mem_generation_ir,
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
