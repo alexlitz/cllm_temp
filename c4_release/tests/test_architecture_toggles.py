@@ -139,33 +139,167 @@ def test_rmsnorm_modules_exist_only_when_enabled():
     assert hasattr(block, "ffn_norm")
 
 
+# ---------------------------------------------------------------------------
+# Phase 8.O.9 — full 16-combination smoke matrix
+#
+# Axes (per Phase 8.O plan):
+#   position_encoding ∈ {alibi, rope}             — 8.O.1 (RoPE) landed
+#   attn_softmax      ∈ {softmax1, softmax}       — 8.O.2 in flight
+#   div_mode          ∈ {long_div, fast_div}      — 8.O.3 in flight
+#   output_norm       ∈ {no_norm, rms_norm}       — 8.O.4 in flight
+#
+# Default config (alibi + softmax1 + long_div + no_norm) is asserted to be
+# byte-identical to ``AutoregressiveVM`` constructed with no architecture
+# kwargs at all (existing-test byte-identity guarantee). Non-default
+# combinations are only required to compile + run forward with valid output
+# shape on every smoke input — pass-rate gating, not byte-identity.
+#
+# Toggles whose kwarg has not landed yet (currently ``div_mode``) cause
+# ``TypeError`` at construction; the harness auto-skips those rows rather
+# than failing. As each 8.O.N toggle lands its kwarg, the skip silently
+# turns into a real assertion.
+# ---------------------------------------------------------------------------
+
+# Five deterministic smoke inputs covering distinct VM-token shapes:
+#   1) bare CODE block (shortest legal program)
+#   2) CODE block with payload + STEP_END
+#   3) two STEP_ENDs (multi-step boundary)
+#   4) byte-only payload (no markers)
+#   5) full register prologue prefix (PC marker + 4 value bytes)
+_SMOKE_INPUTS = (
+    [Token.CODE_START, Token.CODE_END],
+    [Token.CODE_START, 1, 2, 3, Token.CODE_END, Token.STEP_END],
+    [Token.CODE_START, 7, Token.CODE_END, Token.STEP_END, Token.STEP_END],
+    [0, 1, 2, 3, 4, 5, 6, 7],
+    [Token.REG_PC, 0, 0, 0, 0, Token.STEP_END],
+)
+
+
+def _toggle_kwargs(position_encoding, attn_softmax, div_mode, output_norm):
+    """Map the 4-axis combo identifiers onto ``AutoregressiveVM`` kwargs.
+
+    Returns the kwargs dict to splat into the constructor. ``div_mode`` and
+    ``output_norm`` axes use their eventual public kwarg names so that as
+    Phase 8.O.3 / 8.O.4 land, the auto-skip becomes a real test row without
+    edits here.
+    """
+    kwargs = {
+        "positional_encoding": position_encoding,
+        "attention_normalization": attn_softmax,
+        "use_rms_norm": output_norm == "rms_norm",
+    }
+    # 8.O.3: surface div_mode via a kwarg. Until landed, passing it raises
+    # TypeError and the test row is skipped (see _build_or_skip).
+    if div_mode != "long_div":
+        kwargs["div_mode"] = div_mode
+    return kwargs
+
+
+def _build_or_skip(**kwargs):
+    """Construct AutoregressiveVM; skip the test row if a toggle kwarg is
+    not yet accepted (TypeError on unexpected keyword argument).
+    """
+    try:
+        return AutoregressiveVM(
+            n_layers=2,
+            d_model=512,
+            n_heads=8,
+            ffn_hidden=16,
+            max_seq_len=16,
+            use_flash_attention=False,
+            **kwargs,
+        )
+    except TypeError as exc:
+        msg = str(exc)
+        if "unexpected keyword argument" in msg:
+            pytest.skip(f"toggle not yet wired: {msg}")
+        raise
+
+
+_TOGGLE_AXES = (
+    ("alibi", "rope"),
+    ("softmax1", "softmax"),
+    ("long_div", "fast_div"),
+    ("no_norm", "rms_norm"),
+)
+
+
 @pytest.mark.parametrize(
-    ("use_rope", "use_standard_softmax", "use_rms_norm"),
-    itertools.product((False, True), repeat=3),
+    ("position_encoding", "attn_softmax", "div_mode", "output_norm"),
+    list(itertools.product(*_TOGGLE_AXES)),
 )
 def test_all_architecture_toggle_combinations_run_forward(
-    use_rope, use_standard_softmax, use_rms_norm
+    position_encoding, attn_softmax, div_mode, output_norm
 ):
-    model = AutoregressiveVM(
+    """All 16 (position × softmax × div × norm) combos compile and forward.
+
+    Asserts per smoke input:
+      * model constructs (skipped via _build_or_skip if a kwarg is unwired)
+      * forward returns the expected (batch, seq, vocab) shape
+      * every logit is finite (no NaN/Inf leakage from a broken toggle)
+    """
+    kwargs = _toggle_kwargs(position_encoding, attn_softmax, div_mode, output_norm)
+
+    torch.manual_seed(0)
+    model = _build_or_skip(**kwargs)
+    model.eval()
+
+    for tokens in _SMOKE_INPUTS:
+        token_ids = torch.tensor([tokens], dtype=torch.long)
+        with torch.no_grad():
+            logits = model(token_ids)
+        assert logits.shape == (1, len(tokens), Token.VOCAB_SIZE), (
+            f"shape mismatch for combo "
+            f"({position_encoding},{attn_softmax},{div_mode},{output_norm}) "
+            f"on input len={len(tokens)}: got {tuple(logits.shape)}"
+        )
+        assert torch.isfinite(logits).all(), (
+            f"non-finite logits for combo "
+            f"({position_encoding},{attn_softmax},{div_mode},{output_norm}) "
+            f"on input {tokens}"
+        )
+
+
+def test_default_combo_byte_identical_to_no_kwargs():
+    """The default 4-axis combo (alibi + softmax1 + long_div + no_norm) must
+    produce byte-identical logits to ``AutoregressiveVM(...)`` with no
+    architecture kwargs at all. This guards the contract that the toggle
+    matrix's default row is a no-op against existing tests.
+    """
+    torch.manual_seed(1234)
+    model_default = AutoregressiveVM(
         n_layers=2,
         d_model=512,
         n_heads=8,
         ffn_hidden=16,
         max_seq_len=16,
-        positional_encoding="rope" if use_rope else "alibi",
-        attention_normalization="softmax" if use_standard_softmax else "softmax1",
-        use_rms_norm=use_rms_norm,
         use_flash_attention=False,
     )
-    token_ids = torch.tensor(
-        [[Token.CODE_START, 1, 2, 3, Token.CODE_END, Token.STEP_END]],
-        dtype=torch.long,
+    model_default.eval()
+
+    torch.manual_seed(1234)
+    model_explicit = AutoregressiveVM(
+        n_layers=2,
+        d_model=512,
+        n_heads=8,
+        ffn_hidden=16,
+        max_seq_len=16,
+        use_flash_attention=False,
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        use_rms_norm=False,
     )
+    model_explicit.eval()
 
-    logits = model(token_ids)
-
-    assert logits.shape == (1, 6, Token.VOCAB_SIZE)
-    assert torch.isfinite(logits).all()
+    for tokens in _SMOKE_INPUTS:
+        token_ids = torch.tensor([tokens], dtype=torch.long)
+        with torch.no_grad():
+            logits_default = model_default(token_ids)
+            logits_explicit = model_explicit(token_ids)
+        assert torch.equal(logits_default, logits_explicit), (
+            "default toggle row drifted from no-kwargs baseline on input "
+            f"{tokens}"
+        )
 
 
 def test_open_model_like_factory_sets_standard_architecture_toggles():
