@@ -497,6 +497,38 @@ def _classify_cells(cells: int) -> str:
     return "imperative_heavy"
 
 
+# Operations carrying one of these explicit ``declarative_authority`` markers
+# are treated by the verifier (``audit_declarative_authority``) as the
+# canonical declaration. The census surfaces them as ``declarative_authority``
+# rather than ``imperative_heavy`` even when their bake_fn writes directly
+# into weight tensors -- the bake IS the spec. See
+# ``c4_release/neural_vm/unified_compiler/decl_verifier.py::audit_declarative_authority``.
+_AUTHORITATIVE_AUTHORITY = frozenset({
+    "declarative",
+    "spec_generated",
+    "structural_model",
+    "topology_anchor",
+})
+
+
+# Mirrors ``_looks_like_opaque_legacy_wrapper`` in ``decl_verifier``: a bake_fn
+# body that calls a ``_set_*`` helper or delegates to ``set_vm_weights`` /
+# ``legacy_bake`` is treated as an opaque legacy wrapper, not authoritative.
+_LEGACY_HELPER_CALL_RE = re.compile(r"\b_set_[A-Za-z0-9_]+\(")
+
+
+def _looks_like_opaque_legacy_wrapper(source: str) -> bool:
+    if not source:
+        return False
+    if _LEGACY_HELPER_CALL_RE.search(source):
+        return True
+    if "set_vm_weights" in source:
+        return True
+    if "legacy_bake" in source:
+        return True
+    return False
+
+
 _NUM_HEADS = 16
 
 
@@ -592,6 +624,26 @@ def _classify_op(op, dim_positions: Dict[str, int], d_model: int,
     cells, breakdown, err = _exercise_op(op, dim_positions, d_model, ffn_hidden)
 
     # ---- classification --------------------------------------------------
+    # Explicit ``declarative_authority`` on the Operation is the project's
+    # formal marker that the bake_fn IS the declarative spec (see
+    # ``audit_declarative_authority`` in ``decl_verifier``). For ops with one
+    # of the authoritative values, surface them as ``declarative_authority``
+    # so the census doesn't lump explicit-spec bakes (head_bake,
+    # embedding_bake, initial_pc_bake, spec-generated ALU/shifts/mul bakes,
+    # structural-model wrappers, topology-anchor markers) under
+    # ``imperative_heavy``.
+    #
+    # Also mirror ``audit_declarative_authority``'s inference: ops without
+    # an explicit authority but with ``migrated=True`` are inferred as
+    # ``declarative`` unless they look like an opaque legacy wrapper
+    # (bake_fn body calls ``_set_*`` or ``set_vm_weights`` directly).
+    authority = getattr(op, "declarative_authority", None)
+    if (
+        authority is None
+        and bool(getattr(op, "migrated", False))
+        and not _looks_like_opaque_legacy_wrapper(source)
+    ):
+        authority = "declarative"  # inferred, matches audit_declarative_authority
     if inline_declarative and cells > 0:
         classification = "declarative"
     elif inline_declarative and cells == 0:
@@ -600,6 +652,12 @@ def _classify_op(op, dim_positions: Dict[str, int], d_model: int,
         classification = "declarative_via_helper"
     elif helper_declarative and cells == 0:
         classification = "declarative_via_helper_no_op"
+    elif authority in _AUTHORITATIVE_AUTHORITY:
+        # Bake_fn either is the canonical declaration (e.g. setup_head_weights,
+        # setup_token_embeddings), or routes through a spec-generated /
+        # structural / topology-anchor path that the verifier already treats
+        # as authoritative. Either way, this is NOT imperative_heavy.
+        classification = "declarative_authority"
     elif err is not None:
         classification = "unknown"
     elif cells == 0:
@@ -758,6 +816,17 @@ _MD_HEADER = (
     "                               no direct `W_*.data` writes.\n"
     "- `declarative_no_op`        — declarative shape but produced 0 cells (flag-off).\n"
     "- `declarative_via_helper_no_op` — same but via helper.\n"
+    "- `declarative_authority`    — bake carries explicit `declarative_authority`\n"
+    "                               in {`declarative`, `spec_generated`,\n"
+    "                               `structural_model`, `topology_anchor`}\n"
+    "                               (or is inferred as such via `migrated=True`\n"
+    "                               with no opaque legacy wrapper), so the\n"
+    "                               verifier treats the bake_fn itself as the\n"
+    "                               canonical declaration (see\n"
+    "                               `audit_declarative_authority` in\n"
+    "                               `decl_verifier`). This is the taxonomy for\n"
+    "                               head/embedding/spec-generated bakes that\n"
+    "                               don't fit the lower-call shape.\n"
     "- `imperative_{trivial,medium,heavy}` — bake (or its helper chain) writes\n"
     "                               weights cells directly. Buckets: ≤10, 11–100, >100.\n"
     "- `no_op`                    — no cells written and no lower call.\n"
@@ -800,6 +869,7 @@ def render_markdown(rows: List[OpCensusRow], agg: Dict[str, Any]) -> str:
     lines.append("## Per-layer breakdown\n")
     cols = ["layer", "declarative", "declarative_via_helper",
             "declarative_no_op", "declarative_via_helper_no_op",
+            "declarative_authority",
             "imperative_trivial", "imperative_medium", "imperative_heavy",
             "no_op", "unknown"]
     lines.append("| " + " | ".join(cols) + " |")
@@ -855,6 +925,7 @@ def render_markdown(rows: List[OpCensusRow], agg: Dict[str, Any]) -> str:
         agg['per_class'].get("declarative_via_helper", 0)
         + agg['per_class'].get("declarative_via_helper_no_op", 0)
     )
+    decl_authority = agg['per_class'].get("declarative_authority", 0)
     no_op = agg['per_class'].get("no_op", 0)
     unknown = agg['per_class'].get("unknown", 0)
 
@@ -868,6 +939,11 @@ def render_markdown(rows: List[OpCensusRow], agg: Dict[str, Any]) -> str:
     )
     lines.append(
         f"- Observed declarative-via-helper ops: **{decl_helper}**"
+    )
+    lines.append(
+        f"- Observed declarative_authority ops "
+        f"(explicit `declarative_authority` markers / inferred): "
+        f"**{decl_authority}**"
     )
     lines.append(f"- Pure no_op ops: **{no_op}**; unknown: **{unknown}**")
     lines.append(
