@@ -2841,108 +2841,102 @@ def _layer6_attn_bake_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
-def _bake_layer6_relay_heads_spec(attn, BD, HD):
-    """Spec writer for L6 PSH relay heads 6-7."""
+def _layer6_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Declarative L6 PSH relay head specs (heads 6 and 7).
+
+    Replaces the imperative ``_bake_layer6_relay_heads_spec`` body. Head 6
+    is the opcode-flag broadcast + AX_CARRY_LO -> ALU_LO relay; head 7 is
+    the AX_CARRY_HI -> ALU_HI relay plus the post-LEV STACK0_BYTE0 ->
+    AX_CARRY refresh extension (see the LEV-refresh block below).
+    """
+
     L = 50.0
     SP_I = 2
     BP_I = 3
+    specs = []
 
-    # Head 6: STACK0 reads AX_CARRY_LO from AX into ALU_LO.
-    base = _L6_HEAD_LAYOUT_BY_NAME["layer6_relay_heads_bake.psh_ax_carry_lo"] * HD
-    # Mirror the opcode relay's marker coverage here so the PSH/JSR/ENT flags
-    # are available to the same L6 FFN step even if later model-level relay
-    # post-passes are trimmed or reordered.
-    attn.W_q[base, BD.MARK_SP] = L
-    attn.W_q[base, BD.H1 + SP_I] = L
-    attn.W_q[base, BD.MARK_STACK0] = L
-    attn.W_q[base, BD.L1H4 + BP_I] = L
-    attn.W_q[base, BD.MARK_BP] = L
-    attn.W_q[base, BD.MARK_PC] = L
-    attn.W_q[base, BD.MARK_MEM] = L
-    attn.W_q[base, BD.MARK_AX] = -L
-    attn.W_k[base, BD.MARK_AX] = L
-    attn.W_v[base + 0, BD.OP_LEV] = 0.1
-    attn.W_v[base + 1, BD.OP_PSH] = 0.2
-    attn.W_v[base + 2, BD.OP_ADJ] = 0.2
+    # Head 6: STACK0 reads AX_CARRY_LO from AX into ALU_LO. Mirrors the
+    # opcode relay's marker coverage so PSH/JSR/ENT flags are available to
+    # the same L6 FFN step even if later model-level relay post-passes are
+    # trimmed or reordered.
+    h6_q = (
+        AP(0, BD.MARK_SP, L),
+        AP(0, BD.H1 + SP_I, L),
+        AP(0, BD.MARK_STACK0, L),
+        AP(0, BD.L1H4 + BP_I, L),
+        AP(0, BD.MARK_BP, L),
+        AP(0, BD.MARK_PC, L),
+        AP(0, BD.MARK_MEM, L),
+        AP(0, BD.MARK_AX, -L),
+    )
+    h6_k = (AP(0, BD.MARK_AX, L),)
+    h6_v: list = [
+        AP(0, BD.OP_LEV, 0.1),
+        AP(1, BD.OP_PSH, 0.2),
+        AP(2, BD.OP_ADJ, 0.2),
+    ]
+    # Binary-pop group folded onto slot 3 (each at +0.04).
     for op_dim in (
-        BD.OP_ADD,
-        BD.OP_SUB,
-        BD.OP_MUL,
-        BD.OP_DIV,
-        BD.OP_MOD,
-        BD.OP_EQ,
-        BD.OP_NE,
-        BD.OP_LT,
-        BD.OP_GT,
-        BD.OP_LE,
-        BD.OP_GE,
-        BD.OP_OR,
-        BD.OP_XOR,
-        BD.OP_AND,
-        BD.OP_SHL,
-        BD.OP_SHR,
-        BD.OP_SI,
-        BD.OP_SC,
+        BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+        BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+        BD.OP_OR, BD.OP_XOR, BD.OP_AND, BD.OP_SHL, BD.OP_SHR,
+        BD.OP_SI, BD.OP_SC,
     ):
-        attn.W_v[base + 3, op_dim] = 0.04
-    attn.W_v[base + 4, BD.OP_ENT] = 0.2
-    attn.W_v[base + 5, BD.OP_JSR] = 0.2
-    attn.W_v[base + 6, BD.OP_SI] = 0.2
-    attn.W_v[base + 6, BD.OP_SC] = 0.2
-    attn.W_v[base + 6, BD.OP_PSH] = 0.2
-    attn.W_v[base + 6, BD.OP_JSR] = 0.2
-    attn.W_v[base + 6, BD.OP_ENT] = 0.2
-    attn.W_v[base + 7, BD.OP_SI] = 0.2
-    attn.W_v[base + 7, BD.OP_SC] = 0.2
-    attn.W_o[BD.CMP + 0, base + 1] = 1.0
-    attn.W_o[BD.PSH_AT_SP, base + 1] = 1.0
-    attn.W_o[BD.CMP + 1, base + 2] = 1.0
-    attn.W_o[BD.CMP + 3, base + 3] = 5.0
-    attn.W_o[BD.CMP + 2, base + 4] = 1.0
-    attn.W_o[BD.CMP + 4, base + 5] = 1.0
-    attn.W_o[BD.OP_JSR, base + 5] = 5.0
-    attn.W_o[BD.OP_ENT, base + 4] = 5.0
-    attn.W_o[BD.MEM_STORE, base + 6] = 1.0
-    attn.W_o[BD.MEM_ADDR_SRC, base + 7] = 1.0
-    attn.W_o[BD.OP_LEV, base + 0] = 10.0
+        h6_v.append(AP(3, op_dim, 0.04))
+    h6_v.extend((
+        AP(4, BD.OP_ENT, 0.2),
+        AP(5, BD.OP_JSR, 0.2),
+        AP(6, BD.OP_SI, 0.2),
+        AP(6, BD.OP_SC, 0.2),
+        AP(6, BD.OP_PSH, 0.2),
+        AP(6, BD.OP_JSR, 0.2),
+        AP(6, BD.OP_ENT, 0.2),
+        AP(7, BD.OP_SI, 0.2),
+        AP(7, BD.OP_SC, 0.2),
+    ))
+    h6_o: list = [
+        AO(BD.CMP + 0, 1, 1.0),
+        AO(BD.PSH_AT_SP, 1, 1.0),
+        AO(BD.CMP + 1, 2, 1.0),
+        AO(BD.CMP + 3, 3, 5.0),
+        AO(BD.CMP + 2, 4, 1.0),
+        AO(BD.CMP + 4, 5, 1.0),
+        AO(BD.OP_JSR, 5, 5.0),
+        AO(BD.OP_ENT, 4, 5.0),
+        AO(BD.MEM_STORE, 6, 1.0),
+        AO(BD.MEM_ADDR_SRC, 7, 1.0),
+        AO(BD.OP_LEV, 0, 10.0),
+    ]
+    # AX_CARRY_LO band relay (slots 8..23).
     for k in range(16):
-        attn.W_v[base + 8 + k, BD.AX_CARRY_LO + k] = 1.0
-        attn.W_o[BD.ALU_LO + k, base + 8 + k] = 1.0
+        h6_v.append(AP(8 + k, BD.AX_CARRY_LO + k, 1.0))
+        h6_o.append(AO(BD.ALU_LO + k, 8 + k, 1.0))
+    specs.append(DeclarativeAttentionHeadSpec(
+        head_idx=_L6_HEAD_LAYOUT_BY_NAME["layer6_relay_heads_bake.psh_ax_carry_lo"],
+        q=h6_q,
+        k=h6_k,
+        v=tuple(h6_v),
+        o=tuple(h6_o),
+    ))
 
-    # Head 7: STACK0 reads AX_CARRY_HI from AX into ALU_HI.
-    base = _L6_HEAD_LAYOUT_BY_NAME["layer6_relay_heads_bake.psh_ax_carry_hi"] * HD
-    attn.W_q[base, BD.MARK_STACK0] = L + L * 20
-    attn.W_q[base, BD.MARK_AX] = -L
-    attn.W_q[base, BD.CONST] = -L * 20
-    attn.W_k[base, BD.MARK_AX] = L
-    for k in range(16):
-        attn.W_v[base + 33 + k, BD.AX_CARRY_HI + k] = 1.0
-        attn.W_o[BD.ALU_HI + k, base + 33 + k] = 1.0
-
-    # ---- LEV AX_CARRY refresh: post-LEV MARK_AX <- STACK0_byte0 CLEAN_EMBED ----
+    # Head 7: STACK0 reads AX_CARRY_HI from AX into ALU_HI plus the post-LEV
+    # AX_CARRY refresh extension.
     #
-    # Post-LEV (step 6 of a typical function-call sequence) the L8 ALU contract
-    # requires AX_CARRY_LO/HI at MARK_AX to hold the popped return value, which
-    # lives on the freed STACK0 saved-AX slot. No earlier layer populates it:
-    # L3 head 1 (legacy carry-forward) copies the *previous* AX byte 0 EMBED
-    # which during LEV is the callee's local AX, not the value just popped
-    # from STACK0. The 2026-06-01 stack/JSR/LEV triage attributes 91 rows of
-    # ``step6:AX_byte0`` corruption to this missing producer (see
+    # ---- LEV AX_CARRY refresh: post-LEV MARK_AX <- STACK0_byte0 CLEAN_EMBED
+    # Post-LEV (step 6 of a typical function-call sequence) the L8 ALU
+    # contract requires AX_CARRY_LO/HI at MARK_AX to hold the popped return
+    # value, which lives on the freed STACK0 saved-AX slot. No earlier layer
+    # populates it: L3 head 1 (legacy carry-forward) copies the *previous* AX
+    # byte 0 EMBED which during LEV is the callee's local AX, not the value
+    # just popped from STACK0. The 2026-06-01 stack/JSR/LEV triage attributes
+    # 91 rows of ``step6:AX_byte0`` corruption to this missing producer (see
     # ``.agent-logs/stack_jsr_lev_triage_2026_06_01.md``).
     #
     # The companion L16 op ``layer16_lev_routing`` (commit 3650e01) added
-    # ``l16_lev_ax_carry_lo/hi_{k}`` FFN rules that gate on ``AX_CARRY_LO/HI+k``
-    # and write OUTPUT_LO/HI at MARK_AX during OP_LEV -- but those gates are
-    # silent unless something populates AX_CARRY_LO/HI first. This sub-pattern
-    # within head 7 provides that producer.
-    #
-    # Wiring (mirrors L7 head 0 ``_layer7_operand_gather_head_specs`` which
-    # already gathers STACK0_byte0 CLEAN_EMBED -> ALU at MARK_AX for binary
-    # ops): an attention sub-pattern within head 7 at unused slots that fires
-    # on (MARK_AX AND OP_LEV) at the Q side and matches the STACK0_BYTE0 flag
-    # (set by the L1 FFN, true at the byte-0 row of the saved-AX stack slot)
-    # at the K side, then routes the attended row's CLEAN_EMBED_LO/HI nibbles
-    # into AX_CARRY_LO/HI at the Q (MARK_AX) position.
+    # ``l16_lev_ax_carry_lo/hi_{k}`` FFN rules that gate on
+    # ``AX_CARRY_LO/HI+k`` and write OUTPUT_LO/HI at MARK_AX during OP_LEV --
+    # but those gates are silent unless something populates AX_CARRY_LO/HI
+    # first. This sub-pattern within head 7 provides that producer.
     #
     # Slot layout (head 7, head_dim 64; existing claims use slot 0 and
     # 33..48):
@@ -2952,35 +2946,66 @@ def _bake_layer6_relay_heads_spec(attn, BD, HD):
     #   slot 18              : V[CLEAN_EMBED_HI+0] -> O[AX_CARRY_HI+0]
     #   slot 49 + k (k=0..14): V[CLEAN_EMBED_HI+(1+k)] -> O[AX_CARRY_HI+(1+k)]
     #
-    # The Q at slot 1 uses a sign pattern designed so the slot contribution to
-    # the Q*K product is positive only at the MARK_AX query position with
-    # OP_LEV simultaneously set (Q[1] = +L only when both bits are on). Head 7's
-    # existing slot-0 attention (MARK_STACK0 -> MARK_AX) is undisturbed because
-    # slot 1's K only matches STACK0_BYTE0 (not MARK_AX), so slot 1's
-    # contribution to the existing routing is zero. At MARK_AX during LEV the
+    # Slot 1's K only matches STACK0_BYTE0 (not MARK_AX), so slot 1's
+    # contribution to the existing slot-0 MARK_STACK0->MARK_AX routing at
+    # query positions other than MARK_AX is zero. At MARK_AX during LEV the
     # combined score for j=STACK0_BYTE0 wins by a wide margin over self-match
-    # (slot 0 is deeply negative at the MARK_AX query) and over arbitrary
-    # other positions (slot 1 only fires at K=STACK0_BYTE0).
-    L_lev = L
-    # Slot 1 Q/K gate: positive contribution only at (MARK_AX + OP_LEV).
+    # and over arbitrary other positions.
     LEV_GATE = 1
-    attn.W_q[base + LEV_GATE, BD.MARK_AX] = L_lev
-    attn.W_q[base + LEV_GATE, BD.OP_LEV] = L_lev
-    attn.W_q[base + LEV_GATE, BD.CONST] = -L_lev
-    attn.W_k[base + LEV_GATE, BD.STACK0_BYTE0] = L_lev
-    # V/O lanes for AX_CARRY_LO band: slots 2..17.
+    h7_q: list = [
+        AP(0, BD.MARK_STACK0, L + L * 20),
+        AP(0, BD.MARK_AX, -L),
+        AP(0, BD.CONST, -L * 20),
+        # Slot 1 Q/K gate: positive only at (MARK_AX + OP_LEV).
+        AP(LEV_GATE, BD.MARK_AX, L),
+        AP(LEV_GATE, BD.OP_LEV, L),
+        AP(LEV_GATE, BD.CONST, -L),
+    ]
+    h7_k: list = [
+        AP(0, BD.MARK_AX, L),
+        AP(LEV_GATE, BD.STACK0_BYTE0, L),
+    ]
+    h7_v: list = []
+    h7_o: list = []
+    # CLEAN_EMBED_LO -> AX_CARRY_LO at MARK_AX (slots 2..17).
     for k in range(16):
-        attn.W_v[base + 2 + k, BD.CLEAN_EMBED_LO + k] = 1.0
-        attn.W_o[BD.AX_CARRY_LO + k, base + 2 + k] = 1.0
-    # V/O lanes for AX_CARRY_HI band: slot 18 for k=0, slots 49..63 for k=1..15
-    # (slots 33..48 are claimed by the existing AX_CARRY_HI -> ALU_HI relay
-    # above, so we route the HI band's k=0 to the lowest unused slot 18 and
-    # the rest to the high tail of the head).
-    attn.W_v[base + 18, BD.CLEAN_EMBED_HI + 0] = 1.0
-    attn.W_o[BD.AX_CARRY_HI + 0, base + 18] = 1.0
+        h7_v.append(AP(2 + k, BD.CLEAN_EMBED_LO + k, 1.0))
+        h7_o.append(AO(BD.AX_CARRY_LO + k, 2 + k, 1.0))
+    # CLEAN_EMBED_HI -> AX_CARRY_HI at MARK_AX: slot 18 for k=0, slots 49..63
+    # for k=1..15 (slots 33..48 are claimed by the AX_CARRY_HI -> ALU_HI relay
+    # below).
+    h7_v.append(AP(18, BD.CLEAN_EMBED_HI + 0, 1.0))
+    h7_o.append(AO(BD.AX_CARRY_HI + 0, 18, 1.0))
     for k in range(1, 16):
-        attn.W_v[base + 48 + k, BD.CLEAN_EMBED_HI + k] = 1.0
-        attn.W_o[BD.AX_CARRY_HI + k, base + 48 + k] = 1.0
+        h7_v.append(AP(48 + k, BD.CLEAN_EMBED_HI + k, 1.0))
+        h7_o.append(AO(BD.AX_CARRY_HI + k, 48 + k, 1.0))
+    # AX_CARRY_HI -> ALU_HI relay (slots 33..48).
+    for k in range(16):
+        h7_v.append(AP(33 + k, BD.AX_CARRY_HI + k, 1.0))
+        h7_o.append(AO(BD.ALU_HI + k, 33 + k, 1.0))
+    specs.append(DeclarativeAttentionHeadSpec(
+        head_idx=_L6_HEAD_LAYOUT_BY_NAME["layer6_relay_heads_bake.psh_ax_carry_hi"],
+        q=tuple(h7_q),
+        k=tuple(h7_k),
+        v=tuple(h7_v),
+        o=tuple(h7_o),
+    ))
+
+    return tuple(specs)
+
+
+def _layer6_relay_heads_bake_ir(dim_positions, HD) -> CompilerIR:
+    """Build the declarative L6 PSH relay heads IR (heads 6 and 7).
+
+    Wraps :func:`_layer6_relay_head_specs` for the compiler so symbolic and
+    static tools see the same spec as the production bake.
+    """
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    for spec in _layer6_relay_head_specs(proxy):
+        ir.layer(0).attention.append(spec)
+    return ir
 
 
 def make_layer6_attn_bake_op() -> Operation:
@@ -3184,9 +3209,11 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         # snapshot first: this guards against future schedules that run
         # this op standalone). Heads 6 and 7 are sourced from
         # :data:`_L6_HEAD_LAYOUT_BY_NAME` inside
-        # ``_bake_layer6_relay_heads_spec``.
+        # ``_layer6_relay_head_specs``.
         attn._l6_head_allocator = _allocate_layer6_heads()
-        _bake_layer6_relay_heads_spec(attn, _as_setdim_proxy(dim_positions), HD)
+        Primitives.generate_attention_heads(
+            attn, _layer6_relay_head_specs(_as_setdim_proxy(dim_positions)), HD
+        )
 
     # Dim-ownership claims. ``_bake_layer6_relay_heads_spec`` programs L6
     # heads 6 and 7 (Q/K/V/O). Head 6 owns the PSH/JSR/ENT/LEV/PSH-group
@@ -3305,6 +3332,7 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer6_relay_heads_bake_ir,
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
