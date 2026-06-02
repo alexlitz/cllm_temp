@@ -849,15 +849,208 @@ def make_head_bake_op() -> Operation:
     )
 
 
+def _embedding_bake_rules(vocab_size: int) -> tuple:
+    """Build the :class:`TokenEmbeddingRule` list mirroring ``setup_token_embeddings``.
+
+    Walks the same per-token write list as the imperative helper in
+    ``ops/shared.py`` (see ``setup_token_embeddings``) and emits one
+    :class:`TokenEmbeddingRule` per logical group of writes. Group structure:
+
+      1. ``CONST=1.0`` for every token id < ``vocab_size``.
+      2. Each register/section marker token writes ``MARK_<X>=1.0`` and
+         ``IS_MARK=1.0`` (one rule per token to keep dim names symbolic).
+      3. ``STACK0`` writes ``MARK_STACK0=1.0`` (no ``IS_MARK``).
+      4. ``STEP_END``/``DATA_END``/``HALT`` write ``MARK_SE=1.0`` + ``IS_MARK``.
+      5. ``STEP_END`` adds ``MARK_SE_ONLY=1.0``.
+      6. ``TOOL_CALL`` writes ``MARK_SE`` + ``IS_MARK`` + ``MARK_SE_ONLY`` +
+         ``CONST``.
+      7. ``THINKING_START`` and ``THINKING_END`` each write ``IS_MARK`` +
+         ``CONST`` + ``TEMP+{1,2}`` + ``MARK_THINKING_{START,END}``.
+      8. ``IO_STATE_EMIT_BYTE`` / ``IO_STATE_EMIT_THINKING`` each write
+         ``IS_MARK`` + ``CONST``.
+      9. Each byte token ``0..255`` writes ``IS_BYTE=1.0``, ``EMBED_LO+nibble``,
+         ``EMBED_HI+nibble``, ``CLEAN_EMBED_LO+nibble``, ``CLEAN_EMBED_HI+nibble``.
+
+    The rule lowering is accumulative (``+=``) -- mirroring the imperative
+    helper requires zeroing ``embed.weight`` first, which is still done in
+    the bake_fn (the IR has no zeroing primitive). After the zero, every
+    cell is written by at most one rule per token, so ``+=`` and ``=``
+    produce byte-identical results.
+    """
+    from ...vm_step import Token
+
+    rules: list[TokenEmbeddingRule] = []
+
+    # 1. CONST=1 for every token.
+    rules.append(TokenEmbeddingRule.embed_write(
+        token_ids=[tok for tok in range(vocab_size)],
+        writes=(("CONST", 1.0),),
+        name="embedding_bake_const_all_tokens",
+    ))
+
+    # 2. Register / section markers (MARK_<X> + IS_MARK).
+    for tok, dim_name in (
+        (Token.REG_PC, "MARK_PC"),
+        (Token.REG_AX, "MARK_AX"),
+        (Token.REG_SP, "MARK_SP"),
+        (Token.REG_BP, "MARK_BP"),
+        (Token.MEM, "MARK_MEM"),
+        (Token.CODE_START, "MARK_CS"),
+    ):
+        if tok < vocab_size:
+            rules.append(TokenEmbeddingRule.embed_write(
+                token_ids=[tok],
+                writes=((dim_name, 1.0), ("IS_MARK", 1.0)),
+                name=f"embedding_bake_marker_{dim_name.lower()}",
+            ))
+
+    # 3. STACK0 marker WITHOUT IS_MARK.
+    if Token.STACK0 < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.STACK0],
+            writes=(("MARK_STACK0", 1.0),),
+            name="embedding_bake_stack0_mark",
+        ))
+
+    # 4. Step-end / data-end / halt: MARK_SE + IS_MARK.
+    for tok in (Token.STEP_END, Token.DATA_END, Token.HALT):
+        if tok < vocab_size:
+            rules.append(TokenEmbeddingRule.embed_write(
+                token_ids=[tok],
+                writes=(("MARK_SE", 1.0), ("IS_MARK", 1.0)),
+                name=f"embedding_bake_se_token_{tok}",
+            ))
+
+    # 5. STEP_END additionally writes MARK_SE_ONLY.
+    if Token.STEP_END < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.STEP_END],
+            writes=(("MARK_SE_ONLY", 1.0),),
+            name="embedding_bake_step_end_se_only",
+        ))
+
+    # 6. TOOL_CALL: MARK_SE + IS_MARK + MARK_SE_ONLY + CONST. Note that
+    #    CONST was already written for every token by rule 1 above; the
+    #    imperative helper rewrote the same +1.0 (assignment, not add) which
+    #    leaves the cell at 1.0. With IR ``+=`` semantics we must NOT add a
+    #    second +1.0 to CONST here or we'd produce 2.0. Skip CONST here.
+    if Token.TOOL_CALL < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.TOOL_CALL],
+            writes=(
+                ("MARK_SE", 1.0),
+                ("IS_MARK", 1.0),
+                ("MARK_SE_ONLY", 1.0),
+            ),
+            name="embedding_bake_tool_call",
+        ))
+
+    # 7. Thinking markers. The dims MAY be undeclared (convo-IO off); the
+    #    bake_fn skips them via try/except in the legacy helper. We register
+    #    the rules unconditionally and let ``compare_symbolic_to_lowered_
+    #    embedding`` raise a ``declaration_semantics`` issue at validation
+    #    time when dims are missing, but the bake-time
+    #    ``lower_token_embeddings`` will resolve them through the proxy.
+    #    Reduce to a conditional rule list: only include the THINKING_*
+    #    rules when both the token AND the dims are present. Since dim
+    #    declarations are done via ``declare_setdim_compat_dims`` and
+    #    ``MARK_THINKING_*`` are always declared (see the ``one_dim`` list
+    #    in ``shared.py``), it's safe to register the rules unconditionally
+    #    when the tokens are in vocab.
+    if Token.THINKING_START < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.THINKING_START],
+            writes=(
+                ("IS_MARK", 1.0),
+                ("TEMP+1", 1.0),
+                ("MARK_THINKING_START", 1.0),
+            ),
+            name="embedding_bake_thinking_start",
+        ))
+    if Token.THINKING_END < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.THINKING_END],
+            writes=(
+                ("IS_MARK", 1.0),
+                ("TEMP+2", 1.0),
+                ("MARK_THINKING_END", 1.0),
+            ),
+            name="embedding_bake_thinking_end",
+        ))
+
+    # 8. IO_STATE_EMIT_*: IS_MARK (CONST already covered by rule 1).
+    if Token.IO_STATE_EMIT_BYTE < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.IO_STATE_EMIT_BYTE],
+            writes=(("IS_MARK", 1.0),),
+            name="embedding_bake_io_state_emit_byte",
+        ))
+    if Token.IO_STATE_EMIT_THINKING < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.IO_STATE_EMIT_THINKING],
+            writes=(("IS_MARK", 1.0),),
+            name="embedding_bake_io_state_emit_thinking",
+        ))
+
+    # 9. Byte tokens 0-255: IS_BYTE + nibble decoding. Group by (lo, hi)
+    #    nibble pair so each rule still carries symbolic dim names. There are
+    #    256 byte tokens, each with a unique (lo, hi) so we emit 256 rules.
+    #    IS_BYTE is +1.0 for all; group it into per-byte rules so the rule
+    #    stays self-contained.
+    for b in range(256):
+        if b >= vocab_size:
+            break
+        lo = b & 0xF
+        hi = (b >> 4) & 0xF
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[b],
+            writes=(
+                ("IS_BYTE", 1.0),
+                (f"EMBED_LO+{lo}", 1.0),
+                (f"EMBED_HI+{hi}", 1.0),
+                (f"CLEAN_EMBED_LO+{lo}", 1.0),
+                (f"CLEAN_EMBED_HI+{hi}", 1.0),
+            ),
+            name=f"embedding_bake_byte_{b}",
+        ))
+
+    return tuple(rules)
+
+
+def _embedding_bake_ir() -> CompilerIR:
+    """Build the embedding-bake :class:`CompilerIR` (rules + lower target)."""
+    from ...vm_step import Token
+
+    ir = CompilerIR()
+    ir.embeddings.extend(_embedding_bake_rules(Token.VOCAB_SIZE))
+    return ir
+
+
 def make_embedding_bake_op() -> Operation:
     """Bake the per-token embedding table.
 
     Phase=1001 so it runs AFTER legacy_bake (phase=999) and head_bake (1000);
     the corresponding embedding section in `set_vm_weights` has been removed
     to avoid double-bake.
+
+    Phase 7.D.2 migration: the imperative ``setup_token_embeddings`` helper
+    is replaced by an op-owned :class:`CompilerIR` containing one
+    :class:`TokenEmbeddingRule` per logical write group (CONST,
+    register markers, byte-nibble decoding, etc.). The bake_fn first zeroes
+    ``model.embed.embed.weight`` (mirroring the helper's ``.zero_()`` call —
+    the IR has no zeroing primitive) and then calls
+    ``CompilerIR.lower_token_embeddings``. Byte-identical to the imperative
+    path because every per-token cell is hit by at most one rule, so the
+    accumulating ``+=`` of rule lowering matches the helper's direct ``=``.
     """
+    _ir = _embedding_bake_ir()
+
     def _bake(model, dim_positions, S):
-        setup_token_embeddings(model.embed.embed.weight, dim_positions)
+        del S
+        import torch
+        with torch.no_grad():
+            model.embed.embed.weight.zero_()
+        _ir.lower_token_embeddings(model, dim_positions)
 
     # Dim-ownership claims. ``setup_token_embeddings`` calls ``embed_weight
     # .zero_()`` first, which differs from the fresh ``nn.Embedding`` random
@@ -877,8 +1070,10 @@ def make_embedding_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         declarative_bake_fn=_bake,
+        compiler_ir=_ir,
         phase=1001,
         declarative_authority="declarative",
+        migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
