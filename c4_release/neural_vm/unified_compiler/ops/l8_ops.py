@@ -1630,7 +1630,6 @@ def make_layer8_sp_gather_op() -> Operation:
 
     return Operation(
         name="layer8_sp_gather",
-        phase=8,
         reads={"MARK_AX", "MARK_SP", "OP_ADJ", "OP_ENT", "OP_LEA",
                "EMBED_LO", "EMBED_HI"},
         writes={"ALU_LO", "ALU_HI"},
