@@ -64,7 +64,6 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
         reads=set(),
         writes=set(),
         kind="model",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         phase=998.8,
@@ -311,7 +310,6 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
         reads=set(),
         writes=set(),
         kind="model",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _tool_call_relay_head_ir if enable_tool_calling else None
@@ -404,7 +402,6 @@ def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Oper
         reads=set(),
         writes=set(),
         kind="model",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _convo_io_relay_heads_ir
@@ -487,7 +484,6 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
         reads=set(),
         writes=set(),
         kind="model",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         phase=998.8,
@@ -778,7 +774,6 @@ def make_convo_io_step_resume_op(
         writes=set(),
         kind="block",
         layer_idx=3,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir=_convo_io_step_resume_ir(),
         declarative_authority="spec_generated",
@@ -889,7 +884,6 @@ def make_convo_io_pc_sp_latch_op(
         writes=set(),
         kind="block",
         layer_idx=6,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_convo_io_pc_sp_latch_ir(),
@@ -1013,7 +1007,6 @@ def make_convo_io_prtf_capture_op(
         writes=set(),
         kind="block",
         layer_idx=7,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         migrated=True,
@@ -1149,7 +1142,6 @@ def make_convo_io_prtf_transport_op(
         writes=set(),
         kind="block",
         layer_idx=4,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _convo_io_prtf_transport_ir
