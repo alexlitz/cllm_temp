@@ -1920,7 +1920,6 @@ def make_layer10_byte_passthrough_op() -> Operation:
 
     return Operation(
         name="layer10_byte_passthrough",
-        phase=10,
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L11/L14 TEMP writers (which fire after L10 in the
         # same step). The same-step values from L3/L5/L7 still resolve at
