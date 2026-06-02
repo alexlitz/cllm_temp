@@ -3,11 +3,108 @@
 import torch.nn as nn
 from collections.abc import Mapping
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L15 attention head layout (pinned head_idx per primary owner) ===
+#
+# L15 attention is the load-side memory pipeline. The block is structurally
+# resized by ``l15_attention_resize`` (phase 14.9) so the live head count
+# varies per build:
+#
+#   * Default 16-layer build: ``num_heads = 9``. Heads 0-3 host the LI/LC
+#     and pop-group STACK0 lookups; head 8 hosts the wide-ALU byte relay;
+#     head 9 is the pop_d8_to_e0 lookup added by the suppress helper.
+#   * 17-layer LEV build:    ``num_heads = 14``. Heads 4-7 add LEV
+#     saved_bp reads, heads 10-11 add LEV return_addr byte 2/3 reads
+#     (byte 0 is on head 8, byte 1 on head 9 which the suppress helper
+#     wipes and rewrites for pop_d8_to_e0). Heads 12-13 host the
+#     SI/SC-only STACK0 byte0 / addr0 overrides.
+#
+# This table is the single source of truth for the L15 head axis.
+# ``layer_max_heads=14`` covers the widest configuration; runtime
+# narrower-width builds simply leave the higher pins unused. Every
+# ``head_idx`` literal in the spec functions below (e.g. ``head_idx=12``
+# in :func:`_layer15_store_stack0_sp_byte0_addr_spec`) is pinned here so
+# the bakes pull the same indices they always have and byte-identity is
+# trivially preserved.
+#
+# Heads 0-11 are written by ``_set_layer15_memory_lookup`` in vm_step
+# (still imperative) and the suppress helper in this module
+# (also still imperative due to conditional num_heads logic). The
+# allocator pins them here so future structural reshuffles (LEV head
+# renumbering, additional load-side heads) can land via an
+# ``allocator.alloc(name, layer_idx=15)`` call without re-pinning. The
+# already-declarative ops ``layer15_store_stack0_sp_byte0_addr``,
+# ``layer15_si_mem_addr0_from_stack0``, and ``layer15_alu_high_byte_relay``
+# (the last one lives in ``l14_ops.py`` but writes to the L15 attention
+# block) resolve their head index by name from this table.
+_L15_HEAD_LAYOUT = (
+    # (op-name key,                                    pinned head_idx)
+    ("layer15_memory_lookup.li_lc_stack0_h0",          0),  # head 0: LI/LC byte 0 + STACK0 pop dual-role
+    ("layer15_memory_lookup.li_lc_stack0_h1",          1),  # head 1: LI/LC byte 1 (BYTE_INDEX_0 gate)
+    ("layer15_memory_lookup.li_lc_stack0_h2",          2),  # head 2: LI/LC byte 2 (BYTE_INDEX_1 gate)
+    ("layer15_memory_lookup.li_lc_stack0_h3",          3),  # head 3: LI/LC byte 3 (BYTE_INDEX_2 gate)
+    ("layer15_memory_lookup.lev_saved_bp_h4",          4),  # head 4: LEV saved_bp byte 0 (num_heads>=12)
+    ("layer15_memory_lookup.lev_saved_bp_h5",          5),  # head 5: LEV saved_bp byte 1
+    ("layer15_memory_lookup.lev_saved_bp_h6",          6),  # head 6: LEV saved_bp byte 2
+    ("layer15_memory_lookup.lev_saved_bp_h7",          7),  # head 7: LEV saved_bp byte 3
+    ("layer15_alu_high_byte_relay",                    8),  # head 8: wide-ALU staged byte 1 relay (l14_ops owns spec)
+    ("layer15_memory_lookup.pop_d8_to_e0",             9),  # head 9: post-pop one-word pushed result lookup (num_heads>9)
+    ("layer15_memory_lookup.lev_return_addr_h10",      10),  # head 10: LEV return_addr byte 2
+    ("layer15_memory_lookup.lev_return_addr_h11",      11),  # head 11: LEV return_addr byte 3
+    ("layer15_store_stack0_sp_byte0_addr",             12),  # head 12: SI/SC store-top SP byte0 -> ADDR_B0
+    ("layer15_si_mem_addr0_from_stack0",               13),  # head 13: SI/SC MEM addr0 from pre-store STACK0 byte0
+)
+_L15_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L15_HEAD_LAYOUT}
+
+
+def _allocate_layer15_attention_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with all L15 heads.
+
+    Every entry in :data:`_L15_HEAD_LAYOUT` is pinned at its existing
+    ``head_idx`` so the underlying primitive calls -- which still write
+    the same weights to the same heads via the legacy imperative helpers
+    in vm_step (for the conditional LEV / pop-group heads that vary by
+    ``attn.num_heads``) plus the declarative specs already on store_stack0
+    / si_mem_addr0 / alu_high_byte_relay -- land byte-identically.
+
+    ``layer_max_heads=14`` is the widest L15 configuration the resize op
+    produces (17-layer LEV build). Narrower builds simply leave the high
+    pins claimed-but-unused; the allocator never writes weights itself,
+    it only records the layout for collision checks and downstream
+    inspection. Stashed on ``attn._l15_head_allocator`` by both
+    ``layer15_memory_lookup`` and ``l15_attention_resize`` bakes so
+    downstream tooling can audit the layout.
+    """
+    allocator = AttentionHeadAllocator(layer_max_heads=14)
+    for name, head_idx in _L15_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=15, pin=head_idx)
+    return allocator
+
+
+def _l15_head_idx(op_name: str) -> int:
+    """Return the pinned L15 ``head_idx`` for ``op_name``.
+
+    Static lookup against :data:`_L15_HEAD_LAYOUT` for callers that
+    cannot instantiate a per-bake allocator (e.g. the head-spec
+    helpers consumed by both bake and ``compiler_ir_factory`` paths,
+    where running the collision-checked allocator on every call
+    would be wasteful). The runtime bakes still go through
+    :func:`_allocate_layer15_attention_heads` so the collision-checked
+    allocator path is exercised on every weight write.
+    """
+    try:
+        return _L15_HEAD_LAYOUT_BY_NAME[op_name]
+    except KeyError:
+        raise KeyError(
+            f"_l15_head_idx: unknown L15 attention op {op_name!r}"
+        ) from None
 
 
 # === L15 FFN unit layout (pinned offsets) ===========================
@@ -278,9 +375,39 @@ def make_nibble_copy_ffn_op() -> Operation:
 
 
 def make_layer15_memory_lookup_op() -> Operation:
-    """L15 attention: memory-lookup heads for LI/LC."""
+    """L15 attention: memory-lookup heads for LI/LC.
+
+    Phase 6 wave 2F (head-axis migration): the bake instantiates a
+    per-bake :class:`AttentionHeadAllocator` pre-loaded with the full
+    L15 head layout (see :data:`_L15_HEAD_LAYOUT`) so the
+    structurally-stable head axis is auditable without grepping for
+    ``head_idx=`` literals. The actual Q/K/V/O writes still go through
+    the legacy ``_set_layer15_memory_lookup`` helper plus
+    :func:`_suppress_l15_lookup_during_current_store_generation`
+    because both helpers branch on ``attn.num_heads`` at runtime
+    (heads 4-11 only fire on the LEV build; head 9 is wiped and
+    rewritten when ``num_heads > 9``) and that conditional shape does
+    not cleanly fit a static per-head
+    :class:`DeclarativeAttentionHeadSpec` today. A follow-up wave can
+    carve each head out into its own spec once the LEV/non-LEV head
+    set is unified.
+    """
     def bake(attn, dim_positions, S):
         from ...vm_step import _set_layer15_memory_lookup
+        # Per-bake attention-head allocator with the full L15 head
+        # layout pinned. Stashing on ``attn._l15_head_allocator`` lets
+        # downstream tooling inspect the L15 head axis without grepping
+        # for ``head_idx=`` literals; the actual weight writes still go
+        # through the legacy ``_set_layer15_memory_lookup`` helper (heads
+        # 0-3 always, plus 4-11 when ``attn.num_heads >= 12``) and the
+        # ``_suppress_l15_lookup_during_current_store_generation`` helper
+        # (heads 0-3 always, head 9 when ``attn.num_heads > 9``, and
+        # rows on heads 4-11 when present). The conditional num_heads
+        # logic in those helpers does not cleanly fit per-head
+        # ``DeclarativeAttentionHeadSpec`` shape today; the allocator
+        # records the layout so a future refactor can carve them out.
+        head_allocator = _allocate_layer15_attention_heads()
+        attn._l15_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
         proxy = _as_setdim_proxy(dim_positions)
         _set_layer15_memory_lookup(attn, S, proxy, HD)
@@ -357,7 +484,11 @@ def _layer15_store_stack0_sp_byte0_addr_spec(BD) -> DeclarativeAttentionHeadSpec
         o.append(AO(BD.ADDR_B0_LO + idx, 1 + idx, 3.0))
         o.append(AO(BD.ADDR_B0_HI + idx, 17 + idx, 3.0))
     return DeclarativeAttentionHeadSpec(
-        head_idx=12,
+        # Pull the head index from the shared L15 layout rather than
+        # baking in a ``head_idx=12`` literal here. Both the bake and IR
+        # paths consult the same source of truth, so renumbering the
+        # layout in one place stays consistent across every consumer.
+        head_idx=_l15_head_idx("layer15_store_stack0_sp_byte0_addr"),
         q=q,
         k=k,
         v=tuple(v),
@@ -451,7 +582,11 @@ def _layer15_si_mem_addr0_from_stack0_spec(BD) -> DeclarativeAttentionHeadSpec:
         o.append(AO(BD.OUTPUT_LO + idx, 1 + idx, 20.0))
         o.append(AO(BD.OUTPUT_HI + idx, 17 + idx, 20.0))
     return DeclarativeAttentionHeadSpec(
-        head_idx=13,
+        # Pull the head index from the shared L15 layout rather than
+        # baking in a ``head_idx=13`` literal here. Both the bake and IR
+        # paths consult the same source of truth, so renumbering the
+        # layout in one place stays consistent across every consumer.
+        head_idx=_l15_head_idx("layer15_si_mem_addr0_from_stack0"),
         q=q,
         k=k,
         v=tuple(v),
