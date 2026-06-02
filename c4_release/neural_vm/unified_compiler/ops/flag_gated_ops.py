@@ -72,6 +72,12 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
         declarative_authority="spec_generated",
         phase=998.8,
         migrated=True,
+        # Phase 11.A IR exposure: bake body is ``if not enable_tool_calling:
+        # return`` at the default ``enable_tool_calling=False`` config, so
+        # an empty IR is byte-identical for the default flag value.
+        # Populating IR with the 6 ``FFNRule.gated_write``s (mirroring the
+        # ``_tool_call_opcode_decode_rules`` body) is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
     )
@@ -513,6 +519,12 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
         declarative_authority="spec_generated",
         phase=998.8,
         migrated=True,
+        # Phase 11.A IR exposure: bake body is ``if not enable_tool_calling:
+        # return`` at the default ``enable_tool_calling=False`` config, so
+        # an empty IR is byte-identical for the default flag value.
+        # Populating IR with the single ``FFNRule.constant_write`` from
+        # ``_tool_call_detection_rules`` is Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
     )
