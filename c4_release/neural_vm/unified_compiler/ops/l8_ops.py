@@ -800,6 +800,68 @@ def _layer8_alu_lev_byte0_hi_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_lev_b1_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV ADDR_B1_LO[0] zero (1 unit, offset 2019).
+
+    For small addresses (< 256), bytes 1-2 of the LEV-relayed BP
+    address are zero. This unit writes ADDR_B1_LO[0] at the
+    LEV + BP marker site (no MARK_PC exclusion in legacy -- the unit
+    fires at PC marker too, which is harmless since the write target
+    is ADDR_B1_LO, not the OUTPUT bank that drives PC).
+
+    The legacy helper writes ``W_gate[unit, CONST] = 1.0`` (no
+    explicit b_gate), so we use ``FFNRule.gated_write(gate="CONST",
+    gate_weight=1.0, gate_bias=0.0)`` to reproduce the exact W_gate
+    cell write. CONST is always 1.0 at runtime so the gate value is
+    identical to the b_gate=1.0 form, but this keeps the matrix
+    byte-identical for the verifier.
+    """
+    write_scale = 2.0 / (S * 9.0)
+    return (
+        FFNRule.gated_write(
+            name="l8_alu_lev_b1",
+            conditions=(
+                ("OP_LEV", 1.0),
+                ("MARK_BP", 1.0),
+            ),
+            threshold=1.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("ADDR_B1_LO+0", write_scale),),
+            scope="OP_LEV and MARK_BP",
+            dominates_at={"ADDR_B1_LO+0": "OP_LEV and MARK_BP"},
+        ),
+    )
+
+
+def _layer8_alu_lev_b2_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEV ADDR_B2_LO[0] zero (1 unit, offset 2020).
+
+    Same byte-identity rationale as ``_layer8_alu_lev_b1_rules``: the
+    legacy helper writes ``W_gate[unit, CONST] = 1.0``, so the rule
+    uses ``FFNRule.gated_write(gate="CONST", gate_weight=1.0,
+    gate_bias=0.0)``.
+    """
+    write_scale = 2.0 / (S * 9.0)
+    return (
+        FFNRule.gated_write(
+            name="l8_alu_lev_b2",
+            conditions=(
+                ("OP_LEV", 1.0),
+                ("MARK_BP", 1.0),
+            ),
+            threshold=1.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("ADDR_B2_LO+0", write_scale),),
+            scope="OP_LEV and MARK_BP",
+            dominates_at={"ADDR_B2_LO+0": "OP_LEV and MARK_BP"},
+        ),
+    )
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
