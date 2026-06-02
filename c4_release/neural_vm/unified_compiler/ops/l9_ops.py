@@ -680,6 +680,97 @@ def _layer9_bp_plus8_shift_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
+    """``ADDR_B1`` 0xff set + BP=0xfff8 cascade fixup (6 units).
+
+    Six contiguous units that finish setting up the LEV return-address
+    bytes at the PC marker:
+
+      * Unit 0 (``addr_b1_lo_set``) -- unconditional ``ADDR_B1_LO[15] = 1``
+        (byte 1 = 0xff for stack-address pages). Constant gate on
+        ``CONST`` (``W_gate[CONST]=1``) with ``b_gate=0``.
+      * Unit 1 (``addr_b1_hi_set``) -- mirror unit writing
+        ``ADDR_B1_HI[15] = 1``.
+      * Units 2-5 (``cascade_b0_hi``, ``cascade_b1_lo``, ``cascade_b1_hi``,
+        ``cascade_b2_lo``) -- fire only when ``ADDR_B0_LO[0]`` AND
+        ``ADDR_B0_HI[15]`` are both high (the post-shift fingerprint of
+        BP=0xf8). They cancel the just-set 0xff bytes and stamp the
+        carried 0x10000 address (b0_hi[0], b1_lo[0], b1_hi[0],
+        b2_lo[1]). The 2-way gate is implemented with
+        ``gate="ADDR_B0_LO+0"`` plus a ``gate_terms`` entry for
+        ``ADDR_B0_HI+15`` and ``gate_bias=-15.0`` so the AND threshold is
+        only crossed in the cascade case.
+    """
+
+    common_conditions = (
+        ("MARK_PC", 1.0),
+        ("OP_LEV", 1.0 / 5.0),
+        ("MARK_BP", -10.0),
+        ("MARK_SP", -10.0),
+    )
+    threshold = 1.5
+
+    rules: list[FFNRule] = []
+
+    # Unit 0: ADDR_B1_LO[15] = 1 (byte 1 = 0xff lo nibble).
+    rules.append(FFNRule.gated_write(
+        name="l9_addr_b1_lo_set",
+        conditions=common_conditions,
+        threshold=threshold,
+        gate="CONST",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        writes=(("ADDR_B1_LO+15", 0.22 / S),),
+    ))
+
+    # Unit 1: ADDR_B1_HI[15] = 1 (byte 1 = 0xff hi nibble).
+    rules.append(FFNRule.gated_write(
+        name="l9_addr_b1_hi_set",
+        conditions=common_conditions,
+        threshold=threshold,
+        gate="CONST",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        writes=(("ADDR_B1_HI+15", 0.22 / S),),
+    ))
+
+    # Units 2-5: BP=0xf8 cascade. Gate is a 2-way AND over
+    # ADDR_B0_LO[0] (post-shift high signal) and ADDR_B0_HI[15] (BP top
+    # nibble) with b_gate=-15.0 so legitimate BP=0xf8 fires (LO[0]~15,
+    # HI[15]~3 -> 18 - 15 = 3 > 0) while BP=0xf0 does not (LO[0]~0).
+    cascade_writes: tuple[tuple[str, tuple[tuple[str, float], ...]], ...] = (
+        # (rule_suffix, writes)
+        ("cascade_b0_hi", (
+            ("ADDR_B0_HI+15", -0.67 / S),
+            ("ADDR_B0_HI+0",   0.67 / S),
+        )),
+        ("cascade_b1_lo", (
+            ("ADDR_B1_LO+15", -0.5 / S),
+            ("ADDR_B1_LO+0",  0.5 / S),
+        )),
+        ("cascade_b1_hi", (
+            ("ADDR_B1_HI+15", -0.5 / S),
+            ("ADDR_B1_HI+0",  0.5 / S),
+        )),
+        ("cascade_b2_lo", (
+            ("ADDR_B2_LO+1", 0.67 / S),
+        )),
+    )
+    for suffix, writes in cascade_writes:
+        rules.append(FFNRule.gated_write(
+            name=f"l9_{suffix}",
+            conditions=common_conditions,
+            threshold=threshold,
+            gate="ADDR_B0_LO+0",
+            gate_weight=1.0,
+            gate_terms=(("ADDR_B0_HI+15", 1.0),),
+            gate_bias=-15.0,
+            writes=writes,
+        ))
+
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 

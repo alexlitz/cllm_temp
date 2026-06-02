@@ -252,6 +252,19 @@ def test_layer9_bp_plus8_shift_rules_match_legacy():
     _compare_symbolic_to_lowered(rules)
 
 
+def test_layer9_addr_b1_set_and_cascade_rules_match_legacy():
+    """ADDR_B1 set + BP=0xfff8 cascade lowers byte-identically at unit 3392."""
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
+        _layer9_addr_b1_set_and_cascade_rules,
+    )
+
+    rules = _layer9_addr_b1_set_and_cascade_rules(100.0)
+    # 1 (B1_LO) + 1 (B1_HI) + 4 cascade = 6.
+    assert len(rules) == 6
+    _assert_unit_range_matches_legacy(rules, start_unit=3392, n_units=6)
+    _compare_symbolic_to_lowered(rules)
+
+
 def test_layer9_lea_adj_ent_fetch_gates_use_one_hot_scale():
     ffn = _StubFFN()
     _set_layer9_alu(ffn, 100.0, _SetDim)
