@@ -2524,15 +2524,10 @@ def make_layer6_attn_op() -> Operation:
         # the AX-marker row. The same-step L3 contribution (carry_forward)
         # is still picked up at the same numeric position. Breaks
         # back-edges L8 → layer6_attn on AX_CARRY_HI.
-        # Phase 8.A targeted (LO twin): AX_CARRY_LO_PREV_STEP mirrors the HI
-        # rename above for the same set of L8 LO writers (multibyte_fetch
-        # {,_bake}, head6_ax_carry_refresh). Same numeric position; weight
-        # bake is byte-identical. Breaks back-edges L8 → layer6_attn on
-        # AX_CARRY_LO.
         reads={"OP_JMP", "OP_EXIT", "OP_JSR", "MARK_AX", "MARK_PC", "MARK_SP",
                "MARK_STACK0", "NEXT_SE", "FETCH_LO", "FETCH_HI",
                "PSH_AT_SP", "OP_PSH", "OP_ADJ", "OP_ENT", "OP_LEV",
-               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP"},
+               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP"},
         writes={"CMP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         layer_idx=6,
