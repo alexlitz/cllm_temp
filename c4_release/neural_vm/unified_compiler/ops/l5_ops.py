@@ -381,7 +381,6 @@ def make_layer5_fetch_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer5_fetch_dep_anchor",
-        phase=5,
         reads={"MARK_PC", "MARK_AX", "HAS_SE",
                "FETCH_LO", "FETCH_HI", "EMBED_LO", "EMBED_HI",
                "ADDR_KEY", "CONST", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
