@@ -1637,6 +1637,7 @@ def make_layer16_lev_routing_op() -> Operation:
 
     return Operation(
         name="layer16_lev_routing",
+        phase=16,
         reads={"MARK_SP", "MARK_PC", "MARK_AX", "OP_ENT", "OP_LEV", "OP_IMM",
                "OP_EXIT", "OP_JMP", "OP_SI", "OP_SC", "OP_LC_RELAY",
                "ADDR_B0_LO", "ADDR_B0_HI", "MEM_ADDR_SRC",

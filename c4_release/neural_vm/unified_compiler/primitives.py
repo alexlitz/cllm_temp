@@ -76,6 +76,33 @@ class DeclarativeAttentionHeadSpec:
     v: Tuple[AttentionProjectionWrite, ...] = field(default_factory=tuple)
     o: Tuple[AttentionOutputWrite, ...] = field(default_factory=tuple)
     alibi_slope: Optional[float] = None
+    # Phase 8.O.2 GQA: number of consecutive Q-head indices that share
+    # this spec's K/V projections. Default ``1`` = vanilla MHA (each Q
+    # head has its own K/V row block) — byte-identical with every
+    # pre-8.O.2 baseline. ``group_size > 1`` declares GQA: K/V rows
+    # land at ``(head_idx // group_size) * HD`` rather than
+    # ``head_idx * HD``. Q and O rows still land at ``head_idx * HD``.
+    # The downstream ``attn`` module must size ``W_k`` / ``W_v`` to
+    # ``num_kv_heads * HD`` for the GQA path to lower cleanly.
+    # ``group_size=1`` is byte-identical with MHA (``head_idx // 1 ==
+    # head_idx``). Mixtral target: 32 Q, 8 KV => 4.
+    group_size: int = 1
+
+    @property
+    def kv_head_idx(self) -> int:
+        """KV-head index = ``head_idx // group_size`` (Phase 8.O.2 GQA).
+
+        At ``group_size=1`` returns ``head_idx`` (byte-identical with
+        MHA). At larger group sizes consecutive Q heads share a single
+        KV-head slot — the canonical GQA grouping.
+        """
+        gs = int(self.group_size)
+        if gs <= 0:
+            raise ValueError(
+                "DeclarativeAttentionHeadSpec: group_size must be >= 1 "
+                f"(got {self.group_size!r})"
+            )
+        return int(self.head_idx) // gs
 
 
 @dataclass(frozen=True)
@@ -123,13 +150,19 @@ class Primitives:
         the legacy behaviour.
         """
 
+        # Phase 8.O.2 GQA: Q and O rows land at ``head_idx * HD``;
+        # K and V rows land at ``kv_head_idx * HD =
+        # (head_idx // group_size) * HD``. At ``group_size=1`` (the
+        # default) the two bases coincide, so the writes are byte-
+        # identical with the pre-8.O.2 MHA path.
         base = spec.head_idx * HD
+        kv_base = spec.kv_head_idx * HD
         for write in spec.q:
             attn.W_q.data[base + write.slot, write.dim] = write.weight
         for write in spec.k:
-            attn.W_k.data[base + write.slot, write.dim] = write.weight
+            attn.W_k.data[kv_base + write.slot, write.dim] = write.weight
         for write in spec.v:
-            attn.W_v.data[base + write.slot, write.dim] = write.weight
+            attn.W_v.data[kv_base + write.slot, write.dim] = write.weight
         for write in spec.o:
             attn.W_o.data[write.out_dim, base + write.slot] = write.weight
         if spec.alibi_slope is not None:

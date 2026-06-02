@@ -64,6 +64,7 @@ def make_layer5_user_input_gather_op(enable: bool = False) -> Operation:
 
     return Operation(
         name="layer5_user_input_gather",
+        phase=5.7,
         # Phase 1 declares empty reads/writes since the bake body is a no-op.
         # Phase 2 will populate with MARK_USER_INPUT_START/END, OP_GETCHAR,
         # MARK_AX, IS_BYTE, EMBED_LO/HI -> STDIN_BYTE_LO/HI.
