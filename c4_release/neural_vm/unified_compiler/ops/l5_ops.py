@@ -158,7 +158,6 @@ def make_layer5_fetch_op() -> Operation:
                 "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
         kind="block",
         layer_idx=5,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer5_fetch_ir,
         migrated=True,
@@ -496,7 +495,6 @@ def make_opcode_decode_ffn_op() -> Operation:
                 "TEMP"},  # JSR writes IS_JSR to TEMP[0]
         kind="block",
         layer_idx=5,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir=_opcode_decode_ffn_ir(),
         migrated=True,
