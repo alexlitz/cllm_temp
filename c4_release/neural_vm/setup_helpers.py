@@ -45,10 +45,7 @@ from .setup_helpers_l6 import (
     _set_tool_call_detection,
     _set_tool_call_relay_head,
 )
-from .setup_helpers_l7 import (
-    _set_convo_io_prtf_capture,
-    _set_layer7_operand_gather,
-)
+from .setup_helpers_l7 import _set_convo_io_prtf_capture
 from .setup_helpers_l9 import (
     _set_layer9_lev_addr_relay,
     _set_layer9_lev_bp_to_pc_relay,
@@ -152,7 +149,6 @@ __all__ = [
     "_set_layer1_ffn",
     "_set_layer2_mem_byte_flags",
     "_set_layer5_fetch",
-    "_set_layer7_operand_gather",
     "_set_layer9_lev_addr_relay",
     "_set_layer9_lev_bp_to_pc_relay",
     "_set_null_terminator_detection",
