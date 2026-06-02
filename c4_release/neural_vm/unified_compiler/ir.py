@@ -342,6 +342,28 @@ class AttentionOp:
     def runtime_fragments(self) -> Tuple["RuntimeAttentionFragment", ...]:
         return tuple(self.fragments)
 
+    def shape(self) -> Tuple[int, int]:
+        """Return ``(num_q_heads, num_kv_heads)`` (Phase 8.O.2 GQA).
+
+        Computed from the registered :class:`AttentionHeadIR` specs:
+
+        * ``num_q_heads = max(spec.head_idx)+1`` across all rules — the
+          Q-row footprint the lowered ``attn.W_q`` needs.
+        * ``num_kv_heads = max(spec.kv_head_idx)+1`` across all rules —
+          the K/V-row footprint the lowered ``attn.W_k`` / ``W_v`` needs.
+
+        At ``group_size=1`` (every spec's default) the two counts are
+        equal and the lowering site stays byte-identical with vanilla
+        MHA. With ``group_size > 1`` (GQA) the K/V count shrinks.
+
+        Empty op (``rules=()``) returns ``(0, 0)``.
+        """
+        if not self.rules:
+            return (0, 0)
+        max_q = max(int(h.spec.head_idx) for h in self.rules)
+        max_kv = max(int(h.spec.kv_head_idx) for h in self.rules)
+        return (max_q + 1, max_kv + 1)
+
 
 @dataclass(frozen=True)
 class AttentionHeadIR:
