@@ -2752,6 +2752,57 @@ def make_layer6_ffn_dep_anchor_op() -> Operation:
     )
 
 
+def make_layer6_attn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer6_attn`` / ``layer6_relay_heads``: declares
+    mirrored reads/writes so the LayerCompiler's dep graph reserves an L6
+    attn slot for both topology-anchor ops to co-locate.
+
+    Mirrors ``_layer13_attn_dep_anchor`` / ``_layer14_attn_dep_anchor``:
+    the actual weight bake happens in ``layer6_attn_bake`` /
+    ``layer6_relay_heads_bake`` (kind="model"); this op's bake is a no-op.
+
+    V4 final structural holdout: lets ``layer6_attn`` and
+    ``layer6_relay_heads`` declare
+    ``requires={"same_layer_as": "_layer6_attn_dep_anchor"}`` (kind="attn"
+    cannot use ``target_op_name`` -- that field is block-op-only) and drop
+    their ``layer_idx=6`` literals. ``requires["after"]`` pins the anchor
+    strictly past the L5 fetch dep anchor so its earliest landable layer
+    is L6 (where it co-locates with ``layer8_multibyte_fetch``,
+    kind="attn", phase=None, via the same-kind same-phase slot share).
+    """
+    def bake(attn, dim_positions, S):
+        # No-op: actual bakes are in ``layer6_attn_bake`` /
+        # ``layer6_relay_heads_bake`` (kind="model").
+        return
+
+    return Operation(
+        name="_layer6_attn_dep_anchor",
+        # phase=None matches the existing L6 attn slot occupant
+        # (``layer8_multibyte_fetch``, phase=None), so the slot
+        # allocator co-locates this anchor at L6.
+        # Mirrored subset of ``layer6_attn`` / ``layer6_relay_heads``
+        # reads/writes, with the AX_CARRY_LO/HI reads kept as
+        # ``.*.-1`` SSA cross-step aliases (matching the consumers'
+        # own form) so a same-step writer at L6 cannot push this
+        # anchor's earliest landable layer past L6.
+        reads={"MARK_AX", "MARK_PC", "MARK_SP", "MARK_STACK0",
+               "OP_JMP", "OP_EXIT", "OP_JSR", "OP_LEV",
+               "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1"},
+        writes={"CMP", "ALU_LO", "ALU_HI"},
+        kind="attn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        # Pin strictly after ``_layer5_fetch_dep_anchor`` so the
+        # earliest landable layer is one past L5, i.e. L6.
+        requires={"after": "_layer5_fetch_dep_anchor"},
+        smoke_tests=set(),
+        spec_section=None,
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
+    )
+
+
 def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
     """L6 FFN: correct ENT's SP byte 0 after the preceding JSR stack push."""
 
@@ -3206,6 +3257,17 @@ def _layer6_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     for k in range(16):
         h6_v.append(AP(8 + k, BD.AX_CARRY_LO + k, 1.0))
         h6_o.append(AO(BD.ALU_LO + k, 8 + k, 1.0))
+    # OPCODE_BYTE_HI spillover from head 5 (Phase 8.I V1 collapse).
+    # Legacy bake wrote ``attn.W_v[5*HD + 51 + k, OPCODE_BYTE_HI + k]``
+    # for k=0..15 via flat row indexing; with HD=64 the k=13/14/15 cells
+    # silently spilled into head 6 slots 0/1/2. They coexist with head 6's
+    # own slot-0/1/2 V writes (OP_LEV/OP_PSH/OP_ADJ) and O writes
+    # (CMP/PSH_AT_SP, CMP+1) -- different (row, col) cells of W_v / W_o.
+    # Migrated here from ``layer6_attn_bake``'s bake_fn residual.
+    for k in range(13, 16):
+        slot = k - 13
+        h6_v.append(AP(slot, BD.OPCODE_BYTE_HI + k, 1.0))
+        h6_o.append(AO(BD.OPCODE_BYTE_HI + k, slot, 1.0))
     specs.append(DeclarativeAttentionHeadSpec(
         head_idx=_L6_HEAD_LAYOUT_BY_NAME["layer6_relay_heads_bake.psh_ax_carry_lo"],
         q=h6_q,

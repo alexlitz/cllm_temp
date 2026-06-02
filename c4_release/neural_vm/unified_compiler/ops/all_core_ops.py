@@ -133,6 +133,7 @@ def all_core_ops(
         make_layer5_user_input_gather_op(enable=False),
         make_opcode_decode_ffn_op(),
         make_opcode_decode_ffn_dep_anchor_op(),
+        make_layer6_attn_dep_anchor_op(),
         make_layer6_attn_op(),
         make_layer6_routing_ffn_op(),
         make_layer6_ffn_dep_anchor_op(),
