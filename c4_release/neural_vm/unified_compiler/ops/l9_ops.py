@@ -79,23 +79,29 @@ def _l9_head_idx(op_name: str) -> int:
     raise KeyError(f"_l9_head_idx: unknown L9 attention op {op_name!r}")
 
 
-# === L9 FFN unit layout (pinned offsets) ============================
+# === L9 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
 #
 # The ``layer9_alu`` op owns the entire L9 FFN. The actual weight writes
 # happen inside ``vm_step._set_layer9_alu`` + ``_set_layer9_marker_suppress``,
 # which use a local ``unit = 0`` counter that increments through 3405
-# sub-stages. Migration to :class:`FFNUnitAllocator` keeps those helpers
-# byte-identical -- we just declare each sub-stage's range at its existing
-# pinned offset so the layout is auditable rather than implicit. Adding a new
-# L9 op family later will go through ``allocator.alloc(name, n)`` without a
-# pin, and the allocator will pick the first free gap below 3405 (or above).
+# sub-stages.
+#
+# Phase 7.B.4: every entry below is auto-placed by
+# :class:`FFNUnitAllocator` first-fit. Because the layout is fully
+# contiguous in declaration order (every entry starts exactly where
+# the previous one ended), first-fit reproduces the legacy pinned
+# offsets bit-for-bit. The underlying ``_set_layer9_alu`` helper /
+# ``Primitives.lower_ffn_rules`` cursor positions the actual weight
+# writes, so byte-identity with the legacy bake is preserved
+# regardless of allocator order. The ``legacy_start`` column is
+# documentation only.
 #
 # The offsets below mirror the unit-counter walk in
 # ``vm_step._set_layer9_alu`` (carry/borrow doubled inner loops) followed by
 # ``_set_layer9_marker_suppress`` (7 NEXT_* dims). Changing any helper's
 # unit count requires updating this table in lock-step.
 _L9_ALU_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     ("layer9_alu.add_hi_nibble",         0, 512),  # ADD hi nibble (carry x 256)
     ("layer9_alu.lea_hi_nibble",       512, 512),  # LEA hi nibble (carry x 256)
     ("layer9_alu.adj_hi_nibble",      1024, 512),  # ADJ hi nibble (carry x 256)
@@ -123,20 +129,27 @@ _L9_ALU_UNIT_LAYOUT = (
 def _allocate_layer9_alu_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L9 ALU sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the underlying
-    ``vm_step._set_layer9_alu`` helper -- which writes via its own
-    monotonic ``unit = 0`` counter -- lands on exactly the same hidden-unit
-    indices it always has. This call is byte-identical bookkeeping: the
-    allocator declares ranges by name, the helper writes the weights. A
-    future refactor can split the monolithic helper into per-range bake
-    functions that consume ``allocator.alloc(...)`` directly.
+    Phase 7.B.4: ``pin=`` is dropped from every entry in
+    :data:`_L9_ALU_UNIT_LAYOUT`. The allocator's default first-fit
+    strategy walks the layout in declaration order and lands each
+    sub-stage at the lowest free gap large enough to hold it. Because
+    the layout is fully contiguous (every entry starts exactly where
+    the previous one ended), first-fit reproduces the legacy pinned
+    offsets bit-for-bit. The underlying ``vm_step._set_layer9_alu``
+    helper -- which writes via its own monotonic ``unit = 0`` counter --
+    lands on exactly the same hidden-unit indices regardless of
+    allocator order, so byte-identity with the legacy bake is
+    preserved. The allocator's role is bookkeeping: the layout declares
+    ranges by name, the helper writes the weights. A future refactor
+    can split the monolithic helper into per-range bake functions that
+    consume ``allocator.alloc(...)`` directly.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L9 op claims a free range past unit 3405).
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L9_ALU_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L9_ALU_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
