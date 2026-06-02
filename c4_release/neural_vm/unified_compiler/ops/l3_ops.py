@@ -740,8 +740,8 @@ def make_layer3_ffn_op() -> Operation:
         # because EMBED_HI_PREV_STEP aliases EMBED_HI. Breaks the
         # layer4_pc_relay → layer3_ffn back-edge on EMBED_HI.
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
-               "EMBED_LO", "EMBED_HI_PREV_STEP", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV_PREV_STEP",
+               "EMBED_LO", "EMBED_HI.*.-1", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "TEMP.*.-1", "IS_BYTE", "H1", "H4", "OP_LEV.*.-1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
@@ -1031,8 +1031,8 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         # EMBED_HI_PREV_STEP rename. Same numeric position; breaks the
         # layer4_pc_relay → _layer3_ffn_dep_anchor back-edge on EMBED_HI.
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
-               "EMBED_LO", "EMBED_HI_PREV_STEP", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV_PREV_STEP",
+               "EMBED_LO", "EMBED_HI.*.-1", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "TEMP.*.-1", "IS_BYTE", "H1", "H4", "OP_LEV.*.-1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "EMBED_LO", "EMBED_HI",
@@ -1172,7 +1172,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         # to the same numeric position because OP_LEV_PREV_STEP aliases
         # OP_LEV. Breaks back-edge L5 → layer3_carry_forward_attn on OP_LEV.
         reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
-               "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV_PREV_STEP", "HAS_SE",
+               "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV.*.-1", "HAS_SE",
                "H1", "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                # Phase 7.A.3.b: head 5 reads prev-step OUTPUT_LO via the
@@ -1199,8 +1199,8 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                # so the previous ``requires["after"]=layer16_lev_routing``
                # cycle-break is no longer needed and has been removed.
                # See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §2.1 + Phase 8.A G7.
-               "EMBED_LO", "EMBED_HI_PREV_STEP", "OUTPUT_LO_PREV_STEP",
-               "OUTPUT_HI_PREV_STEP", "CONST"},
+               "EMBED_LO", "EMBED_HI.*.-1", "OUTPUT_LO.*.-1",
+               "OUTPUT_HI.*.-1", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                 "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI",
                 "TEMP", "ADDR_KEY"},

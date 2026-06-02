@@ -216,7 +216,7 @@ def make_layer4_pc_relay_op() -> Operation:
         # position (see ``ops/shared.py:_ALIAS_OF``) so baked weight cells
         # are byte-identical.
         reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI",
-               "ADDR_KEY_PREV_STEP", "CONST"},
+               "ADDR_KEY.*.-1", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "ADDR_KEY"},  # at AX marker/bytes
         kind="block",
         declarative_bake_fn=bake,
