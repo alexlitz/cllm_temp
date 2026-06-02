@@ -1147,9 +1147,20 @@ def make_layer8_alu_op() -> Operation:
     return Operation(
         name="layer8_alu",
         phase=8.2,
-        reads={"MARK_AX", "MARK_PC", "ALU_LO", "AX_CARRY_LO", "FETCH_LO",
+        # Phase 9.B (ALU_LO SCC rename): ALU_LO -> ALU_LO.*.-1 marks the
+        # read as SSA cross-step. L10 stack0_byte_relay{,_bake} (phase 10/10.4)
+        # and L16 lev_routing (phase 16) stage ALU_LO for the NEXT step's
+        # L8 consumption; same-step fresh ALU_LO at AX_byte0 is still
+        # observed via consumes_fresh declared below. Same numeric slot
+        # via SSA alias; byte-identical bake. Breaks the 3 L10/L16 -> L8
+        # ALU_LO back-edges inside SCC #1.
+        reads={"MARK_AX", "MARK_PC", "ALU_LO.*.-1", "AX_CARRY_LO", "FETCH_LO",
                "OP_ADD", "OP_SUB", "OP_LEA",
-               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE"},
+               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+               # V2/G7 LEV detector: in-step topology edge from
+               # lev_detector_head (phase=8.06) replaces the cross-step
+               # requires["after"]=layer16_lev_routing below.
+               "PC_VIA_LEV_DETECTOR_LO"},
         writes={"OUTPUT_LO", "CARRY", "CMP_GROUP"},
         kind="block",
         declarative_bake_fn=bake,
@@ -1178,25 +1189,10 @@ def make_layer8_alu_op() -> Operation:
             # binary-op semantics for any operand A computation.
             "ALU_LO": "AX_byte0",
         },
-        # Phase 8.A SCC step 4 (ALU_LO chain): the ALU pipeline reads
-        # ALU_LO from ``layer7_operand_gather`` (same-step, fresh at AX
-        # byte 0 -- see ``consumes_fresh`` above). The L10/L16 ops that
-        # also write ALU_LO (``layer10_stack0_byte_relay{,_bake}``,
-        # ``layer16_lev_routing``) stage the band for the NEXT step's
-        # residual; without an explicit prev-step marker the scheduler
-        # interprets every L10+ ALU_LO writer as a forward-cycle
-        # back-edge into this L8 reader. Declaring
-        # ``requires["after"] = "layer16_lev_routing"`` opts this op
-        # into the B9 R-OH-2 prev-step semantics for ALU_LO: the read
-        # is satisfied by L16's prev-step write via the KV cache, and
-        # every other L10+ writer's data-flow edge into ``layer8_alu``
-        # on ALU_LO is suppressed by ``_topological_sort``. The L7
-        # same-step producer remains the actual data source (recorded
-        # by ``consumes_fresh``) -- this declaration is the cycle-graph
-        # acknowledgement, not a data-flow change. Mirrors the
-        # ``layer8_head6_ax_carry_refresh`` pattern (L8 phase reading
-        # an L16-written band via prev-step residual).
-        requires={"after": "layer16_lev_routing"},
+        # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
+        # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
+        # is in-step producer). Previous: requires={"after":
+        # "layer16_lev_routing"}. See CONTROL_FLOW_DETECTOR_HEADS.md §2.4.
         smoke_tests={
             "TestSmokeBasic::test_add_basic",
             "TestSmokeBasic::test_sub_basic",
@@ -1249,7 +1245,12 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
     return Operation(
         name="format_position_counter",
         phase=8.5,
-        reads={"LAST_WAS_BYTE", "IO_IN_OUTPUT_MODE", "IO_FORMAT_POS"},
+        # Phase 9.B (IO_IN_OUTPUT_MODE SCC rename): IO_IN_OUTPUT_MODE ->
+        # IO_IN_OUTPUT_MODE.*.-1 marks the read as SSA cross-step. The
+        # sole writer ``null_terminator_detection`` runs at phase=10.6
+        # (AFTER this op at phase=8.5), so the read sees the prev-step
+        # residual. Same numeric slot via SSA alias.
+        reads={"LAST_WAS_BYTE", "IO_IN_OUTPUT_MODE.*.-1", "IO_FORMAT_POS"},
         writes={"IO_FORMAT_POS"},
         kind="block",
         declarative_bake_fn=bake,
