@@ -1787,6 +1787,369 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
     )
 
 
+# ---------------------------------------------------------------------------
+# layer14_addr_key_neural_decode -- FFNRule program (5 substages, 1728 units).
+#
+# Migration (Phase 6 wave 4H): the 5 imperative substages in
+# :func:`_bake_addr_key_neural_decode` are declared as ``FFNRule`` programs so
+# the compiler IR sees the same per-unit writes the imperative bake produced.
+# The substage layout, gate semantics, and per-write constants mirror the
+# imperative helper one-for-one; ``compare_symbolic_to_lowered_ffn`` validates
+# each substage byte-identically against the lowering contract.
+#
+# Substage layout (1728 units total):
+#   (1) lo+hi nibble decode     : 4 value_gates x 16 hi x 16 lo  = 1024 units
+#   (2) common top nibble       : 4 value_gates x 16 b1_lo       =   64 units
+#   (3) carry-correction top    : 4 value_gates x carry_los x 16 =   96 units
+#   (4) load-query decode       : 2 op_gates x (256 lo+hi + 16   =  544 units
+#                                 top), interleaved per op to
+#                                 preserve the legacy unit indices
+#
+# Value-byte gating mirrors the imperative ``value_gates`` table: bytes
+# 0/1/2 are selected by ``MEM_VAL_B1/B2/B3`` (the L2 autoregressive flags;
+# B1 marks the token predicting MEM value byte 0, etc.), and byte 3 is
+# selected by ``H3+4`` with ``H2+4`` blocked. The first three substages
+# use the ``W_gate[..., blocker_dim] = -1.0`` blocker pattern (a
+# ``gated_write`` with ``gate_weight=-1.0`` / ``gate_bias=1.0``) for the
+# byte-3 case and ``W_gate[..., CONST] = 0`` (a ``constant_write`` with
+# ``gate_bias=1.0``) for bytes 0/1/2 where ``blocker_dim is None``.
+# ---------------------------------------------------------------------------
+
+# (gate_dim_name, blocker_dim_name | None, byte_off)
+_ADDR_KEY_VALUE_GATES = (
+    ("MEM_VAL_B1", None, 0),
+    ("MEM_VAL_B2", None, 1),
+    ("MEM_VAL_B3", None, 2),
+    ("H3+4",       "H2+4", 3),
+)
+
+# (op_gate_name, op_label) for load-query AX substages.
+_ADDR_KEY_LOAD_QUERY_OPS = (
+    ("OP_LI_RELAY", "li"),
+    ("OP_LC_RELAY", "lc"),
+)
+
+# Carry-into-byte-1 lo values per byte_off, mirroring ``carry_los`` in the
+# imperative helper.
+_ADDR_KEY_CARRY_LOS = {
+    0: (),
+    1: (15,),
+    2: (14, 15),
+    3: (13, 14, 15),
+}
+
+
+def _addr_key_gate_kwargs(blocker_dim_name):
+    """Map (None | str) blocker to FFNRule gate / gate_bias / gate_weight.
+
+    The imperative bake sets ``ffn.b_gate[unit] = 1.0`` unconditionally and,
+    when ``blocker_dim is not None``, also ``ffn.W_gate[unit, blocker_dim]
+    = -1.0``. In FFNRule land that is either a ``constant_write`` (gate=None,
+    gate_bias=1.0) or a ``gated_write`` (gate=blocker, gate_weight=-1.0,
+    gate_bias=1.0).
+    """
+    if blocker_dim_name is None:
+        return None
+    return dict(
+        gate=blocker_dim_name,
+        gate_weight=-1.0,
+        gate_bias=1.0,
+    )
+
+
+def _addr_key_make_rule(
+    *,
+    name,
+    conditions,
+    threshold,
+    writes,
+    blocker_dim_name,
+    scope,
+):
+    """Build either ``FFNRule.constant_write`` or ``FFNRule.gated_write``
+    depending on whether ``blocker_dim_name`` is set.
+
+    ``constant_write`` mirrors the imperative ``b_gate=1.0`` (no W_gate
+    writes) form. ``gated_write`` with ``gate_weight=-1.0`` /
+    ``gate_bias=1.0`` mirrors the ``W_gate[..., blocker]=-1.0`` blocker
+    pattern used when a byte-3 case routes through ``H3+4`` with ``H2+4``
+    blocked.
+    """
+    gate_kwargs = _addr_key_gate_kwargs(blocker_dim_name)
+    if gate_kwargs is None:
+        return FFNRule.constant_write(
+            name=name,
+            conditions=conditions,
+            threshold=threshold,
+            writes=writes,
+            scope=scope,
+        )
+    return FFNRule.gated_write(
+        name=name,
+        conditions=conditions,
+        threshold=threshold,
+        writes=writes,
+        scope=scope,
+        **gate_kwargs,
+    )
+
+
+def _layer14_addr_key_neural_decode_lo_hi_rules(
+    S: float,
+) -> tuple[FFNRule, ...]:
+    """Substage 1: lo+hi nibble decode (1024 rules / 4*16*16 units).
+
+    Mirrors the first imperative loop in :func:`_bake_addr_key_neural_decode`:
+    for each ``(value_gate, hi, lo)`` combination, emit one FFN unit with a
+    3-way AND ``gate_dim + ADDR_B0_LO[lo] + ADDR_B0_HI[hi] >= 2.5`` and
+    write ``2/S`` to ``ADDR_KEY[new_lo]`` and ``ADDR_KEY[16+new_hi]`` where
+    ``new_lo = (((hi << 4) | lo) + byte_off) & 0xF`` and
+    ``new_hi = (((hi << 4) | lo) + byte_off) >> 4 & 0xF``.
+
+    Imperative writes per unit::
+
+        ffn.W_up[unit, gate_dim]            = S          # condition weight 1.0
+        ffn.W_up[unit, ADDR_B0_LO + lo]     = S          # condition weight 1.0
+        ffn.W_up[unit, ADDR_B0_HI + hi]     = S          # condition weight 1.0
+        ffn.b_up[unit]                      = -S * 2.5   # threshold = 2.5
+        ffn.b_gate[unit]                    = 1.0        # constant gate
+        if blocker_dim is not None:
+            ffn.W_gate[unit, blocker_dim]   = -1.0       # H2+4 blocker for byte 3
+        ffn.W_down[ADDR_KEY + new_lo, unit]      = 2.0 / S
+        ffn.W_down[ADDR_KEY + 16 + new_hi, unit] = 2.0 / S
+    """
+    rules: list[FFNRule] = []
+    for gate_dim_name, blocker_dim_name, byte_off in _ADDR_KEY_VALUE_GATES:
+        for hi in range(16):
+            for lo in range(16):
+                byte_addr = ((hi << 4) | lo) + byte_off
+                new_lo = byte_addr & 0xF
+                new_hi = (byte_addr >> 4) & 0xF
+                rules.append(_addr_key_make_rule(
+                    name=(
+                        f"l14_addr_key_lohi_off{byte_off}_hi{hi:x}_lo{lo:x}"
+                    ),
+                    conditions=(
+                        (gate_dim_name, 1.0),
+                        (f"ADDR_B0_LO+{lo}", 1.0),
+                        (f"ADDR_B0_HI+{hi}", 1.0),
+                    ),
+                    threshold=2.5,
+                    writes=(
+                        (f"ADDR_KEY+{new_lo}", 2.0 / S),
+                        (f"ADDR_KEY+{16 + new_hi}", 2.0 / S),
+                    ),
+                    blocker_dim_name=blocker_dim_name,
+                    scope=None,
+                ))
+    return tuple(rules)
+
+
+def _layer14_addr_key_neural_decode_top_common_rules(
+    S: float,
+) -> tuple[FFNRule, ...]:
+    """Substage 2: common-case top nibble (64 rules / 4*16 units).
+
+    Mirrors the second imperative loop: emit one FFN unit per
+    ``(value_gate, b1_lo)`` that writes ``ADDR_B1_LO[b1_lo]`` straight into
+    ``ADDR_KEY[32 + b1_lo]`` whenever the value-byte gate fires and
+    ``ADDR_B1_LO[b1_lo]`` is hot (a 2-way AND with threshold 1.5).
+
+    Imperative writes per unit::
+
+        ffn.W_up[unit, gate_dim]            = S          # condition weight 1.0
+        ffn.W_up[unit, ADDR_B1_LO + b1_lo]  = S          # condition weight 1.0
+        ffn.b_up[unit]                      = -S * 1.5   # threshold = 1.5
+        ffn.b_gate[unit]                    = 1.0        # constant gate
+        if blocker_dim is not None:
+            ffn.W_gate[unit, blocker_dim]   = -1.0       # H2+4 blocker for byte 3
+        ffn.W_down[ADDR_KEY + 32 + b1_lo, unit] = 2.0 / S
+    """
+    rules: list[FFNRule] = []
+    for gate_dim_name, blocker_dim_name, byte_off in _ADDR_KEY_VALUE_GATES:
+        for b1_lo in range(16):
+            rules.append(_addr_key_make_rule(
+                name=(
+                    f"l14_addr_key_top_common_off{byte_off}_b1lo{b1_lo:x}"
+                ),
+                conditions=(
+                    (gate_dim_name, 1.0),
+                    (f"ADDR_B1_LO+{b1_lo}", 1.0),
+                ),
+                threshold=1.5,
+                writes=(
+                    (f"ADDR_KEY+{32 + b1_lo}", 2.0 / S),
+                ),
+                blocker_dim_name=blocker_dim_name,
+                scope=None,
+            ))
+    return tuple(rules)
+
+
+def _layer14_addr_key_neural_decode_top_carry_rules(
+    S: float,
+) -> tuple[FFNRule, ...]:
+    """Substage 3: carry-correction top nibble (96 rules total).
+
+    Mirrors the third imperative loop: when ``hi == 15`` and
+    ``lo + byte_off >= 16`` the high-byte adder carries, so the top nibble
+    must be ``b1_lo + 1`` instead of ``b1_lo``. Each FFN unit cancels the
+    substage-2 ``+2/S`` at ``ADDR_KEY[32+b1_lo]`` and adds ``+2/S`` at
+    ``ADDR_KEY[32+((b1_lo+1)&0xF)]``. The trigger is a 4-way AND:
+    ``gate_dim + ADDR_B0_HI[15] + ADDR_B0_LO[lo] + ADDR_B1_LO[b1_lo] >= 3.5``.
+
+    Imperative writes per unit::
+
+        ffn.W_up[unit, gate_dim]            = S          # condition weight 1.0
+        ffn.W_up[unit, ADDR_B0_HI + 15]     = S          # condition weight 1.0
+        ffn.W_up[unit, ADDR_B0_LO + lo]     = S          # condition weight 1.0
+        ffn.W_up[unit, ADDR_B1_LO + b1_lo]  = S          # condition weight 1.0
+        ffn.b_up[unit]                      = -S * 3.5   # threshold = 3.5
+        ffn.b_gate[unit]                    = 1.0        # constant gate
+        if blocker_dim is not None:
+            ffn.W_gate[unit, blocker_dim]   = -1.0       # H2+4 blocker for byte 3
+        ffn.W_down[ADDR_KEY + 32 + b1_lo, unit]              = -2.0 / S
+        ffn.W_down[ADDR_KEY + 32 + ((b1_lo + 1) & 0xF), unit] =  2.0 / S
+    """
+    rules: list[FFNRule] = []
+    for gate_dim_name, blocker_dim_name, byte_off in _ADDR_KEY_VALUE_GATES:
+        for lo in _ADDR_KEY_CARRY_LOS[byte_off]:
+            for b1_lo in range(16):
+                top_next = (b1_lo + 1) & 0xF
+                rules.append(_addr_key_make_rule(
+                    name=(
+                        f"l14_addr_key_top_carry_off{byte_off}"
+                        f"_lo{lo:x}_b1lo{b1_lo:x}"
+                    ),
+                    conditions=(
+                        (gate_dim_name, 1.0),
+                        ("ADDR_B0_HI+15", 1.0),
+                        (f"ADDR_B0_LO+{lo}", 1.0),
+                        (f"ADDR_B1_LO+{b1_lo}", 1.0),
+                    ),
+                    threshold=3.5,
+                    writes=(
+                        (f"ADDR_KEY+{32 + b1_lo}", -2.0 / S),
+                        (f"ADDR_KEY+{32 + top_next}",  2.0 / S),
+                    ),
+                    blocker_dim_name=blocker_dim_name,
+                    scope=None,
+                ))
+    return tuple(rules)
+
+
+def _layer14_addr_key_neural_decode_load_query_rules(
+    S: float,
+) -> tuple[FFNRule, ...]:
+    """Substages 4+5: load-query AX-marker decode (544 rules).
+
+    Mirrors the fourth+fifth imperative loops, which interleave per
+    op_gate: for each of ``(OP_LI_RELAY, OP_LC_RELAY)`` the imperative
+    first emits 256 lo+hi units, then 16 top-nibble units, before moving
+    to the next op. The per-op block layout therefore is::
+
+        unit  0..255 : OP_LI_RELAY * 16 hi * 16 lo  (lo+hi nibbles)
+        unit 256..271: OP_LI_RELAY * 16 b1_lo       (top nibble)
+        unit 272..527: OP_LC_RELAY * 16 hi * 16 lo  (lo+hi nibbles)
+        unit 528..543: OP_LC_RELAY * 16 b1_lo       (top nibble)
+
+    No blocker is used in either sub-block; the gate is the constant
+    ``b_gate=1.0`` form (``constant_write``).
+
+    Per-unit imperative writes (lo+hi sub-block)::
+
+        ffn.W_up[unit, op_gate]              = S          # condition weight 1.0
+        ffn.W_up[unit, MARK_AX]              = S          # condition weight 1.0
+        ffn.W_up[unit, ADDR_B0_LO + lo]      = S          # condition weight 1.0
+        ffn.W_up[unit, ADDR_B0_HI + hi]      = S          # condition weight 1.0
+        ffn.b_up[unit]                       = -S * 3.5   # threshold = 3.5
+        ffn.b_gate[unit]                     = 1.0        # constant gate
+        ffn.W_down[ADDR_KEY + lo, unit]      = 2.0 / S
+        ffn.W_down[ADDR_KEY + 16 + hi, unit] = 2.0 / S
+
+    Per-unit imperative writes (top-nibble sub-block)::
+
+        ffn.W_up[unit, op_gate]              = S          # condition weight 1.0
+        ffn.W_up[unit, MARK_AX]              = S          # condition weight 1.0
+        ffn.W_up[unit, ADDR_B1_LO + b1_lo]   = S          # condition weight 1.0
+        ffn.b_up[unit]                       = -S * 2.5   # threshold = 2.5
+        ffn.b_gate[unit]                     = 1.0        # constant gate
+        ffn.W_down[ADDR_KEY + 32 + b1_lo, unit] = 2.0 / S
+        if b1_lo != 0:
+            ffn.W_down[ADDR_KEY + 32, unit] = -2.0 / S
+    """
+    rules: list[FFNRule] = []
+    for op_gate_name, op_label in _ADDR_KEY_LOAD_QUERY_OPS:
+        # --- (a) lo+hi nibble units (256 per op) ---
+        for hi in range(16):
+            for lo in range(16):
+                rules.append(_addr_key_make_rule(
+                    name=(
+                        f"l14_addr_key_lq_lohi_{op_label}"
+                        f"_hi{hi:x}_lo{lo:x}"
+                    ),
+                    conditions=(
+                        (op_gate_name, 1.0),
+                        ("MARK_AX", 1.0),
+                        (f"ADDR_B0_LO+{lo}", 1.0),
+                        (f"ADDR_B0_HI+{hi}", 1.0),
+                    ),
+                    threshold=3.5,
+                    writes=(
+                        (f"ADDR_KEY+{lo}", 2.0 / S),
+                        (f"ADDR_KEY+{16 + hi}", 2.0 / S),
+                    ),
+                    blocker_dim_name=None,
+                    scope=None,
+                ))
+        # --- (b) top nibble units (16 per op) ---
+        for b1_lo in range(16):
+            writes: list[tuple[str, float]] = [
+                (f"ADDR_KEY+{32 + b1_lo}", 2.0 / S),
+            ]
+            if b1_lo != 0:
+                writes.append(("ADDR_KEY+32", -2.0 / S))
+            rules.append(_addr_key_make_rule(
+                name=(
+                    f"l14_addr_key_lq_top_{op_label}_b1lo{b1_lo:x}"
+                ),
+                conditions=(
+                    (op_gate_name, 1.0),
+                    ("MARK_AX", 1.0),
+                    (f"ADDR_B1_LO+{b1_lo}", 1.0),
+                ),
+                threshold=2.5,
+                writes=tuple(writes),
+                blocker_dim_name=None,
+                scope=None,
+            ))
+    return tuple(rules)
+
+
+def _layer14_addr_key_neural_decode_rules(
+    S: float,
+) -> tuple[FFNRule, ...]:
+    """All five substages chained into one 1728-rule FFN program.
+
+    Order mirrors the imperative substage order in
+    :func:`_bake_addr_key_neural_decode` exactly so the unit indices line
+    up cell-for-cell with the legacy bake (validated by
+    ``compare_symbolic_to_lowered_ffn``).
+    """
+    return (
+        *_layer14_addr_key_neural_decode_lo_hi_rules(S),
+        *_layer14_addr_key_neural_decode_top_common_rules(S),
+        *_layer14_addr_key_neural_decode_top_carry_rules(S),
+        *_layer14_addr_key_neural_decode_load_query_rules(S),
+    )
+
+
+def _layer14_addr_key_neural_decode_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_addr_key_neural_decode_rules(S))
+    return ir
+
+
 def _bake_addr_key_neural_decode(ffn, dim_positions, S, start_unit=0):
     """Bake the BLOG_SPEC.md:830 ADDR_KEY nibble decode into ``ffn``.
 
@@ -1999,11 +2362,23 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         # consumes units 0..133). Byte-identical with the legacy
         # ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_addr_key_neural_decode")
-        next_unit = _bake_addr_key_neural_decode(
-            ffn, dim_positions, S, start_unit=start_unit
+        ir = _layer14_addr_key_neural_decode_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
+
+    # ``compiler_ir`` is attached only when ``enable=True``; when
+    # disabled the bake is an explicit no-op and a non-empty
+    # ``compiler_ir`` would invite the declarations-only dispatcher to
+    # lower the rules at unit 0 outside the chain.
+    op_compiler_ir = _layer14_addr_key_neural_decode_ir() if enable else None
 
     return Operation(
         name="layer14_addr_key_neural_decode",
@@ -2016,6 +2391,7 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=op_compiler_ir,
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
