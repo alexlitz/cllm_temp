@@ -10,55 +10,6 @@ import math
 from .constants import PC_OFFSET
 
 
-def _set_layer14_temp_clear(ffn, S, BD, start_unit=0):
-    """L14 FFN: Clear TEMP at PC marker when OP_LEV is active.
-
-    BUG FIX 2026-04-16: TEMP[0] has residual value from L5/L6 attention (~2.0).
-    This causes L16 TEMP->OUTPUT routing to incorrectly boost OUTPUT_LO[0].
-
-    Solution: Subtract from TEMP[0] when OP_LEV and MARK_PC are active.
-    L15 will then write fresh values to TEMP for the return address.
-
-    Activation calculation at PC marker (S = 100, OP_LEV amplified to ~10 by L6):
-      W_up contribution from OP_LEV  = (S/10) * 10  = 100
-      W_up contribution from MARK_PC = S * 1        = 100
-      b_up                           = -S * 1.5     = -150
-      pre-silu activation            = 100 + 100 - 150 = 50 (positive: fires)
-      silu(50) ~= 50, gate(CONST=1.0) = 1.0
-      hidden = silu * gate = 50
-
-    AUDIT NOTE 2026-05-09: Effective subtraction is silu(50) * 1 * (-5/S) = -2.5,
-    not -5.0 as the original docstring claimed. With residual=2.0, TEMP[0] becomes
-    -0.5 (mild over-correction of 0.5, not -3.0). This is fine because:
-    - SiLU at downstream layers clips small negatives to ~0.
-    - Selectivity is correct: only fires when OP_LEV AND MARK_PC are both set.
-      For non-LEV opcodes, OP_LEV~=0 so pre-silu = -50, silu(-50)~=0 (no firing).
-      For LEV at non-PC positions, MARK_PC=0 so pre-silu = -50, no firing.
-    - For an exact zero-out of a 2.0 residual, set W_down to -4.0/S (delta = -2.0).
-      The current -5.0/S overshoots slightly but is empirically safe.
-
-    The earlier docstring claim "Total = 5" used S=10 in the math, but actual S=100;
-    the relative scales cancel so the firing-vs-not behavior is unchanged. The
-    only consequence is the absolute subtraction magnitude (-2.5 not -5.0).
-    """
-    unit = start_unit
-
-    # Clear TEMP[0] at PC marker when OP_LEV active
-    # Only clear TEMP[0] since that's the problematic residual
-    ffn.W_up[unit, BD.OP_LEV] = S / 10  # ~1 with OP_LEV~=10
-    ffn.W_up[unit, BD.MARK_PC] = S
-    ffn.b_up[unit] = -S * 1.5  # Fire when OP_LEV + MARK_PC
-    ffn.W_gate[unit, BD.CONST] = 1.0
-    # Effective subtraction is silu(50) * (-5/S) = -2.5 (not -5.0).
-    # Residual is ~2.0, so TEMP[0] lands at ~-0.5; safe with downstream SiLU clipping.
-    ffn.W_down[BD.TEMP + 0, unit] = -5.0 / S  # Subtract to clear residual
-    unit += 1
-
-    # Note: Don't clear other TEMP positions since L15 head 8 writes there
-    return unit
-
-
-
 def _set_layer14_clear_addsub_temp_negative_residue(ffn, S, BD, start_unit=0):
     """L14 FFN: clamp negative ADD/SUB relay residue before late tail rules.
 
@@ -116,67 +67,6 @@ def _set_layer14_add_byte1_high_zero_cleanup(ffn, S, BD, start_unit=0):
     unit += 1
 
     return unit
-
-
-
-def _set_layer14_clear_addr_key_pollution(ffn, S, BD, start_unit=0):
-    """L14 FFN: Clear ADDR_KEY pollution at non-MEM, non-marker positions.
-
-    BUG FIX 2026-04-16: ADDR_KEY dims (206-253) are aliased with ADDR_B*_HI.
-    L9 attention writes to ADDR_B*_HI for address gathering, which pollutes
-    ADDR_KEY at non-MEM positions. This causes L15 to attend to wrong positions.
-
-    Solution: Clear ADDR_KEY at positions that are:
-    - NOT MEM value bytes (MEM_VAL_B* = 0)
-    - NOT register markers where ADDR_B*_HI is needed for L15 queries
-      (PC marker for LEV return_addr, BP marker for LEV saved_bp,
-       AX marker for LI/LC, STACK0 marker for stack read)
-
-    Pattern: Fire when NOT at MEM value position AND NOT at query markers.
-    - W_up: Large negative weights for MEM_VAL_B* and MARK_* flags
-    - b_up: Positive bias (fires when no flags present)
-    - W_down: Write negative value to cancel ADDR_KEY pollution
-    """
-    unit = start_unit
-
-    # Large value to suppress firing at MEM and marker positions
-    suppress = S * 100  # When flag = 1.0, adds -100*S to activation
-
-    # Clear all 48 ADDR_KEY dims at non-MEM, non-marker positions
-    for k in range(48):  # ADDR_KEY is 48 dims (206-253)
-        # Suppress at MEM value positions (any of B0/B1/B2/B3)
-        ffn.W_up[unit, BD.MEM_VAL_B0] = -suppress
-        ffn.W_up[unit, BD.MEM_VAL_B1] = -suppress
-        ffn.W_up[unit, BD.MEM_VAL_B2] = -suppress
-        ffn.W_up[unit, BD.MEM_VAL_B3] = -suppress
-
-        # Suppress at register markers where ADDR_B*_HI is used for L15 queries
-        ffn.W_up[unit, BD.MARK_PC] = -suppress  # LEV return_addr lookup
-        ffn.W_up[unit, BD.MARK_BP] = -suppress  # LEV saved_bp lookup
-        ffn.W_up[unit, BD.MARK_AX] = -suppress  # LI/LC address lookup
-        ffn.W_up[unit, BD.MARK_STACK0] = -suppress  # Stack read
-        # FIX 2026-04-16: Also suppress at SP marker during LEV
-        # SP marker needs ADDR_B0 for SP = BP + 16 computation
-        ffn.W_up[unit, BD.MARK_SP] = -suppress
-
-        # Positive bias to fire at non-MEM, non-marker positions
-        ffn.b_up[unit] = S * 0.5
-
-        # Gate unconditionally
-        ffn.W_gate[unit, BD.CONST] = 1.0
-
-        # Write to cancel pollution and bring ADDR_KEY to 0
-        # FIX 2026-04-16: Changed from -200/S (=-100 output) to -4/S (~=-1.4 output).
-        # The original -100 clearing caused negative Q × negative K = positive score
-        # at non-target positions in L15 LEV heads. Clearing to ~0 avoids this issue
-        # while still preventing false address matches (0 × anything = 0).
-        # The pollution to clear is small (typically ~1-2 from L9 ADDR_B*_HI writes),
-        # so a small negative value is sufficient.
-        ffn.W_down[BD.ADDR_KEY + k, unit] = -4.0 / S
-        unit += 1
-
-    return unit
-
 
 
 
