@@ -281,10 +281,13 @@ class LongDivisionModule(nn.Module):
 
         # Divide-by-zero handling: keep the existing-test convention. Tests
         # skip b==0, but we still set sane defaults: q = 0xFFFFFFFF, r = a.
-        if b_is_zero.any():
-            mask = b_is_zero[:, None]  # [B, 1]
-            q_out = q_out * (1 - mask) + 15.0 * mask  # all-ones nibbles
-            rem = rem * (1 - mask) + a * mask
+        # Compute unconditionally so the trace is data-flow independent
+        # (drop the .any() short-circuit which is a tracing blocker and
+        # only an eager-mode optimization — the masked update is a no-op
+        # when b_is_zero is all zeros).
+        mask = b_is_zero[:, None]  # [B, 1]
+        q_out = q_out * (1 - mask) + 15.0 * mask  # all-ones nibbles
+        rem = rem * (1 - mask) + a * mask
 
         # Write back: SLOT_QUOTIENT and SLOT_REMAINDER per-position.
         delta = torch.zeros_like(x)

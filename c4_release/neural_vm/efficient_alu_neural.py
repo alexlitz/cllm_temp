@@ -177,7 +177,23 @@ class BDToGEConverter(nn.Module):
                 pos_idx = torch.arange(seq_len, device=x_bd.device).view(1, seq_len)
                 stack1 = x_bd[:, :, BD.STACK0_BYTE1] > 0.5
                 scores = torch.where(stack1, pos_idx, torch.full_like(pos_idx, -1))
-                latest_score, latest_idx = torch.cummax(scores, dim=1)
+                if torch.onnx.is_in_onnx_export():
+                    # ONNX has no ``cummax`` symbolic. Materialize the
+                    # running argmax via a causal mask + ArgMax/ReduceMax.
+                    # O(S^2) but purely vanilla (Where + ArgMax + ReduceMax).
+                    S = seq_len
+                    rng = torch.arange(S, device=x_bd.device)
+                    causal = (rng.view(1, S) <= rng.view(S, 1))
+                    NEG = torch.full((), -1, dtype=scores.dtype, device=x_bd.device)
+                    masked = torch.where(
+                        causal.unsqueeze(0),
+                        scores.unsqueeze(1).expand(-1, S, S),
+                        NEG.expand_as(scores.unsqueeze(1).expand(-1, S, S)),
+                    )
+                    latest_idx = masked.argmax(dim=-1)
+                    latest_score = masked.max(dim=-1).values
+                else:
+                    latest_score, latest_idx = torch.cummax(scores, dim=1)
                 gather_idx = latest_idx[:, :, None].expand(-1, -1, 16)
                 clean_lo = _clean_onehot(
                     x_bd[:, :, BD.CLEAN_EMBED_LO:BD.CLEAN_EMBED_LO + 16]
