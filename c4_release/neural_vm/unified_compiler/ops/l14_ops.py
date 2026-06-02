@@ -94,6 +94,15 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     "layer14_jsr_ax_bytes_zero":             (None,    4),  # auto-fit (Phase 6 Wave 6D)
     "layer14_lc_ax_bytes_zero":              (1866,    4),
     "layer14_alu_nocarry_ax_bytes_zero":     (1870,    4),
+    # Phase 6 Wave 7 demo: pure-declaration corrective op. ``pin=None``
+    # exercises the auto-fit path (same workflow as
+    # ``layer14_jsr_ax_bytes_zero`` above). The op's single rule is
+    # byte-identically a no-op on the live corpus -- it carries the
+    # impossible condition ``CONST=-100`` so SiLU collapses to 0 and the
+    # OUTPUT residual is unchanged -- so its sole purpose is to prove the
+    # declare-only flow end to end (declare -> byte-identity gate ->
+    # compile -> corpus check). See ``make_layer14_demo_phase6_wave7_op``.
+    "layer14_demo_phase6_wave7":             (None,    1),  # auto-fit (Phase 6 Wave 7 demo)
 }
 
 
@@ -2026,6 +2035,136 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
             "TestSmokeShift::test_shr",
         },
         spec_section="BLOG_SPEC.md#shifts",
+    )
+
+
+# === L14 Phase 6 Wave 7 demo: pure-declaration corrective op =============
+#
+# A minimal demonstration of the declarative IR vision: adding a fix is one
+# ``FFNRule`` edit; the compiler picks the layer/slot/unit (Phase 6 Wave 6D
+# ``pin=None`` auto-fit on the L14 cleanup chain); and the weights are
+# synthesised from the spec via :meth:`CompilerIR.lower_ffn`. The op is
+# byte-identically a no-op on the live corpus -- its sole rule combines an
+# impossible condition (``CONST = -100``) with a ``__never_fires__`` scope so
+# SiLU collapses to 0 and the writes (``TEMP+0`` with weight 0) leave the
+# residual unchanged. The point is the END-TO-END FLOW (declare -> byte
+# identity gate -> compile -> corpus check), not a behavioural fix.
+#
+# Per ``docs/HOW_TO_ADD_A_CORRECTIVE_OP.md``: this demo is what step 5's
+# ``compiler_ir=`` + slim ``bake_fn`` looks like in practice, and what step 7's
+# byte-identity gate (``compare_symbolic_to_lowered_ffn``) clears for a single
+# new rule.
+
+
+def _layer14_demo_phase6_wave7_rules(S: float) -> tuple[FFNRule, ...]:
+    """One :class:`FFNRule` proving the declare-only path end to end.
+
+    The rule is byte-identically a no-op:
+
+    * ``conditions=(("CONST", -100.0),)`` -- ``CONST`` is always 1.0, so the
+      pre-SiLU activation is ``-100 * S`` for every position. ``SiLU(-100*S)``
+      is numerically 0 (``-1e-200`` territory) so the unit's contribution to
+      ``W_down`` is zero.
+    * ``writes=(("TEMP+0", 0.0),)`` -- even if SiLU were nonzero, the write
+      weight is 0, so no residual cell is touched.
+    * ``scope="__never_fires__"`` -- the declared firing scope is empty, so
+      the F-7 ``verify_rule_scopes`` checker has nothing to validate against
+      the live corpus.
+
+    Trivially passes :func:`compare_symbolic_to_lowered_ffn` (both the
+    symbolic execution and the lowered ``PureFFN`` forward return the input
+    residual unchanged at every dim).
+    """
+    return (
+        FFNRule.gated_write(
+            name="l14_demo_phase6_wave7_decl_only_noop",
+            conditions=(("CONST", -100.0),),
+            threshold=0.0,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("TEMP+0", 0.0),),
+            scope="__never_fires__",
+        ),
+    )
+
+
+def _layer14_demo_phase6_wave7_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_demo_phase6_wave7_rules(S))
+    return ir
+
+
+def make_layer14_demo_phase6_wave7_op() -> Operation:
+    """L14 FFN demo: pure-declaration corrective op (Phase 6 Wave 7).
+
+    Demonstrates the end-to-end declarative authoring path described in
+    ``docs/HOW_TO_ADD_A_CORRECTIVE_OP.md``:
+
+    * **Declare** -- one :class:`FFNRule` in
+      :func:`_layer14_demo_phase6_wave7_rules`.
+    * **Allocate** -- ``pin=None`` in
+      :data:`_L14_CLEANUP_CHAIN_LAYOUT`. The chain helper runs
+      :class:`FFNUnitAllocator` in first-fit mode and picks the lowest free
+      gap past the prior chain claims (unit ``1874`` at the time of
+      writing -- right after ``layer14_alu_nocarry_ax_bytes_zero``). The
+      author never wrote the offset.
+    * **Compile** -- :class:`CompilerIR` lowers the rule into a single FFN
+      hidden unit via :meth:`CompilerIR.lower_ffn`.
+    * **Byte-identity gate** -- the rule is byte-identically a no-op on the
+      live corpus (see the docstring of
+      :func:`_layer14_demo_phase6_wave7_rules`), so the residual stream is
+      unchanged at every position. ``compare_symbolic_to_lowered_ffn`` is
+      clean.
+
+    Pinned to ``layer_idx=14`` via ``kind="block"``. The bake function is a
+    slim wrapper around the chain allocator + :meth:`CompilerIR.lower_ffn`
+    -- the body is identical (modulo names) to
+    :func:`make_layer14_alu_nocarry_ax_bytes_zero_op`'s ``bake``, which is
+    exactly the point of the demo: one IR edit + one layout-table entry +
+    one boilerplate wrapper = a new corrective op.
+    """
+
+    def bake(block, dim_positions, S):
+        ffn = block.ffn
+        # Phase 6 Wave 6D auto-fit: this op's layout entry uses
+        # ``pin=None`` so the allocator picks the first free gap past
+        # the prior chain claims. The rule list is invariant to where
+        # in the chain the unit lands.
+        start_unit = _l14_chain_alloc("layer14_demo_phase6_wave7")
+        ir = _layer14_demo_phase6_wave7_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
+        )
+        ffn._l14_unit_counter = next_unit
+
+    # No ``claims`` set: ``writes`` weight is 0 so no W_down cell is
+    # actually touched. The op exists to demonstrate the flow; if a
+    # future iteration of this demo emits a real cell write, the claim
+    # tuples go here.
+    return Operation(
+        name="layer14_demo_phase6_wave7",
+        phase=14.95,
+        reads={"CONST"},
+        writes={"TEMP"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir=_layer14_demo_phase6_wave7_ir(),
+        declarative_authority="spec_generated",
+        layer_idx=14,
+        migrated=True,
+        # New chain tail: prior ops fill [0, 1874), the demo's auto-fit
+        # picks unit 1874 (single-unit rule), so the cumulative max is 1875.
+        # This replaces the legacy ``ffn_units_used=1874`` annotation
+        # carried by ``make_layer14_alu_nocarry_ax_bytes_zero_op``.
+        ffn_units_used=1875,
+        smoke_tests=set(),
+        spec_section="docs/HOW_TO_ADD_A_CORRECTIVE_OP.md",
     )
 
 

@@ -270,6 +270,12 @@ def all_core_ops(
         # in the same commit). Backup for the L10 BinaryOpByteZeroingPostOp
         # against downstream L11-L14 contamination.
         make_layer14_alu_nocarry_ax_bytes_zero_op(),
+        # Phase 6 Wave 7 demo: pure-declaration corrective op. One
+        # ``FFNRule`` + ``pin=None`` auto-fit + slim ``bake_fn`` wrapper.
+        # Byte-identically a no-op on the live corpus -- the demo proves
+        # the END-TO-END FLOW (declare -> byte-identity gate -> compile
+        # -> corpus check) per docs/HOW_TO_ADD_A_CORRECTIVE_OP.md.
+        make_layer14_demo_phase6_wave7_op(),
         make_layer15_memory_lookup_op(),
         make_layer15_nibble_copy_op(),
         make_layer16_lev_routing_op(),
