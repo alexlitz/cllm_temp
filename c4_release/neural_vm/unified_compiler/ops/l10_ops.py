@@ -777,7 +777,7 @@ def _layer10_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
         o.append(AO(BD.ALU_LO + k_idx, 0, -8.0))
         o.append(AO(BD.ALU_HI + k_idx, 0, -8.0))
     return DeclarativeAttentionHeadSpec(
-        head_idx=4,
+        head_idx=_l10_head_idx("layer10_stack0_byte_relay_bake.head_4"),
         q=tuple(q),
         k=tuple(k),
         v=tuple(v),
@@ -839,7 +839,7 @@ def _layer10_nonbitwise_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttenti
         o.append(AO(BD.ALU_LO + k_idx, 1 + k_idx, 6.0))
         o.append(AO(BD.ALU_HI + k_idx, 17 + k_idx, 6.0))
     return DeclarativeAttentionHeadSpec(
-        head_idx=5,
+        head_idx=_l10_head_idx("layer10_stack0_byte_relay_bake.head_5"),
         q=tuple(q),
         k=tuple(k),
         v=tuple(v),
@@ -951,19 +951,12 @@ def _layer10_stack0_persistence_head_spec(BD, S) -> DeclarativeAttentionHeadSpec
         o.append(AO(BD.OUTPUT_LO + k_idx, k_idx, 3.0))
         o.append(AO(BD.OUTPUT_HI + k_idx, 16 + k_idx, 3.0))
     return DeclarativeAttentionHeadSpec(
-        head_idx=6,
+        head_idx=_l10_head_idx("layer10_stack0_byte_relay_bake.head_6"),
         q=tuple(q),
         k=tuple(k),
         v=tuple(v),
         o=tuple(o),
     )
-
-
-def _layer10_single_head_ir(dim_positions, spec_fn, *, S: float = 100.0) -> CompilerIR:
-    proxy = _as_setdim_proxy(dim_positions)
-    ir = CompilerIR()
-    ir.layer(0).attention.append(spec_fn(proxy, S))
-    return ir
 
 
 def _layer10_carry_relay_ir(dim_positions, HD) -> CompilerIR:
@@ -1019,9 +1012,18 @@ def _layer10_psh_stack0_passthrough_ir(dim_positions, HD) -> CompilerIR:
 def _layer10_stack0_byte_relay_ir(dim_positions, HD) -> CompilerIR:
     proxy = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
-    ir.layer(0).attention.append(_layer10_stack0_byte_relay_head_spec(proxy, 100.0))
-    ir.layer(0).attention.append(_layer10_nonbitwise_stack0_byte_relay_head_spec(proxy, 100.0))
-    ir.layer(0).attention.append(_layer10_stack0_persistence_head_spec(proxy, 100.0))
+    ir.layer(0).attention.append(
+        _layer10_stack0_byte_relay_head_spec(proxy, 100.0),
+        name="layer10_stack0_byte_relay_bake.head_4",
+    )
+    ir.layer(0).attention.append(
+        _layer10_nonbitwise_stack0_byte_relay_head_spec(proxy, 100.0),
+        name="layer10_stack0_byte_relay_bake.head_5",
+    )
+    ir.layer(0).attention.append(
+        _layer10_stack0_persistence_head_spec(proxy, 100.0),
+        name="layer10_stack0_byte_relay_bake.head_6",
+    )
     return ir
 
 
@@ -1438,10 +1440,24 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
     Was an inline call in ``set_vm_weights`` (lookup branch only):
     ``_set_layer10_stack0_byte_relay(attn10, S, BD, HD)``. Inline call
     removed; this op now owns the bake. Phase=10.4.
+
+    Phase 6 Wave 2D: migrated to ``AttentionHeadIR`` form. This op owns
+    heads 4, 5, and 6 (bitwise stack-byte relay, non-bitwise stack-byte
+    relay, STACK0 persistence). The three head_idx literals (4/5/6) are
+    replaced with pinned-allocator lookups via
+    ``_l10_head_idx("layer10_stack0_byte_relay_bake.head_<n>")``; spec
+    output is byte-identical to baseline. The bake_fn stashes a
+    per-bake :class:`AttentionHeadAllocator` on ``attn``. See
+    ``make_layer10_carry_relay_bake_op`` for the shared infrastructure.
     """
     def bake(block, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
+        # Per-bake attention-head allocator with the L10 head layout pinned.
+        # This bake op owns three heads (4, 5, 6). See
+        # ``make_layer10_carry_relay_bake_op`` for the rationale.
+        head_allocator = _allocate_layer10_attention_heads()
+        attn._l10_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
         _bake_layer10_stack0_byte_relay_head(attn, proxy, S, HD)
 
