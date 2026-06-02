@@ -729,7 +729,10 @@ def make_layer3_ffn_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
                 "NEXT_STACK0"},
         kind="block",
-        layer_idx=3,
+        # Phase 8.G.6: drop ``layer_idx=3`` literal; bind to the L3 attn
+        # anchor ``layer3_carry_forward_attn`` so the block op resolves
+        # to whichever layer the carry-forward attn lands at.
+        target_op_name="layer3_carry_forward_attn",
         declarative_bake_fn=bake,
         compiler_ir=_layer3_ffn_ir(),
         declarative_authority="spec_generated",
@@ -1165,7 +1168,9 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                 "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI",
                 "TEMP", "ADDR_KEY"},
         kind="attn",
-        layer_idx=3,
+        # Phase 8.G.6: drop ``layer_idx=3`` literal. ``requires["after"]
+        # = layer16_lev_routing`` below + the dep edges from L1/L2 reads
+        # force the earliest landing layer to L3.
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer3_carry_forward_attn_ir,
         declarative_authority="spec_generated",
@@ -1491,7 +1496,10 @@ def make_layer3_convo_io_state_init_op(
         reads=set(),
         writes=set(),
         kind="block",
-        layer_idx=3,
+        # Phase 8.G.6: drop ``layer_idx=3`` literal; bind to the L3 attn
+        # anchor ``layer3_carry_forward_attn`` so the block op resolves
+        # to whichever layer the L3 carry-forward attn lands at.
+        target_op_name="layer3_carry_forward_attn",
         declarative_bake_fn=bake,
         compiler_ir=_layer3_convo_io_state_init_ir(),
         declarative_authority="spec_generated",
