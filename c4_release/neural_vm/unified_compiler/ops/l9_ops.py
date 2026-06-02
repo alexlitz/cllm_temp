@@ -347,6 +347,47 @@ def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT hi-nibble cross-product (512 units).
+
+    Same structural shape as the LEA/ADJ amplified loops (AX-marker
+    amplification with non-AX markers blocked at ``-S*1000``, ``ALU_HI``
+    + ``FETCH_HI`` cross-product, ``CARRY[0]`` borrow discrimination)
+    but gated on ``OP_ENT``. ENT computes ``SP - imm`` with borrow
+    propagation; ``a`` is SP's high nibble (``ALU_HI``) and ``b`` is the
+    immediate's high nibble (``FETCH_HI``). Writes
+    ``OUTPUT_HI_THIS_STEP+((sp_hi - imm_hi - borrow_in) % 16)``.
+    """
+
+    rules: list[FFNRule] = []
+    for borrow_in in (0, 1):
+        for sp_hi in range(16):
+            for imm_hi in range(16):
+                result = (sp_hi - imm_hi - borrow_in) % 16
+                conditions: list[tuple[str, float]] = [("MARK_AX", 20.0)]
+                conditions.extend(
+                    (dim, -1000.0) for dim in _L9_NON_AX_BLOCKERS
+                )
+                conditions.append((f"ALU_HI+{sp_hi}", 1.0))
+                conditions.append((f"FETCH_HI+{imm_hi}", 20.0))
+                if borrow_in == 0:
+                    conditions.append(("CARRY+0", -8.0))
+                    threshold = 42.0
+                else:
+                    conditions.append(("CARRY+0", 8.0))
+                    threshold = 50.0
+                rules.append(FFNRule.gated_write(
+                    name=f"l9_ent_hi_b{borrow_in}_sp{sp_hi}_imm{imm_hi}",
+                    conditions=tuple(conditions),
+                    threshold=threshold,
+                    gate="OP_ENT",
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
+                ))
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 
