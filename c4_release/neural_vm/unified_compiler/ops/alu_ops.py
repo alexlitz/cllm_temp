@@ -957,6 +957,7 @@ def make_alu_divmod_composite_ops():
             # attn anchor ``layer10_carry_relay`` so the block op resolves
             # to whichever layer the compiler places the anchor at.
             target_op_name="layer10_carry_relay",
+            requires={"after": "l10_alu_divmod_getobd"},
             migrated=True,
             declarative_authority="structural_model",
         smoke_tests={
