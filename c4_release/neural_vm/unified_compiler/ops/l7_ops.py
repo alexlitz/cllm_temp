@@ -609,7 +609,10 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
     return Operation(
         name="format_pointer_extraction",
         phase=7.5,
-        reads={"IO_IN_OUTPUT_MODE", "MARK_STACK0", "EMBED_LO", "EMBED_HI"},
+        # Phase 9.B (IO_IN_OUTPUT_MODE SCC rename): SSA cross-step form.
+        # null_terminator_detection (phase 10.6) stages the value for the
+        # NEXT step. Same numeric slot via alias; byte-identical bake.
+        reads={"IO_IN_OUTPUT_MODE.*.-1", "MARK_STACK0", "EMBED_LO", "EMBED_HI"},
         writes={"FORMAT_PTR_LO", "FORMAT_PTR_HI"},
         kind="block",
         declarative_bake_fn=bake,
