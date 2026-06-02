@@ -40,6 +40,7 @@ from typing import Dict, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .kv_liveness_analyzer import KVEntry, LivenessReport
+    from .kv_overwrite_map import OverwriteMap
 
 
 # ---------------------------------------------------------------------------
@@ -56,10 +57,20 @@ class KVEvictionPolicy(str, Enum):
         STATIC_LIVENESS: Drive eviction from a precomputed
             :class:`KVEvictionState` built at compile time from the
             static liveness analyzer (Phase 7.F.1).
+        OVERWRITE_BASED: Phase 8.E.3 — drive eviction from the
+            declarative-IR overwrite map
+            (:func:`neural_vm.kv_overwrite_map.build_overwrite_map`).
+            At each step boundary, evict the ``(position, dim)`` entries
+            whose precomputed ``overwrite_step`` has been reached. The
+            map is a pure function of the IR, so spec-decode and
+            main-decode reach identical decisions. The filter restricted
+            to byte-identity-safe dim categories keeps logits bit-exact
+            with ``OFF``.
     """
 
     OFF = "off"
     STATIC_LIVENESS = "static_liveness"
+    OVERWRITE_BASED = "overwrite_based"
 
     @classmethod
     def from_str(cls, name: Optional[str]) -> "KVEvictionPolicy":
@@ -418,6 +429,134 @@ def build_state_from_report(
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 8.E.3 — OverwriteMap-driven builder
+# ---------------------------------------------------------------------------
+
+
+def build_state_from_overwrite_map(
+    overwrite_map: "OverwriteMap",
+    *,
+    layer_idx: Optional[int] = None,
+    policy: KVEvictionPolicy = KVEvictionPolicy.OVERWRITE_BASED,
+    dim_positions: Optional[Mapping[str, int]] = None,
+    dim_sizes: Optional[Mapping[str, int]] = None,
+    num_heads: Optional[int] = None,
+    head_dim: Optional[int] = None,
+    safe_dim_categories: Optional[Set[str]] = None,
+) -> KVEvictionState:
+    """Project a :class:`OverwriteMap` onto one (layer, head) slot.
+
+    Phase 8.E.3 — the runtime KV-eviction wiring for the declarative-IR
+    overwrite map produced by
+    :func:`neural_vm.kv_overwrite_map.build_overwrite_map`.
+
+    Each :class:`~neural_vm.kv_overwrite_map.OverwriteEntry` records a
+    ``(position, dim_name)`` cache cell and the earliest step ``T`` at
+    which a later writer overwrites the dim (or end-of-step semantics
+    for ``TRANSIENT_SCRATCH`` / ``PREV_STEP``). At step boundary ``T``
+    the runtime can safely drop that cell. We translate the map into
+    per-step ``evictable_dim_slices_at_step[T][position]`` so the
+    existing :func:`apply_eviction` slice path zeros only the residual
+    sub-row the dim occupies — leaving the rest of the row intact and
+    preserving byte-identity with ``OFF`` for every dim that passes the
+    safe filter.
+
+    Parameters mirror :func:`build_state_from_report`:
+
+    Parameters
+    ----------
+    overwrite_map:
+        The :class:`OverwriteMap` from
+        :func:`neural_vm.kv_overwrite_map.build_overwrite_map`.
+    layer_idx:
+        Stamped onto the resulting state. ``None`` means "every layer
+        shares this state"; the overwrite map itself is intrinsically
+        layer-independent (it operates on residual-stream dim names).
+    policy:
+        Policy stamped onto the resulting state. Defaults to
+        :attr:`KVEvictionPolicy.OVERWRITE_BASED`.
+    dim_positions, dim_sizes:
+        ``ModelLayout.dim_positions`` / ``ModelLayout.dim_sizes`` —
+        required to translate a dim name to a
+        ``(d_model_start, d_model_size)`` residual slice. When either is
+        ``None`` the slice path stays empty and the resulting state has
+        nothing to evict (effectively a no-op).
+    num_heads, head_dim:
+        Cache layout stamped into the state so ``apply_eviction`` can
+        translate residual slices to cache indices.
+    safe_dim_categories:
+        Optional whitelist of dim names whose slices the runtime is
+        allowed to zero. Defaults to the byte-identity-safe category
+        filter (same one
+        :func:`build_state_from_report` uses): TEMP* / ALU_TEMP* /
+        MUL_TEMP* / DIV_TEMP* / MUL_ACCUM* / DIV_STAGING* / MEM_STAGING*
+        / SP_GATHERED* prefixes and ``_THIS_STEP`` / ``_SCRATCH`` /
+        ``_PREV_STEP`` / ``_PREV`` / ``_LAST_STEP`` suffixes.
+
+    Returns
+    -------
+    KVEvictionState
+        Per-step (position, slice) eviction map ready to be attached to
+        a ``PureAttention`` (or ``AutoregressiveAttention``) module.
+    """
+
+    safe_filter = (
+        safe_dim_categories
+        if safe_dim_categories is not None
+        else _default_safe_dim_categories()
+    )
+
+    evictable_dim_slices_at_step: Dict[int, Dict[int, Set[Tuple[int, int]]]] = {}
+
+    # Without the residual-layout maps we cannot translate dim names to
+    # cache slices. Return an empty state in that case so callers see a
+    # no-op (the runtime still records "decisions" via apply_eviction's
+    # bookkeeping for tests).
+    if dim_positions is None or dim_sizes is None:
+        return KVEvictionState(
+            policy=policy,
+            layer_idx=layer_idx,
+            evictable_dim_slices_at_step=evictable_dim_slices_at_step,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+
+    # Walk the overwrite map's per-step entries. Drop the ``None``
+    # bucket (entries with no later writer — they stay alive until
+    # end-of-program; the runtime can't evict them in a per-step pass).
+    for overwrite_step, entries in overwrite_map.entries_by_step.items():
+        if overwrite_step is None:
+            continue
+        step_int = int(overwrite_step)
+        for entry in entries:
+            dim_name = entry.dim_name
+            # Apply the same byte-identity-safe filter the slice path in
+            # build_state_from_report uses. Dims whose residual value is
+            # not guaranteed 0 outside their useful window cannot be
+            # safely zeroed without affecting attention scores.
+            if safe_filter and not _dim_name_is_safe(dim_name, safe_filter):
+                continue
+            start = dim_positions.get(dim_name)
+            if start is None:
+                continue
+            size = int(dim_sizes.get(dim_name, 1))
+            if size <= 0:
+                continue
+            slot = (int(start), size)
+            evictable_dim_slices_at_step.setdefault(step_int, {}).setdefault(
+                int(entry.position), set()
+            ).add(slot)
+
+    return KVEvictionState(
+        policy=policy,
+        layer_idx=layer_idx,
+        evictable_dim_slices_at_step=evictable_dim_slices_at_step,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+
+
 # Categories of residual dims whose value is guaranteed 0 outside of
 # their useful window. The K projection therefore writes 0 to whichever
 # cache slot they exclusively feed; zeroing that slot when the dim is
@@ -621,5 +760,6 @@ __all__ = [
     "KVEvictionPolicy",
     "KVEvictionState",
     "apply_eviction",
+    "build_state_from_overwrite_map",
     "build_state_from_report",
 ]

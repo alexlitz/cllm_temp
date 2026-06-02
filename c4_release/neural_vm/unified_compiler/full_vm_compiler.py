@@ -484,6 +484,13 @@ def _attach_kv_eviction_state(
     resulting :class:`KVEvictionState` to ``block.attn``. The decisions are
     deterministic functions of the static IR, so spec-decode and main-decode
     paths see identical eviction sets when given the same step index.
+
+    ``KVEvictionPolicy.OVERWRITE_BASED`` (Phase 8.E.3) instead builds the
+    declarative-IR :class:`~neural_vm.kv_overwrite_map.OverwriteMap` and
+    projects it onto each attention via
+    :func:`neural_vm.kv_eviction.build_state_from_overwrite_map`. The map
+    is a static function of the IR's per-step writers, so spec-decode and
+    main-decode reach the same eviction decisions at any step index.
     """
 
     # Bottom-out: OFF clears any prior attached state and skips analysis.
@@ -505,6 +512,38 @@ def _attach_kv_eviction_state(
         ops.extend(ops_at_layer)
     ops.extend(layout.block_ops)
     ops.extend(layout.model_ops)
+
+    # Phase 8.E.3: OVERWRITE_BASED uses the declarative-IR overwrite map
+    # builder. The path is parallel to STATIC_LIVENESS but consumes the
+    # static (position, dim) -> overwrite_step table instead of the
+    # per-(layer, head) liveness report. Same dim-slice safety semantics,
+    # different upstream data source.
+    if kv_eviction_policy is KVEvictionPolicy.OVERWRITE_BASED:
+        from ..kv_overwrite_map import build_overwrite_map
+        from ..kv_eviction import build_state_from_overwrite_map
+
+        overwrite_map = build_overwrite_map(ops, n_steps=n_steps)
+
+        dim_positions = getattr(layout, "dim_positions", None)
+        dim_sizes = getattr(layout, "dim_sizes", None)
+
+        for layer_idx, block in enumerate(getattr(model, "blocks", ())):
+            attn = getattr(block, "attn", None)
+            if attn is None:
+                continue
+            state = build_state_from_overwrite_map(
+                overwrite_map,
+                layer_idx=layer_idx,
+                policy=kv_eviction_policy,
+                dim_positions=dim_positions,
+                dim_sizes=dim_sizes,
+                num_heads=getattr(attn, "num_heads", None),
+                head_dim=getattr(attn, "head_dim", None),
+            )
+            setattr(attn, "eviction_state", state)
+            if not hasattr(attn, "_eviction_step_idx"):
+                setattr(attn, "_eviction_step_idx", 0)
+        return
 
     # Lazy-import the analyzer to keep ``compile_full_vm`` import-time light
     # and to avoid pulling its IR-walking helpers into the OFF path.

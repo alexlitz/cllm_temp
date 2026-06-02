@@ -104,6 +104,24 @@ def model_static_liveness():
     return model, layout
 
 
+@pytest.fixture(scope="module")
+def model_overwrite_based():
+    """``policy=OVERWRITE_BASED`` model wired via the declarative IR overwrite map.
+
+    Phase 8.E.3: the compiler runs
+    :func:`neural_vm.kv_overwrite_map.build_overwrite_map` over the layout's op
+    corpus and attaches a per-attention :class:`KVEvictionState` constructed by
+    :func:`neural_vm.kv_eviction.build_state_from_overwrite_map`.
+    """
+    from neural_vm.unified_compiler.full_vm_compiler import compile_full_vm
+    model, layout = compile_full_vm(
+        disk_cache=False,
+        kv_eviction_policy=KVEvictionPolicy.OVERWRITE_BASED,
+        kv_eviction_n_steps=8,
+    )
+    return model, layout
+
+
 # ---------------------------------------------------------------------------
 # Test 1: default OFF == no flag.
 # ---------------------------------------------------------------------------
@@ -154,6 +172,32 @@ def test_static_liveness_byte_identical_to_off(model_off, model_static_liveness)
         assert torch.equal(off_logits, sl_logits), (
             f"input {idx}: STATIC_LIVENESS diverged from OFF baseline "
             f"(max abs diff = {(off_logits - sl_logits).abs().max().item()})"
+        )
+
+
+def test_overwrite_based_byte_identical_to_off(model_off, model_overwrite_based):
+    """Phase 8.E.3 — OVERWRITE_BASED must produce logits byte-identical to
+    policy=OFF on the smoke corpus.
+
+    The overwrite map only marks dim names that pass the byte-identity-safe
+    category filter (TEMP* / *_PREV_STEP / etc.), whose residual value is
+    guaranteed 0 outside their useful window. Zeroing the corresponding K/V
+    cache slice is therefore a no-op at the bit level.
+    """
+
+    off_model, _ = model_off
+    ow_model, _ = model_overwrite_based
+
+    for idx, ids in enumerate(_SMOKE_INPUTS):
+        off_logits = _logits_for_model(off_model, ids)
+        ow_logits = _logits_for_model(ow_model, ids)
+        assert off_logits.shape == ow_logits.shape, (
+            f"input {idx} shape mismatch: off={off_logits.shape} "
+            f"ow={ow_logits.shape}"
+        )
+        assert torch.equal(off_logits, ow_logits), (
+            f"input {idx}: OVERWRITE_BASED diverged from OFF baseline "
+            f"(max abs diff = {(off_logits - ow_logits).abs().max().item()})"
         )
 
 
