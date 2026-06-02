@@ -512,6 +512,31 @@ def _attach_kv_eviction_state(
 
     report = analyze_kv_liveness(ops, n_steps=n_steps)
 
+    # Pass dim_positions / dim_sizes to the state builder so the
+    # Phase 7.F.5 per-(position, dim_slice) eviction map gets populated.
+    # Falls back gracefully when a layout omits either map (older cached
+    # payloads): the builder only populates the new map when both are
+    # provided.
+    dim_positions = getattr(layout, "dim_positions", None)
+    dim_sizes = getattr(layout, "dim_sizes", None)
+
+    # When the analyzer can't identify per-layer head sets (because all
+    # attention ops in this build are imperative — they have no
+    # ``compiler_ir`` with ``AttentionHeadIR`` entries), the report's
+    # entries are all stamped layer=0 (the analyzer's fallback). In that
+    # case the per-layer projection would only populate layer 0's state,
+    # leaving the other 30+ attention modules with empty maps. Broadcast
+    # the same state to every layer instead — the dim-name liveness
+    # semantics are intrinsically layer-independent for the dim slices
+    # the slice path zeros (TEMP / *_PREV_STEP / safe cycle dims).
+    analyzer_saw_specific_heads = bool(
+        {
+            (int(getattr(op, "layer_idx", 0) or 0),)
+            for op in ops
+            if any(True for _ in _iter_attention_heads_in_op(op))
+        }
+    )
+
     for layer_idx, block in enumerate(getattr(model, "blocks", ())):
         attn = getattr(block, "attn", None)
         if attn is None:
@@ -521,15 +546,45 @@ def _attach_kv_eviction_state(
         # so attaching one per attention is O(layers) memory.
         state = build_state_from_report(
             report,
-            layer_idx=layer_idx,
+            # When the analyzer didn't see per-layer head specs, drop
+            # the layer filter so every layer inherits the same dim
+            # slice map. This is sound because the dim names the slice
+            # path operates on (TEMP / *_PREV_STEP / safe cycle dims)
+            # are residual-stream identifiers that every layer shares.
+            layer_idx=layer_idx if analyzer_saw_specific_heads else None,
             head_idx=None,
             policy=kv_eviction_policy,
+            dim_positions=dim_positions,
+            dim_sizes=dim_sizes,
+            num_heads=getattr(attn, "num_heads", None),
+            head_dim=getattr(attn, "head_dim", None),
         )
         setattr(attn, "eviction_state", state)
         # Make sure the runtime step counter exists so PureAttention's
         # ``run_eviction_hook`` finds the attribute it expects.
         if not hasattr(attn, "_eviction_step_idx"):
             setattr(attn, "_eviction_step_idx", 0)
+
+
+def _iter_attention_heads_in_op(op):
+    """Yield ``AttentionHeadIR`` entries from an op's ``compiler_ir``.
+
+    Returns an empty iterator when the op is imperative (no ``compiler_ir``)
+    or when the IR doesn't carry attention-head specs. Used by
+    :func:`_attach_kv_eviction_state` to decide whether the analyzer's
+    layer-specific entries are usable as a layer filter.
+    """
+
+    ir = getattr(op, "compiler_ir", None)
+    if ir is None:
+        return
+    layers = getattr(ir, "layers", ())
+    for layer in layers:
+        attn = getattr(layer, "attention", None)
+        if attn is None:
+            continue
+        for head in getattr(attn, "rules", ()):
+            yield head
 
 
 def compile_full_vm(
