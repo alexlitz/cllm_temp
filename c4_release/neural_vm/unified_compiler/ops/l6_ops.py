@@ -3,7 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..layer_compiler import Operation
-from ..ir import FFNRule
+from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
@@ -3262,6 +3262,8 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
         kind="model",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer6_bz_bnz_relay_bake_ir,
+        declarative_authority="spec_generated",
         migrated=True,
         smoke_tests={
             "TestSmokeControlFlow::test_bnz_branch",
@@ -3274,6 +3276,21 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
         },
         opcodes={"OP_BZ", "OP_BNZ"},
     )
+
+
+def _layer6_bz_bnz_relay_bake_ir(dim_positions, HD) -> CompilerIR:
+    """Build the declarative L6 BZ/BNZ relay head IR for the compiler.
+
+    Wraps :func:`_layer6_bz_bnz_relay_head_spec` (head 4) so the layer
+    compiler can lower the head via ``CompilerIR.lower_attention`` instead
+    of relying on the imperative ``Primitives.generate_attention_head`` call
+    in the bake_fn. Byte-identity gated by ``compare_symbolic_to_lowered_attn``.
+    """
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_layer6_bz_bnz_relay_head_spec(proxy))
+    return ir
 
 
 def _layer6_bz_bnz_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
