@@ -408,6 +408,224 @@ class Allocator:
     def _used_bytes(self) -> int:
         return len(self._claimed)
 
+    # ------------------------------------------------------------------
+    # Phase 10.A: d_model packing (best-fit decreasing)
+    # ------------------------------------------------------------------
+    def pack_unpinned_best_fit_decreasing(
+        self,
+        *,
+        target_d_model: Optional[int] = None,
+    ) -> "Allocator":
+        """Return a NEW allocator with unpinned dims re-packed via BFD.
+
+        The packed allocator preserves:
+
+        * Every pinned (non-overlap) slot at its original ``start``.
+        * Every alias slot (``overlap=True``) at its original ``start``,
+          since aliases name a slice of an existing parent slot.
+
+        Unpinned (non-overlap) slots are re-placed using **best-fit
+        decreasing**: slots are sorted by size descending, and each is
+        placed into the SMALLEST free gap that still fits it. Ties on
+        gap size are broken by lowest start (lowest-address gap wins),
+        which keeps the layout deterministic.
+
+        If ``target_d_model`` is provided, the packed allocator's pool
+        width is set to that value and packing is REQUIRED to fit. A
+        failure raises :class:`AllocatorError`. If left ``None``, the
+        packed allocator's width is the maximum of (highest pinned end,
+        highest packed-unpinned end) -- i.e. the tightest pool that holds
+        all current slots.
+
+        Why best-fit decreasing? It's a classic bin-packing heuristic
+        with a worst-case ratio of 11/9*OPT + 6/9 -- strictly better
+        than first-fit decreasing in the average case and easy to
+        reproduce. For ~100 slots of widely-varying width (1..32 bytes)
+        the choice matters: first-fit leaves small gaps behind large
+        slots, best-fit drains them in priority order.
+
+        Insertion order in the returned allocator mirrors this one so
+        :meth:`to_registry` stays deterministic and any audit tooling
+        that walks ``.slots()`` sees the same op order.
+
+        Pin collisions, overlap rules and category/role metadata are
+        preserved one-for-one; only the unpinned starts move.
+        """
+        # ---- collect classification of every slot ----
+        pinned_slots = [s for s in self._slots if s.pinned and not s.overlap]
+        alias_slots = [s for s in self._slots if s.overlap]
+        unpinned_slots = [
+            s for s in self._slots if not s.pinned and not s.overlap
+        ]
+
+        # ---- compute the pool width to pack into ----
+        # Aliases share parents' bytes and are themselves placed atop
+        # already-pinned ranges; only ``pinned_slots`` consume bytes for
+        # the purpose of the gap map.
+        if target_d_model is not None:
+            if not isinstance(target_d_model, int) or target_d_model <= 0:
+                raise AllocatorError(
+                    f"pack_unpinned_best_fit_decreasing: target_d_model "
+                    f"must be a positive int (got {target_d_model!r})"
+                )
+            pool_width = int(target_d_model)
+        else:
+            # Provisional pool -- wide enough to contain every pinned
+            # slot plus every unpinned slot end-to-end. We recompute the
+            # final (tight) width after packing.
+            highest_pinned_end = max(
+                (s.end for s in pinned_slots), default=0
+            )
+            total_unpinned = sum(s.size for s in unpinned_slots)
+            pool_width = max(
+                self.d_model, highest_pinned_end + total_unpinned
+            )
+
+        # Reject pinned slots that already overflow the requested width.
+        for s in pinned_slots:
+            if s.end > pool_width:
+                raise AllocatorError(
+                    f"pack_unpinned_best_fit_decreasing: pinned slot "
+                    f"{s.name!r} at [{s.start},{s.end}) exceeds "
+                    f"target_d_model={pool_width}"
+                )
+
+        # Build the byte-claim bytemap (1 byte/element) covering the
+        # provisional pool. Aliases don't claim bytes; only pinned do.
+        claimed = bytearray(pool_width)
+        for s in pinned_slots:
+            for i in range(s.start, s.end):
+                claimed[i] = 1
+
+        def _free_gaps() -> List[List[int]]:
+            gaps: List[List[int]] = []
+            i = 0
+            while i < pool_width:
+                if claimed[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < pool_width and not claimed[j]:
+                    j += 1
+                gaps.append([i, j - i])  # [start, length] (mutable)
+                i = j
+            return gaps
+
+        # ---- best-fit decreasing pass over the unpinned slots ----
+        # Sort by size desc; secondary key on name keeps placement
+        # deterministic when several slots share the same size.
+        order = sorted(unpinned_slots, key=lambda s: (-s.size, s.name))
+        new_starts: Dict[str, int] = {}
+
+        gaps = _free_gaps()
+        for s in order:
+            # Pick the smallest gap that still fits; tie-break on lowest start.
+            best_idx: Optional[int] = None
+            for idx, (gstart, glen) in enumerate(gaps):
+                if glen < s.size:
+                    continue
+                if best_idx is None:
+                    best_idx = idx
+                    continue
+                # Smaller gap wins; equal gap, lower start wins.
+                if (
+                    glen < gaps[best_idx][1]
+                    or (glen == gaps[best_idx][1]
+                        and gstart < gaps[best_idx][0])
+                ):
+                    best_idx = idx
+            if best_idx is None:
+                # No gap fits in the current pool. If the caller pinned
+                # a target_d_model we surface the failure; otherwise we
+                # widen the pool by appending the residue at the tail.
+                if target_d_model is not None:
+                    raise AllocatorError(
+                        f"pack_unpinned_best_fit_decreasing: cannot fit "
+                        f"unpinned slot {s.name!r} (size {s.size}) into "
+                        f"target_d_model={target_d_model}; remaining gaps "
+                        f"= {[tuple(g) for g in gaps]}"
+                    )
+                # Extend pool: append the slot past the current pool tail.
+                gstart = pool_width
+                pool_width += s.size
+                claimed.extend(b"\x01" * s.size)
+                new_starts[s.name] = gstart
+                continue
+
+            gstart, glen = gaps[best_idx]
+            new_starts[s.name] = gstart
+            # Mark the placed bytes; trim or drop the chosen gap.
+            for i in range(gstart, gstart + s.size):
+                claimed[i] = 1
+            remaining = glen - s.size
+            if remaining == 0:
+                gaps.pop(best_idx)
+            else:
+                gaps[best_idx][0] = gstart + s.size
+                gaps[best_idx][1] = remaining
+
+        # ---- determine the final pool width ----
+        # If target_d_model was set we keep it. Otherwise shrink to the
+        # max(pinned_end, packed_unpinned_end, alias_end).
+        if target_d_model is None:
+            highest = max(
+                (s.end for s in pinned_slots), default=0
+            )
+            for s in unpinned_slots:
+                highest = max(highest, new_starts[s.name] + s.size)
+            for s in alias_slots:
+                highest = max(highest, s.end)
+            pool_width = highest
+
+        # ---- rebuild a fresh allocator with the new starts ----
+        packed = Allocator(d_model=pool_width, strategy=self._strategy)
+        for s in self._slots:
+            if s.overlap:
+                # Alias: replay at original pin with allow_overlap.
+                packed.alloc(
+                    s.name, s.size,
+                    pin=s.start,
+                    semantics=s.semantics,
+                    group=s.group,
+                    description=s.description,
+                    allow_overlap=True,
+                    category=s.category,
+                    role=s.role,
+                )
+            elif s.pinned:
+                packed.alloc(
+                    s.name, s.size,
+                    pin=s.start,
+                    semantics=s.semantics,
+                    group=s.group,
+                    description=s.description,
+                    category=s.category,
+                    role=s.role,
+                )
+            else:
+                packed.alloc(
+                    s.name, s.size,
+                    pin=new_starts[s.name],
+                    semantics=s.semantics,
+                    group=s.group,
+                    description=s.description,
+                    category=s.category,
+                    role=s.role,
+                )
+                # The BFD-chosen start is an allocator artefact, not a
+                # caller-supplied hint -- rewrite ``pinned`` in place so
+                # downstream auditors don't mistake the placement for an
+                # original pin.
+                packed._slots[-1].pinned = False
+        return packed
+
+    def packed_d_model(self) -> int:
+        """Convenience: pool width that
+        :meth:`pack_unpinned_best_fit_decreasing` would settle on with
+        ``target_d_model=None``. Computed without mutating ``self``.
+        """
+        return self.pack_unpinned_best_fit_decreasing().d_model
+
 
 __all__ = [
     "AllocStrategy",
