@@ -2252,7 +2252,11 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
         name="layer14_demo_phase6_wave7",
         phase=14.95,
         reads={"CONST"},
-        writes={"TEMP"},
+        # Phase 9.B (TEMP SCC fix): drop dead TEMP write. The demo bake
+        # emits a zero-weight rule that does not touch any W_down cell
+        # (see docstring + verifier output). Was producing 2 back-edges
+        # into the L14 cleanup loop.
+        writes=set(),
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir=_layer14_demo_phase6_wave7_ir(),
