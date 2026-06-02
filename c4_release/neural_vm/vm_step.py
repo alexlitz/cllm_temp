@@ -2687,6 +2687,17 @@ def _expand_wrapper_blocks(model):
               f"({pureffn_rebakes} re-baked into vanilla PureFFN)")
         print(f"  Total blocks: 17 -> {len(final_blocks)}")
 
+    # Wrapper-coverage retrim: ``_right_size_ffns`` runs at phase 1200,
+    # before this expansion at phase 1300, so composite post_ops
+    # (AddSub5StageBlock, FlattenedPureFFN, etc.) whose inner FFNs hide
+    # behind ``@property W_up`` accessors are treated as flat leaves by
+    # the recursion gate and skip the trim. Once expanded into standalone
+    # wrapper blocks each composite's inner FFN(s) become recursable
+    # children of ``block.ffn`` and the trim reaches them. The retrim is
+    # idempotent: already-right-sized FFNs early-return at
+    # ``n_active == H``.
+    _right_size_ffns(model)
+
 
 def _merge_wrapper_blocks(model):
     """Phase 10.B: fold per-block ``post_ops`` into the parent block's FFN.
