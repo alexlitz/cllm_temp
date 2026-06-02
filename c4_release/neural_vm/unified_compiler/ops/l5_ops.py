@@ -858,7 +858,6 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_opcode_decode_ffn_dep_anchor",
-        phase=5,
         # Phase 8.A SCC step 6: matches opcode_decode_ffn's
         # OPCODE_BYTE_LO_PREV_STEP rename (same numeric base, prev-step
         # semantics).
