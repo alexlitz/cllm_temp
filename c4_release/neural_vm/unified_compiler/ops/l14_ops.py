@@ -725,6 +725,10 @@ def make_layer14_mem_generation_op() -> Operation:
 
     return Operation(
         name="layer14_mem_generation",
+        # Phase 8.G.5 carve-out: SCC cycle-breaker. _layer14_attn_dep_anchor
+        # has phase=14 and uses requires["same_layer_as"]; this co-placement
+        # rule requires the phase ordinal here. Retire when the L14 anchor
+        # gains its own placement primitive or migrates to requires["after"].
         phase=14,
         # Phase 8.A: ADDR_B0_HI_PREV_STEP marks the read as cross-step
         # relative to L15 store_stack0_sp_byte0_addr (phase 15.2), which
