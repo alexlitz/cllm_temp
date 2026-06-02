@@ -369,8 +369,16 @@ def _layer8_alu_add_lo_rules(S: float) -> tuple[FFNRule, ...]:
     (-S * 4) suppresses the unit at PC marker where L6 head 0 / L7
     attention leakage could otherwise sneak it on. Writes
     OUTPUT_LO[(a+b) mod 16] at 2.0/S.
+
+    Phase 8.D: the OP_ADD gate resolves through ``dim_ref("opcode_flag",
+    "ADD")`` -- the gate dim names the opcode-flag family member.
+    ALU_LO+a / AX_CARRY_LO+b operand reads stay structural (per-nibble
+    one-hot lookups). OUTPUT_LO+result writes stay structural too --
+    the per-nibble result is a value-bus lookup, not a role-meaningful
+    byte position.
     """
     write_scale = 2.0 / S
+    gate_add = dim_ref("opcode_flag", "ADD")
     rules = []
     for a in range(16):
         for b in range(16):
@@ -384,7 +392,7 @@ def _layer8_alu_add_lo_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_LO+{b}", 1.0),
                 ),
                 threshold=2.5,
-                gate="OP_ADD",
+                gate=gate_add,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
                 scope="MARK_AX and OP_ADD",
                 dominates_at={
@@ -402,8 +410,12 @@ def _layer8_alu_lea_lo_rules(S: float) -> tuple[FFNRule, ...]:
     requirement (60) + the non-AX-marker blocker set (-1000 on each of
     MARK_PC/SP/BP/STACK0/MEM/SE/IS_BYTE). FETCH_LO contributes at
     weight 20.
+
+    Phase 8.D: the OP_LEA gate resolves through ``dim_ref("opcode_flag",
+    "LEA")``.
     """
     write_scale = 2.0 / S
+    gate_lea = dim_ref("opcode_flag", "LEA")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
     rules = []
     for a in range(16):
@@ -418,7 +430,7 @@ def _layer8_alu_lea_lo_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"FETCH_LO+{b}", 20.0),
                 ),
                 threshold=80.5,
-                gate="OP_LEA",
+                gate=gate_lea,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
                 scope="MARK_AX and OP_LEA",
                 dominates_at={
@@ -433,8 +445,12 @@ def _layer8_alu_sub_lo_rules(S: float) -> tuple[FFNRule, ...]:
 
     C4 semantics: AX = stack_top - AX, so result = ALU_LO[a] - AX_CARRY_LO[b].
     Same structural shape as ADD lo (gate=OP_SUB).
+
+    Phase 8.D: the OP_SUB gate resolves through ``dim_ref("opcode_flag",
+    "SUB")``.
     """
     write_scale = 2.0 / S
+    gate_sub = dim_ref("opcode_flag", "SUB")
     rules = []
     for a in range(16):
         for b in range(16):
@@ -448,7 +464,7 @@ def _layer8_alu_sub_lo_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_LO+{b}", 1.0),
                 ),
                 threshold=2.5,
-                gate="OP_SUB",
+                gate=gate_sub,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
                 scope="MARK_AX and OP_SUB",
                 dominates_at={
@@ -546,8 +562,12 @@ def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
     from L7) and FETCH_LO (immediate). Gate=OP_ADJ; threshold tuned
     higher (85) than LEA (80.5) to reflect the helper's empirical
     margin.
+
+    Phase 8.D: the OP_ADJ gate resolves through ``dim_ref("opcode_flag",
+    "ADJ")``.
     """
     write_scale = 2.0 / S
+    gate_adj_lo = dim_ref("opcode_flag", "ADJ")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
     rules = []
     for a in range(16):
@@ -562,7 +582,7 @@ def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"FETCH_LO+{b}", 20.0),
                 ),
                 threshold=85.0,
-                gate="OP_ADJ",
+                gate=gate_adj_lo,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
                 scope="MARK_AX and OP_ADJ",
                 dominates_at={
@@ -652,8 +672,12 @@ def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
     ENT computes SP = SP - (8 + signed_immediate). For lo nibble:
     result = (sp_lo - (8 + imm_lo)) mod 16. sp_lo from ALU_LO,
     imm_lo from FETCH_LO. Gate=OP_ENT, threshold=85.
+
+    Phase 8.D: the OP_ENT gate resolves through ``dim_ref("opcode_flag",
+    "ENT")``.
     """
     write_scale = 2.0 / S
+    gate_ent_lo = dim_ref("opcode_flag", "ENT")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
     rules = []
     for sp_lo in range(16):
@@ -669,7 +693,7 @@ def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"FETCH_LO+{imm_lo}", 20.0),
                 ),
                 threshold=85.0,
-                gate="OP_ENT",
+                gate=gate_ent_lo,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
                 scope="MARK_AX and OP_ENT",
                 dominates_at={
@@ -762,18 +786,27 @@ def _layer8_alu_cmp_clear_rules(S: float) -> tuple[FFNRule, ...]:
     and ``b_gate = -S/2``. We encode this with ``gate_weight=S`` /
     ``gate_bias=-S/2`` because the lowerer applies them directly
     without the S scaling that conditions get.
+
+    Phase 8.D: the MARK_AX gate resolves through ``dim_ref("marker",
+    "AX")`` and each CMP+k write resolves through
+    ``dim_ref("cmp_flag", "cascade", k)`` -- byte k of the inter-byte
+    CMP cascade (hi_lt / hi_eq / lo_eq / lo_lt). The CMP+k condition
+    read stays bare per the L8 pilot convention (the condition is the
+    current CMP cell being negated, used as an up-branch operand).
     """
     write_scale = -2.0 / (S * S)
+    gate_mark_ax = dim_ref("marker", "AX")
     rules = []
     for k in range(4):
+        cmp_k = dim_ref("cmp_flag", "cascade", k)
         rules.append(FFNRule.gated_write(
             name=f"l8_alu_cmp_clear_k{k}",
             conditions=((f"CMP+{k}", 1.0),),
             threshold=0.0,
-            gate="MARK_AX",
+            gate=gate_mark_ax,
             gate_weight=S,
             gate_bias=-S * 0.5,
-            writes=((f"CMP+{k}", write_scale),),
+            writes=((cmp_k, write_scale),),
             scope="MARK_AX",
             dominates_at={f"CMP+{k}": "MARK_AX"},
         ))
