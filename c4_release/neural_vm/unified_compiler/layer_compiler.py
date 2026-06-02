@@ -1411,11 +1411,31 @@ class LayerCompiler:
                         and (ref_op.writes & op.reads)):
                     continue
                 ref_layer = assignment.get(ref)
+                if ref_layer is None and ref_op is not None and ref_op.kind == "block":
+                    # Phase 8.A.4: block ops are placed by ``layer_idx`` after
+                    # the attn/ffn topo loop, so ``assignment`` won't have
+                    # them yet. Fall back to the pinned ``layer_idx`` (or to
+                    # ``target_op_name``'s already-placed layer) so an
+                    # attn/ffn op declaring ``requires["after"] = "<block_op>"``
+                    # gets its layer bumped past the referenced block.
+                    if ref_op.layer_idx is not None:
+                        ref_layer = ref_op.layer_idx
+                    elif ref_op.target_op_name is not None:
+                        ref_layer = assignment.get(ref_op.target_op_name)
                 if ref_layer is not None:
                     earliest = max(earliest, ref_layer + 1)
             same_layer_refs = requires_same_layer_as_ops(op)
             for ref in same_layer_refs:
+                ref_op = self._op_by_name.get(ref)
                 ref_layer = assignment.get(ref)
+                if ref_layer is None and ref_op is not None and ref_op.kind == "block":
+                    # Phase 8.A.4: same handling for ``requires["same_layer_as"]``
+                    # block refs — pull the layer from the block op's pin so
+                    # an attn/ffn op can co-place with a known block layer.
+                    if ref_op.layer_idx is not None:
+                        ref_layer = ref_op.layer_idx
+                    elif ref_op.target_op_name is not None:
+                        ref_layer = assignment.get(ref_op.target_op_name)
                 if ref_layer is not None:
                     earliest = max(earliest, ref_layer)
 
@@ -1478,7 +1498,17 @@ class LayerCompiler:
             # same_layer_as refs without dim deps may resolve in either
             # direction).
             for ref in same_layer_refs:
+                ref_op = self._op_by_name.get(ref)
                 ref_layer = assignment.get(ref)
+                if ref_layer is None and ref_op is not None and ref_op.kind == "block":
+                    # Phase 8.A.4: block-op ref — pull layer from the block's
+                    # ``layer_idx`` pin (or its resolved ``target_op_name``)
+                    # so the equality check fires even when block ops have
+                    # not yet been assigned by the post-topo loop.
+                    if ref_op.layer_idx is not None:
+                        ref_layer = ref_op.layer_idx
+                    elif ref_op.target_op_name is not None:
+                        ref_layer = assignment.get(ref_op.target_op_name)
                 if ref_layer is not None and ref_layer != layer:
                     raise ValueError(
                         f"Op {op.name!r} requires[\"same_layer_as\"] "
