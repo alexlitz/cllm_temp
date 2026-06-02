@@ -390,6 +390,45 @@ def _layer13_mem_addr_gather_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
+def make_layer13_attn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer13_mem_addr_gather``: declares mirrored
+    reads/writes so the LayerCompiler's dep graph reserves an L13 slot
+    for it. Mirrors ``_layer11_ffn_dep_anchor`` / ``_layer3_ffn_dep_anchor``:
+    the actual weight bake happens in ``layer13_mem_addr_gather`` (kind=
+    "block"); this op's bake is a no-op.
+
+    Phase 8.G.6: lets L13 block ops declare
+    ``target_op_name="_layer13_attn_dep_anchor"`` and bind to whichever
+    layer the compiler places the anchor at, instead of carrying a
+    literal ``layer_idx=13``.
+    """
+    def bake(attn, dim_positions, S):
+        # No-op: actual bake is in ``layer13_mem_addr_gather`` block op below.
+        return
+
+    return Operation(
+        name="_layer13_attn_dep_anchor",
+        # Phase=12.5 places this anchor between L12 MUL combine
+        # (phase=12) and L13 mem-addr-gather (phase=13). Same-step
+        # reads against the L12 dep anchor force the dep graph to land
+        # this at L13.
+        phase=12.5,
+        reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
+               "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC",
+               "OP_SI", "OP_SC", "MEM_ADDR_SRC", "L1H1"},
+        writes={"ADDR_B0_LO", "ADDR_B1_LO", "ADDR_B2_LO",
+                "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},
+        kind="attn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        # Pin strictly after the L12 anchor so the earliest landable
+        # layer is 13 (force a layer past L12).
+        requires={"after": "_layer12_ffn_dep_anchor"},
+        smoke_tests=set(),
+        spec_section=None,
+    )
+
+
 def make_layer13_mem_addr_gather_op() -> Operation:
     """L13 attention: gather MEM addr from STACK0 / AX_CARRY for SI/SC/LI/LC.
 
@@ -463,7 +502,10 @@ def make_layer13_mem_addr_gather_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer13_mem_addr_gather_ir,
         declarative_authority="spec_generated",
-        layer_idx=13,
+        # Phase 8.G.6: drop ``layer_idx=13`` literal; bind to the L13
+        # attn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer13_attn_dep_anchor",
         migrated=True,
         claims=_claims,
         smoke_tests={
@@ -546,7 +588,10 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=compiler_ir,
         declarative_authority="spec_generated",
-        layer_idx=13,
+        # Phase 8.G.6: drop ``layer_idx=13`` literal; bind to the L13
+        # attn dep anchor so the block op resolves to whichever layer
+        # the compiler places the anchor at.
+        target_op_name="_layer13_attn_dep_anchor",
         migrated=True,
         # Staleness invariants: L13 shift FFN consumes ALU_LO/HI (value to
         # shift) and AX_CARRY_LO (shift amount) at the AX marker for

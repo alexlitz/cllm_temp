@@ -238,6 +238,10 @@ def all_core_ops(
         # ``layer_idx=12`` literals.
         make_layer12_ffn_dep_anchor_op(),
         make_layer12_mul_combine_op(alu_mode=alu_mode),
+        # Phase 8.G.6: L13 attn dep anchor — gives L13 block ops a
+        # stable ``target_op_name`` to bind to so they can drop
+        # ``layer_idx=13`` literals.
+        make_layer13_attn_dep_anchor_op(),
         make_layer13_mem_addr_gather_op(),
         make_layer13_shifts_op(alu_mode=alu_mode),
         # 4-stage SHL/SHR composite (replaces ALUShift wrapper). Only
