@@ -167,7 +167,6 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
 
     return Operation(
         name="convo_io_opcode_decode",
-        phase=5.6,
         reads=set(),
         writes=set(),
         kind="block",
@@ -589,7 +588,6 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
 
     return Operation(
         name="convo_io_state_machine",
-        phase=6.6,
         reads=set(),
         writes=set(),
         kind="block",
@@ -794,7 +792,6 @@ def make_convo_io_step_resume_op(
 
     return Operation(
         name="convo_io_step_resume",
-        phase=3.2,
         reads=set(),
         writes=set(),
         kind="block",
@@ -907,7 +904,6 @@ def make_convo_io_pc_sp_latch_op(
 
     return Operation(
         name="convo_io_pc_sp_latch",
-        phase=6.7,
         reads=set(),
         writes=set(),
         kind="block",
@@ -1033,7 +1029,6 @@ def make_convo_io_prtf_capture_op(
 
     return Operation(
         name="convo_io_prtf_capture",
-        phase=7.6,
         reads=set(),
         writes=set(),
         kind="block",
@@ -1171,7 +1166,6 @@ def make_convo_io_prtf_transport_op(
 
     return Operation(
         name="convo_io_prtf_transport",
-        phase=4.6,
         reads=set(),
         writes=set(),
         kind="block",
