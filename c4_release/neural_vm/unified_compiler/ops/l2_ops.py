@@ -493,7 +493,6 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
 
     return Operation(
         name="layer2_initial_pc_bake_cancel",
-        phase=2.5,
         reads={"MARK_PC", "HAS_SE"},
         writes={"EMBED_LO", "EMBED_HI"},
         kind="block",
@@ -568,7 +567,6 @@ def make_layer2_threshold_attn_op() -> Operation:
 
     return Operation(
         name="layer2_threshold_attn",
-        phase=2,
         reads={"IS_MARK", "CONST"},
         writes={"L2H0"},
         kind="attn",
@@ -660,7 +658,6 @@ def make_layer2_lookback_detection_head_op(
 
     return Operation(
         name="layer2_lookback_detection_head",
-        phase=2.1,
         # Reads: CONST (Q/K gate), MARK_THINKING_START/END + IS_BYTE (V copy).
         # Writes go to LAST_WAS_THINKING_START/END/BYTE which are not
         # declared in declare_setdim_compat_dims (conversational-I/O-only
