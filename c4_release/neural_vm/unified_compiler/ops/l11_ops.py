@@ -238,7 +238,6 @@ def make_layer11_ffn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer11_ffn_dep_anchor",
-        phase=11,
         # Phase 9.B (ALU_LO SCC rename): ALU_LO -> ALU_LO.*.-1 marks the
         # read as SSA cross-step. layer16_lev_routing (phase 16) writes
         # ALU_LO as next-step PC staging; the L11 anchor's read is
