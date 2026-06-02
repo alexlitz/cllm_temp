@@ -2655,13 +2655,19 @@ def make_layer6_routing_ffn_op() -> Operation:
         # previous-step's CMP residual via the KV cache; same numeric
         # base as CMP, so weight bakes stay byte-identical. Breaks the
         # layer9_alu -> layer6_routing_ffn back-edge in the dep graph.
+        # Phase 9.B (DIV_STAGING SCC rename): DIV_STAGING -> DIV_STAGING.*.-1
+        # marks the read as SSA cross-step. layer10_alu (phase 10.2) is
+        # the sole DIV_STAGING writer and stages the value for the NEXT
+        # step's L6 routing FFN DIV/MOD routing. Same numeric slot via
+        # SSA alias; byte-identical bake. Breaks the L10 -> L6
+        # DIV_STAGING back-edge (singleton dim).
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
                "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1", "CMP.*.-1",
                "OUTPUT_LO.*.-1", "OUTPUT_HI.*.-1", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
-               "TEMP.*.-1", "DIV_STAGING"},
+               "TEMP.*.-1", "DIV_STAGING.*.-1"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="block",
         declarative_bake_fn=bake,
