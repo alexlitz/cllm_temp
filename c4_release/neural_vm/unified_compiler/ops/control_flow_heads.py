@@ -32,6 +32,7 @@ count path) for the ``enable=True`` bake to fit.
 from __future__ import annotations
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -285,6 +286,14 @@ def make_lev_detector_head_op(enable: bool = False) -> Operation:
             "BP_VIA_LEV_DETECTOR": "BP_byte0",
             "SP_VIA_LEV_DETECTOR": "SP_byte0",
         },
+        # Phase 11.A IR exposure: at the default ``enable=False`` config the
+        # bake body is a no-op (``if not enable: return``), so an empty IR
+        # is byte-identical. When ``enable=True``, the head is fully
+        # declarative (single :class:`DeclarativeAttentionHeadSpec` from
+        # :func:`_lev_detector_head_spec`); migrating to a true factory
+        # requires the ``head_idx`` allocation, which is bake-time
+        # (dynamic_first_fit) -- Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="docs/CONTROL_FLOW_DETECTOR_HEADS.md#2-lev-detector-head",
     )
