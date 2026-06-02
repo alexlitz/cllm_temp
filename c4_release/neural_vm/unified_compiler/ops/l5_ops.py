@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
@@ -513,7 +514,16 @@ def make_opcode_decode_ffn_op() -> Operation:
 
 
 def _opcode_decode_main_rules(S):
-    """CompilerIR rules for opcode byte decode at the AX marker."""
+    """CompilerIR rules for opcode byte decode at the AX marker.
+
+    Phase 8.D: the per-opcode write targets resolve through
+    :func:`dim_ref` for the ``(opcode_flag, <op_name>)`` semantic
+    family lookup -- each rule's output dim names the opcode-flag
+    role it asserts. The ``MARK_AX`` gate also moves to
+    ``dim_ref("marker", "AX")``. Structural ``OPCODE_BYTE_LO/HI+<lo|hi>``
+    operand reads stay as ``+N`` (per-nibble one-hot lookup indices
+    on the opcode byte's nibble decomposition).
+    """
 
     from ...embedding import Opcode
 
@@ -554,6 +564,7 @@ def _opcode_decode_main_rules(S):
         (Opcode.GETCHAR, 0, 4),
     ]
     op_names = _opcode_name_map()
+    gate_mark_ax = dim_ref("marker", "AX")
     return tuple(
         FFNRule.gated_write(
             name=f"l5_decode_{op_names[op_val].lower()}_at_ax",
@@ -562,39 +573,63 @@ def _opcode_decode_main_rules(S):
                 (f"OPCODE_BYTE_HI+{hi}", 1.0),
             ),
             threshold=1.5,
-            gate="MARK_AX",
-            writes=((op_names[op_val], 10.0 / S),),
+            gate=gate_mark_ax,
+            # ``op_names[op_val]`` is the ``"OP_<NAME>"`` slot string;
+            # rewriting it via dim_ref names the (opcode_flag, NAME)
+            # role lookup.
+            writes=((dim_ref("opcode_flag", op_names[op_val][3:]), 10.0 / S),),
         )
         for op_val, lo, hi in opcodes
     )
 
 
 def _opcode_decode_first_step_rules(S):
-    """CompilerIR rules for first-step PC-marker opcode decode."""
+    """CompilerIR rules for first-step PC-marker opcode decode.
 
+    Phase 8.D: ``OP_<NAME>`` write targets use :func:`dim_ref` for the
+    ``(opcode_flag, <NAME>)`` semantic pair. The single ``TEMP+0``
+    write (JSR's first-step IS_JSR flag) stays structural -- ``TEMP+0``
+    is a scratch-slot offset, not a role-meaningful byte position
+    or opcode-flag family member.
+    """
+
+    # Each entry is ``(opcode_lo_nibble, opcode_hi_nibble, out_dim)`` where
+    # ``out_dim`` is either ``dim_ref("opcode_flag", NAME)`` (the
+    # decoded opcode-flag family member) or the bare ``"TEMP+0"`` slot
+    # (JSR's first-step IS_JSR flag, owned by the temp_scratch family
+    # but without a dedicated role binding).
     first_step_opcodes = [
-        (2, 0, "OP_JMP"),
+        (2, 0, dim_ref("opcode_flag", "JMP")),
         (3, 0, "TEMP+0"),
-        (1, 0, "OP_IMM"),
-        (0, 0, "OP_LEA"),
-        (6, 2, "OP_EXIT"),
-        (7, 2, "OP_NOP"),
-        (9, 1, "OP_ADD"),
-        (10, 1, "OP_SUB"),
-        (11, 1, "OP_MUL"),
-        (12, 1, "OP_DIV"),
-        (13, 1, "OP_MOD"),
-        (14, 0, "OP_OR"),
-        (15, 0, "OP_XOR"),
-        (0, 1, "OP_AND"),
-        (1, 1, "OP_EQ"),
-        (3, 1, "OP_LT"),
-        (7, 1, "OP_SHL"),
-        (8, 1, "OP_SHR"),
+        (1, 0, dim_ref("opcode_flag", "IMM")),
+        (0, 0, dim_ref("opcode_flag", "LEA")),
+        (6, 2, dim_ref("opcode_flag", "EXIT")),
+        (7, 2, dim_ref("opcode_flag", "NOP")),
+        (9, 1, dim_ref("opcode_flag", "ADD")),
+        (10, 1, dim_ref("opcode_flag", "SUB")),
+        (11, 1, dim_ref("opcode_flag", "MUL")),
+        (12, 1, dim_ref("opcode_flag", "DIV")),
+        (13, 1, dim_ref("opcode_flag", "MOD")),
+        (14, 0, dim_ref("opcode_flag", "OR")),
+        (15, 0, dim_ref("opcode_flag", "XOR")),
+        (0, 1, dim_ref("opcode_flag", "AND")),
+        (1, 1, dim_ref("opcode_flag", "EQ")),
+        (3, 1, dim_ref("opcode_flag", "LT")),
+        (7, 1, dim_ref("opcode_flag", "SHL")),
+        (8, 1, dim_ref("opcode_flag", "SHR")),
     ]
     return tuple(
         FFNRule.constant_write(
-            name=f"l5_first_step_decode_{out_dim.lower().replace('+', '_')}",
+            # Preserve the legacy rule-name suffix shape by stripping
+            # the ``+0`` produced by ``dim_ref`` (turning ``OP_JMP+0``
+            # back into ``op_jmp``).
+            name=(
+                f"l5_first_step_decode_"
+                f"{out_dim.lower().replace('+', '_')}"
+                if out_dim.startswith("TEMP")
+                else f"l5_first_step_decode_"
+                     f"{out_dim.split('+', 1)[0].lower()}"
+            ),
             conditions=(
                 (f"OPCODE_BYTE_LO+{lo}", 1.0),
                 (f"OPCODE_BYTE_HI+{hi}", 1.0),
@@ -616,6 +651,10 @@ def _opcode_decode_temp_clear_rules(S):
     numbering.
     """
 
+    # No role-meaningful refs here: the ``gate=f"TEMP+{k}"`` / write target
+    # use ``k`` as a structural scratch-slot index (not a role), and the
+    # ``MARK_PC`` condition appears as an up-branch guard term (the L8 pilot
+    # preserved that convention).
     return tuple(
         FFNRule.gated_write(
             name=f"l5_temp_clear_{k}_at_pc",
@@ -630,7 +669,14 @@ def _opcode_decode_temp_clear_rules(S):
 
 
 def _opcode_decode_all_step_pc_rules(S):
-    """CompilerIR rules for all-step PC-marker opcode decode."""
+    """CompilerIR rules for all-step PC-marker opcode decode.
+
+    Phase 8.D: the per-opcode write target resolves through
+    :func:`dim_ref` for the ``(opcode_flag, <NAME>)`` semantic pair.
+    Structural ``OPCODE_BYTE_LO/HI+<lo|hi>`` operand reads stay as
+    ``+N`` and the ``MARK_PC`` up-branch guard condition stays bare
+    (the L8 pilot kept marker-on-up-branch terms structural).
+    """
 
     from ...embedding import Opcode
 
@@ -651,7 +697,9 @@ def _opcode_decode_all_step_pc_rules(S):
                 ("MARK_PC", 1.0),
             ),
             threshold=2.5,
-            writes=((op_names[op_val], 10.0 / S),),
+            # ``op_names[op_val]`` is the ``"OP_<NAME>"`` slot string;
+            # ``dim_ref("opcode_flag", NAME)`` names the role.
+            writes=((dim_ref("opcode_flag", op_names[op_val][3:]), 10.0 / S),),
         )
         for op_val, lo, hi in all_step_opcodes
     )
