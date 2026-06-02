@@ -189,15 +189,42 @@ def build_state_from_report(
             continue
         all_dims.add(entry.dim_name)
 
+    # Phase 7.F.6: project the AND universe onto dims that any attention
+    # head's K/V projection actually samples. Dims that no attention
+    # head reads contribute zero columns to W_K / W_V; their residual
+    # value can be anything (including the cached stale value) without
+    # affecting the K/V dot product. So those dims don't need to be in
+    # the per-row AND.
+    #
+    # Prefer the per-layer attention universe when the caller supplied a
+    # specific ``layer_idx`` — the K/V projection at layer L only reads
+    # the dims declared by ops pinned to L (other layers' attn-read dims
+    # don't affect L's row). When the layer-specific universe is empty
+    # (e.g. attn ops are dynamically routed and not annotated with
+    # ``layer_idx``), fall back to the global universe; that's still
+    # tighter than the analyzer-derived ``all_dims`` (which also folds
+    # in FFN-only writes).
+    attn_universe_by_layer = getattr(
+        report, "attention_read_dim_names_by_layer", None
+    )
+    attn_universe_global = getattr(report, "attention_read_dim_names", None)
+    attn_universe = None
+    if attn_universe_by_layer and layer_idx is not None:
+        attn_universe = attn_universe_by_layer.get(layer_idx)
+    if not attn_universe and attn_universe_global:
+        attn_universe = attn_universe_global
+    if attn_universe:
+        all_dims = set(attn_universe)
+
     evictable_positions_at_step: Dict[int, Set[int]] = {}
     if all_dims:
         for step, by_pos in per_step_dim_count.items():
             positions: Set[int] = set()
             for position, dims_dead in by_pos.items():
-                # Conservative AND: every dim slot at this position
-                # must have been declared evictable. Otherwise some
-                # surviving dim slot could be queried by a future K
-                # projection, so the row stays live.
+                # Conservative AND: every attention-K/V-read dim at this
+                # position must have been declared evictable. Other dims
+                # (FFN-only) contribute no K/V projection and are safe
+                # to leave in the (possibly zeroed) row.
                 if dims_dead >= all_dims:
                     positions.add(position)
             if positions:

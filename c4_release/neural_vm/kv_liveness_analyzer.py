@@ -13,8 +13,7 @@ that participate in a self-referential write/read loop across ops).
 
 Coverage notes
 --------------
-This is the first pass. Only a few high-confidence categories produce
-``evictable`` entries; everything else falls into ``conservative_keep``:
+The high-confidence categories that produce ``evictable`` entries:
 
   * ``TEMP_*`` (and known per-step scratch dims) with no cross-step reader.
   * ``OUTPUT_LO_PREV_STEP`` (or any dim suffixed ``_PREV_STEP``) entries
@@ -22,6 +21,11 @@ This is the first pass. Only a few high-confidence categories produce
     Once that consuming step passes, the entry is dead.
   * Register-marker dims whose later writes overwrite the same residual
     cell (semantic overwrite) without any future K-read.
+  * Per-step register channels (``REG_*``, ``OP_*``, ``ADDR_*``,
+    ``ALU_*``, ``MEM_*``, ``FETCH_*``, ``BYTE_INDEX_*``, ``EMBED_*``)
+    whose every-step writer dominates every reader by phase order. The
+    cache entry from step S is provably dead once step S+1's writer
+    fires (Phase 7.F.6).
 
 The analyzer is READ-ONLY; it never mutates the IR.
 
@@ -34,19 +38,37 @@ Algorithm sketch
    * ``attn_q_reads_by_op`` / ``attn_kv_reads_by_op`` /
      ``attn_o_writes_by_op`` : dim references used by attention heads.
    * ``op_step`` : the step number for each op (derived from declared
-     ``step_idx`` when available, else 0).
-2. Compute the dim-level dependency cycle membership:
-   * Build a directed graph between dim names: ``A -> B`` if any op reads
-     A and writes B. Any dim in a strongly-connected component of size
-     >= 2, or with a self-loop, is "cycle member".
-3. For each step S and each prospective KV entry ``(L, pos, head, dim)``:
+     ``step_idx`` when available, else "every step").
+   * ``op_phase`` : within-step ordering hint (smaller = earlier).
+2. Phase 7.F.6 cycle refinement:
+   * A dim D is a "same-step transient" if every reader of D has at
+     least one writer that fires same-step with phase <= reader's phase
+     (writer dominates reader → value is fresh same-step input, not a
+     carry from the previous step). Same-step transients are NOT cycle
+     members for KV-cache purposes.
+   * A dim D is a true "cross-step cycle" iff:
+       - its name ends with one of the cross-step suffixes
+         (``_PREV_STEP`` / ``_PREV`` / ``_LAST_STEP``), OR
+       - it has a reader with NO dominating same-step writer (writer
+         either fires only at specific later steps or always lags the
+         reader by phase) and no fires-every-step writer overrides it.
+   * SCC self-loops are no longer automatic cycle markers — a self-loop
+     where the writer's phase dominates the reader's phase is treated
+     as same-step transient.
+3. Phase 7.F.6 semantic-overwrite expansion:
+   * Treat ops with ``step_idx=None`` (or "every") as writing at every
+     step. ``writes_at_step[s]`` for any step ``s`` then includes the
+     full every-step writer set, so register channels picked up by
+     decode-style writers become evictable after each step's write.
+4. For each step S and each prospective KV entry ``(L, pos, head, dim)``:
    * If any later step's AttentionHeadIR K/V projection reads ``dim`` -> LIVE.
    * If the entry's dim is cycle-member and
      ``treat_cycle_members_conservative=True`` -> conservative keep.
    * Otherwise classify by category:
        - ``TEMP_*`` / known scratch -> evictable after step.
-       - ``*_PREV_STEP`` -> evictable two steps after write.
-       - Register-marker overwritten by later position write -> evictable.
+       - ``*_PREV_STEP`` -> evictable one step after write (after the
+         consuming step passes).
+       - Register-marker overwritten by NEXT step's write -> evictable.
        - Default: conservative keep.
 
 The categorisation logic is heuristic and conservative on purpose; it
@@ -106,11 +128,27 @@ class LivenessReport:
             analyzer evicts every theoretical entry it inspected; in
             practice the initial implementation lands somewhere lower as it
             keeps unknown dims conservative.
+        attention_read_dim_names: dim names that are read by any
+            attention head's K/V projection (across all layers / steps).
+            Consumers like ``build_state_from_report`` use this to
+            restrict the runtime AND universe — dims that aren't sampled
+            by any attention K/V projection cannot keep a cache row
+            alive, so they don't need to participate in the
+            ``every-dim-must-be-dead`` row-level check.
+        attention_read_dim_names_by_layer: per-layer dim universe for
+            attention K/V reads. Maps ``layer_idx -> set of dim names``
+            read by any attention head pinned to that layer (via
+            ``op.layer_idx``). When a layer is missing from this map,
+            consumers fall back to the global ``attention_read_dim_names``.
     """
 
     evictable_at_step: Dict[int, Set[KVEntry]] = field(default_factory=dict)
     cycle_conservative: Set[KVEntry] = field(default_factory=set)
     coverage: float = 0.0
+    attention_read_dim_names: Set[str] = field(default_factory=set)
+    attention_read_dim_names_by_layer: Dict[int, Set[str]] = field(
+        default_factory=dict
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +323,20 @@ def _attn_head_o_dims(head) -> Set[int]:
 # ---------------------------------------------------------------------------
 
 
+# Sentinel for "fires at every step" (op.step_idx is None / "every" / etc.).
+# We model these as a special marker in the step set; the analyzer treats
+# them as if they were members of every step in ``range(n_steps)``.
+_EVERY_STEP = "__every__"
+
+
 def _op_step(op) -> int:
-    """Return the step index an op is anchored to, or 0 if unknown."""
+    """Return the step index an op is anchored to, or 0 if unknown.
+
+    Legacy helper kept for backwards-compatible tests that probe a single
+    step. New code should call :func:`_op_step_set` which returns a
+    structured representation (set of ints OR the ``_EVERY_STEP``
+    sentinel).
+    """
 
     step_idx = getattr(op, "step_idx", None)
     if isinstance(step_idx, int):
@@ -297,36 +347,200 @@ def _op_step(op) -> int:
     return 0
 
 
+def _op_step_set(op):
+    """Return the structured step set an op fires at.
+
+    Returns either:
+      * ``_EVERY_STEP`` — op fires at every step (``step_idx`` is ``None``
+        or ``"every"`` or other non-int hint).
+      * A ``frozenset[int]`` of concrete step indices when ``step_idx``
+        is an int OR an iterable of ints.
+
+    "after_first" is conservatively treated as ``_EVERY_STEP`` (we don't
+    know how many steps the program runs for; treating it as every-step
+    is the conservative-for-cycles, optimistic-for-eviction choice).
+    """
+
+    step_idx = getattr(op, "step_idx", None)
+    if step_idx is None:
+        return _EVERY_STEP
+    if isinstance(step_idx, int):
+        return frozenset({step_idx})
+    if isinstance(step_idx, str):
+        # "every" / "after_first" / other free-form hints → every step.
+        return _EVERY_STEP
+    try:
+        ints = frozenset(int(s) for s in step_idx)
+        return ints if ints else _EVERY_STEP
+    except (TypeError, ValueError):
+        return _EVERY_STEP
+
+
+def _op_phase(op) -> Optional[float]:
+    """Return the op's declared phase ordering hint, or None when unset."""
+
+    phase = getattr(op, "phase", None)
+    if phase is None:
+        return None
+    try:
+        return float(phase)
+    except (TypeError, ValueError):
+        return None
+
+
+# Register-channel dim-name prefixes whose values are typically refreshed
+# every step by a same-step writer (decode, ALU dispatch, address
+# resolution, etc.). When the analyzer detects an every-step writer for
+# such a dim AND every reader is phase-dominated by the writer, the dim
+# becomes an evictable per-step transient (Phase 7.F.6 semantic-overwrite
+# expansion). The list is informational — the algorithm relies on the
+# phase + every-step-writer signal, not the prefix.
+_REGISTER_CHANNEL_PREFIXES: Tuple[str, ...] = (
+    "REG_",
+    "OP_",
+    "ADDR_",
+    "ALU_",
+    "MEM_",
+    "FETCH_",
+    "BYTE_INDEX_",
+    "EMBED_",
+    "MARK_",
+)
+
+
+def _looks_like_register_channel(dim_name: str) -> bool:
+    upper = dim_name.upper()
+    return any(upper.startswith(p) for p in _REGISTER_CHANNEL_PREFIXES)
+
+
 # ---------------------------------------------------------------------------
 # Dim cycle detection
 # ---------------------------------------------------------------------------
 
 
 def _dim_cycle_members(ops: Sequence) -> Set[str]:
-    """Return dims that participate in a producer/consumer cycle.
+    """Return dims that participate in a TRUE cross-step producer/consumer cycle.
 
-    A dim D is a cycle member if there exist ops O1, O2, ..., On (n>=1)
-    and dims D = D0, D1, ..., Dn = D such that for each i, Oi reads
-    Di-1 and writes Di. Self-loops count: a single op that both reads
-    and writes D puts D in the cycle set.
+    Phase 7.F.6 refinement: the previous implementation treated every
+    self-loop (op reads D, op writes D) as a cycle. Real declarative IR
+    has many such "transient" self-loops where the value is overwritten
+    same-step (e.g. ``OP_PSH`` written by L5 decode at phase=5 and read
+    by L7 dispatch at phase=7 — fresh every step, never a carry).
 
-    Built using Tarjan-style SCC on the projection of the use/def graph
-    onto dim names.
+    Refined rule for dim D being a cross-step cycle member:
+
+      1. **Explicit cross-step alias**: D's name ends with one of
+         ``_PREV_STEP`` / ``_PREV`` / ``_LAST_STEP``. These dims are
+         specifically authored to relay a previous-step value forward
+         (B9 OUTPUT_HI split, B11 OUTPUT_LO split, etc.).
+      2. **Phase-undominated reader**: there exists at least one reader
+         op R with phase ``Pr`` such that NO writer of D fires same-step
+         with phase ``Pw <= Pr``. The reader is therefore consuming a
+         value carried over from a previous step (or from no writer at
+         all — which means D is a constant cache slot, also cross-step
+         from the analyzer's perspective).
+
+    A self-loop where the writer's phase >= the reader's phase (i.e. the
+    op overwrites D before any future reader sees it) is **not** a cycle
+    — the value at step S is overwritten by step S+1's writer before any
+    later attention K projection could sample it.
+
+    Multi-dim SCCs (size >= 2) are still flagged as cycles: those imply
+    a producer/consumer chain that the static analyzer cannot decompose
+    without more semantic data.
     """
 
-    # Build dim-to-dim edges from each op: read_dim -> write_dim.
-    succ: Dict[str, Set[str]] = defaultdict(set)
+    # Per-dim metadata.
+    readers_by_dim: Dict[str, List[Tuple[str, Optional[float], object]]] = (
+        defaultdict(list)
+    )
+    writers_by_dim: Dict[str, List[Tuple[str, Optional[float], object]]] = (
+        defaultdict(list)
+    )
     all_dims: Set[str] = set()
+    # Track (read_dim, write_dim) edges for the multi-dim SCC pass; only
+    # cross-op edges contribute (self-loops are handled separately).
+    succ: Dict[str, Set[str]] = defaultdict(set)
     for op in ops:
         reads = _all_op_reads(op)
         writes = _all_op_writes(op)
         all_dims.update(reads)
         all_dims.update(writes)
+        name = getattr(op, "name", repr(op))
+        phase = _op_phase(op)
+        steps = _op_step_set(op)
+        for r in reads:
+            readers_by_dim[r].append((name, phase, steps))
+        for w in writes:
+            writers_by_dim[w].append((name, phase, steps))
         for r in reads:
             for w in writes:
-                succ[r].add(w)
+                if r != w:  # exclude self-loop; covered by the per-dim check
+                    succ[r].add(w)
 
-    # Tarjan SCC
+    # 1) Per-dim same-step phase-dominance check.
+    def _is_same_step_transient(dim: str) -> bool:
+        readers = readers_by_dim.get(dim, [])
+        writers = writers_by_dim.get(dim, [])
+        if not readers or not writers:
+            return False
+        # Every reader must have a writer that fires same-step AND has
+        # phase <= reader's phase.
+        for r_name, r_phase, r_steps in readers:
+            if r_phase is None:
+                # Reader's phase unknown — we can't prove dominance for
+                # this reader. Treat as non-transient.
+                return False
+            dominated = False
+            for w_name, w_phase, w_steps in writers:
+                if w_phase is None:
+                    continue
+                if w_phase > r_phase:
+                    continue
+                # Check step overlap: writer must fire at every step the
+                # reader fires at, OR at least guarantee a same-step
+                # write before the reader for the reader's domain.
+                if w_steps == _EVERY_STEP:
+                    # Writer fires every step → dominates every reader-step.
+                    dominated = True
+                    break
+                if r_steps == _EVERY_STEP:
+                    # Reader fires every step; writer fires only at some
+                    # steps → there's a step the reader fires without a
+                    # same-step writer. Not dominated for this reader.
+                    continue
+                # Both are concrete step sets. Writer must cover every
+                # reader step.
+                if r_steps <= w_steps:
+                    dominated = True
+                    break
+            if not dominated:
+                return False
+        return True
+
+    cycle_dims: Set[str] = set()
+    same_step_transient: Set[str] = set()
+    for dim in all_dims:
+        # Explicit cross-step alias is a cycle member only when it has
+        # both a reader and a writer in the corpus — a pure writer (no
+        # consumer) cannot form a cycle, and we want the per-step
+        # classifier to fall through to the PREV_STEP eviction category
+        # in that case.
+        if _is_prev_step_dim(dim):
+            if readers_by_dim.get(dim) and writers_by_dim.get(dim):
+                cycle_dims.add(dim)
+            continue
+        if _is_same_step_transient(dim):
+            same_step_transient.add(dim)
+            continue
+        # If the dim has a reader, no dominating writer → cross-step cycle.
+        if readers_by_dim.get(dim) and writers_by_dim.get(dim):
+            cycle_dims.add(dim)
+
+    # 2) Multi-dim SCC pass (size >= 2). A multi-dim SCC implies a
+    # producer/consumer chain that is harder to reason about; flag every
+    # member as a cycle EXCEPT those we've already shown to be same-step
+    # transient.
     index_counter = [0]
     stack: List[str] = []
     on_stack: Set[str] = set()
@@ -360,15 +574,11 @@ def _dim_cycle_members(ops: Sequence) -> Set[str]:
         if v not in indices:
             strongconnect(v)
 
-    cycle_dims: Set[str] = set()
     for comp in sccs:
         if len(comp) > 1:
-            cycle_dims.update(comp)
-            continue
-        # singleton — check for self-loop
-        only = comp[0]
-        if only in succ.get(only, ()):
-            cycle_dims.add(only)
+            for dim in comp:
+                if dim not in same_step_transient:
+                    cycle_dims.add(dim)
     return cycle_dims
 
 
@@ -440,6 +650,7 @@ def analyze_kv_liveness(
     ffn_reads_by_op: Dict[str, Set[str]] = {}
     attn_kv_read_dim_names_by_op: Dict[str, Set[str]] = {}
     attn_heads_seen: Set[Tuple[int, int]] = set()
+    op_has_attention: Dict[str, bool] = {}
     for op in ops_list:
         name = getattr(op, "name", repr(op))
         op_ffn_reads: Set[str] = set()
@@ -450,12 +661,26 @@ def analyze_kv_liveness(
         ffn_reads_by_op[name] = op_ffn_reads
         ffn_writes_by_op[name] = op_ffn_writes
 
-        # For attention K/V reads we record the declared op.reads as the
-        # canonical dim-name set (positional integer dims in the spec
-        # don't carry semantic names).
-        attn_kv_read_dim_names_by_op[name] = set(getattr(op, "reads", ()) or ())
+        op_attn_heads = _attention_heads_from_op(op)
+        op_kind = getattr(op, "kind", None)
+        # Phase 7.F.6: for KV-cache liveness purposes, only attention K/V
+        # reads keep a cached entry alive — FFN reads sample the
+        # same-step residual stream, not the K/V cache. An op is treated
+        # as an attention reader if it declares ``kind="attn"`` OR if
+        # its compiler_ir already resolved to one or more
+        # AttentionHeadIR instances (which catches the declarative
+        # path); kind="block" and kind="ffn" never extend the cache
+        # lifetime via their declared reads.
+        is_attn_op = bool(op_attn_heads) or op_kind == "attn"
+        op_has_attention[name] = is_attn_op
+        if is_attn_op:
+            attn_kv_read_dim_names_by_op[name] = set(
+                getattr(op, "reads", ()) or ()
+            )
+        else:
+            attn_kv_read_dim_names_by_op[name] = set()
 
-        for head in _attention_heads_from_op(op):
+        for head in op_attn_heads:
             attn_heads_seen.add(
                 (int(getattr(op, "layer_idx", 0) or 0), head.head_idx)
             )
@@ -463,37 +688,67 @@ def analyze_kv_liveness(
     # 2) Identify cycle dims.
     cycle_dims = _dim_cycle_members(ops_list)
 
-    # 3) Index later-step KV/Q dim-name reads for fast lookup.
-    #     later_kv_reads[step] = set of dim names that *some* op at step
-    #     > step reads via attention.
-    sorted_steps = sorted({_op_step(op) for op in ops_list} | {0})
-    max_known_step = max(sorted_steps + [n_steps - 1])
+    # 3) Index per-step reads / writes.
+    #
+    # Phase 7.F.6 semantic-overwrite expansion: an op with
+    # ``step_idx=None`` (or ``"every"``) fires at every step. The
+    # previous implementation bucketed those at step 0 only, which left
+    # ``writes_at_step[s>0]`` empty for the majority of ops. We now treat
+    # every-step ops as members of every step ``s in range(n_steps)`` so
+    # the future-writes / future-reads sets reflect the actual VM.
+    by_step: Dict[int, List] = defaultdict(list)
+    every_step_ops: List = []
+    for op in ops_list:
+        steps = _op_step_set(op)
+        if steps == _EVERY_STEP:
+            every_step_ops.append(op)
+            for s in range(n_steps):
+                by_step[s].append(op)
+        else:
+            for s in steps:
+                by_step[s].append(op)
 
-    # For each step S, what attention-KV dim names will be referenced at
-    # any step > S?
+    # Every-step reads/writes (used both directly and below).
+    # Reads here are attention-K/V reads only; FFN reads sample the
+    # same-step residual stream, not the cache, so they don't extend a
+    # cache entry's lifetime.
+    every_step_reads: Set[str] = set()
+    every_step_writes: Set[str] = set()
+    for op in every_step_ops:
+        name = getattr(op, "name", repr(op))
+        every_step_reads.update(
+            attn_kv_read_dim_names_by_op.get(name, set())
+        )
+        every_step_writes.update(ffn_writes_by_op.get(name, set()))
+
+    # Per-step writes set used by the semantic-overwrite check.
+    writes_at_step: Dict[int, Set[str]] = {}
+    for step in range(n_steps):
+        wset: Set[str] = set(every_step_writes)
+        for op in by_step.get(step, ()):
+            if op in every_step_ops:
+                continue
+            name = getattr(op, "name", repr(op))
+            wset.update(ffn_writes_by_op.get(name, set()))
+        writes_at_step[step] = wset
+
+    max_known_step = max([n_steps - 1] + list(by_step.keys()) + [0])
+
+    # For each step S, what attention-K/V dim names will be referenced
+    # at any step >= S? Only attention reads count here — FFN reads
+    # sample the same-step residual stream and do not access the cache.
     attn_reads_at_or_after: Dict[int, Set[str]] = {}
     cumulative_later: Set[str] = set()
-    # Iterate descending so we can accumulate "what is read at step >= k"
-    # easily.
-    by_step: Dict[int, List] = defaultdict(list)
-    for op in ops_list:
-        by_step[_op_step(op)].append(op)
-
-    # Also remember every write per step for "semantic overwrite" check.
-    writes_at_step: Dict[int, Set[str]] = defaultdict(set)
-    for step, ops_at in by_step.items():
-        for op in ops_at:
-            writes_at_step[step].update(ffn_writes_by_op.get(getattr(op, "name", ""), set()))
-
     for step in range(max_known_step, -1, -1):
-        # accumulate reads from this step too — used by callers asking
-        # "what's read at step >= S?"; we'll subtract S itself below.
+        # Every-step reads contribute at every step.
+        cumulative_later.update(every_step_reads)
+        # Step-specific reads accumulate as we walk descending.
         for op in by_step.get(step, ()):
+            if op in every_step_ops:
+                continue
+            name = getattr(op, "name", repr(op))
             cumulative_later.update(
-                attn_kv_read_dim_names_by_op.get(getattr(op, "name", ""), set())
-            )
-            cumulative_later.update(
-                ffn_reads_by_op.get(getattr(op, "name", ""), set())
+                attn_kv_read_dim_names_by_op.get(name, set())
             )
         attn_reads_at_or_after[step] = set(cumulative_later)
 
@@ -537,8 +792,17 @@ def analyze_kv_liveness(
 
     for step in range(n_steps):
         future_reads = _read_at_any_step_at_or_after(step)
-        future_writes: Set[str] = set()
-        for later_step in range(step + 1, n_steps):
+        # Phase 7.F.6 semantic-overwrite expansion: loosen the future-write
+        # criterion to "written at the very next step" (or any later
+        # step). Since every-step writers now populate writes_at_step at
+        # every step, the next-step check is sufficient — if step S+1's
+        # writer overwrites D, the cache row at position S is provably
+        # dead at step S+1's boundary.
+        next_step_writes: Set[str] = (
+            writes_at_step.get(step + 1, set()) if (step + 1) < n_steps else set()
+        )
+        future_writes: Set[str] = set(next_step_writes)
+        for later_step in range(step + 2, n_steps):
             future_writes.update(writes_at_step.get(later_step, set()))
 
         for dim_name in all_dim_names:
@@ -551,11 +815,18 @@ def analyze_kv_liveness(
                         dim_name=dim_name,
                     )
                     total_considered += 1
-                    if dim_name in future_reads:
-                        # Some later op explicitly reads this dim — LIVE.
-                        continue
+                    # Phase 7.F.6: cycle classification fires BEFORE the
+                    # future-reads test so that cycle-conservative
+                    # bookkeeping is observable even when the dim also
+                    # happens to be read at a later step. (A cycle dim is
+                    # always live for KV purposes; we just want it
+                    # bucketed under ``cycle_conservative`` rather than
+                    # vanishing into the "future-reads keep" bucket.)
                     if treat_cycle_members_conservative and dim_name in cycle_dims:
                         cycle_kept.add(entry)
+                        continue
+                    if dim_name in future_reads:
+                        # Some later op explicitly reads this dim — LIVE.
                         continue
 
                     # Categorise: scratch / prev-step / overwrite.
@@ -572,6 +843,16 @@ def analyze_kv_liveness(
                             evictable_at_step[evict_step].add(entry)
                             total_evicted += 1
                         continue
+                    # Phase 7.F.6: prefer the tight "next-step overwrite"
+                    # signal — if step S+1 writes the dim, the position
+                    # S value can be evicted at step S. This catches the
+                    # register-channel (REG_*, OP_*, ADDR_*, ALU_*, ...)
+                    # pattern: an every-step writer refreshes the dim at
+                    # the very next step.
+                    if dim_name in next_step_writes:
+                        evictable_at_step[step].add(entry)
+                        total_evicted += 1
+                        continue
                     if dim_name in future_writes:
                         # Semantic overwrite: same residual cell will be
                         # written later, and we've already confirmed no
@@ -582,10 +863,26 @@ def analyze_kv_liveness(
                     # Default — conservative keep.
 
     coverage = (total_evicted / total_considered) if total_considered else 0.0
+    # Phase 7.F.6: expose the attention-K/V-read dim universe so the
+    # runtime build_state_from_report can scope the per-row AND to dims
+    # that genuinely contribute to a K/V projection.
+    attention_read_dim_names: Set[str] = set()
+    attention_read_dim_names_by_layer: Dict[int, Set[str]] = defaultdict(set)
+    for op in ops_list:
+        name = getattr(op, "name", repr(op))
+        dims = attn_kv_read_dim_names_by_op.get(name, set())
+        if not dims:
+            continue
+        attention_read_dim_names.update(dims)
+        layer_val = getattr(op, "layer_idx", None)
+        if isinstance(layer_val, int):
+            attention_read_dim_names_by_layer[layer_val].update(dims)
     return LivenessReport(
         evictable_at_step=evictable_at_step,
         cycle_conservative=cycle_kept,
         coverage=coverage,
+        attention_read_dim_names=attention_read_dim_names,
+        attention_read_dim_names_by_layer=dict(attention_read_dim_names_by_layer),
     )
 
 
