@@ -629,6 +629,51 @@ def _layer14_mem_generation_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
+def make_layer14_attn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer14_mem_generation``: declares mirrored
+    reads/writes so the LayerCompiler's dep graph reserves an L14 slot.
+
+    Mirrors ``_layer13_attn_dep_anchor`` / ``_layer11_ffn_dep_anchor``
+    / ``_layer3_ffn_dep_anchor``: the actual weight bake happens in
+    ``layer14_mem_generation`` (kind="attn"); this op's bake is a no-op.
+
+    Phase 8.G.6 follow-up (4-of-4 holdouts): lets
+    ``layer14_mem_generation`` declare
+    ``requires={"same_layer_as": "_layer14_attn_dep_anchor"}`` (kind="attn"
+    cannot use ``target_op_name`` — that field is block-op-only) and drop
+    its ``layer_idx=14`` literal. ``requires={"after":
+    "_layer13_attn_dep_anchor"}`` pins this anchor strictly past L13 so
+    the earliest landable layer is L14, mirroring the L13 anchor's pin
+    past L12.
+    """
+    def bake(attn, dim_positions, S):
+        # No-op: actual bake is in ``layer14_mem_generation`` (kind="attn").
+        return
+
+    return Operation(
+        name="_layer14_attn_dep_anchor",
+        # Phase=13.5 places this anchor between L13 mem-addr-gather
+        # (phase=13) and L14 mem-generation (phase=14). Same-step reads
+        # against the L13 anchor force the dep graph to land this at L14.
+        phase=13.5,
+        # Subset of layer14_mem_generation reads/writes. Excludes the
+        # high-fan-in dims (CLEAN_EMBED, OUTPUT) the routing/attn fabric
+        # writes everywhere, so the anchor's earliest landable layer is
+        # not pushed past L14 by upstream same-step writers.
+        reads={"MARK_MEM", "MARK_SP", "OP_PSH", "OP_SI", "OP_SC",
+               "OP_JSR", "OP_ENT", "MEM_STORE", "MEM_ADDR_SRC"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        kind="attn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        # Pin strictly after the L13 anchor so the earliest landable
+        # layer is L14 (force a layer past L13).
+        requires={"after": "_layer13_attn_dep_anchor"},
+        smoke_tests=set(),
+        spec_section=None,
+    )
+
+
 def make_layer14_mem_generation_op() -> Operation:
     """L14 attention: generate MEM section tokens (addr + value) for SI/SC/PSH.
 
@@ -692,7 +737,14 @@ def make_layer14_mem_generation_op() -> Operation:
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3", "IS_BYTE"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
-        layer_idx=14,
+        # Phase 8.G.6 follow-up: drop ``layer_idx=14`` literal and bind to
+        # the L14 attn dep anchor via ``requires["same_layer_as"]``.
+        # ``kind="attn"`` cannot use ``target_op_name`` (block-op-only),
+        # so co-placement with ``_layer14_attn_dep_anchor`` is the
+        # equivalent mechanism. The anchor in turn is pinned past
+        # ``_layer13_attn_dep_anchor`` so the earliest landable layer is
+        # L14 — byte-identical placement to the prior literal pin.
+        requires={"same_layer_as": "_layer14_attn_dep_anchor"},
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer14_mem_generation_ir,
         declarative_authority="spec_generated",

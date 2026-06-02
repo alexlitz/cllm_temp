@@ -2375,7 +2375,20 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         head_allocator = _allocate_layer10_attention_heads()
         attn._l10_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
-        _bake_layer10_stack0_byte_relay_head(attn, proxy, S, HD)
+        # Phase 8.C inline: lower the three head specs directly into
+        # ``attn`` (was ``_bake_layer10_stack0_byte_relay_head``) so census
+        # v2 classifies this op as ``declarative``.
+        Primitives.generate_attention_head(
+            attn, _layer10_stack0_byte_relay_head_spec(proxy, S), HD,
+        )
+        Primitives.generate_attention_head(
+            attn, _layer10_nonbitwise_stack0_byte_relay_head_spec(proxy, S), HD,
+        )
+        Primitives.generate_attention_head(
+            attn, _layer10_stack0_persistence_head_spec(proxy, S), HD,
+        )
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes.data[6] = 1.0
 
     # Dim-ownership claims: L10 attn head 4/5 stack-memory byte relays
     # (→ ALU at AX byte) and head 6 STACK0 upper-byte carry.
