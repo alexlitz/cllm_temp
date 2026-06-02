@@ -228,6 +228,9 @@ def make_l8_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
         _make_alu_postop_attach_op(
             "l8_alu_postop_attach", 8, "ALUAddSub", alu_mode,
             same_layer_as="layer8_alu",
+            # layer8_alu binds to ``layer10_byte_passthrough`` (kind=attn);
+            # the postop attach co-places via the same anchor.
+            target_op_name="layer10_byte_passthrough",
         )
     )
 
@@ -237,6 +240,8 @@ def make_l9_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
         _make_alu_postop_attach_op(
             "l9_alu_postop_attach", 9, "ALUAddSub", alu_mode,
             same_layer_as="layer9_alu",
+            # layer9_alu binds to ``layer9_marker_suppress`` (kind=ffn).
+            target_op_name="layer9_marker_suppress",
         )
     )
 
@@ -246,6 +251,8 @@ def make_l10_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
         _make_alu_postop_attach_op(
             "l10_alu_postop_attach", 10, "ALUAndOrXor", alu_mode,
             same_layer_as="layer10_alu",
+            # layer10_alu binds to ``layer10_carry_relay`` (kind=attn).
+            target_op_name="layer10_carry_relay",
         )
     )
 
@@ -255,6 +262,8 @@ def make_l11_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
         _make_alu_postop_attach_op(
             "l11_alu_postop_attach", 11, "ALUMul", alu_mode,
             same_layer_as="layer11_mul_partial",
+            # layer11_mul_partial binds to ``_layer11_ffn_dep_anchor``.
+            target_op_name="_layer11_ffn_dep_anchor",
         )
     )
 
@@ -264,6 +273,8 @@ def make_l12_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
         _make_alu_postop_attach_op(
             "l12_alu_postop_attach", 12, "ALUMul", alu_mode,
             same_layer_as="layer12_mul_combine",
+            # layer12_mul_combine binds to ``_layer12_ffn_dep_anchor``.
+            target_op_name="_layer12_ffn_dep_anchor",
         )
     )
 
@@ -273,6 +284,8 @@ def make_l13_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
         _make_alu_postop_attach_op(
             "l13_alu_postop_attach", 13, "ALUShift", alu_mode,
             same_layer_as="layer13_shifts",
+            # layer13_shifts binds to ``_layer13_attn_dep_anchor``.
+            target_op_name="_layer13_attn_dep_anchor",
         )
     )
 

@@ -165,7 +165,8 @@ def _bake_post_op_into(ffn, post_op_instance, hidden_offset: int = 0) -> int:
 
 def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
                                alu_mode: str = 'lookup',
-                               same_layer_as: str = None) -> Operation:
+                               same_layer_as: str = None,
+                               target_op_name: str = None) -> Operation:
     """Construct an ALU postop-attach Operation.
 
     Args:
@@ -233,20 +234,27 @@ def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
     requires: Dict[str, str] = {}
     if same_layer_as is not None:
         requires["same_layer_as"] = same_layer_as
-    # Phase 8.G.6: drop the ``layer_idx=`` literal pin. ``target_op_name``
-    # binds this block op to whichever layer the wrapped ALU op resolves
-    # to (mirroring the dep DAG); ``requires["same_layer_as"]`` is the
+    # Phase 8.G.6: drop the ``layer_idx=`` literal pin in favour of
+    # ``target_op_name=`` pointing at an attn/ffn anchor that resolves to
+    # the wrapped ALU op's layer. ``requires["same_layer_as"]`` is the
     # strict-mode dep-edge signal that this co-placement is intentional.
     # ``phase=1180+`` keeps the >= 100 post-pass short-circuit in the
     # strict admission gate (``_current_layer_for_strict`` returns
-    # ``floor(phase) = 1180`` which the categoriser treats as ``ok``
-    # before the dep-depth comparison runs).
+    # ``floor(phase) = 1180`` which the categoriser treats as ``ok``).
+    #
+    # The factories pass ``target_op_name=<wrapped op's anchor>`` because
+    # the wrapped ``layerN_alu`` is itself a kind="block" op and
+    # ``Operation.target_op_name`` can only reference attn/ffn ops (see
+    # ``ModelLayout.resolve_block_op_layer``). When no ``target_op_name``
+    # is provided we fall back to the legacy ``layer_idx`` pin (which
+    # still triggers the strict-mode flag).
     return Operation(
         name=name,
         reads=set(),
         writes=set(),
         kind="block",
-        target_op_name=same_layer_as,
+        target_op_name=target_op_name,
+        layer_idx=layer_idx if target_op_name is None else None,
         bake_fn=bake,
         phase=1180 + layer_idx * 0.01,
         migrated=True,
