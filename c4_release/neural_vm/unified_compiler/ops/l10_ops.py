@@ -2177,7 +2177,14 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         head_allocator = _allocate_layer10_attention_heads()
         attn._l10_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
-        _bake_layer10_sp_byte_passthrough_head(attn, proxy, S, HD)
+        # Phase 8.C inline: lower the head spec directly into ``attn``
+        # (was ``_bake_layer10_sp_byte_passthrough_head``) so census v2
+        # classifies this op as ``declarative``.
+        Primitives.generate_attention_head(
+            attn, _layer10_sp_byte_passthrough_head_spec(proxy, S), HD,
+        )
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes.data[2] = 1.0
 
     # Dim-ownership claims: L10 attn head 2 SP byte passthrough.
     #   W_v[2*HD + k, CLEAN_EMBED_LO + k]      for k=0..15
