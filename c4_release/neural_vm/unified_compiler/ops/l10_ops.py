@@ -2214,7 +2214,7 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         _claims.add((10, "attn_W_v", f"3_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
         _claims.add((10, "attn_W_v", f"3_{32 + k}", f"OUTPUT_LO+{k}"))
         _claims.add((10, "attn_W_v", f"3_{32 + k}", f"CLEAN_EMBED_LO+{k}"))
-        _claims.add((10, "attn_W_v", f"3_{48 + k}", f"OUTPUT_HI_THIS_STEP+{k}"))
+        _claims.add((10, "attn_W_v", f"3_{48 + k}", f"OUTPUT_HI+{k}"))
         _claims.add((10, "attn_W_v", f"3_{48 + k}", f"CLEAN_EMBED_HI+{k}"))
 
     return Operation(
@@ -2225,11 +2225,11 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                # LEA-local differential routing (bug #33) reads the
                # current-step OUTPUT bands at the attended AX byte 0 row.
-               # Use the B9 ``THIS_STEP`` reader-side name for OUTPUT_HI;
-               # OUTPUT_LO has no split alias yet (see L7
-               # ``layer7_operand_gather`` for the same convention).
-               "OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+               # Verifier categorizes residual writes under the canonical
+               # OUTPUT_HI name (alias OUTPUT_HI_THIS_STEP shares the dim);
+               # see L7 ``layer7_operand_gather`` for the same convention.
+               "OUTPUT_LO", "OUTPUT_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_psh_stack0_passthrough_ir,

@@ -2600,12 +2600,12 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1668", "EMBED_LO+8"),
         (6, "ffn_W_up", "1668", "EMBED_HI+15"),
         (6, "ffn_W_down", "1668", "OUTPUT_LO+8"),
-        (6, "ffn_W_down", "1668", "OUTPUT_HI_THIS_STEP+14"),
+        (6, "ffn_W_down", "1668", "OUTPUT_HI+14"),
         (6, "ffn_W_down", "1668", "OUTPUT_LO+0"),
         (6, "ffn_W_down", "1668", "OUTPUT_LO+10"),
         (6, "ffn_W_down", "1668", "OUTPUT_LO+14"),
-        (6, "ffn_W_down", "1668", "OUTPUT_HI_THIS_STEP+1"),
-        (6, "ffn_W_down", "1668", "OUTPUT_HI_THIS_STEP+15"),
+        (6, "ffn_W_down", "1668", "OUTPUT_HI+1"),
+        (6, "ffn_W_down", "1668", "OUTPUT_HI+15"),
         # Unit 1669: l6_ent_after_jsr_sp_byte0_f0_when_ent_zero
         (6, "ffn_W_up", "1669", "OP_ENT+0"),
         (6, "ffn_W_up", "1669", "MARK_SP+0"),
@@ -2614,19 +2614,19 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1669", "EMBED_HI+15"),
         (6, "ffn_W_up", "1669", "EMBED_LO+8"),
         (6, "ffn_W_down", "1669", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1669", "OUTPUT_HI_THIS_STEP+15"),
+        (6, "ffn_W_down", "1669", "OUTPUT_HI+15"),
         (6, "ffn_W_down", "1669", "OUTPUT_LO+8"),
         (6, "ffn_W_down", "1669", "OUTPUT_LO+10"),
-        (6, "ffn_W_down", "1669", "OUTPUT_HI_THIS_STEP+0"),
-        (6, "ffn_W_down", "1669", "OUTPUT_HI_THIS_STEP+14"),
+        (6, "ffn_W_down", "1669", "OUTPUT_HI+0"),
+        (6, "ffn_W_down", "1669", "OUTPUT_HI+14"),
         # Unit 1670: l6_ent_after_jsr_bp_byte0_f0
         (6, "ffn_W_up", "1670", "OP_ENT+0"),
         (6, "ffn_W_up", "1670", "MARK_BP+0"),
         (6, "ffn_W_up", "1670", "HAS_SE+0"),
         (6, "ffn_W_down", "1670", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1670", "OUTPUT_HI_THIS_STEP+15"),
+        (6, "ffn_W_down", "1670", "OUTPUT_HI+15"),
         (6, "ffn_W_down", "1670", "OUTPUT_LO+8"),
-        (6, "ffn_W_down", "1670", "OUTPUT_HI_THIS_STEP+1"),
+        (6, "ffn_W_down", "1670", "OUTPUT_HI+1"),
         # Unit 1671: l6_ent_after_jsr_bp_byte1_ff
         (6, "ffn_W_up", "1671", "OP_ENT+0"),
         (6, "ffn_W_up", "1671", "IS_BYTE+0"),
@@ -2634,9 +2634,9 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1671", "BYTE_INDEX_0+0"),
         (6, "ffn_W_up", "1671", "HAS_SE+0"),
         (6, "ffn_W_down", "1671", "OUTPUT_LO+15"),
-        (6, "ffn_W_down", "1671", "OUTPUT_HI_THIS_STEP+15"),
+        (6, "ffn_W_down", "1671", "OUTPUT_HI+15"),
         (6, "ffn_W_down", "1671", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1671", "OUTPUT_HI_THIS_STEP+0"),
+        (6, "ffn_W_down", "1671", "OUTPUT_HI+0"),
         # Unit 1672: l6_ent_after_jsr_bp_byte2_00
         (6, "ffn_W_up", "1672", "OP_ENT+0"),
         (6, "ffn_W_up", "1672", "IS_BYTE+0"),
@@ -2644,10 +2644,10 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1672", "BYTE_INDEX_1+0"),
         (6, "ffn_W_up", "1672", "HAS_SE+0"),
         (6, "ffn_W_down", "1672", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1672", "OUTPUT_HI_THIS_STEP+0"),
+        (6, "ffn_W_down", "1672", "OUTPUT_HI+0"),
         (6, "ffn_W_down", "1672", "OUTPUT_LO+1"),
         (6, "ffn_W_down", "1672", "OUTPUT_LO+15"),
-        (6, "ffn_W_down", "1672", "OUTPUT_HI_THIS_STEP+15"),
+        (6, "ffn_W_down", "1672", "OUTPUT_HI+15"),
         # Unit 1673: l6_ent_after_jsr_bp_byte3_00
         (6, "ffn_W_up", "1673", "OP_ENT+0"),
         (6, "ffn_W_up", "1673", "IS_BYTE+0"),
@@ -2655,27 +2655,27 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         (6, "ffn_W_up", "1673", "BYTE_INDEX_2+0"),
         (6, "ffn_W_up", "1673", "HAS_SE+0"),
         (6, "ffn_W_down", "1673", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1673", "OUTPUT_HI_THIS_STEP+0"),
+        (6, "ffn_W_down", "1673", "OUTPUT_HI+0"),
         (6, "ffn_W_down", "1673", "OUTPUT_LO+1"),
         (6, "ffn_W_down", "1673", "OUTPUT_LO+15"),
-        (6, "ffn_W_down", "1673", "OUTPUT_HI_THIS_STEP+15"),
+        (6, "ffn_W_down", "1673", "OUTPUT_HI+15"),
         # Unit 1674: l6_ent_after_jsr_stack0_byte0_00
         (6, "ffn_W_up", "1674", "OP_ENT+0"),
         (6, "ffn_W_up", "1674", "MARK_STACK0+0"),
         (6, "ffn_W_up", "1674", "HAS_SE+0"),
         (6, "ffn_W_down", "1674", "OUTPUT_LO+0"),
-        (6, "ffn_W_down", "1674", "OUTPUT_HI_THIS_STEP+0"),
+        (6, "ffn_W_down", "1674", "OUTPUT_HI+0"),
         (6, "ffn_W_down", "1674", "OUTPUT_LO+2"),
         (6, "ffn_W_down", "1674", "OUTPUT_LO+12"),
-        (6, "ffn_W_down", "1674", "OUTPUT_HI_THIS_STEP+1"),
-        (6, "ffn_W_down", "1674", "OUTPUT_HI_THIS_STEP+2"),
+        (6, "ffn_W_down", "1674", "OUTPUT_HI+1"),
+        (6, "ffn_W_down", "1674", "OUTPUT_HI+2"),
     })
 
     return Operation(
         name="layer6_ent_after_jsr_sp_byte0_fixup",
         phase=6.55,
         reads={"OP_ENT", "MARK_SP", "HAS_SE", "EMBED_LO", "EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
@@ -3576,10 +3576,10 @@ def make_binary_pop_sp_increment_op() -> Operation:
     #     OUTPUT_LO+k (the canceling pair).
     #   - units 2310..2325: SP_HI += 1 ladder gated on EMBED_HI+k (k=0..15)
     #     with an additional 8-wide EMBED_LO blocker bank in W_up; W_gate
-    #     selects EMBED_HI+k, W_down writes OUTPUT_HI_THIS_STEP+(k+1)%16 and OUTPUT_HI_THIS_STEP+k.
+    #     selects EMBED_HI+k, W_down writes OUTPUT_HI+(k+1)%16 and OUTPUT_HI+k.
     #   - unit 2326: byte-row pop boundary fixup (BYTE_INDEX_0 + CLEAN_EMBED
     #     gates -> OUTPUT_{LO,HI}+0).
-    #   - unit 2327: same idea for BYTE_INDEX_1 (-> OUTPUT_LO+1, OUTPUT_HI_THIS_STEP+0
+    #   - unit 2327: same idea for BYTE_INDEX_1 (-> OUTPUT_LO+1, OUTPUT_HI+0
     #     plus clean-embed cancels).
     _claims = set()
     # Shared marker / opcode-flag conditions present on every LO/HI unit
@@ -3604,8 +3604,8 @@ def make_binary_pop_sp_increment_op() -> Operation:
             _claims.add((6, "ffn_W_up", str(unit), f"EMBED_LO+{lo_bit}"))
         _claims.add((6, "ffn_W_gate", str(unit), f"EMBED_HI+{unit_off}"))
         new_carry = (unit_off + 1) % 16
-        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{new_carry}"))
-        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{unit_off}"))
+        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI+{new_carry}"))
+        _claims.add((6, "ffn_W_down", str(unit), f"OUTPUT_HI+{unit_off}"))
     # byte_row_conditions: IS_BYTE, H1+2, CMP+3, plus 6 marker blockers
     # (-PC, -AX, -SP, -BP, -STACK0, -MEM).
     _byte_row_cond_cols = (
@@ -3620,7 +3620,7 @@ def make_binary_pop_sp_increment_op() -> Operation:
     _claims.add((6, "ffn_W_up", "2326", "CLEAN_EMBED_HI+0"))
     _claims.add((6, "ffn_W_gate", "2326", "CONST+0"))
     _claims.add((6, "ffn_W_down", "2326", "OUTPUT_LO+0"))
-    _claims.add((6, "ffn_W_down", "2326", "OUTPUT_HI_THIS_STEP+0"))
+    _claims.add((6, "ffn_W_down", "2326", "OUTPUT_HI+0"))
     # Unit 2327: l6_binary_pop_sp_byte2_00_to_01_lo
     for col in _byte_row_cond_cols:
         _claims.add((6, "ffn_W_up", "2327", col))
@@ -3629,7 +3629,7 @@ def make_binary_pop_sp_increment_op() -> Operation:
     _claims.add((6, "ffn_W_up", "2327", "CLEAN_EMBED_HI+0"))
     _claims.add((6, "ffn_W_gate", "2327", "CONST+0"))
     _claims.add((6, "ffn_W_down", "2327", "OUTPUT_LO+1"))
-    _claims.add((6, "ffn_W_down", "2327", "OUTPUT_HI_THIS_STEP+0"))
+    _claims.add((6, "ffn_W_down", "2327", "OUTPUT_HI+0"))
     _claims.add((6, "ffn_W_down", "2327", "CLEAN_EMBED_LO+0"))
     _claims.add((6, "ffn_W_down", "2327", "CLEAN_EMBED_HI+0"))
     _claims = frozenset(_claims)

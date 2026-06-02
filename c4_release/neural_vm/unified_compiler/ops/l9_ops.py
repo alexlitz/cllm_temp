@@ -935,40 +935,40 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     # W_up/W_gate selectors are left unclaimed to mirror the L14/L6 style).
     _claims: set = set()
     unit = 0
-    # ADD hi nibble (carry_in in [0, 1]): 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
+    # ADD hi nibble (carry_in in [0, 1]): 512 units -> W_down[OUTPUT_HI+result]
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
                 result = (a + b + carry_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
                 unit += 1
-    # LEA hi nibble: 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
+    # LEA hi nibble: 512 units -> W_down[OUTPUT_HI+result]
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
                 result = (a + b + carry_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
                 unit += 1
-    # ADJ hi nibble: 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
+    # ADJ hi nibble: 512 units -> W_down[OUTPUT_HI+result]
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
                 result = (a + b + carry_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
                 unit += 1
-    # SUB hi nibble: 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
+    # SUB hi nibble: 512 units -> W_down[OUTPUT_HI+result]
     for borrow_in in (0, 1):
         for a in range(16):
             for b in range(16):
                 result = (a - b - borrow_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
                 unit += 1
-    # ENT hi nibble: 512 units -> W_down[OUTPUT_HI_THIS_STEP+result]
+    # ENT hi nibble: 512 units -> W_down[OUTPUT_HI+result]
     for borrow_in in (0, 1):
         for sp_hi in range(16):
             for imm_hi in range(16):
                 result = (sp_hi - imm_hi - borrow_in) % 16
-                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{result}"))
+                _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{result}"))
                 unit += 1
     # hi_eq: 16 units -> W_down[CMP+1]
     for _k in range(16):
@@ -1047,14 +1047,14 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     _claims.add((9, "ffn_W_down", str(unit), "ADDR_B2_LO+1"))
     unit += 1
     # _set_layer9_marker_suppress: 7 units (one per NEXT_* dim), each writes
-    # W_down[OUTPUT_LO+k] and W_down[OUTPUT_HI_THIS_STEP+k] for k in 0..15.
+    # W_down[OUTPUT_LO+k] and W_down[OUTPUT_HI+k] for k in 0..15.
     for _next_dim in (
         "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
         "NEXT_STACK0", "NEXT_MEM", "NEXT_SE",
     ):
         for k in range(16):
             _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_LO+{k}"))
-            _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI_THIS_STEP+{k}"))
+            _claims.add((9, "ffn_W_down", str(unit), f"OUTPUT_HI+{k}"))
         unit += 1
     # Total expected unit index after bake: 3405 (matches ffn_units_used).
     _claims = frozenset(_claims)
@@ -1075,7 +1075,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
                "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                "ALU_LO", "AX_CARRY_LO"},
-        writes={"OUTPUT_HI_THIS_STEP", "CMP", "OUTPUT_LO", "CARRY"},
+        writes={"OUTPUT_HI", "CMP", "OUTPUT_LO", "CARRY"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir=compiler_ir,
