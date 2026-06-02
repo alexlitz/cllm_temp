@@ -46,7 +46,13 @@ After Phase 7:
 
 **7.A.5** — B14 strict-flip: set `compile_full_vm(strict=True)` as default, run corpus. 1 agent, ~30 min. **COMPLETE** (Phase 7.A.5 default-flip): `compile_full_vm_dynamic` now defaults to `strict=True, allow_sealed_cycles=True`; backfilled `requires["after"]` declarations on `layer14_demo_phase6_wave7` and `l12_alu_mul_getobd` so the strict admission gate has no non-cycle `phase_required_but_undeclared` ops on the lookup or efficient op sets. Byte-identity preserved across both ALU modes.
 
+**7.A.6** — Closing-audit priority 5: route `compile_full_vm` through `compile_full_vm_dynamic` by default. **COMPLETE**: production callsites now hit the hybrid dynamic-layer scheduler transparently. The legacy phase-pruning implementation is preserved behind `compile_full_vm(use_static_path=True)` as a fallback while the migration completes (deletion candidate once one release passes without a static-path fallback in production callsites). The byte-identity gate (`compare_compile_paths` / `tests/test_compile_dynamic_byte_identical.py`) was updated to invoke the static implementation via `use_static_path=True` so the regression check keeps signal on both paths.
+
 **Wave 7.A blocked on**: nothing (can start immediately).
+
+### 7.A.6 follow-up — Delete the static phase-pruning implementation
+
+Once one release passes without production callsites flipping `use_static_path=True`, the entire body of `compile_full_vm` past the dynamic-routing early-return becomes unreachable and can be removed in a dedicated commit. The TODO comment at `c4_release/neural_vm/unified_compiler/full_vm_compiler.py` (`# TODO(phase-7-audit-priority-5)`) marks the deletion site. The byte-identity tests (`compare_compile_paths`, `test_compile_full_vm_dynamic_byte_identical_lookup` / `_efficient`) explicitly exercise the static branch via `use_static_path=True` and must be deleted alongside it (they become redundant once the path itself is gone).
 
 ### 7.B — Pin removal corpus-wide (2-3 days, ~6 agents)
 

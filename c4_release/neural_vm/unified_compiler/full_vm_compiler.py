@@ -555,8 +555,18 @@ def compile_full_vm(
     declarations_only: bool = False,
     kv_eviction_policy: KVEvictionPolicy = KVEvictionPolicy.OFF,
     kv_eviction_n_steps: int = 64,
+    use_static_path: bool = False,
 ):
     """Compile and bake a full Neural VM model via the compiler.
+
+    Phase 7 closing audit priority 5: ``compile_full_vm`` now routes through
+    :func:`compile_full_vm_dynamic` by default. The hybrid dynamic-layer
+    scheduler is byte-identical to the static phase-pruning path on today's
+    op set (see
+    :func:`neural_vm.unified_compiler.full_vm_compiler_dynamic.compare_compile_paths`
+    and ``tests/test_compile_dynamic_byte_identical.py``). Pass
+    ``use_static_path=True`` to force the legacy phase-pruning implementation
+    while the migration completes.
 
     The compiler is the single bake authority. Internally, the legacy
     `set_vm_weights` pipeline is wrapped as one model-level Operation
@@ -657,6 +667,47 @@ def compile_full_vm(
         - model is an AutoregressiveVM with all weights baked
         - layout is the ModelLayout (d_model, n_layers, dim_positions)
     """
+    if not use_static_path:
+        # Phase 7 closing audit priority 5: route to the hybrid dynamic-layer
+        # scheduler. Byte-identical to the static path on today's op set; the
+        # legacy phase-pruning implementation lives behind ``use_static_path``
+        # as a fallback while the migration completes (deletion candidate
+        # once one release passes without static-path fallbacks in production
+        # callsites). Lazy-imported to avoid a circular import — the dynamic
+        # module imports this one as ``_static`` to share helpers.
+        from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+        return compile_full_vm_dynamic(
+            S=S,
+            enable_conversational_io=enable_conversational_io,
+            enable_tool_calling=enable_tool_calling,
+            enable_neural_io_think_protocol=enable_neural_io_think_protocol,
+            alu_mode=alu_mode,
+            n_heads=n_heads,
+            ffn_hidden=ffn_hidden,
+            max_seq_len=max_seq_len,
+            pin_io_only=pin_io_only,
+            disk_cache=disk_cache,
+            use_dynamic_ffn=use_dynamic_ffn,
+            enable_moe_routing=enable_moe_routing,
+            positional_encoding=positional_encoding,
+            attention_normalization=attention_normalization,
+            rope_base=rope_base,
+            use_rms_norm=use_rms_norm,
+            rms_norm_eps=rms_norm_eps,
+            require_declarative_bake=require_declarative_bake,
+            declarations_only=declarations_only,
+            kv_eviction_policy=kv_eviction_policy,
+            kv_eviction_n_steps=kv_eviction_n_steps,
+        )
+
+    # ------------------------------------------------------------------
+    # TODO(phase-7-audit-priority-5): the static phase-pruning path below
+    # is preserved as a fallback under ``use_static_path=True`` while the
+    # migration completes. Deletion candidate once one release passes
+    # without production callsites flipping the flag. ``compare_compile_paths``
+    # and ``tests/test_compile_dynamic_byte_identical.py`` still exercise
+    # this code path so the byte-identity gate keeps signal until then.
+    # ------------------------------------------------------------------
     if not declarations_only:
         declarations_only = _env_flag_enabled(_DECLARATIONS_ONLY_BAKE_ENV)
     if enable_moe_routing is None:
