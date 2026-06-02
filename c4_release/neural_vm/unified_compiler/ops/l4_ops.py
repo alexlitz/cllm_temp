@@ -2,7 +2,7 @@
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -410,6 +410,7 @@ def make_layer4_ffn_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=make_layer4_ffn_ir(),
         layer_idx=4,
         migrated=True,
         claims=_claims,
@@ -423,74 +424,250 @@ def make_layer4_ffn_op() -> Operation:
     )
 
 
+def _nibble_rotation_chain_rules(
+    *,
+    name_prefix: str,
+    gate_marker_name: str,
+    source_lo_name: str,
+    source_lo_offset: int,
+    source_hi_name: str,
+    source_hi_offset: int,
+    target_lo_name: str,
+    target_lo_offset: int,
+    target_hi_name: str,
+    target_hi_offset: int,
+    offset: int,
+    with_carry: bool,
+    S: float,
+    magnitude: float,
+    condition_names: tuple[str, ...] = (),
+    scope: str | None = None,
+) -> tuple[FFNRule, ...]:
+    """Declarative twin of :meth:`Primitives.nibble_rotation_chain`.
+
+    Emits the same ``32`` (no-carry) or ``32 + 32*offset`` (with-carry)
+    units' worth of gated-write rules. The unit-write contract is the
+    direct port of the imperative helper; see
+    :meth:`Primitives.nibble_rotation_chain`'s docstring for the math.
+
+    All condition / gate / write dim references use the
+    ``"NAME+offset"`` string form so the rules can be lowered through
+    :func:`Primitives.lower_ffn_rules` against the compiler-allocated
+    ``dim_positions`` map.
+
+    ``condition_names`` is an extra AND list applied to every emitted
+    rule (matches ``condition_dims=`` on the imperative helper). The
+    threshold formula tracks the helper's ``0.5 + n_conds`` /
+    ``1.5 + n_conds`` split between the default-copy / carry blocks.
+    """
+
+    rules: list[FFNRule] = []
+    n_conds = len(condition_names)
+    base_thresh = 0.5 + n_conds
+    carry_thresh = base_thresh + 1.0
+    scale = magnitude / S
+
+    base_conditions: tuple[tuple[str, float], ...] = (
+        (f"{gate_marker_name}+0", 1.0),
+    ) + tuple((cname, 1.0) for cname in condition_names)
+
+    # 16 x lo rotation: source_lo+(k - offset) % 16 -> target_lo+k
+    for k in range(16):
+        src = (k - offset) % 16
+        rules.append(FFNRule.gated_write(
+            name=f"{name_prefix}_lo_rot_{k}",
+            conditions=base_conditions,
+            threshold=base_thresh,
+            gate=f"{source_lo_name}+{source_lo_offset + src}",
+            writes=((f"{target_lo_name}+{target_lo_offset + k}", scale),),
+            scope=scope,
+        ))
+
+    # 16 x hi default copy: source_hi+k -> target_hi+k
+    for k in range(16):
+        rules.append(FFNRule.gated_write(
+            name=f"{name_prefix}_hi_copy_{k}",
+            conditions=base_conditions,
+            threshold=base_thresh,
+            gate=f"{source_hi_name}+{source_hi_offset + k}",
+            writes=((f"{target_hi_name}+{target_hi_offset + k}", scale),),
+            scope=scope,
+        ))
+
+    if with_carry:
+        # For offset=N, carry happens when (lo + N) >= 16 i.e.
+        # lo in [16-N, 15]. Emit (cancel default, write rotated) pair per
+        # carry source bit, gated on source_lo[carry_src]=1.
+        for carry_src in range(16 - offset, 16):
+            carry_conditions = base_conditions + (
+                (f"{source_lo_name}+{source_lo_offset + carry_src}", 1.0),
+            )
+            for k in range(16):
+                # Cancel default copy when source_lo[carry_src] == 1
+                rules.append(FFNRule.gated_write(
+                    name=f"{name_prefix}_carry_cancel_{carry_src}_{k}",
+                    conditions=carry_conditions,
+                    threshold=carry_thresh,
+                    gate=f"{source_hi_name}+{source_hi_offset + k}",
+                    gate_weight=-1.0,
+                    writes=(
+                        (f"{target_hi_name}+{target_hi_offset + k}", scale),
+                    ),
+                    scope=scope,
+                ))
+                # Add rotated +1 when source_lo[carry_src] == 1
+                hi_src = (k - 1) % 16
+                rules.append(FFNRule.gated_write(
+                    name=f"{name_prefix}_carry_rotated_{carry_src}_{k}",
+                    conditions=carry_conditions,
+                    threshold=carry_thresh,
+                    gate=f"{source_hi_name}+{source_hi_offset + hi_src}",
+                    writes=(
+                        (f"{target_hi_name}+{target_hi_offset + k}", scale),
+                    ),
+                    scope=scope,
+                ))
+
+    return tuple(rules)
+
+
+def _layer4_pc_plus1_ax_rules(S: float) -> tuple[FFNRule, ...]:
+    """PC+1 chain at MARK_AX: EMBED -> TEMP (64 units, offset=1, with carry)."""
+    return _nibble_rotation_chain_rules(
+        name_prefix="l4_pc_plus1_ax",
+        gate_marker_name="MARK_AX",
+        source_lo_name="EMBED_LO", source_lo_offset=0,
+        source_hi_name="EMBED_HI", source_hi_offset=0,
+        target_lo_name="TEMP", target_lo_offset=0,
+        target_hi_name="TEMP", target_hi_offset=16,
+        offset=1, with_carry=True, S=S, magnitude=2.0,
+        scope="MARK_AX",
+    )
+
+
+def _layer4_temp_clear_pc_rules(S: float) -> tuple[FFNRule, ...]:
+    """TEMP[0..31] clear at MARK_PC (32 units).
+
+    Unit 0 (TEMP[0]) is reserved for the L5 first-step IS_JSR flag, so
+    its rule is a no-op placeholder that consumes the hidden-unit slot
+    without performing any writes (matches the imperative
+    ``unit += 1; continue`` for k==0).
+    """
+    rules: list[FFNRule] = []
+    # Placeholder unit: TEMP[0] reserved for IS_JSR.
+    rules.append(FFNRule(
+        conditions=(),
+        threshold=0.0,
+        writes=(),
+        gate=None,
+        gate_bias=0.0,
+        name="l4_temp_clear_pc_jsr_placeholder",
+    ))
+    # TEMP[1..31] clear: gate=-TEMP[k] at MARK_PC writes 2/S back into TEMP[k].
+    for k in range(1, 32):
+        rules.append(FFNRule.gated_write(
+            name=f"l4_temp_clear_pc_{k}",
+            conditions=(("MARK_PC", 1.0),),
+            threshold=0.5,
+            gate=f"TEMP+{k}",
+            gate_weight=-1.0,
+            writes=((f"TEMP+{k}", 2.0 / S),),
+            scope="MARK_PC",
+        ))
+    return tuple(rules)
+
+
+def _layer4_pc_plus_offset_byte_rules(
+    *, byte_idx: int, S: float,
+) -> tuple[FFNRule, ...]:
+    """PC+N chain at IS_BYTE x H1[AX_I] x BYTE_INDEX_{byte_idx}.
+
+    Reads pre-rotated TEMP (the lo/hi pair filled by the PC+1@AX chain)
+    and writes a further +offset rotation into FETCH. ``offset = byte_idx + 2``
+    yields PC+2 (byte_idx=0, 96 units), PC+3 (byte_idx=1, 128 units),
+    PC+4 (byte_idx=2, 160 units).
+    """
+    AX_I = 1
+    offset = byte_idx + 2
+    return _nibble_rotation_chain_rules(
+        name_prefix=f"l4_pc_plus{offset}_byte{byte_idx}",
+        gate_marker_name="IS_BYTE",
+        source_lo_name="TEMP", source_lo_offset=0,
+        source_hi_name="TEMP", source_hi_offset=16,
+        target_lo_name="FETCH_LO", target_lo_offset=0,
+        target_hi_name="FETCH_HI", target_hi_offset=0,
+        offset=offset, with_carry=True, S=S, magnitude=2.0,
+        condition_names=(f"H1+{AX_I}", f"BYTE_INDEX_{byte_idx}"),
+        scope=f"IS_BYTE and H1+{AX_I} and BYTE_INDEX_{byte_idx}",
+    )
+
+
+def _layer4_pc_plus1_pc_rules(S: float) -> tuple[FFNRule, ...]:
+    """PC+1 chain at MARK_PC: EMBED -> FETCH (64 units, offset=1, with carry).
+
+    Fallback path for L5 fetch head 3: dynamic immediate fetch at PC marker.
+    """
+    return _nibble_rotation_chain_rules(
+        name_prefix="l4_pc_plus1_pc",
+        gate_marker_name="MARK_PC",
+        source_lo_name="EMBED_LO", source_lo_offset=0,
+        source_hi_name="EMBED_HI", source_hi_offset=0,
+        target_lo_name="FETCH_LO", target_lo_offset=0,
+        target_hi_name="FETCH_HI", target_hi_offset=0,
+        offset=1, with_carry=True, S=S, magnitude=2.0,
+        scope="MARK_PC",
+    )
+
+
+def _layer4_ffn_rules(S: float) -> tuple[FFNRule, ...]:
+    """Combined declarative L4 FFN rule list (544 units).
+
+    Layout matches :data:`_L4_FFN_UNIT_LAYOUT` rule-for-rule:
+      units 0..63    -> PC+1 @ MARK_AX                       (64 units)
+      units 64..95   -> TEMP[0..31] clear @ MARK_PC          (32 units)
+      units 96..191  -> PC+2 @ IS_BYTE x H1+1 x BYTE_INDEX_0 (96 units)
+      units 192..319 -> PC+3 @ IS_BYTE x H1+1 x BYTE_INDEX_1 (128 units)
+      units 320..479 -> PC+4 @ IS_BYTE x H1+1 x BYTE_INDEX_2 (160 units)
+      units 480..543 -> PC+1 @ MARK_PC                       (64 units)
+    Total: 544 units, matches the imperative ``_bake_layer4_ffn`` footprint.
+    """
+    rules: list[FFNRule] = []
+    rules.extend(_layer4_pc_plus1_ax_rules(S))
+    rules.extend(_layer4_temp_clear_pc_rules(S))
+    for byte_idx in range(3):
+        rules.extend(_layer4_pc_plus_offset_byte_rules(byte_idx=byte_idx, S=S))
+    rules.extend(_layer4_pc_plus1_pc_rules(S))
+    return tuple(rules)
+
+
+def make_layer4_ffn_ir(S: float = 100.0) -> CompilerIR:
+    """Declarative IR for L4 FFN (PC+1/2/3/4 rotations + TEMP clear)."""
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer4_ffn_rules(S))
+    return ir
+
+
 def _bake_layer4_ffn(ffn, S, BD) -> int:
     """Declarative L4 FFN spec: PC+1/2/3/4 fetch-address rotations.
 
-    Returns the post-bake unit cursor (must equal
-    :data:`_L4_FFN_TOTAL_UNITS` for byte-identity with the historical
-    544-unit footprint). The caller asserts this in ``make_layer4_ffn_op``.
+    Lowers :func:`_layer4_ffn_rules` through
+    :func:`Primitives.lower_ffn_rules`. Returns the post-bake unit cursor
+    (must equal :data:`_L4_FFN_TOTAL_UNITS` for byte-identity with the
+    historical 544-unit footprint). The caller asserts this in
+    ``make_layer4_ffn_op``.
     """
-
-    unit = 0
-
-    unit = Primitives.nibble_rotation_chain(
-        ffn,
-        unit=unit,
-        gate_marker=BD.MARK_AX,
-        source_lo_dim=BD.EMBED_LO,
-        source_hi_dim=BD.EMBED_HI,
-        target_lo_dim=BD.TEMP,
-        target_hi_dim=BD.TEMP + 16,
-        offset=1,
-        with_carry=True,
-        S=S,
-        magnitude=2.0,
+    rules = _layer4_ffn_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
     )
-
-    # Preserve unit numbering from the legacy helper: TEMP[0] is reserved for
-    # IS_JSR, so its clearing unit remains an empty placeholder.
-    for k in range(32):
-        if k == 0:
-            unit += 1
-            continue
-        ffn.W_up.data[unit, BD.MARK_PC] = S
-        ffn.b_up.data[unit] = -S * 0.5
-        ffn.W_gate.data[unit, BD.TEMP + k] = -1.0
-        ffn.W_down.data[BD.TEMP + k, unit] = 2.0 / S
-        unit += 1
-
-    AX_I = 1
-    for byte_idx in range(3):
-        unit = Primitives.nibble_rotation_chain(
-            ffn,
-            unit=unit,
-            gate_marker=BD.IS_BYTE,
-            source_lo_dim=BD.TEMP,
-            source_hi_dim=BD.TEMP + 16,
-            target_lo_dim=BD.FETCH_LO,
-            target_hi_dim=BD.FETCH_HI,
-            offset=byte_idx + 2,
-            with_carry=True,
-            S=S,
-            magnitude=2.0,
-            condition_dims=[BD.H1 + AX_I, BD.BYTE_INDEX_0 + byte_idx],
-        )
-
-    unit = Primitives.nibble_rotation_chain(
+    return Primitives.lower_ffn_rules(
         ffn,
-        unit=unit,
-        gate_marker=BD.MARK_PC,
-        source_lo_dim=BD.EMBED_LO,
-        source_hi_dim=BD.EMBED_HI,
-        target_lo_dim=BD.FETCH_LO,
-        target_hi_dim=BD.FETCH_HI,
-        offset=1,
-        with_carry=True,
+        rules,
+        dim_positions,
+        start_unit=0,
         S=S,
-        magnitude=2.0,
     )
-
-    return unit
 
 
 def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
