@@ -2472,7 +2472,16 @@ def make_layer10_alu_op() -> Operation:
         block.ffn._l10_unit_allocator = allocator
 
         proxy = _as_setdim_proxy(dim_positions)
-        n10 = _bake_layer10_alu_rules(block.ffn, S, proxy)
+        # Phase 8.C inline: lower the rule list directly (was
+        # ``_bake_layer10_alu_rules``) so census v2 classifies this op
+        # as ``declarative`` rather than ``declarative_via_helper``.
+        rules = _layer10_alu_rules(S)
+        rule_dim_positions = Primitives.dim_positions_from_bd(
+            proxy, Primitives.ffn_rule_dim_names(rules),
+        )
+        n10 = Primitives.lower_ffn_rules(
+            block.ffn, rules, rule_dim_positions, start_unit=0, S=S,
+        )
         # Byte-identity guard: the rule lowering's final cursor MUST
         # equal the total declared in ``_L10_FFN_UNIT_LAYOUT_MAIN``. If
         # any sub-stage rule generator drifts, this fires before the
