@@ -257,8 +257,8 @@ def make_lev_detector_head_op(enable: bool = False) -> Operation:
         # HAS_SE / CONST drive the Q-side current-step gate.
         reads={
             "MARK_PC", "HAS_SE", "CONST",
-            "TEMP_PREV_STEP",
-            "ADDR_B0_LO_PREV_STEP", "ADDR_B0_HI_PREV_STEP",
+            "TEMP.*.-1",
+            "ADDR_B0_LO.*.-1", "ADDR_B0_HI.*.-1",
             "OP_LEV",
             "OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR",
             "OP_BZ", "OP_BNZ", "OP_PSH", "OP_ADJ", "OP_ENT",
