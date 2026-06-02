@@ -2,7 +2,7 @@
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -11,19 +11,19 @@ from .shared import _as_setdim_proxy
 # === L1 FFN unit layout (pinned offsets) ============================
 #
 # The ``layer1_ffn`` op owns the entire L1 FFN. The weight writes happen
-# inside ``_bake_layer1_ffn`` below, which uses a local ``unit = 0``
-# counter that increments through 5 sub-stages (one unit per output
-# dim). Migration to :class:`FFNUnitAllocator` keeps the helper
-# byte-identical -- we just declare each sub-stage's range at its
-# existing pinned offset so the layout is auditable rather than
-# implicit. Adding a new L1 op family later will go through
-# ``allocator.alloc(name, n)`` without a pin, and the allocator will
-# pick the first free gap past unit 5.
+# via ``_layer1_ffn_rules`` (a list of :class:`FFNRule` declarations)
+# which is lowered by ``Primitives.lower_ffn_rules`` through
+# ``CompilerIR.lower_ffn``. Each rule consumes one hidden unit and they
+# are appended monotonically starting at ``start_unit=0`` -- so the 5
+# rules land on units 0..4 in the order declared. The
+# :class:`FFNUnitAllocator` below declares those same offsets by name so
+# the layout is auditable rather than implicit. Adding a new L1 op
+# family later will go through ``allocator.alloc(name, n)`` without a
+# pin, and the allocator will pick the first free gap past unit 5.
 #
-# The offsets below mirror the unit-counter walk in ``_bake_layer1_ffn``
+# The offsets below mirror the rule order in ``_layer1_ffn_rules``
 # (STACK0_BYTE0 followed by the four BYTE_INDEX_i thresholds).
-# Changing the helper's unit count requires updating this table in
-# lock-step.
+# Changing the rule list requires updating this table in lock-step.
 _L1_FFN_UNIT_LAYOUT = (
     # (sub-stage name, pinned start, n_units)
     ("layer1_ffn.stack0_byte0",   0, 1),  # STACK0_BYTE0 from L1H4 + IS_BYTE
@@ -37,13 +37,14 @@ _L1_FFN_UNIT_LAYOUT = (
 def _allocate_layer1_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L1 FFN sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the underlying
-    ``_bake_layer1_ffn`` helper -- which writes via its own monotonic
-    ``unit = 0`` counter -- lands on exactly the same hidden-unit
-    indices it always has. This call is byte-identical bookkeeping: the
-    allocator declares ranges by name, the helper writes the weights. A
-    future refactor can split the monolithic helper into per-range bake
-    functions that consume ``allocator.alloc(...)`` directly.
+    Every sub-stage is pinned at its existing offset so the
+    ``_layer1_ffn_rules`` lowering -- which appends one hidden unit per
+    rule starting at ``start_unit=0`` -- lands on exactly the same
+    hidden-unit indices it always has. This call is byte-identical
+    bookkeeping: the allocator declares ranges by name, the rule
+    lowering writes the weights. A future refactor can split the rule
+    list into per-range bake functions that consume
+    ``allocator.alloc(...)`` directly.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L1 op claims a free range past unit 5).
@@ -54,10 +55,95 @@ def _allocate_layer1_ffn_units() -> FFNUnitAllocator:
     return allocator
 
 
+def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for the L1 FFN (STACK0_BYTE0 + BYTE_INDEX_0..3).
+
+    Mirrors the legacy ``_set_layer1_ffn`` helper one-for-one:
+
+    * Unit 0 — STACK0_BYTE0 flag at d=6 from BP: fires when
+      ``L1H4[BP]`` (d<=6.5) and ``IS_BYTE`` both fire, blocked by
+      ``H1[BP]`` (d>4.5). Implements
+      ``silu(S*(L1H4_BP + IS_BYTE - 1.5)) * (1 - H1_BP)``.
+    * Units 1..4 — marker-agnostic BYTE_INDEX_0..3 flags. Each fires
+      when ``IS_BYTE`` and any-marker ``src_base[*]`` band activate,
+      blocked by the lower any-marker ``blocker_base[*]`` band.
+
+    The 7 (NUM_MARKERS) marker conditions per BYTE_INDEX_i are
+    summed in the up branch with weight 1.0 each, and similarly in
+    the gate branch with weight -1.0 each. Only one marker type is
+    nearest at any position, so the sum is ~1 when active. The
+    threshold/scale constants here (S, 1.5 threshold, 2.0/S write
+    weight) are unchanged from the imperative helper.
+    """
+    BP_I = 3
+    NM = 7  # NUM_MARKERS — fixed-width threshold-head bank
+    write_scale = 2.0 / S
+
+    rules: list[FFNRule] = []
+
+    # Unit 0: STACK0_BYTE0 = L1H4[BP] AND IS_BYTE AND NOT H1[BP].
+    rules.append(FFNRule.gated_write(
+        name="l1_stack0_byte0",
+        conditions=(
+            (f"L1H4+{BP_I}", 1.0),
+            ("IS_BYTE", 1.0),
+        ),
+        threshold=1.5,
+        gate_terms=((f"H1+{BP_I}", -1.0),),
+        gate_bias=1.0,
+        writes=(("STACK0_BYTE0", write_scale),),
+    ))
+
+    # Units 1..4: BYTE_INDEX_0..3 = IS_BYTE AND any(src_base) AND NOT any(blocker_base).
+    for src_base, blocker_base, out_dim in (
+        ("L1H1", "L1H0", "BYTE_INDEX_0"),
+        ("L1H2", "L1H1", "BYTE_INDEX_1"),
+        ("H0",   "L1H2", "BYTE_INDEX_2"),
+        ("H1",   "H0",   "BYTE_INDEX_3"),
+    ):
+        conditions = [("IS_BYTE", 1.0)]
+        gate_terms = []
+        for i in range(NM):
+            conditions.append((f"{src_base}+{i}", 1.0))
+            gate_terms.append((f"{blocker_base}+{i}", -1.0))
+        rules.append(FFNRule.gated_write(
+            name=f"l1_{out_dim.lower()}",
+            conditions=tuple(conditions),
+            threshold=1.5,
+            gate_terms=tuple(gate_terms),
+            gate_bias=1.0,
+            writes=((out_dim, write_scale),),
+        ))
+
+    return tuple(rules)
+
+
+def _layer1_ffn_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer1_ffn_rules(S))
+    return ir
+
+
+def _bake_layer1_ffn(ffn, S, BD) -> int:
+    """Bake L1 FFN via :class:`FFNRule` lowering (byte-identical helper).
+
+    Used both by the migrated :func:`make_layer1_ffn_op` bake path and as
+    a standalone entry-point for callers wanting to drive the L1 weight
+    writes without constructing a full ``Operation``.
+    """
+    rules = _layer1_ffn_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(ffn, rules, dim_positions, S=S)
+
+
 def make_layer1_ffn_op() -> Operation:
     """L1 FFN: STACK0_BYTE0 flag + BYTE_INDEX flags from threshold differences.
 
-    Originally: `_set_layer1_ffn` at vm_step.py:2922.
+    Originally: `_set_layer1_ffn` at vm_step.py:2922. Migrated to
+    :class:`FFNRule` declarations + ``compiler_ir`` in Phase 6 wave 3B.
 
     Reads L1H0/L1H1/L1H2/L1H4/H0/H1 threshold outputs and IS_BYTE.
     Writes STACK0_BYTE0, BYTE_INDEX_0, BYTE_INDEX_1, BYTE_INDEX_2, BYTE_INDEX_3.
@@ -73,7 +159,15 @@ def make_layer1_ffn_op() -> Operation:
         allocator = _allocate_layer1_ffn_units()
         ffn._l1_unit_allocator = allocator
 
-        _bake_layer1_ffn(ffn, S, proxy)
+        n0 = _bake_layer1_ffn(ffn, S, proxy)
+        # Byte-identity guard: the FFNRule lowering MUST write exactly the
+        # number of hidden units the allocator table declares. Mirrors the
+        # L0 phase_a_ffn assertion in ``_bake_phase_a_ffn``.
+        expected_total = sum(n for _, _, n in _L1_FFN_UNIT_LAYOUT)
+        assert n0 == expected_total, (
+            f"L1 layer1_ffn unit cursor drift: rules wrote {n0} units, "
+            f"allocator declared {expected_total}"
+        )
 
     # Dim-ownership claims: L1 FFN writes 5 units at fixed positions:
     #   unit 0: STACK0_BYTE0
@@ -99,6 +193,8 @@ def make_layer1_ffn_op() -> Operation:
         layer_idx=1,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer1_ffn_ir(),
+        declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
         # ``_set_layer1_ffn`` writes 5 units (one per output: STACK0_BYTE0,
@@ -110,37 +206,6 @@ def make_layer1_ffn_op() -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
-
-
-def _bake_layer1_ffn(ffn, S, BD):
-    """Declarative L1 FFN spec: STACK0_BYTE0 and byte-index flags."""
-
-    BP_I = 3
-    NM = BD.NUM_MARKERS
-    unit = 0
-
-    ffn.W_up.data[unit, BD.L1H4 + BP_I] = S
-    ffn.W_up.data[unit, BD.IS_BYTE] = S
-    ffn.b_up.data[unit] = -S * 1.5
-    ffn.W_gate.data[unit, BD.H1 + BP_I] = -1.0
-    ffn.b_gate.data[unit] = 1.0
-    ffn.W_down.data[BD.STACK0_BYTE0, unit] = 2.0 / S
-    unit += 1
-
-    for src_base, blocker_base, out_dim in (
-        (BD.L1H1, BD.L1H0, BD.BYTE_INDEX_0),
-        (BD.L1H2, BD.L1H1, BD.BYTE_INDEX_1),
-        (BD.H0, BD.L1H2, BD.BYTE_INDEX_2),
-        (BD.H1, BD.H0, BD.BYTE_INDEX_3),
-    ):
-        ffn.W_up.data[unit, BD.IS_BYTE] = S
-        for i in range(NM):
-            ffn.W_up.data[unit, src_base + i] = S
-            ffn.W_gate.data[unit, blocker_base + i] = -1.0
-        ffn.b_up.data[unit] = -S * 1.5
-        ffn.b_gate.data[unit] = 1.0
-        ffn.W_down.data[out_dim, unit] = 2.0 / S
-        unit += 1
 
 
 _L1_HEAD_LAYOUT = (
