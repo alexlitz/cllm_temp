@@ -1495,7 +1495,10 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
             if enable_conversational_io else None
         ),
         declarative_authority="spec_generated",
-        layer_idx=9,
+        # Phase 8.A.4 retry: layer_idx=9 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer9_marker_suppress``
+        # (kind="ffn", L9 anchor pinned via ``requires["after"]: layer8_alu``).
+        target_op_name="layer9_marker_suppress",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
