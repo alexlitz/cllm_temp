@@ -657,8 +657,14 @@ def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
     Borrow when sp_lo < (8 + imm_lo) mod 16, or when (8 + imm_lo) >= 16
     (carry out of byte 0 into byte 1). The condition is asymmetric
     because the +8 constant offset can itself produce a byte-1 carry.
+
+    Phase 7.E.2: gate + carry-output refs use ``dim_ref`` for the
+    ``(opcode_flag, ENT)`` and ``(carry, alu, byte_index=0)`` pairs.
+    ALU_LO+sp_lo / FETCH_LO+imm_lo stay structural.
     """
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_ent = dim_ref("opcode_flag", "ENT")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
     rules = []
     for sp_lo in range(16):
@@ -675,10 +681,10 @@ def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"FETCH_LO+{imm_lo}", 20.0),
                 ),
                 threshold=85.0,
-                gate="OP_ENT",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_ent,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_ENT",
-                dominates_at={"CARRY+0": "MARK_AX and OP_ENT"},
+                dominates_at={carry_byte0: "MARK_AX and OP_ENT"},
             ))
     return tuple(rules)
 

@@ -26,6 +26,7 @@ from neural_vm.unified_compiler.ir import DimRef
 from neural_vm.unified_compiler.ops.l8_ops import (
     _layer8_alu_add_carry_rules,
     _layer8_alu_adj_carry_rules,
+    _layer8_alu_ent_borrow_rules,
     _layer8_alu_lea_carry_rules,
     _layer8_alu_sub_borrow_rules,
 )
@@ -225,6 +226,38 @@ class TestLayer8AluAdjCarry:
         rules = _layer8_alu_adj_carry_rules(self.S)
         _check_dominates_at_carry0(
             rules, expected_scope="MARK_AX and OP_ADJ"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pilot op 5: layer8_alu_ent_borrow
+# ---------------------------------------------------------------------------
+class TestLayer8AluEntBorrow:
+    """ENT borrow: SP = SP - (8 + signed_immediate). Borrow when
+    sp_lo < (8 + imm_lo) mod 16, OR when (8 + imm_lo) >= 16 — the +8
+    constant offset can itself produce a byte-1 carry. Gated on
+    OP_ENT."""
+
+    S = 100.0
+
+    def test_writes_resolve_to_carry_byte0(self):
+        rules = _layer8_alu_ent_borrow_rules(self.S)
+        # The set of (sp_lo, imm_lo) pairs that fire is asymmetric, but
+        # every emitted rule must still write the canonical CARRY+0
+        # cell with the byte-identical scale.
+        assert len(rules) > 0
+        _check_carry_byte0_writes(
+            rules, expected_scale=2.0 / (self.S * 5.0)
+        )
+
+    def test_gate_is_op_ent_flag(self):
+        rules = _layer8_alu_ent_borrow_rules(self.S)
+        _check_gate(rules, expected_opcode="ENT")
+
+    def test_dominates_at_unchanged(self):
+        rules = _layer8_alu_ent_borrow_rules(self.S)
+        _check_dominates_at_carry0(
+            rules, expected_scope="MARK_AX and OP_ENT"
         )
 
 
