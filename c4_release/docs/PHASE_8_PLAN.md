@@ -524,6 +524,106 @@ cross-stack tests — sequence 8.K.4 last among the deployment items.
 * **8.M.3** Self-hosting validation: the C4-C bundler must be able to bundle ITSELF (output runs and produces a working bundler).
 * **Acceptance**: Python bundler passes 1096/1096; C4-C bundler passes 1096/1096; self-bundle round-trips.
 
+#### 8.O — Architectural toggles + HuggingFace loadable model
+
+The model architecture is configurable, but several pieces are
+currently fixed: ALiBi position encoding, softmax (no +1), log
+division. The user wants each of these as a runtime toggle, plus an
+optional output norm, and a packaged HuggingFace-loadable definite
+model that can run through the standard `transformers` runner.
+
+**Toggles to add:**
+1. **Position encoding**: `position_encoding: Literal["alibi", "rope"]`
+   - Today: ALiBi via `attn.alibi_slopes` per-head field (decoupled
+     post-`e791fef`).
+   - 8.O.1 add RoPE implementation — standard rotational embeddings
+     applied to Q/K before attention. Make compatible with the existing
+     attention head specs (RoPE is residual-stream-agnostic so doesn't
+     conflict with `DeclarativeAttentionHeadSpec`).
+   - Both modes must produce byte-identical 1096 corpus pass-rate.
+
+2. **Attention denominator**: `attn_softmax: Literal["softmax", "softmax1"]`
+   - Today: standard softmax in `PureAttention.forward`.
+   - 8.O.2 add softmax1 (+1 in denominator — "can attend to nothing"
+     variant). Toggle through to baking via the existing attention
+     scoring path (some Phase 6 work already references softmax1
+     sinks in the symbolic comparison harness — extend to runtime).
+   - Both modes must pass 1096 corpus.
+
+3. **Division strategy**: `div_mode: Literal["log_exp", "log_div"]`
+   - **Clarification needed**: please confirm which path is
+     "log/exp" vs "log division" in the current codebase. Two
+     candidates:
+     (a) DIV opcode lookup table (current) vs log-space subtraction
+     (b) Softmax computation: standard log-sum-exp vs alternative
+     log-division formulation
+   - 8.O.3 add the other mode; both pass 1096.
+
+4. **Output norm**: `output_norm: Optional[Literal["rmsnorm", "layernorm"]]
+   = None`
+   - Today: no output norm after the last transformer block.
+   - 8.O.4 add `nn.RMSNorm` or `nn.LayerNorm` after the block stack,
+     toggled by config. With norm OFF the model is byte-identical to
+     today's behavior; with norm ON it must still pass 1096 corpus
+     (norm trained or analytically derived to be identity at our scale).
+
+**HuggingFace packaging:**
+
+* **8.O.5** Write `c4_release/hf_export/`:
+  - `configuration_c4vm.py` — `transformers.PretrainedConfig` subclass
+    with all the toggles above + existing hyperparameters
+    (n_layers, n_heads, d_model, vocab_size, etc.)
+  - `modeling_c4vm.py` — `transformers.PreTrainedModel` subclass
+    wrapping `BakedC4Transformer`. Override `forward` to match the
+    HF convention (input_ids → logits).
+  - `tokenization_c4vm.py` — `transformers.PreTrainedTokenizer`
+    subclass for the C4 token vocabulary (opcodes, markers, bytes).
+* **8.O.6** Map weights from internal names to HF-conventional names
+  (or vice versa). The `compile_full_vm` output is a `nn.Module`;
+  serialize via `model.save_pretrained(path)`.
+* **8.O.7** Publish to HuggingFace Hub:
+  - Pick a model ID (suggested: `c4vm/c4-baked-transformer-15L-v1`).
+  - Upload weights + config + tokenizer + README + license.
+  - **Clarification needed**: which HF org / model name?
+* **8.O.8** Round-trip test:
+  ```python
+  from transformers import AutoModelForCausalLM, AutoTokenizer
+  model = AutoModelForCausalLM.from_pretrained("c4vm/c4-baked-transformer-15L-v1")
+  tokenizer = AutoTokenizer.from_pretrained("c4vm/c4-baked-transformer-15L-v1")
+  # Run 1096 corpus through the HF model
+  ```
+  Acceptance: HF-loaded model passes 1096/1096 corpus identical to
+  internal `BakedC4Transformer`.
+
+* **8.O.9** Each toggle combination must pass:
+  - 1096 corpus 100%
+  - Smoke tests
+  - Byte-identical logits under the toggle's "current default" mode
+
+* **8.O.10** Document combinations in
+  `docs/ARCHITECTURE_TOGGLES.md` — which combinations are byte-identical
+  to current default, which produce different (but still-valid) logits,
+  performance tradeoffs.
+
+**Total: 4 toggles × {old, new} = 16 combinations. Test matrix:**
+all 16 must pass 1096 corpus. Default config matches today's behavior
+byte-for-byte; non-default configs may produce different (but valid)
+logits — gate on 1096 pass-rate, not byte-identity, for non-default
+combinations.
+
+**Acceptance**:
+- 16 toggle combinations all pass 1096 corpus
+- HuggingFace model published at the agreed-on ID
+- Round-trip via `AutoModelForCausalLM.from_pretrained()` → 1096/1096
+- Both PyTorch path AND ONNX export path support all toggles
+  (the ONNX export from 8.J must accept the config and produce
+   correct ONNX graphs per toggle)
+- ARCHITECTURE_TOGGLES.md documents each combination
+
+8.O depends on: 8.J (ONNX export must support toggles too) and
+the byte-identity gates from earlier waves (toggle ≡ default mode
+must be byte-identical so toggles don't silently regress).
+
 #### 8.N — Quine (closes C9)
 
 * **8.N.1** Verify `vm/neural_quine.c` or `vm/meta_quine.c` compiles, runs via the model, and outputs its own source code.
