@@ -17,6 +17,7 @@ from c4_release.neural_vm.unified_compiler.ir import (
 from c4_release.neural_vm.unified_compiler.ops.l10_ops import (
     _L10_FFN_UNIT_LAYOUT_MAIN,
     _layer10_alu_bitwise_or_rules,
+    _layer10_alu_bitwise_xor_rules,
     _layer10_alu_cmp_combine_rules,
 )
 from c4_release.neural_vm.unified_compiler.primitives import Primitives
@@ -156,3 +157,30 @@ def test_layer10_alu_bitwise_or_rules_compare_symbolic_to_lowered_ffn():
     """Structural ``compare_symbolic_to_lowered_ffn`` parity for bitwise_or."""
 
     _assert_substage_compare_clean(_layer10_alu_bitwise_or_rules(100.0))
+
+
+def test_layer10_alu_bitwise_xor_rules_match_legacy_units():
+    """Sub-stage 3 (units 530..1041): bitwise XOR 3-way AND cross-product."""
+
+    actual = _StubFFN()
+    expected = _StubFFN()
+
+    rules = _layer10_alu_bitwise_xor_rules(100.0)
+    start, end = _layout_range("layer10_alu.bitwise_xor")
+    next_unit = _lower_rules(actual, rules, start_unit=start, S=100.0)
+    _set_layer10_alu(expected, 100.0, _SetDim)
+
+    assert next_unit == end, (
+        f"bitwise_xor cursor drift: lowered to {next_unit}, expected {end}"
+    )
+    assert len(rules) == end - start, (
+        f"bitwise_xor rule count drift: {len(rules)} rules vs "
+        f"{end - start} pinned units"
+    )
+    _assert_same_ffn_units(actual, expected, start, end)
+
+
+def test_layer10_alu_bitwise_xor_rules_compare_symbolic_to_lowered_ffn():
+    """Structural ``compare_symbolic_to_lowered_ffn`` parity for bitwise_xor."""
+
+    _assert_substage_compare_clean(_layer10_alu_bitwise_xor_rules(100.0))
