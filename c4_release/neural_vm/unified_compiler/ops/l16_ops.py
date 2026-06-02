@@ -1652,10 +1652,16 @@ def make_layer16_lev_routing_op() -> Operation:
                "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "ALU_LO"},
         kind="ffn",
-        layer_idx=16,
         bake_fn=bake,
         compiler_ir=make_layer16_lev_routing_ir(),
         migrated=True,
+        # Phase 8.A.4: dropped ``layer_idx=16`` pin. The dep-graph already
+        # forces a later layer than every L15 op via the read on
+        # ``OUTPUT_LO`` / ``OUTPUT_HI_THIS_STEP`` produced by
+        # ``layer15_memory_lookup``; ``requires["after"]`` re-affirms
+        # ordering against the L15 attn op so the scheduler honours the
+        # 1-layer gap when block-op writes don't appear in the dep graph.
+        requires={"after": "layer15_memory_lookup"},
         # ``_set_layer16_lev_routing`` writes 121 units (vm_step.py:6845):
         #   16 (cancel OUTPUT_LO at SP) + 16 (cancel OUTPUT_HI at SP) +
         #   16 (SP=BP+16 lo) + 16 (SP=BP+16 hi) +
