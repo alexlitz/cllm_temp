@@ -330,6 +330,11 @@ def make_layer7_memory_heads_op() -> Operation:
         # L7 also self-writes TEMP for the NOCARRY_ALU_OP relay (head 5 V
         # slot 9) — that write is independent of the read. Breaks L11/L14 →
         # layer7_memory_heads back-edges on TEMP.
+        # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the L7 read as
+        # cross-step relative to L8 AX_CARRY_HI writers (multibyte_fetch
+        # {,_bake}, head6_ax_carry_refresh). L7 fires before L8 in the
+        # same step. Same-step L3 / L5 contributions still land at the
+        # same numeric position.
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "OP_LI", "OP_LC", "OP_PSH", "OP_SI", "OP_SC",
                "OP_ADD", "OP_SUB",
@@ -337,7 +342,7 @@ def make_layer7_memory_heads_op() -> Operation:
                # propagation relays and OP_SHR for the byte-zero cleanup relay.
                "OP_AND", "OP_OR", "OP_XOR", "OP_SHR",
                "OP_JSR",  # head 5 V slot 8 (existing, declared for completeness)
-               "AX_CARRY_LO", "AX_CARRY_HI", "TEMP_PREV_STEP"},
+               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP", "TEMP_PREV_STEP"},
         writes={"OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP",
                 "TEMP", "ADDR_KEY",
                 # V7 Block 13 (2026-05-12): head 5 V slot 9 writes the

@@ -2478,10 +2478,17 @@ def make_layer6_attn_op() -> Operation:
     return Operation(
         name="layer6_attn",
         phase=6,
+        # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the L6 read as
+        # cross-step relative to the L8 writers (multibyte_fetch{,_bake},
+        # head6_ax_carry_refresh). L6 fires before L8 in the same step, so
+        # any L8 contribution it sees is the prev-step residual cached in
+        # the AX-marker row. The same-step L3 contribution (carry_forward)
+        # is still picked up at the same numeric position. Breaks
+        # back-edges L8 → layer6_attn on AX_CARRY_HI.
         reads={"OP_JMP", "OP_EXIT", "OP_JSR", "MARK_AX", "MARK_PC", "MARK_SP",
                "MARK_STACK0", "NEXT_SE", "FETCH_LO", "FETCH_HI",
                "PSH_AT_SP", "OP_PSH", "OP_ADJ", "OP_ENT", "OP_LEV",
-               "AX_CARRY_LO", "AX_CARRY_HI"},
+               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP"},
         writes={"CMP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
         layer_idx=6,
@@ -2550,10 +2557,13 @@ def make_layer6_routing_ffn_op() -> Operation:
         # same step). The same-step values from L3 carry_forward / L5
         # opcode_decode are still picked up at the same numeric position.
         # Breaks L7/L11/L14 → layer6_routing_ffn back-edges on TEMP.
+        # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the read as
+        # cross-step relative to L8 AX_CARRY_HI writers (multibyte_fetch
+        # {,_bake}, head6_ax_carry_refresh). See layer6_attn for rationale.
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
-               "AX_CARRY_LO", "AX_CARRY_HI", "CMP",
+               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP", "CMP",
                "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
                "TEMP_PREV_STEP", "DIV_STAGING"},
@@ -2791,7 +2801,10 @@ def make_layer6_relay_heads_op() -> Operation:
         # K side and writes AX_CARRY_LO / AX_CARRY_HI at the MARK_AX query
         # position; declare those so the LayerCompiler dep graph routes the
         # producer before downstream consumers.
-        reads={"MARK_STACK0", "MARK_AX", "AX_CARRY_LO", "AX_CARRY_HI",
+        # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the L6 read as
+        # cross-step relative to L8 writers. See layer6_attn for rationale.
+        reads={"MARK_STACK0", "MARK_AX",
+               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP",
                "STACK0_BYTE0", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "OP_LEV", "CONST"},
         writes={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
@@ -3908,7 +3921,12 @@ def make_putchar_think_protocol_op(
     return Operation(
         name="putchar_think_protocol",
         phase=6.6,
-        reads={"IO_IS_PUTCHAR", "NEXT_SE", "AX_CARRY_LO", "AX_CARRY_HI"},
+        # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the read as
+        # cross-step relative to L8 AX_CARRY_HI writers (this op fires at
+        # L6 phase 6.6, before any L8 AX_CARRY producer). Stub bake; the
+        # reads are placeholders for the Phase 2 implementation.
+        reads={"IO_IS_PUTCHAR", "NEXT_SE",
+               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP"},
         writes={"NEXT_THINKING_END", "NEXT_SE", "IO_STATE",
                 "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         kind="block",
