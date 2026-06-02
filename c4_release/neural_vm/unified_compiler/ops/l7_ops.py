@@ -163,7 +163,6 @@ def make_layer7_operand_gather_op() -> Operation:
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         writes={"ALU_LO", "ALU_HI"},
         kind="block",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer7_operand_gather_ir,
         declarative_authority="spec_generated",
@@ -336,7 +335,6 @@ def make_layer7_memory_heads_op() -> Operation:
                 # relay back to OP_JSR at AX byte positions (added 2026-05-12).
         "OP_JSR", "OP_SI", "OP_SC"},
         kind="block",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer7_memory_heads_ir,
         layer_idx=7,
@@ -571,7 +569,6 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
         reads={"IO_IN_OUTPUT_MODE", "MARK_STACK0", "EMBED_LO", "EMBED_HI"},
         writes={"FORMAT_PTR_LO", "FORMAT_PTR_HI"},
         kind="block",
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _format_pointer_extraction_ir
@@ -698,7 +695,6 @@ def make_layer7_sp_byte0_is_f8_op() -> Operation:
         writes={"SP_BYTE0_IS_F8"},
         kind="block",
         layer_idx=7,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer7_sp_byte0_is_f8_ir,
         declarative_authority="spec_generated",
