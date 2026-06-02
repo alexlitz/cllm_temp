@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
@@ -787,17 +788,25 @@ def _layer6_temp_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
 
 
 def _layer6_cmp3_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
-    """CompilerIR rules for L6 CMP[3] cleanup unit 417."""
+    """CompilerIR rules for L6 CMP[3] cleanup unit 417.
+
+    Phase 8.D: the CMP[3] gate and write both use :func:`dim_ref` for
+    the ``(cmp_flag, "cascade", 3)`` semantic pair -- byte 3 of the
+    inter-byte CMP cascade (lo_lt). ``MARK_PC`` / ``IS_BYTE`` condition
+    reads stay bare per the L8 pilot convention (marker-on-up-branch
+    guards stay structural).
+    """
 
     write_scale = 2.0 / S
+    cmp_cascade_3 = dim_ref("cmp_flag", "cascade", 3)
     return (
         FFNRule.gated_write(
             name="l6_cmp3_cleanup",
             conditions=(("MARK_PC", 1.0), ("IS_BYTE", -1.0)),
             threshold=0.5,
-            gate="CMP+3",
+            gate=cmp_cascade_3,
             gate_weight=-1.0,
-            writes=(("CMP+3", write_scale),),
+            writes=((cmp_cascade_3, write_scale),),
         ),
     )
 
