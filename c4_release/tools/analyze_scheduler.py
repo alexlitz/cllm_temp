@@ -125,16 +125,22 @@ def build_dep_graph(
     same_layer_only: Set[Tuple[str, str]] = set()
     other_edges: Set[Tuple[str, str]] = set()
 
-    # writers index: dim -> ops that write it
+    # writers index: dim -> ops that write it.
+    # We iterate ops in their natural list order so writers[d] is a
+    # deterministic list; we sort op.writes (a Set) to make the
+    # *order in which dims are populated* PYTHONHASHSEED-independent.
     writers: Dict[str, List[Operation]] = defaultdict(list)
     for op in ops:
-        for d in op.writes:
+        for d in sorted(op.writes):
             writers[d].append(op)
 
-    # produces index: (dim, register) -> ops that produce it
+    # produces index: (dim, register) -> ops that produce it.
+    # ``produces`` is a Dict (insertion order in CPython 3.7+, which is
+    # deterministic for ops authored declaratively), but sort defensively
+    # so the (dim, register) keys are added in seed-independent order.
     producers: Dict[Tuple[str, str], List[Operation]] = defaultdict(list)
     for op in ops:
-        for dim, reg in op.produces.items():
+        for dim, reg in sorted(op.produces.items()):
             producers[(dim, reg)].append(op)
 
     for v in ops:
@@ -155,8 +161,11 @@ def build_dep_graph(
             for d in ref_op.writes & v.reads:
                 requires_after_writers.add((ref, d))
         suppressed_dims = {d for (_, d) in requires_after_writers}
-        # Data-flow edges
-        for d in v.reads:
+        # Data-flow edges. Iterate v.reads in sorted order so the
+        # FIRST contributing dim for each (u,v) pair is
+        # PYTHONHASHSEED-independent, and so the order of dims appended
+        # to edge_reasons is deterministic.
+        for d in sorted(v.reads):
             if d in suppressed_dims:
                 # Cross-step read acknowledged via requires["after"];
                 # the actual X→v edge is added below in the requires
@@ -169,11 +178,22 @@ def build_dep_graph(
                 if u.name not in in_edges[v.name]:
                     in_edges[v.name].add(u.name)
                     out_edges[u.name].add(v.name)
-                    edge_reasons[(u.name, v.name)].append(f"writes/reads:{d}")
+                # IMPORTANT: record the reason OUTSIDE the
+                # ``if u not in in_edges`` guard. If multiple dims
+                # contribute to the same (u,v) edge (e.g. u writes
+                # {A, B}, v reads {A, B}) every contributing dim must
+                # appear in edge_reasons -- the back-edge histogram
+                # below sums counts per dim, so under-counting hides
+                # cycle structure and (because set-iteration order
+                # determines which dim "wins" the slot) the bug
+                # leaks PYTHONHASHSEED non-determinism into the
+                # rendered report.
+                edge_reasons[(u.name, v.name)].append(f"writes/reads:{d}")
                 other_edges.add((u.name, v.name))
 
-        # Staleness edges
-        for dim, reg in v.consumes_fresh.items():
+        # Staleness edges. Iterate consumes_fresh in sorted order for
+        # the same reason.
+        for dim, reg in sorted(v.consumes_fresh.items()):
             for u in producers.get((dim, reg), ()):
                 if u.name == v.name:
                     continue
@@ -190,7 +210,11 @@ def build_dep_graph(
         # or an iterable of strings (B10 schema). Unknown names are
         # silently skipped here; ``validate_requires_op_refs`` already ran
         # in ``main`` and would have surfaced them as a hard error.
-        for ref in requires_after_ops(v):
+        # ``requires_after_ops`` / ``requires_same_layer_as_ops`` return
+        # lists in declaration order, which is already deterministic;
+        # we sort here defensively so future refactors can't reintroduce
+        # set-iteration non-determinism.
+        for ref in sorted(requires_after_ops(v)):
             if ref == v.name or ref not in name_to_op:
                 continue
             if ref not in in_edges[v.name]:
@@ -198,7 +222,7 @@ def build_dep_graph(
                 out_edges[ref].add(v.name)
             edge_reasons[(ref, v.name)].append(f"requires[after]={ref}")
             other_edges.add((ref, v.name))
-        for ref in requires_same_layer_as_ops(v):
+        for ref in sorted(requires_same_layer_as_ops(v)):
             if ref == v.name or ref not in name_to_op:
                 continue
             if ref not in in_edges[v.name]:
@@ -295,7 +319,15 @@ def find_scc_summary(
     Tarjan's algorithm on the cycle-member subgraph. Returns SCCs sorted by
     size descending.
     """
-    sub_out = {n: out_edges[n] & cycle_members for n in cycle_members}
+    # Sort neighbour lists so Tarjan's recursion order is independent of
+    # PYTHONHASHSEED. SCC composition is mathematically invariant to
+    # traversal order, but recursion order affects per-SCC member order
+    # (and would affect the `sccs.sort(key=len, reverse=True)` tie-break
+    # when two SCCs have equal sizes -- we additionally tie-break on
+    # sorted membership below).
+    sub_out = {
+        n: sorted(out_edges[n] & cycle_members) for n in cycle_members
+    }
     index_counter = [0]
     stack: List[str] = []
     on_stack: Set[str] = set()
@@ -331,7 +363,9 @@ def find_scc_summary(
         if n not in indices:
             strongconnect(n)
 
-    sccs.sort(key=len, reverse=True)
+    # Stable sort: primary by size descending, secondary by sorted member
+    # tuple ascending so equal-size SCCs always emit in the same order.
+    sccs.sort(key=lambda comp: (-len(comp), tuple(sorted(comp))))
     return sccs
 
 
@@ -584,27 +618,41 @@ def render_report(
             lines.append(f"  - …+{len(sccs) - 5} more SCCs (see CSV)")
     lines.append("")
 
-    # Top dims responsible for back-edges into the largest SCC
+    # Top dims responsible for back-edges into the largest SCC.
+    # We sort every iteration that contributes to ordering so the
+    # rendered output is PYTHONHASHSEED-independent: (a) the (u,v) walk
+    # is sorted, (b) example lists are accumulated in sorted (u,v)
+    # order, (c) the top-N dims are sorted by (-count, dim_name) so
+    # equal-count dims have a stable lexicographic tiebreaker.
     if sccs:
         biggest_scc = set(sccs[0])
         # Count which dim contributes the most edges inside the SCC.
         # An edge u→v is inside the SCC iff u in scc and v in scc.
         dim_back_edges: Dict[str, int] = defaultdict(int)
         dim_back_examples: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-        for (u, v), reasons in edge_reasons.items():
+        for (u, v) in sorted(edge_reasons.keys()):
+            reasons = edge_reasons[(u, v)]
             if u not in biggest_scc or v not in biggest_scc:
                 continue
             u_layer = _current_layer(by_name[u]) or 0
             v_layer = _current_layer(by_name[v]) or 0
             if u_layer <= v_layer:
                 continue  # forward edge in current layout
-            # back-edge in current static phase ordering
+            # back-edge in current static phase ordering. De-dup dims so
+            # multiple "writes/reads:X" entries on a single (u,v) edge
+            # (e.g. produced by repeated declarations) count once per
+            # edge, not once per repetition.
+            seen_dims: Set[str] = set()
             for reason in reasons:
-                if reason.startswith("writes/reads:"):
-                    dim = reason.split(":", 1)[1]
-                    dim_back_edges[dim] += 1
-                    if len(dim_back_examples[dim]) < 3:
-                        dim_back_examples[dim].append((u, v))
+                if not reason.startswith("writes/reads:"):
+                    continue
+                dim = reason.split(":", 1)[1]
+                if dim in seen_dims:
+                    continue
+                seen_dims.add(dim)
+                dim_back_edges[dim] += 1
+                if len(dim_back_examples[dim]) < 3:
+                    dim_back_examples[dim].append((u, v))
         if dim_back_edges:
             lines.append("### Top dims producing back-edges inside the largest SCC")
             lines.append("")
@@ -616,8 +664,10 @@ def render_report(
                 "step-local vs. cross-step variants is the typical fix."
             )
             lines.append("")
+            # Tie-break by dim name lexicographically so equal-count
+            # dims have a stable order.
             sorted_dims = sorted(
-                dim_back_edges.items(), key=lambda kv: kv[1], reverse=True
+                dim_back_edges.items(), key=lambda kv: (-kv[1], kv[0])
             )[:10]
             for dim, n in sorted_dims:
                 exs = dim_back_examples[dim][:3]
@@ -646,11 +696,14 @@ def render_report(
                 )
     lines.append("")
 
-    # phase_required_but_undeclared — top 30 by gap
+    # phase_required_but_undeclared — top 30 by gap (lex tiebreak on
+    # op name so equal-gap rows have a stable order).
     needs_decl = [op for op in ops if cats[op.name] == "phase_required_but_undeclared"]
     needs_decl.sort(
-        key=lambda o: (_current_layer(o) or 0) - depth.get(o.name, 0),
-        reverse=True,
+        key=lambda o: (
+            -((_current_layer(o) or 0) - depth.get(o.name, 0)),
+            o.name,
+        ),
     )
     lines.append(f"## phase_required_but_undeclared ({len(needs_decl)})")
     lines.append("")
@@ -680,9 +733,9 @@ def render_report(
         lines.append(f"…+{len(needs_decl) - 30} more, see CSV dump for the full list.")
     lines.append("")
 
-    # phase_pinned_by_deps — top 30 by depth
+    # phase_pinned_by_deps — top 30 by depth (lex tiebreak on op name).
     pinned = [op for op in ops if cats[op.name] == "phase_pinned_by_deps"]
-    pinned.sort(key=lambda o: depth.get(o.name, 0))
+    pinned.sort(key=lambda o: (depth.get(o.name, 0), o.name))
     lines.append(f"## phase_pinned_by_deps ({len(pinned)})")
     lines.append("")
     lines.append(
