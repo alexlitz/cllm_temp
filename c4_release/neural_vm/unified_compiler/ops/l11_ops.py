@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -124,9 +125,17 @@ def _layer11_mul_partial_rules_for_a_lo(
     ``_set_layer11_mul_partial`` so the lowering cursor lands on the
     historical hidden-unit indices (slab ``a_lo`` occupies units
     ``a_lo*256 .. (a_lo+1)*256``).
+
+    Phase 7.E.3: gate uses :func:`dim_ref` for the
+    ``(opcode_flag, MUL)`` semantic pair. Structural operand reads
+    (``ALU_LO+a_lo``, ``AX_CARRY_LO+b_lo``, ``AX_CARRY_HI+b_hi``) and
+    the ``TEMP+partial`` write stay as ``+N`` -- the ``partial`` offset
+    is a value-bus lookup index (computed nibble of the MUL partial
+    product), not a role-meaningful byte position.
     """
     if not 0 <= a_lo < 16:
         raise ValueError(f"a_lo must be in [0, 16), got {a_lo}")
+    gate_mul = dim_ref("opcode_flag", "MUL")
     rules: list[FFNRule] = []
     for b_lo in range(16):
         carry = (a_lo * b_lo) // 16
@@ -141,7 +150,7 @@ def _layer11_mul_partial_rules_for_a_lo(
                     (f"AX_CARRY_HI+{b_hi}", 1.0),
                 ),
                 threshold=3.5,
-                gate="OP_MUL",
+                gate=gate_mul,
                 gate_weight=1.0,
                 gate_bias=0.0,
                 writes=((f"TEMP+{partial}", 10.0 / S),),
