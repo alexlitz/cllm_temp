@@ -156,6 +156,19 @@ class PureAttention(nn.Module):
 
     Subclasses ONLY override _bake_weights().
     Used for carry propagation between nibble positions.
+
+    KV eviction (Phase 7.F.2)
+    -------------------------
+    ``eviction_state`` is an optional :class:`KVEvictionState` attached
+    by the compiler when ``--kv-eviction-policy=static_liveness`` is
+    selected. ``None`` (the default) preserves byte-identity with all
+    historical baselines: the forward pass detects the absence of state
+    and skips the eviction hook entirely. The hook itself is also a
+    no-op when this module has no live KV cache (the standard
+    ``PureAttention.forward`` below recomputes K/V from the residual on
+    every call); the state is still consulted so that determinism gates
+    in tests can observe the same decisions across spec-decode and
+    main-decode paths.
     """
 
     def __init__(self, dim: int, num_heads: int = 1, causal: bool = True):
@@ -174,7 +187,38 @@ class PureAttention(nn.Module):
         # Default mask is zeros (no masking). Child classes override with custom masks.
         self.register_buffer('mask', torch.zeros(E.NUM_POSITIONS, E.NUM_POSITIONS))
 
+        # Phase 7.F.2: precomputed runtime eviction state. Compiler
+        # attaches a ``KVEvictionState`` when the eviction policy is on;
+        # remains ``None`` otherwise (the byte-identity baseline).
+        self.eviction_state = None
+        # Track step index for the optional step-boundary eviction hook.
+        # The runtime caller bumps this by overwriting the attribute or
+        # by passing ``step_idx`` to :meth:`run_eviction_hook`.
+        self._eviction_step_idx = 0
+
         self._bake_weights()
+
+    def run_eviction_hook(self, step_idx: int | None = None) -> int:
+        """Apply the attached :class:`KVEvictionState` at step boundary.
+
+        Safe to call regardless of whether ``eviction_state`` is set —
+        when it's ``None`` or ``KVEvictionPolicy.OFF`` the call is a
+        zero-cost no-op and returns ``0`` rows zeroed.
+
+        Returns the number of cache rows zeroed (always 0 for the
+        default cache-less ``PureAttention.forward``).
+        """
+
+        state = getattr(self, "eviction_state", None)
+        if state is None:
+            return 0
+        if step_idx is None:
+            step_idx = int(getattr(self, "_eviction_step_idx", 0))
+        # Lazy import to avoid a hard dependency at module import time
+        # (``kv_eviction`` may import IR types that haven't loaded yet).
+        from .kv_eviction import apply_eviction
+
+        return apply_eviction(self, state, step_idx)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """FINAL - Standard attention. DO NOT OVERRIDE."""
@@ -195,7 +239,16 @@ class PureAttention(nn.Module):
         out = torch.matmul(attn, V)
 
         out = out.transpose(1, 2).contiguous().view(B, S, D)
-        return x + F.linear(out, self.W_o)
+        result = x + F.linear(out, self.W_o)
+
+        # Phase 7.F.2 step-boundary hook. The hook is a no-op when no
+        # eviction state is attached, preserving byte-identity with the
+        # baseline. When attached, the hook consults the precomputed
+        # ``KVEvictionState`` (same decisions across spec/main decode).
+        if getattr(self, "eviction_state", None) is not None:
+            self.run_eviction_hook()
+
+        return result
 
     def _bake_weights(self):
         """Override to bake attention weights."""
