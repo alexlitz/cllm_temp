@@ -738,7 +738,8 @@ class LayerCompiler:
         self.block_ops: List[Operation] = []
         self.model_ops: List[Operation] = []
 
-    def declare_dim(self, name: str, size: int, pinned: Optional[int] = None):
+    def declare_dim(self, name: str, size: int, pinned: Optional[int] = None,
+                    alias_of: Optional[str] = None):
         """Declare a dim with optional pinned start position.
 
         When pinned is given, the compiler MUST place the dim at that exact
@@ -746,6 +747,14 @@ class LayerCompiler:
         names share the same physical position).
 
         When pinned is None, the dim is bump-pointer-allocated.
+
+        When ``alias_of`` is given, the dim is registered as an alias of
+        ``alias_of``: at allocation time it gets the SAME numeric position as
+        the base regardless of whether the base is pinned or bump-allocated.
+        Use this when the base is bump-pointer-allocated (not pinned) and the
+        alias must follow it. Both ``pinned`` and ``alias_of`` can be supplied;
+        ``alias_of`` takes precedence at allocation time. See Phase 7.A.3.c
+        spec — PREV_STEP cross-step alias decomposition.
         """
         if name in self.dims and self.dims[name] != size:
             raise ValueError(
@@ -757,6 +766,10 @@ class LayerCompiler:
             if not hasattr(self, "_pinned"):
                 self._pinned: Dict[str, int] = {}
             self._pinned[name] = pinned
+        if alias_of is not None:
+            if not hasattr(self, "_aliases"):
+                self._aliases: Dict[str, str] = {}
+            self._aliases[name] = alias_of
 
     def add_op(self, op: Operation):
         if op.kind not in ("attn", "ffn", "block", "model"):
@@ -1488,24 +1501,46 @@ class LayerCompiler:
 
         Pinned dims (declared with `pinned=POS`) get their requested position.
         Unpinned dims are bump-pointer allocated AFTER the highest pinned
-        endpoint, in declaration order.
+        endpoint, in declaration order. Aliases (declared via
+        ``declare_dim(..., alias_of=BASE)``) get the same position as their
+        base AND do not consume bump-pointer space.
         """
         positions: Dict[str, int] = {}
         pinned = getattr(self, "_pinned", {}) or {}
-        # Place pinned dims first
+        aliases = getattr(self, "_aliases", {}) or {}
+        # Place pinned dims first (skipping aliases — they resolve last)
         for name, pos in pinned.items():
+            if name in aliases:
+                continue
             positions[name] = pos
         # Highest pinned endpoint becomes the start for bump-pointer
         max_pinned_end = 0
         for name, pos in pinned.items():
+            if name in aliases:
+                continue
             max_pinned_end = max(max_pinned_end, pos + self.dims[name])
-        # Bump-pointer the rest, starting after the highest pinned endpoint
+        # Bump-pointer the rest (excluding aliases), starting after the
+        # highest pinned endpoint
         cursor = max_pinned_end
         for name, size in self.dims.items():
-            if name in pinned:
+            if name in pinned or name in aliases:
                 continue
             positions[name] = cursor
             cursor += size
+        # Resolve aliases last: each alias inherits its base's position.
+        # Aliases-of-aliases are resolved transitively.
+        for name in list(aliases):
+            base = aliases[name]
+            # Walk alias chain (cap to dim count to avoid cycles).
+            for _ in range(len(self.dims) + 1):
+                if base not in aliases:
+                    break
+                base = aliases[base]
+            if base not in positions:
+                raise ValueError(
+                    f"Alias {name!r} references unknown base dim {base!r}"
+                )
+            positions[name] = positions[base]
         return positions
 
 

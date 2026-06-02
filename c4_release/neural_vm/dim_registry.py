@@ -622,6 +622,14 @@ def build_default_registry() -> DimRegistry:
     # FIXME(F-4): refine — fires at MEM-region query positions.
     _pin("ADDR_KEY", 206, 48, "One-hot address key for memory matching (3 nibbles x 16)",
               semantics="mark == MEM")
+    # Phase 8.A.6 v2: ADDR_KEY_PREV_STEP aliases the same 48-slot key band
+    # so byte-identity is preserved. Cross-step readers (L4/L5/L8/L9 ops
+    # that fire before L7/L14 writers in the same step) declare their
+    # reads as prev-step semantically. Mirrors the B9 OUTPUT_HI_THIS_STEP
+    # pattern. See docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
+    _pin("ADDR_KEY_PREV_STEP", 206, 48,
+              "Prev-step ADDR_KEY residual (aliases ADDR_KEY)",
+              semantics="mark == MEM", alias=True)
 
     # NEXT_* transition flags. Written at the marker position preceding
     # the transition; conservatively scoped to "any marker" since the
@@ -680,6 +688,18 @@ def build_default_registry() -> DimRegistry:
               semantics="mark == AX OR (is_byte AND byte_index == 0)")
     _pin("AX_CARRY_HI", 344, 16, "Carried-forward AX hi nibble",
               semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    # Phase 8.A.6 v2: AX_CARRY_{LO,HI}_PREV_STEP aliases let cross-step
+    # readers (L6/L7 ops that fire before L8 writers in the same step)
+    # declare their reads as prev-step semantically. Same numeric base so
+    # byte-identity is preserved.
+    _pin("AX_CARRY_LO_PREV_STEP", 328, 16,
+              "Prev-step AX_CARRY_LO residual (aliases AX_CARRY_LO)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)",
+              alias=True)
+    _pin("AX_CARRY_HI_PREV_STEP", 344, 16,
+              "Prev-step AX_CARRY_HI residual (aliases AX_CARRY_HI)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)",
+              alias=True)
 
     # ALU result staging. Written at AX byte positions when an ALU opcode
     # is active in the current step.
@@ -689,6 +709,13 @@ def build_default_registry() -> DimRegistry:
               semantics="mark == AX OR (is_byte AND byte_index == 0)")
     _pin("ALU_HI", 376, 16, "ALU result hi nibble",
               semantics="mark == AX OR (is_byte AND byte_index == 0)")
+    # Phase 8.A.6 v2: ALU_LO_PREV_STEP alias lets cross-step readers (L8+
+    # ops that fire before the next ALU_LO writer in the same step) declare
+    # their reads as prev-step semantically. Same numeric base.
+    _pin("ALU_LO_PREV_STEP", 360, 16,
+              "Prev-step ALU_LO residual (aliases ALU_LO)",
+              semantics="mark == AX OR (is_byte AND byte_index == 0)",
+              alias=True)
 
     # Carry / comparison cascade. Per-byte carry propagation slot for
     # add/sub/mul cascade and comparison-flag bus.
