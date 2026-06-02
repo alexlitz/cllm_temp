@@ -252,20 +252,29 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
     Runs before legacy_bake (999).
 
     When `enable_tool_calling=False`, the bake_fn is a no-op.
+
+    Migrated 2026-06-01 (Phase 6 Wave 3L): the imperative helper
+    ``_set_tool_call_relay_head`` is replaced by a
+    ``DeclarativeAttentionHeadSpec`` lowered through
+    ``Primitives.generate_attention_head`` (matching the
+    ``make_convo_io_relay_heads_op`` pattern). Byte-identical to the
+    legacy helper. The ``alibi_slopes[5] = 5.0`` mutation stays inline
+    in the bake_fn (alibi slopes are not part of the declarative
+    attention IR).
     """
-    if enable_tool_calling:
-        def bake(model, dim_positions, S):
-            from ...vm_step import _set_tool_call_relay_head
-            attn = model.blocks[6].attn
-            if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-                attn.alibi_slopes[5] = 5.0  # steep ALiBi for head 5
-            HD = attn.W_q.shape[0] // attn.num_heads
-            _set_tool_call_relay_head(
-                attn, S, _as_setdim_proxy(dim_positions), HD,
-            )
-    else:
-        def bake(model, dim_positions, S):
-            return  # disabled when enable_tool_calling=False
+    def bake(model, dim_positions, S):
+        del S
+        if not enable_tool_calling:
+            return
+        attn = model.blocks[6].attn
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[5] = 5.0  # steep ALiBi for head 5
+        HD = attn.W_q.shape[0] // attn.num_heads
+        Primitives.generate_attention_head(
+            attn,
+            _tool_call_relay_head_spec(_as_setdim_proxy(dim_positions)),
+            HD,
+        )
 
     return Operation(
         name="tool_call_relay_head",
@@ -273,11 +282,45 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_tool_calling else None,
+        declarative_bake_fn=bake,
+        compiler_ir_factory=(
+            _tool_call_relay_head_ir if enable_tool_calling else None
+        ),
+        declarative_authority="spec_generated",
         phase=998.8,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
+    )
+
+
+def _tool_call_relay_head_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(_tool_call_relay_head_spec(proxy))
+    return ir
+
+
+def _tool_call_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative L6 attention head 5: relay IO_IS_TOOL_CALL AX -> SE.
+
+    Mirrors ``_set_tool_call_relay_head`` exactly:
+      - Q: ``NEXT_SE`` × L (query at SE position), ``MARK_AX`` × -L (block at AX)
+      - K: ``MARK_AX`` × L (attend to AX marker)
+      - V slot 1: copy ``IO_IS_TOOL_CALL`` (×1.0)
+      - O: write slot-1 value into ``CMP+2`` (×1.0, the IS_TOOL_CALL relay)
+    """
+    L = 50.0
+    return DeclarativeAttentionHeadSpec(
+        head_idx=5,
+        q=(
+            AP(0, BD.NEXT_SE, L),
+            AP(0, BD.MARK_AX, -L),
+        ),
+        k=(AP(0, BD.MARK_AX, L),),
+        v=(AP(1, BD.IO_IS_TOOL_CALL, 1.0),),
+        o=(AO(BD.CMP + 2, 1, 1.0),),
     )
 
 
