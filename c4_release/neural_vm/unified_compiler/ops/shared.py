@@ -233,12 +233,20 @@ def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
     requires: Dict[str, str] = {}
     if same_layer_as is not None:
         requires["same_layer_as"] = same_layer_as
+    # Phase 8.G.6: drop the ``layer_idx=`` literal pin. ``target_op_name``
+    # binds this block op to whichever layer the wrapped ALU op resolves
+    # to (mirroring the dep DAG); ``requires["same_layer_as"]`` is the
+    # strict-mode dep-edge signal that this co-placement is intentional.
+    # ``phase=1180+`` keeps the >= 100 post-pass short-circuit in the
+    # strict admission gate (``_current_layer_for_strict`` returns
+    # ``floor(phase) = 1180`` which the categoriser treats as ``ok``
+    # before the dep-depth comparison runs).
     return Operation(
         name=name,
         reads=set(),
         writes=set(),
         kind="block",
-        layer_idx=layer_idx,
+        target_op_name=same_layer_as,
         bake_fn=bake,
         phase=1180 + layer_idx * 0.01,
         migrated=True,

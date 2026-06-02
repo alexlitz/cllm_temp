@@ -1742,7 +1742,10 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
 
     return Operation(
         name="layer9_alibi_mem_attn",
-        phase=9.2,  # after lev_addr_relay (9.0) and lev_bp_to_pc_relay (9.1)
+        # Phase 8.G.6: phase=9.2 dropped (had trailing comment); the
+        # ``target_op_name`` below binds the layer and
+        # ``requires["after"]: layer4_pc_relay`` supplies the strict-mode
+        # dep edge.
         reads={"MEM_VAL_B0", "OP_LI_RELAY", "OP_LC_RELAY", "CMP", "CONST",
                "PSH_AT_SP", "MEM_STORE", "ADDR_KEY",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
