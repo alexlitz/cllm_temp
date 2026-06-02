@@ -1891,11 +1891,25 @@ def make_layer10_carry_relay_op() -> Operation:
     return Operation(
         name="layer10_carry_relay",
         phase=10,
-        reads={"MARK_AX", "IS_BYTE", "H1", "CARRY"},
+        # Phase 9.B (CARRY SCC rename): CARRY -> CARRY.*.-1 marks the read
+        # as SSA cross-step relative to the same-step L10 CARRY writers
+        # (``layer10_carry_relay_bake``, ``l10_post_ops_combined``).
+        # Semantically the relay forwards the *previous* step's CARRY into
+        # the current-step CARRY slot for the L10 AX-byte ADD/SUB sum.
+        # ``CARRY.*.-1`` aliases the numeric ``CARRY`` slot via the SSA
+        # rewriter so the lowered weights remain byte-identical; the
+        # same-step writers' edges into this op are suppressed, breaking
+        # the 3-op same-step structural sub-cycle on CARRY
+        # (l10_post_ops_combined <-CARRY-> layer10_carry_relay{,_bake}),
+        # per ``.agent-logs/scc_zero_audit.md §3.7`` option (b).
+        reads={"MARK_AX", "IS_BYTE", "H1", "CARRY.*.-1"},
         writes={"CARRY"},  # broadcast
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR makes the bake noop explicit and
+        # unblocks Phase 10.E/F multiplexer's opcode-class derivation.
+        compiler_ir=CompilerIR(),
         # Phase 8.A.4 retry: this op is the L10 layer anchor. Pointing at
         # ``layer9_marker_suppress`` (kind="ffn", pinned to L9 via its own
         # ``requires["after"]: layer8_alu``) creates a topo dep edge that
@@ -1933,6 +1947,9 @@ def make_layer10_byte_passthrough_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR makes the bake noop explicit and
+        # unblocks Phase 10.E/F multiplexer's opcode-class derivation.
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1958,6 +1975,9 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR makes the bake noop explicit and
+        # unblocks Phase 10.E/F multiplexer's opcode-class derivation.
+        compiler_ir=CompilerIR(),
         # Phase 7.A.2 backfill: this is the topology anchor for L10 head 2's
         # SP byte-0 marker carry-forward. The actual spec
         # (``_layer10_sp_byte_passthrough_head_spec``) reads dims at Q
@@ -1997,6 +2017,9 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR makes the bake noop explicit and
+        # unblocks Phase 10.E/F multiplexer's opcode-class derivation.
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -2590,6 +2613,9 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 11.A IR exposure: empty IR makes the bake noop explicit and
+        # unblocks Phase 10.E/F multiplexer's opcode-class derivation.
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
