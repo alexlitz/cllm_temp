@@ -5,7 +5,7 @@ from collections.abc import Mapping
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR, FFNRule, RuntimeAttentionFragment
+from ..ir import CompilerIR, FFNRule, RuntimeAttentionFragment, StructuralOp
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -1601,13 +1601,76 @@ def make_layer15_nibble_copy_op() -> Operation:
     )
 
 
+def _l15_attention_resize_follow_up(block, dim_positions, S) -> None:
+    """Post-resize bookkeeping + suppress-lookup helper for L15.
+
+    Used as :attr:`StructuralOp.follow_up` by
+    :func:`_l15_attention_resize_structural_ir`. Stashes the L15
+    attention-head allocator on ``attn._l15_head_allocator`` so
+    downstream tooling can audit the head axis after the resize, then
+    invokes
+    :func:`_suppress_l15_lookup_during_current_store_generation`
+    against the resized block. The suppress helper is the legacy
+    imperative writer of the L15 load-head Q/K/V cells; it remains
+    helper-shaped because its writes branch on ``attn.num_heads`` after
+    the resize.
+    """
+
+    del S  # the suppress helper does not consume S
+    attn = block.attn
+    head_allocator = _allocate_layer15_attention_heads()
+    attn._l15_head_allocator = head_allocator
+    head_dim = getattr(
+        attn, "head_dim", attn.W_q.shape[1] // attn.num_heads
+    )
+    _suppress_l15_lookup_during_current_store_generation(
+        attn,
+        _as_setdim_proxy(dim_positions),
+        head_dim,
+    )
+
+
+def _l15_attention_resize_structural_ir(dim_positions, head_dim) -> CompilerIR:
+    """Build the declarative :class:`CompilerIR` for ``l15_attention_resize``.
+
+    Phase 8.I closing audit: the bake's structural intent (resize L15
+    attention to 14 / 9 heads depending on ``n_layers_hint``, pin load
+    head ALiBi to 0.05) lives in a :class:`StructuralOp` with
+    ``kind="attention_resize"``. The follow-up imperative pass (head
+    allocator stash + suppress helper) is carried by
+    :attr:`StructuralOp.follow_up`. The lowerer in
+    :meth:`CompilerIR.lower_structural_ops` handles the
+    ``num_heads``/``W_q``/``W_k``/``W_v``/``W_o`` reallocation and the
+    ALiBi pin, then dispatches the follow-up.
+    """
+
+    del dim_positions, head_dim  # the structural op is shape-agnostic
+    ir = CompilerIR()
+    ir.layer(0).structural_ops.append(
+        StructuralOp(
+            kind="attention_resize",
+            target_num_heads=14,
+            small_num_heads=9,
+            layers_threshold=16,
+            alibi_pin_value=0.05,
+            alibi_pin_count=4,
+            follow_up=_l15_attention_resize_follow_up,
+            metadata={
+                "op_name": "l15_attention_resize",
+                "spec_section": "BLOG_SPEC.md#registers",
+            },
+        )
+    )
+    return ir
+
+
 def make_l15_attention_resize_op() -> Operation:
     """Resize L15 attention for late memory/ALU relay heads.
 
     Migrates the inline resize that previously lived in `set_vm_weights`. The
     extra heads (8-11) hold saved_bp and return_addr reads alongside the
     existing LI/LC/STACK0 reads (heads 0-3) and val heads (4-7). Required
-    when the model has L16 (>=17 layers) — `_set_layer15_memory_lookup`
+    when the model has L16 (>=17 layers) -- `_set_layer15_memory_lookup`
     keys off `attn.num_heads >= 12` to populate the LEV-specific heads.
 
     LEV still needs 12 heads in 17-layer builds. The strict 16-layer neural
@@ -1615,92 +1678,25 @@ def make_l15_attention_resize_op() -> Operation:
     while keeping ``attn.num_heads < 12`` so the LEV-specific memory lookup
     bake remains disabled.
 
-    phase=14.9 places this after L14 (phase=14) and before
-    `_set_layer15_memory_lookup` inside legacy_bake at phase=999.
-
-    Phase 6 wave 2F (head-axis migration): the bake instantiates a
-    per-bake :class:`AttentionHeadAllocator` pre-loaded with the full
-    L15 head layout (see :data:`_L15_HEAD_LAYOUT`) and stashes it on
-    ``attn._l15_head_allocator`` so downstream tooling can audit the
-    head axis after the resize. The op stays
-    ``declarative_authority="structural_model"`` with ``compiler_ir=None``
-    (no ``compiler_ir_factory`` either): the work it performs is a
-    structural ``nn.Parameter`` resize plus a follow-up suppress-helper
-    call, neither of which fits the per-head
-    :class:`AttentionHeadIR` semantics. This is intentional -- the
-    resize *makes* the head set available, it is not a head spec
-    itself; the layer compiler already early-returns for
-    ``structural_model`` ops at IR lowering, so leaving the IR factory
-    unset is correct.
+    Phase 8.I closing audit: the bake routes through
+    :meth:`CompilerIR.lower_structural_ops`. The :class:`StructuralOp`
+    (kind="attention_resize", target_num_heads=14, small_num_heads=9,
+    layers_threshold=16, alibi_pin_value=0.05) carries the head-count
+    branching and ALiBi pin as data; the follow-up callable
+    (:func:`_l15_attention_resize_follow_up`) handles the L15
+    head-allocator stash + suppress-lookup helper. The op upgrades to
+    ``declarative_authority="spec_generated"`` to reflect that the
+    structural intent now lives in the IR.
     """
+
     def bake(block, dim_positions, S):
-        import torch
-
-        n_layers_hint = getattr(block, "_n_layers_hint", None)
-        num_heads_new = 14
-        if n_layers_hint is not None and n_layers_hint <= 16:
-            num_heads_new = 9
-
-        attn = block.attn
-        # Per-bake attention-head allocator with the full L15 head
-        # layout pinned. ``l15_attention_resize`` does not write Q/K/V/O
-        # itself -- it only enlarges ``attn.num_heads``/``W_q``/``W_k``/
-        # ``W_v``/``W_o`` and re-initialises ``alibi_slopes`` -- so this
-        # is bookkeeping-only: the allocator declares the L15 head axis
-        # for the resized attention block. The follow-up
-        # ``_suppress_l15_lookup_during_current_store_generation`` call
-        # then writes into the heads the allocator just pinned. Stashing
-        # the allocator on ``attn._l15_head_allocator`` keeps the
-        # layout discoverable when this op runs before the per-layer
-        # memory-lookup bake (legacy_bake at phase=999) AND when it runs
-        # after, so the late_bake reentrant case keeps a consistent view.
-        head_allocator = _allocate_layer15_attention_heads()
-        attn._l15_head_allocator = head_allocator
-        d = attn.W_q.shape[1]
-        head_dim_old = d // attn.num_heads
-        if getattr(attn, "num_heads", 8) >= num_heads_new:
-            if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-                attn.alibi_slopes[:4] = 0.05
-            _suppress_l15_lookup_during_current_store_generation(
-                attn,
-                _as_setdim_proxy(dim_positions),
-                getattr(attn, "head_dim", head_dim_old),
-            )
-            return
-
-        new_q_rows = num_heads_new * head_dim_old
-
-        attn.num_heads = num_heads_new
-        attn.head_dim = head_dim_old
-
-        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-            new_slopes = torch.tensor(
-                [2.0 ** (-8.0 / num_heads_new * (i + 1))
-                 for i in range(num_heads_new)]
-            )
-            # Keep load heads aligned with the memory-lookup bake when this
-            # resize block runs after the per-layer L15 attention bake.
-            new_slopes[:4] = 0.05
-            attn.register_buffer('alibi_slopes', new_slopes)
-
-        old_W_q = attn.W_q.data
-        old_W_k = attn.W_k.data
-        old_W_v = attn.W_v.data
-        attn.W_q = nn.Parameter(torch.zeros(new_q_rows, d))
-        attn.W_k = nn.Parameter(torch.zeros(new_q_rows, d))
-        attn.W_v = nn.Parameter(torch.zeros(new_q_rows, d))
-        attn.W_q.data[:d, :] = old_W_q
-        attn.W_k.data[:d, :] = old_W_k
-        attn.W_v.data[:d, :] = old_W_v
-
-        old_W_o = attn.W_o.data
-        attn.W_o = nn.Parameter(torch.zeros(d, new_q_rows))
-        attn.W_o.data[:, :d] = old_W_o
-        _suppress_l15_lookup_during_current_store_generation(
-            attn,
-            _as_setdim_proxy(dim_positions),
-            head_dim_old,
-        )
+        # Declarative dispatch: the structural intent (resize to 14/9
+        # heads, ALiBi load-head pin, follow-up suppress helper) lives
+        # in the CompilerIR built by ``_l15_attention_resize_structural_ir``.
+        # ``ir.lower_structural_ops`` performs the resize then invokes
+        # the follow-up against the resized block.
+        ir = _l15_attention_resize_structural_ir(dim_positions, None)
+        ir.lower_structural_ops(block, dim_positions, S=S)
 
     return Operation(
         name="l15_attention_resize",
@@ -1708,12 +1704,13 @@ def make_l15_attention_resize_op() -> Operation:
         writes=set(),
         kind="block",
         declarative_bake_fn=bake,
+        compiler_ir_factory=_l15_attention_resize_structural_ir,
         # Phase 8.A.4: dropped ``layer_idx=15`` pin in favour of
         # ``target_op_name``. Binds to whichever layer the compiler
         # placed ``layer15_memory_lookup`` (the L15 attn op).
         target_op_name="layer15_memory_lookup",
         migrated=True,
-        declarative_authority="structural_model",
+        declarative_authority="spec_generated",
         # B12 backfill (wave 1c): structural cleanup that resizes L15
         # attention after the nibble-copy weights are baked. The op writes
         # no dims, so the dep DAG can't derive the post-bake placement on
