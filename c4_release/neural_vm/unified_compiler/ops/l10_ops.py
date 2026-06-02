@@ -12,21 +12,28 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L10 attention-head layout (pinned indices) =====================
+# === L10 attention-head layout (auto-fit; legacy head_idx as docs) ===
 #
 # L10 attention hosts 8 primary heads, each owned by one ``kind="block"``
 # bake op below. Pre-migration the spec helpers used bare ``head_idx=N``
-# literals; pinning the allocator and resolving every literal through
-# :func:`_l10_head_idx` preserves byte-identity while declaring the L10
-# head axis as audited data. Order mirrors the bake-op factory order below
-# so the table reads top-to-bottom alongside the bakes that own each row.
+# literals; resolving every literal through :func:`_l10_head_idx`
+# preserves byte-identity while declaring the L10 head axis as audited
+# data. Order mirrors the bake-op factory order below so the table
+# reads top-to-bottom alongside the bakes that own each row.
 #
 # Head 1 (AX byte passthrough) and head 7 (BP byte passthrough) both reuse
 # the byte-passthrough chain template :func:`_byte_passthrough_chain_spec`;
 # heads 4/5/6 are co-owned by ``layer10_stack0_byte_relay_bake`` (one
 # allocator row per spec for inspection clarity).
+#
+# Phase 7.B.6: the allocator runs without ``pin=`` -- first-fit picks
+# 0..7 in declaration order, which matches the legacy layout bit-for-bit
+# because :data:`_L10_HEAD_LAYOUT` is contiguous and ordered. The
+# ``legacy_head_idx`` column is documentation only; the load-bearing
+# copy is the :func:`_l10_head_idx` lookup, consumed by the head-spec
+# factories that write Q/K/V/O weights at the resolved index.
 _L10_HEAD_LAYOUT = (
-    # (op-name key,                                       pinned head_idx)
+    # (op-name key,                                       legacy_head_idx (docs only))
     ("layer10_carry_relay_bake.head_0",                  0),  # ADD/SUB byte carry
     ("layer10_byte_passthrough_bake.head_1",             1),  # AX byte passthrough
     ("layer10_sp_byte_passthrough_bake.head_2",          2),  # SP byte passthrough
@@ -39,18 +46,20 @@ _L10_HEAD_LAYOUT = (
 
 
 def _allocate_layer10_attention_heads() -> AttentionHeadAllocator:
-    """Build a per-bake :class:`AttentionHeadAllocator` with the L10 heads pinned.
+    """Build a per-bake :class:`AttentionHeadAllocator` with the L10 heads.
 
-    Every entry in :data:`_L10_HEAD_LAYOUT` is pinned at its existing
-    ``head_idx`` so the underlying weight writes -- expressed as
-    ``DeclarativeAttentionHeadSpec`` instances -- land byte-identically.
-    A future L10 attention op can claim a free head past index 7 via
-    ``allocator.alloc(name, layer_idx=10)`` (no ``pin=``) without
-    touching this table; today layer_max_heads=8 so the layer is full.
+    Phase 7.B.6: ``pin=`` is dropped from every entry. The allocator's
+    first-fit picks the lowest free head index in declaration order;
+    because :data:`_L10_HEAD_LAYOUT` is contiguous (0..7) and ordered,
+    first-fit reproduces the legacy ``head_idx`` values bit-for-bit.
+    The actual weight-write head indices are still looked up via
+    :func:`_l10_head_idx` inside the head-spec factories below, so
+    byte-identity with the legacy bake is preserved regardless of
+    allocator order. ``layer_max_heads=8`` so the layer is full today.
     """
     allocator = AttentionHeadAllocator()
-    for name, head_idx in _L10_HEAD_LAYOUT:
-        allocator.alloc(name, layer_idx=10, pin=head_idx)
+    for name, _legacy_head_idx in _L10_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=10)
     return allocator
 
 
@@ -67,7 +76,7 @@ def _l10_head_idx(op_name: str) -> int:
     raise KeyError(f"_l10_head_idx: unknown L10 attention op {op_name!r}")
 
 
-# === L10 FFN unit layouts (pinned offsets) ==========================
+# === L10 FFN unit layouts (auto-fit; legacy offsets retained as docs) ==
 #
 # L10 hosts three distinct FFNs in the compiled model:
 #
@@ -88,6 +97,17 @@ def _l10_head_idx(op_name: str) -> int:
 #      Single-owner layout, declared here so a future second tenant in
 #      that bank goes through ``allocator.alloc(...)``.
 #
+# Phase 7.B.6: every layout below is auto-placed by
+# :class:`FFNUnitAllocator` first-fit. Because each layout is fully
+# contiguous in declaration order (every entry starts exactly where
+# the previous one ended), first-fit reproduces the legacy pinned
+# offsets bit-for-bit -- so byte-identity with the legacy bakes and
+# their monotonic ``unit = 0`` / ``offset = 0`` cursors survives the
+# pin drop. The ``legacy_start`` columns are kept purely as
+# documentation; downstream MUL/LEA tail rules in the wide-MUL fix
+# chain are unaffected because they consume layout-by-name, not by
+# pin offset.
+#
 # The per-block ``make_l10_post_op_attach_op`` bake appends six (lookup)
 # or seven (efficient) *independent* ``PureFFN`` modules onto
 # ``block.post_ops`` -- each is a standalone bank, not a shared hidden
@@ -105,7 +125,7 @@ def _l10_head_idx(op_name: str) -> int:
 # Main L10 FFN (model.blocks[10].ffn). Walk mirrors the order of writes
 # in ``vm_step._set_layer10_alu``.
 _L10_FFN_UNIT_LAYOUT_MAIN = (
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     ("layer10_alu.cmp_combine",       0,   18),  # 6 default + 12 override
     ("layer10_alu.bitwise_or",       18,  512),  # 256 lo + 256 hi
     ("layer10_alu.bitwise_xor",     530,  512),  # 256 lo + 256 hi
@@ -121,6 +141,7 @@ _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL = 1846
 # ``hidden_dim`` and lands at the offset the inline ``offset`` counter
 # walks to in the original bake.
 _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED = (
+    # (sub-stage name, legacy_start (docs only), n_units)
     ("l10_post_ops_combined.binary_op_byte_zeroing",     0,    8),  # PureFFN H=8
     ("l10_post_ops_combined.carry_propagation_byte0",    8,  512),  # PureFFN H=512
     ("l10_post_ops_combined.carry_propagation_byte1",  520,  512),  # PureFFN H=512
@@ -133,6 +154,7 @@ _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL = 1562
 # fresh PureFFN). Single tenant today; the layout makes the bank
 # explicit so a future tenant claims through the allocator.
 _L10_FFN_UNIT_LAYOUT_TAIL_BIT32 = (
+    # (sub-stage name, legacy_start (docs only), n_units)
     ("tail_bit32_result_correction.rules", 0, 2059),
 )
 _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL = 2059
@@ -141,15 +163,18 @@ _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL = 2059
 def _allocate_l10_main_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` for ``model.blocks[10].ffn``.
 
-    All sub-stages of ``_set_layer10_alu`` are pinned at their existing
-    offsets so the helper -- which writes via its own monotonic
-    ``unit = 0`` counter -- lands byte-identically. The allocator is
-    stashed on ``block.ffn._l10_unit_allocator`` so downstream tools and
-    a future L10 op family can claim a free gap past unit 1846.
+    Phase 7.B.6: ``pin=`` is dropped. First-fit walks
+    :data:`_L10_FFN_UNIT_LAYOUT_MAIN` in declaration order and lands
+    each sub-stage at the lowest free gap; because the layout is fully
+    contiguous (every entry starts where the previous one ended)
+    first-fit reproduces the legacy offsets bit-for-bit, so
+    ``_set_layer10_alu``'s monotonic ``unit = 0`` counter still lands
+    on the same indices. The allocator is stashed on
+    ``block.ffn._l10_unit_allocator`` for downstream auditing.
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L10_FFN_UNIT_LAYOUT_MAIN:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L10_FFN_UNIT_LAYOUT_MAIN:
+        allocator.alloc(name, n_units)
     return allocator
 
 
@@ -158,14 +183,18 @@ def _allocate_l10_post_ops_combined_units() -> FFNUnitAllocator:
 
     Mirrors the inline ``offset`` walk in ``make_l10_post_ops_combined``:
     one ``BinaryOpByteZeroingPostOp``, three ``CarryPropagationPostOp``,
-    one ``ComparisonCombine`` -- each pinned at the offset its
+    one ``ComparisonCombine`` -- each occupying the slot its
     predecessor's ``hidden_dim`` advances to. The carry slice is zeroed
     by the existing post-bake step but still occupies its declared
     range so the comparison-combine offset remains stable.
+
+    Phase 7.B.6: ``pin=`` is dropped. First-fit reproduces the legacy
+    offsets bit-for-bit because the layout is fully contiguous in
+    declaration order.
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED:
+        allocator.alloc(name, n_units)
     return allocator
 
 
@@ -587,7 +616,13 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     layout is parameterised: ``n_rules`` must match the
     ``_L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL`` constant. A mismatch
     means someone changed the tail rule set without updating the
-    layout table; fail loudly rather than silently miss a pinned range.
+    layout table; fail loudly rather than silently miss a declared range.
+
+    Phase 7.B.6: ``pin=`` is dropped. With an empty L17 tail FFN pool
+    first-fit lands the single 2059-unit range at start=0, matching
+    the legacy bake bit-for-bit. The wide-MUL high-byte fix chain
+    (MUL/LEA tail rules) is unaffected because those rules consume
+    layout-by-name, not by pin offset.
     """
     if n_rules != _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL:
         raise ValueError(
@@ -596,8 +631,8 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
             f"{_L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL}"
         )
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L10_FFN_UNIT_LAYOUT_TAIL_BIT32:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L10_FFN_UNIT_LAYOUT_TAIL_BIT32:
+        allocator.alloc(name, n_units)
     return allocator
 
 
