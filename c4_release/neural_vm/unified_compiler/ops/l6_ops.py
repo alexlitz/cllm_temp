@@ -2969,16 +2969,15 @@ def make_layer6_relay_heads_op() -> Operation:
                "OP_LEV", "CONST"},
         writes={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
-        # Phase 8.G.6 holdout: ``layer_idx=6`` is retained for the same
-        # reason as ``layer6_attn`` above — the dep graph's earliest
-        # landable layer for this op is L7, so adding
-        # ``requires["same_layer_as"]: "_opcode_decode_ffn_dep_anchor"``
-        # (or any L6-resident anchor) raises a placement-mismatch error
-        # ("placed at layer 7 but requires layer 6"). Needs an L6 attn
-        # dep anchor or topological shift — out of scope here.
-        layer_idx=6,
+        # phase=6 matches ``_layer6_attn_dep_anchor`` so the L6 attn
+        # slot allocator co-locates this op via the same-phase share.
+        phase=6,
         migrated=True,
         declarative_authority="topology_anchor",
+        # V4 final structural cleanup: drop ``layer_idx=6`` literal in
+        # favor of co-placement with ``_layer6_attn_dep_anchor`` (see
+        # ``layer6_attn`` above for rationale).
+        requires={"same_layer_as": "_layer6_attn_dep_anchor"},
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
         # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
         compiler_ir=CompilerIR(),
