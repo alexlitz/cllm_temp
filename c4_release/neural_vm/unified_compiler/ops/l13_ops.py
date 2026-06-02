@@ -176,6 +176,9 @@ def _layer13_shifts_substage_rules(
                     ),
                     conditions=(
                         ("MARK_AX", 1.0),
+                        # structural offset: a_lo/a_hi are nibble-value
+                        # one-hot lookup indices into the operand bands;
+                        # s is the shift-amount one-hot read.
                         (f"ALU_LO+{a_lo}", 1.0),
                         (f"ALU_HI+{a_hi}", 1.0),
                         (f"AX_CARRY_LO+{s}", 1.0),
@@ -185,6 +188,9 @@ def _layer13_shifts_substage_rules(
                     gate=gate_ref,
                     gate_weight=1.0,
                     gate_bias=0.0,
+                    # structural offset: result_lo/result_hi are
+                    # computed nibbles of the shift result (value-bus
+                    # lookups), not role-meaningful byte positions.
                     writes=(
                         (f"OUTPUT_LO+{result_lo}", write_scale),
                         (f"OUTPUT_HI+{result_hi}", write_scale),
