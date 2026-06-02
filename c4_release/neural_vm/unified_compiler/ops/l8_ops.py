@@ -365,6 +365,40 @@ def _layer8_alu_add_lo_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_lea_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEA lo nibble (256 units, offsets 256..511).
+
+    Like ADD lo but reads operand-B from FETCH_LO (one-hot) instead of
+    AX_CARRY_LO, gates on OP_LEA, and uses the strong MARK_AX
+    requirement (60) + the non-AX-marker blocker set (-1000 on each of
+    MARK_PC/SP/BP/STACK0/MEM/SE/IS_BYTE). FETCH_LO contributes at
+    weight 20.
+    """
+    write_scale = 2.0 / S
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            result = (a + b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_lea_lo_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"FETCH_LO+{b}", 20.0),
+                ),
+                threshold=80.5,
+                gate="OP_LEA",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_LEA",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_LEA",
+                },
+            ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
