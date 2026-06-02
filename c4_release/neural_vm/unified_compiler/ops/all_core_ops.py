@@ -28,6 +28,7 @@ from .user_input_ops import (  # noqa: F401
     make_layer5_user_input_gather_op,
     make_layer6_getchar_routing_op,
 )
+from .control_flow_heads import make_lev_detector_head_op  # noqa: F401
 
 
 def all_core_ops(
@@ -169,6 +170,15 @@ def all_core_ops(
         # bake currently lives in ``unified_compiler/compiler.py`` (the
         # UnifiedVMCompiler path, see commit 3d1b700).
         make_layer8_head6_ax_carry_refresh_op(enable=False),
+        # V2/G7 LEV detector attention head (phase=8.06). Detects that
+        # the prior instruction-step's opcode was LEV and materialises the
+        # saved PC / BP / SP nibbles into the current step's
+        # ``PC_VIA_LEV_DETECTOR_LO/HI`` / ``BP_VIA_LEV_DETECTOR`` /
+        # ``SP_VIA_LEV_DETECTOR`` residual bands. Downstream readers
+        # (L9 alu, L8 sp_gather_bake) consume the detector dims so the
+        # cross-step ``requires["after"]=layer16_lev_routing`` edges
+        # collapse. See docs/CONTROL_FLOW_DETECTOR_HEADS.md.
+        make_lev_detector_head_op(enable=False),
         make_layer8_alu_op(),
         # Convo-I/O L8 FFN bake (phase=8.5). Always registered; bake is a
         # no-op when enable_conversational_io is False. Fires regardless of
