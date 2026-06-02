@@ -444,6 +444,53 @@ def make_layer4_ffn_op() -> Operation:
     )
 
 
+def make_layer4_ffn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer4_ffn``: declares identical reads/writes so
+    the LayerCompiler's dep graph reserves a layer slot for it. Mirrors
+    ``_layer3_ffn_dep_anchor`` / ``_layer5_fetch_dep_anchor``: the actual
+    bake happens in ``layer4_ffn`` (kind="block", layer_idx=4); this op's
+    bake is a no-op (its layout-assigned ffn block is unrelated to
+    block[4]).
+
+    Phase 8.A.4 prep: lets L4 block ops (e.g. ``convo_io_prtf_transport``)
+    declare ``target_op_name="_layer4_ffn_dep_anchor"`` and bind to
+    whichever layer the compiler places the L4 FFN at, instead of
+    carrying a literal ``layer_idx=4``.
+    """
+    def bake(ffn, dim_positions, S):
+        # No-op: actual bake is in `layer4_ffn` block op above.
+        return
+
+    return Operation(
+        name="_layer4_ffn_dep_anchor",
+        # Phase=3 matches ``_layer3_ffn_dep_anchor`` so the two L4 FFN
+        # anchors share the same layer slot (the layer compiler's
+        # earliest-fit allocator co-places same-kind ops at the same
+        # phase). The actual ``layer4_ffn`` block op runs at phase=4
+        # and pins layer_idx=4 separately, so the anchor's phase is
+        # purely a placement key for the dep-graph slot table.
+        phase=3,
+        # Drop ``EMBED_LO`` / ``EMBED_HI`` (which ``_layer3_ffn_dep_anchor``
+        # writes at L4) so the new anchor's earliest landable layer is not
+        # pushed past L4 by the L3 anchor's writes. ``requires["same_layer_as"]``
+        # below then pins it to the same layer as the L3 anchor (L4) and the
+        # phase-share rule places both anchors in the L4 FFN slot.
+        reads={"MARK_AX", "MARK_PC",
+               "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "H1"},
+        writes={"FETCH_LO", "FETCH_HI"},
+        kind="ffn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        # Co-place with ``_layer3_ffn_dep_anchor`` so the new anchor lands
+        # at exactly L4 (where the L3 anchor lands today). The phase-share
+        # rule (same kind, same phase) then puts both in the L4 FFN slot.
+        requires={"same_layer_as": "_layer3_ffn_dep_anchor"},
+        smoke_tests=set(),
+        spec_section=None,
+    )
+
+
 def _nibble_rotation_chain_rules(
     *,
     name_prefix: str,
