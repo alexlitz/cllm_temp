@@ -139,6 +139,12 @@ def make_layer6_getchar_routing_op(enable: bool = False) -> Operation:
         declarative_bake_fn=bake if not enable else None,
         phase=998.9,
         migrated=True,
+        # Phase 11.A IR exposure: bake body is ``if not enable: return`` at
+        # the default ``enable=False`` config, so an empty IR is byte-identical
+        # for the default flag value. Populating IR with the 33 FFNRules
+        # (mirroring ``io_putchar_routing``) is Phase 11.A follow-up when
+        # the V9 phase 2 wiring lands.
+        compiler_ir=CompilerIR(),
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
