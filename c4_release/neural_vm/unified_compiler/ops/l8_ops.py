@@ -917,6 +917,81 @@ def _layer8_alu_lea_axb2_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
 
+def _layer8_alu_rules(S: float) -> tuple[FFNRule, ...]:
+    """Full ordered ``FFNRule`` sequence for ``layer8_alu``.
+
+    Concatenates the 18 sub-stage rule tuples in cursor order so the
+    composite list lowers byte-identically against
+    ``_set_layer8_alu``. Total: 2023 rules covering offsets 0..2022.
+    """
+    return (
+        _layer8_alu_add_lo_rules(S)
+        + _layer8_alu_lea_lo_rules(S)
+        + _layer8_alu_sub_lo_rules(S)
+        + _layer8_alu_add_carry_rules(S)
+        + _layer8_alu_lea_carry_rules(S)
+        + _layer8_alu_adj_lo_rules(S)
+        + _layer8_alu_adj_carry_rules(S)
+        + _layer8_alu_sub_borrow_rules(S)
+        + _layer8_alu_ent_lo_rules(S)
+        + _layer8_alu_ent_borrow_rules(S)
+        + _layer8_alu_cmp_group_rules(S)
+        + _layer8_alu_cmp_clear_rules(S)
+        + _layer8_alu_ent_adj_defaults_rules(S)
+        + _layer8_alu_lev_byte0_lo_rules(S)
+        + _layer8_alu_lev_byte0_hi_rules(S)
+        + _layer8_alu_lev_b1_rules(S)
+        + _layer8_alu_lev_b2_rules(S)
+        + _layer8_alu_lea_axb2_rules(S)
+    )
+
+
+def _layer8_alu_ir(S: float = 100.0) -> CompilerIR:
+    """Build the L8 ALU CompilerIR (single FFN op, 2023 rules).
+
+    Exposes ``layer8_alu``'s full declarative spec as
+    ``Operation.compiler_ir`` so the verifier, scope checker, and
+    dominance auditor can read the per-rule semantics. The bake path
+    drives the imperative pin via ``lower_layer8_alu_ir`` so the
+    weights land at units 0..2022, exactly where the legacy
+    ``_set_layer8_alu`` helper used to write.
+    """
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer8_alu_rules(S))
+    return ir
+
+
+def lower_layer8_alu_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    start_unit: int = 0,
+) -> int:
+    """Lower L8 ALU rules into ``ffn`` and return the next unit cursor.
+
+    The companion to ``lower_layer8_multibyte_routing_ir``: the bake
+    path calls this from ``make_layer8_alu_op``'s ``bake_fn`` so the
+    weights land at the same offsets the imperative helper used to
+    write. Symbolic / verifier tooling reads the same rule list via
+    ``_layer8_alu_ir`` (attached as ``compiler_ir`` on the Operation).
+    """
+
+    rules = _layer8_alu_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=start_unit,
+        S=S,
+    )
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
