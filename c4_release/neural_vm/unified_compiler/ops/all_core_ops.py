@@ -178,7 +178,7 @@ def all_core_ops(
         # (L9 alu, L8 sp_gather_bake) consume the detector dims so the
         # cross-step ``requires["after"]=layer16_lev_routing`` edges
         # collapse. See docs/CONTROL_FLOW_DETECTOR_HEADS.md.
-        make_lev_detector_head_op(enable=False),
+        make_lev_detector_head_op(enable=True),
         make_layer8_alu_op(),
         # Convo-I/O L8 FFN bake (phase=8.5). Always registered; bake is a
         # no-op when enable_conversational_io is False. Fires regardless of
