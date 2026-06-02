@@ -603,3 +603,87 @@ def test_swiglu_ffn_per_block_widths_dict_propagates():
     assert vm.blocks[0].ffn.hidden_dim == per_block[0]
     assert vm.blocks[1].ffn.hidden_dim == per_block[1]
     assert vm.blocks[0].ffn.hidden_dim != vm.blocks[1].ffn.hidden_dim
+
+
+def test_rmsnorm_toggle_changes_block_output():
+    """The ``use_rms_norm`` toggle must produce observably different
+    block outputs on the same input + identical attention/FFN weights.
+
+    Existing test_rmsnorm_modules_exist_only_when_enabled covers the
+    structural side (presence of attn_norm / ffn_norm submodules); this
+    test covers the numerical side — that the toggle actually changes
+    forward output. Without nontrivial Q/K/V/O the zero-init attn
+    contribution is zero and the toggle has no visible effect, so we
+    randomize Q/K/V/O first.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 32)
+
+    def make_block(use_rms_norm):
+        attn = AutoregressiveAttention(
+            dim=32, num_heads=4, max_seq_len=8,
+            positional_encoding="alibi",
+            attention_normalization="softmax1",
+            use_flash_attention=False,
+        )
+        _randomize_attention_inplace(attn, seed=2)
+        ffn = PureFFN(32, 16)
+        return TransformerBlock(attn=attn, ffn=ffn, use_rms_norm=use_rms_norm)
+
+    block_off = make_block(use_rms_norm=False)
+    block_on = make_block(use_rms_norm=True)
+
+    assert not hasattr(block_off, "attn_norm")
+    assert hasattr(block_on, "attn_norm")
+    assert isinstance(block_on.attn_norm, RMSNorm)
+    assert isinstance(block_on.ffn_norm, RMSNorm)
+
+    with torch.no_grad():
+        y_off = block_off(x)
+        y_on = block_on(x)
+
+    assert torch.isfinite(y_off).all()
+    assert torch.isfinite(y_on).all()
+    assert y_off.shape == y_on.shape == x.shape
+    assert not torch.allclose(y_off, y_on, atol=1e-6), (
+        "RMSNorm toggle did not change the block output — toggle is "
+        "wired structurally but has no numerical effect."
+    )
+
+
+def test_rmsnorm_default_off_byte_identical_to_no_kwarg():
+    """The current default (``use_rms_norm=False``) must be byte-
+    identical to constructing a block with no ``use_rms_norm`` kwarg.
+    Mixtral-style ``use_rms_norm=True`` flips the default; this test
+    guards that the False path remains a no-op against existing tests.
+    """
+    torch.manual_seed(0)
+    attn1 = AutoregressiveAttention(
+        dim=32, num_heads=4, max_seq_len=8,
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        use_flash_attention=False,
+    )
+    _randomize_attention_inplace(attn1, seed=3)
+    block_default = TransformerBlock(attn=attn1, ffn=PureFFN(32, 16))
+
+    torch.manual_seed(0)
+    attn2 = AutoregressiveAttention(
+        dim=32, num_heads=4, max_seq_len=8,
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        use_flash_attention=False,
+    )
+    _randomize_attention_inplace(attn2, seed=3)
+    block_explicit = TransformerBlock(
+        attn=attn2, ffn=PureFFN(32, 16), use_rms_norm=False
+    )
+
+    x = torch.randn(1, 4, 32)
+    with torch.no_grad():
+        y_default = block_default(x)
+        y_explicit = block_explicit(x)
+
+    assert torch.equal(y_default, y_explicit), (
+        "use_rms_norm=False is not byte-identical to no-kwarg default."
+    )
