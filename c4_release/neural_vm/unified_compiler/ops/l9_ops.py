@@ -1766,6 +1766,12 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         # default) the bake is a no-op, but the dep declaration still
         # contributes to the scheduler's cycle decomposition.
         requires={"after": "layer4_pc_relay"},
+        # Phase 11.A IR exposure: at default ``enable=False`` the bake body
+        # is ``if not enable: return``, so empty CompilerIR is byte-identical.
+        # When ``enable=True`` the head spec mixes a declarative attention
+        # spec with alibi_slopes[head]=0.5 mutation -- the slope side needs a
+        # RuntimeAttentionFragment for full migration (Phase 11.A follow-up).
+        compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#the-attention-layer",
     )
