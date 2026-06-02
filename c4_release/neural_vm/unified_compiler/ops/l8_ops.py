@@ -429,6 +429,68 @@ def _layer8_alu_sub_lo_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADD carry detection (120 units, offsets 768..887).
+
+    Same conditions as add_lo (MARK_AX + ALU_LO[a] + AX_CARRY_LO[b],
+    MARK_PC blocker, OP_ADD gate) but only emits a unit when
+    ``a + b >= 16`` (carry-out from the lo nibble). Writes CARRY+0
+    normalized by 2.0/(S*5.0) so the gated output ~1 after scaling.
+    """
+    carry_scale = 2.0 / (S * 5.0)
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            if a + b < 16:
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_add_carry_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -4.0),
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"AX_CARRY_LO+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="OP_ADD",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_ADD",
+                dominates_at={"CARRY+0": "MARK_AX and OP_ADD"},
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
+    """LEA carry detection (120 units, offsets 888..1007).
+
+    Same structural shape as lea_lo (gate=OP_LEA, FETCH_LO operand,
+    non-AX blockers) but only emits when ``a + b >= 16``. Writes
+    CARRY+0 at the same 2.0/(S*5.0) normalization as ADD carry.
+    """
+    carry_scale = 2.0 / (S * 5.0)
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            if a + b < 16:
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_lea_carry_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"FETCH_LO+{b}", 20.0),
+                ),
+                threshold=80.5,
+                gate="OP_LEA",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_LEA",
+                dominates_at={"CARRY+0": "MARK_AX and OP_LEA"},
+            ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
