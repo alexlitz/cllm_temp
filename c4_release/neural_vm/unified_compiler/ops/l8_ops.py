@@ -708,6 +708,44 @@ def _layer8_alu_cmp_clear_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_ent_adj_defaults_rules(S: float) -> tuple[FFNRule, ...]:
+    """ENT/ADJ first-step ALU defaults (2 units, offsets 1985..1986).
+
+    For the first step (NOT HAS_SE), L7 attention can't gather SP
+    because the SP marker is AFTER the AX marker (causal attention).
+    For ENT/ADJ with initial SP = 0, we need ALU_LO[0] > 0 and
+    ALU_HI[0] > 0. These units fire when OP_ENT or OP_ADJ + MARK_AX +
+    NOT HAS_SE. MARK_SP blocker prevents firing at the SP marker
+    (where OP_ENT can be relayed). Output weight 50/S overrides L7's
+    garbage write (~-32).
+
+    Constant write (W_gate untouched, b_gate=1.0) because the original
+    helper uses the SiLU path for gating (b_gate=1.0 only, no W_gate
+    write).
+    """
+    output_weight = 50.0 / S
+    rules = []
+    for alu_base in ("ALU_LO", "ALU_HI"):
+        rules.append(FFNRule.constant_write(
+            name=f"l8_alu_ent_adj_default_{alu_base.lower()}",
+            conditions=(
+                ("OP_ENT", 1.0 / 3.0),
+                ("OP_ADJ", 1.0 / 3.0),
+                ("MARK_AX", 2.0),
+                ("MARK_SP", -10.0),
+                ("HAS_SE", -10.0),
+            ),
+            threshold=6.0,
+            writes=((f"{alu_base}+0", output_weight),),
+            scope="MARK_AX and (OP_ENT or OP_ADJ) and not HAS_SE",
+            dominates_at={
+                f"{alu_base}+0":
+                    "MARK_AX and (OP_ENT or OP_ADJ) and not HAS_SE",
+            },
+        ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
