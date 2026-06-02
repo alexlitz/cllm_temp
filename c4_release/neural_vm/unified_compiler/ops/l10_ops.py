@@ -398,6 +398,133 @@ def _l10_carry_propagation_rules(
     return tuple(rules)
 
 
+def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
+    """Declarative rules for ``ComparisonCombine`` (18 units).
+
+    Mirrors ``vm_step.ComparisonCombine._bake_weights``. For each of
+    EQ/NE/LT/GT/LE/GE the post-op emits one *default* unit that writes
+    the initial result and one or two *override* units that flip the
+    result when CMP[0..3] flags indicate the opposite outcome.
+
+      * Default unit: constant_write style (``W_gate[unit, CONST]``
+        was the legacy gate, but ``ComparisonCombine`` actually sets
+        ``b_gate = 1.0`` with no W_gate cell, matching
+        ``constant_write``'s ``gate=None``/``gate_bias=1.0`` form).
+        Writes ``OUTPUT_LO+default_result`` and ``OUTPUT_HI+0`` at
+        +2/S.
+      * Override 2-way: gated by the opcode dim, conditions sum
+        MARK_AX + one CMP flag with threshold 1.5, writes a +4/S/-4/S
+        pair on OUTPUT_LO.
+      * Override 3-way: gated by the opcode dim, conditions sum
+        MARK_AX + two CMP flags with threshold 2.5, writes a +4/S/
+        -4/S pair on OUTPUT_LO.
+
+    All units include a strong MARK_PC blocker (``-50``) to prevent
+    leaked OP_NE/OP_GT/OP_GE or CMP residue from corrupting PC
+    predictions; see the 2026-05-09 fix comment in vm_step.py.
+    """
+
+    MARK_PC_BLOCK = -50.0
+
+    def cmp_default(op_name: str, default_result: int, *, idx: int) -> FFNRule:
+        return FFNRule.constant_write(
+            conditions=(
+                ("MARK_AX", 1.0),
+                (op_name, 1.0),
+                ("MARK_PC", MARK_PC_BLOCK),
+            ),
+            threshold=1.5,
+            writes=(
+                (f"OUTPUT_LO+{default_result}", 2.0 / S),
+                ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
+            ),
+            name=f"l10_cmp_default_{op_name.lower()}_{idx}",
+            scope=f"MARK_AX and {op_name} and not MARK_PC",
+        )
+
+    def cmp_override_2way(
+        op_name: str, cmp_name: str, to_result: int, from_result: int,
+        *, idx: int,
+    ) -> FFNRule:
+        return FFNRule.gated_write(
+            conditions=(
+                ("MARK_AX", 1.0),
+                (cmp_name, 1.0),
+                ("MARK_PC", MARK_PC_BLOCK),
+            ),
+            threshold=1.5,
+            gate=op_name,
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                (f"OUTPUT_LO+{to_result}", 4.0 / S),
+                (f"OUTPUT_LO+{from_result}", -4.0 / S),
+            ),
+            name=f"l10_cmp_override2_{op_name.lower()}_{idx}",
+            scope=f"MARK_AX and {op_name} and {cmp_name} and not MARK_PC",
+        )
+
+    def cmp_override_3way(
+        op_name: str, cmp_name1: str, cmp_name2: str,
+        to_result: int, from_result: int, *, idx: int,
+    ) -> FFNRule:
+        return FFNRule.gated_write(
+            conditions=(
+                ("MARK_AX", 1.0),
+                (cmp_name1, 1.0),
+                (cmp_name2, 1.0),
+                ("MARK_PC", MARK_PC_BLOCK),
+            ),
+            threshold=2.5,
+            gate=op_name,
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                (f"OUTPUT_LO+{to_result}", 4.0 / S),
+                (f"OUTPUT_LO+{from_result}", -4.0 / S),
+            ),
+            name=f"l10_cmp_override3_{op_name.lower()}_{idx}",
+            scope=(
+                f"MARK_AX and {op_name} and {cmp_name1} and "
+                f"{cmp_name2} and not MARK_PC"
+            ),
+        )
+
+    rules: list[FFNRule] = []
+
+    # EQ: default 0, override (CMP+1,CMP+2 -> 1)
+    rules.append(cmp_default("OP_EQ", 0, idx=0))
+    rules.append(cmp_override_3way("OP_EQ", "CMP+1", "CMP+2", 1, 0, idx=1))
+
+    # NE: default 1, override (CMP+1,CMP+2 -> 0)
+    rules.append(cmp_default("OP_NE", 1, idx=2))
+    rules.append(cmp_override_3way("OP_NE", "CMP+1", "CMP+2", 0, 1, idx=3))
+
+    # LT: default 0, override CMP+0 -> 1, override (CMP+1,CMP+3 -> 1)
+    rules.append(cmp_default("OP_LT", 0, idx=4))
+    rules.append(cmp_override_2way("OP_LT", "CMP+0", 1, 0, idx=5))
+    rules.append(cmp_override_3way("OP_LT", "CMP+1", "CMP+3", 1, 0, idx=6))
+
+    # GT: default 1, override CMP+0 -> 0, two 3-way overrides -> 0
+    rules.append(cmp_default("OP_GT", 1, idx=7))
+    rules.append(cmp_override_2way("OP_GT", "CMP+0", 0, 1, idx=8))
+    rules.append(cmp_override_3way("OP_GT", "CMP+1", "CMP+3", 0, 1, idx=9))
+    rules.append(cmp_override_3way("OP_GT", "CMP+1", "CMP+2", 0, 1, idx=10))
+
+    # LE: default 0, override CMP+0 -> 1, two 3-way overrides -> 1
+    rules.append(cmp_default("OP_LE", 0, idx=11))
+    rules.append(cmp_override_2way("OP_LE", "CMP+0", 1, 0, idx=12))
+    rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+3", 1, 0, idx=13))
+    rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+2", 1, 0, idx=14))
+
+    # GE: default 1, override CMP+0 -> 0, override (CMP+1,CMP+3 -> 0)
+    rules.append(cmp_default("OP_GE", 1, idx=15))
+    rules.append(cmp_override_2way("OP_GE", "CMP+0", 0, 1, idx=16))
+    rules.append(cmp_override_3way("OP_GE", "CMP+1", "CMP+3", 0, 1, idx=17))
+
+    return tuple(rules)
+
+
 def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` for ``tail_bit32_result_correction``.
 
@@ -1879,8 +2006,14 @@ def make_l10_post_ops_combined() -> Operation:
             f"L10 post_ops_combined carry2 cursor drift: {offset}"
         )
         carry_end = offset
-        offset = _bake_post_op_into(
-            ffn, ComparisonCombine(d_model, S, dim_positions=dim_positions), offset)
+        # Migrated to FFNRule. See ``_l10_comparison_combine_rules``.
+        offset = Primitives.lower_ffn_rules(
+            ffn,
+            _l10_comparison_combine_rules(S),
+            dim_positions,
+            start_unit=offset,
+            S=S,
+        )
         assert offset == _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL, (
             f"L10 post_ops_combined comparison cursor drift: helper "
             f"ended at {offset}, allocator expected "
