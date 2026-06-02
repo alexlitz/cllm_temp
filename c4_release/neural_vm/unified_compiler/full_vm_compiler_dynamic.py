@@ -804,6 +804,7 @@ def compile_full_vm_dynamic(
     kv_eviction_n_steps: int = 64,
     strict: bool = True,
     allow_sealed_cycles: bool = True,
+    model_shape_constraint=None,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
@@ -954,7 +955,7 @@ def compile_full_vm_dynamic(
     # op order. The static compile_full_vm wraps op collection inline,
     # so we re-implement just the body here so the dynamic path is
     # actually a parallel API (not a wrapper around the static call).
-    return _bake_from_scheduled_ops(
+    model, layout = _bake_from_scheduled_ops(
         ops,
         S=S,
         alu_mode=alu_mode,
@@ -978,6 +979,31 @@ def compile_full_vm_dynamic(
         kv_eviction_policy=kv_eviction_policy,
         kv_eviction_n_steps=kv_eviction_n_steps,
     )
+
+    # Post-compile shape-constraint check. When the caller hands in a
+    # ``ModelShapeConstraint``, diff it against the compiled model and
+    # raise ``ModelShapeMismatchError`` on any mismatch. The check runs
+    # AFTER the bake so it sees the real ``num_heads`` / ``head_dim``
+    # the allocator emitted (Phase 8.O.1/8.O.2 dynamic heads + GQA), not
+    # just the caller's intent.
+    if model_shape_constraint is not None:
+        from .model_shape_constraint import (
+            ModelShapeConstraint as _MSC,
+            ModelShapeMismatchError,
+            validate_against_shape,
+        )
+        if not isinstance(model_shape_constraint, _MSC):
+            raise TypeError(
+                "model_shape_constraint must be a ModelShapeConstraint instance, "
+                f"got {type(model_shape_constraint).__name__}"
+            )
+        mismatches = validate_against_shape(model, model_shape_constraint)
+        if mismatches:
+            raise ModelShapeMismatchError(
+                mismatches, target=model_shape_constraint.target
+            )
+
+    return model, layout
 
 
 # ---------------------------------------------------------------------------
