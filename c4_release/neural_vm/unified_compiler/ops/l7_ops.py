@@ -357,7 +357,7 @@ def make_layer7_memory_heads_op() -> Operation:
                # propagation relays and OP_SHR for the byte-zero cleanup relay.
                "OP_AND", "OP_OR", "OP_XOR", "OP_SHR",
                "OP_JSR",  # head 5 V slot 8 (existing, declared for completeness)
-               "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP", "TEMP_PREV_STEP"},
+               "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP", "TEMP_PREV_STEP"},
         writes={"OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP",
                 "TEMP", "ADDR_KEY",
                 # V7 Block 13 (2026-05-12): head 5 V slot 9 writes the
