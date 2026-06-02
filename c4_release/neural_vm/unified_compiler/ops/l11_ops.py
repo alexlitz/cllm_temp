@@ -1,7 +1,9 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
+from ..primitives import Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -59,6 +61,175 @@ _L11_MUL_PARTIAL_TOTAL_UNITS = sum(
 )
 
 
+# Declarative-migration boundary: a_lo slabs ``[0, this)`` are baked via
+# ``CompilerIR`` / ``FFNRule`` lowering; slabs ``[this, 16)`` still go
+# through the inlined imperative tail in
+# ``_bake_layer11_mul_partial_imperative_tail``. This constant advances
+# 4 -> 8 -> 12 -> 16 across the Wave 4D substage commits; the final
+# commit removes the imperative tail entirely and attaches the full
+# ``compiler_ir`` to the op.
+_L11_MUL_PARTIAL_MIGRATED_END_A_LO = 4
+
+
+# === Declarative FFNRule generators for L11 MUL partial ===============
+#
+# Each a_lo slab walks the (b_lo, b_hi) grid (16 * 16 = 256 units). For
+# every (a_lo, b_lo, b_hi) triple the helper bakes a 4-way AND unit that
+# fires when ``MARK_AX + ALU_LO[a_lo] + AX_CARRY_LO[b_lo] +
+# AX_CARRY_HI[b_hi]`` is hot, gated by ``OP_MUL``, and writes
+# ``10.0/S`` into ``TEMP[partial]`` where
+# ``partial = ((a_lo * b_lo) // 16 + a_lo * b_hi) % 16``.
+#
+# The lowerer (``CompilerIR.lower_ffn``) multiplies condition weights and
+# the threshold by ``S`` but leaves ``writes`` / ``gate_weight`` /
+# ``gate_bias`` unscaled. So:
+#   ffn.W_up[unit, MARK_AX]            = S        -> ("MARK_AX",            1.0)
+#   ffn.W_up[unit, ALU_LO + a_lo]      = S        -> (f"ALU_LO+{a_lo}",     1.0)
+#   ffn.W_up[unit, AX_CARRY_LO + b_lo] = S        -> (f"AX_CARRY_LO+{b_lo}", 1.0)
+#   ffn.W_up[unit, AX_CARRY_HI + b_hi] = S        -> (f"AX_CARRY_HI+{b_hi}", 1.0)
+#   ffn.b_up[unit]                     = -S * 3.5 -> threshold = 3.5
+#   ffn.W_gate[unit, OP_MUL]           = 1.0      -> gated_write(gate="OP_MUL",
+#                                                                 gate_weight=1.0,
+#                                                                 gate_bias=0.0)
+#   ffn.W_down[TEMP + partial, unit]   = 10.0 / S -> writes=((f"TEMP+{partial}",
+#                                                              10.0 / S),)
+#
+# Substage granularity = per a_lo slab (256 rules) so the migration can
+# proceed in 16 byte-identical, independently-bisectable commits while
+# matching the existing pinned offsets in
+# ``_L11_MUL_PARTIAL_UNIT_LAYOUT``.
+
+
+def _layer11_mul_partial_rules_for_a_lo(
+    a_lo: int, S: float
+) -> tuple[FFNRule, ...]:
+    """Return the 256 ``FFNRule``s for one ``a_lo`` slab.
+
+    The rules are emitted in the same ``(b_lo, b_hi)`` order as
+    ``_set_layer11_mul_partial`` so the lowering cursor lands on the
+    historical hidden-unit indices (slab ``a_lo`` occupies units
+    ``a_lo*256 .. (a_lo+1)*256``).
+    """
+    if not 0 <= a_lo < 16:
+        raise ValueError(f"a_lo must be in [0, 16), got {a_lo}")
+    rules: list[FFNRule] = []
+    for b_lo in range(16):
+        carry = (a_lo * b_lo) // 16
+        for b_hi in range(16):
+            partial = (carry + a_lo * b_hi) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l11_mul_partial_a{a_lo:02d}_b{b_lo:02d}_h{b_hi:02d}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    (f"ALU_LO+{a_lo}", 1.0),
+                    (f"AX_CARRY_LO+{b_lo}", 1.0),
+                    (f"AX_CARRY_HI+{b_hi}", 1.0),
+                ),
+                threshold=3.5,
+                gate="OP_MUL",
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=((f"TEMP+{partial}", 10.0 / S),),
+            ))
+    return tuple(rules)
+
+
+def _layer11_mul_partial_rules(S: float) -> tuple[FFNRule, ...]:
+    """Return the full 4096-rule ``FFNRule`` sequence for the L11 MUL partial.
+
+    Concatenates ``_layer11_mul_partial_rules_for_a_lo`` for ``a_lo`` in
+    ``range(16)`` so the lowering cursor walks 0..4096 with no gap, matching
+    the historical ``_set_layer11_mul_partial`` unit numbering.
+    """
+    rules: list[FFNRule] = []
+    for a_lo in range(16):
+        rules.extend(_layer11_mul_partial_rules_for_a_lo(a_lo, S))
+    return tuple(rules)
+
+
+def _layer11_mul_partial_ir(S: float = 100.0) -> CompilerIR:
+    """Build the declarative ``CompilerIR`` for the L11 MUL partial.
+
+    Exposed via the op's ``compiler_ir=`` so symbolic execution,
+    ``compare_symbolic_to_lowered_ffn``, and the declarative verifier
+    can read the rules without going through the bake.
+    """
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer11_mul_partial_rules(S))
+    return ir
+
+
+def _lower_layer11_mul_partial_rules_range(
+    ffn,
+    S: float,
+    BD,
+    *,
+    start_a_lo: int,
+    end_a_lo: int,
+) -> int:
+    """Lower a contiguous ``a_lo`` slab range into ``ffn``.
+
+    Returns the post-bake unit cursor. Used during the multi-commit
+    migration so each substage commit can lower its slabs declaratively
+    while the remaining slabs continue through the inlined imperative
+    tail below.
+    """
+    rules: list[FFNRule] = []
+    for a_lo in range(start_a_lo, end_a_lo):
+        rules.extend(_layer11_mul_partial_rules_for_a_lo(a_lo, S))
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=start_a_lo * 256,
+        S=S,
+    )
+
+
+def _bake_layer11_mul_partial_imperative_tail(
+    ffn,
+    S: float,
+    BD,
+    *,
+    start_a_lo: int,
+    start_unit: int,
+) -> int:
+    """Inlined ``_set_layer11_mul_partial`` body, restricted to ``a_lo``
+    slabs ``[start_a_lo, 16)``.
+
+    Mirror of ``setup_helpers._set_layer11_mul_partial`` so the multi-
+    commit migration can advance the declarative boundary
+    ``start_a_lo`` one substage at a time without modifying the legacy
+    helper (which other tests still call as a single 4096-unit bake).
+    Final commit of the migration removes the call to this tail entirely.
+    """
+    assert start_unit == start_a_lo * 256, (
+        f"L11 imperative tail expects start_unit = start_a_lo * 256, "
+        f"got start_unit={start_unit} for start_a_lo={start_a_lo}"
+    )
+    unit = start_unit
+    for a_lo in range(start_a_lo, 16):
+        for b_lo in range(16):
+            carry = (a_lo * b_lo) // 16
+            for b_hi in range(16):
+                partial = (carry + a_lo * b_hi) % 16
+                # 4-way AND: MARK_AX + ALU_LO[a_lo] + AX_CARRY_LO[b_lo] + AX_CARRY_HI[b_hi]
+                ffn.W_up[unit, BD.MARK_AX] = S
+                ffn.W_up[unit, BD.ALU_LO + a_lo] = S
+                ffn.W_up[unit, BD.AX_CARRY_LO + b_lo] = S
+                ffn.W_up[unit, BD.AX_CARRY_HI + b_hi] = S
+                ffn.b_up[unit] = -S * 3.5
+                ffn.W_gate[unit, BD.OP_MUL] = 1.0
+                # 10.0/S so hot TEMP[partial] lands at ~5.0 (L12 threshold).
+                ffn.W_down[BD.TEMP + partial, unit] = 10.0 / S
+                unit += 1
+    return unit
+
+
 def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
     """L11 FFN: MUL partial product accumulation.
 
@@ -75,12 +246,11 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
     def bake(block, dim_positions, S):
         if alu_mode == "efficient":
             return None
-        from ...vm_step import _set_layer11_mul_partial
         proxy = _as_setdim_proxy(dim_positions)
 
         # Per-bake FFN-unit allocator. Each L11 MUL partial slab (one per
-        # ``a_lo``) is pinned to its existing offset so the call below
-        # lands byte-identically. The block-level attribute mirrors the
+        # ``a_lo``) is pinned to its existing offset so the calls below
+        # land byte-identically. The block-level attribute mirrors the
         # ``_l14_unit_counter`` convention used by sibling layers, but
         # carries the allocator object so the layout is structured, not
         # just a monotonic int. Downstream tools (e.g. a future L11 op
@@ -89,14 +259,31 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         allocator = _allocate_layer11_mul_partial_units()
         block.ffn._l11_unit_allocator = allocator
 
-        n11 = _set_layer11_mul_partial(block.ffn, S, proxy)
-        # Byte-identity guard: the helper's local cursor MUST end exactly
-        # at the allocator's total footprint. If the layout table drifts
-        # from the helper's writes, this assertion fires before any
-        # weight surgery propagates downstream.
-        assert n11 == _L11_MUL_PARTIAL_TOTAL_UNITS, (
-            f"L11 MUL partial unit cursor drift: helper returned {n11}, "
-            f"allocator expected {_L11_MUL_PARTIAL_TOTAL_UNITS}"
+        # Migrated portion (declarative FFNRule lowering): a_lo slabs
+        # ``[0, _L11_MUL_PARTIAL_MIGRATED_END_A_LO)``. The remaining
+        # slabs run through ``_bake_layer11_mul_partial_imperative_tail``
+        # below. Both halves are byte-identical to the legacy
+        # ``setup_helpers._set_layer11_mul_partial`` -- verified via
+        # ``compare_symbolic_to_lowered_ffn`` per substage commit.
+        next_unit = _lower_layer11_mul_partial_rules_range(
+            block.ffn, S, proxy,
+            start_a_lo=0,
+            end_a_lo=_L11_MUL_PARTIAL_MIGRATED_END_A_LO,
+        )
+        # Imperative tail covers the unmigrated a_lo slabs.
+        next_unit = _bake_layer11_mul_partial_imperative_tail(
+            block.ffn, S, proxy,
+            start_a_lo=_L11_MUL_PARTIAL_MIGRATED_END_A_LO,
+            start_unit=next_unit,
+        )
+        # Byte-identity guard: combined declarative + imperative cursor
+        # MUST end exactly at the allocator's total footprint. If the
+        # layout table drifts from the rules / helper writes, this
+        # assertion fires before any weight surgery propagates downstream.
+        assert next_unit == _L11_MUL_PARTIAL_TOTAL_UNITS, (
+            f"L11 MUL partial unit cursor drift: bake returned "
+            f"{next_unit}, allocator expected "
+            f"{_L11_MUL_PARTIAL_TOTAL_UNITS}"
         )
 
     return Operation(
