@@ -385,12 +385,12 @@ def make_layer5_fetch_dep_anchor_op() -> Operation:
         reads={"MARK_PC", "MARK_AX", "HAS_SE",
                "FETCH_LO", "FETCH_HI", "EMBED_LO", "EMBED_HI",
                "ADDR_KEY", "CONST", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
-                "FETCH_LO", "FETCH_HI",
-                "OP_IMM", "OP_LEA", "OP_EXIT", "OP_JMP", "OP_JSR",
-                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
-                "OP_OR", "OP_XOR", "OP_AND",
-                "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
+        # Phase 9.B (FETCH_LO/HI SCC #4 dep-anchor): drop anchor writes
+        # so it is read-only. The real FETCH_LO/HI / OPCODE_BYTE_* / OP_*
+        # writes are owned by ``layer5_fetch``; doubling them here
+        # produced the same-step 2-cycle SCC #4. Block op resolves to
+        # the anchor's layer via ``target_op_name``.
+        writes=set(),
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
