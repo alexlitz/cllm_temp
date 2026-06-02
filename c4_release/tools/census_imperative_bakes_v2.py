@@ -149,6 +149,7 @@ _DECLARATIVE_LOWER_RE = re.compile(
     r"\b("
     r"lower_ffn"
     r"|lower_attention"
+    r"|lower_token_embeddings"
     r"|_?lower_[a-zA-Z0-9_]*_via_(compiler_)?ir"
     r"|_?lower_[a-zA-Z0-9_]*_ir"
     r"|Primitives\.lower_ffn_rules"
@@ -171,6 +172,40 @@ _IMPERATIVE_RE = re.compile(
     r"|alibi_slopes\.data\["
     r")"
 )
+
+# "Benign" residual write patterns. These don't disqualify an op as
+# declarative-via-helper:
+#   - ``alibi_slopes.data[<scalar idx>] = <number>``: one-shot per-head slope
+#     bookkeeping written alongside an otherwise declarative head spec.
+#     The :class:`AttentionHeadIR` doesn't carry slope values, so a 1-line
+#     scalar assignment is the canonical residual; see L10
+#     ``_bake_layer10_*_passthrough_head`` for the pattern.
+#   - ``<param>.data[...].zero_()``: zero-fill range cleanups that
+#     ``_clear_ffn_unit_band`` and similar helpers issue before the IR
+#     lowering writes into the same range. Pure zeroing has no semantic
+#     content and is not a target for IR migration on its own.
+_BENIGN_RESIDUAL_RES = (
+    # ``alibi_slopes.data[<idx>] = <scalar number>`` (require a non-word
+    # char after the number so we don't strip ``= 0`` from ``= 0.5``).
+    re.compile(
+        r"alibi_slopes\.data\[\d+\] = -?\d+(?:\.\d+)?(?![\.\w])"
+    ),
+    # ``<param>.data[...].zero_()`` — single contiguous slice zero-fill.
+    re.compile(
+        r"\b(?:W_up|W_down|W_gate|W_q|W_k|W_v|W_o|b_up|b_gate|b_down)"
+        r"\.data\[[^\]]*\]\.zero_\(\)"
+    ),
+)
+
+
+def _strip_benign_residuals(source: str) -> str:
+    """Remove benign residual write patterns from source for imperative scan."""
+    if not source:
+        return source
+    out = source
+    for pat in _BENIGN_RESIDUAL_RES:
+        out = pat.sub("", out)
+    return out
 
 _HELPER_CALL_RE = re.compile(
     r"\b("
@@ -222,12 +257,18 @@ def _get_source(fn) -> str:
 
 
 def _looks_declarative_in_source(source: str) -> bool:
-    """Source contains a lowering call AND no direct W_*.data writes."""
+    """Source contains a lowering call AND no direct W_*.data writes.
+
+    Benign residual patterns (per-head ``alibi_slopes`` scalars, zero-fill
+    range cleanups) are stripped before scanning so a mostly-declarative
+    helper isn't penalized for a 1-line slope setter or a band zero-fill
+    that precedes the IR lowering.
+    """
     if not source:
         return False
     if not _DECLARATIVE_LOWER_RE.search(source):
         return False
-    if _IMPERATIVE_RE.search(source):
+    if _IMPERATIVE_RE.search(_strip_benign_residuals(source)):
         return False
     return True
 
@@ -237,7 +278,10 @@ def _has_lower_call(source: str) -> bool:
 
 
 def _has_imperative_writes(source: str) -> bool:
-    return bool(source and _IMPERATIVE_RE.search(source))
+    """Detect direct W_*.data writes that are NOT benign residuals."""
+    if not source:
+        return False
+    return bool(_IMPERATIVE_RE.search(_strip_benign_residuals(source)))
 
 
 # ---------------------------------------------------------------------------
