@@ -7,49 +7,49 @@ from ..primitives import Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L12 FFN unit layout (pinned offsets) ===========================
+# === L12 FFN unit layout (auto-fit) =================================
 #
 # The ``layer12_mul_combine`` op owns the entire L12 FFN. The weight
 # writes happen via ``_layer12_mul_combine_rules`` (a list of
 # :class:`FFNRule` declarations) which is lowered by
 # ``Primitives.lower_ffn_rules`` through ``CompilerIR.lower_ffn``. The
 # rules walk a ``(partial, a_hi, b_lo)`` triple-loop and fill all 4096
-# hidden units (16^3). Migration to :class:`FFNUnitAllocator` keeps that
-# helper byte-identical -- we declare the sub-stage's range at its
-# existing pinned offset so the layout is auditable rather than implicit.
-# Adding a new L12 op family later will go through
-# ``allocator.alloc(name, n)`` without a pin, and the allocator will pick
-# the first free gap above 4096 (or any earlier gap, though none exist in
-# the current bake).
+# hidden units (16^3).
 #
-# The offsets below mirror the rule order in
-# ``_layer12_mul_combine_rules``. Changing the rule list requires updating
-# this table in lock-step.
+# Phase 7.B.5: the partials sub-stage now uses ``pin=None`` so the
+# :class:`FFNUnitAllocator` first-fit pick lands it at unit 0 — there are
+# no prior claims, so the lowest free gap is the start of the pool, which
+# is byte-identical to the legacy explicit ``pin=0``. Dropping the pin
+# turns the layout table into an audit-only declaration of name and
+# size; the allocator owns the offset.
+#
+# The rule order in ``_layer12_mul_combine_rules`` determines the per-unit
+# write semantics. Changing the rule list requires updating this table
+# entry's ``n_units`` in lock-step.
 _L12_MUL_COMBINE_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
-    ("layer12_mul_combine.partials", 0, 4096),  # 16 partial x 16 a_hi x 16 b_lo
+    # (sub-stage name, n_units)  -- pin dropped (Phase 7.B.5, auto-fit)
+    ("layer12_mul_combine.partials", 4096),  # 16 partial x 16 a_hi x 16 b_lo
 )
 
 
 def _allocate_layer12_mul_combine_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with L12's MUL combine range.
 
-    The sub-stage is pinned at its existing offset so the FFNRule lowering
-    -- which appends one hidden unit per rule starting at ``start_unit=0``
-    -- lands on exactly the same hidden-unit indices the legacy
-    ``_set_layer12_mul_combine`` helper always wrote. This call is
-    byte-identical bookkeeping: the allocator declares the range by name,
-    the rule lowering writes the weights. A future refactor can split the
-    monolithic rule list into per-range bake functions that consume
-    ``allocator.alloc(...)`` directly.
+    Phase 7.B.5: the partials sub-stage is now auto-fit (``pin=None``);
+    first-fit on an empty 4096-wide pool returns start unit 0, which is
+    byte-identical to the legacy explicit ``pin=0`` the previous
+    revision used. The FFNRule lowering still consumes ``start_unit=0``
+    from the allocator's range, so every weight write lands on the same
+    hidden-unit index the legacy ``_set_layer12_mul_combine`` helper
+    wrote.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L12 op claims a free range past unit 4096 by widening the
     pool, or claims a sub-range if the rule list is split).
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L12_MUL_COMBINE_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, n_units in _L12_MUL_COMBINE_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
