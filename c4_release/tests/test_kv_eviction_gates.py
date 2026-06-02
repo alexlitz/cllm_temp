@@ -42,6 +42,18 @@ Gate summary
     consume the same precomputed state and reach the same decisions at
     every step index.
 
+* **8.E.10 / Test 4 — Efficiency threshold**:
+    After driving ``apply_eviction`` across every planned step of a
+    500-step compile, the realised KV cache row count (= total planned
+    positions minus ``len(state.evicted_positions)``) must be no more
+    than ``(1 - EFFICIENCY_THRESHOLD)`` of the upper bound
+    "no-eviction" cache size (= unique positions read by any later
+    step, i.e. every position present anywhere in the per-step plan).
+    This is the "did eviction actually save anything" signal —
+    correctness/completeness/determinism only verify the *plan* is
+    sound; the efficiency gate verifies the plan *fires* at runtime
+    and reaches a non-trivial fraction of the upper bound.
+
 Runtime contracts consumed
 --------------------------
 
@@ -141,6 +153,23 @@ def overwrite_model_layout_n_steps_64():
         disk_cache=False,
         kv_eviction_policy=KVEvictionPolicy.OVERWRITE_BASED,
         kv_eviction_n_steps=64,
+    )
+
+
+@pytest.fixture(scope="module")
+def overwrite_model_layout_n_steps_500():
+    """``policy=OVERWRITE_BASED`` with ``n_steps=500`` for the efficiency gate.
+
+    Used exclusively by the 8.E.10 efficiency-threshold gate (Test 4).
+    The 500-step plan is large enough that the OVERWRITE_BASED policy
+    must evict the bulk of the planned positions for the runtime
+    bookkeeping to remain a meaningful "saved bytes" signal.
+    """
+
+    return compile_full_vm_dynamic(
+        disk_cache=False,
+        kv_eviction_policy=KVEvictionPolicy.OVERWRITE_BASED,
+        kv_eviction_n_steps=500,
     )
 
 
@@ -571,6 +600,112 @@ def test_determinism_spec_and_main_decode_evict_identical_entries_per_step(
                 f"  main: {m_book}\n"
                 f"  spec: {s_book}\n"
             )
+
+
+# ---------------------------------------------------------------------------
+# Gate 4 — Efficiency threshold: after a 500-step run, the realised KV
+# cache row count must fall below (1 - threshold) of the no-eviction
+# upper bound (= unique positions read by any later step).
+# ---------------------------------------------------------------------------
+
+
+# Phase 8.E.10 efficiency threshold. The 500-step n_steps explored in
+# practice evicts >= 99% of planned positions (every position appears
+# in at least one step's overwrite plan when the corpus is the full op
+# set). The threshold is intentionally set well below the observed
+# headroom so transient drops from new op additions don't false-fail
+# the gate; it's a "did eviction fire at all" floor, not an exact
+# count.
+EFFICIENCY_THRESHOLD = 0.50
+
+
+def test_efficiency_threshold_500_step_run_evicts_at_least_half_of_planned_positions(
+    overwrite_model_layout_n_steps_500,
+):
+    """8.E.10 efficiency-threshold gate.
+
+    Build a 500-step OVERWRITE_BASED compile and drive ``apply_eviction``
+    across every step in the precomputed plan on each attention layer.
+    For each layer:
+
+    * ``expected_no_eviction_rows`` = number of unique positions that any
+      step in the plan reads from. This is the upper bound on cache rows
+      the runtime would carry if eviction were OFF.
+    * ``actual_live_rows`` = ``expected_no_eviction_rows`` minus
+      ``len(state.evicted_positions)``. Positions that ``apply_eviction``
+      has zeroed are no longer "live" cache rows from the eviction
+      runtime's point of view.
+
+    The gate asserts ``actual_live_rows <= (1 - EFFICIENCY_THRESHOLD) *
+    expected_no_eviction_rows`` for every layer with a non-empty plan.
+    Equivalently: at least ``EFFICIENCY_THRESHOLD`` of the upper-bound
+    cache rows must have been evicted by the end of the run.
+
+    Unlike Gates 1-3 (which prove the plan is correct, complete, and
+    deterministic), this gate proves the plan *actually saves space* at
+    runtime. A 100% correct plan that evicts nothing would still pass
+    Gates 1-3 but fail this one.
+    """
+
+    from neural_vm.kv_eviction import apply_eviction
+
+    ow_model, _layout = overwrite_model_layout_n_steps_500
+
+    _reset_model_bookkeeping(ow_model)
+
+    layer_results: list[tuple[int, int, int]] = []
+    for layer_idx, attn, state in _eviction_states(ow_model):
+        # Compute "expected count = unique positions read by any later
+        # step". A position is in the no-eviction upper bound iff it
+        # appears anywhere in the per-step plan — the runtime would
+        # have to keep its cache row alive if eviction were OFF.
+        positions_anywhere_in_plan: set[int] = set()
+        for _step, by_pos in state.evictable_dim_slices_at_step.items():
+            positions_anywhere_in_plan.update(int(p) for p in by_pos.keys())
+        expected_no_eviction_rows = len(positions_anywhere_in_plan)
+        if expected_no_eviction_rows == 0:
+            # Layer carries no plan — nothing to evict, nothing to
+            # measure. Skip it (same shape as Gates 1-3 skipping empty
+            # plans).
+            continue
+
+        # Drive the runtime over the full plan. ``apply_eviction``
+        # populates ``state.evicted_positions`` as it walks each step.
+        _reset_state_bookkeeping(state)
+        for step in sorted(state.evictable_dim_slices_at_step.keys()):
+            apply_eviction(attn, state, step_idx=step)
+
+        actual_evicted_rows = len(state.evicted_positions)
+        actual_live_rows = expected_no_eviction_rows - actual_evicted_rows
+        layer_results.append(
+            (layer_idx, actual_live_rows, expected_no_eviction_rows)
+        )
+
+        # The gate: live rows must be at most (1 - threshold) of the
+        # no-eviction upper bound. Equivalently, eviction must remove
+        # at least EFFICIENCY_THRESHOLD of the planned positions.
+        max_allowed_live = int(
+            (1.0 - EFFICIENCY_THRESHOLD) * expected_no_eviction_rows
+        )
+        assert actual_live_rows <= max_allowed_live, (
+            f"layer {layer_idx}: realised KV cache rows after 500-step "
+            f"run = {actual_live_rows} (= {expected_no_eviction_rows} "
+            f"planned - {actual_evicted_rows} evicted), which exceeds "
+            f"the efficiency threshold of "
+            f"{(1.0 - EFFICIENCY_THRESHOLD) * 100:.0f}% of the "
+            f"no-eviction upper bound ({max_allowed_live}). The "
+            f"OVERWRITE_BASED runtime did not fire on enough planned "
+            f"positions — either the plan is empty for most positions "
+            f"or apply_eviction is silently no-op'ing on the cache-less "
+            f"path for too many slot entries."
+        )
+
+    assert layer_results, (
+        "8.E.10 efficiency gate found 0 layers with a non-empty "
+        "eviction plan at n_steps=500. Either the OVERWRITE_BASED "
+        "policy is failing to attach states or build_overwrite_map is "
+        "returning an empty map; the gate cannot measure efficiency."
+    )
 
 
 # ---------------------------------------------------------------------------
