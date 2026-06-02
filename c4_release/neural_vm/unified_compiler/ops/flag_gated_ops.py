@@ -1162,7 +1162,27 @@ def make_convo_io_prtf_transport_op(
         # constraint to analyze_scheduler.py and LayerCompiler equally;
         # the per-block phase ordering (4.5 < 4.6) handles within-block
         # sequencing of alibi-slope writes.
-        requires={"same_layer_as": "layer4_sp_to_addr_key"},
+        #
+        # Phase 7.A.2 backfill: declare the strict-after edges for both
+        # head 0/1 (``layer4_pc_relay``) and head 2/3
+        # (``layer4_sp_to_addr_key``) as named in the docstring above.
+        # The two predecessors share the L4 attention-head allocator with
+        # this op (this is head 4 in the same builder), and the
+        # ``alibi_slopes[4] = 0.1`` override here MUST run after the
+        # per-block ``alibi_slopes.fill_(0.5)`` plus the relay's slope
+        # writes -- the ordering is currently maintained by the
+        # per-block phase tiebreaker (phase 4 < 4.5 < 4.6) but is
+        # otherwise invisible to the dim-only analyzer because this op
+        # has empty reads/writes. ``layer4_pc_relay`` is itself currently
+        # a cycle member; the ``same_layer_as`` edge previously already
+        # pulled this op into the same SCC transitively via
+        # ``layer4_sp_to_addr_key``, so declaring the explicit
+        # ``after`` edges is documentation-only for cycle membership and
+        # makes the dep-graph honest about the load-bearing order.
+        requires={
+            "after": ["layer4_pc_relay", "layer4_sp_to_addr_key"],
+            "same_layer_as": "layer4_sp_to_addr_key",
+        },
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
