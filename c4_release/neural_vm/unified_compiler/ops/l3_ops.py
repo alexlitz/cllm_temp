@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...constants import INSTR_WIDTH, PC_OFFSET
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
@@ -986,38 +987,69 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
     )
 
 
+# === L3 attention head layout (pinned head_idx per primary owner) ====
+#
+# The ``layer3_carry_forward_attn`` op owns all 8 L3 attention heads.
+# Heads 0-3 are register carry-forward heads (PC / AX / SP / BP),
+# head 4 retires the stale STACK0 marker carry, and heads 5-7 are
+# declarative relays (AX_FULL gather, LEV BP->PC, PC byte1 carry).
+#
+# Pinning every head at its existing ``head_idx`` preserves byte-identity
+# with the legacy bake (which used literal ``head_idx=N`` everywhere).
+# Once a future wave drops ``pin=`` the allocator will auto-fit any new
+# head added to L3 above index 7.
+_L3_HEAD_LAYOUT = (
+    # (op_name, head_idx)
+    ("layer3_carry_forward_attn.head_0", 0),  # PC carry-forward
+    ("layer3_carry_forward_attn.head_1", 1),  # AX carry-forward -> AX_CARRY band
+    ("layer3_carry_forward_attn.head_2", 2),  # SP carry-forward
+    ("layer3_carry_forward_attn.head_3", 3),  # BP carry-forward
+    ("layer3_carry_forward_attn.head_4", 4),  # STACK0 marker carry retirer
+    ("layer3_carry_forward_attn.head_5", 5),  # AX_FULL relay (OUTPUT -> AX_FULL)
+    ("layer3_carry_forward_attn.head_6", 6),  # LEV BP->PC (CLEAN_EMBED relay)
+    ("layer3_carry_forward_attn.head_7", 7),  # PC byte1 prev -> TEMP
+)
+_L3_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L3_HEAD_LAYOUT}
+
+
+def _allocate_layer3_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with all L3 heads.
+
+    Every L3 head is pinned at its existing ``head_idx`` (declared in
+    :data:`_L3_HEAD_LAYOUT`) so byte-identity with the legacy bake is
+    preserved. Returns the allocator so callers can attach it to the
+    ``attn`` module for inspection.
+    """
+    allocator = AttentionHeadAllocator(layer_max_heads=8)
+    for name, head_idx in _L3_HEAD_LAYOUT:
+        allocator.alloc(name, 3, pin=head_idx)
+    return allocator
+
+
 def make_layer3_carry_forward_attn_op() -> Operation:
     """L3 attention: 8 carry-forward heads (PC, AX, SP, BP, STACK0 + relays).
 
-    Heads 0-3 use ``Primitives.carry_forward_attention`` (the canonical
-    proxy-aware implementation; the legacy ``_set_carry_forward_attn``
-    helper was deleted per BD_SETDIM_HARDCODE_AUDIT M1). Head 4 uses
-    ``_set_stack0_carry_attn`` (different K source). Heads 5-7 are
-    declarative relays for AX_FULL, LEV BP->PC, and PC byte1 preservation.
+    Heads 0-3 are declarative carry-forward heads (PC, AX, SP, BP) that
+    formerly went through ``Primitives.carry_forward_attention``; their
+    Q/K/V/O writes are now expressed as ``DeclarativeAttentionHeadSpec``
+    via :func:`_carry_forward_head_spec` (byte-identical with the
+    legacy helper). Head 4 is the declarative STACK0 marker carry
+    retirer. Heads 5-7 are declarative relays for AX_FULL, LEV BP->PC,
+    and PC byte1 preservation.
     """
     def bake(attn, dim_positions, S):
-        from ..primitives import Primitives
         proxy = _as_setdim_proxy(dim_positions)
+
+        # Per-bake attention-head allocator. Pins every L3 head_idx at
+        # its existing slot so byte-identity is preserved.
+        head_allocator = _allocate_layer3_heads()
+        attn._l3_head_allocator = head_allocator
+
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
-        PC_I, AX_I, SP_I, BP_I = 0, 1, 2, 3
-        cf = Primitives.carry_forward_attention
-        # Pass proxy as bd= so pin_io_only=True layouts resolve L1H0/L1H1/CONST
-        # to the compiler-allocated positions rather than legacy _SetDim ones.
-        cf(attn, 0, proxy.MARK_PC, PC_I, PC_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
-        cf(attn, 1, proxy.MARK_AX, AX_I, AX_I, proxy.AX_CARRY_LO, proxy.AX_CARRY_HI, HD=HD, bd=proxy)
-        cf(attn, 2, proxy.MARK_SP, SP_I, SP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
-        cf(attn, 3, proxy.MARK_BP, BP_I, BP_I, proxy.EMBED_LO, proxy.EMBED_HI, HD=HD, bd=proxy)
         Primitives.generate_attention_heads(
-            attn,
-            (
-                _stack0_carry_head_spec(proxy),
-                _ax_full_relay_head_spec(proxy),
-                _lev_bp_to_pc_head_spec(proxy),
-                _pc_byte1_prev_head_spec(proxy),
-            ),
-            HD,
+            attn, _layer3_carry_forward_head_specs(proxy), HD,
         )
 
     # Dim-ownership claims: 7 carry-forward attention heads.
@@ -1075,6 +1107,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         layer_idx=3,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer3_carry_forward_attn_ir,
         declarative_authority="spec_generated",
         migrated=True,
         # B9 OUTPUT_HI split: head 5 (``_ax_full_relay_head_spec``) reads
@@ -1092,6 +1125,139 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _carry_forward_head_spec(
+    BD,
+    *,
+    head_idx: int,
+    marker_dim: int,
+    l1h1_idx: int,
+    l1h0_idx: int,
+    out_lo: int,
+    out_hi: int,
+    src_lo: int,
+    src_hi: int,
+    L: float = 15.0,
+) -> DeclarativeAttentionHeadSpec:
+    """Declarative replacement for ``Primitives.carry_forward_attention``.
+
+    Mirrors the exact Q/K/V/O writes of the helper one-to-one so the
+    lowered matrices are byte-identical. The spec carries:
+
+    * ``Q[0] = marker_dim * L`` -- fires at the target marker.
+    * ``K[0] = L1H1+l1h1_idx * L``, ``K[0] = L1H0+l1h0_idx * -L`` --
+      fires at the previous step's byte 0 row.
+    * ``V[1+k] = src_lo+k``, ``V[17+k] = src_hi+k`` for k=0..15.
+    * ``O[out_lo+k] = V[1+k]``, ``O[out_hi+k] = V[17+k]`` for k=0..15.
+    * Anti-leakage gate at slot 33: ``Q[33]=marker*L + CONST*-L/2``,
+      ``K[33]=CONST*L``.
+    """
+
+    GATE = 33
+    q = [
+        AP(0, marker_dim, L),
+        AP(GATE, marker_dim, L),
+        AP(GATE, BD.CONST, -L / 2),
+    ]
+    k = [
+        AP(0, BD.L1H1 + l1h1_idx, L),
+        AP(0, BD.L1H0 + l1h0_idx, -L),
+        AP(GATE, BD.CONST, L),
+    ]
+    v = []
+    o = []
+    for k_idx in range(16):
+        v.append(AP(1 + k_idx, src_lo + k_idx, 1.0))
+        v.append(AP(17 + k_idx, src_hi + k_idx, 1.0))
+        o.append(AO(out_lo + k_idx, 1 + k_idx, 1.0))
+        o.append(AO(out_hi + k_idx, 17 + k_idx, 1.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+    )
+
+
+def _layer3_carry_forward_head_specs(
+    BD,
+) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """All 8 L3 carry-forward attention heads as declarative specs.
+
+    Heads 0-3 are register carry-forward heads (PC / AX / SP / BP) built
+    via :func:`_carry_forward_head_spec`. Head 4 retires the stale STACK0
+    marker carry. Heads 5-7 are the AX_FULL relay, the LEV BP->PC relay,
+    and the PC byte1 prev relay respectively.
+    """
+
+    PC_I, AX_I, SP_I, BP_I = 0, 1, 2, 3
+    specs = (
+        _carry_forward_head_spec(
+            BD,
+            head_idx=_L3_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_0"],
+            marker_dim=BD.MARK_PC,
+            l1h1_idx=PC_I,
+            l1h0_idx=PC_I,
+            out_lo=BD.EMBED_LO,
+            out_hi=BD.EMBED_HI,
+            src_lo=BD.EMBED_LO,
+            src_hi=BD.EMBED_HI,
+        ),
+        _carry_forward_head_spec(
+            BD,
+            head_idx=_L3_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_1"],
+            marker_dim=BD.MARK_AX,
+            l1h1_idx=AX_I,
+            l1h0_idx=AX_I,
+            out_lo=BD.AX_CARRY_LO,
+            out_hi=BD.AX_CARRY_HI,
+            src_lo=BD.EMBED_LO,
+            src_hi=BD.EMBED_HI,
+        ),
+        _carry_forward_head_spec(
+            BD,
+            head_idx=_L3_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_2"],
+            marker_dim=BD.MARK_SP,
+            l1h1_idx=SP_I,
+            l1h0_idx=SP_I,
+            out_lo=BD.EMBED_LO,
+            out_hi=BD.EMBED_HI,
+            src_lo=BD.EMBED_LO,
+            src_hi=BD.EMBED_HI,
+        ),
+        _carry_forward_head_spec(
+            BD,
+            head_idx=_L3_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_3"],
+            marker_dim=BD.MARK_BP,
+            l1h1_idx=BP_I,
+            l1h0_idx=BP_I,
+            out_lo=BD.EMBED_LO,
+            out_hi=BD.EMBED_HI,
+            src_lo=BD.EMBED_LO,
+            src_hi=BD.EMBED_HI,
+        ),
+        _stack0_carry_head_spec(BD),
+        _ax_full_relay_head_spec(BD),
+        _lev_bp_to_pc_head_spec(BD),
+        _pc_byte1_prev_head_spec(BD),
+    )
+    return specs
+
+
+def _layer3_carry_forward_attn_ir(dim_positions, HD) -> CompilerIR:
+    """CompilerIR factory for ``layer3_carry_forward_attn``.
+
+    Resolves dim names through ``_as_setdim_proxy`` so the lowering
+    works under both legacy ``_SetDim`` and ``pin_io_only=True``
+    compiler-allocated layouts.
+    """
+    del HD  # head specs are dim-only; HD is encoded in the lowering call.
+    BD = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.extend(_layer3_carry_forward_head_specs(BD))
+    return ir
 
 
 def _stack0_carry_head_spec(BD) -> DeclarativeAttentionHeadSpec:
