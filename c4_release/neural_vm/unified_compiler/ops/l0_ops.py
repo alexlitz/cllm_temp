@@ -75,8 +75,21 @@ def _allocate_phase_a_ffn_units() -> FFNUnitAllocator:
 
 
 def _phase_a_ffn_rules(S: float) -> tuple[FFNRule, ...]:
-    """CompilerIR rules for the L0 marker-transition detector."""
+    """CompilerIR rules for the L0 marker-transition detector.
 
+    Phase 8.D: the per-marker ``H<k>+{i}`` reads stay as ``+N`` -- the
+    ``<i>`` offset indexes a fixed-width 7-slot threshold-head bank
+    position, a structural slot index into the H<k> head's output
+    (same convention as the L1 marker-bank reads). The transition's
+    ``NEXT_*`` output names are slot-level singleton flags with no
+    ``(category, role)`` binding in the dim registry, so the write
+    targets also stay bare. No role-meaningful (category, role) refs
+    surface in this rule generator.
+    """
+
+    # structural offsets: PC_I/AX_I/SP_I/BP_I/MEM_I/SE_I index a
+    # fixed-width 7-slot threshold-head bank position, not a
+    # role-meaningful byte index.
     PC_I, AX_I, SP_I, BP_I, MEM_I, SE_I = 0, 1, 2, 3, 4, 5
     write_scale = 2.0 / S
     transitions = (
