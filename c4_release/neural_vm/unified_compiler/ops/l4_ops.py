@@ -490,6 +490,19 @@ def make_layer4_ffn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer4_ffn_dep_anchor",
+        # Phase 10.B prerequisite: restore phase=3 placement key. Commit
+        # 6ae5343f dropped it without verifying that the L3 anchor
+        # (whose phase= was also dropped in 18a90a4d) still co-located.
+        # Phase 9.B SSA renames let the L3 anchor's earliest-feasible
+        # layer settle at 3, so the L4 anchor's
+        # ``requires["same_layer_as"]`` constraint resolved to L3 -- but
+        # the L4 FFN's writers force layer 4 minimum, producing the
+        # "placed at layer 4 but reference at layer 3" mismatch.
+        # Restoring phase=3 puts both anchors on the same (kind, phase)
+        # slot in the phase-share allocator, which historically pins
+        # them at L4 together (matching ``layer4_ffn`` block op's
+        # layer_idx=4 pin).
+        phase=3,
         # Drop ``EMBED_LO`` / ``EMBED_HI`` (which ``_layer3_ffn_dep_anchor``
         # writes at L4) so the new anchor's earliest landable layer is not
         # pushed past L4 by the L3 anchor's writes. ``requires["same_layer_as"]``
