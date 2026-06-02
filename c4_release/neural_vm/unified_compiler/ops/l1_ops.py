@@ -232,7 +232,11 @@ def make_layer1_ffn_op() -> Operation:
         writes={"STACK0_BYTE0", "BYTE_INDEX_0", "BYTE_INDEX_1",
                 "BYTE_INDEX_2", "BYTE_INDEX_3"},
         kind="ffn",
-        layer_idx=1,
+        # Phase 8.G.6: drop ``layer_idx=1`` literal. The ``requires
+        # ["same_layer_as"]`` below co-places this op with the L1
+        # threshold-attn (which lands at L1 via ``requires["after"]``
+        # against layer0_threshold_attn), so the explicit layer pin is
+        # redundant.
         declarative_bake_fn=bake,
         compiler_ir=_layer1_ffn_ir(),
         declarative_authority="spec_generated",
@@ -423,7 +427,9 @@ def make_layer1_threshold_attn_op() -> Operation:
         reads={"IS_MARK", "MARK_SE_ONLY", "MARK_CS", "CONST"},
         writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE", "IN_STEP_FRESH"},
         kind="attn",
-        layer_idx=1,
+        # Phase 8.G.6: drop ``layer_idx=1`` literal. ``requires["after"]
+        # = layer0_threshold_attn`` (below) is the structural pin: the
+        # dep edge forces this attn to land at L1 (one after L0).
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer1_threshold_ir,
         migrated=True,
