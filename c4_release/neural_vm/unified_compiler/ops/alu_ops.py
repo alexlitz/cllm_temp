@@ -36,7 +36,6 @@ def make_alu_shift_composite_ops():
 
         return Operation(
             name="l13_alu_shift_bdtoge",
-            phase=13,
             reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                    "OP_SHL", "OP_SHR"},
             writes=set(),
