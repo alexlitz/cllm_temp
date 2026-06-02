@@ -83,77 +83,25 @@ class UnifiedVMCompiler:
         self._compile_output_head(model)
 
     def _compile_embedding(self, model):
-        """Compile embedding weights."""
-        embed = model.embed.embed.weight
-        embed.zero_()
+        """Compile embedding weights via declarative ``TokenEmbeddingRule`` IR.
 
-        V = model.vocab_size
+        Phase 7.D.3 migration: replaced per-token imperative writes with a
+        call to ``CompilerIR.lower_token_embeddings`` carrying the same
+        ``_embedding_bake_rules`` list that ``make_embedding_bake_op`` (the
+        active production op) uses -- single source of truth. The bake_fn
+        first zeroes ``model.embed.embed.weight`` (the IR has no zeroing
+        primitive) and then lowers the rules.
+        """
+        from .ir import CompilerIR
+        from .ops.model_ops import _embedding_bake_rules
+        from .ops.shared import _setdim_to_positions
 
-        # CONST dimension for all tokens
-        for tok in range(V):
-            embed[tok, BD.CONST] = 1.0
+        model.embed.embed.weight.zero_()
 
-        # Marker tokens
-        marker_dims = [
-            (Token.REG_PC, BD.MARK_PC),
-            (Token.REG_AX, BD.MARK_AX),
-            (Token.REG_SP, BD.MARK_SP),
-            (Token.REG_BP, BD.MARK_BP),
-            (Token.MEM, BD.MARK_MEM),
-            (Token.CODE_START, BD.MARK_CS),
-        ]
-
-        for tok, dim in marker_dims:
-            embed[tok, dim] = 1.0
-            embed[tok, BD.IS_MARK] = 1.0
-
-        # STACK0 marker (NOT IS_MARK to avoid blocking BP from threshold detection)
-        embed[Token.STACK0, BD.MARK_STACK0] = 1.0
-
-        # Step-end tokens
-        for tok in [Token.STEP_END, Token.DATA_END, Token.HALT]:
-            embed[tok, BD.MARK_SE] = 1.0
-            embed[tok, BD.IS_MARK] = 1.0
-
-        embed[Token.STEP_END, BD.MARK_SE_ONLY] = 1.0
-
-        # TOOL_CALL has same profile as STEP_END
-        embed[Token.TOOL_CALL, BD.MARK_SE] = 1.0
-        embed[Token.TOOL_CALL, BD.IS_MARK] = 1.0
-        embed[Token.TOOL_CALL, BD.MARK_SE_ONLY] = 1.0
-        embed[Token.TOOL_CALL, BD.CONST] = 1.0
-
-        # I/O markers
-        embed[Token.USER_INPUT_START, BD.IS_MARK] = 1.0
-        embed[Token.USER_INPUT_END, BD.IS_MARK] = 1.0
-
-        # Thinking tags. MARK_THINKING_START/_END are baked directly into the
-        # embedding table so the runtime
-        # `NeuralVMEmbedding._inject_thinking_markers` loop is unnecessary
-        # (L2's lookback head reads these dims).
-        embed[Token.THINKING_START, BD.IS_MARK] = 1.0
-        embed[Token.THINKING_START, BD.CONST] = 1.0
-        embed[Token.THINKING_START, BD.TEMP + 1] = 1.0
-        embed[Token.THINKING_START, BD.MARK_THINKING_START] = 1.0
-        embed[Token.THINKING_END, BD.IS_MARK] = 1.0
-        embed[Token.THINKING_END, BD.CONST] = 1.0
-        embed[Token.THINKING_END, BD.TEMP + 2] = 1.0
-        embed[Token.THINKING_END, BD.MARK_THINKING_END] = 1.0
-
-        # I/O state tokens
-        embed[Token.IO_STATE_EMIT_BYTE, BD.IS_MARK] = 1.0
-        embed[Token.IO_STATE_EMIT_BYTE, BD.CONST] = 1.0
-        embed[Token.IO_STATE_EMIT_THINKING, BD.IS_MARK] = 1.0
-        embed[Token.IO_STATE_EMIT_THINKING, BD.CONST] = 1.0
-
-        # Byte embeddings (0-255)
-        for b in range(256):
-            embed[b, BD.IS_BYTE] = 1.0
-            embed[b, BD.EMBED_LO + (b & 0xF)] = 1.0
-            embed[b, BD.EMBED_HI + ((b >> 4) & 0xF)] = 1.0
-            # Clean copies (never written by attention/FFN)
-            embed[b, BD.CLEAN_EMBED_LO + (b & 0xF)] = 1.0
-            embed[b, BD.CLEAN_EMBED_HI + ((b >> 4) & 0xF)] = 1.0
+        dim_positions = _setdim_to_positions(BD)
+        ir = CompilerIR()
+        ir.embeddings.extend(_embedding_bake_rules(model.vocab_size))
+        ir.lower_token_embeddings(model, dim_positions)
 
     def _compile_attention_layers(self, model):
         """Compile attention weights for all layers."""
@@ -3837,84 +3785,23 @@ class UnifiedVMCompiler:
         _suppress_l15_lookup_during_current_store_generation(attn, BD, HD)
 
     def _compile_output_head(self, model):
-        """Compile output head (lm_head) weights."""
-        head = model.head
+        """Compile output head (lm_head) weights via declarative IR.
 
-        # Zero out all weights and biases
+        Phase 7.D.3 migration: replaced per-byte / per-marker imperative
+        writes with a call to ``CompilerIR.lower_token_embeddings`` carrying
+        the same ``_head_bake_rules`` list that ``make_head_bake_op`` (the
+        active production op) uses -- single source of truth.
+        """
+        from .ir import CompilerIR
+        from .ops.model_ops import _head_bake_rules
+        from .ops.shared import _setdim_to_positions
+
+        head = model.head
         head.weight.data.zero_()
         head.bias.data.zero_()
 
-        # Token constants (from vm_step.py Token class)
-        REG_PC = 257
-        REG_AX = 258
-        REG_SP = 259
-        REG_BP = 260
-        MEM = 261
-        STEP_END = 262
-        HALT = 263
-        CODE_START = 264
-        CODE_END = 265
-        DATA_START = 266
-        DATA_END = 267
-        STACK0 = 268
-        USER_INPUT_START = 269
-        USER_INPUT_END = 270
-        TOOL_CALL = 271
-        THINKING_START = 272
-        THINKING_END = 273
-        IO_STATE_EMIT_BYTE = 274
-        IO_STATE_EMIT_THINKING = 275
-
-        # NEXT_* flag dimensions for marker suppression
-        next_flags = [
-            BD.NEXT_PC,
-            BD.NEXT_AX,
-            BD.NEXT_SP,
-            BD.NEXT_BP,
-            BD.NEXT_STACK0,
-            BD.NEXT_MEM,
-            BD.NEXT_SE,
-            BD.NEXT_HALT,
-            BD.NEXT_TOOL_CALL,
-            BD.NEXT_THINKING_START,
-            BD.NEXT_THINKING_END,
-        ]
-
-        # Byte tokens (0-255): nibble decoding + marker suppression
-        for b in range(256):
-            lo, hi = b & 0xF, (b >> 4) & 0xF
-            head.weight.data[b, BD.OUTPUT_LO + lo] = 5.0
-            head.weight.data[b, BD.OUTPUT_HI + hi] = 5.0
-            head.bias.data[b] = -5.0
-            # Suppress byte logits when a marker transition is expected
-            for flag in next_flags:
-                head.weight.data[b, flag] += -80.0
-        head.bias.data[0] = -4.0  # slight preference for byte 0 as default
-
-        # Transition tokens
-        transition_tokens = [
-            (REG_PC, BD.NEXT_PC),
-            (REG_AX, BD.NEXT_AX),
-            (REG_SP, BD.NEXT_SP),
-            (REG_BP, BD.NEXT_BP),
-            (STACK0, BD.NEXT_STACK0),
-            (MEM, BD.NEXT_MEM),
-            (STEP_END, BD.NEXT_SE),
-            (HALT, BD.NEXT_HALT),
-            (TOOL_CALL, BD.NEXT_TOOL_CALL),
-            (THINKING_START, BD.NEXT_THINKING_START),
-            (THINKING_END, BD.NEXT_THINKING_END),
-        ]
-        for tok, flag in transition_tokens:
-            head.weight.data[tok, flag] = 20.0
-            head.bias.data[tok] = -10.0
-
-        # Never output context marker tokens
-        SEP = 256
-        for tok in [CODE_START, CODE_END, DATA_START, DATA_END, SEP,
-                    USER_INPUT_START, USER_INPUT_END]:
-            head.bias.data[tok] = -50.0
-
-        # I/O state tokens (suppress by default)
-        head.bias.data[IO_STATE_EMIT_BYTE] = -20.0
-        head.bias.data[IO_STATE_EMIT_THINKING] = -20.0
+        dim_positions = _setdim_to_positions(BD)
+        vocab_size = head.weight.shape[0]
+        ir = CompilerIR()
+        ir.embeddings.extend(_head_bake_rules(vocab_size, dim_positions))
+        ir.lower_token_embeddings(model, dim_positions)
