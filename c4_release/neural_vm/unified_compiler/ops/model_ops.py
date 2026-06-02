@@ -1,6 +1,6 @@
 """Model-level and post-pass op factories. See ../migrated_ops.py for history."""
 
-from ..ir import CompilerIR, FFNRule
+from ..ir import CompilerIR, FFNRule, TokenEmbeddingRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
@@ -814,11 +814,192 @@ def make_expand_wrapper_blocks_op() -> Operation:
     )
 
 
+def _head_bake_rules(vocab_size: int, dim_positions) -> tuple:
+    """Build the :class:`TokenEmbeddingRule` list mirroring ``setup_head_weights``.
+
+    The imperative helper in ``ops/shared.py`` (see ``setup_head_weights``)
+    walks the head's weight + bias as follows:
+
+      1. Zero both ``head.weight`` and ``head.bias``.
+      2. Build a ``next_flags`` list of NEXT_* dim names (some optional).
+      3. For each byte ``b in 0..255``:
+         - ``head.weight[b, OUTPUT_LO+lo] = 5.0``
+         - ``head.weight[b, OUTPUT_HI+hi] = 5.0``
+         - ``head.bias[b] = -5.0``
+         - For each ``flag in next_flags``: ``head.weight[b, flag] += -80.0``
+      4. ``head.bias[0] = -4.0`` (overrides the -5.0 from step 3).
+      5. For each (tok, flag_name) pair: ``head.weight[tok, D(flag_name)] = 20.0``
+         and ``head.bias[tok] = -10.0``.
+      6. For [CODE_START, CODE_END, DATA_START, DATA_END, SEP,
+         USER_INPUT_START, USER_INPUT_END]: ``head.bias[tok] = -50.0``.
+      7. ``head.bias[IO_STATE_EMIT_BYTE] = -20.0`` and
+         ``head.bias[IO_STATE_EMIT_THINKING] = -20.0``.
+
+    The rule lowering is accumulative (``+=``), so we follow exactly the same
+    sequence: the bake_fn zeroes ``head.weight`` / ``head.bias`` first, then
+    every rule is additive. The single ``=`` vs ``+=`` conflict is step 4,
+    which writes byte 0's bias to ``-4.0`` AFTER step 3 wrote ``-5.0``. We
+    emit a delta rule (``bias += +1.0`` for byte 0) so the final cell value
+    is ``-5.0 + 1.0 = -4.0`` — byte-identical.
+
+    The ``next_flags`` list is built from ``dim_positions`` so the rules
+    only reference dims that exist in the active layout (mirrors the
+    legacy helper's per-flag ``try: D(opt) except AttributeError``).
+    Marker / step-end rules likewise skip the flag-name lookup when the
+    dim is absent.
+    """
+    from ...vm_step import Token
+
+    rules: list[TokenEmbeddingRule] = []
+
+    # 2. Build the NEXT_* flags list (the optional flags only appear when
+    #    conversational I/O is enabled — same try/except semantics as
+    #    ``setup_head_weights``).
+    next_flags: list[str] = [
+        "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
+        "NEXT_STACK0", "NEXT_MEM", "NEXT_SE", "NEXT_HALT",
+    ]
+    for opt in ("NEXT_TOOL_CALL", "NEXT_THINKING_START", "NEXT_THINKING_END"):
+        if opt in dim_positions:
+            next_flags.append(opt)
+
+    byte_tokens = [b for b in range(min(256, vocab_size))]
+
+    # 3a. For each byte: head.weight[b, OUTPUT_LO+lo] = 5.0 and
+    #     head.weight[b, OUTPUT_HI+hi] = 5.0. Emit one rule per byte.
+    for b in byte_tokens:
+        lo = b & 0xF
+        hi = (b >> 4) & 0xF
+        rules.append(TokenEmbeddingRule.head_weight_write(
+            token_ids=[b],
+            writes=(
+                (f"OUTPUT_LO+{lo}", 5.0),
+                (f"OUTPUT_HI+{hi}", 5.0),
+            ),
+            name=f"head_bake_byte_{b}_output",
+        ))
+
+    # 3b. All bytes get -80.0 on every NEXT_* flag (the inner ``+=``).
+    #     Emit one rule per flag with token_ids=byte_tokens.
+    for flag in next_flags:
+        rules.append(TokenEmbeddingRule.head_weight_write(
+            token_ids=byte_tokens,
+            writes=((flag, -80.0),),
+            name=f"head_bake_byte_next_flag_{flag.lower()}",
+        ))
+
+    # 3c. All bytes get bias = -5.0.
+    rules.append(TokenEmbeddingRule.head_bias_write(
+        token_ids=byte_tokens,
+        value=-5.0,
+        name="head_bake_byte_bias_minus_five",
+    ))
+
+    # 4. byte 0's bias is overridden to -4.0. With ``+=`` semantics we
+    #    add +1.0 so the cell ends at -5.0 + 1.0 = -4.0.
+    if 0 < vocab_size:
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=[0],
+            value=1.0,
+            name="head_bake_byte_zero_bias_override_delta",
+        ))
+
+    # 5. Marker/step-end tokens: head.weight[tok, D(flag_name)] = 20.0
+    #    and head.bias[tok] = -10.0. The legacy helper's try/except
+    #    skips the entry when the flag dim is missing; we do the same.
+    for tok, flag_name in (
+        (Token.REG_PC, "NEXT_PC"),
+        (Token.REG_AX, "NEXT_AX"),
+        (Token.REG_SP, "NEXT_SP"),
+        (Token.REG_BP, "NEXT_BP"),
+        (Token.STACK0, "NEXT_STACK0"),
+        (Token.MEM, "NEXT_MEM"),
+        (Token.STEP_END, "NEXT_SE"),
+        (Token.HALT, "NEXT_HALT"),
+        (Token.TOOL_CALL, "NEXT_TOOL_CALL"),
+        (Token.THINKING_START, "NEXT_THINKING_START"),
+        (Token.THINKING_END, "NEXT_THINKING_END"),
+    ):
+        if tok >= vocab_size:
+            continue
+        if flag_name not in dim_positions:
+            continue
+        rules.append(TokenEmbeddingRule.head_weight_write(
+            token_ids=[tok],
+            writes=((flag_name, 20.0),),
+            name=f"head_bake_marker_weight_token_{tok}",
+        ))
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=[tok],
+            value=-10.0,
+            name=f"head_bake_marker_bias_token_{tok}",
+        ))
+
+    # 6. Section/special tokens: head.bias[tok] = -50.0.
+    section_tokens = [
+        tok for tok in (
+            Token.CODE_START, Token.CODE_END,
+            Token.DATA_START, Token.DATA_END,
+            Token.SEP, Token.USER_INPUT_START, Token.USER_INPUT_END,
+        ) if tok < vocab_size
+    ]
+    if section_tokens:
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=section_tokens,
+            value=-50.0,
+            name="head_bake_section_token_bias",
+        ))
+
+    # 7. IO_STATE_* bias = -20.0.
+    if Token.IO_STATE_EMIT_BYTE < vocab_size:
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=[Token.IO_STATE_EMIT_BYTE],
+            value=-20.0,
+            name="head_bake_io_state_emit_byte_bias",
+        ))
+    if Token.IO_STATE_EMIT_THINKING < vocab_size:
+        rules.append(TokenEmbeddingRule.head_bias_write(
+            token_ids=[Token.IO_STATE_EMIT_THINKING],
+            value=-20.0,
+            name="head_bake_io_state_emit_thinking_bias",
+        ))
+
+    return tuple(rules)
+
+
+def _head_bake_ir(dim_positions) -> CompilerIR:
+    """Build the head-bake :class:`CompilerIR`.
+
+    Built lazily from ``dim_positions`` because the optional ``NEXT_*``
+    convo-IO flags appear only when conversational I/O is enabled, mirroring
+    the legacy helper's ``try: D(opt) except AttributeError`` behaviour.
+    """
+    from ...vm_step import Token
+
+    ir = CompilerIR()
+    ir.embeddings.extend(_head_bake_rules(Token.VOCAB_SIZE, dim_positions))
+    return ir
+
+
 def make_head_bake_op() -> Operation:
     """Bake the output projection head: byte/marker token logits.
 
     Phase=1000 so it runs AFTER legacy_bake (phase=999); the corresponding
     head section in `set_vm_weights` has been removed to avoid double-bake.
+
+    Phase 7.D.2 migration: the imperative ``setup_head_weights`` helper is
+    replaced by an op-owned :class:`CompilerIR` carrying ~270 + 13
+    :class:`TokenEmbeddingRule`s (256 per-byte OUTPUT_LO/OUTPUT_HI writes,
+    one rule per NEXT_* flag for the -80.0 byte gating, one bulk
+    ``head.bias = -5.0`` write across all bytes, one ``+1.0`` delta on
+    byte 0 to override to ``-4.0``, plus marker / step-end / section /
+    IO_STATE bias and weight rules). The bake_fn zeroes ``head.weight``
+    and ``head.bias`` first (the IR has no zeroing primitive) and then
+    calls ``CompilerIR.lower_token_embeddings``. The single ``=`` /
+    ``+=`` conflict in the legacy helper -- ``head.bias[0] = -4.0``
+    overriding the prior ``-5.0`` -- is modelled as a ``+1.0`` delta
+    rule. Byte-identical to ``setup_head_weights`` for the canonical
+    ``_SetDim`` and the compact ``pin_io_only=True`` layouts.
 
     Claim-coverage note: ``claims`` is intentionally left empty. The static
     verifier in ``decl_verifier.py`` (``_diff_all_blocks_by_ptr``) diffs only
@@ -833,7 +1014,13 @@ def make_head_bake_op() -> Operation:
     only writer to ``head.{weight,bias}``, so collisions aren't a concern.
     """
     def _bake(model, dim_positions, S):
-        setup_head_weights(model.head, dim_positions)
+        del S
+        import torch
+        with torch.no_grad():
+            model.head.weight.zero_()
+            model.head.bias.zero_()
+        ir = _head_bake_ir(dim_positions)
+        ir.lower_token_embeddings(model, dim_positions)
 
     return Operation(
         name="head_bake",
@@ -844,9 +1031,187 @@ def make_head_bake_op() -> Operation:
         declarative_bake_fn=_bake,
         phase=1000,
         declarative_authority="declarative",
+        migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _embedding_bake_rules(vocab_size: int) -> tuple:
+    """Build the :class:`TokenEmbeddingRule` list mirroring ``setup_token_embeddings``.
+
+    Walks the same per-token write list as the imperative helper in
+    ``ops/shared.py`` (see ``setup_token_embeddings``) and emits one
+    :class:`TokenEmbeddingRule` per logical group of writes. Group structure:
+
+      1. ``CONST=1.0`` for every token id < ``vocab_size``.
+      2. Each register/section marker token writes ``MARK_<X>=1.0`` and
+         ``IS_MARK=1.0`` (one rule per token to keep dim names symbolic).
+      3. ``STACK0`` writes ``MARK_STACK0=1.0`` (no ``IS_MARK``).
+      4. ``STEP_END``/``DATA_END``/``HALT`` write ``MARK_SE=1.0`` + ``IS_MARK``.
+      5. ``STEP_END`` adds ``MARK_SE_ONLY=1.0``.
+      6. ``TOOL_CALL`` writes ``MARK_SE`` + ``IS_MARK`` + ``MARK_SE_ONLY`` +
+         ``CONST``.
+      7. ``THINKING_START`` and ``THINKING_END`` each write ``IS_MARK`` +
+         ``CONST`` + ``TEMP+{1,2}`` + ``MARK_THINKING_{START,END}``.
+      8. ``IO_STATE_EMIT_BYTE`` / ``IO_STATE_EMIT_THINKING`` each write
+         ``IS_MARK`` + ``CONST``.
+      9. Each byte token ``0..255`` writes ``IS_BYTE=1.0``, ``EMBED_LO+nibble``,
+         ``EMBED_HI+nibble``, ``CLEAN_EMBED_LO+nibble``, ``CLEAN_EMBED_HI+nibble``.
+
+    The rule lowering is accumulative (``+=``) -- mirroring the imperative
+    helper requires zeroing ``embed.weight`` first, which is still done in
+    the bake_fn (the IR has no zeroing primitive). After the zero, every
+    cell is written by at most one rule per token, so ``+=`` and ``=``
+    produce byte-identical results.
+    """
+    from ...vm_step import Token
+
+    rules: list[TokenEmbeddingRule] = []
+
+    # 1. CONST=1 for every token.
+    rules.append(TokenEmbeddingRule.embed_write(
+        token_ids=[tok for tok in range(vocab_size)],
+        writes=(("CONST", 1.0),),
+        name="embedding_bake_const_all_tokens",
+    ))
+
+    # 2. Register / section markers (MARK_<X> + IS_MARK).
+    for tok, dim_name in (
+        (Token.REG_PC, "MARK_PC"),
+        (Token.REG_AX, "MARK_AX"),
+        (Token.REG_SP, "MARK_SP"),
+        (Token.REG_BP, "MARK_BP"),
+        (Token.MEM, "MARK_MEM"),
+        (Token.CODE_START, "MARK_CS"),
+    ):
+        if tok < vocab_size:
+            rules.append(TokenEmbeddingRule.embed_write(
+                token_ids=[tok],
+                writes=((dim_name, 1.0), ("IS_MARK", 1.0)),
+                name=f"embedding_bake_marker_{dim_name.lower()}",
+            ))
+
+    # 3. STACK0 marker WITHOUT IS_MARK.
+    if Token.STACK0 < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.STACK0],
+            writes=(("MARK_STACK0", 1.0),),
+            name="embedding_bake_stack0_mark",
+        ))
+
+    # 4. Step-end / data-end / halt: MARK_SE + IS_MARK.
+    for tok in (Token.STEP_END, Token.DATA_END, Token.HALT):
+        if tok < vocab_size:
+            rules.append(TokenEmbeddingRule.embed_write(
+                token_ids=[tok],
+                writes=(("MARK_SE", 1.0), ("IS_MARK", 1.0)),
+                name=f"embedding_bake_se_token_{tok}",
+            ))
+
+    # 5. STEP_END additionally writes MARK_SE_ONLY.
+    if Token.STEP_END < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.STEP_END],
+            writes=(("MARK_SE_ONLY", 1.0),),
+            name="embedding_bake_step_end_se_only",
+        ))
+
+    # 6. TOOL_CALL: MARK_SE + IS_MARK + MARK_SE_ONLY + CONST. Note that
+    #    CONST was already written for every token by rule 1 above; the
+    #    imperative helper rewrote the same +1.0 (assignment, not add) which
+    #    leaves the cell at 1.0. With IR ``+=`` semantics we must NOT add a
+    #    second +1.0 to CONST here or we'd produce 2.0. Skip CONST here.
+    if Token.TOOL_CALL < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.TOOL_CALL],
+            writes=(
+                ("MARK_SE", 1.0),
+                ("IS_MARK", 1.0),
+                ("MARK_SE_ONLY", 1.0),
+            ),
+            name="embedding_bake_tool_call",
+        ))
+
+    # 7. Thinking markers. The dims MAY be undeclared (convo-IO off); the
+    #    bake_fn skips them via try/except in the legacy helper. We register
+    #    the rules unconditionally and let ``compare_symbolic_to_lowered_
+    #    embedding`` raise a ``declaration_semantics`` issue at validation
+    #    time when dims are missing, but the bake-time
+    #    ``lower_token_embeddings`` will resolve them through the proxy.
+    #    Reduce to a conditional rule list: only include the THINKING_*
+    #    rules when both the token AND the dims are present. Since dim
+    #    declarations are done via ``declare_setdim_compat_dims`` and
+    #    ``MARK_THINKING_*`` are always declared (see the ``one_dim`` list
+    #    in ``shared.py``), it's safe to register the rules unconditionally
+    #    when the tokens are in vocab.
+    if Token.THINKING_START < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.THINKING_START],
+            writes=(
+                ("IS_MARK", 1.0),
+                ("TEMP+1", 1.0),
+                ("MARK_THINKING_START", 1.0),
+            ),
+            name="embedding_bake_thinking_start",
+        ))
+    if Token.THINKING_END < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.THINKING_END],
+            writes=(
+                ("IS_MARK", 1.0),
+                ("TEMP+2", 1.0),
+                ("MARK_THINKING_END", 1.0),
+            ),
+            name="embedding_bake_thinking_end",
+        ))
+
+    # 8. IO_STATE_EMIT_*: IS_MARK (CONST already covered by rule 1).
+    if Token.IO_STATE_EMIT_BYTE < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.IO_STATE_EMIT_BYTE],
+            writes=(("IS_MARK", 1.0),),
+            name="embedding_bake_io_state_emit_byte",
+        ))
+    if Token.IO_STATE_EMIT_THINKING < vocab_size:
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[Token.IO_STATE_EMIT_THINKING],
+            writes=(("IS_MARK", 1.0),),
+            name="embedding_bake_io_state_emit_thinking",
+        ))
+
+    # 9. Byte tokens 0-255: IS_BYTE + nibble decoding. Group by (lo, hi)
+    #    nibble pair so each rule still carries symbolic dim names. There are
+    #    256 byte tokens, each with a unique (lo, hi) so we emit 256 rules.
+    #    IS_BYTE is +1.0 for all; group it into per-byte rules so the rule
+    #    stays self-contained.
+    for b in range(256):
+        if b >= vocab_size:
+            break
+        lo = b & 0xF
+        hi = (b >> 4) & 0xF
+        rules.append(TokenEmbeddingRule.embed_write(
+            token_ids=[b],
+            writes=(
+                ("IS_BYTE", 1.0),
+                (f"EMBED_LO+{lo}", 1.0),
+                (f"EMBED_HI+{hi}", 1.0),
+                (f"CLEAN_EMBED_LO+{lo}", 1.0),
+                (f"CLEAN_EMBED_HI+{hi}", 1.0),
+            ),
+            name=f"embedding_bake_byte_{b}",
+        ))
+
+    return tuple(rules)
+
+
+def _embedding_bake_ir() -> CompilerIR:
+    """Build the embedding-bake :class:`CompilerIR` (rules + lower target)."""
+    from ...vm_step import Token
+
+    ir = CompilerIR()
+    ir.embeddings.extend(_embedding_bake_rules(Token.VOCAB_SIZE))
+    return ir
 
 
 def make_embedding_bake_op() -> Operation:
@@ -855,9 +1220,25 @@ def make_embedding_bake_op() -> Operation:
     Phase=1001 so it runs AFTER legacy_bake (phase=999) and head_bake (1000);
     the corresponding embedding section in `set_vm_weights` has been removed
     to avoid double-bake.
+
+    Phase 7.D.2 migration: the imperative ``setup_token_embeddings`` helper
+    is replaced by an op-owned :class:`CompilerIR` containing one
+    :class:`TokenEmbeddingRule` per logical write group (CONST,
+    register markers, byte-nibble decoding, etc.). The bake_fn first zeroes
+    ``model.embed.embed.weight`` (mirroring the helper's ``.zero_()`` call —
+    the IR has no zeroing primitive) and then calls
+    ``CompilerIR.lower_token_embeddings``. Byte-identical to the imperative
+    path because every per-token cell is hit by at most one rule, so the
+    accumulating ``+=`` of rule lowering matches the helper's direct ``=``.
     """
+    _ir = _embedding_bake_ir()
+
     def _bake(model, dim_positions, S):
-        setup_token_embeddings(model.embed.embed.weight, dim_positions)
+        del S
+        import torch
+        with torch.no_grad():
+            model.embed.embed.weight.zero_()
+        _ir.lower_token_embeddings(model, dim_positions)
 
     # Dim-ownership claims. ``setup_token_embeddings`` calls ``embed_weight
     # .zero_()`` first, which differs from the fresh ``nn.Embedding`` random
@@ -877,12 +1258,46 @@ def make_embedding_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         declarative_bake_fn=_bake,
+        compiler_ir=_ir,
         phase=1001,
         declarative_authority="declarative",
+        migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+def _initial_pc_bake_ir() -> CompilerIR:
+    """Build the :class:`TokenEmbeddingRule` IR for ``initial_pc_bake``.
+
+    Mirrors the imperative bake bit-for-bit:
+      - ``embed[REG_PC, EMBED_LO + (PC_OFFSET & 0xF)] += 1.0``
+      - ``embed[REG_PC, EMBED_HI + ((PC_OFFSET >> 4) & 0xF)] += 1.0``
+
+    The rule lowering is accumulative (``+=``), and the imperative bake used
+    direct assignment (``=``) to +1.0 on cells previously zeroed by
+    ``setup_token_embeddings``. Since the embedding-table cells in question
+    are NOT also written by ``setup_token_embeddings`` for the ``REG_PC``
+    token (the token only gets ``MARK_PC``, ``IS_MARK``, and ``CONST``
+    set — none of which alias these EMBED_LO/HI nibble slots), the
+    ``+=`` semantics produce the same byte-identical 1.0 cell value.
+    """
+    from ...vm_step import Token
+    from ...constants import PC_OFFSET
+
+    ir = CompilerIR()
+    init_pc_lo = PC_OFFSET & 0xF
+    init_pc_hi = (PC_OFFSET >> 4) & 0xF
+    ir.embeddings.append(TokenEmbeddingRule.embed_write(
+        token_ids=[Token.REG_PC],
+        writes=(
+            (f"EMBED_LO+{init_pc_lo}", 1.0),
+            (f"EMBED_HI+{init_pc_hi}", 1.0),
+        ),
+        name="initial_pc_reg_pc_nibbles",
+    ))
+    return ir
 
 
 def make_initial_pc_bake_op() -> Operation:
@@ -903,30 +1318,20 @@ def make_initial_pc_bake_op() -> Operation:
     inline at `_set_layer3_ffn`) subtracts -1.0 from those same EMBED_LO/HI
     dims at MARK_PC AND HAS_SE positions — leaving step-1+ residuals
     bit-identical to the pre-migration behavior.
+
+    Phase 7.D.2 migration: the imperative body is replaced by an op-owned
+    :class:`CompilerIR` carrying a single :class:`TokenEmbeddingRule` (one
+    rule, two writes — the EMBED_LO and EMBED_HI nibble columns derived
+    from ``PC_OFFSET``). The bake_fn delegates to
+    ``CompilerIR.lower_token_embeddings``. Byte-identical to the prior
+    imperative path because the IR rule writes ``+1.0`` to cells that
+    ``setup_token_embeddings`` (phase=1001) leaves at 0 for ``REG_PC``.
     """
+    _ir = _initial_pc_bake_ir()
+
     def _bake(model, dim_positions, S):
-        import torch
-        from ...vm_step import Token
-        from ...constants import PC_OFFSET
-
-        def D(name):
-            if dim_positions is not None and name in dim_positions:
-                return dim_positions[name]
-            from ...vm_step import _SetDim
-            return getattr(_SetDim, name)
-
-        embed_weight = model.embed.embed.weight
-        if Token.REG_PC >= embed_weight.shape[0]:
-            return  # No REG_PC token in vocab (shouldn't happen).
-
-        embed_lo = D("EMBED_LO")
-        embed_hi = D("EMBED_HI")
-        init_pc_lo = PC_OFFSET & 0xF
-        init_pc_hi = (PC_OFFSET >> 4) & 0xF
-
-        with torch.no_grad():
-            embed_weight[Token.REG_PC, embed_lo + init_pc_lo] = 1.0
-            embed_weight[Token.REG_PC, embed_hi + init_pc_hi] = 1.0
+        del S
+        _ir.lower_token_embeddings(model, dim_positions)
 
     # Dim-ownership claims. The bake adds two non-zero values into the REG_PC
     # row of the token-embedding table (column EMBED_LO + (PC_OFFSET & 0xF)
@@ -944,8 +1349,10 @@ def make_initial_pc_bake_op() -> Operation:
         kind="model",
         bake_fn=_bake,
         declarative_bake_fn=_bake,
+        compiler_ir=_ir,
         phase=1001.5,
         declarative_authority="declarative",
+        migrated=True,
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
