@@ -7,19 +7,30 @@ from ..primitives import Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L11 FFN unit layout (pinned offsets) ===========================
+# === L11 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
 #
 # The ``layer11_mul_partial`` op owns the entire L11 FFN. As of Wave 4D
 # the weight writes are fully declarative: a 4096-rule ``FFNRule`` IR
 # (see ``_layer11_mul_partial_rules`` / ``_layer11_mul_partial_ir``)
 # walks a schoolbook ``(a_lo, b_lo, b_hi)`` triple-loop and fills all
-# 4096 hidden units (16^3) via ``Primitives.lower_ffn_rules``. The
-# pinned offsets in this table declare each ``a_lo`` slab so the layout
-# is auditable rather than implicit. Adding a new L11 op family later
-# will go through ``allocator.alloc(name, n)`` without a pin, but since
-# the MUL partial rules already saturate the 4096-unit pool there are
-# no free gaps; a future op family would have to widen
-# ``layer_max_units=`` or evict a slab.
+# 4096 hidden units (16^3) via ``Primitives.lower_ffn_rules``.
+#
+# Phase 7.B.4: every entry below is auto-placed by
+# :class:`FFNUnitAllocator` first-fit. Because the layout is fully
+# contiguous in declaration order (slab ``a_lo`` lands at
+# ``a_lo * 256``, and the iteration is in increasing ``a_lo`` order),
+# first-fit reproduces the legacy pinned offsets bit-for-bit. The IR
+# lowerer (``Primitives.lower_ffn_rules``) walks a monotonic
+# ``unit = start_unit`` counter starting at 0 and writes the weights,
+# independent of the allocator's chosen indices, so byte-identity is
+# preserved regardless of allocator order. The ``legacy_start`` column
+# is documentation only.
+#
+# Adding a new L11 op family later will go through
+# ``allocator.alloc(name, n)`` and the allocator will report no free
+# gap (the MUL partial rules already saturate the 4096-unit pool); a
+# future op family would have to widen ``layer_max_units=`` or evict a
+# slab.
 #
 # The offsets below mirror the rule order in
 # ``_layer11_mul_partial_rules`` (and the legacy
@@ -29,7 +40,7 @@ from .shared import _as_setdim_proxy
 # Changing the rule loop structure requires updating this table in
 # lock-step.
 _L11_MUL_PARTIAL_UNIT_LAYOUT = tuple(
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     (f"layer11_mul_partial.a_lo_{a_lo:02d}", a_lo * 256, 256)
     for a_lo in range(16)
 )
@@ -38,23 +49,30 @@ _L11_MUL_PARTIAL_UNIT_LAYOUT = tuple(
 def _allocate_layer11_mul_partial_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` for the L11 MUL partial.
 
-    Every ``a_lo`` slab is pinned at its existing offset so the
-    declarative ``_lower_layer11_mul_partial_rules`` call -- which lowers
-    via the IR lowerer's monotonic ``unit = start_unit`` counter -- lands
-    on exactly the same hidden-unit indices the legacy
-    ``_set_layer11_mul_partial`` helper used. This call is byte-identical
-    bookkeeping: the allocator declares ranges by name, the IR lowerer
-    writes the weights. A future refactor can split the monolithic rule
-    list into per-slab bake fragments that consume
-    ``allocator.alloc(...)`` directly.
+    Phase 7.B.4: ``pin=`` is dropped from every entry in
+    :data:`_L11_MUL_PARTIAL_UNIT_LAYOUT`. The allocator's default
+    first-fit strategy walks the layout in declaration order and lands
+    each ``a_lo`` slab at the lowest free gap large enough to hold it
+    (256 units). Because the layout is fully contiguous (slab ``a_lo``
+    is declared in increasing order and each occupies exactly 256
+    units), first-fit reproduces the legacy pinned offsets bit-for-bit
+    (slab ``a_lo`` lands at ``a_lo * 256``). The IR lowerer
+    (``Primitives.lower_ffn_rules``) walks its own monotonic
+    ``unit = start_unit`` counter starting at 0 to position the actual
+    weight writes, so byte-identity with the legacy
+    ``_set_layer11_mul_partial`` bake is preserved regardless of
+    allocator order. The allocator's role is bookkeeping: the layout
+    declares ranges by name, the IR lowerer writes the weights. A
+    future refactor can split the monolithic rule list into per-slab
+    bake fragments that consume ``allocator.alloc(...)`` directly.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L11 op that widens ``layer_max_units=`` and claims a fresh
     range past unit 4096).
     """
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L11_MUL_PARTIAL_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L11_MUL_PARTIAL_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
