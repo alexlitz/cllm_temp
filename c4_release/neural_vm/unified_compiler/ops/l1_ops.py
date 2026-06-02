@@ -8,50 +8,58 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L1 FFN unit layout (pinned offsets) ============================
+# === L1 FFN unit layout (auto-fit offsets, Phase 7.B.1) =============
 #
 # The ``layer1_ffn`` op owns the entire L1 FFN. The weight writes happen
 # via ``_layer1_ffn_rules`` (a list of :class:`FFNRule` declarations)
 # which is lowered by ``Primitives.lower_ffn_rules`` through
 # ``CompilerIR.lower_ffn``. Each rule consumes one hidden unit and they
 # are appended monotonically starting at ``start_unit=0`` -- so the 5
-# rules land on units 0..4 in the order declared. The
-# :class:`FFNUnitAllocator` below declares those same offsets by name so
-# the layout is auditable rather than implicit. Adding a new L1 op
-# family later will go through ``allocator.alloc(name, n)`` without a
-# pin, and the allocator will pick the first free gap past unit 5.
+# rules land on units 0..4 in the order declared. The actual FFN weight
+# writes are bound to the ``lower_ffn_rules`` cursor (always 0..4 in
+# declaration order), NOT to the allocator, so dropping the pins is
+# purely bookkeeping.
 #
-# The offsets below mirror the rule order in ``_layer1_ffn_rules``
+# Phase 7.B.1: ``pin`` is dropped from every entry. The allocator is
+# constructed in ``"dynamic_first_fit"`` mode and walks the layout in
+# declaration order; first-fit on a 4096-wide pool lands the 5
+# single-unit sub-stages back at indices 0..4 -- byte-identical to the
+# legacy pins -- but the author no longer supplies the offsets. A
+# future L1 op family can claim a free range past unit 5 via
+# ``allocator.alloc(name, n)`` without a pin.
+#
+# The order below mirrors the rule order in ``_layer1_ffn_rules``
 # (STACK0_BYTE0 followed by the four BYTE_INDEX_i thresholds).
 # Changing the rule list requires updating this table in lock-step.
 _L1_FFN_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
-    ("layer1_ffn.stack0_byte0",   0, 1),  # STACK0_BYTE0 from L1H4 + IS_BYTE
-    ("layer1_ffn.byte_index_0",   1, 1),  # BYTE_INDEX_0 from L1H1 vs L1H0
-    ("layer1_ffn.byte_index_1",   2, 1),  # BYTE_INDEX_1 from L1H2 vs L1H1
-    ("layer1_ffn.byte_index_2",   3, 1),  # BYTE_INDEX_2 from H0   vs L1H2
-    ("layer1_ffn.byte_index_3",   4, 1),  # BYTE_INDEX_3 from H1   vs H0
+    # (sub-stage name, n_units) -- ``pin=None`` everywhere; offsets are
+    # picked by the FFNUnitAllocator in ``dynamic_first_fit`` mode.
+    ("layer1_ffn.stack0_byte0",   1),  # STACK0_BYTE0 from L1H4 + IS_BYTE
+    ("layer1_ffn.byte_index_0",   1),  # BYTE_INDEX_0 from L1H1 vs L1H0
+    ("layer1_ffn.byte_index_1",   1),  # BYTE_INDEX_1 from L1H2 vs L1H1
+    ("layer1_ffn.byte_index_2",   1),  # BYTE_INDEX_2 from H0   vs L1H2
+    ("layer1_ffn.byte_index_3",   1),  # BYTE_INDEX_3 from H1   vs H0
 )
 
 
 def _allocate_layer1_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L1 FFN sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the
-    ``_layer1_ffn_rules`` lowering -- which appends one hidden unit per
-    rule starting at ``start_unit=0`` -- lands on exactly the same
-    hidden-unit indices it always has. This call is byte-identical
-    bookkeeping: the allocator declares ranges by name, the rule
-    lowering writes the weights. A future refactor can split the rule
-    list into per-range bake functions that consume
-    ``allocator.alloc(...)`` directly.
+    Phase 7.B.1 auto-fit: the allocator is built in
+    ``dynamic_first_fit`` mode with no ``pin=`` hints. Each sub-stage
+    is allocated in declaration order; first-fit picks the lowest free
+    unit each call, so the 5 single-unit sub-stages land at indices
+    0..4 -- byte-identical to the legacy pinned offsets. The
+    ``_layer1_ffn_rules`` lowering still drives weight writes at
+    ``start_unit=0`` via ``Primitives.lower_ffn_rules`` so the
+    allocator's pick is bookkeeping only.
 
     Returns the allocator so callers can inspect or extend it (e.g. a
     future L1 op claims a free range past unit 5).
     """
-    allocator = FFNUnitAllocator()
-    for name, start, n_units in _L1_FFN_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    allocator = FFNUnitAllocator(strategy="dynamic_first_fit")
+    for name, n_units in _L1_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
@@ -151,11 +159,13 @@ def make_layer1_ffn_op() -> Operation:
     def bake(ffn, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
 
-        # Per-bake FFN-unit allocator. Each L1 FFN sub-stage is pinned to
-        # its existing offset so the call below lands byte-identically.
-        # Stashed on the FFN module so downstream tools (e.g. a future
-        # L1 op family claiming a free gap) can inspect or extend the
-        # layout. Mirrors the L9 convention from ca775eb.
+        # Per-bake FFN-unit allocator (Phase 7.B.1 auto-fit). The allocator
+        # is built in ``dynamic_first_fit`` mode without pin hints; the
+        # 5 single-unit sub-stages land at indices 0..4 by first-fit, the
+        # same offsets the legacy pins produced. Stashed on the FFN module
+        # so downstream tools (e.g. a future L1 op family claiming a free
+        # gap) can inspect or extend the layout. Mirrors the L9 convention
+        # from ca775eb.
         allocator = _allocate_layer1_ffn_units()
         ffn._l1_unit_allocator = allocator
 
@@ -163,7 +173,7 @@ def make_layer1_ffn_op() -> Operation:
         # Byte-identity guard: the FFNRule lowering MUST write exactly the
         # number of hidden units the allocator table declares. Mirrors the
         # L0 phase_a_ffn assertion in ``_bake_phase_a_ffn``.
-        expected_total = sum(n for _, _, n in _L1_FFN_UNIT_LAYOUT)
+        expected_total = sum(n for _, n in _L1_FFN_UNIT_LAYOUT)
         assert n0 == expected_total, (
             f"L1 layer1_ffn unit cursor drift: rules wrote {n0} units, "
             f"allocator declared {expected_total}"

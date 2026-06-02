@@ -69,7 +69,7 @@ def _l2_head_idx(op_name: str) -> int:
     raise KeyError(f"_l2_head_idx: unknown L2 attention op {op_name!r}")
 
 
-# === L2 FFN unit layout (pinned offsets) ============================
+# === L2 FFN unit layout (auto-fit offsets, Phase 7.B.1) =============
 #
 # Two ops share the L2 FFN today:
 #
@@ -86,29 +86,49 @@ def _l2_head_idx(op_name: str) -> int:
 # attribute writes. Both bakes still stash the allocator on
 # ``ffn._l2_unit_allocator`` so downstream tooling can inspect the
 # layout, mirroring the L9 convention.
+#
+# Phase 7.B.1: ``pin`` is dropped from every entry. The allocator is
+# constructed in ``"dynamic_first_fit"`` mode and walks the layout in
+# declaration order; with the 8-unit flags claim first and the two
+# 1-unit cancel taps second/third, first-fit on a 4096-wide pool
+# lands them at indices 0..7 / 8 / 9 -- byte-identical to the legacy
+# pins. Both bakes read back the allocator-assigned ``start_unit`` via
+# ``allocator.ranges()`` and pass it to ``Primitives.lower_ffn_rules``,
+# so the auto-fit pick is what drives the actual weight offsets here
+# (unlike L0/L1 where ``start_unit=0`` was hard-coded). The
+# contiguity invariant for ``lo``/``hi`` (which lower in a single
+# ``lower_ffn_rules`` call) still holds because they are declared
+# consecutively and the allocator is deterministic.
 _L2_FFN_UNIT_LAYOUT = (
-    # (sub-stage name, pinned start, n_units)
-    ("layer2_mem_byte_flags.flags",         0, 8),  # MEM_VAL + BYTE_INDEX
-    ("layer2_initial_pc_bake_cancel.lo",    8, 1),  # EMBED_LO cancel
-    ("layer2_initial_pc_bake_cancel.hi",    9, 1),  # EMBED_HI cancel
+    # (sub-stage name, n_units) -- ``pin=None`` everywhere; offsets are
+    # picked by the FFNUnitAllocator in ``dynamic_first_fit`` mode.
+    ("layer2_mem_byte_flags.flags",         8),  # MEM_VAL + BYTE_INDEX
+    ("layer2_initial_pc_bake_cancel.lo",    1),  # EMBED_LO cancel
+    ("layer2_initial_pc_bake_cancel.hi",    1),  # EMBED_HI cancel
 )
 
 
 def _allocate_layer2_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L2 FFN sub-stages.
 
-    Every sub-stage is pinned at its existing offset so the underlying
-    bake helpers -- which still write the same weights to the same
-    indices -- land byte-identically. Both ``layer2_mem_byte_flags`` and
-    ``layer2_initial_pc_bake_cancel`` call this so each can look up its
-    own start unit by name without depending on a cross-op
-    ``_l2_unit_counter`` attribute. A future L2 FFN op family can claim
-    a free range past unit 10 via ``allocator.alloc(name, n)`` without a
-    pin.
+    Phase 7.B.1 auto-fit: the allocator is built in
+    ``dynamic_first_fit`` mode with no ``pin=`` hints. Each sub-stage
+    is allocated in declaration order; first-fit picks the lowest free
+    unit each call, so the 8-unit flags range lands at [0, 8) and the
+    two cancel taps land at 8 and 9 -- byte-identical to the legacy
+    pinned offsets. Both ``layer2_mem_byte_flags`` and
+    ``layer2_initial_pc_bake_cancel`` read their own ``start_unit``
+    from ``allocator.ranges()`` and feed it to
+    ``Primitives.lower_ffn_rules`` so the auto-fit pick drives the
+    actual weight offsets. The two cancel ranges (.lo / .hi) stay
+    contiguous because they are declared consecutively in the layout
+    and first-fit is deterministic. A future L2 FFN op family can
+    claim a free range past unit 10 via ``allocator.alloc(name, n)``
+    without a pin.
     """
-    allocator = FFNUnitAllocator()
-    for name, start, n_units in _L2_FFN_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    allocator = FFNUnitAllocator(strategy="dynamic_first_fit")
+    for name, n_units in _L2_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     return allocator
 
 
@@ -213,9 +233,12 @@ def make_layer2_mem_byte_flags_op() -> Operation:
     ``compare_symbolic_to_lowered_ffn`` see the same declarations.
     """
     def bake(ffn, dim_positions, S):
-        # Per-bake FFN-unit allocator. Pin every existing L2 range so the
-        # underlying weight writes land byte-identically; expose the
-        # allocator for inspection on the FFN module.
+        # Per-bake FFN-unit allocator (Phase 7.B.1 auto-fit). Built in
+        # ``dynamic_first_fit`` mode without pin hints; the 8-unit flags
+        # range lands at [0, 8) by first-fit -- the same offset the
+        # legacy pin produced. Reads the assigned ``start_unit`` from
+        # the allocator and passes it to ``lower_ffn_rules`` so the
+        # auto-fit pick is the source of truth for the weight offset.
         allocator = _allocate_layer2_ffn_units()
         flags_range = next(
             r for r in allocator.ranges()
@@ -376,10 +399,13 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
     """
     def bake(block, dim_positions, S):
         ffn = block.ffn
-        # Per-bake allocator with the full L2 FFN layout pinned. Looking
-        # up the cancel-op ranges by name keeps the start unit identical
-        # to the legacy ``_l2_unit_counter`` value (8 / 9) without
-        # depending on any prior op having mutated the FFN module.
+        # Per-bake allocator with the full L2 FFN layout in auto-fit mode
+        # (Phase 7.B.1). The flags op pre-claims 8 units, then the cancel
+        # taps land at 8 / 9 by first-fit -- the same offsets the legacy
+        # ``_l2_unit_counter`` value produced. Looking up the cancel-op
+        # ranges by name resolves each tap's ``start_unit`` from the
+        # allocator without depending on any prior op having mutated the
+        # FFN module.
         allocator = _allocate_layer2_ffn_units()
         ffn._l2_unit_allocator = allocator
         lo_range = next(
