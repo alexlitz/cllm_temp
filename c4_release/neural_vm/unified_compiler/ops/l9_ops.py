@@ -302,6 +302,51 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+    """SUB hi-nibble cross-product (512 units).
+
+    Mirrors the SUB loop in :func:`vm_step._set_layer9_alu` -- 4-way
+    AND at the AX marker over ``ALU_HI[a]`` (stack-top high nibble) and
+    ``AX_CARRY_HI[b]`` (AX high nibble) with borrow-in discrimination on
+    ``CARRY[0]``. SUB computes ``stack_top - AX = a - b``, so the
+    written nibble is ``(a - b - borrow_in) % 16``. Gated by ``OP_SUB``.
+    """
+
+    rules: list[FFNRule] = []
+    for borrow_in in (0, 1):
+        for a in range(16):
+            for b in range(16):
+                result = (a - b - borrow_in) % 16
+                if borrow_in == 0:
+                    conditions = (
+                        ("MARK_AX", 1.0),
+                        ("MARK_PC", -2.0),
+                        (f"ALU_HI+{a}", 1.0),
+                        (f"AX_CARRY_HI+{b}", 1.0),
+                        ("CARRY+0", -2.0),
+                    )
+                    threshold = 2.5
+                else:
+                    conditions = (
+                        ("MARK_AX", 1.0),
+                        ("MARK_PC", -2.0),
+                        (f"ALU_HI+{a}", 1.0),
+                        (f"AX_CARRY_HI+{b}", 1.0),
+                        ("CARRY+0", 2.0),
+                    )
+                    threshold = 4.5
+                rules.append(FFNRule.gated_write(
+                    name=f"l9_sub_hi_b{borrow_in}_a{a}_b{b}",
+                    conditions=conditions,
+                    threshold=threshold,
+                    gate="OP_SUB",
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
+                ))
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 
