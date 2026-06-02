@@ -2505,7 +2505,14 @@ def make_layer10_alu_op() -> Operation:
     return Operation(
         name="layer10_alu",
         phase=10.2,
-        reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "ALU_HI", "AX_CARRY_HI",
+        # Phase 9.B (ALU_HI SCC rename): ALU_HI -> ALU_HI.*.-1 marks the
+        # read as SSA cross-step. L10 stack0_byte_relay_bake (phase 10.4)
+        # writes ALU_HI for the NEXT step's L9/L10 consumption; same-step
+        # fresh ALU_HI from L7 operand_gather is still observed via
+        # consumes_fresh (ALU_HI@AX_byte0) below. Same numeric slot via
+        # SSA alias; byte-identical bake. Breaks 1 L10.4 -> L10.2
+        # back-edge.
+        reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "ALU_HI.*.-1", "AX_CARRY_HI",
                "OP_OR", "OP_XOR", "OP_AND", "OP_DIV", "OP_MOD"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "DIV_STAGING"},
         kind="block",
