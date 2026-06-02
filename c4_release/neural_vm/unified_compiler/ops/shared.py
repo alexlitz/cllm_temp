@@ -611,12 +611,9 @@ def declare_setdim_compat_dims(
         "IO_IN_OUTPUT_MODE", "IO_OUTPUT_COMPLETE",
         "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
         "OP_ENT", "OP_ADJ", "OP_LEV",
-        # Phase 8.A PREV_STEP infrastructure: OP_LEV_PREV_STEP alias
-        # (declared right after OP_LEV so the base's pinned position is
-        # already in ``compiler._pinned`` when the alias is declared,
-        # mirroring the OUTPUT_LO_PREV_STEP pattern). 6 OP_LEV back-edges
-        # in the latest scheduler analyzer report. See ``_ALIAS_OF`` below.
-        "OP_LEV_PREV_STEP",
+        # Phase 9.C: OP_LEV_PREV_STEP alias retired - corpus reads now
+        # use SSA spellings (OP_LEV.<writer>.-1) instead of the
+        # numeric alias.
         "OP_LI", "OP_LC",
         "OP_SI", "OP_SC", "OP_PSH",
         "OP_OR", "OP_XOR", "OP_AND", "OP_EQ", "OP_NE", "OP_LT",
@@ -677,109 +674,39 @@ def declare_setdim_compat_dims(
                  "L1H0", "L1H1", "L1H2", "L1H4", "L2H0"]
     # 16-dim nibble groups
     sixteen_dim = ["EMBED_LO",
-                   # Phase 8.A PREV_STEP infrastructure: EMBED_LO/HI_PREV_STEP
-                   # aliases break the L4 pc_relay → L3 carry_forward_attn /
-                   # L3 ffn back-edges on EMBED_LO/HI (3 back-edges each in
-                   # the latest scheduler analyzer report). Declared right
-                   # after each base so the base's pinned position is in
-                   # ``compiler._pinned`` when the alias is declared. See
-                   # ``_ALIAS_OF`` below.
-                   "EMBED_LO_PREV_STEP",
-                   "EMBED_HI", "EMBED_HI_PREV_STEP",
+                   "EMBED_HI",
                    "OUTPUT_LO", "OUTPUT_HI",
-                   # B9 OUTPUT_HI split: OUTPUT_HI_THIS_STEP is the new
+                   # B9 OUTPUT_HI split: OUTPUT_HI_THIS_STEP is the
                    # canonical name for the same-step write band. Same
                    # numeric base as OUTPUT_HI in _SetDim (190) so baked
                    # weight indices are byte-identical; the alias keeps
                    # ``BD.OUTPUT_HI`` lookups in legacy bake bodies
-                   # working unchanged. The 2 cross-step readers
+                   # working unchanged. Phase 9.C retired the sibling
+                   # ``OUTPUT_HI_PREV_STEP`` alias - cross-step readers
                    # (layer3_carry_forward_attn head 5,
-                   # layer8_head6_ax_carry_refresh) still read the same
-                   # numeric slot but acknowledge the prev-step semantic
-                   # via ``requires["after"]``. See
-                   # docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
+                   # layer8_head6_ax_carry_refresh) now use SSA reads
+                   # plus ``requires["after"]`` for the cross-step
+                   # boundary. See docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
                    "OUTPUT_HI_THIS_STEP",
-                   # Phase 8.A G7: OUTPUT_HI_PREV_STEP is the cross-step
-                   # alias for all OUTPUT_HI readers that fire at an
-                   # earlier static layer than any same-step OUTPUT_HI
-                   # writer. Same numeric base as OUTPUT_HI (190) so
-                   # baked weight cells are byte-identical. Declared
-                   # right after OUTPUT_HI_THIS_STEP so the alias
-                   # inherits the pinned position via ``_ALIAS_OF`` below.
-                   "OUTPUT_HI_PREV_STEP",
-                   # Phase 7.A.3 OUTPUT_LO split: OUTPUT_LO_PREV_STEP is
-                   # the cross-step alias for the L3 head 5 / L8 head 6
-                   # attention-back reads. Same numeric base as OUTPUT_LO
-                   # (174) so bakes stay byte-identical.
-                   "OUTPUT_LO_PREV_STEP",
                    "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
-                   # Phase 8.A.6 v2: PREV_STEP aliases for the ALU/AX_CARRY
-                   # bands. Same numeric base as ALU_LO / AX_CARRY_{LO,HI}.
-                   # Used by cross-step readers (ops that fire BEFORE the
-                   # next writer of the band in the same step) to break the
-                   # ALU_LO / AX_CARRY_HI back-edges in the dynamic
-                   # scheduler dep graph. Mirrors B9 OUTPUT_HI_THIS_STEP /
-                   # 7.A.3 OUTPUT_LO_PREV_STEP / 7.A.3.b TEMP_PREV_STEP.
-                   # Declared after each base so the alias inherits the
-                   # pinned position via ``_ALIAS_OF`` below.
-                   "ALU_LO_PREV_STEP",
-                   "AX_CARRY_LO_PREV_STEP", "AX_CARRY_HI_PREV_STEP",
                    "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                    "FETCH_LO", "FETCH_HI", "MUL_ACCUM", "DIV_STAGING",
                    "AX_FULL_LO", "AX_FULL_HI",
                    "OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
-                   # Phase 8.A SCC step 6: OPCODE_BYTE_LO_PREV_STEP alias
-                   # for the same 16-slot band. L5 opcode-decode readers
-                   # (``opcode_decode_ffn`` and
-                   # ``_opcode_decode_ffn_dep_anchor``) declare their reads
-                   # against this alias so the writes/reads edge from
-                   # ``layer5_fetch`` is removed from the SCC dep graph.
-                   # Same numeric base as OPCODE_BYTE_LO so baked weight
-                   # cells are byte-identical. Declared AFTER the base so
-                   # the alias inherits the pinned position via
-                   # ``_ALIAS_OF`` below.
-                   "OPCODE_BYTE_LO_PREV_STEP",
                    "ADDR_B0_LO",
-                   # Phase 8.A PREV_STEP infrastructure: ADDR_B0_{LO,HI}_PREV_STEP
-                   # aliases. ADDR_B0_HI has 4-5 back-edges in the latest
-                   # scheduler analyzer report (L9 lev_addr_relay → L8
-                   # mem_to_alu, L13 mem_addr_gather → L8 mem_to_alu, etc.);
-                   # ADDR_B0_LO appears as a low-count back-edge. Declared
-                   # right after each base so the pinned position is
-                   # available. See ``_ALIAS_OF`` below.
-                   "ADDR_B0_LO_PREV_STEP",
-                   # Phase 8.A PREV_STEP infrastructure: ADDR_B{1,2}_LO_PREV_STEP
-                   # aliases. ADDR_B1_LO / ADDR_B2_LO show up as 2-each
-                   # back-edges from L13 mem_addr_gather / L12 attn anchor
-                   # into L8 mem_to_alu. Same numeric base; bake-position
-                   # unchanged. See ``_ALIAS_OF`` below.
-                   "ADDR_B1_LO", "ADDR_B1_LO_PREV_STEP",
-                   "ADDR_B2_LO", "ADDR_B2_LO_PREV_STEP",
-                   "ADDR_B0_HI", "ADDR_B0_HI_PREV_STEP",
-                   # Phase 8.A PREV_STEP infrastructure: ADDR_B{1,2}_HI_PREV_STEP
-                   # aliases mirror the LO-side aliases above.
-                   "ADDR_B1_HI", "ADDR_B1_HI_PREV_STEP",
-                   "ADDR_B2_HI", "ADDR_B2_HI_PREV_STEP",
+                   "ADDR_B1_LO",
+                   "ADDR_B2_LO",
+                   "ADDR_B0_HI",
+                   "ADDR_B1_HI",
+                   "ADDR_B2_HI",
                    "FORMAT_PTR_LO", "FORMAT_PTR_HI",
                    "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"]
-    # Phase 8.A PREV_STEP infrastructure: CARRY_PREV_STEP / CMP_PREV_STEP
-    # aliases break L10 carry_relay → L9 alu and similar cross-step back-
-    # edges in the dep graph. Same numeric base as CARRY / CMP. See
-    # ``_ALIAS_OF`` below. No ops migrated in this pass.
-    four_dim = ["CARRY", "CARRY_PREV_STEP"]
-    eight_dim = ["CMP", "CMP_PREV_STEP"]
-    forty_eight_dim = ["ADDR_KEY",
-                      # Phase 8.A.6 v2: PREV_STEP alias for ADDR_KEY. Same
-                      # numeric base. Used by cross-step readers (L4/L5/L8/L9
-                      # ops that fire before L7/L14 writers in the same step).
-                      # See ALU_LO / AX_CARRY *_PREV_STEP comment above.
-                      "ADDR_KEY_PREV_STEP"]
-    thirty_two_dim = ["TEMP",
-                      # Phase 7.A.3 TEMP split: TEMP_PREV_STEP cross-step
-                      # alias mirrors the B9 OUTPUT_HI / 7.A.3.b OUTPUT_LO
-                      # PREV_STEP pattern. Same numeric base (480) so bakes
-                      # stay byte-identical.
-                      "TEMP_PREV_STEP"]
+    # Phase 9.C: CARRY/CMP/ADDR_KEY/TEMP PREV_STEP aliases retired -
+    # corpus reads now use SSA spellings (``<DIM>.<writer>.-1``).
+    four_dim = ["CARRY"]
+    eight_dim = ["CMP"]
+    forty_eight_dim = ["ADDR_KEY"]
+    thirty_two_dim = ["TEMP"]
 
     # Cursor for the compact IO block when pin_io_only=True. IO dims are
     # pinned at consecutive positions starting at 0, in declaration order
@@ -795,50 +722,12 @@ def declare_setdim_compat_dims(
     # is declared. See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §6.4.
     _ALIAS_OF = {
         "OUTPUT_HI_THIS_STEP": "OUTPUT_HI",
-        # Phase 8.A G7: PREV_STEP alias for cross-step OUTPUT_HI reads.
-        "OUTPUT_HI_PREV_STEP": "OUTPUT_HI",
-        # Phase 7.A.3 OUTPUT_LO split: PREV_STEP alias for cross-step reads.
-        "OUTPUT_LO_PREV_STEP": "OUTPUT_LO",
-        # Phase 7.A.3 TEMP split: PREV_STEP alias for future cross-step reads.
-        "TEMP_PREV_STEP": "TEMP",
-        # Phase 8.A.6 v2: PREV_STEP aliases break back-edges on ADDR_KEY,
-        # ALU_LO, and AX_CARRY_{LO,HI} in the dynamic scheduler dep graph.
-        # Each alias shares the same numeric position as its base so baked
-        # weight cells are byte-identical.
-        "ADDR_KEY_PREV_STEP": "ADDR_KEY",
-        "ALU_LO_PREV_STEP": "ALU_LO",
-        "AX_CARRY_LO_PREV_STEP": "AX_CARRY_LO",
-        "AX_CARRY_HI_PREV_STEP": "AX_CARRY_HI",
-        # Phase 8.A PREV_STEP infrastructure: aliases for additional
-        # residual dims that show up as back-edges in the latest
-        # ``tools/analyze_scheduler.py`` report (OP_LEV: 6, ADDR_B0_HI:
-        # 4-5, EMBED_LO: 3, EMBED_HI: 3, CARRY: 3, CMP: 1-2,
-        # ADDR_B0_LO: 1). Each alias shares the same numeric position
-        # as its base so baked weight cells are byte-identical. No ops
-        # are migrated in this pass — this is infrastructure for future
-        # cross-step reader migrations.
-        "EMBED_LO_PREV_STEP": "EMBED_LO",
-        "EMBED_HI_PREV_STEP": "EMBED_HI",
-        "ADDR_B0_LO_PREV_STEP": "ADDR_B0_LO",
-        "ADDR_B0_HI_PREV_STEP": "ADDR_B0_HI",
-        # Phase 8.A PREV_STEP infrastructure: ADDR_B{1,2}_{LO,HI}_PREV_STEP
-        # aliases retire L13/L12-anchor → L8 mem_to_alu back-edges (2 each)
-        # on the ADDR_B1/B2 nibble bands. Numeric base shared with the
-        # respective ADDR_B1/B2_{LO,HI} writers; baked weight cells are
-        # byte-identical.
-        "ADDR_B1_LO_PREV_STEP": "ADDR_B1_LO",
-        "ADDR_B2_LO_PREV_STEP": "ADDR_B2_LO",
-        "ADDR_B1_HI_PREV_STEP": "ADDR_B1_HI",
-        "ADDR_B2_HI_PREV_STEP": "ADDR_B2_HI",
-        "CARRY_PREV_STEP": "CARRY",
-        "CMP_PREV_STEP": "CMP",
-        "OP_LEV_PREV_STEP": "OP_LEV",
-        # Phase 8.A SCC step 6: OPCODE_BYTE_LO_PREV_STEP rename for L5
-        # opcode-decode readers (anchored at ``opcode_decode_ffn`` and
-        # ``_opcode_decode_ffn_dep_anchor``). Same numeric base as the
-        # OPCODE_BYTE_LO writer band (`layer5_fetch`) so baked cells are
-        # byte-identical. Targets SCC step 20→16 (-4 ops).
-        "OPCODE_BYTE_LO_PREV_STEP": "OPCODE_BYTE_LO",
+        # Phase 9.C: all ``*_PREV_STEP`` aliases (OUTPUT_HI/LO, TEMP,
+        # ADDR_KEY, ALU_LO, AX_CARRY_{LO,HI}, EMBED_{LO,HI}, ADDR_B*_*,
+        # CARRY, CMP, OP_LEV, OPCODE_BYTE_LO) were retired now that
+        # Phase 9.B migrated every cross-step reader to its SSA spelling
+        # (``<DIM>.<writer>.-1``). The numeric-position aliasing was
+        # purely cosmetic since each alias shared its base's position.
     }
 
     def _declare(name, size):
