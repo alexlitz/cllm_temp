@@ -297,6 +297,109 @@ def test_layer9_marker_suppress_rules_match_legacy():
     _compare_symbolic_to_lowered(rules)
 
 
+def test_layer9_alu_rules_total_unit_count_is_3405():
+    """The composite rule list must total 3405 units."""
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
+        _layer9_alu_rules,
+    )
+
+    rules = _layer9_alu_rules(100.0)
+    # 512 * 5 (ADD/LEA/ADJ/SUB/ENT hi) + 272 (CMP) + 256 * 2 (carry/borrow)
+    # + 32 (ALU clear) + 16 (BP+8) + 6 (ADDR_B1 + cascade) + 7 (marker
+    # suppress) = 3405.
+    assert len(rules) == 3405
+
+
+def test_layer9_alu_full_ir_matches_legacy_helper():
+    """One-shot ``Primitives.lower_ffn_rules`` of the composite IR equals
+    the legacy ``_set_layer9_alu`` + ``_set_layer9_marker_suppress``
+    bake byte-for-byte across all 3405 units."""
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
+        _layer9_alu_rules,
+    )
+
+    actual = _StubFFN(hidden_dim=3600)
+    expected = _legacy_l9_with_marker_suppress()
+
+    rules = _layer9_alu_rules(100.0)
+    dim_positions = Primitives.dim_positions_from_bd(
+        _SetDim,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    end = Primitives.lower_ffn_rules(
+        actual, rules, dim_positions, start_unit=0, S=100.0,
+    )
+    assert end == 3405
+
+    # Per-tensor full equality over the 0..3405 range.
+    for name in ("W_up", "b_up", "W_gate", "b_gate", "W_down"):
+        a = getattr(actual, name)
+        e = getattr(expected, name)
+        if a.ndim == 2 and a.shape[0] == 3600:  # W_up, W_gate (units, d_model)
+            a_slice = a[:3405, :]
+            e_slice = e[:3405, :]
+        elif a.ndim == 2 and a.shape[1] == 3600:  # W_down (d_model, units)
+            a_slice = a[:, :3405]
+            e_slice = e[:, :3405]
+        else:  # b_up, b_gate (units,)
+            a_slice = a[:3405]
+            e_slice = e[:3405]
+        assert torch.equal(a_slice, e_slice), f"{name} differs in [0, 3405)"
+
+
+def test_layer9_alu_op_exposes_compiler_ir():
+    """``make_layer9_alu_op()`` must attach the composite IR in lookup mode."""
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
+        make_layer9_alu_op,
+    )
+
+    op = make_layer9_alu_op(alu_mode="lookup")
+    assert op.compiler_ir is not None
+    assert len(op.compiler_ir.layer(0).ffn.rules) == 3405
+
+    # Efficient mode skips the compiler_ir publication because the
+    # imperative ``_suppress_l9_legacy_addsub_writes`` post-pass mutates
+    # the lowered weights in a way the IR does not model.
+    op_eff = make_layer9_alu_op(alu_mode="efficient")
+    assert op_eff.compiler_ir is None
+
+
+def test_layer9_alu_full_ir_structural_check():
+    """``compare_symbolic_to_lowered_ffn`` over the 3405-rule IR has no
+    declaration-semantics or lowering-contract failures.
+
+    The per-cell weight check (W_up / b_up / W_gate / b_gate / W_down)
+    and declaration resolution are byte-identity guarantees for the rule
+    list. The synthetic ``weight_output_mismatch`` failures that arise
+    when many rules share output dims (the ALU cross-product fan-out)
+    are checked separately via the per-sub-stage tests above.
+    """
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
+        _layer9_alu_ir,
+    )
+
+    ir = _layer9_alu_ir(100.0)
+    dim_positions = Primitives.dim_positions_from_bd(
+        _SetDim,
+        Primitives.ffn_rule_dim_names(ir.layer(0).ffn.rules),
+    )
+    report = compare_symbolic_to_lowered_ffn(
+        ir,
+        dim_positions,
+        S=100.0,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    structural = [
+        issue for issue in report.issues
+        if issue.kind in ("declaration_semantics", "lowering")
+    ]
+    assert not structural, (
+        "structural compare_symbolic_to_lowered_ffn failures: "
+        + "\n".join(f"  [{i.kind}] {i.message}" for i in structural)
+    )
+
+
 def test_layer9_lea_adj_ent_fetch_gates_use_one_hot_scale():
     ffn = _StubFFN()
     _set_layer9_alu(ffn, 100.0, _SetDim)

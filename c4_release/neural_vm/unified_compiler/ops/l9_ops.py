@@ -815,6 +815,45 @@ def _layer9_marker_suppress_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_alu_rules(S: float) -> tuple[FFNRule, ...]:
+    """Full ordered ``FFNRule`` sequence for ``layer9_alu`` (3405 units).
+
+    Concatenates every L9 ALU sub-stage in the order declared by
+    :data:`_L9_ALU_UNIT_LAYOUT` so a single ``start_unit=0`` lowering
+    via :func:`Primitives.lower_ffn_rules` reproduces the legacy
+    ``_set_layer9_alu`` + ``_set_layer9_marker_suppress`` byte-for-byte.
+
+    The bundled grouping (5 hi-nibble ALU bands, the CMP family, the
+    carry/borrow propagators, the ALU-clear pair, the BP+8 / ADDR_B1 /
+    cascade address fixups, and the NEXT_* marker-suppression band)
+    matches the legacy helper's monotonic ``unit`` walk so the pinned
+    unit slots in :data:`_L9_ALU_UNIT_LAYOUT` stay in lock-step with the
+    rule order.
+    """
+
+    return (
+        _layer9_add_hi_nibble_rules(S)
+        + _layer9_lea_hi_nibble_rules(S)
+        + _layer9_adj_hi_nibble_rules(S)
+        + _layer9_sub_hi_nibble_rules(S)
+        + _layer9_ent_hi_nibble_rules(S)
+        + _layer9_cmp_rules(S)
+        + _layer9_add_carry_out_rules(S)
+        + _layer9_sub_borrow_out_rules(S)
+        + _layer9_alu_clear_rules(S)
+        + _layer9_bp_plus8_shift_rules(S)
+        + _layer9_addr_b1_set_and_cascade_rules(S)
+        + _layer9_marker_suppress_rules(S)
+    )
+
+
+def _layer9_alu_ir(S: float = 100.0) -> CompilerIR:
+    """Build the declarative ``CompilerIR`` exposed by ``layer9_alu``."""
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer9_alu_rules(S))
+    return ir
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 
@@ -823,33 +862,40 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         ``n9 = _set_layer9_alu(ffn9, S, BD)``
         ``_set_layer9_marker_suppress(ffn9, S, BD, n9)``
 
-    Combined into a single migrated bake_fn that captures ``n9`` and
-    threads it to ``_set_layer9_marker_suppress`` as ``start_unit`` so the
-    two routines share the FFN's hidden-unit allocator. Mirrors the
-    combined-bake pattern proven safe by Unit 9's diagnosis (see
-    ``c4_release/docs/LOOKUP_MODE_BUG_DIAGNOSIS.md``).
+    Phase 6 Wave 4C migration: the entire 3405-unit weight surface is now
+    declared via :func:`_layer9_alu_rules` -- a concatenation of 12
+    sub-stage rule helpers (ADD/LEA/ADJ/SUB/ENT hi nibble, CMP family,
+    ADD carry-out, SUB borrow-out, ALU LO/HI clear, BP+8 shift, ADDR_B1
+    set + cascade, NEXT_* marker suppress). The bake_fn lowers them
+    in one shot through :func:`Primitives.lower_ffn_rules` against the
+    compiler-allocated dim positions; the legacy
+    :func:`vm_step._set_layer9_alu` /
+    :func:`vm_step._set_layer9_marker_suppress` helpers are no longer
+    referenced from this op.
 
     Migrated as ``kind="block"`` pinned to ``layer_idx=9`` with
     ``migrated=True``; the inline call pair has been removed from
     ``set_vm_weights`` to avoid double-bake. Phase stays at 9. Fires in
-    both lookup and efficient ALU modes — the lookup-branch nesting was
-    incidental and the helpers themselves are alu_mode-agnostic.
+    both lookup and efficient ALU modes -- the lookup-branch nesting was
+    incidental and the rules are alu_mode-agnostic. In the efficient
+    path the imperative :func:`_suppress_l9_legacy_addsub_writes` post-pass
+    still zeroes the ADD/SUB legacy output units and legacy carry rows;
+    we keep it imperative because it operates on the already-lowered
+    ``W_down`` cells as a downstream mutation rather than as a rule fan-out.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer9_alu, _set_layer9_marker_suppress
         proxy = _as_setdim_proxy(dim_positions)
 
         # Per-bake FFN-unit allocator. Each L9 ALU sub-stage is pinned to
-        # its existing offset so the calls below land byte-identically. The
-        # ``marker_suppress`` range gives the start-unit for the
-        # ``_set_layer9_marker_suppress`` chained call, replacing the
-        # implicit ``n9`` cursor return.
+        # its existing offset so the rule lowering below -- which appends
+        # units monotonically starting at ``start_unit=0`` -- lands
+        # byte-identically with the legacy ``_set_layer9_alu`` cursor walk.
         allocator = _allocate_layer9_alu_units()
         marker_range = next(
             r for r in allocator.ranges()
             if r.op_name == "layer9_alu.marker_suppress"
         )
-        marker_start = marker_range.start
+        marker_end = marker_range.start + marker_range.n_units
         # Make the allocator available for inspection / extension by
         # downstream tools (e.g. a future L9 op family claiming a free
         # gap). The block-level attribute mirrors the ``_l14_unit_counter``
@@ -857,18 +903,28 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         # object so the layout is structured, not just a monotonic int.
         block.ffn._l9_unit_allocator = allocator
 
-        n9 = _set_layer9_alu(block.ffn, S, proxy)
-        # Byte-identity guard: the helper's local cursor MUST end exactly
-        # where the allocator's marker_suppress range starts. If the table
-        # drifts from the helper's writes, this assertion fires before any
-        # weight surgery happens.
-        assert n9 == marker_start, (
-            f"L9 ALU unit cursor drift: helper returned {n9}, allocator "
-            f"expected {marker_start}"
+        rules = _layer9_alu_rules(S)
+        rule_dim_positions = Primitives.dim_positions_from_bd(
+            proxy,
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        end_unit = Primitives.lower_ffn_rules(
+            block.ffn,
+            rules,
+            rule_dim_positions,
+            start_unit=0,
+            S=S,
+        )
+        # Byte-identity guard: the rule lowering MUST land exactly where
+        # the allocator's marker_suppress range ends. If the table drifts
+        # from the rule order, this assertion fires before any downstream
+        # consumer reads the L9 weights.
+        assert end_unit == marker_end, (
+            f"L9 ALU rule lowering ended at {end_unit}, allocator "
+            f"expected {marker_end}"
         )
         if alu_mode == "efficient":
             _suppress_l9_legacy_addsub_writes(block.ffn, proxy)
-        _set_layer9_marker_suppress(block.ffn, S, proxy, marker_start)
 
     # Dim-ownership claims (W_down output cells). Mirrors ``_set_layer9_alu``
     # in ``vm_step.py`` (3398 units) followed by ``_set_layer9_marker_suppress``
@@ -1003,6 +1059,15 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     # Total expected unit index after bake: 3405 (matches ffn_units_used).
     _claims = frozenset(_claims)
 
+    # Declarative IR exposed to symbolic execution / verifier tooling.
+    # The ``efficient`` alu_mode skips the IR-only dispatch path because
+    # the post-bake :func:`_suppress_l9_legacy_addsub_writes` mutation
+    # zeroes a subset of the lowered cells -- a step the IR does not
+    # model. The bake_fn handles both modes correctly; only the
+    # declarations-only path (compiler_ir lowering without bake_fn) needs
+    # to be gated.
+    compiler_ir = _layer9_alu_ir() if alu_mode == "lookup" else None
+
     return Operation(
         name="layer9_alu",
         phase=9,
@@ -1014,6 +1079,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=compiler_ir,
         declarative_authority="spec_generated",
         layer_idx=9,
         migrated=True,
