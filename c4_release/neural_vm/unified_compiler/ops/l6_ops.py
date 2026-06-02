@@ -2792,9 +2792,13 @@ def make_layer6_attn_dep_anchor_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
-        # Pin strictly after ``_layer5_fetch_dep_anchor`` so the
-        # earliest landable layer is one past L5, i.e. L6.
-        requires={"after": "_layer5_fetch_dep_anchor"},
+        # Pin strictly after the L5 fetch anchor AND the opcode-decode
+        # anchor. The opcode-decode reference triggers R-OH-2 suppression
+        # for OP_JMP/OP_EXIT/OP_JSR/OP_LEV reads: same-step writes by
+        # later-layer ops (layer7_memory_heads, ...) are dropped from
+        # the dep DAG so the earliest landable layer stays at L6.
+        requires={"after": ["_layer5_fetch_dep_anchor",
+                            "_opcode_decode_ffn_dep_anchor"]},
         smoke_tests=set(),
         spec_section=None,
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
