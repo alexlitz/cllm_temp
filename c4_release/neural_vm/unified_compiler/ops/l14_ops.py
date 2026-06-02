@@ -672,9 +672,17 @@ def make_layer14_mem_generation_op() -> Operation:
     return Operation(
         name="layer14_mem_generation",
         phase=14,
+        # Phase 8.A: ADDR_B0_HI_PREV_STEP marks the read as cross-step
+        # relative to L15 store_stack0_sp_byte0_addr (phase 15.2), which
+        # writes ADDR_B0_HI after L14 in the same step. All other
+        # ADDR_B0_HI writers (L4 sp_to_addr_key, L8 sp_gather_bake, L9
+        # lev_addr_relay/lev_bp_to_pc_relay, L13 mem_addr_gather) sit
+        # earlier in the schedule — those forward edges still resolve to
+        # the same numeric slot 206. The alias is position-identical so
+        # weight bakes stay byte-identical; only the dep graph view changes.
         reads={"MARK_MEM", "MARK_SP", "MARK_STACK0", "OP_PSH", "OP_SI", "OP_SC",
                "OP_JSR", "OP_ENT", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
-               "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO", "ADDR_B0_HI",
+               "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO", "ADDR_B0_HI_PREV_STEP",
                "MEM_STORE", "MEM_ADDR_SRC", "STACK0_BYTE0", "L1H0", "L1H1", "L1H2",
                "H0", "H1", "L1H4", "H2", "H3", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3", "IS_BYTE"},
@@ -2954,9 +2962,12 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
     return Operation(
         name="layer14_addr_key_neural_decode",
         phase=14.5,
+        # Phase 8.A: matches layer14_mem_generation's ADDR_B0_HI_PREV_STEP
+        # rename — same back-edge against L15 store_stack0_sp_byte0_addr,
+        # same numeric position (slot 206), no functional change.
         reads={"MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "H2", "H3",
                "OP_LI_RELAY", "OP_LC_RELAY", "MARK_AX",
-               "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO",
+               "ADDR_B0_LO", "ADDR_B0_HI_PREV_STEP", "ADDR_B1_LO",
                "CONST"},
         writes={"ADDR_KEY"},
         kind="block",

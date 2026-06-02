@@ -1662,9 +1662,20 @@ def make_layer8_sp_gather_bake_op() -> Operation:
     return Operation(
         name="layer8_sp_gather_bake",
         phase=8.0,
+        # Phase 8.A targeted: cross-step CMP+3 read (STACK0-suppression
+        # gate on the SP-gather Q rows) declared as CMP_PREV_STEP. L9
+        # ALU writes CMP in the same step but AFTER L8; the gate
+        # semantics use the previous step's CMP (the BZ/BNZ branch
+        # decision that was just committed). Renaming the read to the
+        # PREV_STEP alias retires the data-flow edge L9_ALU -> L8 on
+        # CMP from the dep graph; the explicit cross-step boundary is
+        # captured by the ``requires["after"] = layer9_alu`` declaration
+        # below (mirrors the L3 OUTPUT_LO/HI PREV_STEP pattern from
+        # Phase 7.A.3.b). Same numeric position as CMP so baked weight
+        # cells are byte-identical. See .agent-logs/scc_audit_phase8.md.
         reads={"MARK_STACK0", "MARK_SP", "MARK_BP", "H1", "H3", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CMP", "CONST"},
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CMP_PREV_STEP", "CONST"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI",
                 "ADDR_B1_LO", "ADDR_B1_HI",
                 "ADDR_B2_LO", "ADDR_B2_HI"},
@@ -1675,6 +1686,19 @@ def make_layer8_sp_gather_bake_op() -> Operation:
         layer_idx=8,
         migrated=True,
         claims=_claims,
+        # Phase 8.A targeted: explicit cross-step boundary. The
+        # CMP_PREV_STEP read above is satisfied by L9 ALU's previous-
+        # step write via the KV residual; ``requires["after"]`` records
+        # that producer relationship declaratively so the strict-mode
+        # admission gate sees a layer-pinning dep (without it the op
+        # would fall into ``phase_required_but_undeclared`` because its
+        # remaining in-step reads only reach depth=3, while phase=8 /
+        # layer_idx=8 pin current_layer=8). Mirrors
+        # ``layer3_carry_forward_attn``'s ``requires["after"] =
+        # layer16_lev_routing`` pattern for the L3 OUTPUT_LO/HI
+        # PREV_STEP rename (Phase 7.A.3.b). See
+        # .agent-logs/scc_audit_phase8.md §5 wave 2.
+        requires={"after": "layer9_alu"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1722,7 +1746,14 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
                 k=(
                     AP(0, byte_idx_dim, L),
                     AP(0, BD.H1 + SP_I, L),
-                    AP(0, BD.CMP + 3, -L),
+                    # Phase 8.A targeted: CMP_PREV_STEP cross-step alias.
+                    # Same numeric position as CMP (396+3=399); byte-
+                    # identical at the bake level. See the op-level
+                    # ``reads={... "CMP_PREV_STEP" ...}`` + ``requires=
+                    # {"after": "layer9_alu"}`` block in
+                    # ``make_layer8_sp_gather_bake_op`` for the dep-
+                    # graph semantics.
+                    AP(0, BD.CMP_PREV_STEP + 3, -L),
                     AP(33, BD.CONST, L),
                 ),
                 v=(
@@ -1777,7 +1808,14 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
                 k=(
                     AP(0, byte_idx_dim, L),
                     AP(0, BD.H1 + SP_I, L),
-                    AP(0, BD.CMP + 3, -L),
+                    # Phase 8.A targeted: CMP_PREV_STEP cross-step alias.
+                    # Same numeric position as CMP (396+3=399); byte-
+                    # identical at the bake level. See the op-level
+                    # ``reads={... "CMP_PREV_STEP" ...}`` + ``requires=
+                    # {"after": "layer9_alu"}`` block in
+                    # ``make_layer8_sp_gather_bake_op`` for the dep-
+                    # graph semantics.
+                    AP(0, BD.CMP_PREV_STEP + 3, -L),
                     AP(33, BD.CONST, L),
                 ),
                 v=(
@@ -2333,6 +2371,14 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         # the L8 alu_postop_attach (8.5), keeping all L8 attn bakes in
         # phase order.
         phase=8.45,
+        # Phase 8.A: ADDR_B0_HI_PREV_STEP marks the read as cross-step
+        # relative to L9 lev_addr_relay / L9 lev_bp_to_pc_relay / L15
+        # store_stack0_sp_byte0_addr which fire after L8 in the same step.
+        # L4 sp_to_addr_key, L8 sp_gather_bake, L13 mem_addr_gather are
+        # same-step or earlier writers, but L8 mem_to_alu's read targets
+        # the prev-step residual ADDR_B0_HI value (via the KV cache) — the
+        # alias keeps the numeric position identical (slot 206) so weight
+        # bakes stay byte-identical; only the dep graph view changes.
         reads={"MARK_AX", "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR",
@@ -2340,7 +2386,7 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
                "OP_PSH", "OP_JSR", "OP_ENT", "OP_LEV", "OP_JMP", "OP_ADJ",
                "OP_BZ", "OP_BNZ", "OP_EXIT", "MEM_STORE", "MEM_VAL_B2", "L2H0",
                "H1", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
-               "MARK_STACK0", "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO",
+               "MARK_STACK0", "ADDR_B0_LO", "ADDR_B0_HI_PREV_STEP", "ADDR_B1_LO",
                "ADDR_B1_HI", "ADDR_B2_LO", "ADDR_B2_HI",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
         writes={"ALU_LO", "ALU_HI", "AX_FULL_LO", "AX_FULL_HI"},
