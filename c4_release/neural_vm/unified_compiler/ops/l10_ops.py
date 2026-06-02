@@ -2333,12 +2333,18 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         reads={"MARK_STACK0", "IS_BYTE", "PSH_AT_SP", "H1", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               # LEA-local differential routing (bug #33) reads the
-               # current-step OUTPUT bands at the attended AX byte 0 row.
-               # Verifier categorizes residual writes under the canonical
-               # OUTPUT_HI name (alias OUTPUT_HI_THIS_STEP shares the dim);
-               # see L7 ``layer7_operand_gather`` for the same convention.
-               "OUTPUT_LO", "OUTPUT_HI"},
+               # LEA-local differential routing (bug #33) reads the OUTPUT
+               # bands at the attended AX byte 0 row. Phase 8.A G7 finisher:
+               # OUTPUT_LO_PREV_STEP / OUTPUT_HI_PREV_STEP mark these as
+               # cross-step reads relative to the L13/L14/L15/L16/L17
+               # OUTPUT_LO/HI writers that all fire AFTER this L10 op in
+               # the same step (the attention-V read is therefore step
+               # N-1's value). PREV_STEP aliases share the same numeric
+               # base as OUTPUT_LO/OUTPUT_HI (dim_registry _pin), so baked
+               # weight cells stay byte-identical; only the dep-graph view
+               # changes. Mirrors the L7 ``layer7_operand_gather`` rename
+               # (commits 6967fe8f, 8e6ec805).
+               "OUTPUT_LO_PREV_STEP", "OUTPUT_HI_PREV_STEP"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,

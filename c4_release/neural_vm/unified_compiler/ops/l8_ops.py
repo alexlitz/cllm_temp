@@ -2425,6 +2425,12 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         # targets the previous-step residual value (KV cache), so the
         # PREV_STEP alias retires the back-edges into L8 without changing
         # the baked weight position (slot is shared with ADDR_B0_LO).
+        # Phase 8.A continuation: ADDR_B{1,2}_{LO,HI}_PREV_STEP retire the
+        # same back-edge pattern for the B1/B2 nibble bands -- L13
+        # mem_addr_gather and the L12 attn dep anchor write
+        # ADDR_B{1,2}_{LO,HI} after L8 in the same step, but this op's
+        # read targets the previous-step residual value via the KV cache.
+        # Same numeric base; weight bakes byte-identical.
         reads={"MARK_AX", "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR",
@@ -2432,8 +2438,9 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
                "OP_PSH", "OP_JSR", "OP_ENT", "OP_LEV", "OP_JMP", "OP_ADJ",
                "OP_BZ", "OP_BNZ", "OP_EXIT", "MEM_STORE", "MEM_VAL_B2", "L2H0",
                "H1", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
-               "MARK_STACK0", "ADDR_B0_LO_PREV_STEP", "ADDR_B0_HI_PREV_STEP", "ADDR_B1_LO",
-               "ADDR_B1_HI", "ADDR_B2_LO", "ADDR_B2_HI",
+               "MARK_STACK0", "ADDR_B0_LO_PREV_STEP", "ADDR_B0_HI_PREV_STEP",
+               "ADDR_B1_LO_PREV_STEP", "ADDR_B1_HI_PREV_STEP",
+               "ADDR_B2_LO_PREV_STEP", "ADDR_B2_HI_PREV_STEP",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
         writes={"ALU_LO", "ALU_HI", "AX_FULL_LO", "AX_FULL_HI"},
         kind="block",
