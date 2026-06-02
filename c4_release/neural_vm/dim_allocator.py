@@ -76,6 +76,11 @@ class AllocatedSlot:
     # Tracked so :meth:`Allocator.free_pool` correctly accounts for the
     # underlying byte coverage (aliases do not consume new bytes).
     overlap: bool = False
+    # Phase 7.E.1 — semantic category & role. Forwarded to
+    # :class:`DimSlot` by :meth:`Allocator.to_registry` so rules can
+    # resolve dims via ``DimRegistry.resolve_dim(category, role)``.
+    category: Optional[str] = None
+    role: Optional[str] = None
 
     @property
     def end(self) -> int:
@@ -156,6 +161,8 @@ class Allocator:
         group: Optional[str] = None,
         description: str = "",
         allow_overlap: bool = False,
+        category: Optional[str] = None,
+        role: Optional[str] = None,
     ) -> AllocatedSlot:
         """Allocate ``size`` consecutive slots for ``name``.
 
@@ -241,6 +248,12 @@ class Allocator:
             pinned = False
             overlap = False
 
+        if (category is None) != (role is None):
+            raise AllocatorError(
+                f"alloc({name!r}): category and role must both be "
+                f"provided or both omitted "
+                f"(got category={category!r}, role={role!r})"
+            )
         slot = AllocatedSlot(
             name=name,
             start=start,
@@ -250,6 +263,8 @@ class Allocator:
             group=group,
             pinned=pinned,
             overlap=overlap,
+            category=category,
+            role=role,
         )
         self._slots.append(slot)
         self._by_name[name] = slot
@@ -344,7 +359,12 @@ class Allocator:
             # DimRegistry.alloc() warns when semantics is None — that's
             # the static registry's behaviour and we want to inherit it,
             # so we pass through whatever the caller provided.
-            reg.alloc(s.name, s.start, s.size, s.description, semantics=s.semantics)
+            reg.alloc(
+                s.name, s.start, s.size, s.description,
+                semantics=s.semantics,
+                category=s.category,
+                role=s.role,
+            )
         return reg
 
     # ------------------------------------------------------------------

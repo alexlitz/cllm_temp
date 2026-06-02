@@ -546,7 +546,13 @@ def build_default_registry_dynamic() -> DimRegistry:
         "Compact-layout STACK0_BYTE3 (mirrors legacy at 510)",
         "mark == STACK0 OR (is_byte AND byte_index == 3)")
 
-    return a.to_registry()
+    reg = a.to_registry()
+    # Phase 7.E.1 — apply the same semantic-category bindings as the
+    # static registry so the dynamic mirror stays byte-identical (now
+    # including ``(category, role)`` index entries).
+    from neural_vm.dim_registry import _register_default_categories
+    _register_default_categories(reg)
+    return reg
 
 
 __all__ = ["build_default_registry_dynamic"]

@@ -30,6 +30,17 @@ class DimSlot:
                                      # (F-7). None means "not yet specified
                                      # — tolerated this merge cycle but will
                                      # become required."
+    # Phase 7.E.1 — semantic category & role for the (category, role) ->
+    # offset lookup path. ``category`` names a family of conceptually
+    # equivalent dims (``"register_lo"``, ``"memory_hi"``, ``"opcode_flag"``,
+    # …) and ``role`` distinguishes members within that family
+    # (``"AX"``, ``"SP"``, ``"OP_JMP"``, …). Together they uniquely
+    # identify a slot via ``DimRegistry.resolve_dim(category, role)``.
+    # Both are optional so legacy ``+N`` offset references and slot-name
+    # lookups continue to work unchanged — the category index is purely
+    # additive. Phase 7.E.2 will start migrating rules to the new path.
+    category: Optional[str] = None
+    role: Optional[str] = None
 
     @property
     def end(self) -> int:
@@ -59,6 +70,13 @@ class DimRegistry:
     def __init__(self, d_model: int = 256):
         self.d_model = d_model
         self.slots: Dict[str, DimSlot] = {}
+        # Phase 7.E.1 — (category, role) -> slot_name index. Built up
+        # incrementally as slots are allocated with category/role
+        # arguments OR registered post-hoc via ``register_category``.
+        # ``resolve_dim`` reads from this map. A given (category, role)
+        # pair MUST map to exactly one slot — duplicate registration
+        # raises ``ValueError`` so accidental collisions are loud.
+        self._category_index: Dict[Tuple[str, str], str] = {}
 
     def alloc(
         self,
@@ -67,6 +85,8 @@ class DimRegistry:
         size: int,
         desc: str,
         semantics: Optional[str] = None,
+        category: Optional[str] = None,
+        role: Optional[str] = None,
     ) -> DimSlot:
         """Register a dimension allocation. Returns the DimSlot.
 
@@ -74,6 +94,11 @@ class DimRegistry:
         neural_vm.unified_compiler.predicates.parse) describing when this
         dim fires. Optional during F-3 tolerant rollout; will become
         required in a follow-on commit once all ~80 dims are backfilled.
+
+        Phase 7.E.1: `category` + `role` populate the
+        ``(category, role) -> offset`` index consumed by
+        :meth:`resolve_dim`. Both must be provided together or both
+        omitted; passing one without the other raises ``ValueError``.
         """
         if name in self.slots:
             raise ValueError(f"Duplicate slot name: {name}")
@@ -88,8 +113,16 @@ class DimRegistry:
                 category=DeprecationWarning,
                 stacklevel=2,
             )
-        slot = DimSlot(name, start, size, desc, semantics)
+        if (category is None) != (role is None):
+            raise ValueError(
+                f"Slot {name!r}: category and role must both be provided "
+                f"or both omitted (got category={category!r}, role={role!r})"
+            )
+        slot = DimSlot(name, start, size, desc, semantics,
+                       category=category, role=role)
         self.slots[name] = slot
+        if category is not None and role is not None:
+            self._index_category(name, category, role)
         return slot
 
     def semantics(self, name: str) -> Optional[str]:
@@ -98,6 +131,95 @@ class DimRegistry:
         if name not in self.slots:
             raise KeyError(f"Unknown dim: {name!r}")
         return self.slots[name].semantics
+
+    # ------------------------------------------------------------------
+    # Phase 7.E.1 — semantic category / role index
+    # ------------------------------------------------------------------
+    def _index_category(self, name: str, category: str, role: str) -> None:
+        """Insert ``(category, role) -> name`` into the lookup map.
+
+        Raises ``ValueError`` if the pair is already claimed by a
+        different slot. Used internally by :meth:`alloc` and
+        :meth:`register_category`.
+        """
+        key = (category, role)
+        existing = self._category_index.get(key)
+        if existing is not None and existing != name:
+            raise ValueError(
+                f"Category ({category!r}, {role!r}) already maps to "
+                f"{existing!r}; cannot re-register for {name!r}"
+            )
+        self._category_index[key] = name
+
+    def register_category(
+        self,
+        name: str,
+        category: str,
+        role: str,
+    ) -> None:
+        """Attach a ``(category, role)`` label to an already-allocated slot.
+
+        Used for slots whose ``alloc`` call doesn't yet carry category
+        kwargs (the bulk of ``build_default_registry``'s body). Idempotent
+        when the slot is re-registered with the same ``(category, role)``;
+        raises ``ValueError`` on any conflicting registration.
+
+        The slot itself is updated in place so
+        :attr:`DimSlot.category`/``.role`` reflect the registration.
+        """
+        if name not in self.slots:
+            raise KeyError(f"Unknown dim: {name!r}")
+        slot = self.slots[name]
+        if slot.category is not None or slot.role is not None:
+            # Re-registration with identical pair is a no-op; conflicting
+            # pair is an error.
+            if slot.category == category and slot.role == role:
+                return
+            raise ValueError(
+                f"Slot {name!r} already has category=({slot.category!r}, "
+                f"{slot.role!r}); cannot re-tag as ({category!r}, {role!r})"
+            )
+        slot.category = category
+        slot.role = role
+        self._index_category(name, category, role)
+
+    def resolve_dim(self, category: str, role: str) -> int:
+        """Return the absolute dim offset for ``(category, role)``.
+
+        Phase 7.E.1 lookup helper: rules that today reference dims by
+        ``"OUTPUT_LO+15"``-style strings will start consuming
+        ``resolve_dim("output_lo", "nibble_15")`` (or analogous role
+        names) once Phase 7.E.2 migrates the call sites. The returned
+        offset is the slot's ``start`` — for multi-cell slots like
+        ``OUTPUT_LO``, the role names a specific cell and the slot is
+        sized 1; for whole-family slots like ``ALU_LO`` the role is the
+        family name and the returned offset is the family base.
+
+        Raises ``KeyError`` if no slot has been registered with the
+        requested ``(category, role)`` pair.
+        """
+        key = (category, role)
+        if key not in self._category_index:
+            raise KeyError(
+                f"No dim registered for (category={category!r}, "
+                f"role={role!r})"
+            )
+        slot_name = self._category_index[key]
+        return self.slots[slot_name].start
+
+    def categories(self) -> Dict[str, List[str]]:
+        """Return ``{category: [role, ...]}`` for every registered pair.
+
+        Roles within each category are sorted by their resolved offset
+        so the output groups conceptually-equivalent dims together.
+        """
+        out: Dict[str, List[Tuple[str, int]]] = {}
+        for (cat, role), name in self._category_index.items():
+            out.setdefault(cat, []).append((role, self.slots[name].start))
+        return {
+            cat: [r for r, _ in sorted(pairs, key=lambda x: x[1])]
+            for cat, pairs in out.items()
+        }
 
     def check_overlaps(self) -> List[str]:
         """Return error messages for any overlapping slots."""
@@ -979,7 +1101,132 @@ def build_default_registry() -> DimRegistry:
               "Compact-layout STACK0_BYTE3 (mirrors legacy at 510)",
               semantics="mark == STACK0 OR (is_byte AND byte_index == 3)")
 
-    return a.to_registry()
+    reg = a.to_registry()
+    _register_default_categories(reg)
+    return reg
+
+
+# ============================================================================
+# Phase 7.E.1 — semantic category / role bindings for the default registry.
+# ----------------------------------------------------------------------------
+# Categories let Phase 7.E.2 rules reference dims by ``(category, role)``
+# instead of ``"OUTPUT_LO+15"``-style strings. The mapping below covers
+# the suggested initial set:
+#
+#   register_lo / register_hi     PC/AX/SP/BP/STACK0 lo/hi nibble families
+#   memory_lo / memory_hi         MEM value bus + addr nibble families
+#   output_lo / output_hi         Decoder output nibble families
+#   temp_scratch                  General scratch
+#   addr_key_nibble               Memory address one-hot key
+#   opcode_flag                   One-hot opcode flags (LEA..GETCHAR)
+#   marker                        Marker identity flags (PC/AX/SP/BP/MEM/SE/…)
+#   byte_index                    Byte index within register
+#   carry                         Inter-byte carry cascades
+#   cmp_flag                      Comparison cascade
+#   alu_lo / alu_hi               ALU result nibbles
+#   ax_carry_lo / ax_carry_hi     AX carry-forward staging
+#
+# Roles inside a category are slot-level (the family base) for now;
+# Phase 7.E.2 can attach per-cell roles if a rule needs ``+N`` granularity.
+# Registration uses :meth:`DimRegistry.register_category` so this block is
+# additive — existing slots aren't re-allocated and trained weights stay
+# in place.
+# ============================================================================
+def _register_default_categories(reg: 'DimRegistry') -> None:
+    """Tag :func:`build_default_registry` slots with semantic categories.
+
+    Called by :func:`build_default_registry`; safe to skip in callers
+    that don't need the ``(category, role)`` resolution path. Every
+    pair must be unique — duplicate registration raises ``ValueError``
+    via :meth:`DimRegistry._index_category`.
+    """
+    bindings = (
+        # ---- marker (register identity flags + token-class flags) ----
+        ("MARK_PC",      "marker", "PC"),
+        ("MARK_AX",      "marker", "AX"),
+        ("MARK_SP",      "marker", "SP"),
+        ("MARK_BP",      "marker", "BP"),
+        ("MARK_MEM",     "marker", "MEM"),
+        ("MARK_SE",      "marker", "SE"),
+        ("MARK_CS",      "marker", "CS"),
+        ("MARK_SE_ONLY", "marker", "SE_ONLY"),
+        ("MARK_STACK0",  "marker", "STACK0"),
+
+        # ---- byte_index ----
+        ("BYTE_INDEX_0", "byte_index", "0"),
+        ("BYTE_INDEX_1", "byte_index", "1"),
+        ("BYTE_INDEX_2", "byte_index", "2"),
+        ("BYTE_INDEX_3", "byte_index", "3"),
+
+        # ---- register_lo / register_hi (full + carry views are split
+        # into their own ax_carry_* category; register_* refers to the
+        # value-bus view at AX positions). The compiler-IR consumers
+        # use ``AX_FULL_LO`` / ``AX_FULL_HI`` (471/487) for the AX
+        # value bus; SP/BP/PC analogues are POST_PRTF_PC_LO/HI and
+        # POST_PRTF_SP_LO/HI which alias those ranges. ----
+        ("AX_FULL_LO",     "register_lo", "AX"),
+        ("AX_FULL_HI",     "register_hi", "AX"),
+        ("POST_PRTF_PC_LO", "register_lo", "PC"),
+        ("POST_PRTF_PC_HI", "register_hi", "PC"),
+        ("POST_PRTF_SP_LO", "register_lo", "SP"),
+        ("POST_PRTF_SP_HI", "register_hi", "SP"),
+        ("SP_OLD_LO",      "register_lo", "SP_OLD"),
+        ("SP_OLD_HI",      "register_hi", "SP_OLD"),
+
+        # ---- ax_carry_lo / ax_carry_hi ----
+        ("AX_CARRY_LO", "ax_carry_lo", "AX"),
+        ("AX_CARRY_HI", "ax_carry_hi", "AX"),
+
+        # ---- alu_lo / alu_hi ----
+        ("ALU_LO", "alu_lo", "result"),
+        ("ALU_HI", "alu_hi", "result"),
+
+        # ---- carry (inter-byte cascades) ----
+        ("CARRY",     "carry", "alu"),
+        ("ADJ_CARRY", "carry", "adj"),
+
+        # ---- cmp_flag ----
+        ("CMP",       "cmp_flag", "cascade"),
+        ("CMP_GROUP", "cmp_flag", "group"),
+
+        # ---- memory_lo / memory_hi (address byte nibbles + MEM value bus
+        # single-bit cells). ADDR_B*_LO are the low-nibble one-hot
+        # encodings; ADDR_B*_HI alias ADDR_KEY's first 3 nibbles. ----
+        ("ADDR_B0_LO", "memory_lo", "addr_b0"),
+        ("ADDR_B1_LO", "memory_lo", "addr_b1"),
+        ("ADDR_B2_LO", "memory_lo", "addr_b2"),
+        ("ADDR_B0_HI", "memory_hi", "addr_b0"),
+        ("ADDR_B1_HI", "memory_hi", "addr_b1"),
+        ("ADDR_B2_HI", "memory_hi", "addr_b2"),
+        ("MEM_VAL_B0", "memory_lo", "val_b0"),
+        ("MEM_VAL_B1", "memory_lo", "val_b1"),
+        ("MEM_VAL_B2", "memory_lo", "val_b2"),
+        ("MEM_VAL_B3", "memory_lo", "val_b3"),
+
+        # ---- addr_key_nibble ----
+        ("ADDR_KEY", "addr_key_nibble", "key"),
+
+        # ---- output_lo / output_hi ----
+        ("OUTPUT_LO",      "output_lo", "nibble"),
+        ("OUTPUT_HI",      "output_hi", "nibble"),
+        ("OUTPUT_BYTE_LO", "output_lo", "byte"),
+        ("OUTPUT_BYTE_HI", "output_hi", "byte"),
+
+        # ---- temp_scratch ----
+        ("TEMP", "temp_scratch", "general"),
+    )
+    for slot_name, cat, role in bindings:
+        reg.register_category(slot_name, cat, role)
+
+    # ---- opcode_flag (one role per opcode, role is the opcode mnemonic) ----
+    _OPCODE_ROLES = [
+        "LEA", "IMM", "JMP", "JSR", "BZ", "BNZ", "ENT", "ADJ", "LEV",
+        "LI", "LC", "SI", "SC", "PSH", "OR", "XOR", "AND", "EQ", "NE",
+        "LT", "GT", "LE", "GE", "SHL", "SHR", "ADD", "SUB", "MUL",
+        "DIV", "MOD", "EXIT", "NOP", "PUTCHAR", "GETCHAR",
+    ]
+    for op in _OPCODE_ROLES:
+        reg.register_category(f"OP_{op}", "opcode_flag", op)
 
 
 def build_default_contracts(registry: DimRegistry) -> List[LayerIO]:
