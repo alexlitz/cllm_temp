@@ -992,25 +992,39 @@ Work:
   block's `FFNOp` and drop the wrapper block.
 - Track via `ModelShapeConstraint(num_hidden_layers=<target>)`.
 
-### 10.C — Axis 3: Per-byte FFN granularity (target ≤50M, saves ~50M on top of A+B)
+### 10.C — Axis 3: Per-byte FFN granularity — PARKED
 
-Most FFN units are nibble-level (16 per byte slot) for symbolic
-clarity. Folding to byte-level codecs shrinks FFN ~4× but changes
-representation. Per-family verification required.
+**Audit result (2026-06-02, .agent-logs/phase_10c_byte_ffn_audit_20260602.md)**:
+After enumerating 115 FFN rule factories (~38.5k units), only **108
+units** in 2 small L14 cleanup families are byte-safe collapsible.
+NIBBLE_REQUIRED dominates: L11/L12 MUL (4096 each), L13 SHL/SHR (4096),
+L10 carry chains, L9 hi-nibble ALU (2560), L8 lo-nibble ALU (1280),
+L6 routing — the per-k nibble dispatch IS the byte arithmetic. SwiGLU's
+one-scalar-per-unit prevents folding.
 
-Work:
-- Audit FFN ops: classify "byte-level-safe" vs "nibble-required".
-- Rewrite byte-safe families with 16→1 unit collapse via gate
-  composition.
-- Gate behind `enable_byte_ffn=False` flag; flip per-family as
-  verified.
+Phase 10.C parked. The 50M savings estimate over-assumed nibble-banded
+families were collapsible. They aren't, because the per-k gates
+implement the routing logic.
 
-### 10.D — Floor estimate
+The 108-unit cleanup could fold into a future L14 simplify pass
+(~0.24M savings at d_model=736), not its own Phase 10.C flag.
 
-An ideal hand-authored compiler for this 27-opcode VM fits in ~10-20M
-params. The gap from 50M (post-A+B+C) to ~15M is per-op symbolic
-compression (shared residual slots across non-overlapping opcode
-classes).
+A future architectural change — byte-wide MUL/ALU operators that
+compose nibble products at the data path level rather than the FFN
+unit level — could unlock further compression, but that's a separate
+research direction beyond Phase 10's scope.
+
+### 10.D — Floor estimate (revised)
+
+With Axes 10.A + 10.B (10.C parked), realistic floor is **~80M**
+through declarative knobs alone. The further gap to ~10-20M (an ideal
+hand-authored compiler) requires architectural restructuring beyond
+Phase 10's scope:
+- Byte-wide MUL/ALU operators (composes nibble products at the data
+  path level, not per-FFN-unit)
+- Per-op symbolic compression (shared residual slots across
+  non-overlapping opcode classes)
+- Vocab pruning if the compiled VM's symbol set is smaller than 32k
 
 ### Phase 10 acceptance
 
