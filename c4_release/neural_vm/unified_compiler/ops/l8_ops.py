@@ -545,9 +545,19 @@ def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
 
 
 def _layer8_alu_adj_carry_rules(S: float) -> tuple[FFNRule, ...]:
-    """ADJ carry detection (120 units, offsets 1264..1383)."""
+    """ADJ carry detection (120 units, offsets 1264..1383).
+
+    Same shape as lea_carry but gated on OP_ADJ with the ADJ-tuned
+    threshold (85.0 vs LEA's 80.5).
+
+    Phase 7.E.2: gate + carry-output refs use ``dim_ref`` for the
+    ``(opcode_flag, ADJ)`` and ``(carry, alu, byte_index=0)`` pairs.
+    ALU_LO+a / FETCH_LO+b stay structural.
+    """
 
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_adj = dim_ref("opcode_flag", "ADJ")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
     rules = []
     for a in range(16):
@@ -563,10 +573,10 @@ def _layer8_alu_adj_carry_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"FETCH_LO+{b}", 20.0),
                 ),
                 threshold=85.0,
-                gate="OP_ADJ",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_adj,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_ADJ",
-                dominates_at={"CARRY+0": "MARK_AX and OP_ADJ"},
+                dominates_at={carry_byte0: "MARK_AX and OP_ADJ"},
             ))
     return tuple(rules)
 
