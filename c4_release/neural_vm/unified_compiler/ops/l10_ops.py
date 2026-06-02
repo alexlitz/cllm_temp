@@ -1856,9 +1856,14 @@ def make_l10_post_ops_combined() -> Operation:
         assert offset == by_name["l10_post_ops_combined.carry_propagation_byte1"].start, (
             f"L10 post_ops_combined carry0 cursor drift: {offset}"
         )
-        offset = _bake_post_op_into(
-            ffn, CarryPropagationPostOp(d_model, S, byte_idx=1, cascade=True,
-                                        dim_positions=dim_positions), offset)
+        # Migrated to FFNRule. See ``_l10_carry_propagation_rules``.
+        offset = Primitives.lower_ffn_rules(
+            ffn,
+            _l10_carry_propagation_rules(S, byte_idx=1, cascade=True),
+            dim_positions,
+            start_unit=offset,
+            S=S,
+        )
         assert offset == by_name["l10_post_ops_combined.carry_propagation_byte2"].start, (
             f"L10 post_ops_combined carry1 cursor drift: {offset}"
         )
