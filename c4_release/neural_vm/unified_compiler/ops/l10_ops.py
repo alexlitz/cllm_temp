@@ -3,6 +3,7 @@
 from dataclasses import replace
 from typing import Mapping, Optional
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule
 from ..layer_compiler import Operation
@@ -10,6 +11,61 @@ from ..band_guarantees import expected_byte_guarantee_rules
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 from .shared import _bake_post_op_into
+
+
+# === L10 attention-head layout (pinned indices) =====================
+#
+# L10 attention hosts 8 primary heads, each owned by one ``kind="block"``
+# bake op below. Pre-migration the spec helpers used bare ``head_idx=N``
+# literals; pinning the allocator and resolving every literal through
+# :func:`_l10_head_idx` preserves byte-identity while declaring the L10
+# head axis as audited data. Order mirrors the bake-op factory order below
+# so the table reads top-to-bottom alongside the bakes that own each row.
+#
+# Head 1 (AX byte passthrough) and head 7 (BP byte passthrough) both reuse
+# the byte-passthrough chain template :func:`_byte_passthrough_chain_spec`;
+# heads 4/5/6 are co-owned by ``layer10_stack0_byte_relay_bake`` (one
+# allocator row per spec for inspection clarity).
+_L10_HEAD_LAYOUT = (
+    # (op-name key,                                       pinned head_idx)
+    ("layer10_carry_relay_bake.head_0",                  0),  # ADD/SUB byte carry
+    ("layer10_byte_passthrough_bake.head_1",             1),  # AX byte passthrough
+    ("layer10_sp_byte_passthrough_bake.head_2",          2),  # SP byte passthrough
+    ("layer10_psh_stack0_passthrough_bake.head_3",       3),  # PSH STACK0 passthrough
+    ("layer10_stack0_byte_relay_bake.head_4",            4),  # bitwise stack-byte relay
+    ("layer10_stack0_byte_relay_bake.head_5",            5),  # non-bitwise stack-byte relay
+    ("layer10_stack0_byte_relay_bake.head_6",            6),  # STACK0 byte persistence
+    ("layer10_bp_byte_passthrough_bake.head_7",          7),  # BP byte passthrough
+)
+
+
+def _allocate_layer10_attention_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with the L10 heads pinned.
+
+    Every entry in :data:`_L10_HEAD_LAYOUT` is pinned at its existing
+    ``head_idx`` so the underlying weight writes -- expressed as
+    ``DeclarativeAttentionHeadSpec`` instances -- land byte-identically.
+    A future L10 attention op can claim a free head past index 7 via
+    ``allocator.alloc(name, layer_idx=10)`` (no ``pin=``) without
+    touching this table; today layer_max_heads=8 so the layer is full.
+    """
+    allocator = AttentionHeadAllocator()
+    for name, head_idx in _L10_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=10, pin=head_idx)
+    return allocator
+
+
+def _l10_head_idx(op_name: str) -> int:
+    """Return the pinned L10 ``head_idx`` for ``op_name``.
+
+    Static lookup against :data:`_L10_HEAD_LAYOUT` for callers (e.g.
+    ``compiler_ir_factory`` helpers, spec functions) that cannot
+    instantiate a per-bake allocator. Mirrors the L4/L13 pattern.
+    """
+    for name, head_idx in _L10_HEAD_LAYOUT:
+        if name == op_name:
+            return head_idx
+    raise KeyError(f"_l10_head_idx: unknown L10 attention op {op_name!r}")
 
 
 # === L10 FFN unit layouts (pinned offsets) ==========================
@@ -148,7 +204,7 @@ def _layer10_carry_relay_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
     AX_IDX = 1
     L = S
     return DeclarativeAttentionHeadSpec(
-        head_idx=0,
+        head_idx=_l10_head_idx("layer10_carry_relay_bake.head_0"),
         q=(
             AP(0, BD.IS_BYTE, L),
             AP(0, BD.CONST, -L / 2),
@@ -911,7 +967,13 @@ def _layer10_single_head_ir(dim_positions, spec_fn, *, S: float = 100.0) -> Comp
 
 
 def _layer10_carry_relay_ir(dim_positions, HD) -> CompilerIR:
-    return _layer10_single_head_ir(dim_positions, _layer10_carry_relay_head_spec)
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(
+        _layer10_carry_relay_head_spec(proxy, 100.0),
+        name="layer10_carry_relay_bake.head_0",
+    )
+    return ir
 
 
 def _layer10_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
@@ -1080,10 +1142,26 @@ def make_layer10_carry_relay_bake_op() -> Operation:
     branches): ``_set_layer10_carry_relay(attn10, S, BD, HD)``. Inline call
     removed; this op now owns the bake. Phase=10.0 preserves the original
     ordering relative to the four sibling L10 attn bake ops below.
+
+    Phase 6 Wave 2D: migrated to ``AttentionHeadIR`` form. The head_idx=0
+    literal is replaced with a pinned-allocator lookup
+    (``_l10_head_idx("layer10_carry_relay_bake.head_0")``); the bake_fn
+    stashes a per-bake :class:`AttentionHeadAllocator` on ``attn`` so the
+    L10 head axis is auditable. The Q/K/V/O write authority remains in
+    :func:`_layer10_carry_relay_head_spec` (data, not imperative code);
+    the bake_fn keeps the residual ``Primitives.generate_attention_head``
+    call until Wave 6B shrinks it to ``_lower_via_compiler_ir``.
     """
     def bake(block, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
         attn = block.attn
+        # Per-bake attention-head allocator with the L10 head layout pinned.
+        # Stashed on ``attn`` for downstream inspection / extension; the
+        # actual ``head_idx`` value used by the spec comes from
+        # :func:`_l10_head_idx` so the spec stays in lockstep with the
+        # layout table without re-querying the allocator here.
+        head_allocator = _allocate_layer10_attention_heads()
+        attn._l10_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
         _bake_layer10_carry_relay_head(attn, proxy, S, HD)
 
