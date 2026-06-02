@@ -26,7 +26,9 @@ VM → Mixtral key mapping
 Synthesized (zeros / ones) when the VM doesn't carry them:
 - ``model.layers.{i}.block_sparse_moe.gate.weight`` — zeros (uniform routing)
 - ``model.layers.{i}.input_layernorm.weight`` / ``post_attention_layernorm.weight``
-  — ones when the VM block has no RMSNorm enabled
+  — ones when the VM block has no RMSNorm enabled. When the block has
+  ``use_rms_norm=True`` the actual ``attn_norm.weight`` /
+  ``ffn_norm.weight`` are copied (and padded with ones to ``hidden_size``).
 - ``model.norm.weight`` — ones (Mixtral has a final RMSNorm, VM does not)
 
 Dropped from the VM side:
@@ -230,6 +232,21 @@ def _pad_2d(
     r = min(int(w.shape[0]), int(target_shape[0]))
     c = min(int(w.shape[1]), int(target_shape[1]))
     out[:r, :c] = w[:r, :c].to(out_dtype)
+    return out
+
+
+def _pad_1d_norm(
+    w: torch.Tensor, target_len: int, *, dtype=None
+) -> torch.Tensor:
+    """Place a 1-D RMSNorm weight vector at the top of a ones-filled target.
+
+    Layer-norm weights default to ones (identity scale) so unused lanes
+    beyond the VM's ``d_model`` keep identity behaviour after padding.
+    """
+    out_dtype = dtype if dtype is not None else w.dtype
+    out = torch.ones(target_len, dtype=out_dtype, device=w.device)
+    n = min(int(w.shape[0]), int(target_len))
+    out[:n] = w[:n].to(out_dtype)
     return out
 
 
@@ -487,11 +504,35 @@ def _export_padded_state_dict(
             padded_w3 = torch.zeros((t_ffn, t_dmodel), dtype=dtype)
             padded_w2 = torch.zeros((t_dmodel, t_ffn), dtype=dtype)
 
-        # Layer norms: ones keep unused lanes at identity scale.
-        sd[f"{prefix}.input_layernorm.weight"] = torch.ones(t_dmodel, dtype=dtype)
-        sd[f"{prefix}.post_attention_layernorm.weight"] = torch.ones(
-            t_dmodel, dtype=dtype
-        )
+        # Layer norms: copy the VM's RMSNorm weights when ``use_rms_norm=True``,
+        # otherwise synthesize ones (identity scale). Unused lanes beyond the
+        # VM's ``d_model`` always pad with ones so the synthesized portion is
+        # an identity scale on the zero-filled FFN/attn outputs above.
+        attn_norm_w = None
+        ffn_norm_w = None
+        if i < n_vm_layers and getattr(blocks[i], "use_rms_norm", False):
+            attn_norm_w = _get_param(
+                getattr(blocks[i], "attn_norm", None), "weight"
+            )
+            ffn_norm_w = _get_param(
+                getattr(blocks[i], "ffn_norm", None), "weight"
+            )
+        if attn_norm_w is not None:
+            sd[f"{prefix}.input_layernorm.weight"] = _pad_1d_norm(
+                attn_norm_w.detach(), t_dmodel, dtype=dtype
+            )
+        else:
+            sd[f"{prefix}.input_layernorm.weight"] = torch.ones(
+                t_dmodel, dtype=dtype
+            )
+        if ffn_norm_w is not None:
+            sd[f"{prefix}.post_attention_layernorm.weight"] = _pad_1d_norm(
+                ffn_norm_w.detach(), t_dmodel, dtype=dtype
+            )
+        else:
+            sd[f"{prefix}.post_attention_layernorm.weight"] = torch.ones(
+                t_dmodel, dtype=dtype
+            )
 
         for e in range(num_local_experts):
             sd[f"{prefix}.block_sparse_moe.experts.{e}.w1.weight"] = padded_w1.clone()
