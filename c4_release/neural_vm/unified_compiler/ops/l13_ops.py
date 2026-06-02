@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -137,20 +138,30 @@ def _layer13_shifts_substage_rules(
     *,
     name_prefix: str,
     S: float,
+    gate: str | None = None,
 ) -> tuple[FFNRule, ...]:
     """Build the 2048-rule list for one L13 shift sub-stage.
 
     ``op_dim_name`` is the gating opcode dim name (``"OP_SHL"`` or
-    ``"OP_SHR"``). ``shift_fn(value, s)`` computes the 8-bit shift result
-    for ``(value, shift_amount)``; it must agree with the imperative
+    ``"OP_SHR"``) used in the human-readable ``scope`` string.
+    ``shift_fn(value, s)`` computes the 8-bit shift result for
+    ``(value, shift_amount)``; it must agree with the imperative
     helper's per-shift table.
 
     The 2048 rules iterate ``(s, a_hi, a_lo)`` in nested order to match
     the legacy unit counter in ``setup_helpers._set_layer13_shifts``;
     appending the SHL list followed by the SHR list lands on the
     pinned offsets declared in :data:`_L13_SHIFTS_UNIT_LAYOUT`.
+
+    Phase 7.E.3: the ``gate`` parameter accepts the role-meaningful
+    :func:`dim_ref` form (``dim_ref("opcode_flag", "SHL"/"SHR")``)
+    while ``op_dim_name`` stays in the legacy ``"OP_SHL"`` /
+    ``"OP_SHR"`` form for the human-readable ``scope`` string. When
+    ``gate is None`` (legacy callers) it falls back to ``op_dim_name``
+    so existing behaviour is preserved.
     """
     write_scale = 2.0 / S
+    gate_ref = gate if gate is not None else op_dim_name
     rules: list[FFNRule] = []
     for s in range(8):
         for a_hi in range(16):
@@ -171,7 +182,7 @@ def _layer13_shifts_substage_rules(
                         ("AX_CARRY_HI+0", 1.0),
                     ),
                     threshold=4.5,
-                    gate=op_dim_name,
+                    gate=gate_ref,
                     gate_weight=1.0,
                     gate_bias=0.0,
                     writes=(
@@ -184,22 +195,32 @@ def _layer13_shifts_substage_rules(
 
 
 def _layer13_shl_rules(S: float) -> tuple[FFNRule, ...]:
-    """L13 SHL sub-stage: 2048 lookup-table units (units 0..2047)."""
+    """L13 SHL sub-stage: 2048 lookup-table units (units 0..2047).
+
+    Phase 7.E.3: the gate ref uses :func:`dim_ref` for the
+    ``(opcode_flag, SHL)`` semantic pair.
+    """
     return _layer13_shifts_substage_rules(
         "OP_SHL",
         lambda v, s: (v << s) & 0xFF,
         name_prefix="l13_shl",
         S=S,
+        gate=dim_ref("opcode_flag", "SHL"),
     )
 
 
 def _layer13_shr_rules(S: float) -> tuple[FFNRule, ...]:
-    """L13 SHR sub-stage: 2048 lookup-table units (units 2048..4095)."""
+    """L13 SHR sub-stage: 2048 lookup-table units (units 2048..4095).
+
+    Phase 7.E.3: the gate ref uses :func:`dim_ref` for the
+    ``(opcode_flag, SHR)`` semantic pair.
+    """
     return _layer13_shifts_substage_rules(
         "OP_SHR",
         lambda v, s: (v >> s) & 0xFF,
         name_prefix="l13_shr",
         S=S,
+        gate=dim_ref("opcode_flag", "SHR"),
     )
 
 

@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -195,8 +196,14 @@ def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     (carry_in=1, threshold 4.5). Gated by ``OP_ADD``; writes
     ``OUTPUT_HI_THIS_STEP+result`` where ``result = (a + b + carry_in) %
     16``.
+
+    Phase 7.E.3: gate uses :func:`dim_ref` for the
+    ``(opcode_flag, ADD)`` semantic pair. The ``OUTPUT_HI_THIS_STEP+result``
+    write stays structural (result is a value-bus lookup index, not a
+    role-meaningful byte position).
     """
 
+    gate_add = dim_ref("opcode_flag", "ADD")
     rules: list[FFNRule] = []
     for carry_in in (0, 1):
         for a in range(16):
@@ -224,7 +231,7 @@ def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                     name=f"l9_add_hi_c{carry_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
-                    gate="OP_ADD",
+                    gate=gate_add,
                     gate_weight=1.0,
                     gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
@@ -243,8 +250,14 @@ def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     at ``-S * 1000`` so PC/SP/BP/STACK0/MEM/SE/byte rows never fire even
     when LEA's FETCH gate is high. Gated by ``OP_LEA``; writes
     ``OUTPUT_HI_THIS_STEP+result``.
+
+    Phase 7.E.3: gate uses :func:`dim_ref` for the
+    ``(opcode_flag, LEA)`` semantic pair. Structural reads
+    (``ALU_HI+a`` / ``FETCH_HI+b``) and the result-nibble write stay as
+    ``+N`` (value-bus one-hot lookups).
     """
 
+    gate_lea = dim_ref("opcode_flag", "LEA")
     rules: list[FFNRule] = []
     for carry_in in (0, 1):
         for a in range(16):
@@ -266,7 +279,7 @@ def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                     name=f"l9_lea_hi_c{carry_in}_a{a}_b{b}",
                     conditions=tuple(conditions),
                     threshold=threshold,
-                    gate="OP_LEA",
+                    gate=gate_lea,
                     gate_weight=1.0,
                     gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
@@ -284,8 +297,12 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     works after the ADJ opcode amplification. Writes
     ``OUTPUT_HI_THIS_STEP+result`` where ``result = (a + b + carry_in)
     % 16``.
+
+    Phase 7.E.3: gate uses :func:`dim_ref` for the
+    ``(opcode_flag, ADJ)`` semantic pair.
     """
 
+    gate_adj = dim_ref("opcode_flag", "ADJ")
     rules: list[FFNRule] = []
     for carry_in in (0, 1):
         for a in range(16):
@@ -307,7 +324,7 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                     name=f"l9_adj_hi_c{carry_in}_a{a}_b{b}",
                     conditions=tuple(conditions),
                     threshold=threshold,
-                    gate="OP_ADJ",
+                    gate=gate_adj,
                     gate_weight=1.0,
                     gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
@@ -323,8 +340,12 @@ def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     ``AX_CARRY_HI[b]`` (AX high nibble) with borrow-in discrimination on
     ``CARRY[0]``. SUB computes ``stack_top - AX = a - b``, so the
     written nibble is ``(a - b - borrow_in) % 16``. Gated by ``OP_SUB``.
+
+    Phase 7.E.3: gate uses :func:`dim_ref` for the
+    ``(opcode_flag, SUB)`` semantic pair.
     """
 
+    gate_sub = dim_ref("opcode_flag", "SUB")
     rules: list[FFNRule] = []
     for borrow_in in (0, 1):
         for a in range(16):
@@ -352,7 +373,7 @@ def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                     name=f"l9_sub_hi_b{borrow_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
-                    gate="OP_SUB",
+                    gate=gate_sub,
                     gate_weight=1.0,
                     gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
@@ -370,8 +391,12 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     propagation; ``a`` is SP's high nibble (``ALU_HI``) and ``b`` is the
     immediate's high nibble (``FETCH_HI``). Writes
     ``OUTPUT_HI_THIS_STEP+((sp_hi - imm_hi - borrow_in) % 16)``.
+
+    Phase 7.E.3: gate uses :func:`dim_ref` for the
+    ``(opcode_flag, ENT)`` semantic pair.
     """
 
+    gate_ent = dim_ref("opcode_flag", "ENT")
     rules: list[FFNRule] = []
     for borrow_in in (0, 1):
         for sp_hi in range(16):
@@ -393,7 +418,7 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                     name=f"l9_ent_hi_b{borrow_in}_sp{sp_hi}_imm{imm_hi}",
                     conditions=tuple(conditions),
                     threshold=threshold,
-                    gate="OP_ENT",
+                    gate=gate_ent,
                     gate_weight=1.0,
                     gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
@@ -417,8 +442,20 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     for the 3-way AND; writes ``2.0 / S`` to the matching CMP output
     nibble. Equality uses ``a == k`` for both operand dims; less-than
     uses ``a < b`` over the (a, b) pairs.
+
+    Phase 7.E.3: gate uses :func:`dim_ref` for the
+    ``(cmp_flag, group)`` pair; CMP-cascade byte writes use
+    ``dim_ref("cmp_flag", "cascade", byte_index)`` -- the ``+0..+3``
+    offsets are role-meaningful (hi_lt/hi_eq/lo_eq/lo_lt cascade byte
+    positions). Operand ``ALU_*+k`` / ``AX_CARRY_*+k`` reads remain
+    structural (per-nibble one-hot lookups).
     """
 
+    gate_cmp_group = dim_ref("cmp_flag", "group")
+    cmp_byte0 = dim_ref("cmp_flag", "cascade", 0)
+    cmp_byte1 = dim_ref("cmp_flag", "cascade", 1)
+    cmp_byte2 = dim_ref("cmp_flag", "cascade", 2)
+    cmp_byte3 = dim_ref("cmp_flag", "cascade", 3)
     rules: list[FFNRule] = []
 
     # hi_eq: 16 units -> CMP+1
@@ -432,10 +469,10 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"AX_CARRY_HI+{k}", 1.0),
             ),
             threshold=2.5,
-            gate="CMP_GROUP",
+            gate=gate_cmp_group,
             gate_weight=1.0,
             gate_bias=0.0,
-            writes=(("CMP+1", 2.0 / S),),
+            writes=((cmp_byte1, 2.0 / S),),
         ))
 
     # lo_eq: 16 units -> CMP+2
@@ -449,10 +486,10 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"AX_CARRY_LO+{k}", 1.0),
             ),
             threshold=2.5,
-            gate="CMP_GROUP",
+            gate=gate_cmp_group,
             gate_weight=1.0,
             gate_bias=0.0,
-            writes=(("CMP+2", 2.0 / S),),
+            writes=((cmp_byte2, 2.0 / S),),
         ))
 
     # hi_lt: 120 units -> CMP+0 (a < b for hi nibble)
@@ -467,10 +504,10 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_HI+{b}", 1.0),
                 ),
                 threshold=2.5,
-                gate="CMP_GROUP",
+                gate=gate_cmp_group,
                 gate_weight=1.0,
                 gate_bias=0.0,
-                writes=(("CMP+0", 2.0 / S),),
+                writes=((cmp_byte0, 2.0 / S),),
             ))
 
     # lo_lt: 120 units -> CMP+3 (a < b for lo nibble)
@@ -485,10 +522,10 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_LO+{b}", 1.0),
                 ),
                 threshold=2.5,
-                gate="CMP_GROUP",
+                gate=gate_cmp_group,
                 gate_weight=1.0,
                 gate_bias=0.0,
-                writes=(("CMP+3", 2.0 / S),),
+                writes=((cmp_byte3, 2.0 / S),),
             ))
 
     return tuple(rules)
@@ -505,8 +542,15 @@ def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
     raw stack-top carry signal is at value ~1.0 here, not amplified, so
     the threshold itself does most of the discrimination work. Gated by
     ``OP_ADD``.
+
+    Phase 7.E.3: gate + carry-output refs use :func:`dim_ref` for the
+    ``(opcode_flag, ADD)`` and ``(carry, alu, byte_index=1)`` pairs.
+    The carry-output offset 1 is role-meaningful (byte 1 of the
+    inter-byte ALU carry cascade); operand reads stay structural.
     """
 
+    gate_add = dim_ref("opcode_flag", "ADD")
+    carry_byte1 = dim_ref("carry", "alu", 1)
     rules: list[FFNRule] = []
     for carry_in in (0, 1):
         for a in range(16):
@@ -535,10 +579,10 @@ def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
                     name=f"l9_add_carry_out_c{carry_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
-                    gate="OP_ADD",
+                    gate=gate_add,
                     gate_weight=1.0,
                     gate_bias=0.0,
-                    writes=(("CARRY+1", 2.0 / S),),
+                    writes=((carry_byte1, 2.0 / S),),
                 ))
     return tuple(rules)
 
@@ -551,8 +595,15 @@ def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
     borrow: ``a < b`` when ``borrow_in == 0``, or ``a <= b`` when
     ``borrow_in == 1``. Same weak ``±0.01`` carry discrimination /
     relaxed thresholds as the ADD carry-out band. Gated by ``OP_SUB``.
+
+    Phase 7.E.3: gate + carry-output refs use :func:`dim_ref` for the
+    ``(opcode_flag, SUB)`` and ``(carry, alu, byte_index=2)`` pairs.
+    The ``+2`` offset is the byte-2 position of the inter-byte ALU
+    carry cascade.
     """
 
+    gate_sub = dim_ref("opcode_flag", "SUB")
+    carry_byte2 = dim_ref("carry", "alu", 2)
     rules: list[FFNRule] = []
     for borrow_in in (0, 1):
         for a in range(16):
@@ -585,10 +636,10 @@ def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
                     name=f"l9_sub_borrow_out_b{borrow_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
-                    gate="OP_SUB",
+                    gate=gate_sub,
                     gate_weight=1.0,
                     gate_bias=0.0,
-                    writes=(("CARRY+2", 2.0 / S),),
+                    writes=((carry_byte2, 2.0 / S),),
                 ))
     return tuple(rules)
 
