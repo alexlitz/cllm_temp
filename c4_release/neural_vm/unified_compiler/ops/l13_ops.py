@@ -460,8 +460,10 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
     Pinned to ``layer_idx=13`` via ``kind="block"``. See
     ``make_layer13_mem_addr_gather_op``.
 
-    In ``alu_mode='lookup'`` we bake the standard SHL/SHR lookup table via
-    ``_set_layer13_shifts`` into the L13 PureFFN block.
+    In ``alu_mode='lookup'`` we bake the standard SHL/SHR lookup table as a
+    4096-rule declarative :class:`FFNRule` IR (Phase 6 Wave 4B migration);
+    byte-identical to the legacy ``setup_helpers._set_layer13_shifts`` helper
+    (gated by ``test_declarative_ffn_bakes_l13``).
 
     Declarations-only note: lookup mode is exposed through the migrated owner
     so strict builds do not fall back to legacy model bake. Efficient mode is
@@ -484,9 +486,10 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
     if alu_mode == "efficient":
         def bake(block, dim_positions, S):
             return  # ALUShiftComposite (4-stage) owns SHL/SHR in efficient mode.
+
+        compiler_ir = None
     else:
         def bake(block, dim_positions, S):
-            from ...vm_step import _set_layer13_shifts
             proxy = _as_setdim_proxy(dim_positions)
 
             # Per-bake FFN-unit allocator. Each L13 shift sub-stage is
@@ -498,7 +501,18 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
             allocator = _allocate_layer13_shifts_units()
             block.ffn._l13_unit_allocator = allocator
 
-            _set_layer13_shifts(block.ffn, S, proxy)
+            n_units = _bake_layer13_shifts(block.ffn, S, proxy)
+            # Byte-identity guard: the declarative lowering MUST land
+            # exactly on the allocator's declared range total or a
+            # downstream layer will read stale weights.
+            expected_total = sum(n for _, _, n in _L13_SHIFTS_UNIT_LAYOUT)
+            assert n_units == expected_total, (
+                f"L13 layer13_shifts unit cursor drift: declarative "
+                f"bake wrote {n_units} units, allocator declared "
+                f"{expected_total}"
+            )
+
+        compiler_ir = _layer13_shifts_ir()
 
     return Operation(
         name="layer13_shifts",
@@ -509,6 +523,7 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=compiler_ir,
         declarative_authority="spec_generated",
         layer_idx=13,
         migrated=True,

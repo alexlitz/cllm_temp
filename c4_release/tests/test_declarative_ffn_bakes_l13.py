@@ -29,6 +29,7 @@ from c4_release.neural_vm.unified_compiler.ops.l13_ops import (
     _layer13_shifts_rules,
     _layer13_shl_rules,
     _layer13_shr_rules,
+    make_layer13_shifts_op,
 )
 from c4_release.neural_vm.unified_compiler.primitives import Primitives
 
@@ -166,3 +167,43 @@ def test_layer13_shifts_ir_passes_declaration_and_lowering_checks():
         "structural compare_symbolic_to_lowered_ffn failures: "
         + "\n".join(f"  [{i.kind}] {i.message}" for i in structural_failures)
     )
+
+
+def test_layer13_shifts_op_exposes_compiler_ir():
+    """``make_layer13_shifts_op(alu_mode='lookup')`` must attach the IR.
+
+    Efficient mode is a no-op (ALUShiftComposite owns SHL/SHR there) so
+    it intentionally has no ``compiler_ir``.
+    """
+    lookup_op = make_layer13_shifts_op(alu_mode="lookup")
+    assert lookup_op.compiler_ir is not None
+    assert len(lookup_op.compiler_ir.layer(0).ffn.rules) == 4096
+
+    efficient_op = make_layer13_shifts_op(alu_mode="efficient")
+    assert efficient_op.compiler_ir is None
+
+
+def test_layer13_shifts_op_bake_fn_matches_legacy_helper():
+    """End-to-end: ``make_layer13_shifts_op().bake_fn`` produces a block
+    whose FFN is byte-identical to ``_set_layer13_shifts``.
+    """
+
+    class _StubBlock:
+        def __init__(self):
+            self.ffn = _StubFFN(hidden_dim=4096)
+
+    op = make_layer13_shifts_op(alu_mode="lookup")
+
+    block = _StubBlock()
+    # Use the canonical dim_positions derived from ``_SetDim`` (the legacy
+    # bake reads attributes via the proxy adapter).
+    names = Primitives.ffn_rule_dim_names(
+        op.compiler_ir.layer(0).ffn.rules
+    )
+    dim_positions = Primitives.dim_positions_from_bd(_SetDim, names)
+    op.bake_fn(block, dim_positions, 100.0)
+
+    expected = _StubFFN(hidden_dim=4096)
+    _set_layer13_shifts(expected, 100.0, _SetDim)
+
+    _assert_same_ffn(block.ffn, expected)
