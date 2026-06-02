@@ -1,8 +1,66 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..ir import CompilerIR
 from ..layer_compiler import Operation
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+# === L13 attention-head layout (pinned indices) =====================
+#
+# ``layer13_mem_addr_gather`` owns heads 0, 1, 2 on the L13 attention
+# block. Each head gathers one MEM addr byte's CLEAN_EMBED nibbles into
+# ADDR_B{0,1,2}_LO/HI at the MEM val byte positions:
+#
+#   head 0 -> ADDR_B0_LO/HI, plus the ADDR_B0_VALID lifecycle bit
+#             (slot 34, B7-4).
+#   head 1 -> ADDR_B1_LO/HI, plus the ADDR_B1_VALID lifecycle bit
+#             (slot 34, B8-A; routes into H5+4 / position 99).
+#   head 2 -> ADDR_B2_LO/HI, plus the ADDR_B2_VALID lifecycle bit
+#             (slot 34, B8-A; routes into H5+5 / position 100).
+#
+# Pre-migration the call sites used bare ``base = j * HD`` literals
+# inside ``_set_layer13_mem_addr_gather`` and ``_l13_addr_bn_valid_extension``.
+# Pinning the allocator preserves those exact slots so the lowering is
+# byte-identical, while the layout table becomes the audited source of
+# truth for future L13 attention extensions.
+_L13_HEAD_LAYOUT = (
+    # (op-name key,                            pinned head_idx)
+    ("layer13_mem_addr_gather.head_0",         0),  # ADDR_B0 + ADDR_B0_VALID
+    ("layer13_mem_addr_gather.head_1",         1),  # ADDR_B1 + ADDR_B1_VALID
+    ("layer13_mem_addr_gather.head_2",         2),  # ADDR_B2 + ADDR_B2_VALID
+)
+
+
+def _allocate_layer13_attention_heads() -> AttentionHeadAllocator:
+    """Build a per-bake :class:`AttentionHeadAllocator` with the L13 heads pinned.
+
+    Every entry in :data:`_L13_HEAD_LAYOUT` is pinned at its existing
+    ``head_idx`` so the underlying weight writes -- now expressed as
+    ``DeclarativeAttentionHeadSpec`` instances -- land byte-identically.
+    A future L13 attention op can claim a free head past index 2 via
+    ``allocator.alloc(name, layer_idx=13)`` (no ``pin=``) without
+    touching this table.
+    """
+    allocator = AttentionHeadAllocator()
+    for name, head_idx in _L13_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=13, pin=head_idx)
+    return allocator
+
+
+def _l13_head_idx(op_name: str) -> int:
+    """Return the pinned L13 ``head_idx`` for ``op_name``.
+
+    Static lookup against :data:`_L13_HEAD_LAYOUT` for callers (e.g.
+    ``compiler_ir_factory`` helpers) that cannot instantiate a per-bake
+    allocator. Mirrors the L4 ``_l4_head_idx`` pattern.
+    """
+    for name, head_idx in _L13_HEAD_LAYOUT:
+        if name == op_name:
+            return head_idx
+    raise KeyError(f"_l13_head_idx: unknown L13 attention op {op_name!r}")
 
 
 # === L13 FFN unit layout (pinned offsets) ============================
@@ -53,53 +111,16 @@ def _allocate_layer13_shifts_units() -> FFNUnitAllocator:
     return allocator
 
 
-def _l13_addr_bn_valid_extension(attn, BD, HD, S):
-    """B8-A: mirror the head-0 ADDR_B0_VALID slot-34 producer on heads 1 and 2.
+def _l13_addr_bn_valid_positions(BD):
+    """Resolve the ADDR_B{1,2}_VALID destination dim positions.
 
-    The B7-4 producer in ``_set_layer13_mem_addr_gather`` wires a single
-    lifecycle bit on head 0 slot 34: Q fires at MEM val byte positions, K
-    selects the MEM addr byte 0 row (L1H1+MEM_I=+L, L1H0+MEM_I=-L), V reads
-    ``L1H1+MEM_I``, and W_o routes the gathered constant into
-    ``ADDR_B0_VALID`` (slot 97).
-
-    B8-A allocates two more lifecycle bits at slots 99 (``ADDR_B1_VALID``)
-    and 100 (``ADDR_B2_VALID``). Heads 1 and 2 already gather the ADDR_B1 /
-    ADDR_B2 nibbles via slots 1..32; this helper adds the matching slot-34
-    VALID bit per head so downstream rules can gate on B1/B2 freshness with
-    a dedicated witness instead of borrowing ADDR_B0_VALID.
-
-    Per-head K rows mirror the primary-gather K:
-      - head 1: K[+L1H2+MEM_I, -L1H1+MEM_I] -- picks MEM addr byte 1 (d=2).
-      - head 2: K[+H0+MEM_I,   -L1H2+MEM_I] -- picks MEM addr byte 2 (d=3).
-
-    V reads the same threshold dim that K's positive arm fires on (so the
-    attended row delivers V=1 and unrelated rows V=0; same lifecycle logic
-    as head 0 slot 34 with L1H1+MEM_I).
-
-    Output W_o routes to position 99 (ADDR_B1_VALID) for head 1 and 100
-    (ADDR_B2_VALID) for head 2. We resolve the destination through
-    ``dim_positions`` when the compiler declared the slot, and fall back to
-    the dim_registry-allocated aliases (H5+4 / H5+5 = 99 / 100) otherwise so
-    the producer fires under both the legacy ``pin_to_setdim`` layout and
-    pre-declaration layouts.
-
-    The matrix writes are inlined here (not in ``setup_helpers``) so this
-    B8-A producer ships in a single op-factory file. ``writes`` and
-    ``claims`` are deliberately left untouched -- those declarations
-    formalize ownership and are scheduled for a follow-up commit that also
-    adds the dim names to ``declare_setdim_compat_dims`` and refreshes the
-    per-op contract tests. The verifier reports the new cells under
-    ``written_but_not_declared`` (non-strict OK) until that lands.
+    Position 99 (``ADDR_B1_VALID``) aliases ``H5+4``; position 100
+    (``ADDR_B2_VALID``) aliases ``H5+5``. Use ``dim_positions`` when the
+    compiler exposed the new names; otherwise derive from ``H5`` (the
+    dormant L0 head-5 threshold output the B7/B8 dims alias onto). The
+    numeric fallback (99 / 100) matches the dim_registry allocation so the
+    producer fires even before the compiler learns the new names.
     """
-    L = 15.0
-    MEM_I = 4
-    VALID_SLOT = 34
-    # Position 99 (ADDR_B1_VALID) aliases H5+4; position 100 aliases H5+5.
-    # Use dim_positions when the compiler exposed the new names; otherwise
-    # derive from H5 (the dormant L0 head-5 threshold output the B7/B8 dims
-    # all alias onto). The numeric fallback (99 / 100) matches the
-    # dim_registry allocation so the producer fires even before the compiler
-    # learns the new names.
     h5_base = getattr(BD, "H5", None)
     addr_b1_valid_pos = getattr(BD, "ADDR_B1_VALID", None)
     if addr_b1_valid_pos is None:
@@ -107,27 +128,119 @@ def _l13_addr_bn_valid_extension(attn, BD, HD, S):
     addr_b2_valid_pos = getattr(BD, "ADDR_B2_VALID", None)
     if addr_b2_valid_pos is None:
         addr_b2_valid_pos = (h5_base + 5) if h5_base is not None else 100
+    return addr_b1_valid_pos, addr_b2_valid_pos
 
-    # Per-head wiring tables: (base, K_pos_dim, K_neg_dim, V_read_dim, O_dest)
-    head_specs = (
-        (1, BD.L1H2 + MEM_I, BD.L1H1 + MEM_I, BD.L1H2 + MEM_I, addr_b1_valid_pos),
-        (2, BD.H0   + MEM_I, BD.L1H2 + MEM_I, BD.H0   + MEM_I, addr_b2_valid_pos),
+
+def _layer13_mem_addr_gather_head_specs(BD) -> tuple:
+    """Declarative L13 heads 0-2: MEM addr-byte gather + B7-4/B8-A VALID bits.
+
+    Mirrors ``setup_helpers._set_layer13_mem_addr_gather`` (heads 0-2 slot 0
+    + slot 33 anti-leak, slot 1..32 V/O CLEAN_EMBED -> ADDR_BJ_LO/HI, plus
+    head 0 slot 34 ADDR_B0_VALID lifecycle) AND
+    ``_l13_addr_bn_valid_extension`` (heads 1/2 slot 34 ADDR_B{1,2}_VALID
+    extension). Per-head K rows pick the MEM addr-byte ``j`` row:
+
+      - head 0 (ADDR_B0): K[+L1H1+MEM_I, -L1H0+MEM_I] -- addr byte 0 at d=1.
+      - head 1 (ADDR_B1): K[+L1H2+MEM_I, -L1H1+MEM_I] -- addr byte 1 at d=2.
+      - head 2 (ADDR_B2): K[+H0+MEM_I,   -L1H2+MEM_I] -- addr byte 2 at d=3.
+
+    The VALID lifecycle V reads the K+ threshold dim so the attended
+    addr-byte-J row delivers V=1.0 (and unrelated rows V=0) -- same logic
+    as the head-0 slot-34 ADDR_B0_VALID producer (B7-4) extended to
+    ADDR_B1_VALID / ADDR_B2_VALID (B8-A).
+    """
+    L = 15.0
+    MEM_I = 4
+    VALID_SLOT = 34
+    addr_b1_valid_pos, addr_b2_valid_pos = _l13_addr_bn_valid_positions(BD)
+
+    # Per-head wiring tables: layout for the J-th MEM addr byte gather head.
+    # (head_idx, addr_lo_out, addr_hi_out, K_pos_dim, K_neg_dim,
+    #  valid_v_read_dim, valid_o_dest)
+    head_layout = (
+        (
+            _l13_head_idx("layer13_mem_addr_gather.head_0"),
+            BD.ADDR_B0_LO, BD.ADDR_B0_HI,
+            BD.L1H1 + MEM_I, BD.L1H0 + MEM_I,
+            BD.L1H1 + MEM_I, BD.ADDR_B0_VALID,
+        ),
+        (
+            _l13_head_idx("layer13_mem_addr_gather.head_1"),
+            BD.ADDR_B1_LO, BD.ADDR_B1_HI,
+            BD.L1H2 + MEM_I, BD.L1H1 + MEM_I,
+            BD.L1H2 + MEM_I, addr_b1_valid_pos,
+        ),
+        (
+            _l13_head_idx("layer13_mem_addr_gather.head_2"),
+            BD.ADDR_B2_LO, BD.ADDR_B2_HI,
+            BD.H0 + MEM_I, BD.L1H2 + MEM_I,
+            BD.H0 + MEM_I, addr_b2_valid_pos,
+        ),
     )
 
-    for h, k_pos, k_neg, v_read, o_dest in head_specs:
-        base = h * HD
-        # Q mirrors the primary slot 0 -- fires at every MEM val byte position.
-        attn.W_q[base + VALID_SLOT, BD.MEM_VAL_B0] = L
-        attn.W_q[base + VALID_SLOT, BD.MEM_VAL_B1] = L
-        attn.W_q[base + VALID_SLOT, BD.MEM_VAL_B2] = L
-        attn.W_q[base + VALID_SLOT, BD.MEM_VAL_B3] = L
-        # K mirrors the primary slot 0 -- picks the MEM addr byte j row.
-        attn.W_k[base + VALID_SLOT, k_pos] = L
-        attn.W_k[base + VALID_SLOT, k_neg] = -L
-        # V reads the K+ dim so the attended addr-byte-j row delivers 1.0.
-        attn.W_v[base + VALID_SLOT, v_read] = 1.0
-        # O routes the gathered constant into ADDR_B{1,2}_VALID.
-        attn.W_o[o_dest, base + VALID_SLOT] = 1.0
+    specs = []
+    for (head_idx, addr_lo_out, addr_hi_out,
+         k_pos, k_neg, valid_v_read, valid_o_dest) in head_layout:
+        # Q slot 0: fires at MEM val byte positions (d=5..8 from MEM)
+        q = [
+            AP(0, BD.MEM_VAL_B0, L),
+            AP(0, BD.MEM_VAL_B1, L),
+            AP(0, BD.MEM_VAL_B2, L),
+            AP(0, BD.MEM_VAL_B3, L),
+            # Slot 33 anti-leakage gate
+            AP(33, BD.MEM_VAL_B0, L),
+            AP(33, BD.CONST, -L / 2),
+            # Slot 34 VALID lifecycle Q mirrors slot 0 (fires at MEM val bytes)
+            AP(VALID_SLOT, BD.MEM_VAL_B0, L),
+            AP(VALID_SLOT, BD.MEM_VAL_B1, L),
+            AP(VALID_SLOT, BD.MEM_VAL_B2, L),
+            AP(VALID_SLOT, BD.MEM_VAL_B3, L),
+        ]
+        # K slot 0: fires at MEM addr byte J position; slot 33 const anti-leak;
+        # slot 34 mirrors slot 0 (picks the MEM addr byte J row).
+        k = [
+            AP(0, k_pos, L),
+            AP(0, k_neg, -L),
+            AP(33, BD.CONST, L),
+            AP(VALID_SLOT, k_pos, L),
+            AP(VALID_SLOT, k_neg, -L),
+        ]
+        # V slots 1..32 copy CLEAN_EMBED nibbles (addr byte value).
+        # V slot 34 reads valid_v_read so the attended addr-byte-J row
+        # delivers V=1.0 and unrelated rows deliver 0.
+        v = [AP(1 + kk, BD.CLEAN_EMBED_LO + kk, 1.0) for kk in range(16)]
+        v += [AP(17 + kk, BD.CLEAN_EMBED_HI + kk, 1.0) for kk in range(16)]
+        v.append(AP(VALID_SLOT, valid_v_read, 1.0))
+        # O slots 1..32 route gathered nibbles to ADDR_BJ_LO/HI; slot 34
+        # routes the VALID lifecycle bit into ADDR_BJ_VALID.
+        o = [AO(addr_lo_out + kk, 1 + kk, 1.0) for kk in range(16)]
+        o += [AO(addr_hi_out + kk, 17 + kk, 1.0) for kk in range(16)]
+        o.append(AO(valid_o_dest, VALID_SLOT, 1.0))
+
+        specs.append(DeclarativeAttentionHeadSpec(
+            head_idx=head_idx,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ))
+    return tuple(specs)
+
+
+def _layer13_mem_addr_gather_ir(dim_positions, HD) -> CompilerIR:
+    """Build the declarative L13 mem-addr-gather IR for the compiler.
+
+    Three heads (0/1/2), each gather one MEM addr byte's CLEAN_EMBED
+    nibbles into ADDR_BJ_LO/HI at MEM val byte positions, plus a
+    slot-34 VALID lifecycle bit per head (ADDR_B0_VALID/B1_VALID/B2_VALID).
+    See :func:`_layer13_mem_addr_gather_head_specs` for the byte-level layout.
+    """
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    for spec in _layer13_mem_addr_gather_head_specs(proxy):
+        ir.layer(0).attention.append(spec)
+    return ir
 
 
 def make_layer13_mem_addr_gather_op() -> Operation:
@@ -135,20 +248,34 @@ def make_layer13_mem_addr_gather_op() -> Operation:
 
     Pinned to ``layer_idx=13`` via ``kind="block"``: dep-graph assignment
     otherwise lands at L15 (mismatch with legacy block 13).
+
+    Wave 3I: fully migrated to ``DeclarativeAttentionHeadSpec`` form. The
+    legacy ``_set_layer13_mem_addr_gather`` and ``_l13_addr_bn_valid_extension``
+    imperative helpers are replaced by
+    :func:`_layer13_mem_addr_gather_head_specs` (three head specs covering
+    the B7-4 ADDR_B0_VALID producer and the B8-A ADDR_B{1,2}_VALID
+    extension), exposed via ``compiler_ir_factory``. Byte-identity gated by
+    ``compare_symbolic_to_lowered_attn``.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer13_mem_addr_gather
+        del S
         attn = block.attn
+        proxy = _as_setdim_proxy(dim_positions)
+        # Per-bake attention-head allocator with the L13 head layout pinned.
+        # Stashed on ``attn`` for downstream inspection / extension; the
+        # actual ``head_idx`` values used by ``_layer13_mem_addr_gather_head_specs``
+        # come from :func:`_l13_head_idx` so the spec stays in lockstep
+        # with the layout table without re-querying the allocator here.
+        allocator = _allocate_layer13_attention_heads()
+        attn._l13_head_allocator = allocator
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
-        BD = _as_setdim_proxy(dim_positions)
-        _set_layer13_mem_addr_gather(attn, S, BD, HD)
-        # B8-A: extend the producer with ADDR_B1_VALID / ADDR_B2_VALID slot-34
-        # bakes on heads 1 and 2. Inlined here (not in setup_helpers) so the
-        # follow-up cleanup -- which will also need to update the L13 per-op
-        # test contract -- can move them in one go.
-        _l13_addr_bn_valid_extension(attn, BD, HD, S)
+        Primitives.generate_attention_heads(
+            attn,
+            _layer13_mem_addr_gather_head_specs(proxy),
+            HD,
+        )
 
     # Dim-ownership claims: L13 attn heads 0-2 mem addr gather. Each head
     # writes V slots 1..32 reading CLEAN_EMBED_LO/HI:
@@ -188,6 +315,7 @@ def make_layer13_mem_addr_gather_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir_factory=_layer13_mem_addr_gather_ir,
         declarative_authority="spec_generated",
         layer_idx=13,
         migrated=True,
