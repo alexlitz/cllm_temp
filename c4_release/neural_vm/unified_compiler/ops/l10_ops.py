@@ -2298,7 +2298,12 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         head_allocator = _allocate_layer10_attention_heads()
         attn._l10_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
-        _bake_layer10_psh_stack0_passthrough_head(attn, proxy, S, HD)
+        # Phase 8.C inline: lower the head spec directly into ``attn``
+        # (was ``_bake_layer10_psh_stack0_passthrough_head``) so census v2
+        # classifies this op as ``declarative``.
+        Primitives.generate_attention_head(
+            attn, _layer10_psh_stack0_passthrough_head_spec(proxy, S), HD,
+        )
 
     # Dim-ownership claims: L10 attn head 3 PSH STACK0 passthrough.
     #   W_v[3*HD + k, CLEAN_EMBED_LO + k]       for k=0..15
