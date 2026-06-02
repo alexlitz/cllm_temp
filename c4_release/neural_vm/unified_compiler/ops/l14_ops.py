@@ -1225,6 +1225,64 @@ def make_layer14_clear_output_corruption_op() -> Operation:
     )
 
 
+def _layer14_clear_mem_marker_output_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_clear_mem_marker_output``.
+
+    64 hidden units arranged as four 16-element blocks:
+      block 0 (units +0..+15):  OP_JSR + OUTPUT_LO[k]   (k in 0..15)
+      block 1 (units +16..+31): OP_JSR + OUTPUT_HI[k]   (k in 0..15)
+      block 2 (units +32..+47): OP_ENT + OUTPUT_LO[k]   (k in 0..15)
+      block 3 (units +48..+63): OP_ENT + OUTPUT_HI[k]   (k in 0..15)
+
+    Each rule fires only at the MEM marker token when the matching op
+    relay is active: positive contributions from OP_* (weight 0.2,
+    matching the imperative ``W_up[OP_*] = S/5``) and MARK_MEM (weight
+    1.0), strong -10 blockers on IS_BYTE / MARK_PC / MARK_AX / MARK_SP /
+    MARK_BP / MARK_STACK0, threshold 1.5 so only the (relay+MEM marker)
+    pair fires. The W_down weight is the per-S 76/S offset
+    that cancels the L14 attention's -115 corruption per dim.
+    """
+    OFFSET = 76.0 / S  # imperative: same OFFSET = 76.0 / S
+    common_blockers = (
+        ("IS_BYTE", -10.0),
+        ("MARK_PC", -10.0),
+        ("MARK_AX", -10.0),
+        ("MARK_SP", -10.0),
+        ("MARK_BP", -10.0),
+        ("MARK_STACK0", -10.0),
+    )
+
+    def rule_for(op_name: str, band: str, k: int) -> FFNRule:
+        return FFNRule.gated_write(
+            name=f"l14_clear_mem_marker_output_{op_name.lower()}_{band.lower()}_{k}",
+            conditions=(
+                (op_name, 0.2),  # imperative: W_up[OP_*] = S / 5
+                ("MARK_MEM", 1.0),
+                *common_blockers,
+            ),
+            threshold=1.5,
+            gate="CONST",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"{band}+{k}", OFFSET),),
+            scope=f"{op_name} and MARK_MEM",
+        )
+
+    rules: list[FFNRule] = []
+    for op_name in ("OP_JSR", "OP_ENT"):
+        for k in range(16):
+            rules.append(rule_for(op_name, "OUTPUT_LO", k))
+        for k in range(16):
+            rules.append(rule_for(op_name, "OUTPUT_HI_THIS_STEP", k))
+    return tuple(rules)
+
+
+def _layer14_clear_mem_marker_output_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_clear_mem_marker_output_rules(S))
+    return ir
+
+
 def make_layer14_clear_mem_marker_output_op() -> Operation:
     """L14 FFN: Clear OUTPUT at MEM marker for OP_JSR/OP_ENT.
 
@@ -1232,15 +1290,24 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
     counter on ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops
     (``layer14_temp_clear``, ``layer14_clear_addr_key_pollution``,
     ``layer14_clear_output_corruption``). Last in the chain (phase=14.4).
+
+    Migration (Phase 6 wave 3J): per-unit writes declared via
+    :func:`_layer14_clear_mem_marker_output_rules` and attached as
+    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_clear_mem_marker_output
         ffn = block.ffn
         # Pinned to chain offset 70 (predecessors consume units 0..69).
         # Byte-identical with the legacy ``_l14_unit_counter`` start.
         start_unit = _l14_chain_alloc("layer14_clear_mem_marker_output")
-        next_unit = _set_layer14_clear_mem_marker_output(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_clear_mem_marker_output_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
         )
         _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
         ffn._l14_unit_counter = next_unit
@@ -1275,6 +1342,7 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer14_clear_mem_marker_output_ir(),
         declarative_authority="spec_generated",
         layer_idx=14,
         migrated=True,
