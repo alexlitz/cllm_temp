@@ -195,6 +195,16 @@ _BENIGN_RESIDUAL_RES = (
         r"\b(?:W_up|W_down|W_gate|W_q|W_k|W_v|W_o|b_up|b_gate|b_down)"
         r"\.data\[[^\]]*\]\.zero_\(\)"
     ),
+    # ``<param>.data[<slice>] = 0`` / ``= 0.0`` — slice zero-fill via
+    # assignment. The slice must contain ``:`` (a true slice, not an
+    # individual cell), so this only matches band-style clears such as
+    # ``ffn.W_up.data[start:end, :] = 0`` from ``_clear_ffn_unit_band``.
+    # The trailing negative lookahead avoids stripping ``= 0`` from
+    # ``= 0.5`` / ``= 0e3``.
+    re.compile(
+        r"\b(?:W_up|W_down|W_gate|W_q|W_k|W_v|W_o|b_up|b_gate|b_down)"
+        r"\.data\[[^\]]*:[^\]]*\] = 0(?:\.0)?(?![\.\w])"
+    ),
 )
 
 
@@ -284,6 +294,26 @@ def _has_imperative_writes(source: str) -> bool:
     return bool(_IMPERATIVE_RE.search(_strip_benign_residuals(source)))
 
 
+# Threshold for the ``declarative_with_residual`` classification: an op
+# whose bake or helper-chain contains a declarative lower call AND no
+# more than this many distinct ``W_*.data[`` / ``b_*.data[`` /
+# ``alibi_slopes.data[`` write statements (after stripping benign
+# residuals) is classified as "declarative with a small imperative
+# residual" rather than imperative_heavy. The residual is intentionally
+# kept by the op (e.g., cross-head boundary spillover for
+# ``layer6_attn_bake``) but the bulk of cells is IR-driven.
+_DECLARATIVE_WITH_RESIDUAL_MAX_IMP_WRITES = 10
+
+
+def _count_imperative_writes(source: str) -> int:
+    """Count direct ``W_*.data[`` / ``b_*.data[`` / ``alibi_slopes.data[``
+    write statements in ``source`` after benign residuals are stripped.
+    """
+    if not source:
+        return 0
+    return len(_IMPERATIVE_RE.findall(_strip_benign_residuals(source)))
+
+
 # ---------------------------------------------------------------------------
 # Recursive helper walking
 # ---------------------------------------------------------------------------
@@ -322,6 +352,12 @@ class _HelperWalkResult:
     any_lower_call: bool = False
     # Any helper had direct W_*.data writes.
     any_imperative_writes: bool = False
+    # Sum of imperative-write statements (post benign-residual strip) across
+    # the bake_fn's source + every reached helper's source. Used by the
+    # ``declarative_with_residual`` classification to distinguish
+    # "mostly-declarative with a tiny boundary residual" from a genuinely
+    # imperative helper chain.
+    total_imperative_writes: int = 0
 
 
 def _walk_helpers(
@@ -363,6 +399,12 @@ def _walk_helpers(
             continue
 
         qualname = getattr(fn, "__qualname__", getattr(fn, "__name__", "?"))
+        # Always count imperative-write statements (including the bake_fn's
+        # own source at depth 0). The bake_fn body is the most common host
+        # for residual writes alongside an inline declarative lower call,
+        # so we must include it in the running total used by
+        # ``declarative_with_residual``.
+        result.total_imperative_writes += _count_imperative_writes(src)
         if depth > 0:  # don't list the bake_fn itself
             result.visited.append(
                 (getattr(fn, "__name__", "?"), qualname)
@@ -631,6 +673,31 @@ def _classify_op(op, dim_positions: Dict[str, int], d_model: int,
         and walk.any_lower_call
     )
 
+    # Declarative-with-residual: at least one declarative lower call is
+    # reached (inline in bake_fn OR via helper) AND the total imperative-
+    # write count is small. This covers ops whose bulk is IR-driven but
+    # that keep a tiny residual of direct writes — for example
+    # ``layer6_attn_bake`` uses ``Primitives.generate_attention_heads``
+    # for ~306 cells and 6 cross-head boundary-spillover writes to
+    # ``attn.W_v/W_o.data[...]``. We exclude truly imperative chains
+    # (e.g. ``function_call_weights`` which dispatches to
+    # ``vm_step._set_function_call_weights`` and ``l15_attention_resize``
+    # whose helpers carry ~232 imperative writes).
+    #
+    # NOTE: ``_looks_declarative_in_source`` returns False when the bake_fn
+    # has any imperative writes (even residuals); to recognize the inline
+    # lower call we check the regex directly on ``source`` here so that
+    # ``layer6_attn_bake`` (inline ``Primitives.generate_attention_heads``
+    # + 2 residual ``attn.W_v.data[...]`` writes in a 6-cell loop) lands
+    # in this bucket.
+    bake_has_lower_call = _has_lower_call(source)
+    inline_imperative_count = _count_imperative_writes(source)
+    declarative_with_residual = (
+        (inline_declarative or bake_has_lower_call or walk.any_lower_call)
+        and (bake_has_imperative_writes or walk.any_imperative_writes)
+        and walk.total_imperative_writes <= _DECLARATIVE_WITH_RESIDUAL_MAX_IMP_WRITES
+    )
+
     helpers = _extract_helpers(source)
 
     cells, breakdown, err = _exercise_op(op, dim_positions, d_model, ffn_hidden)
@@ -644,6 +711,8 @@ def _classify_op(op, dim_positions: Dict[str, int], d_model: int,
         classification = "declarative_via_helper"
     elif helper_declarative and cells == 0:
         classification = "declarative_via_helper_no_op"
+    elif declarative_with_residual and cells > 0:
+        classification = "declarative_with_residual"
     elif err is not None:
         classification = "unknown"
     elif cells == 0:
@@ -654,10 +723,13 @@ def _classify_op(op, dim_positions: Dict[str, int], d_model: int,
     # ---- informational-IR flag ------------------------------------------
     # IR attached but the bake (transitively through helpers) doesn't lower
     # it — bake still writes weights through legacy/imperative helpers.
+    # ``declarative_with_residual`` ops DO lower their IR (the residual is
+    # a small auxiliary patch), so they're not informational.
     informational_ir = bool(
         (has_ir or has_ir_factory)
         and not inline_declarative
         and not helper_declarative
+        and not declarative_with_residual
     )
 
     return OpCensusRow(
@@ -800,6 +872,11 @@ _MD_HEADER = (
     "- `declarative_via_helper`   — lower call appears in a module-local helper\n"
     "                               reached from `bake_fn`; bake_fn itself has\n"
     "                               no direct `W_*.data` writes.\n"
+    "- `declarative_with_residual` — bake/helpers issue a declarative lower call\n"
+    "                               (bulk of cells come from IR lowering) AND a\n"
+    "                               small number (≤ 10) of direct `W_*.data`\n"
+    "                               writes that remain as documented residuals\n"
+    "                               (e.g. boundary spillover, cross-head fixups).\n"
     "- `declarative_no_op`        — declarative shape but produced 0 cells (flag-off).\n"
     "- `declarative_via_helper_no_op` — same but via helper.\n"
     "- `imperative_{trivial,medium,heavy}` — bake (or its helper chain) writes\n"
@@ -843,6 +920,7 @@ def render_markdown(rows: List[OpCensusRow], agg: Dict[str, Any]) -> str:
 
     lines.append("## Per-layer breakdown\n")
     cols = ["layer", "declarative", "declarative_via_helper",
+            "declarative_with_residual",
             "declarative_no_op", "declarative_via_helper_no_op",
             "imperative_trivial", "imperative_medium", "imperative_heavy",
             "no_op", "unknown"]
