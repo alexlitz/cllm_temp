@@ -737,7 +737,7 @@ def make_layer14_mem_generation_op() -> Operation:
         # retires the back-edge while keeping the numeric slot identical.
         reads={"MARK_MEM", "MARK_SP", "MARK_STACK0", "OP_PSH", "OP_SI", "OP_SC",
                "OP_JSR", "OP_ENT", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
-               "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO_PREV_STEP", "ADDR_B0_HI_PREV_STEP",
+               "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO.*.-1", "ADDR_B0_HI.*.-1",
                "MEM_STORE", "MEM_ADDR_SRC", "STACK0_BYTE0", "L1H0", "L1H1", "L1H2",
                "H0", "H1", "L1H4", "H2", "H3", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3", "IS_BYTE"},
@@ -3031,7 +3031,7 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         # — same L15 back-edge, same numeric slot, no functional change.
         reads={"MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "H2", "H3",
                "OP_LI_RELAY", "OP_LC_RELAY", "MARK_AX",
-               "ADDR_B0_LO_PREV_STEP", "ADDR_B0_HI_PREV_STEP", "ADDR_B1_LO",
+               "ADDR_B0_LO.*.-1", "ADDR_B0_HI.*.-1", "ADDR_B1_LO",
                "CONST"},
         writes={"ADDR_KEY"},
         kind="block",
