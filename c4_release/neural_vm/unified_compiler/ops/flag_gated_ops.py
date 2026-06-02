@@ -622,11 +622,25 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
 
 
 def _convo_io_state_machine_rules(S: float) -> tuple[FFNRule, ...]:
+    """L6 convo-IO state-machine band: gate NEXT_THINKING_END on CMP cascade.
+
+    Two ``gated_write`` units that fire on the per-opcode CMP cascade
+    signal staged by the L6 relay heads (``CMP+5`` = PRTF, ``CMP+6`` =
+    READ) AND ``NEXT_SE``, then emit ``NEXT_THINKING_END`` / suppress
+    ``NEXT_SE`` / set ``IO_STATE``.
+
+    Phase 8.D: the two ``CMP+{5,6}`` condition dims use :func:`dim_ref`
+    for the role-meaningful ``(cmp_flag, "cascade", k)`` family lookups
+    -- each binding names the inter-byte cascade byte the IO relay
+    head writes for its opcode. ``NEXT_SE`` / ``NEXT_THINKING_END`` /
+    ``IO_STATE`` are slot-level flags with no ``(category, role)``
+    binding so the writes stay bare.
+    """
     write_scale = 2.0 / S
     rules = []
     for flag_name, flag_dim in (
-        ("prtf", "CMP+5"),
-        ("read", "CMP+6"),
+        ("prtf", dim_ref("cmp_flag", "cascade", 5)),
+        ("read", dim_ref("cmp_flag", "cascade", 6)),
     ):
         rules.append(FFNRule.gated_write(
             name=f"convo_io_state_machine_{flag_name}",
