@@ -2410,7 +2410,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 stack writeback IR lowered to unexpected units "
             f"{stack_writeback_ends}; expected {expected_stack_writeback_ends}"
         )
-    return
     for start, end in (
         (
             L6_ENT_FIRST_STEP_SP_BYTE0_START_UNIT,
@@ -2432,6 +2431,7 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 ENT first-step IR lowered to unexpected units "
             f"{ent_first_step_ends}; expected {expected_ent_first_step_ends}"
         )
+    return
     for start, end in (
         (L6_BZ_PC_OVERRIDE_START_UNIT, L6_BZ_PC_OVERRIDE_END_UNIT),
         (L6_BNZ_PC_OVERRIDE_START_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT),
