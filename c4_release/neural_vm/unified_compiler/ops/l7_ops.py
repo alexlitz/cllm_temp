@@ -169,14 +169,23 @@ def make_layer7_operand_gather_op() -> Operation:
         # value. Declare via the OUTPUT_LO_PREV_STEP alias (same numeric
         # slot 174, byte-identical bake) to retire the 31 OUTPUT_LO
         # back-edges into this op visible in the SCC audit. Mirrors the
-        # L3 head 5 / L8 head 6 pattern from Phase 7.A.3.b. OUTPUT_HI
-        # keeps its canonical name — OUTPUT_HI uses the B9 rename-only
-        # split and the (single) back-edge into this op is handled
-        # separately. See .agent-logs/scc_audit_phase8.md.
+        # L3 head 5 / L8 head 6 pattern from Phase 7.A.3.b.
+        #
+        # Phase 8.A G7 follow-up: OUTPUT_HI gets the same cross-step
+        # rename. Head 1's V slot 17+k reads OUTPUT_HI at the attended
+        # BP/SP marker row -- that token was last a current-step AX
+        # marker in a previous step, so its residual OUTPUT_HI carries
+        # step N-1's value. L7 (phase 7) fires before any same-step
+        # OUTPUT_HI writer (L8+), so the read is genuinely cross-step.
+        # Retarget to OUTPUT_HI_PREV_STEP (alias of OUTPUT_HI at numeric
+        # position 190; byte-identical bake) to retire 7 back-edges into
+        # this op (1 from layer9_alu, 1 from
+        # layer10_psh_stack0_passthrough_bake, and 5 L14 OUTPUT_HI
+        # writers). See .agent-logs/scheduler_phase_a_2026_06_02.md.
         reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA", "OP_ADJ", "OP_ENT",
                "CONST",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "OUTPUT_LO_PREV_STEP", "OUTPUT_HI"},
+               "OUTPUT_LO_PREV_STEP", "OUTPUT_HI_PREV_STEP"},
         writes={"ALU_LO", "ALU_HI"},
         kind="block",
         declarative_bake_fn=bake,
