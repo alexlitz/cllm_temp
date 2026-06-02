@@ -3,7 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..layer_compiler import Operation
-from ..ir import FFNRule
+from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
@@ -1912,6 +1912,21 @@ def _lower_layer6_ent_after_jsr_sp_byte0_fixup_ir(ffn, S: float, BD) -> int:
     )
 
 
+def make_layer6_ent_after_jsr_sp_byte0_fixup_ir(S: float = 100.0) -> CompilerIR:
+    """Declarative CompilerIR for the L6 ENT-after-JSR SP byte-0 fixup band.
+
+    Mirrors ``_lower_layer6_ent_after_jsr_sp_byte0_fixup_ir`` so the verifier,
+    scope checker, and dominance auditor can read the rule set directly.
+    The actual bake stays in ``make_layer6_ent_after_jsr_sp_byte0_fixup_op``
+    because the band is pinned to FFN units 1668..1674, which the generic
+    ``_dispatch_operation_ir`` (start_unit=0) cannot replicate.
+    """
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer6_ent_after_jsr_sp_byte0_fixup_rules(S))
+    return ir
+
+
 def _lower_layer6_branch_pc_override_ir(ffn, S: float, BD) -> tuple[int, int]:
     """Lower IR-authored BZ/BNZ PC override bands."""
 
@@ -2598,6 +2613,7 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir=make_layer6_ent_after_jsr_sp_byte0_fixup_ir(),
         layer_idx=6,
         ffn_units_used=L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT,
         migrated=True,
