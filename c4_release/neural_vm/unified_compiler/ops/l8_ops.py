@@ -1003,14 +1003,21 @@ def make_layer8_alu_op() -> Operation:
     after format_pointer_extraction (7.5) and the L8 multibyte_fetch
     bake (8.1), and before format_position_counter (8.5) — matching the
     legacy in-set_vm_weights ordering.
+
+    MIGRATED 2026 Phase 6 Wave 4F: the imperative ``_set_layer8_alu``
+    bake is replaced with a declarative ``FFNRule`` list lowered via
+    ``Primitives.lower_ffn_rules`` (see ``lower_layer8_alu_ir`` and the
+    18 ``_layer8_alu_<substage>_rules`` factories). The ``vm_step``
+    helper is still imported by ``layer8_multibyte_routing`` for cursor
+    recovery (an idempotent overwrite of the same weights), so it
+    stays in place; this op no longer calls it. ``compiler_ir`` exposes
+    the rule spec to verifier / scope / dominance tooling.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer8_alu
-
         # Per-bake FFN-unit allocator. ``layer8_alu`` claims the whole
-        # 0..2023 cluster via its sub-stage rows; the helper's local
-        # ``unit = 0`` counter walks that range byte-identically. The
-        # allocator is the structured manifest of those offsets so a
+        # 0..2023 cluster via its sub-stage rows; the declarative
+        # lowerer's start_unit=0 cursor walks that range byte-identically.
+        # The allocator is the structured manifest of those offsets so a
         # future op claiming a free L8 gap goes through
         # ``allocator.alloc(...)`` instead of hand-picking another
         # offset. Stash on ``block.ffn`` (mirrors the
@@ -1019,15 +1026,17 @@ def make_layer8_alu_op() -> Operation:
         allocator = _allocate_layer8_ffn_units()
         block.ffn._l8_unit_allocator = allocator
 
-        n8 = _set_layer8_alu(block.ffn, S, _as_setdim_proxy(dim_positions))
-        # Byte-identity guard: the helper's local cursor must end
-        # exactly where the next L8 FFN op (``layer8_multibyte_routing``)
-        # is pinned. If the helper's cursor drifts from the table the
-        # assertion fires before any weight surgery happens.
+        proxy = _as_setdim_proxy(dim_positions)
+        n8 = lower_layer8_alu_ir(block.ffn, S, proxy, start_unit=0)
+        # Byte-identity guard: the declarative lowerer's cursor must
+        # end exactly where the next L8 FFN op
+        # (``layer8_multibyte_routing``) is pinned. If the rule list
+        # drifts from the table the assertion fires before any weight
+        # surgery happens.
         expected_end = _l8_ffn_range_start(allocator, "layer8_multibyte_routing")
         assert n8 == expected_end, (
-            f"L8 ALU unit cursor drift: helper returned {n8}, allocator "
-            f"expected {expected_end}"
+            f"L8 ALU unit cursor drift: rule lowering returned {n8}, "
+            f"allocator expected {expected_end}"
         )
 
     return Operation(
@@ -1041,6 +1050,7 @@ def make_layer8_alu_op() -> Operation:
         bake_fn=bake,
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        compiler_ir=_layer8_alu_ir(),
         layer_idx=8,
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
