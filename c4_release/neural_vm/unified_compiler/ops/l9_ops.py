@@ -481,6 +481,105 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADD hi-nibble carry-out -> CARRY+1 (256 units).
+
+    For every (a, b, carry_in) where ``a + b + carry_in >= 16`` the unit
+    fires at the AX marker and writes ``CARRY+1`` (byte-level carry for
+    inter-byte propagation). Same 3-way operand AND used by the ADD
+    hi-nibble sub-stage, but the ``CARRY[0]`` discrimination uses the
+    weaker ``+/- 0.01`` weights documented in the legacy helper -- the
+    raw stack-top carry signal is at value ~1.0 here, not amplified, so
+    the threshold itself does most of the discrimination work. Gated by
+    ``OP_ADD``.
+    """
+
+    rules: list[FFNRule] = []
+    for carry_in in (0, 1):
+        for a in range(16):
+            for b in range(16):
+                if a + b + carry_in < 16:
+                    continue  # no carry-out
+                if carry_in == 0:
+                    conditions = (
+                        ("MARK_AX", 1.0),
+                        ("MARK_PC", -2.0),
+                        (f"ALU_HI+{a}", 1.0),
+                        (f"AX_CARRY_HI+{b}", 1.0),
+                        ("CARRY+0", -0.01 / S),
+                    )
+                    threshold = 2.5
+                else:
+                    conditions = (
+                        ("MARK_AX", 1.0),
+                        ("MARK_PC", -2.0),
+                        (f"ALU_HI+{a}", 1.0),
+                        (f"AX_CARRY_HI+{b}", 1.0),
+                        ("CARRY+0", 0.01 / S),
+                    )
+                    threshold = 2.9
+                rules.append(FFNRule.gated_write(
+                    name=f"l9_add_carry_out_c{carry_in}_a{a}_b{b}",
+                    conditions=conditions,
+                    threshold=threshold,
+                    gate="OP_ADD",
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=(("CARRY+1", 2.0 / S),),
+                ))
+    return tuple(rules)
+
+
+def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
+    """SUB hi-nibble borrow-out -> CARRY+2 (256 units).
+
+    Mirrors the SUB borrow-out loop in :func:`vm_step._set_layer9_alu`.
+    The pair-filter selects only the operand combinations that produce a
+    borrow: ``a < b`` when ``borrow_in == 0``, or ``a <= b`` when
+    ``borrow_in == 1``. Same weak ``±0.01`` carry discrimination /
+    relaxed thresholds as the ADD carry-out band. Gated by ``OP_SUB``.
+    """
+
+    rules: list[FFNRule] = []
+    for borrow_in in (0, 1):
+        for a in range(16):
+            for b in range(16):
+                if borrow_in == 0:
+                    if a >= b:
+                        continue  # no borrow-out when ALU >= AX_CARRY
+                else:
+                    if a > b:
+                        continue  # no borrow-out when ALU > AX_CARRY (a - b - 1 >= 0)
+                if borrow_in == 0:
+                    conditions = (
+                        ("MARK_AX", 1.0),
+                        ("MARK_PC", -2.0),
+                        (f"ALU_HI+{a}", 1.0),
+                        (f"AX_CARRY_HI+{b}", 1.0),
+                        ("CARRY+0", -0.01 / S),
+                    )
+                    threshold = 2.5
+                else:
+                    conditions = (
+                        ("MARK_AX", 1.0),
+                        ("MARK_PC", -2.0),
+                        (f"ALU_HI+{a}", 1.0),
+                        (f"AX_CARRY_HI+{b}", 1.0),
+                        ("CARRY+0", 0.01 / S),
+                    )
+                    threshold = 2.9
+                rules.append(FFNRule.gated_write(
+                    name=f"l9_sub_borrow_out_b{borrow_in}_a{a}_b{b}",
+                    conditions=conditions,
+                    threshold=threshold,
+                    gate="OP_SUB",
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=(("CARRY+2", 2.0 / S),),
+                ))
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 
