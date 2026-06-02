@@ -6649,7 +6649,10 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         phase=10.7,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="structural_model",
         smoke_tests={"all"},
