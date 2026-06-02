@@ -616,6 +616,13 @@ def build_default_registry() -> DimRegistry:
     _pin("OUTPUT_LO_PREV_STEP", 174, 16,
               "OUTPUT_LO from previous step (aliases OUTPUT_LO)",
               semantics="is_byte OR NOT is_byte", alias=True)
+    # Phase 8.A G7: OUTPUT_HI_PREV_STEP aliases OUTPUT_HI (same numeric
+    # base 190). Cross-step readers retarget their ``reads`` to this name
+    # so the scheduler dep graph drops the corresponding back-edges into
+    # the OUTPUT_HI_THIS_STEP writer band. Byte-identical bake.
+    _pin("OUTPUT_HI_PREV_STEP", 190, 16,
+              "OUTPUT_HI from previous step (aliases OUTPUT_HI)",
+              semantics="is_byte OR NOT is_byte", alias=True)
 
     # Memory address key (3 nibbles × 16 one-hot = 48 dims). Written at
     # positions feeding the L15 memory lookup attention.

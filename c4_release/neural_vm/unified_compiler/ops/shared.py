@@ -768,6 +768,14 @@ def declare_setdim_compat_dims(
                    # via ``requires["after"]``. See
                    # docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
                    "OUTPUT_HI_THIS_STEP",
+                   # Phase 8.A G7: OUTPUT_HI_PREV_STEP is the cross-step
+                   # alias for all OUTPUT_HI readers that fire at an
+                   # earlier static layer than any same-step OUTPUT_HI
+                   # writer. Same numeric base as OUTPUT_HI (190) so
+                   # baked weight cells are byte-identical. Declared
+                   # right after OUTPUT_HI_THIS_STEP so the alias
+                   # inherits the pinned position via ``_ALIAS_OF`` below.
+                   "OUTPUT_HI_PREV_STEP",
                    # Phase 7.A.3 OUTPUT_LO split: OUTPUT_LO_PREV_STEP is
                    # the cross-step alias for the L3 head 5 / L8 head 6
                    # attention-back reads. Same numeric base as OUTPUT_LO
@@ -847,6 +855,8 @@ def declare_setdim_compat_dims(
     # is declared. See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §6.4.
     _ALIAS_OF = {
         "OUTPUT_HI_THIS_STEP": "OUTPUT_HI",
+        # Phase 8.A G7: PREV_STEP alias for cross-step OUTPUT_HI reads.
+        "OUTPUT_HI_PREV_STEP": "OUTPUT_HI",
         # Phase 7.A.3 OUTPUT_LO split: PREV_STEP alias for cross-step reads.
         "OUTPUT_LO_PREV_STEP": "OUTPUT_LO",
         # Phase 7.A.3 TEMP split: PREV_STEP alias for future cross-step reads.
