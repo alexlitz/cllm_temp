@@ -414,6 +414,78 @@ window.
 
 ---
 
+## Section 7a — Mapping to TESTING_CHECKLIST.md
+
+The user's canonical testing requirements live in
+`c4_release/docs/TESTING_CHECKLIST.md`. Last status report
+(`TESTING_CHECKLIST_STATUS.md`, 2026-03-31) was **4/10 verified,
+6/10 needing test suites**. Phase 8 must close those gaps in
+addition to the declarative-IR work below. Each checklist item
+maps to a Phase 8 sub-wave:
+
+| # | Checklist item (verbatim) | Status (last audit) | Owned by sub-wave |
+|---|---|---|---|
+| C1 | All of the 1000+ comprehensive tests work | ✅ 1096/1096 at Phase 7 close | 8.F + 8.I (no regression) |
+| C2 | The network is 100% autoregressive, not using any external memory or logic only using standard layers | ✅ verified | 8.I (re-verify no custom-layer regression) |
+| C3 | It is able to export and run via onnx, still passing the 100+ tests | ⚠️ code exists, no test suite | **8.J** (new sub-wave) |
+| C4 | IO behavior with 100% pure autoregressive transformer works with the reading and writing user messages | ✅ 8/8 passing | 8.I (re-verify) |
+| C5 | Tool use IO works correctly | ⚠️ unclear / no test suite | **8.K** (new sub-wave) |
+| C6 | KV cache eviction works properly and maintains correct outputs over even long problems | ⚠️ partial (8.E covers correctness on smoke + 1096 but not long-context) | 8.E + **8.E.9** (long-context test) |
+| C7 | Running through the onnx runtime in c4 c works and passes the 1000+ tests | ⚠️ runtime code exists, no automated 1096 test through it | **8.L** (new sub-wave) |
+| C8 | Bundler bundles programs, the model weights and the program bytecode all together into a single file which runs the bytecode via executing the bundled model in onnx runtime, and passes the 1000+ tests. A version of the bundler written in C4 C should also exist and pass all 1000+ tests | ⚠️ bundler code exists, no automated 1096 test | **8.M** (new sub-wave) |
+| C9 | The quine, a program which outputs its own source code, runs correctly and passes the 1000+ tests. Should be written in c4 c, run via the model, include the runtime, the model weights and program bytecode. | ⚠️ quine code exists, not verified | **8.N** (new sub-wave) |
+| C10 | The network structure, it should be 100% a vanilla transformer using MoE, SwiGLU, vanilla attention. None of the operations should be performed in any other way, such as via external memory or custom non-transformer layers. The network should be able to be exported to onnx and run in onnx runtime, still passing all 1000+ tests. | ✅ architecture verified; ⚠️ ONNX-runtime 1000+ pass not verified | C10 = C2 + C3 + C7 + C8 |
+
+### New sub-waves added to close the checklist
+
+#### 8.J — ONNX export + ONNX runtime 1096 test suite (closes C3, part of C10)
+
+* **8.J.1** Verify `bundler/bundle_onnx_standard.py` (and `bundle_onnx_v2.py` / `bundle_onnx_memory.py`) produce a valid ONNX graph that loads in `onnxruntime`.
+* **8.J.2** Create `tests/test_onnx_runtime_1096.py`: export model, run all 1096 corpus programs through ONNX runtime, assert 100% pass match PyTorch implementation.
+* **8.J.3** Add CI gate.
+* **Acceptance**: ONNX runtime passes 1096/1096 (matches Phase 7 close baseline of 1096/1096 on `BakedC4Transformer`).
+
+#### 8.K — Tool-use IO test suite (closes C5)
+
+* **8.K.1** Clarify the requirement: review `neural_vm/tool_calling/` + `docs/TOOL_CALLING.md`. Document what "tool use IO" means.
+* **8.K.2** If interactive function-calling: create `tests/test_tool_use_io.py` covering open/read/close + tool-call markers. If external program calls: implement at minimum a stub harness.
+* **Acceptance**: documented + at least 5 representative tool-use programs pass end-to-end with byte-accurate IO traces.
+
+#### 8.E.9 — KV eviction long-context correctness test (closes C6)
+
+* Already in 8.E scope (overwrite-detection), but add an explicit **long-context** test: run programs whose token sequence exceeds the default KV window, verify output remains correct AND eviction actually fires.
+* `tests/test_kv_eviction_long_context.py` with 5-10 long programs.
+* **Acceptance**: long programs pass with eviction ON and OFF, byte-identical logits; eviction count > 0 (proves the policy actually evicts).
+
+#### 8.L — ONNX runtime in C4-C (closes C7, part of C10)
+
+* **8.L.1** Audit `vm/onnx_standard_runtime.c`, `bundler/onnx_standard_runtime.c`. Determine if both compile + execute today.
+* **8.L.2** Create `tests/test_c_runtime_1096.py`: compile the C4-C ONNX runtime; load the exported ONNX; run all 1096 test programs through it; assert 100% pass.
+* **8.L.3** Document compile + run procedure.
+* **Acceptance**: C runtime passes 1096/1096.
+
+#### 8.M — Bundler tests (closes C8)
+
+* **8.M.1** `tests/test_bundler_1096.py`: bundle all 1096 test programs (model weights + bytecode + bundled runtime) into single executable; run each; assert 100% pass.
+* **8.M.2** C4-C version of the bundler: verify it exists, builds, and produces equivalent output.
+* **8.M.3** Self-hosting validation: the C4-C bundler must be able to bundle ITSELF (output runs and produces a working bundler).
+* **Acceptance**: Python bundler passes 1096/1096; C4-C bundler passes 1096/1096; self-bundle round-trips.
+
+#### 8.N — Quine (closes C9)
+
+* **8.N.1** Verify `vm/neural_quine.c` or `vm/meta_quine.c` compiles, runs via the model, and outputs its own source code.
+* **8.N.2** Add `tests/test_quine.py` that runs the quine, diffs output against source, asserts identical.
+* **8.N.3** Run 1096 tests through the bundled-quine stack: the quine output (model + runtime + bytecode) must itself pass the 1096 suite — meta-bootstrap test.
+* **Acceptance**: quine produces byte-identical source; bundled quine passes 1096/1096.
+
+These six sub-waves (8.J, 8.K, 8.E.9, 8.L, 8.M, 8.N) add roughly
+**14-21 days of work** per the status doc estimates. They are
+prerequisite to declaring the full vision realized — without them,
+the model works in PyTorch but the deployment + meta-bootstrap
+story (ONNX, C runtime, bundler, quine) is incomplete.
+
+---
+
 ## Section 7 — Explicit mapping to the user's original vision
 
 The user's 5-component vision (from the original conversation):
@@ -501,16 +573,92 @@ so nothing slips.
 | Dim-ownership `_detect_claim_collisions` warnings | 0 (was 2 at one point; `c455e38` fixed it) |
 | Pre-existing test pass set | Tests passing at Phase 7 close must still pass |
 
+### Additional declarative-IR + scheduler test suites (must stay green)
+
+These existed at Phase 7 close and gate specific Phase 6/7 contracts.
+Phase 8 must not regress them.
+
+| Suite | What it gates |
+|---|---|
+| `test_u32_invariant.py` | No fp64 fallback, no >32-bit values, no 16-bit MUL_ACCUM |
+| `test_declarative_verification.py` | Corpus-wide declaration drift (no `declared_but_not_written` ops beyond the 0 baseline) |
+| `test_compiler_ir.py` | `CompilerIR` lowering semantics on every FFN/attn op |
+| `test_attention_ir.py` | `AttentionHeadIR` semantics |
+| `test_token_embedding_ir.py` | `TokenEmbeddingRule` lowering (Phase 7.D) |
+| `test_compare_symbolic_to_lowered_attn.py` | Attn byte-identity sweep tool itself |
+| `test_attention_verifier.py` / `test_attention_verifier_v2.py` | Scope-aware competition filter (Q-side overlap) |
+| `test_compiler_linker_semantics.py` | Compiler/linker semantic invariants |
+| `test_declarative_band_contracts.py` / `test_declarative_band_guarantees.py` | Per-band declaration contracts |
+| `test_declarative_attention_specs.py` / `test_declarative_threshold_attention_specs.py` | Attention spec semantics |
+| `test_declarative_l10_passthrough_specs.py` | L10 passthrough spec semantics |
+| `test_declarative_nibble_discretizer.py` | Nibble discretization |
+| `test_declarative_bake_gate.py` | Bake gate (authority kinds) |
+| `test_ffnrule_dominates_at.py` / `test_ffnrule_scope.py` | FFN rule `scope` and `dominates_at` predicate gates |
+| `test_phase_7_e_2_dim_ref_migration.py` | dim_ref refactor byte-identity |
+| `test_phase_deprecation.py` | `phase=` deprecation tracking (8.G.5 forcing function) |
+| `test_op_requires_op_name.py` | `requires={"after": "op_name"}` schema (B10) |
+| `test_b13_dep_declaration_gate.py` | Dep declaration gate (B13) |
+| `test_per_op_audit_scope_helper.py` / `test_per_op_audit_strength_helper.py` | Per-op audit predicates (F12 / S-10) |
+| `test_effective_predicate.py` | Effective predicate linearity (S-1) |
+| `test_predicates_entailment.py` / `test_predicates_overlap.py` / `test_predicates_parse.py` | Predicate DSL (F1/F2) |
+| `test_writer_index.py` | Writer index (S-4) |
+| `test_contribution_algebra.py` | Sign-aware contribution algebra (S-2 followup) |
+| `test_strength_verifier.py` | Rule strength verification (S-6) |
+| `test_verify_rule_scopes.py` | Rule scope verifier (F7) |
+| `test_verifier_prints_semantics.py` | Verifier output stability (F11) |
+| `test_backbone_bounds.py` | Backbone bounds (S-7/S-8) — residual magnitude bounds |
+| `test_staleness_invariants.py` | Staleness analyzer invariants |
+| `test_structural_guarantees.py` | Structural guarantees corpus |
+| `test_dim_ownership.py` | Dim ownership invariants |
+| `test_dim_semantics_present.py` / `test_dim_semantics_all_parse.py` | Dim semantics parsing |
+| `test_dim_registry_categories.py` | (category, role) index (Phase 7.E.1) |
+
+### Behavioral suites (must stay green)
+
+| Suite | What it gates |
+|---|---|
+| `test_smoke_pure_neural.py` | Narrow opcode/path coverage in pure-neural mode |
+| `test_pure_neural_pc.py` / `test_pure_neural_psh_add.py` / `test_pure_neural_jmp_bz.py` / `test_pure_neural_jsr_ent_lev.py` / `test_pure_neural_io.py` / `test_pure_neural_multibyte.py` / `test_pure_neural_heap_div.py` | Per-opcode-family pure-neural behavior |
+| `test_pure_autoregressive.py` | Autoregressive vs teacher-forced agreement |
+| `test_teacher_forced_lowering_support.py` | Teacher-forced support invariants |
+| `test_suite_1000.py` / `test_suite_1096_pytest.py` / `test_suite_1096_pure_neural_pytest.py` | 1096 corpus full pass-rate, both teacher-forced and pure-neural |
+| `test_1096_neural_declarative_diagnostic.py` | Per-id diagnostic (the SP_BYTE0 root-cause harness) |
+| `test_1096_teacher_forced_lowering_audit.py` | Teacher-forced lowering audit |
+| `test_alu_wide_composites_per_op.py` | Per-op ALU wide composites |
+| `test_alibi_mem_attn.py` | ALiBi MEM attention |
+| `test_addr_key_neural_decode.py` | L14 ADDR_KEY neural decode (also exercises disk cache) |
+| `test_autoregressive_kv_cache_byte_identical.py` / `test_autoregressive_kv_cache.py` | KV cache byte-identity in autoregressive mode |
+| `test_batched_pure_neural.py` / `test_batched_kv_eviction_validation.py` | Batched mode == single batch |
+| `test_speculative.py` | Spec-decoded output matches main-decoded |
+| `test_dual_weight_modes.py` | Efficient mode == lookup mode |
+| `test_v18_convo_io_neural_bakes.py` / `test_v18_convo_io_neural_parity.py` | V18 conversational-IO parity |
+| `test_runtime_vanilla.py` | Vanilla runtime |
+| `test_kv_eviction.py` | Per Phase 7.F.2, OFF == STATIC_LIVENESS byte-identical |
+| `test_compile_with_allocators.py` | Compile path using new allocators |
+| `test_compile_determinism.py` | Cross-run state_dict determinism |
+| `test_compile_dynamic_byte_identical.py` | static-path == dynamic-path until 8.G.3 deletion |
+| `test_compile_dynamic_strict_mode.py` | Strict-mode admission |
+
+### Per-layer per-op suites (all must stay green)
+
+`test_l<N>_per_op.py` for N in 0..16; `test_declarative_ffn_bakes_l<N>.py`
+for N in {1-5, 3, 6, 8, 9, 10_alu, 13, 15, 16}; `test_l<N>_pc_marker_blockers.py` etc.
+
+If any of these test files surfaces new failures during a Phase 8
+sub-wave, the agent must investigate before merging — they are
+gating contracts, not optional checks.
+
 ### Final Phase 8 acceptance forcing-function
 
 8.I closing audit must confirm:
 1. **All 5 vision goals at 100%** (Section 7)
 2. **All 4 non-vision goals at 100%** (Section 7)
-3. **All 22 testing gates above green** (Section 8)
-4. **One head-of-branch commit** with everything landed
-5. **Closing audit doc committed**
+3. **All 10 TESTING_CHECKLIST.md items at ✅** (Section 7a)
+4. **All testing gates green** (Section 8)
+5. **One head-of-branch commit** with everything landed
+6. **Closing audit doc committed**
 
-Only when all 5 of these are simultaneously true is Phase 8 declared
+Only when all 6 of these are simultaneously true is Phase 8 declared
 complete and the original vision realized.
 
 ---
