@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Mapping, Optional
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule
 from ..layer_compiler import Operation
@@ -351,8 +352,12 @@ def _l10_carry_propagation_rules(
         name for i, name in enumerate(_L10_CARRY_BYTE_DIM_BY_IDX)
         if i != byte_idx
     )
-    add_carry_in_name = f"CARRY+{3 if cascade else 1}"
-    sub_carry_in_name = f"CARRY+{3 if cascade else 2}"
+    # Phase 8.D: carry-in / carry-out byte-cell refs name the
+    # (carry, alu, byte_index) semantic family lookup; byte-identical
+    # to the legacy "CARRY+<k>" strings via DimRef.parse.
+    add_carry_in_name = dim_ref("carry", "alu", 3 if cascade else 1)
+    sub_carry_in_name = dim_ref("carry", "alu", 3 if cascade else 2)
+    carry_byte3 = dim_ref("carry", "alu", 3)
     threshold = 40.0 if cascade else 56.0
 
     # carry_weight=1.0, output_weight=20.0, mismatch_weight=0.0 in the
@@ -414,7 +419,7 @@ def _l10_carry_propagation_rules(
             writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", -2.0 / S))
             writes.append((f"OUTPUT_HI_THIS_STEP+{new_hi}", 2.0 / S))
         if lo == 15 and hi == 15 and byte_idx < 2:
-            writes.append(("CARRY+3", 2.0 / S))
+            writes.append((carry_byte3, 2.0 / S))
 
         return FFNRule.gated_write(
             conditions=tuple(conds),
@@ -456,7 +461,7 @@ def _l10_carry_propagation_rules(
             writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", -2.0 / S))
             writes.append((f"OUTPUT_HI_THIS_STEP+{new_hi}", 2.0 / S))
         if lo == 0 and hi == 0 and byte_idx < 2:
-            writes.append(("CARRY+3", 2.0 / S))
+            writes.append((carry_byte3, 2.0 / S))
 
         return FFNRule.gated_write(
             conditions=tuple(conds),
@@ -681,6 +686,8 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
         # Helper: W_up[MARK_AX]=S, W_up[CMP+i]=S, b_up=-S*1.5,
         # W_gate[op]=1.0 (b_gate=0), W_down[OUTPUT_LO+to]=4/S,
         # W_down[OUTPUT_LO+from]=-4/S.
+        # Phase 8.D: the OP_<NAME> gate names the (opcode_flag, NAME)
+        # semantic family member.
         return FFNRule.gated_write(
             name=f"l10_cmp_{op_name.lower()}_override2_{suffix}",
             conditions=(
@@ -688,7 +695,7 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"CMP+{cmp_idx}", 1.0),
             ),
             threshold=1.5,
-            gate=f"OP_{op_name}",
+            gate=dim_ref("opcode_flag", op_name),
             gate_weight=1.0,
             gate_bias=0.0,
             writes=(
@@ -704,6 +711,8 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
         # Helper: W_up[MARK_AX]=S, W_up[CMP+i]=S, W_up[CMP+j]=S,
         # b_up=-S*4.0, W_gate[op]=1.0 (b_gate=0),
         # W_down[OUTPUT_LO+to]=4/S, W_down[OUTPUT_LO+from]=-4/S.
+        # Phase 8.D: the OP_<NAME> gate names the (opcode_flag, NAME)
+        # semantic family member.
         return FFNRule.gated_write(
             name=f"l10_cmp_{op_name.lower()}_override3_{suffix}",
             conditions=(
@@ -712,7 +721,7 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"CMP+{cmp_idx2}", 1.0),
             ),
             threshold=4.0,
-            gate=f"OP_{op_name}",
+            gate=dim_ref("opcode_flag", op_name),
             gate_weight=1.0,
             gate_bias=0.0,
             writes=(
@@ -768,6 +777,9 @@ def _layer10_alu_bitwise_rules(
     ``and_``) used to compute the result nibble.
     """
 
+    # Phase 8.D: pre-bind the (opcode_flag, op_name) gate ref so
+    # the inner loop reuses one dim_ref call.
+    gate_op = dim_ref("opcode_flag", op_name)
     rules: list[FFNRule] = []
     for nibble_label, alu_dim, carry_dim, out_dim in (
         ("lo", "ALU_LO", "AX_CARRY_LO", "OUTPUT_LO"),
@@ -787,7 +799,7 @@ def _layer10_alu_bitwise_rules(
                         (f"{carry_dim}+{b}", 30.0),
                     ),
                     threshold=80.0,
-                    gate=f"OP_{op_name}",
+                    gate=gate_op,
                     gate_weight=1.0,
                     gate_bias=0.0,
                     writes=((f"{out_dim}+{result}", 2.0 / S),),
@@ -840,6 +852,7 @@ def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
     """
 
     def _case_a(op_name: str) -> FFNRule:
+        # Phase 8.D: OP_<NAME> gate -> (opcode_flag, NAME).
         return FFNRule.gated_write(
             name=f"l10_{op_name.lower()}_shift_ge16_zero",
             conditions=(
@@ -847,7 +860,7 @@ def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
                 ("AX_CARRY_HI+0", -1.0),
             ),
             threshold=59.0,
-            gate=f"OP_{op_name}",
+            gate=dim_ref("opcode_flag", op_name),
             gate_weight=1.0,
             gate_bias=0.0,
             writes=(
@@ -863,11 +876,12 @@ def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
         ]
         for lo_bit in range(8, 16):
             conditions.append((f"AX_CARRY_LO+{lo_bit}", 1.0))
+        # Phase 8.D: OP_<NAME> gate -> (opcode_flag, NAME).
         return FFNRule.gated_write(
             name=f"l10_{op_name.lower()}_shift_8_15_zero",
             conditions=tuple(conditions),
             threshold=80.0,
-            gate=f"OP_{op_name}",
+            gate=dim_ref("opcode_flag", op_name),
             gate_weight=1.0,
             gate_bias=0.0,
             writes=(
@@ -961,6 +975,8 @@ def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
     spurious one-hot in either operand band cannot fire the unit.
     """
 
+    # Phase 8.D: OP_MUL gate -> (opcode_flag, MUL).
+    gate_mul = dim_ref("opcode_flag", "MUL")
     rules: list[FFNRule] = []
     for a in range(16):
         for b in range(16):
@@ -973,7 +989,7 @@ def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_LO+{b}", 30.0),
                 ),
                 threshold=80.0,
-                gate="OP_MUL",
+                gate=gate_mul,
                 gate_weight=1.0,
                 gate_bias=0.0,
                 writes=((f"OUTPUT_LO+{result}", 2.0 / S),),
@@ -2773,7 +2789,19 @@ def _suppress_l10_addsub_on_wide_alu(post_op, BD, S: float) -> None:
 
 
 def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
-    """Late FFN correction rules after the dependency-assigned post-op tail."""
+    """Late FFN correction rules after the dependency-assigned post-op tail.
+
+    Phase 8.D: marker gates (MARK_SP / MARK_STACK0 / MARK_AX / MARK_SP)
+    and a few opcode_flag / carry / byte_index gates are bound up
+    front via :func:`dim_ref` so each inner rule generator names the
+    semantic family/role rather than the bare slot string.
+    """
+
+    # Phase 8.D: pre-bound role-meaningful refs reused across the
+    # inner generators below.
+    gate_mark_sp = dim_ref("marker", "SP")
+    gate_mark_stack0 = dim_ref("marker", "STACK0")
+    gate_mark_ax = dim_ref("marker", "AX")
 
     def byte_writes(value: int, strength: float = 100.0):
         return Primitives.byte_value_writes(value, strength=strength)
@@ -3040,6 +3068,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         expanded declarative layout, so the marker can still stage the old SP
         byte. Correct the marker prediction from the staged OUTPUT byte when
         the binary-pop relay is active.
+
+        Phase 8.D: the MARK_SP gate (closure binding ``gate_mark_sp``)
+        uses :func:`dim_ref` for the ``(marker, SP)`` semantic pair --
+        the gate dim names the marker family member it asserts.
         """
 
         base_conditions = (
@@ -3076,7 +3108,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("OUTPUT_HI_THIS_STEP+0", -0.05),
                 ),
                 threshold=9.0,
-                gate="MARK_SP",
+                gate=gate_mark_sp,
                 writes=byte_writes(0xE8, strength=300.0),
             ),
             FFNRule.gated_write(
@@ -3102,7 +3134,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("IS_BYTE", -100.0),
                 ),
                 threshold=5.5,
-                gate="MARK_SP",
+                gate=gate_mark_sp,
                 writes=byte_writes(0xD8, strength=500.0),
             ),
             FFNRule.gated_write(
@@ -3128,7 +3160,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("IS_BYTE", -100.0),
                 ),
                 threshold=5.5,
-                gate="MARK_SP",
+                gate=gate_mark_sp,
                 writes=byte_writes(0xF8, strength=500.0),
             ),
             FFNRule.gated_write(
@@ -3153,7 +3185,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("IS_BYTE", -100.0),
                 ),
                 threshold=5.5,
-                gate="MARK_SP",
+                gate=gate_mark_sp,
                 writes=byte_writes(0xE0, strength=500.0),
             ),
         )
@@ -3540,7 +3572,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             (f"OUTPUT_HI_THIS_STEP+{hi}", 0.1),
                         ),
                         threshold=10.5,
-                        gate="MARK_STACK0",
+                        gate=gate_mark_stack0,
                         writes=byte_writes(value, strength=500.0),
                     )
                 )
@@ -3587,7 +3619,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             (f"OUTPUT_HI_THIS_STEP+{hi}", 0.001),
                         ),
                         threshold=25.0,
-                        gate="MARK_STACK0",
+                        gate=gate_mark_stack0,
                         writes=byte_writes(value, strength=2000.0),
                     )
                 )
@@ -3643,7 +3675,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             (f"OUTPUT_HI_THIS_STEP+{hi}", 0.001),
                         ),
                         threshold=4300.0,
-                        gate="MARK_STACK0",
+                        gate=gate_mark_stack0,
                         writes=byte_writes(value, strength=5000.0),
                     )
                 )
@@ -3709,7 +3741,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             (f"OUTPUT_HI_THIS_STEP+{hi}", 1.0),
                         ),
                         threshold=25.0,
-                        gate="MARK_STACK0",
+                        gate=gate_mark_stack0,
                         writes=byte_writes(value, strength=5000.0),
                     )
                 )
@@ -4176,8 +4208,16 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         )
 
     def ax_sub_borrow_decrement_rules() -> tuple[FFNRule, ...]:
-        """Re-apply byte-0 SUB borrow after L15 restores the base high byte."""
+        """Re-apply byte-0 SUB borrow after L15 restores the base high byte.
 
+        Phase 8.D: the CARRY+2 gate names the
+        ``(carry, alu, byte_index=2)`` cell of the inter-byte ALU
+        carry cascade (byte 2 = lo-nibble carry-out).
+        """
+
+        # Phase 8.D: bind the carry-byte-2 ref once and reuse it for
+        # every (old_lo) variant.
+        gate_carry_byte2 = dim_ref("carry", "alu", 2)
         rules = []
         for old_lo in range(1, 16):
             rules.append(
@@ -4207,7 +4247,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         ("NEXT_SE", -1000000.0),
                     ),
                     threshold=350.0,
-                    gate="CARRY+2",
+                    gate=gate_carry_byte2,
                     writes=byte_writes(old_lo - 1, strength=1.0e8),
                 )
             )
@@ -4307,7 +4347,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                             ("TEMP+9", -1000.0),
                         ) + non_mul_blockers,
                         threshold=220.0,
-                        gate="OP_MUL",
+                        gate=dim_ref("opcode_flag", "MUL"),
                         writes=byte_writes(byte_value, strength=10_000_000.0),
                     )
                 )
@@ -4754,7 +4794,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("STACK0_BYTE3", -10000.0),
             ),
             threshold=180.0,
-            gate="BYTE_INDEX_2",
+            gate=dim_ref("byte_index", "2"),
             writes=byte_writes(0x00, strength=10000.0),
         ),
         FFNRule.constant_write(
@@ -5955,7 +5995,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_IMM", -1000.0),
             ),
             threshold=1000.0,
-            gate="CARRY+1",
+            gate=dim_ref("carry", "alu", 1),
             writes=byte_writes(0x03, strength=500_000.0),
         ),
         # SHL-by-8 loses byte 1 to the same tail, but its signature is a huge
@@ -5970,7 +6010,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("EMBED_HI+0", 1.0),
             ),
             threshold=90.0,
-            gate="CARRY+3",
+            gate=dim_ref("carry", "alu", 3),
             writes=byte_writes(0x01),
         ),
         # SI preserves AX while writing memory. The dependency-expanded tail
@@ -6050,7 +6090,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+6", -5.0),
             ),
             threshold=250.0,
-            gate="CARRY+2",
+            gate=dim_ref("carry", "alu", 2),
             writes=byte_writes(0x00),
         ),
         # 16-bit AND's high byte must zero; CMP/TEMP distinguish AND from
@@ -6084,7 +6124,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+14", 0.001),
             ),
             threshold=5.5,
-            gate="BYTE_INDEX_0",
+            gate=dim_ref("byte_index", "0"),
             writes=byte_writes(0x0F),
         ),
         # SHR by 8 also needs byte 1 cleared after the marker correction emits
@@ -6131,7 +6171,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+10", -1.0),
             ),
             threshold=5005.0,
-            gate="MARK_AX",
+            gate=gate_mark_ax,
             writes=byte_writes(0x01),
         ),
         FFNRule.constant_write(
@@ -6308,7 +6348,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("IS_BYTE", -100.0),
             ),
             threshold=1505.0,
-            gate="MARK_SP",
+            gate=gate_mark_sp,
             writes=byte_writes(0xE0, strength=5000.0),
         ),
         # Pure suppressor (clear_output_writes lays out -1e8 on every
@@ -6339,7 +6379,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_VAL_B0", -1000.0),
             ),
             threshold=1.5,
-            gate="BYTE_INDEX_3",
+            gate=dim_ref("byte_index", "3"),
             writes=clear_output_writes(strength=100_000_000.0),
         ),
         # Pure suppressor (clear_output_writes lays out -1e8 on every
