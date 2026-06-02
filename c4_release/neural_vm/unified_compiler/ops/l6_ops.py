@@ -2299,7 +2299,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 IMM carry refresh IR lowered to unexpected unit "
             f"{imm_carry_end}; expected {L6_IMM_CARRY_REFRESH_END_UNIT}"
         )
-    return
     for start, end in (
         (L6_EXIT_AX_ROUTE_START_UNIT, L6_EXIT_AX_ROUTE_END_UNIT),
         (L6_NOP_AX_ROUTE_START_UNIT, L6_NOP_AX_ROUTE_END_UNIT),
@@ -2319,6 +2318,7 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 AX-output route IR lowered to unexpected units "
             f"{route_ends}; expected {expected_ends}"
         )
+    return
     for start, end in (
         (
             L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
