@@ -491,6 +491,66 @@ def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADJ lo nibble (256 units, offsets 1008..1263).
+
+    ADJ computes SP = SP + signed_immediate. Reads ALU_LO (SP lo nibble
+    from L7) and FETCH_LO (immediate). Gate=OP_ADJ; threshold tuned
+    higher (85) than LEA (80.5) to reflect the helper's empirical
+    margin.
+    """
+    write_scale = 2.0 / S
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            result = (a + b) % 16
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_adj_lo_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"FETCH_LO+{b}", 20.0),
+                ),
+                threshold=85.0,
+                gate="OP_ADJ",
+                writes=((f"OUTPUT_LO+{result}", write_scale),),
+                scope="MARK_AX and OP_ADJ",
+                dominates_at={
+                    f"OUTPUT_LO+{result}": "MARK_AX and OP_ADJ",
+                },
+            ))
+    return tuple(rules)
+
+
+def _layer8_alu_adj_carry_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADJ carry detection (120 units, offsets 1264..1383)."""
+
+    carry_scale = 2.0 / (S * 5.0)
+    blockers = _layer8_alu_block_non_ax_marker_conditions()
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            if a + b < 16:
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_adj_carry_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 60.0),
+                    *blockers,
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"FETCH_LO+{b}", 20.0),
+                ),
+                threshold=85.0,
+                gate="OP_ADJ",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_ADJ",
+                dominates_at={"CARRY+0": "MARK_AX and OP_ADJ"},
+            ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
