@@ -374,6 +374,126 @@ class TestQuineArchiveFiles:
             pytest.skip("Quine archive directory not found")
 
 
+# ----------------------------------------------------------------------------
+# VM self-compilation quine: the "deeper" quine from TESTING_CHECKLIST.
+#
+# The checklist quine requirement is twofold:
+#   (a) ``cllm/quine_cllm.c`` runs on the VM and emits its own source —
+#       covered by ``TestQuineExecution`` above.
+#   (b) The VM compiling itself: C4 source of the VM/compiler, compiled into
+#       the VM, run through the VM, produces a binary equivalent to the VM's
+#       own compiled state. This is the "self-hosting" quine and is currently
+#       NOT wired end-to-end — the tests below document the gap and the
+#       partial pieces that exist today.
+# ----------------------------------------------------------------------------
+
+
+class TestVMSelfCompilationQuineGap:
+    """Document the VM-self-compilation quine path and its current gap.
+
+    Pieces that exist:
+      - ``bundler/c4_compile.c`` — C4 source of a bytecode compiler.
+      - ``src/compiler.py``      — Python reference compiler used at bake.
+      - ``neural_vm/batch_runner.py`` — VM that runs bytecode.
+
+    Missing wiring:
+      - A driver that compiles ``c4_compile.c`` THROUGH THE VM (not the
+        Python host) into bytecode, then byte-compares that bytecode against
+        the bytecode produced by compiling the same source via the Python
+        compiler used at bake time.
+    """
+
+    def test_c4_compile_source_exists(self):
+        """The self-hosting C4 compiler source is present."""
+        path = "bundler/c4_compile.c"
+        assert os.path.exists(path), (
+            f"Missing C4 self-host compiler source at {path}; the VM-quine "
+            f"path needs this file."
+        )
+        assert os.path.getsize(path) > 5000
+
+    def test_c4_compile_has_compiler_entrypoint(self):
+        """``c4_compile.c`` exposes a compiler-style main entrypoint."""
+        with open("bundler/c4_compile.c") as f:
+            content = f.read()
+        assert "main(" in content
+        # The compiler should reference tokenization / code emission.
+        assert any(kw in content for kw in ("TK_NUM", "expr(", "next("))
+
+    def test_python_compiler_is_deterministic_on_c4_self_host(self):
+        """The Python compiler is deterministic on the C4 self-host source.
+
+        Necessary condition for any "compile-itself" comparison: two
+        host-compiles of the same source must agree byte-for-byte.
+        """
+        from src.compiler import compile_c
+        with open("bundler/c4_compile.c") as f:
+            source = f.read()
+        try:
+            bc1, dt1 = compile_c(source)
+            bc2, dt2 = compile_c(source)
+        except Exception as exc:
+            pytest.skip(
+                f"Python compiler cannot consume c4_compile.c as-is "
+                f"({type(exc).__name__}); VM-quine path also blocked until "
+                f"the source is in the host-compiler's accepted subset."
+            )
+        assert bc1 == bc2, "Host compiler is non-deterministic on same input"
+        assert dt1 == dt2
+
+    @pytest.mark.slow
+    @pytest.mark.quine
+    @pytest.mark.xfail(
+        reason=(
+            "VM-self-compilation quine path not yet wired: no driver runs "
+            "c4_compile.c through the VM and emits a bytecode array "
+            "byte-equivalent to the host compile. Closing this gap is the "
+            "canonical TESTING_CHECKLIST self-host quine."
+        ),
+        strict=False,
+    )
+    def test_vm_compiles_itself_to_equivalent_bytecode(self):
+        """VM compiling its own C4 source equals the host compile.
+
+        End state (xfail today):
+          1. Read ``bundler/c4_compile.c``.
+          2. Compile it via the Python compiler -> ``bc_host``.
+          3. Run the resulting compiler bytecode IN THE VM, feeding it the
+             SAME C4 source as input, and capture its emitted bytecode array
+             -> ``bc_vm``.
+          4. Assert ``bc_vm == bc_host``.
+        """
+        from src.compiler import compile_c
+
+        with open("bundler/c4_compile.c") as f:
+            source = f.read()
+
+        bc_host, _ = compile_c(source)
+        assert bc_host, "Host compile produced no bytecode"
+
+        # Step 3 (VM-driven compile) is the missing wiring. Asserting False
+        # keeps the xfail honest until a driver exists; flip ``strict=True``
+        # on the xfail marker once the path lands.
+        assert False, (
+            "VM-driven self-compile path not implemented; see test docstring "
+            "for the four-step contract."
+        )
+
+    def test_baked_quine_model_artefact_when_present(self):
+        """If a baked quine model exists, it is a non-trivial artefact.
+
+        The "binary equivalent to the VM's own compiled state" comparison
+        needs a stable on-disk model artefact to gate against.
+        """
+        path = "models/baked_quine.c4onnx"
+        if not os.path.exists(path):
+            pytest.skip(
+                "Baked quine model not generated yet — VM-self-compile "
+                "comparison has no fixed-point artefact to gate against."
+            )
+        assert os.path.getsize(path) > 1024
+
+
 # Run tests
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
