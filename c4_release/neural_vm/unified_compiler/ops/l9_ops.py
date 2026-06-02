@@ -1654,7 +1654,6 @@ def make_layer9_marker_suppress_op() -> Operation:
                "OP_OR", "OP_XOR", "OP_AND"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="ffn",
-        bake_fn=bake,
         migrated=True,
         declarative_authority="topology_anchor",
         smoke_tests={"all"},
