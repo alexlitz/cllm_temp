@@ -2526,7 +2526,6 @@ def make_layer6_attn_op() -> Operation:
 
     return Operation(
         name="layer6_attn",
-        phase=6,
         # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the L6 read as
         # cross-step relative to the L8 writers (multibyte_fetch{,_bake},
         # head6_ax_carry_refresh). L6 fires before L8 in the same step, so
