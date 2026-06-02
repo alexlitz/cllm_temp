@@ -739,28 +739,23 @@ def declare_setdim_compat_dims(
                  "L1H0", "L1H1", "L1H2", "L1H4", "L2H0"]
     # 16-dim nibble groups
     sixteen_dim = ["EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI",
-                   # B9 OUTPUT_HI split: OUTPUT_HI_THIS_STEP is the
+                   # B9 OUTPUT_HI split: OUTPUT_HI_THIS_STEP is the new
                    # canonical name for the same-step write band. Same
                    # numeric base as OUTPUT_HI in _SetDim (190) so baked
                    # weight indices are byte-identical; the alias keeps
                    # ``BD.OUTPUT_HI`` lookups in legacy bake bodies
-                   # working unchanged.  Phase 7.A.3 introduces a sibling
-                   # OUTPUT_HI_PREV_STEP alias for the 2 cross-step
-                   # readers (layer3_carry_forward_attn head 5,
-                   # layer8_head6_ax_carry_refresh) so the dynamic
-                   # scheduler resolves their reads via dim algebra
-                   # (no ``requires["after"]`` workaround required).
-                   # See docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
+                   # working unchanged. The 2 cross-step readers
+                   # (layer3_carry_forward_attn head 5,
+                   # layer8_head6_ax_carry_refresh) still read the same
+                   # numeric slot but acknowledge the prev-step semantic
+                   # via ``requires["after"]``. See
+                   # docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
                    "OUTPUT_HI_THIS_STEP",
                    # Phase 7.A.3 OUTPUT_LO split: OUTPUT_LO_PREV_STEP is
                    # the cross-step alias for the L3 head 5 / L8 head 6
                    # attention-back reads. Same numeric base as OUTPUT_LO
                    # (174) so bakes stay byte-identical.
                    "OUTPUT_LO_PREV_STEP",
-                   # Phase 7.A.3.a OUTPUT_HI split: OUTPUT_HI_PREV_STEP
-                   # is the cross-step alias for the same readers. Same
-                   # numeric base as OUTPUT_HI (190).
-                   "OUTPUT_HI_PREV_STEP",
                    "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                    "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                    "FETCH_LO", "FETCH_HI", "MUL_ACCUM", "DIV_STAGING",
@@ -798,9 +793,6 @@ def declare_setdim_compat_dims(
         "OUTPUT_LO_PREV_STEP": "OUTPUT_LO",
         # Phase 7.A.3 TEMP split: PREV_STEP alias for future cross-step reads.
         "TEMP_PREV_STEP": "TEMP",
-        # Phase 7.A.3.a OUTPUT_HI split: PREV_STEP alias for cross-step reads
-        # by L3 head 5 / L8 head 6.
-        "OUTPUT_HI_PREV_STEP": "OUTPUT_HI",
     }
 
     def _declare(name, size):
