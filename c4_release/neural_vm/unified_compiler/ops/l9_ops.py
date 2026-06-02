@@ -1151,7 +1151,10 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=compiler_ir,
         declarative_authority="spec_generated",
-        layer_idx=9,
+        # Phase 8.A.4 retry: layer_idx=9 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer9_marker_suppress``
+        # (kind="ffn", L9 anchor pinned via ``requires["after"]: layer8_alu``).
+        target_op_name="layer9_marker_suppress",
         migrated=True,
         claims=_claims,
         # Staleness invariants: the L9 ALU consumes ALU_HI as operand A hi
@@ -1727,6 +1730,12 @@ def make_layer9_marker_suppress_op() -> Operation:
         kind="ffn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 8.A.4 retry: this op is the L9 layer anchor. The scheduler
+        # (commit 78ec127c) honors block-op refs in ``requires["after"]`` --
+        # pointing at ``layer8_alu`` (kind="block", layer_idx=8) forces the
+        # anchor to ``earliest = 9``. L9 block ops (layer9_alu and friends)
+        # then bind to this anchor's resolved layer via ``target_op_name``.
+        requires={"after": "layer8_alu"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
