@@ -176,9 +176,6 @@ def _layer13_shifts_substage_rules(
                     ),
                     conditions=(
                         ("MARK_AX", 1.0),
-                        # structural offset: a_lo/a_hi are nibble-value
-                        # one-hot lookup indices into the operand bands;
-                        # s is the shift-amount one-hot read.
                         (f"ALU_LO+{a_lo}", 1.0),
                         (f"ALU_HI+{a_hi}", 1.0),
                         (f"AX_CARRY_LO+{s}", 1.0),
@@ -188,9 +185,6 @@ def _layer13_shifts_substage_rules(
                     gate=gate_ref,
                     gate_weight=1.0,
                     gate_bias=0.0,
-                    # structural offset: result_lo/result_hi are
-                    # computed nibbles of the shift result (value-bus
-                    # lookups), not role-meaningful byte positions.
                     writes=(
                         (f"OUTPUT_LO+{result_lo}", write_scale),
                         (f"OUTPUT_HI+{result_hi}", write_scale),
@@ -418,6 +412,7 @@ def make_layer13_attn_dep_anchor_op() -> Operation:
         # (phase=12) and L13 mem-addr-gather (phase=13). Same-step
         # reads against the L12 dep anchor force the dep graph to land
         # this at L13.
+        phase=12.5,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC",
                "OP_SI", "OP_SC", "MEM_ADDR_SRC", "L1H1"},
@@ -570,22 +565,7 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
             allocator = _allocate_layer13_shifts_units()
             block.ffn._l13_unit_allocator = allocator
 
-            # Phase 8.C inline cut: lower the ``_layer13_shifts_rules``
-            # IR directly here so census v2 classifies this op as
-            # ``declarative`` rather than ``declarative_via_helper``
-            # (which routed through the ``_bake_layer13_shifts``
-            # trampoline). Byte-identical to the prior
-            # ``_bake_layer13_shifts(block.ffn, S, proxy)`` call.
-            # The helper is retained for ``test_declarative_ffn_bakes_l13``
-            # parity coverage.
-            rules = _layer13_shifts_rules(S)
-            rule_dim_positions = Primitives.dim_positions_from_bd(
-                proxy,
-                Primitives.ffn_rule_dim_names(rules),
-            )
-            n_units = Primitives.lower_ffn_rules(
-                block.ffn, rules, rule_dim_positions, S=S,
-            )
+            n_units = _bake_layer13_shifts(block.ffn, S, proxy)
             # Byte-identity guard: the declarative lowering MUST land
             # exactly on the allocator's declared range total or a
             # downstream layer will read stale weights.
@@ -600,6 +580,7 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
 
     return Operation(
         name="layer13_shifts",
+        phase=13,
         reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                "OP_SHL", "OP_SHR"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},

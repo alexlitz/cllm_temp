@@ -151,6 +151,7 @@ def make_layer5_fetch_op() -> Operation:
 
     return Operation(
         name="layer5_fetch",
+        phase=5,
         # Reads: PC/AX markers + FETCH addr (PC+K) + ADDR_KEY (per CODE byte) +
         #        CLEAN_EMBED (the value at the matched CODE byte).
         # Note: heads 6/7 also read OP_* via V projection but that's the DEPRECATED
@@ -380,6 +381,7 @@ def make_layer5_fetch_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer5_fetch_dep_anchor",
+        phase=5,
         reads={"MARK_PC", "MARK_AX", "HAS_SE",
                "FETCH_LO", "FETCH_HI", "EMBED_LO", "EMBED_HI",
                "ADDR_KEY", "CONST", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -424,19 +426,10 @@ def make_opcode_decode_ffn_op() -> Operation:
         allocator = _allocate_layer5_ffn_units()
         block.ffn._l5_unit_allocator = allocator
 
-        # Phase 8.C inline cut: lower the ``_opcode_decode_ffn_rules`` IR
-        # directly here so census v2 classifies this op as
-        # ``declarative`` rather than ``declarative_via_helper`` (which
-        # routed through the ``_bake_opcode_decode_ffn`` trampoline).
-        # Byte-identical to the prior helper call.
-        proxy = _as_setdim_proxy(dim_positions)
-        rules = _opcode_decode_ffn_rules(S)
-        rule_dim_positions = Primitives.dim_positions_from_bd(
-            proxy,
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        final_unit = Primitives.lower_ffn_rules(
-            block.ffn, rules, rule_dim_positions, start_unit=0, S=S,
+        final_unit = _bake_opcode_decode_ffn(
+            block.ffn,
+            S,
+            _as_setdim_proxy(dim_positions),
         )
         # Byte-identity guard: the helper's local cursor MUST end exactly
         # at the allocator's declared footprint. If the layout table
@@ -515,6 +508,7 @@ def make_opcode_decode_ffn_op() -> Operation:
 
     return Operation(
         name="opcode_decode_ffn",
+        phase=5,
         # Phase 8.A SCC step 6: read OPCODE_BYTE_LO via the
         # ``OPCODE_BYTE_LO_PREV_STEP`` alias (same numeric base, see
         # shared.py ``_ALIAS_OF``) so the dynamic scheduler sees this
@@ -856,6 +850,7 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_opcode_decode_ffn_dep_anchor",
+        phase=5,
         # Phase 8.A SCC step 6: matches opcode_decode_ffn's
         # OPCODE_BYTE_LO_PREV_STEP rename (same numeric base, prev-step
         # semantics).

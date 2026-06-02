@@ -190,17 +190,7 @@ def make_layer1_ffn_op() -> Operation:
         allocator = _allocate_layer1_ffn_units()
         ffn._l1_unit_allocator = allocator
 
-        # Phase 8.C inline cut: lower the ``_layer1_ffn_rules`` IR
-        # directly here so census v2 classifies this op as
-        # ``declarative`` rather than ``declarative_via_helper`` (which
-        # routed through the ``_bake_layer1_ffn`` trampoline).
-        # Byte-identical to the prior ``_bake_layer1_ffn(ffn, S, proxy)``.
-        rules = _layer1_ffn_rules(S)
-        rule_dim_positions = Primitives.dim_positions_from_bd(
-            proxy,
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        n0 = Primitives.lower_ffn_rules(ffn, rules, rule_dim_positions, S=S)
+        n0 = _bake_layer1_ffn(ffn, S, proxy)
         # Byte-identity guard: the FFNRule lowering MUST write exactly the
         # number of hidden units the allocator table declares. Mirrors the
         # L0 phase_a_ffn assertion in ``_bake_phase_a_ffn``.
@@ -226,6 +216,7 @@ def make_layer1_ffn_op() -> Operation:
 
     return Operation(
         name="layer1_ffn",
+        phase=1,
         # Phase 7.A.1: L1H0/L1H1/L1H2/L1H4 are written by
         # ``layer1_threshold_attn`` at the SAME layer (L1 attn substage feeds
         # the L1 FFN substage inside the same transformer block). Express
@@ -432,6 +423,7 @@ def make_layer1_threshold_attn_op() -> Operation:
 
     return Operation(
         name="layer1_threshold_attn",
+        phase=1,
         reads={"IS_MARK", "MARK_SE_ONLY", "MARK_CS", "CONST"},
         writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE", "IN_STEP_FRESH"},
         kind="attn",

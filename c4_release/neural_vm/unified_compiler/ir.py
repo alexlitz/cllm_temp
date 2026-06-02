@@ -1950,19 +1950,24 @@ def _validate_lowered_attn(
         spec = head.spec
         label = head.name or f"head_{h_idx}"
         base = int(spec.head_idx) * head_dim
-        for role, writes, matrix_name in (
-            ("q", spec.q, "W_q"),
-            ("k", spec.k, "W_k"),
-            ("v", spec.v, "W_v"),
+        # Phase 8.O.2 GQA: Q/O addressed by ``head_idx * HD``; K/V by
+        # ``kv_head_idx * HD``. At ``group_size=1`` (the default)
+        # the two coincide and this validator is byte-identical with
+        # the pre-8.O.2 MHA path.
+        kv_base = int(spec.kv_head_idx) * head_dim
+        for role, writes, matrix_name, row_base in (
+            ("q", spec.q, "W_q", base),
+            ("k", spec.k, "W_k", kv_base),
+            ("v", spec.v, "W_v", kv_base),
         ):
             matrix = getattr(attn, matrix_name).detach()
             for write in writes:
-                observed = float(matrix[base + int(write.slot), int(write.dim)])
+                observed = float(matrix[row_base + int(write.slot), int(write.dim)])
                 expected = float(write.weight)
                 if abs(observed - expected) > (atol + rtol * abs(expected)):
                     issues.append(AttentionComparisonIssue(
                         "lowering",
-                        f"{label} {matrix_name}[{base + int(write.slot)}, "
+                        f"{label} {matrix_name}[{row_base + int(write.slot)}, "
                         f"{int(write.dim)}]: expected {expected:.8g}, "
                         f"observed {observed:.8g}",
                     ))

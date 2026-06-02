@@ -1141,6 +1141,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
 
     return Operation(
         name="layer9_alu",
+        phase=9,
         # Phase 8.A: CARRY_PREV_STEP marks the CARRY read as cross-step
         # relative to the L10 CARRY writers (layer10_carry_relay,
         # layer10_carry_relay_bake, l10_post_ops_combined) that fire AFTER
@@ -1503,6 +1504,7 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
 
     return Operation(
         name="format_string_fetch_head",
+        phase=9.5,
         reads={"IO_IN_OUTPUT_MODE", "FORMAT_PTR_LO", "FORMAT_PTR_HI",
                "ADDR_KEY", "EMBED_LO", "EMBED_HI"},
         writes={"OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
@@ -1723,6 +1725,7 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
 
     return Operation(
         name="layer9_alibi_mem_attn",
+        phase=9.2,  # after lev_addr_relay (9.0) and lev_bp_to_pc_relay (9.1)
         reads={"MEM_VAL_B0", "OP_LI_RELAY", "OP_LC_RELAY", "CMP", "CONST",
                "PSH_AT_SP", "MEM_STORE", "ADDR_KEY",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -1764,6 +1767,7 @@ def make_layer9_marker_suppress_op() -> Operation:
 
     return Operation(
         name="layer9_marker_suppress",
+        phase=9,
         reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
                "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
                "OP_OR", "OP_XOR", "OP_AND"},

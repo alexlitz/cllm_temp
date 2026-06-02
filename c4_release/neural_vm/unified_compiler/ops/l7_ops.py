@@ -161,6 +161,7 @@ def make_layer7_operand_gather_op() -> Operation:
 
     return Operation(
         name="layer7_operand_gather",
+        phase=7,
         # Phase 8.A targeted: head 1's V slots read BP/SP OUTPUT_LO via
         # attention back to the prev-step BP/SP marker row (LEA/ADJ/ENT
         # operand A relay). L7 fires before any same-step OUTPUT_LO
@@ -336,6 +337,7 @@ def make_layer7_memory_heads_op() -> Operation:
 
     return Operation(
         name="layer7_memory_heads",
+        phase=7,
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L11/L14 TEMP writers (which fire after L7 in the same
         # step). The same-step values written by L3 carry_forward / L5

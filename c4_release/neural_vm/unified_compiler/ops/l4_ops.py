@@ -205,6 +205,7 @@ def make_layer4_pc_relay_op() -> Operation:
 
     return Operation(
         name="layer4_pc_relay",
+        phase=4,
         # Phase 8.A targeted (SCC audit step 7): the ADDR_KEY read here is
         # the PREV-step value carried on the PC marker residual (set by
         # the previous step's ``layer14_clear_addr_key_pollution`` /
@@ -381,19 +382,8 @@ def make_layer4_ffn_op() -> Operation:
         allocator = _allocate_layer4_ffn_units()
         block.ffn._l4_unit_allocator = allocator
 
-        # Phase 8.C inline cut: lower the ``_layer4_ffn_rules`` IR
-        # directly here so census v2 classifies this op as
-        # ``declarative`` rather than ``declarative_via_helper`` (which
-        # routed through the ``_bake_layer4_ffn`` trampoline).
-        # Byte-identical to the prior helper call.
-        proxy = _as_setdim_proxy(dim_positions)
-        rules = _layer4_ffn_rules(S)
-        rule_dim_positions = Primitives.dim_positions_from_bd(
-            proxy,
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        final_unit = Primitives.lower_ffn_rules(
-            block.ffn, rules, rule_dim_positions, start_unit=0, S=S,
+        final_unit = _bake_layer4_ffn(
+            block.ffn, S, _as_setdim_proxy(dim_positions)
         )
         # Byte-identity guard: the helper's local cursor MUST end exactly
         # at the allocator's declared footprint. If the layout table drifts
@@ -495,6 +485,7 @@ def make_layer4_ffn_dep_anchor_op() -> Operation:
         # phase). The actual ``layer4_ffn`` block op runs at phase=4
         # and pins layer_idx=4 separately, so the anchor's phase is
         # purely a placement key for the dep-graph slot table.
+        phase=3,
         # Drop ``EMBED_LO`` / ``EMBED_HI`` (which ``_layer3_ffn_dep_anchor``
         # writes at L4) so the new anchor's earliest landable layer is not
         # pushed past L4 by the L3 anchor's writes. ``requires["same_layer_as"]``
@@ -894,6 +885,7 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
 
     return Operation(
         name="layer4_sp_to_addr_key",
+        phase=4.5,  # after layer4_pc_relay (phase=4) so its writes don't clobber
         reads={"MARK_AX", "BYTE_INDEX_0", "BYTE_INDEX_1", "H1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
         writes={"ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},  # = ADDR_KEY band

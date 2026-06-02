@@ -1890,6 +1890,7 @@ def make_layer10_carry_relay_op() -> Operation:
 
     return Operation(
         name="layer10_carry_relay",
+        phase=10,
         reads={"MARK_AX", "IS_BYTE", "H1", "CARRY"},
         writes={"CARRY"},  # broadcast
         kind="attn",
@@ -1950,6 +1951,7 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
 
     return Operation(
         name="layer10_sp_byte_passthrough",
+        phase=10,
         reads={"IS_BYTE", "HAS_SE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -2047,11 +2049,7 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         head_allocator = _allocate_layer10_attention_heads()
         attn._l10_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
-        # Phase 8.C inline: lower the head spec directly into ``attn`` so
-        # census v2 classifies this op as ``declarative`` (no helper hop).
-        Primitives.generate_attention_head(
-            attn, _layer10_carry_relay_head_spec(proxy, S), HD,
-        )
+        _bake_layer10_carry_relay_head(attn, proxy, S, HD)
 
     # Dim-ownership claims: L10 attn head 0 CARRY relay (AX marker → AX bytes).
     #   W_v[0*HD + 1, CARRY + 1]  (CARRY[1] = ADD byte carry)
@@ -2447,6 +2445,7 @@ def make_layer10_alu_op() -> Operation:
 
     return Operation(
         name="layer10_alu",
+        phase=10.2,
         reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "ALU_HI", "AX_CARRY_HI",
                "OP_OR", "OP_XOR", "OP_AND", "OP_DIV", "OP_MOD"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "DIV_STAGING"},
@@ -2739,6 +2738,7 @@ def make_l10_post_ops_combined() -> Operation:
     # phase comparison uses < / >.
     return Operation(
         name="l10_post_ops_combined",
+        phase=10.5,
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L11/L14 TEMP writers. Same numeric position as TEMP.
         # See layer10_byte_passthrough for the per-band rationale.
