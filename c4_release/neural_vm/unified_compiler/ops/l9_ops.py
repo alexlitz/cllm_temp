@@ -771,6 +771,50 @@ def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_marker_suppress_rules(S: float) -> tuple[FFNRule, ...]:
+    """``NEXT_*`` marker-suppression band (7 units).
+
+    Mirrors :func:`vm_step._set_layer9_marker_suppress`. One unit per
+    NEXT_* dim (PC/AX/SP/BP/STACK0/MEM/SE) suppresses the natural
+    OUTPUT_LO[0..15] and OUTPUT_HI[0..15] values from the multibyte
+    routing whenever the corresponding NEXT_* flag is high (~1.37 from
+    L8). The unit's up branch is sharply tuned with raw
+    ``W_up[NEXT]=100`` / ``b_up=-80`` (i.e. NOT S-scaled), so the rule
+    declares ``conditions=((NEXT_*, 100/S),)`` and ``threshold=80/S`` to
+    reproduce the same un-scaled W_up cells after the ``S`` rescaling in
+    the lowerer. The gate path uses the same NEXT_* dim as gate with
+    raw ``W_gate=5.0`` / ``b_gate=-3.0`` (no scaling). The 32 write
+    cells (16 OUTPUT_LO + 16 OUTPUT_HI_THIS_STEP) all carry raw weight
+    ``-1.0``.
+    """
+
+    next_dims = (
+        "NEXT_PC",
+        "NEXT_AX",
+        "NEXT_SP",
+        "NEXT_BP",
+        "NEXT_STACK0",
+        "NEXT_MEM",
+        "NEXT_SE",
+    )
+    rules: list[FFNRule] = []
+    for next_dim in next_dims:
+        writes: list[tuple[str, float]] = []
+        for k in range(16):
+            writes.append((f"OUTPUT_LO+{k}", -1.0))
+            writes.append((f"OUTPUT_HI_THIS_STEP+{k}", -1.0))
+        rules.append(FFNRule.gated_write(
+            name=f"l9_marker_suppress_{next_dim.lower()}",
+            conditions=((next_dim, 100.0 / S),),
+            threshold=80.0 / S,
+            gate=next_dim,
+            gate_weight=5.0,
+            gate_bias=-3.0,
+            writes=tuple(writes),
+        ))
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 

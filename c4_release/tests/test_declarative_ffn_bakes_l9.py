@@ -265,6 +265,38 @@ def test_layer9_addr_b1_set_and_cascade_rules_match_legacy():
     _compare_symbolic_to_lowered(rules)
 
 
+def _legacy_l9_with_marker_suppress() -> _StubFFN:
+    """Bake legacy ``_set_layer9_alu`` + ``_set_layer9_marker_suppress``.
+
+    The marker-suppress band lives in
+    :func:`vm_step._set_layer9_marker_suppress`, not in
+    :func:`vm_step._set_layer9_alu`, so the comparison helper has to chain
+    them to expose units 3398..3404.
+    """
+    from c4_release.neural_vm.vm_step import _set_layer9_marker_suppress
+    ffn = _StubFFN(hidden_dim=3600)
+    n9 = _set_layer9_alu(ffn, 100.0, _SetDim)
+    _set_layer9_marker_suppress(ffn, 100.0, _SetDim, n9)
+    return ffn
+
+
+def test_layer9_marker_suppress_rules_match_legacy():
+    """Marker-suppress band (7 units) lowers byte-identically at unit 3398."""
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
+        _layer9_marker_suppress_rules,
+    )
+
+    rules = _layer9_marker_suppress_rules(100.0)
+    assert len(rules) == 7
+    _assert_unit_range_matches_legacy(
+        rules,
+        start_unit=3398,
+        n_units=7,
+        legacy_ffn=_legacy_l9_with_marker_suppress(),
+    )
+    _compare_symbolic_to_lowered(rules)
+
+
 def test_layer9_lea_adj_ent_fetch_gates_use_one_hot_scale():
     ffn = _StubFFN()
     _set_layer9_alu(ffn, 100.0, _SetDim)
