@@ -897,3 +897,33 @@ def declare_setdim_compat_dims(
     # not renumber any pre-existing compiler-allocated non-IO dims.
     for name in ("STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3"):
         _declare(name, 1)
+
+    # V2/G7 LEV detector head output dims (Phase 9 spike from
+    # docs/CONTROL_FLOW_DETECTOR_HEADS.md §2.3). These are fresh residual
+    # bands written by ``make_lev_detector_head_op`` (L8 attn head, default
+    # ``enable=False``). The head's V/O projection materialises the saved
+    # PC / BP / SP from the prev-step LEV row at the current-step PC/BP/SP
+    # marker rows; downstream readers (L9 alu, L8 sp_gather_bake) can prefer
+    # the detector dim when present, falling back to the existing
+    # OUTPUT_LO/HI writes from L16 ``layer16_lev_routing`` on non-LEV-
+    # following steps.
+    #
+    # The dims are declared unconditionally so the residual layout / dim
+    # registry is stable regardless of the head's ``enable`` flag. The
+    # explicit ``compiler.declare_dim`` call bypasses the
+    # ``hasattr(_SetDim, name)`` guard inside ``_declare`` -- these slots
+    # have no ``_SetDim`` legacy position (they are V2-native and emerge
+    # from the bump-pointer allocator above the STACK0_BYTE3 high-water
+    # mark; ``pinned=None`` lets the compiler pick the lowest free slot).
+    #
+    # PC has lo/hi nibble pair (mirrors OUTPUT_LO/HI structure); BP and SP
+    # are single 16-wide bands. See docs/CONTROL_FLOW_DETECTOR_HEADS.md
+    # §2.3 for the residual-stream rationale and §2.2 for the V/O write
+    # table.
+    for name in (
+        "PC_VIA_LEV_DETECTOR_LO",
+        "PC_VIA_LEV_DETECTOR_HI",
+        "BP_VIA_LEV_DETECTOR",
+        "SP_VIA_LEV_DETECTOR",
+    ):
+        compiler.declare_dim(name, 16, pinned=None)
