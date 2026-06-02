@@ -12,6 +12,46 @@ delete the static-phase scheduler, and hit the headline KV target.
 
 ---
 
+## Status as of 2026-06-02 ~08:00Z
+
+The narrative below (Sections 1-N) predates several landings; this
+section is the running ground-truth delta and supersedes any stale
+counts further down. Major landings since the original draft:
+
+* **V1 — `declarative_via_helper`**: corpus-wide **0** after
+  `phase_a_ffn` inlined `lower_ffn_rules` into `bake_fn`
+  (commit `b182cc2c`). V1 acceptance met.
+* **V2 — attention head shape**: dynamic head count + GQA + per-head
+  `head_dim` landed; `ModelShapeConstraint` IR landed
+  (commit `1a97f1b4`). Head-pin work is the remaining V2 item.
+* **V3 — `dim_ref(category, role)`**: corpus-wide complete across
+  L1–L17 + `model_ops` + `flag_gated_ops` + L0. V3 acceptance met;
+  the ≥50% target in Section 2 is exceeded.
+* **V4 — `layer_idx` / `phase=` carve-out**: `layer_idx` cut from
+  ~60 → **4** call sites (L6 / L14 holdouts remain documented);
+  `phase=` cut from 146 → **30** documented carve-outs.
+* **V5 — static `compile_full_vm` redirect**: **deleted**. Wave A
+  renamed 73 files, Waves B + C completed (`2df143a1`); the module
+  is now `_legacy_redirect` only.
+* **G6 — KV eviction**: 100% complete (analyzer + state + flag +
+  byte-identity gate + measurement harness all landed and active).
+* **G7 — Scheduler SCC**: largest SCC down to **26** (baseline 74,
+  −65%). Continuing toward the ≤10 acceptance bar.
+* **Phase 9 — SSA prototype**: schema (`caf86340`), `LayerCompiler`
+  SSA scheduler hook (`5900344b`), demo op
+  `layer8_head6_ax_carry_refresh` on SSA dim names (`ac4e7b9a`),
+  and design doc `PHASE_9_SSA_PROTOTYPE.md` (`89881ab4`) all landed.
+* **HF deployment**: Mixtral adapter (`1773ef2d`) + adapter tests
+  (`06c1f1a4`) landed; covers VM → `MixtralForCausalLM` export with
+  shape-mismatch / custom / overrides coverage.
+
+Open / in-flight against Section 2 acceptance: attention head pins
+(non-None `pin=`), the residual `phase=` carve-outs, SCC ≤ 10, and
+the remaining `imperative_heavy` ops (post the V1 cut). The closing
+demo (sub-wave 8.H) is not yet committed.
+
+---
+
 ## Section 1 — Why Phase 8
 
 ### What Phase 7 achieved (closing-audit numbers)
