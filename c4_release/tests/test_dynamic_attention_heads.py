@@ -192,8 +192,8 @@ def test_group_size_4_routes_kv_to_shared_block():
     HD = 8
     num_q_heads = 8
     num_kv_heads = 2
-    dim_q = HD * num_q_heads
-    dim_kv = HD * num_kv_heads
+    dim_q = HD * num_q_heads  # 64
+    dim_kv = HD * num_kv_heads  # 16
     # Synthetic GQA-shape attention module: W_q sized to num_q_heads,
     # W_k/W_v sized to num_kv_heads. W_o is num_q_heads-wide too because
     # GQA still produces num_q_heads value rows in the output.
@@ -205,33 +205,36 @@ def test_group_size_4_routes_kv_to_shared_block():
     attn.W_v = torch.nn.Parameter(torch.zeros(dim_kv, dim_q))
     attn.W_o = torch.nn.Parameter(torch.zeros(dim_q, dim_q))
     # Heads 0,1,2,3 share KV head 0; heads 4,5,6,7 share KV head 1.
+    # Use Q-head-id as the col index so each head writes into a
+    # distinct column within the dim_q-wide weight matrices.
     for q_head_idx in range(num_q_heads):
         spec = DeclarativeAttentionHeadSpec(
             head_idx=q_head_idx,
-            q=(AP(0, q_head_idx, 1.0),),  # Q writes col=head_idx
-            k=(AP(0, 100 + q_head_idx, 1.0),),
-            v=(AP(0, 200 + q_head_idx, 1.0),),
-            o=(AO(300 + q_head_idx, 0, 1.0),),
+            q=(AP(0, q_head_idx, 1.0),),
+            k=(AP(0, q_head_idx, 1.0),),
+            v=(AP(0, q_head_idx, 1.0),),
+            o=(AO(q_head_idx, 0, 1.0),),
             group_size=4,
         )
         # kv_head_idx is computed from head_idx and group_size
         assert spec.kv_head_idx == q_head_idx // 4
         Primitives.generate_attention_head(attn, spec, HD)
-    # Q row layout: each Q head has its own block (0,8,16,...)
+    # Q row layout: each Q head has its own block (rows 0,8,16,...)
     for q_head_idx in range(num_q_heads):
         assert float(attn.W_q.data[q_head_idx * HD + 0, q_head_idx]) == 1.0
-    # K row layout: heads 0..3 all stomp into KV row 0; heads 4..7 all
-    # into KV row 8 (since HD=8). The LAST write wins because the K
-    # rule writes to slot 0 in every spec — i.e. the same K row.
+    # K row layout: heads 0..3 all hit KV row 0; heads 4..7 all hit
+    # KV row 8 (since HD=8). The K col carries the head's id; the K
+    # row carries the KV group.
     # Heads 0..3: kv_head_idx=0 -> kv_base=0 -> slot 0 -> row 0
     # Heads 4..7: kv_head_idx=1 -> kv_base=8 -> slot 0 -> row 8
-    # The K col carries the head's id; the K row carries the KV group.
-    # Each spec writes col=100+q_head_idx, so all 4 cols in group 0
-    # should be populated at row 0.
     for q_head_idx in range(num_q_heads):
         kv_row = (q_head_idx // 4) * HD + 0
-        assert float(attn.W_k.data[kv_row, 100 + q_head_idx]) == 1.0
-        assert float(attn.W_v.data[kv_row, 200 + q_head_idx]) == 1.0
+        assert float(attn.W_k.data[kv_row, q_head_idx]) == 1.0
+        assert float(attn.W_v.data[kv_row, q_head_idx]) == 1.0
+    # KV matrix shape verifies the GQA compression contract: only
+    # num_kv_heads * HD = 16 rows, NOT num_q_heads * HD = 64.
+    assert attn.W_k.data.shape[0] == num_kv_heads * HD
+    assert attn.W_v.data.shape[0] == num_kv_heads * HD
 
 
 def test_attention_op_shape_reports_q_and_kv_counts():
