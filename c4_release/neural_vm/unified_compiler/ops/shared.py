@@ -806,6 +806,18 @@ def declare_setdim_compat_dims(
             existing = getattr(compiler, "_pinned", {}) or {}
             if base in existing:
                 pinned = existing[base]
+            elif pin_io_only and base not in _IO_REQUIRED_DIMS:
+                # Compact layout: base is bump-pointer allocated (not
+                # pinned). Skip the alias declaration so it doesn't get
+                # pinned to a stale _SetDim position that disagrees with
+                # the bump-pointer location of the base. The alias still
+                # resolves via the ``_SetDim`` proxy fallback in baked
+                # code that references ``BD.<alias>``, and ops that
+                # declare reads on the alias name would surface a clear
+                # "undeclared dim" error in compact mode -- which is the
+                # correct behaviour because there is no byte-identical
+                # cell to read.
+                return
             else:
                 # Fall back to _SetDim if the base wasn't pinned (shouldn't
                 # happen because the base is declared first in the list).
