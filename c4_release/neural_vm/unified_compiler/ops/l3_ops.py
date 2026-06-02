@@ -1153,39 +1153,39 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                "H1", "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                # Phase 7.A.3.b: head 5 reads prev-step OUTPUT_LO via the
-               # AX-marker attention back-edge (mirrors OUTPUT_HI_THIS_STEP
-               # cross-step semantics; cycle-break tracked under the
-               # requires["after"] declaration below).
+               # AX-marker attention back-edge. OUTPUT_LO_PREV_STEP has
+               # no same-step writers (it is an alias of OUTPUT_LO at
+               # position 174) so the rename suffices to break every
+               # cross-step back-edge from L8+/L14+ OUTPUT_LO writers.
                # Phase 8.A (EMBED_HI split): EMBED_HI_PREV_STEP marks the
                # EMBED_HI read as cross-step relative to layer4_pc_relay
                # (L4 writes EMBED_HI at the AX marker AFTER L3 in the
                # same step). Same numeric position; breaks the
                # layer4_pc_relay → layer3_carry_forward_attn back-edge
                # on EMBED_HI.
+               # Phase 8.A G7: OUTPUT_HI_THIS_STEP read renamed to
+               # OUTPUT_HI_PREV_STEP. Head 5 (``_ax_full_relay_head_spec``)
+               # attends back to the prev-step AX marker row where the
+               # high-nibble OUTPUT residual still holds the previous
+               # step's value. The alias shares the same numeric
+               # position (190) as OUTPUT_HI so baked weights are
+               # byte-identical. Because OUTPUT_HI_PREV_STEP has no
+               # declared writers, the scheduler dep graph no longer
+               # creates a back-edge from any later-layer
+               # OUTPUT_HI_THIS_STEP writer (L8+/L14+) into this op,
+               # so the previous ``requires["after"]=layer16_lev_routing``
+               # cycle-break is no longer needed and has been removed.
+               # See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §2.1 + Phase 8.A G7.
                "EMBED_LO", "EMBED_HI_PREV_STEP", "OUTPUT_LO_PREV_STEP",
-               "OUTPUT_HI_THIS_STEP", "CONST"},
+               "OUTPUT_HI_PREV_STEP", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                 "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI",
                 "TEMP", "ADDR_KEY"},
         kind="attn",
-        # Phase 8.G.6: drop ``layer_idx=3`` literal. ``requires["after"]
-        # = layer16_lev_routing`` below + the dep edges from L1/L2 reads
-        # force the earliest landing layer to L3.
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer3_carry_forward_attn_ir,
         declarative_authority="spec_generated",
         migrated=True,
-        # B9 OUTPUT_HI split: head 5 (``_ax_full_relay_head_spec``) reads
-        # OUTPUT_LO/HI at the AX marker, but L3 is the first layer in
-        # step N to touch OUTPUT -- the read actually consumes the
-        # PREVIOUS step's residual via attention back to the prev-step
-        # AX marker token. Declare requires["after"]=layer16_lev_routing
-        # to inform the dynamic scheduler that the OUTPUT_HI_THIS_STEP
-        # read on this op is satisfied by the previous step's final
-        # OUTPUT writer (and is therefore NOT a same-step data dep on
-        # any later-layer producer). See
-        # docs/B9_OUTPUT_HI_SPLIT_SPEC.md §2.1 and §6.3.
-        requires={"after": "layer16_lev_routing"},
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
