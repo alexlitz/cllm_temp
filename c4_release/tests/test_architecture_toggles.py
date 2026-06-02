@@ -526,3 +526,80 @@ def test_div_mode_default_long_div_byte_identical_to_no_kwarg():
         div_mode="long_div",
     )
     assert default.div_mode == explicit.div_mode == "long_div"
+
+
+def test_swiglu_ffn_hidden_ratio_configurable_for_mixtral():
+    """The SwiGLU FFN hidden dim is an explicit constructor kwarg, so
+    Mixtral-style ratios (intermediate = 3.5 * d_model) are reachable.
+
+    Asserts:
+      * ``PureFFN(dim=d, hidden_dim=int(3.5*d))`` constructs cleanly.
+      * The baked weight shapes match the ratio (no silent rounding /
+        clamping).
+      * Forward runs and returns the expected shape.
+      * An ``AutoregressiveVM`` with ``ffn_hidden=int(3.5*d_model)``
+        also constructs and each block's FFN reports the requested
+        width — i.e. the toggle propagates end-to-end.
+      * A different ratio produces different weight shapes (the kwarg
+        isn't a no-op constant).
+    """
+    d_model = 64
+
+    # Mixtral expects intermediate = 3.5 * hidden_size.
+    mixtral_hidden = int(d_model * 3.5)
+    ffn = PureFFN(dim=d_model, hidden_dim=mixtral_hidden)
+    assert ffn.hidden_dim == mixtral_hidden
+    assert ffn.W_up.shape == (mixtral_hidden, d_model)
+    assert ffn.W_gate.shape == (mixtral_hidden, d_model)
+    assert ffn.W_down.shape == (d_model, mixtral_hidden)
+    assert ffn.b_up.shape == (mixtral_hidden,)
+
+    x = torch.randn(1, 3, d_model)
+    with torch.no_grad():
+        y = ffn(x)
+    assert y.shape == x.shape
+
+    # A non-Mixtral ratio must yield a different shape — proves the
+    # kwarg isn't being clamped to some hard-coded width.
+    vanilla_hidden = d_model * 4
+    ffn_vanilla = PureFFN(dim=d_model, hidden_dim=vanilla_hidden)
+    assert ffn_vanilla.hidden_dim == vanilla_hidden
+    assert ffn_vanilla.W_up.shape != ffn.W_up.shape
+
+    # End-to-end: AutoregressiveVM honours per-block ffn_hidden too.
+    d_model_vm = 32
+    mixtral_vm_hidden = int(d_model_vm * 3.5)
+    torch.manual_seed(0)
+    vm = AutoregressiveVM(
+        n_layers=2,
+        d_model=d_model_vm,
+        n_heads=4,
+        ffn_hidden=mixtral_vm_hidden,
+        max_seq_len=16,
+        use_flash_attention=False,
+    )
+    for block in vm.blocks:
+        assert block.ffn.hidden_dim == mixtral_vm_hidden
+        assert block.ffn.W_up.shape == (mixtral_vm_hidden, d_model_vm)
+
+
+def test_swiglu_ffn_per_block_widths_dict_propagates():
+    """``ffn_hidden`` accepts a dict[int, int] of per-block widths from
+    the compiler's ``ModelLayout.ffn_widths``. This pins the per-block
+    FFN-ratio toggle (a generalisation of the Mixtral 3.5x case).
+    """
+    d_model = 32
+    per_block = {0: 16, 1: int(d_model * 3.5)}  # Mixtral on block 1
+
+    torch.manual_seed(0)
+    vm = AutoregressiveVM(
+        n_layers=2,
+        d_model=d_model,
+        n_heads=4,
+        ffn_hidden=per_block,
+        max_seq_len=16,
+        use_flash_attention=False,
+    )
+    assert vm.blocks[0].ffn.hidden_dim == per_block[0]
+    assert vm.blocks[1].ffn.hidden_dim == per_block[1]
+    assert vm.blocks[0].ffn.hidden_dim != vm.blocks[1].ffn.hidden_dim
