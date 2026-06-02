@@ -2277,7 +2277,6 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 BZ/BNZ PC override IR lowered to unexpected units "
             f"{branch_pc_ends}; expected {expected_branch_pc_ends}"
         )
-    return
     _clear_ffn_unit_band(
         ffn,
         L6_IMM_FETCH_ROUTE_START_UNIT,
@@ -2289,6 +2288,7 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 IMM fetch route IR lowered to unexpected unit "
             f"{imm_end}; expected {L6_IMM_FETCH_ROUTE_END_UNIT}"
         )
+    return
     _clear_ffn_unit_band(
         ffn,
         L6_IMM_CARRY_REFRESH_START_UNIT,
