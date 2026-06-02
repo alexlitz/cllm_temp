@@ -212,6 +212,43 @@ def _lower_layer11_mul_partial_rules(
     )
 
 
+def make_layer11_ffn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer11_mul_partial``: declares identical
+    reads/writes so the LayerCompiler's dep graph reserves a layer slot
+    for L11. Mirrors ``_layer3_ffn_dep_anchor`` /
+    ``_opcode_decode_ffn_dep_anchor`` -- the actual MUL partial weight
+    bake happens in ``layer11_mul_partial`` (kind="block",
+    target_op_name=``_layer11_ffn_dep_anchor``); this op's bake is a
+    no-op (its layout-assigned ffn block is unrelated to the bake
+    target, which the block op resolves via ``target_op_name``).
+
+    Phase 8.A.4 retry: added so the L11 layer is dep-anchored rather
+    than ``layer_idx=11``-pinned. The anchor's
+    ``requires["after"]: layer10_carry_relay`` forces
+    ``earliest = L10 + 1 = L11``; the block op then binds to this
+    anchor's resolved layer via ``target_op_name``.
+    """
+    def bake(ffn, dim_positions, S):
+        # No-op: actual bake is in `layer11_mul_partial` block op below.
+        return
+
+    return Operation(
+        name="_layer11_ffn_dep_anchor",
+        phase=11,
+        reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
+        writes={"TEMP"},
+        kind="ffn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        # Pointing at L10's attn anchor ``layer10_carry_relay`` (placed at
+        # L10 via its own ``requires["after"]: layer9_marker_suppress``)
+        # creates a topo dep edge so this anchor lands at L10 + 1 = L11.
+        requires={"after": "layer10_carry_relay"},
+        smoke_tests=set(),
+        spec_section=None,
+    )
+
+
 def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
     """L11 FFN: MUL partial product accumulation.
 
@@ -285,7 +322,11 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # bypass the allocator bookkeeping.
         compiler_ir=_layer11_mul_partial_ir(),
         declarative_authority="spec_generated",
-        layer_idx=11,
+        # Phase 8.A.4 retry: layer_idx=11 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``_layer11_ffn_dep_anchor``
+        # (kind="ffn", L11 anchor pinned via
+        # ``requires["after"]: layer10_carry_relay``).
+        target_op_name="_layer11_ffn_dep_anchor",
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G): the L11 MUL partial unit
         # consumes ALU_LO (operand A low nibble) and AX_CARRY_LO/HI (operand B
