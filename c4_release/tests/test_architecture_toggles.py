@@ -325,3 +325,110 @@ def test_compiler_cache_key_distinguishes_architecture_toggles(monkeypatch):
     assert full_vm_compiler._cache_key({**base, "positional_encoding": "rope"}) != base_key
     assert full_vm_compiler._cache_key({**base, "attention_normalization": "softmax"}) != base_key
     assert full_vm_compiler._cache_key({**base, "use_rms_norm": True}) != base_key
+
+
+# ---------------------------------------------------------------------------
+# Toggle differentiation tests (per TESTING_CHECKLIST / Phase 8.O).
+#
+# For each architectural toggle we assert two things:
+#   (a) the non-default value produces observably different behaviour than
+#       the default (i.e. the toggle actually toggles something), and
+#   (b) the current default value remains byte-identical to a model built
+#       with no architecture kwarg (the no-regress guarantee).
+# Byte-identity at the 4-axis default is also covered by
+# ``test_default_combo_byte_identical_to_no_kwargs``.
+# ---------------------------------------------------------------------------
+
+
+def _randomize_attention_inplace(attn, seed: int = 0):
+    """Fill Q/K/V/O with nontrivial weights so position encoding actually
+    influences the attention scores.
+
+    With the default zero-init weights every score collapses to zero
+    regardless of RoPE/ALiBi, so any difference between modes would be
+    invisible. A small random fill keeps the test sensitive while leaving
+    the toggle logic itself untouched.
+    """
+    g = torch.Generator().manual_seed(seed)
+    for p in (attn.W_q, attn.W_k, attn.W_v, attn.W_o):
+        p.data.normal_(generator=g)
+        p.data.mul_(0.1)
+
+
+def test_rope_vs_alibi_produces_different_attention_outputs():
+    """RoPE and ALiBi must produce observably different attention outputs
+    on the same input + same Q/K/V/O weights. This pins the position-
+    encoding toggle to actual numerical behaviour, not just buffer presence.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(1, 6, 32)
+
+    attn_alibi = AutoregressiveAttention(
+        dim=32, num_heads=4, max_seq_len=8,
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        use_flash_attention=False,
+    )
+    _randomize_attention_inplace(attn_alibi, seed=1)
+
+    attn_rope = AutoregressiveAttention(
+        dim=32, num_heads=4, max_seq_len=8,
+        positional_encoding="rope",
+        attention_normalization="softmax1",
+        use_flash_attention=False,
+    )
+    # Identical Q/K/V/O so the only remaining axis of variation is the
+    # position-encoding branch (alibi_slopes-as-bias vs RoPE Q/K rotation).
+    with torch.no_grad():
+        attn_rope.W_q.copy_(attn_alibi.W_q)
+        attn_rope.W_k.copy_(attn_alibi.W_k)
+        attn_rope.W_v.copy_(attn_alibi.W_v)
+        attn_rope.W_o.copy_(attn_alibi.W_o)
+
+    with torch.no_grad():
+        out_alibi = attn_alibi(x)
+        out_rope = attn_rope(x)
+
+    assert torch.isfinite(out_alibi).all()
+    assert torch.isfinite(out_rope).all()
+    assert not torch.allclose(out_alibi, out_rope, atol=1e-6), (
+        "RoPE and ALiBi attention produced identical outputs — the "
+        "position-encoding toggle is not influencing attention scores."
+    )
+    # Buffer presence matches the toggle (defensive — guards against a
+    # regression that nominally accepts the kwarg but never populates
+    # the RoPE cache).
+    assert attn_alibi.alibi_slopes is not None and attn_alibi._rope_cos is None
+    assert attn_rope.alibi_slopes is None and attn_rope._rope_cos is not None
+
+
+def test_alibi_default_byte_identical_to_no_kwarg():
+    """The current position-encoding default (``"alibi"``) must be
+    byte-identical to constructing AutoregressiveAttention with no
+    ``positional_encoding`` kwarg.
+    """
+    torch.manual_seed(0)
+    attn_default = AutoregressiveAttention(
+        dim=32, num_heads=4, max_seq_len=8,
+        attention_normalization="softmax1",
+        use_flash_attention=False,
+    )
+    _randomize_attention_inplace(attn_default, seed=4)
+
+    torch.manual_seed(0)
+    attn_explicit = AutoregressiveAttention(
+        dim=32, num_heads=4, max_seq_len=8,
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        use_flash_attention=False,
+    )
+    _randomize_attention_inplace(attn_explicit, seed=4)
+
+    x = torch.randn(1, 6, 32)
+    with torch.no_grad():
+        y_default = attn_default(x)
+        y_explicit = attn_explicit(x)
+
+    assert torch.equal(y_default, y_explicit), (
+        "positional_encoding default drifted from no-kwarg baseline."
+    )
