@@ -261,6 +261,47 @@ def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADJ hi-nibble cross-product (512 units).
+
+    Same structural shape as ``_layer9_lea_hi_nibble_rules`` (amplified
+    AX marker AND with ``ALU_HI`` and ``FETCH_HI``, non-AX blocker dims
+    at ``-S*1000``) but gates on ``OP_ADJ`` and uses slightly shifted
+    thresholds (42.0 / 50.0) so the carry/no-carry discrimination still
+    works after the ADJ opcode amplification. Writes
+    ``OUTPUT_HI_THIS_STEP+result`` where ``result = (a + b + carry_in)
+    % 16``.
+    """
+
+    rules: list[FFNRule] = []
+    for carry_in in (0, 1):
+        for a in range(16):
+            for b in range(16):
+                result = (a + b + carry_in) % 16
+                conditions: list[tuple[str, float]] = [("MARK_AX", 20.0)]
+                conditions.extend(
+                    (dim, -1000.0) for dim in _L9_NON_AX_BLOCKERS
+                )
+                conditions.append((f"ALU_HI+{a}", 1.0))
+                conditions.append((f"FETCH_HI+{b}", 20.0))
+                if carry_in == 0:
+                    conditions.append(("CARRY+0", -8.0))
+                    threshold = 42.0
+                else:
+                    conditions.append(("CARRY+0", 8.0))
+                    threshold = 50.0
+                rules.append(FFNRule.gated_write(
+                    name=f"l9_adj_hi_c{carry_in}_a{a}_b{b}",
+                    conditions=tuple(conditions),
+                    threshold=threshold,
+                    gate="OP_ADJ",
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
+                ))
+    return tuple(rules)
+
+
 def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     """L9 FFN: ADD/SUB hi nibble + bitwise ops byte 0, plus marker suppression.
 
