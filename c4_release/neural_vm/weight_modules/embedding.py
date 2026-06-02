@@ -2,10 +2,36 @@
 Embedding Weight Module.
 
 Sets token embedding weights for the Neural VM.
+
+Phase 7.D.3 migration: the imperative per-token writes were replaced by
+``TokenEmbeddingRule``s lowered via :meth:`CompilerIR.lower_token_embeddings`.
+The rule list is the same one used by the active production bake op
+``make_embedding_bake_op`` in ``unified_compiler/ops/model_ops.py`` --
+single source of truth.
 """
 
 from typing import List
 from .base import WeightModule, WeightConfig, get_dimension_registry
+
+
+def _setdim_to_positions(BD) -> dict:
+    """Build a ``dim_positions`` dict from a ``_SetDim``-like class.
+
+    Mirrors the contract expected by ``CompilerIR.lower_token_embeddings``:
+    a ``Mapping[str, int]``. Walks every public class attribute that resolves
+    to an ``int`` (the dim-position constants on ``_SetDim``). Lookups for
+    missing dims fall back to ``getattr(_SetDim, name)`` inside the rule
+    lowering only if the dim name is referenced; here we copy every
+    integer attribute up-front so the mapping is closed.
+    """
+    dim_positions = {}
+    for name in dir(BD):
+        if name.startswith("_"):
+            continue
+        val = getattr(BD, name, None)
+        if isinstance(val, int) and not isinstance(val, bool):
+            dim_positions[name] = val
+    return dim_positions
 
 
 class EmbeddingWeights(WeightModule):
@@ -24,44 +50,24 @@ class EmbeddingWeights(WeightModule):
         return list(range(512))  # Uses all dimensions
 
     def set_weights(self, model) -> None:
-        """Set embedding weights."""
+        """Set embedding weights via declarative ``TokenEmbeddingRule`` IR.
+
+        Phase 7.D.3 migration: replaced per-token imperative writes with a
+        call to ``CompilerIR.lower_token_embeddings`` carrying the same rule
+        list that ``make_embedding_bake_op`` uses. The bake_fn first zeroes
+        ``model.embed.embed.weight`` (the IR has no zeroing primitive) and
+        then lowers the rules.
+        """
+        import torch
+        from neural_vm.unified_compiler.ir import CompilerIR
+        from neural_vm.unified_compiler.ops.model_ops import _embedding_bake_rules
+
         BD = get_dimension_registry()
-        embed = model.embed.embed.weight
-        embed.zero_()
+        dim_positions = _setdim_to_positions(BD)
 
-        V = model.vocab_size
+        with torch.no_grad():
+            model.embed.embed.weight.zero_()
 
-        # CONST dimension for all tokens
-        for tok in range(V):
-            embed[tok, BD.CONST] = 1.0
-
-        # Register markers
-        from neural_vm.vm_step import Token
-        for tok, dim in [
-            (Token.REG_PC, BD.MARK_PC),
-            (Token.REG_AX, BD.MARK_AX),
-            (Token.REG_SP, BD.MARK_SP),
-            (Token.REG_BP, BD.MARK_BP),
-            (Token.MEM, BD.MARK_MEM),
-            (Token.CODE_START, BD.MARK_CS),
-        ]:
-            embed[tok, dim] = 1.0
-            embed[tok, BD.IS_MARK] = 1.0
-
-        # STACK0 marker (no IS_MARK)
-        embed[Token.STACK0, BD.MARK_STACK0] = 1.0
-
-        # Step-end markers
-        for tok in [Token.STEP_END, Token.DATA_END, Token.HALT]:
-            embed[tok, BD.MARK_SE] = 1.0
-            embed[tok, BD.IS_MARK] = 1.0
-
-        embed[Token.STEP_END, BD.MARK_SE_ONLY] = 1.0
-
-        # Byte embeddings
-        for b in range(256):
-            embed[b, BD.IS_BYTE] = 1.0
-            embed[b, BD.EMBED_LO + (b & 0xF)] = 1.0
-            embed[b, BD.EMBED_HI + ((b >> 4) & 0xF)] = 1.0
-            embed[b, BD.CLEAN_EMBED_LO + (b & 0xF)] = 1.0
-            embed[b, BD.CLEAN_EMBED_HI + ((b >> 4) & 0xF)] = 1.0
+        ir = CompilerIR()
+        ir.embeddings.extend(_embedding_bake_rules(model.vocab_size))
+        ir.lower_token_embeddings(model, dim_positions)
