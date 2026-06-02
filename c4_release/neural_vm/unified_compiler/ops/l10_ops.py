@@ -2136,7 +2136,11 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_byte_passthrough_ir,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor pinned via
+        # ``requires["after"]: layer9_marker_suppress``).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
