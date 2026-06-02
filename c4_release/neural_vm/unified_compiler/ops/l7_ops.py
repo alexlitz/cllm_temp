@@ -162,9 +162,21 @@ def make_layer7_operand_gather_op() -> Operation:
     return Operation(
         name="layer7_operand_gather",
         phase=7,
+        # Phase 8.A targeted: head 1's V slots read BP/SP OUTPUT_LO via
+        # attention back to the prev-step BP/SP marker row (LEA/ADJ/ENT
+        # operand A relay). L7 fires before any same-step OUTPUT_LO
+        # producer (L8-L17), so the available residual is step N-1's
+        # value. Declare via the OUTPUT_LO_PREV_STEP alias (same numeric
+        # slot 174, byte-identical bake) to retire the 31 OUTPUT_LO
+        # back-edges into this op visible in the SCC audit. Mirrors the
+        # L3 head 5 / L8 head 6 pattern from Phase 7.A.3.b. OUTPUT_HI
+        # keeps its canonical name — OUTPUT_HI uses the B9 rename-only
+        # split and the (single) back-edge into this op is handled
+        # separately. See .agent-logs/scc_audit_phase8.md.
         reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA", "OP_ADJ", "OP_ENT",
                "CONST",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "OUTPUT_LO", "OUTPUT_HI"},
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "OUTPUT_LO_PREV_STEP", "OUTPUT_HI"},
         writes={"ALU_LO", "ALU_HI"},
         kind="block",
         declarative_bake_fn=bake,
