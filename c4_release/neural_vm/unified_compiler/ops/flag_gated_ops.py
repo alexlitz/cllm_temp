@@ -1,5 +1,6 @@
 """Flag-gated factories (tool-call + conversational I/O). See ../migrated_ops.py for history."""
 
+from ...dim_registry import dim_ref
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -96,8 +97,15 @@ def _tool_call_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
     ``OPCODE_BYTE_LO/HI`` nibbles, MARK_AX gate, writes ``IO_IS_TOOL_CALL``.
     Each unit's effective contribution is ``10.0/S`` so the combined flag
     is roughly 5.0 when an I/O opcode is active.
+
+    Phase 8.D: the ``MARK_AX`` gate uses :func:`dim_ref` for the
+    ``(marker, AX)`` semantic pair. Structural ``OPCODE_BYTE_LO/HI+{lo,hi}``
+    condition reads stay as ``+N`` (per-nibble one-hot lookups, not
+    role-meaningful byte positions). ``IO_IS_TOOL_CALL`` is a slot-level
+    flag with no ``(category, role)`` binding so the write stays bare.
     """
     write_scale = 10.0 / S
+    gate_ax = dim_ref("marker", "AX")
     return tuple(
         FFNRule.gated_write(
             name=f"tool_call_decode_{name}",
@@ -106,7 +114,7 @@ def _tool_call_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"OPCODE_BYTE_HI+{hi}", 1.0),
             ),
             threshold=1.5,
-            gate="MARK_AX",
+            gate=gate_ax,
             writes=(("IO_IS_TOOL_CALL", write_scale),),
         )
         for lo, hi, name in _TOOL_CALL_OPCODE_TABLE
@@ -211,8 +219,18 @@ def _convo_io_opcode_decode_ir(S: float = 100.0) -> CompilerIR:
 
 
 def _convo_io_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
+    """Two gated-write units detecting PRTF / READ opcodes at MARK_AX.
+
+    Phase 8.D: the ``MARK_AX`` gate uses :func:`dim_ref` for the
+    ``(marker, AX)`` semantic pair. Structural ``OPCODE_BYTE_LO/HI+{n}``
+    condition reads stay as ``+N`` (per-nibble one-hot lookups, not
+    role-meaningful byte positions). ``IO_IS_PRTF`` / ``IO_IS_READ`` /
+    ``ACTIVE_OPCODE_*`` are slot-level flags with no ``(category, role)``
+    binding so the writes stay bare.
+    """
     write_io = 10.0 / S
     write_active = 2.0 / S
+    gate_ax = dim_ref("marker", "AX")
     return (
         FFNRule.gated_write(
             name="convo_io_decode_prtf",
@@ -221,7 +239,7 @@ def _convo_io_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OPCODE_BYTE_HI+2", 1.0),
             ),
             threshold=1.5,
-            gate="MARK_AX",
+            gate=gate_ax,
             writes=(
                 ("IO_IS_PRTF", write_io),
                 ("ACTIVE_OPCODE_PRTF", write_active),
@@ -234,7 +252,7 @@ def _convo_io_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OPCODE_BYTE_HI+1", 1.0),
             ),
             threshold=1.5,
-            gate="MARK_AX",
+            gate=gate_ax,
             writes=(
                 ("IO_IS_READ", write_io),
                 ("ACTIVE_OPCODE_READ", write_active),
