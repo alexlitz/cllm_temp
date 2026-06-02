@@ -2579,6 +2579,61 @@ def make_layer6_routing_ffn_op() -> Operation:
     )
 
 
+def make_layer6_ffn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer6_routing_ffn``: declares mirrored
+    reads/writes so the LayerCompiler's dep graph reserves a layer slot
+    for it. Mirrors ``_opcode_decode_ffn_dep_anchor`` /
+    ``_layer3_ffn_dep_anchor``: the actual bake happens in
+    ``layer6_routing_ffn`` (kind="block", layer_idx=6); this op's bake
+    is a no-op (its layout-assigned ffn block is unrelated to block[6]).
+
+    Phase 8.A.4 prep: lets L6 FFN block ops (e.g. ``convo_io_state_machine``,
+    ``convo_io_pc_sp_latch``) declare
+    ``target_op_name="_layer6_ffn_dep_anchor"`` and bind to whichever
+    layer the compiler places the L6 FFN at, instead of carrying a
+    literal ``layer_idx=6`` -- or the misleading
+    ``target_op_name="layer6_attn"`` which the two ops use today.
+    """
+    def bake(ffn, dim_positions, S):
+        # No-op: actual bake is in `layer6_routing_ffn` block op above.
+        return
+
+    return Operation(
+        name="_layer6_ffn_dep_anchor",
+        # Phase=5 matches ``_opcode_decode_ffn_dep_anchor`` so the two
+        # L6 FFN anchors share the same layer slot (the layer compiler's
+        # earliest-fit allocator co-places same-kind ops at the same
+        # phase). The actual ``layer6_routing_ffn`` block op runs at
+        # phase=6.5 and pins layer_idx=6 separately, so the anchor's
+        # phase is purely a placement key for the dep-graph slot table.
+        phase=5,
+        # Mirrored subset of ``layer6_routing_ffn``'s reads/writes,
+        # excluding dims the ``_opcode_decode_ffn_dep_anchor`` writes at
+        # L6 (OP_IMM/OP_EXIT/OP_JMP/OP_NOP/OP_LEA/TEMP) so the new
+        # anchor's earliest landable layer is not pushed past L6 by the
+        # opcode-decode anchor's writes. ``requires["same_layer_as"]``
+        # below then pins it to the same layer as the opcode-decode
+        # anchor (L6) and the phase-share rule places both anchors in
+        # the L6 FFN slot.
+        reads={"MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
+               "IS_BYTE", "FETCH_LO", "FETCH_HI",
+               "AX_CARRY_LO", "AX_CARRY_HI", "CMP",
+               "HAS_SE", "OPCODE_BASE"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
+                "AX_CARRY_LO", "AX_CARRY_HI"},
+        kind="ffn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        # Co-place with ``_opcode_decode_ffn_dep_anchor`` so the new
+        # anchor lands at exactly L6 (where the opcode-decode anchor
+        # lands today). The phase-share rule (same kind, same phase)
+        # then puts both in the L6 FFN slot.
+        requires={"same_layer_as": "_opcode_decode_ffn_dep_anchor"},
+        smoke_tests=set(),
+        spec_section=None,
+    )
+
+
 def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
     """L6 FFN: correct ENT's SP byte 0 after the preceding JSR stack push."""
 
