@@ -813,6 +813,219 @@ class TestBundleGapExporterEmbeddingPath:
         )
 
 
+# ----------------------------------------------------------------------------
+# Additional gap coverage: header version preservation, multi-layer structure
+# fidelity, all-zero sparse weight blocks, dense/sparse equivalence, and
+# tokenizer round-trip on edge inputs. These pin behaviours the user-facing
+# requirement ("preserves weights, structure, and metadata + gap handling +
+# tokenizer compatibility") implies but the existing class set only partially
+# exercises.
+# ----------------------------------------------------------------------------
+
+
+class TestBundleMetadataPreserved:
+    """Header metadata (magic, version, dims) survives a write -> read trip."""
+
+    def test_round_trip_preserves_version(self, tmp_path):
+        """The header version we write is the one ``load_arvm`` reports back."""
+        import struct
+        from tools.export_autoregressive import ARVM_VERSION, load_arvm
+
+        path = tmp_path / "ver.arvm"
+        _write_minimal_arvm(str(path))
+        with open(path, 'rb') as f:
+            f.read(4)  # magic
+            ver = struct.unpack('<I', f.read(4))[0]
+        assert ver == ARVM_VERSION, (
+            f"Header version drifted on write: got {ver}, expected "
+            f"{ARVM_VERSION}"
+        )
+        # And the loader handles it without error (i.e. version is in the
+        # supported set {1, 2}).
+        load_arvm(str(path))
+
+    def test_round_trip_preserves_n_heads_and_hidden(self, tmp_path):
+        """n_heads + ffn_hidden survive round-trip independently of d_model."""
+        from tools.export_autoregressive import load_arvm
+
+        path = tmp_path / "dims.arvm"
+        _write_minimal_arvm(
+            str(path), vocab_size=16, d_model=4, n_layers=2,
+            n_heads=4, ffn_hidden=12,
+        )
+        loaded = load_arvm(str(path))
+        assert loaded['n_heads'] == 4
+        assert loaded['ffn_hidden'] == 12
+        # And the alibi_slopes tensor was sized to n_heads, not n_heads*d_model.
+        assert loaded['layers'][0]['alibi_slopes'].shape == (4,)
+
+
+class TestBundleStructurePreserved:
+    """Per-layer tensor shapes survive end-to-end through write -> read."""
+
+    def test_layer_tensor_shapes_round_trip(self, tmp_path):
+        """Each layer's weight tensors come back with the documented shapes."""
+        from tools.export_autoregressive import load_arvm
+
+        vocab_size, d_model, n_layers, n_heads, ffn_hidden = 8, 4, 2, 2, 8
+
+        path = tmp_path / "shapes.arvm"
+        _write_minimal_arvm(
+            str(path), vocab_size=vocab_size, d_model=d_model,
+            n_layers=n_layers, n_heads=n_heads, ffn_hidden=ffn_hidden,
+        )
+        loaded = load_arvm(str(path))
+
+        assert loaded['embed_weight'].shape == (vocab_size, d_model)
+        assert loaded['head_weight'].shape == (vocab_size, d_model)
+        assert loaded['head_bias'].shape == (vocab_size,)
+        assert len(loaded['layers']) == n_layers
+        for layer in loaded['layers']:
+            assert layer['W_q'].shape == (d_model, d_model)
+            assert layer['W_k'].shape == (d_model, d_model)
+            assert layer['W_v'].shape == (d_model, d_model)
+            assert layer['W_o'].shape == (d_model, d_model)
+            assert layer['W_up'].shape == (ffn_hidden, d_model)
+            assert layer['W_gate'].shape == (ffn_hidden, d_model)
+            assert layer['W_down'].shape == (d_model, ffn_hidden)
+            assert layer['b_up'].shape == (ffn_hidden,)
+            assert layer['b_gate'].shape == (ffn_hidden,)
+            assert layer['b_down'].shape == (d_model,)
+
+
+class TestBundleGapAllZeroSparse:
+    """All-zero tensors must round-trip when written with ``sparse=True``.
+
+    The sparse-COO path stores only non-zeros; the loader must still
+    expand a 0-nnz tensor back to the right shape. This is the
+    'sparse weight block' degenerate case.
+    """
+
+    def test_all_zero_dense_block_round_trips_via_sparse(self, tmp_path):
+        """Writing an all-zero tensor with sparse=True yields zeros back."""
+        import numpy as np
+        from tools.export_autoregressive import (
+            ARVM_MAGIC, ARVM_VERSION, _write_u32, write_tensor, load_arvm,
+        )
+
+        vocab_size, d_model, n_heads, ffn_hidden = 4, 4, 2, 4
+
+        path = tmp_path / "allzero.arvm"
+        zero_embed = np.zeros((vocab_size, d_model), dtype=np.float32)
+        with open(path, 'wb') as f:
+            _write_u32(f, ARVM_MAGIC)
+            _write_u32(f, ARVM_VERSION)
+            _write_u32(f, vocab_size)
+            _write_u32(f, d_model)
+            _write_u32(f, 1)
+            _write_u32(f, n_heads)
+            _write_u32(f, ffn_hidden)
+            # All-zero embed via sparse path (nnz==0 must be legal).
+            write_tensor(f, zero_embed, sparse=True)
+            write_tensor(f,
+                         np.array([1.0, 0.5], dtype=np.float32), sparse=False)
+            for shape in (
+                (d_model, d_model), (d_model, d_model),
+                (d_model, d_model), (d_model, d_model),
+                (ffn_hidden, d_model), (ffn_hidden,),
+                (ffn_hidden, d_model), (ffn_hidden,),
+                (d_model, ffn_hidden), (d_model,),
+            ):
+                write_tensor(f, np.zeros(shape, dtype=np.float32), sparse=True)
+            write_tensor(f, np.zeros((vocab_size, d_model), dtype=np.float32),
+                         sparse=True)
+            write_tensor(f, np.zeros((vocab_size,), dtype=np.float32),
+                         sparse=True)
+
+        loaded = load_arvm(str(path))
+        np.testing.assert_array_equal(loaded['embed_weight'], zero_embed)
+        assert loaded['embed_weight'].shape == (vocab_size, d_model)
+        np.testing.assert_array_equal(
+            loaded['layers'][0]['W_q'],
+            np.zeros((d_model, d_model), dtype=np.float32),
+        )
+        # head_bias is the shortest sparse-encoded tensor: confirm it doesn't
+        # truncate to length 0 (the gap the empty-sparse path can hit).
+        assert loaded['head_bias'].shape == (vocab_size,)
+
+
+class TestBundleDenseSparseEquivalence:
+    """A tensor written via dense vs sparse path must read back equal."""
+
+    def test_dense_sparse_paths_agree(self, tmp_path):
+        """Same tensor through dense vs sparse storage -> bit-equal load."""
+        import numpy as np
+        from tools.export_autoregressive import load_arvm
+
+        dense_path = tmp_path / "dense_path.arvm"
+        sparse_path = tmp_path / "sparse_path.arvm"
+
+        dense_tensors = _write_minimal_arvm(str(dense_path), sparse=False,
+                                            seed=7)
+        sparse_tensors = _write_minimal_arvm(str(sparse_path), sparse=True,
+                                             seed=7)
+
+        d_loaded = load_arvm(str(dense_path))
+        s_loaded = load_arvm(str(sparse_path))
+
+        # Original tensors are identical (same seed) — both load paths must
+        # return them bit-equivalent regardless of storage choice.
+        np.testing.assert_array_equal(dense_tensors['embed_weight'],
+                                      sparse_tensors['embed_weight'])
+        np.testing.assert_array_equal(d_loaded['embed_weight'],
+                                      s_loaded['embed_weight'])
+        np.testing.assert_array_equal(d_loaded['head_weight'],
+                                      s_loaded['head_weight'])
+        for layer_d, layer_s in zip(d_loaded['layers'], s_loaded['layers']):
+            for key in layer_d:
+                np.testing.assert_array_equal(
+                    layer_d[key], layer_s[key],
+                    err_msg=f"Dense/sparse disagree on {key}",
+                )
+
+
+class TestBundleTokenizerCompatibility:
+    """Tokenizer round-trip on edge inputs the bundle must support."""
+
+    def test_tokenizer_round_trip_empty_string(self):
+        """Empty input must round-trip to empty output (no UnicodeError)."""
+        from src.tokenizer import C4Tokenizer
+        tok = C4Tokenizer()
+        assert tok.decode(tok.encode("")) == ""
+
+    def test_tokenizer_round_trip_multiline(self):
+        """Multi-line C source round-trips byte-for-byte."""
+        from src.tokenizer import C4Tokenizer
+        tok = C4Tokenizer()
+        text = "int main() {\n  return 42;\n}\n"
+        assert tok.decode(tok.encode(text)) == text
+
+    def test_tokenizer_round_trip_all_ascii_printable(self):
+        """Every printable ASCII byte survives encode -> decode."""
+        from src.tokenizer import C4Tokenizer
+        tok = C4Tokenizer()
+        text = ''.join(chr(c) for c in range(32, 127))
+        assert tok.decode(tok.encode(text)) == text
+
+    def test_tokenizer_vocab_size_matches_arvm_header_capacity(self, tmp_path):
+        """An .arvm header can carry the tokenizer's full vocab_size.
+
+        The header stores vocab_size as a u32, so any practical tokenizer
+        must fit. This pins the compatibility contract.
+        """
+        from src.tokenizer import C4Tokenizer
+        tok = C4Tokenizer()
+        # u32 can carry up to 2**32 - 1, which trivially fits any tokenizer.
+        # The substantive check: the header round-trips the tokenizer's
+        # actual vocab_size without truncation.
+        from tools.export_autoregressive import load_arvm
+        path = tmp_path / "vocab_fit.arvm"
+        _write_minimal_arvm(str(path), vocab_size=tok.vocab_size, d_model=4,
+                            n_layers=1, n_heads=2, ffn_hidden=4)
+        loaded = load_arvm(str(path))
+        assert loaded['vocab_size'] == tok.vocab_size
+
+
 # Run tests
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
