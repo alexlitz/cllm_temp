@@ -310,6 +310,14 @@ def _layer10_alu_bitwise_xor_rules(S: float) -> tuple[FFNRule, ...]:
     return _layer10_alu_bitwise_rules(S, op_name="XOR", op_fn=operator.xor)
 
 
+def _layer10_alu_bitwise_and_rules(S: float) -> tuple[FFNRule, ...]:
+    """L10 bitwise AND: 512 units (256 lo + 256 hi) gated on OP_AND."""
+
+    import operator
+
+    return _layer10_alu_bitwise_rules(S, op_name="AND", op_fn=operator.and_)
+
+
 def _bake_layer10_carry_relay_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 0 carry relay spec."""
     Primitives.generate_attention_head(
