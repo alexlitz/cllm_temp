@@ -85,6 +85,49 @@ ALLOWED_DECLARATIVE_AUTHORITY = frozenset({
 })
 
 
+def _topology_anchor_noop_bake(target, dim_positions, S):
+    """Default no-op bake used by ``declarative_authority='topology_anchor'``.
+
+    Topology anchors intentionally write no weights — they only exist so the
+    dep graph keeps a stable shape for adjacent ops. Authors no longer need
+    to spell out a no-op ``bake_fn=`` argument: omitting ``bake_fn`` on a
+    topology-anchor op causes ``Operation.__post_init__`` to substitute this
+    function in.
+    """
+    return None
+
+
+def _resolve_default_bake_fn(op: "Operation") -> Optional[Callable]:
+    """Pick a default ``bake_fn`` for an op that didn't supply one.
+
+    Resolution order (see ``Operation.bake_fn`` docstring for rationale):
+
+      1. ``declarative_bake_fn`` — the dominant case (100/115 historical
+         core ops passed the same callable to both fields).
+      2. An IR-lowering closure when ``compiler_ir`` /
+         ``compiler_ir_factory`` is set. Mirrors the declarations-only
+         dispatch path in ``dispatch_operation_bake`` so behaviour is
+         byte-identical regardless of which path triggers.
+      3. A no-op when ``declarative_authority == 'topology_anchor'``.
+
+    Returns ``None`` when none of the above applies — the op will retain
+    ``bake_fn = None`` and ``dispatch_operation_bake`` will raise at the
+    first call. This mirrors the pre-6B behaviour for ops missing a bake.
+    """
+    if op.declarative_bake_fn is not None:
+        return op.declarative_bake_fn
+    if op.compiler_ir is not None or op.compiler_ir_factory is not None:
+        def _ir_bake(target, dim_positions, S, *, _op=op):
+            ir = _op.compiler_ir
+            if ir is None:
+                ir = _make_operation_ir(_op, target, dim_positions)
+            _dispatch_operation_ir(_op, target, dim_positions, S, ir)
+        return _ir_bake
+    if op.declarative_authority == "topology_anchor":
+        return _topology_anchor_noop_bake
+    return None
+
+
 @dataclass
 class Operation:
     """A single declarative operation that the compiler can place at any layer.
@@ -123,7 +166,23 @@ class Operation:
     reads: Set[str]
     writes: Set[str]
     kind: str  # "attn", "ffn", "block", or "model"
-    bake_fn: Callable
+    # Imperative bake. As of Phase 6 Wave 6B this is OPTIONAL: when omitted,
+    # ``__post_init__`` resolves it from the declarative siblings:
+    #
+    #   1. ``declarative_bake_fn`` if set (the common case — 100/115 core
+    #      ops historically passed ``bake_fn=bake, declarative_bake_fn=bake``
+    #      with the same callable, so omitting ``bake_fn`` is byte-identical).
+    #   2. An IR-lowering closure when ``compiler_ir`` or
+    #      ``compiler_ir_factory`` is set (used by ops whose only bake is the
+    #      declarative IR — see ``layer16_lev_routing``-style ops).
+    #   3. A no-op when ``declarative_authority == "topology_anchor"``
+    #      (anchors intentionally write no weights).
+    #
+    # An op that supplies none of {bake_fn, declarative_bake_fn, compiler_ir,
+    # compiler_ir_factory, topology_anchor authority} ends up with
+    # ``bake_fn = None`` and will raise at dispatch — that mirrors the
+    # pre-6B behaviour for ops missing a bake entirely.
+    bake_fn: Optional[Callable] = None
     declarative_bake_fn: Optional[Callable] = None
     # Declarative compiler IR owned by this operation. When populated, this is
     # the semantic source of truth: bake functions should lower this IR to
@@ -285,6 +344,14 @@ class Operation:
     semantic_label: Optional[str] = None
 
     def __post_init__(self):
+        # Phase 6 Wave 6B: resolve ``bake_fn`` from declarative siblings when
+        # the caller omitted it. See the ``bake_fn`` field docstring above for
+        # the resolution chain. Done BEFORE the phase-deprecation hook so the
+        # rest of this method can assume the standard invariants.
+        if self.bake_fn is None:
+            resolved = _resolve_default_bake_fn(self)
+            if resolved is not None:
+                self.bake_fn = resolved
         # B15 prep (1.0d, see docs/DYNAMIC_SCHEDULER_MIGRATION_PLAN.md):
         # scaffold a DeprecationWarning emission path for the `phase=N.M`
         # field. The dynamic scheduler retires `phase` after B14 strict mode
