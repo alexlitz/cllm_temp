@@ -221,10 +221,7 @@ def make_layer4_pc_relay_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer4_pc_relay_ir,
-        # Phase 8.G.6: drop ``layer_idx=4`` literal; bind to the L4 ffn
-        # dep anchor so the block op resolves to whichever layer the
-        # compiler places the anchor at.
-        target_op_name="_layer4_ffn_dep_anchor",
+        layer_idx=4,
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
@@ -444,10 +441,7 @@ def make_layer4_ffn_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir=make_layer4_ffn_ir(),
-        # Phase 8.G.6: drop ``layer_idx=4`` literal; bind to the L4 ffn
-        # dep anchor so the block op resolves to whichever layer the
-        # compiler places the anchor at.
-        target_op_name="_layer4_ffn_dep_anchor",
+        layer_idx=4,
         migrated=True,
         claims=_claims,
         # ``_set_layer4_ffn`` writes the PC+1 (lo/hi/carry = 64 units) +
@@ -892,10 +886,7 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
-        # Phase 8.G.6: drop ``layer_idx=4`` literal; bind to the L4 ffn
-        # dep anchor so the block op resolves to whichever layer the
-        # compiler places the anchor at.
-        target_op_name="_layer4_ffn_dep_anchor",
+        layer_idx=4,
         migrated=True,
         # Phase 7.A.2 backfill: this op shares the L4 attention-head allocator
         # with ``layer4_pc_relay`` (heads 0/1 vs 2/3, both pinned via the same
