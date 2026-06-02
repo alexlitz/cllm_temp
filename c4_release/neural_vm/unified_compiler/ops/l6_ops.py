@@ -3926,6 +3926,8 @@ def make_binary_pop_sp_increment_op() -> Operation:
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
+        # Phase 11.A IR exposure: informational factory (34 FFNRules).
+        compiler_ir_factory=_binary_pop_sp_increment_ir,
         phase=998,
         migrated=True,
         # Phase 8.G.6 holdout: ``layer_idx=6`` is retained because this
@@ -4051,6 +4053,25 @@ def _lower_layer6_binary_pop_sp_increment_ir(
         BD,
         unit=unit,
     )
+
+
+def _binary_pop_sp_increment_ir(dim_positions, HD, S: float = 100.0):
+    """Informational :class:`CompilerIR` for ``binary_pop_sp_increment``.
+
+    Carries the 34 :class:`FFNRule` declarations from
+    ``_layer6_binary_pop_sp_increment_rules`` so the declarative verifier
+    and symbolic tooling see the same writes the bake produces. The
+    production bake stays in :func:`_lower_layer6_binary_pop_sp_increment_ir`
+    because it pins ``unit=L6_BINARY_POP_SP_INCREMENT_START_UNIT`` (2294)
+    while ``CompilerIR.lower_ffn`` lowers at ``start_unit=0``; both
+    produce the same per-rule weights at their respective offsets.
+    Phase 11.A.
+    """
+    from ..ir import CompilerIR
+    del dim_positions, HD
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer6_binary_pop_sp_increment_rules(S))
+    return ir
 
 
 def make_putchar_think_protocol_op(
