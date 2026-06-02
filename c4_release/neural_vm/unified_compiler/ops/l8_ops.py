@@ -2418,6 +2418,13 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         # the prev-step residual ADDR_B0_HI value (via the KV cache) — the
         # alias keeps the numeric position identical (slot 206) so weight
         # bakes stay byte-identical; only the dep graph view changes.
+        # Phase 8.A follow-up: ADDR_B0_LO_PREV_STEP is the matching alias
+        # for the LO-nibble band. L9 lev_addr_relay/lev_bp_to_pc_relay,
+        # L13 mem_addr_gather, and L15 store_stack0_sp_byte0_addr all
+        # write ADDR_B0_LO after L8 in the same step; the read at L8.45
+        # targets the previous-step residual value (KV cache), so the
+        # PREV_STEP alias retires the back-edges into L8 without changing
+        # the baked weight position (slot is shared with ADDR_B0_LO).
         reads={"MARK_AX", "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR",
@@ -2425,7 +2432,7 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
                "OP_PSH", "OP_JSR", "OP_ENT", "OP_LEV", "OP_JMP", "OP_ADJ",
                "OP_BZ", "OP_BNZ", "OP_EXIT", "MEM_STORE", "MEM_VAL_B2", "L2H0",
                "H1", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
-               "MARK_STACK0", "ADDR_B0_LO", "ADDR_B0_HI_PREV_STEP", "ADDR_B1_LO",
+               "MARK_STACK0", "ADDR_B0_LO_PREV_STEP", "ADDR_B0_HI_PREV_STEP", "ADDR_B1_LO",
                "ADDR_B1_HI", "ADDR_B2_LO", "ADDR_B2_HI",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
         writes={"ALU_LO", "ALU_HI", "AX_FULL_LO", "AX_FULL_HI"},
