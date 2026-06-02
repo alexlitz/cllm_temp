@@ -2907,7 +2907,6 @@ def make_layer6_relay_heads_op() -> Operation:
 
     return Operation(
         name="layer6_relay_heads",
-        phase=6.1,
         # Head 7 LEV AX_CARRY refresh (pairs with L16's 3650e01) additionally
         # reads STACK0_BYTE0 / CLEAN_EMBED_LO / CLEAN_EMBED_HI / OP_LEV at the
         # K side and writes AX_CARRY_LO / AX_CARRY_HI at the MARK_AX query
