@@ -9,6 +9,7 @@ families that have them) are synthesized.
 """
 
 from .mixtral_adapter import (  # noqa: F401
+    MIXTRAL_8X7B_SHAPE,
     MixtralShapeMismatchError,
     export_to_mixtral_state_dict,
     infer_mixtral_config_kwargs,

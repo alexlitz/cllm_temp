@@ -42,7 +42,7 @@ Dropped from the VM side:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -55,6 +55,19 @@ DEFAULT_MIXTRAL_VM_SHAPE: Dict[str, int] = {
     "n_layers": 18,
     "num_heads": 8,
     "head_dim": 92,
+}
+
+
+# Canonical Mixtral-8x7B geometry. Used as the default ``target_shape``
+# when callers pass ``pad_to_mixtral=True`` without their own envelope.
+MIXTRAL_8X7B_SHAPE: Dict[str, int] = {
+    "d_model": 4096,
+    "n_layers": 32,
+    "num_heads": 32,
+    "num_kv_heads": 8,  # GQA
+    "head_dim": 128,
+    "ffn_hidden": 14336,
+    "vocab_size": 32000,
 }
 
 
@@ -208,11 +221,25 @@ def _get_param(module: Any, name: str) -> Optional[torch.Tensor]:
     return None
 
 
+def _pad_2d(
+    w: torch.Tensor, target_shape: Tuple[int, int], *, dtype=None
+) -> torch.Tensor:
+    """Place ``w`` in the top-left corner of a zero-filled target tensor."""
+    out_dtype = dtype if dtype is not None else w.dtype
+    out = torch.zeros(target_shape, dtype=out_dtype, device=w.device)
+    r = min(int(w.shape[0]), int(target_shape[0]))
+    c = min(int(w.shape[1]), int(target_shape[1]))
+    out[:r, :c] = w[:r, :c].to(out_dtype)
+    return out
+
+
 def export_to_mixtral_state_dict(
     model: Any,
     *,
     num_local_experts: int = 8,
     num_experts_per_tok: int = 2,
+    pad_to_mixtral: bool = False,
+    target_shape: Optional[Dict[str, int]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Translate a compiled VM model into a Mixtral state_dict.
 
@@ -228,11 +255,32 @@ def export_to_mixtral_state_dict(
         num_experts_per_tok: Top-k router config the target Mixtral uses.
             Not used by the state-dict map directly but kept here so callers
             can pass the same value when building the config.
+        pad_to_mixtral: When True, route through the pad/zero-fill path
+            (``_export_padded_state_dict``) which tolerates per-layer FFN
+            width variation, vocab mismatch, n_heads/head_dim/d_model
+            mismatch, and synthesizes extra layers / extra KV heads when
+            the target is larger than the VM. Most weights in the output
+            are zero, but the resulting state_dict loads cleanly into
+            ``MixtralForCausalLM`` and runs a forward pass. This is wiring
+            correctness, not numerical equivalence.
+        target_shape: Required when ``pad_to_mixtral=True``. A dict with
+            keys ``d_model``, ``n_layers``, ``num_heads``, ``num_kv_heads``
+            (optional, defaults to ``num_heads``), ``head_dim``,
+            ``ffn_hidden``, ``vocab_size``. Defaults to
+            ``MIXTRAL_8X7B_SHAPE`` when None.
 
     Raises:
-        MixtralShapeMismatchError: When the VM isn't Mixtral-shaped (e.g.
-            per-layer FFN widths differ, or num_heads * head_dim != d_model).
+        MixtralShapeMismatchError: When ``pad_to_mixtral=False`` and the VM
+            isn't Mixtral-shaped (e.g. per-layer FFN widths differ, or
+            num_heads * head_dim != d_model).
     """
+
+    if pad_to_mixtral:
+        return _export_padded_state_dict(
+            model,
+            target=target_shape if target_shape is not None else MIXTRAL_8X7B_SHAPE,
+            num_local_experts=num_local_experts,
+        )
 
     del num_experts_per_tok  # consumed by config, not state_dict
     shape = _read_vm_shape(model)
@@ -323,6 +371,147 @@ def export_to_mixtral_state_dict(
             "VM model has no head.weight to map to lm_head.weight."
         )
     sd["lm_head.weight"] = head_weight.detach().clone()
+
+    return sd
+
+
+def _export_padded_state_dict(
+    model: Any,
+    *,
+    target: Dict[str, int],
+    num_local_experts: int = 8,
+) -> Dict[str, torch.Tensor]:
+    """Pad-fill export: VM weights → Mixtral-shape state_dict (top-left corner).
+
+    Per-layer FFN width variation is tolerated (each layer padded
+    independently to ``target['ffn_hidden']``). When the VM has fewer
+    layers than the target, extra layers are synthesized with zero
+    attention + zero FFN + ones-norm (identity via residual). When the
+    VM has more layers, layers beyond the target count are dropped. GQA
+    targets (``num_kv_heads`` < ``num_heads``) are supported by sizing
+    K/V projections to ``num_kv_heads * head_dim`` rather than
+    ``num_heads * head_dim``.
+
+    The resulting state_dict loads cleanly into ``MixtralForCausalLM``
+    and runs a forward pass; most weights are zero, so logits won't be
+    informative — this is wiring correctness, not numerical equivalence.
+    """
+    t_vocab = int(target["vocab_size"])
+    t_dmodel = int(target["d_model"])
+    t_nlayers = int(target["n_layers"])
+    t_nheads = int(target["num_heads"])
+    t_nkv = int(target.get("num_kv_heads", t_nheads))
+    t_head_dim = int(target["head_dim"])
+    t_ffn = int(target["ffn_hidden"])
+    t_q_dim = t_nheads * t_head_dim
+    t_kv_dim = t_nkv * t_head_dim
+
+    sd: Dict[str, torch.Tensor] = {}
+
+    inner_embed = getattr(getattr(model, "embed", None), "embed", None)
+    embed_weight = _get_param(inner_embed, "weight")
+    if embed_weight is None:
+        raise MixtralShapeMismatchError(
+            "VM model has no embed.embed.weight to map to model.embed_tokens.weight."
+        )
+    dtype = embed_weight.dtype
+
+    sd["model.embed_tokens.weight"] = _pad_2d(
+        embed_weight.detach(), (t_vocab, t_dmodel), dtype=dtype
+    )
+
+    blocks = list(model.blocks)
+    n_vm_layers = len(blocks)
+
+    for i in range(t_nlayers):
+        prefix = f"model.layers.{i}"
+        if i < n_vm_layers:
+            block = blocks[i]
+            attn = block.attn
+            ffn = block.ffn
+
+            w_q = _get_param(attn, "W_q")
+            w_k = _get_param(attn, "W_k")
+            w_v = _get_param(attn, "W_v")
+            w_o = _get_param(attn, "W_o")
+            sd[f"{prefix}.self_attn.q_proj.weight"] = (
+                _pad_2d(w_q.detach(), (t_q_dim, t_dmodel), dtype=dtype)
+                if w_q is not None
+                else torch.zeros((t_q_dim, t_dmodel), dtype=dtype)
+            )
+            sd[f"{prefix}.self_attn.k_proj.weight"] = (
+                _pad_2d(w_k.detach(), (t_kv_dim, t_dmodel), dtype=dtype)
+                if w_k is not None
+                else torch.zeros((t_kv_dim, t_dmodel), dtype=dtype)
+            )
+            sd[f"{prefix}.self_attn.v_proj.weight"] = (
+                _pad_2d(w_v.detach(), (t_kv_dim, t_dmodel), dtype=dtype)
+                if w_v is not None
+                else torch.zeros((t_kv_dim, t_dmodel), dtype=dtype)
+            )
+            sd[f"{prefix}.self_attn.o_proj.weight"] = (
+                _pad_2d(w_o.detach(), (t_dmodel, t_q_dim), dtype=dtype)
+                if w_o is not None
+                else torch.zeros((t_dmodel, t_q_dim), dtype=dtype)
+            )
+
+            w_gate = _get_param(ffn, "W_gate")
+            w_up = _get_param(ffn, "W_up")
+            w_down = _get_param(ffn, "W_down")
+            # Some VM blocks (ALU post_op blocks etc.) use non-SwiGLU FFN
+            # variants that don't expose W_gate/W_up/W_down. Fall back to
+            # zero-init for those — they'll be no-op blocks in the Mixtral
+            # target, which is fine for wiring correctness.
+            if w_gate is not None and w_up is not None and w_down is not None:
+                padded_w1 = _pad_2d(w_gate.detach(), (t_ffn, t_dmodel), dtype=dtype)
+                padded_w3 = _pad_2d(w_up.detach(), (t_ffn, t_dmodel), dtype=dtype)
+                padded_w2 = _pad_2d(w_down.detach(), (t_dmodel, t_ffn), dtype=dtype)
+            else:
+                padded_w1 = torch.zeros((t_ffn, t_dmodel), dtype=dtype)
+                padded_w3 = torch.zeros((t_ffn, t_dmodel), dtype=dtype)
+                padded_w2 = torch.zeros((t_dmodel, t_ffn), dtype=dtype)
+        else:
+            sd[f"{prefix}.self_attn.q_proj.weight"] = torch.zeros(
+                (t_q_dim, t_dmodel), dtype=dtype
+            )
+            sd[f"{prefix}.self_attn.k_proj.weight"] = torch.zeros(
+                (t_kv_dim, t_dmodel), dtype=dtype
+            )
+            sd[f"{prefix}.self_attn.v_proj.weight"] = torch.zeros(
+                (t_kv_dim, t_dmodel), dtype=dtype
+            )
+            sd[f"{prefix}.self_attn.o_proj.weight"] = torch.zeros(
+                (t_dmodel, t_q_dim), dtype=dtype
+            )
+            padded_w1 = torch.zeros((t_ffn, t_dmodel), dtype=dtype)
+            padded_w3 = torch.zeros((t_ffn, t_dmodel), dtype=dtype)
+            padded_w2 = torch.zeros((t_dmodel, t_ffn), dtype=dtype)
+
+        # Layer norms: ones keep unused lanes at identity scale.
+        sd[f"{prefix}.input_layernorm.weight"] = torch.ones(t_dmodel, dtype=dtype)
+        sd[f"{prefix}.post_attention_layernorm.weight"] = torch.ones(
+            t_dmodel, dtype=dtype
+        )
+
+        for e in range(num_local_experts):
+            sd[f"{prefix}.block_sparse_moe.experts.{e}.w1.weight"] = padded_w1.clone()
+            sd[f"{prefix}.block_sparse_moe.experts.{e}.w3.weight"] = padded_w3.clone()
+            sd[f"{prefix}.block_sparse_moe.experts.{e}.w2.weight"] = padded_w2.clone()
+
+        sd[f"{prefix}.block_sparse_moe.gate.weight"] = torch.zeros(
+            num_local_experts, t_dmodel, dtype=dtype
+        )
+
+    sd["model.norm.weight"] = torch.ones(t_dmodel, dtype=dtype)
+
+    head_weight = _get_param(getattr(model, "head", None), "weight")
+    if head_weight is None:
+        raise MixtralShapeMismatchError(
+            "VM model has no head.weight to map to lm_head.weight."
+        )
+    sd["lm_head.weight"] = _pad_2d(
+        head_weight.detach(), (t_vocab, t_dmodel), dtype=dtype
+    )
 
     return sd
 
