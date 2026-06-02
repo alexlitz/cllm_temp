@@ -8,17 +8,18 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
-# === L8 attention head layout (pinned head_idx values) ==============
+# === L8 attention head layout (auto-fit; legacy head_idx as docs) ====
 #
 # L8 hosts five attention-bake op families competing for an 8-head budget.
 # Pre-migration each ``DeclarativeAttentionHeadSpec`` / hand-rolled
 # weight-write block carried a literal ``head_idx=N``, making it fragile
 # to add a new head (the author had to remember which slots were already
-# taken). With :class:`AttentionHeadAllocator` the layout is structural:
-# every existing head_idx is declared here at its current slot so the
-# bakes stay byte-identical, and a future L8 attn op can claim a free
-# slot via ``allocator.alloc(name, layer_idx=8)`` (no pin) without
-# touching the existing weight writes.
+# taken). The layout is now structural: every load-bearing ``head_idx``
+# is resolved via :data:`_L8_HEAD_LAYOUT_BY_NAME` inside the spec
+# functions / inline blocks below, so the bakes stay byte-identical
+# regardless of how the allocator orders its inventory. A future L8 attn
+# op can claim a free slot via ``allocator.alloc(name, layer_idx=8)``
+# without touching the existing weight writes.
 #
 # Heads 6 and 7 are intentionally listed twice — once as
 # ``layer8_sp_gather_bake`` mirror heads (the production owners; both
@@ -28,12 +29,20 @@ from .shared import _as_setdim_proxy
 # owner is flipped to ``enable=True``; in that configuration the
 # sp_gather mirror writes are an acknowledged collision (see the head
 # spec docstring in :func:`_layer8_sp_gather_head_specs`). Each bake
-# instantiates its OWN allocator pinning only the heads it actually
-# writes, so the collision is not raised by the allocator at registration
+# instantiates its OWN allocator over only the heads it actually writes,
+# so the collision is not raised by the allocator at registration
 # time — but the table below documents the full picture so a future
 # reconciliation has a single source of truth.
+#
+# Phase 7.B.3: ``pin=`` is dropped from ``_allocate_layer8_attn_heads``.
+# Each per-bake allocator is constructed from a subset of op names; the
+# subset is contiguous in declaration order so first-fit reproduces the
+# legacy ``head_idx`` values bit-for-bit for the production subsets
+# tested by ``tests/test_l8_per_op.py``. The ``legacy_head_idx`` column
+# is documentation only -- weight writes still flow through
+# :data:`_L8_HEAD_LAYOUT_BY_NAME`.
 _L8_HEAD_LAYOUT = (
-    # (op-name key,                                       pinned head_idx)
+    # (op-name key,                                       legacy_head_idx (docs only))
     ("layer8_sp_gather_bake.head_0",                      0),  # SP gather j=0
     ("layer8_sp_gather_bake.head_1",                      1),  # SP gather j=1
     ("layer8_sp_gather_bake.head_2",                      2),  # SP gather j=2
@@ -49,35 +58,37 @@ _L8_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L8_HEAD_LAYOUT}
 
 
 def _allocate_layer8_attn_heads(op_names: tuple[str, ...]) -> AttentionHeadAllocator:
-    """Build a per-bake :class:`AttentionHeadAllocator` pinning ``op_names``.
+    """Build a per-bake :class:`AttentionHeadAllocator` for ``op_names``.
 
     Each L8 attn bake calls this with the subset of
     :data:`_L8_HEAD_LAYOUT` entries it owns and stashes the result on
-    ``block.attn._l8_head_allocator`` for downstream inspection. The
-    helper resolves each name through :data:`_L8_HEAD_LAYOUT_BY_NAME`
-    and pins it at exactly the existing slot so the underlying weight
-    writes -- still hand-coded in the spec functions / inline blocks --
-    land byte-identically.
+    ``block.attn._l8_head_allocator`` for downstream inspection.
 
-    Subsetting (rather than pinning the full table on every call) sidesteps
-    the head 6/7 dual ownership documented in :data:`_L8_HEAD_LAYOUT`: the
-    sp_gather mirrors and the alt owners never share a single allocator
-    instance, so the collision check fires only on intra-op duplicates
-    (which is what we want).
+    Phase 7.B.3: ``pin=`` is dropped; the allocator first-fits each
+    name in ``op_names`` order over the unclaimed slots in
+    ``[0, layer_max_heads)``. The weight-write head indices are still
+    looked up via :data:`_L8_HEAD_LAYOUT_BY_NAME` in the spec functions
+    / inline blocks below, so byte-identity with the legacy bake is
+    preserved regardless of allocator order. The allocator inventory
+    is bookkeeping for layout audits (``block.attn._l8_head_allocator``).
+
+    Subsetting (rather than including the full table on every call)
+    sidesteps the head 6/7 dual ownership documented in
+    :data:`_L8_HEAD_LAYOUT`: the sp_gather mirrors and the alt owners
+    never share a single allocator instance, so duplicate-name errors
+    fire only on intra-op duplicates (which is what we want).
     """
     allocator = AttentionHeadAllocator()
     for name in op_names:
-        try:
-            head_idx = _L8_HEAD_LAYOUT_BY_NAME[name]
-        except KeyError as exc:
+        if name not in _L8_HEAD_LAYOUT_BY_NAME:
             raise KeyError(
                 f"_allocate_layer8_attn_heads: unknown L8 attn op {name!r}"
-            ) from exc
-        allocator.alloc(name, layer_idx=8, pin=head_idx)
+            )
+        allocator.alloc(name, layer_idx=8)
     return allocator
 
 
-# === L8 FFN unit layout (pinned offsets) ============================
+# === L8 FFN unit layout (auto-fit; legacy offsets retained as docs) ===
 #
 # The L8 FFN hosts four op families that historically picked their
 # hidden-unit ranges by hand. ``layer8_alu`` runs the monolithic
@@ -93,20 +104,27 @@ def _allocate_layer8_attn_heads(op_names: tuple[str, ...]) -> AttentionHeadAlloc
 # overwriting a slice of the ALU's SUB lo nibble cluster -- a deliberate
 # legacy choice carried forward via ``allow_overlap=True``.
 #
-# Migration to :class:`FFNUnitAllocator` keeps every bake byte-identical
-# by pinning each sub-stage at the offset its helper already writes to.
-# The ALU sub-stage rows mirror the cursor walk inside
-# ``vm_step._set_layer8_alu`` exactly; the carry/borrow widths are the
-# number of ``(a, b)`` pairs that satisfy the helper's branch condition
-# (e.g. ``a + b >= 16`` gives 120). Changing any helper's unit count
-# requires updating this table in lock-step.
+# Phase 7.B.3: ``pin=`` is dropped from every contiguous entry below.
+# The layout is fully contiguous (every sub-stage starts exactly where
+# the previous one ended) so :class:`FFNUnitAllocator` first-fit
+# reproduces the legacy offsets bit-for-bit. The ALU sub-stage rows
+# mirror the cursor walk inside ``vm_step._set_layer8_alu`` exactly; the
+# carry/borrow widths are the number of ``(a, b)`` pairs that satisfy
+# the helper's branch condition (e.g. ``a + b >= 16`` gives 120). Changing
+# any helper's unit count requires updating this table in lock-step.
+# The ``legacy_start`` column is documentation only -- the load-bearing
+# pin is the cursor walk in the helpers themselves. ``_l8_ffn_range_start``
+# resolves any downstream-needed start via the allocator's first-fit
+# result (which equals the legacy offset for this contiguous layout).
 #
-# Adding a new L8 FFN op family later goes through
-# ``allocator.alloc(name, n)`` without a pin and the allocator picks the
-# first free gap (today the only gap is past unit 2056).
+# Retained pin: ``format_position_counter`` keeps its explicit
+# ``pin=600, allow_overlap=True`` because it is a SEMANTIC alias (it
+# intentionally overwrites a slice of ``layer8_alu.sub_lo``); first-fit
+# would land it past the rest of the layout instead of on the trained
+# overlay slot.
 _L8_FFN_UNIT_LAYOUT = (
     # ---- layer8_alu sub-stages (cursor walk in _set_layer8_alu) ----
-    # (sub-stage name, pinned start, n_units)
+    # (sub-stage name, legacy_start (docs only), n_units)
     ("layer8_alu.add_lo",                0, 256),  # ADD lo nibble
     ("layer8_alu.lea_lo",              256, 256),  # LEA lo nibble (FETCH_LO)
     ("layer8_alu.sub_lo",              512, 256),  # SUB lo nibble
@@ -134,7 +152,10 @@ _L8_FFN_UNIT_LAYOUT = (
 # a slice of layer8_alu.sub_lo (units 600..615). Tracked as a separate
 # entry because allocator pins must be declared with allow_overlap=True
 # and aliases should not consume free units. Only registered when the
-# conversational-io flag is set on bake.
+# conversational-io flag is set on bake. RETAINED PIN: this entry keeps
+# ``pin=600, allow_overlap=True`` after Phase 7.B.3 because the overlay
+# is semantically load-bearing (the position-counter rules overwrite a
+# trained ADD-carry slice); first-fit would land elsewhere.
 _L8_FFN_FORMAT_POS_COUNTER_PIN = 600
 _L8_FFN_FORMAT_POS_COUNTER_UNITS = 16
 
@@ -144,24 +165,31 @@ def _allocate_layer8_ffn_units(
 ) -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` for the L8 FFN.
 
-    Every FFN op family is pinned at its existing offset so the helpers
-    in ``vm_step._set_layer8_alu`` /
-    ``vm_step._set_layer8_multibyte_routing`` -- which write via their
-    own monotonic ``unit`` counters -- land on exactly the same hidden
-    units they always have. The allocator is bookkeeping rather than
-    persistent state: each bake instantiates a fresh one and stashes it
-    on ``block.ffn._l8_unit_allocator`` so downstream tooling can
-    inspect the layout.
+    Phase 7.B.3: ``pin=`` is dropped from every contiguous entry in
+    :data:`_L8_FFN_UNIT_LAYOUT`. First-fit over the contiguous layout
+    reproduces the legacy offsets bit-for-bit, so downstream callers
+    that read ``_l8_ffn_range_start(allocator, name)`` (e.g.
+    ``layer8_multibyte_routing`` and ``layer8_sp_gathered_sentinel``)
+    observe the same starts as before. The actual weight writes still
+    flow through ``vm_step._set_layer8_alu`` /
+    ``vm_step._set_layer8_multibyte_routing`` -- whose monotonic
+    ``unit`` counters land on exactly the same hidden units they always
+    have. The allocator is bookkeeping rather than persistent state:
+    each bake instantiates a fresh one and stashes it on
+    ``block.ffn._l8_unit_allocator`` so downstream tooling can inspect
+    the layout.
 
     ``include_format_position_counter`` adds the convo-io alias range
-    at unit 600 with ``allow_overlap=True``. Pass it only on bakes
-    where the conversational-io flag is set; otherwise the legacy
-    sub_lo cluster is left untouched.
+    at unit 600 with ``allow_overlap=True``. The alias retains its
+    explicit pin because the overlay is semantically load-bearing
+    (see comment on :data:`_L8_FFN_FORMAT_POS_COUNTER_PIN`). Pass the
+    flag only on bakes where the conversational-io flag is set;
+    otherwise the legacy sub_lo cluster is left untouched.
     """
 
     allocator = FFNUnitAllocator()
-    for name, start, n_units in _L8_FFN_UNIT_LAYOUT:
-        allocator.alloc(name, n_units, pin=start)
+    for name, _legacy_start, n_units in _L8_FFN_UNIT_LAYOUT:
+        allocator.alloc(name, n_units)
     if include_format_position_counter:
         allocator.alloc(
             "format_position_counter",
