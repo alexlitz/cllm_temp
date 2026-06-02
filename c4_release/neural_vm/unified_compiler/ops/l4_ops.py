@@ -205,7 +205,6 @@ def make_layer4_pc_relay_op() -> Operation:
 
     return Operation(
         name="layer4_pc_relay",
-        phase=4,
         # Phase 8.A targeted (SCC audit step 7): the ADDR_KEY read here is
         # the PREV-step value carried on the PC marker residual (set by
         # the previous step's ``layer14_clear_addr_key_pollution`` /
@@ -485,7 +484,6 @@ def make_layer4_ffn_dep_anchor_op() -> Operation:
         # phase). The actual ``layer4_ffn`` block op runs at phase=4
         # and pins layer_idx=4 separately, so the anchor's phase is
         # purely a placement key for the dep-graph slot table.
-        phase=3,
         # Drop ``EMBED_LO`` / ``EMBED_HI`` (which ``_layer3_ffn_dep_anchor``
         # writes at L4) so the new anchor's earliest landable layer is not
         # pushed past L4 by the L3 anchor's writes. ``requires["same_layer_as"]``
@@ -885,7 +883,6 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
 
     return Operation(
         name="layer4_sp_to_addr_key",
-        phase=4.5,  # after layer4_pc_relay (phase=4) so its writes don't clobber
         reads={"MARK_AX", "BYTE_INDEX_0", "BYTE_INDEX_1", "H1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
         writes={"ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},  # = ADDR_KEY band
