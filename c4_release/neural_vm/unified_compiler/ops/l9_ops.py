@@ -40,43 +40,50 @@ from .shared import _as_setdim_proxy
 # forbids head aliasing, so the convo-I/O head stays outside this
 # layout until a follow-up reconciles the two ops onto distinct slots.
 _L9_HEAD_LAYOUT = (
-    # (op-name key,                          pinned head_idx)
-    ("layer9_lev_addr_relay",                0),
-    ("layer9_lev_bp_to_pc_relay",            1),
-    ("layer9_alibi_mem_attn",                2),
+    # (op-name key,)  -- no pinned head_idx; allocator first-fits in
+    # declaration order, landing at 0 / 1 / 2 byte-identically
+    # (Phase 8.B retry attn pin drop).
+    ("layer9_lev_addr_relay",),
+    ("layer9_lev_bp_to_pc_relay",),
+    ("layer9_alibi_mem_attn",),
 )
 
 
 def _allocate_layer9_attention_heads() -> AttentionHeadAllocator:
-    """Build a per-bake :class:`AttentionHeadAllocator` with all L9 heads.
+    """Build a per-bake :class:`AttentionHeadAllocator` for L9 heads.
 
-    Every entry in :data:`_L9_HEAD_LAYOUT` is pinned at its existing
-    ``head_idx`` so the underlying primitive calls -- which still write
-    the same weights to the same heads -- land byte-identically. Each
-    of the three migrated L9 attention ops calls this so they can look
-    up their own head by name without baking in an integer literal at
-    the call site.
+    Phase 8.B retry auto-fit: the allocator is built in
+    ``dynamic_first_fit`` mode without ``pin=`` hints. Each entry is
+    allocated in declaration order; first-fit picks the lowest free
+    head each call, so the 3 declarations land at indices 0 / 1 / 2 --
+    byte-identical to the legacy pinned offsets. The alibi-slope
+    overrides in each bake key off the allocator-resolved indices, so
+    the LEV/MEM relay slopes follow their semantic heads across any
+    future allocator reshuffle.
     """
-    allocator = AttentionHeadAllocator()
-    for name, head_idx in _L9_HEAD_LAYOUT:
-        allocator.alloc(name, layer_idx=9, pin=head_idx)
+    allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    for (name,) in _L9_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=9)
     return allocator
 
 
 def _l9_head_idx(op_name: str) -> int:
-    """Return the pinned L9 ``head_idx`` for ``op_name``.
+    """Return the L9 ``head_idx`` for ``op_name`` under the current
+    layout / allocator strategy.
 
-    Static lookup against :data:`_L9_HEAD_LAYOUT` for callers that
-    cannot instantiate a per-bake allocator (e.g. the head-spec
-    helpers consumed by both bake and ``compiler_ir_factory`` paths,
-    where running the collision-checked allocator on every call
-    would be wasteful). The runtime bakes still go through
-    :func:`_allocate_layer9_attention_heads` so the collision-checked
-    allocator path is exercised on every weight write.
+    Replays :func:`_allocate_layer9_attention_heads` (cheap; the L9
+    pool has 3 declared heads) and returns the named head's resolved
+    ``head_idx``. The static-lookup contract held before the pin drop,
+    but with ``dynamic_first_fit`` the layout decision is "compute the
+    assignment by replaying the allocator", so the helper now does
+    exactly that. Bakes that need to thread the same allocator
+    through multiple call sites should pass the allocator instance
+    directly rather than re-replaying for every lookup.
     """
-    for name, head_idx in _L9_HEAD_LAYOUT:
-        if name == op_name:
-            return head_idx
+    allocator = _allocate_layer9_attention_heads()
+    for rec in allocator.heads():
+        if rec.op_name == op_name:
+            return rec.head_idx
     raise KeyError(f"_l9_head_idx: unknown L9 attention op {op_name!r}")
 
 
