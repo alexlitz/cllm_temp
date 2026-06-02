@@ -159,7 +159,11 @@ def make_layer12_ffn_dep_anchor_op() -> Operation:
         # include TEMP (written by L11 MUL partial) so the dep graph
         # earliest-fit lands at L12.
         phase=11.5,
-        reads={"MARK_AX", "TEMP", "ALU_HI", "AX_CARRY_LO", "OP_MUL"},
+        # Phase 11.x (SCC sub-cycle D, TEMP): mirror layer12_mul_combine's
+        # TEMP -> TEMP.*.-1 SSA rename. This anchor's TEMP read otherwise
+        # creates the same L14 -> _layer12_ffn_dep_anchor back-edge that
+        # the block op's rename retires.
+        reads={"MARK_AX", "TEMP.*.-1", "ALU_HI", "AX_CARRY_LO", "OP_MUL"},
         writes={"OUTPUT_HI_THIS_STEP"},
         kind="ffn",
         migrated=True,
@@ -257,7 +261,20 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         # silently masked downstream contention analysis. Corrected so the
         # staleness analyzer / claim-collision detector see the true producer/
         # consumer surface of this op.
-        reads={"MARK_AX", "TEMP", "ALU_HI", "AX_CARRY_LO", "OP_MUL"},
+        # Phase 11.x (SCC sub-cycle D, TEMP): TEMP -> TEMP.*.-1 SSA cross-step
+        # rename. The same-step fresh TEMP[partial] from L11 mul_partial is
+        # still encoded via ``consumes_fresh={"TEMP": "AX_byte0"}`` below,
+        # which preserves the L11 -> L12 producer/consumer edge. The plain
+        # ``TEMP`` read here was the structural in-edge from every TEMP writer
+        # including ``layer14_temp_clear`` (phase=14.1), which writes TEMP for
+        # the NEXT step's L12 read -- creating the L14 -> L12 back-edge that
+        # was the last TEMP cycle in SCC #1 (see
+        # ``.agent-logs/scc_remaining_structural_20260602.md`` section 2.4).
+        # SSA alias resolves to the same numeric slot at bake time
+        # (byte-identical), but the scheduler now treats every base-TEMP
+        # writer as a prev-step residual relative to this read. Retires
+        # SCC #1 sub-cycle D.
+        reads={"MARK_AX", "TEMP.*.-1", "ALU_HI", "AX_CARRY_LO", "OP_MUL"},
         writes={"OUTPUT_HI_THIS_STEP"},
         kind="block",
         declarative_bake_fn=bake,
