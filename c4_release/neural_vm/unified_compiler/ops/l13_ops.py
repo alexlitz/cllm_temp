@@ -2,7 +2,7 @@
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -109,6 +109,132 @@ def _allocate_layer13_shifts_units() -> FFNUnitAllocator:
     for name, start, n_units in _L13_SHIFTS_UNIT_LAYOUT:
         allocator.alloc(name, n_units, pin=start)
     return allocator
+
+
+# === L13 SHL/SHR FFN rules (declarative) ============================
+#
+# Each shift sub-stage is a dense 8 x 16 x 16 = 2048-unit lookup table
+# implementing the 8-bit nibble-level result for shift amounts 0..7.
+# Each unit is a 5-way AND in the silu path:
+#
+#   conditions = MARK_AX + ALU_LO[a_lo] + ALU_HI[a_hi]
+#              + AX_CARRY_LO[s] + AX_CARRY_HI[0]
+#   threshold  = 4.5  (so b_up = -S * 4.5)
+#   gate       = OP_SHL or OP_SHR (gate_weight = 1.0, gate_bias = 0.0)
+#   writes     = OUTPUT_LO[result_lo] = 2.0/S, OUTPUT_HI[result_hi] = 2.0/S
+#
+# Walk order matches the imperative ``_set_layer13_shifts`` outer loop:
+# ``for s in range(8): for a_hi in range(16): for a_lo in range(16):``
+# so that with start_unit=0 the SHL substage lands on units 0..2047 and
+# the SHR substage lands on units 2048..4095 -- the same indices the
+# legacy helper writes. Byte-identity is gated by
+# :func:`compare_symbolic_to_lowered_ffn` over the full 4096-rule IR.
+
+
+def _layer13_shifts_substage_rules(
+    op_dim_name: str,
+    shift_fn,
+    *,
+    name_prefix: str,
+    S: float,
+) -> tuple[FFNRule, ...]:
+    """Build the 2048-rule list for one L13 shift sub-stage.
+
+    ``op_dim_name`` is the gating opcode dim name (``"OP_SHL"`` or
+    ``"OP_SHR"``). ``shift_fn(value, s)`` computes the 8-bit shift result
+    for ``(value, shift_amount)``; it must agree with the imperative
+    helper's per-shift table.
+
+    The 2048 rules iterate ``(s, a_hi, a_lo)`` in nested order to match
+    the legacy unit counter in ``setup_helpers._set_layer13_shifts``;
+    appending the SHL list followed by the SHR list lands on the
+    pinned offsets declared in :data:`_L13_SHIFTS_UNIT_LAYOUT`.
+    """
+    write_scale = 2.0 / S
+    rules: list[FFNRule] = []
+    for s in range(8):
+        for a_hi in range(16):
+            for a_lo in range(16):
+                value = (a_hi << 4) | a_lo
+                result = shift_fn(value, s)
+                result_lo = result & 0xF
+                result_hi = (result >> 4) & 0xF
+                rules.append(FFNRule.gated_write(
+                    name=(
+                        f"{name_prefix}_s{s}_ahi{a_hi}_alo{a_lo}"
+                    ),
+                    conditions=(
+                        ("MARK_AX", 1.0),
+                        (f"ALU_LO+{a_lo}", 1.0),
+                        (f"ALU_HI+{a_hi}", 1.0),
+                        (f"AX_CARRY_LO+{s}", 1.0),
+                        ("AX_CARRY_HI+0", 1.0),
+                    ),
+                    threshold=4.5,
+                    gate=op_dim_name,
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=(
+                        (f"OUTPUT_LO+{result_lo}", write_scale),
+                        (f"OUTPUT_HI+{result_hi}", write_scale),
+                    ),
+                    scope=f"MARK_AX and {op_dim_name}",
+                ))
+    return tuple(rules)
+
+
+def _layer13_shl_rules(S: float) -> tuple[FFNRule, ...]:
+    """L13 SHL sub-stage: 2048 lookup-table units (units 0..2047)."""
+    return _layer13_shifts_substage_rules(
+        "OP_SHL",
+        lambda v, s: (v << s) & 0xFF,
+        name_prefix="l13_shl",
+        S=S,
+    )
+
+
+def _layer13_shr_rules(S: float) -> tuple[FFNRule, ...]:
+    """L13 SHR sub-stage: 2048 lookup-table units (units 2048..4095)."""
+    return _layer13_shifts_substage_rules(
+        "OP_SHR",
+        lambda v, s: (v >> s) & 0xFF,
+        name_prefix="l13_shr",
+        S=S,
+    )
+
+
+def _layer13_shifts_rules(S: float) -> tuple[FFNRule, ...]:
+    """Combined SHL + SHR rule list (4096 units total).
+
+    Order matches the imperative ``_set_layer13_shifts`` outer
+    ``[(OP_SHL, ...), (OP_SHR, ...)]`` loop so that lowering with
+    ``start_unit=0`` writes the SHL block at units 0..2047 and the SHR
+    block at units 2048..4095, byte-identical to the legacy helper.
+    """
+    return _layer13_shl_rules(S) + _layer13_shr_rules(S)
+
+
+def _layer13_shifts_ir(S: float = 100.0) -> CompilerIR:
+    """L13 FFN: declarative SHL+SHR lookup tables (4096 rules)."""
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer13_shifts_rules(S))
+    return ir
+
+
+def _bake_layer13_shifts(ffn, S, BD) -> int:
+    """Lower the declarative L13 shifts IR into ``ffn``.
+
+    Returns the next-free unit cursor (4096). Byte-identical to
+    ``setup_helpers._set_layer13_shifts`` (verified via
+    :func:`compare_symbolic_to_lowered_ffn` and per-substage parity
+    tests against the legacy helper).
+    """
+    rules = _layer13_shifts_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(ffn, rules, dim_positions, S=S)
 
 
 def _l13_addr_bn_valid_positions(BD):
