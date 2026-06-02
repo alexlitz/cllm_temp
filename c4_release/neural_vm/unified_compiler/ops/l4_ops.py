@@ -206,7 +206,17 @@ def make_layer4_pc_relay_op() -> Operation:
     return Operation(
         name="layer4_pc_relay",
         phase=4,
-        reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI", "ADDR_KEY", "CONST"},
+        # Phase 8.A targeted (SCC audit step 7): the ADDR_KEY read here is
+        # the PREV-step value carried on the PC marker residual (set by
+        # the previous step's ``layer14_clear_addr_key_pollution`` /
+        # ``layer14_addr_key_neural_decode``). Renamed from ``ADDR_KEY``
+        # to ``ADDR_KEY_PREV_STEP`` so the dim-flow analyser stops drawing
+        # the 3 ``L7/L14 -> L4`` back-edges that previously dragged this
+        # op into the giant SCC. The alias maps to the same numeric dim
+        # position (see ``ops/shared.py:_ALIAS_OF``) so baked weight cells
+        # are byte-identical.
+        reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI",
+               "ADDR_KEY_PREV_STEP", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "ADDR_KEY"},  # at AX marker/bytes
         kind="block",
         declarative_bake_fn=bake,

@@ -1488,6 +1488,12 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
         declarative_authority="spec_generated",
         layer_idx=9,
         migrated=True,
+        # Phase 8.A targeted (SCC audit step 7): pin the ADDR_KEY K-side
+        # reader to ``layer4_pc_relay`` so the dim-flow analyser's R-OH-2
+        # rule suppresses the spurious L7/L14 ADDR_KEY back-edges into
+        # this op. The K-side matches format-string code byte ADDR_KEYs
+        # (stable from embedding); no same-step dep on the L14 writers.
+        requires={"after": "layer4_pc_relay"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
@@ -1698,6 +1704,13 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         layer_idx=9,
         migrated=True,
         claims=_claims,
+        # Phase 8.A targeted (SCC audit step 7): pin the ADDR_KEY reader to
+        # ``layer4_pc_relay`` so R-OH-2 in the dim-flow analyser
+        # suppresses spurious back-edges from later ADDR_KEY writers
+        # (``layer7_memory_heads`` / L14). When ``enable=False`` (the
+        # default) the bake is a no-op, but the dep declaration still
+        # contributes to the scheduler's cycle decomposition.
+        requires={"after": "layer4_pc_relay"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#the-attention-layer",
     )

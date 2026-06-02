@@ -1318,6 +1318,12 @@ def make_layer8_multibyte_fetch_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 8.A targeted (SCC audit step 7): the Q-side reads
+        # ADDR_KEY+32..47 at AX byte positions; those slots are written
+        # same-step by ``layer4_pc_relay`` head 1. Anchoring the dep
+        # explicitly lets R-OH-2 suppress the L14 ADDR_KEY-writer back
+        # edges into this op.
+        requires={"after": "layer4_pc_relay"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
@@ -1382,6 +1388,11 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
         layer_idx=8,
         migrated=True,
         claims=_claims,
+        # Phase 8.A targeted (SCC audit step 7): mirror the
+        # ``layer8_multibyte_fetch`` dep anchor's ``requires["after"]`` so
+        # the same R-OH-2 suppression applies to the real baked op. See
+        # the anchor's comment for the same-step ADDR_KEY rationale.
+        requires={"after": "layer4_pc_relay"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
