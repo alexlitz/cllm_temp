@@ -318,6 +318,71 @@ def _layer10_alu_bitwise_and_rules(S: float) -> tuple[FFNRule, ...]:
     return _layer10_alu_bitwise_rules(S, op_name="AND", op_fn=operator.and_)
 
 
+def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
+    """L10 SHL/SHR shift-out-zero shortcut: 4 units (2 per opcode).
+
+    For shifts >= 8 the result byte is 0x00. Two cases per opcode:
+
+      * Case A (shift >= 16): high nibble of the shift count is non-zero
+        so ``AX_CARRY_HI[0]`` is NOT hot. The unit fires on
+        ``MARK_AX * 60`` after subtracting ``-S * AX_CARRY_HI[0]`` to
+        suppress shifts 0-15; ``b_up = -S * 59`` requires MARK_AX to be
+        present to clear the threshold.
+      * Case B (shift 8-15): high nibble = 0 (so ``AX_CARRY_HI[0] = 1``)
+        and the low nibble is in 8..15. The unit fires when MARK_AX +
+        ``AX_CARRY_HI[0]`` plus any one of ``AX_CARRY_LO[8..15]`` are
+        present (threshold 80 vs 60 + 1 + 1 = 62 forces all three terms).
+
+    Both cases write ``OUTPUT_LO[0]`` and ``OUTPUT_HI[0]`` to 1 so the
+    next position emits a 0x00 byte. The OP_* gate selects which opcode
+    the shortcut fires for.
+    """
+
+    def _case_a(op_name: str) -> FFNRule:
+        return FFNRule.gated_write(
+            name=f"l10_{op_name.lower()}_shift_ge16_zero",
+            conditions=(
+                ("MARK_AX", 60.0),
+                ("AX_CARRY_HI+0", -1.0),
+            ),
+            threshold=59.0,
+            gate=f"OP_{op_name}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                ("OUTPUT_LO+0", 2.0 / S),
+                ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
+            ),
+        )
+
+    def _case_b(op_name: str) -> FFNRule:
+        conditions = [
+            ("MARK_AX", 60.0),
+            ("AX_CARRY_HI+0", 1.0),
+        ]
+        for lo_bit in range(8, 16):
+            conditions.append((f"AX_CARRY_LO+{lo_bit}", 1.0))
+        return FFNRule.gated_write(
+            name=f"l10_{op_name.lower()}_shift_8_15_zero",
+            conditions=tuple(conditions),
+            threshold=80.0,
+            gate=f"OP_{op_name}",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(
+                ("OUTPUT_LO+0", 2.0 / S),
+                ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
+            ),
+        )
+
+    return (
+        _case_a("SHL"),
+        _case_b("SHL"),
+        _case_a("SHR"),
+        _case_b("SHR"),
+    )
+
+
 def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
     """L10 MUL lo-nibble lookup: 256 units gated on OP_MUL.
 
