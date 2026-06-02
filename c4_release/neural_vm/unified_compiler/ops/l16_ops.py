@@ -1637,10 +1637,25 @@ def make_layer16_lev_routing_op() -> Operation:
 
     return Operation(
         name="layer16_lev_routing",
+        # Phase 11 SCC residual (cycle #1, 5-op LEV next-step C-instruction
+        # loop): TEMP / ADDR_B0_LO / ADDR_B0_HI reads renamed to their SSA
+        # `.*.-1` cross-step forms. lev_routing has phase=None, so the
+        # static analyser visualises it at layer 0 and sees back-edges
+        # from:
+        #   - layer11_mul_partial (phase=11)              -> TEMP
+        #   - layer14_temp_clear (phase=14.1)             -> TEMP
+        #   - layer15_store_stack0_sp_byte0_addr (15.2)   -> ADDR_B0_{LO,HI}
+        # These are the genuine cross-step LEV semantics: l16's LEV
+        # routing materialises PC / BP / SP from the previous step's
+        # marker residuals (delivered via the KV cache), not from the
+        # current step's L11/L14/L15 writers (which dynamic scheduling
+        # places AFTER l16). SSA `.*.-1` aliases share the base dim's
+        # numeric slot, so baked weights stay byte-identical while the
+        # analyser drops the back-edges.
         reads={"MARK_SP", "MARK_PC", "MARK_AX", "OP_ENT", "OP_LEV", "OP_IMM",
                "OP_EXIT", "OP_JMP", "OP_SI", "OP_SC", "OP_LC_RELAY",
-               "ADDR_B0_LO", "ADDR_B0_HI", "MEM_ADDR_SRC",
-               "TEMP", "HAS_SE", "IS_BYTE", "PSH_AT_SP", "EMBED_LO",
+               "ADDR_B0_LO.*.-1", "ADDR_B0_HI.*.-1", "MEM_ADDR_SRC",
+               "TEMP.*.-1", "HAS_SE", "IS_BYTE", "PSH_AT_SP", "EMBED_LO",
                "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "FETCH_LO", "FETCH_HI",
                "MARK_BP", "MARK_STACK0", "H1", "H3",
