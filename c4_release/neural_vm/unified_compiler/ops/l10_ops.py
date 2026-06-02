@@ -1967,7 +1967,6 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
 
     return Operation(
         name="layer10_sp_byte_passthrough",
-        phase=10,
         reads={"IS_BYTE", "HAS_SE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -2090,7 +2089,22 @@ def make_layer10_carry_relay_bake_op() -> Operation:
     return Operation(
         name="layer10_carry_relay_bake",
         phase=10.0,
-        reads={"MARK_AX", "IS_BYTE", "H1", "CARRY", "CONST"},
+        # Phase 9.B (SCC #2 dissolution): CARRY -> CARRY.*.-1 marks the
+        # read as SSA cross-step relative to the same-step L10 CARRY
+        # writer ``l10_post_ops_combined`` (phase=10.5). This bake op
+        # runs at phase=10.0, so any CARRY value it reads must originate
+        # from the PREVIOUS step (attention-broadcast residue) — the
+        # later L10 post-op writer cannot influence the current-step
+        # input. ``CARRY.*.-1`` aliases the numeric ``CARRY`` slot via
+        # the SSA rewriter so the lowered weights remain byte-identical;
+        # the same-step writer's edge into this op is suppressed,
+        # breaking the CARRY back-edge ``l10_post_ops_combined ->
+        # layer10_carry_relay_bake``. Direct parallel to the sub-cycle C
+        # fix on ``layer10_carry_relay`` in commit 0fa605e8; paired with
+        # the OUTPUT_LO.*.-1 rename in ``l10_post_ops_combined`` to
+        # break the OUTPUT_LO back-edge from
+        # ``tail_bit32_result_correction``.
+        reads={"MARK_AX", "IS_BYTE", "H1", "CARRY.*.-1", "CONST"},
         writes={"CARRY"},
         kind="block",
         declarative_bake_fn=bake,
