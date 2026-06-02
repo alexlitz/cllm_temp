@@ -6,7 +6,10 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import (  # noqa: F401
+    _as_setdim_proxy,
+    _empty_compiler_ir_factory,
+)
 
 
 # === L2 attention-head layout (pinned indices) ======================
@@ -676,7 +679,8 @@ def make_layer2_lookback_detection_head_op(
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _layer2_lookback_detection_head_ir
-            if enable_conversational_io else None
+            if enable_conversational_io
+            else _empty_compiler_ir_factory
         ),
         declarative_authority="spec_generated",
         migrated=True,
