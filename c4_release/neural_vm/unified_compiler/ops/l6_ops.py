@@ -2526,32 +2526,29 @@ def make_layer6_attn_op() -> Operation:
 
     return Operation(
         name="layer6_attn",
+        # phase=6 matches ``_layer6_attn_dep_anchor`` so the L6 attn
+        # slot allocator co-locates this op via the same-phase share.
+        phase=6,
         # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the L6 read as
         # cross-step relative to the L8 writers (multibyte_fetch{,_bake},
         # head6_ax_carry_refresh). L6 fires before L8 in the same step, so
         # any L8 contribution it sees is the prev-step residual cached in
         # the AX-marker row. The same-step L3 contribution (carry_forward)
         # is still picked up at the same numeric position. Breaks
-        # back-edges L8 → layer6_attn on AX_CARRY_HI.
+        # back-edges L8 -> layer6_attn on AX_CARRY_HI.
         reads={"OP_JMP", "OP_EXIT", "OP_JSR", "MARK_AX", "MARK_PC", "MARK_SP",
                "MARK_STACK0", "NEXT_SE", "FETCH_LO", "FETCH_HI",
                "PSH_AT_SP", "OP_PSH", "OP_ADJ", "OP_ENT", "OP_LEV",
                "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1"},
         writes={"CMP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
-        # Phase 8.G.6 holdout: ``layer_idx=6`` is retained because the
-        # dep graph naturally places this op at L6 only with the literal
-        # pin (no L6 attn dep anchor exists). Adding
-        # ``requires["same_layer_as"]: "_opcode_decode_ffn_dep_anchor"``
-        # (or ``"_layer6_ffn_dep_anchor"``) raises a placement-mismatch
-        # error: the constraint shifts the op's earliest-placeable layer
-        # to L7 (via topology) but then asserts L6, raising
-        # ``ValueError: ... placed at layer 7 but requires layer 6``.
-        # Dropping the literal needs an L6 attn dep anchor or a
-        # topological shift — both out of scope for the literal-drop wave.
-        layer_idx=6,
         migrated=True,
         declarative_authority="topology_anchor",
+        # V4 final structural cleanup: drop ``layer_idx=6`` literal in
+        # favor of co-placement with ``_layer6_attn_dep_anchor`` (a
+        # kind="attn" anchor that the dep graph lands at L6 via
+        # ``requires["after"] = "_layer5_fetch_dep_anchor"`` + phase=6).
+        requires={"same_layer_as": "_layer6_attn_dep_anchor"},
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
         # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
         compiler_ir=CompilerIR(),
@@ -2777,9 +2774,12 @@ def make_layer6_attn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer6_attn_dep_anchor",
-        # phase=None matches the existing L6 attn slot occupant
-        # (``layer8_multibyte_fetch``, phase=None), so the slot
-        # allocator co-locates this anchor at L6.
+        # phase=6 matches the explicit phase assigned to ``layer6_attn``
+        # and ``layer6_relay_heads`` below, so the slot allocator's
+        # phase-share rule co-locates all three at the same L6 attn
+        # slot. None-phase ops do NOT share slots (see _assign_layers
+        # check ``op.phase is not None and existing_phase == op.phase``).
+        phase=6,
         # Mirrored subset of ``layer6_attn`` / ``layer6_relay_heads``
         # reads/writes, with the AX_CARRY_LO/HI reads kept as
         # ``.*.-1`` SSA cross-step aliases (matching the consumers'
@@ -3408,23 +3408,13 @@ def make_layer6_attn_bake_op() -> Operation:
         Primitives.generate_attention_heads(
             attn, _layer6_attn_head_specs(BD), HD
         )
-        # OPCODE_BYTE_HI relay spillover: the legacy bake wrote
-        # ``attn.W_v[5*HD + 51 + k, OPCODE_BYTE_HI + k]`` for k=0..15 via
-        # flat row indexing that crossed the head-5 / head-6 boundary at
-        # HD=64. k=0..12 fit in head 5 (slots 51..63) and are declared on
-        # head 5's spec; k=13, 14, 15 land in head 6 slots 0, 1, 2 (rows
-        # 384, 385, 386) and are preserved here as imperative residual
-        # writes to retain byte-identity without breaking the
-        # AttentionHeadIR's per-head slot bounds. These cells coexist with
-        # head 6's own slot-0/1/2 writes from ``layer6_relay_heads_bake``
-        # since they target different (row, col) cells of W_v/W_o.
-        head5_base = (
-            _L6_HEAD_LAYOUT_BY_NAME["layer6_attn_bake.first_step_fetch_relay"]
-            * HD
-        )
-        for k in range(13, 16):
-            attn.W_v.data[head5_base + 51 + k, BD.OPCODE_BYTE_HI + k] = 1.0
-            attn.W_o.data[BD.OPCODE_BYTE_HI + k, head5_base + 51 + k] = 1.0
+        # Phase 8.I V1 declarative_with_residual collapse: the
+        # OPCODE_BYTE_HI spillover for k=13/14/15 (legacy flat indexing
+        # into head 5 slots 64/65/66 = head 6 slots 0/1/2) used to live
+        # as an imperative residual here. It is now declared on head 6's
+        # spec inside ``_layer6_relay_head_specs`` so this bake_fn is
+        # pure-declarative. Byte-identity preserved: head 6's spec
+        # writes the same 1.0 cells (verified via direct bake comparison).
 
     # Dim-ownership claims. ``_bake_layer6_attn_spec`` writes heads 0, 1, 2,
     # 3, and 5 (head 4 is owned by ``layer6_bz_bnz_relay_bake``, heads 6/7 by
@@ -3486,8 +3476,13 @@ def make_layer6_attn_bake_op() -> Operation:
         _claims.add((6, "attn_W_o", f"5_{slot}", dim))
     for k in range(16):
         _claims.add((6, "attn_W_v", f"5_{35 + k}", f"OPCODE_BYTE_LO+{k}"))
-        _claims.add((6, "attn_W_v", f"5_{51 + k}", f"OPCODE_BYTE_HI+{k}"))
         _claims.add((6, "attn_W_o", f"5_{35 + k}", f"OPCODE_BYTE_LO+{k}"))
+    # OPCODE_BYTE_HI: k=0..12 land in head 5 slots 51..63 (within HD=64).
+    # k=13/14/15 spill onto head 6 slots 0/1/2 (declared on head 6's spec
+    # in ``_layer6_relay_head_specs`` -- Phase 8.I V1 collapse) and are
+    # claimed by ``layer6_relay_heads_bake`` instead.
+    for k in range(13):
+        _claims.add((6, "attn_W_v", f"5_{51 + k}", f"OPCODE_BYTE_HI+{k}"))
         _claims.add((6, "attn_W_o", f"5_{51 + k}", f"OPCODE_BYTE_HI+{k}"))
     # Head-5 Q/K discriminator slots: the branch byte-0 relay (slot 52), the
     # AX-byte fetch blocker (slot 53), the fetch gate (slot 50), the HAS_SE
@@ -3644,6 +3639,17 @@ def make_layer6_relay_heads_bake_op() -> Operation:
     }) | frozenset({
         (6, "attn_W_o", f"6_{8 + k}", f"ALU_LO+{k}")
         for k in range(16)
+    })
+    # Head 6 V + O for OPCODE_BYTE_HI spillover (slots 0, 1, 2 for k=13,
+    # 14, 15). Migrated from ``layer6_attn_bake``'s bake_fn residual into
+    # head 6's declarative spec (Phase 8.I V1 declarative_with_residual
+    # collapse) so head 6 owns the spillover cells declaratively.
+    _claims = _claims | frozenset({
+        (6, "attn_W_v", f"6_{k - 13}", f"OPCODE_BYTE_HI+{k}")
+        for k in range(13, 16)
+    }) | frozenset({
+        (6, "attn_W_o", f"6_{k - 13}", f"OPCODE_BYTE_HI+{k}")
+        for k in range(13, 16)
     })
     # Head 7 Q/K at slot 0 and V/O for AX_CARRY_HI byte-1 relay (slots 33..48).
     _claims = _claims | frozenset({
