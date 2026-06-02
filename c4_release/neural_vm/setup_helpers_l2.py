@@ -10,6 +10,7 @@ import math
 from .constants import PC_OFFSET
 
 
+# DEPRECATED — parity oracle only, no production use (Phase 6 wave 6A).
 def _set_layer2_mem_byte_flags(ffn, S, BD):
     """Layer 2 FFN: MEM val byte position flags + extended BYTE_INDEX for STACK0.
 
