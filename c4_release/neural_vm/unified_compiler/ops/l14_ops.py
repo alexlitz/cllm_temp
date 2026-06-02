@@ -680,9 +680,13 @@ def make_layer14_mem_generation_op() -> Operation:
         # earlier in the schedule — those forward edges still resolve to
         # the same numeric slot 206. The alias is position-identical so
         # weight bakes stay byte-identical; only the dep graph view changes.
+        # Phase 8.A follow-up: ADDR_B0_LO_PREV_STEP matches the HI pattern
+        # for the LO-nibble band. L15 store_stack0_sp_byte0_addr writes
+        # ADDR_B0_LO after L14 in the same step; the PREV_STEP alias
+        # retires the back-edge while keeping the numeric slot identical.
         reads={"MARK_MEM", "MARK_SP", "MARK_STACK0", "OP_PSH", "OP_SI", "OP_SC",
                "OP_JSR", "OP_ENT", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
-               "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO", "ADDR_B0_HI_PREV_STEP",
+               "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO_PREV_STEP", "ADDR_B0_HI_PREV_STEP",
                "MEM_STORE", "MEM_ADDR_SRC", "STACK0_BYTE0", "L1H0", "L1H1", "L1H2",
                "H0", "H1", "L1H4", "H2", "H3", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3", "IS_BYTE"},

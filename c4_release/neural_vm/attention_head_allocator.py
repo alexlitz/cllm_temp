@@ -2,9 +2,10 @@
 Per-layer attention-head allocator for the Autoregressive Neural VM.
 
 Parallel to :mod:`neural_vm.dim_allocator` (slot pool, ``Allocator``) but
-narrower: each transformer layer has a fixed number of attention heads
-(typically 8) and every op that needs a head must claim a ``head_idx`` in
-``[0, layer_max_heads)``. Today those ``head_idx`` values are hand-coded
+narrower: each transformer layer has its own attention-head pool and
+every op that needs a head must claim a ``head_idx`` in
+``[0, layer_max_heads)`` (when bounded) or anywhere in ``[0, inf)``
+(when unbounded). Today those ``head_idx`` values are hand-coded
 in every ``AttentionHeadIR`` construction, which makes adding a new head
 fragile — the author has to remember which slots are already taken in
 that layer.
@@ -15,17 +16,22 @@ that layer.
     migration so the bake stays byte-identical), or
   * ``pin=None`` first-fits the lowest free head in the requested layer.
 
-This module is scaffolding only. Nothing in the production bake is wired
-to it yet — a follow-up wave will migrate ``AttentionHeadIR``
-constructions one op family at a time, pinning each at its current
-``head_idx`` so the trained weights stay valid.
+Phase 8.O.2 (dynamic head count): ``layer_max_heads`` now accepts
+``None`` to mean "unbounded per layer". In unbounded mode the allocator
+grows the per-layer claim set on demand — auto-placed heads pick the
+lowest free index from ``[0, inf)`` rather than aborting when a fixed
+budget fills. The per-layer live head count is then ``max(claimed)+1``
+and is exposed via :meth:`num_heads_at`. Tests / configs can pass a
+compiler-level cap via :meth:`assert_within_cap` (independent of the
+constructor's bound). The legacy default (``DEFAULT_LAYER_MAX_HEADS=8``)
+is retained so unmigrated call sites stay byte-identical.
 
 Design choices (kept parallel to :class:`neural_vm.dim_allocator.Allocator`):
 
-* **Per-layer first-fit.** Each layer has its own ``[0, layer_max_heads)``
-  pool; allocations never cross layers. Pinned heads claim first, then
-  unpinned allocations sweep upward from index 0 and take the lowest
-  free slot.
+* **Per-layer first-fit.** Each layer has its own pool (bounded or
+  unbounded); allocations never cross layers. Pinned heads claim first,
+  then unpinned allocations sweep upward from index 0 and take the
+  lowest free slot.
 * **No overlap, ever.** Unlike slot dims, attention heads cannot be
   aliased — two ops writing the same ``head_idx`` in the same layer
   would clobber each other's logits. Any collision (pinned or auto) is
@@ -55,9 +61,14 @@ from typing import Dict, List, Literal, Optional, Tuple
 AllocStrategy = Literal["pinned", "dynamic_first_fit"]
 
 
-# Default heads-per-layer — matches the production bake's attention
-# config (8 heads per transformer layer). Wider configs can pass
-# ``layer_max_heads=`` to the constructor.
+# Legacy default heads-per-layer — matches the production bake's
+# attention config (8 heads per transformer layer) at the time this
+# allocator was introduced. Retained as the default constructor cap so
+# unmigrated call sites (and the existing test corpus) stay byte-
+# identical. Phase 8.O.2 introduces the unbounded mode
+# (``layer_max_heads=None``) for the fully-dynamic vision; pass it
+# explicitly when the per-layer head count should emerge from the
+# allocator instead of being capped up front.
 DEFAULT_LAYER_MAX_HEADS = 8
 
 
@@ -93,9 +104,15 @@ class AttentionHeadAllocator:
     Parameters
     ----------
     layer_max_heads:
-        Number of attention heads available per transformer layer.
-        Defaults to :data:`DEFAULT_LAYER_MAX_HEADS` (8), matching the
-        production bake's attention config.
+        Per-layer head budget. ``int > 0`` caps the layer at that many
+        heads (legacy mode — auto-placement aborts when the cap is hit).
+        ``None`` (Phase 8.O.2) means *unbounded*: the per-layer pool
+        grows on demand and the live head count is reported by
+        :meth:`num_heads_at`. Defaults to :data:`DEFAULT_LAYER_MAX_HEADS`
+        (8) so unmigrated call sites stay byte-identical; pass
+        ``layer_max_heads=None`` explicitly to opt into the dynamic
+        per-layer head count. The optional compiler-level cap is enforced
+        separately via :meth:`assert_within_cap`.
     strategy:
         Allocation strategy. ``"pinned"`` (default) treats ``pin=`` as
         a hard placement claim — collisions raise. ``"dynamic_first_fit"``
@@ -113,21 +130,27 @@ class AttentionHeadAllocator:
 
     def __init__(
         self,
-        layer_max_heads: int = DEFAULT_LAYER_MAX_HEADS,
+        layer_max_heads: Optional[int] = DEFAULT_LAYER_MAX_HEADS,
         *,
         strategy: AllocStrategy = "pinned",
     ):
-        if not isinstance(layer_max_heads, int) or layer_max_heads <= 0:
-            raise AttentionHeadAllocatorError(
-                f"layer_max_heads must be a positive int "
-                f"(got {layer_max_heads!r})"
-            )
+        if layer_max_heads is not None:
+            if not isinstance(layer_max_heads, int) or layer_max_heads <= 0:
+                raise AttentionHeadAllocatorError(
+                    f"layer_max_heads must be a positive int or None "
+                    f"(got {layer_max_heads!r})"
+                )
         if strategy not in ("pinned", "dynamic_first_fit"):
             raise AttentionHeadAllocatorError(
                 f"strategy must be 'pinned' or 'dynamic_first_fit' "
                 f"(got {strategy!r})"
             )
-        self.layer_max_heads: int = int(layer_max_heads)
+        # ``layer_max_heads = None`` => unbounded (Phase 8.O.2 dynamic
+        # head count). Bounded mode keeps the legacy
+        # ``[0, layer_max_heads)`` pool.
+        self.layer_max_heads: Optional[int] = (
+            int(layer_max_heads) if layer_max_heads is not None else None
+        )
         self._strategy: AllocStrategy = strategy
         # Insertion-ordered list; used as the source of truth when
         # replaying allocations during a bake.
@@ -196,7 +219,8 @@ class AttentionHeadAllocator:
                     f"alloc({op_name!r}): pin must be a non-negative int "
                     f"(got {pin!r})"
                 )
-            if pin >= self.layer_max_heads:
+            # Unbounded mode (Phase 8.O.2): no upper-bound check on pin.
+            if self.layer_max_heads is not None and pin >= self.layer_max_heads:
                 raise AttentionHeadAllocatorError(
                     f"alloc({op_name!r}): pinned head_idx={pin} "
                     f"exceeds layer_max_heads={self.layer_max_heads}"
@@ -258,6 +282,12 @@ class AttentionHeadAllocator:
     def free_heads(self, layer_idx: int) -> List[int]:
         """Return the sorted list of unclaimed head indices in
         ``layer_idx``. Cheap inspection helper for migration tooling.
+
+        In unbounded mode (``layer_max_heads is None``) "free" is
+        intrinsically infinite; this method then reports the unclaimed
+        indices in ``[0, num_heads_at(layer_idx))`` — the gaps *below*
+        the current high-water mark — which is the actionable subset
+        for the migration tooling.
         """
         if not isinstance(layer_idx, int) or layer_idx < 0:
             raise AttentionHeadAllocatorError(
@@ -265,7 +295,51 @@ class AttentionHeadAllocator:
                 f"(got {layer_idx!r})"
             )
         claimed = self._claimed.get(layer_idx, set())
+        if self.layer_max_heads is None:
+            high = max(claimed) + 1 if claimed else 0
+            return [h for h in range(high) if h not in claimed]
         return [h for h in range(self.layer_max_heads) if h not in claimed]
+
+    def num_heads_at(self, layer_idx: int) -> int:
+        """Return the live attention-head count at ``layer_idx``.
+
+        Defined as ``max(claimed)+1`` so a partially-populated layer
+        reports the full Q-row footprint downstream code needs to
+        allocate. Returns ``0`` for layers with no claims yet. Used by
+        the compiler to derive the per-layer ``num_heads`` of the lowered
+        ``PureAttention`` block when ``layer_max_heads`` is unbounded.
+        """
+        if not isinstance(layer_idx, int) or layer_idx < 0:
+            raise AttentionHeadAllocatorError(
+                f"num_heads_at(): layer_idx must be a non-negative int "
+                f"(got {layer_idx!r})"
+            )
+        claimed = self._claimed.get(layer_idx)
+        if not claimed:
+            return 0
+        return max(claimed) + 1
+
+    def assert_within_cap(self, layer_idx: int, cap: int) -> None:
+        """Assert the live head count at ``layer_idx`` is at most ``cap``.
+
+        Compiler-level cap-check (Phase 8.O.2): tests / configs can pass
+        ``max_heads_per_layer=cap`` to fail compilation if a per-layer
+        allocator grows beyond the budget. Independent of the
+        constructor's ``layer_max_heads`` — that one configures how the
+        allocator itself behaves, while ``assert_within_cap`` is the
+        external compiler-level invariant.
+        """
+        if not isinstance(cap, int) or cap <= 0:
+            raise AttentionHeadAllocatorError(
+                f"assert_within_cap(): cap must be a positive int "
+                f"(got {cap!r})"
+            )
+        live = self.num_heads_at(layer_idx)
+        if live > cap:
+            raise AttentionHeadAllocatorError(
+                f"assert_within_cap(): layer {layer_idx} has {live} "
+                f"heads, exceeds compiler cap {cap}"
+            )
 
     @property
     def strategy(self) -> AllocStrategy:
@@ -323,9 +397,18 @@ class AttentionHeadAllocator:
         """Return the lowest unclaimed head index, or ``None`` if the
         layer is full.
 
-        Linear sweep over ``[0, layer_max_heads)`` — at 8 heads this is
-        trivially cheap and keeps allocation order deterministic.
+        In bounded mode, linear sweep over ``[0, layer_max_heads)`` —
+        at 8 heads this is trivially cheap and keeps allocation order
+        deterministic. In unbounded mode (``layer_max_heads is None``,
+        Phase 8.O.2) sweeps over ``[0, len(claimed)]``: if there is a
+        gap below the high-water mark it is filled first; otherwise
+        ``len(claimed)`` is returned, growing the pool by one.
         """
+        if self.layer_max_heads is None:
+            for h in range(len(claimed) + 1):
+                if h not in claimed:
+                    return h
+            return None  # unreachable — range is [0, len+1]
         for h in range(self.layer_max_heads):
             if h not in claimed:
                 return h
