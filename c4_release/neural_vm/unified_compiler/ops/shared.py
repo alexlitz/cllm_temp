@@ -679,7 +679,14 @@ def declare_setdim_compat_dims(
         "IO_IS_PUTCHAR", "IO_OUTPUT_READY",
         "IO_IN_OUTPUT_MODE", "IO_OUTPUT_COMPLETE",
         "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
-        "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC",
+        "OP_ENT", "OP_ADJ", "OP_LEV",
+        # Phase 8.A PREV_STEP infrastructure: OP_LEV_PREV_STEP alias
+        # (declared right after OP_LEV so the base's pinned position is
+        # already in ``compiler._pinned`` when the alias is declared,
+        # mirroring the OUTPUT_LO_PREV_STEP pattern). 6 OP_LEV back-edges
+        # in the latest scheduler analyzer report. See ``_ALIAS_OF`` below.
+        "OP_LEV_PREV_STEP",
+        "OP_LI", "OP_LC",
         "OP_SI", "OP_SC", "OP_PSH",
         "OP_OR", "OP_XOR", "OP_AND", "OP_EQ", "OP_NE", "OP_LT",
         "OP_GT", "OP_LE", "OP_GE", "OP_SHL", "OP_SHR",
@@ -738,7 +745,17 @@ def declare_setdim_compat_dims(
     seven_dim = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",
                  "L1H0", "L1H1", "L1H2", "L1H4", "L2H0"]
     # 16-dim nibble groups
-    sixteen_dim = ["EMBED_LO", "EMBED_HI", "OUTPUT_LO", "OUTPUT_HI",
+    sixteen_dim = ["EMBED_LO",
+                   # Phase 8.A PREV_STEP infrastructure: EMBED_LO/HI_PREV_STEP
+                   # aliases break the L4 pc_relay → L3 carry_forward_attn /
+                   # L3 ffn back-edges on EMBED_LO/HI (3 back-edges each in
+                   # the latest scheduler analyzer report). Declared right
+                   # after each base so the base's pinned position is in
+                   # ``compiler._pinned`` when the alias is declared. See
+                   # ``_ALIAS_OF`` below.
+                   "EMBED_LO_PREV_STEP",
+                   "EMBED_HI", "EMBED_HI_PREV_STEP",
+                   "OUTPUT_LO", "OUTPUT_HI",
                    # B9 OUTPUT_HI split: OUTPUT_HI_THIS_STEP is the new
                    # canonical name for the same-step write band. Same
                    # numeric base as OUTPUT_HI in _SetDim (190) so baked
@@ -772,12 +789,26 @@ def declare_setdim_compat_dims(
                    "FETCH_LO", "FETCH_HI", "MUL_ACCUM", "DIV_STAGING",
                    "AX_FULL_LO", "AX_FULL_HI",
                    "OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
-                   "ADDR_B0_LO", "ADDR_B1_LO", "ADDR_B2_LO",
-                   "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI",
+                   "ADDR_B0_LO",
+                   # Phase 8.A PREV_STEP infrastructure: ADDR_B0_{LO,HI}_PREV_STEP
+                   # aliases. ADDR_B0_HI has 4-5 back-edges in the latest
+                   # scheduler analyzer report (L9 lev_addr_relay → L8
+                   # mem_to_alu, L13 mem_addr_gather → L8 mem_to_alu, etc.);
+                   # ADDR_B0_LO appears as a low-count back-edge. Declared
+                   # right after each base so the pinned position is
+                   # available. See ``_ALIAS_OF`` below.
+                   "ADDR_B0_LO_PREV_STEP",
+                   "ADDR_B1_LO", "ADDR_B2_LO",
+                   "ADDR_B0_HI", "ADDR_B0_HI_PREV_STEP",
+                   "ADDR_B1_HI", "ADDR_B2_HI",
                    "FORMAT_PTR_LO", "FORMAT_PTR_HI",
                    "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"]
-    four_dim = ["CARRY"]
-    eight_dim = ["CMP"]
+    # Phase 8.A PREV_STEP infrastructure: CARRY_PREV_STEP / CMP_PREV_STEP
+    # aliases break L10 carry_relay → L9 alu and similar cross-step back-
+    # edges in the dep graph. Same numeric base as CARRY / CMP. See
+    # ``_ALIAS_OF`` below. No ops migrated in this pass.
+    four_dim = ["CARRY", "CARRY_PREV_STEP"]
+    eight_dim = ["CMP", "CMP_PREV_STEP"]
     forty_eight_dim = ["ADDR_KEY",
                       # Phase 8.A.6 v2: PREV_STEP alias for ADDR_KEY. Same
                       # numeric base. Used by cross-step readers (L4/L5/L8/L9
@@ -817,6 +848,21 @@ def declare_setdim_compat_dims(
         "ALU_LO_PREV_STEP": "ALU_LO",
         "AX_CARRY_LO_PREV_STEP": "AX_CARRY_LO",
         "AX_CARRY_HI_PREV_STEP": "AX_CARRY_HI",
+        # Phase 8.A PREV_STEP infrastructure: aliases for additional
+        # residual dims that show up as back-edges in the latest
+        # ``tools/analyze_scheduler.py`` report (OP_LEV: 6, ADDR_B0_HI:
+        # 4-5, EMBED_LO: 3, EMBED_HI: 3, CARRY: 3, CMP: 1-2,
+        # ADDR_B0_LO: 1). Each alias shares the same numeric position
+        # as its base so baked weight cells are byte-identical. No ops
+        # are migrated in this pass — this is infrastructure for future
+        # cross-step reader migrations.
+        "EMBED_LO_PREV_STEP": "EMBED_LO",
+        "EMBED_HI_PREV_STEP": "EMBED_HI",
+        "ADDR_B0_LO_PREV_STEP": "ADDR_B0_LO",
+        "ADDR_B0_HI_PREV_STEP": "ADDR_B0_HI",
+        "CARRY_PREV_STEP": "CARRY",
+        "CMP_PREV_STEP": "CMP",
+        "OP_LEV_PREV_STEP": "OP_LEV",
     }
 
     def _declare(name, size):
