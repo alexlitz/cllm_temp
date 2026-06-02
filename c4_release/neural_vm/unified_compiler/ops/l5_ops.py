@@ -172,6 +172,14 @@ def make_layer5_fetch_op() -> Operation:
         compiler_ir_factory=_layer5_fetch_ir,
         migrated=True,
         claims=_claims,
+        # Phase 8.A targeted (SCC audit step 7): pin the ADDR_KEY reader to
+        # layer4_pc_relay so the R-OH-2 rule in the dim-flow analyser
+        # suppresses the spurious back-edges from later ADDR_KEY writers
+        # (``layer7_memory_heads``, ``layer14_clear_addr_key_pollution``,
+        # ``layer14_addr_key_neural_decode``) into this op. L5 fetch's K-side
+        # consumes the AX-marker top nibble that ``layer4_pc_relay`` writes
+        # same-step; the L7/L14 ADDR_KEY writes are not the source.
+        requires={"after": "layer4_pc_relay"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
@@ -383,6 +391,11 @@ def make_layer5_fetch_dep_anchor_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 8.A targeted (SCC audit step 7): mirror the
+        # ``layer5_fetch`` ``requires["after"]`` so the dep anchor's
+        # ADDR_KEY back-edges from L7/L14 are also suppressed via R-OH-2.
+        # The anchor's reads/writes track the real ``layer5_fetch`` op.
+        requires={"after": "layer4_pc_relay"},
         smoke_tests=set(),
         spec_section=None,
     )
