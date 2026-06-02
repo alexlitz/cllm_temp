@@ -184,7 +184,6 @@ def make_phase_a_ffn_op() -> Operation:
     # H0..H4 ranges, which are size-7 dims.
     return Operation(
         name="phase_a_ffn",
-        phase=0,
         # Phase 7.A.1: H0..H4 are written by ``layer0_threshold_attn`` at the
         # SAME layer (L0 attn substage feeds the L0 block-FFN substage within
         # the same transformer block). Express this as a co-placement
@@ -432,7 +431,6 @@ def make_layer0_threshold_attn_op() -> Operation:
 
     return Operation(
         name="layer0_threshold_attn",
-        phase=0,
         reads={"IS_MARK", "CONST"},
         writes={"H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"},
         kind="block",
