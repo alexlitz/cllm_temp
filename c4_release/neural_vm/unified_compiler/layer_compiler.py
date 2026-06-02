@@ -42,7 +42,6 @@ Example:
     # layout.ops_at(1) = [pc_increment]
 """
 
-import os
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -146,12 +145,15 @@ class Operation:
     the dispatcher refuses to call `bake_fn` and only runs this generator (or
     skips `topology_anchor` ops, which intentionally write no weights).
 
-    `phase` is an optional ordering hint. When the dep graph has ambiguity
-    (e.g., two ops both read+write the same dim at different positions, which
-    the dim-name-only dep model can't distinguish), the compiler uses phase to
-    break ties: an edge u→v in the dep graph is dropped if u.phase > v.phase.
-    Smaller phase = earlier. Use the original `_set_layerN_*` layer number as
-    the phase for migrated ops to preserve hand-set order.
+    `phase` is an optional ordering hint retained as the cycle-breaker
+    inside the dim-only dep graph's strongly-connected components (Phase
+    8.G.4: out-of-SCC phase ordering deleted; the SCC tiebreaker in
+    ``_topological_sort`` still uses ``u.phase > v.phase`` to drop
+    back-edges so Kahn's algorithm can complete on today's op set, which
+    has 18-22 SCC members in attn/ffn). Smaller phase = earlier. Use the
+    original `_set_layerN_*` layer number as the phase for migrated ops
+    to preserve hand-set order until B9 dim decomposition (the SCC's
+    OUTPUT_HI / IF_VAR back-edges) lands.
 
     `layer_idx` is required when kind="block" — it pins the op to that exact
     layer index. Ignored for attn/ffn kinds.
@@ -345,38 +347,12 @@ class Operation:
 
     def __post_init__(self):
         # Phase 6 Wave 6B: resolve ``bake_fn`` from declarative siblings when
-        # the caller omitted it. See the ``bake_fn`` field docstring above for
-        # the resolution chain. Done BEFORE the phase-deprecation hook so the
-        # rest of this method can assume the standard invariants.
+        # the caller omitted it. See the ``bake_fn`` field docstring above
+        # for the resolution chain.
         if self.bake_fn is None:
             resolved = _resolve_default_bake_fn(self)
             if resolved is not None:
                 self.bake_fn = resolved
-        # B15 prep (1.0d, see docs/DYNAMIC_SCHEDULER_MIGRATION_PLAN.md):
-        # scaffold a DeprecationWarning emission path for the `phase=N.M`
-        # field. The dynamic scheduler retires `phase` after B14 strict mode
-        # stabilizes; this hook is silent by default and only fires when ALL
-        # THREE gates trip:
-        #
-        #   1. ``self.phase is not None``     — the op actually uses phase
-        #   2. ``C4_PHASE_STRICT_MODE=1``    — strict mode (B14) is enabled
-        #   3. ``C4_PHASE_DEPRECATION_WARN=1`` — deprecation warning opt-in
-        #
-        # Under normal use (no env flags set) this method is a no-op. Flip
-        # the env flags once B14 lands to surface remaining phase= users,
-        # then drop the `phase` field and this hook entirely in B15.
-        if self.phase is None:
-            return
-        if os.environ.get("C4_PHASE_STRICT_MODE") != "1":
-            return
-        if os.environ.get("C4_PHASE_DEPRECATION_WARN") != "1":
-            return
-        warnings.warn(
-            f"Operation '{self.name}' uses phase={self.phase}; "
-            f"switch to dep-based ordering",
-            DeprecationWarning,
-            stacklevel=2,
-        )
 
     def __hash__(self):
         return hash(self.name)
@@ -1043,6 +1019,13 @@ class LayerCompiler:
 
         # Model-ops are applied after all layer-ops; sort by phase so the
         # original hand-set order is preserved (smaller phase = earlier).
+        # Phase 8.G.4 note: kept because model ops are not in the
+        # ``_topological_sort`` dep graph and have no other ordering
+        # signal; today's model ops cover a wide phase range (8.0 to
+        # 1300) that does NOT match insertion order, so dropping this
+        # sort would break byte-identity with the static path. Retire
+        # only after model ops migrate to explicit ``requires["after"]``
+        # chains (tracked in PHASE_8_PLAN.md 8.G.5).
         model_ops = [op for op in self.ops if op.kind == "model"]
         model_ops.sort(key=lambda o: (o.phase if o.phase is not None else 0))
 
@@ -1211,6 +1194,12 @@ class LayerCompiler:
     # only count as in-step producers for consumers that also have no phase.
     # In practice every annotated op should set ``phase`` for the analyzer
     # to be useful.
+    #
+    # Phase 8.G.4 note: this analyzer's phase comparison is purely
+    # DIAGNOSTIC -- it never affects compile output. The producer-after-
+    # consumer test (``test_producer_after_consumer_warns``) pins the
+    # phase-ordering semantic, so the rewrite to a dep-derived signal
+    # ships with the SCC retirement in PHASE_8_PLAN.md 8.G.5.
     # --------------------------------------------------------------------
 
     def build_staleness_registry(self) -> Tuple[
@@ -1291,6 +1280,21 @@ class LayerCompiler:
         Cycles: writes-then-reads on the same dim across ops is fine (downstream op
         sees upstream's write). A *cycle* would be op A reads dim X written by B,
         and B reads dim Y written by A. We detect cycles and raise.
+
+        Phase as SCC tiebreaker (Phase 8.G.4)
+        ------------------------------------
+        Today's production op set has 18-22 attn/ffn ops trapped in an
+        SCC of the unpruned dim-only dep graph (the OUTPUT_HI / IF_VAR
+        carry chain; see ``docs/B9_OUTPUT_HI_SPLIT_SPEC.md``). To let
+        Kahn's algorithm complete, this method drops back-edges where
+        ``u.phase > v.phase``. The rule is purely a CYCLE-BREAKER
+        inside the SCC -- every edge it drops is an edge that, kept,
+        would prevent the topo sort from terminating. Phase 8.G.4
+        deleted the out-of-SCC phase usages (the ``Operation.phase``
+        deprecation scaffold, unused imports, etc.); this in-SCC
+        tiebreaker stays until B9 dim decomposition breaks the cycle
+        at the data-flow level, at which point ``phase`` retires
+        entirely (see ``docs/PHASE_8_PLAN.md`` 8.G).
         """
         if ops is None:
             ops = self.ops
@@ -1303,8 +1307,10 @@ class LayerCompiler:
         # Build edges: u -> v iff v.reads ∩ u.writes
         # Drop edges where the dim-name-only dep model would create spurious
         # cycles. Two pruning rules:
-        # 1. Phase-based: u.phase > v.phase means u writes "later" in hand-set
-        #    order than v reads, so v doesn't actually depend on u.
+        # 1. Phase-based (SCC tiebreaker; see method docstring): u.phase
+        #    > v.phase means u writes "later" in hand-set order than v
+        #    reads, so v doesn't actually depend on u. Load-bearing for
+        #    the production OUTPUT_HI carry SCC.
         # 2. Block-internal kind ordering: at the SAME phase, attn comes
         #    before ffn within a transformer block. So an ffn writer doesn't
         #    create a dep on an attn reader at the same phase.
@@ -1397,6 +1403,16 @@ class LayerCompiler:
         to fix the L1+ regression where ``migrated=True`` attn/ffn ops with
         no layer_idx were assigned to the wrong block by the dep-graph; see
         ``docs/MODEL_REGRESSION_BISECT.md``.
+
+        Phase 8.G.4 note: every ``phase`` consult in this method is
+        load-bearing for today's production op set (slot sharing via
+        ``layer_phase_kinds`` packs the 17-layer model; the B9
+        cross-step exception keeps the L3 / L16 carry compileable; the
+        same-layer pinned check is the validator's escape valve).
+        Retire as a wave once the B9 SCC breaks (dim decomposition lands
+        in PHASE_8_PLAN.md 8.G.5) and op factories adopt explicit
+        ``requires["after"]`` / ``requires["same_layer_as"]`` declarations
+        in place of phase ordinals.
         """
         writes_layer: Dict[str, int] = {}
         # writers_at_layer[(layer, dim)] = (op_name, phase) for the op that
