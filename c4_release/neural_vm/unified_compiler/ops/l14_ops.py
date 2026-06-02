@@ -652,10 +652,16 @@ def make_layer14_attn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer14_attn_dep_anchor",
-        # Phase=13.5 places this anchor between L13 mem-addr-gather
-        # (phase=13) and L14 mem-generation (phase=14). Same-step reads
-        # against the L13 anchor force the dep graph to land this at L14.
-        phase=13.5,
+        # Phase=14 matches ``layer14_mem_generation`` so the two attn ops
+        # share the same (layer, kind) slot in ``_assign_layers``. The
+        # ``requires["after"] = "_layer13_attn_dep_anchor"`` constraint
+        # pushes the earliest landable layer to L14 (one past the L13
+        # anchor); the shared phase keeps mem_generation co-placed at
+        # L14 instead of advancing to L15 (mismatched phase would
+        # consume a separate (layer, kind) slot via the round-robin
+        # advance loop, defeating the ``same_layer_as`` equality
+        # assertion downstream).
+        phase=14,
         # Subset of layer14_mem_generation reads/writes. Excludes the
         # high-fan-in dims (CLEAN_EMBED, OUTPUT) the routing/attn fabric
         # writes everywhere, so the anchor's earliest landable layer is
