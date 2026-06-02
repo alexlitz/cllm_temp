@@ -1780,14 +1780,14 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
                 k=(
                     AP(0, byte_idx_dim, L),
                     AP(0, BD.H1 + SP_I, L),
-                    # Phase 8.A targeted: CMP_PREV_STEP cross-step alias.
-                    # Same numeric position as CMP (396+3=399); byte-
-                    # identical at the bake level. See the op-level
-                    # ``reads={... "CMP.*.-1" ...}`` + ``requires=
+                    # Phase 9.C: read from CMP at the same numeric position
+                    # (396+3=399). The cross-step semantics are captured by
+                    # the SSA ``reads={... "CMP.*.-1" ...}`` + ``requires=
                     # {"after": "layer9_alu"}`` block in
-                    # ``make_layer8_sp_gather_bake_op`` for the dep-
-                    # graph semantics.
-                    AP(0, BD.CMP_PREV_STEP + 3, -L),
+                    # ``make_layer8_sp_gather_bake_op``; the PREV_STEP alias
+                    # was retired now that SSA spellings own the dep-graph
+                    # contract.
+                    AP(0, BD.CMP + 3, -L),
                     AP(33, BD.CONST, L),
                 ),
                 v=(
@@ -1842,14 +1842,12 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
                 k=(
                     AP(0, byte_idx_dim, L),
                     AP(0, BD.H1 + SP_I, L),
-                    # Phase 8.A targeted: CMP_PREV_STEP cross-step alias.
-                    # Same numeric position as CMP (396+3=399); byte-
-                    # identical at the bake level. See the op-level
-                    # ``reads={... "CMP.*.-1" ...}`` + ``requires=
-                    # {"after": "layer9_alu"}`` block in
-                    # ``make_layer8_sp_gather_bake_op`` for the dep-
-                    # graph semantics.
-                    AP(0, BD.CMP_PREV_STEP + 3, -L),
+                    # Phase 9.C: read from CMP at the same numeric position
+                    # (396+3=399). Mirror of head 0-2 above; SSA
+                    # ``"CMP.*.-1"`` + ``requires["after"]`` carries the
+                    # cross-step semantics that the PREV_STEP alias used to
+                    # express.
+                    AP(0, BD.CMP + 3, -L),
                     AP(33, BD.CONST, L),
                 ),
                 v=(
