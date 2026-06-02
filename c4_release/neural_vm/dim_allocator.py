@@ -627,10 +627,97 @@ class Allocator:
         return self.pack_unpinned_best_fit_decreasing().d_model
 
 
+def pack_layout_dims(
+    *,
+    dim_positions: Dict[str, int],
+    dim_sizes: Dict[str, int],
+    pinned_dims: Dict[str, int],
+    alias_map: Optional[Dict[str, str]] = None,
+    current_d_model: int,
+    target_d_model: Optional[int] = None,
+) -> Tuple[Dict[str, int], int]:
+    """Re-pack a ``ModelLayout``'s dim positions via best-fit decreasing.
+
+    Phase 10.A helper. Given a compiled :class:`ModelLayout`'s
+    ``dim_positions`` / ``dim_sizes`` plus the LayerCompiler's
+    ``_pinned`` / ``_aliases`` maps, build a fresh :class:`Allocator`
+    that mirrors the layout's pinning structure and re-run
+    :meth:`Allocator.pack_unpinned_best_fit_decreasing`. Returns a new
+    ``(dim_positions, d_model)`` pair where pinned dims keep their
+    positions byte-identically and unpinned dims are re-placed via BFD.
+
+    ``target_d_model`` (when provided) forces the packed pool width;
+    BFD failure raises :class:`AllocatorError`. Aliases are re-bound
+    post-pack so a moved base drags its aliases with it (matches
+    ``LayerCompiler._allocate_dims`` semantics).
+    """
+    if alias_map is None:
+        alias_map = {}
+    if current_d_model <= 0:
+        raise AllocatorError(
+            f"pack_layout_dims: current_d_model must be positive "
+            f"(got {current_d_model})"
+        )
+
+    pinned_names: List[str] = []
+    unpinned_names: List[str] = []
+    alias_names: List[str] = []
+    for name in dim_positions.keys():
+        if name in alias_map:
+            alias_names.append(name)
+        elif name in pinned_dims:
+            pinned_names.append(name)
+        else:
+            unpinned_names.append(name)
+
+    pool_width = current_d_model
+    for name in dim_positions:
+        end = dim_positions[name] + dim_sizes[name]
+        if end > pool_width:
+            pool_width = end
+    a = Allocator(d_model=pool_width)
+
+    for name in sorted(pinned_names, key=lambda n: dim_positions[n]):
+        a.alloc(name, dim_sizes[name], pin=dim_positions[name])
+
+    for name in sorted(unpinned_names, key=lambda n: dim_positions[n]):
+        a.alloc(name, dim_sizes[name], pin=dim_positions[name])
+        a._slots[-1].pinned = False
+
+    for name in sorted(alias_names, key=lambda n: dim_positions[n]):
+        a.alloc(
+            name, dim_sizes[name],
+            pin=dim_positions[name],
+            allow_overlap=True,
+        )
+
+    packed = a.pack_unpinned_best_fit_decreasing(target_d_model=target_d_model)
+
+    new_positions: Dict[str, int] = {}
+    for slot in packed.slots():
+        new_positions[slot.name] = slot.start
+
+    for alias_name in alias_names:
+        base = alias_map[alias_name]
+        for _ in range(len(dim_positions) + 1):
+            if base not in alias_map:
+                break
+            base = alias_map[base]
+        if base not in new_positions:
+            raise AllocatorError(
+                f"pack_layout_dims: alias {alias_name!r} references "
+                f"unknown base dim {base!r}"
+            )
+        new_positions[alias_name] = new_positions[base]
+
+    return new_positions, packed.d_model
+
+
 __all__ = [
     "AllocStrategy",
     "AllocatedSlot",
     "Allocator",
     "AllocatorError",
     "DEFAULT_POOL_WIDTH",
+    "pack_layout_dims",
 ]
