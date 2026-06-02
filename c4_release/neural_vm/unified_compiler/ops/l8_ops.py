@@ -575,9 +575,17 @@ def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
     """SUB borrow detection (120 units, offsets 1384..1503).
 
     Borrow occurs when ALU_LO[a] < AX_CARRY_LO[b] (stack_top < AX in
-    this nibble). Mirrors SUB lo structure with gate=OP_SUB.
+    this nibble). Mirrors SUB lo structure with the
+    ``(opcode_flag, SUB)`` gate, writing the ``(carry, alu)`` byte-0
+    cell.
+
+    Phase 7.E.2: gate + carry-output refs use ``dim_ref`` (mirrors the
+    add_carry / lea_carry pilots). ALU_LO+a / AX_CARRY_LO+b operand
+    reads stay structural.
     """
     carry_scale = 2.0 / (S * 5.0)
+    carry_byte0 = dim_ref("carry", "alu", 0)
+    gate_sub = dim_ref("opcode_flag", "SUB")
     rules = []
     for a in range(16):
         for b in range(16):
@@ -592,10 +600,10 @@ def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_LO+{b}", 1.0),
                 ),
                 threshold=2.5,
-                gate="OP_SUB",
-                writes=(("CARRY+0", carry_scale),),
+                gate=gate_sub,
+                writes=((carry_byte0, carry_scale),),
                 scope="MARK_AX and OP_SUB",
-                dominates_at={"CARRY+0": "MARK_AX and OP_SUB"},
+                dominates_at={carry_byte0: "MARK_AX and OP_SUB"},
             ))
     return tuple(rules)
 
