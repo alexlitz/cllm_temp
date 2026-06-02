@@ -1890,7 +1890,6 @@ def make_layer10_carry_relay_op() -> Operation:
 
     return Operation(
         name="layer10_carry_relay",
-        phase=10,
         # Phase 9.B (CARRY SCC rename): CARRY -> CARRY.*.-1 marks the read
         # as SSA cross-step relative to the same-step L10 CARRY writers
         # (``layer10_carry_relay_bake``, ``l10_post_ops_combined``).

@@ -807,6 +807,8 @@ def compile_full_vm_dynamic(
     allow_sealed_cycles: bool = True,
     model_shape_constraint=None,
     target_shape_overrides=None,
+    d_model_packing: bool = False,
+    d_model_packing_target: Optional[int] = None,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
@@ -1001,6 +1003,8 @@ def compile_full_vm_dynamic(
         enable_neural_io_think_protocol=enable_neural_io_think_protocol,
         kv_eviction_policy=kv_eviction_policy,
         kv_eviction_n_steps=kv_eviction_n_steps,
+        d_model_packing=d_model_packing,
+        d_model_packing_target=d_model_packing_target,
     )
 
     # Post-compile shape rebuild. When the caller hands in
@@ -1262,6 +1266,8 @@ def _bake_from_scheduled_ops(
     enable_neural_io_think_protocol: bool,
     kv_eviction_policy: KVEvictionPolicy = KVEvictionPolicy.OFF,
     kv_eviction_n_steps: int = 64,
+    d_model_packing: bool = False,
+    d_model_packing_target: Optional[int] = None,
 ):
     """Run the unchanged static compile/bake pipeline against ``scheduled``.
 
@@ -1349,6 +1355,44 @@ def _bake_from_scheduled_ops(
         pad = n_heads - (layout.d_model % n_heads)
         compiler.declare_dim("_pad", pad)
         layout = compiler.compile()
+
+    # Phase 10.A: optionally repack unpinned dims via best-fit decreasing
+    # so the residual stream is tighter. Pinned IO dims (declared via
+    # ``declare_setdim_compat_dims(pin_io_only=True)``) keep their
+    # positions byte-identically; unpinned scratch dims relocate to
+    # recover slack. The packed pool width is rounded up to ``n_heads``
+    # so the attention head splits remain integer. An explicit
+    # ``d_model_packing_target`` is honored exactly and must already be
+    # a multiple of n_heads.
+    if d_model_packing:
+        from ..dim_allocator import pack_layout_dims
+
+        target = d_model_packing_target
+        if target is not None and target % n_heads != 0:
+            raise ValueError(
+                f"compile_full_vm_dynamic(d_model_packing_target="
+                f"{target}) must be a multiple of n_heads={n_heads}"
+            )
+        new_positions, packed_d_model = pack_layout_dims(
+            dim_positions=layout.dim_positions,
+            dim_sizes=layout.dim_sizes,
+            pinned_dims=getattr(compiler, "_pinned", {}) or {},
+            alias_map=getattr(compiler, "_aliases", {}) or {},
+            current_d_model=layout.d_model,
+            target_d_model=target,
+        )
+        if target is None and packed_d_model % n_heads != 0:
+            packed_d_model += n_heads - (packed_d_model % n_heads)
+        layout = ModelLayout(
+            d_model=packed_d_model,
+            n_layers=layout.n_layers,
+            ops_per_layer=layout.ops_per_layer,
+            dim_positions=new_positions,
+            dim_sizes=layout.dim_sizes,
+            block_ops=layout.block_ops,
+            model_ops=layout.model_ops,
+            ffn_widths=layout.ffn_widths,
+        )
 
     if require_declarative_bake:
         _static.enforce_declarative_bake_authority(layout)
