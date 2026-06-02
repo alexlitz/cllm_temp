@@ -96,6 +96,9 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
                     name=f"l12_mul_combine_p{partial:02d}_ah{a_hi:02d}_bl{b_lo:02d}",
                     conditions=(
                         ("MARK_AX", 1.0),
+                        # structural offset: partial/a_hi/b_lo are
+                        # nibble-value one-hot lookup indices into the
+                        # TEMP scratch and operand bands.
                         (f"TEMP+{partial}", 1.0),
                         (f"ALU_HI+{a_hi}", 1.0),
                         (f"AX_CARRY_LO+{b_lo}", 1.0),
@@ -104,6 +107,9 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
                     gate=gate_mul,
                     gate_weight=1.0,
                     gate_bias=0.0,
+                    # structural offset: result_hi is the computed
+                    # high-byte nibble of (a*b) & 0xFF (value-bus
+                    # lookup), not a role-meaningful byte position.
                     writes=((f"OUTPUT_HI+{result_hi}", write_scale),),
                     scope="MARK_AX and OP_MUL",
                     dominates_at={
