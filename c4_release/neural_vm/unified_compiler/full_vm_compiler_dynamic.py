@@ -67,6 +67,7 @@ from .layer_compiler import (
     requires_same_layer_as_ops,
 )
 from . import full_vm_compiler as _static
+from ..kv_eviction import KVEvictionPolicy
 
 
 # ---------------------------------------------------------------------------
@@ -796,13 +797,17 @@ def compile_full_vm_dynamic(
     rms_norm_eps: Optional[float] = None,
     require_declarative_bake: Optional[bool] = None,
     declarations_only: bool = False,
+    kv_eviction_policy=None,
+    kv_eviction_n_steps: int = 64,
     strict: bool = True,
     allow_sealed_cycles: bool = True,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
     Signature mirrors ``compile_full_vm`` exactly (same args/kwargs, same
-    return type ``(model, layout)``).
+    return type ``(model, layout)``). As of Phase 7 closing audit priority
+    5 this is the default implementation of ``compile_full_vm`` — that
+    entry point delegates here unless ``use_static_path=True`` is passed.
 
     Internally:
 
@@ -867,6 +872,11 @@ def compile_full_vm_dynamic(
         declarations_only = _static._env_flag_enabled(
             _static._DECLARATIONS_ONLY_BAKE_ENV
         )
+    # Phase 7.F.2: default to OFF (preserves byte-identity with the
+    # historical baseline). Accept either a ``KVEvictionPolicy`` member
+    # or its string value; the static path is symmetric.
+    if kv_eviction_policy is None:
+        kv_eviction_policy = KVEvictionPolicy.OFF
     if enable_moe_routing is None:
         enable_moe_routing = _static._env_flag_enabled(
             _static._ENABLE_MOE_ROUTING_ENV
@@ -962,6 +972,8 @@ def compile_full_vm_dynamic(
         enable_conversational_io=enable_conversational_io,
         enable_tool_calling=enable_tool_calling,
         enable_neural_io_think_protocol=enable_neural_io_think_protocol,
+        kv_eviction_policy=kv_eviction_policy,
+        kv_eviction_n_steps=kv_eviction_n_steps,
     )
 
 
@@ -1043,6 +1055,8 @@ def _bake_from_scheduled_ops(
     enable_conversational_io: bool,
     enable_tool_calling: bool,
     enable_neural_io_think_protocol: bool,
+    kv_eviction_policy: KVEvictionPolicy = KVEvictionPolicy.OFF,
+    kv_eviction_n_steps: int = 64,
 ):
     """Run the unchanged static compile/bake pipeline against ``scheduled``.
 
@@ -1084,6 +1098,11 @@ def _bake_from_scheduled_ops(
         "rms_norm_eps": float(rms_norm_eps),
         "require_declarative_bake": bool(require_declarative_bake),
         "declarations_only": bool(declarations_only),
+        # Phase 7.F.2: include eviction policy in the cache key so OFF and
+        # STATIC_LIVENESS builds don't share a serialised model (mirrors the
+        # static-path snapshot in ``compile_full_vm``).
+        "kv_eviction_policy": KVEvictionPolicy(kv_eviction_policy).value,
+        "kv_eviction_n_steps": int(kv_eviction_n_steps),
         # Namespace the dynamic cache so it never collides with the static
         # entry (same kwargs, different scheduler).
         "__dynamic": True,
@@ -1096,7 +1115,16 @@ def _bake_from_scheduled_ops(
         cache_path = _static._cache_dir() / f"{cache_key}.pt"
         cached = _static._try_load_cached(cache_path, kwargs_snapshot)
         if cached is not None:
-            return cached
+            # Phase 7.F.2: defensive re-attach of KV eviction state on cache
+            # hit, mirroring the static-path behaviour.
+            cached_model, cached_layout = cached
+            _static._attach_kv_eviction_state(
+                cached_model,
+                cached_layout,
+                kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
+                n_steps=int(kv_eviction_n_steps),
+            )
+            return cached_model, cached_layout
 
     compiler = LayerCompiler()
     declare_setdim_compat_dims(compiler, pin_io_only=pin_io_only)
@@ -1136,7 +1164,16 @@ def _bake_from_scheduled_ops(
             cache_path = _static._cache_dir() / f"{cache_key}.pt"
             cached = _static._try_load_cached(cache_path, kwargs_snapshot)
             if cached is not None:
-                return cached
+                # Phase 7.F.2: defensive re-attach of KV eviction state on
+                # cache hit (mirrors the static-path declarations_only branch).
+                cached_model, cached_layout = cached
+                _static._attach_kv_eviction_state(
+                    cached_model,
+                    cached_layout,
+                    kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
+                    n_steps=int(kv_eviction_n_steps),
+                )
+                return cached_model, cached_layout
 
     from ..vm_step import AutoregressiveVM
 
@@ -1192,6 +1229,18 @@ def _bake_from_scheduled_ops(
         model.compact(block_size=32)
         model.compact_moe()
 
+    # Phase 7.F.2: attach per-attention KVEvictionState artifacts. OFF is
+    # a no-op (preserves byte-identity with the historical baseline), so
+    # the static and dynamic paths emit identical models when the policy
+    # is unset. STATIC_LIVENESS runs the analyzer and projects the report
+    # onto every block.attn — same code path as the static implementation.
+    _static._attach_kv_eviction_state(
+        model,
+        layout,
+        kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
+        n_steps=int(kv_eviction_n_steps),
+    )
+
     if cache_path is not None:
         _static._try_save_cached(cache_path, model, layout, kwargs_snapshot)
 
@@ -1234,6 +1283,10 @@ def compare_compile_paths(
     ``disk_cache`` defaults to False so this comparator never returns
     stale cache hits — both paths must rebuild from source.
     """
+    # Force the legacy phase-pruning path on the static side so we still
+    # exercise the byte-identity gate between the two implementations even
+    # after ``compile_full_vm`` was rerouted to the dynamic path by default
+    # (Phase 7 closing audit priority 5).
     static_model, static_layout = _static.compile_full_vm(
         S=S,
         alu_mode=alu_mode,
@@ -1241,6 +1294,7 @@ def compare_compile_paths(
         enable_tool_calling=enable_tool_calling,
         enable_neural_io_think_protocol=enable_neural_io_think_protocol,
         disk_cache=disk_cache,
+        use_static_path=True,
     )
     dyn_model, dyn_layout = compile_full_vm_dynamic(
         S=S,
