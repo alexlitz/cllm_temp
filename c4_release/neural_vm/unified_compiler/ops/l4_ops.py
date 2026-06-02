@@ -801,6 +801,25 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         declarative_authority="spec_generated",
         layer_idx=4,
         migrated=True,
+        # Phase 7.A.2 backfill: this op shares the L4 attention-head allocator
+        # with ``layer4_pc_relay`` (heads 0/1 vs 2/3, both pinned via the same
+        # ``_allocate_layer4_attention_heads`` builder) and the phase=4.5
+        # comment above explicitly orders this op AFTER ``layer4_pc_relay``
+        # (phase=4) "so its writes don't clobber". The dim-only analyzer
+        # cannot see the allocator-sharing constraint: head 2/3's V/O writes
+        # land at the same AX-marker position where head 0/1 wrote
+        # EMBED_LO/HI/ADDR_KEY, and the per-block attention bake must apply
+        # the relay's writes first so this op's SP-byte staging into the
+        # ADDR_KEY sub-band (ADDR_B0_HI/ADDR_B1_HI/ADDR_B2_HI) layers on top
+        # without competing with head 0/1's ADDR_KEY top-nibble carry. Declare
+        # the real cross-op dep so the analyzer can see the L4 ordering edge.
+        #
+        # ``layer4_pc_relay`` is itself currently a cycle member (it reads
+        # ADDR_KEY which is rewritten downstream by L7 / L14), so this op
+        # joins the same SCC under the new edge -- that is correct honest
+        # classification per the Phase 7.A.2 plan; the cycle decomposition
+        # work in 7.A.3 will eventually retire the back-edge.
+        requires={"after": ["layer4_pc_relay"]},
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
