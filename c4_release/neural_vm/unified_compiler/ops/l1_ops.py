@@ -226,7 +226,6 @@ def make_layer1_ffn_op() -> Operation:
 
     return Operation(
         name="layer1_ffn",
-        phase=1,
         # Phase 7.A.1: L1H0/L1H1/L1H2/L1H4 are written by
         # ``layer1_threshold_attn`` at the SAME layer (L1 attn substage feeds
         # the L1 FFN substage inside the same transformer block). Express
