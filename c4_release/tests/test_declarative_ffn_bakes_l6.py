@@ -1160,3 +1160,110 @@ def test_layer6_routing_bake_keeps_non_overlay_ir_bands_at_legacy_parity():
     # The routing bake overlays delayed/first/all-step branch override,
     # branch PC-byte1, and later-call JSR SP bands with declarative fixes;
     # those have dedicated coverage above.
+
+
+def test_layer6_psh_stack0_marker_override_ir_matches_legacy_units():
+    """The PSH STACK0 marker-override band is byte-identical between the
+    new declarative ``_layer6_psh_stack0_marker_override_rules`` lowering
+    and the prior inline imperative writes in ``_bake_layer6_routing_ffn``.
+    """
+    from neural_vm.unified_compiler.ops.l6_ops import (
+        L6_PSH_STACK0_MARKER_OVERRIDE_END_UNIT,
+        L6_PSH_STACK0_MARKER_OVERRIDE_START_UNIT,
+        _layer6_psh_stack0_marker_override_rules,
+        _lower_layer6_psh_stack0_marker_override_ir,
+    )
+
+    actual = _StubFFN()
+    expected = _StubFFN()
+
+    end = _lower_layer6_psh_stack0_marker_override_ir(actual, 100.0, _SetDim)
+    # Replay the legacy inline imperative writes for the expected side.
+    BD = _SetDim
+    S = 100.0
+    unit = L6_PSH_STACK0_MARKER_OVERRIDE_START_UNIT
+    for output_base, alu_base in (
+        (BD.OUTPUT_LO, BD.ALU_LO),
+        (BD.OUTPUT_HI, BD.ALU_HI),
+    ):
+        for k in range(16):
+            expected.W_up[unit, BD.PSH_AT_SP] = S
+            expected.W_up[unit, BD.MARK_STACK0] = S
+            expected.b_up[unit] = -S * 1.5
+            expected.W_gate[unit, output_base + k] = -1.0
+            expected.W_down[output_base + k, unit] = 2.0 / S
+            unit += 1
+        for k in range(16):
+            expected.W_up[unit, BD.PSH_AT_SP] = S
+            expected.W_up[unit, BD.MARK_STACK0] = S
+            expected.b_up[unit] = -S * 1.5
+            expected.W_gate[unit, alu_base + k] = 1.0
+            expected.W_down[output_base + k, unit] = 2.0 / S
+            unit += 1
+        for k in range(16):
+            expected.W_up[unit, BD.PSH_AT_SP] = S
+            expected.W_up[unit, BD.MARK_STACK0] = S
+            expected.W_up[unit, alu_base + k] = S
+            expected.b_up[unit] = -S * 2.5
+            expected.b_gate[unit] = 1.0
+            expected.W_down[output_base + k, unit] = 3.0 / S
+            unit += 1
+
+    assert end == L6_PSH_STACK0_MARKER_OVERRIDE_END_UNIT
+    assert len(_layer6_psh_stack0_marker_override_rules(100.0)) == 96
+    _assert_same_ffn_units(
+        actual,
+        expected,
+        L6_PSH_STACK0_MARKER_OVERRIDE_START_UNIT,
+        L6_PSH_STACK0_MARKER_OVERRIDE_END_UNIT,
+    )
+
+
+def test_layer6_routing_ffn_ir_passes_declaration_and_lowering_checks():
+    """``compare_symbolic_to_lowered_ffn`` over the aggregate L6 routing IR
+    has no declaration-semantics or lowering-contract failures.
+
+    Per the documented Phase 6 wave 4 migration pattern, the per-cell
+    lowering-contract check (W_up / b_up / W_gate / b_gate / W_down) and
+    declaration resolution are the byte-identity guarantees for the rule
+    list. The synthetic ``weight_output_mismatch`` issues that arise from
+    aggregating ~1500 rules whose conditions naturally fan into the same
+    state dims are checked per band via the dedicated per-substage tests
+    above (``test_layer6_imm_fetch_route_ir_matches_legacy_units`` etc.).
+    """
+    from neural_vm.unified_compiler.ir import compare_symbolic_to_lowered_ffn
+    from neural_vm.unified_compiler.ops.l6_ops import make_layer6_routing_ffn_ir
+    from neural_vm.unified_compiler.primitives import Primitives
+
+    ir = make_layer6_routing_ffn_ir(100.0)
+    names = Primitives.ffn_rule_dim_names(ir.layer(0).ffn.rules)
+    dim_positions = Primitives.dim_positions_from_bd(_SetDim, names)
+    report = compare_symbolic_to_lowered_ffn(
+        ir,
+        dim_positions,
+        S=100.0,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+    structural_failures = [
+        issue for issue in report.issues
+        if issue.kind in ("declaration_semantics", "lowering")
+    ]
+    assert not structural_failures, (
+        "structural compare_symbolic_to_lowered_ffn failures: "
+        + "\n".join(f"  [{i.kind}] {i.message}" for i in structural_failures)
+    )
+
+
+def test_layer6_routing_ffn_op_exposes_compiler_ir():
+    """``make_layer6_routing_ffn_op()`` must attach the aggregate L6 IR."""
+    from neural_vm.unified_compiler.ops.l6_ops import (
+        make_layer6_routing_ffn_ir,
+        make_layer6_routing_ffn_op,
+    )
+
+    op = make_layer6_routing_ffn_op()
+    expected = make_layer6_routing_ffn_ir(100.0)
+    assert op.compiler_ir is not None
+    assert len(op.compiler_ir.layer(0).ffn.rules) == len(expected.layer(0).ffn.rules)
