@@ -1926,7 +1926,7 @@ def make_layer10_byte_passthrough_op() -> Operation:
         # same step). The same-step values from L3/L5/L7 still resolve at
         # the same numeric position (TEMP_PREV_STEP aliases TEMP). Breaks
         # L11/L14 → layer10_byte_passthrough back-edges on TEMP.
-        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "TEMP_PREV_STEP",
+        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "TEMP.*.-1",
                "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "MEM_STORE", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -2140,7 +2140,7 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         # Phase 8.A.6 v2: matches layer10_byte_passthrough's TEMP_PREV_STEP
         # rename. See that op for rationale.
         reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "OP_LC_RELAY",
-               "TEMP_PREV_STEP",
+               "TEMP.*.-1",
                "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "MEM_STORE", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -2344,7 +2344,7 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
                # weight cells stay byte-identical; only the dep-graph view
                # changes. Mirrors the L7 ``layer7_operand_gather`` rename
                # (commits 6967fe8f, 8e6ec805).
-               "OUTPUT_LO_PREV_STEP", "OUTPUT_HI_PREV_STEP"},
+               "OUTPUT_LO.*.-1", "OUTPUT_HI.*.-1"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,
@@ -2421,7 +2421,7 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         # relative to L11/L14 TEMP writers (which fire after L10 in the
         # same step). Same numeric position as TEMP. See
         # layer10_byte_passthrough for the per-band rationale.
-        reads={"IS_BYTE", "HAS_SE", "H1", "H4", "TEMP_PREV_STEP", "CMP",
+        reads={"IS_BYTE", "HAS_SE", "H1", "H4", "TEMP.*.-1", "CMP",
                "PSH_AT_SP",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
                "OP_PSH", "OP_SI", "OP_SC", "OP_LEV", "MEM_STORE", "MARK_MEM",
@@ -2576,7 +2576,7 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
         phase=10,
         # Phase 8.A.6 v2: matches layer10_stack0_byte_relay_bake's
         # TEMP_PREV_STEP rename. See that op for rationale.
-        reads={"MARK_AX", "IS_BYTE", "HAS_SE", "H1", "H4", "TEMP_PREV_STEP",
+        reads={"MARK_AX", "IS_BYTE", "HAS_SE", "H1", "H4", "TEMP.*.-1",
                "CMP",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
                "PSH_AT_SP", "OP_PSH", "OP_SI", "OP_SC", "OP_LEV", "MEM_STORE", "MARK_MEM",
@@ -2821,8 +2821,8 @@ def make_l10_post_ops_combined() -> Operation:
             "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC",
             "OP_SI", "OP_SC", "OP_PSH", "OP_EXIT", "OP_NOP",
             "OP_PUTCHAR", "OP_GETCHAR",
-            "OUTPUT_LO", "OUTPUT_HI_PREV_STEP", "ALU_LO", "ALU_HI",
-            "CARRY", "CMP", "TEMP_PREV_STEP",
+            "OUTPUT_LO", "OUTPUT_HI.*.-1", "ALU_LO", "ALU_HI",
+            "CARRY", "CMP", "TEMP.*.-1",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CARRY"},
