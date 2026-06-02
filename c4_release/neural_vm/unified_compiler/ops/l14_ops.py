@@ -78,22 +78,23 @@ def _allocate_layer14_mem_generation_heads() -> AttentionHeadAllocator:
 # (mirrors the L9 ``_L9_ALU_UNIT_LAYOUT`` convention).
 _L14_CLEANUP_CHAIN_LAYOUT = {
     # ``pin=None`` means auto-fit: the allocator picks the first free gap
-    # past the previously-pinned chain ops. Phase 6 Wave 6D demos the
-    # auto-fit path on ``layer14_jsr_ax_bytes_zero`` — a 4-unit op whose
-    # rules don't cross-reference unit indices, so the FFN function is
-    # invariant to where in the chain the units land. With the static
-    # pins above consuming [0, 1862), first-fit on a 4096-wide pool
-    # lands the 4-unit auto-fit range back at unit 1862, so weight bits
-    # are coincidentally byte-identical to the legacy pin — but the
-    # author no longer has to supply the offset.
-    "layer14_temp_clear":                    (   0,    4),
-    "layer14_clear_addr_key_pollution":      (   4,   48),
-    "layer14_clear_output_corruption":       (  52,   18),
-    "layer14_clear_mem_marker_output":       (  70,   64),
-    "layer14_addr_key_neural_decode":        ( 134, 1728),
-    "layer14_jsr_ax_bytes_zero":             (None,    4),  # auto-fit (Phase 6 Wave 6D)
-    "layer14_lc_ax_bytes_zero":              (1866,    4),
-    "layer14_alu_nocarry_ax_bytes_zero":     (1870,    4),
+    # past the previously-claimed chain ops. Phase 7.B.5 drops the
+    # remaining static pins on the cleanup chain (the addr_key_neural_decode
+    # 1728-unit substage and every 4..64-unit cleanup before/after it).
+    # ``_l14_chain_alloc`` pre-claims every preceding entry in declaration
+    # order, so first-fit on a 4096-wide pool deterministically lands each
+    # op at the same offset the legacy pin specified — byte-identical
+    # because none of the rule families cross-reference the unit index.
+    # Phase 6 Wave 6D landed the same auto-fit treatment on
+    # ``layer14_jsr_ax_bytes_zero`` first as the demo (commit fd38b6e).
+    "layer14_temp_clear":                    (None,    4),
+    "layer14_clear_addr_key_pollution":      (None,   48),
+    "layer14_clear_output_corruption":       (None,   18),
+    "layer14_clear_mem_marker_output":       (None,   64),
+    "layer14_addr_key_neural_decode":        (None, 1728),
+    "layer14_jsr_ax_bytes_zero":             (None,    4),
+    "layer14_lc_ax_bytes_zero":              (None,    4),
+    "layer14_alu_nocarry_ax_bytes_zero":     (None,    4),
 }
 
 
