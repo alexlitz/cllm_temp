@@ -44,16 +44,20 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
 
     When `enable_tool_calling=False`, the bake_fn is a no-op so the op can be
     unconditionally registered in `all_core_ops()` without changing behavior.
+
+    Migrated 2026-06-01 (Phase 6 Wave 3L): the imperative helper
+    ``_set_tool_call_opcode_decode`` is replaced by an
+    ``FFNRule``-driven lowerer (``_lower_tool_call_opcode_decode_ir``)
+    — six ``FFNRule.gated_write`` units lowered through
+    ``Primitives.lower_ffn_rules`` at pinned units 400..405.
+    Byte-identical to the legacy helper.
     """
-    if enable_tool_calling:
-        def bake(model, dim_positions, S):
-            from ...vm_step import _set_tool_call_opcode_decode
-            _set_tool_call_opcode_decode(
-                model.blocks[5].ffn, S, _as_setdim_proxy(dim_positions),
-            )
-    else:
-        def bake(model, dim_positions, S):
-            return  # disabled when enable_tool_calling=False
+    def bake(model, dim_positions, S):
+        if not enable_tool_calling:
+            return
+        _lower_tool_call_opcode_decode_ir(
+            model.blocks[5].ffn, S, _as_setdim_proxy(dim_positions),
+        )
 
     return Operation(
         name="tool_call_opcode_decode",
@@ -61,11 +65,67 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
         writes=set(),
         kind="model",
         bake_fn=bake,
-        declarative_bake_fn=bake if not enable_tool_calling else None,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         phase=998.8,
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#tool-use-mode",
+    )
+
+
+_TOOL_CALL_OPCODE_DECODE_START_UNIT = 400
+
+# (OPCODE_BYTE_LO nibble, OPCODE_BYTE_HI nibble, opcode name).  Mirrors the
+# ``io_opcodes`` table in ``_set_tool_call_opcode_decode``: OPEN=30 (0x1E),
+# READ=31 (0x1F), CLOS=32 (0x20), PRTF=33 (0x21), GETCHAR=64 (0x40),
+# PUTCHAR=65 (0x41).
+_TOOL_CALL_OPCODE_TABLE = (
+    (14, 1, "open"),
+    (15, 1, "read"),
+    (0, 2, "clos"),
+    (1, 2, "prtf"),
+    (0, 4, "getchar"),
+    (1, 4, "putchar"),
+)
+
+
+def _tool_call_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for ``_set_tool_call_opcode_decode``.
+
+    Six gated-write units, one per I/O opcode: 2-way AND on
+    ``OPCODE_BYTE_LO/HI`` nibbles, MARK_AX gate, writes ``IO_IS_TOOL_CALL``.
+    Each unit's effective contribution is ``10.0/S`` so the combined flag
+    is roughly 5.0 when an I/O opcode is active.
+    """
+    write_scale = 10.0 / S
+    return tuple(
+        FFNRule.gated_write(
+            name=f"tool_call_decode_{name}",
+            conditions=(
+                (f"OPCODE_BYTE_LO+{lo}", 1.0),
+                (f"OPCODE_BYTE_HI+{hi}", 1.0),
+            ),
+            threshold=1.5,
+            gate="MARK_AX",
+            writes=(("IO_IS_TOOL_CALL", write_scale),),
+        )
+        for lo, hi, name in _TOOL_CALL_OPCODE_TABLE
+    )
+
+
+def _lower_tool_call_opcode_decode_ir(ffn, S: float, BD) -> int:
+    rules = _tool_call_opcode_decode_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=_TOOL_CALL_OPCODE_DECODE_START_UNIT,
+        S=S,
     )
 
 
