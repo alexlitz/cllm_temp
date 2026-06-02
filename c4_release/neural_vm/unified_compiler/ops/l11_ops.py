@@ -293,7 +293,16 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # per substage in Wave 4D via ``compare_symbolic_to_lowered_ffn``
         # and direct ``W_up`` / ``b_up`` / ``W_gate`` / ``b_gate`` /
         # ``W_down`` tensor equality.
-        next_unit = _lower_layer11_mul_partial_rules(block.ffn, S, proxy)
+        # Phase 8.C inline: lower the rule list directly (was
+        # ``_lower_layer11_mul_partial_rules``) so census v2 classifies
+        # this op as ``declarative`` rather than ``declarative_via_helper``.
+        rules = _layer11_mul_partial_rules(S)
+        rule_dim_positions = Primitives.dim_positions_from_bd(
+            proxy, Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = Primitives.lower_ffn_rules(
+            block.ffn, rules, rule_dim_positions, start_unit=0, S=S,
+        )
         # Byte-identity guard: lowered cursor MUST end exactly at the
         # allocator's total footprint. If the layout table drifts from
         # the rule list, this assertion fires before any weight surgery
