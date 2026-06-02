@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
@@ -605,9 +606,17 @@ def _layer4_pc_plus_offset_byte_rules(
     and writes a further +offset rotation into FETCH. ``offset = byte_idx + 2``
     yields PC+2 (byte_idx=0, 96 units), PC+3 (byte_idx=1, 128 units),
     PC+4 (byte_idx=2, 160 units).
+
+    Phase 8.D: the ``BYTE_INDEX_<byte_idx>`` condition uses
+    :func:`dim_ref` for the ``(byte_index, str(byte_idx))`` semantic
+    pair so the rule names the byte-position role rather than the
+    bare slot label. Structural source/target lookup offsets
+    (``TEMP+<k>`` / ``FETCH_LO+<k>``) stay as ``+N`` -- ``<k>`` is a
+    value-bus nibble index, not a role-meaningful byte position.
     """
     AX_I = 1
     offset = byte_idx + 2
+    byte_index_cond = dim_ref("byte_index", str(byte_idx))
     return _nibble_rotation_chain_rules(
         name_prefix=f"l4_pc_plus{offset}_byte{byte_idx}",
         gate_marker_name="IS_BYTE",
@@ -616,7 +625,7 @@ def _layer4_pc_plus_offset_byte_rules(
         target_lo_name="FETCH_LO", target_lo_offset=0,
         target_hi_name="FETCH_HI", target_hi_offset=0,
         offset=offset, with_carry=True, S=S, magnitude=2.0,
-        condition_names=(f"H1+{AX_I}", f"BYTE_INDEX_{byte_idx}"),
+        condition_names=(f"H1+{AX_I}", byte_index_cond),
         scope=f"IS_BYTE and H1+{AX_I} and BYTE_INDEX_{byte_idx}",
     )
 
