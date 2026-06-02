@@ -1365,6 +1365,20 @@ class LayerCompiler:
         out_edges: Dict[str, Set[str]] = {op.name: set() for op in ops}
         op_set = {op.name for op in ops}
         for v in ops:
+            # Phase 7.A SCC retirement: ``requires["next_step_after"] = X``
+            # declares ``v`` reads X's output from the PREVIOUS step.
+            # Suppress same-step data-flow edges on every dim X writes
+            # that v reads. NO replacement explicit edge is added. See
+            # ``docs/NEXT_STEP_AFTER_PRIMITIVE.md``.
+            next_step_suppressed_dims: Set[str] = set()
+            for ref in requires_next_step_after_ops(v):
+                if ref == v.name or ref not in op_set:
+                    continue
+                ref_op = self._op_by_name.get(ref)
+                if ref_op is None:
+                    continue
+                for d in ref_op.writes & v.reads:
+                    next_step_suppressed_dims.add(d)
             for d in v.reads:
                 # Phase 9 SSA prototype: SSA cross-step reads
                 # (``BASE.WRITER.STEP_OFFSET`` with step_offset != 0) are
@@ -1379,6 +1393,8 @@ class LayerCompiler:
                     parsed = parse_ssa_name(d)
                     if parsed.is_cross_step:
                         continue
+                if d in next_step_suppressed_dims:
+                    continue
                 for u in writers.get(d, ()):
                     if u.name == v.name:
                         continue
