@@ -2302,7 +2302,7 @@ class _SetDim:
     OUTPUT_LO = 174  # 174-189: output decoding nibbles
     OUTPUT_HI = 190  # 190-205
     # B9 OUTPUT_HI split: declarative alias for the same 16-slot band. The
-    # rename clarifies "this step's OUTPUT_HI write" vs the would-be
+    # rename clarifies "this step's OUTPUT_HI write" vs the
     # "OUTPUT_HI_PREV_STEP" cross-step carry (see docs/B9_OUTPUT_HI_SPLIT_SPEC.md).
     # Numeric position is identical so baked weights are byte-identical.
     OUTPUT_HI_THIS_STEP = 190  # alias of OUTPUT_HI
@@ -2311,6 +2311,12 @@ class _SetDim:
     # L8 head 6 AX_CARRY refresh) attend back to the prior step's AX
     # marker row, where this slot still holds the prev-step value.
     OUTPUT_LO_PREV_STEP = 174  # alias of OUTPUT_LO
+    # Phase 7.A.3.a: OUTPUT_HI cross-step variant. Same numeric base as
+    # OUTPUT_HI so baked weight indices are byte-identical with the
+    # previous ``requires["after"]`` workaround; the rename lets the
+    # dynamic scheduler resolve cross-step reads via dim algebra alone
+    # (no spurious data-flow edges from same-step writers).
+    OUTPUT_HI_PREV_STEP = 190  # alias of OUTPUT_HI
 
     # --- Address key (for memory attention) ---
     ADDR_KEY = 206  # 206-253 (48 dims: 3 nibbles × 16 one-hot)
