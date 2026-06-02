@@ -71,7 +71,10 @@ def make_layer5_user_input_gather_op(enable: bool = False) -> Operation:
         reads=set(),
         writes=set(),
         kind="block",
-        layer_idx=5,
+        # Phase 8.G.6: drop ``layer_idx=5`` literal; bind to the L5
+        # attn anchor (``_layer5_fetch_dep_anchor``, kind="attn") so the
+        # placement follows wherever the compiler puts that anchor.
+        target_op_name="_layer5_fetch_dep_anchor",
         bake_fn=bake,
         declarative_bake_fn=bake if not enable else None,
         migrated=True,
