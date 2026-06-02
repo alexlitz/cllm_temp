@@ -221,6 +221,11 @@ def all_core_ops(
         make_layer10_psh_stack0_passthrough_bake_op(),
         make_layer10_stack0_byte_relay_bake_op(),
         make_layer10_alu_op(),
+        # Phase 8.A.4 retry: dep anchor for L11. The actual MUL partial bake
+        # is owned by ``layer11_mul_partial`` (kind="block", target_op_name=
+        # ``_layer11_ffn_dep_anchor``); this no-op companion gives the
+        # scheduler a layer-resident ffn op so the block op resolves to L11.
+        make_layer11_ffn_dep_anchor_op(),
         make_layer11_mul_partial_op(alu_mode=alu_mode),
         make_layer12_mul_combine_op(alu_mode=alu_mode),
         make_layer13_mem_addr_gather_op(),

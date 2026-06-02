@@ -1896,6 +1896,13 @@ def make_layer10_carry_relay_op() -> Operation:
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
+        # Phase 8.A.4 retry: this op is the L10 layer anchor. Pointing at
+        # ``layer9_marker_suppress`` (kind="ffn", pinned to L9 via its own
+        # ``requires["after"]: layer8_alu``) creates a topo dep edge that
+        # both orders the placement (anchor placed after suppress) and
+        # forces ``earliest = L9 + 1 = L10``. L10 block ops then bind to
+        # this anchor's resolved layer via ``target_op_name``.
+        requires={"after": "layer9_marker_suppress"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -2062,7 +2069,10 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_carry_relay_ir,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor pinned via ``requires["after"]: layer9_alu``).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2126,7 +2136,11 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_byte_passthrough_ir,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor pinned via
+        # ``requires["after"]: layer9_marker_suppress``).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2177,7 +2191,10 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_sp_byte_passthrough_ir,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2224,7 +2241,10 @@ def make_layer10_bp_byte_passthrough_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_bp_byte_passthrough_ir,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2292,7 +2312,10 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_psh_stack0_passthrough_ir,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2359,7 +2382,10 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_stack0_byte_relay_ir,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2427,7 +2453,10 @@ def make_layer10_alu_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer10_alu_ir(),
         declarative_authority="spec_generated",
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         # Staleness invariants (Phase 3 / Agent G): L10 ALU consumes
         # ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) at the AX
@@ -6473,7 +6502,10 @@ def make_tail_bit32_result_correction_op() -> Operation:
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
-        layer_idx=17,
+        # Phase 8.A.4 retry: layer_idx=17 literal dropped (was redundant
+        # alongside ``target_op_name`` since ``target_op_name`` takes
+        # precedence in ``resolve_block_op_layer``). The L17 placement is
+        # dep-derived from ``l10_post_ops_combined``'s position.
         target_op_name="l10_post_ops_combined",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
@@ -6620,7 +6652,10 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         phase=10.7,
-        layer_idx=10,
+        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
+        # binds this block op to the layer of ``layer10_carry_relay``
+        # (kind="attn", L10 anchor).
+        target_op_name="layer10_carry_relay",
         migrated=True,
         declarative_authority="structural_model",
         smoke_tests={"all"},

@@ -986,7 +986,27 @@ class LayerCompiler:
         topo = self._topological_sort(attn_ffn_ops)
         layer_assignment = self._assign_layers(topo)
         for op in block_ops:
-            layer_assignment[op.name] = op.layer_idx
+            # Phase 8.A.4 retry: block ops may bind to a layer via
+            # ``target_op_name`` (pointing at an attn/ffn op the topo loop
+            # already placed) instead of a hardcoded ``layer_idx``. Resolve
+            # the target's layer in that case so block ops without a
+            # ``layer_idx`` pin still land at the correct block.
+            if op.layer_idx is not None:
+                layer_assignment[op.name] = op.layer_idx
+            elif op.target_op_name is not None:
+                target_layer = layer_assignment.get(op.target_op_name)
+                if target_layer is None:
+                    raise ValueError(
+                        f"Block op {op.name!r} target_op_name "
+                        f"{op.target_op_name!r} not found in placed "
+                        f"attn/ffn ops"
+                    )
+                layer_assignment[op.name] = target_layer
+            else:
+                raise ValueError(
+                    f"Block op {op.name!r} has neither layer_idx nor "
+                    f"target_op_name"
+                )
 
         dim_positions = self._allocate_dims()
 
