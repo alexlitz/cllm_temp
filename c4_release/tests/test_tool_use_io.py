@@ -468,6 +468,169 @@ class TestToolCallEdgeCases:
         assert "Hello" in ''.join(output)
 
 
+class TestExtensibleHandler:
+    """Tests proving the handler API is extensible without core VM edits.
+
+    See docs/HOW_TO_ADD_A_TOOL_HANDLER.md. The pattern is: define a wrapper
+    that owns the new tool and delegates the rest to ``ToolUseIOHandler``,
+    then pass it to ``ToolUseVM(io_handler=wrapper)``. No edits to
+    ``ToolUseVM`` or ``ToolUseIOHandler`` are required.
+    """
+
+    def test_extensible_handler_demo(self):
+        """End-to-end demo: a new "RNG" tool added without touching core VM.
+
+        Adds a mock deterministic RNG that returns ``[seed, seed+1, ...]``
+        and proves:
+
+        1. A wrapper handler can intercept a new ``ToolCallType``-like tag
+           (we use a string tag to avoid mutating the enum from a test).
+        2. The wrapper delegates all other tool types to the inner
+           ``ToolUseIOHandler`` byte-identically.
+        3. ``ToolUseVM(io_handler=wrapper)`` accepts the wrapper without
+           any change to ``ToolUseVM`` source.
+        4. The standard PUTCHAR / EXIT path still works when routed
+           through the wrapper.
+        """
+        from tools.tooluse_io import (
+            Opcode,
+            ToolCall as IOToolCall,
+            ToolCallType,
+            ToolResponse,
+            ToolUseIOHandler,
+            ToolUseVM,
+        )
+
+        # --- Step 1: define a wrapper handler with a new "rng" tool. ---
+        # Using a string tag ("rng") keeps the test from depending on a
+        # ToolCallType enum entry; in production code you would add
+        # ``ToolCallType.RNG = "rng"`` and dispatch on it (see the doc).
+        class RNGHandler:
+            def __init__(self, inner, seed=0):
+                self.inner = inner
+                self.seed = seed
+                self.counter = 0
+                self.delegated = 0
+                self.rng_calls = 0
+
+            def handle(self, call):
+                tag = call.call_type
+                tag_value = tag.value if hasattr(tag, "value") else tag
+                if tag_value == "rng":
+                    self.rng_calls += 1
+                    n = call.params.get("n", 1)
+                    values = [
+                        (self.seed + self.counter + i) & 0xFFFFFFFF
+                        for i in range(n)
+                    ]
+                    self.counter += n
+                    return ToolResponse(call.call_id, True, result=values)
+                self.delegated += 1
+                return self.inner.handle(call)
+
+        # --- Step 2: build inner handler + wrapper. ---
+        output_buffer = []
+        inner = ToolUseIOHandler(
+            output_callback=lambda s: output_buffer.append(s),
+            input_callback=lambda: "Z\n",
+        )
+        wrapper = RNGHandler(inner, seed=100)
+
+        # --- Step 3a: invoke the new tool directly via the handler API. ---
+        # This proves the new tool works end-to-end at the protocol layer
+        # without needing an opcode that emits it.
+        rng_call = IOToolCall(
+            call_type="rng",  # string tag — wrapper handles it
+            call_id=1,
+            params={"n": 3},
+        )
+        rng_resp = wrapper.handle(rng_call)
+        assert rng_resp.success
+        assert rng_resp.result == [100, 101, 102]
+        assert wrapper.rng_calls == 1
+        assert wrapper.delegated == 0
+
+        # Determinism: a second call continues the sequence.
+        rng_resp2 = wrapper.handle(
+            IOToolCall(call_type="rng", call_id=2, params={"n": 2})
+        )
+        assert rng_resp2.result == [103, 104]
+        assert wrapper.rng_calls == 2
+
+        # --- Step 3b: drive ToolUseVM with the wrapper as io_handler. ---
+        # ToolUseVM only requires .handle(call) -> ToolResponse on the
+        # handler. We did NOT subclass ToolUseVM or ToolUseIOHandler.
+        vm = ToolUseVM(io_handler=wrapper)
+        bytecode = [
+            (Opcode.IMM << 0) | (ord('H') << 8),
+            (Opcode.PSH << 0),
+            (Opcode.PUTCHAR << 0),
+            (Opcode.IMM << 0) | (ord('i') << 8),
+            (Opcode.PSH << 0),
+            (Opcode.PUTCHAR << 0),
+            (Opcode.EXIT << 0),
+        ]
+        vm.reset()
+        vm.load(bytecode)
+        vm.run()
+
+        # Standard tools still work — PUTCHAR was delegated to the inner
+        # handler and produced "Hi" on the captured output_buffer.
+        assert ''.join(output_buffer) == "Hi"
+        # PUTCHAR(2) + EXIT(1) delegated through the wrapper. EXIT may
+        # short-circuit after halt, so we assert at least the PUTCHARs.
+        assert wrapper.delegated >= 2
+
+        # --- Step 4: prove the wrapper can be swapped for a different
+        # implementation of the same tool without VM changes. ---
+        class FixedRNG:
+            """Always returns [7]. Demonstrates plug-replaceability."""
+            def __init__(self, inner):
+                self.inner = inner
+
+            def handle(self, call):
+                tag_value = (
+                    call.call_type.value
+                    if hasattr(call.call_type, "value")
+                    else call.call_type
+                )
+                if tag_value == "rng":
+                    return ToolResponse(call.call_id, True, result=[7])
+                return self.inner.handle(call)
+
+        fixed = FixedRNG(ToolUseIOHandler())
+        resp = fixed.handle(
+            IOToolCall(call_type="rng", call_id=1, params={"n": 1})
+        )
+        assert resp.result == [7]
+
+        # --- Step 5: failure path. A handler that returns success=False
+        # is the documented way to signal errors; never raise. ---
+        class FlakyRNG:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def handle(self, call):
+                tag_value = (
+                    call.call_type.value
+                    if hasattr(call.call_type, "value")
+                    else call.call_type
+                )
+                if tag_value == "rng":
+                    return ToolResponse(
+                        call.call_id, success=False, result=None,
+                        error="rng unavailable",
+                    )
+                return self.inner.handle(call)
+
+        flaky = FlakyRNG(ToolUseIOHandler())
+        bad = flaky.handle(
+            IOToolCall(call_type="rng", call_id=1, params={"n": 1})
+        )
+        assert not bad.success
+        assert bad.error == "rng unavailable"
+
+
 # Run tests
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
