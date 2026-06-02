@@ -2511,7 +2511,10 @@ def make_layer10_alu_op() -> Operation:
         # SSA alias; byte-identical bake. Breaks 1 L10.4 -> L10.2
         # back-edge.
         reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "ALU_HI.*.-1", "AX_CARRY_HI",
-               "OP_OR", "OP_XOR", "OP_AND", "OP_DIV", "OP_MOD"},
+               "OP_OR", "OP_XOR", "OP_AND", "OP_DIV", "OP_MOD",
+               # V2/G7 LEV detector: in-step topology edge replacing the
+               # cross-step requires["after"]=layer16_lev_routing below.
+               "PC_VIA_LEV_DETECTOR_LO"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "DIV_STAGING"},
         kind="block",
         declarative_bake_fn=bake,
@@ -2532,15 +2535,10 @@ def make_layer10_alu_op() -> Operation:
             "AX_CARRY_LO": "AX_byte0",
             "AX_CARRY_HI": "AX_byte0",
         },
-        # Phase 8.A SCC step 4 (ALU_LO chain): see ``make_layer8_alu_op``'s
-        # ``requires`` comment for the full rationale. L10 ALU's ALU_LO
-        # read is the same-step operand-A nibble (from L7 operand_gather,
-        # asserted by ``consumes_fresh`` above). The phase=10.4 / phase=16
-        # ALU_LO writers stage NEXT-step residuals;
-        # ``requires["after"] = "layer16_lev_routing"`` opts L10 into the
-        # B9 R-OH-2 prev-step semantics so the L10 stack0 byte relay and
-        # L16 LEV routing forward-cycle back-edges on ALU_LO collapse.
-        requires={"after": "layer16_lev_routing"},
+        # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
+        # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
+        # is in-step producer). Previous: requires={"after":
+        # "layer16_lev_routing"}. See CONTROL_FLOW_DETECTOR_HEADS.md §2.4.
         # ``_set_layer10_alu`` writes the comparison-combine (18 units) +
         # bitwise-cross-product (~1536) + AX passthrough (~32) + DIV/MOD
         # setup units, reaching unit 1845. No other op writes to L10 FFN
@@ -2829,23 +2827,19 @@ def make_l10_post_ops_combined() -> Operation:
             "OUTPUT_LO", "OUTPUT_HI.*.-1", "ALU_LO", "ALU_HI",
             "CARRY", "CMP", "TEMP.*.-1",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+            # V2/G7 LEV detector: in-step topology edge replacing the
+            # cross-step requires["after"]=layer16_lev_routing below.
+            "PC_VIA_LEV_DETECTOR_LO",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "CARRY"},
         kind="ffn",
         declarative_bake_fn=bake,
         migrated=True,
         declarative_authority="declarative",
-        # Phase 8.A SCC step 4 (ALU_LO chain): see ``make_layer8_alu_op``'s
-        # ``requires`` comment for the full rationale. The L10 byte
-        # post-ops read ALU_LO/HI at byte-cleanup positions to drive the
-        # carry-propagation and zeroing rules; the ALU_LO read is
-        # satisfied by L7 operand_gather + L8/L9/L10 ALU's same-step
-        # output (this op runs at phase=10.5 after layer10_alu at 10.2).
-        # The L16 ALU_LO writer stages a NEXT-step residual;
-        # ``requires["after"] = "layer16_lev_routing"`` opts this op into
-        # the B9 R-OH-2 prev-step semantics so the L16 forward-cycle
-        # back-edge on ALU_LO collapses.
-        requires={"after": "layer16_lev_routing"},
+        # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
+        # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
+        # is in-step producer). Previous: requires={"after":
+        # "layer16_lev_routing"}. See CONTROL_FLOW_DETECTOR_HEADS.md §2.4.
         ffn_units_used=1562,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",

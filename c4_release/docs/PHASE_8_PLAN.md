@@ -1014,17 +1014,75 @@ compose nibble products at the data path level rather than the FFN
 unit level — could unlock further compression, but that's a separate
 research direction beyond Phase 10's scope.
 
-### 10.D — Floor estimate (revised)
+### 10.D — Floor estimate (Axes A+B only)
 
 With Axes 10.A + 10.B (10.C parked), realistic floor is **~80M**
-through declarative knobs alone. The further gap to ~10-20M (an ideal
-hand-authored compiler) requires architectural restructuring beyond
-Phase 10's scope:
-- Byte-wide MUL/ALU operators (composes nibble products at the data
-  path level, not per-FFN-unit)
-- Per-op symbolic compression (shared residual slots across
-  non-overlapping opcode classes)
-- Vocab pruning if the compiled VM's symbol set is smaller than 32k
+through naive declarative knobs alone.
+
+### 10.E — Axis 4: FFN-only dim multiplexing (target ≤95M, saves ~85M from baseline)
+
+The 733 active residual dims include many that are opcode-specific.
+Dims used by LEV (PC_SAVED, BP_SAVED) are dormant during LEA. Dims
+used during JMP are dormant during EXIT.
+
+Classic register-allocation / liveness analysis applies: build a
+dim-interference graph from the declarative IR's `reads`/`writes` +
+opcode-condition info, graph-color, merge non-interfering dims into
+shared slots.
+
+**Safety**: this axis only merges dims that are FFN-only (no attention
+reader). FFN ops operate per-row, so cross-position contamination is
+impossible by construction.
+
+Work:
+- Liveness pass: for each dim, derive the opcode-class set that
+  reads/writes it (from op `conditions` + `gated_write` constraints)
+- Interference graph: dim X interferes with dim Y if their opcode
+  sets overlap OR if any attention head reads either
+- Greedy coloring: minimum slots needed
+- Re-emit lowering with merged slot map (dim_positions lookups
+  redirect through the merge table)
+- Add `enable_dim_multiplex_ffn_only: bool = False` flag
+
+Expected savings: if ~30-40% of FFN-only dims are mergeable, d_model
+drops 800 → ~500. Attention 81M → 32M, FFN 79M → 50M = -78M total.
+
+### 10.F — Axis 5: Validity-mask dim multiplexing (target ≤50M, saves ~138M from baseline)
+
+Generalizes 10.E using attention validity masking. Even attention-read
+dims can multiplex if every reading head gates its K-side on the
+target opcode marker.
+
+Standard attention-gating trick (used by lookback masks today):
+reserve one K-dim per multiplexing group as a "validity" channel.
+`K_valid_i = strength × MARK_<opcode>_i`. Wrong-opcode rows get no
+boost in the Q·K dot product → drown out in softmax.
+
+Almost all 733 active dims have an identifiable "active opcode class"
+(derivable from op conditions). The non-mergeable set is the
+always-active markers themselves (MARK_AX, MARK_PC, BYTE_INDEX,
+IS_BYTE, HAS_SE) — ~30-50 dims floor.
+
+Work:
+- Per-dim active-opcode-class derivation (read directly from IR)
+- Per-head active-class requirement derivation (read from
+  `DeclarativeAttentionHeadSpec` conditions)
+- Auto-insert validity K-dim per multiplexing group; auto-set
+  corresponding Q-gate constant
+- Compile-time verification: head's gate boost ≥ max non-gate
+  similarity by a margin (rejection condition)
+- Refuse-to-compile diagnostic when a head reads multiple
+  multiplexed-group dims with incompatible active classes
+- Add `enable_dim_multiplex_validity_mask: bool = False` flag
+
+Expected savings: physical slots collapse from 733 → ~100-150. d_model
+800 → 256 (alignment-friendly). Attention 81M → 8.4M, FFN 79M → 26M,
+Embed 0.4M → 0.3M ≈ ~46M total. **Saves ~138M from baseline.**
+
+Verification cost: significant. Must prove no head can read
+contaminated KV from a wrong-opcode row. Compiler-side proof is
+tractable (the IR has all the info) but represents the bulk of
+implementation effort.
 
 ### Phase 10 acceptance
 

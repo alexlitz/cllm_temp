@@ -328,7 +328,10 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # Declaring a phantom ALU_HI read here understates L11's true producer
         # role and inflates ALU_HI's apparent in-step consumer count, which
         # makes the staleness analyzer harder to interpret. Removed.
-        reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
+        reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL",
+               # V2/G7 LEV detector: in-step topology edge replacing the
+               # cross-step requires["after"]=layer16_lev_routing below.
+               "PC_VIA_LEV_DETECTOR_LO"},
         writes={"TEMP"},
         kind="block",
         declarative_bake_fn=bake,
@@ -364,19 +367,10 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         produces={
             "TEMP": "AX_byte0",
         } if alu_mode == "lookup" else {},
-        # Phase 8.A SCC step 4 (ALU_LO chain): see ``make_layer8_alu_op``'s
-        # ``requires`` comment for the full rationale. L11 MUL partial
-        # reads ALU_LO at AX byte 0 (operand A low nibble; same-step
-        # fresh from L7 operand_gather per ``consumes_fresh`` above).
-        # The L16 ALU_LO writer stages a NEXT-step residual;
-        # ``requires["after"] = "layer16_lev_routing"`` opts L11 into
-        # the B9 R-OH-2 prev-step semantics so the L16 forward-cycle
-        # back-edge on ALU_LO collapses. Only meaningful in lookup mode
-        # (efficient mode strips ``consumes_fresh`` entirely); we still
-        # declare the requires unconditionally so the scheduler graph
-        # is identical across modes (the constraint is cycle-graph
-        # bookkeeping, not a data-flow change).
-        requires={"after": "layer16_lev_routing"},
+        # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
+        # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
+        # is in-step producer). Previous: requires={"after":
+        # "layer16_lev_routing"}. See CONTROL_FLOW_DETECTOR_HEADS.md §2.4.
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
