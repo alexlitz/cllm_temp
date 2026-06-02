@@ -2838,7 +2838,6 @@ def make_l10_post_ops_combined() -> Operation:
     # phase comparison uses < / >.
     return Operation(
         name="l10_post_ops_combined",
-        phase=10.5,
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L11/L14 TEMP writers. Same numeric position as TEMP.
         # See layer10_byte_passthrough for the per-band rationale.
