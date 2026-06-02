@@ -1025,16 +1025,12 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer3_ffn_dep_anchor",
-        # Phase 10.B prerequisite: restore phase=3 placement key. Commit
-        # 18a90a4d dropped it claiming the SSA renames had freed the
-        # anchor from its SCC, but the L4 anchor still has
-        # ``requires["same_layer_as"]`` pinned to this anchor and the
-        # phase-share allocator drives the co-location. Without
-        # matching phases, the L3 anchor floats to layer 3 while the
-        # L4 anchor lands at layer 4 (driven by L4 FFN writers), and
-        # the same-layer constraint raises. Restoring phase=3 keeps
-        # both anchors on the same (kind, phase) slot.
-        phase=3,
+        # Tier 1 phase= elimination: drop phase=3. The L4 anchor now
+        # carries requires={} (per df6f0671) and places at L4 via its
+        # FETCH_LO/HI writes; this L3 anchor lands at L3 via its
+        # earliest-feasible layer (no writes, reads satisfied by
+        # earlier-layer producers). The phase-share co-location is no
+        # longer the load-bearing mechanism for either anchor.
         # Phase 8.A.6 v2: matches layer3_ffn's TEMP_PREV_STEP rename.
         # Phase 8.A: matches layer3_ffn's OP_LEV_PREV_STEP rename.
         # Phase 8.A (EMBED_HI split): matches layer3_ffn's

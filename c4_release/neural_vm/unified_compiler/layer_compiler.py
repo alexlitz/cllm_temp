@@ -452,6 +452,17 @@ def requires_same_layer_as_ops(op: "Operation") -> Tuple[str, ...]:
     return _requires_op_names(op.requires.get(REQUIRES_SAME_LAYER_AS_KEY))
 
 
+def requires_next_step_after_ops(op: "Operation") -> Tuple[str, ...]:
+    """Return the op-name strings ``op`` requires to run in the PREVIOUS step.
+
+    Returns an empty tuple when no ``requires["next_step_after"]`` is
+    declared. Treated as a NON-CYCLE edge by every scheduler — same-step
+    data-flow edges on the referenced op's writes that this op reads are
+    suppressed. See ``docs/NEXT_STEP_AFTER_PRIMITIVE.md``.
+    """
+    return _requires_op_names(op.requires.get(REQUIRES_NEXT_STEP_AFTER_KEY))
+
+
 def validate_requires_op_refs(
     ops: Iterable["Operation"],
 ) -> List[str]:
