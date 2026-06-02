@@ -270,7 +270,6 @@ def make_layer2_mem_byte_flags_op() -> Operation:
                 "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3"},
         kind="ffn",
         layer_idx=2,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir=_layer2_mem_byte_flags_ir(),
         declarative_authority="spec_generated",
@@ -431,7 +430,6 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         writes={"EMBED_LO", "EMBED_HI"},
         kind="block",
         layer_idx=2,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir=_layer2_initial_pc_bake_cancel_ir(),
         migrated=True,
@@ -498,7 +496,6 @@ def make_layer2_threshold_attn_op() -> Operation:
         writes={"L2H0"},
         kind="attn",
         layer_idx=2,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer2_threshold_ir,
         migrated=True,
@@ -594,7 +591,6 @@ def make_layer2_lookback_detection_head_op(
         writes=set(),
         kind="block",
         layer_idx=2,
-        bake_fn=bake,
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _layer2_lookback_detection_head_ir
