@@ -447,9 +447,62 @@ maps to a Phase 8 sub-wave:
 
 #### 8.K — Tool-use IO test suite (closes C5)
 
-* **8.K.1** Clarify the requirement: review `neural_vm/tool_calling/` + `docs/TOOL_CALLING.md`. Document what "tool use IO" means.
-* **8.K.2** If interactive function-calling: create `tests/test_tool_use_io.py` covering open/read/close + tool-call markers. If external program calls: implement at minimum a stub harness.
-* **Acceptance**: documented + at least 5 representative tool-use programs pass end-to-end with byte-accurate IO traces.
+Architecture is already specified in `docs/BLOG_SPEC.md:851` +
+`docs/OPCODE_TABLE.md:762`:
+- VM emits `TOOL_CALL:type:id:{params}` token on I/O opcode
+- External runner intercepts, calls handler, returns `ToolResponse`
+- Runner injects response, VM continues
+
+Tool calls scope: the 4 I/O opcodes — **PRTF, OPEN, READ, CLOS** —
+plus GETCHAR/PUTCHAR. Handler registration should be extensible
+(handler registry must accept new `ToolCallType` entries without
+core code changes) but the test bar is on the 4 + GETCHAR/PUTCHAR.
+
+Existing infrastructure:
+- `tests/test_tool_use_io.py` (473 lines)
+- `tools/tooluse_io.py` (`ToolUseVM`, `ToolUseIOHandler`, `ToolCallType`)
+- `neural_vm/run_vm.py` (`ToolCall`, `ToolResponse`)
+- Op-level: `open_clos_tool_call`, `prtf_think_protocol`,
+  `tool_call_detection`, `tool_call_opcode_decode`,
+  `tool_call_relay_head`, `_set_tool_call_*`
+
+* **8.K.1** Run `test_tool_use_io.py` at HEAD and document pass/fail.
+  If failing: fix to baseline-green before extending.
+* **8.K.2** Extensible handler API audit: verify a user can add a
+  custom `ToolCallType` + handler without touching the core VM or
+  baked ops. Document in `docs/HOW_TO_ADD_A_TOOL_HANDLER.md`.
+* **8.K.3** **1096 corpus through tool-use mode**: every 1096 program
+  that performs PRTF/OPEN/READ/CLOS/GETCHAR/PUTCHAR must produce
+  byte-identical output when its I/O goes through the TOOL_CALL
+  emit-intercept path vs the default neural-IO path. New harness:
+  `tests/test_1096_tool_use_mode.py`. Acceptance: 1096/1096 pass with
+  identical traces.
+* **8.K.4** **Cross-stack tool-use** — tool calling must work in all
+  four execution stacks:
+  - **PyTorch path** (default) — 8.K.1/8.K.3 already cover this
+  - **Bundled ONNX runtime** (depends on 8.M) — bundled artifact still
+    emits TOOL_CALL tokens; runner intercepts identically
+  - **C4-C ONNX runtime** (depends on 8.L) — C runner intercepts
+    TOOL_CALL and calls registered handler; C handlers for the 4
+    opcodes exist
+  - **Quine-bundled stack** (depends on 8.N) — bundled quine artifact
+    can also tool-call (necessary for quine's own I/O)
+  Add per-stack tests under `tests/test_tool_use_<stack>_1096.py`.
+* **8.K.5** **Additional coverage** — extend `test_tool_use_io.py`
+  to cover edge cases the existing 473-line suite may not (long
+  PRTF format strings, OPEN of missing/invalid files, READ partial,
+  interleaved tool-call + neural-IO programs).
+* **8.K.6** Acceptance gate uses option (c): byte-accurate IO traces
+  match a reference. The reference is the PyTorch path's output trace
+  for each test program — every other stack must reproduce it byte-for-byte.
+* **Acceptance**: `test_tool_use_io.py` green; 1096 corpus passes 1096/1096
+  in tool-use mode in every stack (PyTorch, ONNX, C4-C, quine-bundled);
+  cross-stack byte-accurate IO trace match; extensible handler API
+  demonstrated by adding 1 mock tool (e.g. a deterministic random
+  number generator) without core changes.
+
+8.K depends on 8.L (C4-C runtime) and 8.M (bundler) for its
+cross-stack tests — sequence 8.K.4 last among the deployment items.
 
 #### 8.E.9 — KV eviction long-context correctness test (closes C6)
 
