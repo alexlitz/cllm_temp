@@ -1,24 +1,17 @@
-"""Byte-identity tests for the hybrid dynamic-layer compile path (B11).
+"""Scheduler-invariant tests for the dynamic compile path (B11).
 
-These tests assert that ``compile_full_vm_dynamic`` returns a layout
-that is bit-identical to ``compile_full_vm`` on today's op set.
-
-The tests are marked ``slow`` because each one runs two full compiles
-(~40-70s each on the default static path; the dynamic path adds another
-full compile on top). Run them with ``pytest --runslow``. The fast
-non-build-heavy assertions (schedule consistency, cycle counts) are kept
-out of the slow gate so CI surfaces scheduler regressions cheaply.
+The historical slow byte-identity tests (which ran ``compile_full_vm``
+under the legacy static phase-pruning body and diffed it against
+``compile_full_vm_dynamic``) were removed in Phase 8.G.3 alongside the
+static body itself. The fast scheduler invariants below — schedule
+permutation, topological validity, cycle-member presence under
+unpruned-but-not-pruned graphs — continue to gate any change to the
+declared deps that would break the dep-pruned order.
 """
 
 import pytest
-import torch
 
-from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
-    compile_full_vm,
-)
 from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
-    compare_compile_paths,
-    compile_full_vm_dynamic,
     compute_dynamic_schedule,
     _build_dep_graph,
     _build_phase_pruned_graph,
@@ -143,49 +136,14 @@ def test_dynamic_schedule_cycle_members_exist_and_phase_pruning_breaks_them():
 
 
 # ---------------------------------------------------------------------------
-# Slow: full byte-identity comparison vs compile_full_vm
+# Slow: end-to-end build smoke
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-def test_compile_full_vm_dynamic_byte_identical_lookup():
-    """Default-arg dynamic compile must match the static compile bit-for-bit."""
-    report = compare_compile_paths(
-        alu_mode="lookup",
-        disk_cache=False,
-    )
-    assert report["n_diffs"] == 0, (
-        f"dynamic vs static state_dict differs in {report['n_diffs']} "
-        f"tensors; first 5: {report['diff_keys'][:5]}"
-    )
-    assert report["layout_diff"] == [], (
-        f"dynamic vs static ModelLayout differs: {report['layout_diff']}"
-    )
-    assert report["phase_disagrees_with_dep_order"] == [], (
-        "dep order diverged from phase order — Phase A guarantees this "
-        f"set should match. Divergences: "
-        f"{report['phase_disagrees_with_dep_order'][:5]}"
-    )
-
-
-@pytest.mark.slow
-def test_compile_full_vm_dynamic_byte_identical_efficient():
-    """``alu_mode='efficient'`` dynamic compile must match the static
-    compile bit-for-bit. Efficient mode adds 12 extra ALU wrapper /
-    composite ops, so this is a separate regression surface from the
-    lookup-mode case.
-    """
-    report = compare_compile_paths(
-        alu_mode="efficient",
-        disk_cache=False,
-    )
-    assert report["n_diffs"] == 0, (
-        f"dynamic vs static state_dict differs in {report['n_diffs']} "
-        f"tensors; first 5: {report['diff_keys'][:5]}"
-    )
-    assert report["layout_diff"] == [], (
-        f"dynamic vs static ModelLayout differs: {report['layout_diff']}"
-    )
+#
+# Phase 8.G.3 deleted the byte-identity slow tests that previously ran
+# ``compile_full_vm_dynamic`` against the legacy ``compile_full_vm``
+# static body via ``compare_compile_paths``. The static body is gone, so
+# the diff has no left operand to compare against. The dep-graph
+# regression surface lives in the fast scheduler-invariant tests above.
 
 
 @pytest.mark.slow
@@ -195,6 +153,10 @@ def test_compile_full_vm_dynamic_runs_with_all_flags():
     runtime metadata. Cycle members are routed through the phase-fallback
     branch; this test exercises that path under flags=on.
     """
+    from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+        compile_full_vm_dynamic,
+    )
+
     model, layout = compile_full_vm_dynamic(
         enable_conversational_io=True,
         enable_tool_calling=True,

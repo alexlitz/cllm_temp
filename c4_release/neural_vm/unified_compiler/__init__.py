@@ -27,7 +27,6 @@ try:
     from .full_vm_compiler_dynamic import (  # noqa: F401
         compile_full_vm_dynamic,
         compute_dynamic_schedule,
-        compare_compile_paths,
     )
 except ImportError:
     pass
@@ -66,7 +65,6 @@ for _name in (
     'BuilderConfig', 'PruningConfig', 'IRBuilder',
     'CompilerIR', 'AttentionOp', 'FFNOp', 'LayerSpec',
     'compile_full_vm_dynamic', 'compute_dynamic_schedule',
-    'compare_compile_paths',
 ):
     if _name in globals():
         __all__.append(_name)

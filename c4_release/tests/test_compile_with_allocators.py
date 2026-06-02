@@ -1,25 +1,20 @@
 """B16 wiring tests: dim / FFN-unit / attention-head allocators on
 ``ModelLayout`` after :func:`compile_full_vm_dynamic`.
 
-Three coverage layers:
+Two coverage layers (the byte-identity layer was removed in Phase
+8.G.3 alongside the static ``compile_full_vm`` body):
 
 1. **Reachability** — every allocator is present on the returned layout
    under canonical attribute names, regardless of whether the bake was
    served from cache or freshly compiled.
-2. **Byte-identity** — the pin-every-existing-dim wiring must NOT
-   change the layout returned by ``compile_full_vm_dynamic``; the B11
-   ``compare_compile_paths`` invariant must continue to report
-   ``n_diffs=0`` against the static ``compile_full_vm``.
-3. **Per-op declaration semantics** — a synthetic new op asking for
+2. **Per-op declaration semantics** — a synthetic new op asking for
    ``N`` units (no ``pin=``) lands in a free gap that doesn't overlap
    the existing FFN tail at that layer, so future per-op migrations
    can request allocations declaratively.
 
-The full-bake byte-identity check (#2) runs the static + dynamic
-compiles back-to-back; it's marked ``slow`` to mirror
-``tests/test_compile_dynamic_byte_identical.py``. The reachability and
-synthetic-op tests do not bake a real model — they call the layout
-helpers directly so they can stay in the fast suite.
+The reachability and synthetic-op tests do not bake a real model —
+they call the layout helpers directly so they can stay in the fast
+suite.
 """
 
 from __future__ import annotations
@@ -37,7 +32,6 @@ from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
     LAYOUT_FFN_UNIT_ALLOCATORS_ATTR,
     _attach_allocators_to_layout,
     _collect_ops_for_compile,
-    compare_compile_paths,
     compile_full_vm_dynamic,
 )
 from c4_release.neural_vm.unified_compiler.layer_compiler import (
@@ -306,30 +300,14 @@ def test_synthetic_head_pin_picks_free_head_in_layer():
 
 
 # ---------------------------------------------------------------------------
-# 3. Byte-identity (slow): compare_compile_paths must still report 0
+# 3. End-to-end allocator reachability after a full compile
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-def test_allocator_wiring_preserves_byte_identity():
-    """The full byte-identity invariant from B11 must hold after
-    attaching the three allocators. This is the canonical regression
-    gate — any change to the wiring that perturbs the layout would
-    show up as a non-zero ``n_diffs`` or a non-empty ``layout_diff``.
-    """
-    report = compare_compile_paths(
-        alu_mode="lookup",
-        disk_cache=False,
-    )
-    assert report["n_diffs"] == 0, (
-        f"dynamic vs static state_dict differs in {report['n_diffs']} "
-        f"tensors after allocator wiring; first 5: "
-        f"{report['diff_keys'][:5]}"
-    )
-    assert report["layout_diff"] == [], (
-        f"dynamic vs static ModelLayout differs after allocator wiring: "
-        f"{report['layout_diff']}"
-    )
+#
+# Phase 8.G.3 deleted ``test_allocator_wiring_preserves_byte_identity``
+# along with the static phase-pruning body it diffed against. The
+# layout-equivalence claim was provided by ``compare_compile_paths``,
+# which is gone; the reachability test below continues to gate the
+# allocator wiring end-to-end.
 
 
 @pytest.mark.slow

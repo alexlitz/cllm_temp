@@ -39,10 +39,13 @@ to the layout produced by ``compile_full_vm``. The mechanism is:
     ``dim_registry``, ``ir.py``, or any op factory. It only re-orders the
     ops fed into the unchanged compile pipeline.
 
-This invariant is enforced by ``compare_compile_paths()`` and by the
-``tests/test_compile_dynamic_byte_identical.py`` regression test. Any
-future change in the declared deps that would split the hybrid order
-away from the static order would fail those checks immediately.
+This invariant was historically enforced by ``compare_compile_paths()``
+and the matching slow byte-identity tests in
+``tests/test_compile_dynamic_byte_identical.py``. Both were removed in
+Phase 8.G.3 alongside the static phase-pruning body — the remaining
+fast scheduler invariants (topo-order, cycle-pruning) live in the same
+test module and continue to gate any change to the declared deps that
+would break the dep-pruned order.
 
 Migration path
 --------------
@@ -805,9 +808,10 @@ def compile_full_vm_dynamic(
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
     Signature mirrors ``compile_full_vm`` exactly (same args/kwargs, same
-    return type ``(model, layout)``). As of Phase 7 closing audit priority
-    5 this is the default implementation of ``compile_full_vm`` — that
-    entry point delegates here unless ``use_static_path=True`` is passed.
+    return type ``(model, layout)``). As of Phase 8.G.3 this is the only
+    implementation of ``compile_full_vm`` — that entry point is a thin
+    unconditional redirect here after the static phase-pruning body was
+    deleted.
 
     Internally:
 
@@ -826,10 +830,12 @@ def compile_full_vm_dynamic(
          ordering ambiguity is resolved identically to the static path.
 
     The caller receives ``(model, layout)`` exactly as from
-    ``compile_full_vm``. By construction the returned layout is byte-
-    identical to the static path's layout on today's op set; this is
-    asserted post-hoc by ``compare_compile_paths`` and by
-    ``tests/test_compile_dynamic_byte_identical.py``.
+    ``compile_full_vm`` (which is now a thin redirect to this function
+    after the Phase 8.G.3 static-body deletion). The historical
+    byte-identity gate (``compare_compile_paths``) was removed alongside
+    the static body; the surviving fast scheduler invariants in
+    ``tests/test_compile_dynamic_byte_identical.py`` continue to gate
+    dep-graph regressions.
 
     Args mirror ``compile_full_vm`` -- see that function's docstring for
     detailed semantics. The disk-cache key is namespaced by appending
@@ -933,18 +939,15 @@ def compile_full_vm_dynamic(
     # order with phase-pruning fallback) is the load-bearing "dynamic"
     # signal — it's how a strict dep-derived scheduler would lay these
     # ops out. We do NOT feed that re-ordered list into LayerCompiler:
-    # the static path's ``_topological_sort`` uses ``ops.index(o)`` for
-    # Kahn's stability and any reordering would feed a different
-    # stability key in. Instead the schedule is computed alongside, the
-    # static compile pipeline runs over the natural ``_collect_ops`` order
-    # exactly as ``compile_full_vm`` does, and ``compare_compile_paths``
-    # cross-checks that the dep-derived order is CONSISTENT with the
-    # static path's layer assignment (every op's dep-layer is <= its
-    # static layer). On a clean op set the two coincide; on today's set
-    # they coincide on every non-cycle op and the cycle members fall
-    # through to phase-only ordering, which the static path already
-    # respects. This decoupling is what makes B11 a byte-identical
-    # parallel path rather than a behavioural change.
+    # ``_topological_sort`` uses ``ops.index(o)`` for Kahn's stability
+    # and any reordering would feed a different stability key in.
+    # Instead the schedule is computed alongside, and the compile pipeline
+    # runs over the natural ``_collect_ops`` order. On today's op set the
+    # two coincide on every non-cycle op and the cycle members fall
+    # through to phase-only ordering. This decoupling is what made B11 a
+    # byte-identical parallel path rather than a behavioural change
+    # (Phase 8.G.3 cut the static fallback that gated this claim, leaving
+    # the dynamic path as the single bake entry point).
     _scheduled, _source = compute_dynamic_schedule(ops)
 
     # Build the model via the unchanged static pipeline with the natural
@@ -1245,137 +1248,3 @@ def _bake_from_scheduled_ops(
         _static._try_save_cached(cache_path, model, layout, kwargs_snapshot)
 
     return model, layout
-
-
-# ---------------------------------------------------------------------------
-# Validation: dynamic vs static byte-identity check
-# ---------------------------------------------------------------------------
-
-
-def compare_compile_paths(
-    *,
-    alu_mode: str = "lookup",
-    enable_conversational_io: bool = False,
-    enable_tool_calling: bool = False,
-    enable_neural_io_think_protocol: bool = False,
-    S: float = 100.0,
-    disk_cache: bool = False,
-) -> Dict[str, object]:
-    """Compile both paths and return a structured byte-identity report.
-
-    Returns a dict with keys:
-
-      * ``"n_diffs"``: total number of tensors that differ between
-        ``compile_full_vm`` and ``compile_full_vm_dynamic`` outputs. Zero
-        on the current op set.
-      * ``"diff_keys"``: up to 20 example ``state_dict`` keys that differ.
-      * ``"layout_diff"``: list of ``(field, static_value, dynamic_value)``
-        for any divergent ``ModelLayout`` field (``d_model``, ``n_layers``,
-        ``dim_positions``, ``dim_sizes``, ``ffn_widths``).
-      * ``"schedule"``: ``{"dep": N, "phase": M}`` — counts of ops the
-        hybrid scheduler placed via deps vs phase fallback.
-      * ``"phase_disagrees_with_dep_order"``: list of op names where the
-        dep-derived order differed from the strict phase order. Empty on
-        a clean Phase-A op set. A non-empty list would mean an op was
-        scheduled by deps to an earlier position than its phase requires,
-        signaling either a Phase A finding bug or an unannotated edge.
-
-    ``disk_cache`` defaults to False so this comparator never returns
-    stale cache hits — both paths must rebuild from source.
-    """
-    # Force the legacy phase-pruning path on the static side so we still
-    # exercise the byte-identity gate between the two implementations even
-    # after ``compile_full_vm`` was rerouted to the dynamic path by default
-    # (Phase 7 closing audit priority 5).
-    static_model, static_layout = _static.compile_full_vm(
-        S=S,
-        alu_mode=alu_mode,
-        enable_conversational_io=enable_conversational_io,
-        enable_tool_calling=enable_tool_calling,
-        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
-        disk_cache=disk_cache,
-        use_static_path=True,
-    )
-    dyn_model, dyn_layout = compile_full_vm_dynamic(
-        S=S,
-        alu_mode=alu_mode,
-        enable_conversational_io=enable_conversational_io,
-        enable_tool_calling=enable_tool_calling,
-        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
-        disk_cache=disk_cache,
-    )
-
-    import torch as _torch
-
-    sd_s = static_model.state_dict()
-    sd_d = dyn_model.state_dict()
-    diff_keys: List[str] = []
-    if set(sd_s.keys()) != set(sd_d.keys()):
-        diff_keys.append("__keys_differ__")
-    for k in sd_s.keys() & sd_d.keys():
-        if not _torch.equal(sd_s[k], sd_d[k]):
-            diff_keys.append(k)
-            if len(diff_keys) > 64:
-                break
-
-    layout_diff: List[Tuple[str, object, object]] = []
-    for field in ("d_model", "n_layers", "dim_positions", "dim_sizes", "ffn_widths"):
-        s_val = getattr(static_layout, field)
-        d_val = getattr(dyn_layout, field)
-        if s_val != d_val:
-            layout_diff.append((field, s_val, d_val))
-
-    # Also surface scheduler-internal stats for the report.
-    ops = _collect_ops_for_compile(
-        alu_mode=alu_mode,
-        enable_conversational_io=enable_conversational_io,
-        enable_tool_calling=enable_tool_calling,
-        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
-    )
-    _scheduled, source = compute_dynamic_schedule(ops)
-    schedule_counts: Dict[str, int] = {"dep": 0, "phase": 0}
-    for src in source.values():
-        schedule_counts[src] = schedule_counts.get(src, 0) + 1
-
-    # Cross-check: is the dep-derived order CONSISTENT with the static
-    # layer assignment? "Consistent" = every op appears in the dep order
-    # no later than its earliest valid topological position. We don't
-    # require literal order equality (Kahn's stability differs between
-    # phase tiebreaker and ops.index tiebreaker), but we require that
-    # the dep order is a valid topological sort of the phase-pruned
-    # DAG. The build-time test that ``compare_compile_paths`` returns
-    # zero state-dict diffs is the authoritative byte-identity check;
-    # this list surfaces any op whose dep-derived position falls AFTER
-    # an op that the static path would have placed later. A non-empty
-    # list would mean the dep-derived scheduler picked an order that
-    # the static path could not have picked — i.e. an unannotated
-    # back-edge or a Phase A finding bug. Empty list on today's op set.
-    by_dep, source_map = compute_dynamic_schedule(ops)
-    dep_position = {op.name: i for i, op in enumerate(by_dep)}
-    in_e, out_e, _ = _build_phase_pruned_graph(
-        ops, restrict_to_kinds={"attn", "ffn"},
-    )
-    disagreements: List[str] = []
-    for u in ops:
-        if u.kind not in ("attn", "ffn"):
-            continue
-        for v_name in out_e.get(u.name, set()):
-            if dep_position[u.name] >= dep_position[v_name]:
-                disagreements.append(
-                    f"{u.name} (dep_pos={dep_position[u.name]}) "
-                    f"-> {v_name} (dep_pos={dep_position[v_name]}) "
-                    "in phase-pruned DAG but dep order places "
-                    "predecessor AFTER successor"
-                )
-                if len(disagreements) >= 20:
-                    break
-        if len(disagreements) >= 20:
-            break
-
-    return {
-        "n_diffs": len(diff_keys),
-        "diff_keys": diff_keys[:20],
-        "layout_diff": layout_diff,
-        "schedule": schedule_counts,
-        "phase_disagrees_with_dep_order": disagreements,
-    }
