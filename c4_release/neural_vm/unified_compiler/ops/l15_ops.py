@@ -368,7 +368,6 @@ def make_nibble_copy_ffn_op() -> Operation:
 
     return Operation(
         name="nibble_copy_ffn",
-        phase=15,
         reads={"IS_BYTE", "H1", "H4", "MEM_STORE",
                "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
