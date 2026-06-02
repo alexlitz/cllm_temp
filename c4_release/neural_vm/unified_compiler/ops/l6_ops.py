@@ -2540,6 +2540,16 @@ def make_layer6_attn_op() -> Operation:
                "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1"},
         writes={"CMP", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
+        # Phase 8.G.6 holdout: ``layer_idx=6`` is retained because the
+        # dep graph naturally places this op at L6 only with the literal
+        # pin (no L6 attn dep anchor exists). Adding
+        # ``requires["same_layer_as"]: "_opcode_decode_ffn_dep_anchor"``
+        # (or ``"_layer6_ffn_dep_anchor"``) raises a placement-mismatch
+        # error: the constraint shifts the op's earliest-placeable layer
+        # to L7 (via topology) but then asserts L6, raising
+        # ``ValueError: ... placed at layer 7 but requires layer 6``.
+        # Dropping the literal needs an L6 attn dep anchor or a
+        # topological shift — both out of scope for the literal-drop wave.
         layer_idx=6,
         migrated=True,
         declarative_authority="topology_anchor",
@@ -2900,6 +2910,13 @@ def make_layer6_relay_heads_op() -> Operation:
                "OP_LEV", "CONST"},
         writes={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
+        # Phase 8.G.6 holdout: ``layer_idx=6`` is retained for the same
+        # reason as ``layer6_attn`` above — the dep graph's earliest
+        # landable layer for this op is L7, so adding
+        # ``requires["same_layer_as"]: "_opcode_decode_ffn_dep_anchor"``
+        # (or any L6-resident anchor) raises a placement-mismatch error
+        # ("placed at layer 7 but requires layer 6"). Needs an L6 attn
+        # dep anchor or topological shift — out of scope here.
         layer_idx=6,
         migrated=True,
         declarative_authority="topology_anchor",
@@ -3829,6 +3846,16 @@ def make_binary_pop_sp_increment_op() -> Operation:
         declarative_authority="spec_generated",
         phase=998,
         migrated=True,
+        # Phase 8.G.6 holdout: ``layer_idx=6`` is retained because this
+        # ``kind="model"`` op uses it to pre-size block[6]'s FFN width
+        # via ``ffn_units_used`` (see the ``layer_idx``/``ffn_units_used``
+        # docstrings in ``layer_compiler.py``). The bake itself also
+        # hardcodes ``model.blocks[6].ffn`` and calls
+        # ``_allocate_layer6_ffn_units()``, both L6-pinned.
+        # Routing through the dynamic-first-fit allocator (per the
+        # 8.G.6 follow-up sketch) is a larger refactor than the
+        # literal-drop wave covers — needs an L6-FFN target_op
+        # reference and a model-handle resolver.
         layer_idx=6,
         ffn_units_used=L6_BINARY_POP_SP_INCREMENT_END_UNIT,
         claims=_claims,
