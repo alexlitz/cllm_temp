@@ -722,7 +722,6 @@ def make_layer14_mem_generation_op() -> Operation:
 
     return Operation(
         name="layer14_mem_generation",
-        phase=14,
         # Phase 8.A: ADDR_B0_HI_PREV_STEP marks the read as cross-step
         # relative to L15 store_stack0_sp_byte0_addr (phase 15.2), which
         # writes ADDR_B0_HI after L14 in the same step. All other
