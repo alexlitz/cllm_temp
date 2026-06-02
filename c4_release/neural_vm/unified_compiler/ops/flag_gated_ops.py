@@ -170,7 +170,6 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
 
     return Operation(
         name="convo_io_opcode_decode",
-        phase=5.6,
         reads=set(),
         writes=set(),
         kind="block",
@@ -603,7 +602,6 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
 
     return Operation(
         name="convo_io_state_machine",
-        phase=6.6,
         reads=set(),
         writes=set(),
         kind="block",
@@ -755,7 +753,6 @@ def make_null_terminator_detection_op(
 
     return Operation(
         name="null_terminator_detection",
-        phase=10.6,
         reads={"OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI", "IO_IN_OUTPUT_MODE"},
         writes={"IO_OUTPUT_COMPLETE", "IO_IN_OUTPUT_MODE",
                 "NEXT_THINKING_START"},
@@ -826,7 +823,6 @@ def make_convo_io_step_resume_op(
 
     return Operation(
         name="convo_io_step_resume",
-        phase=3.2,
         reads=set(),
         writes=set(),
         kind="block",
@@ -939,7 +935,6 @@ def make_convo_io_pc_sp_latch_op(
 
     return Operation(
         name="convo_io_pc_sp_latch",
-        phase=6.7,
         reads=set(),
         writes=set(),
         kind="block",
@@ -1065,7 +1060,6 @@ def make_convo_io_prtf_capture_op(
 
     return Operation(
         name="convo_io_prtf_capture",
-        phase=7.6,
         reads=set(),
         writes=set(),
         kind="block",
@@ -1207,7 +1201,6 @@ def make_convo_io_prtf_transport_op(
 
     return Operation(
         name="convo_io_prtf_transport",
-        phase=4.6,
         reads=set(),
         writes=set(),
         kind="block",
@@ -1417,7 +1410,6 @@ def make_conversational_io_output_routing_op(
 
     return Operation(
         name="conversational_io_output_routing",
-        phase=15.1,
         reads={"IO_IN_OUTPUT_MODE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",

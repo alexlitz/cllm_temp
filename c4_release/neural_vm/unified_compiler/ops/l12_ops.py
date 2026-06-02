@@ -255,7 +255,6 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
 
     return Operation(
         name="layer12_mul_combine",
-        phase=12,
         # ``_set_layer12_mul_combine`` reads MARK_AX, TEMP[partial], ALU_HI[a_hi],
         # AX_CARRY_LO[b_lo], gates on OP_MUL, and writes ONLY to OUTPUT_HI (the
         # low byte's high nibble). It does NOT write OUTPUT_LO -- L10's MUL

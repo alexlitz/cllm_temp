@@ -848,7 +848,6 @@ def make_alu_divmod_composite_ops():
 
         return Operation(
             name="l10_alu_divmod_bdtoge",
-            phase=10.0,
             reads={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                    "OP_DIV", "OP_MOD"},
             writes=set(),
@@ -875,7 +874,6 @@ def make_alu_divmod_composite_ops():
 
         return Operation(
             name="l10_alu_divmod_longdiv",
-            phase=10.1,
             reads={"OP_DIV", "OP_MOD"},
             writes=set(),
             kind="block",
@@ -901,7 +899,6 @@ def make_alu_divmod_composite_ops():
 
         return Operation(
             name="l10_alu_divmod_getobd",
-            phase=10.2,
             reads={"OP_DIV", "OP_MOD", "MARK_AX"},
             writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
             kind="block",

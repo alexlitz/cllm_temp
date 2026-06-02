@@ -1144,7 +1144,6 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
 
     return Operation(
         name="layer9_alu",
-        phase=9,
         # Phase 8.A: CARRY_PREV_STEP marks the CARRY read as cross-step
         # relative to the L10 CARRY writers (layer10_carry_relay,
         # layer10_carry_relay_bake, l10_post_ops_combined) that fire AFTER
@@ -1305,7 +1304,6 @@ def make_layer9_lev_addr_relay_op() -> Operation:
 
     return Operation(
         name="layer9_lev_addr_relay",
-        phase=9.0,
         reads={"MARK_SP", "OP_LEV", "L1H1", "BYTE_INDEX_0",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
@@ -1377,7 +1375,6 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
 
     return Operation(
         name="layer9_lev_bp_to_pc_relay",
-        phase=9.1,
         reads={"MARK_PC", "OP_LEV", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "L1H1", "BYTE_INDEX_0"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
@@ -1518,7 +1515,6 @@ def make_format_string_fetch_head_op(enable_conversational_io: bool = False) -> 
 
     return Operation(
         name="format_string_fetch_head",
-        phase=9.5,
         # Phase 9.B (IO_IN_OUTPUT_MODE SCC rename): IO_IN_OUTPUT_MODE ->
         # IO_IN_OUTPUT_MODE.*.-1 marks the read as SSA cross-step.
         # null_terminator_detection (phase 10.6) stages the value for the

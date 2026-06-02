@@ -447,7 +447,6 @@ def make_layer4_ffn_op() -> Operation:
 
     return Operation(
         name="layer4_ffn",
-        phase=4,
         reads={"MARK_AX", "MARK_PC", "EMBED_LO", "EMBED_HI",
                "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "H1"},

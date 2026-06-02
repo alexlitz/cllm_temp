@@ -323,7 +323,6 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
 
     return Operation(
         name="layer11_mul_partial",
-        phase=11,
         # ``_set_layer11_mul_partial`` reads ALU_LO[a_lo], AX_CARRY_LO[b_lo],
         # AX_CARRY_HI[b_hi], MARK_AX, gates on OP_MUL, writes TEMP[partial].
         # It does NOT read ALU_HI -- that's L12's job (``a_hi`` lookup).

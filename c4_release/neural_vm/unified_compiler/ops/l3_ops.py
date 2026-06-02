@@ -1532,7 +1532,6 @@ def make_layer3_convo_io_state_init_op(
 
     return Operation(
         name="layer3_convo_io_state_init",
-        phase=3.1,
         # Reads/writes use LAST_WAS_THINKING_END and IO_IN_OUTPUT_MODE,
         # which are not declared in declare_setdim_compat_dims
         # (conversational-I/O-only dims); the bake resolves them via the

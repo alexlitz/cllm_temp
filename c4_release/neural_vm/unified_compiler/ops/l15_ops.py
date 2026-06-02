@@ -663,7 +663,6 @@ def make_layer15_store_stack0_sp_byte0_addr_op() -> Operation:
 
     return Operation(
         name="layer15_store_stack0_sp_byte0_addr",
-        phase=15.2,
         # Phase 8.A G7: OUTPUT_HI_THIS_STEP read renamed to
         # OUTPUT_HI_PREV_STEP. Head 12 attends back to the post-pop
         # STACK0 / SP-marker token whose cached OUTPUT_HI residual
@@ -812,7 +811,6 @@ def make_layer15_si_mem_addr0_from_stack0_op() -> Operation:
 
     return Operation(
         name="layer15_si_mem_addr0_from_stack0",
-        phase=15.25,
         reads={
             "MARK_MEM", "MEM_STORE", "MEM_ADDR_SRC", "STACK0_BYTE0",
             "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST",
@@ -1577,7 +1575,6 @@ def make_layer15_nibble_copy_op() -> Operation:
 
     return Operation(
         name="layer15_nibble_copy",
-        phase=15,
         reads={"IS_BYTE", "H1", "H4", "MEM_STORE",
                "EMBED_LO", "EMBED_HI", "PSH_AT_SP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
@@ -1711,7 +1708,6 @@ def make_l15_attention_resize_op() -> Operation:
         writes=set(),
         kind="block",
         declarative_bake_fn=bake,
-        phase=14.9,
         # Phase 8.A.4: dropped ``layer_idx=15`` pin in favour of
         # ``target_op_name``. Binds to whichever layer the compiler
         # placed ``layer15_memory_lookup`` (the L15 attn op).

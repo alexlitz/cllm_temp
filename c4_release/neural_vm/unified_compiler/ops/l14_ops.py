@@ -898,7 +898,6 @@ def make_layer14_alu_high_byte_relay_op() -> Operation:
 
     return Operation(
         name="layer15_alu_high_byte_relay",
-        phase=15.05,
         reads={"IS_BYTE", "H1", "H3", "H4", "BYTE_INDEX_0", "MARK_AX",
                "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "STACK0_BYTE0", "OP_MUL",
@@ -1371,7 +1370,6 @@ def make_layer14_temp_clear_op() -> Operation:
 
     return Operation(
         name="layer14_temp_clear",
-        phase=14.1,
         reads={"OP_LEV", "MARK_PC", "TEMP", "IS_BYTE", "H1",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "MARK_AX", "AX_CARRY_HI", "CONST"},
@@ -1478,7 +1476,6 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
 
     return Operation(
         name="layer14_clear_addr_key_pollution",
-        phase=14.2,
         reads={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "MARK_PC", "MARK_BP", "MARK_AX", "MARK_STACK0", "MARK_SP",
                "CONST"},
@@ -1679,7 +1676,6 @@ def make_layer14_clear_output_corruption_op() -> Operation:
 
     return Operation(
         name="layer14_clear_output_corruption",
-        phase=14.3,
         reads={"H4", "H1", "H3", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "OP_JSR", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "IS_BYTE", "BYTE_INDEX_3", "PSH_AT_SP", "CMP",
@@ -1810,7 +1806,6 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
 
     return Operation(
         name="layer14_clear_mem_marker_output",
-        phase=14.4,
         reads={"OP_JSR", "OP_ENT", "MARK_MEM", "IS_BYTE",
                "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
                "CONST"},
@@ -1962,7 +1957,6 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
 
     return Operation(
         name="layer14_jsr_ax_bytes_zero",
-        phase=14.6,
         reads={"OP_JSR", "IS_BYTE", "H1", "CONST", "STACK0_BYTE0", "STACK0_BYTE1",
                "STACK0_BYTE2", "STACK0_BYTE3"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
@@ -2107,7 +2101,6 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
 
     return Operation(
         name="layer14_alu_nocarry_ax_bytes_zero",
-        phase=14.8,
         reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
@@ -2257,7 +2250,6 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
     # tuples go here.
     return Operation(
         name="layer14_demo_phase6_wave7",
-        phase=14.95,
         reads={"CONST"},
         # Phase 9.B (TEMP SCC fix): drop dead TEMP write. The demo bake
         # emits a zero-weight rule that does not touch any W_down cell
@@ -2420,7 +2412,6 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
 
     return Operation(
         name="layer14_lc_ax_bytes_zero",
-        phase=14.7,
         reads={"OP_LC_RELAY", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
@@ -3034,7 +3025,6 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
 
     return Operation(
         name="layer14_addr_key_neural_decode",
-        phase=14.5,
         # Phase 8.A: matches layer14_mem_generation's ADDR_B0_HI_PREV_STEP
         # rename — same back-edge against L15 store_stack0_sp_byte0_addr,
         # same numeric position (slot 206), no functional change.

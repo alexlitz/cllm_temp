@@ -248,7 +248,6 @@ def make_lev_detector_head_op(enable: bool = False) -> Operation:
         # the L8 multibyte / OP_IMM relay heads -- and any future L9
         # alu consumer reading ``PC_VIA_LEV_DETECTOR_LO`` -- to see it
         # in the residual.
-        phase=8.06,
         # Cross-step reads via the attention back-edge: TEMP_PREV_STEP /
         # ADDR_B0_LO_PREV_STEP / ADDR_B0_HI_PREV_STEP carry the
         # prev-step row's saved-PC / saved-BP staging through the KV

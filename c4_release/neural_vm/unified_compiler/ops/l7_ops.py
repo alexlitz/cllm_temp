@@ -164,7 +164,6 @@ def make_layer7_operand_gather_op() -> Operation:
 
     return Operation(
         name="layer7_operand_gather",
-        phase=7,
         # Phase 8.A targeted: head 1's V slots read BP/SP OUTPUT_LO via
         # attention back to the prev-step BP/SP marker row (LEA/ADJ/ENT
         # operand A relay). L7 fires before any same-step OUTPUT_LO
@@ -349,7 +348,6 @@ def make_layer7_memory_heads_op() -> Operation:
 
     return Operation(
         name="layer7_memory_heads",
-        phase=7,
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L11/L14 TEMP writers (which fire after L7 in the same
         # step). The same-step values written by L3 carry_forward / L5
@@ -611,7 +609,6 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
 
     return Operation(
         name="format_pointer_extraction",
-        phase=7.5,
         # Phase 9.B (IO_IN_OUTPUT_MODE SCC rename): SSA cross-step form.
         # null_terminator_detection (phase 10.6) stages the value for the
         # NEXT step. Same numeric slot via alias; byte-identical bake.
@@ -743,7 +740,6 @@ def make_layer7_sp_byte0_is_f8_op() -> Operation:
 
     return Operation(
         name="layer7_sp_byte0_is_f8",
-        phase=7.6,
         reads={"MARK_SP", "EMBED_LO", "EMBED_HI"},
         writes={"SP_BYTE0_IS_F8"},
         kind="block",

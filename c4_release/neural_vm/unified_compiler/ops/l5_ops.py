@@ -151,7 +151,6 @@ def make_layer5_fetch_op() -> Operation:
 
     return Operation(
         name="layer5_fetch",
-        phase=5,
         # Reads: PC/AX markers + FETCH addr (PC+K) + ADDR_KEY (per CODE byte) +
         #        CLEAN_EMBED (the value at the matched CODE byte).
         # Note: heads 6/7 also read OP_* via V projection but that's the DEPRECATED
@@ -519,7 +518,6 @@ def make_opcode_decode_ffn_op() -> Operation:
 
     return Operation(
         name="opcode_decode_ffn",
-        phase=5,
         # Phase 8.A SCC step 6: read OPCODE_BYTE_LO via the
         # ``OPCODE_BYTE_LO_PREV_STEP`` alias (same numeric base, see
         # shared.py ``_ALIAS_OF``) so the dynamic scheduler sees this

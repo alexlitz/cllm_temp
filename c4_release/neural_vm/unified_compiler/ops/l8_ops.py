@@ -1146,7 +1146,6 @@ def make_layer8_alu_op() -> Operation:
 
     return Operation(
         name="layer8_alu",
-        phase=8.2,
         # Phase 9.B (ALU_LO SCC rename): ALU_LO -> ALU_LO.*.-1 marks the
         # read as SSA cross-step. L10 stack0_byte_relay{,_bake} (phase 10/10.4)
         # and L16 lev_routing (phase 16) stage ALU_LO for the NEXT step's
@@ -1405,7 +1404,6 @@ def make_layer8_multibyte_fetch_bake_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_fetch_bake",
-        phase=8.1,
         reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1", "HAS_SE",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST", "MARK_AX"},
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
@@ -1527,7 +1525,6 @@ def make_layer8_multibyte_routing_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_routing",
-        phase=8.3,
         reads={"IS_BYTE", "H1", "OP_IMM", "MARK_AX",
                "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
@@ -1697,7 +1694,6 @@ def make_layer8_sp_gather_bake_op() -> Operation:
 
     return Operation(
         name="layer8_sp_gather_bake",
-        phase=8.0,
         # Phase 8.A targeted: cross-step CMP+3 read (STACK0-suppression
         # gate on the SP-gather Q rows) declared as CMP_PREV_STEP. L9
         # ALU writes CMP in the same step but AFTER L8; the gate
@@ -1959,7 +1955,6 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         # AX_CARRY_LO/HI fires. The exact phase number is not load-bearing
         # for the staleness analyzer (it only checks producer.phase <=
         # consumer.phase); 8.05 keeps the L8 attn bakes contiguous.
-        phase=8.05,
         # Phase 7.A.3.b: OUTPUT_LO read is cross-step (the V slots pull
         # the prev step's AX marker residual via attention back-edge).
         # Phase 8.A G7: OUTPUT_HI_THIS_STEP read renamed to
@@ -2428,7 +2423,6 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         # Phase 8.45 places this after layer8_op_imm_relay (8.4) and BEFORE
         # the L8 alu_postop_attach (8.5), keeping all L8 attn bakes in
         # phase order.
-        phase=8.45,
         # Phase 8.A: ADDR_B0_HI_PREV_STEP marks the read as cross-step
         # relative to L9 lev_addr_relay / L9 lev_bp_to_pc_relay / L15
         # store_stack0_sp_byte0_addr which fire after L8 in the same step.
@@ -2599,7 +2593,6 @@ def make_layer8_sp_gathered_sentinel_op() -> Operation:
 
     return Operation(
         name="layer8_sp_gathered_sentinel",
-        phase=8.6,
         reads={"MARK_SP"},
         writes={"SP_GATHERED_THIS_STEP"},
         kind="block",

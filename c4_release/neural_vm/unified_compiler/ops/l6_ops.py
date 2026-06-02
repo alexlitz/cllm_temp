@@ -2621,7 +2621,6 @@ def make_layer6_routing_ffn_op() -> Operation:
 
     return Operation(
         name="layer6_routing_ffn",
-        phase=6.5,
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L7/L11/L14 TEMP writers (which fire after L6 in the
         # same step). The same-step values from L3 carry_forward / L5
@@ -2874,7 +2873,6 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
 
     return Operation(
         name="layer6_ent_after_jsr_sp_byte0_fixup",
-        phase=6.55,
         reads={"OP_ENT", "MARK_SP", "HAS_SE", "EMBED_LO", "EMBED_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
@@ -4051,7 +4049,6 @@ def make_putchar_think_protocol_op(
 
     return Operation(
         name="putchar_think_protocol",
-        phase=6.6,
         # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the read as
         # cross-step relative to L8 AX_CARRY_HI writers (this op fires at
         # L6 phase 6.6, before any L8 AX_CARRY producer). Stub bake; the
@@ -4153,7 +4150,6 @@ def make_prtf_think_protocol_op(
 
     return Operation(
         name="prtf_think_protocol",
-        phase=6.6,
         reads=set(),
         writes=set(),
         kind="block",
@@ -4232,7 +4228,6 @@ def make_open_clos_tool_call_op(
 
     return Operation(
         name="open_clos_tool_call",
-        phase=6.7,
         reads=set(),
         writes=set(),
         kind="block",

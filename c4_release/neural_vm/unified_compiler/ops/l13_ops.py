@@ -494,7 +494,6 @@ def make_layer13_mem_addr_gather_op() -> Operation:
 
     return Operation(
         name="layer13_mem_addr_gather",
-        phase=13,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC", "OP_SI", "OP_SC",
                "MEM_ADDR_SRC", "L1H1"},
@@ -598,7 +597,6 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
 
     return Operation(
         name="layer13_shifts",
-        phase=13,
         reads={"MARK_AX", "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                "OP_SHL", "OP_SHR",
                # V2/G7 LEV detector: in-step topology edge replacing the

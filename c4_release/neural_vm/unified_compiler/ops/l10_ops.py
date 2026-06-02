@@ -2087,7 +2087,6 @@ def make_layer10_carry_relay_bake_op() -> Operation:
 
     return Operation(
         name="layer10_carry_relay_bake",
-        phase=10.0,
         # Phase 9.B (SCC #2 dissolution): CARRY -> CARRY.*.-1 marks the
         # read as SSA cross-step relative to the same-step L10 CARRY
         # writer ``l10_post_ops_combined`` (phase=10.5). This bake op
@@ -2170,7 +2169,6 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
 
     return Operation(
         name="layer10_byte_passthrough_bake",
-        phase=10.1,
         # Phase 8.A.6 v2: matches layer10_byte_passthrough's TEMP_PREV_STEP
         # rename. See that op for rationale.
         reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "OP_LC_RELAY",
@@ -2235,7 +2233,6 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
 
     return Operation(
         name="layer10_sp_byte_passthrough_bake",
-        phase=10.2,
         reads={"IS_BYTE", "HAS_SE", "H1", "PSH_AT_SP", "CMP",
                "OP_ENT", "OP_JSR",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
@@ -2293,7 +2290,6 @@ def make_layer10_bp_byte_passthrough_bake_op() -> Operation:
 
     return Operation(
         name="layer10_bp_byte_passthrough_bake",
-        phase=10.25,
         reads={"IS_BYTE", "HAS_SE", "H1", "OP_ENT", "OP_LEV",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -2363,7 +2359,6 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
 
     return Operation(
         name="layer10_psh_stack0_passthrough_bake",
-        phase=10.3,
         reads={"MARK_STACK0", "IS_BYTE", "PSH_AT_SP", "H1", "H4",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
@@ -2450,7 +2445,6 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
 
     return Operation(
         name="layer10_stack0_byte_relay_bake",
-        phase=10.4,
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L11/L14 TEMP writers (which fire after L10 in the
         # same step). Same numeric position as TEMP. See
@@ -2538,7 +2532,6 @@ def make_layer10_alu_op() -> Operation:
 
     return Operation(
         name="layer10_alu",
-        phase=10.2,
         # Phase 9.B (ALU_HI SCC rename): ALU_HI -> ALU_HI.*.-1 marks the
         # read as SSA cross-step. L10 stack0_byte_relay_bake (phase 10.4)
         # writes ALU_HI for the NEXT step's L9/L10 consumption; same-step
@@ -6620,7 +6613,6 @@ def make_tail_bit32_result_correction_op() -> Operation:
 
     return Operation(
         name="tail_bit32_result_correction",
-        phase=17.1,
         reads={
             "CONST", "IS_BYTE", "HAS_SE", "H1", "H3",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
