@@ -6802,6 +6802,7 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         # binds this block op to the layer of ``layer10_carry_relay``
         # (kind="attn", L10 anchor).
         target_op_name="layer10_carry_relay",
+        requires={"after": "layer10_carry_relay"},
         migrated=True,
         declarative_authority="structural_model",
         smoke_tests={"all"},

@@ -459,6 +459,7 @@ def make_layer0_threshold_attn_op() -> Operation:
         # dep anchor so the block op resolves to whichever layer the
         # compiler places the anchor at.
         target_op_name="_layer0_threshold_attn_dep_anchor",
+        requires={"after": "_layer0_threshold_attn_dep_anchor"},
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer0_threshold_attn_ir,
         declarative_authority="spec_generated",

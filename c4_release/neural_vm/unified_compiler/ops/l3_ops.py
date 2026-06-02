@@ -752,6 +752,7 @@ def make_layer3_ffn_op() -> Operation:
         # anchor ``layer3_carry_forward_attn`` so the block op resolves
         # to whichever layer the carry-forward attn lands at.
         target_op_name="layer3_carry_forward_attn",
+        requires={"after": "layer3_carry_forward_attn"},
         declarative_bake_fn=bake,
         compiler_ir=_layer3_ffn_ir(),
         declarative_authority="spec_generated",

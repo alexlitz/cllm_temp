@@ -1259,6 +1259,7 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         # anchor ``layer10_byte_passthrough`` so the block op resolves
         # to whichever layer the compiler places the anchor at.
         target_op_name="layer10_byte_passthrough",
+        requires={"after": "layer8_alu"},
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -2066,6 +2067,7 @@ def make_layer8_op_imm_relay_op() -> Operation:
         # anchor ``layer10_byte_passthrough`` so the block op resolves
         # to whichever layer the compiler places the anchor at.
         target_op_name="layer10_byte_passthrough",
+        requires={"after": "layer8_alu"},
         phase=8.4,
         migrated=True,
         claims=_claims,

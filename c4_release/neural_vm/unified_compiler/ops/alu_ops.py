@@ -390,6 +390,7 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         # attn anchor ``layer10_carry_relay`` so the block op resolves
         # to whichever layer the compiler places the anchor at.
         target_op_name="layer10_carry_relay",
+        requires={"after": "l10_alu_divmod_install"},
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
@@ -443,6 +444,7 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
         target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "l11_alu_mul_bdtoge"},
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#binary-ALU",
@@ -512,6 +514,7 @@ def make_l11_alu_mul_bdtoge_op() -> Operation:
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
         target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "_layer11_ffn_dep_anchor"},
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -544,6 +547,7 @@ def make_l11_alu_mul_schoolbook_op() -> Operation:
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
         target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "l11_alu_mul_bdtoge"},
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -576,6 +580,7 @@ def make_l11_alu_mul_carrypass1_op() -> Operation:
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
         target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "l11_alu_mul_schoolbook"},
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -609,6 +614,7 @@ def make_l11_alu_mul_carrypass2_op() -> Operation:
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
         target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "l11_alu_mul_carrypass1"},
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -643,6 +649,7 @@ def make_l11_alu_mul_carrypass3_op() -> Operation:
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
         target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "l11_alu_mul_carrypass2"},
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -676,6 +683,7 @@ def make_l12_alu_mul_genprop_op() -> Operation:
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
         target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "l11_alu_mul_carrypass3"},
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -709,6 +717,7 @@ def make_l12_alu_mul_binarylookahead_op() -> Operation:
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
         target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "l12_alu_mul_genprop"},
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
@@ -741,6 +750,7 @@ def make_l12_alu_mul_finalcorrection_op() -> Operation:
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
         target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "l12_alu_mul_binarylookahead"},
         migrated=True,
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",

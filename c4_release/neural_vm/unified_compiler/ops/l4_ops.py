@@ -225,6 +225,7 @@ def make_layer4_pc_relay_op() -> Operation:
         # dep anchor so the block op resolves to whichever layer the
         # compiler places the anchor at.
         target_op_name="_layer4_ffn_dep_anchor",
+        requires={"after": "_layer4_ffn_dep_anchor"},
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
