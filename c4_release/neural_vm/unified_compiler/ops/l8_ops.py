@@ -551,6 +551,35 @@ def _layer8_alu_adj_carry_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
+    """SUB borrow detection (120 units, offsets 1384..1503).
+
+    Borrow occurs when ALU_LO[a] < AX_CARRY_LO[b] (stack_top < AX in
+    this nibble). Mirrors SUB lo structure with gate=OP_SUB.
+    """
+    carry_scale = 2.0 / (S * 5.0)
+    rules = []
+    for a in range(16):
+        for b in range(16):
+            if a >= b:
+                continue
+            rules.append(FFNRule.gated_write(
+                name=f"l8_alu_sub_borrow_a{a}_b{b}",
+                conditions=(
+                    ("MARK_AX", 1.0),
+                    ("MARK_PC", -4.0),
+                    (f"ALU_LO+{a}", 1.0),
+                    (f"AX_CARRY_LO+{b}", 1.0),
+                ),
+                threshold=2.5,
+                gate="OP_SUB",
+                writes=(("CARRY+0", carry_scale),),
+                scope="MARK_AX and OP_SUB",
+                dominates_at={"CARRY+0": "MARK_AX and OP_SUB"},
+            ))
+    return tuple(rules)
+
+
 def make_layer8_alu_op() -> Operation:
     """L8 FFN: ADD/SUB lo nibble + carry/borrow + LEA + CMP_GROUP.
 
