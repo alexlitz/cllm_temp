@@ -2,7 +2,7 @@
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR
+from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -112,6 +112,90 @@ def _allocate_layer2_ffn_units() -> FFNUnitAllocator:
     return allocator
 
 
+# === L2 FFN rule families ===========================================
+#
+# ``layer2_mem_byte_flags`` (units 0..7) and ``layer2_initial_pc_bake_cancel``
+# (units 8..9) are now expressed as ``FFNRule`` lists so the verifier and
+# symbolic execution see the same declarations the lowering uses. The bake
+# paths still drive ``Primitives.lower_ffn_rules`` with the same pinned
+# ``start_unit`` offsets owned by ``_L2_FFN_UNIT_LAYOUT`` so the underlying
+# weight cells land byte-identically.
+#
+# Phase 6 wave 3C migration.
+
+_L2_MEM_FLAGS_TRANSITIONS = (
+    # (src_dim_name_with_offset, blocker_dim_name_with_offset,
+    #  out_dim_names_with_offset_tuple)
+    ("H1+4",   "H0+4",   ("MEM_VAL_B0",)),
+    ("L2H0+4", "H1+4",   ("MEM_VAL_B1",)),
+    ("L1H4+4", "L2H0+4", ("MEM_VAL_B2",)),
+    ("H2+4",   "L1H4+4", ("MEM_VAL_B3",)),
+    ("L1H4+3", "H1+3",   ("BYTE_INDEX_0",)),
+    ("H2+3",   "L1H4+3", ("BYTE_INDEX_1", "STACK0_BYTE1")),
+    ("H3+3",   "H2+3",   ("BYTE_INDEX_2", "STACK0_BYTE2")),
+    ("H4+3",   "H3+3",   ("BYTE_INDEX_3", "STACK0_BYTE3")),
+)
+
+
+def _layer2_mem_byte_flags_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule list mirroring ``_bake_layer2_mem_byte_flags``.
+
+    Each unit fires when ``src_dim + IS_BYTE >= 1.5`` (i.e. the byte slot
+    that immediately follows the marker, identified by the H-threshold
+    pair) and the blocker ``H``-output is OFF (so only the boundary slot
+    is selected, not every byte slot in the run). The gate computes
+    ``1.0 - blocker``, so ``hidden = silu(S/2) * (1.0 - blocker) ~= S/2``
+    at the boundary and ``0`` deeper into the run.
+    """
+    write_scale = 2.0 / S
+    rules = []
+    for idx, (src_dim, blocker_dim, out_dims) in enumerate(
+        _L2_MEM_FLAGS_TRANSITIONS
+    ):
+        rules.append(FFNRule.gated_write(
+            name=f"layer2_mem_byte_flags_{idx}_{out_dims[0].lower()}",
+            conditions=(
+                (src_dim, 1.0),
+                ("IS_BYTE", 1.0),
+            ),
+            threshold=1.5,
+            gate=None,
+            gate_terms=((blocker_dim, -1.0),),
+            gate_bias=1.0,
+            writes=tuple((out_dim, write_scale) for out_dim in out_dims),
+        ))
+    return tuple(rules)
+
+
+def _layer2_mem_byte_flags_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer2_mem_byte_flags_rules(S))
+    return ir
+
+
+def _bake_layer2_mem_byte_flags(ffn, S, BD, start_unit=0):
+    """Thin compatibility shim around :func:`_layer2_mem_byte_flags_rules`.
+
+    Lowers the FFNRule list through ``Primitives.lower_ffn_rules`` at
+    ``start_unit``. Kept as the public entry point for parity tests in
+    ``tests/test_declarative_ffn_bakes_l1_l5.py`` and any other consumer
+    that drives the L2 mem-byte-flags bake directly.
+
+    ``start_unit`` is the pinned hidden-unit base supplied by the
+    :class:`FFNUnitAllocator`. Callers pass ``start_unit=0`` today (the
+    pinned offset for ``layer2_mem_byte_flags.flags``); the parameter
+    exists so the helper does not bake in an implicit ``0`` -- the
+    layout is owned by ``_L2_FFN_UNIT_LAYOUT``.
+    """
+    rules = _layer2_mem_byte_flags_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD, Primitives.ffn_rule_dim_names(rules)
+    )
+    return Primitives.lower_ffn_rules(
+        ffn, rules, dim_positions, start_unit=start_unit, S=S,
+    )
+
+
 def make_layer2_mem_byte_flags_op() -> Operation:
     """L2 FFN: MEM val byte position flags + extended BYTE_INDEX for STACK0.
 
@@ -121,6 +205,12 @@ def make_layer2_mem_byte_flags_op() -> Operation:
     layout. The legacy ``ffn._l2_unit_counter`` cross-op handoff is gone
     -- the cancel op now resolves its own start from
     ``_L2_FFN_UNIT_LAYOUT``, not from a mutated FFN attribute.
+
+    Phase 6 wave 3C: the per-unit weight writes are now driven by an
+    ``FFNRule`` list (``_layer2_mem_byte_flags_rules``) lowered through
+    ``Primitives.lower_ffn_rules``. The IR is also exposed via
+    ``compiler_ir`` so the declarative verifier and
+    ``compare_symbolic_to_lowered_ffn`` see the same declarations.
     """
     def bake(ffn, dim_positions, S):
         # Per-bake FFN-unit allocator. Pin every existing L2 range so the
@@ -132,13 +222,22 @@ def make_layer2_mem_byte_flags_op() -> Operation:
             if r.op_name == "layer2_mem_byte_flags.flags"
         )
         ffn._l2_unit_allocator = allocator
-        _bake_layer2_mem_byte_flags(
-            ffn, S, _as_setdim_proxy(dim_positions), flags_range.start,
+        rules = _layer2_mem_byte_flags_rules(S)
+        named_positions = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(
+            ffn,
+            rules,
+            named_positions,
+            start_unit=flags_range.start,
+            S=S,
         )
 
-    # Dim-ownership claims: ``_set_layer2_mem_byte_flags`` writes units 0..7
-    # (see setup_helpers.py:_set_layer2_mem_byte_flags). Each unit writes a
-    # unique W_down output dim:
+    # Dim-ownership claims: ``_layer2_mem_byte_flags_rules`` writes units 0..7
+    # (one per transition in ``_L2_MEM_FLAGS_TRANSITIONS``). Each unit writes
+    # a unique W_down output dim:
     #   unit 0: MEM_VAL_B0
     #   unit 1: MEM_VAL_B1
     #   unit 2: MEM_VAL_B2
@@ -173,53 +272,62 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         layer_idx=2,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer2_mem_byte_flags_ir(),
+        declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
-        # ``_set_layer2_mem_byte_flags`` writes 8 units (4 MEM_VAL_B* +
-        # 4 BYTE_INDEX_*) pinned at offset 0 via ``_L2_FFN_UNIT_LAYOUT``.
-        # The cancel op below resolves its own start (unit 8) from the
-        # same shared layout.
+        # ``_layer2_mem_byte_flags_rules`` produces 8 hidden units (4
+        # MEM_VAL_B* + 4 BYTE_INDEX_*) pinned at offset 0 via
+        # ``_L2_FFN_UNIT_LAYOUT``. The cancel op below resolves its own
+        # start (unit 8) from the same shared layout.
         ffn_units_used=8,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
 
 
-def _bake_layer2_mem_byte_flags(ffn, S, BD, start_unit=0):
-    """Declarative L2 FFN spec: MEM value-byte and STACK0 byte-index flags.
+def _layer2_initial_pc_bake_cancel_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule list mirroring the legacy two-unit initial-PC cancel.
 
-    ``start_unit`` is the pinned hidden-unit base supplied by the
-    :class:`FFNUnitAllocator`. Callers pass ``start_unit=0`` today (the
-    pinned offset for ``layer2_mem_byte_flags.flags``); the parameter
-    exists so the helper does not bake in an implicit ``0`` -- the
-    layout is owned by ``_L2_FFN_UNIT_LAYOUT``.
+    Each unit fires when ``HAS_SE >= 0.5`` (i.e. step >= 1, since HAS_SE
+    is 0 at the first step and 1 afterwards) and is gated by MARK_PC so
+    only PC-marker rows write. The W_down strength ``-2.0 / S`` cancels
+    the +1.0 EMBED bake from ``make_initial_pc_bake_op``.
+
+    The output offsets are derived from runtime ``PC_OFFSET`` so the
+    cancel slots match the token-embedding bake exactly.
     """
+    from ...constants import PC_OFFSET
+    init_pc_lo = PC_OFFSET & 0xF
+    init_pc_hi = (PC_OFFSET >> 4) & 0xF
+    write_scale = -2.0 / S
 
-    MEM_I = 4
-    BP_I = 3
-    unit = start_unit
+    return (
+        FFNRule.gated_write(
+            name="layer2_initial_pc_bake_cancel_lo",
+            conditions=(("HAS_SE", 1.0),),
+            threshold=0.5,
+            gate="MARK_PC",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"EMBED_LO+{init_pc_lo}", write_scale),),
+        ),
+        FFNRule.gated_write(
+            name="layer2_initial_pc_bake_cancel_hi",
+            conditions=(("HAS_SE", 1.0),),
+            threshold=0.5,
+            gate="MARK_PC",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=((f"EMBED_HI+{init_pc_hi}", write_scale),),
+        ),
+    )
 
-    for src_dim, blocker_dim, out_dim in (
-        (BD.H1 + MEM_I, BD.H0 + MEM_I, BD.MEM_VAL_B0),
-        (BD.L2H0 + MEM_I, BD.H1 + MEM_I, BD.MEM_VAL_B1),
-        (BD.L1H4 + MEM_I, BD.L2H0 + MEM_I, BD.MEM_VAL_B2),
-        (BD.H2 + MEM_I, BD.L1H4 + MEM_I, BD.MEM_VAL_B3),
-        (BD.L1H4 + BP_I, BD.H1 + BP_I, BD.BYTE_INDEX_0),
-        (BD.H2 + BP_I, BD.L1H4 + BP_I, (BD.BYTE_INDEX_1, BD.STACK0_BYTE1)),
-        (BD.H3 + BP_I, BD.H2 + BP_I, (BD.BYTE_INDEX_2, BD.STACK0_BYTE2)),
-        (BD.H4 + BP_I, BD.H3 + BP_I, (BD.BYTE_INDEX_3, BD.STACK0_BYTE3)),
-    ):
-        ffn.W_up.data[unit, src_dim] = S
-        ffn.W_up.data[unit, BD.IS_BYTE] = S
-        ffn.b_up.data[unit] = -S * 1.5
-        ffn.W_gate.data[unit, blocker_dim] = -1.0
-        ffn.b_gate.data[unit] = 1.0
-        if isinstance(out_dim, tuple):
-            for dim in out_dim:
-                ffn.W_down.data[dim, unit] = 2.0 / S
-        else:
-            ffn.W_down.data[out_dim, unit] = 2.0 / S
-        unit += 1
+
+def _layer2_initial_pc_bake_cancel_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer2_initial_pc_bake_cancel_rules(S))
+    return ir
 
 
 def make_layer2_initial_pc_bake_cancel_op() -> Operation:
@@ -259,16 +367,15 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
     indices (8 and 9) are now resolved through the shared
     :class:`FFNUnitAllocator` layout in ``_L2_FFN_UNIT_LAYOUT`` rather
     than via the historical ``ffn._l2_unit_counter`` handoff.
+
+    Phase 6 wave 3C: the two cancel units are now expressed as
+    ``FFNRule.gated_write`` declarations (see
+    ``_layer2_initial_pc_bake_cancel_rules``). The bake lowers the rules
+    through ``Primitives.lower_ffn_rules`` at the pinned start unit,
+    and the ``compiler_ir`` attribute exposes the same declarations to
+    ``compare_symbolic_to_lowered_ffn``.
     """
     def bake(block, dim_positions, S):
-        from ...constants import PC_OFFSET
-
-        def D(name):
-            if dim_positions is not None and name in dim_positions:
-                return dim_positions[name]
-            from ...vm_step import _SetDim
-            return getattr(_SetDim, name)
-
         ffn = block.ffn
         # Per-bake allocator with the full L2 FFN layout pinned. Looking
         # up the cancel-op ranges by name keeps the start unit identical
@@ -284,31 +391,23 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
             r for r in allocator.ranges()
             if r.op_name == "layer2_initial_pc_bake_cancel.hi"
         )
-        lo_unit = lo_range.start
-        hi_unit = hi_range.start
+        assert hi_range.start == lo_range.start + 1, (
+            "L2 initial_pc_bake_cancel: lo/hi must be contiguous to lower "
+            "via a single Primitives.lower_ffn_rules call"
+        )
 
-        init_pc_lo = PC_OFFSET & 0xF
-        init_pc_hi = (PC_OFFSET >> 4) & 0xF
-
-        MARK_PC = D("MARK_PC")
-        HAS_SE = D("HAS_SE")
-        EMBED_LO = D("EMBED_LO")
-        EMBED_HI = D("EMBED_HI")
-
-        # Cancel EMBED_LO[init_pc_lo] when MARK_PC AND HAS_SE.
-        # up = S * HAS_SE - S/2 → +S/2 at HAS_SE=1, silu(+S/2) ≈ S/2.
-        # gate = MARK_PC → 1.0 at PC marker.
-        # hidden = S/2, W_down = -2.0/S → contribution = -1.0.
-        ffn.W_up.data[lo_unit, HAS_SE] = S
-        ffn.b_up.data[lo_unit] = -S * 0.5
-        ffn.W_gate.data[lo_unit, MARK_PC] = 1.0
-        ffn.W_down.data[EMBED_LO + init_pc_lo, lo_unit] = -2.0 / S
-
-        # Cancel EMBED_HI[init_pc_hi] (mirror of the LO cancel).
-        ffn.W_up.data[hi_unit, HAS_SE] = S
-        ffn.b_up.data[hi_unit] = -S * 0.5
-        ffn.W_gate.data[hi_unit, MARK_PC] = 1.0
-        ffn.W_down.data[EMBED_HI + init_pc_hi, hi_unit] = -2.0 / S
+        rules = _layer2_initial_pc_bake_cancel_rules(S)
+        named_positions = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(
+            ffn,
+            rules,
+            named_positions,
+            start_unit=lo_range.start,
+            S=S,
+        )
 
     # Dim-ownership claims: two FFN units pinned at indices 8 and 9 via
     # ``_L2_FFN_UNIT_LAYOUT`` (the same offsets the legacy
@@ -334,6 +433,7 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         layer_idx=2,
         bake_fn=bake,
         declarative_bake_fn=bake,
+        compiler_ir=_layer2_initial_pc_bake_cancel_ir(),
         migrated=True,
         claims=_claims,
         declarative_authority="spec_generated",
