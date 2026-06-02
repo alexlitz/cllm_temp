@@ -182,7 +182,10 @@ def make_layer7_operand_gather_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer7_operand_gather_ir,
         declarative_authority="spec_generated",
-        layer_idx=7,
+        # Phase 8.G.6: drop ``layer_idx=7`` literal; bind to the L7 ffn
+        # anchor ``layer8_sp_gather`` so the block op resolves to
+        # whichever layer the compiler places the anchor at.
+        target_op_name="layer8_sp_gather",
         migrated=True,
         claims=_claims,
         # Staleness invariants (Phase 3 / Agent G of ARCH_LEAKAGE_FIX_PLAN.md).
@@ -365,7 +368,10 @@ def make_layer7_memory_heads_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer7_memory_heads_ir,
-        layer_idx=7,
+        # Phase 8.G.6: drop ``layer_idx=7`` literal; bind to the L7 ffn
+        # anchor ``layer8_sp_gather`` so the block op resolves to
+        # whichever layer the compiler places the anchor at.
+        target_op_name="layer8_sp_gather",
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
@@ -603,7 +609,10 @@ def make_format_pointer_extraction_op(enable_conversational_io: bool = False) ->
             if enable_conversational_io else None
         ),
         declarative_authority="spec_generated",
-        layer_idx=7,
+        # Phase 8.G.6: drop ``layer_idx=7`` literal; bind to the L7 ffn
+        # anchor ``layer8_sp_gather`` so the block op resolves to
+        # whichever layer the compiler places the anchor at.
+        target_op_name="layer8_sp_gather",
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
@@ -722,7 +731,10 @@ def make_layer7_sp_byte0_is_f8_op() -> Operation:
         reads={"MARK_SP", "EMBED_LO", "EMBED_HI"},
         writes={"SP_BYTE0_IS_F8"},
         kind="block",
-        layer_idx=7,
+        # Phase 8.G.6: drop ``layer_idx=7`` literal; bind to the L7 ffn
+        # anchor ``layer8_sp_gather`` so the block op resolves to
+        # whichever layer the compiler places the anchor at.
+        target_op_name="layer8_sp_gather",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer7_sp_byte0_is_f8_ir,
         declarative_authority="spec_generated",
