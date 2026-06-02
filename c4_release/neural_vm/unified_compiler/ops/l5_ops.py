@@ -506,7 +506,14 @@ def make_opcode_decode_ffn_op() -> Operation:
     return Operation(
         name="opcode_decode_ffn",
         phase=5,
-        reads={"OPCODE_BYTE_LO", "OPCODE_BYTE_HI", "MARK_AX", "MARK_PC", "HAS_SE"},
+        # Phase 8.A SCC step 6: read OPCODE_BYTE_LO via the
+        # ``OPCODE_BYTE_LO_PREV_STEP`` alias (same numeric base, see
+        # shared.py ``_ALIAS_OF``) so the dynamic scheduler sees this
+        # consumption as a prev-step residual read rather than a
+        # same-layer dep on ``layer5_fetch``. Drops the L5
+        # fetch->decode writes/reads edge from the SCC.
+        reads={"OPCODE_BYTE_LO_PREV_STEP",
+               "OPCODE_BYTE_HI", "MARK_AX", "MARK_PC", "HAS_SE"},
         writes={"OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
                 "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
                 "OP_SC", "OP_PSH", "OP_OR", "OP_XOR", "OP_AND",
@@ -838,7 +845,11 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
     return Operation(
         name="_opcode_decode_ffn_dep_anchor",
         phase=5,
-        reads={"OPCODE_BYTE_LO", "OPCODE_BYTE_HI", "MARK_AX", "MARK_PC", "HAS_SE"},
+        # Phase 8.A SCC step 6: matches opcode_decode_ffn's
+        # OPCODE_BYTE_LO_PREV_STEP rename (same numeric base, prev-step
+        # semantics).
+        reads={"OPCODE_BYTE_LO_PREV_STEP",
+               "OPCODE_BYTE_HI", "MARK_AX", "MARK_PC", "HAS_SE"},
         writes={"OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
                 "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
                 "OP_SC", "OP_PSH", "OP_OR", "OP_XOR", "OP_AND",

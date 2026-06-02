@@ -2250,6 +2250,14 @@ class _SetDim:
     # Separate from ALU_LO/HI to avoid residual collision with L7 operand gather
     OPCODE_BYTE_LO = 12  # reuse ADDR_B0_LO (unused in autoregressive)
     OPCODE_BYTE_HI = 28  # reuse ADDR_B1_LO (unused in autoregressive)
+    # Phase 8.A SCC step 6: OPCODE_BYTE_LO_PREV_STEP alias (same numeric
+    # base as OPCODE_BYTE_LO) lets L5 opcode-decode readers (anchored at
+    # ``opcode_decode_ffn`` / ``_opcode_decode_ffn_dep_anchor``) declare
+    # their reads as prev-step semantically, breaking the same-layer
+    # writer→reader edge from ``layer5_fetch`` in the dynamic scheduler
+    # dep graph. Mirrors OUTPUT_LO_PREV_STEP / ALU_LO_PREV_STEP /
+    # ADDR_KEY_PREV_STEP. See shared.py ``_ALIAS_OF``.
+    OPCODE_BYTE_LO_PREV_STEP = 12  # alias of OPCODE_BYTE_LO
 
     # --- L0 threshold heads (8 heads for 39-token step) ---
     # Thresholds: [3.5, 4.5, 5.5, 9.5, 10.5, 14.5, 15.5, 19.5]

@@ -789,6 +789,17 @@ def declare_setdim_compat_dims(
                    "FETCH_LO", "FETCH_HI", "MUL_ACCUM", "DIV_STAGING",
                    "AX_FULL_LO", "AX_FULL_HI",
                    "OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
+                   # Phase 8.A SCC step 6: OPCODE_BYTE_LO_PREV_STEP alias
+                   # for the same 16-slot band. L5 opcode-decode readers
+                   # (``opcode_decode_ffn`` and
+                   # ``_opcode_decode_ffn_dep_anchor``) declare their reads
+                   # against this alias so the writes/reads edge from
+                   # ``layer5_fetch`` is removed from the SCC dep graph.
+                   # Same numeric base as OPCODE_BYTE_LO so baked weight
+                   # cells are byte-identical. Declared AFTER the base so
+                   # the alias inherits the pinned position via
+                   # ``_ALIAS_OF`` below.
+                   "OPCODE_BYTE_LO_PREV_STEP",
                    "ADDR_B0_LO",
                    # Phase 8.A PREV_STEP infrastructure: ADDR_B0_{LO,HI}_PREV_STEP
                    # aliases. ADDR_B0_HI has 4-5 back-edges in the latest
@@ -863,6 +874,12 @@ def declare_setdim_compat_dims(
         "CARRY_PREV_STEP": "CARRY",
         "CMP_PREV_STEP": "CMP",
         "OP_LEV_PREV_STEP": "OP_LEV",
+        # Phase 8.A SCC step 6: OPCODE_BYTE_LO_PREV_STEP rename for L5
+        # opcode-decode readers (anchored at ``opcode_decode_ffn`` and
+        # ``_opcode_decode_ffn_dep_anchor``). Same numeric base as the
+        # OPCODE_BYTE_LO writer band (`layer5_fetch`) so baked cells are
+        # byte-identical. Targets SCC step 20→16 (-4 ops).
+        "OPCODE_BYTE_LO_PREV_STEP": "OPCODE_BYTE_LO",
     }
 
     def _declare(name, size):
