@@ -142,6 +142,12 @@ L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT = 1136
 L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT = 1332
 L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT = 1410
 L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT = 1490
+# The PSH STACK0 marker-only OUTPUT rewrite (96 units) is pinned at the
+# legacy cursor offset ``L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT + 2`` set by
+# ``_bake_layer6_routing_ffn``. Splitting the constant out preserves the
+# historical cursor while letting the band be addressed declaratively.
+L6_PSH_STACK0_MARKER_OVERRIDE_START_UNIT = L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT + 2
+L6_PSH_STACK0_MARKER_OVERRIDE_END_UNIT = L6_PSH_STACK0_MARKER_OVERRIDE_START_UNIT + 96
 L6_BINARY_POP_SP_INCREMENT_START_UNIT = 2294
 L6_BINARY_POP_SP_INCREMENT_END_UNIT = 2328
 L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_START_UNIT = 1668
@@ -949,6 +955,71 @@ def _layer6_psh_stack0_writeback_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"{alu_base}+{k}", 1.0),
                 ),
                 writes=((f"{output_base}+{k}", write_scale),),
+            ))
+    return tuple(rules)
+
+
+def _layer6_psh_stack0_marker_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """CompilerIR rules for the L6 PSH STACK0 marker-only OUTPUT rewrite.
+
+    Reproduces the anonymous inline block written by ``_bake_layer6_routing_ffn``
+    immediately after ``L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT + 2`` (96 units).
+    For strict-neural PSH, STACK0 byte 0 must be exactly AX; the legacy
+    PSH STACK0 writeback (units 584..615) cancels EMBED and adds ALU, but a
+    tiny residual OUTPUT_HI[1] can beat OUTPUT_HI[0] at the STACK0 marker and
+    emit 0x1a instead of 0x0a. This band does a local marker-only OUTPUT
+    rewrite from the relayed ALU value, structured as:
+
+      * 16 cancel-OUTPUT (band=lo / hi) gated_writes
+      * 16 add-ALU (band=lo / hi) gated_writes
+      * 16 ALU-conditioned constant_writes (band=lo / hi)
+
+    Repeated for LO then HI (2 outer x 3 inner x 16 = 96 units total).
+    """
+
+    rules = []
+    cancel_scale = 2.0 / S
+    add_scale = 2.0 / S
+    final_scale = 3.0 / S
+    conditions = (
+        ("PSH_AT_SP", 1.0),
+        ("MARK_STACK0", 1.0),
+    )
+    for band, output_base, alu_base in (
+        ("lo", "OUTPUT_LO", "ALU_LO"),
+        ("hi", "OUTPUT_HI_THIS_STEP", "ALU_HI"),
+    ):
+        # Sub-loop 1: cancel residual OUTPUT
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_psh_stack0_marker_cancel_output_{band}_{k}",
+                conditions=conditions,
+                threshold=1.5,
+                gate=f"{output_base}+{k}",
+                gate_weight=-1.0,
+                writes=((f"{output_base}+{k}", cancel_scale),),
+            ))
+        # Sub-loop 2: add ALU value into OUTPUT
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"l6_psh_stack0_marker_add_alu_{band}_{k}",
+                conditions=conditions,
+                threshold=1.5,
+                gate=f"{alu_base}+{k}",
+                gate_weight=1.0,
+                writes=((f"{output_base}+{k}", add_scale),),
+            ))
+        # Sub-loop 3: constant_write conditioned also on ALU lane
+        for k in range(16):
+            rules.append(FFNRule.constant_write(
+                name=f"l6_psh_stack0_marker_final_{band}_{k}",
+                conditions=(
+                    ("PSH_AT_SP", 1.0),
+                    ("MARK_STACK0", 1.0),
+                    (f"{alu_base}+{k}", 1.0),
+                ),
+                threshold=2.5,
+                writes=((f"{output_base}+{k}", final_scale),),
             ))
     return tuple(rules)
 
@@ -2013,6 +2084,28 @@ def _lower_layer6_all_step_jsr_pc_override_ir(
     )
 
 
+def _lower_layer6_psh_stack0_marker_override_ir(
+    ffn,
+    S: float,
+    BD,
+    *,
+    unit: int = L6_PSH_STACK0_MARKER_OVERRIDE_START_UNIT,
+) -> int:
+    """Lower the IR-authored PSH STACK0 marker override band into L6 FFN weights.
+
+    Replaces the anonymous inline write block in ``_bake_layer6_routing_ffn``
+    (96 units starting at ``L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT + 2``).
+    """
+
+    return _lower_layer6_ffn_rules(
+        ffn,
+        _layer6_psh_stack0_marker_override_rules(S),
+        S,
+        BD,
+        unit=unit,
+    )
+
+
 def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
     """Bake L6 routing FFN via the smoke-stable legacy wrapper.
 
@@ -2024,38 +2117,20 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
     from ...vm_step import _set_layer6_routing_ffn
 
     _set_layer6_routing_ffn(ffn, S, BD)
-    unit = L6_ALL_STEP_JSR_PC_OVERRIDE_END_UNIT + 2
 
     # Strict neural PSH needs STACK0 byte 0 to be exactly AX. The legacy
     # writeback cancels EMBED and adds ALU, but a tiny residual OUTPUT_HI[1]
     # can beat OUTPUT_HI[0] at the STACK0 marker and emit 0x1a instead of
-    # 0x0a. Do a local marker-only OUTPUT rewrite from the relayed ALU value.
-    for output_base, alu_base in (
-        (BD.OUTPUT_LO, BD.ALU_LO),
-        (BD.OUTPUT_HI, BD.ALU_HI),
-    ):
-        for k in range(16):
-            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
-            ffn.W_up.data[unit, BD.MARK_STACK0] = S
-            ffn.b_up.data[unit] = -S * 1.5
-            ffn.W_gate.data[unit, output_base + k] = -1.0
-            ffn.W_down.data[output_base + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
-            ffn.W_up.data[unit, BD.MARK_STACK0] = S
-            ffn.b_up.data[unit] = -S * 1.5
-            ffn.W_gate.data[unit, alu_base + k] = 1.0
-            ffn.W_down.data[output_base + k, unit] = 2.0 / S
-            unit += 1
-        for k in range(16):
-            ffn.W_up.data[unit, BD.PSH_AT_SP] = S
-            ffn.W_up.data[unit, BD.MARK_STACK0] = S
-            ffn.W_up.data[unit, alu_base + k] = S
-            ffn.b_up.data[unit] = -S * 2.5
-            ffn.b_gate.data[unit] = 1.0
-            ffn.W_down.data[output_base + k, unit] = 3.0 / S
-            unit += 1
+    # 0x0a. The marker-only OUTPUT rewrite from the relayed ALU value is now
+    # declared by ``_layer6_psh_stack0_marker_override_rules`` and lowered
+    # byte-identically via ``_lower_layer6_psh_stack0_marker_override_ir``.
+    psh_marker_end = _lower_layer6_psh_stack0_marker_override_ir(ffn, S, BD)
+    if psh_marker_end != L6_PSH_STACK0_MARKER_OVERRIDE_END_UNIT:
+        raise AssertionError(
+            "L6 PSH STACK0 marker override IR lowered to unexpected unit "
+            f"{psh_marker_end}; expected "
+            f"{L6_PSH_STACK0_MARKER_OVERRIDE_END_UNIT}"
+        )
     _clear_ffn_unit_band(
         ffn,
         L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
