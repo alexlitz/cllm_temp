@@ -197,7 +197,10 @@ def make_phase_a_ffn_op() -> Operation:
         writes={"NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
                 "NEXT_STACK0", "NEXT_MEM", "NEXT_SE"},
         kind="block",
-        layer_idx=0,
+        # Phase 8.G.6: drop ``layer_idx=0`` literal; bind to the L0 attn
+        # dep anchor so the block op resolves to whichever layer the
+        # compiler places the anchor at.
+        target_op_name="_layer0_threshold_attn_dep_anchor",
         declarative_bake_fn=bake,
         compiler_ir=_phase_a_ffn_ir(),
         declarative_authority="spec_generated",
@@ -322,6 +325,39 @@ def _layer0_threshold_attn_ir(dim_positions, HD: int) -> CompilerIR:
     return ir
 
 
+def make_layer0_threshold_attn_dep_anchor_op() -> Operation:
+    """No-op companion for ``layer0_threshold_attn``: declares mirrored
+    reads/writes so the LayerCompiler's dep graph reserves an L0 slot
+    for it. Mirrors ``_layer3_ffn_dep_anchor`` / ``_layer6_ffn_dep_anchor``:
+    the actual weight bake happens in ``layer0_threshold_attn`` (kind=
+    "block"); this op's bake is a no-op.
+
+    Phase 8.G.6: lets L0 block ops (``phase_a_ffn``, ``layer0_threshold_attn``
+    itself) declare ``target_op_name="_layer0_threshold_attn_dep_anchor"``
+    and bind to whichever layer the compiler places the anchor at,
+    instead of carrying a literal ``layer_idx=0``.
+    """
+    def bake(attn, dim_positions, S):
+        # No-op: actual bake is in ``layer0_threshold_attn`` block op below.
+        return
+
+    return Operation(
+        name="_layer0_threshold_attn_dep_anchor",
+        phase=0,
+        # Mirror ``layer0_threshold_attn``'s reads/writes so the dep
+        # graph places this anchor at L0. With no upstream writers for
+        # IS_MARK / CONST (both set by token embedding pre-L0), the
+        # earliest landable layer is 0.
+        reads={"IS_MARK", "CONST"},
+        writes={"H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"},
+        kind="attn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        smoke_tests=set(),
+        spec_section=None,
+    )
+
+
 def make_layer0_threshold_attn_op() -> Operation:
     """L0 attention: 8 threshold heads detecting marker distance.
 
@@ -400,7 +436,10 @@ def make_layer0_threshold_attn_op() -> Operation:
         reads={"IS_MARK", "CONST"},
         writes={"H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"},
         kind="block",
-        layer_idx=0,
+        # Phase 8.G.6: drop ``layer_idx=0`` literal; bind to the L0 attn
+        # dep anchor so the block op resolves to whichever layer the
+        # compiler places the anchor at.
+        target_op_name="_layer0_threshold_attn_dep_anchor",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer0_threshold_attn_ir,
         declarative_authority="spec_generated",

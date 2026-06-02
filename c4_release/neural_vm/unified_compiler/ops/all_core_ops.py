@@ -73,6 +73,10 @@ def all_core_ops(
     ffn10 is replaced with ``ALUAndOrXor`` in efficient mode.
     """
     return [
+        # Phase 8.G.6: L0 attn dep anchor — gives L0 block ops a stable
+        # ``target_op_name`` to bind to so they can drop ``layer_idx=0``
+        # literals. Mirrors the L3/L4/L5/L6/L11 dep-anchor pattern.
+        make_layer0_threshold_attn_dep_anchor_op(),
         make_layer0_threshold_attn_op(),
         make_layer1_threshold_attn_op(),
         make_layer2_threshold_attn_op(),
