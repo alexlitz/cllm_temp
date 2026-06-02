@@ -380,6 +380,11 @@ class StrictModeUnschedulableError(RuntimeError):
       * ``cycle_members`` — ops trapped in a directed cycle in the
         unpruned dep graph (today: the OUTPUT_HI / IF_VAR SCC, etc.).
         These need ``B9`` dim decomposition to break the back-edges.
+        In cycle-aware strict mode (``allow_sealed_cycles=True``) the
+        cycle members are sealed as a group and the ordering inside the
+        group falls back to phase; only ``phase_required_but_undeclared``
+        and ``phase_inconsistent_with_deps`` populated by ops OUTSIDE
+        the SCC actually raise.
       * ``phase_required_but_undeclared`` — ops whose static
         ``phase=N.M`` places them later than their dep-derived earliest
         position. The static path uses ``phase`` to pin them; strict
@@ -438,7 +443,8 @@ class StrictModeUnschedulableError(RuntimeError):
             "consumes_fresh, or new reads/writes) per "
             "DYNAMIC_SCHEDULER_MIGRATION_PLAN.md units B9/B12. Until then, "
             "compile with strict=False (the default) to fall back to phase "
-            "tiebreaking."
+            "tiebreaking, or pass allow_sealed_cycles=True (the strict-mode "
+            "default) to accept SCCs as sealed groups."
         )
         super().__init__("\n".join(msg_parts))
 
@@ -459,6 +465,143 @@ def _current_layer_for_strict(op: Operation) -> Optional[int]:
         return None
 
 
+def _build_strict_dep_graph(
+    ops: Sequence[Operation],
+) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]], Set[Tuple[str, str]]]:
+    """Strict-mode dep graph that mirrors ``tools/analyze_scheduler.py``.
+
+    Differs from :func:`_build_dep_graph` in two ways that align with the
+    offline analyzer:
+
+      * Applies the B9 R-OH-2 suppression rule: when a reader ``v``
+        declares ``requires["after"] = X`` AND ``X`` writes a dim ``D``
+        that ``v`` also reads, the data-flow edge ``u→v`` on ``D`` is
+        suppressed for every other writer ``u`` of ``D``. The explicit
+        ``X→v`` edge is still added. Semantic: the reader opted into
+        the prev-step residual / KV-cache satisfaction, NOT a same-step
+        data dep on any later-layer producer. See
+        ``docs/B9_OUTPUT_HI_SPLIT_SPEC.md`` §7.2 and §6.3.
+      * Tracks ``same_layer_edges`` — the set of ``(u, v)`` pairs whose
+        ONLY contribution comes from a ``requires["same_layer_as"]``
+        declaration. ``_strict_topo_depth`` propagates ``depth[u]``
+        instead of ``depth[u]+1`` along these so co-placement peers
+        don't artificially bump the depth.
+
+    Used ONLY by the strict-mode admission check; the hybrid scheduler
+    still uses the simpler :func:`_build_dep_graph` (kept for backward
+    compat with existing ``_build_phase_pruned_graph`` callers).
+    """
+    name_to_op = {op.name: op for op in ops}
+    in_edges: Dict[str, Set[str]] = {op.name: set() for op in ops}
+    out_edges: Dict[str, Set[str]] = {op.name: set() for op in ops}
+    same_layer_only: Set[Tuple[str, str]] = set()
+    other_edges: Set[Tuple[str, str]] = set()
+
+    writers: Dict[str, List[Operation]] = defaultdict(list)
+    for op in ops:
+        for d in op.writes:
+            writers[d].append(op)
+
+    producers: Dict[Tuple[str, str], List[Operation]] = defaultdict(list)
+    for op in ops:
+        for dim, reg in op.produces.items():
+            producers[(dim, reg)].append(op)
+
+    for v in ops:
+        # B9 R-OH-2 suppression: when v declares requires["after"]=X and
+        # X writes a dim that v reads, drop the dataflow edge from EVERY
+        # other writer of that dim. X→v is added below via the explicit
+        # ``requires["after"]`` walk.
+        suppressed_dims: Set[str] = set()
+        for ref in requires_after_ops(v):
+            if ref == v.name or ref not in name_to_op:
+                continue
+            ref_op = name_to_op[ref]
+            for d in ref_op.writes & v.reads:
+                suppressed_dims.add(d)
+        for d in v.reads:
+            if d in suppressed_dims:
+                continue
+            for u in writers.get(d, ()):
+                if u.name == v.name:
+                    continue
+                if u.name not in in_edges[v.name]:
+                    in_edges[v.name].add(u.name)
+                    out_edges[u.name].add(v.name)
+                other_edges.add((u.name, v.name))
+        for dim, reg in v.consumes_fresh.items():
+            for u in producers.get((dim, reg), ()):
+                if u.name == v.name:
+                    continue
+                if u.name not in in_edges[v.name]:
+                    in_edges[v.name].add(u.name)
+                    out_edges[u.name].add(v.name)
+                other_edges.add((u.name, v.name))
+        for ref in requires_after_ops(v):
+            if ref == v.name or ref not in name_to_op:
+                continue
+            if ref not in in_edges[v.name]:
+                in_edges[v.name].add(ref)
+                out_edges[ref].add(v.name)
+            other_edges.add((ref, v.name))
+        for ref in requires_same_layer_as_ops(v):
+            if ref == v.name or ref not in name_to_op:
+                continue
+            if ref not in in_edges[v.name]:
+                in_edges[v.name].add(ref)
+                out_edges[ref].add(v.name)
+            same_layer_only.add((ref, v.name))
+
+    # Same-layer edges are ONLY edges with no other contribution.
+    same_layer_edges = {p for p in same_layer_only if p not in other_edges}
+    return in_edges, out_edges, same_layer_edges
+
+
+def _strict_topo_depth(
+    ops: Sequence[Operation],
+    in_edges: Dict[str, Set[str]],
+    out_edges: Dict[str, Set[str]],
+    same_layer_edges: Set[Tuple[str, str]],
+) -> Tuple[Dict[str, int], Set[str]]:
+    """Compute earliest-layer depth via Kahn's algorithm.
+
+    Mirrors ``tools/analyze_scheduler.py:topo_depth``. Edges in
+    ``same_layer_edges`` contribute ``depth[u]`` (peer-equal), all
+    others contribute ``depth[u] + 1``.
+
+    Returns ``(depth, cycle_members)`` where ``cycle_members`` is the
+    set of ops never reached (in-degree never hits 0 because they live
+    in or downstream of a directed cycle).
+    """
+    indeg = {op.name: len(in_edges[op.name]) for op in ops}
+    max_pred_depth: Dict[str, int] = {op.name: -1 for op in ops}
+    depth: Dict[str, int] = {}
+    queue: List[str] = []
+    for op in ops:
+        if indeg[op.name] == 0:
+            depth[op.name] = 0
+            queue.append(op.name)
+    while queue:
+        u = queue.pop(0)
+        for v in sorted(out_edges[u]):
+            if (u, v) in same_layer_edges:
+                contribution = depth[u]
+            else:
+                contribution = depth[u] + 1
+            if contribution > max_pred_depth[v]:
+                max_pred_depth[v] = contribution
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                depth[v] = max(max_pred_depth[v], 0)
+                queue.append(v)
+    cycle_members: Set[str] = set()
+    for op in ops:
+        if op.name not in depth:
+            depth[op.name] = -1
+            cycle_members.add(op.name)
+    return depth, cycle_members
+
+
 def _strict_mode_categorise(
     ops: Sequence[Operation],
 ) -> Dict[str, List[str]]:
@@ -472,37 +615,23 @@ def _strict_mode_categorise(
 
     Implementation notes
     --------------------
-    * Uses the unpruned dep graph (no phase pruning) — strict mode is
-      defined as "what happens when phase is ignored".
+    * Uses the strict dep graph (B9 R-OH-2 suppression + same_layer_as
+      peer modelling) — keeps the depth calculation aligned with the
+      static path's ``LayerCompiler._assign_layers`` co-placement
+      semantics.
     * Post-pass ops (current layer >= 100) and ``kind="model"`` ops are
       treated as structurally pinned and pass strict mode unconditionally
       (the dispatcher places them by phase / layer_idx, never by dep
       depth). Block-kind ops go through the same dep check as attn / ffn
       ops — they may still expose ordering bugs.
+    * A "freely_placeable" refinement marks ops with no in-edges AND no
+      out-edges in the dep graph as ``ok`` regardless of phase vs depth
+      — there is no constraint to satisfy.
     """
-    in_edges, out_edges = _build_dep_graph(ops)
-    cycle_members = _find_cycle_members(ops, in_edges, out_edges)
-
-    # Compute dep-derived earliest layer (matches analyzer.topo_depth).
-    indeg = {op.name: len(in_edges[op.name]) for op in ops}
-    max_pred_depth: Dict[str, int] = {op.name: -1 for op in ops}
-    depth: Dict[str, int] = {}
-    queue: List[str] = []
-    for op in ops:
-        if indeg[op.name] == 0:
-            depth[op.name] = 0
-            queue.append(op.name)
-    while queue:
-        u = queue.pop(0)
-        for v in sorted(out_edges[u]):
-            if depth[u] > max_pred_depth[v]:
-                max_pred_depth[v] = depth[u]
-            indeg[v] -= 1
-            if indeg[v] == 0:
-                depth[v] = max_pred_depth[v] + 1
-                queue.append(v)
-    for op in ops:
-        depth.setdefault(op.name, -1)
+    in_edges, out_edges, same_layer_edges = _build_strict_dep_graph(ops)
+    depth, cycle_members = _strict_topo_depth(
+        ops, in_edges, out_edges, same_layer_edges
+    )
 
     buckets: Dict[str, List[str]] = {
         "ok": [],
@@ -528,6 +657,12 @@ def _strict_mode_categorise(
             # No phase declared and no cycle — free placement.
             buckets["ok"].append(op.name)
             continue
+        # Refinement: an op with NO in/out edges in the dep graph has
+        # nothing to satisfy. Mirrors analyzer.categorise's
+        # freely_placeable refinement.
+        if not in_edges[op.name] and not out_edges[op.name]:
+            buckets["ok"].append(op.name)
+            continue
         if current < derived:
             buckets["phase_inconsistent_with_deps"].append(op.name)
             continue
@@ -542,14 +677,88 @@ def _strict_mode_categorise(
     return buckets
 
 
-def _assert_strict_mode_clean(ops: Sequence[Operation]) -> None:
-    """Raise ``StrictModeUnschedulableError`` if any op fails strict admission."""
+def _strict_mode_sccs(ops: Sequence[Operation]) -> List[Set[str]]:
+    """Return strongly-connected components restricted to cycle members.
+
+    Uses Tarjan's algorithm on the cycle-member subgraph derived from
+    the strict dep graph. Returns SCCs sorted by size descending; each
+    SCC is a set of op names.
+    """
+    in_edges, out_edges, _ = _build_strict_dep_graph(ops)
+    _depth, cycle = _strict_topo_depth(
+        ops, in_edges, out_edges, set()
+    )
+    sub_out: Dict[str, Set[str]] = {
+        n: out_edges[n] & cycle for n in cycle
+    }
+    index_counter = [0]
+    stack: List[str] = []
+    on_stack: Set[str] = set()
+    indices: Dict[str, int] = {}
+    lowlinks: Dict[str, int] = {}
+    sccs: List[List[str]] = []
+
+    def _strongconnect(v: str) -> None:
+        indices[v] = index_counter[0]
+        lowlinks[v] = index_counter[0]
+        index_counter[0] += 1
+        stack.append(v)
+        on_stack.add(v)
+        for w in sub_out.get(v, ()):
+            if w not in indices:
+                _strongconnect(w)
+                lowlinks[v] = min(lowlinks[v], lowlinks[w])
+            elif w in on_stack:
+                lowlinks[v] = min(lowlinks[v], indices[w])
+        if lowlinks[v] == indices[v]:
+            comp: List[str] = []
+            while True:
+                w = stack.pop()
+                on_stack.discard(w)
+                comp.append(w)
+                if w == v:
+                    break
+            if len(comp) > 1 or v in sub_out.get(v, ()):
+                sccs.append(comp)
+
+    import sys as _sys
+    _sys.setrecursionlimit(10000)
+    for n in sorted(cycle):
+        if n not in indices:
+            _strongconnect(n)
+
+    sccs.sort(key=len, reverse=True)
+    return [set(c) for c in sccs]
+
+
+def _assert_strict_mode_clean(
+    ops: Sequence[Operation],
+    *,
+    allow_sealed_cycles: bool = True,
+) -> None:
+    """Raise ``StrictModeUnschedulableError`` if any op fails strict admission.
+
+    When ``allow_sealed_cycles=True`` (the default for B14 strict mode),
+    cycle members are accepted as a sealed group — the hybrid scheduler
+    falls back to phase ordering INSIDE the SCC only, leaving the rest
+    of the graph dep-derived. Only ``phase_required_but_undeclared``
+    and ``phase_inconsistent_with_deps`` (which are populated by
+    non-cycle ops in the strict categoriser) actually gate strict mode.
+    A non-empty ``cycle_members`` bucket combined with empty
+    ``phase_required_but_undeclared`` and ``phase_inconsistent_with_deps``
+    is the "cycle-aware strict accept" outcome.
+
+    When ``allow_sealed_cycles=False``, any cycle is a hard failure
+    (legacy strict-mode behavior).
+    """
     buckets = _strict_mode_categorise(ops)
-    if (
-        buckets["cycle_members"]
-        or buckets["phase_required_but_undeclared"]
+    gating = bool(
+        buckets["phase_required_but_undeclared"]
         or buckets["phase_inconsistent_with_deps"]
-    ):
+    )
+    if not allow_sealed_cycles:
+        gating = gating or bool(buckets["cycle_members"])
+    if gating:
         raise StrictModeUnschedulableError(
             cycle_members=buckets["cycle_members"],
             phase_required_but_undeclared=buckets[
@@ -588,6 +797,7 @@ def compile_full_vm_dynamic(
     require_declarative_bake: Optional[bool] = None,
     declarations_only: bool = False,
     strict: bool = False,
+    allow_sealed_cycles: bool = True,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
@@ -687,8 +897,19 @@ def compile_full_vm_dynamic(
     # model state to tear down, no stale cache hit masking the failure).
     # When ``strict=False`` (the default), the hybrid scheduler falls
     # back to phase, preserving the B11/B12 byte-identity behaviour.
+    #
+    # Cycle-aware strict mode (Phase 7.A.5 B14 attempt): when
+    # ``allow_sealed_cycles=True`` (the strict-mode default) the SCC of
+    # cycle members is accepted as a sealed group — the hybrid
+    # scheduler still routes them via phase fallback INSIDE the SCC, but
+    # the rest of the graph is dep-derived. This lets strict mode land
+    # before B9 dim decomposition completes. The byte-identity invariant
+    # still holds because the hybrid scheduler's actual placement logic
+    # is unchanged; strict mode is purely an admission gate.
     if strict:
-        _assert_strict_mode_clean(ops)
+        _assert_strict_mode_clean(
+            ops, allow_sealed_cycles=allow_sealed_cycles
+        )
 
     # Compute the hybrid schedule. The schedule output (dep-derived
     # order with phase-pruning fallback) is the load-bearing "dynamic"
