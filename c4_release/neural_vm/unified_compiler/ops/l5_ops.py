@@ -167,7 +167,10 @@ def make_layer5_fetch_op() -> Operation:
                 "OP_OR", "OP_XOR", "OP_AND",
                 "OP_EQ", "OP_LT", "OP_SHL", "OP_SHR"},
         kind="block",
-        layer_idx=5,
+        # Phase 8.G.6: drop ``layer_idx=5`` literal; bind to the L5 attn
+        # dep anchor so the block op resolves to whichever layer the
+        # compiler places the anchor at.
+        target_op_name="_layer5_fetch_dep_anchor",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer5_fetch_ir,
         migrated=True,
@@ -523,7 +526,10 @@ def make_opcode_decode_ffn_op() -> Operation:
                 "OP_PUTCHAR", "OP_GETCHAR",
                 "TEMP"},  # JSR writes IS_JSR to TEMP[0]
         kind="block",
-        layer_idx=5,
+        # Phase 8.G.6: drop ``layer_idx=5`` literal; bind to the L5
+        # opcode-decode ffn dep anchor so the block op resolves to
+        # whichever layer the compiler places the anchor at.
+        target_op_name="_opcode_decode_ffn_dep_anchor",
         declarative_bake_fn=bake,
         compiler_ir=_opcode_decode_ffn_ir(),
         migrated=True,

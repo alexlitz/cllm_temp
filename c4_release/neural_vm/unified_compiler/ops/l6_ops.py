@@ -444,13 +444,23 @@ def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     )
     write_scale = 2.0 / S
 
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
+    # Phase 8.A.7: OUTPUT_LO cancel gate reads the PREV_STEP alias (same
+    # numeric position as OUTPUT_LO). The L8+/L14+ OUTPUT_LO writers fire
+    # AFTER this L6 op in the same step, so the residual value observed
+    # here is the previous step's. Renaming the read breaks the
+    # layer6_routing_ffn ← (L8+, L14+) back-edges in the dep graph.
+    # OUTPUT_HI_THIS_STEP is already step-local (B9 split) so its gate
+    # name is unchanged.
+    for band, output_base, output_gate_base in (
+        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+    ):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_jmp_all_step_cancel_{band}_{k}",
                 conditions=conditions,
                 threshold=threshold,
-                gate=f"{output_base}+{k}",
+                gate=f"{output_gate_base}+{k}",
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
@@ -551,13 +561,18 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     threshold = 21.5
     write_scale = 2.0 / S
 
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
+    # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
+    # See _layer6_all_step_jmp_pc_override_rules for the rationale.
+    for band, output_base, output_gate_base in (
+        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+    ):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_jsr_all_step_cancel_{band}_{k}",
                 conditions=conditions,
                 threshold=threshold,
-                gate=f"{output_base}+{k}",
+                gate=f"{output_gate_base}+{k}",
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
@@ -697,13 +712,17 @@ def _layer6_delayed_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ("CONST", -1000.0),
     )
     write_scale = 2.0 / S
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
+    # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
+    for band, output_base, output_gate_base in (
+        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+    ):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_delayed_jmp_cancel_{band}_{k}",
                 conditions=conditions,
                 threshold=5.5,
-                gate=f"{output_base}+{k}",
+                gate=f"{output_gate_base}+{k}",
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
@@ -731,13 +750,17 @@ def _layer6_first_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     )
     write_scale = 2.0 / S
     threshold = 5.0
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
+    # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
+    for band, output_base, output_gate_base in (
+        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+    ):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_first_step_jmp_cancel_{band}_{k}",
                 conditions=conditions,
                 threshold=threshold,
-                gate=f"{output_base}+{k}",
+                gate=f"{output_gate_base}+{k}",
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
@@ -1007,9 +1030,13 @@ def _layer6_psh_stack0_marker_override_rules(S: float) -> tuple[FFNRule, ...]:
         ("PSH_AT_SP", 1.0),
         ("MARK_STACK0", 1.0),
     )
-    for band, output_base, alu_base in (
-        ("lo", "OUTPUT_LO", "ALU_LO"),
-        ("hi", "OUTPUT_HI_THIS_STEP", "ALU_HI"),
+    # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias
+    # (Sub-loop 1 reads the residual OUTPUT band cross-step). The add-ALU
+    # sub-loop (gate=ALU) and the final constant_write sub-loop are
+    # unaffected; only the cancel-output gate needs the alias rename.
+    for band, output_base, alu_base, output_gate_base in (
+        ("lo", "OUTPUT_LO", "ALU_LO", "OUTPUT_LO_PREV_STEP"),
+        ("hi", "OUTPUT_HI_THIS_STEP", "ALU_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         # Sub-loop 1: cancel residual OUTPUT
         for k in range(16):
@@ -1017,7 +1044,7 @@ def _layer6_psh_stack0_marker_override_rules(S: float) -> tuple[FFNRule, ...]:
                 name=f"l6_psh_stack0_marker_cancel_output_{band}_{k}",
                 conditions=conditions,
                 threshold=1.5,
-                gate=f"{output_base}+{k}",
+                gate=f"{output_gate_base}+{k}",
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", cancel_scale),),
             ))
@@ -1408,13 +1435,17 @@ def _layer6_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     )
     target_conditions = cancel_conditions + (("MARK_STACK0", -10.0),)
     write_scale = 2.0 / S
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
+    # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
+    for band, output_base, output_gate_base in (
+        ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+        ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+    ):
         for k in range(16):
             rules.append(FFNRule.gated_write(
                 name=f"l6_bz_cancel_{band}_{k}",
                 conditions=cancel_conditions,
                 threshold=3.5,
-                gate=f"{output_base}+{k}",
+                gate=f"{output_gate_base}+{k}",
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
@@ -1452,14 +1483,18 @@ def _layer6_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             2.5,
         ),
     )
+    # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
     for group, conditions, threshold in groups:
-        for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
+        for band, output_base, output_gate_base in (
+            ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+            ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+        ):
             for k in range(16):
                 rules.append(FFNRule.gated_write(
                     name=f"l6_bnz_{group}_cancel_{band}_{k}",
                     conditions=conditions,
                     threshold=threshold,
-                    gate=f"{output_base}+{k}",
+                    gate=f"{output_gate_base}+{k}",
                     gate_weight=-1.0,
                     writes=((f"{output_base}+{k}", write_scale),),
                 ))
@@ -1530,14 +1565,18 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
         ),
     )
 
+    # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
     for group, conditions, threshold in groups:
-        for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
+        for band, output_base, output_gate_base in (
+            ("lo", "OUTPUT_LO", "OUTPUT_LO_PREV_STEP"),
+            ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+        ):
             for k in range(16):
                 rules.append(FFNRule.gated_write(
                     name=f"l6_branch_pc_byte1_{group}_cancel_{band}_{k}",
                     conditions=conditions,
                     threshold=threshold,
-                    gate=f"{output_base}+{k}",
+                    gate=f"{output_gate_base}+{k}",
                     gate_weight=-1.0,
                     writes=((f"{output_base}+{k}", write_scale),),
                 ))
@@ -2560,11 +2599,20 @@ def make_layer6_routing_ffn_op() -> Operation:
         # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the read as
         # cross-step relative to L8 AX_CARRY_HI writers (multibyte_fetch
         # {,_bake}, head6_ax_carry_refresh). See layer6_attn for rationale.
+        #
+        # Phase 8.A.7: OUTPUT_LO read renamed to OUTPUT_LO_PREV_STEP -- the
+        # L6 routing FFN's cancel bands gate on the residual OUTPUT_LO,
+        # whose value is the PREVIOUS step's output (L8+/L14+ OUTPUT_LO
+        # writers fire AFTER L6 in the same step). The alias shares the
+        # same numeric position as OUTPUT_LO so baked weight cells are
+        # byte-identical. This single rename breaks 31 OUTPUT_LO back-
+        # edges into layer6_routing_ffn (per scc_audit_phase8.md §3),
+        # the single largest back-edge contributor in the dep graph.
         reads={"OP_IMM", "OP_EXIT", "OP_JMP", "OP_NOP", "OP_LEA",
                "MARK_AX", "MARK_PC", "MARK_STACK0", "MARK_BP",
                "IS_BYTE", "FETCH_LO", "FETCH_HI",
                "AX_CARRY_LO", "AX_CARRY_HI_PREV_STEP", "CMP",
-               "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "HAS_SE",
+               "OUTPUT_LO_PREV_STEP", "OUTPUT_HI_THIS_STEP", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
                "TEMP_PREV_STEP", "DIV_STAGING"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "AX_CARRY_LO", "AX_CARRY_HI"},
