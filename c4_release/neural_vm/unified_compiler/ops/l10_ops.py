@@ -6502,7 +6502,10 @@ def make_tail_bit32_result_correction_op() -> Operation:
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
-        layer_idx=17,
+        # Phase 8.A.4 retry: layer_idx=17 literal dropped (was redundant
+        # alongside ``target_op_name`` since ``target_op_name`` takes
+        # precedence in ``resolve_block_op_layer``). The L17 placement is
+        # dep-derived from ``l10_post_ops_combined``'s position.
         target_op_name="l10_post_ops_combined",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
