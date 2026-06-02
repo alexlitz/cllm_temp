@@ -751,6 +751,11 @@ def declare_setdim_compat_dims(
                    # via ``requires["after"]``. See
                    # docs/B9_OUTPUT_HI_SPLIT_SPEC.md.
                    "OUTPUT_HI_THIS_STEP",
+                   # Phase 7.A.3 OUTPUT_LO split: OUTPUT_LO_PREV_STEP is
+                   # the cross-step alias for the L3 head 5 / L8 head 6
+                   # attention-back reads. Same numeric base as OUTPUT_LO
+                   # (174) so bakes stay byte-identical.
+                   "OUTPUT_LO_PREV_STEP",
                    "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                    "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                    "FETCH_LO", "FETCH_HI", "MUL_ACCUM", "DIV_STAGING",
@@ -779,6 +784,8 @@ def declare_setdim_compat_dims(
     # is declared. See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §6.4.
     _ALIAS_OF = {
         "OUTPUT_HI_THIS_STEP": "OUTPUT_HI",
+        # Phase 7.A.3 OUTPUT_LO split: PREV_STEP alias for cross-step reads.
+        "OUTPUT_LO_PREV_STEP": "OUTPUT_LO",
     }
 
     def _declare(name, size):

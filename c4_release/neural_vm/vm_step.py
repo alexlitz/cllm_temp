@@ -2306,6 +2306,11 @@ class _SetDim:
     # "OUTPUT_HI_PREV_STEP" cross-step carry (see docs/B9_OUTPUT_HI_SPLIT_SPEC.md).
     # Numeric position is identical so baked weights are byte-identical.
     OUTPUT_HI_THIS_STEP = 190  # alias of OUTPUT_HI
+    # Phase 7.A.3 OUTPUT_LO split: PREV_STEP alias for the same 16-slot
+    # band. Cross-step readers (L3 head 5 AX_FULL relay,
+    # L8 head 6 AX_CARRY refresh) attend back to the prior step's AX
+    # marker row, where this slot still holds the prev-step value.
+    OUTPUT_LO_PREV_STEP = 174  # alias of OUTPUT_LO
 
     # --- Address key (for memory attention) ---
     ADDR_KEY = 206  # 206-253 (48 dims: 3 nibbles × 16 one-hot)
