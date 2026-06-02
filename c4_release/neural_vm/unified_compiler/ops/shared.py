@@ -817,9 +817,18 @@ def declare_setdim_compat_dims(
                    # right after each base so the pinned position is
                    # available. See ``_ALIAS_OF`` below.
                    "ADDR_B0_LO_PREV_STEP",
-                   "ADDR_B1_LO", "ADDR_B2_LO",
+                   # Phase 8.A PREV_STEP infrastructure: ADDR_B{1,2}_LO_PREV_STEP
+                   # aliases. ADDR_B1_LO / ADDR_B2_LO show up as 2-each
+                   # back-edges from L13 mem_addr_gather / L12 attn anchor
+                   # into L8 mem_to_alu. Same numeric base; bake-position
+                   # unchanged. See ``_ALIAS_OF`` below.
+                   "ADDR_B1_LO", "ADDR_B1_LO_PREV_STEP",
+                   "ADDR_B2_LO", "ADDR_B2_LO_PREV_STEP",
                    "ADDR_B0_HI", "ADDR_B0_HI_PREV_STEP",
-                   "ADDR_B1_HI", "ADDR_B2_HI",
+                   # Phase 8.A PREV_STEP infrastructure: ADDR_B{1,2}_HI_PREV_STEP
+                   # aliases mirror the LO-side aliases above.
+                   "ADDR_B1_HI", "ADDR_B1_HI_PREV_STEP",
+                   "ADDR_B2_HI", "ADDR_B2_HI_PREV_STEP",
                    "FORMAT_PTR_LO", "FORMAT_PTR_HI",
                    "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"]
     # Phase 8.A PREV_STEP infrastructure: CARRY_PREV_STEP / CMP_PREV_STEP
@@ -881,6 +890,15 @@ def declare_setdim_compat_dims(
         "EMBED_HI_PREV_STEP": "EMBED_HI",
         "ADDR_B0_LO_PREV_STEP": "ADDR_B0_LO",
         "ADDR_B0_HI_PREV_STEP": "ADDR_B0_HI",
+        # Phase 8.A PREV_STEP infrastructure: ADDR_B{1,2}_{LO,HI}_PREV_STEP
+        # aliases retire L13/L12-anchor → L8 mem_to_alu back-edges (2 each)
+        # on the ADDR_B1/B2 nibble bands. Numeric base shared with the
+        # respective ADDR_B1/B2_{LO,HI} writers; baked weight cells are
+        # byte-identical.
+        "ADDR_B1_LO_PREV_STEP": "ADDR_B1_LO",
+        "ADDR_B2_LO_PREV_STEP": "ADDR_B2_LO",
+        "ADDR_B1_HI_PREV_STEP": "ADDR_B1_HI",
+        "ADDR_B2_HI_PREV_STEP": "ADDR_B2_HI",
         "CARRY_PREV_STEP": "CARRY",
         "CMP_PREV_STEP": "CMP",
         "OP_LEV_PREV_STEP": "OP_LEV",

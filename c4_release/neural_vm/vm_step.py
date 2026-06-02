@@ -2528,6 +2528,13 @@ class _SetDim:
     # ADDR_KEY comment above). No ops migrated in this pass — alias is
     # infrastructure only.
     ADDR_B0_HI_PREV_STEP = 206  # alias of ADDR_B0_HI
+    # Phase 8.A (PREV_STEP infrastructure): ADDR_B1/B2_HI_PREV_STEP aliases
+    # (same numeric base as the respective ADDR_B1/B2_HI writers). Used by
+    # cross-step readers (e.g. ``layer8_mem_to_alu``) so the dep-graph
+    # back-edges from L13 / L12-anchor writers are retired. No bake-position
+    # change — slot is shared with ADDR_B1/B2_HI.
+    ADDR_B1_HI_PREV_STEP = 222  # alias of ADDR_B1_HI
+    ADDR_B2_HI_PREV_STEP = 238  # alias of ADDR_B2_HI
 
     # --- L2 threshold head output (7 dims: one per marker type) ---
     # Shifted +4 (was 448-454, now 452-458)
