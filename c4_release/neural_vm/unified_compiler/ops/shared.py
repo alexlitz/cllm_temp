@@ -768,7 +768,12 @@ def declare_setdim_compat_dims(
     four_dim = ["CARRY"]
     eight_dim = ["CMP"]
     forty_eight_dim = ["ADDR_KEY"]
-    thirty_two_dim = ["TEMP"]
+    thirty_two_dim = ["TEMP",
+                      # Phase 7.A.3 TEMP split: TEMP_PREV_STEP cross-step
+                      # alias mirrors the B9 OUTPUT_HI / 7.A.3.b OUTPUT_LO
+                      # PREV_STEP pattern. Same numeric base (480) so bakes
+                      # stay byte-identical.
+                      "TEMP_PREV_STEP"]
 
     # Cursor for the compact IO block when pin_io_only=True. IO dims are
     # pinned at consecutive positions starting at 0, in declaration order
@@ -786,6 +791,8 @@ def declare_setdim_compat_dims(
         "OUTPUT_HI_THIS_STEP": "OUTPUT_HI",
         # Phase 7.A.3 OUTPUT_LO split: PREV_STEP alias for cross-step reads.
         "OUTPUT_LO_PREV_STEP": "OUTPUT_LO",
+        # Phase 7.A.3 TEMP split: PREV_STEP alias for future cross-step reads.
+        "TEMP_PREV_STEP": "TEMP",
     }
 
     def _declare(name, size):

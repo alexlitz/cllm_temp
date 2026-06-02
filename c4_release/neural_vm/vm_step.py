@@ -2505,6 +2505,11 @@ class _SetDim:
 
     # --- General temporaries / reserved ---
     TEMP = 480  # 480-511 (32 dims)
+    # Phase 7.A.3 TEMP split: PREV_STEP alias for the same 32-slot scratch
+    # band. Mirrors the OUTPUT_HI / OUTPUT_LO PREV_STEP naming convention.
+    # Same numeric base as TEMP so bakes stay byte-identical; future
+    # cross-step TEMP readers can declare reads against this alias.
+    TEMP_PREV_STEP = 480  # alias of TEMP
 
     # Convenience: map Opcode int → _SetDim opcode flag dim
     _OPCODE_DIM = None  # lazily built

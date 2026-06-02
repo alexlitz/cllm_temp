@@ -578,6 +578,14 @@ def build_default_registry() -> DimRegistry:
     # predicates once consumers stabilize.
     _pin("TEMP", 480, 32, "General temporaries / reserved",
               semantics="is_byte OR NOT is_byte")
+    # Phase 7.A.3 TEMP split: TEMP_PREV_STEP aliases the same numeric slot
+    # as TEMP so byte-identity is preserved. Mirrors the B9 OUTPUT_HI /
+    # Phase 7.A.3.b OUTPUT_LO PREV_STEP pattern. TEMP is heavily
+    # cell-multiplexed; the alias documents the prev-step semantic and
+    # leaves room for future cross-step migrations.
+    _pin("TEMP_PREV_STEP", 480, 32,
+              "TEMP from previous step (aliases TEMP)",
+              semantics="is_byte OR NOT is_byte", alias=True)
 
     # =========================================================================
     # F-4-extension: per-opcode sub-offsets, MEM/STACK0 control flags,
