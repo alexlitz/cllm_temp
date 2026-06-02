@@ -141,13 +141,22 @@ def make_alu_shift_composite_ops():
             kind="block",
             declarative_bake_fn=bake,
             declarative_authority="structural_model",
-            # Phase 8.A.4: dropped ``layer_idx=13`` in favour of
-            # ``target_op_name``. Binds to whichever layer the dep graph
-            # places ``l13_alu_shift_getobd`` (the final kind="ffn"
-            # composite stage) -- those stages all write into the L13
-            # FFN, so the install op naturally follows them.
-            target_op_name="l13_alu_shift_getobd",
+            # Phase 8.A.4 fix (smoke_bisect_20260602_1339): originally pointed
+            # at ``l13_alu_shift_getobd`` (a kind="ffn" composite stage), but
+            # that stage is only registered in efficient mode and even then
+            # the dep graph did not anchor it at L13 -- block fusion
+            # collapsed L12.ffn/L13.ffn into a single dead block, breaking
+            # 29 AX-write smoke tests. Bind to ``_layer13_attn_dep_anchor``
+            # instead: it is always registered (regardless of alu_mode) and
+            # is pinned at L13 via ``requires["after"]:
+            # _layer12_ffn_dep_anchor``, mirroring the same pattern used by
+            # ``efficient_l10_andorxor_wrap`` against ``layer10_carry_relay``.
+            target_op_name="_layer13_attn_dep_anchor",
             migrated=True,
+            # Keep ``requires["after"]`` on the final kind="ffn" composite
+            # stage so the install runs AFTER the composite is fully
+            # assembled (block.ffn = builder.composite must come after
+            # ShiftGEToBDStage was attached by the getobd op's bake).
             requires={"after": "l13_alu_shift_getobd"},
         smoke_tests={
             "TestSmoke32Bit::test_shl_8bit",
