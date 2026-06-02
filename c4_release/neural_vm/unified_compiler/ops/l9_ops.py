@@ -1151,7 +1151,14 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         # subsequent AX byte positions. Same numeric position as CARRY so
         # baked weight cells are byte-identical. Breaks the 3 L10 -> L9
         # back-edges (CARRY rank 9 in the latest scheduler SCC audit).
-        reads={"MARK_AX", "MARK_PC", "ALU_HI", "AX_CARRY_HI", "FETCH_HI",
+        # Phase 9.B (ALU_HI SCC rename): ALU_HI -> ALU_HI.*.-1 marks the
+        # read as SSA cross-step. L10 stack0_byte_relay{,_bake} stage
+        # ALU_HI for the NEXT step's L9 consumption (PSH/SI/SC stack-byte
+        # staging); same-step fresh ALU_HI from L7 operand_gather is
+        # still observed via consumes_fresh (ALU_HI@AX_byte0) declared
+        # below. Same numeric slot via SSA alias; byte-identical bake.
+        # Breaks 2 L10 -> L9 back-edges.
+        reads={"MARK_AX", "MARK_PC", "ALU_HI.*.-1", "AX_CARRY_HI", "FETCH_HI",
                "CARRY.*.-1",
                "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
