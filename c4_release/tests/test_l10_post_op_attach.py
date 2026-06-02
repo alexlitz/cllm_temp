@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 from c4_release.neural_vm.base_layers import PureFFN
-from c4_release.neural_vm.unified_compiler.full_vm_compiler import (
+from c4_release.neural_vm.unified_compiler.ops.shared import (
     declare_setdim_compat_dims,
 )
 from c4_release.neural_vm.unified_compiler.layer_compiler import LayerCompiler

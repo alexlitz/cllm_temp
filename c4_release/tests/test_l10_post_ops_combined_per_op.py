@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 from neural_vm.base_layers import PureFFN  # noqa: E402
-from neural_vm.unified_compiler.full_vm_compiler import (  # noqa: E402
+from neural_vm.unified_compiler.ops.shared import (  # noqa: E402
     declare_setdim_compat_dims,
 )
 from neural_vm.unified_compiler.layer_compiler import LayerCompiler  # noqa: E402
