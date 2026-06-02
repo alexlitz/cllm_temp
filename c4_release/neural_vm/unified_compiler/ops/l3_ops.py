@@ -715,8 +715,14 @@ def make_layer3_ffn_op() -> Operation:
         # rules use the previous step's OP_LEV decode as the "skip increment
         # on LEV" suppressor — byte-identical because OP_LEV_PREV_STEP
         # aliases OP_LEV. Breaks back-edge L5 → layer3_ffn on OP_LEV.
+        # Phase 8.A (EMBED_HI split): EMBED_HI_PREV_STEP marks the EMBED_HI
+        # read as cross-step relative to layer4_pc_relay (L4 writes EMBED_HI
+        # at the AX marker AFTER L3 in the same step). The same-step value
+        # carried by L3/L0-L2 still resolves at the same numeric position
+        # because EMBED_HI_PREV_STEP aliases EMBED_HI. Breaks the
+        # layer4_pc_relay → layer3_ffn back-edge on EMBED_HI.
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
-               "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "EMBED_LO", "EMBED_HI_PREV_STEP", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV_PREV_STEP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
@@ -995,8 +1001,11 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         phase=3,
         # Phase 8.A.6 v2: matches layer3_ffn's TEMP_PREV_STEP rename.
         # Phase 8.A: matches layer3_ffn's OP_LEV_PREV_STEP rename.
+        # Phase 8.A (EMBED_HI split): matches layer3_ffn's
+        # EMBED_HI_PREV_STEP rename. Same numeric position; breaks the
+        # layer4_pc_relay → _layer3_ffn_dep_anchor back-edge on EMBED_HI.
         reads={"MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "HAS_SE",
-               "EMBED_LO", "EMBED_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "EMBED_LO", "EMBED_HI_PREV_STEP", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "TEMP_PREV_STEP", "IS_BYTE", "H1", "H4", "OP_LEV_PREV_STEP",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
@@ -1144,7 +1153,13 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                # AX-marker attention back-edge (mirrors OUTPUT_HI_THIS_STEP
                # cross-step semantics; cycle-break tracked under the
                # requires["after"] declaration below).
-               "EMBED_LO", "EMBED_HI", "OUTPUT_LO_PREV_STEP",
+               # Phase 8.A (EMBED_HI split): EMBED_HI_PREV_STEP marks the
+               # EMBED_HI read as cross-step relative to layer4_pc_relay
+               # (L4 writes EMBED_HI at the AX marker AFTER L3 in the
+               # same step). Same numeric position; breaks the
+               # layer4_pc_relay → layer3_carry_forward_attn back-edge
+               # on EMBED_HI.
+               "EMBED_LO", "EMBED_HI_PREV_STEP", "OUTPUT_LO_PREV_STEP",
                "OUTPUT_HI_THIS_STEP", "CONST"},
         writes={"EMBED_LO", "EMBED_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                 "AX_FULL_LO", "AX_FULL_HI", "OUTPUT_LO", "OUTPUT_HI",
