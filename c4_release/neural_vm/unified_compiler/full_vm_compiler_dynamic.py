@@ -632,6 +632,21 @@ def _strict_mode_categorise(
     * A "freely_placeable" refinement marks ops with no in-edges AND no
       out-edges in the dep graph as ``ok`` regardless of phase vs depth
       — there is no constraint to satisfy.
+    * Phase-as-slot-share refinement (mirrors ``_topological_sort``): for
+      ops with an explicit ``phase=N`` but ``layer_idx=None``, the phase
+      is a slot-share key, not a hard layer pin.
+      ``LayerCompiler._assign_layers`` places such ops at
+      ``max(dep-derived earliest, slot-share constraint)`` and uses
+      ``phase`` only to break ties within a ``(layer, kind)`` slot. So
+      ``current < derived`` is NOT a strict-mode violation when the op
+      has no hard ``layer_idx`` pin — the dispatcher simply slides the
+      op to ``derived``. This mirrors the static path's
+      ``_topological_sort`` phase-pruning semantics (phase orders ops
+      INSIDE an SCC / same layer; it never overrides dep-derived layer
+      assignment). The categoriser flags
+      ``phase_inconsistent_with_deps`` only for ``layer_idx``-pinned ops,
+      where the static path cannot reconcile a phase < derived gap by
+      sliding the op later.
     """
     in_edges, out_edges, same_layer_edges = _build_strict_dep_graph(ops)
     depth, cycle_members = _strict_topo_depth(
@@ -669,6 +684,16 @@ def _strict_mode_categorise(
             buckets["ok"].append(op.name)
             continue
         if current < derived:
+            # Phase-as-slot-share refinement (see docstring): when the
+            # op has no ``layer_idx`` pin, ``phase`` is a slot-share key
+            # not a hard layer pin. ``_assign_layers`` will slide the op
+            # to ``derived`` (or later) and use ``phase`` only for
+            # intra-slot ordering. This mirrors ``_topological_sort``'s
+            # phase-pruning rules: phase orders ops within the same SCC
+            # / layer but never overrides dep-derived placement.
+            if op.layer_idx is None:
+                buckets["ok"].append(op.name)
+                continue
             buckets["phase_inconsistent_with_deps"].append(op.name)
             continue
         if current == derived:

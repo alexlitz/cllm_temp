@@ -441,6 +441,17 @@ def categorise(
             continue
 
         if current < derived:
+            # Phase-as-slot-share refinement (mirrors
+            # ``_topological_sort``): when the op has no ``layer_idx``
+            # pin, ``phase`` is a slot-share key not a hard layer pin.
+            # ``LayerCompiler._assign_layers`` slides the op to
+            # ``derived`` and uses ``phase`` only for intra-slot
+            # ordering, so ``current < derived`` is NOT an
+            # inconsistency. Only ``layer_idx``-pinned ops can be
+            # genuinely inconsistent with the DAG.
+            if op.layer_idx is None:
+                cats[op.name] = "phase_pinned_by_deps"
+                continue
             cats[op.name] = "phase_inconsistent_with_deps"
             continue
         if current == derived:
