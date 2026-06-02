@@ -9,7 +9,6 @@ from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
-from .shared import _bake_post_op_into
 
 
 # === L10 FFN unit layouts (pinned offsets) ==========================
@@ -1931,16 +1930,9 @@ def make_l10_post_ops_combined() -> Operation:
     turns already-computed 16-bit XOR bytes back into zero.
     """
     def bake(ffn, dim_positions, S):
-        from ...vm_step import (
-            BinaryOpByteZeroingPostOp,
-            CarryPropagationPostOp,
-            ComparisonCombine,
-        )
-        d_model = ffn.W_up.shape[1]
-
         # Per-bake FFN-unit allocator. Every sub-range matches the
-        # ``hidden_dim`` of the post-op instance baked into it and is
-        # pinned at the offset the inline ``_bake_post_op_into`` walk
+        # hidden_dim of the corresponding FFNRule family lowered into
+        # it and is pinned at the offset the historical inline walk
         # would naturally land on. Stashed on the FFN itself (this op
         # is ``kind="ffn"`` so ``ffn`` IS the block-equivalent target)
         # so a future second tenant in this dependency-assigned bank
@@ -1950,9 +1942,8 @@ def make_l10_post_ops_combined() -> Operation:
 
         # Pull the pinned starts back out of the allocator so the
         # inline walk uses the table as its source of truth. Drift
-        # between the walk and the table fails fast in
-        # ``_bake_post_op_into`` (which raises if the resulting end
-        # exceeds the FFN's ``hidden_dim``).
+        # between the walk and the rule-emitted cursors fails fast in
+        # the ``assert offset == ...`` checks below.
         by_name = {r.op_name: r for r in allocator.ranges()}
 
         offset = by_name["l10_post_ops_combined.binary_op_byte_zeroing"].start
