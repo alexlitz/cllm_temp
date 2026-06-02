@@ -323,7 +323,9 @@ def make_layer2_mem_byte_flags_op() -> Operation:
                 "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                 "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3"},
         kind="ffn",
-        layer_idx=2,
+        # Phase 8.G.6: drop ``layer_idx=2`` literal. The placement is
+        # derived from the dep graph: reads of H0/H1/H4 (L1 attn) +
+        # BYTE_INDEX_* (L1 ffn) force the earliest landing layer to L2.
         declarative_bake_fn=bake,
         compiler_ir=_layer2_mem_byte_flags_ir(),
         declarative_authority="spec_generated",
@@ -495,7 +497,10 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         reads={"MARK_PC", "HAS_SE"},
         writes={"EMBED_LO", "EMBED_HI"},
         kind="block",
-        layer_idx=2,
+        # Phase 8.G.6: drop ``layer_idx=2`` literal; bind to the L2 attn
+        # anchor ``layer2_threshold_attn`` so the block op resolves to
+        # whichever layer the L2 threshold-attn lands at.
+        target_op_name="layer2_threshold_attn",
         declarative_bake_fn=bake,
         compiler_ir=_layer2_initial_pc_bake_cancel_ir(),
         migrated=True,
@@ -561,7 +566,9 @@ def make_layer2_threshold_attn_op() -> Operation:
         reads={"IS_MARK", "CONST"},
         writes={"L2H0"},
         kind="attn",
-        layer_idx=2,
+        # Phase 8.G.6: drop ``layer_idx=2`` literal. ``requires["after"]
+        # = layer1_threshold_attn`` (below) is the structural pin: the
+        # dep edge forces this attn to land at L2 (one after L1).
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer2_threshold_ir,
         migrated=True,
@@ -656,7 +663,10 @@ def make_layer2_lookback_detection_head_op(
         reads={"CONST", "MARK_THINKING_START", "MARK_THINKING_END", "IS_BYTE"},
         writes=set(),
         kind="block",
-        layer_idx=2,
+        # Phase 8.G.6: drop ``layer_idx=2`` literal; bind to the L2 attn
+        # anchor ``layer2_threshold_attn`` so the block op resolves to
+        # whichever layer the L2 threshold-attn lands at.
+        target_op_name="layer2_threshold_attn",
         declarative_bake_fn=bake,
         compiler_ir_factory=(
             _layer2_lookback_detection_head_ir
