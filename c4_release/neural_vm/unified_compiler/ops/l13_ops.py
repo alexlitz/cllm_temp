@@ -408,11 +408,22 @@ def make_layer13_attn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer13_attn_dep_anchor",
-        # Phase=12.5 places this anchor between L12 MUL combine
-        # (phase=12) and L13 mem-addr-gather (phase=13). Same-step
-        # reads against the L12 dep anchor force the dep graph to land
-        # this at L13.
-        phase=12.5,
+        # Phase=13.0: nominally pins this anchor between the L12 dep
+        # anchor (phase=11.5, landed at L15) and the L14 dep anchor
+        # (phase=14, landed at L17). Intended to force L13 anchor to
+        # land at L13 (cluster A AX-zero, see
+        # SMOKE_MEMORY_TRACE_20260603.md Fix Option 1).
+        #
+        # NOTE 2026-06-03: empirically the bump from phase=12.5 to
+        # phase=13.0 alone did NOT move the anchor — it still lands at
+        # L16, identical to the 12.5 placement, because the dep-graph
+        # scheduler only uses `phase` as an SCC cycle-breaker (see
+        # layer_compiler.py:1745+) and there is no `before=` edge
+        # forcing the anchor earlier than the layer at which its
+        # `after: _layer12_ffn_dep_anchor` is first satisfiable. The
+        # real fix likely needs an explicit `layer_idx=13` (Fix Option
+        # 2) or a `before: layer14_addr_key_neural_decode` edge.
+        phase=13.0,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC",
                "OP_SI", "OP_SC", "MEM_ADDR_SRC", "L1H1"},
