@@ -370,11 +370,21 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
 
 
 def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    """Replace L10 ``block.ffn`` with ``ALUAndOrXor(S, BD)`` (= bitwise neural ALU).
+    """Replace L10 ``block.ffn`` with a rule-lowered bitwise FFN (= bitwise neural ALU).
 
-    Migrates the inline efficient-mode assignment at vm_step.py:
-        ``model.blocks[10].ffn = EfficientALU_L10_Neural(S, BD)``
-    (``EfficientALU_L10_Neural`` is an alias for ``ALUAndOrXor``.)
+    DSL Wave W1 (``docs/IR_DSL_DESIGN.md`` Section 5): the historical
+    ``block.ffn = ALUAndOrXor(S, BD)`` install (= a multi-stage BD/GE
+    composite from ``efficient_alu_neural.py``) is replaced by a
+    rule-derived ``PureFFN`` baked from
+    ``wide_alu_dsl.bitwise_rules(op=...)`` for AND/OR/XOR. Each opcode
+    emits 512 rules (256 lo + 256 hi nibble cross-product); the three
+    batches concatenate to 1,536 hidden units lowered in one
+    ``Primitives.lower_ffn_rules`` call.
+
+    Byte-identity contract: ``block.ffn.forward(x)`` decodes to the same
+    OUTPUT byte as the legacy ``ALUAndOrXor.forward`` — validated by the
+    POC ``tests/test_wide_alu_dsl.py`` (20/20 pass at scaffolding commit
+    ``5e9ff9be``) and by ``TestSmokeBitwise`` in the full VM compile.
 
     ``kind="block"`` at phase=10.85 — runs after ``l10_post_op_attach``
     (phase=10.7, which inspects ``block.ffn.W_up`` to derive d_model) and the
@@ -383,9 +393,54 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
     def bake(block, dim_positions, S):
         if alu_mode != 'efficient':
             return
-        from ...efficient_alu_neural import ALUAndOrXor
-        BD = _as_setdim_proxy(dim_positions)
-        block.ffn = ALUAndOrXor(S, BD)
+        from ...base_layers import PureFFN
+        from ..primitives import Primitives
+        from ..wide_alu_dsl import bitwise_rules
+
+        # Generate per-opcode rule batches (512 rules each: 256 lo + 256 hi).
+        rule_list: list = []
+        for op_name, opcode_gate in (
+            ("and", "OP_AND"),
+            ("or", "OP_OR"),
+            ("xor", "OP_XOR"),
+        ):
+            rule_list.extend(bitwise_rules(
+                op=op_name,
+                operand_a_lo="ALU_LO",
+                operand_a_hi="ALU_HI",
+                operand_b_lo="AX_CARRY_LO",
+                operand_b_hi="AX_CARRY_HI",
+                result_lo="OUTPUT_LO",
+                result_hi="OUTPUT_HI",
+                opcode_gate=opcode_gate,
+                marker_gate="MARK_AX",
+                S=S,
+            ))
+        rules = tuple(rule_list)
+        assert len(rules) == 3 * 512, (
+            f"bitwise_rules: expected 1536 rules (3 opcodes x 512), got {len(rules)}"
+        )
+
+        # Build a fresh PureFFN sized for the rule count and lower in one pass.
+        # d_model comes from the pre-existing block.ffn so we stay shape-stable
+        # whether or not the host is the production 512-dim residual.
+        ffn_in = block.ffn
+        if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
+            d_model = int(ffn_in.W_up.shape[1])
+        else:
+            d_model = int(getattr(ffn_in, "dim", 512))
+        new_ffn = PureFFN(dim=d_model, hidden_dim=len(rules))
+
+        bd_proxy = _as_setdim_proxy(dim_positions)
+        names = Primitives.ffn_rule_dim_names(rules)
+        dim_pos = Primitives.dim_positions_from_bd(bd_proxy, names)
+        end = Primitives.lower_ffn_rules(
+            new_ffn, rules, dim_pos, start_unit=0, S=S,
+        )
+        assert end == len(rules), (
+            f"lower_ffn_rules wrote {end} units; expected {len(rules)}"
+        )
+        block.ffn = new_ffn
 
     return Operation(
         name="efficient_l10_andorxor_wrap",
