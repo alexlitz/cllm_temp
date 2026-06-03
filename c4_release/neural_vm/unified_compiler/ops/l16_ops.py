@@ -340,7 +340,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_AX", -10.0),
             ("MARK_SP", -10.0),
             ("MARK_BP", -10.0),
-            ("MARK_STACK0", -10.0),
+            ("MARK_STACK0", -100.0),  # don't write 0x0a at STACK0 emit positions (var_* cluster)
             ("MARK_MEM", -10.0),
         ),
         threshold=7.5,
