@@ -1391,6 +1391,24 @@ def make_layer14_temp_clear_op() -> Operation:
         migrated=True,
         claims=_claims,
         requires={"after": "layer14_mem_generation"},
+        # Phase 7 produces/consumes_fresh POC (see
+        # docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py`` from the IR rule writes /
+        # condition reads, then slot-mapped manually:
+        #   - TEMP+0 at PC marker (unit 0)        -> "PC_marker"
+        #   - TEMP+8/9 position-uniform (1-2)     -> "PC_marker" (default)
+        #   - OUTPUT_HI_THIS_STEP+0..15 at AX     -> "AX_byte0"
+        # AX_CARRY_HI is a same-step read produced by L13 carry ALU at
+        # AX_byte0; declaring it consumes_fresh lets the scheduler enforce
+        # the L13 -> L14 ordering as a fresh-residual dependency.
+        produces={
+            "TEMP": "PC_marker",
+            "OUTPUT_HI_THIS_STEP": "AX_byte0",
+        },
+        consumes_fresh={
+            "TEMP": "PC_marker",
+            "AX_CARRY_HI": "AX_byte0",
+        },
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
