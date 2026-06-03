@@ -368,6 +368,10 @@ def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
 
     gate_sub = dim_ref("opcode_flag", "SUB")
     rules: list[FFNRule] = []
+    # Same 5-way AND shape as _layer9_add_hi_nibble_rules but gated on OP_SUB
+    # and writing ``(a - b - borrow_in) % 16``. CARRY+0 carries the borrow-in
+    # bit with the same +/- 2.0 sign-flipped discrimination at threshold
+    # 2.5 (no borrow) / 4.5 (with borrow).
     for borrow_in in (0, 1):
         for a in range(16):
             for b in range(16):
@@ -390,13 +394,11 @@ def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                         ("CARRY+0", 2.0),
                     )
                     threshold = 4.5
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l9_sub_hi_b{borrow_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
                     gate=gate_sub,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
                 ))
     return tuple(rules)
