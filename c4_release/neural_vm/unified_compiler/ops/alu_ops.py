@@ -119,6 +119,16 @@ def make_alu_shift_composite_ops():
             declarative_bake_fn=bake,
             declarative_authority="structural_model",
             migrated=True,
+            # Wave 5 (docs/PRODUCES_CONSUMES_MIGRATION.md): final GE->BD stage
+            # of the SHL/SHR composite writes the shifted result at the
+            # AX-marker row into OUTPUT_LO/HI -- same convention as the L14
+            # POC ops (AX_byte0 slot). Operand reads (ALU_LO/HI, AX_CARRY_LO/HI)
+            # are cross-step durables populated by upstream L7/L8 setup ops,
+            # not in-step fresh residuals; consumes_fresh stays empty.
+            produces={
+                "OUTPUT_LO": "AX_byte0",
+                "OUTPUT_HI_THIS_STEP": "AX_byte0",
+            },
         smoke_tests={
             "TestSmoke32Bit::test_shl_8bit",
             "TestSmoke32Bit::test_shr_8bit",
@@ -775,6 +785,15 @@ def make_l12_alu_mul_getobd_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
+        # Wave 5 (docs/PRODUCES_CONSUMES_MIGRATION.md): final GE->BD stage of
+        # the L11/L12 MUL flattened composite writes the multiplication result
+        # at the AX-marker row into OUTPUT_LO/HI -- AX_byte0 slot per the L14
+        # POC convention. Stage takes no fresh residual reads (operates on
+        # module-internal GE buffer); consumes_fresh stays empty.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI_THIS_STEP": "AX_byte0",
+        },
         # Phase 11.A r3: dropped phase=12.3 — target_op_name +
         # requires['after']: l12_alu_mul_finalcorrection already pin order.
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
@@ -928,6 +947,16 @@ def make_alu_divmod_composite_ops():
             target_op_name="layer10_carry_relay",
             migrated=True,
             declarative_authority="structural_model",
+            # Wave 5 (docs/PRODUCES_CONSUMES_MIGRATION.md): final GE->BD stage
+            # of the L10 DIV/MOD flattened composite writes the quotient/
+            # remainder at the AX-marker row into OUTPUT_LO/HI -- AX_byte0
+            # slot per the L14 POC convention. Reads OP_DIV/OP_MOD/MARK_AX
+            # are all cross-step durables (opcode/marker dims); consumes_fresh
+            # stays empty.
+            produces={
+                "OUTPUT_LO": "AX_byte0",
+                "OUTPUT_HI_THIS_STEP": "AX_byte0",
+            },
         smoke_tests={
             "TestSmokeBasic::test_div_basic",
             "TestSmokeBasic::test_mod_basic",
