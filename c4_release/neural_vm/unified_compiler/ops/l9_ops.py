@@ -3,6 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -475,9 +476,16 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     cmp_byte3 = dim_ref("cmp_flag", "cascade", 3)
     rules: list[FFNRule] = []
 
+    # Each CMP rule is a 4-way AND at the AX marker: MARK_AX(+1) +
+    # MARK_PC(-2) blocker + two operand-nibble one-hots(+1 each), gated
+    # on CMP_GROUP. The MARK_PC negative weight prevents the rule firing
+    # at PC marker positions where MARK_AX might leak in. multi_way_and_rule
+    # takes the explicit threshold=2.5 (the default derivation requires all
+    # positive weights and would not pass the negative MARK_PC blocker).
+
     # hi_eq: 16 units -> CMP+1
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l9_cmp_hi_eq_{k}",
             conditions=(
                 ("MARK_AX", 1.0),
@@ -487,14 +495,12 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             threshold=2.5,
             gate=gate_cmp_group,
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=((cmp_byte1, 2.0 / S),),
         ))
 
     # lo_eq: 16 units -> CMP+2
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l9_cmp_lo_eq_{k}",
             conditions=(
                 ("MARK_AX", 1.0),
@@ -504,15 +510,13 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             threshold=2.5,
             gate=gate_cmp_group,
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=((cmp_byte2, 2.0 / S),),
         ))
 
     # hi_lt: 120 units -> CMP+0 (a < b for hi nibble)
     for a in range(16):
         for b in range(a + 1, 16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l9_cmp_hi_lt_a{a}_b{b}",
                 conditions=(
                     ("MARK_AX", 1.0),
@@ -522,15 +526,13 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                 ),
                 threshold=2.5,
                 gate=gate_cmp_group,
-                gate_weight=1.0,
-                gate_bias=0.0,
                 writes=((cmp_byte0, 2.0 / S),),
             ))
 
     # lo_lt: 120 units -> CMP+3 (a < b for lo nibble)
     for a in range(16):
         for b in range(a + 1, 16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l9_cmp_lo_lt_a{a}_b{b}",
                 conditions=(
                     ("MARK_AX", 1.0),
@@ -540,8 +542,6 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                 ),
                 threshold=2.5,
                 gate=gate_cmp_group,
-                gate_weight=1.0,
-                gate_bias=0.0,
                 writes=((cmp_byte3, 2.0 / S),),
             ))
 
