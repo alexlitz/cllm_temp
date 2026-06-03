@@ -2712,13 +2712,19 @@ def make_layer6_ffn_dep_anchor_op() -> Operation:
 
     return Operation(
         name="_layer6_ffn_dep_anchor",
-        # Phase=5 matches ``_opcode_decode_ffn_dep_anchor`` so the two
-        # L6 FFN anchors share the same layer slot (the layer compiler's
-        # earliest-fit allocator co-places same-kind ops at the same
-        # phase). The actual ``layer6_routing_ffn`` block op runs at
-        # phase=6.5 and pins layer_idx=6 separately, so the anchor's
-        # phase is purely a placement key for the dep-graph slot table.
-        phase=5,
+        # 2026-06-03 fix: ``phase=5`` previously matched
+        # ``_opcode_decode_ffn_dep_anchor``'s phase=5, which together
+        # with ``same_layer_as`` (dropped above) forced both anchors
+        # into the SAME (layer, kind="ffn") slot via the
+        # ``layer_phase_kinds`` co-share rule in
+        # ``LayerCompiler._assign_layers``. The shared slot caused
+        # ``layer6_routing_ffn``'s start_unit=0..88 writes to clobber
+        # ``opcode_decode_ffn``'s OP_<NAME> band (see fix comment on
+        # ``same_layer_as`` above). Leaving ``phase`` unset (None)
+        # routes the anchor to its own layer slot — opcode_decode
+        # keeps L5's FFN; L6 routing claims its own FFN block.
+        # (The opcode-decode anchor's phase=5 in l5_ops.py is the
+        # historical pin; keeping it there preserves its layer slot.)
         # Mirrored subset of ``layer6_routing_ffn``'s reads/writes,
         # excluding dims the ``_opcode_decode_ffn_dep_anchor`` writes at
         # L6 (OP_IMM/OP_EXIT/OP_JMP/OP_NOP/OP_LEA/TEMP) so the new
@@ -2736,11 +2742,24 @@ def make_layer6_ffn_dep_anchor_op() -> Operation:
         kind="ffn",
         migrated=True,
         declarative_authority="topology_anchor",
-        # Co-place with ``_opcode_decode_ffn_dep_anchor`` so the new
-        # anchor lands at exactly L6 (where the opcode-decode anchor
-        # lands today). The phase-share rule (same kind, same phase)
-        # then puts both in the L6 FFN slot.
-        requires={"same_layer_as": "_opcode_decode_ffn_dep_anchor"},
+        # 2026-06-03 fix: the historical ``requires={"same_layer_as":
+        # "_opcode_decode_ffn_dep_anchor"}`` co-placement was load-bearing
+        # but produced an L5/L6 FFN COLLISION — both ``opcode_decode_ffn``
+        # (89 units at start_unit=0..88) and ``layer6_routing_ffn``
+        # (~2328 units, starting at L6_IMM_FETCH_ROUTE_START_UNIT=0)
+        # bound via ``target_op_name`` to anchors that landed in the
+        # SAME block, so L6 routing's units 0..88 trampled the L5
+        # opcode-decode writes. The right-sized FFN block kept only
+        # L6's footprint (1514 hidden units), and the L5 OP_<NAME>
+        # writes to compact dims 187..217 disappeared — every smoke
+        # test reading OP_EQ / OP_IMM / OP_EXIT got 0, breaking
+        # test_imm_exit (return 0 instead of 42), TestSmokeComparison,
+        # and many more (see ``docs/SMOKE_COMPARISON_OP_DECODE_MISSING.md``).
+        # Dropping ``requires["same_layer_as"]`` lets each FFN anchor
+        # land on its OWN block (L5 = 89-unit opcode_decode, L6 =
+        # ~2328-unit routing). Byte-identity for L6 tenants is preserved
+        # because their ``start_unit`` constants now address their own
+        # block's hidden units (no overlap with L5's 89-unit slot).
         smoke_tests=set(),
         spec_section=None,
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
