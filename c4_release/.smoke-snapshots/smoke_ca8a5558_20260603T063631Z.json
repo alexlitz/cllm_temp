@@ -1,0 +1,429 @@
+{
+  "schema_version": 1,
+  "commit": "ca8a555878449c50cc00a10c07021932bc1b4088",
+  "commit_short": "ca8a5558",
+  "branch": "HEAD",
+  "timestamp_utc": "2026-06-03T06:36:31Z",
+  "pytest_args": [
+    "c4_release/tests/test_smoke.py",
+    "-q",
+    "--tb=no",
+    "-rA"
+  ],
+  "duration_seconds": 2.7,
+  "returncode": 1,
+  "totals": {
+    "passed": 6,
+    "failed": 4,
+    "errors": 41,
+    "skipped": 0,
+    "xfailed": 0,
+    "xpassed": 0
+  },
+  "by_class": {
+    "TestSmoke32Bit": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 10,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeAddress": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 2,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeBasic": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 6,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeBitwise": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 3,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeComparison": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 7,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeControlFlow": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 3,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeFunctionCall": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 1,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeHandlerStatus": {
+      "passed": 3,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeHarnessConfig": {
+      "passed": 3,
+      "failed": 4,
+      "errors": 0,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeIntegration": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 1,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeMemory": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 6,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    "TestSmokeShift": {
+      "passed": 0,
+      "failed": 0,
+      "errors": 2,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    }
+  },
+  "tests": [
+    {
+      "class": "TestSmokeHarnessConfig",
+      "name": "test_lookup_and_check_exposes_neural_result_mismatch",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHarnessConfig::test_lookup_and_check_exposes_neural_result_mismatch",
+      "outcome": "passed"
+    },
+    {
+      "class": "TestSmokeHarnessConfig",
+      "name": "test_lookup_and_check_reports_batch_errors",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHarnessConfig::test_lookup_and_check_reports_batch_errors",
+      "outcome": "passed"
+    },
+    {
+      "class": "TestSmokeHarnessConfig",
+      "name": "test_selected_group_filter_keeps_focused_pytest_runs_narrow",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHarnessConfig::test_selected_group_filter_keeps_focused_pytest_runs_narrow",
+      "outcome": "passed"
+    },
+    {
+      "class": "TestSmokeHandlerStatus",
+      "name": "test_neural_ops_no_handler",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHandlerStatus::test_neural_ops_no_handler",
+      "outcome": "passed"
+    },
+    {
+      "class": "TestSmokeHandlerStatus",
+      "name": "test_handler_ops_have_handler",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHandlerStatus::test_handler_ops_have_handler",
+      "outcome": "passed"
+    },
+    {
+      "class": "TestSmokeHandlerStatus",
+      "name": "test_phase6_prtf_read_status_is_explicit",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHandlerStatus::test_phase6_prtf_read_status_is_explicit",
+      "outcome": "passed"
+    },
+    {
+      "class": "TestSmokeBasic",
+      "name": "test_imm_exit",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeBasic::test_imm_exit",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeBasic",
+      "name": "test_add_basic",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeBasic::test_add_basic",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeBasic",
+      "name": "test_sub_basic",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeBasic::test_sub_basic",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeBasic",
+      "name": "test_mul_basic",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeBasic::test_mul_basic",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeBasic",
+      "name": "test_div_basic",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeBasic::test_div_basic",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeBasic",
+      "name": "test_mod_basic",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeBasic::test_mod_basic",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeControlFlow",
+      "name": "test_jmp_forward",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeControlFlow::test_jmp_forward",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeControlFlow",
+      "name": "test_bz_branch",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeControlFlow::test_bz_branch",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeControlFlow",
+      "name": "test_bnz_branch",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeControlFlow::test_bnz_branch",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeFunctionCall",
+      "name": "test_simple_function",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeFunctionCall::test_simple_function",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeBitwise",
+      "name": "test_or_basic",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeBitwise::test_or_basic",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeBitwise",
+      "name": "test_and_basic",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeBitwise::test_and_basic",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeBitwise",
+      "name": "test_xor_basic",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeBitwise::test_xor_basic",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeComparison",
+      "name": "test_eq_true",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeComparison::test_eq_true",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeComparison",
+      "name": "test_eq_false",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeComparison::test_eq_false",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeComparison",
+      "name": "test_lt_true",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeComparison::test_lt_true",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeComparison",
+      "name": "test_ne_true",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeComparison::test_ne_true",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeComparison",
+      "name": "test_gt_true",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeComparison::test_gt_true",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeComparison",
+      "name": "test_le_true",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeComparison::test_le_true",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeComparison",
+      "name": "test_ge_true",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeComparison::test_ge_true",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeAddress",
+      "name": "test_lea_basic",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeAddress::test_lea_basic",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeAddress",
+      "name": "test_adj_sp",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeAddress::test_adj_sp",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeMemory",
+      "name": "test_si_li_roundtrip",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeMemory::test_si_li_roundtrip",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeMemory",
+      "name": "test_sc_lc_roundtrip",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeMemory::test_sc_lc_roundtrip",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeMemory",
+      "name": "test_si_li_zero",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeMemory::test_si_li_zero",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeMemory",
+      "name": "test_si_li_multiple_stores",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeMemory::test_si_li_multiple_stores",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeMemory",
+      "name": "test_si_li_overwrite",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeMemory::test_si_li_overwrite",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeMemory",
+      "name": "test_si_li_16bit_value",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeMemory::test_si_li_16bit_value",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeShift",
+      "name": "test_shl",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeShift::test_shl",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeShift",
+      "name": "test_shr",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeShift::test_shr",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_add_16bit",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_add_16bit",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_add_carry_cascade",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_add_carry_cascade",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_sub_16bit",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_sub_16bit",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_sub_borrow_cascade",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_sub_borrow_cascade",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_or_16bit",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_or_16bit",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_and_16bit",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_and_16bit",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_xor_16bit",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_xor_16bit",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_mul_overflow",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_mul_overflow",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_shl_8bit",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_shl_8bit",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmoke32Bit",
+      "name": "test_shr_8bit",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmoke32Bit::test_shr_8bit",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeIntegration",
+      "name": "test_cmp_and_branch",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeIntegration::test_cmp_and_branch",
+      "outcome": "error"
+    },
+    {
+      "class": "TestSmokeHarnessConfig",
+      "name": "test_spec_k_zero_disables_draftvm_bucketing",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHarnessConfig::test_spec_k_zero_disables_draftvm_bucketing",
+      "outcome": "failed"
+    },
+    {
+      "class": "TestSmokeHarnessConfig",
+      "name": "test_positive_spec_k_enables_spec_experiment_bucketing",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHarnessConfig::test_positive_spec_k_enables_spec_experiment_bucketing",
+      "outcome": "failed"
+    },
+    {
+      "class": "TestSmokeHarnessConfig",
+      "name": "test_max_steps_cap_overrides_group_max",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHarnessConfig::test_max_steps_cap_overrides_group_max",
+      "outcome": "failed"
+    },
+    {
+      "class": "TestSmokeHarnessConfig",
+      "name": "test_declarative_check_failure_blocks_neural_batch",
+      "nodeid": "c4_release/tests/test_smoke.py::TestSmokeHarnessConfig::test_declarative_check_failure_blocks_neural_batch",
+      "outcome": "failed"
+    }
+  ]
+}
