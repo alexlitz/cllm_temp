@@ -1028,8 +1028,13 @@ def make_layer10_residual_alibi_slopes_op(alu_mode: str = 'lookup') -> Operation
         attn10.alibi_slopes[1] = 1.0  # head 1: AX byte passthrough
         attn10.alibi_slopes[2] = 1.0  # head 2: SP byte passthrough
         attn10.alibi_slopes[3] = 0.5  # head 3: PSH STACK0 passthrough
-        if alu_mode == 'lookup':
-            attn10.alibi_slopes[4] = 1.0  # head 4: STACK0 byte relay for bitwise
+        # Cluster C (2026-06-03): head 4 spec bakes unconditionally (the
+        # bitwise stack-byte relay also feeds SUB byte 1+ in efficient mode
+        # via the shared head). Gating the slope on alu_mode='lookup' left
+        # efficient mode with slope[4]=0, so the head's attention was
+        # muted and SUB stack byte 1 read as zero -> UINT32 wrap. Ungate
+        # so the slope matches the (already unconditional) weight bake.
+        attn10.alibi_slopes[4] = 1.0  # head 4: STACK0 byte relay for bitwise
 
     return Operation(
         name="layer10_residual_alibi_slopes",
