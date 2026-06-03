@@ -548,12 +548,11 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         # the dynamic scheduler honours the requires["after"] edge.
         requires={"after": "phase_a_ffn"},
         step_idx={0},
-        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L2 token-feed
-        # step-0 cancel op. Writes EMBED_LO/HI (cross-step durables)
-        # at MARK_PC. HAS_SE read is uniformly zero at step 0
-        # (step_idx={0}); no consumes_fresh assertion is meaningful.
-        produces={},
-        consumes_fresh={},
+        # Wave 4 note: the earlier ``produces``/``consumes_fresh`` block
+        # (~line 526) already encodes the L2 token-feed step-0 cancel
+        # contract (EMBED_LO/HI at PC_marker; HAS_SE as the fresh gate).
+        # The duplicate placeholders that previously lived here triggered
+        # ``SyntaxError: keyword argument repeated`` at import; removed.
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

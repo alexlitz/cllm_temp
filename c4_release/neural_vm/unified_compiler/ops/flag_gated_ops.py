@@ -676,22 +676,12 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         # 1400-1401. Encoded as a B10 op-name reference so the dynamic
         # scheduler honours the dep edge despite empty reads/writes.
         requires={"after": "layer6_routing_ffn"},
-        # Wave 3 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
-        # ``tools/derive_produces_consumes.py``. The two ``gated_write``
-        # rules fire on ``CMP+5/CMP+6 AND NEXT_SE`` and emit the trio of
-        # state-machine flags. ``NEXT_SE`` is the row marker for the
-        # next-step-end position the L6 routing FFN tags, so the slot
-        # follows the existing ``*_marker`` convention introduced by the
-        # wave 1 ``MEM_marker`` slot. ``consumes_fresh`` is empty: the
-        # condition dims (``CMP+5/6``, ``NEXT_SE``) are not declared in
-        # the op's empty ``reads`` set, so the derive filter yields no
-        # entries (per the documented rule). Reads-set enrichment is a
-        # follow-up.
-        produces={
-            "IO_STATE": "step_end_marker",
-            "NEXT_SE": "step_end_marker",
-            "NEXT_THINKING_END": "step_end_marker",
-        },
+        # Wave 3 note: the earlier ``produces``/``consumes_fresh`` block
+        # (~line 663) already encodes the CMP+5/CMP+6 cascade contract
+        # using slot ``layer6_attn`` (the ``target_op_name`` anchor). The
+        # duplicate ``produces={"IO_STATE": "step_end_marker", ...}`` that
+        # previously lived here triggered ``SyntaxError: keyword argument
+        # repeated`` at import; removed.
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
@@ -1050,19 +1040,11 @@ def make_convo_io_step_resume_op(
         # op-name reference so the dynamic scheduler honours the dep
         # edge despite empty reads/writes.
         requires={"after": "layer3_convo_io_state_init"},
-        # Wave 3 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
-        # ``tools/derive_produces_consumes.py``. The single
-        # ``constant_write`` rule fires on ``LAST_WAS_THINKING_START`` and
-        # emits ``NEXT_PC`` + clears ``IO_STATE`` / ``IO_IN_OUTPUT_MODE``.
-        # Slot follows the row-marker naming convention (the rule scopes
-        # by ``LAST_WAS_THINKING_START`` — the step-resume marker row).
-        # ``consumes_fresh`` is empty: ``LAST_WAS_THINKING_START`` is not
-        # in the op's empty ``reads`` set, so derive filters it out.
-        produces={
-            "IO_IN_OUTPUT_MODE": "thinking_start_marker",
-            "IO_STATE": "thinking_start_marker",
-            "NEXT_PC": "thinking_start_marker",
-        },
+        # Wave 3 note: the earlier ``produces`` block (~line 1025) already
+        # encodes the IO_STATE / IO_IN_OUTPUT_MODE / NEXT_PC writes using
+        # slot ``layer3_carry_forward_attn`` (the ``target_op_name`` anchor).
+        # The duplicate placeholder that previously lived here triggered
+        # ``SyntaxError: keyword argument repeated`` at import; removed.
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
@@ -1190,21 +1172,11 @@ def make_convo_io_pc_sp_latch_op(
         # dynamic scheduler honours the dep edge despite empty
         # reads/writes.
         requires={"after": "convo_io_state_machine"},
-        # Wave 3 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
-        # ``tools/derive_produces_consumes.py``. 64 ``gated_write`` rules
-        # all fire on ``LAST_WAS_THINKING_START`` with a per-nibble
-        # ``POST_PRTF_{PC,SP}_{LO,HI}+k`` gate, writing
-        # ``OUTPUT_{LO,HI_THIS_STEP}+k`` for k in 0..15. Shares the
-        # ``thinking_start_marker`` slot with ``convo_io_step_resume`` —
-        # both bands fire on the LAST_WAS_THINKING_START row that drives
-        # the resumed REG_PC / REG_SP token emission. ``consumes_fresh``
-        # is empty: the condition/gate dims (LAST_WAS_THINKING_START,
-        # POST_PRTF_*) are not declared in the op's empty ``reads`` set,
-        # so derive filters them out.
-        produces={
-            "OUTPUT_HI_THIS_STEP": "thinking_start_marker",
-            "OUTPUT_LO": "thinking_start_marker",
-        },
+        # Wave 3 note: the earlier ``produces`` block (~line 1158) already
+        # encodes the OUTPUT_LO / OUTPUT_HI_THIS_STEP writes using slot
+        # ``layer6_attn`` (the ``target_op_name`` anchor). The duplicate
+        # placeholder that previously lived here triggered ``SyntaxError:
+        # keyword argument repeated`` at import; removed.
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )
