@@ -1016,3 +1016,457 @@ def test_wide_mul_rules_byte_identity_8bit(lowered_mul_ffn):
         f"wide_mul byte-identity failures ({len(mismatches)}/256):\n  "
         + "\n  ".join(mismatches[:10])
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave W3: wide_sub_rules multi-byte byte-identity (width_bytes=2 = 8-bit
+# value at 2 nibble lanes, width_bytes=4 = 16-bit at 4 nibble lanes).
+# ---------------------------------------------------------------------------
+#
+# Same single-pass cascade limitation as the wide_add multi-byte tests:
+# the FFN cannot self-feed a borrow written this pass back into a higher
+# nibble's lookup. We pre-inject the expected borrow-in flags into the
+# input residual so each nibble's rule sees the borrow chain it needs,
+# isolating the per-rule semantics from the cross-pass cascade (the
+# wider pipeline handles propagation across layers).
+#
+# Layout reuses the same ad-hoc band layout as the add multi-byte tests:
+# nibble lane ``bi`` lives at ``OPERAND_*+bi*16+nib`` and the borrow band
+# at ``CARRY+bi`` (here repurposed as the borrow_base for SUB).
+
+_SUB_MAX_BYTES = _ADD_MAX_BYTES
+_SUB_DIM_LAYOUT = {
+    "MARK_GATE": 0,
+    "OP_SUB_GATE": 1,
+    "OPERAND_A": 2,
+    "OPERAND_B": 2 + 16 * _SUB_MAX_BYTES,
+    "RESULT":    2 + 32 * _SUB_MAX_BYTES,
+    "BORROW":    2 + 48 * _SUB_MAX_BYTES,
+}
+_SUB_FFN_DIM = 2 + 48 * _SUB_MAX_BYTES + _SUB_MAX_BYTES
+
+
+def _build_wide_sub_rules_multi(width_bytes: int, S: float = 100.0):
+    """Construct multi-byte wide_sub rules for the ad-hoc dim layout."""
+    return wide_sub_rules(
+        operand_a_base="OPERAND_A",
+        operand_b_base="OPERAND_B",
+        result_base="RESULT",
+        borrow_base="BORROW",
+        width_bytes=width_bytes,
+        opcode_gate="OP_SUB_GATE",
+        marker_gate="MARK_GATE",
+        S=S,
+    )
+
+
+def _lowered_pureffn_for_wide_sub_multi(
+    width_bytes: int, S: float = 100.0
+) -> PureFFN:
+    """Lower the multi-byte wide_sub rules into a PureFFN."""
+    rules = _build_wide_sub_rules_multi(width_bytes, S=S)
+    # Per docstring: 256 for byte 0 + (512 + 1) per subsequent byte
+    # (mirror of wide_add_rules).
+    expected_count = 256 + (width_bytes - 1) * (512 + 1)
+    assert len(rules) == expected_count, (
+        f"wide_sub_rules(width_bytes={width_bytes}) emitted {len(rules)} "
+        f"rules, expected {expected_count}"
+    )
+    ffn = PureFFN(dim=_SUB_FFN_DIM, hidden_dim=expected_count)
+    end = Primitives.lower_ffn_rules(
+        ffn, rules, _SUB_DIM_LAYOUT, start_unit=0, S=S,
+    )
+    assert end == expected_count, (
+        f"lower_ffn_rules wrote {end} units, expected {expected_count}"
+    )
+    return ffn
+
+
+def _make_wide_sub_input(
+    *, a: int, b: int, width_bytes: int
+) -> torch.Tensor:
+    """Build a one-position residual carrying a multi-nibble (a, b) SUB
+    plus the pre-computed borrow-in one-hots needed for each nibble > 0.
+
+    Operand A (minuend) nibbles populate ``OPERAND_A+(bi*16 + nib)``;
+    operand B (subtrahend) similarly. Borrow-in flags ``BORROW+bi`` for
+    ``bi in 0..width-2`` are set if the partial diff at nibble ``bi``
+    borrows (precomputed in Python so the single-pass FFN can resolve
+    each nibble's lookup without needing a multi-pass cascade).
+    """
+    x = torch.zeros(1, 1, _SUB_FFN_DIM)
+    x[0, 0, _SUB_DIM_LAYOUT["MARK_GATE"]] = 1.0
+    x[0, 0, _SUB_DIM_LAYOUT["OP_SUB_GATE"]] = 1.0
+    a_nibs = _per_nibble(a, width_bytes)
+    b_nibs = _per_nibble(b, width_bytes)
+    for bi, (an, bn) in enumerate(zip(a_nibs, b_nibs)):
+        x[0, 0, _SUB_DIM_LAYOUT["OPERAND_A"] + bi * 16 + an] = 1.0
+        x[0, 0, _SUB_DIM_LAYOUT["OPERAND_B"] + bi * 16 + bn] = 1.0
+    # Precompute borrow chain for the input residual so each nibble's
+    # lookup sees the expected borrow-in via BORROW+(bi-1).
+    borrow = 0
+    for bi in range(width_bytes - 1):
+        raw = a_nibs[bi] - b_nibs[bi] - borrow
+        borrow = 1 if raw < 0 else 0
+        if borrow:
+            x[0, 0, _SUB_DIM_LAYOUT["BORROW"] + bi] = 1.0
+    return x
+
+
+def _decode_wide_sub_result(y: torch.Tensor, width_bytes: int) -> int:
+    """Reassemble the multi-nibble diff by argmax over each nibble's
+    RESULT lane and packing nibbles little-endian.
+    """
+    base = _SUB_DIM_LAYOUT["RESULT"]
+    value = 0
+    for bi in range(width_bytes):
+        lane = y[0, 0, base + bi * 16:base + bi * 16 + 16]
+        value |= int(lane.argmax().item()) << (4 * bi)
+    return value
+
+
+def test_wide_sub_rules_emit_expected_multi_byte_count():
+    """Sanity: rule count formula 256 + (W - 1) * 513 for width_bytes 1..8."""
+    for w in (1, 2, 4, 8):
+        rules = _build_wide_sub_rules_multi(w)
+        assert len(rules) == 256 + (w - 1) * (512 + 1), (
+            f"width_bytes={w}: emitted {len(rules)} rules, "
+            f"expected {256 + (w - 1) * (512 + 1)}"
+        )
+
+
+def test_wide_sub_rules_rejects_bad_width_bytes():
+    """``width_bytes < 1`` is a ValueError."""
+    with pytest.raises(ValueError, match="width_bytes"):
+        wide_sub_rules(
+            operand_a_base="OPERAND_A",
+            operand_b_base="OPERAND_B",
+            result_base="RESULT",
+            borrow_base="BORROW",
+            width_bytes=0,
+            opcode_gate="OP_SUB_GATE",
+            marker_gate="MARK_GATE",
+            S=100.0,
+        )
+
+
+@pytest.fixture(scope="module")
+def lowered_sub_ffn_8bit_multi() -> PureFFN:
+    # width_bytes=2 -> 2 nibbles -> 8 bits
+    return _lowered_pureffn_for_wide_sub_multi(2)
+
+
+@pytest.fixture(scope="module")
+def lowered_sub_ffn_16bit() -> PureFFN:
+    # width_bytes=4 -> 4 nibbles -> 16 bits
+    return _lowered_pureffn_for_wide_sub_multi(4)
+
+
+def test_wide_sub_rules_byte_identity_8bit_multi(lowered_sub_ffn_8bit_multi):
+    """width_bytes=2 (8-bit via 2 nibble lanes) decoded diff equals
+    ``(a - b) & 0xFF`` for every sampled pair, including the canonical
+    0x100-1 borrow boundary.
+
+    The pre-injected borrow-in flag per ``_make_wide_sub_input`` lets each
+    nibble's lookup see its expected borrow-in. This validates the
+    per-nibble rule semantics (borrow suppression for bin=0, positive
+    borrow-in activation for bin=1) and the multi-nibble end-to-end
+    layout for a single byte's worth of value split across 2 nibble lanes.
+    """
+    gen = torch.Generator().manual_seed(0x05B17506)  # "8-bit sub"
+    n_trials = 64
+    pairs = torch.randint(0, 256, (n_trials, 2), generator=gen).tolist()
+    # Boundary cases: the task brief requests the 0x100-1 borrow boundary,
+    # plus zero, alternating, and full-width borrow chain coverage.
+    pairs += [
+        (0x00, 0x00),
+        (0xFF, 0xFF),
+        (0x00, 0x01),  # 0x100 - 1 boundary: forces borrow through nibble 0
+        (0x10, 0x01),  # mid-byte borrow boundary
+        (0x80, 0x7F),
+        (0x55, 0xAA),  # interleaved bits, full borrow
+        (0xAA, 0x55),  # interleaved bits, no borrow
+    ]
+
+    mismatches = []
+    for a, b in pairs:
+        x = _make_wide_sub_input(a=a, b=b, width_bytes=2)
+        with torch.no_grad():
+            y = lowered_sub_ffn_8bit_multi(x)
+        decoded = _decode_wide_sub_result(y, width_bytes=2)
+        expected = (a - b) & 0xFF
+        if decoded != expected:
+            mismatches.append(
+                f"a=0x{a:02X} b=0x{b:02X}: "
+                f"expected=0x{expected:02X} got=0x{decoded:02X}"
+            )
+
+    assert not mismatches, (
+        f"wide_sub width=2 (8-bit) byte-identity failures "
+        f"({len(mismatches)}/{len(pairs)}):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+def test_wide_sub_rules_byte_identity_16bit(lowered_sub_ffn_16bit):
+    """width_bytes=4 (16-bit, 4 nibble lanes) decoded diff equals
+    ``(a - b) & 0xFFFF`` for every sampled pair, including the canonical
+    0x10000-1 borrow boundary.
+    """
+    gen = torch.Generator().manual_seed(0x16B17506)  # "16-bit sub"
+    n_trials = 64
+    pairs = torch.randint(0, 0x10000, (n_trials, 2), generator=gen).tolist()
+    # Boundary cases: full-width borrow chain, mid-width borrow, no-borrow.
+    pairs += [
+        (0x0000, 0x0000),
+        (0xFFFF, 0xFFFF),
+        (0x0000, 0x0001),  # 0x10000 - 1: full-chain borrow
+        (0x0100, 0x0001),  # mid-width borrow boundary
+        (0x1000, 0x0001),  # borrow through 3 nibbles
+        (0x5555, 0xAAAA),  # interleaved bits, full borrow
+        (0xAAAA, 0x5555),  # interleaved bits, no borrow
+    ]
+
+    mismatches = []
+    for a, b in pairs:
+        x = _make_wide_sub_input(a=a, b=b, width_bytes=4)
+        with torch.no_grad():
+            y = lowered_sub_ffn_16bit(x)
+        decoded = _decode_wide_sub_result(y, width_bytes=4)
+        expected = (a - b) & 0xFFFF
+        if decoded != expected:
+            mismatches.append(
+                f"a=0x{a:04X} b=0x{b:04X}: "
+                f"expected=0x{expected:04X} got=0x{decoded:04X}"
+            )
+
+    assert not mismatches, (
+        f"wide_sub width=4 (16-bit) byte-identity failures "
+        f"({len(mismatches)}/{len(pairs)}):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave W2: wide_shift_rules multi-byte byte-identity (width_bytes=2 = 16-bit,
+# width_bytes=4 = 32-bit).
+# ---------------------------------------------------------------------------
+#
+# Shift semantics from ``wide_shift_rules`` docstring: "The shift is
+# per-byte and independent across bytes -- no inter-byte propagation,
+# matching the simplified semantics this Wave is targeting." So multi-byte
+# shift = N independent 8-bit shifts, one per byte lane. The test
+# validates the cross-byte layout (each byte's operand at ``OPERAND_BASE
+# + b*256 + N`` writes to ``RESULT_BASE + b*256 + result`` without
+# bleeding into adjacent lanes) and randomised + boundary correctness.
+#
+# Reuses the same per-byte 256-wide one-hot bands as the 8-bit shift
+# test; we just widen the OPERAND / RESULT bands to cover ``width_bytes *
+# 256`` slots.
+
+_MULTI_SHIFT_MAX_BYTES = 4
+_MULTI_SHIFT_DIM_LAYOUT = {
+    "MARK_GATE": 0,
+    "OP_SHL_GATE": 1,
+    "OP_SHR_GATE": 2,
+    "SHIFT_AMT": 3,                              # +k for k in 0..7
+    "OPERAND": 11,                               # +(b*256 + N)
+    "RESULT": 11 + 256 * _MULTI_SHIFT_MAX_BYTES,  # +(b*256 + R)
+}
+_MULTI_SHIFT_FFN_DIM = 11 + 512 * _MULTI_SHIFT_MAX_BYTES
+
+
+def _lowered_wide_shift_ffn_multi(
+    direction: str, width_bytes: int, S: float = 100.0
+) -> PureFFN:
+    """Build a multi-byte PureFFN lowered from ``wide_shift_rules`` for one
+    direction at the given width.
+    """
+    rules = wide_shift_rules(
+        direction=direction,
+        operand_base="OPERAND",
+        shift_amount_dim="SHIFT_AMT",
+        result_base="RESULT",
+        width_bytes=width_bytes,
+        opcode_gate="OP_SHL_GATE" if direction == "left" else "OP_SHR_GATE",
+        marker_gate="MARK_GATE",
+        S=S,
+    )
+    expected_count = width_bytes * 8 * 256
+    assert len(rules) == expected_count, (
+        f"wide_shift_rules({direction!r}, width_bytes={width_bytes}) "
+        f"emitted {len(rules)} rules, expected {expected_count}"
+    )
+    ffn = PureFFN(dim=_MULTI_SHIFT_FFN_DIM, hidden_dim=expected_count)
+    end = Primitives.lower_ffn_rules(
+        ffn, rules, _MULTI_SHIFT_DIM_LAYOUT, start_unit=0, S=S,
+    )
+    assert end == expected_count, (
+        f"lower_ffn_rules wrote {end} units, expected {expected_count}"
+    )
+    return ffn
+
+
+def _make_multi_shift_input(
+    *, ns: list[int], k: int, direction: str, width_bytes: int
+) -> torch.Tensor:
+    """One-position residual with marker, opcode, shift amount, and one
+    operand byte per lane. ``ns[bi]`` is the byte value at lane ``bi``.
+    """
+    assert len(ns) == width_bytes, (
+        f"need exactly {width_bytes} byte values, got {len(ns)}"
+    )
+    x = torch.zeros(1, 1, _MULTI_SHIFT_FFN_DIM)
+    x[0, 0, _MULTI_SHIFT_DIM_LAYOUT["MARK_GATE"]] = 1.0
+    gate_dim = "OP_SHL_GATE" if direction == "left" else "OP_SHR_GATE"
+    x[0, 0, _MULTI_SHIFT_DIM_LAYOUT[gate_dim]] = 1.0
+    x[0, 0, _MULTI_SHIFT_DIM_LAYOUT["SHIFT_AMT"] + k] = 1.0
+    for bi, n in enumerate(ns):
+        x[0, 0, _MULTI_SHIFT_DIM_LAYOUT["OPERAND"] + bi * 256 + (n & 0xFF)] = 1.0
+    return x
+
+
+def _decode_multi_shift_result(
+    y: torch.Tensor, width_bytes: int
+) -> list[int]:
+    """Decode each byte lane independently via argmax over its 256-wide
+    RESULT slice.
+    """
+    base = _MULTI_SHIFT_DIM_LAYOUT["RESULT"]
+    return [
+        int(y[0, 0, base + bi * 256:base + bi * 256 + 256].argmax().item())
+        for bi in range(width_bytes)
+    ]
+
+
+@pytest.fixture(scope="module")
+def lowered_shift_ffns_16bit() -> dict:
+    return {
+        "left": _lowered_wide_shift_ffn_multi("left", 2),
+        "right": _lowered_wide_shift_ffn_multi("right", 2),
+    }
+
+
+@pytest.fixture(scope="module")
+def lowered_shift_ffns_32bit() -> dict:
+    return {
+        "left": _lowered_wide_shift_ffn_multi("left", 4),
+        "right": _lowered_wide_shift_ffn_multi("right", 4),
+    }
+
+
+@pytest.mark.parametrize("direction", ["left", "right"])
+def test_wide_shift_rules_byte_identity_16bit(
+    lowered_shift_ffns_16bit, direction
+):
+    """width_bytes=2 cross-byte shift: each of the 2 byte lanes shifts
+    independently. Lane ``bi`` must equal ``(ns[bi] OP k) & 0xFF`` with no
+    bleed into the other lane.
+
+    Boundary coverage:
+      * 0x80 << 1 (carry-out lost — drop high bit per per-byte semantics)
+      * 0x01 << 7 (max shift)
+      * 0xFF >> 7 (max right shift)
+      * Mixed lanes (one lane non-trivial, other lane zero) to verify
+        cross-byte isolation.
+    """
+    gen = torch.Generator().manual_seed(0x16B175 if direction == "left" else 0x16B175F2)
+    pairs = []
+    for _ in range(32):
+        b0 = int(torch.randint(0, 256, (1,), generator=gen).item())
+        b1 = int(torch.randint(0, 256, (1,), generator=gen).item())
+        k = int(torch.randint(0, 8, (1,), generator=gen).item())
+        pairs.append(([b0, b1], k))
+    # Boundary cases.
+    pairs += [
+        ([0x00, 0x00], 0),
+        ([0xFF, 0xFF], 0),
+        ([0x80, 0x80], 1),  # 0x80<<1 = 0x00 (drop high) on each lane
+        ([0x01, 0x00], 7),  # left: 0x80,0; right: 0,0
+        ([0xFF, 0x00], 7),  # cross-byte isolation: lane 1 must stay 0
+        ([0x00, 0xFF], 7),  # mirror — lane 0 must stay 0
+        ([0xAA, 0x55], 4),  # interleaved
+    ]
+
+    mismatches = []
+    for ns, k in pairs:
+        x = _make_multi_shift_input(
+            ns=ns, k=k, direction=direction, width_bytes=2,
+        )
+        with torch.no_grad():
+            y = lowered_shift_ffns_16bit[direction](x)
+        decoded = _decode_multi_shift_result(y, width_bytes=2)
+        if direction == "left":
+            expected = [(n << k) & 0xFF for n in ns]
+        else:
+            expected = [(n >> k) & 0xFF for n in ns]
+        if decoded != expected:
+            mismatches.append(
+                f"{direction} ns={[f'0x{n:02X}' for n in ns]} k={k}: "
+                f"expected={[f'0x{e:02X}' for e in expected]} "
+                f"got={[f'0x{d:02X}' for d in decoded]}"
+            )
+
+    assert not mismatches, (
+        f"wide_shift width=2 (16-bit) {direction} byte-identity failures "
+        f"({len(mismatches)}/{len(pairs)}):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+@pytest.mark.parametrize("direction", ["left", "right"])
+def test_wide_shift_rules_byte_identity_32bit(
+    lowered_shift_ffns_32bit, direction
+):
+    """width_bytes=4 cross-byte shift: each of the 4 byte lanes shifts
+    independently with no inter-lane bleed.
+
+    The single-pass FFN here exercises the wide layout end-to-end at
+    32-bit operand width: 4 lanes * 8 shift amounts * 256 byte values =
+    8192 rules.
+    """
+    gen = torch.Generator().manual_seed(
+        0x32B175 if direction == "left" else 0x32B175F2
+    )
+    pairs = []
+    for _ in range(24):
+        ns = [
+            int(torch.randint(0, 256, (1,), generator=gen).item())
+            for _ in range(4)
+        ]
+        k = int(torch.randint(0, 8, (1,), generator=gen).item())
+        pairs.append((ns, k))
+    # Boundary cases.
+    pairs += [
+        ([0x00, 0x00, 0x00, 0x00], 0),
+        ([0xFF, 0xFF, 0xFF, 0xFF], 0),
+        ([0x80, 0x80, 0x80, 0x80], 1),  # 0x80<<1 boundary on every lane
+        ([0x01, 0x01, 0x01, 0x01], 7),
+        ([0xFF, 0x00, 0xFF, 0x00], 7),  # cross-lane isolation
+        ([0xAA, 0x55, 0xAA, 0x55], 4),
+    ]
+
+    mismatches = []
+    for ns, k in pairs:
+        x = _make_multi_shift_input(
+            ns=ns, k=k, direction=direction, width_bytes=4,
+        )
+        with torch.no_grad():
+            y = lowered_shift_ffns_32bit[direction](x)
+        decoded = _decode_multi_shift_result(y, width_bytes=4)
+        if direction == "left":
+            expected = [(n << k) & 0xFF for n in ns]
+        else:
+            expected = [(n >> k) & 0xFF for n in ns]
+        if decoded != expected:
+            mismatches.append(
+                f"{direction} ns={[f'0x{n:02X}' for n in ns]} k={k}: "
+                f"expected={[f'0x{e:02X}' for e in expected]} "
+                f"got={[f'0x{d:02X}' for d in decoded]}"
+            )
+
+    assert not mismatches, (
+        f"wide_shift width=4 (32-bit) {direction} byte-identity failures "
+        f"({len(mismatches)}/{len(pairs)}):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
