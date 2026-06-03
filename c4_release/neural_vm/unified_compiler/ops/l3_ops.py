@@ -770,8 +770,6 @@ def make_layer3_ffn_op() -> Operation:
         # prev-step aliases (EMBED_*.*.-1, TEMP.*.-1, OP_LEV.*.-1) or
         # cross-step structural (CLEAN_EMBED, H4, HAS_SE, BYTE_INDEX_*).
         # No same-step in-register slot surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
         compaction_safe=True,
@@ -1072,8 +1070,6 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
         compiler_ir=CompilerIR(),
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor.
-        produces={},
-        consumes_fresh={},
         smoke_tests=set(),
         spec_section=None,
     )
@@ -1252,8 +1248,6 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         # only IR). Writes are AX_CARRY/AX_FULL/EMBED/OUTPUT/TEMP/
         # ADDR_KEY at per-marker-row positions, not register-slot
         # consumption. All reads are *.-1 SSA-renamed prev-step aliases.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1581,8 +1575,6 @@ def make_layer3_convo_io_state_init_op(
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): flag-gated
         # conversational-I/O init op. Writes IO_IN_OUTPUT_MODE via
         # _SetDim fallback. Cross-step state init; no in-step surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
     )

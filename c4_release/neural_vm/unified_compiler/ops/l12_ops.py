@@ -294,20 +294,12 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         # AX marker. These must be the in-step fresh values. Also consumes
         # the fresh TEMP[partial] just written by ``layer11_mul_partial`` at
         # the AX marker (phase 11 < 12).
-        consumes_fresh={
-            "ALU_HI": "AX_byte0",
-            "AX_CARRY_LO": "AX_byte0",
-            "TEMP": "AX_byte0",
-        } if alu_mode == "lookup" else {},
         # Produces the fresh MUL hi-nibble result at the AX marker (gated
         # on MARK_AX + OP_MUL): ``result_hi = (partial + a_hi*b_lo) % 16``
         # is written via 4-way AND units into OUTPUT_HI. ``_set_layer12_mul_combine``
         # itself writes only OUTPUT_HI (not OUTPUT_LO); the lo-nibble was
         # already populated upstream in L10's MUL units, so the staleness
         # contract only covers the hi half emitted here.
-        produces={
-            "OUTPUT_HI_THIS_STEP": "AX_byte0",
-        },
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",

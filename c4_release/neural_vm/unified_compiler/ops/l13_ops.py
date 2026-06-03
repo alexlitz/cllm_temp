@@ -617,11 +617,6 @@ def make_layer13_shifts_op(alu_mode: str = "lookup") -> Operation:
         # OP_SHL / OP_SHR. Only meaningful when alu_mode='lookup' fires the
         # bake; in efficient mode the composite owns the consumes-fresh
         # chain via its own stages.
-        consumes_fresh={
-            "ALU_LO": "AX_byte0",
-            "ALU_HI": "AX_byte0",
-            "AX_CARRY_LO": "AX_byte0",
-        } if alu_mode == "lookup" else {},
         # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
         # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
         # is in-step producer). Previous: requires={"after":

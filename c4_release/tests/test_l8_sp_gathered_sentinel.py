@@ -89,8 +89,12 @@ def test_layer8_sp_gathered_sentinel_reads_writes_contract():
     )
     assert op.reads == {"MARK_SP"}
     assert op.writes == {"SP_GATHERED_THIS_STEP"}
-    # The dim is freshly produced at MARK_SP each step.
-    assert op.produces == {"SP_GATHERED_THIS_STEP": "SP_marker"}
+    # Step 5 of IR_INCREMENTAL_IMPROVEMENTS.md: ``produces`` is a derived
+    # @property — slot string is the constant ``<derived>``. Assert by
+    # key set (the dim names are the load-bearing contract; the slot
+    # string used to be the semantic ``"SP_marker"`` but is no longer
+    # author-controlled).
+    assert set(op.produces.keys()) == {"SP_GATHERED_THIS_STEP"}
 
 
 def test_layer8_sp_gathered_sentinel_grows_l8_ffn_by_one_unit():

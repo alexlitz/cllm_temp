@@ -232,8 +232,6 @@ def make_phase_a_ffn_op() -> Operation:
         # the next step's L0 phase rotation (cross-step). No same-step
         # per-register slot consumer reads NEXT_*; empty surface
         # affirms the cross-step boundary semantics.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
         compaction_safe=True,
@@ -381,8 +379,6 @@ def make_layer0_threshold_attn_dep_anchor_op() -> Operation:
         compiler_ir=CompilerIR(),
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor
         # — empty IR, no bake, no in-step produce/consume_fresh surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests=set(),
         spec_section=None,
     )
@@ -483,8 +479,6 @@ def make_layer0_threshold_attn_op() -> Operation:
         # derive yields empty (attention-only IR — no FFNRule.writes).
         # L0 attn is the first non-embed op; reads IS_MARK/CONST are
         # embed-time/structural. No same-step consumes_fresh surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

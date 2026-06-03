@@ -344,8 +344,6 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         # BYTE_INDEX_* on the _CROSS_STEP_DURABLE allowlist). H4 read
         # is cross-block in-step but the op doesn't gate per-register
         # slot, so no consumes_fresh assertion is meaningful.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
@@ -523,13 +521,6 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         # existing wave-1 AX/PC/SP/BP_marker convention. MARK_PC drops
         # out of consumes_fresh via _CROSS_STEP_DURABLE; HAS_SE is the
         # same-step step-end marker that gates the cancel firing.
-        produces={
-            "EMBED_LO": "PC_marker",
-            "EMBED_HI": "PC_marker",
-        },
-        consumes_fresh={
-            "HAS_SE": "PC_marker",
-        },
         claims=_claims,
         declarative_authority="spec_generated",
         # Allocates 2 FFN units pinned at indices 8 and 9 via
@@ -622,8 +613,6 @@ def make_layer2_threshold_attn_op() -> Operation:
         # threshold-attn op (single head writing L2H0). Derive yields
         # empty (attention-only IR). Cross-step embed-time reads. No
         # in-step surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -730,8 +719,6 @@ def make_layer2_lookback_detection_head_op(
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L2 token-feed
         # lookback-detection head (flag-gated stub). writes=set() via
         # _SetDim fallback; reads are marker dims. No in-step surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

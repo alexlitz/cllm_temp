@@ -660,12 +660,6 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         # treats it as a scope/gate flag, not a fresh-consume read; left
         # out of ``consumes_fresh`` per derive's read-intersection rule
         # (the op declares ``reads=set()`` so no candidates qualify).
-        produces={
-            "IO_STATE": "layer6_attn",
-            "NEXT_SE": "layer6_attn",
-            "NEXT_THINKING_END": "layer6_attn",
-        },
-        consumes_fresh={},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_convo_io_state_machine_ir(),
@@ -917,20 +911,6 @@ def make_null_terminator_detection_op(
         reads={"OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI", "IO_IN_OUTPUT_MODE"},
         writes={"IO_OUTPUT_COMPLETE", "IO_IN_OUTPUT_MODE",
                 "NEXT_THINKING_START"},
-        produces=(
-            {
-                "IO_OUTPUT_COMPLETE": "layer10_carry_relay",
-                "IO_IN_OUTPUT_MODE": "layer10_carry_relay",
-                "NEXT_THINKING_START": "layer10_carry_relay",
-            }
-            if _flag_active
-            else {}
-        ),
-        consumes_fresh=(
-            {"IO_IN_OUTPUT_MODE": "layer10_carry_relay"}
-            if _flag_active
-            else {}
-        ),
         audited_empty_produces=(not _flag_active),
         kind="block",
         bake_fn=bake,
@@ -1022,12 +1002,6 @@ def make_convo_io_step_resume_op(
         # is the scope/condition read and is not in ``reads``, so it
         # doesn't surface in ``consumes_fresh`` per derive's
         # read-intersection rule.
-        produces={
-            "IO_IN_OUTPUT_MODE": "layer3_carry_forward_attn",
-            "IO_STATE": "layer3_carry_forward_attn",
-            "NEXT_PC": "layer3_carry_forward_attn",
-        },
-        consumes_fresh={},
         declarative_bake_fn=bake,
         compiler_ir=_convo_io_step_resume_ir(),
         declarative_authority="spec_generated",
@@ -1155,11 +1129,6 @@ def make_convo_io_pc_sp_latch_op(
         # condition reads but the op declares ``reads=set()``, so
         # ``consumes_fresh`` is empty per derive's read-intersection rule
         # (the cached POST_PRTF_* dims are cross-step durables anyway).
-        produces={
-            "OUTPUT_HI_THIS_STEP": "layer6_attn",
-            "OUTPUT_LO": "layer6_attn",
-        },
-        consumes_fresh={},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_convo_io_pc_sp_latch_ir(),
@@ -1659,19 +1628,6 @@ def make_conversational_io_output_routing_op(
         name="conversational_io_output_routing",
         reads={"IO_IN_OUTPUT_MODE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
-        produces=(
-            {
-                "OUTPUT_LO": "layer15_memory_lookup",
-                "OUTPUT_HI_THIS_STEP": "layer15_memory_lookup",
-            }
-            if enable_conversational_io
-            else {}
-        ),
-        consumes_fresh=(
-            {"IO_IN_OUTPUT_MODE": "layer15_memory_lookup"}
-            if enable_conversational_io
-            else {}
-        ),
         audited_empty_produces=(not enable_conversational_io),
         kind="block",
         bake_fn=bake,

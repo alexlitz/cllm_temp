@@ -1179,15 +1179,6 @@ def make_layer8_alu_op() -> Operation:
         # the L8 head 6 AX_CARRY refresh in commit 3d1b700). The
         # ``layer8_head6_ax_carry_refresh`` op (phase=8.05) is the
         # canonical in-step producer.
-        consumes_fresh={
-            "AX_CARRY_LO": "AX_byte0",
-            # ALU_LO at AX marker is the operand-A input to ADD/SUB/LEA.
-            # Produced by ``layer7_operand_gather`` (phase=7, L7 head 0 +
-            # head 1) at the AX byte 0 position. Without an in-step
-            # producer, ALU_LO would carry stale prev-step values, breaking
-            # binary-op semantics for any operand A computation.
-            "ALU_LO": "AX_byte0",
-        },
         # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
         # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
         # is in-step producer). Previous: requires={"after":
@@ -1281,13 +1272,6 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         #     self-loop for the multistep verifier (the value carries
         #     forward across steps; the in-step read sees prev-step
         #     output).
-        produces={
-            "IO_FORMAT_POS": "IO_FORMAT_POS",
-        },
-        consumes_fresh={
-            "IO_FORMAT_POS": "IO_FORMAT_POS",
-            "LAST_WAS_BYTE": "IO_FORMAT_POS",
-        },
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1570,10 +1554,6 @@ def make_layer8_multibyte_routing_op() -> Operation:
         # AX_CARRY -> OUTPUT at AX byte positions). The L6 routing FFN
         # produces AX_byte0 OUTPUT for the other AX-emitting opcodes; this
         # L8 FFN extension covers the IMM multi-byte path.
-        produces={
-            "OUTPUT_LO": "AX_byte0",
-            "OUTPUT_HI_THIS_STEP": "AX_byte0",
-        },
         # ``_set_layer8_multibyte_routing`` re-invokes ``_set_layer8_alu``
         # internally to recover the ALU-final unit cursor (~2023) and then
         # appends 32 multibyte-IMM routing units, reaching unit 2054 — so
@@ -2029,10 +2009,6 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         # unchanged. The Operation itself stays in the registry either way
         # so the staleness analyzer can see its ``produces`` annotation.
         migrated=True,
-        produces={
-            "AX_CARRY_LO": "AX_byte0",
-            "AX_CARRY_HI": "AX_byte0",
-        },
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
         # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
@@ -2641,7 +2617,6 @@ def make_layer8_sp_gathered_sentinel_op() -> Operation:
         # The op produces a fresh in-step sentinel at MARK_SP. Mark it
         # so the staleness scanner sees the producer when downstream
         # consumers (L10 tail rules) declare ``consumes_fresh``.
-        produces={"SP_GATHERED_THIS_STEP": "SP_marker"},
         # B12 backfill (wave 1c): the docstring lists six L8 ops this
         # sentinel must run after (phases 8.0..8.5). The last L8 writer
         # to MARK_SP-adjacent dims is layer8_multibyte_routing, so pin

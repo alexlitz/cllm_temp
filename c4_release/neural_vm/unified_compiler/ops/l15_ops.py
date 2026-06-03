@@ -1607,17 +1607,6 @@ def make_layer15_nibble_copy_op() -> Operation:
         # BYTE_INDEX_* drop out). CMP / HAS_SE / MEM_STORE / PSH_AT_SP
         # are L6/L7 marker writes earlier in the same step; H4 is the
         # L1 threshold-attn nibble decode (same step at L1).
-        produces={
-            "OUTPUT_LO": "layer15_memory_lookup",
-            "OUTPUT_HI_THIS_STEP": "layer15_memory_lookup",
-        },
-        consumes_fresh={
-            "CMP": "layer15_memory_lookup",
-            "H4": "layer15_memory_lookup",
-            "HAS_SE": "layer15_memory_lookup",
-            "MEM_STORE": "layer15_memory_lookup",
-            "PSH_AT_SP": "layer15_memory_lookup",
-        },
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )

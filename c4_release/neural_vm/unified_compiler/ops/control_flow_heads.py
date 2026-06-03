@@ -280,12 +280,6 @@ def make_lev_detector_head_op(enable: bool = False) -> Operation:
         # layer the dynamic compiler places the anchor at.
         target_op_name="layer10_byte_passthrough",
         migrated=True,
-        produces={
-            "PC_VIA_LEV_DETECTOR_LO": "PC_byte0",
-            "PC_VIA_LEV_DETECTOR_HI": "PC_byte0",
-            "BP_VIA_LEV_DETECTOR": "BP_byte0",
-            "SP_VIA_LEV_DETECTOR": "SP_byte0",
-        },
         # Phase 11.A IR exposure: at the default ``enable=False`` config the
         # bake body is a no-op (``if not enable: return``), so an empty IR
         # is byte-identical. When ``enable=True``, the head is fully

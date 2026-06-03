@@ -263,8 +263,6 @@ def make_layer1_ffn_op() -> Operation:
         # step durables (BYTE_INDEX_* on the _CROSS_STEP_DURABLE
         # allowlist; STACK0_BYTE0 is a per-position stable flag). No
         # in-step register-slot surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -463,8 +461,6 @@ def make_layer1_threshold_attn_op() -> Operation:
         # IN_STEP_FRESH). Derive yields empty (attention-only IR);
         # reads are all marker/CONST cross-step embed-time dims. No
         # in-step register-slot surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

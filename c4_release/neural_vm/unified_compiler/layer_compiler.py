@@ -44,7 +44,7 @@ Example:
 
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from .ssa_dim import SSA_ANY_WRITER, is_ssa_form, parse_ssa_name
@@ -287,28 +287,32 @@ class Operation:
     # against the whole model regardless of this field.
     ffn_units_used: Optional[int] = None
     # Residual-dim staleness invariants (Phase 3 / Agent G of
-    # ARCH_LEAKAGE_FIX_PLAN.md). Both fields are opt-in (default empty):
+    # ARCH_LEAKAGE_FIX_PLAN.md).
     #
-    #   ``produces``: maps a residual dim name to the *register* name whose
-    #       fresh value this op writes. E.g. the L8 attn head 6 (commit
-    #       3d1b700) declares
-    #       ``produces={"AX_CARRY_LO": "AX_byte0",
-    #                   "AX_CARRY_HI": "AX_byte0"}``
-    #       because it writes the prev-step AX byte 0 value into AX_CARRY_LO
-    #       and AX_CARRY_HI at the current AX marker.
+    # Step 5 of IR_INCREMENTAL_IMPROVEMENTS.md: ``produces`` and
+    # ``consumes_fresh`` are now COMPUTED PROPERTIES (see the
+    # ``@property`` definitions below) derived from
+    # ``compiler_ir.layers[i].ffn.rules``. Op authors no longer declare
+    # them explicitly — the derivation aggregates every dim name written by
+    # any FFN rule's ``writes`` (→ ``produces``) and every condition-read
+    # dim that is also in ``reads`` and not on the cross-step-durable
+    # allowlist (→ ``consumes_fresh``). See ``tools.derive_produces_consumes``
+    # for the canonical derivation logic.
     #
-    #   ``consumes_fresh``: maps a residual dim name to the register the op
-    #       expects to read a fresh in-step value from. The analyzer warns
-    #       when a dim is declared ``consumes_fresh`` but no earlier-phase
-    #       op in the same step ``produces`` the same (dim, register).
-    #       Use this only for in-step freshness — ops that rely solely on
-    #       cross-step values (e.g. L3 head 1's prev-step EMBED_LO/HI relay
-    #       into AX_CARRY) should leave ``consumes_fresh`` empty.
+    # For backward compatibility (a small number of synthetic test ops that
+    # have no ``compiler_ir``), the constructor still accepts ``produces=``
+    # and ``consumes_fresh=`` kwargs; when provided they OVERRIDE the
+    # derived value. Implemented as :class:`dataclasses.InitVar` slots with
+    # *renamed* ``produces_override`` / ``consumes_fresh_override`` field
+    # names so they don't shadow the ``@property`` definitions below; the
+    # generated ``__init__`` exposes them as ``produces`` / ``consumes_fresh``
+    # via the alias-init wrapper installed at the bottom of this class
+    # (search for ``_install_legacy_init_aliases``).
     #
     # See c4_release/docs/STALENESS_INVARIANTS.md for the bake-author API
     # and the canonical AX_CARRY example.
-    produces: Dict[str, str] = field(default_factory=dict)
-    consumes_fresh: Dict[str, str] = field(default_factory=dict)
+    produces_override: InitVar[Optional[Dict[str, str]]] = None
+    consumes_fresh_override: InitVar[Optional[Dict[str, str]]] = None
     # Audit marker (waves 4-7 of docs/PRODUCES_CONSUMES_MIGRATION.md). When
     # True, the empty ``produces`` / ``consumes_fresh`` dicts are a
     # deliberate, audited declaration that the op has no in-step semantic
@@ -381,7 +385,11 @@ class Operation:
     # facing blocker lists.
     semantic_label: Optional[str] = None
 
-    def __post_init__(self):
+    def __post_init__(
+        self,
+        produces_override: Optional[Dict[str, str]] = None,
+        consumes_fresh_override: Optional[Dict[str, str]] = None,
+    ):
         # Phase 6 Wave 6B: resolve ``bake_fn`` from declarative siblings when
         # the caller omitted it. See the ``bake_fn`` field docstring above
         # for the resolution chain.
@@ -389,9 +397,250 @@ class Operation:
             resolved = _resolve_default_bake_fn(self)
             if resolved is not None:
                 self.bake_fn = resolved
+        # Step 5 of IR_INCREMENTAL_IMPROVEMENTS.md: explicit ``produces`` /
+        # ``consumes_fresh`` overrides are stored on private slots. The
+        # public ``produces`` / ``consumes_fresh`` attributes are
+        # ``@property`` accessors below that prefer the override and
+        # otherwise derive from ``compiler_ir`` rule contents.
+        self._produces_explicit: Optional[Any] = produces_override
+        self._consumes_fresh_explicit: Optional[Any] = consumes_fresh_override
 
     def __hash__(self):
         return hash(self.name)
+
+    # ---- Step 5: derived produces / consumes_fresh ----------------------
+    # Cross-step / embed-time durable dims — reads of these don't count as
+    # ``consumes_fresh`` because their value is either embed-time-stable,
+    # opcode-broadcast (one-hot per opcode, never refreshed in-step), or
+    # explicitly cross-step relayed. The list is a superset of
+    # ``tools.derive_produces_consumes._CROSS_STEP_DURABLE`` — it picks up
+    # the opcode dims registered in
+    # ``c4_release/neural_vm/dim_registry._OPCODES`` (all ``OP_*`` names),
+    # PSH/IO cascade relays, MEM_VAL_BYTE/B nibble relays, and the SSA
+    # prev-step form ``BASE.*.-1`` (handled separately via
+    # ``_is_cross_step_dim_name``).
+    _CROSS_STEP_DURABLE_DIMS = frozenset({
+        "CONST",
+        "IS_BYTE",
+        "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+        "MARK_PC", "MARK_BP", "MARK_AX", "MARK_SP",
+        "MARK_STACK0", "MARK_STACK1", "MARK_STACK2",
+        "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+        "EMBED_LO", "EMBED_HI",
+        "H0", "H1",
+        # Opcode-broadcast one-hots from dim_registry._OPCODES — every
+        # ``OP_*`` dim is set at embed time from the instruction stream
+        # and stays constant across the per-instruction cycle. Reads of
+        # these are gate/scope flags, not fresh-consume residuals.
+        "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR",
+        "OP_BZ", "OP_BNZ", "OP_ENT", "OP_ADJ",
+        "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
+        "OP_SC", "OP_PSH", "OP_OR", "OP_XOR",
+        "OP_AND", "OP_EQ", "OP_NE", "OP_LT",
+        "OP_GT", "OP_LE", "OP_GE", "OP_SHL",
+        "OP_SHR", "OP_ADD", "OP_SUB", "OP_MUL",
+        "OP_DIV", "OP_MOD", "OP_EXIT", "OP_NOP",
+        "OP_PUTCHAR", "OP_GETCHAR",
+        "OP_RET",  # legacy alias retained from the migration helper.
+        # PSH / opcode cascade relays staged into SP/STACK0 at embed
+        # time; constant across the inter-byte cascade window.
+        "PSH_AT_SP",
+        # CMP cascade per-opcode bytes — staged by L6 relay heads at
+        # embed time, not refreshed by the consumer's same-step phase.
+        "CMP+0", "CMP+1", "CMP+2", "CMP+3", "CMP+4",
+        "CMP+5", "CMP+6", "CMP+7", "CMP+8", "CMP+9",
+        # Token-position markers (set at embed time, durable through the
+        # step's compute layers).
+        "MARK_CS", "MARK_MEM", "MARK_SE_ONLY",
+        "MARK_THINKING_START", "MARK_THINKING_END",
+        "IS_MARK",
+        # CLEAN_EMBED_* — clean embedding nibble pair, written by the
+        # L0/L1 embed cleanup pass and durable through the rest of the
+        # step's compute.
+        "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+        # NEXT_* — token-class next-register predictors, set at embed
+        # time from the bytecode stream.
+        "NEXT_AX", "NEXT_BP", "NEXT_MEM", "NEXT_PC",
+        "NEXT_SP", "NEXT_SE", "NEXT_STACK0",
+        "NEXT_THINKING_START", "NEXT_THINKING_END",
+        # IO-state cross-step durables.
+        "LAST_WAS_BYTE", "IO_IS_PUTCHAR", "IO_IS_PRTF",
+        "IO_IN_OUTPUT_MODE", "IO_OUTPUT_COMPLETE",
+        "IO_STATE", "IO_FORMAT_POS",
+        # L1 head outputs are L1-baked and consumed cross-step by
+        # downstream layers' attn/ffn reads — embed-time-equivalent.
+        "L1H0", "L1H1", "L1H2", "L1H3", "L1H4",
+        # Opcode-broadcast suffix carriers (one-hot per opcode, embed-time).
+        "OPCODE_BASE", "OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
+        "OPCODE_BASE_BYTE0", "OPCODE_BASE_BYTE1",
+        "OP_LC_RELAY", "OP_LI_RELAY", "OP_SI_RELAY",
+        # MEM / STACK byte position flags (embed-time markers).
+        "STACK0_BYTE0", "STACK0_BYTE1",
+        "STACK0_BYTE2", "STACK0_BYTE3",
+        "MEM_STORE", "MEM_ADDR_SRC",
+        # HAS_SE — STEP_END existence flag, set at embed time.
+        "HAS_SE",
+        # CMP — base CMP marker flag.
+        "CMP",
+    })
+
+    @staticmethod
+    def _is_cross_step_dim_name(name: str) -> bool:
+        """Return True for dim names that are cross-step by construction.
+
+        Covers the static :attr:`_CROSS_STEP_DURABLE_DIMS` set plus SSA
+        prev-step aliases of the form ``BASE.*.OFFSET`` where ``OFFSET``
+        is a negative integer (e.g. ``OUTPUT_LO.*.-1``). The compiler
+        treats those as alias-of-base reads from the previous VM step;
+        they are by definition not refreshed by an in-step producer.
+        """
+        if name in Operation._CROSS_STEP_DURABLE_DIMS:
+            return True
+        # SSA prev-step form: e.g. ``OUTPUT_LO.*.-1``.
+        if ".*." in name:
+            tail = name.rsplit(".*.", 1)[-1]
+            try:
+                offset = int(tail)
+            except ValueError:
+                return False
+            return offset < 0
+        return False
+
+    # Constant slot used for every derived ``produces`` / ``consumes_fresh``
+    # entry. Step 5 of IR_INCREMENTAL_IMPROVEMENTS.md: the derivation can
+    # no longer infer the semantic register-name strings the manual
+    # annotations carried (``"AX_byte0"``, ``"SP_marker"``, ...) because
+    # rule contents don't encode that hand-picked metadata. Collapsing
+    # every derived entry to ``"<derived>"`` makes producer/consumer
+    # pairing depend only on the dim name — the analyzer asks "does any
+    # earlier-phase op write this dim within the step?", which is the
+    # weaker but still useful in-step refresh contract the test corpus
+    # exercises (see test_removing_l8_head6_surfaces_ax_carry_staleness:
+    # removing the L8 head6 producer of ``AX_CARRY_LO`` still surfaces
+    # the consumer's missing-producer warning under this scheme).
+    _DERIVED_SLOT = "<derived>"
+
+    def _derive_register_slot(self) -> str:
+        """Return the slot string for this op's derived produces/consumes.
+
+        See :attr:`_DERIVED_SLOT` for the rationale.
+        """
+        return self._DERIVED_SLOT
+
+    def _derive_produces_consumes(self) -> Tuple[Dict[str, str], Dict[str, str]]:
+        """Return ``(produces, consumes_fresh)`` derived from rule contents.
+
+        ``produces`` aggregates every dim name written by any FFN rule
+        across every layer of ``compiler_ir`` and unions in ``self.writes``
+        so attention-head ops with no FFN rules still publish their
+        residual writes (the staleness analyzer only needs the dim name
+        set; the slot string is a constant — see :attr:`_DERIVED_SLOT`).
+
+        ``consumes_fresh`` is the subset of FFN rule condition dims
+        (conditions / gate / gate_terms) that ALSO appears in
+        ``self.reads`` and is NOT cross-step durable. We deliberately do
+        not derive a ``consumes_fresh`` from ``self.reads`` alone — the
+        declared reads include many cross-step / embed-time durables and
+        would surface false-positive staleness warnings.  Only FFN rule
+        condition dims (which represent same-step gated reads) feed the
+        consumer set. Ops with no FFN rules consume nothing fresh by
+        derivation (still pass an explicit override via the constructor
+        if a test needs to assert otherwise).
+        """
+        write_names: Set[str] = set()
+        cond_names: Set[str] = set()
+        ir = self.compiler_ir
+        if ir is not None and getattr(ir, "layers", None):
+            for layer in ir.layers:
+                ffn = getattr(layer, "ffn", None)
+                if ffn is None:
+                    continue
+                for rule in ffn.rules:
+                    for w in rule.writes:
+                        write_names.add(w.dim.name)
+                    for cond in rule.conditions:
+                        cond_names.add(cond.dim.name)
+                    if rule.gate is not None:
+                        cond_names.add(rule.gate.name)
+                    for term in rule.gate_terms:
+                        cond_names.add(term.dim.name)
+        # Union ``self.writes`` in so attention-head ops (no FFN rules,
+        # imperative bake) still publish their residual writes.
+        write_names |= set(self.writes or ())
+        slot = self._derive_register_slot()
+        produces = {name: slot for name in sorted(write_names)}
+        reads = set(self.reads or ())
+        consumes_candidates = {
+            name for name in (cond_names & reads)
+            if not self._is_cross_step_dim_name(name)
+        }
+        consumes_fresh = {name: slot for name in sorted(consumes_candidates)}
+        return produces, consumes_fresh
+
+    @property
+    def produces(self) -> Dict[str, str]:
+        """Computed-property view of in-step residual dim writes.
+
+        Returns the explicit override when set; otherwise derives from
+        ``compiler_ir`` rule contents (every dim written by any FFN rule's
+        ``writes``). Empty IR yields ``{}``.
+        """
+        if self._produces_explicit is not None:
+            return self._produces_explicit
+        return self._derive_produces_consumes()[0]
+
+    @produces.setter
+    def produces(self, value):
+        # Preserves the legacy ``op.produces = ...`` mutate-after-construct
+        # pattern (used by validation tests in test_staleness_invariants).
+        self._produces_explicit = value
+
+    @property
+    def consumes_fresh(self) -> Dict[str, str]:
+        """Computed-property view of in-step residual dim reads.
+
+        Returns the explicit override when set; otherwise derives from
+        ``compiler_ir`` rule conditions ∩ ``self.reads`` (minus the
+        cross-step-durable allowlist).
+        """
+        if self._consumes_fresh_explicit is not None:
+            return self._consumes_fresh_explicit
+        return self._derive_produces_consumes()[1]
+
+    @consumes_fresh.setter
+    def consumes_fresh(self, value):
+        # Mirror of the ``produces`` setter — see above.
+        self._consumes_fresh_explicit = value
+
+
+def _install_legacy_init_aliases() -> None:
+    """Wrap ``Operation.__init__`` so callers can still pass ``produces=``
+    and ``consumes_fresh=`` kwargs (the override slots).
+
+    Step 5 of IR_INCREMENTAL_IMPROVEMENTS.md renamed the InitVar fields to
+    ``produces_override`` / ``consumes_fresh_override`` so they don't
+    collide with the ``@property`` accessors of the same public names.
+    Test fixtures (``c4_release/tests/test_staleness_invariants.py`` and a
+    handful of historical call sites) still pass ``produces={...}`` /
+    ``consumes_fresh={...}`` to the constructor; this wrapper translates
+    those kwargs into the override slots without disturbing the dataclass-
+    generated ``__init__``.
+    """
+
+    original_init = Operation.__init__
+
+    def _init(self, *args, **kwargs):
+        if "produces" in kwargs:
+            kwargs["produces_override"] = kwargs.pop("produces")
+        if "consumes_fresh" in kwargs:
+            kwargs["consumes_fresh_override"] = kwargs.pop("consumes_fresh")
+        original_init(self, *args, **kwargs)
+
+    _init.__doc__ = original_init.__doc__
+    Operation.__init__ = _init
+
+
+_install_legacy_init_aliases()
 
 
 # Reserved ``Operation.requires`` keys whose values are op-name references

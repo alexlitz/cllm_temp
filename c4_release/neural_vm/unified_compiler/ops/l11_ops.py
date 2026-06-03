@@ -360,14 +360,6 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # value plus its own fresh ALU_HI / AX_CARRY_LO lookup. ALU_HI is NOT
         # consumed here -- the L11 helper writes ``a_hi``-independent
         # ``partial = (carry + a_lo * b_hi) % 16`` entries.
-        consumes_fresh={
-            "ALU_LO": "AX_byte0",
-            "AX_CARRY_LO": "AX_byte0",
-            "AX_CARRY_HI": "AX_byte0",
-        } if alu_mode == "lookup" else {},
-        produces={
-            "TEMP": "AX_byte0",
-        } if alu_mode == "lookup" else {},
         # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
         # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
         # is in-step producer). Previous: requires={"after":

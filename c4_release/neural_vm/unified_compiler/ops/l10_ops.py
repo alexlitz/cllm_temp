@@ -2564,12 +2564,6 @@ def make_layer10_alu_op() -> Operation:
         # ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) at the AX
         # marker for bitwise OR/XOR/AND + DIV/MOD setup. Both must be
         # current-step fresh values.
-        consumes_fresh={
-            "ALU_LO": "AX_byte0",
-            "ALU_HI": "AX_byte0",
-            "AX_CARRY_LO": "AX_byte0",
-            "AX_CARRY_HI": "AX_byte0",
-        },
         # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
         # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
         # is in-step producer). Previous: requires={"after":

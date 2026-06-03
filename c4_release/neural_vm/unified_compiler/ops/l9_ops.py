@@ -1196,9 +1196,6 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         # Staleness invariants: the L9 ALU consumes ALU_HI as operand A hi
         # nibble at the AX marker. Produced by ``layer7_operand_gather`` (L7
         # head 0 + head 1, phase=7) at AX byte 0.
-        consumes_fresh={
-            "ALU_HI": "AX_byte0",
-        },
         # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
         # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
         # is in-step producer). Previous: requires={"after":

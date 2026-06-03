@@ -203,10 +203,6 @@ def make_layer7_operand_gather_op() -> Operation:
         # L7 head 0 + head 1 produce the fresh in-step ALU_LO/HI at the AX
         # marker (operand A for binary ops + LEA destination address).
         # L8 ALU and L9 ALU consume these via their AX-marker reads.
-        produces={
-            "ALU_LO": "AX_byte0",
-            "ALU_HI": "AX_byte0",
-        },
         smoke_tests={
             "TestSmokeBasic::test_add_basic",
             "TestSmokeBasic::test_sub_basic",

@@ -2683,10 +2683,6 @@ def make_layer6_routing_ffn_op() -> Operation:
             "all",
         },
         spec_section="BLOG_SPEC.md#function-calls",
-        produces={
-            "OUTPUT_LO": "AX_byte0",
-            "OUTPUT_HI_THIS_STEP": "AX_byte0",
-        },
         opcodes={"OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR"},
     )
 
@@ -2969,13 +2965,6 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         # used by the L14 ax_bytes_zero wave-1 ops. OP_ENT drops out
         # via _CROSS_STEP_DURABLE; HAS_SE is the same-step step-end
         # marker.
-        produces={
-            "OUTPUT_LO": "SP_marker",
-            "OUTPUT_HI_THIS_STEP": "SP_marker",
-        },
-        consumes_fresh={
-            "HAS_SE": "SP_marker",
-        },
         claims=_claims,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
@@ -3561,10 +3550,6 @@ def make_layer6_attn_bake_op() -> Operation:
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
-        produces={
-            "ALU_LO": "STACK0",
-            "ALU_HI": "STACK0",
-        },
     )
 
 
@@ -3801,9 +3786,6 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
         },
         spec_section="BLOG_SPEC.md#control-flow",
         claims=_claims,
-        produces={
-            "CMP": "PC_marker",
-        },
         opcodes={"OP_BZ", "OP_BNZ"},
     )
 

@@ -187,8 +187,6 @@ def make_layer5_fetch_op() -> Operation:
         # dims — all cross-step durables (opcode broadcast / re-derived
         # fetch). Derive yields empty (attention-only IR). No in-step
         # surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
@@ -405,8 +403,6 @@ def make_layer5_fetch_dep_anchor_op() -> Operation:
         # The anchor's reads/writes track the real ``layer5_fetch`` op.
         requires={"after": "layer4_pc_relay"},
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor.
-        produces={},
-        consumes_fresh={},
         smoke_tests=set(),
         spec_section=None,
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
@@ -560,8 +556,6 @@ def make_opcode_decode_ffn_op() -> Operation:
         # follows the same once-per-step opcode-broadcast semantics).
         # OPCODE_BYTE_LO read is SSA-renamed prev-step alias. No
         # in-step register-slot surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
@@ -899,8 +893,6 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
         # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
         compiler_ir=CompilerIR(),
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor.
-        produces={},
-        consumes_fresh={},
         smoke_tests=set(),
         spec_section=None,
     )

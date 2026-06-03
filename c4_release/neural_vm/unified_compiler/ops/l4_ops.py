@@ -234,8 +234,6 @@ def make_layer4_pc_relay_op() -> Operation:
         # Writes EMBED_LO/HI / ADDR_KEY at AX-marker rows — all cross-
         # step durables. ADDR_KEY read is SSA-renamed prev-step
         # (ADDR_KEY.*.-1). No in-step surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -478,8 +476,6 @@ def make_layer4_ffn_op() -> Operation:
         # memory fetch). Writes FETCH_LO/HI + TEMP at PC-marker rows —
         # cross-step durables (FETCH_* re-derived each step). Reads
         # are cross-step structural. No in-step surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -533,8 +529,6 @@ def make_layer4_ffn_dep_anchor_op() -> Operation:
         # matching the ``layer4_ffn`` block op's slot.
         requires={},
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor.
-        produces={},
-        consumes_fresh={},
         smoke_tests=set(),
         spec_section=None,
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
@@ -955,8 +949,6 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): flag-gated stub
         # (SP-to-ADDR_KEY staging). Writes ADDR_KEY sub-bands (cross-
         # step durable). No in-step surface.
-        produces={},
-        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
         # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
