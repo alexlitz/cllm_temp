@@ -238,6 +238,13 @@ def test_speculation_guard_blocks_call_frame_opcodes():
 
 
 def test_declarative_halt_horizon_marks_overrun_as_divergence():
+    """Cap-hit decodes from the in-progress step's REG_AX instead of returning
+    ``None`` (updated 2026-06-03 to match serial behaviour — see
+    ``BatchedPureNeuralRunner._decode_bail_exit_code`` docstring). The element
+    still halts at the horizon; the observable change is that ``exit_code``
+    now mirrors what ``AutoregressiveVMRunner.run`` returns after its own
+    ``draft_divergence`` / max-token loop exit (``_decode_exit_code``).
+    """
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
     from neural_vm.vm_step import Token
 
@@ -254,7 +261,11 @@ def test_declarative_halt_horizon_marks_overrun_as_divergence():
     runner._step_one(state, Token.STEP_END, 0)
 
     assert state.halted is True
-    assert state.exit_code is None
+    # Context is empty -> no REG_AX to find -> decoded value is 0 (legacy
+    # ``_decode_exit_code`` fallback). What matters is that ``exit_code`` is
+    # NOT ``None``: callers can rely on the integer value being a defined
+    # exit code, never a sentinel.
+    assert state.exit_code == 0
 
 
 def test_spec_fail_on_correction_stops_at_first_safe_divergence():

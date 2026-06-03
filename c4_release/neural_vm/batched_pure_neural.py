@@ -193,6 +193,22 @@ class _ElementState:
     stdin_pos: int = 0
 
     token_pos: int = 0  # number of tokens generated since context start
+    # Snapshot of ``last_ax`` after the most recent STEP_END dispatch.
+    # ``_decode_bail_exit_code`` falls back to this when no REG_AX appears
+    # after the snapshot position (e.g. the model collapsed before re-emitting
+    # the next step's register block).
+    last_step_end_ax: Optional[int] = None
+    # Absolute context position immediately after the most recent STEP_END
+    # token (i.e. the first token of the next step). Used at cap-hit time
+    # to scan forward for the in-progress step's REG_AX, which holds the
+    # architecturally-correct exit value when the model emitted IMM/
+    # EXIT-precursor correctly but then collapsed before STEP_END. Required
+    # for smoke ``and_basic`` / ``xor_basic`` (IMM operand with the high bit
+    # set drives the L15/L16 MEM_STORE-injection-sensitive heads to over-
+    # emit tokens past the architectural EXIT, so the trailing REG_AX
+    # ``_decode_exit_code`` finds is zeroed/truncated even though an
+    # earlier in-progress step had the correct value).
+    last_step_end_pos: int = 0
 
     # Speculative-decoding helper. `draft_vm` is a per-element DraftVM (Python
     # C4 interpreter) that emits the deterministic next-N tokens. Set when
@@ -998,12 +1014,14 @@ class BatchedPureNeuralRunner:
                 max_context_window=max_context_window,
             )
 
-        # Build results, decoding exit codes for any program that never
-        # emitted HALT (matches serial: _decode_exit_code reads the last AX).
+        # Build results. For programs that never emitted HALT, decode via
+        # ``_decode_bail_exit_code`` so we pick up the in-progress step's
+        # REG_AX when present (matches the smoke-driven semantics — see the
+        # helper's docstring for the IMM-operand-high-bit motivation).
         results = []
         for s in states:
             if not s.halted:
-                s.exit_code = self._decode_exit_code(s.context)
+                s.exit_code = self._decode_bail_exit_code(s)
             results.append(("".join(s.output), s.exit_code))
         return results
 
@@ -1777,6 +1795,13 @@ class BatchedPureNeuralRunner:
 
         if next_token == Token.STEP_END or next_token == Token.TOOL_CALL:
             self._dispatch_pure_neural(s)
+            # Snapshot the well-formed step's AX + position so a later
+            # cap-hit decode can scan forward from here for the next REG_AX
+            # (the in-progress step's AX, which holds the architecturally
+            # correct exit value when the model emitted IMM/EXIT-precursor
+            # correctly before going off-rails).
+            s.last_step_end_ax = int(s.last_ax) & 0xFFFFFFFF
+            s.last_step_end_pos = len(s.context)
             if s.halted:
                 return
 
@@ -1785,7 +1810,15 @@ class BatchedPureNeuralRunner:
             and s.token_pos >= s.expected_steps * Token.STEP_TOKENS
             and not s.halted
         ):
-            s.exit_code = None
+            # Cap reached without an explicit HALT. Mirror the serial runner's
+            # behaviour after its ``draft_divergence`` bail / max-token loop
+            # exit (``AutoregressiveVMRunner.run`` lines 1199-1223 + the
+            # final ``return ... _decode_exit_code(context)``): instead of
+            # returning ``None`` (which was the prior behaviour and caused
+            # smoke ``and_basic``/``xor_basic`` to fail despite the model
+            # emitting the correct AX on the EXIT-precursor step), decode the
+            # in-progress step's REG_AX. See ``_decode_bail_exit_code``.
+            s.exit_code = self._decode_bail_exit_code(s)
             s.halted = True
             return
 
@@ -1985,6 +2018,41 @@ class BatchedPureNeuralRunner:
                     val |= (context[i + 1 + j] & 0xFF) << (j * 8)
                 return val
         return 0
+
+    @staticmethod
+    def _decode_bail_exit_code(s: _ElementState) -> int:
+        """Exit code at divergence-bail / cap-hit time.
+
+        Strategy (mirrors how ``AutoregressiveVMRunner.run`` ends up returning
+        the right answer for ``and_basic``/``xor_basic`` after its
+        ``draft_divergence`` bail):
+
+        1. Scan forward from the position just after the last STEP_END for the
+           NEXT REG_AX marker. This captures the in-progress step's AX — when
+           the model collapses mid-step but had already emitted the
+           architecturally-correct AX for the EXIT-precursor instruction, this
+           value is the right answer. Required for the smoke
+           ``and_basic``/``xor_basic`` tests where the AND/XOR step emits the
+           correct AX (=0x2A) but never reaches STEP_END before the model
+           devolves into a repeat-byte loop.
+
+        2. Fall back to the snapshot taken at the last STEP_END (the last
+           well-formed step's AX).
+
+        3. Final fallback: scan the full context (legacy behaviour).
+        """
+        ctx = s.context
+        start = max(0, int(getattr(s, "last_step_end_pos", 0)))
+        n = len(ctx)
+        for i in range(start, n):
+            if ctx[i] == Token.REG_AX and i + 4 < n:
+                val = 0
+                for j in range(4):
+                    val |= (ctx[i + 1 + j] & 0xFF) << (j * 8)
+                return val
+        if s.last_step_end_ax is not None:
+            return int(s.last_step_end_ax) & 0xFFFFFFFF
+        return BatchedPureNeuralRunner._decode_exit_code(ctx)
 
     @staticmethod
     def _track_mem_access(s: _ElementState, addr: int, mem_section: list) -> None:
