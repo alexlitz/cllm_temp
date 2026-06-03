@@ -630,6 +630,11 @@ def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
     gate_sub = dim_ref("opcode_flag", "SUB")
     carry_byte2 = dim_ref("carry", "alu", 2)
     rules: list[FFNRule] = []
+    # Mirror of _layer9_add_carry_out_rules: same 5-way AND shape with weak
+    # +/- 0.01/S carry discrimination and relaxed thresholds, gated on
+    # OP_SUB and writing to CARRY+2 (byte-2 of the inter-byte ALU carry
+    # cascade). Pair-filter selects only (a, b) combinations that produce
+    # a borrow: a < b (no borrow_in) or a <= b (with borrow_in).
     for borrow_in in (0, 1):
         for a in range(16):
             for b in range(16):
@@ -657,13 +662,11 @@ def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
                         ("CARRY+0", 0.01 / S),
                     )
                     threshold = 2.9
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l9_sub_borrow_out_b{borrow_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
                     gate=gate_sub,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((carry_byte2, 2.0 / S),),
                 ))
     return tuple(rules)
