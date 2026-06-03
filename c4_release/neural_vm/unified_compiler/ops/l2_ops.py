@@ -507,6 +507,21 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir=_layer2_initial_pc_bake_cancel_ir(),
         migrated=True,
+        # Wave 2 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py``. Two rules write
+        # EMBED_LO[init_pc_lo] / EMBED_HI[init_pc_hi] at MARK_PC rows
+        # gated by HAS_SE (cancel the step-0 init-PC bake at step 1+).
+        # Slot tag "PC_marker" matches the MARK_PC scope per the
+        # existing wave-1 AX/PC/SP/BP_marker convention. MARK_PC drops
+        # out of consumes_fresh via _CROSS_STEP_DURABLE; HAS_SE is the
+        # same-step step-end marker that gates the cancel firing.
+        produces={
+            "EMBED_LO": "PC_marker",
+            "EMBED_HI": "PC_marker",
+        },
+        consumes_fresh={
+            "HAS_SE": "PC_marker",
+        },
         claims=_claims,
         declarative_authority="spec_generated",
         # Allocates 2 FFN units pinned at indices 8 and 9 via

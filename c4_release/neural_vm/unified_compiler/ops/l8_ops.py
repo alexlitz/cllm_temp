@@ -1263,6 +1263,31 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
         target_op_name="layer10_byte_passthrough",
         requires={"after": "layer8_alu"},
         migrated=True,
+        # Wave 2 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py``. 16 rules write
+        # IO_FORMAT_POS at byte k -> byte (k+1)%16 (a rotating counter)
+        # gated by LAST_WAS_BYTE + IO_IN_OUTPUT_MODE.*.-1; the gate is
+        # IO_FORMAT_POS itself (self-loop: read this position k, write
+        # the rotated value). Slot tag "IO_FORMAT_POS" names the
+        # dedicated counter register.
+        # consumes_fresh notes:
+        #   - LAST_WAS_BYTE: same-step writer (null_terminator_detection
+        #     family at phase 10.6 — but that's LATER than this op at
+        #     phase 8.5; the analyzer's same-step-writer warning is
+        #     architecturally correct and tracked by the step-0 safety
+        #     pass).
+        #   - IO_FORMAT_POS: self-feedback (gate); no earlier-phase
+        #     writer in the same step. Declaring it here flags the
+        #     self-loop for the multistep verifier (the value carries
+        #     forward across steps; the in-step read sees prev-step
+        #     output).
+        produces={
+            "IO_FORMAT_POS": "IO_FORMAT_POS",
+        },
+        consumes_fresh={
+            "IO_FORMAT_POS": "IO_FORMAT_POS",
+            "LAST_WAS_BYTE": "IO_FORMAT_POS",
+        },
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

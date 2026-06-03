@@ -1530,6 +1530,19 @@ def make_layer14_clear_addr_key_pollution_op() -> Operation:
             "layer14_addr_key_neural_decode",
             "layer14_mem_generation",
         ]},
+        # Wave 2 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py``. 48 single-write rules,
+        # each writes ADDR_KEY+k at non-MEM, non-marker positions
+        # (scope: ``not MEM_VAL_B* and not MARK_*``). All structural
+        # conditions are cross-step-durable markers (MEM_VAL_B*,
+        # MARK_PC/BP/AX/SP/STACK0), so consumes_fresh is empty after the
+        # _CROSS_STEP_DURABLE allowlist filter. The slot tag follows the
+        # POC convention of naming the bind-target op for "everywhere
+        # except marker rows" writes (no single anatomical register).
+        produces={
+            "ADDR_KEY": "layer14_mem_generation",
+        },
+        consumes_fresh={},
         claims=_claims,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",

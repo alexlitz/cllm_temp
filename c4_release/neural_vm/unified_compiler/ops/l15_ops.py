@@ -1596,6 +1596,28 @@ def make_layer15_nibble_copy_op() -> Operation:
         #   16 LO copy + 16 HI copy + 2 PSH SP byte0 + 2 PSH SP byte1 +
         #   2 PSH SP byte2 + 2 PSH BP byte2 + 2 LEA first-step AX byte2 = 42.
         ffn_units_used=42,
+        # Wave 2 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py``. Rules write OUTPUT_LO /
+        # OUTPUT_HI_THIS_STEP at multiple byte positions (16 LO + 16 HI
+        # nibble copies, plus PSH SP/BP byte fixups and LEA AX byte2
+        # first-step fixup). No single anatomical slot covers all rules;
+        # tag with the bind-target op per the POC fallback convention.
+        # consumes_fresh: gate / condition dims that survive the
+        # _CROSS_STEP_DURABLE allowlist filter (IS_BYTE, H1, MARK_*,
+        # BYTE_INDEX_* drop out). CMP / HAS_SE / MEM_STORE / PSH_AT_SP
+        # are L6/L7 marker writes earlier in the same step; H4 is the
+        # L1 threshold-attn nibble decode (same step at L1).
+        produces={
+            "OUTPUT_LO": "layer15_memory_lookup",
+            "OUTPUT_HI_THIS_STEP": "layer15_memory_lookup",
+        },
+        consumes_fresh={
+            "CMP": "layer15_memory_lookup",
+            "H4": "layer15_memory_lookup",
+            "HAS_SE": "layer15_memory_lookup",
+            "MEM_STORE": "layer15_memory_lookup",
+            "PSH_AT_SP": "layer15_memory_lookup",
+        },
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )

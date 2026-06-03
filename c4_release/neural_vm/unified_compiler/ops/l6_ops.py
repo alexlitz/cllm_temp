@@ -2940,6 +2940,23 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_op() -> Operation:
         target_op_name="_layer6_ffn_dep_anchor",
         ffn_units_used=L6_ENT_AFTER_JSR_SP_BYTE0_FIXUP_END_UNIT,
         migrated=True,
+        # Wave 2 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py``. Seven rules write
+        # OUTPUT_LO / OUTPUT_HI_THIS_STEP at SP / BP / STACK0 marker
+        # rows (and BP byte positions 0..2) gated by OP_ENT + HAS_SE.
+        # Primary scope is the SP byte0 fixup (op name); the BP / STACK0
+        # rules ride on the same OP_ENT gate. Slot tag "SP_marker"
+        # follows the existing PC/AX/SP/BP_marker anatomical convention
+        # used by the L14 ax_bytes_zero wave-1 ops. OP_ENT drops out
+        # via _CROSS_STEP_DURABLE; HAS_SE is the same-step step-end
+        # marker.
+        produces={
+            "OUTPUT_LO": "SP_marker",
+            "OUTPUT_HI_THIS_STEP": "SP_marker",
+        },
+        consumes_fresh={
+            "HAS_SE": "SP_marker",
+        },
         claims=_claims,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
