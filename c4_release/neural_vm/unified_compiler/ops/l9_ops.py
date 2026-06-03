@@ -331,6 +331,10 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
 
     gate_adj = dim_ref("opcode_flag", "ADJ")
     rules: list[FFNRule] = []
+    # Same 10-way amplified AND shape as _layer9_lea_hi_nibble_rules but
+    # gated on OP_ADJ with slightly shifted thresholds (42.0 / 50.0) to
+    # accommodate the ADJ-side opcode amplification. Writes the same
+    # (a + b + carry_in) % 16 sum to OUTPUT_HI_THIS_STEP.
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
@@ -347,13 +351,11 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                 else:
                     conditions.append(("CARRY+0", 8.0))
                     threshold = 50.0
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l9_adj_hi_c{carry_in}_a{a}_b{b}",
                     conditions=tuple(conditions),
                     threshold=threshold,
                     gate=gate_adj,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
                 ))
     return tuple(rules)
