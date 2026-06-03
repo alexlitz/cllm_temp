@@ -749,6 +749,34 @@ class _MulCombineStage(nn.Module):
         mark_ax = x_bd[:, :, BD.MARK_AX]
         opcode_mask = opcode_mask * (mark_ax > 0.5).float()
 
+        # FIX 2026-06-03 (L17 tail MUL double-fire defensive guard):
+        # Single-fire guard — only fire when residual indicates this is the
+        # first MUL composite to write at this AX-marker row this step.
+        #
+        # When ``_expand_wrapper_blocks`` (Phase 10.B, ``vm_step.py:2578``)
+        # split L11/L12 ALU post-op attaches into adjacent wrapper blocks
+        # (blocks 25 + 27 historically), the second composite re-fired the
+        # same ``OUTPUT_HI/LO += 2.0`` writes on the same AX-marker row,
+        # doubling the signal and clobbering ``OUT_LO[expected]`` by ±16.0
+        # at L17 (see ``docs/L17_TAIL_MUL_DOUBLE_FIRE.md``). The root-cause
+        # fix removed the redundant L11 post-op attach (see
+        # ``all_core_ops.py:497``), but this guard hardens
+        # ``_MulCombineStage`` against any future schedule that places
+        # multiple ``FlattenedALUMul`` instances on the same step.
+        #
+        # Detection: ``GEToBDConverter.forward`` writes one-hot indicators
+        # scaled by 2.0 into ``OUTPUT_HI[k]`` on a MUL fire (line 335). A
+        # band sum > 1.5 at the AX marker row implies a prior MUL composite
+        # has already written this step — the second fire would double the
+        # nibble. We zero the opcode mask on those rows so this composite
+        # leaves OUTPUT untouched. Threshold 1.5 sits below the single-fire
+        # signal (~2.0) and above residual noise from non-MUL writers; the
+        # gate is conjoined with ``op_mul`` and ``mark_ax > 0.5`` so it
+        # only matters when this stage would otherwise have fired.
+        output_hi_band = x_bd[:, :, BD.OUTPUT_HI:BD.OUTPUT_HI + 16].sum(dim=-1)
+        already_fired = (output_hi_band > 1.5).float()
+        opcode_mask = opcode_mask * (1.0 - already_fired)
+
         state.x_ge_out = x_ge_out
         state.opcode_mask = opcode_mask
         return state
