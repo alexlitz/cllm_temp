@@ -6619,7 +6619,38 @@ def make_tail_bit32_result_correction_op() -> Operation:
     def bake(block, dim_positions, S):
         from ...base_layers import PureFFN
 
-        d_model = block.ffn.W_up.shape[1] if hasattr(block.ffn, "W_up") else 512
+        # Derive d_model from the block's residual-stream width. Preferred
+        # source is ``block.attn.dim`` (always set to the model's d_model on
+        # the AutoregressiveAttention used by every TransformerBlock); the
+        # legacy ``block.ffn.W_up.shape[1]`` fallback is incorrect for
+        # efficient-mode L10 where ``block.ffn`` is a ``PureNeuralALU``
+        # subclass (e.g. ``ALUAndOrXor``) that has no ``W_up`` attribute,
+        # silently bottoming out at the hard-coded ``512`` constant. Mirrors
+        # the derivation chain installed at the sibling bake site (line
+        # ~6764, ``make_l10_post_op_attach_op``) by commit 24cca5ee to avoid
+        # the same wide-d_model overflow when the dim allocator lifts
+        # d_model above 512 (e.g. ``alu_mode='efficient'`` to 800).
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
         # Per-bake FFN-unit allocator. The tail FFN is a standalone bank
         # whose ``hidden_dim`` equals ``len(rules)``; pinning the full
         # range under a single op name makes the bank's tenancy
