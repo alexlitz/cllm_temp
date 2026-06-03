@@ -34,6 +34,7 @@ from __future__ import annotations
 import operator
 from typing import Callable, Literal, Tuple
 
+from .building_blocks_dsl import multi_way_and_rule
 from .ir import FFNRule
 
 
@@ -116,7 +117,7 @@ def bitwise_rules(
         for a in range(16):
             for b in range(16):
                 result = op_fn(a, b)
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=(
                         f"bitwise_{op}_{nibble_label}_"
                         f"a{a:x}_b{b:x}"
@@ -128,8 +129,6 @@ def bitwise_rules(
                     ),
                     threshold=80.0,
                     gate=opcode_gate,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((f"{out_band}+{result}", 2.0 / S),),
                 ))
     return tuple(rules)
@@ -278,7 +277,7 @@ def wide_add_rules(
                         )
                         threshold = 120.0
 
-                    rules.append(FFNRule.gated_write(
+                    rules.append(multi_way_and_rule(
                         name=(
                             f"wide_add_b{b}_cin{carry_in}_"
                             f"a{a_nib:x}_b{b_nib:x}"
@@ -286,8 +285,6 @@ def wide_add_rules(
                         conditions=conditions,
                         threshold=threshold,
                         gate=opcode_gate,
-                        gate_weight=1.0,
-                        gate_bias=0.0,
                         writes=tuple(writes),
                     ))
 
@@ -298,7 +295,7 @@ def wide_add_rules(
         # at the same amplitude so the carry cascade is bit-stable across
         # repeated lowerings.
         if b > 0:
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"wide_add_b{b}_carry_in_detect",
                 conditions=(
                     (marker_gate, 40.0),
@@ -306,8 +303,6 @@ def wide_add_rules(
                 ),
                 threshold=80.0,
                 gate=opcode_gate,
-                gate_weight=1.0,
-                gate_bias=0.0,
                 writes=(
                     (f"{carry_base}+{b - 1}", 0.0),
                 ),
@@ -456,7 +451,7 @@ def wide_sub_rules(
                         )
                         threshold = 120.0
 
-                    rules.append(FFNRule.gated_write(
+                    rules.append(multi_way_and_rule(
                         name=(
                             f"wide_sub_b{b}_bin{borrow_in}_"
                             f"a{a_nib:x}_b{b_nib:x}"
@@ -464,8 +459,6 @@ def wide_sub_rules(
                         conditions=conditions,
                         threshold=threshold,
                         gate=opcode_gate,
-                        gate_weight=1.0,
-                        gate_bias=0.0,
                         writes=tuple(writes),
                     ))
 
@@ -476,7 +469,7 @@ def wide_sub_rules(
         # ``borrow_base+(b-1)`` at the same amplitude so the borrow
         # cascade is bit-stable across repeated lowerings.
         if b > 0:
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"wide_sub_b{b}_borrow_in_detect",
                 conditions=(
                     (marker_gate, 40.0),
@@ -484,8 +477,6 @@ def wide_sub_rules(
                 ),
                 threshold=80.0,
                 gate=opcode_gate,
-                gate_weight=1.0,
-                gate_bias=0.0,
                 writes=(
                     (f"{borrow_base}+{b - 1}", 0.0),
                 ),
@@ -588,7 +579,7 @@ def wide_shift_rules(
         for k in range(8):
             for n in range(256):
                 result = shift_fn(n, k)
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=(
                         f"wide_{dir_tag}_b{b}_k{k}_n{n:02x}"
                     ),
@@ -599,8 +590,6 @@ def wide_shift_rules(
                     ),
                     threshold=80.0,
                     gate=opcode_gate,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=(
                         (f"{result_base}+{result_offset + result}",
                          write_scale),
@@ -724,7 +713,7 @@ def wide_mul_rules(
                 product = (a_nib * b_nib) & 0xFFFF
                 lo_nib = product & 0xF
                 hi_nib = (product >> 4) & 0xF
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"wide_mul_b0_a{a_nib:x}_b{b_nib:x}",
                     conditions=(
                         (marker_gate, 40.0),
@@ -733,8 +722,6 @@ def wide_mul_rules(
                     ),
                     threshold=80.0,
                     gate=opcode_gate,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=(
                         (f"{result_base}+{lo_nib}", write_amplitude),
                         (f"{result_base}+{16 + hi_nib}", write_amplitude),
@@ -759,7 +746,7 @@ def wide_mul_rules(
                     nib1 = (product >> 4) & 0xF
                     nib2 = (product >> 8) & 0xF
                     nib3 = (product >> 12) & 0xF
-                    rules.append(FFNRule.gated_write(
+                    rules.append(multi_way_and_rule(
                         name=(
                             f"wide_mul_w2_alo{a_lo:x}_ahi{a_hi:x}_"
                             f"blo{b_lo:x}_bhi{b_hi:x}"
@@ -773,8 +760,6 @@ def wide_mul_rules(
                         ),
                         threshold=150.0,
                         gate=opcode_gate,
-                        gate_weight=1.0,
-                        gate_bias=0.0,
                         writes=(
                             (f"{result_base}+{nib0}", write_amplitude),
                             (f"{result_base}+{16 + nib1}", write_amplitude),
@@ -906,7 +891,7 @@ def wide_div_rules(
             for b_nib in range(1, 16):
                 q = a_nib // b_nib
                 r = a_nib % b_nib
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=(
                         f"wide_div_b{b}_a{a_nib:x}_b{b_nib:x}"
                     ),
@@ -917,8 +902,6 @@ def wide_div_rules(
                     ),
                     threshold=80.0,
                     gate=opcode_gate,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=(
                         (f"{quotient_base}+{byte_offset + q}",
                          write_amplitude),
@@ -932,7 +915,7 @@ def wide_div_rules(
         # Matches the common "saturate-to-0 / preserve dividend"
         # behavior used by other ALU divide-by-zero handlers.
         for a_nib in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"wide_div_b{b}_a{a_nib:x}_b0_guard",
                 conditions=(
                     (marker_gate, 40.0),
@@ -941,8 +924,6 @@ def wide_div_rules(
                 ),
                 threshold=80.0,
                 gate=opcode_gate,
-                gate_weight=1.0,
-                gate_bias=0.0,
                 writes=(
                     (f"{quotient_base}+{byte_offset + 0}",
                      write_amplitude),
@@ -1104,7 +1085,7 @@ def wide_ge_add_rules(
                         )
                         threshold = 120.0
 
-                    rules.append(FFNRule.gated_write(
+                    rules.append(multi_way_and_rule(
                         name=(
                             f"wide_ge_add_b{b}_cin{carry_in}_"
                             f"a{a_nib:x}_b{b_nib:x}"
@@ -1112,8 +1093,6 @@ def wide_ge_add_rules(
                         conditions=conditions,
                         threshold=threshold,
                         gate=opcode_gate,
-                        gate_weight=1.0,
-                        gate_bias=0.0,
                         writes=tuple(writes),
                     ))
 
@@ -1122,7 +1101,7 @@ def wide_ge_add_rules(
         # write is a no-op self-relay (amplitude 0) so the cascade is
         # bit-stable across repeated lowerings.
         if b > 0:
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"wide_ge_add_b{b}_carry_in_detect",
                 conditions=(
                     (marker_gate, 40.0),
@@ -1130,8 +1109,6 @@ def wide_ge_add_rules(
                 ),
                 threshold=80.0,
                 gate=opcode_gate,
-                gate_weight=1.0,
-                gate_bias=0.0,
                 writes=(
                     (carry_in_dim, 0.0),
                 ),
@@ -1240,7 +1217,7 @@ def wide_ge_sub_rules(
                         )
                         threshold = 120.0
 
-                    rules.append(FFNRule.gated_write(
+                    rules.append(multi_way_and_rule(
                         name=(
                             f"wide_ge_sub_b{b}_bin{borrow_in}_"
                             f"a{a_nib:x}_b{b_nib:x}"
@@ -1248,13 +1225,11 @@ def wide_ge_sub_rules(
                         conditions=conditions,
                         threshold=threshold,
                         gate=opcode_gate,
-                        gate_weight=1.0,
-                        gate_bias=0.0,
                         writes=tuple(writes),
                     ))
 
         if b > 0:
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"wide_ge_sub_b{b}_borrow_in_detect",
                 conditions=(
                     (marker_gate, 40.0),
@@ -1262,8 +1237,6 @@ def wide_ge_sub_rules(
                 ),
                 threshold=80.0,
                 gate=opcode_gate,
-                gate_weight=1.0,
-                gate_bias=0.0,
                 writes=(
                     (borrow_in_dim, 0.0),
                 ),
