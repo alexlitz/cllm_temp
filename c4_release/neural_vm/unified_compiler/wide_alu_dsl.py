@@ -11,10 +11,17 @@ FFNRule, ...]`` lists. They lower through the existing
 
 Status (Task 81, scaffolding):
   - ``bitwise_rules`` — IMPLEMENTED (Wave W1 POC).
-  - ``wide_add_rules`` / ``wide_sub_rules`` — stubs (Wave W3).
+  - ``wide_add_rules`` / ``wide_sub_rules`` — IMPLEMENTED (Wave W3,
+    verified multi-byte up to width_bytes=8 / 32-bit; see commit
+    ``478120d9``).
   - ``wide_shift_rules`` — IMPLEMENTED (Wave W2, per-byte lookup).
-  - ``wide_mul_rules`` — stub (Wave W5, 9-stage pipeline).
-  - ``wide_div_rules`` — IMPLEMENTED (Wave W4, per-byte nibble lookup POC).
+  - ``wide_mul_rules`` — IMPLEMENTED (Wave W5; width_bytes=1 POC and
+    width_bytes=2 flat 8-bit×8-bit→16-bit lookup; wider widths deferred
+    to a partial-product cascade — see
+    ``docs/DSL_W5_MULDIV_LIMIT.md``).
+  - ``wide_div_rules`` — IMPLEMENTED (Wave W4, width_bytes=1 nibble
+    lookup POC; multi-byte deferred — per-nibble division does not
+    compose to wide DIV; see ``docs/DSL_W5_MULDIV_LIMIT.md``).
 
 The validation contract per helper is:
   ``rule_lowered_ffn.forward(x)  ==  hand_composite.forward(x)``
@@ -617,99 +624,164 @@ def wide_mul_rules(
     marker_gate: str,
     S: float,
 ) -> Tuple[FFNRule, ...]:
-    """Generate FFNRule list for wide MUL — 8-bit POC (per-nibble lookup).
+    """Generate FFNRule list for wide MUL — nibble-stacked flat lookup.
 
-    Wave W5, **8-bit slice only**. The full ``FlattenedALUMul`` composite
-    in ``efficient_alu_neural.py:1066+`` is a 9-stage pipeline (BDToGE →
+    Wave W5. The full ``FlattenedALUMul`` composite in
+    ``efficient_alu_neural.py:1066+`` is a 9-stage pipeline (BDToGE →
     schoolbook → 3 carry passes → genprop → binary-lookahead →
-    final-correction → MulCombine → GEToBD). For the POC, we collapse
-    the entire pipeline into a single nibble × nibble lookup table:
+    final-correction → MulCombine → GEToBD). The DSL collapses that
+    pipeline into a single flat lookup table over the full operand
+    cross-product.
 
-      * For each ``(a, b)`` in ``0..15 × 0..15`` (256 pairs), emit one
-        FFNRule that fires when ``marker_gate`` AND ``operand_a_base+a``
-        AND ``operand_b_base+b`` are all hot, gated by ``opcode_gate``.
-      * Each rule writes ``2.0 / S`` to two output positions:
+    Each "byte" in this DSL slice is a single 4-bit nibble lane (matching
+    the per-byte stacking convention of :func:`wide_add_rules`):
+    ``operand_a_base + (b*16 + nib)`` is the one-hot at nibble ``b``,
+    value ``nib``. So ``width_bytes=1`` is a 4-bit × 4-bit MUL (POC) and
+    ``width_bytes=2`` is an 8-bit × 8-bit MUL with a 16-bit (4-nibble)
+    result.
+
+    ``width_bytes=1`` — 4-bit × 4-bit lookup (POC):
+      For each ``(a, b)`` in ``0..15 × 0..15`` (256 pairs), emit one
+      FFNRule that fires when ``marker_gate`` AND ``operand_a_base+a``
+      AND ``operand_b_base+b`` are all hot, gated by ``opcode_gate``.
+      Each rule writes ``2.0 / S`` to two output positions:
         - ``result_base + (a * b) & 0xF``                 (low nibble)
         - ``result_base + 16 + ((a * b) >> 4) & 0xF``     (high nibble)
+      Conditions use the bitwise-rules pattern (marker(40) + a(30)
+      + b(30) > 80).
 
-      The product of two nibbles is at most ``15 * 15 == 225``, which
-      fits in 8 bits, so the two-nibble split is sufficient. The output
-      layout mirrors the per-byte stacking convention used by
-      :func:`wide_add_rules`: ``result_base+(b*16+nib)`` where byte 0
-      holds the low nibble and byte 1 holds the high nibble.
+    ``width_bytes=2`` — 8-bit × 8-bit flat lookup (16-bit result):
+      For each ``(a_lo, a_hi, b_lo, b_hi)`` quad in
+      ``0..15 × 0..15 × 0..15 × 0..15`` (65536 quads), emit one rule
+      that fires when all four nibble one-hots AND ``marker_gate`` are
+      hot, gated by ``opcode_gate``. Each rule writes ``2.0 / S`` to
+      four result positions — one per nibble lane — covering the full
+      16-bit product:
+        - ``result_base + (product       & 0xF)``         (byte 0)
+        - ``result_base + 16  + ((product >>  4) & 0xF)`` (byte 1)
+        - ``result_base + 32  + ((product >>  8) & 0xF)`` (byte 2)
+        - ``result_base + 48  + ((product >> 12) & 0xF)`` (byte 3)
+      Conditions use a 5-way balanced AND: ``marker(+40) + a_lo(+30)
+      + a_hi(+30) + b_lo(+30) + b_hi(+30) > 150``. All-on totals 160
+      > 150 → fires; missing the marker totals 120 < 150; missing any
+      single nibble totals 130 < 150 → blocked. This mirrors the 4-way
+      AND pattern :func:`wide_add_rules` uses for the carry-in=1 case.
 
-    Conditions use the same balanced-AND pattern as :func:`bitwise_rules`:
-    ``marker(+40) + a(+30) + b(+30) > 80`` (100 > 80 fires; any pair
-    sums to <= 70 which is blocked).
-
-    Multi-byte (16-bit, 32-bit) lowering is **deferred** to a follow-up
-    wave per ``docs/IR_DSL_DESIGN.md`` Section 5. The 9-stage pipeline
-    (schoolbook partial products + 3 carry passes + gen/prop + binary
-    carry-lookahead + final correction) only kicks in for ``width_bytes
-    >= 2``; the 8-bit case naturally collapses because a nibble × nibble
-    product fits in one byte with no inter-byte carries.
+    ``width_bytes > 2``: deferred (see ``docs/DSL_W5_MULDIV_LIMIT.md``).
+    A flat cross-product table grows as ``16 ** (2 * width_bytes)`` —
+    ``width_bytes=3`` would emit ~16.8M rules, intractable as a single
+    FFN lookup. Wider MUL requires the schoolbook partial-product
+    pipeline (a multi-pass cascade with inter-nibble carry propagation),
+    which is what ``FlattenedALUMul`` implements and what a future DSL
+    helper must reproduce.
 
     Args:
-        operand_a_base: dim base for operand A. Rule reads
-            ``operand_a_base + a_nib`` for ``a_nib`` in 0..15.
-        operand_b_base: dim base for operand B. Rule reads
-            ``operand_b_base + b_nib`` for ``b_nib`` in 0..15.
-        result_base: dim base for the result. Rule writes
-            ``result_base + (a*b & 0xF)`` (low nibble, "byte 0") and
-            ``result_base + 16 + ((a*b >> 4) & 0xF)`` (high nibble,
-            "byte 1") at amplitude ``2.0 / S``.
-        width_bytes: operand width in bytes. **POC supports only
-            ``width_bytes=1``** (8-bit multiply, nibble × nibble lookup).
-            Larger widths raise ``NotImplementedError``.
+        operand_a_base: dim base for operand A. For nibble lane ``b``
+            the rule reads ``operand_a_base + (b * 16 + a_nib)``.
+        operand_b_base: dim base for operand B. Read as
+            ``operand_b_base + (b * 16 + b_nib)``.
+        result_base: dim base for the result. Writes land on
+            ``result_base + (lane * 16 + nib_value)`` for each nibble
+            lane in the product.
+        width_bytes: operand width in nibble lanes. Supported:
+            ``width_bytes=1`` (4-bit MUL POC) and ``width_bytes=2``
+            (8-bit MUL, 16-bit result). Wider raises NotImplementedError.
         opcode_gate: dim ref for the ``MUL`` opcode flag (e.g. ``"OP_MUL"``).
         marker_gate: dim name for the AX-style marker (e.g. ``"MARK_AX"``).
         S: SwiGLU scale (typically 100.0).
 
     Returns:
-        ``tuple[FFNRule, ...]`` of length 256 (16 × 16 nibble pairs).
+        ``tuple[FFNRule, ...]`` — 256 rules for ``width_bytes=1``,
+        65536 rules for ``width_bytes=2``.
 
     Raises:
         ValueError: if ``width_bytes < 1``.
-        NotImplementedError: if ``width_bytes > 1`` (multi-byte deferred
-            to follow-up wave; the 9-stage pipeline must be reproduced
-            for inter-byte carry propagation).
+        NotImplementedError: if ``width_bytes > 2`` (intractable flat
+            lookup; multi-byte requires partial-product cascade).
     """
     if not isinstance(width_bytes, int) or width_bytes < 1:
         raise ValueError(
             f"wide_mul_rules: width_bytes must be a positive int; "
             f"got {width_bytes!r}"
         )
-    if width_bytes > 1:
+    if width_bytes > 2:
         raise NotImplementedError(
-            f"wide_mul_rules: multi-byte MUL (width_bytes={width_bytes}) "
-            f"is deferred — requires the 9-stage FlattenedALUMul pipeline "
-            f"(schoolbook + 3 carry passes + genprop + lookahead + final-"
-            f"correction). Tracked under ``docs/IR_DSL_DESIGN.md`` Section 5."
+            f"wide_mul_rules: width_bytes={width_bytes} is deferred — a "
+            f"flat cross-product table would emit "
+            f"16 ** (2 * {width_bytes}) = {16 ** (2 * width_bytes)} rules. "
+            f"Wider MUL requires the schoolbook partial-product pipeline "
+            f"(see docs/DSL_W5_MULDIV_LIMIT.md and FlattenedALUMul in "
+            f"efficient_alu_neural.py)."
         )
 
     write_amplitude = 2.0 / S
     rules: list[FFNRule] = []
-    for a_nib in range(16):
-        for b_nib in range(16):
-            product = (a_nib * b_nib) & 0xFFFF
-            lo_nib = product & 0xF
-            hi_nib = (product >> 4) & 0xF
-            rules.append(FFNRule.gated_write(
-                name=f"wide_mul_b0_a{a_nib:x}_b{b_nib:x}",
-                conditions=(
-                    (marker_gate, 40.0),
-                    (f"{operand_a_base}+{a_nib}", 30.0),
-                    (f"{operand_b_base}+{b_nib}", 30.0),
-                ),
-                threshold=80.0,
-                gate=opcode_gate,
-                gate_weight=1.0,
-                gate_bias=0.0,
-                writes=(
-                    (f"{result_base}+{lo_nib}", write_amplitude),
-                    (f"{result_base}+{16 + hi_nib}", write_amplitude),
-                ),
-            ))
+
+    if width_bytes == 1:
+        # 4-bit POC: 3-way AND (marker + a + b).
+        for a_nib in range(16):
+            for b_nib in range(16):
+                product = (a_nib * b_nib) & 0xFFFF
+                lo_nib = product & 0xF
+                hi_nib = (product >> 4) & 0xF
+                rules.append(FFNRule.gated_write(
+                    name=f"wide_mul_b0_a{a_nib:x}_b{b_nib:x}",
+                    conditions=(
+                        (marker_gate, 40.0),
+                        (f"{operand_a_base}+{a_nib}", 30.0),
+                        (f"{operand_b_base}+{b_nib}", 30.0),
+                    ),
+                    threshold=80.0,
+                    gate=opcode_gate,
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=(
+                        (f"{result_base}+{lo_nib}", write_amplitude),
+                        (f"{result_base}+{16 + hi_nib}", write_amplitude),
+                    ),
+                ))
+        return tuple(rules)
+
+    # width_bytes == 2: 8-bit × 8-bit flat lookup. 5-way AND
+    # (marker + a_lo + a_hi + b_lo + b_hi).
+    # Weights: marker=40, each nibble=30. Threshold=150.
+    #   all-on  = 40 + 4*30 = 160 > 150 → fires
+    #   no mark = 4*30      = 120 < 150 → blocked
+    #   miss-one= 40 + 3*30 = 130 < 150 → blocked
+    for a_lo in range(16):
+        for a_hi in range(16):
+            a_byte = (a_hi << 4) | a_lo
+            for b_lo in range(16):
+                for b_hi in range(16):
+                    b_byte = (b_hi << 4) | b_lo
+                    product = (a_byte * b_byte) & 0xFFFF
+                    nib0 = product & 0xF
+                    nib1 = (product >> 4) & 0xF
+                    nib2 = (product >> 8) & 0xF
+                    nib3 = (product >> 12) & 0xF
+                    rules.append(FFNRule.gated_write(
+                        name=(
+                            f"wide_mul_w2_alo{a_lo:x}_ahi{a_hi:x}_"
+                            f"blo{b_lo:x}_bhi{b_hi:x}"
+                        ),
+                        conditions=(
+                            (marker_gate, 40.0),
+                            (f"{operand_a_base}+{a_lo}", 30.0),
+                            (f"{operand_a_base}+{16 + a_hi}", 30.0),
+                            (f"{operand_b_base}+{b_lo}", 30.0),
+                            (f"{operand_b_base}+{16 + b_hi}", 30.0),
+                        ),
+                        threshold=150.0,
+                        gate=opcode_gate,
+                        gate_weight=1.0,
+                        gate_bias=0.0,
+                        writes=(
+                            (f"{result_base}+{nib0}", write_amplitude),
+                            (f"{result_base}+{16 + nib1}", write_amplitude),
+                            (f"{result_base}+{32 + nib2}", write_amplitude),
+                            (f"{result_base}+{48 + nib3}", write_amplitude),
+                        ),
+                    ))
     return tuple(rules)
 
 
@@ -738,6 +810,19 @@ def wide_div_rules(
     This DSL helper expresses the equivalent semantics as a flat lookup
     table: one FFNRule per ``(byte_position, dividend_nibble,
     divisor_nibble)`` triple.
+
+    **Multi-byte gap (width_bytes > 1).** Per-nibble independent
+    division is mathematically wrong for multi-nibble operands: the
+    quotient/remainder of a wide value is **not** the per-nibble
+    quotients/remainders concatenated. For example, ``0xFF / 0x0F == 0x11``
+    (quotient 17, remainder 0), but per-nibble division would yield
+    nibble0 = ``0xF / 0xF == 1`` and nibble1 = ``0xF / 0`` (zero-divide
+    guard → ``q=0, r=0xF``), giving the wrong reassembled value. The
+    full long-division pipeline (shift + subtract + select per bit)
+    cannot be collapsed into a single per-nibble lookup. Multi-byte DIV
+    is therefore deferred to a follow-up wave (see
+    ``docs/DSL_W5_MULDIV_LIMIT.md``); ``FlattenedDivMod`` remains
+    authoritative for ``width_bytes > 1``.
 
     Per byte position ``b`` (0..``width_bytes``-1):
 
@@ -778,20 +863,37 @@ def wide_div_rules(
             on ``quotient_base+(b*16 + a_nib // b_nib)``.
         remainder_base: dim base for remainder per-byte bands.
         width_bytes: number of nibble-wide bytes in the wide operation.
+            **Only ``width_bytes=1`` is supported**; wider values raise
+            ``NotImplementedError`` because per-nibble independent
+            division does not compose into wide-operand division.
         opcode_gate: dim ref for the ``DIV`` / ``MOD`` opcode flag.
         marker_gate: dim name for the AX-style marker.
         S: SwiGLU scale (typically 100.0).
 
     Returns:
-        ``tuple[FFNRule, ...]`` of length ``width_bytes * 256``.
+        ``tuple[FFNRule, ...]`` of length 256 (POC, ``width_bytes=1``).
 
     Raises:
-        ValueError: if ``width_bytes`` is not a positive integer.
+        ValueError: if ``width_bytes < 1``.
+        NotImplementedError: if ``width_bytes > 1`` (multi-byte DIV
+            requires the long-division pipeline — see
+            ``docs/DSL_W5_MULDIV_LIMIT.md``).
     """
     if not isinstance(width_bytes, int) or width_bytes < 1:
         raise ValueError(
             f"wide_div_rules: width_bytes must be a positive int; "
             f"got {width_bytes!r}"
+        )
+    if width_bytes > 1:
+        raise NotImplementedError(
+            f"wide_div_rules: width_bytes={width_bytes} is deferred — "
+            f"per-nibble independent division does not compose into "
+            f"wide-operand division (e.g. 0xFF / 0x0F = 0x11, but "
+            f"per-nibble would give 1 and a zero-divide guard). "
+            f"Multi-byte DIV requires the long-division pipeline "
+            f"implemented by FlattenedDivMod (see efficient_alu_"
+            f"divmod_split.py) and is tracked under "
+            f"docs/DSL_W5_MULDIV_LIMIT.md."
         )
 
     write_amplitude = 2.0 / S
