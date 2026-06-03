@@ -64,7 +64,7 @@ import math
 import os
 import warnings
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .layer_compiler import (
     Operation,
@@ -834,6 +834,188 @@ class CrossStepReadWarning(UserWarning):
     """
 
 
+class CrossStepReadError(Exception):
+    """Raised by ``compile_full_vm_dynamic(strict=True)`` (Step 4) when the
+    cross-step safety check finds at least one ``(consumer, ssa_read)``
+    pair that is NOT in the
+    ``cross_step_baseline_allowlist`` (or the bundled
+    :data:`CROSS_STEP_BASELINE_ALLOWLIST` when none is passed).
+
+    This is the strict-mode promotion of :class:`CrossStepReadWarning`
+    (Step 4 of ``IR_INCREMENTAL_IMPROVEMENTS.md``). Distinguishing
+    ``DIM`` (step=0) from ``DIM.*.-1`` (step=-1) as separate logical
+    values means the compiler must refuse to compile when an op reads a
+    cross-step alias whose base dim ALSO has a same-step writer — unless
+    that pair has been explicitly whitelisted for incremental migration.
+
+    The error message lists every offending ``(consumer, ssa_read)`` pair
+    along with the same-step writers so the bake author can either:
+
+    * Migrate the read (replace ``X.*.-1`` with ``X`` or
+      ``OR(X, X.*.-1)``), removing the line from the allowlist as the
+      cause is fixed; or
+    * Add the pair to the caller-supplied allowlist with a TODO comment
+      pointing at the migration tracking doc.
+
+    Attributes
+    ----------
+    unallowed_findings:
+        ``[(consumer_op_name, ssa_dim_name, same_step_writers), ...]`` —
+        the findings that escaped the allowlist. The full set of all
+        findings (allowlisted + unallowed) is available on the
+        ``all_findings`` attribute.
+    all_findings:
+        Every finding the safety check produced, regardless of allowlist
+        status. Lets a downstream tool re-derive the allowlist by
+        filtering the runtime-rejected pairs.
+    """
+
+    def __init__(
+        self,
+        unallowed_findings: List[Tuple[str, str, Tuple[str, ...]]],
+        all_findings: List[Tuple[str, str, Tuple[str, ...]]],
+    ):
+        self.unallowed_findings = unallowed_findings
+        self.all_findings = all_findings
+        # Cap message preview to avoid 80-line tracebacks for the same
+        # underlying bug class. The full list is on the attribute.
+        preview = "\n".join(
+            f"  - {consumer!r} reads {ssa_read!r}; same-step writers: "
+            f"{list(writers)!r}"
+            for (consumer, ssa_read, writers) in unallowed_findings[:10]
+        )
+        extra = max(0, len(unallowed_findings) - 10)
+        if extra:
+            preview = f"{preview}\n  ... (+{extra} more)"
+        super().__init__(
+            f"compile_full_vm_dynamic(strict=True) refused to compile: "
+            f"{len(unallowed_findings)} cross-step read(s) with same-step "
+            f"writers are not in the baseline allowlist (Step 4 of "
+            f"IR_INCREMENTAL_IMPROVEMENTS.md). On VM step 1 the cross-step "
+            f"alias resolves to 0; if a same-step writer exists the bake "
+            f"author likely meant the same-step value. Either migrate the "
+            f"read OR add the pair to "
+            f"``cross_step_baseline_allowlist`` with a TODO. Findings:\n"
+            f"{preview}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 4 cross-step baseline allowlist
+# ---------------------------------------------------------------------------
+#
+# Each entry is a ``(consumer_op_name, ssa_dim_name)`` tuple that the safety
+# check has agreed to ignore — i.e. it WILL still produce a warning, but it
+# WILL NOT cause ``compile_full_vm_dynamic(strict=True)`` to raise
+# :class:`CrossStepReadError`. The list pins the 82 findings present at
+# Step-4 landing (alu_mode='lookup', io/tool/think flags all off); every
+# entry is a TODO to migrate the read away from the cross-step alias or
+# document why the step-1 zero-propagation is intentional.
+#
+# Adding entries: only as a last resort when the cause cannot be fixed in
+# the same change. Removing entries: do this aggressively — every removal
+# is a step toward Step 4's "no cross-step zero-prop bugs at compile" goal.
+# A regression test
+# (``tests/test_compile_cross_step_safety.py::test_baseline_allowlist_does_not_grow``)
+# pins ``len(CROSS_STEP_BASELINE_ALLOWLIST) <= 82`` as the ratchet.
+#
+# TODO(step4-migration): each entry below corresponds to a real cross-step
+# read in the production op set that should eventually be migrated to one
+# of:
+#   * a same-step read of the base dim (when the same-step writer is the
+#     intended producer),
+#   * an explicit ``OR(X.*.-1, X)`` aggregation (when both same-step and
+#     prev-step writes are legitimate inputs), or
+#   * a documented self-writer back-edge (which the safety check already
+#     excludes — these entries are the residual non-self-writer findings).
+# Track migrations in ``docs/IR_INCREMENTAL_IMPROVEMENTS.md`` Step 4
+# section.
+CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
+    ('_layer11_ffn_dep_anchor', 'ALU_LO.*.-1'),
+    ('_layer12_ffn_dep_anchor', 'TEMP.*.-1'),
+    ('_layer3_ffn_dep_anchor', 'EMBED_HI.*.-1'),
+    ('_layer3_ffn_dep_anchor', 'EMBED_LO.*.-1'),
+    ('_layer3_ffn_dep_anchor', 'OP_LEV.*.-1'),
+    ('_layer3_ffn_dep_anchor', 'TEMP.*.-1'),
+    ('_layer6_attn_dep_anchor', 'AX_CARRY_HI.*.-1'),
+    ('_layer6_attn_dep_anchor', 'AX_CARRY_LO.*.-1'),
+    ('_layer6_ffn_dep_anchor', 'AX_CARRY_HI.*.-1'),
+    ('_layer6_ffn_dep_anchor', 'AX_CARRY_LO.*.-1'),
+    ('_layer6_ffn_dep_anchor', 'CMP.*.-1'),
+    ('_opcode_decode_ffn_dep_anchor', 'OPCODE_BYTE_LO.*.-1'),
+    ('format_pointer_extraction', 'IO_IN_OUTPUT_MODE.*.-1'),
+    ('format_position_counter', 'IO_IN_OUTPUT_MODE.*.-1'),
+    ('format_string_fetch_head', 'IO_IN_OUTPUT_MODE.*.-1'),
+    ('l10_post_ops_combined', 'OUTPUT_HI.*.-1'),
+    ('l10_post_ops_combined', 'OUTPUT_LO.*.-1'),
+    ('l10_post_ops_combined', 'TEMP.*.-1'),
+    ('layer10_alu', 'ALU_HI.*.-1'),
+    ('layer10_byte_passthrough', 'TEMP.*.-1'),
+    ('layer10_byte_passthrough_bake', 'TEMP.*.-1'),
+    ('layer10_carry_relay', 'CARRY.*.-1'),
+    ('layer10_carry_relay_bake', 'CARRY.*.-1'),
+    ('layer10_psh_stack0_passthrough_bake', 'OUTPUT_HI.*.-1'),
+    ('layer10_psh_stack0_passthrough_bake', 'OUTPUT_LO.*.-1'),
+    ('layer10_stack0_byte_relay', 'TEMP.*.-1'),
+    ('layer10_stack0_byte_relay_bake', 'TEMP.*.-1'),
+    ('layer12_mul_combine', 'TEMP.*.-1'),
+    ('layer14_addr_key_neural_decode', 'ADDR_B0_HI.*.-1'),
+    ('layer14_addr_key_neural_decode', 'ADDR_B0_LO.*.-1'),
+    ('layer14_mem_generation', 'ADDR_B0_HI.*.-1'),
+    ('layer14_mem_generation', 'ADDR_B0_LO.*.-1'),
+    ('layer15_memory_lookup', 'TEMP.*.-1'),
+    ('layer15_store_stack0_sp_byte0_addr', 'OUTPUT_HI.*.-1'),
+    ('layer16_lev_routing', 'ADDR_B0_HI.*.-1'),
+    ('layer16_lev_routing', 'ADDR_B0_LO.*.-1'),
+    ('layer16_lev_routing', 'TEMP.*.-1'),
+    ('layer3_carry_forward_attn', 'EMBED_HI.*.-1'),
+    ('layer3_carry_forward_attn', 'EMBED_LO.*.-1'),
+    ('layer3_carry_forward_attn', 'OP_LEV.*.-1'),
+    ('layer3_carry_forward_attn', 'OUTPUT_HI.*.-1'),
+    ('layer3_carry_forward_attn', 'OUTPUT_LO.*.-1'),
+    ('layer3_ffn', 'EMBED_HI.*.-1'),
+    ('layer3_ffn', 'EMBED_LO.*.-1'),
+    ('layer3_ffn', 'OP_LEV.*.-1'),
+    ('layer3_ffn', 'TEMP.*.-1'),
+    ('layer4_pc_relay', 'ADDR_KEY.*.-1'),
+    ('layer6_attn', 'AX_CARRY_HI.*.-1'),
+    ('layer6_attn', 'AX_CARRY_LO.*.-1'),
+    ('layer6_relay_heads', 'AX_CARRY_HI.*.-1'),
+    ('layer6_relay_heads', 'AX_CARRY_LO.*.-1'),
+    ('layer6_routing_ffn', 'AX_CARRY_HI.*.-1'),
+    ('layer6_routing_ffn', 'AX_CARRY_LO.*.-1'),
+    ('layer6_routing_ffn', 'CMP.*.-1'),
+    ('layer6_routing_ffn', 'DIV_STAGING.*.-1'),
+    ('layer6_routing_ffn', 'OUTPUT_HI.*.-1'),
+    ('layer6_routing_ffn', 'OUTPUT_LO.*.-1'),
+    ('layer6_routing_ffn', 'TEMP.*.-1'),
+    ('layer7_memory_heads', 'AX_CARRY_HI.*.-1'),
+    ('layer7_memory_heads', 'AX_CARRY_LO.*.-1'),
+    ('layer7_memory_heads', 'TEMP.*.-1'),
+    ('layer7_operand_gather', 'OUTPUT_HI.*.-1'),
+    ('layer7_operand_gather', 'OUTPUT_LO.*.-1'),
+    ('layer8_alu', 'ALU_LO.*.-1'),
+    ('layer8_head6_ax_carry_refresh', 'OUTPUT_HI.*.-1'),
+    ('layer8_head6_ax_carry_refresh', 'OUTPUT_LO.*.-1'),
+    ('layer8_mem_to_alu', 'ADDR_B0_HI.*.-1'),
+    ('layer8_mem_to_alu', 'ADDR_B0_LO.*.-1'),
+    ('layer8_mem_to_alu', 'ADDR_B1_HI.*.-1'),
+    ('layer8_mem_to_alu', 'ADDR_B1_LO.*.-1'),
+    ('layer8_mem_to_alu', 'ADDR_B2_HI.*.-1'),
+    ('layer8_mem_to_alu', 'ADDR_B2_LO.*.-1'),
+    ('layer8_sp_gather_bake', 'CMP.*.-1'),
+    ('layer9_alu', 'ALU_HI.*.-1'),
+    ('layer9_alu', 'ALU_LO.*.-1'),
+    ('layer9_alu', 'CARRY.*.-1'),
+    ('lev_detector_head', 'ADDR_B0_HI.*.-1'),
+    ('lev_detector_head', 'ADDR_B0_LO.*.-1'),
+    ('lev_detector_head', 'TEMP.*.-1'),
+    ('opcode_decode_ffn', 'OPCODE_BYTE_LO.*.-1'),
+    ('putchar_think_protocol', 'AX_CARRY_HI.*.-1'),
+    ('putchar_think_protocol', 'AX_CARRY_LO.*.-1'),
+})
+
+
 def _find_cross_step_reads_with_same_step_writers(
     ops: Sequence[Operation],
 ) -> List[Tuple[str, str, Tuple[str, ...]]]:
@@ -897,6 +1079,8 @@ def _emit_cross_step_safety_warnings(
     *,
     enabled: bool = True,
     limit: Optional[int] = None,
+    strict_error: bool = False,
+    allowlist: Optional[Iterable[Tuple[str, str]]] = None,
 ) -> List[Tuple[str, str, Tuple[str, ...]]]:
     """Run the cross-step safety check and emit one warning per finding.
 
@@ -912,6 +1096,28 @@ def _emit_cross_step_safety_warnings(
     findings are still returned). Use ``None`` (the default) to emit them
     all — the production op set has ~5-15 findings so the volume is
     bounded.
+
+    Step 4 strict-error path (``strict_error=True``)
+    ------------------------------------------------
+    When the caller sets ``strict_error=True``, every finding whose
+    ``(consumer, ssa_read)`` is NOT in ``allowlist`` is treated as a
+    HARD ERROR: the function raises :class:`CrossStepReadError` after
+    emitting the per-finding warnings. The error carries both the
+    unallowed-finding subset and the full findings list as attributes
+    so a caller can post-process (e.g. for incremental migration).
+
+    ``allowlist``: an iterable of ``(consumer, ssa_read)`` tuples to
+    suppress from the hard-error gate. When ``None`` (the default) the
+    bundled :data:`CROSS_STEP_BASELINE_ALLOWLIST` is used — that is, the
+    82 entries present at Step-4 landing. Pass an empty iterable to
+    disable the baseline (i.e. promote every finding to an error). Pass
+    a custom iterable to extend or replace the baseline for a specific
+    compile.
+
+    The warning emission is independent of ``strict_error`` — every
+    finding still emits a :class:`CrossStepReadWarning` so allowlisted
+    entries remain visible in the warnings stream and analyzers can
+    still pattern-match them.
     """
     findings = _find_cross_step_reads_with_same_step_writers(ops)
     if enabled:
@@ -932,6 +1138,26 @@ def _emit_cross_step_safety_warnings(
                 f"class-of-bug."
             )
             warnings.warn(msg, CrossStepReadWarning, stacklevel=2)
+    if strict_error:
+        # Resolve the allowlist. ``None`` -> baked-in baseline. Any explicit
+        # iterable (including an empty one) -> use as-is. This lets a
+        # caller pass ``[]`` to promote every finding to an error.
+        if allowlist is None:
+            effective_allowlist: FrozenSet[Tuple[str, str]] = (
+                CROSS_STEP_BASELINE_ALLOWLIST
+            )
+        else:
+            effective_allowlist = frozenset(allowlist)
+        unallowed = [
+            (consumer, ssa_read, writers)
+            for (consumer, ssa_read, writers) in findings
+            if (consumer, ssa_read) not in effective_allowlist
+        ]
+        if unallowed:
+            raise CrossStepReadError(
+                unallowed_findings=unallowed,
+                all_findings=findings,
+            )
     return findings
 
 
@@ -997,6 +1223,7 @@ def compile_full_vm_dynamic(
     target_shape_overrides=None,
     d_model_packing: bool = False,
     d_model_packing_target: Optional[int] = None,
+    cross_step_baseline_allowlist: Optional[Iterable[Tuple[str, str]]] = None,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
@@ -1270,14 +1497,27 @@ def compile_full_vm_dynamic(
     # ALSO has a same-step writer in the scheduled op set. On VM step 1
     # there is no previous step, so the cross-step alias resolves to 0;
     # when a same-step writer exists, the bake author very often meant to
-    # consume that fresh write instead. The warning is purely diagnostic —
-    # it changes no runtime behaviour. Emitted via ``warnings.warn`` with
+    # consume that fresh write instead. Emitted via ``warnings.warn`` with
     # the ``CrossStepReadWarning`` category so callers can filter or
     # promote to errors via the stdlib ``warnings`` filter mechanism. The
     # canonical motivating case is the OPCODE_BYTE_LO read in
     # ``opcode_decode_ffn`` (see ``ops/l5_ops.py``) whose same-step writer
     # is ``layer5_fetch`` — on step 1 the decoder reads 0.
-    _emit_cross_step_safety_warnings(_scheduled)
+    #
+    # Step 4 (``IR_INCREMENTAL_IMPROVEMENTS.md``): when ``strict=True``,
+    # the warning becomes a HARD ERROR (``CrossStepReadError``). The
+    # caller can pass ``cross_step_baseline_allowlist`` to whitelist the
+    # historical findings while migrating them off cross-step reads; the
+    # bundled :data:`CROSS_STEP_BASELINE_ALLOWLIST` (82 entries at Step-4
+    # landing) is used when no explicit allowlist is supplied. Passing
+    # ``cross_step_baseline_allowlist=[]`` promotes every finding to an
+    # error (useful for new bake authors who want zero cross-step
+    # zero-prop risk).
+    _emit_cross_step_safety_warnings(
+        _scheduled,
+        strict_error=strict,
+        allowlist=cross_step_baseline_allowlist,
+    )
 
     # Build the model via the unchanged static pipeline with the natural
     # op order. The static compile_full_vm wraps op collection inline,

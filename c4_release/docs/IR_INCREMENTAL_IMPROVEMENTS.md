@@ -63,7 +63,7 @@ to receive d_model from a typed model_config object.
 
 ---
 
-## Step 4: SSA value distinction (small refactor)
+## Step 4: SSA value distinction (small refactor) — LANDED
 
 Today: `DIM` and `DIM.*.-1` resolve to the same physical slot at
 lowering. The OPCODE_BYTE_LO bug was an instance of this collapse.
@@ -74,6 +74,19 @@ cross-step read has an explicit producer.
 
 **Acceptance**: compiler-step0 safety (`ef6ef561`) becomes a hard
 error in strict mode.
+
+**Status**: shipped. `compile_full_vm_dynamic(strict=True)` now raises
+`CrossStepReadError` for any `(consumer, ssa_read)` pair that finds a
+same-step writer AND is not in the baseline allowlist. The bundled
+`CROSS_STEP_BASELINE_ALLOWLIST` (82 entries at landing) preserves the
+existing behaviour — every entry is a TODO to migrate the read away
+from the cross-step alias. A regression ratchet
+(`test_baseline_allowlist_size_matches_step4_landing`) caps the
+allowlist at 82 so future commits must shrink, not grow it. Callers
+can pass `cross_step_baseline_allowlist=[]` to promote every finding
+to an error (new bake authors), pass a custom subset for incremental
+migration, or pass `None` (default) to use the baseline.
+
 **Effort**: 1-2 sessions.
 
 ---

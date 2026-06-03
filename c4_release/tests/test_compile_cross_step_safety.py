@@ -36,12 +36,16 @@ Tests cover:
 import warnings
 
 from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+    CROSS_STEP_BASELINE_ALLOWLIST,
+    CrossStepReadError,
     CrossStepReadWarning,
     _collect_ops_for_compile,
     _emit_cross_step_safety_warnings,
     _find_cross_step_reads_with_same_step_writers,
 )
 from c4_release.neural_vm.unified_compiler.layer_compiler import Operation
+
+import pytest
 
 
 def _noop_bake(*_args, **_kwargs):
@@ -234,3 +238,128 @@ def test_production_op_set_has_nontrivial_finding_baseline():
         f"dropped to near zero, celebrate — the OUTPUT_HI / IF_VAR SCC "
         f"may have been broken — and consider tightening the floor."
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. Step 4 hard-error mode: strict_error + allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_strict_error_empty_allowlist_raises_cross_step_read_error():
+    """When ``strict_error=True`` and the allowlist is empty, every finding
+    must be promoted to a hard :class:`CrossStepReadError`.
+
+    Step 4 of ``IR_INCREMENTAL_IMPROVEMENTS.md``: cross-step reads with
+    same-step writers become a compile-time error in strict mode. This
+    pins the "no allowlist" worst-case: the call must raise carrying ALL
+    findings as ``unallowed_findings``.
+    """
+    ops = _collect_ops_for_compile(
+        alu_mode="lookup",
+        enable_conversational_io=False,
+        enable_tool_calling=False,
+        enable_neural_io_think_protocol=False,
+    )
+    with pytest.raises(CrossStepReadError) as excinfo:
+        _emit_cross_step_safety_warnings(
+            ops, strict_error=True, allowlist=[]
+        )
+    err = excinfo.value
+    assert len(err.unallowed_findings) >= 10, (
+        f"expected the no-allowlist hard error to surface >=10 unallowed "
+        f"findings (current production baseline ~82); got "
+        f"{len(err.unallowed_findings)}."
+    )
+    assert len(err.all_findings) == len(err.unallowed_findings), (
+        "with an empty allowlist every finding must be unallowed"
+    )
+
+
+def test_strict_error_default_baseline_allowlist_succeeds():
+    """The bundled :data:`CROSS_STEP_BASELINE_ALLOWLIST` (82 entries at
+    Step-4 landing) must cover every finding the safety check produces
+    on today's op set. If not, the next compile would error and a fix
+    brief is needed to either migrate the offending read or extend the
+    allowlist with an explicit TODO.
+    """
+    ops = _collect_ops_for_compile(
+        alu_mode="lookup",
+        enable_conversational_io=False,
+        enable_tool_calling=False,
+        enable_neural_io_think_protocol=False,
+    )
+    # No raise -> success. Default ``allowlist=None`` activates the
+    # baked-in baseline.
+    findings = _emit_cross_step_safety_warnings(ops, strict_error=True)
+    pairs = {(c, r) for (c, r, _ws) in findings}
+    leaked = pairs - CROSS_STEP_BASELINE_ALLOWLIST
+    assert not leaked, (
+        f"baseline allowlist missed {len(leaked)} new finding(s): "
+        f"{sorted(leaked)}. Either migrate those reads or extend "
+        f"CROSS_STEP_BASELINE_ALLOWLIST in "
+        f"``unified_compiler/full_vm_compiler_dynamic.py`` with a TODO."
+    )
+
+
+def test_baseline_allowlist_size_matches_step4_landing():
+    """Pin the Step-4 landing baseline size as a ratchet.
+
+    Step 4 freezes the allowlist at 82 entries (the production findings
+    at landing). The ratchet asserts that future commits do NOT GROW the
+    allowlist — every removal is progress toward the Step 4 goal of zero
+    cross-step zero-prop ambiguity. New cross-step reads must be migrated
+    in the same commit that introduces them, not allowlisted.
+
+    If you must add an entry, increment this ceiling in the same commit
+    AND add a TODO comment in the allowlist body pointing at the fix
+    plan.
+    """
+    assert len(CROSS_STEP_BASELINE_ALLOWLIST) <= 82, (
+        f"CROSS_STEP_BASELINE_ALLOWLIST grew to "
+        f"{len(CROSS_STEP_BASELINE_ALLOWLIST)} entries; Step 4 ratchet "
+        f"caps it at 82. New cross-step reads must be migrated, not "
+        f"whitelisted."
+    )
+
+
+def test_strict_error_custom_allowlist_filters_specific_pairs():
+    """``allowlist=[(consumer, ssa_read), ...]`` must filter only the
+    listed pairs — every other finding is still promoted to an error.
+
+    This is the canonical "partial migration" usage: a caller can pass a
+    smaller allowlist than the baseline as their fix lands, and the
+    compile error surfaces exactly the pairs they haven't migrated yet.
+    """
+    # Two synthetic ops: writer + reader. ``reader`` reads BASE.*.-1
+    # and ``writer`` writes BASE in the same step, so the safety check
+    # finds 1 entry. With an allowlist that EXCLUDES that pair we expect
+    # CrossStepReadError; with an allowlist that INCLUDES it we expect
+    # success.
+    writer = Operation(
+        name="writer_op",
+        reads=set(),
+        writes={"BASE"},
+        kind="ffn",
+        bake_fn=_noop_bake,
+        phase=0.0,
+    )
+    reader = Operation(
+        name="reader_op",
+        reads={"BASE.*.-1"},
+        writes={"OUT"},
+        kind="ffn",
+        bake_fn=_noop_bake,
+        phase=1.0,
+    )
+    # Allowlist does NOT include the pair -> error.
+    with pytest.raises(CrossStepReadError):
+        _emit_cross_step_safety_warnings(
+            [writer, reader], strict_error=True, allowlist=[]
+        )
+    # Allowlist includes the pair -> no error.
+    findings = _emit_cross_step_safety_warnings(
+        [writer, reader],
+        strict_error=True,
+        allowlist=[("reader_op", "BASE.*.-1")],
+    )
+    assert len(findings) == 1
