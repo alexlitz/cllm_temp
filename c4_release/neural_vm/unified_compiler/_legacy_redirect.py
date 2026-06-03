@@ -405,12 +405,131 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
     return model, layout
 
 
+_CACHE_MAX_BYTES_ENV = "C4_VM_CACHE_MAX_BYTES"
+_CACHE_MAX_ENTRIES_ENV = "C4_VM_CACHE_MAX_ENTRIES"
+_CACHE_DEFAULT_MAX_BYTES = 10 * 1024 * 1024 * 1024  # 10 GiB
+_CACHE_DEFAULT_MAX_ENTRIES = 16
+
+
+def _parse_positive_int_env(name: str, default: int) -> int:
+    """Parse a positive int env var; fall back to ``default`` on bad values.
+
+    Returning <= 0 disables the corresponding LRU threshold.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        _logger.warning(
+            "compile_full_vm_dynamic: %s=%r is not an integer; using default %d",
+            name, raw, default,
+        )
+        return default
+
+
+def _evict_cache_lru(
+    cache_dir: pathlib.Path,
+    *,
+    keep_path: Optional[pathlib.Path] = None,
+    max_bytes: Optional[int] = None,
+    max_entries: Optional[int] = None,
+) -> List[pathlib.Path]:
+    """Evict oldest ``*.pt`` entries from ``cache_dir`` to satisfy LRU bounds.
+
+    The disk cache is unbounded by default — each entry is ~830 MB and a
+    handful of compile variants (n_heads / ffn_hidden / alu_mode / ...) can
+    push the directory past 30 GB quickly. This helper enforces two caps:
+
+    - ``max_bytes`` (env ``C4_VM_CACHE_MAX_BYTES``, default 10 GiB): total
+      on-disk size across ``*.pt`` files.
+    - ``max_entries`` (env ``C4_VM_CACHE_MAX_ENTRIES``, default 16): count of
+      ``*.pt`` files in the directory.
+
+    Set either env var to ``0`` to disable that cap independently. Eviction
+    is best-effort and never raises; the caller (cache writer) is unaffected
+    by failures here. ``keep_path`` is never evicted (used to protect the
+    entry just written by the current call). Returns the list of evicted
+    paths (mostly for tests).
+    """
+    if max_bytes is None:
+        max_bytes = _parse_positive_int_env(
+            _CACHE_MAX_BYTES_ENV, _CACHE_DEFAULT_MAX_BYTES
+        )
+    if max_entries is None:
+        max_entries = _parse_positive_int_env(
+            _CACHE_MAX_ENTRIES_ENV, _CACHE_DEFAULT_MAX_ENTRIES
+        )
+
+    evicted: List[pathlib.Path] = []
+    try:
+        if not cache_dir.exists():
+            return evicted
+
+        entries: List[tuple] = []
+        for p in cache_dir.glob("*.pt"):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, p))
+
+        # Oldest first; LRU = evict from the front.
+        entries.sort(key=lambda e: e[0])
+
+        total_bytes = sum(e[1] for e in entries)
+        count = len(entries)
+
+        keep_resolved = None
+        if keep_path is not None:
+            try:
+                keep_resolved = keep_path.resolve()
+            except OSError:
+                keep_resolved = keep_path
+
+        for mtime, size, p in entries:
+            over_bytes = max_bytes > 0 and total_bytes > max_bytes
+            over_count = max_entries > 0 and count > max_entries
+            if not (over_bytes or over_count):
+                break
+            try:
+                p_resolved = p.resolve()
+            except OSError:
+                p_resolved = p
+            if keep_resolved is not None and p_resolved == keep_resolved:
+                # Don't evict the file we just wrote even if it's also the
+                # oldest (e.g. a single-entry over-budget cache).
+                continue
+            try:
+                p.unlink()
+            except OSError as exc:
+                _logger.warning(
+                    "compile_full_vm_dynamic: failed to evict cache entry %s (%s)",
+                    p, exc,
+                )
+                continue
+            evicted.append(p)
+            total_bytes -= size
+            count -= 1
+    except Exception as exc:  # never let LRU break the cache write
+        _logger.warning(
+            "compile_full_vm_dynamic: LRU eviction in %s failed (%s); skipping",
+            cache_dir, exc,
+        )
+    return evicted
+
+
 def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
     """Save the compiled model to ``path`` atomically. Best-effort.
 
     Saves the full model object so loading reproduces the post-bake state
     (including right-sized FFN shapes and wrapper modules attached during
     the bake) without re-running any bake_fn.
+
+    After a successful write the disk cache is trimmed via ``_evict_cache_lru``
+    so it does not grow unbounded across compile-variant kwargs (see the env
+    knobs ``C4_VM_CACHE_MAX_BYTES`` / ``C4_VM_CACHE_MAX_ENTRIES``).
     """
     import torch as _torch
 
@@ -461,6 +580,11 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
                 tmp_path.unlink()
             except OSError:
                 pass
+
+    # Best-effort: trim cache directory after a successful write. Pass the
+    # just-written path as ``keep_path`` so it's protected even if the cap is
+    # somehow below a single entry's size (e.g. a misconfigured tiny cap).
+    _evict_cache_lru(path.parent, keep_path=path)
 
 
 def _attach_kv_eviction_state(
