@@ -23,20 +23,31 @@ import math
 import pytest
 import torch
 
-from c4_release.neural_vm.base_layers import PureFFN
+from c4_release.neural_vm.base_layers import PureAttention, PureFFN
+from c4_release.neural_vm.kv_cache_eviction import softmax1
 from c4_release.neural_vm.unified_compiler.building_blocks_dsl import (
     band_range_check_rules,
+    bit_range_extract_rules,
     cancel_residual_rule,
+    efficient_exp_attention,
+    fetch_byte_attention,
     lookup_table_rules,
+    magic_floor_rules,
+    memory_load_attention,
     multi_way_and_rule,
     multi_way_or_rules,
     one_hot_indicator_rule,
+    opcode_expert_rules,
     step_function_rule,
 )
 from c4_release.neural_vm.unified_compiler.ir import (
+    FFNRule,
     compare_symbolic_to_lowered_ffn,
 )
-from c4_release.neural_vm.unified_compiler.primitives import Primitives
+from c4_release.neural_vm.unified_compiler.primitives import (
+    DeclarativeAttentionHeadSpec,
+    Primitives,
+)
 
 
 _SILU_ONE_INPUT = 1.278464542761074
@@ -460,3 +471,584 @@ def test_all_primitives_return_ffn_rule_objects():
         key_band="K", key_to_writes={0: [("OUT+0", 1.0)]},
     )
     assert isinstance(lut, tuple) and len(lut) == 1
+
+
+# ===========================================================================
+# V2 helpers
+# ===========================================================================
+
+
+def _floor_ffn_at_S1(rules, dim_positions):
+    """Build a fresh PureFFN sized for ``rules`` and lower at S=1 (the
+    scale that ``magic_floor_rules`` / ``bit_range_extract_rules``
+    require)."""
+
+    n_rules = len(rules)
+    d_model = max(dim_positions.values()) + 8
+    ffn = PureFFN(dim=d_model, hidden_dim=max(n_rules, 1))
+    end = Primitives.lower_ffn_rules(
+        ffn, rules, dim_positions, start_unit=0, S=1.0,
+    )
+    assert end == n_rules
+    return ffn
+
+
+def _ffn_delta(ffn, dim_positions, state):
+    """Run one FFN forward pass and return the per-dim delta the layer
+    contributed (forward output minus the input residual)."""
+
+    d_model = ffn.W_up.shape[1]
+    x = torch.zeros(1, 1, d_model, dtype=torch.float32)
+    for key, value in state.items():
+        if "+" in key:
+            base, off = key.rsplit("+", 1)
+            x[0, 0, dim_positions[base] + int(off)] = float(value)
+        else:
+            x[0, 0, dim_positions[key]] = float(value)
+    with torch.no_grad():
+        y = ffn(x)
+    delta = (y - x)[0, 0]
+    out = {}
+    for name, base_pos in dim_positions.items():
+        out[name] = float(delta[base_pos].item())
+    return out
+
+
+# ===========================================================================
+# magic_floor_rules
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0.0, 0.4, 1.0, 1.5, 1.7, 2.0, 3.4, 7.9, 100.5, 999.0, 100000.7],
+)
+def test_magic_floor_rules_matches_python_floor(value):
+    rules = magic_floor_rules(
+        input_dim="X", output_dim="Y", const_dim="CONST", name="mf",
+    )
+    assert len(rules) == 2
+    dim_positions = {"X": 0, "Y": 1, "CONST": 2}
+    ffn = _floor_ffn_at_S1(rules, dim_positions)
+    delta = _ffn_delta(ffn, dim_positions, {"X": value, "CONST": 1.0})
+    expected = math.floor(value)
+    assert abs(delta["Y"] - expected) < 1e-3, (
+        f"magic_floor({value}): got {delta['Y']!r}, expected {expected}"
+    )
+
+
+def test_magic_floor_rules_emits_two_rules_of_correct_kinds():
+    rules = magic_floor_rules(input_dim="X", output_dim="Y")
+    assert len(rules) == 2
+    floor_unit, cancel_unit = rules
+    # The floor unit reads input + the offset const dim; the cancel unit
+    # is pure-constant (no conditions).
+    assert len(floor_unit.conditions) == 2
+    assert floor_unit.conditions[0].dim.name == "X"
+    assert floor_unit.conditions[1].dim.name == "CONST"
+    assert len(cancel_unit.conditions) == 0
+    # Both writes target the same output dim with opposite signs.
+    assert floor_unit.writes[0].dim.name == "Y"
+    assert cancel_unit.writes[0].dim.name == "Y"
+    assert floor_unit.writes[0].weight == +1.0
+    assert cancel_unit.writes[0].weight == -1.0
+
+
+def test_magic_floor_rules_with_gate_uses_gated_write():
+    rules = magic_floor_rules(
+        input_dim="X", output_dim="Y", gate="OP_FLOOR",
+    )
+    for r in rules:
+        assert r.gate is not None
+        assert r.gate.name == "OP_FLOOR"
+        # gated_write sets gate_bias=0 (not 1).
+        assert r.gate_bias == 0.0
+
+
+# ===========================================================================
+# bit_range_extract_rules
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "value", [0, 0x12, 0x3A, 0x80, 0xFF, 0x100, 0xC, 0x123, 0x1234],
+)
+@pytest.mark.parametrize(
+    "lo_bit, hi_bit", [(0, 4), (4, 8), (0, 8), (8, 16), (4, 12)],
+)
+def test_bit_range_extract_rules_lowers_correctly(value, lo_bit, hi_bit):
+    rules = bit_range_extract_rules(
+        input_dim="X",
+        lo_shift_dim="LO",
+        hi_shift_dim="HI",
+        lo_bit=lo_bit,
+        hi_bit=hi_bit,
+        name="extract",
+    )
+    assert len(rules) == 4
+    dim_positions = {"X": 0, "LO": 1, "HI": 2, "CONST": 3}
+    ffn = _floor_ffn_at_S1(rules, dim_positions)
+    delta = _ffn_delta(ffn, dim_positions, {"X": float(value), "CONST": 1.0})
+    width = hi_bit - lo_bit
+    expected_lo = (value >> lo_bit)
+    expected_hi = (value >> hi_bit)
+    expected_combine = expected_lo - (1 << width) * expected_hi
+    expected_bits = (value >> lo_bit) & ((1 << width) - 1)
+    assert expected_combine == expected_bits, (
+        "test sanity: combine identity should equal masked extract"
+    )
+    combine = delta["LO"] - float(1 << width) * delta["HI"]
+    assert abs(combine - expected_bits) < 1e-3, (
+        f"bit_range_extract({value:#x}, lo={lo_bit}, hi={hi_bit}): "
+        f"lo={delta['LO']}, hi={delta['HI']}, combine={combine}, "
+        f"expected_bits={expected_bits}"
+    )
+
+
+def test_bit_range_extract_rules_rejects_invalid_ranges():
+    with pytest.raises(ValueError, match="lo_bit"):
+        bit_range_extract_rules(
+            input_dim="X", lo_shift_dim="LO", hi_shift_dim="HI",
+            lo_bit=-1, hi_bit=4,
+        )
+    with pytest.raises(ValueError, match="hi_bit"):
+        bit_range_extract_rules(
+            input_dim="X", lo_shift_dim="LO", hi_shift_dim="HI",
+            lo_bit=4, hi_bit=4,
+        )
+    with pytest.raises(ValueError, match="hi_bit"):
+        bit_range_extract_rules(
+            input_dim="X", lo_shift_dim="LO", hi_shift_dim="HI",
+            lo_bit=4, hi_bit=24,
+        )
+
+
+# ===========================================================================
+# efficient_exp_attention
+# ===========================================================================
+
+
+def _softmax1_attn_forward(x, attn_mod):
+    """Run a single-head PureAttention forward using softmax1 instead of
+    F.softmax. PureAttention defaults to F.softmax; the blog's
+    efficient-exp construction depends on softmax1's +1 anchor, so the
+    test replays the same matrix products with the correct
+    normalization."""
+
+    HD = attn_mod.head_dim
+    Q = x @ attn_mod.W_q.T
+    K = x @ attn_mod.W_k.T
+    V = x @ attn_mod.W_v.T
+    scores = Q @ K.transpose(-1, -2) / math.sqrt(HD)
+    weights = softmax1(scores, dim=-1, anchor=0.0)
+    out = weights @ V
+    return x + out @ attn_mod.W_o.T
+
+
+def test_efficient_exp_attention_spec_structure():
+    dim_positions = {"N": 0, "OUT": 1, "BOS_K": 2, "CONST": 3}
+    spec = efficient_exp_attention(
+        head_idx=0, input_dim="N", output_dim="OUT",
+        bos_token_key_dim="BOS_K", bias=2.5, head_dim=8,
+        dim_positions=dim_positions,
+    )
+    assert isinstance(spec, DeclarativeAttentionHeadSpec)
+    assert spec.head_idx == 0
+    assert spec.alibi_slope == 0.0
+    # Q reads input_dim with +1 and bias_dim with -bias.
+    assert len(spec.q) == 2
+    weights_by_dim = {w.dim: w.weight for w in spec.q}
+    assert weights_by_dim[dim_positions["N"]] == 1.0
+    assert weights_by_dim[dim_positions["CONST"]] == -2.5
+    # K reads bos_token_key_dim with weight sqrt(head_dim).
+    assert len(spec.k) == 1
+    assert spec.k[0].dim == dim_positions["BOS_K"]
+    assert math.isclose(spec.k[0].weight, math.sqrt(8.0))
+    # V reads bos_token_key_dim with weight e^B.
+    assert len(spec.v) == 1
+    assert spec.v[0].dim == dim_positions["BOS_K"]
+    assert math.isclose(spec.v[0].weight, math.exp(2.5))
+    # O writes the V slot back to OUT.
+    assert len(spec.o) == 1
+    assert spec.o[0].out_dim == dim_positions["OUT"]
+
+
+@pytest.mark.parametrize("N_val", [0.0, 0.5, 1.0, 2.0, 2.5])
+def test_efficient_exp_attention_matches_blog_softmax1_formula(N_val):
+    """In the canonical [BOS, query] two-token setup with softmax1, the
+    head's output equals the closed-form formula
+
+        e^B · e^(N-B) / (2 + e^(N-B))
+
+    (T=1 non-BOS token: the query's self-attention contributes one e^0=1
+    to the denominator alongside the BOS row's e^(N-B); softmax1's "+1"
+    anchor adds the remaining 1). At ``N ≪ B`` this collapses to
+    ``e^N / 2`` which is the blog's approximation up to a constant.
+    """
+    B = 2.5
+    dim_positions = {"N": 0, "OUT": 1, "BOS_K": 2, "CONST": 3}
+    spec = efficient_exp_attention(
+        head_idx=0, input_dim="N", output_dim="OUT",
+        bos_token_key_dim="BOS_K", bias=B, head_dim=8,
+        dim_positions=dim_positions,
+    )
+    attn = PureAttention(dim=8, num_heads=1, causal=False)
+    Primitives.generate_attention_head(attn, spec, HD=8)
+    x = torch.zeros(1, 2, 8, dtype=torch.float32)
+    x[0, 0, dim_positions["BOS_K"]] = 1.0
+    x[0, 0, dim_positions["CONST"]] = 1.0
+    x[0, 1, dim_positions["N"]] = N_val
+    x[0, 1, dim_positions["CONST"]] = 1.0
+    with torch.no_grad():
+        y = _softmax1_attn_forward(x, attn)
+    delta = float((y - x)[0, 1, dim_positions["OUT"]].item())
+    diff = N_val - B
+    expected = math.exp(B) * math.exp(diff) / (2.0 + math.exp(diff))
+    assert math.isclose(delta, expected, rel_tol=1e-4, abs_tol=1e-4), (
+        f"N={N_val}, B={B}: delta={delta}, expected={expected}"
+    )
+
+
+def test_efficient_exp_attention_rejects_missing_dim():
+    with pytest.raises(ValueError, match="missing from dim_positions"):
+        efficient_exp_attention(
+            head_idx=0, input_dim="MISSING", output_dim="OUT",
+            bos_token_key_dim="BOS_K", bias=1.0, head_dim=8,
+            dim_positions={"OUT": 0, "BOS_K": 1, "CONST": 2},
+        )
+
+
+def test_efficient_exp_attention_rejects_slot_overflow():
+    with pytest.raises(ValueError, match="input_slot"):
+        efficient_exp_attention(
+            head_idx=0, input_dim="N", output_dim="OUT",
+            bos_token_key_dim="BOS_K", bias=1.0, head_dim=4,
+            input_slot=4,
+            dim_positions={"N": 0, "OUT": 1, "BOS_K": 2, "CONST": 3},
+        )
+
+
+# ===========================================================================
+# memory_load_attention
+# ===========================================================================
+
+
+def test_memory_load_attention_fetches_correct_row():
+    """Build a KV state with 3 memory rows at distinct one-hot
+    addresses and verify the head loads the matching row's value."""
+
+    dim_positions = {
+        "Q_A0": 0, "Q_A1": 1, "Q_A2": 2, "Q_A3": 3,
+        "K_A0": 4, "K_A1": 5, "K_A2": 6, "K_A3": 7,
+        "VAL": 8, "OUT": 9,
+    }
+    spec = memory_load_attention(
+        head_idx=0,
+        addr_query_dims=["Q_A0", "Q_A1", "Q_A2", "Q_A3"],
+        addr_key_dims=["K_A0", "K_A1", "K_A2", "K_A3"],
+        value_dims=["VAL"],
+        output_dims=["OUT"],
+        head_dim=8, query_weight=15.0, key_weight=15.0,
+        dim_positions=dim_positions,
+    )
+    attn = PureAttention(dim=16, num_heads=1, causal=False)
+    Primitives.generate_attention_head(attn, spec, HD=8)
+    # Token i: K_A{i}=1, VAL=i*10. Token 3 (query): Q_A{2}=1 → fetch
+    # the row whose addr nibble bank-2 is hot (token 2, VAL=20).
+    x = torch.zeros(1, 4, 16, dtype=torch.float32)
+    x[0, 0, dim_positions["K_A0"]] = 1.0
+    x[0, 0, dim_positions["VAL"]] = 10.0
+    x[0, 1, dim_positions["K_A1"]] = 1.0
+    x[0, 1, dim_positions["VAL"]] = 20.0
+    x[0, 2, dim_positions["K_A2"]] = 1.0
+    x[0, 2, dim_positions["VAL"]] = 30.0
+    x[0, 3, dim_positions["Q_A2"]] = 1.0
+    with torch.no_grad():
+        y = attn(x)
+    delta = float((y - x)[0, 3, dim_positions["OUT"]].item())
+    # With L=15.0 and one-hot match, the attention saturates sharply.
+    # Score on the matched row is much higher than the non-matched rows
+    # (which still attend a little via the query row's self-attention),
+    # so the matched row's value (30.0) lands cleanly on OUT.
+    assert abs(delta - 30.0) < 1e-2, f"memory_load delta={delta!r}"
+
+
+def test_memory_load_attention_rejects_width_mismatch():
+    dim_positions = {"A": 0, "B": 1, "V": 2, "O": 3}
+    with pytest.raises(ValueError, match="length mismatch"):
+        memory_load_attention(
+            head_idx=0,
+            addr_query_dims=["A"],
+            addr_key_dims=["A", "B"],
+            value_dims=["V"],
+            output_dims=["O"],
+            dim_positions=dim_positions,
+        )
+    with pytest.raises(ValueError, match="length mismatch"):
+        memory_load_attention(
+            head_idx=0,
+            addr_query_dims=["A"],
+            addr_key_dims=["B"],
+            value_dims=["V"],
+            output_dims=["O", "O"],
+            dim_positions=dim_positions,
+        )
+
+
+def test_memory_load_attention_rejects_slot_overflow():
+    dim_positions = {"A": 0, "B": 1, "V": 2, "O": 3}
+    with pytest.raises(ValueError, match="head_dim"):
+        memory_load_attention(
+            head_idx=0,
+            addr_query_dims=["A"] * 4,
+            addr_key_dims=["B"] * 4,
+            value_dims=["V"],
+            output_dims=["O"],
+            head_dim=4,
+            dim_positions=dim_positions,
+        )
+
+
+# ===========================================================================
+# fetch_byte_attention
+# ===========================================================================
+
+
+def _build_fetch_byte_kv(*, n_rows, pc_nibbles=2, nibble_bits=4,
+                          value_width=2, dim_positions, addr_per_row,
+                          val_per_row):
+    """Build a synthetic [n_rows] KV state for fetch_byte_attention.
+
+    PC is one-hot encoded across ``pc_nibbles`` banks of
+    ``2 ** nibble_bits`` cells. ``addr_per_row[i]`` is the integer
+    address stored at row ``i``. ``val_per_row[i]`` is the byte-tuple
+    stored at that row.
+    """
+    cells = 1 << nibble_bits
+    d_model = max(dim_positions.values()) + value_width + 8
+    x = torch.zeros(1, n_rows, d_model, dtype=torch.float32)
+    for i, addr in enumerate(addr_per_row):
+        for b in range(pc_nibbles):
+            cell = (addr >> (b * nibble_bits)) & (cells - 1)
+            x[0, i, dim_positions["ADDR_KEY"] + b * cells + cell] = 1.0
+        for j, v in enumerate(val_per_row[i]):
+            x[0, i, dim_positions["VAL"] + j] = float(v)
+    return x
+
+
+def test_fetch_byte_attention_zero_offset_loads_pc_row():
+    """With ``pc_offset=0`` and one-hot-encoded PC, the query at the
+    cell encoding PC=k loads the row whose stored address equals k."""
+    pc_nibbles = 2
+    nibble_bits = 4
+    cells = 1 << nibble_bits
+    addr_band_w = pc_nibbles * cells
+    value_width = 2
+    dim_positions = {
+        "PC": 0,
+        "ADDR_KEY": addr_band_w,
+        "VAL": 2 * addr_band_w,
+        "OUT": 2 * addr_band_w + value_width,
+    }
+    d_model = 2 * addr_band_w + 2 * value_width + 8
+    spec = fetch_byte_attention(
+        head_idx=0,
+        pc_dim_base="PC",
+        addr_key_dim_base="ADDR_KEY",
+        value_dim_base="VAL",
+        output_dim_base="OUT",
+        pc_offset=0,
+        pc_nibbles=pc_nibbles,
+        nibble_bits=nibble_bits,
+        value_width=value_width,
+        head_dim=64,
+        query_weight=15.0,
+        key_weight=15.0,
+        dim_positions=dim_positions,
+    )
+    attn = PureAttention(dim=d_model, num_heads=1, causal=False)
+    Primitives.generate_attention_head(attn, spec, HD=64)
+    # 5 tokens: 4 memory rows storing addresses 0..3 with values
+    # (10+i, 100+i), and one query at PC=2 → fetch row 2.
+    x = _build_fetch_byte_kv(
+        n_rows=5, pc_nibbles=pc_nibbles, nibble_bits=nibble_bits,
+        value_width=value_width, dim_positions=dim_positions,
+        addr_per_row=[0, 1, 2, 3, 0],
+        val_per_row=[(10, 100), (11, 101), (12, 102), (13, 103), (0, 0)],
+    )
+    # Query at token 4: encode PC=2 as one-hot
+    pc_val = 2
+    for b in range(pc_nibbles):
+        cell = (pc_val >> (b * nibble_bits)) & (cells - 1)
+        x[0, 4, dim_positions["PC"] + b * cells + cell] = 1.0
+    with torch.no_grad():
+        y = attn(x)
+    delta_lo = float((y - x)[0, 4, dim_positions["OUT"]].item())
+    delta_hi = float((y - x)[0, 4, dim_positions["OUT"] + 1].item())
+    assert abs(delta_lo - 12.0) < 5e-2, (
+        f"OUT[0] should fetch row 2 VAL[0]=12, got {delta_lo!r}"
+    )
+    assert abs(delta_hi - 102.0) < 5e-2, (
+        f"OUT[1] should fetch row 2 VAL[1]=102, got {delta_hi!r}"
+    )
+
+
+def test_fetch_byte_attention_offset_one_shifts_query_target():
+    """With ``pc_offset=1``, query at PC=2 should fetch the row whose
+    stored address equals 3 (one ahead)."""
+    pc_nibbles = 2
+    nibble_bits = 4
+    cells = 1 << nibble_bits
+    addr_band_w = pc_nibbles * cells
+    value_width = 2
+    dim_positions = {
+        "PC": 0,
+        "ADDR_KEY": addr_band_w,
+        "VAL": 2 * addr_band_w,
+        "OUT": 2 * addr_band_w + value_width,
+    }
+    d_model = 2 * addr_band_w + 2 * value_width + 8
+    spec = fetch_byte_attention(
+        head_idx=0,
+        pc_dim_base="PC",
+        addr_key_dim_base="ADDR_KEY",
+        value_dim_base="VAL",
+        output_dim_base="OUT",
+        pc_offset=1,
+        pc_nibbles=pc_nibbles,
+        nibble_bits=nibble_bits,
+        value_width=value_width,
+        head_dim=64,
+        query_weight=15.0,
+        key_weight=15.0,
+        dim_positions=dim_positions,
+    )
+    attn = PureAttention(dim=d_model, num_heads=1, causal=False)
+    Primitives.generate_attention_head(attn, spec, HD=64)
+    x = _build_fetch_byte_kv(
+        n_rows=5, pc_nibbles=pc_nibbles, nibble_bits=nibble_bits,
+        value_width=value_width, dim_positions=dim_positions,
+        addr_per_row=[0, 1, 2, 3, 0],
+        val_per_row=[(10, 100), (11, 101), (12, 102), (13, 103), (0, 0)],
+    )
+    pc_val = 2
+    for b in range(pc_nibbles):
+        cell = (pc_val >> (b * nibble_bits)) & (cells - 1)
+        x[0, 4, dim_positions["PC"] + b * cells + cell] = 1.0
+    with torch.no_grad():
+        y = attn(x)
+    delta_lo = float((y - x)[0, 4, dim_positions["OUT"]].item())
+    assert abs(delta_lo - 13.0) < 5e-2, (
+        f"OUT[0] should fetch row 3 VAL[0]=13 (PC+1 of PC=2), got "
+        f"{delta_lo!r}"
+    )
+
+
+def test_fetch_byte_attention_rejects_out_of_range_pc_offset():
+    dim_positions = {"PC": 0, "ADDR_KEY": 32, "VAL": 64, "OUT": 72}
+    with pytest.raises(ValueError, match="pc_offset"):
+        fetch_byte_attention(
+            head_idx=0,
+            pc_dim_base="PC", addr_key_dim_base="ADDR_KEY",
+            value_dim_base="VAL", output_dim_base="OUT",
+            pc_offset=16, nibble_bits=4,
+            dim_positions=dim_positions,
+        )
+
+
+# ===========================================================================
+# opcode_expert_rules
+# ===========================================================================
+
+
+def test_opcode_expert_rules_threads_gate_into_ungated_rule():
+    """An ungated rule (constant_write) gets ``gate=OP_X`` and gate_bias
+    flips 1→0 to match gated_write convention."""
+
+    rule = one_hot_indicator_rule(band="BAND", value=3, write_dim="OUT+0")
+    assert rule.gate is None
+    assert rule.gate_terms == ()
+    assert rule.gate_bias == 1.0
+    wrapped = opcode_expert_rules("OP_ADD", (rule,))
+    assert len(wrapped) == 1
+    w = wrapped[0]
+    assert w.gate is not None
+    assert w.gate.name == "OP_ADD"
+    assert w.gate_weight == 1.0
+    assert w.gate_bias == 0.0
+    # Conditions and writes are unchanged.
+    assert w.conditions == rule.conditions
+    assert w.writes == rule.writes
+
+
+def test_opcode_expert_rules_folds_into_existing_gate_terms():
+    """A rule with existing gate_terms gets the opcode appended as
+    another additive term — preserves the existing gate structure."""
+
+    rule = multi_way_and_rule(
+        conditions=(("A", 1.0), ("B", 1.0)),
+        writes=(("OUT+0", 0.02),),
+        gate_terms=(("MARK_AX", 1.0),),
+    )
+    assert rule.gate is None
+    assert len(rule.gate_terms) == 1
+    wrapped = opcode_expert_rules("OP_SUB", (rule,))
+    assert len(wrapped) == 1
+    w = wrapped[0]
+    assert w.gate is None
+    assert len(w.gate_terms) == 2
+    assert w.gate_terms[0].dim.name == "MARK_AX"
+    assert w.gate_terms[1].dim.name == "OP_SUB"
+    assert w.gate_terms[1].weight == 1.0
+    # gate_bias is preserved.
+    assert w.gate_bias == rule.gate_bias
+
+
+def test_opcode_expert_rules_preserves_existing_gate_dim():
+    """A rule that already has ``gate=`` set should get the opcode
+    folded into ``gate_terms`` (so both the original gate and the
+    opcode flag must be present for the rule to fire)."""
+
+    rule = step_function_rule(
+        input_dim="X", threshold=0.5, write_dim="OUT+0",
+        gate="MARK_AX",
+    )
+    assert rule.gate is not None
+    assert rule.gate.name == "MARK_AX"
+    wrapped = opcode_expert_rules("OP_MUL", (rule,))
+    w = wrapped[0]
+    # Original gate dim is preserved.
+    assert w.gate is not None
+    assert w.gate.name == "MARK_AX"
+    # Opcode appended as an additive gate term.
+    assert len(w.gate_terms) == 1
+    assert w.gate_terms[0].dim.name == "OP_MUL"
+
+
+def test_opcode_expert_rules_threads_through_batch():
+    """All rules in a batch should be wrapped uniformly."""
+
+    band_rules = band_range_check_rules(
+        band="BAND", lo=0, hi=3, write_dim="OUT+0", name="rng",
+    )
+    assert len(band_rules) == 4
+    wrapped = opcode_expert_rules("OP_AND", band_rules)
+    assert len(wrapped) == 4
+    for w in wrapped:
+        assert w.gate is not None
+        assert w.gate.name == "OP_AND"
+        assert w.gate_bias == 0.0
+
+
+def test_opcode_expert_rules_with_custom_gate_weight():
+    rule = one_hot_indicator_rule(band="B", value=3, write_dim="OUT+0")
+    wrapped = opcode_expert_rules("OP_X", (rule,), gate_weight=2.5)
+    assert wrapped[0].gate_weight == 2.5
+
+
+def test_opcode_expert_rules_returns_ffn_rule_tuple():
+    rule = one_hot_indicator_rule(band="B", value=3, write_dim="OUT+0")
+    wrapped = opcode_expert_rules("OP_X", (rule,))
+    assert isinstance(wrapped, tuple)
+    for w in wrapped:
+        assert isinstance(w, FFNRule)
