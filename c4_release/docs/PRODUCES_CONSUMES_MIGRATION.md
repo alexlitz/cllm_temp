@@ -18,7 +18,8 @@ end-state validation gate.
 | Surface | Status | Used by |
 |---------|--------|---------|
 | `reads` / `writes` | MANDATORY | scheduler dep graph (`LayerCompiler._topological_sort`) |
-| `produces` / `consumes_fresh` | OPTIONAL (3+8+4 / 166 ops as of 2026-06-03) | `decl_verifier` staleness analyzer (`LayerCompiler.build_staleness_registry`) |
+| `produces` / `consumes_fresh` | OPTIONAL (3+8+4 / 166 ops as of 2026-06-03; 7+11+4+24 audited / 166 post-wave-7) | `decl_verifier` staleness analyzer (`LayerCompiler.build_staleness_registry`) |
+| `audited_empty_produces` | OPT-IN (24 / 166 post-wave-7) | audit script — marks deliberately-empty produces/consumes_fresh as "audited, no surface" |
 
 The semantics, per `ARCH_LEAKAGE_FIX_PLAN.md` and the docstrings on
 `Operation`:
@@ -49,6 +50,28 @@ ops_classified:           166
 none_with_ir (auto-derivable):       23
 none_without_ir (manual / imperative): 128
 ```
+
+### Post-wave-7 audit (2026-06-03)
+
+After waves 1+3+6+7 (Operation.audited_empty_produces field + the
+matching audit recategorization):
+
+```
+total_factories_examined: 170
+ops_classified:           166
+  both:                     7   (wave 1: l14)
+  produces_only:           11   (wave 3: 3 flag_gated)
+  consumes_only:            4
+  audited_empty:           24   (wave 6: 13 model_ops + 9 flag_gated;
+                                 wave 7: 2 user_input_ops)
+  none:                   120   (was 151)
+none_with_ir (auto-derivable):       16
+none_without_ir (manual / imperative): 104
+```
+
+Wave 7's direct contribution (the 2 ``user_input_ops`` factories):
+``user_input_ops`` module row moves from ``{none: 2}`` to
+``{audited_empty: 2, none: 0}``.
 
 Per-module `none` count is dominated by `alu_ops` (42 — all `alu_mode="lookup"`
 table bakes, imperative-only) and `model_ops` (13 — embed/tie/unembed).

@@ -142,6 +142,12 @@ def make_io_putchar_routing_op() -> Operation:
         name="io_putchar_routing",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Model-level FFN
+        # routing bake: programs L5 FFN units to dispatch ``putchar``
+        # output. Writes target the L5 FFN weights/biases (model setup),
+        # not per-step residual dims, so the in-step semantic
+        # produces/consumes_fresh surface is empty by construction.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
@@ -911,6 +917,11 @@ def make_function_call_weights_op() -> Operation:
         name="function_call_weights",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Model-level FFN
+        # routing bake into L6 FFN units 1700..2158 (function-call dispatch
+        # table). Writes target FFN weights, not per-step residual dims,
+        # so produces/consumes_fresh stays empty by construction.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         compiler_ir_factory=_function_call_weights_ir,
@@ -1017,6 +1028,11 @@ def make_opcode_relay_head_op() -> Operation:
         name="opcode_relay_head",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Model-level bake
+        # that rewires the L6 opcode relay attention head (K/V matrices
+        # + alibi slope). Writes target attention parameters, not
+        # per-step residual dims, so produces/consumes_fresh stays empty.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         compiler_ir_factory=_opcode_relay_head_ir,
@@ -1194,6 +1210,10 @@ def make_residual_alibi_slopes_op() -> Operation:
         name="residual_alibi_slopes",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Model-level bake
+        # that sets attention alibi slope tables. Writes target attention
+        # bias parameters, not per-step residual dims.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=_bake,
         phase=999,
@@ -1288,6 +1308,10 @@ def make_branch_override_patch_op() -> Operation:  # noqa: E302
         name="branch_override_patch",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Defensive sweep
+        # / topology patch that zeros stale branch-override weights. No
+        # in-step semantic residual reads/writes.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         phase=1100,
@@ -1376,6 +1400,10 @@ def make_l6_dead_unit_zero_op() -> Operation:
         name="l6_dead_unit_zero",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Defensive sweep:
+        # zero L6 FFN units that no op currently writes (post-rightsize
+        # safety). No in-step semantic residual reads/writes.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         phase=1160,
@@ -1464,6 +1492,10 @@ def make_l7_dead_unit_zero_op() -> Operation:
         name="l7_dead_unit_zero",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Defensive sweep:
+        # zero L7 FFN units that no op currently writes. No in-step
+        # semantic residual reads/writes.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         phase=1170,
@@ -1487,6 +1519,10 @@ def make_right_size_ffns_op() -> Operation:
         name="right_size_ffns",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). FFN width trim
+        # pass: drops unused hidden units. Pure topology pass with no
+        # residual-dim semantics.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         phase=1200,
@@ -1526,6 +1562,10 @@ def make_expand_wrapper_blocks_op() -> Operation:
         name="expand_wrapper_blocks",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Topology pass that
+        # inserts wrapper blocks (multi-block expansion). No residual-dim
+        # semantics.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         phase=1300,
@@ -1763,6 +1803,11 @@ def make_head_bake_op() -> Operation:
         name="head_bake",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Unembed-head bake:
+        # populates the output projection (lm_head). The rules are
+        # TokenEmbeddingRules over per-token logit lanes, not per-step
+        # residual reads/writes, so produces/consumes_fresh stays empty.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=_bake,
         # Phase 11.A IR exposure: informational factory (~270 TokenEmbeddingRules).
@@ -2007,6 +2052,13 @@ def make_embedding_bake_op() -> Operation:
         name="embedding_bake",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Embedding-table
+        # bake: populates the token embedding matrix. Rules write
+        # cross-step EMBED_LO / EMBED_HI (allowlisted as cross-step
+        # durable in tools/derive_produces_consumes._CROSS_STEP_DURABLE),
+        # not in-step residual dims, so the in-step produces surface is
+        # empty by convention.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=_bake,
         compiler_ir=_ir,
@@ -2097,6 +2149,10 @@ def make_initial_pc_bake_op() -> Operation:
         name="initial_pc_bake",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Sets the initial
+        # PC value into the embedding table for token position 0. Pure
+        # embed-time write, not a per-step residual production.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=_bake,
         compiler_ir=_ir,
@@ -2134,6 +2190,9 @@ def make_contract_validation_op() -> Operation:
         name="contract_validation",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Pure invariant
+        # check / assertion pass; no writes at all.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=_bake,
         phase=1199,

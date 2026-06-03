@@ -70,6 +70,7 @@ def main() -> int:
         "both": 0,
         "produces_only": 0,
         "consumes_only": 0,
+        "audited_empty": 0,
         "none": 0,
     }
     none_with_ir: List[str] = []
@@ -93,6 +94,7 @@ def main() -> int:
                 continue
             has_p = bool(o.produces)
             has_c = bool(o.consumes_fresh)
+            audited = bool(getattr(o, "audited_empty_produces", False))
             ir = getattr(o, "compiler_ir", None)
             ir_has_rules = bool(
                 ir and any(layer.ffn.rules for layer in ir.layers)
@@ -103,6 +105,8 @@ def main() -> int:
                 key = "produces_only"
             elif has_c:
                 key = "consumes_only"
+            elif audited:
+                key = "audited_empty"
             else:
                 key = "none"
                 if ir_has_rules:
@@ -112,7 +116,7 @@ def main() -> int:
             buckets[key] += 1
             by_module.setdefault(mod_name, {
                 "both": 0, "produces_only": 0,
-                "consumes_only": 0, "none": 0,
+                "consumes_only": 0, "audited_empty": 0, "none": 0,
             })[key] += 1
 
     print(f"total_factories_examined: {total}")

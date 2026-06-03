@@ -70,6 +70,13 @@ def make_layer5_user_input_gather_op(enable: bool = False) -> Operation:
         # MARK_AX, IS_BYTE, EMBED_LO/HI -> STDIN_BYTE_LO/HI.
         reads=set(),
         writes=set(),
+        # Wave 7 (docs/PRODUCES_CONSUMES_MIGRATION.md). At the default
+        # ``enable=False`` config this op is a strict no-op: ``reads``
+        # and ``writes`` are empty, so there is no in-step semantic
+        # residual surface to declare. When V9 phase 2 flips ``enable=True``
+        # the produces/consumes_fresh must populate with
+        # ``STDIN_BYTE_LO/HI`` at a new ``STDIN_marker`` slot.
+        audited_empty_produces=True,
         kind="block",
         # Phase 8.G.6: drop ``layer_idx=5`` literal; bind to the L5
         # attn anchor (``_layer5_fetch_dep_anchor``, kind="attn") so the
@@ -134,6 +141,15 @@ def make_layer6_getchar_routing_op(enable: bool = False) -> Operation:
         name="layer6_getchar_routing",
         reads=set(),
         writes=set(),
+        # Wave 7 (docs/PRODUCES_CONSUMES_MIGRATION.md). At the default
+        # ``enable=False`` config this op is a strict no-op: ``reads``
+        # and ``writes`` are empty, so there is no in-step semantic
+        # residual surface to declare. When V9 phase 2 flips
+        # ``enable=True`` the produces/consumes_fresh must populate with
+        # ``AX_CARRY_LO/HI: "AX_byte0"`` (writes mirror io_putchar_routing's
+        # AX_byte0 slot) and ``STDIN_BYTE_LO/HI: "AX_byte0"`` on
+        # consumes_fresh (the same-step bytes from layer5_user_input_gather).
+        audited_empty_produces=True,
         kind="model",
         bake_fn=bake,
         declarative_bake_fn=bake if not enable else None,

@@ -309,6 +309,17 @@ class Operation:
     # and the canonical AX_CARRY example.
     produces: Dict[str, str] = field(default_factory=dict)
     consumes_fresh: Dict[str, str] = field(default_factory=dict)
+    # Audit marker (waves 4-7 of docs/PRODUCES_CONSUMES_MIGRATION.md). When
+    # True, the empty ``produces`` / ``consumes_fresh`` dicts are a
+    # deliberate, audited declaration that the op has no in-step semantic
+    # residual-dim read/write surface (e.g. model_ops bake weights into
+    # the FFN/attn matrices, not into residual dims; flag-gated ops are
+    # no-ops at default flag config; ALU lookup tables are constants).
+    # The audit script (``tools/audit_produces_consumes.py``) buckets such
+    # ops as ``audited_empty`` instead of ``none``. Wave 8 will require
+    # every op to declare either non-empty ``produces`` /
+    # ``consumes_fresh`` OR ``audited_empty_produces=True``.
+    audited_empty_produces: bool = False
     # Tier A verifier annotations. Empty means "not annotated"; these fields
     # are metadata only unless a verifier chooses to inspect them.
     reset_after_step: Set[str] = field(default_factory=set)

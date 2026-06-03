@@ -67,6 +67,13 @@ def make_tool_call_opcode_decode_op(enable_tool_calling: bool = False) -> Operat
         name="tool_call_opcode_decode",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
+        # at default ``enable_tool_calling=False``. When the flag is True
+        # the 6 ``FFNRule.gated_write`` units write ``IO_IS_TOOL_CALL`` at
+        # L5 FFN units 400..405; populating ``produces`` conditionally is
+        # deferred until the IR exposure (Phase 11.A follow-up) lands so
+        # the audit and the IR stay in sync.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
@@ -178,6 +185,11 @@ def make_convo_io_opcode_decode_op(enable_conversational_io: bool = False) -> Op
         name="convo_io_opcode_decode",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
+        # at default ``enable_conversational_io=False``. Conditional
+        # produces population deferred until IR exposure lands so audit
+        # and IR stay in sync.
+        audited_empty_produces=True,
         kind="block",
         # Phase 8.A.4: dropped ``layer_idx=5`` in favour of
         # ``target_op_name``. Binds to whichever layer the compiler
@@ -337,6 +349,12 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
         name="tool_call_relay_head",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
+        # at default ``enable_tool_calling=False``. The flag-on branch
+        # rewires L6 attn head 5 (relay head) — semantically reads/writes
+        # are L6 attention key/value matrices, not residual dims, so the
+        # produces/consumes_fresh surface stays empty even when active.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         compiler_ir_factory=(
@@ -431,6 +449,11 @@ def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Oper
         phase=999.5,
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
+        # at default ``enable_conversational_io=False``. The flag-on branch
+        # programs attention relay heads (K/V matrices), not residual dims,
+        # so produces/consumes_fresh stays empty even when active.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         compiler_ir_factory=(
@@ -514,6 +537,10 @@ def make_tool_call_detection_op(enable_tool_calling: bool = False) -> Operation:
         name="tool_call_detection",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
+        # at default ``enable_tool_calling=False``. Conditional produces
+        # population deferred until IR exposure (Phase 11.A) lands.
+        audited_empty_produces=True,
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
@@ -622,6 +649,23 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         # placed ``layer6_attn`` (an L6 attn op anchor).
         target_op_name="layer6_attn",
         migrated=True,
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py`` from the IR rule writes.
+        # Two ``gated_write`` units fire on CMP+5/CMP+6 (per-opcode IO
+        # cascade flags staged by L6 relay heads in the same step) AND
+        # ``NEXT_SE``, then emit ``NEXT_THINKING_END``, suppress
+        # ``NEXT_SE``, set ``IO_STATE``. Slot ``layer6_attn`` matches the
+        # ``target_op_name`` anchor (convention shared across all L6
+        # block ops). ``NEXT_SE`` is read by the gate but the verifier
+        # treats it as a scope/gate flag, not a fresh-consume read; left
+        # out of ``consumes_fresh`` per derive's read-intersection rule
+        # (the op declares ``reads=set()`` so no candidates qualify).
+        produces={
+            "IO_STATE": "layer6_attn",
+            "NEXT_SE": "layer6_attn",
+            "NEXT_THINKING_END": "layer6_attn",
+        },
+        consumes_fresh={},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_convo_io_state_machine_ir(),
@@ -865,11 +909,39 @@ def make_null_terminator_detection_op(
         def bake(block, dim_positions, S):
             return
 
+    # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). When convo-IO + lookup
+    # are both active, the single ``gated_write`` unit at L10 FFN unit 1864
+    # writes ``IO_OUTPUT_COMPLETE`` / ``IO_IN_OUTPUT_MODE`` /
+    # ``NEXT_THINKING_START`` at positions where ``IO_IN_OUTPUT_MODE``
+    # gates AND ``OUTPUT_BYTE_LO+0`` AND ``OUTPUT_BYTE_HI+0`` (null
+    # terminator). Slot ``layer10_carry_relay`` matches the
+    # ``target_op_name`` anchor. ``IO_IN_OUTPUT_MODE`` is read by the gate
+    # AND declared in ``reads``, so it qualifies as ``consumes_fresh``;
+    # ``OUTPUT_BYTE_{LO,HI}`` are cross-step durables in this mode (set by
+    # the prior step's PRTF emission). When the flag is off the op is a
+    # bake no-op and we mark ``audited_empty_produces=True`` so wave 8 can
+    # treat the no-op config as deliberately empty.
+    _flag_active = (enable_conversational_io and alu_mode == "lookup")
     return Operation(
         name="null_terminator_detection",
         reads={"OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI", "IO_IN_OUTPUT_MODE"},
         writes={"IO_OUTPUT_COMPLETE", "IO_IN_OUTPUT_MODE",
                 "NEXT_THINKING_START"},
+        produces=(
+            {
+                "IO_OUTPUT_COMPLETE": "layer10_carry_relay",
+                "IO_IN_OUTPUT_MODE": "layer10_carry_relay",
+                "NEXT_THINKING_START": "layer10_carry_relay",
+            }
+            if _flag_active
+            else {}
+        ),
+        consumes_fresh=(
+            {"IO_IN_OUTPUT_MODE": "layer10_carry_relay"}
+            if _flag_active
+            else {}
+        ),
+        audited_empty_produces=(not _flag_active),
         kind="block",
         bake_fn=bake,
         # Phase 11.A: the bake is now fully declarative in both states
@@ -950,6 +1022,22 @@ def make_convo_io_step_resume_op(
         # ``target_op_name``. Binds to whichever layer the compiler
         # placed ``layer3_carry_forward_attn`` (the L3 attn op).
         target_op_name="layer3_carry_forward_attn",
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py`` from the IR rule writes.
+        # One ``constant_write`` unit fires on ``LAST_WAS_THINKING_START``
+        # (a single-position scope flag) and emits ``NEXT_PC=+1`` (drives
+        # ``Token.REG_PC`` for the next step) plus clears ``IO_STATE`` /
+        # ``IO_IN_OUTPUT_MODE``. Slot ``layer3_carry_forward_attn``
+        # matches the ``target_op_name`` anchor. ``LAST_WAS_THINKING_START``
+        # is the scope/condition read and is not in ``reads``, so it
+        # doesn't surface in ``consumes_fresh`` per derive's
+        # read-intersection rule.
+        produces={
+            "IO_IN_OUTPUT_MODE": "layer3_carry_forward_attn",
+            "IO_STATE": "layer3_carry_forward_attn",
+            "NEXT_PC": "layer3_carry_forward_attn",
+        },
+        consumes_fresh={},
         declarative_bake_fn=bake,
         compiler_ir=_convo_io_step_resume_ir(),
         declarative_authority="spec_generated",
@@ -1075,6 +1163,21 @@ def make_convo_io_pc_sp_latch_op(
         # ``target_op_name``. Binds to whichever layer the compiler
         # placed ``layer6_attn`` (an L6 attn op anchor).
         target_op_name="layer6_attn",
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py`` from the IR rule writes.
+        # 64 ``gated_write`` units fire on ``LAST_WAS_THINKING_START`` AND
+        # ``POST_PRTF_{PC,SP}_{LO,HI}+k`` (k=0..15), copying staged PC/SP
+        # nibbles to ``OUTPUT_LO+k`` / ``OUTPUT_HI_THIS_STEP+k``. Slot
+        # ``layer6_attn`` matches the ``target_op_name`` anchor.
+        # ``LAST_WAS_THINKING_START`` and the ``POST_PRTF_*`` gates are
+        # condition reads but the op declares ``reads=set()``, so
+        # ``consumes_fresh`` is empty per derive's read-intersection rule
+        # (the cached POST_PRTF_* dims are cross-step durables anyway).
+        produces={
+            "OUTPUT_HI_THIS_STEP": "layer6_attn",
+            "OUTPUT_LO": "layer6_attn",
+        },
+        consumes_fresh={},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=make_convo_io_pc_sp_latch_ir(),
@@ -1210,6 +1313,14 @@ def make_convo_io_prtf_capture_op(
         name="convo_io_prtf_capture",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
+        # at the default double-flag ``False`` config. When the flags are
+        # on, the L7 FFN units 800..863 stage POST_PRTF_{PC,SP}_{LO,HI}
+        # nibbles for ``convo_io_pc_sp_latch`` to replay one step later;
+        # since POST_PRTF_* are cached cross-step durables (carry into the
+        # next step), they sit OUTSIDE the per-step ``produces`` /
+        # ``consumes_fresh`` schema even when the flag is active.
+        audited_empty_produces=True,
         kind="block",
         # Phase 8.A.4: dropped ``layer_idx=7`` in favour of
         # ``target_op_name``. Binds to whichever layer the compiler
@@ -1351,6 +1462,12 @@ def make_convo_io_prtf_transport_op(
         name="convo_io_prtf_transport",
         reads=set(),
         writes=set(),
+        # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
+        # at the default double-flag ``False`` config. Conditional
+        # produces population is left to the IR-on follow-up because the
+        # transport bake moves cached POST_PRTF_* nibbles between cross-
+        # step durable slots, not per-step residual dims.
+        audited_empty_produces=True,
         kind="block",
         # Phase 8.A.4: dropped ``layer_idx=4`` in favour of
         # ``target_op_name``. Binds to whichever layer the compiler
@@ -1556,10 +1673,34 @@ def make_conversational_io_output_routing_op(
         def bake(block, dim_positions, S):
             return
 
+    # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). When convo-IO is active,
+    # the L15 FFN units 1200..1231 (16 LO + 16 HI = 32 nibble-copy units)
+    # route each ``OUTPUT_BYTE`` nibble to the matching ``OUTPUT_LO`` /
+    # ``OUTPUT_HI_THIS_STEP`` nibble while ``IO_IN_OUTPUT_MODE`` gates.
+    # Slot ``layer15_memory_lookup`` matches the ``target_op_name`` anchor.
+    # ``IO_IN_OUTPUT_MODE`` is the gate read AND declared in ``reads``, so
+    # it qualifies as ``consumes_fresh``; the ``OUTPUT_BYTE_{LO,HI}`` reads
+    # are cross-step durables (set by the prior step). When the flag is
+    # off the bake body is a no-op and we mark ``audited_empty_produces``
+    # so wave 8 sees the explicit empty declaration.
     return Operation(
         name="conversational_io_output_routing",
         reads={"IO_IN_OUTPUT_MODE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        produces=(
+            {
+                "OUTPUT_LO": "layer15_memory_lookup",
+                "OUTPUT_HI_THIS_STEP": "layer15_memory_lookup",
+            }
+            if enable_conversational_io
+            else {}
+        ),
+        consumes_fresh=(
+            {"IO_IN_OUTPUT_MODE": "layer15_memory_lookup"}
+            if enable_conversational_io
+            else {}
+        ),
+        audited_empty_produces=(not enable_conversational_io),
         kind="block",
         bake_fn=bake,
         declarative_bake_fn=bake if not enable_conversational_io else None,
