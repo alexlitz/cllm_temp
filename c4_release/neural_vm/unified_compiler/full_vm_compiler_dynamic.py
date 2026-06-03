@@ -1453,7 +1453,21 @@ def _rebuild_to_target_shape(
         widths = [
             int(getattr(b.ffn, "hidden_dim", 0)) for b in compiled_model.blocks
         ]
-        ffn_hidden = max(widths) if widths else 4096
+        # Step 3 (literal-fallback lint, audit 2026-06-03): historically
+        # the empty-widths branch substituted a literal ``4096`` —
+        # which silently seeded the rebuild with a stale shape any time
+        # ``compiled_model.blocks`` was empty (synthetic / partial
+        # rebuild fixtures). Demand an explicit override instead of
+        # papering over the missing topology.
+        if not widths:
+            raise ValueError(
+                "rebuild target: cannot derive ffn_hidden because "
+                "compiled_model.blocks is empty. Pass "
+                "target_shape_overrides.intermediate_size explicitly. "
+                "Bare-literal fallback (4096) removed by Step 3 (see "
+                "docs/LITERAL_FALLBACK_AUDIT.md)."
+            )
+        ffn_hidden = max(widths)
     vocab_size = (
         int(overrides.vocab_size)
         if overrides.vocab_size is not None

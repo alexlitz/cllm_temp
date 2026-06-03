@@ -3480,13 +3480,34 @@ class UnifiedVMCompiler:
             ffn.W_down.data[BD.OUTPUT_HI + 0, unit] = 5.0 / S
             unit += 1
 
-    def _resize_l15_attention(self, attn, d_model):
-        """Resize L15 attention to 12 heads (768 dims) for LEV support."""
+    def _resize_l15_attention(self, attn, d_model, *, source_num_heads=None):
+        """Resize L15 attention to 12 heads for LEV support.
+
+        Step 3 (literal-fallback lint, audit 2026-06-03): the historical
+        ``head_dim = d_model // 8`` divided by the literal ``8`` regardless
+        of the actual ``attn.num_heads`` it was inheriting from. A model
+        rebuilt with ``n_heads != 8`` (allowed by
+        ``full_vm_compiler_dynamic``) would write a mismatched
+        ``head_dim`` onto ``attn.head_dim`` (line below) and diverge from
+        the rest of the stack. We now derive the source head count from
+        the attn module before mutating it; callers may override via
+        ``source_num_heads`` when ``attn`` has already been partially
+        resized.
+        """
         import torch.nn as nn
 
         num_heads_l15 = 12
-        head_dim = d_model // 8  # 64 (based on default 8 heads)
-        new_q_rows = num_heads_l15 * head_dim  # 12 * 64 = 768
+        if source_num_heads is None:
+            source_num_heads = getattr(attn, "num_heads", None)
+        if not source_num_heads:
+            raise ValueError(
+                "_resize_l15_attention: cannot derive source head count; "
+                "attn.num_heads is missing or zero. Bare-literal fallback "
+                "(d_model // 8) removed by Step 3 (see "
+                "docs/LITERAL_FALLBACK_AUDIT.md)."
+            )
+        head_dim = int(d_model) // int(source_num_heads)
+        new_q_rows = num_heads_l15 * head_dim
 
         # Update num_heads and head_dim attributes
         attn.num_heads = num_heads_l15

@@ -30,7 +30,7 @@ from collections import deque
 from typing import List, Optional, Callable, Any, Dict
 from dataclasses import dataclass, field
 
-from .vm_step import AutoregressiveVM, Token
+from .vm_step import AutoregressiveVM, Token, DEFAULT_N_HEADS, DEFAULT_FFN_HIDDEN
 from .embedding import Opcode
 from .constants import INSTR_WIDTH, PC_OFFSET
 from .speculative import DraftVM
@@ -194,8 +194,8 @@ class AutoregressiveVMRunner:
         self,
         d_model=None,
         n_layers=None,
-        n_heads=8,
-        ffn_hidden=4096,
+        n_heads=DEFAULT_N_HEADS,
+        ffn_hidden=DEFAULT_FFN_HIDDEN,
         max_seq_len=4096,
         pure_attention_memory=False,
         conversational_io=False,

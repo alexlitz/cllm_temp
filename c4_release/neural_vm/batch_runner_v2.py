@@ -17,7 +17,7 @@ correctly, not just getting lucky with speculative execution.
 
 import torch
 from typing import List, Tuple, Optional
-from .vm_step import Token
+from .vm_step import Token, DEFAULT_D_MODEL, DEFAULT_N_HEADS, DEFAULT_FFN_HIDDEN
 from .embedding import Opcode
 from .speculative import DraftVM
 
@@ -38,10 +38,10 @@ class UltraBatchRunner:
     def __init__(
         self,
         batch_size: int = 256,
-        d_model=512,
+        d_model=DEFAULT_D_MODEL,
         n_layers=16,
-        n_heads=8,
-        ffn_hidden=4096,
+        n_heads=DEFAULT_N_HEADS,
+        ffn_hidden=DEFAULT_FFN_HIDDEN,
         max_seq_len=4096,
         device='cuda' if torch.cuda.is_available() else 'cpu',
         strict: bool = False,

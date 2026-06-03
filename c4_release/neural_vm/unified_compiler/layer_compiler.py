@@ -645,11 +645,56 @@ def _make_operation_ir(op: Operation, target, dim_positions):
     attn = target
     if op.kind == "block":
         attn = getattr(target, "attn", None)
-    if attn is None or not hasattr(attn, "W_q"):
-        head_dim = 64
-    else:
-        head_dim = attn.W_q.shape[0] // attn.num_heads
+    head_dim = _derive_head_dim(op, target, attn, dim_positions)
     return factory(dim_positions, head_dim)
+
+
+def _derive_head_dim(op: Operation, target, attn, dim_positions) -> int:
+    """Derive ``head_dim`` for declarations-only IR factories.
+
+    Step 3 (literal-fallback lint, audit 2026-06-03): the previous
+    implementation silently substituted ``head_dim = 64`` whenever the
+    target's attention module was unavailable. That was the exact
+    failure shape of the L10 ``d_model=512`` fallback (cf. l10_ops.py
+    derivation chain) — a wider model or a 12-head attention would
+    have its IR factory invoked against a mismatched slot stride.
+
+    Derivation order:
+      1. ``attn.W_q.shape[0] // attn.num_heads`` — the canonical
+         source whenever attention weights exist.
+      2. ``attn.head_dim`` — set explicitly by structural resize
+         passes (e.g. ``_resize_l15_attention``).
+      3. ``getattr(target, 'attn', None).head_dim`` / ``W_q`` chain
+         when ``target`` is a block but ``attn`` was passed directly.
+      4. Explicit error — no silent literal substitution. Callers
+         that genuinely need an attention-less factory should pass
+         a target that exposes ``head_dim`` or migrate the IR to
+         not depend on it.
+    """
+    if attn is not None:
+        W_q = getattr(attn, "W_q", None)
+        num_heads = getattr(attn, "num_heads", None)
+        if W_q is not None and num_heads:
+            try:
+                return int(W_q.shape[0]) // int(num_heads)
+            except (AttributeError, IndexError, TypeError, ZeroDivisionError):
+                pass
+        explicit = getattr(attn, "head_dim", None)
+        if explicit is not None:
+            try:
+                return int(explicit)
+            except (TypeError, ValueError):
+                pass
+    raise DeclarationsOnlyBakeError(
+        [op.name],
+        [
+            f"{operation_display_label(op)} — head_dim is undeterminable: "
+            "target attention has no W_q/num_heads and no explicit "
+            "head_dim attribute. Bare-literal fallback (head_dim=64) "
+            "was removed by Step 3 (see "
+            "docs/LITERAL_FALLBACK_AUDIT.md)."
+        ],
+    )
 
 
 def _dispatch_operation_ir(op: Operation, target, dim_positions, S, ir):

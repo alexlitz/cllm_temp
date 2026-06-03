@@ -10,7 +10,7 @@ the neural VM and checks if the result is correct.
 import torch
 from typing import Dict
 
-from .vm_step import AutoregressiveVM
+from .vm_step import AutoregressiveVM, DEFAULT_N_HEADS, DEFAULT_FFN_HIDDEN
 from .weight_loader import CompiledWeightLoader
 from .nibble_embedding import NibbleVMEmbedding
 from .embedding import E, Opcode
@@ -30,8 +30,8 @@ class SingleOperationExecutor:
         self.vm = AutoregressiveVM(
             d_model=1280,
             n_layers=16,
-            n_heads=8,
-            ffn_hidden=4096,
+            n_heads=DEFAULT_N_HEADS,
+            ffn_hidden=DEFAULT_FFN_HIDDEN,
         )
         self.vm.eval()
         

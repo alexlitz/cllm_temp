@@ -44,7 +44,7 @@ from collections import deque
 from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
 
-from .vm_step import Token
+from .vm_step import Token, DEFAULT_N_HEADS, DEFAULT_FFN_HIDDEN
 from .embedding import Opcode
 from .constants import INSTR_WIDTH, PC_OFFSET
 from .run_vm import (
@@ -244,8 +244,8 @@ class BatchedPureNeuralRunner:
         *,
         d_model=None,
         n_layers=None,
-        n_heads=8,
-        ffn_hidden=4096,
+        n_heads=DEFAULT_N_HEADS,
+        ffn_hidden=DEFAULT_FFN_HIDDEN,
         max_seq_len=4096,
         use_kv_cache: Optional[bool] = None,
         kv_cache_max_tokens: Optional[int] = None,

@@ -44,6 +44,17 @@ from .efficient_alu_addsub_split import AddSub5StageBlock
 # =============================================================================
 
 
+# Step 3 (literal-fallback lint, audit 2026-06-03): single source of truth
+# for the d_model / n_heads / ffn_hidden triplet historically replicated
+# across ``AutoregressiveVM.__init__`` and ~8 runner files. Runners must
+# import these constants instead of re-stating the literals so that any
+# future arch migration that updates one source updates them all. The
+# lint at ``c4_release/tools/lint_bare_literals.py`` enforces this.
+DEFAULT_D_MODEL = 512
+DEFAULT_N_HEADS = 8  # HD=64; HD=32 broke attention score budgets (LEV).
+DEFAULT_FFN_HIDDEN = 4096
+
+
 def rotate_half(x):
     """Rotate adjacent feature pairs for RoPE."""
     if x.shape[-1] % 2 != 0:
@@ -1612,10 +1623,10 @@ class AutoregressiveVM(nn.Module):
     def __init__(
         self,
         vocab_size=None,
-        d_model=512,
+        d_model=DEFAULT_D_MODEL,
         n_layers=17,  # Updated from 16 for LEV Phase 3 (L16 routing layer)
-        n_heads=8,  # REVERTED from 16: HD=32 broke attention score budgets
-        ffn_hidden=4096,
+        n_heads=DEFAULT_N_HEADS,  # REVERTED from 16: HD=32 broke attention score budgets
+        ffn_hidden=DEFAULT_FFN_HIDDEN,
         max_seq_len=1024,  # PERF: reduced from 4096; Phase 1 contexts are <100 tokens (1024 leaves headroom)
         dim_positions=None,
         use_flash_attention=True,

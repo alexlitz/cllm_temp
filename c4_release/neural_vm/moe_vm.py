@@ -13,7 +13,7 @@ from .embedding import E
 from .nibble_embedding import NibbleVMEmbedding
 
 # Import AutoregressiveAttention and Token from vm_step
-from .vm_step import AutoregressiveAttention, Token
+from .vm_step import AutoregressiveAttention, Token, DEFAULT_N_HEADS
 
 
 class MoEAutoregressiveVM(nn.Module):
@@ -30,7 +30,7 @@ class MoEAutoregressiveVM(nn.Module):
         vocab_size=None,
         d_model=1352,
         n_layers=7,
-        n_heads=8,
+        n_heads=DEFAULT_N_HEADS,
         experts_per_layer: List[List[ExpertConfig]] = None,
         max_seq_len=4096,
     ):
