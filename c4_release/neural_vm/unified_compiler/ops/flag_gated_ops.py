@@ -726,6 +726,82 @@ def make_convo_io_state_machine_ir(S: float = 100.0) -> CompilerIR:
 # kind="block". ffn15 is a ``PureFFN`` in both alu_modes, so this op
 # always bakes when convo-io is enabled.
 
+_NULL_TERMINATOR_DETECTION_START_UNIT = 1864
+
+
+def _null_terminator_detection_rules(S: float) -> tuple[FFNRule, ...]:
+    """Declarative FFN rule for L10 null-terminator detection.
+
+    One gated-write unit (lowered at start_unit=1864) that mirrors the
+    legacy ``_set_null_terminator_detection`` body byte-for-byte:
+
+    Conditions (W_up):
+      - ``OUTPUT_BYTE_LO+0`` weight 1.0  (low nibble all-zero bit)
+      - ``OUTPUT_BYTE_HI+0`` weight 1.0  (high nibble all-zero bit)
+      - ``IO_IN_OUTPUT_MODE`` weight 1.0 (currently emitting)
+      - threshold 2.5 -> b_up = -S*2.5
+
+    Gate (W_gate / b_gate):
+      - ``W_gate[IO_IN_OUTPUT_MODE] = 1.0`` via ``gate=IO_IN_OUTPUT_MODE``
+        with ``gate_weight=1.0``
+      - ``b_gate = -5.0`` via ``gate_bias=-5.0``
+
+    Writes (W_down), with write_scale 2.0/S:
+      - ``IO_OUTPUT_COMPLETE``    += +2.0/S
+      - ``IO_IN_OUTPUT_MODE``     += -2.0/S  (clear output mode)
+      - ``NEXT_THINKING_START``   += +2.0/S
+    """
+    write_scale = 2.0 / S
+    return (
+        FFNRule.gated_write(
+            name="null_terminator_detection",
+            conditions=(
+                ("OUTPUT_BYTE_LO+0", 1.0),
+                ("OUTPUT_BYTE_HI+0", 1.0),
+                ("IO_IN_OUTPUT_MODE", 1.0),
+            ),
+            threshold=2.5,
+            gate="IO_IN_OUTPUT_MODE",
+            gate_weight=1.0,
+            gate_bias=-5.0,
+            writes=(
+                ("IO_OUTPUT_COMPLETE", write_scale),
+                ("IO_IN_OUTPUT_MODE", -write_scale),
+                ("NEXT_THINKING_START", write_scale),
+            ),
+            scope="IO_IN_OUTPUT_MODE AND OUTPUT_BYTE_LO+0 AND OUTPUT_BYTE_HI+0",
+        ),
+    )
+
+
+def _null_terminator_detection_ir(S: float = 100.0) -> CompilerIR:
+    """Build a :class:`CompilerIR` exposing the null-terminator rule.
+
+    The bake body lowers at ``start_unit=1864`` (above the L10 ALU's
+    0-1845 cluster); the IR-level lowering uses ``start_unit=0`` so the
+    declarative verifier can compare rule weights independent of the
+    production offset.
+    """
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_null_terminator_detection_rules(S))
+    return ir
+
+
+def _lower_null_terminator_detection_ir(ffn, S: float, BD) -> int:
+    rules = _null_terminator_detection_rules(S)
+    dim_positions = Primitives.dim_positions_from_bd(
+        BD,
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    return Primitives.lower_ffn_rules(
+        ffn,
+        rules,
+        dim_positions,
+        start_unit=_NULL_TERMINATOR_DETECTION_START_UNIT,
+        S=S,
+    )
+
+
 def make_null_terminator_detection_op(
     enable_conversational_io: bool = False,
     alu_mode: str = "lookup",
@@ -752,12 +828,22 @@ def make_null_terminator_detection_op(
     ``alu_mode != 'lookup'`` (in efficient mode ffn10 is an
     ``ALUAndOrXor`` and lacks the PureFFN ``W_*``/``b_*`` interface the
     helper expects).
+
+    Phase 11.A: the bake body is now a declarative ``FFNRule.gated_write``
+    lowered via :func:`_lower_null_terminator_detection_ir`. The
+    weights/biases produced are byte-identical to the legacy inline
+    ``_set_null_terminator_detection`` (verified by
+    ``compare_symbolic_to_lowered_ffn`` in the test suite). The
+    ``compiler_ir`` field exposes the rule when convo-IO + lookup mode
+    are both active so the declarative verifier sees the same data the
+    bake lowers.
     """
     if enable_conversational_io and alu_mode == "lookup":
         def bake(block, dim_positions, S):
-            from ...vm_step import _set_null_terminator_detection
-            _set_null_terminator_detection(
-                block.ffn, S, _as_setdim_proxy(dim_positions)
+            _lower_null_terminator_detection_ir(
+                block.ffn,
+                S,
+                _as_setdim_proxy(dim_positions),
             )
     else:
         def bake(block, dim_positions, S):
@@ -770,9 +856,11 @@ def make_null_terminator_detection_op(
                 "NEXT_THINKING_START"},
         kind="block",
         bake_fn=bake,
-        declarative_bake_fn=bake
-        if not (enable_conversational_io and alu_mode == "lookup")
-        else None,
+        # Phase 11.A: the bake is now fully declarative in both states
+        # (no-op when convo-IO is off / efficient mode; FFNRule lowering
+        # when on + lookup). Both branches are spec-generated.
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
         # Phase 8.G.6: drop ``layer_idx=10`` literal; bind to the L10
         # attn anchor ``layer10_carry_relay`` so the block op resolves to
         # whichever layer the compiler picks for the L10 carry-relay attn.
@@ -790,10 +878,14 @@ def make_null_terminator_detection_op(
         ),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
-        # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
-        # config, so an empty IR is byte-identical for default flag values.
-        # Populating IR with the matching rules is Phase 11.A follow-up.
-        compiler_ir=CompilerIR(),
+        # Phase 11.A: expose the matching FFNRule when convo-IO + lookup
+        # are active; otherwise an empty IR is byte-identical to the
+        # no-op bake.
+        compiler_ir=(
+            _null_terminator_detection_ir()
+            if (enable_conversational_io and alu_mode == "lookup")
+            else CompilerIR()
+        ),
     )
 
 
