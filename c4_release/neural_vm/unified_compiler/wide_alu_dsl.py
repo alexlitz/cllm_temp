@@ -852,10 +852,330 @@ def wide_div_rules(
     return tuple(rules)
 
 
+# ---------------------------------------------------------------------------
+# Wave W3 (retry): GE-format wide ADD/SUB helpers.
+# ---------------------------------------------------------------------------
+#
+# These mirror ``wide_add_rules`` / ``wide_sub_rules`` semantically but
+# emit rules that address the **GE workspace** ``[seq, byte, nibble]``
+# (per ``efficient_alu_addsub_split.py`` and ``efficient_alu_neural.py``
+# lines 236-415) rather than the BD band-offset model.
+#
+# Why this exists: ``docs/DSL_W3_ADDSUB_LIMIT.md`` documents that
+# multi-byte ADD/SUB cannot be expressed via the band-offset DSL because
+# the BD residual's wide-ALU bands (``ALU_LO``/``ALU_HI``/``OUTPUT_LO``/
+# ``OUTPUT_HI``/``CARRY``) are only 16 dims wide each. Stacking nibbles
+# via ``operand_a_base + (b*16 + nib)`` works for ``width_bytes <= 2``
+# (because ``ALU_LO+16 == ALU_HI``) but corrupts unrelated bands for
+# wider operands (``ALU_LO+32`` lands in ``CARRY``; ``ALU_LO+48`` lands
+# in ``CLEAN_EMBED_HI``).
+#
+# The GE workspace already separates bytes by *position* — each position
+# row has its own ``GE.DIM == 160`` slot space — so byte rows never
+# collide regardless of width. ``AddSub5StageBlock`` operates in this
+# workspace; the helpers here express the same cascade as a flat
+# ``FFNRule`` table over ``(byte_position, nibble_a, nibble_b)`` triples.
+#
+# Naming convention: each position's per-nibble bands are addressed via
+# the dim refs ``"p{b}_NIB_A+{nib}"``, ``"p{b}_NIB_B+{nib}"``,
+# ``"p{b}_RESULT+{nib}"``, and the per-position carry-out by
+# ``"p{b}_CARRY_OUT"``. The marker and opcode gates are global
+# (``marker_gate``, ``opcode_gate``). Callers supply a ``dim_positions``
+# map that resolves ``p{b}_NIB_A`` → ``b * POS_STRIDE + nib_a_offset``
+# for the flattened ``[seq, 8 * POS_STRIDE]`` workspace.
+
+
+def wide_ge_add_rules(
+    *,
+    width_bytes: int,
+    opcode_gate: str,
+    marker_gate: str,
+    S: float,
+    operand_a_name: str = "NIB_A",
+    operand_b_name: str = "NIB_B",
+    result_name: str = "RESULT",
+    carry_out_name: str = "CARRY_OUT",
+    position_prefix: str = "p",
+) -> Tuple[FFNRule, ...]:
+    """Emit FFN rules for wide multi-byte ADD on the GE workspace.
+
+    Mirrors :func:`wide_add_rules` semantically but routes each byte
+    row through a distinct GE-format position rather than offsetting
+    into a single 16-dim band. Each byte position ``b`` in
+    ``0..width_bytes-1`` references its own per-nibble one-hot bands
+    ``p{b}_NIB_A+{nib}`` (operand A), ``p{b}_NIB_B+{nib}`` (operand B),
+    ``p{b}_RESULT+{nib}`` (sum nibble), and a single per-position
+    carry-out flag ``p{b}_CARRY_OUT``. The inter-byte carry cascade
+    reads ``p{b-1}_CARRY_OUT`` for byte ``b > 0``.
+
+    Per-byte rule semantics are identical to :func:`wide_add_rules`:
+
+      * sum_nib  = (a_nib + b_nib + carry_in) % 16
+      * carry_out = (a_nib + b_nib + carry_in) >= 16
+
+    Byte 0 emits 256 rules (no carry-in). Byte ``b > 0`` emits 256+256
+    rules (separately gated for ``carry_in=0`` via the ``-50`` borrow-
+    suppression weight and ``carry_in=1`` via the ``+30`` cumulative
+    threshold-120 cascade) plus one carry-relay rule. Total:
+    ``256 + (width_bytes - 1) * (512 + 1)``.
+
+    The function is GE-only: it does NOT touch BD bands. Callers
+    pair it with a BD→GE projection upstream (BDToGEConverter) and a
+    GE→BD writeback downstream (GEToBDConverter), the same way the
+    ``AddSub5StageBlock`` does.
+
+    Args:
+        width_bytes: number of nibble-wide bytes in the wide ADD
+            (1 for 4-bit, 2 for 8-bit, 4 for 16-bit, 8 for 32-bit).
+        opcode_gate: dim ref for the ``ADD`` opcode gate.
+        marker_gate: dim ref for the AX-style marker gate.
+        S: SwiGLU scale.
+        operand_a_name: slot suffix for operand A's per-position nibble
+            band. Default ``"NIB_A"``. Combined with ``position_prefix``
+            yields ``"p{b}_NIB_A"``.
+        operand_b_name: slot suffix for operand B's per-position band.
+        result_name: slot suffix for the per-position result band.
+        carry_out_name: slot suffix for the per-position 1-bit carry
+            flag.
+        position_prefix: prefix for the per-position slot names.
+
+    Returns:
+        ``tuple[FFNRule, ...]`` of length
+        ``256 + (width_bytes - 1) * 513``.
+    """
+    if width_bytes < 1:
+        raise ValueError(
+            f"wide_ge_add_rules: width_bytes must be >= 1; "
+            f"got {width_bytes!r}"
+        )
+
+    rules: list[FFNRule] = []
+    write_amplitude = 2.0 / S
+
+    for b in range(width_bytes):
+        a_band = f"{position_prefix}{b}_{operand_a_name}"
+        b_band = f"{position_prefix}{b}_{operand_b_name}"
+        out_band = f"{position_prefix}{b}_{result_name}"
+        carry_out_dim = f"{position_prefix}{b}_{carry_out_name}"
+        carry_in_dim = (
+            f"{position_prefix}{b - 1}_{carry_out_name}" if b > 0 else None
+        )
+
+        carry_in_cases = (0,) if b == 0 else (0, 1)
+
+        for carry_in in carry_in_cases:
+            for a_nib in range(16):
+                for b_nib in range(16):
+                    total = a_nib + b_nib + carry_in
+                    sum_nib = total % 16
+                    carry_out = total >= 16
+
+                    writes: list[Tuple[str, float]] = [
+                        (f"{out_band}+{sum_nib}", write_amplitude),
+                    ]
+                    if carry_out:
+                        writes.append(
+                            (carry_out_dim, write_amplitude)
+                        )
+
+                    if b == 0:
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{a_nib}", 30.0),
+                            (f"{b_band}+{b_nib}", 30.0),
+                        )
+                        threshold = 80.0
+                    elif carry_in == 0:
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{a_nib}", 30.0),
+                            (f"{b_band}+{b_nib}", 30.0),
+                            (carry_in_dim, -50.0),
+                        )
+                        threshold = 80.0
+                    else:
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{a_nib}", 30.0),
+                            (f"{b_band}+{b_nib}", 30.0),
+                            (carry_in_dim, 30.0),
+                        )
+                        threshold = 120.0
+
+                    rules.append(FFNRule.gated_write(
+                        name=(
+                            f"wide_ge_add_b{b}_cin{carry_in}_"
+                            f"a{a_nib:x}_b{b_nib:x}"
+                        ),
+                        conditions=conditions,
+                        threshold=threshold,
+                        gate=opcode_gate,
+                        gate_weight=1.0,
+                        gate_bias=0.0,
+                        writes=tuple(writes),
+                    ))
+
+        # Single carry-in detection / relay rule for byte > 0. Probes
+        # the prior byte's carry-out as a verification observable. The
+        # write is a no-op self-relay (amplitude 0) so the cascade is
+        # bit-stable across repeated lowerings.
+        if b > 0:
+            rules.append(FFNRule.gated_write(
+                name=f"wide_ge_add_b{b}_carry_in_detect",
+                conditions=(
+                    (marker_gate, 40.0),
+                    (carry_in_dim, 60.0),
+                ),
+                threshold=80.0,
+                gate=opcode_gate,
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=(
+                    (carry_in_dim, 0.0),
+                ),
+            ))
+
+    return tuple(rules)
+
+
+def wide_ge_sub_rules(
+    *,
+    width_bytes: int,
+    opcode_gate: str,
+    marker_gate: str,
+    S: float,
+    operand_a_name: str = "NIB_A",
+    operand_b_name: str = "NIB_B",
+    result_name: str = "RESULT",
+    borrow_out_name: str = "BORROW_OUT",
+    position_prefix: str = "p",
+) -> Tuple[FFNRule, ...]:
+    """Emit FFN rules for wide multi-byte SUB on the GE workspace.
+
+    Mirror of :func:`wide_ge_add_rules` for subtraction. Per-byte rule
+    semantics are identical to :func:`wide_sub_rules`:
+
+      * diff_nib   = (a_nib - b_nib - borrow_in) & 0xF
+      * borrow_out = (a_nib - b_nib - borrow_in) < 0
+
+    Per-position dim names ``p{b}_NIB_A``, ``p{b}_NIB_B``,
+    ``p{b}_RESULT``, ``p{b}_BORROW_OUT`` (the borrow flag is per
+    position; previous-byte borrow read via
+    ``p{b-1}_BORROW_OUT`` for ``b > 0``). Rule mechanics, condition
+    weights and thresholds match :func:`wide_ge_add_rules` modulo the
+    sub-specific arithmetic.
+
+    Args:
+        width_bytes: number of nibble-wide bytes in the wide SUB.
+        opcode_gate: dim ref for the ``SUB`` opcode gate.
+        marker_gate: dim ref for the AX-style marker gate.
+        S: SwiGLU scale.
+        operand_a_name, operand_b_name, result_name: per-position slot
+            suffixes (defaults match the ADD helper).
+        borrow_out_name: per-position 1-bit borrow flag suffix.
+        position_prefix: prefix for the per-position slot names.
+
+    Returns:
+        ``tuple[FFNRule, ...]`` of length
+        ``256 + (width_bytes - 1) * 513``.
+    """
+    if width_bytes < 1:
+        raise ValueError(
+            f"wide_ge_sub_rules: width_bytes must be >= 1; "
+            f"got {width_bytes!r}"
+        )
+
+    rules: list[FFNRule] = []
+    write_amplitude = 2.0 / S
+
+    for b in range(width_bytes):
+        a_band = f"{position_prefix}{b}_{operand_a_name}"
+        b_band = f"{position_prefix}{b}_{operand_b_name}"
+        out_band = f"{position_prefix}{b}_{result_name}"
+        borrow_out_dim = f"{position_prefix}{b}_{borrow_out_name}"
+        borrow_in_dim = (
+            f"{position_prefix}{b - 1}_{borrow_out_name}" if b > 0 else None
+        )
+
+        borrow_in_cases = (0,) if b == 0 else (0, 1)
+
+        for borrow_in in borrow_in_cases:
+            for a_nib in range(16):
+                for b_nib in range(16):
+                    raw = a_nib - b_nib - borrow_in
+                    diff_nib = raw & 0xF
+                    borrow_out = raw < 0
+
+                    writes: list[Tuple[str, float]] = [
+                        (f"{out_band}+{diff_nib}", write_amplitude),
+                    ]
+                    if borrow_out:
+                        writes.append(
+                            (borrow_out_dim, write_amplitude)
+                        )
+
+                    if b == 0:
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{a_nib}", 30.0),
+                            (f"{b_band}+{b_nib}", 30.0),
+                        )
+                        threshold = 80.0
+                    elif borrow_in == 0:
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{a_nib}", 30.0),
+                            (f"{b_band}+{b_nib}", 30.0),
+                            (borrow_in_dim, -50.0),
+                        )
+                        threshold = 80.0
+                    else:
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{a_nib}", 30.0),
+                            (f"{b_band}+{b_nib}", 30.0),
+                            (borrow_in_dim, 30.0),
+                        )
+                        threshold = 120.0
+
+                    rules.append(FFNRule.gated_write(
+                        name=(
+                            f"wide_ge_sub_b{b}_bin{borrow_in}_"
+                            f"a{a_nib:x}_b{b_nib:x}"
+                        ),
+                        conditions=conditions,
+                        threshold=threshold,
+                        gate=opcode_gate,
+                        gate_weight=1.0,
+                        gate_bias=0.0,
+                        writes=tuple(writes),
+                    ))
+
+        if b > 0:
+            rules.append(FFNRule.gated_write(
+                name=f"wide_ge_sub_b{b}_borrow_in_detect",
+                conditions=(
+                    (marker_gate, 40.0),
+                    (borrow_in_dim, 60.0),
+                ),
+                threshold=80.0,
+                gate=opcode_gate,
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=(
+                    (borrow_in_dim, 0.0),
+                ),
+            ))
+
+    return tuple(rules)
+
+
 __all__ = [
     "bitwise_rules",
     "wide_add_rules",
     "wide_sub_rules",
+    "wide_ge_add_rules",
+    "wide_ge_sub_rules",
     "wide_shift_rules",
     "wide_mul_rules",
     "wide_div_rules",

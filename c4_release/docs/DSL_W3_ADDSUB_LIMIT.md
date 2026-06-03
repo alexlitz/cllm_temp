@@ -57,3 +57,47 @@ Multi-byte ADD/SUB/DIV/MOD via DSL: **deferred**. Current legacy
 composites (AddSub5StageBlock, FlattenedDivMod multi-byte, FlattenedALUMul)
 remain authoritative for `width_bytes > 1`. W6 deletion of
 `efficient_alu_*.py` is blocked on this.
+
+## Update (W3 retry, GE-format helpers landed)
+
+`wide_alu_dsl.wide_ge_add_rules` and `wide_alu_dsl.wide_ge_sub_rules`
+take Path 2 above. They emit rules over a GE-format dim layout where
+each byte row gets its own per-position slot block — no nibble stacking
+inside a single 16-dim band, so no collision into `CARRY` /
+`CLEAN_EMBED_HI` for `width_bytes > 2`. Per-position dim names follow
+the convention `p{b}_NIB_A`, `p{b}_NIB_B`, `p{b}_RESULT`,
+`p{b}_CARRY_OUT` / `p{b}_BORROW_OUT`.
+
+Byte-identity passes for 16-bit (`width_bytes=4`) and 32-bit
+(`width_bytes=8`) ADD and SUB — see
+`tests/test_wide_alu_dsl.py::test_wide_ge_add_rules_byte_identity_*`
+and the SUB equivalents. The tests pre-inject the per-byte
+carry/borrow chain into the input residual (same single-pass strategy
+as the existing W3 multi-byte BD test in
+`test_wide_add_rules_byte_identity_16bit/32bit`), so they validate
+per-nibble rule semantics and the cross-position dim layout.
+
+### Path forward for full W3 retry
+
+1. **Wire the GE-format helpers into a per-layer bake.** The helpers
+   are pure FFNRule generators; the next step is to lower them through
+   `Primitives.lower_ffn_rules` inside a wide-ALU layer alongside the
+   existing BD↔GE projection (`BDToGEConverter` / `GEToBDConverter`,
+   see `efficient_alu_neural.py:236-415`). The bake order mirrors
+   `AddSub5StageBlock`: BD→GE (stage 0), per-byte ADD/SUB lookup (the
+   DSL rules, replacing stages 1-3), GE→BD writeback (stage 4).
+2. **Carry cascade across passes.** A single FFN forward cannot
+   self-cascade carries (W_up only reads the input residual). The
+   cross-byte cascade can be expressed either by stacking
+   `width_bytes` FFN layers (each resolving one byte's lookup and
+   writing the next byte's carry) or by replicating the binary
+   carry-lookahead used in `AddCarryLookaheadFFN` /
+   `SubBorrowLookaheadFFN`. Either is a follow-up step — the per-byte
+   rule semantics validated by this test are the load-bearing piece.
+3. **DIV / MOD / MUL.** The same dim-layout trick (per-position GE
+   slot blocks) generalises to the other multi-byte arithmetic ops.
+   `wide_ge_div_rules` / `wide_ge_mul_rules` can be added in follow-up
+   waves with identical structure to the ADD/SUB helpers here.
+4. **W6 deletion of `efficient_alu_*.py`.** Becomes feasible once
+   (1) and (2) are in place for ADD/SUB and DIV/MOD. The 8-bit slices
+   are already covered by the existing BD-mode helpers.
