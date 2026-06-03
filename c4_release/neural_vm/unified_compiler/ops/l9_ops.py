@@ -429,6 +429,11 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
 
     gate_ent = dim_ref("opcode_flag", "ENT")
     rules: list[FFNRule] = []
+    # Same 10-way amplified AND shape as _layer9_lea_hi_nibble_rules /
+    # _layer9_adj_hi_nibble_rules but gated on OP_ENT, computing SP - imm
+    # (a = SP's hi nibble via ALU_HI, b = imm's hi nibble via FETCH_HI).
+    # Thresholds 42.0 / 50.0 match the ADJ tuning. Writes
+    # (sp_hi - imm_hi - borrow_in) % 16 to OUTPUT_HI_THIS_STEP.
     for borrow_in in (0, 1):
         for sp_hi in range(16):
             for imm_hi in range(16):
@@ -445,13 +450,11 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                 else:
                     conditions.append(("CARRY+0", 8.0))
                     threshold = 50.0
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l9_ent_hi_b{borrow_in}_sp{sp_hi}_imm{imm_hi}",
                     conditions=tuple(conditions),
                     threshold=threshold,
                     gate=gate_ent,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
                 ))
     return tuple(rules)
