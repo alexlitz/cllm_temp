@@ -136,7 +136,9 @@ def make_alu_shift_composite_ops():
 
         return Operation(
             name="l13_alu_shift_install",
-            phase=13.5,
+            # Phase 11.A r3: dropped phase=13.5 — target_op_name +
+            # requires['after']: l13_alu_shift_getobd already pin
+            # placement and intra-target order.
             reads=set(),
             writes=set(),
             kind="block",
@@ -439,7 +441,8 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=11.05,
+        # Phase 11.A r3: dropped phase=11.05 — target_op_name +
+        # requires['after']: l11_alu_mul_bdtoge already pin placement.
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -772,7 +775,8 @@ def make_l12_alu_mul_getobd_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        phase=12.3,
+        # Phase 11.A r3: dropped phase=12.3 — target_op_name +
+        # requires['after']: l12_alu_mul_finalcorrection already pin order.
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
@@ -940,7 +944,8 @@ def make_alu_divmod_composite_ops():
 
         return Operation(
             name="l10_alu_divmod_install",
-            phase=10.8,
+            # Phase 11.A r3: dropped phase=10.8 — target_op_name +
+            # requires['after']: l10_alu_divmod_getobd already pin order.
             reads=set(),
             writes=set(),
             kind="block",

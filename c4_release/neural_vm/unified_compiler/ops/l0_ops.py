@@ -451,7 +451,9 @@ def make_layer0_threshold_attn_op() -> Operation:
 
     return Operation(
         name="layer0_threshold_attn",
-        phase=0,
+        # Phase 11.A r3: dropped phase=0 — co-placement at
+        # ``_layer0_threshold_attn_dep_anchor`` + explicit
+        # ``requires['after']`` on the anchor already pin fire order.
         reads={"IS_MARK", "CONST"},
         writes={"H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"},
         kind="block",

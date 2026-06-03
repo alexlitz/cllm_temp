@@ -1243,7 +1243,9 @@ def make_format_position_counter_op(enable_conversational_io: bool = False) -> O
 
     return Operation(
         name="format_position_counter",
-        phase=8.5,
+        # Phase 11.A r3: dropped phase=8.5 — target_op_name +
+        # requires['after']: layer8_alu already pin placement at
+        # layer10_byte_passthrough and intra-target order.
         # Phase 9.B (IO_IN_OUTPUT_MODE SCC rename): IO_IN_OUTPUT_MODE ->
         # IO_IN_OUTPUT_MODE.*.-1 marks the read as SSA cross-step. The
         # sole writer ``null_terminator_detection`` runs at phase=10.6
@@ -2068,7 +2070,8 @@ def make_layer8_op_imm_relay_op() -> Operation:
         # to whichever layer the compiler places the anchor at.
         target_op_name="layer10_byte_passthrough",
         requires={"after": "layer8_alu"},
-        phase=8.4,
+        # Phase 11.A r3: dropped phase=8.4 — target_op_name +
+        # requires['after']: layer8_alu already pin placement and order.
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},

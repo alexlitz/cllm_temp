@@ -205,7 +205,9 @@ def make_layer4_pc_relay_op() -> Operation:
 
     return Operation(
         name="layer4_pc_relay",
-        phase=4,
+        # Phase 11.A r3: dropped phase=4 — co-placement at
+        # ``_layer4_ffn_dep_anchor`` + ``requires['after']`` on the
+        # anchor already pins ordering; phase= was redundant.
         # Phase 8.A targeted (SCC audit step 7): the ADDR_KEY read here is
         # the PREV-step value carried on the PC marker residual (set by
         # the previous step's ``layer14_clear_addr_key_pollution`` /

@@ -720,7 +720,10 @@ def make_layer3_ffn_op() -> Operation:
 
     return Operation(
         name="layer3_ffn",
-        phase=3,
+        # Phase 11.A r3: dropped phase=3 — co-placement at
+        # ``layer3_carry_forward_attn`` + explicit ``requires['after']``
+        # on the same op already pins fire order; the phase literal was
+        # a redundant fallback signal.
         # Phase 8.A.6 v2: TEMP_PREV_STEP marks the TEMP read as cross-step
         # relative to L5/L7/L11/L14 TEMP writers (which fire AFTER L3 in the
         # same step). The same-step value layer3_carry_forward_attn writes

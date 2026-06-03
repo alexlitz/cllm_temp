@@ -6821,7 +6821,8 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         writes=set(),
         kind="block",
         declarative_bake_fn=bake,
-        phase=10.7,
+        # Phase 11.A r3: dropped phase=10.7 — target_op_name and
+        # requires['after'] already pin ordering at layer10_carry_relay.
         # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
         # binds this block op to the layer of ``layer10_carry_relay``
         # (kind="attn", L10 anchor).
