@@ -691,6 +691,12 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # Stack slots are 8-byte aligned, so the only nonzero byte-0 low nibble
     # that can be a PSH address is 8. Other nonzero low lanes at the MEM
     # marker are usually staged store values (for example pushing 0x0b).
+    # Step 2 (IR_INCREMENTAL_IMPROVEMENTS): every rule below writes only
+    # at the MEM marker (psh_mem_addr0_conditions pins MARK_MEM=+1.0 with
+    # -1e6 blockers on every other marker and -1e6 on IS_BYTE). Declare
+    # dominates_at == "mark == MEM" so the S-6 strength verifier scopes
+    # cross-op competition to the MEM-marker firing set rather than the
+    # full position lattice.
     rules.append(FFNRule.constant_write(
         name="l16_psh_mem_addr0_restore_lo_8",
         conditions=psh_mem_addr0_conditions + (("OUTPUT_LO+8", 1.0),),
@@ -699,6 +705,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_LO+8", psh_mem_addr0_restore),
             ("OUTPUT_LO+0", -psh_mem_addr0_restore),
         ),
+        scope="mark == MEM",
+        dominates_at={"OUTPUT_LO": "mark == MEM"},
     ))
     for k in range(1, 16):
         rules.append(FFNRule.constant_write(
@@ -709,6 +717,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"OUTPUT_HI_THIS_STEP+{k}", psh_mem_addr0_restore),
                 ("OUTPUT_HI_THIS_STEP+0", -psh_mem_addr0_restore),
             ),
+            scope="mark == MEM",
+            dominates_at={"OUTPUT_HI_THIS_STEP": "mark == MEM"},
         ))
     rules.append(FFNRule.constant_write(
         name="l16_psh_mem_addr0_force_d8_from_l14_evidence",
@@ -722,6 +732,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_LO+8", 1_000_000.0),
             ("OUTPUT_HI_THIS_STEP+13", 1_000_000.0),
         ),
+        scope="mark == MEM",
+        dominates_at={
+            "OUTPUT_LO": "mark == MEM",
+            "OUTPUT_HI_THIS_STEP": "mark == MEM",
+        },
     ))
     rules.append(FFNRule.constant_write(
         name="l16_psh_mem_addr0_e0_from_addr_b0",
@@ -763,6 +778,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         threshold=8.5,
         writes=Primitives.byte_value_writes(0xE0, strength=200_000.0),
+        scope="mark == MEM",
+        dominates_at={
+            "OUTPUT_LO": "mark == MEM",
+            "OUTPUT_HI_THIS_STEP": "mark == MEM",
+        },
     ))
 
     # After a strict neural LEV, the next AX marker can still carry a
