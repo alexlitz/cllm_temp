@@ -1843,6 +1843,22 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
         # placed ``layer14_mem_generation`` (the L14 attn op).
         target_op_name="layer14_mem_generation",
         migrated=True,
+        # Wave 1 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py``. Rules fire at MARK_MEM
+        # rows gated by OP_JSR or OP_ENT, writing OUTPUT_LO/HI at the
+        # MEM marker -- new "MEM_marker" slot per the existing
+        # AX_marker / PC_marker / SP_marker / BP_marker convention.
+        # OP_JSR is the in-step opcode broadcast; OP_ENT is allowlisted
+        # cross-step durable per derive's _CROSS_STEP_DURABLE and is
+        # NOT in consumes_fresh (architecturally correct: ENT is a
+        # multi-step routine -- see STALENESS_INVARIANTS.md).
+        produces={
+            "OUTPUT_LO": "MEM_marker",
+            "OUTPUT_HI_THIS_STEP": "MEM_marker",
+        },
+        consumes_fresh={
+            "OP_JSR": "MEM_marker",
+        },
         claims=_claims,
         requires={"after": "layer14_mem_generation"},
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
@@ -1993,6 +2009,20 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
         # placed ``layer14_mem_generation`` (the L14 attn op).
         target_op_name="layer14_mem_generation",
         migrated=True,
+        # Wave 1 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py`` from the IR rule writes
+        # then slot-mapped: the rule scope is ``IS_BYTE and H1+1`` (AX
+        # byte positions), matching the existing AX_byte0 convention
+        # used by the L14 temp_clear POC. OP_JSR is broadcast to AX byte
+        # positions by L7 head 5 (V slot 8) in the same step, so it's
+        # the fresh in-step value, not a cross-step durable.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI_THIS_STEP": "AX_byte0",
+        },
+        consumes_fresh={
+            "OP_JSR": "AX_byte0",
+        },
         claims=_claims,
         requires={"after": "layer14_mem_generation"},
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
@@ -2136,6 +2166,18 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         # placed ``layer14_mem_generation`` (the L14 attn op).
         target_op_name="layer14_mem_generation",
         migrated=True,
+        # Wave 1 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py``; mirrors
+        # ``layer14_jsr_ax_bytes_zero``. Rule scope ``IS_BYTE and H1+1``
+        # = AX byte positions -> AX_byte0 slot. TEMP[7] (NOCARRY_ALU_OP
+        # relay) is populated by L7 head 5 V slot 9 in the same step.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI_THIS_STEP": "AX_byte0",
+        },
+        consumes_fresh={
+            "TEMP": "AX_byte0",
+        },
         claims=_claims,
         requires={"after": "layer14_mem_generation"},
         # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1873
@@ -2447,6 +2489,19 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         # placed ``layer14_mem_generation`` (the L14 attn op).
         target_op_name="layer14_mem_generation",
         migrated=True,
+        # Wave 1 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
+        # ``tools/derive_produces_consumes.py``; mirrors
+        # ``layer14_jsr_ax_bytes_zero``. Rule scope ``IS_BYTE and H1+1``
+        # = AX byte positions -> AX_byte0 slot. OP_LC_RELAY is broadcast
+        # to AX byte positions by L7 head 5 (V slot 2) in the same step,
+        # so it's the fresh in-step value.
+        produces={
+            "OUTPUT_LO": "AX_byte0",
+            "OUTPUT_HI_THIS_STEP": "AX_byte0",
+        },
+        consumes_fresh={
+            "OP_LC_RELAY": "AX_byte0",
+        },
         claims=_claims,
         requires={"after": "layer14_mem_generation"},
         smoke_tests={"TestSmokeMemory::test_sc_lc_roundtrip"},
