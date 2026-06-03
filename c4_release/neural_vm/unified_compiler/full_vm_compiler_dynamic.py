@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -70,6 +71,7 @@ from .layer_compiler import (
     requires_after_ops,
     requires_same_layer_as_ops,
 )
+from .ssa_dim import base_of, is_ssa_form, parse_ssa_name
 from . import _legacy_redirect as _static
 from ..kv_eviction import KVEvictionPolicy
 
@@ -801,6 +803,138 @@ def _assert_strict_mode_clean(
 
 
 # ---------------------------------------------------------------------------
+# Step-1 safety: cross-step reads with same-step writers
+# ---------------------------------------------------------------------------
+
+
+# Sentinel used by the step-1 safety check to indicate "no warning category
+# filter was supplied". Exposed via module-level constant so callers can pass
+# it through.
+class CrossStepReadWarning(UserWarning):
+    """Emitted at compile time when an op declares a cross-step (``X.*.-1``)
+    read of a residual dim that ALSO has a same-step writer scheduled in the
+    same compile.
+
+    On VM step 1 (the first step) there is no previous step, so a cross-step
+    read returns the residual's zero-init value rather than a meaningful
+    producer-written value. If a same-step writer exists, the bake author
+    very often *meant* to read the freshly-written same-step value (or to OR
+    same-step ∪ prev-step), but the IR's ``.*.-1`` form silently falls
+    through to 0 on step 1.
+
+    This warning surfaces the class-of-bug at compile time WITHOUT changing
+    runtime behaviour. Each warning names the consuming op, the cross-step
+    SSA dim name, and the set of same-step writer ops so the bake author can
+    audit whether the step-1 zero-propagation is intentional. The historical
+    discovery that motivated this check is the OPCODE_BYTE_LO cross-step
+    read in ``l5_ops.py:opcode_decode_ffn`` whose same-step writer is
+    ``layer5_fetch``: on step 1 the decoder reads 0 because L5 fetch's
+    write hadn't entered the prev-step residual.
+    """
+
+
+def _find_cross_step_reads_with_same_step_writers(
+    ops: Sequence[Operation],
+) -> List[Tuple[str, str, Tuple[str, ...]]]:
+    """Return ``[(consumer_op_name, ssa_dim_name, same_step_writers), ...]``.
+
+    For each op in ``ops``, scan its declared ``reads`` for SSA names whose
+    ``step_offset`` is non-zero (the cross-step alias, e.g.
+    ``OPCODE_BYTE_LO.*.-1``). Then look across ALL ops for any op whose
+    ``writes`` contain the base dim (unversioned form). When at least one
+    such writer exists, emit a tuple naming the reader, the SSA read, and
+    the writer ops.
+
+    The check is purely declarative: it only inspects ``reads`` / ``writes``
+    sets on the op set. It does NOT consult the schedule, dim positions, or
+    runtime state.
+
+    Notes
+    -----
+    * Self-writers are excluded — an op that both writes ``X`` and reads
+      ``X.*.-1`` is not a step-1 safety problem (the cross-step read is
+      asking for the PRIOR step's own write, which is the canonical
+      back-edge pattern).
+    * Writes are matched against the *base dim only*. Today the corpus
+      writes with unversioned names exclusively, so this is a strict
+      match. If future ops adopt versioned writes, ``base_of`` strips
+      the suffix before comparison.
+    """
+    # writers[base_dim] -> [op.name, ...]
+    writers: Dict[str, List[str]] = defaultdict(list)
+    for op in ops:
+        for w in op.writes:
+            base = base_of(w) if is_ssa_form(w) else w
+            writers[base].append(op.name)
+
+    findings: List[Tuple[str, str, Tuple[str, ...]]] = []
+    for op in ops:
+        for r in op.reads:
+            if not is_ssa_form(r):
+                continue
+            try:
+                parsed = parse_ssa_name(r)
+            except ValueError:
+                # Malformed SSA name — let the rest of the compile pipeline
+                # surface the structured error; the safety check stays quiet.
+                continue
+            if parsed.step_offset == 0:
+                continue
+            base = parsed.base_dim
+            ws = writers.get(base, ())
+            # Exclude self-writers: an op that reads its own prior-step
+            # write is the canonical back-edge case (not a step-1 bug).
+            same_step = tuple(sorted(w for w in ws if w != op.name))
+            if not same_step:
+                continue
+            findings.append((op.name, r, same_step))
+    return findings
+
+
+def _emit_cross_step_safety_warnings(
+    ops: Sequence[Operation],
+    *,
+    enabled: bool = True,
+    limit: Optional[int] = None,
+) -> List[Tuple[str, str, Tuple[str, ...]]]:
+    """Run the cross-step safety check and emit one warning per finding.
+
+    Returns the findings list (always — even when ``enabled=False``) so the
+    caller can count / log without re-running the analysis. When
+    ``enabled=True`` (the default) each finding is also emitted via
+    ``warnings.warn`` with the :class:`CrossStepReadWarning` category. A
+    fixed-format message names the consumer op, the SSA read, and the
+    same-step writer set so a downstream agent / log scraper can pattern-
+    match the structured fields.
+
+    ``limit``: if set, only the first ``limit`` findings emit warnings (all
+    findings are still returned). Use ``None`` (the default) to emit them
+    all — the production op set has ~5-15 findings so the volume is
+    bounded.
+    """
+    findings = _find_cross_step_reads_with_same_step_writers(ops)
+    if enabled:
+        for i, (consumer, ssa_read, same_step_writers) in enumerate(findings):
+            if limit is not None and i >= limit:
+                break
+            writers_preview = ", ".join(same_step_writers[:5])
+            extra = max(0, len(same_step_writers) - 5)
+            if extra:
+                writers_preview = f"{writers_preview}, ... (+{extra} more)"
+            msg = (
+                f"Cross-step read {ssa_read!r} in op {consumer!r} may return "
+                f"0 on VM step 1 because same-step writer(s) for base dim "
+                f"{base_of(ssa_read)!r} exist: [{writers_preview}]. Did you "
+                f"mean to OR the cross-step alias with the same-step dim, or "
+                f"read the same-step dim directly? See "
+                f"CrossStepReadWarning for the step-1 zero-propagation "
+                f"class-of-bug."
+            )
+            warnings.warn(msg, CrossStepReadWarning, stacklevel=2)
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Public compile entry point
 # ---------------------------------------------------------------------------
 
@@ -1000,6 +1134,19 @@ def compile_full_vm_dynamic(
     # (Phase 8.G.3 cut the static fallback that gated this claim, leaving
     # the dynamic path as the single bake entry point).
     _scheduled, _source = compute_dynamic_schedule(ops)
+
+    # Step-1 safety: scan for cross-step reads (``X.*.-1``) whose base dim
+    # ALSO has a same-step writer in the scheduled op set. On VM step 1
+    # there is no previous step, so the cross-step alias resolves to 0;
+    # when a same-step writer exists, the bake author very often meant to
+    # consume that fresh write instead. The warning is purely diagnostic —
+    # it changes no runtime behaviour. Emitted via ``warnings.warn`` with
+    # the ``CrossStepReadWarning`` category so callers can filter or
+    # promote to errors via the stdlib ``warnings`` filter mechanism. The
+    # canonical motivating case is the OPCODE_BYTE_LO read in
+    # ``opcode_decode_ffn`` (see ``ops/l5_ops.py``) whose same-step writer
+    # is ``layer5_fetch`` — on step 1 the decoder reads 0.
+    _emit_cross_step_safety_warnings(_scheduled)
 
     # Build the model via the unchanged static pipeline with the natural
     # op order. The static compile_full_vm wraps op collection inline,
