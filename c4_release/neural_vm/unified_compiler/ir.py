@@ -285,12 +285,16 @@ class AttentionOp:
 
     In addition to the per-head specs in ``rules``, an op may attach
     :class:`RuntimeAttentionFragment` entries to express attention bakes
-    whose shape depends on runtime properties of the target attention
-    block (e.g. ``attn.num_heads``). Fragments carry their own predicate
-    and writer; the lowerer emits each fragment whose predicate matches.
-    Used by Phase 7.C.2's L15 ``memory_lookup`` migration to keep the
-    LEV / pop-d8-to-e0 conditional shapes inside the IR rather than
-    hidden behind an imperative bake call.
+    whose shape depends on the live attention block's geometry (e.g.
+    ``attn.num_heads``). Fragments carry a name + bake_fn; the lowerer
+    emits each attached fragment in order.
+
+    Phase 7.C.2 introduced fragments with ``runtime_predicate`` lambdas
+    that gated emission at lowering time. DSL Wave W7 moves that
+    branching one level up: the IR-builder takes the shape variable as
+    an argument (e.g. ``_layer15_memory_lookup_ir(.., num_heads=...)``)
+    and uses plain Python ``if`` to choose which fragments to attach.
+    ``runtime_predicate`` is deprecated and no in-tree builder sets it.
     """
 
     rules: List["AttentionHeadIR"] = field(default_factory=list)
@@ -445,18 +449,28 @@ class AttentionHeadIR:
 
 @dataclass(frozen=True)
 class RuntimeAttentionFragment:
-    """A conditionally-emitted imperative attention-head fragment.
+    """An imperative attention-head fragment carried by an :class:`AttentionOp`.
 
     Phase 7.C.2 (Option B) — some legacy attention bakes (notably L15
     ``memory_lookup``) write Q/K/V/O across heads whose presence depends
-    on runtime shape (``attn.num_heads``). The per-head
+    on the live attention shape (``attn.num_heads``). The per-head
     :class:`DeclarativeAttentionHeadSpec` shape can't express that
-    branching, so we keep the imperative writer as a callable and let
-    the IR carry it as a *fragment* with a runtime predicate. The
-    lowerer picks the right fragments at compile time based on the
-    target attention block, so all variants are visible in one place
-    rather than hidden inside a bake function that branches at the
+    branching, so the imperative writer is kept as a callable and the
+    IR carries it as a *fragment*. All variants are visible at the IR
+    site rather than hidden inside a bake function that branches at the
     weight-write site.
+
+    DSL Wave W7 — the per-fragment ``runtime_predicate`` escape hatch
+    is deprecated. Shape branching now happens at IR-build time inside
+    the (parameterized) factory: the builder takes the shape variable
+    (e.g. ``num_heads``) as an argument, uses plain Python ``if`` to
+    select which fragments to add, and lowering emits every attached
+    fragment unconditionally. ``runtime_predicate`` defaults to ``None``
+    ("always emit"), and is retained for backward compatibility only --
+    new fragments should leave it ``None`` and rely on the builder's
+    Python branching to do the selection. :meth:`should_emit` still
+    honours a non-``None`` predicate, so any pre-W7 caller continues to
+    work, but no in-tree call site sets it as of this wave.
 
     Attributes
     ----------
@@ -465,20 +479,22 @@ class RuntimeAttentionFragment:
         Surfaced in debug reports and used as a deduplication key by
         downstream tooling.
     bake_fn:
-        Callable that writes weights when the predicate matches. Called
-        as ``bake_fn(attn, dim_positions, HD, S)`` so it has the same
+        Callable that writes weights. Called as
+        ``bake_fn(attn, dim_positions, HD, S)`` so it has the same
         information the legacy imperative helper consumed. Must be
         idempotent within a single bake pass — fragments may be invoked
         multiple times if the surrounding IR is composed.
     runtime_predicate:
-        Callable ``(attn) -> bool``. The fragment is emitted iff this
-        returns ``True``. Defaults to ``None`` meaning "always emit".
-        The predicate runs against the live ``attn`` (so it can read
-        ``attn.num_heads``, ``attn.head_dim``, etc.) — keep it cheap and
-        side-effect free.
+        Deprecated since DSL Wave W7. Callable ``(attn) -> bool``. The
+        fragment is emitted iff this returns ``True``. Defaults to
+        ``None`` meaning "always emit". New fragments should leave it
+        ``None``.
     metadata:
         Optional opaque mapping for downstream tooling (audit reports,
         symbolic execution stubs, etc.). The lowerer never consults it.
+        Convention: ``shape="num_heads >= 12"`` (a human-readable
+        marker) is used by W7-era builders to record the build-time
+        shape gate that selected the fragment.
     """
 
     name: str
@@ -1476,9 +1492,16 @@ class CompilerIR:
 
         Emits the per-head :class:`DeclarativeAttentionHeadSpec` rules
         first, then runs each :class:`RuntimeAttentionFragment` whose
-        predicate matches ``attn``. Fragments receive
+        (deprecated) predicate matches ``attn``. Fragments receive
         ``(attn, dim_positions, HD, S)`` so they have the same context
         the legacy imperative helpers consumed.
+
+        DSL Wave W7: in-tree builders no longer set
+        ``runtime_predicate``; shape selection happens at IR-build
+        time so the loop below emits every attached fragment
+        unconditionally. ``should_emit`` is kept for backward
+        compatibility with any out-of-tree caller that still attaches
+        a predicate.
 
         ``dim_positions`` is required by fragments that resolve dim
         names at bake time; pass-through callers without fragments can

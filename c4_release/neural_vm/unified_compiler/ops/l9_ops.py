@@ -1773,8 +1773,10 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         # Phase 11.A IR exposure: at default ``enable=False`` the bake body
         # is ``if not enable: return``, so empty CompilerIR is byte-identical.
         # When ``enable=True`` the head spec mixes a declarative attention
-        # spec with alibi_slopes[head]=0.5 mutation -- the slope side needs a
-        # RuntimeAttentionFragment for full migration (Phase 11.A follow-up).
+        # spec with alibi_slopes[head]=0.5 mutation -- the slope side needs
+        # an :class:`AttentionOp` fragment (DSL Wave W7: a bake-fn carried
+        # on the IR's ``fragments`` list, selected at IR-build time rather
+        # than via a runtime predicate).
         compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#the-attention-layer",

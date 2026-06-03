@@ -7206,9 +7206,12 @@ def _set_layer15_memory_lookup_heads_0_3(attn, S, BD, HD):
 
     Factored out for Phase 7.C.2 so the IR carries the unconditional
     heads-0-3 writes as one :class:`RuntimeAttentionFragment` and the
-    LEV-only heads-4-11 writes as another fragment gated by
-    ``attn.num_heads >= 12``. Callable directly for tests and for the
-    legacy :func:`_set_layer15_memory_lookup` umbrella entry point.
+    LEV-only heads-4-11 writes as another fragment. DSL Wave W7 made
+    the LEV branch selectable at IR-build time via ``num_heads`` rather
+    than via a runtime predicate, but this body itself is unchanged --
+    it is the always-on fragment's writer. Callable directly for tests
+    and for the legacy :func:`_set_layer15_memory_lookup` umbrella
+    entry point.
     """
     L = 15.0
     PC_I = 0
@@ -7391,10 +7394,13 @@ def _set_layer15_memory_lookup_lev_heads_4_11(attn, S, BD, HD):
     """LEV-only portion of :func:`_set_layer15_memory_lookup`: heads 4-11.
 
     Factored out for Phase 7.C.2 so the IR can carry this body as a
-    :class:`RuntimeAttentionFragment` gated by
-    ``attn.num_heads >= 12``. Heads 4-7 read ``saved_bp`` from
-    ``memory[BP]`` and heads 8-11 read ``return_addr`` from
-    ``memory[BP+8]``. Only fires on 17-layer LEV builds.
+    :class:`RuntimeAttentionFragment`. DSL Wave W7 makes the
+    ``num_heads >= 12`` gate explicit at IR-build time in
+    :func:`_layer15_memory_lookup_ir` rather than via a runtime
+    predicate; this body itself is the LEV branch's writer and is
+    unchanged. Heads 4-7 read ``saved_bp`` from ``memory[BP]`` and
+    heads 8-11 read ``return_addr`` from ``memory[BP+8]``. Only fires
+    on 17-layer LEV builds.
     """
     L = 15.0
     # === LEV-specific heads (4-7, 8-11): Only when L15 has 12 heads ===
@@ -7697,11 +7703,15 @@ def _set_layer15_memory_lookup(attn, S, BD, HD):
 
     Phase 7.C.2 split this umbrella into three runtime-shape pieces so
     the L15 ``memory_lookup`` op can carry them as
-    :class:`RuntimeAttentionFragment` entries in its CompilerIR:
+    :class:`RuntimeAttentionFragment` entries in its CompilerIR. DSL
+    Wave W7 (current) moved the shape gating from per-fragment runtime
+    predicates to compile-time Python ``if`` inside
+    :func:`_layer15_memory_lookup_ir`, parameterized on ``num_heads``;
+    the bodies below are unchanged.
 
     * :func:`_set_layer15_memory_lookup_heads_0_3` — always emits.
     * :func:`_set_layer15_memory_lookup_lev_heads_4_11` — emits only
-      when ``attn.num_heads >= 12``.
+      when ``num_heads >= 12``.
     * The current-store-generation suppress helper in
       ``unified_compiler.ops.l15_ops``.
 

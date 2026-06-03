@@ -384,34 +384,51 @@ def make_nibble_copy_ffn_op() -> Operation:
     )
 
 
-def _layer15_memory_lookup_ir(dim_positions, HD) -> CompilerIR:
-    """Build the L15 ``memory_lookup`` CompilerIR with conditional fragments.
+def _layer15_memory_lookup_ir(
+    dim_positions,
+    HD,
+    num_heads=None,
+) -> CompilerIR:
+    """Build the L15 ``memory_lookup`` CompilerIR, shape-parameterized.
 
-    Phase 7.C.2 migrates the bake's two imperative helpers
-    (``vm_step._set_layer15_memory_lookup`` and the local
-    :func:`_suppress_l15_lookup_during_current_store_generation`) into
-    five :class:`RuntimeAttentionFragment` entries on a single
-    :class:`AttentionOp`. The IR carries each fragment's runtime
-    predicate so the lowerer can choose the right ones at bake time:
+    DSL Wave W7 (this commit) replaces the Phase 7.C.2
+    :class:`RuntimeAttentionFragment` ``runtime_predicate`` escape hatch
+    with compile-time Python branching on the shape variable
+    ``num_heads``. The five conditional fragments in the legacy bake are
+    now selected by plain ``if`` statements at IR-build time rather than
+    by ``should_emit(attn)`` at lowering time. The :class:`AttentionOp`
+    only carries the fragments that *actually fire* on the target
+    attention block, so the lowering pass becomes unconditional.
 
-    * ``memory_lookup.heads_0_3`` (always) — universal LI/LC + STACK0
-      load heads.
-    * ``memory_lookup.lev_heads_4_11`` (``attn.num_heads >= 12``) —
-      LEV-only saved_bp / return_addr reads.
-    * ``suppress.heads_0_3`` (always) — load-side suppression for
-      heads 0-3.
-    * ``suppress.lev_blockers_4_11`` (``attn.num_heads >= 12``) —
-      blocker rows on heads 4-11 keeping them silent during current
-      store generation.
-    * ``suppress.pop_d8_head_9`` (``attn.num_heads > 9``) — head 9 wipe
-      + pop_d8_to_e0 rewrite.
+    Selection table (driven by ``num_heads``):
+
+    * ``memory_lookup.heads_0_3`` — universal LI/LC + STACK0 load heads
+      (always emitted).
+    * ``memory_lookup.lev_heads_4_11`` — LEV-only saved_bp /
+      return_addr reads; emitted when ``num_heads >= 12``.
+    * ``suppress.heads_0_3`` — load-side suppression for heads 0-3
+      (always emitted).
+    * ``suppress.lev_blockers_4_11`` — blocker rows on heads 4-11
+      keeping them silent during current-store generation; emitted when
+      ``num_heads > 4``. The legacy ``range(4, min(num_heads, 12))``
+      body is a no-op below that threshold, so byte-identity is
+      preserved either way -- the explicit gate keeps the IR's intent
+      visible.
+    * ``suppress.pop_d8_head_9`` — head 9 wipe + pop_d8_to_e0 rewrite;
+      emitted when ``num_heads > 9``.
+
+    ``num_heads=None`` (the audit / declarations-only path that calls
+    ``compiler_ir_factory(dim_positions, head_dim)`` without a live
+    ``attn``) emits only the always-on fragments. This matches the
+    pre-W7 audit-path semantics: the symbolic execution ignores
+    fragments entirely, so the audit-side IR shape is a soft subset.
 
     ``dim_positions`` is wrapped into a SetDim proxy and captured into
     each fragment via closure so the writers see the same dim layout
-    they did in the imperative helpers. The wrapper functions in
-    ``vm_step`` and this module are byte-identity verified callers --
-    factoring them here just exposes the runtime-shape conditionals
-    one level up.
+    they did in the imperative helpers. The legacy
+    ``_set_layer15_memory_lookup_*`` / ``_suppress_l15_lookup_*``
+    bodies are unchanged -- W7 only moves the runtime-shape switch
+    one level up, from the lowerer to the builder.
     """
     from ...vm_step import (
         _set_layer15_memory_lookup_heads_0_3,
@@ -422,12 +439,12 @@ def _layer15_memory_lookup_ir(dim_positions, HD) -> CompilerIR:
     ir = CompilerIR()
     attn_op = ir.layer(0).attention
 
-    # `_set_layer15_memory_lookup_*` and `_suppress_l15_*` take
+    # ``_set_layer15_memory_lookup_*`` and ``_suppress_l15_*`` take
     # ``(attn, S, BD, HD)`` and ``(attn, BD, HD)`` respectively;
-    # `bake_fn` adapters absorb the IR's ``(attn, dim_positions, HD,
-    # S)`` call shape and pass `proxy` for BD. ``dim_positions`` is
-    # already captured via closure; the param is accepted but unused so
-    # the IR contract stays uniform.
+    # the ``bake_fn`` adapters absorb the IR's ``(attn, dim_positions,
+    # HD, S)`` call shape and pass ``proxy`` for BD. ``dim_positions``
+    # is already captured via closure; the param is accepted but
+    # unused so the IR contract stays uniform.
     attn_op.add_fragment(
         RuntimeAttentionFragment(
             name="layer15_memory_lookup.heads_0_3",
@@ -438,17 +455,19 @@ def _layer15_memory_lookup_ir(dim_positions, HD) -> CompilerIR:
             metadata={"role": "load_heads", "always_on": True},
         )
     )
-    attn_op.add_fragment(
-        RuntimeAttentionFragment(
-            name="layer15_memory_lookup.lev_heads_4_11",
-            bake_fn=(
-                lambda attn, _dp, hd, s:
-                _set_layer15_memory_lookup_lev_heads_4_11(attn, s, proxy, hd)
-            ),
-            runtime_predicate=lambda attn: int(getattr(attn, "num_heads", 0)) >= 12,
-            metadata={"role": "lev_heads", "predicate": "num_heads >= 12"},
+    if num_heads is None or int(num_heads) >= 12:
+        attn_op.add_fragment(
+            RuntimeAttentionFragment(
+                name="layer15_memory_lookup.lev_heads_4_11",
+                bake_fn=(
+                    lambda attn, _dp, hd, s:
+                    _set_layer15_memory_lookup_lev_heads_4_11(
+                        attn, s, proxy, hd
+                    )
+                ),
+                metadata={"role": "lev_heads", "shape": "num_heads >= 12"},
+            )
         )
-    )
     attn_op.add_fragment(
         RuntimeAttentionFragment(
             name="layer15_memory_lookup.suppress_heads_0_3",
@@ -459,53 +478,62 @@ def _layer15_memory_lookup_ir(dim_positions, HD) -> CompilerIR:
             metadata={"role": "current_store_suppress", "always_on": True},
         )
     )
-    attn_op.add_fragment(
-        RuntimeAttentionFragment(
-            name="layer15_memory_lookup.suppress_lev_blockers_4_11",
-            bake_fn=(
-                lambda attn, _dp, hd, _s:
-                _suppress_l15_lookup_lev_blockers_4_11(attn, proxy, hd)
-            ),
-            # The blocker loop iterates ``range(4, min(num_heads, 12))``
-            # in the legacy helper -- it has no LEV-build gate of its
-            # own. The body is empty for ``num_heads <= 4`` so any
-            # always-on emit would still be byte-identical, but
-            # restricting to ``num_heads > 4`` keeps the IR's intent
-            # explicit (these blocker rows belong to heads 4+).
-            runtime_predicate=lambda attn: int(getattr(attn, "num_heads", 0)) > 4,
-            metadata={
-                "role": "current_store_suppress_lev",
-                "predicate": "num_heads > 4",
-            },
+    # The blocker loop iterates ``range(4, min(num_heads, 12))`` in the
+    # legacy helper -- it has no LEV-build gate of its own. The body is
+    # empty for ``num_heads <= 4`` so always emitting would still be
+    # byte-identical, but restricting to ``num_heads > 4`` keeps the
+    # IR's intent explicit (these blocker rows belong to heads 4+).
+    if num_heads is None or int(num_heads) > 4:
+        attn_op.add_fragment(
+            RuntimeAttentionFragment(
+                name="layer15_memory_lookup.suppress_lev_blockers_4_11",
+                bake_fn=(
+                    lambda attn, _dp, hd, _s:
+                    _suppress_l15_lookup_lev_blockers_4_11(attn, proxy, hd)
+                ),
+                metadata={
+                    "role": "current_store_suppress_lev",
+                    "shape": "num_heads > 4",
+                },
+            )
         )
-    )
-    attn_op.add_fragment(
-        RuntimeAttentionFragment(
-            name="layer15_memory_lookup.suppress_pop_d8_head_9",
-            bake_fn=(
-                lambda attn, _dp, hd, _s:
-                _suppress_l15_lookup_pop_d8_head_9(attn, proxy, hd)
-            ),
-            runtime_predicate=lambda attn: int(getattr(attn, "num_heads", 0)) > 9,
-            metadata={"role": "pop_d8_to_e0", "predicate": "num_heads > 9"},
+    if num_heads is None or int(num_heads) > 9:
+        attn_op.add_fragment(
+            RuntimeAttentionFragment(
+                name="layer15_memory_lookup.suppress_pop_d8_head_9",
+                bake_fn=(
+                    lambda attn, _dp, hd, _s:
+                    _suppress_l15_lookup_pop_d8_head_9(attn, proxy, hd)
+                ),
+                metadata={"role": "pop_d8_to_e0", "shape": "num_heads > 9"},
+            )
         )
-    )
     return ir
 
 
 def make_layer15_memory_lookup_op() -> Operation:
     """L15 attention: memory-lookup heads for LI/LC.
 
-    Phase 7.C.2 (Option B, this commit): the bake no longer calls the
-    legacy ``_set_layer15_memory_lookup`` /
+    Phase 7.C.2 (Option B): the bake no longer calls the legacy
+    ``_set_layer15_memory_lookup`` /
     :func:`_suppress_l15_lookup_during_current_store_generation`
     helpers directly. The CompilerIR built by
-    :func:`_layer15_memory_lookup_ir` carries the same writes as five
-    :class:`RuntimeAttentionFragment` entries gated by their respective
-    ``attn.num_heads`` predicates, and the layer-compiler dispatches
-    the bake through that IR. The legacy helpers stay around as the
-    fragment bodies (and as the single legacy entry point for
-    :mod:`tests.test_l15_per_op` and :func:`make_l15_attention_resize_op`).
+    :func:`_layer15_memory_lookup_ir` carries the same writes as a
+    sequence of :class:`RuntimeAttentionFragment` bake-fns, and the
+    layer-compiler dispatches the bake through that IR. The legacy
+    helpers stay around as the fragment bodies (and as the single
+    legacy entry point for :mod:`tests.test_l15_per_op` and
+    :func:`make_l15_attention_resize_op`).
+
+    DSL Wave W7 (this commit): the per-fragment
+    ``runtime_predicate`` escape hatch is gone. The IR builder takes
+    the shape variable ``num_heads`` directly and selects the right
+    fragments at IR-build time via plain Python ``if``. The
+    declarations-only audit path keeps calling
+    ``compiler_ir_factory(dim_positions, head_dim)`` without a live
+    ``attn``; in that case ``num_heads`` defaults to ``None`` and the
+    IR carries every fragment (the symbolic execution ignores fragments
+    anyway, so the audit-side IR shape is a soft superset).
 
     Phase 6 wave 2F (head-axis migration, still in force): the bake
     instantiates a per-bake :class:`AttentionHeadAllocator` pre-loaded
@@ -524,11 +552,14 @@ def make_layer15_memory_lookup_op() -> Operation:
         attn._l15_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
 
-        # Dispatch the conditional fragments via the IR. Each fragment
-        # carries its own ``num_heads`` predicate so the LEV / head-9
-        # branches fire only when the resized attention block exposes
-        # the right shape.
-        ir = _layer15_memory_lookup_ir(dim_positions, HD)
+        # DSL Wave W7: pass the live ``attn.num_heads`` into the
+        # IR builder so the LEV / head-9 branches are selected at
+        # IR-build time via plain Python ``if``. The lowering pass
+        # below emits every fragment unconditionally -- shape gating
+        # has already happened.
+        ir = _layer15_memory_lookup_ir(
+            dim_positions, HD, num_heads=int(attn.num_heads)
+        )
         ir.lower_attention(attn, HD, dim_positions=dim_positions, S=S)
 
         if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
@@ -1429,13 +1460,14 @@ def _suppress_l15_lookup_lev_blockers_4_11(attn, BD, HD) -> None:
     blockers to address or negative-constant rows can create
     negative-query × negative-key false positives.
 
-    Carried as a :class:`RuntimeAttentionFragment` gated on
-    ``attn.num_heads >= 12`` in ``layer15_memory_lookup``'s CompilerIR.
-    The legacy umbrella loops ``range(4, min(num_heads, 12))`` so this
-    is a no-op when ``num_heads < 5``; gating the fragment on
-    ``num_heads >= 12`` keeps the IR's runtime-shape claim ("fires on
-    LEV build") explicit while remaining byte-identical because the
-    range is empty for ``num_heads < 5`` anyway.
+    Carried as a :class:`RuntimeAttentionFragment` in
+    ``layer15_memory_lookup``'s CompilerIR. The legacy umbrella loops
+    ``range(4, min(num_heads, 12))`` so this is a no-op when
+    ``num_heads <= 4``. DSL Wave W7 selects this fragment at IR-build
+    time on ``num_heads > 4`` -- byte-identical with always-emitting
+    (the body's range is empty below the threshold) but the gate keeps
+    the IR's runtime-shape intent ("these are heads 4+ blocker rows")
+    visible at the builder site.
     """
     mem_i = 4
     for head in range(4, min(getattr(attn, "num_heads", 4), 12)):
@@ -1457,8 +1489,10 @@ def _suppress_l15_lookup_pop_d8_head_9(attn, BD, HD) -> None:
     head 0.
 
     Wipes head 9's full Q/K/V/O bands first, then writes the pop_d8
-    lookup row. Carried as a :class:`RuntimeAttentionFragment` gated on
-    ``attn.num_heads > 9`` in ``layer15_memory_lookup``'s CompilerIR.
+    lookup row. Carried as a :class:`RuntimeAttentionFragment` in
+    ``layer15_memory_lookup``'s CompilerIR; DSL Wave W7 selects it at
+    IR-build time on ``num_heads > 9`` rather than via a runtime
+    predicate.
     """
     head = 9
     base = head * HD
@@ -1518,13 +1552,16 @@ def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
 
     Phase 7.C.2 split this umbrella into three runtime-shape pieces so
     the ``layer15_memory_lookup`` op carries them as
-    :class:`RuntimeAttentionFragment` entries in its CompilerIR:
+    :class:`RuntimeAttentionFragment` entries in its CompilerIR. DSL
+    Wave W7 (current) moves the shape gating into compile-time
+    Python ``if`` branches inside :func:`_layer15_memory_lookup_ir`,
+    parameterized on ``num_heads``:
 
     * :func:`_suppress_l15_lookup_heads_0_3` — always emits.
     * :func:`_suppress_l15_lookup_lev_blockers_4_11` — emits when
-      ``attn.num_heads >= 12`` (LEV build only).
+      ``num_heads > 4`` (the LEV-blocker rows live on heads 4+).
     * :func:`_suppress_l15_lookup_pop_d8_head_9` — emits when
-      ``attn.num_heads > 9`` (covers the 14-head LEV build).
+      ``num_heads > 9`` (the head-9 pop_d8 rewrite).
 
     Kept as a single legacy entry point for the other callers
     (``vm_step._set_layer15_memory_lookup`` and
