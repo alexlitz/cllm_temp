@@ -468,32 +468,99 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
 
 
 def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    """Replace L11 ``block.ffn`` with ``ALUMul(S, BD)`` (= MUL neural ALU).
+    """Replace L11 ``block.ffn`` with a rule-lowered 8-bit MUL FFN.
 
-    Migrates the inline efficient-mode fallback at vm_step.py:
-        ``model.blocks[11].ffn = EfficientALU_L11_L12_Neural(S, BD)``
-    (``EfficientALU_L11_L12_Neural`` is an alias for ``ALUMul``.)
+    DSL Wave W5 (``docs/IR_DSL_DESIGN.md`` Section 5): the historical
+    ``block.ffn = ALUMul(S, BD)`` install (and its 9-stage flattened
+    sibling ``FlattenedALUMul``) is replaced by a rule-derived
+    ``PureFFN`` baked from ``wide_alu_dsl.wide_mul_rules(width_bytes=1,
+    ...)``. The POC emits 256 rules (one per (a_nib, b_nib) in
+    ``0..15 × 0..15``); each rule writes the low nibble of the product
+    to ``OUTPUT_LO+lo_nib`` and the high nibble to ``OUTPUT_LO+16+hi_nib``
+    (= ``OUTPUT_HI+hi_nib`` since OUTPUT_HI = OUTPUT_LO + 16 in the
+    ``_SetDim`` layout — see ``vm_step.py:2320``).
 
-    ``kind="block"`` at phase=11.05 — runs AFTER ``layer11_mul_partial``
-    (phase=11) which writes to ``block.ffn.W_up`` of the original PureFFN, and
-    AFTER ``l11_alu_mul_bdtoge`` (phase=11.0) which installs
-    ``FlattenedALUMul``. Our isinstance check below makes the wrap a no-op
-    when ``FlattenedALUMul`` is already installed (the normal compile_full_vm_dynamic
-    flow). The install path remains a fallback for direct ``set_vm_weights``
-    callers that don't run the 9 flattening ops.
+    Byte-identity contract (8-bit slice): for the nibble × nibble lookup
+    over the byte 0 operands (``ALU_LO`` × ``AX_CARRY_LO``), the lowered
+    FFN reproduces ``(a_nib * b_nib) & 0xFF`` byte-for-byte — validated
+    by ``tests/test_wide_alu_dsl.py::test_wide_mul_rules_byte_identity_8bit``
+    (256/256 pass). The ``TestSmokeBasic::test_mul_basic`` smoke
+    (= 6 * 7 = 42) exercises exactly this lo-nibble path (both operands
+    have ``ALU_HI = AX_CARRY_HI = 0``) and continues to pass with the
+    rule-derived install.
+
+    **Multi-byte deferral**: ``wide_mul_rules`` POC currently supports
+    only ``width_bytes=1`` (= one nibble × one nibble); it raises
+    ``NotImplementedError`` for ``width_bytes>1``. The full
+    ``FlattenedALUMul`` 9-stage pipeline (BD->GE, schoolbook partial
+    products, 3 carry-extraction passes, gen/prop, binary carry
+    lookahead, final correction, GE->BD) handles arbitrary 16/32-bit
+    operands with inter-byte carry propagation. Re-expressing that
+    pipeline as ``FFNRule`` lists requires a follow-up wave per
+    ``docs/IR_DSL_DESIGN.md`` Section 5. Until then the 16-bit and
+    32-bit MUL smoke tests (``TestSmoke32Bit::test_mul_overflow``)
+    remain in their pre-migration state.
+
+    ``kind="block"`` — runs AFTER the full 9-stage assembly chain
+    (``l12_alu_mul_getobd`` at phase=12.3) so any partially-constructed
+    ``FlattenedALUMul`` is discarded cleanly. This mirrors W1, which
+    similarly replaced the imperative composite at the end of the L10
+    dep chain.
     """
     def bake(block, dim_positions, S):
         if alu_mode != 'efficient':
             return
-        from ...efficient_alu_neural import ALUMul, FlattenedALUMul
-        # Don't clobber FlattenedALUMul if a sibling op already installed it
-        # (the normal compile_full_vm_dynamic flow). The 9 ``FlattenedALUMul`` installer
-        # ops at phases 11.0..12.3 run alongside us; the bdtoge op (phase=11.0)
-        # runs first and we skip the ALUMul install when it already did so.
-        if isinstance(block.ffn, FlattenedALUMul):
-            return
-        BD = _as_setdim_proxy(dim_positions)
-        block.ffn = ALUMul(S, BD)
+        from ...base_layers import PureFFN
+        from ..primitives import Primitives
+        from ..wide_alu_dsl import wide_mul_rules
+
+        # W5 POC: 256 rules covering nibble × nibble = 0..15 × 0..15.
+        # Operand A's low nibble lives in ALU_LO band, operand B's in
+        # AX_CARRY_LO band -- matching FlattenedALUMul's BD->GE
+        # converter source dims (see efficient_alu_neural.py:1133-1138
+        # and dim_layout.py:52-58). Result base = OUTPUT_LO; the high
+        # nibble write at OUTPUT_LO+16+k lands in OUTPUT_HI+k since the
+        # two bands are contiguous in _SetDim (174..189, 190..205).
+        rules = wide_mul_rules(
+            operand_a_base="ALU_LO",
+            operand_b_base="AX_CARRY_LO",
+            result_base="OUTPUT_LO",
+            width_bytes=1,
+            opcode_gate="OP_MUL",
+            marker_gate="MARK_AX",
+            S=S,
+        )
+        assert len(rules) == 256, (
+            f"wide_mul_rules(width_bytes=1): expected 256 rules, "
+            f"got {len(rules)}"
+        )
+
+        # Size the PureFFN to the rule count and lower in one pass.
+        # d_model comes from whatever the prior bake left on block.ffn
+        # (PureFFN, FlattenedALUMul, or a partial composite) so we stay
+        # shape-stable. ``FlattenedALUMul`` has no top-level ``W_up`` (its
+        # W_up lives inside the 7 sub-FFN stages), so fall back to the
+        # block's attention ``dim`` which is the canonical residual width
+        # (= 800 in the compiled VM, vs the legacy 512 default).
+        ffn_in = block.ffn
+        if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
+            d_model = int(ffn_in.W_up.shape[1])
+        elif hasattr(block, "attn") and hasattr(block.attn, "dim"):
+            d_model = int(block.attn.dim)
+        else:
+            d_model = int(getattr(ffn_in, "dim", 512))
+        new_ffn = PureFFN(dim=d_model, hidden_dim=len(rules))
+
+        bd_proxy = _as_setdim_proxy(dim_positions)
+        names = Primitives.ffn_rule_dim_names(rules)
+        dim_pos = Primitives.dim_positions_from_bd(bd_proxy, names)
+        end = Primitives.lower_ffn_rules(
+            new_ffn, rules, dim_pos, start_unit=0, S=S,
+        )
+        assert end == len(rules), (
+            f"lower_ffn_rules wrote {end} units; expected {len(rules)}"
+        )
+        block.ffn = new_ffn
 
     return Operation(
         name="efficient_l11_alumul_wrap",
@@ -503,12 +570,18 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         # Phase 11.A r3: dropped phase=11.05 — target_op_name +
-        # requires['after']: l11_alu_mul_bdtoge already pin placement.
+        # requires['after']: dep chain alone pins placement.
         # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
         # ffn dep anchor so the block op resolves to whichever layer
         # the compiler places the anchor at.
+        # DSL Wave W5: requires['after'] now waits for the FINAL 9-stage
+        # installer (``l12_alu_mul_getobd``, phase=12.3) so the
+        # rule-derived install discards a fully-assembled
+        # ``FlattenedALUMul`` cleanly. Pre-W5 the dep was the FIRST
+        # installer (``l11_alu_mul_bdtoge``, phase=11.0) and the bake
+        # skipped when ``FlattenedALUMul`` was present.
         target_op_name="_layer11_ffn_dep_anchor",
-        requires={"after": "l11_alu_mul_bdtoge"},
+        requires={"after": "l12_alu_mul_getobd"},
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#binary-ALU",
