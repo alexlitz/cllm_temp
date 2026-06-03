@@ -31,6 +31,7 @@ from neural_vm.unified_compiler.wide_alu_dsl import (  # noqa: E402
     bitwise_rules,
     wide_add_rules,
     wide_shift_rules,
+    wide_sub_rules,
 )
 from neural_vm.vm_step import _SetDim  # noqa: E402
 
@@ -543,5 +544,127 @@ def test_wide_shift_rules_byte_identity_randomized(lowered_shift_ffns):
 
     assert not mismatches, (
         f"Byte-identity failures ({len(mismatches)}/{2 * n_trials}):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave W3: wide_sub_rules byte-identity test (one byte / one nibble lane).
+# ---------------------------------------------------------------------------
+
+
+def _build_wide_sub_rules_one_byte(S: float = 100.0):
+    """Construct the 256-rule per-byte SUB lookup for width_bytes=1.
+
+    Same band-wiring convention as the wide_add POC: operand A (minuend)
+    on ``ALU_LO``, operand B (subtrahend) on ``AX_CARRY_LO``, result on
+    ``OUTPUT_LO``, borrow on ``CARRY``. Opcode gate is ``OP_SUB``;
+    marker is ``MARK_AX``.
+    """
+    return wide_sub_rules(
+        operand_a_base="ALU_LO",
+        operand_b_base="AX_CARRY_LO",
+        result_base="OUTPUT_LO",
+        borrow_base="CARRY",
+        width_bytes=1,
+        opcode_gate="OP_SUB",
+        marker_gate="MARK_AX",
+        S=S,
+    )
+
+
+def _lowered_pureffn_for_wide_sub(S: float = 100.0) -> PureFFN:
+    """Lower the width_bytes=1 wide_sub rules into a PureFFN."""
+    rules = _build_wide_sub_rules_one_byte(S=S)
+    assert len(rules) == 256, (
+        f"wide_sub_rules(width_bytes=1) emitted {len(rules)} rules, "
+        f"expected 256"
+    )
+    ffn = PureFFN(dim=512, hidden_dim=256)
+    names = Primitives.ffn_rule_dim_names(rules)
+    dim_positions = Primitives.dim_positions_from_bd(_SetDim, names)
+    end = Primitives.lower_ffn_rules(
+        ffn, rules, dim_positions, start_unit=0, S=S,
+    )
+    assert end == 256, f"lower_ffn_rules wrote {end} units, expected 256"
+    return ffn
+
+
+def _make_sub_input(*, a_nib: int, b_nib: int) -> torch.Tensor:
+    """One-position residual at MARK_AX with operand A/B nibbles + OP_SUB.
+
+    Layout mirrors ``_make_add_input``: ALU_LO carries operand A (minuend)
+    nibble, AX_CARRY_LO carries operand B (subtrahend) nibble. CARRY
+    (borrow_base) is left zero — no incoming borrow for byte 0.
+    """
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, _SetDim.MARK_AX] = 1.0
+    x[0, 0, _SetDim.CONST] = 1.0
+    x[0, 0, _SetDim.OP_SUB] = 1.0
+    x[0, 0, _SetDim.ALU_LO + (a_nib & 0xF)] = 1.0
+    x[0, 0, _SetDim.AX_CARRY_LO + (b_nib & 0xF)] = 1.0
+    return x
+
+
+def _decode_sub_output(y: torch.Tensor) -> tuple[int, int]:
+    """Return ``(diff_nib, borrow_out)`` decoded from the lowered FFN's
+    residual output for byte 0.
+
+    ``diff_nib`` is the argmax over ``OUTPUT_LO[0:16]``; ``borrow_out``
+    is 1 iff the borrow dim at byte 0 (``CARRY+0`` = ``CARRY``) exceeds a
+    small threshold (lookup-mode amplitude is ``2.0 / S``, 0.02 for
+    S=100, well above zero).
+    """
+    diff_nib = int(
+        y[0, 0, _SetDim.OUTPUT_LO:_SetDim.OUTPUT_LO + 16].argmax().item()
+    )
+    borrow_out = int(y[0, 0, _SetDim.CARRY].item() > 0.005)
+    return diff_nib, borrow_out
+
+
+@pytest.fixture(scope="module")
+def lowered_sub_ffn() -> PureFFN:
+    return _lowered_pureffn_for_wide_sub()
+
+
+def test_wide_sub_rules_emit_expected_unit_count():
+    """Sanity: width_bytes=1 emits exactly 256 diff rules (no borrow-in
+    relay since byte 0 has no borrow predecessor).
+    """
+    rules = _build_wide_sub_rules_one_byte()
+    assert len(rules) == 256
+
+
+def test_wide_sub_rules_byte_identity_one_byte(lowered_sub_ffn):
+    """Lowered ``wide_sub_rules(width_bytes=1)`` matches Python's
+    nibble-sub for every (a, b) in 0..15 × 0..15.
+
+    The DSL's per-byte abstraction treats each "byte" as one 4-bit
+    nibble, so this is the byte-0 identity contract for an 8-bit sub
+    (byte 0 = low nibble of an 8-bit value). Concretely:
+
+      * diff_nib_out == (a - b) & 0xF
+      * borrow_out   == 1 iff a < b   (i.e. (a - b) < 0)
+    """
+    mismatches = []
+    for a in range(16):
+        for b in range(16):
+            x = _make_sub_input(a_nib=a, b_nib=b)
+            with torch.no_grad():
+                y = lowered_sub_ffn(x)
+            diff_nib, borrow_out = _decode_sub_output(y)
+
+            expected_diff = (a - b) & 0xF
+            expected_borrow = 1 if a < b else 0
+            if diff_nib != expected_diff or borrow_out != expected_borrow:
+                mismatches.append(
+                    f"a=0x{a:X} b=0x{b:X}: "
+                    f"expected diff=0x{expected_diff:X} "
+                    f"borrow={expected_borrow} "
+                    f"got diff=0x{diff_nib:X} borrow={borrow_out}"
+                )
+
+    assert not mismatches, (
+        f"wide_sub byte-identity failures ({len(mismatches)}/256):\n  "
         + "\n  ".join(mismatches[:10])
     )

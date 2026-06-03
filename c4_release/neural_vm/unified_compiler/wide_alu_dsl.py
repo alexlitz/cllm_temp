@@ -320,33 +320,171 @@ def wide_sub_rules(
     marker_gate: str,
     S: float,
 ) -> Tuple[FFNRule, ...]:
-    """Generate FFNRule list for wide multi-byte SUB with borrow.
+    """Generate FFNRule list for wide multi-byte SUB with borrow propagation.
 
-    Stub for Wave W3 (same composite as ``wide_add_rules`` — they share
-    the ``AddSub5StageBlock`` pipeline; only the per-nibble arithmetic and
-    the carry-vs-borrow polarity differ).
+    Per-byte nibble-sub lookup table (Wave W3 — AddSub5StageBlock
+    migration, SUB half). Mirror of :func:`wide_add_rules`; only the
+    per-nibble arithmetic and the carry-vs-borrow polarity differ. Each
+    "byte" in this DSL slice is a single 4-bit nibble:
+    ``operand_a_base+(b*16+k)`` is the one-hot at nibble ``k`` for byte
+    ``b``. Wider operands stack bytes contiguously in the residual.
+
+    For each byte ``b`` in ``0..width_bytes-1`` and each nibble pair
+    ``(a_nib, b_nib)`` in ``0..15 × 0..15``:
+
+      * diff_nib   = (a_nib - b_nib - borrow_in) & 0xF
+      * borrow_out = (a_nib - b_nib - borrow_in) < 0
+
+    Byte 0 has no borrow-in, so it emits 256 rules (one per (a, b)).
+
+    Byte ``b > 0`` emits 256 + 256 = 512 rules — one set for
+    borrow_in = 0 (suppressed by a negative weight on ``borrow_base+(b-1)``)
+    and one set for borrow_in = 1 (positively conditioned on
+    ``borrow_base+(b-1)``). Each byte ``b > 0`` also emits one borrow-in
+    relay rule (single unit) that copies ``borrow_base+(b-1)`` forward as
+    a verification probe, matching the spec's "single borrow_in detection
+    rule for byte > 0".
+
+    Rule mechanics (lookup mode, same shape as :func:`wide_add_rules`):
+
+      * Borrow-in = 0, byte 0:
+          marker(+40) + a(+30) + b(+30) > 80 → diff + borrow_out write.
+      * Borrow-in = 0, byte > 0:
+          marker(+40) + a(+30) + b(+30) + borrow_dim(-50) > 80.
+          With borrow set, total = 50 < 80 → blocked.
+      * Borrow-in = 1, byte > 0:
+          marker(+40) + a(+30) + b(+30) + borrow_dim(+30) > 120.
+          All four required; without borrow, total = 100 < 120 → blocked.
+
+    Output writes use the standard ``2.0 / S`` lookup-mode amplitude to
+    ``result_base+(b*16+diff_nib)``. When ``borrow_out`` is true the rule
+    also writes ``2.0 / S`` to ``borrow_base+b`` so the next byte's
+    borrow-in is set.
 
     Args:
-        operand_a_base: dim base for operand A (minuend).
-        operand_b_base: dim base for operand B (subtrahend).
-        result_base: dim base for the result per-byte bands.
-        borrow_base: dim base for the inter-byte borrow cascade.
-        width_bytes: number of bytes in the wide operation.
-        opcode_gate: dim ref for the ``SUB`` opcode flag.
-        marker_gate: dim name for the AX-style marker.
-        S: SwiGLU scale.
+        operand_a_base: residual dim base for operand A (minuend) per-byte
+            nibble bands. Rule reads ``operand_a_base+(b*16+a_nib)``.
+        operand_b_base: dim base for operand B (subtrahend) per-byte
+            nibble bands.
+        result_base: dim base for the result per-byte nibble bands
+            (e.g. ``"OUTPUT_LO"``).
+        borrow_base: dim base for the inter-byte borrow cascade. Rule
+            writes ``borrow_base+b`` on borrow-out and reads
+            ``borrow_base+(b-1)`` for borrow-in (byte > 0 only).
+        width_bytes: number of nibble-wide bytes in the wide SUB.
+        opcode_gate: dim ref for the ``SUB`` opcode flag (e.g.
+            ``"OP_SUB"``).
+        marker_gate: dim name for the AX-style marker (e.g. ``"MARK_AX"``).
+        S: SwiGLU scale (typically 100.0).
 
     Returns:
-        Stub raises ``NotImplementedError`` (W3 pending).
+        ``tuple[FFNRule, ...]`` of length
+        ``256 + (width_bytes - 1) * (512 + 1)`` — 256 diff rules for byte
+        0 plus 512 diff rules and 1 borrow-relay rule per subsequent byte.
     """
-    del (
-        operand_a_base, operand_b_base, result_base, borrow_base,
-        width_bytes, opcode_gate, marker_gate, S,
-    )
-    raise NotImplementedError(
-        "wide_sub_rules: Wave W3 not implemented. "
-        "Tracked under ``docs/IR_DSL_DESIGN.md`` Section 5 — AddSub migration."
-    )
+    if width_bytes < 1:
+        raise ValueError(
+            f"wide_sub_rules: width_bytes must be >= 1; got {width_bytes!r}"
+        )
+
+    rules: list[FFNRule] = []
+    write_amplitude = 2.0 / S
+
+    for b in range(width_bytes):
+        a_band = operand_a_base
+        b_band = operand_b_base
+        # borrow_in possibilities for this byte
+        if b == 0:
+            borrow_in_cases = (0,)
+        else:
+            borrow_in_cases = (0, 1)
+
+        for borrow_in in borrow_in_cases:
+            for a_nib in range(16):
+                for b_nib in range(16):
+                    raw = a_nib - b_nib - borrow_in
+                    diff_nib = raw & 0xF
+                    borrow_out = raw < 0
+
+                    writes: list[Tuple[str, float]] = [
+                        (
+                            f"{result_base}+{b * 16 + diff_nib}",
+                            write_amplitude,
+                        ),
+                    ]
+                    if borrow_out:
+                        writes.append(
+                            (f"{borrow_base}+{b}", write_amplitude)
+                        )
+
+                    if b == 0:
+                        # No borrow-in dim. Standard 3-way AND
+                        # (marker, a, b) > 80.
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{b * 16 + a_nib}", 30.0),
+                            (f"{b_band}+{b * 16 + b_nib}", 30.0),
+                        )
+                        threshold = 80.0
+                    elif borrow_in == 0:
+                        # Suppress when borrow-in dim is active.
+                        # marker(40) + a(30) + b(30) - borrow(50) > 80
+                        # → 100 > 80 fires without borrow, 50 < 80 with.
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{b * 16 + a_nib}", 30.0),
+                            (f"{b_band}+{b * 16 + b_nib}", 30.0),
+                            (f"{borrow_base}+{b - 1}", -50.0),
+                        )
+                        threshold = 80.0
+                    else:
+                        # borrow_in == 1: require borrow dim positively.
+                        # marker(40) + a(30) + b(30) + borrow(30) > 120
+                        # → 130 > 120 fires only if all four set.
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{b * 16 + a_nib}", 30.0),
+                            (f"{b_band}+{b * 16 + b_nib}", 30.0),
+                            (f"{borrow_base}+{b - 1}", 30.0),
+                        )
+                        threshold = 120.0
+
+                    rules.append(FFNRule.gated_write(
+                        name=(
+                            f"wide_sub_b{b}_bin{borrow_in}_"
+                            f"a{a_nib:x}_b{b_nib:x}"
+                        ),
+                        conditions=conditions,
+                        threshold=threshold,
+                        gate=opcode_gate,
+                        gate_weight=1.0,
+                        gate_bias=0.0,
+                        writes=tuple(writes),
+                    ))
+
+        # Single borrow-in detection / relay rule for byte > 0. Probes
+        # the prior byte's borrow-out (no residual write — it is a
+        # standalone observable unit that the validator can check). The
+        # write is intentionally a self-relay back to
+        # ``borrow_base+(b-1)`` at the same amplitude so the borrow
+        # cascade is bit-stable across repeated lowerings.
+        if b > 0:
+            rules.append(FFNRule.gated_write(
+                name=f"wide_sub_b{b}_borrow_in_detect",
+                conditions=(
+                    (marker_gate, 40.0),
+                    (f"{borrow_base}+{b - 1}", 60.0),
+                ),
+                threshold=80.0,
+                gate=opcode_gate,
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=(
+                    (f"{borrow_base}+{b - 1}", 0.0),
+                ),
+            ))
+
+    return tuple(rules)
 
 
 # ---------------------------------------------------------------------------
