@@ -291,6 +291,46 @@ def test_multi_way_and_rule_rejects_empty_conditions():
         multi_way_and_rule(conditions=(), writes=(("OUT", 1.0),))
 
 
+def test_multi_way_and_rule_passes_non_zero_gate_bias_through():
+    """Non-zero ``gate_bias`` reaches the underlying FFNRule.
+
+    Used by L9 patterns like ``_layer9_bp_plus8_shift`` (gate_bias=-2.5)
+    and ``_layer9_addr_b1_set_and_cascade`` (gate_bias=-15.0).
+    """
+    rule = multi_way_and_rule(
+        conditions=(("A", 1.0),),
+        threshold=0.5,
+        writes=(("OUT+0", 0.02),),
+        gate="G",
+        gate_weight=5.0,
+        gate_bias=-3.0,
+        name="bias_test",
+    )
+    assert rule.gate is not None
+    assert rule.gate_weight == 5.0
+    assert rule.gate_bias == -3.0
+
+
+def test_multi_way_and_rule_default_gate_bias_is_zero_with_gate():
+    rule = multi_way_and_rule(
+        conditions=(("A", 1.0),),
+        threshold=0.5,
+        writes=(("OUT+0", 0.02),),
+        gate="G",
+    )
+    assert rule.gate_bias == 0.0
+
+
+def test_multi_way_and_rule_default_gate_bias_is_one_without_gate():
+    rule = multi_way_and_rule(
+        conditions=(("A", 1.0),),
+        threshold=0.5,
+        writes=(("OUT+0", 0.02),),
+    )
+    # constant_write path; gate_bias defaults to 1.0
+    assert rule.gate_bias == 1.0
+
+
 # ===========================================================================
 # multi_way_or_rules
 # ===========================================================================

@@ -78,13 +78,19 @@ def _build_rule(
     gate: Optional[str],
     gate_terms: Sequence[Tuple[str, float]],
     gate_weight: float = 1.0,
+    gate_bias: Optional[float] = None,
     name: Optional[str],
     scope: Optional[str],
     dominates_at: Optional[Mapping[str, str]] = None,
 ) -> FFNRule:
     """Dispatch to ``FFNRule.constant_write`` or ``gated_write`` depending
-    on whether a gate is supplied. Keeps the gate_bias convention
-    consistent (1.0 for constant_write, 0.0 for gated_write).
+    on whether a gate is supplied.
+
+    ``gate_bias`` default behavior (``None``): 1.0 for constant_write
+    path (no gate), 0.0 for gated_write path. Pass explicit value to
+    override — needed for patterns with non-zero gate bias (e.g.
+    ``gate_bias=-2.5`` for L9 BP+8 shift, ``gate_bias=-15.0`` for L9
+    addr_b1 cascade).
     """
     if gate is None and not gate_terms:
         return FFNRule.constant_write(
@@ -102,7 +108,7 @@ def _build_rule(
         gate=gate,
         gate_weight=gate_weight,
         gate_terms=tuple(gate_terms),
-        gate_bias=0.0,
+        gate_bias=0.0 if gate_bias is None else float(gate_bias),
         writes=tuple(writes),
         scope=scope,
         dominates_at=dominates_at,
@@ -288,6 +294,7 @@ def multi_way_and_rule(
     gate: Optional[str] = None,
     gate_terms: Sequence[Tuple[str, float]] = (),
     gate_weight: float = 1.0,
+    gate_bias: Optional[float] = None,
     threshold: Optional[float] = None,
     name: Optional[str] = None,
     scope: Optional[str] = None,
@@ -307,6 +314,10 @@ def multi_way_and_rule(
         conditions: list of ``(dim_name, weight)`` tuples.
         writes: list of ``(dim_name, weight)`` output writes.
         gate / gate_terms / gate_weight: optional multiplicative gate.
+        gate_bias: explicit gate bias; if ``None``, defaults to 1.0
+            without a gate and 0.0 with one. Non-zero values are
+            common in negative-bias gating (e.g. ``-2.5`` for L9
+            BP+8 shift, ``-15.0`` for L9 addr_b1 cascade).
         threshold: explicit threshold; derived if ``None``.
         name / scope / dominates_at: passed through to FFNRule.
 
@@ -339,6 +350,7 @@ def multi_way_and_rule(
         gate=gate,
         gate_terms=tuple(gate_terms),
         gate_weight=gate_weight,
+        gate_bias=gate_bias,
         name=name,
         scope=scope,
         dominates_at=dominates_at,
