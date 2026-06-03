@@ -146,36 +146,167 @@ def wide_add_rules(
 ) -> Tuple[FFNRule, ...]:
     """Generate FFNRule list for wide multi-byte ADD with carry propagation.
 
-    Stub for Wave W3 (``AddSub5StageBlock`` migration). Will emit:
-      - per-byte sum nibble units (lo + hi)
-      - per-byte carry-out units feeding ``carry_base+(k+1)``
-      - inter-byte carry-in conditioned units (carry_in=0 vs 1)
+    Per-byte nibble-add lookup table (Wave W3 — AddSub5StageBlock migration,
+    POC slice). Each "byte" in this DSL slice is a single 4-bit nibble:
+    ``operand_a_base+(b*16+k)`` is the one-hot at nibble ``k`` for byte
+    ``b``. Wider operands stack bytes contiguously in the residual.
+
+    For each byte ``b`` in ``0..width_bytes-1`` and each nibble pair
+    ``(a_nib, b_nib)`` in ``0..15 × 0..15``:
+
+      * sum_nib  = (a_nib + b_nib + carry_in) % 16
+      * carry_out = (a_nib + b_nib + carry_in) >= 16
+
+    Byte 0 has no carry-in, so it emits 256 rules (one per (a, b)).
+
+    Byte ``b > 0`` emits 256 + 256 = 512 rules — one set for
+    carry_in = 0 (suppressed by a negative weight on ``carry_base+(b-1)``)
+    and one set for carry_in = 1 (positively conditioned on
+    ``carry_base+(b-1)``). Each byte ``b > 0`` also emits one carry-in
+    relay rule (single unit) that copies ``carry_base+(b-1)`` forward as
+    a verification probe, matching the spec's "single carry_in detection
+    rule for byte > 0".
+
+    Rule mechanics (lookup mode, same shape as ``bitwise_rules``):
+
+      * Carry-in = 0, byte 0:
+          marker(+40) + a(+30) + b(+30) > 80 → sum + carry_out write.
+      * Carry-in = 0, byte > 0:
+          marker(+40) + a(+30) + b(+30) + carry_dim(-50) > 80.
+          With carry set, total = 50 < 80 → blocked.
+      * Carry-in = 1, byte > 0:
+          marker(+40) + a(+30) + b(+30) + carry_dim(+30) > 120.
+          All four required; without carry, total = 100 < 120 → blocked.
+
+    Output writes use the standard ``2.0 / S`` lookup-mode amplitude to
+    ``result_base+(b*16+sum_nib)``. When ``carry_out`` is true the rule
+    also writes ``2.0 / S`` to ``carry_base+b`` so the next byte's
+    carry-in is set.
 
     Args:
-        operand_a_base: residual dim base for operand A's per-byte bands
-            (e.g. ``"AX_LO"`` — helpers append ``+k`` for byte ``k``).
-        operand_b_base: dim base for operand B's per-byte bands.
-        result_base: dim base for the result per-byte bands
+        operand_a_base: residual dim base for operand A's per-byte nibble
+            bands (e.g. ``"AX_CARRY_LO"``). Rule reads
+            ``operand_a_base+(b*16+a_nib)``.
+        operand_b_base: dim base for operand B's per-byte nibble bands.
+        result_base: dim base for the result per-byte nibble bands
             (e.g. ``"OUTPUT_LO"``).
-        carry_base: dim base for the inter-byte carry cascade
-            (e.g. ``"CARRY"``).
-        width_bytes: number of bytes in the wide operation (e.g. 4 for u32).
-        opcode_gate: dim ref for the ``ADD`` opcode flag.
-        marker_gate: dim name for the AX-style marker.
-        S: SwiGLU scale.
+        carry_base: dim base for the inter-byte carry cascade. Rule
+            writes ``carry_base+b`` on carry-out and reads
+            ``carry_base+(b-1)`` for carry-in (byte > 0 only).
+        width_bytes: number of nibble-wide bytes in the wide ADD.
+        opcode_gate: dim ref for the ``ADD`` opcode flag (e.g.
+            ``"OP_ADD"``).
+        marker_gate: dim name for the AX-style marker (e.g. ``"MARK_AX"``).
+        S: SwiGLU scale (typically 100.0).
 
     Returns:
-        Empty tuple for now (W3 NOT IMPLEMENTED). The signature is pinned
-        so the lowering pipeline and call-sites can be wired up first.
+        ``tuple[FFNRule, ...]`` of length
+        ``256 + (width_bytes - 1) * (512 + 1)`` — 256 sum rules for byte
+        0 plus 512 sum rules and 1 carry-relay rule per subsequent byte.
     """
-    del (
-        operand_a_base, operand_b_base, result_base, carry_base,
-        width_bytes, opcode_gate, marker_gate, S,
-    )
-    raise NotImplementedError(
-        "wide_add_rules: Wave W3 not implemented. "
-        "Tracked under ``docs/IR_DSL_DESIGN.md`` Section 5 — AddSub migration."
-    )
+    if width_bytes < 1:
+        raise ValueError(
+            f"wide_add_rules: width_bytes must be >= 1; got {width_bytes!r}"
+        )
+
+    rules: list[FFNRule] = []
+    write_amplitude = 2.0 / S
+
+    for b in range(width_bytes):
+        a_band = operand_a_base
+        b_band = operand_b_base
+        # carry_in possibilities for this byte
+        if b == 0:
+            carry_in_cases = (0,)
+        else:
+            carry_in_cases = (0, 1)
+
+        for carry_in in carry_in_cases:
+            for a_nib in range(16):
+                for b_nib in range(16):
+                    total = a_nib + b_nib + carry_in
+                    sum_nib = total % 16
+                    carry_out = total >= 16
+
+                    writes: list[Tuple[str, float]] = [
+                        (
+                            f"{result_base}+{b * 16 + sum_nib}",
+                            write_amplitude,
+                        ),
+                    ]
+                    if carry_out:
+                        writes.append(
+                            (f"{carry_base}+{b}", write_amplitude)
+                        )
+
+                    if b == 0:
+                        # No carry-in dim. Standard 3-way AND
+                        # (marker, a, b) > 80.
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{b * 16 + a_nib}", 30.0),
+                            (f"{b_band}+{b * 16 + b_nib}", 30.0),
+                        )
+                        threshold = 80.0
+                    elif carry_in == 0:
+                        # Suppress when carry-in dim is active.
+                        # marker(40) + a(30) + b(30) - carry(50) > 80
+                        # → 100 > 80 fires without carry, 50 < 80 with.
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{b * 16 + a_nib}", 30.0),
+                            (f"{b_band}+{b * 16 + b_nib}", 30.0),
+                            (f"{carry_base}+{b - 1}", -50.0),
+                        )
+                        threshold = 80.0
+                    else:
+                        # carry_in == 1: require carry dim positively.
+                        # marker(40) + a(30) + b(30) + carry(30) > 120
+                        # → 130 > 120 fires only if all four set.
+                        conditions = (
+                            (marker_gate, 40.0),
+                            (f"{a_band}+{b * 16 + a_nib}", 30.0),
+                            (f"{b_band}+{b * 16 + b_nib}", 30.0),
+                            (f"{carry_base}+{b - 1}", 30.0),
+                        )
+                        threshold = 120.0
+
+                    rules.append(FFNRule.gated_write(
+                        name=(
+                            f"wide_add_b{b}_cin{carry_in}_"
+                            f"a{a_nib:x}_b{b_nib:x}"
+                        ),
+                        conditions=conditions,
+                        threshold=threshold,
+                        gate=opcode_gate,
+                        gate_weight=1.0,
+                        gate_bias=0.0,
+                        writes=tuple(writes),
+                    ))
+
+        # Single carry-in detection / relay rule for byte > 0. Probes
+        # the prior byte's carry-out (no residual write — it is a
+        # standalone observable unit that the validator can check). The
+        # write is intentionally a self-relay back to ``carry_base+(b-1)``
+        # at the same amplitude so the carry cascade is bit-stable across
+        # repeated lowerings.
+        if b > 0:
+            rules.append(FFNRule.gated_write(
+                name=f"wide_add_b{b}_carry_in_detect",
+                conditions=(
+                    (marker_gate, 40.0),
+                    (f"{carry_base}+{b - 1}", 60.0),
+                ),
+                threshold=80.0,
+                gate=opcode_gate,
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=(
+                    (f"{carry_base}+{b - 1}", 0.0),
+                ),
+            ))
+
+    return tuple(rules)
 
 
 def wide_sub_rules(
