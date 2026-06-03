@@ -755,7 +755,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             # neural=None failures from wide-ALU triage 2026-06-01.
             ("OP_ENT", -1_000_000.0),
             ("OP_LEV", -1_000_000.0),
-            ("OP_IMM", -1_000_000.0),
+            # Strengthened from -1M to -1e9 because IMM at MARK_AX attenuates
+            # to ~1e-3 via upstream broadcast, so -1M × 1e-3 = -1000 was
+            # insufficient to block. -1e9 × 1e-3 = -1e6 dominates the +5
+            # positive signal sum. See EDGE_POW2_OP_IMM_LEAK.md.
+            ("OP_IMM", -1e9),
         ),
         threshold=8.5,
         writes=Primitives.byte_value_writes(0xE0, strength=200_000.0),

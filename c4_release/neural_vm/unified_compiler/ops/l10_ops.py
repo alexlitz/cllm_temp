@@ -671,8 +671,14 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=(
                 ("MARK_AX", 1.0),
                 (f"OP_{op_name}", 1.0),
+                # MARK_PC blocker: mirror the parallel rule at line 518
+                # which has MARK_PC_BLOCK=-50 to prevent the default from
+                # firing at positions where MARK_PC leaks into MARK_AX.
+                # Without this, OUTPUT_LO+default_result clobbers legitimate
+                # AX_byte0 writes on pure-IMM steps. See IF_EQ_CMP_DEFAULT_LEAK.md.
+                ("MARK_PC", -50.0),
             ),
-            threshold=1.5,
+            threshold=2.5,
             writes=(
                 (f"OUTPUT_LO+{default_result}", 2.0 / S),
                 ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
