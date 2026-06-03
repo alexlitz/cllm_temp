@@ -22,12 +22,15 @@ On-disk cache
 -------------
 ``compile_full_vm_dynamic`` is deterministic (see ``tests/test_compile_determinism``),
 so an on-disk cache keyed on source bytes + kwargs lets pytest processes (and
-any other short-lived caller) skip the ~40-70 s bake on cache hit. The cache
-file holds the post-bake model (including the right-sized FFNs, attached
-post_ops, and any wrapper modules such as ``FlattenedALUMul`` /
-``ALUDivMod`` that the bake pipeline swaps in), so loading reproduces the
-compiled model byte-identically without re-running any bake_fn. Pass
-``disk_cache=False`` to bypass.
+any other short-lived caller) skip the ~40-70 s bake on cache hit. Each entry
+is a pair of sibling files: ``<key>.pt`` (pickled module shell with meta
+tensors + layout metadata) and ``<key>.safetensors`` (the real weights). The
+shell records the post-bake model structure (right-sized FFNs, attached
+post_ops, wrapper modules such as ``FlattenedALUMul`` / ``ALUDivMod``), and
+the safetensors file holds essentially all of the bytes and mmap-loads in
+milliseconds on the warm-disk path. Loading reproduces the compiled model
+byte-identically without re-running any bake_fn. Pass ``disk_cache=False``
+to bypass.
 """
 
 import dataclasses
@@ -251,7 +254,25 @@ def derive_layout(num_heads: int = 8):
     return layout
 
 
-_CACHE_FORMAT_VERSION = 4
+# Cache format version. Bump invalidates every entry on disk.
+#
+# v4 → v5: switched model weights serialisation from pickle (``torch.save``)
+# to ``safetensors`` for the warm-disk hit. The cache is now a two-file pair:
+#
+#   <key>.pt           — pickled shell (model with parameters/buffers swapped
+#                        to ``meta`` tensors) + layout metadata + kwargs
+#                        snapshot. Tiny (sub-MB).
+#   <key>.safetensors  — ``model.state_dict()`` written via
+#                        ``safetensors.torch.save_file``. Holds the ~830 MB of
+#                        weights; loaded via mmap so the warm hit is
+#                        sub-half-second.
+#
+# On load the shell is unpickled, then ``load_state_dict(..., assign=True)``
+# swaps the safetensors-backed real tensors back in over the meta
+# placeholders. This produces the same post-bake model the pickle path used
+# to (including FFN width / wrapper module swaps recorded in the shell's
+# class structure), without paying torch.save's pickle-based tensor IO cost.
+_CACHE_FORMAT_VERSION = 5
 
 # Operation fields that hold callables / closures captured at op-construction
 # time (typically inner functions inside the per-op factory). These are not
@@ -335,28 +356,153 @@ def _cache_key(kwargs_snapshot: dict) -> str:
     return h.hexdigest()
 
 
+def _weights_path_for(shell_path: pathlib.Path) -> pathlib.Path:
+    """Return the ``.safetensors`` sibling for a ``.pt`` shell cache path."""
+    return shell_path.with_suffix(".safetensors")
+
+
+def _dedupe_state_dict_for_safetensors(state_dict: dict):
+    """Drop aliased entries from ``state_dict`` for ``safetensors`` save.
+
+    Returns ``(deduped_state_dict, alias_map)`` where ``alias_map`` is a dict
+    ``{alias_name: keep_name}`` covering every dropped entry. ``safetensors``
+    refuses to save tensors that share storage; the compiler's wrapper
+    expansion (``_stages`` / ``pipeline`` parallel branches on the same
+    submodule) creates these shared-storage aliases for many FFN weights.
+
+    Strategy mirrors ``safetensors.torch.save_model``: group entries by
+    storage identity, pick one "keep" name per group (alphabetically first,
+    matching ``save_model``'s choice), drop the rest. The alias map is
+    persisted in the shell pickle so ``_try_load_cached`` can re-establish
+    the sharing after ``load_state_dict``.
+    """
+    from safetensors.torch import _find_shared_tensors
+
+    groups = _find_shared_tensors(state_dict)
+    alias_map: dict = {}
+    drop: set = set()
+    for group in groups:
+        names = sorted(group)
+        keep = names[0]
+        for name in names[1:]:
+            alias_map[name] = keep
+            drop.add(name)
+    deduped = {k: v for k, v in state_dict.items() if k not in drop}
+    return deduped, alias_map
+
+
+def _reshare_aliased_params(model, alias_map: dict) -> None:
+    """Re-establish shared storage between params/buffers that were deduped.
+
+    For each ``alias -> keep`` mapping, locate the underlying
+    parameter/buffer attribute on both modules and assign the alias slot to
+    reference the same tensor object as the keep slot. This restores the
+    bit-identical post-bake module graph that the old pickle path produced
+    (where the same module instance was attached to two different parent
+    paths, so both names naturally aliased the same tensor).
+    """
+    import torch as _torch
+
+    # Build a name → (module, attr_name, kind) index so we can look entries
+    # up by their dotted ``state_dict`` key. We walk the full module tree
+    # once instead of repeatedly resolving paths per alias.
+    index: dict = {}
+    for mod_name, mod in model.named_modules():
+        prefix = mod_name + "." if mod_name else ""
+        for name, p in mod._parameters.items():
+            if p is None:
+                continue
+            index[prefix + name] = (mod, name, "param")
+        for name, b in mod._buffers.items():
+            if name in mod._non_persistent_buffers_set or b is None:
+                continue
+            index[prefix + name] = (mod, name, "buffer")
+
+    for alias_name, keep_name in alias_map.items():
+        alias_entry = index.get(alias_name)
+        keep_entry = index.get(keep_name)
+        if alias_entry is None or keep_entry is None:
+            # The shell graph no longer has one of these names; skip silently
+            # rather than failing the whole load. This shouldn't happen in
+            # practice for v5+ entries but the loader is defensive.
+            continue
+        alias_mod, alias_attr, alias_kind = alias_entry
+        keep_mod, keep_attr, _keep_kind = keep_entry
+        if alias_kind == "param":
+            keep_param = keep_mod._parameters[keep_attr]
+            alias_mod._parameters[alias_attr] = keep_param
+        else:
+            alias_mod._buffers[alias_attr] = keep_mod._buffers[keep_attr]
+
+
+def _strip_module_to_meta(module) -> None:
+    """Replace a module's persistent parameters/buffers with meta tensors.
+
+    Meta tensors have shape + dtype but no storage, so they pickle in a few
+    hundred bytes regardless of original size. Non-persistent buffers (those
+    excluded from ``state_dict``) are left intact — they're not reloaded from
+    safetensors and the model needs them at runtime (e.g. compact-routing
+    index buffers).
+    """
+    import torch as _torch
+
+    for name in list(module._parameters.keys()):
+        p = module._parameters[name]
+        if p is None:
+            continue
+        module._parameters[name] = _torch.nn.Parameter(
+            _torch.empty(p.shape, dtype=p.dtype, device="meta"),
+            requires_grad=p.requires_grad,
+        )
+    for name in list(module._buffers.keys()):
+        if name in module._non_persistent_buffers_set:
+            continue
+        b = module._buffers[name]
+        if b is None:
+            continue
+        module._buffers[name] = _torch.empty(
+            b.shape, dtype=b.dtype, device="meta"
+        )
+
+
+def _strip_model_to_meta(model) -> None:
+    """Strip every submodule of ``model`` to meta tensors (in place)."""
+    for mod in model.modules():
+        _strip_module_to_meta(mod)
+
+
 def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
     """Load a cached compile from ``path``. Returns ``(model, layout)`` or None.
 
+    The cache is a pair of files:
+      - ``path`` (``.pt``): pickled shell (model with meta tensors) + layout
+        + kwargs snapshot. Tiny.
+      - ``path.with_suffix(".safetensors")``: real weights, loaded via mmap.
+
     On any load failure (missing, corrupt, key collision, version mismatch)
     returns None and the caller falls through to the recompile path. A bad
-    file is deleted so the next run won't keep tripping over it.
+    pair is deleted so the next run won't keep tripping over it.
     """
-    if not path.exists():
+    weights_path = _weights_path_for(path)
+    if not path.exists() or not weights_path.exists():
         return None
-    import torch as _torch
+    import pickle as _pickle
+    from safetensors.torch import load_file as _safetensors_load
 
     try:
-        payload = _torch.load(path, weights_only=False, map_location="cpu")
+        with open(path, "rb") as f:
+            payload = _pickle.load(f)
     except Exception as exc:
         _logger.warning(
-            "compile_full_vm_dynamic: failed to load cache %s (%s); recompiling",
+            "compile_full_vm_dynamic: failed to load cache shell %s (%s); "
+            "recompiling",
             path, exc,
         )
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        for p in (path, weights_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
         return None
 
     saved_kwargs = payload.get("kwargs_snapshot")
@@ -373,12 +519,9 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
     if payload.get("format_version") != _CACHE_FORMAT_VERSION:
         return None
 
-    # Backwards-compat guard: format v3 and earlier didn't serialise
-    # ``block_ops`` / ``ops_per_layer`` / ``model_ops`` / ``ffn_widths``, so
-    # loading would silently return a layout with empty op lists and
-    # introspecting tests (e.g. ``tests/test_addr_key_neural_decode.py``) would
-    # break. The format-version check above already invalidates those entries;
-    # this defensive check covers any future field-renaming slip-ups.
+    # Defensive: format-version mismatches are already filtered above. This
+    # guards against future renames where the shell pickle is written by a
+    # newer code path than the loader.
     required_keys = (
         "model", "d_model", "n_layers", "dim_positions", "dim_sizes",
         "ops_per_layer", "block_ops", "model_ops", "ffn_widths",
@@ -392,6 +535,54 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
             return None
 
     model = payload["model"]
+
+    try:
+        state_dict = _safetensors_load(str(weights_path), device="cpu")
+    except Exception as exc:
+        _logger.warning(
+            "compile_full_vm_dynamic: failed to load weights %s (%s); "
+            "recompiling",
+            weights_path, exc,
+        )
+        for p in (path, weights_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        return None
+
+    alias_map = payload.get("alias_map") or {}
+
+    try:
+        # ``assign=True`` replaces the model's meta-tensor placeholders with
+        # the real tensors from safetensors without any shape-coercing copy.
+        # ``strict=False`` because the safetensors file only carries the
+        # dedup'd (keep) names — the alias slots are still meta and will be
+        # rebound to the kept tensors by ``_reshare_aliased_params`` below.
+        missing, unexpected = model.load_state_dict(
+            state_dict, strict=False, assign=True
+        )
+        # Every "missing" key should be an alias we know how to re-share.
+        unaccounted = [m for m in missing if m not in alias_map]
+        if unaccounted or unexpected:
+            raise RuntimeError(
+                f"load_state_dict produced unexpected={unexpected}, "
+                f"unaccounted missing={unaccounted}"
+            )
+        _reshare_aliased_params(model, alias_map)
+    except Exception as exc:
+        _logger.warning(
+            "compile_full_vm_dynamic: load_state_dict failed for %s (%s); "
+            "recompiling",
+            path, exc,
+        )
+        for p in (path, weights_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        return None
+
     layout = ModelLayout(
         d_model=payload["d_model"],
         n_layers=payload["n_layers"],
@@ -468,12 +659,22 @@ def _evict_cache_lru(
             return evicted
 
         entries: List[tuple] = []
+        # Each cache entry is the pair (``<key>.pt``, ``<key>.safetensors``);
+        # size is the combined on-disk bytes so caps account for the real
+        # footprint. The ``.pt`` mtime drives LRU ordering since the loader
+        # touches both files together.
         for p in cache_dir.glob("*.pt"):
             try:
                 st = p.stat()
             except OSError:
                 continue
-            entries.append((st.st_mtime, st.st_size, p))
+            weights = _weights_path_for(p)
+            size = st.st_size
+            try:
+                size += weights.stat().st_size
+            except OSError:
+                pass
+            entries.append((st.st_mtime, size, p))
 
         # Oldest first; LRU = evict from the front.
         entries.sort(key=lambda e: e[0])
@@ -509,6 +710,14 @@ def _evict_cache_lru(
                     p, exc,
                 )
                 continue
+            # Also drop the safetensors sibling; an orphan would otherwise
+            # leak ~830 MB per evicted entry and confuse cache_dir size
+            # accounting on the next eviction pass.
+            sibling = _weights_path_for(p)
+            try:
+                sibling.unlink()
+            except OSError:
+                pass
             evicted.append(p)
             total_bytes -= size
             count -= 1
@@ -523,15 +732,70 @@ def _evict_cache_lru(
 def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
     """Save the compiled model to ``path`` atomically. Best-effort.
 
-    Saves the full model object so loading reproduces the post-bake state
-    (including right-sized FFN shapes and wrapper modules attached during
-    the bake) without re-running any bake_fn.
+    Splits the cache into two atomically-replaced files:
 
-    After a successful write the disk cache is trimmed via ``_evict_cache_lru``
-    so it does not grow unbounded across compile-variant kwargs (see the env
-    knobs ``C4_VM_CACHE_MAX_BYTES`` / ``C4_VM_CACHE_MAX_ENTRIES``).
+      - ``path`` (``.pt``): pickled shell. The model's persistent
+        parameters/buffers are swapped to ``meta`` tensors so the shell
+        carries only the post-bake module graph (FFN shapes, wrapper module
+        classes, compact-routing buffers' non-persistent values) and weighs
+        well under a megabyte.
+      - ``path.with_suffix(".safetensors")``: the real ``state_dict``,
+        written via ``safetensors.torch.save_file``. This holds essentially
+        all of the on-disk size; mmap'd on load.
+
+    The model object passed in is *not* mutated — the meta-swap runs on an
+    in-memory shallow clone (the original module instances are restored
+    immediately afterward). Callers continue to use the returned model.
+
+    After a successful write the disk cache is trimmed via
+    ``_evict_cache_lru`` so it does not grow unbounded across compile-variant
+    kwargs (see the env knobs ``C4_VM_CACHE_MAX_BYTES`` /
+    ``C4_VM_CACHE_MAX_ENTRIES``).
     """
+    from safetensors.torch import save_file as _safetensors_save
+    import pickle as _pickle
+
+    weights_path = _weights_path_for(path)
+
+    # Capture the live state_dict before stripping. The wrapper-expansion
+    # phase attaches the same FFN submodule under both ``_stages.*`` and
+    # ``pipeline.*`` paths, so many entries share storage. ``safetensors``
+    # refuses shared storages; we dedupe to one keep-name per group and
+    # record the alias map in the shell so the loader can re-share.
+    raw_state_dict = dict(model.state_dict())
+    state_dict, alias_map = _dedupe_state_dict_for_safetensors(raw_state_dict)
+    # ``save_file`` requires contiguous tensors; ``raw_state_dict`` entries
+    # are usually contiguous but ``.contiguous()`` is a no-op when so.
+    state_dict = {
+        k: (v.contiguous() if not v.is_contiguous() else v)
+        for k, v in state_dict.items()
+    }
+
+    # Snapshot the real parameters/buffers per-module so we can restore them
+    # after pickling the meta-only shell. We mutate ``model`` in place to
+    # avoid a 830 MB deepcopy; the restore step at the end puts everything
+    # back exactly as it was, so callers see no change.
+    saved_params: List[tuple] = []  # (module, name, value)
+    saved_buffers: List[tuple] = []
     import torch as _torch
+    for mod in model.modules():
+        for name, p in list(mod._parameters.items()):
+            if p is None:
+                continue
+            saved_params.append((mod, name, p))
+            mod._parameters[name] = _torch.nn.Parameter(
+                _torch.empty(p.shape, dtype=p.dtype, device="meta"),
+                requires_grad=p.requires_grad,
+            )
+        for name, b in list(mod._buffers.items()):
+            if name in mod._non_persistent_buffers_set:
+                continue
+            if b is None:
+                continue
+            saved_buffers.append((mod, name, b))
+            mod._buffers[name] = _torch.empty(
+                b.shape, dtype=b.dtype, device="meta"
+            )
 
     payload = {
         "format_version": _CACHE_FORMAT_VERSION,
@@ -552,22 +816,40 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
         "model_ops": _strip_op_list_for_cache(layout.model_ops),
         "ffn_widths": dict(layout.ffn_widths),
         "kwargs_snapshot": kwargs_snapshot,
+        # ``alias_map`` records {alias_name: keep_name} pairs that were
+        # dropped from the safetensors file to satisfy the no-shared-storage
+        # rule. The loader uses it to re-establish the aliasing after
+        # ``load_state_dict``.
+        "alias_map": dict(alias_map),
     }
-    tmp_path = None
+
+    tmp_shell = None
+    tmp_weights = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write: save to a temp file alongside the target, then replace.
-        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+
+        # Atomic write: weights first, then shell. Both go to .tmp siblings
+        # and are os.replace'd into place. On a partial write the loader
+        # checks both files exist before consuming either.
+        fd, tmp_weights_name = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".weights.tmp"
+        )
         os.close(fd)
-        tmp_path = pathlib.Path(tmp_name)
-        # The default zip writer has been observed to fail near the end of
-        # this large model payload with a small "unexpected pos" mismatch on
-        # some hosts. The legacy stream format is slower to write but has been
-        # reliable for this cache, and cache reads remain transparent through
-        # torch.load(..., weights_only=False).
-        _torch.save(payload, tmp_path, _use_new_zipfile_serialization=False)
-        os.replace(tmp_path, path)
-        tmp_path = None  # replaced; nothing to clean up
+        tmp_weights = pathlib.Path(tmp_weights_name)
+        _safetensors_save(state_dict, str(tmp_weights))
+
+        fd, tmp_shell_name = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".shell.tmp"
+        )
+        os.close(fd)
+        tmp_shell = pathlib.Path(tmp_shell_name)
+        with open(tmp_shell, "wb") as f:
+            _pickle.dump(payload, f, protocol=_pickle.HIGHEST_PROTOCOL)
+
+        os.replace(tmp_weights, weights_path)
+        tmp_weights = None
+        os.replace(tmp_shell, path)
+        tmp_shell = None
     except Exception as exc:
         _logger.warning(
             "compile_full_vm_dynamic: failed to save cache %s (%s); returning "
@@ -575,11 +857,19 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
             path, exc,
         )
     finally:
-        if tmp_path is not None and tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+        for tmp in (tmp_weights, tmp_shell):
+            if tmp is not None and tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+        # Restore the real tensors onto the live model so the caller sees no
+        # change. This runs even when the save raised.
+        for mod, name, p in saved_params:
+            mod._parameters[name] = p
+        for mod, name, b in saved_buffers:
+            mod._buffers[name] = b
 
     # Best-effort: trim cache directory after a successful write. Pass the
     # just-written path as ``keep_path`` so it's protected even if the cap is
