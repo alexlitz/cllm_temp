@@ -423,6 +423,10 @@ def make_layer13_attn_dep_anchor_op() -> Operation:
         # `after: _layer12_ffn_dep_anchor` is first satisfiable. The
         # real fix likely needs an explicit `layer_idx=13` (Fix Option
         # 2) or a `before: layer14_addr_key_neural_decode` edge.
+        # 2026-06-03 follow-up: see L13_ANCHOR_DOWNSTREAM_CHAIN.md —
+        # `layer_idx=13` alone breaks `l13_alu_shift_install` (composite
+        # stages at L17-L20 bake AFTER install at L13). Pin the 4
+        # composite stages to L13 too before re-trying.
         phase=13.0,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC",
