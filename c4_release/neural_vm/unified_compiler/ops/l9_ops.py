@@ -698,24 +698,30 @@ def _layer9_alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
 
     rules: list[FFNRule] = []
 
+    # Conditions = MARK_AX + OR over the 15 non-ALU opcodes (all unit weights).
+    # Threshold 1.5 implements "MARK_AX AND any one non-ALU opcode" semantics:
+    # MARK_AX(=1) + exactly one OP_*(=1) sums to 2.0 > 1.5 while OP_* alone
+    # only sums to 1.0 (blocked). multi_way_and_rule with explicit
+    # threshold=1.5 captures the same structural N-way conditional write
+    # (default threshold derivation would over-shoot to 15.5 = "all on").
+    common_conditions = [("MARK_AX", 1.0)]
+    common_conditions.extend((dim, 1.0) for dim in _L9_NON_ALU_OPCODES)
+    common_conditions = tuple(common_conditions)
+
     # ALU_LO clear: 16 units.
     for k in range(16):
-        conditions = [("MARK_AX", 1.0)]
-        conditions.extend((dim, 1.0) for dim in _L9_NON_ALU_OPCODES)
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l9_alu_lo_clear_{k}",
-            conditions=tuple(conditions),
+            conditions=common_conditions,
             threshold=1.5,
             writes=((f"ALU_LO+{k}", -10.0 / S),),
         ))
 
     # ALU_HI clear: 16 units.
     for k in range(16):
-        conditions = [("MARK_AX", 1.0)]
-        conditions.extend((dim, 1.0) for dim in _L9_NON_ALU_OPCODES)
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l9_alu_hi_clear_{k}",
-            conditions=tuple(conditions),
+            conditions=common_conditions,
             threshold=1.5,
             writes=((f"ALU_HI+{k}", -10.0 / S),),
         ))
