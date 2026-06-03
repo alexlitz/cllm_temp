@@ -30,6 +30,7 @@ from neural_vm.unified_compiler.primitives import Primitives  # noqa: E402
 from neural_vm.unified_compiler.wide_alu_dsl import (  # noqa: E402
     bitwise_rules,
     wide_add_rules,
+    wide_mul_rules,
     wide_shift_rules,
     wide_sub_rules,
 )
@@ -554,13 +555,7 @@ def test_wide_shift_rules_byte_identity_randomized(lowered_shift_ffns):
 
 
 def _build_wide_sub_rules_one_byte(S: float = 100.0):
-    """Construct the 256-rule per-byte SUB lookup for width_bytes=1.
-
-    Same band-wiring convention as the wide_add POC: operand A (minuend)
-    on ``ALU_LO``, operand B (subtrahend) on ``AX_CARRY_LO``, result on
-    ``OUTPUT_LO``, borrow on ``CARRY``. Opcode gate is ``OP_SUB``;
-    marker is ``MARK_AX``.
-    """
+    """Construct the 256-rule per-byte SUB lookup for width_bytes=1."""
     return wide_sub_rules(
         operand_a_base="ALU_LO",
         operand_b_base="AX_CARRY_LO",
@@ -569,6 +564,33 @@ def _build_wide_sub_rules_one_byte(S: float = 100.0):
         width_bytes=1,
         opcode_gate="OP_SUB",
         marker_gate="MARK_AX",
+        S=S,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave W5: wide_mul_rules byte-identity (8-bit POC, width_bytes=1).
+# ---------------------------------------------------------------------------
+
+_MUL_DIM_LAYOUT = {
+    "MARK_GATE": 0,
+    "OP_MUL_GATE": 1,
+    "OPERAND_A": 2,
+    "OPERAND_B": 18,
+    "RESULT": 34,
+}
+_MUL_FFN_DIM = 66
+
+
+def _build_wide_mul_rules_8bit(S: float = 100.0):
+    """Construct the 256-rule wide_mul lookup for width_bytes=1."""
+    return wide_mul_rules(
+        operand_a_base="OPERAND_A",
+        operand_b_base="OPERAND_B",
+        result_base="RESULT",
+        width_bytes=1,
+        opcode_gate="OP_MUL_GATE",
+        marker_gate="MARK_GATE",
         S=S,
     )
 
@@ -585,6 +607,21 @@ def _lowered_pureffn_for_wide_sub(S: float = 100.0) -> PureFFN:
     dim_positions = Primitives.dim_positions_from_bd(_SetDim, names)
     end = Primitives.lower_ffn_rules(
         ffn, rules, dim_positions, start_unit=0, S=S,
+    )
+    assert end == 256, f"lower_ffn_rules wrote {end} units, expected 256"
+    return ffn
+
+
+def _lowered_pureffn_for_wide_mul(S: float = 100.0) -> PureFFN:
+    """Lower the width_bytes=1 wide_mul rules into a PureFFN."""
+    rules = _build_wide_mul_rules_8bit(S=S)
+    assert len(rules) == 256, (
+        f"wide_mul_rules(width_bytes=1) emitted {len(rules)} rules, "
+        f"expected 256"
+    )
+    ffn = PureFFN(dim=_MUL_FFN_DIM, hidden_dim=256)
+    end = Primitives.lower_ffn_rules(
+        ffn, rules, _MUL_DIM_LAYOUT, start_unit=0, S=S,
     )
     assert end == 256, f"lower_ffn_rules wrote {end} units, expected 256"
     return ffn
@@ -666,5 +703,77 @@ def test_wide_sub_rules_byte_identity_one_byte(lowered_sub_ffn):
 
     assert not mismatches, (
         f"wide_sub byte-identity failures ({len(mismatches)}/256):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+def _make_mul_input(*, a_nib: int, b_nib: int) -> torch.Tensor:
+    """One-position residual with marker, opcode, operand A/B one-hots."""
+    x = torch.zeros(1, 1, _MUL_FFN_DIM)
+    x[0, 0, _MUL_DIM_LAYOUT["MARK_GATE"]] = 1.0
+    x[0, 0, _MUL_DIM_LAYOUT["OP_MUL_GATE"]] = 1.0
+    x[0, 0, _MUL_DIM_LAYOUT["OPERAND_A"] + (a_nib & 0xF)] = 1.0
+    x[0, 0, _MUL_DIM_LAYOUT["OPERAND_B"] + (b_nib & 0xF)] = 1.0
+    return x
+
+
+def _decode_mul_output(y: torch.Tensor) -> int:
+    base = _MUL_DIM_LAYOUT["RESULT"]
+    lo = int(y[0, 0, base:base + 16].argmax().item())
+    hi = int(y[0, 0, base + 16:base + 32].argmax().item())
+    return lo | (hi << 4)
+
+
+@pytest.fixture(scope="module")
+def lowered_mul_ffn() -> PureFFN:
+    return _lowered_pureffn_for_wide_mul()
+
+
+def test_wide_mul_rules_emit_expected_unit_count():
+    rules = _build_wide_mul_rules_8bit()
+    assert len(rules) == 256
+
+
+def test_wide_mul_rules_rejects_bad_args():
+    with pytest.raises(ValueError, match="width_bytes"):
+        wide_mul_rules(
+            operand_a_base="OPERAND_A",
+            operand_b_base="OPERAND_B",
+            result_base="RESULT",
+            width_bytes=0,
+            opcode_gate="OP_MUL_GATE",
+            marker_gate="MARK_GATE",
+            S=100.0,
+        )
+    with pytest.raises(NotImplementedError, match="multi-byte"):
+        wide_mul_rules(
+            operand_a_base="OPERAND_A",
+            operand_b_base="OPERAND_B",
+            result_base="RESULT",
+            width_bytes=2,
+            opcode_gate="OP_MUL_GATE",
+            marker_gate="MARK_GATE",
+            S=100.0,
+        )
+
+
+def test_wide_mul_rules_byte_identity_8bit(lowered_mul_ffn):
+    """Lowered wide_mul_rules matches Python's 4-bit mul."""
+    mismatches = []
+    for a in range(16):
+        for b in range(16):
+            x = _make_mul_input(a_nib=a, b_nib=b)
+            with torch.no_grad():
+                y = lowered_mul_ffn(x)
+            decoded = _decode_mul_output(y)
+            expected = (a * b) & 0xFF
+            if decoded != expected:
+                mismatches.append(
+                    f"a=0x{a:X} b=0x{b:X}: "
+                    f"expected=0x{expected:02X} got=0x{decoded:02X}"
+                )
+
+    assert not mismatches, (
+        f"wide_mul byte-identity failures ({len(mismatches)}/256):\n  "
         + "\n  ".join(mismatches[:10])
     )

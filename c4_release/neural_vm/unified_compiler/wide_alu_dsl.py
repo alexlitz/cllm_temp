@@ -612,42 +612,105 @@ def wide_mul_rules(
     operand_a_base: str,
     operand_b_base: str,
     result_base: str,
-    carry_base: str,
     width_bytes: int,
     opcode_gate: str,
     marker_gate: str,
     S: float,
 ) -> Tuple[FFNRule, ...]:
-    """Generate FFNRule list for the 9-stage wide MUL pipeline.
+    """Generate FFNRule list for wide MUL — 8-bit POC (per-nibble lookup).
 
-    Stub for Wave W5 (``FlattenedALUMul`` migration — the boss fight).
-    The 9 stages currently live in ``efficient_alu_neural.py`` and span
-    BD↔GE format conversion, schoolbook partial products, carry-pass
-    propagation, and a final merge into ``OUTPUT_LO/HI``. The DSL
-    migration will subdivide the lowering by stage so each ships
-    independently (see Section 5 of the design doc).
+    Wave W5, **8-bit slice only**. The full ``FlattenedALUMul`` composite
+    in ``efficient_alu_neural.py:1066+`` is a 9-stage pipeline (BDToGE →
+    schoolbook → 3 carry passes → genprop → binary-lookahead →
+    final-correction → MulCombine → GEToBD). For the POC, we collapse
+    the entire pipeline into a single nibble × nibble lookup table:
+
+      * For each ``(a, b)`` in ``0..15 × 0..15`` (256 pairs), emit one
+        FFNRule that fires when ``marker_gate`` AND ``operand_a_base+a``
+        AND ``operand_b_base+b`` are all hot, gated by ``opcode_gate``.
+      * Each rule writes ``2.0 / S`` to two output positions:
+        - ``result_base + (a * b) & 0xF``                 (low nibble)
+        - ``result_base + 16 + ((a * b) >> 4) & 0xF``     (high nibble)
+
+      The product of two nibbles is at most ``15 * 15 == 225``, which
+      fits in 8 bits, so the two-nibble split is sufficient. The output
+      layout mirrors the per-byte stacking convention used by
+      :func:`wide_add_rules`: ``result_base+(b*16+nib)`` where byte 0
+      holds the low nibble and byte 1 holds the high nibble.
+
+    Conditions use the same balanced-AND pattern as :func:`bitwise_rules`:
+    ``marker(+40) + a(+30) + b(+30) > 80`` (100 > 80 fires; any pair
+    sums to <= 70 which is blocked).
+
+    Multi-byte (16-bit, 32-bit) lowering is **deferred** to a follow-up
+    wave per ``docs/IR_DSL_DESIGN.md`` Section 5. The 9-stage pipeline
+    (schoolbook partial products + 3 carry passes + gen/prop + binary
+    carry-lookahead + final correction) only kicks in for ``width_bytes
+    >= 2``; the 8-bit case naturally collapses because a nibble × nibble
+    product fits in one byte with no inter-byte carries.
 
     Args:
-        operand_a_base: dim base for operand A per-byte bands.
-        operand_b_base: dim base for operand B per-byte bands.
-        result_base: dim base for the 2*width-byte result.
-        carry_base: dim base for inter-stage carry cascades.
-        width_bytes: input operand width in bytes.
-        opcode_gate: dim ref for the ``MUL`` opcode flag.
-        marker_gate: dim name for the AX-style marker.
-        S: SwiGLU scale.
+        operand_a_base: dim base for operand A. Rule reads
+            ``operand_a_base + a_nib`` for ``a_nib`` in 0..15.
+        operand_b_base: dim base for operand B. Rule reads
+            ``operand_b_base + b_nib`` for ``b_nib`` in 0..15.
+        result_base: dim base for the result. Rule writes
+            ``result_base + (a*b & 0xF)`` (low nibble, "byte 0") and
+            ``result_base + 16 + ((a*b >> 4) & 0xF)`` (high nibble,
+            "byte 1") at amplitude ``2.0 / S``.
+        width_bytes: operand width in bytes. **POC supports only
+            ``width_bytes=1``** (8-bit multiply, nibble × nibble lookup).
+            Larger widths raise ``NotImplementedError``.
+        opcode_gate: dim ref for the ``MUL`` opcode flag (e.g. ``"OP_MUL"``).
+        marker_gate: dim name for the AX-style marker (e.g. ``"MARK_AX"``).
+        S: SwiGLU scale (typically 100.0).
 
     Returns:
-        Stub raises ``NotImplementedError`` (W5 pending).
+        ``tuple[FFNRule, ...]`` of length 256 (16 × 16 nibble pairs).
+
+    Raises:
+        ValueError: if ``width_bytes < 1``.
+        NotImplementedError: if ``width_bytes > 1`` (multi-byte deferred
+            to follow-up wave; the 9-stage pipeline must be reproduced
+            for inter-byte carry propagation).
     """
-    del (
-        operand_a_base, operand_b_base, result_base, carry_base,
-        width_bytes, opcode_gate, marker_gate, S,
-    )
-    raise NotImplementedError(
-        "wide_mul_rules: Wave W5 not implemented (9-stage pipeline). "
-        "Tracked under ``docs/IR_DSL_DESIGN.md`` Section 5 — MUL migration."
-    )
+    if not isinstance(width_bytes, int) or width_bytes < 1:
+        raise ValueError(
+            f"wide_mul_rules: width_bytes must be a positive int; "
+            f"got {width_bytes!r}"
+        )
+    if width_bytes > 1:
+        raise NotImplementedError(
+            f"wide_mul_rules: multi-byte MUL (width_bytes={width_bytes}) "
+            f"is deferred — requires the 9-stage FlattenedALUMul pipeline "
+            f"(schoolbook + 3 carry passes + genprop + lookahead + final-"
+            f"correction). Tracked under ``docs/IR_DSL_DESIGN.md`` Section 5."
+        )
+
+    write_amplitude = 2.0 / S
+    rules: list[FFNRule] = []
+    for a_nib in range(16):
+        for b_nib in range(16):
+            product = (a_nib * b_nib) & 0xFFFF
+            lo_nib = product & 0xF
+            hi_nib = (product >> 4) & 0xF
+            rules.append(FFNRule.gated_write(
+                name=f"wide_mul_b0_a{a_nib:x}_b{b_nib:x}",
+                conditions=(
+                    (marker_gate, 40.0),
+                    (f"{operand_a_base}+{a_nib}", 30.0),
+                    (f"{operand_b_base}+{b_nib}", 30.0),
+                ),
+                threshold=80.0,
+                gate=opcode_gate,
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=(
+                    (f"{result_base}+{lo_nib}", write_amplitude),
+                    (f"{result_base}+{16 + hi_nib}", write_amplitude),
+                ),
+            ))
+    return tuple(rules)
 
 
 # ---------------------------------------------------------------------------
