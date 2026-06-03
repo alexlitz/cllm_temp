@@ -238,6 +238,14 @@ def all_core_ops(
         make_layer10_psh_stack0_passthrough_bake_op(),
         make_layer10_stack0_byte_relay_bake_op(),
         make_layer10_alu_op(),
+        # Cluster D fix (2026-06-03): post-L9 BZ/BNZ PC override owner.
+        # Physically moves the BZ/BNZ cancel + FETCH-target-copy bands out
+        # of layer6_routing_ffn (which runs BEFORE layer9_alu in the
+        # forward pass) into a kind="ffn" op pinned via
+        # ``requires={"after": "layer10_alu"}`` so it lands at L11+ where
+        # same-step CMP is the freshly-written L9 ALU output. See
+        # c4_release/docs/CMP_PATH_AUDIT.md.
+        make_post_l9_bz_bnz_pc_override_op(),
         # Phase 8.A.4 retry: dep anchor for L11. The actual MUL partial bake
         # is owned by ``layer11_mul_partial`` (kind="block", target_op_name=
         # ``_layer11_ffn_dep_anchor``); this no-op companion gives the

@@ -2217,8 +2217,10 @@ def make_layer6_routing_ffn_ir(S: float = 100.0) -> CompilerIR:
     ffn_op.rules.extend(_layer6_ent_sp_writeback_rules(S))
     ffn_op.rules.extend(_layer6_ent_first_step_sp_byte0_rules(S))
     ffn_op.rules.extend(_layer6_ent_first_step_sp_bytes_rules(S))
-    ffn_op.rules.extend(_layer6_bz_pc_override_rules(S))
-    ffn_op.rules.extend(_layer6_bnz_pc_override_rules(S))
+    # Cluster D fix: BZ/BNZ PC override rules have moved to
+    # `post_l9_bz_bnz_pc_override` (kind="ffn", post-L9 placement). Keeping
+    # them here would declare ownership of bands the L6 bake no longer
+    # writes. See `_bake_layer6_routing_ffn` (BZ/BNZ section) for details.
     ffn_op.rules.extend(_layer6_tail_cleanup_rules(S))
     ffn_op.rules.extend(_layer6_branch_pc_byte1_override_rules(S))
     ffn_op.rules.extend(_layer6_all_step_jsr_pc_override_rules(S))
@@ -2324,16 +2326,14 @@ def _bake_layer6_routing_ffn(ffn, S: float, BD) -> None:
             "L6 all-step JMP PC override IR lowered to unexpected unit "
             f"{all_step_jmp_end}; expected {L6_ALL_STEP_JMP_PC_OVERRIDE_END_UNIT}"
         )
-    branch_pc_ends = _lower_layer6_branch_pc_override_ir(ffn, S, BD)
-    expected_branch_pc_ends = (
-        L6_BZ_PC_OVERRIDE_END_UNIT,
-        L6_BNZ_PC_OVERRIDE_END_UNIT,
-    )
-    if branch_pc_ends != expected_branch_pc_ends:
-        raise AssertionError(
-            "L6 BZ/BNZ PC override IR lowered to unexpected units "
-            f"{branch_pc_ends}; expected {expected_branch_pc_ends}"
-        )
+    # Cluster D fix (architectural attempt 2): the L6 BZ/BNZ PC override
+    # bands physically run BEFORE layer9_alu in the forward pass, so their
+    # CMP+4 / CMP+5 reads see the PREVIOUS step's CMP value (or 0 on step 1).
+    # The bands are now owned by `post_l9_bz_bnz_pc_override` (kind="ffn",
+    # requires={"after": "layer10_alu"}) which bakes equivalent rules into
+    # an FFN block placed at L11+ where same-step CMP is the freshly-written
+    # L9 ALU output. The L6 unit ranges 878..1070 stay zero-cleared above.
+    # See c4_release/docs/CMP_PATH_AUDIT.md.
     _clear_ffn_unit_band(
         ffn,
         L6_IMM_FETCH_ROUTE_START_UNIT,
@@ -4361,4 +4361,194 @@ def make_open_clos_tool_call_op(
         # config, so an empty IR is byte-identical for default flag values.
         # Populating IR with the matching rules is Phase 11.A follow-up.
         compiler_ir=CompilerIR(),
+    )
+
+
+# ============================================================================
+# Cluster D fix: post-L9 BZ/BNZ PC override.
+#
+# Background (see docs/CMP_PATH_AUDIT.md):
+#   - The L6 routing FFN's BZ/BNZ PC override bands read CMP+4/CMP+5 (the AX
+#     zero flags written by the L9 ALU).
+#   - L6 physically runs BEFORE L9 in the forward pass, so its read of CMP
+#     is necessarily cross-step (CMP.*.-1).
+#   - On step 1 there is no prior step => CMP+4 = CMP+5 = 0 => BZ-taken bands
+#     never fire on step 1 even when the L9 ALU produced the correct CMP.
+#
+# Fix:
+#   - Mirror the same BZ/BNZ PC override rule families into a new op whose
+#     physical FFN block lands strictly AFTER layer10_alu (cluster D arch
+#     attempt 2). The new op's reads include same-step CMP -- valid because
+#     the bake block lives at L11+, after L9 ALU has produced the current
+#     step's CMP.
+#   - The L6 BZ/BNZ band lowering is removed in `_bake_layer6_routing_ffn`
+#     so the BZ/BNZ overrides only fire from the post-L9 op. The L6 unit
+#     bands (878..1070) are left zero by `_clear_ffn_unit_band`.
+# ============================================================================
+
+
+def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """Same-step-CMP variant of `_layer6_bz_pc_override_rules`.
+
+    Identical structure to the L6 rules; the only difference is the CMP+4 /
+    CMP+5 reads are not aliased to `CMP.*.-1` -- they resolve to the current
+    step's CMP because this op runs in an FFN block strictly after layer9_alu.
+    """
+
+    rules = []
+    cancel_conditions = (
+        ("MARK_PC", 1.0),
+        ("OP_BZ", 0.2),
+        ("CMP+4", 1.0),
+        ("CMP+5", 1.0),
+        ("IS_BYTE", -10.0),
+    )
+    target_conditions = cancel_conditions + (("MARK_STACK0", -10.0),)
+    write_scale = 2.0 / S
+    # OUTPUT_LO cancel gate is intentionally cross-step (`.*.-1`) because the
+    # purpose of the cancel band is to subtract the PREVIOUS step's residual
+    # from the current-step OUTPUT bank, mirroring the L6 semantics.
+    for band, output_base, output_gate_base in (
+        ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
+        ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+    ):
+        for k in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"post_l9_bz_cancel_{band}_{k}",
+                conditions=cancel_conditions,
+                threshold=3.5,
+                gate=f"{output_gate_base}+{k}",
+                gate_weight=-1.0,
+                writes=((f"{output_base}+{k}", write_scale),),
+            ))
+    _append_pc_byte0_direct_copy_rules(
+        rules,
+        name_prefix="post_l9_bz",
+        conditions=target_conditions,
+        threshold=3.5,
+        lo_source="FETCH_LO",
+        hi_source="FETCH_HI",
+        write_scale=write_scale,
+    )
+    return tuple(rules)
+
+
+def _post_l9_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
+    """Same-step-CMP variant of `_layer6_bnz_pc_override_rules`."""
+
+    rules = []
+    write_scale = 2.0 / S
+    groups = (
+        (
+            "lo_nonzero",
+            (("MARK_PC", 1.0), ("OP_BNZ", 0.2), ("CMP+4", -1.0)),
+            1.5,
+        ),
+        (
+            "hi_nonzero",
+            (
+                ("MARK_PC", 1.0),
+                ("OP_BNZ", 0.2),
+                ("CMP+4", 1.0),
+                ("CMP+5", -1.0),
+            ),
+            2.5,
+        ),
+    )
+    for group, conditions, threshold in groups:
+        for band, output_base, output_gate_base in (
+            ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
+            ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+        ):
+            for k in range(16):
+                rules.append(FFNRule.gated_write(
+                    name=f"post_l9_bnz_{group}_cancel_{band}_{k}",
+                    conditions=conditions,
+                    threshold=threshold,
+                    gate=f"{output_gate_base}+{k}",
+                    gate_weight=-1.0,
+                    writes=((f"{output_base}+{k}", write_scale),),
+                ))
+        _append_pc_byte0_direct_copy_rules(
+            rules,
+            name_prefix=f"post_l9_bnz_{group}",
+            conditions=conditions,
+            threshold=threshold,
+            lo_source="FETCH_LO",
+            hi_source="FETCH_HI",
+            write_scale=write_scale,
+        )
+    return tuple(rules)
+
+
+def _post_l9_bz_bnz_pc_override_ir(S: float = 100.0) -> CompilerIR:
+    """CompilerIR exposing the post-L9 BZ/BNZ override rules."""
+
+    ir = CompilerIR()
+    ffn_op = ir.layer(0).ffn
+    ffn_op.rules.extend(_post_l9_bz_pc_override_rules(S))
+    ffn_op.rules.extend(_post_l9_bnz_pc_override_rules(S))
+    return ir
+
+
+def make_post_l9_bz_bnz_pc_override_op() -> Operation:
+    """Cluster D fix: bake BZ/BNZ PC override into a post-L9 FFN block.
+
+    The L6 routing FFN owns the legacy BZ/BNZ PC override bands (units
+    878..1070), but those bands read CMP cross-step because L6 runs before
+    L9 in the forward pass. On step 1 the cross-step alias resolves to 0
+    and the BZ-taken band never fires. Documented in
+    `c4_release/docs/CMP_PATH_AUDIT.md` and
+    `c4_release/docs/ABSDIFF_BZ_REDIRECT_BUG.md`.
+
+    This op declares same-step `CMP` (no `.*.-1` alias) and is pinned past
+    `layer10_alu` via ``requires={"after": "layer10_alu"}``, so the
+    LayerCompiler's dep-graph earliest-feasible assignment lands it at
+    L11 or later. The bake is a `kind="ffn"` dependency-assigned FFN
+    block (one tenant per block), modeled on `l10_post_ops_combined`.
+
+    The L6 BZ/BNZ unit bands remain zero-cleared by
+    `_bake_layer6_routing_ffn` so only this post-L9 op fires the override.
+    """
+
+    def bake(ffn, dim_positions, S):
+        proxy = _as_setdim_proxy(dim_positions)
+        rules = (
+            _post_l9_bz_pc_override_rules(S)
+            + _post_l9_bnz_pc_override_rules(S)
+        )
+        rule_dim_positions = Primitives.dim_positions_from_bd(
+            proxy, Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(
+            ffn, rules, rule_dim_positions, start_unit=0, S=S,
+        )
+
+    return Operation(
+        name="post_l9_bz_bnz_pc_override",
+        # Same-step CMP read (no .*.-1 alias): this op's bake block lands
+        # AFTER layer9_alu (the authoritative CMP writer) so the same-step
+        # value is the freshly-produced AX-zero flag.
+        # OUTPUT_LO is read cross-step on the cancel gate to subtract the
+        # PREVIOUS step's residual, mirroring the L6 routing FFN semantics.
+        reads={
+            "MARK_PC", "MARK_STACK0", "OP_BZ", "OP_BNZ",
+            "CMP", "IS_BYTE", "FETCH_LO", "FETCH_HI",
+            "OUTPUT_LO.*.-1", "OUTPUT_HI_THIS_STEP",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        kind="ffn",
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=_post_l9_bz_bnz_pc_override_ir(),
+        migrated=True,
+        # Pin strictly after layer10_alu so the scheduler places this op's
+        # FFN block at layer >= 11 (after the L9/L10 ALU writes CMP).
+        requires={"after": "layer10_alu"},
+        smoke_tests={
+            "TestSmokeControlFlow::test_bz_taken",
+            "TestSmokeControlFlow::test_bnz_taken",
+            "all",
+        },
+        spec_section="BLOG_SPEC.md#control-flow",
     )
