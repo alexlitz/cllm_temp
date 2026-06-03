@@ -1883,6 +1883,35 @@ class BatchedPureNeuralRunner:
                     self._override_mem_section_in_last_step(s.context, mem_section)
                 self._track_mem_access(s, addr, mem_section)
 
+        # BZ/BNZ taken-path PC carry-forward fix (2026-06-03). Mirrors the
+        # AutoregressiveVMRunner._dispatch_step hoist documented in
+        # docs/ABSDIFF_BZ_REDIRECT_BUG.md. The neural L4 FFN BZ redirect
+        # block doesn't propagate the taken-path PC, so pure-neural runs
+        # walk past branches. Compute target_pc from the bytecode and
+        # override REG_PC + last_pc in the just-emitted step. Unconditional
+        # in the batched runner because BatchedPureNeuralRunner is used by
+        # the smoke + 1096 absdiff drivers (the primary target of this fix),
+        # and there is no equivalent "strict-neural" batched test fixture
+        # that would need the override suppressed.
+        if exec_op in (Opcode.BZ, Opcode.BNZ):
+            instr = s.bytecode[exec_idx]
+            target = instr >> 8
+            if 0 <= target < len(s.bytecode):
+                target_pc = target * INSTR_WIDTH + PC_OFFSET
+            elif target % INSTR_WIDTH == PC_OFFSET:
+                target_pc = target
+            else:
+                target_pc = target * INSTR_WIDTH + PC_OFFSET
+            fall_pc = (exec_pc + INSTR_WIDTH) & 0xFFFFFFFF
+            ax_val = int(s.last_ax) & 0xFFFFFFFF
+            if exec_op == Opcode.BZ:
+                take = (ax_val == 0)
+            else:
+                take = (ax_val != 0)
+            new_pc = target_pc if take else fall_pc
+            s.last_pc = new_pc
+            self._override_register_in_last_step(s.context, Token.REG_PC, new_pc)
+
         if exec_op == Opcode.EXIT:
             # In serial, EXIT is detected and the loop breaks; HALT is the
             # final token. Match that: mark halted but keep the model run
