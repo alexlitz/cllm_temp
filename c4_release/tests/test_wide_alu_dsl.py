@@ -332,6 +332,245 @@ def test_wide_add_rules_byte_identity_one_byte(lowered_add_ffn):
 
 
 # ---------------------------------------------------------------------------
+# Wave W3: wide_add_rules multi-byte byte-identity (width_bytes=4 = 16-bit,
+# width_bytes=8 = 32-bit).
+# ---------------------------------------------------------------------------
+#
+# Multi-byte semantics: each "byte" in this DSL slice is a single 4-bit
+# nibble lane (see ``wide_add_rules`` docstring). So width_bytes=4 maps
+# to a 16-bit add, width_bytes=8 to a 32-bit add. The helper emits
+# per-nibble lookup units that read operand_a/b at offset (b*16 + nib)
+# and write the sum at result_base + (b*16 + sum_nib). For byte > 0 the
+# rule also reads carry_base + (b - 1) (positively at threshold 120 for
+# cin=1, or with -50 weight for cin=0) and writes carry_base + b on
+# carry-out.
+#
+# A single SwiGLU forward pass cannot self-cascade: W_up reads the
+# input residual only, so a carry written via W_down to position
+# carry_base+(b-1) won't be visible to byte b's lookup in the same
+# pass. The wider architecture handles propagation across separate
+# layers / passes. To exercise the per-byte rule semantics in a single
+# pass, this test pre-injects the *expected* carry-in flags into the
+# input residual alongside the operand one-hots. The decode then
+# checks that every byte's sum nibble argmax matches the Python
+# reference, end-to-end giving the full multi-nibble result.
+
+# Ad-hoc dim layout for the wide_add multi-byte tests.
+# Bands are sized for width_bytes <= 8 (8 nibble lanes = 32 bits is the
+# largest case we exercise; we lay out 8 nibbles worth = 128 slots per band).
+_ADD_MAX_BYTES = 8
+_ADD_DIM_LAYOUT = {
+    "MARK_GATE": 0,
+    "OP_ADD_GATE": 1,
+    "OPERAND_A": 2,                     # +k for k in 0..(16*B-1)
+    "OPERAND_B": 2 + 16 * _ADD_MAX_BYTES,
+    "RESULT":    2 + 32 * _ADD_MAX_BYTES,
+    "CARRY":     2 + 48 * _ADD_MAX_BYTES,
+}
+_ADD_FFN_DIM = 2 + 48 * _ADD_MAX_BYTES + _ADD_MAX_BYTES  # +carry band
+
+
+def _build_wide_add_rules_multi(width_bytes: int, S: float = 100.0):
+    """Construct multi-byte wide_add rules for the ad-hoc dim layout."""
+    return wide_add_rules(
+        operand_a_base="OPERAND_A",
+        operand_b_base="OPERAND_B",
+        result_base="RESULT",
+        carry_base="CARRY",
+        width_bytes=width_bytes,
+        opcode_gate="OP_ADD_GATE",
+        marker_gate="MARK_GATE",
+        S=S,
+    )
+
+
+def _lowered_pureffn_for_wide_add_multi(
+    width_bytes: int, S: float = 100.0
+) -> PureFFN:
+    """Lower the multi-byte wide_add rules into a PureFFN."""
+    rules = _build_wide_add_rules_multi(width_bytes, S=S)
+    # Per docstring: 256 for byte 0 + (512 + 1) per subsequent byte.
+    expected_count = 256 + (width_bytes - 1) * (512 + 1)
+    assert len(rules) == expected_count, (
+        f"wide_add_rules(width_bytes={width_bytes}) emitted {len(rules)} "
+        f"rules, expected {expected_count}"
+    )
+    ffn = PureFFN(dim=_ADD_FFN_DIM, hidden_dim=expected_count)
+    end = Primitives.lower_ffn_rules(
+        ffn, rules, _ADD_DIM_LAYOUT, start_unit=0, S=S,
+    )
+    assert end == expected_count, (
+        f"lower_ffn_rules wrote {end} units, expected {expected_count}"
+    )
+    return ffn
+
+
+def _per_nibble(value: int, width_bytes: int) -> list[int]:
+    """Split a value into ``width_bytes`` little-endian 4-bit nibbles."""
+    return [(value >> (4 * b)) & 0xF for b in range(width_bytes)]
+
+
+def _make_wide_add_input(
+    *, a: int, b: int, width_bytes: int
+) -> torch.Tensor:
+    """Build a one-position residual carrying a multi-nibble (a, b) ADD
+    plus the pre-computed carry-in one-hots needed for each nibble > 0.
+
+    Operand A nibbles populate ``OPERAND_A+(b*16 + nib)``; operand B
+    similarly. Carry-in flags ``CARRY+b`` for ``b in 0..width-2`` are set
+    if the partial sum at nibble ``b`` carries (precomputed in Python so
+    the single-pass FFN can resolve each nibble's lookup without needing
+    a multi-pass cascade).
+    """
+    x = torch.zeros(1, 1, _ADD_FFN_DIM)
+    x[0, 0, _ADD_DIM_LAYOUT["MARK_GATE"]] = 1.0
+    x[0, 0, _ADD_DIM_LAYOUT["OP_ADD_GATE"]] = 1.0
+    a_nibs = _per_nibble(a, width_bytes)
+    b_nibs = _per_nibble(b, width_bytes)
+    for bi, (an, bn) in enumerate(zip(a_nibs, b_nibs)):
+        x[0, 0, _ADD_DIM_LAYOUT["OPERAND_A"] + bi * 16 + an] = 1.0
+        x[0, 0, _ADD_DIM_LAYOUT["OPERAND_B"] + bi * 16 + bn] = 1.0
+    # Precompute carry chain for the input residual so each nibble's
+    # lookup sees the expected carry-in via CARRY+(b-1).
+    carry = 0
+    for bi in range(width_bytes - 1):
+        carry = 1 if (a_nibs[bi] + b_nibs[bi] + carry) >= 16 else 0
+        if carry:
+            x[0, 0, _ADD_DIM_LAYOUT["CARRY"] + bi] = 1.0
+    return x
+
+
+def _decode_wide_add_result(y: torch.Tensor, width_bytes: int) -> int:
+    """Reassemble the multi-nibble result by argmax over each nibble's
+    RESULT lane and packing nibbles little-endian.
+    """
+    base = _ADD_DIM_LAYOUT["RESULT"]
+    value = 0
+    for bi in range(width_bytes):
+        lane = y[0, 0, base + bi * 16:base + bi * 16 + 16]
+        value |= int(lane.argmax().item()) << (4 * bi)
+    return value
+
+
+def test_wide_add_rules_emit_expected_multi_byte_count():
+    """Sanity: rule count formula 256 + (W - 1) * 513 for width_bytes 1..4."""
+    for w in (1, 2, 4, 8):
+        rules = _build_wide_add_rules_multi(w)
+        assert len(rules) == 256 + (w - 1) * (512 + 1), (
+            f"width_bytes={w}: emitted {len(rules)} rules, "
+            f"expected {256 + (w - 1) * (512 + 1)}"
+        )
+
+
+def test_wide_add_rules_rejects_bad_width_bytes():
+    """``width_bytes < 1`` is a ValueError."""
+    with pytest.raises(ValueError, match="width_bytes"):
+        wide_add_rules(
+            operand_a_base="OPERAND_A",
+            operand_b_base="OPERAND_B",
+            result_base="RESULT",
+            carry_base="CARRY",
+            width_bytes=0,
+            opcode_gate="OP_ADD_GATE",
+            marker_gate="MARK_GATE",
+            S=100.0,
+        )
+
+
+@pytest.fixture(scope="module")
+def lowered_add_ffn_16bit() -> PureFFN:
+    # width_bytes=4 → 4 nibbles → 16 bits
+    return _lowered_pureffn_for_wide_add_multi(4)
+
+
+@pytest.fixture(scope="module")
+def lowered_add_ffn_32bit() -> PureFFN:
+    # width_bytes=8 → 8 nibbles → 32 bits
+    return _lowered_pureffn_for_wide_add_multi(8)
+
+
+def test_wide_add_rules_byte_identity_16bit(lowered_add_ffn_16bit):
+    """Randomised sweep: width_bytes=4 (16-bit, 4 nibble lanes) decoded
+    result equals ``(a + b) & 0xFFFF`` for every sampled pair.
+
+    The carry-in flags are pre-injected per ``_make_wide_add_input`` so
+    each nibble's lookup sees its expected carry-in. This validates the
+    *per-nibble rule semantics* (carry suppression for cin=0, positive
+    carry-in activation for cin=1) and end-to-end nibble layout — the
+    inter-nibble cascade across layers is a property of the wider
+    pipeline.
+    """
+    gen = torch.Generator().manual_seed(0x16B17ADD)  # "16-bit add"
+    n_trials = 64
+    pairs = torch.randint(0, 0x10000, (n_trials, 2), generator=gen).tolist()
+    # Boundary cases that force a full-width carry chain.
+    pairs += [
+        (0x0000, 0x0000),
+        (0xFFFF, 0x0001),  # carry through every nibble
+        (0xFFFF, 0xFFFF),  # full chain + overflow drop
+        (0x0FFF, 0x0001),  # mid-width carry boundary
+        (0xAAAA, 0x5555),  # interleaved bits, no carry
+    ]
+
+    mismatches = []
+    for a, b in pairs:
+        x = _make_wide_add_input(a=a, b=b, width_bytes=4)
+        with torch.no_grad():
+            y = lowered_add_ffn_16bit(x)
+        decoded = _decode_wide_add_result(y, width_bytes=4)
+        expected = (a + b) & 0xFFFF
+        if decoded != expected:
+            mismatches.append(
+                f"a=0x{a:04X} b=0x{b:04X}: "
+                f"expected=0x{expected:04X} got=0x{decoded:04X}"
+            )
+
+    assert not mismatches, (
+        f"wide_add width=4 (16-bit) byte-identity failures "
+        f"({len(mismatches)}/{len(pairs)}):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+def test_wide_add_rules_byte_identity_32bit(lowered_add_ffn_32bit):
+    """Randomised sweep: width_bytes=8 (32-bit, 8 nibble lanes) decoded
+    result equals ``(a + b) & 0xFFFFFFFF`` for every sampled pair.
+    """
+    gen = torch.Generator().manual_seed(0x32B17ADD)  # "32-bit add"
+    n_trials = 64
+    pairs = torch.randint(
+        0, 2**31, (n_trials, 2), generator=gen
+    ).tolist()
+    # Add some boundary cases that force long carry chains.
+    pairs += [
+        (0x00000000, 0x00000000),
+        (0xFFFFFFFF, 0x00000001),  # carry through all 8 nibbles
+        (0xFFFFFFFF, 0xFFFFFFFF),  # full chain plus overflow drop
+        (0x0FFF0FFF, 0x00010001),  # mid-width carry boundary
+        (0xAAAAAAAA, 0x55555555),  # interleaved bits, no carry
+    ]
+
+    mismatches = []
+    for a, b in pairs:
+        x = _make_wide_add_input(a=a, b=b, width_bytes=8)
+        with torch.no_grad():
+            y = lowered_add_ffn_32bit(x)
+        decoded = _decode_wide_add_result(y, width_bytes=8)
+        expected = (a + b) & 0xFFFFFFFF
+        if decoded != expected:
+            mismatches.append(
+                f"a=0x{a:08X} b=0x{b:08X}: "
+                f"expected=0x{expected:08X} got=0x{decoded:08X}"
+            )
+
+    assert not mismatches, (
+        f"wide_add width=8 (32-bit) byte-identity failures "
+        f"({len(mismatches)}/{len(pairs)}):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+# ---------------------------------------------------------------------------
 # Wave W2: wide_shift_rules byte-identity (8-bit, width_bytes=1).
 # ---------------------------------------------------------------------------
 #
