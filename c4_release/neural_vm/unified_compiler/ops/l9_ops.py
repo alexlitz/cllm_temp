@@ -574,6 +574,11 @@ def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
     gate_add = dim_ref("opcode_flag", "ADD")
     carry_byte1 = dim_ref("carry", "alu", 1)
     rules: list[FFNRule] = []
+    # Same 5-way AND shape as _layer9_add_hi_nibble_rules but with weaker
+    # CARRY+0 discrimination (raw +/- 0.01/S) and relaxed thresholds
+    # (2.5 / 2.9); the threshold itself does most of the discrimination
+    # work since the raw stack-top carry signal isn't amplified here.
+    # Writes to CARRY+1 (byte-level carry for inter-byte propagation).
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
@@ -597,13 +602,11 @@ def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
                         ("CARRY+0", 0.01 / S),
                     )
                     threshold = 2.9
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l9_add_carry_out_c{carry_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
                     gate=gate_add,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((carry_byte1, 2.0 / S),),
                 ))
     return tuple(rules)
