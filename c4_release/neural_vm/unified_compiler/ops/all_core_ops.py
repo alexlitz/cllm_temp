@@ -493,12 +493,28 @@ def all_alu_postop_attach_ops() -> list:
     ``block.post_ops`` AFTER set_vm_weights' legacy bake has populated the
     FFN weights. Use _dispatch_migrated_block_ops in vm_step.py to fire them
     at the right time (post-legacy-bake, pre-right-size).
+
+    2026-06-03 (L17 tail MUL double-fire fix): ``make_l11_alu_postop_attach_op``
+    is intentionally OMITTED. The L11 MUL ``FlattenedALUMul`` post-op attach
+    was redundant: it installed a from-scratch MUL pipeline (reads
+    ALU_LO/HI, OP_MUL, MARK_AX from BD; writes OUTPUT_LO/HI += 2.0 indicators
+    via ``GEToBDConverter``) at L11, then ``make_l12_alu_postop_attach_op``
+    installed an identical pipeline at L12. After ``_expand_wrapper_blocks``
+    (Phase 10.B) split both post_ops into adjacent wrapper blocks 25 and 27,
+    the second run re-fired ``OUTPUT_HI/LO += 2.0`` on the same MARK_AX
+    row, doubling the signal and clobbering OUT_LO[expected]. Margin was
+    uniformly -16.00 across 58 / 384 of the 1096 failures at L17.post_ops[0]
+    block=27 ``expected-token-never-wins`` (see
+    docs/L17_TAIL_MUL_DOUBLE_FIRE.md). The L11 ``layer11_mul_partial`` FFN
+    rules still own the partial-product staging in block 11's FFN; only the
+    redundant post-op wrap is removed.
     """
     return [
         make_l8_alu_postop_attach_op(),
         make_l9_alu_postop_attach_op(),
         make_l10_alu_postop_attach_op(),
-        make_l11_alu_postop_attach_op(),
+        # make_l11_alu_postop_attach_op() — removed; L12's attach covers
+        # the single FlattenedALUMul fire. See docstring above.
         make_l12_alu_postop_attach_op(),
         make_l13_alu_postop_attach_op(),
     ]
