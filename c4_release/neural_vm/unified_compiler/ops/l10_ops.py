@@ -6716,14 +6716,38 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
             ComparisonCombine,
             _SetDim,
         )
-        # Use the block's d_model when available; fall back to 512 to mirror
-        # the previous inline behavior.
-        d_model = 512
-        if hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+        # Derive d_model from the block's residual-stream width. Preferred
+        # source is ``block.attn.dim`` (always set to the model's d_model on
+        # the AutoregressiveAttention used by every TransformerBlock); the
+        # legacy ``block.ffn.W_up.shape[1]`` fallback is incorrect for
+        # efficient-mode L10 where ``block.ffn`` is a ``PureNeuralALU``
+        # subclass (e.g. ``ALUAndOrXor``) that has no ``W_up`` attribute,
+        # silently bottoming out at the hard-coded ``512`` constant. With
+        # the dynamic dim allocator (e.g. ``alu_mode='efficient'`` lifting
+        # d_model to 800 to accommodate the V2/G7 LEV detector residual
+        # band) this caused a stale ``BD.TEMP + 8 = 706`` to overflow the
+        # 512-wide post-op ``W_up`` row and raise ``IndexError``.
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
             try:
                 d_model = block.ffn.W_up.shape[1]
             except (AttributeError, IndexError):
-                d_model = 512
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
 
         # Pass dim_positions so each post-op bakes against the compact layout
         # rather than legacy `_SetDim` positions. Without this, the post-ops
