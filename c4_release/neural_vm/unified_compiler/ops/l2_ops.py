@@ -338,6 +338,14 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         # ``_L2_FFN_UNIT_LAYOUT``. The cancel op below resolves its own
         # start (unit 8) from the same shared layout.
         ffn_units_used=8,
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L2 token-feed
+        # pipeline op. Writes MEM_VAL_B0..B3 + BYTE_INDEX_1..3 +
+        # STACK0_BYTE1..3 — all cross-step durables (MEM_VAL_B* /
+        # BYTE_INDEX_* on the _CROSS_STEP_DURABLE allowlist). H4 read
+        # is cross-block in-step but the op doesn't gate per-register
+        # slot, so no consumes_fresh assertion is meaningful.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
     )
@@ -540,6 +548,12 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
         # the dynamic scheduler honours the requires["after"] edge.
         requires={"after": "phase_a_ffn"},
         step_idx={0},
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L2 token-feed
+        # step-0 cancel op. Writes EMBED_LO/HI (cross-step durables)
+        # at MARK_PC. HAS_SE read is uniformly zero at step 0
+        # (step_idx={0}); no consumes_fresh assertion is meaningful.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -605,6 +619,12 @@ def make_layer2_threshold_attn_op() -> Operation:
         # matching current_layer=2 and reaching the phase_pinned_by_deps
         # bucket. See docs/B12_BACKFILL_SPEC.md §24 recommended choice (a).
         requires={"after": "layer1_threshold_attn"},
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L2 token-feed
+        # threshold-attn op (single head writing L2H0). Derive yields
+        # empty (attention-only IR). Cross-step embed-time reads. No
+        # in-step surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -708,6 +728,11 @@ def make_layer2_lookback_detection_head_op(
         # current_layer=2; using layer1_threshold_attn keeps dep_depth at
         # the L2 floor (= current_layer) and reaches phase_pinned_by_deps.
         requires={"after": "layer1_threshold_attn"},
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L2 token-feed
+        # lookback-detection head (flag-gated stub). writes=set() via
+        # _SetDim fallback; reads are marker dims. No in-step surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

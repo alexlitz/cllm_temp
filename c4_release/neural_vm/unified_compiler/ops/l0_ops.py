@@ -227,6 +227,13 @@ def make_phase_a_ffn_op() -> Operation:
         # the 7-entry ``transitions`` list (SE→PC, PC→AX, AX→SP, SP→BP,
         # BP→STACK0, STACK0→MEM, MEM→SE). Units 0..6.
         ffn_units_used=7,
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L0 token-feed
+        # pipeline op. Writes NEXT_* step-boundary flags consumed at
+        # the next step's L0 phase rotation (cross-step). No same-step
+        # per-register slot consumer reads NEXT_*; empty surface
+        # affirms the cross-step boundary semantics.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
         compaction_safe=True,
@@ -372,6 +379,10 @@ def make_layer0_threshold_attn_dep_anchor_op() -> Operation:
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
         # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
         compiler_ir=CompilerIR(),
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor
+        # — empty IR, no bake, no in-step produce/consume_fresh surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests=set(),
         spec_section=None,
     )
@@ -467,6 +478,13 @@ def make_layer0_threshold_attn_op() -> Operation:
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L0 token-feed
+        # attention op. Writes H0..H7 threshold outputs via 8 heads;
+        # derive yields empty (attention-only IR — no FFNRule.writes).
+        # L0 attn is the first non-embed op; reads IS_MARK/CONST are
+        # embed-time/structural. No same-step consumes_fresh surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

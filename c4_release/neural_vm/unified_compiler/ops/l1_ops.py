@@ -258,6 +258,13 @@ def make_layer1_ffn_op() -> Operation:
         postcondition={
             "STACK0_BYTE0": "0_or_1",
         },
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L1 token-feed
+        # pipeline op. Writes STACK0_BYTE0 + BYTE_INDEX_0..3 — cross-
+        # step durables (BYTE_INDEX_* on the _CROSS_STEP_DURABLE
+        # allowlist; STACK0_BYTE0 is a per-position stable flag). No
+        # in-step register-slot surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -451,6 +458,13 @@ def make_layer1_threshold_attn_op() -> Operation:
         # gap is a true structural pin, not a declaration bug.
         # See docs/B12_BACKFILL_SPEC.md §27.
         requires={"after": "layer0_threshold_attn"},
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L1 token-feed
+        # attention op (3 fine threshold heads + HAS_SE + L1H4 +
+        # IN_STEP_FRESH). Derive yields empty (attention-only IR);
+        # reads are all marker/CONST cross-step embed-time dims. No
+        # in-step register-slot surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

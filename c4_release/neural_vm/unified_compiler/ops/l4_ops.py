@@ -230,6 +230,12 @@ def make_layer4_pc_relay_op() -> Operation:
         requires={"after": "_layer4_ffn_dep_anchor"},
         migrated=True,
         claims=_claims,
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L4 PC relay.
+        # Writes EMBED_LO/HI / ADDR_KEY at AX-marker rows — all cross-
+        # step durables. ADDR_KEY read is SSA-renamed prev-step
+        # (ADDR_KEY.*.-1). No in-step surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -468,6 +474,12 @@ def make_layer4_ffn_op() -> Operation:
         # PC+1@PC marker (64) chains for a total of 544 units (0..543).
         # See bake body in vm_step.py:_set_layer4_ffn.
         ffn_units_used=544,
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L4 FFN (PC-byte
+        # memory fetch). Writes FETCH_LO/HI + TEMP at PC-marker rows —
+        # cross-step durables (FETCH_* re-derived each step). Reads
+        # are cross-step structural. No in-step surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -520,6 +532,9 @@ def make_layer4_ffn_dep_anchor_op() -> Operation:
         # this anchor at L4 naturally (no earlier layer writes FETCH_LO/HI),
         # matching the ``layer4_ffn`` block op's slot.
         requires={},
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor.
+        produces={},
+        consumes_fresh={},
         smoke_tests=set(),
         spec_section=None,
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
@@ -937,6 +952,11 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
         # work in 7.A.3 will eventually retire the back-edge.
         requires={"after": ["layer4_pc_relay"]},
         claims=_claims,
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): flag-gated stub
+        # (SP-to-ADDR_KEY staging). Writes ADDR_KEY sub-bands (cross-
+        # step durable). No in-step surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
         # Phase 11.A IR exposure: bake is `if not <flag>: return` at default

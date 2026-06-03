@@ -182,6 +182,13 @@ def make_layer5_fetch_op() -> Operation:
         # consumes the AX-marker top nibble that ``layer4_pc_relay`` writes
         # same-step; the L7/L14 ADDR_KEY writes are not the source.
         requires={"after": "layer4_pc_relay"},
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L5 fetch (8 attn
+        # heads). Writes OPCODE_BYTE_LO/HI + FETCH_LO/HI + 21 OP_*
+        # dims — all cross-step durables (opcode broadcast / re-derived
+        # fetch). Derive yields empty (attention-only IR). No in-step
+        # surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
@@ -397,6 +404,9 @@ def make_layer5_fetch_dep_anchor_op() -> Operation:
         # ADDR_KEY back-edges from L7/L14 are also suppressed via R-OH-2.
         # The anchor's reads/writes track the real ``layer5_fetch`` op.
         requires={"after": "layer4_pc_relay"},
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor.
+        produces={},
+        consumes_fresh={},
         smoke_tests=set(),
         spec_section=None,
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
@@ -543,6 +553,15 @@ def make_opcode_decode_ffn_op() -> Operation:
         compiler_ir=_opcode_decode_ffn_ir(),
         migrated=True,
         claims=_claims,
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): L5 opcode
+        # decode FFN. Writes 34 OP_* dims + TEMP[0] IS_JSR sentinel —
+        # all cross-step durable opcode broadcasts (OP_LEV/OP_ENT/
+        # OP_RET on _CROSS_STEP_DURABLE allowlist; broader OP_* family
+        # follows the same once-per-step opcode-broadcast semantics).
+        # OPCODE_BYTE_LO read is SSA-renamed prev-step alias. No
+        # in-step register-slot surface.
+        produces={},
+        consumes_fresh={},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#how-bytecode-is-passed-to-the-network",
     )
@@ -879,6 +898,9 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
         # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
         compiler_ir=CompilerIR(),
+        # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor.
+        produces={},
+        consumes_fresh={},
         smoke_tests=set(),
         spec_section=None,
     )
