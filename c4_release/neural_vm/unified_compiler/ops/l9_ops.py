@@ -211,9 +211,16 @@ def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     ``(opcode_flag, ADD)`` semantic pair. The ``OUTPUT_HI_THIS_STEP+result``
     write stays structural (result is a value-bus lookup index, not a
     role-meaningful byte position).
+
+    Phase 7.E (sem-dim follow-up): the ``CARRY+0`` carry-in read
+    resolves through ``dim_ref("carry", "alu", 0)`` -- byte 0 of the
+    inter-byte ALU carry cascade (the same semantic position that
+    ``_layer8_alu_add_carry_rules`` *writes*). Byte-identical: the
+    helper returns the legacy ``"CARRY+0"`` string verbatim.
     """
 
     gate_add = dim_ref("opcode_flag", "ADD")
+    carry_byte0 = dim_ref("carry", "alu", 0)
     rules: list[FFNRule] = []
     for carry_in in (0, 1):
         for a in range(16):
@@ -225,7 +232,7 @@ def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                         ("MARK_PC", -2.0),
                         (f"ALU_HI+{a}", 1.0),
                         (f"AX_CARRY_HI+{b}", 1.0),
-                        ("CARRY+0", -2.0),
+                        (carry_byte0, -2.0),
                     )
                     threshold = 2.5
                 else:
@@ -234,7 +241,7 @@ def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                         ("MARK_PC", -2.0),
                         (f"ALU_HI+{a}", 1.0),
                         (f"AX_CARRY_HI+{b}", 1.0),
-                        ("CARRY+0", 2.0),
+                        (carry_byte0, 2.0),
                     )
                     threshold = 4.5
                 rules.append(FFNRule.gated_write(
