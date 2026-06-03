@@ -2895,6 +2895,20 @@ def make_l10_post_ops_combined() -> Operation:
         declarative_bake_fn=bake,
         migrated=True,
         declarative_authority="declarative",
+        # Phase 11.A IR exposure: empty CompilerIR drops this op from the
+        # ``no_ir`` census bucket (the last residual in 11.A). The bake
+        # combines four FFNRule families (``_l10_binary_op_byte_zeroing_rules``,
+        # 3x ``_l10_carry_propagation_rules``, ``_l10_comparison_combine_rules``)
+        # with a declarative residual band suppressor + carry-slice zero-out.
+        # Because ``declarative_bake_fn`` takes priority over ``compiler_ir``
+        # in ``_resolve_bake_callable`` (layer_compiler.py L146-147), exposing
+        # an empty IR here is byte-identical to the previous bake (the
+        # imperative path is unchanged). A faithful IR factory would have to
+        # carry both the rules and the residual band as a CompilerIR
+        # extension (carry-slice zero + ``apply_ffn_band_suppressors`` --
+        # the same Phase 7.C-grade pattern flagged in HANDOFF_2026_06_02.md
+        # §"Phase 11"); deferred to Phase 11.A follow-up.
+        compiler_ir=CompilerIR(),
         # Phase 9.D: ALU_LO cycle-graph constraint satisfied by the
         # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
         # is in-step producer). Previous: requires={"after":
