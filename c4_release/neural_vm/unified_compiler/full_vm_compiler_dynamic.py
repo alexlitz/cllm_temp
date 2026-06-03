@@ -64,7 +64,7 @@ import math
 import os
 import warnings
 from collections import defaultdict
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .layer_compiler import (
     Operation,
@@ -940,6 +940,33 @@ def _emit_cross_step_safety_warnings(
 # ---------------------------------------------------------------------------
 
 
+# In-process memo for compile_full_vm_dynamic results, keyed by a structural
+# hash of the public kwargs. The disk cache lives at ``~/.cache/c4_release/
+# compiled_vm/<sha256>.pt`` (see ``_legacy_redirect._cache_dir`` /
+# ``_cache_key``) and short-circuits the ~60-120 s bake to a ~3 s torch.load
+# of an ~830 MB pickle, but the dynamic entry still pays ~1.3 s for
+# ``_collect_ops_for_compile`` BEFORE the disk-cache check, plus the
+# deserialisation cost on every call. When a single process compiles with the
+# same kwargs more than once -- the conftest ``_pure_neural_runner_model``
+# session fixture, the class-scoped runner fixtures in
+# ``tests/test_suite_1096_pytest.py``, and any in-process retry loop -- this
+# memo returns the already-built ``(model, layout)`` in O(hash) time.
+#
+# Cross-process callers (fresh pytest invocations) still hit the disk cache;
+# this memo only short-circuits same-process repeats. The key is the structural
+# kwargs dict (the same one passed into ``_cache_key``), so cache invalidation
+# tracks the disk-cache key 1:1 without needing to rehash source bytes.
+_INPROC_COMPILE_CACHE: Dict[str, Tuple[Any, Any]] = {}
+
+
+def _inproc_cache_key(snapshot: dict) -> str:
+    """Stable SHA1 of a kwargs snapshot for in-process memoisation."""
+    import hashlib as _hashlib
+    import json as _json
+    payload = _json.dumps(snapshot, sort_keys=True, default=repr).encode("utf-8")
+    return _hashlib.sha1(payload).hexdigest()
+
+
 def compile_full_vm_dynamic(
     S: float = 100.0,
     *,
@@ -1137,6 +1164,65 @@ def compile_full_vm_dynamic(
         if rms_norm_eps is None:
             rms_norm_eps = vm_config.rms_norm_eps
 
+    # In-process memo short-circuit. Mirrors the kwargs snapshot built inside
+    # ``_bake_from_scheduled_ops`` at the disk-cache lookup so the two layers
+    # invalidate together. Skips the ~1.3 s ``_collect_ops_for_compile`` pass
+    # and the ~3 s ``torch.load`` deserialisation on every subsequent call in
+    # the same process. Cross-process callers (fresh pytest invocations) still
+    # fall through to the disk cache. Disabled when ``disk_cache=False``
+    # (test paths that explicitly want a fresh compile) and when
+    # ``require_declarative_bake`` / ``declarations_only`` / a
+    # ``target_shape_overrides`` rebuild is requested (those paths post-process
+    # the model and would alias if we handed back a memoised reference).
+    _inproc_snapshot = None
+    if (
+        disk_cache
+        and not require_declarative_bake
+        and not declarations_only
+        and target_shape_overrides is None
+        and model_shape_constraint is None
+        and not d_model_packing
+    ):
+        _inproc_snapshot = {
+            "S": S,
+            "enable_conversational_io": enable_conversational_io,
+            "enable_tool_calling": enable_tool_calling,
+            "enable_neural_io_think_protocol": enable_neural_io_think_protocol,
+            "alu_mode": alu_mode,
+            "n_heads": n_heads,
+            "ffn_hidden": ffn_hidden,
+            "max_seq_len": max_seq_len,
+            "pin_io_only": pin_io_only,
+            "enable_moe_routing": bool(enable_moe_routing),
+            "positional_encoding": positional_encoding,
+            "attention_normalization": attention_normalization,
+            "rope_base": float(rope_base),
+            "use_rms_norm": bool(use_rms_norm),
+            "rms_norm_eps": float(rms_norm_eps),
+            "require_declarative_bake": bool(require_declarative_bake),
+            "declarations_only": bool(declarations_only),
+            "kv_eviction_policy": KVEvictionPolicy(kv_eviction_policy).value,
+            "kv_eviction_n_steps": int(kv_eviction_n_steps),
+            "C4_DISABLE_WRAPPER_EXPANSION": (
+                os.environ.get("C4_DISABLE_WRAPPER_EXPANSION") == "1"
+            ),
+            "__dynamic": True,
+        }
+        _memo_key = _inproc_cache_key(_inproc_snapshot)
+        _memo_hit = _INPROC_COMPILE_CACHE.get(_memo_key)
+        if _memo_hit is not None:
+            _cached_model, _cached_layout = _memo_hit
+            # Re-attach KV eviction state mirrors the disk-cache hit path in
+            # ``_bake_from_scheduled_ops``; the cached model may have been
+            # built in this process with a different policy/step count.
+            _static._attach_kv_eviction_state(
+                _cached_model,
+                _cached_layout,
+                kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
+                n_steps=int(kv_eviction_n_steps),
+            )
+            return _cached_model, _cached_layout
+
     # Collect ops with the same composition rules as compile_full_vm.
     ops = _collect_ops_for_compile(
         alu_mode=alu_mode,
@@ -1273,6 +1359,13 @@ def compile_full_vm_dynamic(
             raise ModelShapeMismatchError(
                 mismatches, target=model_shape_constraint.target
             )
+
+    # Populate the in-process memo so a subsequent call with the same kwargs
+    # in this process skips ``_collect_ops_for_compile`` + ``torch.load``.
+    # Only populated when the early-cache snapshot path was taken (the post-
+    # compile rebuild / packing branches are explicitly excluded above).
+    if _inproc_snapshot is not None:
+        _INPROC_COMPILE_CACHE[_inproc_cache_key(_inproc_snapshot)] = (model, layout)
 
     return model, layout
 
