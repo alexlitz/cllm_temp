@@ -37,6 +37,7 @@ import warnings
 
 from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
     CROSS_STEP_BASELINE_ALLOWLIST,
+    CROSS_STEP_DOCUMENTED_SAFE,
     CrossStepReadError,
     CrossStepReadWarning,
     _collect_ops_for_compile,
@@ -276,11 +277,13 @@ def test_strict_error_empty_allowlist_raises_cross_step_read_error():
 
 
 def test_strict_error_default_baseline_allowlist_succeeds():
-    """The bundled :data:`CROSS_STEP_BASELINE_ALLOWLIST` (82 entries at
-    Step-4 landing) must cover every finding the safety check produces
-    on today's op set. If not, the next compile would error and a fix
-    brief is needed to either migrate the offending read or extend the
-    allowlist with an explicit TODO.
+    """The bundled :data:`CROSS_STEP_BASELINE_ALLOWLIST` *union*
+    :data:`CROSS_STEP_DOCUMENTED_SAFE` (82 entries total at Step-4
+    landing; the documented-safe split lets audited cross-step reads
+    move out of the migration backlog) must cover every finding the
+    safety check produces on today's op set. If not, the next compile
+    would error and a fix brief is needed to either migrate the
+    offending read or extend the allowlist with an explicit TODO.
     """
     ops = _collect_ops_for_compile(
         alu_mode="lookup",
@@ -289,30 +292,44 @@ def test_strict_error_default_baseline_allowlist_succeeds():
         enable_neural_io_think_protocol=False,
     )
     # No raise -> success. Default ``allowlist=None`` activates the
-    # baked-in baseline.
+    # baked-in baseline UNION the documented-safe set.
     findings = _emit_cross_step_safety_warnings(ops, strict_error=True)
     pairs = {(c, r) for (c, r, _ws) in findings}
-    leaked = pairs - CROSS_STEP_BASELINE_ALLOWLIST
+    effective_allowlist = (
+        CROSS_STEP_BASELINE_ALLOWLIST | frozenset(CROSS_STEP_DOCUMENTED_SAFE.keys())
+    )
+    leaked = pairs - effective_allowlist
     assert not leaked, (
-        f"baseline allowlist missed {len(leaked)} new finding(s): "
-        f"{sorted(leaked)}. Either migrate those reads or extend "
-        f"CROSS_STEP_BASELINE_ALLOWLIST in "
-        f"``unified_compiler/full_vm_compiler_dynamic.py`` with a TODO."
+        f"baseline+documented-safe allowlists missed {len(leaked)} new "
+        f"finding(s): {sorted(leaked)}. Either migrate those reads or "
+        f"extend CROSS_STEP_BASELINE_ALLOWLIST / "
+        f"CROSS_STEP_DOCUMENTED_SAFE in "
+        f"``unified_compiler/full_vm_compiler_dynamic.py``."
     )
 
 
 def test_baseline_allowlist_size_matches_step4_landing():
     """Pin the Step-4 landing baseline size as a ratchet.
 
-    Step 4 freezes the allowlist at 82 entries (the production findings
-    at landing). The ratchet asserts that future commits do NOT GROW the
-    allowlist — every removal is progress toward the Step 4 goal of zero
-    cross-step zero-prop ambiguity. New cross-step reads must be migrated
-    in the same commit that introduces them, not allowlisted.
+    Step 4 froze the allowlist at 82 entries (the production findings
+    at landing). The ratchet asserts that future commits do NOT GROW
+    the BASELINE — every removal is progress toward the Step 4 goal of
+    zero cross-step zero-prop ambiguity. New cross-step reads must be
+    migrated in the same commit that introduces them, not allowlisted.
 
-    If you must add an entry, increment this ceiling in the same commit
-    AND add a TODO comment in the allowlist body pointing at the fix
-    plan.
+    Migrations OUT of the baseline come in two shapes:
+
+    * Bug-class fix — the read is renamed away from ``.*.-1`` (or the
+      writer is moved). The pair disappears from the findings, so it
+      can simply be removed from the baseline.
+    * Audited safe — the read is intentional cross-step (writer runs
+      later-in-step or the residual is a step-boundary durable). The
+      pair moves into :data:`CROSS_STEP_DOCUMENTED_SAFE` with a
+      justification, removing it from the baseline (and from the
+      ratchet's "TODO" count) without changing runtime behaviour.
+
+    If you must add an entry to the baseline, increment this ceiling in
+    the same commit AND add a TODO comment pointing at the fix plan.
     """
     assert len(CROSS_STEP_BASELINE_ALLOWLIST) <= 82, (
         f"CROSS_STEP_BASELINE_ALLOWLIST grew to "

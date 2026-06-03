@@ -907,7 +907,7 @@ class CrossStepReadError(Exception):
 # Each entry is a ``(consumer_op_name, ssa_dim_name)`` tuple that the safety
 # check has agreed to ignore — i.e. it WILL still produce a warning, but it
 # WILL NOT cause ``compile_full_vm_dynamic(strict=True)`` to raise
-# :class:`CrossStepReadError`. The list pins the 82 findings present at
+# :class:`CrossStepReadError`. The list pinned the 82 findings present at
 # Step-4 landing (alu_mode='lookup', io/tool/think flags all off); every
 # entry is a TODO to migrate the read away from the cross-step alias or
 # document why the step-1 zero-propagation is intentional.
@@ -918,6 +918,15 @@ class CrossStepReadError(Exception):
 # A regression test
 # (``tests/test_compile_cross_step_safety.py::test_baseline_allowlist_does_not_grow``)
 # pins ``len(CROSS_STEP_BASELINE_ALLOWLIST) <= 82`` as the ratchet.
+#
+# Step 4 follow-up: entries that have been audited and confirmed
+# INTENTIONAL cross-step reads (see ``CROSS_STEP_SSA_ANTIPATTERN_AUDIT.md``)
+# are migrated OUT of this baseline and INTO
+# :data:`CROSS_STEP_DOCUMENTED_SAFE` (a dict with per-entry
+# justifications). Both sets together form the effective allowlist used
+# by :func:`_emit_cross_step_safety_warnings`; the baseline ratchet only
+# counts this set, so each documented-safe migration shrinks the
+# remaining migration backlog visible to the ratchet.
 #
 # TODO(step4-migration): each entry below corresponds to a real cross-step
 # read in the production op set that should eventually be migrated to one
@@ -943,9 +952,6 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('_layer6_ffn_dep_anchor', 'AX_CARRY_LO.*.-1'),
     ('_layer6_ffn_dep_anchor', 'CMP.*.-1'),
     ('_opcode_decode_ffn_dep_anchor', 'OPCODE_BYTE_LO.*.-1'),
-    ('format_pointer_extraction', 'IO_IN_OUTPUT_MODE.*.-1'),
-    ('format_position_counter', 'IO_IN_OUTPUT_MODE.*.-1'),
-    ('format_string_fetch_head', 'IO_IN_OUTPUT_MODE.*.-1'),
     ('l10_post_ops_combined', 'OUTPUT_HI.*.-1'),
     ('l10_post_ops_combined', 'OUTPUT_LO.*.-1'),
     ('l10_post_ops_combined', 'TEMP.*.-1'),
@@ -959,15 +965,6 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('layer10_stack0_byte_relay', 'TEMP.*.-1'),
     ('layer10_stack0_byte_relay_bake', 'TEMP.*.-1'),
     ('layer12_mul_combine', 'TEMP.*.-1'),
-    ('layer14_addr_key_neural_decode', 'ADDR_B0_HI.*.-1'),
-    ('layer14_addr_key_neural_decode', 'ADDR_B0_LO.*.-1'),
-    ('layer14_mem_generation', 'ADDR_B0_HI.*.-1'),
-    ('layer14_mem_generation', 'ADDR_B0_LO.*.-1'),
-    ('layer15_memory_lookup', 'TEMP.*.-1'),
-    ('layer15_store_stack0_sp_byte0_addr', 'OUTPUT_HI.*.-1'),
-    ('layer16_lev_routing', 'ADDR_B0_HI.*.-1'),
-    ('layer16_lev_routing', 'ADDR_B0_LO.*.-1'),
-    ('layer16_lev_routing', 'TEMP.*.-1'),
     ('layer3_carry_forward_attn', 'EMBED_HI.*.-1'),
     ('layer3_carry_forward_attn', 'EMBED_LO.*.-1'),
     ('layer3_carry_forward_attn', 'OP_LEV.*.-1'),
@@ -977,7 +974,6 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('layer3_ffn', 'EMBED_LO.*.-1'),
     ('layer3_ffn', 'OP_LEV.*.-1'),
     ('layer3_ffn', 'TEMP.*.-1'),
-    ('layer4_pc_relay', 'ADDR_KEY.*.-1'),
     ('layer6_attn', 'AX_CARRY_HI.*.-1'),
     ('layer6_attn', 'AX_CARRY_LO.*.-1'),
     ('layer6_relay_heads', 'AX_CARRY_HI.*.-1'),
@@ -992,8 +988,6 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('layer7_memory_heads', 'AX_CARRY_HI.*.-1'),
     ('layer7_memory_heads', 'AX_CARRY_LO.*.-1'),
     ('layer7_memory_heads', 'TEMP.*.-1'),
-    ('layer7_operand_gather', 'OUTPUT_HI.*.-1'),
-    ('layer7_operand_gather', 'OUTPUT_LO.*.-1'),
     ('layer8_alu', 'ALU_LO.*.-1'),
     ('layer8_head6_ax_carry_refresh', 'OUTPUT_HI.*.-1'),
     ('layer8_head6_ax_carry_refresh', 'OUTPUT_LO.*.-1'),
@@ -1007,13 +1001,120 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('layer9_alu', 'ALU_HI.*.-1'),
     ('layer9_alu', 'ALU_LO.*.-1'),
     ('layer9_alu', 'CARRY.*.-1'),
-    ('lev_detector_head', 'ADDR_B0_HI.*.-1'),
-    ('lev_detector_head', 'ADDR_B0_LO.*.-1'),
-    ('lev_detector_head', 'TEMP.*.-1'),
     ('opcode_decode_ffn', 'OPCODE_BYTE_LO.*.-1'),
     ('putchar_think_protocol', 'AX_CARRY_HI.*.-1'),
     ('putchar_think_protocol', 'AX_CARRY_LO.*.-1'),
 })
+
+
+# ---------------------------------------------------------------------------
+# Cross-step DOCUMENTED-SAFE annotations
+# ---------------------------------------------------------------------------
+#
+# Each entry is a ``(consumer_op_name, ssa_dim_name)`` pair that the
+# safety check produces a finding for, but which has been *audited* (see
+# ``docs/CROSS_STEP_SSA_ANTIPATTERN_AUDIT.md``) and confirmed as an
+# INTENTIONAL cross-step read: the same-step "writer" reported by the
+# global writer scan runs *later in the same VM step* than the reader, so
+# the ``.*.-1`` alias correctly resolves to the prior step's value (not
+# the current step's not-yet-produced write). Step 1 then sees the
+# initialised residual rather than a stale 0 (or sees 0 by design because
+# the prev-step residual is the boot value).
+#
+# The dict value is a short justification — typically pointing at the
+# comment in the op factory that explains the cross-step semantics. These
+# pairs are MERGED into the effective allowlist by
+# :func:`_emit_cross_step_safety_warnings`, so they continue to suppress
+# the strict-mode error, but they no longer count toward the
+# :data:`CROSS_STEP_BASELINE_ALLOWLIST` migration backlog (the ratchet
+# test only inspects the baseline allowlist).
+#
+# Add an entry HERE rather than to the baseline when the cross-step read
+# is the correct semantics (writer is genuinely later-in-step, or the
+# residual is a step-boundary durable). Add to the baseline only when
+# the read is a TODO for migration.
+CROSS_STEP_DOCUMENTED_SAFE: Dict[Tuple[str, str], str] = {
+    ('layer4_pc_relay', 'ADDR_KEY.*.-1'):
+        "Reader is L4; sole producer is L14 (layer14_addr_key_neural_decode "
+        "/ layer14_clear_addr_key_pollution), which runs AFTER L4 in the "
+        "same step. The PC-marker residual carries prev-step's L14 write. "
+        "See ops/l4_ops.py:211-219.",
+    ('format_pointer_extraction', 'IO_IN_OUTPUT_MODE.*.-1'):
+        "null_terminator_detection (phase=10.6) writes IO_IN_OUTPUT_MODE "
+        "for the NEXT step's gating. Same numeric slot via SSA alias; "
+        "byte-identical bake. See ops/l7_ops.py:608-611.",
+    ('format_position_counter', 'IO_IN_OUTPUT_MODE.*.-1'):
+        "null_terminator_detection (phase=10.6) is the sole writer and "
+        "runs AFTER this op (phase=8.5) in the same step; reader sees "
+        "the prev-step residual by design. See ops/l8_ops.py:1240-1244.",
+    ('format_string_fetch_head', 'IO_IN_OUTPUT_MODE.*.-1'):
+        "null_terminator_detection (phase=10.6) stages "
+        "IO_IN_OUTPUT_MODE for the NEXT step's L9 format-fetch gating. "
+        "Breaks the null_terminator_detection -> format_string_fetch_head "
+        "SCC. See ops/l9_ops.py:1522-1527.",
+    ('lev_detector_head', 'TEMP.*.-1'):
+        "L8 form-2 control-flow head whose job is to detect the PRIOR "
+        "instruction step's LEV opcode. The cross-step TEMP read is the "
+        "core design: it materialises the prev-step saved-PC staging "
+        "through the KV cache. See ops/control_flow_heads.py:252-261.",
+    ('lev_detector_head', 'ADDR_B0_LO.*.-1'):
+        "Same design as TEMP.*.-1 above — the LEV detector head reads "
+        "prev-step ADDR_B0_LO from the saved-BP staging. "
+        "See ops/control_flow_heads.py:252-261.",
+    ('lev_detector_head', 'ADDR_B0_HI.*.-1'):
+        "Same design as TEMP.*.-1 above — the LEV detector head reads "
+        "prev-step ADDR_B0_HI from the saved-BP staging. "
+        "See ops/control_flow_heads.py:252-261.",
+    ('layer7_operand_gather', 'OUTPUT_LO.*.-1'):
+        "L7 fires before any same-step OUTPUT_LO writer (L8+/L14+). The "
+        "attended row is a prior step's marker; its residual OUTPUT_LO "
+        "carries the previous step's value. Retires 31 OUTPUT_LO "
+        "back-edges from later layers. See ops/l7_ops.py:167-175.",
+    ('layer7_operand_gather', 'OUTPUT_HI.*.-1'):
+        "L7 fires before any same-step OUTPUT_HI writer (L8+). Same "
+        "prev-step semantics as OUTPUT_LO above. "
+        "See ops/l7_ops.py:176-189.",
+    ('layer14_addr_key_neural_decode', 'ADDR_B0_HI.*.-1'):
+        "Sole same-step writer is L15 store_stack0_sp_byte0_addr "
+        "(phase=15.2), which runs AFTER L14. Same numeric slot 206; "
+        "byte-identical bake. See ops/l14_ops.py:3080-3084.",
+    ('layer14_addr_key_neural_decode', 'ADDR_B0_LO.*.-1'):
+        "Same design as ADDR_B0_HI above — L15 store_stack0_sp_byte0_addr "
+        "is the sole same-step writer. See ops/l14_ops.py:3083-3084.",
+    ('layer14_mem_generation', 'ADDR_B0_HI.*.-1'):
+        "L15 store_stack0_sp_byte0_addr (phase=15.2) writes ADDR_B0_HI "
+        "AFTER L14 in the same step. All earlier ADDR_B0_HI writers "
+        "(L4/L8/L9/L13) resolve to the same numeric slot 206 as forward "
+        "edges. See ops/l14_ops.py:739-746.",
+    ('layer14_mem_generation', 'ADDR_B0_LO.*.-1'):
+        "Same design as ADDR_B0_HI above — L15 store_stack0_sp_byte0_addr "
+        "is the same-step LATER writer. See ops/l14_ops.py:747-750.",
+    ('layer15_memory_lookup', 'TEMP.*.-1'):
+        "L11 mul_partial / L14 temp_clear are the same-step writers but "
+        "land AFTER L15 under dynamic scheduling; the TEMP residual the "
+        "lookup heads consume is the PRIOR step's value carried through "
+        "the KV cache. See ops/l15_ops.py:559-569.",
+    ('layer15_store_stack0_sp_byte0_addr', 'OUTPUT_HI.*.-1'):
+        "L16 lev_routing and tail_bit32_result_correction both fire AFTER "
+        "L15 in the same step. Head 12 attends back to the prior-step "
+        "STACK0/SP-marker token whose cached OUTPUT_HI is the "
+        "prev-step value. See ops/l15_ops.py:666-673.",
+    ('layer16_lev_routing', 'ADDR_B0_LO.*.-1'):
+        "L16 is the last layer; the LEV routing materialises PC/BP/SP "
+        "from the previous step's marker residuals via the KV cache. "
+        "Same-step L15 store_stack0_sp_byte0_addr is the writer the "
+        "global scan flags but dynamic scheduling lands it BEFORE L16, "
+        "so the resolved read is genuine prev-step. "
+        "See ops/l16_ops.py:1664-1678.",
+    ('layer16_lev_routing', 'ADDR_B0_HI.*.-1'):
+        "Same design as ADDR_B0_LO above — genuine prev-step LEV "
+        "semantics. See ops/l16_ops.py:1671.",
+    ('layer16_lev_routing', 'TEMP.*.-1'):
+        "Same design — L11 mul_partial / L14 temp_clear writers run "
+        "earlier than L16 (forward edges, resolved at the same numeric "
+        "slot); the LEV routing reads the previous step's TEMP residual "
+        "delivered via the KV cache. See ops/l16_ops.py:1669-1670.",
+}
 
 
 def _find_cross_step_reads_with_same_step_writers(
@@ -1108,11 +1209,13 @@ def _emit_cross_step_safety_warnings(
 
     ``allowlist``: an iterable of ``(consumer, ssa_read)`` tuples to
     suppress from the hard-error gate. When ``None`` (the default) the
-    bundled :data:`CROSS_STEP_BASELINE_ALLOWLIST` is used — that is, the
-    82 entries present at Step-4 landing. Pass an empty iterable to
-    disable the baseline (i.e. promote every finding to an error). Pass
-    a custom iterable to extend or replace the baseline for a specific
-    compile.
+    bundled :data:`CROSS_STEP_BASELINE_ALLOWLIST` UNION
+    :data:`CROSS_STEP_DOCUMENTED_SAFE` is used — together they cover the
+    82 findings present at Step-4 landing (the baseline is the
+    migration backlog; documented-safe is the audited-intentional
+    subset). Pass an empty iterable to disable both (i.e. promote every
+    finding to an error). Pass a custom iterable to extend or replace
+    them for a specific compile.
 
     The warning emission is independent of ``strict_error`` — every
     finding still emits a :class:`CrossStepReadWarning` so allowlisted
@@ -1139,12 +1242,17 @@ def _emit_cross_step_safety_warnings(
             )
             warnings.warn(msg, CrossStepReadWarning, stacklevel=2)
     if strict_error:
-        # Resolve the allowlist. ``None`` -> baked-in baseline. Any explicit
-        # iterable (including an empty one) -> use as-is. This lets a
-        # caller pass ``[]`` to promote every finding to an error.
+        # Resolve the allowlist. ``None`` -> baked-in baseline UNION
+        # the documented-safe set (entries audited as intentional
+        # cross-step reads; see :data:`CROSS_STEP_DOCUMENTED_SAFE`).
+        # Any explicit iterable (including an empty one) -> use as-is,
+        # which lets a caller pass ``[]`` to promote every finding to
+        # an error (audited or not) for the strictest no-cross-step
+        # bake-author workflow.
         if allowlist is None:
             effective_allowlist: FrozenSet[Tuple[str, str]] = (
                 CROSS_STEP_BASELINE_ALLOWLIST
+                | frozenset(CROSS_STEP_DOCUMENTED_SAFE.keys())
             )
         else:
             effective_allowlist = frozenset(allowlist)
