@@ -45,17 +45,23 @@ _L14_HEAD_LAYOUT_BY_NAME = {n: h for n, h in _L14_HEAD_LAYOUT}
 
 
 def _allocate_layer14_mem_generation_heads() -> AttentionHeadAllocator:
-    """Build a per-bake :class:`AttentionHeadAllocator` with the L14 heads pinned.
+    """Build a per-bake :class:`AttentionHeadAllocator` for the L14 heads.
 
-    Every entry in :data:`_L14_HEAD_LAYOUT` is pinned at its existing
-    ``head_idx`` so the underlying weight writes -- now expressed as
-    ``DeclarativeAttentionHeadSpec`` instances -- land byte-identically.
-    The legacy ``_set_layer14_mem_generation`` helper iterated h=0..7
-    with ``base = h * HD``; those same indices are pinned here.
+    Phase 7.B: ``pin=`` has been dropped. :data:`_L14_HEAD_LAYOUT` lists
+    the heads in declaration order ``(head_0..head_7)`` and the per-bake
+    allocator starts empty, so first-fit deterministically lands each
+    entry at the same ``head_idx`` the legacy pin claimed (0..7). The
+    layout table remains the audited source of truth for downstream
+    :data:`_L14_HEAD_LAYOUT_BY_NAME` lookups -- the allocator itself is
+    bookkeeping for collision detection, not the source of ``head_idx``
+    for the bake. Drop-of-pins is byte-identical because the legacy
+    ``_set_layer14_mem_generation`` helper iterated ``h=0..7`` with
+    ``base = h * HD``; first-fit on an empty per-layer pool reproduces
+    that exact sweep.
     """
     allocator = AttentionHeadAllocator()
-    for name, head_idx in _L14_HEAD_LAYOUT:
-        allocator.alloc(name, layer_idx=14, pin=head_idx)
+    for name, _expected_head_idx in _L14_HEAD_LAYOUT:
+        allocator.alloc(name, layer_idx=14)
     return allocator
 
 
