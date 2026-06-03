@@ -14,7 +14,7 @@ Status (Task 81, scaffolding):
   - ``wide_add_rules`` / ``wide_sub_rules`` — stubs (Wave W3).
   - ``wide_shift_rules`` — IMPLEMENTED (Wave W2, per-byte lookup).
   - ``wide_mul_rules`` — stub (Wave W5, 9-stage pipeline).
-  - ``wide_div_rules`` — stub (Wave W4, long-division).
+  - ``wide_div_rules`` — IMPLEMENTED (Wave W4, per-byte nibble lookup POC).
 
 The validation contract per helper is:
   ``rule_lowered_ffn.forward(x)  ==  hand_composite.forward(x)``
@@ -729,34 +729,127 @@ def wide_div_rules(
     marker_gate: str,
     S: float,
 ) -> Tuple[FFNRule, ...]:
-    """Generate FFNRule list for the long-division DIV/MOD pipeline.
+    """Generate FFNRule list for wide DIV/MOD — per-byte nibble lookup (POC).
 
-    Stub for Wave W4 (``FlattenedDivMod`` migration). The current
-    composite is a multi-stage long-division pipeline using
-    ``wide_sub_rules``-equivalents internally; the DSL migration will
-    layer it on top of the W3 ``wide_sub_rules`` helper.
+    Wave W4 implementation (8-bit POC). The hand-written composite
+    ``FlattenedDivMod`` (see ``efficient_alu_divmod_split.py``) is a
+    4-stage long-division pipeline (BD->GE, DIV pipeline, MOD pipeline,
+    GE->BD writeback) wrapping an 8-outer x 3-inner long-division loop.
+    This DSL helper expresses the equivalent semantics as a flat lookup
+    table: one FFNRule per ``(byte_position, dividend_nibble,
+    divisor_nibble)`` triple.
+
+    Per byte position ``b`` (0..``width_bytes``-1):
+
+      * For each ``(a_nib, b_nib)`` with ``b_nib > 0``:
+        emit one rule that fires when ``marker_gate`` AND
+        ``dividend_base+(b*16+a_nib)`` AND ``divisor_base+(b*16+b_nib)``
+        are all hot, gated on ``opcode_gate``. The rule writes BOTH:
+          - ``quotient_base+(b*16 + a_nib // b_nib)``
+          - ``remainder_base+(b*16 + a_nib % b_nib)``
+
+      * For each ``a_nib`` with ``b_nib == 0`` (divide-by-zero guard):
+        emit one rule that fires on the divisor zero-bin
+        (``divisor_base+(b*16+0)``) and writes the conventional
+        zero-divide convention:
+          - quotient = 0  (write to ``quotient_base+(b*16+0)``)
+          - remainder = a_nib  (write to
+            ``remainder_base+(b*16+a_nib)``, i.e. dividend pass-through)
+
+    Rule mechanics (lookup mode, same 3-way AND pattern as
+    :func:`bitwise_rules` and :func:`wide_shift_rules`):
+
+      * conditions: marker(+40), dividend_nib(+30), divisor_nib(+30)
+      * threshold:  80.0  (40+30+30=100 > 80 fires; any two = 70 < 80)
+      * gate:       ``opcode_gate``  (DIV / MOD opcode flag)
+
+    Output writes use the standard ``2.0 / S`` lookup-mode amplitude.
+
+    Total rule count per byte: 16 * 16 = 256 (240 quotient+remainder
+    rules for ``b_nib in 1..15`` plus 16 guard rules for ``b_nib == 0``).
+    For ``width_bytes=1`` this matches the brief's nibble-level POC
+    target.
 
     Args:
-        dividend_base: dim base for dividend per-byte bands.
-        divisor_base: dim base for divisor per-byte bands.
-        quotient_base: dim base for quotient per-byte bands.
+        dividend_base: dim base for dividend per-byte nibble bands. Per
+            byte ``b`` rule reads ``dividend_base+(b*16+a_nib)``.
+        divisor_base: dim base for divisor per-byte nibble bands.
+        quotient_base: dim base for quotient per-byte bands. Writes land
+            on ``quotient_base+(b*16 + a_nib // b_nib)``.
         remainder_base: dim base for remainder per-byte bands.
-        width_bytes: operand width in bytes.
+        width_bytes: number of nibble-wide bytes in the wide operation.
         opcode_gate: dim ref for the ``DIV`` / ``MOD`` opcode flag.
         marker_gate: dim name for the AX-style marker.
-        S: SwiGLU scale.
+        S: SwiGLU scale (typically 100.0).
 
     Returns:
-        Stub raises ``NotImplementedError`` (W4 pending).
+        ``tuple[FFNRule, ...]`` of length ``width_bytes * 256``.
+
+    Raises:
+        ValueError: if ``width_bytes`` is not a positive integer.
     """
-    del (
-        dividend_base, divisor_base, quotient_base, remainder_base,
-        width_bytes, opcode_gate, marker_gate, S,
-    )
-    raise NotImplementedError(
-        "wide_div_rules: Wave W4 not implemented (long-division). "
-        "Tracked under ``docs/IR_DSL_DESIGN.md`` Section 5 — DivMod migration."
-    )
+    if not isinstance(width_bytes, int) or width_bytes < 1:
+        raise ValueError(
+            f"wide_div_rules: width_bytes must be a positive int; "
+            f"got {width_bytes!r}"
+        )
+
+    write_amplitude = 2.0 / S
+    rules: list[FFNRule] = []
+
+    for b in range(width_bytes):
+        byte_offset = b * 16
+        # Non-zero divisor cases: quotient + remainder lookup.
+        for a_nib in range(16):
+            for b_nib in range(1, 16):
+                q = a_nib // b_nib
+                r = a_nib % b_nib
+                rules.append(FFNRule.gated_write(
+                    name=(
+                        f"wide_div_b{b}_a{a_nib:x}_b{b_nib:x}"
+                    ),
+                    conditions=(
+                        (marker_gate, 40.0),
+                        (f"{dividend_base}+{byte_offset + a_nib}", 30.0),
+                        (f"{divisor_base}+{byte_offset + b_nib}", 30.0),
+                    ),
+                    threshold=80.0,
+                    gate=opcode_gate,
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=(
+                        (f"{quotient_base}+{byte_offset + q}",
+                         write_amplitude),
+                        (f"{remainder_base}+{byte_offset + r}",
+                         write_amplitude),
+                    ),
+                ))
+
+        # Divide-by-zero guard: divisor nibble == 0.
+        # Convention: quotient = 0, remainder = dividend (pass-through).
+        # Matches the common "saturate-to-0 / preserve dividend"
+        # behavior used by other ALU divide-by-zero handlers.
+        for a_nib in range(16):
+            rules.append(FFNRule.gated_write(
+                name=f"wide_div_b{b}_a{a_nib:x}_b0_guard",
+                conditions=(
+                    (marker_gate, 40.0),
+                    (f"{dividend_base}+{byte_offset + a_nib}", 30.0),
+                    (f"{divisor_base}+{byte_offset + 0}", 30.0),
+                ),
+                threshold=80.0,
+                gate=opcode_gate,
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=(
+                    (f"{quotient_base}+{byte_offset + 0}",
+                     write_amplitude),
+                    (f"{remainder_base}+{byte_offset + a_nib}",
+                     write_amplitude),
+                ),
+            ))
+
+    return tuple(rules)
 
 
 __all__ = [
