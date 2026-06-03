@@ -1850,7 +1850,7 @@ def _build_layout_only(
         compiler.add_op(make_efficient_l8_addsub_wrap_op(alu_mode=alu_mode))
         compiler.add_op(make_efficient_l10_andorxor_wrap_op(alu_mode=alu_mode))
         compiler.add_op(make_efficient_l11_alumul_wrap_op(alu_mode=alu_mode))
-    for op in make_alu_divmod_composite_ops():
+    for op in make_alu_divmod_composite_ops(alu_mode=alu_mode):
         compiler.add_op(op)
     compiler.add_op(make_residual_alibi_slopes_op())
     compiler.add_op(make_layer10_residual_alibi_slopes_op(alu_mode=alu_mode))

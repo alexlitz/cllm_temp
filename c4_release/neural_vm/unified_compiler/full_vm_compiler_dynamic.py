@@ -1792,7 +1792,7 @@ def _collect_ops_for_compile(
         ops.append(_static.make_efficient_l10_andorxor_wrap_op(alu_mode=alu_mode))
         ops.append(_static.make_efficient_l11_alumul_wrap_op(alu_mode=alu_mode))
 
-    for op in _static.make_alu_divmod_composite_ops():
+    for op in _static.make_alu_divmod_composite_ops(alu_mode=alu_mode):
         ops.append(op)
 
     ops.append(_static.make_residual_alibi_slopes_op())

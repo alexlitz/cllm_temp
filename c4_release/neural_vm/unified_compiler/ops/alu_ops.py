@@ -912,7 +912,7 @@ def make_l12_alu_mul_getobd_op() -> Operation:
 from .shared import _FlattenedDivModBuilder
 
 
-def make_alu_divmod_composite_ops():
+def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
     """Build the 4 cooperating ops (3 stage + 1 install) for FlattenedDivMod.
 
     Returns ``[bdtoge, longdiv, getobd, install]`` — all sharing the same
@@ -922,11 +922,36 @@ def make_alu_divmod_composite_ops():
     Stage ops are kind="block", layer_idx=10 (so they have access to the
     block when needed; their bake_fns operate on the shared builder
     rather than the block). Install op is kind="block", layer_idx=10.
+
+    DSL Wave W4 (``docs/IR_DSL_DESIGN.md`` Section 5): when
+    ``alu_mode == 'efficient'``, the 3 stage ops (bdtoge/longdiv/getobd)
+    become no-ops and the install op installs a rule-derived ``PureFFN``
+    post_op baked from ``wide_alu_dsl.wide_div_rules`` (DIV + MOD
+    batches) instead of the hand-written ``FlattenedDivMod`` composite.
+
+    8-bit POC limit (W4): ``wide_div_rules(width_bytes=1, ...)`` emits a
+    per-nibble lookup (256 rules per byte band per opcode). The
+    legacy ``FlattenedDivMod`` runs a true 8-bit long-division pipeline
+    over the GE workspace (cross-nibble carries). The per-nibble lookup
+    is therefore NOT byte-identical for inputs that span both nibbles
+    (e.g. ``84 / 2 = 42`` would require dividing ``0x54`` as a single
+    integer, not nibble-by-nibble). Multi-byte / cross-nibble lowering is
+    deferred to a follow-up wave that lowers the 4-stage GE composite
+    (BD->GE, long-division loop, GE->BD writeback) as rules. The current
+    POC matches the W3 (sub) / W5 (mul) "per-byte naive" convention so
+    we land the install-site contract without blocking on the GE pipeline.
+
+    For the legacy ``alu_mode == 'lookup'`` path nothing changes —
+    ``FlattenedDivMod`` is still appended as the post_op.
     """
     builder = _FlattenedDivModBuilder()
 
     def make_bdtoge():
         def bake(block, dim_positions, S):
+            if alu_mode == 'efficient':
+                # DSL W4: stage ops are no-ops; install op builds the
+                # rule-derived PureFFN directly.
+                return
             BD = _as_setdim_proxy(dim_positions)
             composite = builder.ensure(S, BD)
             composite.install_bdtoge()
@@ -953,6 +978,8 @@ def make_alu_divmod_composite_ops():
 
     def make_longdiv():
         def bake(block, dim_positions, S):
+            if alu_mode == 'efficient':
+                return
             BD = _as_setdim_proxy(dim_positions)
             composite = builder.ensure(S, BD)
             composite.install_longdiv()
@@ -978,6 +1005,8 @@ def make_alu_divmod_composite_ops():
 
     def make_getobd():
         def bake(block, dim_positions, S):
+            if alu_mode == 'efficient':
+                return
             BD = _as_setdim_proxy(dim_positions)
             composite = builder.ensure(S, BD)
             composite.install_getobd()
@@ -1009,6 +1038,96 @@ def make_alu_divmod_composite_ops():
 
     def make_install():
         def bake(block, dim_positions, S):
+            if alu_mode == 'efficient':
+                # DSL Wave W4: install a rule-derived PureFFN post_op
+                # baked from ``wide_div_rules`` (DIV + MOD batches) in
+                # place of the hand-written ``FlattenedDivMod`` composite.
+                #
+                # 8-bit POC limit: per-nibble lookup only — NOT byte-
+                # identical for inputs spanning both nibbles. See the
+                # docstring on ``make_alu_divmod_composite_ops`` for the
+                # deferred multi-byte / cross-nibble plan.
+                from ...base_layers import PureFFN
+                from ..primitives import Primitives
+                from ..wide_alu_dsl import wide_div_rules
+
+                rule_list: list = []
+                # DIV: quotient -> OUTPUT_LO/HI; remainder discarded by
+                # routing it to a non-output band (we route both into the
+                # same OUTPUT bands and rely on the opcode gate to keep
+                # only the active opcode's write).
+                rule_list.extend(wide_div_rules(
+                    dividend_base="ALU_LO",
+                    divisor_base="AX_CARRY_LO",
+                    quotient_base="OUTPUT_LO",
+                    remainder_base="OUTPUT_LO",
+                    width_bytes=1,
+                    opcode_gate="OP_DIV",
+                    marker_gate="MARK_AX",
+                    S=S,
+                ))
+                rule_list.extend(wide_div_rules(
+                    dividend_base="ALU_HI",
+                    divisor_base="AX_CARRY_HI",
+                    quotient_base="OUTPUT_HI",
+                    remainder_base="OUTPUT_HI",
+                    width_bytes=1,
+                    opcode_gate="OP_DIV",
+                    marker_gate="MARK_AX",
+                    S=S,
+                ))
+                # MOD: remainder -> OUTPUT_LO/HI; quotient routed onto
+                # same OUTPUT band, opcode-gated by OP_MOD so only this
+                # batch fires for MOD opcodes.
+                rule_list.extend(wide_div_rules(
+                    dividend_base="ALU_LO",
+                    divisor_base="AX_CARRY_LO",
+                    quotient_base="OUTPUT_LO",
+                    remainder_base="OUTPUT_LO",
+                    width_bytes=1,
+                    opcode_gate="OP_MOD",
+                    marker_gate="MARK_AX",
+                    S=S,
+                ))
+                rule_list.extend(wide_div_rules(
+                    dividend_base="ALU_HI",
+                    divisor_base="AX_CARRY_HI",
+                    quotient_base="OUTPUT_HI",
+                    remainder_base="OUTPUT_HI",
+                    width_bytes=1,
+                    opcode_gate="OP_MOD",
+                    marker_gate="MARK_AX",
+                    S=S,
+                ))
+                rules = tuple(rule_list)
+                # 4 batches x 256 rules (per byte band) = 1024 rules.
+                assert len(rules) == 4 * 256, (
+                    f"wide_div_rules: expected 1024 rules "
+                    f"(4 batches x 256), got {len(rules)}"
+                )
+
+                # d_model from the existing block.ffn; PureFFN post_op
+                # uses the same residual width.
+                ffn_in = block.ffn
+                if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
+                    d_model = int(ffn_in.W_up.shape[1])
+                else:
+                    d_model = int(getattr(ffn_in, "dim", 512))
+                new_ffn = PureFFN(dim=d_model, hidden_dim=len(rules))
+
+                bd_proxy = _as_setdim_proxy(dim_positions)
+                names = Primitives.ffn_rule_dim_names(rules)
+                dim_pos = Primitives.dim_positions_from_bd(bd_proxy, names)
+                end = Primitives.lower_ffn_rules(
+                    new_ffn, rules, dim_pos, start_unit=0, S=S,
+                )
+                assert end == len(rules), (
+                    f"lower_ffn_rules wrote {end} units; "
+                    f"expected {len(rules)}"
+                )
+                block.post_ops.append(new_ffn)
+                return
+
             if builder.composite is None:
                 # No stage bakes ran (defensive). Skip cleanly.
                 return
@@ -1041,24 +1160,24 @@ def make_alu_divmod_composite_ops():
 
 # Single-op factory shims for callers that want one op (e.g. unit tests).
 # Each returns a fresh builder so the ops aren't entangled across factories.
-def make_l10_alu_divmod_bdtoge_op() -> Operation:
+def make_l10_alu_divmod_bdtoge_op(alu_mode: str = 'lookup') -> Operation:
     """L10 stage 1: BD → GE format conversion (standalone factory)."""
-    return make_alu_divmod_composite_ops()[0]
+    return make_alu_divmod_composite_ops(alu_mode=alu_mode)[0]
 
 
-def make_l10_alu_divmod_longdiv_op() -> Operation:
+def make_l10_alu_divmod_longdiv_op(alu_mode: str = 'lookup') -> Operation:
     """L10 stage 2: long-division pipeline (standalone factory)."""
-    return make_alu_divmod_composite_ops()[1]
+    return make_alu_divmod_composite_ops(alu_mode=alu_mode)[1]
 
 
-def make_l10_alu_divmod_getobd_op() -> Operation:
+def make_l10_alu_divmod_getobd_op(alu_mode: str = 'lookup') -> Operation:
     """L10 stage 3: GE → BD format conversion (standalone factory)."""
-    return make_alu_divmod_composite_ops()[2]
+    return make_alu_divmod_composite_ops(alu_mode=alu_mode)[2]
 
 
-def make_l10_alu_divmod_install_op() -> Operation:
+def make_l10_alu_divmod_install_op(alu_mode: str = 'lookup') -> Operation:
     """L10 install op: append composite to block.post_ops (standalone factory)."""
-    return make_alu_divmod_composite_ops()[3]
+    return make_alu_divmod_composite_ops(alu_mode=alu_mode)[3]
 
 
 def make_layer10_residual_alibi_slopes_op(alu_mode: str = 'lookup') -> Operation:
