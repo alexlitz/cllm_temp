@@ -687,3 +687,133 @@ def test_rmsnorm_default_off_byte_identical_to_no_kwarg():
     assert torch.equal(y_default, y_explicit), (
         "use_rms_norm=False is not byte-identical to no-kwarg default."
     )
+
+
+# ---------------------------------------------------------------------------
+# Declarative IR-spec unit tests (Phase 11 / V2 architectural toggles).
+#
+# The compile_full_vm_dynamic kwargs (positional_encoding=, use_rms_norm=,
+# rope_base=, ffn_hidden=, div_mode=, attention_normalization=) are being
+# migrated to declarative IR specs that live on CompilerIR. These tests pin
+# the validation + default behaviour of those specs so a downstream wiring
+# commit can swap the kwarg surface without silently changing semantics.
+#
+# Wiring into compile_full_vm_dynamic is a follow-up — these tests cover
+# the spec types themselves, not the compiler pathway.
+# ---------------------------------------------------------------------------
+
+from dataclasses import FrozenInstanceError
+
+from neural_vm.unified_compiler.ir import (
+    NormSpec,
+    PositionalEncodingSpec,
+)
+
+
+# --- NormSpec --------------------------------------------------------------
+
+
+def test_norm_spec_default_is_layernorm_with_positive_eps():
+    """Default NormSpec must match the historical pre-RMSNorm behaviour:
+    LayerNorm with a small positive epsilon. The default is the no-toggle
+    path so existing models stay byte-identical when callers migrate from
+    the kwarg surface to the IR spec.
+    """
+    spec = NormSpec()
+    assert spec.kind == "layernorm"
+    assert spec.eps > 0.0
+    # Frozen dataclass — mutation must raise so the spec is round-trippable.
+    with pytest.raises(FrozenInstanceError):
+        spec.kind = "rmsnorm"  # type: ignore[misc]
+
+
+def test_norm_spec_accepts_known_kinds():
+    """All advertised norm kinds construct cleanly. Pinning the valid set
+    here guards against an accidental rename / removal that would silently
+    break a caller passing the kind as a string from config.
+    """
+    for kind in NormSpec._VALID_KINDS:
+        spec = NormSpec(kind=kind, eps=1e-5)
+        assert spec.kind == kind
+        assert spec.eps == 1e-5
+
+
+def test_norm_spec_rejects_unknown_kind():
+    """An unknown norm kind must raise ValueError at construction. This
+    is the user-facing error path when a caller mis-spells the kind
+    string (e.g. "RMSNorm" instead of "rmsnorm").
+    """
+    with pytest.raises(ValueError, match="NormSpec.kind"):
+        NormSpec(kind="layer_norm")  # type: ignore[arg-type]
+
+
+def test_norm_spec_rejects_non_positive_eps():
+    """eps must be strictly positive — a zero or negative eps would
+    divide-by-zero (or produce a complex sqrt) inside the norm and is
+    almost certainly a caller bug, so reject at construction time.
+    """
+    with pytest.raises(ValueError, match="eps"):
+        NormSpec(eps=0.0)
+    with pytest.raises(ValueError, match="eps"):
+        NormSpec(eps=-1e-6)
+
+
+# --- PositionalEncodingSpec ------------------------------------------------
+
+
+def test_positional_encoding_spec_default_is_alibi_with_rope_base():
+    """Default PositionalEncodingSpec must be byte-identical to the
+    historical default — alibi attention with the canonical RoPE base
+    inherited from the kwarg surface (used when the kind flips to rope).
+    """
+    spec = PositionalEncodingSpec()
+    assert spec.kind == "alibi"
+    assert spec.rope_base == 10000.0
+    assert spec.alibi_slopes is None
+    with pytest.raises(FrozenInstanceError):
+        spec.kind = "rope"  # type: ignore[misc]
+
+
+def test_positional_encoding_spec_accepts_known_kinds():
+    """All advertised positional-encoding kinds construct cleanly. The
+    valid set is intentionally broader than {rope, alibi} so callers can
+    target sinusoidal / learned / none from the same spec type.
+    """
+    for kind in PositionalEncodingSpec._VALID_KINDS:
+        spec = PositionalEncodingSpec(kind=kind)
+        assert spec.kind == kind
+
+
+def test_positional_encoding_spec_rejects_unknown_kind():
+    """An unknown position-encoding kind must raise ValueError. Guards
+    against typos in config strings (e.g. "Rope" or "ALIBI") that would
+    otherwise silently fall through to a default code path.
+    """
+    with pytest.raises(ValueError, match="PositionalEncodingSpec.kind"):
+        PositionalEncodingSpec(kind="rope_v2")  # type: ignore[arg-type]
+
+
+def test_positional_encoding_spec_alibi_slopes_must_be_tuple():
+    """alibi_slopes must be a tuple (frozen, hashable) — a list would
+    silently break the frozen-dataclass equality / hashing contract that
+    callers depend on for IR caching.
+    """
+    # Tuple input is accepted.
+    spec = PositionalEncodingSpec(kind="alibi", alibi_slopes=(0.5, 0.25))
+    assert spec.alibi_slopes == (0.5, 0.25)
+
+    # List input is rejected — the user is responsible for tuple(...).
+    with pytest.raises(TypeError, match="alibi_slopes"):
+        PositionalEncodingSpec(
+            kind="alibi", alibi_slopes=[0.5, 0.25]  # type: ignore[arg-type]
+        )
+
+
+def test_positional_encoding_spec_rope_base_overridable():
+    """rope_base is a public field — Mixtral-style models use a larger
+    base (1e6) than the canonical 10000. This pins the override path so
+    a downstream compile wiring can plumb the value through.
+    """
+    spec = PositionalEncodingSpec(kind="rope", rope_base=1_000_000.0)
+    assert spec.kind == "rope"
+    assert spec.rope_base == 1_000_000.0
