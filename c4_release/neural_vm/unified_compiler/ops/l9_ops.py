@@ -280,6 +280,14 @@ def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
 
     gate_lea = dim_ref("opcode_flag", "LEA")
     rules: list[FFNRule] = []
+    # 10-way amplified AND: MARK_AX(+20) + seven non-AX marker blockers(-1000
+    # each) + ALU_HI nibble(+1) + FETCH_HI nibble(+20) + CARRY+0 carry-in
+    # discrimination (+/- 8.0). Explicit threshold 40.5 (no carry) / 48.5
+    # (with carry) — the non-AX blockers' -1000 magnitudes would derail any
+    # automatic threshold derivation, and the negative MARK_PC-like
+    # blockers similarly can't be passed through multi_way_and_rule's
+    # default. Passed as explicit threshold to keep the structural cell
+    # layout identical to the legacy bake.
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
@@ -296,13 +304,11 @@ def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                 else:
                     conditions.append(("CARRY+0", 8.0))
                     threshold = 48.5
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l9_lea_hi_c{carry_in}_a{a}_b{b}",
                     conditions=tuple(conditions),
                     threshold=threshold,
                     gate=gate_lea,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
                 ))
     return tuple(rules)
