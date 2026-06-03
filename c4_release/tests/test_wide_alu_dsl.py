@@ -30,6 +30,7 @@ from neural_vm.unified_compiler.primitives import Primitives  # noqa: E402
 from neural_vm.unified_compiler.wide_alu_dsl import (  # noqa: E402
     bitwise_rules,
     wide_add_rules,
+    wide_shift_rules,
 )
 from neural_vm.vm_step import _SetDim  # noqa: E402
 
@@ -324,5 +325,223 @@ def test_wide_add_rules_byte_identity_one_byte(lowered_add_ffn):
 
     assert not mismatches, (
         f"wide_add byte-identity failures ({len(mismatches)}/256):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave W2: wide_shift_rules byte-identity (8-bit, width_bytes=1).
+# ---------------------------------------------------------------------------
+#
+# The shift helper uses a 256-wide-per-byte one-hot operand band — distinct
+# from the residual layout consumed by ALUShiftComposite (which splits the
+# operand into 16-wide LO + 16-wide HI nibble bands). To validate the rule
+# semantics independently of any existing dim allocation, the test builds an
+# ad-hoc ``dim_positions`` mapping and a fresh ``PureFFN`` sized to cover
+# all positions the rules reference. The reference is Python's native shift,
+# which is the contract documented in ``wide_shift_rules``.
+
+
+# Ad-hoc dim layout for the 8-bit shift test. ``operand_base`` and
+# ``result_base`` are 256-wide one-hot bands per byte position; with
+# ``width_bytes=1`` each consumes 256 slots. ``SHIFT_AMT`` is 8-wide.
+# ``MARK_GATE`` and the opcode gates each take one slot.
+_SHIFT_DIM_LAYOUT = {
+    "MARK_GATE": 0,
+    "OP_SHL_GATE": 1,
+    "OP_SHR_GATE": 2,
+    "SHIFT_AMT": 3,            # SHIFT_AMT+k for k in 0..7 → slots 3..10
+    "OPERAND": 11,             # OPERAND+N for N in 0..255 → slots 11..266
+    "RESULT": 267,             # RESULT+R for R in 0..255 → slots 267..522
+}
+_SHIFT_FFN_DIM = 523
+
+
+def _lowered_wide_shift_ffn(direction: str, S: float = 100.0) -> PureFFN:
+    """Build a ``PureFFN`` lowered from ``wide_shift_rules`` for one direction.
+
+    ``width_bytes=1`` (an 8-bit shift). The FFN dim is sized to exactly
+    cover the ad-hoc dim layout above.
+    """
+    rules = wide_shift_rules(
+        direction=direction,
+        operand_base="OPERAND",
+        shift_amount_dim="SHIFT_AMT",
+        result_base="RESULT",
+        width_bytes=1,
+        opcode_gate="OP_SHL_GATE" if direction == "left" else "OP_SHR_GATE",
+        marker_gate="MARK_GATE",
+        S=S,
+    )
+    expected_count = 1 * 8 * 256
+    assert len(rules) == expected_count, (
+        f"wide_shift_rules({direction!r}) emitted {len(rules)} rules, "
+        f"expected {expected_count}"
+    )
+    ffn = PureFFN(dim=_SHIFT_FFN_DIM, hidden_dim=expected_count)
+    end = Primitives.lower_ffn_rules(
+        ffn, rules, _SHIFT_DIM_LAYOUT, start_unit=0, S=S,
+    )
+    assert end == expected_count, (
+        f"lower_ffn_rules wrote {end} units, expected {expected_count}"
+    )
+    return ffn
+
+
+def _make_shift_input(*, n: int, k: int, direction: str) -> torch.Tensor:
+    """Build a one-position residual with the marker, opcode, shift, and
+    operand one-hots set per the ad-hoc layout.
+    """
+    x = torch.zeros(1, 1, _SHIFT_FFN_DIM)
+    x[0, 0, _SHIFT_DIM_LAYOUT["MARK_GATE"]] = 1.0
+    gate_dim = "OP_SHL_GATE" if direction == "left" else "OP_SHR_GATE"
+    x[0, 0, _SHIFT_DIM_LAYOUT[gate_dim]] = 1.0
+    x[0, 0, _SHIFT_DIM_LAYOUT["SHIFT_AMT"] + k] = 1.0
+    x[0, 0, _SHIFT_DIM_LAYOUT["OPERAND"] + n] = 1.0
+    return x
+
+
+def _decode_shift_result_byte(y: torch.Tensor) -> int:
+    """argmax over the 256-wide RESULT band → byte value."""
+    base = _SHIFT_DIM_LAYOUT["RESULT"]
+    return int(y[0, 0, base:base + 256].argmax().item())
+
+
+def test_wide_shift_rules_emits_expected_count():
+    """Sanity: width_bytes * 8 shift amounts * 256 byte values per direction."""
+    for direction in ("left", "right"):
+        rules = wide_shift_rules(
+            direction=direction,
+            operand_base="OPERAND",
+            shift_amount_dim="SHIFT_AMT",
+            result_base="RESULT",
+            width_bytes=1,
+            opcode_gate=(
+                "OP_SHL_GATE" if direction == "left" else "OP_SHR_GATE"
+            ),
+            marker_gate="MARK_GATE",
+            S=100.0,
+        )
+        assert len(rules) == 8 * 256, (
+            f"{direction}: emitted {len(rules)} rules, expected 2048"
+        )
+
+    # width_bytes=4 → 4 * 8 * 256 = 8192 rules.
+    rules_wide = wide_shift_rules(
+        direction="left",
+        operand_base="OPERAND",
+        shift_amount_dim="SHIFT_AMT",
+        result_base="RESULT",
+        width_bytes=4,
+        opcode_gate="OP_SHL_GATE",
+        marker_gate="MARK_GATE",
+        S=100.0,
+    )
+    assert len(rules_wide) == 4 * 8 * 256
+
+
+def test_wide_shift_rules_rejects_bad_args():
+    """Validation errors for unsupported direction / width_bytes."""
+    with pytest.raises(ValueError, match="direction"):
+        wide_shift_rules(
+            direction="middle",  # type: ignore[arg-type]
+            operand_base="OPERAND",
+            shift_amount_dim="SHIFT_AMT",
+            result_base="RESULT",
+            width_bytes=1,
+            opcode_gate="OP_SHL_GATE",
+            marker_gate="MARK_GATE",
+            S=100.0,
+        )
+    with pytest.raises(ValueError, match="width_bytes"):
+        wide_shift_rules(
+            direction="left",
+            operand_base="OPERAND",
+            shift_amount_dim="SHIFT_AMT",
+            result_base="RESULT",
+            width_bytes=0,
+            opcode_gate="OP_SHL_GATE",
+            marker_gate="MARK_GATE",
+            S=100.0,
+        )
+
+
+@pytest.fixture(scope="module")
+def lowered_shift_ffns() -> dict:
+    return {
+        "left": _lowered_wide_shift_ffn("left"),
+        "right": _lowered_wide_shift_ffn("right"),
+    }
+
+
+@pytest.mark.parametrize("direction", ["left", "right"])
+@pytest.mark.parametrize(
+    ("n", "k"),
+    [
+        (0x00, 0),  # zero operand
+        (0xFF, 0),  # zero shift
+        (0x01, 4),  # left: 0x10, right: 0x00
+        (0x0F, 4),  # left: 0xF0, right: 0x00
+        (0xF0, 4),  # left: 0x00, right: 0x0F
+        (0x80, 3),  # left: 0xC0 (drop high), right: 0x10
+        (0x42, 1),  # arbitrary
+        (0xAA, 7),  # max shift
+        (0x55, 7),
+        (0xC3, 2),
+    ],
+)
+def test_wide_shift_rules_byte_identity_8bit(
+    lowered_shift_ffns, direction, n, k
+):
+    """The lowered ``wide_shift_rules`` FFN reproduces the Python reference
+    shift bit-for-bit on the RESULT band (argmax decode).
+    """
+    x = _make_shift_input(n=n, k=k, direction=direction)
+    with torch.no_grad():
+        y = lowered_shift_ffns[direction](x)
+    decoded = _decode_shift_result_byte(y)
+
+    if direction == "left":
+        expected = (n << k) & 0xFF
+    else:
+        expected = (n >> k) & 0xFF
+
+    assert decoded == expected, (
+        f"wide_shift_rules({direction!r}) byte-identity drift: "
+        f"n=0x{n:02X} k={k} -> expected=0x{expected:02X}, "
+        f"got=0x{decoded:02X}"
+    )
+
+
+def test_wide_shift_rules_byte_identity_randomized(lowered_shift_ffns):
+    """Randomized sweep: 24 (n, k) pairs per direction. Argmax-decoded
+    RESULT byte must match the Python reference on every one. Seeded for
+    determinism.
+    """
+    gen = torch.Generator().manual_seed(0x5417C757)  # "SHIFTS" hex-ish
+    n_trials = 24
+    ns = torch.randint(0, 256, (n_trials,), generator=gen).tolist()
+    ks = torch.randint(0, 8, (n_trials,), generator=gen).tolist()
+
+    mismatches = []
+    for direction in ("left", "right"):
+        for n, k in zip(ns, ks):
+            x = _make_shift_input(n=n, k=k, direction=direction)
+            with torch.no_grad():
+                decoded = _decode_shift_result_byte(
+                    lowered_shift_ffns[direction](x)
+                )
+            if direction == "left":
+                expected = (n << k) & 0xFF
+            else:
+                expected = (n >> k) & 0xFF
+            if decoded != expected:
+                mismatches.append(
+                    f"{direction} n=0x{n:02X} k={k}: "
+                    f"expected=0x{expected:02X} got=0x{decoded:02X}"
+                )
+
+    assert not mismatches, (
+        f"Byte-identity failures ({len(mismatches)}/{2 * n_trials}):\n  "
         + "\n  ".join(mismatches[:10])
     )

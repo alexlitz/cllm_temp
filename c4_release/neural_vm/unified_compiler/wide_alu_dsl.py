@@ -12,7 +12,7 @@ FFNRule, ...]`` lists. They lower through the existing
 Status (Task 81, scaffolding):
   - ``bitwise_rules`` — IMPLEMENTED (Wave W1 POC).
   - ``wide_add_rules`` / ``wide_sub_rules`` — stubs (Wave W3).
-  - ``wide_shift_rules`` — stub (Wave W2).
+  - ``wide_shift_rules`` — IMPLEMENTED (Wave W2, per-byte lookup).
   - ``wide_mul_rules`` — stub (Wave W5, 9-stage pipeline).
   - ``wide_div_rules`` — stub (Wave W4, long-division).
 
@@ -365,34 +365,103 @@ def wide_shift_rules(
     marker_gate: str,
     S: float,
 ) -> Tuple[FFNRule, ...]:
-    """Generate FFNRule list for wide shift (SHL/SHR).
+    """Generate FFNRule list for wide shift (SHL/SHR) — per-byte lookup.
 
-    Stub for Wave W2 (``ALUShiftComposite`` migration). The composite is
-    a per-byte select + precompute pipeline; the rules will encode the
-    SHL/SHR lookup table currently produced by ``_set_layer13_shifts``
-    (already partially migrated — see ``ops/l13_ops.py``).
+    Wave W2 implementation. The composite ``ALUShiftComposite`` in
+    ``efficient_alu_neural.py`` is a 4-stage precompute + select pipeline
+    (BD->GE, SHL/SHR precompute, opcode-gated select, GE->BD). This DSL
+    helper expresses the equivalent semantics as a flat lookup table:
+    one FFNRule per ``(byte_position, shift_amount, byte_value)`` triple.
+
+    Per byte position ``b`` (0..``width_bytes``-1), per shift amount
+    ``k`` (0..7), per byte value ``N`` (0..255), the helper emits one
+    rule that:
+
+      * fires when ``marker_gate`` AND ``shift_amount_dim+k`` (the shift
+        amount one-hot at value ``k``) AND ``operand_base+(b*256+N)``
+        (the byte-b operand one-hot at value ``N``) are all hot, AND
+      * is gated by ``opcode_gate`` (the ``SHL`` / ``SHR`` opcode flag).
+
+    The write lands on ``result_base+(b*256 + result_value)`` where
+    ``result_value = (N << k) & 0xFF`` for ``direction='left'`` or
+    ``N >> k`` for ``direction='right'``. The shift is per-byte and
+    independent across bytes — no inter-byte propagation, matching the
+    simplified semantics this Wave is targeting (full carry propagation
+    is a future extension).
+
+    The 3-way AND uses weights (40, 30, 30) with threshold 80 — same
+    balanced-AND pattern as :func:`bitwise_rules`:
+
+      * all three present: 40 + 30 + 30 = 100 > 80 -> fires
+      * any two present:   max(40 + 30) = 70 < 80 -> blocked
 
     Args:
         direction: ``"left"`` (SHL) or ``"right"`` (SHR).
-        operand_base: dim base for the operand per-byte bands.
-        shift_amount_dim: dim name for the shift amount nibble.
-        result_base: dim base for the result per-byte bands.
-        width_bytes: number of bytes in the wide operation.
+        operand_base: dim base for the operand. Per byte ``b`` the rule
+            reads ``operand_base+(b*256+N)``. A 256-wide one-hot band
+            per byte position.
+        shift_amount_dim: dim base for the shift amount. The rule reads
+            ``shift_amount_dim+k`` for shift amount ``k``.
+        result_base: dim base for the result. Per byte ``b`` the rule
+            writes ``result_base+(b*256+result_value)``.
+        width_bytes: number of bytes in the wide operation (e.g. 1 for
+            u8, 4 for u32).
         opcode_gate: dim ref for the ``SHL`` / ``SHR`` opcode flag.
         marker_gate: dim name for the AX-style marker.
-        S: SwiGLU scale.
+        S: SwiGLU scale (typically 100.0).
 
     Returns:
-        Stub raises ``NotImplementedError`` (W2 pending).
+        ``tuple[FFNRule, ...]`` of length ``width_bytes * 8 * 256``.
+
+    Raises:
+        ValueError: if ``direction`` is not ``"left"`` or ``"right"``.
+        ValueError: if ``width_bytes`` is not a positive integer.
     """
-    del (
-        direction, operand_base, shift_amount_dim, result_base,
-        width_bytes, opcode_gate, marker_gate, S,
-    )
-    raise NotImplementedError(
-        "wide_shift_rules: Wave W2 not implemented. "
-        "Tracked under ``docs/IR_DSL_DESIGN.md`` Section 5 — Shift migration."
-    )
+    if direction not in ("left", "right"):
+        raise ValueError(
+            f"wide_shift_rules: direction must be 'left' or 'right'; "
+            f"got {direction!r}"
+        )
+    if not isinstance(width_bytes, int) or width_bytes < 1:
+        raise ValueError(
+            f"wide_shift_rules: width_bytes must be a positive int; "
+            f"got {width_bytes!r}"
+        )
+
+    if direction == "left":
+        shift_fn = lambda n, k: (n << k) & 0xFF
+        dir_tag = "shl"
+    else:
+        shift_fn = lambda n, k: (n >> k) & 0xFF
+        dir_tag = "shr"
+
+    write_scale = 2.0 / S
+    rules: list[FFNRule] = []
+    for b in range(width_bytes):
+        operand_offset = b * 256
+        result_offset = b * 256
+        for k in range(8):
+            for n in range(256):
+                result = shift_fn(n, k)
+                rules.append(FFNRule.gated_write(
+                    name=(
+                        f"wide_{dir_tag}_b{b}_k{k}_n{n:02x}"
+                    ),
+                    conditions=(
+                        (marker_gate, 40.0),
+                        (f"{shift_amount_dim}+{k}", 30.0),
+                        (f"{operand_base}+{operand_offset + n}", 30.0),
+                    ),
+                    threshold=80.0,
+                    gate=opcode_gate,
+                    gate_weight=1.0,
+                    gate_bias=0.0,
+                    writes=(
+                        (f"{result_base}+{result_offset + result}",
+                         write_scale),
+                    ),
+                ))
+    return tuple(rules)
 
 
 # ---------------------------------------------------------------------------
