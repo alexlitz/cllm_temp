@@ -72,6 +72,7 @@ from .layer_compiler import (
     requires_same_layer_as_ops,
 )
 from .ssa_dim import base_of, is_ssa_form, parse_ssa_name
+from .ir import ModelArchitectureSpec
 from . import _legacy_redirect as _static
 from ..kv_eviction import KVEvictionPolicy
 
@@ -953,6 +954,7 @@ def compile_full_vm_dynamic(
     disk_cache: bool = True,
     use_dynamic_ffn: bool = True,
     enable_moe_routing: Optional[bool] = None,
+    arch: Optional[ModelArchitectureSpec] = None,
     positional_encoding: Optional[str] = None,
     attention_normalization: Optional[str] = None,
     rope_base: Optional[float] = None,
@@ -1081,16 +1083,59 @@ def compile_full_vm_dynamic(
 
     from ..config import get_config
     vm_config = get_config()
-    if positional_encoding is None:
-        positional_encoding = vm_config.positional_encoding
-    if attention_normalization is None:
-        attention_normalization = vm_config.attention_normalization
-    if rope_base is None:
-        rope_base = vm_config.rope_base
-    if use_rms_norm is None:
-        use_rms_norm = vm_config.use_rms_norm
-    if rms_norm_eps is None:
-        rms_norm_eps = vm_config.rms_norm_eps
+
+    # V2 vision (Phase 8.X): a single ``arch=ModelArchitectureSpec(...)`` may
+    # be passed in lieu of the individual architectural kwargs
+    # (``positional_encoding=``, ``attention_normalization=``,
+    # ``rope_base=``, ``use_rms_norm=``, ``rms_norm_eps=``). Mixing the two
+    # surfaces is rejected with an explicit error rather than silently
+    # privileging one — the migration story is "pick one path per call site".
+    # The individual kwargs remain the back-compat surface; new callers
+    # should prefer ``arch=`` (which composes per-layer overrides cleanly
+    # via :class:`LayerSpec`).
+    if arch is not None:
+        _explicit_arch_kwargs = {
+            name: value
+            for name, value in (
+                ("positional_encoding", positional_encoding),
+                ("attention_normalization", attention_normalization),
+                ("rope_base", rope_base),
+                ("use_rms_norm", use_rms_norm),
+                ("rms_norm_eps", rms_norm_eps),
+            )
+            if value is not None
+        }
+        if _explicit_arch_kwargs:
+            raise TypeError(
+                "compile_full_vm_dynamic(arch=...) is mutually exclusive "
+                "with the individual architectural kwargs "
+                f"{sorted(_explicit_arch_kwargs)}. Pass either an "
+                "``arch=ModelArchitectureSpec(...)`` instance OR the "
+                "individual ``positional_encoding=``/"
+                "``attention_normalization=``/``rope_base=``/"
+                "``use_rms_norm=``/``rms_norm_eps=`` kwargs, not both."
+            )
+        # Project the spec back onto the legacy 5-kwarg surface that the
+        # downstream ``_bake_from_scheduled_ops`` / ``_rebuild_to_target_shape``
+        # APIs still consume. This keeps the runtime path byte-identical
+        # to the historical kwarg path — a spec is just a typed name for
+        # the same five values.
+        positional_encoding = arch.positional_encoding.kind
+        attention_normalization = arch.attention_activation.softmax_kind
+        rope_base = float(arch.positional_encoding.rope_base)
+        use_rms_norm = arch.norm_pre_attention.kind == "rmsnorm"
+        rms_norm_eps = float(arch.norm_pre_attention.eps)
+    else:
+        if positional_encoding is None:
+            positional_encoding = vm_config.positional_encoding
+        if attention_normalization is None:
+            attention_normalization = vm_config.attention_normalization
+        if rope_base is None:
+            rope_base = vm_config.rope_base
+        if use_rms_norm is None:
+            use_rms_norm = vm_config.use_rms_norm
+        if rms_norm_eps is None:
+            rms_norm_eps = vm_config.rms_norm_eps
 
     # Collect ops with the same composition rules as compile_full_vm.
     ops = _collect_ops_for_compile(

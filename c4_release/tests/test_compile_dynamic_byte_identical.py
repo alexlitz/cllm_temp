@@ -168,3 +168,103 @@ def test_compile_full_vm_dynamic_runs_with_all_flags():
     assert layout.d_model > 0
     sd = model.state_dict()
     assert len(sd) > 0
+
+
+# ---------------------------------------------------------------------------
+# V2 toggle-IR wiring: ``arch=ModelArchitectureSpec(...)``
+# ---------------------------------------------------------------------------
+
+
+def test_arch_spec_kwarg_rejects_mixed_individual_kwargs():
+    """Passing both ``arch=`` and an individual architectural kwarg must
+    fail loudly. The two surfaces are mutually exclusive — silently
+    privileging one would let a caller think a toggle took effect when it
+    didn't.
+    """
+    from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+        compile_full_vm_dynamic,
+    )
+    from c4_release.neural_vm.unified_compiler.ir import (
+        ModelArchitectureSpec,
+        PositionalEncodingSpec,
+    )
+
+    spec = ModelArchitectureSpec(
+        positional_encoding=PositionalEncodingSpec(kind="rope", rope_base=10000.0),
+    )
+    with pytest.raises(TypeError, match="mutually exclusive"):
+        compile_full_vm_dynamic(
+            arch=spec,
+            positional_encoding="alibi",  # conflicts with spec
+            disk_cache=False,
+        )
+
+
+@pytest.mark.slow
+def test_arch_spec_kwarg_byte_identical_to_individual_kwargs():
+    """Building a VM via ``arch=ModelArchitectureSpec.from_compile_kwargs(...)``
+    must be byte-identical to building it via the legacy individual
+    architectural kwargs. The spec is just a typed name for the same
+    five values, so the compiled state-dict tensors must match
+    exactly.
+    """
+    import torch
+
+    from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+        compile_full_vm_dynamic,
+    )
+    from c4_release.neural_vm.unified_compiler.ir import ModelArchitectureSpec
+
+    common_kwargs = dict(
+        alu_mode="lookup",
+        disk_cache=False,
+    )
+
+    # Path A: legacy individual kwargs (the historical surface).
+    model_kwargs, layout_kwargs = compile_full_vm_dynamic(
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        rope_base=10000.0,
+        use_rms_norm=False,
+        rms_norm_eps=1e-6,
+        **common_kwargs,
+    )
+
+    # Path B: single ``arch=`` spec (the V2 surface). Build the spec via
+    # the documented adapter so the two paths are explicitly equivalent.
+    spec = ModelArchitectureSpec.from_compile_kwargs(
+        positional_encoding="alibi",
+        attention_normalization="softmax1",
+        rope_base=10000.0,
+        use_rms_norm=False,
+        rms_norm_eps=1e-6,
+    )
+    model_arch, layout_arch = compile_full_vm_dynamic(arch=spec, **common_kwargs)
+
+    # Layout-level shape parity: both paths must produce the same
+    # topology. (Layout deltas would surface before tensor diffs.)
+    assert layout_kwargs.n_layers == layout_arch.n_layers
+    assert layout_kwargs.d_model == layout_arch.d_model
+
+    # State-dict tensor byte-identity: every key must match and every
+    # tensor must be bitwise-equal. Random init is keyed by
+    # ``torch.manual_seed`` inside the compile path, so the two builds
+    # see identical RNG state when given byte-equivalent kwargs.
+    sd_kwargs = model_kwargs.state_dict()
+    sd_arch = model_arch.state_dict()
+    assert set(sd_kwargs.keys()) == set(sd_arch.keys()), (
+        "arch= path produced a different state_dict key set than the "
+        "kwarg path"
+    )
+    for key in sd_kwargs:
+        t_kw = sd_kwargs[key]
+        t_ar = sd_arch[key]
+        assert t_kw.shape == t_ar.shape, (
+            f"shape diff at {key}: kwargs={tuple(t_kw.shape)} vs "
+            f"arch={tuple(t_ar.shape)}"
+        )
+        assert torch.equal(t_kw, t_ar), (
+            f"tensor diff at {key} between kwargs path and arch= path "
+            f"(max-abs diff "
+            f"{(t_kw - t_ar).abs().max().item() if t_kw.is_floating_point() else 'non-float'})"
+        )
