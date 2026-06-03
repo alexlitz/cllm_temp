@@ -940,18 +940,6 @@ class CrossStepReadError(Exception):
 # Track migrations in ``docs/IR_INCREMENTAL_IMPROVEMENTS.md`` Step 4
 # section.
 CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
-    ('_layer11_ffn_dep_anchor', 'ALU_LO.*.-1'),
-    ('_layer12_ffn_dep_anchor', 'TEMP.*.-1'),
-    ('_layer3_ffn_dep_anchor', 'EMBED_HI.*.-1'),
-    ('_layer3_ffn_dep_anchor', 'EMBED_LO.*.-1'),
-    ('_layer3_ffn_dep_anchor', 'OP_LEV.*.-1'),
-    ('_layer3_ffn_dep_anchor', 'TEMP.*.-1'),
-    ('_layer6_attn_dep_anchor', 'AX_CARRY_HI.*.-1'),
-    ('_layer6_attn_dep_anchor', 'AX_CARRY_LO.*.-1'),
-    ('_layer6_ffn_dep_anchor', 'AX_CARRY_HI.*.-1'),
-    ('_layer6_ffn_dep_anchor', 'AX_CARRY_LO.*.-1'),
-    ('_layer6_ffn_dep_anchor', 'CMP.*.-1'),
-    ('_opcode_decode_ffn_dep_anchor', 'OPCODE_BYTE_LO.*.-1'),
     ('l10_post_ops_combined', 'OUTPUT_HI.*.-1'),
     ('l10_post_ops_combined', 'OUTPUT_LO.*.-1'),
     ('l10_post_ops_combined', 'TEMP.*.-1'),
@@ -967,12 +955,8 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('layer12_mul_combine', 'TEMP.*.-1'),
     ('layer3_carry_forward_attn', 'EMBED_HI.*.-1'),
     ('layer3_carry_forward_attn', 'EMBED_LO.*.-1'),
-    ('layer3_carry_forward_attn', 'OP_LEV.*.-1'),
-    ('layer3_carry_forward_attn', 'OUTPUT_HI.*.-1'),
-    ('layer3_carry_forward_attn', 'OUTPUT_LO.*.-1'),
     ('layer3_ffn', 'EMBED_HI.*.-1'),
     ('layer3_ffn', 'EMBED_LO.*.-1'),
-    ('layer3_ffn', 'OP_LEV.*.-1'),
     ('layer3_ffn', 'TEMP.*.-1'),
     ('layer6_attn', 'AX_CARRY_HI.*.-1'),
     ('layer6_attn', 'AX_CARRY_LO.*.-1'),
@@ -981,7 +965,6 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('layer6_routing_ffn', 'AX_CARRY_HI.*.-1'),
     ('layer6_routing_ffn', 'AX_CARRY_LO.*.-1'),
     ('layer6_routing_ffn', 'CMP.*.-1'),
-    ('layer6_routing_ffn', 'DIV_STAGING.*.-1'),
     ('layer6_routing_ffn', 'OUTPUT_HI.*.-1'),
     ('layer6_routing_ffn', 'OUTPUT_LO.*.-1'),
     ('layer6_routing_ffn', 'TEMP.*.-1'),
@@ -1114,6 +1097,110 @@ CROSS_STEP_DOCUMENTED_SAFE: Dict[Tuple[str, str], str] = {
         "earlier than L16 (forward edges, resolved at the same numeric "
         "slot); the LEV routing reads the previous step's TEMP residual "
         "delivered via the KV cache. See ops/l16_ops.py:1669-1670.",
+    # ----- Round 2 migrations (TODO backlog -> documented-safe) -----
+    # Subset 1: consumer-is-topology-anchor (writes-only-declared, bake_fn
+    # returns immediately — see make_*_dep_anchor_op factories). For these
+    # ops the cross-step read has ZERO runtime impact: the declared reads
+    # exist purely to fix the dep-graph slot the LayerCompiler reserves;
+    # the bake itself produces no weight rows. Same-step earlier writers
+    # therefore cannot "poison" any downstream computation through this
+    # consumer, regardless of who else writes the base dim.
+    ('_layer3_ffn_dep_anchor', 'EMBED_HI.*.-1'):
+        "Topology anchor: writes=set(), bake_fn returns immediately "
+        "(see ops/l3_ops.py:1032-1034). The EMBED_HI.*.-1 read is "
+        "declarative-only — it sizes the dep-graph slot so layer3_ffn "
+        "(kind='block', target_op_name='_layer3_ffn_dep_anchor') resolves "
+        "to L3; the anchor's own bake produces no weight contribution.",
+    ('_layer3_ffn_dep_anchor', 'EMBED_LO.*.-1'):
+        "Same design as EMBED_HI.*.-1 above — topology anchor, no bake "
+        "side-effect. See ops/l3_ops.py:1049-1052 (Phase 9.B mirror of "
+        "layer3_ffn's EMBED_LO rename).",
+    ('_layer3_ffn_dep_anchor', 'OP_LEV.*.-1'):
+        "Topology anchor (no bake side-effect) AND all writers run later: "
+        "_opcode_decode_ffn_dep_anchor / opcode_decode_ffn are L5 ops, "
+        "anchor sits at L3. See ops/l3_ops.py:1045 (Phase 8.A OP_LEV "
+        "PREV_STEP rationale: L5 owns OP_LEV; L3 anchor reads prev-step).",
+    ('_layer3_ffn_dep_anchor', 'TEMP.*.-1'):
+        "Topology anchor (no bake side-effect). The same-step earlier "
+        "writer layer3_carry_forward_attn writes TEMP but the anchor's "
+        "read cannot propagate because writes=set(). See "
+        "ops/l3_ops.py:1044 (Phase 8.A.6 v2 TEMP_PREV_STEP rationale).",
+    ('_layer6_attn_dep_anchor', 'AX_CARRY_HI.*.-1'):
+        "Topology anchor: writes={CMP, ALU_LO, ALU_HI} but bake_fn returns "
+        "immediately (see ops/l6_ops.py; the AX_CARRY reads are kept as "
+        ".*.-1 SSA aliases to keep the anchor's earliest landable layer "
+        "at L6 — purely structural). The anchor's bake produces no weight "
+        "contribution; same-step writers cannot poison anything downstream.",
+    ('_layer6_attn_dep_anchor', 'AX_CARRY_LO.*.-1'):
+        "Same design as AX_CARRY_HI.*.-1 above — topology anchor, no bake "
+        "side-effect. The AX_CARRY_LO/HI .*.-1 form is documented in the "
+        "factory as 'kept so a same-step writer at L6 cannot push this "
+        "anchor's earliest landable layer past L6'.",
+    ('_layer6_ffn_dep_anchor', 'AX_CARRY_HI.*.-1'):
+        "Topology anchor for layer6_routing_ffn (block, target_op_name="
+        "'_layer6_ffn_dep_anchor'): writes are dep-graph mirrors, bake_fn "
+        "returns immediately. The cross-step AX_CARRY_HI read is purely "
+        "declarative; it cannot affect runtime weights.",
+    ('_layer6_ffn_dep_anchor', 'AX_CARRY_LO.*.-1'):
+        "Same design as AX_CARRY_HI.*.-1 above — topology anchor, no bake "
+        "side-effect.",
+    ('_layer6_ffn_dep_anchor', 'CMP.*.-1'):
+        "Same design — topology anchor (no bake side-effect). See "
+        "ops/l6_ops.py make_layer6_ffn_dep_anchor_op; the CMP.*.-1 read "
+        "mirrors layer6_routing_ffn's own cross-step CMP read so the dep "
+        "graph treats them identically.",
+    ('_layer11_ffn_dep_anchor', 'ALU_LO.*.-1'):
+        "Topology anchor for layer11_mul_partial (block, target_op_name="
+        "'_layer11_ffn_dep_anchor'). bake_fn returns immediately; "
+        "writes={TEMP} are dep-graph mirrors, not a runtime computation. "
+        "The cross-step ALU_LO read is declarative-only.",
+    ('_layer12_ffn_dep_anchor', 'TEMP.*.-1'):
+        "Topology anchor for layer12_mul_combine (block, target_op_name="
+        "'_layer12_ffn_dep_anchor'). bake_fn returns immediately. The "
+        "cross-step TEMP read is declarative-only and cannot poison any "
+        "downstream computation. See ops/l12_ops.py make_layer12_ffn_dep_"
+        "anchor_op.",
+    ('_opcode_decode_ffn_dep_anchor', 'OPCODE_BYTE_LO.*.-1'):
+        "Topology anchor for opcode_decode_ffn (block, target_op_name="
+        "'_opcode_decode_ffn_dep_anchor'). bake_fn returns immediately "
+        "(ops/l5_ops.py:869-871) so the cross-step read is declarative-"
+        "only. Additionally the sole writer layer5_fetch runs LATER in "
+        "step than this anchor: anchor@L5(attn,0,1), fetch@L5(block,1,9). "
+        "The actual opcode_decode_ffn op (block, same layer LATER intra) "
+        "still appears in the BASELINE as the active bug record.",
+    # Subset 2: all-writers-later-than-reader, confirmed by inspecting
+    # the compiled layout (LayerCompiler.ops_per_layer + block-op layer
+    # resolution). The cross-step alias correctly resolves to the prior
+    # step's value through the KV cache because no same-step writer of
+    # the base dim runs before the reader.
+    ('layer3_carry_forward_attn', 'OP_LEV.*.-1'):
+        "Sole writers are L5 ops (_opcode_decode_ffn_dep_anchor / "
+        "opcode_decode_ffn), both LATER than L3 reader. See "
+        "ops/l3_ops.py:733-738: 'OP_LEV_PREV_STEP marks the OP_LEV read "
+        "as cross-step relative to L5 opcode_decode_ffn... PC-increment "
+        "/ carry-correction rules use the previous step's OP_LEV decode "
+        "as the skip-increment-on-LEV suppressor.'",
+    ('layer3_carry_forward_attn', 'OUTPUT_HI.*.-1'):
+        "L3 carry-forward attn is at layer 3 (attn, intra=0); every "
+        "OUTPUT_HI writer runs LATER (L10/L14/L17 block ops, plus "
+        "layer3_ffn at (3,1,4)). The prev-step OUTPUT_HI residual through "
+        "the KV cache is the genuine input. See "
+        "ops/l3_ops.py:1225-1236 (OUTPUT_*.*.-1 cross-step rationale).",
+    ('layer3_carry_forward_attn', 'OUTPUT_LO.*.-1'):
+        "Same design as OUTPUT_HI.*.-1 above — every OUTPUT_LO writer runs "
+        "LATER than the L3 reader in the same step. The cross-step alias "
+        "delivers the prior step's OUTPUT_LO residual via the KV cache.",
+    ('layer3_ffn', 'OP_LEV.*.-1'):
+        "Sole writers are L5 ops (_opcode_decode_ffn_dep_anchor / "
+        "opcode_decode_ffn), both at later layers than the L3 FFN reader. "
+        "See ops/l3_ops.py:733-738 — the L3 FFN PC-increment uses the "
+        "PREVIOUS step's OP_LEV decode as the skip-increment-on-LEV "
+        "suppressor; that's exactly what the prev-step alias delivers.",
+    ('layer6_routing_ffn', 'DIV_STAGING.*.-1'):
+        "Sole writer is layer10_alu at L13 (block, intra=38); reader is "
+        "layer6_routing_ffn at L6 (block, intra=12). Writer runs MUCH "
+        "later — the cross-step alias delivers the prior step's "
+        "DIV_STAGING residual via the KV cache.",
 }
 
 
