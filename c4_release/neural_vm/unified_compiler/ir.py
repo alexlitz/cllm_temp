@@ -1089,14 +1089,33 @@ class AttentionActivationSpec:
     """
 
     softmax_kind: Literal["softmax", "softmax1", "none"] = "softmax1"
+    div_mode: Literal["long_div", "log_softmax1"] = "long_div"
 
     _VALID_KINDS = ("softmax", "softmax1", "none")
+    _VALID_DIV_MODES = ("long_div", "log_softmax1")
 
     def __post_init__(self) -> None:
         if self.softmax_kind not in self._VALID_KINDS:
             raise ValueError(
                 "AttentionActivationSpec.softmax_kind must be one of "
                 f"{self._VALID_KINDS}; got {self.softmax_kind!r}"
+            )
+        if self.div_mode not in self._VALID_DIV_MODES:
+            raise ValueError(
+                "AttentionActivationSpec.div_mode must be one of "
+                f"{self._VALID_DIV_MODES}; got {self.div_mode!r}"
+            )
+        # Mirror ``VMConfig.__post_init__``: log_softmax1 div requires the
+        # softmax1 sink, otherwise the 1/n attention construction has no
+        # geometric backing.
+        if (
+            self.div_mode == "log_softmax1"
+            and self.softmax_kind != "softmax1"
+        ):
+            raise ValueError(
+                "AttentionActivationSpec.div_mode='log_softmax1' requires "
+                "softmax_kind='softmax1'; got softmax_kind="
+                f"{self.softmax_kind!r}."
             )
 
 
@@ -1141,6 +1160,12 @@ class FFNActivationSpec:
 
     kind: Literal["relu", "gelu", "swiglu"] = "relu"
     ffn_expansion_ratio: float = 4.0
+    # Absolute ``ffn_hidden`` overrides the expansion ratio when set. This
+    # mirrors the legacy ``compile_full_vm_dynamic(ffn_hidden=4096, ...)``
+    # kwarg path: callers that know the absolute width (HF state-dict
+    # exports, fixed-layout bakes) can pin it explicitly; otherwise the
+    # ratio derives the width from ``d_model``.
+    ffn_hidden: Optional[int] = None
 
     _VALID_KINDS = ("relu", "gelu", "swiglu")
 
@@ -1155,6 +1180,22 @@ class FFNActivationSpec:
                 "FFNActivationSpec.ffn_expansion_ratio must be > 0; "
                 f"got {self.ffn_expansion_ratio!r}"
             )
+        if self.ffn_hidden is not None and not (self.ffn_hidden > 0):
+            raise ValueError(
+                "FFNActivationSpec.ffn_hidden must be > 0 or None; "
+                f"got {self.ffn_hidden!r}"
+            )
+
+    def resolve_hidden(self, d_model: int) -> int:
+        """Return the effective FFN hidden width for ``d_model``.
+
+        ``ffn_hidden`` (if set) wins; otherwise derive from the expansion
+        ratio. This is the single point of truth for the lowering pipeline
+        and the HF export adapters.
+        """
+        if self.ffn_hidden is not None:
+            return int(self.ffn_hidden)
+        return int(round(self.ffn_expansion_ratio * d_model))
 
 
 @dataclass(frozen=True)
