@@ -223,6 +223,11 @@ def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     gate_add = dim_ref("opcode_flag", "ADD")
     carry_byte0 = dim_ref("carry", "alu", 0)
     rules: list[FFNRule] = []
+    # 5-way AND with mixed weights at the AX marker: MARK_AX(+1), MARK_PC(-2)
+    # blocker, two operand-nibble one-hots(+1 each), and carry-in
+    # discrimination at +/-2.0 (carry_byte0). Threshold 2.5 (no carry_in) /
+    # 4.5 (carry_in) is explicit; the default derivation wouldn't handle the
+    # negative MARK_PC weight nor the sign-flipped CARRY discrimination.
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
@@ -245,13 +250,11 @@ def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                         (carry_byte0, 2.0),
                     )
                     threshold = 4.5
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l9_add_hi_c{carry_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
                     gate=gate_add,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
                 ))
     return tuple(rules)
