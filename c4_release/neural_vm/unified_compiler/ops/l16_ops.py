@@ -330,7 +330,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # top-level LEV marker because OP_LEV + MARK_PC alone crosses their old
     # threshold. Keep the byte-identical legacy prefix, then make the proven
     # top-level return address (0x0a) authoritative.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_lev_pc_top_return_0a",
         conditions=(
             ("OP_LEV", 1.0),
@@ -356,7 +356,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # local-JSR e0 guard also keys weakly on ALU_LO+14, so push that scalar
     # down only for this no-SE row; the tail's own initial-JSR f8 exactness
     # guard can then keep the byte supported.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_jsr_mem_addr0_f8",
         conditions=(
             ("OP_JSR", 1.0),
@@ -376,7 +376,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("ALU_LO+14", -30.0),
         ),
     ))
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="l16_jsr_mem_addr0_e0_from_l14_evidence",
         conditions=(
             ("OP_JSR", 1000.0),
