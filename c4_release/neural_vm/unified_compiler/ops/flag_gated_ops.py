@@ -798,7 +798,7 @@ def _null_terminator_detection_rules(S: float) -> tuple[FFNRule, ...]:
     """
     write_scale = 2.0 / S
     return (
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="null_terminator_detection",
             conditions=(
                 ("OUTPUT_BYTE_LO+0", 1.0),
