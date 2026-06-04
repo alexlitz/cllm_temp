@@ -864,7 +864,7 @@ def _layer8_alu_lev_byte0_lo_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / (S * 9.0)
     rules = []
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l8_alu_lev_byte0_lo_k{k}",
             conditions=(
                 ("OP_LEV", 1.0),
@@ -888,7 +888,7 @@ def _layer8_alu_lev_byte0_hi_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / (S * 9.0)
     rules = []
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l8_alu_lev_byte0_hi_k{k}",
             conditions=(
                 ("OP_LEV", 1.0),
