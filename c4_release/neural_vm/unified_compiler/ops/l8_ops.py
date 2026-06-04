@@ -3,7 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import multi_way_and_rule
+from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -2502,18 +2502,18 @@ def _layer8_sp_gathered_sentinel_rule(S: float) -> FFNRule:
     token, not carried into the next step's embedding).
     """
 
-    return FFNRule.gated_write(
+    # ``lower_ffn`` multiplies S into W_up + b_up but does NOT scale
+    # W_down — the rule author owns the W_down magnitude. ``2.0 / S``
+    # cancels the SwiGLU hidden amplitude (silu(S/2) ≈ S/2) so the
+    # delta lands at 1.0 (matching ``_bake_layer1_ffn``'s
+    # STACK0_BYTE0 unit and ``_format_position_counter_rules``).
+    return step_function_rule(
         name="l8_sp_gathered_this_step_sentinel",
-        conditions=(("MARK_SP", 1.0),),
+        input_dim="MARK_SP",
         threshold=0.5,
-        gate=None,
-        gate_bias=1.0,
-        # ``lower_ffn`` multiplies S into W_up + b_up but does NOT scale
-        # W_down — the rule author owns the W_down magnitude. ``2.0 / S``
-        # cancels the SwiGLU hidden amplitude (silu(S/2) ≈ S/2) so the
-        # delta lands at 1.0 (matching ``_bake_layer1_ffn``'s
-        # STACK0_BYTE0 unit and ``_format_position_counter_rules``).
-        writes=(("SP_GATHERED_THIS_STEP", 2.0 / S),),
+        write_dim="SP_GATHERED_THIS_STEP",
+        write_value=2.0,
+        S=S,
     )
 
 
