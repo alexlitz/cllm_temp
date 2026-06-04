@@ -990,6 +990,298 @@ def opcode_expert_rules(
     return tuple(wrapped)
 
 
+# ===========================================================================
+# V2.1 — Binary-encoded address lookup attention (L15 memory_lookup pattern)
+# ===========================================================================
+
+
+def binary_address_lookup_attention(
+    *,
+    head_idx: int,
+    addr_dim_bases: Sequence[str],
+    addr_width_bits: int = 4,
+    addr_slot_base: int = 4,
+    bit_scale: float = 10.0,
+    bias_slot: int = 0,
+    bias_dim: Optional[str] = "CONST",
+    bias_weight: float = 0.0,
+    key_bias_dim: Optional[str] = None,
+    key_bias_weight: float = 0.0,
+    discriminators: Optional[Sequence[Tuple[str, float]]] = None,
+    suppressors: Optional[Sequence[Tuple[str, float]]] = None,
+    value_slot_base: Optional[int] = None,
+    value_dims: Sequence[str] = (),
+    output_dims: Sequence[str] = (),
+    head_dim: int = 64,
+    dim_positions: Mapping[str, int],
+) -> DeclarativeAttentionHeadSpec:
+    """Binary-encoded address lookup attention head (L15 pattern).
+
+    Unlike :func:`memory_load_attention` (one-hot per nibble), this
+    primitive encodes the query/key address with ``±bit_scale`` per bit
+    across one-hot nibble bands. For each nibble band ``base + k`` with
+    ``k ∈ [0, 2**addr_width_bits)``, the W_q / W_k row at slot
+    ``addr_slot_base + bit`` writes ``+bit_scale`` when bit ``bit`` of
+    ``k`` is 1 and ``-bit_scale`` when it is 0. This matches the legacy
+    L15 ``_set_layer15_memory_lookup_heads_0_3`` body's "dims 4-27 are
+    binary 24-bit address encoding" comment block.
+
+    Per nibble band the helper consumes ``addr_width_bits`` slots, so
+    the address occupies ``len(addr_dim_bases) * addr_width_bits`` slots
+    starting at ``addr_slot_base``.
+
+    Optional Q-side **discriminators** are added to ``bias_slot`` (slot
+    0 by default): each ``(dim_name, weight)`` pair contributes
+    ``+weight`` to ``W_q[base + bias_slot, dim_positions[dim_name]]``.
+    Use these for opcode gates (e.g. ``("OP_LI_RELAY", 2000.0)``) and
+    extra match conditions (e.g. ``("CMP+3", 2000.0)`` for the
+    pop-group dual-role head 0).
+
+    Optional Q-side **suppressors** are also added to ``bias_slot``:
+    each ``(dim_name, weight)`` pair contributes ``+weight`` (typically
+    negative) so non-target queries (e.g. at MARK_PC/MARK_SP positions
+    during LEV) produce overwhelmingly negative scores. The L15 body
+    uses MARK_PC=-25000, MARK_SP=-100000, OP_LEV=-1000, H1[SP]=-50000,
+    H1[BP]=-50000.
+
+    Both ``discriminators`` and ``suppressors`` accept band-offset names
+    of the form ``"BAND+N"`` (e.g. ``"CMP+3"``, ``"H1+3"``); the helper
+    resolves ``dim_positions["BAND"] + N`` exactly the way ``DimRef.parse``
+    does for FFN rules.
+
+    Optional V/O block: if ``value_dims`` / ``output_dims`` are supplied,
+    the helper also writes V slots (one per ``value_dims`` entry) and
+    matching O writes. ``value_slot_base`` defaults to ``addr_slot_base +
+    len(addr_dim_bases) * addr_width_bits`` (right after the address
+    block). The legacy L15 V/O block at slots 32..63 writes
+    ``W_v[base + 32 + k, CLEAN_EMBED_LO + k] = 1`` and
+    ``W_o[OUTPUT_LO + k, base + 32 + k] = 1`` for k in [0, 16) and the
+    same for HI; pass ``value_slot_base=32`` to match it.
+
+    Args:
+        head_idx: attention head index.
+        addr_dim_bases: ordered list of nibble-band base dim names.
+            Example for L15's 24-bit address:
+            ``("ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO", "ADDR_B1_HI",
+              "ADDR_B2_LO", "ADDR_B2_HI")``.
+        addr_width_bits: bits per nibble band (default 4 — each band is
+            16 one-hot cells covering a 4-bit value).
+        addr_slot_base: head-local slot index where the address block
+            starts. Default 4 matches the legacy L15 layout
+            (slots 0..3 are reserved for bias / store anchor / ZFOD /
+            byte selection).
+        bit_scale: ``±bit_scale`` per Q/K bit. Default 10.0 (legacy L15
+            ``scale = 10.0`` in ``_set_layer15_memory_lookup_heads_0_3``).
+        bias_slot: head-local slot for the non-target bias + Q-side
+            discriminators + suppressors. Default 0 (legacy L15 Dim 0).
+        bias_dim: residual dim driving the per-position non-target bias.
+            Default ``"CONST"`` — the legacy ``-2000`` default bias.
+            Set to ``None`` to skip the bias write.
+        bias_weight: weight for the bias-dim Q-write (e.g. ``-2000.0``
+            for the legacy L15 non-target suppression).
+        key_bias_dim: residual dim that the K-side reads at ``bias_slot``.
+            Default ``None`` (no K-side bias). The legacy L15 writes
+            ``W_k[base + 0, CONST] = 10.0`` — pass ``"CONST"`` with
+            ``key_bias_weight=10.0`` to reproduce that.
+        key_bias_weight: K-side weight at ``bias_slot``.
+        discriminators: optional Q-side ``(dim_name, weight)`` writes at
+            ``bias_slot``. Used for opcode gates (e.g.
+            ``("OP_LI_RELAY", 2000.0)``).
+        suppressors: optional Q-side ``(dim_name, weight)`` writes at
+            ``bias_slot`` (typically negative). Names may include
+            band-offset form ``"BAND+N"``.
+        value_slot_base: starting slot for V/O writes. Default
+            ``addr_slot_base + len(addr_dim_bases) * addr_width_bits``.
+        value_dims: residual dims read by V projection (one slot per dim).
+        output_dims: residual dims written by O projection
+            (same length as ``value_dims``).
+        head_dim: per-head slot width. Validates that all writes
+            (address + V/O) fit.
+        dim_positions: dim layout map.
+
+    Returns:
+        One ``DeclarativeAttentionHeadSpec``.
+
+    Raises:
+        ValueError: on dim-name typos, slot overflow, or V/O length
+            mismatch.
+    """
+    addr_bases = tuple(addr_dim_bases)
+    discs = tuple(discriminators or ())
+    supps = tuple(suppressors or ())
+    vals = tuple(value_dims)
+    outs = tuple(output_dims)
+
+    if len(vals) != len(outs):
+        raise ValueError(
+            "binary_address_lookup_attention: value_dims/output_dims "
+            f"length mismatch ({len(vals)} vs {len(outs)})"
+        )
+    if addr_width_bits <= 0:
+        raise ValueError(
+            "binary_address_lookup_attention: addr_width_bits must be "
+            f"positive, got {addr_width_bits}"
+        )
+
+    cells_per_band = 1 << addr_width_bits
+    addr_slots = len(addr_bases) * addr_width_bits
+    if value_slot_base is None:
+        value_slot_base = addr_slot_base + addr_slots
+
+    total_slot_extent = max(
+        bias_slot + 1,
+        addr_slot_base + addr_slots,
+        value_slot_base + len(vals),
+    )
+    if total_slot_extent > head_dim:
+        raise ValueError(
+            "binary_address_lookup_attention: slot extent "
+            f"{total_slot_extent} > head_dim ({head_dim}) "
+            f"(addr_slot_base={addr_slot_base}, addr_slots={addr_slots}, "
+            f"value_slot_base={value_slot_base}, value_count={len(vals)})"
+        )
+
+    # Resolve dim references. Supports "BAND+N" syntax (e.g. "CMP+3")
+    # the same way the FFN-rule DimRef.parse does.
+    def _resolve(name: str) -> int:
+        if "+" in name:
+            base, off = name.rsplit("+", 1)
+            base = base.strip()
+            off = int(off.strip())
+            if base not in dim_positions:
+                raise ValueError(
+                    f"binary_address_lookup_attention: dim {base!r} "
+                    f"(from {name!r}) missing from dim_positions"
+                )
+            return dim_positions[base] + off
+        if name not in dim_positions:
+            raise ValueError(
+                f"binary_address_lookup_attention: dim {name!r} missing "
+                f"from dim_positions"
+            )
+        return dim_positions[name]
+
+    for nibble_base in addr_bases:
+        if nibble_base not in dim_positions:
+            raise ValueError(
+                f"binary_address_lookup_attention: addr nibble base "
+                f"{nibble_base!r} missing from dim_positions"
+            )
+    for name in (*vals, *outs):
+        if name not in dim_positions:
+            raise ValueError(
+                f"binary_address_lookup_attention: dim {name!r} missing "
+                f"from dim_positions"
+            )
+
+    q_writes: list[AttentionProjectionWrite] = []
+    k_writes: list[AttentionProjectionWrite] = []
+
+    # --- bias / discriminator / suppressor row at bias_slot ---
+    if bias_dim is not None and bias_weight != 0.0:
+        q_writes.append(AP(bias_slot, _resolve(bias_dim), float(bias_weight)))
+    if key_bias_dim is not None and key_bias_weight != 0.0:
+        k_writes.append(
+            AP(bias_slot, _resolve(key_bias_dim), float(key_bias_weight))
+        )
+    for dim_name, weight in discs:
+        q_writes.append(AP(bias_slot, _resolve(dim_name), float(weight)))
+    for dim_name, weight in supps:
+        q_writes.append(AP(bias_slot, _resolve(dim_name), float(weight)))
+
+    # --- binary-encoded address block at addr_slot_base.. ---
+    slot = addr_slot_base
+    for nibble_base in addr_bases:
+        base_pos = dim_positions[nibble_base]
+        for bit in range(addr_width_bits):
+            for k in range(cells_per_band):
+                bit_val = 2 * ((k >> bit) & 1) - 1
+                q_writes.append(AP(slot, base_pos + k, bit_scale * bit_val))
+                k_writes.append(AP(slot, base_pos + k, bit_scale * bit_val))
+            slot += 1
+
+    # --- V/O block ---
+    v_writes: list[AttentionProjectionWrite] = []
+    o_writes: list[AttentionOutputWrite] = []
+    for j, (val_dim, out_dim) in enumerate(zip(vals, outs)):
+        v_slot = value_slot_base + j
+        v_writes.append(AP(v_slot, dim_positions[val_dim], 1.0))
+        o_writes.append(AO(dim_positions[out_dim], v_slot, 1.0))
+
+    return DeclarativeAttentionHeadSpec(
+        head_idx=int(head_idx),
+        q=tuple(q_writes),
+        k=tuple(k_writes),
+        v=tuple(v_writes),
+        o=tuple(o_writes),
+    )
+
+
+# ===========================================================================
+# V2.1 — Attention head extension (compose multiple spec fragments)
+# ===========================================================================
+
+
+def attention_head_extension(
+    base_spec: DeclarativeAttentionHeadSpec,
+    *,
+    extra_q_writes: Sequence[AttentionProjectionWrite] = (),
+    extra_k_writes: Sequence[AttentionProjectionWrite] = (),
+    extra_v_writes: Sequence[AttentionProjectionWrite] = (),
+    extra_o_writes: Sequence[AttentionOutputWrite] = (),
+    alibi_slope: Optional[float] = None,
+) -> DeclarativeAttentionHeadSpec:
+    """Augment an existing :class:`DeclarativeAttentionHeadSpec` with
+    additional Q/K/V/O writes.
+
+    This is the V2.1 composition helper. The L15 lookup heads layer
+    bespoke discriminator rows, per-head position gates, marker
+    suppressions, and value-lane writes on top of a shared "binary
+    address match" base. Rather than encoding the full surface in
+    :func:`binary_address_lookup_attention`, the V2.1 design exposes a
+    small primitive plus a generic extension wrapper:
+
+        base = binary_address_lookup_attention(...)
+        spec = attention_head_extension(
+            base,
+            extra_q_writes=(AP(28, MARK_AX, 500.0), ...),
+            extra_o_writes=(AO(OUTPUT_LO+0, 32, 1.0), ...),
+        )
+
+    Writes are *appended*, not merged. ``Primitives.generate_attention_head``
+    applies each write in order, so a later write to the same
+    ``(slot, dim)`` cell overwrites the earlier one — useful for
+    reconstructing the legacy L15 head 9 wipe-then-write pattern.
+
+    ``alibi_slope`` is propagated when supplied; otherwise the base
+    spec's slope is preserved.
+
+    Args:
+        base_spec: the base spec to extend.
+        extra_q_writes / extra_k_writes / extra_v_writes / extra_o_writes:
+            additional ``AP`` / ``AO`` writes to append.
+        alibi_slope: optional override for the head's ALiBi slope.
+
+    Returns:
+        A new :class:`DeclarativeAttentionHeadSpec` with the extra
+        writes appended. The ``head_idx``, ``head_dim``, and
+        ``group_size`` are inherited from ``base_spec``.
+    """
+    new_q = tuple(base_spec.q) + tuple(extra_q_writes)
+    new_k = tuple(base_spec.k) + tuple(extra_k_writes)
+    new_v = tuple(base_spec.v) + tuple(extra_v_writes)
+    new_o = tuple(base_spec.o) + tuple(extra_o_writes)
+    new_slope = alibi_slope if alibi_slope is not None else base_spec.alibi_slope
+    return dataclasses.replace(
+        base_spec,
+        q=new_q,
+        k=new_k,
+        v=new_v,
+        o=new_o,
+        alibi_slope=new_slope,
+    )
+
+
 __all__ = [
     "step_function_rule",
     "one_hot_indicator_rule",
@@ -1001,5 +1293,7 @@ __all__ = [
     "efficient_exp_attention",
     "memory_load_attention",
     "fetch_byte_attention",
+    "binary_address_lookup_attention",
+    "attention_head_extension",
     "opcode_expert_rules",
 ]
