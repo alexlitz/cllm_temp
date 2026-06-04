@@ -832,7 +832,7 @@ def _layer8_alu_ent_adj_defaults_rules(S: float) -> tuple[FFNRule, ...]:
     output_weight = 50.0 / S
     rules = []
     for alu_base in ("ALU_LO", "ALU_HI"):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l8_alu_ent_adj_default_{alu_base.lower()}",
             conditions=(
                 ("OP_ENT", 1.0 / 3.0),
