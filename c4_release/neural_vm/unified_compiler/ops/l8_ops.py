@@ -3,6 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -383,7 +384,7 @@ def _layer8_alu_add_lo_rules(S: float) -> tuple[FFNRule, ...]:
     for a in range(16):
         for b in range(16):
             result = (a + b) % 16
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l8_alu_add_lo_a{a}_b{b}",
                 conditions=(
                     ("MARK_AX", 1.0),
