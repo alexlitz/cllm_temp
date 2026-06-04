@@ -992,7 +992,9 @@ def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
     for a in range(16):
         for b in range(16):
             result = (a * b) % 16
-            rules.append(FFNRule.gated_write(
+            # DSL v4b: 3-way balanced AND across (MARK_AX, ALU_LO[a],
+            # AX_CARRY_LO[b]) at (40, 30, 30) > 80; gate=OP_MUL.
+            rules.append(multi_way_and_rule(
                 name=f"l10_mul_lo_a{a:x}_b{b:x}",
                 conditions=(
                     ("MARK_AX", 40.0),
@@ -1002,7 +1004,6 @@ def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=80.0,
                 gate=gate_mul,
                 gate_weight=1.0,
-                gate_bias=0.0,
                 writes=((f"OUTPUT_LO+{result}", 2.0 / S),),
             ))
     return tuple(rules)
