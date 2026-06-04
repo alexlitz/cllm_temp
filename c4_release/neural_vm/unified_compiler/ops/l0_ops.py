@@ -2,6 +2,7 @@
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
@@ -104,14 +105,16 @@ def _phase_a_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     rules = []
     for idx, (up_dim, gate_dim, out_dim) in enumerate(transitions):
         if gate_dim is None:
-            rules.append(FFNRule.constant_write(
+            rules.append(step_function_rule(
                 name=f"phase_a_{idx}_{out_dim.lower()}",
-                conditions=((up_dim, 1.0),),
+                input_dim=up_dim,
                 threshold=0.3,
-                writes=((out_dim, write_scale),),
+                write_dim=out_dim,
+                write_value=write_scale * S,
+                S=S,
             ))
         else:
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"phase_a_{idx}_{out_dim.lower()}",
                 conditions=((up_dim, 1.0),),
                 threshold=0.3,

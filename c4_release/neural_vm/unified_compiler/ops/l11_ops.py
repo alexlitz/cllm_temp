@@ -2,6 +2,7 @@
 
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
@@ -141,7 +142,7 @@ def _layer11_mul_partial_rules_for_a_lo(
         carry = (a_lo * b_lo) // 16
         for b_hi in range(16):
             partial = (carry + a_lo * b_hi) % 16
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l11_mul_partial_a{a_lo:02d}_b{b_lo:02d}_h{b_hi:02d}",
                 conditions=(
                     ("MARK_AX", 1.0),
@@ -153,8 +154,6 @@ def _layer11_mul_partial_rules_for_a_lo(
                 ),
                 threshold=3.5,
                 gate=gate_mul,
-                gate_weight=1.0,
-                gate_bias=0.0,
                 # structural offset: partial is the computed MUL partial
                 # nibble (value-bus lookup), not a role-meaningful byte.
                 writes=((f"TEMP+{partial}", 10.0 / S),),

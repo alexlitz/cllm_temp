@@ -2,6 +2,7 @@
 
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
@@ -92,7 +93,7 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
         for a_hi in range(16):
             for b_lo in range(16):
                 result_hi = (partial + a_hi * b_lo) % 16
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l12_mul_combine_p{partial:02d}_ah{a_hi:02d}_bl{b_lo:02d}",
                     conditions=(
                         ("MARK_AX", 1.0),
@@ -102,8 +103,6 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
                     ),
                     threshold=7.5,
                     gate=gate_mul,
-                    gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((f"OUTPUT_HI+{result_hi}", write_scale),),
                     scope="MARK_AX and OP_MUL",
                     dominates_at={

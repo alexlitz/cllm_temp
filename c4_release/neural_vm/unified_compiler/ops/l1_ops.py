@@ -3,6 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -99,7 +100,7 @@ def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     rules: list[FFNRule] = []
 
     # Unit 0: STACK0_BYTE0 = L1H4[BP] AND IS_BYTE AND NOT H1[BP].
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="l1_stack0_byte0",
         conditions=(
             (f"L1H4+{BP_I}", 1.0),
@@ -135,7 +136,7 @@ def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
         # Recover the human-readable name (drops the "+0" so the rule
         # name keeps the legacy ``l1_byte_index_<n>`` form).
         out_name = out_dim.split("+", 1)[0].lower()
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l1_{out_name}",
             conditions=tuple(conditions),
             threshold=1.5,
