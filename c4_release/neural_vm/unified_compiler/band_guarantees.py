@@ -10,6 +10,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence, Tuple
 
+from .building_blocks_dsl import multi_way_and_rule
 from .ir import FFNRule
 
 
@@ -158,7 +159,7 @@ class OneHotBandGuarantee:
         rules = []
         for lane in range(self.width):
             lane_name = self.lane_name(lane)
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"{self.label}.lane_{lane}",
                 conditions=conditions,
                 threshold=threshold,
