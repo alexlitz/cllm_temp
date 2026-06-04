@@ -260,13 +260,16 @@ def _l10_binary_op_byte_zeroing_rules(S: float) -> tuple[FFNRule, ...]:
     rules: list[FFNRule] = []
 
     # Units 0..3: opcode-gated detectors.
+    # DSL v4b: 4-condition AND with explicit threshold 1.5; the opcode
+    # set is fed via gate_terms (multi-opcode disjunctive gate) so the
+    # rule fires on any single binary-op being active.
     for unit_idx, writes in enumerate((
         output_lo_wipe,
         output_hi_wipe,
         (("OUTPUT_LO+0", 5.0 / S),),
         (("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
     )):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             conditions=conds_opcode_gated(),
             threshold=1.5,
             gate=None,
@@ -282,18 +285,18 @@ def _l10_binary_op_byte_zeroing_rules(S: float) -> tuple[FFNRule, ...]:
         ))
 
     # Units 4..7: bitwise-gated detectors (gate = TEMP+3).
+    # DSL v4b: explicit-threshold AND; single TEMP+3 gate.
     for unit_idx, writes in enumerate((
         output_lo_wipe,
         output_hi_wipe,
         (("OUTPUT_LO+0", 5.0 / S),),
         (("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
     )):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             conditions=conds_bitwise_gated(),
             threshold=2.5,
             gate="TEMP+3",
             gate_weight=1.0,
-            gate_bias=0.0,
             writes=writes,
             name=f"l10_binary_op_byte_zeroing_bitwise_unit{unit_idx}",
             scope="IS_BYTE and TEMP+3",
