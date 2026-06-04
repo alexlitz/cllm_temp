@@ -3,6 +3,10 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import (
+    cancel_residual_rule,
+    multi_way_and_rule,
+)
 from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -1688,6 +1692,8 @@ def _layer6_ax_output_route_rules(
     conditions: tuple[tuple[str, float], ...],
     S: float,
 ) -> tuple[FFNRule, ...]:
+    # Each rule is an N-way AND across opcode/marker conditions, gated by
+    # the AX_CARRY band cell, routing the AX_CARRY value into OUTPUT.
     rules = []
     write_scale = 2.0 / S
     for band, source_base, output_base in (
@@ -1695,7 +1701,7 @@ def _layer6_ax_output_route_rules(
         ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"{name_prefix}_{band}_{k}",
                 conditions=conditions,
                 threshold=threshold,
