@@ -3724,7 +3724,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             for hi in range(1, 16):
                 value = lo | (hi << 4)
                 rules.append(
-                    FFNRule.constant_write(
+                    multi_way_and_rule(
                         name=f"tail_stack0_store_byte_{value:02x}",
                         scope="mark == STACK0",
                         dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -3770,7 +3770,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     continue
                 value = lo | (hi << 4)
                 rules.append(
-                    FFNRule.gated_write(
+                    multi_way_and_rule(
                         name=f"tail_stack0_pop_loaded_byte_{value:02x}",
                         scope="mark == STACK0",
                         dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -3815,7 +3815,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 if value == 0xE0:
                     continue
                 rules.append(
-                    FFNRule.gated_write(
+                    multi_way_and_rule(
                         name=f"tail_stack0_store_top_e0_byte_{value:02x}",
                         scope="mark == STACK0",
                         dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -3870,7 +3870,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     continue
                 value = lo | (hi << 4)
                 rules.append(
-                    FFNRule.gated_write(
+                    multi_way_and_rule(
                         name=(
                             "tail_stack0_store_top_e8_from_e0_byte_"
                             f"{value:02x}"
@@ -3887,7 +3887,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     )
                 )
         rules.append(
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name=(
                     "tail_stack0_store_top_e8_from_e0_byte_39_from_e8_addr"
                 ),
