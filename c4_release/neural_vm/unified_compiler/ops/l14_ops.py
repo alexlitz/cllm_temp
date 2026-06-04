@@ -2224,7 +2224,7 @@ def _layer14_demo_phase6_wave7_rules(S: float) -> tuple[FFNRule, ...]:
     residual unchanged at every dim).
     """
     return (
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_demo_phase6_wave7_decl_only_noop",
             conditions=(("CONST", -100.0),),
             threshold=0.0,
