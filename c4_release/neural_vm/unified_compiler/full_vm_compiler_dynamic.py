@@ -944,13 +944,10 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('l10_post_ops_combined', 'OUTPUT_LO.*.-1'),
     ('l10_post_ops_combined', 'TEMP.*.-1'),
     ('layer10_alu', 'ALU_HI.*.-1'),
-    ('layer10_byte_passthrough', 'TEMP.*.-1'),
     ('layer10_byte_passthrough_bake', 'TEMP.*.-1'),
-    ('layer10_carry_relay', 'CARRY.*.-1'),
     ('layer10_carry_relay_bake', 'CARRY.*.-1'),
     ('layer10_psh_stack0_passthrough_bake', 'OUTPUT_HI.*.-1'),
     ('layer10_psh_stack0_passthrough_bake', 'OUTPUT_LO.*.-1'),
-    ('layer10_stack0_byte_relay', 'TEMP.*.-1'),
     ('layer10_stack0_byte_relay_bake', 'TEMP.*.-1'),
     ('layer12_mul_combine', 'TEMP.*.-1'),
     ('layer3_carry_forward_attn', 'EMBED_HI.*.-1'),
@@ -958,13 +955,8 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('layer3_ffn', 'EMBED_HI.*.-1'),
     ('layer3_ffn', 'EMBED_LO.*.-1'),
     ('layer3_ffn', 'TEMP.*.-1'),
-    ('layer6_attn', 'AX_CARRY_HI.*.-1'),
-    ('layer6_attn', 'AX_CARRY_LO.*.-1'),
-    ('layer6_relay_heads', 'AX_CARRY_HI.*.-1'),
-    ('layer6_relay_heads', 'AX_CARRY_LO.*.-1'),
     ('layer6_routing_ffn', 'AX_CARRY_HI.*.-1'),
     ('layer6_routing_ffn', 'AX_CARRY_LO.*.-1'),
-    ('layer6_routing_ffn', 'CMP.*.-1'),
     ('layer6_routing_ffn', 'OUTPUT_HI.*.-1'),
     ('layer6_routing_ffn', 'OUTPUT_LO.*.-1'),
     ('layer6_routing_ffn', 'TEMP.*.-1'),
@@ -975,16 +967,20 @@ CROSS_STEP_BASELINE_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
     ('layer8_head6_ax_carry_refresh', 'OUTPUT_HI.*.-1'),
     ('layer8_head6_ax_carry_refresh', 'OUTPUT_LO.*.-1'),
     ('layer8_mem_to_alu', 'ADDR_B0_HI.*.-1'),
-    ('layer8_mem_to_alu', 'ADDR_B0_LO.*.-1'),
     ('layer8_mem_to_alu', 'ADDR_B1_HI.*.-1'),
-    ('layer8_mem_to_alu', 'ADDR_B1_LO.*.-1'),
     ('layer8_mem_to_alu', 'ADDR_B2_HI.*.-1'),
-    ('layer8_mem_to_alu', 'ADDR_B2_LO.*.-1'),
-    ('layer8_sp_gather_bake', 'CMP.*.-1'),
     ('layer9_alu', 'ALU_HI.*.-1'),
     ('layer9_alu', 'ALU_LO.*.-1'),
     ('layer9_alu', 'CARRY.*.-1'),
     ('opcode_decode_ffn', 'OPCODE_BYTE_LO.*.-1'),
+    # TODO(step4-migration): post_l9_bz_bnz_pc_override OUTPUT_LO.*.-1 added
+    # in commit b82462c5 (2026-06-03 cluster D BZ/BNZ move) after the round-2
+    # audit, so the round-2 ratchet missed it. Same Tier A pattern as the
+    # other OUTPUT_LO.*.-1 readers in this set: every L3+ OUTPUT_LO writer
+    # fires before this op's post-L9 placement, so the prev-step alias here
+    # is the same potential step-1 zero-prop bug class. Migration needs a
+    # bake-side fix (rename the cancel gate to a non-aliasing form).
+    ('post_l9_bz_bnz_pc_override', 'OUTPUT_LO.*.-1'),
     ('putchar_think_protocol', 'AX_CARRY_HI.*.-1'),
     ('putchar_think_protocol', 'AX_CARRY_LO.*.-1'),
 })
@@ -1201,6 +1197,117 @@ CROSS_STEP_DOCUMENTED_SAFE: Dict[Tuple[str, str], str] = {
         "layer6_routing_ffn at L6 (block, intra=12). Writer runs MUCH "
         "later — the cross-step alias delivers the prior step's "
         "DIV_STAGING residual via the KV cache.",
+    # ----- Round 3 migrations (TODO backlog -> documented-safe) -----
+    # Subset 3A: consumer is a ``declarative_authority="topology_anchor"``
+    # op whose ``compiler_ir`` has zero rules and whose ``bake_fn`` body is
+    # ``return``. These ops declare ``reads`` / ``writes`` solely to fix
+    # the LayerCompiler dep-graph slot for downstream consumers; no weight
+    # rows are emitted, so the cross-step read has ZERO runtime impact
+    # regardless of any same-step writer. Equivalent in spirit to Round 2
+    # Subset 1 (``*_dep_anchor`` consumers); these are the *non-anchor-
+    # named* sibling anchors. Verified by inspecting each op factory in
+    # ``ops/l{6,10}_ops.py``.
+    ('layer6_attn', 'AX_CARRY_HI.*.-1'):
+        "Topology anchor: ``declarative_authority='topology_anchor'`` + "
+        "empty ``CompilerIR()``; ``bake_fn`` body is ``return`` (see "
+        "ops/l6_ops.py:2562-2604 ``make_layer6_attn_op``). Actual L6 attn "
+        "weight bake happens in ``layer6_attn_bake`` (kind='model', "
+        "phase=998.5). Declared ``writes={CMP, AX_CARRY_LO, AX_CARRY_HI}`` "
+        "are dep-graph mirrors; cross-step read has zero runtime impact.",
+    ('layer6_attn', 'AX_CARRY_LO.*.-1'):
+        "Same design as AX_CARRY_HI.*.-1 above — topology anchor, "
+        "``bake_fn`` returns immediately. See "
+        "ops/l6_ops.py:2580-2587 for the AX_CARRY_*_PREV_STEP rationale "
+        "comment (Phase 8.A targeted).",
+    ('layer6_relay_heads', 'AX_CARRY_HI.*.-1'):
+        "Topology anchor for L6 head 6/7 STACK0<-AX relay: "
+        "``declarative_authority='topology_anchor'`` + empty "
+        "``CompilerIR()``; ``bake_fn`` body is ``return`` (see "
+        "ops/l6_ops.py:3022-3063 ``make_layer6_relay_heads_op``). Actual "
+        "bake happens in ``layer6_relay_heads_bake`` (kind='model', "
+        "phase=998.6). Cross-step read has zero runtime impact.",
+    ('layer6_relay_heads', 'AX_CARRY_LO.*.-1'):
+        "Same design as AX_CARRY_HI.*.-1 above — topology anchor, no "
+        "bake side-effect. See ops/l6_ops.py:3041-3042 for the "
+        "AX_CARRY_*_PREV_STEP rationale (Phase 8.A targeted).",
+    ('layer10_byte_passthrough', 'TEMP.*.-1'):
+        "Topology anchor for L10 head 1 AX-byte passthrough: "
+        "``declarative_authority='topology_anchor'`` + empty "
+        "``CompilerIR()``; ``bake_fn`` body is ``return`` (see "
+        "ops/l10_ops.py:1944-1974 ``make_layer10_byte_passthrough_op``). "
+        "Actual bake lives in ``layer10_byte_passthrough_bake`` "
+        "(kind='block', target_op_name='layer10_byte_passthrough'); the "
+        "anchor's read has zero runtime impact. The ``_bake`` sibling "
+        "still appears in BASELINE as the active record.",
+    ('layer10_carry_relay', 'CARRY.*.-1'):
+        "Topology anchor for L10 head 0 carry relay: "
+        "``declarative_authority='topology_anchor'`` + empty "
+        "``CompilerIR()``; ``bake_fn`` body is ``return None`` (see "
+        "ops/l10_ops.py:1902-1941 ``make_layer10_carry_relay_op``). "
+        "Actual bake lives in ``layer10_carry_relay_bake``; this "
+        "anchor's CARRY.*.-1 read sizes the dep-graph slot but emits "
+        "no weight rows. The ``_bake`` sibling stays in BASELINE.",
+    ('layer10_stack0_byte_relay', 'TEMP.*.-1'):
+        "Topology anchor for L10 stack byte relays: "
+        "``declarative_authority='topology_anchor'`` + empty "
+        "``CompilerIR()``; ``bake_fn`` body is ``return None`` (see "
+        "ops/l10_ops.py:2611-2640 ``make_layer10_stack0_byte_relay_op``). "
+        "Actual bake lives in ``layer10_stack0_byte_relay_bake``; this "
+        "anchor's read sizes the dep-graph slot but emits no weight "
+        "rows. The ``_bake`` sibling stays in BASELINE.",
+    # Subset 3B: all-writers-later-than-reader confirmed by the
+    # LayerCompiler-resolved fire order. Reader at fire-tuple
+    # (layer, kind_order={attn:0,ffn:1,block:2}, intra) compared to
+    # writers' fire-tuples; every writer fires strictly later, so the
+    # ``.*.-1`` alias delivers the previous step's residual via the KV
+    # cache by design (no same-step write has landed when the reader
+    # fires).
+    ('layer8_mem_to_alu', 'ADDR_B0_LO.*.-1'):
+        "All same-step writers fire LATER than the L8.45 (block, intra=3) "
+        "reader: ``_layer13_attn_dep_anchor`` (L16 attn), "
+        "``layer13_mem_addr_gather`` (L16 block), "
+        "``layer15_store_stack0_sp_byte0_addr`` (L18 block), "
+        "``layer8_sp_gather_bake`` (L9 block intra=7), "
+        "``layer9_lev_addr_relay`` (L10 block), "
+        "``layer9_lev_bp_to_pc_relay`` (L10 block). The prev-step "
+        "residual via KV cache is the genuine input (slot shared with "
+        "ADDR_B0_LO; bake byte-identical). See ops/l8_ops.py:2437-2443.",
+    ('layer8_mem_to_alu', 'ADDR_B1_LO.*.-1'):
+        "All same-step writers fire LATER than the L8.45 reader: "
+        "``_layer13_attn_dep_anchor`` (L16 attn), "
+        "``layer13_mem_addr_gather`` (L16 block), "
+        "``layer8_sp_gather_bake`` (L9 block intra=7). See "
+        "ops/l8_ops.py:2444-2449 for the ADDR_B{1,2}_*_PREV_STEP "
+        "rationale (Phase 8.A continuation).",
+    ('layer8_mem_to_alu', 'ADDR_B2_LO.*.-1'):
+        "Same design as ADDR_B1_LO.*.-1 above — all writers "
+        "(``_layer13_attn_dep_anchor`` L16, ``layer13_mem_addr_gather`` "
+        "L16, ``layer8_sp_gather_bake`` L9.7) fire LATER than the L8.45 "
+        "reader. The cross-step alias delivers the prior step's "
+        "ADDR_B2_LO residual via the KV cache.",
+    # Subset 3C: same-layer earlier writers are all topology anchors
+    # (no bake side-effect); every real-bake writer fires LATER than the
+    # reader. The reader's cross-step read is unambiguous because no
+    # weight-emitting writer has landed when the reader fires.
+    ('layer6_routing_ffn', 'CMP.*.-1'):
+        "Reader at L6 (block, intra=3). The two same-layer-earlier "
+        "writers — ``_layer6_attn_dep_anchor`` (L6 attn intra=0) and "
+        "``layer6_attn`` (L6 attn intra=1) — are BOTH topology anchors "
+        "(``declarative_authority='topology_anchor'`` + empty IR + "
+        "``bake_fn=return``), so neither emits weight rows. The sole "
+        "real-bake CMP writer (``layer9_alu`` at L10) fires LATER than "
+        "this reader. The prev-step CMP residual via KV cache (BZ/BNZ "
+        "branch decision committed at end of prev step) is the genuine "
+        "input. See ops/l6_ops.py:2696-2703 (Phase 8.A CMP_PREV_STEP "
+        "rationale).",
+    ('layer8_sp_gather_bake', 'CMP.*.-1'):
+        "Reader at L9 (block, intra=7). Same-layer-earlier writers are "
+        "``_layer6_attn_dep_anchor`` and ``layer6_attn`` (both topology "
+        "anchors at L6, no bake side-effect). The sole real-bake CMP "
+        "writer (``layer9_alu`` at L10.2) fires LATER than this reader. "
+        "The cross-step alias delivers the prev-step CMP (the BZ/BNZ "
+        "branch decision just committed). See ops/l8_ops.py:1702-1712 "
+        "(Phase 8.A CMP_PREV_STEP rationale).",
 }
 
 
