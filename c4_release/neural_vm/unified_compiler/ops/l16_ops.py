@@ -224,7 +224,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("OP_JMP", -20.0),
     )
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_ax_carry_lo_{k}",
             conditions=lev_ax_carry_conditions,
             threshold=1.5,
@@ -232,7 +232,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_ax_carry_hi_{k}",
             conditions=lev_ax_carry_conditions,
             threshold=1.5,
@@ -268,7 +268,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # store writes (which carry MEM_STORE and are excluded above).
     lev_stack0_preserve_strength = 50.0 / S
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_stack0_byte0_preserve_lo_{k}",
             conditions=lev_stack0_preserve_conditions,
             threshold=4.5,
@@ -276,7 +276,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", lev_stack0_preserve_strength),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_stack0_byte0_preserve_hi_{k}",
             conditions=lev_stack0_preserve_conditions,
             threshold=4.5,
@@ -302,7 +302,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("NEXT_SE", -1.5),
     )
     for byte_idx in ("BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_clear_output_lo10_{byte_idx}",
             conditions=byte_zero_base + ((byte_idx, 1.0),),
             threshold=4.0,
@@ -310,7 +310,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=(("OUTPUT_LO+10", -10.0 / S),),
         ))
     for byte_idx in ("BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_set_output_lo0_{byte_idx}",
             conditions=byte_zero_base + ((byte_idx, 1.0),),
             threshold=4.0,
@@ -318,7 +318,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=(("OUTPUT_LO+0", 5.0 / S),),
         ))
     for byte_idx in ("BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_set_output_hi0_{byte_idx}",
             conditions=byte_zero_base + ((byte_idx, 1.0),),
             threshold=4.0,
