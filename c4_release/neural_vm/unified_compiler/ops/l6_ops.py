@@ -834,10 +834,12 @@ def _layer6_cmp3_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
     guards stay structural).
     """
 
+    # Cancel residual at the cmp_cascade_3 cell: 2-way AND on
+    # (MARK_PC, ~IS_BYTE), gated by the dim_ref with gate_weight=-1.
     write_scale = 2.0 / S
     cmp_cascade_3 = dim_ref("cmp_flag", "cascade", 3)
     return (
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l6_cmp3_cleanup",
             conditions=(("MARK_PC", 1.0), ("IS_BYTE", -1.0)),
             threshold=0.5,
