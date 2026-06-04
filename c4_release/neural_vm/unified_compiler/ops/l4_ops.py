@@ -3,6 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -678,7 +679,7 @@ def _layer4_temp_clear_pc_rules(S: float) -> tuple[FFNRule, ...]:
     ))
     # TEMP[1..31] clear: gate=-TEMP[k] at MARK_PC writes 2/S back into TEMP[k].
     for k in range(1, 32):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l4_temp_clear_pc_{k}",
             conditions=(("MARK_PC", 1.0),),
             threshold=0.5,
