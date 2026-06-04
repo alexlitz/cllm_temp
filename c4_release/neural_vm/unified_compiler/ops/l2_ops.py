@@ -376,7 +376,7 @@ def _layer2_initial_pc_bake_cancel_rules(S: float) -> tuple[FFNRule, ...]:
     gate_mark_pc = dim_ref("marker", "PC")
 
     return (
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="layer2_initial_pc_bake_cancel_lo",
             conditions=(("HAS_SE", 1.0),),
             threshold=0.5,
@@ -385,7 +385,7 @@ def _layer2_initial_pc_bake_cancel_rules(S: float) -> tuple[FFNRule, ...]:
             gate_bias=0.0,
             writes=((f"EMBED_LO+{init_pc_lo}", write_scale),),
         ),
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="layer2_initial_pc_bake_cancel_hi",
             conditions=(("HAS_SE", 1.0),),
             threshold=0.5,
