@@ -807,9 +807,12 @@ def _layer6_halt_detect_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_temp_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 TEMP[1..31] cleanup units 386..416."""
 
+    # Cancel residual at TEMP+k: 2-way AND on (MARK_PC, ~IS_BYTE),
+    # gated by TEMP+k with gate_weight=-1 so the +write * -gate
+    # subtracts the residual from itself.
     write_scale = 2.0 / S
     return tuple(
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name=f"l6_temp_cleanup_{k}",
             conditions=(("MARK_PC", 1.0), ("IS_BYTE", -1.0)),
             threshold=0.5,
