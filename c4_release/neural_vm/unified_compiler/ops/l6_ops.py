@@ -1232,6 +1232,9 @@ def _layer6_ent_first_step_sp_byte0_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_ent_first_step_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 ENT first-step SP bytes 1..3 units 872..877."""
 
+    # ENT first-step SP bytes 1..3 (6 units = 3 bytes × LO/HI). N-way AND
+    # on (OP_ENT, BYTE_INDEX_n, IS_BYTE, H1+2, ~HAS_SE) gated by CONST,
+    # writing fixed values for the JSR-pushed SP frame.
     rules = []
     conditions_by_byte = (
         ("byte1", "BYTE_INDEX_0", 15, 15, 10.0 / S),
@@ -1246,14 +1249,14 @@ def _layer6_ent_first_step_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
             ("H1+2", 1.0),
             ("HAS_SE", -10.0),
         )
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_ent_first_step_sp_{label}_lo",
             conditions=conditions,
             threshold=4.0,
             gate="CONST",
             writes=((f"OUTPUT_LO+{lo}", scale),),
         ))
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_ent_first_step_sp_{label}_hi",
             conditions=conditions,
             threshold=4.0,
