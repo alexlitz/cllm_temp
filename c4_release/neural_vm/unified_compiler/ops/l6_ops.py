@@ -894,11 +894,15 @@ def _layer6_sp_decrement_rules(
     threshold: float,
     S: float,
 ) -> tuple[FFNRule, ...]:
+    # SP -= 8 per nibble: N-way AND on marker conditions, gated by the
+    # EMBED nibble cell, writes the shifted nibble lane and cancels the
+    # source lane. Hi-byte rules add EMBED_LO[8..15] blockers so borrow
+    # only propagates when the low byte sits in [0, 7].
     rules = []
     write_scale = 2.0 / S
     for k in range(16):
         new_k = (k - 8) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"{name_prefix}_lo_{k}",
             conditions=conditions,
             threshold=threshold,
@@ -910,7 +914,7 @@ def _layer6_sp_decrement_rules(
         ))
     for k in range(16):
         new_k_borrow = (k - 1) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"{name_prefix}_hi_{k}",
             conditions=conditions + tuple(
                 (f"EMBED_LO+{lo_bit}", -1.0)
