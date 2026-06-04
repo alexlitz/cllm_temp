@@ -2,6 +2,7 @@
 
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -614,7 +615,7 @@ def _opcode_decode_main_rules(S):
     op_names = _opcode_name_map()
     gate_mark_ax = dim_ref("marker", "AX")
     return tuple(
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name=f"l5_decode_{op_names[op_val].lower()}_at_ax",
             conditions=(
                 (f"OPCODE_BYTE_LO+{lo}", 1.0),
