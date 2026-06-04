@@ -419,7 +419,7 @@ def _append_pc_byte0_direct_copy_rules(
     """
 
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"{name_prefix}_target_lo_{k}",
             conditions=conditions,
             threshold=threshold,
@@ -427,7 +427,7 @@ def _append_pc_byte0_direct_copy_rules(
             writes=((f"OUTPUT_LO+{k}", write_scale),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"{name_prefix}_target_hi_{k}",
             conditions=conditions,
             threshold=threshold,
@@ -460,7 +460,7 @@ def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_jmp_all_step_cancel_{band}_{k}",
                 conditions=conditions,
                 threshold=threshold,
@@ -577,7 +577,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_jsr_all_step_cancel_{band}_{k}",
                 conditions=conditions,
                 threshold=threshold,
@@ -587,7 +587,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             ))
 
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_jsr_all_step_target_lo_{k}",
             conditions=conditions,
             threshold=threshold,
@@ -595,7 +595,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_jsr_all_step_target_hi_{k}",
             conditions=conditions,
             threshold=threshold,
@@ -611,7 +611,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         for k in range(0, 16, 2)
     )
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_jsr_all_step_target_hi_odd_imm_hi_correction_{k}",
             conditions=(
                 ("MARK_PC", 20.0),
@@ -727,7 +727,7 @@ def _layer6_delayed_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_delayed_jmp_cancel_{band}_{k}",
                 conditions=conditions,
                 threshold=5.5,
@@ -765,7 +765,7 @@ def _layer6_first_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_first_step_jmp_cancel_{band}_{k}",
                 conditions=conditions,
                 threshold=threshold,
@@ -1071,7 +1071,7 @@ def _layer6_psh_stack0_marker_override_rules(S: float) -> tuple[FFNRule, ...]:
     ):
         # Sub-loop 1: cancel residual OUTPUT
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_psh_stack0_marker_cancel_output_{band}_{k}",
                 conditions=conditions,
                 threshold=1.5,
@@ -1081,7 +1081,7 @@ def _layer6_psh_stack0_marker_override_rules(S: float) -> tuple[FFNRule, ...]:
             ))
         # Sub-loop 2: add ALU value into OUTPUT
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_psh_stack0_marker_add_alu_{band}_{k}",
                 conditions=conditions,
                 threshold=1.5,
@@ -1091,7 +1091,7 @@ def _layer6_psh_stack0_marker_override_rules(S: float) -> tuple[FFNRule, ...]:
             ))
         # Sub-loop 3: constant_write conditioned also on ALU lane
         for k in range(16):
-            rules.append(FFNRule.constant_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_psh_stack0_marker_final_{band}_{k}",
                 conditions=(
                     ("PSH_AT_SP", 1.0),
@@ -1280,7 +1280,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
 
     del S
     return (
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_ent_after_jsr_sp_byte0_e8",
             conditions=(
                 ("OP_ENT", 1.0),
@@ -1310,7 +1310,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 "OUTPUT_HI_THIS_STEP": "mark == SP AND opcode_in_step in {ENT}",
             },
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_ent_after_jsr_sp_byte0_f0_when_ent_zero",
             conditions=(
                 ("OP_ENT", 1.0),
@@ -1339,7 +1339,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 "OUTPUT_HI_THIS_STEP": "mark == SP AND opcode_in_step in {ENT}",
             },
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_ent_after_jsr_bp_byte0_f0",
             conditions=(
                 ("OP_ENT", 1.0),
@@ -1360,7 +1360,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 "OUTPUT_HI_THIS_STEP": "mark == BP AND opcode_in_step in {ENT}",
             },
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_ent_after_jsr_bp_byte1_ff",
             conditions=(
                 ("OP_ENT", 1.0),
@@ -1385,7 +1385,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 "OUTPUT_HI_THIS_STEP": "is_byte AND byte_index == 0 AND opcode_in_step in {ENT}",
             },
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_ent_after_jsr_bp_byte2_00",
             conditions=(
                 ("OP_ENT", 1.0),
@@ -1409,7 +1409,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 "OUTPUT_HI_THIS_STEP": "is_byte AND byte_index == 1 AND opcode_in_step in {ENT}",
             },
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_ent_after_jsr_bp_byte3_00",
             conditions=(
                 ("OP_ENT", 1.0),
@@ -1433,7 +1433,7 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 "OUTPUT_HI_THIS_STEP": "is_byte AND byte_index == 2 AND opcode_in_step in {ENT}",
             },
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_ent_after_jsr_stack0_byte0_00",
             conditions=(
                 ("OP_ENT", 1.0),
@@ -1478,7 +1478,7 @@ def _layer6_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_bz_cancel_{band}_{k}",
                 conditions=cancel_conditions,
                 threshold=3.5,
@@ -1527,7 +1527,7 @@ def _layer6_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
         ):
             for k in range(16):
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l6_bnz_{group}_cancel_{band}_{k}",
                     conditions=conditions,
                     threshold=threshold,
@@ -1609,7 +1609,7 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
             ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
         ):
             for k in range(16):
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l6_branch_pc_byte1_{group}_cancel_{band}_{k}",
                     conditions=conditions,
                     threshold=threshold,
@@ -1618,7 +1618,7 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
                     writes=((f"{output_base}+{k}", write_scale),),
                 ))
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_branch_pc_byte1_{group}_target_lo_{k}",
                 conditions=conditions,
                 threshold=threshold,
@@ -1628,7 +1628,7 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
                     write_scale,
                 ),),
             ))
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_branch_pc_byte1_{group}_target_hi_zero",
             conditions=conditions,
             threshold=threshold,
@@ -4466,7 +4466,7 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"post_l9_bz_cancel_{band}_{k}",
                 conditions=cancel_conditions,
                 threshold=3.5,
@@ -4514,7 +4514,7 @@ def _post_l9_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
         ):
             for k in range(16):
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"post_l9_bnz_{group}_cancel_{band}_{k}",
                     conditions=conditions,
                     threshold=threshold,
