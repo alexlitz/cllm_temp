@@ -698,7 +698,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # dominates_at == "mark == MEM" so the S-6 strength verifier scopes
     # cross-op competition to the MEM-marker firing set rather than the
     # full position lattice.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_psh_mem_addr0_restore_lo_8",
         conditions=psh_mem_addr0_conditions + (("OUTPUT_LO+8", 1.0),),
         threshold=5.9,
@@ -710,7 +710,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         dominates_at={"OUTPUT_LO": "mark == MEM"},
     ))
     for k in range(1, 16):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_psh_mem_addr0_restore_hi_{k}",
             conditions=psh_mem_addr0_conditions + ((f"OUTPUT_HI_THIS_STEP+{k}", 1.0),),
             threshold=5.5,
@@ -721,7 +721,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             scope="mark == MEM",
             dominates_at={"OUTPUT_HI_THIS_STEP": "mark == MEM"},
         ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_psh_mem_addr0_force_d8_from_l14_evidence",
         conditions=psh_mem_addr0_conditions + (
             ("H1+4", 1.0),
@@ -739,7 +739,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             "OUTPUT_HI_THIS_STEP": "mark == MEM",
         },
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_psh_mem_addr0_e0_from_addr_b0",
         conditions=psh_mem_addr0_conditions + (
             ("MEM_ADDR_SRC", 1.0),
@@ -749,7 +749,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         threshold=8.5,
         writes=Primitives.byte_value_writes(0xE0, strength=20.0),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_psh_mem_addr0_e0_from_sp_no_addr_src",
         conditions=psh_mem_addr0_conditions + (
             ("MEM_ADDR_SRC", -1000.0),
