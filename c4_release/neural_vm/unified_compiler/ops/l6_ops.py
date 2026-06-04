@@ -4002,6 +4002,11 @@ def make_binary_pop_sp_increment_op() -> Operation:
 def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for SP += 8 after binary pop-style ops."""
 
+    # SP += 8 after binary-pop (32 nibble lanes + 2 byte-row fixups).
+    # Each lane is an N-way AND on (MARK_SP, CMP+3, ~other-markers),
+    # gated by the EMBED nibble cell; hi rules block when EMBED_LO is
+    # high. Byte-row fixups materialise the upper-byte carry on
+    # BYTE_INDEX_0 / BYTE_INDEX_1 under clean-embed staging.
     rules = []
     write_scale = 2.0 / S
     conditions = (
@@ -4016,7 +4021,7 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
     )
     for k in range(16):
         new_k = (k + 8) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_binary_pop_sp_lo_{k}",
             conditions=conditions,
             threshold=1.5,
@@ -4029,7 +4034,7 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
 
     for k in range(16):
         new_k_carry = (k + 1) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_binary_pop_sp_hi_{k}",
             conditions=conditions + tuple(
                 (f"EMBED_LO+{lo_bit}", -1.0)
@@ -4061,7 +4066,7 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
     # The common stack-pop boundary is 0x00fff8 + 8 => 0x010000.  L6
     # already emits byte 0 on the SP marker; materialize the upper-byte
     # carry before later tail layers can reinterpret the same CMP[3] relay.
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="l6_binary_pop_sp_byte1_ff_to_00_lo",
         conditions=byte_row_conditions + (
             ("BYTE_INDEX_0", 1.0),
@@ -4073,7 +4078,7 @@ def _layer6_binary_pop_sp_increment_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_HI_THIS_STEP+0", 10.0 / S),
         ),
     ))
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="l6_binary_pop_sp_byte2_00_to_01_lo",
         conditions=byte_row_conditions + (
             ("BYTE_INDEX_1", 1.0),
