@@ -100,12 +100,11 @@ _SKIP_DIR_SEGMENTS = {
 # decrement (or delete) the entry in the SAME commit so the ratchet
 # only walks downward.
 _BASELINE: Dict[str, int] = {
-    "c4_release/neural_vm/unified_compiler/ops/l0_ops.py": 2,
-    "c4_release/neural_vm/unified_compiler/ops/l11_ops.py": 1,
-    "c4_release/neural_vm/unified_compiler/ops/l12_ops.py": 1,
-    "c4_release/neural_vm/unified_compiler/ops/l1_ops.py": 2,
-    "c4_release/neural_vm/unified_compiler/ops/l6_ops.py": 26,
-    "c4_release/neural_vm/unified_compiler/ops/l9_ops.py": 5,
+    # All previously-baselined files migrated to 0 raw constructor
+    # calls as of 2026-06-04 (commits bc8d999a + ce56aab2 + 608b3c65 +
+    # the model_ops/flag_gated_ops/band_guarantees migration series).
+    # Ratchet held at empty — any future raw constructor in any
+    # non-allowlisted file under ``c4_release/neural_vm/`` fails CI.
 }
 
 
