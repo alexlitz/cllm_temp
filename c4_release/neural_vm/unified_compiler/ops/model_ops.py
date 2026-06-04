@@ -435,7 +435,7 @@ def _function_call_ent_stack0_rules(S: float) -> tuple[FFNRule, ...]:
     conditions = (("CMP+2", 1.0), ("MARK_STACK0", 1.0))
     rules: list[FFNRule] = []
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"ent_stack0_lo_{k}",
             conditions=conditions,
             threshold=T_ent_s0,
@@ -446,7 +446,7 @@ def _function_call_ent_stack0_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", write_scale),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"ent_stack0_hi_{k}",
             conditions=conditions,
             threshold=T_ent_s0,
