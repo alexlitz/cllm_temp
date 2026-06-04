@@ -485,6 +485,8 @@ def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_imm_fetch_route_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 IMM FETCH -> OUTPUT units 0..31."""
 
+    # N-way AND on opcode/marker conditions, gated by the FETCH band cell,
+    # routes the immediate fetch into OUTPUT at AX marker rows.
     rules = []
     conditions = (
         ("OP_IMM", 1.0),
@@ -500,7 +502,7 @@ def _layer6_imm_fetch_route_rules(S: float) -> tuple[FFNRule, ...]:
         ("hi", "FETCH_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_imm_fetch_to_output_{band}_{k}",
                 conditions=conditions,
                 threshold=4.0,
