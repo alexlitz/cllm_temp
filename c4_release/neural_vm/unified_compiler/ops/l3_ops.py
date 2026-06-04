@@ -4,6 +4,7 @@ from ...attention_head_allocator import AttentionHeadAllocator
 from ...constants import INSTR_WIDTH, PC_OFFSET
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -244,14 +245,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
         scope="MARK_SP and not HAS_SE",
     ))
     for byte_idx in (0, 2):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.sp_byte_idx_{byte_idx}_default_lo",
             conditions=((f"H1+{_SP_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.sp_byte_idx_{byte_idx}_default_hi",
             conditions=((f"H1+{_SP_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
@@ -289,14 +290,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
         scope="MARK_BP and not HAS_SE",
     ))
     for byte_idx in (0, 2):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.bp_byte_idx_{byte_idx}_default_lo",
             conditions=((f"H1+{_BP_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.bp_byte_idx_{byte_idx}_default_hi",
             conditions=((f"H1+{_BP_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
@@ -320,14 +321,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
 
     # --- PC bytes 1-3 default (units 22-27) ---
     for byte_idx in (0, 1, 2):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.pc_byte_{byte_idx}_default_lo",
             conditions=((f"H1+{_PC_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.pc_byte_{byte_idx}_default_hi",
             conditions=((f"H1+{_PC_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
@@ -337,14 +338,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
 
     # --- AX bytes 1-3 default (units 28-33) ---
     for byte_idx in (0, 1, 2):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.ax_byte_{byte_idx}_default_lo",
             conditions=((f"H1+{_AX_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.ax_byte_{byte_idx}_default_hi",
             conditions=((f"H1+{_AX_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
@@ -370,14 +371,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
 
     # --- MEM addr bytes 1-3 default (units 36-41) ---
     for byte_idx in (0, 1, 2):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.mem_byte_{byte_idx}_default_lo",
             conditions=((f"H1+{_MEM_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.mem_byte_{byte_idx}_default_hi",
             conditions=((f"H1+{_MEM_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
