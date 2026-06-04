@@ -517,7 +517,7 @@ def _function_call_ent_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
     conditions = (("OP_ENT", 1.0), ("MARK_AX", 1.0))
     rules: list[FFNRule] = []
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"ent_ax_passthrough_lo_{k}",
             conditions=conditions,
             threshold=T,
@@ -525,7 +525,7 @@ def _function_call_ent_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", write_scale),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"ent_ax_passthrough_hi_{k}",
             conditions=conditions,
             threshold=T,
