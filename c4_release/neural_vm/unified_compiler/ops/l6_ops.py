@@ -996,6 +996,9 @@ def _layer6_jsr_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_psh_stack0_writeback_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 PSH STACK0 writeback units 584..615."""
 
+    # N-way AND on (PSH_AT_SP, MARK_STACK0), gated by (ALU - EMBED) per
+    # nibble — writes the ALU stack0 value into OUTPUT only where it
+    # differs from the EMBED residual.
     rules = []
     write_scale = 2.0 / S
     conditions = (("PSH_AT_SP", 1.0), ("MARK_STACK0", 1.0))
@@ -1004,7 +1007,7 @@ def _layer6_psh_stack0_writeback_rules(S: float) -> tuple[FFNRule, ...]:
         ("hi", "EMBED_HI", "ALU_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_psh_stack0_writeback_{band}_{k}",
                 conditions=conditions,
                 threshold=1.5,
