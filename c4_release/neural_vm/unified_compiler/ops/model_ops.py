@@ -1,6 +1,7 @@
 """Model-level and post-pass op factories. See ../migrated_ops.py for history."""
 
 from ..ir import CompilerIR, FFNRule, TokenEmbeddingRule
+from ..building_blocks_dsl import multi_way_and_rule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
@@ -27,7 +28,7 @@ def _io_putchar_routing_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / S
     conditions = (("OP_PUTCHAR", 1.0), ("MARK_AX", 1.0))
     rules: list[FFNRule] = [
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="io_putchar_detect",
             conditions=conditions,
             threshold=T,
@@ -35,7 +36,7 @@ def _io_putchar_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ),
     ]
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"io_putchar_route_lo_{k}",
             conditions=conditions,
             threshold=T,
@@ -43,7 +44,7 @@ def _io_putchar_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", write_scale),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"io_putchar_route_hi_{k}",
             conditions=conditions,
             threshold=T,
