@@ -182,7 +182,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
     # Encoded as a "set" unit (ungated; fires on MARK_PC) plus a
     # HAS_SE-keyed "undo" unit gated by MARK_PC that subtracts the
     # same amount whenever HAS_SE is on.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.pc_first_step_default_lo_set",
         conditions=(("MARK_PC", 1.0),),
         threshold=0.5,
@@ -190,18 +190,16 @@ def _layer3_ffn_rules(S: float) -> tuple:
                 (f"EMBED_LO+{pc_lo}", 2.0 / S)),
         scope="MARK_PC and not HAS_SE",
     ))
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.pc_first_step_default_lo_undo",
         conditions=(("HAS_SE", 1.0),),
         threshold=0.5,
         gate=gate_mark_pc,
-        gate_weight=1.0,
-        gate_bias=0.0,
         writes=((f"OUTPUT_LO+{pc_lo}", -2.0 / S),
                 (f"EMBED_LO+{pc_lo}", -2.0 / S)),
         scope="MARK_PC and HAS_SE",
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.pc_first_step_default_hi_set",
         conditions=(("MARK_PC", 1.0),),
         threshold=0.5,
@@ -209,13 +207,11 @@ def _layer3_ffn_rules(S: float) -> tuple:
                 (f"EMBED_HI+{pc_hi}", 2.0 / S)),
         scope="MARK_PC and not HAS_SE",
     ))
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.pc_first_step_default_hi_undo",
         conditions=(("HAS_SE", 1.0),),
         threshold=0.5,
         gate=gate_mark_pc,
-        gate_weight=1.0,
-        gate_bias=0.0,
         writes=((f"OUTPUT_HI+{pc_hi}", -2.0 / S),
                 (f"EMBED_HI+{pc_hi}", -2.0 / S)),
         scope="MARK_PC and HAS_SE",
