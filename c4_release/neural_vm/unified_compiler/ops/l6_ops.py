@@ -788,9 +788,11 @@ def _layer6_first_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_halt_detect_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 EXIT halt conversion unit 384."""
 
+    # EXIT halt conversion: 2-way AND on (CMP+1, NEXT_SE), no gate;
+    # raises NEXT_HALT and clears NEXT_SE.
     write_scale = 2.0 / S
     return (
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_exit_halt_detect",
             conditions=(("CMP+1", 1.0), ("NEXT_SE", 1.0)),
             threshold=1.3,
