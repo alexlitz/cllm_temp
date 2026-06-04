@@ -3,6 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -1255,7 +1256,7 @@ def _layer14_temp_clear_rules(S: float) -> tuple[FFNRule, ...]:
     AX_I = 1
     rules = (
         # Unit 0: clear TEMP[0] at PC marker when OP_LEV active.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_temp_clear_pc_lev",
             conditions=(
                 ("OP_LEV", 0.1),    # S * 0.1 == legacy W_up[..., OP_LEV] = S/10
@@ -1270,7 +1271,7 @@ def _layer14_temp_clear_rules(S: float) -> tuple[FFNRule, ...]:
             dominates_at={"TEMP+0": "OP_LEV and MARK_PC"},
         ),
         # Unit 1: TEMP[8] negative residue clamp.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_clear_addsub_temp_negative_residue_8",
             conditions=(("TEMP+8", -1.0),),
             threshold=0.0,
@@ -1280,7 +1281,7 @@ def _layer14_temp_clear_rules(S: float) -> tuple[FFNRule, ...]:
             writes=(("TEMP+8", 2.0 / S),),
         ),
         # Unit 2: TEMP[9] negative residue clamp.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_clear_addsub_temp_negative_residue_9",
             conditions=(("TEMP+9", -1.0),),
             threshold=0.0,
@@ -1290,7 +1291,7 @@ def _layer14_temp_clear_rules(S: float) -> tuple[FFNRule, ...]:
             writes=(("TEMP+9", 2.0 / S),),
         ),
         # Unit 3: ADD byte-1 high-nibble zero cleanup.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_add_byte1_high_zero_cleanup",
             conditions=(
                 ("IS_BYTE", 1.0),
