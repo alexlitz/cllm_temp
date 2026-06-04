@@ -520,7 +520,9 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     MARK_PC_BLOCK = -50.0
 
     def cmp_default(op_name: str, default_result: int, *, idx: int) -> FFNRule:
-        return FFNRule.constant_write(
+        # DSL v4b: 3-condition AND with explicit threshold 1.5; MARK_PC
+        # blocker uses negative weight. constant_write style (no gate).
+        return multi_way_and_rule(
             conditions=(
                 ("MARK_AX", 1.0),
                 (op_name, 1.0),
@@ -539,7 +541,9 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
         op_name: str, cmp_name: str, to_result: int, from_result: int,
         *, idx: int,
     ) -> FFNRule:
-        return FFNRule.gated_write(
+        # DSL v4b: 3-condition AND (MARK_AX + CMP cell + MARK_PC blocker)
+        # gated on the opcode flag.
+        return multi_way_and_rule(
             conditions=(
                 ("MARK_AX", 1.0),
                 (cmp_name, 1.0),
@@ -548,7 +552,6 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=1.5,
             gate=op_name,
             gate_weight=1.0,
-            gate_bias=0.0,
             writes=(
                 (f"OUTPUT_LO+{to_result}", 4.0 / S),
                 (f"OUTPUT_LO+{from_result}", -4.0 / S),
@@ -561,7 +564,9 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
         op_name: str, cmp_name1: str, cmp_name2: str,
         to_result: int, from_result: int, *, idx: int,
     ) -> FFNRule:
-        return FFNRule.gated_write(
+        # DSL v4b: 4-condition AND (MARK_AX + 2 CMP cells + MARK_PC
+        # blocker) with explicit threshold 2.5, gated on opcode.
+        return multi_way_and_rule(
             conditions=(
                 ("MARK_AX", 1.0),
                 (cmp_name1, 1.0),
@@ -571,7 +576,6 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=2.5,
             gate=op_name,
             gate_weight=1.0,
-            gate_bias=0.0,
             writes=(
                 (f"OUTPUT_LO+{to_result}", 4.0 / S),
                 (f"OUTPUT_LO+{from_result}", -4.0 / S),
