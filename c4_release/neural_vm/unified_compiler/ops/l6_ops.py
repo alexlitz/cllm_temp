@@ -1196,6 +1196,9 @@ def _layer6_ent_sp_writeback_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_ent_first_step_sp_byte0_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 ENT first-step SP byte 0 units 840..871."""
 
+    # ENT first-step SP byte 0: 32 N-way AND rules at the SP marker row
+    # gated by FETCH (immediate) nibbles, writing (-8 - imm) mod 16 to
+    # OUTPUT_LO and (-1 - imm) mod 16 to OUTPUT_HI.
     rules = []
     conditions = (
         ("OP_ENT", 1.0),
@@ -1204,7 +1207,7 @@ def _layer6_ent_first_step_sp_byte0_rules(S: float) -> tuple[FFNRule, ...]:
     )
     for imm_lo in range(16):
         result_lo = (-8 - imm_lo) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_ent_first_step_sp_byte0_lo_{imm_lo}",
             conditions=conditions,
             threshold=1.5,
@@ -1213,7 +1216,7 @@ def _layer6_ent_first_step_sp_byte0_rules(S: float) -> tuple[FFNRule, ...]:
         ))
     for imm_hi in range(16):
         result_hi = (-1 - imm_hi) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_ent_first_step_sp_byte0_hi_{imm_hi}",
             conditions=conditions,
             threshold=1.5,
