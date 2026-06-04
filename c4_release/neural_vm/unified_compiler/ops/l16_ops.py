@@ -901,7 +901,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     )
     top_store_restore = 50.0 / S
     for k in range(1, 16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_top_store_stack0_restore_lo_{k}",
             conditions=top_store_stack0_conditions,
             threshold=7.0,
@@ -934,7 +934,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_MEM", -10.0),
     )
     stack0_byte1_zero = 1000.0 / S
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="l16_stack0_byte1_zero_after_unit_low_byte",
         conditions=stack0_byte1_zero_conditions,
         threshold=8.0,
@@ -980,7 +980,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_MEM", -10.0),
     )
     jsr_return_addr_byte1_strength = 500.0 / S
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_jsr_return_addr_byte1_01_from_low_22",
         conditions=jsr_return_addr_byte1_conditions,
         threshold=9.0,
@@ -1012,7 +1012,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             # TEMP[11]. Do not treat that marker residue as the preserved AX
             # value when JMP is merely preserving the prior AX byte.
             extra_conditions.append(("TEMP+11", -2.0))
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_jmp_ax_preserve_lo_{k}",
             conditions=jmp_ax_preserve_conditions + tuple(extra_conditions),
             threshold=1.5,
