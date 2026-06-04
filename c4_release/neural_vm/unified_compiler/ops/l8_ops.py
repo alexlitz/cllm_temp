@@ -725,7 +725,7 @@ def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
             full_sum = 8 + imm_lo
             if not (sp_lo < (full_sum % 16) or full_sum >= 16):
                 continue
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l8_alu_ent_borrow_sp{sp_lo}_imm{imm_lo}",
                 conditions=(
                     ("MARK_AX", 60.0),
