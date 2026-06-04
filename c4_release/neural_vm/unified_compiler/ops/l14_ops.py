@@ -1751,7 +1751,7 @@ def _layer14_clear_mem_marker_output_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
     def rule_for(op_name: str, band: str, k: int) -> FFNRule:
-        return FFNRule.gated_write(
+        return multi_way_and_rule(
             name=f"l14_clear_mem_marker_output_{op_name.lower()}_{band.lower()}_{k}",
             conditions=(
                 (op_name, 0.2),  # imperative: W_up[OP_*] = S / 5
