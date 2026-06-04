@@ -348,7 +348,7 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
 
     rules: list[FFNRule] = []
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"jsr_pc_cancel_output_lo_{k}",
             conditions=conditions,
             threshold=T_jsr_pc,
@@ -357,7 +357,7 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", write_scale),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"jsr_pc_cancel_output_hi_{k}",
             conditions=conditions,
             threshold=T_jsr_pc,
@@ -367,7 +367,7 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ))
     for k in range(16):
         target_lo = ((k * INSTR_WIDTH) + PC_OFFSET) & 0xF
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"jsr_pc_target_lo_{k}",
             conditions=conditions,
             threshold=T_jsr_pc,
@@ -378,7 +378,7 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     # bake writes ``ffn6.W_gate[unit, FETCH_HI+k] = 1.0`` and no down
     # assignment because JSR fixtures target instruction indexes < 16.
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"jsr_pc_fetch_hi_reserved_{k}",
             conditions=conditions,
             threshold=T_jsr_pc,
@@ -387,7 +387,7 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ))
     for k in range(16):
         target_hi_from_lo = ((k * INSTR_WIDTH) + PC_OFFSET) >> 4
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"jsr_pc_target_hi_from_lo_{k}",
             conditions=conditions,
             threshold=T_jsr_pc,
