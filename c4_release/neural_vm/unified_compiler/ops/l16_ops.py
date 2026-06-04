@@ -1447,7 +1447,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     for idx, mem_val_dim in enumerate(
         ("MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3")
     ):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_nonstore_mem_value{idx}_zero",
             conditions=(
                 ("IS_BYTE", 1.0),
@@ -1476,7 +1476,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         for k in range(8, 16)
     )
     for hi in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_psh_sp_no_borrow_hi_{hi}",
             conditions=(
                 ("PSH_AT_SP", 1.0),
@@ -1514,7 +1514,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -10.0),
         ("MARK_MEM", -10.0),
     )
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_lea_local_ax_byte1_ff_lo",
         conditions=lea_ax_byte1_conditions,
         threshold=4.5,
@@ -1526,7 +1526,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             for k in range(16)
         ),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_lea_local_ax_byte1_ff_hi",
         conditions=lea_ax_byte1_conditions,
         threshold=4.5,
@@ -1543,7 +1543,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # layers compute the low nibble strongly, but the high-nibble lanes can
     # tie at residual scale and let 0x08 win by a few thousandths.  Nudge only
     # this local-address marker shape so downstream byte generation sees 0xe8.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_lea_local_ax_byte0_hi_e",
         conditions=(
             ("MARK_AX", 1.0),
@@ -1578,7 +1578,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     )
     lev_sp_stack0_cancel_threshold = 105.0
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_stack0_cancel_lev_sp_lo_{k}",
             conditions=lev_sp_stack0_cancel_conditions + (
                 (f"ADDR_B0_LO+{k}", 1.0),
@@ -1589,7 +1589,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ))
     for k in range(16):
         result = (k + 1) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_stack0_cancel_lev_sp_hi_{k}",
             conditions=lev_sp_stack0_cancel_conditions + (
                 (f"ADDR_B0_HI+{k}", 1.0),
