@@ -4428,7 +4428,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         rules = []
         for old_lo in range(1, 16):
             rules.append(
-                FFNRule.gated_write(
+                multi_way_and_rule(
                     name=f"tail_ax_sub_borrow_byte1_{old_lo:01x}_to_{old_lo - 1:01x}",
                     scope="is_byte",
                     dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -4512,7 +4512,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     else f"tail_wide_mul_byte1_preserve_{high_nibble:01x}{low_nibble:01x}"
                 )
                 rules.append(
-                    FFNRule.gated_write(
+                    multi_way_and_rule(
                         name=name,
                         # The MARK_AX hard blocker (-1000) inside
                         # bounded_ax_byte0 plus the OP_MUL positive whose
