@@ -4446,15 +4446,26 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     Identical structure to the L6 rules; the only difference is the CMP+4 /
     CMP+5 reads are not aliased to `CMP.*.-1` -- they resolve to the current
     step's CMP because this op runs in an FFN block strictly after layer9_alu.
+
+    Step-0 guard: all BZ-taken override rules are semantically meaningful
+    only on step >= 1 (the cancel band reads the previous step's OUTPUT and
+    there is no preceding CMP-producing instruction on step 0). `HAS_SE` is
+    0 on step 0 and 1 on step 1+ (see ``dim_registry_dynamic.py:104``); the
+    +10 weight together with the +10 threshold bump makes the rule dead on
+    step 0 while preserving the original step-1+ firing margin. Documented
+    in ``docs/L34_FFN_ATTRIBUTION_2026_06_04.md`` (the cheapest fix for the
+    L34 var_simple/var_three 0x00 leak at MEM_addr1 step 0).
     """
 
     rules = []
+    step0_guard_weight = 10.0
     cancel_conditions = (
         ("MARK_PC", 1.0),
         ("OP_BZ", 0.2),
         ("CMP+4", 1.0),
         ("CMP+5", 1.0),
         ("IS_BYTE", -10.0),
+        ("HAS_SE", step0_guard_weight),
     )
     target_conditions = cancel_conditions + (("MARK_STACK0", -10.0),)
     write_scale = 2.0 / S
@@ -4469,7 +4480,7 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             rules.append(multi_way_and_rule(
                 name=f"post_l9_bz_cancel_{band}_{k}",
                 conditions=cancel_conditions,
-                threshold=3.5,
+                threshold=3.5 + step0_guard_weight,
                 gate=f"{output_gate_base}+{k}",
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
@@ -4478,7 +4489,7 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         rules,
         name_prefix="post_l9_bz",
         conditions=target_conditions,
-        threshold=3.5,
+        threshold=3.5 + step0_guard_weight,
         lo_source="FETCH_LO",
         hi_source="FETCH_HI",
         write_scale=write_scale,
@@ -4487,15 +4498,29 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
 
 
 def _post_l9_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
-    """Same-step-CMP variant of `_layer6_bnz_pc_override_rules`."""
+    """Same-step-CMP variant of `_layer6_bnz_pc_override_rules`.
+
+    Step-0 guard: same rationale as ``_post_l9_bz_pc_override_rules`` --
+    BNZ-taken overrides have no semantic role on step 0 since there is no
+    prior CMP-producing instruction. The ``HAS_SE`` term with +10 weight
+    plus a +10 threshold bump zeroes the rule on step 0 (``HAS_SE = 0``)
+    while preserving the original step-1+ firing margin.
+    """
 
     rules = []
     write_scale = 2.0 / S
+    step0_guard_weight = 10.0
+    step0_guard_term = ("HAS_SE", step0_guard_weight)
     groups = (
         (
             "lo_nonzero",
-            (("MARK_PC", 1.0), ("OP_BNZ", 0.2), ("CMP+4", -1.0)),
-            1.5,
+            (
+                ("MARK_PC", 1.0),
+                ("OP_BNZ", 0.2),
+                ("CMP+4", -1.0),
+                step0_guard_term,
+            ),
+            1.5 + step0_guard_weight,
         ),
         (
             "hi_nonzero",
@@ -4504,8 +4529,9 @@ def _post_l9_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OP_BNZ", 0.2),
                 ("CMP+4", 1.0),
                 ("CMP+5", -1.0),
+                step0_guard_term,
             ),
-            2.5,
+            2.5 + step0_guard_weight,
         ),
     )
     for group, conditions, threshold in groups:
@@ -4588,6 +4614,11 @@ def make_post_l9_bz_bnz_pc_override_op() -> Operation:
             "MARK_PC", "MARK_STACK0", "OP_BZ", "OP_BNZ",
             "CMP", "IS_BYTE", "FETCH_LO", "FETCH_HI",
             "OUTPUT_LO.*.-1", "OUTPUT_HI_THIS_STEP",
+            # Step-0 guard: HAS_SE = 0 on step 0, 1 on step 1+. The BZ/BNZ
+            # cancel+target rules add `("HAS_SE", +10)` and bump threshold
+            # by 10 so step 0 cannot fire (no preceding CMP exists). See
+            # docs/L34_FFN_ATTRIBUTION_2026_06_04.md.
+            "HAS_SE",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="ffn",
