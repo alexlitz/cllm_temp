@@ -1,6 +1,7 @@
 """Flag-gated factories (tool-call + conversational I/O). See ../migrated_ops.py for history."""
 
 from ...dim_registry import dim_ref
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -123,7 +124,7 @@ def _tool_call_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 10.0 / S
     gate_ax = dim_ref("marker", "AX")
     return tuple(
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name=f"tool_call_decode_{name}",
             conditions=(
                 (f"OPCODE_BYTE_LO+{lo}", 1.0),
