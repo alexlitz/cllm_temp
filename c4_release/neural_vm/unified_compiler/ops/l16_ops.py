@@ -116,7 +116,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     )
     for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l16_lev_sp_cancel_{band}_{k}",
                 conditions=sp_cancel_conditions,
                 threshold=31.5,
@@ -143,7 +143,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("PSH_AT_SP", -first_step_gate),
     )
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_sp_bp_plus16_lo_{k}",
             conditions=sp_value_base_conditions + ((f"ADDR_B0_LO+{k}", 1.0),),
             threshold=40.0,
@@ -152,7 +152,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ))
     for k in range(16):
         result = (k + 1) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_sp_bp_plus16_hi_{k}",
             conditions=sp_value_base_conditions + ((f"ADDR_B0_HI+{k}", 1.0),),
             threshold=40.0,
@@ -168,7 +168,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_BP", -1.0),
     )
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_pc_cancel_hi_{k}",
             conditions=pc_cancel_hi_conditions,
             threshold=1.5,
@@ -177,7 +177,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_pc_temp_lo_{k}",
             conditions=(
                 ("OP_LEV", 1.0),
@@ -189,7 +189,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", write_scale),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_lev_pc_temp_hi_{k}",
             conditions=(
                 ("OP_LEV", 1.0),
