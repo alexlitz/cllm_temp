@@ -3,6 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -206,7 +207,7 @@ def _layer2_mem_byte_flags_rules(S: float) -> tuple[FFNRule, ...]:
         # Preserve the legacy rule-name suffix by stripping ``+0`` from
         # the ``dim_ref`` output strings.
         first_out = out_dims[0].split("+", 1)[0]
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"layer2_mem_byte_flags_{idx}_{first_out.lower()}",
             conditions=(
                 (src_dim, 1.0),
