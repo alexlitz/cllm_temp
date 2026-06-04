@@ -950,7 +950,7 @@ def _layer3_pc_byte1_output_rules(S: float) -> tuple:
     )
     # Rule 0 (unit 134): wrap token -- new byte0 high nibble == 0 AND
     # new byte0 low nibble == 2 (i.e. PC just crossed 0x100).
-    wrap = FFNRule.constant_write(
+    wrap = multi_way_and_rule(
         name="layer3_ffn.pc_byte1_wrap_token",
         conditions=common_conds + (
             ("CLEAN_EMBED_LO+2", 1.0),
@@ -968,7 +968,7 @@ def _layer3_pc_byte1_output_rules(S: float) -> tuple:
     preserve_conds.append(("TEMP+16", 1.0))
     for hi in range(5):
         preserve_conds.append((f"CLEAN_EMBED_HI+{hi}", 1.0))
-    preserve = FFNRule.constant_write(
+    preserve = multi_way_and_rule(
         name="layer3_ffn.pc_byte1_preserve",
         conditions=tuple(preserve_conds),
         threshold=6.5,
