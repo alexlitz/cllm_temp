@@ -502,14 +502,12 @@ def _layer3_ffn_rules(S: float) -> tuple:
     # cancel the HAS_SE/MARK_PC pair (suppress on LEV opcodes).
     for k in range(16):
         new_k = (k + INSTR_WIDTH) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.pc_increment_lo_{k}",
             conditions=(("HAS_SE", 1.0), ("MARK_PC", 1.0),
                         ("OP_LEV", -1.0 / 5.0)),
             threshold=1.5,
             gate=f"EMBED_LO+{k}",
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=((f"OUTPUT_LO+{new_k}", 2.0 / S),),
             scope="MARK_PC and HAS_SE and not OP_LEV",
         ))
@@ -517,14 +515,12 @@ def _layer3_ffn_rules(S: float) -> tuple:
     # --- PC INCREMENT hi nibble (units 102-117) ---
     # Same condition; copies EMBED_HI[k] -> OUTPUT_HI[k].
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.pc_increment_hi_{k}",
             conditions=(("HAS_SE", 1.0), ("MARK_PC", 1.0),
                         ("OP_LEV", -1.0 / 5.0)),
             threshold=1.5,
             gate=f"EMBED_HI+{k}",
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=((f"OUTPUT_HI+{k}", 2.0 / S),),
             scope="MARK_PC and HAS_SE and not OP_LEV",
         ))
@@ -541,13 +537,11 @@ def _layer3_ffn_rules(S: float) -> tuple:
         conds = [("MARK_PC", 4.0), ("HAS_SE", 1.0), ("OP_LEV", -1.0)]
         for lo_bit in range(carry_threshold, 16):
             conds.append((f"EMBED_LO+{lo_bit}", 1.0))
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.pc_carry_correction_{k}",
             conditions=tuple(conds),
             threshold=5.5,
             gate=f"EMBED_HI+{k}",
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=((f"OUTPUT_HI+{k}", -2.0 / S),
                     (f"OUTPUT_HI+{(k + 1) % 16}", 2.0 / S)),
             scope="MARK_PC and HAS_SE and not OP_LEV",
