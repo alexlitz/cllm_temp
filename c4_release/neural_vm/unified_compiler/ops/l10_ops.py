@@ -864,7 +864,10 @@ def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
 
     def _case_a(op_name: str) -> FFNRule:
         # Phase 8.D: OP_<NAME> gate -> (opcode_flag, NAME).
-        return FFNRule.gated_write(
+        # DSL v4b: explicit-threshold AND (MARK_AX dominant + AX_CARRY_HI[0]
+        # suppressor). Threshold 59 fires only when MARK_AX is hot AND
+        # AX_CARRY_HI[0] is absent (i.e. shift >= 16).
+        return multi_way_and_rule(
             name=f"l10_{op_name.lower()}_shift_ge16_zero",
             conditions=(
                 ("MARK_AX", 60.0),
@@ -873,7 +876,6 @@ def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=59.0,
             gate=dim_ref("opcode_flag", op_name),
             gate_weight=1.0,
-            gate_bias=0.0,
             writes=(
                 ("OUTPUT_LO+0", 2.0 / S),
                 ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
@@ -888,13 +890,15 @@ def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
         for lo_bit in range(8, 16):
             conditions.append((f"AX_CARRY_LO+{lo_bit}", 1.0))
         # Phase 8.D: OP_<NAME> gate -> (opcode_flag, NAME).
-        return FFNRule.gated_write(
+        # DSL v4b: explicit-threshold AND across MARK_AX + AX_CARRY_HI[0] +
+        # (AX_CARRY_LO[8..15]). Threshold 80 forces all three terms (MARK_AX
+        # 60 + HI 1 + one of the LO 8..15 cells 1 = 62 < 80).
+        return multi_way_and_rule(
             name=f"l10_{op_name.lower()}_shift_8_15_zero",
             conditions=tuple(conditions),
             threshold=80.0,
             gate=dim_ref("opcode_flag", op_name),
             gate_weight=1.0,
-            gate_bias=0.0,
             writes=(
                 ("OUTPUT_LO+0", 2.0 / S),
                 ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
