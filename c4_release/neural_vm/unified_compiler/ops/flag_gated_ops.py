@@ -256,7 +256,7 @@ def _convo_io_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
     write_active = 2.0 / S
     gate_ax = dim_ref("marker", "AX")
     return (
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="convo_io_decode_prtf",
             conditions=(
                 ("OPCODE_BYTE_LO+1", 1.0),
@@ -269,7 +269,7 @@ def _convo_io_opcode_decode_rules(S: float) -> tuple[FFNRule, ...]:
                 ("ACTIVE_OPCODE_PRTF", write_active),
             ),
         ),
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="convo_io_decode_read",
             conditions=(
                 ("OPCODE_BYTE_LO+15", 1.0),
