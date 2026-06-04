@@ -769,7 +769,7 @@ def _layer9_bp_plus8_shift_rules(S: float) -> tuple[FFNRule, ...]:
     rules: list[FFNRule] = []
     for k in range(16):
         new_k = (k + 8) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l9_bp_plus8_shift_{k}",
             conditions=(
                 ("MARK_PC", 1.0),
@@ -822,7 +822,7 @@ def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
     rules: list[FFNRule] = []
 
     # Unit 0: ADDR_B1_LO[15] = 1 (byte 1 = 0xff lo nibble).
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="l9_addr_b1_lo_set",
         conditions=common_conditions,
         threshold=threshold,
@@ -833,7 +833,7 @@ def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
     ))
 
     # Unit 1: ADDR_B1_HI[15] = 1 (byte 1 = 0xff hi nibble).
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="l9_addr_b1_hi_set",
         conditions=common_conditions,
         threshold=threshold,
@@ -866,7 +866,7 @@ def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
         )),
     )
     for suffix, writes in cascade_writes:
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l9_{suffix}",
             conditions=common_conditions,
             threshold=threshold,
@@ -912,7 +912,7 @@ def _layer9_marker_suppress_rules(S: float) -> tuple[FFNRule, ...]:
         for k in range(16):
             writes.append((f"OUTPUT_LO+{k}", -1.0))
             writes.append((f"OUTPUT_HI_THIS_STEP+{k}", -1.0))
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l9_marker_suppress_{next_dim.lower()}",
             conditions=((next_dim, 100.0 / S),),
             threshold=80.0 / S,
