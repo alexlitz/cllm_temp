@@ -4,7 +4,7 @@ from ...attention_head_allocator import AttentionHeadAllocator
 from ...constants import INSTR_WIDTH, PC_OFFSET
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import multi_way_and_rule
+from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -354,18 +354,22 @@ def _layer3_ffn_rules(S: float) -> tuple:
         ))
 
     # --- MEM marker default (units 34-35) ---
-    rules.append(FFNRule.constant_write(
+    rules.append(step_function_rule(
         name="layer3_ffn.mem_marker_default_lo",
-        conditions=(("MARK_MEM", 1.0),),
+        input_dim="MARK_MEM",
         threshold=0.5,
-        writes=(("OUTPUT_LO+0", 2.0 / S),),
+        write_dim="OUTPUT_LO+0",
+        write_value=2.0,
+        S=S,
         scope="MARK_MEM",
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(step_function_rule(
         name="layer3_ffn.mem_marker_default_hi",
-        conditions=(("MARK_MEM", 1.0),),
+        input_dim="MARK_MEM",
         threshold=0.5,
-        writes=(("OUTPUT_HI+0", 2.0 / S),),
+        write_dim="OUTPUT_HI+0",
+        write_value=2.0,
+        S=S,
         scope="MARK_MEM",
     ))
 
