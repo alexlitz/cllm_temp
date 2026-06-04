@@ -579,7 +579,7 @@ def _tool_call_detection_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / S
     cmp_lo_eq = dim_ref("cmp_flag", "cascade", 2)
     return (
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tool_call_detection",
             conditions=(
                 (cmp_lo_eq, 1.0),
