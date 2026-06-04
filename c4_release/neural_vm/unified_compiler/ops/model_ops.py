@@ -591,7 +591,7 @@ def _function_call_lev_ax_byte_rules(S: float) -> tuple[FFNRule, ...]:
     )
     rules: list[FFNRule] = []
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"lev_ax_byte_lo_{k}",
             conditions=conditions,
             threshold=T_byte,
@@ -599,7 +599,7 @@ def _function_call_lev_ax_byte_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", write_scale),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"lev_ax_byte_hi_{k}",
             conditions=conditions,
             threshold=T_byte,
