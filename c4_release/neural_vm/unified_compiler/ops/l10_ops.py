@@ -4220,7 +4220,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # entailed. Leave scope/dominates_at unset until the conditions can
         # be restructured.
         rules = [
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_ax_add_byte1_hi_zero",
                 conditions=base_conditions,
                 threshold=250.0,
@@ -4229,7 +4229,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ]
         for lo in range(16):
             rules.append(
-                FFNRule.gated_write(
+                multi_way_and_rule(
                     name=f"tail_ax_add_byte1_hi_zero_lo_{lo:01x}",
                     conditions=base_conditions
                     + ((f"OUTPUT_LO+{lo}", 10.0),)
@@ -4307,7 +4307,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("NEXT_SE", -1000000.0),
         )
         return (
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_ax_add_byte1_no_carry_low1_02",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -4318,7 +4318,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 threshold=1080.0,
                 writes=byte_writes(0x02, strength=1_000_000.0),
             ),
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_ax_add_byte1_no_carry_low2_03",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -4329,7 +4329,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 threshold=1080.0,
                 writes=byte_writes(0x03, strength=1_000_000.0),
             ),
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_ax_add_byte1_carry_low2_03",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -4348,7 +4348,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         rules = []
         for lo in range(16):
             rules.append(
-                FFNRule.constant_write(
+                multi_way_and_rule(
                     name=f"tail_ax_sub_byte1_hi_zero_lo_{lo:01x}",
                     scope="is_byte",
                     dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -4384,7 +4384,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         """Materialize byte 1 as 0xff for SUB underflow from high byte zero."""
 
         return (
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_ax_sub_full_underflow_byte1_ff",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
