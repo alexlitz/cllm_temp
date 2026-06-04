@@ -6,10 +6,7 @@ from typing import Mapping, Optional
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import (
-    lookup_table_rules,
-    multi_way_and_rule,
-)
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule
 from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
