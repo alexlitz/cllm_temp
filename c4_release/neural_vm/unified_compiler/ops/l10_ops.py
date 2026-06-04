@@ -6478,16 +6478,31 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=6.1,
             writes=byte_writes(0x00, strength=1000.0),
         ),
-        FFNRule.constant_write(
+        # OP_LT moved from conditions (additive) to gate (multiplicative) so
+        # OP_LT residual fan-in via L6 routing's slot-3 binary-pop head does
+        # not add to the condition score on non-LT op rows. CMP+0 is the
+        # canonical LT-true bit (hi_lt fired); when CMP+0 is hot we want this
+        # LT-false-writer to NOT fire, so it is a strong negative blocker
+        # rather than the inverted positive coefficient that was here before
+        # ("CMP+0", 0.01). Threshold drops to 0.5 so MARK_AX (=1.0 in state)
+        # alone clears the gate, while a hot CMP+0 (~1.0) drives the score
+        # below zero and suppresses the rule. Multiplicative OP_LT gate via
+        # silu means the rule only contributes on OP_LT-active rows.
+        # Mirrors the polarity discipline of tail_cmp_eq_false_00 directly
+        # above, but uses the gate to suppress LT fan-in (per the 2026-06-03
+        # CMP polarity investigation doc).
+        FFNRule.gated_write(
             name="tail_cmp_lt_false_00",
             scope="mark == AX",
             dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
             conditions=(
                 ("MARK_AX", 1.0),
-                ("OP_LT", 1.0),
-                ("CMP+0", 0.01),
+                ("CMP+0", -10.0),
             ),
-            threshold=7.0,
+            threshold=0.5,
+            gate="OP_LT",
+            gate_weight=1.0,
+            gate_bias=0.0,
             writes=byte_writes(0x00, strength=1000.0),
         ),
         FFNRule.constant_write(
