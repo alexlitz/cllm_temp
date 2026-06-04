@@ -5,6 +5,7 @@ from collections.abc import Mapping
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule, RuntimeAttentionFragment, StructuralOp
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -208,13 +209,13 @@ def make_l15_psh_stack_ir() -> CompilerIR:
         )
 
     # SP byte 0 position predicts SP byte 1 = 0xff after SP -= 8.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="psh_sp_byte1_lo_ff",
         conditions=psh_byte_conditions(sp_i, "BYTE_INDEX_0"),
         threshold=threshold,
         writes=(("OUTPUT_LO+15", 4.0), ("OUTPUT_LO+0", -4.0)),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="psh_sp_byte1_hi_ff",
         conditions=psh_byte_conditions(sp_i, "BYTE_INDEX_0"),
         threshold=threshold,
@@ -226,13 +227,13 @@ def make_l15_psh_stack_ir() -> CompilerIR:
         ("BYTE_INDEX_1", "byte2"),
         ("BYTE_INDEX_2", "byte3"),
     ):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"psh_sp_{predicted_byte}_lo_00",
             conditions=psh_byte_conditions(sp_i, byte_index_name),
             threshold=threshold,
             writes=(("OUTPUT_LO+0", 2.0),),
         ))
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"psh_sp_{predicted_byte}_hi_00",
             conditions=psh_byte_conditions(sp_i, byte_index_name),
             threshold=threshold,
@@ -240,13 +241,13 @@ def make_l15_psh_stack_ir() -> CompilerIR:
         ))
 
     # PSH leaves BP unchanged; preserve STACK_INIT byte 2 = 0x01.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="psh_bp_byte2_lo_01",
         conditions=psh_byte_conditions(bp_i, "BYTE_INDEX_1"),
         threshold=threshold,
         writes=(("OUTPUT_LO+1", 4.0), ("OUTPUT_LO+0", -4.0)),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="psh_bp_byte2_hi_00",
         conditions=psh_byte_conditions(bp_i, "BYTE_INDEX_1"),
         threshold=threshold,
