@@ -1300,7 +1300,7 @@ def _convo_io_prtf_capture_rules(S: float) -> tuple[FFNRule, ...]:
             (src_hi, dst_hi),
         ):
             for k in range(16):
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"convo_io_capture_{dest_base.lower()}_{k}",
                     conditions=(
                         ("ACTIVE_OPCODE_PRTF", 1.0),
