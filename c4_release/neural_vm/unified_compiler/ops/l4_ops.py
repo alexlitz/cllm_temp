@@ -588,7 +588,7 @@ def _nibble_rotation_chain_rules(
     # 16 x lo rotation: source_lo+(k - offset) % 16 -> target_lo+k
     for k in range(16):
         src = (k - offset) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"{name_prefix}_lo_rot_{k}",
             conditions=base_conditions,
             threshold=base_thresh,
@@ -599,7 +599,7 @@ def _nibble_rotation_chain_rules(
 
     # 16 x hi default copy: source_hi+k -> target_hi+k
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"{name_prefix}_hi_copy_{k}",
             conditions=base_conditions,
             threshold=base_thresh,
@@ -618,7 +618,7 @@ def _nibble_rotation_chain_rules(
             )
             for k in range(16):
                 # Cancel default copy when source_lo[carry_src] == 1
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"{name_prefix}_carry_cancel_{carry_src}_{k}",
                     conditions=carry_conditions,
                     threshold=carry_thresh,
@@ -631,7 +631,7 @@ def _nibble_rotation_chain_rules(
                 ))
                 # Add rotated +1 when source_lo[carry_src] == 1
                 hi_src = (k - 1) % 16
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"{name_prefix}_carry_rotated_{carry_src}_{k}",
                     conditions=carry_conditions,
                     threshold=carry_thresh,
