@@ -500,7 +500,7 @@ def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
         for b in range(16):
             if a + b < 16:
                 continue
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l8_alu_add_carry_a{a}_b{b}",
                 conditions=(
                     ("MARK_AX", 1.0),
