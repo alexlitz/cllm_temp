@@ -1028,7 +1028,7 @@ def make_convo_io_step_resume_op(
 def _convo_io_step_resume_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / S
     return (
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="convo_io_step_resume",
             conditions=(("LAST_WAS_THINKING_START", 1.0),),
             threshold=0.5,
