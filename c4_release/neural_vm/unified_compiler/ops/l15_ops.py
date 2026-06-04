@@ -1765,6 +1765,19 @@ def make_l15_attention_resize_op() -> Operation:
         # no dims, so the dep DAG can't derive the post-bake placement on
         # its own. See docs/B12_BACKFILL_SPEC.md §1.
         requires={"after": "layer15_nibble_copy"},
+        # Dim-ownership claims: empty. ``bake`` rebuilds
+        # ``model.blocks[15].attn`` -- resizes head count (14 for 17-
+        # layer LEV builds, 9 for default 16-layer builds) which
+        # replaces the attention's ``W_q`` / ``W_k`` / ``W_v`` /
+        # ``W_o`` parameters wholesale, then runs a follow-up that
+        # writes ALiBi pin / suppress-lookup helper state. Module
+        # replacement, not per-cell ``(layer, scope, identifier,
+        # column)`` writes. Sentinel below documents the structural
+        # effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L15.attn[resize num_heads]'},
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )

@@ -6904,6 +6904,17 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         requires={"after": "layer10_carry_relay"},
         migrated=True,
         declarative_authority="structural_model",
+        # Dim-ownership claims: empty. ``bake`` appends 6-7 freshly
+        # constructed post_op modules (BinaryOpByteZeroingPostOp,
+        # AddSubBytePropagationPostOp, CarryPropagationPostOp x3,
+        # BitwiseBytePropagationPostOp, optional ComparisonCombine) to
+        # ``model.blocks[10].post_ops`` -- module attach, not per-cell
+        # ``(layer, scope, identifier, column)`` writes. Sentinel below
+        # documents the structural effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L10.post_ops[+6 structural FFNs]'},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

@@ -1219,6 +1219,16 @@ def make_residual_alibi_slopes_op() -> Operation:
         phase=999,
         migrated=True,
         declarative_authority="structural_model",
+        # Dim-ownership claims: empty. ``bake`` writes
+        # ``attn.alibi_slopes`` tables on L6 / L8 / L14 / L15 -- ALiBi
+        # bias parameters (not residual dims), spanning four blocks.
+        # Module-level table writes, not per-cell ``(layer, scope,
+        # identifier, column)`` writes. Sentinel below documents the
+        # structural effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L6/L8/L14/L15.attn[alibi_slopes]'},
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#the-attention-layer",
     )
@@ -1320,6 +1330,16 @@ def make_branch_override_patch_op() -> Operation:  # noqa: E302
         # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
         # no static FFNRule form -- introspects already-baked weights).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` scans every block's
+        # FFN and zeros W_up rows of spuriously-firing branch/LEV
+        # override units across the entire model -- whole-model
+        # defensive weight surgery, not per-cell ``(layer, scope,
+        # identifier, column)`` writes. Sentinel below documents the
+        # structural effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'model.blocks[*].ffn[branch override zero]'},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#control-flow",
     )
@@ -1412,6 +1432,16 @@ def make_l6_dead_unit_zero_op() -> Operation:
         # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
         # no static FFNRule form -- introspects already-baked weights).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` scans
+        # ``model.blocks[6].ffn`` and zeros W_up/W_gate rows, W_down
+        # columns, and biases for spuriously-firing units writing to
+        # OUTPUT_LO/HI -- structural defensive weight surgery, not
+        # per-cell ``(layer, scope, identifier, column)`` writes.
+        # Sentinel below documents the structural effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L6.ffn[dead unit zero]'},
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1504,6 +1534,16 @@ def make_l7_dead_unit_zero_op() -> Operation:
         # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
         # no static FFNRule form -- introspects already-baked weights).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` scans
+        # ``model.blocks[7].ffn`` and adds strong MARK_PC / IS_BYTE
+        # negative weights to spuriously-firing units (suppression
+        # patch) -- structural defensive weight surgery, not per-cell
+        # ``(layer, scope, identifier, column)`` writes. Sentinel
+        # below documents the structural effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L7.ffn[dead unit suppress]'},
         smoke_tests=set(),
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -1531,6 +1571,15 @@ def make_right_size_ffns_op() -> Operation:
         # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
         # no static FFNRule form -- introspects already-baked weights).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` trims each block's FFN
+        # hidden_dim to the actually-programmed unit count -- whole-
+        # model topology surgery on ``W_up`` / ``W_gate`` / ``W_down``
+        # shapes, not per-cell ``(layer, scope, identifier, column)``
+        # writes. Sentinel below documents the structural effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'model.blocks[*].ffn[trim hidden_dim]'},
         smoke_tests=set(),
         spec_section=None,
     )
@@ -1574,6 +1623,17 @@ def make_expand_wrapper_blocks_op() -> Operation:
         # Phase 11.A: empty CompilerIR (defensive sweep / topology op;
         # no static FFNRule form -- introspects already-baked weights).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` rebuilds
+        # ``model.blocks`` -- splits HybridALUBlocks + post_ops into
+        # separate transformer blocks (default) or folds them into the
+        # parent block's FFN via ``nn.Sequential``
+        # (C4_DISABLE_WRAPPER_EXPANSION=1 path). Whole-model topology
+        # surgery, not per-cell ``(layer, scope, identifier, column)``
+        # writes. Sentinel below documents the structural effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'model.blocks[* expansion/fold]'},
         smoke_tests=set(),
         spec_section=None,
     )
