@@ -1433,7 +1433,7 @@ def _layer14_clear_addr_key_pollution_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_SP", suppress_weight),
     )
     rules = tuple(
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name=f"l14_clear_addr_key_pollution_{k}",
             conditions=common_conditions,
             threshold=-0.5,  # imperative: b_up = +S * 0.5 == -S * (-0.5)
