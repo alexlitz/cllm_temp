@@ -230,14 +230,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
         "layer3_ffn.initial_pc_bake_cancel_hi"))
 
     # --- SP DEFAULT (units 6-13) ---
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.sp_marker_default_lo",
         conditions=(("MARK_SP", 1.0), ("HAS_SE", -1.0)),
         threshold=0.5,
         writes=(("OUTPUT_LO+0", 2.0 / S),),
         scope="MARK_SP and not HAS_SE",
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.sp_marker_default_hi",
         conditions=(("MARK_SP", 1.0), ("HAS_SE", -1.0)),
         threshold=0.5,
@@ -259,14 +259,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.sp_byte_1_first_step_lo",
         conditions=((f"H1+{_SP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_LO+1", 2.0 / S),),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.sp_byte_1_first_step_hi",
         conditions=((f"H1+{_SP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
                     ("HAS_SE", -1.0)),
@@ -275,14 +275,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
     ))
 
     # --- BP DEFAULT (units 14-21) ---
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.bp_marker_default_lo",
         conditions=(("MARK_BP", 1.0), ("HAS_SE", -1.0)),
         threshold=0.5,
         writes=(("OUTPUT_LO+0", 2.0 / S),),
         scope="MARK_BP and not HAS_SE",
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.bp_marker_default_hi",
         conditions=(("MARK_BP", 1.0), ("HAS_SE", -1.0)),
         threshold=0.5,
@@ -304,14 +304,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.bp_byte_1_first_step_lo",
         conditions=((f"H1+{_BP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_LO+1", 2.0 / S),),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.bp_byte_1_first_step_hi",
         conditions=((f"H1+{_BP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
                     ("HAS_SE", -1.0)),
@@ -390,7 +390,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
     # H4[BP] covers BP through STACK0 (d<=9.5); subtract H1[BP] to
     # exclude the BP-area positions and leave only STACK0.
     for byte_idx in (0, 1, 2):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.stack0_byte_{byte_idx}_default_lo",
             conditions=((f"H4+{_BP_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0),
@@ -398,7 +398,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
             threshold=1.5,
             writes=(("OUTPUT_LO+0", 2.0 / S),),
         ))
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.stack0_byte_{byte_idx}_default_hi",
             conditions=((f"H4+{_BP_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0),
@@ -408,14 +408,14 @@ def _layer3_ffn_rules(S: float) -> tuple:
         ))
 
     # --- STACK0 first-step default (units 48-49) ---
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.stack0_first_step_default_lo",
         conditions=(("MARK_STACK0", 1.0), ("HAS_SE", -1.0)),
         threshold=0.5,
         writes=(("OUTPUT_LO+0", 2.0 / S),),
         scope="MARK_STACK0 and not HAS_SE",
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.stack0_first_step_default_hi",
         conditions=(("MARK_STACK0", 1.0), ("HAS_SE", -1.0)),
         threshold=0.5,
