@@ -259,7 +259,7 @@ class ScalarValueGuarantee:
 
     def to_ffn_rules(self) -> Tuple[FFNRule, ...]:
         return (
-            FFNRule.gated_write(
+            multi_way_and_rule(
                 name=self.label,
                 conditions=self.conditions,
                 threshold=self.resolved_condition_threshold,
