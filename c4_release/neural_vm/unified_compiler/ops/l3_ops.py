@@ -433,62 +433,52 @@ def _layer3_ffn_rules(S: float) -> tuple:
     # ``writes=()`` means no W_down cells are touched, matching the
     # post-suppression final state cell-for-cell.
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.stack0_carry_projection_lo_{k}",
             conditions=(("MARK_STACK0", 1.0), ("HAS_SE", 1.0)),
             threshold=1.5,
             gate=f"EMBED_LO+{k}",
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=(),  # suppressed (was 2/S in legacy, zeroed by suppressor)
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.stack0_carry_projection_hi_{k}",
             conditions=(("MARK_STACK0", 1.0), ("HAS_SE", 1.0)),
             threshold=1.5,
             gate=f"EMBED_HI+{k}",
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=(),  # suppressed (was 2/S in legacy, zeroed by suppressor)
         ))
 
     # --- NEXT_STACK0 locality (units 82-85) ---
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.next_stack0_locality_marker",
         conditions=(("MARK_STACK0", 1.0),),
         threshold=0.5,
         gate="NEXT_STACK0",
-        gate_weight=1.0,
-        gate_bias=0.0,
         writes=(("NEXT_STACK0", -3.0 / S),),
         scope="MARK_STACK0",
     ))
     # STACK0 byte 0 aliases BYTE_INDEX_3; exclude BP byte 3 by
     # requiring H0[BP] to be effectively zero (-1000 weight makes any
     # H0[BP] presence dominate the threshold).
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="layer3_ffn.next_stack0_locality_byte_idx_3",
         conditions=((f"H4+{_BP_I}", 1.0),
                     (_BYTE_INDEX[3], 1.0),
                     (f"H0+{_BP_I}", -1000.0)),
         threshold=1.5,
         gate="NEXT_STACK0",
-        gate_weight=1.0,
-        gate_bias=0.0,
         writes=(("NEXT_STACK0", -3.0 / S),
                 ("OUTPUT_LO+0", 5.0 / S),
                 ("OUTPUT_HI+0", 5.0 / S)),
     ))
     for byte_idx in (1, 2):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"layer3_ffn.next_stack0_locality_byte_idx_{byte_idx}",
             conditions=((f"H4+{_BP_I}", 1.0),
                         (_BYTE_INDEX[byte_idx], 1.0)),
             threshold=1.5,
             gate="NEXT_STACK0",
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=(("NEXT_STACK0", -3.0 / S),),
         ))
 
