@@ -981,7 +981,7 @@ def _layer8_alu_lea_axb2_rules(S: float) -> tuple[FFNRule, ...]:
     constant_write rules.
     """
     return (
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l8_alu_lea_axb2_lo",
             conditions=(
                 ("CMP+7", 1.0),
@@ -1003,7 +1003,7 @@ def _layer8_alu_lea_axb2_rules(S: float) -> tuple[FFNRule, ...]:
                     "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
             },
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l8_alu_lea_axb2_hi",
             conditions=(
                 ("CMP+7", 1.0),
