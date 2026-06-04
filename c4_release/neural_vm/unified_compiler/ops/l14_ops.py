@@ -2562,25 +2562,30 @@ def _addr_key_make_rule(
     blocker_dim_name,
     scope,
 ):
-    """Build either ``FFNRule.constant_write`` or ``FFNRule.gated_write``
-    depending on whether ``blocker_dim_name`` is set.
+    """Build a rule via ``multi_way_and_rule``, dispatching between the
+    ``constant_write`` and ``gated_write`` shapes via the building-blocks
+    DSL's internal ``_build_rule`` selector.
 
-    ``constant_write`` mirrors the imperative ``b_gate=1.0`` (no W_gate
-    writes) form. ``gated_write`` with ``gate_weight=-1.0`` /
-    ``gate_bias=1.0`` mirrors the ``W_gate[..., blocker]=-1.0`` blocker
-    pattern used when a byte-3 case routes through ``H3+4`` with ``H2+4``
-    blocked.
+    When ``blocker_dim_name is None``, ``multi_way_and_rule`` falls back
+    to ``FFNRule.constant_write`` (gate is None, gate_terms is empty),
+    mirroring the imperative ``b_gate=1.0`` (no W_gate writes) form.
+
+    When a blocker is set, the gate kwargs from
+    :func:`_addr_key_gate_kwargs` provide ``gate=blocker``,
+    ``gate_weight=-1.0`` and ``gate_bias=1.0`` — the
+    ``W_gate[..., blocker]=-1.0`` blocker pattern used when a byte-3
+    case routes through ``H3+4`` with ``H2+4`` blocked.
     """
     gate_kwargs = _addr_key_gate_kwargs(blocker_dim_name)
     if gate_kwargs is None:
-        return FFNRule.constant_write(
+        return multi_way_and_rule(
             name=name,
             conditions=conditions,
             threshold=threshold,
             writes=writes,
             scope=scope,
         )
-    return FFNRule.gated_write(
+    return multi_way_and_rule(
         name=name,
         conditions=conditions,
         threshold=threshold,
