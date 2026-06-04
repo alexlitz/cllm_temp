@@ -31,12 +31,13 @@ from .dim_registry import (
     build_default_contracts,
     ContractValidator,
 )
-from .efficient_alu_neural import (
-    ALUAndOrXor,
-    ALUMul,
-    ALUDivMod,
-)
-from .efficient_alu_addsub_split import AddSub5StageBlock
+# V8 audit (2026-06-04): the `efficient_alu_*` imports here were unused
+# at code level — only mentioned in `_expand_wrapper_blocks` docstrings
+# and `_right_size_ffns` recursion comments. The composites
+# (ALUAndOrXor/ALUMul/ALUDivMod/AddSub5StageBlock) still exist and are
+# instantiated lazily inside `unified_compiler/ops/alu_ops.py` and
+# `unified_compiler/ops/shared.py` for the production lookup-mode bake.
+# See `docs/V8_DELETE_AUDIT_2026_06_04.md`.
 
 
 # =============================================================================
