@@ -685,7 +685,7 @@ def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
         for imm_lo in range(16):
             effective_b = (8 + imm_lo) % 16
             result = (sp_lo - effective_b) % 16
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l8_alu_ent_lo_sp{sp_lo}_imm{imm_lo}",
                 conditions=(
                     ("MARK_AX", 60.0),
