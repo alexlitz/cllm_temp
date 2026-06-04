@@ -800,7 +800,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("OP_JMP", -20.0),
     )
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_stale_imm_ax_carry_lo_{k}",
             conditions=stale_imm_ax_conditions,
             threshold=1.5,
@@ -808,7 +808,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_stale_imm_ax_carry_hi_{k}",
             conditions=stale_imm_ax_conditions,
             threshold=1.5,
@@ -830,7 +830,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("OP_JMP", -20.0),
     )
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_store_ax_carry_lo_{k}",
             conditions=store_ax_conditions,
             threshold=4.0,
@@ -838,7 +838,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_store_ax_carry_hi_{k}",
             conditions=store_ax_conditions,
             threshold=4.0,
@@ -855,25 +855,25 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("H1+1", 1.0),
         ("BYTE_INDEX_3", -4.0),
     )
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_lc_ax_bytes_1_3_clear_lo",
         conditions=lc_ax_byte_conditions,
         threshold=2.5,
         writes=tuple((f"OUTPUT_LO+{k}", -300.0 / S) for k in range(16)),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_lc_ax_bytes_1_3_clear_hi",
         conditions=lc_ax_byte_conditions,
         threshold=2.5,
         writes=tuple((f"OUTPUT_HI_THIS_STEP+{k}", -300.0 / S) for k in range(16)),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_lc_ax_bytes_1_3_zero_lo",
         conditions=lc_ax_byte_conditions,
         threshold=2.5,
         writes=(("OUTPUT_LO+0", 500.0 / S),),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_lc_ax_bytes_1_3_zero_hi",
         conditions=lc_ax_byte_conditions,
         threshold=2.5,
