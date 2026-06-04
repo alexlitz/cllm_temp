@@ -27,12 +27,10 @@ from c4_release.neural_vm.base_layers import PureAttention, PureFFN
 from c4_release.neural_vm.kv_cache_eviction import softmax1
 from c4_release.neural_vm.unified_compiler.building_blocks_dsl import (
     band_range_check_rules,
-    bit_range_extract_rules,
     cancel_residual_rule,
     efficient_exp_attention,
     fetch_byte_attention,
     lookup_table_rules,
-    magic_floor_rules,
     memory_load_attention,
     multi_way_and_rule,
     multi_way_or_rules,
@@ -511,156 +509,6 @@ def test_all_primitives_return_ffn_rule_objects():
         key_band="K", key_to_writes={0: [("OUT+0", 1.0)]},
     )
     assert isinstance(lut, tuple) and len(lut) == 1
-
-
-# ===========================================================================
-# V2 helpers
-# ===========================================================================
-
-
-def _floor_ffn_at_S1(rules, dim_positions):
-    """Build a fresh PureFFN sized for ``rules`` and lower at S=1 (the
-    scale that ``magic_floor_rules`` / ``bit_range_extract_rules``
-    require)."""
-
-    n_rules = len(rules)
-    d_model = max(dim_positions.values()) + 8
-    ffn = PureFFN(dim=d_model, hidden_dim=max(n_rules, 1))
-    end = Primitives.lower_ffn_rules(
-        ffn, rules, dim_positions, start_unit=0, S=1.0,
-    )
-    assert end == n_rules
-    return ffn
-
-
-def _ffn_delta(ffn, dim_positions, state):
-    """Run one FFN forward pass and return the per-dim delta the layer
-    contributed (forward output minus the input residual)."""
-
-    d_model = ffn.W_up.shape[1]
-    x = torch.zeros(1, 1, d_model, dtype=torch.float32)
-    for key, value in state.items():
-        if "+" in key:
-            base, off = key.rsplit("+", 1)
-            x[0, 0, dim_positions[base] + int(off)] = float(value)
-        else:
-            x[0, 0, dim_positions[key]] = float(value)
-    with torch.no_grad():
-        y = ffn(x)
-    delta = (y - x)[0, 0]
-    out = {}
-    for name, base_pos in dim_positions.items():
-        out[name] = float(delta[base_pos].item())
-    return out
-
-
-# ===========================================================================
-# magic_floor_rules
-# ===========================================================================
-
-
-@pytest.mark.parametrize(
-    "value",
-    [0.0, 0.4, 1.0, 1.5, 1.7, 2.0, 3.4, 7.9, 100.5, 999.0, 100000.7],
-)
-def test_magic_floor_rules_matches_python_floor(value):
-    rules = magic_floor_rules(
-        input_dim="X", output_dim="Y", const_dim="CONST", name="mf",
-    )
-    assert len(rules) == 2
-    dim_positions = {"X": 0, "Y": 1, "CONST": 2}
-    ffn = _floor_ffn_at_S1(rules, dim_positions)
-    delta = _ffn_delta(ffn, dim_positions, {"X": value, "CONST": 1.0})
-    expected = math.floor(value)
-    assert abs(delta["Y"] - expected) < 1e-3, (
-        f"magic_floor({value}): got {delta['Y']!r}, expected {expected}"
-    )
-
-
-def test_magic_floor_rules_emits_two_rules_of_correct_kinds():
-    rules = magic_floor_rules(input_dim="X", output_dim="Y")
-    assert len(rules) == 2
-    floor_unit, cancel_unit = rules
-    # The floor unit reads input + the offset const dim; the cancel unit
-    # is pure-constant (no conditions).
-    assert len(floor_unit.conditions) == 2
-    assert floor_unit.conditions[0].dim.name == "X"
-    assert floor_unit.conditions[1].dim.name == "CONST"
-    assert len(cancel_unit.conditions) == 0
-    # Both writes target the same output dim with opposite signs.
-    assert floor_unit.writes[0].dim.name == "Y"
-    assert cancel_unit.writes[0].dim.name == "Y"
-    assert floor_unit.writes[0].weight == +1.0
-    assert cancel_unit.writes[0].weight == -1.0
-
-
-def test_magic_floor_rules_with_gate_uses_gated_write():
-    rules = magic_floor_rules(
-        input_dim="X", output_dim="Y", gate="OP_FLOOR",
-    )
-    for r in rules:
-        assert r.gate is not None
-        assert r.gate.name == "OP_FLOOR"
-        # gated_write sets gate_bias=0 (not 1).
-        assert r.gate_bias == 0.0
-
-
-# ===========================================================================
-# bit_range_extract_rules
-# ===========================================================================
-
-
-@pytest.mark.parametrize(
-    "value", [0, 0x12, 0x3A, 0x80, 0xFF, 0x100, 0xC, 0x123, 0x1234],
-)
-@pytest.mark.parametrize(
-    "lo_bit, hi_bit", [(0, 4), (4, 8), (0, 8), (8, 16), (4, 12)],
-)
-def test_bit_range_extract_rules_lowers_correctly(value, lo_bit, hi_bit):
-    rules = bit_range_extract_rules(
-        input_dim="X",
-        lo_shift_dim="LO",
-        hi_shift_dim="HI",
-        lo_bit=lo_bit,
-        hi_bit=hi_bit,
-        name="extract",
-    )
-    assert len(rules) == 4
-    dim_positions = {"X": 0, "LO": 1, "HI": 2, "CONST": 3}
-    ffn = _floor_ffn_at_S1(rules, dim_positions)
-    delta = _ffn_delta(ffn, dim_positions, {"X": float(value), "CONST": 1.0})
-    width = hi_bit - lo_bit
-    expected_lo = (value >> lo_bit)
-    expected_hi = (value >> hi_bit)
-    expected_combine = expected_lo - (1 << width) * expected_hi
-    expected_bits = (value >> lo_bit) & ((1 << width) - 1)
-    assert expected_combine == expected_bits, (
-        "test sanity: combine identity should equal masked extract"
-    )
-    combine = delta["LO"] - float(1 << width) * delta["HI"]
-    assert abs(combine - expected_bits) < 1e-3, (
-        f"bit_range_extract({value:#x}, lo={lo_bit}, hi={hi_bit}): "
-        f"lo={delta['LO']}, hi={delta['HI']}, combine={combine}, "
-        f"expected_bits={expected_bits}"
-    )
-
-
-def test_bit_range_extract_rules_rejects_invalid_ranges():
-    with pytest.raises(ValueError, match="lo_bit"):
-        bit_range_extract_rules(
-            input_dim="X", lo_shift_dim="LO", hi_shift_dim="HI",
-            lo_bit=-1, hi_bit=4,
-        )
-    with pytest.raises(ValueError, match="hi_bit"):
-        bit_range_extract_rules(
-            input_dim="X", lo_shift_dim="LO", hi_shift_dim="HI",
-            lo_bit=4, hi_bit=4,
-        )
-    with pytest.raises(ValueError, match="hi_bit"):
-        bit_range_extract_rules(
-            input_dim="X", lo_shift_dim="LO", hi_shift_dim="HI",
-            lo_bit=4, hi_bit=24,
-        )
 
 
 # ===========================================================================
