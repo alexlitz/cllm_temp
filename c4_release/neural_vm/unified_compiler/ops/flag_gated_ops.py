@@ -1164,7 +1164,7 @@ def _convo_io_pc_sp_latch_rules(S: float) -> tuple[FFNRule, ...]:
             (src_hi, "OUTPUT_HI_THIS_STEP"),
         ):
             for k in range(16):
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"convo_io_latch_{source_base.lower()}_{k}",
                     conditions=(("LAST_WAS_THINKING_START", 1.0),),
                     threshold=0.5,
