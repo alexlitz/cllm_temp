@@ -6,6 +6,10 @@ from typing import Mapping, Optional
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import (
+    lookup_table_rules,
+    multi_way_and_rule,
+)
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule
 from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
@@ -794,7 +798,9 @@ def _layer10_alu_bitwise_rules(
         for a in range(16):
             for b in range(16):
                 result = op_fn(a, b)
-                rules.append(FFNRule.gated_write(
+                # DSL v4b: 3-way balanced AND across (MARK_AX, ALU_*[a],
+                # AX_CARRY_*[b]) at (40, 30, 30) > 80; gate=OP_<op>.
+                rules.append(multi_way_and_rule(
                     name=(
                         f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
                         f"a{a:x}_b{b:x}"
@@ -807,7 +813,6 @@ def _layer10_alu_bitwise_rules(
                     threshold=80.0,
                     gate=gate_op,
                     gate_weight=1.0,
-                    gate_bias=0.0,
                     writes=((f"{out_dim}+{result}", 2.0 / S),),
                 ))
     return tuple(rules)
