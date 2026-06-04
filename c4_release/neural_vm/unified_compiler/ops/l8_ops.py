@@ -924,7 +924,7 @@ def _layer8_alu_lev_b1_rules(S: float) -> tuple[FFNRule, ...]:
     """
     write_scale = 2.0 / (S * 9.0)
     return (
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l8_alu_lev_b1",
             conditions=(
                 ("OP_LEV", 1.0),
@@ -932,8 +932,6 @@ def _layer8_alu_lev_b1_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             threshold=1.5,
             gate="CONST",
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=(("ADDR_B1_LO+0", write_scale),),
             scope="OP_LEV and MARK_BP",
             dominates_at={"ADDR_B1_LO+0": "OP_LEV and MARK_BP"},
@@ -951,7 +949,7 @@ def _layer8_alu_lev_b2_rules(S: float) -> tuple[FFNRule, ...]:
     """
     write_scale = 2.0 / (S * 9.0)
     return (
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l8_alu_lev_b2",
             conditions=(
                 ("OP_LEV", 1.0),
@@ -959,8 +957,6 @@ def _layer8_alu_lev_b2_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             threshold=1.5,
             gate="CONST",
-            gate_weight=1.0,
-            gate_bias=0.0,
             writes=(("ADDR_B2_LO+0", write_scale),),
             scope="OP_LEV and MARK_BP",
             dominates_at={"ADDR_B2_LO+0": "OP_LEV and MARK_BP"},
