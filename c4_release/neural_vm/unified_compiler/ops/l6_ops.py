@@ -1665,6 +1665,9 @@ def _layer6_stack_writeback_rules(
     threshold: float,
     S: float,
 ) -> tuple[FFNRule, ...]:
+    # N-way AND on marker conditions, gated by (AX_CARRY - EMBED) for each
+    # nibble lane — emits OUTPUT = stack-writeback when the AND fires and
+    # the relayed AX_CARRY differs from the EMBED residual.
     rules = []
     write_scale = 2.0 / S
     for band, embed_base, carry_base, output_base in (
@@ -1672,7 +1675,7 @@ def _layer6_stack_writeback_rules(
         ("hi", "EMBED_HI", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"{name_prefix}_{band}_{k}",
                 conditions=conditions,
                 threshold=threshold,
