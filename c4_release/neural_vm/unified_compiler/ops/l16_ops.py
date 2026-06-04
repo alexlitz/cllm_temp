@@ -1261,7 +1261,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     )
     ent_frame_strength = 5000.0 / S
     for imm_lo, result_lo in ((0, 0), (8, 8)):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_ent_frame_sp_byte0_lo_{imm_lo:x}",
             conditions=ent_sp_frame_conditions + (
                 (f"FETCH_LO+{imm_lo}", 1.0),
@@ -1278,7 +1278,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ))
     for imm_hi in range(16):
         result_hi = (15 - imm_hi) & 0xF
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_ent_frame_sp_byte0_hi_lo0_{imm_hi:x}",
             conditions=ent_sp_frame_conditions + (
                 ("FETCH_LO+0", 1.0),
@@ -1300,7 +1300,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # it over-writes these nested SP markers back to 0xfff0. The initial entry
     # carries a strongly negative OUTPUT_HI_THIS_STEP+15 before this block, while nested
     # entries are near zero there, so use that as the narrow discriminator.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_ent_nested_sp_byte0_d8",
         conditions=ent_sp_frame_conditions + (
             ("OP_ENT", 9.8),
@@ -1316,7 +1316,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_HI_THIS_STEP+15", -10.0),
         ),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_ent_nested_bp_byte0_d8",
         conditions=(
             ("OP_ENT", 100.0),
@@ -1338,7 +1338,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_HI_THIS_STEP+15", -1.0),
         ),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_ent_nested_stack0_saved_bp_byte0_f0",
         conditions=(
             ("OP_ENT", 10.0),
@@ -1362,7 +1362,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_LO+15", -1.0),
         ),
     ))
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="l16_ent_stack0_saved_bp_byte1_ff",
         conditions=(
             ("IS_BYTE", 1.0),
@@ -1392,7 +1392,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_HI_THIS_STEP+0", -50.0 / S),
         ),
     ))
-    rules.append(FFNRule.gated_write(
+    rules.append(multi_way_and_rule(
         name="l16_ent_initial_stack0_saved_bp_byte1_00",
         conditions=(
             ("IS_BYTE", 1.0),
@@ -1424,7 +1424,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     ))
     for imm_hi in range(16):
         result_hi = (14 - imm_hi) & 0xF
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_ent_frame_sp_byte0_hi_lo8_{imm_hi:x}",
             conditions=ent_sp_frame_conditions + (
                 ("FETCH_LO+8", 1.0),
