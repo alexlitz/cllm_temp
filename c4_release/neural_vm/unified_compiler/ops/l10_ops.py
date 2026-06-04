@@ -3939,7 +3939,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     continue
                 value = lo | (hi << 4)
                 rules.append(
-                    FFNRule.gated_write(
+                    multi_way_and_rule(
                         name=f"tail_stack0_store_loaded_byte_{value:02x}",
                         scope="mark == STACK0",
                         dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -3958,7 +3958,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         """Materialize current top-store values when only ALU residue remains."""
 
         return (
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_stack0_store_top_value_2f_from_alu",
                 scope="mark == STACK0",
                 dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -4039,7 +4039,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             for old_value in range(256):
                 old_lo = old_value & 0xF
                 rules.append(
-                    FFNRule.constant_write(
+                    multi_way_and_rule(
                         name=(
                             f"tail_ax_add_carry_byte{byte_idx + 1}_"
                             f"{old_value:02x}"
@@ -4120,7 +4120,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("NEXT_MEM", -1000000.0),
         )
         return (
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_ax_add_no_carry_byte1_00",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
