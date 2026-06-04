@@ -846,6 +846,9 @@ def _layer6_cmp3_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_stack_identity_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 SP/BP/STACK0 identity units 418..513."""
 
+    # Three marker families × 2 bands × 16 nibbles = 96 N-way AND rules,
+    # each gated by the EMBED band cell — passes EMBED through to OUTPUT
+    # at SP/BP/STACK0 marker rows for HAS_SE steps (not byte rows).
     rules = []
     write_scale = 2.0 / S
     for marker_name in ("MARK_SP", "MARK_BP", "MARK_STACK0"):
@@ -860,7 +863,7 @@ def _layer6_stack_identity_rules(S: float) -> tuple[FFNRule, ...]:
             ("hi", "EMBED_HI", "OUTPUT_HI_THIS_STEP"),
         ):
             for k in range(16):
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=f"l6_{label}_identity_{band}_{k}",
                     conditions=conditions,
                     threshold=1.5,
