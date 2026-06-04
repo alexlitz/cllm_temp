@@ -3116,7 +3116,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("NEXT_SE", -1_000_000.0),
         ) + other_lo + other_hi + tuple(extra_conditions)
         return (
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name=name,
                 scope=scope,
                 dominates_at=dominates_at,
@@ -3213,7 +3213,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
 
             if byte_idx == 0:
                 rules.append(
-                    FFNRule.gated_write(
+                    multi_way_and_rule(
                         name="tail_sp_pop_carry_byte1_zero",
                         # Same base_conditions contradiction as the
                         # byte_idx=1 family below (CMP+3 vs BYTE_INDEX_*
@@ -3236,7 +3236,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             output_match_weight = 5.0
             for old_value in range(256):
                 rules.append(
-                    FFNRule.gated_write(
+                    multi_way_and_rule(
                         name=(
                             f"tail_sp_pop_carry_byte{byte_idx + 1}_"
                             f"{old_value:02x}"
@@ -3300,7 +3300,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("IS_BYTE", -100.0),
             )
         return (
-            FFNRule.gated_write(
+            multi_way_and_rule(
                 name="tail_sp_pop_marker_e0_to_e8",
                 scope="mark == SP",
                 dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
@@ -3318,7 +3318,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 gate=gate_mark_sp,
                 writes=byte_writes(0xE8, strength=300.0),
             ),
-            FFNRule.gated_write(
+            multi_way_and_rule(
                 name="tail_sp_pop_marker_d0_to_d8",
                 scope="mark == SP",
                 dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
@@ -3344,7 +3344,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 gate=gate_mark_sp,
                 writes=byte_writes(0xD8, strength=500.0),
             ),
-            FFNRule.gated_write(
+            multi_way_and_rule(
                 name="tail_sp_pop_marker_f0_to_f8",
                 scope="mark == SP",
                 dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
@@ -3370,7 +3370,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 gate=gate_mark_sp,
                 writes=byte_writes(0xF8, strength=500.0),
             ),
-            FFNRule.gated_write(
+            multi_way_and_rule(
                 name="tail_sp_pop_marker_d8_to_e0",
                 scope="mark == SP",
                 dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
@@ -4662,7 +4662,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # gate tautology, so no scope is tightenable below tautology.
         # Leave scope/dominates_at unset.
         return (
-            FFNRule.gated_write(
+            multi_way_and_rule(
                 name="tail_ax_add_mul_byte1_materialize_01",
                 conditions=base_conditions + (
                     ("EMBED_HI+0", 25.0),
@@ -4674,7 +4674,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 gate="TEMP+8",
                 writes=byte_writes(0x01, strength=5000.0),
             ),
-            FFNRule.gated_write(
+            multi_way_and_rule(
                 name="tail_ax_add_mul_byte1_materialize_02_from_hi2",
                 conditions=base_conditions + (
                     ("EMBED_HI+2", 25.0),
@@ -4686,7 +4686,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 gate="TEMP+8",
                 writes=byte_writes(0x02, strength=5000.0),
             ),
-            FFNRule.gated_write(
+            multi_way_and_rule(
                 name="tail_ax_add_mul_byte1_materialize_02_from_hid",
                 conditions=base_conditions + (
                     ("EMBED_HI+13", 25.0),
@@ -4775,7 +4775,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # Binary-pop ops consume the top stack cell. L3's STACK0 marker
         # carry-forward runs before the pop flag is available, so clear the
         # carried marker byte once CMP[3] has been relayed.
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_stack0_pop_marker_zero",
             scope="mark == STACK0",
             dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -4804,7 +4804,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # saved local address at e8. The generic pop-marker zero rule above
         # clears stale carried STACK0 bytes; this narrower rule restores the
         # revealed address needed by update/store expressions.
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_stack0_pop_reveals_saved_addr_e8",
             scope="mark == STACK0",
             dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -4832,7 +4832,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # The marker-zero rule above is still useful for empty stack slots, but
         # this e0-address signature means the revealed stack value is the saved
         # local address 0xffe8.
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_stack0_pop_reveals_saved_addr_e8_from_e0_addr",
             scope="mark == STACK0",
             dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -4859,7 +4859,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # store address equals the post-pop SP. For local stores such as
         # BP-8 with a larger frame, the store address remains above the new
         # SP; the STACK0 marker should therefore be zero, not the stored AX.
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_stack0_store_non_top_zero",
             scope="mark == STACK0",
             dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -4885,7 +4885,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=50.0,
             writes=byte_writes(0x00, strength=1000.0),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_stack0_store_non_top_zero_e8_from_e0",
             scope="mark == STACK0",
             dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -4911,7 +4911,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=240.0,
             writes=byte_writes(0x00, strength=1000.0),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_stack0_store_non_top_zero_e0",
             scope="mark == STACK0",
             dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
@@ -4975,7 +4975,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         # At the final SP byte position, byte-output residue can beat the
         # stack-base high byte. Assert the zero byte for binary-pop SP byte 3.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_sp_pop_byte3_zero",
             scope="is_byte",
             dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -5004,7 +5004,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             gate=dim_ref("byte_index", "2"),
             writes=byte_writes(0x00, strength=10000.0),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_sp_store_pop_byte1_zero",
             scope="is_byte",
             dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -5051,7 +5051,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *stack0_store_loaded_output_rules(),
         *stack0_store_top_e0_output_rules(),
         *stack0_store_top_e8_from_e0_output_rules(),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_pc_byte0_12_from_initial_jmp_exact",
             scope="mark == PC",
             dominates_at={"OUTPUT_LO": "mark == PC", "OUTPUT_HI_THIS_STEP": "mark == PC"},
@@ -5083,7 +5083,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 strength=5000.0,
             ),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_pc_byte0_1a_from_taken_branch_index3_exact_bz",
             scope="mark == PC",
             dominates_at={"OUTPUT_LO": "mark == PC", "OUTPUT_HI_THIS_STEP": "mark == PC"},
@@ -5117,7 +5117,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=250.0,
             writes=Primitives.byte_value_writes(0x1A, strength=5000.0),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_pc_byte0_1a_from_taken_branch_index3_exact_bnz",
             scope="mark == PC",
             dominates_at={"OUTPUT_LO": "mark == PC", "OUTPUT_HI_THIS_STEP": "mark == PC"},
@@ -5182,7 +5182,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ),
             threshold=70.0,
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_pc_byte1_01_from_initial_jsr_fetch_hi_exact",
             scope="is_byte",
             dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -5326,7 +5326,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # witnesses remain as the legitimate fallback; the structural dims
         # promote the proof decisively when the gather completes.  Strength
         # stays at 10k (≤10k bound per B4-H §3.2).
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_mem_store_addr0_f8_exact",
             scope="mark == MEM",
             dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
@@ -5489,7 +5489,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # Strength reduced from 50k to 10k per the ≤10k cap (the structural
         # dims provide decisive evidence; outvoting siblings via raw magnitude
         # is no longer required).
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_mem_store_addr0_f8_initial_jsr_authority",
             scope="mark == MEM",
             dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
@@ -5536,7 +5536,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # soft +2.0 ADDR_B0 evidence to hard +50 ADDR_B0 gate combined with
         # ADDR_B0_VALID (B7-4) and IN_STEP_FRESH (B7-1).  Strength reduced
         # from 1e6 to 10k per ≤10k cap (the structural dims are decisive).
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_mem_store_addr0_f0_exact",
             scope="mark == MEM",
             dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
@@ -5840,7 +5840,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # (these arrive late from L13 for the PSH path but still strengthen
         # the proof when present).  The hard OP_ENT -1e6 blocker is retained
         # so the rule cannot fire on ENT-main regardless of strength.
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_mem_store_addr0_e0_from_psh_sp_no_addr_src_authority",
             scope="mark == MEM",
             dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
@@ -6061,7 +6061,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # unsatisfiable; F-5 falls back to the gate ``OUTPUT_HI_THIS_STEP+14`` whose
         # semantics is tautological. No scope tighter than tautology is
         # entailable. Leave scope/dominates_at unset for now.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_mem_store_addr0_e8_from_local_frame_output_exact",
             conditions=(
                 ("MARK_MEM", 1.0),
@@ -6096,7 +6096,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         # Non-memory binary pops should emit a zero MEM row. Store/load ops
         # have dedicated memory paths and block this cleanup.
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_pop_mem_marker_zero",
             scope="mark == MEM",
             dominates_at={"OUTPUT_LO": "mark == MEM", "OUTPUT_HI_THIS_STEP": "mark == MEM"},
@@ -6140,7 +6140,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # possible without code-level restructuring of the conditions.
         # Leave scope/dominates_at unset until the verifier supports
         # sign-aware competition and the condition shape can be tightened.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_bp_byte2_preserve_01",
             conditions=(
                 ("IS_BYTE", 1.0),
@@ -6183,7 +6183,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         *ax_sub_borrow_decrement_rules(),
         *wide_mul_byte1_preserve_rules(),
         *ax_add_mul_byte1_materialize_rules(),
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_ax_add_byte1_carry_high2_03",
             scope="is_byte",
             dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -6207,7 +6207,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         # SHL-by-8 loses byte 1 to the same tail, but its signature is a huge
         # OUTPUT_LO[1] plus carry residue rather than MUL's OUTPUT_LO[2].
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_wide_shl_byte1_01",
             scope="is_byte",
             dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -6232,7 +6232,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # MEM_STORE gate semantics. Match scope/dominates_at to that
         # effective gate firing set so F-7 entailment succeeds and
         # cross-op strength competition is limited to MEM-store rows.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_si_ax_byte1_12",
             scope="mark == MEM AND opcode_in_step in {PSH, SC, SI}",
             dominates_at={
@@ -6254,7 +6254,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             gate="MEM_STORE",
             writes=byte_writes(0x12, strength=300.0),
         ),
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_si_ax_byte1_00",
             scope="mark == MEM AND opcode_in_step in {PSH, SC, SI}",
             dominates_at={
@@ -6280,7 +6280,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # byte 1 to zero; the old tail currently leaves 0x01 there. Use
         # CARRY[2] instead of CARRY[3] so wide MUL/SHL carry residue does not
         # accidentally trigger the zeroing rule.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_sub_borrow_byte1_00",
             scope="is_byte",
             dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -6302,7 +6302,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
         # 16-bit AND's high byte must zero; CMP/TEMP distinguish AND from
         # OR/XOR, whose high bytes intentionally remain 0x0f.
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_and_byte1_00",
             scope="is_byte",
             dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -6320,7 +6320,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # OR/XOR byte 1 should remain 0x0f. The late tail inflates it to
         # 0x1e; TEMP[4] distinguishes AND and is used here as a blocker so
         # the AND-zeroing rule above remains authoritative for AND.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_or_xor_byte1_0f",
             scope="is_byte",
             dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -6343,7 +6343,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # falls back to the TEMP+7 gate (no semantics) producing a
         # tautology. Leave scope/dominates_at unset until the shared
         # ax_byte0 conditions are restructured.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_shr_byte1_00",
             conditions=ax_byte0 + (
                 ("TEMP+7", 1.0),
@@ -6356,7 +6356,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # SHR by 8 currently computes byte 0 as 0x06 at the AX marker. OP_SHR
         # is still visible at the marker, so correct the marker prediction
         # before byte generation proceeds.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_shr_marker_byte0_01",
             scope="mark == AX",
             dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
@@ -6381,7 +6381,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             gate=gate_mark_ax,
             writes=byte_writes(0x01),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_lea_local_ax_marker_byte0_e8",
             scope="mark == AX",
             dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
@@ -6402,7 +6402,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=9.0,
             writes=byte_writes(0xE8, strength=1_000_000.0),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_ax_add_byte1_missing_stack_high_02",
             scope="is_byte",
             dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -6442,7 +6442,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # Comparison combine still sees amplified CMP residuals in the
         # expanded strict path. These two marker-only corrections restore the
         # truthy NE and LE cases without touching byte-lane arithmetic.
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_cmp_ne_true_01",
             scope="mark == AX",
             dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
@@ -6454,7 +6454,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=4.5,
             writes=byte_writes(0x01, strength=1000.0),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_cmp_eq_false_00",
             scope="mark == AX",
             dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
@@ -6467,7 +6467,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=4.5,
             writes=byte_writes(0x00, strength=1000.0),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_cmp_le_lt_true_01",
             scope="mark == AX",
             dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
@@ -6480,7 +6480,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=7.0,
             writes=byte_writes(0x01, strength=1000.0),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_cmp_le_eq_prefix_false_00",
             scope="mark == AX",
             dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
@@ -6508,7 +6508,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # Mirrors the polarity discipline of tail_cmp_eq_false_00 directly
         # above, but uses the gate to suppress LT fan-in (per the 2026-06-03
         # CMP polarity investigation doc).
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_cmp_lt_false_00",
             scope="mark == AX",
             dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
@@ -6522,7 +6522,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             gate_bias=0.0,
             writes=byte_writes(0x00, strength=1000.0),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="tail_cmp_gt_false_00",
             scope="mark == AX",
             dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
@@ -6547,7 +6547,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # dominates_at down to the actual firing site so positive-write
         # competition is limited to SP marker rows; the negative side
         # writes remain flagged until the verifier becomes sign-aware.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_sp_pop_marker_output_d8_to_e0",
             scope="mark == SP",
             dominates_at={"OUTPUT_LO": "mark == SP", "OUTPUT_HI_THIS_STEP": "mark == SP"},
@@ -6583,7 +6583,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # byte3 step boundary; competition with positive-write rules is
         # spurious. Leave scope/dominates_at unset; the verifier cannot
         # prove a useful claim with the current sign-blind algebra.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_clear_output_after_byte3",
             conditions=(
                 ("IS_BYTE", 1.0),
@@ -6617,7 +6617,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # the IS_BYTE+NEXT_SE conditions contradict in the registry
         # semantics. Leave scope/dominates_at unset; the verifier cannot
         # prove a useful claim with the current algebra.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="tail_clear_output_before_step_end",
             conditions=(
                 ("IS_BYTE", 1.0),
