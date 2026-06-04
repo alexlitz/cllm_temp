@@ -705,7 +705,7 @@ def _opcode_decode_temp_clear_rules(S):
     # ``MARK_PC`` condition appears as an up-branch guard term (the L8 pilot
     # preserved that convention).
     return tuple(
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name=f"l5_temp_clear_{k}_at_pc",
             conditions=(("MARK_PC", 1.0),),
             threshold=0.5,
