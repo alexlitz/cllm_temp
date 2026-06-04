@@ -1567,11 +1567,13 @@ def make_layer3_convo_io_state_init_op(
 
 def _layer3_convo_io_state_init_rules(S: float) -> tuple[FFNRule, ...]:
     return (
-        FFNRule.constant_write(
+        step_function_rule(
             name="convo_io_enter_output_mode",
-            conditions=(("LAST_WAS_THINKING_END", 1.0),),
+            input_dim="LAST_WAS_THINKING_END",
             threshold=0.5,
-            writes=(("IO_IN_OUTPUT_MODE", 2.0 / S),),
+            write_dim="IO_IN_OUTPUT_MODE",
+            write_value=2.0,
+            S=S,
             scope="LAST_WAS_THINKING_END",
         ),
     )
