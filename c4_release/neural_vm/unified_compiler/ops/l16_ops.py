@@ -2,6 +2,7 @@
 
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..band_guarantees import scalar_value_guarantee_rules
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
@@ -77,7 +78,7 @@ def _add_stack0_x0_alu_materializer(
     """
 
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_stack0_{family}_marker_from_alu_lo_{k}",
             conditions=conditions,
             threshold=threshold,
@@ -87,7 +88,7 @@ def _add_stack0_x0_alu_materializer(
             dominates_at=dominates_at,
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_stack0_{family}_marker_from_alu_hi_{k}",
             conditions=conditions,
             threshold=threshold,
