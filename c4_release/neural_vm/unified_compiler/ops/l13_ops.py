@@ -3,6 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
+from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -170,7 +171,7 @@ def _layer13_shifts_substage_rules(
                 result = shift_fn(value, s)
                 result_lo = result & 0xF
                 result_hi = (result >> 4) & 0xF
-                rules.append(FFNRule.gated_write(
+                rules.append(multi_way_and_rule(
                     name=(
                         f"{name_prefix}_s{s}_ahi{a_hi}_alo{a_lo}"
                     ),
