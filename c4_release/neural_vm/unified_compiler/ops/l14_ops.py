@@ -1593,7 +1593,7 @@ def _layer14_clear_output_corruption_rules(S: float) -> tuple[FFNRule, ...]:
         return tuple(cond)
 
     rules = (
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_clear_output_corruption_lo0_boost",
             conditions=boost_unit_conditions(0, "OUTPUT_LO"),
             threshold=0.5,  # imperative: b_up = -S * 0.5
@@ -1602,7 +1602,7 @@ def _layer14_clear_output_corruption_rules(S: float) -> tuple[FFNRule, ...]:
             gate_bias=0.0,
             writes=(("OUTPUT_LO+0", 50.0 / S),),
         ),
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_clear_output_corruption_hi0_boost",
             conditions=boost_unit_conditions(16, "OUTPUT_HI_THIS_STEP"),
             threshold=0.5,
@@ -1616,7 +1616,7 @@ def _layer14_clear_output_corruption_rules(S: float) -> tuple[FFNRule, ...]:
         # immediately after the rules lower, so the net residual cell
         # writes are zero. The unit is still allocated to keep the chain
         # offset / claim grid consistent with the legacy bake.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_clear_output_corruption_jsr_stack0_hi0_marker",
             conditions=(
                 ("OP_JSR", 0.2),  # imperative: W_up[OP_JSR] = S/5
