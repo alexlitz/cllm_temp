@@ -973,13 +973,14 @@ def _layer10_alu_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
             conditions = [("MARK_AX", 1.0)]
             for op_dim in _L10_ALU_AX_PASSTHROUGH_SUPPRESSED_OPS:
                 conditions.append((op_dim, -1.0))
-            rules.append(FFNRule.gated_write(
+            # DSL v4b: explicit-threshold AND. The gate dim is the
+            # AX_CARRY_*+k one-hot so the rule routes carry[k] -> out[k].
+            rules.append(multi_way_and_rule(
                 name=f"l10_ax_passthrough_{nibble_label}_{k}",
                 conditions=tuple(conditions),
                 threshold=0.5,
                 gate=f"{carry_dim}+{k}",
                 gate_weight=1.0,
-                gate_bias=0.0,
                 writes=((f"{out_dim}+{k}", 2.0 / S),),
             ))
     return tuple(rules)
