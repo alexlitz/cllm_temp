@@ -1584,7 +1584,7 @@ def _layer8_multibyte_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_AX", -4.0),
     )
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l8_multibyte_route_lo_{k}",
             conditions=conditions,
             threshold=6.5,
@@ -1592,7 +1592,7 @@ def _layer8_multibyte_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", 8.0 / S),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l8_multibyte_route_hi_{k}",
             conditions=conditions,
             threshold=6.5,
