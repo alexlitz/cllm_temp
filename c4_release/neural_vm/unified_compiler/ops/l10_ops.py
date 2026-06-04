@@ -3408,7 +3408,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         """
 
         return (
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_sp_pop_byte1_ff_after_e0",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -3438,7 +3438,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 threshold=40.5,
                 writes=byte_writes(0xFF, strength=5000.0),
             ),
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_sp_pop_byte1_ff_after_d8",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -3468,7 +3468,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 threshold=40.5,
                 writes=byte_writes(0xFF, strength=5000.0),
             ),
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_sp_pop_byte1_ff_after_f8",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -3498,7 +3498,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 threshold=40.5,
                 writes=byte_writes(0xFF, strength=5000.0),
             ),
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_sp_pop_byte1_ff_after_e8",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
