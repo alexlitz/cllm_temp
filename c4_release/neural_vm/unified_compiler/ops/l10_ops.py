@@ -667,10 +667,10 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
     """
 
     def _cmp_default(op_name: str, default_result: int) -> FFNRule:
-        # Helper: W_up[MARK_AX]=S, W_up[op]=S, b_up=-S*1.5, b_gate=1.0
-        # (gate=None), W_down[OUTPUT_LO+default_result]=2/S,
-        # W_down[OUTPUT_HI+0]=2/S.
-        return FFNRule.constant_write(
+        # DSL v4b: 3-condition AND with explicit threshold 2.5 and a
+        # negative MARK_PC blocker (-50). multi_way_and_rule with
+        # gate=None lowers via constant_write (gate_bias=1.0).
+        return multi_way_and_rule(
             name=f"l10_cmp_{op_name.lower()}_default",
             conditions=(
                 ("MARK_AX", 1.0),
@@ -693,12 +693,9 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
         op_name: str, cmp_idx: int, to_result: int, from_result: int,
         suffix: str,
     ) -> FFNRule:
-        # Helper: W_up[MARK_AX]=S, W_up[CMP+i]=S, b_up=-S*1.5,
-        # W_gate[op]=1.0 (b_gate=0), W_down[OUTPUT_LO+to]=4/S,
-        # W_down[OUTPUT_LO+from]=-4/S.
-        # Phase 8.D: the OP_<NAME> gate names the (opcode_flag, NAME)
-        # semantic family member.
-        return FFNRule.gated_write(
+        # DSL v4b: 2-condition balanced AND (MARK_AX + CMP+i, both 1.0)
+        # with threshold 1.5; OP_<NAME> gate via (opcode_flag, NAME).
+        return multi_way_and_rule(
             name=f"l10_cmp_{op_name.lower()}_override2_{suffix}",
             conditions=(
                 ("MARK_AX", 1.0),
@@ -707,7 +704,6 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=1.5,
             gate=dim_ref("opcode_flag", op_name),
             gate_weight=1.0,
-            gate_bias=0.0,
             writes=(
                 (f"OUTPUT_LO+{to_result}", 4.0 / S),
                 (f"OUTPUT_LO+{from_result}", -4.0 / S),
@@ -718,12 +714,11 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
         op_name: str, cmp_idx1: int, cmp_idx2: int,
         to_result: int, from_result: int, suffix: str,
     ) -> FFNRule:
-        # Helper: W_up[MARK_AX]=S, W_up[CMP+i]=S, W_up[CMP+j]=S,
-        # b_up=-S*4.0, W_gate[op]=1.0 (b_gate=0),
-        # W_down[OUTPUT_LO+to]=4/S, W_down[OUTPUT_LO+from]=-4/S.
-        # Phase 8.D: the OP_<NAME> gate names the (opcode_flag, NAME)
-        # semantic family member.
-        return FFNRule.gated_write(
+        # DSL v4b: 3-condition AND (MARK_AX + 2 CMP cells, all 1.0) with
+        # explicit threshold 4.0 (the legacy bake's "all three must be
+        # present" gate). multi_way_and_rule with explicit threshold
+        # passes through unchanged.
+        return multi_way_and_rule(
             name=f"l10_cmp_{op_name.lower()}_override3_{suffix}",
             conditions=(
                 ("MARK_AX", 1.0),
@@ -733,7 +728,6 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=4.0,
             gate=dim_ref("opcode_flag", op_name),
             gate_weight=1.0,
-            gate_bias=0.0,
             writes=(
                 (f"OUTPUT_LO+{to_result}", 4.0 / S),
                 (f"OUTPUT_LO+{from_result}", -4.0 / S),
