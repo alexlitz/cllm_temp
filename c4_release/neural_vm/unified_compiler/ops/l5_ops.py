@@ -668,7 +668,7 @@ def _opcode_decode_first_step_rules(S):
         (8, 1, dim_ref("opcode_flag", "SHR")),
     ]
     return tuple(
-        FFNRule.constant_write(
+        multi_way_and_rule(
             # Preserve the legacy rule-name suffix shape by stripping
             # the ``+0`` produced by ``dim_ref`` (turning ``OP_JMP+0``
             # back into ``op_jmp``).
