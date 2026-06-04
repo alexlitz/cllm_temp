@@ -630,10 +630,16 @@ class ALUAddSub(PureNeuralALU):
         super().__init__(S, BD, operations='add_sub')
 
 
-class ALUAndOrXor(PureNeuralALU):
-    """Neural AND/OR/XOR."""
-    def __init__(self, S, BD):
-        super().__init__(S, BD, operations='bitwise')
+# ``ALUAndOrXor`` (= ``PureNeuralALU(operations='bitwise')``) was deleted
+# in the V8 lookup-mode wave (2026-06-04). Production install for L10
+# bitwise (AND/OR/XOR) now uses the rule-derived ``PureFFN`` baked from
+# ``wide_alu_dsl.bitwise_rules`` via
+# ``ops/alu_ops.py:make_lookup_mode_l10_bitwise_rules_op``. The rule
+# install is byte-identical at the decoded OUTPUT byte (verified by
+# ``tests/test_wide_alu_dsl.py::test_bitwise_rules_byte_identity_*`` and
+# ``test_lookup_mode_l10_postop_factory_byte_identity``). See
+# ``docs/V8_DELETE_AUDIT_2026_06_04.md`` for the migration audit and
+# ``docs/LOOKUP_MODE_RULE_DERIVATION_2026_06_04.md`` for follow-up notes.
 
 
 class _MulPipelineState:

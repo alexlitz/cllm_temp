@@ -97,20 +97,42 @@ def test_wide_alu_composite_owner_op_remains_absent_from_default_report(
 
 
 # ---------------------------------------------------------------------------
-# Section 2: ALUAndOrXor symbolic forward.
+# Section 2: L10 bitwise (AND/OR/XOR) symbolic forward.
 # ---------------------------------------------------------------------------
 #
-# ALUAndOrXor is a PureNeuralALU subclass (operations='bitwise') that
-# wraps BDToGEConverter -> [AND, OR, XOR layers] -> GEToBDConverter.
-# The forward applies the bitwise op selected by OP_AND/OR/XOR at the
-# AX marker and writes the result into OUTPUT_LO/HI.
+# Post-V8 (2026-06-04): the legacy ``ALUAndOrXor`` composite (a
+# ``PureNeuralALU(operations='bitwise')`` subclass) was deleted; the
+# production lookup-mode install is now a rule-derived ``PureFFN`` baked
+# from ``wide_alu_dsl.bitwise_rules`` via the factory
+# ``ops/alu_ops.py:make_lookup_mode_l10_bitwise_rules_op``. The tests
+# below exercise that factory's bake_fn directly (mock block, real
+# PureFFN install) and assert the decoded OUTPUT byte matches Python.
 
 
 @pytest.fixture(scope="module")
 def andorxor_composite():
-    from neural_vm.efficient_alu_neural import ALUAndOrXor
+    """Rule-derived ``PureFFN`` install (replacing the legacy ALUAndOrXor).
 
-    return ALUAndOrXor(S=100.0, BD=_SetDim)
+    Replays the production install path's bake function on a mock block
+    and returns the ``PureFFN`` inserted into ``block.post_ops[0]``.
+    """
+    import torch.nn as nn
+
+    from neural_vm.base_layers import PureFFN
+    from neural_vm.unified_compiler.ops.alu_ops import (
+        make_lookup_mode_l10_bitwise_rules_op,
+    )
+    from neural_vm.unified_compiler.ops.shared import _setdim_to_positions
+
+    class _MockBlock:
+        def __init__(self):
+            self.ffn = PureFFN(dim=512, hidden_dim=64)
+            self.post_ops = nn.ModuleList()
+
+    block = _MockBlock()
+    op = make_lookup_mode_l10_bitwise_rules_op()
+    op.bake_fn(block, _setdim_to_positions(_SetDim), 100.0)
+    return block.post_ops[0]
 
 
 def _make_alu_byte_input(*, a: int, b: int, op_dim: int) -> torch.Tensor:
@@ -156,12 +178,13 @@ def _decode_output_byte(y: torch.Tensor) -> int:
 def test_alu_andorxor_byte_identical_to_python(
     andorxor_composite, op_dim, op_name, py_op, a, b
 ):
-    """ALUAndOrXor wrote OUTPUT byte must match Python's bitwise op result.
+    """Rule-derived L10 bitwise install: OUTPUT byte matches Python.
 
     Each (a, b) pair exercises a different nibble pattern so a regression
     in either the lo or hi nibble path surfaces. Forward through the
-    composite and decode (OUTPUT_LO argmax) | (OUTPUT_HI argmax << 4);
-    compare to the spec result.
+    rule-lowered ``PureFFN`` and decode
+    ``(OUTPUT_LO argmax) | (OUTPUT_HI argmax << 4)``; compare to the
+    spec result.
     """
     x = _make_alu_byte_input(a=a, b=b, op_dim=op_dim)
     with torch.no_grad():
@@ -170,15 +193,15 @@ def test_alu_andorxor_byte_identical_to_python(
     got = _decode_output_byte(y)
     expected = py_op(a, b) & 0xFF
     assert got == expected, (
-        f"ALUAndOrXor {op_name}: a=0x{a:02X} {op_name} b=0x{b:02X} "
-        f"expected 0x{expected:02X}, got 0x{got:02X}"
+        f"L10 bitwise rule install {op_name}: a=0x{a:02X} {op_name} "
+        f"b=0x{b:02X} expected 0x{expected:02X}, got 0x{got:02X}"
     )
 
 
 def test_alu_andorxor_no_fire_without_mark_ax(andorxor_composite):
-    """Without MARK_AX, the composite must not overwrite OUTPUT.
+    """Without MARK_AX, the rule-derived install must not overwrite OUTPUT.
 
-    The PureNeuralALU forward gates OUTPUT writes on (mark_ax > 0.5).
+    The ``bitwise_rules`` 3-way AND gates OUTPUT writes on ``MARK_AX``.
     Sentinel for the most common silent-corruption mode where the gate
     drops and the bitwise op leaks at every position.
     """
@@ -189,13 +212,13 @@ def test_alu_andorxor_no_fire_without_mark_ax(andorxor_composite):
     x[0, 0, _SetDim.OUTPUT_HI + 11] = 11.0
     with torch.no_grad():
         y = andorxor_composite(x)
-    # The MARK_AX gate should mask the GE→BD writeback; OUTPUT should
+    # The MARK_AX gate should suppress the rule fires; OUTPUT should
     # therefore be passed through unchanged.
     assert torch.allclose(
         y[0, 0, _SetDim.OUTPUT_LO:_SetDim.OUTPUT_LO + 16],
         x[0, 0, _SetDim.OUTPUT_LO:_SetDim.OUTPUT_LO + 16],
         atol=1e-3,
-    ), "ALUAndOrXor wrote OUTPUT_LO without MARK_AX"
+    ), "L10 bitwise rule install wrote OUTPUT_LO without MARK_AX"
 
 
 # ---------------------------------------------------------------------------

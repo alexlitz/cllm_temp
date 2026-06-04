@@ -331,7 +331,132 @@ def make_l9_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     )
 
 
+def make_lookup_mode_l10_bitwise_rules_op() -> Operation:
+    """Lookup-mode rule-derived replacement for the L10 ``ALUAndOrXor`` post_op.
+
+    V8 follow-up wave (`docs/V8_DELETE_AUDIT_2026_06_04.md`): the legacy
+    install path for L10 lookup-mode is ``_make_alu_postop_attach_op``
+    instantiating ``efficient_alu_neural.ALUAndOrXor(S, BD)`` and inserting it
+    into ``block.post_ops[0]``. ``_expand_wrapper_blocks`` then splits that
+    post_op into its own passthrough TransformerBlock, so it runs as the FFN
+    of a dedicated block immediately after L10's existing FFN.
+
+    This factory replaces that imperative composite with a rule-derived
+    ``PureFFN`` baked from ``wide_alu_dsl.bitwise_rules`` for AND/OR/XOR
+    (512 rules per opcode = 1536 hidden units total). Byte-identity at the
+    decoded OUTPUT_LO/HI byte is already proven by the POC tests in
+    ``tests/test_wide_alu_dsl.py::test_bitwise_rules_byte_identity_*``
+    (which compare the same rule-derived PureFFN against ``ALUAndOrXor``
+    on randomized AND/OR/XOR inputs).
+
+    Forward semantics:
+      - Input: BD-format residual ``[B, seq_len, d_model]``.
+      - Output: input + SwiGLU contribution that writes ``2.0 / S`` into
+        ``OUTPUT_LO+(a OP b & 0xF)`` and ``OUTPUT_HI+((a OP b) >> 4)`` at
+        ``MARK_AX > 0.5`` positions when the matching opcode flag is set.
+      - Per-bit semantics differ from ``ALUAndOrXor`` (which routes through
+        a BD->GE->FFN->GE->BD pipeline using sigmoid step-pair indicators)
+        but the decoded one-hot OUTPUT byte is identical.
+
+    Note: ``ALUAndOrXor`` also writes CARRY flags and AX_FULL_*; those are
+    only populated for ADD/SUB/wide ops (MUL/SHL/SHR/DIV/MOD), not for
+    AND/OR/XOR, so the rule-derived path is OUTPUT-complete for bitwise.
+    """
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+        from ..primitives import Primitives
+        from ..wide_alu_dsl import bitwise_rules
+
+        # Generate per-opcode rule batches (512 rules each: 256 lo + 256 hi).
+        rule_list: list = []
+        for op_name, opcode_gate in (
+            ("and", "OP_AND"),
+            ("or", "OP_OR"),
+            ("xor", "OP_XOR"),
+        ):
+            rule_list.extend(bitwise_rules(
+                op=op_name,
+                operand_a_lo="ALU_LO",
+                operand_a_hi="ALU_HI",
+                operand_b_lo="AX_CARRY_LO",
+                operand_b_hi="AX_CARRY_HI",
+                result_lo="OUTPUT_LO",
+                result_hi="OUTPUT_HI",
+                opcode_gate=opcode_gate,
+                marker_gate="MARK_AX",
+                S=S,
+            ))
+        rules = tuple(rule_list)
+        assert len(rules) == 3 * 512, (
+            f"bitwise_rules: expected 1536 rules (3 opcodes x 512), got {len(rules)}"
+        )
+
+        # Size the new PureFFN to match the parent block's d_model. The
+        # post_op runs in its own passthrough block downstream (see
+        # ``_expand_wrapper_blocks`` in ``vm_step.py``) where it becomes
+        # the block's ``ffn``, so its input/output dim must match the
+        # residual width of the surrounding model.
+        ffn_in = block.ffn
+        if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
+            d_model = int(ffn_in.W_up.shape[1])
+        else:
+            d_model = int(getattr(ffn_in, "dim", 512))
+        new_ffn = PureFFN(dim=d_model, hidden_dim=len(rules))
+
+        bd_proxy = _as_setdim_proxy(dim_positions)
+        names = Primitives.ffn_rule_dim_names(rules)
+        dim_pos = Primitives.dim_positions_from_bd(bd_proxy, names)
+        end = Primitives.lower_ffn_rules(
+            new_ffn, rules, dim_pos, start_unit=0, S=S,
+        )
+        assert end == len(rules), (
+            f"lower_ffn_rules wrote {end} units; expected {len(rules)}"
+        )
+
+        # Insert as post_op[0] to match the legacy ``_make_alu_postop_attach_op``
+        # behaviour. ``_expand_wrapper_blocks`` will split each post_op into
+        # its own passthrough block, preserving execution order. The rebake
+        # in ``_expand_wrapper_blocks._rebake_as_pureffn`` is a no-op for
+        # vanilla ``PureFFN`` (type check at vm_step.py:2641 short-circuits).
+        block.post_ops.insert(0, new_ffn)
+
+    return Operation(
+        name="l10_alu_postop_attach",
+        reads=set(),
+        writes=set(),
+        kind="block",
+        # Phase 8.G.6 anchor: layer10_alu binds to ``layer10_carry_relay``
+        # (kind=attn). Same target as the legacy ``_make_alu_postop_attach_op``
+        # path so the dynamic scheduler co-places this op with the L10 ALU.
+        target_op_name="layer10_carry_relay",
+        bake_fn=bake,
+        # Same phase as the legacy factory (1180 + 10 * 0.01 = 1180.10).
+        phase=1180 + 10 * 0.01,
+        migrated=True,
+        requires={"same_layer_as": "layer10_alu"},
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        claims=set(),
+        produces={
+            '__module_replacement': 'L10.post_ops[PureFFN/bitwise_rules]',
+        },
+    )
+
+
 def make_l10_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
+    # V8 follow-up (``docs/LOOKUP_MODE_RULE_DERIVATION_2026_06_04.md``): the
+    # legacy ``ALUAndOrXor`` install in lookup mode is replaced by a
+    # rule-derived ``PureFFN`` baked from ``wide_alu_dsl.bitwise_rules``.
+    # Byte-identity at the decoded OUTPUT byte is proven by
+    # ``tests/test_wide_alu_dsl.py::test_bitwise_rules_byte_identity_*``.
+    #
+    # The replacement preserves the install schedule (phase=1180.10,
+    # same target_op_name, same kind="block") so the dynamic scheduler and
+    # the ``_expand_wrapper_blocks`` post-op split behave identically.
+    if alu_mode == 'lookup':
+        return _mark_structural_declarations(
+            make_lookup_mode_l10_bitwise_rules_op()
+        )
     # Dim-ownership claims: empty. ``bake`` inserts an
     # ``ALUAndOrXor`` into ``model.blocks[10].post_ops`` -- module
     # attach. Sentinel below documents the structural effect.

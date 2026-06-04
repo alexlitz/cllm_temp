@@ -25,7 +25,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 from neural_vm.base_layers import PureFFN  # noqa: E402
-from neural_vm.efficient_alu_neural import ALUAndOrXor  # noqa: E402
 from neural_vm.unified_compiler.primitives import Primitives  # noqa: E402
 from neural_vm.unified_compiler.wide_alu_dsl import (  # noqa: E402
     bitwise_rules,
@@ -112,11 +111,6 @@ def _decode_output_byte(y: torch.Tensor) -> int:
 
 
 @pytest.fixture(scope="module")
-def composite() -> ALUAndOrXor:
-    return ALUAndOrXor(S=100.0, BD=_SetDim)
-
-
-@pytest.fixture(scope="module")
 def lowered_ffns() -> dict:
     return {op: _lowered_pureffn_for(op) for op in ("and", "or", "xor")}
 
@@ -144,44 +138,34 @@ def test_bitwise_rules_emit_512_units_per_op():
         (0xBE, 0xEF),  # arbitrary
     ],
 )
-def test_bitwise_rules_byte_identity_vs_composite(
-    composite, lowered_ffns, op, a, b
-):
+def test_bitwise_rules_byte_identity_vs_python(lowered_ffns, op, a, b):
     """Lowered ``bitwise_rules`` decodes to the same OUTPUT byte as
-    ``ALUAndOrXor.forward`` on the same input.
+    Python's reference op (``a OP b``) on the same input.
 
-    Both paths must agree with Python's reference op (``a OP b``) — the
-    composite already has its byte-identity gate in
-    ``test_alu_wide_composites_per_op``, so matching the composite is
-    sufficient for the DSL POC contract.
+    Post-V8: the legacy ``ALUAndOrXor`` composite was deleted (it was
+    the imperative composite the rules replaced); the contract now
+    asserted is ``lowered_byte == (a OP b) & 0xFF`` directly. Lookup-mode
+    install matches this byte-for-byte via the factory in
+    ``ops/alu_ops.py:make_lookup_mode_l10_bitwise_rules_op`` (separately
+    sanity-checked by
+    ``test_lookup_mode_l10_postop_factory_byte_identity``).
     """
     x = _make_input(a=a, b=b, op=op)
     with torch.no_grad():
-        y_composite = composite(x)
         y_lowered = lowered_ffns[op](x)
 
-    composite_byte = _decode_output_byte(y_composite)
     lowered_byte = _decode_output_byte(y_lowered)
     expected = _PY_OP[op](a, b) & 0xFF
 
-    assert composite_byte == expected, (
-        f"composite drift: {op} 0x{a:02X} 0x{b:02X} "
-        f"-> expected 0x{expected:02X}, got 0x{composite_byte:02X}"
-    )
     assert lowered_byte == expected, (
         f"lowered drift: bitwise_rules({op!r}) 0x{a:02X} 0x{b:02X} "
         f"-> expected 0x{expected:02X}, got 0x{lowered_byte:02X}"
     )
-    assert lowered_byte == composite_byte, (
-        f"DSL byte-identity: bitwise_rules vs ALUAndOrXor disagree on "
-        f"{op} 0x{a:02X} 0x{b:02X} (lowered=0x{lowered_byte:02X}, "
-        f"composite=0x{composite_byte:02X})"
-    )
 
 
-def test_bitwise_rules_byte_identity_randomized(composite, lowered_ffns):
+def test_bitwise_rules_byte_identity_randomized(lowered_ffns):
     """Randomized sweep — 32 (a, b) pairs per op, decoded OUTPUT byte
-    must match the composite on every one. Seeded for determinism.
+    must match Python's reference on every one. Seeded for determinism.
     """
     gen = torch.Generator().manual_seed(0x1B17C155)  # "BITWISE" hex-ish
     n_trials = 32
@@ -193,18 +177,99 @@ def test_bitwise_rules_byte_identity_randomized(composite, lowered_ffns):
             x = _make_input(a=a, b=b, op=op)
             with torch.no_grad():
                 lowered_byte = _decode_output_byte(lowered_ffns[op](x))
-                composite_byte = _decode_output_byte(composite(x))
             expected = _PY_OP[op](a, b) & 0xFF
-            if lowered_byte != expected or composite_byte != expected:
+            if lowered_byte != expected:
                 mismatches.append(
                     f"{op} 0x{a:02X} 0x{b:02X}: "
                     f"expected=0x{expected:02X} "
-                    f"lowered=0x{lowered_byte:02X} "
-                    f"composite=0x{composite_byte:02X}"
+                    f"lowered=0x{lowered_byte:02X}"
                 )
 
     assert not mismatches, (
         f"Byte-identity failures ({len(mismatches)}/{3 * n_trials}):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+# ---------------------------------------------------------------------------
+# V8 follow-up: lookup-mode factory byte-identity test.
+#
+# Validates the new ``make_lookup_mode_l10_bitwise_rules_op`` install path
+# against the legacy ``_make_alu_postop_attach_op`` install (which inserts an
+# ``ALUAndOrXor`` composite). The new factory's bake function emits a
+# ``PureFFN`` baked from 1,536 ``bitwise_rules`` (3 opcodes x 512 rules) and
+# inserts it into ``block.post_ops[0]`` — the same slot the old install used.
+# Decoded OUTPUT_LO/HI byte must match the composite forward on every
+# (a, b, op) tuple.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def lookup_mode_rule_postop():
+    """Bake the new lookup-mode L10 rule-derived post_op into a mock block.
+
+    Returns the ``PureFFN`` instance installed at ``block.post_ops[0]``.
+    """
+    import torch.nn as nn
+
+    from neural_vm.unified_compiler.ops.alu_ops import (
+        make_lookup_mode_l10_bitwise_rules_op,
+    )
+    from neural_vm.unified_compiler.ops.shared import _setdim_to_positions
+
+    class _MockBlock:
+        def __init__(self):
+            self.ffn = PureFFN(dim=512, hidden_dim=64)
+            self.post_ops = nn.ModuleList()
+
+    block = _MockBlock()
+    op = make_lookup_mode_l10_bitwise_rules_op()
+    op.bake_fn(block, _setdim_to_positions(_SetDim), 100.0)
+    assert len(block.post_ops) == 1, (
+        f"factory bake expected 1 post_op; got {len(block.post_ops)}"
+    )
+    rule_ffn = block.post_ops[0]
+    assert type(rule_ffn) is PureFFN, (
+        f"factory bake expected vanilla PureFFN; got {type(rule_ffn).__name__}"
+    )
+    assert rule_ffn.hidden_dim == 1536, (
+        f"factory bake expected hidden_dim=1536; got {rule_ffn.hidden_dim}"
+    )
+    return rule_ffn
+
+
+def test_lookup_mode_l10_postop_factory_byte_identity(
+    lookup_mode_rule_postop
+):
+    """V8 follow-up: factory-installed PureFFN matches Python's bitwise op.
+
+    Same sweep as ``test_bitwise_rules_byte_identity_randomized`` but
+    exercises the production install path (``bake_fn`` mutating
+    ``block.post_ops``) rather than building the PureFFN directly. Ensures
+    the dim-positions proxy threading + ``Primitives.lower_ffn_rules`` call
+    inside the factory bake produce a PureFFN whose decoded OUTPUT byte
+    matches Python's reference op (= the post-V8 byte-identity contract,
+    since ``ALUAndOrXor`` was deleted in this same wave).
+    """
+    gen = torch.Generator().manual_seed(0x1B17C155)
+    n_trials = 32
+    pairs = torch.randint(0, 256, (n_trials, 2), generator=gen).tolist()
+
+    mismatches = []
+    for op in ("and", "or", "xor"):
+        for a, b in pairs:
+            x = _make_input(a=a, b=b, op=op)
+            with torch.no_grad():
+                rule_byte = _decode_output_byte(lookup_mode_rule_postop(x))
+            expected = _PY_OP[op](a, b) & 0xFF
+            if rule_byte != expected:
+                mismatches.append(
+                    f"{op} 0x{a:02X} 0x{b:02X}: expected=0x{expected:02X} "
+                    f"rule=0x{rule_byte:02X}"
+                )
+
+    assert not mismatches, (
+        f"Lookup-mode factory drift ({len(mismatches)}/{3 * n_trials}):\n  "
         + "\n  ".join(mismatches[:10])
     )
 
