@@ -428,12 +428,16 @@ def _l10_carry_propagation_rules(
         if lo == 15 and hi == 15 and byte_idx < 2:
             writes.append((carry_byte3, 2.0 / S))
 
-        return FFNRule.gated_write(
+        # DSL v4b: explicit-threshold AND. Carry-in dim acts as both a
+        # positive condition (weight 1.0 above) and the multiplicative
+        # gate (gate_weight=0.5, gate_bias=0.0). The conditions tuple
+        # carries the byte-position selector, opcode blockers, and the
+        # OUTPUT match boosts that select the right (lo, hi) cell.
+        return multi_way_and_rule(
             conditions=tuple(conds),
             threshold=threshold,
             gate=add_carry_in_name,
             gate_weight=0.5,
-            gate_bias=0.0,
             writes=tuple(writes),
             name=f"l10_carry_byte{byte_idx}_add_lo{lo}_hi{hi}",
             scope=(
@@ -470,12 +474,13 @@ def _l10_carry_propagation_rules(
         if lo == 0 and hi == 0 and byte_idx < 2:
             writes.append((carry_byte3, 2.0 / S))
 
-        return FFNRule.gated_write(
+        # DSL v4b: same shape as add_rule_for, but with the SUB carry-in
+        # dim driving the gate and the SUB-side mutual-exclusion conds.
+        return multi_way_and_rule(
             conditions=tuple(conds),
             threshold=threshold,
             gate=sub_carry_in_name,
             gate_weight=0.5,
-            gate_bias=0.0,
             writes=tuple(writes),
             name=f"l10_carry_byte{byte_idx}_sub_lo{lo}_hi{hi}",
             scope=(
