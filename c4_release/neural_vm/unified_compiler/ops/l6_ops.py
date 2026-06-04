@@ -941,9 +941,11 @@ def _layer6_sp_decrement_rules(
 def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 JSR SP byte-0 fixup units 578..579."""
 
+    # JSR SP byte 0 fixup: 2 N-way AND rules (no gate; constant_write
+    # path) on (OP_JSR, MARK_SP, ~HAS_SE), writing 0xf8 into OUTPUT_LO/HI.
     write_scale = 2.0 / S
     return (
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_jsr_sp_fixup_lo",
             conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0)),
             threshold=1.5,
@@ -952,7 +954,7 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+0", -write_scale),
             ),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l6_jsr_sp_fixup_hi",
             conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0)),
             threshold=1.5,
