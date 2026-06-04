@@ -967,6 +967,9 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_jsr_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 JSR SP byte fixups units 580..583."""
 
+    # JSR SP byte 1/2 fixups: 4 N-way AND rules at byte rows under
+    # H1+2 staging, gated by CONST (constant-on), writing fixed values
+    # to OUTPUT_LO/HI.
     rules = []
     specs = (
         ("byte1", "BYTE_INDEX_0", 15, 15),
@@ -979,14 +982,14 @@ def _layer6_jsr_sp_bytes_rules(S: float) -> tuple[FFNRule, ...]:
             ("IS_BYTE", 1.0),
             ("H1+2", 1.0),
         )
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_jsr_sp_{label}_lo",
             conditions=conditions,
             threshold=3.5,
             gate="CONST",
             writes=((f"OUTPUT_LO+{lo}", 10.0 / S),),
         ))
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_jsr_sp_{label}_hi",
             conditions=conditions,
             threshold=3.5,
