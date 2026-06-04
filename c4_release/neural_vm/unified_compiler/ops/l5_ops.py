@@ -738,7 +738,7 @@ def _opcode_decode_all_step_pc_rules(S):
     ]
     op_names = _opcode_name_map()
     return tuple(
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name=f"l5_all_step_decode_{op_names[op_val].lower()}_at_pc",
             conditions=(
                 (f"OPCODE_BYTE_LO+{lo}", 1.0),
