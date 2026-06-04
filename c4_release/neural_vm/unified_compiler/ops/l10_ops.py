@@ -5233,6 +5233,21 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # regresses var_simple 200-249 from 23/50 to 13/50 (the L1/L7
         # producers introduce numeric noise the consumer threshold cannot
         # absorb at v3-baseline-preserving sensitivity).
+        #
+        # 2026-06-04 multicluster fix: per
+        # docs/MULTICLUSTER_ATTRIBUTION_2026_06_04.md, this rule is the
+        # dominant carrier of the step0:SP_byte0=0xf8 bootstrap leak
+        # affecting add_*/if_eq_*/if_lt_*/if_gt_* (~71% of 1096 failures).
+        # The CMP+4=+0.5 weight is insufficient to discriminate JSR-
+        # bootstrap step 0 from arbitrary non-JSR step 0, so MARK_SP=+10
+        # alone (with tiny H1+2/H1+9 contributions) clears the +10.04
+        # threshold on every step-0 SP marker row.  Apply the BZ step-0
+        # guard pattern (commit 877335ae): require HAS_SE=1 to fire by
+        # adding the +10 step0_guard_weight and bumping the threshold by
+        # the same amount.  This kills the rule on step 0 entirely.
+        # JSR-bootstrap programs (func_identity_*) currently pass per the
+        # multicluster doc — neither relying on this rule for SP_byte0
+        # emission nor exposing a regression here.
         *exact_output_byte_rules(
             name="tail_sp_marker_byte0_f8_from_initial_stack_exact",
             scope="mark == SP",
@@ -5263,7 +5278,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_MEM", -1_000_000_000.0),
                 ("OP_JSR", -1_000_000.0),
                 ("IS_BYTE", -100.0),
-                ("HAS_SE", -100.0),
+                # Replaces the prior HAS_SE=-100 "soft step-0 gate" which
+                # let the rule fire on step 0 of arbitrary programs.  The
+                # +10 weight + +10 threshold bump (BZ pattern from commit
+                # 877335ae) requires HAS_SE=1 (step >= 1) for activation.
+                ("HAS_SE", 10.0),
                 ("NEXT_PC", -1000000.0),
                 ("NEXT_AX", -1000.0),
                 ("NEXT_SP", -1000000.0),
@@ -5272,7 +5291,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
             ),
-            threshold=10.04,
+            threshold=20.04,
             max_abs_weight=1_000_000_000.0,
         ),
         *exact_output_byte_rules(
