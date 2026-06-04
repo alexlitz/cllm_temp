@@ -209,13 +209,13 @@ def _function_call_lea_first_step_alu_init_rules(S: float) -> tuple[FFNRule, ...
         ("HAS_SE", -10.0),
     )
     return (
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="lea_first_step_alu_lo_init",
             conditions=conditions,
             threshold=1.5,
             writes=(("ALU_LO+0", write_scale),),
         ),
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="lea_first_step_alu_hi_init",
             conditions=conditions,
             threshold=1.5,
