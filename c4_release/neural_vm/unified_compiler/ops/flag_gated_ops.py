@@ -1531,7 +1531,7 @@ def _conversational_io_output_routing_rules(S: float) -> tuple[FFNRule, ...]:
     """
     rules: list[FFNRule] = []
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"convo_io_output_routing_lo_{k}",
             conditions=(("IO_IN_OUTPUT_MODE", 1.0),),
             threshold=0.5,
@@ -1540,7 +1540,7 @@ def _conversational_io_output_routing_rules(S: float) -> tuple[FFNRule, ...]:
             gate_bias=0.0,
             writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
         ))
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"convo_io_output_routing_hi_{k}",
             conditions=(("IO_IN_OUTPUT_MODE", 1.0),),
             threshold=0.5,
