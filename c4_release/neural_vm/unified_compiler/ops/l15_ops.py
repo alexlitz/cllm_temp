@@ -289,7 +289,7 @@ def make_l15_nibble_copy_ir() -> CompilerIR:
         ("MARK_BP", -1_000_000.0),
     )
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"nibble_copy_lo_{k}",
             conditions=copy_conditions,
             threshold=0.5,
@@ -297,7 +297,7 @@ def make_l15_nibble_copy_ir() -> CompilerIR:
             writes=((f"OUTPUT_LO+{k}", 2.0),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"nibble_copy_hi_{k}",
             conditions=copy_conditions,
             threshold=0.5,
@@ -314,13 +314,13 @@ def make_l15_nibble_copy_ir() -> CompilerIR:
         ("BYTE_INDEX_1", 1.0),
         ("HAS_SE", -1.0),
     )
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="lea_first_step_ax_byte2_lo_01",
         conditions=lea_conditions,
         threshold=4.5,
         writes=(("OUTPUT_LO+1", 4.0), ("OUTPUT_LO+0", -4.0)),
     ))
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="lea_first_step_ax_byte2_hi_00",
         conditions=lea_conditions,
         threshold=4.5,
