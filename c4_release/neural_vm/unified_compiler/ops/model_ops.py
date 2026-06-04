@@ -260,14 +260,14 @@ def _function_call_jsr_stack0_marker_rules(S: float) -> tuple[FFNRule, ...]:
         # ``b_gate = 1.0`` bias) so the gate value at any position with
         # ``CONST=1`` (every position) is 1.0. ``gated_write`` with
         # ``gate="CONST"`` reproduces that cell layout exactly.
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="jsr_stack0_cancel_l3_default_lo",
             conditions=conditions,
             threshold=T_jsr_s0,
             gate="CONST",
             writes=(("OUTPUT_LO+0", write_scale_cancel),),
         ),
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="jsr_stack0_cancel_l3_default_hi",
             conditions=conditions,
             threshold=T_jsr_s0,
@@ -276,7 +276,7 @@ def _function_call_jsr_stack0_marker_rules(S: float) -> tuple[FFNRule, ...]:
         ),
     ]
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"jsr_stack0_writeback_lo_{k}",
             conditions=conditions,
             threshold=T_jsr_s0,
@@ -287,7 +287,7 @@ def _function_call_jsr_stack0_marker_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", write_scale_writeback),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"jsr_stack0_writeback_hi_{k}",
             conditions=conditions,
             threshold=T_jsr_s0,
