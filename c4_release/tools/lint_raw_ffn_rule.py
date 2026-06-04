@@ -100,15 +100,12 @@ _SKIP_DIR_SEGMENTS = {
 # decrement (or delete) the entry in the SAME commit so the ratchet
 # only walks downward.
 _BASELINE: Dict[str, int] = {
-    "c4_release/neural_vm/unified_compiler/band_guarantees.py": 2,
-    "c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py": 11,
     "c4_release/neural_vm/unified_compiler/ops/l0_ops.py": 2,
     "c4_release/neural_vm/unified_compiler/ops/l11_ops.py": 1,
     "c4_release/neural_vm/unified_compiler/ops/l12_ops.py": 1,
     "c4_release/neural_vm/unified_compiler/ops/l1_ops.py": 2,
     "c4_release/neural_vm/unified_compiler/ops/l6_ops.py": 26,
     "c4_release/neural_vm/unified_compiler/ops/l9_ops.py": 5,
-    "c4_release/neural_vm/unified_compiler/ops/model_ops.py": 26,
 }
 
 
