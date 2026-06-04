@@ -232,26 +232,58 @@ def make_l13_alu_shift_install_op() -> Operation:
 # arguments.
 
 
+def _annotate_module_replacement(op: Operation, sentinel_value: str) -> Operation:
+    """Tag an op as a structural module-replacement (post-construction).
+
+    Used by the ``make_lN_alu_postop_attach_op`` factories below, which
+    delegate to ``_make_alu_postop_attach_op`` in ``shared.py`` and so
+    cannot pass ``claims`` / ``produces`` via the constructor. Mutating
+    after construction is safe: ``claims`` is a mutable set field, and
+    ``produces`` has a setter on ``Operation``. The
+    ``__module_replacement`` sentinel key is skipped by the validation
+    in ``LayerCompiler.add_op`` (see the ``dim_name.startswith("__")``
+    guard there).
+    """
+    op.claims = set()
+    op.produces = {'__module_replacement': sentinel_value}
+    return op
+
+
 def make_l8_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _mark_structural_declarations(
-        _make_alu_postop_attach_op(
-            "l8_alu_postop_attach", 8, "ALUAddSub", alu_mode,
-            same_layer_as="layer8_alu",
-            # layer8_alu binds to ``layer10_byte_passthrough`` (kind=attn);
-            # the postop attach co-places via the same anchor.
-            target_op_name="layer10_byte_passthrough",
-        )
+    # Dim-ownership claims: empty. ``bake`` inserts an
+    # ``AddSub5StageBlock`` (= ``ALUAddSub``) into
+    # ``model.blocks[8].post_ops`` -- module attach, not per-cell
+    # ``(layer, scope, identifier, column)`` writes. Sentinel below
+    # documents the structural effect.
+    return _annotate_module_replacement(
+        _mark_structural_declarations(
+            _make_alu_postop_attach_op(
+                "l8_alu_postop_attach", 8, "ALUAddSub", alu_mode,
+                same_layer_as="layer8_alu",
+                # layer8_alu binds to ``layer10_byte_passthrough`` (kind=attn);
+                # the postop attach co-places via the same anchor.
+                target_op_name="layer10_byte_passthrough",
+            )
+        ),
+        'L8.post_ops[AddSub5StageBlock]',
     )
 
 
 def make_l9_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _mark_structural_declarations(
-        _make_alu_postop_attach_op(
-            "l9_alu_postop_attach", 9, "ALUAddSub", alu_mode,
-            same_layer_as="layer9_alu",
-            # layer9_alu binds to ``layer9_marker_suppress`` (kind=ffn).
-            target_op_name="layer9_marker_suppress",
-        )
+    # Dim-ownership claims: empty. ``bake`` inserts an
+    # ``AddSub5StageBlock`` (= ``ALUAddSub``) into
+    # ``model.blocks[9].post_ops`` -- module attach. Sentinel below
+    # documents the structural effect.
+    return _annotate_module_replacement(
+        _mark_structural_declarations(
+            _make_alu_postop_attach_op(
+                "l9_alu_postop_attach", 9, "ALUAddSub", alu_mode,
+                same_layer_as="layer9_alu",
+                # layer9_alu binds to ``layer9_marker_suppress`` (kind=ffn).
+                target_op_name="layer9_marker_suppress",
+            )
+        ),
+        'L9.post_ops[AddSub5StageBlock]',
     )
 
 
@@ -267,24 +299,38 @@ def make_l10_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
 
 
 def make_l11_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _mark_structural_declarations(
-        _make_alu_postop_attach_op(
-            "l11_alu_postop_attach", 11, "ALUMul", alu_mode,
-            same_layer_as="layer11_mul_partial",
-            # layer11_mul_partial binds to ``_layer11_ffn_dep_anchor``.
-            target_op_name="_layer11_ffn_dep_anchor",
-        )
+    # Dim-ownership claims: empty. ``bake`` inserts a fully-baked
+    # ``FlattenedALUMul`` (= ``ALUMul``) into
+    # ``model.blocks[11].post_ops`` -- module attach. Sentinel below
+    # documents the structural effect.
+    return _annotate_module_replacement(
+        _mark_structural_declarations(
+            _make_alu_postop_attach_op(
+                "l11_alu_postop_attach", 11, "ALUMul", alu_mode,
+                same_layer_as="layer11_mul_partial",
+                # layer11_mul_partial binds to ``_layer11_ffn_dep_anchor``.
+                target_op_name="_layer11_ffn_dep_anchor",
+            )
+        ),
+        'L11.post_ops[FlattenedALUMul]',
     )
 
 
 def make_l12_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _mark_structural_declarations(
-        _make_alu_postop_attach_op(
-            "l12_alu_postop_attach", 12, "ALUMul", alu_mode,
-            same_layer_as="layer12_mul_combine",
-            # layer12_mul_combine binds to ``_layer12_ffn_dep_anchor``.
-            target_op_name="_layer12_ffn_dep_anchor",
-        )
+    # Dim-ownership claims: empty. ``bake`` inserts a fully-baked
+    # ``FlattenedALUMul`` (= ``ALUMul``) into
+    # ``model.blocks[12].post_ops`` -- module attach. Sentinel below
+    # documents the structural effect.
+    return _annotate_module_replacement(
+        _mark_structural_declarations(
+            _make_alu_postop_attach_op(
+                "l12_alu_postop_attach", 12, "ALUMul", alu_mode,
+                same_layer_as="layer12_mul_combine",
+                # layer12_mul_combine binds to ``_layer12_ffn_dep_anchor``.
+                target_op_name="_layer12_ffn_dep_anchor",
+            )
+        ),
+        'L12.post_ops[FlattenedALUMul]',
     )
 
 
@@ -358,6 +404,15 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` inserts an
+        # ``AddSub5StageBlock`` into ``model.blocks[8].post_ops``
+        # (module attach -- functionally equivalent to swapping
+        # ``model.blocks[8].ffn``), not per-cell ``(layer, scope,
+        # identifier, column)`` writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L8.post_ops[AddSub5StageBlock]'},
         smoke_tests={
             "TestSmoke32Bit::test_add_16bit",
             "TestSmoke32Bit::test_sub_16bit",
@@ -583,6 +638,14 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         target_op_name="_layer11_ffn_dep_anchor",
         requires={"after": "l12_alu_mul_getobd"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` replaces
+        # ``model.blocks[11].ffn`` with a rule-derived ``PureFFN``
+        # baked from ``wide_mul_rules`` -- module replacement, not
+        # per-cell ``(layer, scope, identifier, column)`` writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[PureFFN/wide_mul_rules]'},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
@@ -652,6 +715,15 @@ def make_l11_alu_mul_bdtoge_op() -> Operation:
         target_op_name="_layer11_ffn_dep_anchor",
         requires={"after": "_layer11_ffn_dep_anchor"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` installs the
+        # ``FlattenedALUMul`` BD->GE sub-FFN on ``model.blocks[11].ffn``
+        # (module replacement), not per-cell ``(layer, scope, identifier,
+        # column)`` writes. Sentinel below documents the structural
+        # effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[FlattenedALUMul]'},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
@@ -684,6 +756,14 @@ def make_l11_alu_mul_schoolbook_op() -> Operation:
         target_op_name="_layer11_ffn_dep_anchor",
         requires={"after": "l11_alu_mul_bdtoge"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` appends the schoolbook
+        # partial-product sub-FFN to the ``FlattenedALUMul`` composite
+        # on ``model.blocks[11].ffn`` (module assembly), not per-cell
+        # ``(layer, scope, identifier, column)`` writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[FlattenedALUMul]'},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
@@ -716,6 +796,14 @@ def make_l11_alu_mul_carrypass1_op() -> Operation:
         target_op_name="_layer11_ffn_dep_anchor",
         requires={"after": "l11_alu_mul_schoolbook"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` appends the carry-pass
+        # sub-FFN to the ``FlattenedALUMul`` composite on
+        # ``model.blocks[11].ffn`` (module assembly), not per-cell
+        # writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[FlattenedALUMul]'},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
@@ -749,6 +837,14 @@ def make_l11_alu_mul_carrypass2_op() -> Operation:
         target_op_name="_layer11_ffn_dep_anchor",
         requires={"after": "l11_alu_mul_carrypass1"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` appends the carry-pass
+        # sub-FFN to the ``FlattenedALUMul`` composite on
+        # ``model.blocks[11].ffn`` (module assembly), not per-cell
+        # writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[FlattenedALUMul]'},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
@@ -783,6 +879,14 @@ def make_l11_alu_mul_carrypass3_op() -> Operation:
         target_op_name="_layer11_ffn_dep_anchor",
         requires={"after": "l11_alu_mul_carrypass2"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` appends the final
+        # carry-pass sub-FFN to the ``FlattenedALUMul`` composite on
+        # ``model.blocks[11].ffn`` (module assembly), not per-cell
+        # writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[FlattenedALUMul]'},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
@@ -816,6 +920,14 @@ def make_l12_alu_mul_genprop_op() -> Operation:
         target_op_name="_layer11_ffn_dep_anchor",
         requires={"after": "l11_alu_mul_carrypass3"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` appends the gen/prop
+        # sub-FFN to the ``FlattenedALUMul`` composite on
+        # ``model.blocks[11].ffn`` (module assembly), not per-cell
+        # writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[FlattenedALUMul]'},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
@@ -849,6 +961,14 @@ def make_l12_alu_mul_binarylookahead_op() -> Operation:
         target_op_name="_layer11_ffn_dep_anchor",
         requires={"after": "l12_alu_mul_genprop"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` appends the binary
+        # carry-lookahead sub-FFN to the ``FlattenedALUMul`` composite
+        # on ``model.blocks[11].ffn`` (module assembly), not per-cell
+        # writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[FlattenedALUMul]'},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
@@ -881,6 +1001,14 @@ def make_l12_alu_mul_finalcorrection_op() -> Operation:
         target_op_name="_layer11_ffn_dep_anchor",
         requires={"after": "l12_alu_mul_binarylookahead"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` appends the final
+        # correction sub-FFN to the ``FlattenedALUMul`` composite on
+        # ``model.blocks[11].ffn`` (module assembly), not per-cell
+        # writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[FlattenedALUMul]'},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
@@ -931,6 +1059,16 @@ def make_l12_alu_mul_getobd_op() -> Operation:
         requires={"after": [
             "l12_alu_mul_finalcorrection",
         ]},
+        # Dim-ownership claims: empty. ``bake`` installs the final
+        # GE->BD sub-FFN on the ``FlattenedALUMul`` composite that
+        # owns ``model.blocks[11].ffn`` (module assembly), not per-cell
+        # ``(layer, scope, identifier, column)`` writes. The ``writes``
+        # set above documents the OUTPUT residual dims the assembled
+        # composite touches at runtime.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L11.ffn[FlattenedALUMul]'},
         smoke_tests={
             "TestSmoke32Bit::test_mul_overflow",
             "TestSmokeBasic::test_mul_basic",
@@ -1348,6 +1486,16 @@ def make_l8_alu_addsub_bdtoge_op() -> Operation:
         # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
         # installed imperatively by set_vm_weights, validated against PureNeuralALU).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` is a documentation-only
+        # no-op; the actual structural effect (swapping
+        # ``model.blocks[8].ffn`` for ``AddSub5StageBlock``) is performed
+        # by ``set_vm_weights`` / ``_expand_wrapper_blocks`` -- module
+        # replacement, not per-cell ``(layer, scope, identifier, column)``
+        # writes. Sentinel below documents the structural effect.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L8.ffn[AddSub5StageBlock]'},
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
@@ -1373,6 +1521,13 @@ def make_l8_alu_addsub_stage1_op() -> Operation:
         # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
         # installed imperatively by set_vm_weights, validated against PureNeuralALU).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` is a documentation-only
+        # no-op; module replacement performed by ``set_vm_weights`` /
+        # ``_expand_wrapper_blocks``.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L8.ffn[AddSub5StageBlock]'},
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
@@ -1400,6 +1555,13 @@ def make_l8_alu_addsub_stage2_op() -> Operation:
         # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
         # installed imperatively by set_vm_weights, validated against PureNeuralALU).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` is a documentation-only
+        # no-op; module replacement performed by ``set_vm_weights`` /
+        # ``_expand_wrapper_blocks``.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L8.ffn[AddSub5StageBlock]'},
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
@@ -1425,6 +1587,13 @@ def make_l8_alu_addsub_stage3_op() -> Operation:
         # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
         # installed imperatively by set_vm_weights, validated against PureNeuralALU).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` is a documentation-only
+        # no-op; module replacement performed by ``set_vm_weights`` /
+        # ``_expand_wrapper_blocks``.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L8.ffn[AddSub5StageBlock]'},
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )
@@ -1450,6 +1619,13 @@ def make_l8_alu_addsub_getobd_op() -> Operation:
         # Phase 11.A: empty CompilerIR (bake_fn is a no-op; AddSub5StageBlock
         # installed imperatively by set_vm_weights, validated against PureNeuralALU).
         compiler_ir=CompilerIR(),
+        # Dim-ownership claims: empty. ``bake`` is a documentation-only
+        # no-op; module replacement performed by ``set_vm_weights`` /
+        # ``_expand_wrapper_blocks``.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L8.ffn[AddSub5StageBlock]'},
         smoke_tests=_L8_ADDSUB_SMOKE_TESTS,
         spec_section="BLOG_SPEC.md#binary-ALU",
     )

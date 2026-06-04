@@ -1169,6 +1169,17 @@ class LayerCompiler:
                         f"Op {op.name!r} {fname}[{dim_name!r}] register "
                         f"must be str; got {register!r}"
                     )
+                # Sentinel keys prefixed with ``__`` (e.g.
+                # ``__module_replacement``) are structural-effect
+                # annotations, not residual-dim references. Bake authors
+                # use them on ops whose ``bake_fn`` swaps a whole
+                # submodule (``model.blocks[N].ffn`` -> {ALU class}); the
+                # sentinel documents the structural effect without
+                # claiming any (layer, scope, identifier, column) cell.
+                # Skip the ``dim_name in self.dims`` check for these
+                # keys -- they are intentionally NOT declared dims.
+                if dim_name.startswith("__"):
+                    continue
                 if dim_name not in self.dims:
                     raise ValueError(
                         f"Op {op.name!r} {fname} references undeclared dim "

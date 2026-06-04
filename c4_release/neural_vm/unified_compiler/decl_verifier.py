@@ -2043,6 +2043,13 @@ def verify_produces_consumes_dynamic(
         ax_pos = mark_ax_positions[0]
 
         for dim_name in op.produces.keys():
+            # Sentinel keys prefixed with ``__`` (e.g.
+            # ``__module_replacement``) annotate ops whose bake swaps a
+            # whole submodule -- there is no residual cell to inspect.
+            # Skip dynamic drift detection for them; static Mode A
+            # snapshot diffing is unaffected.
+            if dim_name.startswith("__"):
+                continue
             if dim_name not in layout.dim_positions:
                 res.drift.append(f"produces {dim_name!r}: dim not in layout")
                 continue
@@ -2614,6 +2621,10 @@ def verify_produces_consumes_multistep(
                 continue
             step_k = step_idx + 1  # 1-indexed for reporting
             for dim_name, register in op.produces.items():
+                # Sentinel keys (``__module_replacement`` etc.) annotate
+                # module-swap ops; no residual cell to probe. Skip.
+                if dim_name.startswith("__"):
+                    continue
                 if dim_name not in layout.dim_positions:
                     result.notes.append(
                         f"step {step_k}: produces {dim_name!r}: "
