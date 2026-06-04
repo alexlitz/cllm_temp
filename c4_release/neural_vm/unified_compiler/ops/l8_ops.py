@@ -1303,7 +1303,7 @@ def _format_position_counter_rules(S: float) -> tuple[FFNRule, ...]:
     )
     for k in range(16):
         next_k = (k + 1) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"format_pos_inc_{k}",
             conditions=conditions,
             threshold=1.5,
