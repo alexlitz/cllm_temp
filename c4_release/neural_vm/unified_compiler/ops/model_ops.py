@@ -485,7 +485,7 @@ def _function_call_ent_bp_rules(S: float) -> tuple[FFNRule, ...]:
     rules: list[FFNRule] = []
     for k in range(16):
         new_k = (k - 8) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"ent_bp_lo_{k}",
             conditions=base_conditions,
             threshold=T_ent_bp,
@@ -497,7 +497,7 @@ def _function_call_ent_bp_rules(S: float) -> tuple[FFNRule, ...]:
         ))
     for k in range(16):
         new_k_borrow = (k - 1) % 16
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"ent_bp_hi_{k}",
             conditions=base_conditions + borrow_blockers,
             threshold=T_ent_bp,
