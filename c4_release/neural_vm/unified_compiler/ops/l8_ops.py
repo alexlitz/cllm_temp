@@ -752,7 +752,7 @@ def _layer8_alu_cmp_group_rules(S: float) -> tuple[FFNRule, ...]:
     """
     write_scale = 2.0 / (S * 9.0)
     return (
-        FFNRule.constant_write(
+        multi_way_and_rule(
             name="l8_alu_cmp_group",
             conditions=(
                 ("OP_EQ", 1.0),
