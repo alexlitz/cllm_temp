@@ -5,7 +5,11 @@ from collections.abc import Mapping
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import multi_way_and_rule
+from ..building_blocks_dsl import (
+    attention_head_extension,
+    binary_address_lookup_attention,
+    multi_way_and_rule,
+)
 from ..ir import CompilerIR, FFNRule, RuntimeAttentionFragment, StructuralOp
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -1479,6 +1483,136 @@ def _suppress_l15_lookup_lev_blockers_4_11(attn, BD, HD) -> None:
                 attn.W_q.data[base + row, BD.H3 + mem_i] = -100000.0
 
 
+def _pop_d8_head_9_dim_positions(BD) -> dict:
+    """Resolve the named dim layout used by :func:`_pop_d8_head_9_spec`.
+
+    The V2.1 primitives (``binary_address_lookup_attention`` /
+    ``attention_head_extension``) take a ``dim_positions`` map keyed by
+    name; this helper materializes the names the pop_d8 head reads
+    from ``BD`` so the spec builder stays free of direct ``BD``
+    attribute access.
+    """
+    return {
+        "CONST": BD.CONST,
+        "MARK_STACK0": BD.MARK_STACK0,
+        "HAS_SE": BD.HAS_SE,
+        "CMP": BD.CMP,
+        "ADDR_B0_LO": BD.ADDR_B0_LO,
+        "ADDR_B0_HI": BD.ADDR_B0_HI,
+        "IS_BYTE": BD.IS_BYTE,
+        "MEM_STORE": BD.MEM_STORE,
+        "MARK_AX": BD.MARK_AX,
+        "MARK_PC": BD.MARK_PC,
+        "MARK_SP": BD.MARK_SP,
+        "MARK_BP": BD.MARK_BP,
+        "MARK_MEM": BD.MARK_MEM,
+        "MEM_VAL_B1": BD.MEM_VAL_B1,
+        "CLEAN_EMBED_LO": BD.CLEAN_EMBED_LO,
+        "CLEAN_EMBED_HI": BD.CLEAN_EMBED_HI,
+        "OUTPUT_LO": BD.OUTPUT_LO,
+        "OUTPUT_HI": BD.OUTPUT_HI,
+    }
+
+
+def _pop_d8_head_9_spec(
+    *,
+    head_idx: int,
+    head_dim: int,
+    BD,
+) -> DeclarativeAttentionHeadSpec:
+    """Declarative spec for the L15 head-9 pop_d8_to_e0 lookup.
+
+    Built via the V2.1 attention primitives (proof-of-concept
+    migration off the imperative writer body — see
+    :func:`_suppress_l15_lookup_pop_d8_head_9` for the legacy form
+    and ``docs/RUNTIME_ATTN_GAPS_2026_06_04.md`` for the design
+    rationale).
+
+    Structure:
+
+    * Slot 0 — universal-sink bias row: ``W_q[CONST]=1``,
+      ``W_k[CONST]=-1000``. Carried by
+      :func:`binary_address_lookup_attention` (no binary address bands;
+      the helper supports an empty ``addr_dim_bases`` for the
+      bias-only case).
+    * Slot ``min(head_dim-1, 63)`` — the pop_d8 discriminator row:
+      strong negative bias (``CONST=-4S``) gated up by 5 positive Q
+      writes (MARK_STACK0, HAS_SE, CMP+3, ADDR_B0_LO+8, ADDR_B0_HI+13),
+      with IS_BYTE/MEM_STORE/marker suppressors on the Q side and
+      MEM_VAL_B1 / ADDR_B0_LO+0 / ADDR_B0_HI+14 on the K side. Added
+      via :func:`attention_head_extension`.
+    * Slots 1..16 (LO) and 17..32 (HI) — V/O block copying
+      ``CLEAN_EMBED`` to ``OUTPUT`` with V=1 and O=40. Added via
+      :func:`attention_head_extension`.
+
+    ALiBi slope is set to ``1.0`` for this head.
+    """
+    dp = _pop_d8_head_9_dim_positions(BD)
+
+    # Slot 0 is the universal sink: Q[CONST]=+1, K[CONST]=-1000.
+    # binary_address_lookup_attention places these via bias_dim /
+    # key_bias_dim with no binary-address bands.
+    base = binary_address_lookup_attention(
+        head_idx=head_idx,
+        addr_dim_bases=(),  # no binary address bands on this head
+        addr_width_bits=4,
+        addr_slot_base=4,
+        bias_slot=0,
+        bias_dim="CONST", bias_weight=1.0,
+        key_bias_dim="CONST", key_bias_weight=-1000.0,
+        head_dim=head_dim,
+        dim_positions=dp,
+    )
+
+    # Slot for the pop_d8 discriminator row.
+    row = min(head_dim - 1, 63)
+    S = 50000.0  # ``pop_d8_to_e0_s`` in the legacy writer.
+
+    extra_q: list = [
+        AP(row, dp["CONST"], -4.0 * S),
+        AP(row, dp["MARK_STACK0"], S),
+        AP(row, dp["HAS_SE"], S),
+        AP(row, dp["CMP"] + 3, S),
+        AP(row, dp["ADDR_B0_LO"] + 8, S),
+        AP(row, dp["ADDR_B0_HI"] + 13, S),
+        AP(row, dp["IS_BYTE"], -5.0 * S),
+        AP(row, dp["MEM_STORE"], -8.0 * S),
+    ]
+    # Marker negatives at -5*S. Order mirrors the legacy writer's
+    # ``for marker_dim in (...)`` tuple so the produced AP list lines
+    # up one-for-one when audited side-by-side.
+    for marker_name in ("MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
+                        "MARK_MEM"):
+        extra_q.append(AP(row, dp[marker_name], -5.0 * S))
+
+    extra_k = (
+        AP(row, dp["MEM_VAL_B1"], 1.0),
+        AP(row, dp["ADDR_B0_LO"] + 0, 1.0),
+        AP(row, dp["ADDR_B0_HI"] + 14, 1.0),
+    )
+
+    # V/O block: V slot ``1+idx`` reads CLEAN_EMBED_LO+idx (V=1.0),
+    # V slot ``17+idx`` reads CLEAN_EMBED_HI+idx; O writes the matched
+    # value slot back to OUTPUT_LO/HI with scale 40.0. Mirrors the
+    # legacy ``for idx in range(16):`` loop exactly.
+    extra_v: list = []
+    extra_o: list = []
+    for idx in range(16):
+        extra_v.append(AP(1 + idx, dp["CLEAN_EMBED_LO"] + idx, 1.0))
+        extra_v.append(AP(17 + idx, dp["CLEAN_EMBED_HI"] + idx, 1.0))
+        extra_o.append(AO(dp["OUTPUT_LO"] + idx, 1 + idx, 40.0))
+        extra_o.append(AO(dp["OUTPUT_HI"] + idx, 17 + idx, 40.0))
+
+    return attention_head_extension(
+        base,
+        extra_q_writes=tuple(extra_q),
+        extra_k_writes=extra_k,
+        extra_v_writes=tuple(extra_v),
+        extra_o_writes=tuple(extra_o),
+        alibi_slope=1.0,
+    )
+
+
 def _suppress_l15_lookup_pop_d8_head_9(attn, BD, HD) -> None:
     """Head-9 wipe + pop_d8_to_e0 rewrite (fires when ``num_heads > 9``).
 
@@ -1494,50 +1628,32 @@ def _suppress_l15_lookup_pop_d8_head_9(attn, BD, HD) -> None:
     ``layer15_memory_lookup``'s CompilerIR; DSL Wave W7 selects it at
     IR-build time on ``num_heads > 9`` rather than via a runtime
     predicate.
+
+    V2.1 migration (this commit): the dense row writes are now built
+    declaratively via :func:`_pop_d8_head_9_spec` (which composes
+    :func:`binary_address_lookup_attention` and
+    :func:`attention_head_extension`) and lowered through
+    :func:`Primitives.generate_attention_head`. The wipe-then-write
+    semantics are preserved: the head's row block is zeroed in-place
+    first so the LEV writer's earlier head-9 writes (when
+    ``num_heads >= 12``) are dropped before the spec's writes land.
+    Byte-identity gate lives at
+    ``tests/test_l15_pop_d8_v21_migration.py``.
     """
     head = 9
     base = head * HD
+    # Wipe head 9's Q/K/V/O bands before the spec writes land.
+    # binary_address_lookup_attention + attention_head_extension emit
+    # an exact superset of distinct (row, col) writes; the wipe ensures
+    # any prior writes by _set_layer15_memory_lookup_lev_heads_4_11
+    # (which touches head 9 at num_heads >= 12) are cleared first.
     attn.W_q.data[base:base + HD, :] = 0.0
     attn.W_k.data[base:base + HD, :] = 0.0
     attn.W_v.data[base:base + HD, :] = 0.0
     attn.W_o.data[:, base:base + HD] = 0.0
 
-    # Row 0 is a universal sink term: any ordinary key gets a negative
-    # score for every query. The target discriminator lives on a separate
-    # row so negative non-target queries cannot multiply a negative key
-    # into a false positive.
-    attn.W_q.data[base + 0, BD.CONST] = 1.0
-    attn.W_k.data[base + 0, BD.CONST] = -1000.0
-
-    pop_d8_to_e0_row = min(HD - 1, 63)
-    pop_d8_to_e0_s = 50000.0
-    row = base + pop_d8_to_e0_row
-    attn.W_q.data[row, BD.CONST] = -4.0 * pop_d8_to_e0_s
-    attn.W_q.data[row, BD.MARK_STACK0] = pop_d8_to_e0_s
-    attn.W_q.data[row, BD.HAS_SE] = pop_d8_to_e0_s
-    attn.W_q.data[row, BD.CMP + 3] = pop_d8_to_e0_s
-    attn.W_q.data[row, BD.ADDR_B0_LO + 8] = pop_d8_to_e0_s
-    attn.W_q.data[row, BD.ADDR_B0_HI + 13] = pop_d8_to_e0_s
-    attn.W_q.data[row, BD.IS_BYTE] = -5.0 * pop_d8_to_e0_s
-    attn.W_q.data[row, BD.MEM_STORE] = -8.0 * pop_d8_to_e0_s
-    for marker_dim in (
-        BD.MARK_AX,
-        BD.MARK_PC,
-        BD.MARK_SP,
-        BD.MARK_BP,
-        BD.MARK_MEM,
-    ):
-        attn.W_q.data[row, marker_dim] = -5.0 * pop_d8_to_e0_s
-    attn.W_k.data[row, BD.MEM_VAL_B1] = 1.0
-    attn.W_k.data[row, BD.ADDR_B0_LO + 0] = 1.0
-    attn.W_k.data[row, BD.ADDR_B0_HI + 14] = 1.0
-    for idx in range(16):
-        attn.W_v.data[base + 1 + idx, BD.CLEAN_EMBED_LO + idx] = 1.0
-        attn.W_v.data[base + 17 + idx, BD.CLEAN_EMBED_HI + idx] = 1.0
-        attn.W_o.data[BD.OUTPUT_LO + idx, base + 1 + idx] = 40.0
-        attn.W_o.data[BD.OUTPUT_HI + idx, base + 17 + idx] = 40.0
-    if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-        attn.alibi_slopes[head] = 1.0
+    spec = _pop_d8_head_9_spec(head_idx=head, head_dim=HD, BD=BD)
+    Primitives.generate_attention_head(attn, spec, HD=HD)
 
 
 def _suppress_l15_lookup_during_current_store_generation(attn, BD, HD) -> None:
