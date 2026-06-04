@@ -26,7 +26,9 @@ import torch
 from c4_release.neural_vm.base_layers import PureAttention, PureFFN
 from c4_release.neural_vm.kv_cache_eviction import softmax1
 from c4_release.neural_vm.unified_compiler.building_blocks_dsl import (
+    attention_head_extension,
     band_range_check_rules,
+    binary_address_lookup_attention,
     cancel_residual_rule,
     efficient_exp_attention,
     fetch_byte_attention,
@@ -43,6 +45,8 @@ from c4_release.neural_vm.unified_compiler.ir import (
     compare_symbolic_to_lowered_ffn,
 )
 from c4_release.neural_vm.unified_compiler.primitives import (
+    AO,
+    AP,
     DeclarativeAttentionHeadSpec,
     Primitives,
 )
@@ -940,3 +944,498 @@ def test_opcode_expert_rules_returns_ffn_rule_tuple():
     assert isinstance(wrapped, tuple)
     for w in wrapped:
         assert isinstance(w, FFNRule)
+
+
+# ===========================================================================
+# binary_address_lookup_attention (V2.1)
+# ===========================================================================
+
+
+def _l15_binary_addr_dim_positions():
+    """Mirror the L15 dim layout the imperative writer expects.
+
+    Just enough dims to write rows 0..63 of one head: bias dim
+    ``CONST``, the three address bytes ``ADDR_B{0,1,2}_{LO,HI}`` (each
+    16 cells), the byte-select V/O dims, and a few discriminator /
+    suppressor flags.
+    """
+    # ``CMP`` is a 16-wide band — the spec resolves ``"CMP+3"`` to
+    # ``dp["CMP"] + 3``; the imperative writer uses ``dp["CMP"] + 3``
+    # directly so both paths land at the same cell.
+    return {
+        "CONST": 0,
+        "OP_LI_RELAY": 1,
+        "OP_LC_RELAY": 2,
+        "MARK_PC": 3,
+        "MARK_SP": 4,
+        "MARK_AX": 5,
+        "MARK_STACK0": 6,
+        "OP_LEV": 7,
+        "H1": 16,  # H1 band base
+        "CMP": 32,  # CMP band base (CMP+3 lands at 35)
+        "ADDR_B0_LO": 48,
+        "ADDR_B0_HI": 64,
+        "ADDR_B1_LO": 80,
+        "ADDR_B1_HI": 96,
+        "ADDR_B2_LO": 112,
+        "ADDR_B2_HI": 128,
+        "CLEAN_EMBED_LO": 144,
+        "CLEAN_EMBED_HI": 160,
+        "OUTPUT_LO": 176,
+        "OUTPUT_HI": 192,
+        "PAD": 208,
+    }
+
+
+def _imperative_l15_head0_binary_addr_slice(attn, HD, dp):
+    """Imperative L15 head-0 binary address slice — mirrors lines
+    7270..7372 of vm_step.py (slot 0 bias + slots 4..27 binary 24-bit).
+
+    Implements the load-side reads only, no V/O block, so the test can
+    compare against the same surface emitted by
+    :func:`binary_address_lookup_attention`.
+    """
+    base = 0
+    scale = 10.0
+    # Bias slot
+    attn.W_q.data[base + 0, dp["CONST"]] = -2000.0
+    attn.W_q.data[base + 0, dp["OP_LI_RELAY"]] = 2000.0
+    attn.W_q.data[base + 0, dp["OP_LC_RELAY"]] = 2000.0
+    attn.W_q.data[base + 0, dp["CMP"] + 3] = 2000.0
+    attn.W_q.data[base + 0, dp["OP_LEV"]] = -1000.0
+    attn.W_q.data[base + 0, dp["MARK_PC"]] = -25000.0
+    attn.W_q.data[base + 0, dp["MARK_SP"]] = -100000.0
+    attn.W_k.data[base + 0, dp["CONST"]] = 10.0
+    # Binary address slots 4..27
+    addr_dim = 4
+    addr_bases = [
+        dp["ADDR_B0_LO"], dp["ADDR_B0_HI"],
+        dp["ADDR_B1_LO"], dp["ADDR_B1_HI"],
+        dp["ADDR_B2_LO"], dp["ADDR_B2_HI"],
+    ]
+    for nibble_base in addr_bases:
+        for bit in range(4):
+            for k in range(16):
+                bit_val = 2 * ((k >> bit) & 1) - 1
+                attn.W_q.data[base + addr_dim, nibble_base + k] = scale * bit_val
+                attn.W_k.data[base + addr_dim, nibble_base + k] = scale * bit_val
+            addr_dim += 1
+
+
+def test_binary_address_lookup_attention_byte_identical_to_imperative():
+    """Build the L15 head-0 binary-address slice via the new primitive
+    and via the imperative writer, then assert byte-identical Q/K/V/O
+    via ``Primitives.generate_attention_head``."""
+    dp = _l15_binary_addr_dim_positions()
+    d_model = dp["PAD"] + 16
+    HD = 64
+
+    # Spec path
+    spec = binary_address_lookup_attention(
+        head_idx=0,
+        addr_dim_bases=[
+            "ADDR_B0_LO", "ADDR_B0_HI",
+            "ADDR_B1_LO", "ADDR_B1_HI",
+            "ADDR_B2_LO", "ADDR_B2_HI",
+        ],
+        addr_width_bits=4,
+        addr_slot_base=4,
+        bit_scale=10.0,
+        bias_slot=0,
+        bias_dim="CONST", bias_weight=-2000.0,
+        key_bias_dim="CONST", key_bias_weight=10.0,
+        discriminators=[
+            ("OP_LI_RELAY", 2000.0),
+            ("OP_LC_RELAY", 2000.0),
+            ("CMP+3", 2000.0),
+        ],
+        suppressors=[
+            ("OP_LEV", -1000.0),
+            ("MARK_PC", -25000.0),
+            ("MARK_SP", -100000.0),
+        ],
+        head_dim=HD,
+        dim_positions=dp,
+    )
+    attn_spec = PureAttention(dim=d_model, num_heads=1, causal=False)
+    Primitives.generate_attention_head(attn_spec, spec, HD=HD)
+
+    # Imperative path
+    attn_imp = PureAttention(dim=d_model, num_heads=1, causal=False)
+    _imperative_l15_head0_binary_addr_slice(attn_imp, HD=HD, dp=dp)
+
+    # Byte-identity
+    assert torch.equal(attn_spec.W_q.data, attn_imp.W_q.data), (
+        "W_q differs between binary_address_lookup_attention and imperative"
+    )
+    assert torch.equal(attn_spec.W_k.data, attn_imp.W_k.data), (
+        "W_k differs between binary_address_lookup_attention and imperative"
+    )
+    assert torch.equal(attn_spec.W_v.data, attn_imp.W_v.data), "W_v differs"
+    assert torch.equal(attn_spec.W_o.data, attn_imp.W_o.data), "W_o differs"
+
+
+def test_binary_address_lookup_attention_with_value_block():
+    """Verify the optional value/output block lands at the right slots
+    and writes the right cells.
+    """
+    dp = _l15_binary_addr_dim_positions()
+    d_model = dp["PAD"] + 16
+    HD = 64
+    # Two-byte CLEAN_EMBED_LO -> OUTPUT_LO mapping at slot 32 onward.
+    value_dims = [f"CLEAN_EMBED_LO" for _ in range(1)]
+    output_dims = [f"OUTPUT_LO" for _ in range(1)]
+    spec = binary_address_lookup_attention(
+        head_idx=0,
+        addr_dim_bases=["ADDR_B0_LO", "ADDR_B0_HI"],
+        addr_width_bits=4,
+        addr_slot_base=4,
+        bias_dim=None, key_bias_dim=None,
+        value_slot_base=32,
+        value_dims=value_dims,
+        output_dims=output_dims,
+        head_dim=HD,
+        dim_positions=dp,
+    )
+    # Verify the V/O writes land at slot 32.
+    assert any(w.slot == 32 and w.dim == dp["CLEAN_EMBED_LO"]
+               for w in spec.v), "V block missing slot 32"
+    assert any(w.slot == 32 and w.out_dim == dp["OUTPUT_LO"]
+               for w in spec.o), "O block missing slot 32"
+
+
+def test_binary_address_lookup_attention_default_value_slot_base():
+    """``value_slot_base=None`` should default to addr_slot_base +
+    len(addr_dim_bases) * addr_width_bits — right after the address block.
+    """
+    dp = _l15_binary_addr_dim_positions()
+    spec = binary_address_lookup_attention(
+        head_idx=0,
+        addr_dim_bases=["ADDR_B0_LO", "ADDR_B0_HI"],  # 2 bands × 4 bits = 8 slots
+        addr_width_bits=4,
+        addr_slot_base=4,
+        bias_dim=None, key_bias_dim=None,
+        value_dims=["CLEAN_EMBED_LO"],
+        output_dims=["OUTPUT_LO"],
+        head_dim=64,
+        dim_positions=dp,
+    )
+    # Address block: slots 4..11 (8 slots). Default value_slot_base = 12.
+    assert spec.v[0].slot == 12, (
+        f"default value_slot_base should be 4+8=12, got {spec.v[0].slot}"
+    )
+
+
+def test_binary_address_lookup_attention_rejects_missing_dim():
+    dp = {"CONST": 0}
+    with pytest.raises(ValueError, match="missing from dim_positions"):
+        binary_address_lookup_attention(
+            head_idx=0,
+            addr_dim_bases=["MISSING_BAND"],
+            addr_width_bits=4,
+            dim_positions=dp,
+        )
+
+
+def test_binary_address_lookup_attention_rejects_slot_overflow():
+    dp = _l15_binary_addr_dim_positions()
+    with pytest.raises(ValueError, match="slot extent"):
+        binary_address_lookup_attention(
+            head_idx=0,
+            addr_dim_bases=["ADDR_B0_LO"] * 8,  # 8 bands × 4 bits = 32 slots
+            addr_width_bits=4,
+            addr_slot_base=40,  # 40 + 32 = 72 > head_dim=64
+            head_dim=64,
+            dim_positions=dp,
+        )
+
+
+def test_binary_address_lookup_attention_rejects_vo_length_mismatch():
+    dp = _l15_binary_addr_dim_positions()
+    with pytest.raises(ValueError, match="length mismatch"):
+        binary_address_lookup_attention(
+            head_idx=0,
+            addr_dim_bases=["ADDR_B0_LO"],
+            addr_width_bits=4,
+            value_dims=["CLEAN_EMBED_LO", "CLEAN_EMBED_HI"],
+            output_dims=["OUTPUT_LO"],
+            dim_positions=dp,
+        )
+
+
+def test_binary_address_lookup_attention_band_offset_dim_names():
+    """``"BAND+N"`` names (e.g. ``"CMP+3"``, ``"H1+3"``) should resolve
+    to ``dim_positions[BAND] + N`` for discriminators / suppressors.
+    """
+    dp = {
+        "CONST": 0,
+        "H1": 10,
+        "CMP": 20,
+        "ADDR_B0_LO": 30,
+    }
+    spec = binary_address_lookup_attention(
+        head_idx=0,
+        addr_dim_bases=["ADDR_B0_LO"],
+        addr_width_bits=2,  # tiny — 2 bits, 4 cells per band, 2 slots
+        bias_slot=0,
+        bias_dim="CONST", bias_weight=-1.0,
+        discriminators=[("CMP+3", 5.0)],
+        suppressors=[("H1+3", -50.0)],
+        head_dim=8,
+        dim_positions=dp,
+    )
+    # Find writes at bias slot.
+    cmp_writes = [w for w in spec.q if w.slot == 0 and w.dim == 23]
+    h1_writes = [w for w in spec.q if w.slot == 0 and w.dim == 13]
+    assert len(cmp_writes) == 1 and cmp_writes[0].weight == 5.0
+    assert len(h1_writes) == 1 and h1_writes[0].weight == -50.0
+
+
+# ===========================================================================
+# attention_head_extension (V2.1)
+# ===========================================================================
+
+
+def test_attention_head_extension_appends_writes_and_preserves_head_idx():
+    """Extension appends Q/K/V/O writes and preserves head_idx /
+    alibi_slope / head_dim / group_size from the base spec.
+    """
+    dp = {"CONST": 0, "ADDR_B0_LO": 1, "MARK_AX": 17, "OUTPUT_LO": 18}
+    base = binary_address_lookup_attention(
+        head_idx=3,
+        addr_dim_bases=["ADDR_B0_LO"],
+        addr_width_bits=4,
+        bias_slot=0, bias_dim="CONST", bias_weight=-1.0,
+        head_dim=64,
+        dim_positions=dp,
+    )
+    base_q = len(base.q)
+    base_k = len(base.k)
+    extra_q = (AP(28, dp["MARK_AX"], 500.0),)
+    extra_o = (AO(dp["OUTPUT_LO"], 32, 1.0),)
+    ext = attention_head_extension(
+        base, extra_q_writes=extra_q, extra_o_writes=extra_o,
+        alibi_slope=1.0,
+    )
+    assert ext.head_idx == 3
+    assert ext.alibi_slope == 1.0
+    assert len(ext.q) == base_q + 1
+    assert len(ext.k) == base_k  # unchanged
+    assert ext.q[-1] == extra_q[0]
+    assert ext.o[-1] == extra_o[0]
+    # Base spec not mutated.
+    assert len(base.q) == base_q
+    assert base.alibi_slope is None
+
+
+def test_attention_head_extension_lowers_byte_identically_to_combined_spec():
+    """An extended spec lowered into a fresh PureAttention should write
+    the same cells as a hand-assembled DeclarativeAttentionHeadSpec that
+    carries the same combined Q/K/V/O writes.
+    """
+    dp = _l15_binary_addr_dim_positions()
+    d_model = dp["PAD"] + 16
+    HD = 64
+    base = binary_address_lookup_attention(
+        head_idx=0,
+        addr_dim_bases=["ADDR_B0_LO", "ADDR_B0_HI"],
+        addr_width_bits=4,
+        bias_slot=0, bias_dim="CONST", bias_weight=-1.0,
+        key_bias_dim="CONST", key_bias_weight=10.0,
+        head_dim=HD,
+        dim_positions=dp,
+    )
+    extra_q = (
+        AP(28, dp["MARK_AX"], 500.0),
+        AP(28, dp["MARK_STACK0"], 500.0),
+    )
+    extra_k = (AP(28, dp["CONST"], 5.0),)
+    ext = attention_head_extension(
+        base, extra_q_writes=extra_q, extra_k_writes=extra_k,
+    )
+    # Combined hand-build for comparison.
+    combined = DeclarativeAttentionHeadSpec(
+        head_idx=0,
+        q=tuple(base.q) + extra_q,
+        k=tuple(base.k) + extra_k,
+        v=base.v, o=base.o,
+        alibi_slope=base.alibi_slope,
+    )
+    a1 = PureAttention(dim=d_model, num_heads=1, causal=False)
+    a2 = PureAttention(dim=d_model, num_heads=1, causal=False)
+    Primitives.generate_attention_head(a1, ext, HD=HD)
+    Primitives.generate_attention_head(a2, combined, HD=HD)
+    assert torch.equal(a1.W_q.data, a2.W_q.data)
+    assert torch.equal(a1.W_k.data, a2.W_k.data)
+    assert torch.equal(a1.W_v.data, a2.W_v.data)
+    assert torch.equal(a1.W_o.data, a2.W_o.data)
+
+
+def test_attention_head_extension_preserves_base_alibi_slope_when_not_overridden():
+    """When ``alibi_slope`` is omitted, the base spec's slope is kept."""
+    spec = DeclarativeAttentionHeadSpec(
+        head_idx=2,
+        q=(AP(0, 0, 1.0),),
+        k=(), v=(), o=(),
+        alibi_slope=0.5,
+    )
+    ext = attention_head_extension(spec, extra_q_writes=(AP(1, 1, 2.0),))
+    assert ext.alibi_slope == 0.5
+
+
+def test_attention_head_extension_overrides_alibi_slope_when_supplied():
+    spec = DeclarativeAttentionHeadSpec(
+        head_idx=2,
+        q=(AP(0, 0, 1.0),),
+        k=(), v=(), o=(),
+        alibi_slope=0.5,
+    )
+    ext = attention_head_extension(spec, alibi_slope=1.0)
+    assert ext.alibi_slope == 1.0
+
+
+# ===========================================================================
+# binary_address_lookup_attention + extension — full L15 head-0 surface
+# ===========================================================================
+
+
+def _imperative_l15_head0_full_surface(attn, HD, dp):
+    """Reproduce a representative subset of the legacy L15 head-0 body:
+    binary address (slots 4..27) + byte-selection (slot 3) +
+    position-gate (slot 28) + V/O block (slots 32..63).
+
+    Excludes the dense suppressor row writes (slots 29..33) — those are
+    rebuilt via :func:`attention_head_extension` extras in the spec
+    path and the test asserts byte-identity over the FULL head surface.
+    """
+    base = 0
+    scale = 10.0
+    BS = 60.0
+    # Slot 0 bias + Q-side discriminators / suppressors
+    attn.W_q.data[base + 0, dp["CONST"]] = -2000.0
+    attn.W_q.data[base + 0, dp["OP_LI_RELAY"]] = 2000.0
+    attn.W_q.data[base + 0, dp["OP_LC_RELAY"]] = 2000.0
+    attn.W_q.data[base + 0, dp["CMP"] + 3] = 2000.0
+    attn.W_q.data[base + 0, dp["MARK_PC"]] = -25000.0
+    attn.W_q.data[base + 0, dp["MARK_SP"]] = -100000.0
+    attn.W_k.data[base + 0, dp["CONST"]] = 10.0
+    # Slot 3 byte selection
+    attn.W_q.data[base + 3, dp["MARK_AX"]] = BS
+    attn.W_q.data[base + 3, dp["MARK_STACK0"]] = BS
+    # Slots 4..27 binary 24-bit address
+    addr_dim = 4
+    addr_bases = [
+        dp["ADDR_B0_LO"], dp["ADDR_B0_HI"],
+        dp["ADDR_B1_LO"], dp["ADDR_B1_HI"],
+        dp["ADDR_B2_LO"], dp["ADDR_B2_HI"],
+    ]
+    for nibble_base in addr_bases:
+        for bit in range(4):
+            for k in range(16):
+                bit_val = 2 * ((k >> bit) & 1) - 1
+                attn.W_q.data[base + addr_dim, nibble_base + k] = scale * bit_val
+                attn.W_k.data[base + addr_dim, nibble_base + k] = scale * bit_val
+            addr_dim += 1
+    # Slot 28 per-head position gate
+    attn.W_q.data[base + 28, dp["CONST"]] = -500.0
+    attn.W_q.data[base + 28, dp["MARK_AX"]] = 500.0
+    attn.W_q.data[base + 28, dp["MARK_STACK0"]] = 500.0
+    attn.W_k.data[base + 28, dp["CONST"]] = 5.0
+    # V/O block at slots 32..63
+    for k in range(16):
+        attn.W_v.data[base + 32 + k, dp["CLEAN_EMBED_LO"] + k] = 1.0
+        attn.W_v.data[base + 48 + k, dp["CLEAN_EMBED_HI"] + k] = 1.0
+        attn.W_o.data[dp["OUTPUT_LO"] + k, base + 32 + k] = 1.0
+        attn.W_o.data[dp["OUTPUT_HI"] + k, base + 48 + k] = 1.0
+
+
+def test_v21_primitive_plus_extension_byte_identical_to_full_imperative_l15_head0():
+    """End-to-end V2.1 byte-identity gate: build the L15 head-0 surface
+    via :func:`binary_address_lookup_attention` + V/O block +
+    :func:`attention_head_extension` rows, and verify the lowered
+    W_q/W_k/W_v/W_o are equal to the imperative writer.
+    """
+    dp = _l15_binary_addr_dim_positions()
+    d_model = dp["PAD"] + 16
+    HD = 64
+    BS = 60.0
+
+    # V/O slots 32..47 (LO) and 48..63 (HI). Pass via value_dims as
+    # base+k entries through dim_positions; here we expand inline.
+    # The primitive's V/O block writes one V slot per value_dims entry,
+    # so 32 entries: 16 LO + 16 HI starting at slot 32.
+    value_dims = [f"CLEAN_EMBED_LO+{k}" for k in range(16)] + [
+        f"CLEAN_EMBED_HI+{k}" for k in range(16)
+    ]
+    output_dims = [f"OUTPUT_LO+{k}" for k in range(16)] + [
+        f"OUTPUT_HI+{k}" for k in range(16)
+    ]
+    # The primitive's resolver doesn't handle band+N for V/O dims (only
+    # for discriminators / suppressors). Expand the per-cell dims by
+    # injecting them into dim_positions for this test.
+    expanded_dp = dict(dp)
+    for k in range(16):
+        expanded_dp[f"CLEAN_EMBED_LO+{k}"] = dp["CLEAN_EMBED_LO"] + k
+        expanded_dp[f"CLEAN_EMBED_HI+{k}"] = dp["CLEAN_EMBED_HI"] + k
+        expanded_dp[f"OUTPUT_LO+{k}"] = dp["OUTPUT_LO"] + k
+        expanded_dp[f"OUTPUT_HI+{k}"] = dp["OUTPUT_HI"] + k
+
+    base_spec = binary_address_lookup_attention(
+        head_idx=0,
+        addr_dim_bases=[
+            "ADDR_B0_LO", "ADDR_B0_HI",
+            "ADDR_B1_LO", "ADDR_B1_HI",
+            "ADDR_B2_LO", "ADDR_B2_HI",
+        ],
+        addr_width_bits=4,
+        addr_slot_base=4,
+        bit_scale=10.0,
+        bias_slot=0,
+        bias_dim="CONST", bias_weight=-2000.0,
+        key_bias_dim="CONST", key_bias_weight=10.0,
+        discriminators=[
+            ("OP_LI_RELAY", 2000.0),
+            ("OP_LC_RELAY", 2000.0),
+            ("CMP+3", 2000.0),
+        ],
+        suppressors=[
+            ("MARK_PC", -25000.0),
+            ("MARK_SP", -100000.0),
+        ],
+        value_slot_base=32,
+        value_dims=value_dims,
+        output_dims=output_dims,
+        head_dim=HD,
+        dim_positions=expanded_dp,
+    )
+    # Layer slot-3 byte selection + slot-28 position gate via extension.
+    extra_q = (
+        AP(3, dp["MARK_AX"], BS),
+        AP(3, dp["MARK_STACK0"], BS),
+        AP(28, dp["CONST"], -500.0),
+        AP(28, dp["MARK_AX"], 500.0),
+        AP(28, dp["MARK_STACK0"], 500.0),
+    )
+    extra_k = (AP(28, dp["CONST"], 5.0),)
+    spec = attention_head_extension(
+        base_spec, extra_q_writes=extra_q, extra_k_writes=extra_k,
+    )
+
+    attn_spec = PureAttention(dim=d_model, num_heads=1, causal=False)
+    Primitives.generate_attention_head(attn_spec, spec, HD=HD)
+
+    attn_imp = PureAttention(dim=d_model, num_heads=1, causal=False)
+    _imperative_l15_head0_full_surface(attn_imp, HD=HD, dp=dp)
+
+    assert torch.equal(attn_spec.W_q.data, attn_imp.W_q.data), (
+        "W_q differs at full L15 head-0 surface"
+    )
+    assert torch.equal(attn_spec.W_k.data, attn_imp.W_k.data), (
+        "W_k differs at full L15 head-0 surface"
+    )
+    assert torch.equal(attn_spec.W_v.data, attn_imp.W_v.data), (
+        "W_v differs at full L15 head-0 surface"
+    )
+    assert torch.equal(attn_spec.W_o.data, attn_imp.W_o.data), (
+        "W_o differs at full L15 head-0 surface"
+    )
