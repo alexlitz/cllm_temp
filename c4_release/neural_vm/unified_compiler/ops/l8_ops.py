@@ -800,7 +800,7 @@ def _layer8_alu_cmp_clear_rules(S: float) -> tuple[FFNRule, ...]:
     rules = []
     for k in range(4):
         cmp_k = dim_ref("cmp_flag", "cascade", k)
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l8_alu_cmp_clear_k{k}",
             conditions=((f"CMP+{k}", 1.0),),
             threshold=0.0,
