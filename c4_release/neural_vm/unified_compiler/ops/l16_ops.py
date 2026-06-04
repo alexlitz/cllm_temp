@@ -421,7 +421,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # (for example 0xffe0) to the byte-stream rules below. The initial row can
     # still carry current-store MEM_STORE residue; saved-frame rows carry
     # HAS_SE, so make that blocker decisive.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_jsr_initial_stack0_marker_0a",
         conditions=(
             ("OP_JSR", 50.0),
@@ -508,7 +508,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # older e8 marker materializer above rejects the e0 address signature.
     # Materialize only the exact e8 byte and require both ALU nibbles so nearby
     # e0 marker rows with unrelated ALU residue stay inert.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_stack0_e0_marker_e8_from_alu_exact",
         conditions=(
             ("MARK_STACK0", 1.0),
@@ -635,7 +635,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             continue
         lo = byte & 0xF
         hi = (byte >> 4) & 0xF
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_stack0_e8_output_authoritative_{byte:02x}",
             conditions=stack0_e8_output_authoritative_conditions + (
                 (f"OUTPUT_LO+{lo}", 100.0),
