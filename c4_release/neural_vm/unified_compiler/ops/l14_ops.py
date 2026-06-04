@@ -2364,24 +2364,24 @@ def _layer14_lc_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
         scope="OP_LC_RELAY and IS_BYTE and H1+1 and not BYTE_INDEX_3",
     )
     rules = (
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_lc_ax_bytes_zero_lo_neg",
             writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
             **common_kwargs,
         ),
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_lc_ax_bytes_zero_hi_neg",
             writes=tuple(
                 (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
             ),
             **common_kwargs,
         ),
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_lc_ax_bytes_zero_lo0_boost",
             writes=(("OUTPUT_LO+0", 5.0 / S),),
             **common_kwargs,
         ),
-        FFNRule.gated_write(
+        multi_way_and_rule(
             name="l14_lc_ax_bytes_zero_hi0_boost",
             writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
             **common_kwargs,
