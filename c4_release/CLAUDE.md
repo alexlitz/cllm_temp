@@ -37,6 +37,17 @@ cut. The pattern guides are mandatory reading before writing any op:
 - [`docs/HOW_TO_ADD_A_CORRECTIVE_OP.md`](docs/HOW_TO_ADD_A_CORRECTIVE_OP.md)
   — short opinionated recipe (8 steps) for a new corrective op without
   reproducing the full DSL.
+- Building-blocks DSL: `step_function_rule`, `one_hot_indicator_rule`,
+  `multi_way_and_rule`, `band_range_check_rules`, `cancel_residual_rule`,
+  `lookup_table_rules`, `multi_way_or_rules` from
+  `neural_vm/unified_compiler/building_blocks_dsl.py`. Used by every
+  layer's FFN bakes (V1-V7 migration). Tests:
+  `tests/test_building_blocks_dsl.py`. New op code MUST go through one
+  of these helpers; raw `FFNRule.constant_write` / `gated_write` calls
+  outside the DSL modules are ratcheted by
+  [`tools/lint_raw_ffn_rule.py`](tools/lint_raw_ffn_rule.py).
+  See [`docs/BUILDING_BLOCKS_DSL.md`](docs/BUILDING_BLOCKS_DSL.md) for
+  the BLOG_SPEC §504-568 → constructor mapping.
 
 Key IR types (all in `neural_vm/unified_compiler/ir.py`):
 

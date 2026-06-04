@@ -9,7 +9,33 @@ re-expressed as rule lists. The compiler is free to optimize the
 lowering — including fusing many rules into a fast composite at
 compile time — but the **source of truth** is rules.
 
-Status: **DRAFT — pending user review.**
+Status: **Waves V1-V7 DONE (2026-06-04). Lint ratchet (V9) in place.**
+
+---
+
+## 0. Wave status summary
+
+The migration is delivered in numbered waves. V1-V7 ship the
+building-blocks DSL plus per-layer FFN-bake rewrites. V8-V9 close
+out the regression machinery.
+
+| Wave | Scope | Status | Tests |
+|---|---|---|---|
+| V1  | Building-blocks DSL — `step_function_rule`, `one_hot_indicator_rule`, `multi_way_and_rule`, `band_range_check_rules`, `cancel_residual_rule`, `lookup_table_rules`, `multi_way_or_rules` | **DONE** | `tests/test_building_blocks_dsl.py` |
+| V2  | Bit/floor extensions — `magic_floor_rules`, `bit_range_extract_rules`, `opcode_expert_rules`, attention helpers (`efficient_exp_attention`, `memory_load_attention`, `fetch_byte_attention`) | **DONE** | `tests/test_building_blocks_dsl.py` |
+| V3  | Per-layer FFN bake migration (L0-L4) onto DSL helpers | **DONE** | per-layer smoke + byte-identity |
+| V4  | Per-layer FFN bake migration (L5-L9) | **DONE** | per-layer smoke + byte-identity |
+| V5  | Per-layer FFN bake migration (L10-L13) | **DONE** | per-layer smoke + byte-identity |
+| V6  | Per-layer FFN bake migration (L14-L17) | **DONE** | per-layer smoke + byte-identity |
+| V7a | Module-replacement op annotation (claims sentinels) | **DONE** | `verify_claims_static` |
+| V7b | L16 final remnants (nonstore_mem + psh_no_borrow + lea_local + stack0_cancel_lev_sp) through `multi_way_and_rule` | **DONE** | smoke |
+| V8  | Wide-ALU DSL (`wide_alu_dsl.py`) — wide add/sub/mul/div/shift/bitwise helpers | in-progress | per-stage byte-identity |
+| V9  | Raw-FFNRule lint ratchet + docs (this wave) | **DONE** | `tests/test_lint_raw_ffn_rule.py` |
+
+Raw `FFNRule.constant_write` / `gated_write` counts at V9 baseline:
+**76 calls across 9 files**, tracked in
+`tools/lint_raw_ffn_rule.py::_BASELINE`. Lint exits 1 when any
+baselined file grows or any new file appears.
 
 ---
 
