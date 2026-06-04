@@ -515,6 +515,9 @@ def _layer6_imm_fetch_route_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_imm_carry_refresh_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 IMM AX_CARRY refresh units 32..63."""
 
+    # N-way AND on opcode/marker conditions, gated by (FETCH - AX_CARRY)
+    # per nibble — refreshes AX_CARRY only where the new fetch differs
+    # from the existing carry residual.
     rules = []
     conditions = (
         ("OP_IMM", 0.2),
@@ -530,7 +533,7 @@ def _layer6_imm_carry_refresh_rules(S: float) -> tuple[FFNRule, ...]:
         ("hi", "FETCH_HI", "AX_CARRY_HI"),
     ):
         for k in range(16):
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l6_imm_carry_refresh_{band}_{k}",
                 conditions=conditions,
                 threshold=1.5,
