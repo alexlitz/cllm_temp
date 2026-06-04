@@ -44,6 +44,15 @@ def make_alu_shift_composite_ops():
             declarative_bake_fn=bake,
             declarative_authority="structural_model",
             migrated=True,
+            # Dim-ownership claims: empty. ``bake`` attaches the BD->GE
+            # stage to the shared ``_ALUShiftCompositeBuilder``; the
+            # install op below ultimately swaps ``model.blocks[13].ffn``
+            # for the assembled composite (module replacement), not
+            # per-cell ``(layer, scope, identifier, column)`` writes.
+            claims=set(),
+            # Module-replacement sentinel: dynamic verifier (Mode B) skips
+            # drift detection; static (Mode A) snapshot diffing unaffected.
+            produces={'__module_replacement': 'L13.ffn[ALUShiftComposite]'},
         smoke_tests={
             "TestSmoke32Bit::test_shl_8bit",
             "TestSmoke32Bit::test_shr_8bit",
@@ -69,6 +78,14 @@ def make_alu_shift_composite_ops():
             declarative_bake_fn=bake,
             declarative_authority="structural_model",
             migrated=True,
+            # Dim-ownership claims: empty. ``bake`` attaches the
+            # SHL/SHR sub-chunk precompute stage to the shared
+            # ``_ALUShiftCompositeBuilder``; module assembly, not
+            # per-cell writes.
+            claims=set(),
+            # Module-replacement sentinel: dynamic verifier (Mode B) skips
+            # drift detection; static (Mode A) snapshot diffing unaffected.
+            produces={'__module_replacement': 'L13.ffn[ALUShiftComposite]'},
         smoke_tests={
             "TestSmoke32Bit::test_shl_8bit",
             "TestSmoke32Bit::test_shr_8bit",
@@ -94,6 +111,14 @@ def make_alu_shift_composite_ops():
             declarative_bake_fn=bake,
             declarative_authority="structural_model",
             migrated=True,
+            # Dim-ownership claims: empty. ``bake`` attaches the
+            # shift-select stage to the shared
+            # ``_ALUShiftCompositeBuilder``; module assembly, not
+            # per-cell writes.
+            claims=set(),
+            # Module-replacement sentinel: dynamic verifier (Mode B) skips
+            # drift detection; static (Mode A) snapshot diffing unaffected.
+            produces={'__module_replacement': 'L13.ffn[ALUShiftComposite]'},
         smoke_tests={
             "TestSmoke32Bit::test_shl_8bit",
             "TestSmoke32Bit::test_shr_8bit",
@@ -125,6 +150,16 @@ def make_alu_shift_composite_ops():
             # POC ops (AX_byte0 slot). Operand reads (ALU_LO/HI, AX_CARRY_LO/HI)
             # are cross-step durables populated by upstream L7/L8 setup ops,
             # not in-step fresh residuals; consumes_fresh stays empty.
+            # Dim-ownership claims: empty. ``bake`` attaches the final
+            # GE->BD stage to the shared ``_ALUShiftCompositeBuilder``;
+            # module assembly, not per-cell ``(layer, scope, identifier,
+            # column)`` writes. The ``writes`` set above documents the
+            # OUTPUT residual dims the assembled composite touches at
+            # runtime.
+            claims=set(),
+            # Module-replacement sentinel: dynamic verifier (Mode B) skips
+            # drift detection; static (Mode A) snapshot diffing unaffected.
+            produces={'__module_replacement': 'L13.ffn[ALUShiftComposite]'},
         smoke_tests={
             "TestSmoke32Bit::test_shl_8bit",
             "TestSmoke32Bit::test_shr_8bit",
@@ -167,6 +202,15 @@ def make_alu_shift_composite_ops():
             # assembled (block.ffn = builder.composite must come after
             # ShiftGEToBDStage was attached by the getobd op's bake).
             requires={"after": "l13_alu_shift_getobd"},
+            # Dim-ownership claims: empty. ``bake`` swaps
+            # ``model.blocks[13].ffn`` for the assembled
+            # ``ALUShiftComposite`` (module replacement), not per-cell
+            # ``(layer, scope, identifier, column)`` writes. Sentinel
+            # below documents the structural effect.
+            claims=set(),
+            # Module-replacement sentinel: dynamic verifier (Mode B) skips
+            # drift detection; static (Mode A) snapshot diffing unaffected.
+            produces={'__module_replacement': 'L13.ffn[ALUShiftComposite]'},
         smoke_tests={
             "TestSmoke32Bit::test_shl_8bit",
             "TestSmoke32Bit::test_shr_8bit",
@@ -288,13 +332,19 @@ def make_l9_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
 
 
 def make_l10_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _mark_structural_declarations(
-        _make_alu_postop_attach_op(
-            "l10_alu_postop_attach", 10, "ALUAndOrXor", alu_mode,
-            same_layer_as="layer10_alu",
-            # layer10_alu binds to ``layer10_carry_relay`` (kind=attn).
-            target_op_name="layer10_carry_relay",
-        )
+    # Dim-ownership claims: empty. ``bake`` inserts an
+    # ``ALUAndOrXor`` into ``model.blocks[10].post_ops`` -- module
+    # attach. Sentinel below documents the structural effect.
+    return _annotate_module_replacement(
+        _mark_structural_declarations(
+            _make_alu_postop_attach_op(
+                "l10_alu_postop_attach", 10, "ALUAndOrXor", alu_mode,
+                same_layer_as="layer10_alu",
+                # layer10_alu binds to ``layer10_carry_relay`` (kind=attn).
+                target_op_name="layer10_carry_relay",
+            )
+        ),
+        'L10.post_ops[ALUAndOrXor]',
     )
 
 
@@ -335,13 +385,20 @@ def make_l12_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
 
 
 def make_l13_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    return _mark_structural_declarations(
-        _make_alu_postop_attach_op(
-            "l13_alu_postop_attach", 13, "ALUShift", alu_mode,
-            same_layer_as="layer13_shifts",
-            # layer13_shifts binds to ``_layer13_attn_dep_anchor``.
-            target_op_name="_layer13_attn_dep_anchor",
-        )
+    # Dim-ownership claims: empty. ``bake`` inserts an
+    # ``ALUShiftComposite`` (= ``ALUShift``) into
+    # ``model.blocks[13].post_ops`` -- module attach. Sentinel below
+    # documents the structural effect.
+    return _annotate_module_replacement(
+        _mark_structural_declarations(
+            _make_alu_postop_attach_op(
+                "l13_alu_postop_attach", 13, "ALUShift", alu_mode,
+                same_layer_as="layer13_shifts",
+                # layer13_shifts binds to ``_layer13_attn_dep_anchor``.
+                target_op_name="_layer13_attn_dep_anchor",
+            )
+        ),
+        'L13.post_ops[ALUShiftComposite]',
     )
 
 
@@ -510,6 +567,15 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         target_op_name="layer10_carry_relay",
         requires={"after": "l10_alu_divmod_install"},
         migrated=True,
+        # Dim-ownership claims: empty. ``bake`` replaces
+        # ``model.blocks[10].ffn`` with a rule-derived ``PureFFN``
+        # baked from ``bitwise_rules`` (AND/OR/XOR) -- module
+        # replacement, not per-cell ``(layer, scope, identifier,
+        # column)`` writes.
+        claims=set(),
+        # Module-replacement sentinel: dynamic verifier (Mode B) skips
+        # drift detection; static (Mode A) snapshot diffing unaffected.
+        produces={'__module_replacement': 'L10.ffn[PureFFN/bitwise_rules]'},
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",
@@ -1180,6 +1246,16 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             target_op_name="layer10_carry_relay",
             migrated=True,
             declarative_authority="structural_model",
+            # Dim-ownership claims: empty. ``bake`` attaches the BD->GE
+            # sub-FFN to the shared ``_FlattenedDivModBuilder``; the
+            # install op below ultimately appends the assembled
+            # ``FlattenedDivMod`` to ``model.blocks[10].post_ops``
+            # (module attach), not per-cell ``(layer, scope, identifier,
+            # column)`` writes.
+            claims=set(),
+            # Module-replacement sentinel: dynamic verifier (Mode B) skips
+            # drift detection; static (Mode A) snapshot diffing unaffected.
+            produces={'__module_replacement': 'L10.post_ops[FlattenedDivMod]'},
         smoke_tests={
             "TestSmokeBasic::test_div_basic",
             "TestSmokeBasic::test_mod_basic",
@@ -1207,6 +1283,14 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             target_op_name="layer10_carry_relay",
             migrated=True,
             declarative_authority="structural_model",
+            # Dim-ownership claims: empty. ``bake`` attaches the
+            # long-division pipeline to the shared
+            # ``_FlattenedDivModBuilder``; module assembly, not
+            # per-cell writes.
+            claims=set(),
+            # Module-replacement sentinel: dynamic verifier (Mode B) skips
+            # drift detection; static (Mode A) snapshot diffing unaffected.
+            produces={'__module_replacement': 'L10.post_ops[FlattenedDivMod]'},
         smoke_tests={
             "TestSmokeBasic::test_div_basic",
             "TestSmokeBasic::test_mod_basic",
@@ -1240,6 +1324,16 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             # slot per the L14 POC convention. Reads OP_DIV/OP_MOD/MARK_AX
             # are all cross-step durables (opcode/marker dims); consumes_fresh
             # stays empty.
+            # Dim-ownership claims: empty. ``bake`` attaches the final
+            # GE->BD sub-FFN to the shared
+            # ``_FlattenedDivModBuilder``; module assembly, not
+            # per-cell ``(layer, scope, identifier, column)`` writes.
+            # The ``writes`` set above documents the OUTPUT residual
+            # dims the assembled composite touches at runtime.
+            claims=set(),
+            # Module-replacement sentinel: dynamic verifier (Mode B) skips
+            # drift detection; static (Mode A) snapshot diffing unaffected.
+            produces={'__module_replacement': 'L10.post_ops[FlattenedDivMod]'},
         smoke_tests={
             "TestSmokeBasic::test_div_basic",
             "TestSmokeBasic::test_mod_basic",
@@ -1359,6 +1453,16 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             requires={"after": "l10_alu_divmod_getobd"},
             migrated=True,
             declarative_authority="structural_model",
+            # Dim-ownership claims: empty. ``bake`` appends the
+            # assembled ``FlattenedDivMod`` composite to
+            # ``model.blocks[10].post_ops`` (or, in efficient mode,
+            # installs a rule-derived ``PureFFN`` post_op from
+            # ``wide_div_rules``) -- module attach, not per-cell
+            # ``(layer, scope, identifier, column)`` writes.
+            claims=set(),
+            # Module-replacement sentinel: dynamic verifier (Mode B) skips
+            # drift detection; static (Mode A) snapshot diffing unaffected.
+            produces={'__module_replacement': 'L10.post_ops[FlattenedDivMod]'},
         smoke_tests={
             "TestSmokeBasic::test_div_basic",
             "TestSmokeBasic::test_mod_basic",
