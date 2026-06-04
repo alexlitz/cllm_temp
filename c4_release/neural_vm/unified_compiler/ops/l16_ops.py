@@ -1044,7 +1044,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("OP_LEV", -2.0),
     )
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_bp_marker_passthrough_lo_{k}",
             conditions=bp_marker_passthrough_conditions,
             threshold=1.5,
@@ -1052,7 +1052,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"OUTPUT_LO+{k}", 10.0 / S),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l16_bp_marker_passthrough_hi_{k}",
             conditions=bp_marker_passthrough_conditions,
             threshold=1.5,
@@ -1117,7 +1117,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # scope/dominates_at unset so the verifier does not audit
     # unprovable claims; the if_var FIXME above continues to document the
     # underlying nudge-vs-wide-writer pressure.
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_bp_frame_byte1_ff",
         conditions=bp_frame_byte1_ff_conditions,
         threshold=5.0,
@@ -1149,7 +1149,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -100.0),
         ("MARK_MEM", -100.0),
     )
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_bp_after_ent_byte2_zero",
         conditions=bp_after_ent_byte2_zero_conditions,
         threshold=14.5,
@@ -1197,7 +1197,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # nibble 0 to nibble 1; touching OUTPUT_HI here is unnecessary and the
     # downstream L10 carry-propagation post_op amplifies any wide writes.
     ent_initial_stack0_byte2_strength = 4.0 / S
-    rules.append(FFNRule.constant_write(
+    rules.append(multi_way_and_rule(
         name="l16_ent_initial_stack0_byte2_01",
         conditions=ent_initial_stack0_byte2_conditions,
         threshold=49.5,
