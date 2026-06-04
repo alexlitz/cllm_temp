@@ -703,7 +703,7 @@ def _convo_io_state_machine_rules(S: float) -> tuple[FFNRule, ...]:
         ("prtf", dim_ref("cmp_flag", "cascade", 5)),
         ("read", dim_ref("cmp_flag", "cascade", 6)),
     ):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"convo_io_state_machine_{flag_name}",
             conditions=((flag_dim, 1.0),),
             threshold=0.5,
