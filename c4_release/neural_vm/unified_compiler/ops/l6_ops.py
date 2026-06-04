@@ -1642,9 +1642,15 @@ def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_tail_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 opcode/MEM/ALU cleanup units 1070..1135."""
 
+    # 66-unit cleanup band:
+    #   * 32 opcode-byte cancels at MARK_AX, gated by OPCODE_BYTE_{LO,HI}+k
+    #     with gate_weight=-1, subtracting the residual into ADDR_B{0,1}_LO.
+    #   * 2 MEM_STORE/MEM_ADDR_SRC leakage cancels at stack-marker rows.
+    #   * 32 ALU clear constants (no gate) at MARK_AX, writing -10/S to
+    #     ALU_{LO,HI}+k to clear the ALU band.
     rules = []
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_opcode_lo_cleanup_{k}",
             conditions=(("MARK_AX", 1.0),),
             threshold=0.5,
@@ -1653,7 +1659,7 @@ def _layer6_tail_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"ADDR_B0_LO+{k}", 2.0 / S),),
         ))
     for k in range(16):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_opcode_hi_cleanup_{k}",
             conditions=(("MARK_AX", 1.0),),
             threshold=0.5,
@@ -1662,7 +1668,7 @@ def _layer6_tail_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"ADDR_B1_LO+{k}", 2.0 / S),),
         ))
     for dim_name in ("MEM_STORE", "MEM_ADDR_SRC"):
-        rules.append(FFNRule.gated_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_{dim_name.lower()}_leakage_cleanup",
             conditions=(
                 ("MARK_SP", 1.0),
@@ -1675,14 +1681,14 @@ def _layer6_tail_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((dim_name, 2.0 / S),),
         ))
     for k in range(16):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_alu_lo_clear_{k}",
             conditions=(("MARK_AX", 1.0),),
             threshold=0.5,
             writes=((f"ALU_LO+{k}", -10.0 / S),),
         ))
     for k in range(16):
-        rules.append(FFNRule.constant_write(
+        rules.append(multi_way_and_rule(
             name=f"l6_alu_hi_clear_{k}",
             conditions=(("MARK_AX", 1.0),),
             threshold=0.5,
