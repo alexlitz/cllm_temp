@@ -650,7 +650,7 @@ def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
         for b in range(16):
             if a >= b:
                 continue
-            rules.append(FFNRule.gated_write(
+            rules.append(multi_way_and_rule(
                 name=f"l8_alu_sub_borrow_a{a}_b{b}",
                 conditions=(
                     ("MARK_AX", 1.0),
