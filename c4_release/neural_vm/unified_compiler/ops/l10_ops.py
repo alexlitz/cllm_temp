@@ -3541,7 +3541,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         """
 
         return (
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_stack0_pushed_addr_byte1_ff_after_e8",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -3573,7 +3573,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 threshold=85.0,
                 writes=byte_writes(0xFF, strength=5000.0),
             ),
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_stack0_pushed_addr_byte1_store_ff_after_e8",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -3608,7 +3608,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 threshold=108.0,
                 writes=byte_writes(0xFF, strength=5000.0),
             ),
-            FFNRule.constant_write(
+            multi_way_and_rule(
                 name="tail_stack0_pushed_addr_byte1_store_ff_after_e0",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
@@ -3660,7 +3660,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             lo = value & 0xF
             hi = value >> 4
             rules.append(
-                FFNRule.constant_write(
+                multi_way_and_rule(
                     name=f"tail_ax_lea_local_addr_byte1_ff_after_{value:02x}",
                     scope="is_byte",
                     dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
