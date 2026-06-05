@@ -497,17 +497,37 @@ def _layer6_imm_fetch_route_rules(S: float) -> tuple[FFNRule, ...]:
         ("IS_BYTE", -10.0),
     )
     write_scale = 2.0 / S
+    # Predicate-DSL scope for the 16 HI rules. The rule fires at the
+    # AX-marker row during OP_IMM, routing the FETCH_HI+k one-hot into
+    # OUTPUT_HI_THIS_STEP+k. ``mark == AX AND opcode_at_AX == IMM`` is
+    # the intended firing region; it is entailed by the F-5 effective
+    # predicate (positive MARK_AX + OP_IMM contributions + FETCH_HI gate
+    # semantics), so verify_rule_scopes accepts it. dominates_at on
+    # OUTPUT_HI_THIS_STEP gives verify_rule_strength the signal it needs
+    # to compare these writes against L8 multibyte_routing / L10 tail
+    # rules / L14 cleanup writers in the same dim+offset column. (LO
+    # band intentionally left unannotated for now — only the HI band is
+    # implicated by the L6 EQ(17)/EQ(42) failure mode per
+    # docs/L6_EQ_VERIFIER_BLIND_2026_06_04.md.)
+    hi_scope = "mark == AX AND opcode_at_AX == IMM"
     for band, source_base, output_base in (
         ("lo", "FETCH_LO", "OUTPUT_LO"),
         ("hi", "FETCH_HI", "OUTPUT_HI_THIS_STEP"),
     ):
         for k in range(16):
+            extra_kwargs = {}
+            if band == "hi":
+                extra_kwargs["scope"] = hi_scope
+                extra_kwargs["dominates_at"] = {
+                    "OUTPUT_HI_THIS_STEP": hi_scope,
+                }
             rules.append(multi_way_and_rule(
                 name=f"l6_imm_fetch_to_output_{band}_{k}",
                 conditions=conditions,
                 threshold=4.0,
                 gate=f"{source_base}+{k}",
                 writes=((f"{output_base}+{k}", write_scale),),
+                **extra_kwargs,
             ))
     return tuple(rules)
 
