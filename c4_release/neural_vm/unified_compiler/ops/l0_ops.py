@@ -372,7 +372,14 @@ def make_layer0_threshold_attn_dep_anchor_op() -> Operation:
         # graph places this anchor at L0. With no upstream writers for
         # IS_MARK / CONST (both set by token embedding pre-L0), the
         # earliest landable layer is 0.
-        reads={"IS_MARK", "CONST"},
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the MARK_* dims each threshold head reads via ``bd.MARKS`` (V
+        # slot 1+m reads MARKS[m] for m=0..6 = MARK_PC, MARK_AX, MARK_SP,
+        # MARK_BP, MARK_MEM, MARK_SE, MARK_CS). Previously only IS_MARK
+        # + CONST were declared (Q/K gates).
+        reads={"IS_MARK", "CONST",
+               "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+               "MARK_MEM", "MARK_SE", "MARK_CS"},
         writes={"H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"},
         kind="attn",
         migrated=True,
@@ -464,7 +471,14 @@ def make_layer0_threshold_attn_op() -> Operation:
         # Phase 11.A r3: dropped phase=0 — co-placement at
         # ``_layer0_threshold_attn_dep_anchor`` + explicit
         # ``requires['after']`` on the anchor already pin fire order.
-        reads={"IS_MARK", "CONST"},
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the MARK_* dims each threshold head reads via ``bd.MARKS`` (V
+        # slot 1+m reads MARKS[m] for m=0..6 = MARK_PC, MARK_AX, MARK_SP,
+        # MARK_BP, MARK_MEM, MARK_SE, MARK_CS). Previously only IS_MARK
+        # + CONST were declared (Q/K gates).
+        reads={"IS_MARK", "CONST",
+               "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+               "MARK_MEM", "MARK_SE", "MARK_CS"},
         writes={"H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7"},
         kind="block",
         # Phase 8.G.6: drop ``layer_idx=0`` literal; bind to the L0 attn
