@@ -428,6 +428,17 @@ def make_layer13_attn_dep_anchor_op() -> Operation:
         # `layer_idx=13` alone breaks `l13_alu_shift_install` (composite
         # stages at L17-L20 bake AFTER install at L13). Pin the 4
         # composite stages to L13 too before re-trying.
+        # 2026-06-05 follow-up: Option A attempted in worktree
+        # `memory-fix` (commit-prep) — added ``layer_idx=13`` here and
+        # to all 4 ``l13_alu_shift_*`` stages. The dep validator
+        # complains that ``layer16_lev_routing`` writes ALU_LO at L16,
+        # which the SSA `.*.-1` alias suppresses; but pinning the
+        # stages to L13 causes a runtime shape mismatch
+        # ``mat1 (264x800) and mat2 (512x1536)`` at every test —
+        # see SMOKE_MEMORY_FIX_ATTEMPT_20260605.md. The L13.ffn
+        # right-sizing pass doesn't accommodate the 4 efficient-mode
+        # stages co-located with the lookup-mode FFN. Option A needs
+        # ffn_widths plumbing before it's viable; reverted.
         phase=13.0,
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC",
