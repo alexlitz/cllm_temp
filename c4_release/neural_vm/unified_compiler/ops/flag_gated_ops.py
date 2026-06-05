@@ -348,8 +348,14 @@ def make_tool_call_relay_head_op(enable_tool_calling: bool = False) -> Operation
 
     return Operation(
         name="tool_call_relay_head",
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the baked reads (Q/K/V cols) and writes (O row) from
+        # ``_tool_call_relay_head_spec``. Bake body is a no-op when
+        # ``enable_tool_calling=False`` but the declarations stay valid
+        # so the liveness analysis treats them as touched when the flag
+        # is enabled.
+        reads={"NEXT_SE", "MARK_AX", "IO_IS_TOOL_CALL"},
+        writes={"CMP"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
         # at default ``enable_tool_calling=False``. The flag-on branch
         # rewires L6 attn head 5 (relay head) — semantically reads/writes
@@ -448,8 +454,12 @@ def make_convo_io_relay_heads_op(enable_conversational_io: bool = False) -> Oper
     return Operation(
         name="convo_io_relay_heads",
         phase=999.5,
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the baked reads (Q/K/V cols) and writes (O row) from
+        # ``_convo_io_relay_head_specs`` (heads 4 + 5).
+        reads={"NEXT_SE", "MARK_AX", "ACTIVE_OPCODE_PRTF",
+               "IO_IS_PRTF", "IO_IS_READ"},
+        writes={"CMP"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
         # at default ``enable_conversational_io=False``. The flag-on branch
         # programs attention relay heads (K/V matrices), not residual dims,
@@ -1402,8 +1412,21 @@ def make_convo_io_prtf_transport_op(
 
     return Operation(
         name="convo_io_prtf_transport",
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the baked reads (Q/K/V columns) and writes (O rows) from
+        # ``_convo_io_prtf_transport_spec`` (L4 attn head 4). The
+        # POST_PRTF_PC_LO/HI / POST_PRTF_SP_LO/HI dims used in the spec
+        # alias AX_FULL_LO/HI and AX_CARRY_LO/HI (see vm_step.py:2524ff);
+        # the LayerCompiler only knows the base names so we declare via
+        # those. Bake body is a no-op when ``enable_conversational_io
+        # and enable`` is False but declarations are valid for the
+        # flag-on case.
+        reads={"LAST_WAS_THINKING_START", "CONST",
+               "ACTIVE_OPCODE_PRTF", "MARK_AX",
+               "AX_FULL_LO", "AX_FULL_HI",
+               "AX_CARRY_LO", "AX_CARRY_HI"},
+        writes={"AX_FULL_LO", "AX_FULL_HI",
+                "AX_CARRY_LO", "AX_CARRY_HI"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Bake body is a no-op
         # at the default double-flag ``False`` config. Conditional
         # produces population is left to the IR-on follow-up because the
