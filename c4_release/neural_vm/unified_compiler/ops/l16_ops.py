@@ -211,6 +211,20 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # materializers above (l16_stale_imm_ax_carry_* / l16_store_ax_carry_*),
     # but key on OP_LEV so the SP/PC LEV-routing rules above (which cancel at
     # MARK_SP / MARK_PC and do not touch MARK_AX) remain orthogonal.
+    #
+    # 2026-06-04 multicluster fix: per
+    # docs/MULTICLUSTER_ATTRIBUTION_2026_06_04.md, this AX-carry materializer
+    # is the dominant carrier of the step0:AX_byte0 leak on programs whose
+    # first IMM operand has both nibbles nonzero (add_3 0xe4->0x01,
+    # if_gt_10 0x08->0xe8). LEV has no semantic role on step 0 because no
+    # ENT has run; the rule's intended firing window starts at step >= 1.
+    # Apply the BZ step-0 guard pattern (commits 877335ae / 4e98cfad):
+    # require HAS_SE=1 to fire by adding +10 step0_guard_weight and bumping
+    # the threshold by the same amount.  HAS_SE=0 on step 0 starves the
+    # rule below threshold; HAS_SE=1 on step >= 1 preserves the original
+    # firing margin so the step-6 AX_byte0 return-value materialization
+    # still works.  HAS_SE already declared in the op's reads set.
+    step0_guard_weight = 10.0
     lev_ax_carry_conditions = (
         ("OP_LEV", 1.0),
         ("MARK_AX", 1.0),
@@ -222,12 +236,13 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("IS_BYTE", -10.0),
         ("OP_EXIT", -20.0),
         ("OP_JMP", -20.0),
+        ("HAS_SE", step0_guard_weight),
     )
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_lev_ax_carry_lo_{k}",
             conditions=lev_ax_carry_conditions,
-            threshold=1.5,
+            threshold=1.5 + step0_guard_weight,
             gate=f"AX_CARRY_LO+{k}",
             writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
         ))
@@ -235,7 +250,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         rules.append(multi_way_and_rule(
             name=f"l16_lev_ax_carry_hi_{k}",
             conditions=lev_ax_carry_conditions,
-            threshold=1.5,
+            threshold=1.5 + step0_guard_weight,
             gate=f"AX_CARRY_HI+{k}",
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
