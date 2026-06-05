@@ -1336,7 +1336,10 @@ def make_layer9_lev_addr_relay_op() -> Operation:
 
     return Operation(
         name="layer9_lev_addr_relay",
-        reads={"MARK_SP", "OP_LEV", "L1H1", "BYTE_INDEX_0",
+        # Declaration audit (2026-06-05): added CONST -- the GATE Q slot
+        # _layer9_lev_addr_relay_head_spec uses on Q[33, BD.CONST] /
+        # K[33, BD.CONST] / Q[0, BD.CONST] gating writes.
+        reads={"MARK_SP", "OP_LEV", "L1H1", "BYTE_INDEX_0", "CONST",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
@@ -1407,8 +1410,11 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
 
     return Operation(
         name="layer9_lev_bp_to_pc_relay",
+        # Declaration audit (2026-06-05): added CONST -- the GATE Q slot
+        # _layer9_lev_bp_to_pc_relay_head_spec uses on Q[33, BD.CONST] /
+        # K[33, BD.CONST] / Q[0, BD.CONST] gating writes.
         reads={"MARK_PC", "OP_LEV", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "L1H1", "BYTE_INDEX_0"},
+               "L1H1", "BYTE_INDEX_0", "CONST"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
         declarative_bake_fn=bake,
