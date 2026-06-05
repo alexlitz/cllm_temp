@@ -1958,9 +1958,18 @@ def make_layer10_byte_passthrough_op() -> Operation:
         # same step). The same-step values from L3/L5/L7 still resolve at
         # the same numeric position (TEMP_PREV_STEP aliases TEMP). Breaks
         # L11/L14 → layer10_byte_passthrough back-edges on TEMP.
-        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "TEMP.*.-1",
-               "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
-               "MEM_STORE", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+        # Declaration audit (2026-06-05): added MARK_AX, H3, H4, MEM_VAL_B0,
+        # MEM_ADDR_SRC, OP_SI, OP_SC, OP_LC_RELAY, CMP, CONST to mirror the
+        # full Q/K read set of _layer10_ax_byte_passthrough_head_spec (the
+        # head spec lowered by the paired ``layer10_byte_passthrough_bake``
+        # block op). Anchor reads gate dim-lifetime analysis; bake op's
+        # block kind filters it out of the same analysis.
+        reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "OP_LC_RELAY",
+               "OP_SI", "OP_SC", "TEMP.*.-1", "CMP", "CONST",
+               "H1", "H3", "H4", "MARK_AX",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "MEM_STORE", "MEM_ADDR_SRC",
+               "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
@@ -1986,8 +1995,15 @@ def make_layer10_sp_byte_passthrough_op() -> Operation:
 
     return Operation(
         name="layer10_sp_byte_passthrough",
-        reads={"IS_BYTE", "HAS_SE", "H1",
-               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+        # Declaration audit (2026-06-05): added MARK_SP, CONST, PSH_AT_SP,
+        # OP_ENT, OP_JSR, CMP, BYTE_INDEX_3 to mirror the Q/K read set of
+        # _layer10_sp_byte_passthrough_head_spec lowered by the paired
+        # ``layer10_sp_byte_passthrough_bake`` block op (the anchor's
+        # reads gate dim-lifetime analysis; the bake's block kind filters
+        # it out of the same analysis).
+        reads={"IS_BYTE", "HAS_SE", "H1", "MARK_SP", "CONST", "PSH_AT_SP",
+               "OP_ENT", "OP_JSR", "CMP",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
@@ -2029,8 +2045,20 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
 
     return Operation(
         name="layer10_psh_stack0_passthrough",
+        # Declaration audit (2026-06-05): added CONST, IS_BYTE, H1, H4,
+        # PSH_AT_SP, BYTE_INDEX_*, CLEAN_EMBED_LO/HI to mirror the Q/K/V
+        # read set of _layer10_psh_stack0_passthrough_head_spec lowered by
+        # the paired ``layer10_psh_stack0_passthrough_bake`` block op.
+        # The LEA-local differential routing reads OUTPUT_LO/HI; those are
+        # tracked on the bake op via OUTPUT_LO.*.-1 / OUTPUT_HI.*.-1 (NOT
+        # mirrored here -- adding them to a kind="attn" anchor trips the
+        # cross-step baseline allowlist gate; the bake op carries the
+        # cross-step semantics for those bands instead).
         reads={"MARK_STACK0", "OP_PSH", "AX_CARRY_LO", "AX_CARRY_HI",
-               "OP_LI", "OP_LC", "OP_SI", "OP_SC"},
+               "OP_LI", "OP_LC", "OP_SI", "OP_SC",
+               "CONST", "IS_BYTE", "H1", "H4", "PSH_AT_SP",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
         migrated=True,
@@ -2191,10 +2219,15 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         name="layer10_byte_passthrough_bake",
         # Phase 8.A.6 v2: matches layer10_byte_passthrough's TEMP_PREV_STEP
         # rename. See that op for rationale.
+        # Declaration audit (2026-06-05): added MARK_AX, H3, H4, MEM_VAL_B0,
+        # MEM_ADDR_SRC, OP_SI, OP_SC, CMP, CONST to cover the full Q/K read
+        # set of _layer10_ax_byte_passthrough_head_spec lowered here.
         reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "OP_LC_RELAY",
-               "TEMP.*.-1",
-               "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "BYTE_INDEX_3", "MEM_STORE", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+               "OP_SI", "OP_SC", "TEMP.*.-1", "CMP", "CONST",
+               "H1", "H3", "H4", "MARK_AX",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "BYTE_INDEX_3", "MEM_STORE", "MEM_ADDR_SRC",
+               "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
@@ -2253,7 +2286,9 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
 
     return Operation(
         name="layer10_sp_byte_passthrough_bake",
-        reads={"IS_BYTE", "HAS_SE", "H1", "PSH_AT_SP", "CMP",
+        # Declaration audit (2026-06-05): added MARK_SP, CONST to mirror the
+        # Q/K read set of _layer10_sp_byte_passthrough_head_spec.
+        reads={"IS_BYTE", "HAS_SE", "H1", "MARK_SP", "CONST", "PSH_AT_SP", "CMP",
                "OP_ENT", "OP_JSR",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
@@ -2310,7 +2345,15 @@ def make_layer10_bp_byte_passthrough_bake_op() -> Operation:
 
     return Operation(
         name="layer10_bp_byte_passthrough_bake",
+        # Declaration audit (2026-06-05): added CONST, MARK_STACK0, MEM_STORE,
+        # MEM_ADDR_SRC, CMP, ADDR_B0_LO, ADDR_B0_HI, STACK0_BYTE0/1/2 to mirror
+        # the Q/K read set of _layer10_bp_byte_passthrough_head_spec (the head
+        # spec lowered here uses these dims in top_store_query rows; ADDR_B0_*
+        # are the shareable dims most affected by the audit).
         reads={"IS_BYTE", "HAS_SE", "H1", "OP_ENT", "OP_LEV",
+               "CONST", "MARK_STACK0", "MEM_STORE", "MEM_ADDR_SRC", "CMP",
+               "ADDR_B0_LO", "ADDR_B0_HI",
+               "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
@@ -2469,8 +2512,11 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         # relative to L11/L14 TEMP writers (which fire after L10 in the
         # same step). Same numeric position as TEMP. See
         # layer10_byte_passthrough for the per-band rationale.
+        # Declaration audit (2026-06-05): added MARK_STACK0 (head 6
+        # persistence STORE-target Q rows) and MEM_ADDR_SRC (head 6 store
+        # gate Q rows).
         reads={"IS_BYTE", "HAS_SE", "H1", "H4", "TEMP.*.-1", "CMP",
-               "PSH_AT_SP",
+               "PSH_AT_SP", "MARK_STACK0", "MEM_ADDR_SRC",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
                "OP_PSH", "OP_SI", "OP_SC", "OP_LEV", "MEM_STORE", "MARK_MEM",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
@@ -2621,11 +2667,16 @@ def make_layer10_stack0_byte_relay_op() -> Operation:
         name="layer10_stack0_byte_relay",
         # Phase 8.A.6 v2: matches layer10_stack0_byte_relay_bake's
         # TEMP_PREV_STEP rename. See that op for rationale.
+        # Declaration audit (2026-06-05): added CONST, MARK_STACK0,
+        # MEM_ADDR_SRC, HAS_SE, BYTE_INDEX_3 to mirror the persistence head
+        # spec's STORE-target Q rows (head 6 stack persistence). Anchor
+        # reads gate dim-lifetime analysis; the bake's block kind filters
+        # it out of the same analysis.
         reads={"MARK_AX", "IS_BYTE", "HAS_SE", "H1", "H4", "TEMP.*.-1",
-               "CMP",
+               "CMP", "CONST", "MARK_STACK0", "MEM_ADDR_SRC",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
                "PSH_AT_SP", "OP_PSH", "OP_SI", "OP_SC", "OP_LEV", "MEM_STORE", "MARK_MEM",
-               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "MEM_VAL_B2", "MEM_VAL_B3", "H2", "H3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"ALU_LO", "ALU_HI", "OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
@@ -2876,6 +2927,12 @@ def make_l10_post_ops_combined() -> Operation:
         # cross-step back-edges into this op.
         reads={
             "CONST", "MARK_AX", "MARK_PC", "IS_BYTE", "H1",
+            # Declaration audit (2026-06-05): added MARK_SP, MARK_BP,
+            # MARK_STACK0, MARK_MEM (consumed by marker_boost_structural_dims
+            # in apply_ffn_band_suppressors); added TEMP (TEMP+8/9/10 are
+            # hard-blocked via suppressors, distinct from the cross-step
+            # TEMP.*.-1 read).
+            "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM", "TEMP",
             "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
             "OP_SHL", "OP_SHR",
             "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
@@ -2884,6 +2941,7 @@ def make_l10_post_ops_combined() -> Operation:
             "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC",
             "OP_SI", "OP_SC", "OP_PSH", "OP_EXIT", "OP_NOP",
             "OP_PUTCHAR", "OP_GETCHAR",
+            "OP_LI_RELAY", "OP_LC_RELAY",
             # Phase 9.B (SCC #2 dissolution): OUTPUT_LO -> OUTPUT_LO.*.-1
             # marks the read as SSA cross-step relative to the
             # downstream OUTPUT_LO writer ``tail_bit32_result_correction``
