@@ -223,6 +223,12 @@ def all_core_ops(
             enable_conversational_io=enable_conversational_io
         ),
         make_layer10_carry_relay_op(),
+        # Phase 3 (mem cluster fix): sibling attn-side anchor for L10.
+        # Decouples the 6 L10 attn-bake ops from ``layer10_carry_relay``
+        # (which historically anchored both attn + ffn families). See
+        # the docstring on ``make_layer10_attn_anchor_op`` and
+        # ``docs/MEMORY_PHASE2_BLOCKER_2026_06_05.md``.
+        make_layer10_attn_anchor_op(),
         make_layer10_byte_passthrough_op(),
         make_layer10_sp_byte_passthrough_op(),
         make_layer10_psh_stack0_passthrough_op(),

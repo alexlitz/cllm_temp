@@ -1919,6 +1919,24 @@ def make_layer10_carry_relay_op() -> Operation:
 
     The actual weight bake is owned by ``layer10_carry_relay_bake`` below,
     pinned to ``model.blocks[10].attn``.
+
+    Phase 3 (mem cluster fix) anchor split note: this anchor historically
+    served BOTH the L10 attn-bake family (head_0/1/2/3/7 + stack0 relays)
+    AND the L10 FFN family (``layer10_alu``, ``l10_post_op_attach``, divmod
+    stages, the efficient andorxor wrap, etc.). The two families therefore
+    could not migrate to different physical layers independently — pinning
+    this anchor moved the 1846-unit ``layer10_alu`` FFN alongside, blowing
+    the L10 FFN budget. Phase 3 split the attn family off to a sibling
+    anchor ``_layer10_attn_anchor`` (added below). The 6 attn-bake ops
+    (``layer10_carry_relay_bake``, ``layer10_byte_passthrough_bake``,
+    ``layer10_sp_byte_passthrough_bake``,
+    ``layer10_psh_stack0_passthrough_bake``,
+    ``layer10_stack0_byte_relay_bake``,
+    ``layer10_bp_byte_passthrough_bake``) now target the new attn anchor;
+    this ``layer10_carry_relay`` anchor retains the FFN-side scheduling
+    role (``layer10_alu`` + downstream post_op / wrap consumers still bind
+    to it via ``target_op_name``). See
+    ``docs/MEMORY_PHASE2_BLOCKER_2026_06_05.md`` for the why.
     """
     def bake(attn, dim_positions, S):
         return None
@@ -1939,6 +1957,17 @@ def make_layer10_carry_relay_op() -> Operation:
         reads={"MARK_AX", "IS_BYTE", "H1", "CARRY.*.-1"},
         writes={"CARRY"},  # broadcast
         kind="attn",
+        # Phase 3 (mem cluster fix, 2026-06-05): explicit ``phase=10.0``
+        # so the sibling ``_layer10_attn_anchor`` (added in Phase 3) can
+        # share this same (layer, kind="attn") slot via the layer
+        # assignment's "same phase, share" branch
+        # (``_assign_layers``, layer_compiler.py:~2132). Without the
+        # shared phase the slot tracker would push the second attn
+        # anchor to the next layer and break byte-identity. The numeric
+        # value is arbitrary — any non-None value the two anchors agree
+        # on works; 10.0 matches the historical "L10 phase=10 baseline"
+        # in the docstrings of ``layer10_alu`` &c.
+        phase=10.0,
         migrated=True,
         declarative_authority="topology_anchor",
         # Phase 11.A IR exposure: empty IR makes the bake noop explicit and
@@ -1951,6 +1980,84 @@ def make_layer10_carry_relay_op() -> Operation:
         # forces ``earliest = L9 + 1 = L10``. L10 block ops then bind to
         # this anchor's resolved layer via ``target_op_name``.
         requires={"after": "layer9_marker_suppress"},
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def make_layer10_attn_anchor_op() -> Operation:
+    """L10 attn-side layer anchor (Phase 3 mem cluster fix).
+
+    Sibling of ``layer10_carry_relay`` (above). The historical
+    ``layer10_carry_relay`` anchor co-served the L10 attn family AND the
+    L10 FFN family because every L10 bake (attn or FFN) used the same
+    ``target_op_name="layer10_carry_relay"``. The
+    ``MEMORY_PHASE2_BLOCKER_2026_06_05.md`` analysis identified this
+    coupling as the prerequisite blocker for Phase 2 (decoupling
+    ``layer10_alu`` from the attn family so the attn cluster could move
+    layers without dragging the 1846-unit FFN alongside).
+
+    This anchor's only role is to give the 6 L10 attn-bake ops a stable
+    ``target_op_name`` that resolves to L10 (via the same
+    ``requires["after"]: layer9_marker_suppress`` chain as
+    ``layer10_carry_relay``) but is independent of the FFN family. As a
+    ``declarative_authority="topology_anchor"`` op it writes no weights;
+    the slot registry derives no slot claims for it (per
+    ``slot_registry.derive_slot_ids_for_op`` — topology anchors return
+    early). Two attn anchors at the same layer are therefore admissible.
+
+    Consumers (target_op_name="_layer10_attn_anchor"):
+      - ``layer10_carry_relay_bake`` (attn head 0)
+      - ``layer10_byte_passthrough_bake`` (attn head 1)
+      - ``layer10_sp_byte_passthrough_bake`` (attn head 2)
+      - ``layer10_psh_stack0_passthrough_bake`` (attn head 3)
+      - ``layer10_bp_byte_passthrough_bake`` (attn head 7)
+      - ``layer10_stack0_byte_relay_bake`` (attn heads 4/5/6)
+
+    Consumers NOT moved (remain on ``layer10_carry_relay``):
+      - ``layer10_alu`` (FFN bake, 1846 units)
+      - ``l10_post_op_attach`` (block.post_ops attach)
+      - ``l10_alu_postop_attach`` (block.post_ops attach)
+      - ``l10_alu_divmod_{bdtoge,longdiv,getobd,install}`` (DivMod stages)
+      - ``efficient_l10_andorxor_wrap`` (block.ffn replacement)
+      - ``null_terminator_detection`` (L10 FFN convo-IO unit)
+    """
+    def bake(attn, dim_positions, S):
+        return None
+
+    return Operation(
+        name="_layer10_attn_anchor",
+        # Mirrors ``layer10_carry_relay``'s read/write semantics — same
+        # MARK_AX gate, same CARRY-relay SSA cross-step rename — so the
+        # dep graph treats the two anchors symmetrically.
+        reads={"MARK_AX", "IS_BYTE", "H1", "CARRY.*.-1"},
+        writes={"CARRY"},
+        kind="attn",
+        # Phase 3 (mem cluster fix, 2026-06-05): shared explicit phase
+        # with ``layer10_carry_relay`` (the sibling FFN-side anchor) so
+        # both anchors co-resolve to the same physical layer via the
+        # layer assignment's "same phase, share" branch
+        # (``_assign_layers``, layer_compiler.py:~2132). Without this the
+        # slot tracker would bump the second attn anchor to the next
+        # layer — the 6 attn-bake ops would then land at a different
+        # block than ``layer10_alu``'s FFN bake, inverting the L10 attn-
+        # before-ffn execution order. The Phase 4 retry of Phase 2 will
+        # drop this constraint when relocating the attn family to a
+        # non-L10 attn-free layer.
+        phase=10.0,
+        migrated=True,
+        declarative_authority="topology_anchor",
+        compiler_ir=CompilerIR(),
+        # ``same_layer_as: layer10_carry_relay`` is a defensive belt-and-
+        # suspenders: the explicit ``phase=10.0`` is what makes the slot
+        # tracker share the layer, but ``same_layer_as`` raises a
+        # structured error rather than silently corrupting placement if a
+        # future refactor changes the slot-share predicate. Drop both
+        # together when retargeting the attn family.
+        requires={
+            "after": "layer9_marker_suppress",
+            "same_layer_as": "layer10_carry_relay",
+        },
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
@@ -2170,10 +2277,15 @@ def make_layer10_carry_relay_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_carry_relay_ir,
-        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
-        # binds this block op to the layer of ``layer10_carry_relay``
-        # (kind="attn", L10 anchor pinned via ``requires["after"]: layer9_alu``).
-        target_op_name="layer10_carry_relay",
+        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
+        # ``layer10_carry_relay`` to the new sibling
+        # ``_layer10_attn_anchor`` so the L10 attn family can migrate
+        # layers independently of the L10 FFN family (``layer10_alu`` &c
+        # still bind to ``layer10_carry_relay``). Both anchors resolve to
+        # L10 today via the same ``requires["after"]:
+        # layer9_marker_suppress`` chain — this change is metadata-only.
+        # See ``docs/MEMORY_PHASE2_BLOCKER_2026_06_05.md``.
+        target_op_name="_layer10_attn_anchor",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2248,11 +2360,12 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_byte_passthrough_ir,
-        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
-        # binds this block op to the layer of ``layer10_carry_relay``
-        # (kind="attn", L10 anchor pinned via
-        # ``requires["after"]: layer9_marker_suppress``).
-        target_op_name="layer10_carry_relay",
+        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
+        # ``layer10_carry_relay`` to ``_layer10_attn_anchor`` (the new
+        # attn-only sibling anchor). Both resolve to L10 today; the split
+        # lets a future Phase 2 retry move the attn family to a non-L10
+        # layer without dragging ``layer10_alu`` (1846 FFN units) along.
+        target_op_name="_layer10_attn_anchor",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2311,10 +2424,11 @@ def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_sp_byte_passthrough_ir,
-        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
-        # binds this block op to the layer of ``layer10_carry_relay``
-        # (kind="attn", L10 anchor).
-        target_op_name="layer10_carry_relay",
+        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
+        # ``layer10_carry_relay`` to ``_layer10_attn_anchor`` (the new
+        # attn-only sibling anchor). Metadata-only at L10 today; enables
+        # the future Phase 2 retry to separate attn and FFN families.
+        target_op_name="_layer10_attn_anchor",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2375,10 +2489,10 @@ def make_layer10_bp_byte_passthrough_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_bp_byte_passthrough_ir,
-        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
-        # binds this block op to the layer of ``layer10_carry_relay``
-        # (kind="attn", L10 anchor).
-        target_op_name="layer10_carry_relay",
+        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
+        # ``layer10_carry_relay`` to ``_layer10_attn_anchor`` (the new
+        # attn-only sibling anchor). Metadata-only at L10 today.
+        target_op_name="_layer10_attn_anchor",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2456,10 +2570,10 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_psh_stack0_passthrough_ir,
-        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
-        # binds this block op to the layer of ``layer10_carry_relay``
-        # (kind="attn", L10 anchor).
-        target_op_name="layer10_carry_relay",
+        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
+        # ``layer10_carry_relay`` to ``_layer10_attn_anchor`` (the new
+        # attn-only sibling anchor). Metadata-only at L10 today.
+        target_op_name="_layer10_attn_anchor",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -2541,10 +2655,10 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer10_stack0_byte_relay_ir,
-        # Phase 8.A.4 retry: layer_idx=10 literal dropped. ``target_op_name``
-        # binds this block op to the layer of ``layer10_carry_relay``
-        # (kind="attn", L10 anchor).
-        target_op_name="layer10_carry_relay",
+        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
+        # ``layer10_carry_relay`` to ``_layer10_attn_anchor`` (the new
+        # attn-only sibling anchor). Metadata-only at L10 today.
+        target_op_name="_layer10_attn_anchor",
         migrated=True,
         declarative_authority="spec_generated",
         claims=_claims,
@@ -6489,8 +6603,19 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # nibble 0x_8/0x_F. Adding MEM_ADDR_SRC as a positive predicate
                 # distinguishes real LEA-byte-evaluation steps (where the
                 # address-byte source is live) from IMM dispatch rows (where
-                # it is not). Raises the firing threshold to ~14; only real
-                # LEA crosses it.
+                # it is not).
+                #
+                # 2026-06-05 refinement (this commit): the original raise
+                # threshold=9 -> 14 over-shot. Max possible positive sum =
+                # 1+1+1+1+2+0.2+5 = 10.2, so threshold=14 is mathematically
+                # unreachable; the rule was effectively disabled (residual
+                # probe at L34 FFN input confirmed sum=1.0 at every MARK_AX
+                # position for LEA_BASIC and XOR_BASIC -- only MARK_AX itself
+                # contributes). Drop to threshold=7 so real LEA byte-0 emit
+                # (legacy positives ~5.2 + MEM_ADDR_SRC*5 = ~10.2) crosses,
+                # while spurious IMM rows (legacy positives only, ~5.2 max
+                # absent MEM_ADDR_SRC) stay below. See
+                # tools/l10_tail_lea_residual_probe.py for the probe.
                 ("MEM_ADDR_SRC", 5.0),
                 ("IS_BYTE", -10.0),
                 ("MARK_PC", -10000.0),
@@ -6499,7 +6624,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_STACK0", -10000.0),
                 ("MARK_MEM", -10000.0),
             ),
-            threshold=14.0,
+            threshold=7.0,
             writes=byte_writes(0xE8, strength=1_000_000.0),
         ),
         multi_way_and_rule(

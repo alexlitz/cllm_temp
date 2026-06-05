@@ -1247,6 +1247,15 @@ CROSS_STEP_DOCUMENTED_SAFE: Dict[Tuple[str, str], str] = {
         "Actual bake lives in ``layer10_carry_relay_bake``; this "
         "anchor's CARRY.*.-1 read sizes the dep-graph slot but emits "
         "no weight rows. The ``_bake`` sibling stays in BASELINE.",
+    ('_layer10_attn_anchor', 'CARRY.*.-1'):
+        "Phase 3 (mem cluster fix, 2026-06-05) sibling topology anchor "
+        "for the L10 attn family: "
+        "``declarative_authority='topology_anchor'`` + empty "
+        "``CompilerIR()``; ``bake_fn`` body is ``return None`` (see "
+        "ops/l10_ops.py ``make_layer10_attn_anchor_op``). Mirrors "
+        "``layer10_carry_relay``'s CARRY.*.-1 read (decoupled from the "
+        "L10 FFN family — see docs/MEMORY_PHASE2_BLOCKER_2026_06_05.md). "
+        "The anchor sizes the dep-graph slot but emits no weight rows.",
     ('layer10_stack0_byte_relay', 'TEMP.*.-1'):
         "Topology anchor for L10 stack byte relays: "
         "``declarative_authority='topology_anchor'`` + empty "
