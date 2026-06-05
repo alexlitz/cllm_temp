@@ -218,9 +218,16 @@ def make_layer4_pc_relay_op() -> Operation:
         # op into the giant SCC. The alias maps to the same numeric dim
         # position (see ``ops/shared.py:_ALIAS_OF``) so baked weight cells
         # are byte-identical.
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit —
+        #   * head 1 Q reads ``IS_BYTE`` and ``H1`` (AX byte gate, slot 0);
+        #   * head 1 O writes ``TEMP`` slots 0..31 (PC EMBED nibbles → TEMP
+        #     at AX byte positions).
+        # Both were baked via ``_layer4_pc_relay_head_specs`` but missing
+        # from this op's reads/writes.
         reads={"MARK_PC", "MARK_AX", "EMBED_LO", "EMBED_HI",
-               "ADDR_KEY.*.-1", "CONST"},
-        writes={"EMBED_LO", "EMBED_HI", "ADDR_KEY"},  # at AX marker/bytes
+               "ADDR_KEY.*.-1", "CONST", "IS_BYTE", "H1"},
+        writes={"EMBED_LO", "EMBED_HI", "ADDR_KEY",  # at AX marker/bytes
+                "TEMP"},  # head 1 O TEMP+0..31 at AX byte positions
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer4_pc_relay_ir,
@@ -916,8 +923,10 @@ def make_layer4_sp_to_addr_key_op(enable: bool = False) -> Operation:
 
     return Operation(
         name="layer4_sp_to_addr_key",
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — add
+        # HAS_SE (Q gate at slot 0 / 33 in ``_stage_sp_byte``).
         reads={"MARK_AX", "BYTE_INDEX_0", "BYTE_INDEX_1", "H1",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST", "HAS_SE"},
         writes={"ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},  # = ADDR_KEY band
         kind="block",
         declarative_bake_fn=bake,
