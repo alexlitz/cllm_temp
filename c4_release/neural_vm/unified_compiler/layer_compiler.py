@@ -67,7 +67,11 @@ _DIM_LIVENESS_ENV = "C4_DIM_LIVENESS"
 
 
 def _env_flag_dim_liveness() -> bool:
-    return os.environ.get(_DIM_LIVENESS_ENV) == "1"
+    # Default ON. Set ``C4_DIM_LIVENESS=0`` to opt out (e.g. for bisecting a
+    # regression). The lifetime walker fix (471c1c08) makes the merge sound
+    # — byte-identity ≡ 0 vs OFF — and the L0-L7 declaration audit gave the
+    # allocator the real lifetime graph it needs to share slots safely.
+    return os.environ.get(_DIM_LIVENESS_ENV, "1") != "0"
 
 
 # Allowed `scope` values for `Operation.claims`. Each scope tags a class of
