@@ -601,7 +601,13 @@ def make_layer2_threshold_attn_op() -> Operation:
 
     return Operation(
         name="layer2_threshold_attn",
-        reads={"IS_MARK", "CONST"},
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the MARK_* dims the threshold head reads via ``bd.MARKS``
+        # (V slot 1+m reads MARKS[m] for m=0..6 = MARK_PC, MARK_AX,
+        # MARK_SP, MARK_BP, MARK_MEM, MARK_SE, MARK_CS).
+        reads={"IS_MARK", "CONST",
+               "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+               "MARK_MEM", "MARK_SE", "MARK_CS"},
         writes={"L2H0"},
         kind="attn",
         # Phase 8.G.6: drop ``layer_idx=2`` literal. ``requires["after"]
@@ -699,12 +705,14 @@ def make_layer2_lookback_detection_head_op(
         # Phase 11.A r3: dropped phase=2.1 — target_op_name +
         # requires['after']: layer1_threshold_attn already pin order.
         # Reads: CONST (Q/K gate), MARK_THINKING_START/END + IS_BYTE (V copy).
-        # Writes go to LAST_WAS_THINKING_START/END/BYTE which are not
-        # declared in declare_setdim_compat_dims (conversational-I/O-only
-        # dims); the bake resolves them via the _SetDim fallback in
-        # _as_setdim_proxy, so no compiler-tracked write edge is needed.
+        # Writes go to LAST_WAS_THINKING_START/END/BYTE. These dims are
+        # declared unconditionally in ``ops/shared.py`` for collision-free
+        # positions, so we declare them in ``writes`` here for the
+        # dim-liveness analysis (see docs/DIM_LIVENESS_FINDINGS_2026_06_05.md
+        # — undeclared writes break slot-sharing soundness).
         reads={"CONST", "MARK_THINKING_START", "MARK_THINKING_END", "IS_BYTE"},
-        writes=set(),
+        writes={"LAST_WAS_THINKING_START", "LAST_WAS_THINKING_END",
+                "LAST_WAS_BYTE"},
         kind="block",
         # Phase 8.G.6: drop ``layer_idx=2`` literal; bind to the L2 attn
         # anchor ``layer2_threshold_attn`` so the block op resolves to
