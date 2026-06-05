@@ -446,4 +446,82 @@ __all__ = [
     "global_schema",
     "check_rule_types",
     "check_rules",
+    "typed_reads",
+    "typed_writes",
+    "operand_use_def",
+    "find_producers",
+    "find_consumers",
 ]
+
+
+# ===========================================================================
+# Operand views (increment 2): typed read/write lists on Operation
+# ===========================================================================
+#
+# Backward-compatible query layer over the existing string-keyed
+# ``Operation.reads`` / ``Operation.writes`` sets. Promotes them to typed
+# Value lists without touching the Operation dataclass.
+
+
+def typed_reads(op) -> "list[Value]":
+    """Return ``Operation.reads`` as a list of typed Values.
+
+    Each read name is parsed (handling the ``DIM.*.-1`` cross-step alias
+    form) and its DimType looked up via ``schema_for``. Order is stable
+    (sorted by name then version) so two calls on the same Operation
+    return identical lists.
+    """
+    reads = getattr(op, "reads", set()) or set()
+    values = [Value.parse(name) for name in reads]
+    return sorted(values, key=lambda v: (v.name, v.offset, v.version or 0))
+
+
+def typed_writes(op) -> "list[Value]":
+    """Same shape as ``typed_reads`` but over ``Operation.writes``."""
+    writes = getattr(op, "writes", set()) or set()
+    values = [Value.parse(name) for name in writes]
+    return sorted(values, key=lambda v: (v.name, v.offset, v.version or 0))
+
+
+def operand_use_def(op) -> "tuple[list[Value], list[Value]]":
+    """Convenience: ``(typed_reads, typed_writes)`` in one call.
+
+    Mirrors the def-use pair that traditional IRs surface on every
+    instruction: the operands an op consumes plus the values it produces.
+    """
+    return typed_reads(op), typed_writes(op)
+
+
+def find_producers(ops, dim_name: str) -> "list":
+    """Return every op in ``ops`` whose write set contains ``dim_name``.
+
+    Order is the input order (stable across calls). Useful for
+    attribution: "which op produces this dim?"
+    """
+    matches = []
+    for op in ops:
+        writes = getattr(op, "writes", set()) or set()
+        if dim_name in writes:
+            matches.append(op)
+            continue
+        # Also match the cross-step alias form
+        for write in writes:
+            if write.startswith(f"{dim_name}+") or write.startswith(f"{dim_name}.*"):
+                matches.append(op)
+                break
+    return matches
+
+
+def find_consumers(ops, dim_name: str) -> "list":
+    """Return every op in ``ops`` whose read set contains ``dim_name``."""
+    matches = []
+    for op in ops:
+        reads = getattr(op, "reads", set()) or set()
+        if dim_name in reads:
+            matches.append(op)
+            continue
+        for read in reads:
+            if read.startswith(f"{dim_name}+") or read.startswith(f"{dim_name}.*"):
+                matches.append(op)
+                break
+    return matches

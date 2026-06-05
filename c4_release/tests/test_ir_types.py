@@ -264,3 +264,92 @@ def test_dim_schema_rejects_conflicting_register():
     # Conflicting spec rejected
     with pytest.raises(ValueError, match="conflicting"):
         schema.register(DimSpec("FOO", DimType.CARRY, 1))
+
+
+# ===========================================================================
+# Operand views — typed reads/writes + producer/consumer queries
+# ===========================================================================
+
+
+class _FakeOp:
+    """Minimal Operation stand-in for testing the typed-operand layer
+    without pulling in the real LayerCompiler dependency."""
+
+    def __init__(self, name, reads, writes):
+        self.name = name
+        self.reads = set(reads)
+        self.writes = set(writes)
+
+
+def test_typed_reads_returns_value_list_with_types():
+    from c4_release.neural_vm.unified_compiler.ir_types import typed_reads
+
+    op = _FakeOp("foo", reads={"MARK_AX", "ALU_LO+5"}, writes={"OUTPUT_LO+0"})
+    reads = typed_reads(op)
+    assert len(reads) == 2
+    names = {r.name for r in reads}
+    assert names == {"MARK_AX", "ALU_LO"}
+    by_name = {r.name: r for r in reads}
+    assert by_name["MARK_AX"].type == DimType.MARKER
+    assert by_name["ALU_LO"].type == DimType.BAND
+    assert by_name["ALU_LO"].offset == 5
+
+
+def test_typed_writes_returns_value_list():
+    from c4_release.neural_vm.unified_compiler.ir_types import typed_writes
+
+    op = _FakeOp("foo", reads=set(), writes={"OUTPUT_LO+0", "OUTPUT_HI+15"})
+    writes = typed_writes(op)
+    assert len(writes) == 2
+    for w in writes:
+        assert w.type == DimType.OUTPUT
+
+
+def test_operand_use_def_returns_both_lists():
+    from c4_release.neural_vm.unified_compiler.ir_types import operand_use_def
+
+    op = _FakeOp("foo", reads={"MARK_AX"}, writes={"OUTPUT_LO+0"})
+    reads, writes = operand_use_def(op)
+    assert len(reads) == 1
+    assert len(writes) == 1
+    assert reads[0].name == "MARK_AX"
+    assert writes[0].name == "OUTPUT_LO"
+
+
+def test_typed_reads_handles_cross_step_alias():
+    from c4_release.neural_vm.unified_compiler.ir_types import typed_reads
+
+    op = _FakeOp("foo", reads={"OUTPUT_LO.*.-1"}, writes=set())
+    reads = typed_reads(op)
+    assert len(reads) == 1
+    assert reads[0].name == "OUTPUT_LO"
+    assert reads[0].version == -1
+    assert reads[0].is_cross_step
+
+
+def test_find_producers_locates_writers():
+    from c4_release.neural_vm.unified_compiler.ir_types import find_producers
+
+    op1 = _FakeOp("alpha", reads=set(), writes={"OUTPUT_LO"})
+    op2 = _FakeOp("beta", reads={"MARK_AX"}, writes={"CARRY"})
+    op3 = _FakeOp("gamma", reads=set(), writes={"OUTPUT_LO+5"})
+
+    producers = find_producers([op1, op2, op3], "OUTPUT_LO")
+    names = {op.name for op in producers}
+    assert names == {"alpha", "gamma"}
+    # op2 doesn't write OUTPUT_LO
+    assert "beta" not in names
+
+
+def test_find_consumers_locates_readers():
+    from c4_release.neural_vm.unified_compiler.ir_types import find_consumers
+
+    op1 = _FakeOp("alpha", reads={"MARK_AX"}, writes=set())
+    op2 = _FakeOp("beta", reads={"ALU_LO+5", "MARK_AX+0"}, writes=set())
+    op3 = _FakeOp("gamma", reads={"CMP+3"}, writes=set())
+
+    consumers = find_consumers([op1, op2, op3], "MARK_AX")
+    names = {op.name for op in consumers}
+    assert "alpha" in names
+    assert "beta" in names
+    assert "gamma" not in names
