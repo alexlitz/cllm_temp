@@ -916,8 +916,17 @@ def make_function_call_weights_op() -> Operation:
 
     return Operation(
         name="function_call_weights",
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # baked reads (Q/K/V columns + FFN rule input dims) and writes
+        # (O rows + FFN rule output dims). Derived from
+        # ``_function_call_l5_head_specs`` (L5 H5/H6 ENT relay),
+        # ``_function_call_l6_head_spec`` (L6 H7 JSR PC OUTPUT relay),
+        # and ``_function_call_l6_ffn_rules``.
+        reads={"MARK_STACK0", "MARK_BP", "MARK_SP", "MARK_PC", "MARK_AX",
+               "CONST", "OP_JSR", "OP_ENT",
+               "EMBED_LO", "EMBED_HI",
+               "OUTPUT_LO", "OUTPUT_HI"},
+        writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Model-level FFN
         # routing bake into L6 FFN units 1700..2158 (function-call dispatch
         # table). Writes target FFN weights, not per-step residual dims,
@@ -1027,8 +1036,24 @@ def make_opcode_relay_head_op() -> Operation:
     # behaviour change.
     return Operation(
         name="opcode_relay_head",
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # baked reads (Q/K/V columns) and writes (O rows) for the L6
+        # opcode-relay head 6. Derived from ``_opcode_relay_head_spec``.
+        # (The cells overlap byte-identically with
+        # ``layer6_relay_heads_bake``'s head-6 writes per the
+        # claim-coverage note above; declarations stay accurate w.r.t.
+        # the residual positions touched even though the bake is inert
+        # at the static-verifier level.)
+        reads={"MARK_SP", "MARK_STACK0", "MARK_BP", "MARK_PC",
+               "MARK_MEM", "MARK_AX",
+               "H1", "L1H4",
+               "OP_PSH", "OP_ADJ", "OP_ENT", "OP_JSR",
+               "OP_SI", "OP_SC", "OP_LEV",
+               "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+               "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR"},
+        writes={"CMP", "PSH_AT_SP", "OP_JSR", "OP_ENT", "OP_LEV",
+                "MEM_STORE", "MEM_ADDR_SRC"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Model-level bake
         # that rewires the L6 opcode relay attention head (K/V matrices
         # + alibi slope). Writes target attention parameters, not
@@ -1317,8 +1342,23 @@ def make_branch_override_patch_op() -> Operation:  # noqa: E302
 
     return Operation(
         name="branch_override_patch",
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the residual positions inspected/modified by the defensive
+        # sweep. The bake reads ``W_up[u, BD.MARK_PC]`` and
+        # ``W_down[BD.OUTPUT_LO/HI:..., u]`` as filters, then sets
+        # ``W_up[u, BD.OP_*]`` to ``-S`` for non-target opcodes. From
+        # the liveness analysis's perspective every BD column touched
+        # (read or modified) and every BD row covered must be declared
+        # so the producer/consumer graph stays sound.
+        reads={"MARK_PC", "CMP",
+               "OP_JMP", "OP_LEV", "OP_BZ", "OP_BNZ", "OP_JSR",
+               "OP_IMM", "OP_EXIT", "OP_NOP", "OP_LEA",
+               "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+               "OP_OR", "OP_XOR", "OP_AND",
+               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+               "OP_SHL", "OP_SHR", "OP_PSH", "OP_LI", "OP_LC",
+               "OP_SI", "OP_SC", "OP_ADJ", "OP_ENT"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Defensive sweep
         # / topology patch that zeros stale branch-override weights. No
         # in-step semantic residual reads/writes.
@@ -1419,8 +1459,19 @@ def make_l6_dead_unit_zero_op() -> Operation:
 
     return Operation(
         name="l6_dead_unit_zero",
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the residual positions inspected/modified by the defensive
+        # sweep. The bake reads ``W_down[BD.OUTPUT_LO/HI:..., u]`` and
+        # ``W_up[u, BD.MARK_PC/STACK0/BP/IS_BYTE/H1/BYTE_INDEX_0]``
+        # plus the ``W_up[u, BD.OUTPUT_BYTE_LO/HI:...]`` filter, then
+        # zeros entire units (W_up/W_gate/W_down/biases) that match.
+        # The zeroed W_down covers ALL residual rows — declared via the
+        # OUTPUT_LO/HI writes since those are the rows the filter
+        # required to be non-zero.
+        reads={"MARK_PC", "MARK_STACK0", "MARK_BP",
+               "IS_BYTE", "H1", "BYTE_INDEX_0",
+               "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Defensive sweep:
         # zero L6 FFN units that no op currently writes (post-rightsize
         # safety). No in-step semantic residual reads/writes.
@@ -1521,8 +1572,19 @@ def make_l7_dead_unit_zero_op() -> Operation:
 
     return Operation(
         name="l7_dead_unit_zero",
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the residual positions inspected/modified by the defensive
+        # sweep. The bake reads OP_ENT/LEV/JSR/LEA, MARK_PC, IS_BYTE,
+        # BYTE_INDEX_0..3, OUTPUT_LO/HI (row check on W_down) and
+        # writes (adds suppression weights into) the MARK_PC and
+        # IS_BYTE columns of W_up. From a liveness standpoint these
+        # are existing read columns whose values are being modified
+        # (not a fresh residual producer); OUTPUT_LO/HI declared as
+        # writes since the row-check filter binds them as touched.
+        reads={"OP_ENT", "OP_LEV", "OP_JSR", "OP_LEA",
+               "MARK_PC", "IS_BYTE",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Defensive sweep:
         # zero L7 FFN units that no op currently writes. No in-step
         # semantic residual reads/writes.
