@@ -1185,7 +1185,11 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         # (the OP_LEV writer). The head's Q[0]+=OP_LEV*L/5 still resolves
         # to the same numeric position because OP_LEV_PREV_STEP aliases
         # OP_LEV. Breaks back-edge L5 → layer3_carry_forward_attn on OP_LEV.
-        reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — add
+        # MARK_STACK0 (head 6 Q at slot 0 / 33 via
+        # ``_lev_bp_to_pc_head_spec`` in ``_layer3_carry_forward_attn_ir``);
+        # was missing from declared reads though baked.
+        reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
                "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV.*.-1", "HAS_SE",
                "H1", "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
