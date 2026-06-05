@@ -51,6 +51,7 @@ from .run_vm import (
     AutoregressiveVMRunner,
     _MEM_ADDR_SRC_OPS,
     _MEM_STORE_OPS,
+    _BINARY_POP_OPS,
 )
 from .speculative import DraftVM
 
@@ -179,6 +180,13 @@ class _ElementState:
     last_sp: int = 0x10000
     last_bp: int = 0x10000
     stack0_shadow: Optional[int] = None
+    # Pre-PSH AX captured at the moment of a PSH dispatch (== the word that
+    # PSH writes to the stack). Required by the collapsed-step binary-ALU
+    # recovery (smoke ``sub_basic``/``div_basic``/``mod_basic``) because the
+    # model's neural STACK0 emit carries garbage in the high bytes, so reading
+    # the PSH'd word from ``stack0_shadow`` gives a wrong full-32-bit operand.
+    # See _dispatch_pure_neural's collapsed-step recovery block.
+    last_pushed_value: Optional[int] = None
 
     memory: dict = field(default_factory=dict)        # addr -> byte
     mem_history: dict = field(default_factory=dict)   # addr -> 9-token MEM section
@@ -1851,6 +1859,13 @@ class BatchedPureNeuralRunner:
             s.last_bp = neural_bp
         if neural_stack0 and exec_op not in (Opcode.SI, Opcode.SC):
             s.stack0_shadow = neural_stack0
+        # PSH: snapshot the pre-PSH AX as the pushed word. The pre-PSH AX is
+        # the value PSH stores at *--SP per C4 semantics; preserving it in
+        # ``last_pushed_value`` lets the collapsed-step binary-ALU recovery
+        # (below) recover the clean 32-bit operand even when the model's
+        # neural STACK0 emit has garbage in the high bytes.
+        if exec_op == Opcode.PSH:
+            s.last_pushed_value = int(prev_ax) & 0xFFFFFFFF
 
         # PUTCHAR: append AX byte 0 to output.
         if exec_op == Opcode.PUTCHAR and neural_ax is not None:
@@ -1954,6 +1969,48 @@ class BatchedPureNeuralRunner:
             s.exit_code = self._decode_exit_code(s.context)
             s.halted = True
             return
+
+        # Collapsed-step binary-ALU recovery (2026-06-04). For smoke
+        # ``sub_basic``/``div_basic``/``mod_basic`` (plus the eq/gt/ge/shl/shr/
+        # mul_overflow comparison + shift suite, which follow the same
+        # IMM,PSH,IMM,<binop>,EXIT shape) the model emits TWO register blocks
+        # under a single STEP_END (e.g. IMM 8 reg-block then SUB reg-block then
+        # one STEP_END). The just-executed op was the IMM (``exec_op`` here),
+        # but ``s.last_pc`` — read from the LAST REG_PC in the collapsed step —
+        # already points past a skipped binary ALU op (e.g. SUB at idx 3
+        # between IMM at idx 2 and EXIT at idx 4). The neural emit for that
+        # skipped SUB step is broken (model writes AX=0 instead of 42), so the
+        # early-exit below reads the broken AX. Detect the one-instruction
+        # skip + binary-ALU pattern and synthesize the correct AX from the
+        # legacy ALU (mirrors the serial ``_BINARY_POP_OPS`` override at
+        # run_vm.py:2255-2275). Bounded to ONE skipped op so we don't paper
+        # over larger model divergences. Operands: ``ax_after_imm`` from the
+        # bytecode's IMM byte, ``stack_val`` from ``last_pushed_value`` (the
+        # clean pre-PSH AX snapshot, not the noisy neural STACK0 emit).
+        if (s.last_pc is not None
+                and exec_op == Opcode.IMM
+                and s.last_pushed_value is not None):
+            post_idx = s.last_pc // INSTR_WIDTH
+            skipped_idx = exec_idx + 1
+            if (post_idx == skipped_idx + 1
+                    and 0 <= skipped_idx < len(s.bytecode)):
+                skipped_op = s.bytecode[skipped_idx] & 0xFF
+                if skipped_op in _BINARY_POP_OPS:
+                    # AX after the just-executed IMM = the IMM's imm value.
+                    imm_val = (s.bytecode[exec_idx] >> 8) & 0xFFFFFF
+                    if imm_val >= 0x800000:
+                        imm_val -= 0x1000000
+                    ax_after_imm = imm_val & 0xFFFFFFFF
+                    # stack_val = the value PSH most recently pushed (clean,
+                    # no neural-emit byte-3 noise). See _ElementState.
+                    stack_val = int(s.last_pushed_value) & 0xFFFFFFFF
+                    alu_result = self._serial._compute_alu_legacy(
+                        skipped_op, stack_val, ax_after_imm
+                    )
+                    s.last_ax = int(alu_result) & 0xFFFFFFFF
+                    self._override_register_in_last_step(
+                        s.context, Token.REG_AX, s.last_ax
+                    )
 
         # Neural-authoritative early exit: after a completed step, the model's
         # emitted PC is the next instruction address and the emitted AX is the
