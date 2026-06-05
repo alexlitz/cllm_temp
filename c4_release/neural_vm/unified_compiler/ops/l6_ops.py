@@ -3608,8 +3608,23 @@ def make_layer6_attn_bake_op() -> Operation:
     return Operation(
         name="layer6_attn_bake",
         phase=998.5,
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # all baked reads (Q/K columns) and writes (O rows) for the L6
+        # attention spec (heads 0, 1, 2, 3, 5). Reads/writes derived from
+        # ``_layer6_attn_head_specs`` (Q gates, V projection sources,
+        # O destination rows). Used to be empty because this is a model-
+        # level bake; populating them is required for the dim-liveness
+        # analysis to compute correct dim lifetimes.
+        reads={"MARK_PC", "MARK_AX", "MARK_SP",
+               "HAS_SE", "CONST", "NEXT_SE", "IS_BYTE",
+               "H1", "BYTE_INDEX_0",
+               "FETCH_LO", "FETCH_HI",
+               "OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
+               "OP_JMP", "OP_EXIT", "OP_JSR", "OP_BZ", "OP_BNZ", "OP_ENT"},
+        writes={"AX_CARRY_LO", "AX_CARRY_HI", "CMP", "TEMP",
+                "FETCH_LO", "FETCH_HI",
+                "OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
+                "OP_BZ", "OP_BNZ", "OP_JSR"},
         kind="model",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer6_attn_bake_ir,
@@ -3781,8 +3796,23 @@ def make_layer6_relay_heads_bake_op() -> Operation:
     return Operation(
         name="layer6_relay_heads_bake",
         phase=998.6,
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # all baked reads (Q/K + V columns) and writes (O rows) for the
+        # L6 PSH relay spec (heads 6, 7). Derived from
+        # ``_layer6_relay_head_specs``.
+        reads={"MARK_SP", "MARK_AX", "MARK_STACK0", "MARK_BP",
+               "MARK_PC", "MARK_MEM",
+               "H1", "L1H4", "CONST",
+               "STACK0_BYTE0", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "AX_CARRY_LO", "AX_CARRY_HI",
+               "OPCODE_BYTE_HI",
+               "OP_LEV", "OP_PSH", "OP_ADJ", "OP_ENT", "OP_JSR",
+               "OP_SI", "OP_SC"},
+        writes={"CMP", "PSH_AT_SP", "MEM_STORE", "MEM_ADDR_SRC",
+                "OP_LEV", "OP_ENT", "OP_JSR",
+                "ALU_LO", "ALU_HI",
+                "OPCODE_BYTE_HI",
+                "AX_CARRY_LO", "AX_CARRY_HI"},
         kind="model",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer6_relay_heads_bake_ir,
@@ -3841,8 +3871,15 @@ def make_layer6_bz_bnz_relay_bake_op() -> Operation:
     return Operation(
         name="layer6_bz_bnz_relay_bake",
         phase=998.7,
-        reads=set(),
-        writes=set(),
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # all baked reads (Q/K/V columns) and writes (O rows) for the L6
+        # BZ/BNZ relay head 4. Derived from ``_layer6_bz_bnz_relay_head_spec``.
+        reads={"MARK_PC", "MARK_AX",
+               "CONST", "IS_BYTE", "H1", "BYTE_INDEX_0",
+               "L1H0", "L1H1",
+               "OP_BZ", "OP_BNZ",
+               "EMBED_LO", "EMBED_HI"},
+        writes={"CMP"},
         kind="model",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer6_bz_bnz_relay_bake_ir,
