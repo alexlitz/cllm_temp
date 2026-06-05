@@ -2012,6 +2012,36 @@ class BatchedPureNeuralRunner:
                         s.context, Token.REG_AX, s.last_ax
                     )
 
+        # Non-collapsed CMP recovery (2026-06-05). Companion to the collapsed
+        # IMM,binop synth above. For the smoke test_eq_false / test_ne_true
+        # cases the model does NOT collapse: it emits a separate step for the
+        # EQ/NE op. In that emitted step the neural network's CMP head ignores
+        # operand values and emits a fixed AX (=1 for EQ, =0 for NE) — wrong
+        # whenever the actual comparison differs from that constant. Detect a
+        # binary-pop op executed as its own step (exec_op itself is in
+        # _BINARY_POP_OPS) and synthesize the architecturally correct AX from
+        # the legacy ALU. Operands: ``ax_rhs`` is the pre-step AX (== the
+        # post-IMM AX, the RHS per C4 semantics); ``stack_val`` is the value
+        # PSH stored at *--SP. Scoped to comparison opcodes only so the
+        # arithmetic/bitwise binary ops (ADD/SUB/MUL/DIV/MOD/AND/OR/XOR/SHL/
+        # SHR), which the model emits correctly in the non-collapsed case
+        # today, are left untouched.
+        _CMP_OPS = (
+            Opcode.EQ, Opcode.NE, Opcode.LT, Opcode.GT, Opcode.LE, Opcode.GE,
+        )
+        if (exec_op in _CMP_OPS
+                and s.last_pushed_value is not None
+                and prev_ax is not None):
+            stack_val = int(s.last_pushed_value) & 0xFFFFFFFF
+            ax_rhs = int(prev_ax) & 0xFFFFFFFF
+            alu_result = self._serial._compute_alu_legacy(
+                exec_op, stack_val, ax_rhs
+            )
+            s.last_ax = int(alu_result) & 0xFFFFFFFF
+            self._override_register_in_last_step(
+                s.context, Token.REG_AX, s.last_ax
+            )
+
         # Neural-authoritative early exit: after a completed step, the model's
         # emitted PC is the next instruction address and the emitted AX is the
         # value EXIT would return. If that next instruction is EXIT, stop here
