@@ -383,6 +383,10 @@ def make_layer7_memory_heads_op() -> Operation:
                # propagation relays and OP_SHR for the byte-zero cleanup relay.
                "OP_AND", "OP_OR", "OP_XOR", "OP_SHR",
                "OP_JSR",  # head 5 V slot 8 (existing, declared for completeness)
+               # Head 5 K-side blocker on OP_IMM (2026-06-05 OP_IMM blocker):
+               # negative term pushes IMM-dispatch AX positions out of the
+               # softmax mass so head 5 cannot relay OP_LEA on IMM steps.
+               "OP_IMM",
                "PSH_AT_SP",
                "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1", "TEMP.*.-1"},
         writes={"OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP",
@@ -514,11 +518,30 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     # Head 5: Relay OP_LI/OP_LC/LEA/bitwise/JSR/no-carry/add/sub flags from AX marker.
     # The K scale is doubled here to preserve the softmax-sharpness fix that
     # previously ran as a post-helper row multiply in ``bake``.
+    #
+    # OP_IMM blocker (2026-06-05, OPCODE_ONE_HOT_FINDINGS_2026_06_05.md): the
+    # K-side previously gated only on ``MARK_AX``, which made head 5 attend to
+    # *any* AX marker in scope -- including the IMM-dispatch AX marker on an
+    # IMM step. Head 5's V projection has ``OP_LEA`` at slot 3 (-> CMP+7 in
+    # O), so OP_LEA's residual at the source AX position broadcast into the
+    # firing MARK_AX even when the current step was IMM. This was the
+    # ``OP_LEA -> CMP+7`` leak path the L10 ``tail_lea_local_ax_marker_byte0_e8``
+    # tail rule had to filter via a ``MEM_ADDR_SRC`` positive predicate.
+    #
+    # Source opcodes routed by head 5 (12 total): OP_LI, OP_LC, OP_LEA,
+    # OP_AND, OP_OR, OP_XOR, OP_JSR, OP_SHR, OP_SI, OP_SC, OP_ADD, OP_SUB.
+    # None of these can coexist with OP_IMM at the same AX position (L5
+    # ``_opcode_decode_main_rules`` is strictly one-hot by construction), so
+    # a negative term on ``OP_IMM`` only suppresses IMM-dispatch AX positions
+    # and is byte-identical at every real source position for the 12 relays.
     specs.append(
         DeclarativeAttentionHeadSpec(
             head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_memory_heads.head_5"],
             q=(AP(0, BD.MARK_AX, L), AP(0, BD.H1 + AX_I, L)),
-            k=(AP(0, BD.MARK_AX, L * 2.0),),
+            k=(
+                AP(0, BD.MARK_AX, L * 2.0),
+                AP(0, BD.OP_IMM, -L * 2.0),  # block IMM-dispatch AX positions
+            ),
             v=(
                 AP(1, BD.OP_LI, 0.2),
                 AP(2, BD.OP_LC, 0.2),
