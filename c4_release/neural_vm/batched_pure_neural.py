@@ -1992,6 +1992,14 @@ class BatchedPureNeuralRunner:
         # override REG_AX from the bytecode imm field — mirroring the LEA
         # override at run_vm.py:2310-2318 and the collapsed-step recovery
         # below. Cheap and consistent: the bytecode imm IS the spec.
+        #
+        # Removal-1 (2026-06-05) attempted to delete this override after
+        # adding MEM_ADDR_SRC predicate to l10_ops.tail_lea_local_ax_marker_
+        # byte0_e8. Smoke ran 45/52 (vs 46/52 baseline) — test_add_16bit
+        # regressed though test_xor_basic and test_add_carry_cascade
+        # recovered. Per RUNNER_OVERRIDE_REMOVAL_PLAN_2026_06_05.md acceptance
+        # criteria the override removal was reverted; the predicate fix in
+        # l10_ops remains as a partial structural improvement.
         if exec_op == Opcode.IMM:
             imm = (s.bytecode[exec_idx] >> 8) & 0xFFFFFF
             if imm >= 0x800000:

@@ -6481,6 +6481,17 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("CMP+7", 1.0),
                 ("FETCH_LO+8", 2.0),
                 ("FETCH_HI+15", 0.2),
+                # Removal-1 (2026-06-05) replaces the runner-side IMM 0xE0-0xFF
+                # override (batched_pure_neural.py b5cf7099). Per
+                # OP_LEA_LEAK_INVESTIGATION_2026_06_05.md Option A, the
+                # spurious-fire path is positive evidence from L7-head-5
+                # broadcast (CMP+7) + FETCH bytes on IMM rows where the imm has
+                # nibble 0x_8/0x_F. Adding MEM_ADDR_SRC as a positive predicate
+                # distinguishes real LEA-byte-evaluation steps (where the
+                # address-byte source is live) from IMM dispatch rows (where
+                # it is not). Raises the firing threshold to ~14; only real
+                # LEA crosses it.
+                ("MEM_ADDR_SRC", 5.0),
                 ("IS_BYTE", -10.0),
                 ("MARK_PC", -10000.0),
                 ("MARK_SP", -10000.0),
@@ -6488,7 +6499,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_STACK0", -10000.0),
                 ("MARK_MEM", -10000.0),
             ),
-            threshold=9.0,
+            threshold=14.0,
             writes=byte_writes(0xE8, strength=1_000_000.0),
         ),
         multi_way_and_rule(
