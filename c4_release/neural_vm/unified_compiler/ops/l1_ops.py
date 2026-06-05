@@ -438,7 +438,14 @@ def make_layer1_threshold_attn_op() -> Operation:
 
     return Operation(
         name="layer1_threshold_attn",
-        reads={"IS_MARK", "MARK_SE_ONLY", "MARK_CS", "CONST"},
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the MARK_* dims threshold heads 0, 1, 2, 4 read via ``bd.MARKS``
+        # (V slot 1+m reads MARKS[m] for m=0..6 = MARK_PC, MARK_AX,
+        # MARK_SP, MARK_BP, MARK_MEM, MARK_SE, MARK_CS). Previously only
+        # MARK_SE_ONLY + MARK_CS were declared (head 3 / head 5 inputs).
+        reads={"IS_MARK", "MARK_SE_ONLY", "MARK_CS", "CONST",
+               "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+               "MARK_MEM", "MARK_SE"},
         writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE", "IN_STEP_FRESH"},
         kind="attn",
         # Phase 8.G.6: drop ``layer_idx=1`` literal. ``requires["after"]
