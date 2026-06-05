@@ -143,3 +143,17 @@ existing `verify_compaction_safety` detector
   experts live in `W_v`/`W_q` of `attn`, where the same overlap argument
   applies and is *not* covered by `_partition_compact_ffn_by_opcode`.
   Out of scope here; flag for a separate attn-MoE audit.
+
+---
+
+## CORRECTION (2026-06-05 later)
+
+The L9 estimate in this audit was wrong. A follow-up implementation attempt verified:
+
+- `l9_ops.py` has exactly ONE FFN op (`make_layer9_alu_op`), not 5 disjoint 512-unit sub-experts.
+- The op declares `ffn_units_used=3405` and gates on `{OP_ADD, OP_SUB, OP_AND, OP_OR, OP_XOR, OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE}`. No `OP_LEA`, `OP_ADJ`, or `OP_ENT` gating.
+- The allocator at `layer_compiler.py:664-667` already takes `max` per layer, not `sum`. There is no `sum`-vs-`max` win to extract for L9.
+
+The "L9: 5×512=2560 → save 2048 units / 7.86M params" claim was based on misreading the bake-body source comments. The actual L9 bake (`_set_layer9_alu`) is a single ~3398-unit ADD/LEA/SUB/AND/OR/XOR/CMP cross-product cluster plus 7 marker-suppress units.
+
+**L10/L14/L16 estimates in this audit have NOT been verified against actual op layout** and may have the same fabrication risk. Re-audit those before implementation. Use the per-opcode dim closure + head/layer activity audits as ground truth.
