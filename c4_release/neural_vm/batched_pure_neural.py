@@ -687,6 +687,7 @@ class BatchedPureNeuralRunner:
         allow_kv: bool = True,
         protected_prefix_lens: Optional[List[int]] = None,
         protected_mem_positions: Optional[List[List[int]]] = None,
+        gather_positions: Optional[List[List[int]]] = None,
     ) -> Tuple[List[List[int]], int, List[int]]:
         """Forward a padded active batch and return argmax rows.
 
@@ -695,8 +696,22 @@ class BatchedPureNeuralRunner:
         common to every active row, capped to the earliest logit any caller
         will inspect. If a cached pass disagrees with a fresh pass, the fresh
         logits are returned and the cache is discarded.
+
+        Perf 2026-06-05: when ``gather_positions`` is provided (per-row
+        absolute positions in the *padded* tensor that the caller actually
+        needs), only those positions are argmaxed and transferred to CPU.
+        This shrinks the per-step host transfer from ``[B, max_len]`` longs
+        to ``[B, P]`` longs (where P is typically 1 for the unspec path and
+        ``K*35`` for the speculative path). On the 32-case profile the
+        ``.cpu()`` dominated wall time (37%); the gather path takes it to
+        a small fraction of a step. ``preds_cpu`` shape is ``[B, P]`` and
+        ``pred_start`` is the implicit ``0`` (callers index relative to
+        their own ``gather_positions``). When ``gather_positions`` is
+        ``None`` the legacy ``[B, max_len-pred_start]`` return is preserved.
         """
         padded, real_lens = self._pad_to_tensor(sequences)
+        gather_idx = self._build_gather_idx(gather_positions, padded.device) \
+            if gather_positions is not None else None
         if (
             not self.use_kv_cache
             or not allow_kv
@@ -715,7 +730,7 @@ class BatchedPureNeuralRunner:
                 self._kv_stats["unsafe_model_fresh_bypass"] += 1
             self._kv_stats["fresh_forwards"] += 1
             logits = self.model.forward(padded)
-            return logits.argmax(dim=-1).cpu().tolist(), 0, real_lens
+            return self._argmax_to_cpu(logits, gather_idx), 0, real_lens
 
         max_len = padded.shape[1]
         first_logit_pos = int(max(0, min(first_logit_pos, max_len - 1)))
@@ -742,7 +757,7 @@ class BatchedPureNeuralRunner:
                 self._reset_kv_cache()
                 self._kv_stats["fresh_forwards"] += 1
                 logits = self.model.forward(padded)
-                return logits.argmax(dim=-1).cpu().tolist(), 0, real_lens
+                return self._argmax_to_cpu(logits, gather_idx), 0, real_lens
 
         kv_cache = self._get_or_build_kv_cache()
         self._kv_stats["calls"] += 1
@@ -754,7 +769,13 @@ class BatchedPureNeuralRunner:
             kv_cache=kv_cache,
             cached_prefix_len=cached_prefix_len,
         )
-        cached_preds = logits.argmax(dim=-1).cpu().tolist()
+        # KV path returns logits sliced from ``cached_prefix_len``; offset the
+        # gather indices accordingly so the gather still picks the absolute
+        # positions the caller asked for.
+        kv_gather_idx = None
+        if gather_idx is not None:
+            kv_gather_idx = (gather_idx - cached_prefix_len).clamp_min(0)
+        cached_preds = self._argmax_to_cpu(logits, kv_gather_idx)
 
         if (
             self.kv_cache_verify
@@ -767,8 +788,11 @@ class BatchedPureNeuralRunner:
             self._kv_stats["verifications"] += 1
             self._kv_stats["verification_forwards"] += 1
             fresh_logits = self.model.forward(padded)
-            fresh_preds = fresh_logits.argmax(dim=-1).cpu().tolist()
-            fresh_tail = [row[cached_prefix_len:] for row in fresh_preds]
+            fresh_preds = self._argmax_to_cpu(fresh_logits, gather_idx)
+            if gather_idx is None:
+                fresh_tail = [row[cached_prefix_len:] for row in fresh_preds]
+            else:
+                fresh_tail = fresh_preds
             if cached_preds != fresh_tail:
                 self._kv_stats["mismatches"] += 1
                 self._kv_stats["fallbacks"] += 1
@@ -794,7 +818,73 @@ class BatchedPureNeuralRunner:
             self._kv_active_idx = tuple(active_idx)
             self._kv_cached_rows = [list(seq) for seq in sequences]
             self._kv_incremental_count += 1
+        # When ``gather_positions`` is set the caller treats positions as
+        # absolute (independent of ``cached_prefix_len``); preserve the
+        # ``pred_start=0`` convention for that mode by returning 0 here.
+        if gather_idx is not None:
+            return cached_preds, 0, real_lens
         return cached_preds, cached_prefix_len, real_lens
+
+    @staticmethod
+    def _build_gather_idx(
+        gather_positions: List[List[int]],
+        device,
+    ) -> torch.Tensor:
+        """Right-pad per-row position lists into a single ``[B, P]`` LongTensor.
+
+        Empty rows fall back to position 0 (their argmax result is unused
+        because the caller knows that row had no requested positions). Ragged
+        rows are tolerated; callers use ``len(gather_positions[b])`` to slice
+        their per-row preds back to the right length.
+        """
+        if not gather_positions:
+            return torch.zeros((0, 0), dtype=torch.long, device=device)
+        B = len(gather_positions)
+        # Pre-compute the per-row length and the global max so we know the
+        # padded width. Pad to ``max_p`` with 0; callers consume only the
+        # leading ``len(row)`` entries.
+        max_p = 0
+        for row in gather_positions:
+            if len(row) > max_p:
+                max_p = len(row)
+        if max_p == 0:
+            return torch.zeros((B, 0), dtype=torch.long, device=device)
+        flat = []
+        for row in gather_positions:
+            if len(row) == max_p:
+                flat.extend(row)
+            else:
+                flat.extend(row)
+                flat.extend([0] * (max_p - len(row)))
+        return torch.tensor(flat, dtype=torch.long, device=device).view(B, max_p)
+
+    @staticmethod
+    def _argmax_to_cpu(
+        logits: torch.Tensor,
+        gather_idx: Optional[torch.Tensor],
+    ) -> List[List[int]]:
+        """Argmax over vocab and transfer to CPU.
+
+        When ``gather_idx`` is a ``[B, P]`` LongTensor we gather just those
+        positions before the host transfer (cutting ``cpu()`` time from
+        ``O(B*S)`` to ``O(B*P)``). When ``gather_idx`` is None we fall back to
+        the legacy full ``[B, S]`` argmax-then-transfer.
+        """
+        if gather_idx is None:
+            return logits.argmax(dim=-1).cpu().tolist()
+        # Logits: [B, S, V]. Compute argmax along V first (B*S int64 result),
+        # then gather only the requested positions along S. This avoids
+        # materialising the V dim during the transfer.
+        amax = logits.argmax(dim=-1)  # [B, S]
+        if gather_idx.numel() == 0:
+            return [[] for _ in range(amax.shape[0])]
+        # Clamp gather indices into the valid range of ``amax``'s S dim. Padded
+        # rows (those whose caller passed an empty list) get 0 here; the caller
+        # ignores those slots because it slices by its own row lengths.
+        s_dim = amax.shape[1]
+        clamped = gather_idx.clamp_max(s_dim - 1) if s_dim > 0 else gather_idx
+        gathered = amax.gather(1, clamped)  # [B, P]
+        return gathered.cpu().tolist()
 
     # ------------------------------------------------------------------
     # Context construction
@@ -1211,18 +1301,24 @@ class BatchedPureNeuralRunner:
                     [states[i].mem_addr_src_positions for i in active_idx]
                 )
 
-            preds_cpu, pred_start, real_lens = self._forward_argmax_batch(
+            # Each row only needs the argmax at ``real_len - 1`` (last real
+            # token's logit predicts the next token). Pass per-row positions
+            # so ``_forward_argmax_batch`` gathers just those and the
+            # ``cpu()`` transfer is ``[B, 1]`` instead of ``[B, max_len]``.
+            row_lens = [len(seq) for seq in windowed]
+            gather_positions = [[n - 1] for n in row_lens]
+            preds_cpu, _pred_start, real_lens = self._forward_argmax_batch(
                 windowed,
                 active_idx,
-                first_logit_pos=min(len(seq) for seq in windowed) - 1,
+                first_logit_pos=min(row_lens) - 1,
                 protected_prefix_lens=[states[i].prefix_len for i in active_idx],
                 protected_mem_positions=[
                     states[i].mem_store_positions for i in active_idx
                 ],
+                gather_positions=gather_positions,
             )
             for b, i in enumerate(active_idx):
-                last_pos = real_lens[b] - 1
-                next_tok = int(preds_cpu[b][last_pos - pred_start])
+                next_tok = int(preds_cpu[b][0])
                 self._step_one(states[i], next_tok, tok_i)
 
     # ------------------------------------------------------------------
@@ -1398,16 +1494,32 @@ class BatchedPureNeuralRunner:
                 )
 
             # Pre-compute argmax for the verifier tensor once (GPU op) and
-            # move to CPU in a single transfer. With KV enabled this may
-            # return only the suffix from ``pred_start`` onward; every caller
-            # indexes relative to that start.
-            preds_cpu, pred_start, _ = self._forward_argmax_batch(
+            # move to CPU in a single transfer. Per-row we only need positions
+            # ``[prefix_len-1, prefix_len-1+len(draft))`` (the verifier scans
+            # those slots) — pass them to ``_forward_argmax_batch`` so the
+            # ``cpu()`` transfer is ``[B, max(P_per_row)]`` instead of
+            # ``[B, max_len]``. The K=0 (no-draft) row just needs the single
+            # position ``prefix_len-1``.
+            gather_positions_per_row: List[List[int]] = []
+            for k, i in enumerate(active_idx):
+                prefix_len_k = real_prefix_lens[k]
+                draft_len = len(drafts[k])
+                # No-draft rows need only the single next-token position
+                # ``prefix_len_k - 1``. Drafted rows need one position per
+                # drafted token (the verifier reads ``row_preds[j]`` for
+                # j in [0, draft_len)). The position 0 entry is always the
+                # next-token prediction for ``draft[0]``.
+                count = draft_len if draft_len > 0 else 1
+                positions = [prefix_len_k - 1 + j for j in range(count)]
+                gather_positions_per_row.append(positions)
+            preds_cpu, _pred_start, _ = self._forward_argmax_batch(
                 windowed_with_drafts,
                 active_idx,
                 first_logit_pos=min(real_prefix_lens) - 1,
                 allow_kv=not any(drafts),
                 protected_prefix_lens=[states[i].prefix_len for i in active_idx],
                 protected_mem_positions=mem_store_positions_with_drafts,
+                gather_positions=gather_positions_per_row,
             )
 
             # 3) For each element: verify drafts and replay accepted prefix + correction.
@@ -1420,8 +1532,9 @@ class BatchedPureNeuralRunner:
 
                 if len(draft) == 0:
                     # Pure single-token decode for this element (no spec budget).
-                    last_pos = prefix_len - 1
-                    next_tok = int(preds_cpu[k][last_pos - pred_start])
+                    # Position ``prefix_len-1`` is the first entry of this row's
+                    # ``gather_positions`` -> ``preds_cpu[k][0]``.
+                    next_tok = int(preds_cpu[k][0])
                     self._step_one(s, next_tok, tok_i)
                     continue
 
@@ -1431,6 +1544,8 @@ class BatchedPureNeuralRunner:
                 # module-level constant docstring); other offsets are verified
                 # against the model's argmax. First rejected safe offset stops
                 # the scan and the model's prediction becomes the correction.
+                # With gather, ``row_preds[j]`` is the model's argmax at
+                # absolute position ``prefix_len - 1 + j``.
                 accepted = 0
                 correction: Optional[int] = None
                 row_preds = preds_cpu[k]
@@ -1438,7 +1553,7 @@ class BatchedPureNeuralRunner:
                     if (j % STEP) in _UNSAFE_OFFSETS:
                         accepted = j + 1
                         continue
-                    pred = row_preds[prefix_len - 1 + j - pred_start]
+                    pred = row_preds[j]
                     if pred == draft[j]:
                         accepted = j + 1
                     else:

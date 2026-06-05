@@ -404,6 +404,15 @@ class NeuralVMEmbedding(nn.Module):
         Args:
             start_pos: Skip positions ``< start_pos`` (prefix-cache hint).
                 The CODE/DATA prefix contains no MEM markers, so this is safe.
+
+        Implementation note (perf 2026-06-05): the previous body issued a
+        per-cell ``token_ids[b, pos].item()`` to gate each MEM marker, which
+        forced one CUDA sync per row*position. For 32-case batches with
+        accumulated MEM history that meant tens of thousands of syncs per
+        forward (855 forwards * 96ms each in the baseline profile). The
+        rewrite gathers all candidate (row, position) pairs on CPU, lifts
+        them into a single index tensor, gates them with a vectorized
+        ``token_ids.gather`` on GPU, and uses ``index_put_`` for the write.
         """
         from .vm_step import Token
 
@@ -411,42 +420,99 @@ class NeuralVMEmbedding(nn.Module):
         mem_addr_src = self._dim("MEM_ADDR_SRC")
         B, S = token_ids.shape
 
-        # MEM_ADDR_SRC=1 is only correct for SI/SC (address sourced from
-        # STACK0); PSH/JSR/ENT must keep MEM_ADDR_SRC=0 (address sourced
-        # from SP). When callers supply ``_mem_addr_src_positions`` they
-        # constrain injection to that SI/SC subset; otherwise the legacy
-        # behaviour of flagging every tracked store row is preserved.
         positions = self._mem_store_positions
         addr_src_positions = self._mem_addr_src_positions
+
+        # Build flat index lists on CPU. Each entry: (row, pos, addr_src_flag).
+        # ``addr_src_flag`` is 1 when MEM_ADDR_SRC=1 should also be set on this
+        # position; 0 when only MEM_STORE=1 should be set.
+        rows: list[int] = []
+        cols: list[int] = []
+        addr_src_flags: list[int] = []
+
         if positions is not None:
-            for b in range(B):
-                row_positions = positions[b] if b < len(positions) else ()
+            for b in range(min(B, len(positions))):
+                row_positions = positions[b]
+                if not row_positions:
+                    continue
                 if (
                     addr_src_positions is not None
                     and b < len(addr_src_positions)
                 ):
                     addr_src_row = frozenset(addr_src_positions[b])
+                    addr_src_row_is_subset = True
                 else:
                     addr_src_row = None
+                    addr_src_row_is_subset = False
                 for pos in row_positions:
-                    if not (
-                        start_pos <= pos < S
-                        and token_ids[b, pos].item() == Token.MEM
-                    ):
+                    if not (start_pos <= pos < S):
                         continue
-                    x[b, pos, mem_store] = 1.0
-                    if addr_src_row is None or pos in addr_src_row:
-                        x[b, pos, mem_addr_src] = 1.0
+                    rows.append(b)
+                    cols.append(int(pos))
+                    if not addr_src_row_is_subset:
+                        addr_src_flags.append(1)
+                    elif pos in addr_src_row:
+                        addr_src_flags.append(1)
+                    else:
+                        addr_src_flags.append(0)
 
         end = self._mem_history_end
-        if end == 0:
+        if end > 0:
+            limit = min(end, S)
+            # The mem_history region is contiguous [start_pos, limit). Add the
+            # cross-product (row, pos) for every row, gated below by the
+            # token == MEM check.
+            for b in range(B):
+                for i in range(start_pos, limit):
+                    rows.append(b)
+                    cols.append(i)
+                    addr_src_flags.append(1)
+
+        if not rows:
             return
 
-        for b in range(B):
-            for i in range(start_pos, min(end, S)):
-                if token_ids[b, i].item() == Token.MEM:
-                    x[b, i, mem_store] = 1.0
-                    x[b, i, mem_addr_src] = 1.0
+        device = x.device
+        row_idx = torch.tensor(rows, dtype=torch.long, device=device)
+        col_idx = torch.tensor(cols, dtype=torch.long, device=device)
+        addr_src_mask = torch.tensor(
+            addr_src_flags, dtype=torch.bool, device=device
+        )
+
+        # Gate by the actual MEM token id at each (row, col). This replaces the
+        # per-cell ``token_ids[b, pos].item() == Token.MEM`` check and runs as
+        # a single GPU op.
+        gathered = token_ids[row_idx, col_idx]
+        is_mem = gathered == int(Token.MEM)
+        if not bool(is_mem.any()):
+            return
+
+        keep_row = row_idx[is_mem]
+        keep_col = col_idx[is_mem]
+        keep_addr_src = addr_src_mask[is_mem]
+
+        ones = torch.ones(keep_row.shape[0], device=device, dtype=x.dtype)
+        # Write MEM_STORE=1 at every surviving (row, col).
+        x.index_put_(
+            (
+                keep_row,
+                keep_col,
+                torch.full_like(keep_row, mem_store),
+            ),
+            ones,
+        )
+        # Write MEM_ADDR_SRC=1 only at the subset whose flag is 1.
+        if bool(keep_addr_src.any()):
+            sub_row = keep_row[keep_addr_src]
+            sub_col = keep_col[keep_addr_src]
+            sub_ones = ones[: sub_row.shape[0]]
+            x.index_put_(
+                (
+                    sub_row,
+                    sub_col,
+                    torch.full_like(sub_row, mem_addr_src),
+                ),
+                sub_ones,
+            )
 
     def set_mem_history_end(self, end):
         """Set the memory history boundary for MEM_STORE injection.
