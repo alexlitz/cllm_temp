@@ -1447,8 +1447,25 @@ class LayerCompiler:
                 )
 
         if self.enable_dim_liveness:
+            # Resolve block-op layer assignments for the lifetime walker so
+            # dims consumed only by kind="block" ops (e.g. AX_FULL_LO read
+            # by layer15_alu_high_byte_relay) get the correct last-use
+            # layer. ``self.block_ops`` is the authoritative store; the
+            # local ``block_ops`` filter above runs over ``self.ops``,
+            # which never contains block ops since ``add_op`` routes them
+            # to ``self.block_ops``. We thread these into a transient copy
+            # of ``layer_assignment`` to avoid perturbing the downstream
+            # ``ops_per_layer`` placement (which expects attn/ffn only).
+            block_layer_assignment = dict(layer_assignment)
+            for op in self.block_ops:
+                if op.layer_idx is not None:
+                    block_layer_assignment[op.name] = op.layer_idx
+                elif op.target_op_name is not None:
+                    tgt = layer_assignment.get(op.target_op_name)
+                    if tgt is not None:
+                        block_layer_assignment[op.name] = tgt
             dim_positions = self._compute_dim_layout_with_liveness(
-                attn_ffn_ops, layer_assignment
+                attn_ffn_ops + list(self.block_ops), block_layer_assignment
             )
         else:
             dim_positions = self._allocate_dims()
