@@ -42,12 +42,27 @@ Example:
     # layout.ops_at(1) = [pc_increment]
 """
 
+import os
 import re
 import warnings
 from dataclasses import InitVar, dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from .ssa_dim import SSA_ANY_WRITER, is_ssa_form, parse_ssa_name
+
+
+# Feature flag: compile-time dim slot sharing via liveness analysis.
+# When ``True`` (constructor arg or env var ``C4_DIM_LIVENESS=1``), the
+# compiler runs the register-allocation-style liveness pass in
+# ``_compute_dim_layout_with_liveness`` and shares residual-stream slots
+# between unpinned, non-aliased, single-cell scratch dims whose lifetimes
+# do not overlap. Default is OFF: production keeps the bump-pointer layout
+# until the liveness path is proven byte-identical on the full smoke set.
+_DIM_LIVENESS_ENV = "C4_DIM_LIVENESS"
+
+
+def _env_flag_dim_liveness() -> bool:
+    return os.environ.get(_DIM_LIVENESS_ENV) == "1"
 
 
 # Allowed `scope` values for `Operation.claims`. Each scope tags a class of
@@ -1069,9 +1084,13 @@ class LayerCompiler:
          they target different module kinds (attn vs ffn) — a single transformer
          block has one attention and one FFN per layer.
       4. Allocate dims: simple bump-pointer (no liveness reuse for MVP).
+         When ``enable_dim_liveness=True`` (constructor arg, default OFF;
+         also gated by ``C4_DIM_LIVENESS=1`` env var), step 4 instead
+         runs a register-allocation-style graph colouring over the
+         scheduled lifetimes — see ``_compute_dim_layout_with_liveness``.
     """
 
-    def __init__(self):
+    def __init__(self, *, enable_dim_liveness: Optional[bool] = None):
         self.ops: List[Operation] = []
         self.dims: Dict[str, int] = {}  # name -> size
         self._op_by_name: Dict[str, Operation] = {}
@@ -1079,6 +1098,19 @@ class LayerCompiler:
         # in dim-position allocation, so they're held separately.
         self.block_ops: List[Operation] = []
         self.model_ops: List[Operation] = []
+        # Compile-time dim slot sharing via liveness analysis. ``None``
+        # defers to the ``C4_DIM_LIVENESS`` env var; default OFF preserves
+        # bump-pointer behaviour. See ``_compute_dim_layout_with_liveness``.
+        if enable_dim_liveness is None:
+            enable_dim_liveness = _env_flag_dim_liveness()
+        self.enable_dim_liveness: bool = bool(enable_dim_liveness)
+        # Populated by ``compile()`` after liveness allocation. Each entry
+        # describes one liveness-merged slot:
+        #   {"slot_idx": int, "members": [dim_name, ...], "size": int}
+        # Empty when liveness is disabled. Used by tests/diagnostics and by
+        # the metrics report in ``liveness_savings_report``.
+        self.liveness_slots: List[Dict[str, Any]] = []
+        self.liveness_stats: Dict[str, Any] = {}
 
     def declare_dim(self, name: str, size: int, pinned: Optional[int] = None,
                     alias_of: Optional[str] = None):
@@ -1383,7 +1415,12 @@ class LayerCompiler:
                     f"target_op_name"
                 )
 
-        dim_positions = self._allocate_dims()
+        if self.enable_dim_liveness:
+            dim_positions = self._compute_dim_layout_with_liveness(
+                attn_ffn_ops, layer_assignment
+            )
+        else:
+            dim_positions = self._allocate_dims()
 
         n_layers = (max(layer_assignment.values()) + 1) if layer_assignment else 0
         # d_model = highest position + size; supports both pinned and bump-pointer.
@@ -2036,6 +2073,379 @@ class LayerCompiler:
                 )
             positions[name] = positions[base]
         return positions
+
+    # ------------------------------------------------------------------
+    # Compile-time dim slot sharing via liveness analysis (Phase 11.A).
+    #
+    # Replaces the bump-pointer allocator with a register-allocation-style
+    # graph colouring over the residual-stream dims:
+    #
+    #   1. For each unpinned, non-aliased dim, compute a lifetime
+    #      interval [def_layer, last_use_layer] from the scheduled layer
+    #      assignment plus ``find_producers`` / ``find_consumers``.
+    #   2. Cross-step dims (read as ``DIM.*.-1`` or in the cross-step
+    #      durable allowlist) and every MARKER / OPCODE_FLAG / CONST dim
+    #      are forced live-forever — they NEVER share.
+    #   3. Build the interference graph: two dims interfere iff their
+    #      lifetime intervals overlap by any layer.
+    #   4. Greedy-colour the graph (first-fit, ordered by lifetime start).
+    #      Bands (width > 1) share only with bands of the same width;
+    #      single-cell scalars share with other compatible single-cell
+    #      slots. Each colour class collapses onto one residual slot.
+    #   5. Lay the colour classes out after the highest pinned endpoint
+    #      so pinned dims and aliases continue to follow the bump-pointer
+    #      semantics. Aliases bind to their base's chosen position last.
+    #
+    # Soundness invariant: dims that share a slot must NEVER be live at
+    # runtime simultaneously. The lifetime computation is a conservative
+    # over-approximation: cross-step durables and all role-bearing markers
+    # are excluded from sharing, so a false-sharing bug would have to come
+    # from a scratch dim with an under-reported lifetime. Tests enforce
+    # the disjoint-lifetime contract end-to-end.
+    # ------------------------------------------------------------------
+
+    _LIVENESS_NEVER_SHARE_PREFIXES: Tuple[str, ...] = (
+        "MARK_",
+        "OP_",
+        "NEXT_",
+        "IS_",
+        "HAS_",
+        "L1H",
+    )
+    _LIVENESS_NEVER_SHARE_NAMES: frozenset = frozenset({
+        "CONST",
+        "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+        "EMBED_LO", "EMBED_HI",
+        "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+        "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+        "H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",
+        "OUTPUT_LO", "OUTPUT_HI", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_PREV_STEP",
+        "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
+        "MEM_STORE", "MEM_ADDR_SRC",
+        "PSH_AT_SP",
+        "LAST_WAS_BYTE", "IO_IS_PUTCHAR", "IO_IS_PRTF",
+        "IO_IN_OUTPUT_MODE", "IO_OUTPUT_COMPLETE",
+        "IO_STATE", "IO_FORMAT_POS",
+        "OPCODE_BASE", "OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
+        "OPCODE_BASE_BYTE0", "OPCODE_BASE_BYTE1",
+        "OP_LC_RELAY", "OP_LI_RELAY", "OP_SI_RELAY",
+        "MARK_CS", "MARK_THINKING_START", "MARK_THINKING_END",
+        "MARK_SE_ONLY", "MARK_SE", "MARK_MEM", "MARK_HALT", "MARK_BP",
+        "MARK_STACK0", "MARK_STACK1", "MARK_STACK2",
+        "IS_MARK",
+        "CMP",
+        # CMP cascade per-opcode bytes — embed-time durable.
+        "CMP+0", "CMP+1", "CMP+2", "CMP+3", "CMP+4",
+        "CMP+5", "CMP+6", "CMP+7", "CMP+8", "CMP+9",
+    })
+
+    def _liveness_never_share(self, name: str) -> bool:
+        """Return True if a dim must keep a private slot (no sharing).
+
+        Markers, opcode flags, NEXT_* predictors, structural / output bands,
+        and the cross-step-durable allowlist all stay private even when
+        their per-step lifetimes look short — they are live across VM
+        steps or carry role identity that downstream queries assume is
+        stable. This is a conservative over-approximation: false negatives
+        (sharing-eligible dims wrongly flagged) cost slot budget but never
+        correctness.
+        """
+        if name in self._LIVENESS_NEVER_SHARE_NAMES:
+            return True
+        for prefix in self._LIVENESS_NEVER_SHARE_PREFIXES:
+            if name.startswith(prefix):
+                return True
+        if Operation._is_cross_step_dim_name(name):
+            return True
+        return False
+
+    def _compute_dim_lifetimes(
+        self,
+        attn_ffn_ops: List[Operation],
+        layer_assignment: Dict[str, int],
+    ) -> Dict[str, Tuple[int, int]]:
+        """Compute ``dim_name -> (def_layer, last_use_layer)`` intervals.
+
+        Walks every attn/ffn op and tags the dim's def-layer with the
+        smallest layer that writes it, and the last-use layer with the
+        largest layer that reads it. Dims read across steps (``DIM.*.-1``)
+        extend their last-use layer to the end of the schedule (effectively
+        always live). Dims with no recorded layer (model-level or
+        block-only writes) get a degenerate (0, n_layers-1) interval so
+        the colouring treats them as long-lived rather than dead.
+
+        Returns a dict keyed by *unversioned* base dim names — SSA forms
+        (``BASE.WRITER.STEP``) are resolved to their base via the alias
+        map so the lifetime tracks the physical residual slot, not the
+        abstract version.
+        """
+        from .ssa_dim import base_of, is_ssa_form
+
+        n_layers = (max(layer_assignment.values()) + 1) if layer_assignment else 1
+        # Use n_layers - 1 as the "end" marker; we cap "live forever" to it.
+        last_layer = max(0, n_layers - 1)
+
+        def_layer: Dict[str, int] = {}
+        last_use: Dict[str, int] = {}
+
+        for op in attn_ffn_ops:
+            layer = layer_assignment.get(op.name)
+            if layer is None:
+                continue
+            for w in op.writes:
+                base = base_of(w) if is_ssa_form(w) else w
+                if base in def_layer:
+                    if layer < def_layer[base]:
+                        def_layer[base] = layer
+                else:
+                    def_layer[base] = layer
+                # A write also counts as a use at its layer (covers
+                # read-modify-write patterns).
+                if base not in last_use or layer > last_use[base]:
+                    last_use[base] = layer
+            for r in op.reads:
+                base = base_of(r) if is_ssa_form(r) else r
+                # Cross-step reads extend live-to-end of the schedule.
+                extended = Operation._is_cross_step_dim_name(r) or (
+                    is_ssa_form(r) and parse_ssa_name(r).is_cross_step
+                )
+                if extended:
+                    last_use[base] = last_layer
+                else:
+                    if base not in last_use or layer > last_use[base]:
+                        last_use[base] = layer
+
+        lifetimes: Dict[str, Tuple[int, int]] = {}
+        for name in self.dims:
+            d = def_layer.get(name, 0)
+            u = last_use.get(name, last_layer)
+            # If a dim is read before it is written (model-level writer),
+            # widen the interval to cover both endpoints conservatively.
+            if u < d:
+                u = d
+            lifetimes[name] = (d, u)
+        return lifetimes
+
+    def _compute_dim_layout_with_liveness(
+        self,
+        attn_ffn_ops: List[Operation],
+        layer_assignment: Dict[str, int],
+    ) -> Dict[str, int]:
+        """Allocate dim positions with slot sharing via liveness analysis.
+
+        Returns a ``dim_name -> position`` mapping just like
+        :meth:`_allocate_dims`. Pinned dims and aliases retain their
+        bump-pointer semantics; sharing runs only over unpinned,
+        non-aliased dims that are eligible.
+
+        Layout strategy: preserve the bump-pointer dim ORDERING (so the
+        starting position of every dim is at most the bump-pointer
+        position) and only collapse a dim back onto an EARLIER dim's
+        slot when the earlier dim's lifetime has fully ended before the
+        new one starts. This guarantees:
+
+          1. ``d_model`` never grows compared with bump-pointer.
+          2. Downstream consumers that hardcode dim positions
+             (e.g. ``efficient_alu_neural.py`` bakes a 512-wide W_proj
+             that indexes ``BD.ALU_LO + k``) still see ALU_LO at the
+             same or earlier slot index.
+          3. The shared-slot members all have disjoint lifetimes by
+             construction.
+
+        The method is pure: it does NOT mutate ``self.dims`` or
+        ``self._pinned`` / ``self._aliases``. It updates two pieces of
+        bookkeeping for diagnostics:
+
+          * ``self.liveness_slots`` — one entry per residual slot the
+            sharing pass produced, listing the dims that share it.
+          * ``self.liveness_stats`` — coarse counters (total dims,
+            shared dims, savings) reported by
+            :meth:`liveness_savings_report`.
+        """
+        pinned = getattr(self, "_pinned", {}) or {}
+        aliases = getattr(self, "_aliases", {}) or {}
+
+        positions: Dict[str, int] = {}
+        # 1. Place pinned dims (excluding aliases) at their requested slot.
+        for name, pos in pinned.items():
+            if name in aliases:
+                continue
+            positions[name] = pos
+        max_pinned_end = 0
+        for name, pos in pinned.items():
+            if name in aliases:
+                continue
+            max_pinned_end = max(max_pinned_end, pos + self.dims[name])
+
+        # 2. Compute lifetimes for every dim.
+        lifetimes = self._compute_dim_lifetimes(attn_ffn_ops, layer_assignment)
+
+        # 3. Bump-pointer the unpinned, non-aliased dims in DECLARATION
+        # order — but each shareable dim first tries to slot into an
+        # EARLIER shareable dim's position whose lifetime ended before
+        # ours starts and whose width matches. Earlier dims keep their
+        # bump-pointer positions exactly, so any downstream consumer
+        # that holds ``positions[X]`` as a structural index sees X at
+        # the SAME slot it would have in the bump-pointer build.
+        #
+        # ``slot_index[size] = [(position, dim_name, last_use), ...]``
+        # tracks every existing slot we might donate to a later dim,
+        # bucketed by width.
+        slot_index: Dict[int, List[Tuple[int, str, int]]] = {}
+        # Reverse-lookup: position -> (slot_idx, members)
+        slot_classes: List[Dict[str, Any]] = []
+        position_to_class: Dict[int, int] = {}
+
+        cursor = max_pinned_end
+        for name, size in self.dims.items():
+            if name in pinned or name in aliases:
+                continue
+            d, u = lifetimes[name]
+            shared = False
+            if not self._liveness_never_share(name):
+                # Find an earlier shareable slot whose last_use is
+                # strictly before ``d``. Same-size bucket only.
+                bucket = slot_index.get(size, [])
+                for entry_idx in range(len(bucket)):
+                    pos, donor, donor_last = bucket[entry_idx]
+                    if donor_last < d:
+                        # Donor's lifetime ended before our def — share.
+                        positions[name] = pos
+                        cls_idx = position_to_class[pos]
+                        slot_classes[cls_idx]["members"].append(name)
+                        if u > slot_classes[cls_idx]["last_use"]:
+                            slot_classes[cls_idx]["last_use"] = u
+                        # Update bucket's last_use so a still-later
+                        # shareable dim sees the union.
+                        bucket[entry_idx] = (
+                            pos, donor,
+                            max(donor_last, u),
+                        )
+                        shared = True
+                        break
+            if shared:
+                continue
+            # Fresh slot at the bump cursor.
+            positions[name] = cursor
+            cls_idx = len(slot_classes)
+            slot_classes.append({
+                "size": size,
+                "position": cursor,
+                "members": [name],
+                "last_use": u,
+                "first_def": d,
+                "shareable": not self._liveness_never_share(name),
+            })
+            position_to_class[cursor] = cls_idx
+            # Only register as a donor if the dim is shareable; never-share
+            # dims (markers, opcode flags, etc.) must NEVER be donated.
+            if not self._liveness_never_share(name):
+                slot_index.setdefault(size, []).append((cursor, name, u))
+            cursor += size
+
+        # 4. Aliases resolve last (same as bump-pointer path).
+        for name in list(aliases):
+            base = aliases[name]
+            for _ in range(len(self.dims) + 1):
+                if base not in aliases:
+                    break
+                base = aliases[base]
+            if base not in positions:
+                raise ValueError(
+                    f"Alias {name!r} references unknown base dim {base!r}"
+                )
+            positions[name] = positions[base]
+
+        # 5. Soundness check: every multi-member slot's members must
+        # have pairwise-disjoint lifetimes.
+        for cls in slot_classes:
+            if len(cls["members"]) < 2:
+                continue
+            members = cls["members"]
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    a, b = members[i], members[j]
+                    ad, au = lifetimes[a]
+                    bd_, bu = lifetimes[b]
+                    if not (au < bd_ or ad > bu):
+                        raise RuntimeError(
+                            "dim-liveness soundness check failed: dims "
+                            f"{a!r} (live [{ad},{au}]) and {b!r} (live "
+                            f"[{bd_},{bu}]) share slot but lifetimes overlap"
+                        )
+
+        # 6. Record diagnostics for ``liveness_savings_report``.
+        self.liveness_slots = [
+            {
+                "slot_idx": idx,
+                "members": list(cls["members"]),
+                "size": cls["size"],
+                "position": cls["position"],
+            }
+            for idx, cls in enumerate(slot_classes)
+        ]
+        merged_dims = sum(
+            len(cls["members"]) for cls in slot_classes
+            if len(cls["members"]) > 1
+        )
+        # Count dims that were *donated* into vs. fresh allocations.
+        saved_dim_count = sum(
+            len(cls["members"]) - 1 for cls in slot_classes
+            if len(cls["members"]) > 1
+        )
+        shareable_dim_count = sum(
+            len(cls["members"]) for cls in slot_classes
+            if cls.get("shareable")
+        )
+        private_dim_count = sum(
+            len(cls["members"]) for cls in slot_classes
+            if not cls.get("shareable")
+        )
+        self.liveness_stats = {
+            "total_dims": len(self.dims),
+            "pinned": sum(1 for n in self.dims if n in pinned and n not in aliases),
+            "aliases": len(aliases),
+            "private": private_dim_count,
+            "shareable": shareable_dim_count,
+            "slot_classes": len(slot_classes),
+            "merged_dims": merged_dims,
+            "saved_dim_count": saved_dim_count,
+            "d_model": cursor,
+        }
+        return positions
+
+    def liveness_savings_report(self) -> Dict[str, Any]:
+        """Return a structured savings report for the most recent compile.
+
+        Empty when liveness was not enabled. Reported counters mirror
+        ``self.liveness_stats`` and add a per-category breakdown computed
+        from the dim-name schema. Useful for the headline numbers in
+        the smoke / CI summary.
+        """
+        if not self.liveness_stats:
+            return {}
+        try:
+            from .ir_types import schema_for
+        except Exception:
+            schema_for = None  # type: ignore[assignment]
+
+        category_counts: Dict[str, int] = {}
+        category_shared: Dict[str, int] = {}
+        for slot in self.liveness_slots:
+            for member in slot["members"]:
+                if schema_for is not None:
+                    cat = schema_for(member).type.name
+                else:
+                    cat = "UNKNOWN"
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+                if len(slot["members"]) > 1:
+                    category_shared[cat] = category_shared.get(cat, 0) + 1
+        return {
+            **self.liveness_stats,
+            "category_counts": category_counts,
+            "category_shared": category_shared,
+            "slots": list(self.liveness_slots),
+        }
 
 
 def build_model_from_layout(layout: ModelLayout, S: float = 100.0,
