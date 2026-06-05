@@ -184,8 +184,12 @@ def make_layer7_operand_gather_op() -> Operation:
         # this op (1 from layer9_alu, 1 from
         # layer10_psh_stack0_passthrough_bake, and 5 L14 OUTPUT_HI
         # writers). See .agent-logs/scheduler_phase_a_2026_06_02.md.
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — add
+        # MARK_BP, MARK_SP (head 1 K reads ``BD.MARK_BP`` + ``BD.MARK_SP``
+        # at slot 0; BP/SP marker self-attention gate for LEA/ADJ/ENT).
         reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA", "OP_ADJ", "OP_ENT",
                "CONST",
+               "MARK_BP", "MARK_SP",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "OUTPUT_LO.*.-1", "OUTPUT_HI.*.-1"},
         writes={"ALU_LO", "ALU_HI"},
@@ -356,13 +360,30 @@ def make_layer7_memory_heads_op() -> Operation:
         # {,_bake}, head6_ax_carry_refresh). L7 fires before L8 in the
         # same step. Same-step L3 / L5 contributions still land at the
         # same numeric position.
+        # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
+        # the previously-undeclared baked reads/writes for the L7 memory
+        # heads (heads 2-7):
+        #   - Q gates use BYTE_INDEX_0/1/2, H1/H3/H4 (marker-distance
+        #     heads), IS_BYTE, MARK_SP, CONST. The structural offsets
+        #     index size-7 marker-distance bands.
+        #   - Head 7 V reads MEM_STORE/MEM_ADDR_SRC/OP_ENT (and writes
+        #     them back via O); these are flag relays.
+        #   - Head 6 V reads CMP+0..4 (CMP[3] relay) and writes CMP back.
+        #   - Head 5 V reads OP_LEA (relayed to CMP[7]).
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
-               "OP_LI", "OP_LC", "OP_PSH", "OP_SI", "OP_SC",
+               "MARK_SP", "MARK_BP",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "H1", "H3", "H4",
+               "IS_BYTE", "CONST",
+               "MEM_STORE", "MEM_ADDR_SRC", "OP_ENT",
+               "CMP",
+               "OP_LI", "OP_LC", "OP_LEA", "OP_PSH", "OP_SI", "OP_SC",
                "OP_ADD", "OP_SUB",
                # Head 5 reads OP_AND/OP_OR/OP_XOR for the bitwise byte
                # propagation relays and OP_SHR for the byte-zero cleanup relay.
                "OP_AND", "OP_OR", "OP_XOR", "OP_SHR",
                "OP_JSR",  # head 5 V slot 8 (existing, declared for completeness)
+               "PSH_AT_SP",
                "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1", "TEMP.*.-1"},
         writes={"OP_LI_RELAY", "OP_LC_RELAY", "PSH_AT_SP",
                 "TEMP", "ADDR_KEY",
@@ -370,7 +391,17 @@ def make_layer7_memory_heads_op() -> Operation:
                 # NOCARRY_ALU_OP relay to TEMP[7]. (TEMP is already in writes
                 # but listed here for clarity.) Head 5 also writes the OP_JSR
                 # relay back to OP_JSR at AX byte positions (added 2026-05-12).
-        "OP_JSR", "OP_SI", "OP_SC"},
+                "OP_JSR", "OP_SI", "OP_SC",
+                # Heads 2-4 O write ADDR_B0_LO/HI / ADDR_B1_LO/HI /
+                # ADDR_B2_LO/HI bands (the "ADDR_KEY" entry above named
+                # the conceptual band but the residual writes land in
+                # these per-byte sub-bands).
+                "ADDR_B0_LO", "ADDR_B0_HI",
+                "ADDR_B1_LO", "ADDR_B1_HI",
+                "ADDR_B2_LO", "ADDR_B2_HI",
+                # Head 7 O writes MEM_STORE / MEM_ADDR_SRC / OP_ENT back
+                # to MEM byte positions; head 5 / 6 O write CMP slots.
+                "MEM_STORE", "MEM_ADDR_SRC", "OP_ENT", "CMP"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer7_memory_heads_ir,
