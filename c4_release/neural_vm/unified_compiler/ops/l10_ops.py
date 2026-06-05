@@ -1445,6 +1445,21 @@ def _layer10_bp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             AP(slot, BD.H1 + 1, -3.0 * M),
             AP(slot, BD.H1 + 2, -3.0 * M),
             AP(slot, BD.H1 + 3, -3.0 * M),
+            # H1+4 (L0 head 1 "MEM marker within dist 4.5") blocker: the
+            # top_store_query aux block was designed for STACK0-store contexts;
+            # at the MEM-addr0 input position of step 0 the residual carries
+            # H1+4=+1.0 (MEM marker nearby), MEM_STORE=+2.0, MEM_ADDR_SRC=+1.0,
+            # CONST=+1.0, giving a slot-40 query sum of +5499 (POSITIVE -> fires)
+            # which produces a spurious +2.0 add to OUTPUT_LO[0]/OUTPUT_HI[0]
+            # via head 7's V/O passthrough. The four sibling H1+0..3 blockers
+            # already exist for the PC/AX/SP/BP marker proximity dims; adding
+            # H1+4 closes the MEM-marker leak. -3.0*M = -15000 mirrors the
+            # existing sibling block magnitude.
+            # See docs/VAR_REAL_ATTRIBUTION_2026_06_05.md "Concrete fix
+            # hypothesis option 1" (the brief named the dim MARK_MEM; the
+            # actual residual leak is via the H1+4 proximity output, which is
+            # what the existing -3.0*M block applies to for H1+0..3).
+            AP(slot, BD.H1 + 4, -3.0 * M),
         )
 
     return replace(
