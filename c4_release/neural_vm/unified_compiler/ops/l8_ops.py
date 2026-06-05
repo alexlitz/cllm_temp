@@ -1534,6 +1534,11 @@ def make_layer8_multibyte_routing_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_routing",
+        # Phase 1 (memory cluster fix plan): shares L8 FFN unit range with
+        # ``layer8_sp_gathered_sentinel`` at a disjoint sub-range (this op
+        # owns units 0..2054; the sentinel owns one trailing unit at 2055).
+        # See docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("ffn_units",),
         reads={"IS_BYTE", "H1", "OP_IMM", "MARK_AX",
                "AX_CARRY_LO", "AX_CARRY_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
@@ -2596,6 +2601,10 @@ def make_layer8_sp_gathered_sentinel_op() -> Operation:
 
     return Operation(
         name="layer8_sp_gathered_sentinel",
+        # Phase 1 (memory cluster fix plan): shares L8 FFN unit range with
+        # ``layer8_multibyte_routing`` at a disjoint sub-range. See
+        # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("ffn_units",),
         reads={"MARK_SP"},
         writes={"SP_GATHERED_THIS_STEP"},
         kind="block",

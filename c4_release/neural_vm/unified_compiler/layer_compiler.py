@@ -48,6 +48,11 @@ import warnings
 from dataclasses import InitVar, dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
+from .slot_registry import (
+    ALLOWED_SLOT_KINDS as _SLOT_REGISTRY_ALLOWED_KINDS,
+    SlotRegistry,
+    derive_slot_ids_for_op,
+)
 from .ssa_dim import SSA_ANY_WRITER, is_ssa_form, parse_ssa_name
 
 
@@ -399,6 +404,18 @@ class Operation:
     # dynamic placement does not leak old physical layer numbers into user
     # facing blocker lists.
     semantic_label: Optional[str] = None
+    # Phase 1 (memory cluster fix plan, docs/MEMORY_CLUSTER_FIX_PLAN_2026_06_05.md):
+    # slot-share opt-out for the compile-time slot-conflict registry. When this
+    # op's bake legitimately shares a slot kind with another op at the same
+    # layer (e.g. multiple L10 tail-correction families sharing block.ffn at
+    # disjoint hidden-unit ranges), list those slot kinds here. Allowed values
+    # are the entries of ``slot_registry.ALLOWED_SLOT_KINDS``: ``"ffn"``,
+    # ``"attn"``, ``"attn_head"``, ``"attn_matrix"``, ``"post_ops"``,
+    # ``"post_ops_append"``, ``"ffn_units"``. Empty (the default) means the
+    # op claims its slots exclusively; the registry will refuse to compile
+    # if another non-opted-in op claims the same slot at the same layer.
+    # See docs/SLOT_REGISTRY_AUDIT_2026_06_05.md for the live audit.
+    slot_share: Tuple[str, ...] = ()
 
     def __post_init__(
         self,
@@ -1307,6 +1324,20 @@ class LayerCompiler:
                 f"Op {op.name!r} semantic_label must be str or None; "
                 f"got {type(op.semantic_label).__name__}"
             )
+        # An invalid slot_share entry would silently disable nothing
+        # without this check (typo like "fnn_units" → no opt-out).
+        if not isinstance(op.slot_share, (tuple, list)):
+            raise ValueError(
+                f"Op {op.name!r} slot_share must be a tuple of slot-kind "
+                f"strings; got {type(op.slot_share).__name__}"
+            )
+        for kind in op.slot_share:
+            if kind not in _SLOT_REGISTRY_ALLOWED_KINDS:
+                raise ValueError(
+                    f"Op {op.name!r} slot_share entry {kind!r} is not a "
+                    f"recognized slot kind. Allowed: "
+                    f"{sorted(_SLOT_REGISTRY_ALLOWED_KINDS)}"
+                )
         # Validate dim-ownership claims (if any). Accept legacy 3-tuple
         # ``(layer_idx, scope, identifier)`` and auto-promote to 4-tuple with
         # ``column=None`` for back-compat with pre-column-granularity ops.
@@ -1516,6 +1547,17 @@ class LayerCompiler:
             if op.ffn_units_used > prev:
                 ffn_widths[op.layer_idx] = op.ffn_units_used
 
+        # Phase 1 of memory cluster fix plan: slot-conflict registry scan.
+        # Records every ``(layer, slot_id)`` claim derived from each op's
+        # produces-sentinel / compiler_ir / ffn_units_used. Conflicts that
+        # are not opted-into via ``Operation.slot_share`` raise
+        # ``SlotConflictError``. The scan runs AFTER layer assignment so we
+        # have the final per-op layer for every attn/ffn/block op.
+        # NOTE: ``ops_per_layer`` carries only attn/ffn ops. Block ops live
+        # in ``self.block_ops`` and resolve their layer via the same
+        # ``layer_assignment`` map populated above.
+        self._run_slot_conflict_scan(ops_per_layer, layer_assignment)
+
         return ModelLayout(
             d_model=d_model,
             n_layers=n_layers,
@@ -1526,6 +1568,85 @@ class LayerCompiler:
             model_ops=list(self.model_ops),
             ffn_widths=ffn_widths,
         )
+
+    # --------------------------------------------------------------------
+    # Slot-conflict registry (Phase 1 of memory cluster fix plan,
+    # docs/MEMORY_CLUSTER_FIX_PLAN_2026_06_05.md). See
+    # ``slot_registry.py`` for the schema. Catches the silent-overwrite
+    # class of bug that V2/V3/V4 of the memory cluster fix all regressed
+    # against. The scan is gated on a flag so the integration can be
+    # disabled if a downstream regression surfaces — set
+    # ``LayerCompiler.disable_slot_registry = True`` (class attribute) or
+    # set the environment variable ``C4_DISABLE_SLOT_REGISTRY=1`` to skip.
+    # --------------------------------------------------------------------
+
+    def _run_slot_conflict_scan(
+        self,
+        ops_per_layer: List[List["Operation"]],
+        layer_assignment: Dict[str, int],
+    ) -> None:
+        """Build a :class:`SlotRegistry` from placed ops and raise on conflict.
+
+        Three op classes contribute claims:
+
+          * attn/ffn ops, layer comes from ``ops_per_layer``;
+          * block ops, layer resolved via ``layer_assignment`` then
+            falling back to ``op.layer_idx`` / ``op.target_op_name``;
+          * model-level ops with an explicit ``layer_idx``.
+
+        Model ops without a ``layer_idx`` are skipped — head/embedding
+        bakes touch every block uniformly and don't claim a structural
+        slot at a specific layer.
+        """
+        if (
+            getattr(type(self), "disable_slot_registry", False)
+            or os.environ.get("C4_DISABLE_SLOT_REGISTRY", "") == "1"
+        ):
+            return
+        registry = SlotRegistry()
+
+        def _record(op: "Operation", layer: int) -> None:
+            for slot_id in derive_slot_ids_for_op(op):
+                registry.claim(
+                    op_name=op.name,
+                    layer_idx=layer,
+                    slot_id=slot_id,
+                    op_kind=op.kind,
+                    slot_share=tuple(op.slot_share),
+                )
+
+        for layer_idx, ops_at_layer in enumerate(ops_per_layer):
+            for op in ops_at_layer:
+                _record(op, layer_idx)
+
+        for op in self.block_ops:
+            # ``compile()`` populates ``layer_assignment`` for block ops
+            # that arrived via ``self.ops``, but every block op since
+            # Phase 8.A.4 lands in ``self.block_ops`` via ``add_op`` and
+            # so is absent from ``layer_assignment``. Resolve target
+            # layer like :meth:`ModelLayout.resolve_block_op_layer`:
+            # ``layer_idx`` wins, else ``target_op_name`` → that op's
+            # layer.
+            target_layer = layer_assignment.get(op.name)
+            if target_layer is None and op.layer_idx is not None:
+                target_layer = int(op.layer_idx)
+            if target_layer is None and op.target_op_name is not None:
+                target_layer = layer_assignment.get(op.target_op_name)
+            if target_layer is None:
+                # ``compile()`` would have raised on an unresolved block
+                # op already; this branch is defensive.
+                continue
+            _record(op, int(target_layer))
+
+        for op in self.model_ops:
+            if op.layer_idx is not None:
+                _record(op, int(op.layer_idx))
+
+        # Audit tools (and the slow integration test in
+        # tests/test_slot_registry.py) read this attribute to inspect
+        # the registry without re-running the derivation.
+        self._last_slot_registry = registry
+        registry.raise_on_conflict()
 
     # --------------------------------------------------------------------
     # Dim-ownership claim collision detection (Phase 1, Agent B of

@@ -810,6 +810,12 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
 
     return Operation(
         name="efficient_l11_alumul_wrap",
+        # Phase 1 (memory cluster fix plan): the 10 L11/L12 mul stages and
+        # this wrapper all co-bake ``block.ffn[FlattenedALUMul]`` on the
+        # same L11 block via :func:`_ensure_l11_mul_module`. Module
+        # assembly, not silent overwrites. See
+        # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("ffn",),
         reads=set(),
         writes=set(),
         kind="block",
@@ -895,6 +901,9 @@ def make_l11_alu_mul_bdtoge_op() -> Operation:
 
     return Operation(
         name="l11_alu_mul_bdtoge",
+        # Phase 1 (memory cluster fix plan): co-bakes L11 block.ffn[FlattenedALUMul]
+        # with sibling mul stages. See docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("ffn",),
         reads={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI", "OP_MUL"},
         writes=set(),
         kind="block",
@@ -936,6 +945,8 @@ def make_l11_alu_mul_schoolbook_op() -> Operation:
 
     return Operation(
         name="l11_alu_mul_schoolbook",
+        # Phase 1 (memory cluster fix plan): co-bakes L11 block.ffn[FlattenedALUMul].
+        slot_share=("ffn",),
         reads={"OP_MUL"},
         writes=set(),
         kind="block",
@@ -976,6 +987,8 @@ def make_l11_alu_mul_carrypass1_op() -> Operation:
 
     return Operation(
         name="l11_alu_mul_carrypass1",
+        # Phase 1 (memory cluster fix plan): co-bakes L11 block.ffn[FlattenedALUMul].
+        slot_share=("ffn",),
         reads={"OP_MUL"},
         writes=set(),
         kind="block",
@@ -1017,6 +1030,8 @@ def make_l11_alu_mul_carrypass2_op() -> Operation:
 
     return Operation(
         name="l11_alu_mul_carrypass2",
+        # Phase 1 (memory cluster fix plan): co-bakes L11 block.ffn[FlattenedALUMul].
+        slot_share=("ffn",),
         reads={"OP_MUL"},
         writes=set(),
         kind="block",
@@ -1059,6 +1074,8 @@ def make_l11_alu_mul_carrypass3_op() -> Operation:
 
     return Operation(
         name="l11_alu_mul_carrypass3",
+        # Phase 1 (memory cluster fix plan): co-bakes L11 block.ffn[FlattenedALUMul].
+        slot_share=("ffn",),
         reads={"OP_MUL"},
         writes=set(),
         kind="block",
@@ -1100,6 +1117,9 @@ def make_l12_alu_mul_genprop_op() -> Operation:
 
     return Operation(
         name="l12_alu_mul_genprop",
+        # Phase 1 (memory cluster fix plan): co-bakes L11 block.ffn[FlattenedALUMul]
+        # (the "L12" label is historical — these stages target the same L11 block).
+        slot_share=("ffn",),
         reads={"OP_MUL"},
         writes=set(),
         kind="block",
@@ -1141,6 +1161,8 @@ def make_l12_alu_mul_binarylookahead_op() -> Operation:
 
     return Operation(
         name="l12_alu_mul_binarylookahead",
+        # Phase 1 (memory cluster fix plan): co-bakes L11 block.ffn[FlattenedALUMul].
+        slot_share=("ffn",),
         reads={"OP_MUL"},
         writes=set(),
         kind="block",
@@ -1181,6 +1203,8 @@ def make_l12_alu_mul_finalcorrection_op() -> Operation:
 
     return Operation(
         name="l12_alu_mul_finalcorrection",
+        # Phase 1 (memory cluster fix plan): co-bakes L11 block.ffn[FlattenedALUMul].
+        slot_share=("ffn",),
         reads={"OP_MUL"},
         writes=set(),
         kind="block",
@@ -1223,6 +1247,8 @@ def make_l12_alu_mul_getobd_op() -> Operation:
 
     return Operation(
         name="l12_alu_mul_getobd",
+        # Phase 1 (memory cluster fix plan): co-bakes L11 block.ffn[FlattenedALUMul].
+        slot_share=("ffn",),
         reads=set(),
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
@@ -1360,6 +1386,10 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
 
         return Operation(
             name="l10_alu_divmod_bdtoge",
+            # Phase 1 (memory cluster fix plan): co-bakes L10
+            # block.post_ops[FlattenedDivMod] with sibling divmod stages.
+            # See docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+            slot_share=("post_ops_append",),
             reads={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
                    "OP_DIV", "OP_MOD"},
             writes=set(),
@@ -1398,6 +1428,9 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
 
         return Operation(
             name="l10_alu_divmod_longdiv",
+            # Phase 1 (memory cluster fix plan): co-bakes L10
+            # block.post_ops[FlattenedDivMod].
+            slot_share=("post_ops_append",),
             reads={"OP_DIV", "OP_MOD"},
             writes=set(),
             kind="block",
@@ -1433,6 +1466,9 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
 
         return Operation(
             name="l10_alu_divmod_getobd",
+            # Phase 1 (memory cluster fix plan): co-bakes L10
+            # block.post_ops[FlattenedDivMod].
+            slot_share=("post_ops_append",),
             reads={"OP_DIV", "OP_MOD", "MARK_AX"},
             writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
             kind="block",
@@ -1565,6 +1601,11 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
 
         return Operation(
             name="l10_alu_divmod_install",
+            # Phase 1 (memory cluster fix plan): co-bakes L10
+            # block.post_ops[FlattenedDivMod] (the install step that appends
+            # the assembled composite). See
+            # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+            slot_share=("post_ops_append",),
             # Phase 11.A r3: dropped phase=10.8 — target_op_name +
             # requires['after']: l10_alu_divmod_getobd already pin order.
             reads=set(),

@@ -2143,6 +2143,11 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
 
     return Operation(
         name="layer14_alu_nocarry_ax_bytes_zero",
+        # Phase 1 (memory cluster fix plan): shares L14 FFN unit range with
+        # ``layer14_demo_phase6_wave7`` at a disjoint sub-range (this op
+        # owns units 0..1873; the demo op owns unit 1874). See
+        # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("ffn_units",),
         reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
@@ -2297,6 +2302,11 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
     # tuples go here.
     return Operation(
         name="layer14_demo_phase6_wave7",
+        # Phase 1 (memory cluster fix plan): shares L14 FFN unit range with
+        # ``layer14_alu_nocarry_ax_bytes_zero`` at a disjoint sub-range
+        # (this op owns unit 1874). See
+        # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("ffn_units",),
         reads={"CONST"},
         # Phase 9.B (TEMP SCC fix): drop dead TEMP write. The demo bake
         # emits a zero-weight rule that does not touch any W_down cell

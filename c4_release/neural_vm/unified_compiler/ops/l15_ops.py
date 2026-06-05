@@ -592,6 +592,13 @@ def make_layer15_memory_lookup_op() -> Operation:
 
     return Operation(
         name="layer15_memory_lookup",
+        # Phase 1 (memory cluster fix plan): shares L15 ``block.attn`` with
+        # ``l15_attention_resize`` (a structural-resize op that runs after
+        # the head bake). The resize replaces the attn module's W_q/W_k/
+        # W_v/W_o wholesale to change ``num_heads``, then the memory
+        # lookup re-bakes against the resized module. Legitimate
+        # post-bake structural mutation, not a silent overwrite.
+        slot_share=("attn",),
         # Phase 11 SCC residual (cycle #1, 5-op LEV next-step C-instruction
         # loop): TEMP -> TEMP.*.-1 SSA cross-step rename. l15
         # memory_lookup has phase=None, so the analyser sees l11_mul_partial's
@@ -1865,6 +1872,10 @@ def make_l15_attention_resize_op() -> Operation:
 
     return Operation(
         name="l15_attention_resize",
+        # Phase 1 (memory cluster fix plan): shares L15 ``block.attn`` with
+        # ``layer15_memory_lookup``. See that op for the rationale +
+        # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("attn",),
         reads=set(),
         writes=set(),
         kind="block",

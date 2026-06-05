@@ -6910,6 +6910,12 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
 
     return Operation(
         name="l10_post_op_attach",
+        # Phase 1 (memory cluster fix plan): co-bakes L10
+        # block.post_ops alongside the divmod composite install stages
+        # (l10_alu_divmod_*). Each appends a different structural FFN to
+        # block[10].post_ops — they sequence, not contest. See
+        # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("post_ops_append",),
         reads=set(),
         writes=set(),
         kind="block",

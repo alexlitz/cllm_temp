@@ -320,6 +320,12 @@ def make_layer2_mem_byte_flags_op() -> Operation:
 
     return Operation(
         name="layer2_mem_byte_flags",
+        # Phase 1 (memory cluster fix plan): shares L2 FFN unit range with
+        # ``layer2_initial_pc_bake_cancel`` at a disjoint sub-range (this op
+        # owns units 0..7; the cancel op owns units 8..9). Allow the
+        # slot-conflict registry to coexist them under the ``ffn_units``
+        # share. See docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("ffn_units",),
         reads={"H0", "H1", "H4", "IS_BYTE", "BYTE_INDEX_0",
                "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
         writes={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
@@ -502,6 +508,10 @@ def make_layer2_initial_pc_bake_cancel_op() -> Operation:
 
     return Operation(
         name="layer2_initial_pc_bake_cancel",
+        # Phase 1 (memory cluster fix plan): shares L2 FFN unit range with
+        # ``layer2_mem_byte_flags`` at a disjoint sub-range. See
+        # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("ffn_units",),
         # Phase 11.A r3: dropped phase=2.5 — target_op_name +
         # requires['after']: phase_a_ffn already pin placement and order.
         reads={"MARK_PC", "HAS_SE"},
