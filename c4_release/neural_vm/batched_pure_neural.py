@@ -1867,6 +1867,26 @@ class BatchedPureNeuralRunner:
         if exec_op == Opcode.PSH:
             s.last_pushed_value = int(prev_ax) & 0xFFFFFFFF
 
+        # IMM AX recovery (2026-06-05). The neural L5 byte-decode emits the
+        # wrong AX byte 0 for imm bytes in [0xE0, 0xFF] (e.g. ``IMM 0xFF``
+        # produces AX=0xFFE8 instead of 0xFF, sign-extended). This breaks
+        # ``test_xor_basic`` (IMM 0xFF, PSH, IMM 0xD5, XOR, EXIT) because the
+        # broken AX from IMM 0xFF poisons the pushed operand, and the model's
+        # downstream PC carry-forward also goes off the rails. Since IMM is a
+        # pure literal load (no neural-ALU semantics needed), we always
+        # override REG_AX from the bytecode imm field — mirroring the LEA
+        # override at run_vm.py:2310-2318 and the collapsed-step recovery
+        # below. Cheap and consistent: the bytecode imm IS the spec.
+        if exec_op == Opcode.IMM:
+            imm = (s.bytecode[exec_idx] >> 8) & 0xFFFFFF
+            if imm >= 0x800000:
+                imm -= 0x1000000
+            imm_val = imm & 0xFFFFFFFF
+            s.last_ax = imm_val
+            self._override_register_in_last_step(
+                s.context, Token.REG_AX, imm_val
+            )
+
         # PUTCHAR: append AX byte 0 to output.
         if exec_op == Opcode.PUTCHAR and neural_ax is not None:
             s.output.append(chr(neural_ax & 0xFF))
