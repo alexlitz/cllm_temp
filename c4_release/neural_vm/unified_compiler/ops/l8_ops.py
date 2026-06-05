@@ -1345,7 +1345,15 @@ def make_layer8_multibyte_fetch_op() -> Operation:
 
     return Operation(
         name="layer8_multibyte_fetch",
+        # Declaration audit (2026-06-05): added HAS_SE, MARK_AX, CONST to
+        # mirror the Q/K read set of _layer8_multibyte_fetch_head_spec
+        # (the head spec lowered by the paired ``layer8_multibyte_fetch_bake``
+        # block op uses HAS_SE at slot TOP, MARK_AX as a K-side exclusion at
+        # slot 35, and CONST as the slot 33/34 K seed + slot 35 Q sink).
+        # Anchor reads gate dim-lifetime analysis; the bake op's block kind
+        # filters it out of the same analysis.
         reads={"FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1",
+               "HAS_SE", "MARK_AX", "CONST",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"AX_CARRY_LO", "AX_CARRY_HI"},
         kind="attn",
@@ -1641,9 +1649,29 @@ def make_layer8_sp_gather_op() -> Operation:
 
     return Operation(
         name="layer8_sp_gather",
-        reads={"MARK_AX", "MARK_SP", "OP_ADJ", "OP_ENT", "OP_LEA",
-               "EMBED_LO", "EMBED_HI"},
-        writes={"ALU_LO", "ALU_HI"},
+        # Declaration audit (2026-06-05): added the ADDR_B0/B1/B2_LO/HI
+        # writes the paired ``layer8_sp_gather_bake`` block op actually
+        # produces via _layer8_sp_gather_head_specs (O-side writes the
+        # three address-byte bands). Also expanded the reads to include
+        # the marker / hop / byte-index / CLEAN_EMBED / CONST dims that
+        # the head specs gate on. ALU_LO/HI writes are kept defensively
+        # to preserve any downstream scheduling dep that referenced this
+        # anchor as an ALU_LO/HI writer; the bake itself does NOT write
+        # ALU_LO/HI -- that is owned by sibling ops (layer7_operand_gather,
+        # layer10_stack0_byte_relay_bake, etc.).
+        # The bake op's CMP.*.-1 cross-step read is NOT mirrored here
+        # because at kind="attn" placement L8 it has same-step CMP writers
+        # at L6 and trips the cross-step baseline allowlist gate; the bake
+        # op's block kind carries the cross-step CMP semantics instead.
+        reads={"MARK_AX", "MARK_STACK0", "MARK_SP", "MARK_BP",
+               "H1", "H3", "H4",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST",
+               "OP_ADJ", "OP_ENT", "OP_LEA", "EMBED_LO", "EMBED_HI"},
+        writes={"ALU_LO", "ALU_HI",
+                "ADDR_B0_LO", "ADDR_B0_HI",
+                "ADDR_B1_LO", "ADDR_B1_HI",
+                "ADDR_B2_LO", "ADDR_B2_HI"},
         kind="attn",
         migrated=True,
         declarative_authority="topology_anchor",
