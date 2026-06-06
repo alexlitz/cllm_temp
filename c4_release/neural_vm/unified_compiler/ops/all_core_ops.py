@@ -315,6 +315,15 @@ def all_core_ops(
         # addr_key_neural_decode (14.5). See l14_ops.py:
         # make_layer14_mem_addr_src_default_suppress_op for derivation.
         make_layer14_mem_addr_src_default_suppress_op(),
+        # var-cluster JSR-path sibling (2026-06-06): the f4f9103d SI/SC
+        # cancel above does not fire on JSR step 0 (MEM_ADDR_SRC=0
+        # because JSR uses SP, not STACK0), so var_simple_0/if_var_0/
+        # var_three_0 still failed. This op cancels the L3 +0.940
+        # baseline at the JSR/PSH/ENT store path (MEM_STORE=1 AND
+        # MEM_ADDR_SRC=0). Runs at phase 14.46, immediately after
+        # mem_addr_src_default_suppress (14.45). See l14_ops.py:
+        # make_layer14_jsr_mem_default_suppress_op for derivation.
+        make_layer14_jsr_mem_default_suppress_op(),
         # V2 ADDR_KEY neural decode (BLOG_SPEC.md:830) — flipped on
         # (2026-05-11, blockers-3-4 PR).  Replaces
         # NeuralVMEmbedding._inject_mem_metadata's per-val-byte

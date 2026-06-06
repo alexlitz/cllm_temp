@@ -265,3 +265,86 @@ def _set_layer14_mem_addr_src_default_suppress(ffn, S, BD, start_unit=0):
 
     return unit
 
+
+def _set_layer14_jsr_mem_default_suppress(ffn, S, BD, start_unit=0):
+    """L14 FFN: Cancel the L3 ``mem_byte_0_default`` baseline at JSR/PSH/ENT.
+
+    BUG FIX 2026-06-06 (JSR-path sibling of f4f9103d): ``f4f9103d`` cancels
+    the L3 ``MEM DEFAULT'' +0.940 baseline at SI/SC stores (gated on
+    ``MEM_ADDR_SRC=1``). The var-cluster failures, however, are NOT at
+    SI/SC — they are at **JSR step 0**, where the call instruction pushes
+    the return-address bytes into memory at SP (which sits at 0xFFFC for
+    the var-cluster fixtures, so addr byte 1 = 0xff). The same wrong-
+    direction L3 baseline also corrupts the PSH and ENT address bytes
+    when SP is in high memory.
+
+    JSR, PSH, and ENT all set ``MEM_STORE=1`` (via the L6 opcode-relay
+    head 6, broadcast to MEM byte positions by L7 head 7) but have
+    ``MEM_ADDR_SRC=0`` (the address source is SP, not STACK0). So the
+    gate ``MEM_STORE AND NOT MEM_ADDR_SRC`` selects exactly the JSR /
+    PSH / ENT store path and is disjoint from the SI/SC gate already
+    handled by ``_set_layer14_mem_addr_src_default_suppress``. Non-store
+    opcodes have ``MEM_STORE=0`` so this cancel does not fire and the
+    L3 baseline (which is correct for IMM etc.) survives intact.
+
+    Activation calculation (S=100, with MEM_STORE-MEM_ADDR_SRC=1 for
+    PSH/JSR/ENT):
+      * MARK_MEM marker row: up = S*MARK_MEM + S*MEM_STORE
+        - S*MEM_ADDR_SRC - 1.5*S = S * (1 + 1 - 0 - 1.5) = 0.5*S
+        → silu(0.5*S) ~= S/2 = 50
+      * MEM byte rows: up = S*H1[MEM] + S*BYTE_INDEX_K + S*MEM_STORE
+        - S*MEM_ADDR_SRC - 2.5*S = S * (1 + 1 + 1 - 0 - 2.5) = 0.5*S
+        → silu(0.5*S) ~= S/2 = 50
+      * SI/SC (MEM_STORE=1, MEM_ADDR_SRC=1): gate = 0 → silu(<0) ≈ 0
+      * Non-store ops (MEM_STORE=0): gate = -1.5*S → silu(<0) ≈ 0
+    W_down = -2.0/S → output delta = (S/2) * (-2.0/S) = -1.0, cancels
+    the L3 +0.940 with a small safety margin. Mirrors the L3 rule shape
+    exactly (matching unit count: 2 marker + 6 byte = 8 units).
+    """
+    unit = start_unit
+    MEM_I = 4  # MEM marker index in MARKS array
+
+    # === Cancel L3 ``MEM DEFAULT'' (marker rule, vm_step.py:3335-3349) ===
+    # Fires when MARK_MEM=1 AND MEM_STORE=1 AND MEM_ADDR_SRC=0 (PSH/JSR/ENT).
+    # LO nibble
+    ffn.W_up[unit, BD.MARK_MEM] = S
+    ffn.W_up[unit, BD.MEM_STORE] = S
+    ffn.W_up[unit, BD.MEM_ADDR_SRC] = -S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = -2.0 / S  # cancel L3 +0.940
+    unit += 1
+    # HI nibble
+    ffn.W_up[unit, BD.MARK_MEM] = S
+    ffn.W_up[unit, BD.MEM_STORE] = S
+    ffn.W_up[unit, BD.MEM_ADDR_SRC] = -S
+    ffn.b_up[unit] = -S * 1.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = -2.0 / S
+    unit += 1
+
+    # === Cancel L3 ``MEM addr bytes 1-3 default'' (byte rule, vm_step.py:3351-3369) ===
+    # Fires when H1[MEM]=1 AND BYTE_INDEX_K=1 AND MEM_STORE=1 AND
+    # MEM_ADDR_SRC=0 (K = 0, 1, 2 → MEM addr bytes 1, 2, 3 respectively).
+    for byte_idx_dim in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]:
+        # LO nibble
+        ffn.W_up[unit, BD.H1 + MEM_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.W_up[unit, BD.MEM_STORE] = S
+        ffn.W_up[unit, BD.MEM_ADDR_SRC] = -S
+        ffn.b_up[unit] = -S * 2.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_LO + 0, unit] = -2.0 / S
+        unit += 1
+        # HI nibble
+        ffn.W_up[unit, BD.H1 + MEM_I] = S
+        ffn.W_up[unit, byte_idx_dim] = S
+        ffn.W_up[unit, BD.MEM_STORE] = S
+        ffn.W_up[unit, BD.MEM_ADDR_SRC] = -S
+        ffn.b_up[unit] = -S * 2.5
+        ffn.b_gate[unit] = 1.0
+        ffn.W_down[BD.OUTPUT_HI + 0, unit] = -2.0 / S
+        unit += 1
+
+    return unit
+

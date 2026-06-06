@@ -105,6 +105,15 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     # (14.4) and before addr_key_neural_decode (14.5). See
     # ``make_layer14_mem_addr_src_default_suppress_op``.
     "layer14_mem_addr_src_default_suppress": (None,    8),
+    # var-cluster follow-up sibling (2026-06-06): 8 units that cancel the
+    # same L3 ``mem_byte_0_default`` +0.940 baseline at PSH/JSR/ENT store
+    # positions (MEM_STORE=1 AND MEM_ADDR_SRC=0). The f4f9103d SI/SC
+    # cancel does not fire on JSR step 0 (where addr=SP=0xFFFC), so the
+    # var-cluster failures (var_simple_0, if_var_0, var_three_0) persisted.
+    # Runs at phase 14.46, after mem_addr_src_default_suppress (14.45) and
+    # before addr_key_neural_decode (14.5). See
+    # ``make_layer14_jsr_mem_default_suppress_op``.
+    "layer14_jsr_mem_default_suppress":      (None,    8),
     "layer14_addr_key_neural_decode":        (None, 1728),
     "layer14_jsr_ax_bytes_zero":             (None,    4),
     "layer14_lc_ax_bytes_zero":              (None,    4),
@@ -1934,6 +1943,77 @@ def make_layer14_mem_addr_src_default_suppress_op() -> Operation:
     )
 
 
+def make_layer14_jsr_mem_default_suppress_op() -> Operation:
+    """L14 FFN: Cancel the L3 ``mem_byte_0_default`` baseline at JSR/PSH/ENT.
+
+    Var-cluster JSR-path sibling of ``f4f9103d`` (2026-06-06): the prior
+    SI/SC fix at phase 14.45 cancels the L3 ``MEM DEFAULT'' +0.940
+    baseline when ``MEM_ADDR_SRC=1`` (SI/SC). The var-cluster failures
+    are not at SI/SC, however — they are at the **JSR call** step where
+    the return-address bytes are pushed to memory at SP (which sits at
+    ``0xFFFC`` for the var-cluster fixtures, so addr byte 1 is ``0xff``).
+    JSR (and PSH and ENT) have ``MEM_ADDR_SRC=0`` (the address source is
+    SP, not STACK0), so the SI/SC cancel does NOT fire and the wrong-
+    direction L3 baseline survives.
+
+    JSR/PSH/ENT all set ``MEM_STORE=1`` (via the L6 opcode-relay head 6,
+    broadcast to MEM byte positions by L7 head 7) but have
+    ``MEM_ADDR_SRC=0``. So the gate ``MEM_STORE AND NOT MEM_ADDR_SRC``
+    selects exactly the JSR/PSH/ENT store path and is disjoint from the
+    SI/SC gate already handled by
+    ``layer14_mem_addr_src_default_suppress``. Non-store opcodes have
+    ``MEM_STORE=0`` so this cancel does not fire (the L3 baseline is
+    correct for IMM / arithmetic / branches etc.).
+
+    Pinned to ``layer_idx=14`` via ``kind="block"``. Phase 14.46 places
+    it AFTER ``mem_addr_src_default_suppress`` (14.45) and BEFORE
+    ``addr_key_neural_decode`` (14.5), within the cleanup chain that
+    runs after the L14 mem_generation attention. Allocates 8 units via
+    the chain layout (2 marker units + 6 byte-index units).
+    """
+    def bake(block, dim_positions, S):
+        from ...vm_step import _set_layer14_jsr_mem_default_suppress
+        ffn = block.ffn
+        start_unit = _l14_chain_alloc("layer14_jsr_mem_default_suppress")
+        next_unit = _set_layer14_jsr_mem_default_suppress(
+            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        )
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_jsr_mem_default_suppress",
+        phase=14.46,
+        reads={"MARK_MEM", "H1", "BYTE_INDEX_0", "BYTE_INDEX_1",
+               "BYTE_INDEX_2", "MEM_STORE", "MEM_ADDR_SRC", "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        declarative_bake_fn=bake,
+        # Phase 8.A.4: use ``target_op_name`` to bind to whichever layer
+        # the compiler placed ``layer14_mem_generation`` (the L14 attn
+        # op). Matches the convention used by the other L14 cleanup ops.
+        target_op_name="layer14_mem_generation",
+        migrated=True,
+        # Tier A opcode gating: fires when MEM_STORE=1 AND MEM_ADDR_SRC=0
+        # (PSH/JSR/ENT). MEM_STORE is set for SI/SC/PSH/JSR/ENT at the
+        # AX marker by L5 FFN, relayed to MEM marker by L6 head 6, and
+        # broadcast to MEM byte positions by L7 head 7. MEM_ADDR_SRC=1
+        # only for SI/SC (whose cancel is handled by the prior op at
+        # 14.45). The matching opcodes are OP_PSH, OP_JSR, OP_ENT.
+        opcodes={"OP_PSH", "OP_JSR", "OP_ENT"},
+        requires={"after": "layer14_mem_addr_src_default_suppress"},
+        # Staleness invariants: subtracts the L3 +0.940 baseline at
+        # OUTPUT_LO[0]/HI[0] for PSH/JSR/ENT stores. Canonical register is
+        # the MEM_addr1 byte row (where the var-cluster diagnostic
+        # flagged the 0xff-vs-0x00 inversion); the same shape applies
+        # at the MEM marker (predicting addr_b0) and at MEM_addr2/
+        # MEM_addr3 by symmetry.
+        produces={
+            "OUTPUT_LO": "MEM_addr1",
+            "OUTPUT_HI": "MEM_addr1",
+        },
+    )
+
+
 def _layer14_jsr_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
     """FFNRule program for ``_set_layer14_jsr_ax_bytes_zero``.
 
@@ -2048,21 +2128,21 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
 
     # Dim-ownership claims (W_down output cells). Runs at phase 14.6 after
     # ``layer14_addr_key_neural_decode`` (14.5) which closes the chain at
-    # unit 1870. The bake's auto-fit allocator (Phase 6 Wave 6D) lands the
-    # 4 units back at 1870 because the prior chain claims fill [0, 1870)
+    # unit 1878. The bake's auto-fit allocator (Phase 6 Wave 6D) lands the
+    # 4 units back at 1878 because the prior chain claims fill [0, 1878)
     # contiguously and first-fit on a 4096-wide pool picks the first free
-    # gap. The helper writes 4 units (shifted +8 by var-cluster
-    # follow-up's mem_addr_src_default_suppress insertion 2026-06-05):
-    #   unit 1870: -3/S on OUTPUT_LO[0..15]
-    #   unit 1871: -3/S on OUTPUT_HI[0..15]
-    #   unit 1872: +5/S on OUTPUT_LO[0]
-    #   unit 1873: +5/S on OUTPUT_HI[0]
+    # gap. The helper writes 4 units (shifted +8 by var-cluster JSR-path
+    # follow-up's jsr_mem_default_suppress insertion 2026-06-06):
+    #   unit 1878: -3/S on OUTPUT_LO[0..15]
+    #   unit 1879: -3/S on OUTPUT_HI[0..15]
+    #   unit 1880: +5/S on OUTPUT_LO[0]
+    #   unit 1881: +5/S on OUTPUT_HI[0]
     _claims = set()
     for k in range(16):
-        _claims.add((14, "ffn_W_down", "1870", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1871", f"OUTPUT_HI+{k}"))
-    _claims.add((14, "ffn_W_down", "1872", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1873", "OUTPUT_HI+0"))
+        _claims.add((14, "ffn_W_down", "1878", f"OUTPUT_LO+{k}"))
+        _claims.add((14, "ffn_W_down", "1879", f"OUTPUT_HI+{k}"))
+    _claims.add((14, "ffn_W_down", "1880", "OUTPUT_LO+0"))
+    _claims.add((14, "ffn_W_down", "1881", "OUTPUT_HI+0"))
 
     return Operation(
         name="layer14_jsr_ax_bytes_zero",
@@ -2202,25 +2282,25 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         ffn._l14_unit_counter = next_unit
 
     # Dim-ownership claims (W_down output cells). Runs at phase 14.8 — last
-    # op in the L14 cleanup chain. Predecessors leave the counter at 1878.
+    # op in the L14 cleanup chain. Predecessors leave the counter at 1886.
     # The helper writes 4 units mirroring jsr/lc_ax_bytes_zero (shifted +8
-    # by var-cluster follow-up's mem_addr_src_default_suppress 2026-06-05):
-    #   unit 1878: -3/S on OUTPUT_LO[0..15]
-    #   unit 1879: -3/S on OUTPUT_HI[0..15]
-    #   unit 1880: +5/S on OUTPUT_LO[0]
-    #   unit 1881: +5/S on OUTPUT_HI[0]
+    # by var-cluster JSR-path follow-up's jsr_mem_default_suppress 2026-06-06):
+    #   unit 1886: -3/S on OUTPUT_LO[0..15]
+    #   unit 1887: -3/S on OUTPUT_HI[0..15]
+    #   unit 1888: +5/S on OUTPUT_LO[0]
+    #   unit 1889: +5/S on OUTPUT_HI[0]
     _claims = set()
     for k in range(16):
-        _claims.add((14, "ffn_W_down", "1878", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1879", f"OUTPUT_HI+{k}"))
-    _claims.add((14, "ffn_W_down", "1880", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1881", "OUTPUT_HI+0"))
+        _claims.add((14, "ffn_W_down", "1886", f"OUTPUT_LO+{k}"))
+        _claims.add((14, "ffn_W_down", "1887", f"OUTPUT_HI+{k}"))
+    _claims.add((14, "ffn_W_down", "1888", "OUTPUT_LO+0"))
+    _claims.add((14, "ffn_W_down", "1889", "OUTPUT_HI+0"))
 
     return Operation(
         name="layer14_alu_nocarry_ax_bytes_zero",
         # Phase 1 (memory cluster fix plan): shares L14 FFN unit range with
         # ``layer14_demo_phase6_wave7`` at a disjoint sub-range (this op
-        # owns units 0..1881; the demo op owns unit 1882). See
+        # owns units 0..1889; the demo op owns unit 1890). See
         # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
         slot_share=("ffn_units",),
         reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
@@ -2241,19 +2321,20 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         # relay) is populated by L7 head 5 V slot 9 in the same step.
         claims=_claims,
         requires={"after": "layer14_mem_generation"},
-        # The L14 FFN chain (``_l14_unit_counter`` reaches 1882 after this
+        # The L14 FFN chain (``_l14_unit_counter`` reaches 1890 after this
         # op runs). The chain is: temp_clear + temp residue clamp +
         # ADD byte-1 high cleanup (4 units) →
         # clear_addr_key_pollution (48) → clear_output_corruption (3) →
         # PSH MEM high-nibble boost (15) → clear_mem_marker_output (64) →
         # mem_addr_src_default_suppress (8, var-cluster 2026-06-05) →
+        # jsr_mem_default_suppress (8, JSR-path 2026-06-06) →
         # addr_key_neural_decode (1728) →
         # jsr_ax_bytes_zero (4) → lc_ax_bytes_zero (4) → this op (4) →
         # demo_phase6_wave7 (1). Annotating only the chain tail with the
         # cumulative max is sufficient — the compiler aggregates per-layer
         # max across all ops, so this single annotation suffices for L14
         # dynamic sizing.
-        ffn_units_used=1882,
+        ffn_units_used=1890,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",
@@ -2381,7 +2462,7 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
         name="layer14_demo_phase6_wave7",
         # Phase 1 (memory cluster fix plan): shares L14 FFN unit range with
         # ``layer14_alu_nocarry_ax_bytes_zero`` at a disjoint sub-range
-        # (this op owns unit 1874). See
+        # (this op owns unit 1890). See
         # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
         slot_share=("ffn_units",),
         reads={"CONST"},
@@ -2414,13 +2495,14 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
             "layer14_alu_nocarry_ax_bytes_zero",
             "layer14_mem_generation",
         ]},
-        # New chain tail: prior ops fill [0, 1882), the demo's auto-fit
-        # picks unit 1882 (single-unit rule), so the cumulative max is 1883.
-        # Var-cluster follow-up (2026-06-05) added 8 units between
-        # ``clear_mem_marker_output`` and ``addr_key_neural_decode``
-        # (``mem_addr_src_default_suppress``), so prior chain total moved
-        # from 1874 → 1882 → demo lands at 1882 → tail = 1883.
-        ffn_units_used=1883,
+        # New chain tail: prior ops fill [0, 1890), the demo's auto-fit
+        # picks unit 1890 (single-unit rule), so the cumulative max is 1891.
+        # Var-cluster JSR-path follow-up (2026-06-06) added 8 more units
+        # between ``mem_addr_src_default_suppress`` and
+        # ``addr_key_neural_decode`` (``jsr_mem_default_suppress``), so
+        # prior chain total moved 1882 → 1890 → demo lands at 1890 →
+        # tail = 1891.
+        ffn_units_used=1891,
         smoke_tests=set(),
         spec_section="docs/HOW_TO_ADD_A_CORRECTIVE_OP.md",
     )
@@ -2533,19 +2615,19 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         ffn._l14_unit_counter = next_unit
 
     # Dim-ownership claims (W_down output cells). Runs at phase 14.7 after
-    # ``layer14_jsr_ax_bytes_zero`` (14.6) consumes units 1870..1873. The
+    # ``layer14_jsr_ax_bytes_zero`` (14.6) consumes units 1878..1881. The
     # helper writes 4 units mirroring jsr_ax_bytes_zero (shifted +8 by
-    # var-cluster follow-up's mem_addr_src_default_suppress 2026-06-05):
-    #   unit 1874: -3/S on OUTPUT_LO[0..15]
-    #   unit 1875: -3/S on OUTPUT_HI[0..15]
-    #   unit 1876: +5/S on OUTPUT_LO[0]
-    #   unit 1877: +5/S on OUTPUT_HI[0]
+    # var-cluster JSR-path follow-up's jsr_mem_default_suppress 2026-06-06):
+    #   unit 1882: -3/S on OUTPUT_LO[0..15]
+    #   unit 1883: -3/S on OUTPUT_HI[0..15]
+    #   unit 1884: +5/S on OUTPUT_LO[0]
+    #   unit 1885: +5/S on OUTPUT_HI[0]
     _claims = set()
     for k in range(16):
-        _claims.add((14, "ffn_W_down", "1874", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1875", f"OUTPUT_HI+{k}"))
-    _claims.add((14, "ffn_W_down", "1876", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1877", "OUTPUT_HI+0"))
+        _claims.add((14, "ffn_W_down", "1882", f"OUTPUT_LO+{k}"))
+        _claims.add((14, "ffn_W_down", "1883", f"OUTPUT_HI+{k}"))
+    _claims.add((14, "ffn_W_down", "1884", "OUTPUT_LO+0"))
+    _claims.add((14, "ffn_W_down", "1885", "OUTPUT_HI+0"))
 
     return Operation(
         name="layer14_lc_ax_bytes_zero",

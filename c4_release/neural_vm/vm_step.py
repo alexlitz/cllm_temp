@@ -2956,6 +2956,7 @@ from .setup_helpers import (
     _set_layer13_mem_addr_gather,
     _set_layer13_shifts,
     _set_layer14_clear_output_corruption,
+    _set_layer14_jsr_mem_default_suppress,
     _set_layer14_mem_addr_src_default_suppress,
     _set_layer1_ffn,
     _set_layer2_mem_byte_flags,
