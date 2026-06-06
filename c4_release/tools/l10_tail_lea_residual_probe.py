@@ -106,16 +106,6 @@ def main():
                 (Opcode.IMM, 0xD5), Opcode.XOR,
                 Opcode.EXIT,
             ])),
-            ("ADD_16BIT", make_bytecode([
-                (Opcode.IMM, 200), Opcode.PSH,
-                (Opcode.IMM, 100), Opcode.ADD,
-                Opcode.EXIT,
-            ])),
-            ("ADD_CARRY", make_bytecode([
-                (Opcode.IMM, 0xFF), Opcode.PSH,
-                (Opcode.IMM, 1), Opcode.ADD,
-                Opcode.EXIT,
-            ])),
         ]:
             print(f"\n[probe] === {name} ===", flush=True)
             print(f"[probe] bytecode: {[hex(b) for b in bytecode]}", flush=True)
