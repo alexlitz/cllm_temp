@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...constants import INSTR_WIDTH, PC_OFFSET
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
@@ -433,6 +434,54 @@ def _append_pc_byte0_direct_copy_rules(
             threshold=threshold,
             gate=f"{hi_source}+{k}",
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
+        ))
+
+
+def _append_pc_byte0_imm_to_byte_addr_rules(
+    rules: list[FFNRule],
+    *,
+    name_prefix: str,
+    conditions: tuple[tuple[str, float], ...],
+    threshold: float,
+    lo_source: str,
+    write_scale: float,
+) -> None:
+    """Convert an instruction-index immediate into PC byte 0 nibbles.
+
+    BZ/BNZ branch immediates emitted by L5 head 3 into ``FETCH_LO`` carry the
+    raw instruction-index low nibble (e.g. ``BZ 3`` → ``FETCH_LO+3 = 1``),
+    not the encoded PC byte address. The legacy ``vm_step._set_layer4_ffn``
+    BZ/BNZ override (lines 5086-5108) bakes the ``imm * 8 + PC_OFFSET``
+    conversion directly: gate on ``FETCH_LO+k`` (the instruction-index lo
+    nibble) and write into the matching byte-address nibble. This helper
+    mirrors that conversion for the post-L9 ffn block. Because every
+    immediate ``k * 8 + 2`` value has lo nibble ∈ {2, 10} and hi nibble = k>>1,
+    the conversion is exact for instruction indexes 0..15 (target byte
+    addresses up to 0x7A).
+
+    Both OUTPUT_LO (byte 0 low nibble) and OUTPUT_HI_THIS_STEP (byte 0 high
+    nibble) are driven from the same single ``FETCH_LO`` gate per k. The
+    ``hi_source`` parameter is unused for byte 0 because the byte-0 hi
+    nibble is determined entirely by ``k >> 1`` (== ((k*8+2) >> 4) & 0xF).
+    """
+
+    for k in range(16):
+        target_lo = (k * INSTR_WIDTH + PC_OFFSET) & 0xF
+        rules.append(multi_way_and_rule(
+            name=f"{name_prefix}_byteaddr_lo_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"{lo_source}+{k}",
+            writes=((f"OUTPUT_LO+{target_lo}", write_scale),),
+        ))
+    for k in range(16):
+        target_hi = ((k * INSTR_WIDTH + PC_OFFSET) >> 4) & 0xF
+        rules.append(multi_way_and_rule(
+            name=f"{name_prefix}_byteaddr_hi_{k}",
+            conditions=conditions,
+            threshold=threshold,
+            gate=f"{lo_source}+{k}",
+            writes=((f"OUTPUT_HI_THIS_STEP+{target_hi}", write_scale),),
         ))
 
 
@@ -4542,13 +4591,24 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 gate_weight=-1.0,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
-    _append_pc_byte0_direct_copy_rules(
+    # FIX 2026-06-06: BZ branch immediates land in FETCH_LO as raw
+    # instruction-index nibbles (e.g. ``BZ 3`` => ``FETCH_LO+3 = 1``), not
+    # as encoded PC byte addresses. The legacy ``_set_layer4_ffn`` bake
+    # (vm_step.py:5086-5108) converts ``imm * 8 + PC_OFFSET`` inline; the
+    # post-L9 IR path was previously using ``_append_pc_byte0_direct_copy_rules``
+    # which copies the index nibble straight into OUTPUT_LO/HI, producing
+    # PC = imm instead of PC = imm * INSTR_WIDTH + PC_OFFSET. This is the
+    # model-side gap that the ``batched_pure_neural`` BZ/BNZ runner override
+    # (commit 44709e13) was masking. Replacing the helper with the
+    # index-to-byte-addr variant resolves both ``test_bz_branch`` and
+    # ``test_bnz_branch`` without the runner override. Documented in
+    # ``docs/ABSDIFF_BZ_REDIRECT_BUG.md``.
+    _append_pc_byte0_imm_to_byte_addr_rules(
         rules,
         name_prefix="post_l9_bz",
         conditions=target_conditions,
         threshold=3.5 + step0_guard_weight,
         lo_source="FETCH_LO",
-        hi_source="FETCH_HI",
         write_scale=write_scale,
     )
     return tuple(rules)
@@ -4605,13 +4665,16 @@ def _post_l9_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                     gate_weight=-1.0,
                     writes=((f"{output_base}+{k}", write_scale),),
                 ))
-        _append_pc_byte0_direct_copy_rules(
+        # FIX 2026-06-06: same root cause as the BZ override above --
+        # FETCH_LO carries raw instruction-index nibbles, not byte-encoded
+        # PC bytes. Convert ``imm * INSTR_WIDTH + PC_OFFSET`` inline to
+        # match the legacy ``_set_layer4_ffn`` BNZ bake.
+        _append_pc_byte0_imm_to_byte_addr_rules(
             rules,
             name_prefix=f"post_l9_bnz_{group}",
             conditions=conditions,
             threshold=threshold,
             lo_source="FETCH_LO",
-            hi_source="FETCH_HI",
             write_scale=write_scale,
         )
     return tuple(rules)

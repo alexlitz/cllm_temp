@@ -2077,33 +2077,18 @@ class AutoregressiveVMRunner:
             # directly. Per BLOG_SPEC.md line 3 — "no auxiliary memory or
             # python variables".
 
-            # BZ/BNZ taken-path PC carry-forward fix (2026-06-03). Documented in
-            # docs/ABSDIFF_BZ_REDIRECT_BUG.md: the L4 FFN BZ redirect block
-            # (`_set_layer4_ffn` in vm_step.py:5030-5095) doesn't carry the
-            # taken-path PC forward. The handler-mode BZ/BNZ override blocks
-            # further below (~lines 2192-2215) compute the correct target_pc and
-            # rewrite REG_PC in the just-emitted step, but the `return False`
-            # below short-circuits this branch for pure_neural runs — so
-            # absdiff_* and similar BZ-using programs walk past their branch
-            # target forever. Hoist the override here so pure_neural handler
-            # mode also gets the redirect. Gated on `not trust_neural_alu` so
-            # the strictly-neural Phase 4 tests (`test_pure_neural_jmp_bz`,
-            # which use trust_neural_alu=True) remain exposed to the neural
-            # blocker and stay xfail.
-            if (not self.trust_neural_alu
-                    and 0 <= exec_idx < len(bytecode)
-                    and exec_op in (Opcode.BZ, Opcode.BNZ)):
-                target_idx = bytecode[exec_idx] >> 8
-                target_pc = self._resolve_target_pc(target_idx, bytecode)
-                fall_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
-                if exec_op == Opcode.BZ:
-                    take = (self._last_ax == 0)
-                else:
-                    take = (self._last_ax != 0)
-                self._last_pc = target_pc if take else fall_pc
-                self._override_register_in_last_step(
-                    context, Token.REG_PC, self._last_pc,
-                )
+            # BZ/BNZ pure_neural taken-path override removed (2026-06-06). The
+            # underlying L4 FFN BZ/BNZ redirect bug is now fixed model-side in
+            # ``unified_compiler/ops/l6_ops.py``:
+            # ``_post_l9_bz_pc_override_rules`` /
+            # ``_post_l9_bnz_pc_override_rules`` now drive
+            # ``_append_pc_byte0_imm_to_byte_addr_rules``, which converts the
+            # raw instruction-index nibbles in ``FETCH_LO`` into the encoded
+            # PC byte address (``imm * INSTR_WIDTH + PC_OFFSET``) -- matching
+            # the legacy ``_set_layer4_ffn`` bake (vm_step.py:5086-5108) and
+            # the JMP overrides. The handler-mode BZ/BNZ override blocks
+            # further below remain because handler-mode emits a marker-only
+            # step where the model's PC bytes are not authoritative.
 
             # Stop on EXIT, and also stop immediately after a completed step
             # whose model-emitted PC points at EXIT. The latter mirrors
