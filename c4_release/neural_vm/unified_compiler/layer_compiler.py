@@ -2359,6 +2359,23 @@ class LayerCompiler:
 
         lifetimes: Dict[str, Tuple[int, int]] = {}
         for name in self.dims:
+            has_def = name in def_layer
+            has_use = name in last_use
+            if not has_def and not has_use:
+                # Dim is declared but no op in the IR writes OR reads it.
+                # The conservative default of (0, last_layer) treats such
+                # dims as live-forever, blocking the slot from being
+                # donated. For truly-dead dims (e.g. ``MUL_ACCUM`` after
+                # the L11 lookup-mul migration moved staging to ``TEMP``),
+                # this hides a free-slot opportunity. Mark them dead at
+                # the first layer so later same-width shareable dims can
+                # claim the slot. Soundness: a dim with no producers AND
+                # no consumers cannot interfere with any other dim's
+                # value, by definition; making it shareable is purely a
+                # slot-budget win. Never-share dims still skip sharing
+                # via ``_liveness_never_share`` regardless of lifetime.
+                lifetimes[name] = (0, 0)
+                continue
             d = def_layer.get(name, 0)
             u = last_use.get(name, last_layer)
             # If a dim is read before it is written (model-level writer),
