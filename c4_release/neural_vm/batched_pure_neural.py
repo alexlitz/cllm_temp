@@ -2000,6 +2000,19 @@ class BatchedPureNeuralRunner:
         # recovered. Per RUNNER_OVERRIDE_REMOVAL_PLAN_2026_06_05.md acceptance
         # criteria the override removal was reverted; the predicate fix in
         # l10_ops remains as a partial structural improvement.
+        #
+        # 2026-06-06 retry: post L7 head 5 K-side OP_IMM blocker (ff4edb61)
+        # and L10 threshold refinement to 7 (983b70c9), the L34 residual
+        # probe shows the tail_lea rule scores sum=1.0 (MARK_AX only) at
+        # every IMM AX marker — well below threshold. Yet removing the
+        # override here STILL regresses ALL 3 critical tests (xor_basic,
+        # add_16bit, add_carry_cascade). Conclusion: the AX byte-0
+        # corruption on IMM rows is NOT solely from the tail_lea rule.
+        # A separate model-side surface is emitting wrong AX bytes for
+        # IMM in [0xE0, 0xFF]. See tools/removal_1_probe_and_smoke.py
+        # for the L34 probe + smoke combination used in the retry.
+        # Override stays in place pending identification of the
+        # remaining surface.
         if exec_op == Opcode.IMM:
             imm = (s.bytecode[exec_idx] >> 8) & 0xFFFFFF
             if imm >= 0x800000:
