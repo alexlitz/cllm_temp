@@ -1057,6 +1057,18 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor.
         smoke_tests=set(),
         spec_section=None,
+        # Dead-unit budget (docs/DEAD_UNIT_AUDIT_2026_06_05.md): L3's
+        # actual FFN bake (``layer3_ffn`` block op) writes 134 PC/SP/BP
+        # default-rule units plus 2 trailing byte-1 emission units from
+        # ``_add_layer3_pc_byte1_output_rules`` -- total 136. Prior to
+        # annotation, the layer fell through to ``DEFAULT_LAYER_MAX_UNITS
+        # = 4096`` and ``_right_size_ffns`` trimmed post-bake. Declaring
+        # the budget here lets the dynamic-FFN allocator pre-size
+        # block[L3].ffn to 136 directly, eliminating 3960 over-budgeted
+        # rows from the pre-rightsize footprint. The rule lowering uses
+        # a monotonic cursor independent of the layer max, so byte-
+        # identity is preserved.
+        ffn_units_used=136,
     )
 
 

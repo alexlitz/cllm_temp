@@ -1683,6 +1683,45 @@ def make_layer8_sp_gather_op() -> Operation:
     )
 
 
+def make_layer8_ffn_dep_anchor_op() -> Operation:
+    """No-op FFN dep anchor for L8 with ``ffn_units_used=0``.
+
+    Per ``docs/DEAD_UNIT_AUDIT_2026_06_05.md``: L8 is attention-routing-
+    heavy and has NO FFN bake at the primary ``block[L8].ffn``. The
+    actual ``layer8_multibyte_routing`` FFN work lives at L9 (via
+    ``target_op_name="layer10_byte_passthrough"``) and the primary L8
+    block FFN is 100% dead (4096 / 4096 = 100.0%) at the historical
+    ``DEFAULT_LAYER_MAX_UNITS=4096`` budget.
+
+    Declaring this kind="ffn" anchor with ``ffn_units_used=0`` lets the
+    dynamic-FFN allocator pre-size ``block[L8].ffn.hidden_dim=0``
+    instead of allocating 4096 dead rows. The anchor pins to the same
+    layer as ``layer8_sp_gather`` via ``requires={"same_layer_as":
+    "layer8_sp_gather"}`` so it lands at L8 in the dep-graph layout.
+
+    Savings: 4096 * (2*d_model + 1) = ~6.55M params pre-rightsize.
+    """
+    def bake(ffn, dim_positions, S):
+        return None
+
+    return Operation(
+        name="_layer8_ffn_dep_anchor",
+        reads=set(),
+        writes=set(),
+        kind="ffn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        compiler_ir=CompilerIR(),
+        # Place at the same layer as ``layer8_sp_gather`` (the L8 attn
+        # anchor) so this FFN anchor lands at L8.
+        requires={"same_layer_as": "layer8_sp_gather"},
+        smoke_tests=set(),
+        spec_section=None,
+        # Dead-unit budget: zero out the L8 primary FFN footprint.
+        ffn_units_used=0,
+    )
+
+
 def make_layer8_sp_gather_bake_op() -> Operation:
     """Bake ``_set_layer8_sp_gather`` into ``model.blocks[8].attn``.
 

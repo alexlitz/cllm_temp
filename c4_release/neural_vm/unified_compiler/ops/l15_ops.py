@@ -386,6 +386,15 @@ def make_nibble_copy_ffn_op() -> Operation:
         compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
+        # Dead-unit budget (docs/DEAD_UNIT_AUDIT_2026_06_05.md): L7 is
+        # attention-only by design -- ``l7_ops.py``'s docstring (lines
+        # 74-83) notes there is no ``_set_layer7_ffn`` helper and no FFN
+        # bake at this anchor's layer. The historical 4096-unit budget
+        # was 100% dead (4096 / 4096 = 100.0%). Declaring 0 lets the
+        # dynamic-FFN allocator pre-size block[L7].ffn to hidden_dim=0
+        # instead of allocating 4096 dead rows. Savings: 4096 *
+        # (2*d_model + 1) = ~6.55M params pre-rightsize.
+        ffn_units_used=0,
     )
 
 

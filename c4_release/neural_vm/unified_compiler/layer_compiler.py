@@ -1525,13 +1525,23 @@ class LayerCompiler:
         # so the caller falls back to the default ffn_hidden (4096) and
         # ``_right_size_ffns`` still trims them. This makes annotation a
         # purely incremental migration — partial coverage = partial speedup.
-        ffn_widths: Dict[int, int] = {}
+        # Use a sentinel (``None``) to distinguish "layer has no annotated
+        # op" (fall back to default 4096) from "layer is annotated with 0
+        # units" (explicit zero-FFN sentinel for attention-only layers per
+        # docs/DEAD_UNIT_AUDIT_2026_06_05.md). The plain ``>``-with-zero-
+        # prev check below would have dropped the explicit 0 because
+        # ``0 > 0`` is False.
+        ffn_widths_acc: Dict[int, Optional[int]] = {}
+
+        def _record_width(layer_idx: int, width: int) -> None:
+            prev = ffn_widths_acc.get(layer_idx)
+            if prev is None or width > prev:
+                ffn_widths_acc[layer_idx] = width
+
         for layer_idx, ops_at_layer in enumerate(ops_per_layer):
             for op in ops_at_layer:
                 if op.ffn_units_used is not None:
-                    prev = ffn_widths.get(layer_idx, 0)
-                    if op.ffn_units_used > prev:
-                        ffn_widths[layer_idx] = op.ffn_units_used
+                    _record_width(layer_idx, op.ffn_units_used)
         # Block ops in ``self.block_ops`` may target layers via either
         # explicit ``layer_idx`` or (resolved later) ``target_op_name``. For
         # the latter we use the same op-name -> layer map we built above.
@@ -1551,9 +1561,7 @@ class LayerCompiler:
                     continue
             else:
                 target_layer = op.layer_idx
-            prev = ffn_widths.get(target_layer, 0)
-            if op.ffn_units_used > prev:
-                ffn_widths[target_layer] = op.ffn_units_used
+            _record_width(target_layer, op.ffn_units_used)
         # Model-level ops (kind="model") may also write to a specific block's
         # FFN — e.g. ``function_call_weights`` writes L6 FFN units 1700-2277.
         # When such an op declares ``layer_idx`` + ``ffn_units_used``, fold
@@ -1564,9 +1572,11 @@ class LayerCompiler:
         for op in self.model_ops:
             if op.ffn_units_used is None or op.layer_idx is None:
                 continue
-            prev = ffn_widths.get(op.layer_idx, 0)
-            if op.ffn_units_used > prev:
-                ffn_widths[op.layer_idx] = op.ffn_units_used
+            _record_width(op.layer_idx, op.ffn_units_used)
+
+        ffn_widths: Dict[int, int] = {
+            li: w for li, w in ffn_widths_acc.items() if w is not None
+        }
 
         # Phase 1 of memory cluster fix plan: slot-conflict registry scan.
         # Records every ``(layer, slot_id)`` claim derived from each op's

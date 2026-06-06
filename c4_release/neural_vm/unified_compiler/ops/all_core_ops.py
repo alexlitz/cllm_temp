@@ -194,6 +194,13 @@ def all_core_ops(
         make_layer8_multibyte_fetch_op(),
         make_layer8_multibyte_routing_op(),
         make_layer8_sp_gather_op(),
+        # Dead-unit budget anchor for L8's primary block FFN. L8 is
+        # attention-only at the primary block (see
+        # docs/DEAD_UNIT_AUDIT_2026_06_05.md); this kind="ffn" anchor
+        # carries ``ffn_units_used=0`` so the dynamic-FFN allocator
+        # pre-sizes block[L8].ffn.hidden_dim=0 instead of allocating
+        # the historical 4096-unit dead footprint.
+        make_layer8_ffn_dep_anchor_op(),
         make_layer8_sp_gather_bake_op(),
         make_layer8_multibyte_fetch_bake_op(),
         # Paired with the disabled L4 SP-to-ADDR_KEY staging above. Keep the

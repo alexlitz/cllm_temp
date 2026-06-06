@@ -4692,4 +4692,16 @@ def make_post_l9_bz_bnz_pc_override_op() -> Operation:
             "all",
         },
         spec_section="BLOG_SPEC.md#control-flow",
+        # Dead-unit budget (docs/DEAD_UNIT_AUDIT_2026_06_05.md): this op
+        # owns the post-L9 BZ/BNZ PC override band (the L21 tail FFN in
+        # the audit). The bake lowers
+        # ``_post_l9_bz_pc_override_rules + _post_l9_bnz_pc_override_rules``
+        # -- exactly 192 units. Prior to annotation, block[L21].ffn fell
+        # through to ``DEFAULT_LAYER_MAX_UNITS = 4096`` and
+        # ``_right_size_ffns`` trimmed 3904 dead rows post-bake.
+        # Declaring 192 here lets the dynamic-FFN allocator pre-size the
+        # block correctly. The rule lowering starts at unit 0 and walks
+        # a monotonic cursor independent of the layer max so byte-
+        # identity is preserved.
+        ffn_units_used=192,
     )

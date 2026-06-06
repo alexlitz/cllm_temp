@@ -896,4 +896,16 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
         # Wave 4 (docs/PRODUCES_CONSUMES_MIGRATION.md): topology anchor.
         smoke_tests=set(),
         spec_section=None,
+        # Dead-unit budget (docs/DEAD_UNIT_AUDIT_2026_06_05.md): L5's
+        # opcode_decode_ffn bake claims 89 fetch / opcode-decode units
+        # via ``_L5_FFN_TOTAL_UNITS``. The audit reported 88 non-zero
+        # rows post-bake (one reserved blank slot has empty W_up/W_gate)
+        # but the allocator footprint and the bake's monotonic cursor
+        # both walk 89 units, so the layer must be sized to 89.
+        # Declaring this here lets the dynamic-FFN allocator pre-size
+        # block[L5].ffn to 89 instead of the historical 4096 fallback,
+        # eliminating ~4007 dead rows. The rule lowering uses a
+        # monotonic cursor independent of the layer max so byte-identity
+        # is preserved.
+        ffn_units_used=_L5_FFN_TOTAL_UNITS,
     )
