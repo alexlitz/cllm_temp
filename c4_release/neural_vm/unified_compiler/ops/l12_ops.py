@@ -304,4 +304,10 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#multiplication-implementation",
+        # Tier A opcode gating: ``_set_layer12_mul_combine`` writes every one
+        # of its 4096 hidden units with ``W_gate[unit, BD.OP_MUL] = 1.0``, so
+        # every unit's SiLU output is gated on OP_MUL. The L12 MUL hi-nibble
+        # combine FFN fires ONLY on OP_MUL steps; non-MUL opcodes leave block
+        # 12 untouched.
+        opcodes={"OP_MUL"},
     )

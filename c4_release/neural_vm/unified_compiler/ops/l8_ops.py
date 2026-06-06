@@ -1593,6 +1593,13 @@ def make_layer8_multibyte_routing_op() -> Operation:
         # (phase=8.2) writes the 0-2022 cluster; this op holds the
         # per-layer max and dominates the dynamic-FFN allocation for L8.
         ffn_units_used=2055,
+        # Tier A opcode gating: every one of the 32 multibyte-IMM routing
+        # units writes ``W_up[unit, BD.OP_IMM] = S`` (see
+        # ``_set_layer8_multibyte_routing`` at vm_step.py:5343). The units
+        # fire only at AX byte positions when OP_IMM is the active opcode
+        # (relayed by L8 head 4 to byte positions); non-IMM opcodes leave
+        # the multibyte routing FFN silent.
+        opcodes={"OP_IMM"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#mixture-of-experts-routing",
     )
@@ -2166,6 +2173,22 @@ def make_layer8_op_imm_relay_op() -> Operation:
         # requires['after']: layer8_alu already pin placement and order.
         migrated=True,
         claims=_claims,
+        # Staleness invariants: head 4 fires at AX byte positions
+        # (IS_BYTE + H1[AX_I] Q gate), attends to the AX marker
+        # (K[MARK_AX]=L), and copies OP_IMM forward so the L8
+        # multibyte_routing FFN can gate on it at byte positions 1/2/3.
+        # Declared at AX_byte1 (the first multi-byte slot) -- the same
+        # write fires at AX_byte2 and AX_byte3 too, but the verifier only
+        # needs one canonical position to confirm the producer fired.
+        produces={
+            "OP_IMM": "AX_byte1",
+        },
+        # Tier A opcode gating: V slot copies OP_IMM from the AX marker to
+        # AX byte positions (``W_v[base, BD.OP_IMM]=1.0``,
+        # ``W_o[BD.OP_IMM, base]=1.0``). The relay output is only non-zero
+        # at the AX marker when OP_IMM is the active opcode, so head 4's
+        # contribution to the residual is OP_IMM-gated by construction.
+        opcodes={"OP_IMM"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )

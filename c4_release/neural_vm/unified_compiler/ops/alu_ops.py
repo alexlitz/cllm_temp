@@ -60,6 +60,11 @@ def make_alu_shift_composite_ops():
             "TestSmokeShift::test_shr",
         },
         spec_section="BLOG_SPEC.md#shifts",
+            # Tier A opcode gating: stage of the L13 ALUShiftComposite SHL/SHR
+            # pipeline. ``ALUShiftComposite.forward`` (efficient_alu_neural.py)
+            # computes op_shl / op_shr from BD OP_SHL / OP_SHR flags and zeros
+            # all residual writes outside those opcodes via opcode_mask.
+            opcodes={"OP_SHL", "OP_SHR"},
         )
 
     def make_precompute():
@@ -93,6 +98,8 @@ def make_alu_shift_composite_ops():
             "TestSmokeShift::test_shr",
         },
         spec_section="BLOG_SPEC.md#shifts",
+            # See l13_alu_shift_bdtoge gating note: SHL/SHR pipeline stage.
+            opcodes={"OP_SHL", "OP_SHR"},
         )
 
     def make_select():
@@ -126,6 +133,8 @@ def make_alu_shift_composite_ops():
             "TestSmokeShift::test_shr",
         },
         spec_section="BLOG_SPEC.md#shifts",
+            # See l13_alu_shift_bdtoge gating note: SHL/SHR pipeline stage.
+            opcodes={"OP_SHL", "OP_SHR"},
         )
 
     def make_getobd():
@@ -167,6 +176,8 @@ def make_alu_shift_composite_ops():
             "TestSmokeShift::test_shr",
         },
         spec_section="BLOG_SPEC.md#shifts",
+            # See l13_alu_shift_bdtoge gating note: SHL/SHR pipeline stage.
+            opcodes={"OP_SHL", "OP_SHR"},
         )
 
     def make_install():
@@ -218,6 +229,11 @@ def make_alu_shift_composite_ops():
             "TestSmokeShift::test_shr",
         },
         spec_section="BLOG_SPEC.md#shifts",
+            # Tier A opcode gating: the installed ALUShiftComposite forward
+            # is fully SHL/SHR-gated (see ``efficient_alu_neural.py``,
+            # ``ALUShiftComposite.forward`` lines 1330-1346: op_shl + op_shr
+            # opcode_mask zeros all OUTPUT writes outside those opcodes).
+            opcodes={"OP_SHL", "OP_SHR"},
         )
 
     return [
@@ -603,6 +619,10 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
             "TestSmokeBasic::test_sub_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # Tier A opcode gating: the wrapped AddSub5StageBlock gates every
+        # residual write on OP_ADD / OP_SUB (see ``_AddSubStage3`` opcode
+        # merge in ``efficient_alu_addsub_split.py``).
+        opcodes={"OP_ADD", "OP_SUB"},
     )
 
 
@@ -710,6 +730,11 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
             "TestSmokeBitwise::test_xor_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # Tier A opcode gating: ALUAndOrXor wraps ``PureNeuralALU(operations=
+        # 'bitwise')``, which gates RESULT on OP_OR / OP_XOR / OP_AND (the
+        # three bitwise opcodes built via ``build_or_layers(opcode=28)`` /
+        # ``build_xor_layers(opcode=29)`` / ``build_and_layers(opcode=30)``).
+        opcodes={"OP_AND", "OP_OR", "OP_XOR"},
     )
 
 
@@ -845,6 +870,10 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         produces={'__module_replacement': 'L11.ffn[PureFFN/wide_mul_rules]'},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # Tier A opcode gating: ALUMul / FlattenedALUMul gate RESULT on
+        # OP_MUL (see ``_MulCombineStage.forward`` in efficient_alu_neural.py
+        # — ``op_mul = (x_ge_flat[:, 0, ge.OP_START + 27] > 0.1)``).
+        opcodes={"OP_MUL"},
     )
 
 
@@ -929,6 +958,10 @@ def make_l11_alu_mul_bdtoge_op() -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # Tier A opcode gating: stage of FlattenedALUMul whose forward gates
+        # all RESULT writes on OP_MUL (see ``_MulCombineStage`` in
+        # ``efficient_alu_neural.py``).
+        opcodes={"OP_MUL"},
     )
 
 
@@ -971,6 +1004,8 @@ def make_l11_alu_mul_schoolbook_op() -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # See l11_alu_mul_bdtoge: FlattenedALUMul stage.
+        opcodes={"OP_MUL"},
     )
 
 
@@ -1013,6 +1048,8 @@ def make_l11_alu_mul_carrypass1_op() -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # See l11_alu_mul_bdtoge: FlattenedALUMul stage.
+        opcodes={"OP_MUL"},
     )
 
 
@@ -1056,6 +1093,8 @@ def make_l11_alu_mul_carrypass2_op() -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # See l11_alu_mul_bdtoge: FlattenedALUMul stage.
+        opcodes={"OP_MUL"},
     )
 
 
@@ -1100,6 +1139,8 @@ def make_l11_alu_mul_carrypass3_op() -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # See l11_alu_mul_bdtoge: FlattenedALUMul stage.
+        opcodes={"OP_MUL"},
     )
 
 
@@ -1144,6 +1185,8 @@ def make_l12_alu_mul_genprop_op() -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # See l11_alu_mul_bdtoge: FlattenedALUMul stage.
+        opcodes={"OP_MUL"},
     )
 
 
@@ -1187,6 +1230,8 @@ def make_l12_alu_mul_binarylookahead_op() -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # See l11_alu_mul_bdtoge: FlattenedALUMul stage.
+        opcodes={"OP_MUL"},
     )
 
 
@@ -1229,6 +1274,8 @@ def make_l12_alu_mul_finalcorrection_op() -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # See l11_alu_mul_bdtoge: FlattenedALUMul stage.
+        opcodes={"OP_MUL"},
     )
 
 
@@ -1291,6 +1338,9 @@ def make_l12_alu_mul_getobd_op() -> Operation:
             "TestSmokeBasic::test_mul_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+        # See l11_alu_mul_bdtoge: FlattenedALUMul stage (the GE→BD writeback
+        # whose ``opcode_mask`` zeros all OUTPUT writes outside OP_MUL).
+        opcodes={"OP_MUL"},
     )
 
 
@@ -1416,6 +1466,12 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             "TestSmokeBasic::test_mod_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+            # Tier A opcode gating: FlattenedDivMod stage. The composite's
+            # forward gates RESULT on OP_DIV / OP_MOD (see
+            # ``_DivModGEToBDStage`` in ``efficient_alu_divmod_split.py``:
+            # ``op_div = (x_ge_flat[:, 0, ge.OP_START + 31] > 0.1)``,
+            # ``op_mod = (x_ge_flat[:, 0, ge.OP_START + 32] > 0.1)``).
+            opcodes={"OP_DIV", "OP_MOD"},
         )
 
     def make_longdiv():
@@ -1454,6 +1510,8 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             "TestSmokeBasic::test_mod_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+            # See l10_alu_divmod_bdtoge: FlattenedDivMod stage.
+            opcodes={"OP_DIV", "OP_MOD"},
         )
 
     def make_getobd():
@@ -1500,6 +1558,9 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             "TestSmokeBasic::test_mod_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+            # See l10_alu_divmod_bdtoge: FlattenedDivMod GE→BD writeback
+            # stage; ``opcode_mask`` zeros OUTPUT writes outside OP_DIV/OP_MOD.
+            opcodes={"OP_DIV", "OP_MOD"},
         )
 
     def make_install():
@@ -1634,6 +1695,9 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             "TestSmokeBasic::test_mod_basic",
         },
         spec_section="BLOG_SPEC.md#binary-ALU",
+            # See l10_alu_divmod_bdtoge: FlattenedDivMod's forward gates
+            # all OUTPUT writes on OP_DIV / OP_MOD via opcode_mask.
+            opcodes={"OP_DIV", "OP_MOD"},
         )
 
     return [make_bdtoge(), make_longdiv(), make_getobd(), make_install()]

@@ -163,6 +163,31 @@ def _bake_post_op_into(ffn, post_op_instance, hidden_offset: int = 0) -> int:
     return end
 
 
+# Per-ALU-class opcode gates. Each ALU module's forward applies an
+# opcode_mask at the GE→BD writeback stage that zeros all residual writes
+# except for the listed BD-format OP_* dims. Sources:
+#   - AddSub5StageBlock (``efficient_alu_addsub_split.py``): op_add /
+#     op_sub merge at stage 3 → OP_ADD, OP_SUB.
+#   - FlattenedALUMul (``efficient_alu_neural.py:_MulCombineStage``):
+#     op_mul gate at the combine stage → OP_MUL.
+#   - ALUShiftComposite (``efficient_alu_neural.py:ALUShiftComposite``):
+#     op_shl + op_shr merge → OP_SHL, OP_SHR.
+#   - ALUAndOrXor (``efficient_alu_neural.py:PureNeuralALU(operations=
+#     'bitwise')``): per-opcode OR/XOR/AND extract+combine + AX-marker
+#     gate → OP_OR, OP_XOR, OP_AND.
+# The attach op installs the module as a ``post_op`` whose forward gates
+# every residual write on those opcodes. Declaring ``opcodes={...}`` on
+# the attach op tells the per-opcode block-skip analyser the attached
+# post-op layer is unreachable for any other opcode, unlocking the
+# layer skip for the bulk of the opcode table.
+_ALU_CLASS_OPCODES = {
+    "ALUAddSub": {"OP_ADD", "OP_SUB"},
+    "ALUMul": {"OP_MUL"},
+    "ALUShift": {"OP_SHL", "OP_SHR"},
+    "ALUAndOrXor": {"OP_AND", "OP_OR", "OP_XOR"},
+}
+
+
 def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
                                alu_mode: str = 'lookup',
                                same_layer_as: str = None,
@@ -259,6 +284,10 @@ def _make_alu_postop_attach_op(name: str, layer_idx: int, alu_cls_name: str,
         phase=1180 + layer_idx * 0.01,
         migrated=True,
         requires=requires,
+        # Tier A opcode gating: the installed post_op module gates every
+        # OUTPUT/CARRY write on the listed opcodes (see ``_ALU_CLASS_OPCODES``
+        # above for the per-module derivations).
+        opcodes=set(_ALU_CLASS_OPCODES.get(alu_cls_name, set())),
     )
 
 
