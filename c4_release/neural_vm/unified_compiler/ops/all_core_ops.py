@@ -274,6 +274,13 @@ def all_core_ops(
         # stable ``target_op_name`` to bind to so they can drop
         # ``layer_idx=13`` literals.
         make_layer13_attn_dep_anchor_op(),
+        # Phase 3b (mem cluster fix, 2026-06-05): L13 mem-addr anchor —
+        # split off from ``_layer13_attn_dep_anchor`` so the mem-addr
+        # gather binds to a ``layer_idx=13``-pinned anchor while the
+        # FFN-side shift family stays on the original (L16) anchor. See
+        # ``docs/MEMORY_PHASE4_BLOCKER_2026_06_05.md`` and the docstring
+        # on ``make_layer13_mem_addr_anchor_op``.
+        make_layer13_mem_addr_anchor_op(),
         make_layer13_mem_addr_gather_op(),
         make_layer13_shifts_op(alu_mode=alu_mode),
         # 4-stage SHL/SHR composite (replaces ALUShift wrapper). Only

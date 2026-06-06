@@ -391,12 +391,113 @@ def _layer13_mem_addr_gather_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
+def make_layer13_mem_addr_anchor_op() -> Operation:
+    """L13 attn-side anchor for the mem-addr family (Phase 3b mem cluster fix).
+
+    Sibling of ``_layer13_attn_dep_anchor`` (below). Historically the joint
+    ``_layer13_attn_dep_anchor`` co-served BOTH the L13 mem-addr family
+    (``layer13_mem_addr_gather``, a kind="block" op writing ADDR_B*_LO/HI
+    into block[L13].attn) AND the L13 FFN-side shift family
+    (``layer13_shifts``, ``l13_alu_shift_install``, ``l13_alu_postop_attach``).
+    Per ``docs/MEMORY_PHASE4_BLOCKER_2026_06_05.md`` this coupling blocked
+    Phase 4: the mem-addr gather needs to land at L13 (where the
+    ADDR_B*_LO/HI residuals feed L14 same-step), but the shift composite
+    stages need the existing anchor at L16 (where AX_CARRY residuals
+    survive intervening L15-L16 ops).
+
+    Phase 3b is the metadata-only split: the new anchor co-resolves to
+    the SAME physical layer as the legacy joint anchor (L16 today) via
+    the shared ``same_layer_as`` constraint, so smoke is byte-identical
+    after the split. Phase 4 will later drop the ``same_layer_as`` and
+    pin this anchor at L13 (paired with the L13 head-0 decoupling and
+    composite-late-placement work documented in the BLOCKER doc).
+
+    Phase 3b splits the anchor into TWO siblings:
+
+      * ``_layer13_mem_addr_anchor`` (this op): owns the mem-addr gather
+        binding. Co-resolves with the legacy anchor today; Phase 4 will
+        retarget it to L13.
+      * ``_layer13_attn_dep_anchor`` (below): keeps the FFN-side shift
+        family (lookup-mode ``layer13_shifts``, efficient-mode composite
+        install + post-op attach) bound where they already work today
+        (block[16] via the ``requires["after"]:_layer12_ffn_dep_anchor``
+        chain). Also remains the chain link for ``_layer14_attn_dep_anchor``.
+
+    As a ``declarative_authority="topology_anchor"`` op this writes no
+    weights; the slot registry derives no slot claims for it (per
+    ``slot_registry.derive_slot_ids_for_op`` — topology anchors return
+    early). Two attn anchors at the same layer are therefore admissible.
+
+    Consumers (``target_op_name="_layer13_mem_addr_anchor"``):
+      - ``layer13_mem_addr_gather`` (block, kind="block").
+
+    Consumers NOT moved (remain on ``_layer13_attn_dep_anchor``):
+      - ``layer13_shifts`` (block, FFN-side lookup-mode shift bake)
+      - ``l13_alu_shift_install`` (block, composite install)
+      - ``l13_alu_postop_attach`` (block, post-op attach)
+      - ``_layer14_attn_dep_anchor`` (``requires["after"]`` chain)
+    """
+    def bake(attn, dim_positions, S):
+        # No-op: actual bake is in ``layer13_mem_addr_gather`` (kind="block").
+        return None
+
+    return Operation(
+        name="_layer13_mem_addr_anchor",
+        # Mirrored subset of ``layer13_mem_addr_gather`` reads/writes
+        # (sized so the dep graph reserves a kind="attn" slot at the
+        # joint anchor's layer). Same dim sets as the legacy joint
+        # anchor so the SCC structure is unchanged.
+        reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
+               "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC",
+               "OP_SI", "OP_SC", "MEM_ADDR_SRC", "L1H1"},
+        writes={"ADDR_B0_LO", "ADDR_B1_LO", "ADDR_B2_LO",
+                "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},
+        kind="attn",
+        # Phase 3b (mem cluster fix, 2026-06-05): shared explicit phase
+        # with ``_layer13_attn_dep_anchor`` (the sibling FFN-side
+        # anchor) so both anchors co-resolve to the same physical layer
+        # via the layer assignment's "same phase, share" branch
+        # (``_assign_layers``, layer_compiler.py:~2132). Mirrors the L10
+        # split pattern (Phase 3 / commit 3423aff1) which used phase=10.0
+        # on both L10 anchors. Phase 4 will replace this with
+        # ``layer_idx=13`` to pull mem-addr gather to L13 (paired with
+        # the head-0 decoupling work documented in the BLOCKER doc).
+        phase=13.0,
+        migrated=True,
+        declarative_authority="topology_anchor",
+        # ``same_layer_as: _layer13_attn_dep_anchor`` is a defensive
+        # belt-and-suspenders: the explicit ``phase=13.0`` is what makes
+        # the slot tracker share the layer, but ``same_layer_as`` raises
+        # a structured error rather than silently corrupting placement
+        # if a future refactor changes the slot-share predicate.
+        # ``requires["after"]`` mirrors the legacy anchor's pin past the
+        # L12 anchor so the earliest landable layer matches.
+        requires={
+            "after": "_layer12_ffn_dep_anchor",
+            "same_layer_as": "_layer13_attn_dep_anchor",
+        },
+        smoke_tests=set(),
+        spec_section=None,
+        # Phase 11.A IR exposure: empty IR exposes the topology-anchor's
+        # noop weight semantics to the dim-multiplexer (Phase 10.E/F).
+        compiler_ir=CompilerIR(),
+    )
+
+
 def make_layer13_attn_dep_anchor_op() -> Operation:
-    """No-op companion for ``layer13_mem_addr_gather``: declares mirrored
-    reads/writes so the LayerCompiler's dep graph reserves an L13 slot
-    for it. Mirrors ``_layer11_ffn_dep_anchor`` / ``_layer3_ffn_dep_anchor``:
-    the actual weight bake happens in ``layer13_mem_addr_gather`` (kind=
-    "block"); this op's bake is a no-op.
+    """No-op companion for the L13 FFN-side shift family: declares mirrored
+    reads/writes so the LayerCompiler's dep graph reserves a kind="attn"
+    slot at whichever layer the dep-chain places it (today: L16). Mirrors
+    ``_layer11_ffn_dep_anchor`` / ``_layer3_ffn_dep_anchor``.
+
+    Phase 3b (mem cluster fix, 2026-06-05) split: the legacy joint anchor
+    co-served the L13 mem-addr family AND the L13 FFN-side shift family.
+    The mem-addr family migrated to the sibling
+    ``_layer13_mem_addr_anchor`` (above, ``layer_idx=13``). This anchor
+    retains the FFN-side shift family (lookup ``layer13_shifts``,
+    efficient ``l13_alu_shift_install``, ``l13_alu_postop_attach``) plus
+    the ``_layer14_attn_dep_anchor`` ``requires["after"]`` chain so the
+    L14 anchor still pins past this one.
 
     Phase 8.G.6: lets L13 block ops declare
     ``target_op_name="_layer13_attn_dep_anchor"`` and bind to whichever
@@ -531,10 +632,18 @@ def make_layer13_mem_addr_gather_op() -> Operation:
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer13_mem_addr_gather_ir,
         declarative_authority="spec_generated",
-        # Phase 8.G.6: drop ``layer_idx=13`` literal; bind to the L13
-        # attn dep anchor so the block op resolves to whichever layer
-        # the compiler places the anchor at.
-        target_op_name="_layer13_attn_dep_anchor",
+        # Phase 3b (mem cluster fix, 2026-06-05): retargeted from the
+        # joint ``_layer13_attn_dep_anchor`` to the new sibling
+        # ``_layer13_mem_addr_anchor`` so the L13 FFN-side shift family
+        # (lookup ``layer13_shifts``, efficient ``l13_alu_shift_install``
+        # + ``l13_alu_postop_attach``) can migrate layers independently
+        # of the mem-addr family. Today both anchors resolve to the
+        # same physical layer via the shared ``phase=13.0`` +
+        # ``same_layer_as`` constraint -- this change is metadata-only,
+        # smoke-neutral. Phase 4 will drop the ``same_layer_as`` and pin
+        # the mem-addr anchor at L13 (paired with the L13 head-0 work
+        # documented in ``docs/MEMORY_PHASE4_BLOCKER_2026_06_05.md``).
+        target_op_name="_layer13_mem_addr_anchor",
         migrated=True,
         claims=_claims,
         smoke_tests={
