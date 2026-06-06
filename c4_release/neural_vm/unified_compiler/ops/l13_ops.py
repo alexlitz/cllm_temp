@@ -453,29 +453,31 @@ def make_layer13_mem_addr_anchor_op() -> Operation:
         writes={"ADDR_B0_LO", "ADDR_B1_LO", "ADDR_B2_LO",
                 "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI"},
         kind="attn",
-        # Phase 3b (mem cluster fix, 2026-06-05): shared explicit phase
-        # with ``_layer13_attn_dep_anchor`` (the sibling FFN-side
-        # anchor) so both anchors co-resolve to the same physical layer
-        # via the layer assignment's "same phase, share" branch
-        # (``_assign_layers``, layer_compiler.py:~2132). Mirrors the L10
-        # split pattern (Phase 3 / commit 3423aff1) which used phase=10.0
-        # on both L10 anchors. Phase 4 will replace this with
-        # ``layer_idx=13`` to pull mem-addr gather to L13 (paired with
-        # the head-0 decoupling work documented in the BLOCKER doc).
-        phase=13.0,
+        # Phase 3c (mem cluster fix, 2026-06-06): pin to ``layer_idx=13``
+        # so ``layer13_mem_addr_gather`` lands at block[13].attn
+        # (the L14 same-step mem-value chain reads ADDR_B*_LO/HI in-step;
+        # see MEMORY_PHASE4_BLOCKER_2026_06_05.md for the data-flow
+        # argument). The head_0/1/2 contest with the L10 attn family
+        # (which historically occupied block[13].attn at all 8 heads) is
+        # resolved by the paired ``layer_idx=11`` pin on
+        # ``_layer10_attn_anchor`` (Phase 3c sibling change in
+        # ``l10_ops.py``); the L10 attn family now bakes into
+        # block[11].attn, freeing block[13].attn heads 0/1/2.
+        #
+        # Replaces the Phase 3b ``phase=13.0`` + ``same_layer_as:
+        # _layer13_attn_dep_anchor`` co-location constraint: that kept
+        # both anchors at L16 (where the joint anchor naturally landed
+        # via its ``after`` chain) so Phase 3b was byte-identical to the
+        # pre-split joint anchor. Phase 3c is the actual layer movement.
+        layer_idx=13,
         migrated=True,
         declarative_authority="topology_anchor",
-        # ``same_layer_as: _layer13_attn_dep_anchor`` is a defensive
-        # belt-and-suspenders: the explicit ``phase=13.0`` is what makes
-        # the slot tracker share the layer, but ``same_layer_as`` raises
-        # a structured error rather than silently corrupting placement
-        # if a future refactor changes the slot-share predicate.
-        # ``requires["after"]`` mirrors the legacy anchor's pin past the
-        # L12 anchor so the earliest landable layer matches.
-        requires={
-            "after": "_layer12_ffn_dep_anchor",
-            "same_layer_as": "_layer13_attn_dep_anchor",
-        },
+        # ``after: _layer12_ffn_dep_anchor`` retained defensively so the
+        # dep graph still orders this anchor after L12; ``same_layer_as``
+        # dropped because Phase 3c intentionally separates the two L13
+        # anchors onto different physical layers (mem-addr at L13,
+        # shift-family anchor stays at L16).
+        requires={"after": "_layer12_ffn_dep_anchor"},
         smoke_tests=set(),
         spec_section=None,
         # Phase 11.A IR exposure: empty IR exposes the topology-anchor's

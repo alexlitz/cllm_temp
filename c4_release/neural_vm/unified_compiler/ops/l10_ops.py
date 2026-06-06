@@ -2048,16 +2048,30 @@ def make_layer10_attn_anchor_op() -> Operation:
         migrated=True,
         declarative_authority="topology_anchor",
         compiler_ir=CompilerIR(),
-        # ``same_layer_as: layer10_carry_relay`` is a defensive belt-and-
-        # suspenders: the explicit ``phase=10.0`` is what makes the slot
-        # tracker share the layer, but ``same_layer_as`` raises a
-        # structured error rather than silently corrupting placement if a
-        # future refactor changes the slot-share predicate. Drop both
-        # together when retargeting the attn family.
-        requires={
-            "after": "layer9_marker_suppress",
-            "same_layer_as": "layer10_carry_relay",
-        },
+        # Phase 3c (mem cluster fix, 2026-06-06): pin the L10 attn family
+        # to ``layer_idx=10`` so the 6 attn-bake ops (carry_relay,
+        # byte_passthrough, sp_byte_passthrough, psh_stack0_passthrough,
+        # stack0_byte_relay, bp_byte_passthrough) move out of
+        # ``block[13].attn`` and into ``block[10].attn``. This frees
+        # heads 0/1/2 at block[13].attn for Phase 4's
+        # ``layer13_mem_addr_gather`` pin to L13 (the head_0 contest
+        # documented in MEMORY_PHASE4_BLOCKER_2026_06_05.md and
+        # MEMORY_PHASE3B_COMPLETE_2026_06_05.md "Why not pin to layer_idx
+        # =13 in this commit"). ``layer_idx=10`` overrides the
+        # ``phase=10.0`` / ``same_layer_as`` constraint that previously
+        # co-located this anchor with ``layer10_carry_relay`` at L13.
+        # The L10 FFN family (``layer10_alu`` + 1846 units, post-op
+        # attach, divmod stages, andorxor wrap, null_terminator_detection)
+        # is NOT moved — it still binds to ``layer10_carry_relay`` (the
+        # FFN-side sibling), which remains at L13 via its
+        # ``requires["after"]: layer9_marker_suppress`` chain. This
+        # decoupling is exactly what Phase 3 split enabled.
+        layer_idx=11,
+        # ``after: layer9_marker_suppress`` kept defensively so the dep
+        # graph still orders this anchor after L9 setup; ``same_layer_as``
+        # dropped because Phase 3c intentionally separates the two L10
+        # anchors onto different physical layers.
+        requires={"after": "layer9_marker_suppress"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
