@@ -99,6 +99,12 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     "layer14_clear_addr_key_pollution":      (None,   48),
     "layer14_clear_output_corruption":       (None,   18),
     "layer14_clear_mem_marker_output":       (None,   64),
+    # var-cluster follow-up (2026-06-05): 8 units that cancel the L3
+    # ``mem_byte_0_default`` +0.940 baseline at SI/SC store positions
+    # (MEM_ADDR_SRC=1). Runs at phase 14.45, after clear_mem_marker_output
+    # (14.4) and before addr_key_neural_decode (14.5). See
+    # ``make_layer14_mem_addr_src_default_suppress_op``.
+    "layer14_mem_addr_src_default_suppress": (None,    8),
     "layer14_addr_key_neural_decode":        (None, 1728),
     "layer14_jsr_ax_bytes_zero":             (None,    4),
     "layer14_lc_ax_bytes_zero":              (None,    4),
@@ -1861,6 +1867,73 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
     )
 
 
+def make_layer14_mem_addr_src_default_suppress_op() -> Operation:
+    """L14 FFN: Cancel the L3 ``mem_byte_0_default`` baseline at SI/SC stores.
+
+    Var-cluster follow-up (2026-06-05): the L3 FFN ``MEM DEFAULT`` rules
+    write ~+0.940 to OUTPUT_LO[0]/HI[0] at the MEM marker row and the
+    three MEM addr-byte query rows, biasing addr predictions toward
+    ``0x00``. For SI/SC stores (MEM_ADDR_SRC=1) the addr comes from
+    STACK0 and can be ANY value (e.g. 0xFFFC for var_simple_0), so the
+    baseline is wrong-direction. This op subtracts the baseline only
+    when MEM_ADDR_SRC=1, leaving the PSH/JSR/ENT/non-store paths intact.
+
+    The brief's "gate the L3 rule on MEM_ADDR_SRC=0" cannot fire at L3
+    because MEM_ADDR_SRC is decoded at the AX marker by L5 from
+    OP_SI/OP_SC and relayed to the MEM marker by L6 head 6 / to MEM
+    byte positions by L7 head 7 — so it is NOT available at L3 input.
+    This op achieves the same algebra at L14 by a counter-write that
+    subtracts -2.0/S only when MEM_ADDR_SRC=1, mirroring the L3 rule
+    shape exactly.
+
+    Pinned to ``layer_idx=14`` via ``kind="block"``. Phase 14.45 places
+    it AFTER ``clear_mem_marker_output`` (14.4) and BEFORE
+    ``addr_key_neural_decode`` (14.5), within the cleanup chain that
+    runs after the L14 mem_generation attention. Allocates 8 units via
+    the chain layout (2 marker units + 6 byte-index units).
+    """
+    def bake(block, dim_positions, S):
+        from ...vm_step import _set_layer14_mem_addr_src_default_suppress
+        ffn = block.ffn
+        start_unit = _l14_chain_alloc("layer14_mem_addr_src_default_suppress")
+        next_unit = _set_layer14_mem_addr_src_default_suppress(
+            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        )
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_mem_addr_src_default_suppress",
+        phase=14.45,
+        reads={"MARK_MEM", "H1", "BYTE_INDEX_0", "BYTE_INDEX_1",
+               "BYTE_INDEX_2", "MEM_ADDR_SRC", "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        declarative_bake_fn=bake,
+        # Phase 8.A.4: use ``target_op_name`` to bind to whichever layer
+        # the compiler placed ``layer14_mem_generation`` (the L14 attn
+        # op). Matches the convention used by the other L14 cleanup ops.
+        target_op_name="layer14_mem_generation",
+        migrated=True,
+        # Tier A opcode gating: only fires when MEM_ADDR_SRC=1 (SI/SC
+        # store address from STACK0). MEM_ADDR_SRC is decoded at the AX
+        # marker by L5 from OP_SI/OP_SC and relayed to MEM marker by L6
+        # head 6 / to MEM byte positions by L7 head 7. The matching
+        # opcodes are OP_SI and OP_SC.
+        opcodes={"OP_SI", "OP_SC"},
+        requires={"after": "layer14_clear_mem_marker_output"},
+        # Staleness invariants: subtracts the L3 +0.940 baseline at
+        # OUTPUT_LO[0]/HI[0] for SI/SC stores. Canonical register is
+        # the MEM_addr1 byte row (where the var-cluster diagnostic
+        # flagged the 0xff-vs-0x00 inversion); the same shape applies
+        # at the MEM marker (predicting addr_b0) and at MEM_addr2/
+        # MEM_addr3 by symmetry.
+        produces={
+            "OUTPUT_LO": "MEM_addr1",
+            "OUTPUT_HI": "MEM_addr1",
+        },
+    )
+
+
 def _layer14_jsr_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
     """FFNRule program for ``_set_layer14_jsr_ax_bytes_zero``.
 
@@ -1975,20 +2048,21 @@ def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
 
     # Dim-ownership claims (W_down output cells). Runs at phase 14.6 after
     # ``layer14_addr_key_neural_decode`` (14.5) which closes the chain at
-    # unit 1862. The bake's auto-fit allocator (Phase 6 Wave 6D) lands the
-    # 4 units back at 1862 because the prior chain claims fill [0, 1862)
+    # unit 1870. The bake's auto-fit allocator (Phase 6 Wave 6D) lands the
+    # 4 units back at 1870 because the prior chain claims fill [0, 1870)
     # contiguously and first-fit on a 4096-wide pool picks the first free
-    # gap. The helper writes 4 units:
-    #   unit 1862: -3/S on OUTPUT_LO[0..15]
-    #   unit 1863: -3/S on OUTPUT_HI[0..15]
-    #   unit 1864: +5/S on OUTPUT_LO[0]
-    #   unit 1865: +5/S on OUTPUT_HI[0]
+    # gap. The helper writes 4 units (shifted +8 by var-cluster
+    # follow-up's mem_addr_src_default_suppress insertion 2026-06-05):
+    #   unit 1870: -3/S on OUTPUT_LO[0..15]
+    #   unit 1871: -3/S on OUTPUT_HI[0..15]
+    #   unit 1872: +5/S on OUTPUT_LO[0]
+    #   unit 1873: +5/S on OUTPUT_HI[0]
     _claims = set()
     for k in range(16):
-        _claims.add((14, "ffn_W_down", "1862", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1863", f"OUTPUT_HI+{k}"))
-    _claims.add((14, "ffn_W_down", "1864", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1865", "OUTPUT_HI+0"))
+        _claims.add((14, "ffn_W_down", "1870", f"OUTPUT_LO+{k}"))
+        _claims.add((14, "ffn_W_down", "1871", f"OUTPUT_HI+{k}"))
+    _claims.add((14, "ffn_W_down", "1872", "OUTPUT_LO+0"))
+    _claims.add((14, "ffn_W_down", "1873", "OUTPUT_HI+0"))
 
     return Operation(
         name="layer14_jsr_ax_bytes_zero",
@@ -2128,24 +2202,25 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         ffn._l14_unit_counter = next_unit
 
     # Dim-ownership claims (W_down output cells). Runs at phase 14.8 — last
-    # op in the L14 cleanup chain. Predecessors leave the counter at 1870.
-    # The helper writes 4 units mirroring jsr/lc_ax_bytes_zero:
-    #   unit 1870: -3/S on OUTPUT_LO[0..15]
-    #   unit 1871: -3/S on OUTPUT_HI[0..15]
-    #   unit 1872: +5/S on OUTPUT_LO[0]
-    #   unit 1873: +5/S on OUTPUT_HI[0]
+    # op in the L14 cleanup chain. Predecessors leave the counter at 1878.
+    # The helper writes 4 units mirroring jsr/lc_ax_bytes_zero (shifted +8
+    # by var-cluster follow-up's mem_addr_src_default_suppress 2026-06-05):
+    #   unit 1878: -3/S on OUTPUT_LO[0..15]
+    #   unit 1879: -3/S on OUTPUT_HI[0..15]
+    #   unit 1880: +5/S on OUTPUT_LO[0]
+    #   unit 1881: +5/S on OUTPUT_HI[0]
     _claims = set()
     for k in range(16):
-        _claims.add((14, "ffn_W_down", "1870", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1871", f"OUTPUT_HI+{k}"))
-    _claims.add((14, "ffn_W_down", "1872", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1873", "OUTPUT_HI+0"))
+        _claims.add((14, "ffn_W_down", "1878", f"OUTPUT_LO+{k}"))
+        _claims.add((14, "ffn_W_down", "1879", f"OUTPUT_HI+{k}"))
+    _claims.add((14, "ffn_W_down", "1880", "OUTPUT_LO+0"))
+    _claims.add((14, "ffn_W_down", "1881", "OUTPUT_HI+0"))
 
     return Operation(
         name="layer14_alu_nocarry_ax_bytes_zero",
         # Phase 1 (memory cluster fix plan): shares L14 FFN unit range with
         # ``layer14_demo_phase6_wave7`` at a disjoint sub-range (this op
-        # owns units 0..1873; the demo op owns unit 1874). See
+        # owns units 0..1881; the demo op owns unit 1882). See
         # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
         slot_share=("ffn_units",),
         reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
@@ -2166,17 +2241,19 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
         # relay) is populated by L7 head 5 V slot 9 in the same step.
         claims=_claims,
         requires={"after": "layer14_mem_generation"},
-        # Last op in the L14 FFN chain (``_l14_unit_counter`` reaches 1873
-        # after this op runs). The chain is: temp_clear + temp residue clamp
-        # + ADD byte-1 high cleanup (4 units) →
+        # The L14 FFN chain (``_l14_unit_counter`` reaches 1882 after this
+        # op runs). The chain is: temp_clear + temp residue clamp +
+        # ADD byte-1 high cleanup (4 units) →
         # clear_addr_key_pollution (48) → clear_output_corruption (3) →
         # PSH MEM high-nibble boost (15) → clear_mem_marker_output (64) →
+        # mem_addr_src_default_suppress (8, var-cluster 2026-06-05) →
         # addr_key_neural_decode (1728) →
-        # jsr_ax_bytes_zero (4) → lc_ax_bytes_zero (4) → this op (4).
-        # Annotating only the chain tail with the cumulative max is
-        # sufficient — the compiler aggregates per-layer max across all
-        # ops, so this single annotation suffices for L14 dynamic sizing.
-        ffn_units_used=1874,
+        # jsr_ax_bytes_zero (4) → lc_ax_bytes_zero (4) → this op (4) →
+        # demo_phase6_wave7 (1). Annotating only the chain tail with the
+        # cumulative max is sufficient — the compiler aggregates per-layer
+        # max across all ops, so this single annotation suffices for L14
+        # dynamic sizing.
+        ffn_units_used=1882,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",
@@ -2337,11 +2414,13 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
             "layer14_alu_nocarry_ax_bytes_zero",
             "layer14_mem_generation",
         ]},
-        # New chain tail: prior ops fill [0, 1874), the demo's auto-fit
-        # picks unit 1874 (single-unit rule), so the cumulative max is 1875.
-        # This replaces the legacy ``ffn_units_used=1874`` annotation
-        # carried by ``make_layer14_alu_nocarry_ax_bytes_zero_op``.
-        ffn_units_used=1875,
+        # New chain tail: prior ops fill [0, 1882), the demo's auto-fit
+        # picks unit 1882 (single-unit rule), so the cumulative max is 1883.
+        # Var-cluster follow-up (2026-06-05) added 8 units between
+        # ``clear_mem_marker_output`` and ``addr_key_neural_decode``
+        # (``mem_addr_src_default_suppress``), so prior chain total moved
+        # from 1874 → 1882 → demo lands at 1882 → tail = 1883.
+        ffn_units_used=1883,
         smoke_tests=set(),
         spec_section="docs/HOW_TO_ADD_A_CORRECTIVE_OP.md",
     )
@@ -2454,18 +2533,19 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
         ffn._l14_unit_counter = next_unit
 
     # Dim-ownership claims (W_down output cells). Runs at phase 14.7 after
-    # ``layer14_jsr_ax_bytes_zero`` (14.6) consumes units 1862..1865. The
-    # helper writes 4 units mirroring jsr_ax_bytes_zero:
-    #   unit 1866: -3/S on OUTPUT_LO[0..15]
-    #   unit 1867: -3/S on OUTPUT_HI[0..15]
-    #   unit 1868: +5/S on OUTPUT_LO[0]
-    #   unit 1869: +5/S on OUTPUT_HI[0]
+    # ``layer14_jsr_ax_bytes_zero`` (14.6) consumes units 1870..1873. The
+    # helper writes 4 units mirroring jsr_ax_bytes_zero (shifted +8 by
+    # var-cluster follow-up's mem_addr_src_default_suppress 2026-06-05):
+    #   unit 1874: -3/S on OUTPUT_LO[0..15]
+    #   unit 1875: -3/S on OUTPUT_HI[0..15]
+    #   unit 1876: +5/S on OUTPUT_LO[0]
+    #   unit 1877: +5/S on OUTPUT_HI[0]
     _claims = set()
     for k in range(16):
-        _claims.add((14, "ffn_W_down", "1866", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1867", f"OUTPUT_HI+{k}"))
-    _claims.add((14, "ffn_W_down", "1868", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1869", "OUTPUT_HI+0"))
+        _claims.add((14, "ffn_W_down", "1874", f"OUTPUT_LO+{k}"))
+        _claims.add((14, "ffn_W_down", "1875", f"OUTPUT_HI+{k}"))
+    _claims.add((14, "ffn_W_down", "1876", "OUTPUT_LO+0"))
+    _claims.add((14, "ffn_W_down", "1877", "OUTPUT_HI+0"))
 
     return Operation(
         name="layer14_lc_ax_bytes_zero",

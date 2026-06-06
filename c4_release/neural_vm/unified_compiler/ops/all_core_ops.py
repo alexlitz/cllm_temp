@@ -305,6 +305,16 @@ def all_core_ops(
         make_layer14_clear_addr_key_pollution_op(),
         make_layer14_clear_output_corruption_op(),
         make_layer14_clear_mem_marker_output_op(),
+        # var-cluster follow-up (2026-06-05): cancel the L3
+        # mem_byte_0_default +0.940 baseline at MEM marker / addr-byte
+        # rows when MEM_ADDR_SRC=1 (SI/SC stores). For SI/SC the addr
+        # comes from STACK0 (can be ANY value, e.g. 0xFFFC for
+        # var_simple_0); the L3 baseline biased argmax toward 0x00 and
+        # competed with L14 mem_generation's addr writes. Runs at phase
+        # 14.45 AFTER clear_mem_marker_output (14.4) and BEFORE
+        # addr_key_neural_decode (14.5). See l14_ops.py:
+        # make_layer14_mem_addr_src_default_suppress_op for derivation.
+        make_layer14_mem_addr_src_default_suppress_op(),
         # V2 ADDR_KEY neural decode (BLOG_SPEC.md:830) — flipped on
         # (2026-05-11, blockers-3-4 PR).  Replaces
         # NeuralVMEmbedding._inject_mem_metadata's per-val-byte

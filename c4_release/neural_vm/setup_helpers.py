@@ -69,6 +69,7 @@ from .setup_helpers_l14 import (
     _set_layer14_add_byte1_high_zero_cleanup,
     _set_layer14_clear_addsub_temp_negative_residue,
     _set_layer14_clear_output_corruption,
+    _set_layer14_mem_addr_src_default_suppress,
 )
 from .setup_helpers_l15 import _set_conversational_io_output_routing
 
@@ -146,6 +147,7 @@ __all__ = [
     "_set_layer14_add_byte1_high_zero_cleanup",
     "_set_layer14_clear_addsub_temp_negative_residue",
     "_set_layer14_clear_output_corruption",
+    "_set_layer14_mem_addr_src_default_suppress",
     "_set_layer1_ffn",
     "_set_layer2_mem_byte_flags",
     "_set_layer5_fetch",
