@@ -1457,6 +1457,21 @@ def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     L = 20.0
     AX_I = 1
     TOP = 36
+    # Removal-1 (2026-06-06): Q-side MARK_AX gate + K-side HAS_SE blocker
+    # on slot 52. Per docs/REMOVAL_1_REAL_SURFACE_2026_06_06.md Option A,
+    # this is intended to disambiguate the IMM byte at PC+1 from the
+    # opcode byte at PC+0 for high-bit IMM values where the ADDR_KEY
+    # nibble pattern aliased. Empirically (smoke 2026-06-06): this gate
+    # alone does not recover the override-removed regression because
+    # HAS_SE is set on every bytecode row once a STEP_END exists, not
+    # row-specific to opcode bytes; the K-side blocker therefore
+    # penalises the IMM byte at PC+1 just as much as the opcode byte at
+    # PC+0. The gate stays as a no-op structural improvement on top of
+    # the existing ADDR_KEY+ FETCH discriminator; the override at
+    # batched_pure_neural.py b5cf7099 remains the load-bearing path
+    # pending Option B (an L9/L10 position-addressed corrective rule
+    # that writes AX_CARRY_LO/HI from CLEAN_EMBED at PC+1 directly).
+    MARK_GATE = 52
     return DeclarativeAttentionHeadSpec(
         head_idx=_L8_HEAD_LAYOUT_BY_NAME["layer8_multibyte_fetch_bake.head_3"],
         q=(
@@ -1478,6 +1493,9 @@ def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
                 AP(35, BD.CONST, -150.0),
                 AP(TOP, BD.CONST, L),
                 AP(TOP, BD.HAS_SE, -L),
+                # Q-side MARK_AX gate (slot 52): only AX-marker query
+                # positions activate the K-side HAS_SE penalty below.
+                AP(MARK_GATE, BD.MARK_AX, L),
             )
         ),
         k=(
@@ -1489,6 +1507,10 @@ def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
                 AP(34, BD.CONST, 5.0),
                 AP(35, BD.MARK_AX, -50.0),
                 AP(35, BD.H1 + AX_I, -50.0),
+                # K-side HAS_SE blocker (slot 52): paired with Q-side
+                # MARK_AX gate; subtracts -2L^2 from any key position
+                # carrying HAS_SE when the query is at the AX marker.
+                AP(MARK_GATE, BD.HAS_SE, -L * 2.0),
             )
         ),
         v=(
