@@ -287,25 +287,41 @@ def _set_layer14_jsr_mem_default_suppress(ffn, S, BD, start_unit=0):
     opcodes have ``MEM_STORE=0`` so this cancel does not fire and the
     L3 baseline (which is correct for IMM etc.) survives intact.
 
+    NARROWING 2026-06-06 (follow-up to initial JSR-path fix): the initial
+    helper baked 8 units (marker + BYTE_INDEX_{0,1,2}) mirroring the full
+    L3 rule shape. That OVER-CANCELLED at MEM_addr2/MEM_addr3 for the
+    var-cluster fixtures: SP=0xFFFC pushes return address ``0xFC, 0xFF,
+    0x00, 0x00`` little-endian, so the L3 baseline of 0x00 is CORRECT at
+    MEM_addr2 (BYTE_INDEX_1) and MEM_addr3 (BYTE_INDEX_2). Cancelling
+    there leaves a 0x11 residue to win the argmax instead of the true
+    0x00. Per VAR_CLUSTER_JSR_PATH_FINDINGS_2026_06_06.md proposed
+    follow-up #1, we narrow the gate to BYTE_INDEX_0 only (which selects
+    MEM_addr1, the originally-failing slot) plus the MEM marker row
+    (predicting addr_b0, kept because SP can be in any range).
+
     Activation calculation (S=100, with MEM_STORE-MEM_ADDR_SRC=1 for
     PSH/JSR/ENT):
       * MARK_MEM marker row: up = S*MARK_MEM + S*MEM_STORE
         - S*MEM_ADDR_SRC - 1.5*S = S * (1 + 1 - 0 - 1.5) = 0.5*S
         → silu(0.5*S) ~= S/2 = 50
-      * MEM byte rows: up = S*H1[MEM] + S*BYTE_INDEX_K + S*MEM_STORE
+      * BYTE_INDEX_0 row: up = S*H1[MEM] + S*BYTE_INDEX_0 + S*MEM_STORE
         - S*MEM_ADDR_SRC - 2.5*S = S * (1 + 1 + 1 - 0 - 2.5) = 0.5*S
         → silu(0.5*S) ~= S/2 = 50
       * SI/SC (MEM_STORE=1, MEM_ADDR_SRC=1): gate = 0 → silu(<0) ≈ 0
       * Non-store ops (MEM_STORE=0): gate = -1.5*S → silu(<0) ≈ 0
+      * BYTE_INDEX_1/2 positions (MEM_addr2/MEM_addr3): no cancel unit
+        fires, so L3's +0.940 baseline survives intact (correct: addr
+        bytes 2/3 should be 0x00 for 16-bit SP).
     W_down = -2.0/S → output delta = (S/2) * (-2.0/S) = -1.0, cancels
-    the L3 +0.940 with a small safety margin. Mirrors the L3 rule shape
-    exactly (matching unit count: 2 marker + 6 byte = 8 units).
+    the L3 +0.940 with a small safety margin. Narrowed unit count:
+    2 marker + 2 BYTE_INDEX_0 = 4 units.
     """
     unit = start_unit
     MEM_I = 4  # MEM marker index in MARKS array
 
     # === Cancel L3 ``MEM DEFAULT'' (marker rule, vm_step.py:3335-3349) ===
     # Fires when MARK_MEM=1 AND MEM_STORE=1 AND MEM_ADDR_SRC=0 (PSH/JSR/ENT).
+    # Predicts addr_b0; kept because SP can be in any range.
     # LO nibble
     ffn.W_up[unit, BD.MARK_MEM] = S
     ffn.W_up[unit, BD.MEM_STORE] = S
@@ -323,28 +339,30 @@ def _set_layer14_jsr_mem_default_suppress(ffn, S, BD, start_unit=0):
     ffn.W_down[BD.OUTPUT_HI + 0, unit] = -2.0 / S
     unit += 1
 
-    # === Cancel L3 ``MEM addr bytes 1-3 default'' (byte rule, vm_step.py:3351-3369) ===
-    # Fires when H1[MEM]=1 AND BYTE_INDEX_K=1 AND MEM_STORE=1 AND
-    # MEM_ADDR_SRC=0 (K = 0, 1, 2 → MEM addr bytes 1, 2, 3 respectively).
-    for byte_idx_dim in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]:
-        # LO nibble
-        ffn.W_up[unit, BD.H1 + MEM_I] = S
-        ffn.W_up[unit, byte_idx_dim] = S
-        ffn.W_up[unit, BD.MEM_STORE] = S
-        ffn.W_up[unit, BD.MEM_ADDR_SRC] = -S
-        ffn.b_up[unit] = -S * 2.5
-        ffn.b_gate[unit] = 1.0
-        ffn.W_down[BD.OUTPUT_LO + 0, unit] = -2.0 / S
-        unit += 1
-        # HI nibble
-        ffn.W_up[unit, BD.H1 + MEM_I] = S
-        ffn.W_up[unit, byte_idx_dim] = S
-        ffn.W_up[unit, BD.MEM_STORE] = S
-        ffn.W_up[unit, BD.MEM_ADDR_SRC] = -S
-        ffn.b_up[unit] = -S * 2.5
-        ffn.b_gate[unit] = 1.0
-        ffn.W_down[BD.OUTPUT_HI + 0, unit] = -2.0 / S
-        unit += 1
+    # === Cancel L3 ``MEM addr byte 1 default'' only (byte rule, vm_step.py:3351-3369) ===
+    # NARROWED 2026-06-06: keep only BYTE_INDEX_0 (which selects MEM_addr1,
+    # the originally-failing slot with true value 0xff for SP=0xFFFC).
+    # BYTE_INDEX_1 (MEM_addr2) and BYTE_INDEX_2 (MEM_addr3) rows are
+    # dropped because the L3 baseline of 0x00 is correct at those positions
+    # for 16-bit addresses and cancelling there leaves a 0x11 residue.
+    # LO nibble
+    ffn.W_up[unit, BD.H1 + MEM_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = S
+    ffn.W_up[unit, BD.MEM_STORE] = S
+    ffn.W_up[unit, BD.MEM_ADDR_SRC] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_LO + 0, unit] = -2.0 / S
+    unit += 1
+    # HI nibble
+    ffn.W_up[unit, BD.H1 + MEM_I] = S
+    ffn.W_up[unit, BD.BYTE_INDEX_0] = S
+    ffn.W_up[unit, BD.MEM_STORE] = S
+    ffn.W_up[unit, BD.MEM_ADDR_SRC] = -S
+    ffn.b_up[unit] = -S * 2.5
+    ffn.b_gate[unit] = 1.0
+    ffn.W_down[BD.OUTPUT_HI + 0, unit] = -2.0 / S
+    unit += 1
 
     return unit
 

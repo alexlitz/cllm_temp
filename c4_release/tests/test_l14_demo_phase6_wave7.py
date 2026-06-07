@@ -89,15 +89,15 @@ def test_demo_ir_clears_byte_identity_gate():
 def test_demo_auto_fit_lands_after_alu_nocarry_chain_tail():
     """``pin=None`` first-fit picks the slot after the prior chain claims.
 
-    The L14 cleanup chain ends at unit 1874 before this demo
-    (``layer14_alu_nocarry_ax_bytes_zero`` occupies 1870..1873). The demo
-    is a single-unit rule, so the allocator picks unit 1874 -- proving the
+    The L14 cleanup chain ends at unit 1886 before this demo
+    (``layer14_alu_nocarry_ax_bytes_zero`` occupies 1882..1885). The demo
+    is a single-unit rule, so the allocator picks unit 1886 -- proving the
     auto-fit story without the author writing the offset.
     """
 
     assert _L14_CLEANUP_CHAIN_LAYOUT["layer14_demo_phase6_wave7"] == (None, 1)
     start = _l14_chain_alloc("layer14_demo_phase6_wave7")
-    assert start == 1874
+    assert start == 1886
 
 
 def test_demo_bake_path_writes_zero_residual_delta():
@@ -155,12 +155,13 @@ def test_demo_op_is_registered_in_all_core_ops():
     assert len(demo_ops) == 1
     op = demo_ops[0]
     assert op.kind == "block"
-    assert op.layer_idx == 14
+    assert op.layer_idx is None
+    assert op.target_op_name == "layer14_mem_generation"
     assert op.migrated is True
     assert op.declarative_authority == "spec_generated"
     # Carries the chain-tail ``ffn_units_used`` so the per-block FFN
     # sizing pass sees the correct cumulative width.
-    assert op.ffn_units_used == 1875
+    assert op.ffn_units_used == 1887
 
 
 def test_demo_op_factory_returns_consistent_operation():
@@ -174,8 +175,9 @@ def test_demo_op_factory_returns_consistent_operation():
     b = make_layer14_demo_phase6_wave7_op()
     assert a.name == b.name == "layer14_demo_phase6_wave7"
     assert a.reads == b.reads == {"CONST"}
-    assert a.writes == b.writes == {"TEMP"}
-    assert a.phase == b.phase == 14.95
+    assert a.writes == b.writes == set()
+    assert a.phase == b.phase is None
+    assert a.target_op_name == b.target_op_name == "layer14_mem_generation"
     # IR rules round-trip identically (frozen dataclasses + tuples).
     assert (
         tuple(r.name for r in a.compiler_ir.layer(0).ffn.rules)

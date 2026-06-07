@@ -276,7 +276,15 @@ class BatchedPureNeuralRunner:
         kv_cache_verify: Optional[bool] = None,
         kv_cache_verify_interval: Optional[int] = None,
         enable_moe_routing: Optional[bool] = None,
+        csr_inference: Optional[bool] = None,
     ):
+        """``csr_inference`` enables the explicit CSR inference path
+        (commit cb0f396f bench: 2.11x CUDA speedup at 99.9% argmax-match).
+        ``None`` reads ``C4_CSR_INFERENCE`` and otherwise keeps dense
+        weights, preserving byte-identity-oriented tests by default.
+        Only consulted when ``model_runner`` is None; if an externally-built
+        runner is supplied its CSR mode is taken from that runner.
+        """
         if use_kv_cache is None:
             use_kv_cache = os.environ.get("C4_BATCH_USE_KV_CACHE") == "1"
         if kv_cache_verify is None:
@@ -312,6 +320,11 @@ class BatchedPureNeuralRunner:
                 os.environ.get("C4_BATCH_ENABLE_MOE_ROUTING") == "1"
                 or os.environ.get("C4_ENABLE_MOE_ROUTING") == "1"
             )
+        if csr_inference is None:
+            csr_inference = (
+                os.environ.get("C4_CSR_INFERENCE", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
         if model_runner is None:
             model_runner = AutoregressiveVMRunner(
                 d_model=d_model,
@@ -322,9 +335,17 @@ class BatchedPureNeuralRunner:
                 pure_neural=True,
                 trust_neural_alu=True,
                 enable_moe_routing=enable_moe_routing,
+                csr_inference=csr_inference,
             )
             model_runner._func_call_handlers = {}
             model_runner._syscall_handlers = {}
+        elif csr_inference:
+            # Externally-built model_runner: defensively re-install the CSR
+            # F.linear shim so that if a non-CSR runner was constructed
+            # earlier in this process and restored F.linear, our CSR
+            # weights still dispatch correctly. Idempotent.
+            from .base_layers import install_csr_linear_shim
+            install_csr_linear_shim()
         self._serial = model_runner
         self.model = model_runner.model
         self._device = next(self.model.parameters()).device

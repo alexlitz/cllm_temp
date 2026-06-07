@@ -216,6 +216,7 @@ class AutoregressiveVMRunner:
         spec_k=0,
         enable_cuda_graphs=False,
         enable_moe_routing=False,
+        csr_inference: Optional[bool] = None,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -300,6 +301,20 @@ class AutoregressiveVMRunner:
                 Defaults False until the MoE-on smoke gate is promoted to the
                 primary testing path. The compiler-owned transform is cached
                 separately from the dense model.
+            csr_inference: If True and the model lives on CUDA, the
+                compiled dense weights are converted to ``torch.sparse_csr``
+                in place after the build (see
+                ``c4_release/neural_vm/base_layers.py:csr_sparsify_model``).
+                Per the 2026-06-06 sparse benchmark
+                (``c4_release/docs/SPARSE_INFERENCE_BENCHMARK_2026_06_06.md``),
+                CSR gives ~2.1x CUDA forward-pass speedup at 99.9% argmax
+                agreement vs dense. The 0.1% divergence is fp32 summation
+                order noise: acceptable for explicit production inference,
+                NOT for byte-identity test gates. ``None`` (default) reads
+                ``C4_CSR_INFERENCE`` and otherwise keeps the dense model.
+                The CSR model is cached separately from the dense model so
+                both can coexist. CPU runs skip the conversion (CSR helps
+                less and the benchmark target is GPU).
         """
         if enable_cuda_graphs:
             raise NotImplementedError(
@@ -318,12 +333,25 @@ class AutoregressiveVMRunner:
         # Normalize compile_mode to a plain "none" sentinel when not set.
         if compile_mode is None:
             compile_mode = "none"
+        if csr_inference is None:
+            csr_inference = (
+                os.environ.get("C4_CSR_INFERENCE", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
         cache_key = (d_model, n_layers, n_heads, ffn_hidden, max_seq_len,
                      conversational_io, alu_mode,
                      enable_neural_io_think_protocol, compile_mode,
-                     bool(enable_moe_routing))
+                     bool(enable_moe_routing),
+                     bool(csr_inference))
         if cache_model and cache_key in AutoregressiveVMRunner._MODEL_CACHE:
             self.model = AutoregressiveVMRunner._MODEL_CACHE[cache_key]
+            # Re-install the CSR F.linear shim defensively in case the
+            # process was forked / a non-CSR runner reset F.linear back
+            # to the real one. The shim is idempotent.
+            self._csr_info = None
+            if csr_inference:
+                from .base_layers import install_csr_linear_shim
+                install_csr_linear_shim()
         else:
             from .unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
             self.model, _layout = compile_full_vm_dynamic(
@@ -343,6 +371,24 @@ class AutoregressiveVMRunner:
             # compile_full_vm_dynamic(enable_moe_routing=True) so the compiler/cache
             # owns the structural transform and compiled graphs see the
             # final module topology.
+            # CSR sparse-inference conversion (commit cb0f396f bench:
+            # 2.11x CUDA speedup at 99.9% argmax-match). Applied AFTER
+            # the model is on its target device but BEFORE torch.compile
+            # so the compiled graph sees CSR weights and the F.linear
+            # shim. CPU and low-sparsity models are skipped automatically
+            # by csr_sparsify_model's internal gates.
+            self._csr_info = None
+            if csr_inference:
+                from .base_layers import csr_sparsify_model
+                # compile_full_vm_dynamic has its own in-process memo that
+                # returns the same model object for identical compiler kwargs.
+                # CSR conversion mutates parameters in place, so isolate the
+                # inference variant before converting or a CSR runner can
+                # contaminate the dense runner/cache entry.
+                if torch.cuda.is_available():
+                    import copy
+                    self.model = copy.deepcopy(self.model)
+                self._csr_info = csr_sparsify_model(self.model)
             if compile_mode and compile_mode != "none":
                 # The model has ~30 blocks with distinct FFN shapes (each
                 # block was right-sized by ``_right_size_ffns``). Compiling

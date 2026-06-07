@@ -66,6 +66,224 @@ def sparse_linear(x, weight_sparse, bias=None):
     return out
 
 
+def csr_linear(x, weight_csr, bias=None):
+    """F.linear drop-in for sparse CSR weight matrices.
+
+    Mirrors :func:`sparse_linear` but the multiplicand is a CSR tensor.
+    Per the sparse benchmark (commit cb0f396f) CSR @ dense via
+    ``torch.sparse.mm`` is the fast path for the c4 VM model (2.11x on
+    CUDA, 1.35x on CPU, 99.9% argmax-match).
+    """
+    if x.dim() == 3:
+        B, S, D = x.shape
+        x_flat = x.reshape(B * S, D)
+    else:
+        x_flat = x
+    out = torch.sparse.mm(weight_csr, x_flat.t()).t()
+    if bias is not None:
+        out = out + bias
+    if x.dim() == 3:
+        out = out.reshape(B, S, -1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CSR inference: model-wide weight conversion + global F.linear dispatch
+# ---------------------------------------------------------------------------
+#
+# Used by the production runner paths (BatchedPureNeuralRunner,
+# AutoregressiveVMRunner) when ``csr_inference=True``. The conversion is:
+#
+#   1. For every block's attn (W_q/W_k/W_v/W_o) and ffn (W_up/W_gate/W_down)
+#      and the model.head.weight, replace the dense nn.Parameter with a
+#      CSR-wrapped nn.Parameter on the SAME device.
+#   2. Install a process-global ``F.linear`` shim that dispatches CSR
+#      weights through ``csr_linear``. Other weight layouts (dense, COO)
+#      fall through to the original ``F.linear``.
+#
+# The CSR shim is install-once and idempotent. We patch ``F.linear`` because
+# PureFFN and PureAttention call ``F.linear(x, weight)`` directly, and
+# CSR tensors have ``is_sparse == False`` (only COO returns True) so the
+# existing ``sparse_linear if W.is_sparse else F.linear`` dispatch in
+# vm_step.py would skip CSR weights without the shim.
+
+_CSR_SHIM_INSTALLED = False
+_REAL_F_LINEAR = None
+
+
+def _csr_aware_linear(input, weight, bias=None):
+    """Replacement for ``F.linear`` that dispatches CSR weights through
+    :func:`csr_linear` and everything else through the real ``F.linear``."""
+    if hasattr(weight, "layout") and weight.layout == torch.sparse_csr:
+        return csr_linear(input, weight, bias=bias)
+    return _REAL_F_LINEAR(input, weight, bias=bias)
+
+
+def install_csr_linear_shim() -> bool:
+    """Install a process-global ``F.linear`` shim that dispatches CSR
+    weights through :func:`csr_linear`.
+
+    Idempotent: calling twice is a no-op. Returns True if the shim was
+    newly installed, False if it was already in place.
+    """
+    global _CSR_SHIM_INSTALLED, _REAL_F_LINEAR
+    if _CSR_SHIM_INSTALLED:
+        return False
+    _REAL_F_LINEAR = F.linear
+    F.linear = _csr_aware_linear
+    _CSR_SHIM_INSTALLED = True
+    return True
+
+
+def _convert_param_to_csr(module: nn.Module, name: str) -> bool:
+    """Replace ``module._parameters[name]`` with an ``nn.Parameter``
+    wrapping a sparse-CSR tensor on the same device.
+
+    Returns True if the conversion happened, False if it was skipped
+    (zero-sized, already sparse, or unsupported layout). Skips parameters
+    that are already sparse (CSR or COO) so the call is idempotent.
+    """
+    if name not in module._parameters:
+        return False
+    param = getattr(module, name)
+    if param is None:
+        return False
+    dense = param.data
+    if dense.numel() == 0:
+        return False
+    if dense.is_sparse or dense.layout == torch.sparse_csr:
+        return False
+    csr = dense.contiguous().to_sparse_csr()
+    module._parameters[name] = nn.Parameter(csr, requires_grad=False)
+    return True
+
+
+def _csr_sparsity_fraction(model: nn.Module) -> float:
+    """Fraction of zero weights across the linear-layer parameters that
+    CSR conversion would touch.
+
+    Sample-based: walks at most 8 parameter tensors (W_up / W_gate / W_down
+    from blocks plus the head) so we don't materialize every dense weight.
+    Returns a value in ``[0.0, 1.0]``; the runner skips CSR conversion when
+    the fraction is below 0.5 since CSR is only a win when most weights
+    are zero.
+    """
+    samples = []
+    if hasattr(model, "blocks"):
+        for block in model.blocks[:3]:
+            for attr in ("attn", "ffn"):
+                mod = getattr(block, attr, None)
+                if mod is None:
+                    continue
+                for name in ("W_q", "W_k", "W_v", "W_o",
+                             "W_up", "W_gate", "W_down"):
+                    p = getattr(mod, name, None)
+                    if isinstance(p, nn.Parameter) and not p.data.is_sparse \
+                            and p.data.layout != torch.sparse_csr \
+                            and p.data.numel() > 0:
+                        samples.append(p.data)
+                        if len(samples) >= 8:
+                            break
+                if len(samples) >= 8:
+                    break
+            if len(samples) >= 8:
+                break
+    if not samples:
+        return 0.0
+    total = 0
+    zeros = 0
+    for t in samples:
+        total += t.numel()
+        zeros += int((t == 0).sum().item())
+    return zeros / max(1, total)
+
+
+def csr_sparsify_model(model: nn.Module, *,
+                       require_cuda: bool = True,
+                       min_sparsity: float = 0.5) -> dict:
+    """Convert the dense weights of a built ``AutoregressiveVM`` to
+    sparse-CSR for inference, and install the global ``F.linear`` shim.
+
+    Designed for production-inference runner paths
+    (``BatchedPureNeuralRunner``, ``AutoregressiveVMRunner``) where the
+    2.11x CUDA speedup is a clear win and the 0.1% fp32-summation-order
+    argmax drift documented in
+    ``c4_release/docs/SPARSE_INFERENCE_BENCHMARK_2026_06_06.md`` is
+    acceptable. Byte-identity test paths should NOT call this.
+
+    The conversion is gated:
+
+      * ``require_cuda``: when True (default) the model must live on CUDA;
+        on CPU CSR gives a smaller win (1.35x) and the benchmark targets
+        the GPU production case, so we skip CPU by default.
+      * ``min_sparsity``: at least this fraction of zeros across a sample
+        of W_* parameters; below the threshold CSR's metadata overhead
+        outweighs the speedup.
+
+    Returns a dict with conversion stats. ``converted`` is False when a
+    gate skipped the conversion.
+
+    Conversion targets:
+
+      * Every ``block.attn`` direct W_q / W_k / W_v / W_o parameter
+      * Every ``block.ffn`` direct W_up / W_gate / W_down parameter
+      * ``model.head.weight``
+
+    Composite FFN blocks that don't expose W_up/W_gate/W_down directly
+    (e.g. ``AddSub5StageBlock``, ``FlattenedDivMod``) are left dense.
+    They're a small minority of the parameter budget.
+    """
+    info: dict = {"converted": False, "params_converted": 0,
+                  "blocks_converted": 0, "skip_reason": None}
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        info["skip_reason"] = "no_parameters"
+        return info
+    if require_cuda and device.type != "cuda":
+        info["skip_reason"] = f"device={device.type}"
+        return info
+    sparsity = _csr_sparsity_fraction(model)
+    info["sampled_sparsity"] = sparsity
+    if sparsity < min_sparsity:
+        info["skip_reason"] = f"sparsity={sparsity:.3f}<min={min_sparsity}"
+        return info
+
+    n_params = 0
+    n_blocks = 0
+    if hasattr(model, "blocks"):
+        for block in model.blocks:
+            block_converted_any = False
+            attn = getattr(block, "attn", None)
+            if attn is not None:
+                for name in ("W_q", "W_k", "W_v", "W_o"):
+                    if _convert_param_to_csr(attn, name):
+                        n_params += 1
+                        block_converted_any = True
+            ffn = getattr(block, "ffn", None)
+            if ffn is not None and all(n in ffn._parameters
+                                       for n in ("W_up", "W_gate", "W_down")):
+                # Skip zero-hidden trimmed FFNs.
+                W_up = getattr(ffn, "W_up", None)
+                if W_up is not None and getattr(W_up, "shape", (0,))[0] > 0:
+                    for name in ("W_up", "W_gate", "W_down"):
+                        if _convert_param_to_csr(ffn, name):
+                            n_params += 1
+                            block_converted_any = True
+            if block_converted_any:
+                n_blocks += 1
+    head = getattr(model, "head", None)
+    if head is not None and "weight" in head._parameters:
+        if _convert_param_to_csr(head, "weight"):
+            n_params += 1
+
+    install_csr_linear_shim()
+    info["converted"] = n_params > 0
+    info["params_converted"] = n_params
+    info["blocks_converted"] = n_blocks
+    return info
+
+
 def bake_weights(method):
     """
     Decorator for _bake_weights methods.
@@ -161,11 +379,11 @@ class PureFFN(nn.Module):
             for blk in sorted(active_blocks):
                 start = blk * block_size
                 indices.extend(range(start, min(start + block_size, H)))
-            active_idx = torch.tensor(indices, dtype=torch.long) if indices else torch.tensor([0], dtype=torch.long)
+            active_idx = torch.tensor(
+                indices, dtype=torch.long, device=W_up.device
+            )
         else:
             active_idx = active.nonzero(as_tuple=True)[0]
-            if len(active_idx) == 0:
-                active_idx = torch.tensor([0], dtype=torch.long)
 
         n = len(active_idx)
         self._compact_size = n

@@ -65,7 +65,13 @@ def autoregressive_results():
     """
     from neural_vm.run_vm import AutoregressiveVMRunner
 
-    runner = AutoregressiveVMRunner()
+    # Byte-identity gate: this fixture is the reference for the
+    # ``test_speculative_byte_identity`` exit-code comparison against
+    # ``UltraBatchRunner`` (which is dense). Pin the reference path to
+    # dense so the comparison isn't muddied by CSR's 0.1% fp32-summation
+    # noise documented in
+    # ``c4_release/docs/SPARSE_INFERENCE_BENCHMARK_2026_06_06.md``.
+    runner = AutoregressiveVMRunner(csr_inference=False)
     results = {}
     for bytecode, _expected in [(p.values[0], p.values[1]) for p in PROGRAMS]:
         key = tuple(bytecode)
