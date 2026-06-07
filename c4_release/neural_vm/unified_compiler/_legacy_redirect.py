@@ -257,7 +257,7 @@ def derive_layout(num_heads: int = 8):
 # Cache format version. Bump invalidates every entry on disk.
 #
 # v4 → v5: switched model weights serialisation from pickle (``torch.save``)
-# to ``safetensors`` for the warm-disk hit. The cache is now a two-file pair:
+# to ``safetensors`` for the warm-disk hit. The cache was a two-file pair:
 #
 #   <key>.pt           — pickled shell (model with parameters/buffers swapped
 #                        to ``meta`` tensors) + layout metadata + kwargs
@@ -267,12 +267,43 @@ def derive_layout(num_heads: int = 8):
 #                        weights; loaded via mmap so the warm hit is
 #                        sub-half-second.
 #
-# On load the shell is unpickled, then ``load_state_dict(..., assign=True)``
-# swaps the safetensors-backed real tensors back in over the meta
-# placeholders. This produces the same post-bake model the pickle path used
-# to (including FFN width / wrapper module swaps recorded in the shell's
-# class structure), without paying torch.save's pickle-based tensor IO cost.
-_CACHE_FORMAT_VERSION = 5
+# v5 → v6: switched the weights sidecar from dense ``.safetensors`` to a
+# bespoke COO sparse sidecar (``<key>.sparse``). The compiled VM state_dict
+# is ~99.78% sparse; encoding each tensor as ``(name, dtype, rank, shape,
+# nnz, idx[uint32], val[fp32])`` (with a dense fallback for tensors above a
+# sparsity threshold) shrinks ~700 MB → ~2-4 MB without any loss of
+# precision. The shell ``.pt`` is unchanged. v5 entries (``.safetensors``
+# siblings) are not read by the v6 loader — they fall through the format
+# version check and are recompiled / overwritten on next save. See
+# ``docs/SPARSE_WEIGHT_STORAGE_2026_06_05.md``.
+_CACHE_FORMAT_VERSION = 6
+
+# Threshold below which a tensor is stored in COO form (nnz / total). At or
+# above this, the tensor is stored dense in the sidecar. The compiled VM has
+# 99.78% sparsity end-to-end so 0.5 is comfortably above every weight tensor
+# in practice; dense fallback is reserved for already-dense bias/buffer
+# blobs (e.g. ``head.bias`` is 100% nonzero).
+_SPARSE_STORAGE_THRESHOLD = 0.5
+
+# Magic header for the COO sparse sidecar. Used to validate the file format
+# at load time.
+_SPARSE_SIDECAR_MAGIC = b"C4SPARSEV1"
+
+# Per-tensor encoding tags inside the sparse sidecar.
+_SPARSE_ENC_COO = 0  # COO with flat-index uint32 + values
+_SPARSE_ENC_DENSE = 1  # Raw dense bytes (for above-threshold tensors)
+
+# Per-tensor dtype tags.
+_SPARSE_DTYPE_F32 = 0
+_SPARSE_DTYPE_F16 = 1
+_SPARSE_DTYPE_I32 = 2
+_SPARSE_DTYPE_I64 = 3
+_SPARSE_DTYPE_I8 = 4
+_SPARSE_DTYPE_U8 = 5
+_SPARSE_DTYPE_BOOL = 6
+_SPARSE_DTYPE_BF16 = 7
+_SPARSE_DTYPE_F64 = 8
+_SPARSE_DTYPE_I16 = 9
 
 # Operation fields that hold callables / closures captured at op-construction
 # time (typically inner functions inside the per-op factory). These are not
@@ -357,8 +388,379 @@ def _cache_key(kwargs_snapshot: dict) -> str:
 
 
 def _weights_path_for(shell_path: pathlib.Path) -> pathlib.Path:
-    """Return the ``.safetensors`` sibling for a ``.pt`` shell cache path."""
+    """Return the COO sparse sidecar sibling for a ``.pt`` shell cache path.
+
+    v6 cache pair is ``<key>.pt`` + ``<key>.sparse``. Older v5 entries used
+    ``<key>.safetensors``; those are filtered out by the format-version
+    check in ``_try_load_cached`` and re-written on the next save.
+    """
+    return shell_path.with_suffix(".sparse")
+
+
+def _legacy_safetensors_path_for(shell_path: pathlib.Path) -> pathlib.Path:
+    """v5 weights sidecar path. Kept so LRU eviction can clean up old pairs."""
     return shell_path.with_suffix(".safetensors")
+
+
+# ---- COO sparse sidecar -------------------------------------------------
+#
+# File layout (little-endian throughout; mirrors the format described in
+# ``docs/SPARSE_WEIGHT_STORAGE_2026_06_05.md`` section 3):
+#
+#   header:
+#     magic            10 bytes  (b"C4SPARSEV1")
+#     n_tensors        uint32
+#   per tensor:
+#     name_len         uint16
+#     name             utf-8 bytes (name_len)
+#     encoding         uint8       (0=COO, 1=DENSE)
+#     dtype            uint8       (see _SPARSE_DTYPE_*)
+#     rank             uint8
+#     shape            rank * uint32
+#     payload:
+#       if encoding == COO:
+#         nnz          uint32
+#         idx          nnz * uint32  (flat row-major indices into ``shape``)
+#         val          nnz * sizeof(dtype) bytes
+#       if encoding == DENSE:
+#         numel        uint32
+#         data         numel * sizeof(dtype) bytes
+#
+# Tensors are emitted in ``state_dict()`` iteration order; that order is
+# stable for a given module graph so the produced bytes are deterministic
+# given a deterministic bake.
+
+
+def _torch_dtype_to_tag(dtype) -> int:
+    """Map a torch dtype to the sparse-sidecar uint8 tag.
+
+    Raises ``ValueError`` for dtypes the sidecar can't represent (we have
+    not seen any in the compiled VM — fp32 is universal — but the loader
+    rejects unknown tags symmetrically so this stays in sync).
+    """
+    import torch as _torch
+    mapping = {
+        _torch.float32: _SPARSE_DTYPE_F32,
+        _torch.float16: _SPARSE_DTYPE_F16,
+        _torch.int32: _SPARSE_DTYPE_I32,
+        _torch.int64: _SPARSE_DTYPE_I64,
+        _torch.int8: _SPARSE_DTYPE_I8,
+        _torch.uint8: _SPARSE_DTYPE_U8,
+        _torch.bool: _SPARSE_DTYPE_BOOL,
+        _torch.bfloat16: _SPARSE_DTYPE_BF16,
+        _torch.float64: _SPARSE_DTYPE_F64,
+        _torch.int16: _SPARSE_DTYPE_I16,
+    }
+    tag = mapping.get(dtype)
+    if tag is None:
+        raise ValueError(f"unsupported tensor dtype for sparse sidecar: {dtype}")
+    return tag
+
+
+def _tag_to_torch_dtype(tag: int):
+    """Inverse of ``_torch_dtype_to_tag``."""
+    import torch as _torch
+    mapping = {
+        _SPARSE_DTYPE_F32: _torch.float32,
+        _SPARSE_DTYPE_F16: _torch.float16,
+        _SPARSE_DTYPE_I32: _torch.int32,
+        _SPARSE_DTYPE_I64: _torch.int64,
+        _SPARSE_DTYPE_I8: _torch.int8,
+        _SPARSE_DTYPE_U8: _torch.uint8,
+        _SPARSE_DTYPE_BOOL: _torch.bool,
+        _SPARSE_DTYPE_BF16: _torch.bfloat16,
+        _SPARSE_DTYPE_F64: _torch.float64,
+        _SPARSE_DTYPE_I16: _torch.int16,
+    }
+    dtype = mapping.get(tag)
+    if dtype is None:
+        raise ValueError(f"unknown dtype tag in sparse sidecar: {tag}")
+    return dtype
+
+
+def _save_sparse_sidecar(state_dict, path: pathlib.Path) -> None:
+    """Serialise ``state_dict`` to a COO sparse sidecar at ``path``.
+
+    Each tensor below ``_SPARSE_STORAGE_THRESHOLD`` density is written in
+    COO form (flat-index uint32 + value array). Above-threshold tensors are
+    written dense. The file is little-endian, single-pass writable, and
+    byte-stable for a given state-dict (encoding is deterministic in
+    ``state_dict()`` iteration order + ``torch.nonzero(..., as_tuple=False)``
+    row-major output).
+
+    The caller is responsible for atomic temp-file + ``os.replace`` if
+    needed — this function writes ``path`` directly.
+    """
+    import struct as _struct
+    import torch as _torch
+
+    items = list(state_dict.items())
+    with open(path, "wb") as f:
+        f.write(_SPARSE_SIDECAR_MAGIC)
+        f.write(_struct.pack("<I", len(items)))
+        for name, tensor in items:
+            name_bytes = name.encode("utf-8")
+            if len(name_bytes) > 0xFFFF:
+                raise ValueError(
+                    f"sparse sidecar: tensor name too long ({len(name_bytes)} bytes): {name!r}"
+                )
+            dtype_tag = _torch_dtype_to_tag(tensor.dtype)
+            shape = tuple(int(s) for s in tensor.shape)
+            rank = len(shape)
+            if rank > 255:
+                raise ValueError(
+                    f"sparse sidecar: tensor rank too high ({rank}): {name!r}"
+                )
+
+            # Flat view; tensors must be contiguous for raw byte storage. A
+            # ``.contiguous()`` call is a no-op when already contiguous.
+            tensor_c = tensor.detach().contiguous()
+            numel = tensor_c.numel()
+
+            # Decide encoding: COO when nnz/numel < threshold, else dense.
+            # Zero-element tensors are always written dense (degenerate
+            # case; the COO branch would otherwise emit an empty payload
+            # but the dense branch is shorter on disk for 0/0).
+            if numel == 0:
+                encoding = _SPARSE_ENC_DENSE
+                density = 0.0
+            else:
+                # ``count_nonzero`` is O(numel) but avoids materialising
+                # the index list when we end up choosing dense.
+                nnz = int(_torch.count_nonzero(tensor_c).item())
+                density = nnz / numel
+                encoding = (
+                    _SPARSE_ENC_COO
+                    if density < _SPARSE_STORAGE_THRESHOLD
+                    else _SPARSE_ENC_DENSE
+                )
+
+            # Per-tensor header.
+            f.write(_struct.pack("<H", len(name_bytes)))
+            f.write(name_bytes)
+            f.write(_struct.pack("<BBB", encoding, dtype_tag, rank))
+            if rank:
+                f.write(_struct.pack(f"<{rank}I", *shape))
+
+            if encoding == _SPARSE_ENC_DENSE:
+                # Raw little-endian bytes. ``numpy()`` reflects native
+                # byte order, which is little-endian on every supported
+                # platform; we still pack ``numel`` so the loader can
+                # validate without re-deriving it from ``shape``.
+                f.write(_struct.pack("<I", numel))
+                if numel:
+                    # ``view(_torch.uint8)`` is a zero-copy byte view for
+                    # dense tensors but only works for contiguous storage
+                    # — guaranteed above. Bool is the one dtype where
+                    # ``view(uint8)`` isn't safe; we fall back to numpy.
+                    if tensor_c.dtype == _torch.bool:
+                        f.write(tensor_c.numpy().tobytes())
+                    else:
+                        # ``tensor_c.flatten()`` keeps storage; ``numpy()``
+                        # would refuse for bfloat16, so we go through the
+                        # untyped storage view.
+                        flat = tensor_c.flatten()
+                        try:
+                            f.write(flat.numpy().tobytes())
+                        except (TypeError, RuntimeError):
+                            # bfloat16 / half on older torches: numpy()
+                            # refuses, so go through the untyped storage
+                            # byte view for raw little-endian dump.
+                            storage = flat.untyped_storage()
+                            f.write(bytes(storage))
+                continue
+
+            # COO branch: nnz flat indices into the row-major view, then
+            # the nonzero values themselves.
+            flat = tensor_c.flatten()
+            # ``nonzero(as_tuple=False)`` returns rows in row-major order
+            # for a 1-D input; this matches the doc's ``flat indices``.
+            idx_tensor = _torch.nonzero(flat, as_tuple=False).flatten()
+            if idx_tensor.numel() and int(idx_tensor.max().item()) >= 2**32:
+                raise ValueError(
+                    f"sparse sidecar: tensor {name!r} has flat index "
+                    f"exceeding uint32 range"
+                )
+            idx_u32 = idx_tensor.to(_torch.int64).numpy().astype("<u4", copy=False)
+            vals = flat.index_select(0, idx_tensor)
+            nnz = idx_tensor.numel()
+            f.write(_struct.pack("<I", nnz))
+            if nnz:
+                f.write(idx_u32.tobytes())
+                # Values: write raw bytes at the tensor's dtype.
+                if vals.dtype == _torch.bool:
+                    f.write(vals.numpy().tobytes())
+                else:
+                    try:
+                        f.write(vals.numpy().tobytes())
+                    except (TypeError, RuntimeError):
+                        storage = vals.contiguous().untyped_storage()
+                        f.write(bytes(storage))
+
+
+def _load_sparse_sidecar(skeleton, path: pathlib.Path) -> dict:
+    """Reconstruct a state-dict from the COO sparse sidecar at ``path``.
+
+    ``skeleton`` is the meta-tensor model whose ``state_dict()`` keys /
+    shapes / dtypes the sidecar must match — we use it only to allocate
+    target tensors with the right dtype + shape. The returned dict is
+    suitable for ``skeleton.load_state_dict(..., strict=False, assign=True)``.
+
+    Tensors stored in COO form are scattered into a freshly-zeroed dense
+    tensor via ``view(-1).index_copy_``. Dense-stored tensors are read
+    directly into a same-shape tensor.
+
+    Raises ``RuntimeError`` on any structural mismatch (bad magic, truncated
+    file, unknown dtype, shape disagreement). The caller (``_try_load_cached``)
+    catches and falls through to recompile.
+    """
+    import struct as _struct
+    import torch as _torch
+
+    # Shape/dtype map from the skeleton so we can validate without
+    # depending on the on-disk header alone.
+    expected = {}
+    for name, t in skeleton.state_dict().items():
+        expected[name] = (tuple(int(s) for s in t.shape), t.dtype)
+
+    out: dict = {}
+    with open(path, "rb") as f:
+        magic = f.read(len(_SPARSE_SIDECAR_MAGIC))
+        if magic != _SPARSE_SIDECAR_MAGIC:
+            raise RuntimeError(
+                f"sparse sidecar magic mismatch: got {magic!r}, "
+                f"expected {_SPARSE_SIDECAR_MAGIC!r}"
+            )
+        (n_tensors,) = _struct.unpack("<I", f.read(4))
+        for _ in range(n_tensors):
+            (name_len,) = _struct.unpack("<H", f.read(2))
+            name = f.read(name_len).decode("utf-8")
+            encoding, dtype_tag, rank = _struct.unpack("<BBB", f.read(3))
+            if rank:
+                shape = _struct.unpack(f"<{rank}I", f.read(4 * rank))
+            else:
+                shape = ()
+            shape = tuple(int(s) for s in shape)
+            dtype = _tag_to_torch_dtype(dtype_tag)
+
+            exp = expected.get(name)
+            if exp is not None:
+                exp_shape, exp_dtype = exp
+                if exp_shape != shape:
+                    raise RuntimeError(
+                        f"sparse sidecar: shape mismatch for {name!r}: "
+                        f"sidecar={shape} skeleton={exp_shape}"
+                    )
+                if exp_dtype != dtype:
+                    raise RuntimeError(
+                        f"sparse sidecar: dtype mismatch for {name!r}: "
+                        f"sidecar={dtype} skeleton={exp_dtype}"
+                    )
+
+            # Allocate a zero tensor of the right shape; we'll fill it
+            # either by index_copy_ (COO) or by view-copy (dense).
+            tensor = _torch.zeros(shape, dtype=dtype)
+
+            if encoding == _SPARSE_ENC_DENSE:
+                (numel,) = _struct.unpack("<I", f.read(4))
+                if numel != tensor.numel():
+                    raise RuntimeError(
+                        f"sparse sidecar: dense numel mismatch for {name!r}: "
+                        f"sidecar={numel} expected={tensor.numel()}"
+                    )
+                if numel:
+                    elem_size = tensor.element_size()
+                    raw = f.read(numel * elem_size)
+                    if len(raw) != numel * elem_size:
+                        raise RuntimeError(
+                            f"sparse sidecar: short read for {name!r} "
+                            f"(dense payload)"
+                        )
+                    if dtype == _torch.bool:
+                        import numpy as _np
+                        arr = _np.frombuffer(raw, dtype=_np.bool_).reshape(shape)
+                        tensor = _torch.from_numpy(arr.copy()).to(_torch.bool)
+                    else:
+                        try:
+                            import numpy as _np
+                            np_dtype = _torch_dtype_to_numpy(dtype)
+                            arr = _np.frombuffer(raw, dtype=np_dtype).reshape(shape).copy()
+                            tensor = _torch.from_numpy(arr).to(dtype)
+                        except (TypeError, ValueError):
+                            # bfloat16: numpy can't address it; copy via
+                            # storage byte view.
+                            flat = tensor.flatten()
+                            byte_view = flat.view(_torch.uint8)
+                            byte_view.copy_(_torch.frombuffer(bytearray(raw), dtype=_torch.uint8))
+                            tensor = flat.reshape(shape)
+                out[name] = tensor
+                continue
+
+            if encoding != _SPARSE_ENC_COO:
+                raise RuntimeError(
+                    f"sparse sidecar: unknown encoding {encoding} for {name!r}"
+                )
+
+            (nnz,) = _struct.unpack("<I", f.read(4))
+            if nnz == 0:
+                out[name] = tensor
+                continue
+
+            idx_bytes = f.read(4 * nnz)
+            if len(idx_bytes) != 4 * nnz:
+                raise RuntimeError(
+                    f"sparse sidecar: short read for {name!r} indices "
+                    f"({len(idx_bytes)} vs {4 * nnz})"
+                )
+            import numpy as _np
+            idx_arr = _np.frombuffer(idx_bytes, dtype="<u4").astype(_np.int64, copy=False)
+            idx_tensor = _torch.from_numpy(idx_arr.copy()).to(_torch.int64)
+
+            elem_size = tensor.element_size()
+            val_bytes = f.read(nnz * elem_size)
+            if len(val_bytes) != nnz * elem_size:
+                raise RuntimeError(
+                    f"sparse sidecar: short read for {name!r} values "
+                    f"({len(val_bytes)} vs {nnz * elem_size})"
+                )
+            if dtype == _torch.bool:
+                arr = _np.frombuffer(val_bytes, dtype=_np.bool_).copy()
+                vals = _torch.from_numpy(arr).to(_torch.bool)
+            else:
+                try:
+                    np_dtype = _torch_dtype_to_numpy(dtype)
+                    arr = _np.frombuffer(val_bytes, dtype=np_dtype).copy()
+                    vals = _torch.from_numpy(arr).to(dtype)
+                except (TypeError, ValueError):
+                    # bfloat16 fallback via storage byte view.
+                    vals_flat = _torch.zeros(nnz, dtype=dtype)
+                    byte_view = vals_flat.view(_torch.uint8)
+                    byte_view.copy_(_torch.frombuffer(bytearray(val_bytes), dtype=_torch.uint8))
+                    vals = vals_flat
+
+            tensor.view(-1).index_copy_(0, idx_tensor, vals)
+            out[name] = tensor
+
+    return out
+
+
+def _torch_dtype_to_numpy(dtype):
+    """Map a torch dtype to its numpy equivalent (used by load path)."""
+    import torch as _torch
+    import numpy as _np
+    mapping = {
+        _torch.float32: _np.dtype("<f4"),
+        _torch.float16: _np.dtype("<f2"),
+        _torch.int32: _np.dtype("<i4"),
+        _torch.int64: _np.dtype("<i8"),
+        _torch.int8: _np.dtype("i1"),
+        _torch.uint8: _np.dtype("u1"),
+        _torch.float64: _np.dtype("<f8"),
+        _torch.int16: _np.dtype("<i2"),
+    }
+    if dtype not in mapping:
+        raise TypeError(f"no numpy mapping for {dtype}")
+    return mapping[dtype]
 
 
 def _dedupe_state_dict_for_safetensors(state_dict: dict):
@@ -474,20 +876,24 @@ def _strip_model_to_meta(model) -> None:
 def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
     """Load a cached compile from ``path``. Returns ``(model, layout)`` or None.
 
-    The cache is a pair of files:
+    The cache (v6+) is a pair of files:
       - ``path`` (``.pt``): pickled shell (model with meta tensors) + layout
         + kwargs snapshot. Tiny.
-      - ``path.with_suffix(".safetensors")``: real weights, loaded via mmap.
+      - ``path.with_suffix(".sparse")``: real weights in COO sparse form,
+        loaded by ``_load_sparse_sidecar``.
 
     On any load failure (missing, corrupt, key collision, version mismatch)
     returns None and the caller falls through to the recompile path. A bad
-    pair is deleted so the next run won't keep tripping over it.
+    pair is deleted so the next run won't keep tripping over it. v5
+    (``.safetensors``) entries fall through the format-version check below
+    and the orphaned safetensors sibling is cleaned up next time the LRU
+    evictor runs.
     """
     weights_path = _weights_path_for(path)
-    if not path.exists() or not weights_path.exists():
+    legacy_weights_path = _legacy_safetensors_path_for(path)
+    if not path.exists():
         return None
     import pickle as _pickle
-    from safetensors.torch import load_file as _safetensors_load
 
     try:
         with open(path, "rb") as f:
@@ -498,7 +904,7 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
             "recompiling",
             path, exc,
         )
-        for p in (path, weights_path):
+        for p in (path, weights_path, legacy_weights_path):
             try:
                 p.unlink()
             except OSError:
@@ -516,7 +922,22 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
             path, saved_kwargs, kwargs_snapshot,
         )
         return None
+    # v5 caches (``.safetensors`` sibling) are legacy and not readable by
+    # this loader. The format-version check below filters them; the
+    # ``.safetensors`` sibling will be reaped by ``_evict_cache_lru`` next
+    # save (it walks ``.pt`` mtimes, so an orphan won't be picked up unless
+    # accompanied by a ``.pt``).
     if payload.get("format_version") != _CACHE_FORMAT_VERSION:
+        return None
+
+    if not weights_path.exists():
+        # v6 shell without a sparse sidecar = a partial / truncated write
+        # from a previous run that crashed between the two atomic-replace
+        # calls. Treat as a cache miss and drop the orphaned shell.
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return None
 
     # Defensive: format-version mismatches are already filtered above. This
@@ -537,7 +958,7 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
     model = payload["model"]
 
     try:
-        state_dict = _safetensors_load(str(weights_path), device="cpu")
+        state_dict = _load_sparse_sidecar(model, weights_path)
     except Exception as exc:
         _logger.warning(
             "compile_full_vm_dynamic: failed to load weights %s (%s); "
@@ -555,10 +976,10 @@ def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):
 
     try:
         # ``assign=True`` replaces the model's meta-tensor placeholders with
-        # the real tensors from safetensors without any shape-coercing copy.
-        # ``strict=False`` because the safetensors file only carries the
-        # dedup'd (keep) names — the alias slots are still meta and will be
-        # rebound to the kept tensors by ``_reshare_aliased_params`` below.
+        # the real tensors from the sparse sidecar without any shape-coercing
+        # copy. ``strict=False`` because the sidecar only carries the dedup'd
+        # (keep) names — the alias slots are still meta and will be rebound
+        # to the kept tensors by ``_reshare_aliased_params`` below.
         missing, unexpected = model.load_state_dict(
             state_dict, strict=False, assign=True
         )
@@ -659,19 +1080,27 @@ def _evict_cache_lru(
             return evicted
 
         entries: List[tuple] = []
-        # Each cache entry is the pair (``<key>.pt``, ``<key>.safetensors``);
+        # Each cache entry is the pair (``<key>.pt``, ``<key>.sparse``);
         # size is the combined on-disk bytes so caps account for the real
-        # footprint. The ``.pt`` mtime drives LRU ordering since the loader
-        # touches both files together.
+        # footprint. v5 entries used ``.safetensors`` siblings, which the
+        # evictor also accounts for and cleans up so an old dense sidecar
+        # left behind by a v5 process doesn't silently inflate the cap.
+        # The ``.pt`` mtime drives LRU ordering since the loader touches
+        # both files together.
         for p in cache_dir.glob("*.pt"):
             try:
                 st = p.stat()
             except OSError:
                 continue
             weights = _weights_path_for(p)
+            legacy_weights = _legacy_safetensors_path_for(p)
             size = st.st_size
             try:
                 size += weights.stat().st_size
+            except OSError:
+                pass
+            try:
+                size += legacy_weights.stat().st_size
             except OSError:
                 pass
             entries.append((st.st_mtime, size, p))
@@ -710,14 +1139,14 @@ def _evict_cache_lru(
                     p, exc,
                 )
                 continue
-            # Also drop the safetensors sibling; an orphan would otherwise
-            # leak ~830 MB per evicted entry and confuse cache_dir size
-            # accounting on the next eviction pass.
-            sibling = _weights_path_for(p)
-            try:
-                sibling.unlink()
-            except OSError:
-                pass
+            # Also drop the weights sibling(s); an orphan would otherwise
+            # leak ~600 MB per evicted v5 entry / ~3 MB per v6 entry and
+            # confuse cache_dir size accounting on the next eviction pass.
+            for sibling in (_weights_path_for(p), _legacy_safetensors_path_for(p)):
+                try:
+                    sibling.unlink()
+                except OSError:
+                    pass
             evicted.append(p)
             total_bytes -= size
             count -= 1
@@ -739,9 +1168,10 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
         carries only the post-bake module graph (FFN shapes, wrapper module
         classes, compact-routing buffers' non-persistent values) and weighs
         well under a megabyte.
-      - ``path.with_suffix(".safetensors")``: the real ``state_dict``,
-        written via ``safetensors.torch.save_file``. This holds essentially
-        all of the on-disk size; mmap'd on load.
+      - ``path.with_suffix(".sparse")``: the real ``state_dict``, encoded
+        as a COO sparse sidecar (see ``_save_sparse_sidecar``). With
+        ~99.78% sparsity this sidecar is ~3.6 MB vs the 555 MB the v5
+        dense ``.safetensors`` carried.
 
     The model object passed in is *not* mutated — the meta-swap runs on an
     in-memory shallow clone (the original module instances are restored
@@ -752,20 +1182,20 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
     kwargs (see the env knobs ``C4_VM_CACHE_MAX_BYTES`` /
     ``C4_VM_CACHE_MAX_ENTRIES``).
     """
-    from safetensors.torch import save_file as _safetensors_save
     import pickle as _pickle
 
     weights_path = _weights_path_for(path)
 
     # Capture the live state_dict before stripping. The wrapper-expansion
     # phase attaches the same FFN submodule under both ``_stages.*`` and
-    # ``pipeline.*`` paths, so many entries share storage. ``safetensors``
-    # refuses shared storages; we dedupe to one keep-name per group and
-    # record the alias map in the shell so the loader can re-share.
+    # ``pipeline.*`` paths, so many entries share storage. The sparse
+    # sidecar (like safetensors) doesn't tolerate shared storage gracefully
+    # — we dedupe to one keep-name per group and record the alias map in
+    # the shell so the loader can re-share.
     raw_state_dict = dict(model.state_dict())
     state_dict, alias_map = _dedupe_state_dict_for_safetensors(raw_state_dict)
-    # ``save_file`` requires contiguous tensors; ``raw_state_dict`` entries
-    # are usually contiguous but ``.contiguous()`` is a no-op when so.
+    # The sparse sidecar requires contiguous tensors for raw byte storage;
+    # ``.contiguous()`` is a no-op when already so.
     state_dict = {
         k: (v.contiguous() if not v.is_contiguous() else v)
         for k, v in state_dict.items()
@@ -836,7 +1266,7 @@ def _try_save_cached(path: pathlib.Path, model, layout, kwargs_snapshot: dict):
         )
         os.close(fd)
         tmp_weights = pathlib.Path(tmp_weights_name)
-        _safetensors_save(state_dict, str(tmp_weights))
+        _save_sparse_sidecar(state_dict, tmp_weights)
 
         fd, tmp_shell_name = tempfile.mkstemp(
             dir=str(path.parent), suffix=".shell.tmp"
