@@ -264,8 +264,20 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # collapsing back to zero. Gate the preservation on the existing OUTPUT
     # nibble so we only reinforce what L14/L15 already staged; the rule is
     # silent on the default-zero row.
+    # 2026-06-07 Removal-2 fix (REMOVAL_2_DEEP_DIVE_2026_06_06.md): the
+    # original OP_LEV weight 1.0 + threshold 4.5 admitted firing during
+    # IMM-before-binop steps because OP_LEV bleeds upward at the STACK0
+    # marker position via attention spread. With the gate self-feedback
+    # (gate=OUTPUT_LO+k with write_scale=50/S), even a small leak
+    # amplifies through ~x97 per step. The L15 nibble_copy +40 spike
+    # at OUTPUT_LO/HI then becomes +3,868 here, which crushes the
+    # downstream L34 stack0_pop_loaded_output rules into a -6.29e8
+    # suppressor. Strengthen the OP_LEV gate (1.0 -> 2.0) and bump the
+    # threshold (4.5 -> 5.5) so IMM-step OP_LEV bleed cannot cross the
+    # threshold. Real LEV-step OP_LEV (~10 after L6 amplification, see
+    # vm_step.py:5871) still clears at 2*10+1+1+1=23 >> 5.5.
     lev_stack0_preserve_conditions = (
-        ("OP_LEV", 1.0),
+        ("OP_LEV", 2.0),
         ("MARK_STACK0", 1.0),
         ("HAS_SE", 1.0),
         ("BYTE_INDEX_0", 1.0),
@@ -286,7 +298,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         rules.append(multi_way_and_rule(
             name=f"l16_lev_stack0_byte0_preserve_lo_{k}",
             conditions=lev_stack0_preserve_conditions,
-            threshold=4.5,
+            threshold=5.5,
             gate=f"OUTPUT_LO+{k}",
             writes=((f"OUTPUT_LO+{k}", lev_stack0_preserve_strength),),
         ))
@@ -294,7 +306,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         rules.append(multi_way_and_rule(
             name=f"l16_lev_stack0_byte0_preserve_hi_{k}",
             conditions=lev_stack0_preserve_conditions,
-            threshold=4.5,
+            threshold=5.5,
             gate=f"OUTPUT_HI_THIS_STEP+{k}",
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", lev_stack0_preserve_strength),),
         ))
