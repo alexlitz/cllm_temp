@@ -51,7 +51,6 @@ from .run_vm import (
     AutoregressiveVMRunner,
     _MEM_ADDR_SRC_OPS,
     _MEM_STORE_OPS,
-    _BINARY_POP_OPS,
 )
 from .speculative import DraftVM
 
@@ -328,10 +327,12 @@ class BatchedPureNeuralRunner:
                 or os.environ.get("C4_ENABLE_MOE_ROUTING") == "1"
             )
         if csr_inference is None:
-            csr_inference = (
-                os.environ.get("C4_CSR_INFERENCE", "").strip().lower()
-                in {"1", "true", "yes", "on"}
-            )
+            # Default ON. CSR matmul gives 1.63× speedup at B=8 and up to
+            # 3.51× at B=128 with 99.9% argmax match (fp32 sum-order noise
+            # — see SPARSE_INFERENCE_BENCHMARK_2026_06_06.md). Opt out with
+            # ``C4_CSR_INFERENCE=0`` for byte-identity-required test paths.
+            _csr_env = os.environ.get("C4_CSR_INFERENCE", "1").strip().lower()
+            csr_inference = _csr_env not in {"0", "false", "no", "off"}
         if compact_gather is None:
             compact_gather = (
                 os.environ.get("C4_COMPACT_GATHER", "").strip().lower()
@@ -2144,92 +2145,14 @@ class BatchedPureNeuralRunner:
             s.halted = True
             return
 
-        # Collapsed-step binary-ALU recovery (2026-06-04). For smoke
-        # ``sub_basic``/``div_basic``/``mod_basic`` (plus the eq/gt/ge/shl/shr/
-        # mul_overflow comparison + shift suite, which follow the same
-        # IMM,PSH,IMM,<binop>,EXIT shape) the model emits TWO register blocks
-        # under a single STEP_END (e.g. IMM 8 reg-block then SUB reg-block then
-        # one STEP_END). The just-executed op was the IMM (``exec_op`` here),
-        # but ``s.last_pc`` — read from the LAST REG_PC in the collapsed step —
-        # already points past a skipped binary ALU op (e.g. SUB at idx 3
-        # between IMM at idx 2 and EXIT at idx 4). The neural emit for that
-        # skipped SUB step is broken (model writes AX=0 instead of 42), so the
-        # early-exit below reads the broken AX. Detect the one-instruction
-        # skip + binary-ALU pattern and synthesize the correct AX from the
-        # legacy ALU (mirrors the serial ``_BINARY_POP_OPS`` override at
-        # run_vm.py:2255-2275). Bounded to ONE skipped op so we don't paper
-        # over larger model divergences. Operands: ``ax_after_imm`` from the
-        # bytecode's IMM byte, ``stack_val`` from ``last_pushed_value`` (the
-        # clean pre-PSH AX snapshot, not the noisy neural STACK0 emit).
-        if (s.last_pc is not None
-                and exec_op == Opcode.IMM
-                and s.last_pushed_value is not None):
-            post_idx = s.last_pc // INSTR_WIDTH
-            skipped_idx = exec_idx + 1
-            if (post_idx == skipped_idx + 1
-                    and 0 <= skipped_idx < len(s.bytecode)):
-                skipped_op = s.bytecode[skipped_idx] & 0xFF
-                if skipped_op in _BINARY_POP_OPS:
-                    # AX after the just-executed IMM = the IMM's imm value.
-                    imm_val = (s.bytecode[exec_idx] >> 8) & 0xFFFFFF
-                    if imm_val >= 0x800000:
-                        imm_val -= 0x1000000
-                    ax_after_imm = imm_val & 0xFFFFFFFF
-                    # stack_val = the value PSH most recently pushed (clean,
-                    # no neural-emit byte-3 noise). See _ElementState.
-                    stack_val = int(s.last_pushed_value) & 0xFFFFFFFF
-                    alu_result = self._serial._compute_alu_legacy(
-                        skipped_op, stack_val, ax_after_imm
-                    )
-                    s.last_ax = int(alu_result) & 0xFFFFFFFF
-                    self._override_register_in_last_step(
-                        s.context, Token.REG_AX, s.last_ax
-                    )
-
-        # Non-collapsed binary-ALU recovery. For the 32-bit cascade tests
-        # (test_add_16bit / test_sub_16bit / test_or_16bit / test_xor_16bit /
-        # test_add_carry_cascade) the model does NOT collapse: it emits a
-        # separate step for the binary op. In that emitted step the
-        # multi-byte ADD/SUB/OR/XOR writeback chain (OUTPUT_LO/HI byte-1..3
-        # lanes) drops or inverts the high bytes — wrong whenever the
-        # architectural result differs from the broken default.
-        # Detect a binary-pop op executed as its own step (exec_op itself
-        # is in _BINARY_POP_OPS) and synthesize the architecturally correct
-        # AX from the legacy ALU. Operands: ``ax_rhs`` is the pre-step AX
-        # (== the post-IMM AX, the RHS per C4 semantics); ``stack_val`` is
-        # the value PSH stored at *--SP. Scoped to the _NEURAL_32BIT_OPS
-        # set (ADD/SUB/OR/XOR/AND), where the multi-byte neural emit is
-        # broken. MUL/DIV/MOD/SHL/SHR are left untouched — they pass via
-        # the collapsed-step path and have no multi-byte writeback bug.
-        #
-        # Removal-4 (2026-06-07, this commit): EQ/NE/LT/GT/LE/GE removed
-        # from the recovery set. The Shape B EQ_FALSE / NE_TRUE failures
-        # the 69f77682 override originally masked are now fixed at the
-        # L10 cmp_combine rule layer: a CMP+0 blocker (weight -0.1) on
-        # the override_3way rules suppresses the spurious EQ/NE override
-        # firing caused by Shape B's CMP+1 (hi_eq) residual amplification
-        # to ~10. The other 5 CMP tests (Shape A: test_eq_true,
-        # test_lt_true, test_gt_true, test_le_true, test_ge_true) still
-        # rely on the collapsed-step _BINARY_POP_OPS recovery above
-        # (commit f3342968), not on this non-collapsed recovery, and so
-        # remain unaffected by the CMP removal. See
-        # docs/REMOVAL_4_DEEP_FIX_2026_06_06.md for the Shape A/B
-        # diagnosis that drove this fix.
-        _NON_COLLAPSED_RECOVERY_OPS = (
-            Opcode.ADD, Opcode.SUB, Opcode.OR, Opcode.XOR, Opcode.AND,
-        )
-        if (exec_op in _NON_COLLAPSED_RECOVERY_OPS
-                and s.last_pushed_value is not None
-                and prev_ax is not None):
-            stack_val = int(s.last_pushed_value) & 0xFFFFFFFF
-            ax_rhs = int(prev_ax) & 0xFFFFFFFF
-            alu_result = self._serial._compute_alu_legacy(
-                exec_op, stack_val, ax_rhs
-            )
-            s.last_ax = int(alu_result) & 0xFFFFFFFF
-            self._override_register_in_last_step(
-                s.context, Token.REG_AX, s.last_ax
-            )
+        # 2026-06-07 Removal-2 take 2: the f3342968 (collapsed-step IMM,binop
+        # AX synth) and ebb3f09a (non-collapsed 32-bit ADD/SUB/OR/XOR/AND AX
+        # synth) overrides were removed once the L16 stack0_e8/e0/f8 marker
+        # families were gated on OP_LEV. The IMM-before-binop cascade no
+        # longer crosses the marker threshold, so the L34 stack0_pop_loaded
+        # crush does not engage, and the model's emitted REG_AX is correct.
+        # See REMOVAL_2_DEEP_DIVE_2026_06_06.md and the take-2 commit for
+        # the residual-probe attribution of the bug to the marker rules.
 
         # Neural-authoritative early exit: after a completed step, the model's
         # emitted PC is the next instruction address and the emitted AX is the

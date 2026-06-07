@@ -351,10 +351,12 @@ class AutoregressiveVMRunner:
         if compile_mode is None:
             compile_mode = "none"
         if csr_inference is None:
-            csr_inference = (
-                os.environ.get("C4_CSR_INFERENCE", "").strip().lower()
-                in {"1", "true", "yes", "on"}
-            )
+            # Default ON. CSR matmul gives 1.63× speedup at B=8 and up to
+            # 3.51× at B=128 with 99.9% argmax match (fp32 sum-order noise
+            # — see SPARSE_INFERENCE_BENCHMARK_2026_06_06.md). Opt out with
+            # ``C4_CSR_INFERENCE=0`` for byte-identity-required test paths.
+            _csr_env = os.environ.get("C4_CSR_INFERENCE", "1").strip().lower()
+            csr_inference = _csr_env not in {"0", "false", "no", "off"}
         if compact_gather is None:
             compact_gather = (
                 os.environ.get("C4_COMPACT_GATHER", "").strip().lower()
