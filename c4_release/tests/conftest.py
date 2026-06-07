@@ -13,6 +13,29 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # =============================================================================
+# Collection exclusions — stale script-style files (not pytest tests)
+# =============================================================================
+#
+# These three files are top-level scripts (module-level ``print``/``assert``
+# blocks, no ``def test_*``/``class Test*``) that reference the retired
+# ``runner.model.set_active_opcode`` weight-swap API and hard-coded FFN unit
+# indices (e.g. ``W_up[410, ...]``) that no longer match the post-compact
+# StandardMoEFFN shapes. They were left in tree as documentation of the
+# pre-MoE conversational-I/O pipeline and now hard-error at *collection*
+# time, blocking the whole ``test_conversational_io_*`` sweep.
+#
+# Excluding them here keeps pytest collection clean. The real
+# conversational-I/O pytest tests live in
+# ``test_conversational_io.py`` and ``test_conversational_io_comprehensive.py``.
+# See ``docs/CONVO_IO_TRIAGE_2026_06_07.md`` for context.
+collect_ignore = [
+    "test_conversational_io_manual_bytecode.py",
+    "test_conversational_io_proper.py",
+    "test_conversational_io_final.py",
+]
+
+
+# =============================================================================
 # torch.compile mode helper
 # =============================================================================
 

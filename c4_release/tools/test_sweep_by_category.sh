@@ -47,8 +47,7 @@ run_cat kv_cache_autoreg 600 \
 
 run_cat conversational_io 600 \
     tests/test_conversational_io.py \
-    tests/test_conversational_io_comprehensive.py \
-    tests/test_conversational_io_final.py
+    tests/test_conversational_io_comprehensive.py
 
 run_cat architecture_toggles 60 \
     tests/test_architecture_toggles.py
