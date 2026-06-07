@@ -1420,6 +1420,16 @@ class LayerCompiler:
         # produces the same dim+register. The analyzer needs the per-op
         # phase ordering, which is fully available at this point.
         self._detect_staleness_violations()
+        # Run dead-consumer integrity scan: warn when any op's ``reads``
+        # contains a dim that no op in the compiler declares in ``writes``.
+        # Cheap O(ops * dims) check that catches the read-but-never-written
+        # class of bug surfaced by the L8 sp_gather STACK0 audit
+        # (``docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md``). Opt out via
+        # ``C4_SKIP_DIM_INTEGRITY=1``. The check emits a warning (not an
+        # error) so it never breaks the bake path while the dead-consumer
+        # backlog is worked down.
+        from .dim_integrity import run_dim_integrity_check
+        self._last_dim_integrity = run_dim_integrity_check(self)
 
         # Block ops are pinned to layer_idx and skip dep analysis.
         attn_ffn_ops = [op for op in self.ops if op.kind != "block"]
