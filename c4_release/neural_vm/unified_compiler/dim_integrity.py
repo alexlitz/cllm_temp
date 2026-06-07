@@ -39,17 +39,10 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import (
-    TYPE_CHECKING,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Set,
-    Tuple,
-)
+from collections import defaultdict
+from typing import TYPE_CHECKING, Dict, Iterable, List, Set
 
-from .ssa_dim import SSA_SEPARATOR, is_ssa_form, parse_ssa_name
+from .ssa_dim import is_ssa_form, parse_ssa_name
 
 if TYPE_CHECKING:
     from .layer_compiler import LayerCompiler, Operation
@@ -62,27 +55,16 @@ def _env_skip() -> bool:
     return os.environ.get(_ENV_SKIP, "") == "1"
 
 
-def _normalize_consumer_name(name: str) -> str:
-    """Return the lookup key used to match a consumer against producers.
-
-    For SSA prev-step aliases (``BASE.WRITER.OFFSET`` with ``OFFSET<0``)
-    we collapse to the base dim so any in-step producer of ``BASE``
-    satisfies the cross-step read. Unversioned names pass through
-    unchanged.
-    """
+def _base_dim(name: str) -> str:
+    """Strip an SSA prev-step suffix; return ``name`` unchanged otherwise."""
     if not is_ssa_form(name):
         return name
     try:
         parsed = parse_ssa_name(name)
     except ValueError:
-        # Malformed SSA name — leave as-is so the dead-consumer report
-        # surfaces it loudly.
         return name
     if parsed.step_offset < 0:
         return parsed.base_dim
-    # Same-step or future-step SSA name: keep the full form so the
-    # producer match goes through the SSA-aware writer-index code paths
-    # (which is what the compiler's other passes already do).
     return name
 
 
@@ -91,15 +73,7 @@ def _producer_set(ops: Iterable["Operation"]) -> Set[str]:
     for op in ops:
         for dim_name in op.writes or ():
             producers.add(dim_name)
-            # Allow base-dim producers to match cross-step aliases of
-            # the same base by also adding the base form (no-op when
-            # the write is already unversioned).
-            if is_ssa_form(dim_name):
-                try:
-                    parsed = parse_ssa_name(dim_name)
-                except ValueError:
-                    continue
-                producers.add(parsed.base_dim)
+            producers.add(_base_dim(dim_name))
     return producers
 
 
@@ -109,28 +83,19 @@ def find_dead_consumers(
     """Return ``{dim_name: [op_name, ...]}`` for dims read but never written.
 
     The returned dict is deterministic: dim names are sorted, and each
-    op-name list is sorted by op name. Cross-step aliases collapse to
-    their base dim (see module docstring); the report lists the alias
-    name as it appears on the consumer op for actionable diagnostics.
+    op-name list is sorted. Cross-step aliases collapse to their base
+    dim (see module docstring); the report lists the alias name as it
+    appears on the consumer op for actionable diagnostics.
     """
     op_list = list(ops)
     producers = _producer_set(op_list)
-    dead: Dict[str, List[str]] = {}
+    dead_sets: Dict[str, Set[str]] = defaultdict(set)
     for op in op_list:
         for dim_name in op.reads or ():
-            key = _normalize_consumer_name(dim_name)
-            if key in producers:
+            if _base_dim(dim_name) in producers:
                 continue
-            # Final check: also accept ``dim_name`` itself (covers the
-            # case where the consumer reads ``BASE.*.-1`` AND some op
-            # writes the exact same dotted form, though we don't expect
-            # this in practice).
-            if dim_name in producers:
-                continue
-            dead.setdefault(dim_name, []).append(op.name)
-    for dim_name in list(dead.keys()):
-        dead[dim_name] = sorted(set(dead[dim_name]))
-    return {k: dead[k] for k in sorted(dead.keys())}
+            dead_sets[dim_name].add(op.name)
+    return {k: sorted(dead_sets[k]) for k in sorted(dead_sets)}
 
 
 def format_report(dead: Dict[str, List[str]]) -> str:
@@ -145,9 +110,7 @@ def format_report(dead: Dict[str, List[str]]) -> str:
         if len(consumer_ops) > 6:
             sample += f", ... (+{len(consumer_ops) - 6} more)"
         lines.append(f"  - {dim_name!r}: read by {sample}")
-    lines.append(
-        f"  (Set {_ENV_SKIP}=1 to skip this check.)"
-    )
+    lines.append(f"  (Set {_ENV_SKIP}=1 to skip this check.)")
     return "\n".join(lines)
 
 
@@ -166,11 +129,7 @@ def run_dim_integrity_check(
     """
     if _env_skip():
         return {}
-    all_ops: List["Operation"] = (
-        list(compiler.ops)
-        + list(getattr(compiler, "block_ops", []) or [])
-        + list(getattr(compiler, "model_ops", []) or [])
-    )
+    all_ops = list(compiler.ops) + list(compiler.block_ops) + list(compiler.model_ops)
     dead = find_dead_consumers(all_ops)
     if dead:
         warnings.warn(format_report(dead), stacklevel=3)
