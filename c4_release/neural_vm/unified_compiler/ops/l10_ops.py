@@ -571,12 +571,31 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     ) -> FFNRule:
         # DSL v4b: 4-condition AND (MARK_AX + 2 CMP cells + MARK_PC
         # blocker) with explicit threshold 2.5, gated on opcode.
+        #
+        # Shape B CMP fix (2026-06-07, removal-4): add CMP+0 blocker at
+        # weight -0.1 to suppress this override when hi_lt is hot. The
+        # Shape B EQ/NE step's neural residual amplifies CMP+1
+        # (hi_eq) to ~10 because L9 hi_eq_k fires spuriously when
+        # ALU_HI+0 (residual at ~6 from the zero-nibble representation)
+        # and AX_CARRY_HI+0 (~0.3) both register as positive. Without
+        # this blocker, CMP+1 alone clears the additive 2.5 threshold,
+        # firing the EQ/NE override on Shape B (test_eq_false +
+        # test_ne_true). With CMP+0 amplified to ~150 (true hi_lt) the
+        # blocker contributes -15 to the score, suppressing the rule.
+        # Semantically clean: when hi_lt is true the operands are not
+        # equal at the high nibble, so any CMP override that asserts
+        # equality (via CMP+1=hi_eq AND CMP+2=lo_eq or CMP+1=hi_eq AND
+        # CMP+3=lo_lt) must not fire. Same justification holds for the
+        # LT/GT/LE/GE 3way overrides that gate on CMP+1: hi_eq cannot
+        # be true when hi_lt is true. The 2way overrides on CMP+0 are
+        # left untouched (they ARE the hi_lt path).
         return multi_way_and_rule(
             conditions=(
                 ("MARK_AX", 1.0),
                 (cmp_name1, 1.0),
                 (cmp_name2, 1.0),
                 ("MARK_PC", MARK_PC_BLOCK),
+                ("CMP+0", -0.1),
             ),
             threshold=2.5,
             gate=op_name,
@@ -727,12 +746,23 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
         # explicit threshold 4.0 (the legacy bake's "all three must be
         # present" gate). multi_way_and_rule with explicit threshold
         # passes through unchanged.
+        #
+        # Shape B CMP fix (2026-06-07, removal-4): add CMP+0 blocker
+        # at weight -0.1 to suppress this override when hi_lt is hot
+        # (operands not equal at hi nibble). See the parallel rule in
+        # ``_l10_comparison_combine_rules.cmp_override_3way`` for the
+        # detailed rationale. The same Shape B residual amplification
+        # of CMP+1 (~10) fires this rule via the additive structure
+        # (1 + 10.587 + 0 = 11.587 >= 4.0) even when CMP+2 is zero.
+        # With CMP+0 amplified to ~150 (true hi_lt), the -0.1 blocker
+        # contributes -15 to the score, dropping it below 4.0.
         return multi_way_and_rule(
             name=f"l10_cmp_{op_name.lower()}_override3_{suffix}",
             conditions=(
                 ("MARK_AX", 1.0),
                 (f"CMP+{cmp_idx1}", 1.0),
                 (f"CMP+{cmp_idx2}", 1.0),
+                ("CMP+0", -0.1),
             ),
             threshold=4.0,
             gate=dim_ref("opcode_flag", op_name),

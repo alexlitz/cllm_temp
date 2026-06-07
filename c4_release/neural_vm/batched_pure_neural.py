@@ -2186,27 +2186,36 @@ class BatchedPureNeuralRunner:
                         s.context, Token.REG_AX, s.last_ax
                     )
 
-        # Non-collapsed binary-ALU recovery (2026-06-05). Companion to the
-        # collapsed IMM,binop synth above. For the smoke test_eq_false /
-        # test_ne_true cases (and the 32-bit cascade tests test_add_16bit /
-        # test_sub_16bit / test_or_16bit / test_xor_16bit /
+        # Non-collapsed binary-ALU recovery. For the 32-bit cascade tests
+        # (test_add_16bit / test_sub_16bit / test_or_16bit / test_xor_16bit /
         # test_add_carry_cascade) the model does NOT collapse: it emits a
-        # separate step for the binary op. In that emitted step the neural
-        # network's CMP head ignores operand values (emits a fixed AX = 1/0)
-        # and the multi-byte ADD/SUB/OR/XOR writeback chain (OUTPUT_LO/HI
-        # byte-1..byte-3 lanes) drops or inverts the high bytes — both wrong
-        # whenever the architectural result differs from the broken default.
-        # Detect a binary-pop op executed as its own step (exec_op itself is
-        # in _BINARY_POP_OPS) and synthesize the architecturally correct AX
-        # from the legacy ALU. Operands: ``ax_rhs`` is the pre-step AX
-        # (== the post-IMM AX, the RHS per C4 semantics); ``stack_val`` is the
-        # value PSH stored at *--SP. Scoped to comparison ops plus the
-        # _NEURAL_32BIT_OPS set (ADD/SUB/OR/XOR/AND), where the multi-byte
-        # neural emit is broken. MUL/DIV/MOD/SHL/SHR are left untouched —
-        # they pass via the collapsed-step path and have no multi-byte
-        # writeback bug today.
+        # separate step for the binary op. In that emitted step the
+        # multi-byte ADD/SUB/OR/XOR writeback chain (OUTPUT_LO/HI byte-1..3
+        # lanes) drops or inverts the high bytes — wrong whenever the
+        # architectural result differs from the broken default.
+        # Detect a binary-pop op executed as its own step (exec_op itself
+        # is in _BINARY_POP_OPS) and synthesize the architecturally correct
+        # AX from the legacy ALU. Operands: ``ax_rhs`` is the pre-step AX
+        # (== the post-IMM AX, the RHS per C4 semantics); ``stack_val`` is
+        # the value PSH stored at *--SP. Scoped to the _NEURAL_32BIT_OPS
+        # set (ADD/SUB/OR/XOR/AND), where the multi-byte neural emit is
+        # broken. MUL/DIV/MOD/SHL/SHR are left untouched — they pass via
+        # the collapsed-step path and have no multi-byte writeback bug.
+        #
+        # Removal-4 (2026-06-07, this commit): EQ/NE/LT/GT/LE/GE removed
+        # from the recovery set. The Shape B EQ_FALSE / NE_TRUE failures
+        # the 69f77682 override originally masked are now fixed at the
+        # L10 cmp_combine rule layer: a CMP+0 blocker (weight -0.1) on
+        # the override_3way rules suppresses the spurious EQ/NE override
+        # firing caused by Shape B's CMP+1 (hi_eq) residual amplification
+        # to ~10. The other 5 CMP tests (Shape A: test_eq_true,
+        # test_lt_true, test_gt_true, test_le_true, test_ge_true) still
+        # rely on the collapsed-step _BINARY_POP_OPS recovery above
+        # (commit f3342968), not on this non-collapsed recovery, and so
+        # remain unaffected by the CMP removal. See
+        # docs/REMOVAL_4_DEEP_FIX_2026_06_06.md for the Shape A/B
+        # diagnosis that drove this fix.
         _NON_COLLAPSED_RECOVERY_OPS = (
-            Opcode.EQ, Opcode.NE, Opcode.LT, Opcode.GT, Opcode.LE, Opcode.GE,
             Opcode.ADD, Opcode.SUB, Opcode.OR, Opcode.XOR, Opcode.AND,
         )
         if (exec_op in _NON_COLLAPSED_RECOVERY_OPS

@@ -729,6 +729,27 @@ class ComparisonCombine(PureFFN):
             self.W_up.data[unit, cmp_dim1] = S
             self.W_up.data[unit, cmp_dim2] = S
             self.W_up.data[unit, BD.MARK_PC] = MARK_PC_BLOCK
+            # Shape B CMP fix (2026-06-07, removal-4): add CMP+0 blocker
+            # at weight -0.1 to suppress this override when hi_lt is hot
+            # (operands not equal at hi nibble). The Shape B EQ_FALSE /
+            # NE_TRUE failures previously masked by the 69f77682
+            # _NON_COLLAPSED_RECOVERY_OPS override are caused by the
+            # legacy ComparisonCombine post_op firing this rule on
+            # spurious CMP+1 amplification (residual ~10 at the
+            # AX-marker row in non-collapsed CMP steps). With CMP+0
+            # amplified to ~150 in those rows (the true hi_lt
+            # indicator), the -0.1 contributes -15 to the symbolic
+            # score, dropping it below the +2.5 threshold and silencing
+            # the spurious override writes. For true-equality cases
+            # (EQ_TRUE, NE_FALSE) CMP+0 is zero (no hi_lt fired), so
+            # the blocker contributes zero and the override fires
+            # normally. Mirrors the parallel declarative fix in
+            # unified_compiler/ops/l10_ops.py::_cmp_override_3way
+            # (both _l10_comparison_combine_rules and
+            # _layer10_alu_cmp_combine_rules). See
+            # docs/REMOVAL_4_DEEP_FIX_2026_06_06.md for the Shape A/B
+            # diagnosis that drove this fix.
+            self.W_up.data[unit, BD.CMP + 0] = -S * 0.1
             self.b_up.data[unit] = -S * 2.5
             self.W_gate.data[unit, op_dim] = 1.0
             self.W_down.data[BD.OUTPUT_LO + to_result, unit] = 4.0 / S
