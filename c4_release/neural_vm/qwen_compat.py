@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import torch
+from torch import nn
 
 
 QWEN2_DENSE = "qwen2_dense"
@@ -904,4 +905,213 @@ __all__ = [
     "build_qwen2_dense_mapping_plan",
     "analyze_qwen_compatibility",
     "export_qwen3_dense",
+    "flatten_post_ops_for_qwen_export",
+    "count_post_ops",
+    "expanded_qwen_layer_count",
+    "summarize_post_ops_flattening",
+    "PostOpsFlatteningReport",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Phase R5 — post_ops flattening for Qwen export
+# ---------------------------------------------------------------------------
+#
+# Qwen2/Qwen3 decoder layers are a strict ``attn -> ffn`` pair plus residuals
+# (with norms). They have no concept of ``post_ops``. Our
+# :class:`neural_vm.vm_step.TransformerBlock` runs an arbitrary
+# ``post_ops: nn.ModuleList`` after ``attn`` + ``ffn``, where each post-op is a
+# residual FFN-shaped transformation (most are :class:`PureFFN` subclasses;
+# some are composite ALU modules).
+#
+# The runtime VM expands these via ``_expand_wrapper_blocks`` (see
+# ``vm_step.py``) into ``1 + N`` blocks with a zero-init "skip-pass" attention
+# (W_q/W_k/W_v/W_o all zero so the post-attention residual stream is
+# ``x + 0 = x``). The same structural transform is what Qwen export needs.
+#
+# This module provides a non-mutating equivalent suitable for the export plan:
+# given a VM model, return a list of fresh :class:`TransformerBlock`
+# instances such that running them in sequence reproduces the original model's
+# block-by-block forward exactly. The base block reuses the original ``attn``
+# and ``ffn`` modules (its own ``post_ops`` is empty); each skip-pass block
+# wraps a single post-op as its FFN and a zero-init attention so the only
+# delta on the residual stream comes from the post-op.
+
+
+def count_post_ops(model: Any) -> List[int]:
+    """Return ``len(block.post_ops)`` for every block in order.
+
+    Blocks without a ``post_ops`` attribute count as 0. This is the data the
+    Qwen export uses to compute the expanded layer count.
+    """
+
+    counts: List[int] = []
+    for block in _blocks(model):
+        post_ops = getattr(block, "post_ops", None)
+        counts.append(int(len(post_ops)) if post_ops is not None else 0)
+    return counts
+
+
+def expanded_qwen_layer_count(model: Any) -> int:
+    """Effective Qwen ``num_hidden_layers`` after post_ops flattening.
+
+    Equals ``sum(1 + len(block.post_ops) for block in model.blocks)``: each
+    base block contributes 1 Qwen layer, plus one skip-pass layer per post-op.
+    """
+
+    return sum(1 + n for n in count_post_ops(model))
+
+
+def _make_skip_pass_attention(template_attn: Any) -> Any:
+    """Build a zero-init attention whose forward delta is 0.
+
+    Mirrors ``_expand_wrapper_blocks._make_passthrough_block`` in
+    ``vm_step.py``: a fresh :class:`AutoregressiveAttention` with the same
+    shape, positional encoding, and normalization as ``template_attn``. All
+    weights default to zero in the constructor, so the attention output is the
+    zero tensor and the residual ``x + attn(x) = x`` is preserved.
+
+    The constructor zero-fills ``W_q``/``W_k``/``W_v``/``W_o`` — no further
+    initialisation is required to guarantee the skip-pass invariant.
+    """
+
+    # Local import keeps qwen_compat importable without forcing the heavyweight
+    # vm_step module load at planning time.
+    from neural_vm.vm_step import AutoregressiveAttention
+
+    attn = AutoregressiveAttention(
+        dim=int(template_attn.dim),
+        num_heads=int(template_attn.num_heads),
+        max_seq_len=int(template_attn.max_seq_len),
+        layer_idx=getattr(template_attn, "layer_idx", None),
+        use_flash_attention=getattr(template_attn, "use_flash_attention", True),
+        positional_encoding=getattr(template_attn, "_positional_encoding", None),
+        attention_normalization=getattr(
+            template_attn, "attention_normalization", None
+        ),
+        rope_base=getattr(template_attn, "rope_base", None),
+    )
+    # Defensive: confirm all four projections are zero so attn(x) ≡ 0.
+    # The constructor already zeros them; this guards against future drift.
+    with torch.no_grad():
+        attn.W_q.zero_()
+        attn.W_k.zero_()
+        attn.W_v.zero_()
+        attn.W_o.zero_()
+    return attn
+
+
+def _make_skip_pass_block(template_block: Any, post_op: nn.Module) -> Any:
+    """Build a TransformerBlock with zero-attn + ``post_op`` as the FFN.
+
+    The skip-pass block deliberately runs without RMSNorm even when the
+    parent ``template_block`` uses RMSNorm. Two reasons:
+
+      * The parent block runs its ``post_ops`` AFTER the rms-norm
+        attention/ffn pair on the bare residual stream (see
+        :class:`TransformerBlock.forward`). The post-op already receives the
+        un-normalized stream and is expected to compute ``x + delta`` from
+        that input. Wrapping it in a rms-norm sub-block would re-normalize
+        the input and change semantics.
+      * With rms-norm enabled the block forward becomes
+        ``x = x + (attn_out - attn_in)``. For attn_out=0 (our skip-pass),
+        that reduces to ``x - rmsnorm(x)`` — NOT a pass-through. Disabling
+        rms-norm gives the clean ``x + attn(x) = x + 0 = x`` we need.
+
+    Without rms-norm the block forward is ``ffn(attn(x))`` and the post-op
+    (a residual ``x + delta`` FFN) reproduces the parent's post-op exactly.
+    """
+
+    from neural_vm.vm_step import TransformerBlock
+
+    attn = _make_skip_pass_attention(template_block.attn)
+    return TransformerBlock(
+        attn=attn,
+        ffn=post_op,
+        use_rms_norm=False,
+    )
+
+
+def _make_base_block_without_post_ops(template_block: Any) -> Any:
+    """Wrap ``template_block``'s attn + ffn in a fresh empty-post_ops block.
+
+    The returned block shares the underlying ``attn`` and ``ffn`` parameter
+    tensors with ``template_block`` (no clone), so forward output is
+    bit-identical to ``template_block`` with ``post_ops`` removed. This
+    matches what Qwen2 export consumes: one ``attn -> ffn`` pair per layer.
+    """
+
+    from neural_vm.vm_step import TransformerBlock
+
+    new_block = TransformerBlock(
+        attn=template_block.attn,
+        ffn=template_block.ffn,
+        use_rms_norm=bool(getattr(template_block, "use_rms_norm", False)),
+        rms_norm_eps=float(
+            getattr(getattr(template_block, "attn_norm", None), "eps", 1e-6)
+            if getattr(template_block, "use_rms_norm", False)
+            else 1e-6
+        ),
+    )
+    if getattr(template_block, "use_rms_norm", False):
+        # Reuse the same RMSNorm parameter tensors so weights are shared, not
+        # copied. The export plan's "copy" mapping then reads the same source.
+        new_block.attn_norm = template_block.attn_norm
+        new_block.ffn_norm = template_block.ffn_norm
+    return new_block
+
+
+def flatten_post_ops_for_qwen_export(model: Any) -> List[Any]:
+    """Return a flattened list of TransformerBlock instances for Qwen export.
+
+    For each block in ``model.blocks`` with N post_ops, the returned list
+    contains 1 + N entries:
+
+      * One base block exposing the original ``attn`` + ``ffn`` with no
+        post_ops. Parameters are shared with the source block (no clone), so
+        the existing Qwen2 mapping plan keys (``blocks.<i>.attn.W_q`` etc.)
+        continue to copy the same tensors.
+      * N skip-pass blocks. Each has a freshly allocated zero-init
+        :class:`AutoregressiveAttention` whose forward delta is the zero
+        tensor (residual gives ``x + 0 = x``), and the corresponding post-op
+        as its ``ffn``. Most post-ops are :class:`PureFFN` subclasses whose
+        ``forward`` is ``x + delta``; the skip-pass block's overall forward
+        is therefore ``post_op(x)`` after the attention pass-through.
+
+    The length of the returned list equals
+    :func:`expanded_qwen_layer_count`. The function does not mutate
+    ``model``: the original blocks (and their ``post_ops`` ModuleLists) are
+    left untouched.
+    """
+
+    flattened: List[Any] = []
+    for block in _blocks(model):
+        flattened.append(_make_base_block_without_post_ops(block))
+        post_ops = getattr(block, "post_ops", None) or []
+        for post_op in post_ops:
+            flattened.append(_make_skip_pass_block(block, post_op))
+    return flattened
+
+
+@dataclass(frozen=True)
+class PostOpsFlatteningReport:
+    """Diagnostic summary of the R5 flattening pass."""
+
+    original_block_count: int
+    post_op_counts: Tuple[int, ...]
+    expanded_block_count: int
+
+    @property
+    def total_post_ops(self) -> int:
+        return sum(self.post_op_counts)
+
+
+def summarize_post_ops_flattening(model: Any) -> PostOpsFlatteningReport:
+    """Return a frozen diagnostic record without instantiating new blocks."""
+
+    counts = count_post_ops(model)
+    return PostOpsFlatteningReport(
+        original_block_count=len(counts),
+        post_op_counts=tuple(counts),
+        expanded_block_count=sum(1 + n for n in counts),
+    )
