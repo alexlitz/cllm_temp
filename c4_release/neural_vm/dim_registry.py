@@ -1128,6 +1128,20 @@ def build_default_registry() -> DimRegistry:
               "Compact-layout STACK0_BYTE3 (mirrors legacy at 510)",
               semantics="mark == STACK0 OR (is_byte AND byte_index == 3)")
 
+    # ------------------------------------------------------------------
+    # Qwen R1 — opt-in NORM_COMPENSATOR slot
+    # ------------------------------------------------------------------
+    # When ``C4_QWEN_EXPORT_COMPAT=1`` is set, expose a width-1 residual
+    # slot that the embedding bake populates with a known constant
+    # ``K`` for every token id. Mirrors the dynamic registry's slot at
+    # the same position. See dim_registry_dynamic.py and
+    # docs/QWEN_STRUCTURAL_ADAPTER_PLAN_2026_06_07.md §R1.
+    import os as _os
+    if _os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1":
+        _pin("NORM_COMPENSATOR", 733, 1,
+                  "Qwen R1 RMSNorm compensator: every token carries K here",
+                  semantics="is_byte OR NOT is_byte")
+
     reg = a.to_registry()
     _register_default_categories(reg)
     return reg

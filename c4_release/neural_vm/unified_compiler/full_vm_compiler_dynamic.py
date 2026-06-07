@@ -1744,6 +1744,10 @@ def compile_full_vm_dynamic(
             "C4_DISABLE_WRAPPER_EXPANSION": (
                 os.environ.get("C4_DISABLE_WRAPPER_EXPANSION") == "1"
             ),
+            # Qwen R1 (see _bake_from_scheduled_ops cache key for context).
+            "C4_QWEN_EXPORT_COMPAT": (
+                os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
+            ),
             "__dynamic": True,
         }
         _memo_key = _inproc_cache_key(_inproc_snapshot)
@@ -2196,6 +2200,16 @@ def _bake_from_scheduled_ops(
         # ``make_expand_wrapper_blocks_op`` for the dispatch.
         "C4_DISABLE_WRAPPER_EXPANSION": (
             os.environ.get("C4_DISABLE_WRAPPER_EXPANSION") == "1"
+        ),
+        # Qwen R1 (docs/QWEN_STRUCTURAL_ADAPTER_PLAN_2026_06_07.md §R1).
+        # When ``C4_QWEN_EXPORT_COMPAT=1`` the dim registry exposes a
+        # NORM_COMPENSATOR slot and ``norm_compensator_seed`` (phase
+        # 1400) seeds it with K=1000.0 on every token + zeros the
+        # corresponding W_o / W_down rows. This changes d_model and
+        # weight contents, so cache keys MUST diverge between flag
+        # states.
+        "C4_QWEN_EXPORT_COMPAT": (
+            os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
         ),
         # Namespace the dynamic cache so it never collides with the static
         # entry (same kwargs, different scheduler).

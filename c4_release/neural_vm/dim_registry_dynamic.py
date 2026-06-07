@@ -23,8 +23,24 @@ overlaying ``FORMAT_PTR_LO`` at 471) is preserved via
 
 from __future__ import annotations
 
+import os
+
 from neural_vm.dim_allocator import Allocator
 from neural_vm.dim_registry import DimRegistry
+
+
+def _qwen_export_compat_enabled() -> bool:
+    """Return True iff the Qwen structural-adapter compat flag is set.
+
+    Qwen Phase R1: when ``C4_QWEN_EXPORT_COMPAT=1`` is set, the dim
+    registry exposes a single-width ``NORM_COMPENSATOR`` slot that the
+    embedding bake fills with a known constant ``K`` per token. This is
+    the foundation for RMSNorm-as-identity on the Qwen export path (see
+    ``docs/QWEN_STRUCTURAL_ADAPTER_PLAN_2026_06_07.md`` §"RMSNorm
+    compensation"). With the flag OFF the dim is absent and the
+    registry / d_model is byte-identical to pre-R1 main.
+    """
+    return os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
 
 
 def build_default_registry_dynamic() -> DimRegistry:
@@ -547,6 +563,22 @@ def build_default_registry_dynamic() -> DimRegistry:
     pin("STACK0_BYTE3_PIN", 732, 1,
         "Compact-layout STACK0_BYTE3 (mirrors legacy at 510)",
         "mark == STACK0 OR (is_byte AND byte_index == 3)")
+
+    # ------------------------------------------------------------------
+    # Qwen R1 — opt-in NORM_COMPENSATOR slot
+    # ------------------------------------------------------------------
+    # When ``C4_QWEN_EXPORT_COMPAT=1`` is set, expose a width-1 residual
+    # slot that the embedding bake populates with a known constant
+    # ``K`` for every token id. Downstream Qwen-export paths (Phase R2)
+    # exploit this to fold RMSNorm into an identity. Position 733 sits
+    # in the unused tail of the 736-wide d_model layout (the last
+    # _PIN family ends at 732), so the slot is byte-identical to a
+    # noop when the flag is off (the dim is simply absent).
+    # See docs/QWEN_STRUCTURAL_ADAPTER_PLAN_2026_06_07.md §R1.
+    if _qwen_export_compat_enabled():
+        pin("NORM_COMPENSATOR", 733, 1,
+            "Qwen R1 RMSNorm compensator: every token carries K here",
+            "is_byte OR NOT is_byte")
 
     reg = a.to_registry()
     # Phase 7.E.1 — apply the same semantic-category bindings as the

@@ -868,3 +868,19 @@ def declare_setdim_compat_dims(
         "SP_VIA_LEV_DETECTOR",
     ):
         compiler.declare_dim(name, 16, pinned=None)
+
+    # ------------------------------------------------------------------
+    # Qwen R1 — opt-in NORM_COMPENSATOR slot
+    # ------------------------------------------------------------------
+    # When ``C4_QWEN_EXPORT_COMPAT=1`` is set, declare a width-1 dim
+    # that the ``norm_compensator_seed`` model bake populates with the
+    # known constant ``K`` (1000.0) for every token id. Declared as
+    # unpinned so the bump-pointer allocator places it at the next
+    # available position above the wave-aligned IO/scratch high-water
+    # mark. With the flag OFF the dim is not declared, so d_model and
+    # the residual layout stay byte-identical to pre-R1 main.
+    # See ``make_norm_compensator_seed_op`` and
+    # docs/QWEN_STRUCTURAL_ADAPTER_PLAN_2026_06_07.md §R1.
+    import os as _os
+    if _os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1":
+        compiler.declare_dim("NORM_COMPENSATOR", 1, pinned=None)

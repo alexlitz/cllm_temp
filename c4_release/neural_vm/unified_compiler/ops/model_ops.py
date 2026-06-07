@@ -2288,6 +2288,114 @@ def make_initial_pc_bake_op() -> Operation:
     )
 
 
+# ============================================================================
+# Qwen R1: NORM_COMPENSATOR seed op
+# ============================================================================
+# When ``C4_QWEN_EXPORT_COMPAT=1`` is set, this op pins the constant
+# ``K = 1000.0`` into the NORM_COMPENSATOR residual slot for every token
+# (via ``embed.embed.weight[:, idx] = K``) and defensively zeroes the
+# corresponding row of every block's attention ``W_o`` and FFN ``W_down``
+# so downstream layers cannot clobber the constant.
+#
+# K is chosen large enough that ``K^2 >> sum(real_dims^2)`` for the entire
+# residual stream, so the RMSNorm denominator is effectively ``K /
+# sqrt(d_model)`` and the norm collapses to a per-dim scalar that the
+# Qwen export can absorb into ``gamma``. See
+# ``docs/QWEN_STRUCTURAL_ADAPTER_PLAN_2026_06_07.md`` §"RMSNorm
+# compensation" and §R1 acceptance.
+NORM_COMPENSATOR_K = 1000.0
+
+
+def make_norm_compensator_seed_op() -> Operation:
+    """Seed the NORM_COMPENSATOR residual slot with ``K`` for every token.
+
+    Phase=1400 — runs after every other model bake (head_bake=1000,
+    embedding_bake=1001, initial_pc_bake=1001.5, opcode_relay_head=1002,
+    branch_override_patch=1100, l6/l7_dead_unit_zero=1160/1170,
+    right_size_ffns=1200, expand_wrapper_blocks=1300) so its defensive
+    W_o / W_down zeros land on the FINAL weights and survive the entire
+    bake pipeline.
+
+    The bake is a no-op when ``C4_QWEN_EXPORT_COMPAT != "1"`` or when the
+    dim is not present in ``dim_positions`` (defence in depth — the dim
+    is only declared when the flag is on, so the early-exit and the
+    declaration are belt-and-braces).
+    """
+    def _bake(model, dim_positions, S):
+        del S
+        import os as _os
+        if _os.environ.get("C4_QWEN_EXPORT_COMPAT") != "1":
+            return
+        idx = dim_positions.get("NORM_COMPENSATOR")
+        if idx is None:
+            return
+        import torch
+        with torch.no_grad():
+            # 1. Embed: every token id carries K at the compensator slot.
+            embed_weight = model.embed.embed.weight
+            embed_weight[:, idx] = NORM_COMPENSATOR_K
+            # 2. Defensive zero of W_o[idx, :] and W_down[idx, :] on
+            #    every block so attention / FFN cannot write through the
+            #    compensator slot. W_o is (d_model, d_model) with output
+            #    dim first; W_down is (d_model, hidden_dim) with output
+            #    dim first. Both store sparse COO or dense after
+            #    ``sparsify()`` / ``compact()`` — handle the dense path
+            #    (the only one set_vm_weights leaves on the model at
+            #    phase 1400; ``sparsify``/``compact`` run later if at
+            #    all). ``ffn`` may have been wrapped in ``nn.Sequential``
+            #    by ``expand_wrapper_blocks`` (when
+            #    ``C4_DISABLE_WRAPPER_EXPANSION=1``); descend into the
+            #    Sequential and zero W_down on every PureFFN inside.
+            for block in model.blocks:
+                attn = getattr(block, "attn", None)
+                if attn is not None and hasattr(attn, "W_o"):
+                    w_o = attn.W_o.data
+                    if w_o.dim() == 2 and idx < w_o.shape[0]:
+                        w_o[idx, :] = 0.0
+                ffn = getattr(block, "ffn", None)
+                if ffn is None:
+                    continue
+                # Walk a Sequential (or list) and zero every W_down we
+                # see; a bare PureFFN exposes W_down directly.
+                _candidates = []
+                if hasattr(ffn, "W_down"):
+                    _candidates.append(ffn)
+                else:
+                    # Iterable composite (Sequential, ModuleList, ...).
+                    try:
+                        _candidates.extend(list(ffn))
+                    except TypeError:
+                        pass
+                for sub in _candidates:
+                    if not hasattr(sub, "W_down"):
+                        continue
+                    w_down = sub.W_down.data
+                    if w_down.dim() == 2 and idx < w_down.shape[0]:
+                        w_down[idx, :] = 0.0
+
+    return Operation(
+        name="norm_compensator_seed",
+        reads=set(),
+        writes=set(),
+        # Wave 6: Qwen R1 compat bake. Writes a constant column into
+        # the embedding table and zeros one row of W_o / W_down per
+        # block. No in-step residual production; flagged as
+        # ``audited_empty_produces`` so the producer/consumer audit
+        # doesn't expect a per-step write surface.
+        audited_empty_produces=True,
+        kind="model",
+        declarative_bake_fn=_bake,
+        # Phase 1400: AFTER expand_wrapper_blocks (1300), the final
+        # model-level structural pass. Any later op that mutates
+        # W_o / W_down rows would have to coexist with R2+ exports.
+        phase=1400,
+        migrated=True,
+        declarative_authority="structural_model",
+        smoke_tests={"all"},
+        spec_section="docs/QWEN_STRUCTURAL_ADAPTER_PLAN_2026_06_07.md#phase-r1",
+    )
+
+
 def make_contract_validation_op() -> Operation:
     """Run the contract validator. Previously inline in set_vm_weights.
 

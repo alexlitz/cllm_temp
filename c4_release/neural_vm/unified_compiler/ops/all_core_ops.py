@@ -530,6 +530,13 @@ def all_core_ops(
         make_conversational_io_output_routing_op(
             enable_conversational_io=enable_conversational_io,
         ),
+        # Qwen R1: NORM_COMPENSATOR seed. Registered unconditionally so
+        # the dep-graph topology is stable across the
+        # ``C4_QWEN_EXPORT_COMPAT`` flag; the bake_fn is a no-op when the
+        # flag is OFF (and an additional no-op when the dim was not
+        # declared). Phase=1400 — runs after every structural model
+        # bake (expand_wrapper_blocks=1300).
+        make_norm_compensator_seed_op(),
     ]
 
 
