@@ -286,12 +286,18 @@ def _ir_from_family(rules_by_name, prefix, count=16):
 def _e0_marker_firing_state(*, alu_lo_lane=None, alu_hi_lane=None, **overrides):
     """Residual state for the e0 STACK0 marker materializers.
 
-    Sets up the post-PSH SP=0xffe0 address signature and optionally
+    Sets up the LEV-step SP=0xffe0 address signature and optionally
     primes one ALU lane so the corresponding OUTPUT lane lights up
     after the rule fires.
+
+    Removal-2 take 2 (2026-06-07): the e0/e8/f8 marker families are now
+    LEV-gated (OP_LEV flipped from -10 blocker to +1 positive predicate
+    so they fire only on real LEV-step STACK0 marker positions; binop
+    cascades and fn-call IMM positions are no longer false-fires).
     """
 
     state = {
+        "OP_LEV": 10.0,  # L6-amplified OP_LEV value at the LEV-step STACK0 marker
         "MARK_STACK0": 1.0,
         "HAS_SE": 1.0,
         "ADDR_B0_LO+0": 1.0,
@@ -377,12 +383,17 @@ def test_b6d_e0_marker_suppresses_store_rows(l16_rules_by_name):
 
 
 def test_b6d_e0_marker_suppresses_function_boundaries(l16_rules_by_name):
-    """OP_JSR / OP_ENT / OP_LEV rows must stay inert for the e0 marker."""
+    """OP_JSR / OP_ENT rows must stay inert for the e0 marker.
+
+    Removal-2 take 2 (2026-06-07): OP_LEV is no longer a blocker but a
+    positive predicate (the rule's intended firing position IS the
+    LEV-step STACK0 marker). JSR/ENT exclusions remain.
+    """
 
     ir = _ir_from_named_rules(
         l16_rules_by_name, ("l16_stack0_e0_marker_from_alu_lo_9",),
     )
-    for blocker in ("OP_JSR", "OP_ENT", "OP_LEV"):
+    for blocker in ("OP_JSR", "OP_ENT"):
         state = _e0_marker_firing_state(alu_lo_lane=9, **{blocker: 5.0})
         out = ir.symbolic_ffn(state)
         assert out.get("OUTPUT_LO+9", 0.0) == 0.0, (
@@ -398,11 +409,14 @@ def test_b6d_e0_marker_suppresses_function_boundaries(l16_rules_by_name):
 def test_e8_marker_lo_lanes_route_to_output_lo(l16_rules_by_name):
     """Parallel sanity for the established e8 marker family.
 
-    Same ALU → OUTPUT mapping as the e0 family but at SP=0xffe8.
+    Same ALU → OUTPUT mapping as the e0 family but at SP=0xffe8. Now
+    LEV-gated (Removal-2 take 2): OP_LEV at L6-amplified value 10 lifts
+    the rule above its 15.5 threshold; IMM/PSH steps stay inert.
     """
 
     ir = _ir_from_family(l16_rules_by_name, "l16_stack0_e8_marker_from_alu_lo_")
     base = {
+        "OP_LEV": 10.0,
         "MARK_STACK0": 1.0,
         "HAS_SE": 1.0,
         "ADDR_B0_LO+8": 1.0,
@@ -422,6 +436,7 @@ def test_e8_marker_suppresses_e0_lookalike(l16_rules_by_name):
         l16_rules_by_name, ("l16_stack0_e8_marker_from_alu_lo_6",),
     )
     e0_lookalike = {
+        "OP_LEV": 10.0,
         "MARK_STACK0": 1.0,
         "HAS_SE": 1.0,
         "ADDR_B0_LO+0": 1.0,  # 0xffe0 byte 0 low nibble
@@ -432,11 +447,33 @@ def test_e8_marker_suppresses_e0_lookalike(l16_rules_by_name):
     assert out.get("OUTPUT_LO+6", 0.0) == 0.0
 
 
+def test_e8_marker_non_lev_step_inert(l16_rules_by_name):
+    """Removal-2 take 2: IMM-after-PSH at SP=0xffe8 (the old fn-call
+    use-case the rule's pre-fix comment described) must NOT fire now
+    that the family is LEV-gated. The L15 nibble_copy materializer
+    handles those IMM positions instead.
+    """
+
+    ir = _ir_from_named_rules(
+        l16_rules_by_name, ("l16_stack0_e8_marker_from_alu_lo_2",),
+    )
+    imm_at_e8 = {
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 1.0,
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+14": 1.0,
+        "ALU_LO+2": 1.0,
+    }
+    out = ir.symbolic_ffn(imm_at_e8)
+    assert out.get("OUTPUT_LO+2", 0.0) == 0.0
+
+
 def test_f8_marker_lo_lanes_route_to_output_lo(l16_rules_by_name):
     """Parallel sanity for the established f8 marker family (SP=0xfff8)."""
 
     ir = _ir_from_family(l16_rules_by_name, "l16_stack0_f8_marker_from_alu_lo_")
     base = {
+        "OP_LEV": 10.0,
         "MARK_STACK0": 1.0,
         "HAS_SE": 1.0,
         "ADDR_B0_LO+8": 1.0,
@@ -450,6 +487,7 @@ def test_f8_marker_lo_lanes_route_to_output_lo(l16_rules_by_name):
 def test_f8_marker_hi_lanes_route_to_output_hi(l16_rules_by_name):
     ir = _ir_from_family(l16_rules_by_name, "l16_stack0_f8_marker_from_alu_hi_")
     base = {
+        "OP_LEV": 10.0,
         "MARK_STACK0": 1.0,
         "HAS_SE": 1.0,
         "ADDR_B0_LO+8": 1.0,
@@ -458,6 +496,26 @@ def test_f8_marker_hi_lanes_route_to_output_hi(l16_rules_by_name):
     for lane in (0, 2, 14):
         out = ir.symbolic_ffn(dict(base, **{f"ALU_HI+{lane}": 1.0}))
         assert out[f"OUTPUT_HI_THIS_STEP+{lane}"] > 0.0
+
+
+def test_f8_marker_non_lev_step_inert(l16_rules_by_name):
+    """Removal-2 take 2: IMM-before-binop at SP=0xfff8 (the binop cascade
+    failure shape this fix targets) must NOT fire. This is the false-fire
+    the OP_LEV gate was added to suppress.
+    """
+
+    ir = _ir_from_named_rules(
+        l16_rules_by_name, ("l16_stack0_f8_marker_from_alu_lo_2",),
+    )
+    imm_at_f8 = {
+        "MARK_STACK0": 1.0,
+        "HAS_SE": 1.0,
+        "ADDR_B0_LO+8": 1.0,
+        "ADDR_B0_HI+15": 1.0,
+        "ALU_LO+2": 1.0,
+    }
+    out = ir.symbolic_ffn(imm_at_f8)
+    assert out.get("OUTPUT_LO+2", 0.0) == 0.0
 
 
 # --------------------------------------------------------------------------- #

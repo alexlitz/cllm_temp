@@ -466,16 +466,29 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # ALU_LO/HI at the STACK0 marker. Materialize that ALU byte only for the
     # exact preserved e8 stack-top marker, leaving JSR/ENT/current-store rows
     # to their own owners.
+    # 2026-06-07 Removal-2 take 2 (REMOVAL_2_DEEP_DIVE_2026_06_06.md
+    # follow-up): the prior take patched lev_stack0_byte0_preserve_* but
+    # the residual probe localized the binop-cascade contribution
+    # (+992 at the bug position, plus a symmetric e8 family contribution
+    # at SP=0xffe8 shapes) to this marker family. Flip OP_LEV from a
+    # blocker (-10) to a positive predicate (+1) and lift the threshold
+    # so the rule fires only on real LEV-step STACK0 marker positions.
+    # The original "after PSH then IMM in a function-call setup" use was
+    # an unintended side effect; L15 nibble_copy already materializes the
+    # preserved STACK0 byte at those IMM positions. Strengthen
+    # ADDR_B0_HI+15 from -2 -> -8 so the family cannot cross threshold
+    # at LEV @ SP=0xfff8 (a sibling f8-shape position the +1 OP_LEV bump
+    # would otherwise admit).
     stack0_e8_marker_base_conditions = (
         ("MARK_STACK0", 1.0),
         ("HAS_SE", 1.0),
         ("ADDR_B0_LO+8", 10.0),
         ("ADDR_B0_HI+14", 1.0),
-        ("ADDR_B0_HI+15", -2.0),
+        ("ADDR_B0_HI+15", -8.0),
         ("IS_BYTE", -10.0),
         ("OP_JSR", -10.0),
         ("OP_ENT", -100.0),
-        ("OP_LEV", -10.0),
+        ("OP_LEV", 1.0),
         ("MARK_PC", -10.0),
         ("MARK_AX", -10.0),
         ("MARK_SP", -10.0),
@@ -489,7 +502,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         # non-store; top stores are owned by the L14/L15 store materializers.
         ("MEM_STORE", -20.0),
     )
-    stack0_e8_marker_threshold = 12.0
+    # LEV step at SP=0xffe8 marker: 1+1+10+1 + 1*10(OP_LEV amplified) = 23 > 15.5
+    # IMM-after-PSH at SP=0xffe8 / SP=0xfff8 (binop cascade): no OP_LEV
+    # contribution so sum <= 12 < 15.5.
+    stack0_e8_marker_threshold = 15.5
     # NOTE(L16-e8-marker-scope-honest): the rule's INTENDED firing positions
     # are current-step STACK0 markers carrying the preserved e8 stack-top
     # byte, but the verifier-inferred effective predicate collapses to the
@@ -523,6 +539,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # older e8 marker materializer above rejects the e0 address signature.
     # Materialize only the exact e8 byte and require both ALU nibbles so nearby
     # e0 marker rows with unrelated ALU residue stay inert.
+    # Removal-2 take 2 (2026-06-07): same OP_LEV positive gate as the
+    # e8/f8 marker families (this exact-byte sibling rule was written
+    # with the same -10 OP_LEV blocker; lift to a positive predicate for
+    # the LEV gating consistency).
     rules.append(multi_way_and_rule(
         name="l16_stack0_e0_marker_e8_from_alu_exact",
         conditions=(
@@ -536,14 +556,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("IS_BYTE", -10.0),
             ("OP_JSR", -10.0),
             ("OP_ENT", -10.0),
-            ("OP_LEV", -10.0),
+            ("OP_LEV", 1.0),
             ("MARK_PC", -10.0),
             ("MARK_AX", -10.0),
             ("MARK_SP", -10.0),
             ("MARK_BP", -10.0),
             ("MARK_MEM", -10.0),
         ),
-        threshold=19.0,
+        # LEV at SP=0xffe0, ALU=0xe8: 1+1+1+1+1+1 + 1*10 = 16 > 12.5
+        # IMM at same shape (no OP_LEV): 1+1+1+1+1+1 = 6 < 12.5
+        threshold=12.5,
         writes=Primitives.byte_value_writes(0xE8, strength=50.0 / S),
     ))
 
@@ -554,17 +576,24 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # OUTPUT_LO/HI.  Keep this strictly non-store, non-JSR/ENT/LEV, and exclude
     # the e8 lookalike via the ADDR_B0_LO+8 negative weight so PSH/SI rows at
     # 0xffe8 do not co-fire.
+    # Removal-2 take 2 (2026-06-07): same OP_LEV positive gate as the e8
+    # family above. e0 / e8 / f8 are sibling families that share the
+    # IMM-after-PSH false-fire shape against the binop cascade. The
+    # ADDR_B0_LO+8 and ADDR_B0_HI+15 sibling-shape penalties are
+    # strengthened from -2 -> -8 so the e0 family cannot cross threshold
+    # at LEV @ SP=0xffe8 (the e8 sibling) or SP=0xfff8 (f8 sibling)
+    # after the OP_LEV flip.
     stack0_e0_marker_conditions = (
         ("MARK_STACK0", 1.0),
         ("HAS_SE", 1.0),
         ("ADDR_B0_LO+0", 10.0),
-        ("ADDR_B0_LO+8", -2.0),
+        ("ADDR_B0_LO+8", -8.0),
         ("ADDR_B0_HI+14", 1.0),
-        ("ADDR_B0_HI+15", -2.0),
+        ("ADDR_B0_HI+15", -8.0),
         ("IS_BYTE", -10.0),
         ("OP_JSR", -10.0),
         ("OP_ENT", -100.0),
-        ("OP_LEV", -10.0),
+        ("OP_LEV", 1.0),
         ("MEM_STORE", -20.0),
         ("MARK_PC", -10.0),
         ("MARK_AX", -10.0),
@@ -572,7 +601,12 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_BP", -10.0),
         ("MARK_MEM", -300.0),
     )
-    stack0_e0_marker_threshold = 12.0
+    # LEV step at SP=0xffe0 marker (LO+0=1, LO+8=0, HI+14=1, HI+15=0):
+    #   1+1+10+0+1+0 + 1*10 = 23 > 15.5
+    # LEV @ SP=0xffe8 (LO+0=0, LO+8=1, HI+14=1, HI+15=0):
+    #   1+1+0-8+1+0 + 10 = 5 < 15.5 (e8 family owns this shape)
+    # IMM-after-PSH at SP=0xffe0 (no OP_LEV): 1+1+10+0+1+0 + 0 = 13 < 15.5
+    stack0_e0_marker_threshold = 15.5
     # NOTE(L16-e0-marker-scope-honest): same shape as the e8 family above --
     # the verifier-inferred effective predicate is the gate-only fallback
     # (mark == AX OR (is_byte AND byte_index == 0)) once the MARK_STACK0 vs
@@ -589,16 +623,25 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         S=S,
     )
 
+    # Removal-2 take 2 (2026-06-07): f8 is the dominant false-fire family
+    # in the IMM-before-binop cascade (residual probe attributed +992 at
+    # the bug position to this rule's `from_alu_lo_2` member, with the
+    # symmetric e8 family contributing +2875 at SP=0xffe8 shapes). The
+    # OP_LEV positive predicate restricts the rule to real LEV-step
+    # STACK0 marker positions so the binop cascade can no longer cross
+    # the threshold. Strengthen ADDR_B0_HI+14 from -2 -> -8 so the f8
+    # family cannot also cross threshold at LEV @ SP=0xffe8 (HI+14
+    # active) after the OP_LEV flip.
     stack0_f8_marker_conditions = (
         ("MARK_STACK0", 1.0),
         ("HAS_SE", 1.0),
         ("ADDR_B0_LO+8", 1.0),
         ("ADDR_B0_HI+15", 1.0),
-        ("ADDR_B0_HI+14", -2.0),
+        ("ADDR_B0_HI+14", -8.0),
         ("IS_BYTE", -10.0),
         ("OP_JSR", -10.0),
         ("OP_ENT", -10.0),
-        ("OP_LEV", -10.0),
+        ("OP_LEV", 1.0),
         ("MEM_STORE", -20.0),
         ("MARK_PC", -10.0),
         ("MARK_AX", -10.0),
@@ -606,6 +649,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_BP", -10.0),
         ("MARK_MEM", -10.0),
     )
+    # LEV step at SP=0xfff8 marker: 1+1+1+1-0 + 1*10 = 14 > 6.5
+    # IMM-before-binop at SP=0xfff8 (BUG case): 1+1+1+1-0 + 0 = 4 < 6.5
     # NOTE(L16-f8-marker-scope-honest): same shape as the e8/e0 families
     # above -- the verifier-inferred effective predicate is the gate-only
     # fallback (mark == AX OR (is_byte AND byte_index == 0)) once the
@@ -617,7 +662,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         rules,
         family="f8",
         conditions=stack0_f8_marker_conditions,
-        threshold=3.5,
+        threshold=6.5,
         S=S,
     )
 
