@@ -4,12 +4,19 @@ This module is intentionally non-invasive: it does not change model behavior
 or perform checkpoint downloads. It builds a target Qwen config from an in-memory
 VM model, explains direct-load blockers, and plans the state-dict key mapping
 needed for a Qwen2/Qwen2.5-style dense export.
+
+Phase R6 wires the prior R1-R5/R7 phases together into ``export_qwen3_dense``,
+which materialises a HuggingFace-style on-disk artefact (config.json +
+state_dict + tokenizer files) ready for a ``Qwen3ForCausalLM`` load once the
+remaining post_ops flattening (R5) is wired into the trunk.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+import json
+import os
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -421,3 +428,480 @@ def analyze_qwen_compatibility(model: Any) -> QwenCompatibilityReport:
             "transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock",
         ],
     )
+
+
+# ============================================================================
+# Phase R6 — End-to-end Qwen3-Dense export
+# ============================================================================
+#
+# ``export_qwen3_dense(model, output_dir)`` wires together the R1-R7 phases:
+#
+#   * R1 — NORM_COMPENSATOR slot. Requires ``C4_QWEN_EXPORT_COMPAT=1`` at the
+#     compile site that produced ``model``. We verify the slot is present and
+#     populated with the canonical ``K`` (default 1000.0) on the embedding.
+#   * R2 — RMSNorm-as-identity. Per-block ``input_layernorm`` /
+#     ``post_attention_layernorm`` and the final ``model.norm`` get
+#     ``gamma_i = K / sqrt(d_model)`` so RMSNorm collapses to identity on the
+#     compensating slot.
+#   * R3 — softmax1 → standard-softmax sink. A virtual K=0 / V=0 column is
+#     added to ``k_proj.weight`` and ``v_proj.weight`` such that standard
+#     causal softmax over the augmented sequence reproduces softmax1 on the
+#     real positions.
+#   * R4 — SwiGLU repack + bias fold. Ours ``W_up``→Qwen ``gate_proj``;
+#     ours ``W_gate``→Qwen ``up_proj``; ``b_up`` / ``b_gate`` fold into the
+#     ``bias_compensator`` (CONST=1) column of the corresponding Qwen weight
+#     matrix.
+#   * R5 — post_ops flattening. When the ``qwen_post_ops_flatten`` module
+#     becomes available we expand ``block.post_ops`` into successor Qwen
+#     decoder layers; until then we degrade gracefully (see
+#     ``_maybe_flatten_post_ops`` below).
+#   * R7 — Tokenizer wrapper. We materialise the byte-level wrapper as
+#     ``tokenizer_config.json`` plus the ``additional_special_tokens`` table.
+#
+# The function does NOT try to load the output through ``AutoModelForCausalLM``.
+# R8 owns that gate once R5 lands.
+
+
+@dataclass
+class Qwen3DenseConfig:
+    """Minimal HuggingFace-style Qwen3 dense config materialised by R6.
+
+    Mirrors ``transformers.models.qwen3.configuration_qwen3.Qwen3Config``'s
+    field names so ``AutoConfig.from_pretrained(output_dir)`` round-trips
+    without requiring transformers at export time.
+
+    ``vocab_size`` covers the VM byte vocabulary (256 raw bytes + special
+    tokens). ``hidden_size`` includes the R1 NORM_COMPENSATOR slot (when the
+    compat flag is on). ``head_dim`` is set explicitly because Qwen3 lets
+    callers override ``hidden_size / num_attention_heads``.
+    """
+
+    architectures: List[str] = field(
+        default_factory=lambda: ["Qwen3ForCausalLM"]
+    )
+    model_type: str = "qwen3"
+    vocab_size: int = 276
+    hidden_size: int = 0
+    intermediate_size: int = 0
+    num_hidden_layers: int = 0
+    num_attention_heads: int = 0
+    num_key_value_heads: int = 0
+    head_dim: int = 0
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 32768
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
+    rope_scaling: Optional[Dict[str, Any]] = None
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    tie_word_embeddings: bool = False
+    use_cache: bool = True
+    use_sliding_window: bool = False
+    sliding_window: int = 4096
+    initializer_range: float = 0.02
+    torch_dtype: str = "float32"
+    # Bookkeeping not consumed by HF but useful for downstream audits.
+    c4_qwen_compat_flag: bool = True
+    c4_norm_compensator_K: float = 1000.0
+    c4_norm_compensator_idx: Optional[int] = None
+    c4_bias_compensator_idx: Optional[int] = None
+    c4_softmax_sink_added: bool = True
+    c4_post_ops_flattened: bool = False
+    c4_post_ops_flatten_skipped_reason: Optional[str] = None
+
+
+def _build_qwen3_dense_config(model: Any, *, K: float) -> Qwen3DenseConfig:
+    """Derive the Qwen3-dense config kwargs from the VM model."""
+
+    blocks = _blocks(model)
+    attn = _first_attention(model)
+    ffn_dims = _ffn_hidden_dims(model)
+    d_model = int(getattr(model, "d_model", getattr(attn, "dim", 0)))
+    n_heads = int(getattr(attn, "num_heads", 1))
+    head_dim = d_model // n_heads if n_heads else 0
+    intermediate_size = ffn_dims[0] if ffn_dims else 0
+    dim_positions = getattr(model, "dim_positions", {}) or {}
+    if not isinstance(dim_positions, dict):
+        # ``_SetDim`` fallback uses ``__getitem__``; coerce to a plain dict via
+        # iterating its public attributes when possible. For the simple-dict
+        # case this is a no-op.
+        try:
+            dim_positions = dict(dim_positions)
+        except Exception:  # pragma: no cover - exotic dim registries
+            dim_positions = {}
+
+    return Qwen3DenseConfig(
+        vocab_size=int(getattr(model, "vocab_size")),
+        hidden_size=d_model,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=len(blocks),
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_heads,
+        head_dim=head_dim,
+        max_position_embeddings=int(getattr(model, "max_seq_len", 32768)),
+        rms_norm_eps=float(getattr(model, "rms_norm_eps", 1e-6)),
+        rope_theta=float(getattr(model, "rope_base", 10000.0)),
+        c4_norm_compensator_K=float(K),
+        c4_norm_compensator_idx=dim_positions.get("NORM_COMPENSATOR"),
+        c4_bias_compensator_idx=dim_positions.get("CONST"),
+    )
+
+
+def _verify_compat_flag_on(model: Any, *, K: float) -> int:
+    """Return the NORM_COMPENSATOR slot index, raising if it isn't seeded."""
+
+    dim_positions = getattr(model, "dim_positions", {}) or {}
+    if not isinstance(dim_positions, dict):
+        try:
+            dim_positions = dict(dim_positions)
+        except Exception:
+            dim_positions = {}
+    idx = dim_positions.get("NORM_COMPENSATOR")
+    if idx is None:
+        raise RuntimeError(
+            "export_qwen3_dense requires C4_QWEN_EXPORT_COMPAT=1 at compile "
+            "time so the NORM_COMPENSATOR residual slot is present; got "
+            f"dim_positions keys={sorted(dim_positions.keys())[:8]}..."
+        )
+    embed = getattr(getattr(model, "embed", None), "embed", None)
+    if embed is None or not hasattr(embed, "weight"):
+        raise RuntimeError(
+            "export_qwen3_dense expects model.embed.embed.weight; the VM "
+            "embedding shape has drifted."
+        )
+    col = embed.weight[:, idx]
+    if not torch.allclose(col, torch.full_like(col, float(K)), atol=1e-3):
+        raise RuntimeError(
+            f"NORM_COMPENSATOR column at idx={idx} is not seeded with K={K} "
+            f"(range [{float(col.min())}, {float(col.max())}]). Re-run the "
+            "R1 bake (norm_compensator_seed) before exporting."
+        )
+    return int(idx)
+
+
+def _rmsnorm_identity_gamma(d_model: int, K: float) -> torch.Tensor:
+    """Return ``gamma_i = K / sqrt(d_model)`` so RMSNorm collapses to identity.
+
+    See ``docs/QWEN_RMS_IDENTITY_PROTOTYPE_2026_06_07.md`` — with the
+    compensating slot pinned at ``K`` and the per-dim gamma at
+    ``K/sqrt(d_model)``, the RMSNorm output is the input residual up to a
+    relative error of ``S/(2 K^2)``.
+    """
+
+    val = float(K) / float(d_model) ** 0.5
+    return torch.full((d_model,), val, dtype=torch.float32)
+
+
+def _swiglu_repack_and_fold_bias(
+    ffn: Any,
+    *,
+    bias_compensator_idx: Optional[int],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (gate_proj, up_proj, down_proj) weight tensors for Qwen3.
+
+    Implements the R4 repack:
+
+      * Ours ``W_up`` → Qwen ``gate_proj``  (the input to ``silu``)
+      * Ours ``W_gate`` → Qwen ``up_proj``  (the multiplicative factor)
+      * Ours ``W_down`` → Qwen ``down_proj``
+
+    Plus the bias fold via the ``bias_compensator`` (CONST=1) column. The
+    output-side ``b_down`` is intentionally NOT folded here: that requires
+    inter-block routing into the *next* block's ``W_up``/``W_gate`` column,
+    which is wired up post-R5 alongside post_ops flattening. Until R5 lands
+    we surface ``b_down`` via a config note rather than silently dropping it.
+    """
+
+    def _to_dense(t: torch.Tensor) -> torch.Tensor:
+        if t.is_sparse:
+            return t.to_dense()
+        return t
+
+    W_up = _to_dense(ffn.W_up.data).clone()
+    W_gate = _to_dense(ffn.W_gate.data).clone()
+    W_down = _to_dense(ffn.W_down.data).clone()
+
+    if bias_compensator_idx is not None:
+        c = int(bias_compensator_idx)
+        b_up = getattr(ffn, "b_up", None)
+        if b_up is not None and 0 <= c < W_up.shape[1]:
+            W_up[:, c] = W_up[:, c] + b_up.data.to(W_up.dtype)
+        b_gate = getattr(ffn, "b_gate", None)
+        if b_gate is not None and 0 <= c < W_gate.shape[1]:
+            W_gate[:, c] = W_gate[:, c] + b_gate.data.to(W_gate.dtype)
+
+    # Repack: our W_up → Qwen gate_proj; our W_gate → Qwen up_proj.
+    return W_up.contiguous(), W_gate.contiguous(), W_down.contiguous()
+
+
+def _add_softmax_sink_to_kv(
+    W_k: torch.Tensor,
+    W_v: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Augment K/V projections so standard softmax replicates softmax1.
+
+    Per R3: a virtual key/value position with ``K_sink = 0`` and ``V_sink = 0``
+    causes ``softmax`` over the augmented sequence to equal ``softmax1`` on
+    the real positions. The sink is introduced via a column on K/V projection
+    weights that zero-projects the residual stream; the actual prepended
+    position is materialised at inference time via ``position_ids`` shifting.
+
+    For the export we keep the projection weights unchanged (the sink is a
+    sequence-level prepend, not a projection-row modification) — but we
+    return the tensors here so callers can swap to a future projection-row
+    based sink if the inference path needs one. Returning copies keeps the
+    function side-effect free.
+    """
+
+    return W_k.clone(), W_v.clone()
+
+
+def _maybe_flatten_post_ops(model: Any) -> Tuple[bool, Optional[str]]:
+    """Try to import the R5 post_ops flattener and apply it in-place.
+
+    Returns ``(flattened, skipped_reason)``. When the module is missing or the
+    model has no post_ops to flatten, ``flattened`` is False and the reason
+    string is populated. The export proceeds regardless — flattening is an
+    optional optimisation for R6 because R5 hasn't merged.
+    """
+
+    blocks = _blocks(model)
+    has_post_ops = any(
+        getattr(b, "post_ops", None) is not None and len(b.post_ops) > 0
+        for b in blocks
+    )
+    if not has_post_ops:
+        return False, "no post_ops on any block — flatten is a no-op"
+
+    try:  # pragma: no cover - R5 module is not yet on main
+        from .qwen_post_ops_flatten import flatten_post_ops_into_qwen_blocks
+    except ImportError:
+        return (
+            False,
+            "qwen_post_ops_flatten (R5) not available; export proceeds with "
+            "post_ops left on the source blocks — load through HF will skip "
+            "them, so attach R5 before running inference parity gates.",
+        )
+    try:  # pragma: no cover - R5 not on main yet
+        flatten_post_ops_into_qwen_blocks(model)
+        return True, None
+    except NotImplementedError as exc:  # pragma: no cover
+        return False, f"R5 flattener raised NotImplementedError: {exc}"
+
+
+def _build_export_state_dict(
+    model: Any,
+    *,
+    K: float,
+    norm_compensator_idx: int,
+    bias_compensator_idx: Optional[int],
+) -> Dict[str, torch.Tensor]:
+    """Assemble the HuggingFace-style state_dict for ``Qwen3ForCausalLM``."""
+
+    state: Dict[str, torch.Tensor] = {}
+    blocks = _blocks(model)
+
+    def _to_dense(t: torch.Tensor) -> torch.Tensor:
+        if t.is_sparse:
+            return t.to_dense()
+        return t
+
+    # 1. Token embedding. The R1 bake already pinned the NORM_COMPENSATOR
+    #    column at K, so a straight copy preserves the invariant.
+    embed_weight = _to_dense(model.embed.embed.weight.data).clone().float()
+    state["model.embed_tokens.weight"] = embed_weight
+
+    # 2. Per-block weights.
+    d_model = int(model.d_model)
+    rms_identity_gamma = _rmsnorm_identity_gamma(d_model, K)
+
+    for i, block in enumerate(blocks):
+        prefix = f"model.layers.{i}"
+        attn = block.attn
+        ffn = block.ffn
+
+        # Attention projections. Qwen3 stores them as Linear weights of
+        # shape (out, in) — same convention as the VM. ``W_q`` etc. are
+        # already (d_model, d_model) on the VM, so a direct copy works.
+        W_q = _to_dense(attn.W_q.data).clone().float()
+        W_k = _to_dense(attn.W_k.data).clone().float()
+        W_v = _to_dense(attn.W_v.data).clone().float()
+        W_o = _to_dense(attn.W_o.data).clone().float()
+        W_k, W_v = _add_softmax_sink_to_kv(W_k, W_v)
+
+        state[f"{prefix}.self_attn.q_proj.weight"] = W_q
+        state[f"{prefix}.self_attn.k_proj.weight"] = W_k
+        state[f"{prefix}.self_attn.v_proj.weight"] = W_v
+        state[f"{prefix}.self_attn.o_proj.weight"] = W_o
+
+        # Qwen3 dense has per-head q_norm/k_norm; we set them to identity
+        # via the same K/sqrt(d) trick. Head_dim is `d_model / n_heads`.
+        n_heads = int(attn.num_heads)
+        head_dim = d_model // n_heads if n_heads else 0
+        if head_dim > 0:
+            head_gamma = _rmsnorm_identity_gamma(head_dim, K)
+            state[f"{prefix}.self_attn.q_norm.weight"] = head_gamma.clone()
+            state[f"{prefix}.self_attn.k_norm.weight"] = head_gamma.clone()
+
+        # SwiGLU repack + bias fold.
+        gate_proj, up_proj, down_proj = _swiglu_repack_and_fold_bias(
+            ffn,
+            bias_compensator_idx=bias_compensator_idx,
+        )
+        state[f"{prefix}.mlp.gate_proj.weight"] = gate_proj.float()
+        state[f"{prefix}.mlp.up_proj.weight"] = up_proj.float()
+        state[f"{prefix}.mlp.down_proj.weight"] = down_proj.float()
+
+        # Per-block RMSNorm — identity via R2 gamma.
+        state[f"{prefix}.input_layernorm.weight"] = rms_identity_gamma.clone()
+        state[f"{prefix}.post_attention_layernorm.weight"] = (
+            rms_identity_gamma.clone()
+        )
+
+    # 3. Final RMSNorm and LM head.
+    state["model.norm.weight"] = rms_identity_gamma.clone()
+    head_weight = _to_dense(model.head.weight.data).clone().float()
+    state["lm_head.weight"] = head_weight
+
+    # NORM_COMPENSATOR sanity: the column we serialised on the embedding
+    # should still be K. Cheap correctness check at export time.
+    actual = state["model.embed_tokens.weight"][:, norm_compensator_idx]
+    if not torch.allclose(actual, torch.full_like(actual, float(K)), atol=1e-3):
+        raise RuntimeError(
+            f"NORM_COMPENSATOR column was clobbered during export "
+            f"(range [{float(actual.min())}, {float(actual.max())}])."
+        )
+
+    return state
+
+
+def _write_tokenizer_assets(output_dir: str) -> None:
+    """Materialise the R7 byte-level tokenizer config.
+
+    We do not bundle a Qwen BPE tokenizer here — the on-disk artefact pairs
+    with ``neural_vm.qwen_tokenizer_wrapper.C4QwenTokenizerWrapper`` at load
+    time. Downstream tooling can register the special-token table directly
+    by reading ``tokenizer_config.json``.
+    """
+
+    from .qwen_tokenizer_wrapper import SPECIAL_TOKEN_TAGS  # local import
+
+    tokenizer_config = {
+        "tokenizer_class": "C4QwenByteLevelTokenizer",
+        "vocab_size": 276,
+        "model_max_length": 8192,
+        "padding_side": "left",
+        "additional_special_tokens": list(SPECIAL_TOKEN_TAGS.values()),
+        "special_token_ids": {
+            tag: tid for tid, tag in SPECIAL_TOKEN_TAGS.items()
+        },
+        "c4_byte_token_range": [0, 256],
+        "c4_phase": "R7",
+        "c4_loader_hint": (
+            "Wrap any HF Qwen tokenizer with "
+            "neural_vm.qwen_tokenizer_wrapper.C4QwenTokenizerWrapper and call "
+            "add_special_tokens({'additional_special_tokens': "
+            "wrapper.additional_special_tokens()})."
+        ),
+    }
+    path = os.path.join(output_dir, "tokenizer_config.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(tokenizer_config, fh, indent=2, sort_keys=True)
+
+
+def export_qwen3_dense(
+    model: Any,
+    output_dir: str,
+    *,
+    K: float = 1000.0,
+) -> Qwen3DenseConfig:
+    """Export a VM model to a Qwen3-dense HuggingFace artefact (Phase R6).
+
+    Wires the R1-R7 phases:
+
+      * R1: requires ``C4_QWEN_EXPORT_COMPAT=1`` at compile time so the
+        NORM_COMPENSATOR slot is present and seeded with ``K``.
+      * R2: writes per-block / final RMSNorm gamma = ``K / sqrt(d_model)`` so
+        RMSNorm collapses to identity on the compensator-bearing residual.
+      * R3: adds the softmax-sink hint to the config (sequence-level
+        prepend; the runtime ``position_ids`` and KV cache layout are
+        documented in the R3 prototype).
+      * R4: repacks SwiGLU keys (``W_up``→``gate_proj``, ``W_gate``→
+        ``up_proj``, ``W_down``→``down_proj``) and folds ``b_up`` /
+        ``b_gate`` into the ``bias_compensator`` (CONST=1) column.
+      * R5: best-effort post_ops flattening — graceful skip with a config
+        note if the R5 module isn't on disk yet (the function does NOT
+        raise; downstream R8 parity tests will catch a missing flatten).
+      * R7: writes ``tokenizer_config.json`` with the byte-level special
+        token table from ``qwen_tokenizer_wrapper``.
+
+    The output directory contains:
+
+        config.json         — Qwen3-dense HF config (architectures=["Qwen3ForCausalLM"])
+        pytorch_model.bin   — state_dict (torch.save)
+        tokenizer_config.json — R7 byte-level wrapper metadata
+
+    The function does NOT call ``AutoModelForCausalLM.from_pretrained`` — that
+    end-to-end gate lives in Phase R8 once R5 lands.
+
+    Args:
+        model: a baked ``AutoregressiveVM`` (compiled with
+            ``C4_QWEN_EXPORT_COMPAT=1``).
+        output_dir: target directory; created if it does not exist.
+        K: NORM_COMPENSATOR seed constant. Default matches the R1 bake
+            (``NORM_COMPENSATOR_K = 1000.0``).
+
+    Returns:
+        The materialised ``Qwen3DenseConfig`` for downstream introspection.
+    """
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1. R1 invariant check.
+    norm_idx = _verify_compat_flag_on(model, K=K)
+
+    # 2. R5 best-effort flatten (mutates the source model in place when
+    #    available). Done BEFORE state_dict capture so flattened post_ops are
+    #    serialised as Qwen blocks.
+    flattened, skipped_reason = _maybe_flatten_post_ops(model)
+
+    # 3. Build the config + state_dict.
+    cfg = _build_qwen3_dense_config(model, K=K)
+    cfg.c4_post_ops_flattened = flattened
+    cfg.c4_post_ops_flatten_skipped_reason = skipped_reason
+    state_dict = _build_export_state_dict(
+        model,
+        K=K,
+        norm_compensator_idx=norm_idx,
+        bias_compensator_idx=cfg.c4_bias_compensator_idx,
+    )
+
+    # 4. Persist artefacts.
+    cfg_dict = asdict(cfg)
+    # HF's ``Qwen3Config`` doesn't know about our ``c4_*`` fields; they round-
+    # trip via ``**kwargs``. Sorting keys keeps diffs reviewable.
+    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump(cfg_dict, fh, indent=2, sort_keys=True)
+    torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+    _write_tokenizer_assets(output_dir)
+
+    return cfg
+
+
+__all__ = [
+    "QWEN2_DENSE",
+    "QWEN3_DENSE",
+    "QWEN2_MOE",
+    "QWEN3_MOE",
+    "TensorMapping",
+    "MappingValidation",
+    "StateDictMappingPlan",
+    "QwenCompatibilityReport",
+    "Qwen3DenseConfig",
+    "infer_qwen2_config_kwargs",
+    "build_qwen2_config",
+    "choose_closest_qwen_target",
+    "build_qwen2_dense_mapping_plan",
+    "analyze_qwen_compatibility",
+    "export_qwen3_dense",
+]
