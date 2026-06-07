@@ -30,8 +30,11 @@ What it does NOT do:
 
 from __future__ import annotations
 
+import os
+import warnings
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .ir import (
     CompilerIR,
@@ -41,6 +44,27 @@ from .ir import (
     TokenEmbeddingRule,
     _state_value,
 )
+
+
+# ---------------------------------------------------------------------------
+# Attention-gate audit constants
+# ---------------------------------------------------------------------------
+
+# Q-side dim-name prefixes that mark a write as a *condition gate* — these
+# are the dims the doc enumerates as "tries to filter K positions". When
+# the K-side at the same slot has no real discriminator (only CONST or
+# nothing), the softmax-cancelling argument means the gate doesn't gate.
+GATE_CONDITION_PREFIXES: Tuple[str, ...] = ("MARK_", "OP_", "HAS_", "IS_")
+
+# Dim names that count as "uniform" on the K-side — they contribute the
+# same value at every K row, so they cannot discriminate.
+UNIFORM_K_DIM_NAMES: frozenset = frozenset({"CONST"})
+
+# Env flag: when set, the compile-time gate audit raises instead of warning.
+GATE_AUDIT_STRICT_ENV = "C4_STRICT_GATE_CHECK"
+
+# Env flag: when set, the compile-time gate audit is skipped entirely.
+GATE_AUDIT_SKIP_ENV = "C4_SKIP_GATE_CHECK"
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +365,339 @@ class DSLInterpreter:
         self.state = dict(initial_state) if initial_state else {}
 
 
+# ---------------------------------------------------------------------------
+# Attention-gate audit
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GateAuditEntry:
+    """One Q-side gate-effectivity classification.
+
+    * ``slot`` — the head-local slot the Q-side write lands in.
+    * ``q_dim_name`` — the (gate-condition) residual dim the Q-side
+      writes (e.g. ``"MARK_PC"``, ``"OP_LEV"``).
+    * ``kind`` — one of:
+        - ``"safe"``: K-side at the slot writes at least one non-CONST
+          dim (a real discriminator).
+        - ``"no_op"``: K-side at the slot writes only CONST(s) — the
+          per-Q-row offset is uniform across K → softmax cancels →
+          the "gate" does not filter K positions.
+        - ``"q_only"``: K-side has no write at the slot at all. The
+          Q-side write is literal dead weight (the doc calls this the
+          "no K-side write at slot" case).
+    * ``k_dim_names`` — the sorted tuple of K-side dim names at the
+      same slot. Empty for ``q_only``; ``("CONST",)`` for the
+      canonical no_op case.
+    * ``head_idx``/``op_name`` — propagated by callers; left ``None``
+      for the bare :func:`audit_attention_gates` entry point.
+    """
+
+    slot: int
+    q_dim_name: str
+    kind: str  # "safe" / "no_op" / "q_only"
+    k_dim_names: Tuple[str, ...] = ()
+    head_idx: Optional[int] = None
+    op_name: Optional[str] = None
+
+
+def build_dim_name_map(
+    dim_positions: Optional[Mapping[str, int]] = None,
+) -> Dict[int, Tuple[str, ...]]:
+    """Build an int→sorted dim-name(s) reverse map.
+
+    Multiple dim names can alias to the same position (e.g. ``H5+0`` and
+    ``SP_BYTE0_IS_F8``). The reverse map records *all* names at a
+    position so the audit can match on any of them.
+
+    When ``dim_positions`` is omitted, falls back to the class-attribute
+    table on ``vm_step._SetDim`` (the legacy / non-compiler-allocated
+    layout). This is what the synthetic-spec tests use and lets the
+    audit run without a live compiler.
+
+    Names are filtered to uppercase identifiers binding to ints, which
+    matches the convention used throughout ``_SetDim`` and the compiler's
+    dim registry.
+    """
+
+    reverse: Dict[int, Set[str]] = defaultdict(set)
+    if dim_positions is None:
+        from ..vm_step import _SetDim
+
+        for name, value in vars(_SetDim).items():
+            if not name.isupper() or not isinstance(value, int):
+                continue
+            reverse[int(value)].add(name)
+    else:
+        for name, value in dim_positions.items():
+            if not isinstance(value, int):
+                continue
+            if not name.isupper():
+                continue
+            reverse[int(value)].add(name)
+    return {pos: tuple(sorted(names)) for pos, names in reverse.items()}
+
+
+def _dim_names_at(
+    position: int,
+    dim_name_map: Mapping[int, Tuple[str, ...]],
+) -> Tuple[str, ...]:
+    return dim_name_map.get(int(position), ())
+
+
+def _is_condition_dim_name(name: str) -> bool:
+    return any(name.startswith(p) for p in GATE_CONDITION_PREFIXES)
+
+
+def _classify_dim_names_as_condition(names: Sequence[str]) -> Optional[str]:
+    """Return the first gate-condition-prefixed name in ``names``, or None."""
+    for n in names:
+        if _is_condition_dim_name(n):
+            return n
+    return None
+
+
+def _classify_dim_names_as_uniform(names: Sequence[str]) -> bool:
+    """K-side names count as uniform only if EVERY name at the position is
+    in :data:`UNIFORM_K_DIM_NAMES` (i.e. ``CONST``). If any alias name at
+    the position is non-CONST, the slot has a real discriminator there.
+    """
+    if not names:
+        return False
+    return all(n in UNIFORM_K_DIM_NAMES for n in names)
+
+
+def audit_attention_gates(
+    spec,
+    dim_name_map: Optional[Mapping[int, Tuple[str, ...]]] = None,
+    *,
+    op_name: Optional[str] = None,
+) -> List[GateAuditEntry]:
+    """Classify every Q-side condition gate in one ``DeclarativeAttentionHeadSpec``.
+
+    Walks ``spec.q``; for each write whose dim resolves to a gate-condition
+    name (``MARK_*`` / ``OP_*`` / ``HAS_*`` / ``IS_*``) it groups the
+    K-side writes by slot and classifies the gate as:
+
+    * ``"safe"`` when K-side writes at least one non-CONST dim at the
+      same slot (real discriminator → gate actually filters K positions);
+    * ``"no_op"`` when K-side writes only CONST(s) at the slot
+      (per-Q-row offset is uniform across K → softmax cancels);
+    * ``"q_only"`` when K-side has no write at the slot at all (the
+      Q-side write is literal dead weight).
+
+    Returns the entries in spec-Q order. ``dim_name_map`` defaults to the
+    ``_SetDim`` table; passing a compiler-allocated map handles
+    ``pin_io_only=True`` layouts where ``CONST`` may live at a non-default
+    position.
+    """
+
+    if dim_name_map is None:
+        dim_name_map = build_dim_name_map(None)
+
+    head_idx = getattr(spec, "head_idx", None)
+    head_idx = int(head_idx) if head_idx is not None else None
+
+    # Group K-side writes by slot.
+    k_by_slot: Dict[int, List[str]] = defaultdict(list)
+    for kw in getattr(spec, "k", ()):
+        names = _dim_names_at(kw.dim, dim_name_map)
+        if not names:
+            # Unknown dim — record by numeric value so we don't drop it.
+            k_by_slot[int(kw.slot)].append(f"<unknown:{int(kw.dim)}>")
+        else:
+            k_by_slot[int(kw.slot)].extend(names)
+
+    out: List[GateAuditEntry] = []
+    for qw in getattr(spec, "q", ()):
+        q_names = _dim_names_at(qw.dim, dim_name_map)
+        cond_name = _classify_dim_names_as_condition(q_names)
+        if cond_name is None:
+            continue
+        slot = int(qw.slot)
+        k_names_at_slot = tuple(sorted(set(k_by_slot.get(slot, []))))
+        if not k_names_at_slot:
+            kind = "q_only"
+        elif _classify_dim_names_as_uniform(k_names_at_slot):
+            kind = "no_op"
+        else:
+            kind = "safe"
+        out.append(
+            GateAuditEntry(
+                slot=slot,
+                q_dim_name=cond_name,
+                kind=kind,
+                k_dim_names=k_names_at_slot,
+                head_idx=head_idx,
+                op_name=op_name,
+            )
+        )
+    return out
+
+
+def _extract_attention_specs_from_op(
+    op,
+    dim_positions: Optional[Mapping[str, int]] = None,
+) -> List[Any]:
+    """Pull ``DeclarativeAttentionHeadSpec``s from an op.
+
+    Tries ``op.compiler_ir`` first, falls back to
+    ``op.compiler_ir_factory(dim_positions, HD)``. Returns ``[]`` for ops
+    with no IR (e.g. legacy imperative bakes — those are covered by
+    ``tools/q_side_gate_audit.py``).
+    """
+
+    ir = getattr(op, "compiler_ir", None)
+    if ir is None:
+        factory = getattr(op, "compiler_ir_factory", None)
+        if factory is None or dim_positions is None:
+            return []
+        try:
+            ir = factory(dim_positions, 8)
+        except Exception:
+            return []
+    if ir is None:
+        return []
+    specs: List[Any] = []
+    layers = getattr(ir, "layers", None) or ()
+    for layer in layers:
+        attention = getattr(layer, "attention", None)
+        if attention is None:
+            continue
+        for head in getattr(attention, "rules", ()) or ():
+            spec = getattr(head, "spec", None)
+            if spec is not None:
+                specs.append(spec)
+    return specs
+
+
+def audit_compiler_attention_gates(
+    compiler,
+    dim_positions: Optional[Mapping[str, int]] = None,
+) -> List[GateAuditEntry]:
+    """Run the gate audit across every declarative attention spec in a compiler.
+
+    Iterates ``compiler.ops``, ``compiler.block_ops`` and
+    ``compiler.model_ops`` (any may carry a ``compiler_ir`` or
+    ``compiler_ir_factory``). For each spec, classifies its Q-side
+    condition gates and tags entries with the originating ``op_name`` for
+    cross-reference with the audit doc.
+
+    ``dim_positions`` is the compiler-allocated position map. When
+    available the audit uses it to resolve aliased dims (e.g. when
+    ``pin_io_only=True`` moves CONST off its legacy slot); when omitted it
+    falls back to the ``_SetDim`` table.
+    """
+
+    dim_name_map = build_dim_name_map(dim_positions)
+    entries: List[GateAuditEntry] = []
+    for op_list_name in ("ops", "block_ops", "model_ops"):
+        ops = getattr(compiler, op_list_name, None) or ()
+        for op in ops:
+            op_name = getattr(op, "name", "<anon>")
+            specs = _extract_attention_specs_from_op(op, dim_positions)
+            for spec in specs:
+                entries.extend(
+                    audit_attention_gates(
+                        spec, dim_name_map, op_name=op_name,
+                    )
+                )
+    return entries
+
+
+def format_gate_audit_report(entries: Sequence[GateAuditEntry]) -> str:
+    """Human-readable summary of the no-op / q-only entries."""
+
+    by_kind: Dict[str, List[GateAuditEntry]] = defaultdict(list)
+    for e in entries:
+        by_kind[e.kind].append(e)
+    total = len(entries)
+    safe = len(by_kind.get("safe", []))
+    no_op = len(by_kind.get("no_op", []))
+    q_only = len(by_kind.get("q_only", []))
+    lines = [
+        f"ATTENTION GATE AUDIT: {total} Q-side condition gate(s) — "
+        f"{safe} safe, {no_op} no-op (K=CONST), {q_only} q-only "
+        f"(no K at slot)."
+    ]
+    flagged = list(by_kind.get("no_op", [])) + list(by_kind.get("q_only", []))
+    by_op: Dict[str, List[GateAuditEntry]] = defaultdict(list)
+    for e in flagged:
+        by_op[e.op_name or "<anon>"].append(e)
+    for op_name in sorted(by_op):
+        op_entries = by_op[op_name]
+        lines.append(f"  - {op_name}: {len(op_entries)} flagged")
+        for e in op_entries[:8]:
+            k_desc = (
+                "(no K at slot)" if e.kind == "q_only"
+                else f"K=[{', '.join(e.k_dim_names) or '-'}]"
+            )
+            head_desc = (
+                f" head={e.head_idx}" if e.head_idx is not None else ""
+            )
+            lines.append(
+                f"      slot={e.slot} Q={e.q_dim_name}{head_desc} "
+                f"{k_desc} [{e.kind}]"
+            )
+        if len(op_entries) > 8:
+            lines.append(f"      ... (+{len(op_entries) - 8} more)")
+    return "\n".join(lines)
+
+
+def run_attention_gate_audit(
+    compiler,
+    dim_positions: Optional[Mapping[str, int]] = None,
+) -> List[GateAuditEntry]:
+    """Compile-time entry point: audit every attention spec and warn.
+
+    * Honours ``C4_SKIP_GATE_CHECK=1`` (returns empty list, no warning).
+    * Default: emits a single :func:`warnings.warn` summarising the
+      no-op / q-only entries when the count is non-zero.
+    * When ``C4_STRICT_GATE_CHECK=1``: raises ``GateAuditError`` instead
+      of warning, listing every flagged entry.
+
+    Returns the *raw* audit-entry list (safe entries included) so callers
+    can post-process or compare against a known baseline.
+    """
+
+    if os.environ.get(GATE_AUDIT_SKIP_ENV, "") == "1":
+        return []
+    entries = audit_compiler_attention_gates(compiler, dim_positions)
+    flagged = [e for e in entries if e.kind != "safe"]
+    if not flagged:
+        return entries
+    report = format_gate_audit_report(entries)
+    if os.environ.get(GATE_AUDIT_STRICT_ENV, "") == "1":
+        raise GateAuditError(report, flagged)
+    warnings.warn(report, stacklevel=3)
+    return entries
+
+
+class GateAuditError(RuntimeError):
+    """Raised by :func:`run_attention_gate_audit` under strict-check mode.
+
+    Carries the flagged entries on ``self.flagged`` for programmatic
+    inspection by callers / tests.
+    """
+
+    def __init__(self, message: str, flagged: Sequence[GateAuditEntry]):
+        super().__init__(message)
+        self.flagged: List[GateAuditEntry] = list(flagged)
+
+
 __all__ = [
     "DSLInterpreter",
     "InterpreterStep",
     "InterpreterResult",
+    "GateAuditEntry",
+    "GateAuditError",
+    "audit_attention_gates",
+    "audit_compiler_attention_gates",
+    "build_dim_name_map",
+    "format_gate_audit_report",
+    "run_attention_gate_audit",
+    "GATE_AUDIT_SKIP_ENV",
+    "GATE_AUDIT_STRICT_ENV",
+    "GATE_CONDITION_PREFIXES",
+    "UNIFORM_K_DIM_NAMES",
 ]

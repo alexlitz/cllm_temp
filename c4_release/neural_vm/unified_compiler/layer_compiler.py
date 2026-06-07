@@ -1480,6 +1480,21 @@ class LayerCompiler:
         else:
             dim_positions = self._allocate_dims()
 
+        # Attention-gate effectivity audit. Walks every op's
+        # declarative attention spec and classifies each Q-side
+        # condition gate (``MARK_*`` / ``OP_*`` / ``HAS_*`` / ``IS_*``)
+        # against its K-side. Emits a single warning summarising the
+        # no-op (K=CONST-only) and q-only (no K at slot) cases — the
+        # 70 instances catalogued in
+        # ``c4_release/docs/Q_SIDE_GATE_AUDIT_2026_06_07.md``.
+        #
+        # Opt out via ``C4_SKIP_GATE_CHECK=1``; promote to a hard error
+        # via ``C4_STRICT_GATE_CHECK=1``.
+        from .dsl_interpreter import run_attention_gate_audit
+        self._last_attention_gate_audit = run_attention_gate_audit(
+            self, dim_positions,
+        )
+
         n_layers = (max(layer_assignment.values()) + 1) if layer_assignment else 0
         # d_model = highest position + size; supports both pinned and bump-pointer.
         d_model = 0
