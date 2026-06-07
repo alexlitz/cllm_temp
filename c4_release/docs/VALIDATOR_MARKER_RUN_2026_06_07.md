@@ -106,3 +106,42 @@ probes hit `torch.OutOfMemoryError`; both passed on a clean GPU. Treat
 - No `git stash`.
 - Doc-only commit; no test or source edits.
 - Measurement only; no fix attempts.
+
+## Update — 2026-06-07 follow-up fix
+
+- **Test #1 (`TestSpecCoverage::test_spec_file_parses_headings`) FIXED**.
+  Root cause: ``audit_spec_coverage`` was using the relative path
+  ``c4_release/docs/BLOG_SPEC.md``, which only resolves when pytest is
+  invoked from the repo root. When invoked from inside the
+  ``c4_release/`` directory, the path becomes
+  ``c4_release/c4_release/docs/BLOG_SPEC.md`` (doesn't exist) and the
+  ``open()`` silently falls through ``except OSError`` to leave
+  ``spec_lines = []``, producing an empty ``all_sections`` even though
+  ``coverage`` is non-empty (the op-side scan succeeds regardless).
+  Fix: added candidate-path resolution that also tries stripping the
+  leading ``c4_release/`` prefix and a fallback derived from the
+  module's own location. See ``decl_verifier.py`` ``audit_spec_coverage``.
+- **Tests #4 (`local_frame_jsr_mem_addr0_e0`) and #5
+  (`positive_saved_frame_stack0_byte0_e8`) REMAIN OPEN** as
+  multi-session bake bugs. Diagnostic from this session:
+  - Both fail at the L34 ``tail_bit32_result_correction`` post-op.
+    Block 33 (layer 24) has the correct argmax for both probes;
+    block 34 (the L34 tail) overrides into wrong bytes.
+  - For #5 (e8), the byte assembly is correct (``output_byte=0xE8``,
+    ``OUT_LO[8]=-292747 ; OUT_HI[14]=-288927`` argmax LO=8, HI=14)
+    but the absolute logit (~−581k) loses to ``REG_PC``'s
+    head_bake default bias of ``-10``. A clear-output style rule is
+    firing on the STACK0_byte0 row driving all 32 OUT_LO/HI lanes
+    by ~−707M; a paired byte-emitter rule lifts the correct lane
+    back to ~−297k but the byte logit still loses to the
+    marker-token default.
+  - For #4 (JSR e0), the byte assembly itself flips (block 33 had
+    LO[0]/HI[14] dominant; block 34 drives LO[1] / HI[2] to +42M
+    and LO[0] / HI[14] to −49M, emitting ``0x21`` instead of ``0xE0``).
+    This is the JSR variant of the L10 PSH ``MEM_addr0=0xE0`` bug;
+    the L34 tail has rules with ~5e7 strength writing wrong lanes.
+  - Both align with the memory note about
+    ``tail_bit32_result_correction`` being the dominant 1096 carrier;
+    a single-rule whack-a-mole has historically been zero-sum here.
+  - Validator pass count after the SpecCoverage fix:
+    **22 passed, 2 failed, 1 skipped** (was 19/25 → now 22/25).

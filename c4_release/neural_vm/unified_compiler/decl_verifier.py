@@ -54,6 +54,7 @@ Usage:
 from __future__ import annotations
 
 import inspect
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -3437,11 +3438,31 @@ def audit_spec_coverage(
     else:
         layout = compile_fn()
 
-    try:
-        with open(spec_path, encoding="utf-8") as f:
-            spec_lines = f.readlines()
-    except OSError:
-        spec_lines = []
+    # Resolve ``spec_path`` robustly: callers may run pytest from either the
+    # repo root (where ``c4_release/docs/BLOG_SPEC.md`` is valid) or from
+    # inside ``c4_release/`` (where ``docs/BLOG_SPEC.md`` is valid). When the
+    # default relative path doesn't exist at the current cwd, try a fallback
+    # derived from this module's location.
+    spec_lines: List[str] = []
+    candidate_paths = [spec_path]
+    if not os.path.isabs(spec_path):
+        # Try stripping a leading ``c4_release/`` prefix in case we are
+        # already inside the ``c4_release/`` directory.
+        if spec_path.startswith("c4_release/"):
+            candidate_paths.append(spec_path[len("c4_release/"):])
+        # Also try a path derived from this module's directory.
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        # decl_verifier.py is at c4_release/neural_vm/unified_compiler/
+        # so the project ``c4_release/`` root is two levels up.
+        project_root = os.path.dirname(os.path.dirname(module_dir))
+        candidate_paths.append(os.path.join(project_root, "docs", "BLOG_SPEC.md"))
+    for candidate in candidate_paths:
+        try:
+            with open(candidate, encoding="utf-8") as f:
+                spec_lines = f.readlines()
+            break
+        except OSError:
+            continue
 
     all_sections: List[str] = []
     heading_slugs: List[str] = []
