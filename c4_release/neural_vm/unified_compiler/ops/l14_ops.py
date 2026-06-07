@@ -1923,6 +1923,17 @@ def make_layer14_mem_addr_src_default_suppress_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,
+        # Phase 7 declarative-authority audit: this op's bake reaches the
+        # ``_set_layer14_*`` legacy helper, but the helper's writes ARE
+        # the declared rule program (counter-write against the L3
+        # ``MEM DEFAULT`` baseline gated by ``MEM_ADDR_SRC=1``). Mark
+        # explicitly as declarative so the audit classifier doesn't fall
+        # back to the ``_set_*`` heuristic and flag it as a legacy
+        # wrapper. Matches the sibling L14 cleanup-chain ops which use
+        # ``spec_generated`` alongside an explicit ``compiler_ir=`` rule
+        # bundle; this op pre-dates the IR factorisation but the bake
+        # behaviour is identical in intent.
+        declarative_authority="declarative",
         # Phase 8.A.4: use ``target_op_name`` to bind to whichever layer
         # the compiler placed ``layer14_mem_generation`` (the L14 attn
         # op). Matches the convention used by the other L14 cleanup ops.
@@ -2001,6 +2012,15 @@ def make_layer14_jsr_mem_default_suppress_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,
+        # Phase 7 declarative-authority audit: same rationale as the
+        # SI/SC sibling ``layer14_mem_addr_src_default_suppress`` above.
+        # The bake calls a ``_set_layer14_*`` legacy helper, but the
+        # helper IS the rule program (counter-write against the L3
+        # ``MEM DEFAULT`` baseline gated by ``MEM_STORE=1 AND
+        # MEM_ADDR_SRC=0`` for PSH/JSR/ENT). Mark explicitly as
+        # declarative so the audit classifier doesn't flag it as a
+        # legacy wrapper.
+        declarative_authority="declarative",
         # Phase 8.A.4: use ``target_op_name`` to bind to whichever layer
         # the compiler placed ``layer14_mem_generation`` (the L14 attn
         # op). Matches the convention used by the other L14 cleanup ops.

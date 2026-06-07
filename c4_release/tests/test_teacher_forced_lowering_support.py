@@ -47,20 +47,12 @@ REC_FIB_1_SRC = (
 @pytest.mark.parametrize(
     "name, source, step, slot, expected",
     [
-        pytest.param(
+        (
             "local_frame_push_mem_addr0_e0",
             LOCAL_FRAME_SRC,
             3,
             "MEM_addr0",
             0xE0,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "active local-frame lowering overwrite: symbolic "
-                    "MEM_addr0=0xe0 is supported until the final tail, "
-                    "which currently flips the byte to 0x18"
-                ),
-            ),
         ),
         (
             "stale_stack0_marker_non_fire",
