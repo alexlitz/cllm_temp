@@ -125,12 +125,6 @@ class TestSmokePureNeuralBasic:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=20)
         assert result == 42
 
-    @pytest.mark.xfail(
-        reason="Phase 7: MUL pure-neural blocked — _set_layer11_mul_partial "
-               "/ _set_layer12_mul_combine not wired in pure_neural mode "
-               "(see test_pure_neural_heap_div.py::test_mul_small).",
-        strict=False,
-    )
     def test_mul_basic(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 6), Opcode.PSH,
@@ -187,17 +181,6 @@ class TestSmokePureNeuralControlFlow:
     carry-forward bug.
     """
 
-    @pytest.mark.xfail(
-        reason="Phase 4: JMP forward passes for the test_pure_neural_jmp_bz.py "
-               "form `(JMP,2), NOP, (IMM,9), EXIT` returning 9 but FAILS "
-               "for the smoke form `(JMP,2), (IMM,99), (IMM,42), EXIT` — "
-               "empirically returns 0 instead of 42. Suggests the JMP "
-               "target-resolution is sensitive to the instruction at the "
-               "target index (NOP works, IMM doesn't relay correctly). "
-               "Promote when this bytecode pattern is added to "
-               "test_pure_neural_jmp_bz.py and confirmed.",
-        strict=False,
-    )
     def test_jmp_forward(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.JMP, 2),
@@ -208,12 +191,6 @@ class TestSmokePureNeuralControlFlow:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=15)
         assert result == 42
 
-    @pytest.mark.xfail(
-        reason="Phase 4: pure_neural BZ taken-path not yet supported (PC "
-               "never redirects at step 1). See test_pure_neural_jmp_bz.py"
-               "::TestPureNeuralBZ::test_bz_taken.",
-        strict=False,
-    )
     def test_bz_branch(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 0),
@@ -225,12 +202,6 @@ class TestSmokePureNeuralControlFlow:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=15)
         assert result == 42
 
-    @pytest.mark.xfail(
-        reason="Phase 4: pure_neural BNZ taken-path not yet supported (PC "
-               "never redirects at step 1). See test_pure_neural_jmp_bz.py"
-               "::TestPureNeuralBNZ::test_bnz_taken.",
-        strict=False,
-    )
     def test_bnz_branch(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 1),
@@ -256,13 +227,6 @@ class TestSmokePureNeuralFunctionCall:
     mem[BP+8].
     """
 
-    @pytest.mark.xfail(
-        reason="Phase 5: callee-writes-AX blocked — _set_layer9_lev_bp_to_pc"
-               "_relay does not restore PC from mem[BP+8]; callee body's IMM "
-               "never reaches caller EXIT. "
-               "See test_pure_neural_jsr_ent_lev.py::test_jsr_callee_writes_ax.",
-        strict=False,
-    )
     def test_simple_function(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.JSR, 3),
@@ -384,11 +348,6 @@ class TestSmokePureNeuralComparison:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=20)
         assert result == 0
 
-    @pytest.mark.xfail(
-        reason="Phase 2: LT pure-neural path not directly exercised; F's "
-               "matrix marks 'likely works (under-tested)'.",
-        strict=False,
-    )
     def test_lt_true(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 10), Opcode.PSH,
@@ -426,11 +385,6 @@ class TestSmokePureNeuralComparison:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=20)
         assert result == 1
 
-    @pytest.mark.xfail(
-        reason="Phase 2: LE pure-neural path not directly exercised; F's "
-               "matrix marks 'likely works (under-tested)'.",
-        strict=False,
-    )
     def test_le_true(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 10), Opcode.PSH,
@@ -484,12 +438,6 @@ class TestSmokePureNeuralAddress:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=20)
         assert result != 0
 
-    @pytest.mark.xfail(
-        reason="Phase 2: ADJ migrated to fully-neural per F's matrix but "
-               "not exercised by any test_pure_neural_*.py file today. "
-               "Promote when added to Phase 2 suite.",
-        strict=False,
-    )
     def test_adj_sp(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 42),
@@ -551,10 +499,6 @@ class TestSmokePureNeuralMemory:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=30)
         assert result == 42
 
-    @pytest.mark.xfail(
-        reason="Phase 7: SI/LI blocked (see test_si_li_roundtrip).",
-        strict=False,
-    )
     def test_si_li_zero(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 0x300),
@@ -766,12 +710,6 @@ class TestSmokePureNeural32Bit:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=20)
         assert result == 0xFF
 
-    @pytest.mark.xfail(
-        reason="Phase 3: SUB borrow cascade blocked — same as test_sub_16bit. "
-               "32-bit underflow result (0xFFFFFFFF) needs full multi-byte "
-               "borrow propagation.",
-        strict=False,
-    )
     def test_sub_borrow_cascade(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 0), Opcode.PSH,
@@ -837,12 +775,6 @@ class TestSmokePureNeural32Bit:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=20)
         assert result == 500
 
-    @pytest.mark.xfail(
-        reason="Phase 3+7: SHL by 8 blocked — cross-byte SHL not implemented "
-               "(_set_layer13_shifts gap). See test_pure_neural_heap_div.py"
-               "::test_shl_small + PHASE_8_RUNNER_SWITCH_SCOPE.md.",
-        strict=False,
-    )
     def test_shl_8bit(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 1), Opcode.PSH,
@@ -852,11 +784,6 @@ class TestSmokePureNeural32Bit:
         _, result = pure_neural_runner.run(bytecode, b'', max_steps=20)
         assert result == 256
 
-    @pytest.mark.xfail(
-        reason="Phase 3+7: SHR by 8 blocked — cross-byte SHR not implemented. "
-               "Also IMM 0x100 requires multi-byte IMM bake.",
-        strict=False,
-    )
     def test_shr_8bit(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 0x100), Opcode.PSH,
@@ -878,11 +805,6 @@ class TestSmokePureNeuralIntegration:
     fall-through xfail). Blocked.
     """
 
-    @pytest.mark.xfail(
-        reason="Phase 2 (EQ under-tested) + Phase 4 (BZ fall-through xfail "
-               "per test_pure_neural_jmp_bz.py::test_bz_not_taken).",
-        strict=False,
-    )
     def test_cmp_and_branch(self, pure_neural_runner, make_bytecode):
         bytecode = make_bytecode([
             (Opcode.IMM, 5), Opcode.PSH,
