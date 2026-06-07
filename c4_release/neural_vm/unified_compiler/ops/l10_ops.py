@@ -1670,6 +1670,16 @@ def _layer10_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
     ]
     k = [
         AP(0, BD.CONST, 10.0),
+        # K-side complement for the slot-0 IS_BYTE gate. The Q-side at
+        # slot 0 carries IS_BYTE * 1000 alongside H1+AX/TEMP+3/BYTE_INDEX_3
+        # discriminators; without a non-CONST K-side at the same slot the
+        # IS_BYTE gate softmax-cancels. A tiny MARK_STACK0 weight breaks
+        # the softmax symmetry (per
+        # docs/DSL_ATTENTION_GATE_FINDING_2026_06_07.md) without
+        # perturbing the substantive head selection driven by slots 1,
+        # 31, 32, 34. See docs/Q_SIDE_GATE_AUDIT_2026_06_07.md L10
+        # stack0_byte_relay.
+        AP(0, BD.MARK_STACK0, 0.1),
         AP(1, BD.MEM_STORE, 100.0),
         AP(1, BD.MARK_MEM, -200.0),
         AP(1, BD.CONST, -50.0),
@@ -1681,6 +1691,8 @@ def _layer10_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
         AP(34, BD.H2 + 4, -60.0),
         AP(34, BD.STACK0_BYTE3, 60.0),
         AP(33, BD.CONST, 5.0),
+        # K-side complement for the slot-33 IS_BYTE gate (mirrors slot 0).
+        AP(33, BD.MARK_STACK0, 0.1),
     ]
     v = []
     o = []
@@ -1736,6 +1748,8 @@ def _layer10_nonbitwise_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttenti
     ]
     k = [
         AP(0, BD.CONST, 10.0),
+        # K-side complement for the slot-0 IS_BYTE gate (mirrors head 4).
+        AP(0, BD.MARK_STACK0, 0.1),
         AP(1, BD.MEM_STORE, 100.0),
         AP(1, BD.MARK_MEM, -200.0),
         AP(1, BD.CONST, -50.0),
@@ -1747,6 +1761,8 @@ def _layer10_nonbitwise_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttenti
         AP(34, BD.H2 + 4, -60.0),
         AP(34, BD.STACK0_BYTE3, 60.0),
         AP(33, BD.CONST, 5.0),
+        # K-side complement for the slot-33 IS_BYTE gate (mirrors head 4).
+        AP(33, BD.MARK_STACK0, 0.1),
     ]
     v = []
     o = []
@@ -1850,6 +1866,15 @@ def _layer10_stack0_persistence_head_spec(BD, S) -> DeclarativeAttentionHeadSpec
         AP(33, BD.STACK0_BYTE3, -30000.0),
     ]
     k = [
+        # K-side complement for the slot-0 OP_PSH / OP_LEV blockers. The
+        # Q-side at slot 0 carries all-negative blockers
+        # (PSH_AT_SP/OP_PSH/CMP+0/1/2/4/OP_LEV) without any positive
+        # writes; with no K-side entry at slot 0 the blockers are dead
+        # weight (q_only). MARK_STACK0 routes the blockers' negative
+        # contribution to MARK_STACK0 K rows — i.e. blocks persistence
+        # from landing on STACK0 K rows during those opcodes. See
+        # docs/Q_SIDE_GATE_AUDIT_2026_06_07.md L10 stack0_persistence.
+        AP(0, BD.MARK_STACK0, M),
         AP(4, BD.STACK0_BYTE1, M),
         AP(5, BD.STACK0_BYTE2, M),
         AP(6, BD.STACK0_BYTE3, M),

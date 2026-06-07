@@ -1278,7 +1278,14 @@ def _carry_forward_head_spec(
     * ``V[1+k] = src_lo+k``, ``V[17+k] = src_hi+k`` for k=0..15.
     * ``O[out_lo+k] = V[1+k]``, ``O[out_hi+k] = V[17+k]`` for k=0..15.
     * Anti-leakage gate at slot 33: ``Q[33]=marker*L + CONST*-L/2``,
-      ``K[33]=CONST*L``.
+      ``K[33]=(L1H1+l1h1_idx)*0.1 + (L1H0+l1h0_idx)*-0.1 + CONST*L``.
+      The K-side L1H1/L1H0 differential (at small weight 0.1) makes the
+      Q-side anti-leakage gate filter without disturbing the slot-0
+      byte-0 selection (per
+      docs/DSL_ATTENTION_GATE_FINDING_2026_06_07.md: a uniform K-side at
+      a Q-gated slot softmax-cancels). The complement mirrors slot 0
+      direction so the gate's K-side discriminator selects the same
+      prev-step register byte-0 row already biased by slot 0.
     """
 
     GATE = 33
@@ -1290,6 +1297,8 @@ def _carry_forward_head_spec(
     k = [
         AP(0, BD.L1H1 + l1h1_idx, L),
         AP(0, BD.L1H0 + l1h0_idx, -L),
+        AP(GATE, BD.L1H1 + l1h1_idx, 0.1),
+        AP(GATE, BD.L1H0 + l1h0_idx, -0.1),
         AP(GATE, BD.CONST, L),
     ]
     v = []
@@ -1399,7 +1408,13 @@ def _stack0_carry_head_spec(BD) -> DeclarativeAttentionHeadSpec:
 
     L = 15.0
     q = [AP(0, BD.MARK_STACK0, L)]
-    k = [AP(0, BD.STACK0_BYTE0, L), AP(33, BD.CONST, L)]
+    k = [
+        AP(0, BD.STACK0_BYTE0, L),
+        AP(33, BD.CONST, L),
+        # K-side complement for slot-33 MARK_STACK0 gate (per
+        # docs/Q_SIDE_GATE_AUDIT_2026_06_07.md L3 carry_forward).
+        AP(33, BD.MARK_STACK0, L),
+    ]
     q.append(AP(33, BD.MARK_STACK0, L))
     q.append(AP(33, BD.CONST, -L / 2))
     return DeclarativeAttentionHeadSpec(
@@ -1421,7 +1436,13 @@ def _ax_full_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(GATE, BD.MARK_AX, L),
         AP(GATE, BD.CONST, -L / 2),
     ]
-    k = [AP(0, BD.MARK_AX, L), AP(GATE, BD.CONST, L)]
+    k = [
+        AP(0, BD.MARK_AX, L),
+        AP(GATE, BD.CONST, L),
+        # K-side complement for slot-33 MARK_AX gate (per
+        # docs/Q_SIDE_GATE_AUDIT_2026_06_07.md L3 carry_forward).
+        AP(GATE, BD.MARK_AX, L),
+    ]
     v = []
     o = []
     for k_idx in range(16):
@@ -1455,6 +1476,13 @@ def _lev_bp_to_pc_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(0, BD.L1H1 + BP_I, L),
         AP(0, BD.L1H0 + BP_I, -L),
         AP(GATE, BD.CONST, L),
+        # K-side complement for slot-33 MARK_PC gate. The head wants
+        # current-step PC marker Q rows attending to previous-step BP
+        # marker K rows; K-side ``MARK_BP`` discriminates the target rows
+        # (slot 0 biases toward L1H1+BP_I, so the prev-step BP byte-0 row
+        # is the dominant K target and carries MARK_BP=1). See
+        # docs/Q_SIDE_GATE_AUDIT_2026_06_07.md L3 carry_forward.
+        AP(GATE, BD.MARK_BP, L),
     ]
     v = []
     for k_idx in range(16):
@@ -1515,6 +1543,12 @@ def _pc_byte1_prev_head_spec(BD) -> DeclarativeAttentionHeadSpec:
             AP(0, BD.BYTE_INDEX_1, L),
             AP(0, BD.CONST, -2.0 * L),
             AP(GATE, BD.CONST, 5.0),
+            # K-side complements for the slot-33 IS_BYTE + MARK_PC gate.
+            # Target K rows are prev-step PC byte rows (IS_BYTE=1 +
+            # MARK_PC=1 + H1+PC_I + BYTE_INDEX_1 at slot 0). See
+            # docs/Q_SIDE_GATE_AUDIT_2026_06_07.md L3 carry_forward.
+            AP(GATE, BD.IS_BYTE, 500.0),
+            AP(GATE, BD.MARK_PC, 500.0),
         ),
         v=tuple(v),
         o=tuple(o),
