@@ -1566,6 +1566,13 @@ def make_layer3_convo_io_state_init_op(
         declarative_authority="spec_generated",
         migrated=True,
         ffn_units_used=1035 if enable_conversational_io else None,
+        # Phase 1 (memory cluster fix plan, slot registry): shares L3
+        # ``block.ffn`` unit range with ``convo_io_step_resume``
+        # (writes unit 1035). This op writes unit 1034. The coarse
+        # ``[0, ffn_units_used)`` derivation overlaps; the actual
+        # single-unit ranges are disjoint. Legitimate co-bake of the
+        # convo-IO L3 FFN extension, not a silent overwrite.
+        slot_share=("ffn_units",),
         # B12 backfill: docstring above pins phase 3.1 AFTER
         # ``layer3_ffn`` (phase 3, same L3 FFN) so this extension's
         # writes at unit 1034 layer cleanly on top of the L3 / L6-routing

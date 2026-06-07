@@ -660,6 +660,15 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
         # placed ``layer6_attn`` (an L6 attn op anchor).
         target_op_name="layer6_attn",
         migrated=True,
+        # Phase 1 (memory cluster fix plan, slot registry): shares L6
+        # ``block.ffn`` unit range with ``convo_io_pc_sp_latch`` (units
+        # 1402-1465) and ``layer6_ent_after_jsr_sp_byte0_fixup`` (units
+        # 1668-1674). This op writes units 1400-1401. The coarse
+        # ``[0, ffn_units_used)`` derivation overlaps; the actual unit
+        # ranges are disjoint. Legitimate co-bake — the convo-IO
+        # state-machine, PC/SP latch, and ENT-after-JSR fixup append
+        # distinct unit clusters above the routing FFN (units 0-1033).
+        slot_share=("ffn_units",),
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
         # ``tools/derive_produces_consumes.py`` from the IR rule writes.
         # Two ``gated_write`` units fire on CMP+5/CMP+6 (per-opcode IO
@@ -935,6 +944,14 @@ def make_null_terminator_detection_op(
         # whichever layer the compiler picks for the L10 carry-relay attn.
         target_op_name="layer10_carry_relay",
         migrated=True,
+        # Phase 1 (memory cluster fix plan, slot registry): shares the
+        # L10 ``block.ffn`` unit range with ``layer10_alu`` (units
+        # 0-1845). This op writes a single unit at 1864 (above ALU's
+        # range). The coarse ``[0, ffn_units_used)`` derivation
+        # overlaps; the actual ranges are disjoint. Legitimate co-bake
+        # — convo-IO null-terminator detection appended on top of L10
+        # ALU, not a silent overwrite.
+        slot_share=("ffn_units",),
         # When ``enable_conversational_io=True`` AND ``alu_mode='lookup'``,
         # the helper writes L10 FFN unit 1864 (single unit). That sits
         # above ``layer10_alu``'s 0-1845 cluster, so the L10 FFN must be
@@ -1018,6 +1035,13 @@ def make_convo_io_step_resume_op(
         declarative_authority="spec_generated",
         migrated=True,
         ffn_units_used=1036 if (enable_conversational_io and enable) else None,
+        # Phase 1 (memory cluster fix plan, slot registry): shares L3
+        # ``block.ffn`` unit range with ``layer3_convo_io_state_init``
+        # (writes unit 1034). This op writes unit 1035. The coarse
+        # ``[0, ffn_units_used)`` derivation overlaps; the actual
+        # single-unit ranges are disjoint. Legitimate co-bake of the
+        # convo-IO L3 FFN extension, not a silent overwrite.
+        slot_share=("ffn_units",),
         # B12 backfill: docstring above names ``layer3_convo_io_state_init``
         # (phase 3.1, same L3 FFN) as the required predecessor — that op
         # writes unit 1034, this one writes unit 1035, so the upstream
@@ -1145,6 +1169,15 @@ def make_convo_io_pc_sp_latch_op(
         compiler_ir=make_convo_io_pc_sp_latch_ir(),
         migrated=True,
         ffn_units_used=1466 if (enable_conversational_io and enable) else None,
+        # Phase 1 (memory cluster fix plan, slot registry): shares L6
+        # ``block.ffn`` unit range with ``convo_io_state_machine`` (units
+        # 1400-1401) and ``layer6_ent_after_jsr_sp_byte0_fixup`` (units
+        # 1668-1674). This op writes units 1402-1465 (PC/SP latch
+        # replay band). The coarse ``[0, ffn_units_used)`` derivation
+        # overlaps; the actual unit ranges are disjoint. Legitimate
+        # co-bake — the convo-IO PC/SP latch is appended on top of the
+        # state-machine and below the ENT-after-JSR fixup.
+        slot_share=("ffn_units",),
         # B12 backfill: docstring above names ``convo_io_state_machine``
         # (phase 6.6, same L6 FFN) as the required predecessor — its
         # state-machine units 1400-1401 must be in place before this op
@@ -1668,6 +1701,14 @@ def make_conversational_io_output_routing_op(
         # 1232-unit allocation in that mode. In lookup mode the L15 FFN
         # falls back to ``layer15_nibble_copy``'s 40 units.
         ffn_units_used=1232 if enable_conversational_io else None,
+        # Phase 1 (memory cluster fix plan, slot registry): shares L15
+        # ``block.ffn`` unit range with ``layer15_nibble_copy`` (units
+        # 0-41). This op writes 32 units starting at 1200 (well above
+        # nibble-copy's range). The coarse ``[0, ffn_units_used)``
+        # derivation overlaps; the actual ranges are disjoint.
+        # Legitimate co-bake — convo-IO output routing appended on top
+        # of L15 nibble copy.
+        slot_share=("ffn_units",),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#printing-and-reading-input",
         # Phase 11.A IR exposure: bake is `if not <flag>: return` at default
