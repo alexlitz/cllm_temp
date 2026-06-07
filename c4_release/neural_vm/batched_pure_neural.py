@@ -277,6 +277,7 @@ class BatchedPureNeuralRunner:
         kv_cache_verify_interval: Optional[int] = None,
         enable_moe_routing: Optional[bool] = None,
         csr_inference: Optional[bool] = None,
+        compact_gather: Optional[bool] = None,
     ):
         """``csr_inference`` enables the explicit CSR inference path
         (commit cb0f396f bench: 2.11x CUDA speedup at 99.9% argmax-match).
@@ -284,6 +285,12 @@ class BatchedPureNeuralRunner:
         weights, preserving byte-identity-oriented tests by default.
         Only consulted when ``model_runner`` is None; if an externally-built
         runner is supplied its CSR mode is taken from that runner.
+
+        ``compact_gather`` enables the byte-identical column-shrink path
+        (2026-06-06 bench: 1.17x CUDA speedup at 100% argmax match, max
+        diff 0.0). ``None`` reads ``C4_COMPACT_GATHER`` and otherwise
+        keeps dense weights. Only consulted when ``model_runner`` is
+        None. Mutually exclusive with ``csr_inference``.
         """
         if use_kv_cache is None:
             use_kv_cache = os.environ.get("C4_BATCH_USE_KV_CACHE") == "1"
@@ -325,6 +332,11 @@ class BatchedPureNeuralRunner:
                 os.environ.get("C4_CSR_INFERENCE", "").strip().lower()
                 in {"1", "true", "yes", "on"}
             )
+        if compact_gather is None:
+            compact_gather = (
+                os.environ.get("C4_COMPACT_GATHER", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
         if model_runner is None:
             model_runner = AutoregressiveVMRunner(
                 d_model=d_model,
@@ -336,6 +348,7 @@ class BatchedPureNeuralRunner:
                 trust_neural_alu=True,
                 enable_moe_routing=enable_moe_routing,
                 csr_inference=csr_inference,
+                compact_gather=compact_gather,
             )
             model_runner._func_call_handlers = {}
             model_runner._syscall_handlers = {}

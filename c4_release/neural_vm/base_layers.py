@@ -284,6 +284,104 @@ def csr_sparsify_model(model: nn.Module, *,
     return info
 
 
+# ---------------------------------------------------------------------------
+# Compact-gather inference: byte-identical column-shrink of dense FFN weights
+# ---------------------------------------------------------------------------
+#
+# Per the 2026-06-06 sparse-inference benchmark
+# (``c4_release/docs/SPARSE_INFERENCE_BENCHMARK_2026_06_06.md``), running
+# ``model.compact(block_size=1)`` over the compiled ``AutoregressiveVM``
+# yields a 1.17x CUDA forward-pass speed-up at **100% argmax match** vs
+# the dense baseline.
+#
+# The FFN transform is bit-identical: ``PureFFN.compact`` only removes
+# hidden units (rows of ``W_up``/``W_gate``, columns of ``W_down``)
+# whose weights are entirely zero. ``W_up @ x`` keeps the same input
+# (sum) dim; ``W_down @ h`` sums over a subset of hidden whose excluded
+# terms each multiplied a zero weight by anything = 0. cuBLAS's tile
+# order over the unchanged input dim is unchanged. We confirm
+# bit-identity with :func:`torch.equal` in
+# ``tests/test_compact_gather.py``.
+#
+# Attention compaction (``PureAttention.compact``) gathers active input
+# dims (changing the K-reduction dim of W_q/W_k/W_v) and active heads;
+# although the discarded contributions are also algebraically zero, the
+# reduction tile order over the smaller K dim differs from the dense
+# one in cuBLAS so individual logits may differ by ~1e6 at the
+# scale-S=100 weights' ~1e10 range (still 100% argmax-equivalent). We
+# therefore default to FFN-only compaction in the production path. The
+# bench observed 0.0 max diff with attention compaction enabled too,
+# but that depended on the specific seed; FFN-only guarantees torch.equal
+# across every input.
+#
+# Used by the production runner paths (``BatchedPureNeuralRunner``,
+# ``AutoregressiveVMRunner``) when ``compact_gather=True``. Opt-in only;
+# byte-identity test paths leave it OFF — the smaller submatrices are
+# bit-identical to dense at the logit, but the on-disk parameter
+# shapes change, which upsets weight-comparison fixtures.
+
+
+def compact_gather_model(model: nn.Module, *,
+                         block_size: int = 1,
+                         compact_attn: bool = False) -> dict:
+    """Apply the bit-identical column-shrink optimisation to a compiled
+    ``AutoregressiveVM``.
+
+    Walks every block and calls ``block.ffn.compact(block_size=...)`` on
+    whichever blocks expose the compactor. Composite FFN blocks
+    (``AddSub5StageBlock`` / ``FlattenedDivMod`` / ``FlattenedPureFFN``
+    wrappers) plumb ``compact`` through to the inner ``PureFFN``
+    already. Blocks that have been trimmed to ``hidden_dim == 0`` are
+    skipped defensively (``PureFFN.compact`` indexes with ``[0]`` and
+    would crash).
+
+    ``compact_attn`` is False by default. Setting it True compacts
+    attention as well — same algebraic identity, but cuBLAS reduction
+    over a smaller K dim does not preserve fp32 tile-order against the
+    dense baseline; bit-identity via ``torch.equal`` may fail (100%
+    argmax-equivalence is preserved). Opt-in only for callers willing
+    to accept that.
+
+    Returns a dict with conversion stats. ``converted`` is False when
+    no block had any active rows/columns to gather.
+    """
+    info: dict = {"converted": False, "ffn_compacted": 0,
+                  "attn_compacted": 0, "skipped": 0,
+                  "block_size": int(block_size),
+                  "compact_attn": bool(compact_attn)}
+    if not hasattr(model, "blocks"):
+        info["skip_reason"] = "no_blocks"
+        return info
+
+    for block in model.blocks:
+        ffn = getattr(block, "ffn", None)
+        if ffn is not None and hasattr(ffn, "compact"):
+            # PureFFN.compact indexes with [0] when no hidden unit is
+            # active; skip zero-hidden blocks rather than crashing.
+            W_up = getattr(ffn, "W_up", None)
+            shape = getattr(W_up, "shape", None) if W_up is not None else None
+            if shape is not None and shape[0] == 0:
+                info["skipped"] += 1
+            else:
+                try:
+                    ffn.compact(block_size=block_size)
+                    info["ffn_compacted"] += 1
+                except Exception:  # noqa: BLE001
+                    info["skipped"] += 1
+
+        if compact_attn:
+            attn = getattr(block, "attn", None)
+            if attn is not None and hasattr(attn, "compact"):
+                try:
+                    attn.compact(block_size=block_size)
+                    info["attn_compacted"] += 1
+                except Exception:  # noqa: BLE001
+                    pass
+
+    info["converted"] = (info["ffn_compacted"] + info["attn_compacted"]) > 0
+    return info
+
+
 def bake_weights(method):
     """
     Decorator for _bake_weights methods.

@@ -217,6 +217,7 @@ class AutoregressiveVMRunner:
         enable_cuda_graphs=False,
         enable_moe_routing=False,
         csr_inference: Optional[bool] = None,
+        compact_gather: Optional[bool] = None,
     ):
         """Initialize the autoregressive VM runner.
 
@@ -315,6 +316,22 @@ class AutoregressiveVMRunner:
                 The CSR model is cached separately from the dense model so
                 both can coexist. CPU runs skip the conversion (CSR helps
                 less and the benchmark target is GPU).
+            compact_gather: If True, the compiled dense weights are
+                pre-shrunk in place after the build to only the columns
+                with any nonzero rows / heads with any active K/V/Q/O
+                (see ``c4_release/neural_vm/base_layers.py
+                :compact_gather_model``). Per the same 2026-06-06
+                benchmark, this yields a 1.17x CUDA forward-pass speed-up
+                at **100% argmax match and max abs diff 0.0** vs dense —
+                byte-identical, because the dense GEMM kernel is unchanged
+                and the gather just removes rows/columns whose
+                contribution to every dot product is already zero.
+                ``None`` (default) reads ``C4_COMPACT_GATHER`` and
+                otherwise keeps the dense model. The compact-gather model
+                is cached separately from the dense model so both can
+                coexist. Mutually exclusive with ``csr_inference``: the
+                two transforms touch the same parameters in different
+                ways, so combining them is unsupported.
         """
         if enable_cuda_graphs:
             raise NotImplementedError(
@@ -338,11 +355,23 @@ class AutoregressiveVMRunner:
                 os.environ.get("C4_CSR_INFERENCE", "").strip().lower()
                 in {"1", "true", "yes", "on"}
             )
+        if compact_gather is None:
+            compact_gather = (
+                os.environ.get("C4_COMPACT_GATHER", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+        if csr_inference and compact_gather:
+            raise ValueError(
+                "AutoregressiveVMRunner: csr_inference=True and "
+                "compact_gather=True are mutually exclusive — both transforms "
+                "rewrite block.attn / block.ffn weight parameters in place."
+            )
         cache_key = (d_model, n_layers, n_heads, ffn_hidden, max_seq_len,
                      conversational_io, alu_mode,
                      enable_neural_io_think_protocol, compile_mode,
                      bool(enable_moe_routing),
-                     bool(csr_inference))
+                     bool(csr_inference),
+                     bool(compact_gather))
         if cache_model and cache_key in AutoregressiveVMRunner._MODEL_CACHE:
             self.model = AutoregressiveVMRunner._MODEL_CACHE[cache_key]
             # Re-install the CSR F.linear shim defensively in case the
@@ -389,6 +418,23 @@ class AutoregressiveVMRunner:
                     import copy
                     self.model = copy.deepcopy(self.model)
                 self._csr_info = csr_sparsify_model(self.model)
+            # Compact-gather inference: column-shrink dense weights to only
+            # active rows/columns. Byte-identical (max diff 0.0, 100%
+            # argmax) per the 2026-06-06 sparse benchmark, 1.17x CUDA
+            # speedup. Applied AFTER device move but BEFORE torch.compile
+            # so the compiled graph sees the smaller submatrices. Same
+            # in-place isolation discipline as CSR: deepcopy the model if
+            # it came from compile_full_vm_dynamic's process-wide memo so
+            # we don't contaminate the dense cache entry.
+            self._compact_gather_info = None
+            if compact_gather:
+                from .base_layers import compact_gather_model
+                if torch.cuda.is_available():
+                    import copy
+                    self.model = copy.deepcopy(self.model)
+                self._compact_gather_info = compact_gather_model(
+                    self.model, block_size=1, compact_attn=False,
+                )
             if compile_mode and compile_mode != "none":
                 # The model has ~30 blocks with distinct FFN shapes (each
                 # block was right-sized by ``_right_size_ffns``). Compiling
