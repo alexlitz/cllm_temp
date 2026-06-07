@@ -2215,8 +2215,30 @@ class BatchedPureNeuralRunner:
         # remain unaffected by the CMP removal. See
         # docs/REMOVAL_4_DEEP_FIX_2026_06_06.md for the Shape A/B
         # diagnosis that drove this fix.
+        # Removal-4 follow-up (2026-06-07): EQ/NE re-added to the recovery
+        # set. The original removal-4 commit (e70ddc6d) dropped EQ/NE
+        # under the assumption that the new L10 cmp_combine CMP+0
+        # blocker (Shape B fix) would cover both Shape B EQ_FALSE/NE_TRUE
+        # (default writes 0/1) AND Shape B EQ_TRUE/NE_FALSE (override3
+        # writes 1/0). In practice the override3 score for Shape B
+        # EQ_TRUE is below the +2.5 threshold (CMP+1~1.43, CMP+2~0,
+        # CMP+0~0 → score 2.43) because the upstream L9 lo_eq rule
+        # does not amplify CMP+2 at the EQ step's AX-marker row in
+        # Shape B. The override3 therefore never fires for Shape B
+        # EQ_TRUE, the default fires AX=0, and `test_cmp_and_branch`
+        # (integration EQ(5,5) + BZ) branches to AX=0. Restoring the
+        # EQ/NE entries to this recovery set covers Shape B EQ_TRUE
+        # (and NE_FALSE) via the legacy ALU. Shape A is unaffected:
+        # IMM+EQ collapses, and the collapsed-step recovery at line
+        # 2164 (commit f3342968) computes the correct AX regardless.
+        # The CMP+0 blocker stays in place — it remains semantically
+        # sound (hi_lt ⇒ not equal at hi nibble, so the equality
+        # override must not fire) and may matter for non-smoke
+        # corpus paths even if the smoke Shape B residual probe does
+        # not currently show CMP+0 amplification.
         _NON_COLLAPSED_RECOVERY_OPS = (
             Opcode.ADD, Opcode.SUB, Opcode.OR, Opcode.XOR, Opcode.AND,
+            Opcode.EQ, Opcode.NE,
         )
         if (exec_op in _NON_COLLAPSED_RECOVERY_OPS
                 and s.last_pushed_value is not None
