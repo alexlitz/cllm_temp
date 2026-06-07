@@ -1858,19 +1858,6 @@ def _layer10_stack0_persistence_head_spec(BD, S) -> DeclarativeAttentionHeadSpec
         AP(9, BD.BYTE_INDEX_2, M),
         AP(10, BD.BYTE_INDEX_3, M),
         AP(11, BD.H1 + AX_IDX, M),
-        # K-side complement for the slot-33 "active step" gate. The Q-side
-        # at slot 33 (above) carries a multi-condition active-step gate
-        # (HAS_SE require + OP_PSH/CMP+0/1/2/4/OP_LEV blockers +
-        # STACK0_BYTE0/1/2 positives). Without a non-CONST K-side at the
-        # same slot, the Q-side gate is uniform across K rows and softmax
-        # cancels, so the "blockers don't blocker" -- persistence can land
-        # on non-STACK0 K positions and overwrite values (documented
-        # `var_*` regression cluster). The complement here routes the gate
-        # positively only at MARK_STACK0 K positions (where persistence
-        # should land), and leaves a smaller CONST baseline so the existing
-        # byte-relay slot competition stays bounded. See
-        # docs/Q_SIDE_GATE_AUDIT_2026_06_07.md "risk #2".
-        AP(33, BD.MARK_STACK0, M),
         AP(33, BD.CONST, 100.0),
     ]
     v = []
