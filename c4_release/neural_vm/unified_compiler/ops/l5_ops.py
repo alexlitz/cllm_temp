@@ -224,7 +224,54 @@ def _code_fetch_v_writes(BD, weight: float = 1.0):
 
 
 def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
-    """Declarative replacement for ``setup_helpers._set_layer5_fetch``."""
+    """Declarative replacement for ``setup_helpers._set_layer5_fetch``.
+
+    Attention-gate audit (docs/Q_SIDE_GATE_AUDIT_2026_06_07.md,
+    docs/DSL_ATTENTION_GATE_FINDING_2026_06_07.md): this op contributes
+    11 of the 67 catalogued Q-side single-condition no-op gates. All 11
+    are cleanup-protected and intentional — DO NOT rewrite as K-side
+    complements without a full L5/L6 downstream rebake. Specifically:
+
+    * Slot 32 marker writes (`MARK_AX`/`MARK_PC`, 6 instances across
+      heads 0-5): the FETCH register has active FFN cleanup at non-AX
+      rows. The design doc calls this out by name as "L5 head 0
+      (memory load) pattern works because the FETCH register has
+      active FFN cleanup at non-AX rows." The slot-32 contribution
+      cancels through softmax (per-Q-row constant), but the resulting
+      attention output at non-marker rows is wiped by the downstream
+      L5 FFN's TEMP-clear and OPCODE-decode-at-MARK_AX gating, and by
+      L6's MARK_AX-conditional routing. Heads 1-5 inherit the same
+      cleanup chain.
+    * Slot 34 `HAS_SE` writes (5 instances across heads 0, 1, 2, 4, 5):
+      cannot be rewritten as K-side complements because the K side
+      (CODE positions indexed by ADDR_KEY) carries no Q-row state.
+      Gating an attention head on a Q-row scalar like HAS_SE
+      fundamentally requires either downstream output gating or a
+      restructured V/O projection — neither is in scope for a slot-
+      level K-side patch. Heads 0/1/5 (non-first-step) and heads 2/4
+      (first-step) both write OPCODE_BYTE_LO/HI or FETCH_LO/HI at
+      MARK_AX/MARK_PC; cross-step leak is masked because:
+        - On step 0, heads 0/1 read TEMP / EMBED (PC relay) which are
+          zero pre-relay, so their ADDR_KEY content match has no
+          discriminator → mass spreads and the V contribution is
+          attenuated.
+        - On step >=1, heads 2/4 read static `PC_OFFSET` (compile-
+          time PC=2) but compete with heads 1/5's dynamic content
+          match for the same OPCODE_BYTE_* destination; the dynamic
+          match wins via stronger Q-K alignment plus alibi-slope-0
+          flat positional bias.
+        - The L5 FFN ``opcode_decode_ffn`` re-decodes from
+          OPCODE_BYTE_LO/HI bits only at MARK_AX (or MARK_PC for
+          first-step), so any residual cross-step leak that lands at
+          non-marker rows is FFN-masked downstream.
+
+    If you suspect L5 fetch is contributing to SI/LI/SC/LC memory
+    test failures (the current smoke 6 failures: test_lea_basic and
+    5 memory tests), the leak is more likely at L7 memory heads or
+    L14/L15 ADDR_KEY/MEM-generation rather than L5. See
+    docs/Q_SIDE_GATE_AUDIT_2026_06_07.md sections 1, 4, 5 (l14/l10/l8
+    HIGH/MEDIUM risk hotspots).
+    """
 
     from ...constants import PC_OFFSET
 
