@@ -264,11 +264,19 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # collapsing back to zero. Gate the preservation on the existing OUTPUT
     # nibble so we only reinforce what L14/L15 already staged; the rule is
     # silent on the default-zero row.
+    # Edit A (collapsed-step joint fix, 2026-06-07): force OP_LEV requirement
+    # past the L27 +40 spike at OUTPUT_LO/HI on IMM-step STACK0 marker. Prior
+    # attempts (1ed6b5b6 at 2.0/5.5) left the gate within reach of carry-over
+    # OP_LEV ~0.5; the 5.0 weight + 7.5 threshold leaves 8 vs 3 at IMM
+    # (5+1+1+1=8 at LEV step, 0+1+1+1=3 at IMM step). Explicit OP_IMM and
+    # OP_PSH blockers add belt-and-braces against the cascade self-feedback.
     lev_stack0_preserve_conditions = (
-        ("OP_LEV", 1.0),
+        ("OP_LEV", 5.0),
         ("MARK_STACK0", 1.0),
         ("HAS_SE", 1.0),
         ("BYTE_INDEX_0", 1.0),
+        ("OP_IMM", -10.0),
+        ("OP_PSH", -10.0),
         ("MARK_PC", -8.0),
         ("MARK_AX", -8.0),
         ("MARK_SP", -8.0),
@@ -286,7 +294,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         rules.append(multi_way_and_rule(
             name=f"l16_lev_stack0_byte0_preserve_lo_{k}",
             conditions=lev_stack0_preserve_conditions,
-            threshold=4.5,
+            threshold=7.5,
             gate=f"OUTPUT_LO+{k}",
             writes=((f"OUTPUT_LO+{k}", lev_stack0_preserve_strength),),
         ))
@@ -294,7 +302,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         rules.append(multi_way_and_rule(
             name=f"l16_lev_stack0_byte0_preserve_hi_{k}",
             conditions=lev_stack0_preserve_conditions,
-            threshold=4.5,
+            threshold=7.5,
             gate=f"OUTPUT_HI_THIS_STEP+{k}",
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", lev_stack0_preserve_strength),),
         ))
