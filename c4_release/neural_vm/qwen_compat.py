@@ -690,6 +690,27 @@ class Qwen3DenseConfig:
     c4_softmax_sink_token_id: Optional[int] = None
     c4_post_ops_flattened: bool = False
     c4_post_ops_flatten_skipped_reason: Optional[str] = None
+    # R8 Blocker 5 — NeuralVMEmbedding augmentations metadata. The exported
+    # ``model.embed_tokens`` is a plain ``nn.Embedding`` whose row for the
+    # original VM vocabulary matches ``model.embed.embed.weight``. The
+    # ADDR_KEY and MEM_STORE augmentations that ``NeuralVMEmbedding.forward``
+    # adds on top of that lookup are NOT writable into the (vocab_size,
+    # d_model) table — ADDR_KEY is a per-position one-hot gated by the
+    # in-sequence CODE_END detector, and MEM_STORE depends on per-row state
+    # populated by the KV-cache eviction logic. Both are exported as a
+    # documented runtime wrapper protocol (see :class:`NeuralVMEmbeddingWrapper`
+    # and :func:`apply_neural_vm_embedding_augmentations`). These config
+    # fields tell a downstream loader where to write the deltas and which
+    # token id marks CODE_END / MEM.
+    c4_addr_key_idx: Optional[int] = None
+    c4_addr_key_width: int = 48
+    c4_mem_store_idx: Optional[int] = None
+    c4_mem_addr_src_idx: Optional[int] = None
+    c4_addr_key_pc_offset: int = 2
+    c4_addr_key_instr_width: int = 8
+    c4_addr_key_data_bytes: int = 5
+    c4_code_end_token_id: int = 265
+    c4_mem_token_id: int = 261
 
 
 def _build_qwen3_dense_config(model: Any, *, K: float) -> Qwen3DenseConfig:
@@ -721,6 +742,16 @@ def _build_qwen3_dense_config(model: Any, *, K: float) -> Qwen3DenseConfig:
     sink_token_id = base_vocab_size  # zero-indexed, sits past the VM vocab
     exported_vocab_size = base_vocab_size + 1
 
+    # R8 Blocker 5 — record the dim positions that NeuralVMEmbedding writes
+    # into. ``ADDR_KEY`` is a 48-dim band (three one-hot nibbles); ``MEM_STORE``
+    # and ``MEM_ADDR_SRC`` are 1-dim flags. The loader wrapper uses these to
+    # reproduce the augmentations on top of the plain ``nn.Embedding`` lookup.
+    addr_key_idx = dim_positions.get("ADDR_KEY")
+    mem_store_idx = dim_positions.get("MEM_STORE")
+    mem_addr_src_idx = dim_positions.get("MEM_ADDR_SRC")
+    from .constants import INSTR_WIDTH, PC_OFFSET
+    from .vm_step import Token
+
     return Qwen3DenseConfig(
         vocab_size=exported_vocab_size,
         hidden_size=d_model,
@@ -736,6 +767,16 @@ def _build_qwen3_dense_config(model: Any, *, K: float) -> Qwen3DenseConfig:
         c4_norm_compensator_idx=dim_positions.get("NORM_COMPENSATOR"),
         c4_bias_compensator_idx=dim_positions.get("CONST"),
         c4_softmax_sink_token_id=sink_token_id,
+        c4_addr_key_idx=int(addr_key_idx) if addr_key_idx is not None else None,
+        c4_mem_store_idx=int(mem_store_idx) if mem_store_idx is not None else None,
+        c4_mem_addr_src_idx=(
+            int(mem_addr_src_idx) if mem_addr_src_idx is not None else None
+        ),
+        c4_addr_key_pc_offset=int(PC_OFFSET),
+        c4_addr_key_instr_width=int(INSTR_WIDTH),
+        c4_addr_key_data_bytes=5,
+        c4_code_end_token_id=int(Token.CODE_END),
+        c4_mem_token_id=int(Token.MEM),
     )
 
 
@@ -962,6 +1003,335 @@ def prepend_softmax_sink(
         device=input_ids.device,
     )
     return torch.cat([sink_col, input_ids], dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Phase R8 / Blocker 5 — NeuralVMEmbedding augmentation export
+# ---------------------------------------------------------------------------
+#
+# ``NeuralVMEmbedding.forward`` (see ``neural_embedding.py``) runs three
+# components on top of a plain ``nn.Embedding`` lookup:
+#
+#   1. The base embedding table — exported losslessly as
+#      ``model.embed_tokens.weight``.
+#   2. ``_add_code_addr_keys`` — a position-only one-hot scatter into the
+#      ``ADDR_KEY`` residual band (48 dims), gated by an in-sequence
+#      ``CODE_END`` detector. Mathematically a deterministic function of
+#      ``(position, token_ids == CODE_END)``; recoverable from input_ids
+#      alone.
+#   3. ``_inject_mem_store`` — sets a 1-dim ``MEM_STORE`` flag (and an
+#      optional ``MEM_ADDR_SRC`` flag) at MEM-marker positions inside the
+#      retained history region. Depends on runtime state set externally:
+#      ``_mem_history_end``, ``_mem_store_positions``,
+#      ``_mem_addr_src_positions``. NOT computable from input_ids alone.
+#
+# Because (2) depends on position and (3) depends on runtime state, the
+# augmentations cannot be folded into a ``(vocab_size, d_model)`` lookup
+# table. They are exported as a documented **runtime wrapper protocol**:
+# the loader calls :func:`apply_neural_vm_embedding_augmentations` (or
+# wraps the Qwen embed_tokens with :class:`NeuralVMEmbeddingWrapper`) and
+# the resulting tensor matches ``NeuralVMEmbedding.forward(input_ids)``
+# bit-for-bit when the dim_positions / state inputs match.
+#
+# The exported ``config.json`` records ``c4_addr_key_idx``,
+# ``c4_mem_store_idx``, ``c4_mem_addr_src_idx``, the ADDR_KEY layout
+# constants, and the ``CODE_END`` / ``MEM`` token ids so the loader can
+# reconstruct the augmentation surface without importing ``neural_vm``.
+
+
+def apply_neural_vm_embedding_augmentations(
+    embeddings: torch.Tensor,
+    input_ids: torch.Tensor,
+    *,
+    addr_key_idx: Optional[int],
+    addr_key_width: int = 48,
+    mem_store_idx: Optional[int] = None,
+    mem_addr_src_idx: Optional[int] = None,
+    code_end_token_id: int = 265,
+    mem_token_id: int = 261,
+    pc_offset: int = 2,
+    instr_width: int = 8,
+    data_bytes: int = 5,
+    mem_history_end: int = 0,
+    mem_store_positions: Optional[List[List[int]]] = None,
+    mem_addr_src_positions: Optional[List[List[int]]] = None,
+) -> torch.Tensor:
+    """Apply ADDR_KEY / MEM_STORE augmentations on top of a Qwen embedding.
+
+    Drop-in equivalent to ``NeuralVMEmbedding.forward(input_ids)`` when
+    given the same ``input_ids``, ``embeddings = embed_tokens(input_ids)``,
+    and the matching dim positions / token ids. Returns the augmented
+    residual ``(B, T, d_model)``. The input tensor is NOT mutated; a clone
+    is augmented in-place and returned (callers can pass a freshly looked-up
+    embedding directly).
+
+    Args:
+        embeddings: ``(B, T, d_model)`` base embedding lookup output. Cloned
+            before mutation so the caller's tensor is left intact.
+        input_ids: ``(B, T)`` long token ids, used to gate ADDR_KEY (by
+            ``CODE_END``) and MEM_STORE (by ``MEM``).
+        addr_key_idx: starting column of the ADDR_KEY band. When ``None``
+            the ADDR_KEY scatter is skipped — useful for tiny test VMs whose
+            residual layout doesn't carry an ADDR_KEY slot.
+        addr_key_width: ADDR_KEY band width (always 48 = 3 nibbles * 16).
+        mem_store_idx: column of the MEM_STORE flag, or ``None`` to skip.
+        mem_addr_src_idx: column of the MEM_ADDR_SRC flag, or ``None`` to
+            skip.
+        code_end_token_id: vocab id of the ``CODE_END`` marker.
+        mem_token_id: vocab id of the ``MEM`` marker.
+        pc_offset, instr_width, data_bytes: ADDR_KEY layout constants
+            mirroring ``PC_OFFSET`` / ``INSTR_WIDTH`` / ``DATA_BYTES`` in
+            ``neural_vm.constants`` and ``neural_embedding._build_addr_key_pos_encoding``.
+        mem_history_end: end of the retained MEM history region. The
+            wrapper writes MEM_STORE=1 / MEM_ADDR_SRC=1 at every position
+            ``[0, mem_history_end)`` whose token equals ``MEM``.
+        mem_store_positions: optional per-row list of tracked MEM marker
+            positions. Mirrors ``NeuralVMEmbedding.set_mem_store_positions``.
+        mem_addr_src_positions: optional per-row subset of
+            ``mem_store_positions`` that should also receive MEM_ADDR_SRC=1.
+            When ``None`` every tracked store row receives both flags.
+
+    Returns:
+        ``(B, T, d_model)`` augmented residual stream.
+    """
+
+    import torch.nn.functional as F
+
+    if embeddings.dim() != 3:
+        raise ValueError(
+            f"embeddings must be (B, T, d_model); got {tuple(embeddings.shape)}"
+        )
+    if input_ids.dim() != 2:
+        raise ValueError(
+            f"input_ids must be (B, T); got {tuple(input_ids.shape)}"
+        )
+    if embeddings.shape[:2] != input_ids.shape:
+        raise ValueError(
+            f"embeddings/input_ids shape mismatch: {tuple(embeddings.shape[:2])} "
+            f"vs {tuple(input_ids.shape)}"
+        )
+
+    x = embeddings.clone()
+    B, S = input_ids.shape
+    device = x.device
+    dtype = x.dtype
+
+    # --- ADDR_KEY scatter -------------------------------------------------
+    if addr_key_idx is not None and addr_key_width > 0:
+        BYTES_PER_INSTR = int(instr_width)
+        DATA_BYTES = int(data_bytes)
+        pos = torch.arange(S, device=device, dtype=torch.long)
+        seq_pos = pos - 1
+        byte_offset = seq_pos % BYTES_PER_INSTR
+        instr_idx = seq_pos // BYTES_PER_INSTR
+        addr = instr_idx * int(instr_width) + int(pc_offset) + byte_offset
+
+        pos_valid = (seq_pos >= 0) & (byte_offset < DATA_BYTES)
+
+        # CODE_END detector: a position is "before the first CODE_END" iff
+        # the cumulative count of CODE_END tokens up to and including that
+        # position is zero. Per-batch.
+        is_code_end = (input_ids == int(code_end_token_id)).to(torch.long)
+        before_code_end = (is_code_end.cumsum(dim=1) == 0)
+        mask = before_code_end & pos_valid.unsqueeze(0)
+        mask_f = mask.to(dtype).unsqueeze(-1)
+
+        # Three nibble one-hots. ``clamp`` mirrors the embed code's defensive
+        # guard so F.one_hot never sees an out-of-range index on the i==0
+        # row that the mask gates to zero anyway.
+        lo = (addr % 16).clamp(min=0, max=15)
+        hi = ((addr // 16) % 16).clamp(min=0, max=15)
+        top = ((addr // 256) % 16).clamp(min=0, max=15)
+        oh_lo = F.one_hot(lo, num_classes=16).to(dtype)
+        oh_hi = F.one_hot(hi, num_classes=16).to(dtype)
+        oh_top = F.one_hot(top, num_classes=16).to(dtype)
+        enc = torch.cat([oh_lo, oh_hi, oh_top], dim=-1)  # [S, 48]
+
+        gated = enc.unsqueeze(0) * mask_f
+        ak = int(addr_key_idx)
+        x[:, :, ak:ak + int(addr_key_width)].add_(gated)
+
+    # --- MEM_STORE / MEM_ADDR_SRC scatter ---------------------------------
+    if mem_store_idx is None and mem_addr_src_idx is None:
+        return x
+
+    rows: List[int] = []
+    cols: List[int] = []
+    addr_src_flags: List[int] = []
+
+    if mem_store_positions is not None:
+        for b in range(min(B, len(mem_store_positions))):
+            row_positions = mem_store_positions[b]
+            if not row_positions:
+                continue
+            if (
+                mem_addr_src_positions is not None
+                and b < len(mem_addr_src_positions)
+            ):
+                addr_src_row = frozenset(int(p) for p in mem_addr_src_positions[b])
+                addr_src_row_is_subset = True
+            else:
+                addr_src_row = None
+                addr_src_row_is_subset = False
+            for pos_i in row_positions:
+                pos_i = int(pos_i)
+                if not (0 <= pos_i < S):
+                    continue
+                rows.append(b)
+                cols.append(pos_i)
+                if not addr_src_row_is_subset:
+                    addr_src_flags.append(1)
+                elif pos_i in addr_src_row:
+                    addr_src_flags.append(1)
+                else:
+                    addr_src_flags.append(0)
+
+    if mem_history_end > 0:
+        limit = min(int(mem_history_end), S)
+        for b in range(B):
+            for i in range(0, limit):
+                rows.append(b)
+                cols.append(i)
+                addr_src_flags.append(1)
+
+    if not rows:
+        return x
+
+    row_idx = torch.tensor(rows, dtype=torch.long, device=device)
+    col_idx = torch.tensor(cols, dtype=torch.long, device=device)
+    addr_src_mask = torch.tensor(addr_src_flags, dtype=torch.bool, device=device)
+
+    gathered = input_ids[row_idx, col_idx]
+    is_mem = gathered == int(mem_token_id)
+    if not bool(is_mem.any()):
+        return x
+
+    keep_row = row_idx[is_mem]
+    keep_col = col_idx[is_mem]
+    keep_addr_src = addr_src_mask[is_mem]
+
+    ones = torch.ones(keep_row.shape[0], device=device, dtype=dtype)
+
+    if mem_store_idx is not None:
+        x.index_put_(
+            (keep_row, keep_col, torch.full_like(keep_row, int(mem_store_idx))),
+            ones,
+        )
+    if mem_addr_src_idx is not None and bool(keep_addr_src.any()):
+        sub_row = keep_row[keep_addr_src]
+        sub_col = keep_col[keep_addr_src]
+        sub_ones = ones[: sub_row.shape[0]]
+        x.index_put_(
+            (sub_row, sub_col, torch.full_like(sub_row, int(mem_addr_src_idx))),
+            sub_ones,
+        )
+
+    return x
+
+
+class NeuralVMEmbeddingWrapper(nn.Module):
+    """Module wrapper that re-applies NeuralVMEmbedding augmentations on Qwen.
+
+    Wraps an ``nn.Embedding`` (typically the exported
+    ``model.embed_tokens``) and adds the ADDR_KEY / MEM_STORE augmentations
+    that ``NeuralVMEmbedding.forward`` runs in the native VM. The MEM_STORE
+    state — ``mem_history_end``, ``mem_store_positions``,
+    ``mem_addr_src_positions`` — is mutable via the same ``set_*`` setters
+    the native embedding exposes so callers can drop this in front of a
+    Qwen3 ``model.embed_tokens`` without changing their step-loop wiring.
+
+    Construct directly with the relevant dim positions, or use
+    :meth:`from_config` to build it from an exported
+    :class:`Qwen3DenseConfig` (round-trips via ``config.json``).
+    """
+
+    def __init__(
+        self,
+        embed: nn.Embedding,
+        *,
+        addr_key_idx: Optional[int],
+        addr_key_width: int = 48,
+        mem_store_idx: Optional[int] = None,
+        mem_addr_src_idx: Optional[int] = None,
+        code_end_token_id: int = 265,
+        mem_token_id: int = 261,
+        pc_offset: int = 2,
+        instr_width: int = 8,
+        data_bytes: int = 5,
+    ) -> None:
+        super().__init__()
+        self.embed = embed
+        self.addr_key_idx = addr_key_idx
+        self.addr_key_width = int(addr_key_width)
+        self.mem_store_idx = mem_store_idx
+        self.mem_addr_src_idx = mem_addr_src_idx
+        self.code_end_token_id = int(code_end_token_id)
+        self.mem_token_id = int(mem_token_id)
+        self.pc_offset = int(pc_offset)
+        self.instr_width = int(instr_width)
+        self.data_bytes = int(data_bytes)
+
+        # Mirror NeuralVMEmbedding's mutable runtime state. Setters below
+        # match the native API so callers can swap in this module without
+        # touching their KV-cache eviction code path.
+        self._mem_history_end: int = 0
+        self._mem_store_positions: Optional[List[List[int]]] = None
+        self._mem_addr_src_positions: Optional[List[List[int]]] = None
+
+    @classmethod
+    def from_config(
+        cls,
+        embed: nn.Embedding,
+        config: Mapping[str, Any],
+    ) -> "NeuralVMEmbeddingWrapper":
+        """Construct from an exported ``config.json`` dict (or ``Qwen3DenseConfig``)."""
+
+        if hasattr(config, "__dataclass_fields__"):
+            cfg = asdict(config)
+        else:
+            cfg = dict(config)
+        return cls(
+            embed,
+            addr_key_idx=cfg.get("c4_addr_key_idx"),
+            addr_key_width=int(cfg.get("c4_addr_key_width", 48)),
+            mem_store_idx=cfg.get("c4_mem_store_idx"),
+            mem_addr_src_idx=cfg.get("c4_mem_addr_src_idx"),
+            code_end_token_id=int(cfg.get("c4_code_end_token_id", 265)),
+            mem_token_id=int(cfg.get("c4_mem_token_id", 261)),
+            pc_offset=int(cfg.get("c4_addr_key_pc_offset", 2)),
+            instr_width=int(cfg.get("c4_addr_key_instr_width", 8)),
+            data_bytes=int(cfg.get("c4_addr_key_data_bytes", 5)),
+        )
+
+    def set_mem_history_end(self, end: int) -> None:
+        self._mem_history_end = int(end)
+
+    def set_mem_store_positions(self, positions: Optional[List[List[int]]]) -> None:
+        self._mem_store_positions = positions
+
+    def set_mem_addr_src_positions(
+        self, positions: Optional[List[List[int]]]
+    ) -> None:
+        self._mem_addr_src_positions = positions
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        base = self.embed(input_ids)
+        return apply_neural_vm_embedding_augmentations(
+            base,
+            input_ids,
+            addr_key_idx=self.addr_key_idx,
+            addr_key_width=self.addr_key_width,
+            mem_store_idx=self.mem_store_idx,
+            mem_addr_src_idx=self.mem_addr_src_idx,
+            code_end_token_id=self.code_end_token_id,
+            mem_token_id=self.mem_token_id,
+            pc_offset=self.pc_offset,
+            instr_width=self.instr_width,
+            data_bytes=self.data_bytes,
+            mem_history_end=self._mem_history_end,
+            mem_store_positions=self._mem_store_positions,
+            mem_addr_src_positions=self._mem_addr_src_positions,
+        )
 
 
 def _maybe_flatten_post_ops(model: Any) -> Tuple[bool, Optional[str]]:
@@ -1533,6 +1903,8 @@ __all__ = [
     "PostOpsFlatteningReport",
     "alibi_to_rope_export",
     "AlibiToRopeReport",
+    "apply_neural_vm_embedding_augmentations",
+    "NeuralVMEmbeddingWrapper",
 ]
 
 
