@@ -507,6 +507,12 @@ class Qwen3DenseConfig:
     c4_norm_compensator_idx: Optional[int] = None
     c4_bias_compensator_idx: Optional[int] = None
     c4_softmax_sink_added: bool = True
+    # ID of the reserved sink-token in the exported vocab. The inference
+    # caller must prepend this token at position 0 of every input_ids
+    # sequence so the K=0/V=0 sink position is materialised and standard
+    # softmax over (sink + real) reproduces softmax1 over real positions.
+    # See Blocker 2 in QWEN_R8_E2E_2026_06_07.md and R3 prototype.
+    c4_softmax_sink_token_id: Optional[int] = None
     c4_post_ops_flattened: bool = False
     c4_post_ops_flatten_skipped_reason: Optional[str] = None
 
@@ -531,8 +537,17 @@ def _build_qwen3_dense_config(model: Any, *, K: float) -> Qwen3DenseConfig:
         except Exception:  # pragma: no cover - exotic dim registries
             dim_positions = {}
 
+    # R3 sink: reserve one extra vocab slot (the original ``vocab_size``)
+    # for the softmax-sink token. Its embedding row is zero, so K=V=0 for
+    # the sink position and standard softmax over (sink + real) reproduces
+    # softmax1 over the real positions. The exported ``vocab_size`` is the
+    # VM's vocab_size + 1.
+    base_vocab_size = int(getattr(model, "vocab_size"))
+    sink_token_id = base_vocab_size  # zero-indexed, sits past the VM vocab
+    exported_vocab_size = base_vocab_size + 1
+
     return Qwen3DenseConfig(
-        vocab_size=int(getattr(model, "vocab_size")),
+        vocab_size=exported_vocab_size,
         hidden_size=d_model,
         intermediate_size=intermediate_size,
         num_hidden_layers=len(blocks),
@@ -545,6 +560,7 @@ def _build_qwen3_dense_config(model: Any, *, K: float) -> Qwen3DenseConfig:
         c4_norm_compensator_K=float(K),
         c4_norm_compensator_idx=dim_positions.get("NORM_COMPENSATOR"),
         c4_bias_compensator_idx=dim_positions.get("CONST"),
+        c4_softmax_sink_token_id=sink_token_id,
     )
 
 
@@ -639,22 +655,58 @@ def _add_softmax_sink_to_kv(
     W_k: torch.Tensor,
     W_v: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Augment K/V projections so standard softmax replicates softmax1.
+    """Return K/V projection weights unchanged.
 
-    Per R3: a virtual key/value position with ``K_sink = 0`` and ``V_sink = 0``
-    causes ``softmax`` over the augmented sequence to equal ``softmax1`` on
-    the real positions. The sink is introduced via a column on K/V projection
-    weights that zero-projects the residual stream; the actual prepended
-    position is materialised at inference time via ``position_ids`` shifting.
+    The softmax-sink is realised as a reserved sink-token id whose embedding
+    row in ``model.embed_tokens.weight`` is zero. Since Qwen3 dense has
+    ``attention_bias=False`` (no bias on ``k_proj`` / ``v_proj``), the linear
+    projection of a zero residual is zero, so the sink position contributes
+    ``K = V = 0`` to attention. Standard softmax over (sink + real
+    positions) then reproduces softmax1 over the real positions (R3 math).
 
-    For the export we keep the projection weights unchanged (the sink is a
-    sequence-level prepend, not a projection-row modification) — but we
-    return the tensors here so callers can swap to a future projection-row
-    based sink if the inference path needs one. Returning copies keeps the
-    function side-effect free.
+    The K/V projection weights themselves do NOT need patching: see
+    :func:`prepend_softmax_sink` for the inference-time helper that
+    materialises the sink position by prepending the reserved token to
+    ``input_ids``.
     """
 
     return W_k.clone(), W_v.clone()
+
+
+def prepend_softmax_sink(
+    input_ids: torch.Tensor,
+    sink_token_id: int,
+) -> torch.Tensor:
+    """Prepend the reserved sink-token to ``input_ids`` along the seq dim.
+
+    R3 / Blocker 2 wiring: standard softmax over a sequence whose first
+    K/V entries are zero is identical to softmax1 over the remaining
+    (real) positions. The exported model reserves
+    ``c4_softmax_sink_token_id`` (= original ``vocab_size``) with a
+    zero embedding row, so prepending that id to ``input_ids`` injects
+    the K=0 / V=0 sink position automatically.
+
+    Args:
+        input_ids: ``(B, T)`` long tensor of token ids.
+        sink_token_id: ``cfg.c4_softmax_sink_token_id`` from the exported
+            config.
+
+    Returns:
+        ``(B, T + 1)`` long tensor with ``sink_token_id`` at column 0.
+    """
+
+    if input_ids.dim() != 2:
+        raise ValueError(
+            f"prepend_softmax_sink expects (B, T) input_ids, got shape "
+            f"{tuple(input_ids.shape)}"
+        )
+    sink_col = torch.full(
+        (input_ids.shape[0], 1),
+        int(sink_token_id),
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    return torch.cat([sink_col, input_ids], dim=1)
 
 
 def _maybe_flatten_post_ops(model: Any) -> Tuple[bool, Optional[str]]:
@@ -696,8 +748,19 @@ def _build_export_state_dict(
     K: float,
     norm_compensator_idx: int,
     bias_compensator_idx: Optional[int],
+    sink_token_id: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Assemble the HuggingFace-style state_dict for ``Qwen3ForCausalLM``."""
+    """Assemble the HuggingFace-style state_dict for ``Qwen3ForCausalLM``.
+
+    When ``sink_token_id`` is provided (R3 softmax-sink wiring), the
+    exported embedding table and LM head are extended by one row whose
+    embedding values are all zero. Loaders that prepend the sink token
+    at inference time (see :func:`prepend_softmax_sink`) will then see
+    K = V = 0 at the sink position because Qwen3 dense has
+    ``attention_bias=False`` — zero residual times any weight + zero
+    bias is still zero. The lm_head row for the sink id is also zero
+    so the model can never *predict* the sink token.
+    """
 
     state: Dict[str, torch.Tensor] = {}
     blocks = _blocks(model)
@@ -707,9 +770,28 @@ def _build_export_state_dict(
             return t.to_dense()
         return t
 
+    def _append_zero_row(t: torch.Tensor) -> torch.Tensor:
+        """Append a single zero row along dim=0."""
+
+        zero_row = torch.zeros(
+            (1, t.shape[1]), dtype=t.dtype, device=t.device
+        )
+        return torch.cat([t, zero_row], dim=0).contiguous()
+
     # 1. Token embedding. The R1 bake already pinned the NORM_COMPENSATOR
-    #    column at K, so a straight copy preserves the invariant.
+    #    column at K, so a straight copy preserves the invariant. R3 then
+    #    appends one zero row as the sink-token embedding (k_proj/v_proj
+    #    have no bias, so K=V=0 at that position).
     embed_weight = _to_dense(model.embed.embed.weight.data).clone().float()
+    if sink_token_id is not None:
+        expected_id = embed_weight.shape[0]
+        if sink_token_id != expected_id:
+            raise RuntimeError(
+                f"sink_token_id={sink_token_id} must equal the original "
+                f"vocab_size ({expected_id}); the sink row is appended "
+                f"past the last VM token."
+            )
+        embed_weight = _append_zero_row(embed_weight)
     state["model.embed_tokens.weight"] = embed_weight
 
     # 2. Per-block weights.
@@ -762,11 +844,19 @@ def _build_export_state_dict(
     # 3. Final RMSNorm and LM head.
     state["model.norm.weight"] = rms_identity_gamma.clone()
     head_weight = _to_dense(model.head.weight.data).clone().float()
+    if sink_token_id is not None:
+        head_weight = _append_zero_row(head_weight)
     state["lm_head.weight"] = head_weight
 
     # NORM_COMPENSATOR sanity: the column we serialised on the embedding
-    # should still be K. Cheap correctness check at export time.
-    actual = state["model.embed_tokens.weight"][:, norm_compensator_idx]
+    # should still be K on every real-token row. The appended sink row
+    # is zero by construction; verify only the real-token rows here.
+    real_rows = (
+        embed_weight.shape[0] - 1
+        if sink_token_id is not None
+        else embed_weight.shape[0]
+    )
+    actual = state["model.embed_tokens.weight"][:real_rows, norm_compensator_idx]
     if not torch.allclose(actual, torch.full_like(actual, float(K)), atol=1e-3):
         raise RuntimeError(
             f"NORM_COMPENSATOR column was clobbered during export "
@@ -875,6 +965,7 @@ def export_qwen3_dense(
         K=K,
         norm_compensator_idx=norm_idx,
         bias_compensator_idx=cfg.c4_bias_compensator_idx,
+        sink_token_id=cfg.c4_softmax_sink_token_id,
     )
 
     # 4. Persist artefacts.
@@ -905,6 +996,7 @@ __all__ = [
     "build_qwen2_dense_mapping_plan",
     "analyze_qwen_compatibility",
     "export_qwen3_dense",
+    "prepend_softmax_sink",
     "flatten_post_ops_for_qwen_export",
     "count_post_ops",
     "expanded_qwen_layer_count",

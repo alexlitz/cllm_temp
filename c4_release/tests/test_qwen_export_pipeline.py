@@ -113,7 +113,9 @@ def test_config_json_has_qwen3_architecture_fields():
 
     assert cfg["architectures"] == ["Qwen3ForCausalLM"]
     assert cfg["model_type"] == "qwen3"
-    assert cfg["vocab_size"] == 276
+    # R3 reserves a sink token at the original vocab_size, so the
+    # exported vocab is 276 + 1.
+    assert cfg["vocab_size"] == 277
     assert cfg["hidden_size"] == 32
     assert cfg["intermediate_size"] == 64
     assert cfg["num_hidden_layers"] == 2
@@ -125,6 +127,9 @@ def test_config_json_has_qwen3_architecture_fields():
     assert cfg["c4_norm_compensator_K"] == NORM_COMPENSATOR_K
     assert cfg["c4_norm_compensator_idx"] == 0
     assert cfg["c4_bias_compensator_idx"] == 1
+    # R3 softmax sink: reserved token id sits past the original vocab.
+    assert cfg["c4_softmax_sink_added"] is True
+    assert cfg["c4_softmax_sink_token_id"] == 276
     # R5 isn't on main → expect the graceful skip.
     assert cfg["c4_post_ops_flattened"] is False
 
@@ -174,12 +179,22 @@ def test_norm_compensator_row_preserved_in_embedding():
             weights_only=True,
         )
 
-    col = sd["model.embed_tokens.weight"][:, 0]
+    # The exported embedding has the original VM rows plus a zero sink
+    # row at the end (R3). The R1 invariant only applies to the real-token
+    # rows.
+    col = sd["model.embed_tokens.weight"][:-1, 0]
     assert torch.allclose(
         col, torch.full_like(col, NORM_COMPENSATOR_K), atol=1e-3
     ), (
-        f"NORM_COMPENSATOR column drift: range "
+        f"NORM_COMPENSATOR column drift on real-token rows: range "
         f"[{float(col.min())}, {float(col.max())}]"
+    )
+    # The sink row itself must be all zeros so K = V = 0 at the sink
+    # position when k_proj/v_proj (bias-free) operate on it.
+    sink_row = sd["model.embed_tokens.weight"][-1, :]
+    assert torch.all(sink_row == 0), (
+        f"softmax-sink embedding row must be all zeros so K = V = 0; "
+        f"got max abs={float(sink_row.abs().max())}"
     )
 
 
