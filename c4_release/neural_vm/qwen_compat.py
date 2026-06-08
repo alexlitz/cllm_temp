@@ -751,7 +751,14 @@ def _build_qwen3_dense_config(model: Any, *, K: float) -> Qwen3DenseConfig:
     d_model = int(getattr(model, "d_model", getattr(attn, "dim", 0)))
     n_heads = int(getattr(attn, "num_heads", 1))
     head_dim = d_model // n_heads if n_heads else 0
-    intermediate_size = ffn_dims[0] if ffn_dims else 0
+    # Qwen3 dense requires a uniform ``intermediate_size`` across all layers.
+    # The VM has heterogeneous PureFFN widths (production model: widths in
+    # {1, 7, 8, 42, 64, 192, 512, 792, 1536, 1846, 1890, 2059, 3405, 4096}).
+    # ``_build_export_state_dict`` zero-pads every block to ``max(ffn_dims)``,
+    # so the config must match — otherwise ``torch.save`` records tensor
+    # shapes that disagree with the config's ``intermediate_size`` and the
+    # ZIP record layout drifts (observed: ``unexpected pos N vs M``).
+    intermediate_size = max(ffn_dims) if ffn_dims else 0
     dim_positions = getattr(model, "dim_positions", {}) or {}
     if not isinstance(dim_positions, dict):
         # ``_SetDim`` fallback uses ``__getitem__``; coerce to a plain dict via
