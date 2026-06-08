@@ -340,6 +340,8 @@ def make_layer7_memory_heads_op() -> Operation:
     _claims.add((7, "attn_W_v", "5_11", "OP_SC+0"))
     _claims.add((7, "attn_W_v", "5_12", "OP_ADD+0"))
     _claims.add((7, "attn_W_v", "5_13", "OP_SUB+0"))
+    # Wave 1 Cluster B1 (2026-06-07): OP_ENT relay at head 5 V slot 14.
+    _claims.add((7, "attn_W_v", "5_14", "OP_ENT+0"))
     # Head 7 MEM flag broadcast.
     _claims.add((7, "attn_W_v", "7_1", "MEM_STORE+0"))
     _claims.add((7, "attn_W_v", "7_2", "MEM_ADDR_SRC+0"))
@@ -558,6 +560,12 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
                 AP(11, BD.OP_SC, 0.2),
                 AP(12, BD.OP_ADD, 0.2),
                 AP(13, BD.OP_SUB, 0.2),
+                # Wave 1 Cluster B1 (2026-06-07): broadcast OP_ENT to AX
+                # byte positions so ``layer14_ent_ax_bytes_zero`` can fire
+                # at AX bytes 1-3 and restore the C4 8-bit-AX invariant
+                # at ENT step 0. Mirrors the OP_JSR slot 8 pattern (V->O
+                # routes the opcode flag onto itself with a +5.0 scale).
+                AP(14, BD.OP_ENT, 0.2),
             ),
             o=(
                 AO(BD.OP_LI_RELAY, 1, 1.0),
@@ -573,6 +581,10 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
                 AO(BD.OP_SC, 11, 5.0),
                 AO(BD.TEMP + 8, 12, 1.0),
                 AO(BD.TEMP + 9, 13, 1.0),
+                # Wave 1 Cluster B1 (2026-06-07): OP_ENT -> OP_ENT relay
+                # broadcast at AX byte positions 1-3. Scale 5.0 mirrors
+                # the OP_JSR slot-8 relay.
+                AO(BD.OP_ENT, 14, 5.0),
             ),
         )
     )

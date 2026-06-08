@@ -123,6 +123,16 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     "layer14_jsr_ax_bytes_zero":             (None,    4),
     "layer14_lc_ax_bytes_zero":              (None,    4),
     "layer14_alu_nocarry_ax_bytes_zero":     (None,    4),
+    # ENT AX bytes 1-3 zeroing (Wave 1 Cluster B1, 2026-06-07): per C4's
+    # 8-bit-AX-with-32-bit-register convention, AX bytes 1-3 must be 0
+    # at every step. At ENT step 0, the model leaks SP byte 0 (0xE8)
+    # into AX bytes 1-3, producing AX=0xE8E8E800 and breaking
+    # ``test_lea_basic`` (program ``ENT, IMM 0, LEA 2, EXIT`` halts with
+    # exit_code=0 instead of the LEA-computed non-zero address). Mirrors
+    # ``layer14_jsr_ax_bytes_zero`` but gates on ``OP_ENT`` (relayed by
+    # L7 head 7 V slot 4) instead of ``OP_JSR``. Runs after
+    # ``layer14_alu_nocarry_ax_bytes_zero`` in the cleanup chain.
+    "layer14_ent_ax_bytes_zero":             (None,    4),
     # Phase 6 Wave 7 demo: pure-declaration corrective op. The op's single
     # rule is byte-identically a no-op on the live corpus -- it carries the
     # impossible condition ``CONST=-100`` so SiLU collapses to 0 and the
@@ -2385,6 +2395,133 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
     )
 
 
+# === L14 ENT AX bytes 1-3 zero (Wave 1 Cluster B1, 2026-06-07) ===========
+
+
+def _layer14_ent_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program: zero AX bytes 1-3 when OP_ENT is broadcast.
+
+    Mirrors :func:`_layer14_jsr_ax_bytes_zero_rules` but gates on
+    ``OP_ENT`` instead of ``OP_JSR``. The OP_ENT flag is broadcast by L7
+    head 7 V slot 4 (see ``layer7_memory_heads`` claims) so OP_ENT is
+    present at AX byte positions (IS_BYTE + H1[AX]) within the ENT step.
+    At those positions, the four units spread -3/S across one nibble
+    band (LO or HI) or boost a single byte-value-0 slot (+5/S on
+    OUTPUT_LO[0] / OUTPUT_HI[0]). The byte-value-0 token then wins
+    argmax -> AX bytes 1-3 = 0x00.
+
+    Pre-fix observed token stream for ``ENT, IMM 0, LEA 2, EXIT``:
+    step 0 emits ``REG_AX 0x00 0xE8 0xE8 0xE8`` (SP byte 0 leak); after
+    fix the trailing 0xE8 bytes are pulled to 0x00, restoring the C4
+    AX-byte-1..3 invariant and unblocking the LEA address path.
+    """
+    AX_I = 1
+    common_conditions = (
+        ("IS_BYTE", 1.0),
+        (f"H1+{AX_I}", 1.0),
+    )
+    # Resolve the OP_ENT gate via the (opcode_flag, "ENT") semantic pair;
+    # byte-identical to the raw "OP_ENT" slot string via DimRef.parse.
+    gate_ent = dim_ref("opcode_flag", "ENT")
+    common_kwargs = dict(
+        conditions=common_conditions,
+        threshold=1.5,
+        gate=gate_ent,
+        gate_weight=1.0,
+        gate_bias=0.0,
+        scope="OP_ENT and IS_BYTE and H1+1",
+    )
+    rules = (
+        multi_way_and_rule(
+            name="l14_ent_ax_bytes_zero_lo_neg",
+            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
+            **common_kwargs,
+        ),
+        multi_way_and_rule(
+            name="l14_ent_ax_bytes_zero_hi_neg",
+            writes=tuple(
+                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
+            ),
+            **common_kwargs,
+        ),
+        multi_way_and_rule(
+            name="l14_ent_ax_bytes_zero_lo0_boost",
+            writes=(("OUTPUT_LO+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+        multi_way_and_rule(
+            name="l14_ent_ax_bytes_zero_hi0_boost",
+            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
+            **common_kwargs,
+        ),
+    )
+    return rules
+
+
+def _layer14_ent_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_ent_ax_bytes_zero_rules(S))
+    return ir
+
+
+def make_layer14_ent_ax_bytes_zero_op() -> Operation:
+    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_ENT is active.
+
+    Wave 1 Cluster B1 (2026-06-07): fixes ``test_lea_basic``. Per C4's
+    8-bit-AX-with-32-bit-register convention, AX bytes 1-3 must be 0.
+    At ENT step 0, the model leaks SP byte 0 (0xE8 from the ENT-pushed
+    frame) into AX byte positions 1-3, producing AX=0xE8E8E800. The
+    LEA step downstream depends on a clean AX (and a clean BP, which is
+    cascaded from AX); the leak collapses LEA to AX=0x00 instead of
+    BP + imm, and ``test_lea_basic`` (program
+    ``[ENT, IMM 0, LEA 2, EXIT]``, expects AX != 0) fails with
+    exit_code=0.
+
+    Mirrors :func:`make_layer14_jsr_ax_bytes_zero_op` and the LC / ALU
+    nocarry variants: gates on ``OP_ENT`` (broadcast by L7 head 7 V slot
+    4) at AX byte positions (IS_BYTE + H1[AX]). Four units zero
+    OUTPUT_LO/OUTPUT_HI nibble dims (-3/S each) and boost the byte-0
+    slot (+5/S on OUTPUT_LO[0] / OUTPUT_HI[0]).
+
+    Pinned to ``layer_idx=14`` via ``kind="block"``. Runs after
+    ``layer14_alu_nocarry_ax_bytes_zero`` in the L14 cleanup chain. Uses
+    auto-fit allocation via :func:`_l14_chain_alloc`.
+    """
+    def bake(block, dim_positions, S):
+        ffn = block.ffn
+        start_unit = _l14_chain_alloc("layer14_ent_ax_bytes_zero")
+        ir = _layer14_ent_ax_bytes_zero_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
+        )
+        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_ent_ax_bytes_zero",
+        # Same FFN unit range share as the sibling cleanup ops: this op
+        # owns 4 units past the alu_nocarry tail; demo_phase6_wave7 sits
+        # past it. See docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
+        slot_share=("ffn_units",),
+        reads={"OP_ENT", "IS_BYTE", "H1", "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir=_layer14_ent_ax_bytes_zero_ir(),
+        declarative_authority="spec_generated",
+        target_op_name="layer14_mem_generation",
+        migrated=True,
+        requires={"after": "layer14_mem_generation"},
+        smoke_tests={"TestSmokeAddress::test_lea_basic"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
 # === L14 Phase 6 Wave 7 demo: pure-declaration corrective op =============
 #
 # A minimal demonstration of the declarative IR vision: adding a fix is one
@@ -2532,14 +2669,16 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
             "layer14_alu_nocarry_ax_bytes_zero",
             "layer14_mem_generation",
         ]},
-        # New chain tail: prior ops fill [0, 1886), the demo's auto-fit
-        # picks unit 1886 (single-unit rule), so the cumulative max is 1887.
+        # New chain tail: prior ops fill [0, 1890), the demo's auto-fit
+        # picks unit 1890 (single-unit rule), so the cumulative max is 1891.
         # Var-cluster JSR-path follow-up (2026-06-06) added units between
         # ``mem_addr_src_default_suppress`` and ``addr_key_neural_decode``
         # (``jsr_mem_default_suppress``); the same-day narrowing reduced
-        # that from 8 to 4, so prior chain total moved 1882 → 1886 →
-        # demo lands at 1886 → tail = 1887.
-        ffn_units_used=1887,
+        # that from 8 to 4. Wave 1 Cluster B1 (2026-06-07) added
+        # ``layer14_ent_ax_bytes_zero`` (4 units) after
+        # ``alu_nocarry_ax_bytes_zero``, shifting demo from 1886 to 1890
+        # → tail = 1891.
+        ffn_units_used=1891,
         smoke_tests=set(),
         spec_section="docs/HOW_TO_ADD_A_CORRECTIVE_OP.md",
     )

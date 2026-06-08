@@ -352,6 +352,14 @@ def all_core_ops(
         # in the same commit). Backup for the L10 BinaryOpByteZeroingPostOp
         # against downstream L11-L14 contamination.
         make_layer14_alu_nocarry_ax_bytes_zero_op(),
+        # ENT AX bytes 1-3 zeroing (Wave 1 Cluster B1, 2026-06-07): fixes
+        # ``test_lea_basic`` by restoring AX bytes 1-3 = 0 at ENT step 0.
+        # Without this op the model emits AX=0xE8E8E800 at the ENT step
+        # (SP byte 0 leaks into AX bytes 1-3), corrupting the downstream
+        # BP frame and collapsing LEA to AX=0 instead of BP+imm.
+        # Mirrors the JSR / LC / nocarry-ALU variants above; gates on
+        # OP_ENT (broadcast by L7 head 7 V slot 4).
+        make_layer14_ent_ax_bytes_zero_op(),
         # Phase 6 Wave 7 demo: pure-declaration corrective op. One
         # ``FFNRule`` + ``pin=None`` auto-fit + slim ``bake_fn`` wrapper.
         # Byte-identically a no-op on the live corpus -- the demo proves
