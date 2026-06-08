@@ -1,0 +1,1587 @@
+{
+  "exit_code": 42,
+  "target_fwd": 6,
+  "mark_pc_pos": 44,
+  "mark_ax_pos": 49,
+  "findings": [
+    {
+      "stage": "L0_pre_attn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L0_pre_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L0_post_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L1_pre_attn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L1_pre_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L1_post_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L2_pre_attn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L2_pre_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L2_post_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L3_pre_attn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L3_pre_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L3_post_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L4_pre_attn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L4_pre_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L4_post_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 3,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 6,
+        "hi_peak_val": 2.556,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {
+          "1": 1.0,
+          "6": 2.556
+        }
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L5_pre_attn",
+      "mark_pc_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 3,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 6,
+        "hi_peak_val": 2.556,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {
+          "1": 1.0,
+          "6": 2.556
+        }
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L5_pre_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 1.0,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 1.0,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 5,
+        "lo_peak_val": 40.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "5": 40.0
+        },
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 40.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {
+          "1": 1.0,
+          "5": 40.0,
+          "6": 2.556
+        }
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L5_post_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 1.0,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 1.0,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 5,
+        "lo_peak_val": 40.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "5": 40.0
+        },
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 40.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {
+          "1": 1.0,
+          "5": 40.0,
+          "6": 2.556
+        }
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L6_pre_attn",
+      "mark_pc_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 1.0,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 1.0,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 1.0
+        },
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 5,
+        "lo_peak_val": 40.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "5": 40.0
+        },
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 40.0,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {
+          "1": 1.0,
+          "5": 40.0,
+          "6": 2.556
+        }
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {}
+      }
+    },
+    {
+      "stage": "L6_pre_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 1.616,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 1.616
+        },
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 2.0,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 2.0
+        },
+        "hi": {}
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 5,
+        "lo_peak_val": 64.639,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "5": 64.639
+        },
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 5,
+        "lo_peak_val": 40.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "5": 40.0
+        },
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 64.639,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {
+          "1": 1.616,
+          "5": 64.639,
+          "6": 4.131
+        }
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 40.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {
+          "1": 1.0,
+          "5": 40.0,
+          "6": 2.556
+        }
+      }
+    },
+    {
+      "stage": "L6_post_ffn",
+      "mark_pc_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 1.616,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 1.616
+        },
+        "hi": {}
+      },
+      "mark_ax_temp": {
+        "lo_peak": 10,
+        "lo_peak_val": 2.0,
+        "hi_peak": 9,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "10": 2.0
+        },
+        "hi": {
+          "11": -2.0
+        }
+      },
+      "mark_pc_fetch": {
+        "lo_peak": 5,
+        "lo_peak_val": 64.639,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "5": 64.639
+        },
+        "hi": {}
+      },
+      "mark_ax_fetch": {
+        "lo_peak": 5,
+        "lo_peak_val": 40.0,
+        "hi_peak": 0,
+        "hi_peak_val": 0.0,
+        "lo": {
+          "5": 40.0
+        },
+        "hi": {}
+      },
+      "mark_pc_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_ax_embed": {
+        "lo_peak": 0,
+        "lo_peak_val": 0.0,
+        "hi_peak": 7,
+        "hi_peak_val": 0.0,
+        "lo": {},
+        "hi": {}
+      },
+      "mark_pc_cembd": {
+        "lo_peak": 3,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 64.639,
+        "lo": {
+          "3": 1.0,
+          "10": 1.0
+        },
+        "hi": {
+          "1": 1.616,
+          "5": 64.639,
+          "6": 4.131
+        }
+      },
+      "mark_ax_cembd": {
+        "lo_peak": 4,
+        "lo_peak_val": 1.0,
+        "hi_peak": 5,
+        "hi_peak_val": 40.0,
+        "lo": {
+          "4": 1.0,
+          "11": 1.0
+        },
+        "hi": {
+          "1": 1.0,
+          "5": 40.0,
+          "6": 2.556
+        }
+      }
+    }
+  ]
+}
