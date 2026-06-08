@@ -3102,18 +3102,19 @@ def make_layer6_relay_heads_op() -> Operation:
 
     return Operation(
         name="layer6_relay_heads",
-        # Head 7 LEV AX_CARRY refresh (pairs with L16's 3650e01) additionally
-        # reads STACK0_BYTE0 / CLEAN_EMBED_LO / CLEAN_EMBED_HI / OP_LEV at the
-        # K side and writes AX_CARRY_LO / AX_CARRY_HI at the MARK_AX query
-        # position; declare those so the LayerCompiler dep graph routes the
-        # producer before downstream consumers.
+        # 2026-06-07: head 7 LEV AX_CARRY refresh disabled (see head 7 spec
+        # comment in ``_layer6_relay_head_specs``).  STACK0_BYTE0 /
+        # CLEAN_EMBED_LO / CLEAN_EMBED_HI / OP_LEV reads and the
+        # AX_CARRY_LO / AX_CARRY_HI writes at MARK_AX that this anchor used
+        # to claim are no longer programmed by the relay-heads bake; dropping
+        # them from the topology anchor keeps the dep graph in sync with the
+        # current weight footprint.
         # Phase 8.A targeted: AX_CARRY_HI_PREV_STEP marks the L6 read as
         # cross-step relative to L8 writers. See layer6_attn for rationale.
         reads={"MARK_STACK0", "MARK_AX",
                "AX_CARRY_LO.*.-1", "AX_CARRY_HI.*.-1",
-               "STACK0_BYTE0", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-               "OP_LEV", "CONST"},
-        writes={"ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
+               "CONST"},
+        writes={"ALU_LO", "ALU_HI"},
         kind="attn",
         # phase=6 matches ``_layer6_attn_dep_anchor`` so the L6 attn
         # slot allocator co-locates this op via the same-phase share.
@@ -3337,8 +3338,9 @@ def _layer6_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
 
     Replaces the imperative ``_bake_layer6_relay_heads_spec`` body. Head 6
     is the opcode-flag broadcast + AX_CARRY_LO -> ALU_LO relay; head 7 is
-    the AX_CARRY_HI -> ALU_HI relay plus the post-LEV STACK0_BYTE0 ->
-    AX_CARRY refresh extension (see the LEV-refresh block below).
+    the AX_CARRY_HI -> ALU_HI relay.  The post-LEV STACK0_BYTE0 -> AX_CARRY
+    refresh that previously lived on head 7 is disabled as of 2026-06-07
+    (see the head 7 spec body for rationale).
     """
 
     L = 50.0
@@ -3421,66 +3423,45 @@ def _layer6_relay_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
         o=tuple(h6_o),
     ))
 
-    # Head 7: STACK0 reads AX_CARRY_HI from AX into ALU_HI plus the post-LEV
-    # AX_CARRY refresh extension.
+    # Head 7: STACK0 reads AX_CARRY_HI from AX into ALU_HI.
     #
-    # ---- LEV AX_CARRY refresh: post-LEV MARK_AX <- STACK0_byte0 CLEAN_EMBED
-    # Post-LEV (step 6 of a typical function-call sequence) the L8 ALU
-    # contract requires AX_CARRY_LO/HI at MARK_AX to hold the popped return
-    # value, which lives on the freed STACK0 saved-AX slot. No earlier layer
-    # populates it: L3 head 1 (legacy carry-forward) copies the *previous* AX
-    # byte 0 EMBED which during LEV is the callee's local AX, not the value
-    # just popped from STACK0. The 2026-06-01 stack/JSR/LEV triage attributes
-    # 91 rows of ``step6:AX_byte0`` corruption to this missing producer (see
-    # ``.agent-logs/stack_jsr_lev_triage_2026_06_01.md``).
+    # 2026-06-07 (this commit): the post-LEV AX_CARRY refresh that previously
+    # lived here (slot 1 + slots 2..17, 18, 49..63 writing
+    # CLEAN_EMBED_LO/HI -> AX_CARRY_LO/HI at MARK_AX gated on
+    # STACK0_BYTE0+OP_LEV) is DISABLED.  Rationale: c4 LEV semantics
+    # (symbolic_program.py::_op_lev) only restore SP/BP/PC -- AX is
+    # *preserved* through LEV by the C calling convention (the callee
+    # leaves the return value in AX before issuing LEV).  L3 head 1
+    # (carry_forward AX) already copies the previous-step AX byte 0 EMBED
+    # into AX_CARRY at MARK_AX, so for func_add(a,b)/func_identity(x)/etc.
+    # AX_CARRY at the LEV step naturally holds the callee's just-computed
+    # return value.
     #
-    # The companion L16 op ``layer16_lev_routing`` (commit 3650e01) added
-    # ``l16_lev_ax_carry_lo/hi_{k}`` FFN rules that gate on
-    # ``AX_CARRY_LO/HI+k`` and write OUTPUT_LO/HI at MARK_AX during OP_LEV --
-    # but those gates are silent unless something populates AX_CARRY_LO/HI
-    # first. This sub-pattern within head 7 provides that producer.
+    # The original refresh read STACK0_BYTE0 (the freed stack slot post-LEV)
+    # into AX_CARRY.  That slot's value is *not* the return value -- it is
+    # the most recently pushed caller-side word.  For func_identity_*(x)
+    # this coincidentally matches x (single arg pushed before JSR), which
+    # is why the 2026-06-01 triage (commits 3650e01/b882482e) appeared to
+    # recover ~141 rows.  But for func_add(a,b) it forces AX = b, producing
+    # the func_add(57,11) -> 11 symptom documented in
+    # docs/1096_ADD_HI_NIBBLE_PLUS_ONE_2026_06_07.md.  Disabling the
+    # refresh restores AX preservation through LEV.
     #
-    # Slot layout (head 7, head_dim 64; existing claims use slot 0 and
-    # 33..48):
-    #   slot 1               : LEV main gate (Q[MARK_AX]+Q[OP_LEV]-Q[CONST];
-    #                          K[STACK0_BYTE0])
-    #   slot 2 + k (k=0..15) : V[CLEAN_EMBED_LO+k] -> O[AX_CARRY_LO+k]
-    #   slot 18              : V[CLEAN_EMBED_HI+0] -> O[AX_CARRY_HI+0]
-    #   slot 49 + k (k=0..14): V[CLEAN_EMBED_HI+(1+k)] -> O[AX_CARRY_HI+(1+k)]
-    #
-    # Slot 1's K only matches STACK0_BYTE0 (not MARK_AX), so slot 1's
-    # contribution to the existing slot-0 MARK_STACK0->MARK_AX routing at
-    # query positions other than MARK_AX is zero. At MARK_AX during LEV the
-    # combined score for j=STACK0_BYTE0 wins by a wide margin over self-match
-    # and over arbitrary other positions.
-    LEV_GATE = 1
+    # L16's ``l16_lev_ax_carry_lo/hi_{k}`` rules
+    # (l16_ops.py:228-256) remain in place: they read AX_CARRY_LO/HI at
+    # MARK_AX during OP_LEV and write OUTPUT_LO/HI.  With L3 head 1 as the
+    # sole AX_CARRY producer, those L16 rules now propagate the correct
+    # callee AX (not STACK0_BYTE0) into OUTPUT at MARK_AX.
     h7_q: list = [
         AP(0, BD.MARK_STACK0, L + L * 20),
         AP(0, BD.MARK_AX, -L),
         AP(0, BD.CONST, -L * 20),
-        # Slot 1 Q/K gate: positive only at (MARK_AX + OP_LEV).
-        AP(LEV_GATE, BD.MARK_AX, L),
-        AP(LEV_GATE, BD.OP_LEV, L),
-        AP(LEV_GATE, BD.CONST, -L),
     ]
     h7_k: list = [
         AP(0, BD.MARK_AX, L),
-        AP(LEV_GATE, BD.STACK0_BYTE0, L),
     ]
     h7_v: list = []
     h7_o: list = []
-    # CLEAN_EMBED_LO -> AX_CARRY_LO at MARK_AX (slots 2..17).
-    for k in range(16):
-        h7_v.append(AP(2 + k, BD.CLEAN_EMBED_LO + k, 1.0))
-        h7_o.append(AO(BD.AX_CARRY_LO + k, 2 + k, 1.0))
-    # CLEAN_EMBED_HI -> AX_CARRY_HI at MARK_AX: slot 18 for k=0, slots 49..63
-    # for k=1..15 (slots 33..48 are claimed by the AX_CARRY_HI -> ALU_HI relay
-    # below).
-    h7_v.append(AP(18, BD.CLEAN_EMBED_HI + 0, 1.0))
-    h7_o.append(AO(BD.AX_CARRY_HI + 0, 18, 1.0))
-    for k in range(1, 16):
-        h7_v.append(AP(48 + k, BD.CLEAN_EMBED_HI + k, 1.0))
-        h7_o.append(AO(BD.AX_CARRY_HI + k, 48 + k, 1.0))
     # AX_CARRY_HI -> ALU_HI relay (slots 33..48).
     for k in range(16):
         h7_v.append(AP(33 + k, BD.AX_CARRY_HI + k, 1.0))
@@ -3817,30 +3798,11 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         (6, "attn_W_o", f"7_{33 + k}", f"ALU_HI+{k}")
         for k in range(16)
     })
-    # Head 7 LEV AX_CARRY refresh: (MARK_AX + OP_LEV) -> STACK0_BYTE0 attention
-    # at slot 1; CLEAN_EMBED -> AX_CARRY band at slots 2..18 + 49..63. Pairs
-    # with the L16 ``l16_lev_ax_carry_lo/hi_{k}`` rules at commit 3650e01.
-    _claims = _claims | frozenset({
-        (6, "attn_W_q", "7_1", "MARK_AX+0"),
-        (6, "attn_W_q", "7_1", "OP_LEV+0"),
-        (6, "attn_W_q", "7_1", "CONST+0"),
-        (6, "attn_W_k", "7_1", "STACK0_BYTE0+0"),
-    }) | frozenset({
-        (6, "attn_W_v", f"7_{2 + k}", f"CLEAN_EMBED_LO+{k}")
-        for k in range(16)
-    }) | frozenset({
-        (6, "attn_W_o", f"7_{2 + k}", f"AX_CARRY_LO+{k}")
-        for k in range(16)
-    }) | frozenset({
-        (6, "attn_W_v", "7_18", "CLEAN_EMBED_HI+0"),
-        (6, "attn_W_o", "7_18", "AX_CARRY_HI+0"),
-    }) | frozenset({
-        (6, "attn_W_v", f"7_{48 + k}", f"CLEAN_EMBED_HI+{k}")
-        for k in range(1, 16)
-    }) | frozenset({
-        (6, "attn_W_o", f"7_{48 + k}", f"AX_CARRY_HI+{k}")
-        for k in range(1, 16)
-    })
+    # Head 7 LEV AX_CARRY refresh DISABLED (2026-06-07): the slot-1 gate +
+    # slots 2..17/18/49..63 CLEAN_EMBED -> AX_CARRY writes were structurally
+    # wrong (STACK0_BYTE0 post-LEV is the caller's last-pushed word, not the
+    # callee's return value).  L3 head 1 already preserves AX through LEV.
+    # See the head-spec comment above for details.  No claims declared here.
 
     return Operation(
         name="layer6_relay_heads_bake",
@@ -3852,7 +3814,6 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         reads={"MARK_SP", "MARK_AX", "MARK_STACK0", "MARK_BP",
                "MARK_PC", "MARK_MEM",
                "H1", "L1H4", "CONST",
-               "STACK0_BYTE0", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "AX_CARRY_LO", "AX_CARRY_HI",
                "OPCODE_BYTE_HI",
                "OP_LEV", "OP_PSH", "OP_ADJ", "OP_ENT", "OP_JSR",
@@ -3860,8 +3821,7 @@ def make_layer6_relay_heads_bake_op() -> Operation:
         writes={"CMP", "PSH_AT_SP", "MEM_STORE", "MEM_ADDR_SRC",
                 "OP_LEV", "OP_ENT", "OP_JSR",
                 "ALU_LO", "ALU_HI",
-                "OPCODE_BYTE_HI",
-                "AX_CARRY_LO", "AX_CARRY_HI"},
+                "OPCODE_BYTE_HI"},
         kind="model",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer6_relay_heads_bake_ir,
