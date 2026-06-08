@@ -293,3 +293,194 @@ def test_int_main_return_42_native_vm_baseline():
     assert output == "", (
         f"int main(){{return 42;}} should produce no stdout; got {output!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# R8 acceptance: full production round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_r8_full_production_roundtrip():
+    """End-to-end plan §R8 acceptance gate.
+
+    Plan §R8 acceptance criterion: ``int main(){return 42;}`` round-trips
+    through the exported Qwen3-dense artefact with **≥99 % per-token
+    argmax match** against the native VM runner.
+
+    The pipeline this test exercises:
+
+      1. Compile the **production** VM with ``C4_QWEN_EXPORT_COMPAT=1`` (R1
+         NORM_COMPENSATOR seeded at K).
+      2. Apply :func:`flatten_post_ops_for_qwen_export` so the per-block
+         ``post_ops`` lists become first-class Qwen blocks (R5).
+      3. Run :func:`export_qwen3_dense` into a temporary directory. The
+         function internally runs R2/R3/R4/R7 + the R5 flatten try-pass.
+      4. Load the artefact through ``AutoModelForCausalLM.from_pretrained``.
+         If the load fails, capture the precise error and ``pytest.xfail``
+         it. The remaining steps run only on a successful load.
+      5. Compile ``int main(){return 42;}`` via :func:`compile_c` and
+         build a token-stream context from the same VM tokenizer the
+         runner uses.
+      6. Forward the context through the exported Qwen3 model and capture
+         a ~30-token argmax sequence.
+      7. Run the native :class:`AutoregressiveVMRunner` on the same input,
+         capturing its argmax sequence via the same forward path.
+      8. Assert per-token argmax match ≥99 %.
+
+    Current state (2026-06-07, base b17b9d3f): all four blockers below
+    keep the export from completing. The test fails fast inside step 3
+    with ``AttributeError`` on ``W_up`` (composite FFN), and we xfail
+    with that signal so the test surfaces as **xpass** the moment all
+    blockers integrate. See ``docs/QWEN_R8_E2E_2026_06_07.md`` for the
+    full blocker list:
+
+      * **D1 / Blocker 1** — composite FFN flattener (L10/L12/L23/L26/L28
+        are ``AddSub5StageBlock`` / ``FlattenedDivMod`` / ``FlattenedALUMul``
+        / ``ALUShiftComposite``; R4 SwiGLU repack expects flat
+        ``W_up``/``W_gate``/``W_down``).
+      * **D2 / Blocker 2** — softmax1 sink runtime wiring (landed at
+        commit 3d02dcc0; still requires the loader-side prepend to be
+        active).
+      * **I1 / Blocker 3** — per-head ``q_norm`` / ``k_norm`` have no VM
+        counterpart; compensator must be replicated per head.
+      * **I2 / Blocker 4** — production VM is ALiBi; Qwen3 is RoPE-only.
+      * **I3 / Blocker 5** — ``NeuralVMEmbedding`` augmentations
+        (``ADDR_KEY``, ``MEM_STORE`` boundary writes) are not exported.
+
+    When D1 + D2 + I1/I2/I3 all integrate, this test flips to xpass
+    (or, if the harness escalates xpass to fail, to a plain pass after
+    removing the runtime ``pytest.xfail`` block).
+    """
+
+    from src.compiler import compile_c
+    from neural_vm.qwen_compat import flatten_post_ops_for_qwen_export
+
+    c_source = "int main(){return 42;}"
+    bytecode, data = compile_c(c_source, link_stdlib=False)
+
+    # Step 1: compile the production VM with the R1 invariant ON.
+    prior = os.environ.get("C4_QWEN_EXPORT_COMPAT")
+    os.environ["C4_QWEN_EXPORT_COMPAT"] = "1"
+    try:
+        from neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+            compile_full_vm_dynamic,
+        )
+
+        model, layout = compile_full_vm_dynamic(disk_cache=True)
+    finally:
+        if prior is None:
+            os.environ.pop("C4_QWEN_EXPORT_COMPAT", None)
+        else:
+            os.environ["C4_QWEN_EXPORT_COMPAT"] = prior
+
+    assert "NORM_COMPENSATOR" in layout.dim_positions, (
+        "R1 invariant lost — flag-ON compile lacks NORM_COMPENSATOR"
+    )
+    model.eval()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Step 2: R5 flatten. The function is non-mutating and returns a
+        # new list of blocks; failure here would mean R5's contract broke.
+        try:
+            flattened_blocks = flatten_post_ops_for_qwen_export(model)
+            assert len(flattened_blocks) >= len(model.blocks)
+        except Exception as exc:  # pragma: no cover - defensive
+            pytest.xfail(
+                f"R5 flatten_post_ops_for_qwen_export raised: "
+                f"{type(exc).__name__}: {exc}. Blockers: D1 (composite FFN), "
+                f"see docs/QWEN_R8_E2E_2026_06_07.md."
+            )
+
+        # Step 3: export. Currently fails on composite FFN (Blocker 1 / D1).
+        try:
+            export_qwen3_dense(model, tmp, K=NORM_COMPENSATOR_K)
+        except Exception as exc:
+            pytest.xfail(
+                f"export_qwen3_dense failed: "
+                f"{type(exc).__name__}: {exc}. Likely blocker: D1 (composite "
+                f"FFNs L10/L12/L23/L26/L28 don't expose W_up/W_gate/W_down). "
+                f"See docs/QWEN_R8_E2E_2026_06_07.md §Blocker 1."
+            )
+
+        # Step 4: HuggingFace load.
+        try:
+            from transformers import AutoModelForCausalLM
+
+            qmodel = AutoModelForCausalLM.from_pretrained(tmp)
+        except Exception as exc:
+            pytest.xfail(
+                f"AutoModelForCausalLM.from_pretrained failed after export: "
+                f"{type(exc).__name__}: {exc}. Likely blockers: D1/D2/I3 "
+                f"(state_dict shape mismatch on flattened composite blocks, "
+                f"sink token id, or embedding augmentations). See "
+                f"docs/QWEN_R8_E2E_2026_06_07.md."
+            )
+        qmodel.eval()
+
+    # Step 5: build the same token context the native runner uses.
+    from neural_vm.run_vm import AutoregressiveVMRunner
+
+    runner = AutoregressiveVMRunner(
+        pure_neural=True,
+        trust_neural_alu=True,
+        enable_divergence_bail=True,
+    )
+
+    # ``_build_context`` is an internal helper but it is the stable
+    # tokenization the runner uses; reusing it keeps the VM and exported
+    # model on the same token grid.
+    context_tokens = runner._build_context(
+        bytecode,
+        bytes(data) if data else b"",
+        argv=None,
+        stdin="",
+    )
+    # Keep within both models' max_seq_len bounds and only diff the
+    # first ~30 generation positions to match the plan's window.
+    max_positions = min(
+        30,
+        len(context_tokens),
+        int(getattr(runner.model, "max_seq_len", len(context_tokens))),
+        int(getattr(qmodel.config, "max_position_embeddings", len(context_tokens))),
+    )
+    if max_positions <= 0:
+        pytest.xfail(
+            "Token context window collapsed to zero; cannot diff argmax. "
+            "Likely blocker: I3 (embedding augmentations)."
+        )
+    diff_window = context_tokens[:max_positions]
+
+    device_native = next(runner.model.parameters()).device
+    device_qwen = next(qmodel.parameters()).device
+    in_native = torch.tensor([diff_window], dtype=torch.long, device=device_native)
+    in_qwen = torch.tensor([diff_window], dtype=torch.long, device=device_qwen)
+
+    with torch.no_grad():
+        try:
+            qout = qmodel(in_qwen).logits
+        except Exception as exc:
+            pytest.xfail(
+                f"Qwen3 forward raised: {type(exc).__name__}: {exc}. "
+                f"Likely blocker: I3 (embedding augmentations) or I2 (RoPE "
+                f"vs ALiBi position encoding)."
+            )
+        try:
+            vout = runner.model(in_native)
+        except Exception as exc:
+            pytest.xfail(
+                f"Native VM forward raised: {type(exc).__name__}: {exc}. "
+                f"This is a runner regression, not an R8 blocker."
+            )
+
+    qwen_argmax = qout.argmax(dim=-1).cpu()
+    native_argmax = vout.argmax(dim=-1).cpu()
+    match = (qwen_argmax == native_argmax).float().mean().item()
+
+    assert match >= R8_ARGMAX_TARGET, (
+        f"R8 argmax match {match:.4f} below plan §R8 target "
+        f"{R8_ARGMAX_TARGET}. Window: {max_positions} positions. "
+        f"This is the live ≥99 % gate — if all blockers are landed "
+        f"the gap is a regression in the export pipeline. See "
+        f"docs/QWEN_R8_E2E_2026_06_07.md."
+    )

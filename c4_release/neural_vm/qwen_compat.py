@@ -980,6 +980,241 @@ def export_qwen3_dense(
     return cfg
 
 
+# ---------------------------------------------------------------------------
+# Phase R8 / Blocker 4 — ALiBi → RoPE export-time transform
+# ---------------------------------------------------------------------------
+#
+# The production VM compiles with ``positional_encoding="alibi"``. Qwen3 is
+# RoPE-only. ALiBi and RoPE have fundamentally different functional forms:
+#
+#   * ALiBi adds an additive bias ``-slope_h * |i - j|`` to the QK^T scores
+#     before softmax. The bias is per-head, per-distance, content-independent.
+#   * RoPE rotates Q[i] and K[j] in their head_dim feature space by angles
+#     that depend on absolute position. The resulting Q'[i] · K'[j] depends
+#     on relative position via rotation but does NOT contribute an additive
+#     constant term to the score.
+#
+# There is no weight transform on ``W_q`` / ``W_k`` that turns the additive
+# ALiBi bias term ``-slope*|i-j|`` (a constant in the input embedding) into
+# the multiplicative rotation that RoPE applies. The two formulations are
+# only equivalent on **causal sequence position 0** (a sequence of length
+# 1), where there is exactly one valid attention pair ``(0,0)``, ``|i-j|=0``
+# makes the ALiBi term zero, and the RoPE angle at position 0 is also
+# zero — so both reduce to ``scaled_dot_product`` of the un-rotated Q/K.
+#
+# ``alibi_to_rope_export`` is therefore a **best-effort** exporter:
+#
+#   * Walks every attention block and removes the ALiBi additive term by
+#     zeroing ``alibi_slopes`` (so the additive bias is identically 0).
+#   * Re-allocates a RoPE cos/sin cache and flips the per-attention
+#     ``_positional_encoding`` flag to ``"rope"`` so subsequent forward
+#     passes route through the RoPE branch.
+#   * Re-bakes ``W_q`` / ``W_k`` only in the trivial sense (no change) —
+#     there is no algebraic transform that compensates for the dropped
+#     additive bias under RoPE rotation in the general case.
+#
+# Byte-identity guarantee: forward outputs match the original ALiBi VM
+# **exactly on position 0** (sequence length 1, after the conversion).
+# For longer sequences the helper documents the bound: the score
+# perturbation at position ``i`` attending to ``j`` is
+# ``slope_h * |i-j| + (cos(theta_i)cos(theta_j) + sin(theta_i)sin(theta_j) - 1)
+#  · q · k`` — i.e. bounded by the largest ALiBi slope times the maximum
+# relative position considered, plus the RoPE angular drift.
+#
+# The companion test ``tests/test_qwen_alibi_to_rope.py`` pins the
+# position-0 byte-identity equivalence and asserts a monotonic divergence
+# bound for positions 1..31 so future regressions land here.
+
+
+def _build_alibi_bias(
+    alibi_slopes: torch.Tensor,
+    seq_len: int,
+    causal: bool = True,
+    device=None,
+    dtype=None,
+) -> torch.Tensor:
+    """Return the additive ALiBi bias matrix at shape ``[H, S, S]``.
+
+    Mirrors the ALiBi convention in
+    :meth:`AutoregressiveAttention.forward`: ``bias[h, i, j] =
+    -slope_h * |i - j|``. The causal mask is NOT applied here; it is the
+    caller's responsibility (the test path bakes the unmasked bias for
+    diagnostics and the runtime forward stacks the causal mask
+    separately).
+
+    Used as a reference oracle for the equivalence test and the
+    diagnostic delta-bound the helper reports.
+    """
+
+    device = device if device is not None else alibi_slopes.device
+    dtype = dtype if dtype is not None else alibi_slopes.dtype
+    pos = torch.arange(seq_len, device=device, dtype=dtype)
+    dist = (pos.unsqueeze(1) - pos.unsqueeze(0)).abs()  # [S, S]
+    bias = -alibi_slopes.view(-1, 1, 1).to(dtype) * dist.unsqueeze(0)
+    if causal:
+        causal_mask = torch.triu(
+            torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
+            diagonal=1,
+        )
+        bias = bias + causal_mask.unsqueeze(0)
+    return bias
+
+
+@dataclass(frozen=True)
+class AlibiToRopeReport:
+    """Diagnostic record returned by :func:`alibi_to_rope_export`.
+
+    Pinning the converted block count + the (asserted) position range over
+    which the transform is byte-identical lets downstream tests detect
+    regressions in either direction (a future helper that *does* close the
+    full equivalence gap would push ``byte_identity_max_pos`` past 0).
+    """
+
+    converted_blocks: int
+    skipped_blocks: int
+    skipped_reasons: Tuple[str, ...]
+    byte_identity_max_pos: int  # inclusive upper bound: 0 in current impl
+    max_alibi_slope: float
+    rope_base: float
+
+
+def alibi_to_rope_export(model: Any, *, rope_base: Optional[float] = None) -> AlibiToRopeReport:
+    """Convert every ALiBi attention block in ``model`` to RoPE in-place.
+
+    Walks every ``block.attn`` (and any ``post_op`` whose attention is
+    ALiBi-baked) and performs the export-time transform:
+
+      1. Verifies the block is on the ALiBi branch
+         (``_positional_encoding == "alibi"``). RoPE blocks pass through
+         unchanged; hybrid layers are converted only on the ALiBi sub-range
+         (the hybrid contract pins ``layer_idx < 3`` to ALiBi — those flip
+         to ``"rope"``; layer >= 3 are already RoPE).
+      2. Zeroes the ``alibi_slopes`` buffer so the additive bias term
+         ``-slope*|i-j|`` collapses to zero in
+         :meth:`AutoregressiveAttention.forward`.
+      3. Allocates ``_rope_cos`` / ``_rope_sin`` buffers using
+         :func:`precompute_rope_cache` so the RoPE branch (line ~458 of
+         ``vm_step.py``) becomes live.
+      4. Flips ``_positional_encoding`` to ``"rope"`` so any code that
+         keys off the string sees the new state.
+
+    The ``W_q`` / ``W_k`` weights are NOT re-baked. As documented above,
+    there is no algebraic transform that turns the ALiBi additive
+    constant into a RoPE rotation for arbitrary inputs. The helper is
+    therefore "best-effort" and the equivalence is *exact* only for
+    sequence length 1 (causal position 0, where ``|i-j|=0`` and the RoPE
+    angle at position 0 is also 0).
+
+    Args:
+        model: a baked VM (typically an :class:`AutoregressiveVM`).
+        rope_base: optional override for the RoPE base frequency. When
+            ``None``, falls back to ``model.rope_base`` (default 10000.0).
+
+    Returns:
+        An :class:`AlibiToRopeReport` summarising the conversion.
+
+    Raises:
+        ValueError: if any attention block has an odd ``head_dim`` (RoPE
+            requires an even feature dimension).
+    """
+
+    # Local imports keep qwen_compat importable without the heavyweight
+    # vm_step module load at planning time.
+    from .vm_step import precompute_rope_cache as _precompute_rope_cache
+
+    if rope_base is None:
+        rope_base = float(getattr(model, "rope_base", 10000.0))
+    else:
+        rope_base = float(rope_base)
+
+    converted = 0
+    skipped = 0
+    reasons: List[str] = []
+    max_slope = 0.0
+
+    def _convert_attn(attn: Any, layer_idx: int) -> None:
+        nonlocal converted, skipped, max_slope
+        if attn is None or not hasattr(attn, "W_q"):
+            skipped += 1
+            reasons.append(f"layer {layer_idx}: attn has no W_q (skipped)")
+            return
+        pe = getattr(attn, "_positional_encoding", None)
+        # Already on the RoPE branch — nothing to do.
+        if pe == "rope":
+            skipped += 1
+            reasons.append(f"layer {layer_idx}: already RoPE (no-op)")
+            return
+        if pe not in {"alibi", "hybrid"}:
+            skipped += 1
+            reasons.append(
+                f"layer {layer_idx}: unknown positional_encoding={pe!r} (skipped)"
+            )
+            return
+        head_dim = int(getattr(attn, "head_dim"))
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"alibi_to_rope_export: layer {layer_idx} has odd head_dim="
+                f"{head_dim}; RoPE requires an even head_dim."
+            )
+
+        # Capture the slopes for the diagnostic bound BEFORE zeroing.
+        slopes = getattr(attn, "alibi_slopes", None)
+        if slopes is not None:
+            max_slope = max(max_slope, float(slopes.abs().max().item()))
+            with torch.no_grad():
+                slopes.zero_()
+
+        # Allocate / overwrite the RoPE cache.
+        max_seq_len = int(getattr(attn, "max_seq_len", 1024))
+        device = attn.W_q.device
+        cos, sin = _precompute_rope_cache(
+            head_dim, max_seq_len, base=rope_base, device=device
+        )
+        # The ALiBi branch assigns ``_rope_cos = None`` as a plain
+        # attribute (NOT a registered buffer). ``register_buffer`` raises
+        # ``KeyError`` when the name already exists, even when it's just
+        # a ``None`` attribute. Clear both possible homes (instance dict
+        # for the ``None`` case, ``_buffers`` for a previously registered
+        # buffer) before re-registering.
+        attn.__dict__.pop("_rope_cos", None)
+        attn.__dict__.pop("_rope_sin", None)
+        attn._buffers.pop("_rope_cos", None)
+        attn._buffers.pop("_rope_sin", None)
+        attn.register_buffer("_rope_cos", cos)
+        attn.register_buffer("_rope_sin", sin)
+
+        # Flip the positional-encoding flag last so a partially-converted
+        # attn (e.g. an exception in cos/sin alloc) leaves the original
+        # branch active.
+        attn._positional_encoding = "rope"
+        attn.rope_base = rope_base
+        converted += 1
+
+    for layer_idx, block in enumerate(_blocks(model)):
+        _convert_attn(getattr(block, "attn", None), layer_idx)
+        for post_op in getattr(block, "post_ops", None) or []:
+            # Some post_ops carry their own attention (skip-pass blocks).
+            inner_attn = getattr(post_op, "attn", None)
+            if inner_attn is not None:
+                _convert_attn(inner_attn, layer_idx)
+
+    # Propagate the flag at the top-level config so subsequent introspection
+    # (and ``analyze_qwen_compatibility``) reports the new state.
+    if hasattr(model, "positional_encoding"):
+        model.positional_encoding = "rope"
+
+    return AlibiToRopeReport(
+        converted_blocks=converted,
+        skipped_blocks=skipped,
+        skipped_reasons=tuple(reasons),
+        # Byte-identity holds for the single-token case only — see the
+        # module-level math note above.
+        byte_identity_max_pos=0,
+        max_alibi_slope=float(max_slope),
+        rope_base=rope_base,
+    )
+
+
 __all__ = [
     "QWEN2_DENSE",
     "QWEN3_DENSE",
@@ -1002,6 +1237,8 @@ __all__ = [
     "expanded_qwen_layer_count",
     "summarize_post_ops_flattening",
     "PostOpsFlatteningReport",
+    "alibi_to_rope_export",
+    "AlibiToRopeReport",
 ]
 
 
