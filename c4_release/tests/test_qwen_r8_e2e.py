@@ -201,13 +201,22 @@ def test_forward_parity_tiny_vm_high_match():
 
 
 @pytest.mark.slow
-def test_full_vm_export_fails_on_composite_ffn():
-    """The production VM has composite FFNs that R4's repack can't handle.
+def test_full_vm_export_succeeds_on_composite_ffn():
+    """The production VM's composite FFNs no longer block export.
 
-    L10/L12/L23/L26/L28 use ``AddSub5StageBlock``, ``FlattenedDivMod``,
-    ``FlattenedALUMul``, ``ALUShiftComposite``. Their forward isn't a
-    single SwiGLU triple, so ``_swiglu_repack_and_fold_bias`` raises
+    Originally (pre Wave 1 Cluster D1) this test pinned the negative
+    invariant — the production VM compiled with ``C4_QWEN_EXPORT_COMPAT=1``
+    has five composite blocks (``AddSub5StageBlock``, ``FlattenedDivMod``,
+    ``FlattenedALUMul``, ``ALUShiftComposite``) and the R4 repack raised
     ``AttributeError: '...' object has no attribute 'W_up'``.
+
+    With ``extract_composite_ffn_weights`` wired into the export, those
+    composites now materialise a zero-init Qwen SwiGLU triple (skip-pass
+    semantics — see ``docs/QWEN_R8_E2E_2026_06_07.md`` Blocker 1's "path
+    forward" notes), so ``export_qwen3_dense`` runs to completion. The
+    semantic byte-identity of those layers is still deferred to a
+    follow-up phase; this test only pins that export does not raise and
+    every layer carries the three SwiGLU keys.
 
     Marked slow because it requires the full ``compile_full_vm_dynamic``
     bake (~10 s wall + disk cache). The smoke gate doesn't run it.
@@ -244,14 +253,42 @@ def test_full_vm_export_fails_on_composite_ffn():
         if type(b.ffn).__name__ in composite_names
     ]
     assert composite_blocks, (
-        "Production VM no longer has composite FFNs — Blocker 1 is "
-        "closed and this test should be repurposed. See "
-        "docs/QWEN_R8_E2E_2026_06_07.md."
+        "Production VM no longer has composite FFNs — this test should "
+        "be updated or removed. See docs/QWEN_R8_E2E_2026_06_07.md."
     )
 
-    with tempfile.TemporaryDirectory() as tmp:
-        with pytest.raises(AttributeError, match="W_up"):
-            export_qwen3_dense(model, tmp, K=NORM_COMPENSATOR_K)
+    # The exported state_dict for the production VM is ~1.7 GB. Many
+    # tempfs-backed ``/tmp`` mounts (CI runners, dev containers) hit
+    # disk-quota limits when the file is materialised there; prefer a
+    # location backed by real disk. Override via ``C4_QWEN_EXPORT_TMP``.
+    import pathlib
+    base_dir = os.environ.get("C4_QWEN_EXPORT_TMP")
+    if base_dir:
+        base_path = pathlib.Path(base_dir)
+    else:
+        base_path = pathlib.Path.home() / ".cache" / "c4_qwen_export_test"
+    base_path.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(base_path)) as tmp:
+        # Should no longer raise — composite FFNs export as zero-init
+        # SwiGLU triples (skip-pass) via extract_composite_ffn_weights.
+        cfg = export_qwen3_dense(model, tmp, K=NORM_COMPENSATOR_K)
+        assert cfg.num_hidden_layers == len(model.blocks)
+        sd = torch.load(
+            os.path.join(tmp, "pytorch_model.bin"),
+            map_location="cpu",
+            weights_only=True,
+        )
+        # Every composite block must carry the three SwiGLU keys.
+        for i in composite_blocks:
+            for key_suffix in (
+                "gate_proj.weight",
+                "up_proj.weight",
+                "down_proj.weight",
+            ):
+                k = f"model.layers.{i}.mlp.{key_suffix}"
+                assert k in sd, (
+                    f"missing exported key for composite block {i}: {k}"
+                )
 
 
 # ---------------------------------------------------------------------------

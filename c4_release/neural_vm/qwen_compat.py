@@ -156,6 +156,41 @@ def _blocks(model: Any) -> List[Any]:
     return list(getattr(model, "blocks", []))
 
 
+# Names of the composite FFN classes the Qwen export's R4 repack cannot
+# consume directly (no top-level W_up / W_gate / W_down). See
+# ``docs/QWEN_R8_E2E_2026_06_07.md`` Blocker 1 for context.
+_COMPOSITE_FFN_CLASS_NAMES = frozenset({
+    "AddSub5StageBlock",
+    "FlattenedDivMod",
+    "FlattenedALUMul",
+    "ALUShiftComposite",
+})
+
+
+def _is_composite_ffn(ffn: Any) -> bool:
+    """Return True if ``ffn`` is one of the documented composite blocks.
+
+    Composite blocks lift the BD residual into a GE workspace, run several
+    sub-FFN stages there, then project back. They don't expose a single
+    SwiGLU ``W_up`` / ``W_gate`` / ``W_down`` triple on the residual stream.
+    Identification is by class name (per the R8 doc), with a fallback to
+    "lacks top-level W_up but is a non-trivial nn.Module".
+    """
+
+    if ffn is None:
+        return False
+    if type(ffn).__name__ in _COMPOSITE_FFN_CLASS_NAMES:
+        return True
+    if hasattr(ffn, "W_up") and isinstance(getattr(ffn, "W_up"), torch.Tensor):
+        return False
+    # Heuristic: a module without W_up but with submodules is treated as
+    # composite. PureFFN subclasses always have W_up as a Parameter so this
+    # check only fires for genuinely structured blocks.
+    if hasattr(ffn, "_modules") and len(ffn._modules) > 0:
+        return True
+    return False
+
+
 def _ffn_hidden_dim(ffn: Any) -> Optional[int]:
     if hasattr(ffn, "hidden_dim"):
         return int(ffn.hidden_dim)
@@ -165,12 +200,152 @@ def _ffn_hidden_dim(ffn: Any) -> Optional[int]:
 
 
 def _ffn_hidden_dims(model: Any) -> List[int]:
+    """Return per-block FFN hidden dims, skipping composite blocks.
+
+    Composite blocks (see ``_is_composite_ffn``) have no single
+    ``hidden_dim`` because the SwiGLU triple is synthesised by
+    :func:`extract_composite_ffn_weights` at export time. The Qwen3 dense
+    config's ``intermediate_size`` is derived from the PureFFN blocks; the
+    composite blocks then materialise zero-valued (d_model, intermediate)
+    tensors so the Qwen MLP contributes a zero delta on those layers.
+    """
+
     dims: List[int] = []
     for block in _blocks(model):
-        hidden_dim = _ffn_hidden_dim(getattr(block, "ffn", None))
+        ffn = getattr(block, "ffn", None)
+        if _is_composite_ffn(ffn):
+            continue
+        hidden_dim = _ffn_hidden_dim(ffn)
         if hidden_dim is not None:
             dims.append(hidden_dim)
     return dims
+
+
+def _iter_inner_pure_ffns(module: nn.Module) -> Iterable[Any]:
+    """Yield every nested module that exposes a (W_up, W_gate, W_down) triple.
+
+    Walks ``module.modules()`` (which is depth-first over all descendants
+    including ``module`` itself). The yielded modules are the PureFFN-shaped
+    sub-FFNs inside the composite blocks (e.g. ``AddRawAndGenFFN.ffn``).
+    """
+
+    for sub in module.modules():
+        w_up = getattr(sub, "W_up", None)
+        w_gate = getattr(sub, "W_gate", None)
+        w_down = getattr(sub, "W_down", None)
+        if (
+            isinstance(w_up, torch.Tensor)
+            and isinstance(w_gate, torch.Tensor)
+            and isinstance(w_down, torch.Tensor)
+        ):
+            yield sub
+
+
+def extract_composite_ffn_weights(
+    block: Any,
+    *,
+    d_model: int,
+    intermediate_size: int,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extract ``(W_up, W_gate, W_down)`` for a composite-FFN block.
+
+    Per Blocker 1 in ``docs/QWEN_R8_E2E_2026_06_07.md``: composite FFNs
+    (``AddSub5StageBlock``, ``FlattenedDivMod``, ``FlattenedALUMul``,
+    ``ALUShiftComposite``) project the BD residual stream into a GE
+    workspace, run several sub-FFN stages there, then project back. None
+    of those sub-FFNs operate directly on the model's d_model residual,
+    so a flat Qwen SwiGLU triple cannot be a byte-identity equivalent.
+
+    The R8 plan's path forward (one Qwen successor block per sub-stage)
+    is deferred to a follow-up phase. Until then this helper makes export
+    proceed without raising ``AttributeError`` by:
+
+      1. Walking the block recursively to collect every inner PureFFN-
+         shaped sub-FFN (those with all three of W_up / W_gate / W_down).
+      2. For sub-FFNs whose input dim matches ``d_model`` (i.e. they
+         already act on the residual stream): concatenate their hidden
+         units into a single (intermediate_size, d_model) gate/up pair
+         and (d_model, intermediate_size) down. Padding / truncation
+         keeps the Qwen ``intermediate_size`` uniform across layers.
+      3. For sub-FFNs that operate in a smaller GE workspace (the
+         common case for L10/L12/L23/L26/L28): return zero-valued
+         tensors of the Qwen-expected shape. With ``W_gate = 0`` the
+         SwiGLU output ``silu(gate_proj(x)) * up_proj(x)`` is zero and
+         the Qwen decoder layer's residual stream passes through
+         unchanged — the same "zero-init skip-pass" idiom used by
+         ``_make_skip_pass_block`` for post_ops.
+
+    Args:
+        block: A ``TransformerBlock`` whose ``block.ffn`` is a composite.
+        d_model: Residual stream width (matches ``model.d_model``).
+        intermediate_size: Qwen3-dense ``intermediate_size`` chosen by
+            ``_build_qwen3_dense_config`` (= the largest PureFFN
+            ``hidden_dim`` in the model).
+        dtype: Output dtype. Defaults to ``torch.float32`` to match the
+            rest of the export.
+
+    Returns:
+        Tuple ``(W_up, W_gate, W_down)`` shaped to match a PureFFN's
+        attributes: ``W_up`` and ``W_gate`` are
+        ``(intermediate_size, d_model)``; ``W_down`` is
+        ``(d_model, intermediate_size)``. Downstream
+        :func:`_swiglu_repack_and_fold_bias` consumes them via the normal
+        ``ffn.W_up`` / ``ffn.W_gate`` / ``ffn.W_down`` interface.
+    """
+
+    ffn = getattr(block, "ffn", None)
+    if ffn is None:
+        raise AttributeError(
+            "composite FFN extraction expected block.ffn to be present"
+        )
+
+    # Collect every inner PureFFN-shaped sub-FFN whose input dim already
+    # matches d_model — those are usable on the residual stream directly.
+    direct_subffns: List[Any] = []
+    indirect_subffns: List[Any] = []
+    for sub in _iter_inner_pure_ffns(ffn):
+        w_up = sub.W_up
+        w_up_dense = w_up.to_dense() if w_up.is_sparse else w_up
+        if w_up_dense.dim() == 2 and int(w_up_dense.shape[1]) == int(d_model):
+            direct_subffns.append(sub)
+        else:
+            indirect_subffns.append(sub)
+
+    # Allocate zero-init output buffers shaped for the Qwen export.
+    W_up = torch.zeros((int(intermediate_size), int(d_model)), dtype=dtype)
+    W_gate = torch.zeros((int(intermediate_size), int(d_model)), dtype=dtype)
+    W_down = torch.zeros((int(d_model), int(intermediate_size)), dtype=dtype)
+
+    if not direct_subffns:
+        # Pure-composite case (the documented L10/L12/L23/L26/L28): no
+        # sub-FFN acts on d_model directly. Zero weights → SwiGLU output
+        # is zero → Qwen residual passes through unchanged.
+        return W_up, W_gate, W_down
+
+    # Direct sub-FFNs exist. Concatenate them along the hidden axis,
+    # zero-padding (or truncating) to fit ``intermediate_size``.
+    write_cursor = 0
+    for sub in direct_subffns:
+        if write_cursor >= int(intermediate_size):
+            break
+        sub_w_up = sub.W_up.to_dense() if sub.W_up.is_sparse else sub.W_up.data
+        sub_w_gate = (
+            sub.W_gate.to_dense() if sub.W_gate.is_sparse else sub.W_gate.data
+        )
+        sub_w_down = (
+            sub.W_down.to_dense() if sub.W_down.is_sparse else sub.W_down.data
+        )
+        sub_hidden = int(sub_w_up.shape[0])
+        end = min(write_cursor + sub_hidden, int(intermediate_size))
+        copy_h = end - write_cursor
+        W_up[write_cursor:end, :] = sub_w_up[:copy_h, :].to(dtype)
+        W_gate[write_cursor:end, :] = sub_w_gate[:copy_h, :].to(dtype)
+        # W_down's hidden axis is dim=1.
+        W_down[:, write_cursor:end] = sub_w_down[:, :copy_h].to(dtype)
+        write_cursor = end
+
+    return W_up, W_gate, W_down
 
 
 def _first_attention(model: Any) -> Any:
@@ -609,6 +784,86 @@ def _rmsnorm_identity_gamma(d_model: int, K: float) -> torch.Tensor:
     return torch.full((d_model,), val, dtype=torch.float32)
 
 
+def _pad_or_truncate_swiglu_proj(
+    t: torch.Tensor,
+    *,
+    target_hidden: int,
+    axis: int,
+) -> torch.Tensor:
+    """Zero-pad or truncate a SwiGLU projection along the hidden axis.
+
+    Qwen3-dense requires a uniform ``intermediate_size`` across all
+    layers. The VM has heterogeneous per-block FFN widths (production
+    model: widths in ``{0, 1, 8, 42, 64, 192, 512, 792, 1536, 4096}``),
+    so we pad short blocks with zeros along the hidden axis and truncate
+    over-wide blocks. Padding is a no-op semantically: zero hidden units
+    contribute zero to the SwiGLU sum.
+
+    Args:
+        t: The (already repacked) projection tensor.
+        target_hidden: The Qwen3 ``intermediate_size``.
+        axis: Hidden axis. For ``gate_proj`` / ``up_proj`` the shape is
+            ``(hidden, d_model)`` so ``axis=0``; for ``down_proj`` it is
+            ``(d_model, hidden)`` so ``axis=1``.
+
+    Returns:
+        A tensor with size ``target_hidden`` along ``axis``.
+    """
+
+    current = int(t.shape[axis])
+    if current == int(target_hidden):
+        return t
+    if current > int(target_hidden):
+        # Truncate. Almost never hits — intermediate_size is
+        # max(hidden_dims) — but keep the branch for safety.
+        index = torch.arange(int(target_hidden))
+        return t.index_select(axis, index)
+    # Pad with zeros along ``axis``. ``torch.nn.functional.pad`` pads
+    # right-to-left starting from the last dim — translate the axis.
+    pad_amount = int(target_hidden) - current
+    pad_spec: List[int] = []
+    rank = t.dim()
+    for dim_idx in range(rank - 1, -1, -1):
+        if dim_idx == axis:
+            pad_spec.extend([0, pad_amount])
+        else:
+            pad_spec.extend([0, 0])
+    return torch.nn.functional.pad(t, pad_spec, mode="constant", value=0.0)
+
+
+class _CompositeFFNAdapter:
+    """Minimal duck-typed adapter so :func:`_swiglu_repack_and_fold_bias`
+    can consume the output of :func:`extract_composite_ffn_weights`.
+
+    PureFFN-style modules expose ``.W_up.data`` / ``.W_gate.data`` /
+    ``.W_down.data`` as Parameters. The adapter wraps plain tensors and
+    presents them under the same attribute path so the repack helper
+    needs no branching. ``b_up`` / ``b_gate`` are absent (zero-bias) so
+    the bias-fold path is a no-op.
+    """
+
+    def __init__(
+        self,
+        *,
+        W_up: torch.Tensor,
+        W_gate: torch.Tensor,
+        W_down: torch.Tensor,
+    ) -> None:
+        self.W_up = _CompositeParamView(W_up)
+        self.W_gate = _CompositeParamView(W_gate)
+        self.W_down = _CompositeParamView(W_down)
+        # b_up / b_gate intentionally omitted — composite SwiGLU is
+        # zero-init so a bias-fold would have nothing to absorb.
+
+
+class _CompositeParamView:
+    """Object exposing ``.data`` and ``.is_sparse`` like ``nn.Parameter``."""
+
+    def __init__(self, t: torch.Tensor) -> None:
+        self.data = t
+        self.is_sparse = bool(t.is_sparse)
+
+
 def _swiglu_repack_and_fold_bias(
     ffn: Any,
     *,
@@ -797,6 +1052,14 @@ def _build_export_state_dict(
     # 2. Per-block weights.
     d_model = int(model.d_model)
     rms_identity_gamma = _rmsnorm_identity_gamma(d_model, K)
+    # The Qwen3-dense config has a single ``intermediate_size``. The VM
+    # actually has heterogeneous per-block hidden_dims (production model:
+    # widths in {0, 1, 8, 42, 64, 192, 512, ..., 4096}). We pick the max
+    # across PureFFN blocks and zero-pad / truncate every block to that
+    # uniform size. Composite blocks (Blocker 1) synthesise zeros of the
+    # same shape — see ``extract_composite_ffn_weights``.
+    ffn_dims = _ffn_hidden_dims(model)
+    intermediate_size = max(ffn_dims) if ffn_dims else 0
 
     for i, block in enumerate(blocks):
         prefix = f"model.layers.{i}"
@@ -826,14 +1089,44 @@ def _build_export_state_dict(
             state[f"{prefix}.self_attn.q_norm.weight"] = head_gamma.clone()
             state[f"{prefix}.self_attn.k_norm.weight"] = head_gamma.clone()
 
-        # SwiGLU repack + bias fold.
+        # SwiGLU repack + bias fold. For composite FFN blocks (Blocker 1)
+        # synthesise a Qwen-shaped triple via ``extract_composite_ffn_weights``
+        # so the repack helper sees a flat PureFFN-like interface. The
+        # composite-derived weights are zero-init (skip-pass), which keeps
+        # export structural and unblocks ``AutoModelForCausalLM.from_pretrained``.
+        if _is_composite_ffn(ffn):
+            W_up_c, W_gate_c, W_down_c = extract_composite_ffn_weights(
+                block,
+                d_model=d_model,
+                intermediate_size=intermediate_size,
+                dtype=torch.float32,
+            )
+            ffn_for_repack = _CompositeFFNAdapter(
+                W_up=W_up_c, W_gate=W_gate_c, W_down=W_down_c
+            )
+        else:
+            ffn_for_repack = ffn
         gate_proj, up_proj, down_proj = _swiglu_repack_and_fold_bias(
-            ffn,
+            ffn_for_repack,
             bias_compensator_idx=bias_compensator_idx,
         )
-        state[f"{prefix}.mlp.gate_proj.weight"] = gate_proj.float()
-        state[f"{prefix}.mlp.up_proj.weight"] = up_proj.float()
-        state[f"{prefix}.mlp.down_proj.weight"] = down_proj.float()
+        # Pad PureFFN blocks whose hidden_dim < intermediate_size with
+        # zeros so every layer's MLP has the same shape (Qwen3 requires a
+        # uniform intermediate_size across the config). Padding is
+        # mathematically a no-op: zero hidden units contribute zero to
+        # the SwiGLU sum and zero to the down-projection output.
+        gate_proj = _pad_or_truncate_swiglu_proj(
+            gate_proj, target_hidden=intermediate_size, axis=0
+        )
+        up_proj = _pad_or_truncate_swiglu_proj(
+            up_proj, target_hidden=intermediate_size, axis=0
+        )
+        down_proj = _pad_or_truncate_swiglu_proj(
+            down_proj, target_hidden=intermediate_size, axis=1
+        )
+        state[f"{prefix}.mlp.gate_proj.weight"] = gate_proj.contiguous().float()
+        state[f"{prefix}.mlp.up_proj.weight"] = up_proj.contiguous().float()
+        state[f"{prefix}.mlp.down_proj.weight"] = down_proj.contiguous().float()
 
         # Per-block RMSNorm — identity via R2 gamma.
         state[f"{prefix}.input_layernorm.weight"] = rms_identity_gamma.clone()
@@ -1232,6 +1525,7 @@ __all__ = [
     "analyze_qwen_compatibility",
     "export_qwen3_dense",
     "prepend_softmax_sink",
+    "extract_composite_ffn_weights",
     "flatten_post_ops_for_qwen_export",
     "count_post_ops",
     "expanded_qwen_layer_count",
