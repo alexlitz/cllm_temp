@@ -57,9 +57,16 @@ def _allocate_layer10_attention_heads() -> AttentionHeadAllocator:
     The actual weight-write head indices are still looked up via
     :func:`_l10_head_idx` inside the head-spec factories below, so
     byte-identity with the legacy bake is preserved regardless of
-    allocator order. ``layer_max_heads=8`` so the layer is full today.
+    allocator order.
+
+    Wave 1 Cluster A2: ``layer_max_heads=12`` widens the L10 head budget
+    from the legacy default (8) to leave four free slots (8..11) for the
+    Wave 1 A3 broadcast heads. The freshly-widened slots stay empty at
+    this stage — first-fit only consumes 0..7 because
+    :data:`_L10_HEAD_LAYOUT` declares exactly 8 heads — so the bake is
+    byte-identical with the pre-widen state.
     """
-    allocator = AttentionHeadAllocator()
+    allocator = AttentionHeadAllocator(layer_max_heads=12)
     for name, _legacy_head_idx in _L10_HEAD_LAYOUT:
         allocator.alloc(name, layer_idx=10)
     return allocator
