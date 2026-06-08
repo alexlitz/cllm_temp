@@ -53,12 +53,20 @@ from .ir import (
 # Q-side dim-name prefixes that mark a write as a *condition gate* — these
 # are the dims the doc enumerates as "tries to filter K positions". When
 # the K-side at the same slot has no real discriminator (only CONST or
-# nothing), the softmax-cancelling argument means the gate doesn't gate.
+# nothing), the softmax-cancelling argument means the gate doesn't gate
+# *under standard softmax*. Under softmax1 a uniform negative offset still
+# suppresses the row (the zero-anchor sink wins). See
+# ``docs/IMM_OVERRIDE_REAL_SURFACE_2026_06_07.md`` §"Audit gate findings".
 GATE_CONDITION_PREFIXES: Tuple[str, ...] = ("MARK_", "OP_", "HAS_", "IS_")
 
 # Dim names that count as "uniform" on the K-side — they contribute the
 # same value at every K row, so they cannot discriminate.
 UNIFORM_K_DIM_NAMES: frozenset = frozenset({"CONST"})
+
+# Score-magnitude threshold below which a softmax1 sink dominates a K row
+# entirely (exp(-10) ≈ 4.5e-5; we use a conservative -8 floor so a slot
+# contribution at least this negative is treated as a row-suppressor).
+SOFTMAX1_SUPPRESS_THRESHOLD: float = -8.0
 
 # Env flag: when set, the compile-time gate audit raises instead of warning.
 GATE_AUDIT_STRICT_ENV = "C4_STRICT_GATE_CHECK"
@@ -380,25 +388,35 @@ class GateAuditEntry:
     * ``kind`` — one of:
         - ``"safe"``: K-side at the slot writes at least one non-CONST
           dim (a real discriminator).
-        - ``"no_op"``: K-side at the slot writes only CONST(s) — the
-          per-Q-row offset is uniform across K → softmax cancels →
-          the "gate" does not filter K positions.
+        - ``"no_op"``: K-side at the slot writes only CONST(s) AND the
+          per-row score contribution is not uniformly suppressive — the
+          "gate" does not filter K positions under either softmax mode.
+        - ``"softmax1_suppress"``: K-side at the slot writes only CONST(s)
+          but the per-Q-row offset is sufficiently negative that the
+          softmax1 zero-anchor sink wins for rows where the condition
+          is OFF. This is an *effective* gate under softmax1 (the
+          deployed model uses softmax1; see
+          ``docs/IMM_OVERRIDE_REAL_SURFACE_2026_06_07.md``).
         - ``"q_only"``: K-side has no write at the slot at all. The
           Q-side write is literal dead weight (the doc calls this the
           "no K-side write at slot" case).
     * ``k_dim_names`` — the sorted tuple of K-side dim names at the
       same slot. Empty for ``q_only``; ``("CONST",)`` for the
-      canonical no_op case.
+      canonical CONST-only case.
     * ``head_idx``/``op_name`` — propagated by callers; left ``None``
       for the bare :func:`audit_attention_gates` entry point.
+    * ``softmax_mode`` — the softmax mode the entry was classified
+      under (``"softmax1"`` or ``"softmax"``). Default ``"softmax1"``
+      matches the deployed model's ``attention_normalization``.
     """
 
     slot: int
     q_dim_name: str
-    kind: str  # "safe" / "no_op" / "q_only"
+    kind: str  # "safe" / "no_op" / "softmax1_suppress" / "q_only"
     k_dim_names: Tuple[str, ...] = ()
     head_idx: Optional[int] = None
     op_name: Optional[str] = None
+    softmax_mode: str = "softmax1"
 
 
 def build_dim_name_map(
@@ -467,11 +485,60 @@ def _classify_dim_names_as_uniform(names: Sequence[str]) -> bool:
     return all(n in UNIFORM_K_DIM_NAMES for n in names)
 
 
+def _q_side_score_contributions_at_slot(
+    spec,
+    slot: int,
+    cond_dim: int,
+    k_const_weight: float,
+    dim_name_map: Mapping[int, Tuple[str, ...]],
+) -> Tuple[Optional[float], Optional[float]]:
+    """Estimate the per-K-row score contribution from ``slot`` against a
+    K row whose only non-trivial activation at the slot is ``CONST``
+    (value 1), in two regimes:
+
+    * ``off_score`` — gate condition is OFF (``cond_dim`` value 0). Only
+      CONST-dim Q-side writes contribute. ``None`` when there is no
+      such non-zero contribution (score is exactly 0).
+    * ``on_score`` — gate condition is ON (``cond_dim`` value 1). Both
+      the condition dim itself and CONST-dim Q-side writes contribute.
+      ``None`` when there is no non-zero contribution.
+
+    Static audit can't pin row-dependent non-CONST Q-side dims, so those
+    contributions are treated as 0 in both regimes.
+    """
+
+    off_total = 0.0
+    on_total = 0.0
+    off_has_any = False
+    on_has_any = False
+    for qw in getattr(spec, "q", ()):
+        if int(qw.slot) != slot:
+            continue
+        q_names = _dim_names_at(qw.dim, dim_name_map)
+        if int(qw.dim) == int(cond_dim):
+            # Gate condition contributes only in the ON regime.
+            on_total += float(qw.weight) * float(k_const_weight)
+            on_has_any = True
+            continue
+        if not q_names or "CONST" not in q_names:
+            # Row-dependent (non-CONST) Q-side dim — undefined statically.
+            continue
+        contrib = float(qw.weight) * float(k_const_weight)
+        off_total += contrib
+        on_total += contrib
+        off_has_any = True
+        on_has_any = True
+    off = off_total if off_has_any else None
+    on = on_total if on_has_any else None
+    return off, on
+
+
 def audit_attention_gates(
     spec,
     dim_name_map: Optional[Mapping[int, Tuple[str, ...]]] = None,
     *,
     op_name: Optional[str] = None,
+    softmax_mode: str = "softmax1",
 ) -> List[GateAuditEntry]:
     """Classify every Q-side condition gate in one ``DeclarativeAttentionHeadSpec``.
 
@@ -481,10 +548,20 @@ def audit_attention_gates(
 
     * ``"safe"`` when K-side writes at least one non-CONST dim at the
       same slot (real discriminator → gate actually filters K positions);
-    * ``"no_op"`` when K-side writes only CONST(s) at the slot
-      (per-Q-row offset is uniform across K → softmax cancels);
+    * ``"softmax1_suppress"`` when ``softmax_mode="softmax1"`` and the
+      K-side is CONST-only but the gate-OFF Q×K score contribution at
+      the slot is uniformly more negative than
+      :data:`SOFTMAX1_SUPPRESS_THRESHOLD` (the zero-anchor sink wins on
+      every K row → row is suppressed → gate IS effective);
+    * ``"no_op"`` when K-side writes only CONST(s) at the slot AND no
+      softmax1 suppression applies (gate is ineffective under both
+      softmax and softmax1);
     * ``"q_only"`` when K-side has no write at the slot at all (the
       Q-side write is literal dead weight).
+
+    ``softmax_mode`` defaults to ``"softmax1"`` — the deployed model's
+    ``attention_normalization``. Passing ``"softmax"`` reverts to the
+    legacy "uniform-K → cancels" verdict and is useful for cross-checks.
 
     Returns the entries in spec-Q order. ``dim_name_map`` defaults to the
     ``_SetDim`` table; passing a compiler-allocated map handles
@@ -495,18 +572,29 @@ def audit_attention_gates(
     if dim_name_map is None:
         dim_name_map = build_dim_name_map(None)
 
+    if softmax_mode not in ("softmax1", "softmax"):
+        raise ValueError(
+            f"audit_attention_gates: softmax_mode must be 'softmax1' or "
+            f"'softmax' (got {softmax_mode!r})"
+        )
+
     head_idx = getattr(spec, "head_idx", None)
     head_idx = int(head_idx) if head_idx is not None else None
 
-    # Group K-side writes by slot.
+    # Group K-side writes by slot — keep names *and* the CONST weight so
+    # the softmax1 suppression check can do real arithmetic.
     k_by_slot: Dict[int, List[str]] = defaultdict(list)
+    k_const_weight_by_slot: Dict[int, float] = defaultdict(float)
     for kw in getattr(spec, "k", ()):
         names = _dim_names_at(kw.dim, dim_name_map)
+        slot = int(kw.slot)
         if not names:
             # Unknown dim — record by numeric value so we don't drop it.
-            k_by_slot[int(kw.slot)].append(f"<unknown:{int(kw.dim)}>")
+            k_by_slot[slot].append(f"<unknown:{int(kw.dim)}>")
         else:
-            k_by_slot[int(kw.slot)].extend(names)
+            k_by_slot[slot].extend(names)
+            if "CONST" in names:
+                k_const_weight_by_slot[slot] += float(kw.weight)
 
     out: List[GateAuditEntry] = []
     for qw in getattr(spec, "q", ()):
@@ -520,6 +608,24 @@ def audit_attention_gates(
             kind = "q_only"
         elif _classify_dim_names_as_uniform(k_names_at_slot):
             kind = "no_op"
+            if softmax_mode == "softmax1":
+                k_const_w = k_const_weight_by_slot.get(slot, 0.0)
+                off_score, on_score = _q_side_score_contributions_at_slot(
+                    spec, slot, qw.dim, k_const_w, dim_name_map,
+                )
+                # The gate is effective under softmax1 if EITHER regime
+                # (cond ON or cond OFF) drives the slot score below the
+                # zero-anchor sink threshold — that regime's K rows are
+                # suppressed relative to the sink, so the gate
+                # discriminates between ON and OFF.
+                if (
+                    off_score is not None
+                    and off_score <= SOFTMAX1_SUPPRESS_THRESHOLD
+                ) or (
+                    on_score is not None
+                    and on_score <= SOFTMAX1_SUPPRESS_THRESHOLD
+                ):
+                    kind = "softmax1_suppress"
         else:
             kind = "safe"
         out.append(
@@ -530,6 +636,7 @@ def audit_attention_gates(
                 k_dim_names=k_names_at_slot,
                 head_idx=head_idx,
                 op_name=op_name,
+                softmax_mode=softmax_mode,
             )
         )
     return out
@@ -574,6 +681,8 @@ def _extract_attention_specs_from_op(
 def audit_compiler_attention_gates(
     compiler,
     dim_positions: Optional[Mapping[str, int]] = None,
+    *,
+    softmax_mode: str = "softmax1",
 ) -> List[GateAuditEntry]:
     """Run the gate audit across every declarative attention spec in a compiler.
 
@@ -587,6 +696,9 @@ def audit_compiler_attention_gates(
     available the audit uses it to resolve aliased dims (e.g. when
     ``pin_io_only=True`` moves CONST off its legacy slot); when omitted it
     falls back to the ``_SetDim`` table.
+
+    ``softmax_mode`` defaults to ``"softmax1"`` (matches the deployed
+    model). See :func:`audit_attention_gates` for the classifier rules.
     """
 
     dim_name_map = build_dim_name_map(dim_positions)
@@ -599,14 +711,20 @@ def audit_compiler_attention_gates(
             for spec in specs:
                 entries.extend(
                     audit_attention_gates(
-                        spec, dim_name_map, op_name=op_name,
+                        spec, dim_name_map,
+                        op_name=op_name,
+                        softmax_mode=softmax_mode,
                     )
                 )
     return entries
 
 
 def format_gate_audit_report(entries: Sequence[GateAuditEntry]) -> str:
-    """Human-readable summary of the no-op / q-only entries."""
+    """Human-readable summary of the no-op / q-only entries.
+
+    ``softmax1_suppress`` entries are counted separately and are not
+    listed as flagged (they are effective gates under softmax1).
+    """
 
     by_kind: Dict[str, List[GateAuditEntry]] = defaultdict(list)
     for e in entries:
@@ -615,10 +733,12 @@ def format_gate_audit_report(entries: Sequence[GateAuditEntry]) -> str:
     safe = len(by_kind.get("safe", []))
     no_op = len(by_kind.get("no_op", []))
     q_only = len(by_kind.get("q_only", []))
+    sm1_suppress = len(by_kind.get("softmax1_suppress", []))
     lines = [
         f"ATTENTION GATE AUDIT: {total} Q-side condition gate(s) — "
-        f"{safe} safe, {no_op} no-op (K=CONST), {q_only} q-only "
-        f"(no K at slot)."
+        f"{safe} safe, {sm1_suppress} softmax1_suppress (K=CONST but "
+        f"row-suppressing under softmax1), {no_op} no-op (K=CONST), "
+        f"{q_only} q-only (no K at slot)."
     ]
     flagged = list(by_kind.get("no_op", [])) + list(by_kind.get("q_only", []))
     by_op: Dict[str, List[GateAuditEntry]] = defaultdict(list)
@@ -647,23 +767,36 @@ def format_gate_audit_report(entries: Sequence[GateAuditEntry]) -> str:
 def run_attention_gate_audit(
     compiler,
     dim_positions: Optional[Mapping[str, int]] = None,
+    *,
+    softmax_mode: str = "softmax1",
 ) -> List[GateAuditEntry]:
     """Compile-time entry point: audit every attention spec and warn.
 
     * Honours ``C4_SKIP_GATE_CHECK=1`` (returns empty list, no warning).
     * Default: emits a single :func:`warnings.warn` summarising the
-      no-op / q-only entries when the count is non-zero.
+      no-op / q-only entries when the count is non-zero. Entries
+      classified as ``softmax1_suppress`` are treated as effective and
+      do *not* contribute to the flagged set.
     * When ``C4_STRICT_GATE_CHECK=1``: raises ``GateAuditError`` instead
       of warning, listing every flagged entry.
 
-    Returns the *raw* audit-entry list (safe entries included) so callers
-    can post-process or compare against a known baseline.
+    ``softmax_mode`` defaults to ``"softmax1"`` (matches the deployed
+    model). Pass ``"softmax"`` to recover the legacy (pre-softmax1-aware)
+    verdict for cross-checks.
+
+    Returns the *raw* audit-entry list (safe + suppress entries included)
+    so callers can post-process or compare against a known baseline.
     """
 
     if os.environ.get(GATE_AUDIT_SKIP_ENV, "") == "1":
         return []
-    entries = audit_compiler_attention_gates(compiler, dim_positions)
-    flagged = [e for e in entries if e.kind != "safe"]
+    entries = audit_compiler_attention_gates(
+        compiler, dim_positions, softmax_mode=softmax_mode,
+    )
+    flagged = [
+        e for e in entries
+        if e.kind not in ("safe", "softmax1_suppress")
+    ]
     if not flagged:
         return entries
     report = format_gate_audit_report(entries)
@@ -699,5 +832,6 @@ __all__ = [
     "GATE_AUDIT_SKIP_ENV",
     "GATE_AUDIT_STRICT_ENV",
     "GATE_CONDITION_PREFIXES",
+    "SOFTMAX1_SUPPRESS_THRESHOLD",
     "UNIFORM_K_DIM_NAMES",
 ]

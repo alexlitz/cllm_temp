@@ -5,9 +5,15 @@ classifies each Q-side condition gate in a
 :class:`DeclarativeAttentionHeadSpec` as one of:
 
 * ``safe`` — K-side at the same slot writes a non-CONST discriminator;
-* ``no_op`` — K-side at the slot writes only CONST(s) (the canonical
-  "silent leak" case from
-  ``c4_release/docs/Q_SIDE_GATE_AUDIT_2026_06_07.md``);
+* ``softmax1_suppress`` — K-side at the slot writes only CONST(s), but
+  the per-row score contribution is sufficiently negative in one
+  regime (cond ON or OFF) that under softmax1 the zero-anchor sink
+  wins on those rows. The deployed model uses softmax1 (see
+  ``docs/IMM_OVERRIDE_REAL_SURFACE_2026_06_07.md``), so this counts
+  as an *effective* gate.
+* ``no_op`` — K-side at the slot writes only CONST(s) AND no softmax1
+  suppression applies (gate is ineffective under both softmax and
+  softmax1);
 * ``q_only`` — K-side has no write at the slot at all (literal dead
   weight).
 
@@ -66,15 +72,42 @@ def _safe_spec() -> DeclarativeAttentionHeadSpec:
     )
 
 
-def _noop_spec() -> DeclarativeAttentionHeadSpec:
-    """Q has MARK_PC at slot 33; K has only CONST at slot 33.
+def _suppress_spec() -> DeclarativeAttentionHeadSpec:
+    """Q has MARK_PC at slot 33 plus a negative CONST offset; K has only CONST.
 
-    This is the canonical anti-pattern from the audit doc — the GATE=33
-    pattern in ``_carry_forward_head_spec``.
+    This is the canonical GATE=33 pattern from ``_carry_forward_head_spec``
+    (audit doc). Under standard softmax the uniform offset cancels — the
+    gate is a "no_op". Under softmax1 the OFF regime score
+    (-7.5 * 15 = -112.5) drops the row below the zero-anchor sink, so
+    the gate IS effective ("softmax1_suppress").
     """
     return DeclarativeAttentionHeadSpec(
         head_idx=0,
         q=(AP(33, BD.MARK_PC, 15.0), AP(33, BD.CONST, -7.5)),
+        k=(AP(33, BD.CONST, 15.0),),
+        v=(),
+        o=(),
+    )
+
+
+# Back-compat alias — older tests / docs refer to the canonical fixture
+# as ``_noop_spec``. It's a misnomer post-softmax1 awareness (the spec
+# *does* suppress under softmax1), but the static-shape is identical.
+_noop_spec = _suppress_spec
+
+
+def _genuine_noop_spec() -> DeclarativeAttentionHeadSpec:
+    """Q has MARK_PC at slot 33 with no Q-side CONST offset; K has only CONST.
+
+    Without a Q-side CONST offset there's no per-row score base, so
+    the OFF regime contribution is 0 (not suppressive even under
+    softmax1) and the ON regime contribution is positive (not
+    suppressive either). The gate is ineffective under BOTH softmax
+    and softmax1 — this is the true "no_op" classification.
+    """
+    return DeclarativeAttentionHeadSpec(
+        head_idx=0,
+        q=(AP(33, BD.MARK_PC, 15.0),),
         k=(AP(33, BD.CONST, 15.0),),
         v=(),
         o=(),
@@ -92,11 +125,14 @@ def _q_only_spec() -> DeclarativeAttentionHeadSpec:
     )
 
 
-def _is_byte_gate_noop_spec() -> DeclarativeAttentionHeadSpec:
-    """Verify ``IS_*`` prefixed dims are also recognised as gate conditions.
+def _is_byte_gate_genuine_noop_spec() -> DeclarativeAttentionHeadSpec:
+    """``IS_*`` prefixed gate with no Q-side CONST offset — true no_op.
 
-    Mirrors the L10 PSH STACK0 passthrough no-op (slot 33, Q=IS_BYTE,
-    K=CONST only) from the audit doc.
+    Without a negative Q-side CONST offset to drive the OFF regime
+    below the sink, this gate is ineffective under both softmax and
+    softmax1: gates that select only via a positive ON-regime score
+    don't filter K positions, they just gate the whole row's
+    attention output. Tracked as ``no_op``.
     """
     return DeclarativeAttentionHeadSpec(
         head_idx=0,
@@ -105,6 +141,10 @@ def _is_byte_gate_noop_spec() -> DeclarativeAttentionHeadSpec:
         v=(),
         o=(),
     )
+
+
+# Back-compat alias for the original fixture name.
+_is_byte_gate_noop_spec = _is_byte_gate_genuine_noop_spec
 
 
 def _op_gate_safe_spec() -> DeclarativeAttentionHeadSpec:
@@ -129,16 +169,43 @@ class TestSyntheticClassification:
         assert "L1H1" in e.k_dim_names
         assert e.head_idx == 0
 
-    def test_known_noop_gate_classified_no_op(self):
-        entries = audit_attention_gates(_noop_spec())
-        # Q has two writes at slot 33; only MARK_PC is a condition dim.
-        # The CONST write at the same slot is not a condition gate.
+    def test_canonical_gate_classified_suppress_under_softmax1(self):
+        """The GATE=33 canonical pattern: under default ``softmax1`` mode
+        the negative Q-side CONST offset drives the OFF regime score below
+        the zero-anchor sink, so the gate IS effective ("softmax1_suppress").
+        """
+        entries = audit_attention_gates(_suppress_spec())
+        gate_entries = [e for e in entries if e.q_dim_name == "MARK_PC"]
+        assert len(gate_entries) == 1
+        e = gate_entries[0]
+        assert e.kind == "softmax1_suppress"
+        assert e.slot == 33
+        assert e.k_dim_names == ("CONST",)
+        assert e.softmax_mode == "softmax1"
+
+    def test_canonical_gate_classified_no_op_under_standard_softmax(self):
+        """Under explicit ``softmax_mode='softmax'`` the same canonical
+        GATE=33 pattern reverts to the legacy "no_op" verdict (uniform
+        K-side offset cancels under standard softmax).
+        """
+        entries = audit_attention_gates(
+            _suppress_spec(), softmax_mode="softmax",
+        )
         gate_entries = [e for e in entries if e.q_dim_name == "MARK_PC"]
         assert len(gate_entries) == 1
         e = gate_entries[0]
         assert e.kind == "no_op"
-        assert e.slot == 33
-        assert e.k_dim_names == ("CONST",)
+        assert e.softmax_mode == "softmax"
+
+    def test_genuine_no_op_classified_no_op_under_softmax1(self):
+        """A gate with no Q-side CONST offset has off_score == 0 under
+        softmax1 — neither regime drives the row below the sink, so the
+        gate is ineffective. Must classify as "no_op" even under softmax1.
+        """
+        entries = audit_attention_gates(_genuine_noop_spec())
+        assert len(entries) == 1
+        assert entries[0].kind == "no_op"
+        assert entries[0].softmax_mode == "softmax1"
 
     def test_q_only_gate_classified_q_only(self):
         entries = audit_attention_gates(_q_only_spec())
@@ -150,9 +217,10 @@ class TestSyntheticClassification:
         assert e.k_dim_names == ()
 
     def test_is_prefix_gate_recognised(self):
-        entries = audit_attention_gates(_is_byte_gate_noop_spec())
+        entries = audit_attention_gates(_is_byte_gate_genuine_noop_spec())
         assert len(entries) == 1
         assert entries[0].q_dim_name == "IS_BYTE"
+        # No Q-side CONST offset → genuine no_op even under softmax1.
         assert entries[0].kind == "no_op"
 
     def test_op_prefix_gate_with_real_k_discriminator_is_safe(self):
@@ -229,17 +297,30 @@ def _make_attn_op(name: str, spec: DeclarativeAttentionHeadSpec) -> Operation:
 
 class TestCompilerIntegration:
     def test_audit_finds_synthetic_no_op_in_compiler(self):
+        """The genuine no_op (no Q-CONST offset) is flagged even under
+        softmax1. The suppress-style fixture is reclassified instead."""
         c = LayerCompiler()
-        c.add_op(_make_attn_op("noop_op", _noop_spec()))
+        c.add_op(_make_attn_op("noop_op", _genuine_noop_spec()))
+        c.add_op(_make_attn_op("suppress_op", _suppress_spec()))
         c.add_op(_make_attn_op("safe_op", _safe_spec()))
         entries = audit_compiler_attention_gates(c)
         kinds = {e.op_name: e.kind for e in entries}
         assert kinds.get("noop_op") == "no_op"
+        assert kinds.get("suppress_op") == "softmax1_suppress"
         assert kinds.get("safe_op") == "safe"
+
+    def test_audit_legacy_softmax_mode_flags_canonical_pattern(self):
+        """With ``softmax_mode='softmax'`` the canonical GATE=33 pattern
+        falls back to ``no_op`` (pre-softmax1 behaviour)."""
+        c = LayerCompiler()
+        c.add_op(_make_attn_op("canonical_op", _suppress_spec()))
+        entries = audit_compiler_attention_gates(c, softmax_mode="softmax")
+        kinds = {e.op_name: e.kind for e in entries}
+        assert kinds.get("canonical_op") == "no_op"
 
     def test_run_attention_gate_audit_warns_on_no_op(self):
         c = LayerCompiler()
-        c.add_op(_make_attn_op("noop_op", _noop_spec()))
+        c.add_op(_make_attn_op("noop_op", _genuine_noop_spec()))
         with warnings.catch_warnings(record=True) as wlist:
             warnings.simplefilter("always")
             run_attention_gate_audit(c)
@@ -256,9 +337,20 @@ class TestCompilerIntegration:
         msgs = [str(w.message) for w in wlist if "ATTENTION GATE AUDIT" in str(w.message)]
         assert not msgs
 
+    def test_run_attention_gate_audit_silent_when_only_suppress(self):
+        """``softmax1_suppress`` entries are effective gates under
+        softmax1 — they must not trigger a warning."""
+        c = LayerCompiler()
+        c.add_op(_make_attn_op("suppress_op", _suppress_spec()))
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            run_attention_gate_audit(c)
+        msgs = [str(w.message) for w in wlist if "ATTENTION GATE AUDIT" in str(w.message)]
+        assert not msgs
+
     def test_skip_env_disables_check(self, monkeypatch):
         c = LayerCompiler()
-        c.add_op(_make_attn_op("noop_op", _noop_spec()))
+        c.add_op(_make_attn_op("noop_op", _genuine_noop_spec()))
         monkeypatch.setenv(GATE_AUDIT_SKIP_ENV, "1")
         with warnings.catch_warnings(record=True) as wlist:
             warnings.simplefilter("always")
@@ -269,7 +361,7 @@ class TestCompilerIntegration:
 
     def test_strict_env_raises(self, monkeypatch):
         c = LayerCompiler()
-        c.add_op(_make_attn_op("noop_op", _noop_spec()))
+        c.add_op(_make_attn_op("noop_op", _genuine_noop_spec()))
         monkeypatch.setenv(GATE_AUDIT_STRICT_ENV, "1")
         with pytest.raises(GateAuditError) as exc_info:
             run_attention_gate_audit(c)
@@ -372,13 +464,14 @@ def test_production_no_op_gate_count_meets_doc_floor():
     )
 
 
-# Op names the audit doc explicitly calls out as containing no-op /
-# q-only gates. The production audit must flag every one of these — if
-# a name drops out, either the op was repaired (good) or the audit
+# Op names the audit doc explicitly calls out as containing K=CONST
+# Q-side condition gates. The production audit must classify every one
+# of these as non-``safe`` — either ``softmax1_suppress`` (effective
+# under softmax1; the canonical GATE=33 pattern) or ``no_op`` /
+# ``q_only`` (truly broken). If a name drops out, either the op was
+# restructured to use real K-side discriminators (good) or the audit
 # lost coverage (bad).
 DOC_FLAGGED_OPS_FLOOR: frozenset = frozenset({
-    # GATE=33 anti-pattern in L3 carry-forward + relay heads.
-    "layer3_carry_forward_attn",
     # L4 PC relay (declarative GATE=33 anti-pattern).
     "layer4_pc_relay",
     # L5 fetch heads — slot 32 dead weight + slot 33 K=CONST blockers.
@@ -390,14 +483,21 @@ DOC_FLAGGED_OPS_FLOOR: frozenset = frozenset({
     # L9 LEV addr / BP->PC relay (GATE=33 anti-pattern).
     "layer9_lev_addr_relay",
     "layer9_lev_bp_to_pc_relay",
-    # L10 stack0 persistence + byte passthrough chain heads.
-    "layer10_stack0_byte_relay_bake",
     # L14 MEM-generation slot 33/38 K=CONST blockers.
     "layer14_mem_generation",
     # L15 ALU high-byte relay slot 33/34 K=CONST blockers.
     "layer15_alu_high_byte_relay",
     # model_ops.py function-call routing path (slot 33/34).
     "function_call_weights",
+    # REMOVED (repaired with K-side complements):
+    # - layer3_carry_forward_attn (commit c1f1af2e)
+    # - layer10_stack0_byte_relay_bake (commit c1f1af2e)
+})
+
+# Kinds that indicate the audit still recognises a K=CONST condition
+# gate on the op (either effective-under-softmax1 or genuinely broken).
+_CONST_K_KINDS: frozenset = frozenset({
+    "softmax1_suppress", "no_op", "q_only",
 })
 
 
@@ -407,14 +507,58 @@ DOC_FLAGGED_OPS_FLOOR: frozenset = frozenset({
     reason=f"{GATE_AUDIT_SKIP_ENV}=1 in environment",
 )
 def test_production_doc_listed_ops_all_flagged():
-    """Every op the doc names is flagged in the production audit."""
+    """Every op the doc names still has a K=CONST condition gate in the audit.
+
+    With softmax1-awareness many gates classify as ``softmax1_suppress``
+    (effective under softmax1) rather than ``no_op``, but the op should
+    still appear with a non-``safe`` kind because the K-side at the
+    flagged slot is still CONST-only. If the op drops out entirely the
+    op was restructured to use a real K-side discriminator (in which
+    case remove it from ``DOC_FLAGGED_OPS_FLOOR``).
+    """
     entries = _compile_and_capture_audit()
-    flagged_ops = {
-        e.op_name for e in entries if e.kind != "safe" and e.op_name
+    const_k_ops = {
+        e.op_name for e in entries
+        if e.kind in _CONST_K_KINDS and e.op_name
     }
-    missing = DOC_FLAGGED_OPS_FLOOR - flagged_ops
+    missing = DOC_FLAGGED_OPS_FLOOR - const_k_ops
     assert not missing, (
         f"Doc-listed ops missing from production audit: {sorted(missing)}. "
-        "Either those ops were repaired (remove from "
-        "DOC_FLAGGED_OPS_FLOOR) or the audit lost coverage."
+        "Either those ops were repaired to use real K-side discriminators "
+        "(remove from DOC_FLAGGED_OPS_FLOOR) or the audit lost coverage."
+    )
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.skipif(
+    os.environ.get(GATE_AUDIT_SKIP_ENV) == "1",
+    reason=f"{GATE_AUDIT_SKIP_ENV}=1 in environment",
+)
+def test_production_softmax1_reduces_flagged_count():
+    """Softmax1-aware audit must classify substantially fewer gates as
+    ``no_op`` than the legacy softmax-mode audit, because the canonical
+    GATE=33 pattern is effective under softmax1.
+    """
+    from c4_release.neural_vm.unified_compiler.dsl_interpreter import (
+        audit_compiler_attention_gates,
+    )
+
+    entries_sm1 = _compile_and_capture_audit()
+    sm1_no_op = sum(1 for e in entries_sm1 if e.kind == "no_op")
+    sm1_suppress = sum(
+        1 for e in entries_sm1 if e.kind == "softmax1_suppress"
+    )
+    assert sm1_suppress > 0, (
+        "Softmax1-aware audit produced 0 softmax1_suppress entries; "
+        "either the audit regressed or every CONST-K gate is now truly "
+        "broken (investigate)."
+    )
+    # The reclassified suppress set should dominate the remaining no_op
+    # set — the original audit doc enumerated 70 instances; if softmax1
+    # awareness leaves more than 35 as no_op, the threshold heuristic
+    # may be too conservative.
+    assert sm1_no_op < sm1_suppress, (
+        f"Softmax1 audit still classifies {sm1_no_op} gates as no_op "
+        f"vs {sm1_suppress} as softmax1_suppress — the reclassifier "
+        "should dominate."
     )
