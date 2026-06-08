@@ -4383,10 +4383,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         scope="mark == STACK0",
                         dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
                         conditions=base_conditions + (
-                            (f"OUTPUT_LO+{lo}", 0.1),
-                            (f"OUTPUT_HI_THIS_STEP+{hi}", 0.1),
+                            (f"OUTPUT_LO+{lo}", 0.05),
+                            (f"OUTPUT_HI_THIS_STEP+{hi}", 0.05),
                         ),
-                        threshold=10.5,
+                        threshold=12.0,
                         gate=gate_mark_stack0,
                         writes=byte_writes(value, strength=500.0),
                     )
