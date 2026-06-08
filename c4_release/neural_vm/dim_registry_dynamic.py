@@ -61,7 +61,16 @@ def build_default_registry_dynamic() -> DimRegistry:
     # compact pin_io_only layout block at positions 510..732. See the
     # ``# --- Compact pin_io_only layout mirrors ---`` block at the end
     # of this function for the ``_PIN``-suffix family.
-    a = Allocator(d_model=736)
+    #
+    # Wave-1 A1 (2026-06-07): d_model further expanded 736 -> 832 to
+    # carry the new ``STACK0_BYTE_VAL_h_LO/HI`` family (h ∈ {1,2,3}, 6
+    # names × 16 wide = 96 dims). These slots sit at 734..829, just
+    # after the opt-in NORM_COMPENSATOR area (733). They are scaffolded
+    # but unwritten/unread at this commit — Wave-1 A3 will add the L10
+    # PSH broadcast that fills them, and L14 mem_generation will read
+    # them. See docs/WAVE_PLAN_2026_06_07.md §A1 and
+    # docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md.
+    a = Allocator(d_model=832)
 
     def pin(name, start, size, desc, semantics=None, alias=False):
         # Tiny wrapper that mirrors the (name, start, size, desc, semantics)
@@ -579,6 +588,40 @@ def build_default_registry_dynamic() -> DimRegistry:
         pin("NORM_COMPENSATOR", 733, 1,
             "Qwen R1 RMSNorm compensator: every token carries K here",
             "is_byte OR NOT is_byte")
+
+    # ------------------------------------------------------------------
+    # Wave-1 A1 — STACK0_BYTE_VAL_h_LO/HI family (734..829)
+    # ------------------------------------------------------------------
+    # Scaffold a new dim family that will hold AX byte 1/2/3 values
+    # broadcast from MARK_AX positions to the corresponding STACK0 byte
+    # rows during PSH. Wave-1 A3 will add the L10 broadcast head; L14
+    # mem_generation will be migrated to read these dims. Until those
+    # commits land the slots are unwritten and unread — they must be
+    # invisible to existing behaviour.
+    #
+    # Each of LO/HI is a 16-wide one-hot nibble (mirrors the
+    # CLEAN_EMBED_LO/HI / OUTPUT_LO/HI pattern). Gating is "fires at
+    # STACK0 byte-h positions during a PSH step".
+    # See docs/WAVE_PLAN_2026_06_07.md §A1 and
+    # docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md.
+    pin("STACK0_BYTE_VAL_1_LO", 734, 16,
+        "AX byte-1 value lo nibble broadcast to STACK0 byte-1 row (PSH)",
+        "mark == STACK0 AND byte_index == 1 AND opcode_in_step in {PSH}")
+    pin("STACK0_BYTE_VAL_1_HI", 750, 16,
+        "AX byte-1 value hi nibble broadcast to STACK0 byte-1 row (PSH)",
+        "mark == STACK0 AND byte_index == 1 AND opcode_in_step in {PSH}")
+    pin("STACK0_BYTE_VAL_2_LO", 766, 16,
+        "AX byte-2 value lo nibble broadcast to STACK0 byte-2 row (PSH)",
+        "mark == STACK0 AND byte_index == 2 AND opcode_in_step in {PSH}")
+    pin("STACK0_BYTE_VAL_2_HI", 782, 16,
+        "AX byte-2 value hi nibble broadcast to STACK0 byte-2 row (PSH)",
+        "mark == STACK0 AND byte_index == 2 AND opcode_in_step in {PSH}")
+    pin("STACK0_BYTE_VAL_3_LO", 798, 16,
+        "AX byte-3 value lo nibble broadcast to STACK0 byte-3 row (PSH)",
+        "mark == STACK0 AND byte_index == 3 AND opcode_in_step in {PSH}")
+    pin("STACK0_BYTE_VAL_3_HI", 814, 16,
+        "AX byte-3 value hi nibble broadcast to STACK0 byte-3 row (PSH)",
+        "mark == STACK0 AND byte_index == 3 AND opcode_in_step in {PSH}")
 
     reg = a.to_registry()
     # Phase 7.E.1 — apply the same semantic-category bindings as the

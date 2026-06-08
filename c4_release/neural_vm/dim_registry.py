@@ -487,7 +487,13 @@ def build_default_registry() -> DimRegistry:
     # can be progressively dropped family-by-family.
     from neural_vm.dim_allocator import Allocator
 
-    a = Allocator(d_model=736)
+    # Wave-1 A1 (2026-06-07): d_model further expanded 736 -> 832 to
+    # carry the new ``STACK0_BYTE_VAL_h_LO/HI`` family (h ∈ {1,2,3}, 6
+    # names × 16 wide = 96 dims) at positions 734..829, just after the
+    # opt-in NORM_COMPENSATOR area (733). Scaffolding only — no writer
+    # or reader at this commit (those land in Wave-1 A3 / L14 migration).
+    # See docs/WAVE_PLAN_2026_06_07.md §A1.
+    a = Allocator(d_model=832)
 
     def _pin(name, start, size, desc, semantics=None, alias=False):
         """Thin wrapper that mirrors ``DimRegistry.alloc``'s signature so
@@ -1141,6 +1147,40 @@ def build_default_registry() -> DimRegistry:
         _pin("NORM_COMPENSATOR", 733, 1,
                   "Qwen R1 RMSNorm compensator: every token carries K here",
                   semantics="is_byte OR NOT is_byte")
+
+    # ------------------------------------------------------------------
+    # Wave-1 A1 — STACK0_BYTE_VAL_h_LO/HI family (734..829)
+    # ------------------------------------------------------------------
+    # Scaffold a new dim family that will hold AX byte 1/2/3 values
+    # broadcast from MARK_AX to the matching STACK0 byte rows during
+    # PSH. Wave-1 A3 will add the L10 PSH broadcast head that fills
+    # these slots, and L14 mem_generation will be migrated to read
+    # them. Until those commits land the slots are unwritten and
+    # unread — they must be invisible to existing behaviour.
+    #
+    # Each of LO/HI is a 16-wide one-hot nibble (mirrors the
+    # CLEAN_EMBED_LO/HI / OUTPUT_LO/HI pattern). Gating predicate is
+    # "fires at STACK0 byte-h positions during a PSH step".
+    # See docs/WAVE_PLAN_2026_06_07.md §A1 and
+    # docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md.
+    _pin("STACK0_BYTE_VAL_1_LO", 734, 16,
+              "AX byte-1 value lo nibble broadcast to STACK0 byte-1 row (PSH)",
+              semantics="mark == STACK0 AND byte_index == 1 AND opcode_in_step in {PSH}")
+    _pin("STACK0_BYTE_VAL_1_HI", 750, 16,
+              "AX byte-1 value hi nibble broadcast to STACK0 byte-1 row (PSH)",
+              semantics="mark == STACK0 AND byte_index == 1 AND opcode_in_step in {PSH}")
+    _pin("STACK0_BYTE_VAL_2_LO", 766, 16,
+              "AX byte-2 value lo nibble broadcast to STACK0 byte-2 row (PSH)",
+              semantics="mark == STACK0 AND byte_index == 2 AND opcode_in_step in {PSH}")
+    _pin("STACK0_BYTE_VAL_2_HI", 782, 16,
+              "AX byte-2 value hi nibble broadcast to STACK0 byte-2 row (PSH)",
+              semantics="mark == STACK0 AND byte_index == 2 AND opcode_in_step in {PSH}")
+    _pin("STACK0_BYTE_VAL_3_LO", 798, 16,
+              "AX byte-3 value lo nibble broadcast to STACK0 byte-3 row (PSH)",
+              semantics="mark == STACK0 AND byte_index == 3 AND opcode_in_step in {PSH}")
+    _pin("STACK0_BYTE_VAL_3_HI", 814, 16,
+              "AX byte-3 value hi nibble broadcast to STACK0 byte-3 row (PSH)",
+              semantics="mark == STACK0 AND byte_index == 3 AND opcode_in_step in {PSH}")
 
     reg = a.to_registry()
     _register_default_categories(reg)
