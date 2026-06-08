@@ -87,9 +87,12 @@ collected 1098 items / 1073 deselected / 25 selected
 ```
 
 - **24 / 25 pass** (96 %).
-- **1 / 25 fail** (xfail) — `bool_and_22` (the parametrised
-  `a > b && b > c` shape on a triple where the `(a, b, c)` random draw
-  hits the var-MEM_addr1 surface).
+- **1 / 25 fail** (xfail) — `bool_and_21` with parametrisation
+  `64 > 47 && 47 > 30` (expected `1`). The triple `(a, b, c) = (64, 47, 30)`
+  satisfies both inner predicates so the program must traverse two
+  nested BZ-not-taken edges and emit `1` via the inner `return 1;`
+  body; the neural emit hits the var-MEM_addr1 baseline at the inner
+  `if` BZ-target.
 
 ## Step 3 — Simplest failing test + L13/L14 hook divergence
 
@@ -169,18 +172,18 @@ this step matches the `edge_if_hundred` pattern: the BZ override at L6
 re-fires with the wrong band because `HAS_SE` is no longer the
 distinguishing first-step gate.
 
-### `bool_and_22` (simplest var-MEM_addr1 bleed)
+### `bool_and_21` (simplest var-MEM_addr1 bleed)
 
 Per `1096_TRIAGE_2026_06_05.md` Bucket A, all bool_and tests are
 nested `if`s — `if (a > b) { if (b > c) return 1; }`. The first `if`
 emits a BZ relative to the *function-frame* address space, and the
 nested second `if` relies on the same residual at a deeper stack
-depth. For the specific random draw at `bool_and_22`, the inner
-comparison ((a,b,c) = (53, 51, 96) under seed 42) produces
-`a > b = TRUE` and `b > c = FALSE`. The neural emit reads stale
-`MEM_addr1` for the inner-`if` BZ target (the var MEM_addr1 baseline
-documented in `VAR_REAL_ATTRIBUTION_2026_06_05.md`) — same L3 `mem_byte_0_default` +
-L13 head 7 `top_store_query` aux pattern as Wave C2.
+depth. For the random draw at `bool_and_21` ((a, b, c) =
+(64, 47, 30) under seed 42), both inner predicates are TRUE, so the
+neural emit must traverse two BZ-not-taken edges and read stale
+`MEM_addr1` for the inner-`if` body target. This is the same L3
+`mem_byte_0_default` + L13 head 7 `top_store_query` aux pattern as
+Wave C2 (documented in `VAR_REAL_ATTRIBUTION_2026_06_05.md`).
 
 ## Step 4 — Cross-reference closeout plan C1/C2/C3/C4 surfaces
 
@@ -189,7 +192,7 @@ L13 head 7 `top_store_query` aux pattern as Wave C2.
 | `edge_zero_mul` / `_div` / `_mod` | **none (Bug #34)** | Wide-MUL/DIV/MOD 0-operand sentinel; not covered by C1-C4. Falls under Bug #34 (loop_pow2/loop_mul 0xD8 sentinel). Single-rule fix candidate per `BUG_CATALOG.md`. |
 | `edge_if_hundred` / `edge_loop_never` / `edge_loop_once_skip` | **none (new "branch re-fire" surface)** | L6 `post_l9_bz_bnz_pc_override` re-fire — same surface as Wave J loops per `LOOP_RECUR_ATTRIBUTION_2026_06_07.md`; not covered by C1-C4. Recommend adding **Wave C5** = branch-target re-fire. |
 | `absdiff_*` (25 / 25) | **partial overlap with C1** | The function-call return path (LEV→AX recovery) shares the L16 LEV / L6 head-7 AX_CARRY refresh surface that C1 targets via `func_add`. Bug #33 in `BUG_CATALOG.md` calls absdiff_* + nested_quad_* downstream of the same L10 PSH addr0_e0 OP_ENT guard. Likely partial closure (≤ ⅓) from C1 alone; the BZ-relay re-fire from `ABSDIFF_BZ_REDIRECT_BUG.md` is the dominant remaining surface and needs Wave C5. |
-| `bool_and_22` | **C2 (`var_*` L3 SP_byte2)** | The single survivor xfail inherits the var-MEM_addr1 baseline (L3 `mem_byte_0_default` + L13 head 7 `top_store_query` aux). Per Wave A fix candidate in `1096_TRIAGE_2026_06_05.md` § Recommended next-round targets #1 + #2. |
+| `bool_and_21` | **C2 (`var_*` L3 SP_byte2)** | The single survivor xfail inherits the var-MEM_addr1 baseline (L3 `mem_byte_0_default` + L13 head 7 `top_store_query` aux). Per Wave A fix candidate in `1096_TRIAGE_2026_06_05.md` § Recommended next-round targets #1 + #2. |
 
 **No EQ Shape-B (C3) bleed** in these three clusters. **No `expr_add_mul`
 (C4) bleed** in these three clusters.
