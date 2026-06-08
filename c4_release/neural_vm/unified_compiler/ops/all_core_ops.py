@@ -239,6 +239,10 @@ def all_core_ops(
         make_layer10_byte_passthrough_op(),
         make_layer10_sp_byte_passthrough_op(),
         make_layer10_psh_stack0_passthrough_op(),
+        # Wave 1 A3 broadcast topology anchor (slots 8/9/10):
+        # AX byte 1/2/3 -> STACK0_BYTE_VAL_h_LO/HI at STACK0 byte rows
+        # during OP_PSH. See docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md.
+        make_layer10_psh_ax_broadcast_op(),
         # 5 block-level bake ops (phases 10.0..10.4): the actual attn weight
         # bakes for L10 heads 0-4. Inline calls in set_vm_weights have been
         # removed; these own the bake. The five kind="attn" placeholders above
@@ -249,6 +253,12 @@ def all_core_ops(
         make_layer10_sp_byte_passthrough_bake_op(),
         make_layer10_bp_byte_passthrough_bake_op(),
         make_layer10_psh_stack0_passthrough_bake_op(),
+        # Wave 1 A3: resize L10 attn 8 -> 12 heads BEFORE the broadcast
+        # bake (otherwise slots 8/9/10 write out-of-bounds). Mirrors
+        # ``l15_attention_resize`` for L15.
+        make_l10_attention_resize_op(),
+        # Wave 1 A3 broadcast heads bake (slots 8/9/10), phase ~10.35.
+        make_layer10_psh_ax_broadcast_bake_op(),
         make_layer10_stack0_byte_relay_bake_op(),
         make_layer10_alu_op(),
         # Cluster D fix (2026-06-03): post-L9 BZ/BNZ PC override owner.

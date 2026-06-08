@@ -7,7 +7,7 @@ from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule
-from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule
+from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StructuralOp
 from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -44,6 +44,13 @@ _L10_HEAD_LAYOUT = (
     ("layer10_stack0_byte_relay_bake.head_5",            5),  # non-bitwise stack-byte relay
     ("layer10_stack0_byte_relay_bake.head_6",            6),  # STACK0 byte persistence
     ("layer10_bp_byte_passthrough_bake.head_7",          7),  # BP byte passthrough
+    # Wave 1 A3 broadcast heads: copy AX byte h CLEAN_EMBED to
+    # STACK0_BYTE_VAL_h_LO/HI at the matching STACK0 byte row during
+    # OP_PSH. See ``_layer10_psh_ax_broadcast_head_spec`` for the design.
+    # Slot 11 reserved; A2 widened L10 attn budget to 12 (commit d39159a1).
+    ("layer10_psh_ax_broadcast_bake.head_8",             8),  # PSH AX_b1 -> STACK0_BYTE_VAL_1
+    ("layer10_psh_ax_broadcast_bake.head_9",             9),  # PSH AX_b2 -> STACK0_BYTE_VAL_2
+    ("layer10_psh_ax_broadcast_bake.head_10",            10), # PSH AX_b3 -> STACK0_BYTE_VAL_3
 )
 
 
@@ -1635,6 +1642,130 @@ def _layer10_psh_stack0_passthrough_head_spec(BD, S) -> DeclarativeAttentionHead
     )
 
 
+# === Wave 1 A3: PSH AX byte 1/2/3 -> STACK0_BYTE_VAL_h_LO/HI broadcast ====
+#
+# The L8 sp_gather audit (docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md) showed
+# no head broadcasts AX byte values 1/2/3 to the STACK0 byte rows during PSH.
+# As a result, L14 mem_generation's BP-relative reads on byte 1/2/3 of the
+# STACK0 frame pull zeros, breaking SI/LI/SC/LC round-trips on the memory
+# smoke suite.
+#
+# This op adds 3 new heads (slots 8/9/10, freed by Wave 1 A2 d39159a1) that
+# attend from the Q-side STACK0 byte h row to the K-side AX byte h source
+# row during OP_PSH, copying CLEAN_EMBED to the new STACK0_BYTE_VAL_h_LO/HI
+# dim family (scaffolded in Wave 1 A1 c31897aa).
+
+
+def _layer10_psh_ax_broadcast_head_spec(BD, S, byte_h: int) -> DeclarativeAttentionHeadSpec:
+    """Broadcast AX byte h CLEAN_EMBED to STACK0_BYTE_VAL_h_LO/HI on PSH.
+
+    Wave 1 Cluster A3 — fills the missing producer identified in the L8
+    sp_gather audit. Three sibling heads (h=1,2,3) each:
+
+    * Q fires at: ``MARK_STACK0`` AND ``BYTE_INDEX_h`` AND ``OP_PSH``.
+    * K fires at: ``MARK_AX`` AND ``BYTE_INDEX_h`` (the AX byte-h row).
+    * V copies ``CLEAN_EMBED_{LO,HI}`` from the K row.
+    * O writes the nibble pair to ``STACK0_BYTE_VAL_h_{LO,HI}`` at the Q row.
+
+    K-side complement at slot 33 (softmax1-aware, per the L10
+    ``stack0_persistence`` slot-33 fix in commit 9bb21bf4): the multi-
+    condition Q gate has matching ``AP(33, MARK_AX, M)`` +
+    ``AP(33, BYTE_INDEX_h, M)`` K complements so the gate routes
+    positively only at the intended AX byte h row. Without the K-side
+    positive, the uniform-negative Q gate softmax-cancels and the head
+    has no per-row preference.
+
+    Slot layout (HD=64, V/O slots 0..31 used, slot 0 for main Q/K
+    selection, slot 33 for active-step gate):
+
+      slot 0..15  : V[CLEAN_EMBED_LO + k] -> O[STACK0_BYTE_VAL_h_LO + k]
+      slot 16..31 : V[CLEAN_EMBED_HI + k] -> O[STACK0_BYTE_VAL_h_HI + k]
+      slot 0  Q/K: main row selection
+      slot 33 Q/K: softmax1-aware active-step (OP_PSH) gate
+    """
+    AX_IDX = 1
+    L = S
+    M = 50.0 * S
+    byte_index_dim = getattr(BD, f"BYTE_INDEX_{byte_h}")
+    value_lo_dim = getattr(BD, f"STACK0_BYTE_VAL_{byte_h}_LO")
+    value_hi_dim = getattr(BD, f"STACK0_BYTE_VAL_{byte_h}_HI")
+
+    # Q gate: fire at STACK0 byte-h row during OP_PSH step.
+    q = [
+        AP(0, BD.MARK_STACK0, L),
+        AP(0, byte_index_dim, L),
+        AP(0, BD.OP_PSH, L),
+        AP(0, BD.CONST, -L * 2.0),
+        # Suppress other byte indices: only the matching row should fire.
+        *(
+            [AP(0, getattr(BD, f"BYTE_INDEX_{j}"), -L)
+             for j in (0, 1, 2, 3) if j != byte_h]
+        ),
+        # Suppress other marker rows.
+        AP(0, BD.MARK_AX, -L),
+        AP(0, BD.MARK_SP, -L),
+        AP(0, BD.MARK_BP, -L),
+        AP(0, BD.MARK_PC, -L),
+        AP(0, BD.MARK_MEM, -L),
+
+        # Slot 33: softmax1-aware active-step gate (per 9bb21bf4
+        # ``stack0_persistence`` pattern). Negative CONST baseline; the
+        # multi-condition positives + K-side complement light up only the
+        # intended (Q,K) pair.
+        AP(33, BD.CONST, -30000.0),
+        AP(33, BD.MARK_STACK0, 10000.0),
+        AP(33, byte_index_dim, 10000.0),
+        AP(33, BD.OP_PSH, 10000.0),
+        # Block other ops at slot 33 so the head is OP_PSH-exclusive.
+        AP(33, BD.OP_SI, -10000.0),
+        AP(33, BD.OP_SC, -10000.0),
+        AP(33, BD.OP_JSR, -10000.0),
+        AP(33, BD.OP_ENT, -10000.0),
+    ]
+
+    # K gate: fire on AX byte-h source row.
+    k = [
+        AP(0, BD.MARK_AX, L),
+        AP(0, byte_index_dim, L),
+        AP(0, BD.IS_BYTE, L),
+        AP(0, BD.H1 + AX_IDX, L),
+
+        # K-side complement for slot 33 (softmax1-aware pattern).
+        AP(33, BD.MARK_AX, M),
+        AP(33, byte_index_dim, M),
+        AP(33, BD.CONST, 100.0),
+    ]
+
+    # V: copy CLEAN_EMBED nibbles. O: write to new STACK0_BYTE_VAL_h dims.
+    v = []
+    o = []
+    for k_idx in range(16):
+        v.append(AP(k_idx, BD.CLEAN_EMBED_LO + k_idx, 1.0))
+        v.append(AP(16 + k_idx, BD.CLEAN_EMBED_HI + k_idx, 1.0))
+        o.append(AO(value_lo_dim + k_idx, k_idx, 3.0))
+        o.append(AO(value_hi_dim + k_idx, 16 + k_idx, 3.0))
+
+    head_idx = _l10_head_idx(f"layer10_psh_ax_broadcast_bake.head_{7 + byte_h}")
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+    )
+
+
+def _layer10_psh_ax_broadcast_ir(dim_positions, HD) -> CompilerIR:
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    for byte_h in (1, 2, 3):
+        ir.layer(0).attention.append(
+            _layer10_psh_ax_broadcast_head_spec(proxy, 100.0, byte_h),
+            name=f"layer10_psh_ax_broadcast_bake.head_{7 + byte_h}",
+        )
+    return ir
+
+
 def _bake_layer10_stack0_byte_relay_head(attn, BD, S, HD) -> None:
     """Declarative L10 STACK0 byte relay specs."""
     Primitives.generate_attention_head(
@@ -2282,6 +2413,36 @@ def make_layer10_psh_stack0_passthrough_op() -> Operation:
     )
 
 
+def make_layer10_psh_ax_broadcast_op() -> Operation:
+    """Topology anchor for the Wave 1 A3 broadcast heads (slots 8/9/10).
+
+    The actual weight bake is owned by ``layer10_psh_ax_broadcast_bake``
+    below; this op is the dep-graph anchor that downstream consumers
+    (L14 mem_generation migration) target via ``STACK0_BYTE_VAL_h_LO/HI``
+    reads.
+    """
+    def bake(attn, dim_positions, S):
+        return None
+
+    return Operation(
+        name="layer10_psh_ax_broadcast",
+        reads={"MARK_STACK0", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_PC",
+               "MARK_MEM", "IS_BYTE", "OP_PSH", "OP_SI", "OP_SC", "OP_JSR",
+               "OP_ENT", "H1", "CONST",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
+                "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
+                "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"},
+        kind="attn",
+        migrated=True,
+        declarative_authority="topology_anchor",
+        compiler_ir=CompilerIR(),
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
 # -- L10 attention bake ops (migrated 2026-05-10) -----------------------------
 #
 # These five ``kind="block", layer_idx=10, migrated=True`` ops bake the five
@@ -2667,6 +2828,149 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
         declarative_authority="spec_generated",
         claims=_claims,
         smoke_tests={"TestSmokeBasic::test_add_basic"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+# === Wave 1 A3 attn resize + broadcast bake ==============================
+
+
+def _layer10_attention_resize_follow_up(block, dim_positions, S) -> None:
+    """Post-resize bookkeeping: restore the per-head ALiBi pins wiped by resize.
+
+    The structural resize rebuilds ``attn.alibi_slopes`` from scratch with
+    the standard ``2 ** (-8/N * (i+1))`` decay, wiping any per-head pins
+    that earlier bakes had stamped. L10 head 1 (byte_passthrough) and
+    head 2 (sp_byte_passthrough) had pin=1.0 set inside their bake_fns
+    BEFORE this resize fires; head 6 (stack0_persistence) re-pins itself
+    AFTER the resize from its own bake. Restore the head 1/2 pins here.
+    """
+    del dim_positions, S
+    attn = block.attn
+    if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+        attn.alibi_slopes.data[1] = 1.0
+        attn.alibi_slopes.data[2] = 1.0
+
+
+def _layer10_attention_resize_structural_ir(dim_positions, head_dim) -> CompilerIR:
+    """Build the declarative CompilerIR for ``l10_attention_resize``.
+
+    The L10 attention block default-builds with ``num_heads=8`` but Wave
+    1 A3 broadcast heads land at slots 8/9/10 — the attention block
+    must grow accordingly. Mirrors the L15 resize pattern with a single
+    ``target_num_heads=12`` for all build configurations.
+    """
+    del dim_positions, head_dim
+    ir = CompilerIR()
+    ir.layer(0).structural_ops.append(
+        StructuralOp(
+            kind="attention_resize",
+            target_num_heads=12,
+            alibi_pin_value=None,
+            follow_up=_layer10_attention_resize_follow_up,
+            metadata={
+                "op_name": "l10_attention_resize",
+                "spec_section": "BLOG_SPEC.md#registers",
+            },
+        )
+    )
+    return ir
+
+
+def make_l10_attention_resize_op() -> Operation:
+    """Resize L10 attention from ``num_heads=8`` to ``num_heads=12``.
+
+    Wave 1 A3 prerequisite: default L10 attn ships with 8 heads, so
+    the A3 broadcast heads (slots 8/9/10) would write out-of-bounds
+    into ``attn.W_q/W_k/W_v/W_o``. This op resizes the attention block
+    to 12 heads before the broadcast bake fires, mirroring
+    ``l15_attention_resize``. Existing heads 0..7 are preserved
+    bit-for-bit; the leading slice of each weight matrix is copied
+    through unchanged. Runs AFTER the original L10 attn bakes (phase
+    10.0..10.3) and BEFORE the A3 broadcast bake (phase 10.35) and
+    stack0_byte_relay bake (phase 10.4).
+    """
+    def bake(block, dim_positions, S):
+        ir = _layer10_attention_resize_structural_ir(dim_positions, None)
+        ir.lower_structural_ops(block, dim_positions, S=S)
+
+    return Operation(
+        name="l10_attention_resize",
+        slot_share=("attn",),
+        reads=set(),
+        writes=set(),
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer10_attention_resize_structural_ir,
+        target_op_name="_layer10_attn_anchor",
+        migrated=True,
+        declarative_authority="spec_generated",
+        # Run AFTER the original L10 attn bakes so we resize an already-
+        # populated block; before the broadcast + stack0_byte_relay
+        # bakes so they see the wider attn.
+        requires={"after": "layer10_psh_stack0_passthrough_bake"},
+        claims=set(),
+        produces={'__module_replacement': 'L10.attn[resize num_heads]'},
+        smoke_tests=set(),
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def make_layer10_psh_ax_broadcast_bake_op() -> Operation:
+    """Wave 1 A3 — broadcast AX byte 1/2/3 -> STACK0_BYTE_VAL_h on PSH.
+
+    Three heads (slots 8/9/10), one per byte h. Q fires at MARK_STACK0 +
+    BYTE_INDEX_h + OP_PSH; K fires at MARK_AX + BYTE_INDEX_h; V copies
+    CLEAN_EMBED_{LO,HI}; O writes STACK0_BYTE_VAL_{h}_{LO,HI} (Wave 1 A1
+    dim family). Closes the missing producer identified in
+    docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md.
+    """
+    def bake(block, dim_positions, S):
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        head_allocator = _allocate_layer10_attention_heads()
+        attn._l10_head_allocator = head_allocator
+        HD = attn.W_q.shape[0] // attn.num_heads
+        for byte_h in (1, 2, 3):
+            Primitives.generate_attention_head(
+                attn,
+                _layer10_psh_ax_broadcast_head_spec(proxy, S, byte_h),
+                HD,
+            )
+
+    # Dim-ownership claims: heads 8/9/10 V slots 0..31 read CLEAN_EMBED.
+    _claims = set()
+    for byte_h in (1, 2, 3):
+        head_idx = 7 + byte_h
+        for k in range(16):
+            _claims.add(
+                (10, "attn_W_v", f"{head_idx}_{k}", f"CLEAN_EMBED_LO+{k}"),
+            )
+            _claims.add(
+                (10, "attn_W_v", f"{head_idx}_{16 + k}",
+                 f"CLEAN_EMBED_HI+{k}"),
+            )
+
+    return Operation(
+        name="layer10_psh_ax_broadcast_bake",
+        reads={"MARK_STACK0", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_PC",
+               "MARK_MEM", "IS_BYTE", "OP_PSH", "OP_SI", "OP_SC", "OP_JSR",
+               "OP_ENT", "H1", "CONST",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
+                "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
+                "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer10_psh_ax_broadcast_ir,
+        target_op_name="_layer10_attn_anchor",
+        migrated=True,
+        declarative_authority="spec_generated",
+        # Ensure resize runs first so the block has 12 heads available.
+        requires={"after": "l10_attention_resize"},
+        claims=_claims,
+        smoke_tests={"TestSmokeMemory::test_si_li_roundtrip"},
         spec_section="BLOG_SPEC.md#registers",
     )
 

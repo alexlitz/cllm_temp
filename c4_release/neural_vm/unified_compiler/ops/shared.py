@@ -869,6 +869,25 @@ def declare_setdim_compat_dims(
     ):
         compiler.declare_dim(name, 16, pinned=None)
 
+    # Wave 1 A3: STACK0_BYTE_VAL_h_LO/HI family. 16-wide nibble bands
+    # holding the AX byte h value broadcast to the matching STACK0 byte
+    # row during PSH. Producer is ``layer10_psh_ax_broadcast`` (3 new
+    # heads at L10 slots 8/9/10); consumer is the L14 ``mem_generation``
+    # read migration (heads 5/6/7). The dim family was scaffolded in
+    # Wave 1 A1 (commit c31897aa); _SetDim has no legacy positions for
+    # these slots, so ``pinned=None`` lets the bump-pointer allocator
+    # place them above the high-water mark in the compat path.
+    # See docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md.
+    for name in (
+        "STACK0_BYTE_VAL_1_LO",
+        "STACK0_BYTE_VAL_1_HI",
+        "STACK0_BYTE_VAL_2_LO",
+        "STACK0_BYTE_VAL_2_HI",
+        "STACK0_BYTE_VAL_3_LO",
+        "STACK0_BYTE_VAL_3_HI",
+    ):
+        compiler.declare_dim(name, 16, pinned=None)
+
     # ------------------------------------------------------------------
     # Qwen R1 — opt-in NORM_COMPENSATOR slot
     # ------------------------------------------------------------------
