@@ -538,6 +538,22 @@ def _layer14_mem_generation_head_specs(
             v.append(AP(17 + kk, BD.CLEAN_EMBED_HI + kk, 1.0))
             v.append(AP(17 + kk, BD.OUTPUT_HI      + kk, 1.0))
 
+        # Wave 1 A3 migration: heads 1/2/3 attend to STACK0 byte h row during
+        # SI/SC. The L10 ``layer10_psh_ax_broadcast`` (slots 8/9/10) populates
+        # ``STACK0_BYTE_VAL_{h}_{LO,HI}`` at that row during the preceding
+        # PSH step. Read those dims into V slots 32+kk (LO) / 48+kk (HI) so
+        # the SI/SC addr byte h prediction picks up the pushed value. The
+        # broadcast dims are zero on non-STACK0-byte-h rows, so the PSH
+        # source path (slot 1 -> SP byte rows) is unaffected. HD=64, so
+        # slot 32..47 (LO) and slot 48..63 (HI) fit within head_dim.
+        if h in (1, 2, 3):
+            val_lo_dim = getattr(BD, f"STACK0_BYTE_VAL_{h}_LO", None)
+            val_hi_dim = getattr(BD, f"STACK0_BYTE_VAL_{h}_HI", None)
+            if val_lo_dim is not None and val_hi_dim is not None:
+                for kk in range(16):
+                    v.append(AP(32 + kk, val_lo_dim + kk, 1.0))
+                    v.append(AP(48 + kk, val_hi_dim + kk, 1.0))
+
         # O: write to OUTPUT_LO/HI + cancel L3 default at byte 0.
         o: list[AO] = []
         o.append(AO(BD.OUTPUT_LO + 0, 0, -1.0))
@@ -545,6 +561,16 @@ def _layer14_mem_generation_head_specs(
         for kk in range(16):
             o.append(AO(BD.OUTPUT_LO + kk, 1  + kk, 1.0))
             o.append(AO(BD.OUTPUT_HI + kk, 17 + kk, 1.0))
+
+        # Wave 1 A3 migration: matching O writes for the STACK0_BYTE_VAL_h
+        # reads at V slots 32+kk / 48+kk -> OUTPUT_LO/HI nibbles.
+        if h in (1, 2, 3):
+            val_lo_dim = getattr(BD, f"STACK0_BYTE_VAL_{h}_LO", None)
+            val_hi_dim = getattr(BD, f"STACK0_BYTE_VAL_{h}_HI", None)
+            if val_lo_dim is not None and val_hi_dim is not None:
+                for kk in range(16):
+                    o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, 1.0))
+                    o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, 1.0))
 
         specs.append(DeclarativeAttentionHeadSpec(
             head_idx=_L14_HEAD_LAYOUT_BY_NAME[f"layer14_mem_generation.head_{h}"],
