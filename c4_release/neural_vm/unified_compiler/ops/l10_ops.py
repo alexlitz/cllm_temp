@@ -1687,53 +1687,73 @@ def _layer10_psh_ax_broadcast_head_spec(BD, S, byte_h: int) -> DeclarativeAttent
     L = S
     M = 50.0 * S
     byte_index_dim = getattr(BD, f"BYTE_INDEX_{byte_h}")
+    # The STACK0_BYTE_{h} position flag fires only at the byte-h row of a
+    # STACK0 frame — MARK_STACK0 itself only fires at the marker (d=0) row,
+    # NOT at the byte rows (verified 2026-06-09: row 116 has BYTE_INDEX_1=1,
+    # STACK0_BYTE1=1, but MARK_STACK0=0). Per A3 diagnostic § "Recommended
+    # fix": use a context-broadcast dim available at the STACK0 Q row.
+    # STACK0_BYTE_h is that dim.
+    stack0_byte_dim = getattr(BD, f"STACK0_BYTE{byte_h}")
     value_lo_dim = getattr(BD, f"STACK0_BYTE_VAL_{byte_h}_LO")
     value_hi_dim = getattr(BD, f"STACK0_BYTE_VAL_{byte_h}_HI")
 
-    # Q gate: fire at STACK0 byte-h row during OP_PSH step.
+    # Q gate: fire at STACK0 byte-h row. The OP_PSH gating lives on the K
+    # side per docs/A3_BROADCAST_DIAGNOSTIC_2026_06_07.md — OP_PSH lives on
+    # the MARK_AX K row (instruction-fetch row), not the STACK0 Q byte
+    # rows. The Q-side anchor uses STACK0_BYTE_h (which DOES fire at the
+    # byte-h row of every STACK0 frame) rather than MARK_STACK0 (which
+    # only fires at the d=0 marker row).
     q = [
-        AP(0, BD.MARK_STACK0, L),
+        AP(0, stack0_byte_dim, L),
         AP(0, byte_index_dim, L),
-        AP(0, BD.OP_PSH, L),
+        AP(0, BD.IS_BYTE, L),
         AP(0, BD.CONST, -L * 2.0),
         # Suppress other byte indices: only the matching row should fire.
         *(
             [AP(0, getattr(BD, f"BYTE_INDEX_{j}"), -L)
              for j in (0, 1, 2, 3) if j != byte_h]
         ),
-        # Suppress other marker rows.
+        # Suppress other marker rows so non-STACK0 byte rows don't fire.
         AP(0, BD.MARK_AX, -L),
         AP(0, BD.MARK_SP, -L),
         AP(0, BD.MARK_BP, -L),
         AP(0, BD.MARK_PC, -L),
         AP(0, BD.MARK_MEM, -L),
 
-        # Slot 33: softmax1-aware active-step gate (per 9bb21bf4
-        # ``stack0_persistence`` pattern). Negative CONST baseline; the
-        # multi-condition positives + K-side complement light up only the
-        # intended (Q,K) pair.
-        AP(33, BD.CONST, -30000.0),
-        AP(33, BD.MARK_STACK0, 10000.0),
-        AP(33, byte_index_dim, 10000.0),
-        AP(33, BD.OP_PSH, 10000.0),
-        # Block other ops at slot 33 so the head is OP_PSH-exclusive.
-        AP(33, BD.OP_SI, -10000.0),
-        AP(33, BD.OP_SC, -10000.0),
-        AP(33, BD.OP_JSR, -10000.0),
-        AP(33, BD.OP_ENT, -10000.0),
+        # Slot 33: positive-only OP_PSH gate at the K row. Q-side stays
+        # POSITIVE at the target STACK0 byte-h row so that K-side suppressors
+        # (OP_SI/SC/JSR/ENT at slot 33) generate negative products at the
+        # wrong op K rows, not positive ones. Use a positive baseline scaled
+        # so STACK0_BYTE_h * BYTE_INDEX_h yields a target value of ~L.
+        AP(33, stack0_byte_dim, 1.0),
+        AP(33, byte_index_dim, 1.0),
+        AP(33, BD.CONST, -1.0),
     ]
 
-    # K gate: fire on AX byte-h source row.
+    # K gate: fire on AX byte-h source row during OP_PSH. The OP_PSH gating
+    # and OP-exclusivity terms live here (not on Q) because the K row IS
+    # the OP_PSH-active row (per A3 diagnostic 2026-06-07).
     k = [
         AP(0, BD.MARK_AX, L),
         AP(0, byte_index_dim, L),
         AP(0, BD.IS_BYTE, L),
         AP(0, BD.H1 + AX_IDX, L),
 
-        # K-side complement for slot 33 (softmax1-aware pattern).
+        # K-side gate: positive at OP_PSH AX byte-h K row, negative at
+        # other ops' K rows. Q[33] is ~+1 at the target Q row; multiplied
+        # by K[33] this either reinforces (+OP_PSH) or suppresses (-other
+        # ops). At non-AX K rows everything is 0, so no contribution.
         AP(33, BD.MARK_AX, M),
         AP(33, byte_index_dim, M),
-        AP(33, BD.CONST, 100.0),
+        AP(33, BD.OP_PSH, M),
+        # Block other ops at slot 33 so the head is OP_PSH-exclusive
+        # (moved from Q side; only effective at the K row where the op
+        # marker dims fire). Magnitude smaller than OP_PSH positive so a
+        # benign K row (no op marker) stays near zero.
+        AP(33, BD.OP_SI, -M),
+        AP(33, BD.OP_SC, -M),
+        AP(33, BD.OP_JSR, -M),
+        AP(33, BD.OP_ENT, -M),
     ]
 
     # V: copy CLEAN_EMBED nibbles. O: write to new STACK0_BYTE_VAL_h dims.
