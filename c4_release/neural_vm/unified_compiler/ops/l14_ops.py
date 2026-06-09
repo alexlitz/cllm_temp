@@ -614,6 +614,16 @@ def _layer14_mem_generation_head_specs(
         if h == 0:
             k.append(AP(2, BD.STACK0_BYTE0, L))
         elif h == 1:
+            # JSR step-0 guard: head 5 (h=1, MEM_value byte-1) slot-2 K
+            # selectors are BP-frame byte-1 markers (``H2+BP_I``,
+            # ``L1H4+BP_I``) which are absent on the function-prologue JSR
+            # (no prior BP frame, HAS_SE=0). Without this guard the K side
+            # degenerates and softmax routes CLEAN_EMBED 0xff bits into
+            # MEM_value byte 1, breaking var_*/if_var_*/var_mul_* clusters.
+            # See docs/VAR_MUL_ATTRIBUTION_2026_06_09.md and
+            # docs/VAR_L3_SP_BYTE2_2026_06_07.md.
+            q.append(AP(2, BD.HAS_SE,  L))
+            q.append(AP(2, BD.CONST,  -L))
             k.append(AP(2, BD.H2   + BP_I,  L))
             k.append(AP(2, BD.L1H4 + BP_I, -L))
         elif h == 2:
@@ -818,7 +828,11 @@ def make_layer14_mem_generation_op() -> Operation:
                # contract (``stack0_byte_val_*_pshk2mem``) verifies clean.
                "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
                "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
-               "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"},
+               "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI",
+               # head-5 slot-2 JSR step-0 guard: requires HAS_SE=1 so the
+               # BP-frame-byte-1 K selectors only fire on steps with a
+               # prior STEP_END. See docs/VAR_MUL_ATTRIBUTION_2026_06_09.md.
+               "HAS_SE", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
         # Phase 8.G.6 follow-up: drop ``layer_idx=14`` literal and bind to
