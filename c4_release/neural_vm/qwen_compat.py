@@ -448,6 +448,106 @@ def _pad_attn_o_cols(t: torch.Tensor, *, target_cols: int) -> torch.Tensor:
     )
 
 
+# Sentinel magnitude for the per-head q_norm / k_norm identity bake.
+# Must dominate typical ``RMS(q_head)`` so RMSNorm's denominator is set
+# by the sentinel slot. Production VM Q/K magnitudes are O(1..10); 100
+# leaves a >10x margin while keeping ``K_h^2 / sqrt(head_dim)`` (the
+# constant sentinel contribution to attention scores) at a softmax-safe
+# magnitude. See :func:`_bake_qk_norm_sentinel` for the derivation.
+_QK_NORM_SENTINEL_K_H = 100.0
+
+
+def _bake_qk_norm_sentinel(
+    W_q: torch.Tensor,
+    W_k: torch.Tensor,
+    *,
+    n_heads: int,
+    head_dim: int,
+    norm_compensator_idx: int,
+    K: float,
+    K_h: float = _QK_NORM_SENTINEL_K_H,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Bake a per-head sentinel into ``W_q`` / ``W_k`` so q_norm/k_norm act as identity.
+
+    Qwen3 applies ``q_norm`` / ``k_norm`` per head over ``head_dim``: the
+    output of q_proj / k_proj is reshaped to ``(..., n_heads, head_dim)``
+    and each head slice is RMSNorm'd. The VM's ``W_q`` / ``W_k`` were
+    not trained against q_norm, so the natural ``q_head`` magnitude
+    varies arbitrarily — a constant ``q_norm.weight`` cannot recover
+    identity (Blocker 3 in ``docs/QWEN_R8_E2E_2026_06_07.md``).
+
+    This helper installs a per-head **sentinel pair** at the last two
+    head-dim indices (``s-1`` and ``s = head_dim - 1``). The transform:
+
+      1. Zero ``W_q[h*head_dim + s - 1, :]`` and ``W_q[h*head_dim + s, :]``
+         for every head ``h in [0, n_heads)`` — the sentinel pair contributes
+         nothing from the original input.
+      2. Set ``W_q[h*head_dim + s, norm_compensator_idx] = K_h / K``. The
+         residual NORM_COMPENSATOR slot carries ``K`` on every real token,
+         so the sentinel row outputs ``q_head[s] = K_h`` independent of
+         position.
+
+    With ``K_h`` larger than the natural ``RMS(q_head)`` of the other
+    ``head_dim - 2`` slots, the per-head RMS is dominated by the sentinel:
+    ``mean(q_head^2) ≈ K_h^2 / head_dim``. Pairing this with
+    ``q_norm.weight = (K_h / sqrt(head_dim)) * ones`` makes RMSNorm an
+    identity on every head: ``out[i] = w[i] * q[i] / RMS(q) ≈ q[i]``.
+
+    The same recipe is applied to ``W_k`` so ``k_head`` also carries
+    ``K_h`` at index ``s``. The attention dot product gets a constant
+    ``K_h^2`` contribution from the sentinel slot (softmax-invariant).
+
+    RoPE caveat: the sentinel pair (``s-1``, ``s``) lives at the lowest
+    RoPE frequency (``theta^(-(head_dim/2 - 1) / (head_dim/2))``), where
+    rotation over the test window (~30 positions) is essentially zero,
+    so ``q_head[s] ≈ K_h`` after RoPE as well. The variation in the
+    constant sentinel contribution to attention is O(rotation^2), which
+    is negligible compared to typical attention score magnitudes.
+
+    Args:
+        W_q: Q projection weight, shape ``(n_heads * head_dim, d_model)``.
+        W_k: K projection weight, same shape.
+        n_heads: Number of attention heads (uniform across exported layers).
+        head_dim: Per-head dimension.
+        norm_compensator_idx: Residual index of the NORM_COMPENSATOR slot.
+        K: NORM_COMPENSATOR residual value (e.g. 1000.0).
+        K_h: Sentinel magnitude — must dominate ``RMS(q_head_orig)``.
+
+    Returns:
+        ``(W_q, W_k)`` with the sentinel baked in (fresh tensors).
+    """
+
+    if n_heads <= 0 or head_dim < 2 or norm_compensator_idx < 0:
+        return W_q, W_k
+    expected_rows = n_heads * head_dim
+    if W_q.shape[0] < expected_rows or W_k.shape[0] < expected_rows:
+        return W_q, W_k
+    if norm_compensator_idx >= W_q.shape[1]:
+        return W_q, W_k
+
+    W_q_out = W_q.clone()
+    W_k_out = W_k.clone()
+    scale = float(K_h) / float(K) if K != 0 else 0.0
+
+    for h in range(int(n_heads)):
+        last = h * head_dim + head_dim - 1
+        prev = last - 1
+        # Zero the RoPE-paired sentinel rows so the original input's
+        # contribution to those head slots is gone.
+        W_q_out[prev, :] = 0.0
+        W_q_out[last, :] = 0.0
+        W_k_out[prev, :] = 0.0
+        W_k_out[last, :] = 0.0
+        # Inject the sentinel at the last index only. After RoPE, the
+        # pair rotates: q_rope[last] ≈ cos*K_h, q_rope[prev] ≈ sin*K_h.
+        # At lowest RoPE frequency over small windows cos ≈ 1, sin ≈ 0,
+        # so the sentinel is approximately position-invariant.
+        W_q_out[last, norm_compensator_idx] = scale
+        W_k_out[last, norm_compensator_idx] = scale
+
+    return W_q_out, W_k_out
+
+
 def infer_qwen2_config_kwargs(model: Any) -> Dict[str, Any]:
     """Return Qwen2Config kwargs inferred from a VM model.
 
@@ -1642,17 +1742,38 @@ def _build_export_state_dict(
             W_v = _pad_attn_proj_rows(W_v, target_rows=target_attn_rows)
             W_o = _pad_attn_o_cols(W_o, target_cols=target_attn_rows)
 
+        # Bake the per-head q_norm/k_norm sentinel (Blocker 3). Each head
+        # gets a constant ``K_h`` at its last head-dim slot so the
+        # subsequent ``q_norm`` / ``k_norm`` RMSNorm collapses to identity
+        # under a matching ``K_h/sqrt(head_dim)`` gamma. The bake applies
+        # to every head up to ``max_n_heads`` (including phantom-padded
+        # heads); padded heads still have zero W_o columns so their
+        # residual contribution stays zero.
+        if head_dim >= 2 and max_n_heads > 0:
+            W_q, W_k = _bake_qk_norm_sentinel(
+                W_q,
+                W_k,
+                n_heads=max_n_heads,
+                head_dim=head_dim,
+                norm_compensator_idx=norm_compensator_idx,
+                K=K,
+            )
+
         state[f"{prefix}.self_attn.q_proj.weight"] = W_q.contiguous()
         state[f"{prefix}.self_attn.k_proj.weight"] = W_k.contiguous()
         state[f"{prefix}.self_attn.v_proj.weight"] = W_v.contiguous()
         state[f"{prefix}.self_attn.o_proj.weight"] = W_o.contiguous()
 
-        # Qwen3 dense has per-head q_norm/k_norm; we set them to identity
-        # via the same K/sqrt(d) trick. ``head_dim`` is uniform across
-        # the VM's attention layers, so the gamma vector is the same
-        # regardless of the per-block ``num_heads``.
+        # Qwen3 dense has per-head q_norm/k_norm. With the sentinel bake
+        # above, the per-head RMS is ``≈ K_h / sqrt(head_dim)``; pairing
+        # that with ``gamma = K_h / sqrt(head_dim)`` makes RMSNorm an
+        # identity. ``head_dim`` is uniform across the VM's attention
+        # layers, so the gamma vector is the same regardless of the
+        # per-block ``num_heads``.
         if head_dim > 0:
-            head_gamma = _rmsnorm_identity_gamma(head_dim, K)
+            head_gamma = _rmsnorm_identity_gamma(
+                head_dim, _QK_NORM_SENTINEL_K_H
+            )
             state[f"{prefix}.self_attn.q_norm.weight"] = head_gamma.clone()
             state[f"{prefix}.self_attn.k_norm.weight"] = head_gamma.clone()
 
