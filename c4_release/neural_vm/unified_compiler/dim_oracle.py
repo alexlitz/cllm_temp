@@ -28,14 +28,22 @@ Public surface
 * :func:`project_state_to_residual` — maps a register state to the
   expected ``(position, dim_name) -> float`` table for the *simple* dim
   families (CLEAN_EMBED_LO/HI, MARK_AX, MARK_STACK0, BYTE_INDEX_h,
-  STACK0_BYTE_VAL_h_LO/HI).
+  STACK0_BYTE_VAL_h_LO/HI) and the same-step projections of
+  OUTPUT_LO/HI, AX_CARRY_LO/HI, ADDR_KEY, and MEM_ADDR_SRC.
 * :func:`expected_trace` — every ``(step, position, block,
   expected_value)`` tuple for a single dim across the whole program.
 
 Scope: this module covers the *embedding-time* and *broadcast-time*
 dims — those whose expected value at a given position is a pure function
-of the VM state for that step. The cross-step OUTPUT_LO/HI family is
-listed as ``DEFERRED`` (see :data:`DEFERRED_DIM_FAMILIES`).
+of the VM state for that step.
+
+OUTPUT_LO/HI and AX_CARRY_LO/HI are projected as same-step residuals
+(the value the op tree ought to have produced by the end of the step).
+Cross-step PREV_STEP semantics (``.*.-1`` aliases) are still owned by
+the actual op-tree; the oracle compares against the same-step
+materialisation since that is the value any same-step writer should
+emit. See :data:`DEFERRED_DIM_FAMILIES` for the (now empty) list of
+families whose projection rule is still missing.
 """
 
 from __future__ import annotations
@@ -127,20 +135,34 @@ SUPPORTED_DIM_FAMILIES: Tuple[str, ...] = (
     "STACK0_BYTE_VAL_2_HI",
     "STACK0_BYTE_VAL_3_LO",
     "STACK0_BYTE_VAL_3_HI",
+    # Same-step ALU / address-gather projections. The op tree writes
+    # these dims in the AX-marker / MEM-marker / PC-marker rows during
+    # the *current* step; the oracle pins the expected one-hot off the
+    # reference VM's AX / MEM-value / PC registers. Cross-step PREV_STEP
+    # reads (the ``.*.-1`` SSA aliases) are intentionally *not* projected
+    # — those are routing back-edges through the KV cache, not residual
+    # values produced this step.
+    "OUTPUT_LO",
+    "OUTPUT_HI",
+    "AX_CARRY_LO",
+    "AX_CARRY_HI",
+    "ADDR_KEY",
+    "MEM_ADDR_SRC",
 )
 
 
 # Dim families whose expected value crosses step boundaries or depends
 # on multi-pass autoregressive teacher-forcing. Diff'ing these against
 # the oracle would be misleading until the projection is extended.
-DEFERRED_DIM_FAMILIES: Tuple[str, ...] = (
-    "OUTPUT_LO",       # autoregressive next-step byte emission
-    "OUTPUT_HI",
-    "AX_CARRY_LO",     # mid-block ALU carry propagation
-    "AX_CARRY_HI",
-    "ADDR_KEY",        # memory-lookup address gather across steps
-    "MEM_ADDR_SRC",
-)
+#
+# The OUTPUT_LO/HI, AX_CARRY_LO/HI, ADDR_KEY, and MEM_ADDR_SRC families
+# previously listed here graduated to ``SUPPORTED_DIM_FAMILIES`` once
+# the oracle learned to project same-step ALU / address-gather
+# materialisations from the reference VM register state. No deferred
+# families remain at this time; the tuple is kept (empty) so callers
+# that test ``DEFERRED_DIM_FAMILIES`` membership do not need to branch
+# on attribute existence.
+DEFERRED_DIM_FAMILIES: Tuple[str, ...] = ()
 
 
 __all__ = [
@@ -183,6 +205,24 @@ class RegisterState:
         ``True`` once the program executed an EXIT or returned from main
         via LEV. Subsequent ``state_at_step`` calls return the final
         snapshot.
+    opcode
+        Opcode dispatched on this step (one of the ``OP_*`` constants
+        from :mod:`symbolic_forward`). Used by the OUTPUT_LO/HI and
+        ADDR_KEY projections to decide whether the MEM marker row is
+        carrying a store value or is idle. ``None`` for the synthetic
+        pre-program snapshot.
+    mem_addr
+        Address that the memory marker row's bus is gated on for this
+        step. ``None`` when the step is not a memory-bus op (everything
+        outside PSH / SI / SC / LI / LC). PSH uses the just-decremented
+        SP; SI/SC use the just-popped top-of-stack; LI/LC use AX.
+    mem_value
+        Value the memory bus carries this step (32-bit). For stores this
+        is the AX value being written; for loads it is the value just
+        read into AX. ``None`` outside memory-bus ops.
+    is_store
+        ``True`` for SI / SC / PSH steps (MEM_ADDR_SRC fires). False for
+        loads or non-memory ops.
     """
 
     step_idx: int
@@ -193,6 +233,10 @@ class RegisterState:
     stack0: int = 0
     memory: Dict[int, int] = field(default_factory=dict)
     halted: bool = False
+    opcode: Optional[int] = None
+    mem_addr: Optional[int] = None
+    mem_value: Optional[int] = None
+    is_store: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +332,13 @@ class ReferenceOracle:
             opcode, imm = decode_instr(self.program[instr_offset])
             pc_next = pc + self.INSTR_WIDTH
 
+            # Per-step memory-bus snapshot. Populated only for the
+            # opcodes that drive the MEM marker row; everything else
+            # leaves the bus idle (``None``).
+            mem_addr: Optional[int] = None
+            mem_value: Optional[int] = None
+            is_store = False
+
             if opcode == OP_IMM:
                 ax = imm & 0xFFFFFFFF
             elif opcode == OP_LEA:
@@ -330,15 +381,27 @@ class ReferenceOracle:
                     for i in range(8):
                         val |= memory_bytes.get(addr + i, 0) << (i * 8)
                 ax = val & 0xFFFFFFFF
+                mem_addr = addr & 0xFFFFFFFF
+                mem_value = ax
+                # LI is a load — MEM_ADDR_SRC stays zero.
+                is_store = False
             elif opcode == OP_SI:
                 if sp in stack:
                     addr = stack[sp]
                     sp += 8
                     for i in range(8):
                         memory_bytes[addr + i] = (ax >> (i * 8)) & 0xFF
+                    mem_addr = addr & 0xFFFFFFFF
+                    mem_value = ax & 0xFFFFFFFF
+                    is_store = True
             elif opcode == OP_PSH:
                 sp -= 8
                 stack[sp] = ax
+                # PSH drives the MEM bus with addr=SP (post-dec) and
+                # value=AX. MEM_ADDR_SRC = 0 (address is SP, not STACK0).
+                mem_addr = sp & 0xFFFFFFFF
+                mem_value = ax & 0xFFFFFFFF
+                is_store = True
             elif opcode == OP_ADD:
                 if sp in stack:
                     top = stack[sp]; sp += 8
@@ -371,6 +434,10 @@ class ReferenceOracle:
                     stack0=stack0 & 0xFFFFFFFF,
                     memory=dict(memory_bytes),
                     halted=halted,
+                    opcode=opcode,
+                    mem_addr=mem_addr,
+                    mem_value=mem_value,
+                    is_store=is_store,
                 )
             )
 
@@ -453,6 +520,50 @@ def _emit_register_nibbles(out, base_pos: int, byte0_pos: int, value: int):
         out[(pos, f"EMBED_HI+{hi}")] = 1.0
 
 
+def _emit_output_at_marker(out, marker_pos: int, value: int):
+    """OUTPUT_LO/HI one-hots for the byte-0 nibbles of ``value`` at a
+    marker row. The op tree's L8/L16 ALU rules emit ``OUTPUT_LO+lo`` and
+    ``OUTPUT_HI+hi`` for the AX byte 0 nibble at the AX marker (and the
+    matching MEM byte 0 for the MEM marker, PC byte 0 for the PC marker).
+    """
+    byte0 = value & 0xFF
+    lo = byte0 & 0x0F
+    hi = (byte0 >> 4) & 0x0F
+    out[(marker_pos, f"OUTPUT_LO+{lo}")] = 1.0
+    out[(marker_pos, f"OUTPUT_HI+{hi}")] = 1.0
+
+
+def _emit_ax_carry_at_marker(out, marker_pos: int, value: int):
+    """AX_CARRY_LO/HI one-hots for the byte-0 nibbles of ``value`` at a
+    marker row. AX_CARRY mirrors the ALU staging path: by the end of the
+    step it carries the same byte-0 nibble values OUTPUT carries (L3
+    head 1 broadcasts EMBED_LO/HI -> AX_CARRY_LO/HI at the AX marker).
+    """
+    byte0 = value & 0xFF
+    lo = byte0 & 0x0F
+    hi = (byte0 >> 4) & 0x0F
+    out[(marker_pos, f"AX_CARRY_LO+{lo}")] = 1.0
+    out[(marker_pos, f"AX_CARRY_HI+{hi}")] = 1.0
+
+
+def _emit_addr_key_at_mem(out, mem_marker_pos: int, addr: int):
+    """ADDR_KEY one-hots for the three address bytes at the MEM marker.
+
+    The L4/L5 SP-gather + L15 store-stack0-sp-byte0-addr ops project
+    the address being accessed this step into ADDR_KEY (48 cells, 3 nibble
+    one-hots). The aliases ADDR_B0_HI/ADDR_B1_HI/ADDR_B2_HI pin the
+    semantics: cell ``k`` of ``ADDR_KEY[0..15]`` is byte-0 hi nibble,
+    ``ADDR_KEY[16..31]`` is byte-1 hi nibble, ``ADDR_KEY[32..47]`` is
+    byte-2 hi nibble.
+    """
+    b0 = addr & 0xFF
+    b1 = (addr >> 8) & 0xFF
+    b2 = (addr >> 16) & 0xFF
+    out[(mem_marker_pos, f"ADDR_KEY+{(b0 >> 4) & 0x0F}")] = 1.0
+    out[(mem_marker_pos, f"ADDR_KEY+{16 + ((b1 >> 4) & 0x0F)}")] = 1.0
+    out[(mem_marker_pos, f"ADDR_KEY+{32 + ((b2 >> 4) & 0x0F)}")] = 1.0
+
+
 def _project_per_token(state, base: int) -> Dict[Tuple[int, str], float]:
     out: Dict[Tuple[int, str], float] = {}
 
@@ -504,6 +615,31 @@ def _project_per_token(state, base: int) -> Dict[Tuple[int, str], float]:
         out[(pos, f"STACK0_BYTE_VAL_{h}_LO+{lo}")] = 1.0
         out[(pos, f"STACK0_BYTE_VAL_{h}_HI+{hi}")] = 1.0
 
+    # Same-step ALU / MEM-bus projections.
+    #
+    # OUTPUT_LO/HI: marker-row one-hot of the byte-0 nibbles of the AX
+    # / MEM-value / PC registers. The op tree's L8/L16 ALU rules write
+    # OUTPUT_LO[ax & 0xF] at the AX-marker row; the PSH/SI MEM bus
+    # writes OUTPUT_LO[mem_value & 0xF] at the MEM-marker row; L16
+    # post-ENT carry writes OUTPUT_LO[pc & 0xF] at the PC-marker row.
+    _emit_output_at_marker(out, base + POS_AX_MARKER, state.ax)
+    _emit_output_at_marker(out, base + POS_PC_MARKER, state.pc)
+    if state.mem_value is not None:
+        _emit_output_at_marker(out, base + POS_MEM_MARKER, state.mem_value)
+
+    # AX_CARRY_LO/HI: AX-marker only (L3 carry-forward head 1).
+    _emit_ax_carry_at_marker(out, base + POS_AX_MARKER, state.ax)
+
+    # ADDR_KEY: MEM-marker only, 3-nibble address one-hot.
+    if state.mem_addr is not None:
+        _emit_addr_key_at_mem(out, base + POS_MEM_MARKER, state.mem_addr)
+
+    # MEM_ADDR_SRC: single-cell flag at the MEM-marker row. Fires for
+    # SI / SC stores (address comes from STACK0); does not fire for
+    # PSH (address is SP) or loads.
+    if state.opcode is not None and state.is_store and state.opcode != OP_PSH:
+        out[(base + POS_MEM_MARKER, "MEM_ADDR_SRC+0")] = 1.0
+
     return out
 
 
@@ -551,6 +687,44 @@ def _project_bag_of_dims(state) -> Dict[Tuple[int, str], float]:
         byte_val = (state.stack0 >> (h * 8)) & 0xFF
         out[(pos, f"STACK0_BYTE_VAL_{h}_LO+{byte_val & 0x0F}")] = 1.0
         out[(pos, f"STACK0_BYTE_VAL_{h}_HI+{(byte_val >> 4) & 0x0F}")] = 1.0
+
+    # Same-step ALU / MEM-bus dims (collapsed onto step position; the
+    # underlying per-token semantics live in the per-token projection
+    # above — see ``_emit_output_at_marker`` for the marker-row rules).
+    #
+    # OUTPUT_LO/HI: the AX-marker row writes the AX byte-0 nibbles. The
+    # PC-marker row writes the PC byte-0 nibbles. The MEM-marker row
+    # writes the mem-bus byte-0 nibbles for store/load steps. Multiple
+    # cells can fire if AX / PC / MEM nibbles disagree; that is the
+    # documented "writes accumulate" behaviour of the residual stream.
+    for value in (state.ax, state.pc):
+        byte0 = value & 0xFF
+        out[(pos, f"OUTPUT_LO+{byte0 & 0x0F}")] = 1.0
+        out[(pos, f"OUTPUT_HI+{(byte0 >> 4) & 0x0F}")] = 1.0
+    if state.mem_value is not None:
+        byte0 = state.mem_value & 0xFF
+        out[(pos, f"OUTPUT_LO+{byte0 & 0x0F}")] = 1.0
+        out[(pos, f"OUTPUT_HI+{(byte0 >> 4) & 0x0F}")] = 1.0
+
+    # AX_CARRY_LO/HI: one-hot of AX byte 0 nibbles (AX marker only).
+    ax_byte0 = state.ax & 0xFF
+    out[(pos, f"AX_CARRY_LO+{ax_byte0 & 0x0F}")] = 1.0
+    out[(pos, f"AX_CARRY_HI+{(ax_byte0 >> 4) & 0x0F}")] = 1.0
+
+    # ADDR_KEY: 3-nibble one-hot of the mem-bus address. Only fires on
+    # memory-bus ops; non-memory steps leave the bus idle.
+    if state.mem_addr is not None:
+        addr = state.mem_addr
+        b0 = addr & 0xFF
+        b1 = (addr >> 8) & 0xFF
+        b2 = (addr >> 16) & 0xFF
+        out[(pos, f"ADDR_KEY+{(b0 >> 4) & 0x0F}")] = 1.0
+        out[(pos, f"ADDR_KEY+{16 + ((b1 >> 4) & 0x0F)}")] = 1.0
+        out[(pos, f"ADDR_KEY+{32 + ((b2 >> 4) & 0x0F)}")] = 1.0
+
+    # MEM_ADDR_SRC: flag, set on SI/SC stores only.
+    if state.opcode is not None and state.is_store and state.opcode != OP_PSH:
+        out[(pos, "MEM_ADDR_SRC+0")] = 1.0
 
     return out
 

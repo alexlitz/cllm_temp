@@ -50,6 +50,7 @@ from c4_release.neural_vm.unified_compiler.symbolic_forward import (
     OP_EXIT,
     OP_IMM,
     OP_PSH,
+    OP_SI,
     SymbolicForwardRunner,
     encode_instr,
 )
@@ -202,14 +203,20 @@ def test_expected_trace_covers_all_blocks():
     actual_blocks = {b for (_, _, b, _) in trace.keys()}
     assert actual_blocks == {0, 1, 2, 3}
 
-    # Unsupported families must raise.
+    # Unsupported (unknown) families must raise. OUTPUT_LO now has a
+    # same-step projection rule (added 2026-06-09) — a fabricated dim
+    # name with no projection still surfaces a ValueError.
     with pytest.raises(ValueError):
-        expected_trace(oracle, "OUTPUT_LO", n_blocks=4)
+        expected_trace(oracle, "NOT_A_REAL_DIM_FAMILY", n_blocks=4)
 
 
 def test_supported_vs_deferred_dim_families_disjoint():
     """Sanity: the supported and deferred lists have no overlap, and the
-    ``is_supported_dim`` predicate agrees."""
+    ``is_supported_dim`` predicate agrees. After the 2026-06-09 oracle
+    extension, ``DEFERRED_DIM_FAMILIES`` is empty (the same-step
+    OUTPUT_LO/HI, AX_CARRY_LO/HI, ADDR_KEY, and MEM_ADDR_SRC projections
+    graduated to ``SUPPORTED_DIM_FAMILIES``).
+    """
 
     assert set(SUPPORTED_DIM_FAMILIES).isdisjoint(DEFERRED_DIM_FAMILIES)
     for name in SUPPORTED_DIM_FAMILIES:
@@ -412,3 +419,147 @@ def test_diff_finds_no_divergence_when_actual_matches_oracle():
     assert find_first_divergent_block(
         runner, oracle, "MARK_AX", atol=1.0,
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# Same-step ALU / MEM-bus projection tests (extended dim families)
+# ---------------------------------------------------------------------------
+
+
+def test_output_lo_hi_projection_imm_42_exit():
+    """``IMM 42; EXIT`` — OUTPUT_LO/HI must encode AX byte 0 nibbles at
+    the AX-marker row at both steps.
+
+    42 = 0x2A. Byte 0 lo nibble = 0xA = 10; hi nibble = 0x2 = 2. The
+    oracle's per-token projection should land OUTPUT_LO+10 and
+    OUTPUT_HI+2 at the AX-marker token (slot 5) of every step.
+    """
+
+    program = [
+        encode_instr(OP_IMM, 42),
+        encode_instr(OP_EXIT),
+    ]
+    oracle = ReferenceOracle(program)
+
+    # Step 0: IMM 42 -> AX = 42.
+    s0 = oracle.state_at_step(0)
+    assert s0.ax == 42
+
+    table = project_state_to_residual(s0, per_token=True)
+    base = s0.step_idx * TOKENS_PER_STEP
+
+    # AX-marker row carries the OUTPUT/AX_CARRY one-hots for AX byte 0.
+    assert table[(base + 5, "OUTPUT_LO+10")] == 1.0  # 42 & 0xF
+    assert table[(base + 5, "OUTPUT_HI+2")] == 1.0   # (42 >> 4) & 0xF
+    assert table[(base + 5, "AX_CARRY_LO+10")] == 1.0
+    assert table[(base + 5, "AX_CARRY_HI+2")] == 1.0
+
+    # PC-marker row carries the OUTPUT one-hots for PC byte 0. After
+    # step 0 PC = 0 (we record state *after* the instruction with PC
+    # still pointing at it). PC byte 0 = 0; lo=0, hi=0.
+    assert table[(base + 0, "OUTPUT_LO+0")] == 1.0
+    assert table[(base + 0, "OUTPUT_HI+0")] == 1.0
+
+    # No MEM bus on IMM -> MEM_ADDR_SRC / ADDR_KEY do not fire.
+    for k in range(16):
+        assert table.get((base + 25, f"ADDR_KEY+{k}"), 0.0) == 0.0
+    assert table.get((base + 25, "MEM_ADDR_SRC+0"), 0.0) == 0.0
+
+    # Bag-of-dims at position=step_idx.
+    bag = project_state_to_residual(s0)
+    assert bag[(0, "OUTPUT_LO+10")] == 1.0
+    assert bag[(0, "OUTPUT_HI+2")] == 1.0
+    assert bag[(0, "AX_CARRY_LO+10")] == 1.0
+    assert bag[(0, "AX_CARRY_HI+2")] == 1.0
+    # No memory step -> ADDR_KEY / MEM_ADDR_SRC absent from the bag.
+    for k in range(48):
+        assert bag.get((0, f"ADDR_KEY+{k}"), 0.0) == 0.0
+    assert bag.get((0, "MEM_ADDR_SRC+0"), 0.0) == 0.0
+
+
+def test_addr_key_and_mem_addr_src_projection_psh_si_program():
+    """``IMM 0x200; PSH; SI; EXIT`` exercises the MEM-bus projections.
+
+    Step 1 (PSH): address bus = post-decrement SP, value bus = AX
+    (0x200). PSH is *not* SI/SC so MEM_ADDR_SRC stays unset; ADDR_KEY
+    fires with the SP-address nibbles.
+
+    Step 2 (SI): address bus = popped top-of-stack = 0x200,
+    value bus = AX (0x200). MEM_ADDR_SRC fires (1.0); ADDR_KEY's three
+    nibble cells encode the 0x200 address.
+    """
+
+    program = [
+        encode_instr(OP_IMM, 0x200),
+        encode_instr(OP_PSH),
+        encode_instr(OP_SI),
+        encode_instr(OP_EXIT),
+    ]
+    oracle = ReferenceOracle(program)
+
+    # Step 1: PSH — sanity-check the snapshot fields.
+    s_psh = oracle.state_at_step(1)
+    assert s_psh.opcode is not None
+    assert s_psh.is_store
+    assert s_psh.mem_value == 0x200
+    assert s_psh.mem_addr == s_psh.sp  # post-dec SP
+
+    # Step 2: SI — STACK0 address source.
+    s_si = oracle.state_at_step(2)
+    assert s_si.is_store
+    assert s_si.mem_addr == 0x200
+    assert s_si.mem_value == 0x200
+
+    # OUTPUT_LO/HI at the MEM-marker row for the PSH step: byte 0 of
+    # 0x200 = 0x00; lo nibble = 0, hi nibble = 0.
+    psh_token = project_state_to_residual(s_psh, per_token=True)
+    psh_base = s_psh.step_idx * TOKENS_PER_STEP
+    assert psh_token[(psh_base + 25, "OUTPUT_LO+0")] == 1.0
+    assert psh_token[(psh_base + 25, "OUTPUT_HI+0")] == 1.0
+    # MEM_ADDR_SRC stays unset (PSH uses SP, not STACK0).
+    assert psh_token.get((psh_base + 25, "MEM_ADDR_SRC+0"), 0.0) == 0.0
+
+    # SI step: MEM_ADDR_SRC fires at the MEM-marker.
+    si_token = project_state_to_residual(s_si, per_token=True)
+    si_base = s_si.step_idx * TOKENS_PER_STEP
+    assert si_token[(si_base + 25, "MEM_ADDR_SRC+0")] == 1.0
+
+    # ADDR_KEY at MEM marker (SI step): addr = 0x200.
+    # byte 0 = 0x00 -> hi nibble = 0 -> ADDR_KEY+0
+    # byte 1 = 0x02 -> hi nibble = 0 -> ADDR_KEY+16
+    # byte 2 = 0x00 -> hi nibble = 0 -> ADDR_KEY+32
+    assert si_token[(si_base + 25, "ADDR_KEY+0")] == 1.0
+    assert si_token[(si_base + 25, "ADDR_KEY+16")] == 1.0
+    assert si_token[(si_base + 25, "ADDR_KEY+32")] == 1.0
+
+    # AX-marker carries OUTPUT_LO/HI for AX byte 0 = 0x00 on every step.
+    assert si_token[(si_base + 5, "OUTPUT_LO+0")] == 1.0
+    assert si_token[(si_base + 5, "OUTPUT_HI+0")] == 1.0
+
+    # Bag-of-dims sanity (SI step): MEM_ADDR_SRC and ADDR_KEY collapse
+    # onto position=step_idx.
+    bag = project_state_to_residual(s_si)
+    assert bag[(s_si.step_idx, "MEM_ADDR_SRC+0")] == 1.0
+    assert bag[(s_si.step_idx, "ADDR_KEY+0")] == 1.0
+    assert bag[(s_si.step_idx, "ADDR_KEY+16")] == 1.0
+    assert bag[(s_si.step_idx, "ADDR_KEY+32")] == 1.0
+
+
+def test_expected_trace_now_supports_output_lo():
+    """The previously-deferred OUTPUT_LO family now produces an
+    ``expected_trace``. Sanity-check: at least one cell fires per step.
+    """
+
+    program = [
+        encode_instr(OP_IMM, 42),
+        encode_instr(OP_EXIT),
+    ]
+    oracle = ReferenceOracle(program)
+    trace = expected_trace(oracle, "OUTPUT_LO", n_blocks=2)
+    # Every step contributes at least one OUTPUT_LO+k entry per block.
+    steps = {step_idx for (step_idx, _pos, _blk, _key) in trace}
+    blocks = {blk for (_step, _pos, blk, _key) in trace}
+    assert steps == {0, 1}
+    assert blocks == {0, 1}
+    # The AX=42 step writes OUTPUT_LO+10 at position=0 (bag-of-dims).
+    assert trace[(0, 0, 0, "OUTPUT_LO+10")] == 1.0
