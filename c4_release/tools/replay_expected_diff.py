@@ -135,9 +135,18 @@ def _build_compiler(declarations_only: bool):
         "this can take 1-2 minutes on a cold cache.",
         file=sys.stderr,
     )
+    # disk_cache=False is load-bearing: the on-disk pickle path drops
+    # ``compiler_ir_factory`` lambdas (they pickle to ``None``), which
+    # would strip every attention spec belonging to a factory-only bake
+    # op (e.g. ``layer10_psh_ax_broadcast_bake``). Without the factories
+    # the V→O propagation in :func:`dsl_interpreter.apply_attention_specs`
+    # never fires and the diff localises to block 0 instead of the
+    # actual broadcast head's block. In-memory compile is ~10-20s
+    # (still slower than the cached load, but the cached load is wrong
+    # for this tool's purpose).
     result = compile_full_vm_dynamic(
         declarations_only=declarations_only,
-        disk_cache=True,
+        disk_cache=False,
     )
     # compile_full_vm_dynamic returns (model, layout).
     if isinstance(result, tuple) and len(result) >= 2:

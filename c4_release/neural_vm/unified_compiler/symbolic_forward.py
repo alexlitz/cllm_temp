@@ -143,6 +143,27 @@ def default_embedding_for_instruction(
         suffix = "" if byte_idx == 0 else f"_{byte_idx}"
         state[f"IMM_AX_LO{suffix}+{lo}"] = 1.0
         state[f"IMM_AX_HI{suffix}+{hi}"] = 1.0
+    # CLEAN_EMBED_LO/HI — the L0/L1 cleanup bake's output. The bake is a
+    # passthrough from the raw IMM nibbles to CLEAN_EMBED_*, so the
+    # symbolic forward seed matches it directly. Without this, downstream
+    # attention V-side reads of CLEAN_EMBED (e.g. the L10 PSH AX
+    # broadcast head) see zero V activation and never propagate — the
+    # same class of bug ``apply_attention_specs`` had before the
+    # int↔string key bridge fix, exposed at the L0/L1 layer instead.
+    # The oracle's per-token projection sets CLEAN_EMBED_LO/HI from the
+    # register byte values at every register slot; the bag-of-dims form
+    # collapses every set nibble onto position=step_idx. Mirror that
+    # here by setting CLEAN_EMBED_LO/HI from the IMM byte values so the
+    # V→O propagation test path can drive end-to-end without a manual
+    # ``initial_state`` injection.
+    for byte_idx in range(3):
+        byte_val = (imm >> (byte_idx * 8)) & 0xFF
+        lo = byte_val & 0x0F
+        hi = (byte_val >> 4) & 0x0F
+        state[f"CLEAN_EMBED_LO+{lo}"] = 1.0
+        state[f"CLEAN_EMBED_HI+{hi}"] = 1.0
+        state[f"EMBED_LO+{lo}"] = 1.0
+        state[f"EMBED_HI+{hi}"] = 1.0
     # PC position — record so callers can disambiguate steps. Kept as a
     # scalar dim rather than a one-hot since downstream consumers vary.
     state["PC+0"] = float(pc)
