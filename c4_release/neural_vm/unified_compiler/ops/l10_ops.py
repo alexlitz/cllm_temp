@@ -1685,7 +1685,18 @@ def _layer10_psh_ax_broadcast_head_spec(BD, S, byte_h: int) -> DeclarativeAttent
     """
     AX_IDX = 1
     L = S
-    M = 50.0 * S
+    # A3.9 (2026-06-09): drop slot-33 K-side magnitude. With M=50*S, slot-33
+    # K-side carried ~2M=1e4 nats at MARK_AX d=0 rows (where MARK_AX +
+    # OP_PSH both fire), and only ~M=5e3 nats at AX byte_h rows (only BI_h
+    # fires). Combined with H1+AX_IDX firing at the MARK_AX d=0 row, the
+    # broadcast head selected the marker row (K@p=100, post-PSH) where
+    # CLEAN_EMBED is zero — V wrote nothing. Set M=0 to let slot 0
+    # (MARK_AX + BI_h + IS_BYTE + H1+AX_IDX) plus ALiBi recency bias drive
+    # K selection. The A3.7 ALiBi pin (slope=1.0) handles latest-write-wins
+    # between successive AX byte_h rows; slot 33 is no longer needed for op
+    # discrimination because softmax1 + ALiBi at scale=1 already isolates
+    # the most-recent AX BI_h row.
+    M = 0.0
     byte_index_dim = getattr(BD, f"BYTE_INDEX_{byte_h}")
     # The STACK0_BYTE_{h} position flag fires only at the byte-h row of a
     # STACK0 frame — MARK_STACK0 itself only fires at the marker (d=0) row,
