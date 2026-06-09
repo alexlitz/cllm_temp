@@ -275,6 +275,104 @@ def test_diff_finds_missing_writer_for_psh_step():
     assert "MARK_AX+0" in msg
 
 
+def test_apply_attention_specs_propagates_v_to_o_via_int_string_bridge():
+    """Regression: the V-side state lookup used to read ``state.get(v.dim,
+    0.0)`` with ``v.dim`` an *int* residual column while the rest of
+    state was keyed by *string* dim names. That mismatch meant the V
+    value was always 0.0 and no V→O propagation fired — the
+    ``replay_expected_diff`` demo localised to block 0 instead of the
+    real broadcast head's block.
+
+    With the int↔string bridge in place, an embedding-seeded state with
+    ``CLEAN_EMBED_LO+2 = 1.0`` (oracle's projection for AX byte 1 of
+    ``IMM 0x200``) propagates through a head whose V slot reads
+    ``CLEAN_EMBED_LO`` and whose O slot writes ``STACK0_BYTE_VAL_1_LO``
+    — i.e. exactly the L10 PSH-AX-broadcast head's V/O channel shape.
+    """
+
+    from c4_release.neural_vm.unified_compiler.dsl_interpreter import (
+        DSLInterpreter,
+    )
+    from c4_release.neural_vm.unified_compiler.primitives import (
+        AO,
+        AP,
+        DeclarativeAttentionHeadSpec,
+    )
+
+    # Minimal dim layout: CLEAN_EMBED_LO at base 100 (16 cells),
+    # STACK0_BYTE_VAL_1_LO at base 200 (16 cells). The choice of bases
+    # is arbitrary so long as the bridge correctly resolves int columns
+    # back to "NAME+offset" string keys.
+    dim_positions = {
+        "CLEAN_EMBED_LO": 100,
+        "STACK0_BYTE_VAL_1_LO": 200,
+    }
+    # Build the per-cell V/O writes for the AX-byte-1 lo-nibble channel
+    # (the L10 PSH broadcast head writes 16 cells: one per nibble value).
+    v_writes = tuple(
+        AP(slot=k, dim=100 + k, weight=1.0) for k in range(16)
+    )
+    o_writes = tuple(
+        AO(out_dim=200 + k, slot=k, weight=3.0) for k in range(16)
+    )
+    spec = DeclarativeAttentionHeadSpec(
+        head_idx=8, q=(), k=(), v=v_writes, o=o_writes,
+    )
+
+    # Seed: only CLEAN_EMBED_LO+2 is active (matches AX=0x200 byte 1
+    # lo nibble == 2).
+    interp = DSLInterpreter(
+        initial_state={"CLEAN_EMBED_LO+2": 1.0},
+        dim_positions=dim_positions,
+    )
+    step = interp.apply_attention_specs([spec], op_name="psh_ax_byte1_broadcast")
+
+    # The bridge should have read CLEAN_EMBED_LO+2 (=1.0) on the V side
+    # and propagated v_weight * o_weight = 3.0 to STACK0_BYTE_VAL_1_LO+2.
+    assert pytest.approx(interp.get("STACK0_BYTE_VAL_1_LO+2"), abs=1e-9) == 3.0
+    # No other STACK0_BYTE_VAL_1_LO+k should fire (only nibble 2 was active).
+    for k in range(16):
+        if k == 2:
+            continue
+        assert interp.get(f"STACK0_BYTE_VAL_1_LO+{k}") == 0.0
+    # Sanity: the step recorded one rule firing and at least one write.
+    assert step.rules_fired == 1
+    assert any(
+        key.startswith("STACK0_BYTE_VAL_1_LO") for key, _value in step.writes
+    )
+
+
+def test_apply_attention_specs_skips_propagation_without_dim_positions():
+    """When ``dim_positions`` is absent the bridge falls back to a
+    stringified int key. Writes still propagate self-consistently within
+    a single spec (V int matches the same int on the O side), so the
+    interpreter is at least usable; the test pins the fallback shape so
+    a regression that returns an empty list silently is caught.
+    """
+
+    from c4_release.neural_vm.unified_compiler.dsl_interpreter import (
+        DSLInterpreter,
+    )
+    from c4_release.neural_vm.unified_compiler.primitives import (
+        AO,
+        AP,
+        DeclarativeAttentionHeadSpec,
+    )
+
+    spec = DeclarativeAttentionHeadSpec(
+        head_idx=0,
+        q=(),
+        k=(),
+        v=(AP(slot=0, dim=42, weight=1.0),),
+        o=(AO(out_dim=99, slot=0, weight=2.0),),
+    )
+    # Seed using the stringified int form so the fallback bridge sees a
+    # non-zero V activation.
+    interp = DSLInterpreter(initial_state={"42": 1.0})
+    interp.apply_attention_specs([spec])
+    assert interp.get("99") == 2.0
+
+
 def test_diff_finds_no_divergence_when_actual_matches_oracle():
     """A runner that writes MARK_AX at every step shows zero divergence."""
 

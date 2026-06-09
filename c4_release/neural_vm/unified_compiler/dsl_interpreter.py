@@ -154,6 +154,63 @@ class DSLInterpreter:
         self.dim_positions: Optional[Dict[str, int]] = (
             dict(dim_positions) if dim_positions else None
         )
+        # Lazily-built reverse map: int residual column -> list of
+        # ``(name, offset)`` pairs sorted by offset (smallest first).
+        # Used by ``apply_attention_specs`` to bridge the int-keyed
+        # attention spec (``v.dim`` / ``o.out_dim`` are int residual
+        # columns) to the string-keyed residual state dict.
+        self._int_pos_to_keys: Optional[Dict[int, List[Tuple[str, int]]]] = None
+
+    def _build_int_pos_map(self) -> Dict[int, List[Tuple[str, int]]]:
+        """Build an int-residual-column -> ``[(name, offset), ...]`` map.
+
+        Walks ``self.dim_positions`` (when set) and assigns every column
+        in the dim's footprint a candidate ``(name, offset)`` pair. The
+        footprint width is inferred from neighbouring dim base positions
+        (next-base - this-base); the last dim's footprint defaults to 16
+        (the nibble-cell width used everywhere in the C4 dim registry).
+
+        Multiple dim names may alias to the same column (e.g. ``CONST``
+        and an offset of some other family); the value list preserves
+        every alias so ``apply_attention_specs`` can probe each one.
+        """
+        out: Dict[int, List[Tuple[str, int]]] = {}
+        if not self.dim_positions:
+            return out
+        # Sort dim families by base position so we can compute footprint
+        # widths from consecutive bases.
+        sorted_dims = sorted(
+            self.dim_positions.items(), key=lambda kv: int(kv[1]),
+        )
+        for i, (name, base) in enumerate(sorted_dims):
+            base = int(base)
+            if i + 1 < len(sorted_dims):
+                width = int(sorted_dims[i + 1][1]) - base
+            else:
+                width = 16
+            if width <= 0:
+                # Aliased dims (same base position) — record at offset 0.
+                width = 1
+            for offset in range(width):
+                out.setdefault(base + offset, []).append((name, offset))
+        return out
+
+    def _candidate_keys_for_int_dim(self, int_dim: int) -> List[str]:
+        """Return state-key candidates for an int residual column.
+
+        Used to bridge attention specs (int-keyed ``v.dim`` /
+        ``o.out_dim``) to the string-keyed residual state. Falls back to
+        ``[str(int_dim)]`` when no dim_positions map is available — the
+        caller will then read/write under the int-stringified key, which
+        is at least self-consistent across V-side reads and O-side writes
+        for the same spec.
+        """
+        if self._int_pos_to_keys is None:
+            self._int_pos_to_keys = self._build_int_pos_map()
+        pairs = self._int_pos_to_keys.get(int(int_dim), [])
+        if not pairs:
+            return [str(int(int_dim))]
+        return [f"{name}+{offset}" for name, offset in pairs]
 
     # ----- per-op application ----------------------------------------------
 
@@ -217,6 +274,30 @@ class DSLInterpreter:
         ``decl_verifier`` and the byte-identity tests use — it's not the
         full softmax dynamics, but it captures the "this head moves data
         from V_dim to O_dim" intent.
+
+        Int↔string key bridge
+        ---------------------
+
+        Attention specs (``AttentionProjectionWrite`` / ``AttentionOutputWrite``)
+        store ``dim`` and ``out_dim`` as *int residual columns* (the
+        position in the residual stream), but the rest of the residual
+        state is keyed by *string dim names* (``"NAME+offset"``) — that's
+        what the embedding bake writes and what every FFN rule reads. A
+        naive ``self.state.get(v.dim, 0.0)`` with an int key always
+        returns ``0.0``, so V→O propagation never fires for symbolic
+        traces driven by string-keyed embeddings (the bug
+        ``replay_expected_diff`` flagged: localised to block 0 instead
+        of the L10 broadcast head at block 12 for the
+        ``STACK0_BYTE_VAL_1_LO`` demo).
+
+        Fix: resolve int dims through ``dim_positions``. On the V-side
+        we probe every candidate string key (multiple dim names can
+        alias to one column) and sum their values — same accumulation
+        rule as the residual stream. On the O-side we write to *every*
+        candidate string key (so downstream reads under any alias see
+        the propagated value). When ``dim_positions`` is absent we fall
+        back to a stringified int key so the read/write pair is at least
+        self-consistent within one spec.
         """
         step = InterpreterStep(
             op_name=op_name, op_kind="attn", layer_idx=layer_idx,
@@ -225,7 +306,7 @@ class DSLInterpreter:
         for spec in specs:
             step.rules_fired += 1
             # Build a slot-to-value-dim map from the V writes.
-            v_by_slot: Dict[int, str] = {}
+            v_by_slot: Dict[int, Any] = {}
             for v in getattr(spec, "v", ()):
                 v_by_slot[v.slot] = v.dim
             # For each O write, propagate the matching V dim's value.
@@ -237,15 +318,36 @@ class DSLInterpreter:
                         f"O slot {o.slot} has no matching V dim — skipped"
                     )
                     continue
-                v_value = self.state.get(v_dim, 0.0)
+                # Bridge: spec dims are ints; state is string-keyed.
+                v_keys = self._resolve_dim_keys(v_dim)
+                v_value = sum(self.state.get(k, 0.0) for k in v_keys)
                 contribution = v_value * o.weight
-                # AttentionOutputWrite carries ``out_dim`` (an int residual
-                # column); use it as the state key directly, mirroring the
-                # V-side which also keys state by an int dim.
-                key = o.out_dim
-                self.state[key] = self.state.get(key, 0.0) + contribution
-                step.writes.append((key, contribution))
+                if contribution == 0.0:
+                    # No V-side activation to propagate — skip to avoid
+                    # creating zero-valued state entries.
+                    continue
+                out_keys = self._resolve_dim_keys(o.out_dim)
+                for key in out_keys:
+                    self.state[key] = (
+                        self.state.get(key, 0.0) + contribution
+                    )
+                    step.writes.append((key, contribution))
         return step
+
+    def _resolve_dim_keys(self, dim) -> List[str]:
+        """Return state-key candidates for a spec dim reference.
+
+        Handles both int (residual column) and string (already a state
+        key) forms. For ints, falls back to
+        :meth:`_candidate_keys_for_int_dim`; for strings, normalises to
+        ``"NAME+0"`` when no ``+`` offset is present.
+        """
+        if isinstance(dim, int):
+            return self._candidate_keys_for_int_dim(dim)
+        s = str(dim)
+        if "+" not in s:
+            return [f"{s}+0"]
+        return [s]
 
     def apply_token_embedding_rules(
         self,
