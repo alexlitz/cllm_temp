@@ -182,10 +182,30 @@ Measured: 1 / 10 on 0700-0709 (rec_factorial 0-9) + 4 / 10 on 0710-0719
 
 ### `func_mul` 1 / 25 (4 %)
 
-- 24 / 25 fail with the post-LEV AX-byte corruption pattern. Notable
-  outlier: `func_mul_23 mul(36, 27) → got 269484032` (≈ `0x100F_0F00`)
-  — raw unmasked high-byte emission, consistent with the L9/L10
-  AX-byte channel writing unmasked sentinel patterns.
+- 24 / 25 fail. Two distinct surface shapes, **both sharing the same
+  first-token divergence**:
+  - Majority (22 / 24): `mul(a, b) → got b` — neural exit equals the
+    second operand (e.g. `mul(45, 32) → 32`, `mul(36, 9) → 9`,
+    `mul(11, 20) → 20`). Consistent with post-LEV AX retaining the
+    pre-call argument (Bug #33 cluster).
+  - Outliers (2 / 24): `func_mul_16 mul(19, 29) → 269484032` and
+    `func_mul_23 mul(36, 27) → 269484032` — *both* identical value
+    `0x10100000` (bytes 0,1 = 0x00; bytes 2,3 = 0x10). Not the
+    L9/L10 high-byte sentinel hypothesized earlier; the upper bytes
+    being equal 0x10 hints at a shared cross-step prev-step OUTPUT
+    relay value.
+- **Re-attribution 2026-06-09** (`tools/attribute_1096_failure.py`
+  on tests 0616, 0617, 0623): all three sampled failures resolve to
+  the **same first divergence** — *step 0, slot `MEM_value1`,
+  expected 0x00, neural 0xff*, suspect dims `OUTPUT_LO` / `OUTPUT_HI`,
+  first-mismatch op `layer3_carry_forward_attn` (residual abs-max at
+  AX-marker pos=186 after layer 3 = 9.644e-22, declared producer for
+  `OUTPUT_HI` not actually writing). The earlier "AX_byte3 unmasked
+  high-byte sentinel" diagnosis is therefore superseded: the surface
+  is upstream at L3 prev-step OUTPUT carry-forward (step 0 has no
+  prev-step; the cross-step alias delivers an unexpected non-zero
+  residual through the KV cache). See `.agent-logs/1096_fail_{616,
+  617,623}.md`.
 
 ### `var_mul` 0 / 25 (0 %)
 
