@@ -29,7 +29,10 @@ transformers = pytest.importorskip("transformers")
 
 import torch
 
-from neural_vm.qwen_compat import export_qwen3_dense
+from neural_vm.qwen_compat import (
+    export_qwen3_dense,
+    install_neural_vm_embedding_wrapper,
+)
 from neural_vm.vm_step import AutoregressiveVM
 
 
@@ -383,9 +386,15 @@ def test_r8_full_production_roundtrip():
         counterpart; compensator must be replicated per head.
       * **I2 / Blocker 4** — production VM is ALiBi; Qwen3 is RoPE-only.
       * **I3 / Blocker 5** — ``NeuralVMEmbedding`` augmentations
-        (``ADDR_KEY``, ``MEM_STORE`` boundary writes) are not exported.
+        (``ADDR_KEY``, ``MEM_STORE`` boundary writes) — runtime wrapper
+        landed at commit 94072b3b and is now wired through the forward
+        path here via :func:`install_neural_vm_embedding_wrapper` after
+        ``from_pretrained`` (the wrapper byte-identity test lives at
+        ``tests/test_qwen_embedding_export.py::test_install_neural_vm_embedding_wrapper_attaches_to_hf_qwen3``).
+        The argmax gain from this fix is masked by the remaining
+        D1/D2/I1/I2 gaps until those land.
 
-    When D1 + D2 + I1/I2/I3 all integrate, this test flips to xpass
+    When D1 + D2 + I1/I2 all integrate, this test flips to xpass
     (or, if the harness escalates xpass to fail, to a plain pass after
     removing the runtime ``pytest.xfail`` block).
     """
@@ -454,6 +463,29 @@ def test_r8_full_production_roundtrip():
                 f"docs/QWEN_R8_E2E_2026_06_07.md."
             )
         qmodel.eval()
+
+        # Step 4b: install the NeuralVMEmbedding augmentation wrapper.
+        # Plain ``from_pretrained`` rebuilds ``model.embed_tokens`` as an
+        # ``nn.Embedding`` — the ADDR_KEY scatter and MEM_STORE writes the
+        # native VM does on every forward (see
+        # ``NeuralVMEmbedding.forward``) are silently dropped, so L5/L7
+        # content-addressed bytecode fetch sees zero ADDR_KEY keys and the
+        # argmax diverges. ``install_neural_vm_embedding_wrapper`` swaps the
+        # embedding for :class:`NeuralVMEmbeddingWrapper`, rebuilt from the
+        # ``c4_addr_key_idx`` / ``c4_mem_*_idx`` config the export persisted.
+        try:
+            wrapper = install_neural_vm_embedding_wrapper(qmodel, qmodel.config)
+            # Mirror the native runner's clean-slate MEM boundary for this
+            # single-shot forward (the runner calls ``set_mem_history_end(0)``
+            # at the start of every ``run`` — see ``run_vm.py``).
+            wrapper.set_mem_history_end(0)
+        except Exception as exc:
+            pytest.xfail(
+                f"install_neural_vm_embedding_wrapper failed after HF load: "
+                f"{type(exc).__name__}: {exc}. Likely blocker: I3 "
+                f"(embedding augmentation wiring). See "
+                f"docs/QWEN_R8_E2E_2026_06_07.md §Blocker 5."
+            )
 
     # Step 5: build the same token context the native runner uses.
     from neural_vm.run_vm import AutoregressiveVMRunner

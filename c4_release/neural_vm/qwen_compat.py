@@ -1448,6 +1448,69 @@ class NeuralVMEmbeddingWrapper(nn.Module):
         )
 
 
+def install_neural_vm_embedding_wrapper(
+    qmodel: Any,
+    config: Any,
+) -> "NeuralVMEmbeddingWrapper":
+    """Swap a loaded HF Qwen3 model's ``embed_tokens`` for the augmentation wrapper.
+
+    Plain ``AutoModelForCausalLM.from_pretrained`` reconstructs
+    ``model.embed_tokens`` as an ``nn.Embedding`` — the ADDR_KEY scatter and
+    MEM_STORE / MEM_ADDR_SRC writes that :class:`NeuralVMEmbedding` performs in
+    the native VM are silently dropped on the Qwen3 forward path, which leaves
+    L5/L7 content-addressed bytecode fetch (and the L15 retained-history lookup)
+    without their key columns. This helper rebuilds the wrapper from the
+    exported config (``c4_addr_key_idx`` / ``c4_mem_store_idx`` /
+    ``c4_mem_addr_src_idx``) and swaps it in-place at
+    ``qmodel.model.embed_tokens`` so the augmentations apply on the next
+    forward.
+
+    The original ``nn.Embedding`` is preserved as ``wrapper.embed``.
+    ``tie_word_embeddings`` is False on every export (see
+    :func:`_build_qwen3_dense_config`), so swapping the module does not affect
+    ``lm_head``. The wrapper is returned so callers can drive the mutable MEM
+    state (``set_mem_history_end`` / ``set_mem_store_positions`` /
+    ``set_mem_addr_src_positions``) without re-walking the model tree. Calling
+    this helper twice is idempotent — the second call returns the existing
+    wrapper unchanged.
+
+    Args:
+        qmodel: a loaded ``Qwen3ForCausalLM`` (or any object with a
+            ``model.embed_tokens`` attribute) freshly returned from
+            ``AutoModelForCausalLM.from_pretrained``.
+        config: an exported :class:`Qwen3DenseConfig`, the HF
+            ``PretrainedConfig`` from ``qmodel.config`` (whose ``c4_*`` fields
+            were round-tripped from ``config.json``), or a plain dict.
+
+    Returns:
+        The installed :class:`NeuralVMEmbeddingWrapper`.
+    """
+
+    inner = qmodel.model.embed_tokens
+    if isinstance(inner, NeuralVMEmbeddingWrapper):
+        return inner  # idempotent — re-install is a no-op.
+    if not isinstance(inner, nn.Embedding):
+        raise TypeError(
+            "install_neural_vm_embedding_wrapper expects qmodel.model.embed_tokens "
+            f"to be an nn.Embedding (or NeuralVMEmbeddingWrapper); got {type(inner)!r}."
+        )
+
+    if hasattr(config, "to_dict"):
+        cfg_dict: Mapping[str, Any] = config.to_dict()
+    elif hasattr(config, "__dataclass_fields__"):
+        cfg_dict = asdict(config)
+    elif isinstance(config, Mapping):
+        cfg_dict = config
+    elif hasattr(config, "__dict__"):
+        cfg_dict = vars(config)
+    else:
+        cfg_dict = dict(config)
+
+    wrapper = NeuralVMEmbeddingWrapper.from_config(inner, cfg_dict)
+    qmodel.model.embed_tokens = wrapper
+    return wrapper
+
+
 def _maybe_flatten_post_ops(model: Any) -> Tuple[bool, Optional[str]]:
     """Try to import the R5 post_ops flattener and apply it in-place.
 
@@ -2039,6 +2102,7 @@ __all__ = [
     "AlibiToRopeReport",
     "apply_neural_vm_embedding_augmentations",
     "NeuralVMEmbeddingWrapper",
+    "install_neural_vm_embedding_wrapper",
 ]
 
 

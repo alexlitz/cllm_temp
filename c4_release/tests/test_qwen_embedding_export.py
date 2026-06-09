@@ -403,3 +403,97 @@ def test_export_qwen3_dense_records_embedding_indices_in_config_json():
     assert loaded["c4_mem_token_id"] == int(Token.MEM)
     assert loaded["c4_addr_key_pc_offset"] == PC_OFFSET
     assert loaded["c4_addr_key_instr_width"] == INSTR_WIDTH
+
+
+# ---------------------------------------------------------------------------
+# Test 8: install_neural_vm_embedding_wrapper swaps the HF embed_tokens.
+# ---------------------------------------------------------------------------
+
+
+def test_install_neural_vm_embedding_wrapper_attaches_to_hf_qwen3():
+    """The runtime helper rewires HF embed_tokens so ADDR_KEY actually applies.
+
+    Pins the gap that R8 step 8 hit: ``AutoModelForCausalLM.from_pretrained``
+    rebuilds ``model.embed_tokens`` as a plain ``nn.Embedding`` and the
+    ADDR_KEY scatter / MEM_STORE writes silently drop. After
+    :func:`install_neural_vm_embedding_wrapper` swaps the wrapper in, the
+    qmodel forward path emits embeddings byte-identical to
+    ``NeuralVMEmbedding.forward`` on the same inputs.
+    """
+
+    transformers = pytest.importorskip("transformers")
+    from neural_vm.qwen_compat import (
+        export_qwen3_dense,
+        install_neural_vm_embedding_wrapper,
+    )
+
+    NORM_COMPENSATOR_K = 1000.0
+    torch.manual_seed(7)
+    d_model = 64
+    vm = AutoregressiveVM(
+        vocab_size=276,
+        d_model=d_model,
+        n_layers=1,
+        n_heads=4,
+        ffn_hidden=32,
+        max_seq_len=64,
+        positional_encoding="rope",
+        attention_normalization="softmax",
+        use_rms_norm=True,
+        use_flash_attention=False,
+    )
+    vm.dim_positions = {
+        "NORM_COMPENSATOR": 0,
+        "CONST": 1,
+        "ADDR_KEY": 8,
+        "MEM_STORE": 56,
+        "MEM_ADDR_SRC": 57,
+    }
+    # NeuralVMEmbedding reads dim_positions through its own attribute, not
+    # via the VM. Mirror the same layout so the native augmentation lands
+    # on the matching slot.
+    vm.embed._dim_positions = vm.dim_positions
+    with torch.no_grad():
+        vm.embed.embed.weight[:, 0] = NORM_COMPENSATOR_K
+        for block in vm.blocks:
+            block.attn.W_o.data[0, :] = 0.0
+            block.ffn.W_down.data[0, :] = 0.0
+    vm.eval()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        export_qwen3_dense(vm, tmp, K=NORM_COMPENSATOR_K)
+        from transformers import AutoModelForCausalLM
+        qmodel = AutoModelForCausalLM.from_pretrained(tmp)
+    qmodel.eval()
+
+    # Build a sequence carrying CODE_END and a couple of MEM markers so
+    # both ADDR_KEY and MEM_STORE augmentations have something to do.
+    input_ids = _seed_token_grid(
+        seq_len=20, code_end_pos=12, mem_positions=[14, 16]
+    )
+
+    # Pre-swap: HF embed lookup misses the ADDR_KEY band by construction.
+    with torch.no_grad():
+        plain_qwen = qmodel.model.embed_tokens(input_ids)
+        native = vm.embed(input_ids)
+    ak = qmodel.config.c4_addr_key_idx
+    assert ak is not None
+    # ADDR_KEY band diverges on the plain HF embedding (the bug).
+    assert not torch.equal(
+        plain_qwen[:, :, ak: ak + 48], native[:, :, ak: ak + 48]
+    )
+
+    # Install the wrapper and re-run the forward path used by HF.
+    wrapper = install_neural_vm_embedding_wrapper(qmodel, qmodel.config)
+    assert qmodel.model.embed_tokens is wrapper
+    with torch.no_grad():
+        wrapped = qmodel.model.embed_tokens(input_ids)
+    assert torch.equal(native, wrapped), (
+        f"wrapper-installed HF embed_tokens diverged from native "
+        f"NeuralVMEmbedding by max |Δ| = "
+        f"{float((native - wrapped).abs().max())}"
+    )
+
+    # Idempotent: calling twice returns the same wrapper.
+    again = install_neural_vm_embedding_wrapper(qmodel, qmodel.config)
+    assert again is wrapper
