@@ -687,17 +687,298 @@ def _layer14_mem_generation_head_specs(
     return tuple(specs)
 
 
+def _layer14_mem_generation_head_specs_with_overrides(
+    BD,
+) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Merged L14 MEM-generation specs: base + overrides folded into one spec.
+
+    Declarative replacement for the legacy post-bake patch
+    :func:`_clear_l14_mem_generation_overbroad_sp_suppression`. The
+    overrides are folded into the per-head ``q``/``k``/``v``/``o`` dicts
+    so the lowered weights are byte-identical with running the override
+    helper after :func:`_layer14_mem_generation_head_specs`.
+
+    Each override cell is expressed as a (slot, dim) -> final-value
+    assignment; the row-wide ``W_q[base + 33, :] *= 2.0`` step is handled
+    by doubling the spec's existing slot-33 weights (every other column
+    is zero pre-multiply and stays zero). The ``head_idx`` ordering of
+    the returned specs matches :data:`_L14_HEAD_LAYOUT`.
+    """
+
+    pc_i = 0
+    ax_i = 1
+    sp_i = 2
+    bp_i = 3
+    mem_i = 4
+
+    base_specs = _layer14_mem_generation_head_specs(BD)
+    merged: list[DeclarativeAttentionHeadSpec] = []
+
+    for spec in base_specs:
+        head = spec.head_idx
+        q_map: dict[tuple[int, int], float] = {
+            (w.slot, w.dim): w.weight for w in spec.q
+        }
+        k_map: dict[tuple[int, int], float] = {
+            (w.slot, w.dim): w.weight for w in spec.k
+        }
+        v_map: dict[tuple[int, int], float] = {
+            (w.slot, w.dim): w.weight for w in spec.v
+        }
+        o_map: dict[tuple[int, int], float] = {
+            (w.out_dim, w.slot): w.weight for w in spec.o
+        }
+
+        # === Common override block (all 8 heads) =====================
+        # Slot 0: SP-suppression cancel.
+        q_map[(0, BD.H1 + sp_i)] = 0.0
+        # Slot 33: double every existing weight at this row (legacy
+        # ``W_q[base + 33, :] *= 2.0`` only multiplies the cells the spec
+        # touched; all other columns stay zero).
+        slot33_keys = [key for key in q_map if key[0] == 33]
+        for key in slot33_keys:
+            q_map[key] = q_map[key] * 2.0
+        q_map[(33, BD.H1 + sp_i)] = 0.0
+        # Slot 35: MEM-source exclusion row (sign-stable).
+        q_map[(35, BD.CONST)] = 40.0
+        k_map[(35, BD.MARK_MEM)] = -40.0
+        k_map[(35, BD.H3 + 4)] = -40.0
+        # Slot 38: shared non-MEM target blocker (override strength 5000
+        # supersedes the base spec's 2000).
+        target_block_s = 5000.0
+        for dim in (
+            BD.MARK_PC,
+            BD.MARK_AX,
+            BD.MARK_SP,
+            BD.MARK_BP,
+            BD.MARK_STACK0,
+            BD.H1 + pc_i,
+            BD.H1 + ax_i,
+            BD.H1 + bp_i,
+            BD.H4 + bp_i,
+        ):
+            q_map[(38, dim)] = -target_block_s
+        k_map[(38, BD.CONST)] = 5.0
+
+        if head < 4:
+            # === Heads 0-3: MEM addr byte generation overrides ========
+            q_map[(38, BD.H1 + sp_i)] = -target_block_s
+            for dim in (
+                BD.MEM_VAL_B0,
+                BD.MEM_VAL_B1,
+                BD.MEM_VAL_B2,
+                BD.MEM_VAL_B3,
+            ):
+                q_map[(38, dim)] = -target_block_s
+
+            # Head 0: PSH addr byte 0 source bonus on MARK_SP (legacy
+            # ``attn.W_k.data[1, BD.MARK_SP] = 45.0`` — row 1 lives in
+            # head 0's row-block only).
+            if head == 0:
+                k_map[(1, BD.MARK_SP)] = 45.0
+
+            # Slot-1 K guards (BP/STACK0 exclusion). Heads 1-3 also
+            # source the SP byte row directly via byte-idx K bonus.
+            k_map[(1, BD.H4 + bp_i)] = -30.0
+            k_map[(1, BD.MARK_STACK0)] = -30.0
+
+            if head in (1, 2, 3):
+                # V slot 0 + zeroed OUTPUT reads (clean-payload only) so
+                # the source byte row's own OUTPUT does not bleed into
+                # the next-byte prediction.
+                v_map[(0, BD.CONST)] = 1.0
+                for kk in range(16):
+                    v_map[(1 + kk, BD.OUTPUT_LO + kk)] = 0.0
+                    v_map[(17 + kk, BD.OUTPUT_HI + kk)] = 0.0
+                byte_dim_by_head = {
+                    1: BD.BYTE_INDEX_1,
+                    2: BD.BYTE_INDEX_2,
+                    3: BD.BYTE_INDEX_3,
+                }
+                k_map[(1, byte_dim_by_head[head])] = 60.0
+
+            # === Slot 2: SI/SC source selector rewrite ==============
+            # Zero the base-spec K writes at slot 2 (every column the
+            # override touches via ``= 0.0`` or per-head assignment).
+            si_source_s = 200.0
+            for dim in (
+                BD.MEM_STORE,
+                BD.STACK0_BYTE0,
+                BD.H1 + bp_i,
+                BD.L1H4 + bp_i,
+                BD.H2 + bp_i,
+                BD.H3 + bp_i,
+                BD.H4 + bp_i,
+                BD.MARK_STACK0,
+                BD.H1 + ax_i,
+                BD.H1 + sp_i,
+            ):
+                k_map[(2, dim)] = 0.0
+            k_map[(2, BD.MEM_STORE)] = -4.0 * si_source_s
+            k_map[(2, BD.H1 + ax_i)] = -si_source_s
+            k_map[(2, BD.H1 + sp_i)] = -si_source_s
+            if head == 0:
+                k_map[(2, BD.STACK0_BYTE0)] = si_source_s
+            elif head == 1:
+                k_map[(2, BD.MARK_STACK0)] = -si_source_s
+                k_map[(2, BD.H2 + bp_i)] = si_source_s
+                k_map[(2, BD.L1H4 + bp_i)] = -si_source_s
+            elif head == 2:
+                k_map[(2, BD.MARK_STACK0)] = -si_source_s
+                k_map[(2, BD.H3 + bp_i)] = si_source_s
+                k_map[(2, BD.H2 + bp_i)] = -si_source_s
+            else:  # head == 3
+                k_map[(2, BD.MARK_STACK0)] = -si_source_s
+                k_map[(2, BD.H4 + bp_i)] = si_source_s
+                k_map[(2, BD.H3 + bp_i)] = -si_source_s
+
+            # === Slots 39-43: ENT addr-source overrides =============
+            ent_addr_s = 50.0
+            ent_wrong_target_s = 500.0
+            q_map[(39, BD.OP_ENT)] = ent_addr_s
+            q_map[(39, BD.HAS_SE)] = ent_addr_s * 3.0
+            q_map[(39, BD.CONST)] = -ent_addr_s * 6.0
+            if head == 0:
+                q_map[(39, BD.IS_BYTE)] = -12.0 * ent_addr_s
+                k_map[(39, BD.MARK_BP)] = ent_addr_s
+            else:
+                k_map[(39, BD.H1 + bp_i)] = 0.0
+                q_map[(40, BD.OP_ENT)] = ent_addr_s
+                q_map[(40, BD.HAS_SE)] = 0.0
+                q_map[(40, BD.CONST)] = 0.0
+                for dim in (BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2):
+                    q_map[(40, dim)] = 0.0
+                allowed_query_dim = (
+                    BD.BYTE_INDEX_0,
+                    BD.BYTE_INDEX_1,
+                    BD.BYTE_INDEX_2,
+                )[head - 1]
+                for dim in (
+                    BD.BYTE_INDEX_0,
+                    BD.BYTE_INDEX_1,
+                    BD.BYTE_INDEX_2,
+                    BD.BYTE_INDEX_3,
+                ):
+                    if dim != allowed_query_dim:
+                        q_map[(40, dim)] = -ent_wrong_target_s
+                k_map[(40, BD.H1 + bp_i)] = ent_addr_s
+                k_map[(40, (BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3)[head - 1])] = ent_addr_s
+
+                # MEM-marker block (heads 1..3 only).
+                mem_marker_block_s = 300.0
+                q_map[(41, BD.MARK_MEM)] = -mem_marker_block_s
+                k_map[(41, BD.CONST)] = mem_marker_block_s
+
+                # Slot-42 zero-out + slot-43 ENT target gate (heads 1..3).
+                ent_target_gate_s = 200.0
+                query_dim_by_head = {
+                    1: BD.BYTE_INDEX_0,
+                    2: BD.BYTE_INDEX_1,
+                    3: BD.BYTE_INDEX_2,
+                }[head]
+                q_map[(42, BD.CONST)] = 0.0
+                q_map[(42, BD.OP_ENT)] = 0.0
+                q_map[(42, query_dim_by_head)] = 0.0
+                k_map[(42, BD.CONST)] = 0.0
+                q_map[(43, BD.CONST)] = -ent_target_gate_s
+                q_map[(43, BD.H3 + mem_i)] = ent_target_gate_s
+                k_map[(43, BD.CONST)] = ent_target_gate_s
+
+        else:
+            # === Heads 4-7: MEM val byte generation overrides ========
+            # V scale-up: CLEAN_EMBED payload doubled, V[0] cancel x2.
+            v_map[(0, BD.CONST)] = 2.0
+            for kk in range(16):
+                v_map[(1 + kk, BD.CLEAN_EMBED_LO + kk)] = 2.0
+                v_map[(17 + kk, BD.CLEAN_EMBED_HI + kk)] = 2.0
+
+            # Slot 36: value-source selector.
+            source_s = 50.0
+            q_map[(36, BD.CONST)] = source_s
+            q_map[(36, BD.OP_JSR)] = -2.0 * source_s
+            q_map[(36, BD.OP_ENT)] = -2.0 * source_s
+            k_map[(36, BD.H1 + ax_i)] = source_s
+            k_map[(36, BD.H1 + sp_i)] = 0.0
+            k_map[(36, BD.H4 + bp_i)] = -source_s
+            k_map[(36, BD.MARK_STACK0)] = source_s
+            k_map[(36, BD.MARK_MEM)] = 0.0
+            k_map[(36, BD.H3 + mem_i)] = 0.0
+
+            # Slot 38: value-target blocks (current head's MEM_VAL stays
+            # active; other 3 + MARK_MEM + BYTE_INDEX_0..2 are blocked).
+            value_target_block_s = 15000.0
+            for dim in (
+                BD.MARK_MEM,
+                BD.BYTE_INDEX_0,
+                BD.BYTE_INDEX_1,
+                BD.BYTE_INDEX_2,
+            ):
+                q_map[(38, dim)] = -value_target_block_s
+            mem_val_dims = (
+                BD.MEM_VAL_B0,
+                BD.MEM_VAL_B1,
+                BD.MEM_VAL_B2,
+                BD.MEM_VAL_B3,
+            )
+            own_value_idx = head - 4
+            for idx, dim in enumerate(mem_val_dims):
+                if idx != own_value_idx:
+                    q_map[(38, dim)] = -value_target_block_s
+
+            # Slots 44-45: ENT old-BP source override.
+            ent_old_bp_s = 80.0
+            ent_value_target_s = 1000.0
+            source_byte_dim = (
+                BD.BYTE_INDEX_0,
+                BD.BYTE_INDEX_1,
+                BD.BYTE_INDEX_2,
+                BD.BYTE_INDEX_3,
+            )[own_value_idx]
+            target_query_dim = mem_val_dims[own_value_idx]
+            q_map[(44, BD.OP_ENT)] = ent_old_bp_s
+            k_map[(44, BD.OP_JSR)] = ent_old_bp_s
+            k_map[(44, BD.H1 + bp_i)] = ent_old_bp_s
+            k_map[(44, source_byte_dim)] = ent_old_bp_s
+            q_map[(45, BD.CONST)] = -0.9 * ent_value_target_s
+            q_map[(45, target_query_dim)] = ent_value_target_s
+            k_map[(45, BD.CONST)] = ent_value_target_s
+
+            # Slot 37: explicit zero-out in legacy override. The base
+            # spec does not touch slot 37, so the assignments are
+            # already 0; nothing to record.
+
+        # === O override: zero-nibble cancel softened to -0.5 ========
+        o_map[(BD.OUTPUT_LO + 0, 0)] = -0.5
+        o_map[(BD.OUTPUT_HI + 0, 0)] = -0.5
+
+        new_q = tuple(AP(slot, dim, w) for (slot, dim), w in q_map.items())
+        new_k = tuple(AP(slot, dim, w) for (slot, dim), w in k_map.items())
+        new_v = tuple(AP(slot, dim, w) for (slot, dim), w in v_map.items())
+        new_o = tuple(AO(out_dim, slot, w) for (out_dim, slot), w in o_map.items())
+        merged.append(DeclarativeAttentionHeadSpec(
+            head_idx=spec.head_idx,
+            q=new_q,
+            k=new_k,
+            v=new_v,
+            o=new_o,
+        ))
+
+    return tuple(merged)
+
+
 def _layer14_mem_generation_ir(dim_positions, HD) -> CompilerIR:
     """Build the declarative L14 mem-generation IR for the compiler.
 
     Eight heads (0-3 address, 4-7 value). See
-    :func:`_layer14_mem_generation_head_specs` for the byte-level layout.
+    :func:`_layer14_mem_generation_head_specs` for the base layout and
+    :func:`_layer14_mem_generation_head_specs_with_overrides` for the
+    merged base+override spec used at bake time.
     """
 
     del HD
     proxy = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
-    for spec in _layer14_mem_generation_head_specs(proxy):
+    for spec in _layer14_mem_generation_head_specs_with_overrides(proxy):
         ir.layer(0).attention.append(spec)
     return ir
 
@@ -761,12 +1042,12 @@ def make_layer14_mem_generation_op() -> Operation:
 
     Wave 2E (Phase 6): migrated to ``DeclarativeAttentionHeadSpec`` form.
     Heads 0-3 (address) and 4-7 (value) are expressed declaratively via
-    :func:`_layer14_mem_generation_head_specs`; the imperative
-    :func:`vm_step._set_layer14_mem_generation` helper is no longer
-    called. Byte-identity is preserved end-to-end (legacy ``W_q``/``W_k``
-    /``W_v``/``W_o`` writes are reproduced cell-for-cell via the spec,
-    then ``_clear_l14_mem_generation_overbroad_sp_suppression`` applies
-    the same residual overrides as before).
+    :func:`_layer14_mem_generation_head_specs_with_overrides`; the
+    imperative :func:`vm_step._set_layer14_mem_generation` helper is no
+    longer called, and the legacy post-bake override
+    :func:`_clear_l14_mem_generation_overbroad_sp_suppression` has been
+    folded into the spec (byte-identical with running the spec then the
+    override imperatively).
     """
 
     def bake(attn, dim_positions, S):
@@ -778,9 +1059,10 @@ def make_layer14_mem_generation_op() -> Operation:
         head_allocator = _allocate_layer14_mem_generation_heads()
         attn._l14_head_allocator = head_allocator
         Primitives.generate_attention_heads(
-            attn, _layer14_mem_generation_head_specs(proxy), HD,
+            attn,
+            _layer14_mem_generation_head_specs_with_overrides(proxy),
+            HD,
         )
-        _clear_l14_mem_generation_overbroad_sp_suppression(attn, proxy, HD)
         if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
             attn.alibi_slopes[:8] = 5.0
 
