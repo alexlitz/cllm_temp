@@ -1157,7 +1157,13 @@ def make_layer8_alu_op() -> Operation:
                # lev_detector_head (phase=8.06) replaces the cross-step
                # requires["after"]=layer16_lev_routing below.
                "PC_VIA_LEV_DETECTOR_LO"},
-        writes={"OUTPUT_LO", "CARRY", "CMP_GROUP"},
+        # UNDECLARED_DIM_AUDIT_2026_06_09: added 8 undeclared writes
+        # (ADDR_B0_HI, ADDR_B0_LO, ADDR_B1_LO, ADDR_B2_LO, ALU_HI,
+        # ALU_LO, CMP, OUTPUT_HI) so the dep graph sees this op's
+        # full writer set. Declaration-only; byte-identical.
+        writes={"OUTPUT_LO", "CARRY", "CMP_GROUP",
+                "ADDR_B0_HI", "ADDR_B0_LO", "ADDR_B1_LO", "ADDR_B2_LO",
+                "ALU_HI", "ALU_LO", "CMP", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",

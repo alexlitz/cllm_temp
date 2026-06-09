@@ -2783,7 +2783,13 @@ def make_layer6_routing_ffn_op() -> Operation:
                "OUTPUT_LO.*.-1", "OUTPUT_HI.*.-1", "HAS_SE",
                "OPCODE_BASE", "OUTPUT_BYTE_LO", "OUTPUT_BYTE_HI",
                "TEMP.*.-1", "DIV_STAGING.*.-1"},
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "AX_CARRY_LO", "AX_CARRY_HI"},
+        # UNDECLARED_DIM_AUDIT_2026_06_09: added 10 undeclared writes
+        # (ADDR_B0_LO, ADDR_B1_LO, ALU_HI, ALU_LO, CMP, MEM_ADDR_SRC,
+        # MEM_STORE, NEXT_HALT, NEXT_SE, TEMP) so the dep graph sees
+        # this op's full writer set. Declaration-only; byte-identical.
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "AX_CARRY_LO", "AX_CARRY_HI",
+                "ADDR_B0_LO", "ADDR_B1_LO", "ALU_HI", "ALU_LO", "CMP",
+                "MEM_ADDR_SRC", "MEM_STORE", "NEXT_HALT", "NEXT_SE", "TEMP"},
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
