@@ -515,6 +515,182 @@ def _register_starter_contracts() -> None:
     ))
 
 
+# ---------------------------------------------------------------------------
+# Expanded coverage: byte siblings + cross-step back-edges + ALU carry path
+# ---------------------------------------------------------------------------
+#
+# This block extends the starter set with ten additional contracts the
+# A3.5 verifier agent recommended. Each contract follows one of three
+# shapes already validated by the starter set:
+#
+# Shape A: same-step producer-consumer (MEM_VAL_B* + STACK0_BYTE_VAL_*).
+# Shape B: same-step ALU carry handoff (AX_CARRY_LO/HI L3 -> L11 anchor).
+# Shape C: cross-step PREV_STEP back-edge (ADDR_B0_LO/HI from L15 to L14
+#          via the SSA `.*.-1` alias; PC carry via OUTPUT_LO from L16 LEV
+#          routing to L3 carry_forward_attn).
+
+
+def _register_expanded_contracts() -> None:
+    """Register byte-sibling, ALU-carry, and PREV_STEP back-edge contracts.
+
+    Mirrors the starter set's shape for the dim families that share the
+    same producer/consumer pair (Shape A) and adds two new shapes:
+    Shape B (AX_CARRY) and Shape C (cross-step PREV_STEP).
+    """
+    psh_consumer_opcodes = OpcodeSet("SI", "LI", "SC", "LC", "PSH")
+    psh_producer_opcodes = OpcodeSet("PSH")
+    mem_consumer_opcodes = OpcodeSet("SI", "SC", "PSH")
+
+    # --- Shape A.1: MEM_VAL_B0 / B2 / B3 byte siblings of B1 -----------
+    #
+    # ``layer2_mem_byte_flags`` writes all four MEM_VAL_B{0,1,2,3} units
+    # at L2 (see l2_ops.py:308-309). L14 ``layer14_mem_generation``
+    # consumes them at the MEM marker row during SI/SC/PSH for the
+    # MEM-write value. The B1 contract proved the shape; B0/B2/B3
+    # close the family.
+    for byte_idx in (0, 2, 3):
+        register_dim_contract(DimContract(
+            dim=f"MEM_VAL_B{byte_idx}",
+            producer=OpRef(
+                "layer2_mem_byte_flags",
+                layer=2,
+                when=None,
+            ),
+            consumer=OpRef(
+                "layer14_mem_generation",
+                layer=14,
+                when=mem_consumer_opcodes,
+            ),
+            must_not_zero_between=False,
+            must_persist_for_steps=0,
+            name=f"mem_val_b{byte_idx}_l2_to_l14",
+        ))
+
+    # --- Shape A.2: STACK0_BYTE_VAL_2/3 LO/HI siblings of VAL_1 --------
+    #
+    # ``layer10_psh_ax_broadcast`` writes VAL_{1,2,3}_{LO,HI} (six dims;
+    # see l10_ops.py:2454-2456). The L14 mem_generation head spec reads
+    # all three at heads 1/2/3 (l14_ops.py:549-555). VAL_1 contracts
+    # already FAIL because the consumer's declared ``reads`` set does
+    # not list them; we expect the same FAIL signature on VAL_2/3.
+    for byte_idx in (2, 3):
+        for nibble in ("LO", "HI"):
+            register_dim_contract(DimContract(
+                dim=f"STACK0_BYTE_VAL_{byte_idx}_{nibble}",
+                producer=OpRef(
+                    "layer10_psh_ax_broadcast",
+                    layer=10,
+                    when=psh_producer_opcodes,
+                ),
+                consumer=OpRef(
+                    "layer14_mem_generation",
+                    layer=14,
+                    when=psh_consumer_opcodes,
+                ),
+                must_not_zero_between=True,
+                must_persist_for_steps=5,
+                name=f"stack0_byte_val_{byte_idx}_{nibble.lower()}_pshk2mem",
+            ))
+
+    # --- Shape B: AX_CARRY_LO / HI L3 carry_forward -> L11 anchor ------
+    #
+    # ``layer3_carry_forward_attn`` writes AX_CARRY_{LO,HI} (l3_ops.py:
+    # 1238). The L11 ``_layer11_ffn_dep_anchor`` reads both
+    # (l11_ops.py:246) to anchor the multiplier partial step's
+    # cross-step ALU_LO contract. This is the per-step staleness
+    # invariant: AX_CARRY must be fresh at the L11 read or the MUL
+    # accumulator picks up stale prev-step carry.
+    mul_opcodes = OpcodeSet("MUL")
+    for nibble in ("LO", "HI"):
+        register_dim_contract(DimContract(
+            dim=f"AX_CARRY_{nibble}",
+            producer=OpRef(
+                "layer3_carry_forward_attn",
+                layer=3,
+                when=None,
+            ),
+            consumer=OpRef(
+                "_layer11_ffn_dep_anchor",
+                layer=11,
+                when=mul_opcodes,
+            ),
+            must_not_zero_between=False,
+            must_persist_for_steps=0,
+            name=f"ax_carry_{nibble.lower()}_l3_to_l11_anchor",
+        ))
+
+    # --- Shape C.1: ADDR_B0_LO / HI PREV_STEP back-edge L15 -> L14 -----
+    #
+    # ``layer15_store_stack0_sp_byte0_addr`` writes ADDR_B0_{LO,HI} at
+    # L15 (l15_ops.py:730). L14 ``layer14_mem_generation`` reads
+    # ``ADDR_B0_LO.*.-1`` / ``ADDR_B0_HI.*.-1`` (l14_ops.py:810). The
+    # ``.*.-1`` SSA alias retires the same-step back-edge: weight bakes
+    # share the numeric slot, but the dep-graph view treats the read as
+    # the previous step's residual. This is Phase 8.A's structural
+    # invariant; the contract pins it so a future PREV_STEP rename or
+    # producer relocation surfaces as a verifier FAIL.
+    #
+    # Note: the consumer reads the ``.*.-1`` SSA alias name, not the
+    # base dim. The verifier today keys on the base name in the
+    # producer's ``writes`` and the consumer's ``reads``; the alias is
+    # not currently a first-class registry citizen. Until the verifier
+    # learns the alias mapping, this contract will FAIL on the
+    # consumer-side declared-reads check -- which is the intended
+    # signal to land the alias-aware verifier extension.
+    for nibble in ("LO", "HI"):
+        register_dim_contract(DimContract(
+            dim=f"ADDR_B0_{nibble}",
+            producer=OpRef(
+                "layer15_store_stack0_sp_byte0_addr",
+                layer=15,
+                when=None,
+            ),
+            consumer=OpRef(
+                "layer14_mem_generation",
+                layer=14,
+                when=OpcodeSet("SI", "SC", "PSH"),
+            ),
+            # The producer fires AFTER the consumer in the same step;
+            # the cross-step PREV_STEP alias is the load-bearing path.
+            # must_not_zero_between is off because the in-between
+            # writers (L4/L8/L9/L13) all forward-feed legitimately.
+            must_not_zero_between=False,
+            must_persist_for_steps=1,
+            name=f"addr_b0_{nibble.lower()}_prev_step_l15_to_l14",
+        ))
+
+    # --- Shape C.2: PC-byte0 post-ENT cleanup OUTPUT_LO L16 -> L3 ------
+    #
+    # ``layer16_lev_routing`` (l16_ops.py:1687) writes OUTPUT_LO during
+    # OP_ENT (among other opcodes) to materialise the post-ENT PC byte
+    # at the PC marker row. The next step's ``layer3_carry_forward_attn``
+    # reads ``OUTPUT_LO.*.-1`` (l3_ops.py:1236) to relay the residual
+    # into the PC carry path. The contract pins the same-step late
+    # writer / next-step early reader hand-off.
+    #
+    # Like the ADDR_B0 PREV_STEP pair, the consumer reads the SSA alias;
+    # we expect a FAIL on the consumer-side declared-reads check until
+    # the alias-aware extension lands. Recording the contract anyway so
+    # the structural intent is captured in the registry.
+    register_dim_contract(DimContract(
+        dim="OUTPUT_LO",
+        producer=OpRef(
+            "layer16_lev_routing",
+            layer=16,
+            when=OpcodeSet("ENT"),
+        ),
+        consumer=OpRef(
+            "layer3_carry_forward_attn",
+            layer=3,
+            when=None,
+        ),
+        must_not_zero_between=False,
+        must_persist_for_steps=1,
+        name="output_lo_post_ent_l16_to_l3_prev_step",
+    ))
+
+
 # Register at import time. Callers that want a clean registry call
 # clear_registered_dim_contracts() and re-register their own.
 _register_starter_contracts()
+_register_expanded_contracts()
