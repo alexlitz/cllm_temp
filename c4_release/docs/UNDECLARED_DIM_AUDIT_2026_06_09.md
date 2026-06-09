@@ -248,3 +248,69 @@ conflicts, and let aggressor writes evade reviewer scrutiny.
    original findings turned out to be `OUTPUT_HI` ↔
    `OUTPUT_HI_THIS_STEP` (pos 85) noise. Future declared sets
    should pick one canonical name per slot to stay clean.
+
+## Migration path: derive_reads_writes
+
+The structural fix is to *derive* `Operation.reads` / `Operation.writes`
+from the rules instead of hand-annotating. Plumbing landed in commit
+`05ad23a1`:
+
+- `neural_vm/unified_compiler/op_introspect.py` —
+  `derive_op_reads_writes_from_rules(op, dim_positions, dim_sizes)`,
+  `assert_declared_matches_derived(op, ..., strict=False)`,
+  `derive_operation(op, ...)`.
+- `Operation.derive_reads_writes()` method on
+  `unified_compiler/layer_compiler.py:Operation` — returns a copy with
+  the derived sets.
+- `Operation.derive_reads_writes_flag` — opt-in marker (default `False`)
+  for per-op migration.
+- `tests/test_op_reads_writes_derivation.py` — 20 tests pin derivation
+  semantics, including parity checks against the audit findings for
+  `layer2_mem_byte_flags`, `layer1_ffn`, and `phase_a_ffn`.
+- `tools/lint_op_reads_writes.py` — per-op ratchet. Default mode is
+  advisory (`declared >= derived`); `--strict` requires equality. The
+  baseline freezes today's mismatch counts; migrations decrement
+  baseline entries in the same commit.
+
+### Per-op migration recipe
+
+For each op listed in the audit table above:
+
+1. Call `op.derive_reads_writes(dim_positions=..., dim_sizes=...)` in
+   the op-factory to verify the derivation matches the intent. (Pure-FFN
+   ops can omit the maps; attention-bearing ops need them.)
+2. Either:
+   - **Path A (drop the annotation)**: set `derive_reads_writes_flag=True`
+     and remove the hand-written `reads={}` / `writes={}` sets. The
+     compiler will pick up the derived sets at op-registration time.
+     *(Wave 2: requires `compiler.add_op` to honor the flag — not yet
+     implemented. See below.)*
+   - **Path B (close the gap)**: extend the hand-written sets to match
+     the derivation, then drop the op's baseline entry in
+     `lint_op_reads_writes.py`. This is the conservative path used for
+     `layer2_mem_byte_flags` writes in commit `d756d9d8`.
+3. Run `python c4_release/tools/lint_op_reads_writes.py` to confirm the
+   baseline ratchet still holds.
+4. For Path A only: run
+   `python c4_release/tools/lint_op_reads_writes.py --strict` to
+   confirm the derivation produces no over-declarations.
+
+### Wave 2 (future) — compiler honors the flag
+
+The `derive_reads_writes_flag` is currently inert — the compiler still
+reads `op.reads` / `op.writes` directly. Wave 2 will:
+
+1. Add a `compiler.add_op` shim that, when `op.derive_reads_writes_flag`
+   is True, runs `op.derive_reads_writes(...)` against the compiler's
+   `dim_positions` and substitutes the result before scheduling.
+2. Migrate the audit table's top-write offenders first
+   (`layer6_routing_ffn`, `layer8_alu`, `function_call_weights`,
+   `binary_pop_sp_increment`) since undeclared writes break the dep
+   graph's scheduling edges, not just the IR-as-contract claim.
+3. Land the `--strict` mode as a CI gate once the per-op baseline
+   reaches zero.
+
+### Priority order
+
+Same as the "Recommended next contracts" section above — writes first,
+then reads, in audit-count order. The lint baseline is the live ratchet.
