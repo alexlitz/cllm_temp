@@ -653,7 +653,11 @@ def make_convo_io_state_machine_op(enable_conversational_io: bool = False) -> Op
     return Operation(
         name="convo_io_state_machine",
         reads=set(),
-        writes=set(),
+        # UNDECLARED_DIM_AUDIT_2026_06_09: declare actual writes from
+        # ``_convo_io_state_machine_rules`` — units fire on CMP+5/CMP+6
+        # cascade AND NEXT_SE, then emit NEXT_THINKING_END, suppress
+        # NEXT_SE, set IO_STATE.
+        writes={"IO_STATE", "NEXT_SE", "NEXT_THINKING_END"},
         kind="block",
         # Phase 8.A.4: dropped ``layer_idx=6`` in favour of
         # ``target_op_name``. Binds to whichever layer the compiler
@@ -1014,7 +1018,10 @@ def make_convo_io_step_resume_op(
     return Operation(
         name="convo_io_step_resume",
         reads=set(),
-        writes=set(),
+        # UNDECLARED_DIM_AUDIT_2026_06_09: declare actual writes from
+        # ``_convo_io_step_resume_rules`` — on LAST_WAS_THINKING_START,
+        # set NEXT_PC and clear IO_STATE / IO_IN_OUTPUT_MODE.
+        writes={"IO_IN_OUTPUT_MODE", "IO_STATE", "NEXT_PC"},
         kind="block",
         # Phase 8.A.4: dropped ``layer_idx=3`` in favour of
         # ``target_op_name``. Binds to whichever layer the compiler
@@ -1148,7 +1155,11 @@ def make_convo_io_pc_sp_latch_op(
     return Operation(
         name="convo_io_pc_sp_latch",
         reads=set(),
-        writes=set(),
+        # UNDECLARED_DIM_AUDIT_2026_06_09: declare actual writes from
+        # ``_lower_convo_io_pc_sp_latch_ir`` — units 1402-1465 drive
+        # OUTPUT_LO/HI from staged PC/SP nibbles on
+        # LAST_WAS_THINKING_START edge.
+        writes={"OUTPUT_HI", "OUTPUT_LO"},
         kind="block",
         # Phase 8.A.4: dropped ``layer_idx=6`` in favour of
         # ``target_op_name``. Binds to whichever layer the compiler

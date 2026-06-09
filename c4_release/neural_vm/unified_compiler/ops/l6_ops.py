@@ -4060,7 +4060,11 @@ def make_binary_pop_sp_increment_op() -> Operation:
     return Operation(
         name="binary_pop_sp_increment",
         reads=set(),
-        writes=set(),
+        # UNDECLARED_DIM_AUDIT_2026_06_09: declare actual writes from
+        # ``_layer6_binary_pop_sp_increment_rules`` — SP+=8 lanes write
+        # OUTPUT_LO/HI; the byte-row fixups also stage via CLEAN_EMBED_LO/HI.
+        writes={"CLEAN_EMBED_HI", "CLEAN_EMBED_LO",
+                "OUTPUT_HI", "OUTPUT_LO"},
         kind="model",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",

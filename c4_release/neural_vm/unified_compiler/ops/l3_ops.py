@@ -1610,7 +1610,10 @@ def make_layer3_convo_io_state_init_op(
         # _SetDim fallback in _as_setdim_proxy, so no compiler-tracked
         # edges are needed.
         reads=set(),
-        writes=set(),
+        # UNDECLARED_DIM_AUDIT_2026_06_09: declare actual write to
+        # IO_IN_OUTPUT_MODE from ``_layer3_convo_io_state_init_rules``
+        # (step_function_rule fires on LAST_WAS_THINKING_END).
+        writes={"IO_IN_OUTPUT_MODE"},
         kind="block",
         # Phase 8.G.6: drop ``layer_idx=3`` literal; bind to the L3 attn
         # anchor ``layer3_carry_forward_attn`` so the block op resolves

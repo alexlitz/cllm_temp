@@ -465,7 +465,11 @@ def make_layer4_ffn_op() -> Operation:
         reads={"MARK_AX", "MARK_PC", "EMBED_LO", "EMBED_HI",
                "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "H1"},
-        writes={"FETCH_LO", "FETCH_HI"},
+        # UNDECLARED_DIM_AUDIT_2026_06_09: TEMP added — the TEMP-clear
+        # band (units 65..95, ``MARK_PC`` -> ``TEMP[1..31]=0``) and the
+        # multi-byte chain TEMP slots write TEMP rows; see
+        # ``_claims`` block above.
+        writes={"FETCH_LO", "FETCH_HI", "TEMP"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir=make_layer4_ffn_ir(),

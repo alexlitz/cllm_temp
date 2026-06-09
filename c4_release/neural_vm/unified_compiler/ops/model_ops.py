@@ -142,7 +142,10 @@ def make_io_putchar_routing_op() -> Operation:
     return Operation(
         name="io_putchar_routing",
         reads=set(),
-        writes=set(),
+        # UNDECLARED_DIM_AUDIT_2026_06_09: declare actual writes from
+        # ``_lower_io_putchar_routing_ir`` — unit 1500 writes
+        # IO_IS_PUTCHAR; units 1501..1532 write OUTPUT_LO/HI.
+        writes={"IO_IS_PUTCHAR", "OUTPUT_HI", "OUTPUT_LO"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Model-level FFN
         # routing bake: programs L5 FFN units to dispatch ``putchar``
         # output. Writes target the L5 FFN weights/biases (model setup),
@@ -926,7 +929,14 @@ def make_function_call_weights_op() -> Operation:
                "CONST", "OP_JSR", "OP_ENT",
                "EMBED_LO", "EMBED_HI",
                "OUTPUT_LO", "OUTPUT_HI"},
-        writes={"AX_CARRY_LO", "AX_CARRY_HI"},
+        # UNDECLARED_DIM_AUDIT_2026_06_09: added ALU_HI/LO, OUTPUT_HI/LO,
+        # TEMP to match the actual write footprint of the L6 FFN rules
+        # produced by ``_function_call_l6_ffn_rules`` (LEA / JSR / ENT /
+        # LEV output routing band writes ALU_*, OUTPUT_* and TEMP slots).
+        writes={"AX_CARRY_LO", "AX_CARRY_HI",
+                "ALU_HI", "ALU_LO",
+                "OUTPUT_HI", "OUTPUT_LO",
+                "TEMP"},
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Model-level FFN
         # routing bake into L6 FFN units 1700..2158 (function-call dispatch
         # table). Writes target FFN weights, not per-step residual dims,

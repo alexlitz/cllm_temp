@@ -627,9 +627,12 @@ def make_layer13_mem_addr_gather_op() -> Operation:
         reads={"MARK_MEM", "MARK_AX", "MARK_STACK0",
                "AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "OP_LC", "OP_SI", "OP_SC",
                "MEM_ADDR_SRC", "L1H1"},
+        # UNDECLARED_DIM_AUDIT_2026_06_09: H5 added — the L13 mem-addr
+        # gather heads also stage to H5 (per IR walk); declared so the
+        # dep graph sees this writer.
         writes={"ADDR_B0_LO", "ADDR_B1_LO", "ADDR_B2_LO",
                 "ADDR_B0_HI", "ADDR_B1_HI", "ADDR_B2_HI",
-                "ADDR_B0_VALID"},
+                "ADDR_B0_VALID", "H5"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer13_mem_addr_gather_ir,
