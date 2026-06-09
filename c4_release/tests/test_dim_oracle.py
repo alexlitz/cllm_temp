@@ -59,6 +59,7 @@ from c4_release.neural_vm.unified_compiler.symbolic_forward import (
     OP_LE,
     OP_LT,
     OP_MOD,
+    OP_MUL,
     OP_NE,
     OP_OR,
     OP_PSH,
@@ -747,6 +748,204 @@ def test_expected_trace_now_supports_output_lo():
     assert blocks == {0, 1}
     # The AX=42 step writes OUTPUT_LO+10 at position=0 (bag-of-dims).
     assert trace[(0, 0, 0, "OUTPUT_LO+10")] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Wide-ALU / DIV-step staging projection tests (AX_FULL_LO/HI,
+# DIV_STAGING, MUL_ACCUM). Added 2026-06-09 to support
+# DIV-step localization in ``replay_expected_diff.py``; see
+# docs/LONG_DIVISION_BUG36_2026_06_09.md for the rationale.
+# ---------------------------------------------------------------------------
+
+
+def test_ax_full_lo_hi_projection_for_byte1_value():
+    """AX_FULL_LO/HI holds the AX *byte 1* nibbles at the AX marker.
+
+    Pick an AX value with distinct byte-0 and byte-1 nibbles so the
+    projection cannot be confused with AX_CARRY (which projects byte
+    0). ``IMM 0x03E8`` -> AX = 0x03E8: byte 0 = 0xE8 (lo=8, hi=E), byte
+    1 = 0x03 (lo=3, hi=0). AX_CARRY must fire on byte 0 (lo=8/hi=E);
+    AX_FULL must fire on byte 1 (lo=3/hi=0).
+    """
+
+    program = [
+        encode_instr(OP_IMM, 0x03E8),  # 1000
+        encode_instr(OP_EXIT),
+    ]
+    oracle = ReferenceOracle(program)
+    s0 = oracle.state_at_step(0)
+    assert s0.ax == 0x03E8
+
+    table = project_state_to_residual(s0, per_token=True)
+    base = s0.step_idx * TOKENS_PER_STEP
+
+    # AX_FULL pins byte 1 = 0x03 -> lo=3, hi=0.
+    assert table[(base + 5, "AX_FULL_LO+3")] == 1.0
+    assert table[(base + 5, "AX_FULL_HI+0")] == 1.0
+    # AX_CARRY pins byte 0 = 0xE8 -> lo=8, hi=14 (0xE).
+    assert table[(base + 5, "AX_CARRY_LO+8")] == 1.0
+    assert table[(base + 5, "AX_CARRY_HI+14")] == 1.0
+    # AX_FULL must not also fire the byte-0 nibbles; sanity that the
+    # projection is byte-1 specific (only nibble cells 3 / 0 fire).
+    for k in range(16):
+        if k != 3:
+            assert table.get((base + 5, f"AX_FULL_LO+{k}"), 0.0) == 0.0
+        if k != 0:
+            assert table.get((base + 5, f"AX_FULL_HI+{k}"), 0.0) == 0.0
+
+    # Bag-of-dims sanity at position=step_idx.
+    bag = project_state_to_residual(s0)
+    assert bag[(0, "AX_FULL_LO+3")] == 1.0
+    assert bag[(0, "AX_FULL_HI+0")] == 1.0
+
+
+def test_div_staging_projection_fires_on_div_mod_only():
+    """``DIV_STAGING`` is opcode-gated: only OP_DIV / OP_MOD steps emit
+    a one-hot. Non-DIV/MOD steps leave the slot idle.
+    """
+
+    # 1000 / 7 = 142 (0x8E) — DIV result byte 0 lo nibble = 0xE (14).
+    program = [
+        encode_instr(OP_IMM, 1000),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 7),
+        encode_instr(OP_DIV),
+        encode_instr(OP_EXIT),
+    ]
+    oracle = ReferenceOracle(program)
+
+    # Step 3 is the DIV step. AX after DIV = 142 = 0x8E.
+    s_div = oracle.state_at_step(3)
+    assert s_div.opcode is not None
+    assert s_div.ax == 142
+
+    table = project_state_to_residual(s_div, per_token=True)
+    base = s_div.step_idx * TOKENS_PER_STEP
+
+    # DIV_STAGING fires at the AX-marker row with byte-0 lo nibble.
+    assert table[(base + 5, "DIV_STAGING+14")] == 1.0
+    # Only the result nibble fires; the other 15 cells are idle.
+    for k in range(16):
+        if k != 14:
+            assert table.get((base + 5, f"DIV_STAGING+{k}"), 0.0) == 0.0
+
+    # Non-DIV steps (IMM, PSH, EXIT) emit no DIV_STAGING projection.
+    for step_idx in (0, 1, 2, 4):
+        s = oracle.state_at_step(step_idx)
+        t = project_state_to_residual(s, per_token=True)
+        s_base = s.step_idx * TOKENS_PER_STEP
+        for k in range(16):
+            assert t.get((s_base + 5, f"DIV_STAGING+{k}"), 0.0) == 0.0
+
+    # MOD also fires DIV_STAGING (shares the staging slot).
+    program_mod = [
+        encode_instr(OP_IMM, 20),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 3),
+        encode_instr(OP_MOD),
+        encode_instr(OP_EXIT),
+    ]
+    oracle_mod = ReferenceOracle(program_mod)
+    s_mod = oracle_mod.state_at_step(3)
+    assert s_mod.ax == 2  # 20 % 3 = 2
+    bag_mod = project_state_to_residual(s_mod)
+    assert bag_mod[(3, "DIV_STAGING+2")] == 1.0
+
+
+def test_mul_accum_projection_fires_on_mul_only():
+    """``MUL_ACCUM`` is opcode-gated: only OP_MUL steps emit a one-hot."""
+
+    # 6 * 7 = 42 = 0x2A — byte 0 lo nibble = 0xA (10).
+    program = [
+        encode_instr(OP_IMM, 6),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 7),
+        encode_instr(OP_MUL),
+        encode_instr(OP_EXIT),
+    ]
+    oracle = ReferenceOracle(program)
+    s_mul = oracle.state_at_step(3)
+    assert s_mul.ax == 42
+
+    bag = project_state_to_residual(s_mul)
+    assert bag[(3, "MUL_ACCUM+10")] == 1.0
+    # Other nibbles idle.
+    for k in range(16):
+        if k != 10:
+            assert bag.get((3, f"MUL_ACCUM+{k}"), 0.0) == 0.0
+
+    # Per-token form: AX marker only.
+    table = project_state_to_residual(s_mul, per_token=True)
+    base = s_mul.step_idx * TOKENS_PER_STEP
+    assert table[(base + 5, "MUL_ACCUM+10")] == 1.0
+
+    # Non-MUL steps leave MUL_ACCUM idle.
+    for step_idx in (0, 1, 2, 4):
+        s = oracle.state_at_step(step_idx)
+        t = project_state_to_residual(s)
+        for k in range(16):
+            assert t.get((step_idx, f"MUL_ACCUM+{k}"), 0.0) == 0.0
+
+
+def test_new_dims_in_supported_families():
+    """The 4 newly-projected dims must be in ``SUPPORTED_DIM_FAMILIES``
+    so ``replay_expected_diff.py`` accepts them via ``is_supported_dim``.
+    """
+
+    for name in ("AX_FULL_LO", "AX_FULL_HI", "DIV_STAGING", "MUL_ACCUM"):
+        assert name in SUPPORTED_DIM_FAMILIES, (
+            f"{name} must be supported so replay_expected_diff can localize"
+        )
+        assert is_supported_dim(name)
+        assert is_supported_dim(f"{name}+5")
+
+
+def test_expected_trace_supports_ax_full_lo_for_div_program():
+    """The brief's acceptance criterion:
+    ``replay_expected_diff --dim AX_FULL_LO`` must work on the canonical
+    DIV program. ``expected_trace`` is the underlying call.
+    """
+
+    program = [
+        encode_instr(OP_IMM, 1000),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 7),
+        encode_instr(OP_DIV),
+        encode_instr(OP_EXIT),
+    ]
+    oracle = ReferenceOracle(program)
+    trace = expected_trace(oracle, "AX_FULL_LO", n_blocks=4)
+    # Every step contributes at least one AX_FULL_LO+k cell per block.
+    steps = {step_idx for (step_idx, _pos, _blk, _key) in trace}
+    blocks = {blk for (_step, _pos, blk, _key) in trace}
+    assert steps == {0, 1, 2, 3, 4}
+    assert blocks == {0, 1, 2, 3}
+
+    # Step 0: AX = 1000 = 0x03E8. byte 1 = 0x03 -> lo = 3.
+    assert trace[(0, 0, 0, "AX_FULL_LO+3")] == 1.0
+    # Step 3 (DIV): AX = 142 = 0x008E. byte 1 = 0x00 -> lo = 0.
+    assert trace[(3, 3, 0, "AX_FULL_LO+0")] == 1.0
+
+
+def test_expected_trace_supports_div_staging_for_div_program():
+    """``DIV_STAGING`` trace only fires on DIV/MOD steps; non-DIV/MOD
+    steps emit no entries so the diff does not over-constrain them.
+    """
+
+    program = [
+        encode_instr(OP_IMM, 1000),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 7),
+        encode_instr(OP_DIV),
+        encode_instr(OP_EXIT),
+    ]
+    oracle = ReferenceOracle(program)
+    trace = expected_trace(oracle, "DIV_STAGING", n_blocks=4)
+    # Only step 3 (DIV) appears in the trace.
+    steps_with_entries = {step_idx for (step_idx, _pos, _blk, _key) in trace}
+    assert steps_with_entries == {3}
+    # AX after DIV = 142 = 0x8E -> byte 0 lo = 0xE (14).
+    assert trace[(3, 3, 0, "DIV_STAGING+14")] == 1.0
 
 
 # ---------------------------------------------------------------------------

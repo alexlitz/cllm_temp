@@ -28,8 +28,11 @@ Public surface
 * :func:`project_state_to_residual` — maps a register state to the
   expected ``(position, dim_name) -> float`` table for the *simple* dim
   families (CLEAN_EMBED_LO/HI, MARK_AX, MARK_STACK0, BYTE_INDEX_h,
-  STACK0_BYTE_VAL_h_LO/HI) and the same-step projections of
-  OUTPUT_LO/HI, AX_CARRY_LO/HI, ADDR_KEY, and MEM_ADDR_SRC.
+  STACK0_BYTE_VAL_h_LO/HI), the same-step projections of OUTPUT_LO/HI,
+  AX_CARRY_LO/HI, ADDR_KEY, and MEM_ADDR_SRC, and the wide-ALU /
+  DIV-step staging dims AX_FULL_LO/HI, DIV_STAGING, and MUL_ACCUM (the
+  last two opcode-gated; see ``docs/LONG_DIVISION_BUG36_2026_06_09.md``
+  for the rationale).
 * :func:`expected_trace` — every ``(step, position, block,
   expected_value)`` tuple for a single dim across the whole program.
 
@@ -161,6 +164,17 @@ SUPPORTED_DIM_FAMILIES: Tuple[str, ...] = (
     "AX_CARRY_HI",
     "ADDR_KEY",
     "MEM_ADDR_SRC",
+    # Wide-ALU staging dims (added 2026-06-09 for DIV step localization;
+    # see docs/LONG_DIVISION_BUG36_2026_06_09.md). AX_FULL_LO/HI holds
+    # the wide-ALU result *byte 1* nibbles at the AX marker (the
+    # "full AX" upper byte staged by L8 mem_to_alu head 7 + L14
+    # alu_high_byte_relay). DIV_STAGING / MUL_ACCUM hold the byte-0
+    # nibbles of the DIV quotient / MUL product respectively, gated on
+    # the active opcode flag.
+    "AX_FULL_LO",
+    "AX_FULL_HI",
+    "DIV_STAGING",
+    "MUL_ACCUM",
 )
 
 
@@ -628,6 +642,67 @@ def _emit_ax_carry_at_marker(out, marker_pos: int, value: int):
     out[(marker_pos, f"AX_CARRY_HI+{hi}")] = 1.0
 
 
+def _emit_ax_full_at_marker(out, marker_pos: int, value: int):
+    """AX_FULL_LO/HI one-hots for the byte-1 nibbles of ``value`` at the AX
+    marker.
+
+    AX_FULL holds the *upper* byte of the wide-ALU result (byte 1 of AX).
+    L8 ``mem_to_alu`` head 7 stages MEM-value byte 1 here for SHL / MUL /
+    SHR; L14 ``alu_high_byte_relay`` reads this back into OUTPUT for the
+    next-step AX byte 1 emission. L3 head 5 also relays prev-step OUTPUT
+    into AX_FULL for the carry chain. By the end of any same-step AX
+    settlement the value held is AX byte 1 (the high byte of the 16-bit
+    wide-ALU result that survives into the next step).
+
+    See docs/LONG_DIVISION_BUG36_2026_06_09.md §"Next-wave entry points"
+    for the rationale (DIV step localization needs AX_FULL projected so
+    ``replay_expected_diff`` can identify the divergent block).
+    """
+    byte1 = (value >> 8) & 0xFF
+    lo = byte1 & 0x0F
+    hi = (byte1 >> 4) & 0x0F
+    out[(marker_pos, f"AX_FULL_LO+{lo}")] = 1.0
+    out[(marker_pos, f"AX_FULL_HI+{hi}")] = 1.0
+
+
+def _emit_div_staging_at_marker(out, marker_pos: int, opcode, ax_value: int):
+    """DIV_STAGING one-hot for the byte-0 lo nibble of the DIV / MOD
+    result at the AX marker.
+
+    ``DIV_STAGING`` is the 16-cell staging slot the L10 ALU writes when
+    OP_DIV or OP_MOD is active (see ``layer10_alu`` writes set). For
+    other opcodes the staging slot is idle; the oracle treats those
+    steps as having no projection (the diff will not over-constrain
+    non-DIV/MOD steps).
+
+    Projection: the post-step AX value's byte-0 lo nibble (the quotient
+    or remainder's low nibble). For multi-byte results the higher bytes
+    are not captured by this single dim; this is the same single-byte
+    limitation called out in ``wide_alu_dsl.wide_div_rules`` and
+    ``docs/DSL_W5_MULDIV_LIMIT.md``.
+    """
+    if opcode is None or opcode not in (OP_DIV, OP_MOD):
+        return
+    byte0 = ax_value & 0xFF
+    lo = byte0 & 0x0F
+    out[(marker_pos, f"DIV_STAGING+{lo}")] = 1.0
+
+
+def _emit_mul_accum_at_marker(out, marker_pos: int, opcode, ax_value: int):
+    """MUL_ACCUM one-hot for the byte-0 lo nibble of the MUL product at
+    the AX marker.
+
+    ``MUL_ACCUM`` is the 16-cell multiplication accumulator. Like
+    DIV_STAGING it is opcode-gated (only OP_MUL drives a value here);
+    on non-MUL steps the slot is idle.
+    """
+    if opcode != OP_MUL:
+        return
+    byte0 = ax_value & 0xFF
+    lo = byte0 & 0x0F
+    out[(marker_pos, f"MUL_ACCUM+{lo}")] = 1.0
+
+
 def _emit_addr_key_at_mem(out, mem_marker_pos: int, addr: int):
     """ADDR_KEY one-hots for the three address bytes at the MEM marker.
 
@@ -712,6 +787,21 @@ def _project_per_token(state, base: int) -> Dict[Tuple[int, str], float]:
     # AX_CARRY_LO/HI: AX-marker only (L3 carry-forward head 1).
     _emit_ax_carry_at_marker(out, base + POS_AX_MARKER, state.ax)
 
+    # AX_FULL_LO/HI: AX-marker only. Byte-1 of AX (the wide-ALU
+    # high-byte staging slot consumed by L14 alu_high_byte_relay).
+    _emit_ax_full_at_marker(out, base + POS_AX_MARKER, state.ax)
+
+    # DIV_STAGING / MUL_ACCUM: AX-marker only, opcode-gated. The L10
+    # ALU only writes DIV_STAGING on OP_DIV/OP_MOD; MUL_ACCUM only on
+    # OP_MUL (see ``layer10_alu`` writes set + ``docs/LONG_DIVISION_
+    # BUG36_2026_06_09.md`` §"Next-wave entry points").
+    _emit_div_staging_at_marker(
+        out, base + POS_AX_MARKER, state.opcode, state.ax,
+    )
+    _emit_mul_accum_at_marker(
+        out, base + POS_AX_MARKER, state.opcode, state.ax,
+    )
+
     # ADDR_KEY: MEM-marker only, 3-nibble address one-hot.
     if state.mem_addr is not None:
         _emit_addr_key_at_mem(out, base + POS_MEM_MARKER, state.mem_addr)
@@ -792,6 +882,22 @@ def _project_bag_of_dims(state) -> Dict[Tuple[int, str], float]:
     ax_byte0 = state.ax & 0xFF
     out[(pos, f"AX_CARRY_LO+{ax_byte0 & 0x0F}")] = 1.0
     out[(pos, f"AX_CARRY_HI+{(ax_byte0 >> 4) & 0x0F}")] = 1.0
+
+    # AX_FULL_LO/HI: one-hot of AX byte 1 nibbles (the wide-ALU upper
+    # byte staged at the AX marker; see _emit_ax_full_at_marker for the
+    # per-token rationale).
+    ax_byte1 = (state.ax >> 8) & 0xFF
+    out[(pos, f"AX_FULL_LO+{ax_byte1 & 0x0F}")] = 1.0
+    out[(pos, f"AX_FULL_HI+{(ax_byte1 >> 4) & 0x0F}")] = 1.0
+
+    # DIV_STAGING / MUL_ACCUM: opcode-gated lo-nibble of byte 0 of the
+    # result. Idle on non-DIV/MOD (DIV_STAGING) and non-MUL (MUL_ACCUM)
+    # steps — the oracle deliberately emits no entry so the diff does
+    # not over-constrain those steps.
+    if state.opcode in (OP_DIV, OP_MOD):
+        out[(pos, f"DIV_STAGING+{ax_byte0 & 0x0F}")] = 1.0
+    if state.opcode == OP_MUL:
+        out[(pos, f"MUL_ACCUM+{ax_byte0 & 0x0F}")] = 1.0
 
     # ADDR_KEY: 3-nibble one-hot of the mem-bus address. Only fires on
     # memory-bus ops; non-memory steps leave the bus idle.
