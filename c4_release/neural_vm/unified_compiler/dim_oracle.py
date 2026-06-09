@@ -821,14 +821,33 @@ def expected_trace(
     dim_name: str,
     *,
     n_blocks: int,
+    first_writer_block: Optional[int] = None,
 ) -> Dict[Tuple[int, int, int, str], float]:
     """Build the ``(step, position, block, dim_key) -> expected_value`` table
     for a single dim family across every step of ``oracle``.
 
-    The expected value is *block-invariant*: the oracle treats the dim
-    as a target that any qualifying block ought to maintain. ``n_blocks``
-    is the number of blocks in the layout (so the per-block diff has
-    something to compare against at every snapshot).
+    By default the expected value is *block-invariant*: the oracle's
+    per-step projection is emitted for every block index in
+    ``[0, n_blocks)``. That is appropriate for callers that diff a
+    specific block themselves (or want the full grid).
+
+    When ``first_writer_block`` is supplied, the trace is restricted to
+    blocks ``[first_writer_block, n_blocks)`` — i.e. the blocks at which
+    *some* op in the schedule has actually written ``dim_name``. This is
+    the block-aware mode used by :func:`dim_diff.find_first_divergent_block`
+    so that the search does not flag a divergence at block 0 (where no
+    op has produced ``dim_name`` yet) as the "first" divergence.
+
+    The oracle's projection itself is a same-step materialisation; it
+    does not predict the per-block intermediate states (writes accumulate
+    block-by-block until the writer fires). The
+    ``first_writer_block`` guard is the conservative "skip pre-writer
+    blocks" stopgap — once a block's writer fires, every subsequent
+    block must preserve the oracle's value, so the comparison is sound
+    from the writer's block onwards.
+
+    ``n_blocks`` is the number of blocks in the layout (so the per-block
+    diff has something to compare against at every snapshot).
 
     ``dim_name`` is the family name (e.g. ``"STACK0_BYTE_VAL_1_LO"``);
     the returned keys carry the per-offset ``"NAME+k"`` form.
@@ -841,6 +860,10 @@ def expected_trace(
             f"families the oracle does not yet model)"
         )
 
+    start_block = 0 if first_writer_block is None else max(0, first_writer_block)
+    if start_block >= n_blocks:
+        return {}
+
     out: Dict[Tuple[int, int, int, str], float] = {}
     for state in oracle.all_states():
         per_pos = project_state_to_residual(state)
@@ -848,6 +871,6 @@ def expected_trace(
             base = dim_key.split("+", 1)[0]
             if base != dim_name:
                 continue
-            for block_idx in range(n_blocks):
+            for block_idx in range(start_block, n_blocks):
                 out[(state.step_idx, pos, block_idx, dim_key)] = value
     return out

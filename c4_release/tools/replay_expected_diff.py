@@ -39,6 +39,7 @@ if _ROOT not in sys.path:
 from c4_release.neural_vm.unified_compiler.dim_diff import (
     diff_actual_vs_expected,
     find_first_divergent_block,
+    first_writer_block_for_dim,
     format_divergence,
 )
 from c4_release.neural_vm.unified_compiler.dim_oracle import (
@@ -223,6 +224,17 @@ def main(argv=None) -> int:
         "--list-supported", action="store_true",
         help="Print the supported / deferred dim families and exit.",
     )
+    parser.add_argument(
+        "--no-block-aware", action="store_true",
+        help=(
+            "Disable the block-aware diff (compare every block in "
+            "[0, n_blocks) against the oracle's projection). The default "
+            "block-aware mode skips blocks before the first op that "
+            "declares a write to ``--dim`` — without that guard, every "
+            "such dim's first divergence is block 0 (pre-compute), which "
+            "is degenerate."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.list_supported:
@@ -252,7 +264,30 @@ def main(argv=None) -> int:
 
     oracle = ReferenceOracle(program)
 
-    diff = find_first_divergent_block(runner, oracle, args.dim, atol=args.atol)
+    block_aware = not args.no_block_aware
+    first_writer = first_writer_block_for_dim(runner, args.dim)
+    if block_aware:
+        if first_writer is None:
+            print(
+                f"[replay_expected_diff] note: no op in any block declares "
+                f"a write to dim {args.dim!r}. Block-aware diff will report "
+                f"no expected entries; falling back to block-invariant mode "
+                f"so the comparison still runs.",
+                file=sys.stderr,
+            )
+            # Fall back so callers still get a diff against the oracle.
+            block_aware = False
+        else:
+            print(
+                f"[replay_expected_diff] first writer block for "
+                f"dim {args.dim!r}: {first_writer} (skipping blocks "
+                f"[0, {first_writer}) in the diff).",
+                file=sys.stderr,
+            )
+
+    diff = find_first_divergent_block(
+        runner, oracle, args.dim, atol=args.atol, block_aware=block_aware,
+    )
     if diff is None:
         print(
             f"OK: no divergence found for dim {args.dim} across "

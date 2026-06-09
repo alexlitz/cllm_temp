@@ -34,6 +34,7 @@ from c4_release.neural_vm.unified_compiler.building_blocks_dsl import (
 from c4_release.neural_vm.unified_compiler.dim_diff import (
     diff_actual_vs_expected,
     find_first_divergent_block,
+    first_writer_block_for_dim,
     format_divergence,
 )
 from c4_release.neural_vm.unified_compiler.dim_oracle import (
@@ -434,6 +435,174 @@ def test_diff_finds_no_divergence_when_actual_matches_oracle():
     assert find_first_divergent_block(
         runner, oracle, "MARK_AX", atol=1.0,
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# Block-aware diff tests (skip blocks before the first declared writer)
+# ---------------------------------------------------------------------------
+
+
+def test_first_writer_block_returns_earliest_writing_block():
+    """``first_writer_block_for_dim`` walks the schedule in order and
+    returns the lowest block index whose op declares a write to the dim.
+    """
+
+    # 4-block layout: blocks 0 + 1 have no writer for OUTPUT_LO; block 2
+    # has the first writer; block 3 has another writer (later).
+    blocks = [
+        [_StubOp(name="b0_noop", writes=set())],
+        [_StubOp(name="b1_other", writes={"AX_CARRY_LO"})],
+        [_StubOp(name="b2_first_writer", writes={"OUTPUT_LO"})],
+        [_StubOp(name="b3_more", writes={"OUTPUT_LO"})],
+    ]
+    compiler = _StubCompiler(ops_per_layer=blocks)
+    runner = SymbolicForwardRunner(
+        compiler,
+        [encode_instr(OP_IMM, 1), encode_instr(OP_EXIT)],
+    )
+    runner.run_all()
+
+    assert first_writer_block_for_dim(runner, "OUTPUT_LO") == 2
+    assert first_writer_block_for_dim(runner, "AX_CARRY_LO") == 1
+    # No op declares a write to this family -> None.
+    assert first_writer_block_for_dim(runner, "ADDR_KEY") is None
+
+
+def test_block_aware_diff_skips_pre_writer_blocks():
+    """When the only op writing ``MARK_AX`` lives at block 2, the
+    block-aware diff must skip blocks 0 and 1 (no expected value at
+    those snapshots — the writer hasn't fired yet) and report the
+    first divergence at block 2 (or later), not at block 0.
+    """
+
+    # FFN rule that writes MARK_AX+0 = 1.0 only when OP_IMM is set
+    # (matches the PSH-step divergence the brief calls out; the PSH
+    # step's snapshot will have MARK_AX==0, oracle says 1.0).
+    rule = step_function_rule(
+        input_dim="OP_IMM",
+        threshold=0.5,
+        write_dim="MARK_AX+0",
+        write_value=1.0,
+    )
+    writer_op = _StubOp(
+        name="block2_mark_ax_writer",
+        kind="ffn",
+        compiler_ir=_ir_with_rule(rule),
+        writes={"MARK_AX"},
+    )
+    # Blocks 0 and 1 are no-ops; block 2 carries the writer.
+    blocks = [
+        [_StubOp(name="b0_noop", writes=set())],
+        [_StubOp(name="b1_noop", writes=set())],
+        [writer_op],
+    ]
+    compiler = _StubCompiler(ops_per_layer=blocks)
+    program = [
+        encode_instr(OP_IMM, 0x200),
+        encode_instr(OP_PSH),
+        encode_instr(OP_EXIT),
+    ]
+    runner = SymbolicForwardRunner(compiler, program)
+    runner.run_all()
+    oracle = ReferenceOracle(program)
+
+    # Sanity: block-invariant diff (legacy behaviour) finds the first
+    # divergence at block 0 (pre-writer) — the degenerate signal the
+    # fix is for.
+    legacy = find_first_divergent_block(
+        runner, oracle, "MARK_AX", block_aware=False,
+    )
+    assert legacy is not None
+    assert legacy.block_idx == 0  # the degenerate localisation
+
+    # Block-aware diff (the fix): skips blocks 0 and 1; first divergence
+    # lands at block 2 (the writer's block) and is the writer's op.
+    diff = find_first_divergent_block(runner, oracle, "MARK_AX")
+    assert diff is not None
+    assert diff.block_idx == 2
+    assert diff.suggested_op == "block2_mark_ax_writer"
+    assert diff.first_divergence is not None
+    assert diff.first_divergence.dim_key == "MARK_AX+0"
+    # PSH and EXIT (step >= 1) have actual=0 (writer is OP_IMM-gated);
+    # the IMM step fires at S=100 scaling -> actual=0.01. Either way the
+    # expected is 1.0 -> divergence.
+    assert diff.first_divergence.expected == 1.0
+    # Confirm at least one PSH/EXIT-step divergence has actual=0.0
+    # (the "writer did not fire at this step" case the brief calls out).
+    no_firing = [d for d in diff.divergences if d.actual == 0.0]
+    assert len(no_firing) >= 2
+    for d in no_firing:
+        assert d.step_idx >= 1
+
+
+def test_block_aware_diff_falls_back_to_no_writer_case():
+    """When no op declares a write to the dim, ``first_writer_block_for_dim``
+    returns ``None``; the block-aware diff treats that as "no expected
+    entries" (returns ``None`` from ``find_first_divergent_block``).
+    Callers that want a comparison anyway can pass ``block_aware=False``.
+    """
+
+    # Two blocks, neither declares a write to OUTPUT_LO.
+    blocks = [
+        [_StubOp(name="b0_noop", writes=set())],
+        [_StubOp(name="b1_noop", writes=set())],
+    ]
+    compiler = _StubCompiler(ops_per_layer=blocks)
+    program = [encode_instr(OP_IMM, 42), encode_instr(OP_EXIT)]
+    runner = SymbolicForwardRunner(compiler, program)
+    runner.run_all()
+    oracle = ReferenceOracle(program)
+
+    # Block-aware: no expected entries -> no divergence.
+    assert find_first_divergent_block(runner, oracle, "OUTPUT_LO") is None
+
+    # Block-invariant fallback: still detects the missing writer at block 0.
+    legacy = find_first_divergent_block(
+        runner, oracle, "OUTPUT_LO", block_aware=False,
+    )
+    assert legacy is not None
+    assert legacy.block_idx == 0
+
+
+def test_format_divergence_reports_writer_did_not_fire_cause():
+    """``format_divergence`` distinguishes "writer did not fire"
+    (``actual == 0``) from "value mismatch" so callers can act on the
+    cause.
+    """
+
+    # Writer is gated on OP_PSH only — so the IMM step has actual=0,
+    # which is the "writer did not fire" branch we want to surface.
+    rule = step_function_rule(
+        input_dim="OP_PSH",
+        threshold=0.5,
+        write_dim="MARK_AX+0",
+        write_value=1.0,
+    )
+    op = _StubOp(
+        name="psh_only_mark_ax",
+        kind="ffn",
+        compiler_ir=_ir_with_rule(rule),
+        writes={"MARK_AX"},
+    )
+    compiler = _StubCompiler(ops_per_layer=[[op]])
+
+    program = [
+        encode_instr(OP_IMM, 0x200),
+        encode_instr(OP_PSH),
+        encode_instr(OP_EXIT),
+    ]
+    runner = SymbolicForwardRunner(compiler, program)
+    runner.run_all()
+    oracle = ReferenceOracle(program)
+
+    diff = find_first_divergent_block(runner, oracle, "MARK_AX")
+    assert diff is not None
+    # Step 0 (IMM) has actual=0 (the PSH gate did not fire); that is
+    # the sorted-first divergence by (block, step, position).
+    assert diff.first_divergence is not None
+    assert diff.first_divergence.actual == 0.0
+    msg = format_divergence(diff)
+    assert "writer did not fire" in msg
 
 
 # ---------------------------------------------------------------------------
