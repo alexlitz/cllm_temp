@@ -575,6 +575,11 @@ def make_layer15_memory_lookup_op() -> Operation:
             dim_positions, HD, num_heads=int(attn.num_heads)
         )
         ir.lower_attention(attn, HD, dim_positions=dim_positions, S=S)
+        # Mark so the legacy umbrella entry point
+        # ``vm_step._set_layer15_memory_lookup`` does not double-bake the
+        # same fragments if a downstream caller invokes it after the
+        # declarative path. Both code paths now lower the same IR.
+        attn._l15_memory_lookup_ir_baked = True
 
         if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
             # Memory reads are last-write-wins. Strict neural traces can leave

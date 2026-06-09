@@ -7742,18 +7742,28 @@ def _set_layer15_memory_lookup(attn, S, BD, HD):
     Kept as a single legacy entry point for ``tests/test_l15_per_op.py``
     and for any caller that still wants the full imperative bake; the
     production L15 op routes through the IR.
+
+    Phase 7.C wave (this commit): the umbrella entry point itself now
+    routes through :func:`_layer15_memory_lookup_ir` + ``lower_attention``
+    instead of calling the imperative children directly. The fragment
+    bodies are still the same imperative writers (Phase 7.C.2 state),
+    but the umbrella's dispatch is declarative -- the
+    ``RuntimeAttentionFragment`` IR is the single source of truth for
+    which fragments fire on which shapes (see
+    :func:`_layer15_memory_lookup_ir` for the ``num_heads`` selection
+    table). A guard prevents double-writes if a caller already lowered
+    the IR before invoking the umbrella.
     """
-    _set_layer15_memory_lookup_heads_0_3(attn, S, BD, HD)
-    if attn.num_heads >= 12:
-        _set_layer15_memory_lookup_lev_heads_4_11(attn, S, BD, HD)
+    if getattr(attn, "_l15_memory_lookup_ir_baked", False):
+        # Already lowered by ``make_layer15_memory_lookup_op``'s bake;
+        # skip to avoid double-writing the same fragments.
+        return
 
-    # Keep legacy_bake's L15 lookup guards in parity with the declarative L15
-    # op while L15 attention is still a legacy-wrapper surface.
-    from .unified_compiler.ops.l15_ops import (
-        _suppress_l15_lookup_during_current_store_generation,
-    )
+    from .unified_compiler.ops.l15_ops import _layer15_memory_lookup_ir
 
-    _suppress_l15_lookup_during_current_store_generation(attn, BD, HD)
+    ir = _layer15_memory_lookup_ir(BD, HD, num_heads=int(attn.num_heads))
+    ir.lower_attention(attn, HD, dim_positions=BD, S=S)
+    attn._l15_memory_lookup_ir_baked = True
 
 
 # =============================================================================

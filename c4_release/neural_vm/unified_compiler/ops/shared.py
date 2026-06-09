@@ -137,7 +137,17 @@ def _as_setdim_proxy(dim_positions: Dict[str, int]):
     Without this override, callers like ``_set_opcode_decode_ffn`` would
     write OP_* flags at the LEGACY ``_SetDim`` positions instead of the
     compiler-allocated ones, breaking pin_io_only=True layouts.
+
+    If ``dim_positions`` is already a ``_SetDim``-like object (the legacy
+    class itself or a previously-built proxy), return it unchanged. This
+    lets legacy umbrella entry points (``vm_step._set_layerN_*``) that
+    route through declarative IR factories pass ``BD = _SetDim`` directly
+    instead of materializing a mirror dict.
     """
+    if not isinstance(dim_positions, dict):
+        # Already a class / proxy that supports ``.NAME`` attribute lookup
+        # for the dim positions. Skip the dict→proxy wrap.
+        return dim_positions
     return _SetDimProxy(dim_positions)
 
 
