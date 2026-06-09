@@ -47,10 +47,25 @@ from c4_release.neural_vm.unified_compiler.dim_oracle import (
 )
 from c4_release.neural_vm.unified_compiler.ir import CompilerIR
 from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+    OP_ADD,
+    OP_AND,
+    OP_DIV,
+    OP_EQ,
     OP_EXIT,
+    OP_GE,
+    OP_GT,
     OP_IMM,
+    OP_LE,
+    OP_LT,
+    OP_MOD,
+    OP_NE,
+    OP_OR,
     OP_PSH,
+    OP_SHL,
+    OP_SHR,
     OP_SI,
+    OP_SUB,
+    OP_XOR,
     SymbolicForwardRunner,
     encode_instr,
 )
@@ -563,3 +578,244 @@ def test_expected_trace_now_supports_output_lo():
     assert blocks == {0, 1}
     # The AX=42 step writes OUTPUT_LO+10 at position=0 (bag-of-dims).
     assert trace[(0, 0, 0, "OUTPUT_LO+10")] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# ALU dispatch tests for the extended opcode set (XOR/OR/AND/SHL/SHR/
+# EQ/NE/LT/GT/LE/GE/DIV/MOD). Each test threads two values through PSH +
+# OP, then inspects the post-step AX. Mirrors how XOR_BASIC and the
+# other L29 collapsed-step re-localization smoke programs are shaped.
+# ---------------------------------------------------------------------------
+
+
+def _final_ax(program):
+    """Run ``program`` through ``ReferenceOracle`` and return AX of the
+    last non-EXIT step (or the EXIT step if there are no others)."""
+
+    oracle = ReferenceOracle(program)
+    # The EXIT snapshot has halted=True but AX is preserved; we want the
+    # AX *after* the ALU op fired (snapshot just before EXIT).
+    if oracle.num_steps >= 2:
+        return oracle.state_at_step(oracle.num_steps - 2).ax
+    return oracle.state_at_step(oracle.num_steps - 1).ax
+
+
+def test_oracle_dispatch_xor_basic():
+    """``IMM 0xFF; PSH; IMM 0xD5; XOR; EXIT`` -> AX = 0xFF ^ 0xD5 = 0x2A."""
+
+    program = [
+        encode_instr(OP_IMM, 0xFF),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 0xD5),
+        encode_instr(OP_XOR),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(program) == 0xFF ^ 0xD5  # 0x2A
+
+
+def test_oracle_dispatch_or_and():
+    program_or = [
+        encode_instr(OP_IMM, 0xF0),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 0x0F),
+        encode_instr(OP_OR),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(program_or) == 0xFF
+
+    program_and = [
+        encode_instr(OP_IMM, 0xF0),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 0x3C),
+        encode_instr(OP_AND),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(program_and) == 0xF0 & 0x3C  # 0x30
+
+
+def test_oracle_dispatch_shl_shr():
+    program_shl = [
+        encode_instr(OP_IMM, 0x01),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 4),
+        encode_instr(OP_SHL),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(program_shl) == 0x10
+
+    program_shr = [
+        encode_instr(OP_IMM, 0x100),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 4),
+        encode_instr(OP_SHR),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(program_shr) == 0x10
+
+
+def test_oracle_dispatch_div_mod():
+    program_div = [
+        encode_instr(OP_IMM, 20),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 3),
+        encode_instr(OP_DIV),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(program_div) == 6  # 20 // 3
+
+    program_mod = [
+        encode_instr(OP_IMM, 20),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 3),
+        encode_instr(OP_MOD),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(program_mod) == 2  # 20 % 3
+
+    # Division by zero -> AX = 0 (defensive; C4 traps but the oracle
+    # picks a deterministic outcome so callers don't have to special
+    # case).
+    program_div0 = [
+        encode_instr(OP_IMM, 5),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 0),
+        encode_instr(OP_DIV),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(program_div0) == 0
+
+
+def test_oracle_dispatch_eq_ne():
+    # 7 EQ 7 -> 1
+    eq_true = [
+        encode_instr(OP_IMM, 7),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 7),
+        encode_instr(OP_EQ),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(eq_true) == 1
+
+    # 7 EQ 8 -> 0
+    eq_false = [
+        encode_instr(OP_IMM, 7),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 8),
+        encode_instr(OP_EQ),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(eq_false) == 0
+
+    # 7 NE 8 -> 1
+    ne_true = [
+        encode_instr(OP_IMM, 7),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 8),
+        encode_instr(OP_NE),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(ne_true) == 1
+
+
+def test_oracle_dispatch_lt_gt_le_ge():
+    # 3 LT 5 -> 1
+    prog = [
+        encode_instr(OP_IMM, 3),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 5),
+        encode_instr(OP_LT),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(prog) == 1
+
+    # 5 GT 3 -> 1
+    prog = [
+        encode_instr(OP_IMM, 5),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 3),
+        encode_instr(OP_GT),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(prog) == 1
+
+    # 5 LE 5 -> 1
+    prog = [
+        encode_instr(OP_IMM, 5),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 5),
+        encode_instr(OP_LE),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(prog) == 1
+
+    # 5 GE 5 -> 1
+    prog = [
+        encode_instr(OP_IMM, 5),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 5),
+        encode_instr(OP_GE),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(prog) == 1
+
+    # 5 GE 6 -> 0
+    prog = [
+        encode_instr(OP_IMM, 5),
+        encode_instr(OP_PSH),
+        encode_instr(OP_IMM, 6),
+        encode_instr(OP_GE),
+        encode_instr(OP_EXIT),
+    ]
+    assert _final_ax(prog) == 0
+
+
+def test_default_embedding_indicator_for_extended_opcodes():
+    """``default_embedding_for_instruction`` should set ``OP_<NAME>+0``
+    for every new opcode in the extended set, matching the indicator
+    families the embedding bake emits.
+    """
+
+    from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+        default_embedding_for_instruction,
+    )
+
+    cases = [
+        (OP_OR,  "OP_OR+0"),
+        (OP_XOR, "OP_XOR+0"),
+        (OP_AND, "OP_AND+0"),
+        (OP_EQ,  "OP_EQ+0"),
+        (OP_NE,  "OP_NE+0"),
+        (OP_LT,  "OP_LT+0"),
+        (OP_GT,  "OP_GT+0"),
+        (OP_LE,  "OP_LE+0"),
+        (OP_GE,  "OP_GE+0"),
+        (OP_SHL, "OP_SHL+0"),
+        (OP_SHR, "OP_SHR+0"),
+        (OP_DIV, "OP_DIV+0"),
+        (OP_MOD, "OP_MOD+0"),
+    ]
+    for op, indicator in cases:
+        state = default_embedding_for_instruction(op, 0, pc=0)
+        assert state.get(indicator) == 1.0, (
+            f"missing {indicator} for opcode {op}"
+        )
+
+
+def test_replay_expected_diff_parser_accepts_extended_opcodes():
+    """The CLI parser in ``tools/replay_expected_diff`` must accept the
+    extended opcode mnemonics so XOR_BASIC and friends can be replayed.
+    """
+
+    from c4_release.tools.replay_expected_diff import parse_program
+
+    # XOR_BASIC demo from the brief.
+    bytecode = parse_program("IMM 0xFF; PSH; IMM 0xD5; XOR; EXIT")
+    assert len(bytecode) == 5
+    # Run through oracle to confirm the parse produced executable bytes.
+    assert _final_ax(bytecode) == 0xFF ^ 0xD5
+
+    # Every new mnemonic parses (no SystemExit).
+    for mnem in ("OR", "AND", "EQ", "NE", "LT", "GT", "LE", "GE",
+                 "SHL", "SHR", "DIV", "MOD"):
+        prog = parse_program(f"IMM 1; PSH; IMM 1; {mnem}; EXIT")
+        assert len(prog) == 5
