@@ -1427,17 +1427,24 @@ def _stack0_carry_head_spec(BD) -> DeclarativeAttentionHeadSpec:
 def _ax_full_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     """Declarative L3 head 5: current AX output byte -> AX_FULL.
 
-    Step-0 suppression (2026-06-09): the slot-0 gate previously balanced
-    ``MARK_AX*L + HAS_SE*L - CONST*1.5L``, yielding Q[0]=-0.5L at the
-    MARK_AX row when HAS_SE=0 (step 0). That residual was strong enough
-    to softmax onto a stale prev-step OUTPUT_LO/HI relay via the KV cache,
-    leaking 0xff bytes back into AX_FULL and (per the verifier brief)
-    into co-located MEM_value1 emissions on the JSR-step-0 path. Strengthen
-    the gate so step 0 lands deeply negative while step N>=1 is unchanged:
-    raise the HAS_SE weight to 2L and the CONST sink to -2.5L. Numerics:
+    Step-0 suppression (2026-06-09): TWO complementary HAS_SE guards.
+
+    (1) Slot-0 strengthened: HAS_SE weight 2L, CONST sink -2.5L. Numerics:
     HAS_SE=0 -> Q[0] = L - 2.5L = -1.5L (vs prior -0.5L).
     HAS_SE=1 -> Q[0] = L + 2L - 2.5L = +0.5L (unchanged).
-    See docs/VAR_L3_SP_BYTE2_2026_06_07.md and docs/1096_CUMULATIVE_PASS_COUNTS_2026_06_07.md.
+
+    (2) Slot-33 GATE also requires HAS_SE=1. Without this guard, at step 0
+    the slot-33 gate-side Q still fires (MARK_AX=1 yields +7.5) and the
+    head attends to the current-step AX marker row picking up garbage
+    OUTPUT_LO/HI residuals from KV cache.
+
+    Together these suppress the 0xff leak into AX_FULL at step 0 that
+    propagates through downstream LEV-return paths, producing the
+    0xFFE8/0xFF<b> sentinels on gcd_/rec_/nested_/absdiff_ /var_/func_mul.
+
+    See docs/VAR_L3_SP_BYTE2_2026_06_07.md,
+    docs/NESTED_ATTRIBUTION_2026_06_09.md, and memory note
+    ``project_var_failure_mode_shifted`` for prior attributions.
     """
 
     L = 15.0
@@ -1447,7 +1454,8 @@ def _ax_full_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(0, BD.HAS_SE, 2 * L),
         AP(0, BD.CONST, -L * 2.5),
         AP(GATE, BD.MARK_AX, L),
-        AP(GATE, BD.CONST, -L / 2),
+        AP(GATE, BD.HAS_SE, L),
+        AP(GATE, BD.CONST, -L * 1.5),
     ]
     k = [
         AP(0, BD.MARK_AX, L),
