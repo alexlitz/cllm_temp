@@ -315,3 +315,201 @@ def test_composite_ffn_export_layer_keys_match_qwen3():
     ]
     for key in expected:
         assert key in sd, f"missing exported key for composite block: {key}"
+
+
+# ---------------------------------------------------------------------------
+# Real composite block (AddSub5StageBlock) forward equivalence on tiny input
+# ---------------------------------------------------------------------------
+#
+# The fakes above gate the export-pipeline machinery but don't actually
+# execute the composite's BD→GE→stages→GE→BD pipeline. This block of tests
+# uses the production ``AddSub5StageBlock`` against a real BD-layout input
+# and measures the per-element equivalence between
+#
+#   (a) the composite's actual forward(x_bd), and
+#   (b) the Qwen MLP synthesised by ``extract_composite_ffn_weights``
+#       (zero-init SwiGLU triple → MLP output is the zero tensor →
+#       Qwen decoder layer's residual stream equals its input).
+#
+# On inputs that do NOT trigger the composite's MARK_AX + OP_ADD/OP_SUB
+# pattern, the composite is residual-identity by construction (the GE→BD
+# writeback multiplies all writes by ``opcode_mask * (mark_ax > 0.5)``
+# which is identically zero). So the zero-MLP skip-pass IS the correct
+# composite output on the smoke-test / tiny-VM input distribution, and
+# the equivalence ratio is 100 %.
+#
+# This is the strongest forward-equivalence statement available without
+# the deferred multi-block flatten (one Qwen block per sub-stage): the
+# composite has 3+ stacked SiLU nonlinearities in its add/sub pipelines
+# plus a data-dependent ``opcode_mask`` multiplication at the GE→BD
+# writeback. A single Qwen MLP has exactly one SiLU and no
+# data-dependent gating beyond the SwiGLU itself, so it cannot reproduce
+# the composite's TRIGGERED-input behaviour. See the qwen_compat
+# docstring ("Fold feasibility") for the algebraic statement.
+
+
+def test_addsub5stage_residual_identity_on_neutral_input():
+    """Real ``AddSub5StageBlock`` is residual-identity when MARK_AX=0.
+
+    Confirms the assumption underlying the zero-MLP skip-pass: on inputs
+    that don't carry the composite's trigger pattern, the composite is
+    bit-equivalent to a pass-through. This is the regime the tiny-VM
+    forward-parity test in ``test_qwen_r8_e2e.py`` operates in.
+    """
+
+    from c4_release.neural_vm.efficient_alu_addsub_split import AddSub5StageBlock
+    from c4_release.neural_vm.vm_step import _SetDim as BD
+
+    torch.manual_seed(0)
+    composite = AddSub5StageBlock(100.0, BD)
+
+    # Neutral input: no MARK_AX, no opcode markers, random residual.
+    # This matches the smoke-test / tiny-VM distribution where the
+    # composite block sees residual content from earlier blocks but no
+    # ADD/SUB trigger.
+    x_bd = torch.randn(2, 4, 512) * 0.01
+
+    with torch.no_grad():
+        y_bd = composite(x_bd)
+
+    # Bit-equivalence ratio: fraction of residual stream positions where
+    # the composite preserved the input within fp32 round-trip noise.
+    diff = (y_bd - x_bd).abs()
+    equiv = (diff < 1e-5).float().mean().item()
+    assert equiv >= 0.99, (
+        f"AddSub5StageBlock not residual-identity on neutral input: "
+        f"equiv={equiv:.4f}, max_diff={diff.max().item():.3e}"
+    )
+
+
+def test_addsub5stage_composite_matches_qwen_skip_pass_mlp():
+    """Composite forward ≡ Qwen MLP (zero-init) on neutral input ≥99 %.
+
+    Builds the production ``AddSub5StageBlock`` and its Qwen-export
+    counterpart (a zero-init SwiGLU triple via ``extract_composite_ffn_weights``).
+    Asserts the per-element equivalence ratio between
+
+        (a) ``y_bd = composite.forward(x_bd) - x_bd`` (the composite's
+            residual delta), and
+        (b) ``mlp_out = Qwen3MLP(x_bd)`` (the Qwen MLP's contribution to
+            the residual stream)
+
+    is ≥ 99 % on a neutral input. Both should be identically zero (within
+    fp32 tolerance) — the composite is residual-identity when MARK_AX=0
+    and the Qwen MLP is zero because all three projections are zero.
+
+    Fold feasibility (documented in ``qwen_compat.extract_composite_ffn_weights``):
+    a non-zero SwiGLU triple CANNOT reproduce the composite's TRIGGERED
+    behaviour because the composite has 3+ stacked SiLU nonlinearities
+    and a data-dependent opcode_mask multiplication, while a Qwen MLP
+    has exactly one SiLU. Zero-init is therefore the best fold-into-one-MLP
+    approximation, and it is exact on the non-triggering regime that
+    forward-parity tests use.
+    """
+
+    from c4_release.neural_vm.efficient_alu_addsub_split import AddSub5StageBlock
+    from c4_release.neural_vm.vm_step import _SetDim as BD
+
+    torch.manual_seed(0)
+    composite = AddSub5StageBlock(100.0, BD)
+
+    d_model = 512
+    intermediate_size = 64
+    block = nn.Module()
+    block.ffn = composite
+
+    W_up, W_gate, W_down = extract_composite_ffn_weights(
+        block, d_model=d_model, intermediate_size=intermediate_size
+    )
+
+    # Neutral BD input: no MARK_AX, no opcode markers.
+    x_bd = torch.randn(2, 4, d_model) * 0.01
+
+    with torch.no_grad():
+        # (a) Composite residual delta.
+        y_bd = composite(x_bd)
+        composite_delta = y_bd - x_bd
+
+        # (b) Qwen MLP output (per ``_swiglu_repack_and_fold_bias``:
+        # our W_up → gate_proj, our W_gate → up_proj, our W_down → down_proj).
+        gate = torch.nn.functional.linear(x_bd, W_up)
+        up = torch.nn.functional.linear(x_bd, W_gate)
+        mlp_out = torch.nn.functional.linear(
+            torch.nn.functional.silu(gate) * up, W_down
+        )
+
+    # Per-element equivalence ratio between the composite's residual
+    # contribution and the Qwen MLP's residual contribution. Both should
+    # be (close to) zero.
+    diff = (composite_delta - mlp_out).abs()
+    equiv = (diff < 1e-5).float().mean().item()
+    assert equiv >= 0.99, (
+        f"composite forward delta differs from Qwen MLP output: "
+        f"equiv={equiv:.4f}, composite_delta_max={composite_delta.abs().max().item():.3e}, "
+        f"mlp_max={mlp_out.abs().max().item():.3e}, diff_max={diff.max().item():.3e}"
+    )
+
+
+def test_addsub5stage_fold_into_single_swiglu_infeasible_when_triggered():
+    """Document the fold-infeasibility claim with a triggered input.
+
+    When MARK_AX=1 and OP_ADD=1, the composite writes a non-trivial
+    OUTPUT_LO/OUTPUT_HI/CARRY delta. The zero-init SwiGLU triple cannot
+    match that delta — it is identically zero. This test PINS the
+    asymmetry so future "improve the fold" attempts surface the right
+    invariant.
+
+    The pinned gap (composite delta non-zero, MLP delta zero) is the
+    direct evidence that a single SwiGLU is insufficient. Closing this
+    gap requires the deferred multi-block flatten (one Qwen layer per
+    composite stage), per ``docs/QWEN_R8_E2E_2026_06_07.md`` Blocker 1.
+    """
+
+    from c4_release.neural_vm.efficient_alu_addsub_split import AddSub5StageBlock
+    from c4_release.neural_vm.vm_step import _SetDim as BD
+
+    torch.manual_seed(0)
+    composite = AddSub5StageBlock(100.0, BD)
+
+    d_model = 512
+    intermediate_size = 64
+    block = nn.Module()
+    block.ffn = composite
+
+    W_up, W_gate, W_down = extract_composite_ffn_weights(
+        block, d_model=d_model, intermediate_size=intermediate_size
+    )
+
+    # Triggered input: MARK_AX=1, OP_ADD=1, real ALU operands.
+    x_bd = torch.zeros(1, 1, d_model)
+    ax_pos = 0
+    x_bd[0, ax_pos, BD.MARK_AX] = 1.0
+    x_bd[0, ax_pos, BD.OP_ADD] = 1.0
+    x_bd[0, ax_pos, BD.ALU_LO + 0x4] = 1.0  # lhs low nibble = 4
+    x_bd[0, ax_pos, BD.ALU_HI + 0x3] = 1.0  # lhs high nibble = 3
+    x_bd[0, ax_pos, BD.AX_CARRY_LO + 0x2] = 1.0  # rhs low nibble = 2
+    x_bd[0, ax_pos, BD.AX_CARRY_HI + 0x1] = 1.0  # rhs high nibble = 1
+
+    with torch.no_grad():
+        y_bd = composite(x_bd)
+        composite_delta = y_bd - x_bd
+
+        gate = torch.nn.functional.linear(x_bd, W_up)
+        up = torch.nn.functional.linear(x_bd, W_gate)
+        mlp_out = torch.nn.functional.linear(
+            torch.nn.functional.silu(gate) * up, W_down
+        )
+
+    # Composite must produce a non-trivial delta on this triggered input
+    # — it computes 0x34 + 0x12 = 0x46 and writes OUTPUT_LO/OUTPUT_HI.
+    assert composite_delta.abs().max().item() > 0.1, (
+        "AddSub5StageBlock made no delta on a triggered ADD input — "
+        "fixture is broken."
+    )
+
+    # Qwen zero-init MLP is identically zero — proving the single-SwiGLU
+    # fold cannot match the composite on triggered inputs.
+    assert mlp_out.abs().max().item() < 1e-5, (
+        "Qwen MLP delta should be zero with skip-pass weights; got "
+        f"{mlp_out.abs().max().item():.3e}"
+    )

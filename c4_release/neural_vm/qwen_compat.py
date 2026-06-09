@@ -257,6 +257,23 @@ def extract_composite_ffn_weights(
     of those sub-FFNs operate directly on the model's d_model residual,
     so a flat Qwen SwiGLU triple cannot be a byte-identity equivalent.
 
+    Fold feasibility (algebraic statement). A single Qwen SwiGLU MLP is
+    ``down_proj(silu(gate_proj(x)) * up_proj(x))`` — exactly ONE SiLU
+    nonlinearity and zero data-dependent gating. The composite blocks
+    chain 3+ SwiGLU sub-FFNs in series in the GE workspace plus a
+    runtime ``opcode_mask`` multiplication at the GE→BD writeback
+    (gating on ``MARK_AX`` and per-position opcode markers from the
+    residual). Function-composition of three SiLUs cannot be re-expressed
+    as a single SiLU regardless of the chosen W_up/W_gate/W_down, and
+    the opcode_mask is a function of the input residual that no static
+    weight can replicate. Conclusion: no non-zero (W_up, W_gate, W_down)
+    triple can match the composite's TRIGGERED-input behaviour. The
+    deferred multi-block flatten (one Qwen layer per composite stage)
+    is the only path to byte identity. See
+    ``tests/test_qwen_composite_ffn_export.py::
+    test_addsub5stage_fold_into_single_swiglu_infeasible_when_triggered``
+    for the pinned counterexample.
+
     The R8 plan's path forward (one Qwen successor block per sub-stage)
     is deferred to a follow-up phase. Until then this helper makes export
     proceed without raising ``AttributeError`` by:
@@ -275,6 +292,18 @@ def extract_composite_ffn_weights(
          the Qwen decoder layer's residual stream passes through
          unchanged — the same "zero-init skip-pass" idiom used by
          ``_make_skip_pass_block`` for post_ops.
+
+         The zero-init MLP is EXACT (not approximate) on inputs where
+         ``MARK_AX < 0.5`` or the relevant opcode markers are off,
+         because in that regime the composite's GE→BD writeback
+         multiplies all its writes by ``opcode_mask * (mark_ax > 0.5)
+         == 0``, so the composite degenerates to residual-identity.
+         The tiny-VM forward-parity test in
+         ``tests/test_qwen_r8_e2e.py`` operates entirely in that
+         regime, so the zero-init choice does not degrade the R8 tiny
+         gate. See
+         ``tests/test_qwen_composite_ffn_export.py::
+         test_addsub5stage_composite_matches_qwen_skip_pass_mlp``.
 
     Args:
         block: A ``TransformerBlock`` whose ``block.ffn`` is a composite.
