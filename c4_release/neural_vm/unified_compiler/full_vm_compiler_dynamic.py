@@ -78,6 +78,200 @@ from ..kv_eviction import KVEvictionPolicy
 
 
 # ---------------------------------------------------------------------------
+# Model-semantics umbrella (compile-flag presets + per-axis overrides).
+# See ``docs/MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md`` for the design.
+# ---------------------------------------------------------------------------
+
+
+# Per-axis values. Each axis has a "native" value (today's behavior, the
+# byte-identity backward-compat target) and a "qwen" value (the
+# Qwen-compatible alternative). The presets snap onto a coherent pair of
+# six; per-axis kwargs ablate a single axis off the chosen preset.
+_MODEL_SEMANTICS_AXES: Tuple[Tuple[str, Tuple[str, str]], ...] = (
+    ("positional_encoding", ("alibi", "rope")),
+    ("softmax_variant",     ("softmax1", "standard")),
+    ("normalization",       ("identity", "rmsnorm")),
+    ("ffn_variant",         ("native", "swiglu")),
+    ("per_head_qk_norm",    ("none", "qwen")),
+    ("ffn_routing",         ("single", "composite")),
+)
+
+
+_MODEL_SEMANTICS_PRESETS: Dict[str, Dict[str, str]] = {
+    "native": {axis: values[0] for axis, values in _MODEL_SEMANTICS_AXES},
+    "qwen":   {axis: values[1] for axis, values in _MODEL_SEMANTICS_AXES},
+}
+
+
+def _validate_semantics_value(axis: str, value: Optional[str]) -> None:
+    """Reject an out-of-range per-axis value with a useful error."""
+    if value is None:
+        return
+    valid = dict(_MODEL_SEMANTICS_AXES).get(axis)
+    if valid is None:  # pragma: no cover - defensive
+        return
+    if value not in valid:
+        raise ValueError(
+            f"compile_full_vm_dynamic({axis}=...) must be one of "
+            f"{valid!r}; got {value!r}"
+        )
+
+
+def _resolve_semantics_flags(
+    *,
+    preset: Optional[str],
+    positional_encoding: Optional[str],
+    softmax_variant: Optional[str],
+    attention_normalization: Optional[str],
+    normalization: Optional[str],
+    use_rms_norm: Optional[bool],
+    ffn_variant: Optional[str],
+    per_head_qk_norm: Optional[str],
+    ffn_routing: Optional[str],
+    enable_moe_routing: Optional[bool],
+    arch: Optional[ModelArchitectureSpec],
+) -> Tuple[Optional[str], Optional[str], Optional[bool], Optional[bool]]:
+    """Collapse the umbrella flags onto the legacy bake-pipeline kwargs.
+
+    Returns the legacy-shaped tuple
+    ``(positional_encoding, attention_normalization, use_rms_norm,
+    enable_moe_routing)`` that the downstream bake already consumes.
+
+    Backward-compatibility contract: when ``preset is None`` and every
+    per-axis umbrella flag is ``None``, this function returns the input
+    legacy kwargs unchanged. This is the byte-identity gate that
+    ``tests/test_compile_flag_parity.py::test_preset_native_byte_identical_to_default``
+    exercises.
+
+    Errors:
+    - ``preset=`` with ``arch=`` is a hard error (mirrors the existing
+      ``arch=`` vs individual-kwarg gate).
+    - Any per-axis value outside the documented set is a ``ValueError``.
+    - ``per_head_qk_norm="qwen"`` raises ``NotImplementedError`` — the
+      flag is reserved on the signature but the lowering lands with the
+      per-axis design doc (see §6 of the design doc).
+    """
+    # Per-axis value validation runs first so the most specific error
+    # surfaces above the preset / arch-gate machinery.
+    _validate_semantics_value("positional_encoding", positional_encoding)
+    _validate_semantics_value("softmax_variant", softmax_variant)
+    _validate_semantics_value("normalization", normalization)
+    _validate_semantics_value("ffn_variant", ffn_variant)
+    _validate_semantics_value("per_head_qk_norm", per_head_qk_norm)
+    _validate_semantics_value("ffn_routing", ffn_routing)
+
+    umbrella_supplied = {
+        name: value
+        for name, value in (
+            ("preset", preset),
+            ("softmax_variant", softmax_variant),
+            ("normalization", normalization),
+            ("ffn_variant", ffn_variant),
+            ("per_head_qk_norm", per_head_qk_norm),
+            ("ffn_routing", ffn_routing),
+        )
+        if value is not None
+    }
+
+    # Pure backward-compat fast path: no umbrella flag supplied AND no
+    # positional_encoding (the one umbrella flag that aliases an existing
+    # legacy kwarg) -- pass the legacy kwargs through unchanged.
+    if not umbrella_supplied and positional_encoding is None:
+        return (
+            positional_encoding,
+            attention_normalization,
+            use_rms_norm,
+            enable_moe_routing,
+        )
+
+    if umbrella_supplied and arch is not None:
+        raise TypeError(
+            "compile_full_vm_dynamic(arch=...) is mutually exclusive with "
+            "the model-semantics umbrella flags "
+            f"{sorted(umbrella_supplied)}. Pass either ``arch=`` or the "
+            "``preset=``/per-axis flags, not both. See "
+            "``docs/MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md`` for the "
+            "migration story."
+        )
+
+    if preset is not None and preset not in _MODEL_SEMANTICS_PRESETS:
+        raise ValueError(
+            f"compile_full_vm_dynamic(preset=...) must be one of "
+            f"{sorted(_MODEL_SEMANTICS_PRESETS)}; got {preset!r}"
+        )
+
+    # Build a sparse resolved dict that holds only the axes the caller
+    # explicitly opted into (via ``preset=`` or a per-axis kwarg). Axes
+    # the caller did NOT name are left untouched: the legacy kwarg /
+    # env default flows through unchanged. This preserves the "only
+    # ablate what I named" composition rule documented in §3 of the
+    # design doc.
+    resolved: Dict[str, str] = {}
+    if preset is not None:
+        resolved.update(_MODEL_SEMANTICS_PRESETS[preset])
+    per_axis_overrides = {
+        "positional_encoding": positional_encoding,
+        "softmax_variant":     softmax_variant,
+        "normalization":       normalization,
+        "ffn_variant":         ffn_variant,
+        "per_head_qk_norm":    per_head_qk_norm,
+        "ffn_routing":         ffn_routing,
+    }
+    for axis, value in per_axis_overrides.items():
+        if value is not None:
+            resolved[axis] = value
+
+    # Per-axis variant implementations land separately. For this round
+    # only the legacy-aliased axes are wired; the others are reserved.
+    if resolved.get("ffn_variant") == "swiglu":
+        raise NotImplementedError(
+            "ffn_variant='swiglu' is reserved on the compile signature; "
+            "implementation lands with QWEN_SWIGLU_REPACK_PROTOTYPE_2026_06_07.md."
+        )
+    if resolved.get("per_head_qk_norm") == "qwen":
+        raise NotImplementedError(
+            "per_head_qk_norm='qwen' is reserved on the compile signature; "
+            "implementation lands with the per-axis design doc (see §6 of "
+            "MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md)."
+        )
+
+    # Map onto the legacy bake-pipeline kwargs. An axis the caller did
+    # not opt into stays at its incoming legacy-kwarg value.
+    new_positional_encoding = resolved.get(
+        "positional_encoding", positional_encoding
+    )
+
+    if "softmax_variant" in resolved:
+        softmax_to_legacy = {"softmax1": "softmax1", "standard": "softmax"}
+        new_attention_normalization = softmax_to_legacy[
+            resolved["softmax_variant"]
+        ]
+    else:
+        new_attention_normalization = attention_normalization
+
+    if "normalization" in resolved:
+        new_use_rms_norm: Optional[bool] = (
+            resolved["normalization"] == "rmsnorm"
+        )
+    else:
+        new_use_rms_norm = use_rms_norm
+
+    if "ffn_routing" in resolved:
+        new_enable_moe_routing: Optional[bool] = (
+            resolved["ffn_routing"] == "composite"
+        )
+    else:
+        new_enable_moe_routing = enable_moe_routing
+
+    return (
+        new_positional_encoding,
+        new_attention_normalization,
+        new_use_rms_norm,
+        new_enable_moe_routing,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dependency graph (same edge model as tools/analyze_scheduler.py)
 # ---------------------------------------------------------------------------
 
@@ -1535,7 +1729,18 @@ def compile_full_vm_dynamic(
     d_model_packing: bool = False,
     d_model_packing_target: Optional[int] = None,
     cross_step_baseline_allowlist: Optional[Iterable[Tuple[str, str]]] = None,
+    # Model-semantics umbrella flags (see
+    # ``docs/MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md``). All default to
+    # ``None`` so existing callers see no behavior change. ``preset=`` is
+    # the convenience shortcut; the six per-axis flags are the per-axis
+    # override surface. Mixing ``preset=`` with ``arch=`` is rejected like
+    # the existing ``arch=`` vs individual-kwarg gate.
+    preset: Optional[str] = None,
     softmax_variant: Optional[str] = None,
+    normalization: Optional[str] = None,
+    ffn_variant: Optional[str] = None,
+    per_head_qk_norm: Optional[str] = None,
+    ffn_routing: Optional[str] = None,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
@@ -1647,44 +1852,32 @@ def compile_full_vm_dynamic(
     if declarations_only:
         require_declarative_bake = True
 
-    # ------------------------------------------------------------------
-    # softmax_variant (DSL variant scaffold; see
-    # ``docs/SOFTMAX_DSL_VARIANT_DESIGN_2026_06_09.md``)
-    #
-    # ``softmax_variant`` is the new high-level surface that coordinates
-    # the runtime softmax kernel and the bake-side ZFOD substitute. The
-    # default ``None`` means "infer from ``attention_normalization``" so
-    # every existing call site stays byte-identical.
-    #
-    # Validation only at this stage: the actual lowering wave (injecting
-    # the per-head sink K row into L7 / L15 memory-lookup heads) lands
-    # behind this flag in a follow-up. Today the flag plumbs through to
-    # ``attention_normalization`` exactly the way ``arch=`` does — pick
-    # one path per call site.
-    # ------------------------------------------------------------------
-    if softmax_variant is not None:
-        if softmax_variant not in ("softmax1", "standard"):
-            raise ValueError(
-                "compile_full_vm_dynamic: softmax_variant must be "
-                "'softmax1' or 'standard'; got "
-                f"{softmax_variant!r}"
-            )
-        _implied_norm = (
-            "softmax1" if softmax_variant == "softmax1" else "softmax"
-        )
-        if (
-            attention_normalization is not None
-            and attention_normalization != _implied_norm
-        ):
-            raise TypeError(
-                "compile_full_vm_dynamic: softmax_variant="
-                f"{softmax_variant!r} implies attention_normalization="
-                f"{_implied_norm!r} but caller passed "
-                f"attention_normalization={attention_normalization!r}; "
-                "pass softmax_variant= alone (preferred) OR "
-                "attention_normalization= alone, not both."
-            )
-        attention_normalization = _implied_norm
+    # Model-semantics umbrella (see
+    # ``docs/MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md``). Resolves the
+    # six per-axis flags + the ``preset=`` shortcut into the existing
+    # ``positional_encoding`` / ``attention_normalization`` / ``use_rms_norm``
+    # / ``enable_moe_routing`` kwargs that the bake pipeline already
+    # consumes. The expansion is purely additive: when every umbrella flag
+    # is ``None`` (the default for existing callers) this block is a no-op
+    # and the downstream bake is byte-identical to the historical path.
+    (
+        positional_encoding,
+        attention_normalization,
+        use_rms_norm,
+        enable_moe_routing,
+    ) = _resolve_semantics_flags(
+        preset=preset,
+        positional_encoding=positional_encoding,
+        softmax_variant=softmax_variant,
+        attention_normalization=attention_normalization,
+        normalization=normalization,
+        use_rms_norm=use_rms_norm,
+        ffn_variant=ffn_variant,
+        per_head_qk_norm=per_head_qk_norm,
+        ffn_routing=ffn_routing,
+        enable_moe_routing=enable_moe_routing,
+        arch=arch,
+    )
 
     from ..config import get_config
     vm_config = get_config()
@@ -1787,17 +1980,6 @@ def compile_full_vm_dynamic(
             # Qwen R1 (see _bake_from_scheduled_ops cache key for context).
             "C4_QWEN_EXPORT_COMPAT": (
                 os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
-            ),
-            # Softmax DSL variant scaffold (see
-            # docs/SOFTMAX_DSL_VARIANT_DESIGN_2026_06_09.md). Today this is
-            # a pass-through of ``attention_normalization`` so the cache
-            # key stays stable; once the bake-side sink injection lands
-            # the two values can diverge and need independent invalidation.
-            "softmax_variant": (
-                softmax_variant
-                if softmax_variant is not None
-                else ("softmax1" if attention_normalization == "softmax1"
-                      else "standard")
             ),
             "__dynamic": True,
         }
@@ -1915,36 +2097,6 @@ def compile_full_vm_dynamic(
         d_model_packing=d_model_packing,
         d_model_packing_target=d_model_packing_target,
     )
-
-    # Phase R8 / Blocker 4 partial fix: optional per-head W_k pre-rotation
-    # for RoPE-mode compiles. Gated by the ``C4_ROPE_REBAKE_REFERENCE_DISTANCE``
-    # env var; default is no-op (preserves position-0 byte identity). When
-    # set to a positive float, shifts the post-RoPE Q·K score peak toward
-    # the given lookback distance — research-level partial recovery on
-    # L15-style content-addressed heads. See
-    # ``neural_vm.qwen_compat._rebake_attention_for_rope`` for the math.
-    if positional_encoding == "rope":
-        _rope_rebake_d = os.environ.get("C4_ROPE_REBAKE_REFERENCE_DISTANCE")
-        if _rope_rebake_d is not None:
-            try:
-                _ref_d = float(_rope_rebake_d)
-            except ValueError:
-                _ref_d = 0.0
-            if _ref_d != 0.0:
-                from neural_vm.qwen_compat import _rebake_attention_for_rope
-                for _block in getattr(model, "blocks", []):
-                    _attn = getattr(_block, "attn", None)
-                    if _attn is None or not hasattr(_attn, "W_k"):
-                        continue
-                    _rebake_attention_for_rope(
-                        _attn,
-                        positional_encoding="rope",
-                        num_heads=int(getattr(_attn, "num_heads")),
-                        head_dim=int(getattr(_attn, "head_dim")),
-                        max_seq_len=int(getattr(_attn, "max_seq_len", max_seq_len)),
-                        rope_base=float(getattr(_attn, "rope_base", rope_base)),
-                        reference_distance=_ref_d,
-                    )
 
     # Post-compile shape rebuild. When the caller hands in
     # ``target_shape_overrides`` (a ``ModelShapeConstraint``), REPLACE the
